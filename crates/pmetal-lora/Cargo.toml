@@ -1,0 +1,39 @@
+[package]
+name = "pmetal-lora"
+description = "LoRA and QLoRA implementations for PMetal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+# Enable fused Metal kernels for accelerated training on Apple Silicon
+metal-fused = ["pmetal-metal"]
+
+[dependencies]
+pmetal-core = { workspace = true }
+pmetal-gguf = { workspace = true }
+pmetal-metal = { workspace = true, optional = true }
+pmetal-mlx = { workspace = true }
+pmetal-models = { workspace = true }
+half = { workspace = true }
+mlx-rs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+mlx-sys = { workspace = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "memory_benchmark"
+harness = false
+
+[lints]
+workspace = true

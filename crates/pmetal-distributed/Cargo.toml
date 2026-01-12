@@ -1,0 +1,50 @@
+[package]
+name = "pmetal-distributed"
+version.workspace = true
+edition.workspace = true
+description = "Distributed training backend for PMetal (Home Clusters)"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+# Use workspace versions for consistency
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+bincode = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+
+# Async utilities
+futures = "0.3"
+bytes = "1.5"
+async-trait = "0.1"
+bytemuck = { version = "1.14", features = ["derive"] }
+
+# Peer discovery and networking (libp2p stack)
+libp2p = { version = "0.54", features = [
+    "tokio",
+    "tcp",
+    "noise",
+    "yamux",
+    "mdns",
+    "gossipsub",
+    "identify",
+    "ping",
+    "macros",
+    "ed25519",
+    "serde",
+] }
+
+# Topology graph
+petgraph = "0.6"
+
+# Utilities
+dirs = "5.0"
+sha3 = "0.10"
+bs58 = "0.5"
+rand = "0.8"
+parking_lot = "0.12"
+half = { workspace = true }
+ordered-float = "4.2"

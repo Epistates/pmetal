@@ -1,0 +1,34 @@
+[package]
+name = "pmetal-models"
+description = "LLM model architectures for PMetal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+pmetal-core = { workspace = true }
+pmetal-gguf = { workspace = true }
+pmetal-metal = { workspace = true }
+pmetal-mlx = { workspace = true }
+mlx-rs = { workspace = true }
+mlx-sys = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+safetensors = { workspace = true }
+
+# Metal dependencies (macOS only)
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-metal = "0.3"
+
+[dev-dependencies]
+serial_test = "3.2"
+
+[lints]
+workspace = true

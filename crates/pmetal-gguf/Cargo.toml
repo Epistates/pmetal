@@ -1,0 +1,23 @@
+[package]
+name = "pmetal-gguf"
+description = "GGUF file format implementation for PMetal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+pmetal-core = { workspace = true }
+byteorder = "1.5"
+half = { version = "2.4", features = ["bytemuck"] }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+proptest = { workspace = true }
+
+[lints]
+workspace = true

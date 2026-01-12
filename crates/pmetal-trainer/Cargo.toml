@@ -1,0 +1,42 @@
+[package]
+name = "pmetal-trainer"
+description = "Training loops and optimization for PMetal"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = []
+tensorboard = ["dep:tensorboard-rs"]
+
+[dependencies]
+pmetal-core = { workspace = true }
+pmetal-mlx = { workspace = true }
+pmetal-lora = { workspace = true }
+pmetal-data = { workspace = true }
+pmetal-models = { workspace = true }
+pmetal-distill = { workspace = true }
+pmetal-metal = { workspace = true }
+mlx-rs = { workspace = true }
+mlx-sys = { workspace = true }
+rand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+indicatif = { workspace = true }
+chrono = "0.4"
+
+# Optional: TensorBoard logging
+tensorboard-rs = { version = "0.5", optional = true }
+
+[dev-dependencies]
+serial_test = "3.2.0"
+tempfile = "3.17"
+
+[lints]
+workspace = true

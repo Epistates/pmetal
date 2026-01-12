@@ -1,0 +1,124 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/pmetal-core",
+    "crates/pmetal-metal",
+    "crates/pmetal-mlx",
+    "crates/pmetal-models",
+    "crates/pmetal-lora",
+    "crates/pmetal-data",
+    "crates/pmetal-trainer",
+    "crates/pmetal-hub",
+    "crates/pmetal-gguf",
+    "crates/pmetal-vocoder",
+    "crates/pmetal-merge",
+    "crates/pmetal-distill",
+    "crates/pmetal-distributed",
+    "crates/pmetal-mhc",
+    "crates/pmetal-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/epistates/pmetal"
+keywords = ["machine-learning", "llm", "fine-tuning", "apple-silicon", "mlx"]
+categories = ["science", "algorithms"]
+
+[workspace.dependencies]
+# Internal crates
+pmetal-core = { path = "crates/pmetal-core", version = "0.1.0" }
+pmetal-metal = { path = "crates/pmetal-metal", version = "0.1.0" }
+pmetal-mlx = { path = "crates/pmetal-mlx", version = "0.1.0" }
+pmetal-models = { path = "crates/pmetal-models", version = "0.1.0" }
+pmetal-lora = { path = "crates/pmetal-lora", version = "0.1.0" }
+pmetal-data = { path = "crates/pmetal-data", version = "0.1.0" }
+pmetal-trainer = { path = "crates/pmetal-trainer", version = "0.1.0" }
+pmetal-hub = { path = "crates/pmetal-hub", version = "0.1.0" }
+pmetal-gguf = { path = "crates/pmetal-gguf", version = "0.1.0" }
+pmetal-cli = { path = "crates/pmetal-cli", version = "0.1.0" }
+pmetal-vocoder = { path = "crates/pmetal-vocoder", version = "0.1.0" }
+pmetal-merge = { path = "crates/pmetal-merge", version = "0.1.0" }
+pmetal-distill = { path = "crates/pmetal-distill", version = "0.1.0" }
+pmetal-mhc = { path = "crates/pmetal-mhc", version = "0.1.0" }
+
+# MLX bindings - using fork with compile_with_state optimizations
+# PRs: https://github.com/oxideai/mlx-rs/pull/305, https://github.com/oxideai/mlx-rs/pull/306
+mlx-rs = { git = "https://github.com/nicholasjpaterno/mlx-rs.git", branch = "main", features = ["safetensors"] }
+mlx-sys = { git = "https://github.com/nicholasjpaterno/mlx-rs.git", branch = "main" }
+
+# Async runtime
+tokio = { version = "1.42", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+
+# Error handling
+thiserror = "2"
+anyhow = "1.0"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Data formats
+safetensors = "0.5"
+arrow = "54"
+parquet = "54"
+
+# HuggingFace integration
+hf-hub = "0.4"
+tokenizers = "0.21"
+
+# Serialization (binary)
+bincode = "1.3"
+
+# Utilities
+bytemuck = { version = "1", features = ["derive"] }
+half = { version = "2", features = ["bytemuck"] }
+num-traits = "0.2"
+ndarray = { version = "0.16", features = ["rayon"] }
+rand = "0.8"
+indicatif = "0.17"
+humansize = "2"
+dirs = "5"
+walkdir = "2"
+
+# Testing
+criterion = "0.5"
+tempfile = "3"
+proptest = "1.5"
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+module_name_repetitions = "allow"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3
+
+# Use fork with compile_with_state fix until PRs are merged
+[patch.crates-io]
+mlx-rs = { git = "https://github.com/nicholasjpaterno/mlx-rs.git", branch = "main" }
+mlx-sys = { git = "https://github.com/nicholasjpaterno/mlx-rs.git", branch = "main" }

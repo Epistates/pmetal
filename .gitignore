@@ -1,0 +1,61 @@
+# Build artifacts
+target/
+*.rlib
+*.rmeta
+
+# Test outputs
+test_output*/
+output_*/
+
+# Test datasets
+test_dataset*.jsonl
+mlx_lm_data/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Strategy / planning documents (internal)
+.strategy/
+
+# Adapters / model weights
+adapters/
+*.safetensors
+*.bin
+*.gguf
+!crates/*/src/**/*.rs
+
+# Environment
+.env
+.env.local
+*.secret
+
+# Logs
+*.log
+logs/
+
+# Profiling
+*.trace
+*.perf
+
+# Temporary files
+*.tmp
+*.temp
+.cache/
+
+# Python (for any Python tooling)
+__pycache__/
+*.py[cod]
+.pytest_cache/
+venv/
+.venv/
+
+# Coverage
+*.gcda
+*.gcno
+coverage/
+lcov.info

@@ -1,0 +1,30 @@
+[package]
+name = "pmetal-vocoder"
+description = "Neural vocoder (BigVGAN) for text-to-speech synthesis"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+pmetal-core = { workspace = true }
+pmetal-mlx = { workspace = true }
+mlx-rs = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+safetensors = { workspace = true }
+hf-hub = { workspace = true }
+tracing = { workspace = true }
+num-traits = { workspace = true }
+half = { version = "2.4", features = ["bytemuck"] }
+bytemuck = { version = "1.14", features = ["derive"] }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[lints]
+workspace = true

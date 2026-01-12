@@ -1,0 +1,39 @@
+[package]
+name = "pmetal-cli"
+description = "Command-line interface for PMetal LLM fine-tuning"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "pmetal"
+path = "src/main.rs"
+
+[dependencies]
+pmetal-core = { workspace = true }
+pmetal-mlx = { workspace = true }
+pmetal-models = { workspace = true }
+pmetal-lora = { workspace = true }
+pmetal-data = { workspace = true }
+pmetal-hub = { workspace = true }
+pmetal-gguf = { workspace = true }
+pmetal-trainer = { workspace = true }
+mlx-rs = { workspace = true }
+clap = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+indicatif = { workspace = true }
+anyhow = { workspace = true }
+dirs = { workspace = true }
+chrono = "0.4"
+
+[lints]
+workspace = true

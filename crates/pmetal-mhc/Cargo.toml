@@ -1,0 +1,60 @@
+[package]
+name = "pmetal-mhc"
+version.workspace = true
+edition.workspace = true
+description = "Manifold-Constrained Hyper-Connections (mHC) for stable deep network training"
+license.workspace = true
+repository.workspace = true
+keywords = ["deep-learning", "transformer", "residual-connections", "training"]
+categories = ["science", "mathematics"]
+
+[dependencies]
+# Core - use workspace references
+pmetal-core = { workspace = true }
+pmetal-metal = { workspace = true, optional = true }
+
+# Math
+ndarray = { version = "0.16", features = ["rayon", "serde"] }
+num-traits = "0.2"
+
+# Async - use workspace
+tokio = { workspace = true }
+
+# Concurrency
+parking_lot = "0.12"
+
+# Serialization - use workspace
+serde = { workspace = true }
+
+# Logging - use workspace
+tracing = { workspace = true }
+
+# Error handling - use workspace
+thiserror = { workspace = true }
+
+# Random (for initialization)
+rand = "0.8"
+rand_distr = "0.4"
+
+# Metal (optional)
+metal = { version = "0.29", optional = true }
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+approx = "0.5"
+proptest = "1.4"
+
+[[bench]]
+name = "sinkhorn"
+harness = false
+
+[[bench]]
+name = "mhc_kernels"
+harness = false
+
+[features]
+default = ["metal"]
+# Enable Metal GPU acceleration for Apple Silicon (macOS)
+metal = ["dep:metal", "pmetal-metal"]
+# Enable CUDA backend for NVIDIA GPUs (future)
+cuda = []
