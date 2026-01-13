@@ -17,6 +17,8 @@ use mlx_rs::{
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
+use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
+use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::mistral::MistralConfig;
 
 use crate::{LoraError, LoraLinear, TrainableModel};
@@ -183,6 +185,85 @@ impl MistralLoraAttention {
         self.o_proj.forward(&output).map_err(LoraError::from)
     }
 
+    /// Forward pass with KV cache for efficient inference.
+    ///
+    /// This method is optimized for autoregressive generation with O(n)
+    /// complexity per token instead of O(n²).
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor [batch, seq_len, hidden_size]
+    /// * `mask` - Optional attention mask
+    /// * `cache` - Optional (KVCache, layer_idx) tuple for cached generation
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, LoraError> {
+        let shape = x.shape();
+        let batch = shape[0];
+        let seq_len = shape[1];
+
+        // Project to Q, K, V using LoRA layers
+        let queries = self.q_proj.forward(x)?;
+        let keys = self.k_proj.forward(x)?;
+        let values = self.v_proj.forward(x)?;
+
+        // Reshape for multi-head attention: [B, L, heads, head_dim]
+        let queries = queries
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?; // [B, heads, L, head_dim]
+        let keys = keys
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let values = values
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+
+        // Get RoPE offset and apply RoPE
+        let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
+            let offset = cache_ref.rope_offset();
+            let queries = apply_rope(&queries, self.head_dim, false, self.rope.base, 1.0, offset)?;
+            let keys = apply_rope(&keys, self.head_dim, false, self.rope.base, 1.0, offset)?;
+            (queries, keys, values)
+        } else {
+            let queries = mlx_rs::module::Module::forward(&mut self.rope, &queries)?;
+            let keys = mlx_rs::module::Module::forward(&mut self.rope, &keys)?;
+            (queries, keys, values)
+        };
+
+        // Handle KV cache update - keys/values are already in [B, heads, seq, head_dim] format
+        let (keys, values) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &keys, &values)
+                .map_err(|e| LoraError::Mlx(e))?
+        } else {
+            (keys, values)
+        };
+
+        // Use fused attention kernel for inference (more efficient than standard attention)
+        // Mistral supports sliding window attention if configured
+        let mask_type = if let Some(window_size) = self.sliding_window {
+            AttentionMaskType::SlidingWindow(window_size)
+        } else {
+            AttentionMaskType::Causal
+        };
+
+        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+            .with_scale(self.scale)
+            .with_mask_type(mask_type);
+
+        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)
+            .map_err(|e| LoraError::Mlx(e))?;
+
+        // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[batch, seq_len, -1])?;
+
+        // Output projection
+        self.o_proj.forward(&output).map_err(LoraError::from)
+    }
+
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
         self.q_proj.num_trainable_params()
@@ -321,6 +402,29 @@ impl MistralLoraDecoderLayer {
         Ok(h.add(&mlp_out)?)
     }
 
+    /// Forward pass with KV cache for efficient inference.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor
+    /// * `mask` - Optional attention mask
+    /// * `cache` - Optional (KVCache, layer_idx) tuple for cached generation
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, LoraError> {
+        // Pre-norm + attention + residual
+        let normed = mlx_rs::module::Module::forward(&mut self.input_layernorm, x)?;
+        let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
+        let h = x.add(&attn_out)?;
+
+        // Pre-norm + MLP + residual
+        let normed = mlx_rs::module::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        Ok(h.add(&mlp_out)?)
+    }
+
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
         self.self_attn.num_trainable_params() + self.mlp.num_trainable_params()
@@ -389,6 +493,43 @@ impl MistralLoraModel {
         self.forward(input_ids, mask)
     }
 
+    /// Forward pass with KV cache for efficient inference.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `mask` - Optional attention mask
+    /// * `cache` - Optional mutable reference to KV cache
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        // Get embeddings
+        let mut hidden_states = mlx_rs::module::Module::forward(&mut self.embed_tokens, input_ids)?;
+
+        // Don't create explicit causal mask - fused SDPA handles it internally
+        // with proper dtype handling. Only pass through user-provided masks.
+
+        // Pass through transformer layers
+        match cache {
+            Some(cache) => {
+                for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+                    hidden_states =
+                        layer.forward_with_cache(&hidden_states, mask, Some((cache, layer_idx)))?;
+                }
+            }
+            None => {
+                for layer in &mut self.layers {
+                    hidden_states = layer.forward(&hidden_states, mask)?;
+                }
+            }
+        }
+
+        // Final norm
+        Ok(mlx_rs::module::Module::forward(&mut self.norm, &hidden_states)?)
+    }
+
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
         self.layers.iter().map(|l| l.num_trainable_params()).sum()
@@ -444,6 +585,46 @@ impl MistralLoraForCausalLM {
         } else {
             Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
         }
+    }
+
+    /// Forward pass with KV cache for efficient inference.
+    ///
+    /// KV caching provides O(n) complexity per token instead of O(n²),
+    /// enabling fast autoregressive generation.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `mask` - Optional attention mask
+    /// * `cache` - Optional mutable reference to KV cache
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
+
+        // Get logits from LM head or shared embeddings
+        if let Some(ref mut lm_head) = self.lm_head {
+            Ok(mlx_rs::module::Module::forward(lm_head, &hidden_states)?)
+        } else {
+            // Tie weights: use embedding weight transposed
+            Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
+        }
+    }
+
+    /// Create a KV cache for this model.
+    ///
+    /// # Arguments
+    /// * `max_seq_len` - Maximum sequence length to cache
+    pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
+        let config = KVCacheConfig::new(
+            self.model.config.num_hidden_layers as usize,
+            max_seq_len,
+            self.model.config.num_kv_heads() as usize,
+            self.model.config.get_head_dim() as usize,
+        );
+        KVCache::new(config)
     }
 
     /// Load base model weights from safetensors.
@@ -747,6 +928,23 @@ impl TrainableModel for MistralLoraForCausalLM {
         }
     }
 
+    fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        MistralLoraForCausalLM::forward_with_cache(self, input_ids, mask, cache)
+    }
+
+    fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {
+        Some(MistralLoraForCausalLM::create_cache(self, max_seq_len))
+    }
+
+    fn supports_kv_cache(&self) -> bool {
+        true
+    }
+
     fn num_trainable_params(&self) -> usize {
         self.model.num_trainable_params()
     }
@@ -993,5 +1191,34 @@ mod tests {
         let params = model.lora_parameters();
         // 2 layers × 7 projections × 2 (A + B) = 28 parameters
         assert_eq!(params.len(), 28);
+    }
+
+    #[test]
+    fn test_kv_cache_support() {
+        let config = small_config();
+        let lora_config = small_lora_config();
+        let mut model = MistralLoraForCausalLM::new(config, lora_config).unwrap();
+
+        // Check that model supports KV cache
+        use crate::TrainableModel;
+        assert!(model.supports_kv_cache());
+
+        // Create a cache (via trait method which returns Option<KVCache>)
+        let mut cache = model.create_cache(128);
+        assert_eq!(cache.rope_offset(), 0);
+
+        // Test forward pass with cache
+        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let logits = model.forward_with_cache(&input_ids, None, Some(&mut cache)).unwrap();
+
+        assert_eq!(logits.shape(), &[1, 4, 1000]);
+        assert_eq!(cache.rope_offset(), 4);
+
+        // Test incremental generation
+        let next_token = mlx_rs::Array::from_slice(&[5_i32], &[1, 1]);
+        let next_logits = model.forward_with_cache(&next_token, None, Some(&mut cache)).unwrap();
+
+        assert_eq!(next_logits.shape(), &[1, 1, 1000]);
+        assert_eq!(cache.rope_offset(), 5);
     }
 }

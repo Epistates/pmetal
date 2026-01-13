@@ -1931,12 +1931,12 @@ async fn run_inference_with_lora(
     temperature: f32,
 ) -> anyhow::Result<()> {
     use pmetal_lora::{DynamicLoraModel, TrainableModel};
-    use pmetal_models::{GenerationConfig, generate};
+    use pmetal_models::{GenerationConfig, generate_cached_async};
     use pmetal_core::LoraConfig;
 
-    // Create LoRA config (minimal rank for inference - actual weights will be loaded from file)
+    // Create LoRA config - we'll load actual weights which override this
     let lora_config = LoraConfig {
-        r: 16,  // Match typical training rank
+        r: 16,  // Will be overridden by loaded weights
         alpha: 16.0,
         ..Default::default()
     };
@@ -1970,21 +1970,40 @@ async fn run_inference_with_lora(
     };
 
     println!("\nPrompt: {}\n", prompt);
-    println!("Generating...\n");
+    println!("Generating with KV cache...\n");
 
-    // Generate
-    let output = generate(
-        |input| model.forward(input, None).map_err(|e| mlx_rs::error::Exception::custom(e.to_string())),
+    // Create KV cache for efficient generation
+    // Cache size = prompt_len + max_tokens + buffer
+    let max_seq_len = input_ids.len() + max_tokens + 64;
+    let mut cache = model.create_cache(max_seq_len)
+        .ok_or_else(|| anyhow::anyhow!("Model does not support KV cache"))?;
+    tracing::info!("Created KV cache for {} tokens", max_seq_len);
+
+    let start = std::time::Instant::now();
+
+    // Generate with KV cache (O(n+k) complexity - fast!)
+    let output = generate_cached_async(
+        |input, cache| {
+            model.forward_with_cache(input, None, Some(cache))
+                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
+        },
         &input_ids,
         gen_config,
+        &mut cache,
     )?;
 
-    // Decode output
-    let generated_text = tokenizer.decode(&output.token_ids)?;
+    let elapsed = start.elapsed();
+
+    // Decode only the generated tokens (not the prompt)
+    let prompt_len = input_ids.len();
+    let generated_tokens = &output.token_ids[prompt_len..];
+    let generated_text = tokenizer.decode(generated_tokens)?;
     println!("{}", generated_text);
 
+    let tokens_per_sec = output.num_generated as f64 / elapsed.as_secs_f64();
     println!("\n---");
-    println!("Generated {} tokens", output.num_generated);
+    println!("Generated {} tokens in {:.2}s ({:.1} tok/s)",
+             output.num_generated, elapsed.as_secs_f64(), tokens_per_sec);
     if output.stopped_by_token {
         println!("Stopped by: EOS token");
     } else {

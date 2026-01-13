@@ -28,6 +28,8 @@ use mlx_rs::{
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
+use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
+use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::phi::{PhiActivation, PhiConfig};
 
 use crate::{LoraError, LoraLinear};
@@ -211,8 +213,104 @@ impl PhiLoraAttention {
         self.o_proj.forward(&output).map_err(LoraError::from)
     }
 
+    /// Forward pass with KV cache for efficient inference.
+    ///
+    /// This method is optimized for autoregressive generation with O(n)
+    /// complexity per token instead of O(n²).
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor [batch, seq_len, hidden_size]
+    /// * `mask` - Optional attention mask
+    /// * `cache` - Optional (KVCache, layer_idx) tuple for cached generation
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, LoraError> {
+        let shape = x.shape();
+        let batch = shape[0];
+        let seq_len = shape[1];
+
+        // Project to Q, K, V using LoRA layers
+        let queries = self.q_proj.forward(x)?;
+        let keys = self.k_proj.forward(x)?;
+        let values = self.v_proj.forward(x)?;
+
+        // Reshape for multi-head attention: [B, L, heads, head_dim]
+        let queries = queries.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
+        let keys = keys.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        let values = values.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+
+        // Transpose for attention: [B, heads, L, head_dim]
+        let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
+        let keys = keys.transpose_axes(&[0, 2, 1, 3])?;
+        let values = values.transpose_axes(&[0, 2, 1, 3])?;
+
+        // Apply partial RoPE with cache offset
+        let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
+            let offset = cache_ref.rope_offset();
+
+            // Apply partial RoPE to query
+            let (q_rope, q_pass) = self.split_rotary_transposed(&queries)?;
+            let q_rope = apply_rope(&q_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
+            let queries = mlx_rs::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
+
+            // Apply partial RoPE to key
+            let (k_rope, k_pass) = self.split_rotary_transposed(&keys)?;
+            let k_rope = apply_rope(&k_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
+            let keys = mlx_rs::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
+
+            (queries, keys, values)
+        } else {
+            // No cache - use standard RoPE
+            let (q_rope, q_pass) = self.split_rotary_transposed(&queries)?;
+            let (k_rope, k_pass) = self.split_rotary_transposed(&keys)?;
+
+            let q_rope = Module::forward(&mut self.rope, &q_rope)?;
+            let k_rope = Module::forward(&mut self.rope, &k_rope)?;
+
+            let queries = mlx_rs::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
+            let keys = mlx_rs::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
+
+            (queries, keys, values)
+        };
+
+        // Handle KV cache update - keys/values are already in [B, heads, seq, head_dim] format
+        let (keys, values) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &keys, &values)
+                .map_err(|e| LoraError::Mlx(e))?
+        } else {
+            (keys, values)
+        };
+
+        // Use fused attention kernel for inference (more efficient than standard attention)
+        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+            .with_scale(self.scale)
+            .with_mask_type(AttentionMaskType::Causal);
+
+        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)
+            .map_err(|e| LoraError::Mlx(e))?;
+
+        // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[batch, seq_len, -1])?;
+
+        // Output projection
+        self.o_proj.forward(&output).map_err(LoraError::from)
+    }
+
     /// Split tensor into RoPE and pass-through parts.
     fn split_rotary(&self, x: &Array) -> Result<(Array, Array), Exception> {
+        let rope_part = x.index((.., .., .., ..self.rope_dim));
+        let pass_part = x.index((.., .., .., self.rope_dim..));
+        Ok((rope_part, pass_part))
+    }
+
+    /// Split tensor into RoPE and pass-through parts (for transposed layout).
+    /// Input: [B, heads, seq, head_dim]
+    fn split_rotary_transposed(&self, x: &Array) -> Result<(Array, Array), Exception> {
         let rope_part = x.index((.., .., .., ..self.rope_dim));
         let pass_part = x.index((.., .., .., self.rope_dim..));
         Ok((rope_part, pass_part))
@@ -364,6 +462,29 @@ impl PhiLoraDecoderLayer {
         Ok(residual.add(&hidden)?)
     }
 
+    /// Forward pass with KV cache for efficient inference.
+    ///
+    /// # Arguments
+    /// * `x` - Input tensor
+    /// * `mask` - Optional attention mask
+    /// * `cache` - Optional (KVCache, layer_idx) tuple for cached generation
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, LoraError> {
+        // Pre-norm + attention + residual
+        let normed = self.input_layernorm.forward(x)?;
+        let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
+        let h = x.add(&attn_out)?;
+
+        // Pre-norm + MLP + residual
+        let normed = self.post_attention_layernorm.forward(&h)?;
+        let mlp_out = self.mlp.forward(&normed)?;
+        Ok(h.add(&mlp_out)?)
+    }
+
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
         self.self_attn.num_trainable_params() + self.mlp.num_trainable_params()
@@ -442,6 +563,43 @@ impl PhiLoraModel {
         Ok(self.norm.forward(&hidden_states)?)
     }
 
+    /// Forward pass with KV cache for efficient inference.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `mask` - Optional attention mask
+    /// * `cache` - Optional mutable reference to KV cache
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        // Get embeddings
+        let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
+
+        // Don't create explicit causal mask - fused SDPA handles it internally
+        // with proper dtype handling. Only pass through user-provided masks.
+
+        // Pass through transformer layers
+        match cache {
+            Some(cache) => {
+                for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+                    hidden_states =
+                        layer.forward_with_cache(&hidden_states, mask, Some((cache, layer_idx)))?;
+                }
+            }
+            None => {
+                for layer in &mut self.layers {
+                    hidden_states = layer.forward(&hidden_states, mask)?;
+                }
+            }
+        }
+
+        // Final norm
+        Ok(self.norm.forward(&hidden_states)?)
+    }
+
     /// Get number of trainable parameters.
     pub fn num_trainable_params(&self) -> usize {
         self.layers.iter().map(|l| l.num_trainable_params()).sum()
@@ -504,6 +662,39 @@ impl PhiLoraForCausalLM {
     ) -> Result<Array, LoraError> {
         let hidden_states = self.model.forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
         Ok(Module::forward(&mut self.lm_head, &hidden_states)?)
+    }
+
+    /// Forward pass with KV cache for efficient inference.
+    ///
+    /// KV caching provides O(n) complexity per token instead of O(n²),
+    /// enabling fast autoregressive generation.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `mask` - Optional attention mask
+    /// * `cache` - Optional mutable reference to KV cache
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
+        Ok(Module::forward(&mut self.lm_head, &hidden_states)?)
+    }
+
+    /// Create a KV cache for this model.
+    ///
+    /// # Arguments
+    /// * `max_seq_len` - Maximum sequence length to cache
+    pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
+        let config = KVCacheConfig::new(
+            self.model.config.num_hidden_layers as usize,
+            max_seq_len,
+            self.model.config.num_key_value_heads as usize,
+            self.model.config.head_dim() as usize,
+        );
+        KVCache::new(config)
     }
 
     /// Get all trainable LoRA parameters.
@@ -911,6 +1102,23 @@ impl crate::TrainableModel for PhiLoraForCausalLM {
     fn supports_gradient_checkpointing(&self) -> bool {
         true
     }
+
+    fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        PhiLoraForCausalLM::forward_with_cache(self, input_ids, mask, cache)
+    }
+
+    fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {
+        Some(PhiLoraForCausalLM::create_cache(self, max_seq_len))
+    }
+
+    fn supports_kv_cache(&self) -> bool {
+        true
+    }
 }
 
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
@@ -1000,5 +1208,34 @@ mod tests {
         let config = small_config();
         assert_eq!(config.head_dim(), 16);
         assert_eq!(config.rope_dim(), 8); // 50% of head_dim
+    }
+
+    #[test]
+    fn test_phi_kv_cache() {
+        let config = small_config();
+        let lora_config = small_lora_config();
+        let mut model = PhiLoraForCausalLM::new(config, lora_config).unwrap();
+
+        // Check that model supports KV cache
+        use crate::TrainableModel;
+        assert!(model.supports_kv_cache());
+
+        // Create a cache
+        let mut cache = model.create_cache(128);
+        assert_eq!(cache.rope_offset(), 0);
+
+        // Test forward pass with cache
+        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let logits = model.forward_with_cache(&input_ids, None, Some(&mut cache)).unwrap();
+
+        assert_eq!(logits.shape(), &[1, 4, 1000]);
+        assert_eq!(cache.rope_offset(), 4);
+
+        // Test incremental generation
+        let next_token = mlx_rs::Array::from_slice(&[5_i32], &[1, 1]);
+        let next_logits = model.forward_with_cache(&next_token, None, Some(&mut cache)).unwrap();
+
+        assert_eq!(next_logits.shape(), &[1, 1, 1000]);
+        assert_eq!(cache.rope_offset(), 5);
     }
 }

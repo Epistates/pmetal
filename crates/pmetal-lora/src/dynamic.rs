@@ -24,6 +24,7 @@ use std::path::Path;
 use std::rc::Rc;
 
 use pmetal_core::LoraConfig;
+use pmetal_mlx::kv_cache::KVCache;
 use pmetal_models::{
     DispatchError, GgufModelConfig, ModelArchitecture, WeightFormat, WeightFormatError,
     WeightLoader,
@@ -538,6 +539,41 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(_) => true,   // Implemented
             Self::Gemma(_) => true,   // Implemented
             Self::Phi(_) => true,     // Implemented
+        }
+    }
+
+    fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        match self {
+            Self::Llama(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Mistral(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Qwen3(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Gemma(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Phi(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+        }
+    }
+
+    fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {
+        match self {
+            Self::Llama(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::Mistral(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::Qwen3(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::Gemma(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::Phi(m) => TrainableModel::create_cache(m, max_seq_len),
+        }
+    }
+
+    fn supports_kv_cache(&self) -> bool {
+        match self {
+            Self::Llama(_) => true,
+            Self::Mistral(_) => true,
+            Self::Qwen3(_) => true,
+            Self::Gemma(_) => true,
+            Self::Phi(_) => true,
         }
     }
 }

@@ -8,6 +8,7 @@ use std::rc::Rc;
 
 use mlx_rs::module::ModuleParameters;
 use mlx_rs::Array;
+use pmetal_mlx::kv_cache::KVCache;
 
 use crate::LoraError;
 
@@ -79,6 +80,50 @@ pub trait TrainableModel: ModuleParameters {
 
     /// Check if this model supports multimodal (image+text) inputs.
     fn is_multimodal(&self) -> bool {
+        false
+    }
+
+    /// Perform forward pass with KV cache for efficient inference.
+    ///
+    /// KV caching stores previously computed key and value tensors,
+    /// avoiding redundant computation for past tokens during generation.
+    /// This provides O(n) complexity instead of O(n²) per token.
+    ///
+    /// # Arguments
+    /// * `input_ids` - Token IDs [batch, seq_len]
+    /// * `mask` - Optional attention mask
+    /// * `cache` - Optional mutable reference to KV cache
+    ///
+    /// # Returns
+    /// Logits [batch, seq_len, vocab_size]
+    fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, LoraError> {
+        // Default implementation: ignore cache and use standard forward
+        // Models that support KV cache should override this
+        let _ = cache;
+        self.forward(input_ids, mask)
+    }
+
+    /// Create a KV cache for this model.
+    ///
+    /// Creates an appropriately sized cache based on the model's configuration.
+    ///
+    /// # Arguments
+    /// * `max_seq_len` - Maximum sequence length to cache
+    ///
+    /// # Returns
+    /// A new KVCache instance, or None if the model doesn't support caching
+    fn create_cache(&self, _max_seq_len: usize) -> Option<KVCache> {
+        // Default: no cache support
+        None
+    }
+
+    /// Check if this model supports KV caching for efficient inference.
+    fn supports_kv_cache(&self) -> bool {
         false
     }
 
