@@ -166,25 +166,77 @@ impl Tuner {
         let all_candidates: Vec<TunedConfig> = match props.device_tier {
             DeviceTier::Ultra | DeviceTier::Max => vec![
                 // M4 Max/Ultra: Start with largest tiles (best for high bandwidth)
-                TunedConfig { tile_m: 64, tile_n: 64, tile_k: 32 },
-                TunedConfig { tile_m: 64, tile_n: 32, tile_k: 32 },
-                TunedConfig { tile_m: 32, tile_n: 64, tile_k: 32 },
-                TunedConfig { tile_m: 32, tile_n: 32, tile_k: 32 },
+                TunedConfig {
+                    tile_m: 64,
+                    tile_n: 64,
+                    tile_k: 32,
+                },
+                TunedConfig {
+                    tile_m: 64,
+                    tile_n: 32,
+                    tile_k: 32,
+                },
+                TunedConfig {
+                    tile_m: 32,
+                    tile_n: 64,
+                    tile_k: 32,
+                },
+                TunedConfig {
+                    tile_m: 32,
+                    tile_n: 32,
+                    tile_k: 32,
+                },
             ],
             DeviceTier::Pro => vec![
                 // M4 Pro: Balance between tile size and occupancy
-                TunedConfig { tile_m: 64, tile_n: 32, tile_k: 32 },
-                TunedConfig { tile_m: 32, tile_n: 64, tile_k: 32 },
-                TunedConfig { tile_m: 64, tile_n: 64, tile_k: 32 },
-                TunedConfig { tile_m: 32, tile_n: 32, tile_k: 32 },
+                TunedConfig {
+                    tile_m: 64,
+                    tile_n: 32,
+                    tile_k: 32,
+                },
+                TunedConfig {
+                    tile_m: 32,
+                    tile_n: 64,
+                    tile_k: 32,
+                },
+                TunedConfig {
+                    tile_m: 64,
+                    tile_n: 64,
+                    tile_k: 32,
+                },
+                TunedConfig {
+                    tile_m: 32,
+                    tile_n: 32,
+                    tile_k: 32,
+                },
             ],
             DeviceTier::Base => vec![
                 // M4 Base: Smaller tiles for better occupancy
-                TunedConfig { tile_m: 32, tile_n: 32, tile_k: 32 },
-                TunedConfig { tile_m: 32, tile_n: 64, tile_k: 32 },
-                TunedConfig { tile_m: 16, tile_n: 64, tile_k: 32 },
-                TunedConfig { tile_m: 64, tile_n: 32, tile_k: 32 },
-                TunedConfig { tile_m: 16, tile_n: 32, tile_k: 32 },
+                TunedConfig {
+                    tile_m: 32,
+                    tile_n: 32,
+                    tile_k: 32,
+                },
+                TunedConfig {
+                    tile_m: 32,
+                    tile_n: 64,
+                    tile_k: 32,
+                },
+                TunedConfig {
+                    tile_m: 16,
+                    tile_n: 64,
+                    tile_k: 32,
+                },
+                TunedConfig {
+                    tile_m: 64,
+                    tile_n: 32,
+                    tile_k: 32,
+                },
+                TunedConfig {
+                    tile_m: 16,
+                    tile_n: 32,
+                    tile_k: 32,
+                },
             ],
         };
 
@@ -237,10 +289,8 @@ impl Tuner {
 
         // Estimate memory usage. If > 500MB, skip tuning or use smaller proxy.
         // x: f16
-        let total_bytes = (batch_size * in_features
-            + out_features * in_features
-            + batch_size * out_features)
-            * 2;
+        let total_bytes =
+            (batch_size * in_features + out_features * in_features + batch_size * out_features) * 2;
         if total_bytes > 500 * 1024 * 1024 {
             debug!(
                 "Skipping benchmark (memory too large: {} MB)",
@@ -263,24 +313,42 @@ impl Tuner {
         let y_size = batch_size * out_features * 2;
         // Allocations
         // NOTE: newBufferWithLength_options takes usize in newer bindings
-        let buf_x = device
-            .newBufferWithLength_options(x_size, options)
-            .ok_or(MetalError::BufferCreation { size: x_size, reason: "x buffer".into() })?;
-        let buf_w = device
-            .newBufferWithLength_options(w_size, options)
-            .ok_or(MetalError::BufferCreation { size: w_size, reason: "w buffer".into() })?;
+        let buf_x = device.newBufferWithLength_options(x_size, options).ok_or(
+            MetalError::BufferCreation {
+                size: x_size,
+                reason: "x buffer".into(),
+            },
+        )?;
+        let buf_w = device.newBufferWithLength_options(w_size, options).ok_or(
+            MetalError::BufferCreation {
+                size: w_size,
+                reason: "w buffer".into(),
+            },
+        )?;
         let buf_a = device
             .newBufferWithLength_options(rank * in_features * 2, options)
-            .ok_or(MetalError::BufferCreation { size: rank * in_features * 2, reason: "a buffer".into() })?;
+            .ok_or(MetalError::BufferCreation {
+                size: rank * in_features * 2,
+                reason: "a buffer".into(),
+            })?;
         let buf_b = device
             .newBufferWithLength_options(out_features * rank * 2, options)
-            .ok_or(MetalError::BufferCreation { size: out_features * rank * 2, reason: "b buffer".into() })?;
-        let buf_y = device
-            .newBufferWithLength_options(y_size, options)
-            .ok_or(MetalError::BufferCreation { size: y_size, reason: "y buffer".into() })?;
+            .ok_or(MetalError::BufferCreation {
+                size: out_features * rank * 2,
+                reason: "b buffer".into(),
+            })?;
+        let buf_y = device.newBufferWithLength_options(y_size, options).ok_or(
+            MetalError::BufferCreation {
+                size: y_size,
+                reason: "y buffer".into(),
+            },
+        )?;
         let buf_xa = device
             .newBufferWithLength_options(batch_size * rank * 2, options)
-            .ok_or(MetalError::BufferCreation { size: batch_size * rank * 2, reason: "xa buffer".into() })?;
+            .ok_or(MetalError::BufferCreation {
+                size: batch_size * rank * 2,
+                reason: "xa buffer".into(),
+            })?;
 
         // Create params buffer
         struct FusedLoraParams {
@@ -297,25 +365,29 @@ impl Tuner {
             rank: rank as u32,
             scale: 1.0,
         };
-        
+
         let params_size = std::mem::size_of::<FusedLoraParams>();
         let params_ptr = NonNull::new(&params as *const _ as *mut c_void).unwrap();
-        
+
         // unsafe {
         //    device.newBufferWithBytes_length_options(...)
         // }
         // The bindings might differ. Let's assume standard signatures.
         // If passing pointer directly, use unsafe block.
-        // But obj2-metal wrapper might be safe if using &T? 
+        // But obj2-metal wrapper might be safe if using &T?
         // Based on error "unsafe fn newBufferWithBytes...", we need unsafe.
-        
+
         let buf_params = unsafe {
             device.newBufferWithBytes_length_options(
                 params_ptr,
                 params_size,
                 MTLResourceOptions::CPUCacheModeDefaultCache,
             )
-        }.ok_or(MetalError::BufferCreation { size: params_size, reason: "params buffer".into() })?;
+        }
+        .ok_or(MetalError::BufferCreation {
+            size: params_size,
+            reason: "params buffer".into(),
+        })?;
 
         // Warmup
         self.dispatch_kernel(

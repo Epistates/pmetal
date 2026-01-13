@@ -1290,7 +1290,12 @@ pub fn dequantize_iq3xxs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 
             // Get scale and signs from packed gas data
             let gas_offset = QK_K / 4 + ib32 * 4;
-            let aux32 = u32::from_le_bytes([qs[gas_offset], qs[gas_offset + 1], qs[gas_offset + 2], qs[gas_offset + 3]]);
+            let aux32 = u32::from_le_bytes([
+                qs[gas_offset],
+                qs[gas_offset + 1],
+                qs[gas_offset + 2],
+                qs[gas_offset + 3],
+            ]);
             let db = d * (0.5 + (aux32 >> 28) as f32) * 0.5;
 
             // Process 2 groups of 16 values
@@ -1401,7 +1406,8 @@ pub fn dequantize_iq3s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                 // Process 4 values from each grid
                 for j in 0..2 {
                     let qs_idx = qs_offset + 4 * il + j * 2;
-                    let grid_idx = qs[qs_idx] as usize | (((qh_byte >> (qh_shift + 3 - j)) & 1) as usize * 256);
+                    let grid_idx = qs[qs_idx] as usize
+                        | (((qh_byte >> (qh_shift + 3 - j)) & 1) as usize * 256);
                     let grid = IQ3S_GRID[grid_idx];
 
                     for i in 0..4 {
@@ -1473,11 +1479,7 @@ pub fn dequantize_iq2s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                     let q_idx = qs_offset + 2 * il + j;
 
                     // Build 10-bit grid index: qs[i] | ((qh << shift) & 0x300)
-                    let qh_shift = if il == 0 {
-                        8 - 2 * j
-                    } else {
-                        4 - 2 * j
-                    };
+                    let qh_shift = if il == 0 { 8 - 2 * j } else { 4 - 2 * j };
                     let high_bits = ((qh_byte as usize) << qh_shift) & 0x300;
                     let grid_idx = (qs[q_idx] as usize) | high_bits;
 
@@ -1618,10 +1620,7 @@ pub fn dequantize_iq1m_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 
         // Extract d from HIGH nibbles (bits [15:12]) of each u16
         // Reference: d = (scales & 0xF000) >> [12, 8, 4, 0]
-        let d_bits = ((sc3 >> 12) << 12)
-            | ((sc2 >> 12) << 8)
-            | ((sc1 >> 12) << 4)
-            | (sc0 >> 12);
+        let d_bits = ((sc3 >> 12) << 12) | ((sc2 >> 12) << 8) | ((sc1 >> 12) << 4) | (sc0 >> 12);
         let d = f16::from_bits(d_bits as u16).to_f32();
 
         // Pre-extract all 16 3-bit scale values from the four u16s
@@ -2187,12 +2186,15 @@ mod tests {
         let sc2 = u16::from_le_bytes([data[52], data[53]]);
         let sc3 = u16::from_le_bytes([data[54], data[55]]);
 
-        let d_bits =
-            ((sc3 >> 12) << 12) | ((sc2 >> 12) << 8) | ((sc1 >> 12) << 4) | (sc0 >> 12);
+        let d_bits = ((sc3 >> 12) << 12) | ((sc2 >> 12) << 8) | ((sc1 >> 12) << 4) | (sc0 >> 12);
         assert_eq!(d_bits, 0x3800, "d_bits extraction failed");
 
         let d = f16::from_bits(d_bits as u16).to_f32();
-        assert!((d - 0.5).abs() < 1e-4, "d extraction: expected 0.5, got {}", d);
+        assert!(
+            (d - 0.5).abs() < 1e-4,
+            "d extraction: expected 0.5, got {}",
+            d
+        );
 
         // Now verify full dequantization
         let result = dequantize_iq1m_bytes(&data, 8);
@@ -2489,7 +2491,10 @@ mod tests {
             assert_eq!(result.len(), 256);
             // Output should be tiny but valid
             for &val in &result {
-                assert!(val.abs() < 1e-3, "Subnormal scale should produce tiny output");
+                assert!(
+                    val.abs() < 1e-3,
+                    "Subnormal scale should produce tiny output"
+                );
             }
         }
 
@@ -2514,8 +2519,11 @@ mod tests {
             // Second block values should be ~2x first block values
             // (both have same grid indices, just different scales)
             let ratio = result[256].abs() / result[0].abs();
-            assert!((ratio - 2.0).abs() < 0.1 || result[0] == 0.0,
-                "Multi-block scale ratio should be ~2.0, got {}", ratio);
+            assert!(
+                (ratio - 2.0).abs() < 0.1 || result[0] == 0.0,
+                "Multi-block scale ratio should be ~2.0, got {}",
+                ratio
+            );
         }
     }
 }

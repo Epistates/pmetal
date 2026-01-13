@@ -48,8 +48,8 @@ pub unsafe fn metal_buffer_from_ptr<T: Pod + Zeroable>(
 ) -> Result<MetalBufferView<T>> {
     let size = len * std::mem::size_of::<T>();
 
-    let ptr_void = NonNull::new(ptr as *mut std::ffi::c_void)
-        .ok_or_else(|| MetalError::BufferCreation {
+    let ptr_void =
+        NonNull::new(ptr as *mut std::ffi::c_void).ok_or_else(|| MetalError::BufferCreation {
             size,
             reason: "Null pointer".to_string(),
         })?;
@@ -57,8 +57,8 @@ pub unsafe fn metal_buffer_from_ptr<T: Pod + Zeroable>(
     // Create buffer without copy - wraps existing memory
     // StorageModeShared: Required for unified memory (CPU + GPU access)
     // HazardTrackingModeTracked: Metal tracks read/write hazards automatically
-    let options = MTLResourceOptions::StorageModeShared
-        | MTLResourceOptions::HazardTrackingModeTracked;
+    let options =
+        MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeTracked;
 
     // SAFETY (internal):
     // 1. ptr_void is non-null (checked above)
@@ -69,12 +69,7 @@ pub unsafe fn metal_buffer_from_ptr<T: Pod + Zeroable>(
     // 5. The Pod + Zeroable bounds ensure T has no padding or invariants
     let buffer = ctx
         .device()
-        .newBufferWithBytesNoCopy_length_options_deallocator(
-            ptr_void,
-            size,
-            options,
-            None,
-        )
+        .newBufferWithBytesNoCopy_length_options_deallocator(ptr_void, size, options, None)
         .ok_or_else(|| MetalError::BufferCreation {
             size,
             reason: "Failed to create buffer view".to_string(),
@@ -168,9 +163,7 @@ mod tests {
         let mut data = vec![1.0f32, 2.0, 3.0, 4.0];
 
         // Create a view (unsafe - we know the data is valid)
-        let view = unsafe {
-            metal_buffer_from_ptr(&ctx, data.as_mut_ptr(), data.len())
-        }.unwrap();
+        let view = unsafe { metal_buffer_from_ptr(&ctx, data.as_mut_ptr(), data.len()) }.unwrap();
 
         assert_eq!(view.len(), 4);
         assert_eq!(view.size_bytes(), 16);

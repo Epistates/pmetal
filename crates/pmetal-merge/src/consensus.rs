@@ -3,9 +3,9 @@
 //! Sign consensus is a key component of TIES-Merging that reduces interference
 //! by only keeping parameters where the models agree on the direction of change.
 
-use mlx_rs::Array;
-use mlx_rs::ops::sign;
 use crate::Result;
+use mlx_rs::ops::sign;
+use mlx_rs::Array;
 
 /// Compute sign consensus mask across multiple tensors.
 ///

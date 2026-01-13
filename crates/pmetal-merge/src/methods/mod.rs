@@ -2,24 +2,24 @@
 //!
 //! Each merge method implements a different algorithm for combining model weights.
 
-mod linear;
-mod slerp;
-mod ties;
 mod dare;
+mod linear;
 mod model_stock;
 mod passthrough;
+mod slerp;
 mod task_arithmetic;
+mod ties;
 
-pub use linear::LinearMerge;
-pub use slerp::SlerpMerge;
-pub use ties::TiesMerge;
 pub use dare::DareMerge;
+pub use linear::LinearMerge;
 pub use model_stock::ModelStockMerge;
 pub use passthrough::PassthroughMerge;
+pub use slerp::SlerpMerge;
 pub use task_arithmetic::TaskArithmeticMerge;
+pub use ties::TiesMerge;
 
-use mlx_rs::Array;
 use crate::{MergeParameters, Result};
+use mlx_rs::Array;
 
 /// Trait for merge method implementations.
 pub trait MergeMethod: Send + Sync {

@@ -70,7 +70,8 @@ impl Tokenizer {
     /// Tries common pad token names, falls back to EOS token.
     pub fn pad_token_id(&self) -> Option<u32> {
         // Try common pad token names
-        self.inner.token_to_id("<pad>")
+        self.inner
+            .token_to_id("<pad>")
             .or_else(|| self.inner.token_to_id("[PAD]"))
             .or_else(|| self.inner.token_to_id("<|pad|>"))
             .or_else(|| self.inner.token_to_id("<|finetune_right_pad_id|>"))
@@ -82,7 +83,8 @@ impl Tokenizer {
 
     /// Get EOS token ID if available.
     pub fn eos_token_id(&self) -> Option<u32> {
-        self.inner.token_to_id("</s>")
+        self.inner
+            .token_to_id("</s>")
             .or_else(|| self.inner.token_to_id("<|endoftext|>"))
             .or_else(|| self.inner.token_to_id("<|end_of_text|>"))
             .or_else(|| self.inner.token_to_id("<eos>"))
@@ -90,7 +92,8 @@ impl Tokenizer {
 
     /// Get BOS token ID if available.
     pub fn bos_token_id(&self) -> Option<u32> {
-        self.inner.token_to_id("<s>")
+        self.inner
+            .token_to_id("<s>")
             .or_else(|| self.inner.token_to_id("<|begin_of_text|>"))
             .or_else(|| self.inner.token_to_id("<bos>"))
     }

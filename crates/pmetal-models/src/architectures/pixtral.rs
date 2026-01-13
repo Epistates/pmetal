@@ -12,11 +12,7 @@
 //!
 //! - Reference: <https://mistral.ai/news/pixtral-12b/>
 
-use mlx_rs::{
-    error::Exception,
-    macros::ModuleParameters,
-    Array,
-};
+use mlx_rs::{error::Exception, macros::ModuleParameters, Array};
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::mistral::{MistralConfig, MistralForCausalLM};
@@ -79,9 +75,15 @@ pub struct PixtralConfig {
     pub image_end_token_id: i32,
 }
 
-fn default_image_token_id() -> i32 { 10 }
-fn default_image_break_id() -> i32 { 12 }
-fn default_image_end_id() -> i32 { 13 }
+fn default_image_token_id() -> i32 {
+    10
+}
+fn default_image_break_id() -> i32 {
+    12
+}
+fn default_image_end_id() -> i32 {
+    13
+}
 
 impl Default for PixtralConfig {
     fn default() -> Self {
@@ -162,7 +164,10 @@ impl Pixtral {
     /// Create a new Pixtral model.
     pub fn new(config: PixtralConfig) -> Result<Self, Exception> {
         let language_model = MistralForCausalLM::new(config.text_config.clone())?;
-        Ok(Self { language_model, config })
+        Ok(Self {
+            language_model,
+            config,
+        })
     }
 
     /// Forward pass with optional pre-computed vision embeddings.

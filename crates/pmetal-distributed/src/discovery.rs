@@ -287,7 +287,9 @@ impl DiscoveryService {
         ));
 
         // Create ping behaviour
-        let ping = ping::Behaviour::new(ping::Config::new().with_interval(Duration::from_secs(PING_INTERVAL_SECS)));
+        let ping = ping::Behaviour::new(
+            ping::Config::new().with_interval(Duration::from_secs(PING_INTERVAL_SECS)),
+        );
 
         let swarm = SwarmBuilder::with_existing_identity(self.identity.keypair().clone())
             .with_tokio()

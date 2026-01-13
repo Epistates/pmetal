@@ -50,13 +50,17 @@ impl MergeMethod for TaskArithmeticMerge {
         })?;
 
         if tensors.is_empty() {
-             return Err(MergeError::InvalidConfig("Task Arithmetic requires at least one fine-tuned model".into()));
+            return Err(MergeError::InvalidConfig(
+                "Task Arithmetic requires at least one fine-tuned model".into(),
+            ));
         }
 
         // Helper to get weight for model i
         let get_weight = |i: usize| -> f32 {
             // Priority: per-model weight -> global weight -> 1.0
-            params.get(i).and_then(|p| p.weight)
+            params
+                .get(i)
+                .and_then(|p| p.weight)
                 .or(global_params.weight)
                 .unwrap_or(1.0)
         };
@@ -70,14 +74,14 @@ impl MergeMethod for TaskArithmeticMerge {
 
         for (i, model_tensor) in tensors.iter().enumerate() {
             let weight = get_weight(i);
-            
+
             // Task vector = Model - Base
             let task_vector = model_tensor.subtract(base)?;
-            
+
             // Weighted task vector
             let weight_arr = Array::from_f32(weight);
             let weighted_task = task_vector.multiply(&weight_arr)?;
-            
+
             // Accumulate
             accumulated_task_vector = accumulated_task_vector.add(&weighted_task)?;
         }

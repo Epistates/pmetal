@@ -4,8 +4,8 @@ use crate::{
     GgmlType, MetadataValue, MetadataValueType, TensorInfo, GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC,
     GGUF_VERSION,
 };
-use pmetal_core::Result;
 use byteorder::{LittleEndian, WriteBytesExt};
+use pmetal_core::Result;
 use std::collections::BTreeMap;
 use std::io::{Seek, Write};
 
@@ -143,10 +143,7 @@ impl GgufBuilder {
     ) -> &mut Self {
         let info = TensorInfo::new(name, dimensions, GgmlType::F16);
         // Convert f16 to bytes (little-endian)
-        let bytes: Vec<u8> = data
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
         self.tensors.push((info, bytes));
         self
     }
@@ -159,10 +156,7 @@ impl GgufBuilder {
         data: Vec<half::bf16>,
     ) -> &mut Self {
         let info = TensorInfo::new(name, dimensions, GgmlType::Bf16);
-        let bytes: Vec<u8> = data
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
         self.tensors.push((info, bytes));
         self
     }
@@ -224,10 +218,7 @@ impl GgufBuilder {
                 let padding = align_offset(current_pos, self.alignment as u64) - current_pos;
                 for _ in 0..padding {
                     writer.write_u8(0).map_err(|e| {
-                        pmetal_core::PMetalError::Io(std::io::Error::new(
-                            e.kind(),
-                            e.to_string(),
-                        ))
+                        pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
                     })?;
                 }
             }
@@ -340,19 +331,13 @@ impl GgufBuilder {
                 writer
                     .write_u32::<LittleEndian>(elem_type as u32)
                     .map_err(|e| {
-                        pmetal_core::PMetalError::Io(std::io::Error::new(
-                            e.kind(),
-                            e.to_string(),
-                        ))
+                        pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
                     })?;
                 // Write array length
                 writer
                     .write_u64::<LittleEndian>(arr.len() as u64)
                     .map_err(|e| {
-                        pmetal_core::PMetalError::Io(std::io::Error::new(
-                            e.kind(),
-                            e.to_string(),
-                        ))
+                        pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
                     })?;
                 // Write array elements (without type prefix)
                 for elem in arr {
@@ -437,11 +422,9 @@ impl GgufBuilder {
                 pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
             })?;
         // Offset
-        writer
-            .write_u64::<LittleEndian>(info.offset)
-            .map_err(|e| {
-                pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
-            })?;
+        writer.write_u64::<LittleEndian>(info.offset).map_err(|e| {
+            pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
+        })?;
         Ok(())
     }
 
@@ -497,7 +480,11 @@ mod tests {
     #[test]
     fn test_gguf_tensor() {
         let mut builder = GgufBuilder::with_model("llama", "test-model");
-        builder.add_f32_tensor("test.weight", vec![2, 3], vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        builder.add_f32_tensor(
+            "test.weight",
+            vec![2, 3],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        );
 
         let bytes = builder.build_to_bytes().unwrap();
         assert!(!bytes.is_empty());

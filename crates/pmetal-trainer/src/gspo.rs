@@ -211,9 +211,7 @@ impl GspoConfig {
             return Err(GspoError::Config("temperature must be positive".into()));
         }
         if self.advantage_clip <= 0.0 {
-            return Err(GspoError::Config(
-                "advantage_clip must be positive".into(),
-            ));
+            return Err(GspoError::Config("advantage_clip must be positive".into()));
         }
         Ok(())
     }
@@ -298,7 +296,10 @@ impl GspoGroup {
 
     /// Get rewards as a vector.
     pub fn rewards(&self) -> Vec<f64> {
-        self.completions.iter().map(|c| c.normalized_reward).collect()
+        self.completions
+            .iter()
+            .map(|c| c.normalized_reward)
+            .collect()
     }
 
     /// Compute mean reward.
@@ -400,8 +401,7 @@ impl GspoTrainer {
             for completion in &mut group.completions {
                 let effective_len = completion.len().max(self.config.min_length_for_norm);
                 // Normalize by sqrt of length (balances length bias without over-correcting)
-                completion.normalized_reward =
-                    completion.reward / (effective_len as f64).sqrt();
+                completion.normalized_reward = completion.reward / (effective_len as f64).sqrt();
             }
         }
     }
@@ -460,10 +460,8 @@ impl GspoTrainer {
 
                 // Clip advantages
                 if self.config.clip_advantages {
-                    advantage = advantage.clamp(
-                        -self.config.advantage_clip,
-                        self.config.advantage_clip,
-                    );
+                    advantage =
+                        advantage.clamp(-self.config.advantage_clip, self.config.advantage_clip);
                 }
 
                 // Apply quality weighting if enabled
@@ -510,9 +508,7 @@ impl GspoTrainer {
         // Compute per-token loss with advantage
         // Key insight: we DON'T normalize per sequence, we treat all tokens equally
         let adv_expanded = advantages.reshape(&[advantages.dim(0), 1])?;
-        let per_token_loss = per_token_policy_logps
-            .negative()?
-            .multiply(&adv_expanded)?;
+        let per_token_loss = per_token_policy_logps.negative()?.multiply(&adv_expanded)?;
 
         // Apply mask and compute mean over ALL tokens (equal weighting)
         let masked_loss = per_token_loss.multiply(mask)?;
@@ -566,9 +562,7 @@ impl GspoTrainer {
 
         // Per-token loss with advantage
         let adv_expanded = advantages.reshape(&[advantages.dim(0), 1])?;
-        let per_token_loss = per_token_policy_logps
-            .negative()?
-            .multiply(&adv_expanded)?;
+        let per_token_loss = per_token_policy_logps.negative()?.multiply(&adv_expanded)?;
 
         // Apply weighted mask
         let weighted_loss = per_token_loss.multiply(&weighted_mask)?;
@@ -635,30 +629,24 @@ impl GspoTrainer {
         mask: &Array,
     ) -> GspoResult<(Array, Array)> {
         match self.config.token_weighting {
-            TokenWeighting::Equal => {
-                self.compute_equal_weighted_loss(
-                    per_token_policy_logps,
-                    per_token_ref_logps,
-                    advantages,
-                    mask,
-                )
-            }
-            TokenWeighting::PositionalDecay => {
-                self.compute_positional_weighted_loss(
-                    per_token_policy_logps,
-                    per_token_ref_logps,
-                    advantages,
-                    mask,
-                )
-            }
-            TokenWeighting::PerSequence => {
-                self.compute_sequence_weighted_loss(
-                    per_token_policy_logps,
-                    per_token_ref_logps,
-                    advantages,
-                    mask,
-                )
-            }
+            TokenWeighting::Equal => self.compute_equal_weighted_loss(
+                per_token_policy_logps,
+                per_token_ref_logps,
+                advantages,
+                mask,
+            ),
+            TokenWeighting::PositionalDecay => self.compute_positional_weighted_loss(
+                per_token_policy_logps,
+                per_token_ref_logps,
+                advantages,
+                mask,
+            ),
+            TokenWeighting::PerSequence => self.compute_sequence_weighted_loss(
+                per_token_policy_logps,
+                per_token_ref_logps,
+                advantages,
+                mask,
+            ),
             TokenWeighting::AttentionBased => {
                 // Fall back to equal weighting if attention weights not available
                 self.compute_equal_weighted_loss(
@@ -857,11 +845,7 @@ mod tests {
 
         // Mean = 2.0
         // Advantages: 1-2=-1, 3-2=1, 2-2=0
-        let advs: Vec<f64> = groups[0]
-            .completions
-            .iter()
-            .map(|c| c.advantage)
-            .collect();
+        let advs: Vec<f64> = groups[0].completions.iter().map(|c| c.advantage).collect();
 
         assert!((advs[0] - (-1.0)).abs() < 0.01);
         assert!((advs[1] - 1.0).abs() < 0.01);
@@ -896,14 +880,8 @@ mod tests {
         };
         let trainer = GspoTrainer::new(config).unwrap();
 
-        let policy_logps = Array::from_slice(
-            &[-1.0f32, -1.0, -1.0, -1.0, -1.0, -1.0],
-            &[2, 3],
-        );
-        let ref_logps = Array::from_slice(
-            &[-1.0f32, -1.0, -1.0, -1.0, -1.0, -1.0],
-            &[2, 3],
-        );
+        let policy_logps = Array::from_slice(&[-1.0f32, -1.0, -1.0, -1.0, -1.0, -1.0], &[2, 3]);
+        let ref_logps = Array::from_slice(&[-1.0f32, -1.0, -1.0, -1.0, -1.0, -1.0], &[2, 3]);
         let advantages = Array::from_slice(&[1.0f32, -1.0], &[2]);
         // Different length sequences: [3 tokens, 2 tokens]
         let mask = Array::from_slice(&[1.0f32, 1.0, 1.0, 1.0, 1.0, 0.0], &[2, 3]);

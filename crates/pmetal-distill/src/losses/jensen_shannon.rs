@@ -15,18 +15,18 @@
 //! zero-copy bridging to pass MLX array data directly to Metal kernels without
 //! copying, providing significant performance improvements for large tensors.
 
-use mlx_rs::Array;
+use super::{softmax, DistillLoss};
 use crate::Result;
-use super::{DistillLoss, softmax};
+use mlx_rs::Array;
 
 #[cfg(feature = "metal")]
 use std::sync::Arc;
 
 #[cfg(feature = "metal")]
 use pmetal_metal::{
-    context::MetalContext,
     bridge::metal_buffer_from_ptr,
-    kernels::{FusedDistill, FusedDistillConfig, DistillLossType as MetalDistillLossType},
+    context::MetalContext,
+    kernels::{DistillLossType as MetalDistillLossType, FusedDistill, FusedDistillConfig},
 };
 
 /// Jensen-Shannon Divergence loss for knowledge distillation.
@@ -87,20 +87,24 @@ impl JensenShannonLoss {
         student_logits: &Array,
         temperature: f32,
     ) -> Result<Array> {
-        let ctx = self.ctx.as_ref().ok_or_else(|| {
-            crate::DistillError::Metal("Metal context not available".to_string())
-        })?;
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| crate::DistillError::Metal("Metal context not available".to_string()))?;
 
         let shape = teacher_logits.shape();
         if shape.len() < 2 {
             return Err(crate::DistillError::Other(
-                "Logits must have at least 2 dimensions".to_string()
+                "Logits must have at least 2 dimensions".to_string(),
             ));
         }
 
         // Get dimensions - handle both [batch, seq, vocab] and [tokens, vocab]
         let vocab_size = shape[shape.len() - 1] as usize;
-        let num_tokens: usize = shape[..shape.len() - 1].iter().map(|&d| d as usize).product();
+        let num_tokens: usize = shape[..shape.len() - 1]
+            .iter()
+            .map(|&d| d as usize)
+            .product();
         let total_elements = num_tokens * vocab_size;
 
         // Flatten to [num_tokens, vocab] for Metal kernel
@@ -134,14 +138,18 @@ impl JensenShannonLoss {
         };
 
         // Configure kernel with automatic SIMD selection for large vocabularies
-        let config = FusedDistillConfig::new(num_tokens, vocab_size)
-            .with_temperature(temperature);
+        let config = FusedDistillConfig::new(num_tokens, vocab_size).with_temperature(temperature);
 
         let kernel = FusedDistill::new(ctx.clone(), config)
             .map_err(|e| crate::DistillError::Metal(format!("Kernel error: {}", e)))?;
 
         // Execute kernel with zero-copy buffer views
-        let output = kernel.forward(&teacher_view, &student_view, MetalDistillLossType::JensenShannon)
+        let output = kernel
+            .forward(
+                &teacher_view,
+                &student_view,
+                MetalDistillLossType::JensenShannon,
+            )
             .map_err(|e| crate::DistillError::Metal(format!("Execution error: {}", e)))?;
 
         // Return mean loss
@@ -237,7 +245,11 @@ mod tests {
         let value: f32 = result.item();
 
         // JS of identical distributions should be 0
-        assert!(value.abs() < 1e-4, "JS of identical distributions should be ~0, got {}", value);
+        assert!(
+            value.abs() < 1e-4,
+            "JS of identical distributions should be ~0, got {}",
+            value
+        );
     }
 
     #[test]
@@ -253,7 +265,12 @@ mod tests {
         let v_qp: f32 = js_qp.item();
 
         // JS should be symmetric
-        assert!((v_pq - v_qp).abs() < 1e-4, "JS should be symmetric: JS(P||Q)={}, JS(Q||P)={}", v_pq, v_qp);
+        assert!(
+            (v_pq - v_qp).abs() < 1e-4,
+            "JS should be symmetric: JS(P||Q)={}, JS(Q||P)={}",
+            v_pq,
+            v_qp
+        );
     }
 
     #[test]
@@ -267,7 +284,12 @@ mod tests {
         let value: f32 = result.item();
 
         let ln2 = 2.0_f32.ln();
-        assert!(value <= ln2 + 1e-4, "JS should be bounded by ln(2)={}, got {}", ln2, value);
+        assert!(
+            value <= ln2 + 1e-4,
+            "JS should be bounded by ln(2)={}, got {}",
+            ln2,
+            value
+        );
         assert!(value >= 0.0, "JS should be non-negative, got {}", value);
     }
 
@@ -285,7 +307,12 @@ mod tests {
         let v1: f32 = js_t1.item();
         let v2: f32 = js_t2.item();
 
-        assert!(v2 < v1, "Higher temp should reduce JS: T=1: {}, T=2: {}", v1, v2);
+        assert!(
+            v2 < v1,
+            "Higher temp should reduce JS: T=1: {}, T=2: {}",
+            v1,
+            v2
+        );
     }
 
     #[cfg(feature = "metal")]
@@ -309,8 +336,14 @@ mod tests {
             .map(|i| ((i * 7 % 100) as f32 - 50.0) / 10.0)
             .collect();
 
-        let teacher = Array::from_slice(&teacher_data, &[batch_size as i32, seq_len as i32, vocab_size as i32]);
-        let student = Array::from_slice(&student_data, &[batch_size as i32, seq_len as i32, vocab_size as i32]);
+        let teacher = Array::from_slice(
+            &teacher_data,
+            &[batch_size as i32, seq_len as i32, vocab_size as i32],
+        );
+        let student = Array::from_slice(
+            &student_data,
+            &[batch_size as i32, seq_len as i32, vocab_size as i32],
+        );
 
         let loss = JensenShannonLoss::new();
         let result = loss.compute(&teacher, &student, 2.0).unwrap();

@@ -6,9 +6,6 @@
 //! - LoRA parameter updates
 //! - Checkpoint saving
 
-use pmetal_core::{EvalMetrics, TrainingConfig};
-use pmetal_lora::LoraLinear;
-use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 use mlx_rs::{
     builder::Builder,
     error::Exception,
@@ -16,6 +13,9 @@ use mlx_rs::{
     optimizers::{AdamW, AdamWBuilder},
     Array,
 };
+use pmetal_core::{EvalMetrics, TrainingConfig};
+use pmetal_lora::LoraLinear;
+use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 use std::path::Path;
 
 /// Error type for SFT training.
@@ -159,10 +159,8 @@ impl SftTrainer {
         forward_fn: impl Fn(&[&LoraLinear], &Array) -> Result<Array>,
     ) -> Result<f64> {
         // Collect LoRA parameters for gradient computation
-        let _lora_params: Vec<(&Array, &Array)> = lora_layers
-            .iter()
-            .map(|l| (&l.lora_a, &l.lora_b))
-            .collect();
+        let _lora_params: Vec<(&Array, &Array)> =
+            lora_layers.iter().map(|l| (&l.lora_a, &l.lora_b)).collect();
 
         // Forward pass
         let lora_refs: Vec<&LoraLinear> = lora_layers.iter().map(|l| &**l).collect();

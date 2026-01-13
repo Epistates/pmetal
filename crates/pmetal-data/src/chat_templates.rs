@@ -5,7 +5,6 @@
 //! - Response masking support (identifying which tokens to train on)
 //! - System message customization
 
-
 /// A single message in a conversation.
 #[derive(Debug, Clone)]
 pub struct Message {
@@ -149,7 +148,10 @@ impl ChatTemplate {
             default_system_message: None,
             bos_token: template_type.bos_token().map(String::from),
             eos_token: template_type.eos_token().to_string(),
-            add_bos: matches!(template_type, ChatTemplateType::Llama2 | ChatTemplateType::Llama3),
+            add_bos: matches!(
+                template_type,
+                ChatTemplateType::Llama2 | ChatTemplateType::Llama3
+            ),
             add_eos: true,
         }
     }
@@ -189,8 +191,9 @@ impl ChatTemplate {
     /// Create a Qwen template.
     pub fn qwen() -> Self {
         let mut template = Self::new(ChatTemplateType::Qwen);
-        template.default_system_message =
-            Some("You are Qwen, created by Alibaba Cloud. You are a helpful assistant.".to_string());
+        template.default_system_message = Some(
+            "You are Qwen, created by Alibaba Cloud. You are a helpful assistant.".to_string(),
+        );
         template
     }
 
@@ -562,7 +565,10 @@ impl ChatTemplate {
         let mut response_start = 0;
 
         for (i, msg) in messages.iter().enumerate() {
-            let formatted = format!("<|im_start|>{}<|im_sep|>{}<|im_end|>", msg.role, msg.content);
+            let formatted = format!(
+                "<|im_start|>{}<|im_sep|>{}<|im_end|>",
+                msg.role, msg.content
+            );
 
             if msg.role == "assistant" && i == messages.len() - 1 {
                 let header = format!("<|im_start|>{}<|im_sep|>", msg.role);
@@ -833,7 +839,10 @@ pub fn detect_template_from_model(model_name: &str) -> ChatTemplate {
         ChatTemplate::gemma()
     } else if name_lower.contains("phi-4") || name_lower.contains("phi4") {
         ChatTemplate::new(ChatTemplateType::Phi4)
-    } else if name_lower.contains("phi-3") || name_lower.contains("phi3") || name_lower.contains("phi") {
+    } else if name_lower.contains("phi-3")
+        || name_lower.contains("phi3")
+        || name_lower.contains("phi")
+    {
         ChatTemplate::phi3()
     } else if name_lower.contains("qwen") {
         ChatTemplate::qwen()
@@ -931,17 +940,16 @@ mod tests {
 
         let formatted = template.apply(&messages);
         assert!(formatted.text.contains("<|begin_of_text|>"));
-        assert!(formatted.text.contains("<|start_header_id|>user<|end_header_id|>"));
+        assert!(formatted
+            .text
+            .contains("<|start_header_id|>user<|end_header_id|>"));
         assert!(formatted.text.contains("<|eot_id|>"));
     }
 
     #[test]
     fn test_response_masking() {
         let template = ChatTemplate::chatml();
-        let messages = vec![
-            Message::user("Hello"),
-            Message::assistant("Hi there!"),
-        ];
+        let messages = vec![Message::user("Hello"), Message::assistant("Hi there!")];
 
         let formatted = template.apply(&messages);
 
@@ -1041,7 +1049,9 @@ mod tests {
 
         // Check Harmony format tokens
         assert!(formatted.text.contains("<|start|>user<|message|>"));
-        assert!(formatted.text.contains("<|start|>assistant<|channel|>final<|message|>"));
+        assert!(formatted
+            .text
+            .contains("<|start|>assistant<|channel|>final<|message|>"));
         assert!(formatted.text.contains("<|end|>"));
         assert!(formatted.text.contains("<|return|>"));
 
@@ -1120,9 +1130,14 @@ mod tests {
         let formatted = template.apply(&messages);
 
         // Last message is user, so should add assistant header for training
-        assert!(formatted.text.contains("<|start|>assistant<|channel|>final<|message|>"));
+        assert!(formatted
+            .text
+            .contains("<|start|>assistant<|channel|>final<|message|>"));
 
         // Response start should be at the end, ready for model to generate
-        assert_eq!(formatted.response_start, formatted.text.len() - "<|return|>".len());
+        assert_eq!(
+            formatted.response_start,
+            formatted.text.len() - "<|return|>".len()
+        );
     }
 }

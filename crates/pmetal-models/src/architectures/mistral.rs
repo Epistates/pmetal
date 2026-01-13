@@ -8,19 +8,14 @@
 
 use std::collections::HashMap;
 
-use pmetal_mlx::kernels::{fused_sdpa, AttentionMaskType, FusedAttentionConfig, rope::apply_rope};
-use pmetal_mlx::kv_cache::KVCache;
 use mlx_rs::{
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::Module,
-    nn,
-    Array,
+    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn, Array,
 };
+use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
+use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
-use crate::traits::{ModelConfig, CausalLMModel};
+use crate::traits::{CausalLMModel, ModelConfig};
 
 /// Mistral model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -469,11 +464,7 @@ impl MistralModel {
         // Pass through transformer layers
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             let c = cache.as_deref_mut().map(|c| (c, idx));
-            hidden_states = layer.forward_with_cache(
-                &hidden_states,
-                mask.as_ref(),
-                c,
-            )?;
+            hidden_states = layer.forward_with_cache(&hidden_states, mask.as_ref(), c)?;
         }
 
         // Final norm
@@ -607,7 +598,8 @@ impl CausalLMModel for MistralForCausalLM {
     }
 
     fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception> {
-        crate::loader::load_mistral_weights(self, weights).map_err(|e| Exception::custom(e.to_string()))
+        crate::loader::load_mistral_weights(self, weights)
+            .map_err(|e| Exception::custom(e.to_string()))
     }
 
     fn eval(&self) -> Result<(), Exception> {
@@ -760,14 +752,18 @@ mod tests {
 
         // First forward (prompt)
         let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
-        let logits = model.forward_with_cache(&input_ids, None, Some(&mut cache)).unwrap();
+        let logits = model
+            .forward_with_cache(&input_ids, None, Some(&mut cache))
+            .unwrap();
         logits.eval().unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]);
 
         // Second forward (incremental)
         let next_token = mlx_rs::Array::from_slice(&[5_i32], &[1, 1]);
-        let logits = model.forward_with_cache(&next_token, None, Some(&mut cache)).unwrap();
+        let logits = model
+            .forward_with_cache(&next_token, None, Some(&mut cache))
+            .unwrap();
         logits.eval().unwrap();
 
         assert_eq!(logits.shape(), &[1, 1, 1000]);

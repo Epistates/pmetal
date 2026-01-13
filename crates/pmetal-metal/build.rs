@@ -84,10 +84,7 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path) {
             .expect("Failed to run Metal compiler");
 
         if !status.success() {
-            panic!(
-                "Failed to compile Metal shader: {}",
-                metal_file.display()
-            );
+            panic!("Failed to compile Metal shader: {}", metal_file.display());
         }
 
         air_files.push(air_file);

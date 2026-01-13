@@ -8,16 +8,16 @@
 //! NOTE: These tests must run serially due to Metal's single-threaded
 //! command buffer model. Parallel execution causes command encoder conflicts.
 
+use mlx_rs::optimizers::Sgd;
+use mlx_rs::Array;
 use pmetal_core::{LoraConfig, TrainingConfig};
-use serial_test::serial;
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
 use pmetal_lora::Qwen3LoraForCausalLM;
 use pmetal_models::architectures::qwen3::Qwen3Config;
 use pmetal_trainer::{
-    forward_process_gpu, diffusion_loss_gpu, DiffusionConfig, DiffusionTrainingLoop,
+    diffusion_loss_gpu, forward_process_gpu, DiffusionConfig, DiffusionTrainingLoop,
 };
-use mlx_rs::Array;
-use mlx_rs::optimizers::Sgd;
+use serial_test::serial;
 
 fn small_qwen3_config() -> Qwen3Config {
     Qwen3Config {
@@ -97,8 +97,8 @@ fn test_forward_process_gpu() {
 fn test_diffusion_loss_gpu() {
     // Test GPU-native diffusion loss
     // Create dummy logits: [batch=1, seq_len=4, vocab_size=8]
-    let logits = mlx_rs::random::normal::<f32>(&[1, 4, 8], None, None, None)
-        .expect("Random logits");
+    let logits =
+        mlx_rs::random::normal::<f32>(&[1, 4, 8], None, None, None).expect("Random logits");
 
     // Create targets: [batch=1, seq_len=4]
     let targets = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
@@ -173,7 +173,7 @@ fn test_diffusion_training_step() {
             pad_token_id: 0,
             ..Default::default()
         },
-    None,
+        None,
     );
 
     let batch = dataloader.next_batch().expect("Should have a batch");
@@ -187,7 +187,11 @@ fn test_diffusion_training_step() {
         .expect("Diffusion training step should succeed");
 
     // Verify stats
-    assert!(stats.loss > 0.0, "Loss should be positive, got {}", stats.loss);
+    assert!(
+        stats.loss > 0.0,
+        "Loss should be positive, got {}",
+        stats.loss
+    );
     assert_eq!(stats.step, 1, "Step should be 1");
     assert!(stats.tokens > 0, "Tokens processed should be positive");
     assert!(stats.noise_level > 0.0, "Noise level should be positive");
@@ -231,7 +235,7 @@ fn test_diffusion_training_multiple_steps() {
             pad_token_id: 0,
             ..Default::default()
         },
-    None,
+        None,
     );
 
     let mut optimizer = Sgd::new(1e-4);
@@ -285,7 +289,7 @@ fn test_diffusion_gradient_accumulation() {
             pad_token_id: 0,
             ..Default::default()
         },
-    None,
+        None,
     );
 
     let mut optimizer = Sgd::new(1e-4);
@@ -295,14 +299,20 @@ fn test_diffusion_gradient_accumulation() {
     let stats1 = training_loop
         .train_step(&mut model, &batch1, &mut optimizer)
         .expect("Step 1 should succeed");
-    assert!(stats1.grad_norm.is_none(), "First step should not apply gradients");
+    assert!(
+        stats1.grad_norm.is_none(),
+        "First step should not apply gradients"
+    );
 
     // Second step: should apply accumulated gradients
     let batch2 = dataloader.next_batch().expect("Batch 2");
     let stats2 = training_loop
         .train_step(&mut model, &batch2, &mut optimizer)
         .expect("Step 2 should succeed");
-    assert!(stats2.grad_norm.is_some(), "Second step should apply gradients");
+    assert!(
+        stats2.grad_norm.is_some(),
+        "Second step should apply gradients"
+    );
 }
 
 #[test]
@@ -332,22 +342,26 @@ fn test_noise_schedules() {
 #[serial]
 fn test_elbo_weighting() {
     // Test that ELBO weighting increases loss at low noise levels
-    let logits = mlx_rs::random::normal::<f32>(&[1, 4, 8], None, None, None)
-        .expect("Random logits");
+    let logits =
+        mlx_rs::random::normal::<f32>(&[1, 4, 8], None, None, None).expect("Random logits");
     let targets = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
     let mask = Array::from_slice(&[true, true, true, true], &[1, 4]);
 
     // Loss at t=0.5 without ELBO
-    let loss_no_elbo = diffusion_loss_gpu(&logits, &targets, &mask, 0.5, false, -100)
-        .expect("Loss without ELBO");
+    let loss_no_elbo =
+        diffusion_loss_gpu(&logits, &targets, &mask, 0.5, false, -100).expect("Loss without ELBO");
     loss_no_elbo.eval().expect("Eval");
 
     // Loss at t=0.5 with ELBO (should be ~2x higher due to 1/t weighting)
-    let loss_elbo = diffusion_loss_gpu(&logits, &targets, &mask, 0.5, true, -100)
-        .expect("Loss with ELBO");
+    let loss_elbo =
+        diffusion_loss_gpu(&logits, &targets, &mask, 0.5, true, -100).expect("Loss with ELBO");
     loss_elbo.eval().expect("Eval");
 
     let ratio = loss_elbo.item::<f32>() / loss_no_elbo.item::<f32>();
     // ELBO weighting at t=0.5 should multiply loss by 1/0.5 = 2
-    assert!((ratio - 2.0).abs() < 0.1, "ELBO ratio should be ~2, got {}", ratio);
+    assert!(
+        (ratio - 2.0).abs() < 0.1,
+        "ELBO ratio should be ~2, got {}",
+        ratio
+    );
 }

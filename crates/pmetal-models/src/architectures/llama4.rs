@@ -87,17 +87,39 @@ pub struct Llama4TextConfig {
     pub router_aux_loss_coef: f32,
 }
 
-fn default_intermediate_size_mlp() -> i32 { 16384 }
-fn default_num_experts_per_tok() -> i32 { 1 }
-fn default_num_local_experts() -> i32 { 16 }
-fn default_interleave_moe_layer_step() -> i32 { 1 }
-fn default_no_rope_layer_interval() -> i32 { 4 }
-fn default_attention_chunk_size() -> i32 { 8192 }
-fn default_use_qk_norm() -> bool { true }
-fn default_attn_temperature_tuning() -> bool { true }
-fn default_floor_scale() -> i32 { 8192 }
-fn default_attn_scale() -> f32 { 0.1 }
-fn default_router_aux_loss_coef() -> f32 { 0.001 }
+fn default_intermediate_size_mlp() -> i32 {
+    16384
+}
+fn default_num_experts_per_tok() -> i32 {
+    1
+}
+fn default_num_local_experts() -> i32 {
+    16
+}
+fn default_interleave_moe_layer_step() -> i32 {
+    1
+}
+fn default_no_rope_layer_interval() -> i32 {
+    4
+}
+fn default_attention_chunk_size() -> i32 {
+    8192
+}
+fn default_use_qk_norm() -> bool {
+    true
+}
+fn default_attn_temperature_tuning() -> bool {
+    true
+}
+fn default_floor_scale() -> i32 {
+    8192
+}
+fn default_attn_scale() -> f32 {
+    0.1
+}
+fn default_router_aux_loss_coef() -> f32 {
+    0.001
+}
 
 impl Default for Llama4TextConfig {
     fn default() -> Self {
@@ -156,18 +178,42 @@ impl Llama4TextConfig {
 }
 
 impl ModelConfig for Llama4TextConfig {
-    fn model_type(&self) -> &str { "llama4" }
-    fn vocab_size(&self) -> i32 { self.vocab_size }
-    fn hidden_size(&self) -> i32 { self.hidden_size }
-    fn num_hidden_layers(&self) -> i32 { self.num_hidden_layers }
-    fn num_attention_heads(&self) -> i32 { self.num_attention_heads }
-    fn num_kv_heads(&self) -> i32 { self.num_key_value_heads }
-    fn head_dim(&self) -> i32 { self.head_dim }
-    fn intermediate_size(&self) -> i32 { self.intermediate_size }
-    fn max_position_embeddings(&self) -> i32 { self.max_position_embeddings }
-    fn norm_eps(&self) -> f32 { self.rms_norm_eps }
-    fn rope_theta(&self) -> f32 { self.rope_theta }
-    fn tie_word_embeddings(&self) -> bool { self.tie_word_embeddings }
+    fn model_type(&self) -> &str {
+        "llama4"
+    }
+    fn vocab_size(&self) -> i32 {
+        self.vocab_size
+    }
+    fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+    fn num_hidden_layers(&self) -> i32 {
+        self.num_hidden_layers
+    }
+    fn num_attention_heads(&self) -> i32 {
+        self.num_attention_heads
+    }
+    fn num_kv_heads(&self) -> i32 {
+        self.num_key_value_heads
+    }
+    fn head_dim(&self) -> i32 {
+        self.head_dim
+    }
+    fn intermediate_size(&self) -> i32 {
+        self.intermediate_size
+    }
+    fn max_position_embeddings(&self) -> i32 {
+        self.max_position_embeddings
+    }
+    fn norm_eps(&self) -> f32 {
+        self.rms_norm_eps
+    }
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
 }
 
 // =============================================================================
@@ -196,7 +242,11 @@ impl Llama4Expert {
         let down_proj = nn::LinearBuilder::new(intermediate_size, hidden_size)
             .bias(false)
             .build()?;
-        Ok(Self { gate_proj, up_proj, down_proj })
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
@@ -222,7 +272,11 @@ impl Llama4Router {
         let gate = nn::LinearBuilder::new(hidden_size, num_experts)
             .bias(false)
             .build()?;
-        Ok(Self { gate, num_experts, top_k })
+        Ok(Self {
+            gate,
+            num_experts,
+            top_k,
+        })
     }
 
     /// Route tokens to experts.
@@ -374,8 +428,16 @@ impl Llama4Attention {
         // QK norm (if enabled)
         let (q_norm, k_norm) = if config.use_qk_norm {
             (
-                Some(nn::RmsNormBuilder::new(head_dim).eps(config.rms_norm_eps).build()?),
-                Some(nn::RmsNormBuilder::new(head_dim).eps(config.rms_norm_eps).build()?),
+                Some(
+                    nn::RmsNormBuilder::new(head_dim)
+                        .eps(config.rms_norm_eps)
+                        .build()?,
+                ),
+                Some(
+                    nn::RmsNormBuilder::new(head_dim)
+                        .eps(config.rms_norm_eps)
+                        .build()?,
+                ),
             )
         } else {
             (None, None)
@@ -487,9 +549,9 @@ pub struct Llama4DecoderLayer {
     #[param]
     pub self_attn: Llama4Attention,
     #[param]
-    pub mlp: Option<Llama4Expert>,  // Dense MLP (if not MoE)
+    pub mlp: Option<Llama4Expert>, // Dense MLP (if not MoE)
     #[param]
-    pub moe: Option<Llama4MoE>,     // MoE layer (if MoE)
+    pub moe: Option<Llama4MoE>, // MoE layer (if MoE)
     #[param]
     pub input_layernorm: nn::RmsNorm,
     #[param]
@@ -504,7 +566,13 @@ impl Llama4DecoderLayer {
         let (mlp, moe) = if is_moe {
             (None, Some(Llama4MoE::new(config)?))
         } else {
-            (Some(Llama4Expert::new(config.hidden_size, config.intermediate_size_mlp)?), None)
+            (
+                Some(Llama4Expert::new(
+                    config.hidden_size,
+                    config.intermediate_size_mlp,
+                )?),
+                None,
+            )
         };
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
@@ -619,7 +687,11 @@ impl Llama4ForCausalLM {
 
         let model = Llama4TextModel::new(config.clone())?;
 
-        Ok(Self { config, model, lm_head })
+        Ok(Self {
+            config,
+            model,
+            lm_head,
+        })
     }
 
     pub fn forward(
@@ -642,7 +714,7 @@ impl Llama4TextConfig {
     pub fn scout() -> Self {
         Self {
             num_local_experts: 16,
-            interleave_moe_layer_step: 1,  // All layers are MoE
+            interleave_moe_layer_step: 1, // All layers are MoE
             ..Default::default()
         }
     }
@@ -651,7 +723,7 @@ impl Llama4TextConfig {
     pub fn maverick() -> Self {
         Self {
             num_local_experts: 128,
-            interleave_moe_layer_step: 2,  // MoE every other layer
+            interleave_moe_layer_step: 2, // MoE every other layer
             ..Default::default()
         }
     }
@@ -685,11 +757,11 @@ mod tests {
         let config = Llama4TextConfig::default();
 
         // NoPE every 4th layer (layers 0, 4, 8, ...)
-        assert!(!config.uses_rope(0));  // NoPE
-        assert!(config.uses_rope(1));   // RoPE
-        assert!(config.uses_rope(2));   // RoPE
-        assert!(config.uses_rope(3));   // RoPE
-        assert!(!config.uses_rope(4));  // NoPE
+        assert!(!config.uses_rope(0)); // NoPE
+        assert!(config.uses_rope(1)); // RoPE
+        assert!(config.uses_rope(2)); // RoPE
+        assert!(config.uses_rope(3)); // RoPE
+        assert!(!config.uses_rope(4)); // NoPE
     }
 
     #[test]

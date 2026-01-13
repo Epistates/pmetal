@@ -1,6 +1,6 @@
 //! Comprehensive error types for distributed operations.
 //!
-//! Modeled after Burn's GlobalCollectiveError for 
+//! Modeled after Burn's GlobalCollectiveError for
 //! error classification and handling.
 
 use libp2p::PeerId;

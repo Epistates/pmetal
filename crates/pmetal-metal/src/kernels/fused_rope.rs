@@ -69,12 +69,7 @@ pub struct FusedRoPEConfig {
 
 impl FusedRoPEConfig {
     /// Create a new RoPE config.
-    pub fn new(
-        batch_size: usize,
-        num_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-    ) -> Self {
+    pub fn new(batch_size: usize, num_heads: usize, seq_len: usize, head_dim: usize) -> Self {
         Self {
             batch_size,
             num_heads,
@@ -238,11 +233,7 @@ impl FusedRoPE {
     ///
     /// * `q` - Query tensor [batch, q_heads, seq_len, head_dim] (modified in-place)
     /// * `k` - Key tensor [batch, kv_heads, seq_len, head_dim] (modified in-place)
-    pub fn apply_qk_inplace(
-        &self,
-        q: &MetalBuffer<f32>,
-        k: &MetalBuffer<f32>,
-    ) -> Result<()> {
+    pub fn apply_qk_inplace(&self, q: &MetalBuffer<f32>, k: &MetalBuffer<f32>) -> Result<()> {
         let expected_q = self.config.batch_size
             * self.config.num_heads
             * self.config.seq_len
@@ -487,11 +478,7 @@ impl FusedRoPE {
         Ok(())
     }
 
-    fn execute_qk_inplace(
-        &self,
-        q: &MetalBuffer<f32>,
-        k: &MetalBuffer<f32>,
-    ) -> Result<()> {
+    fn execute_qk_inplace(&self, q: &MetalBuffer<f32>, k: &MetalBuffer<f32>) -> Result<()> {
         let kernel_name = "rope_qk_inplace";
 
         let pipeline = {

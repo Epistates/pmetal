@@ -18,28 +18,34 @@ pub mod moe;
 
 // Re-export main types
 pub use flash_attention::{
-    FlashAttention, FlashAttentionConfig, FlashAttentionOutput,
-    FlashAttentionVarlen, FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,
+    FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,
+    FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,
+};
+pub use fp8_training::{
+    Fp8DynamicScale, Fp8Format, Fp8GemmOutput, Fp8QuantOutput, Fp8TrainingConfig, Fp8TrainingKernel,
 };
 pub use fused_cross_entropy::{
-    FusedCrossEntropy, FusedCrossEntropyConfig, FusedCrossEntropyOutput,
+    FusedCrossEntropy,
+    FusedCrossEntropyConfig,
+    FusedCrossEntropyOutput,
     // The key unsloth optimization: fused linear + cross-entropy
-    FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig, FusedLinearCrossEntropyOutput,
+    FusedLinearCrossEntropy,
+    FusedLinearCrossEntropyConfig,
+    FusedLinearCrossEntropyOutput,
 };
 pub use fused_distill::{
-    FusedDistill, FusedDistillConfig, FusedDistillOutput, DistillLossType,
-    FusedHiddenAlign, HiddenAlignConfig, HiddenAlignLossType,
+    DistillLossType, FusedDistill, FusedDistillConfig, FusedDistillOutput, FusedHiddenAlign,
+    HiddenAlignConfig, HiddenAlignLossType,
 };
 pub use fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};
 pub use fused_sampler::{FusedSampler, FusedSamplerConfig, SamplingParams};
-pub use fused_swiglu::{FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput};
-pub use moe::{MoeConfig, MoeGemmOutput, MoeKernel, MoeRouting};
-pub use fp8_training::{
-    Fp8Format, Fp8TrainingConfig, Fp8TrainingKernel, Fp8QuantOutput, Fp8GemmOutput, Fp8DynamicScale,
+pub use fused_swiglu::{
+    FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
 };
 pub use fused_training::{
-    AdamWConfig, BatchedCommandBuffer, BatchCompletionToken, FusedAdamW,
-    FusedCrossEntropyTraining, FusedGradientClipping, FusedTrainingCoordinator, ParamInfo,
+    AdamWConfig, BatchCompletionToken, BatchedCommandBuffer, FusedAdamW, FusedCrossEntropyTraining,
+    FusedGradientClipping, FusedTrainingCoordinator, ParamInfo,
 };
+pub use moe::{MoeConfig, MoeGemmOutput, MoeKernel, MoeRouting};

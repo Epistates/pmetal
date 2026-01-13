@@ -20,10 +20,10 @@
 //! - `pi` is the policy model (trainable)
 //! - `pi_ref` is the reference model (frozen)
 
-use pmetal_core::TrainingConfig;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
+use pmetal_core::TrainingConfig;
 
 /// Error type for GRPO training.
 #[derive(Debug, thiserror::Error)]
@@ -483,8 +483,8 @@ impl GrpoTrainer {
                 // Batch-level normalization
                 let mean: f64 = rewards.iter().sum::<f64>() / rewards.len() as f64;
                 let std = if self.config.whiten_advantages {
-                    let var: f64 =
-                        rewards.iter().map(|r| (r - mean).powi(2)).sum::<f64>() / rewards.len() as f64;
+                    let var: f64 = rewards.iter().map(|r| (r - mean).powi(2)).sum::<f64>()
+                        / rewards.len() as f64;
                     var.sqrt().max(1e-8)
                 } else {
                     1.0
@@ -709,9 +709,9 @@ impl GrpoTrainer {
         &mut self,
         groups: &[CompletionGroup],
     ) -> GrpoResult<(
-        Vec<Vec<u32>>, 
-        Vec<Vec<u32>>, 
-        Vec<f64>, 
+        Vec<Vec<u32>>,
+        Vec<Vec<u32>>,
+        Vec<f64>,
         Vec<Vec<u32>>,
         Option<Vec<Vec<Array>>>, // Added images
     )> {
@@ -751,13 +751,13 @@ impl GrpoTrainer {
                     all_images.push(imgs.clone());
                 }
             } else if has_images {
-                 // specific case where some have images and some don't?
-                 // For now assume all or nothing for simplicity, or handle empty vec
-                 for _ in &group.completion_ids {
+                // specific case where some have images and some don't?
+                // For now assume all or nothing for simplicity, or handle empty vec
+                for _ in &group.completion_ids {
                     all_images.push(Vec::new());
-                 }
+                }
             }
-            
+
             for completion_ids in &group.completion_ids {
                 all_prompts.push(group.prompt_ids.clone());
                 all_completions.push(completion_ids.clone());
@@ -767,7 +767,13 @@ impl GrpoTrainer {
 
         let images_out = if has_images { Some(all_images) } else { None };
 
-        Ok((all_prompts, all_completions, advantages, all_masks, images_out))
+        Ok((
+            all_prompts,
+            all_completions,
+            advantages,
+            all_masks,
+            images_out,
+        ))
     }
 }
 
@@ -848,8 +854,8 @@ pub trait RewardFunction: Send + Sync {
     /// # Returns
     /// Rewards for each completion
     fn compute(
-        &self, 
-        prompts: &[String], 
+        &self,
+        prompts: &[String],
         completions: &[String],
         images: Option<&[Vec<Array>]>,
     ) -> GrpoResult<Vec<f64>>;
@@ -880,8 +886,8 @@ impl CombinedReward {
 
     /// Compute combined rewards.
     pub fn compute(
-        &self, 
-        prompts: &[String], 
+        &self,
+        prompts: &[String],
         completions: &[String],
         images: Option<&[Vec<Array>]>,
     ) -> GrpoResult<Vec<f64>> {
@@ -1063,8 +1069,7 @@ mod tests {
         let advantages = vec![-1.5, -0.5, 0.5, 1.5];
         let lengths = vec![10, 15, 12, 8];
 
-        let metrics =
-            GrpoMetrics::compute(0.5, 0.4, 0.01, 0.1, &rewards, &advantages, &lengths);
+        let metrics = GrpoMetrics::compute(0.5, 0.4, 0.01, 0.1, &rewards, &advantages, &lengths);
 
         assert!((metrics.mean_reward - 2.5).abs() < 0.01);
         assert!((metrics.mean_advantage - 0.0).abs() < 0.01);
@@ -1109,7 +1114,12 @@ mod tests {
     fn test_combined_reward() {
         struct ConstantReward(f64);
         impl RewardFunction for ConstantReward {
-            fn compute(&self, _: &[String], completions: &[String], _: Option<&[Vec<Array>]>) -> GrpoResult<Vec<f64>> {
+            fn compute(
+                &self,
+                _: &[String],
+                completions: &[String],
+                _: Option<&[Vec<Array>]>,
+            ) -> GrpoResult<Vec<f64>> {
                 Ok(vec![self.0; completions.len()])
             }
             fn name(&self) -> &str {

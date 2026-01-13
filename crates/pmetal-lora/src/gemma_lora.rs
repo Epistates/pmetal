@@ -22,8 +22,7 @@ use mlx_rs::{
     fast,
     module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param},
     nested::NestedValue,
-    nn,
-    Array,
+    nn, Array,
 };
 
 use pmetal_core::LoraConfig;
@@ -304,16 +303,18 @@ impl GemmaLoraAttention {
 
         // Handle KV cache update - keys/values are already in [B, heads, seq, head_dim] format
         let (keys, values) = if let Some((cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &keys, &values)
+            cache
+                .update_and_fetch(layer_idx, &keys, &values)
                 .map_err(|e| LoraError::Mlx(e))?
         } else {
             (keys, values)
         };
 
         // Use fused attention kernel for inference
-        let mut attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
-            .with_scale(self.scale)
-            .with_mask_type(AttentionMaskType::Causal);
+        let mut attn_config =
+            FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+                .with_scale(self.scale)
+                .with_mask_type(AttentionMaskType::Causal);
 
         // Apply logit softcapping if configured (Gemma2)
         if let Some(cap) = self.logit_softcapping {
@@ -520,7 +521,8 @@ impl Gemma2LoraDecoderLayer {
         let input_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
         let post_attention_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
         let pre_feedforward_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
-        let post_feedforward_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
+        let post_feedforward_layernorm =
+            GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
 
         Ok(Self {
             self_attn,
@@ -642,13 +644,13 @@ impl GemmaLoraModel {
             GemmaLoraLayers::Gemma2(
                 (0..config.num_hidden_layers)
                     .map(|_| Gemma2LoraDecoderLayer::new(&config, &lora_config))
-                    .collect::<Result<Vec<_>, _>>()?
+                    .collect::<Result<Vec<_>, _>>()?,
             )
         } else {
             GemmaLoraLayers::Gemma1(
                 (0..config.num_hidden_layers)
                     .map(|_| GemmaLoraDecoderLayer::new(&config, &lora_config))
-                    .collect::<Result<Vec<_>, _>>()?
+                    .collect::<Result<Vec<_>, _>>()?,
             )
         };
 
@@ -741,12 +743,14 @@ impl GemmaLoraModel {
         match (&mut self.layers, cache) {
             (GemmaLoraLayers::Gemma1(layers), Some(cache)) => {
                 for (layer_idx, layer) in layers.iter_mut().enumerate() {
-                    hidden_states = layer.forward_with_cache(&hidden_states, mask, Some((cache, layer_idx)))?;
+                    hidden_states =
+                        layer.forward_with_cache(&hidden_states, mask, Some((cache, layer_idx)))?;
                 }
             }
             (GemmaLoraLayers::Gemma2(layers), Some(cache)) => {
                 for (layer_idx, layer) in layers.iter_mut().enumerate() {
-                    hidden_states = layer.forward_with_cache(&hidden_states, mask, Some((cache, layer_idx)))?;
+                    hidden_states =
+                        layer.forward_with_cache(&hidden_states, mask, Some((cache, layer_idx)))?;
                 }
             }
             (GemmaLoraLayers::Gemma1(layers), None) => {
@@ -822,7 +826,9 @@ impl GemmaLoraForCausalLM {
         mask: Option<&Array>,
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
-        let hidden_states = self.model.forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
+        let hidden_states =
+            self.model
+                .forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
         // Gemma always ties embeddings
         Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
     }
@@ -869,20 +875,62 @@ impl GemmaLoraForCausalLM {
         macro_rules! add_layer_params {
             ($layer:expr, $i:expr) => {
                 let prefix = format!("layers.{}", $i);
-                params.insert(Rc::from(format!("{}.self_attn.q_proj.lora_a", prefix)), $layer.self_attn.q_proj.lora_a.clone());
-                params.insert(Rc::from(format!("{}.self_attn.q_proj.lora_b", prefix)), $layer.self_attn.q_proj.lora_b.clone());
-                params.insert(Rc::from(format!("{}.self_attn.k_proj.lora_a", prefix)), $layer.self_attn.k_proj.lora_a.clone());
-                params.insert(Rc::from(format!("{}.self_attn.k_proj.lora_b", prefix)), $layer.self_attn.k_proj.lora_b.clone());
-                params.insert(Rc::from(format!("{}.self_attn.v_proj.lora_a", prefix)), $layer.self_attn.v_proj.lora_a.clone());
-                params.insert(Rc::from(format!("{}.self_attn.v_proj.lora_b", prefix)), $layer.self_attn.v_proj.lora_b.clone());
-                params.insert(Rc::from(format!("{}.self_attn.o_proj.lora_a", prefix)), $layer.self_attn.o_proj.lora_a.clone());
-                params.insert(Rc::from(format!("{}.self_attn.o_proj.lora_b", prefix)), $layer.self_attn.o_proj.lora_b.clone());
-                params.insert(Rc::from(format!("{}.mlp.gate_proj.lora_a", prefix)), $layer.mlp.gate_proj.lora_a.clone());
-                params.insert(Rc::from(format!("{}.mlp.gate_proj.lora_b", prefix)), $layer.mlp.gate_proj.lora_b.clone());
-                params.insert(Rc::from(format!("{}.mlp.up_proj.lora_a", prefix)), $layer.mlp.up_proj.lora_a.clone());
-                params.insert(Rc::from(format!("{}.mlp.up_proj.lora_b", prefix)), $layer.mlp.up_proj.lora_b.clone());
-                params.insert(Rc::from(format!("{}.mlp.down_proj.lora_a", prefix)), $layer.mlp.down_proj.lora_a.clone());
-                params.insert(Rc::from(format!("{}.mlp.down_proj.lora_b", prefix)), $layer.mlp.down_proj.lora_b.clone());
+                params.insert(
+                    Rc::from(format!("{}.self_attn.q_proj.lora_a", prefix)),
+                    $layer.self_attn.q_proj.lora_a.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.self_attn.q_proj.lora_b", prefix)),
+                    $layer.self_attn.q_proj.lora_b.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.self_attn.k_proj.lora_a", prefix)),
+                    $layer.self_attn.k_proj.lora_a.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.self_attn.k_proj.lora_b", prefix)),
+                    $layer.self_attn.k_proj.lora_b.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.self_attn.v_proj.lora_a", prefix)),
+                    $layer.self_attn.v_proj.lora_a.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.self_attn.v_proj.lora_b", prefix)),
+                    $layer.self_attn.v_proj.lora_b.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.self_attn.o_proj.lora_a", prefix)),
+                    $layer.self_attn.o_proj.lora_a.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.self_attn.o_proj.lora_b", prefix)),
+                    $layer.self_attn.o_proj.lora_b.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.mlp.gate_proj.lora_a", prefix)),
+                    $layer.mlp.gate_proj.lora_a.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.mlp.gate_proj.lora_b", prefix)),
+                    $layer.mlp.gate_proj.lora_b.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.mlp.up_proj.lora_a", prefix)),
+                    $layer.mlp.up_proj.lora_a.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.mlp.up_proj.lora_b", prefix)),
+                    $layer.mlp.up_proj.lora_b.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.mlp.down_proj.lora_a", prefix)),
+                    $layer.mlp.down_proj.lora_a.clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.mlp.down_proj.lora_b", prefix)),
+                    $layer.mlp.down_proj.lora_b.clone(),
+                );
             };
         }
 
@@ -914,20 +962,62 @@ impl GemmaLoraForCausalLM {
                         }
                     };
                 }
-                set_param!($layer.self_attn.q_proj.lora_a, format!("{}.self_attn.q_proj.lora_a", prefix));
-                set_param!($layer.self_attn.q_proj.lora_b, format!("{}.self_attn.q_proj.lora_b", prefix));
-                set_param!($layer.self_attn.k_proj.lora_a, format!("{}.self_attn.k_proj.lora_a", prefix));
-                set_param!($layer.self_attn.k_proj.lora_b, format!("{}.self_attn.k_proj.lora_b", prefix));
-                set_param!($layer.self_attn.v_proj.lora_a, format!("{}.self_attn.v_proj.lora_a", prefix));
-                set_param!($layer.self_attn.v_proj.lora_b, format!("{}.self_attn.v_proj.lora_b", prefix));
-                set_param!($layer.self_attn.o_proj.lora_a, format!("{}.self_attn.o_proj.lora_a", prefix));
-                set_param!($layer.self_attn.o_proj.lora_b, format!("{}.self_attn.o_proj.lora_b", prefix));
-                set_param!($layer.mlp.gate_proj.lora_a, format!("{}.mlp.gate_proj.lora_a", prefix));
-                set_param!($layer.mlp.gate_proj.lora_b, format!("{}.mlp.gate_proj.lora_b", prefix));
-                set_param!($layer.mlp.up_proj.lora_a, format!("{}.mlp.up_proj.lora_a", prefix));
-                set_param!($layer.mlp.up_proj.lora_b, format!("{}.mlp.up_proj.lora_b", prefix));
-                set_param!($layer.mlp.down_proj.lora_a, format!("{}.mlp.down_proj.lora_a", prefix));
-                set_param!($layer.mlp.down_proj.lora_b, format!("{}.mlp.down_proj.lora_b", prefix));
+                set_param!(
+                    $layer.self_attn.q_proj.lora_a,
+                    format!("{}.self_attn.q_proj.lora_a", prefix)
+                );
+                set_param!(
+                    $layer.self_attn.q_proj.lora_b,
+                    format!("{}.self_attn.q_proj.lora_b", prefix)
+                );
+                set_param!(
+                    $layer.self_attn.k_proj.lora_a,
+                    format!("{}.self_attn.k_proj.lora_a", prefix)
+                );
+                set_param!(
+                    $layer.self_attn.k_proj.lora_b,
+                    format!("{}.self_attn.k_proj.lora_b", prefix)
+                );
+                set_param!(
+                    $layer.self_attn.v_proj.lora_a,
+                    format!("{}.self_attn.v_proj.lora_a", prefix)
+                );
+                set_param!(
+                    $layer.self_attn.v_proj.lora_b,
+                    format!("{}.self_attn.v_proj.lora_b", prefix)
+                );
+                set_param!(
+                    $layer.self_attn.o_proj.lora_a,
+                    format!("{}.self_attn.o_proj.lora_a", prefix)
+                );
+                set_param!(
+                    $layer.self_attn.o_proj.lora_b,
+                    format!("{}.self_attn.o_proj.lora_b", prefix)
+                );
+                set_param!(
+                    $layer.mlp.gate_proj.lora_a,
+                    format!("{}.mlp.gate_proj.lora_a", prefix)
+                );
+                set_param!(
+                    $layer.mlp.gate_proj.lora_b,
+                    format!("{}.mlp.gate_proj.lora_b", prefix)
+                );
+                set_param!(
+                    $layer.mlp.up_proj.lora_a,
+                    format!("{}.mlp.up_proj.lora_a", prefix)
+                );
+                set_param!(
+                    $layer.mlp.up_proj.lora_b,
+                    format!("{}.mlp.up_proj.lora_b", prefix)
+                );
+                set_param!(
+                    $layer.mlp.down_proj.lora_a,
+                    format!("{}.mlp.down_proj.lora_a", prefix)
+                );
+                set_param!(
+                    $layer.mlp.down_proj.lora_b,
+                    format!("{}.mlp.down_proj.lora_b", prefix)
+                );
             };
         }
 
@@ -971,7 +1061,10 @@ impl GemmaLoraForCausalLM {
     ///
     /// # Arguments
     /// * `path` - Path to either a directory containing `lora_weights.safetensors` or a direct `.safetensors` file
-    pub fn load_lora_weights(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
+    pub fn load_lora_weights(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), LoraError> {
         let path = path.as_ref();
         let file_path = if path.is_dir() {
             path.join("lora_weights.safetensors")
@@ -990,20 +1083,62 @@ impl GemmaLoraForCausalLM {
                         }
                     };
                 }
-                load_param!($layer.self_attn.q_proj.lora_a, format!("{}.self_attn.q_proj.lora_a", prefix));
-                load_param!($layer.self_attn.q_proj.lora_b, format!("{}.self_attn.q_proj.lora_b", prefix));
-                load_param!($layer.self_attn.k_proj.lora_a, format!("{}.self_attn.k_proj.lora_a", prefix));
-                load_param!($layer.self_attn.k_proj.lora_b, format!("{}.self_attn.k_proj.lora_b", prefix));
-                load_param!($layer.self_attn.v_proj.lora_a, format!("{}.self_attn.v_proj.lora_a", prefix));
-                load_param!($layer.self_attn.v_proj.lora_b, format!("{}.self_attn.v_proj.lora_b", prefix));
-                load_param!($layer.self_attn.o_proj.lora_a, format!("{}.self_attn.o_proj.lora_a", prefix));
-                load_param!($layer.self_attn.o_proj.lora_b, format!("{}.self_attn.o_proj.lora_b", prefix));
-                load_param!($layer.mlp.gate_proj.lora_a, format!("{}.mlp.gate_proj.lora_a", prefix));
-                load_param!($layer.mlp.gate_proj.lora_b, format!("{}.mlp.gate_proj.lora_b", prefix));
-                load_param!($layer.mlp.up_proj.lora_a, format!("{}.mlp.up_proj.lora_a", prefix));
-                load_param!($layer.mlp.up_proj.lora_b, format!("{}.mlp.up_proj.lora_b", prefix));
-                load_param!($layer.mlp.down_proj.lora_a, format!("{}.mlp.down_proj.lora_a", prefix));
-                load_param!($layer.mlp.down_proj.lora_b, format!("{}.mlp.down_proj.lora_b", prefix));
+                load_param!(
+                    $layer.self_attn.q_proj.lora_a,
+                    format!("{}.self_attn.q_proj.lora_a", prefix)
+                );
+                load_param!(
+                    $layer.self_attn.q_proj.lora_b,
+                    format!("{}.self_attn.q_proj.lora_b", prefix)
+                );
+                load_param!(
+                    $layer.self_attn.k_proj.lora_a,
+                    format!("{}.self_attn.k_proj.lora_a", prefix)
+                );
+                load_param!(
+                    $layer.self_attn.k_proj.lora_b,
+                    format!("{}.self_attn.k_proj.lora_b", prefix)
+                );
+                load_param!(
+                    $layer.self_attn.v_proj.lora_a,
+                    format!("{}.self_attn.v_proj.lora_a", prefix)
+                );
+                load_param!(
+                    $layer.self_attn.v_proj.lora_b,
+                    format!("{}.self_attn.v_proj.lora_b", prefix)
+                );
+                load_param!(
+                    $layer.self_attn.o_proj.lora_a,
+                    format!("{}.self_attn.o_proj.lora_a", prefix)
+                );
+                load_param!(
+                    $layer.self_attn.o_proj.lora_b,
+                    format!("{}.self_attn.o_proj.lora_b", prefix)
+                );
+                load_param!(
+                    $layer.mlp.gate_proj.lora_a,
+                    format!("{}.mlp.gate_proj.lora_a", prefix)
+                );
+                load_param!(
+                    $layer.mlp.gate_proj.lora_b,
+                    format!("{}.mlp.gate_proj.lora_b", prefix)
+                );
+                load_param!(
+                    $layer.mlp.up_proj.lora_a,
+                    format!("{}.mlp.up_proj.lora_a", prefix)
+                );
+                load_param!(
+                    $layer.mlp.up_proj.lora_b,
+                    format!("{}.mlp.up_proj.lora_b", prefix)
+                );
+                load_param!(
+                    $layer.mlp.down_proj.lora_a,
+                    format!("{}.mlp.down_proj.lora_a", prefix)
+                );
+                load_param!(
+                    $layer.mlp.down_proj.lora_b,
+                    format!("{}.mlp.down_proj.lora_b", prefix)
+                );
             };
         }
 
@@ -1057,7 +1192,9 @@ impl GemmaLoraForCausalLM {
                 if let Some(w) = $weights.get(&format!("{}.input_layernorm.weight", $prefix)) {
                     $layer.input_layernorm.weight = Param::new(w.clone());
                 }
-                if let Some(w) = $weights.get(&format!("{}.post_attention_layernorm.weight", $prefix)) {
+                if let Some(w) =
+                    $weights.get(&format!("{}.post_attention_layernorm.weight", $prefix))
+                {
                     $layer.post_attention_layernorm.weight = Param::new(w.clone());
                 }
             };
@@ -1076,10 +1213,14 @@ impl GemmaLoraForCausalLM {
                     let prefix = format!("model.layers.{}", i);
                     load_layer_base_weights!(layer, prefix, weights);
                     // Gemma2 extra layernorms
-                    if let Some(w) = weights.get(&format!("{}.pre_feedforward_layernorm.weight", prefix)) {
+                    if let Some(w) =
+                        weights.get(&format!("{}.pre_feedforward_layernorm.weight", prefix))
+                    {
                         layer.pre_feedforward_layernorm.weight = Param::new(w.clone());
                     }
-                    if let Some(w) = weights.get(&format!("{}.post_feedforward_layernorm.weight", prefix)) {
+                    if let Some(w) =
+                        weights.get(&format!("{}.post_feedforward_layernorm.weight", prefix))
+                    {
                         layer.post_feedforward_layernorm.weight = Param::new(w.clone());
                     }
                 }
@@ -1095,7 +1236,10 @@ impl GemmaLoraForCausalLM {
     }
 
     /// Load base model weights from directory.
-    pub fn load_base_weights_from_dir(&mut self, model_dir: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
+    pub fn load_base_weights_from_dir(
+        &mut self,
+        model_dir: impl AsRef<std::path::Path>,
+    ) -> Result<(), LoraError> {
         let model_dir = model_dir.as_ref();
 
         let single_file = model_dir.join("model.safetensors");
@@ -1162,7 +1306,12 @@ impl GemmaLoraForCausalLM {
                 $layer.mlp.down_proj.lora_a.eval()?;
                 $layer.mlp.down_proj.lora_b.eval()?;
                 $layer.input_layernorm.weight.value.as_ref().eval()?;
-                $layer.post_attention_layernorm.weight.value.as_ref().eval()?;
+                $layer
+                    .post_attention_layernorm
+                    .weight
+                    .value
+                    .as_ref()
+                    .eval()?;
             };
         }
 
@@ -1175,8 +1324,18 @@ impl GemmaLoraForCausalLM {
             GemmaLoraLayers::Gemma2(layers) => {
                 for layer in layers {
                     eval_layer!(layer);
-                    layer.pre_feedforward_layernorm.weight.value.as_ref().eval()?;
-                    layer.post_feedforward_layernorm.weight.value.as_ref().eval()?;
+                    layer
+                        .pre_feedforward_layernorm
+                        .weight
+                        .value
+                        .as_ref()
+                        .eval()?;
+                    layer
+                        .post_feedforward_layernorm
+                        .weight
+                        .value
+                        .as_ref()
+                        .eval()?;
                 }
             }
         }
@@ -1202,41 +1361,83 @@ impl ModuleParameters for GemmaLoraForCausalLM {
 
                 let mut attn_params = HashMap::new();
                 let mut q_params = HashMap::new();
-                q_params.insert(Rc::from("lora_a"), NestedValue::Value(&$layer.self_attn.q_proj.lora_a));
-                q_params.insert(Rc::from("lora_b"), NestedValue::Value(&$layer.self_attn.q_proj.lora_b));
+                q_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&$layer.self_attn.q_proj.lora_a),
+                );
+                q_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&$layer.self_attn.q_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
 
                 let mut k_params = HashMap::new();
-                k_params.insert(Rc::from("lora_a"), NestedValue::Value(&$layer.self_attn.k_proj.lora_a));
-                k_params.insert(Rc::from("lora_b"), NestedValue::Value(&$layer.self_attn.k_proj.lora_b));
+                k_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&$layer.self_attn.k_proj.lora_a),
+                );
+                k_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&$layer.self_attn.k_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
 
                 let mut v_params = HashMap::new();
-                v_params.insert(Rc::from("lora_a"), NestedValue::Value(&$layer.self_attn.v_proj.lora_a));
-                v_params.insert(Rc::from("lora_b"), NestedValue::Value(&$layer.self_attn.v_proj.lora_b));
+                v_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&$layer.self_attn.v_proj.lora_a),
+                );
+                v_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&$layer.self_attn.v_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
 
                 let mut o_params = HashMap::new();
-                o_params.insert(Rc::from("lora_a"), NestedValue::Value(&$layer.self_attn.o_proj.lora_a));
-                o_params.insert(Rc::from("lora_b"), NestedValue::Value(&$layer.self_attn.o_proj.lora_b));
+                o_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&$layer.self_attn.o_proj.lora_a),
+                );
+                o_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&$layer.self_attn.o_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
 
                 layer_params.insert(Rc::from("self_attn"), NestedValue::Map(attn_params));
 
                 let mut mlp_params = HashMap::new();
                 let mut gate_params = HashMap::new();
-                gate_params.insert(Rc::from("lora_a"), NestedValue::Value(&$layer.mlp.gate_proj.lora_a));
-                gate_params.insert(Rc::from("lora_b"), NestedValue::Value(&$layer.mlp.gate_proj.lora_b));
+                gate_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&$layer.mlp.gate_proj.lora_a),
+                );
+                gate_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&$layer.mlp.gate_proj.lora_b),
+                );
                 mlp_params.insert(Rc::from("gate_proj"), NestedValue::Map(gate_params));
 
                 let mut up_params = HashMap::new();
-                up_params.insert(Rc::from("lora_a"), NestedValue::Value(&$layer.mlp.up_proj.lora_a));
-                up_params.insert(Rc::from("lora_b"), NestedValue::Value(&$layer.mlp.up_proj.lora_b));
+                up_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&$layer.mlp.up_proj.lora_a),
+                );
+                up_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&$layer.mlp.up_proj.lora_b),
+                );
                 mlp_params.insert(Rc::from("up_proj"), NestedValue::Map(up_params));
 
                 let mut down_params = HashMap::new();
-                down_params.insert(Rc::from("lora_a"), NestedValue::Value(&$layer.mlp.down_proj.lora_a));
-                down_params.insert(Rc::from("lora_b"), NestedValue::Value(&$layer.mlp.down_proj.lora_b));
+                down_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&$layer.mlp.down_proj.lora_a),
+                );
+                down_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&$layer.mlp.down_proj.lora_b),
+                );
                 mlp_params.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
 
                 layer_params.insert(Rc::from("mlp"), NestedValue::Map(mlp_params));
@@ -1271,41 +1472,83 @@ impl ModuleParameters for GemmaLoraForCausalLM {
 
                 let mut attn_params = HashMap::new();
                 let mut q_params = HashMap::new();
-                q_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut $layer.self_attn.q_proj.lora_a));
-                q_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut $layer.self_attn.q_proj.lora_b));
+                q_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut $layer.self_attn.q_proj.lora_a),
+                );
+                q_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut $layer.self_attn.q_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
 
                 let mut k_params = HashMap::new();
-                k_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut $layer.self_attn.k_proj.lora_a));
-                k_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut $layer.self_attn.k_proj.lora_b));
+                k_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut $layer.self_attn.k_proj.lora_a),
+                );
+                k_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut $layer.self_attn.k_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
 
                 let mut v_params = HashMap::new();
-                v_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut $layer.self_attn.v_proj.lora_a));
-                v_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut $layer.self_attn.v_proj.lora_b));
+                v_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut $layer.self_attn.v_proj.lora_a),
+                );
+                v_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut $layer.self_attn.v_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
 
                 let mut o_params = HashMap::new();
-                o_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut $layer.self_attn.o_proj.lora_a));
-                o_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut $layer.self_attn.o_proj.lora_b));
+                o_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut $layer.self_attn.o_proj.lora_a),
+                );
+                o_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut $layer.self_attn.o_proj.lora_b),
+                );
                 attn_params.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
 
                 layer_params.insert(Rc::from("self_attn"), NestedValue::Map(attn_params));
 
                 let mut mlp_params = HashMap::new();
                 let mut gate_params = HashMap::new();
-                gate_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut $layer.mlp.gate_proj.lora_a));
-                gate_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut $layer.mlp.gate_proj.lora_b));
+                gate_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut $layer.mlp.gate_proj.lora_a),
+                );
+                gate_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut $layer.mlp.gate_proj.lora_b),
+                );
                 mlp_params.insert(Rc::from("gate_proj"), NestedValue::Map(gate_params));
 
                 let mut up_params = HashMap::new();
-                up_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut $layer.mlp.up_proj.lora_a));
-                up_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut $layer.mlp.up_proj.lora_b));
+                up_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut $layer.mlp.up_proj.lora_a),
+                );
+                up_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut $layer.mlp.up_proj.lora_b),
+                );
                 mlp_params.insert(Rc::from("up_proj"), NestedValue::Map(up_params));
 
                 let mut down_params = HashMap::new();
-                down_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut $layer.mlp.down_proj.lora_a));
-                down_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut $layer.mlp.down_proj.lora_b));
+                down_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut $layer.mlp.down_proj.lora_a),
+                );
+                down_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut $layer.mlp.down_proj.lora_b),
+                );
                 mlp_params.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
 
                 layer_params.insert(Rc::from("mlp"), NestedValue::Map(mlp_params));
@@ -1335,8 +1578,12 @@ impl ModuleParameters for GemmaLoraForCausalLM {
 
     fn freeze_parameters(&mut self, _recursive: bool) {}
     fn unfreeze_parameters(&mut self, _recursive: bool) {}
-    fn all_frozen(&self) -> Option<bool> { Some(false) }
-    fn any_frozen(&self) -> Option<bool> { Some(false) }
+    fn all_frozen(&self) -> Option<bool> {
+        Some(false)
+    }
+    fn any_frozen(&self) -> Option<bool> {
+        Some(false)
+    }
 }
 
 impl crate::TrainableModel for GemmaLoraForCausalLM {
@@ -1427,7 +1674,12 @@ mod tests {
             alpha: 16.0,
             dropout: 0.0,
             use_rslora: false,
-            target_modules: vec!["q_proj".to_string(), "k_proj".to_string(), "v_proj".to_string(), "o_proj".to_string()],
+            target_modules: vec![
+                "q_proj".to_string(),
+                "k_proj".to_string(),
+                "v_proj".to_string(),
+                "o_proj".to_string(),
+            ],
             bias: "none".to_string(),
             init_lora_weights: true,
             use_dora: false,

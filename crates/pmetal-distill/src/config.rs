@@ -1,7 +1,7 @@
 //! Configuration types for knowledge distillation.
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Complete distillation configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -289,7 +289,9 @@ impl DistillConfig {
     /// Validate the configuration.
     pub fn validate(&self) -> crate::Result<()> {
         if self.loss.temperature <= 0.0 {
-            return Err(crate::DistillError::InvalidTemperature(self.loss.temperature));
+            return Err(crate::DistillError::InvalidTemperature(
+                self.loss.temperature,
+            ));
         }
 
         if self.loss.alpha < 0.0 || self.loss.alpha > 1.0 {

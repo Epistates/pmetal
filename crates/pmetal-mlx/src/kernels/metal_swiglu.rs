@@ -443,34 +443,17 @@ mod tests {
         let hidden_size = 64;
         let intermediate_size = 128;
 
-        let x = mlx_rs::random::normal::<f32>(
-            &[batch, seq_len, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let gate_weight = mlx_rs::random::normal::<f32>(
-            &[intermediate_size, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let up_weight = mlx_rs::random::normal::<f32>(
-            &[intermediate_size, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let down_weight = mlx_rs::random::normal::<f32>(
-            &[hidden_size, intermediate_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
+            .unwrap();
+        let gate_weight =
+            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
+                .unwrap();
+        let up_weight =
+            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
+                .unwrap();
+        let down_weight =
+            mlx_rs::random::normal::<f32>(&[hidden_size, intermediate_size], None, None, None)
+                .unwrap();
 
         let output = fused_swiglu_forward(&x, &gate_weight, &up_weight, &down_weight).unwrap();
         assert_eq!(output.shape(), &[batch, seq_len, hidden_size]);
@@ -483,34 +466,17 @@ mod tests {
         let hidden_size = 64;
         let intermediate_size = 128;
 
-        let x = mlx_rs::random::normal::<f32>(
-            &[batch, seq_len, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let gate_weight = mlx_rs::random::normal::<f32>(
-            &[intermediate_size, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let up_weight = mlx_rs::random::normal::<f32>(
-            &[intermediate_size, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let down_weight = mlx_rs::random::normal::<f32>(
-            &[hidden_size, intermediate_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
+            .unwrap();
+        let gate_weight =
+            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
+                .unwrap();
+        let up_weight =
+            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
+                .unwrap();
+        let down_weight =
+            mlx_rs::random::normal::<f32>(&[hidden_size, intermediate_size], None, None, None)
+                .unwrap();
 
         let output = fused_geglu_forward(&x, &gate_weight, &up_weight, &down_weight).unwrap();
         assert_eq!(output.shape(), &[batch, seq_len, hidden_size]);
@@ -526,36 +492,21 @@ mod tests {
         let config = FusedSwiGLUConfig::new(hidden_size as usize, intermediate_size as usize);
         let mlp = FusedSwiGLUMlx::new(config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(
-            &[batch, seq_len, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let gate_weight = mlx_rs::random::normal::<f32>(
-            &[intermediate_size, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let up_weight = mlx_rs::random::normal::<f32>(
-            &[intermediate_size, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let down_weight = mlx_rs::random::normal::<f32>(
-            &[hidden_size, intermediate_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
+            .unwrap();
+        let gate_weight =
+            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
+                .unwrap();
+        let up_weight =
+            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
+                .unwrap();
+        let down_weight =
+            mlx_rs::random::normal::<f32>(&[hidden_size, intermediate_size], None, None, None)
+                .unwrap();
 
-        let result = mlp.forward(&x, &gate_weight, &up_weight, &down_weight).unwrap();
+        let result = mlp
+            .forward(&x, &gate_weight, &up_weight, &down_weight)
+            .unwrap();
         assert_eq!(result.output.shape(), &[batch, seq_len, hidden_size]);
     }
 
@@ -575,42 +526,33 @@ mod tests {
         );
         let mlp = FusedSwiGLUMlx::new(config).unwrap();
 
-        let x = mlx_rs::random::normal::<f32>(
-            &[batch, seq_len, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let gate_weight = mlx_rs::random::normal::<f32>(
-            &[intermediate_size, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let up_weight = mlx_rs::random::normal::<f32>(
-            &[intermediate_size, hidden_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
-        let down_weight = mlx_rs::random::normal::<f32>(
-            &[hidden_size, intermediate_size],
-            None,
-            None,
-            None,
-        )
-        .unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden_size], None, None, None)
+            .unwrap();
+        let gate_weight =
+            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
+                .unwrap();
+        let up_weight =
+            mlx_rs::random::normal::<f32>(&[intermediate_size, hidden_size], None, None, None)
+                .unwrap();
+        let down_weight =
+            mlx_rs::random::normal::<f32>(&[hidden_size, intermediate_size], None, None, None)
+                .unwrap();
 
         // LoRA matrices
-        let gate_a = mlx_rs::random::normal::<f32>(&[lora_rank, hidden_size], None, None, None).unwrap();
-        let gate_b = mlx_rs::random::normal::<f32>(&[intermediate_size, lora_rank], None, None, None).unwrap();
-        let up_a = mlx_rs::random::normal::<f32>(&[lora_rank, hidden_size], None, None, None).unwrap();
-        let up_b = mlx_rs::random::normal::<f32>(&[intermediate_size, lora_rank], None, None, None).unwrap();
-        let down_a = mlx_rs::random::normal::<f32>(&[lora_rank, intermediate_size], None, None, None).unwrap();
-        let down_b = mlx_rs::random::normal::<f32>(&[hidden_size, lora_rank], None, None, None).unwrap();
+        let gate_a =
+            mlx_rs::random::normal::<f32>(&[lora_rank, hidden_size], None, None, None).unwrap();
+        let gate_b =
+            mlx_rs::random::normal::<f32>(&[intermediate_size, lora_rank], None, None, None)
+                .unwrap();
+        let up_a =
+            mlx_rs::random::normal::<f32>(&[lora_rank, hidden_size], None, None, None).unwrap();
+        let up_b = mlx_rs::random::normal::<f32>(&[intermediate_size, lora_rank], None, None, None)
+            .unwrap();
+        let down_a =
+            mlx_rs::random::normal::<f32>(&[lora_rank, intermediate_size], None, None, None)
+                .unwrap();
+        let down_b =
+            mlx_rs::random::normal::<f32>(&[hidden_size, lora_rank], None, None, None).unwrap();
 
         let result = mlp
             .forward_with_lora(

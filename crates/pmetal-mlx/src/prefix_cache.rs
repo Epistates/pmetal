@@ -41,9 +41,9 @@
 //!
 //! Use `max_entries` to limit cache size and `clear()` to free memory when needed.
 
+use mlx_rs::{error::Exception, Array};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use mlx_rs::{Array, error::Exception};
 
 use crate::kv_cache::{KVCache, KVCacheConfig};
 
@@ -327,7 +327,11 @@ impl PrefixCachedGenerator {
 
     /// Get cache statistics.
     pub fn stats(&self) -> (usize, usize, f64) {
-        (self.cache.hits(), self.cache.misses(), self.cache.hit_rate())
+        (
+            self.cache.hits(),
+            self.cache.misses(),
+            self.cache.hit_rate(),
+        )
     }
 
     /// Get the underlying prefix cache for direct manipulation.

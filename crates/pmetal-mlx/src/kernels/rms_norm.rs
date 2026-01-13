@@ -15,7 +15,11 @@ pub use mlx_rs::nn::{RmsNorm, RmsNormBuilder};
 ///
 /// # Returns
 /// Normalized tensor of same shape as input.
-pub fn rms_norm(x: &mlx_rs::Array, weight: &mlx_rs::Array, eps: f32) -> mlx_rs::error::Result<mlx_rs::Array> {
+pub fn rms_norm(
+    x: &mlx_rs::Array,
+    weight: &mlx_rs::Array,
+    eps: f32,
+) -> mlx_rs::error::Result<mlx_rs::Array> {
     mlx_rs::fast::rms_norm(x, weight, eps)
 }
 

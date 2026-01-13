@@ -3,9 +3,9 @@
 //! Provides efficient image preprocessing for VLMs like Llama 3.2 Vision.
 //! Uses CLIP-style normalization and supports batch processing.
 
-use std::path::Path;
 use image::{imageops::FilterType, DynamicImage};
-use mlx_rs::{Array, error::Exception};
+use mlx_rs::{error::Exception, Array};
+use std::path::Path;
 
 /// Configuration for Mllama image processing.
 #[derive(Debug, Clone)]
@@ -86,11 +86,8 @@ impl MllamaImageProcessor {
     /// Returns: Array of shape [1, 3, H, W]
     pub fn process_image(&self, img: DynamicImage) -> Result<Array, Exception> {
         // 1. Resize with bilinear interpolation
-        let resized = img.resize_exact(
-            self.config.size.0,
-            self.config.size.1,
-            FilterType::Triangle,
-        );
+        let resized =
+            img.resize_exact(self.config.size.0, self.config.size.1, FilterType::Triangle);
         let rgb = resized.to_rgb8();
 
         let width = rgb.width() as usize;
@@ -112,12 +109,10 @@ impl MllamaImageProcessor {
             // Extract channel c from interleaved RGB data
             // Pixels are stored as [R, G, B, R, G, B, ...]
             // We want [R0, R1, R2, ...] for channel 0
-            data.extend(
-                (0..num_pixels).map(|i| {
-                    let pixel_val = pixels[i * 3 + c] as f32;
-                    (pixel_val * scale - mean) / std
-                })
-            );
+            data.extend((0..num_pixels).map(|i| {
+                let pixel_val = pixels[i * 3 + c] as f32;
+                (pixel_val * scale - mean) / std
+            }));
         }
 
         // Create Array: [1, C, H, W]
@@ -132,17 +127,16 @@ impl MllamaImageProcessor {
     /// More efficient for large batches as normalization happens on GPU.
     /// Requires `init_gpu_arrays()` to be called first.
     pub fn process_image_gpu(&self, img: DynamicImage) -> Result<Array, Exception> {
-        let mean = self.mean_array.as_ref()
-            .ok_or_else(|| Exception::custom("GPU arrays not initialized. Call init_gpu_arrays() first."))?;
-        let std = self.std_array.as_ref()
-            .ok_or_else(|| Exception::custom("GPU arrays not initialized. Call init_gpu_arrays() first."))?;
+        let mean = self.mean_array.as_ref().ok_or_else(|| {
+            Exception::custom("GPU arrays not initialized. Call init_gpu_arrays() first.")
+        })?;
+        let std = self.std_array.as_ref().ok_or_else(|| {
+            Exception::custom("GPU arrays not initialized. Call init_gpu_arrays() first.")
+        })?;
 
         // 1. Resize
-        let resized = img.resize_exact(
-            self.config.size.0,
-            self.config.size.1,
-            FilterType::Triangle,
-        );
+        let resized =
+            img.resize_exact(self.config.size.0, self.config.size.1, FilterType::Triangle);
         let rgb = resized.to_rgb8();
 
         let width = rgb.width() as usize;
@@ -194,7 +188,8 @@ impl MllamaImageProcessor {
         let images: Result<Vec<_>, _> = paths
             .iter()
             .map(|p| {
-                image::open(p).map_err(|e| Exception::custom(format!("Failed to open image: {}", e)))
+                image::open(p)
+                    .map_err(|e| Exception::custom(format!("Failed to open image: {}", e)))
             })
             .collect();
 
@@ -273,9 +268,7 @@ mod tests {
         let processor = MllamaImageProcessor::new(config);
 
         // Create a simple synthetic image
-        let img_buf = image::RgbImage::from_fn(4, 4, |_x, _y| {
-            image::Rgb([128u8, 64, 192])
-        });
+        let img_buf = image::RgbImage::from_fn(4, 4, |_x, _y| image::Rgb([128u8, 64, 192]));
         let img = DynamicImage::ImageRgb8(img_buf);
 
         let result = processor.process_image(img).unwrap();

@@ -46,24 +46,21 @@
 //! ```
 
 mod config;
+mod distill;
 mod error;
 pub mod losses;
 mod offline;
-mod distill;
 pub mod taid;
 
 pub use config::{
-    AttentionConfig, CompressionMethod, DistillConfig, DistillMethod,
-    HiddenStateConfig, HiddenStateLossType, LossConfig, LossType,
-    OfflineConfig, TrainingConfig,
+    AttentionConfig, CompressionMethod, DistillConfig, DistillMethod, HiddenStateConfig,
+    HiddenStateLossType, LossConfig, LossType, OfflineConfig, TrainingConfig,
 };
+pub use distill::{run_distillation, DistillLossOutput, Distiller, DistillerBuilder};
 pub use error::{DistillError, Result};
 pub use losses::{
-    DistillLoss, KlDivergenceLoss, JensenShannonLoss, SoftCrossEntropyLoss,
-    MseLoss, HiddenStateLoss, is_gpu_available,
+    is_gpu_available, DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, MseLoss,
+    SoftCrossEntropyLoss,
 };
 pub use offline::{LogitCache, LogitCompressor};
-pub use distill::{run_distillation, Distiller, DistillerBuilder, DistillLossOutput};
-pub use taid::{
-    TaidConfig, TaidDistiller, TaidLossOutput, TaidSchedule, TaidLossType, TaidError,
-};
+pub use taid::{TaidConfig, TaidDistiller, TaidError, TaidLossOutput, TaidLossType, TaidSchedule};

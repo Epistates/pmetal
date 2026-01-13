@@ -20,9 +20,11 @@
 
 use std::cell::RefCell;
 
-use pmetal_core::LoraConfig;
-use pmetal_mlx::quantization::{NF4Config, NF4Quantizer, QuantScheme, QuantizedTensor, QuantizerOps};
 use mlx_rs::{error::Exception, Array};
+use pmetal_core::LoraConfig;
+use pmetal_mlx::quantization::{
+    NF4Config, NF4Quantizer, QuantScheme, QuantizedTensor, QuantizerOps,
+};
 
 use super::LoraError;
 
@@ -175,7 +177,8 @@ impl QLoraLinear {
         weight_f32.eval()?;
         let weight_data: Vec<f32> = weight_f32.as_slice().to_vec();
         let shape = vec![out_features as usize, in_features as usize];
-        let quantized_weight = quantizer.quantize(&weight_data, &shape)
+        let quantized_weight = quantizer
+            .quantize(&weight_data, &shape)
             .map_err(|e| LoraError::Mlx(Exception::custom(e.to_string())))?;
 
         // Compute LoRA scaling
@@ -223,12 +226,8 @@ impl QLoraLinear {
     ) -> Result<Self, LoraError> {
         // Create random weight
         let bound = (3.0_f32 / in_features as f32).sqrt();
-        let weight = mlx_rs::random::uniform::<_, f32>(
-            -bound,
-            bound,
-            &[out_features, in_features],
-            None,
-        )?;
+        let weight =
+            mlx_rs::random::uniform::<_, f32>(-bound, bound, &[out_features, in_features], None)?;
 
         // Create random bias if needed
         let bias = if use_bias {
@@ -255,13 +254,12 @@ impl QLoraLinear {
         }
 
         // Dequantize
-        let weight_data = self.quantizer.dequantize(&self.quantized_weight)
+        let weight_data = self
+            .quantizer
+            .dequantize(&self.quantized_weight)
             .map_err(|e| LoraError::Mlx(Exception::custom(e.to_string())))?;
 
-        let weight = Array::from_slice(
-            &weight_data,
-            &[self.out_features, self.in_features],
-        );
+        let weight = Array::from_slice(&weight_data, &[self.out_features, self.in_features]);
 
         // Store in cache if enabled
         if self.cache_enabled {
@@ -391,8 +389,8 @@ impl QLoraLinear {
     /// Returns (quantized_bytes, lora_bytes, total_bytes)
     pub fn memory_usage(&self) -> (usize, usize, usize) {
         // Quantized weight: packed 4-bit + absmax
-        let quantized_bytes = self.quantized_weight.data.len()
-            + self.quantized_weight.absmax.len() * 4; // f32 absmax
+        let quantized_bytes =
+            self.quantized_weight.data.len() + self.quantized_weight.absmax.len() * 4; // f32 absmax
 
         // LoRA params in f32
         let lora_bytes = self.num_trainable_params() * 4;
@@ -519,7 +517,11 @@ mod tests {
         // But LoRA params are in full precision, so overall savings is less
         // Expected: (quantized_weight + lora) / (full_weight + lora)
         // quantized ~= full / 8, lora stays same
-        assert!(savings < 0.3, "Expected significant memory savings, got {}", savings);
+        assert!(
+            savings < 0.3,
+            "Expected significant memory savings, got {}",
+            savings
+        );
     }
 
     #[test]
@@ -588,7 +590,13 @@ mod tests {
         output2.eval().unwrap();
 
         // Results should be identical
-        let diff = output1.subtract(&output2).unwrap().abs().unwrap().max(None).unwrap();
+        let diff = output1
+            .subtract(&output2)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
         diff.eval().unwrap();
         assert!(diff.item::<f32>() < 1e-10);
 

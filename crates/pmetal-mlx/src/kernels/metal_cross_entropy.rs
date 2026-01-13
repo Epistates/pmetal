@@ -46,8 +46,8 @@ use pmetal_metal::{
     FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig,
 };
 
-use crate::error::MlxError;
 use super::cut_cross_entropy::{CutCrossEntropy, CutCrossEntropyConfig};
+use crate::error::MlxError;
 
 /// Result type for metal cross-entropy operations.
 pub type Result<T> = std::result::Result<T, MlxError>;
@@ -145,8 +145,7 @@ pub struct MetalCrossEntropyContext {
 impl MetalCrossEntropyContext {
     /// Create a new Metal cross-entropy context.
     pub fn new() -> Result<Self> {
-        let metal_ctx = MetalContext::global()
-            .map_err(|e| MlxError::Metal(e.to_string()))?;
+        let metal_ctx = MetalContext::global().map_err(|e| MlxError::Metal(e.to_string()))?;
         Ok(Self { metal_ctx })
     }
 
@@ -157,10 +156,7 @@ impl MetalCrossEntropyContext {
 }
 
 /// Convert MLX i32 Array to MetalBuffer<i32>.
-fn array_to_metal_buffer_i32(
-    ctx: &MetalContext,
-    array: &Array,
-) -> Result<MetalBuffer<i32>> {
+fn array_to_metal_buffer_i32(ctx: &MetalContext, array: &Array) -> Result<MetalBuffer<i32>> {
     // Ensure array is evaluated and in i32
     let array = if array.dtype() != Dtype::Int32 {
         array.as_dtype(Dtype::Int32)?
@@ -175,10 +171,7 @@ fn array_to_metal_buffer_i32(
 }
 
 /// Convert MLX f32 Array to MetalBuffer<f32>.
-fn array_to_metal_buffer_f32(
-    ctx: &MetalContext,
-    array: &Array,
-) -> Result<MetalBuffer<f32>> {
+fn array_to_metal_buffer_f32(ctx: &MetalContext, array: &Array) -> Result<MetalBuffer<f32>> {
     let array = if array.dtype() != Dtype::Float32 {
         array.as_dtype(Dtype::Float32)?
     } else {
@@ -192,10 +185,7 @@ fn array_to_metal_buffer_f32(
 }
 
 /// Convert MLX f16 Array to MetalBuffer<f16>.
-fn array_to_metal_buffer_f16(
-    ctx: &MetalContext,
-    array: &Array,
-) -> Result<MetalBuffer<f16>> {
+fn array_to_metal_buffer_f16(ctx: &MetalContext, array: &Array) -> Result<MetalBuffer<f16>> {
     let array = if array.dtype() != Dtype::Float16 {
         array.as_dtype(Dtype::Float16)?
     } else {
@@ -326,13 +316,15 @@ fn metal_kernel_cross_entropy(
         let hidden_buffer = array_to_metal_buffer_f16(metal_ctx, hidden_states)?;
         let weight_buffer = array_to_metal_buffer_f16(metal_ctx, lm_head_weight)?;
 
-        kernel.forward_f16(&hidden_buffer, &weight_buffer, &targets_buffer)
+        kernel
+            .forward_f16(&hidden_buffer, &weight_buffer, &targets_buffer)
             .map_err(|e| MlxError::Metal(e.to_string()))?
     } else {
         let hidden_buffer = array_to_metal_buffer_f32(metal_ctx, hidden_states)?;
         let weight_buffer = array_to_metal_buffer_f32(metal_ctx, lm_head_weight)?;
 
-        kernel.forward(&hidden_buffer, &weight_buffer, &targets_buffer)
+        kernel
+            .forward(&hidden_buffer, &weight_buffer, &targets_buffer)
             .map_err(|e| MlxError::Metal(e.to_string()))?
     };
 
@@ -347,11 +339,17 @@ fn metal_kernel_cross_entropy(
 
     // Compute mean loss
     let mean_loss = output.mean_loss(targets_slice, config.ignore_index);
-    let n_valid = targets_slice.iter().filter(|&&t| t != config.ignore_index).count();
+    let n_valid = targets_slice
+        .iter()
+        .filter(|&&t| t != config.ignore_index)
+        .count();
 
     // Validate result
     if !mean_loss.is_finite() {
-        warn!("Metal kernel returned non-finite loss ({}), falling back to MLX", mean_loss);
+        warn!(
+            "Metal kernel returned non-finite loss ({}), falling back to MLX",
+            mean_loss
+        );
         return mlx_cut_cross_entropy(hidden_states, lm_head_weight, targets, config);
     }
 
@@ -393,10 +391,10 @@ pub fn fused_linear_cross_entropy_loss(
     ignore_index: i32,
 ) -> Result<Array> {
     let ctx = MetalCrossEntropyContext::new()?;
-    let config = MetalCrossEntropyConfig::new()
-        .with_ignore_index(ignore_index);
+    let config = MetalCrossEntropyConfig::new().with_ignore_index(ignore_index);
 
-    let output = metal_fused_linear_cross_entropy(&ctx, hidden_states, lm_head_weight, targets, &config)?;
+    let output =
+        metal_fused_linear_cross_entropy(&ctx, hidden_states, lm_head_weight, targets, &config)?;
     Ok(output.loss)
 }
 
@@ -413,7 +411,8 @@ pub fn fused_linear_cross_entropy_loss_smoothed(
         .with_ignore_index(ignore_index)
         .with_label_smoothing(label_smoothing);
 
-    let output = metal_fused_linear_cross_entropy(&ctx, hidden_states, lm_head_weight, targets, &config)?;
+    let output =
+        metal_fused_linear_cross_entropy(&ctx, hidden_states, lm_head_weight, targets, &config)?;
     Ok(output.loss)
 }
 
@@ -485,10 +484,10 @@ mod tests {
         let targets = Array::from_slice(&[0i32, -100, 5, -100], &[4]);
 
         let ctx = MetalCrossEntropyContext::new().unwrap();
-        let config = MetalCrossEntropyConfig::new()
-            .with_ignore_index(-100);  // use_metal defaults to false
+        let config = MetalCrossEntropyConfig::new().with_ignore_index(-100); // use_metal defaults to false
 
-        let output = metal_fused_linear_cross_entropy(&ctx, &hidden, &weight, &targets, &config).unwrap();
+        let output =
+            metal_fused_linear_cross_entropy(&ctx, &hidden, &weight, &targets, &config).unwrap();
 
         assert_eq!(output.n_valid, 2);
         output.loss.eval().unwrap();

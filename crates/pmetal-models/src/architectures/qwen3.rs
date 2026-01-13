@@ -6,16 +6,11 @@
 //! - Support for layer_types configuration (full_attention vs sliding)
 //! - Backwards compatible with Qwen2 weight files
 
+use mlx_rs::{
+    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn, Array,
+};
 use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
 use pmetal_mlx::kv_cache::KVCache;
-use mlx_rs::{
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::Module,
-    nn,
-    Array,
-};
 use serde::{Deserialize, Serialize};
 
 /// Qwen3 model configuration.
@@ -624,7 +619,6 @@ impl Qwen3ForCausalLM {
         &self.model.config
     }
 }
-
 
 #[cfg(test)]
 mod tests {

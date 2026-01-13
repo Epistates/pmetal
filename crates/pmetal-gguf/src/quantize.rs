@@ -3,7 +3,9 @@
 //! Helper functions for quantizing f32 data to K-quant block formats.
 //! Based on llama.cpp and Candle implementations.
 
-use crate::k_quants::{quantize_q2k, quantize_q3k, quantize_q4k, quantize_q5k, quantize_q6k, quantize_q8k};
+use crate::k_quants::{
+    quantize_q2k, quantize_q3k, quantize_q4k, quantize_q5k, quantize_q6k, quantize_q8k,
+};
 use crate::types::GgmlType;
 use pmetal_core::{PMetalError, Result};
 
@@ -62,11 +64,7 @@ fn blocks_to_bytes<T: Copy>(blocks: &[T]) -> Vec<u8> {
     // SAFETY: We're reinterpreting the blocks as raw bytes
     // The blocks are repr(C) packed structs
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            blocks.as_ptr() as *const u8,
-            bytes.as_mut_ptr(),
-            byte_len,
-        );
+        std::ptr::copy_nonoverlapping(blocks.as_ptr() as *const u8, bytes.as_mut_ptr(), byte_len);
     }
     bytes
 }

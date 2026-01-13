@@ -50,17 +50,15 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{Array, nn};
+use mlx_rs::{nn, Array};
 
 use crate::autograd::{
-    AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads,
-    lora_forward_with_grad, lora_backward,
+    lora_backward, lora_forward_with_grad, AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext,
+    LoraGrads,
 };
 use crate::custom_backward::{
-    AttentionSaved, RmsNormSaved, RopeSaved, SiluSaved,
-    attention_backward, attention_forward_with_grad,
-    rmsnorm_backward, rmsnorm_forward_with_grad,
-    silu_backward, silu_forward_with_grad,
+    attention_backward, attention_forward_with_grad, rmsnorm_backward, rmsnorm_forward_with_grad,
+    silu_backward, silu_forward_with_grad, AttentionSaved, RmsNormSaved, RopeSaved, SiluSaved,
 };
 use crate::custom_training::CustomLoraTrainer;
 use crate::{LoraError, LoraLinear};
@@ -184,7 +182,8 @@ impl CustomAutogradTrainer {
             &layer.lora_b,
             layer.scale,
             &self.ctx,
-        ).map_err(LoraError::from)
+        )
+        .map_err(LoraError::from)
     }
 
     /// Perform backward pass through a LoRA linear layer.
@@ -208,41 +207,23 @@ impl CustomAutogradTrainer {
     }
 
     /// Accumulate gradients from a layer.
-    pub fn accumulate_layer_grads(
-        &mut self,
-        layer_idx: usize,
-        grads: &LayerGradients,
-    ) {
+    pub fn accumulate_layer_grads(&mut self, layer_idx: usize, grads: &LayerGradients) {
         let prefix = format!("layers.{}", layer_idx);
 
-        self.accumulated_grads.add_layer_grads(
-            &format!("{}.self_attn.q_proj", prefix),
-            &grads.q_grads,
-        );
-        self.accumulated_grads.add_layer_grads(
-            &format!("{}.self_attn.k_proj", prefix),
-            &grads.k_grads,
-        );
-        self.accumulated_grads.add_layer_grads(
-            &format!("{}.self_attn.v_proj", prefix),
-            &grads.v_grads,
-        );
-        self.accumulated_grads.add_layer_grads(
-            &format!("{}.self_attn.o_proj", prefix),
-            &grads.o_grads,
-        );
-        self.accumulated_grads.add_layer_grads(
-            &format!("{}.mlp.gate_proj", prefix),
-            &grads.gate_grads,
-        );
-        self.accumulated_grads.add_layer_grads(
-            &format!("{}.mlp.up_proj", prefix),
-            &grads.up_grads,
-        );
-        self.accumulated_grads.add_layer_grads(
-            &format!("{}.mlp.down_proj", prefix),
-            &grads.down_grads,
-        );
+        self.accumulated_grads
+            .add_layer_grads(&format!("{}.self_attn.q_proj", prefix), &grads.q_grads);
+        self.accumulated_grads
+            .add_layer_grads(&format!("{}.self_attn.k_proj", prefix), &grads.k_grads);
+        self.accumulated_grads
+            .add_layer_grads(&format!("{}.self_attn.v_proj", prefix), &grads.v_grads);
+        self.accumulated_grads
+            .add_layer_grads(&format!("{}.self_attn.o_proj", prefix), &grads.o_grads);
+        self.accumulated_grads
+            .add_layer_grads(&format!("{}.mlp.gate_proj", prefix), &grads.gate_grads);
+        self.accumulated_grads
+            .add_layer_grads(&format!("{}.mlp.up_proj", prefix), &grads.up_grads);
+        self.accumulated_grads
+            .add_layer_grads(&format!("{}.mlp.down_proj", prefix), &grads.down_grads);
     }
 
     /// Check if we should apply gradients (after accumulation).
@@ -288,8 +269,11 @@ pub fn mlp_backward(
     // d_output is gradient w.r.t. down(mlp_hidden)
     // First, backward through down projection
     let down_grads = lora_backward(d_output, down_saved)?;
-    let d_mlp_hidden = down_grads.d_x.as_ref()
-        .ok_or_else(|| LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from down backward")))?;
+    let d_mlp_hidden = down_grads.d_x.as_ref().ok_or_else(|| {
+        LoraError::Mlx(mlx_rs::error::Exception::custom(
+            "Expected d_x from down backward",
+        ))
+    })?;
 
     // d_mlp_hidden is gradient w.r.t. gate_activated * up_out
     // d_gate_activated = d_mlp_hidden * up_out
@@ -307,10 +291,16 @@ pub fn mlp_backward(
     let up_grads = lora_backward(&d_up_out, up_saved)?;
 
     // d_x = d_gate_x + d_up_x (both paths from x)
-    let d_gate_x = gate_grads.d_x.as_ref()
-        .ok_or_else(|| LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from gate backward")))?;
-    let d_up_x = up_grads.d_x.as_ref()
-        .ok_or_else(|| LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from up backward")))?;
+    let d_gate_x = gate_grads.d_x.as_ref().ok_or_else(|| {
+        LoraError::Mlx(mlx_rs::error::Exception::custom(
+            "Expected d_x from gate backward",
+        ))
+    })?;
+    let d_up_x = up_grads.d_x.as_ref().ok_or_else(|| {
+        LoraError::Mlx(mlx_rs::error::Exception::custom(
+            "Expected d_x from up backward",
+        ))
+    })?;
     let d_x = d_gate_x.add(d_up_x)?;
 
     Ok((d_x, gate_grads, up_grads, down_grads))
@@ -352,7 +342,8 @@ mod tests {
         let (down_out, down_saved) = trainer.lora_forward(&down, &mlp_hidden).unwrap();
 
         // Backward
-        let d_output = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
+        let d_output =
+            mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
 
         let (d_x, gate_grads, up_grads, down_grads) = mlp_backward(
             &d_output,
@@ -362,7 +353,8 @@ mod tests {
             &down_saved,
             &gate_activated,
             &up_out,
-        ).unwrap();
+        )
+        .unwrap();
 
         // Verify shapes
         assert_eq!(d_x.shape(), &[batch, seq_len, hidden]);

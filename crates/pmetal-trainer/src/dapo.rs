@@ -205,7 +205,9 @@ impl DapoConfig {
             return Err(DapoError::Config("temperature must be positive".into()));
         }
         if self.min_group_size == 0 {
-            return Err(DapoError::Config("min_group_size must be at least 1".into()));
+            return Err(DapoError::Config(
+                "min_group_size must be at least 1".into(),
+            ));
         }
         Ok(())
     }
@@ -297,11 +299,7 @@ impl DapoPromptGroup {
             return;
         }
         // Accuracy = fraction of positive rewards (correct answers)
-        let correct = self
-            .completions
-            .iter()
-            .filter(|c| c.reward > 0.0)
-            .count();
+        let correct = self.completions.iter().filter(|c| c.reward > 0.0).count();
         self.accuracy = correct as f64 / self.completions.len() as f64;
     }
 
@@ -396,8 +394,7 @@ impl DapoTrainer {
         for group in groups {
             for completion in &mut group.completions {
                 if completion.truncated {
-                    completion.reward =
-                        completion.raw_reward + self.config.overlong_penalty;
+                    completion.reward = completion.raw_reward + self.config.overlong_penalty;
                 }
             }
             // Update group accuracy after penalty
@@ -470,18 +467,18 @@ impl DapoTrainer {
         let eps_high = 1.0 + self.config.clip_eps_high;
         let eps_low = self.config.clip_eps_low;
 
-        let ratio_clipped_high =
-            mlx_rs::ops::minimum(&ratio, &Array::from_f32(eps_high as f32))?;
-        let ratio_clipped = mlx_rs::ops::maximum(
-            &ratio_clipped_high,
-            &Array::from_f32(eps_low as f32),
-        )?;
+        let ratio_clipped_high = mlx_rs::ops::minimum(&ratio, &Array::from_f32(eps_high as f32))?;
+        let ratio_clipped =
+            mlx_rs::ops::maximum(&ratio_clipped_high, &Array::from_f32(eps_low as f32))?;
 
         // Compute clip fraction for logging
         let is_clipped = ratio
             .gt(&Array::from_f32(eps_high as f32))?
             .as_dtype(mlx_rs::Dtype::Float32)?;
-        let clip_fraction = is_clipped.multiply(mask)?.sum(None)?.divide(&mask.sum(None)?)?;
+        let clip_fraction = is_clipped
+            .multiply(mask)?
+            .sum(None)?
+            .divide(&mask.sum(None)?)?;
         clip_fraction.eval()?;
         let clip_frac = clip_fraction.item::<f32>();
 
@@ -502,9 +499,9 @@ impl DapoTrainer {
     /// Compute sequence-level DAPO loss (alternative to token-level).
     pub fn compute_sequence_level_loss(
         &self,
-        policy_logps: &Array, // [batch]
+        policy_logps: &Array,     // [batch]
         old_policy_logps: &Array, // [batch]
-        advantages: &Array, // [batch]
+        advantages: &Array,       // [batch]
     ) -> DapoResult<(Array, f32)> {
         // Importance ratio
         let log_ratio = policy_logps.subtract(old_policy_logps)?;
@@ -514,12 +511,9 @@ impl DapoTrainer {
         let eps_high = 1.0 + self.config.clip_eps_high;
         let eps_low = self.config.clip_eps_low;
 
-        let ratio_clipped_high =
-            mlx_rs::ops::minimum(&ratio, &Array::from_f32(eps_high as f32))?;
-        let ratio_clipped = mlx_rs::ops::maximum(
-            &ratio_clipped_high,
-            &Array::from_f32(eps_low as f32),
-        )?;
+        let ratio_clipped_high = mlx_rs::ops::minimum(&ratio, &Array::from_f32(eps_high as f32))?;
+        let ratio_clipped =
+            mlx_rs::ops::maximum(&ratio_clipped_high, &Array::from_f32(eps_low as f32))?;
 
         // Clip fraction
         let is_clipped = ratio.gt(&Array::from_f32(eps_high as f32))?;
@@ -558,11 +552,7 @@ impl DapoTrainer {
     }
 
     /// Compute entropy bonus.
-    pub fn compute_entropy(
-        &self,
-        logits: &Array,
-        mask: Option<&Array>,
-    ) -> DapoResult<Array> {
+    pub fn compute_entropy(&self, logits: &Array, mask: Option<&Array>) -> DapoResult<Array> {
         let log_probs = mlx_rs::nn::log_softmax(logits, -1)?;
         let probs = log_probs.exp()?;
         let neg_entropy = probs.multiply(&log_probs)?.sum_axis(-1, None)?;
@@ -580,10 +570,7 @@ impl DapoTrainer {
     /// Prepare a training batch from prompt groups.
     ///
     /// Applies dynamic sampling and computes advantages.
-    pub fn prepare_batch(
-        &mut self,
-        groups: &mut [DapoPromptGroup],
-    ) -> DapoResult<DapoBatch> {
+    pub fn prepare_batch(&mut self, groups: &mut [DapoPromptGroup]) -> DapoResult<DapoBatch> {
         // Apply overlong penalty
         self.apply_overlong_penalty(groups);
 
@@ -650,8 +637,7 @@ impl DapoTrainer {
         let n_completions = advantages.len();
         if n_completions > 0 {
             self.stats.mean_reward = total_reward / n_completions as f64;
-            self.stats.mean_advantage =
-                advantages.iter().sum::<f64>() / n_completions as f64;
+            self.stats.mean_advantage = advantages.iter().sum::<f64>() / n_completions as f64;
         }
 
         Ok(DapoBatch {
@@ -840,11 +826,7 @@ mod tests {
         trainer.compute_advantages(&mut groups);
 
         // Mean = 2.0, normalized advantages should sum to ~0
-        let adv_sum: f64 = groups[0]
-            .completions
-            .iter()
-            .map(|c| c.advantage)
-            .sum();
+        let adv_sum: f64 = groups[0].completions.iter().map(|c| c.advantage).sum();
         assert!(adv_sum.abs() < 0.01);
     }
 

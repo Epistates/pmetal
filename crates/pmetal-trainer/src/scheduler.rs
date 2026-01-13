@@ -44,9 +44,7 @@ impl LrScheduler {
         match self.scheduler_type {
             LrSchedulerType::Constant => self.base_lr,
             LrSchedulerType::Linear => self.base_lr * (1.0 - progress),
-            LrSchedulerType::Cosine => {
-                self.base_lr * 0.5 * (1.0 + (PI * progress).cos())
-            }
+            LrSchedulerType::Cosine => self.base_lr * 0.5 * (1.0 + (PI * progress).cos()),
             LrSchedulerType::CosineWithRestarts => {
                 // Single cycle for now
                 self.base_lr * 0.5 * (1.0 + (PI * progress).cos())

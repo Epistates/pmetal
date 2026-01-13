@@ -30,14 +30,14 @@
 //! 3. **Early Exit Masking**: Skip computation for finished sequences
 //! 4. **Async Pipelining**: Overlap sampling with next forward pass
 
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
-use pmetal_mlx::prefix_cache::PrefixCachedGenerator;
 use mlx_rs::{
-    Array,
     error::Exception,
     ops::{concatenate_axis, indexing::IndexOp},
     random::categorical,
+    Array,
 };
+use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
+use pmetal_mlx::prefix_cache::PrefixCachedGenerator;
 
 use crate::generation::{GenerationConfig, GenerationOutput};
 
@@ -204,9 +204,8 @@ impl BatchedRlGenerator {
         let batch_size = self.config.num_generations;
 
         // Initialize per-sequence state
-        let mut sequences: Vec<Vec<u32>> = (0..batch_size)
-            .map(|_| prompt_tokens.to_vec())
-            .collect();
+        let mut sequences: Vec<Vec<u32>> =
+            (0..batch_size).map(|_| prompt_tokens.to_vec()).collect();
         let mut finished: Vec<bool> = vec![false; batch_size];
         let mut stopped_by_token: Vec<bool> = vec![false; batch_size];
 
@@ -311,15 +310,17 @@ impl BatchedRlGenerator {
         }
 
         // Build output
-        let num_generated: Vec<usize> = sequences
-            .iter()
-            .map(|s| s.len() - prompt_len)
-            .collect();
+        let num_generated: Vec<usize> = sequences.iter().map(|s| s.len() - prompt_len).collect();
 
         let stopped_by_length: Vec<bool> = finished
             .iter()
             .zip(stopped_by_token.iter())
-            .map(|(&f, &st)| !st && f || num_generated.iter().any(|&n| n >= self.config.max_new_tokens))
+            .map(|(&f, &st)| {
+                !st && f
+                    || num_generated
+                        .iter()
+                        .any(|&n| n >= self.config.max_new_tokens)
+            })
             .collect();
 
         Ok(BatchedGenerationOutput {

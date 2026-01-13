@@ -148,7 +148,9 @@ pub fn sinkhorn_knopp_batch(h_tilde_batch: &Array3<f32>, config: &SinkhornConfig
     for b in 0..batch_size {
         let h_tilde = h_tilde_batch.slice(ndarray::s![b, .., ..]).to_owned();
         let result = sinkhorn_knopp(&h_tilde, config);
-        output.slice_mut(ndarray::s![b, .., ..]).assign(&result.matrix);
+        output
+            .slice_mut(ndarray::s![b, .., ..])
+            .assign(&result.matrix);
     }
 
     output
@@ -405,7 +407,12 @@ mod tests {
 
     #[test]
     fn test_sinkhorn_row_sums() {
-        let h_tilde = array![[0.5, 1.5, 2.0, 0.3], [1.0, 2.0, 3.0, 1.5], [0.2, 0.8, 1.2, 0.9], [2.1, 1.3, 0.7, 1.8]];
+        let h_tilde = array![
+            [0.5, 1.5, 2.0, 0.3],
+            [1.0, 2.0, 3.0, 1.5],
+            [0.2, 0.8, 1.2, 0.9],
+            [2.1, 1.3, 0.7, 1.8]
+        ];
         let config = SinkhornConfig::default();
 
         let result = sinkhorn_knopp(&h_tilde, &config);
@@ -413,18 +420,18 @@ mod tests {
         // Check row sums
         for i in 0..4 {
             let row_sum: f32 = result.matrix.row(i).iter().sum();
-            assert!(
-                (row_sum - 1.0).abs() < 1e-4,
-                "Row {} sum: {}",
-                i,
-                row_sum
-            );
+            assert!((row_sum - 1.0).abs() < 1e-4, "Row {} sum: {}", i, row_sum);
         }
     }
 
     #[test]
     fn test_sinkhorn_col_sums() {
-        let h_tilde = array![[0.5, 1.5, 2.0, 0.3], [1.0, 2.0, 3.0, 1.5], [0.2, 0.8, 1.2, 0.9], [2.1, 1.3, 0.7, 1.8]];
+        let h_tilde = array![
+            [0.5, 1.5, 2.0, 0.3],
+            [1.0, 2.0, 3.0, 1.5],
+            [0.2, 0.8, 1.2, 0.9],
+            [2.1, 1.3, 0.7, 1.8]
+        ];
         let config = SinkhornConfig::default();
 
         let result = sinkhorn_knopp(&h_tilde, &config);
@@ -469,7 +476,12 @@ mod tests {
     #[test]
     fn test_amax_gain_bounded() {
         // Doubly stochastic matrices should have Amax gain ≤ 1 (approximately)
-        let h_tilde = array![[1.0, 2.0, 0.5, 1.5], [0.8, 1.2, 2.1, 0.9], [1.5, 0.7, 1.3, 2.0], [2.0, 1.8, 0.6, 0.4]];
+        let h_tilde = array![
+            [1.0, 2.0, 0.5, 1.5],
+            [0.8, 1.2, 2.1, 0.9],
+            [1.5, 0.7, 1.3, 2.0],
+            [2.0, 1.8, 0.6, 0.4]
+        ];
         let config = SinkhornConfig::default();
 
         let result = sinkhorn_knopp(&h_tilde, &config);
@@ -478,11 +490,7 @@ mod tests {
         let backward_gain = amax_gain_backward(&result.matrix);
 
         // For a doubly stochastic matrix, Amax gain should be close to 1
-        assert!(
-            forward_gain <= 1.0 + 1e-4,
-            "Forward gain: {}",
-            forward_gain
-        );
+        assert!(forward_gain <= 1.0 + 1e-4, "Forward gain: {}", forward_gain);
         assert!(
             backward_gain <= 1.0 + 1e-4,
             "Backward gain: {}",
@@ -493,7 +501,12 @@ mod tests {
     #[test]
     fn test_spectral_norm_bounded() {
         // The spectral norm of a doubly stochastic matrix is bounded by 1
-        let h_tilde = array![[1.0, 2.0, 3.0, 4.0], [2.0, 1.0, 4.0, 3.0], [3.0, 4.0, 1.0, 2.0], [4.0, 3.0, 2.0, 1.0]];
+        let h_tilde = array![
+            [1.0, 2.0, 3.0, 4.0],
+            [2.0, 1.0, 4.0, 3.0],
+            [3.0, 4.0, 1.0, 2.0],
+            [4.0, 3.0, 2.0, 1.0]
+        ];
         let config = SinkhornConfig::default();
 
         let result = sinkhorn_knopp(&h_tilde, &config);
@@ -508,14 +521,16 @@ mod tests {
         let av = result.matrix.dot(&v);
         let spectral_norm: f32 = av.iter().map(|x| x * x).sum::<f32>().sqrt();
 
-        assert!(spectral_norm <= 1.0 + 1e-4, "Spectral norm: {}", spectral_norm);
+        assert!(
+            spectral_norm <= 1.0 + 1e-4,
+            "Spectral norm: {}",
+            spectral_norm
+        );
     }
 
     #[test]
     fn test_batched_sinkhorn() {
-        let batch = Array3::from_shape_fn((8, 4, 4), |(_, i, j)| {
-            ((i + j) as f32) * 0.5
-        });
+        let batch = Array3::from_shape_fn((8, 4, 4), |(_, i, j)| ((i + j) as f32) * 0.5);
         let config = SinkhornConfig::default();
 
         let output = sinkhorn_knopp_batch(&batch, &config);
@@ -555,7 +570,11 @@ mod tests {
         let backward_gain = amax_gain_backward(&composite);
 
         // Paper shows max ~1.6 for 60 layers
-        assert!(forward_gain < 3.0, "Forward gain too high: {}", forward_gain);
+        assert!(
+            forward_gain < 3.0,
+            "Forward gain too high: {}",
+            forward_gain
+        );
         assert!(
             backward_gain < 3.0,
             "Backward gain too high: {}",

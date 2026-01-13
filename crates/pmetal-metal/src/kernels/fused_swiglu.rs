@@ -163,7 +163,11 @@ impl FusedSwiGLU {
     pub fn new(ctx: Arc<MetalContext>, config: FusedSwiGLUConfig) -> Result<Self> {
         // Select threadgroup size based on device tier for M4 optimization
         let threads_per_group = Self::select_threadgroup_size(&ctx);
-        Ok(Self { ctx, config, threads_per_group })
+        Ok(Self {
+            ctx,
+            config,
+            threads_per_group,
+        })
     }
 
     /// Select optimal threadgroup size based on device tier.
@@ -256,9 +260,7 @@ impl FusedSwiGLU {
         up_lora_b: &MetalBuffer<f32>,
     ) -> Result<FusedSwiGLUOutput> {
         if !self.config.has_lora() {
-            return Err(MetalError::InvalidConfig(
-                "LoRA not configured".to_string(),
-            ));
+            return Err(MetalError::InvalidConfig("LoRA not configured".to_string()));
         }
 
         // Validate input
@@ -530,7 +532,11 @@ impl FusedMLP {
     pub fn new(ctx: Arc<MetalContext>, config: FusedSwiGLUConfig) -> Result<Self> {
         // Select threadgroup size based on device tier for M4 optimization
         let threads_per_group = Self::select_threadgroup_size(&ctx);
-        Ok(Self { ctx, config, threads_per_group })
+        Ok(Self {
+            ctx,
+            config,
+            threads_per_group,
+        })
     }
 
     /// Select optimal threadgroup size based on device tier.

@@ -10,8 +10,8 @@
 //! - `apply_pre`: Aggregate streams using H^pre weights
 //! - `apply_post_res`: Fused post-mapping and residual merge
 
-pub mod metal_shaders;
 pub mod metal_impl;
+pub mod metal_shaders;
 
 // Re-exports
 pub use metal_impl::MhcMetalError;
@@ -41,7 +41,7 @@ impl Default for MhcKernelConfig {
     fn default() -> Self {
         Self {
             compute_mappings_threads: 256,
-            sinkhorn_threads: 64,  // Smaller for iterative algorithm
+            sinkhorn_threads: 64, // Smaller for iterative algorithm
             apply_threads: 256,
             use_mixed_precision: true,
         }

@@ -326,10 +326,8 @@ impl CheckpointManager {
         })?;
 
         // Convert HashMap<String, Array> to HashMap<Rc<str>, Array>
-        let params: HashMap<Rc<str>, Array> = params
-            .into_iter()
-            .map(|(k, v)| (Rc::from(k), v))
-            .collect();
+        let params: HashMap<Rc<str>, Array> =
+            params.into_iter().map(|(k, v)| (Rc::from(k), v)).collect();
 
         // Load metadata
         let metadata_path = checkpoint_path.join("metadata.json");
@@ -458,7 +456,10 @@ mod tests {
 
         // Create dummy parameters
         let mut params: HashMap<Rc<str>, Array> = HashMap::new();
-        params.insert(Rc::from("test_param"), Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]));
+        params.insert(
+            Rc::from("test_param"),
+            Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]),
+        );
 
         // Create metadata
         let metadata = CheckpointMetadata::new(50, 1, 0.3, 1e-4);

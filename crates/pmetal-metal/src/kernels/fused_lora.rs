@@ -84,9 +84,7 @@ impl FusedLoraConfig {
             return Err(MetalError::InvalidConfig("in_features must be > 0".into()));
         }
         if self.out_features == 0 {
-            return Err(MetalError::InvalidConfig(
-                "out_features must be > 0".into(),
-            ));
+            return Err(MetalError::InvalidConfig("out_features must be > 0".into()));
         }
         if self.rank == 0 {
             return Err(MetalError::InvalidConfig("rank must be > 0".into()));

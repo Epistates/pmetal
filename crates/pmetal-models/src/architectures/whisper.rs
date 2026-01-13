@@ -356,11 +356,8 @@ pub struct WhisperEncoderBlock {
 impl WhisperEncoderBlock {
     /// Create a new encoder block.
     pub fn new(config: &WhisperConfig) -> Result<Self, Exception> {
-        let self_attn = WhisperAttention::new(
-            config.d_model,
-            config.encoder_attention_heads,
-            true,
-        )?;
+        let self_attn =
+            WhisperAttention::new(config.d_model, config.encoder_attention_heads, true)?;
         let self_attn_layer_norm = nn::LayerNormBuilder::new(config.d_model)
             .eps(config.layer_norm_eps)
             .build()?;
@@ -429,19 +426,13 @@ pub struct WhisperDecoderBlock {
 impl WhisperDecoderBlock {
     /// Create a new decoder block.
     pub fn new(config: &WhisperConfig) -> Result<Self, Exception> {
-        let self_attn = WhisperAttention::new(
-            config.d_model,
-            config.decoder_attention_heads,
-            true,
-        )?;
+        let self_attn =
+            WhisperAttention::new(config.d_model, config.decoder_attention_heads, true)?;
         let self_attn_layer_norm = nn::LayerNormBuilder::new(config.d_model)
             .eps(config.layer_norm_eps)
             .build()?;
-        let encoder_attn = WhisperAttention::new(
-            config.d_model,
-            config.decoder_attention_heads,
-            true,
-        )?;
+        let encoder_attn =
+            WhisperAttention::new(config.d_model, config.decoder_attention_heads, true)?;
         let encoder_attn_layer_norm = nn::LayerNormBuilder::new(config.d_model)
             .eps(config.layer_norm_eps)
             .build()?;
@@ -480,7 +471,9 @@ impl WhisperDecoderBlock {
 
         // Cross-attention with residual
         let x_norm = Module::forward(&mut self.encoder_attn_layer_norm, &x)?;
-        let cross_out = self.encoder_attn.forward(&x_norm, Some(encoder_out), None)?;
+        let cross_out = self
+            .encoder_attn
+            .forward(&x_norm, Some(encoder_out), None)?;
         let x = mlx_rs::ops::add(&x, &cross_out)?;
 
         // MLP with residual

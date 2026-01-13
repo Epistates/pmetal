@@ -13,10 +13,10 @@
 //! log_odds = log(probs / (1 - probs))
 //! ```
 
-use pmetal_core::TrainingConfig;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, Dtype};
+use pmetal_core::TrainingConfig;
 
 /// Error type for ORPO training.
 #[derive(Debug, thiserror::Error)]
@@ -180,11 +180,11 @@ impl OrpoTrainer {
             let p = avg_log_p.exp()?;
             let one = Array::from_f32(1.0);
             let one_minus_p = one.subtract(&p)?;
-            
+
             // Numerical stability: clip 1-p to avoid log(0)
             let epsilon = Array::from_f32(1e-10);
             let one_minus_p_safe = mlx_rs::ops::maximum(&one_minus_p, &epsilon)?;
-            
+
             let log_one_minus_p = one_minus_p_safe.log()?;
             Ok(avg_log_p.subtract(&log_one_minus_p)?)
         };
@@ -223,10 +223,10 @@ mod tests {
         // Test log odds calculation
         // If p = 0.5, log_odds = log(0.5/0.5) = 0
         // avg_log_p = log(0.5) = -0.6931
-        
+
         let config = OrpoConfig::default();
         let _trainer = OrpoTrainer::new(config, TrainingConfig::default()).unwrap();
-        
+
         let avg_log_p = Array::from_f32(-0.693147);
         // Manually invoke logic (can't access closure directly)
         // Replicating closure logic for test:
@@ -235,7 +235,7 @@ mod tests {
         let one_minus_p = one.subtract(&p).unwrap();
         let log_one_minus_p = one_minus_p.log().unwrap();
         let log_odds = avg_log_p.subtract(&log_one_minus_p).unwrap();
-        
+
         log_odds.eval().unwrap();
         assert!(log_odds.item::<f32>().abs() < 1e-4);
     }
@@ -248,29 +248,27 @@ mod tests {
         // Case: Chosen is better
         // Chosen avg log prob = log(0.9) approx -0.105
         // Rejected avg log prob = log(0.1) approx -2.302
-        
+
         let chosen_log_p = Array::from_slice(&[-0.105f32], &[1]);
         let chosen_sum = Array::from_slice(&[-1.05f32], &[1]); // assuming 10 tokens
-        
+
         let rejected_log_p = Array::from_slice(&[-2.302f32], &[1]);
-        
+
         // SFT loss = -sum = 1.05
-        
-        let (total, sft, or, _, _) = trainer.compute_orpo_loss(
-            &chosen_sum,
-            &chosen_log_p,
-            &rejected_log_p
-        ).unwrap();
-        
+
+        let (total, sft, or, _, _) = trainer
+            .compute_orpo_loss(&chosen_sum, &chosen_log_p, &rejected_log_p)
+            .unwrap();
+
         total.eval().unwrap();
         sft.eval().unwrap();
         or.eval().unwrap();
-        
+
         // chosen odds = 0.9/0.1 = 9, log = 2.19
         // rejected odds = 0.1/0.9 = 0.11, log = -2.19
         // diff = 4.38
         // or_loss = -log(sigmoid(4.38)) approx 0.012
-        
+
         assert!((sft.item::<f32>() - 1.05).abs() < 1e-3);
         assert!(or.item::<f32>() < 0.1); // Loss should be small as chosen >> rejected
     }

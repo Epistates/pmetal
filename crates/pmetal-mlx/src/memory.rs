@@ -23,20 +23,20 @@ mod sys {
     pub struct rusage {
         pub ru_utime: timeval,
         pub ru_stime: timeval,
-        pub ru_maxrss: i64,  // Maximum resident set size
-        pub ru_ixrss: i64,   // Integral shared memory size
-        pub ru_idrss: i64,   // Integral unshared data size
-        pub ru_isrss: i64,   // Integral unshared stack size
-        pub ru_minflt: i64,  // Page reclaims (soft page faults)
-        pub ru_majflt: i64,  // Page faults (hard page faults)
-        pub ru_nswap: i64,   // Swaps
-        pub ru_inblock: i64, // Block input operations
-        pub ru_oublock: i64, // Block output operations
-        pub ru_msgsnd: i64,  // IPC messages sent
-        pub ru_msgrcv: i64,  // IPC messages received
-        pub ru_nsignals: i64,// Signals received
-        pub ru_nvcsw: i64,   // Voluntary context switches
-        pub ru_nivcsw: i64,  // Involuntary context switches
+        pub ru_maxrss: i64,   // Maximum resident set size
+        pub ru_ixrss: i64,    // Integral shared memory size
+        pub ru_idrss: i64,    // Integral unshared data size
+        pub ru_isrss: i64,    // Integral unshared stack size
+        pub ru_minflt: i64,   // Page reclaims (soft page faults)
+        pub ru_majflt: i64,   // Page faults (hard page faults)
+        pub ru_nswap: i64,    // Swaps
+        pub ru_inblock: i64,  // Block input operations
+        pub ru_oublock: i64,  // Block output operations
+        pub ru_msgsnd: i64,   // IPC messages sent
+        pub ru_msgrcv: i64,   // IPC messages received
+        pub ru_nsignals: i64, // Signals received
+        pub ru_nvcsw: i64,    // Voluntary context switches
+        pub ru_nivcsw: i64,   // Involuntary context switches
     }
 
     pub const RUSAGE_SELF: i32 = 0;

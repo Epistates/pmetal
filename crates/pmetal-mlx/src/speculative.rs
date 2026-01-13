@@ -550,7 +550,9 @@ mod tests {
         let draft_probs = vec![0.8, 0.7, 0.9];
         let target_probs = vec![0.9, 0.8, 0.85]; // Similar to draft
 
-        let result = decoder.verify(&draft_tokens, &draft_probs, &target_probs).unwrap();
+        let result = decoder
+            .verify(&draft_tokens, &draft_probs, &target_probs)
+            .unwrap();
 
         // With similar probs, most should be accepted
         assert!(result.num_accepted >= 2);
@@ -566,7 +568,9 @@ mod tests {
         let draft_probs = vec![0.9, 0.9, 0.9]; // Draft is confident
         let target_probs = vec![0.1, 0.1, 0.1]; // Target disagrees
 
-        let result = decoder.verify(&draft_tokens, &draft_probs, &target_probs).unwrap();
+        let result = decoder
+            .verify(&draft_tokens, &draft_probs, &target_probs)
+            .unwrap();
 
         // Should reject most/all
         assert!(result.acceptance_rate < 0.5);

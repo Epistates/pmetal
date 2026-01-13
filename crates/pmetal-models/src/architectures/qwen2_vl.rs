@@ -13,11 +13,7 @@
 //!
 //! - Paper: <https://arxiv.org/abs/2409.12191>
 
-use mlx_rs::{
-    error::Exception,
-    macros::ModuleParameters,
-    Array,
-};
+use mlx_rs::{error::Exception, macros::ModuleParameters, Array};
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::qwen2::{Qwen2Config, Qwen2ForCausalLM};
@@ -79,8 +75,12 @@ pub struct Qwen2VLConfig {
     pub video_token_id: i32,
 }
 
-fn default_image_token_id() -> i32 { 151655 }
-fn default_video_token_id() -> i32 { 151656 }
+fn default_image_token_id() -> i32 {
+    151655
+}
+fn default_video_token_id() -> i32 {
+    151656
+}
 
 impl Default for Qwen2VLConfig {
     fn default() -> Self {
@@ -160,7 +160,10 @@ impl Qwen2VL {
     /// Create a new Qwen2-VL model.
     pub fn new(config: Qwen2VLConfig) -> Result<Self, Exception> {
         let language_model = Qwen2ForCausalLM::new(config.text_config.clone())?;
-        Ok(Self { language_model, config })
+        Ok(Self {
+            language_model,
+            config,
+        })
     }
 
     /// Forward pass with optional pre-computed vision embeddings.

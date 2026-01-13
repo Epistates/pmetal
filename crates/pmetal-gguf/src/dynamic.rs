@@ -195,10 +195,8 @@ impl DynamicQuantizer {
         }
 
         // Sort tensors by importance (descending)
-        let mut ranked: Vec<(String, f32)> = tensor_scores
-            .iter()
-            .map(|(k, v)| (k.clone(), *v))
-            .collect();
+        let mut ranked: Vec<(String, f32)> =
+            tensor_scores.iter().map(|(k, v)| (k.clone(), *v)).collect();
         ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
 
         // Find the threshold for top percentile
@@ -275,14 +273,23 @@ mod tests {
     fn create_test_imatrix() -> IMatrix {
         let mut data = HashMap::new();
         // Simulate importance scores for various layers
-        data.insert("model.layers.0.self_attn.q_proj".to_string(), vec![100.0; 100]); // 10000
-        data.insert("model.layers.0.self_attn.k_proj".to_string(), vec![80.0; 100]);  // 8000
-        data.insert("model.layers.0.mlp.gate_proj".to_string(), vec![50.0; 100]);     // 5000
-        data.insert("model.layers.0.mlp.up_proj".to_string(), vec![40.0; 100]);       // 4000
-        data.insert("model.layers.1.self_attn.q_proj".to_string(), vec![90.0; 100]);  // 9000
-        data.insert("model.layers.1.mlp.gate_proj".to_string(), vec![30.0; 100]);     // 3000
-        data.insert("model.layers.2.mlp.down_proj".to_string(), vec![20.0; 100]);     // 2000
-        data.insert("model.layers.3.mlp.down_proj".to_string(), vec![10.0; 100]);     // 1000
+        data.insert(
+            "model.layers.0.self_attn.q_proj".to_string(),
+            vec![100.0; 100],
+        ); // 10000
+        data.insert(
+            "model.layers.0.self_attn.k_proj".to_string(),
+            vec![80.0; 100],
+        ); // 8000
+        data.insert("model.layers.0.mlp.gate_proj".to_string(), vec![50.0; 100]); // 5000
+        data.insert("model.layers.0.mlp.up_proj".to_string(), vec![40.0; 100]); // 4000
+        data.insert(
+            "model.layers.1.self_attn.q_proj".to_string(),
+            vec![90.0; 100],
+        ); // 9000
+        data.insert("model.layers.1.mlp.gate_proj".to_string(), vec![30.0; 100]); // 3000
+        data.insert("model.layers.2.mlp.down_proj".to_string(), vec![20.0; 100]); // 2000
+        data.insert("model.layers.3.mlp.down_proj".to_string(), vec![10.0; 100]); // 1000
         IMatrix {
             data,
             ncalls: HashMap::new(),
@@ -327,31 +334,53 @@ mod tests {
             .values()
             .filter(|&&v| v >= threshold)
             .count();
-        assert!(high_prec_count >= 2, "Should have at least 2 high precision tensors");
+        assert!(
+            high_prec_count >= 2,
+            "Should have at least 2 high precision tensors"
+        );
     }
 
     #[test]
     fn test_critical_layer_detection() {
         assert!(DynamicQuantizer::is_critical_layer("lm_head.weight"));
         assert!(DynamicQuantizer::is_critical_layer("model.output.weight"));
-        assert!(DynamicQuantizer::is_critical_layer("model.embed_tokens.weight"));
+        assert!(DynamicQuantizer::is_critical_layer(
+            "model.embed_tokens.weight"
+        ));
         assert!(DynamicQuantizer::is_critical_layer("token_embd.weight"));
-        assert!(!DynamicQuantizer::is_critical_layer("model.layers.0.mlp.weight"));
+        assert!(!DynamicQuantizer::is_critical_layer(
+            "model.layers.0.mlp.weight"
+        ));
     }
 
     #[test]
     fn test_attention_layer_detection() {
-        assert!(DynamicQuantizer::is_attention_layer("model.layers.0.self_attn.q_proj.weight"));
-        assert!(DynamicQuantizer::is_attention_layer("model.layers.0.attention.k_proj.weight"));
-        assert!(!DynamicQuantizer::is_attention_layer("model.layers.0.mlp.gate_proj.weight"));
+        assert!(DynamicQuantizer::is_attention_layer(
+            "model.layers.0.self_attn.q_proj.weight"
+        ));
+        assert!(DynamicQuantizer::is_attention_layer(
+            "model.layers.0.attention.k_proj.weight"
+        ));
+        assert!(!DynamicQuantizer::is_attention_layer(
+            "model.layers.0.mlp.gate_proj.weight"
+        ));
     }
 
     #[test]
     fn test_layer_index_extraction() {
-        assert_eq!(DynamicQuantizer::extract_layer_index("model.layers.5.mlp"), Some(5));
+        assert_eq!(
+            DynamicQuantizer::extract_layer_index("model.layers.5.mlp"),
+            Some(5)
+        );
         assert_eq!(DynamicQuantizer::extract_layer_index("h.12.attn"), Some(12));
-        assert_eq!(DynamicQuantizer::extract_layer_index("blocks.0.ff"), Some(0));
-        assert_eq!(DynamicQuantizer::extract_layer_index("lm_head.weight"), None);
+        assert_eq!(
+            DynamicQuantizer::extract_layer_index("blocks.0.ff"),
+            Some(0)
+        );
+        assert_eq!(
+            DynamicQuantizer::extract_layer_index("lm_head.weight"),
+            None
+        );
     }
 
     #[test]
@@ -433,7 +462,9 @@ mod tests {
 
         let summary = quantizer.get_quantization_summary();
         assert!(summary.threshold > 0.0);
-        assert!(!summary.high_precision_layers.is_empty() || !summary.base_precision_layers.is_empty());
+        assert!(
+            !summary.high_precision_layers.is_empty() || !summary.base_precision_layers.is_empty()
+        );
     }
 
     #[test]

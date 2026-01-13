@@ -5,11 +5,11 @@
 
 use std::time::Instant;
 
+use mlx_rs::transforms::eval;
+use mlx_rs::Array;
 use pmetal_core::LoraConfig;
 use pmetal_lora::{Qwen3CustomTrainer, Qwen3LoraForCausalLM};
 use pmetal_models::architectures::qwen3::Qwen3Config;
-use mlx_rs::Array;
-use mlx_rs::transforms::eval;
 
 fn create_model_config(hidden_size: i32, num_layers: i32) -> Qwen3Config {
     let head_dim = 64;
@@ -119,7 +119,10 @@ fn main() {
 
     // Report GPU memory
     let mem_size = get_memory_size();
-    println!("GPU Memory Available: {:.2} GB\n", mem_size as f64 / 1024.0 / 1024.0 / 1024.0);
+    println!(
+        "GPU Memory Available: {:.2} GB\n",
+        mem_size as f64 / 1024.0 / 1024.0 / 1024.0
+    );
 
     let configs = [
         // (hidden_size, num_layers, seq_len, batch_size, name)
@@ -129,8 +132,10 @@ fn main() {
     ];
 
     for (hidden_size, num_layers, seq_len, batch_size, name) in configs {
-        println!("Config: {} (hidden={}, layers={}, seq_len={}, batch={})",
-            name, hidden_size, num_layers, seq_len, batch_size);
+        println!(
+            "Config: {} (hidden={}, layers={}, seq_len={}, batch={})",
+            name, hidden_size, num_layers, seq_len, batch_size
+        );
 
         match benchmark_custom_autograd(hidden_size, num_layers, seq_len, batch_size, 5) {
             Ok((loss, duration, tokens)) => {

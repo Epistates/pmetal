@@ -53,7 +53,7 @@ impl Fp8Format {
     /// Minimum representable non-zero value.
     pub fn min_value(&self) -> f32 {
         match self {
-            Self::E4M3 => 1.0 / 448.0,  // 2^-9
+            Self::E4M3 => 1.0 / 448.0,   // 2^-9
             Self::E5M2 => 1.0 / 16384.0, // 2^-14
         }
     }
@@ -204,7 +204,7 @@ impl Fp8TrainingKernel {
     ) -> Result<Fp8QuantOutput> {
         let block_size = self.config.block_size;
         let n_blocks = (k + block_size - 1) / block_size;
-        
+
         let output_data = MetalBuffer::<u8>::new(&self.ctx, m * k, BufferUsage::Shared)?;
         let output_scales = MetalBuffer::<f32>::new(&self.ctx, m * n_blocks, BufferUsage::Shared)?;
 
@@ -214,8 +214,14 @@ impl Fp8TrainingKernel {
             None,
         )?;
 
-        let command_buffer = self.ctx.command_queue().commandBuffer().ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer.computeCommandEncoder().ok_or(MetalError::EncoderCreation)?;
+        let command_buffer = self
+            .ctx
+            .command_queue()
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::EncoderCreation)?;
 
         encoder.setComputePipelineState(&pipeline);
 
@@ -223,11 +229,11 @@ impl Fp8TrainingKernel {
             encoder.setBuffer_offset_atIndex(Some(input.metal_buffer()), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(output_data.metal_buffer()), 0, 1);
             encoder.setBuffer_offset_atIndex(Some(output_scales.metal_buffer()), 0, 2);
-            
+
             let m_u32 = m as u32;
             let k_u32 = k as u32;
             let bs_u32 = block_size as u32;
-            
+
             let params = [m_u32, k_u32, bs_u32];
             let params_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
@@ -238,7 +244,7 @@ impl Fp8TrainingKernel {
             height: m,
             depth: 1,
         };
-        
+
         let threadgroup_size = MTLSize {
             width: block_size.min(256),
             height: 1,
@@ -259,14 +265,11 @@ impl Fp8TrainingKernel {
     }
 
     /// Dequantize FP8 tensor back to BF16 (GPU).
-    pub fn dequantize_gpu(
-        &self,
-        input: &Fp8QuantOutput,
-    ) -> Result<MetalBuffer<bf16>> {
+    pub fn dequantize_gpu(&self, input: &Fp8QuantOutput) -> Result<MetalBuffer<bf16>> {
         let m = input.shape[0];
         let k = input.shape[1];
         let block_size = input.block_size;
-        
+
         let output = MetalBuffer::<bf16>::new(&self.ctx, m * k, BufferUsage::Shared)?;
 
         let pipeline = self.ctx.pipeline_cache_mut().get_or_create_pipeline(
@@ -275,8 +278,14 @@ impl Fp8TrainingKernel {
             None,
         )?;
 
-        let command_buffer = self.ctx.command_queue().commandBuffer().ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer.computeCommandEncoder().ok_or(MetalError::EncoderCreation)?;
+        let command_buffer = self
+            .ctx
+            .command_queue()
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::EncoderCreation)?;
 
         encoder.setComputePipelineState(&pipeline);
 
@@ -284,11 +293,11 @@ impl Fp8TrainingKernel {
             encoder.setBuffer_offset_atIndex(Some(input.data.metal_buffer()), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(input.scales.metal_buffer()), 0, 1);
             encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), 0, 2);
-            
+
             let m_u32 = m as u32;
             let k_u32 = k as u32;
             let bs_u32 = block_size as u32;
-            
+
             let params = [m_u32, k_u32, bs_u32];
             let params_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
@@ -299,14 +308,14 @@ impl Fp8TrainingKernel {
             height: m,
             depth: 1,
         };
-        
+
         // Simple 1D dispatch
         let threadgroup_size = MTLSize {
             width: 32,
             height: 1,
             depth: 1,
         };
-        
+
         // Use dispatchThreads if available (Metal 2) or standard grid
         // Here we use standard grid for compatibility, though inefficient for this kernel
         // Optimized would be 2D blocking
@@ -314,7 +323,7 @@ impl Fp8TrainingKernel {
         let tg_height = 8;
         let grid_width = (k + tg_width - 1) / tg_width;
         let grid_height = (m + tg_height - 1) / tg_height;
-        
+
         let grid_size_dispatch = MTLSize {
             width: grid_width,
             height: grid_height,
@@ -336,38 +345,40 @@ impl Fp8TrainingKernel {
 
     /// Perform Block FP8 GEMM (GPU).
     /// C = A @ B
-    pub fn gemm_gpu(
-        &self,
-        a: &Fp8QuantOutput,
-        b: &Fp8QuantOutput,
-    ) -> Result<MetalBuffer<bf16>> {
+    pub fn gemm_gpu(&self, a: &Fp8QuantOutput, b: &Fp8QuantOutput) -> Result<MetalBuffer<bf16>> {
         let m = a.shape[0];
         let k = a.shape[1];
         let n = b.shape[0]; // Assuming B is [N, K] layout for weights?
-        // Wait, standard matmul is [M, K] @ [K, N].
-        // If B is weights, it's often stored as [N, K] (transposed) or [K, N].
-        // Our kernel 'fp8_block_gemm' comment says:
-        // A: [M, K], B: [N, K] (Quantized weights (N, K))
-        // So B is transposed.
-        
+                            // Wait, standard matmul is [M, K] @ [K, N].
+                            // If B is weights, it's often stored as [N, K] (transposed) or [K, N].
+                            // Our kernel 'fp8_block_gemm' comment says:
+                            // A: [M, K], B: [N, K] (Quantized weights (N, K))
+                            // So B is transposed.
+
         if a.shape[1] != b.shape[1] {
-             return Err(MetalError::DimensionMismatch {
+            return Err(MetalError::DimensionMismatch {
                 param: "K",
                 expected: a.shape[1],
                 actual: b.shape[1],
             });
         }
-        
+
         let output = MetalBuffer::<bf16>::new(&self.ctx, m * n, BufferUsage::Shared)?;
-        
+
         let pipeline = self.ctx.pipeline_cache_mut().get_or_create_pipeline(
             self.ctx.device(),
             "fp8_block_gemm",
             None,
         )?;
 
-        let command_buffer = self.ctx.command_queue().commandBuffer().ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer.computeCommandEncoder().ok_or(MetalError::EncoderCreation)?;
+        let command_buffer = self
+            .ctx
+            .command_queue()
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::EncoderCreation)?;
 
         encoder.setComputePipelineState(&pipeline);
 
@@ -377,7 +388,7 @@ impl Fp8TrainingKernel {
             encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), 0, 2);
             encoder.setBuffer_offset_atIndex(Some(a.scales.metal_buffer()), 0, 3);
             encoder.setBuffer_offset_atIndex(Some(b.scales.metal_buffer()), 0, 4);
-            
+
             // Params: M, N, K, group_n, group_k
             // group_k is block_size (usually 128)
             // group_n is block_size (usually 128)
@@ -386,26 +397,26 @@ impl Fp8TrainingKernel {
             let k_u32 = k as u32;
             let gn_u32 = self.config.block_size as u32;
             let gk_u32 = self.config.block_size as u32;
-            
+
             let params = [m_u32, n_u32, k_u32, gn_u32, gk_u32];
             let params_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
         }
-        
+
         // Grid setup from kernel:
         // Thread block computes BLOCK_M x BLOCK_N tile of C (64x64)
         let block_m = 64;
         let block_n = 64;
-        
+
         let grid_width = (n + block_n - 1) / block_n;
         let grid_height = (m + block_m - 1) / block_m;
-        
+
         let grid_size = MTLSize {
             width: grid_width,
             height: grid_height,
             depth: 1,
         };
-        
+
         // Kernel uses 256 threads (16x16? No, linear index)
         let threadgroup_size = MTLSize {
             width: 256,

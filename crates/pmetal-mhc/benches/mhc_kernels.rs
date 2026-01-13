@@ -1,10 +1,10 @@
 //! Benchmarks for mHC Metal kernels.
 
+use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use ndarray::Array2;
 use pmetal_mhc::{
     apply_post_res_mapping, apply_pre_mapping, compute_mappings, MhcConfig, MhcParams, MhcPreset,
 };
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
-use ndarray::Array2;
 
 fn bench_compute_mappings(c: &mut Criterion) {
     let mut group = c.benchmark_group("compute_mappings");

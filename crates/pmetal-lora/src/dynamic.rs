@@ -23,21 +23,18 @@ use std::collections::HashMap;
 use std::path::Path;
 use std::rc::Rc;
 
+use mlx_rs::Array;
 use pmetal_core::LoraConfig;
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_models::{
     DispatchError, GgufModelConfig, ModelArchitecture, WeightFormat, WeightFormatError,
     WeightLoader,
 };
-use mlx_rs::Array;
 
 use crate::{
-    gemma_lora::GemmaLoraForCausalLM,
-    llama_lora::LlamaLoraForCausalLM,
-    mistral_lora::MistralLoraForCausalLM,
-    phi_lora::PhiLoraForCausalLM,
-    qwen3_lora::Qwen3LoraForCausalLM,
-    LoraError, TrainableModel,
+    gemma_lora::GemmaLoraForCausalLM, llama_lora::LlamaLoraForCausalLM,
+    mistral_lora::MistralLoraForCausalLM, phi_lora::PhiLoraForCausalLM,
+    qwen3_lora::Qwen3LoraForCausalLM, LoraError, TrainableModel,
 };
 
 /// Dynamic LoRA model container using enum dispatch.
@@ -270,9 +267,9 @@ impl DynamicLoraModel {
             "gemma" => ModelArchitecture::Gemma,
             "phi" => ModelArchitecture::Phi,
             other => {
-                return Err(DynamicLoraError::Dispatch(DispatchError::UnsupportedArchitecture(
-                    other.to_string(),
-                )));
+                return Err(DynamicLoraError::Dispatch(
+                    DispatchError::UnsupportedArchitecture(other.to_string()),
+                ));
             }
         };
 
@@ -608,9 +605,21 @@ mod tests {
     #[test]
     fn test_architecture_dispatch() {
         // Test that the dispatch logic is correct
-        assert_eq!(ModelArchitecture::from_model_type("llama"), Some(ModelArchitecture::Llama));
-        assert_eq!(ModelArchitecture::from_model_type("mistral"), Some(ModelArchitecture::Mistral));
-        assert_eq!(ModelArchitecture::from_model_type("qwen3"), Some(ModelArchitecture::Qwen3));
-        assert_eq!(ModelArchitecture::from_model_type("qwen2"), Some(ModelArchitecture::Qwen2));
+        assert_eq!(
+            ModelArchitecture::from_model_type("llama"),
+            Some(ModelArchitecture::Llama)
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("mistral"),
+            Some(ModelArchitecture::Mistral)
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("qwen3"),
+            Some(ModelArchitecture::Qwen3)
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("qwen2"),
+            Some(ModelArchitecture::Qwen2)
+        );
     }
 }

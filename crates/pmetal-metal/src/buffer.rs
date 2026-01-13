@@ -138,11 +138,12 @@ impl<T: Pod + Zeroable> MetalBuffer<T> {
         let options = usage.to_metal_options();
 
         // Create buffer with data
-        let data_ptr = NonNull::new(data.as_ptr() as *mut std::ffi::c_void)
-            .ok_or_else(|| MetalError::BufferCreation {
+        let data_ptr = NonNull::new(data.as_ptr() as *mut std::ffi::c_void).ok_or_else(|| {
+            MetalError::BufferCreation {
                 size,
                 reason: "Null data pointer".to_string(),
-            })?;
+            }
+        })?;
 
         // SAFETY:
         // 1. data_ptr is a NonNull pointer obtained from a valid slice, so it's non-null

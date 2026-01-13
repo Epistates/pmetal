@@ -48,17 +48,17 @@ pub mod checkpointing;
 pub mod dapo;
 pub mod diffusion;
 pub mod distillation;
+pub mod dpo;
 pub mod explicit_state_compile;
 pub mod ffi_compile;
-pub mod jit_compile;
-pub mod dpo;
+pub mod grpo;
 pub mod gspo;
+pub mod jit_compile;
+pub mod kto;
+pub mod lora_trainer;
 pub mod metal_fused;
 pub mod mlx_metal_optimizer;
 pub mod online_dpo;
-pub mod grpo;
-pub mod kto;
-pub mod lora_trainer;
 pub mod orpo;
 pub mod param_groups;
 pub mod ppo;
@@ -78,21 +78,21 @@ pub use distillation::*;
 pub use dpo::*;
 pub use explicit_state_compile::*;
 pub use ffi_compile::*;
-pub use jit_compile::*;
 pub use gspo::*;
+pub use jit_compile::*;
 pub use metal_fused::*;
 pub use mlx_metal_optimizer::{
-    MlxMetalOptimizer, MlxMetalOptimizerBuilder, MlxMetalOptimizerConfig,
-    MlxMetalOptimizerError, MlxMetalOptimizerResult, is_mlx_metal_optimizer_available,
+    is_mlx_metal_optimizer_available, MlxMetalOptimizer, MlxMetalOptimizerBuilder,
+    MlxMetalOptimizerConfig, MlxMetalOptimizerError, MlxMetalOptimizerResult,
 };
 // Re-export online_dpo selectively to avoid ambiguous RewardFunction with grpo
-pub use online_dpo::{
-    OnlineDpoConfig, OnlineDpoTrainer, OnlinePreferencePair, OnlineDpoIterationStats,
-    RewardFunction as OnlineRewardFunction, LengthRewardFunction,
-};
 pub use grpo::*;
 pub use kto::*;
 pub use lora_trainer::*;
+pub use online_dpo::{
+    LengthRewardFunction, OnlineDpoConfig, OnlineDpoIterationStats, OnlineDpoTrainer,
+    OnlinePreferencePair, RewardFunction as OnlineRewardFunction,
+};
 pub use orpo::*;
 pub use param_groups::*;
 pub use ppo::*;

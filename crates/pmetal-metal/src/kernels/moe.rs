@@ -418,8 +418,7 @@ impl MoeKernel {
         let total_tokens = self.config.total_tokens();
 
         // Temporary gather indices (unused in this phase)
-        let temp_gather =
-            MetalBuffer::<u32>::new(&self.ctx, total_tokens, BufferUsage::Shared)?;
+        let temp_gather = MetalBuffer::<u32>::new(&self.ctx, total_tokens, BufferUsage::Shared)?;
 
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(topk_ids.metal_buffer()), 0, 0);
@@ -480,7 +479,11 @@ impl MoeKernel {
 
             let num_experts = self.config.num_experts as u32;
             let num_experts_ptr = NonNull::from(&num_experts).cast();
-            encoder2.setBytes_length_atIndex(num_experts_ptr, std::mem::size_of_val(&num_experts), 2);
+            encoder2.setBytes_length_atIndex(
+                num_experts_ptr,
+                std::mem::size_of_val(&num_experts),
+                2,
+            );
         }
 
         let grid_size = objc2_metal::MTLSize {

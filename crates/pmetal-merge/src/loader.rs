@@ -4,10 +4,10 @@
 //! rather than loading entire models into memory. This is critical for merging
 //! large models on memory-constrained macOS devices.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use mlx_rs::Array;
 use safetensors::SafeTensors;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
 use crate::{MergeError, Result};
@@ -69,7 +69,11 @@ impl SafetensorsLoader {
         // Sort for deterministic ordering
         safetensor_files.sort();
 
-        info!("Loading {} safetensors files from {:?}", safetensor_files.len(), path);
+        info!(
+            "Loading {} safetensors files from {:?}",
+            safetensor_files.len(),
+            path
+        );
 
         // Load file contents and build tensor mapping
         let mut files = Vec::new();
@@ -114,7 +118,9 @@ impl TensorLoader for SafetensorsLoader {
     }
 
     fn load_tensor(&self, name: &str) -> Result<Array> {
-        let file_idx = self.tensor_to_file.get(name)
+        let file_idx = self
+            .tensor_to_file
+            .get(name)
             .ok_or_else(|| MergeError::TensorNotFound(name.to_string()))?;
 
         let tensors = self.get_safetensors(*file_idx)?;
@@ -151,7 +157,9 @@ impl TensorLoader for SafetensorsLoader {
     }
 
     fn tensor_shape(&self, name: &str) -> Result<Vec<usize>> {
-        let file_idx = self.tensor_to_file.get(name)
+        let file_idx = self
+            .tensor_to_file
+            .get(name)
             .ok_or_else(|| MergeError::TensorNotFound(name.to_string()))?;
 
         let tensors = self.get_safetensors(*file_idx)?;
@@ -161,7 +169,9 @@ impl TensorLoader for SafetensorsLoader {
     }
 
     fn tensor_dtype(&self, name: &str) -> Result<safetensors::Dtype> {
-        let file_idx = self.tensor_to_file.get(name)
+        let file_idx = self
+            .tensor_to_file
+            .get(name)
             .ok_or_else(|| MergeError::TensorNotFound(name.to_string()))?;
 
         let tensors = self.get_safetensors(*file_idx)?;
@@ -241,9 +251,7 @@ impl ModelSource {
     /// Resolve to a TensorLoader.
     pub fn resolve(&self) -> Result<Box<dyn TensorLoader>> {
         match self {
-            Self::Local(path) => {
-                Ok(Box::new(SafetensorsLoader::new(path)?))
-            }
+            Self::Local(path) => Ok(Box::new(SafetensorsLoader::new(path)?)),
             Self::Hub { repo_id, revision } => {
                 info!("Downloading model from Hub: {}", repo_id);
 
@@ -259,7 +267,8 @@ impl ModelSource {
 
                 // Download all safetensors files
                 let files = repo.info()?.siblings;
-                let safetensor_files: Vec<_> = files.iter()
+                let safetensor_files: Vec<_> = files
+                    .iter()
                     .filter(|f| f.rfilename.ends_with(".safetensors"))
                     .collect();
 
@@ -356,14 +365,20 @@ impl TensorWriter {
         info!("Writing shard: {:?}", shard_path);
 
         // Convert to safetensors format
-        let tensors: Vec<_> = self.current_shard.iter()
+        let tensors: Vec<_> = self
+            .current_shard
+            .iter()
             .map(|(name, (shape, data))| {
                 let shape: Vec<usize> = shape.iter().map(|&s| s as usize).collect();
-                (name.as_str(), safetensors::tensor::TensorView::new(
-                    safetensors::Dtype::F32,
-                    shape,
-                    bytemuck::cast_slice(data),
-                ).unwrap())
+                (
+                    name.as_str(),
+                    safetensors::tensor::TensorView::new(
+                        safetensors::Dtype::F32,
+                        shape,
+                        bytemuck::cast_slice(data),
+                    )
+                    .unwrap(),
+                )
             })
             .collect();
 
@@ -389,11 +404,23 @@ mod tests {
     #[test]
     fn test_model_source_parse() {
         // Local paths
-        assert!(matches!(ModelSource::parse("/path/to/model"), ModelSource::Local(_)));
-        assert!(matches!(ModelSource::parse("./model"), ModelSource::Local(_)));
+        assert!(matches!(
+            ModelSource::parse("/path/to/model"),
+            ModelSource::Local(_)
+        ));
+        assert!(matches!(
+            ModelSource::parse("./model"),
+            ModelSource::Local(_)
+        ));
 
         // Hub repos
-        assert!(matches!(ModelSource::parse("meta-llama/Llama-2-7b"), ModelSource::Hub { .. }));
-        assert!(matches!(ModelSource::parse("mistralai/Mistral-7B-v0.1"), ModelSource::Hub { .. }));
+        assert!(matches!(
+            ModelSource::parse("meta-llama/Llama-2-7b"),
+            ModelSource::Hub { .. }
+        ));
+        assert!(matches!(
+            ModelSource::parse("mistralai/Mistral-7B-v0.1"),
+            ModelSource::Hub { .. }
+        ));
     }
 }

@@ -27,10 +27,10 @@
 //!
 //! - [llama.cpp imatrix](https://github.com/ggml-org/llama.cpp/blob/master/tools/imatrix/imatrix.cpp)
 
+use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
+use pmetal_core::{PMetalError, Result};
 use std::collections::HashMap;
 use std::io::{BufReader, BufWriter, Read, Seek, Write};
-use byteorder::{LittleEndian, ReadBytesExt, WriteBytesExt};
-use pmetal_core::{Result, PMetalError};
 
 /// Maximum allowed tensor name length (prevents DoS from malicious files).
 pub const MAX_NAME_LENGTH: i32 = 4096;
@@ -71,11 +71,8 @@ impl IMatrix {
     /// - File is corrupted or has invalid format
     /// - Values exceed safety limits (DoS protection)
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let file = std::fs::File::open(path)
-            .map_err(|e| PMetalError::Io(e))?;
-        let file_size = file.metadata()
-            .map_err(|e| PMetalError::Io(e))?
-            .len();
+        let file = std::fs::File::open(path).map_err(|e| PMetalError::Io(e))?;
+        let file_size = file.metadata().map_err(|e| PMetalError::Io(e))?.len();
         let mut reader = BufReader::new(file);
 
         Self::load_from_reader(&mut reader, file_size)
@@ -87,7 +84,8 @@ impl IMatrix {
         let mut ncalls = HashMap::new();
 
         // Read number of entries (header)
-        let n_entries = reader.read_i32::<LittleEndian>()
+        let n_entries = reader
+            .read_i32::<LittleEndian>()
             .map_err(|e| PMetalError::Io(e))?;
 
         // Validate entry count
@@ -101,7 +99,8 @@ impl IMatrix {
         // Read each entry
         for entry_idx in 0..n_entries {
             // Read name length
-            let name_len = reader.read_i32::<LittleEndian>()
+            let name_len = reader
+                .read_i32::<LittleEndian>()
                 .map_err(|e| PMetalError::Io(e))?;
 
             // Validate name length
@@ -114,20 +113,24 @@ impl IMatrix {
 
             // Read name
             let mut name_bytes = vec![0u8; name_len as usize];
-            reader.read_exact(&mut name_bytes)
+            reader
+                .read_exact(&mut name_bytes)
                 .map_err(|e| PMetalError::Io(e))?;
-            let name = String::from_utf8(name_bytes)
-                .map_err(|e| PMetalError::Serialization(format!(
+            let name = String::from_utf8(name_bytes).map_err(|e| {
+                PMetalError::Serialization(format!(
                     "Invalid UTF-8 in tensor name at entry {}: {}",
                     entry_idx, e
-                )))?;
+                ))
+            })?;
 
             // Read ncall (number of calibration chunks processed)
-            let ncall = reader.read_i32::<LittleEndian>()
+            let ncall = reader
+                .read_i32::<LittleEndian>()
                 .map_err(|e| PMetalError::Io(e))?;
 
             // Read nval (number of values)
-            let nval = reader.read_i32::<LittleEndian>()
+            let nval = reader
+                .read_i32::<LittleEndian>()
                 .map_err(|e| PMetalError::Io(e))?;
 
             // Validate value count
@@ -140,18 +143,20 @@ impl IMatrix {
 
             // Check we have enough bytes remaining (early bounds check)
             let values_size = (nval as u64) * 4; // f32 = 4 bytes
-            let current_pos = reader.stream_position()
-                .map_err(|e| PMetalError::Io(e))?;
+            let current_pos = reader.stream_position().map_err(|e| PMetalError::Io(e))?;
             if current_pos + values_size > file_size {
                 return Err(PMetalError::InvalidArgument(format!(
                     "Truncated file: tensor '{}' expects {} bytes but only {} remain",
-                    name, values_size, file_size.saturating_sub(current_pos)
+                    name,
+                    values_size,
+                    file_size.saturating_sub(current_pos)
                 )));
             }
 
             // Read values
             let mut values = vec![0.0f32; nval as usize];
-            reader.read_f32_into::<LittleEndian>(&mut values)
+            reader
+                .read_f32_into::<LittleEndian>(&mut values)
                 .map_err(|e| PMetalError::Io(e))?;
 
             data.insert(name.clone(), values);
@@ -185,8 +190,7 @@ impl IMatrix {
 
     /// Save IMatrix to a file (llama.cpp legacy .dat format).
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
-        let file = std::fs::File::create(path)
-            .map_err(|e| PMetalError::Io(e))?;
+        let file = std::fs::File::create(path).map_err(|e| PMetalError::Io(e))?;
         let mut writer = BufWriter::new(file);
 
         self.save_to_writer(&mut writer)
@@ -195,7 +199,8 @@ impl IMatrix {
     /// Save IMatrix to a writer.
     pub fn save_to_writer<W: Write>(&self, writer: &mut W) -> Result<()> {
         // Write number of entries
-        writer.write_i32::<LittleEndian>(self.data.len() as i32)
+        writer
+            .write_i32::<LittleEndian>(self.data.len() as i32)
             .map_err(|e| PMetalError::Io(e))?;
 
         // Write each entry
@@ -203,39 +208,47 @@ impl IMatrix {
             let name_bytes = name.as_bytes();
 
             // Write name length
-            writer.write_i32::<LittleEndian>(name_bytes.len() as i32)
+            writer
+                .write_i32::<LittleEndian>(name_bytes.len() as i32)
                 .map_err(|e| PMetalError::Io(e))?;
 
             // Write name
-            writer.write_all(name_bytes)
+            writer
+                .write_all(name_bytes)
                 .map_err(|e| PMetalError::Io(e))?;
 
             // Write ncall
             let ncall = self.ncalls.get(name).copied().unwrap_or(1);
-            writer.write_i32::<LittleEndian>(ncall)
+            writer
+                .write_i32::<LittleEndian>(ncall)
                 .map_err(|e| PMetalError::Io(e))?;
 
             // Write nval
-            writer.write_i32::<LittleEndian>(values.len() as i32)
+            writer
+                .write_i32::<LittleEndian>(values.len() as i32)
                 .map_err(|e| PMetalError::Io(e))?;
 
             // Write values
             for &v in values {
-                writer.write_f32::<LittleEndian>(v)
+                writer
+                    .write_f32::<LittleEndian>(v)
                     .map_err(|e| PMetalError::Io(e))?;
             }
         }
 
         // Write footer
         let last_chunk = self.last_chunk.unwrap_or(0);
-        writer.write_i32::<LittleEndian>(last_chunk)
+        writer
+            .write_i32::<LittleEndian>(last_chunk)
             .map_err(|e| PMetalError::Io(e))?;
 
         let dataset = self.dataset_name.as_deref().unwrap_or("");
         let dataset_bytes = dataset.as_bytes();
-        writer.write_i32::<LittleEndian>(dataset_bytes.len() as i32)
+        writer
+            .write_i32::<LittleEndian>(dataset_bytes.len() as i32)
             .map_err(|e| PMetalError::Io(e))?;
-        writer.write_all(dataset_bytes)
+        writer
+            .write_all(dataset_bytes)
             .map_err(|e| PMetalError::Io(e))?;
 
         writer.flush().map_err(|e| PMetalError::Io(e))?;
@@ -321,14 +334,19 @@ mod tests {
         let mut cursor = Cursor::new(&buffer);
         let result = IMatrix::load_from_reader(&mut cursor, buffer.len() as u64);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid tensor name length"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid tensor name length"));
     }
 
     #[test]
     fn test_bounds_validation_name_too_long() {
         let mut buffer = Vec::new();
         buffer.write_i32::<LittleEndian>(1).unwrap(); // 1 entry
-        buffer.write_i32::<LittleEndian>(MAX_NAME_LENGTH + 1).unwrap(); // Too long
+        buffer
+            .write_i32::<LittleEndian>(MAX_NAME_LENGTH + 1)
+            .unwrap(); // Too long
 
         let mut cursor = Cursor::new(&buffer);
         let result = IMatrix::load_from_reader(&mut cursor, buffer.len() as u64);
@@ -347,7 +365,10 @@ mod tests {
         let mut cursor = Cursor::new(&buffer);
         let result = IMatrix::load_from_reader(&mut cursor, buffer.len() as u64);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid value count"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid value count"));
     }
 
     #[test]
@@ -357,7 +378,9 @@ mod tests {
         buffer.write_i32::<LittleEndian>(4).unwrap(); // name length
         buffer.write_all(b"test").unwrap(); // name
         buffer.write_i32::<LittleEndian>(1).unwrap(); // ncall
-        buffer.write_i32::<LittleEndian>(MAX_VALUES_COUNT + 1).unwrap(); // Too large
+        buffer
+            .write_i32::<LittleEndian>(MAX_VALUES_COUNT + 1)
+            .unwrap(); // Too large
 
         let mut cursor = Cursor::new(&buffer);
         let result = IMatrix::load_from_reader(&mut cursor, buffer.len() as u64);
@@ -421,7 +444,10 @@ mod tests {
         let mut cursor = Cursor::new(&buffer);
         let result = IMatrix::load_from_reader(&mut cursor, buffer.len() as u64);
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Invalid imatrix entry count"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Invalid imatrix entry count"));
     }
 
     #[test]

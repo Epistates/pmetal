@@ -15,18 +15,18 @@
 //! zero-copy bridging to pass MLX array data directly to Metal kernels without
 //! copying, providing significant performance improvements for large tensors.
 
-use mlx_rs::Array;
+use super::{softmax, DistillLoss};
 use crate::Result;
-use super::{DistillLoss, softmax};
+use mlx_rs::Array;
 
 #[cfg(feature = "metal")]
 use std::sync::Arc;
 
 #[cfg(feature = "metal")]
 use pmetal_metal::{
-    context::MetalContext,
     bridge::metal_buffer_from_ptr,
-    kernels::{FusedDistill, FusedDistillConfig, DistillLossType as MetalDistillLossType},
+    context::MetalContext,
+    kernels::{DistillLossType as MetalDistillLossType, FusedDistill, FusedDistillConfig},
 };
 
 /// KL Divergence loss for knowledge distillation.
@@ -103,20 +103,24 @@ impl KlDivergenceLoss {
         student_logits: &Array,
         temperature: f32,
     ) -> Result<Array> {
-        let ctx = self.ctx.as_ref().ok_or_else(|| {
-            crate::DistillError::Metal("Metal context not available".to_string())
-        })?;
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| crate::DistillError::Metal("Metal context not available".to_string()))?;
 
         let shape = teacher_logits.shape();
         if shape.len() < 2 {
             return Err(crate::DistillError::Other(
-                "Logits must have at least 2 dimensions".to_string()
+                "Logits must have at least 2 dimensions".to_string(),
             ));
         }
 
         // Get dimensions - handle both [batch, seq, vocab] and [tokens, vocab]
         let vocab_size = shape[shape.len() - 1] as usize;
-        let num_tokens: usize = shape[..shape.len() - 1].iter().map(|&d| d as usize).product();
+        let num_tokens: usize = shape[..shape.len() - 1]
+            .iter()
+            .map(|&d| d as usize)
+            .product();
         let total_elements = num_tokens * vocab_size;
 
         // Flatten to [num_tokens, vocab] for Metal kernel
@@ -150,8 +154,7 @@ impl KlDivergenceLoss {
         };
 
         // Configure kernel with automatic SIMD selection for large vocabularies
-        let config = FusedDistillConfig::new(num_tokens, vocab_size)
-            .with_temperature(temperature);
+        let config = FusedDistillConfig::new(num_tokens, vocab_size).with_temperature(temperature);
 
         let kernel = FusedDistill::new(ctx.clone(), config)
             .map_err(|e| crate::DistillError::Metal(format!("Kernel error: {}", e)))?;
@@ -164,7 +167,8 @@ impl KlDivergenceLoss {
         };
 
         // Execute kernel with zero-copy buffer views
-        let output = kernel.forward(&teacher_view, &student_view, loss_type)
+        let output = kernel
+            .forward(&teacher_view, &student_view, loss_type)
             .map_err(|e| crate::DistillError::Metal(format!("Execution error: {}", e)))?;
 
         // Return mean loss
@@ -261,7 +265,11 @@ mod tests {
         let value: f32 = result.item();
 
         // KL divergence of identical distributions should be 0
-        assert!(value.abs() < 1e-4, "KL of identical distributions should be ~0, got {}", value);
+        assert!(
+            value.abs() < 1e-4,
+            "KL of identical distributions should be ~0, got {}",
+            value
+        );
     }
 
     #[test]
@@ -274,7 +282,11 @@ mod tests {
         let value: f32 = result.item();
 
         // KL divergence should be positive
-        assert!(value > 0.0, "KL divergence should be positive, got {}", value);
+        assert!(
+            value > 0.0,
+            "KL divergence should be positive, got {}",
+            value
+        );
     }
 
     #[test]
@@ -293,8 +305,18 @@ mod tests {
         let v2: f32 = kl_t2.item();
         let v4: f32 = kl_t4.item();
 
-        assert!(v2 < v1, "Higher temp should reduce KL: T=1: {}, T=2: {}", v1, v2);
-        assert!(v4 < v2, "Higher temp should reduce KL: T=2: {}, T=4: {}", v2, v4);
+        assert!(
+            v2 < v1,
+            "Higher temp should reduce KL: T=1: {}, T=2: {}",
+            v1,
+            v2
+        );
+        assert!(
+            v4 < v2,
+            "Higher temp should reduce KL: T=2: {}, T=4: {}",
+            v2,
+            v4
+        );
     }
 
     #[test]
@@ -338,8 +360,14 @@ mod tests {
             .map(|i| ((i * 7 % 100) as f32 - 50.0) / 10.0)
             .collect();
 
-        let teacher = Array::from_slice(&teacher_data, &[batch_size as i32, seq_len as i32, vocab_size as i32]);
-        let student = Array::from_slice(&student_data, &[batch_size as i32, seq_len as i32, vocab_size as i32]);
+        let teacher = Array::from_slice(
+            &teacher_data,
+            &[batch_size as i32, seq_len as i32, vocab_size as i32],
+        );
+        let student = Array::from_slice(
+            &student_data,
+            &[batch_size as i32, seq_len as i32, vocab_size as i32],
+        );
 
         let loss = KlDivergenceLoss::new();
         let result = loss.compute(&teacher, &student, 2.0).unwrap();

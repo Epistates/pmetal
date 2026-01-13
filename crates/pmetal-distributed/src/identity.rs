@@ -86,7 +86,11 @@ impl NodeIdentity {
         let pmetal_dir = home.join(PMETAL_DIR);
         if !pmetal_dir.exists() {
             fs::create_dir_all(&pmetal_dir).map_err(|e| {
-                DistributedError::Config(format!("Failed to create {}: {}", pmetal_dir.display(), e))
+                DistributedError::Config(format!(
+                    "Failed to create {}: {}",
+                    pmetal_dir.display(),
+                    e
+                ))
             })?;
         }
 
@@ -95,14 +99,12 @@ impl NodeIdentity {
 
     /// Load a keypair from a file.
     fn load_keypair(path: &PathBuf) -> Result<Keypair> {
-        let mut file = File::open(path).map_err(|e| {
-            DistributedError::Config(format!("Failed to open keypair file: {}", e))
-        })?;
+        let mut file = File::open(path)
+            .map_err(|e| DistributedError::Config(format!("Failed to open keypair file: {}", e)))?;
 
         let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|e| {
-            DistributedError::Config(format!("Failed to read keypair file: {}", e))
-        })?;
+        file.read_to_end(&mut bytes)
+            .map_err(|e| DistributedError::Config(format!("Failed to read keypair file: {}", e)))?;
 
         // Decode the Ed25519 secret key (32 bytes)
         if bytes.len() != 32 {
@@ -113,9 +115,8 @@ impl NodeIdentity {
             .into());
         }
 
-        let secret = ed25519::SecretKey::try_from_bytes(&mut bytes).map_err(|e| {
-            DistributedError::Config(format!("Invalid Ed25519 secret key: {}", e))
-        })?;
+        let secret = ed25519::SecretKey::try_from_bytes(&mut bytes)
+            .map_err(|e| DistributedError::Config(format!("Invalid Ed25519 secret key: {}", e)))?;
 
         let keypair = ed25519::Keypair::from(secret);
         debug!("Loaded keypair from {}", path.display());
@@ -148,9 +149,8 @@ impl NodeIdentity {
             })?;
         }
 
-        file.write_all(secret_bytes).map_err(|e| {
-            DistributedError::Config(format!("Failed to write keypair: {}", e))
-        })?;
+        file.write_all(secret_bytes)
+            .map_err(|e| DistributedError::Config(format!("Failed to write keypair: {}", e)))?;
 
         debug!("Saved keypair to {}", path.display());
         Ok(keypair)

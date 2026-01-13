@@ -1,8 +1,8 @@
 //! Dataset types and loading.
 
-use pmetal_core::Result;
 use arrow::array::{Array as ArrowArray, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+use pmetal_core::Result;
 use serde::Deserialize;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
@@ -292,7 +292,10 @@ impl TrainingDataset {
                     None
                 };
 
-                Ok(TextSample { text: full_text, prompt })
+                Ok(TextSample {
+                    text: full_text,
+                    prompt,
+                })
             }
             DatasetFormat::Auto => {
                 // Should not reach here after detection
@@ -401,7 +404,8 @@ impl TrainingDataset {
         let text_idx = schema.index_of(text_column).map_err(|_| {
             pmetal_core::PMetalError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Column '{}' not found in Parquet file. Available columns: {:?}",
+                format!(
+                    "Column '{}' not found in Parquet file. Available columns: {:?}",
                     text_column,
                     schema.fields().iter().map(|f| f.name()).collect::<Vec<_>>()
                 ),
@@ -437,12 +441,15 @@ impl TrainingDataset {
             })?;
 
             let text_col = batch.column(text_idx);
-            let text_array = text_col.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                pmetal_core::PMetalError::Io(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!("Column '{}' is not a string type", text_column),
-                ))
-            })?;
+            let text_array = text_col
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    pmetal_core::PMetalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Column '{}' is not a string type", text_column),
+                    ))
+                })?;
 
             let prompt_array = if let Some(idx) = prompt_idx {
                 let col = batch.column(idx);
@@ -517,7 +524,12 @@ impl TrainingDataset {
         let val_size = (self.samples.len() as f32 * val_ratio).round() as usize;
         let val_samples = self.samples.split_off(self.samples.len() - val_size);
 
-        (self, Self { samples: val_samples })
+        (
+            self,
+            Self {
+                samples: val_samples,
+            },
+        )
     }
 }
 
@@ -572,8 +584,7 @@ mod tests {
         writeln!(file, r#"{{"text": "Hello world"}}"#).unwrap();
         writeln!(file, r#"{{"text": "Another sample"}}"#).unwrap();
 
-        let samples =
-            TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Simple).unwrap();
+        let samples = TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Simple).unwrap();
 
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].text, "Hello world");
@@ -589,8 +600,7 @@ mod tests {
         )
         .unwrap();
 
-        let samples =
-            TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Alpaca).unwrap();
+        let samples = TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Alpaca).unwrap();
 
         assert_eq!(samples.len(), 1);
         assert!(samples[0].text.contains("Say hello"));
@@ -651,10 +661,7 @@ mod tests {
         prompt_builder.append_value("Third ");
         let prompt_array = Arc::new(prompt_builder.finish());
 
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![text_array, prompt_array],
-        ).unwrap();
+        let batch = RecordBatch::try_new(schema.clone(), vec![text_array, prompt_array]).unwrap();
 
         // Write Parquet file
         let file = File::create(&path).unwrap();
@@ -671,7 +678,8 @@ mod tests {
         assert!(samples[0].prompt.is_none());
 
         // Test loading with prompt column
-        let samples_with_prompt = TrainingDataset::load_parquet_text(&path, "text", Some("prompt")).unwrap();
+        let samples_with_prompt =
+            TrainingDataset::load_parquet_text(&path, "text", Some("prompt")).unwrap();
         assert_eq!(samples_with_prompt.len(), 3);
         assert_eq!(samples_with_prompt[0].prompt, Some("Hello ".to_string()));
         assert!(samples_with_prompt[1].prompt.is_none()); // null in parquet
@@ -689,9 +697,11 @@ mod tests {
         let temp_file = tempfile::NamedTempFile::new().unwrap();
         let path = temp_file.path().to_path_buf();
 
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("content", DataType::Utf8, false),
-        ]));
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "content",
+            DataType::Utf8,
+            false,
+        )]));
 
         let mut builder = StringBuilder::new();
         builder.append_value("Test content");
@@ -708,6 +718,10 @@ mod tests {
         let result = TrainingDataset::load_parquet_text(&path, "text", None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
-        assert!(err.contains("not found"), "Error should mention column not found: {}", err);
+        assert!(
+            err.contains("not found"),
+            "Error should mention column not found: {}",
+            err
+        );
     }
 }

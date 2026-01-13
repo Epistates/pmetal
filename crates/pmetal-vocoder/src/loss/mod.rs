@@ -133,7 +133,7 @@ pub fn multi_scale_mel_loss(
     mel_config: &MelConfig,
 ) -> Result<Array> {
     let scales = vec![
-        (512, 128),   // (n_fft, hop_length)
+        (512, 128), // (n_fft, hop_length)
         (1024, 256),
         (2048, 512),
     ];

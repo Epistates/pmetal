@@ -38,7 +38,13 @@
 //! }
 //! ```
 
-use mlx_rs::{error::Exception, ops::concatenate_axis, ops::indexing::{IndexOp, TryIndexMutOp}, ops, Array, Dtype};
+use mlx_rs::{
+    error::Exception,
+    ops,
+    ops::concatenate_axis,
+    ops::indexing::{IndexOp, TryIndexMutOp},
+    Array, Dtype,
+};
 
 /// Configuration for KV cache.
 #[derive(Debug, Clone)]
@@ -206,9 +212,7 @@ pub struct KVCache {
 impl KVCache {
     /// Create a new KV cache with the given configuration.
     pub fn new(config: KVCacheConfig) -> Self {
-        let layer_caches = (0..config.num_layers)
-            .map(|_| LayerCache::new())
-            .collect();
+        let layer_caches = (0..config.num_layers).map(|_| LayerCache::new()).collect();
 
         Self {
             config,
@@ -224,10 +228,7 @@ impl KVCache {
 
     /// Get the current cached sequence length.
     pub fn seq_len(&self) -> usize {
-        self.layer_caches
-            .first()
-            .map(|c| c.offset)
-            .unwrap_or(0)
+        self.layer_caches.first().map(|c| c.offset).unwrap_or(0)
     }
 
     /// Get total tokens processed (may differ from seq_len with sliding window).
@@ -327,8 +328,14 @@ impl KVCache {
         let v_buf = cache.values.as_mut().unwrap();
 
         // Assign new keys/values into the pre-allocated buffer
-        k_buf.try_index_mut((.., .., prev_offset as i32..cache.offset as i32, ..), new_keys)?;
-        v_buf.try_index_mut((.., .., prev_offset as i32..cache.offset as i32, ..), new_values)?;
+        k_buf.try_index_mut(
+            (.., .., prev_offset as i32..cache.offset as i32, ..),
+            new_keys,
+        )?;
+        v_buf.try_index_mut(
+            (.., .., prev_offset as i32..cache.offset as i32, ..),
+            new_values,
+        )?;
 
         // Apply cache mode limits (sliding window, rotating, etc.)
         let final_offset = match self.config.mode {
@@ -378,7 +385,10 @@ impl KVCache {
 
     /// Legacy update method - DEPRECATED, use update_and_fetch instead.
     /// Kept for backwards compatibility.
-    #[deprecated(since = "0.2.0", note = "Use update_and_fetch instead for SOTA performance")]
+    #[deprecated(
+        since = "0.2.0",
+        note = "Use update_and_fetch instead for SOTA performance"
+    )]
     pub fn update(
         &mut self,
         layer_idx: usize,
@@ -627,7 +637,12 @@ impl RotatingKVCache {
     }
 
     /// Trim entries from the front of the cache.
-    fn trim_impl(&self, trim_size: usize, v: &Array, append: Option<&Array>) -> Result<Array, Exception> {
+    fn trim_impl(
+        &self,
+        trim_size: usize,
+        v: &Array,
+        append: Option<&Array>,
+    ) -> Result<Array, Exception> {
         if trim_size > 0 {
             // Keep initial tokens, then slice from after trim
             let kept = v.index((.., .., ..self.keep as i32, ..));
@@ -688,11 +703,18 @@ impl RotatingKVCache {
         self.offset += num_steps;
         self._idx = self.keys.as_ref().unwrap().dim(2) as usize;
 
-        Ok((self.keys.as_ref().unwrap().clone(), self.values.as_ref().unwrap().clone()))
+        Ok((
+            self.keys.as_ref().unwrap().clone(),
+            self.values.as_ref().unwrap().clone(),
+        ))
     }
 
     /// Update in-place (for single-token updates).
-    fn update_in_place(&mut self, keys: &Array, values: &Array) -> Result<(Array, Array), Exception> {
+    fn update_in_place(
+        &mut self,
+        keys: &Array,
+        values: &Array,
+    ) -> Result<(Array, Array), Exception> {
         let batch = keys.dim(0) as usize;
         let n_kv_heads = keys.dim(1) as usize;
         let num_steps = keys.dim(2) as usize;
@@ -700,20 +722,33 @@ impl RotatingKVCache {
         let v_head_dim = values.dim(3) as usize;
 
         // Grow cache if needed
-        let needs_growth = self.keys.is_none() ||
-           (self.offset >= self.keys.as_ref().unwrap().dim(2) as usize &&
-            (self.keys.as_ref().unwrap().dim(2) as usize) < self.max_size);
+        let needs_growth = self.keys.is_none()
+            || (self.offset >= self.keys.as_ref().unwrap().dim(2) as usize
+                && (self.keys.as_ref().unwrap().dim(2) as usize) < self.max_size);
         if needs_growth {
             let new_size = self.step.min(self.max_size - self.offset);
-            let k_shape = [batch as i32, n_kv_heads as i32, new_size as i32, k_head_dim as i32];
-            let v_shape = [batch as i32, n_kv_heads as i32, new_size as i32, v_head_dim as i32];
+            let k_shape = [
+                batch as i32,
+                n_kv_heads as i32,
+                new_size as i32,
+                k_head_dim as i32,
+            ];
+            let v_shape = [
+                batch as i32,
+                n_kv_heads as i32,
+                new_size as i32,
+                v_head_dim as i32,
+            ];
 
             let new_k = Array::zeros::<f32>(&k_shape)?;
             let new_v = Array::zeros::<f32>(&v_shape)?;
 
             if let Some(ref existing_k) = self.keys {
                 self.keys = Some(concatenate_axis(&[existing_k, &new_k], 2)?);
-                self.values = Some(concatenate_axis(&[self.values.as_ref().unwrap(), &new_v], 2)?);
+                self.values = Some(concatenate_axis(
+                    &[self.values.as_ref().unwrap(), &new_v],
+                    2,
+                )?);
             } else {
                 self.keys = Some(new_k);
                 self.values = Some(new_v);
@@ -743,14 +778,22 @@ impl RotatingKVCache {
         let v = self.values.as_ref().unwrap();
 
         // Build updated cache by concatenating before, new, and after
-        let before_k = if self._idx > 0 { Some(k.index((.., .., ..self._idx as i32, ..))) } else { None };
+        let before_k = if self._idx > 0 {
+            Some(k.index((.., .., ..self._idx as i32, ..)))
+        } else {
+            None
+        };
         let after_k = if self._idx + num_steps < k.dim(2) as usize {
             Some(k.index((.., .., (self._idx + num_steps) as i32.., ..)))
         } else {
             None
         };
 
-        let before_v = if self._idx > 0 { Some(v.index((.., .., ..self._idx as i32, ..))) } else { None };
+        let before_v = if self._idx > 0 {
+            Some(v.index((.., .., ..self._idx as i32, ..)))
+        } else {
+            None
+        };
         let after_v = if self._idx + num_steps < v.dim(2) as usize {
             Some(v.index((.., .., (self._idx + num_steps) as i32.., ..)))
         } else {
@@ -759,14 +802,22 @@ impl RotatingKVCache {
 
         // Assemble new cache
         let mut k_parts: Vec<&Array> = Vec::new();
-        if let Some(ref bk) = before_k { k_parts.push(bk); }
+        if let Some(ref bk) = before_k {
+            k_parts.push(bk);
+        }
         k_parts.push(keys);
-        if let Some(ref ak) = after_k { k_parts.push(ak); }
+        if let Some(ref ak) = after_k {
+            k_parts.push(ak);
+        }
 
         let mut v_parts: Vec<&Array> = Vec::new();
-        if let Some(ref bv) = before_v { v_parts.push(bv); }
+        if let Some(ref bv) = before_v {
+            v_parts.push(bv);
+        }
         v_parts.push(values);
-        if let Some(ref av) = after_v { v_parts.push(av); }
+        if let Some(ref av) = after_v {
+            v_parts.push(av);
+        }
 
         self.keys = Some(concatenate_axis(&k_parts, 2)?);
         self.values = Some(concatenate_axis(&v_parts, 2)?);
@@ -777,8 +828,14 @@ impl RotatingKVCache {
         // Return slice if not full yet
         if self.offset < self.max_size {
             Ok((
-                self.keys.as_ref().unwrap().index((.., .., ..self.offset as i32, ..)),
-                self.values.as_ref().unwrap().index((.., .., ..self.offset as i32, ..)),
+                self.keys
+                    .as_ref()
+                    .unwrap()
+                    .index((.., .., ..self.offset as i32, ..)),
+                self.values
+                    .as_ref()
+                    .unwrap()
+                    .index((.., .., ..self.offset as i32, ..)),
             ))
         } else {
             Ok((
@@ -875,7 +932,10 @@ impl QuantizedKVCache {
     /// * `bits` - Number of bits (2, 4, or 8)
     /// * `group_size` - Group size for quantization (default: 64)
     pub fn new(bits: u8, group_size: usize) -> Self {
-        assert!(bits == 2 || bits == 4 || bits == 8, "bits must be 2, 4, or 8");
+        assert!(
+            bits == 2 || bits == 4 || bits == 8,
+            "bits must be 2, 4, or 8"
+        );
         Self {
             keys: None,
             values: None,
@@ -933,7 +993,11 @@ impl QuantizedKVCache {
         let data_shape = [batch as i32, heads as i32, seq as i32, packed_dim as i32];
         let data = Array::zeros::<u32>(&data_shape)?;
 
-        Ok(QuantizedTensor { data, scales, biases })
+        Ok(QuantizedTensor {
+            data,
+            scales,
+            biases,
+        })
     }
 
     /// Dequantize a tensor.
@@ -1024,18 +1088,12 @@ impl QuantizedKVCache {
 }
 
 /// Convenience function to create a rotating KV cache.
-pub fn create_rotating_cache(
-    max_size: usize,
-    keep: usize,
-) -> RotatingKVCache {
+pub fn create_rotating_cache(max_size: usize, keep: usize) -> RotatingKVCache {
     RotatingKVCache::new(max_size, keep)
 }
 
 /// Convenience function to create a quantized KV cache.
-pub fn create_quantized_cache(
-    bits: u8,
-    group_size: usize,
-) -> QuantizedKVCache {
+pub fn create_quantized_cache(bits: u8, group_size: usize) -> QuantizedKVCache {
     QuantizedKVCache::new(bits, group_size)
 }
 
@@ -1231,7 +1289,9 @@ impl BlockTable {
     pub fn get_block_and_offset(&self, token_pos: usize) -> Option<(usize, usize)> {
         let block_idx = token_pos / self.block_size;
         let offset = token_pos % self.block_size;
-        self.block_indices.get(block_idx).map(|&phys| (phys, offset))
+        self.block_indices
+            .get(block_idx)
+            .map(|&phys| (phys, offset))
     }
 }
 
@@ -1411,11 +1471,7 @@ impl PagedKVCache {
     /// Fetch cached K/V for attention computation.
     ///
     /// Returns concatenated K/V arrays for all tokens in the sequence.
-    pub fn fetch(
-        &self,
-        seq_id: u64,
-        layer_idx: usize,
-    ) -> Result<(Array, Array), Exception> {
+    pub fn fetch(&self, seq_id: u64, layer_idx: usize) -> Result<(Array, Array), Exception> {
         let table = self
             .block_tables
             .get(&seq_id)
@@ -1493,7 +1549,8 @@ impl PagedKVCache {
 
     /// Get memory statistics.
     pub fn memory_stats(&self) -> PagedCacheMemoryStats {
-        let block_elements = self.config.num_kv_heads * self.config.block_size * self.config.head_dim;
+        let block_elements =
+            self.config.num_kv_heads * self.config.block_size * self.config.head_dim;
         let bytes_per_block = block_elements * dtype_size(self.config.dtype) * 2; // K + V
 
         PagedCacheMemoryStats {
@@ -1501,8 +1558,12 @@ impl PagedKVCache {
             allocated_blocks: self.allocator.num_allocated(),
             free_blocks: self.allocator.num_free(),
             bytes_per_block,
-            total_memory_bytes: self.allocator.total_blocks() * bytes_per_block * self.config.num_layers,
-            used_memory_bytes: self.allocator.num_allocated() * bytes_per_block * self.config.num_layers,
+            total_memory_bytes: self.allocator.total_blocks()
+                * bytes_per_block
+                * self.config.num_layers,
+            used_memory_bytes: self.allocator.num_allocated()
+                * bytes_per_block
+                * self.config.num_layers,
         }
     }
 
@@ -1580,14 +1641,22 @@ impl PagedKVCache {
 
         // Assemble new block
         let mut k_parts: Vec<&Array> = Vec::new();
-        if let Some(ref b) = before_k { k_parts.push(b); }
+        if let Some(ref b) = before_k {
+            k_parts.push(b);
+        }
         k_parts.push(&k_squeezed);
-        if let Some(ref a) = after_k { k_parts.push(a); }
+        if let Some(ref a) = after_k {
+            k_parts.push(a);
+        }
 
         let mut v_parts: Vec<&Array> = Vec::new();
-        if let Some(ref b) = before_v { v_parts.push(b); }
+        if let Some(ref b) = before_v {
+            v_parts.push(b);
+        }
         v_parts.push(&v_squeezed);
-        if let Some(ref a) = after_v { v_parts.push(a); }
+        if let Some(ref a) = after_v {
+            v_parts.push(a);
+        }
 
         self.key_blocks[layer_idx][block_idx] = Some(concatenate_axis(&k_parts, 1)?);
         self.value_blocks[layer_idx][block_idx] = Some(concatenate_axis(&v_parts, 1)?);
@@ -1801,7 +1870,11 @@ mod tests {
         // Update one cache - [B, heads, seq, head_dim] format
         let keys = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
         let values = Array::zeros::<f32>(&[1, 4, 10, 64]).unwrap();
-        batch_cache.get_mut(0).unwrap().update_and_fetch(0, &keys, &values).unwrap();
+        batch_cache
+            .get_mut(0)
+            .unwrap()
+            .update_and_fetch(0, &keys, &values)
+            .unwrap();
 
         assert!(!batch_cache.caches[0].is_empty());
         assert!(batch_cache.caches[1].is_empty());
@@ -1818,7 +1891,11 @@ mod tests {
 
         // Fill all caches
         for i in 0..4 {
-            batch_cache.get_mut(i).unwrap().update_and_fetch(0, &keys, &values).unwrap();
+            batch_cache
+                .get_mut(i)
+                .unwrap()
+                .update_and_fetch(0, &keys, &values)
+                .unwrap();
         }
 
         // Reset specific indices
@@ -1837,7 +1914,10 @@ mod tests {
         assert_eq!(cache.config().mode, CacheMode::Standard);
 
         let sliding_cache = create_sliding_window_cache(32, 512, 8, 128);
-        assert_eq!(sliding_cache.config().mode, CacheMode::SlidingWindow { window_size: 512 });
+        assert_eq!(
+            sliding_cache.config().mode,
+            CacheMode::SlidingWindow { window_size: 512 }
+        );
     }
 
     // =========================================================================
@@ -2128,18 +2208,28 @@ mod tests {
 
     #[test]
     fn test_cache_mode_rotating() {
-        let config = KVCacheConfig::new(32, 2048, 8, 128)
-            .with_rotating(1024, 8);
+        let config = KVCacheConfig::new(32, 2048, 8, 128).with_rotating(1024, 8);
 
-        assert_eq!(config.mode, CacheMode::Rotating { max_size: 1024, keep: 8 });
+        assert_eq!(
+            config.mode,
+            CacheMode::Rotating {
+                max_size: 1024,
+                keep: 8
+            }
+        );
     }
 
     #[test]
     fn test_cache_mode_quantized() {
-        let config = KVCacheConfig::new(32, 2048, 8, 128)
-            .with_quantized(4, 64);
+        let config = KVCacheConfig::new(32, 2048, 8, 128).with_quantized(4, 64);
 
-        assert_eq!(config.mode, CacheMode::Quantized { bits: 4, group_size: 64 });
+        assert_eq!(
+            config.mode,
+            CacheMode::Quantized {
+                bits: 4,
+                group_size: 64
+            }
+        );
     }
 
     // =========================================================================
@@ -2298,8 +2388,7 @@ mod tests {
 
     #[test]
     fn test_paged_cache_memory_stats() {
-        let config = PagedKVCacheConfig::new(2, 8, 128, 1024)
-            .with_dtype(Dtype::Float16);
+        let config = PagedKVCacheConfig::new(2, 8, 128, 1024).with_dtype(Dtype::Float16);
         let mut cache = PagedKVCache::new(config);
 
         let stats = cache.memory_stats();

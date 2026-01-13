@@ -47,7 +47,7 @@ impl Fp8Format {
     /// Epsilon value for numerical stability.
     pub fn epsilon(&self) -> f32 {
         match self {
-            Self::E4M3 => 0.0625, // 2^-4
+            Self::E4M3 => 0.0625,       // 2^-4
             Self::E5M2 => 0.0009765625, // 2^-10
         }
     }
@@ -170,7 +170,8 @@ impl Fp8Linear {
         bias: Option<&Array>,
         config: Fp8Config,
     ) -> Result<Self, Exception> {
-        let quantized_weight = Fp8Tensor::quantize(weight, config.weight_format, config.per_channel)?;
+        let quantized_weight =
+            Fp8Tensor::quantize(weight, config.weight_format, config.per_channel)?;
 
         Ok(Self {
             weight: quantized_weight,
@@ -256,7 +257,11 @@ impl Fp8DynamicScaling {
         }
 
         // Compute scale from max of history
-        let max_amax = self.amax_history_activation.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_amax = self
+            .amax_history_activation
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
         self.activation_scale = format.max_value() / max_amax.max(1e-12);
     }
 
@@ -267,7 +272,11 @@ impl Fp8DynamicScaling {
             self.amax_history_gradient.remove(0);
         }
 
-        let max_amax = self.amax_history_gradient.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let max_amax = self
+            .amax_history_gradient
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
         self.gradient_scale = format.max_value() / max_amax.max(1e-12);
     }
 }

@@ -67,10 +67,7 @@ pub enum CompressedData {
     /// Full precision (no compression).
     Full(Vec<f32>),
     /// Sparse representation (indices + values).
-    Sparse {
-        indices: Vec<u32>,
-        values: Vec<f32>,
-    },
+    Sparse { indices: Vec<u32>, values: Vec<f32> },
     /// FP16 quantized.
     FP16(Vec<u16>),
     /// BF16 quantized.
@@ -150,9 +147,7 @@ impl GradientCompressor {
             CompressionStrategy::Random { probability } => {
                 self.compress_random(&working_grads, *probability)
             }
-            CompressionStrategy::Quantize(qtype) => {
-                (self.quantize(&working_grads, *qtype), None)
-            }
+            CompressionStrategy::Quantize(qtype) => (self.quantize(&working_grads, *qtype), None),
             CompressionStrategy::PowerSGD { rank } => {
                 // PowerSGD requires state across iterations, simplified here
                 (CompressedData::Full(working_grads.clone()), None)
@@ -190,14 +185,8 @@ impl GradientCompressor {
                 }
                 result
             }
-            CompressedData::FP16(v) => v
-                .iter()
-                .map(|&x| f16::from_bits(x).to_f32())
-                .collect(),
-            CompressedData::BF16(v) => v
-                .iter()
-                .map(|&x| bf16::from_bits(x).to_f32())
-                .collect(),
+            CompressedData::FP16(v) => v.iter().map(|&x| f16::from_bits(x).to_f32()).collect(),
+            CompressedData::BF16(v) => v.iter().map(|&x| bf16::from_bits(x).to_f32()).collect(),
             CompressedData::INT8 { data, scale } => {
                 data.iter().map(|&x| x as f32 * scale).collect()
             }
@@ -281,11 +270,17 @@ impl GradientCompressor {
     fn quantize(&self, gradients: &[f32], qtype: QuantizationType) -> CompressedData {
         match qtype {
             QuantizationType::FP16 => {
-                let data: Vec<u16> = gradients.iter().map(|&x| f16::from_f32(x).to_bits()).collect();
+                let data: Vec<u16> = gradients
+                    .iter()
+                    .map(|&x| f16::from_f32(x).to_bits())
+                    .collect();
                 CompressedData::FP16(data)
             }
             QuantizationType::BF16 => {
-                let data: Vec<u16> = gradients.iter().map(|&x| bf16::from_f32(x).to_bits()).collect();
+                let data: Vec<u16> = gradients
+                    .iter()
+                    .map(|&x| bf16::from_f32(x).to_bits())
+                    .collect();
                 CompressedData::BF16(data)
             }
             QuantizationType::INT8 => {
@@ -400,8 +395,7 @@ pub fn deserialize_compressed(bytes: &[u8]) -> Option<CompressedGradient> {
         }
         1 => {
             // Sparse
-            let num_indices =
-                u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
+            let num_indices = u32::from_le_bytes([bytes[5], bytes[6], bytes[7], bytes[8]]) as usize;
             let indices_end = 9 + num_indices * 4;
             let indices: Vec<u32> = bytes[9..indices_end]
                 .chunks_exact(4)

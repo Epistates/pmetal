@@ -389,7 +389,14 @@ fn conv_transpose_1d_manual(
         let conv_padding = dilation * (kernel_size - 1) - padding;
         let conv_padding = conv_padding.max(0);
 
-        let output = run_conv1d(&upsampled, &weight_flipped, 1, conv_padding, dilation, groups)?;
+        let output = run_conv1d(
+            &upsampled,
+            &weight_flipped,
+            1,
+            conv_padding,
+            dilation,
+            groups,
+        )?;
 
         // Handle output_padding by adding zeros at the end
         if output_padding > 0 {
@@ -414,7 +421,8 @@ mod tests {
 
     #[test]
     fn test_weight_norm_conv1d_shape() {
-        let conv = WeightNormConv1d::new(4, 8, 3, Some(1), Some(1), None, None, Some(true)).unwrap();
+        let conv =
+            WeightNormConv1d::new(4, 8, 3, Some(1), Some(1), None, None, Some(true)).unwrap();
 
         let x = mlx_rs::random::normal::<f32>(&[2, 4, 16], None, None, None).unwrap();
         let y = conv.forward(&x).unwrap();
@@ -452,18 +460,9 @@ mod tests {
     #[test]
     fn test_conv_transpose1d_shape() {
         // stride=2 should double the length (approximately)
-        let conv = WeightNormConvTranspose1d::new(
-            8,
-            4,
-            4,
-            Some(2),
-            Some(1),
-            None,
-            None,
-            None,
-            Some(true),
-        )
-        .unwrap();
+        let conv =
+            WeightNormConvTranspose1d::new(8, 4, 4, Some(2), Some(1), None, None, None, Some(true))
+                .unwrap();
 
         let x = mlx_rs::random::normal::<f32>(&[1, 8, 16], None, None, None).unwrap();
         let y = conv.forward(&x).unwrap();

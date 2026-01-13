@@ -16,9 +16,9 @@
 //! - When you want to preserve the "magnitude structure" of weights
 //! - Blending models with similar architectures
 
-use mlx_rs::Array;
-use crate::{MergeParameters, Result, MergeError};
 use super::MergeMethod;
+use crate::{MergeError, MergeParameters, Result};
+use mlx_rs::Array;
 
 /// SLERP merge implementation.
 #[derive(Debug, Clone, Default)]
@@ -79,7 +79,8 @@ impl SlerpMerge {
 
         // If vectors are very close, use linear interpolation
         if cos_theta.abs() > 0.9999 {
-            let result_flat = a_flat.multiply(&Array::from_f32(1.0 - t))?
+            let result_flat = a_flat
+                .multiply(&Array::from_f32(1.0 - t))?
                 .add(&b_flat.multiply(&Array::from_f32(t))?)?;
             return Ok(result_flat.reshape(&original_shape)?);
         }
@@ -101,7 +102,8 @@ impl SlerpMerge {
 
         if sin_theta.abs() < 1e-8 {
             // Fallback to linear interpolation
-            let result_flat = a_flat.multiply(&Array::from_f32(1.0 - t))?
+            let result_flat = a_flat
+                .multiply(&Array::from_f32(1.0 - t))?
                 .add(&b_flat.multiply(&Array::from_f32(t))?)?;
             return Ok(result_flat.reshape(&original_shape)?);
         }
@@ -110,7 +112,8 @@ impl SlerpMerge {
         let s1 = (t * theta).sin() / sin_theta;
 
         // Interpolate unit vectors
-        let result_unit = a_unit.multiply(&Array::from_f32(s0))?
+        let result_unit = a_unit
+            .multiply(&Array::from_f32(s0))?
             .add(&b_unit.multiply(&Array::from_f32(s1))?)?;
 
         // Interpolate norms linearly
@@ -150,7 +153,8 @@ impl MergeMethod for SlerpMerge {
         }
 
         // Get t from first model's params or global
-        let t = params.first()
+        let t = params
+            .first()
             .and_then(|p| p.t)
             .or(global_params.t)
             .unwrap_or(0.5);

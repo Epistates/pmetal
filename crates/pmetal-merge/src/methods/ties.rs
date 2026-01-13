@@ -13,9 +13,9 @@
 //! - Reducing interference when merging many specialized models
 //! - When you have models with conflicting capabilities
 
-use mlx_rs::Array;
-use crate::{MergeParameters, Result, MergeError, sparsify_by_magnitude, sign_consensus};
 use super::MergeMethod;
+use crate::{sign_consensus, sparsify_by_magnitude, MergeError, MergeParameters, Result};
+use mlx_rs::Array;
 
 /// TIES merge implementation.
 #[derive(Debug, Clone, Default)]
@@ -53,7 +53,8 @@ impl TiesMerge {
         }
 
         // Step 1: Sparsify each task vector by magnitude
-        let sparse_vectors: Vec<Array> = task_vectors.iter()
+        let sparse_vectors: Vec<Array> = task_vectors
+            .iter()
             .zip(densities.iter())
             .map(|(tv, &density)| sparsify_by_magnitude(tv, density))
             .collect::<Result<Vec<_>>>()?;
@@ -103,16 +104,19 @@ impl MergeMethod for TiesMerge {
         })?;
 
         // Compute task vectors
-        let task_vectors: Vec<Array> = tensors.iter()
+        let task_vectors: Vec<Array> = tensors
+            .iter()
             .map(|t| Self::task_vector(t, base))
             .collect::<Result<Vec<_>>>()?;
 
         // Get parameters for each model
-        let densities: Vec<f32> = params.iter()
+        let densities: Vec<f32> = params
+            .iter()
             .map(|p| global_params.merge_with(p).density())
             .collect();
 
-        let weights: Vec<f32> = params.iter()
+        let weights: Vec<f32> = params
+            .iter()
             .map(|p| global_params.merge_with(p).weight())
             .collect();
 
@@ -152,13 +156,26 @@ mod tests {
         let t2 = Array::from_slice(&[3.0_f32, 4.0, 5.0], &[3]);
 
         let params = vec![
-            MergeParameters { weight: Some(1.0), density: Some(1.0), ..Default::default() },
-            MergeParameters { weight: Some(1.0), density: Some(1.0), ..Default::default() },
+            MergeParameters {
+                weight: Some(1.0),
+                density: Some(1.0),
+                ..Default::default()
+            },
+            MergeParameters {
+                weight: Some(1.0),
+                density: Some(1.0),
+                ..Default::default()
+            },
         ];
 
-        let global = MergeParameters { lambda: Some(0.0), ..Default::default() };
+        let global = MergeParameters {
+            lambda: Some(0.0),
+            ..Default::default()
+        };
 
-        let result = merge.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
+        let result = merge
+            .merge(&[t1, t2], Some(&base), &params, &global)
+            .unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();
         let base_slice: Vec<f32> = base.as_slice().to_vec();
 
@@ -175,13 +192,20 @@ mod tests {
         let base = Array::from_slice(&[0.0_f32, 0.0, 0.0], &[3]);
         let t1 = Array::from_slice(&[1.0_f32, 1.0, 1.0], &[3]);
 
-        let params = vec![
-            MergeParameters { weight: Some(1.0), density: Some(1.0), ..Default::default() },
-        ];
+        let params = vec![MergeParameters {
+            weight: Some(1.0),
+            density: Some(1.0),
+            ..Default::default()
+        }];
 
-        let global = MergeParameters { lambda: Some(1.0), ..Default::default() };
+        let global = MergeParameters {
+            lambda: Some(1.0),
+            ..Default::default()
+        };
 
-        let result = merge.merge(&[t1.clone()], Some(&base), &params, &global).unwrap();
+        let result = merge
+            .merge(&[t1.clone()], Some(&base), &params, &global)
+            .unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();
 
         // With single model, full density, lambda=1: should equal t1

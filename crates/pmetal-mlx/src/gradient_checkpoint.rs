@@ -86,10 +86,7 @@ impl CheckpointConfig {
 ///
 /// # Returns
 /// The same arrays, possibly after evaluation
-pub fn checkpoint_boundary(
-    arrays: &[&Array],
-    config: &CheckpointConfig,
-) -> Result<(), Exception> {
+pub fn checkpoint_boundary(arrays: &[&Array], config: &CheckpointConfig) -> Result<(), Exception> {
     if config.enabled && config.eval_at_boundaries {
         // Evaluate arrays to materialize them
         // This breaks the computation graph, allowing earlier parts to be freed

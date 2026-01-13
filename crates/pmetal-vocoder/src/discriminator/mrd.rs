@@ -25,7 +25,7 @@ impl MultiResolutionDiscriminator {
     /// Default: n_fft = [1024, 2048, 512], hop = [120, 240, 50]
     pub fn new() -> Result<Self> {
         let resolutions = vec![
-            (1024, 120, 600),  // (n_fft, hop_length, win_length)
+            (1024, 120, 600), // (n_fft, hop_length, win_length)
             (2048, 240, 1200),
             (512, 50, 240),
         ];
@@ -122,7 +122,8 @@ impl ResolutionDiscriminator {
         }
 
         // Final convolution
-        let conv_post = WeightNormConv1d::new(1024, 1, 3, Some(1), Some(1), None, None, Some(true))?;
+        let conv_post =
+            WeightNormConv1d::new(1024, 1, 3, Some(1), Some(1), None, None, Some(true))?;
 
         Ok(Self {
             stft_config,
@@ -198,9 +199,11 @@ mod tests {
 
     #[test]
     fn test_mrd_custom_resolutions() {
-        let mrd =
-            MultiResolutionDiscriminator::with_resolutions(vec![(512, 128, 512), (1024, 256, 1024)])
-                .unwrap();
+        let mrd = MultiResolutionDiscriminator::with_resolutions(vec![
+            (512, 128, 512),
+            (1024, 256, 1024),
+        ])
+        .unwrap();
         assert_eq!(mrd.discriminators.len(), 2);
     }
 }

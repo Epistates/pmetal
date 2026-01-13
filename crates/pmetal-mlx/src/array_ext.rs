@@ -53,12 +53,10 @@ pub fn ones(shape: &[i32], dtype: Dtype) -> mlx_rs::error::Result<Array> {
 
 /// Create a random normal array with the given shape and dtype.
 pub fn randn(shape: &[i32], dtype: Dtype) -> mlx_rs::error::Result<Array> {
-    mlx_rs::random::normal::<f32>(shape, None, None, None)
-        .map(|a| a.as_dtype(dtype).unwrap())
+    mlx_rs::random::normal::<f32>(shape, None, None, None).map(|a| a.as_dtype(dtype).unwrap())
 }
 
 /// Create a random uniform array with the given shape, range, and dtype.
 pub fn rand(shape: &[i32], low: f32, high: f32, dtype: Dtype) -> mlx_rs::error::Result<Array> {
-    mlx_rs::random::uniform::<_, f32>(low, high, shape, None)
-        .map(|a| a.as_dtype(dtype).unwrap())
+    mlx_rs::random::uniform::<_, f32>(low, high, shape, None).map(|a| a.as_dtype(dtype).unwrap())
 }

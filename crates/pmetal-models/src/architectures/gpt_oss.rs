@@ -22,9 +22,6 @@
 //! - Tool use optimization
 //! - Apache 2.0 license
 
-use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
-use pmetal_mlx::kv_cache::KVCache;
-use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use mlx_rs::{
     builder::Builder,
     error::Exception,
@@ -34,6 +31,9 @@ use mlx_rs::{
     ops::indexing::IndexOp,
     Array,
 };
+use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
+use pmetal_mlx::kv_cache::KVCache;
+use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};
 
 /// Attention layer type for GPT-OSS.
@@ -161,31 +161,81 @@ pub struct RopeScalingConfig {
 }
 
 // Default functions
-fn default_model_type() -> String { "gpt_oss".to_string() }
-fn default_vocab_size() -> i32 { 201088 }
-fn default_hidden_size() -> i32 { 2880 }
-fn default_intermediate_size() -> i32 { 2880 }
-fn default_num_hidden_layers() -> i32 { 24 }
-fn default_num_attention_heads() -> i32 { 64 }
-fn default_num_key_value_heads() -> i32 { 8 }
-fn default_head_dim() -> i32 { 64 }
-fn default_max_position_embeddings() -> i32 { 131072 }
-fn default_initial_context_length() -> i32 { 4096 }
-fn default_rms_norm_eps() -> f32 { 1e-5 }
-fn default_rope_theta() -> f32 { 150000.0 }
-fn default_true() -> bool { true }
-fn default_num_local_experts() -> i32 { 32 }
-fn default_experts_per_token() -> i32 { 4 }
-fn default_router_aux_loss_coef() -> f32 { 0.9 }
-fn default_sliding_window() -> i32 { 128 }
-fn default_swiglu_limit() -> f32 { 7.0 }
-fn default_hidden_act() -> String { "silu".to_string() }
-fn default_eos_token_id() -> i32 { 200002 }
-fn default_pad_token_id() -> i32 { 199999 }
-fn default_rope_factor() -> f32 { 32.0 }
-fn default_original_max_position() -> i32 { 4096 }
-fn default_beta_fast() -> f32 { 32.0 }
-fn default_beta_slow() -> f32 { 1.0 }
+fn default_model_type() -> String {
+    "gpt_oss".to_string()
+}
+fn default_vocab_size() -> i32 {
+    201088
+}
+fn default_hidden_size() -> i32 {
+    2880
+}
+fn default_intermediate_size() -> i32 {
+    2880
+}
+fn default_num_hidden_layers() -> i32 {
+    24
+}
+fn default_num_attention_heads() -> i32 {
+    64
+}
+fn default_num_key_value_heads() -> i32 {
+    8
+}
+fn default_head_dim() -> i32 {
+    64
+}
+fn default_max_position_embeddings() -> i32 {
+    131072
+}
+fn default_initial_context_length() -> i32 {
+    4096
+}
+fn default_rms_norm_eps() -> f32 {
+    1e-5
+}
+fn default_rope_theta() -> f32 {
+    150000.0
+}
+fn default_true() -> bool {
+    true
+}
+fn default_num_local_experts() -> i32 {
+    32
+}
+fn default_experts_per_token() -> i32 {
+    4
+}
+fn default_router_aux_loss_coef() -> f32 {
+    0.9
+}
+fn default_sliding_window() -> i32 {
+    128
+}
+fn default_swiglu_limit() -> f32 {
+    7.0
+}
+fn default_hidden_act() -> String {
+    "silu".to_string()
+}
+fn default_eos_token_id() -> i32 {
+    200002
+}
+fn default_pad_token_id() -> i32 {
+    199999
+}
+fn default_rope_factor() -> f32 {
+    32.0
+}
+fn default_original_max_position() -> i32 {
+    4096
+}
+fn default_beta_fast() -> f32 {
+    32.0
+}
+fn default_beta_slow() -> f32 {
+    1.0
+}
 
 impl GptOssConfig {
     /// Get the number of experts per token.
@@ -209,15 +259,13 @@ impl GptOssConfig {
 
     /// Get YaRN RoPE factor if configured.
     pub fn rope_factor(&self) -> f32 {
-        self.rope_scaling
-            .as_ref()
-            .map(|s| s.factor)
-            .unwrap_or(1.0)
+        self.rope_scaling.as_ref().map(|s| s.factor).unwrap_or(1.0)
     }
 
     /// Get the effective max position embeddings considering RoPE scaling.
     pub fn effective_max_position(&self) -> i32 {
-        let base = self.rope_scaling
+        let base = self
+            .rope_scaling
             .as_ref()
             .map(|s| s.original_max_position_embeddings)
             .unwrap_or(self.initial_context_length);
@@ -442,7 +490,11 @@ pub struct GptOssMLP {
 
 impl GptOssMLP {
     /// Create a new MLP.
-    pub fn new(hidden_size: i32, intermediate_size: i32, swiglu_limit: f32) -> Result<Self, Exception> {
+    pub fn new(
+        hidden_size: i32,
+        intermediate_size: i32,
+        swiglu_limit: f32,
+    ) -> Result<Self, Exception> {
         // GPT-OSS uses bias in MLP
         let gate_proj = nn::LinearBuilder::new(hidden_size, intermediate_size)
             .bias(true)
@@ -505,7 +557,10 @@ impl GptOssMoE {
 
         let moe_layer = MoELayer::new(config);
 
-        Ok(Self { moe_layer, swiglu_limit })
+        Ok(Self {
+            moe_layer,
+            swiglu_limit,
+        })
     }
 
     /// Forward pass through MoE.
@@ -697,10 +752,8 @@ impl GptOssForCausalLM {
 // LoRA Support for GPT-OSS
 // =============================================================================
 
-use pmetal_mlx::kernels::fast_lora::{
-    create_lora_params, fused_lora_forward,
-};
 use pmetal_core::LoraConfig;
+use pmetal_mlx::kernels::fast_lora::{create_lora_params, fused_lora_forward};
 
 /// LoRA-enabled linear layer for GPT-OSS.
 #[derive(Debug)]
@@ -721,17 +774,13 @@ pub struct LoraLinear {
 
 impl LoraLinear {
     /// Create LoRA linear from base nn::Linear.
-    pub fn from_linear(
-        linear: &nn::Linear,
-        rank: i32,
-        alpha: f32,
-    ) -> Result<Self, Exception> {
+    pub fn from_linear(linear: &nn::Linear, rank: i32, alpha: f32) -> Result<Self, Exception> {
         // Access weight through the parameter
         let params = linear.parameters();
         let flat = params.flatten();
-        let weight_ref = flat.get("weight").ok_or_else(|| {
-            Exception::from("Missing weight in Linear")
-        })?;
+        let weight_ref = flat
+            .get("weight")
+            .ok_or_else(|| Exception::from("Missing weight in Linear"))?;
         let weight = (*weight_ref).clone();
 
         let shape = weight.shape();
@@ -853,10 +902,18 @@ impl GptOssLoraAttention {
         let mut o_proj = LoraLinear::from_linear(&attn.o_proj, rank, alpha)?;
 
         // Disable LoRA for non-target modules
-        if !has_q { q_proj.lora_active = false; }
-        if !has_k { k_proj.lora_active = false; }
-        if !has_v { v_proj.lora_active = false; }
-        if !has_o { o_proj.lora_active = false; }
+        if !has_q {
+            q_proj.lora_active = false;
+        }
+        if !has_k {
+            k_proj.lora_active = false;
+        }
+        if !has_v {
+            v_proj.lora_active = false;
+        }
+        if !has_o {
+            o_proj.lora_active = false;
+        }
 
         Ok(Self {
             layer_idx: attn.layer_idx,
@@ -1043,11 +1100,9 @@ pub struct GptOssLoraModel {
 
 impl GptOssLoraModel {
     /// Create LoRA model from base model.
-    pub fn from_model(
-        model: GptOssModel,
-        lora_config: &LoraConfig,
-    ) -> Result<Self, Exception> {
-        let layers = model.layers
+    pub fn from_model(model: GptOssModel, lora_config: &LoraConfig) -> Result<Self, Exception> {
+        let layers = model
+            .layers
             .into_iter()
             .map(|layer| GptOssLoraDecoderLayer::from_layer(layer, lora_config))
             .collect::<Result<Vec<_>, _>>()?;
@@ -1169,10 +1224,7 @@ impl GptOssLoraForCausalLM {
 
 impl GptOssForCausalLM {
     /// Convert to LoRA-enabled model.
-    pub fn into_lora(
-        self,
-        lora_config: &LoraConfig,
-    ) -> Result<GptOssLoraForCausalLM, Exception> {
+    pub fn into_lora(self, lora_config: &LoraConfig) -> Result<GptOssLoraForCausalLM, Exception> {
         GptOssLoraForCausalLM::from_model(self, lora_config)
     }
 }
@@ -1213,17 +1265,17 @@ mod tests {
     fn test_lora_config_default_target_modules() {
         let lora_config = LoraConfig::default();
         // Default targets attention projections
-        assert!(lora_config.target_modules.iter().any(|m| m == "q_proj" || m.contains("q_proj")));
+        assert!(lora_config
+            .target_modules
+            .iter()
+            .any(|m| m == "q_proj" || m.contains("q_proj")));
     }
 
     #[test]
     fn test_lora_linear_creation() {
         use mlx_rs::builder::Builder;
 
-        let linear = nn::LinearBuilder::new(256, 512)
-            .bias(true)
-            .build()
-            .unwrap();
+        let linear = nn::LinearBuilder::new(256, 512).bias(true).build().unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 8, 16.0).unwrap();
 
@@ -1237,10 +1289,7 @@ mod tests {
     fn test_lora_linear_forward_shape() {
         use mlx_rs::builder::Builder;
 
-        let linear = nn::LinearBuilder::new(64, 128)
-            .bias(false)
-            .build()
-            .unwrap();
+        let linear = nn::LinearBuilder::new(64, 128).bias(false).build().unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
         let x = Array::zeros::<f32>(&[2, 8, 64]).unwrap();
@@ -1253,10 +1302,7 @@ mod tests {
     fn test_lora_linear_merge() {
         use mlx_rs::builder::Builder;
 
-        let linear = nn::LinearBuilder::new(32, 64)
-            .bias(false)
-            .build()
-            .unwrap();
+        let linear = nn::LinearBuilder::new(32, 64).bias(false).build().unwrap();
 
         let mut lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
         assert!(lora_linear.lora_active);
@@ -1274,10 +1320,7 @@ mod tests {
     fn test_lora_trainable_params() {
         use mlx_rs::builder::Builder;
 
-        let linear = nn::LinearBuilder::new(32, 64)
-            .bias(false)
-            .build()
-            .unwrap();
+        let linear = nn::LinearBuilder::new(32, 64).bias(false).build().unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
         let params = lora_linear.trainable_parameters();

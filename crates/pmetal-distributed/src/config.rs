@@ -60,10 +60,10 @@ impl DistributedConfig {
         // Check for duplicate addresses
         let unique: HashSet<_> = self.nodes.iter().collect();
         if unique.len() != self.nodes.len() {
-            return Err(
-                DistributedError::Config("nodes list contains duplicate addresses".to_string())
-                    .into(),
-            );
+            return Err(DistributedError::Config(
+                "nodes list contains duplicate addresses".to_string(),
+            )
+            .into());
         }
 
         Ok(())

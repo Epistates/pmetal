@@ -229,8 +229,18 @@ pub mod ring {
         recv: &R,
     ) -> DistributedResult<()>
     where
-        S: Fn(&[u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = DistributedResult<()>> + Send>> + Send + Sync,
-        R: Fn(&mut [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = DistributedResult<()>> + Send>> + Send + Sync,
+        S: Fn(
+                &[u8],
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = DistributedResult<()>> + Send>>
+            + Send
+            + Sync,
+        R: Fn(
+                &mut [u8],
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = DistributedResult<()>> + Send>>
+            + Send
+            + Sync,
     {
         if world_size < 2 {
             return Ok(());
@@ -376,8 +386,18 @@ pub mod centralized {
         send_to_peer: &S,
     ) -> DistributedResult<()>
     where
-        S: Fn(&[u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = DistributedResult<()>> + Send>> + Send + Sync,
-        R: Fn(&mut [u8]) -> std::pin::Pin<Box<dyn std::future::Future<Output = DistributedResult<()>> + Send>> + Send + Sync,
+        S: Fn(
+                &[u8],
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = DistributedResult<()>> + Send>>
+            + Send
+            + Sync,
+        R: Fn(
+                &mut [u8],
+            )
+                -> std::pin::Pin<Box<dyn std::future::Future<Output = DistributedResult<()>> + Send>>
+            + Send
+            + Sync,
     {
         if world_size < 2 {
             return Ok(());

@@ -757,16 +757,13 @@ impl FusedTrainingCoordinator {
     /// * `ctx` - Metal context
     /// * `param_sizes` - Sizes of each parameter tensor
     /// * `max_grad_norm` - Optional gradient clipping threshold
-    pub fn new(
-        ctx: Arc<MetalContext>,
-        param_sizes: &[usize],
-        max_grad_norm: Option<f32>,
-    ) -> Self {
+    pub fn new(ctx: Arc<MetalContext>, param_sizes: &[usize], max_grad_norm: Option<f32>) -> Self {
         let total_elements: usize = param_sizes.iter().sum();
 
         let adamw = FusedAdamW::new(ctx.clone(), param_sizes);
 
-        let grad_clip = max_grad_norm.map(|_| FusedGradientClipping::new(ctx.clone(), total_elements));
+        let grad_clip =
+            max_grad_norm.map(|_| FusedGradientClipping::new(ctx.clone(), total_elements));
 
         let cross_entropy = FusedCrossEntropyTraining::new(ctx.clone());
 
@@ -990,9 +987,7 @@ mod tests {
 
         println!(
             "Fused AdamW: {:.2}ms per iter, {:.0} params/sec ({} total params)",
-            ms_per_iter,
-            params_per_sec,
-            total_elements
+            ms_per_iter, params_per_sec, total_elements
         );
 
         // Should be fast - less than 1ms for 10M params

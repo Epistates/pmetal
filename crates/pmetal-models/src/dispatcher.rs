@@ -17,8 +17,8 @@
 
 use std::path::Path;
 
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use mlx_rs::{error::Exception, module::ModuleParametersExt, Array};
+use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use serde::Deserialize;
 
 use crate::architectures::{
@@ -39,7 +39,10 @@ use crate::architectures::{
 ///
 /// This function handles both single-file and sharded models using
 /// mlx-rs's built-in safetensors loading with automatic parameter name matching.
-fn load_generic_weights<M: ModuleParametersExt>(model: &mut M, model_dir: &Path) -> Result<(), DispatchError> {
+fn load_generic_weights<M: ModuleParametersExt>(
+    model: &mut M,
+    model_dir: &Path,
+) -> Result<(), DispatchError> {
     use std::collections::HashSet;
 
     // Check for single file model
@@ -203,7 +206,8 @@ impl ModelArchitecture {
             if lower.contains("deepseek") {
                 return Some(Self::DeepSeek);
             }
-            if lower.contains("cohere") || lower.contains("commandr") || lower.contains("command_r") {
+            if lower.contains("cohere") || lower.contains("commandr") || lower.contains("command_r")
+            {
                 return Some(Self::Cohere);
             }
             if lower.contains("granite") {
@@ -432,7 +436,10 @@ impl DynamicModel {
     }
 
     /// Load weights using generic safetensors loading.
-    fn load_generic<M: ModuleParametersExt>(model: &mut M, model_dir: &Path) -> Result<(), DispatchError> {
+    fn load_generic<M: ModuleParametersExt>(
+        model: &mut M,
+        model_dir: &Path,
+    ) -> Result<(), DispatchError> {
         load_generic_weights(model, model_dir)
     }
 

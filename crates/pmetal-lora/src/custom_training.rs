@@ -46,8 +46,8 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{error::Exception, Array};
 use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::{error::Exception, Array};
 
 use crate::autograd::{AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads};
 use crate::{LoraError, LoraLinear};
@@ -291,9 +291,7 @@ impl CustomLoraTrainer {
     }
 
     /// Convert accumulated gradients to flat parameter map for optimizer.
-    pub fn grads_to_flat_params(
-        acc: AccumulatedLoraGrads,
-    ) -> HashMap<Rc<str>, Array> {
+    pub fn grads_to_flat_params(acc: AccumulatedLoraGrads) -> HashMap<Rc<str>, Array> {
         acc.grads
             .into_iter()
             .map(|(k, v)| (Rc::from(k), v))
@@ -320,11 +318,7 @@ impl LoraGradAccumulator {
     }
 
     /// Add gradients for a single LoRA layer.
-    pub fn add(
-        &mut self,
-        layer_name: &str,
-        grads: &LoraGrads,
-    ) {
+    pub fn add(&mut self, layer_name: &str, grads: &LoraGrads) {
         self.grads.add_layer_grads(layer_name, grads);
     }
 
@@ -365,23 +359,15 @@ mod tests {
         let vocab_size = 100;
 
         // Random logits
-        let logits = mlx_rs::random::normal::<f32>(
-            &[batch, seq_len, vocab_size],
-            None, None, None,
-        ).unwrap();
+        let logits =
+            mlx_rs::random::normal::<f32>(&[batch, seq_len, vocab_size], None, None, None).unwrap();
 
         // Random labels (valid indices 0 to vocab_size-1)
-        let labels = mlx_rs::random::randint::<i32, i32>(
-            0, vocab_size,
-            &[batch, seq_len],
-            None,
-        ).unwrap();
+        let labels =
+            mlx_rs::random::randint::<i32, i32>(0, vocab_size, &[batch, seq_len], None).unwrap();
 
-        let (loss, d_logits) = CustomLoraTrainer::cross_entropy_with_grad(
-            &logits,
-            &labels,
-            -100,
-        ).unwrap();
+        let (loss, d_logits) =
+            CustomLoraTrainer::cross_entropy_with_grad(&logits, &labels, -100).unwrap();
 
         // Loss should be positive
         assert!(loss > 0.0);
@@ -398,34 +384,34 @@ mod tests {
         let batch = 2;
         let seq_len = 4;
 
-        let lora = LoraLinear::new(
-            in_features, out_features, rank, 16.0, false, false,
-        ).unwrap();
+        let lora = LoraLinear::new(in_features, out_features, rank, 16.0, false, false).unwrap();
 
         let trainer = CustomLoraTrainer::new();
 
         // Forward with grad
-        let x = mlx_rs::random::normal::<f32>(
-            &[batch, seq_len, in_features],
-            None, None, None,
-        ).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, in_features], None, None, None)
+            .unwrap();
 
         let (output, saved) = trainer.forward_lora_linear(&lora, &x).unwrap();
         assert_eq!(output.shape(), &[batch, seq_len, out_features]);
 
         // Backward
-        let d_output = mlx_rs::random::normal::<f32>(
-            &[batch, seq_len, out_features],
-            None, None, None,
-        ).unwrap();
+        let d_output =
+            mlx_rs::random::normal::<f32>(&[batch, seq_len, out_features], None, None, None)
+                .unwrap();
 
-        let grads = trainer.backward_lora_linear(&lora, &d_output, &saved).unwrap();
+        let grads = trainer
+            .backward_lora_linear(&lora, &d_output, &saved)
+            .unwrap();
 
         // Check gradient shapes
         assert_eq!(grads.d_lora_a.shape(), &[rank, in_features]);
         assert_eq!(grads.d_lora_b.shape(), &[out_features, rank]);
         assert!(grads.d_x.is_some());
-        assert_eq!(grads.d_x.as_ref().unwrap().shape(), &[batch, seq_len, in_features]);
+        assert_eq!(
+            grads.d_x.as_ref().unwrap().shape(),
+            &[batch, seq_len, in_features]
+        );
     }
 
     #[test]

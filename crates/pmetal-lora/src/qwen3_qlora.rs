@@ -17,8 +17,7 @@ use mlx_rs::{
     error::Exception,
     module::{ModuleParamMut, ModuleParamRef, ModuleParameters, Param},
     nested::NestedValue,
-    nn,
-    Array,
+    nn, Array,
 };
 
 use pmetal_core::LoraConfig;
@@ -67,12 +66,7 @@ impl Qwen3QLoraAttention {
         let scale = (head_dim as f32).sqrt().recip();
 
         // Create QLoRA linear layers for projections
-        let q_proj = QLoraLinear::new(
-            config.hidden_size,
-            n_heads * head_dim,
-            qlora_config,
-            false,
-        )?;
+        let q_proj = QLoraLinear::new(config.hidden_size, n_heads * head_dim, qlora_config, false)?;
         let k_proj = QLoraLinear::new(
             config.hidden_size,
             n_kv_heads * head_dim,
@@ -85,12 +79,7 @@ impl Qwen3QLoraAttention {
             qlora_config,
             false,
         )?;
-        let o_proj = QLoraLinear::new(
-            n_heads * head_dim,
-            config.hidden_size,
-            qlora_config,
-            false,
-        )?;
+        let o_proj = QLoraLinear::new(n_heads * head_dim, config.hidden_size, qlora_config, false)?;
 
         // Qwen3-specific: Q and K normalization before RoPE
         let q_norm = nn::RmsNormBuilder::new(head_dim)
@@ -163,7 +152,8 @@ impl Qwen3QLoraAttention {
         let (queries, keys) = if let Some(pos_ids) = position_ids {
             // Use custom RoPE with explicit position IDs
             use pmetal_mlx::kernels::rope::apply_rope_with_positions;
-            let q = apply_rope_with_positions(&queries, pos_ids, self.head_dim, self.rope.base, 1.0)?;
+            let q =
+                apply_rope_with_positions(&queries, pos_ids, self.head_dim, self.rope.base, 1.0)?;
             let k = apply_rope_with_positions(&keys, pos_ids, self.head_dim, self.rope.base, 1.0)?;
             (q, k)
         } else {
@@ -523,7 +513,10 @@ impl Qwen3QloraForCausalLM {
     }
 
     /// Create with explicit QLoRA configuration.
-    pub fn with_qlora_config(config: Qwen3Config, qlora_config: QLoraConfig) -> Result<Self, LoraError> {
+    pub fn with_qlora_config(
+        config: Qwen3Config,
+        qlora_config: QLoraConfig,
+    ) -> Result<Self, LoraError> {
         let tie_weights = config.tie_word_embeddings;
         let model = Qwen3QloraModel::new(config.clone(), qlora_config)?;
 
@@ -577,12 +570,9 @@ impl Qwen3QloraForCausalLM {
         position_ids: Option<&Array>,
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
-        let hidden_states = self.model.forward_with_checkpoint(
-            input_ids,
-            mask,
-            position_ids,
-            checkpoint_config,
-        )?;
+        let hidden_states =
+            self.model
+                .forward_with_checkpoint(input_ids, mask, position_ids, checkpoint_config)?;
 
         // Get logits from LM head or shared embeddings
         if let Some(ref mut lm_head) = self.lm_head {
@@ -678,22 +668,64 @@ impl Qwen3QloraForCausalLM {
             }
 
             // Attention LoRA params
-            set_param!(layer.self_attn.q_proj.lora_a, format!("{}.self_attn.q_proj.lora_a", prefix));
-            set_param!(layer.self_attn.q_proj.lora_b, format!("{}.self_attn.q_proj.lora_b", prefix));
-            set_param!(layer.self_attn.k_proj.lora_a, format!("{}.self_attn.k_proj.lora_a", prefix));
-            set_param!(layer.self_attn.k_proj.lora_b, format!("{}.self_attn.k_proj.lora_b", prefix));
-            set_param!(layer.self_attn.v_proj.lora_a, format!("{}.self_attn.v_proj.lora_a", prefix));
-            set_param!(layer.self_attn.v_proj.lora_b, format!("{}.self_attn.v_proj.lora_b", prefix));
-            set_param!(layer.self_attn.o_proj.lora_a, format!("{}.self_attn.o_proj.lora_a", prefix));
-            set_param!(layer.self_attn.o_proj.lora_b, format!("{}.self_attn.o_proj.lora_b", prefix));
+            set_param!(
+                layer.self_attn.q_proj.lora_a,
+                format!("{}.self_attn.q_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.self_attn.q_proj.lora_b,
+                format!("{}.self_attn.q_proj.lora_b", prefix)
+            );
+            set_param!(
+                layer.self_attn.k_proj.lora_a,
+                format!("{}.self_attn.k_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.self_attn.k_proj.lora_b,
+                format!("{}.self_attn.k_proj.lora_b", prefix)
+            );
+            set_param!(
+                layer.self_attn.v_proj.lora_a,
+                format!("{}.self_attn.v_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.self_attn.v_proj.lora_b,
+                format!("{}.self_attn.v_proj.lora_b", prefix)
+            );
+            set_param!(
+                layer.self_attn.o_proj.lora_a,
+                format!("{}.self_attn.o_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.self_attn.o_proj.lora_b,
+                format!("{}.self_attn.o_proj.lora_b", prefix)
+            );
 
             // MLP LoRA params
-            set_param!(layer.mlp.gate_proj.lora_a, format!("{}.mlp.gate_proj.lora_a", prefix));
-            set_param!(layer.mlp.gate_proj.lora_b, format!("{}.mlp.gate_proj.lora_b", prefix));
-            set_param!(layer.mlp.up_proj.lora_a, format!("{}.mlp.up_proj.lora_a", prefix));
-            set_param!(layer.mlp.up_proj.lora_b, format!("{}.mlp.up_proj.lora_b", prefix));
-            set_param!(layer.mlp.down_proj.lora_a, format!("{}.mlp.down_proj.lora_a", prefix));
-            set_param!(layer.mlp.down_proj.lora_b, format!("{}.mlp.down_proj.lora_b", prefix));
+            set_param!(
+                layer.mlp.gate_proj.lora_a,
+                format!("{}.mlp.gate_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.mlp.gate_proj.lora_b,
+                format!("{}.mlp.gate_proj.lora_b", prefix)
+            );
+            set_param!(
+                layer.mlp.up_proj.lora_a,
+                format!("{}.mlp.up_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.mlp.up_proj.lora_b,
+                format!("{}.mlp.up_proj.lora_b", prefix)
+            );
+            set_param!(
+                layer.mlp.down_proj.lora_a,
+                format!("{}.mlp.down_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.mlp.down_proj.lora_b,
+                format!("{}.mlp.down_proj.lora_b", prefix)
+            );
         }
     }
 
@@ -725,7 +757,10 @@ impl Qwen3QloraForCausalLM {
     }
 
     /// Load LoRA weights from safetensors.
-    pub fn load_lora_weights(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
+    pub fn load_lora_weights(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), LoraError> {
         let path = path.as_ref();
         let file_path = if path.is_dir() {
             path.join("lora_weights.safetensors")
@@ -746,29 +781,74 @@ impl Qwen3QloraForCausalLM {
             }
 
             // Attention LoRA params
-            load_param!(layer.self_attn.q_proj.lora_a, format!("{}.self_attn.q_proj.lora_a", prefix));
-            load_param!(layer.self_attn.q_proj.lora_b, format!("{}.self_attn.q_proj.lora_b", prefix));
-            load_param!(layer.self_attn.k_proj.lora_a, format!("{}.self_attn.k_proj.lora_a", prefix));
-            load_param!(layer.self_attn.k_proj.lora_b, format!("{}.self_attn.k_proj.lora_b", prefix));
-            load_param!(layer.self_attn.v_proj.lora_a, format!("{}.self_attn.v_proj.lora_a", prefix));
-            load_param!(layer.self_attn.v_proj.lora_b, format!("{}.self_attn.v_proj.lora_b", prefix));
-            load_param!(layer.self_attn.o_proj.lora_a, format!("{}.self_attn.o_proj.lora_a", prefix));
-            load_param!(layer.self_attn.o_proj.lora_b, format!("{}.self_attn.o_proj.lora_b", prefix));
+            load_param!(
+                layer.self_attn.q_proj.lora_a,
+                format!("{}.self_attn.q_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.self_attn.q_proj.lora_b,
+                format!("{}.self_attn.q_proj.lora_b", prefix)
+            );
+            load_param!(
+                layer.self_attn.k_proj.lora_a,
+                format!("{}.self_attn.k_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.self_attn.k_proj.lora_b,
+                format!("{}.self_attn.k_proj.lora_b", prefix)
+            );
+            load_param!(
+                layer.self_attn.v_proj.lora_a,
+                format!("{}.self_attn.v_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.self_attn.v_proj.lora_b,
+                format!("{}.self_attn.v_proj.lora_b", prefix)
+            );
+            load_param!(
+                layer.self_attn.o_proj.lora_a,
+                format!("{}.self_attn.o_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.self_attn.o_proj.lora_b,
+                format!("{}.self_attn.o_proj.lora_b", prefix)
+            );
 
             // MLP LoRA params
-            load_param!(layer.mlp.gate_proj.lora_a, format!("{}.mlp.gate_proj.lora_a", prefix));
-            load_param!(layer.mlp.gate_proj.lora_b, format!("{}.mlp.gate_proj.lora_b", prefix));
-            load_param!(layer.mlp.up_proj.lora_a, format!("{}.mlp.up_proj.lora_a", prefix));
-            load_param!(layer.mlp.up_proj.lora_b, format!("{}.mlp.up_proj.lora_b", prefix));
-            load_param!(layer.mlp.down_proj.lora_a, format!("{}.mlp.down_proj.lora_a", prefix));
-            load_param!(layer.mlp.down_proj.lora_b, format!("{}.mlp.down_proj.lora_b", prefix));
+            load_param!(
+                layer.mlp.gate_proj.lora_a,
+                format!("{}.mlp.gate_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.mlp.gate_proj.lora_b,
+                format!("{}.mlp.gate_proj.lora_b", prefix)
+            );
+            load_param!(
+                layer.mlp.up_proj.lora_a,
+                format!("{}.mlp.up_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.mlp.up_proj.lora_b,
+                format!("{}.mlp.up_proj.lora_b", prefix)
+            );
+            load_param!(
+                layer.mlp.down_proj.lora_a,
+                format!("{}.mlp.down_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.mlp.down_proj.lora_b,
+                format!("{}.mlp.down_proj.lora_b", prefix)
+            );
         }
 
         Ok(())
     }
 
     /// Load and quantize base model weights from a HashMap.
-    pub fn load_and_quantize_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), LoraError> {
+    pub fn load_and_quantize_weights(
+        &mut self,
+        weights: &HashMap<String, Array>,
+    ) -> Result<(), LoraError> {
         // Load embed_tokens (kept in full precision)
         if let Some(w) = weights.get("model.embed_tokens.weight") {
             self.model.embed_tokens.weight = Param::new(w.clone());
@@ -867,23 +947,47 @@ impl ModuleParameters for Qwen3QloraForCausalLM {
             // Attention LoRA params
             let mut attn_params = HashMap::new();
             let mut q_params = HashMap::new();
-            q_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.self_attn.q_proj.lora_a));
-            q_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.self_attn.q_proj.lora_b));
+            q_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.self_attn.q_proj.lora_a),
+            );
+            q_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.self_attn.q_proj.lora_b),
+            );
             attn_params.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
 
             let mut k_params = HashMap::new();
-            k_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.self_attn.k_proj.lora_a));
-            k_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.self_attn.k_proj.lora_b));
+            k_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.self_attn.k_proj.lora_a),
+            );
+            k_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.self_attn.k_proj.lora_b),
+            );
             attn_params.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
 
             let mut v_params = HashMap::new();
-            v_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.self_attn.v_proj.lora_a));
-            v_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.self_attn.v_proj.lora_b));
+            v_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.self_attn.v_proj.lora_a),
+            );
+            v_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.self_attn.v_proj.lora_b),
+            );
             attn_params.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
 
             let mut o_params = HashMap::new();
-            o_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.self_attn.o_proj.lora_a));
-            o_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.self_attn.o_proj.lora_b));
+            o_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.self_attn.o_proj.lora_a),
+            );
+            o_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.self_attn.o_proj.lora_b),
+            );
             attn_params.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
 
             layer_params.insert(Rc::from("self_attn"), NestedValue::Map(attn_params));
@@ -891,18 +995,36 @@ impl ModuleParameters for Qwen3QloraForCausalLM {
             // MLP LoRA params
             let mut mlp_params = HashMap::new();
             let mut gate_params = HashMap::new();
-            gate_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.mlp.gate_proj.lora_a));
-            gate_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.mlp.gate_proj.lora_b));
+            gate_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.mlp.gate_proj.lora_a),
+            );
+            gate_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.mlp.gate_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("gate_proj"), NestedValue::Map(gate_params));
 
             let mut up_params = HashMap::new();
-            up_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.mlp.up_proj.lora_a));
-            up_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.mlp.up_proj.lora_b));
+            up_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.mlp.up_proj.lora_a),
+            );
+            up_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.mlp.up_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("up_proj"), NestedValue::Map(up_params));
 
             let mut down_params = HashMap::new();
-            down_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.mlp.down_proj.lora_a));
-            down_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.mlp.down_proj.lora_b));
+            down_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.mlp.down_proj.lora_a),
+            );
+            down_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.mlp.down_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
 
             layer_params.insert(Rc::from("mlp"), NestedValue::Map(mlp_params));
@@ -923,23 +1045,47 @@ impl ModuleParameters for Qwen3QloraForCausalLM {
             // Attention LoRA params
             let mut attn_params = HashMap::new();
             let mut q_params = HashMap::new();
-            q_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.q_proj.lora_a));
-            q_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.q_proj.lora_b));
+            q_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.self_attn.q_proj.lora_a),
+            );
+            q_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.self_attn.q_proj.lora_b),
+            );
             attn_params.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
 
             let mut k_params = HashMap::new();
-            k_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.k_proj.lora_a));
-            k_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.k_proj.lora_b));
+            k_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.self_attn.k_proj.lora_a),
+            );
+            k_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.self_attn.k_proj.lora_b),
+            );
             attn_params.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
 
             let mut v_params = HashMap::new();
-            v_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.v_proj.lora_a));
-            v_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.v_proj.lora_b));
+            v_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.self_attn.v_proj.lora_a),
+            );
+            v_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.self_attn.v_proj.lora_b),
+            );
             attn_params.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
 
             let mut o_params = HashMap::new();
-            o_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.o_proj.lora_a));
-            o_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.o_proj.lora_b));
+            o_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.self_attn.o_proj.lora_a),
+            );
+            o_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.self_attn.o_proj.lora_b),
+            );
             attn_params.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
 
             layer_params.insert(Rc::from("self_attn"), NestedValue::Map(attn_params));
@@ -947,18 +1093,36 @@ impl ModuleParameters for Qwen3QloraForCausalLM {
             // MLP LoRA params
             let mut mlp_params = HashMap::new();
             let mut gate_params = HashMap::new();
-            gate_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.mlp.gate_proj.lora_a));
-            gate_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.mlp.gate_proj.lora_b));
+            gate_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.mlp.gate_proj.lora_a),
+            );
+            gate_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.mlp.gate_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("gate_proj"), NestedValue::Map(gate_params));
 
             let mut up_params = HashMap::new();
-            up_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.mlp.up_proj.lora_a));
-            up_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.mlp.up_proj.lora_b));
+            up_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.mlp.up_proj.lora_a),
+            );
+            up_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.mlp.up_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("up_proj"), NestedValue::Map(up_params));
 
             let mut down_params = HashMap::new();
-            down_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.mlp.down_proj.lora_a));
-            down_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.mlp.down_proj.lora_b));
+            down_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.mlp.down_proj.lora_a),
+            );
+            down_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.mlp.down_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
 
             layer_params.insert(Rc::from("mlp"), NestedValue::Map(mlp_params));
@@ -975,8 +1139,12 @@ impl ModuleParameters for Qwen3QloraForCausalLM {
 
     fn freeze_parameters(&mut self, _recursive: bool) {}
     fn unfreeze_parameters(&mut self, _recursive: bool) {}
-    fn all_frozen(&self) -> Option<bool> { Some(false) }
-    fn any_frozen(&self) -> Option<bool> { Some(false) }
+    fn all_frozen(&self) -> Option<bool> {
+        Some(false)
+    }
+    fn any_frozen(&self) -> Option<bool> {
+        Some(false)
+    }
 }
 
 /// Implement TrainableModel for Qwen3QloraForCausalLM.

@@ -106,8 +106,9 @@ where
         if optimizer_state_count == 0 && !param_keys.is_empty() {
             tracing::warn!(
                 "Optimizer state not initialized ({} params, 0 optimizer states). \
-                 Run a warmup step before creating CompiledTrainStep for best performance."
-            , param_keys.len());
+                 Run a warmup step before creating CompiledTrainStep for best performance.",
+                param_keys.len()
+            );
         }
 
         Ok(Self {
@@ -160,7 +161,8 @@ where
 
     /// Extract model parameters as flat array list.
     fn extract_model_params(&self) -> Vec<Array> {
-        let params: FlattenedModuleParam = self.model
+        let params: FlattenedModuleParam = self
+            .model
             .trainable_parameters()
             .flatten()
             .into_iter()
@@ -207,7 +209,9 @@ pub fn stateless_loss_and_grad(
         .collect();
 
     // Define loss function for autodiff
-    let loss_fn = |params: HashMap<Rc<str>, Array>, (input_ids, labels): (&Array, &Array)| -> std::result::Result<Vec<Array>, Exception> {
+    let loss_fn = |params: HashMap<Rc<str>, Array>,
+                   (input_ids, labels): (&Array, &Array)|
+     -> std::result::Result<Vec<Array>, Exception> {
         let params: FlattenedModuleParam = params;
         let logits = forward_fn(&params, input_ids)?;
 
@@ -308,22 +312,22 @@ mod tests {
         let labels = Array::from_slice(&[-100_i32, 1], &[1, 2]); // First token ignored
 
         // Mock forward that returns logits
-        let forward_fn = |_params: &FlattenedModuleParam, _input: &Array| -> std::result::Result<Array, Exception> {
+        let forward_fn = |_params: &FlattenedModuleParam,
+                          _input: &Array|
+         -> std::result::Result<Array, Exception> {
             // Return fake logits [batch=1, seq=2, vocab=4]
-            let logits = Array::from_slice(&[
-                0.1f32, 0.2, 0.3, 0.4,  // token 0
-                0.5, 0.6, 0.7, 0.8,     // token 1
-            ], &[1, 2, 4]);
+            let logits = Array::from_slice(
+                &[
+                    0.1f32, 0.2, 0.3, 0.4, // token 0
+                    0.5, 0.6, 0.7, 0.8, // token 1
+                ],
+                &[1, 2, 4],
+            );
             Ok(logits)
         };
 
-        let result = stateless_loss_and_grad(
-            &param_arrays,
-            &param_keys,
-            &input_ids,
-            &labels,
-            forward_fn,
-        );
+        let result =
+            stateless_loss_and_grad(&param_arrays, &param_keys, &input_ids, &labels, forward_fn);
 
         assert!(result.is_ok());
         let (loss, grads) = result.unwrap();

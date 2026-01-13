@@ -84,18 +84,18 @@ impl GgmlType {
         match self {
             Self::F32 => 4,
             Self::F16 | Self::Bf16 => 2,
-            Self::Q4_0 => 18,  // 32 values in 18 bytes (16 + 2 scale)
-            Self::Q4_1 => 20,  // 32 values in 20 bytes
-            Self::Q5_0 => 22,  // 32 values in 22 bytes
-            Self::Q5_1 => 24,  // 32 values in 24 bytes
-            Self::Q8_0 => 34,  // 32 values in 34 bytes
-            Self::Q8_1 => 36,  // 32 values in 36 bytes
-            Self::Q2K => 84,   // 256 values in 84 bytes
-            Self::Q3K => 110,  // 256 values in 110 bytes
-            Self::Q4K => 144,  // 256 values in 144 bytes
-            Self::Q5K => 176,  // 256 values in 176 bytes
-            Self::Q6K => 210,  // 256 values in 210 bytes
-            Self::Q8K => 292,  // 256 values in 292 bytes
+            Self::Q4_0 => 18, // 32 values in 18 bytes (16 + 2 scale)
+            Self::Q4_1 => 20, // 32 values in 20 bytes
+            Self::Q5_0 => 22, // 32 values in 22 bytes
+            Self::Q5_1 => 24, // 32 values in 24 bytes
+            Self::Q8_0 => 34, // 32 values in 34 bytes
+            Self::Q8_1 => 36, // 32 values in 36 bytes
+            Self::Q2K => 84,  // 256 values in 84 bytes
+            Self::Q3K => 110, // 256 values in 110 bytes
+            Self::Q4K => 144, // 256 values in 144 bytes
+            Self::Q5K => 176, // 256 values in 176 bytes
+            Self::Q6K => 210, // 256 values in 210 bytes
+            Self::Q8K => 292, // 256 values in 292 bytes
             // IQ types (importance-weighted quantization)
             Self::Iq1S => 50,   // 256 values in 50 bytes (~1.5625 bits/element)
             Self::Iq1M => 56,   // 256 values in 56 bytes (~1.75 bits/element)
@@ -124,8 +124,14 @@ impl GgmlType {
             Self::Q4K | Self::Q5K | Self::Q6K => 256,
             // IQ types: IQ4_NL uses 32, all others use 256
             Self::Iq4Nl => 32,
-            Self::Iq1S | Self::Iq1M | Self::Iq2Xxs | Self::Iq2Xs | Self::Iq2S
-            | Self::Iq3Xxs | Self::Iq3S | Self::Iq4Xs => 256,
+            Self::Iq1S
+            | Self::Iq1M
+            | Self::Iq2Xxs
+            | Self::Iq2Xs
+            | Self::Iq2S
+            | Self::Iq3Xxs
+            | Self::Iq3S
+            | Self::Iq4Xs => 256,
             _ => 32,
         }
     }
@@ -320,8 +326,7 @@ impl TensorInfo {
     /// # Panics
     /// Panics if the calculation would overflow. Use [`byte_size_checked`] for fallible version.
     pub fn byte_size(&self) -> usize {
-        self.byte_size_checked()
-            .expect("tensor byte size overflow")
+        self.byte_size_checked().expect("tensor byte size overflow")
     }
 }
 

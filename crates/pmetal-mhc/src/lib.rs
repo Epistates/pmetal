@@ -97,9 +97,8 @@ mod tests {
     #[test]
     fn test_sinkhorn_produces_doubly_stochastic() {
         let n = 4;
-        let matrix = Array2::<f32>::from_shape_fn((n, n), |(i, j)| {
-            ((i * n + j) as f32 + 1.0) * 0.1
-        });
+        let matrix =
+            Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i * n + j) as f32 + 1.0) * 0.1);
 
         let config = SinkhornConfig::default();
         let result = sinkhorn_knopp(&matrix, &config);
@@ -112,12 +111,9 @@ mod tests {
         let n = 4;
         let config = SinkhornConfig::default();
 
-        let a_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| {
-            ((i + j) as f32 + 0.1) * 0.1
-        });
-        let b_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| {
-            ((i * 2 + j) as f32 + 0.2) * 0.1
-        });
+        let a_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i + j) as f32 + 0.1) * 0.1);
+        let b_input =
+            Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i * 2 + j) as f32 + 0.2) * 0.1);
 
         let a = sinkhorn_knopp(&a_input, &config).matrix;
         let b = sinkhorn_knopp(&b_input, &config).matrix;
@@ -165,15 +161,11 @@ mod tests {
         let n = 4;
         let config = SinkhornConfig::default();
 
-        let h_pre_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| {
-            ((i + j) as f32 * 0.1)
-        });
-        let h_post_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| {
-            ((i * j) as f32 * 0.05 + 0.1)
-        });
-        let h_res_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| {
-            ((i + j * 2) as f32 * 0.08)
-        });
+        let h_pre_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i + j) as f32 * 0.1));
+        let h_post_input =
+            Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i * j) as f32 * 0.05 + 0.1));
+        let h_res_input =
+            Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i + j * 2) as f32 * 0.08));
 
         let h_pre = sinkhorn_knopp(&h_pre_input, &config).matrix;
         let h_post = sinkhorn_knopp(&h_post_input, &config).matrix;
@@ -262,6 +254,10 @@ mod tests {
 
         // Norm should be clipped
         let clipped_norm = grads.norm();
-        assert!(clipped_norm <= 1.0 + 1e-5, "Gradient norm not clipped: {}", clipped_norm);
+        assert!(
+            clipped_norm <= 1.0 + 1e-5,
+            "Gradient norm not clipped: {}",
+            clipped_norm
+        );
     }
 }

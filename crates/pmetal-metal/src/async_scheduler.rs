@@ -45,8 +45,8 @@ use std::time::Duration;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
-    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandQueue,
-    MTLComputeCommandEncoder, MTLCommandEncoder,
+    MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
+    MTLComputeCommandEncoder,
 };
 use parking_lot::RwLock;
 
@@ -298,9 +298,7 @@ impl InFlightBuffer {
     }
 
     /// Take the command buffer (consumes self).
-    fn take_command_buffer(
-        &mut self,
-    ) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
+    fn take_command_buffer(&mut self) -> Result<Retained<ProtocolObject<dyn MTLCommandBuffer>>> {
         self.command_buffer
             .take()
             .ok_or(MetalError::CommandBufferCreation)
@@ -773,9 +771,7 @@ mod tests {
 
     fn create_test_scheduler() -> Arc<AsyncScheduler> {
         let ctx = Arc::new(MetalContext::new().expect("Failed to create Metal context"));
-        Arc::new(
-            AsyncScheduler::new(ctx, 4).expect("Failed to create scheduler"),
-        )
+        Arc::new(AsyncScheduler::new(ctx, 4).expect("Failed to create scheduler"))
     }
 
     #[test]
@@ -869,7 +865,9 @@ mod tests {
         let token = scheduler.commit_async(buffer).unwrap();
 
         // Should complete quickly (empty buffer)
-        let completed = token.wait_timeout(std::time::Duration::from_secs(1)).unwrap();
+        let completed = token
+            .wait_timeout(std::time::Duration::from_secs(1))
+            .unwrap();
         assert!(completed);
     }
 

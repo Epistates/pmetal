@@ -7,16 +7,11 @@
 //! - No RoPE scaling support
 //! - Optional sliding window attention (usually disabled)
 
+use mlx_rs::{
+    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn, Array,
+};
 use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
 use pmetal_mlx::kv_cache::KVCache;
-use mlx_rs::{
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::Module,
-    nn,
-    Array,
-};
 use serde::{Deserialize, Serialize};
 
 /// Qwen2 model configuration.
@@ -544,8 +539,11 @@ impl Qwen2Model {
         match cache {
             Some(cache) => {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                    hidden_states =
-                        layer.forward_with_cache(&hidden_states, mask.as_ref(), Some((cache, layer_idx)))?;
+                    hidden_states = layer.forward_with_cache(
+                        &hidden_states,
+                        mask.as_ref(),
+                        Some((cache, layer_idx)),
+                    )?;
                 }
             }
             None => {
@@ -651,7 +649,9 @@ fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> Result<Array, E
     // Valid if distance >= 0 and distance < window_size
     let window_size_arr = Array::from_f32(window_size as f32);
     let zero = Array::from_f32(0.0);
-    let in_window = distance.ge(&zero)?.logical_and(&distance.lt(&window_size_arr)?)?;
+    let in_window = distance
+        .ge(&zero)?
+        .logical_and(&distance.lt(&window_size_arr)?)?;
 
     // Combine with causal mask
     let combined = causal_mask.multiply(&in_window.as_dtype(mlx_rs::Dtype::Float32)?)?;

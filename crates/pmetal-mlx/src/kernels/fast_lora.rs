@@ -437,8 +437,7 @@ mod tests {
         let rank = 8;
         let scale = 2.0;
 
-        let x =
-            mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
 
         // Create Q, K, V weights
         let wq = mlx_rs::random::normal::<f32>(&[hidden, hidden], None, None, None).unwrap();

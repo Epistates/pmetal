@@ -15,17 +15,11 @@
 
 use std::sync::Arc;
 
+use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::{error::Exception, nn, optimizers::Optimizer, Array, Dtype};
 use pmetal_core::TrainingConfig;
 use pmetal_lora::TrainableModel;
-use mlx_rs::{
-    error::Exception,
-    nn,
-    optimizers::Optimizer,
-    Array,
-    Dtype,
-};
-use mlx_rs::ops::indexing::IndexOp;
-use tracing::{info, debug};
+use tracing::{debug, info};
 
 use crate::dpo::{DpoConfig, DpoLossType};
 
@@ -114,11 +108,7 @@ pub trait RewardFunction: Send + Sync {
     ///
     /// # Returns
     /// Array of scalar scores [batch]
-    fn score(
-        &self,
-        prompt_tokens: &Array,
-        completion_tokens: &Array,
-    ) -> Result<Array, Exception>;
+    fn score(&self, prompt_tokens: &Array, completion_tokens: &Array) -> Result<Array, Exception>;
 }
 
 /// A preference pair for training.
@@ -257,7 +247,11 @@ impl OnlineDpoTrainer {
         // Mean loss
         let loss = loss.mean(None)?;
 
-        Ok((loss, chosen_rewards.multiply(&beta)?, rejected_rewards.multiply(&beta)?))
+        Ok((
+            loss,
+            chosen_rewards.multiply(&beta)?,
+            rejected_rewards.multiply(&beta)?,
+        ))
     }
 
     /// Generate completions for a batch of prompts.
@@ -294,7 +288,8 @@ impl OnlineDpoTrainer {
                     let last_logits = logits.index((.., -1, ..));
 
                     // Apply temperature scaling to logits
-                    let scaled = last_logits.multiply(&Array::from_f32(1.0 / self.config.temperature))?;
+                    let scaled =
+                        last_logits.multiply(&Array::from_f32(1.0 / self.config.temperature))?;
 
                     // Sample from categorical distribution (proper stochastic sampling)
                     // categorical() takes logits directly (applies softmax internally)
@@ -417,7 +412,8 @@ impl OnlineDpoTrainer {
         let chosen_ids = Array::from_slice(&chosen_full, &[1, chosen_full.len() as i32]);
         let rejected_ids = Array::from_slice(&rejected_full, &[1, rejected_full.len() as i32]);
         let chosen_labels_arr = Array::from_slice(&chosen_labels, &[1, chosen_labels.len() as i32]);
-        let rejected_labels_arr = Array::from_slice(&rejected_labels, &[1, rejected_labels.len() as i32]);
+        let rejected_labels_arr =
+            Array::from_slice(&rejected_labels, &[1, rejected_labels.len() as i32]);
 
         // Reference model forward (no grad)
         let ref_chosen_logits = ref_model
@@ -427,8 +423,10 @@ impl OnlineDpoTrainer {
             .forward(&rejected_ids, None)
             .map_err(|e| Exception::custom(e.to_string()))?;
 
-        let ref_chosen_logps = Self::compute_log_probs_static(&ref_chosen_logits, &chosen_labels_arr)?;
-        let ref_rejected_logps = Self::compute_log_probs_static(&ref_rejected_logits, &rejected_labels_arr)?;
+        let ref_chosen_logps =
+            Self::compute_log_probs_static(&ref_chosen_logits, &chosen_labels_arr)?;
+        let ref_rejected_logps =
+            Self::compute_log_probs_static(&ref_rejected_logits, &rejected_labels_arr)?;
 
         // Extract DPO config for the closure
         let dpo_config = self.config.dpo_config.clone();
@@ -442,8 +440,10 @@ impl OnlineDpoTrainer {
                 .forward(&rejected_ids, None)
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
-            let policy_chosen_logps = Self::compute_log_probs_static(&policy_chosen_logits, &chosen_labels_arr)?;
-            let policy_rejected_logps = Self::compute_log_probs_static(&policy_rejected_logits, &rejected_labels_arr)?;
+            let policy_chosen_logps =
+                Self::compute_log_probs_static(&policy_chosen_logits, &chosen_labels_arr)?;
+            let policy_rejected_logps =
+                Self::compute_log_probs_static(&policy_rejected_logits, &rejected_labels_arr)?;
 
             let (loss, _, _) = Self::compute_dpo_loss_static(
                 &dpo_config,
@@ -527,7 +527,11 @@ impl OnlineDpoTrainer {
         let loss = nn::softplus(&neg_logits)?;
         let loss = loss.mean(None)?;
 
-        Ok((loss, chosen_rewards.multiply(&beta)?, rejected_rewards.multiply(&beta)?))
+        Ok((
+            loss,
+            chosen_rewards.multiply(&beta)?,
+            rejected_rewards.multiply(&beta)?,
+        ))
     }
 
     /// Run the full online training loop.
@@ -544,16 +548,26 @@ impl OnlineDpoTrainer {
     {
         let mut all_stats = Vec::with_capacity(self.config.num_iterations);
 
-        info!("Starting Online DPO training for {} iterations", self.config.num_iterations);
+        info!(
+            "Starting Online DPO training for {} iterations",
+            self.config.num_iterations
+        );
 
         for iter in 0..self.config.num_iterations {
             self.iteration = iter;
-            info!("=== Iteration {}/{} ===", iter + 1, self.config.num_iterations);
+            info!(
+                "=== Iteration {}/{} ===",
+                iter + 1,
+                self.config.num_iterations
+            );
 
             // 1. Generate completions
             debug!("Generating completions...");
             let prompt_completions = self.generate_completions(policy_model, prompts)?;
-            debug!("Generated {} prompt-completion sets", prompt_completions.len());
+            debug!(
+                "Generated {} prompt-completion sets",
+                prompt_completions.len()
+            );
 
             // 2. Create preference pairs
             debug!("Creating preference pairs...");
@@ -582,17 +596,12 @@ impl OnlineDpoTrainer {
                 total_rejected_reward += pair.rejected_reward;
 
                 if (step + 1) % 10 == 0 {
-                    debug!(
-                        "  Step {}/{}: loss={:.4}",
-                        step + 1, steps, loss
-                    );
+                    debug!("  Step {}/{}: loss={:.4}", step + 1, steps, loss);
                 }
             }
 
             // 4. Update reference model if using self-play
-            if self.config.use_self_play
-                && (iter + 1) % self.config.ref_update_interval == 0
-            {
+            if self.config.use_self_play && (iter + 1) % self.config.ref_update_interval == 0 {
                 info!("Updating reference model to current policy");
                 *ref_model = policy_model.clone();
             }
@@ -615,7 +624,10 @@ impl OnlineDpoTrainer {
 
             info!(
                 "Iteration {} complete: loss={:.4}, margin={:.4}, pairs={}",
-                iter + 1, avg_loss, avg_reward_margin, pairs.len()
+                iter + 1,
+                avg_loss,
+                avg_reward_margin,
+                pairs.len()
             );
 
             all_stats.push(stats);
@@ -669,9 +681,7 @@ mod tests {
 
     #[test]
     fn test_online_dpo_config() {
-        let config = OnlineDpoConfig::new()
-            .with_beta(0.2)
-            .with_simpo(1.5);
+        let config = OnlineDpoConfig::new().with_beta(0.2).with_simpo(1.5);
 
         assert_eq!(config.dpo_config.beta, 0.2);
         assert!(matches!(config.dpo_config.loss_type, DpoLossType::SimPo));

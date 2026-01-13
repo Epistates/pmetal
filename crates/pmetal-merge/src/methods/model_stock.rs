@@ -15,8 +15,8 @@
 //! For N > 2 models, we use iterative geometric averaging with cosine
 //! similarity weighting to approximate the center.
 
+use crate::{MergeError, MergeMethod, MergeParameters, Result};
 use mlx_rs::Array;
-use crate::{MergeMethod, MergeParameters, Result, MergeError};
 
 /// Model Stock merge method.
 ///
@@ -82,12 +82,7 @@ impl ModelStockMerge {
     ///
     /// Finds the perpendicular foot from the estimated center to the plane
     /// defined by the pretrained weights and two fine-tuned weights.
-    fn merge_two_models(
-        &self,
-        base: &Array,
-        w1: &Array,
-        w2: &Array,
-    ) -> Result<Array> {
+    fn merge_two_models(&self, base: &Array, w1: &Array, w2: &Array) -> Result<Array> {
         // Task vectors
         let tau1 = w1.subtract(base)?;
         let tau2 = w2.subtract(base)?;
@@ -136,11 +131,7 @@ impl ModelStockMerge {
     ///
     /// Uses an iterative approach that weights each model's contribution
     /// by its cosine similarity to the estimated center direction.
-    fn merge_n_models(
-        &self,
-        base: &Array,
-        tensors: &[Array],
-    ) -> Result<Array> {
+    fn merge_n_models(&self, base: &Array, tensors: &[Array]) -> Result<Array> {
         let n = tensors.len();
 
         // Compute task vectors
@@ -251,7 +242,8 @@ mod tests {
         let w1 = Array::from_slice(&[1.1f32, 0.2, 0.0, 0.0], &[4]);
         let w2 = Array::from_slice(&[1.0f32, 0.0, 0.3, 0.0], &[4]);
 
-        let result = merger.merge(&[w1, w2], Some(&base), &[], &MergeParameters::default())
+        let result = merger
+            .merge(&[w1, w2], Some(&base), &[], &MergeParameters::default())
             .unwrap();
 
         result.eval().unwrap();
@@ -272,7 +264,8 @@ mod tests {
         let w2 = Array::from_slice(&[0.9f32, 0.1, 0.0], &[3]); // Similar to w1
         let w3 = Array::from_slice(&[0.0f32, 0.0, 1.0], &[3]); // Different direction
 
-        let result = merger.merge(&[w1, w2, w3], Some(&base), &[], &MergeParameters::default())
+        let result = merger
+            .merge(&[w1, w2, w3], Some(&base), &[], &MergeParameters::default())
             .unwrap();
 
         result.eval().unwrap();
@@ -292,7 +285,8 @@ mod tests {
         let base = Array::from_slice(&[1.0f32, 2.0], &[2]);
         let w1 = Array::from_slice(&[1.5f32, 2.5], &[2]);
 
-        let result = merger.merge(&[w1.clone()], Some(&base), &[], &MergeParameters::default())
+        let result = merger
+            .merge(&[w1.clone()], Some(&base), &[], &MergeParameters::default())
             .unwrap();
 
         result.eval().unwrap();

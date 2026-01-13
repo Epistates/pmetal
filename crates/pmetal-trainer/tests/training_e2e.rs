@@ -6,12 +6,12 @@
 //! - Optional Metal FlashAttention for forward pass
 //! - Checkpoint saving/loading
 
+use mlx_rs::optimizers::Sgd;
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
 use pmetal_lora::LlamaLoraForCausalLM;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_trainer::{TrainingLoop, TrainingLoopConfig};
-use mlx_rs::optimizers::Sgd;
 
 fn small_llama_config() -> LlamaConfig {
     LlamaConfig {
@@ -82,7 +82,8 @@ fn test_training_loop_single_step() {
         log_every: 1,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false, ..Default::default()
+        use_jit_compilation: false,
+        ..Default::default()
     };
 
     let mut training_loop = TrainingLoop::new(config);
@@ -98,7 +99,7 @@ fn test_training_loop_single_step() {
             pad_token_id: 0,
             ..Default::default()
         },
-    None,
+        None,
     );
 
     // Create optimizer
@@ -142,7 +143,8 @@ fn test_training_loop_gradient_accumulation() {
         log_every: 100,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false, ..Default::default()
+        use_jit_compilation: false,
+        ..Default::default()
     };
 
     let mut training_loop = TrainingLoop::new(config);
@@ -156,19 +158,26 @@ fn test_training_loop_gradient_accumulation() {
             pad_token_id: 0,
             ..Default::default()
         },
-    None,
+        None,
     );
 
     let mut optimizer = Sgd::new(1e-4);
 
     // First step - should accumulate, not apply gradients
     let batch1 = dataloader.next_batch().unwrap();
-    let stats1 = training_loop.train_step(&mut model, &batch1, &mut optimizer).unwrap();
-    assert!(stats1.grad_norm.is_none(), "First step should not apply gradients");
+    let stats1 = training_loop
+        .train_step(&mut model, &batch1, &mut optimizer)
+        .unwrap();
+    assert!(
+        stats1.grad_norm.is_none(),
+        "First step should not apply gradients"
+    );
 
     // Second step - should apply accumulated gradients
     let batch2 = dataloader.next_batch().unwrap();
-    let stats2 = training_loop.train_step(&mut model, &batch2, &mut optimizer).unwrap();
+    let stats2 = training_loop
+        .train_step(&mut model, &batch2, &mut optimizer)
+        .unwrap();
     // After gradient accumulation is complete, grad_norm should be Some
     // (assuming max_grad_norm > 0, which triggers gradient clipping computation)
 
@@ -199,7 +208,8 @@ fn test_training_loop_multiple_steps() {
         log_every: 100,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false, ..Default::default()
+        use_jit_compilation: false,
+        ..Default::default()
     };
 
     let mut training_loop = TrainingLoop::new(config);
@@ -213,7 +223,7 @@ fn test_training_loop_multiple_steps() {
             pad_token_id: 0,
             ..Default::default()
         },
-    None,
+        None,
     );
 
     let mut optimizer = Sgd::new(1e-3);
@@ -223,11 +233,16 @@ fn test_training_loop_multiple_steps() {
     // Train for 4 steps
     for _ in 0..4 {
         if let Some(batch) = dataloader.next_batch() {
-            let stats = training_loop.train_step(&mut model, &batch, &mut optimizer).unwrap();
+            let stats = training_loop
+                .train_step(&mut model, &batch, &mut optimizer)
+                .unwrap();
             losses.push(stats.loss);
 
             // Gradient norm should be computed (since max_grad_norm > 0)
-            assert!(stats.grad_norm.is_some(), "Gradient norm should be computed");
+            assert!(
+                stats.grad_norm.is_some(),
+                "Gradient norm should be computed"
+            );
         }
     }
 
@@ -264,7 +279,8 @@ fn test_training_with_metal_flash_attention() {
         log_every: 1,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false, ..Default::default()
+        use_jit_compilation: false,
+        ..Default::default()
     };
 
     let mut training_loop = TrainingLoop::new(config);
@@ -278,7 +294,7 @@ fn test_training_with_metal_flash_attention() {
             pad_token_id: 0,
             ..Default::default()
         },
-    None,
+        None,
     );
 
     let mut optimizer = Sgd::new(1e-4);
@@ -327,8 +343,16 @@ fn test_learning_rate_schedules() {
         let lr_end_warmup = training_loop.get_learning_rate();
 
         // Warmup should increase LR
-        assert!(lr_mid_warmup > lr_start, "LR should increase during warmup for {:?}", scheduler);
-        assert!(lr_end_warmup >= lr_mid_warmup, "LR should continue increasing during warmup for {:?}", scheduler);
+        assert!(
+            lr_mid_warmup > lr_start,
+            "LR should increase during warmup for {:?}",
+            scheduler
+        );
+        assert!(
+            lr_end_warmup >= lr_mid_warmup,
+            "LR should continue increasing during warmup for {:?}",
+            scheduler
+        );
 
         // After warmup, behavior depends on scheduler
         training_loop.set_step(50);
@@ -336,7 +360,10 @@ fn test_learning_rate_schedules() {
 
         match scheduler {
             pmetal_core::LrSchedulerType::Constant => {
-                assert!((lr_mid - 1e-4).abs() < 1e-8, "Constant LR should stay at base");
+                assert!(
+                    (lr_mid - 1e-4).abs() < 1e-8,
+                    "Constant LR should stay at base"
+                );
             }
             pmetal_core::LrSchedulerType::Linear | pmetal_core::LrSchedulerType::Cosine => {
                 assert!(lr_mid < 1e-4, "LR should decay for {:?}", scheduler);
@@ -396,7 +423,8 @@ fn test_qlora_training_step() {
         log_every: 1,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false, ..Default::default()
+        use_jit_compilation: false,
+        ..Default::default()
     };
 
     let mut training_loop = TrainingLoop::new(config);
@@ -410,7 +438,7 @@ fn test_qlora_training_step() {
             pad_token_id: 0,
             ..Default::default()
         },
-    None,
+        None,
     );
 
     let mut optimizer = Sgd::new(1e-4);
@@ -466,7 +494,8 @@ fn test_qlora_multiple_steps() {
         log_every: 100,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false, ..Default::default()
+        use_jit_compilation: false,
+        ..Default::default()
     };
 
     let mut training_loop = TrainingLoop::new(config);
@@ -480,7 +509,7 @@ fn test_qlora_multiple_steps() {
             pad_token_id: 0,
             ..Default::default()
         },
-    None,
+        None,
     );
 
     let mut optimizer = Sgd::new(1e-3);
@@ -493,11 +522,18 @@ fn test_qlora_multiple_steps() {
                 .train_step(&mut model, &batch, &mut optimizer)
                 .unwrap();
             losses.push(stats.loss);
-            assert!(stats.grad_norm.is_some(), "Gradient norm should be computed");
+            assert!(
+                stats.grad_norm.is_some(),
+                "Gradient norm should be computed"
+            );
         }
     }
 
-    assert_eq!(training_loop.current_step(), 4, "Should have completed 4 steps");
+    assert_eq!(
+        training_loop.current_step(),
+        4,
+        "Should have completed 4 steps"
+    );
     assert_eq!(losses.len(), 4, "Should have 4 loss values");
 
     // All losses should be positive
@@ -530,33 +566,48 @@ fn test_evaluation_metrics() {
         log_every: 1,
         checkpoint_every: 0,
         eval_every: 0,
-        use_jit_compilation: false, ..Default::default()
+        use_jit_compilation: false,
+        ..Default::default()
     };
 
     let training_loop = TrainingLoop::new(config);
     let eval_dataset = create_dummy_dataset(4, 16);
 
     // Run evaluation
-    let metrics = training_loop.evaluate(&mut model, &eval_dataset)
+    let metrics = training_loop
+        .evaluate(&mut model, &eval_dataset)
         .expect("Evaluation should succeed");
 
     // Verify loss is positive
-    assert!(metrics.loss > 0.0, "Loss should be positive, got {}", metrics.loss);
+    assert!(
+        metrics.loss > 0.0,
+        "Loss should be positive, got {}",
+        metrics.loss
+    );
 
     // Verify perplexity = exp(loss)
     let expected_ppl = metrics.loss.exp();
     assert!(
         (metrics.perplexity - expected_ppl).abs() < 0.01,
         "Perplexity should be exp(loss), got {} vs expected {}",
-        metrics.perplexity, expected_ppl
+        metrics.perplexity,
+        expected_ppl
     );
 
     // Verify accuracy is present and reasonable (0-100%)
     assert!(metrics.accuracy.is_some(), "Accuracy should be computed");
     let acc = metrics.accuracy.unwrap();
-    assert!(acc >= 0.0 && acc <= 100.0, "Accuracy should be 0-100%, got {}", acc);
+    assert!(
+        acc >= 0.0 && acc <= 100.0,
+        "Accuracy should be 0-100%, got {}",
+        acc
+    );
 
     // With random weights, accuracy should be roughly 1/vocab_size * 100 = 0.39%
     // But could be higher due to model structure, so just check it's not 100%
-    assert!(acc < 50.0, "Accuracy with random weights should be low, got {}", acc);
+    assert!(
+        acc < 50.0,
+        "Accuracy with random weights should be low, got {}",
+        acc
+    );
 }

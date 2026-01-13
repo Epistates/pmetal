@@ -137,7 +137,9 @@ impl WeightLoader {
     ///
     /// Handles both single-file and sharded models.
     /// Automatically converts BF16 weights to F32 for training compatibility.
-    pub fn load_safetensors(path: impl AsRef<Path>) -> Result<HashMap<String, Array>, WeightFormatError> {
+    pub fn load_safetensors(
+        path: impl AsRef<Path>,
+    ) -> Result<HashMap<String, Array>, WeightFormatError> {
         let path = path.as_ref();
         let mut weights = HashMap::new();
 
@@ -239,9 +241,9 @@ impl WeightLoader {
         let tensor_names: Vec<String> = content.tensor_names().map(String::from).collect();
 
         for tensor_name in tensor_names {
-            let tensor_info = content
-                .get_tensor_info(&tensor_name)
-                .ok_or_else(|| WeightFormatError::Gguf(format!("Tensor not found: {}", tensor_name)))?;
+            let tensor_info = content.get_tensor_info(&tensor_name).ok_or_else(|| {
+                WeightFormatError::Gguf(format!("Tensor not found: {}", tensor_name))
+            })?;
 
             // Read tensor data
             let data = content
@@ -401,21 +403,21 @@ impl GgufModelConfig {
         };
 
         // Extract required values
-        let hidden_size = get_u32("embedding_length")
-            .ok_or_else(|| WeightFormatError::Gguf(format!("{}.embedding_length not found", arch)))?
-            as i32;
+        let hidden_size = get_u32("embedding_length").ok_or_else(|| {
+            WeightFormatError::Gguf(format!("{}.embedding_length not found", arch))
+        })? as i32;
 
         let num_hidden_layers = get_u32("block_count")
             .ok_or_else(|| WeightFormatError::Gguf(format!("{}.block_count not found", arch)))?
             as i32;
 
-        let num_attention_heads = get_u32("attention.head_count")
-            .ok_or_else(|| WeightFormatError::Gguf(format!("{}.attention.head_count not found", arch)))?
-            as i32;
+        let num_attention_heads = get_u32("attention.head_count").ok_or_else(|| {
+            WeightFormatError::Gguf(format!("{}.attention.head_count not found", arch))
+        })? as i32;
 
-        let intermediate_size = get_u32("feed_forward_length")
-            .ok_or_else(|| WeightFormatError::Gguf(format!("{}.feed_forward_length not found", arch)))?
-            as i32;
+        let intermediate_size = get_u32("feed_forward_length").ok_or_else(|| {
+            WeightFormatError::Gguf(format!("{}.feed_forward_length not found", arch))
+        })? as i32;
 
         // Get vocab size from tokenizer or estimate from token embedding
         let vocab_size = content
@@ -426,7 +428,9 @@ impl GgufModelConfig {
             })
             .or_else(|| {
                 // Fallback: estimate from token embedding tensor shape
-                content.get_tensor_info("token_embd.weight").map(|t| t.dimensions[0] as i32)
+                content
+                    .get_tensor_info("token_embd.weight")
+                    .map(|t| t.dimensions[0] as i32)
             })
             .unwrap_or(32000); // Default fallback
 
@@ -472,9 +476,9 @@ impl GgufModelConfig {
     /// Convert to Qwen3 config.
     pub fn to_qwen3_config(&self) -> crate::architectures::qwen3::Qwen3Config {
         // Qwen3 requires head_dim as i32, compute if not provided
-        let head_dim = self.head_dim.unwrap_or_else(|| {
-            self.hidden_size / self.num_attention_heads
-        });
+        let head_dim = self
+            .head_dim
+            .unwrap_or_else(|| self.hidden_size / self.num_attention_heads);
         crate::architectures::qwen3::Qwen3Config {
             vocab_size: self.vocab_size,
             hidden_size: self.hidden_size,

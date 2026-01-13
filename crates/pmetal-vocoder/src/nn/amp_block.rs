@@ -255,12 +255,8 @@ mod tests {
     #[test]
     fn test_amp_block_multiple_branches() {
         // Test with 4 branches like some BigVGAN configs
-        let amp = AMPBlock::new(
-            256,
-            3,
-            vec![vec![1, 2], vec![3, 4], vec![5, 6], vec![7, 8]],
-        )
-        .unwrap();
+        let amp =
+            AMPBlock::new(256, 3, vec![vec![1, 2], vec![3, 4], vec![5, 6], vec![7, 8]]).unwrap();
 
         let x = mlx_rs::random::normal::<f32>(&[1, 256, 64], None, None, None).unwrap();
         let y = amp.forward(&x).unwrap();

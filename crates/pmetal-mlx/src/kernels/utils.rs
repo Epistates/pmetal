@@ -3,13 +3,13 @@
 //! This module provides common functions for converting between MLX arrays
 //! and Metal buffers, used by training_attention and differentiable_attention.
 
+use crate::error::MlxError;
 use half::f16;
 use mlx_rs::{Array, Dtype};
 use pmetal_metal::{
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
 };
-use crate::error::MlxError;
 
 /// Result type for kernel utilities.
 pub type Result<T> = std::result::Result<T, MlxError>;
@@ -25,10 +25,7 @@ pub type Result<T> = std::result::Result<T, MlxError>;
 ///
 /// # Returns
 /// A MetalBuffer containing the array data in f16 format.
-pub fn array_to_metal_buffer_f16(
-    ctx: &MetalContext,
-    array: &Array,
-) -> Result<MetalBuffer<f16>> {
+pub fn array_to_metal_buffer_f16(ctx: &MetalContext, array: &Array) -> Result<MetalBuffer<f16>> {
     // Ensure array is evaluated and in f16
     let array = if array.dtype() != Dtype::Float16 {
         array.as_dtype(Dtype::Float16)?
@@ -53,11 +50,9 @@ pub fn array_to_metal_buffer_f16(
 ///
 /// # Returns
 /// An MLX Array with the buffer data.
-pub fn metal_buffer_to_array_f16(
-    buffer: &MetalBuffer<f16>,
-    shape: &[i32],
-) -> Result<Array> {
-    let data = buffer.to_vec()
+pub fn metal_buffer_to_array_f16(buffer: &MetalBuffer<f16>, shape: &[i32]) -> Result<Array> {
+    let data = buffer
+        .to_vec()
         .map_err(|e| MlxError::Metal(e.to_string()))?;
 
     Ok(Array::from_slice(&data, shape))
@@ -66,10 +61,7 @@ pub fn metal_buffer_to_array_f16(
 /// Convert MLX Array to f32 MetalBuffer.
 ///
 /// For zero-copy operations, prefer `MlxMetalBridge::view_f32` when possible.
-pub fn array_to_metal_buffer_f32(
-    ctx: &MetalContext,
-    array: &Array,
-) -> Result<MetalBuffer<f32>> {
+pub fn array_to_metal_buffer_f32(ctx: &MetalContext, array: &Array) -> Result<MetalBuffer<f32>> {
     // Ensure array is evaluated and in f32
     let array = if array.dtype() != Dtype::Float32 {
         array.as_dtype(Dtype::Float32)?
@@ -84,11 +76,9 @@ pub fn array_to_metal_buffer_f32(
 }
 
 /// Convert f32 MetalBuffer back to MLX Array.
-pub fn metal_buffer_to_array_f32(
-    buffer: &MetalBuffer<f32>,
-    shape: &[i32],
-) -> Result<Array> {
-    let data = buffer.to_vec()
+pub fn metal_buffer_to_array_f32(buffer: &MetalBuffer<f32>, shape: &[i32]) -> Result<Array> {
+    let data = buffer
+        .to_vec()
         .map_err(|e| MlxError::Metal(e.to_string()))?;
 
     Ok(Array::from_slice(&data, shape))

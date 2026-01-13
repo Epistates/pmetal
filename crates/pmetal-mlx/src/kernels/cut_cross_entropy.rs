@@ -32,9 +32,9 @@
 //! - Apple ML: https://github.com/apple/ml-cross-entropy
 //! - Unsloth integration: unsloth/kernels/cross_entropy_loss.py
 
-use mlx_rs::{Array, Dtype, Stream};
 use mlx_rs::error::{Exception, Result};
 use mlx_rs::ops::indexing::TryIndexOp;
+use mlx_rs::{Array, Dtype, Stream};
 
 /// Configuration for Cut Cross Entropy.
 #[derive(Debug, Clone)]
@@ -207,12 +207,8 @@ impl CutCrossEntropy {
 
         // Step 1: Compute target logits directly (only for target tokens)
         // This is O(n_tokens * hidden_dim) instead of O(n_tokens * vocab_size * hidden_dim)
-        let target_logits = self.compute_target_logits(
-            hidden_states,
-            lm_head_weight,
-            targets,
-            lm_head_bias,
-        )?;
+        let target_logits =
+            self.compute_target_logits(hidden_states, lm_head_weight, targets, lm_head_bias)?;
 
         // Step 2: Compute logsumexp in chunks
         let logsumexp = self.compute_chunked_logsumexp(
@@ -424,12 +420,15 @@ impl CutCrossEntropy {
         let n_chunks = (vocab_size + chunk_size - 1) / chunk_size;
 
         // Get cached logsumexp
-        let logsumexp = output.cached_logsumexp.as_ref()
+        let logsumexp = output
+            .cached_logsumexp
+            .as_ref()
             .ok_or_else(|| Exception::custom("No cached logsumexp for backward"))?;
 
         // Initialize gradient accumulator
         let zero = Array::from_f32(0.0);
-        let mut grad_hidden = mlx_rs::ops::broadcast_to(&zero, &[n_tokens as i32, hidden_dim as i32])?;
+        let mut grad_hidden =
+            mlx_rs::ops::broadcast_to(&zero, &[n_tokens as i32, hidden_dim as i32])?;
 
         // Expand grad_loss and logsumexp for broadcasting
         let grad_expanded = grad_loss.reshape(&[-1, 1])?;
@@ -456,7 +455,9 @@ impl CutCrossEntropy {
             // Create mask for targets in this chunk range
             let start_arr = Array::from_int(start as i32);
             let end_arr = Array::from_int(end as i32);
-            let in_chunk = targets.ge(&start_arr)?.logical_and(&targets.lt(&end_arr)?)?;
+            let in_chunk = targets
+                .ge(&start_arr)?
+                .logical_and(&targets.lt(&end_arr)?)?;
 
             // For tokens where target is in this chunk, subtract 1 from softmax at target position
             // This is tricky - we need scatter subtract
@@ -528,8 +529,7 @@ pub fn cut_cross_entropy_loss(
     targets: &Array,
     ignore_index: i32,
 ) -> Result<Array> {
-    let config = CutCrossEntropyConfig::new()
-        .with_ignore_index(ignore_index);
+    let config = CutCrossEntropyConfig::new().with_ignore_index(ignore_index);
     let cce = CutCrossEntropy::new(config);
     let output = cce.forward(hidden_states, lm_head_weight, targets, None)?;
     Ok(output.loss)
@@ -597,8 +597,7 @@ mod tests {
         // Targets
         let targets = Array::from_slice(&[0i32, 5, 10, 15], &[4]);
 
-        let config = CutCrossEntropyConfig::new()
-            .with_vocab_chunk_size(4); // Small chunks for testing
+        let config = CutCrossEntropyConfig::new().with_vocab_chunk_size(4); // Small chunks for testing
         let cce = CutCrossEntropy::new(config);
 
         let output = cce.forward(&hidden, &weight, &targets, None).unwrap();
@@ -650,10 +649,11 @@ mod tests {
         let targets = Array::from_slice(&[0i32, 1], &[2]);
 
         // Without softcap
-        let config_no_cap = CutCrossEntropyConfig::new()
-            .with_vocab_chunk_size(4);
+        let config_no_cap = CutCrossEntropyConfig::new().with_vocab_chunk_size(4);
         let cce_no_cap = CutCrossEntropy::new(config_no_cap);
-        let output_no_cap = cce_no_cap.forward(&hidden, &weight, &targets, None).unwrap();
+        let output_no_cap = cce_no_cap
+            .forward(&hidden, &weight, &targets, None)
+            .unwrap();
         output_no_cap.loss.eval().unwrap();
 
         // With softcap

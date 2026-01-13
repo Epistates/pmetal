@@ -33,9 +33,9 @@
 //! - "GaLore: Memory-Efficient LLM Training by Gradient Low-Rank Projection"
 //!   (Zhao et al., 2024) <https://arxiv.org/abs/2403.03507>
 
-use mlx_rs::{Array, StreamOrDevice};
-use mlx_rs::ops::indexing::IndexOp;
 use crate::LoraError;
+use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::{Array, StreamOrDevice};
 
 /// Projection type for GaLore.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -223,7 +223,9 @@ impl GaloreProjector {
             self.update_ortho_matrix(grad)?;
         }
 
-        let ortho = self.ortho_matrix.as_ref()
+        let ortho = self
+            .ortho_matrix
+            .as_ref()
             .ok_or_else(|| LoraError::InvalidState("Projector not initialized".into()))?;
 
         let low_rank = if self.use_right_projection {
@@ -248,7 +250,9 @@ impl GaloreProjector {
     /// - Right projection: low_rank @ P^T
     /// - Left projection: P @ low_rank
     pub fn unproject(&self, low_rank_grad: &Array) -> Result<Array, LoraError> {
-        let ortho = self.ortho_matrix.as_ref()
+        let ortho = self
+            .ortho_matrix
+            .as_ref()
             .ok_or_else(|| LoraError::InvalidState("Projector not initialized".into()))?;
 
         let full_grad = if self.use_right_projection {
@@ -276,7 +280,9 @@ impl GaloreProjector {
             self.update_ortho_matrix(grad)?;
         }
 
-        let ortho = self.ortho_matrix.as_ref()
+        let ortho = self
+            .ortho_matrix
+            .as_ref()
             .ok_or_else(|| LoraError::InvalidState("Projector not initialized".into()))?;
 
         let low_rank = if self.use_right_projection {
@@ -411,13 +417,17 @@ impl GaloreParamState {
         // m = beta1 * m + (1 - beta1) * g
         let beta1_arr = Array::from_f32(beta1);
         let one_minus_beta1 = Array::from_f32(1.0 - beta1);
-        let new_m = m.multiply(&beta1_arr)?.add(&low_rank_grad.multiply(&one_minus_beta1)?)?;
+        let new_m = m
+            .multiply(&beta1_arr)?
+            .add(&low_rank_grad.multiply(&one_minus_beta1)?)?;
 
         // v = beta2 * v + (1 - beta2) * g^2
         let beta2_arr = Array::from_f32(beta2);
         let one_minus_beta2 = Array::from_f32(1.0 - beta2);
         let grad_sq = low_rank_grad.multiply(&low_rank_grad)?;
-        let new_v = v.multiply(&beta2_arr)?.add(&grad_sq.multiply(&one_minus_beta2)?)?;
+        let new_v = v
+            .multiply(&beta2_arr)?
+            .add(&grad_sq.multiply(&one_minus_beta2)?)?;
 
         // Bias correction
         let bias_correction1 = 1.0 - beta1.powf(step);
@@ -490,9 +500,7 @@ mod tests {
         let mut projector = GaloreProjector::new(config);
 
         // Create a gradient where m >= n (10 x 8)
-        let grad = mlx_rs::random::uniform::<_, f32>(
-            -1.0, 1.0, &[10, 8], None
-        ).unwrap();
+        let grad = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
 
         let low_rank = projector.project(&grad).unwrap();
 
@@ -512,9 +520,7 @@ mod tests {
         let mut projector = GaloreProjector::new(config);
 
         // Create a gradient where m < n (8 x 10)
-        let grad = mlx_rs::random::uniform::<_, f32>(
-            -1.0, 1.0, &[8, 10], None
-        ).unwrap();
+        let grad = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[8, 10], None).unwrap();
 
         let low_rank = projector.project(&grad).unwrap();
 
@@ -530,13 +536,10 @@ mod tests {
     #[test]
     fn test_projector_forced_direction() {
         // Force right projection even when m < n
-        let config = GaloreConfig::with_rank(4)
-            .projection_type(GaloreProjectionType::Right);
+        let config = GaloreConfig::with_rank(4).projection_type(GaloreProjectionType::Right);
         let mut projector = GaloreProjector::new(config);
 
-        let grad = mlx_rs::random::uniform::<_, f32>(
-            -1.0, 1.0, &[8, 10], None
-        ).unwrap();
+        let grad = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[8, 10], None).unwrap();
 
         let low_rank = projector.project(&grad).unwrap();
 
@@ -550,18 +553,10 @@ mod tests {
         let config = GaloreConfig::with_rank(4).update_gap(3);
         let mut projector = GaloreProjector::new(config);
 
-        let grad1 = mlx_rs::random::uniform::<_, f32>(
-            -1.0, 1.0, &[10, 8], None
-        ).unwrap();
-        let grad2 = mlx_rs::random::uniform::<_, f32>(
-            -1.0, 1.0, &[10, 8], None
-        ).unwrap();
-        let grad3 = mlx_rs::random::uniform::<_, f32>(
-            -1.0, 1.0, &[10, 8], None
-        ).unwrap();
-        let grad4 = mlx_rs::random::uniform::<_, f32>(
-            -1.0, 1.0, &[10, 8], None
-        ).unwrap();
+        let grad1 = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
+        let grad2 = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
+        let grad3 = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
+        let grad4 = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
 
         // First projection - initializes projector
         projector.project(&grad1).unwrap();
@@ -601,9 +596,7 @@ mod tests {
         let config = GaloreConfig::with_rank(4);
         let mut projector = GaloreProjector::new(config);
 
-        let grad = mlx_rs::random::uniform::<_, f32>(
-            -1.0, 1.0, &[10, 8], None
-        ).unwrap();
+        let grad = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
 
         let state = projector.project_with_state(&grad).unwrap();
 
@@ -632,23 +625,19 @@ mod tests {
         let mut state = GaloreParamState::new(config);
 
         // Create parameter and gradient
-        let param = mlx_rs::random::uniform::<_, f32>(
-            -1.0, 1.0, &[10, 8], None
-        ).unwrap();
-        let grad = mlx_rs::random::uniform::<_, f32>(
-            -0.1, 0.1, &[10, 8], None
-        ).unwrap();
+        let param = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
+        let grad = mlx_rs::random::uniform::<_, f32>(-0.1, 0.1, &[10, 8], None).unwrap();
 
         // Take a step
-        let new_param = state.adam_step(
-            &param,
-            &grad,
-            0.001,  // lr
-            0.9,    // beta1
-            0.999,  // beta2
-            1e-8,   // eps
-            0.0,    // weight_decay
-        ).unwrap();
+        let new_param = state
+            .adam_step(
+                &param, &grad, 0.001, // lr
+                0.9,   // beta1
+                0.999, // beta2
+                1e-8,  // eps
+                0.0,   // weight_decay
+            )
+            .unwrap();
 
         // Check shapes
         assert_eq!(new_param.shape(), param.shape());
@@ -667,25 +656,17 @@ mod tests {
         let config = GaloreConfig::with_rank(4).update_gap(5);
         let mut state = GaloreParamState::new(config);
 
-        let mut param = mlx_rs::random::uniform::<_, f32>(
-            -1.0, 1.0, &[10, 8], None
-        ).unwrap();
+        let mut param = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[10, 8], None).unwrap();
 
         // Take multiple steps
         for _ in 0..10 {
-            let grad = mlx_rs::random::uniform::<_, f32>(
-                -0.1, 0.1, &[10, 8], None
-            ).unwrap();
+            let grad = mlx_rs::random::uniform::<_, f32>(-0.1, 0.1, &[10, 8], None).unwrap();
 
-            param = state.adam_step(
-                &param,
-                &grad,
-                0.001,
-                0.9,
-                0.999,
-                1e-8,
-                0.01, // with weight decay
-            ).unwrap();
+            param = state
+                .adam_step(
+                    &param, &grad, 0.001, 0.9, 0.999, 1e-8, 0.01, // with weight decay
+                )
+                .unwrap();
         }
 
         assert_eq!(state.projector.iteration(), 10);

@@ -14,10 +14,6 @@
 
 use std::collections::HashMap;
 
-use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
-use pmetal_data::{DataLoader, DataLoaderConfig, TrainingBatch, TrainingDataset};
-use pmetal_lora::TrainableModel;
-use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 use mlx_rs::{
     builder::Builder,
     error::Exception,
@@ -27,6 +23,10 @@ use mlx_rs::{
     transforms::eval_params,
     Array, Dtype,
 };
+use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
+use pmetal_data::{DataLoader, DataLoaderConfig, TrainingBatch, TrainingDataset};
+use pmetal_lora::TrainableModel;
+use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 use rand::{rngs::StdRng, Rng, SeedableRng};
 
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
@@ -491,7 +491,10 @@ impl DiffusionTrainingLoop {
         O: Optimizer,
     {
         let start_time = std::time::Instant::now();
-        let batch_tokens = batch.batch_size.checked_mul(batch.seq_len).unwrap_or(usize::MAX);
+        let batch_tokens = batch
+            .batch_size
+            .checked_mul(batch.seq_len)
+            .unwrap_or(usize::MAX);
 
         // 1. Sample noise level t ~ U(min_noise, 1]
         let t: f32 = self.rng.gen_range(self.config.min_noise_level..=1.0);
@@ -499,12 +502,8 @@ impl DiffusionTrainingLoop {
         // 2. Apply GPU-native forward masking process
         // Use step as seed for reproducibility while staying on GPU
         let seed = self.step as u64 + self.config.seed * 1000;
-        let (x_t, mask) = forward_process_gpu(
-            &batch.input_ids,
-            t,
-            self.config.mask_token_id,
-            Some(seed),
-        )?;
+        let (x_t, mask) =
+            forward_process_gpu(&batch.input_ids, t, self.config.mask_token_id, Some(seed))?;
 
         // IMPORTANT: Eval x_t and mask before any further operations to avoid
         // Metal command buffer conflicts (AGXG16X tryCoalescingPreviousComputeCommandEncoder)
@@ -725,8 +724,12 @@ impl DiffusionTrainingLoop {
         let eval_t = 0.5_f32;
 
         for batch in dataloader {
-            let (x_t, mask_flags) =
-                forward_process(&batch.input_ids, eval_t, self.config.mask_token_id, &mut self.rng)?;
+            let (x_t, mask_flags) = forward_process(
+                &batch.input_ids,
+                eval_t,
+                self.config.mask_token_id,
+                &mut self.rng,
+            )?;
 
             let logits = model
                 .forward(&x_t, None)
@@ -904,14 +907,12 @@ impl DiffusionSampler {
             // Remask if not final step
             if step < self.num_steps - 1 {
                 let remask_ratio = s / t;
-                let num_to_remask =
-                    ((max_new_tokens as f32) * remask_ratio).ceil() as usize;
+                let num_to_remask = ((max_new_tokens as f32) * remask_ratio).ceil() as usize;
 
                 match self.remasking {
                     RemaskingStrategy::Random => {
                         // Random remasking
-                        let mut indices: Vec<usize> =
-                            (prompt_len..total_len).collect();
+                        let mut indices: Vec<usize> = (prompt_len..total_len).collect();
                         for i in 0..num_to_remask.min(indices.len()) {
                             let j = self.rng.gen_range(i..indices.len());
                             indices.swap(i, j);

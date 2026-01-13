@@ -330,12 +330,7 @@ mod tests {
         // Values should be approximately preserved
         for (orig, deq) in values.iter().zip(dequantized.iter()) {
             // NF4 has ~0.1 quantization error on average
-            assert!(
-                (orig - deq).abs() < 0.2,
-                "orig: {}, deq: {}",
-                orig,
-                deq
-            );
+            assert!((orig - deq).abs() < 0.2, "orig: {}, deq: {}", orig, deq);
         }
     }
 }

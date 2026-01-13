@@ -18,20 +18,18 @@
 //! - Dedicated generation stream for parallel execution
 //! - All tensor operations stay on GPU until final token extraction
 
-use pmetal_mlx::kv_cache::KVCache;
 use mlx_rs::{
-    Device,
-    Dtype,
     error::Exception,
     ops::{
-        argpartition_axis, argsort_axis, exp, expand_dims_axes, logsumexp_axis, squeeze_axes,
-        which, zeros_like,
+        argpartition_axis, argsort_axis, exp, expand_dims_axes,
         indexing::{argmax, argmax_axis, put_along_axis, take_along_axis, IndexOp},
+        logsumexp_axis, squeeze_axes, which, zeros_like,
     },
     random::{categorical, seed as mlx_seed},
     transforms::async_eval,
-    Stream, Array,
+    Array, Device, Dtype, Stream,
 };
+use pmetal_mlx::kv_cache::KVCache;
 use std::collections::HashMap;
 
 /// Wait for a specific array to be ready (computed).
@@ -339,7 +337,7 @@ impl GenerationConfig {
         Self {
             max_new_tokens,
             temperature: 1.2,
-            top_k: 0,  // Disabled, relying on min-p
+            top_k: 0,   // Disabled, relying on min-p
             top_p: 1.0, // Disabled, relying on min-p
             min_p: 0.1,
             repetition_penalty: 1.15,
@@ -484,7 +482,8 @@ impl Sampler {
 
         // Cache inverse temperature for categorical sampling
         // If temp == 1.0, no scaling needed so we store None
-        let inv_temp = if config.do_sample && config.temperature != 1.0 && config.temperature > 0.0 {
+        let inv_temp = if config.do_sample && config.temperature != 1.0 && config.temperature > 0.0
+        {
             Some(Array::from_f32(1.0 / config.temperature))
         } else {
             None
@@ -539,7 +538,11 @@ impl Sampler {
 
         // Apply repetition penalty on raw logits (before log-softmax)
         if self.config.repetition_penalty != 1.0 && !generated_tokens.is_empty() {
-            logits = apply_repetition_penalty(&logits, generated_tokens, self.config.repetition_penalty)?;
+            logits = apply_repetition_penalty(
+                &logits,
+                generated_tokens,
+                self.config.repetition_penalty,
+            )?;
         }
 
         // Apply frequency and presence penalties on raw logits
@@ -605,7 +608,7 @@ impl Sampler {
         if !self.config.do_sample {
             let token = greedy_sample_array(logits)?;
             // Return minimal view for log_probs since greedy doesn't need them
-            let empty_logprobs = logits.index((.., ..1));  // Minimal view, not used
+            let empty_logprobs = logits.index((.., ..1)); // Minimal view, not used
             return Ok((token, empty_logprobs));
         }
 
@@ -613,7 +616,7 @@ impl Sampler {
         // This avoids clone for the common Float32 case
         let owned_logits;
         let logits_f32: &Array = if is_f32(logits) {
-            logits  // Borrow, no clone needed
+            logits // Borrow, no clone needed
         } else {
             owned_logits = logits.as_type::<f32>()?;
             &owned_logits
@@ -679,7 +682,7 @@ impl Sampler {
         if !needs_top_k && !needs_top_p && !needs_min_p {
             // MLX operations create views, so returning as-is is safe
             // The caller's logits_to_log_probs already created a new array
-            return Ok(log_probs.clone());  // NOTE: This clone is unavoidable due to return type
+            return Ok(log_probs.clone()); // NOTE: This clone is unavoidable due to return type
         }
 
         let vocab_size = log_probs.dim(-1) as usize;
@@ -693,11 +696,11 @@ impl Sampler {
             input_2d = log_probs.reshape(&[1, vocab_size as i32])?;
             &input_2d
         } else {
-            log_probs  // Already 2D, just borrow - no clone!
+            log_probs // Already 2D, just borrow - no clone!
         };
 
         // First filter creates a new array, subsequent filters modify that
-        let mut result = input_2d_ref.clone();  // Single clone here
+        let mut result = input_2d_ref.clone(); // Single clone here
 
         // Apply top-k filter (uses cached neg_inf)
         if needs_top_k {
@@ -723,7 +726,11 @@ impl Sampler {
     }
 
     /// Internal top-k filter using cached arrays. Input must be 2D [1, vocab_size].
-    fn top_k_filter_internal(&self, logits_2d: &Array, vocab_size: usize) -> Result<Array, Exception> {
+    fn top_k_filter_internal(
+        &self,
+        logits_2d: &Array,
+        vocab_size: usize,
+    ) -> Result<Array, Exception> {
         let k = (self.config.top_k as usize).min(vocab_size);
 
         // argpartition on -logits gives indices that partition around k-th largest
@@ -736,7 +743,11 @@ impl Sampler {
     }
 
     /// Internal top-p filter using cached arrays. Input must be 2D [1, vocab_size].
-    fn top_p_filter_internal(&self, logits_2d: &Array, vocab_size: usize) -> Result<Array, Exception> {
+    fn top_p_filter_internal(
+        &self,
+        logits_2d: &Array,
+        vocab_size: usize,
+    ) -> Result<Array, Exception> {
         // Convert logits to probabilities
         let probs = exp(logits_2d)?;
 
@@ -764,7 +775,11 @@ impl Sampler {
     }
 
     /// Internal min-p filter using cached arrays. Input must be 2D [1, vocab_size].
-    fn min_p_filter_internal(&self, logits_2d: &Array, vocab_size: usize) -> Result<Array, Exception> {
+    fn min_p_filter_internal(
+        &self,
+        logits_2d: &Array,
+        vocab_size: usize,
+    ) -> Result<Array, Exception> {
         // Sort indices in descending order
         let neg_logits = logits_2d.negative()?;
         let sorted_indices = argsort_axis(&neg_logits, -1)?;
@@ -804,7 +819,7 @@ fn greedy_sample(logits: &Array) -> Result<u32, Exception> {
 /// Greedy sampling - return argmax along last axis to match Python's pattern.
 /// Returns shape [batch] for input shape [batch, vocab].
 fn greedy_sample_array(logits: &Array) -> Result<Array, Exception> {
-    argmax_axis(logits, -1, None)  // axis=-1 like Python's mx.argmax(x, axis=-1)
+    argmax_axis(logits, -1, None) // axis=-1 like Python's mx.argmax(x, axis=-1)
 }
 
 /// Convert logits to log probabilities (log-softmax).
@@ -1365,7 +1380,7 @@ where
     // Avoiding squeeze reduces reshape operations in sampling pipeline
     let extract_logits = |logits: &Array| -> Array {
         let last_idx = logits.dim(1) - 1;
-        logits.index((.., last_idx, ..))  // Returns [1, vocab]
+        logits.index((.., last_idx, ..)) // Returns [1, vocab]
     };
 
     // Prefill: Process the entire prompt at once (INSIDE stream context)
@@ -1556,8 +1571,7 @@ where
 
         // Apply repetition penalty
         if config.repetition_penalty != 1.0 && !generated.is_empty() {
-            penalized =
-                apply_repetition_penalty(&penalized, generated, config.repetition_penalty)?;
+            penalized = apply_repetition_penalty(&penalized, generated, config.repetition_penalty)?;
         }
 
         // Apply frequency and presence penalties
@@ -1825,12 +1839,8 @@ where
     let prompt_len = input_ids.len();
 
     // Create compiled sampler with config parameters
-    let mut compiled_sampler = CompiledSampler::new(
-        config.temperature,
-        config.top_k,
-        config.top_p,
-        config.min_p,
-    )?;
+    let mut compiled_sampler =
+        CompiledSampler::new(config.temperature, config.top_k, config.top_p, config.min_p)?;
 
     // Create a standard sampler for stop token checking
     let sampler = Sampler::new(config.clone());
@@ -1845,7 +1855,9 @@ where
         let _stream_ctx = StreamContext::new(&generation_stream);
         let logits = forward_fn(&prompt_input, cache)?;
         let last_idx = logits.dim(1) - 1;
-        let current_logits = logits.index((.., last_idx..last_idx + 1, ..)).squeeze_axes(&[1])?;
+        let current_logits = logits
+            .index((.., last_idx..last_idx + 1, ..))
+            .squeeze_axes(&[1])?;
         compiled_sampler.sample(&current_logits)?
     };
 

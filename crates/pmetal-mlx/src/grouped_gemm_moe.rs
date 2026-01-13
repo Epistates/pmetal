@@ -30,11 +30,7 @@
 //! This maximizes GPU utilization by processing all experts in parallel.
 
 use mlx_rs::{
-    builder::Builder,
-    error::Exception,
-    nn::Linear,
-    ops::indexing::TryIndexOp,
-    Array, Dtype,
+    builder::Builder, error::Exception, nn::Linear, ops::indexing::TryIndexOp, Array, Dtype,
 };
 
 /// Configuration for Grouped GEMM MoE.
@@ -212,7 +208,11 @@ pub struct SharedExpert {
 
 impl SharedExpert {
     /// Create a new shared expert.
-    pub fn new(hidden_size: i32, intermediate_size: i32, use_swiglu: bool) -> Result<Self, Exception> {
+    pub fn new(
+        hidden_size: i32,
+        intermediate_size: i32,
+        use_swiglu: bool,
+    ) -> Result<Self, Exception> {
         let std_dev = (2.0 / (hidden_size + intermediate_size) as f32).sqrt();
 
         let w1 = mlx_rs::random::normal::<f32>(
@@ -469,7 +469,12 @@ impl GroupedGemmMoE {
         let hidden = if let Some(ref w3) = self.experts.w3 {
             // SwiGLU path
             // Gather w3 for each token's expert
-            let w3_gathered = self.experts.w3.as_ref().unwrap().take_axis(expert_indices, 0)?;
+            let w3_gathered = self
+                .experts
+                .w3
+                .as_ref()
+                .unwrap()
+                .take_axis(expert_indices, 0)?;
 
             // Compute up projection
             let up = self.batched_matmul(x, &w3_gathered)?;
@@ -532,7 +537,9 @@ impl GroupedGemmMoE {
         // Encourages load balancing
         let product = fraction_tokens.multiply(&mean_routing_prob)?;
         let aux_loss = product.sum(None)?;
-        aux_loss.multiply(&Array::from_f32(n_experts as f32 * self.config.aux_loss_coef))
+        aux_loss.multiply(&Array::from_f32(
+            n_experts as f32 * self.config.aux_loss_coef,
+        ))
     }
 }
 
@@ -586,8 +593,7 @@ mod tests {
 
     #[test]
     fn test_grouped_gemm_moe_creation() {
-        let config = GroupedGemmMoEConfig::new(64, 128, 4)
-            .with_top_k(2);
+        let config = GroupedGemmMoEConfig::new(64, 128, 4).with_top_k(2);
         let moe = GroupedGemmMoE::new(config).unwrap();
 
         assert_eq!(moe.experts.num_experts, 4);
@@ -676,10 +682,7 @@ mod tests {
         let config = GroupedGemmMoEConfig::new(64, 128, 4).with_top_k(2);
         let moe = GroupedGemmMoE::new(config).unwrap();
 
-        let probs = Array::from_slice(
-            &[0.1f32, 0.4, 0.2, 0.3, 0.3, 0.1, 0.4, 0.2],
-            &[2, 4],
-        );
+        let probs = Array::from_slice(&[0.1f32, 0.4, 0.2, 0.3, 0.3, 0.1, 0.4, 0.2], &[2, 4]);
 
         let (values, indices) = moe.topk_experts(&probs).unwrap();
         values.eval().unwrap();

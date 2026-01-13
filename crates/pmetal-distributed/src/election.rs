@@ -425,10 +425,7 @@ impl ElectionManager {
                 let session = *self.session_id.read();
                 warn!("Election timeout, session={}", session);
 
-                let _ = self
-                    .event_tx
-                    .send(ElectionEvent::Timeout { session })
-                    .await;
+                let _ = self.event_tx.send(ElectionEvent::Timeout { session }).await;
 
                 // Start new election
                 self.start_election().await?;

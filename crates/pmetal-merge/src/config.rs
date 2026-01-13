@@ -1,7 +1,7 @@
 //! Configuration types for model merging.
 
-use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// Complete merge configuration, typically loaded from YAML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -319,12 +319,10 @@ parameters:
     fn test_slerp_validation() {
         let config = MergeConfig {
             merge_method: MergeMethodConfig::Slerp,
-            models: vec![
-                ModelConfig {
-                    model: "a".to_string(),
-                    parameters: Default::default(),
-                },
-            ],
+            models: vec![ModelConfig {
+                model: "a".to_string(),
+                parameters: Default::default(),
+            }],
             ..Default::default()
         };
 
@@ -335,12 +333,10 @@ parameters:
     fn test_ties_requires_base() {
         let config = MergeConfig {
             merge_method: MergeMethodConfig::Ties,
-            models: vec![
-                ModelConfig {
-                    model: "a".to_string(),
-                    parameters: Default::default(),
-                },
-            ],
+            models: vec![ModelConfig {
+                model: "a".to_string(),
+                parameters: Default::default(),
+            }],
             base_model: None,
             ..Default::default()
         };

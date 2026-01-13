@@ -18,7 +18,8 @@ use crate::tuna::Tuner;
 static GLOBAL_CONTEXT: OnceLock<Result<Arc<MetalContext>>> = OnceLock::new();
 
 /// Embedded Metal library binary (compiled at build time).
-const METAL_LIBRARY_BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/pmetal_kernels.metallib"));
+const METAL_LIBRARY_BYTES: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/pmetal_kernels.metallib"));
 
 /// Metal execution context.
 ///
@@ -241,7 +242,10 @@ impl MetalContext {
         info!(
             "Loaded Metal library ({} bytes, {} kernels available)",
             METAL_LIBRARY_BYTES.len(),
-            cache.library().map(|l| l.functionNames().len()).unwrap_or(0)
+            cache
+                .library()
+                .map(|l| l.functionNames().len())
+                .unwrap_or(0)
         );
 
         let pipeline_cache = RwLock::new(cache);
@@ -333,7 +337,10 @@ mod tests {
     #[test]
     fn test_context_creation() {
         let ctx = MetalContext::new();
-        assert!(ctx.is_ok(), "Should be able to create Metal context on macOS");
+        assert!(
+            ctx.is_ok(),
+            "Should be able to create Metal context on macOS"
+        );
 
         let ctx = ctx.unwrap();
         assert!(!ctx.properties().name.is_empty());

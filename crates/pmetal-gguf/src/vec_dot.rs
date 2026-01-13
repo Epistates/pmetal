@@ -208,10 +208,7 @@ mod neon {
                     let qh1 = vld1q_u8(qh.add(offset_qh + 16));
 
                     // Reconstruct 6-bit values for first 32 elements
-                    let q6_0l = vorrq_u8(
-                        vandq_u8(ql0, m4b),
-                        vshlq_n_u8(vandq_u8(qh0, m2b), 4),
-                    );
+                    let q6_0l = vorrq_u8(vandq_u8(ql0, m4b), vshlq_n_u8(vandq_u8(qh0, m2b), 4));
                     let q6_0h = vorrq_u8(
                         vshrq_n_u8(ql0, 4),
                         vshlq_n_u8(vandq_u8(vshrq_n_u8(qh0, 2), m2b), 4),
@@ -249,10 +246,7 @@ mod neon {
                     sumi += p2 * scale2 + p3 * scale3;
 
                     // Second half using ql2, ql3, qh1
-                    let q6_2l = vorrq_u8(
-                        vandq_u8(ql2, m4b),
-                        vshlq_n_u8(vandq_u8(qh1, m2b), 4),
-                    );
+                    let q6_2l = vorrq_u8(vandq_u8(ql2, m4b), vshlq_n_u8(vandq_u8(qh1, m2b), 4));
                     let q6_2h = vorrq_u8(
                         vshrq_n_u8(ql2, 4),
                         vshlq_n_u8(vandq_u8(vshrq_n_u8(qh1, 2), m2b), 4),
@@ -339,8 +333,16 @@ mod neon {
                     let qhbits = *qh.add(offset_qh);
 
                     // Reconstruct 5-bit values for lower nibbles
-                    let hbit0 = if (qhbits & 0x01) != 0 { mone } else { vdupq_n_u8(0) };
-                    let hbit1 = if (qhbits & 0x02) != 0 { mone } else { vdupq_n_u8(0) };
+                    let hbit0 = if (qhbits & 0x01) != 0 {
+                        mone
+                    } else {
+                        vdupq_n_u8(0)
+                    };
+                    let hbit1 = if (qhbits & 0x02) != 0 {
+                        mone
+                    } else {
+                        vdupq_n_u8(0)
+                    };
 
                     let q5_0l = vaddq_u8(vandq_u8(q5l_0, m4b), hbit0);
                     let q5_0h = vaddq_u8(vshrq_n_u8(q5l_0, 4), hbit1);
@@ -354,8 +356,16 @@ mod neon {
                     sumi += vaddvq_s32(vaddq_s32(p0, p1)) * sc0 as i32;
 
                     // Upper nibbles
-                    let hbit2 = if (qhbits & 0x04) != 0 { mone } else { vdupq_n_u8(0) };
-                    let hbit3 = if (qhbits & 0x08) != 0 { mone } else { vdupq_n_u8(0) };
+                    let hbit2 = if (qhbits & 0x04) != 0 {
+                        mone
+                    } else {
+                        vdupq_n_u8(0)
+                    };
+                    let hbit3 = if (qhbits & 0x08) != 0 {
+                        mone
+                    } else {
+                        vdupq_n_u8(0)
+                    };
 
                     let q5_1l = vaddq_u8(vandq_u8(q5l_1, m4b), hbit2);
                     let q5_1h = vaddq_u8(vshrq_n_u8(q5l_1, 4), hbit3);
@@ -900,7 +910,11 @@ mod tests {
 
         let result = vec_dot_q8k_q8k(&xs, &ys);
         // With d=1.0 for both, result should be 256 (QK_K * 1 * 1)
-        assert!((result - 256.0).abs() < 1e-6, "Expected 256, got {}", result);
+        assert!(
+            (result - 256.0).abs() < 1e-6,
+            "Expected 256, got {}",
+            result
+        );
     }
 
     #[test]

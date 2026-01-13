@@ -1,5 +1,5 @@
+use crate::{MergeError, MergeMethod, MergeParameters, Result};
 use mlx_rs::Array;
-use crate::{MergeMethod, MergeParameters, Result, MergeError};
 
 /// Passthrough "merge" - copies the tensor from the first model that contains it.
 ///

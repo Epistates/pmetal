@@ -108,10 +108,8 @@ pub trait LoraCapable: CausalLMModel {
     type LoraModel;
 
     /// Convert to LoRA-enabled model with the given configuration.
-    fn into_lora(
-        self,
-        lora_config: &pmetal_core::LoraConfig,
-    ) -> Result<Self::LoraModel, Exception>;
+    fn into_lora(self, lora_config: &pmetal_core::LoraConfig)
+        -> Result<Self::LoraModel, Exception>;
 }
 
 /// Trait for models that can be quantized.

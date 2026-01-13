@@ -278,7 +278,8 @@ impl PhiLoraAttention {
 
         // Handle KV cache update - keys/values are already in [B, heads, seq, head_dim] format
         let (keys, values) = if let Some((cache, layer_idx)) = cache {
-            cache.update_and_fetch(layer_idx, &keys, &values)
+            cache
+                .update_and_fetch(layer_idx, &keys, &values)
                 .map_err(|e| LoraError::Mlx(e))?
         } else {
             (keys, values)
@@ -405,9 +406,7 @@ impl PhiLoraMLP {
                 let gate_activated = nn::silu(&gate)?;
                 gate_activated.multiply(&up)?
             }
-            PhiActivation::GeluApprox | PhiActivation::GeluExact => {
-                nn::gelu(&hidden)?
-            }
+            PhiActivation::GeluApprox | PhiActivation::GeluExact => nn::gelu(&hidden)?,
         };
 
         self.down_proj.forward(&activated)
@@ -660,7 +659,9 @@ impl PhiLoraForCausalLM {
         mask: Option<&Array>,
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
-        let hidden_states = self.model.forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
+        let hidden_states =
+            self.model
+                .forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
         Ok(Module::forward(&mut self.lm_head, &hidden_states)?)
     }
 
@@ -705,20 +706,56 @@ impl PhiLoraForCausalLM {
             let prefix = format!("layers.{}", i);
 
             // Attention LoRA params
-            params.insert(Rc::from(format!("{}.self_attn.q_proj.lora_a", prefix)), layer.self_attn.q_proj.lora_a.clone());
-            params.insert(Rc::from(format!("{}.self_attn.q_proj.lora_b", prefix)), layer.self_attn.q_proj.lora_b.clone());
-            params.insert(Rc::from(format!("{}.self_attn.k_proj.lora_a", prefix)), layer.self_attn.k_proj.lora_a.clone());
-            params.insert(Rc::from(format!("{}.self_attn.k_proj.lora_b", prefix)), layer.self_attn.k_proj.lora_b.clone());
-            params.insert(Rc::from(format!("{}.self_attn.v_proj.lora_a", prefix)), layer.self_attn.v_proj.lora_a.clone());
-            params.insert(Rc::from(format!("{}.self_attn.v_proj.lora_b", prefix)), layer.self_attn.v_proj.lora_b.clone());
-            params.insert(Rc::from(format!("{}.self_attn.o_proj.lora_a", prefix)), layer.self_attn.o_proj.lora_a.clone());
-            params.insert(Rc::from(format!("{}.self_attn.o_proj.lora_b", prefix)), layer.self_attn.o_proj.lora_b.clone());
+            params.insert(
+                Rc::from(format!("{}.self_attn.q_proj.lora_a", prefix)),
+                layer.self_attn.q_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.q_proj.lora_b", prefix)),
+                layer.self_attn.q_proj.lora_b.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.k_proj.lora_a", prefix)),
+                layer.self_attn.k_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.k_proj.lora_b", prefix)),
+                layer.self_attn.k_proj.lora_b.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.v_proj.lora_a", prefix)),
+                layer.self_attn.v_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.v_proj.lora_b", prefix)),
+                layer.self_attn.v_proj.lora_b.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.o_proj.lora_a", prefix)),
+                layer.self_attn.o_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.self_attn.o_proj.lora_b", prefix)),
+                layer.self_attn.o_proj.lora_b.clone(),
+            );
 
             // MLP LoRA params (fused gate_up)
-            params.insert(Rc::from(format!("{}.mlp.gate_up_proj.lora_a", prefix)), layer.mlp.gate_up_proj.lora_a.clone());
-            params.insert(Rc::from(format!("{}.mlp.gate_up_proj.lora_b", prefix)), layer.mlp.gate_up_proj.lora_b.clone());
-            params.insert(Rc::from(format!("{}.mlp.down_proj.lora_a", prefix)), layer.mlp.down_proj.lora_a.clone());
-            params.insert(Rc::from(format!("{}.mlp.down_proj.lora_b", prefix)), layer.mlp.down_proj.lora_b.clone());
+            params.insert(
+                Rc::from(format!("{}.mlp.gate_up_proj.lora_a", prefix)),
+                layer.mlp.gate_up_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.mlp.gate_up_proj.lora_b", prefix)),
+                layer.mlp.gate_up_proj.lora_b.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.mlp.down_proj.lora_a", prefix)),
+                layer.mlp.down_proj.lora_a.clone(),
+            );
+            params.insert(
+                Rc::from(format!("{}.mlp.down_proj.lora_b", prefix)),
+                layer.mlp.down_proj.lora_b.clone(),
+            );
         }
 
         params
@@ -737,19 +774,55 @@ impl PhiLoraForCausalLM {
                 };
             }
 
-            set_param!(layer.self_attn.q_proj.lora_a, format!("{}.self_attn.q_proj.lora_a", prefix));
-            set_param!(layer.self_attn.q_proj.lora_b, format!("{}.self_attn.q_proj.lora_b", prefix));
-            set_param!(layer.self_attn.k_proj.lora_a, format!("{}.self_attn.k_proj.lora_a", prefix));
-            set_param!(layer.self_attn.k_proj.lora_b, format!("{}.self_attn.k_proj.lora_b", prefix));
-            set_param!(layer.self_attn.v_proj.lora_a, format!("{}.self_attn.v_proj.lora_a", prefix));
-            set_param!(layer.self_attn.v_proj.lora_b, format!("{}.self_attn.v_proj.lora_b", prefix));
-            set_param!(layer.self_attn.o_proj.lora_a, format!("{}.self_attn.o_proj.lora_a", prefix));
-            set_param!(layer.self_attn.o_proj.lora_b, format!("{}.self_attn.o_proj.lora_b", prefix));
+            set_param!(
+                layer.self_attn.q_proj.lora_a,
+                format!("{}.self_attn.q_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.self_attn.q_proj.lora_b,
+                format!("{}.self_attn.q_proj.lora_b", prefix)
+            );
+            set_param!(
+                layer.self_attn.k_proj.lora_a,
+                format!("{}.self_attn.k_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.self_attn.k_proj.lora_b,
+                format!("{}.self_attn.k_proj.lora_b", prefix)
+            );
+            set_param!(
+                layer.self_attn.v_proj.lora_a,
+                format!("{}.self_attn.v_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.self_attn.v_proj.lora_b,
+                format!("{}.self_attn.v_proj.lora_b", prefix)
+            );
+            set_param!(
+                layer.self_attn.o_proj.lora_a,
+                format!("{}.self_attn.o_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.self_attn.o_proj.lora_b,
+                format!("{}.self_attn.o_proj.lora_b", prefix)
+            );
 
-            set_param!(layer.mlp.gate_up_proj.lora_a, format!("{}.mlp.gate_up_proj.lora_a", prefix));
-            set_param!(layer.mlp.gate_up_proj.lora_b, format!("{}.mlp.gate_up_proj.lora_b", prefix));
-            set_param!(layer.mlp.down_proj.lora_a, format!("{}.mlp.down_proj.lora_a", prefix));
-            set_param!(layer.mlp.down_proj.lora_b, format!("{}.mlp.down_proj.lora_b", prefix));
+            set_param!(
+                layer.mlp.gate_up_proj.lora_a,
+                format!("{}.mlp.gate_up_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.mlp.gate_up_proj.lora_b,
+                format!("{}.mlp.gate_up_proj.lora_b", prefix)
+            );
+            set_param!(
+                layer.mlp.down_proj.lora_a,
+                format!("{}.mlp.down_proj.lora_a", prefix)
+            );
+            set_param!(
+                layer.mlp.down_proj.lora_b,
+                format!("{}.mlp.down_proj.lora_b", prefix)
+            );
         }
     }
 
@@ -779,7 +852,10 @@ impl PhiLoraForCausalLM {
     ///
     /// # Arguments
     /// * `path` - Path to either a directory containing `lora_weights.safetensors` or a direct `.safetensors` file
-    pub fn load_lora_weights(&mut self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
+    pub fn load_lora_weights(
+        &mut self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), LoraError> {
         let path = path.as_ref();
         let file_path = if path.is_dir() {
             path.join("lora_weights.safetensors")
@@ -799,19 +875,55 @@ impl PhiLoraForCausalLM {
                 };
             }
 
-            load_param!(layer.self_attn.q_proj.lora_a, format!("{}.self_attn.q_proj.lora_a", prefix));
-            load_param!(layer.self_attn.q_proj.lora_b, format!("{}.self_attn.q_proj.lora_b", prefix));
-            load_param!(layer.self_attn.k_proj.lora_a, format!("{}.self_attn.k_proj.lora_a", prefix));
-            load_param!(layer.self_attn.k_proj.lora_b, format!("{}.self_attn.k_proj.lora_b", prefix));
-            load_param!(layer.self_attn.v_proj.lora_a, format!("{}.self_attn.v_proj.lora_a", prefix));
-            load_param!(layer.self_attn.v_proj.lora_b, format!("{}.self_attn.v_proj.lora_b", prefix));
-            load_param!(layer.self_attn.o_proj.lora_a, format!("{}.self_attn.o_proj.lora_a", prefix));
-            load_param!(layer.self_attn.o_proj.lora_b, format!("{}.self_attn.o_proj.lora_b", prefix));
+            load_param!(
+                layer.self_attn.q_proj.lora_a,
+                format!("{}.self_attn.q_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.self_attn.q_proj.lora_b,
+                format!("{}.self_attn.q_proj.lora_b", prefix)
+            );
+            load_param!(
+                layer.self_attn.k_proj.lora_a,
+                format!("{}.self_attn.k_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.self_attn.k_proj.lora_b,
+                format!("{}.self_attn.k_proj.lora_b", prefix)
+            );
+            load_param!(
+                layer.self_attn.v_proj.lora_a,
+                format!("{}.self_attn.v_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.self_attn.v_proj.lora_b,
+                format!("{}.self_attn.v_proj.lora_b", prefix)
+            );
+            load_param!(
+                layer.self_attn.o_proj.lora_a,
+                format!("{}.self_attn.o_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.self_attn.o_proj.lora_b,
+                format!("{}.self_attn.o_proj.lora_b", prefix)
+            );
 
-            load_param!(layer.mlp.gate_up_proj.lora_a, format!("{}.mlp.gate_up_proj.lora_a", prefix));
-            load_param!(layer.mlp.gate_up_proj.lora_b, format!("{}.mlp.gate_up_proj.lora_b", prefix));
-            load_param!(layer.mlp.down_proj.lora_a, format!("{}.mlp.down_proj.lora_a", prefix));
-            load_param!(layer.mlp.down_proj.lora_b, format!("{}.mlp.down_proj.lora_b", prefix));
+            load_param!(
+                layer.mlp.gate_up_proj.lora_a,
+                format!("{}.mlp.gate_up_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.mlp.gate_up_proj.lora_b,
+                format!("{}.mlp.gate_up_proj.lora_b", prefix)
+            );
+            load_param!(
+                layer.mlp.down_proj.lora_a,
+                format!("{}.mlp.down_proj.lora_a", prefix)
+            );
+            load_param!(
+                layer.mlp.down_proj.lora_b,
+                format!("{}.mlp.down_proj.lora_b", prefix)
+            );
         }
 
         Ok(())
@@ -881,7 +993,10 @@ impl PhiLoraForCausalLM {
     }
 
     /// Load base model weights from directory.
-    pub fn load_base_weights_from_dir(&mut self, model_dir: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
+    pub fn load_base_weights_from_dir(
+        &mut self,
+        model_dir: impl AsRef<std::path::Path>,
+    ) -> Result<(), LoraError> {
         let model_dir = model_dir.as_ref();
 
         let single_file = model_dir.join("model.safetensors");
@@ -946,7 +1061,12 @@ impl PhiLoraForCausalLM {
             layer.mlp.down_proj.lora_b.eval()?;
 
             layer.input_layernorm.weight.value.as_ref().eval()?;
-            layer.post_attention_layernorm.weight.value.as_ref().eval()?;
+            layer
+                .post_attention_layernorm
+                .weight
+                .value
+                .as_ref()
+                .eval()?;
         }
 
         self.model.norm.weight.value.as_ref().eval()?;
@@ -969,36 +1089,72 @@ impl ModuleParameters for PhiLoraForCausalLM {
 
             let mut attn_params = HashMap::new();
             let mut q_params = HashMap::new();
-            q_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.self_attn.q_proj.lora_a));
-            q_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.self_attn.q_proj.lora_b));
+            q_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.self_attn.q_proj.lora_a),
+            );
+            q_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.self_attn.q_proj.lora_b),
+            );
             attn_params.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
 
             let mut k_params = HashMap::new();
-            k_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.self_attn.k_proj.lora_a));
-            k_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.self_attn.k_proj.lora_b));
+            k_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.self_attn.k_proj.lora_a),
+            );
+            k_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.self_attn.k_proj.lora_b),
+            );
             attn_params.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
 
             let mut v_params = HashMap::new();
-            v_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.self_attn.v_proj.lora_a));
-            v_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.self_attn.v_proj.lora_b));
+            v_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.self_attn.v_proj.lora_a),
+            );
+            v_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.self_attn.v_proj.lora_b),
+            );
             attn_params.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
 
             let mut o_params = HashMap::new();
-            o_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.self_attn.o_proj.lora_a));
-            o_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.self_attn.o_proj.lora_b));
+            o_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.self_attn.o_proj.lora_a),
+            );
+            o_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.self_attn.o_proj.lora_b),
+            );
             attn_params.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
 
             layer_params.insert(Rc::from("self_attn"), NestedValue::Map(attn_params));
 
             let mut mlp_params = HashMap::new();
             let mut gate_up_params = HashMap::new();
-            gate_up_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.mlp.gate_up_proj.lora_a));
-            gate_up_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.mlp.gate_up_proj.lora_b));
+            gate_up_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.mlp.gate_up_proj.lora_a),
+            );
+            gate_up_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.mlp.gate_up_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("gate_up_proj"), NestedValue::Map(gate_up_params));
 
             let mut down_params = HashMap::new();
-            down_params.insert(Rc::from("lora_a"), NestedValue::Value(&layer.mlp.down_proj.lora_a));
-            down_params.insert(Rc::from("lora_b"), NestedValue::Value(&layer.mlp.down_proj.lora_b));
+            down_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&layer.mlp.down_proj.lora_a),
+            );
+            down_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&layer.mlp.down_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
 
             layer_params.insert(Rc::from("mlp"), NestedValue::Map(mlp_params));
@@ -1017,36 +1173,72 @@ impl ModuleParameters for PhiLoraForCausalLM {
 
             let mut attn_params = HashMap::new();
             let mut q_params = HashMap::new();
-            q_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.q_proj.lora_a));
-            q_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.q_proj.lora_b));
+            q_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.self_attn.q_proj.lora_a),
+            );
+            q_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.self_attn.q_proj.lora_b),
+            );
             attn_params.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
 
             let mut k_params = HashMap::new();
-            k_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.k_proj.lora_a));
-            k_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.k_proj.lora_b));
+            k_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.self_attn.k_proj.lora_a),
+            );
+            k_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.self_attn.k_proj.lora_b),
+            );
             attn_params.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
 
             let mut v_params = HashMap::new();
-            v_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.v_proj.lora_a));
-            v_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.v_proj.lora_b));
+            v_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.self_attn.v_proj.lora_a),
+            );
+            v_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.self_attn.v_proj.lora_b),
+            );
             attn_params.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
 
             let mut o_params = HashMap::new();
-            o_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.self_attn.o_proj.lora_a));
-            o_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.self_attn.o_proj.lora_b));
+            o_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.self_attn.o_proj.lora_a),
+            );
+            o_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.self_attn.o_proj.lora_b),
+            );
             attn_params.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
 
             layer_params.insert(Rc::from("self_attn"), NestedValue::Map(attn_params));
 
             let mut mlp_params = HashMap::new();
             let mut gate_up_params = HashMap::new();
-            gate_up_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.mlp.gate_up_proj.lora_a));
-            gate_up_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.mlp.gate_up_proj.lora_b));
+            gate_up_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.mlp.gate_up_proj.lora_a),
+            );
+            gate_up_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.mlp.gate_up_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("gate_up_proj"), NestedValue::Map(gate_up_params));
 
             let mut down_params = HashMap::new();
-            down_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut layer.mlp.down_proj.lora_a));
-            down_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut layer.mlp.down_proj.lora_b));
+            down_params.insert(
+                Rc::from("lora_a"),
+                NestedValue::Value(&mut layer.mlp.down_proj.lora_a),
+            );
+            down_params.insert(
+                Rc::from("lora_b"),
+                NestedValue::Value(&mut layer.mlp.down_proj.lora_b),
+            );
             mlp_params.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
 
             layer_params.insert(Rc::from("mlp"), NestedValue::Map(mlp_params));
@@ -1062,8 +1254,12 @@ impl ModuleParameters for PhiLoraForCausalLM {
 
     fn freeze_parameters(&mut self, _recursive: bool) {}
     fn unfreeze_parameters(&mut self, _recursive: bool) {}
-    fn all_frozen(&self) -> Option<bool> { Some(false) }
-    fn any_frozen(&self) -> Option<bool> { Some(false) }
+    fn all_frozen(&self) -> Option<bool> {
+        Some(false)
+    }
+    fn any_frozen(&self) -> Option<bool> {
+        Some(false)
+    }
 }
 
 impl crate::TrainableModel for PhiLoraForCausalLM {
@@ -1161,7 +1357,12 @@ mod tests {
             alpha: 16.0,
             dropout: 0.0,
             use_rslora: false,
-            target_modules: vec!["q_proj".to_string(), "k_proj".to_string(), "v_proj".to_string(), "o_proj".to_string()],
+            target_modules: vec![
+                "q_proj".to_string(),
+                "k_proj".to_string(),
+                "v_proj".to_string(),
+                "o_proj".to_string(),
+            ],
             bias: "none".to_string(),
             init_lora_weights: true,
             use_dora: false,
@@ -1226,14 +1427,18 @@ mod tests {
 
         // Test forward pass with cache
         let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
-        let logits = model.forward_with_cache(&input_ids, None, Some(&mut cache)).unwrap();
+        let logits = model
+            .forward_with_cache(&input_ids, None, Some(&mut cache))
+            .unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]);
         assert_eq!(cache.rope_offset(), 4);
 
         // Test incremental generation
         let next_token = mlx_rs::Array::from_slice(&[5_i32], &[1, 1]);
-        let next_logits = model.forward_with_cache(&next_token, None, Some(&mut cache)).unwrap();
+        let next_logits = model
+            .forward_with_cache(&next_token, None, Some(&mut cache))
+            .unwrap();
 
         assert_eq!(next_logits.shape(), &[1, 1, 1000]);
         assert_eq!(cache.rope_offset(), 5);

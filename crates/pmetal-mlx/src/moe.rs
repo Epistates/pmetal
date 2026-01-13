@@ -158,10 +158,7 @@ impl MoERouter {
     /// - routing_weights: [batch * seq, num_experts_per_tok]
     /// - selected_experts: [batch * seq, num_experts_per_tok]
     /// - router_logits: [batch * seq, num_experts] (for aux loss)
-    pub fn forward(
-        &mut self,
-        hidden_states: &Array,
-    ) -> Result<(Array, Array, Array), Exception> {
+    pub fn forward(&mut self, hidden_states: &Array) -> Result<(Array, Array, Array), Exception> {
         let shape = hidden_states.shape();
         let batch_seq = shape[..shape.len() - 1].iter().product::<i32>();
         let hidden_size = shape[shape.len() - 1];

@@ -50,7 +50,9 @@ pub struct CohereConfig {
     pub global_attention_layers: Option<Vec<i32>>,
 }
 
-fn default_sliding_window() -> i32 { 4096 }
+fn default_sliding_window() -> i32 {
+    4096
+}
 
 impl Default for CohereConfig {
     fn default() -> Self {
@@ -117,18 +119,42 @@ impl CohereConfig {
 }
 
 impl ModelConfig for CohereConfig {
-    fn model_type(&self) -> &str { "cohere" }
-    fn vocab_size(&self) -> i32 { self.vocab_size }
-    fn hidden_size(&self) -> i32 { self.hidden_size }
-    fn num_hidden_layers(&self) -> i32 { self.num_hidden_layers }
-    fn num_attention_heads(&self) -> i32 { self.num_attention_heads }
-    fn num_kv_heads(&self) -> i32 { self.num_key_value_heads }
-    fn head_dim(&self) -> i32 { self.head_dim }
-    fn intermediate_size(&self) -> i32 { self.intermediate_size }
-    fn max_position_embeddings(&self) -> i32 { self.max_position_embeddings }
-    fn norm_eps(&self) -> f32 { self.layer_norm_eps }
-    fn rope_theta(&self) -> f32 { self.rope_theta }
-    fn tie_word_embeddings(&self) -> bool { self.tie_word_embeddings }
+    fn model_type(&self) -> &str {
+        "cohere"
+    }
+    fn vocab_size(&self) -> i32 {
+        self.vocab_size
+    }
+    fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+    fn num_hidden_layers(&self) -> i32 {
+        self.num_hidden_layers
+    }
+    fn num_attention_heads(&self) -> i32 {
+        self.num_attention_heads
+    }
+    fn num_kv_heads(&self) -> i32 {
+        self.num_key_value_heads
+    }
+    fn head_dim(&self) -> i32 {
+        self.head_dim
+    }
+    fn intermediate_size(&self) -> i32 {
+        self.intermediate_size
+    }
+    fn max_position_embeddings(&self) -> i32 {
+        self.max_position_embeddings
+    }
+    fn norm_eps(&self) -> f32 {
+        self.layer_norm_eps
+    }
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
 }
 
 // =============================================================================
@@ -157,7 +183,11 @@ impl CohereMLP {
         let down_proj = nn::LinearBuilder::new(intermediate_size, hidden_size)
             .bias(false)
             .build()?;
-        Ok(Self { gate_proj, up_proj, down_proj })
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
@@ -211,7 +241,8 @@ impl CohereAttention {
             .build()?;
 
         // Check if this layer uses global attention
-        let use_sliding_window = config.use_sliding_window && !config.uses_global_attention(layer_idx as i32);
+        let use_sliding_window =
+            config.use_sliding_window && !config.uses_global_attention(layer_idx as i32);
 
         Ok(Self {
             layer_idx,
@@ -391,7 +422,11 @@ impl CohereForCausalLM {
 
         let model = CohereModel::new(config.clone())?;
 
-        Ok(Self { config, model, lm_head })
+        Ok(Self {
+            config,
+            model,
+            lm_head,
+        })
     }
 
     pub fn forward(
@@ -419,11 +454,11 @@ mod tests {
         assert!(!config.uses_global_attention(0));
         assert!(!config.uses_global_attention(1));
         assert!(!config.uses_global_attention(2));
-        assert!(config.uses_global_attention(3));  // 4th layer
+        assert!(config.uses_global_attention(3)); // 4th layer
         assert!(!config.uses_global_attention(4));
         assert!(!config.uses_global_attention(5));
         assert!(!config.uses_global_attention(6));
-        assert!(config.uses_global_attention(7));  // 8th layer
+        assert!(config.uses_global_attention(7)); // 8th layer
     }
 
     #[test]

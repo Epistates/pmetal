@@ -8,9 +8,9 @@
 //! - Model soups (averaging checkpoints from the same training run)
 //! - Simple model combinations where interference is minimal
 
-use mlx_rs::Array;
-use crate::{MergeParameters, Result, MergeError};
 use super::MergeMethod;
+use crate::{MergeError, MergeParameters, Result};
+use mlx_rs::Array;
 
 /// Linear merge implementation.
 #[derive(Debug, Clone, Default)]
@@ -51,7 +51,8 @@ impl MergeMethod for LinearMerge {
         }
 
         // Get weights for each tensor
-        let weights: Vec<f32> = params.iter()
+        let weights: Vec<f32> = params
+            .iter()
             .map(|p| global_params.merge_with(p).weight())
             .collect();
 
@@ -91,11 +92,20 @@ mod tests {
         let t2 = Array::from_slice(&[4.0_f32, 5.0, 6.0], &[3]);
 
         let params = vec![
-            MergeParameters { weight: Some(1.0), ..Default::default() },
-            MergeParameters { weight: Some(1.0), ..Default::default() },
+            MergeParameters {
+                weight: Some(1.0),
+                ..Default::default()
+            },
+            MergeParameters {
+                weight: Some(1.0),
+                ..Default::default()
+            },
         ];
 
-        let global = MergeParameters { normalize: Some(true), ..Default::default() };
+        let global = MergeParameters {
+            normalize: Some(true),
+            ..Default::default()
+        };
 
         let result = merge.merge(&[t1, t2], None, &params, &global).unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();
@@ -114,11 +124,20 @@ mod tests {
         let t2 = Array::from_slice(&[0.0_f32, 1.0], &[2]);
 
         let params = vec![
-            MergeParameters { weight: Some(0.75), ..Default::default() },
-            MergeParameters { weight: Some(0.25), ..Default::default() },
+            MergeParameters {
+                weight: Some(0.75),
+                ..Default::default()
+            },
+            MergeParameters {
+                weight: Some(0.25),
+                ..Default::default()
+            },
         ];
 
-        let global = MergeParameters { normalize: Some(true), ..Default::default() };
+        let global = MergeParameters {
+            normalize: Some(true),
+            ..Default::default()
+        };
 
         let result = merge.merge(&[t1, t2], None, &params, &global).unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();

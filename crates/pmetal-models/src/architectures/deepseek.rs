@@ -15,18 +15,13 @@
 
 use std::collections::HashMap;
 
+use mlx_rs::{
+    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
+    ops::indexing::IndexOp, Array,
+};
 use pmetal_mlx::kernels::rope::apply_rope;
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
-use mlx_rs::{
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::Module,
-    nn,
-    ops::indexing::IndexOp,
-    Array,
-};
 use serde::{Deserialize, Serialize};
 
 /// DeepSeek model variant.
@@ -139,7 +134,6 @@ pub struct DeepSeekConfig {
     // =========================================================================
     // V3.2 DeepSeek Sparse Attention (DSA) Configuration
     // =========================================================================
-
     /// Enable DeepSeek Sparse Attention (V3.2 feature).
     #[serde(default)]
     pub use_sparse_attention: bool,
@@ -159,7 +153,6 @@ pub struct DeepSeekConfig {
     // =========================================================================
     // V3.2-Speciale Extended Thinking Configuration
     // =========================================================================
-
     /// Model variant (V3, V3.2, V3.2-Speciale).
     #[serde(default)]
     pub variant: DeepSeekVariant,
@@ -177,29 +170,71 @@ pub struct DeepSeekConfig {
     pub thinking_end_token_id: Option<i32>,
 }
 
-fn default_lightning_indexer_heads() -> i32 { 4 }
-fn default_sparse_top_k() -> i32 { 2048 }
+fn default_lightning_indexer_heads() -> i32 {
+    4
+}
+fn default_sparse_top_k() -> i32 {
+    2048
+}
 
 // Default value functions
-fn default_model_type() -> String { "deepseek_v3".to_string() }
-fn default_vocab_size() -> i32 { 102400 }
-fn default_hidden_size() -> i32 { 4096 }
-fn default_intermediate_size() -> i32 { 11008 }
-fn default_moe_intermediate_size() -> i32 { 1407 }
-fn default_num_hidden_layers() -> i32 { 30 }
-fn default_num_attention_heads() -> i32 { 32 }
-fn default_routed_scaling_factor() -> f32 { 1.0 }
-fn default_kv_lora_rank() -> i32 { 512 }
-fn default_qk_rope_head_dim() -> i32 { 64 }
-fn default_v_head_dim() -> i32 { 128 }
-fn default_qk_nope_head_dim() -> i32 { 128 }
-fn default_topk_method() -> String { "noaux_tc".to_string() }
-fn default_scoring_func() -> String { "sigmoid".to_string() }
-fn default_true() -> bool { true }
-fn default_one() -> i32 { 1 }
-fn default_max_position_embeddings() -> i32 { 2048 }
-fn default_rms_norm_eps() -> f32 { 1e-6 }
-fn default_rope_theta() -> f32 { 10000.0 }
+fn default_model_type() -> String {
+    "deepseek_v3".to_string()
+}
+fn default_vocab_size() -> i32 {
+    102400
+}
+fn default_hidden_size() -> i32 {
+    4096
+}
+fn default_intermediate_size() -> i32 {
+    11008
+}
+fn default_moe_intermediate_size() -> i32 {
+    1407
+}
+fn default_num_hidden_layers() -> i32 {
+    30
+}
+fn default_num_attention_heads() -> i32 {
+    32
+}
+fn default_routed_scaling_factor() -> f32 {
+    1.0
+}
+fn default_kv_lora_rank() -> i32 {
+    512
+}
+fn default_qk_rope_head_dim() -> i32 {
+    64
+}
+fn default_v_head_dim() -> i32 {
+    128
+}
+fn default_qk_nope_head_dim() -> i32 {
+    128
+}
+fn default_topk_method() -> String {
+    "noaux_tc".to_string()
+}
+fn default_scoring_func() -> String {
+    "sigmoid".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+fn default_one() -> i32 {
+    1
+}
+fn default_max_position_embeddings() -> i32 {
+    2048
+}
+fn default_rms_norm_eps() -> f32 {
+    1e-6
+}
+fn default_rope_theta() -> f32 {
+    10000.0
+}
 
 /// RoPE scaling configuration value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,7 +302,11 @@ impl DeepSeekConfig {
 
     /// Check if this configuration uses sparse attention (V3.2+).
     pub fn uses_sparse_attention(&self) -> bool {
-        self.use_sparse_attention || matches!(self.variant, DeepSeekVariant::V32 | DeepSeekVariant::V32Speciale)
+        self.use_sparse_attention
+            || matches!(
+                self.variant,
+                DeepSeekVariant::V32 | DeepSeekVariant::V32Speciale
+            )
     }
 }
 
@@ -374,32 +413,29 @@ impl DeepSeekAttention {
         let scale = (q_head_dim as f32).powf(-0.5);
 
         // Q projection (LoRA-style or direct)
-        let (q_a_proj, q_a_layernorm, q_b_proj, q_proj) = if let Some(q_lora_rank) = config.q_lora_rank {
-            let q_a = nn::LinearBuilder::new(hidden_size, q_lora_rank)
-                .bias(config.attention_bias)
-                .build()?;
-            let q_a_norm = nn::RmsNormBuilder::new(q_lora_rank)
-                .eps(1e-6)
-                .build()?;
-            let q_b = nn::LinearBuilder::new(q_lora_rank, n_heads * q_head_dim)
-                .bias(false)
-                .build()?;
-            (Some(q_a), Some(q_a_norm), Some(q_b), None)
-        } else {
-            let q = nn::LinearBuilder::new(hidden_size, n_heads * q_head_dim)
-                .bias(false)
-                .build()?;
-            (None, None, None, Some(q))
-        };
+        let (q_a_proj, q_a_layernorm, q_b_proj, q_proj) =
+            if let Some(q_lora_rank) = config.q_lora_rank {
+                let q_a = nn::LinearBuilder::new(hidden_size, q_lora_rank)
+                    .bias(config.attention_bias)
+                    .build()?;
+                let q_a_norm = nn::RmsNormBuilder::new(q_lora_rank).eps(1e-6).build()?;
+                let q_b = nn::LinearBuilder::new(q_lora_rank, n_heads * q_head_dim)
+                    .bias(false)
+                    .build()?;
+                (Some(q_a), Some(q_a_norm), Some(q_b), None)
+            } else {
+                let q = nn::LinearBuilder::new(hidden_size, n_heads * q_head_dim)
+                    .bias(false)
+                    .build()?;
+                (None, None, None, Some(q))
+            };
 
         // KV projection: outputs [kv_lora_rank + qk_rope_head_dim]
         // The kv_lora_rank portion gets compressed, qk_rope_head_dim is the RoPE key
-        let kv_a_proj_with_mqa = nn::LinearBuilder::new(
-            hidden_size,
-            config.kv_lora_rank + config.qk_rope_head_dim,
-        )
-        .bias(config.attention_bias)
-        .build()?;
+        let kv_a_proj_with_mqa =
+            nn::LinearBuilder::new(hidden_size, config.kv_lora_rank + config.qk_rope_head_dim)
+                .bias(config.attention_bias)
+                .build()?;
 
         let kv_a_layernorm = nn::RmsNormBuilder::new(config.kv_lora_rank)
             .eps(1e-6)
@@ -460,7 +496,7 @@ impl DeepSeekAttention {
         // mx.split(q, [qk_nope_head_dim], axis=-1) -> split_axis(&[idx], Some(-1))
         let q_parts = q.split_axis(&[self.config.qk_nope_head_dim as i32], Some(-1))?;
         let q_nope = &q_parts[0]; // [B, heads, seq, qk_nope_head_dim]
-        let q_pe = &q_parts[1];   // [B, heads, seq, qk_rope_head_dim]
+        let q_pe = &q_parts[1]; // [B, heads, seq, qk_rope_head_dim]
 
         // Compute compressed KV: outputs [latent, k_pe]
         let compressed_kv = self.kv_a_proj_with_mqa.forward(x)?;
@@ -504,7 +540,10 @@ impl DeepSeekAttention {
         )?;
 
         // Repeat k_pe for all heads: [B, 1, seq, rope_dim] -> [B, heads, seq, rope_dim]
-        let k_pe_repeated = mlx_rs::ops::broadcast_to(&k_pe, &[batch, self.n_heads, seq_len, self.config.qk_rope_head_dim])?;
+        let k_pe_repeated = mlx_rs::ops::broadcast_to(
+            &k_pe,
+            &[batch, self.n_heads, seq_len, self.config.qk_rope_head_dim],
+        )?;
 
         // Concatenate to form full keys and queries
         let keys = mlx_rs::ops::concatenate_axis(&[k_nope, &k_pe_repeated], -1)?;
@@ -600,11 +639,7 @@ impl LightningIndexer {
     ///
     /// Returns scores of shape [batch, seq_len, seq_len] indicating
     /// how relevant each key position is for each query position.
-    pub fn compute_scores(
-        &mut self,
-        x: &Array,
-        offset: i32,
-    ) -> Result<Array, Exception> {
+    pub fn compute_scores(&mut self, x: &Array, offset: i32) -> Result<Array, Exception> {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
@@ -675,11 +710,7 @@ impl TokenSelector {
     ///
     /// Returns:
     ///     indices: Selected token indices [batch, query_len, top_k]
-    pub fn select_tokens(
-        &self,
-        scores: &Array,
-        mask: Option<&Array>,
-    ) -> Result<Array, Exception> {
+    pub fn select_tokens(&self, scores: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
         // Apply causal mask if provided
         let masked_scores = if let Some(mask) = mask {
             // Mask is typically [1, 1, query_len, key_len] for causal
@@ -1023,7 +1054,10 @@ impl DeepSeekDecoderLayer {
         let mlp = if config.is_moe_layer(layer_id as i32) {
             DeepSeekMLPType::MoE(DeepSeekMoE::new(config)?)
         } else {
-            DeepSeekMLPType::Dense(DeepSeekMLP::new(config.hidden_size, config.intermediate_size)?)
+            DeepSeekMLPType::Dense(DeepSeekMLP::new(
+                config.hidden_size,
+                config.intermediate_size,
+            )?)
         };
 
         Ok(Self {
@@ -1221,12 +1255,30 @@ mod tests {
 
     #[test]
     fn test_variant_detection() {
-        assert_eq!(DeepSeekConfig::detect_variant("deepseek_v3"), DeepSeekVariant::V3);
-        assert_eq!(DeepSeekConfig::detect_variant("deepseek-v3"), DeepSeekVariant::V3);
-        assert_eq!(DeepSeekConfig::detect_variant("deepseek_v32"), DeepSeekVariant::V32);
-        assert_eq!(DeepSeekConfig::detect_variant("deepseek-v3.2"), DeepSeekVariant::V32);
-        assert_eq!(DeepSeekConfig::detect_variant("deepseek_v32_speciale"), DeepSeekVariant::V32Speciale);
-        assert_eq!(DeepSeekConfig::detect_variant("deepseek-thinking"), DeepSeekVariant::V32Speciale);
+        assert_eq!(
+            DeepSeekConfig::detect_variant("deepseek_v3"),
+            DeepSeekVariant::V3
+        );
+        assert_eq!(
+            DeepSeekConfig::detect_variant("deepseek-v3"),
+            DeepSeekVariant::V3
+        );
+        assert_eq!(
+            DeepSeekConfig::detect_variant("deepseek_v32"),
+            DeepSeekVariant::V32
+        );
+        assert_eq!(
+            DeepSeekConfig::detect_variant("deepseek-v3.2"),
+            DeepSeekVariant::V32
+        );
+        assert_eq!(
+            DeepSeekConfig::detect_variant("deepseek_v32_speciale"),
+            DeepSeekVariant::V32Speciale
+        );
+        assert_eq!(
+            DeepSeekConfig::detect_variant("deepseek-thinking"),
+            DeepSeekVariant::V32Speciale
+        );
     }
 
     #[test]

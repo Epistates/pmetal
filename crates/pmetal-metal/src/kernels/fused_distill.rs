@@ -178,7 +178,14 @@ impl FusedDistill {
         let teacher_lse = MetalBuffer::new(&self.ctx, self.config.num_tokens, BufferUsage::Shared)?;
         let student_lse = MetalBuffer::new(&self.ctx, self.config.num_tokens, BufferUsage::Shared)?;
 
-        self.execute_forward(teacher_logits, student_logits, &losses, &teacher_lse, &student_lse, loss_type)?;
+        self.execute_forward(
+            teacher_logits,
+            student_logits,
+            &losses,
+            &teacher_lse,
+            &student_lse,
+            loss_type,
+        )?;
 
         Ok(FusedDistillOutput {
             losses,
@@ -198,7 +205,14 @@ impl FusedDistill {
         let teacher_lse = MetalBuffer::new(&self.ctx, self.config.num_tokens, BufferUsage::Shared)?;
         let student_lse = MetalBuffer::new(&self.ctx, self.config.num_tokens, BufferUsage::Shared)?;
 
-        self.execute_forward_f16(teacher_logits, student_logits, &losses, &teacher_lse, &student_lse, loss_type)?;
+        self.execute_forward_f16(
+            teacher_logits,
+            student_logits,
+            &losses,
+            &teacher_lse,
+            &student_lse,
+            loss_type,
+        )?;
 
         Ok(FusedDistillOutput {
             losses,
@@ -224,7 +238,13 @@ impl FusedDistill {
         student_lse: &MetalBuffer<f32>,
         grad_loss: &MetalBuffer<f32>,
     ) -> Result<()> {
-        self.execute_backward(teacher_logits, student_logits, teacher_lse, student_lse, grad_loss)
+        self.execute_backward(
+            teacher_logits,
+            student_logits,
+            teacher_lse,
+            student_lse,
+            grad_loss,
+        )
     }
 
     /// Execute forward kernel.
@@ -290,33 +310,34 @@ impl FusedDistill {
             }
         }
 
-        let (grid_size, threadgroup_size) = if self.config.use_simd && matches!(loss_type, DistillLossType::KlDivergence) {
-            (
-                objc2_metal::MTLSize {
-                    width: self.config.num_tokens,
-                    height: 1,
-                    depth: 1,
-                },
-                objc2_metal::MTLSize {
-                    width: 128, // DISTILL_THREADS_PER_TOKEN
-                    height: 1,
-                    depth: 1,
-                },
-            )
-        } else {
-            (
-                objc2_metal::MTLSize {
-                    width: self.config.num_tokens,
-                    height: 1,
-                    depth: 1,
-                },
-                objc2_metal::MTLSize {
-                    width: 32,
-                    height: 1,
-                    depth: 1,
-                },
-            )
-        };
+        let (grid_size, threadgroup_size) =
+            if self.config.use_simd && matches!(loss_type, DistillLossType::KlDivergence) {
+                (
+                    objc2_metal::MTLSize {
+                        width: self.config.num_tokens,
+                        height: 1,
+                        depth: 1,
+                    },
+                    objc2_metal::MTLSize {
+                        width: 128, // DISTILL_THREADS_PER_TOKEN
+                        height: 1,
+                        depth: 1,
+                    },
+                )
+            } else {
+                (
+                    objc2_metal::MTLSize {
+                        width: self.config.num_tokens,
+                        height: 1,
+                        depth: 1,
+                    },
+                    objc2_metal::MTLSize {
+                        width: 32,
+                        height: 1,
+                        depth: 1,
+                    },
+                )
+            };
 
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
         encoder.endEncoding();
@@ -343,7 +364,7 @@ impl FusedDistill {
         // Only KL divergence has fp16 variant
         if loss_type != DistillLossType::KlDivergence {
             return Err(MetalError::ExecutionFailed(
-                "fp16 only supported for KL divergence".to_string()
+                "fp16 only supported for KL divergence".to_string(),
             ));
         }
 
@@ -645,33 +666,34 @@ impl FusedHiddenAlign {
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
         }
 
-        let (grid_size, threadgroup_size) = if self.config.use_simd && loss_type == HiddenAlignLossType::Mse {
-            (
-                objc2_metal::MTLSize {
-                    width: self.config.num_tokens,
-                    height: 1,
-                    depth: 1,
-                },
-                objc2_metal::MTLSize {
-                    width: 128,
-                    height: 1,
-                    depth: 1,
-                },
-            )
-        } else {
-            (
-                objc2_metal::MTLSize {
-                    width: self.config.num_tokens,
-                    height: 1,
-                    depth: 1,
-                },
-                objc2_metal::MTLSize {
-                    width: 32,
-                    height: 1,
-                    depth: 1,
-                },
-            )
-        };
+        let (grid_size, threadgroup_size) =
+            if self.config.use_simd && loss_type == HiddenAlignLossType::Mse {
+                (
+                    objc2_metal::MTLSize {
+                        width: self.config.num_tokens,
+                        height: 1,
+                        depth: 1,
+                    },
+                    objc2_metal::MTLSize {
+                        width: 128,
+                        height: 1,
+                        depth: 1,
+                    },
+                )
+            } else {
+                (
+                    objc2_metal::MTLSize {
+                        width: self.config.num_tokens,
+                        height: 1,
+                        depth: 1,
+                    },
+                    objc2_metal::MTLSize {
+                        width: 32,
+                        height: 1,
+                        depth: 1,
+                    },
+                )
+            };
 
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
         encoder.endEncoding();
@@ -754,14 +776,26 @@ mod tests {
         temperature: f32,
     ) -> f32 {
         // Compute softmax for teacher
-        let t_max = teacher_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let t_exp: Vec<f32> = teacher_logits.iter().map(|&x| ((x / temperature) - t_max / temperature).exp()).collect();
+        let t_max = teacher_logits
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let t_exp: Vec<f32> = teacher_logits
+            .iter()
+            .map(|&x| ((x / temperature) - t_max / temperature).exp())
+            .collect();
         let t_sum: f32 = t_exp.iter().sum();
         let t_probs: Vec<f32> = t_exp.iter().map(|&x| x / t_sum).collect();
 
         // Compute softmax for student
-        let s_max = student_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let s_exp: Vec<f32> = student_logits.iter().map(|&x| ((x / temperature) - s_max / temperature).exp()).collect();
+        let s_max = student_logits
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+        let s_exp: Vec<f32> = student_logits
+            .iter()
+            .map(|&x| ((x / temperature) - s_max / temperature).exp())
+            .collect();
         let s_sum: f32 = s_exp.iter().sum();
         let s_probs: Vec<f32> = s_exp.iter().map(|&x| x / s_sum).collect();
 
@@ -803,7 +837,9 @@ mod tests {
         let teacher = MetalBuffer::from_slice(&ctx, &teacher_data, BufferUsage::Shared).unwrap();
         let student = MetalBuffer::from_slice(&ctx, &student_data, BufferUsage::Shared).unwrap();
 
-        let output = distill.forward(&teacher, &student, DistillLossType::KlDivergence).unwrap();
+        let output = distill
+            .forward(&teacher, &student, DistillLossType::KlDivergence)
+            .unwrap();
 
         // Verify against reference
         let losses = output.losses.as_slice();
@@ -842,7 +878,9 @@ mod tests {
         let teacher = MetalBuffer::from_slice(&ctx, &logits_data, BufferUsage::Shared).unwrap();
         let student = MetalBuffer::from_slice(&ctx, &logits_data, BufferUsage::Shared).unwrap();
 
-        let output = distill.forward(&teacher, &student, DistillLossType::KlDivergence).unwrap();
+        let output = distill
+            .forward(&teacher, &student, DistillLossType::KlDivergence)
+            .unwrap();
 
         // KL of identical distributions should be 0
         let losses = output.losses.as_slice();
@@ -858,8 +896,7 @@ mod tests {
 
     #[test]
     fn test_hidden_align_config() {
-        let config = HiddenAlignConfig::new(1024, 4096, 2048)
-            .with_weight(0.5);
+        let config = HiddenAlignConfig::new(1024, 4096, 2048).with_weight(0.5);
 
         assert_eq!(config.num_tokens, 1024);
         assert_eq!(config.teacher_dim, 4096);
@@ -890,13 +927,20 @@ mod tests {
         let teacher = MetalBuffer::from_slice(&ctx, &teacher_data, BufferUsage::Shared).unwrap();
         let student = MetalBuffer::from_slice(&ctx, &student_data, BufferUsage::Shared).unwrap();
 
-        let losses = align.forward(&teacher, &student, HiddenAlignLossType::Mse).unwrap();
+        let losses = align
+            .forward(&teacher, &student, HiddenAlignLossType::Mse)
+            .unwrap();
 
         // Verify MSE is reasonable
         let loss_data = losses.as_slice();
         for (i, &loss) in loss_data.iter().enumerate() {
             assert!(loss >= 0.0, "MSE should be non-negative at token {}", i);
-            assert!(loss < 1.0, "MSE should be reasonable at token {}: got {}", i, loss);
+            assert!(
+                loss < 1.0,
+                "MSE should be reasonable at token {}: got {}",
+                i,
+                loss
+            );
         }
     }
 
@@ -918,7 +962,9 @@ mod tests {
         let teacher = MetalBuffer::from_slice(&ctx, &data, BufferUsage::Shared).unwrap();
         let student = MetalBuffer::from_slice(&ctx, &data, BufferUsage::Shared).unwrap();
 
-        let losses = align.forward(&teacher, &student, HiddenAlignLossType::Mse).unwrap();
+        let losses = align
+            .forward(&teacher, &student, HiddenAlignLossType::Mse)
+            .unwrap();
 
         // MSE of identical vectors should be 0
         let loss_data = losses.as_slice();

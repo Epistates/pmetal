@@ -52,15 +52,22 @@ impl MhcMetalContext {
             .map_err(|e| MhcMetalError::CompileError(e.to_string()))?;
 
         // Create compute pipelines
-        let compute_mappings_pipeline = Self::create_pipeline(&device, &library, "compute_mappings")?;
-        let apply_constraints_pipeline = Self::create_pipeline(&device, &library, "apply_constraints")?;
-        let apply_pre_mapping_pipeline = Self::create_pipeline(&device, &library, "apply_pre_mapping")?;
+        let compute_mappings_pipeline =
+            Self::create_pipeline(&device, &library, "compute_mappings")?;
+        let apply_constraints_pipeline =
+            Self::create_pipeline(&device, &library, "apply_constraints")?;
+        let apply_pre_mapping_pipeline =
+            Self::create_pipeline(&device, &library, "apply_pre_mapping")?;
         let apply_post_res_mapping_pipeline =
             Self::create_pipeline(&device, &library, "apply_post_res_mapping")?;
-        let sinkhorn_backward_pipeline = Self::create_pipeline(&device, &library, "sinkhorn_backward")?;
-        let compute_amax_gain_pipeline = Self::create_pipeline(&device, &library, "compute_amax_gain")?;
-        let expand_to_streams_pipeline = Self::create_pipeline(&device, &library, "expand_to_streams")?;
-        let collapse_streams_pipeline = Self::create_pipeline(&device, &library, "collapse_streams")?;
+        let sinkhorn_backward_pipeline =
+            Self::create_pipeline(&device, &library, "sinkhorn_backward")?;
+        let compute_amax_gain_pipeline =
+            Self::create_pipeline(&device, &library, "compute_amax_gain")?;
+        let expand_to_streams_pipeline =
+            Self::create_pipeline(&device, &library, "expand_to_streams")?;
+        let collapse_streams_pipeline =
+            Self::create_pipeline(&device, &library, "collapse_streams")?;
 
         Ok(Self {
             device,
@@ -155,7 +162,11 @@ impl MhcMetalContext {
         encoder.set_buffer(3, Some(&config_buf), 0);
 
         let threads_per_group = MTLSize::new(self.config.compute_mappings_threads as u64, 1, 1);
-        let num_groups = MTLSize::new(((n * n) as u64 + threads_per_group.width - 1) / threads_per_group.width, 1, 1);
+        let num_groups = MTLSize::new(
+            ((n * n) as u64 + threads_per_group.width - 1) / threads_per_group.width,
+            1,
+            1,
+        );
         encoder.dispatch_thread_groups(num_groups, threads_per_group);
 
         // Repeat for post and res (or use batch kernel)
@@ -176,7 +187,8 @@ impl MhcMetalContext {
             encoder.set_buffer(1, Some(&config_buf), 0);
 
             let sinkhorn_groups = MTLSize::new(
-                ((n) as u64 + self.config.sinkhorn_threads as u64 - 1) / self.config.sinkhorn_threads as u64,
+                ((n) as u64 + self.config.sinkhorn_threads as u64 - 1)
+                    / self.config.sinkhorn_threads as u64,
                 1,
                 1,
             );
@@ -205,7 +217,11 @@ impl MhcMetalContext {
         self.stats.compute_mappings_us += start.elapsed().as_micros() as u64;
         self.stats.invocations += 1;
 
-        Ok(MhcMappings { h_pre, h_post, h_res })
+        Ok(MhcMappings {
+            h_pre,
+            h_post,
+            h_res,
+        })
     }
 
     /// Apply pre-mapping on GPU: h_in = H^pre @ x
@@ -237,11 +253,7 @@ impl MhcMetalContext {
         encoder.set_buffer(3, Some(&config_buf), 0);
 
         let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
-        let groups = MTLSize::new(
-            ((n * c) as u64 + threads.width - 1) / threads.width,
-            1,
-            1,
-        );
+        let groups = MTLSize::new(((n * c) as u64 + threads.width - 1) / threads.width, 1, 1);
         encoder.dispatch_thread_groups(groups, threads);
 
         encoder.end_encoding();
@@ -291,11 +303,7 @@ impl MhcMetalContext {
         encoder.set_buffer(5, Some(&config_buf), 0);
 
         let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
-        let groups = MTLSize::new(
-            ((n * c) as u64 + threads.width - 1) / threads.width,
-            1,
-            1,
-        );
+        let groups = MTLSize::new(((n * c) as u64 + threads.width - 1) / threads.width, 1, 1);
         encoder.dispatch_thread_groups(groups, threads);
 
         encoder.end_encoding();
@@ -381,11 +389,7 @@ impl MhcMetalContext {
         encoder.set_buffer(2, Some(&config_buf), 0);
 
         let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
-        let groups = MTLSize::new(
-            (c as u64 + threads.width - 1) / threads.width,
-            1,
-            1,
-        );
+        let groups = MTLSize::new((c as u64 + threads.width - 1) / threads.width, 1, 1);
         encoder.dispatch_thread_groups(groups, threads);
 
         encoder.end_encoding();
@@ -460,7 +464,11 @@ impl MhcMetalContext {
         Ok(buffer)
     }
 
-    fn read_buffer<T: Clone>(&self, buffer: &Buffer, count: usize) -> Result<Vec<T>, MhcMetalError> {
+    fn read_buffer<T: Clone>(
+        &self,
+        buffer: &Buffer,
+        count: usize,
+    ) -> Result<Vec<T>, MhcMetalError> {
         let ptr = buffer.contents() as *const T;
         let slice = unsafe { std::slice::from_raw_parts(ptr, count) };
         Ok(slice.to_vec())
@@ -473,7 +481,8 @@ impl MhcMetalContext {
         cols: usize,
     ) -> Result<Array2<f32>, MhcMetalError> {
         let data = self.read_buffer::<f32>(buffer, rows * cols)?;
-        Array2::from_shape_vec((rows, cols), data).map_err(|e| MhcMetalError::ShapeError(e.to_string()))
+        Array2::from_shape_vec((rows, cols), data)
+            .map_err(|e| MhcMetalError::ShapeError(e.to_string()))
     }
 }
 

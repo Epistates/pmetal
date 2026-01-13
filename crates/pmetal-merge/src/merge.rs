@@ -7,13 +7,12 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use mlx_rs::Array;
-use tracing::{info, debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::{
-    MergeConfig, MergeMethodConfig, MergeParameters, Result, MergeError,
-    SafetensorsLoader, TensorLoader, TensorWriter,
-    MergeMethod, LinearMerge, SlerpMerge, TiesMerge, DareMerge,
-    ModelStockMerge, PassthroughMerge, TaskArithmeticMerge,
+    DareMerge, LinearMerge, MergeConfig, MergeError, MergeMethod, MergeMethodConfig,
+    MergeParameters, ModelStockMerge, PassthroughMerge, Result, SafetensorsLoader, SlerpMerge,
+    TaskArithmeticMerge, TensorLoader, TensorWriter, TiesMerge,
 };
 
 /// Main entry point for running a model merge.
@@ -28,7 +27,11 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
 
     // Create the merge method
     let method = create_merge_method(&config.merge_method);
-    info!("Using merge method: {} - {}", method.name(), method.description());
+    info!(
+        "Using merge method: {} - {}",
+        method.name(),
+        method.description()
+    );
 
     // Validate configuration
     validate_config(config, &*method)?;
@@ -42,7 +45,9 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
     info!("Found {} tensors to merge", tensor_names.len());
 
     // Determine output path
-    let output_path = config.output_path.clone()
+    let output_path = config
+        .output_path
+        .clone()
         .unwrap_or_else(|| std::path::PathBuf::from("merged_model"));
 
     // Create output writer
@@ -55,13 +60,7 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
             info!("Processing tensor {}/{}: {}", idx + 1, total, name);
         }
 
-        let merged = merge_tensor(
-            name,
-            &loaders,
-            base_loader.as_ref(),
-            &*method,
-            config,
-        )?;
+        let merged = merge_tensor(name, &loaders, base_loader.as_ref(), &*method, config)?;
 
         writer.write_tensor(name, &merged)?;
     }
@@ -201,7 +200,9 @@ fn merge_tensor(
             tensors.push(tensor);
 
             // Get per-model parameters
-            let model_params = config.models.get(idx)
+            let model_params = config
+                .models
+                .get(idx)
                 .map(|m| m.parameters.clone())
                 .unwrap_or_default();
             params.push(model_params);
@@ -237,20 +238,11 @@ fn merge_tensor(
     verify_shapes(name, &tensors, base_tensor.as_ref())?;
 
     // Run the merge
-    method.merge(
-        &tensors,
-        base_tensor.as_ref(),
-        &params,
-        &config.parameters,
-    )
+    method.merge(&tensors, base_tensor.as_ref(), &params, &config.parameters)
 }
 
 /// Verify that all tensor shapes match.
-fn verify_shapes(
-    name: &str,
-    tensors: &[Array],
-    base: Option<&Array>,
-) -> Result<()> {
+fn verify_shapes(name: &str, tensors: &[Array], base: Option<&Array>) -> Result<()> {
     if tensors.is_empty() {
         return Ok(());
     }
@@ -281,8 +273,6 @@ fn verify_shapes(
 
     Ok(())
 }
-
-
 
 /// Builder for creating merge configurations programmatically.
 #[derive(Debug, Default)]
@@ -362,9 +352,9 @@ impl MergeBuilder {
 
     /// Build the merge configuration.
     pub fn build(self) -> Result<MergeConfig> {
-        let method = self.method.ok_or_else(|| {
-            MergeError::InvalidConfig("Merge method is required".to_string())
-        })?;
+        let method = self
+            .method
+            .ok_or_else(|| MergeError::InvalidConfig("Merge method is required".to_string()))?;
 
         if self.models.is_empty() {
             return Err(MergeError::NotEnoughModels {
@@ -373,7 +363,8 @@ impl MergeBuilder {
             });
         }
 
-        let models = self.models
+        let models = self
+            .models
             .into_iter()
             .enumerate()
             .map(|(idx, path)| crate::ModelConfig {
@@ -421,8 +412,7 @@ mod tests {
 
     #[test]
     fn test_builder_requires_method() {
-        let builder = MergeBuilder::new()
-            .add_model("model1");
+        let builder = MergeBuilder::new().add_model("model1");
 
         let result = builder.build();
         assert!(result.is_err());
@@ -430,8 +420,7 @@ mod tests {
 
     #[test]
     fn test_builder_requires_models() {
-        let builder = MergeBuilder::new()
-            .method(MergeMethodConfig::Linear);
+        let builder = MergeBuilder::new().method(MergeMethodConfig::Linear);
 
         let result = builder.build();
         assert!(result.is_err());

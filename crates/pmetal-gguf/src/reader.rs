@@ -244,8 +244,8 @@ impl GgufContent {
             dims.reverse(); // GGUF stores column-major, we want row-major
 
             let dtype_num = reader.read_u32::<LittleEndian>()?;
-            let dtype =
-                GgmlType::try_from(dtype_num).map_err(|_| GgufReadError::InvalidDtype(dtype_num))?;
+            let dtype = GgmlType::try_from(dtype_num)
+                .map_err(|_| GgufReadError::InvalidDtype(dtype_num))?;
 
             let offset = reader.read_u64::<LittleEndian>()?;
 

@@ -17,10 +17,10 @@
 //! - Alternative to TIES when you want stochastic sparsification
 //! - When magnitude-based pruning removes important small-magnitude weights
 
+use super::MergeMethod;
+use crate::{sign_consensus, MergeError, MergeParameters, Result};
 use mlx_rs::Array;
 use rand::Rng;
-use crate::{MergeParameters, Result, MergeError, sign_consensus};
-use super::MergeMethod;
 
 /// DARE merge implementation.
 #[derive(Debug, Clone)]
@@ -137,16 +137,19 @@ impl MergeMethod for DareMerge {
         })?;
 
         // Compute task vectors
-        let task_vectors: Vec<Array> = tensors.iter()
+        let task_vectors: Vec<Array> = tensors
+            .iter()
             .map(|t| Self::task_vector(t, base))
             .collect::<Result<Vec<_>>>()?;
 
         // Get parameters
-        let densities: Vec<f32> = params.iter()
+        let densities: Vec<f32> = params
+            .iter()
             .map(|p| global_params.merge_with(p).density())
             .collect();
 
-        let weights: Vec<f32> = params.iter()
+        let weights: Vec<f32> = params
+            .iter()
             .map(|p| global_params.merge_with(p).weight())
             .collect();
 
@@ -154,7 +157,8 @@ impl MergeMethod for DareMerge {
         let lambda = global_params.lambda();
 
         // Apply DARE sparsification to each task vector
-        let sparse_vectors: Vec<Array> = task_vectors.iter()
+        let sparse_vectors: Vec<Array> = task_vectors
+            .iter()
             .zip(densities.iter())
             .map(|(tv, &density)| Self::dare_sparsify(tv, density, rescale))
             .collect::<Result<Vec<_>>>()?;
@@ -223,11 +227,16 @@ mod tests {
         let base = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[3]);
         let t1 = Array::from_slice(&[2.0_f32, 3.0, 4.0], &[3]);
 
-        let params = vec![
-            MergeParameters { weight: Some(1.0), density: Some(0.5), ..Default::default() },
-        ];
+        let params = vec![MergeParameters {
+            weight: Some(1.0),
+            density: Some(0.5),
+            ..Default::default()
+        }];
 
-        let global = MergeParameters { lambda: Some(0.0), ..Default::default() };
+        let global = MergeParameters {
+            lambda: Some(0.0),
+            ..Default::default()
+        };
 
         let result = merge.merge(&[t1], Some(&base), &params, &global).unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();

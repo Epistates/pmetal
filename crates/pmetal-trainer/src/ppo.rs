@@ -27,10 +27,10 @@
 //! - "Proximal Policy Optimization Algorithms" (Schulman et al., 2017)
 //! - TRL/Unsloth implementations
 
-use pmetal_core::TrainingConfig;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
+use pmetal_core::TrainingConfig;
 
 /// Error type for PPO training.
 #[derive(Debug, thiserror::Error)]
@@ -205,7 +205,9 @@ impl PpoConfig {
             return Err(PpoError::Config("ppo_epochs must be at least 1".into()));
         }
         if self.mini_batch_size == 0 {
-            return Err(PpoError::Config("mini_batch_size must be at least 1".into()));
+            return Err(PpoError::Config(
+                "mini_batch_size must be at least 1".into(),
+            ));
         }
         Ok(())
     }
@@ -302,11 +304,7 @@ impl PpoTrainer {
     }
 
     /// Compute per-token log probabilities.
-    pub fn compute_log_probs(
-        &self,
-        logits: &Array,
-        labels: &Array,
-    ) -> PpoResult<Array> {
+    pub fn compute_log_probs(&self, logits: &Array, labels: &Array) -> PpoResult<Array> {
         let seq_len = logits.dim(1);
 
         // Shift for next-token prediction
@@ -342,7 +340,10 @@ impl PpoTrainer {
             }
         }
 
-        Ok(Array::from_slice(&token_logps, &[batch_size as i32, pred_len as i32]))
+        Ok(Array::from_slice(
+            &token_logps,
+            &[batch_size as i32, pred_len as i32],
+        ))
     }
 
     /// Compute advantages using GAE.
@@ -362,11 +363,7 @@ impl PpoTrainer {
         // Compute GAE backwards
         let mut gae = 0.0f32;
         for t in (0..n).rev() {
-            let next_value = if t == n - 1 {
-                0.0
-            } else {
-                values[t + 1]
-            };
+            let next_value = if t == n - 1 { 0.0 } else { values[t + 1] };
 
             let delta = rewards[t] + gamma * next_value * (!dones[t] as i32 as f32) - values[t];
             gae = delta + gamma * lambda * (!dones[t] as i32 as f32) * gae;
@@ -419,7 +416,8 @@ impl PpoTrainer {
         let surr2 = clipped_ratio.multiply(advantages)?;
         let policy_loss = mlx_rs::ops::minimum(&surr1, &surr2)?;
         let masked_policy_loss = policy_loss.multiply(mask)?;
-        let mean_policy_loss = masked_policy_loss.sum(None)?
+        let mean_policy_loss = masked_policy_loss
+            .sum(None)?
             .divide(&mask.sum(None)?)?
             .negative()?;
 
@@ -446,10 +444,11 @@ impl PpoTrainer {
                 let vf_coef = Array::from_f32(self.config.vf_coef as f32);
                 let half = Array::from_f32(0.5);
                 Some(
-                    masked_vf.sum(None)?
+                    masked_vf
+                        .sum(None)?
                         .divide(&mask.sum(None)?)?
                         .multiply(&vf_coef)?
-                        .multiply(&half)?
+                        .multiply(&half)?,
                 )
             } else {
                 None
@@ -463,13 +462,15 @@ impl PpoTrainer {
             if self.config.entropy_coef > 0.0 {
                 let log_probs = mlx_rs::nn::log_softmax(logits, -1)?;
                 let probs = log_probs.exp()?;
-                let entropy_per_token = probs.multiply(&log_probs)?.sum_axis(-1, None)?.negative()?;
+                let entropy_per_token =
+                    probs.multiply(&log_probs)?.sum_axis(-1, None)?.negative()?;
                 let entropy_coef = Array::from_f32(self.config.entropy_coef as f32);
                 Some(
-                    entropy_per_token.multiply(mask)?
+                    entropy_per_token
+                        .multiply(mask)?
                         .sum(None)?
                         .divide(&mask.sum(None)?)?
-                        .multiply(&entropy_coef)?
+                        .multiply(&entropy_coef)?,
                 )
             } else {
                 None
@@ -580,21 +581,39 @@ impl PpoTrainer {
 
         Ok(RolloutBatch {
             input_ids: Array::from_slice(&input_ids_data, &[batch_size as i32, max_total as i32]),
-            attention_mask: Array::from_slice(&attn_mask_data, &[batch_size as i32, max_total as i32]),
-            old_log_probs: Array::from_slice(&old_logps_data, &[batch_size as i32, max_response as i32]),
+            attention_mask: Array::from_slice(
+                &attn_mask_data,
+                &[batch_size as i32, max_total as i32],
+            ),
+            old_log_probs: Array::from_slice(
+                &old_logps_data,
+                &[batch_size as i32, max_response as i32],
+            ),
             old_values: if self.config.use_value_head {
-                Some(Array::from_slice(&values_data, &[batch_size as i32, max_response as i32]))
+                Some(Array::from_slice(
+                    &values_data,
+                    &[batch_size as i32, max_response as i32],
+                ))
             } else {
                 None
             },
             rewards: Array::from_slice(&rewards_data, &[batch_size as i32, max_response as i32]),
-            advantages: Array::from_slice(&advantages_data, &[batch_size as i32, max_response as i32]),
+            advantages: Array::from_slice(
+                &advantages_data,
+                &[batch_size as i32, max_response as i32],
+            ),
             returns: if self.config.use_value_head {
-                Some(Array::from_slice(&returns_data, &[batch_size as i32, max_response as i32]))
+                Some(Array::from_slice(
+                    &returns_data,
+                    &[batch_size as i32, max_response as i32],
+                ))
             } else {
                 None
             },
-            response_mask: Array::from_slice(&response_mask_data, &[batch_size as i32, max_response as i32]),
+            response_mask: Array::from_slice(
+                &response_mask_data,
+                &[batch_size as i32, max_response as i32],
+            ),
         })
     }
 
@@ -736,7 +755,16 @@ mod tests {
         let mask = Array::from_slice(&[1.0f32, 1.0, 1.0, 1.0], &[2, 2]);
 
         let (loss, policy_loss, _, _, kl) = trainer
-            .compute_ppo_loss(&new_logps, &old_logps, &advantages, None, None, None, &mask, None)
+            .compute_ppo_loss(
+                &new_logps,
+                &old_logps,
+                &advantages,
+                None,
+                None,
+                None,
+                &mask,
+                None,
+            )
             .unwrap();
 
         loss.eval().unwrap();
@@ -749,8 +777,7 @@ mod tests {
 
     #[test]
     fn test_adaptive_kl_update() {
-        let config = PpoConfig::new()
-            .with_adaptive_kl(0.1, 0.01);
+        let config = PpoConfig::new().with_adaptive_kl(0.1, 0.01);
         let training_config = TrainingConfig::default();
         let mut trainer = PpoTrainer::new(config, training_config).unwrap();
 

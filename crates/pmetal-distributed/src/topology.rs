@@ -285,9 +285,7 @@ impl ClusterTopology {
 
     /// Get socket addresses of all remote nodes.
     pub fn remote_socket_addrs(&self) -> Vec<SocketAddr> {
-        self.remote_nodes()
-            .filter_map(|n| n.socket_addr)
-            .collect()
+        self.remote_nodes().filter_map(|n| n.socket_addr).collect()
     }
 
     /// Check if the topology forms a valid ring for all-reduce.
@@ -317,9 +315,7 @@ impl ClusterTopology {
 
     /// Get the rank of a peer in the ring.
     pub fn ring_rank(&self, peer_id: &PeerId) -> Option<usize> {
-        self.ring_order()
-            .iter()
-            .position(|n| &n.peer_id == peer_id)
+        self.ring_order().iter().position(|n| &n.peer_id == peer_id)
     }
 
     /// Get the local node's rank in the ring.
@@ -345,10 +341,7 @@ impl ClusterTopology {
 
     /// Get the total cluster RAM (sum of all nodes).
     pub fn total_cluster_ram(&self) -> u64 {
-        self.graph
-            .node_weights()
-            .map(|n| n.profile.total_ram)
-            .sum()
+        self.graph.node_weights().map(|n| n.profile.total_ram).sum()
     }
 
     /// Prune nodes that haven't been seen recently.
@@ -393,7 +386,11 @@ impl ClusterTopology {
     pub fn thunderbolt_nodes(&self) -> Vec<&NodeInfo> {
         self.graph
             .node_weights()
-            .filter(|n| n.socket_addr.map(|a| is_thunderbolt_ip(&a.ip())).unwrap_or(false))
+            .filter(|n| {
+                n.socket_addr
+                    .map(|a| is_thunderbolt_ip(&a.ip()))
+                    .unwrap_or(false)
+            })
             .collect()
     }
 
@@ -468,7 +465,10 @@ pub type SharedTopology = Arc<RwLock<ClusterTopology>>;
 
 /// Create a new shared topology.
 pub fn new_shared_topology(local_peer_id: PeerId, local_profile: NodeProfile) -> SharedTopology {
-    Arc::new(RwLock::new(ClusterTopology::new(local_peer_id, local_profile)))
+    Arc::new(RwLock::new(ClusterTopology::new(
+        local_peer_id,
+        local_profile,
+    )))
 }
 
 #[cfg(test)]

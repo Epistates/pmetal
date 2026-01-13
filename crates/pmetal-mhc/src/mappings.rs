@@ -35,11 +35,7 @@ use ndarray::{Array1, Array2, Array3, Axis};
 /// # Returns
 ///
 /// Computed mappings (H^pre, H^post, H^res).
-pub fn compute_mappings(
-    x: &Array3<f32>,
-    params: &MhcParams,
-    config: &MhcConfig,
-) -> MhcMappings {
+pub fn compute_mappings(x: &Array3<f32>, params: &MhcParams, config: &MhcConfig) -> MhcMappings {
     let batch_size = x.shape()[0];
     let n = config.expansion_rate;
     let c = config.hidden_dim;
@@ -60,7 +56,11 @@ pub fn compute_mappings(
     let h_post = apply_scaled_sigmoid(&h_tilde_post, 2.0);
     let h_res = apply_sinkhorn(&h_tilde_res, config);
 
-    MhcMappings { h_pre, h_post, h_res }
+    MhcMappings {
+        h_pre,
+        h_post,
+        h_res,
+    }
 }
 
 /// Compute unconstrained mappings (before constraint application).
@@ -303,7 +303,9 @@ pub fn compute_mappings_backward(
         let h_t = h_tilde_res.slice(ndarray::s![b, .., ..]).to_owned();
         let g_out = grad_h_res.slice(ndarray::s![b, .., ..]).to_owned();
         let g_in = sinkhorn_knopp_backward(&h_t, &g_out, &sk_config);
-        grad_h_tilde_res.slice_mut(ndarray::s![b, .., ..]).assign(&g_in);
+        grad_h_tilde_res
+            .slice_mut(ndarray::s![b, .., ..])
+            .assign(&g_in);
     }
 
     // Backward through unconstrained mapping computation
@@ -363,7 +365,12 @@ pub fn compute_mappings_backward(
     };
 
     // Backward through RMSNorm
-    let grad_x_flat = rmsnorm_backward(&x_flat, &grad_x_norm, &params.rmsnorm_weight, config.epsilon);
+    let grad_x_flat = rmsnorm_backward(
+        &x_flat,
+        &grad_x_norm,
+        &params.rmsnorm_weight,
+        config.epsilon,
+    );
 
     // Gradient for rmsnorm weight
     let x_normalized = rmsnorm_normalize_only(&x_flat, config.epsilon);
@@ -447,9 +454,7 @@ mod tests {
         let params = MhcParams::new(&config);
 
         let batch = 8;
-        let x = Array3::from_shape_fn((batch, 4, 64), |(b, i, j)| {
-            ((b + i + j) as f32) * 0.01
-        });
+        let x = Array3::from_shape_fn((batch, 4, 64), |(b, i, j)| ((b + i + j) as f32) * 0.01);
 
         let mappings = compute_mappings(&x, &params, &config);
 

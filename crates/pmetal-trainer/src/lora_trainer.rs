@@ -5,19 +5,14 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use mlx_rs::{
+    error::Exception, module::ModuleParameters, nn, ops::indexing::IndexOp, optimizers::Optimizer,
+    transforms::eval_params, Array,
+};
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_lora::LlamaLoraForCausalLM;
 use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 use pmetal_models::architectures::llama::LlamaConfig;
-use mlx_rs::{
-    error::Exception,
-    module::ModuleParameters,
-    nn,
-    ops::indexing::IndexOp,
-    optimizers::Optimizer,
-    transforms::eval_params,
-    Array,
-};
 
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
 
@@ -201,8 +196,9 @@ impl LoraTrainer {
         // Define loss function for value_and_grad
         let loss_fn = |model: &mut LlamaLoraForCausalLM,
                        (ids, lbls): (&Array, &Array)|
-                       -> std::result::Result<Array, Exception> {
-            let logits = model.forward(ids, None)
+         -> std::result::Result<Array, Exception> {
+            let logits = model
+                .forward(ids, None)
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
             let seq_len = logits.dim(1);
@@ -344,7 +340,10 @@ impl LoraTrainer {
     ///
     /// # Arguments
     /// * `checkpoint_path` - Path to checkpoint directory
-    pub fn restore_checkpoint(&mut self, checkpoint_path: impl AsRef<std::path::Path>) -> Result<()> {
+    pub fn restore_checkpoint(
+        &mut self,
+        checkpoint_path: impl AsRef<std::path::Path>,
+    ) -> Result<()> {
         let (params, metadata) = CheckpointManager::load_checkpoint(checkpoint_path)?;
 
         // Restore parameters
@@ -409,7 +408,6 @@ pub fn compute_lm_loss(logits: &Array, labels: &Array) -> Result<Array> {
 
     Ok(loss.mean(None)?)
 }
-
 
 /// Create a simple training loop for testing.
 ///
@@ -573,7 +571,9 @@ mod tests {
         let initial_loss_val = initial_loss.item::<f32>();
 
         // Perform training step with autodiff
-        let stats = trainer.train_step(&input_ids, &labels, &mut optimizer).unwrap();
+        let stats = trainer
+            .train_step(&input_ids, &labels, &mut optimizer)
+            .unwrap();
 
         // Verify stats are reasonable
         assert!(stats.loss > 0.0);

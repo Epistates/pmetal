@@ -62,8 +62,8 @@ impl LayerType {
             LayerType::MoeExpert => 2.5, // Second most expensive
             LayerType::Mlp => 1.5,
             LayerType::MoeRouter => 0.5, // Cheap
-            LayerType::Norm => 0.2,       // Very cheap
-            LayerType::Embedding => 0.1,  // Just lookup
+            LayerType::Norm => 0.2,      // Very cheap
+            LayerType::Embedding => 0.1, // Just lookup
             LayerType::Output => 0.1,
             LayerType::Unknown => 1.0,
         }
@@ -244,7 +244,8 @@ impl ActivationStore {
 
         // For now, store in memory as fallback
         // TODO: Implement proper disk serialization using safetensors
-        self.memory_store.insert(key.to_string(), activation.clone());
+        self.memory_store
+            .insert(key.to_string(), activation.clone());
         self.disk_store.insert(key.to_string(), file_path);
 
         Ok(())
@@ -287,10 +288,7 @@ impl ActivationStore {
 
     /// Get estimated memory usage.
     pub fn memory_usage(&self) -> usize {
-        self.memory_store
-            .values()
-            .map(|arr| arr.nbytes())
-            .sum()
+        self.memory_store.values().map(|arr| arr.nbytes()).sum()
     }
 }
 
@@ -389,7 +387,8 @@ impl SmartCheckpointContext {
 
     /// Get policy for current layer.
     pub fn current_policy(&self) -> CheckpointPolicy {
-        let layer_type = self.layer_types
+        let layer_type = self
+            .layer_types
             .get(self.current_layer)
             .copied()
             .unwrap_or(LayerType::Unknown);
@@ -514,10 +513,7 @@ impl SmartCheckpointStats {
 }
 
 /// Helper to create layer type list for common architectures.
-pub fn create_transformer_layer_types(
-    num_layers: usize,
-    has_moe: bool,
-) -> Vec<LayerType> {
+pub fn create_transformer_layer_types(num_layers: usize, has_moe: bool) -> Vec<LayerType> {
     let mut types = Vec::with_capacity(num_layers * 4);
 
     for _ in 0..num_layers {

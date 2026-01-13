@@ -1,8 +1,8 @@
 //! Model and dataset downloading from HuggingFace Hub.
 
-use pmetal_core::{Result, SecretString};
 use hf_hub::api::tokio::{Api, ApiBuilder};
 use hf_hub::{Repo, RepoType};
+use pmetal_core::{Result, SecretString};
 use std::path::PathBuf;
 
 /// Build API with optional token authentication.

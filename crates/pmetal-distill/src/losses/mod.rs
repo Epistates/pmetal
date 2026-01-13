@@ -31,20 +31,20 @@
 
 use std::ops::Neg;
 
-mod kl_divergence;
-mod jensen_shannon;
-mod soft_cross_entropy;
-mod mse;
 pub mod hidden_state;
+mod jensen_shannon;
+mod kl_divergence;
+mod mse;
+mod soft_cross_entropy;
 
-pub use kl_divergence::KlDivergenceLoss;
-pub use jensen_shannon::JensenShannonLoss;
-pub use soft_cross_entropy::SoftCrossEntropyLoss;
-pub use mse::MseLoss;
 pub use hidden_state::HiddenStateLoss;
+pub use jensen_shannon::JensenShannonLoss;
+pub use kl_divergence::KlDivergenceLoss;
+pub use mse::MseLoss;
+pub use soft_cross_entropy::SoftCrossEntropyLoss;
 
-use mlx_rs::Array;
 use crate::Result;
+use mlx_rs::Array;
 
 /// Trait for distillation loss functions.
 pub trait DistillLoss: Send + Sync {
@@ -115,7 +115,9 @@ impl CombinedLoss {
         labels: &Array,
     ) -> Result<Array> {
         // Soft loss (temperature-scaled KL/CE between teacher and student)
-        let soft = self.soft_loss.compute(teacher_logits, student_logits, self.temperature)?;
+        let soft = self
+            .soft_loss
+            .compute(teacher_logits, student_logits, self.temperature)?;
 
         // Hard loss (cross-entropy with ground truth)
         let hard = cross_entropy_with_logits(student_logits, labels)?;

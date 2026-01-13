@@ -86,11 +86,21 @@ pub struct GraniteConfig {
     pub use_shared_expert: bool,
 }
 
-fn default_true() -> bool { true }
-fn default_mamba_state_dim() -> i32 { 128 }
-fn default_mamba_conv_dim() -> i32 { 4 }
-fn default_num_experts() -> i32 { 8 }
-fn default_num_experts_per_tok() -> i32 { 2 }
+fn default_true() -> bool {
+    true
+}
+fn default_mamba_state_dim() -> i32 {
+    128
+}
+fn default_mamba_conv_dim() -> i32 {
+    4
+}
+fn default_num_experts() -> i32 {
+    8
+}
+fn default_num_experts_per_tok() -> i32 {
+    2
+}
 
 impl Default for GraniteConfig {
     fn default() -> Self {
@@ -142,10 +152,7 @@ impl GraniteConfig {
         Self {
             is_hybrid: true,
             // Typical pattern: alternating attention and mamba layers
-            layer_types: Some(vec![
-                GraniteLayerType::Attention,
-                GraniteLayerType::Mamba2,
-            ]),
+            layer_types: Some(vec![GraniteLayerType::Attention, GraniteLayerType::Mamba2]),
             ..Default::default()
         }
     }
@@ -186,18 +193,42 @@ impl GraniteConfig {
 }
 
 impl ModelConfig for GraniteConfig {
-    fn model_type(&self) -> &str { "granite" }
-    fn vocab_size(&self) -> i32 { self.vocab_size }
-    fn hidden_size(&self) -> i32 { self.hidden_size }
-    fn num_hidden_layers(&self) -> i32 { self.num_hidden_layers }
-    fn num_attention_heads(&self) -> i32 { self.num_attention_heads }
-    fn num_kv_heads(&self) -> i32 { self.num_key_value_heads }
-    fn head_dim(&self) -> i32 { self.head_dim }
-    fn intermediate_size(&self) -> i32 { self.intermediate_size }
-    fn max_position_embeddings(&self) -> i32 { self.max_position_embeddings }
-    fn norm_eps(&self) -> f32 { self.rms_norm_eps }
-    fn rope_theta(&self) -> f32 { self.rope_theta }
-    fn tie_word_embeddings(&self) -> bool { self.tie_word_embeddings }
+    fn model_type(&self) -> &str {
+        "granite"
+    }
+    fn vocab_size(&self) -> i32 {
+        self.vocab_size
+    }
+    fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+    fn num_hidden_layers(&self) -> i32 {
+        self.num_hidden_layers
+    }
+    fn num_attention_heads(&self) -> i32 {
+        self.num_attention_heads
+    }
+    fn num_kv_heads(&self) -> i32 {
+        self.num_key_value_heads
+    }
+    fn head_dim(&self) -> i32 {
+        self.head_dim
+    }
+    fn intermediate_size(&self) -> i32 {
+        self.intermediate_size
+    }
+    fn max_position_embeddings(&self) -> i32 {
+        self.max_position_embeddings
+    }
+    fn norm_eps(&self) -> f32 {
+        self.rms_norm_eps
+    }
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
 }
 
 // =============================================================================
@@ -226,7 +257,11 @@ impl GraniteMLP {
         let down_proj = nn::LinearBuilder::new(intermediate_size, hidden_size)
             .bias(false)
             .build()?;
-        Ok(Self { gate_proj, up_proj, down_proj })
+        Ok(Self {
+            gate_proj,
+            up_proj,
+            down_proj,
+        })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
@@ -361,7 +396,8 @@ impl GraniteMamba2 {
             .build()?;
 
         // 1D conv weight [conv_dim, hidden_size]
-        let conv1d_weight = mlx_rs::random::normal::<f32>(&[conv_dim, hidden_size], None, None, None)?;
+        let conv1d_weight =
+            mlx_rs::random::normal::<f32>(&[conv_dim, hidden_size], None, None, None)?;
 
         let out_proj = nn::LinearBuilder::new(hidden_size, hidden_size)
             .bias(false)
@@ -456,11 +492,12 @@ impl GraniteDecoderLayer {
         // Mixer (attention or mamba)
         let mixer_out = match self.layer_type {
             GraniteLayerType::Attention => {
-                self.attention.as_mut().unwrap().forward(&normed, mask, position_ids)?
+                self.attention
+                    .as_mut()
+                    .unwrap()
+                    .forward(&normed, mask, position_ids)?
             }
-            GraniteLayerType::Mamba2 => {
-                self.mamba.as_mut().unwrap().forward(&normed)?
-            }
+            GraniteLayerType::Mamba2 => self.mamba.as_mut().unwrap().forward(&normed)?,
         };
 
         let h = x.add(&mixer_out)?;
@@ -537,16 +574,22 @@ impl GraniteForCausalLM {
     pub fn new(config: GraniteConfig) -> Result<Self, Exception> {
         // Only create separate lm_head if not tied
         let lm_head = if !config.tie_word_embeddings {
-            Some(nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
-                .bias(false)
-                .build()?)
+            Some(
+                nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
+                    .bias(false)
+                    .build()?,
+            )
         } else {
             None
         };
 
         let model = GraniteModel::new(config.clone())?;
 
-        Ok(Self { config, model, lm_head })
+        Ok(Self {
+            config,
+            model,
+            lm_head,
+        })
     }
 
     pub fn forward(

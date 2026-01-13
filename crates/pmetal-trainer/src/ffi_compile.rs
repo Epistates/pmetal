@@ -167,10 +167,7 @@ where
         {
             // Use MLX's array set to update in place
             unsafe {
-                mlx_sys::mlx_array_set(
-                    &mut state_ref.as_ptr() as *mut _,
-                    new_val.as_ptr(),
-                );
+                mlx_sys::mlx_array_set(&mut state_ref.as_ptr() as *mut _, new_val.as_ptr());
             }
         }
     }
@@ -444,9 +441,7 @@ pub mod raw_ffi {
         pub fn from_arrays(arrays: &[Array]) -> std::result::Result<Self, Exception> {
             // Collect raw pointers
             let ptrs: Vec<mlx_sys::mlx_array> = arrays.iter().map(|a| a.as_ptr()).collect();
-            let vec = unsafe {
-                mlx_sys::mlx_vector_array_new_data(ptrs.as_ptr(), ptrs.len())
-            };
+            let vec = unsafe { mlx_sys::mlx_vector_array_new_data(ptrs.as_ptr(), ptrs.len()) };
             if vec.ctx.is_null() {
                 return Err(Exception::custom("Failed to create vector array"));
             }
@@ -459,9 +454,7 @@ pub mod raw_ffi {
             let mut arrays = Vec::with_capacity(size);
             for i in 0..size {
                 let mut arr = unsafe { mlx_sys::mlx_array_new() };
-                let result = unsafe {
-                    mlx_sys::mlx_vector_array_get(&mut arr, self.vec, i)
-                };
+                let result = unsafe { mlx_sys::mlx_vector_array_get(&mut arr, self.vec, i) };
                 if result != 0 {
                     return Err(Exception::custom("Failed to get array from vector"));
                 }
@@ -534,11 +527,7 @@ pub mod raw_ffi {
     ) -> std::result::Result<RawVectorArray, Exception> {
         let mut outputs = RawVectorArray::new();
         let result = unsafe {
-            mlx_sys::mlx_closure_apply(
-                outputs.as_mut_ptr(),
-                closure.as_ptr(),
-                inputs.as_ptr(),
-            )
+            mlx_sys::mlx_closure_apply(outputs.as_mut_ptr(), closure.as_ptr(), inputs.as_ptr())
         };
         if result != 0 {
             return Err(Exception::custom("Failed to apply closure"));
@@ -627,7 +616,9 @@ pub mod raw_ffi {
             unsafe {
                 rust_closure_destructor(payload);
             }
-            return Err(Exception::custom("Failed to create closure from Rust function"));
+            return Err(Exception::custom(
+                "Failed to create closure from Rust function",
+            ));
         }
 
         Ok(RawClosure { closure })
@@ -711,10 +702,8 @@ pub fn clip_grad_norm(
     let clip_coef = max_norm_arr.divide(&mlx_rs::ops::maximum(&total_norm, &max_norm_arr)?)?;
 
     // Scale all gradients
-    let clipped: std::result::Result<Vec<Array>, Exception> = grads
-        .iter()
-        .map(|g| g.multiply(&clip_coef))
-        .collect();
+    let clipped: std::result::Result<Vec<Array>, Exception> =
+        grads.iter().map(|g| g.multiply(&clip_coef)).collect();
 
     clipped
 }
@@ -841,11 +830,15 @@ pub fn stateless_optimizer_step(
             let v = &opt_state[i * 2 + 1];
 
             // m = beta1 * m + (1 - beta1) * grad
-            let new_m = beta1.multiply(m)?.add(&Array::from_f32(1.0 - 0.9).multiply(grad)?)?;
+            let new_m = beta1
+                .multiply(m)?
+                .add(&Array::from_f32(1.0 - 0.9).multiply(grad)?)?;
 
             // v = beta2 * v + (1 - beta2) * grad^2
             let grad_sq = grad.multiply(grad)?;
-            let new_v = beta2.multiply(v)?.add(&Array::from_f32(1.0 - 0.999).multiply(&grad_sq)?)?;
+            let new_v = beta2
+                .multiply(v)?
+                .add(&Array::from_f32(1.0 - 0.999).multiply(&grad_sq)?)?;
 
             // param = param - lr * m / (sqrt(v) + eps)
             let denom = new_v.sqrt()?.add(&eps)?;
@@ -990,8 +983,8 @@ mod tests {
         let sum_result: Vec<f32> = outputs[0].as_slice().to_vec();
         let prod_result: Vec<f32> = outputs[1].as_slice().to_vec();
 
-        assert!((sum_result[0] - 4.0).abs() < 1e-5);  // 1 + 3
-        assert!((sum_result[1] - 6.0).abs() < 1e-5);  // 2 + 4
+        assert!((sum_result[0] - 4.0).abs() < 1e-5); // 1 + 3
+        assert!((sum_result[1] - 6.0).abs() < 1e-5); // 2 + 4
         assert!((prod_result[0] - 3.0).abs() < 1e-5); // 1 * 3
         assert!((prod_result[1] - 8.0).abs() < 1e-5); // 2 * 4
     }

@@ -36,7 +36,9 @@ use std::sync::Arc;
 use bytemuck::{Pod, Zeroable};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+};
 
 use crate::bridge::MetalBufferView;
 use crate::buffer::{BufferUsage, MetalBuffer};
@@ -284,14 +286,8 @@ impl FusedSampler {
         // 2. Memory sizes are computed correctly based on simd_groups and type sizes
         // 3. Indices 0 and 1 match the kernel's threadgroup memory declarations
         unsafe {
-            encoder.setThreadgroupMemoryLength_atIndex(
-                simd_groups * std::mem::size_of::<f32>(),
-                0,
-            );
-            encoder.setThreadgroupMemoryLength_atIndex(
-                simd_groups * std::mem::size_of::<u32>(),
-                1,
-            );
+            encoder.setThreadgroupMemoryLength_atIndex(simd_groups * std::mem::size_of::<f32>(), 0);
+            encoder.setThreadgroupMemoryLength_atIndex(simd_groups * std::mem::size_of::<u32>(), 1);
         }
 
         // Dispatch - single threadgroup is enough for argmax
@@ -479,14 +475,8 @@ impl FusedSampler {
         let simd_groups = (self.config.threadgroup_size + 31) / 32;
         // SAFETY: Same invariants as argmax() - see comments there
         unsafe {
-            encoder.setThreadgroupMemoryLength_atIndex(
-                simd_groups * std::mem::size_of::<f32>(),
-                0,
-            );
-            encoder.setThreadgroupMemoryLength_atIndex(
-                simd_groups * std::mem::size_of::<u32>(),
-                1,
-            );
+            encoder.setThreadgroupMemoryLength_atIndex(simd_groups * std::mem::size_of::<f32>(), 0);
+            encoder.setThreadgroupMemoryLength_atIndex(simd_groups * std::mem::size_of::<u32>(), 1);
         }
 
         let grid_size = objc2_metal::MTLSize {

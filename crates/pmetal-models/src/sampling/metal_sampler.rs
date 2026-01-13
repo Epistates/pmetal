@@ -28,13 +28,11 @@
 
 use std::sync::Arc;
 
-use pmetal_metal::{
-    bridge::metal_buffer_from_ptr, FusedSampler, MetalContext, MetalError,
-};
 use mlx_rs::Array;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLCommandBuffer;
+use pmetal_metal::{bridge::metal_buffer_from_ptr, FusedSampler, MetalContext, MetalError};
 
 /// Error type for MetalSampler operations.
 #[derive(Debug, thiserror::Error)]
@@ -148,7 +146,9 @@ impl MetalSampler {
         }
 
         // Ensure array is evaluated before getting data pointer
-        logits.eval().map_err(|_| MetalSamplerError::NonContiguous)?;
+        logits
+            .eval()
+            .map_err(|_| MetalSamplerError::NonContiguous)?;
 
         // Check dtype - must be f32
         let dtype = logits.dtype();
@@ -163,18 +163,12 @@ impl MetalSampler {
 
         // Create zero-copy buffer view
         // SAFETY: MLX uses unified memory, pointer is valid for GPU access
-        let buffer_view = unsafe {
-            metal_buffer_from_ptr(&self.ctx, data_ptr, logits.size())?
-        };
+        let buffer_view = unsafe { metal_buffer_from_ptr(&self.ctx, data_ptr, logits.size())? };
 
         // Dispatch kernel asynchronously
-        let cmd = self.fused.sample_async(
-            &buffer_view,
-            temperature,
-            top_k,
-            top_p,
-            min_p,
-        )?;
+        let cmd = self
+            .fused
+            .sample_async(&buffer_view, temperature, top_k, top_p, min_p)?;
 
         self.pending_cmd = Some(cmd);
         Ok(())
@@ -190,7 +184,9 @@ impl MetalSampler {
         }
 
         // Ensure array is evaluated
-        logits.eval().map_err(|_| MetalSamplerError::NonContiguous)?;
+        logits
+            .eval()
+            .map_err(|_| MetalSamplerError::NonContiguous)?;
 
         // Check dtype
         let dtype = logits.dtype();
@@ -204,9 +200,7 @@ impl MetalSampler {
 
         // Create zero-copy buffer view
         // SAFETY: MLX uses unified memory, pointer is valid for GPU access
-        let buffer_view = unsafe {
-            metal_buffer_from_ptr(&self.ctx, data_ptr, logits.size())?
-        };
+        let buffer_view = unsafe { metal_buffer_from_ptr(&self.ctx, data_ptr, logits.size())? };
 
         // Dispatch kernel
         let cmd = self.fused.argmax_async(&buffer_view)?;
@@ -223,9 +217,9 @@ impl MetalSampler {
 
             // Check for errors
             if let Some(error) = cmd.error() {
-                return Err(MetalSamplerError::Metal(
-                    MetalError::ExecutionFailed(error.to_string()),
-                ));
+                return Err(MetalSamplerError::Metal(MetalError::ExecutionFailed(
+                    error.to_string(),
+                )));
             }
         }
 

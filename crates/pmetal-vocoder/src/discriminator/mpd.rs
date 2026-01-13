@@ -107,7 +107,8 @@ impl PeriodDiscriminator {
         }
 
         // Final 1x1 conv to single channel
-        let conv_post = WeightNormConv1d::new(1024, 1, 3, Some(1), Some(1), None, None, Some(true))?;
+        let conv_post =
+            WeightNormConv1d::new(1024, 1, 3, Some(1), Some(1), None, None, Some(true))?;
 
         Ok(Self {
             period,

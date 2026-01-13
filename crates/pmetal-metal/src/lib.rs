@@ -75,26 +75,31 @@ pub use buffer::{BufferUsage, MetalBuffer};
 pub use context::MetalContext;
 pub use error::{MetalError, Result};
 pub use kernels::flash_attention::{
-    FlashAttention, FlashAttentionConfig, FlashAttentionOutput,
-    FlashAttentionVarlen, FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,
+    FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,
+    FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,
 };
 pub use kernels::fused_cross_entropy::{
-    FusedCrossEntropy, FusedCrossEntropyConfig, FusedCrossEntropyOutput,
+    FusedCrossEntropy,
+    FusedCrossEntropyConfig,
+    FusedCrossEntropyOutput,
     // Key unsloth optimization: fused linear + cross-entropy (skips logits materialization)
-    FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig, FusedLinearCrossEntropyOutput,
+    FusedLinearCrossEntropy,
+    FusedLinearCrossEntropyConfig,
+    FusedLinearCrossEntropyOutput,
 };
 pub use kernels::fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use kernels::fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use kernels::fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};
 pub use kernels::fused_sampler::{AsMetalBuffer, FusedSampler, FusedSamplerConfig, SamplingParams};
-pub use kernels::fused_swiglu::{FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput};
+pub use kernels::fused_swiglu::{
+    FusedMLP, FusedMLPOutput, FusedSwiGLU, FusedSwiGLUConfig, FusedSwiGLUOutput,
+};
 pub use pipeline::{FunctionConstant, PipelineCache};
 
 // Async command buffer scheduling
 pub use async_scheduler::{
-    AsyncScheduler, AsyncBatchBuilder, CompletionToken, DoubleBuffer,
-    GpuCompletionToken, InFlightBuffer, SchedulerStats, TripleBuffer,
-    DEFAULT_GPU_TIMEOUT,
+    AsyncBatchBuilder, AsyncScheduler, CompletionToken, DoubleBuffer, GpuCompletionToken,
+    InFlightBuffer, SchedulerStats, TripleBuffer, DEFAULT_GPU_TIMEOUT,
 };
 
 /// Prelude for convenient imports.
@@ -103,12 +108,11 @@ pub mod prelude {
     pub use crate::context::MetalContext;
     pub use crate::error::{MetalError, Result};
     pub use crate::kernels::flash_attention::{
-        FlashAttention, FlashAttentionConfig,
-        FlashAttentionVarlen, FlashAttentionVarlenConfig,
+        FlashAttention, FlashAttentionConfig, FlashAttentionVarlen, FlashAttentionVarlenConfig,
     };
     pub use crate::kernels::fused_cross_entropy::{
-        FusedCrossEntropy, FusedCrossEntropyConfig,
-        FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig,
+        FusedCrossEntropy, FusedCrossEntropyConfig, FusedLinearCrossEntropy,
+        FusedLinearCrossEntropyConfig,
     };
     pub use crate::kernels::fused_lora::{FusedLora, FusedLoraConfig};
     pub use crate::kernels::fused_sampler::{FusedSampler, FusedSamplerConfig};

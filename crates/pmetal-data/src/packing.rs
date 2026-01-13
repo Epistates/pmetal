@@ -143,7 +143,11 @@ impl PackedBatch {
         for &len in &self.seq_lengths {
             let len = len as usize;
             for i in 0..len {
-                let start = if i >= window_size { i - window_size + 1 } else { 0 };
+                let start = if i >= window_size {
+                    i - window_size + 1
+                } else {
+                    0
+                };
                 for j in start..=i {
                     mask[(offset + i) * n + (offset + j)] = 0.0;
                 }
@@ -709,12 +713,7 @@ pub struct PackedDataLoader {
 
 impl PackedDataLoader {
     /// Create a new PackedDataLoader from samples.
-    pub fn new(
-        samples: &[Sample],
-        config: PackerConfig,
-        shuffle: bool,
-        seed: u64,
-    ) -> Result<Self> {
+    pub fn new(samples: &[Sample], config: PackerConfig, shuffle: bool, seed: u64) -> Result<Self> {
         let packer = SequencePacker::new(config);
         let batches = packer.pack(samples)?;
 
@@ -733,7 +732,12 @@ impl PackedDataLoader {
         let max_len = self.packer.config.max_length;
         let total_capacity: usize = self.batches.len() * max_len;
         let num_sequences: usize = self.batches.iter().map(|b| b.num_sequences).sum();
-        let max_seqs_per_batch = self.batches.iter().map(|b| b.num_sequences).max().unwrap_or(0);
+        let max_seqs_per_batch = self
+            .batches
+            .iter()
+            .map(|b| b.num_sequences)
+            .max()
+            .unwrap_or(0);
 
         PackingStats {
             total_tokens,
@@ -951,12 +955,12 @@ mod tests {
     fn test_ffd_packing_efficiency() {
         // Create samples with varying lengths that benefit from FFD
         let samples = vec![
-            make_sample(vec![1; 8], None),  // 8 tokens
-            make_sample(vec![2; 2], None),  // 2 tokens
-            make_sample(vec![3; 7], None),  // 7 tokens
-            make_sample(vec![4; 3], None),  // 3 tokens
-            make_sample(vec![5; 5], None),  // 5 tokens
-            make_sample(vec![6; 5], None),  // 5 tokens
+            make_sample(vec![1; 8], None), // 8 tokens
+            make_sample(vec![2; 2], None), // 2 tokens
+            make_sample(vec![3; 7], None), // 7 tokens
+            make_sample(vec![4; 3], None), // 3 tokens
+            make_sample(vec![5; 5], None), // 5 tokens
+            make_sample(vec![6; 5], None), // 5 tokens
         ];
         // Total: 30 tokens
 
@@ -1055,15 +1059,13 @@ mod tests {
     #[test]
     fn test_min_length_filter() {
         let samples = vec![
-            make_sample(vec![1], None),     // Too short
-            make_sample(vec![2, 3], None),  // OK
-            make_sample(vec![4], None),     // Too short
+            make_sample(vec![1], None),       // Too short
+            make_sample(vec![2, 3], None),    // OK
+            make_sample(vec![4], None),       // Too short
             make_sample(vec![5, 6, 7], None), // OK
         ];
 
-        let packer = SequencePacker::new(
-            PackerConfig::with_max_length(10).with_min_length(2)
-        );
+        let packer = SequencePacker::new(PackerConfig::with_max_length(10).with_min_length(2));
         let batches = packer.pack(&samples).unwrap();
 
         let total_tokens: usize = batches.iter().map(|b| b.total_tokens()).sum();

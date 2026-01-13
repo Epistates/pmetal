@@ -6,18 +6,13 @@
 //! - RMSNorm applied to Q and K before RoPE (q_norm, k_norm)
 //! - SwitchGLU-style expert MLP with gather_mm
 
+use mlx_rs::{
+    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
+    ops::indexing::IndexOp, Array,
+};
 use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
-use mlx_rs::{
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::Module,
-    nn,
-    ops::indexing::IndexOp,
-    Array,
-};
 use serde::{Deserialize, Serialize};
 
 /// Qwen3-MoE model configuration.
@@ -368,13 +363,9 @@ impl Qwen3MoEBlock {
             .bias(false)
             .build()?;
 
-        let moe_config = MoEConfig::new(
-            config.hidden_size,
-            moe_intermediate,
-            num_experts,
-        )
-        .with_num_experts_per_tok(config.num_experts_per_tok as usize)
-        .with_aux_loss(false, 0.0);
+        let moe_config = MoEConfig::new(config.hidden_size, moe_intermediate, num_experts)
+            .with_num_experts_per_tok(config.num_experts_per_tok as usize)
+            .with_aux_loss(false, 0.0);
 
         let moe = MoELayer::new(moe_config);
 
@@ -628,7 +619,7 @@ mod tests {
         let config = Qwen3MoEConfig::default();
         assert_eq!(config.num_experts, 64);
         assert_eq!(config.num_experts_per_tok, 8);
-        assert!(config.use_moe_at(0));  // Layer 0 should use MoE with sparse_step=1
+        assert!(config.use_moe_at(0)); // Layer 0 should use MoE with sparse_step=1
     }
 
     #[test]
@@ -637,14 +628,14 @@ mod tests {
 
         // With sparse_step=2, only odd layers (0-indexed layer 1, 3, 5...) should be MoE
         config.decoder_sparse_step = 2;
-        assert!(!config.use_moe_at(0));  // Layer 1: 0+1=1, 1%2=1 != 0
-        assert!(config.use_moe_at(1));   // Layer 2: 1+1=2, 2%2=0
-        assert!(!config.use_moe_at(2));  // Layer 3: 2+1=3, 3%2=1 != 0
-        assert!(config.use_moe_at(3));   // Layer 4: 3+1=4, 4%2=0
+        assert!(!config.use_moe_at(0)); // Layer 1: 0+1=1, 1%2=1 != 0
+        assert!(config.use_moe_at(1)); // Layer 2: 1+1=2, 2%2=0
+        assert!(!config.use_moe_at(2)); // Layer 3: 2+1=3, 3%2=1 != 0
+        assert!(config.use_moe_at(3)); // Layer 4: 3+1=4, 4%2=0
 
         // Test mlp_only_layers
         config.mlp_only_layers = vec![1];
-        assert!(!config.use_moe_at(1));  // Forced to dense
+        assert!(!config.use_moe_at(1)); // Forced to dense
     }
 
     #[test]

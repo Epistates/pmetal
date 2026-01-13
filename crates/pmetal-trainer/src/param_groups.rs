@@ -86,10 +86,10 @@ impl Default for ParameterGroupConfig {
             embedding_patterns: vec![
                 "embed_tokens".to_string(),
                 "lm_head".to_string(),
-                "wte".to_string(),      // GPT-2 style
-                "wpe".to_string(),      // Position embeddings
+                "wte".to_string(),        // GPT-2 style
+                "wpe".to_string(),        // Position embeddings
                 "token_embd".to_string(), // GGUF style
-                "output".to_string(),   // Output projection
+                "output".to_string(),     // Output projection
             ],
         }
     }
@@ -226,11 +226,7 @@ pub fn create_parameter_groups<'a>(
 }
 
 /// Get the learning rate for a specific parameter.
-pub fn get_param_lr(
-    param_name: &str,
-    groups: &[ParameterGroup],
-    default_lr: f64,
-) -> f64 {
+pub fn get_param_lr(param_name: &str, groups: &[ParameterGroup], default_lr: f64) -> f64 {
     for group in groups {
         if group.contains(param_name) {
             return group.learning_rate;
@@ -264,22 +260,24 @@ mod tests {
             "lm_head.weight",
         ];
 
-        let groups = create_parameter_groups(
-            param_names.iter().map(|s| *s),
-            2e-4,
-            Some(5e-5),
-            0.01,
-        );
+        let groups =
+            create_parameter_groups(param_names.iter().map(|s| *s), 2e-4, Some(5e-5), 0.01);
 
         assert_eq!(groups.len(), 2);
 
         // Find embedding group
-        let embedding_group = groups.iter().find(|g| g.description == "embeddings").unwrap();
+        let embedding_group = groups
+            .iter()
+            .find(|g| g.description == "embeddings")
+            .unwrap();
         assert_eq!(embedding_group.len(), 2); // embed_tokens and lm_head
         assert!((embedding_group.learning_rate - 5e-5).abs() < 1e-10);
 
         // Find non-embedding group
-        let non_embedding_group = groups.iter().find(|g| g.description == "non_embeddings").unwrap();
+        let non_embedding_group = groups
+            .iter()
+            .find(|g| g.description == "non_embeddings")
+            .unwrap();
         assert_eq!(non_embedding_group.len(), 3); // 3 LoRA params
         assert!((non_embedding_group.learning_rate - 2e-4).abs() < 1e-10);
     }
@@ -334,10 +332,16 @@ mod tests {
 
         let groups = builder.build();
 
-        let embedding_group = groups.iter().find(|g| g.description == "embeddings").unwrap();
+        let embedding_group = groups
+            .iter()
+            .find(|g| g.description == "embeddings")
+            .unwrap();
         assert!(embedding_group.contains("my_custom_embedding.weight"));
 
-        let non_embedding_group = groups.iter().find(|g| g.description == "non_embeddings").unwrap();
+        let non_embedding_group = groups
+            .iter()
+            .find(|g| g.description == "non_embeddings")
+            .unwrap();
         assert!(non_embedding_group.contains("regular_layer.weight"));
     }
 }

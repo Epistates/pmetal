@@ -3,8 +3,8 @@
 //! Sparsification reduces interference when merging models by keeping only
 //! the most important parameters (by some criterion) and zeroing the rest.
 
-use mlx_rs::Array;
 use crate::Result;
+use mlx_rs::Array;
 
 /// Sparsify a tensor by keeping only the top `density` fraction by magnitude.
 ///
@@ -76,9 +76,8 @@ pub fn sparsify_breadcrumbs(tensor: &Array, density: f32, gamma: f32) -> Result<
     let abs_slice: Vec<f32> = abs_vals.as_slice().to_vec();
 
     // Get sorted magnitudes with indices
-    let mut indexed: Vec<(usize, f32)> = abs_slice.iter().enumerate()
-        .map(|(i, &v)| (i, v))
-        .collect();
+    let mut indexed: Vec<(usize, f32)> =
+        abs_slice.iter().enumerate().map(|(i, &v)| (i, v)).collect();
     indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
     // Determine thresholds
@@ -88,7 +87,11 @@ pub fn sparsify_breadcrumbs(tensor: &Array, density: f32, gamma: f32) -> Result<
 
     // Create mask
     let mut mask = vec![0.0_f32; n];
-    for (idx, _) in indexed.iter().skip(lower_k).take(upper_k.saturating_sub(lower_k)) {
+    for (idx, _) in indexed
+        .iter()
+        .skip(lower_k)
+        .take(upper_k.saturating_sub(lower_k))
+    {
         mask[*idx] = 1.0;
     }
 
@@ -157,7 +160,7 @@ mod tests {
         // Values sorted by magnitude: 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0
         let tensor = Array::from_slice(
             &[0.5_f32, 1.0, 0.3, 0.8, 0.1, 0.6, 0.9, 0.4, 0.2, 0.7],
-            &[10]
+            &[10],
         );
 
         // Keep middle 50% (indices 2-7 in sorted order), remove smallest and largest

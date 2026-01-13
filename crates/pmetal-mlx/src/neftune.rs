@@ -101,10 +101,7 @@ impl NEFTuneConfig {
 ///
 /// # Returns
 /// Embeddings with noise added (or original if disabled).
-pub fn apply_neftune(
-    embeddings: &Array,
-    config: &NEFTuneConfig,
-) -> Result<Array, Exception> {
+pub fn apply_neftune(embeddings: &Array, config: &NEFTuneConfig) -> Result<Array, Exception> {
     if !config.enabled || config.alpha == 0.0 {
         return Ok(embeddings.clone());
     }
@@ -112,7 +109,7 @@ pub fn apply_neftune(
     let shape = embeddings.shape();
     if shape.len() < 2 {
         return Err(Exception::custom(
-            "NEFTune requires at least 2D embeddings [seq, hidden] or [batch, seq, hidden]"
+            "NEFTune requires at least 2D embeddings [seq, hidden] or [batch, seq, hidden]",
         ));
     }
 
@@ -127,12 +124,7 @@ pub fn apply_neftune(
     let magnitude = config.alpha / (seq_len * hidden_dim).sqrt();
 
     // Generate uniform noise in [-1, 1]
-    let noise = mlx_rs::random::uniform::<_, f32>(
-        -1.0f32,
-        1.0f32,
-        shape,
-        None,
-    )?;
+    let noise = mlx_rs::random::uniform::<_, f32>(-1.0f32, 1.0f32, shape, None)?;
 
     // Scale noise
     let scaled_noise = noise.multiply(Array::from_f32(magnitude))?;

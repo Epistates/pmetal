@@ -137,11 +137,11 @@ impl AdamWGroups {
 
         // Maintain the ratio if there was a custom embedding LR, otherwise same as base
         let ratio = if (current_base - current_embedding).abs() < 1e-10 {
-            1.0  // Same LR for both
+            1.0 // Same LR for both
         } else if current_base > 1e-10 {
             current_embedding / current_base
         } else {
-            1.0  // Fallback to same LR
+            1.0 // Fallback to same LR
         };
 
         let new_embedding_lr = base_lr * ratio;
@@ -184,7 +184,8 @@ impl Optimizer for AdamWGroups {
         parameter: &mut Array,
     ) -> Result<()> {
         if self.is_embedding_param(key) {
-            self.embedding_optimizer.update_single(key, gradient, parameter)
+            self.embedding_optimizer
+                .update_single(key, gradient, parameter)
         } else {
             self.lora_optimizer.update_single(key, gradient, parameter)
         }

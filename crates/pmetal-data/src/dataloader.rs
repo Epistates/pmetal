@@ -164,7 +164,7 @@ impl DataLoader {
         let mut input_ids_flat = Vec::with_capacity(batch_size * max_len);
         let mut labels_flat = Vec::with_capacity(batch_size * max_len);
         let mut attention_mask_flat = Vec::with_capacity(batch_size * max_len);
-        
+
         // Image processing
         let mut pixel_tensors = Vec::new();
         let mut has_images = false;
@@ -183,7 +183,9 @@ impl DataLoader {
                                 Err(e) => {
                                     tracing::error!(
                                         "Failed to process image {} in sample {}: {}",
-                                        path.display(), idx, e
+                                        path.display(),
+                                        idx,
+                                        e
                                     );
                                     // Fail explicitly - silent corruption is worse
                                     panic!(
@@ -217,7 +219,8 @@ impl DataLoader {
 
             // Input IDs
             input_ids_flat.extend(sample.input_ids.iter().take(seq_len).map(|&x| x as i32));
-            input_ids_flat.extend(std::iter::repeat(self.config.pad_token_id as i32).take(max_len - seq_len));
+            input_ids_flat
+                .extend(std::iter::repeat(self.config.pad_token_id as i32).take(max_len - seq_len));
 
             // Labels
             if let Some(ref labels) = sample.labels {
@@ -237,8 +240,9 @@ impl DataLoader {
         // Convert to mlx Arrays
         let input_ids = Array::from_slice(&input_ids_flat, &[batch_size as i32, max_len as i32]);
         let labels = Array::from_slice(&labels_flat, &[batch_size as i32, max_len as i32]);
-        let attention_mask = Array::from_slice(&attention_mask_flat, &[batch_size as i32, max_len as i32]);
-        
+        let attention_mask =
+            Array::from_slice(&attention_mask_flat, &[batch_size as i32, max_len as i32]);
+
         let pixel_values = if has_images && !pixel_tensors.is_empty() {
             // Concatenate along batch dim (0)
             mlx_rs::ops::concatenate(&pixel_tensors).ok()
@@ -327,9 +331,7 @@ mod tests {
 
     #[test]
     fn test_dataloader_drop_last() {
-        let samples: Vec<Sample> = (0..10)
-            .map(|i| Sample::new(vec![i as u32]))
-            .collect();
+        let samples: Vec<Sample> = (0..10).map(|i| Sample::new(vec![i as u32])).collect();
         let dataset = TrainingDataset::from_samples(samples);
 
         let config = DataLoaderConfig {
@@ -374,7 +376,7 @@ mod tests {
     fn test_dataloader_padding() {
         let samples = vec![
             Sample::new(vec![1, 2, 3]),
-            Sample::new(vec![4, 5]),  // Shorter sequence
+            Sample::new(vec![4, 5]), // Shorter sequence
         ];
         let dataset = TrainingDataset::from_samples(samples);
 
@@ -389,7 +391,7 @@ mod tests {
         let mut loader = DataLoader::new(dataset, config, None);
         let batch = loader.next_batch().unwrap();
 
-        assert_eq!(batch.seq_len, 3);  // Max length in batch
+        assert_eq!(batch.seq_len, 3); // Max length in batch
         assert_eq!(batch.batch_size, 2);
 
         // Check that shorter sequence is padded
@@ -399,9 +401,7 @@ mod tests {
 
     #[test]
     fn test_batch_iterator() {
-        let samples: Vec<Sample> = (0..8)
-            .map(|i| Sample::new(vec![i as u32]))
-            .collect();
+        let samples: Vec<Sample> = (0..8).map(|i| Sample::new(vec![i as u32])).collect();
         let dataset = TrainingDataset::from_samples(samples);
 
         let iter = create_batch_iterator(dataset, 2, 10, 0, false, 42);

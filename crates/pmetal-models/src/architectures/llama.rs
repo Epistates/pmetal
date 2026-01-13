@@ -4,19 +4,14 @@
 
 use std::collections::HashMap;
 
+use mlx_rs::{
+    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn, Array,
+};
 use pmetal_mlx::kernels::{
-    differentiable_attention, fused_sdpa, get_training_context,
-    rope::apply_rope, AttentionMaskType, FusedAttentionConfig,
+    differentiable_attention, fused_sdpa, get_training_context, rope::apply_rope,
+    AttentionMaskType, FusedAttentionConfig,
 };
 use pmetal_mlx::kv_cache::KVCache;
-use mlx_rs::{
-    builder::Builder,
-    error::Exception,
-    macros::ModuleParameters,
-    module::Module,
-    nn,
-    Array,
-};
 use serde::{Deserialize, Serialize};
 
 /// Llama model configuration.
@@ -95,7 +90,8 @@ impl LlamaConfig {
 
     /// Get the head dimension.
     pub fn get_head_dim(&self) -> i32 {
-        self.head_dim.unwrap_or(self.hidden_size / self.num_attention_heads)
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 }
 
@@ -507,8 +503,11 @@ impl LlamaModel {
         match cache {
             Some(cache) => {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                    hidden_states =
-                        layer.forward_with_cache(&hidden_states, mask.as_ref(), Some((cache, layer_idx)))?;
+                    hidden_states = layer.forward_with_cache(
+                        &hidden_states,
+                        mask.as_ref(),
+                        Some((cache, layer_idx)),
+                    )?;
                 }
             }
             None => {

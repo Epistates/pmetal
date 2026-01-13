@@ -12,9 +12,9 @@
 //! - `AttentionBackward` - Full attention mechanism backward
 //! - `TransformerLayerBackward` - Complete layer backward combining all above
 
-use mlx_rs::{Array, Dtype};
 use mlx_rs::error::Exception;
 use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::{Array, Dtype};
 
 use crate::LoraError;
 
@@ -78,10 +78,7 @@ pub fn rmsnorm_forward_with_grad(
 ///
 /// The gradient is:
 /// d_x = weight / rms * (d_y - x_norm * mean(d_y * x_norm))
-pub fn rmsnorm_backward(
-    d_output: &Array,
-    saved: &RmsNormSaved,
-) -> Result<Array, LoraError> {
+pub fn rmsnorm_backward(d_output: &Array, saved: &RmsNormSaved) -> Result<Array, LoraError> {
     let hidden_size = saved.x.dim(-1) as f32;
 
     // d_y * weight (since output = x_norm * weight)
@@ -135,10 +132,7 @@ pub fn silu_forward_with_grad(x: &Array) -> Result<(Array, SiluSaved), LoraError
 ///
 /// d_silu/d_x = sigmoid(x) + x * sigmoid(x) * (1 - sigmoid(x))
 ///            = sigmoid(x) * (1 + x * (1 - sigmoid(x)))
-pub fn silu_backward(
-    d_output: &Array,
-    saved: &SiluSaved,
-) -> Result<Array, LoraError> {
+pub fn silu_backward(d_output: &Array, saved: &SiluSaved) -> Result<Array, LoraError> {
     // 1 - sigmoid(x)
     let one_minus_sigmoid = Array::from_f32(1.0).subtract(&saved.sigmoid_x)?;
 
@@ -204,10 +198,7 @@ pub fn rope_forward_with_grad(
 ///
 /// The rotation is orthogonal, so backward is inverse rotation:
 /// d_x = rotate_backward(d_output) = [d1*cos + d2*sin, -d1*sin + d2*cos]
-pub fn rope_backward(
-    d_output: &Array,
-    saved: &RopeSaved,
-) -> Result<Array, LoraError> {
+pub fn rope_backward(d_output: &Array, saved: &RopeSaved) -> Result<Array, LoraError> {
     let shape = d_output.shape();
     let head_dim = shape[shape.len() - 1];
     let half_dim = head_dim / 2;
@@ -218,7 +209,9 @@ pub fn rope_backward(
 
     // Inverse rotation: [d1*cos + d2*sin, -d1*sin + d2*cos]
     let dx1 = d1.multiply(&saved.cos)?.add(&d2.multiply(&saved.sin)?)?;
-    let dx2 = d2.multiply(&saved.cos)?.subtract(&d1.multiply(&saved.sin)?)?;
+    let dx2 = d2
+        .multiply(&saved.cos)?
+        .subtract(&d1.multiply(&saved.sin)?)?;
 
     // Concatenate
     Ok(mlx_rs::ops::concatenate_axis(&[&dx1, &dx2], -1)?)
@@ -315,7 +308,10 @@ pub fn attention_backward(
     // d_V = weights^T @ d_output
     // [batch, heads, seq, seq]^T @ [batch, heads, seq, head_dim]
     // = [batch, heads, seq, head_dim]
-    let d_v_expanded = saved.attn_weights.transpose_axes(&[0, 1, 3, 2])?.matmul(d_output)?;
+    let d_v_expanded = saved
+        .attn_weights
+        .transpose_axes(&[0, 1, 3, 2])?
+        .matmul(d_output)?;
 
     // d_weights = d_output @ V^T
     // [batch, heads, seq, head_dim] @ [batch, heads, head_dim, seq]
@@ -325,7 +321,9 @@ pub fn attention_backward(
     // Softmax backward: d_scores = weights * (d_weights - sum(d_weights * weights, axis=-1, keepdims=True))
     let weighted_d = d_weights.multiply(&saved.attn_weights)?;
     let sum_weighted = weighted_d.sum_axis(-1, true)?;
-    let d_scores = saved.attn_weights.multiply(&d_weights.subtract(&sum_weighted)?)?;
+    let d_scores = saved
+        .attn_weights
+        .multiply(&d_weights.subtract(&sum_weighted)?)?;
 
     // Scale backward
     let d_scores = d_scores.multiply(Array::from_f32(saved.scale))?;
@@ -334,7 +332,10 @@ pub fn attention_backward(
     // d_Q = d_scores @ K
     // d_K = d_scores^T @ Q = Q^T @ d_scores (then transpose)
     let d_q = d_scores.matmul(&k_expanded)?;
-    let d_k_expanded = saved.q.transpose_axes(&[0, 1, 3, 2])?.matmul(&d_scores)?
+    let d_k_expanded = saved
+        .q
+        .transpose_axes(&[0, 1, 3, 2])?
+        .matmul(&d_scores)?
         .transpose_axes(&[0, 1, 3, 2])?;
 
     // Contract GQA gradients if needed
@@ -487,17 +488,25 @@ mod tests {
         let seq_len = 8;
         let head_dim = 16;
 
-        let q = mlx_rs::random::normal::<f32>(&[batch, heads, seq_len, head_dim], None, None, None).unwrap();
-        let k = mlx_rs::random::normal::<f32>(&[batch, kv_heads, seq_len, head_dim], None, None, None).unwrap();
-        let v = mlx_rs::random::normal::<f32>(&[batch, kv_heads, seq_len, head_dim], None, None, None).unwrap();
+        let q = mlx_rs::random::normal::<f32>(&[batch, heads, seq_len, head_dim], None, None, None)
+            .unwrap();
+        let k =
+            mlx_rs::random::normal::<f32>(&[batch, kv_heads, seq_len, head_dim], None, None, None)
+                .unwrap();
+        let v =
+            mlx_rs::random::normal::<f32>(&[batch, kv_heads, seq_len, head_dim], None, None, None)
+                .unwrap();
 
         let scale = (head_dim as f32).sqrt().recip();
         let num_heads_per_kv = heads / kv_heads;
 
-        let (output, saved) = attention_forward_with_grad(&q, &k, &v, None, scale, num_heads_per_kv).unwrap();
+        let (output, saved) =
+            attention_forward_with_grad(&q, &k, &v, None, scale, num_heads_per_kv).unwrap();
         assert_eq!(output.shape(), &[batch, heads, seq_len, head_dim]);
 
-        let d_output = mlx_rs::random::normal::<f32>(&[batch, heads, seq_len, head_dim], None, None, None).unwrap();
+        let d_output =
+            mlx_rs::random::normal::<f32>(&[batch, heads, seq_len, head_dim], None, None, None)
+                .unwrap();
         let (d_q, d_k, d_v) = attention_backward(&d_output, &saved).unwrap();
 
         assert_eq!(d_q.shape(), q.shape());

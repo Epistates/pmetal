@@ -86,9 +86,7 @@ impl RopeScaling {
             RopeScaling::NtkAware { factor, alpha } => {
                 base * (alpha * factor - alpha + 1.0).powf(dims as f32 / (dims - 2) as f32)
             }
-            RopeScaling::Yarn(config) => {
-                config.compute_base(base, dims)
-            }
+            RopeScaling::Yarn(config) => config.compute_base(base, dims),
         }
     }
 }
@@ -293,7 +291,9 @@ pub fn apply_rope_with_positions(
     // Apply rotation (non-traditional RoPE):
     // rx1 = x1 * cos - x2 * sin
     // rx2 = x1 * sin + x2 * cos
-    let rx1 = x1.multiply(&cos_theta)?.subtract(&x2.multiply(&sin_theta)?)?;
+    let rx1 = x1
+        .multiply(&cos_theta)?
+        .subtract(&x2.multiply(&sin_theta)?)?;
     let rx2 = x1.multiply(&sin_theta)?.add(&x2.multiply(&cos_theta)?)?;
 
     // Concatenate rotated halves
@@ -335,12 +335,7 @@ pub fn apply_rope_scaled(
 }
 
 /// Create a RoPE module with scaling configuration.
-pub fn create_rope(
-    dims: i32,
-    base: f32,
-    scaling: RopeScaling,
-    traditional: bool,
-) -> Rope {
+pub fn create_rope(dims: i32, base: f32, scaling: RopeScaling, traditional: bool) -> Rope {
     use mlx_rs::builder::Builder;
 
     let scale = scaling.scale();
@@ -451,7 +446,10 @@ mod tests {
 
     #[test]
     fn test_rope_scaling_ntk_aware() {
-        let scaling = RopeScaling::NtkAware { factor: 4.0, alpha: 1.0 };
+        let scaling = RopeScaling::NtkAware {
+            factor: 4.0,
+            alpha: 1.0,
+        };
 
         // NTK-aware uses sqrt of factor for scale
         assert!((scaling.scale() - 0.5).abs() < 0.01);

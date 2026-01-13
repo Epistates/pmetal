@@ -265,18 +265,25 @@ impl LogitCompressor {
     /// Decompress logits.
     pub fn decompress(&self, compressed: &CompressedLogits, vocab_size: usize) -> Result<Array> {
         match compressed {
-            CompressedLogits::Full { data, shape } => {
-                Ok(Array::from_slice(data, shape))
-            }
-            CompressedLogits::TopK { values, indices, num_tokens, k } => {
-                self.decompress_topk(values, indices, *num_tokens, *k, vocab_size)
-            }
-            CompressedLogits::Int8 { data, scale, zero_point, shape } => {
-                self.decompress_int8(data, *scale, *zero_point, shape)
-            }
-            CompressedLogits::Int4 { data, scale, zero_point, shape } => {
-                self.decompress_int4(data, *scale, *zero_point, shape)
-            }
+            CompressedLogits::Full { data, shape } => Ok(Array::from_slice(data, shape)),
+            CompressedLogits::TopK {
+                values,
+                indices,
+                num_tokens,
+                k,
+            } => self.decompress_topk(values, indices, *num_tokens, *k, vocab_size),
+            CompressedLogits::Int8 {
+                data,
+                scale,
+                zero_point,
+                shape,
+            } => self.decompress_int8(data, *scale, *zero_point, shape),
+            CompressedLogits::Int4 {
+                data,
+                scale,
+                zero_point,
+                shape,
+            } => self.decompress_int4(data, *scale, *zero_point, shape),
         }
     }
 
@@ -353,7 +360,10 @@ impl LogitCompressor {
             }
         }
 
-        Ok(Array::from_slice(&full, &[num_tokens as i32, vocab_size as i32]))
+        Ok(Array::from_slice(
+            &full,
+            &[num_tokens as i32, vocab_size as i32],
+        ))
     }
 
     fn compress_int8(&self, logits: &Array) -> Result<CompressedLogits> {
@@ -486,16 +496,18 @@ mod tests {
 
     #[test]
     fn test_topk_compression() {
-        let logits = Array::from_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[2, 4],
-        );
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
 
         let compressor = LogitCompressor::new(CompressionMethod::TopK, 2);
         let compressed = compressor.compress(&logits).unwrap();
 
         match &compressed {
-            CompressedLogits::TopK { values, indices, num_tokens, k } => {
+            CompressedLogits::TopK {
+                values,
+                indices,
+                num_tokens,
+                k,
+            } => {
                 assert_eq!(*num_tokens, 2);
                 assert_eq!(*k, 2);
                 assert_eq!(values.len(), 4); // 2 tokens * 2 top-k
@@ -513,10 +525,7 @@ mod tests {
 
     #[test]
     fn test_topk_roundtrip() {
-        let logits = Array::from_slice(
-            &[1.0_f32, 2.0, 10.0, 4.0, 5.0, 6.0, 20.0, 8.0],
-            &[2, 4],
-        );
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 10.0, 4.0, 5.0, 6.0, 20.0, 8.0], &[2, 4]);
 
         let compressor = LogitCompressor::new(CompressionMethod::TopK, 2);
         let compressed = compressor.compress(&logits).unwrap();
@@ -532,10 +541,7 @@ mod tests {
 
     #[test]
     fn test_int8_roundtrip() {
-        let logits = Array::from_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[2, 4],
-        );
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
 
         let compressor = LogitCompressor::new(CompressionMethod::Int8, 128);
         let compressed = compressor.compress(&logits).unwrap();
@@ -552,10 +558,7 @@ mod tests {
 
     #[test]
     fn test_int4_roundtrip() {
-        let logits = Array::from_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[2, 4],
-        );
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
 
         let compressor = LogitCompressor::new(CompressionMethod::Int4, 128);
         let compressed = compressor.compress(&logits).unwrap();

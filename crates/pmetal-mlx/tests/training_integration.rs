@@ -3,12 +3,12 @@
 //! These tests verify the complete training flow works correctly with our
 //! efficient O(n) backward pass implementation.
 
+use mlx_rs::random::uniform;
+use mlx_rs::Array;
 use pmetal_mlx::kernels::{
     compute_attention_gradients, differentiable_attention, init_training_context,
     with_training_mode, FusedAttentionConfig,
 };
-use mlx_rs::random::uniform;
-use mlx_rs::Array;
 
 fn random_tensor(shape: &[i32]) -> Array {
     uniform::<_, f32>(0.0, 1.0, shape, None).unwrap()
@@ -48,8 +48,7 @@ fn test_training_attention_forward_backward() {
     let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
 
     // Backward pass
-    let (d_q, d_k, d_v) = compute_attention_gradients(0, &d_output)
-        .expect("Backward pass failed");
+    let (d_q, d_k, d_v) = compute_attention_gradients(0, &d_output).expect("Backward pass failed");
 
     d_q.eval().expect("Eval d_q failed");
     d_k.eval().expect("Eval d_k failed");
@@ -88,7 +87,7 @@ fn test_with_training_mode_helper() {
         let n_heads = 4;
         let n_kv_heads = 4;
         let seq_len = 16;
-        let head_dim = 64;  // Use 64 to match implemented kernels
+        let head_dim = 64; // Use 64 to match implemented kernels
 
         let queries = random_tensor(&[batch, n_heads, seq_len, head_dim]);
         let keys = random_tensor(&[batch, n_kv_heads, seq_len, head_dim]);
@@ -108,7 +107,11 @@ fn test_with_training_mode_helper() {
         Ok(output.sum(None).unwrap().item::<f32>())
     });
 
-    assert!(result.is_ok(), "Training mode helper should succeed: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Training mode helper should succeed: {:?}",
+        result.err()
+    );
 }
 
 #[test]
@@ -209,7 +212,10 @@ fn test_inference_mode_no_cache() {
     // Verify no cache was stored
     {
         let ctx_guard = ctx.lock().unwrap();
-        assert!(!ctx_guard.has_cache(0), "Cache should not be stored in inference mode");
+        assert!(
+            !ctx_guard.has_cache(0),
+            "Cache should not be stored in inference mode"
+        );
     }
 }
 
@@ -245,8 +251,7 @@ fn test_gqa_gradients() {
 
     // Backward pass
     let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
-    let (d_q, d_k, d_v) = compute_attention_gradients(0, &d_output)
-        .expect("Backward pass failed");
+    let (d_q, d_k, d_v) = compute_attention_gradients(0, &d_output).expect("Backward pass failed");
 
     d_q.eval().expect("Eval d_q failed");
     d_k.eval().expect("Eval d_k failed");

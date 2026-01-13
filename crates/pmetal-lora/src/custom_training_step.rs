@@ -18,18 +18,16 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::{Array, nn};
 use mlx_rs::module::Module;
+use mlx_rs::{nn, Array};
 
 use crate::autograd::{
-    AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads,
-    lora_forward_with_grad, lora_backward,
+    lora_backward, lora_forward_with_grad, AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext,
+    LoraGrads,
 };
 use crate::custom_backward::{
-    AttentionSaved, RmsNormSaved, SiluSaved,
-    attention_backward, attention_forward_with_grad,
-    rmsnorm_backward, rmsnorm_forward_with_grad,
-    silu_backward, silu_forward_with_grad,
+    attention_backward, attention_forward_with_grad, rmsnorm_backward, rmsnorm_forward_with_grad,
+    silu_backward, silu_forward_with_grad, AttentionSaved, RmsNormSaved, SiluSaved,
 };
 use crate::custom_training::CustomLoraTrainer;
 use crate::{LoraError, LoraLinear, Qwen3LoraForCausalLM};
@@ -104,12 +102,7 @@ pub struct Qwen3CustomTrainer {
 
 impl Qwen3CustomTrainer {
     /// Create a new custom trainer.
-    pub fn new(
-        n_heads: i32,
-        n_kv_heads: i32,
-        head_dim: i32,
-        learning_rate: f32,
-    ) -> Self {
+    pub fn new(n_heads: i32, n_kv_heads: i32, head_dim: i32, learning_rate: f32) -> Self {
         Self {
             ctx: LoraGradContext::new(),
             learning_rate,
@@ -140,7 +133,8 @@ impl Qwen3CustomTrainer {
             &layer.lora_b,
             layer.scale,
             &self.ctx,
-        ).map_err(LoraError::from)
+        )
+        .map_err(LoraError::from)
     }
 
     /// Forward through attention with custom state saving.
@@ -153,7 +147,17 @@ impl Qwen3CustomTrainer {
         rope: &mut nn::Rope,
         x: &Array,
         mask: Option<&Array>,
-    ) -> Result<(Array, LoraForwardSaved, LoraForwardSaved, LoraForwardSaved, AttentionSaved, LoraForwardSaved), LoraError> {
+    ) -> Result<
+        (
+            Array,
+            LoraForwardSaved,
+            LoraForwardSaved,
+            LoraForwardSaved,
+            AttentionSaved,
+            LoraForwardSaved,
+        ),
+        LoraError,
+    > {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
@@ -164,11 +168,14 @@ impl Qwen3CustomTrainer {
         let (v, v_saved) = self.lora_forward(v_proj, x)?;
 
         // Reshape for multi-head attention
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
+        let q = q
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+        let k = k
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
+        let v = v
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
         // Apply RoPE
@@ -177,9 +184,8 @@ impl Qwen3CustomTrainer {
 
         // Attention with state saving
         let num_heads_per_kv = self.n_heads / self.n_kv_heads;
-        let (attn_out, attn_saved) = attention_forward_with_grad(
-            &q, &k, &v, mask, self.scale, num_heads_per_kv,
-        )?;
+        let (attn_out, attn_saved) =
+            attention_forward_with_grad(&q, &k, &v, mask, self.scale, num_heads_per_kv)?;
 
         // Reshape back
         let attn_out = attn_out
@@ -199,7 +205,18 @@ impl Qwen3CustomTrainer {
         up_proj: &LoraLinear,
         down_proj: &LoraLinear,
         x: &Array,
-    ) -> Result<(Array, LoraForwardSaved, SiluSaved, LoraForwardSaved, Array, Array, LoraForwardSaved), LoraError> {
+    ) -> Result<
+        (
+            Array,
+            LoraForwardSaved,
+            SiluSaved,
+            LoraForwardSaved,
+            Array,
+            Array,
+            LoraForwardSaved,
+        ),
+        LoraError,
+    > {
         // Gate projection
         let (gate, gate_saved) = self.lora_forward(gate_proj, x)?;
 
@@ -215,7 +232,15 @@ impl Qwen3CustomTrainer {
         // Down projection
         let (output, down_saved) = self.lora_forward(down_proj, &hidden)?;
 
-        Ok((output, gate_saved, silu_saved, up_saved, gate_activated, up_out, down_saved))
+        Ok((
+            output,
+            gate_saved,
+            silu_saved,
+            up_saved,
+            gate_activated,
+            up_out,
+            down_saved,
+        ))
     }
 
     /// Forward through a single decoder layer with state saving.
@@ -227,9 +252,7 @@ impl Qwen3CustomTrainer {
     ) -> Result<(Array, Qwen3LayerSaved), LoraError> {
         // Input norm
         let input_norm_weight = layer.input_layernorm.weight.value.as_ref().clone();
-        let (x_normed, input_norm_saved) = rmsnorm_forward_with_grad(
-            x, &input_norm_weight, 1e-6,
-        )?;
+        let (x_normed, input_norm_saved) = rmsnorm_forward_with_grad(x, &input_norm_weight, 1e-6)?;
 
         // Attention
         let (attn_out, q_saved, k_saved, v_saved, attn_saved, o_saved) = self.attention_forward(
@@ -247,17 +270,17 @@ impl Qwen3CustomTrainer {
 
         // Post-attention norm
         let post_attn_norm_weight = layer.post_attention_layernorm.weight.value.as_ref().clone();
-        let (h_normed, post_attn_norm_saved) = rmsnorm_forward_with_grad(
-            &h, &post_attn_norm_weight, 1e-6,
-        )?;
+        let (h_normed, post_attn_norm_saved) =
+            rmsnorm_forward_with_grad(&h, &post_attn_norm_weight, 1e-6)?;
 
         // MLP
-        let (mlp_out, gate_saved, silu_saved, up_saved, gate_activated, up_out, down_saved) = self.mlp_forward(
-            &layer.mlp.gate_proj,
-            &layer.mlp.up_proj,
-            &layer.mlp.down_proj,
-            &h_normed,
-        )?;
+        let (mlp_out, gate_saved, silu_saved, up_saved, gate_activated, up_out, down_saved) = self
+            .mlp_forward(
+                &layer.mlp.gate_proj,
+                &layer.mlp.up_proj,
+                &layer.mlp.down_proj,
+                &h_normed,
+            )?;
 
         // Residual
         let output = h.add(&mlp_out)?;
@@ -293,8 +316,9 @@ impl Qwen3CustomTrainer {
     ) -> Result<(Array, LoraGrads, LoraGrads, LoraGrads), LoraError> {
         // Backward through down projection
         let down_grads = lora_backward(d_output, &saved.down_saved)?;
-        let d_hidden = down_grads.d_x.as_ref()
-            .ok_or_else(|| LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from down")))?;
+        let d_hidden = down_grads.d_x.as_ref().ok_or_else(|| {
+            LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from down"))
+        })?;
 
         // Backward through multiply: d_gate_act = d_hidden * up_out, d_up_out = d_hidden * gate_act
         let d_gate_activated = d_hidden.multiply(&saved.up_out)?;
@@ -308,10 +332,15 @@ impl Qwen3CustomTrainer {
         let up_grads = lora_backward(&d_up_out, &saved.up_saved)?;
 
         // Sum gradients to h_normed
-        let d_h_normed = gate_grads.d_x.as_ref()
-            .ok_or_else(|| LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from gate")))?
-            .add(up_grads.d_x.as_ref()
-                .ok_or_else(|| LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from up")))?)?;
+        let d_h_normed = gate_grads
+            .d_x
+            .as_ref()
+            .ok_or_else(|| {
+                LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from gate"))
+            })?
+            .add(up_grads.d_x.as_ref().ok_or_else(|| {
+                LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from up"))
+            })?)?;
 
         Ok((d_h_normed, gate_grads, up_grads, down_grads))
     }
@@ -346,8 +375,9 @@ impl Qwen3CustomTrainer {
 
         // Backward through O projection
         let o_grads = lora_backward(d_attn_out, &saved.o_saved)?;
-        let d_attn_out_reshaped = o_grads.d_x.as_ref()
-            .ok_or_else(|| LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from o_proj")))?;
+        let d_attn_out_reshaped = o_grads.d_x.as_ref().ok_or_else(|| {
+            LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from o_proj"))
+        })?;
 
         // Backward through attention
         // Note: We need to reshape d_attn_out for attention backward
@@ -361,9 +391,15 @@ impl Qwen3CustomTrainer {
         let (d_q, d_k, d_v) = attention_backward(&d_attn_reshaped, &saved.attn_saved)?;
 
         // Reshape gradients back for projection backward
-        let d_q_flat = d_q.transpose_axes(&[0, 2, 1, 3])?.reshape(&[batch, seq_len, -1])?;
-        let d_k_flat = d_k.transpose_axes(&[0, 2, 1, 3])?.reshape(&[batch, seq_len, -1])?;
-        let d_v_flat = d_v.transpose_axes(&[0, 2, 1, 3])?.reshape(&[batch, seq_len, -1])?;
+        let d_q_flat = d_q
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[batch, seq_len, -1])?;
+        let d_k_flat = d_k
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[batch, seq_len, -1])?;
+        let d_v_flat = d_v
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[batch, seq_len, -1])?;
 
         // Backward through Q, K, V projections
         let q_grads = lora_backward(&d_q_flat, &saved.q_saved)?;
@@ -371,12 +407,16 @@ impl Qwen3CustomTrainer {
         let v_grads = lora_backward(&d_v_flat, &saved.v_saved)?;
 
         // Sum gradients to x_normed
-        let d_x_normed = q_grads.d_x.as_ref()
+        let d_x_normed = q_grads
+            .d_x
+            .as_ref()
             .ok_or_else(|| LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from q")))?
-            .add(k_grads.d_x.as_ref()
-                .ok_or_else(|| LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from k")))?)?
-            .add(v_grads.d_x.as_ref()
-                .ok_or_else(|| LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from v")))?)?;
+            .add(k_grads.d_x.as_ref().ok_or_else(|| {
+                LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from k"))
+            })?)?
+            .add(v_grads.d_x.as_ref().ok_or_else(|| {
+                LoraError::Mlx(mlx_rs::error::Exception::custom("Expected d_x from v"))
+            })?)?;
 
         // Backward through input norm
         let d_x_from_norm = rmsnorm_backward(&d_x_normed, &saved.input_norm)?;
@@ -425,9 +465,8 @@ impl Qwen3CustomTrainer {
 
         // Final norm
         let final_norm_weight = model.model.norm.weight.value.as_ref().clone();
-        let (hidden_normed, final_norm_saved) = rmsnorm_forward_with_grad(
-            &hidden, &final_norm_weight, 1e-6,
-        )?;
+        let (hidden_normed, final_norm_saved) =
+            rmsnorm_forward_with_grad(&hidden, &final_norm_weight, 1e-6)?;
 
         // LM head (no LoRA)
         let logits = if let Some(ref mut lm_head) = model.lm_head {
@@ -437,9 +476,8 @@ impl Qwen3CustomTrainer {
         };
 
         // ========== LOSS ==========
-        let (loss, d_logits) = CustomLoraTrainer::cross_entropy_with_grad(
-            &logits, labels, self.ignore_index,
-        )?;
+        let (loss, d_logits) =
+            CustomLoraTrainer::cross_entropy_with_grad(&logits, labels, self.ignore_index)?;
 
         // ========== BACKWARD PASS ==========
 
@@ -463,10 +501,9 @@ impl Qwen3CustomTrainer {
 
             // Prefix gradients with layer index
             for (name, grad) in layer_grads.grads {
-                all_grads.grads.insert(
-                    format!("layers.{}.{}", layer_idx, name),
-                    grad,
-                );
+                all_grads
+                    .grads
+                    .insert(format!("layers.{}.{}", layer_idx, name), grad);
             }
 
             d_hidden = d_x;
@@ -503,28 +540,36 @@ impl Qwen3CustomTrainer {
 
             match (parts[2], parts[3], parts.get(4).copied()) {
                 ("self_attn", "q_proj", Some("lora_a")) => {
-                    layer.self_attn.q_proj.lora_a = layer.self_attn.q_proj.lora_a.subtract(&update)?;
+                    layer.self_attn.q_proj.lora_a =
+                        layer.self_attn.q_proj.lora_a.subtract(&update)?;
                 }
                 ("self_attn", "q_proj", Some("lora_b")) => {
-                    layer.self_attn.q_proj.lora_b = layer.self_attn.q_proj.lora_b.subtract(&update)?;
+                    layer.self_attn.q_proj.lora_b =
+                        layer.self_attn.q_proj.lora_b.subtract(&update)?;
                 }
                 ("self_attn", "k_proj", Some("lora_a")) => {
-                    layer.self_attn.k_proj.lora_a = layer.self_attn.k_proj.lora_a.subtract(&update)?;
+                    layer.self_attn.k_proj.lora_a =
+                        layer.self_attn.k_proj.lora_a.subtract(&update)?;
                 }
                 ("self_attn", "k_proj", Some("lora_b")) => {
-                    layer.self_attn.k_proj.lora_b = layer.self_attn.k_proj.lora_b.subtract(&update)?;
+                    layer.self_attn.k_proj.lora_b =
+                        layer.self_attn.k_proj.lora_b.subtract(&update)?;
                 }
                 ("self_attn", "v_proj", Some("lora_a")) => {
-                    layer.self_attn.v_proj.lora_a = layer.self_attn.v_proj.lora_a.subtract(&update)?;
+                    layer.self_attn.v_proj.lora_a =
+                        layer.self_attn.v_proj.lora_a.subtract(&update)?;
                 }
                 ("self_attn", "v_proj", Some("lora_b")) => {
-                    layer.self_attn.v_proj.lora_b = layer.self_attn.v_proj.lora_b.subtract(&update)?;
+                    layer.self_attn.v_proj.lora_b =
+                        layer.self_attn.v_proj.lora_b.subtract(&update)?;
                 }
                 ("self_attn", "o_proj", Some("lora_a")) => {
-                    layer.self_attn.o_proj.lora_a = layer.self_attn.o_proj.lora_a.subtract(&update)?;
+                    layer.self_attn.o_proj.lora_a =
+                        layer.self_attn.o_proj.lora_a.subtract(&update)?;
                 }
                 ("self_attn", "o_proj", Some("lora_b")) => {
-                    layer.self_attn.o_proj.lora_b = layer.self_attn.o_proj.lora_b.subtract(&update)?;
+                    layer.self_attn.o_proj.lora_b =
+                        layer.self_attn.o_proj.lora_b.subtract(&update)?;
                 }
                 ("mlp", "gate_proj", Some("lora_a")) => {
                     layer.mlp.gate_proj.lora_a = layer.mlp.gate_proj.lora_a.subtract(&update)?;
@@ -588,10 +633,7 @@ mod tests {
             alpha: 8.0,
             dropout: 0.0,
             use_rslora: false,
-            target_modules: vec![
-                "q_proj".to_string(),
-                "v_proj".to_string(),
-            ],
+            target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
             bias: "none".to_string(),
             init_lora_weights: true,
             use_dora: false,
@@ -614,11 +656,19 @@ mod tests {
         // Create dummy batch
         let batch_size = 2;
         let seq_len = 8;
-        let input_ids = mlx_rs::Array::from_slice(&vec![1_i32; batch_size * seq_len], &[batch_size as i32, seq_len as i32]);
-        let labels = mlx_rs::Array::from_slice(&vec![2_i32; batch_size * seq_len], &[batch_size as i32, seq_len as i32]);
+        let input_ids = mlx_rs::Array::from_slice(
+            &vec![1_i32; batch_size * seq_len],
+            &[batch_size as i32, seq_len as i32],
+        );
+        let labels = mlx_rs::Array::from_slice(
+            &vec![2_i32; batch_size * seq_len],
+            &[batch_size as i32, seq_len as i32],
+        );
 
         // Run training step
-        let (loss, grads) = trainer.training_step(&mut model, &input_ids, &labels).unwrap();
+        let (loss, grads) = trainer
+            .training_step(&mut model, &input_ids, &labels)
+            .unwrap();
 
         // Loss should be positive
         assert!(loss > 0.0, "Loss should be positive: {}", loss);

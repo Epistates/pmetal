@@ -74,8 +74,7 @@ pub struct TrainingContext {
 impl TrainingContext {
     /// Create a new training context.
     pub fn new() -> Result<Self> {
-        let metal_ctx = MetalContext::global()
-            .map_err(|e| MlxError::Metal(e.to_string()))?;
+        let metal_ctx = MetalContext::global().map_err(|e| MlxError::Metal(e.to_string()))?;
 
         Ok(Self {
             metal_ctx,
@@ -200,7 +199,9 @@ pub fn differentiable_attention(
 
     // Training mode: use Metal FlashAttention with caching
     let ctx = training_ctx.expect("Training context should be initialized");
-    let ctx_guard = ctx.lock().map_err(|_| MlxError::Metal("Failed to lock training context".to_string()))?;
+    let ctx_guard = ctx
+        .lock()
+        .map_err(|_| MlxError::Metal("Failed to lock training context".to_string()))?;
     let metal_ctx = ctx_guard.metal_context();
 
     // Get shapes
@@ -244,7 +245,8 @@ pub fn differentiable_attention(
         .map_err(|e| MlxError::Metal(e.to_string()))?;
 
     // Run forward pass
-    let fa_output = flash_attn.forward(&q_buffer, &k_buffer, &v_buffer)
+    let fa_output = flash_attn
+        .forward(&q_buffer, &k_buffer, &v_buffer)
         .map_err(|e| MlxError::Metal(e.to_string()))?;
 
     // Convert output to MLX Array
@@ -269,7 +271,9 @@ pub fn differentiable_attention(
 
     // Store cache (need to drop ctx_guard first to release lock)
     drop(ctx_guard);
-    let ctx_guard = ctx.lock().map_err(|_| MlxError::Metal("Failed to lock training context".to_string()))?;
+    let ctx_guard = ctx
+        .lock()
+        .map_err(|_| MlxError::Metal("Failed to lock training context".to_string()))?;
     ctx_guard.store_cache(layer_id, cache);
 
     Ok(output_array)
@@ -295,11 +299,13 @@ pub fn compute_attention_gradients(
     let training_ctx = get_training_context()
         .ok_or_else(|| MlxError::Metal("Training context not initialized".to_string()))?;
 
-    let ctx_guard = training_ctx.lock()
+    let ctx_guard = training_ctx
+        .lock()
         .map_err(|_| MlxError::Metal("Failed to lock training context".to_string()))?;
 
     // Take cache (removes it from storage)
-    let cache = ctx_guard.take_cache(layer_id)
+    let cache = ctx_guard
+        .take_cache(layer_id)
         .ok_or_else(|| MlxError::Metal(format!("No cache found for layer {}", layer_id)))?;
 
     let metal_ctx = ctx_guard.metal_context();
@@ -308,14 +314,17 @@ pub fn compute_attention_gradients(
     let d_out_buffer = array_to_metal_buffer_f16(metal_ctx, d_output)?;
 
     // Run backward pass
-    let (d_q, d_k, d_v) = cache.flash_attn.backward(
-        &cache.queries,
-        &cache.keys,
-        &cache.values,
-        &cache.output,
-        &d_out_buffer,
-        &cache.logsumexp,
-    ).map_err(|e| MlxError::Metal(e.to_string()))?;
+    let (d_q, d_k, d_v) = cache
+        .flash_attn
+        .backward(
+            &cache.queries,
+            &cache.keys,
+            &cache.values,
+            &cache.output,
+            &d_out_buffer,
+            &cache.logsumexp,
+        )
+        .map_err(|e| MlxError::Metal(e.to_string()))?;
 
     // Convert gradients to MLX Arrays
     let d_queries = metal_buffer_to_array_f16(&d_q, &cache.query_shape)?;
@@ -353,7 +362,8 @@ where
 
     // Enable training mode
     {
-        let mut ctx_guard = ctx.lock()
+        let mut ctx_guard = ctx
+            .lock()
             .map_err(|_| MlxError::Metal("Failed to lock training context".to_string()))?;
         ctx_guard.enable_training();
     }
@@ -363,7 +373,8 @@ where
 
     // Disable training mode and clear caches
     {
-        let mut ctx_guard = ctx.lock()
+        let mut ctx_guard = ctx
+            .lock()
             .map_err(|_| MlxError::Metal("Failed to lock training context".to_string()))?;
         ctx_guard.disable_training();
     }
@@ -415,7 +426,10 @@ mod tests {
 
         let result = differentiable_attention(0, &queries, &keys, &values, &config);
         assert!(result.is_ok());
-        assert_eq!(result.unwrap().shape(), &[batch, n_heads, seq_len, head_dim]);
+        assert_eq!(
+            result.unwrap().shape(),
+            &[batch, n_heads, seq_len, head_dim]
+        );
     }
 
     #[test]
@@ -457,7 +471,11 @@ mod tests {
         // Compute gradients
         let d_output = random_tensor(&[batch, n_heads, seq_len, head_dim]);
         let grads = compute_attention_gradients(0, &d_output);
-        assert!(grads.is_ok(), "Gradient computation failed: {:?}", grads.err());
+        assert!(
+            grads.is_ok(),
+            "Gradient computation failed: {:?}",
+            grads.err()
+        );
 
         let (d_q, d_k, d_v) = grads.unwrap();
         assert_eq!(d_q.shape(), &[batch, n_heads, seq_len, head_dim]);

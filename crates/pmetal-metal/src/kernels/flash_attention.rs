@@ -177,7 +177,9 @@ impl FlashAttentionConfig {
             ));
         }
         if self.query_seq_len == 0 {
-            return Err(MetalError::InvalidConfig("query_seq_len must be > 0".into()));
+            return Err(MetalError::InvalidConfig(
+                "query_seq_len must be > 0".into(),
+            ));
         }
         if self.kv_seq_len == 0 {
             return Err(MetalError::InvalidConfig("kv_seq_len must be > 0".into()));
@@ -267,7 +269,10 @@ impl FlashAttention {
     ///
     /// Higher-tier devices (M4 Max/Ultra) benefit from larger tile sizes
     /// due to increased memory bandwidth and shader core count.
-    fn select_block_sizes(head_dim: usize, device_tier: crate::context::DeviceTier) -> (usize, usize) {
+    fn select_block_sizes(
+        head_dim: usize,
+        device_tier: crate::context::DeviceTier,
+    ) -> (usize, usize) {
         use crate::context::DeviceTier;
 
         match (head_dim, device_tier) {
@@ -329,11 +334,7 @@ impl FlashAttention {
         self.validate_input_sizes(queries, keys, values)?;
 
         // Allocate output buffer
-        let output = MetalBuffer::new(
-            &self.ctx,
-            self.config.output_size(),
-            BufferUsage::Shared,
-        )?;
+        let output = MetalBuffer::new(&self.ctx, self.config.output_size(), BufferUsage::Shared)?;
 
         // Allocate logsumexp if training
         let logsumexp = if self.config.is_training {
@@ -401,28 +402,17 @@ impl FlashAttention {
         }
 
         // Allocate gradient buffers
-        let d_queries = MetalBuffer::zeros(
-            &self.ctx,
-            self.config.query_size(),
-            BufferUsage::Shared,
-        )?;
-        let d_keys = MetalBuffer::zeros(
-            &self.ctx,
-            self.config.kv_size(),
-            BufferUsage::Shared,
-        )?;
-        let d_values = MetalBuffer::zeros(
-            &self.ctx,
-            self.config.kv_size(),
-            BufferUsage::Shared,
-        )?;
+        let d_queries =
+            MetalBuffer::zeros(&self.ctx, self.config.query_size(), BufferUsage::Shared)?;
+        let d_keys = MetalBuffer::zeros(&self.ctx, self.config.kv_size(), BufferUsage::Shared)?;
+        let d_values = MetalBuffer::zeros(&self.ctx, self.config.kv_size(), BufferUsage::Shared)?;
 
         // Execute backward kernels
         self.execute_backward_dq(
-            queries, keys, values, output, d_output, logsumexp, &d_queries
+            queries, keys, values, output, d_output, logsumexp, &d_queries,
         )?;
         self.execute_backward_dkv(
-            queries, keys, values, output, d_output, logsumexp, &d_keys, &d_values
+            queries, keys, values, output, d_output, logsumexp, &d_keys, &d_values,
         )?;
 
         Ok((d_queries, d_keys, d_values))
@@ -470,7 +460,9 @@ impl FlashAttention {
     /// - 1: BLOCK_K (key block size) - UInt
     /// - 2: HEAD_DIM - UInt
     /// - 3: IS_CAUSAL - Bool
-    fn create_function_constants(&self) -> std::collections::HashMap<u64, crate::pipeline::FunctionConstant> {
+    fn create_function_constants(
+        &self,
+    ) -> std::collections::HashMap<u64, crate::pipeline::FunctionConstant> {
         use crate::pipeline::FunctionConstant;
         let mut constants = std::collections::HashMap::new();
         constants.insert(0, FunctionConstant::UInt(self.block_q as u32));
@@ -544,8 +536,8 @@ impl FlashAttention {
         };
 
         let threadgroup_size = objc2_metal::MTLSize {
-            width: 32,  // SIMD width on Apple GPUs
-            height: 4,  // Warp-level parallelism
+            width: 32, // SIMD width on Apple GPUs
+            height: 4, // Warp-level parallelism
             depth: 1,
         };
 
@@ -1024,11 +1016,7 @@ impl FlashAttentionVarlen {
         }
 
         // Allocate output
-        let output = MetalBuffer::new(
-            &self.ctx,
-            self.config.query_size(),
-            BufferUsage::Shared,
-        )?;
+        let output = MetalBuffer::new(&self.ctx, self.config.query_size(), BufferUsage::Shared)?;
 
         let logsumexp = if self.config.is_training {
             Some(MetalBuffer::new(
@@ -1040,7 +1028,14 @@ impl FlashAttentionVarlen {
             None
         };
 
-        self.execute_forward(queries, keys, values, cu_seqlens, &output, logsumexp.as_ref())?;
+        self.execute_forward(
+            queries,
+            keys,
+            values,
+            cu_seqlens,
+            &output,
+            logsumexp.as_ref(),
+        )?;
 
         Ok(FlashAttentionVarlenOutput { output, logsumexp })
     }
@@ -1058,11 +1053,7 @@ impl FlashAttentionVarlen {
         let function_name = self.kernel_name();
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(
-                self.ctx.device(),
-                &function_name,
-                None,
-            )?
+            cache.get_or_create_pipeline(self.ctx.device(), &function_name, None)?
         };
 
         let command_queue = self.ctx.command_queue();
@@ -1197,7 +1188,7 @@ mod tests {
 
         let invalid_config = FlashAttentionConfig {
             num_heads: 32,
-            num_kv_heads: 7,  // Not divisible
+            num_kv_heads: 7, // Not divisible
             ..Default::default()
         };
         assert!(invalid_config.validate().is_err());

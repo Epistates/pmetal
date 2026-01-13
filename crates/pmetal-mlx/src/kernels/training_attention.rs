@@ -40,8 +40,7 @@ impl TrainingAttentionContext {
     ///
     /// Returns an error if Metal initialization fails.
     pub fn new() -> Result<Self> {
-        let metal_ctx = MetalContext::global()
-            .map_err(|e| MlxError::Metal(e.to_string()))?;
+        let metal_ctx = MetalContext::global().map_err(|e| MlxError::Metal(e.to_string()))?;
 
         Ok(Self { metal_ctx })
     }
@@ -146,7 +145,7 @@ pub fn training_attention_forward(
         is_causal,
         sliding_window,
         softcap: config.logit_softcapping,
-        is_training: true,  // Store logsumexp for backward
+        is_training: true, // Store logsumexp for backward
     };
 
     // Create FlashAttention instance
@@ -154,7 +153,8 @@ pub fn training_attention_forward(
         .map_err(|e| MlxError::Metal(e.to_string()))?;
 
     // Run forward pass
-    let fa_output = flash_attn.forward(&q_buffer, &k_buffer, &v_buffer)
+    let fa_output = flash_attn
+        .forward(&q_buffer, &k_buffer, &v_buffer)
         .map_err(|e| MlxError::Metal(e.to_string()))?;
 
     // Convert output to MLX Array
@@ -205,14 +205,17 @@ pub fn training_attention_backward(
     let d_out_buffer = array_to_metal_buffer_f16(metal_ctx, d_output)?;
 
     // Run backward pass
-    let (d_q, d_k, d_v) = cache.flash_attn.backward(
-        &cache.queries,
-        &cache.keys,
-        &cache.values,
-        &cache.output,
-        &d_out_buffer,
-        &cache.logsumexp,
-    ).map_err(|e| MlxError::Metal(e.to_string()))?;
+    let (d_q, d_k, d_v) = cache
+        .flash_attn
+        .backward(
+            &cache.queries,
+            &cache.keys,
+            &cache.values,
+            &cache.output,
+            &d_out_buffer,
+            &cache.logsumexp,
+        )
+        .map_err(|e| MlxError::Metal(e.to_string()))?;
 
     // Get shapes for conversion
     let q_shape = [
@@ -252,7 +255,10 @@ mod tests {
     #[test]
     fn test_training_context_creation() {
         let ctx = TrainingAttentionContext::new();
-        assert!(ctx.is_ok(), "Should be able to create training context on macOS");
+        assert!(
+            ctx.is_ok(),
+            "Should be able to create training context on macOS"
+        );
     }
 
     #[test]

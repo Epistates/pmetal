@@ -183,16 +183,14 @@ impl OffloadedEmbedding {
     /// Get the embedding weights, loading from offload if necessary.
     pub fn get_weights(&mut self) -> Result<&Array, Exception> {
         match self.target {
-            OffloadTarget::Gpu => {
-                self.gpu_cache
-                    .as_ref()
-                    .ok_or_else(|| Exception::custom("GPU cache empty"))
-            }
-            OffloadTarget::Cpu => {
-                self.cpu_array
-                    .as_ref()
-                    .ok_or_else(|| Exception::custom("CPU array empty"))
-            }
+            OffloadTarget::Gpu => self
+                .gpu_cache
+                .as_ref()
+                .ok_or_else(|| Exception::custom("GPU cache empty")),
+            OffloadTarget::Cpu => self
+                .cpu_array
+                .as_ref()
+                .ok_or_else(|| Exception::custom("CPU array empty")),
             OffloadTarget::Disk => {
                 // Load from disk if not in GPU cache
                 if self.gpu_cache.is_none() {
@@ -385,11 +383,10 @@ impl ActivationOffloader {
         self.stats.load_count += 1;
 
         match activation.target {
-            OffloadTarget::Gpu | OffloadTarget::Cpu => {
-                activation.array.clone().ok_or_else(|| {
-                    Exception::custom(format!("Activation '{}' array is None", key))
-                })
-            }
+            OffloadTarget::Gpu | OffloadTarget::Cpu => activation
+                .array
+                .clone()
+                .ok_or_else(|| Exception::custom(format!("Activation '{}' array is None", key))),
             OffloadTarget::Disk => {
                 let path = activation
                     .disk_path
@@ -504,11 +501,10 @@ impl GradientOffloader {
                     );
                 }
                 OffloadTarget::Disk => {
-                    let dir = self
-                        .config
-                        .offload_dir
-                        .as_ref()
-                        .ok_or_else(|| Exception::custom("Disk offload requires offload_dir"))?;
+                    let dir =
+                        self.config.offload_dir.as_ref().ok_or_else(|| {
+                            Exception::custom("Disk offload requires offload_dir")
+                        })?;
 
                     let path = dir.join(format!("grad_{}_{}.bin", name, uuid_simple()));
                     save_array_to_disk(&grad, &path)?;
@@ -743,8 +739,7 @@ mod tests {
     #[test]
     fn test_memory_usage_estimate() {
         let weights = mlx_rs::random::normal::<f32>(&[1000, 512], None, None, None).unwrap();
-        let embedding =
-            OffloadedEmbedding::from_array(weights, OffloadTarget::Gpu, None).unwrap();
+        let embedding = OffloadedEmbedding::from_array(weights, OffloadTarget::Gpu, None).unwrap();
 
         let expected_bytes = 1000 * 512 * 4; // float32
         assert_eq!(embedding.memory_usage(), expected_bytes);

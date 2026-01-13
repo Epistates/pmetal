@@ -2,16 +2,18 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use pmetal_core::{DatasetConfig, LoraConfig, ModelConfig, TrainingConfig};
-use pmetal_data::{DataLoaderConfig, DatasetFormat, TrainingDataset, Tokenizer};
-use pmetal_lora::{DynamicLoraModel, LlamaLoraForCausalLM, LlamaQloraForCausalLM, QLoraConfig, TrainableModel};
-use pmetal_models::WeightFormat;
-use pmetal_models::ollama::{ModelfileBuilder, templates as ollama_templates};
-use pmetal_mlx::quantization::QuantScheme;
-use pmetal_models::architectures::llama::LlamaConfig;
-use pmetal_trainer::{CheckpointManager, MetricsJsonCallback, TrainingLoop, TrainingLoopConfig};
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
+use pmetal_core::{DatasetConfig, LoraConfig, ModelConfig, TrainingConfig};
+use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
+use pmetal_lora::{
+    DynamicLoraModel, LlamaLoraForCausalLM, LlamaQloraForCausalLM, QLoraConfig, TrainableModel,
+};
+use pmetal_mlx::quantization::QuantScheme;
+use pmetal_models::architectures::llama::LlamaConfig;
+use pmetal_models::ollama::{templates as ollama_templates, ModelfileBuilder};
+use pmetal_models::WeightFormat;
+use pmetal_trainer::{CheckpointManager, MetricsJsonCallback, TrainingLoop, TrainingLoopConfig};
 use serde::{Deserialize, Serialize};
 
 /// Combined configuration for training.
@@ -618,10 +620,11 @@ async fn run_quantization(
     method: &str,
 ) -> anyhow::Result<()> {
     use pmetal_gguf::{
-        GgufBuilder, GgmlType,
-        dynamic::{DynamicQuantizer, DynamicQuantizationConfig},
+        dynamic::{DynamicQuantizationConfig, DynamicQuantizer},
         imatrix::IMatrix,
         quantize::quantize, // Import the function explicitly
+        GgmlType,
+        GgufBuilder,
     };
     use std::path::{Path, PathBuf};
 
@@ -637,13 +640,14 @@ async fn run_quantization(
     println!("========================================\n");
 
     // Resolve HuggingFace model ID to local path
-    let resolved_model_path: PathBuf = if model_path.contains('/') && !PathBuf::from(model_path).exists() {
-        // HuggingFace model ID - download/resolve to cache
-        tracing::info!("Resolving HuggingFace model: {}", model_path);
-        pmetal_hub::download_model(model_path, None, None).await?
-    } else {
-        PathBuf::from(model_path)
-    };
+    let resolved_model_path: PathBuf =
+        if model_path.contains('/') && !PathBuf::from(model_path).exists() {
+            // HuggingFace model ID - download/resolve to cache
+            tracing::info!("Resolving HuggingFace model: {}", model_path);
+            pmetal_hub::download_model(model_path, None, None).await?
+        } else {
+            PathBuf::from(model_path)
+        };
 
     // 1. Load IMatrix if provided
     let imatrix = if let Some(path) = imatrix_path {
@@ -687,7 +691,7 @@ async fn run_quantization(
     // 4. Detect Architecture
     let config_path = resolved_model_path.join("config.json");
     let mut architecture = "llama".to_string(); // Default fallback
-    
+
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
@@ -701,11 +705,18 @@ async fn run_quantization(
                             "PhiForCausalLM" | "Phi3ForCausalLM" => "phi".to_string(),
                             // Add more mappings as needed
                             _ => {
-                                tracing::warn!("Unknown architecture '{}', defaulting to 'llama'", arch_str);
+                                tracing::warn!(
+                                    "Unknown architecture '{}', defaulting to 'llama'",
+                                    arch_str
+                                );
                                 "llama".to_string()
                             }
                         };
-                        tracing::info!("Detected architecture: {} (from {})", architecture, arch_str);
+                        tracing::info!(
+                            "Detected architecture: {} (from {})",
+                            architecture,
+                            arch_str
+                        );
                     }
                 }
             }
@@ -719,7 +730,7 @@ async fn run_quantization(
 
     // 6. Quantize and Write
     tracing::info!("Starting quantization...");
-    
+
     // Sort keys for deterministic output
     let mut keys: Vec<_> = weights.keys().collect();
     keys.sort();
@@ -728,28 +739,33 @@ async fn run_quantization(
         let tensor = weights.get(name).unwrap();
         // Skip quantization for non-F32/F16 tensors (e.g. integer indices) if any
         // But most LLM weights are floats.
-        
+
         let shape = tensor.shape();
         let shape_u64: Vec<u64> = shape.iter().map(|&d| d as u64).collect();
-        
+
         // Determine target type
         let target_type = quantizer.get_tensor_type(name, &shape_u64);
-        
+
         // Convert MLX array to host vector
         // Note: This requires evaluating the array and copying data to CPU
         // Ensure tensor is evaluated
-        tensor.eval().map_err(|e| anyhow::anyhow!("MLX eval error: {}", e))?;
-        
+        tensor
+            .eval()
+            .map_err(|e| anyhow::anyhow!("MLX eval error: {}", e))?;
+
         // We assume weights are float32 for quantization input.
         // If they are float16/bfloat16, we convert them.
         let data_f32: Vec<f32> = match tensor.dtype() {
             pmetal_mlx::Dtype::Float32 => tensor.as_slice::<f32>().to_vec(),
             pmetal_mlx::Dtype::Float16 | pmetal_mlx::Dtype::Bfloat16 => {
-                let t_f32 = tensor.as_dtype(pmetal_mlx::Dtype::Float32)
+                let t_f32 = tensor
+                    .as_dtype(pmetal_mlx::Dtype::Float32)
                     .map_err(|e| anyhow::anyhow!("Dtype conversion error: {}", e))?;
-                t_f32.eval().map_err(|e| anyhow::anyhow!("MLX eval error: {}", e))?;
+                t_f32
+                    .eval()
+                    .map_err(|e| anyhow::anyhow!("MLX eval error: {}", e))?;
                 t_f32.as_slice::<f32>().to_vec()
-            },
+            }
             _ => {
                 tracing::warn!("Skipping non-float tensor: {}", name);
                 continue;
@@ -841,7 +857,10 @@ async fn run_training(
     }
 
     println!("========================================");
-    println!("  PMetal {} Fine-Tuning", if use_qlora { "QLoRA" } else { "LoRA" });
+    println!(
+        "  PMetal {} Fine-Tuning",
+        if use_qlora { "QLoRA" } else { "LoRA" }
+    );
     println!("========================================");
     println!("Model:         {}", config.model.model_id);
     println!("Dataset:       {}", config.dataset.dataset_id);
@@ -852,24 +871,64 @@ async fn run_training(
     println!("LoRA Rank:     {}", config.lora.r);
     println!("LR:            {}", config.training.learning_rate);
     println!("Batch Size:    {}", config.training.batch_size);
-    println!("Grad Accum:    {}", config.training.gradient_accumulation_steps);
+    println!(
+        "Grad Accum:    {}",
+        config.training.gradient_accumulation_steps
+    );
     println!("Epochs:        {}", config.training.num_epochs);
     println!("Max Seq Len:   {}", config.training.max_seq_len);
     println!("Max Grad Norm: {}", config.training.max_grad_norm);
-    println!("Metal FA:      {}", if use_metal_flash_attention { "enabled" } else { "disabled" });
-    println!("Fused:         {}", if fused { "enabled" } else { "disabled" });
-    println!("Metal Opt:     {}", if use_metal_fused_optimizer { "enabled" } else { "disabled" });
-    println!("Packing:       {}", if use_sequence_packing { "enabled" } else { "disabled" });
-    println!("JIT Compile:   {}", if use_jit_compilation { "enabled" } else { "disabled" });
+    println!(
+        "Metal FA:      {}",
+        if use_metal_flash_attention {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "Fused:         {}",
+        if fused { "enabled" } else { "disabled" }
+    );
+    println!(
+        "Metal Opt:     {}",
+        if use_metal_fused_optimizer {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "Packing:       {}",
+        if use_sequence_packing {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "JIT Compile:   {}",
+        if use_jit_compilation {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
     if gradient_checkpointing {
-        println!("Grad Ckpt:     enabled ({} layers/block)", gradient_checkpointing_layers);
+        println!(
+            "Grad Ckpt:     enabled ({} layers/block)",
+            gradient_checkpointing_layers
+        );
     } else {
         println!("Grad Ckpt:     disabled");
     }
     if use_qlora {
         println!("Quantization:  {:?}", quantization);
         println!("Block Size:    {}", quant_block_size);
-        println!("Double Quant:  {}", if double_quant { "enabled" } else { "disabled" });
+        println!(
+            "Double Quant:  {}",
+            if double_quant { "enabled" } else { "disabled" }
+        );
     }
     if let Some(ref metrics_path) = log_metrics {
         println!("Metrics Log:   {}", metrics_path);
@@ -888,7 +947,11 @@ async fn run_training(
             PathBuf::from(&output_dir).join(metrics_path)
         };
         let callback = MetricsJsonCallback::new(&path)?
-            .with_run_name(format!("{}-{}", config.model.model_id.replace('/', "-"), chrono::Utc::now().format("%Y%m%d-%H%M%S")))
+            .with_run_name(format!(
+                "{}-{}",
+                config.model.model_id.replace('/', "-"),
+                chrono::Utc::now().format("%Y%m%d-%H%M%S")
+            ))
             .with_config(serde_json::json!({
                 "model": config.model.model_id,
                 "lora_r": lora_r,
@@ -910,12 +973,18 @@ async fn run_training(
 
     // Download model if needed
     tracing::info!("Loading model: {}", config.model.model_id);
-    let model_path = if config.model.model_id.contains('/') && !PathBuf::from(&config.model.model_id).exists() {
-        // HuggingFace model ID
-        pmetal_hub::download_model(&config.model.model_id, config.model.revision.as_deref(), None).await?
-    } else {
-        PathBuf::from(&config.model.model_id)
-    };
+    let model_path =
+        if config.model.model_id.contains('/') && !PathBuf::from(&config.model.model_id).exists() {
+            // HuggingFace model ID
+            pmetal_hub::download_model(
+                &config.model.model_id,
+                config.model.revision.as_deref(),
+                None,
+            )
+            .await?
+        } else {
+            PathBuf::from(&config.model.model_id)
+        };
 
     // Load model config (optional for GGUF - config is extracted from metadata)
     let model_config_path = model_path.join("config.json");
@@ -980,8 +1049,7 @@ async fn run_training(
 
     // Set up checkpointing
     let checkpoint_dir = PathBuf::from(&output_dir).join("checkpoints");
-    let checkpoint_manager = CheckpointManager::new(&checkpoint_dir)?
-        .with_max_checkpoints(3);
+    let checkpoint_manager = CheckpointManager::new(&checkpoint_dir)?.with_max_checkpoints(3);
 
     // Create data loader config
     let dataloader_config = DataLoaderConfig {
@@ -1047,15 +1115,23 @@ async fn run_training(
             compute_in_half: true,
         };
 
-        tracing::info!("Initializing QLoRA model with {:?} quantization...", quantization);
+        tracing::info!(
+            "Initializing QLoRA model with {:?} quantization...",
+            quantization
+        );
         // QLoRA currently requires config.json (Llama-only)
         let llama_cfg = llama_config.ok_or_else(|| {
-            anyhow::anyhow!("QLoRA requires config.json. GGUF format is only supported with standard LoRA.")
+            anyhow::anyhow!(
+                "QLoRA requires config.json. GGUF format is only supported with standard LoRA."
+            )
         })?;
         let mut model = LlamaQloraForCausalLM::with_qlora_config(llama_cfg, qlora_config)?;
 
         // Load and quantize base model weights
-        tracing::info!("Loading and quantizing base model weights from {:?}...", model_path);
+        tracing::info!(
+            "Loading and quantizing base model weights from {:?}...",
+            model_path
+        );
         model.load_and_quantize_from_dir(&model_path)?;
 
         // Report memory savings
@@ -1109,7 +1185,9 @@ async fn run_training(
         tracing::info!("Starting QLoRA training...");
 
         if fused {
-            tracing::warn!("Fused training is not yet supported for QLoRA, using standard training");
+            tracing::warn!(
+                "Fused training is not yet supported for QLoRA, using standard training"
+            );
         }
 
         // Run training loop
@@ -1127,7 +1205,11 @@ async fn run_training(
         model.save_lora_weights(&final_path)?;
         tracing::info!("Saved LoRA weights to {:?}", final_path);
 
-        (training_loop.current_loss(), training_loop.current_step(), training_loop.total_tokens())
+        (
+            training_loop.current_loss(),
+            training_loop.current_step(),
+            training_loop.total_tokens(),
+        )
     } else {
         // Standard LoRA path - full precision base weights with dynamic architecture detection
         tracing::info!("Initializing LoRA model with auto-detected architecture...");
@@ -1204,7 +1286,8 @@ async fn run_training(
             let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
             model.save_lora_weights(&final_path)?;
             tracing::info!("Saved LoRA weights to {:?}", final_path);
-        } else if (fused || use_jit_compilation) && config.training.gradient_accumulation_steps == 1 {
+        } else if (fused || use_jit_compilation) && config.training.gradient_accumulation_steps == 1
+        {
             // Fused training step (combines forward/backward/optimizer)
             // JIT compilation requires the fused training path for compile_with_state
             let model = training_loop.run_compiled(
@@ -1255,7 +1338,11 @@ async fn run_training(
             tracing::info!("Saved LoRA weights to {:?}", final_path);
         }
 
-        (training_loop.current_loss(), training_loop.current_step(), training_loop.total_tokens())
+        (
+            training_loop.current_loss(),
+            training_loop.current_step(),
+            training_loop.total_tokens(),
+        )
     };
 
     // Finalize metrics callback
@@ -1265,12 +1352,15 @@ async fn run_training(
         let mut custom = std::collections::HashMap::new();
         custom.insert("total_tokens".to_string(), total_tokens as f64);
         custom.insert("total_steps".to_string(), final_step as f64);
-        callback.on_epoch_end(num_epochs.saturating_sub(1), &pmetal_core::EvalMetrics {
-            loss: final_loss,
-            perplexity: final_loss.exp(),
-            accuracy: None,
-            custom,
-        });
+        callback.on_epoch_end(
+            num_epochs.saturating_sub(1),
+            &pmetal_core::EvalMetrics {
+                loss: final_loss,
+                perplexity: final_loss.exp(),
+                accuracy: None,
+                custom,
+            },
+        );
         callback.on_train_end();
         tracing::info!("Metrics saved to {:?}", callback.path());
     }
@@ -1317,9 +1407,12 @@ async fn run_inference(
     minimal: bool,
     show_thinking: bool,
 ) -> anyhow::Result<()> {
-    use pmetal_models::{DynamicModel, GenerationConfig, generate_cached_async, generate_cached_compiled, generate_minimal_async};
     #[cfg(target_os = "macos")]
     use pmetal_models::generate_cached_metal;
+    use pmetal_models::{
+        generate_cached_async, generate_cached_compiled, generate_minimal_async, DynamicModel,
+        GenerationConfig,
+    };
 
     tracing::info!(model = %model_id, "Loading model for inference");
 
@@ -1343,7 +1436,15 @@ async fn run_inference(
         // LoRA requires architecture-specific handling
         // For now, only Llama is supported with LoRA
         // LoRA uses default temperature if not specified
-        return run_inference_with_lora(&model_path, lora_path.unwrap(), &tokenizer, prompt, max_tokens, temperature.unwrap_or(0.7)).await;
+        return run_inference_with_lora(
+            &model_path,
+            lora_path.unwrap(),
+            &tokenizer,
+            prompt,
+            max_tokens,
+            temperature.unwrap_or(0.7),
+        )
+        .await;
     }
 
     // Use DynamicModel for architecture-agnostic inference
@@ -1409,8 +1510,7 @@ async fn run_inference(
 
     // Configure generation with user-specified parameters
     let gen_config = if temperature == 0.0 {
-        GenerationConfig::greedy(max_tokens)
-            .with_stop_tokens(stop_tokens)
+        GenerationConfig::greedy(max_tokens).with_stop_tokens(stop_tokens)
     } else {
         let mut config = GenerationConfig::sampling(max_tokens, temperature)
             .with_top_k(top_k)
@@ -1575,7 +1675,8 @@ async fn run_inference(
     }
 
     println!("\n---");
-    println!("Generated {} tokens in {:.2}s ({:.1} tok/s)",
+    println!(
+        "Generated {} tokens in {:.2}s ({:.1} tok/s)",
         output.num_generated,
         elapsed.as_secs_f64(),
         output.num_generated as f64 / elapsed.as_secs_f64()
@@ -1787,7 +1888,11 @@ fn format_chatml(user_message: &str, system_message: Option<&str>, no_thinking: 
 ///
 /// By default, the model decides when to use `<think>` blocks based on query complexity.
 /// If `no_thinking` is true, prefills empty `<think></think>` to force non-thinking mode.
-fn format_qwen3_chatml(user_message: &str, system_message: Option<&str>, no_thinking: bool) -> String {
+fn format_qwen3_chatml(
+    user_message: &str,
+    system_message: Option<&str>,
+    no_thinking: bool,
+) -> String {
     let mut result = String::new();
 
     if let Some(sys) = system_message {
@@ -1930,13 +2035,13 @@ async fn run_inference_with_lora(
     max_tokens: usize,
     temperature: f32,
 ) -> anyhow::Result<()> {
-    use pmetal_lora::{DynamicLoraModel, TrainableModel};
-    use pmetal_models::{GenerationConfig, generate_cached_async};
     use pmetal_core::LoraConfig;
+    use pmetal_lora::{DynamicLoraModel, TrainableModel};
+    use pmetal_models::{generate_cached_async, GenerationConfig};
 
     // Create LoRA config - we'll load actual weights which override this
     let lora_config = LoraConfig {
-        r: 16,  // Will be overridden by loaded weights
+        r: 16, // Will be overridden by loaded weights
         alpha: 16.0,
         ..Default::default()
     };
@@ -1959,14 +2064,10 @@ async fn run_inference_with_lora(
     // Configure generation
     let gen_config = if temperature > 0.0 {
         GenerationConfig::sampling(max_tokens, temperature)
-            .with_stop_tokens(vec![
-                tokenizer.eos_token_id().unwrap_or(2),
-            ])
+            .with_stop_tokens(vec![tokenizer.eos_token_id().unwrap_or(2)])
     } else {
         GenerationConfig::greedy(max_tokens)
-            .with_stop_tokens(vec![
-                tokenizer.eos_token_id().unwrap_or(2),
-            ])
+            .with_stop_tokens(vec![tokenizer.eos_token_id().unwrap_or(2)])
     };
 
     println!("\nPrompt: {}\n", prompt);
@@ -1975,7 +2076,8 @@ async fn run_inference_with_lora(
     // Create KV cache for efficient generation
     // Cache size = prompt_len + max_tokens + buffer
     let max_seq_len = input_ids.len() + max_tokens + 64;
-    let mut cache = model.create_cache(max_seq_len)
+    let mut cache = model
+        .create_cache(max_seq_len)
         .ok_or_else(|| anyhow::anyhow!("Model does not support KV cache"))?;
     tracing::info!("Created KV cache for {} tokens", max_seq_len);
 
@@ -1984,7 +2086,8 @@ async fn run_inference_with_lora(
     // Generate with KV cache (O(n+k) complexity - fast!)
     let output = generate_cached_async(
         |input, cache| {
-            model.forward_with_cache(input, None, Some(cache))
+            model
+                .forward_with_cache(input, None, Some(cache))
                 .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
         },
         &input_ids,
@@ -2002,8 +2105,12 @@ async fn run_inference_with_lora(
 
     let tokens_per_sec = output.num_generated as f64 / elapsed.as_secs_f64();
     println!("\n---");
-    println!("Generated {} tokens in {:.2}s ({:.1} tok/s)",
-             output.num_generated, elapsed.as_secs_f64(), tokens_per_sec);
+    println!(
+        "Generated {} tokens in {:.2}s ({:.1} tok/s)",
+        output.num_generated,
+        elapsed.as_secs_f64(),
+        tokens_per_sec
+    );
     if output.stopped_by_token {
         println!("Stopped by: EOS token");
     } else {
@@ -2163,7 +2270,10 @@ fn validate_ollama_model_name(name: &str) -> anyhow::Result<()> {
     if name.starts_with('.') || name.starts_with('-') {
         anyhow::bail!("Model name cannot start with '.' or '-'");
     }
-    if !name.chars().all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':')) {
+    if !name
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'))
+    {
         anyhow::bail!(
             "Invalid model name '{}'. Name must contain only alphanumeric characters, \
              hyphens, underscores, periods, colons, and forward slashes.",
@@ -2178,7 +2288,10 @@ fn validate_file_path(path: &str, allow_creation: bool) -> anyhow::Result<std::p
     let path = std::path::Path::new(path);
 
     // Prevent path traversal
-    if path.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
         anyhow::bail!("Invalid path: path traversal detected (.. not allowed)");
     }
 
@@ -2219,11 +2332,16 @@ fn create_ollama_model(
     // Create secure temporary file
     let temp_dir = std::env::temp_dir();
     // Use a sanitized name for the temp file
-    let safe_name: String = name.chars()
+    let safe_name: String = name
+        .chars()
         .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
         .take(64)
         .collect();
-    let modelfile_path = temp_dir.join(format!("pmetal-modelfile-{}-{}", safe_name, std::process::id()));
+    let modelfile_path = temp_dir.join(format!(
+        "pmetal-modelfile-{}-{}",
+        safe_name,
+        std::process::id()
+    ));
     let modelfile_str = modelfile_path.to_string_lossy().to_string();
 
     generate_modelfile(
@@ -2569,7 +2687,11 @@ fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
 ///
 /// Python baseline: ~7420 argmax ops/sec (~0.135ms per op) on Qwen3 vocab size.
 fn run_ffi_benchmark() -> anyhow::Result<()> {
-    use mlx_rs::{Array, ops::indexing::{argmax, argmax_axis}, transforms::eval};
+    use mlx_rs::{
+        ops::indexing::{argmax, argmax_axis},
+        transforms::eval,
+        Array,
+    };
     use std::time::Instant;
 
     println!("FFI Overhead Benchmark");
@@ -2676,7 +2798,11 @@ fn run_ffi_benchmark() -> anyhow::Result<()> {
     let elapsed = start.elapsed();
 
     let per_op_us = elapsed.as_micros() as f64 / n_iters as f64;
-    println!("Per iteration with async_eval: {:.3} ms ({:.1} us)", per_op_us / 1000.0, per_op_us);
+    println!(
+        "Per iteration with async_eval: {:.3} ms ({:.1} us)",
+        per_op_us / 1000.0,
+        per_op_us
+    );
 
     // Test 5: Measure graph construction vs execution
     println!("\n--- Test 5: Graph construction vs execution timing ---");
@@ -2691,7 +2817,10 @@ fn run_ffi_benchmark() -> anyhow::Result<()> {
     }
     let graph_time = start.elapsed();
     println!("Graph construction (100 iters): {:?}", graph_time);
-    println!("Per graph: {:.3} ms", graph_time.as_micros() as f64 / 100.0 / 1000.0);
+    println!(
+        "Per graph: {:.3} ms",
+        graph_time.as_micros() as f64 / 100.0 / 1000.0
+    );
 
     // Now evaluate all
     let start = Instant::now();
@@ -2700,7 +2829,10 @@ fn run_ffi_benchmark() -> anyhow::Result<()> {
     }
     let exec_time = start.elapsed();
     println!("Execution (100 iters): {:?}", exec_time);
-    println!("Per execution: {:.3} ms", exec_time.as_micros() as f64 / 100.0 / 1000.0);
+    println!(
+        "Per execution: {:.3} ms",
+        exec_time.as_micros() as f64 / 100.0 / 1000.0
+    );
 
     Ok(())
 }
@@ -2709,8 +2841,12 @@ fn run_ffi_benchmark() -> anyhow::Result<()> {
 ///
 /// This profiles each step of the generation loop to compare with mlx_lm's timing.
 async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
+    use mlx_rs::{
+        ops::indexing::{argmax, IndexOp},
+        transforms::{async_eval, eval},
+        Array,
+    };
     use pmetal_models::DynamicModel;
-    use mlx_rs::{Array, ops::indexing::{argmax, IndexOp}, transforms::{eval, async_eval}};
     use std::path::PathBuf;
     use std::time::Instant;
 
@@ -2799,12 +2935,17 @@ async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
     // Print results
     println!("=== Generation Loop Timing ===");
     for (name, durations) in &times {
-        let avg_us: f64 = durations.iter().map(|d| d.as_micros() as f64).sum::<f64>() / durations.len() as f64;
+        let avg_us: f64 =
+            durations.iter().map(|d| d.as_micros() as f64).sum::<f64>() / durations.len() as f64;
         let avg_ms = avg_us / 1000.0;
         println!("{:15}: {:7.3}ms", name, avg_ms);
     }
 
-    let total_avg: f64 = times["total"].iter().map(|d| d.as_micros() as f64).sum::<f64>() / times["total"].len() as f64;
+    let total_avg: f64 = times["total"]
+        .iter()
+        .map(|d| d.as_micros() as f64)
+        .sum::<f64>()
+        / times["total"].len() as f64;
     println!("\nEffective tok/s: {:.0}", 1_000_000.0 / total_avg);
 
     println!("\n=== Comparison ===");

@@ -35,10 +35,7 @@ use pmetal_metal::{
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
     error::MetalError,
-    kernels::{
-        AdamWConfig, BatchedCommandBuffer, FusedAdamW, FusedGradientClipping,
-        ParamInfo,
-    },
+    kernels::{AdamWConfig, BatchedCommandBuffer, FusedAdamW, FusedGradientClipping, ParamInfo},
 };
 
 /// Error type for Metal-fused operations.
@@ -128,10 +125,7 @@ impl MetalFusedOptimizer {
     /// # Arguments
     /// * `param_sizes` - Sizes of each parameter tensor
     /// * `config` - Optimizer configuration
-    pub fn new(
-        param_sizes: &[usize],
-        config: MetalFusedConfig,
-    ) -> MetalFusedResult<Self> {
+    pub fn new(param_sizes: &[usize], config: MetalFusedConfig) -> MetalFusedResult<Self> {
         let ctx = MetalContext::global()?;
         let total_elements: usize = param_sizes.iter().sum();
 
@@ -250,9 +244,13 @@ pub fn is_metal_fused_available() -> bool {
 
 /// Get information about the Metal device.
 pub fn metal_device_info() -> Option<String> {
-    MetalContext::global()
-        .ok()
-        .map(|ctx| format!("{} ({:?})", ctx.properties().name, ctx.properties().device_tier))
+    MetalContext::global().ok().map(|ctx| {
+        format!(
+            "{} ({:?})",
+            ctx.properties().name,
+            ctx.properties().device_tier
+        )
+    })
 }
 
 #[cfg(test)]

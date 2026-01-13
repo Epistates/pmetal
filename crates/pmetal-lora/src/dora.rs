@@ -12,9 +12,9 @@
 //! DoRA typically achieves better performance than LoRA by allowing the magnitude
 //! and direction of updates to be learned separately, closer to full fine-tuning.
 
+use crate::lora::LoraError;
 use mlx_rs::{error::Exception, nn, Array};
 use pmetal_core::LoraConfig;
-use crate::lora::LoraError;
 
 /// DoRA Linear layer implementing weight decomposition.
 #[derive(Debug)]
@@ -244,7 +244,9 @@ impl DoraLinear {
             return Ok(());
         }
         // TODO: Store original weight for unmerging
-        Err(LoraError::Mlx(Exception::custom("DoRA unmerge not yet supported without original weight storage")))
+        Err(LoraError::Mlx(Exception::custom(
+            "DoRA unmerge not yet supported without original weight storage",
+        )))
     }
 
     /// Get trainable parameters: LoRA A, LoRA B, and Magnitude.
@@ -268,14 +270,28 @@ mod tests {
     #[test]
     fn test_dora_linear_initialization() {
         let dora = DoraLinear::new(64, 128, 8, 16.0, false, false).unwrap();
-        
+
         assert_eq!(dora.in_features, 64);
         assert_eq!(dora.out_features, 128);
         assert_eq!(dora.magnitude.shape(), &[128, 1]);
-        
+
         // Magnitude should be close to norm of initialized weights
-        let w_norm = dora.weight.square().unwrap().sum_axis(1, true).unwrap().sqrt().unwrap();
-        let diff = dora.magnitude.subtract(&w_norm).unwrap().abs().unwrap().sum(None).unwrap();
+        let w_norm = dora
+            .weight
+            .square()
+            .unwrap()
+            .sum_axis(1, true)
+            .unwrap()
+            .sqrt()
+            .unwrap();
+        let diff = dora
+            .magnitude
+            .subtract(&w_norm)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .sum(None)
+            .unwrap();
         assert!(diff.item::<f32>() < 1e-4);
     }
 
@@ -283,7 +299,7 @@ mod tests {
     fn test_dora_forward_pass() {
         let mut dora = DoraLinear::new(32, 64, 4, 8.0, false, false).unwrap();
         let x = mlx_rs::random::normal::<f32>(&[2, 4, 32], None, None, None).unwrap();
-        
+
         let output = dora.forward(&x).unwrap();
         assert_eq!(output.shape(), &[2, 4, 64]);
     }

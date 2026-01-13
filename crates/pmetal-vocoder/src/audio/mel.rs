@@ -162,10 +162,7 @@ pub fn mel_filterbank(config: &MelConfig) -> Result<Array> {
         }
     }
 
-    Ok(Array::from_slice(
-        &filterbank,
-        &[config.n_mels, n_freqs],
-    ))
+    Ok(Array::from_slice(&filterbank, &[config.n_mels, n_freqs]))
 }
 
 /// Compute mel spectrogram from audio.

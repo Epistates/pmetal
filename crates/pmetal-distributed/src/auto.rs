@@ -105,11 +105,7 @@ impl AutoDiscoveryBackend {
         let (event_tx, event_rx) = mpsc::channel(256);
 
         // Create and spawn discovery service
-        let discovery = DiscoveryService::new(
-            identity.clone(),
-            config.discovery_port,
-            event_tx,
-        );
+        let discovery = DiscoveryService::new(identity.clone(), config.discovery_port, event_tx);
         let discovery_state = discovery.state();
 
         // Spawn discovery in background
@@ -160,8 +156,15 @@ impl AutoDiscoveryBackend {
     /// Wait for a minimum number of peers to be discovered.
     ///
     /// Returns the number of peers found, or an error if timeout occurs.
-    pub async fn wait_for_peers(&self, min_peers: usize, timeout_duration: Duration) -> Result<usize> {
-        info!("Waiting for {} peers (timeout: {:?})", min_peers, timeout_duration);
+    pub async fn wait_for_peers(
+        &self,
+        min_peers: usize,
+        timeout_duration: Duration,
+    ) -> Result<usize> {
+        info!(
+            "Waiting for {} peers (timeout: {:?})",
+            min_peers, timeout_duration
+        );
 
         let start = std::time::Instant::now();
 
@@ -254,10 +257,7 @@ impl AutoDiscoveryBackend {
                 .collect();
 
             // Collect peer IDs for logging
-            let peer_ids: Vec<String> = ring_order
-                .iter()
-                .map(|n| n.peer_id.to_base58())
-                .collect();
+            let peer_ids: Vec<String> = ring_order.iter().map(|n| n.peer_id.to_base58()).collect();
 
             (local_rank, world_size, node_addrs, peer_ids)
         }; // topology lock released here

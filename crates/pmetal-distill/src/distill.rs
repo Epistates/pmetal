@@ -9,9 +9,12 @@ use mlx_rs::Array;
 use tracing::{debug, info, warn};
 
 use crate::{
-    losses::{DistillLoss, KlDivergenceLoss, JensenShannonLoss, SoftCrossEntropyLoss, MseLoss, HiddenStateLoss},
+    losses::{
+        DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, MseLoss,
+        SoftCrossEntropyLoss,
+    },
     offline::{LogitCache, LogitCompressor},
-    DistillConfig, DistillError, DistillMethod, LossType, Result, CompressionMethod,
+    CompressionMethod, DistillConfig, DistillError, DistillMethod, LossType, Result,
 };
 
 /// Run knowledge distillation with the given configuration.
@@ -67,24 +70,22 @@ impl DistillerBuilder {
 
     /// Build the Distiller.
     pub fn build(self) -> Result<Distiller> {
-        let config = self.config.ok_or_else(|| {
-            DistillError::InvalidConfig("Configuration is required".to_string())
-        })?;
+        let config = self
+            .config
+            .ok_or_else(|| DistillError::InvalidConfig("Configuration is required".to_string()))?;
 
         // Create loss function from config if not provided
-        let loss: Box<dyn DistillLoss> = self.loss.unwrap_or_else(|| {
-            match config.loss.loss_type {
-                LossType::KlDivergence => {
-                    if config.loss.reverse_kl {
-                        Box::new(KlDivergenceLoss::reverse())
-                    } else {
-                        Box::new(KlDivergenceLoss::new())
-                    }
+        let loss: Box<dyn DistillLoss> = self.loss.unwrap_or_else(|| match config.loss.loss_type {
+            LossType::KlDivergence => {
+                if config.loss.reverse_kl {
+                    Box::new(KlDivergenceLoss::reverse())
+                } else {
+                    Box::new(KlDivergenceLoss::new())
                 }
-                LossType::JensenShannon => Box::new(JensenShannonLoss::new()),
-                LossType::SoftCrossEntropy => Box::new(SoftCrossEntropyLoss::new()),
-                LossType::MseLoss => Box::new(MseLoss::new()),
             }
+            LossType::JensenShannon => Box::new(JensenShannonLoss::new()),
+            LossType::SoftCrossEntropy => Box::new(SoftCrossEntropyLoss::new()),
+            LossType::MseLoss => Box::new(MseLoss::new()),
         });
 
         Ok(Distiller {
@@ -135,7 +136,10 @@ impl Distiller {
         // This would integrate with pmetal-trainer for actual training
         // For now, we provide the infrastructure for the training loop
 
-        let output_path = self.config.output_path.clone()
+        let output_path = self
+            .config
+            .output_path
+            .clone()
             .unwrap_or_else(|| PathBuf::from("./distilled_model"));
 
         info!("Online distillation configured");
@@ -163,10 +167,15 @@ impl Distiller {
         info!("Running offline distillation");
 
         let offline_config = self.config.offline.as_ref().ok_or_else(|| {
-            DistillError::InvalidConfig("Offline config required for offline distillation".to_string())
+            DistillError::InvalidConfig(
+                "Offline config required for offline distillation".to_string(),
+            )
         })?;
 
-        let output_path = self.config.output_path.clone()
+        let output_path = self
+            .config
+            .output_path
+            .clone()
             .unwrap_or_else(|| PathBuf::from("./distilled_model"));
 
         if offline_config.generate {
@@ -177,7 +186,10 @@ impl Distiller {
 
         // Load cached logits
         let cache = LogitCache::load(&offline_config.logits_path)?;
-        info!("Loaded logit cache with {} sequences", cache.metadata().num_sequences);
+        info!(
+            "Loaded logit cache with {} sequences",
+            cache.metadata().num_sequences
+        );
         info!("  Compression: {}", cache.metadata().compression);
         info!("  Vocab size: {}", cache.metadata().vocab_size);
 
@@ -194,7 +206,10 @@ impl Distiller {
 
     /// Generate and cache teacher logits.
     fn generate_logits(&self, offline_config: &crate::OfflineConfig) -> Result<()> {
-        info!("Generating teacher logits to {:?}", offline_config.logits_path);
+        info!(
+            "Generating teacher logits to {:?}",
+            offline_config.logits_path
+        );
 
         let mut cache = LogitCache::new(
             &offline_config.logits_path,
@@ -226,7 +241,10 @@ impl Distiller {
     fn run_progressive(&self) -> Result<PathBuf> {
         info!("Running progressive distillation");
 
-        let output_path = self.config.output_path.clone()
+        let output_path = self
+            .config
+            .output_path
+            .clone()
             .unwrap_or_else(|| PathBuf::from("./distilled_model"));
 
         let total_steps = self.config.training.epochs * 1000; // Approximate
@@ -255,11 +273,9 @@ impl Distiller {
         labels: Option<&Array>,
     ) -> Result<DistillLossOutput> {
         // Soft distillation loss
-        let soft_loss = self.loss.compute(
-            teacher_logits,
-            student_logits,
-            self.config.loss.temperature,
-        )?;
+        let soft_loss =
+            self.loss
+                .compute(teacher_logits, student_logits, self.config.loss.temperature)?;
 
         // Scale by temperature squared (to maintain gradient magnitude)
         let t_squared = self.config.loss.temperature * self.config.loss.temperature;
@@ -401,10 +417,7 @@ mod tests {
     #[test]
     fn test_distiller_builder() {
         let config = test_config();
-        let distiller = DistillerBuilder::new()
-            .with_config(config)
-            .build()
-            .unwrap();
+        let distiller = DistillerBuilder::new().with_config(config).build().unwrap();
 
         assert_eq!(distiller.config().teacher, "teacher-model");
         assert_eq!(distiller.loss.name(), "kl_divergence");

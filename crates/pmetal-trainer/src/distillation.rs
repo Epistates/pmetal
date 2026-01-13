@@ -3,20 +3,13 @@
 //! Implements the training loop for distilling knowledge from a teacher model
 //! to a student model. Supports Online, Offline, and Progressive distillation.
 
+use mlx_rs::{error::Exception, nn, optimizers::Optimizer, Array};
 use pmetal_data::{DataLoader, TrainingDataset};
-use pmetal_distill::{Distiller, DistillLossOutput};
+use pmetal_distill::{DistillLossOutput, Distiller};
 use pmetal_lora::TrainableModel;
 use pmetal_mlx::kernels::with_training_mode;
-use mlx_rs::{
-    error::Exception,
-    nn,
-    optimizers::Optimizer,
-    Array,
-};
 
-use crate::{
-    CheckpointManager, Result, SftError, StepStats, TrainingLoop, TrainingLoopConfig,
-};
+use crate::{CheckpointManager, Result, SftError, StepStats, TrainingLoop, TrainingLoopConfig};
 
 /// Trainer for Knowledge Distillation.
 pub struct DistillationTrainer {
@@ -55,22 +48,24 @@ impl DistillationTrainer {
         O: Optimizer,
     {
         let start_time = std::time::Instant::now();
-        let batch_tokens = batch.batch_size.checked_mul(batch.seq_len).unwrap_or(usize::MAX);
+        let batch_tokens = batch
+            .batch_size
+            .checked_mul(batch.seq_len)
+            .unwrap_or(usize::MAX);
 
         // 1. Teacher Forward Pass (No Grad)
         // We run this outside the autodiff scope to save memory/compute
         let teacher_logits = teacher
             .forward(&batch.input_ids, None)
             .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
-        
+
         // Note: No explicit stop_gradient needed here as these logits enter the loss function
         // as a constant input (not the first argument to value_and_grad).
 
         // 2. Define Loss Function for Student
         let loss_fn = |student: &mut S,
                        (input_ids, labels, teacher_logits): (&Array, &Array, &Array)|
-                       -> std::result::Result<Array, Exception> {
-            
+         -> std::result::Result<Array, Exception> {
             // Student Forward
             let student_logits = student
                 .forward(input_ids, None)
@@ -78,9 +73,14 @@ impl DistillationTrainer {
 
             // Compute Distillation Loss
             // We can optionally pass labels for "hard" loss component
-            let labels_opt = if labels.size() > 0 { Some(labels) } else { None };
-            
-            let output: DistillLossOutput = self.distiller
+            let labels_opt = if labels.size() > 0 {
+                Some(labels)
+            } else {
+                None
+            };
+
+            let output: DistillLossOutput = self
+                .distiller
                 .compute_loss(teacher_logits, &student_logits, labels_opt)
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
@@ -89,7 +89,7 @@ impl DistillationTrainer {
 
         // 3. Student Backward Pass & Update
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-        
+
         // Use Metal FlashAttention if available
         let (loss, grads) = if self.loop_state.metal_fa_available {
             let result = with_training_mode(|| {
@@ -137,7 +137,7 @@ impl DistillationTrainer {
         // Setup optimizer
         let base_lr = self.loop_state.config.training.learning_rate as f32;
         // let _weight_decay = self.loop_state.config.training.weight_decay as f32;
-        
+
         // TODO: Support embedding LR if needed
         let mut optimizer = mlx_rs::optimizers::AdamW::new(base_lr);
         // Set weight decay if exposed, mlx-rs AdamW might not expose builder easily here
@@ -149,29 +149,31 @@ impl DistillationTrainer {
 
         for epoch in 0..num_epochs {
             self.loop_state.epoch = epoch;
-            
+
             let mut dataloader = DataLoader::new(
                 train_dataset.clone(),
                 self.loop_state.config.dataloader.clone(),
                 None,
             );
-            
+
             if epoch > 0 {
                 dataloader.reset(Some(self.loop_state.config.dataloader.seed + epoch as u64));
             }
 
             while let Some(batch) = dataloader.next_batch() {
                 let stats = self.train_step(student, teacher, &batch, &mut optimizer)?;
-                
+
                 self.loop_state.step += 1;
-                
+
                 if self.loop_state.step % self.loop_state.config.log_every == 0 {
                     tracing::info!(
                         "Step {}: loss={:.4}, lr={:.2e}",
-                        stats.step, stats.loss, stats.learning_rate
+                        stats.step,
+                        stats.loss,
+                        stats.learning_rate
                     );
                 }
-                
+
                 // TODO: Checkpointing and Evaluation logic
             }
         }

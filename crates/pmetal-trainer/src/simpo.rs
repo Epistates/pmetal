@@ -27,10 +27,10 @@
 //! - "SimPO: Simple Preference Optimization with a Reference-Free Reward"
 //!   (Meng et al., 2024)
 
-use pmetal_core::TrainingConfig;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
+use pmetal_core::TrainingConfig;
 
 /// Error type for SimPO training.
 #[derive(Debug, thiserror::Error)]
@@ -277,11 +277,7 @@ impl SimpoTrainer {
     }
 
     /// Compute sequence-level reward (length-normalized or summed).
-    pub fn compute_rewards(
-        &self,
-        per_token_logps: &Array,
-        mask: &Array,
-    ) -> SimpoResult<Array> {
+    pub fn compute_rewards(&self, per_token_logps: &Array, mask: &Array) -> SimpoResult<Array> {
         let masked_logps = per_token_logps.multiply(mask)?;
         let sum_logps = masked_logps.sum_axis(-1, None)?;
 
@@ -349,9 +345,7 @@ impl SimpoTrainer {
             // Smoothed loss: (1-ε)*loss + ε*flipped_loss
             let flipped_margin = rejected_scaled.subtract(&chosen_scaled)?.subtract(&gamma)?;
             let flipped_loss = match self.config.loss_type {
-                SimpoLossType::Sigmoid => {
-                    mlx_rs::nn::log_sigmoid(&flipped_margin)?.negative()?
-                }
+                SimpoLossType::Sigmoid => mlx_rs::nn::log_sigmoid(&flipped_margin)?.negative()?,
                 SimpoLossType::Hinge => {
                     let one = Array::from_f32(1.0);
                     let hinge = one.subtract(&flipped_margin)?;
@@ -364,7 +358,8 @@ impl SimpoTrainer {
                 }
             };
 
-            loss.multiply(&one_minus_smooth)?.add(&flipped_loss.multiply(&smooth)?)?
+            loss.multiply(&one_minus_smooth)?
+                .add(&flipped_loss.multiply(&smooth)?)?
         } else {
             loss
         };
@@ -433,16 +428,53 @@ impl SimpoTrainer {
         let metrics = SimpoMetrics {
             loss: total_loss.item::<f32>(),
             simpo_loss: simpo_loss.item::<f32>(),
-            cpo_loss: cpo_loss.map(|l| { l.eval().ok(); l.item::<f32>() }).unwrap_or(0.0),
-            sft_loss: sft_loss.map(|l| { l.eval().ok(); l.item::<f32>() }).unwrap_or(0.0),
-            chosen_reward: chosen_rewards.mean(None).ok().map(|m| { m.eval().ok(); m.item::<f32>() }).unwrap_or(0.0),
-            rejected_reward: rejected_rewards.mean(None).ok().map(|m| { m.eval().ok(); m.item::<f32>() }).unwrap_or(0.0),
-            margin: margin.mean(None).ok().map(|m| { m.eval().ok(); m.item::<f32>() }).unwrap_or(0.0),
-            accuracy: (margin.gt(&Array::from_f32(0.0)).ok()
+            cpo_loss: cpo_loss
+                .map(|l| {
+                    l.eval().ok();
+                    l.item::<f32>()
+                })
+                .unwrap_or(0.0),
+            sft_loss: sft_loss
+                .map(|l| {
+                    l.eval().ok();
+                    l.item::<f32>()
+                })
+                .unwrap_or(0.0),
+            chosen_reward: chosen_rewards
+                .mean(None)
+                .ok()
                 .map(|m| {
-                    m.as_dtype(mlx_rs::Dtype::Float32).ok()
+                    m.eval().ok();
+                    m.item::<f32>()
+                })
+                .unwrap_or(0.0),
+            rejected_reward: rejected_rewards
+                .mean(None)
+                .ok()
+                .map(|m| {
+                    m.eval().ok();
+                    m.item::<f32>()
+                })
+                .unwrap_or(0.0),
+            margin: margin
+                .mean(None)
+                .ok()
+                .map(|m| {
+                    m.eval().ok();
+                    m.item::<f32>()
+                })
+                .unwrap_or(0.0),
+            accuracy: (margin
+                .gt(&Array::from_f32(0.0))
+                .ok()
+                .map(|m| {
+                    m.as_dtype(mlx_rs::Dtype::Float32)
+                        .ok()
                         .and_then(|m| m.mean(None).ok())
-                        .map(|m| { m.eval().ok(); m.item::<f32>() })
+                        .map(|m| {
+                            m.eval().ok();
+                            m.item::<f32>()
+                        })
                         .unwrap_or(0.0)
                 })
                 .unwrap_or(0.0)),
@@ -522,11 +554,7 @@ mod tests {
 
     #[test]
     fn test_preference_pair() {
-        let pair = PreferencePair::new(
-            vec![1, 2, 3],
-            vec![4, 5, 6],
-            vec![7, 8],
-        );
+        let pair = PreferencePair::new(vec![1, 2, 3], vec![4, 5, 6], vec![7, 8]);
 
         assert_eq!(pair.chosen_length(), 3);
         assert_eq!(pair.rejected_length(), 2);
@@ -566,8 +594,7 @@ mod tests {
 
     #[test]
     fn test_simpo_loss_hinge() {
-        let config = SimpoConfig::new()
-            .with_loss_type(SimpoLossType::Hinge);
+        let config = SimpoConfig::new().with_loss_type(SimpoLossType::Hinge);
         let training_config = TrainingConfig::default();
         let trainer = SimpoTrainer::new(config, training_config).unwrap();
 
@@ -585,8 +612,7 @@ mod tests {
 
     #[test]
     fn test_simpo_with_cpo() {
-        let config = SimpoConfig::new()
-            .with_cpo(0.1);
+        let config = SimpoConfig::new().with_cpo(0.1);
         let training_config = TrainingConfig::default();
         let trainer = SimpoTrainer::new(config, training_config).unwrap();
 
@@ -612,8 +638,7 @@ mod tests {
 
     #[test]
     fn test_simpo_with_sft() {
-        let config = SimpoConfig::new()
-            .with_sft_loss(0.1);
+        let config = SimpoConfig::new().with_sft_loss(0.1);
         let training_config = TrainingConfig::default();
         let trainer = SimpoTrainer::new(config, training_config).unwrap();
 

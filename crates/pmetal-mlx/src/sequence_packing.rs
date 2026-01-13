@@ -130,10 +130,7 @@ impl SequencePacker {
     ///
     /// # Returns
     /// A packed batch with concatenated sequences.
-    pub fn pack_sequences(
-        &self,
-        sequences: &[(&Array, &Array)],
-    ) -> Result<PackedBatch, Exception> {
+    pub fn pack_sequences(&self, sequences: &[(&Array, &Array)]) -> Result<PackedBatch, Exception> {
         if sequences.is_empty() {
             return Err(Exception::custom("Cannot pack empty sequence list"));
         }
@@ -206,7 +203,9 @@ impl SequencePacker {
                 if self.config.reset_position_ids {
                     packed_positions.extend((0..seq_len as i32).collect::<Vec<_>>());
                 } else {
-                    packed_positions.extend((current_pos as i32..(current_pos + seq_len) as i32).collect::<Vec<_>>());
+                    packed_positions.extend(
+                        (current_pos as i32..(current_pos + seq_len) as i32).collect::<Vec<_>>(),
+                    );
                 }
 
                 current_pos += seq_len;
@@ -226,18 +225,10 @@ impl SequencePacker {
         }
 
         // Create tensors
-        let input_ids = Array::from_slice(
-            &all_input_ids.concat(),
-            &[batch_size as i32, max_len],
-        );
-        let labels = Array::from_slice(
-            &all_labels.concat(),
-            &[batch_size as i32, max_len],
-        );
-        let position_ids = Array::from_slice(
-            &all_position_ids.concat(),
-            &[batch_size as i32, max_len],
-        );
+        let input_ids = Array::from_slice(&all_input_ids.concat(), &[batch_size as i32, max_len]);
+        let labels = Array::from_slice(&all_labels.concat(), &[batch_size as i32, max_len]);
+        let position_ids =
+            Array::from_slice(&all_position_ids.concat(), &[batch_size as i32, max_len]);
 
         // Create attention mask
         let attention_mask = if self.config.use_block_diagonal_attention {
@@ -267,10 +258,17 @@ impl SequencePacker {
         let mut mask_data = Vec::with_capacity(batch_size * max_len);
         for ids in all_input_ids {
             for &id in ids {
-                mask_data.push(if id != self.config.pad_token_id { 1.0f32 } else { 0.0f32 });
+                mask_data.push(if id != self.config.pad_token_id {
+                    1.0f32
+                } else {
+                    0.0f32
+                });
             }
         }
-        Ok(Array::from_slice(&mask_data, &[batch_size as i32, max_len as i32]))
+        Ok(Array::from_slice(
+            &mask_data,
+            &[batch_size as i32, max_len as i32],
+        ))
     }
 
     /// Create a block diagonal attention mask for packed sequences.
@@ -341,10 +339,7 @@ impl SequencePacker {
 ///
 /// # Returns
 /// Efficiency as a ratio (0.0 - 1.0), where 1.0 means perfect packing.
-pub fn calculate_packing_efficiency(
-    sequence_lengths: &[usize],
-    max_seq_len: usize,
-) -> f64 {
+pub fn calculate_packing_efficiency(sequence_lengths: &[usize], max_seq_len: usize) -> f64 {
     if sequence_lengths.is_empty() {
         return 0.0;
     }
@@ -479,10 +474,7 @@ mod tests {
         let seq2_ids = Array::from_slice(&[6i32, 7, 8], &[3]);
         let seq2_labels = Array::from_slice(&[6i32, 7, 8], &[3]);
 
-        let sequences = vec![
-            (&seq1_ids, &seq1_labels),
-            (&seq2_ids, &seq2_labels),
-        ];
+        let sequences = vec![(&seq1_ids, &seq1_labels), (&seq2_ids, &seq2_labels)];
 
         let packed = packer.pack_sequences(&sequences).unwrap();
 
@@ -504,10 +496,7 @@ mod tests {
         let seq2_ids = Array::from_slice(&[4i32, 5], &[2]);
         let seq2_labels = Array::from_slice(&[4i32, 5], &[2]);
 
-        let sequences = vec![
-            (&seq1_ids, &seq1_labels),
-            (&seq2_ids, &seq2_labels),
-        ];
+        let sequences = vec![(&seq1_ids, &seq1_labels), (&seq2_ids, &seq2_labels)];
 
         let packed = packer.pack_sequences(&sequences).unwrap();
 
@@ -544,8 +533,7 @@ mod tests {
 
     #[test]
     fn test_multiple_bins_required() {
-        let config = PackingConfig::new(10)
-            .with_block_diagonal_attention(false);
+        let config = PackingConfig::new(10).with_block_diagonal_attention(false);
         let packer = SequencePacker::new(config);
 
         // Each sequence is 8 tokens - can't fit 2 in max_len=10

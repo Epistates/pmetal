@@ -20,11 +20,11 @@
 //! - `pi_ref` is the reference model (frozen)
 //! - `beta` is the temperature parameter
 
-use pmetal_core::TrainingConfig;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 use mlx_rs::Dtype;
+use pmetal_core::TrainingConfig;
 
 /// Error type for DPO training.
 #[derive(Debug, thiserror::Error)]
@@ -306,7 +306,8 @@ impl DpoTrainer {
         // Mask out ignored tokens
         // valid_mask is [B, S] boolean
         // multiply by mask (cast to float)
-        let masked_log_probs = gathered_log_probs.multiply(&valid_mask.as_dtype(Dtype::Float32)?)?;
+        let masked_log_probs =
+            gathered_log_probs.multiply(&valid_mask.as_dtype(Dtype::Float32)?)?;
 
         // Sum over sequence dimension -> [B]
         let total_log_probs = masked_log_probs.sum_axes(&[1i32], false)?;
@@ -473,7 +474,9 @@ impl DpoTrainer {
             let s = Array::from_f32(self.config.label_smoothing as f32);
             let one_minus_s = Array::from_f32((1.0 - self.config.label_smoothing) as f32);
 
-            let loss = pos_loss.multiply(&one_minus_s)?.add(&neg_loss.multiply(&s)?)?;
+            let loss = pos_loss
+                .multiply(&one_minus_s)?
+                .add(&neg_loss.multiply(&s)?)?;
             Ok(loss)
         } else {
             // Simple: -log_sigmoid(logits) = softplus(-logits)
@@ -635,7 +638,9 @@ impl DpoTrainer {
     {
         // Validate batch_size
         if batch_size == 0 {
-            return Err(DpoError::Config("batch_size must be greater than 0".to_string()));
+            return Err(DpoError::Config(
+                "batch_size must be greater than 0".to_string(),
+            ));
         }
 
         let mut all_chosen_logps = Vec::new();
@@ -903,12 +908,7 @@ mod tests {
         let ref_rejected = Array::from_slice(&[0.0f32], &[1]); // Should be ignored
 
         let (loss, _, _) = trainer
-            .compute_dpo_loss(
-                &policy_chosen,
-                &policy_rejected,
-                &ref_chosen,
-                &ref_rejected,
-            )
+            .compute_dpo_loss(&policy_chosen, &policy_rejected, &ref_chosen, &ref_rejected)
             .unwrap();
 
         loss.eval().unwrap();
@@ -991,10 +991,16 @@ mod tests {
         let logits_data: Vec<f32> = (0..batch_size * seq_len * vocab_size)
             .map(|i| (i as f32) * 0.1)
             .collect();
-        let logits = Array::from_slice(&logits_data, &[batch_size as i32, seq_len as i32, vocab_size as i32]);
+        let logits = Array::from_slice(
+            &logits_data,
+            &[batch_size as i32, seq_len as i32, vocab_size as i32],
+        );
 
         // i64 labels (common from PyTorch datasets)
-        let labels_i64 = Array::from_slice(&[-100i64, 1, 2, 3, -100, 4, 5, 6], &[batch_size as i32, seq_len as i32]);
+        let labels_i64 = Array::from_slice(
+            &[-100i64, 1, 2, 3, -100, 4, 5, 6],
+            &[batch_size as i32, seq_len as i32],
+        );
 
         // Compute log probs - should handle dtype mismatch
         let result = trainer.compute_log_probs(&logits, &labels_i64);

@@ -7,14 +7,13 @@ use pmetal_core::Result;
 
 /// FP4 quantization bins (positive values only, sign is separate).
 pub const FP4_BINS: [f32; 8] = [
-    0.0,
-    0.0625,  // 2^-4
-    0.125,   // 2^-3
-    0.25,    // 2^-2
-    0.5,     // 2^-1
-    1.0,     // 2^0
-    2.0,     // 2^1
-    4.0,     // 2^2 (scaled)
+    0.0, 0.0625, // 2^-4
+    0.125,  // 2^-3
+    0.25,   // 2^-2
+    0.5,    // 2^-1
+    1.0,    // 2^0
+    2.0,    // 2^1
+    4.0,    // 2^2 (scaled)
 ];
 
 /// FP4 quantizer configuration.

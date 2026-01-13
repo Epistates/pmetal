@@ -18,7 +18,9 @@
 //!
 //! Based on llama.cpp/GGML K-quant implementation and Candle's quantized module.
 
-use crate::quantize::{get_scale_min_k4, make_q3_quants, make_qkx1_quants, make_qx_quants, nearest_int};
+use crate::quantize::{
+    get_scale_min_k4, make_q3_quants, make_qkx1_quants, make_qx_quants, nearest_int,
+};
 use half::f16;
 
 /// Block size for all K-quants (256 elements per block).
@@ -479,7 +481,12 @@ pub fn dequantize_q4k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
         let mut qs = [0u8; QK_K / 2];
         qs.copy_from_slice(&block_bytes[4 + K_SCALE_SIZE..]);
 
-        let block = BlockQ4K { d, dmin, scales, qs };
+        let block = BlockQ4K {
+            d,
+            dmin,
+            scales,
+            qs,
+        };
 
         // Dequantize this block
         let mut block_output = [0.0f32; QK_K];
@@ -514,7 +521,10 @@ pub fn dequantize_q8k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 
         // Parse block from bytes
         let d = f32::from_le_bytes([
-            block_bytes[0], block_bytes[1], block_bytes[2], block_bytes[3]
+            block_bytes[0],
+            block_bytes[1],
+            block_bytes[2],
+            block_bytes[3],
         ]);
 
         let mut qs = [0i8; QK_K];
@@ -567,7 +577,10 @@ pub fn dequantize_q6k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
         qh.copy_from_slice(&block_bytes[QK_K / 2..QK_K / 2 + QK_K / 4]);
 
         let mut scales = [0i8; QK_K / 16];
-        for (i, &b) in block_bytes[QK_K / 2 + QK_K / 4..QK_K / 2 + QK_K / 4 + QK_K / 16].iter().enumerate() {
+        for (i, &b) in block_bytes[QK_K / 2 + QK_K / 4..QK_K / 2 + QK_K / 4 + QK_K / 16]
+            .iter()
+            .enumerate()
+        {
             scales[i] = b as i8;
         }
 
@@ -618,7 +631,13 @@ pub fn dequantize_q5k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
         let mut qs = [0u8; QK_K / 2];
         qs.copy_from_slice(&block_bytes[4 + K_SCALE_SIZE + QK_K / 8..]);
 
-        let block = BlockQ5K { d, dmin, scales, qh, qs };
+        let block = BlockQ5K {
+            d,
+            dmin,
+            scales,
+            qh,
+            qs,
+        };
 
         let mut block_output = [0.0f32; QK_K];
         dequantize_q5k(&block, &mut block_output);
@@ -662,7 +681,12 @@ pub fn dequantize_q3k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
         let d_offset = QK_K / 8 + QK_K / 4 + 12;
         let d = f16::from_le_bytes([block_bytes[d_offset], block_bytes[d_offset + 1]]);
 
-        let block = BlockQ3K { hmask, qs, scales, d };
+        let block = BlockQ3K {
+            hmask,
+            qs,
+            scales,
+            d,
+        };
 
         let mut block_output = [0.0f32; QK_K];
         dequantize_q3k(&block, &mut block_output);
@@ -704,7 +728,12 @@ pub fn dequantize_q2k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
         let d = f16::from_le_bytes([block_bytes[d_offset], block_bytes[d_offset + 1]]);
         let dmin = f16::from_le_bytes([block_bytes[d_offset + 2], block_bytes[d_offset + 3]]);
 
-        let block = BlockQ2K { scales, qs, d, dmin };
+        let block = BlockQ2K {
+            scales,
+            qs,
+            d,
+            dmin,
+        };
 
         let mut block_output = [0.0f32; QK_K];
         dequantize_q2k(&block, &mut block_output);
@@ -726,11 +755,14 @@ pub fn dequantize_q2k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// Q8K is the simplest K-quant: 8-bit signed values with a single scale per block.
 pub fn quantize_q8k(xs: &[f32]) -> Vec<BlockQ8K> {
     let n_blocks = (xs.len() + QK_K - 1) / QK_K;
-    let mut blocks = vec![BlockQ8K {
-        d: 0.0,
-        qs: [0i8; QK_K],
-        bsums: [0i16; QK_K / 16],
-    }; n_blocks];
+    let mut blocks = vec![
+        BlockQ8K {
+            d: 0.0,
+            qs: [0i8; QK_K],
+            bsums: [0i16; QK_K / 16],
+        };
+        n_blocks
+    ];
 
     for (block_idx, block) in blocks.iter_mut().enumerate() {
         let start = block_idx * QK_K;
@@ -784,12 +816,15 @@ pub fn quantize_q8k(xs: &[f32]) -> Vec<BlockQ8K> {
 /// Q4K uses 4-bit values with per-subblock scales and minimums.
 pub fn quantize_q4k(xs: &[f32]) -> Vec<BlockQ4K> {
     let n_blocks = (xs.len() + QK_K - 1) / QK_K;
-    let mut blocks = vec![BlockQ4K {
-        d: f16::from_f32(0.0),
-        dmin: f16::from_f32(0.0),
-        scales: [0u8; K_SCALE_SIZE],
-        qs: [0u8; QK_K / 2],
-    }; n_blocks];
+    let mut blocks = vec![
+        BlockQ4K {
+            d: f16::from_f32(0.0),
+            dmin: f16::from_f32(0.0),
+            scales: [0u8; K_SCALE_SIZE],
+            qs: [0u8; QK_K / 2],
+        };
+        n_blocks
+    ];
 
     for (block_idx, block) in blocks.iter_mut().enumerate() {
         let start = block_idx * QK_K;
@@ -810,7 +845,11 @@ pub fn quantize_q4k(xs: &[f32]) -> Vec<BlockQ4K> {
         let max_scale = scales.iter().fold(0.0f32, |max, &val| val.max(max));
         let max_min = mins.iter().fold(0.0f32, |max, &val| val.max(max));
 
-        let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+        let inv_scale = if max_scale > 0.0 {
+            63.0 / max_scale
+        } else {
+            0.0
+        };
         let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
 
         // Encode scales into 12-byte packed format
@@ -861,13 +900,16 @@ pub fn quantize_q4k(xs: &[f32]) -> Vec<BlockQ4K> {
 /// Q5K uses 5-bit values with per-subblock scales and minimums.
 pub fn quantize_q5k(xs: &[f32]) -> Vec<BlockQ5K> {
     let n_blocks = (xs.len() + QK_K - 1) / QK_K;
-    let mut blocks = vec![BlockQ5K {
-        d: f16::from_f32(0.0),
-        dmin: f16::from_f32(0.0),
-        scales: [0u8; K_SCALE_SIZE],
-        qh: [0u8; QK_K / 8],
-        qs: [0u8; QK_K / 2],
-    }; n_blocks];
+    let mut blocks = vec![
+        BlockQ5K {
+            d: f16::from_f32(0.0),
+            dmin: f16::from_f32(0.0),
+            scales: [0u8; K_SCALE_SIZE],
+            qh: [0u8; QK_K / 8],
+            qs: [0u8; QK_K / 2],
+        };
+        n_blocks
+    ];
 
     for (block_idx, block) in blocks.iter_mut().enumerate() {
         let start = block_idx * QK_K;
@@ -886,7 +928,11 @@ pub fn quantize_q5k(xs: &[f32]) -> Vec<BlockQ5K> {
         let max_scale = scales.iter().fold(0.0f32, |max, &val| val.max(max));
         let max_min = mins.iter().fold(0.0f32, |max, &val| val.max(max));
 
-        let inv_scale = if max_scale > 0.0 { 63.0 / max_scale } else { 0.0 };
+        let inv_scale = if max_scale > 0.0 {
+            63.0 / max_scale
+        } else {
+            0.0
+        };
         let inv_min = if max_min > 0.0 { 63.0 / max_min } else { 0.0 };
 
         for j in 0..(QK_K / 32) {
@@ -950,12 +996,15 @@ pub fn quantize_q5k(xs: &[f32]) -> Vec<BlockQ5K> {
 /// Q6K uses 6-bit values with signed per-subblock scales.
 pub fn quantize_q6k(xs: &[f32]) -> Vec<BlockQ6K> {
     let n_blocks = (xs.len() + QK_K - 1) / QK_K;
-    let mut blocks = vec![BlockQ6K {
-        ql: [0u8; QK_K / 2],
-        qh: [0u8; QK_K / 4],
-        scales: [0i8; QK_K / 16],
-        d: f16::from_f32(0.0),
-    }; n_blocks];
+    let mut blocks = vec![
+        BlockQ6K {
+            ql: [0u8; QK_K / 2],
+            qh: [0u8; QK_K / 4],
+            scales: [0i8; QK_K / 16],
+            d: f16::from_f32(0.0),
+        };
+        n_blocks
+    ];
 
     for (block_idx, block) in blocks.iter_mut().enumerate() {
         let start = block_idx * QK_K;
@@ -1016,7 +1065,8 @@ pub fn quantize_q6k(xs: &[f32]) -> Vec<BlockQ6K> {
                 block.qh[(j / 4) + l_idx] = ((l[j + l_idx] >> 4)
                     | ((l[j + l_idx + 32] >> 4) << 2)
                     | ((l[j + l_idx + 64] >> 4) << 4)
-                    | ((l[j + l_idx + 96] >> 4) << 6)) as u8;
+                    | ((l[j + l_idx + 96] >> 4) << 6))
+                    as u8;
             }
         }
     }
@@ -1029,12 +1079,15 @@ pub fn quantize_q6k(xs: &[f32]) -> Vec<BlockQ6K> {
 /// Q3K uses 3-bit values with complex scale packing.
 pub fn quantize_q3k(xs: &[f32]) -> Vec<BlockQ3K> {
     let n_blocks = (xs.len() + QK_K - 1) / QK_K;
-    let mut blocks = vec![BlockQ3K {
-        hmask: [0u8; QK_K / 8],
-        qs: [0u8; QK_K / 4],
-        scales: [0u8; 12],
-        d: f16::from_f32(0.0),
-    }; n_blocks];
+    let mut blocks = vec![
+        BlockQ3K {
+            hmask: [0u8; QK_K / 8],
+            qs: [0u8; QK_K / 4],
+            scales: [0u8; 12],
+            d: f16::from_f32(0.0),
+        };
+        n_blocks
+    ];
 
     for (block_idx, block) in blocks.iter_mut().enumerate() {
         let start = block_idx * QK_K;
@@ -1131,12 +1184,15 @@ pub fn quantize_q2k(xs: &[f32]) -> Vec<BlockQ2K> {
     const Q4SCALE: f32 = 15.0;
 
     let n_blocks = (xs.len() + QK_K - 1) / QK_K;
-    let mut blocks = vec![BlockQ2K {
-        scales: [0u8; QK_K / 16],
-        qs: [0u8; QK_K / 4],
-        d: f16::from_f32(0.0),
-        dmin: f16::from_f32(0.0),
-    }; n_blocks];
+    let mut blocks = vec![
+        BlockQ2K {
+            scales: [0u8; QK_K / 16],
+            qs: [0u8; QK_K / 4],
+            d: f16::from_f32(0.0),
+            dmin: f16::from_f32(0.0),
+        };
+        n_blocks
+    ];
 
     for (block_idx, block) in blocks.iter_mut().enumerate() {
         let start = block_idx * QK_K;
@@ -1215,11 +1271,7 @@ pub fn blocks_to_bytes<T: Copy>(blocks: &[T]) -> Vec<u8> {
     // Safety: We're copying the raw bytes of the block structures
     // This is safe because our blocks are #[repr(C)] with known layout
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            blocks.as_ptr() as *const u8,
-            bytes.as_mut_ptr(),
-            byte_len,
-        );
+        std::ptr::copy_nonoverlapping(blocks.as_ptr() as *const u8, bytes.as_mut_ptr(), byte_len);
     }
 
     bytes
@@ -1269,7 +1321,7 @@ mod tests {
             d: f16::from_f32(1.0),
             dmin: f16::from_f32(0.0),
             scales: [1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0], // sc=1, m=0 for all
-            qs: [0x21; QK_K / 2], // 0x21 = 0b00100001, lower=1, upper=2
+            qs: [0x21; QK_K / 2],                         // 0x21 = 0b00100001, lower=1, upper=2
         };
 
         let mut output = [0.0f32; QK_K];
@@ -1332,11 +1384,7 @@ mod tests {
         let rmse = compute_rmse(&original, &restored);
         let max_err = compute_max_err(&original, &restored);
 
-        assert!(
-            rmse < 0.01,
-            "Q8K RMSE too high: {} (expected < 0.01)",
-            rmse
-        );
+        assert!(rmse < 0.01, "Q8K RMSE too high: {} (expected < 0.01)", rmse);
         assert!(
             max_err < 0.02,
             "Q8K max error too high: {} (expected < 0.02)",
@@ -1358,11 +1406,7 @@ mod tests {
         let max_err = compute_max_err(&original, &restored);
 
         // Q4K has more quantization error than Q8K
-        assert!(
-            rmse < 0.15,
-            "Q4K RMSE too high: {} (expected < 0.15)",
-            rmse
-        );
+        assert!(rmse < 0.15, "Q4K RMSE too high: {} (expected < 0.15)", rmse);
         assert!(
             max_err < 0.5,
             "Q4K max error too high: {} (expected < 0.5)",
@@ -1384,11 +1428,7 @@ mod tests {
         let max_err = compute_max_err(&original, &restored);
 
         // Q5K should be more accurate than Q4K
-        assert!(
-            rmse < 0.1,
-            "Q5K RMSE too high: {} (expected < 0.1)",
-            rmse
-        );
+        assert!(rmse < 0.1, "Q5K RMSE too high: {} (expected < 0.1)", rmse);
         assert!(
             max_err < 0.4,
             "Q5K max error too high: {} (expected < 0.4)",

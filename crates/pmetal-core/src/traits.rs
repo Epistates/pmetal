@@ -161,8 +161,7 @@ pub trait Quantizer {
     /// # Arguments
     /// * `tensor` - The tensor to quantize
     /// * `block_size` - Block size for blockwise quantization
-    fn quantize(&self, tensor: &Self::Tensor, block_size: usize)
-        -> Result<Self::QuantizedTensor>;
+    fn quantize(&self, tensor: &Self::Tensor, block_size: usize) -> Result<Self::QuantizedTensor>;
 
     /// Dequantize a tensor back to full precision.
     fn dequantize(&self, quantized: &Self::QuantizedTensor) -> Result<Self::Tensor>;

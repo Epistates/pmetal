@@ -33,7 +33,7 @@
 //! let weights = quantizer.dequantize(&quantized)?;
 //! ```
 
-use super::{QuantScheme, QuantizerOps, QuantizedTensor};
+use super::{QuantScheme, QuantizedTensor, QuantizerOps};
 use pmetal_core::{PMetalError, Result};
 
 /// Configuration for group-wise quantization.
@@ -166,7 +166,11 @@ impl GroupQuantizer {
     /// Quantize a weight matrix.
     ///
     /// Input shape: [out_features, in_features]
-    pub fn quantize_weights(&self, weights: &[f32], shape: &[usize]) -> Result<GroupQuantizedTensor> {
+    pub fn quantize_weights(
+        &self,
+        weights: &[f32],
+        shape: &[usize],
+    ) -> Result<GroupQuantizedTensor> {
         if shape.len() != 2 {
             return Err(PMetalError::Quantization(
                 "Group quantization requires 2D weights".to_string(),
@@ -238,8 +242,7 @@ impl GroupQuantizer {
                     let val = weights[row_start + i];
                     let q = if self.config.symmetric {
                         let half = (n_levels / 2) as f32;
-                        ((val / scale).round() + half)
-                            .clamp(0.0, (n_levels - 1) as f32) as u32
+                        ((val / scale).round() + half).clamp(0.0, (n_levels - 1) as f32) as u32
                     } else {
                         ((val - zero) / scale)
                             .round()

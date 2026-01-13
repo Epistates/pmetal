@@ -74,8 +74,6 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
-use pmetal_lora::TrainableModel;
-use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 use mlx_rs::{
     error::Exception,
     module::{FlattenedModuleParam, ModuleParameters},
@@ -85,6 +83,8 @@ use mlx_rs::{
     utils::Updatable,
     Array,
 };
+use pmetal_lora::TrainableModel;
+use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 
 use crate::Result;
 
@@ -287,7 +287,10 @@ impl FrozenState {
     pub fn from_keyed_container_ref<'a>(container: &HashMap<Rc<str>, &'a Array>) -> Self {
         let mut keys: Vec<_> = container.keys().cloned().collect();
         keys.sort();
-        let arrays = keys.iter().map(|k| (*container.get(k).unwrap()).clone()).collect();
+        let arrays = keys
+            .iter()
+            .map(|k| (*container.get(k).unwrap()).clone())
+            .collect();
         Self {
             arrays,
             keys: Some(keys),
@@ -298,7 +301,10 @@ impl FrozenState {
     pub fn from_keyed_container_owned(container: &FlattenedModuleParam) -> Self {
         let mut keys: Vec<_> = container.keys().cloned().collect();
         keys.sort();
-        let arrays = keys.iter().map(|k| container.get(k).unwrap().clone()).collect();
+        let arrays = keys
+            .iter()
+            .map(|k| container.get(k).unwrap().clone())
+            .collect();
         Self {
             arrays,
             keys: Some(keys),
@@ -550,9 +556,9 @@ where
     /// This MUST be called before `step()`.
     pub fn warmup(&mut self, input_ids: &Array, labels: &Array) -> Result<Array> {
         // Define loss function
-        let loss_fn = |model: &mut M, (input_ids, labels): (&Array, &Array)|
-            -> std::result::Result<Array, Exception>
-        {
+        let loss_fn = |model: &mut M,
+                       (input_ids, labels): (&Array, &Array)|
+         -> std::result::Result<Array, Exception> {
             let logits = model
                 .forward(input_ids, None)
                 .map_err(|e| Exception::custom(e.to_string()))?;
@@ -566,10 +572,10 @@ where
             pmetal_mlx::kernels::with_training_mode(|| {
                 loss_and_grad_fn(&mut self.model, (input_ids, labels))
                     .map_err(|e| pmetal_mlx::error::MlxError::from(e))
-            }).map_err(|e| crate::SftError::Mlx(Exception::custom(e.to_string())))?
+            })
+            .map_err(|e| crate::SftError::Mlx(Exception::custom(e.to_string())))?
         } else {
-            loss_and_grad_fn(&mut self.model, (input_ids, labels))
-                .map_err(crate::SftError::Mlx)?
+            loss_and_grad_fn(&mut self.model, (input_ids, labels)).map_err(crate::SftError::Mlx)?
         };
 
         // Apply gradient clipping if configured
@@ -579,7 +585,8 @@ where
         }
 
         // Apply optimizer update (this initializes optimizer state)
-        self.optimizer.update(&mut self.model, grads)
+        self.optimizer
+            .update(&mut self.model, grads)
             .map_err(crate::SftError::Mlx)?;
 
         // Evaluate to ensure state is materialized
@@ -604,16 +611,16 @@ where
     pub fn step(&mut self, input_ids: &Array, labels: &Array) -> Result<Array> {
         if !self.initialized {
             return Err(crate::SftError::Mlx(Exception::custom(
-                "Trainer not initialized. Call warmup() first."
+                "Trainer not initialized. Call warmup() first.",
             )));
         }
 
         self.call_count += 1;
 
         // Define loss function
-        let loss_fn = |model: &mut M, (input_ids, labels): (&Array, &Array)|
-            -> std::result::Result<Array, Exception>
-        {
+        let loss_fn = |model: &mut M,
+                       (input_ids, labels): (&Array, &Array)|
+         -> std::result::Result<Array, Exception> {
             let logits = model
                 .forward(input_ids, None)
                 .map_err(|e| Exception::custom(e.to_string()))?;
@@ -627,10 +634,10 @@ where
             pmetal_mlx::kernels::with_training_mode(|| {
                 loss_and_grad_fn(&mut self.model, (input_ids, labels))
                     .map_err(|e| pmetal_mlx::error::MlxError::from(e))
-            }).map_err(|e| crate::SftError::Mlx(Exception::custom(e.to_string())))?
+            })
+            .map_err(|e| crate::SftError::Mlx(Exception::custom(e.to_string())))?
         } else {
-            loss_and_grad_fn(&mut self.model, (input_ids, labels))
-                .map_err(crate::SftError::Mlx)?
+            loss_and_grad_fn(&mut self.model, (input_ids, labels)).map_err(crate::SftError::Mlx)?
         };
 
         // Apply gradient clipping if configured
@@ -640,7 +647,8 @@ where
         }
 
         // Apply optimizer update
-        self.optimizer.update(&mut self.model, grads)
+        self.optimizer
+            .update(&mut self.model, grads)
             .map_err(crate::SftError::Mlx)?;
 
         // Eager evaluation if configured (for memory-constrained scenarios)
@@ -649,10 +657,12 @@ where
             loss.eval().map_err(crate::SftError::Mlx)?;
 
             // Eval model params (flatten returns HashMap<Rc<str>, &Array>)
-            let param_refs: Vec<&Array> = self.model.trainable_parameters()
+            let param_refs: Vec<&Array> = self
+                .model
+                .trainable_parameters()
                 .flatten()
                 .values()
-                .copied()  // &Array -> Array reference
+                .copied() // &Array -> Array reference
                 .collect();
             if !param_refs.is_empty() {
                 mlx_rs::transforms::eval(param_refs).map_err(crate::SftError::Mlx)?;
@@ -772,7 +782,10 @@ fn clip_gradients_gpu(grads: &mut FlattenedModuleParam, max_norm: f32) -> Result
         .values()
         .map(|g| {
             let flat = g.reshape(&[-1]).expect("reshape failed");
-            flat.multiply(&flat).expect("multiply failed").sum(None).expect("sum failed")
+            flat.multiply(&flat)
+                .expect("multiply failed")
+                .sum(None)
+                .expect("sum failed")
         })
         .collect();
 
@@ -789,7 +802,9 @@ fn clip_gradients_gpu(grads: &mut FlattenedModuleParam, max_norm: f32) -> Result
     let max_norm_arr = Array::from_f32(max_norm);
     let eps = Array::from_f32(1e-6);
     let norm_plus_eps = global_norm.add(&eps).map_err(crate::SftError::Mlx)?;
-    let raw_scale = max_norm_arr.divide(&norm_plus_eps).map_err(crate::SftError::Mlx)?;
+    let raw_scale = max_norm_arr
+        .divide(&norm_plus_eps)
+        .map_err(crate::SftError::Mlx)?;
     let one = Array::from_f32(1.0);
     let scale = mlx_rs::ops::minimum(&raw_scale, &one).map_err(crate::SftError::Mlx)?;
 
@@ -812,7 +827,11 @@ pub fn warmup_training_step<M, O, F>(
 where
     M: ModuleParameters,
     O: Optimizer,
-    F: FnOnce(&mut M, &Array, &Array) -> std::result::Result<(Array, FlattenedModuleParam), Exception>,
+    F: FnOnce(
+        &mut M,
+        &Array,
+        &Array,
+    ) -> std::result::Result<(Array, FlattenedModuleParam), Exception>,
 {
     let (loss, grads) = loss_and_grad_fn(model, input_ids, labels)?;
     optimizer.update(model, grads)?;
@@ -900,10 +919,7 @@ mod tests {
             Array::from_slice(&[3.0f32], &[1]),
         ];
 
-        let mut frozen = FrozenState {
-            arrays,
-            keys: None,
-        };
+        let mut frozen = FrozenState { arrays, keys: None };
 
         assert_eq!(frozen.len(), 2);
 
@@ -982,8 +998,10 @@ mod tests {
         let seq_len = 4;
         let vocab_size = 10;
 
-        let logits = mlx_rs::random::normal::<f32>(&[batch, seq_len, vocab_size], None, None, None).unwrap();
-        let labels = mlx_rs::random::randint::<_, i32>(0, vocab_size, &[batch, seq_len], None).unwrap();
+        let logits =
+            mlx_rs::random::normal::<f32>(&[batch, seq_len, vocab_size], None, None, None).unwrap();
+        let labels =
+            mlx_rs::random::randint::<_, i32>(0, vocab_size, &[batch, seq_len], None).unwrap();
 
         let loss = compute_causal_lm_loss(&logits, &labels).unwrap();
         loss.eval().unwrap();
@@ -998,8 +1016,14 @@ mod tests {
     #[test]
     fn test_gradient_clipping() {
         let mut grads = FlattenedModuleParam::new();
-        grads.insert(Rc::from("layer1.weight"), Array::from_slice(&[10.0f32, 20.0], &[2]));
-        grads.insert(Rc::from("layer2.weight"), Array::from_slice(&[30.0f32], &[1]));
+        grads.insert(
+            Rc::from("layer1.weight"),
+            Array::from_slice(&[10.0f32, 20.0], &[2]),
+        );
+        grads.insert(
+            Rc::from("layer2.weight"),
+            Array::from_slice(&[30.0f32], &[1]),
+        );
 
         let result = clip_gradients_gpu(&mut grads, 1.0);
         assert!(result.is_ok());

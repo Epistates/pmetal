@@ -29,14 +29,14 @@
 //! kernel.forward(&view)?;
 //! ```
 
+use half::f16;
+use mlx_rs::{Array, Dtype};
 use pmetal_metal::{
     bridge::{metal_buffer_from_ptr, MetalBufferView},
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
     error::{MetalError, Result as MetalResult},
 };
-use half::f16;
-use mlx_rs::{Array, Dtype};
 
 /// High-level bridge for MLX ↔ Metal data transfer.
 ///
@@ -72,10 +72,9 @@ impl MlxMetalBridge {
         }
 
         // Ensure array is evaluated
-        array.eval().map_err(|e| MetalError::InvalidConfig(format!(
-            "Failed to evaluate array: {}",
-            e
-        )))?;
+        array
+            .eval()
+            .map_err(|e| MetalError::InvalidConfig(format!("Failed to evaluate array: {}", e)))?;
 
         // Get raw data pointer using mlx-rs safe API
         // Using as_slice() is safe - it returns a slice backed by the array's data
@@ -110,10 +109,9 @@ impl MlxMetalBridge {
         }
 
         // Ensure array is evaluated
-        array.eval().map_err(|e| MetalError::InvalidConfig(format!(
-            "Failed to evaluate array: {}",
-            e
-        )))?;
+        array
+            .eval()
+            .map_err(|e| MetalError::InvalidConfig(format!("Failed to evaluate array: {}", e)))?;
 
         // Get raw data pointer using mlx-rs safe API
         // Using as_slice() is safe - it returns a slice backed by the array's data
@@ -146,10 +144,9 @@ impl MlxMetalBridge {
             array.clone()
         };
 
-        array.eval().map_err(|e| MetalError::InvalidConfig(format!(
-            "Failed to evaluate array: {}",
-            e
-        )))?;
+        array
+            .eval()
+            .map_err(|e| MetalError::InvalidConfig(format!("Failed to evaluate array: {}", e)))?;
 
         let data: &[f16] = array.as_slice();
         MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)
@@ -169,10 +166,9 @@ impl MlxMetalBridge {
             array.clone()
         };
 
-        array.eval().map_err(|e| MetalError::InvalidConfig(format!(
-            "Failed to evaluate array: {}",
-            e
-        )))?;
+        array
+            .eval()
+            .map_err(|e| MetalError::InvalidConfig(format!("Failed to evaluate array: {}", e)))?;
 
         let data: &[f32] = array.as_slice();
         MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)

@@ -9,8 +9,8 @@ use crate::mappings::{
 };
 use crate::params::{MhcGradients, MhcMappings, MhcParams};
 use ndarray::{Array2, Array3};
-use std::sync::Arc;
 use parking_lot::RwLock;
+use std::sync::Arc;
 
 /// mHC layer that manages residual stream expansion and information mixing.
 ///

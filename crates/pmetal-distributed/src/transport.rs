@@ -68,7 +68,9 @@ impl TcpTransport {
     ///
     /// Each node connects to its next peer and accepts a connection
     /// from its previous peer, forming a bidirectional ring.
-    pub async fn connect(config: &DistributedConfig) -> Result<(TransportSender, TransportReceiver)> {
+    pub async fn connect(
+        config: &DistributedConfig,
+    ) -> Result<(TransportSender, TransportReceiver)> {
         let world_size = config.nodes.len();
         let rank = config.rank;
         let my_addr = config.nodes[rank];
@@ -108,8 +110,8 @@ impl TcpTransport {
                         retries += 1;
 
                         // Exponential backoff with jitter
-                        let backoff = (INITIAL_BACKOFF_MS * 2u64.pow(retries.min(6)))
-                            .min(MAX_BACKOFF_MS);
+                        let backoff =
+                            (INITIAL_BACKOFF_MS * 2u64.pow(retries.min(6))).min(MAX_BACKOFF_MS);
                         tokio::time::sleep(Duration::from_millis(backoff)).await;
                     }
                 }
@@ -127,22 +129,26 @@ impl TcpTransport {
                     info!("Accepted connection from {}", addr);
                     Ok(stream)
                 }
-                Ok(Err(e)) => {
-                    Err(DistributedError::Io(e))
-                }
-                Err(_) => {
-                    Err(DistributedError::Protocol(format!(
-                        "Timeout waiting for incoming connection ({}ms)",
-                        config.connection_timeout_ms
-                    )))
-                }
+                Ok(Err(e)) => Err(DistributedError::Io(e)),
+                Err(_) => Err(DistributedError::Protocol(format!(
+                    "Timeout waiting for incoming connection ({}ms)",
+                    config.connection_timeout_ms
+                ))),
             }
         };
 
         // Run both concurrently - order doesn't matter since it's symmetric
         let (next_peer, prev_peer) = tokio::try_join!(
-            async { connect_fut.await.map_err(|e: DistributedError| anyhow::anyhow!(e)) },
-            async { accept_fut.await.map_err(|e: DistributedError| anyhow::anyhow!(e)) }
+            async {
+                connect_fut
+                    .await
+                    .map_err(|e: DistributedError| anyhow::anyhow!(e))
+            },
+            async {
+                accept_fut
+                    .await
+                    .map_err(|e: DistributedError| anyhow::anyhow!(e))
+            }
         )?;
 
         // We send to next_peer, receive from prev_peer

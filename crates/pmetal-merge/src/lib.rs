@@ -38,28 +38,22 @@
 #![warn(missing_docs)]
 
 mod config;
+mod consensus;
 mod error;
 mod loader;
-pub mod methods;
 mod merge;
+pub mod methods;
 mod sparsify;
-mod consensus;
 
 pub use config::*;
+pub use consensus::*;
 pub use error::*;
 pub use loader::*;
 pub use merge::*;
 pub use sparsify::*;
-pub use consensus::*;
 
 /// Re-export merge methods for convenience
 pub use methods::{
-    MergeMethod,
-    LinearMerge,
-    SlerpMerge,
-    TiesMerge,
-    DareMerge,
-    ModelStockMerge,
-    PassthroughMerge,
-    TaskArithmeticMerge,
+    DareMerge, LinearMerge, MergeMethod, ModelStockMerge, PassthroughMerge, SlerpMerge,
+    TaskArithmeticMerge, TiesMerge,
 };

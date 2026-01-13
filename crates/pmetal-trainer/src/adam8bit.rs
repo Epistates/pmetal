@@ -156,10 +156,7 @@ impl Adam8bit {
             let block_data = &data[start..end];
 
             // Find max absolute value in block
-            let max_abs = block_data
-                .iter()
-                .map(|x| x.abs())
-                .fold(0.0f32, f32::max);
+            let max_abs = block_data.iter().map(|x| x.abs()).fold(0.0f32, f32::max);
 
             // Scale factor: max_abs / 127 (for int8 range)
             let scale = if max_abs < self.config.eps_quantize {
@@ -360,17 +357,17 @@ impl Adam8bit {
         // Vectorized moment updates: m = beta1 * m + (1 - beta1) * g
         let beta1_arr = Array::from_f32(self.config.beta1);
         let one_minus_beta1 = Array::from_f32(1.0 - self.config.beta1);
-        let m_new = m_array.multiply(&beta1_arr)?.add(
-            &flat_grad.multiply(&one_minus_beta1)?
-        )?;
+        let m_new = m_array
+            .multiply(&beta1_arr)?
+            .add(&flat_grad.multiply(&one_minus_beta1)?)?;
 
         // v = beta2 * v + (1 - beta2) * g^2
         let beta2_arr = Array::from_f32(self.config.beta2);
         let one_minus_beta2 = Array::from_f32(1.0 - self.config.beta2);
         let grad_sq = flat_grad.multiply(&flat_grad)?;
-        let v_new = v_array.multiply(&beta2_arr)?.add(
-            &grad_sq.multiply(&one_minus_beta2)?
-        )?;
+        let v_new = v_array
+            .multiply(&beta2_arr)?
+            .add(&grad_sq.multiply(&one_minus_beta2)?)?;
 
         // Bias-corrected estimates
         let bc1 = Array::from_f32(bias_correction1);
@@ -436,7 +433,11 @@ impl Adam8bit {
     }
 
     /// Apply updates to multiple parameters.
-    pub fn update(&mut self, gradients: &HashMap<Rc<str>, Array>, parameters: &mut HashMap<Rc<str>, Array>) -> Result<()> {
+    pub fn update(
+        &mut self,
+        gradients: &HashMap<Rc<str>, Array>,
+        parameters: &mut HashMap<Rc<str>, Array>,
+    ) -> Result<()> {
         for (key, grad) in gradients {
             if let Some(param) = parameters.get_mut(key) {
                 self.update_single(key, grad, param)?;
@@ -537,9 +538,7 @@ mod tests {
 
     #[test]
     fn test_adam8bit_creation() {
-        let optimizer = Adam8bitBuilder::new(2e-4)
-            .with_weight_decay(0.01)
-            .build();
+        let optimizer = Adam8bitBuilder::new(2e-4).with_weight_decay(0.01).build();
 
         assert!((optimizer.learning_rate() - 2e-4).abs() < 1e-8);
         assert_eq!(optimizer.config.block_size, 2048);
@@ -577,9 +576,7 @@ mod tests {
 
     #[test]
     fn test_adam8bit_memory_stats() {
-        let mut optimizer = Adam8bitBuilder::new(0.1)
-            .with_block_size(64)
-            .build();
+        let mut optimizer = Adam8bitBuilder::new(0.1).with_block_size(64).build();
 
         // Add some parameters
         let mut param1 = Array::from_slice(&vec![1.0f32; 1024], &[1024]);
@@ -597,9 +594,7 @@ mod tests {
 
     #[test]
     fn test_adam8bit_quantization() {
-        let optimizer = Adam8bitBuilder::new(0.1)
-            .with_block_size(4)
-            .build();
+        let optimizer = Adam8bitBuilder::new(0.1).with_block_size(4).build();
 
         // Test signed quantization
         let data = vec![-1.0f32, 0.5, -0.5, 1.0];

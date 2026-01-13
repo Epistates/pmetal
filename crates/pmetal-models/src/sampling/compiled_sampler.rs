@@ -55,8 +55,9 @@
 
 use mlx_rs::error::Exception;
 use mlx_rs::ops::{
-    argpartition_axis, argsort_axis, cumsum, exp, logsumexp_axis, which, zeros_like,
+    argpartition_axis, argsort_axis, cumsum, exp,
     indexing::{argmax, put_along_axis, take_along_axis, IndexOp},
+    logsumexp_axis, which, zeros_like,
 };
 use mlx_rs::random::{categorical, RandomState};
 use mlx_rs::utils::Updatable;
@@ -135,7 +136,12 @@ impl Updatable for SamplerState {
 ///
 /// IMPORTANT: Input MUST be 2D [1, vocab_size]. Use apply_filters_fused to ensure this.
 #[inline]
-fn apply_top_k_2d(logits_2d: &Array, k: usize, vocab_size: usize, neg_inf: &Array) -> Result<Array, Exception> {
+fn apply_top_k_2d(
+    logits_2d: &Array,
+    k: usize,
+    vocab_size: usize,
+    neg_inf: &Array,
+) -> Result<Array, Exception> {
     let k = k.min(vocab_size);
 
     // argpartition on -logits gives indices that partition around k-th largest
@@ -155,7 +161,12 @@ fn apply_top_k_2d(logits_2d: &Array, k: usize, vocab_size: usize, neg_inf: &Arra
 ///
 /// IMPORTANT: Input MUST be 2D [1, vocab_size]. Use apply_filters_fused to ensure this.
 #[inline]
-fn apply_top_p_2d(logits_2d: &Array, p: f32, vocab_size: usize, neg_inf: &Array) -> Result<Array, Exception> {
+fn apply_top_p_2d(
+    logits_2d: &Array,
+    p: f32,
+    vocab_size: usize,
+    neg_inf: &Array,
+) -> Result<Array, Exception> {
     // Convert to probabilities and sort ascending
     let probs = exp(logits_2d)?;
     let sorted_indices = argsort_axis(logits_2d, -1)?;
@@ -166,8 +177,12 @@ fn apply_top_p_2d(logits_2d: &Array, p: f32, vocab_size: usize, neg_inf: &Array)
 
     // Create inverse mapping to restore original order
     let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
-    let inverse_indices =
-        put_along_axis(&zeros_like(&sorted_indices)?, &sorted_indices, &vocab_range, -1)?;
+    let inverse_indices = put_along_axis(
+        &zeros_like(&sorted_indices)?,
+        &sorted_indices,
+        &vocab_range,
+        -1,
+    )?;
     let cumulative_probs = take_along_axis(&cumulative_probs, &inverse_indices, -1)?;
 
     // Mask tokens where cumulative probability exceeds threshold
@@ -184,7 +199,12 @@ fn apply_top_p_2d(logits_2d: &Array, p: f32, vocab_size: usize, neg_inf: &Array)
 ///
 /// IMPORTANT: Input MUST be 2D [1, vocab_size]. Use apply_filters_fused to ensure this.
 #[inline]
-fn apply_min_p_2d(logits_2d: &Array, min_p: f32, vocab_size: usize, neg_inf: &Array) -> Result<Array, Exception> {
+fn apply_min_p_2d(
+    logits_2d: &Array,
+    min_p: f32,
+    vocab_size: usize,
+    neg_inf: &Array,
+) -> Result<Array, Exception> {
     // Sort to find max logprob (descending)
     let neg_logits = logits_2d.negative()?;
     let sorted_indices = argsort_axis(&neg_logits, -1)?;
@@ -201,8 +221,12 @@ fn apply_min_p_2d(logits_2d: &Array, min_p: f32, vocab_size: usize, neg_inf: &Ar
 
     // Restore original order
     let vocab_range = Array::from_iter(0..vocab_size as i32, &[1, vocab_size as i32]);
-    let inverse_indices =
-        put_along_axis(&zeros_like(&sorted_indices)?, &sorted_indices, &vocab_range, -1)?;
+    let inverse_indices = put_along_axis(
+        &zeros_like(&sorted_indices)?,
+        &sorted_indices,
+        &vocab_range,
+        -1,
+    )?;
     take_along_axis(&selected_logits, &inverse_indices, -1)
 }
 
@@ -516,7 +540,11 @@ mod tests {
 
         // With uniform distribution and 20 samples, we should see variation
         let unique: std::collections::HashSet<_> = samples.iter().collect();
-        assert!(unique.len() > 1, "Expected different samples, got {:?}", samples);
+        assert!(
+            unique.len() > 1,
+            "Expected different samples, got {:?}",
+            samples
+        );
     }
 
     #[test]

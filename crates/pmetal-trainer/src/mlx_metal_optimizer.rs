@@ -391,14 +391,18 @@ impl MlxMetalOptimizer {
     pub fn set_total_steps(&mut self, total_steps: u32) {
         match &mut self.config.lr_schedule {
             LrSchedule::CosineDecay { total_steps: ts } => *ts = total_steps,
-            LrSchedule::CosineDecayWithWarmup { total_steps: ts, .. } => *ts = total_steps,
+            LrSchedule::CosineDecayWithWarmup {
+                total_steps: ts, ..
+            } => *ts = total_steps,
             LrSchedule::Constant => {}
         }
     }
 
     /// Get the current learning rate (after applying schedule).
     pub fn current_lr(&self) -> f32 {
-        self.config.lr_schedule.get_lr_multiplier(self.step, self.config.learning_rate)
+        self.config
+            .lr_schedule
+            .get_lr_multiplier(self.step, self.config.learning_rate)
     }
 
     /// Initialize the optimizer with model parameters.
@@ -417,7 +421,10 @@ impl MlxMetalOptimizer {
     }
 
     /// Initialize from flattened parameters.
-    fn initialize_from_params(&mut self, params: &FlattenedModuleParam) -> MlxMetalOptimizerResult<()> {
+    fn initialize_from_params(
+        &mut self,
+        params: &FlattenedModuleParam,
+    ) -> MlxMetalOptimizerResult<()> {
         // Build parameter layout
         self.layout = ParameterLayout::from_params(params);
 
@@ -487,7 +494,10 @@ impl MlxMetalOptimizer {
     }
 
     /// Copy parameters from MLX arrays to flat Metal buffer.
-    fn copy_params_to_flat(&mut self, params: &FlattenedModuleParam) -> MlxMetalOptimizerResult<()> {
+    fn copy_params_to_flat(
+        &mut self,
+        params: &FlattenedModuleParam,
+    ) -> MlxMetalOptimizerResult<()> {
         let flat_slice = self.flat_params.as_mut_slice();
         let mut offset = 0;
 
@@ -521,12 +531,24 @@ impl MlxMetalOptimizer {
             let missing_grads: Vec<_> = param_keys.difference(&grad_keys).collect();
             let extra_grads: Vec<_> = grad_keys.difference(&param_keys).collect();
             if !missing_grads.is_empty() {
-                tracing::warn!("Missing gradients for {} params: {:?}", missing_grads.len(), &missing_grads[..missing_grads.len().min(5)]);
+                tracing::warn!(
+                    "Missing gradients for {} params: {:?}",
+                    missing_grads.len(),
+                    &missing_grads[..missing_grads.len().min(5)]
+                );
             }
             if !extra_grads.is_empty() {
-                tracing::warn!("Extra gradients for {} params: {:?}", extra_grads.len(), &extra_grads[..extra_grads.len().min(5)]);
+                tracing::warn!(
+                    "Extra gradients for {} params: {:?}",
+                    extra_grads.len(),
+                    &extra_grads[..extra_grads.len().min(5)]
+                );
             }
-            tracing::info!("Total param keys: {}, grad keys: {}", param_keys.len(), grad_keys.len());
+            tracing::info!(
+                "Total param keys: {}, grad keys: {}",
+                param_keys.len(),
+                grad_keys.len()
+            );
             // Show first few keys from each
             let mut param_names: Vec<_> = self.layout.names.iter().take(3).collect();
             let mut grad_names: Vec<_> = grads.keys().take(3).collect();
@@ -544,16 +566,25 @@ impl MlxMetalOptimizer {
                     let max = slice.iter().cloned().fold(0.0f32, f32::max);
                     let min = slice.iter().cloned().fold(0.0f32, f32::min);
                     tracing::info!("First param name: '{}'", name);
-                    tracing::info!("as_slice - len={}, max={:.6}, min={:.6}, first4={:?}",
-                        slice.len(), max, min, &slice[..4.min(slice.len())]);
+                    tracing::info!(
+                        "as_slice - len={}, max={:.6}, min={:.6}, first4={:?}",
+                        slice.len(),
+                        max,
+                        min,
+                        &slice[..4.min(slice.len())]
+                    );
 
                     // Also check raw pointer path
                     let src_ptr = unsafe { mlx_sys::mlx_array_data_float32(grad.as_ptr()) };
                     let ptr_slice = unsafe { std::slice::from_raw_parts(src_ptr, grad.size()) };
                     let ptr_max = ptr_slice.iter().cloned().fold(0.0f32, f32::max);
                     let ptr_min = ptr_slice.iter().cloned().fold(0.0f32, f32::min);
-                    tracing::info!("raw_ptr - max={:.6}, min={:.6}, first4={:?}",
-                        ptr_max, ptr_min, &ptr_slice[..4.min(ptr_slice.len())]);
+                    tracing::info!(
+                        "raw_ptr - max={:.6}, min={:.6}, first4={:?}",
+                        ptr_max,
+                        ptr_min,
+                        &ptr_slice[..4.min(ptr_slice.len())]
+                    );
                 }
 
                 let size = grad.size();
@@ -570,7 +601,8 @@ impl MlxMetalOptimizer {
                 offset += size;
             } else {
                 // No gradient for this parameter - zero it out
-                let size = self.layout.sizes[self.layout.names.iter().position(|n| n == name).unwrap()];
+                let size =
+                    self.layout.sizes[self.layout.names.iter().position(|n| n == name).unwrap()];
                 for i in 0..size {
                     flat_slice[offset + i] = 0.0;
                 }
@@ -582,7 +614,10 @@ impl MlxMetalOptimizer {
     }
 
     /// Copy updated parameters back to MLX arrays.
-    fn copy_flat_to_params(&self, params: &mut FlattenedModuleParam) -> MlxMetalOptimizerResult<()> {
+    fn copy_flat_to_params(
+        &self,
+        params: &mut FlattenedModuleParam,
+    ) -> MlxMetalOptimizerResult<()> {
         let flat_slice = self.flat_params.as_slice();
         let mut offset = 0;
 
@@ -609,7 +644,11 @@ impl MlxMetalOptimizer {
     ///
     /// This is the core optimization - all parameters are processed in a single
     /// Metal dispatch, eliminating per-parameter overhead.
-    pub fn fused_step(&mut self, params: &mut FlattenedModuleParam, grads: &FlattenedModuleParam) -> MlxMetalOptimizerResult<()> {
+    pub fn fused_step(
+        &mut self,
+        params: &mut FlattenedModuleParam,
+        grads: &FlattenedModuleParam,
+    ) -> MlxMetalOptimizerResult<()> {
         if !self.initialized {
             self.initialize_from_params(params)?;
         }
@@ -643,8 +682,12 @@ impl MlxMetalOptimizer {
         if self.step <= 3 {
             tracing::info!(
                 "Metal AdamW config - step={}, lr={:.6}, beta1={}, beta2={}, eps={}, wd={}",
-                self.step, adamw_config.learning_rate, adamw_config.beta1,
-                adamw_config.beta2, adamw_config.epsilon, adamw_config.weight_decay
+                self.step,
+                adamw_config.learning_rate,
+                adamw_config.beta1,
+                adamw_config.beta2,
+                adamw_config.epsilon,
+                adamw_config.weight_decay
             );
 
             // Detailed trace for first param element
@@ -659,10 +702,21 @@ impl MlxMetalOptimizer {
             // NO bias correction - use m and v directly
             let update = new_m0 / (new_v0.sqrt() + adamw_config.epsilon);
             let expected_p0 = p0 * (1.0 - adamw_config.learning_rate * adamw_config.weight_decay)
-                             - adamw_config.learning_rate * update;
+                - adamw_config.learning_rate * update;
 
-            tracing::info!("TRACE[0]: p={:.8}, g={:.8e}, m={:.8e}, v={:.8e}", p0, g0, m0, v0);
-            tracing::info!("TRACE[0]: new_m={:.8e}, new_v={:.8e}, update={:.8e}", new_m0, new_v0, update);
+            tracing::info!(
+                "TRACE[0]: p={:.8}, g={:.8e}, m={:.8e}, v={:.8e}",
+                p0,
+                g0,
+                m0,
+                v0
+            );
+            tracing::info!(
+                "TRACE[0]: new_m={:.8e}, new_v={:.8e}, update={:.8e}",
+                new_m0,
+                new_v0,
+                update
+            );
             tracing::info!("TRACE[0]: expected_new_p={:.8}", expected_p0);
         }
 
@@ -684,7 +738,12 @@ impl MlxMetalOptimizer {
             let actual_p0 = self.flat_params.as_slice()[0];
             let actual_m0 = self.m_buffer.as_slice()[0];
             let actual_v0 = self.v_buffer.as_slice()[0];
-            tracing::info!("TRACE[0] ACTUAL: p={:.8}, m={:.8e}, v={:.8e}", actual_p0, actual_m0, actual_v0);
+            tracing::info!(
+                "TRACE[0] ACTUAL: p={:.8}, m={:.8e}, v={:.8e}",
+                actual_p0,
+                actual_m0,
+                actual_v0
+            );
         }
 
         // Copy updated params back to MLX arrays
@@ -784,29 +843,33 @@ impl MlxMetalOptimizer {
         self.step += 1;
 
         // Get scheduled learning rate
-        let scheduled_lr = self.config.lr_schedule.get_lr_multiplier(
-            self.step,
-            self.config.learning_rate,
-        );
+        let scheduled_lr = self
+            .config
+            .lr_schedule
+            .get_lr_multiplier(self.step, self.config.learning_rate);
 
         // Collect params and grads in layout order, flattening each to 1D
         // Track missing params/grads for validation
         let mut missing_params: Vec<&str> = Vec::new();
         let mut missing_grads: Vec<&str> = Vec::new();
 
-        let param_arrays: Vec<Array> = self.layout.names.iter()
-            .map(|name| {
-                match model_params.get(&**name) {
-                    Some(p) => (*p).reshape(&[-1]).unwrap_or_else(|_| (*p).clone()),
-                    None => {
-                        missing_params.push(name);
-                        Array::zeros::<f32>(&[0]).unwrap()
-                    }
+        let param_arrays: Vec<Array> = self
+            .layout
+            .names
+            .iter()
+            .map(|name| match model_params.get(&**name) {
+                Some(p) => (*p).reshape(&[-1]).unwrap_or_else(|_| (*p).clone()),
+                None => {
+                    missing_params.push(name);
+                    Array::zeros::<f32>(&[0]).unwrap()
                 }
             })
             .collect();
 
-        let grad_arrays: Vec<Array> = self.layout.names.iter()
+        let grad_arrays: Vec<Array> = self
+            .layout
+            .names
+            .iter()
             .enumerate()
             .map(|(i, name)| {
                 match gradients.get(name) {
@@ -826,7 +889,7 @@ impl MlxMetalOptimizer {
             if missing_grads.len() == self.layout.names.len() {
                 return Err(mlx_rs::error::Exception::custom(
                     "MlxMetalOptimizer: All gradients are missing. \
-                     This indicates backward pass was not called or gradients were lost."
+                     This indicates backward pass was not called or gradients were lost.",
                 ));
             }
             tracing::warn!(
@@ -881,18 +944,24 @@ impl MlxMetalOptimizer {
         let one_minus_lr_wd = Array::from_f32(1.0 - scheduled_lr * self.config.weight_decay);
 
         // m = beta1 * m + (1-beta1) * grad
-        let new_flat_m = beta1.multiply(flat_m)?.add(&one_minus_b1.multiply(&flat_grads)?)?;
+        let new_flat_m = beta1
+            .multiply(flat_m)?
+            .add(&one_minus_b1.multiply(&flat_grads)?)?;
 
         // v = beta2 * v + (1-beta2) * grad²
         let grad_sq = flat_grads.multiply(&flat_grads)?;
-        let new_flat_v = beta2.multiply(flat_v)?.add(&one_minus_b2.multiply(&grad_sq)?)?;
+        let new_flat_v = beta2
+            .multiply(flat_v)?
+            .add(&one_minus_b2.multiply(&grad_sq)?)?;
 
         // update = m / (sqrt(v) + eps)
         let denom = new_flat_v.sqrt()?.add(eps)?;
         let update = new_flat_m.divide(&denom)?;
 
         // new_params = params * (1 - lr*wd) - lr * update
-        let new_flat_params = flat_params.multiply(&one_minus_lr_wd)?.subtract(&lr.multiply(&update)?)?;
+        let new_flat_params = flat_params
+            .multiply(&one_minus_lr_wd)?
+            .subtract(&lr.multiply(&update)?)?;
 
         // LAZY SPLIT: O(1) - just builds computation graph
         let new_param_arrays = split_sections(&new_flat_params, &self.layout.split_indices, 0)?;
@@ -964,10 +1033,10 @@ impl MlxMetalOptimizer {
         self.step += 1;
 
         // SOTA: Apply learning rate schedule
-        let scheduled_lr = self.config.lr_schedule.get_lr_multiplier(
-            self.step,
-            self.config.learning_rate,
-        );
+        let scheduled_lr = self
+            .config
+            .lr_schedule
+            .get_lr_multiplier(self.step, self.config.learning_rate);
         let wd = self.config.weight_decay;
 
         // SOTA: Use cached scalar arrays for beta1, beta2, epsilon
@@ -1004,16 +1073,25 @@ impl MlxMetalOptimizer {
                     let p_val = unsafe { *mlx_sys::mlx_array_data_float32((*param).as_ptr()) };
                     tracing::info!(
                         "MLX BEFORE[0]: step={}, lr={:.6}, p={:.8}, g={:.8e}, m={:.8e}, v={:.8e}",
-                        self.step, scheduled_lr, p_val, g_val, m_val, v_val
+                        self.step,
+                        scheduled_lr,
+                        p_val,
+                        g_val,
+                        m_val,
+                        v_val
                     );
                 }
 
                 // Compute new m and v using MLX ops ON THE ACTUAL GRADIENT
                 // m/v are MLX Arrays from state - no from_slice needed!
                 // Use references to m/v to avoid move (we need to assign back to them)
-                let new_m = beta1_arr.multiply(&*m)?.add(&one_minus_b1.multiply(grad)?)?;
+                let new_m = beta1_arr
+                    .multiply(&*m)?
+                    .add(&one_minus_b1.multiply(grad)?)?;
                 let grad_sq = grad.multiply(grad)?;
-                let new_v = beta2_arr.multiply(&*v)?.add(&one_minus_b2.multiply(&grad_sq)?)?;
+                let new_v = beta2_arr
+                    .multiply(&*v)?
+                    .add(&one_minus_b2.multiply(&grad_sq)?)?;
 
                 // Compute update using MLX ops
                 let denom = new_v.sqrt()?.add(eps_arr)?;
@@ -1034,7 +1112,9 @@ impl MlxMetalOptimizer {
                     let p_new = unsafe { *mlx_sys::mlx_array_data_float32(new_param.as_ptr()) };
                     tracing::info!(
                         "MLX AFTER[0]: p={:.8}, m={:.8e}, v={:.8e}",
-                        p_new, m_new, v_new
+                        p_new,
+                        m_new,
+                        v_new
                     );
                 }
 
@@ -1076,7 +1156,7 @@ impl MlxMetalOptimizer {
         &self,
         flat_grads: &Array,
     ) -> std::result::Result<(), mlx_rs::error::Exception> {
-        use mlx_rs::ops::{any, is_nan, is_inf, logical_or};
+        use mlx_rs::ops::{any, is_inf, is_nan, logical_or};
 
         // Build lazy check (single eval for both NaN and Inf)
         let has_nan = any(is_nan(flat_grads)?, None)?;
@@ -1345,17 +1425,23 @@ mod tests {
         let wd = 0.01f32;
 
         let g_val = 0.1f32;
-        let m_new = (1.0 - beta1) * g_val;  // 0.01
-        let v_new = (1.0 - beta2) * g_val * g_val;  // 0.00001
-        let update = m_new / (v_new.sqrt() + eps);  // 0.01 / (0.00316 + 1e-8) ≈ 3.16
-        let p_new = 1.0 * (1.0 - lr * wd) - lr * update;  // 0.999 - 0.316 ≈ 0.683
+        let m_new = (1.0 - beta1) * g_val; // 0.01
+        let v_new = (1.0 - beta2) * g_val * g_val; // 0.00001
+        let update = m_new / (v_new.sqrt() + eps); // 0.01 / (0.00316 + 1e-8) ≈ 3.16
+        let p_new = 1.0 * (1.0 - lr * wd) - lr * update; // 0.999 - 0.316 ≈ 0.683
 
         println!("Expected first element: {:.6}", p_new);
         println!("Fused result: {:?}", fused_result);
-        println!("Manual calc: m={:.6}, v={:.6}, update={:.6}", m_new, v_new, update);
+        println!(
+            "Manual calc: m={:.6}, v={:.6}, update={:.6}",
+            m_new, v_new, update
+        );
 
         // Verify fused result is reasonable
-        assert!(fused_result[0] < 1.0, "Param should decrease with positive gradient");
+        assert!(
+            fused_result[0] < 1.0,
+            "Param should decrease with positive gradient"
+        );
     }
 
     #[test]
@@ -1380,7 +1466,10 @@ mod tests {
 
         // At step 50 (halfway), should be ~0.5 * base_lr
         let lr_50 = schedule.get_lr_multiplier(50, base_lr);
-        assert!((lr_50 - 0.5 * base_lr).abs() < 1e-6, "Step 50 should be ~0.5 * base_lr");
+        assert!(
+            (lr_50 - 0.5 * base_lr).abs() < 1e-6,
+            "Step 50 should be ~0.5 * base_lr"
+        );
 
         // At step 100, should be ~0
         let lr_100 = schedule.get_lr_multiplier(100, base_lr);
@@ -1402,7 +1491,10 @@ mod tests {
 
         // At step 5 (halfway through warmup), should be ~0.5 * base_lr
         let lr_5 = schedule.get_lr_multiplier(5, base_lr);
-        assert!((lr_5 - 0.5 * base_lr).abs() < 1e-6, "Step 5 should be ~0.5 * base_lr");
+        assert!(
+            (lr_5 - 0.5 * base_lr).abs() < 1e-6,
+            "Step 5 should be ~0.5 * base_lr"
+        );
 
         // At step 10 (end of warmup), should be full base_lr
         let lr_10 = schedule.get_lr_multiplier(10, base_lr);
@@ -1422,7 +1514,11 @@ mod tests {
 
         // Verify schedule was set
         match &opt.config.lr_schedule {
-            LrSchedule::CosineDecayWithWarmup { warmup_steps, total_steps, .. } => {
+            LrSchedule::CosineDecayWithWarmup {
+                warmup_steps,
+                total_steps,
+                ..
+            } => {
                 assert_eq!(*warmup_steps, 10);
                 assert_eq!(*total_steps, 100);
             }

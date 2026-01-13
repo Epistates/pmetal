@@ -58,14 +58,6 @@
 //! The `jit_compile` module provides experimental utilities for future JIT support
 //! when mlx-rs improves its compile_with_state implementation.
 
-use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
-use pmetal_data::{
-    DataLoader, DataLoaderConfig, PackedDataLoader, PackedTrainingBatch, PackerConfig,
-    TrainingBatch, TrainingDataset,
-};
-use pmetal_lora::TrainableModel;
-use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
-use pmetal_mlx::kernels::{init_training_context, with_training_mode};
 use mlx_rs::{
     builder::Builder,
     error::Exception,
@@ -78,9 +70,19 @@ use mlx_rs::{
     utils::Updatable,
     Array,
 };
+use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
+use pmetal_data::{
+    DataLoader, DataLoaderConfig, PackedDataLoader, PackedTrainingBatch, PackerConfig,
+    TrainingBatch, TrainingDataset,
+};
+use pmetal_lora::TrainableModel;
+use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
+use pmetal_mlx::kernels::{init_training_context, with_training_mode};
 
+use crate::mlx_metal_optimizer::{
+    is_mlx_metal_optimizer_available, MlxMetalOptimizer, MlxMetalOptimizerBuilder,
+};
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
-use crate::mlx_metal_optimizer::{MlxMetalOptimizer, MlxMetalOptimizerBuilder, is_mlx_metal_optimizer_available};
 
 /// JIT-compiled training step for maximum throughput.
 ///
@@ -95,7 +97,7 @@ fn jit_training_step<M: TrainableModel, O: Optimizer>(
     // Define loss function that will be used by value_and_grad
     let loss_fn = |model: &mut M,
                    (input_ids, labels): (&Array, &Array)|
-                   -> std::result::Result<Array, Exception> {
+     -> std::result::Result<Array, Exception> {
         let logits = model
             .forward(input_ids, None)
             .map_err(|e| Exception::custom(e.to_string()))?;
@@ -151,7 +153,7 @@ fn trainable_training_step<M: TrainableModel, O: Optimizer>(
     // Define loss function that will be used by value_and_grad
     let loss_fn = |model: &mut M,
                    (input_ids, labels): (&Array, &Array)|
-                   -> std::result::Result<Array, Exception> {
+     -> std::result::Result<Array, Exception> {
         let logits = model
             .forward(input_ids, None)
             .map_err(|e| Exception::custom(e.to_string()))?;
@@ -217,7 +219,7 @@ fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
     // Use IDENTICAL loss computation as regular training for consistency
     let loss_fn = |model: &mut M,
                    (input_ids, labels, mask, pos_ids): (&Array, &Array, &Array, &Array)|
-                   -> std::result::Result<Array, Exception> {
+     -> std::result::Result<Array, Exception> {
         // Use forward_with_positions for correct RoPE with packed sequences
         let logits = model
             .forward_with_positions(input_ids, Some(mask), pos_ids)
@@ -251,7 +253,10 @@ fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
 
     // Compute loss and gradients - pass position_ids as 4th argument
     let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-    let (loss, grads) = loss_and_grad_fn(model, (&input_ids_2d, &labels_2d, &attn_mask_4d, &position_ids))?;
+    let (loss, grads) = loss_and_grad_fn(
+        model,
+        (&input_ids_2d, &labels_2d, &attn_mask_4d, &position_ids),
+    )?;
 
     // Apply gradients via optimizer
     optimizer.update(model, grads)?;
@@ -330,8 +335,8 @@ impl Default for TrainingLoopConfig {
             use_sequence_packing: false, // Off by default, enable for variable-length datasets
             gradient_checkpointing: false, // Off by default, enable for memory-constrained training
             gradient_checkpointing_layers: 4, // 4 layers per block is a good default
-            embedding_lr: None, // None = same as base learning rate
-            eager_evaluation: false, // Off by default for throughput, enable for memory savings
+            embedding_lr: None,         // None = same as base learning rate
+            eager_evaluation: false,    // Off by default for throughput, enable for memory savings
             use_metal_fused_optimizer: false, // Off by default until fully tested
         }
     }
@@ -424,9 +429,7 @@ impl TrainingLoop {
 
             match self.config.training.lr_scheduler {
                 LrSchedulerType::Constant => base_lr,
-                LrSchedulerType::Linear => {
-                    base_lr * (1.0 - current / decay_steps).max(0.0)
-                }
+                LrSchedulerType::Linear => base_lr * (1.0 - current / decay_steps).max(0.0),
                 LrSchedulerType::Cosine => {
                     let progress = (current / decay_steps).min(1.0);
                     base_lr * 0.5 * (1.0 + (std::f64::consts::PI as f32 * progress).cos())
@@ -505,7 +508,12 @@ impl TrainingLoop {
             let mut norm_copy = norm.clone();
             norm_copy.eval().ok();
             let norm_val = norm_copy.item::<f32>();
-            tracing::info!("Gradient clipping: norm={:.4}, max_norm={}, scale={:.4}", norm_val, max_norm, scale_val);
+            tracing::info!(
+                "Gradient clipping: norm={:.4}, max_norm={}, scale={:.4}",
+                norm_val,
+                max_norm,
+                scale_val
+            );
         });
 
         // Apply scale to all gradients on GPU (lazy)
@@ -647,14 +655,15 @@ impl TrainingLoop {
                 // Apply with optimizer (lazy - no eval by default)
                 optimizer.update(model, accumulated)?;
 
-                // Eager evaluation mode 
+                // Eager evaluation mode
                 // Forces immediate evaluation to clear intermediate activations.
                 // Trade-off: Lower memory usage vs lower throughput.
                 if self.config.eager_evaluation {
                     // Eval model parameters (clears computation graph)
                     mlx_rs::transforms::eval_params(model.parameters())?;
                     // Optimizer state is evaluated via Updatable trait
-                    let opt_states: Vec<&Array> = optimizer.updatable_states().into_iter().collect();
+                    let opt_states: Vec<&Array> =
+                        optimizer.updatable_states().into_iter().collect();
                     if !opt_states.is_empty() {
                         mlx_rs::transforms::eval(opt_states)?;
                     }
@@ -714,12 +723,11 @@ impl TrainingLoop {
         // Define loss function for autodiff
         let loss_fn = |model: &mut M,
                        (input_ids, labels): (&Array, &Array)|
-                       -> std::result::Result<Array, Exception> {
+         -> std::result::Result<Array, Exception> {
             let logits = model
                 .forward(input_ids, None)
                 .map_err(|e| Exception::custom(e.to_string()))?;
-            Self::compute_loss(&logits, labels)
-                .map_err(|e| Exception::custom(e.to_string()))
+            Self::compute_loss(&logits, labels).map_err(|e| Exception::custom(e.to_string()))
         };
 
         // Create value_and_grad function
@@ -752,13 +760,12 @@ impl TrainingLoop {
         // Define loss function for VLM autodiff
         let loss_fn = |model: &mut M,
                        (input_ids, labels): (&Array, &Array)|
-                       -> std::result::Result<Array, Exception> {
+         -> std::result::Result<Array, Exception> {
             // Use forward_with_images for VLM models
             let logits = model
                 .forward_with_images(input_ids, None, Some(&pixels))
                 .map_err(|e| Exception::custom(e.to_string()))?;
-            Self::compute_loss(&logits, labels)
-                .map_err(|e| Exception::custom(e.to_string()))
+            Self::compute_loss(&logits, labels).map_err(|e| Exception::custom(e.to_string()))
         };
 
         // Create value_and_grad function
@@ -794,14 +801,14 @@ impl TrainingLoop {
         let weight_decay = self.config.training.weight_decay as f32;
 
         // Use AdamWGroups when embedding_lr is specified
-        let mut optimizer = crate::AdamWGroupsBuilder::new(base_lr)
-            .with_weight_decay(weight_decay);
+        let mut optimizer = crate::AdamWGroupsBuilder::new(base_lr).with_weight_decay(weight_decay);
 
         if let Some(emb_lr) = self.config.embedding_lr {
             optimizer = optimizer.with_embedding_lr(emb_lr);
             tracing::info!(
                 "Using separate embedding LR: {:.2e} (base: {:.2e})",
-                emb_lr, base_lr
+                emb_lr,
+                base_lr
             );
         }
 
@@ -908,8 +915,7 @@ impl TrainingLoop {
                 }
 
                 // Regular checkpointing
-                if self.config.checkpoint_every > 0
-                    && self.step % self.config.checkpoint_every == 0
+                if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
                 {
                     if let Some(manager) = checkpoint_manager {
                         self.save_checkpoint(model, manager, false, None)?;
@@ -988,7 +994,10 @@ impl TrainingLoop {
             self.config.training.batch_size,
             self.config.training.gradient_accumulation_steps
         );
-        tracing::info!("Metal fused optimizer: {} total elements", metal_optimizer.total_elements());
+        tracing::info!(
+            "Metal fused optimizer: {} total elements",
+            metal_optimizer.total_elements()
+        );
 
         // Initialize timing for throughput measurement
         self.last_log_time = Some(std::time::Instant::now());
@@ -1001,11 +1010,8 @@ impl TrainingLoop {
             tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
 
             // Create dataloader for this epoch
-            let mut dataloader = DataLoader::new(
-                train_dataset.clone(),
-                self.config.dataloader.clone(),
-                None,
-            );
+            let mut dataloader =
+                DataLoader::new(train_dataset.clone(), self.config.dataloader.clone(), None);
 
             while let Some(batch) = dataloader.next_batch() {
                 // Training step with Metal optimizer
@@ -1035,7 +1041,10 @@ impl TrainingLoop {
                         self.running_loss,
                         stats.learning_rate,
                         tokens_per_sec,
-                        stats.grad_norm.map(|n| format!(", grad_norm={:.2}", n)).unwrap_or_default()
+                        stats
+                            .grad_norm
+                            .map(|n| format!(", grad_norm={:.2}", n))
+                            .unwrap_or_default()
                     );
                 }
 
@@ -1046,7 +1055,8 @@ impl TrainingLoop {
                 {
                     let eval_ds = eval_dataset.as_ref().unwrap();
                     let metrics = self.evaluate(model, eval_ds)?;
-                    let acc_str = metrics.accuracy
+                    let acc_str = metrics
+                        .accuracy
                         .map(|a| format!(", accuracy={:.2}%", a * 100.0))
                         .unwrap_or_default();
                     tracing::info!("Eval: loss={:.4}{}", metrics.loss, acc_str);
@@ -1060,8 +1070,7 @@ impl TrainingLoop {
                 }
 
                 // Regular checkpointing
-                if self.config.checkpoint_every > 0
-                    && self.step % self.config.checkpoint_every == 0
+                if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
                 {
                     if let Some(manager) = checkpoint_manager {
                         self.save_checkpoint(model, manager, false, None)?;
@@ -1178,7 +1187,8 @@ impl TrainingLoop {
         let step_time_ms = start_time.elapsed().as_millis() as u64;
 
         // Log profiling info on first few steps and periodically
-        static PROFILE_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        static PROFILE_COUNT: std::sync::atomic::AtomicUsize =
+            std::sync::atomic::AtomicUsize::new(0);
         let profile_idx = PROFILE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if profile_idx < 5 || profile_idx % 50 == 0 {
             let total_us = fwd_bwd_us + accum_us + clip_us + opt_us;
@@ -1255,14 +1265,15 @@ impl TrainingLoop {
         let base_lr = self.config.training.learning_rate as f32;
         let weight_decay = self.config.training.weight_decay as f32;
 
-        let mut optimizer_builder = crate::AdamWGroupsBuilder::new(base_lr)
-            .with_weight_decay(weight_decay);
+        let mut optimizer_builder =
+            crate::AdamWGroupsBuilder::new(base_lr).with_weight_decay(weight_decay);
 
         if let Some(emb_lr) = self.config.embedding_lr {
             optimizer_builder = optimizer_builder.with_embedding_lr(emb_lr);
             tracing::info!(
                 "Using separate embedding LR: {:.2e} (base: {:.2e})",
-                emb_lr, base_lr
+                emb_lr,
+                base_lr
             );
         }
 
@@ -1298,9 +1309,9 @@ impl TrainingLoop {
         );
 
         // Get first batch for warmup
-        let warmup_batch = dataloader.next_batch().ok_or_else(|| {
-            SftError::Mlx(Exception::custom("Dataset is empty, cannot warmup"))
-        })?;
+        let warmup_batch = dataloader
+            .next_batch()
+            .ok_or_else(|| SftError::Mlx(Exception::custom("Dataset is empty, cannot warmup")))?;
 
         // Record state count BEFORE warmup (optimizer states not yet initialized)
         let state_count_before = state.updatable_states_len();
@@ -1311,7 +1322,8 @@ impl TrainingLoop {
         );
 
         // Run ONE uncompiled training step
-        let warmup_loss = jit_training_step(&mut state, (&warmup_batch.input_ids, &warmup_batch.labels))?;
+        let warmup_loss =
+            jit_training_step(&mut state, (&warmup_batch.input_ids, &warmup_batch.labels))?;
         warmup_loss.eval()?;
         let warmup_loss_val = warmup_loss.item::<f32>();
 
@@ -1327,7 +1339,10 @@ impl TrainingLoop {
         );
 
         // Update stats for warmup step - use checked arithmetic
-        let warmup_tokens = warmup_batch.batch_size.checked_mul(warmup_batch.seq_len).unwrap_or(usize::MAX);
+        let warmup_tokens = warmup_batch
+            .batch_size
+            .checked_mul(warmup_batch.seq_len)
+            .unwrap_or(usize::MAX);
         self.step = 1;
         self.total_tokens = warmup_tokens;
         self.running_loss = warmup_loss_val as f64;
@@ -1350,9 +1365,7 @@ impl TrainingLoop {
             state_count_after
         );
 
-        tracing::info!(
-            "Fused mode enabled - using deferred evaluation for optimized throughput"
-        );
+        tracing::info!("Fused mode enabled - using deferred evaluation for optimized throughput");
 
         // Initialize timing for throughput measurement
         self.last_log_time = Some(std::time::Instant::now());
@@ -1383,13 +1396,20 @@ impl TrainingLoop {
             }
 
             if epoch == 0 {
-                tracing::info!("Epoch {}/{} (continuing after warmup)", epoch + 1, num_epochs);
+                tracing::info!(
+                    "Epoch {}/{} (continuing after warmup)",
+                    epoch + 1,
+                    num_epochs
+                );
             } else {
                 tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
             }
 
             while let Some(batch) = dataloader.next_batch() {
-                let batch_tokens = batch.batch_size.checked_mul(batch.seq_len).unwrap_or(usize::MAX);
+                let batch_tokens = batch
+                    .batch_size
+                    .checked_mul(batch.seq_len)
+                    .unwrap_or(usize::MAX);
 
                 // Execute fused training step (forward + backward + optimizer update)
                 // DEFERRED EVAL: Loss remains a lazy Array, no GPU-CPU sync here
@@ -1442,8 +1462,7 @@ impl TrainingLoop {
                 }
 
                 // Regular checkpointing - need to eval before checkpoint
-                if self.config.checkpoint_every > 0
-                    && self.step % self.config.checkpoint_every == 0
+                if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
                 {
                     // Eval any pending losses before checkpointing
                     if !accumulated_losses.is_empty() {
@@ -1546,14 +1565,15 @@ impl TrainingLoop {
         let base_lr = self.config.training.learning_rate as f32;
         let weight_decay = self.config.training.weight_decay as f32;
 
-        let mut optimizer_builder = crate::AdamWGroupsBuilder::new(base_lr)
-            .with_weight_decay(weight_decay);
+        let mut optimizer_builder =
+            crate::AdamWGroupsBuilder::new(base_lr).with_weight_decay(weight_decay);
 
         if let Some(emb_lr) = self.config.embedding_lr {
             optimizer_builder = optimizer_builder.with_embedding_lr(emb_lr);
             tracing::info!(
                 "Using separate embedding LR: {:.2e} (base: {:.2e})",
-                emb_lr, base_lr
+                emb_lr,
+                base_lr
             );
         }
 
@@ -1577,15 +1597,12 @@ impl TrainingLoop {
         // =========================================================================
         // PHASE 1: WARMUP - Initialize optimizer states
         // =========================================================================
-        let mut dataloader = DataLoader::new(
-            train_dataset.clone(),
-            self.config.dataloader.clone(),
-            None,
-        );
+        let mut dataloader =
+            DataLoader::new(train_dataset.clone(), self.config.dataloader.clone(), None);
 
-        let warmup_batch = dataloader.next_batch().ok_or_else(|| {
-            SftError::Mlx(Exception::custom("Dataset is empty, cannot warmup"))
-        })?;
+        let warmup_batch = dataloader
+            .next_batch()
+            .ok_or_else(|| SftError::Mlx(Exception::custom("Dataset is empty, cannot warmup")))?;
 
         let state_count_before = state.updatable_states_len();
 
@@ -1595,7 +1612,8 @@ impl TrainingLoop {
         );
 
         // Run ONE uncompiled training step for warmup
-        let warmup_loss = trainable_training_step(&mut state, (&warmup_batch.input_ids, &warmup_batch.labels))?;
+        let warmup_loss =
+            trainable_training_step(&mut state, (&warmup_batch.input_ids, &warmup_batch.labels))?;
         warmup_loss.eval()?;
         let warmup_loss_val = warmup_loss.item::<f32>();
 
@@ -1612,7 +1630,10 @@ impl TrainingLoop {
         );
 
         // Update stats for warmup step
-        let warmup_tokens = warmup_batch.batch_size.checked_mul(warmup_batch.seq_len).unwrap_or(usize::MAX);
+        let warmup_tokens = warmup_batch
+            .batch_size
+            .checked_mul(warmup_batch.seq_len)
+            .unwrap_or(usize::MAX);
         self.step = 1;
         self.total_tokens = warmup_tokens;
         self.running_loss = warmup_loss_val as f64;
@@ -1627,7 +1648,8 @@ impl TrainingLoop {
 
         // Create the compiled training step
         // Note: compile_with_state will trace the function on first call
-        let mut compiled_step = compile_with_state(trainable_training_step::<M, crate::AdamWGroups>, None);
+        let mut compiled_step =
+            compile_with_state(trainable_training_step::<M, crate::AdamWGroups>, None);
 
         // Initialize timing for throughput measurement
         self.last_log_time = Some(std::time::Instant::now());
@@ -1642,18 +1664,18 @@ impl TrainingLoop {
             self.epoch = epoch;
 
             if epoch > 0 {
-                dataloader = DataLoader::new(
-                    train_dataset.clone(),
-                    self.config.dataloader.clone(),
-                    None,
-                );
+                dataloader =
+                    DataLoader::new(train_dataset.clone(), self.config.dataloader.clone(), None);
                 dataloader.reset(Some(self.config.dataloader.seed + epoch as u64));
             }
 
             tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
 
             while let Some(batch) = dataloader.next_batch() {
-                let batch_tokens = batch.batch_size.checked_mul(batch.seq_len).unwrap_or(usize::MAX);
+                let batch_tokens = batch
+                    .batch_size
+                    .checked_mul(batch.seq_len)
+                    .unwrap_or(usize::MAX);
 
                 // Execute JIT-compiled training step
                 let loss = compiled_step(&mut state, (&batch.input_ids, &batch.labels))?;
@@ -1759,14 +1781,15 @@ impl TrainingLoop {
         let base_lr = self.config.training.learning_rate as f32;
         let weight_decay = self.config.training.weight_decay as f32;
 
-        let mut optimizer_builder = crate::AdamWGroupsBuilder::new(base_lr)
-            .with_weight_decay(weight_decay);
+        let mut optimizer_builder =
+            crate::AdamWGroupsBuilder::new(base_lr).with_weight_decay(weight_decay);
 
         if let Some(emb_lr) = self.config.embedding_lr {
             optimizer_builder = optimizer_builder.with_embedding_lr(emb_lr);
             tracing::info!(
                 "Using separate embedding LR: {:.2e} (base: {:.2e})",
-                emb_lr, base_lr
+                emb_lr,
+                base_lr
             );
         }
 
@@ -1818,7 +1841,9 @@ impl TrainingLoop {
 
         let warmup_batch = packed_dataloader
             .next_batch()
-            .ok_or_else(|| SftError::Mlx(Exception::custom("No packed batches available for warmup")))?
+            .ok_or_else(|| {
+                SftError::Mlx(Exception::custom("No packed batches available for warmup"))
+            })?
             .map_err(|e| SftError::Mlx(e))?;
 
         let warmup_tokens = warmup_batch.total_tokens;
@@ -1873,8 +1898,7 @@ impl TrainingLoop {
             tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
 
             while let Some(batch_result) = packed_dataloader.next_batch() {
-                let packed_batch = batch_result
-                    .map_err(|e| SftError::Mlx(e))?;
+                let packed_batch = batch_result.map_err(|e| SftError::Mlx(e))?;
 
                 let batch_tokens = packed_batch.total_tokens;
 
@@ -1928,8 +1952,7 @@ impl TrainingLoop {
                 }
 
                 // Regular checkpointing
-                if self.config.checkpoint_every > 0
-                    && self.step % self.config.checkpoint_every == 0
+                if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
                 {
                     // Eval any pending losses before checkpointing
                     if !accumulated_losses.is_empty() {
@@ -1988,11 +2011,7 @@ impl TrainingLoop {
     /// - Average loss across all batches
     /// - Perplexity (exp(loss))
     /// - Token-level accuracy (correct next-token predictions)
-    pub fn evaluate<M>(
-        &self,
-        model: &mut M,
-        dataset: &TrainingDataset,
-    ) -> Result<EvalMetrics>
+    pub fn evaluate<M>(&self, model: &mut M, dataset: &TrainingDataset) -> Result<EvalMetrics>
     where
         M: TrainableModel,
     {
@@ -2311,7 +2330,9 @@ mod tests {
             seq_len: 4,
         };
 
-        let stats = training_loop.train_step(&mut model, &batch, &mut optimizer).unwrap();
+        let stats = training_loop
+            .train_step(&mut model, &batch, &mut optimizer)
+            .unwrap();
 
         assert!(stats.loss > 0.0);
         assert_eq!(stats.step, 1);
@@ -2338,7 +2359,11 @@ mod tests {
 
         let loss_val = loss.item::<f32>();
         assert!(loss_val > 0.0, "Loss should be positive, got {}", loss_val);
-        assert!(loss_val.is_finite(), "Loss should be finite, got {}", loss_val);
+        assert!(
+            loss_val.is_finite(),
+            "Loss should be finite, got {}",
+            loss_val
+        );
     }
 
     #[test]
@@ -2366,15 +2391,23 @@ mod tests {
 
         // All losses should be finite and positive
         for (i, loss) in losses.iter().enumerate() {
-            assert!(loss.is_finite(), "Loss {} should be finite, got {}", i, loss);
+            assert!(
+                loss.is_finite(),
+                "Loss {} should be finite, got {}",
+                i,
+                loss
+            );
             assert!(*loss > 0.0, "Loss {} should be positive, got {}", i, loss);
         }
 
         // Verify loss is changing (parameters are being updated)
-        let loss_variance: f32 = losses.iter()
-            .map(|l| (l - losses[0]).powi(2))
-            .sum::<f32>() / losses.len() as f32;
-        assert!(loss_variance > 0.0, "Loss should change over steps, got {:?}", losses);
+        let loss_variance: f32 =
+            losses.iter().map(|l| (l - losses[0]).powi(2)).sum::<f32>() / losses.len() as f32;
+        assert!(
+            loss_variance > 0.0,
+            "Loss should change over steps, got {:?}",
+            losses
+        );
 
         println!("Training step losses: {:?}", losses);
     }
@@ -2414,9 +2447,11 @@ mod tests {
         // PHASE 3: Record state count AFTER warmup
         // ========================================
         let state_count_after = state.updatable_states_len();
-        println!("State count AFTER warmup: {} (delta={})",
-                 state_count_after,
-                 state_count_after as i64 - state_count_before as i64);
+        println!(
+            "State count AFTER warmup: {} (delta={})",
+            state_count_after,
+            state_count_after as i64 - state_count_before as i64
+        );
 
         // AdamW should have created momentum and velocity buffers
         // So state count should have increased
@@ -2437,16 +2472,15 @@ mod tests {
         println!("Second warmup loss: {:.4}", warmup2_loss_val);
 
         let state_count_after_2 = state.updatable_states_len();
-        println!("State count AFTER second warmup: {} (should be same as {})",
-                 state_count_after_2,
-                 state_count_after);
+        println!(
+            "State count AFTER second warmup: {} (should be same as {})",
+            state_count_after_2, state_count_after
+        );
 
         assert_eq!(
-            state_count_after,
-            state_count_after_2,
+            state_count_after, state_count_after_2,
             "State count should be stable after second warmup: {} vs {}",
-            state_count_after,
-            state_count_after_2
+            state_count_after, state_count_after_2
         );
 
         // ========================================
@@ -2476,11 +2510,9 @@ mod tests {
         // Verify state count remains stable
         let final_state_count = state.updatable_states_len();
         assert_eq!(
-            state_count_after,
-            final_state_count,
+            state_count_after, final_state_count,
             "State count should remain stable: {} -> {}",
-            state_count_after,
-            final_state_count
+            state_count_after, final_state_count
         );
 
         println!("State stability verified! Losses: {:?}", losses);
@@ -2490,7 +2522,10 @@ mod tests {
     fn test_eager_evaluation_config() {
         // Test eager evaluation mode can be enabled
         let mut config = TrainingLoopConfig::default();
-        assert!(!config.eager_evaluation, "Default should have eager_evaluation disabled");
+        assert!(
+            !config.eager_evaluation,
+            "Default should have eager_evaluation disabled"
+        );
 
         config.eager_evaluation = true;
         let training_loop = TrainingLoop::new(config);
@@ -2526,7 +2561,10 @@ mod tests {
         assert!(result.is_ok(), "GPU gradient clipping should succeed");
 
         let norm_arr = result.unwrap();
-        assert!(norm_arr.is_some(), "Should return norm array when max_grad_norm > 0");
+        assert!(
+            norm_arr.is_some(),
+            "Should return norm array when max_grad_norm > 0"
+        );
 
         let norm = norm_arr.unwrap();
         norm.eval().unwrap();
@@ -2592,7 +2630,9 @@ mod tests {
         assert!(result.is_none(), "Should detect potential overflow");
 
         // With our protected version, it returns MAX
-        let protected = large_batch_size.checked_mul(large_seq_len).unwrap_or(usize::MAX);
+        let protected = large_batch_size
+            .checked_mul(large_seq_len)
+            .unwrap_or(usize::MAX);
         assert_eq!(protected, usize::MAX, "Should return MAX on overflow");
     }
 }

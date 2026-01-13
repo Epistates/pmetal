@@ -305,7 +305,8 @@ impl LoraLinear {
             &self.lora_b,
             self.scale,
             ctx,
-        ).map_err(LoraError::from)
+        )
+        .map_err(LoraError::from)
     }
 
     /// Backward pass using saved state from forward_with_grad.

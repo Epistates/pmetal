@@ -169,7 +169,10 @@ pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
 
     // Handle batched input
     let (stft_matrix, was_2d) = if stft_matrix.ndim() == 2 {
-        (stft_matrix.reshape(&[1, stft_matrix.dim(0), stft_matrix.dim(1)])?, true)
+        (
+            stft_matrix.reshape(&[1, stft_matrix.dim(0), stft_matrix.dim(1)])?,
+            true,
+        )
     } else {
         (stft_matrix.clone(), false)
     };
@@ -227,9 +230,7 @@ fn pad_signal(signal: &Array, pad_amount: i32, mode: PadMode) -> Result<Array> {
             };
 
             // Right reflection
-            let right_indices: Vec<i32> = ((length - pad_amount - 1)..(length - 1))
-                .rev()
-                .collect();
+            let right_indices: Vec<i32> = ((length - pad_amount - 1)..(length - 1)).rev().collect();
             let right_pad = if !right_indices.is_empty() {
                 let indices = Array::from_slice(&right_indices, &[pad_amount]);
                 signal.take_axis(&indices, 1)?
@@ -250,7 +251,8 @@ fn pad_signal(signal: &Array, pad_amount: i32, mode: PadMode) -> Result<Array> {
 
             mlx_rs::ops::concatenate_axis(&[&left_pad, signal, &right_pad], 1)
         }
-    }.map_err(VocoderError::from)
+    }
+    .map_err(VocoderError::from)
 }
 
 /// Compute magnitude spectrogram from complex STFT.

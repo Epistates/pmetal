@@ -6,11 +6,6 @@
 
 use std::collections::HashMap;
 
-use pmetal_mlx::kernels::{
-    differentiable_attention, fused_sdpa, get_training_context,
-    rope::apply_rope, AttentionMaskType, FusedAttentionConfig,
-};
-use pmetal_mlx::kv_cache::KVCache;
 use mlx_rs::{
     builder::Builder,
     error::Exception,
@@ -20,9 +15,14 @@ use mlx_rs::{
     ops::softmax_axis,
     Array,
 };
+use pmetal_mlx::kernels::{
+    differentiable_attention, fused_sdpa, get_training_context, rope::apply_rope,
+    AttentionMaskType, FusedAttentionConfig,
+};
+use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
-use crate::architectures::llama::{LlamaConfig, LlamaAttention, LlamaMLP, RopeScalingValue};
+use crate::architectures::llama::{LlamaAttention, LlamaConfig, LlamaMLP, RopeScalingValue};
 use crate::traits::ModelConfig;
 
 /// Mllama vision model configuration.
@@ -79,7 +79,7 @@ impl Default for MllamaConfig {
         let vision_config = MllamaVisionConfig::default();
         // Example indices for 11B model (every 4th layer)
         let cross_attention_layers = vec![3, 7, 11, 15, 19, 23, 27, 31];
-        
+
         Self {
             text_config,
             vision_config,
@@ -150,7 +150,9 @@ impl Gate {
         // Initialize with 0 usually for tanh gating to start as identity (x + 0*attn)
         // or small value
         let weight = mlx_rs::ops::zeros::<f32>(shape)?;
-        Ok(Self { weight: Param::new(weight) })
+        Ok(Self {
+            weight: Param::new(weight),
+        })
     }
 }
 
@@ -166,8 +168,8 @@ pub struct MllamaVisionEmbeddings {
     #[param]
     pub pre_tile_position_embedding: nn::Embedding, // Gated positional embeddings for tiles
     #[param]
-    pub post_tile_position_embedding: nn::Embedding, 
-    
+    pub post_tile_position_embedding: nn::Embedding,
+
     pub patch_size: i32,
     pub image_size: i32,
     pub hidden_size: i32,
@@ -176,30 +178,25 @@ pub struct MllamaVisionEmbeddings {
 
 impl MllamaVisionEmbeddings {
     pub fn new(config: &MllamaVisionConfig) -> Result<Self, Exception> {
-        let patch_embedding = nn::Conv2dBuilder::new(
-            config.num_channels,
-            config.hidden_size,
-            config.patch_size,
-        )
-        .stride(config.patch_size)
-        .bias(false)
-        .build()?;
+        let patch_embedding =
+            nn::Conv2dBuilder::new(config.num_channels, config.hidden_size, config.patch_size)
+                .stride(config.patch_size)
+                .bias(false)
+                .build()?;
 
         let num_patches = (config.image_size / config.patch_size).pow(2);
-        
+
         // Class token
         let class_embedding = nn::Embedding::new(1, config.hidden_size)?;
-        
+
         // Positional embeddings
         let position_embedding = nn::Embedding::new(num_patches, config.hidden_size)?;
         let pre_tile_position_embedding = nn::Embedding::new(
             config.num_global_layers * num_patches, // Placeholder size
-            config.hidden_size
+            config.hidden_size,
         )?;
-        let post_tile_position_embedding = nn::Embedding::new(
-            config.num_global_layers * num_patches, 
-            config.hidden_size
-        )?;
+        let post_tile_position_embedding =
+            nn::Embedding::new(config.num_global_layers * num_patches, config.hidden_size)?;
 
         Ok(Self {
             patch_embedding,
@@ -219,11 +216,11 @@ impl MllamaVisionEmbeddings {
         // Conv2d expects [batch, height, width, channels] in MLX by default (NHWC)
         // Assuming input is NCHW (standard PyTorch), we transpose.
         let x = pixel_values.transpose_axes(&[0, 2, 3, 1])?;
-        
+
         let patches = Module::forward(&mut self.patch_embedding, &x)?;
         // flatten patches: [B, H_p, W_p, C] -> [B, N_p, C]
         let patches_flat = patches.reshape(&[patches.shape()[0], -1, self.hidden_size])?;
-        
+
         Ok(patches_flat)
     }
 }
@@ -276,11 +273,19 @@ impl MllamaVisionAttention {
     pub fn new(config: &MllamaVisionConfig) -> Result<Self, Exception> {
         let n_heads = config.num_attention_heads;
         let head_dim = config.hidden_size / n_heads;
-        
-        let q_proj = nn::LinearBuilder::new(config.hidden_size, config.hidden_size).bias(false).build()?;
-        let k_proj = nn::LinearBuilder::new(config.hidden_size, config.hidden_size).bias(false).build()?;
-        let v_proj = nn::LinearBuilder::new(config.hidden_size, config.hidden_size).bias(false).build()?;
-        let o_proj = nn::LinearBuilder::new(config.hidden_size, config.hidden_size).bias(false).build()?;
+
+        let q_proj = nn::LinearBuilder::new(config.hidden_size, config.hidden_size)
+            .bias(false)
+            .build()?;
+        let k_proj = nn::LinearBuilder::new(config.hidden_size, config.hidden_size)
+            .bias(false)
+            .build()?;
+        let v_proj = nn::LinearBuilder::new(config.hidden_size, config.hidden_size)
+            .bias(false)
+            .build()?;
+        let o_proj = nn::LinearBuilder::new(config.hidden_size, config.hidden_size)
+            .bias(false)
+            .build()?;
 
         Ok(Self {
             n_heads,
@@ -301,9 +306,15 @@ impl MllamaVisionAttention {
         let k = Module::forward(&mut self.k_proj, x)?;
         let v = Module::forward(&mut self.v_proj, x)?;
 
-        let q = q.reshape(&[batch, seq, self.n_heads, self.head_dim])?.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.reshape(&[batch, seq, self.n_heads, self.head_dim])?.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.reshape(&[batch, seq, self.n_heads, self.head_dim])?.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q
+            .reshape(&[batch, seq, self.n_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let k = k
+            .reshape(&[batch, seq, self.n_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let v = v
+            .reshape(&[batch, seq, self.n_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
 
         // Standard SDPA
         let scores = q.matmul(&k.transpose_axes(&[0, 1, 3, 2])?)?;
@@ -311,8 +322,10 @@ impl MllamaVisionAttention {
         // Use mlx_rs::ops::softmax_axis with 3 arguments
         let probs = softmax_axis(&scores, -1, None)?;
         let output = probs.matmul(&v)?;
-        
-        let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[batch, seq, -1])?;
+
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[batch, seq, -1])?;
         Module::forward(&mut self.o_proj, &output)
     }
 }
@@ -328,7 +341,7 @@ pub struct MllamaVisionEncoderLayer {
     pub input_layernorm: nn::LayerNorm,
     #[param]
     pub post_attention_layernorm: nn::LayerNorm,
-    
+
     // Gating parameters (Vec for optionality)
     #[param]
     pub gate_attn: Vec<Gate>, // 0 or 1 element
@@ -361,7 +374,7 @@ impl MllamaVisionEncoderLayer {
         // Pre-norm
         let normed = Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward(&normed)?;
-        
+
         // Gate logic: h = x + tanh(gate) * attn_out
         let h = if let Some(gate) = self.gate_attn.first() {
             let gated = mlx_rs::ops::tanh(&gate.weight.value)?.multiply(&attn_out)?;
@@ -372,7 +385,7 @@ impl MllamaVisionEncoderLayer {
 
         let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
-        
+
         if let Some(gate) = self.gate_mlp.first() {
             let gated = mlx_rs::ops::tanh(&gate.weight.value)?.multiply(&mlp_out)?;
             h.add(&gated)
@@ -386,7 +399,7 @@ impl MllamaVisionEncoderLayer {
 #[derive(Debug, ModuleParameters)]
 pub struct MllamaVisionModel {
     pub config: MllamaVisionConfig,
-    
+
     #[param]
     pub embeddings: MllamaVisionEmbeddings,
     #[param]
@@ -415,11 +428,11 @@ impl MllamaVisionModel {
 
     pub fn forward(&mut self, pixel_values: &Array) -> Result<Array, Exception> {
         let mut hidden_states = self.embeddings.forward(pixel_values)?;
-        
+
         for layer in &mut self.layers {
             hidden_states = layer.forward(&hidden_states)?;
         }
-        
+
         Module::forward(&mut self.layernorm, &hidden_states)
     }
 }
@@ -446,7 +459,7 @@ pub struct MllamaCrossAttention {
     pub v_proj: nn::Linear,
     #[param]
     pub o_proj: nn::Linear,
-    
+
     // Gating
     #[param]
     pub gate: Vec<Gate>, // Optional gate
@@ -457,15 +470,23 @@ impl MllamaCrossAttention {
         let text_dim = config.text_config.hidden_size;
         // Vision dimension same as text? Usually projected before this.
         // Assuming cross_attention_states have dimension text_dim (after projector)
-        
+
         let n_heads = config.text_config.num_attention_heads;
         let n_kv_heads = config.text_config.num_kv_heads();
         let head_dim = config.text_config.get_head_dim();
-        
-        let q_proj = nn::LinearBuilder::new(text_dim, n_heads * head_dim).bias(false).build()?;
-        let k_proj = nn::LinearBuilder::new(text_dim, n_kv_heads * head_dim).bias(false).build()?;
-        let v_proj = nn::LinearBuilder::new(text_dim, n_kv_heads * head_dim).bias(false).build()?;
-        let o_proj = nn::LinearBuilder::new(n_heads * head_dim, text_dim).bias(false).build()?;
+
+        let q_proj = nn::LinearBuilder::new(text_dim, n_heads * head_dim)
+            .bias(false)
+            .build()?;
+        let k_proj = nn::LinearBuilder::new(text_dim, n_kv_heads * head_dim)
+            .bias(false)
+            .build()?;
+        let v_proj = nn::LinearBuilder::new(text_dim, n_kv_heads * head_dim)
+            .bias(false)
+            .build()?;
+        let o_proj = nn::LinearBuilder::new(n_heads * head_dim, text_dim)
+            .bias(false)
+            .build()?;
 
         Ok(Self {
             n_heads,
@@ -480,14 +501,10 @@ impl MllamaCrossAttention {
         })
     }
 
-    pub fn forward(
-        &mut self, 
-        x: &Array, 
-        cross_states: &Array,
-    ) -> Result<Array, Exception> {
+    pub fn forward(&mut self, x: &Array, cross_states: &Array) -> Result<Array, Exception> {
         // x: [batch, seq, text_dim]
         // cross_states: [batch, vision_seq, text_dim]
-        
+
         let batch = x.shape()[0];
         let seq = x.shape()[1];
         let vision_seq = cross_states.shape()[1];
@@ -496,21 +513,29 @@ impl MllamaCrossAttention {
         let k = Module::forward(&mut self.k_proj, cross_states)?;
         let v = Module::forward(&mut self.v_proj, cross_states)?;
 
-        let q = q.reshape(&[batch, seq, self.n_heads, self.head_dim])?.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.reshape(&[batch, vision_seq, self.n_kv_heads, self.head_dim])?.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.reshape(&[batch, vision_seq, self.n_kv_heads, self.head_dim])?.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q
+            .reshape(&[batch, seq, self.n_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let k = k
+            .reshape(&[batch, vision_seq, self.n_kv_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let v = v
+            .reshape(&[batch, vision_seq, self.n_kv_heads, self.head_dim])?
+            .transpose_axes(&[0, 2, 1, 3])?;
 
         // Standard SDPA with GQA broadcasting handled by matmul
         // scores: [B, heads, seq, vision_seq]
         let scores = q.matmul(&k.transpose_axes(&[0, 1, 3, 2])?)?;
         let scores = scores.multiply(&Array::from_f32(self.scale))?;
-        
+
         let probs = softmax_axis(&scores, -1, None)?;
         let output = probs.matmul(&v)?;
-        
-        let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[batch, seq, -1])?;
+
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[batch, seq, -1])?;
         let output = Module::forward(&mut self.o_proj, &output)?;
-        
+
         // Gate logic
         if let Some(gate) = self.gate.first() {
             let gated = mlx_rs::ops::tanh(&gate.weight.value)?.multiply(&output)?;
@@ -542,7 +567,7 @@ impl MllamaDecoderLayer {
     pub fn new(config: &MllamaConfig, layer_id: usize) -> Result<Self, Exception> {
         let self_attn = LlamaAttention::new(&config.text_config, layer_id)?;
         let mlp = LlamaMLP::new(&config.text_config)?;
-        
+
         let input_layernorm = nn::RmsNormBuilder::new(config.text_config.hidden_size)
             .eps(config.text_config.rms_norm_eps)
             .build()?;
@@ -551,7 +576,7 @@ impl MllamaDecoderLayer {
             .build()?;
 
         let has_cross_attn = config.cross_attention_layers.contains(&(layer_id as i32));
-        
+
         let (cross_attn, cross_attention_layernorm) = if has_cross_attn {
             let attn = MllamaCrossAttention::new(config)?;
             let norm = nn::RmsNormBuilder::new(config.text_config.hidden_size)
@@ -585,9 +610,11 @@ impl MllamaDecoderLayer {
         let mut h = x.add(&attn_out)?;
 
         // Cross Attention (if present and states provided)
-        if let (Some(cross_attn), Some(cross_states), Some(cross_norm)) = 
-            (self.cross_attn.as_mut(), cross_attention_states, self.cross_attention_layernorm.as_mut()) 
-        {
+        if let (Some(cross_attn), Some(cross_states), Some(cross_norm)) = (
+            self.cross_attn.as_mut(),
+            cross_attention_states,
+            self.cross_attention_layernorm.as_mut(),
+        ) {
             let normed = Module::forward(cross_norm, &h)?;
             let cross_out = cross_attn.forward(&normed, cross_states)?;
             h = h.add(&cross_out)?;
@@ -616,12 +643,16 @@ impl MllamaMultiModalProjector {
         let vision_dim = config.vision_config.hidden_size;
         let text_dim = config.text_config.hidden_size;
         let _intermediate_dim = config.vision_config.intermediate_size; // Or specific projector dim?
-        // Usually uses intermediate size or text dim. 
-        // Llama 3.2 uses specific projection logic. Simplified to MLP here.
-        
-        let linear_1 = nn::LinearBuilder::new(vision_dim, text_dim).bias(true).build()?;
-        let linear_2 = nn::LinearBuilder::new(text_dim, text_dim).bias(true).build()?;
-        
+                                                                        // Usually uses intermediate size or text dim.
+                                                                        // Llama 3.2 uses specific projection logic. Simplified to MLP here.
+
+        let linear_1 = nn::LinearBuilder::new(vision_dim, text_dim)
+            .bias(true)
+            .build()?;
+        let linear_2 = nn::LinearBuilder::new(text_dim, text_dim)
+            .bias(true)
+            .build()?;
+
         Ok(Self { linear_1, linear_2 })
     }
 
@@ -636,7 +667,7 @@ impl MllamaMultiModalProjector {
 #[derive(Debug, ModuleParameters)]
 pub struct MllamaTextModel {
     pub config: MllamaConfig,
-    
+
     #[param]
     pub embed_tokens: nn::Embedding,
     #[param]
@@ -648,8 +679,8 @@ pub struct MllamaTextModel {
 impl MllamaTextModel {
     pub fn new(config: MllamaConfig) -> Result<Self, Exception> {
         let embed_tokens = nn::Embedding::new(
-            config.text_config.vocab_size, 
-            config.text_config.hidden_size
+            config.text_config.vocab_size,
+            config.text_config.hidden_size,
         )?;
 
         let layers = (0..config.text_config.num_hidden_layers)
@@ -669,23 +700,23 @@ impl MllamaTextModel {
     }
 
     pub fn forward(
-        &mut self, 
-        input_ids: &Array, 
+        &mut self,
+        input_ids: &Array,
         cross_attention_states: Option<&Array>,
     ) -> Result<Array, Exception> {
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
-        
+
         // TODO: Causal mask logic similar to LlamaModel
-        
+
         for layer in &mut self.layers {
             hidden_states = layer.forward(
-                &hidden_states, 
-                None, // Mask 
-                cross_attention_states, 
-                None // Cache
+                &hidden_states,
+                None, // Mask
+                cross_attention_states,
+                None, // Cache
             )?;
         }
-        
+
         Module::forward(&mut self.norm, &hidden_states)
     }
 }
@@ -694,7 +725,7 @@ impl MllamaTextModel {
 #[derive(Debug, ModuleParameters)]
 pub struct MllamaForConditionalGeneration {
     pub config: MllamaConfig,
-    
+
     #[param]
     pub vision_model: MllamaVisionModel,
     #[param]
@@ -711,9 +742,11 @@ impl MllamaForConditionalGeneration {
         let multi_modal_projector = MllamaMultiModalProjector::new(&config)?;
         let language_model = MllamaTextModel::new(config.clone())?;
         let lm_head = nn::LinearBuilder::new(
-            config.text_config.hidden_size, 
-            config.text_config.vocab_size
-        ).bias(false).build()?;
+            config.text_config.hidden_size,
+            config.text_config.vocab_size,
+        )
+        .bias(false)
+        .build()?;
 
         Ok(Self {
             config,
@@ -725,8 +758,8 @@ impl MllamaForConditionalGeneration {
     }
 
     pub fn forward(
-        &mut self, 
-        input_ids: &Array, 
+        &mut self,
+        input_ids: &Array,
         pixel_values: Option<&Array>,
     ) -> Result<Array, Exception> {
         // 1. Vision Encoder
@@ -739,8 +772,10 @@ impl MllamaForConditionalGeneration {
         };
 
         // 2. Text Decoder with Cross Attention
-        let hidden_states = self.language_model.forward(input_ids, cross_attention_states.as_ref())?;
-        
+        let hidden_states = self
+            .language_model
+            .forward(input_ids, cross_attention_states.as_ref())?;
+
         // 3. LM Head
         Module::forward(&mut self.lm_head, &hidden_states)
     }
@@ -761,15 +796,15 @@ mod tests {
         config.text_config.num_hidden_layers = 2;
         config.text_config.num_attention_heads = 4;
         config.text_config.num_key_value_heads = Some(2);
-        
+
         config.vision_config.hidden_size = 32;
         config.vision_config.num_hidden_layers = 2;
         config.vision_config.num_attention_heads = 4;
         config.vision_config.image_size = 28; // small image
         config.vision_config.patch_size = 14; // 2x2 grid
-        
+
         let model = MllamaForConditionalGeneration::new(config).unwrap();
-        
+
         // Check params count > 0
         let params = model.parameters().flatten();
         assert!(params.len() > 0);

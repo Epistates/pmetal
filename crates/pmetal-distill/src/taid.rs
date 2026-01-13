@@ -33,10 +33,10 @@
 //! let loss = distiller.compute_loss(&teacher_logits, &student_logits, step, total_steps)?;
 //! ```
 
-use mlx_rs::{error::Exception, Array};
-use mlx_rs::ops::indexing::IndexOp;
 use crate::losses::softmax;
 use crate::Result;
+use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::{error::Exception, Array};
 
 /// Log-softmax along specified axis.
 fn log_softmax(x: &Array, axis: i32) -> Result<Array> {
@@ -222,9 +222,7 @@ impl TaidConfig {
     /// Validate the configuration.
     pub fn validate(&self) -> TaidResult<()> {
         if self.initial_alpha < 0.0 || self.initial_alpha > 1.0 {
-            return Err(TaidError::Config(
-                "initial_alpha must be in [0, 1]".into(),
-            ));
+            return Err(TaidError::Config("initial_alpha must be in [0, 1]".into()));
         }
         if self.final_alpha < 0.0 || self.final_alpha > 1.0 {
             return Err(TaidError::Config("final_alpha must be in [0, 1]".into()));
@@ -233,9 +231,7 @@ impl TaidConfig {
             return Err(TaidError::Config("temperature must be positive".into()));
         }
         if self.min_alpha > self.max_alpha {
-            return Err(TaidError::Config(
-                "min_alpha must be <= max_alpha".into(),
-            ));
+            return Err(TaidError::Config("min_alpha must be <= max_alpha".into()));
         }
         Ok(())
     }
@@ -273,9 +269,7 @@ impl TaidDistiller {
         let alpha_range = self.config.initial_alpha - self.config.final_alpha;
 
         let alpha = match self.config.schedule {
-            TaidSchedule::Linear => {
-                self.config.initial_alpha - alpha_range * progress
-            }
+            TaidSchedule::Linear => self.config.initial_alpha - alpha_range * progress,
             TaidSchedule::Cosine => {
                 // Cosine annealing: starts slow, speeds up, then slows down
                 let cosine_factor = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
@@ -351,8 +345,7 @@ impl TaidDistiller {
 
         // Adjust alpha: alpha = base_alpha + difficulty_adjustment
         // Where difficulty_adjustment scales from 0 to (max_alpha - base_alpha)
-        let alpha_adjustment_range =
-            (self.config.max_alpha - base_alpha) as f32;
+        let alpha_adjustment_range = (self.config.max_alpha - base_alpha) as f32;
         let adjustment = normalized_diff.multiply(&Array::from_f32(alpha_adjustment_range))?;
         let alpha = adjustment.add(&Array::from_f32(base_alpha as f32))?;
 
@@ -435,11 +428,8 @@ impl TaidDistiller {
         let alpha = self.compute_difficulty_alpha(&teacher_probs, &student_probs, base_alpha)?;
 
         // Compute interpolated target distribution
-        let target_probs = self.interpolate_distributions(
-            &teacher_probs,
-            &student_probs,
-            &alpha,
-        )?;
+        let target_probs =
+            self.interpolate_distributions(&teacher_probs, &student_probs, &alpha)?;
 
         // Compute distillation loss
         let distill_loss = match self.config.loss_type {
@@ -461,7 +451,9 @@ impl TaidDistiller {
                 // JS = 0.5 * KL(P_I || M) + 0.5 * KL(P_S || M)
                 // where M = 0.5 * (P_I + P_S)
                 let eps = Array::from_f32(1e-10);
-                let m = target_probs.add(&student_probs)?.multiply(&Array::from_f32(0.5))?;
+                let m = target_probs
+                    .add(&student_probs)?
+                    .multiply(&Array::from_f32(0.5))?;
                 let m_safe = m.add(&eps)?;
 
                 let log_ratio_target = target_probs.add(&eps)?.divide(&m_safe)?.log()?;
@@ -470,7 +462,9 @@ impl TaidDistiller {
                 let log_ratio_student = student_probs.add(&eps)?.divide(&m_safe)?.log()?;
                 let kl_student = student_probs.multiply(&log_ratio_student)?;
 
-                let js = kl_target.add(&kl_student)?.multiply(&Array::from_f32(0.5))?;
+                let js = kl_target
+                    .add(&kl_student)?
+                    .multiply(&Array::from_f32(0.5))?;
                 js.sum_axis(-1, None)?.mean(None)?
             }
             TaidLossType::ReverseKl => {
@@ -516,11 +510,7 @@ impl TaidDistiller {
                         let label_idx = safe_labels.index((b as i32, s as i32));
                         label_idx.eval()?;
                         let idx = label_idx.item::<i32>();
-                        let log_prob = student_log_probs_unscaled.index((
-                            b as i32,
-                            s as i32,
-                            idx,
-                        ));
+                        let log_prob = student_log_probs_unscaled.index((b as i32, s as i32, idx));
                         log_prob.eval()?;
                         ce_values.push(-log_prob.item::<f32>());
                     }
@@ -664,14 +654,8 @@ mod tests {
         let distiller = TaidDistiller::new(config).unwrap();
 
         // Simple 2x1x3 distributions
-        let teacher = Array::from_slice(
-            &[0.7f32, 0.2, 0.1, 0.1, 0.8, 0.1],
-            &[2, 1, 3],
-        );
-        let student = Array::from_slice(
-            &[0.3f32, 0.4, 0.3, 0.5, 0.3, 0.2],
-            &[2, 1, 3],
-        );
+        let teacher = Array::from_slice(&[0.7f32, 0.2, 0.1, 0.1, 0.8, 0.1], &[2, 1, 3]);
+        let student = Array::from_slice(&[0.3f32, 0.4, 0.3, 0.5, 0.3, 0.2], &[2, 1, 3]);
         let alpha = Array::from_slice(&[0.5f32, 0.8], &[2]);
 
         let interpolated = distiller
@@ -699,14 +683,8 @@ mod tests {
         let distiller = TaidDistiller::new(config).unwrap();
 
         // Create simple logits
-        let teacher_logits = Array::from_slice(
-            &[2.0f32, 1.0, 0.0, 0.0, 1.0, 2.0],
-            &[2, 1, 3],
-        );
-        let student_logits = Array::from_slice(
-            &[1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0],
-            &[2, 1, 3],
-        );
+        let teacher_logits = Array::from_slice(&[2.0f32, 1.0, 0.0, 0.0, 1.0, 2.0], &[2, 1, 3]);
+        let student_logits = Array::from_slice(&[1.0f32, 1.0, 1.0, 1.0, 1.0, 1.0], &[2, 1, 3]);
 
         let output = distiller
             .compute_loss(&teacher_logits, &student_logits, 0, 100, None)

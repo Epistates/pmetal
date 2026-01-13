@@ -14,18 +14,18 @@
 
 use std::ops::Neg;
 
-use mlx_rs::Array;
+use super::{softmax, DistillLoss};
 use crate::Result;
-use super::{DistillLoss, softmax};
+use mlx_rs::Array;
 
 #[cfg(feature = "metal")]
 use std::sync::Arc;
 
 #[cfg(feature = "metal")]
 use pmetal_metal::{
-    context::MetalContext,
     bridge::metal_buffer_from_ptr,
-    kernels::{FusedDistill, FusedDistillConfig, DistillLossType as MetalDistillLossType},
+    context::MetalContext,
+    kernels::{DistillLossType as MetalDistillLossType, FusedDistill, FusedDistillConfig},
 };
 
 /// Soft Cross-Entropy loss for knowledge distillation.
@@ -86,20 +86,24 @@ impl SoftCrossEntropyLoss {
         student_logits: &Array,
         temperature: f32,
     ) -> Result<Array> {
-        let ctx = self.ctx.as_ref().ok_or_else(|| {
-            crate::DistillError::Metal("Metal context not available".to_string())
-        })?;
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| crate::DistillError::Metal("Metal context not available".to_string()))?;
 
         let shape = teacher_logits.shape();
         if shape.len() < 2 {
             return Err(crate::DistillError::Other(
-                "Logits must have at least 2 dimensions".to_string()
+                "Logits must have at least 2 dimensions".to_string(),
             ));
         }
 
         // Get dimensions - handle both [batch, seq, vocab] and [tokens, vocab]
         let vocab_size = shape[shape.len() - 1] as usize;
-        let num_tokens: usize = shape[..shape.len() - 1].iter().map(|&d| d as usize).product();
+        let num_tokens: usize = shape[..shape.len() - 1]
+            .iter()
+            .map(|&d| d as usize)
+            .product();
         let total_elements = num_tokens * vocab_size;
 
         // Flatten to [num_tokens, vocab] for Metal kernel
@@ -133,14 +137,18 @@ impl SoftCrossEntropyLoss {
         };
 
         // Configure kernel with automatic SIMD selection for large vocabularies
-        let config = FusedDistillConfig::new(num_tokens, vocab_size)
-            .with_temperature(temperature);
+        let config = FusedDistillConfig::new(num_tokens, vocab_size).with_temperature(temperature);
 
         let kernel = FusedDistill::new(ctx.clone(), config)
             .map_err(|e| crate::DistillError::Metal(format!("Kernel error: {}", e)))?;
 
         // Execute kernel with zero-copy buffer views
-        let output = kernel.forward(&teacher_view, &student_view, MetalDistillLossType::SoftCrossEntropy)
+        let output = kernel
+            .forward(
+                &teacher_view,
+                &student_view,
+                MetalDistillLossType::SoftCrossEntropy,
+            )
             .map_err(|e| crate::DistillError::Metal(format!("Execution error: {}", e)))?;
 
         // Return mean loss
@@ -252,8 +260,12 @@ mod tests {
         let cross_val: f32 = cross_ce.item();
 
         // Cross-entropy should be >= entropy (Gibbs' inequality)
-        assert!(cross_val >= self_val - 1e-4,
-            "CE(P, Q) should be >= H(P): CE={}, H={}", cross_val, self_val);
+        assert!(
+            cross_val >= self_val - 1e-4,
+            "CE(P, Q) should be >= H(P): CE={}, H={}",
+            cross_val,
+            self_val
+        );
     }
 
     #[test]
@@ -272,22 +284,19 @@ mod tests {
 
         // At higher temperature, distributions are more similar
         // so cross-entropy approaches entropy
-        assert!(v4 < v1, "Higher temp should reduce soft CE: T=1: {}, T=4: {}", v1, v4);
+        assert!(
+            v4 < v1,
+            "Higher temp should reduce soft CE: T=1: {}, T=4: {}",
+            v1,
+            v4
+        );
     }
 
     #[test]
     fn test_soft_ce_batch_processing() {
         // Test with batch of sequences
-        let teacher = Array::from_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0,
-              2.0, 3.0, 4.0, 5.0],
-            &[2, 1, 4]
-        );
-        let student = Array::from_slice(
-            &[4.0_f32, 3.0, 2.0, 1.0,
-              5.0, 4.0, 3.0, 2.0],
-            &[2, 1, 4]
-        );
+        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0, 5.0], &[2, 1, 4]);
+        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0, 5.0, 4.0, 3.0, 2.0], &[2, 1, 4]);
 
         let loss = SoftCrossEntropyLoss::new();
         let result = loss.compute(&teacher, &student, 1.0).unwrap();
@@ -319,8 +328,14 @@ mod tests {
             .map(|i| ((i * 7 % 100) as f32 - 50.0) / 10.0)
             .collect();
 
-        let teacher = Array::from_slice(&teacher_data, &[batch_size as i32, seq_len as i32, vocab_size as i32]);
-        let student = Array::from_slice(&student_data, &[batch_size as i32, seq_len as i32, vocab_size as i32]);
+        let teacher = Array::from_slice(
+            &teacher_data,
+            &[batch_size as i32, seq_len as i32, vocab_size as i32],
+        );
+        let student = Array::from_slice(
+            &student_data,
+            &[batch_size as i32, seq_len as i32, vocab_size as i32],
+        );
 
         let loss = SoftCrossEntropyLoss::new();
         let result = loss.compute(&teacher, &student, 2.0).unwrap();

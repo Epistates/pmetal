@@ -13,17 +13,19 @@
 //! zero-copy bridging to pass MLX array data directly to Metal kernels without
 //! copying, providing significant performance improvements for large tensors.
 
+use crate::{HiddenStateLossType, Result};
 use mlx_rs::Array;
-use crate::{Result, HiddenStateLossType};
 
 #[cfg(feature = "metal")]
 use std::sync::Arc;
 
 #[cfg(feature = "metal")]
 use pmetal_metal::{
-    context::MetalContext,
     bridge::metal_buffer_from_ptr,
-    kernels::{FusedHiddenAlign, HiddenAlignConfig, HiddenAlignLossType as MetalHiddenAlignLossType},
+    context::MetalContext,
+    kernels::{
+        FusedHiddenAlign, HiddenAlignConfig, HiddenAlignLossType as MetalHiddenAlignLossType,
+    },
 };
 
 /// Hidden state alignment loss.
@@ -112,10 +114,18 @@ impl HiddenStateLoss {
             if self.ctx.is_some() {
                 match self.loss_type {
                     HiddenStateLossType::Mse => {
-                        return self.compute_gpu(teacher_hidden, &student_aligned, MetalHiddenAlignLossType::Mse);
+                        return self.compute_gpu(
+                            teacher_hidden,
+                            &student_aligned,
+                            MetalHiddenAlignLossType::Mse,
+                        );
                     }
                     HiddenStateLossType::Cosine => {
-                        return self.compute_gpu(teacher_hidden, &student_aligned, MetalHiddenAlignLossType::Cosine);
+                        return self.compute_gpu(
+                            teacher_hidden,
+                            &student_aligned,
+                            MetalHiddenAlignLossType::Cosine,
+                        );
                     }
                     HiddenStateLossType::L1 => {
                         // L1 not implemented in Metal, fall through to MLX
@@ -144,23 +154,27 @@ impl HiddenStateLoss {
         student_hidden: &Array,
         loss_type: MetalHiddenAlignLossType,
     ) -> Result<Array> {
-        let ctx = self.ctx.as_ref().ok_or_else(|| {
-            crate::DistillError::Metal("Metal context not available".to_string())
-        })?;
+        let ctx = self
+            .ctx
+            .as_ref()
+            .ok_or_else(|| crate::DistillError::Metal("Metal context not available".to_string()))?;
 
         let t_shape = teacher_hidden.shape();
         let s_shape = student_hidden.shape();
 
         if t_shape.len() < 2 || s_shape.len() < 2 {
             return Err(crate::DistillError::Other(
-                "Hidden states must have at least 2 dimensions".to_string()
+                "Hidden states must have at least 2 dimensions".to_string(),
             ));
         }
 
         // Get dimensions
         let teacher_dim = t_shape[t_shape.len() - 1] as usize;
         let student_dim = s_shape[s_shape.len() - 1] as usize;
-        let num_tokens: usize = t_shape[..t_shape.len() - 1].iter().map(|&d| d as usize).product();
+        let num_tokens: usize = t_shape[..t_shape.len() - 1]
+            .iter()
+            .map(|&d| d as usize)
+            .product();
         let teacher_elements = num_tokens * teacher_dim;
         let student_elements = num_tokens * student_dim;
 
@@ -201,7 +215,8 @@ impl HiddenStateLoss {
             .map_err(|e| crate::DistillError::Metal(format!("Kernel error: {}", e)))?;
 
         // Execute kernel with zero-copy buffer views
-        let losses = kernel.forward(&teacher_view, &student_view, loss_type)
+        let losses = kernel
+            .forward(&teacher_view, &student_view, loss_type)
             .map_err(|e| crate::DistillError::Metal(format!("Execution error: {}", e)))?;
 
         // Compute mean loss
@@ -227,8 +242,14 @@ impl HiddenStateLoss {
         let dot = teacher.multiply(student)?.sum_axes(&[-1], Some(true))?;
 
         // Norms
-        let teacher_norm = teacher.multiply(teacher)?.sum_axes(&[-1], Some(true))?.sqrt()?;
-        let student_norm = student.multiply(student)?.sum_axes(&[-1], Some(true))?.sqrt()?;
+        let teacher_norm = teacher
+            .multiply(teacher)?
+            .sum_axes(&[-1], Some(true))?
+            .sqrt()?;
+        let student_norm = student
+            .multiply(student)?
+            .sum_axes(&[-1], Some(true))?
+            .sqrt()?;
 
         // Cosine similarity with epsilon for stability
         let eps = Array::from_f32(1e-8);
@@ -292,7 +313,11 @@ impl LayerDistillation {
     }
 
     /// Create a skip layer mapping (every Nth teacher layer).
-    pub fn skip_mapping(teacher_layers: usize, student_layers: usize, skip: usize) -> Vec<(usize, usize)> {
+    pub fn skip_mapping(
+        teacher_layers: usize,
+        student_layers: usize,
+        skip: usize,
+    ) -> Vec<(usize, usize)> {
         (0..student_layers)
             .filter_map(|s| {
                 let t = s * skip;
@@ -306,11 +331,7 @@ impl LayerDistillation {
     }
 
     /// Compute total hidden state loss across all layer pairs.
-    pub fn compute(
-        &self,
-        teacher_hiddens: &[Array],
-        student_hiddens: &[Array],
-    ) -> Result<Array> {
+    pub fn compute(&self, teacher_hiddens: &[Array], student_hiddens: &[Array]) -> Result<Array> {
         if self.layer_mapping.is_empty() {
             return Ok(Array::from_f32(0.0));
         }
@@ -362,7 +383,11 @@ mod tests {
         let value: f32 = result.item();
 
         // Each element differs by 1, MSE = 1
-        assert!((value - 1.0).abs() < 1e-4, "MSE should be 1.0, got {}", value);
+        assert!(
+            (value - 1.0).abs() < 1e-4,
+            "MSE should be 1.0, got {}",
+            value
+        );
     }
 
     #[test]
@@ -374,7 +399,11 @@ mod tests {
         let value: f32 = result.item();
 
         // Cosine loss of identical vectors should be 0 (cosine sim = 1)
-        assert!(value.abs() < 1e-4, "Cosine loss of identical vectors should be ~0, got {}", value);
+        assert!(
+            value.abs() < 1e-4,
+            "Cosine loss of identical vectors should be ~0, got {}",
+            value
+        );
     }
 
     #[test]
@@ -388,7 +417,11 @@ mod tests {
         let value: f32 = result.item();
 
         // Cosine loss of orthogonal vectors should be 1 (cosine sim = 0)
-        assert!((value - 1.0).abs() < 1e-4, "Cosine loss of orthogonal vectors should be ~1, got {}", value);
+        assert!(
+            (value - 1.0).abs() < 1e-4,
+            "Cosine loss of orthogonal vectors should be ~1, got {}",
+            value
+        );
     }
 
     #[test]
@@ -401,7 +434,11 @@ mod tests {
         let value: f32 = result.item();
 
         // Each element differs by 1, L1 = 1
-        assert!((value - 1.0).abs() < 1e-4, "L1 should be 1.0, got {}", value);
+        assert!(
+            (value - 1.0).abs() < 1e-4,
+            "L1 should be 1.0, got {}",
+            value
+        );
     }
 
     #[test]
@@ -432,7 +469,11 @@ mod tests {
         let value: f32 = result.item();
 
         // MSE = 1.0 for each pair, weight = 0.5
-        assert!((value - 0.5).abs() < 1e-4, "Weighted hidden loss should be 0.5, got {}", value);
+        assert!(
+            (value - 0.5).abs() < 1e-4,
+            "Weighted hidden loss should be 0.5, got {}",
+            value
+        );
     }
 
     #[cfg(feature = "metal")]
@@ -456,8 +497,14 @@ mod tests {
             .map(|i| ((i * 7 % 100) as f32 - 50.0) / 100.0)
             .collect();
 
-        let teacher = Array::from_slice(&teacher_data, &[batch_size as i32, seq_len as i32, hidden_dim as i32]);
-        let student = Array::from_slice(&student_data, &[batch_size as i32, seq_len as i32, hidden_dim as i32]);
+        let teacher = Array::from_slice(
+            &teacher_data,
+            &[batch_size as i32, seq_len as i32, hidden_dim as i32],
+        );
+        let student = Array::from_slice(
+            &student_data,
+            &[batch_size as i32, seq_len as i32, hidden_dim as i32],
+        );
 
         let loss = HiddenStateLoss::mse();
         let result = loss.compute(&teacher, &student).unwrap();

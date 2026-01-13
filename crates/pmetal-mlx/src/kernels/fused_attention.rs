@@ -125,9 +125,7 @@ pub fn fused_sdpa(
     // Determine mask to use
     match (&config.mask_type, custom_mask) {
         // Custom mask provided - use it directly
-        (_, Some(mask)) => {
-            scaled_dot_product_attention(queries, keys, values, config.scale, mask)
-        }
+        (_, Some(mask)) => scaled_dot_product_attention(queries, keys, values, config.scale, mask),
 
         // Causal masking - use MLX's built-in causal mask
         (AttentionMaskType::Causal, None) => scaled_dot_product_attention(
@@ -139,15 +137,13 @@ pub fn fused_sdpa(
         ),
 
         // No mask (bidirectional attention)
-        (AttentionMaskType::None, None) => {
-            scaled_dot_product_attention(
-                queries,
-                keys,
-                values,
-                config.scale,
-                Option::<ScaledDotProductAttentionMask>::None,
-            )
-        }
+        (AttentionMaskType::None, None) => scaled_dot_product_attention(
+            queries,
+            keys,
+            values,
+            config.scale,
+            Option::<ScaledDotProductAttentionMask>::None,
+        ),
 
         // Sliding window - create custom mask
         (AttentionMaskType::SlidingWindow(window_size), None) => {
@@ -501,8 +497,8 @@ mod tests {
         let keys = random_tensor(&[batch, n_heads, seq_len, head_dim]);
         let values = random_tensor(&[batch, n_heads, seq_len, head_dim]);
 
-        let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim)
-            .with_logit_softcapping(softcap);
+        let config =
+            FusedAttentionConfig::new(n_heads, n_heads, head_dim).with_logit_softcapping(softcap);
         let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
 
         output.eval().unwrap();
@@ -577,8 +573,7 @@ mod tests {
         let keys = random_tensor(&[batch, n_heads, seq_len, head_dim]);
         let values = random_tensor(&[batch, n_heads, seq_len, head_dim]);
 
-        let config =
-            FusedAttentionConfig::new(n_heads, n_heads, head_dim).with_scale(custom_scale);
+        let config = FusedAttentionConfig::new(n_heads, n_heads, head_dim).with_scale(custom_scale);
         let output = fused_sdpa(&queries, &keys, &values, &config, None).unwrap();
 
         output.eval().unwrap();

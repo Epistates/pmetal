@@ -5,7 +5,7 @@
 
 use crate::config::BigVGANConfig;
 use crate::error::{Result, VocoderError};
-use crate::nn::{Activation1d, AMPBlock, SnakeBeta, WeightNormConv1d, WeightNormConvTranspose1d};
+use crate::nn::{AMPBlock, Activation1d, SnakeBeta, WeightNormConv1d, WeightNormConvTranspose1d};
 use mlx_rs::Array;
 use std::path::Path;
 
@@ -187,8 +187,7 @@ impl BigVGAN {
         let config_path = repo
             .get("config.json")
             .map_err(|e| VocoderError::Hub(e.to_string()))?;
-        let config_str =
-            std::fs::read_to_string(&config_path).map_err(VocoderError::from)?;
+        let config_str = std::fs::read_to_string(&config_path).map_err(VocoderError::from)?;
         let config: BigVGANConfig =
             serde_json::from_str(&config_str).map_err(|e| VocoderError::Config(e.to_string()))?;
 
@@ -326,7 +325,7 @@ mod tests {
         // With 256x upsampling: 10 frames * 256 = 2560 samples
         assert_eq!(audio.dim(0), 1); // batch
         assert_eq!(audio.dim(1), 1); // mono channel
-        // Note: exact length may vary due to conv padding
+                                     // Note: exact length may vary due to conv padding
     }
 
     #[test]

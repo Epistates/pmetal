@@ -6,16 +6,16 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use mlx_rs::Array;
 use mlx_rs::module::ModuleParametersExt;
+use mlx_rs::Array;
 
+use crate::architectures::gemma::GemmaForCausalLM;
 use crate::architectures::llama::{LlamaConfig, LlamaForCausalLM};
+use crate::architectures::mistral::MistralForCausalLM;
 use crate::architectures::mllama::MllamaForConditionalGeneration;
+use crate::architectures::phi::PhiForCausalLM;
 use crate::architectures::qwen2::Qwen2ForCausalLM;
 use crate::architectures::qwen3::Qwen3ForCausalLM;
-use crate::architectures::gemma::GemmaForCausalLM;
-use crate::architectures::mistral::MistralForCausalLM;
-use crate::architectures::phi::PhiForCausalLM;
 
 /// Error type for model loading.
 #[derive(Debug, thiserror::Error)]
@@ -124,19 +124,55 @@ pub fn load_llama_weights(
         let prefix = format!("model.layers.{i}");
 
         // Self-attention projections
-        load_linear_weight(&mut layer.self_attn.q_proj, weights, &format!("{prefix}.self_attn.q_proj"))?;
-        load_linear_weight(&mut layer.self_attn.k_proj, weights, &format!("{prefix}.self_attn.k_proj"))?;
-        load_linear_weight(&mut layer.self_attn.v_proj, weights, &format!("{prefix}.self_attn.v_proj"))?;
-        load_linear_weight(&mut layer.self_attn.o_proj, weights, &format!("{prefix}.self_attn.o_proj"))?;
+        load_linear_weight(
+            &mut layer.self_attn.q_proj,
+            weights,
+            &format!("{prefix}.self_attn.q_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.k_proj,
+            weights,
+            &format!("{prefix}.self_attn.k_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.v_proj,
+            weights,
+            &format!("{prefix}.self_attn.v_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.o_proj,
+            weights,
+            &format!("{prefix}.self_attn.o_proj"),
+        )?;
 
         // MLP projections
-        load_linear_weight(&mut layer.mlp.gate_proj, weights, &format!("{prefix}.mlp.gate_proj"))?;
-        load_linear_weight(&mut layer.mlp.up_proj, weights, &format!("{prefix}.mlp.up_proj"))?;
-        load_linear_weight(&mut layer.mlp.down_proj, weights, &format!("{prefix}.mlp.down_proj"))?;
+        load_linear_weight(
+            &mut layer.mlp.gate_proj,
+            weights,
+            &format!("{prefix}.mlp.gate_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.mlp.up_proj,
+            weights,
+            &format!("{prefix}.mlp.up_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.mlp.down_proj,
+            weights,
+            &format!("{prefix}.mlp.down_proj"),
+        )?;
 
         // Layer norms
-        load_rms_norm_weight(&mut layer.input_layernorm, weights, &format!("{prefix}.input_layernorm"))?;
-        load_rms_norm_weight(&mut layer.post_attention_layernorm, weights, &format!("{prefix}.post_attention_layernorm"))?;
+        load_rms_norm_weight(
+            &mut layer.input_layernorm,
+            weights,
+            &format!("{prefix}.input_layernorm"),
+        )?;
+        load_rms_norm_weight(
+            &mut layer.post_attention_layernorm,
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+        )?;
     }
 
     // Load final norm
@@ -160,57 +196,100 @@ pub fn load_mllama_weights(
 ) -> Result<(), LoadError> {
     // 1. Vision Model
     let v_prefix = "vision_model";
-    
+
     // Embeddings
     if let Some(w) = weights.get(&format!("{v_prefix}.embeddings.patch_embedding.weight")) {
-        model.vision_model.embeddings.patch_embedding.weight = mlx_rs::module::Param::new(w.clone());
+        model.vision_model.embeddings.patch_embedding.weight =
+            mlx_rs::module::Param::new(w.clone());
     }
     if let Some(w) = weights.get(&format!("{v_prefix}.embeddings.class_embedding")) {
-        model.vision_model.embeddings.class_embedding.weight = mlx_rs::module::Param::new(w.clone());
+        model.vision_model.embeddings.class_embedding.weight =
+            mlx_rs::module::Param::new(w.clone());
     }
     if let Some(w) = weights.get(&format!("{v_prefix}.embeddings.position_embedding.weight")) {
-        model.vision_model.embeddings.position_embedding.weight = mlx_rs::module::Param::new(w.clone());
+        model.vision_model.embeddings.position_embedding.weight =
+            mlx_rs::module::Param::new(w.clone());
     }
     // Note: Tile embeddings skipped for brevity, add if needed
 
     // Vision Layers
     for (i, layer) in model.vision_model.layers.iter_mut().enumerate() {
         let prefix = format!("{v_prefix}.encoder.layers.{i}");
-        
+
         // Self Attention
-        load_linear_weight(&mut layer.self_attn.q_proj, weights, &format!("{prefix}.self_attn.q_proj"))?;
-        load_linear_weight(&mut layer.self_attn.k_proj, weights, &format!("{prefix}.self_attn.k_proj"))?;
-        load_linear_weight(&mut layer.self_attn.v_proj, weights, &format!("{prefix}.self_attn.v_proj"))?;
-        load_linear_weight(&mut layer.self_attn.o_proj, weights, &format!("{prefix}.self_attn.o_proj"))?;
-        
+        load_linear_weight(
+            &mut layer.self_attn.q_proj,
+            weights,
+            &format!("{prefix}.self_attn.q_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.k_proj,
+            weights,
+            &format!("{prefix}.self_attn.k_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.v_proj,
+            weights,
+            &format!("{prefix}.self_attn.v_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.o_proj,
+            weights,
+            &format!("{prefix}.self_attn.o_proj"),
+        )?;
+
         // Gate (Attn)
         if let Some(w) = weights.get(&format!("{prefix}.self_attn.gate")) {
-             let gate = crate::architectures::mllama::Gate { weight: mlx_rs::module::Param::new(w.clone()) };
-             layer.gate_attn = vec![gate];
+            let gate = crate::architectures::mllama::Gate {
+                weight: mlx_rs::module::Param::new(w.clone()),
+            };
+            layer.gate_attn = vec![gate];
         }
 
         // MLP
         load_linear_weight(&mut layer.mlp.fc1, weights, &format!("{prefix}.mlp.fc1"))?;
         load_linear_weight(&mut layer.mlp.fc2, weights, &format!("{prefix}.mlp.fc2"))?;
-        
+
         // Gate (MLP)
         if let Some(w) = weights.get(&format!("{prefix}.mlp.gate")) {
-             let gate = crate::architectures::mllama::Gate { weight: mlx_rs::module::Param::new(w.clone()) };
-             layer.gate_mlp = vec![gate];
+            let gate = crate::architectures::mllama::Gate {
+                weight: mlx_rs::module::Param::new(w.clone()),
+            };
+            layer.gate_mlp = vec![gate];
         }
 
         // Layer norms
-        load_layer_norm_weight(&mut layer.input_layernorm, weights, &format!("{prefix}.input_layernorm"))?;
-        load_layer_norm_weight(&mut layer.post_attention_layernorm, weights, &format!("{prefix}.post_attention_layernorm"))?;
+        load_layer_norm_weight(
+            &mut layer.input_layernorm,
+            weights,
+            &format!("{prefix}.input_layernorm"),
+        )?;
+        load_layer_norm_weight(
+            &mut layer.post_attention_layernorm,
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+        )?;
     }
-    
+
     // Vision Final Norm
-    load_layer_norm_weight(&mut model.vision_model.layernorm, weights, &format!("{v_prefix}.encoder.layernorm"))?;
+    load_layer_norm_weight(
+        &mut model.vision_model.layernorm,
+        weights,
+        &format!("{v_prefix}.encoder.layernorm"),
+    )?;
 
     // 2. Projector
     let p_prefix = "multi_modal_projector";
-    load_linear_weight(&mut model.multi_modal_projector.linear_1, weights, &format!("{p_prefix}.linear_1"))?;
-    load_linear_weight(&mut model.multi_modal_projector.linear_2, weights, &format!("{p_prefix}.linear_2"))?;
+    load_linear_weight(
+        &mut model.multi_modal_projector.linear_1,
+        weights,
+        &format!("{p_prefix}.linear_1"),
+    )?;
+    load_linear_weight(
+        &mut model.multi_modal_projector.linear_2,
+        weights,
+        &format!("{p_prefix}.linear_2"),
+    )?;
 
     // 3. Language Model
     let l_prefix = "language_model.model";
@@ -222,44 +301,106 @@ pub fn load_mllama_weights(
     // Layers
     for (i, layer) in model.language_model.layers.iter_mut().enumerate() {
         let prefix = format!("{l_prefix}.layers.{i}");
-        
+
         // Self Attn
-        load_linear_weight(&mut layer.self_attn.q_proj, weights, &format!("{prefix}.self_attn.q_proj"))?;
-        load_linear_weight(&mut layer.self_attn.k_proj, weights, &format!("{prefix}.self_attn.k_proj"))?;
-        load_linear_weight(&mut layer.self_attn.v_proj, weights, &format!("{prefix}.self_attn.v_proj"))?;
-        load_linear_weight(&mut layer.self_attn.o_proj, weights, &format!("{prefix}.self_attn.o_proj"))?;
-        
+        load_linear_weight(
+            &mut layer.self_attn.q_proj,
+            weights,
+            &format!("{prefix}.self_attn.q_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.k_proj,
+            weights,
+            &format!("{prefix}.self_attn.k_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.v_proj,
+            weights,
+            &format!("{prefix}.self_attn.v_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.o_proj,
+            weights,
+            &format!("{prefix}.self_attn.o_proj"),
+        )?;
+
         // Cross Attn
         if let Some(cross) = &mut layer.cross_attn {
-             load_linear_weight(&mut cross.q_proj, weights, &format!("{prefix}.cross_attn.q_proj"))?;
-             load_linear_weight(&mut cross.k_proj, weights, &format!("{prefix}.cross_attn.k_proj"))?;
-             load_linear_weight(&mut cross.v_proj, weights, &format!("{prefix}.cross_attn.v_proj"))?;
-             load_linear_weight(&mut cross.o_proj, weights, &format!("{prefix}.cross_attn.o_proj"))?;
-             
-             if let Some(w) = weights.get(&format!("{prefix}.cross_attn.gate")) {
-                 let gate = crate::architectures::mllama::Gate { weight: mlx_rs::module::Param::new(w.clone()) };
-                 cross.gate = vec![gate];
-             }
-             
-             // Cross norm
-             if let Some(norm) = &mut layer.cross_attention_layernorm {
-                 load_rms_norm_weight(norm, weights, &format!("{prefix}.cross_attention_layernorm"))?;
-             }
+            load_linear_weight(
+                &mut cross.q_proj,
+                weights,
+                &format!("{prefix}.cross_attn.q_proj"),
+            )?;
+            load_linear_weight(
+                &mut cross.k_proj,
+                weights,
+                &format!("{prefix}.cross_attn.k_proj"),
+            )?;
+            load_linear_weight(
+                &mut cross.v_proj,
+                weights,
+                &format!("{prefix}.cross_attn.v_proj"),
+            )?;
+            load_linear_weight(
+                &mut cross.o_proj,
+                weights,
+                &format!("{prefix}.cross_attn.o_proj"),
+            )?;
+
+            if let Some(w) = weights.get(&format!("{prefix}.cross_attn.gate")) {
+                let gate = crate::architectures::mllama::Gate {
+                    weight: mlx_rs::module::Param::new(w.clone()),
+                };
+                cross.gate = vec![gate];
+            }
+
+            // Cross norm
+            if let Some(norm) = &mut layer.cross_attention_layernorm {
+                load_rms_norm_weight(
+                    norm,
+                    weights,
+                    &format!("{prefix}.cross_attention_layernorm"),
+                )?;
+            }
         }
-        
+
         // MLP
-        load_linear_weight(&mut layer.mlp.gate_proj, weights, &format!("{prefix}.mlp.gate_proj"))?;
-        load_linear_weight(&mut layer.mlp.up_proj, weights, &format!("{prefix}.mlp.up_proj"))?;
-        load_linear_weight(&mut layer.mlp.down_proj, weights, &format!("{prefix}.mlp.down_proj"))?;
+        load_linear_weight(
+            &mut layer.mlp.gate_proj,
+            weights,
+            &format!("{prefix}.mlp.gate_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.mlp.up_proj,
+            weights,
+            &format!("{prefix}.mlp.up_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.mlp.down_proj,
+            weights,
+            &format!("{prefix}.mlp.down_proj"),
+        )?;
 
         // Norms
-        load_rms_norm_weight(&mut layer.input_layernorm, weights, &format!("{prefix}.input_layernorm"))?;
-        load_rms_norm_weight(&mut layer.post_attention_layernorm, weights, &format!("{prefix}.post_attention_layernorm"))?;
+        load_rms_norm_weight(
+            &mut layer.input_layernorm,
+            weights,
+            &format!("{prefix}.input_layernorm"),
+        )?;
+        load_rms_norm_weight(
+            &mut layer.post_attention_layernorm,
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+        )?;
     }
-    
+
     // LM Norm
-    load_rms_norm_weight(&mut model.language_model.norm, weights, &format!("{l_prefix}.norm"))?;
-    
+    load_rms_norm_weight(
+        &mut model.language_model.norm,
+        weights,
+        &format!("{l_prefix}.norm"),
+    )?;
+
     // LM Head
     // Note: Usually "language_model.lm_head"
     load_linear_weight(&mut model.lm_head, weights, "language_model.lm_head")?;
@@ -316,13 +457,13 @@ fn load_layer_norm_weight(
     } else {
         return Err(LoadError::MissingWeight(weight_key));
     }
-    
+
     // LayerNorm usually has bias
     let bias_key = format!("{prefix}.bias");
     if let Some(b) = weights.get(&bias_key) {
         norm.bias = mlx_rs::module::Param::new(Some(b.clone()));
     }
-    
+
     Ok(())
 }
 
@@ -421,19 +562,55 @@ pub fn load_qwen_weights(
         let prefix = format!("model.layers.{i}");
 
         // Self-attention projections (Qwen2 has bias on Q/K/V)
-        load_linear_weight(&mut layer.self_attn.q_proj, weights, &format!("{prefix}.self_attn.q_proj"))?;
-        load_linear_weight(&mut layer.self_attn.k_proj, weights, &format!("{prefix}.self_attn.k_proj"))?;
-        load_linear_weight(&mut layer.self_attn.v_proj, weights, &format!("{prefix}.self_attn.v_proj"))?;
-        load_linear_weight(&mut layer.self_attn.o_proj, weights, &format!("{prefix}.self_attn.o_proj"))?;
+        load_linear_weight(
+            &mut layer.self_attn.q_proj,
+            weights,
+            &format!("{prefix}.self_attn.q_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.k_proj,
+            weights,
+            &format!("{prefix}.self_attn.k_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.v_proj,
+            weights,
+            &format!("{prefix}.self_attn.v_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.o_proj,
+            weights,
+            &format!("{prefix}.self_attn.o_proj"),
+        )?;
 
         // MLP projections
-        load_linear_weight(&mut layer.mlp.gate_proj, weights, &format!("{prefix}.mlp.gate_proj"))?;
-        load_linear_weight(&mut layer.mlp.up_proj, weights, &format!("{prefix}.mlp.up_proj"))?;
-        load_linear_weight(&mut layer.mlp.down_proj, weights, &format!("{prefix}.mlp.down_proj"))?;
+        load_linear_weight(
+            &mut layer.mlp.gate_proj,
+            weights,
+            &format!("{prefix}.mlp.gate_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.mlp.up_proj,
+            weights,
+            &format!("{prefix}.mlp.up_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.mlp.down_proj,
+            weights,
+            &format!("{prefix}.mlp.down_proj"),
+        )?;
 
         // Layer norms
-        load_rms_norm_weight(&mut layer.input_layernorm, weights, &format!("{prefix}.input_layernorm"))?;
-        load_rms_norm_weight(&mut layer.post_attention_layernorm, weights, &format!("{prefix}.post_attention_layernorm"))?;
+        load_rms_norm_weight(
+            &mut layer.input_layernorm,
+            weights,
+            &format!("{prefix}.input_layernorm"),
+        )?;
+        load_rms_norm_weight(
+            &mut layer.post_attention_layernorm,
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+        )?;
     }
 
     // Load final norm
@@ -468,23 +645,67 @@ pub fn load_qwen3_weights(
         let prefix = format!("model.layers.{i}");
 
         // Self-attention projections
-        load_linear_weight(&mut layer.self_attn.q_proj, weights, &format!("{prefix}.self_attn.q_proj"))?;
-        load_linear_weight(&mut layer.self_attn.k_proj, weights, &format!("{prefix}.self_attn.k_proj"))?;
-        load_linear_weight(&mut layer.self_attn.v_proj, weights, &format!("{prefix}.self_attn.v_proj"))?;
-        load_linear_weight(&mut layer.self_attn.o_proj, weights, &format!("{prefix}.self_attn.o_proj"))?;
+        load_linear_weight(
+            &mut layer.self_attn.q_proj,
+            weights,
+            &format!("{prefix}.self_attn.q_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.k_proj,
+            weights,
+            &format!("{prefix}.self_attn.k_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.v_proj,
+            weights,
+            &format!("{prefix}.self_attn.v_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.o_proj,
+            weights,
+            &format!("{prefix}.self_attn.o_proj"),
+        )?;
 
         // Qwen3-specific: Q/K normalization layers
-        load_rms_norm_weight(&mut layer.self_attn.q_norm, weights, &format!("{prefix}.self_attn.q_norm"))?;
-        load_rms_norm_weight(&mut layer.self_attn.k_norm, weights, &format!("{prefix}.self_attn.k_norm"))?;
+        load_rms_norm_weight(
+            &mut layer.self_attn.q_norm,
+            weights,
+            &format!("{prefix}.self_attn.q_norm"),
+        )?;
+        load_rms_norm_weight(
+            &mut layer.self_attn.k_norm,
+            weights,
+            &format!("{prefix}.self_attn.k_norm"),
+        )?;
 
         // MLP projections
-        load_linear_weight(&mut layer.mlp.gate_proj, weights, &format!("{prefix}.mlp.gate_proj"))?;
-        load_linear_weight(&mut layer.mlp.up_proj, weights, &format!("{prefix}.mlp.up_proj"))?;
-        load_linear_weight(&mut layer.mlp.down_proj, weights, &format!("{prefix}.mlp.down_proj"))?;
+        load_linear_weight(
+            &mut layer.mlp.gate_proj,
+            weights,
+            &format!("{prefix}.mlp.gate_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.mlp.up_proj,
+            weights,
+            &format!("{prefix}.mlp.up_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.mlp.down_proj,
+            weights,
+            &format!("{prefix}.mlp.down_proj"),
+        )?;
 
         // Layer norms
-        load_rms_norm_weight(&mut layer.input_layernorm, weights, &format!("{prefix}.input_layernorm"))?;
-        load_rms_norm_weight(&mut layer.post_attention_layernorm, weights, &format!("{prefix}.post_attention_layernorm"))?;
+        load_rms_norm_weight(
+            &mut layer.input_layernorm,
+            weights,
+            &format!("{prefix}.input_layernorm"),
+        )?;
+        load_rms_norm_weight(
+            &mut layer.post_attention_layernorm,
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+        )?;
     }
 
     // Load final norm
@@ -516,30 +737,110 @@ pub fn load_gemma_weights(
     if let Some(ref mut layers) = model.model.layers.gemma1 {
         for (i, layer) in layers.iter_mut().enumerate() {
             let prefix = format!("model.layers.{i}");
-            load_linear_weight(&mut layer.self_attn.q_proj, weights, &format!("{prefix}.self_attn.q_proj"))?;
-            load_linear_weight(&mut layer.self_attn.k_proj, weights, &format!("{prefix}.self_attn.k_proj"))?;
-            load_linear_weight(&mut layer.self_attn.v_proj, weights, &format!("{prefix}.self_attn.v_proj"))?;
-            load_linear_weight(&mut layer.self_attn.o_proj, weights, &format!("{prefix}.self_attn.o_proj"))?;
-            load_linear_weight(&mut layer.mlp.gate_proj, weights, &format!("{prefix}.mlp.gate_proj"))?;
-            load_linear_weight(&mut layer.mlp.up_proj, weights, &format!("{prefix}.mlp.up_proj"))?;
-            load_linear_weight(&mut layer.mlp.down_proj, weights, &format!("{prefix}.mlp.down_proj"))?;
-            load_gemma_rms_norm_weight(&mut layer.input_layernorm, weights, &format!("{prefix}.input_layernorm"))?;
-            load_gemma_rms_norm_weight(&mut layer.post_attention_layernorm, weights, &format!("{prefix}.post_attention_layernorm"))?;
+            load_linear_weight(
+                &mut layer.self_attn.q_proj,
+                weights,
+                &format!("{prefix}.self_attn.q_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.self_attn.k_proj,
+                weights,
+                &format!("{prefix}.self_attn.k_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.self_attn.v_proj,
+                weights,
+                &format!("{prefix}.self_attn.v_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.self_attn.o_proj,
+                weights,
+                &format!("{prefix}.self_attn.o_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.mlp.gate_proj,
+                weights,
+                &format!("{prefix}.mlp.gate_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.mlp.up_proj,
+                weights,
+                &format!("{prefix}.mlp.up_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.mlp.down_proj,
+                weights,
+                &format!("{prefix}.mlp.down_proj"),
+            )?;
+            load_gemma_rms_norm_weight(
+                &mut layer.input_layernorm,
+                weights,
+                &format!("{prefix}.input_layernorm"),
+            )?;
+            load_gemma_rms_norm_weight(
+                &mut layer.post_attention_layernorm,
+                weights,
+                &format!("{prefix}.post_attention_layernorm"),
+            )?;
         }
     } else if let Some(ref mut layers) = model.model.layers.gemma2 {
         for (i, layer) in layers.iter_mut().enumerate() {
             let prefix = format!("model.layers.{i}");
-            load_linear_weight(&mut layer.self_attn.q_proj, weights, &format!("{prefix}.self_attn.q_proj"))?;
-            load_linear_weight(&mut layer.self_attn.k_proj, weights, &format!("{prefix}.self_attn.k_proj"))?;
-            load_linear_weight(&mut layer.self_attn.v_proj, weights, &format!("{prefix}.self_attn.v_proj"))?;
-            load_linear_weight(&mut layer.self_attn.o_proj, weights, &format!("{prefix}.self_attn.o_proj"))?;
-            load_linear_weight(&mut layer.mlp.gate_proj, weights, &format!("{prefix}.mlp.gate_proj"))?;
-            load_linear_weight(&mut layer.mlp.up_proj, weights, &format!("{prefix}.mlp.up_proj"))?;
-            load_linear_weight(&mut layer.mlp.down_proj, weights, &format!("{prefix}.mlp.down_proj"))?;
-            load_gemma_rms_norm_weight(&mut layer.input_layernorm, weights, &format!("{prefix}.input_layernorm"))?;
-            load_gemma_rms_norm_weight(&mut layer.post_attention_layernorm, weights, &format!("{prefix}.post_attention_layernorm"))?;
-            load_gemma_rms_norm_weight(&mut layer.pre_feedforward_layernorm, weights, &format!("{prefix}.pre_feedforward_layernorm"))?;
-            load_gemma_rms_norm_weight(&mut layer.post_feedforward_layernorm, weights, &format!("{prefix}.post_feedforward_layernorm"))?;
+            load_linear_weight(
+                &mut layer.self_attn.q_proj,
+                weights,
+                &format!("{prefix}.self_attn.q_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.self_attn.k_proj,
+                weights,
+                &format!("{prefix}.self_attn.k_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.self_attn.v_proj,
+                weights,
+                &format!("{prefix}.self_attn.v_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.self_attn.o_proj,
+                weights,
+                &format!("{prefix}.self_attn.o_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.mlp.gate_proj,
+                weights,
+                &format!("{prefix}.mlp.gate_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.mlp.up_proj,
+                weights,
+                &format!("{prefix}.mlp.up_proj"),
+            )?;
+            load_linear_weight(
+                &mut layer.mlp.down_proj,
+                weights,
+                &format!("{prefix}.mlp.down_proj"),
+            )?;
+            load_gemma_rms_norm_weight(
+                &mut layer.input_layernorm,
+                weights,
+                &format!("{prefix}.input_layernorm"),
+            )?;
+            load_gemma_rms_norm_weight(
+                &mut layer.post_attention_layernorm,
+                weights,
+                &format!("{prefix}.post_attention_layernorm"),
+            )?;
+            load_gemma_rms_norm_weight(
+                &mut layer.pre_feedforward_layernorm,
+                weights,
+                &format!("{prefix}.pre_feedforward_layernorm"),
+            )?;
+            load_gemma_rms_norm_weight(
+                &mut layer.post_feedforward_layernorm,
+                weights,
+                &format!("{prefix}.post_feedforward_layernorm"),
+            )?;
         }
     }
 
@@ -566,19 +867,55 @@ pub fn load_mistral_weights(
         let prefix = format!("model.layers.{i}");
 
         // Self-attention projections
-        load_linear_weight(&mut layer.self_attn.q_proj, weights, &format!("{prefix}.self_attn.q_proj"))?;
-        load_linear_weight(&mut layer.self_attn.k_proj, weights, &format!("{prefix}.self_attn.k_proj"))?;
-        load_linear_weight(&mut layer.self_attn.v_proj, weights, &format!("{prefix}.self_attn.v_proj"))?;
-        load_linear_weight(&mut layer.self_attn.o_proj, weights, &format!("{prefix}.self_attn.o_proj"))?;
+        load_linear_weight(
+            &mut layer.self_attn.q_proj,
+            weights,
+            &format!("{prefix}.self_attn.q_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.k_proj,
+            weights,
+            &format!("{prefix}.self_attn.k_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.v_proj,
+            weights,
+            &format!("{prefix}.self_attn.v_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.o_proj,
+            weights,
+            &format!("{prefix}.self_attn.o_proj"),
+        )?;
 
         // MLP projections
-        load_linear_weight(&mut layer.mlp.gate_proj, weights, &format!("{prefix}.mlp.gate_proj"))?;
-        load_linear_weight(&mut layer.mlp.up_proj, weights, &format!("{prefix}.mlp.up_proj"))?;
-        load_linear_weight(&mut layer.mlp.down_proj, weights, &format!("{prefix}.mlp.down_proj"))?;
+        load_linear_weight(
+            &mut layer.mlp.gate_proj,
+            weights,
+            &format!("{prefix}.mlp.gate_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.mlp.up_proj,
+            weights,
+            &format!("{prefix}.mlp.up_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.mlp.down_proj,
+            weights,
+            &format!("{prefix}.mlp.down_proj"),
+        )?;
 
         // Layer norms
-        load_rms_norm_weight(&mut layer.input_layernorm, weights, &format!("{prefix}.input_layernorm"))?;
-        load_rms_norm_weight(&mut layer.post_attention_layernorm, weights, &format!("{prefix}.post_attention_layernorm"))?;
+        load_rms_norm_weight(
+            &mut layer.input_layernorm,
+            weights,
+            &format!("{prefix}.input_layernorm"),
+        )?;
+        load_rms_norm_weight(
+            &mut layer.post_attention_layernorm,
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+        )?;
     }
 
     // Load final norm
@@ -611,18 +948,50 @@ pub fn load_phi_weights(
         let prefix = format!("model.layers.{i}");
 
         // Self-attention projections
-        load_linear_weight(&mut layer.self_attn.q_proj, weights, &format!("{prefix}.self_attn.q_proj"))?;
-        load_linear_weight(&mut layer.self_attn.k_proj, weights, &format!("{prefix}.self_attn.k_proj"))?;
-        load_linear_weight(&mut layer.self_attn.v_proj, weights, &format!("{prefix}.self_attn.v_proj"))?;
-        load_linear_weight(&mut layer.self_attn.o_proj, weights, &format!("{prefix}.self_attn.o_proj"))?;
+        load_linear_weight(
+            &mut layer.self_attn.q_proj,
+            weights,
+            &format!("{prefix}.self_attn.q_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.k_proj,
+            weights,
+            &format!("{prefix}.self_attn.k_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.v_proj,
+            weights,
+            &format!("{prefix}.self_attn.v_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.self_attn.o_proj,
+            weights,
+            &format!("{prefix}.self_attn.o_proj"),
+        )?;
 
         // MLP projections (Phi uses gate_up_proj)
-        load_linear_weight(&mut layer.mlp.gate_up_proj, weights, &format!("{prefix}.mlp.gate_up_proj"))?;
-        load_linear_weight(&mut layer.mlp.down_proj, weights, &format!("{prefix}.mlp.down_proj"))?;
+        load_linear_weight(
+            &mut layer.mlp.gate_up_proj,
+            weights,
+            &format!("{prefix}.mlp.gate_up_proj"),
+        )?;
+        load_linear_weight(
+            &mut layer.mlp.down_proj,
+            weights,
+            &format!("{prefix}.mlp.down_proj"),
+        )?;
 
         // Layer norms
-        load_phi_rms_norm_weight(&mut layer.input_layernorm, weights, &format!("{prefix}.input_layernorm"))?;
-        load_phi_rms_norm_weight(&mut layer.post_attention_layernorm, weights, &format!("{prefix}.post_attention_layernorm"))?;
+        load_phi_rms_norm_weight(
+            &mut layer.input_layernorm,
+            weights,
+            &format!("{prefix}.input_layernorm"),
+        )?;
+        load_phi_rms_norm_weight(
+            &mut layer.post_attention_layernorm,
+            weights,
+            &format!("{prefix}.post_attention_layernorm"),
+        )?;
     }
 
     // Load final norm

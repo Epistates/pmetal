@@ -346,10 +346,7 @@ pub fn cohere_cross_entropy_loss(
 ///
 /// # Returns
 /// Boolean mask [batch, max_seq_len] where positions < length are True.
-pub fn create_mask_from_lengths(
-    lengths: &Array,
-    max_seq_len: i32,
-) -> mlx_rs::error::Result<Array> {
+pub fn create_mask_from_lengths(lengths: &Array, max_seq_len: i32) -> mlx_rs::error::Result<Array> {
     // positions = arange(max_seq_len)[None, :]  -> [1, seq_len]
     let positions = mlx_rs::ops::arange::<_, i32>(0, max_seq_len, None)?;
     let positions = positions.reshape(&[1, max_seq_len])?;
@@ -503,10 +500,7 @@ mod tests {
 
     #[test]
     fn test_fast_cross_entropy_config() {
-        let logits = Array::from_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0],
-            &[2, 4],
-        );
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0], &[2, 4]);
         let targets = Array::from_slice(&[3_i32, 0], &[2]);
 
         let config = CrossEntropyConfig::new().with_ignore_index(-100);
@@ -532,10 +526,7 @@ mod tests {
 
     #[test]
     fn test_gemma2_cross_entropy() {
-        let logits = Array::from_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[2, 4],
-        );
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
         let targets = Array::from_slice(&[3_i32, 0], &[2]);
 
         let loss = gemma2_cross_entropy_loss(&logits, &targets, None).unwrap();
@@ -628,10 +619,16 @@ mod tests {
         let logits_data: Vec<f32> = (0..batch_size * seq_len * vocab_size)
             .map(|i| (i as f32) * 0.1)
             .collect();
-        let logits = Array::from_slice(&logits_data, &[batch_size as i32, seq_len as i32, vocab_size as i32]);
+        let logits = Array::from_slice(
+            &logits_data,
+            &[batch_size as i32, seq_len as i32, vocab_size as i32],
+        );
 
         // Create labels [batch, seq]
-        let labels = Array::from_slice(&[1i32, 2, 3, 4, 5, 6, 7, 8], &[batch_size as i32, seq_len as i32]);
+        let labels = Array::from_slice(
+            &[1i32, 2, 3, 4, 5, 6, 7, 8],
+            &[batch_size as i32, seq_len as i32],
+        );
 
         // Lengths [batch] - first sequence has length 3, second has length 4
         let lengths = Array::from_slice(&[3i32, 4], &[batch_size as i32]);
@@ -641,17 +638,18 @@ mod tests {
 
         // Loss should be positive and finite
         let loss_val = loss.item::<f32>();
-        assert!(loss_val.is_finite(), "Loss should be finite, got {}", loss_val);
+        assert!(
+            loss_val.is_finite(),
+            "Loss should be finite, got {}",
+            loss_val
+        );
         assert!(loss_val > 0.0, "Loss should be positive");
     }
 
     #[test]
     fn test_dtype_matching_in_cross_entropy() {
         // Test that cross entropy handles i64 labels (common from PyTorch)
-        let logits = Array::from_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
-            &[2, 4],
-        );
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
 
         // i64 labels
         let targets_i64 = Array::from_slice(&[3_i64, 0], &[2]);
@@ -666,10 +664,7 @@ mod tests {
     #[test]
     fn test_cross_entropy_division_by_zero_protection() {
         // Test all-ignored tokens case (edge case that could cause div-by-zero)
-        let logits = Array::from_slice(
-            &[1.0_f32, 2.0, 3.0, 4.0],
-            &[1, 4],
-        );
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 4]);
 
         // All tokens are ignored
         let targets = Array::from_slice(&[-100_i32], &[1]);
@@ -680,6 +675,10 @@ mod tests {
 
         let loss_val = loss.item::<f32>();
         // Should not be NaN or Inf
-        assert!(loss_val.is_finite(), "Loss should be finite when all tokens ignored, got {}", loss_val);
+        assert!(
+            loss_val.is_finite(),
+            "Loss should be finite when all tokens ignored, got {}",
+            loss_val
+        );
     }
 }

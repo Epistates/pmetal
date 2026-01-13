@@ -134,7 +134,11 @@ impl FusedNormLora {
     pub fn new(ctx: Arc<MetalContext>, config: FusedNormLoraConfig) -> Result<Self> {
         // Select threadgroup size based on device tier for M4 optimization
         let threads_per_token = Self::select_threadgroup_size(&ctx);
-        Ok(Self { ctx, config, threads_per_token })
+        Ok(Self {
+            ctx,
+            config,
+            threads_per_token,
+        })
     }
 
     /// Select optimal threadgroup size based on device tier.

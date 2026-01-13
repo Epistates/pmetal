@@ -35,7 +35,7 @@ impl ModelRegistry {
         // Llama patterns
         patterns.insert("llama".to_string(), Architecture::Llama);
         patterns.insert("meta-llama".to_string(), Architecture::Llama);
-        
+
         // Mllama (Vision) patterns
         patterns.insert("mllama".to_string(), Architecture::Mllama);
         patterns.insert("llama-3.2-11b-vision".to_string(), Architecture::Mllama);
