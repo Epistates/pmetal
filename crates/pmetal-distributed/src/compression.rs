@@ -17,9 +17,10 @@ use std::collections::BinaryHeap;
 use tracing::debug;
 
 /// Compression strategy.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub enum CompressionStrategy {
     /// No compression.
+    #[default]
     None,
     /// Keep only top-k% gradients by magnitude.
     TopK { ratio: f32 },
@@ -29,12 +30,6 @@ pub enum CompressionStrategy {
     Quantize(QuantizationType),
     /// PowerSGD low-rank approximation.
     PowerSGD { rank: usize },
-}
-
-impl Default for CompressionStrategy {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Quantization type.
@@ -148,7 +143,7 @@ impl GradientCompressor {
                 self.compress_random(&working_grads, *probability)
             }
             CompressionStrategy::Quantize(qtype) => (self.quantize(&working_grads, *qtype), None),
-            CompressionStrategy::PowerSGD { rank } => {
+            CompressionStrategy::PowerSGD { rank: _ } => {
                 // PowerSGD requires state across iterations, simplified here
                 (CompressedData::Full(working_grads.clone()), None)
             }
@@ -301,7 +296,7 @@ impl GradientCompressor {
                 let mean_abs =
                     gradients.iter().map(|x| x.abs()).sum::<f32>() / gradients.len() as f32;
 
-                let num_bytes = (gradients.len() + 7) / 8;
+                let num_bytes = gradients.len().div_ceil(8);
                 let mut signs = vec![0u8; num_bytes];
 
                 for (i, &val) in gradients.iter().enumerate() {
@@ -485,7 +480,7 @@ mod tests {
     fn test_fp16_quantization() {
         let mut compressor =
             GradientCompressor::new(CompressionStrategy::Quantize(QuantizationType::FP16), false);
-        let grads = vec![1.0, 2.5, 3.14159, 4.0];
+        let grads = vec![1.0, 2.5, 3.125, 4.0];
 
         let compressed = compressor.compress(&grads);
         let decompressed = compressor.decompress(&compressed);

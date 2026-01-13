@@ -3,6 +3,8 @@
 //! This benchmark measures peak memory usage during training to validate
 //! the ~50% memory reduction claimed by using custom autograd.
 
+#![allow(unsafe_code)]
+
 use std::time::Instant;
 
 use mlx_rs::transforms::eval;

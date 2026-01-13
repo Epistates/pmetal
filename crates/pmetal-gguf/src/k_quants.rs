@@ -168,7 +168,7 @@ const _: () = assert!(std::mem::size_of::<BlockQ8K>() == 292);
 impl BlockQ2K {
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + QK_K - 1) / QK_K;
+        let n_blocks = n_elements.div_ceil(QK_K);
         n_blocks * std::mem::size_of::<Self>()
     }
 }
@@ -176,7 +176,7 @@ impl BlockQ2K {
 impl BlockQ3K {
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + QK_K - 1) / QK_K;
+        let n_blocks = n_elements.div_ceil(QK_K);
         n_blocks * std::mem::size_of::<Self>()
     }
 }
@@ -184,7 +184,7 @@ impl BlockQ3K {
 impl BlockQ4K {
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + QK_K - 1) / QK_K;
+        let n_blocks = n_elements.div_ceil(QK_K);
         n_blocks * std::mem::size_of::<Self>()
     }
 }
@@ -192,7 +192,7 @@ impl BlockQ4K {
 impl BlockQ5K {
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + QK_K - 1) / QK_K;
+        let n_blocks = n_elements.div_ceil(QK_K);
         n_blocks * std::mem::size_of::<Self>()
     }
 }
@@ -200,7 +200,7 @@ impl BlockQ5K {
 impl BlockQ6K {
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + QK_K - 1) / QK_K;
+        let n_blocks = n_elements.div_ceil(QK_K);
         n_blocks * std::mem::size_of::<Self>()
     }
 }
@@ -208,7 +208,7 @@ impl BlockQ6K {
 impl BlockQ8K {
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + QK_K - 1) / QK_K;
+        let n_blocks = n_elements.div_ceil(QK_K);
         n_blocks * std::mem::size_of::<Self>()
     }
 }
@@ -263,7 +263,7 @@ pub fn dequantize_q3k(block: &BlockQ3K, output: &mut [f32; QK_K]) {
 
     // Handle upper bits
     for i in 0..4 {
-        let upper = (block.scales[8 + i] >> 0) & 3;
+        let upper = block.scales[8 + i] & 3;
         aux[i] |= upper << 6;
         let upper = (block.scales[8 + i] >> 2) & 3;
         aux[i + 4] |= upper << 6;
@@ -456,7 +456,7 @@ pub fn dequantize_q8k(block: &BlockQ8K, output: &mut [f32; QK_K]) {
 /// The input data must be properly aligned and sized for BlockQ4K blocks.
 pub fn dequantize_q4k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ4K>();
-    let n_blocks = (n_elements + QK_K - 1) / QK_K;
+    let n_blocks = n_elements.div_ceil(QK_K);
 
     let mut output = vec![0.0f32; n_elements];
     let mut out_idx = 0;
@@ -504,7 +504,7 @@ pub fn dequantize_q4k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// Dequantize Q8K data from raw bytes.
 pub fn dequantize_q8k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ8K>();
-    let n_blocks = (n_elements + QK_K - 1) / QK_K;
+    let n_blocks = n_elements.div_ceil(QK_K);
 
     let mut output = vec![0.0f32; n_elements];
     let mut out_idx = 0;
@@ -533,6 +533,7 @@ pub fn dequantize_q8k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
         }
 
         let mut bsums = [0i16; QK_K / 16];
+        #[allow(clippy::needless_range_loop)]
         for i in 0..(QK_K / 16) {
             let offset = 4 + QK_K + i * 2;
             bsums[i] = i16::from_le_bytes([block_bytes[offset], block_bytes[offset + 1]]);
@@ -554,7 +555,7 @@ pub fn dequantize_q8k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// Dequantize Q6K data from raw bytes.
 pub fn dequantize_q6k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ6K>();
-    let n_blocks = (n_elements + QK_K - 1) / QK_K;
+    let n_blocks = n_elements.div_ceil(QK_K);
 
     let mut output = vec![0.0f32; n_elements];
     let mut out_idx = 0;
@@ -603,7 +604,7 @@ pub fn dequantize_q6k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// Dequantize Q5K data from raw bytes.
 pub fn dequantize_q5k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ5K>();
-    let n_blocks = (n_elements + QK_K - 1) / QK_K;
+    let n_blocks = n_elements.div_ceil(QK_K);
 
     let mut output = vec![0.0f32; n_elements];
     let mut out_idx = 0;
@@ -653,7 +654,7 @@ pub fn dequantize_q5k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// Dequantize Q3K data from raw bytes.
 pub fn dequantize_q3k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ3K>();
-    let n_blocks = (n_elements + QK_K - 1) / QK_K;
+    let n_blocks = n_elements.div_ceil(QK_K);
 
     let mut output = vec![0.0f32; n_elements];
     let mut out_idx = 0;
@@ -702,7 +703,7 @@ pub fn dequantize_q3k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// Dequantize Q2K data from raw bytes.
 pub fn dequantize_q2k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     const BLOCK_SIZE: usize = std::mem::size_of::<BlockQ2K>();
-    let n_blocks = (n_elements + QK_K - 1) / QK_K;
+    let n_blocks = n_elements.div_ceil(QK_K);
 
     let mut output = vec![0.0f32; n_elements];
     let mut out_idx = 0;
@@ -754,7 +755,7 @@ pub fn dequantize_q2k_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 ///
 /// Q8K is the simplest K-quant: 8-bit signed values with a single scale per block.
 pub fn quantize_q8k(xs: &[f32]) -> Vec<BlockQ8K> {
-    let n_blocks = (xs.len() + QK_K - 1) / QK_K;
+    let n_blocks = xs.len().div_ceil(QK_K);
     let mut blocks = vec![
         BlockQ8K {
             d: 0.0,
@@ -815,7 +816,7 @@ pub fn quantize_q8k(xs: &[f32]) -> Vec<BlockQ8K> {
 ///
 /// Q4K uses 4-bit values with per-subblock scales and minimums.
 pub fn quantize_q4k(xs: &[f32]) -> Vec<BlockQ4K> {
-    let n_blocks = (xs.len() + QK_K - 1) / QK_K;
+    let n_blocks = xs.len().div_ceil(QK_K);
     let mut blocks = vec![
         BlockQ4K {
             d: f16::from_f32(0.0),
@@ -899,7 +900,7 @@ pub fn quantize_q4k(xs: &[f32]) -> Vec<BlockQ4K> {
 ///
 /// Q5K uses 5-bit values with per-subblock scales and minimums.
 pub fn quantize_q5k(xs: &[f32]) -> Vec<BlockQ5K> {
-    let n_blocks = (xs.len() + QK_K - 1) / QK_K;
+    let n_blocks = xs.len().div_ceil(QK_K);
     let mut blocks = vec![
         BlockQ5K {
             d: f16::from_f32(0.0),
@@ -995,7 +996,7 @@ pub fn quantize_q5k(xs: &[f32]) -> Vec<BlockQ5K> {
 ///
 /// Q6K uses 6-bit values with signed per-subblock scales.
 pub fn quantize_q6k(xs: &[f32]) -> Vec<BlockQ6K> {
-    let n_blocks = (xs.len() + QK_K - 1) / QK_K;
+    let n_blocks = xs.len().div_ceil(QK_K);
     let mut blocks = vec![
         BlockQ6K {
             ql: [0u8; QK_K / 2],
@@ -1078,7 +1079,7 @@ pub fn quantize_q6k(xs: &[f32]) -> Vec<BlockQ6K> {
 ///
 /// Q3K uses 3-bit values with complex scale packing.
 pub fn quantize_q3k(xs: &[f32]) -> Vec<BlockQ3K> {
-    let n_blocks = (xs.len() + QK_K - 1) / QK_K;
+    let n_blocks = xs.len().div_ceil(QK_K);
     let mut blocks = vec![
         BlockQ3K {
             hmask: [0u8; QK_K / 8],
@@ -1183,7 +1184,7 @@ pub fn quantize_q3k(xs: &[f32]) -> Vec<BlockQ3K> {
 pub fn quantize_q2k(xs: &[f32]) -> Vec<BlockQ2K> {
     const Q4SCALE: f32 = 15.0;
 
-    let n_blocks = (xs.len() + QK_K - 1) / QK_K;
+    let n_blocks = xs.len().div_ceil(QK_K);
     let mut blocks = vec![
         BlockQ2K {
             scales: [0u8; QK_K / 16],
@@ -1264,8 +1265,9 @@ pub fn quantize_q2k(xs: &[f32]) -> Vec<BlockQ2K> {
 }
 
 /// Convert K-quant blocks to bytes for GGUF export.
+#[allow(unsafe_code)]
 pub fn blocks_to_bytes<T: Copy>(blocks: &[T]) -> Vec<u8> {
-    let byte_len = blocks.len() * std::mem::size_of::<T>();
+    let byte_len = std::mem::size_of_val(blocks);
     let mut bytes = vec![0u8; byte_len];
 
     // Safety: We're copying the raw bytes of the block structures
@@ -1329,7 +1331,7 @@ mod tests {
 
         // With scale=1, min=0, values should be the raw quantized values
         // The exact pattern depends on nibble ordering
-        assert!(output.iter().all(|&x| x >= 0.0 && x <= 15.0));
+        assert!(output.iter().all(|&x| (0.0..=15.0).contains(&x)));
     }
 
     #[test]

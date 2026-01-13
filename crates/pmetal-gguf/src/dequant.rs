@@ -210,7 +210,7 @@ fn dequantize_q4_0(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError>
     const BLOCK_BYTES: usize = 18;
 
     let n_elements: usize = shape.iter().map(|&d| d as usize).product();
-    let n_blocks = (n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
     let expected_size = n_blocks * BLOCK_BYTES;
 
     if data.len() != expected_size {
@@ -258,7 +258,7 @@ fn dequantize_q8_0(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError>
     const BLOCK_BYTES: usize = 34;
 
     let n_elements: usize = shape.iter().map(|&d| d as usize).product();
-    let n_blocks = (n_elements + BLOCK_SIZE - 1) / BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BLOCK_SIZE);
     let expected_size = n_blocks * BLOCK_BYTES;
 
     if data.len() != expected_size {

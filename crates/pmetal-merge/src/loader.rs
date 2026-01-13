@@ -47,13 +47,13 @@ impl SafetensorsLoader {
         // Find all safetensors files
         let mut safetensor_files = Vec::new();
 
-        if path.is_file() && path.extension().map_or(false, |e| e == "safetensors") {
+        if path.is_file() && path.extension().is_some_and(|e| e == "safetensors") {
             safetensor_files.push(path.clone());
         } else if path.is_dir() {
             for entry in std::fs::read_dir(&path)? {
                 let entry = entry?;
                 let file_path = entry.path();
-                if file_path.extension().map_or(false, |e| e == "safetensors") {
+                if file_path.extension().is_some_and(|e| e == "safetensors") {
                     safetensor_files.push(file_path);
                 }
             }

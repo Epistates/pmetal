@@ -27,7 +27,7 @@ use std::fmt;
 /// // Access the secret explicitly when needed
 /// assert_eq!(token.expose_secret(), "sk-secret-key-12345");
 /// ```
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct SecretString {
     inner: String,
 }
@@ -79,13 +79,6 @@ impl fmt::Display for SecretString {
     }
 }
 
-impl Default for SecretString {
-    fn default() -> Self {
-        Self {
-            inner: String::new(),
-        }
-    }
-}
 
 impl From<String> for SecretString {
     fn from(s: String) -> Self {
@@ -100,6 +93,7 @@ impl From<&str> for SecretString {
 }
 
 /// Zeroize the secret on drop to reduce the window of exposure.
+#[allow(unsafe_code)]
 impl Drop for SecretString {
     fn drop(&mut self) {
         // Overwrite the string contents with zeros before deallocating.

@@ -81,8 +81,9 @@ pub const DEFAULT_EXPANSION_RATE: usize = 4;
 pub const DEFAULT_SINKHORN_ITERATIONS: usize = 20;
 
 /// Prelude module for convenient imports.
+///
+/// Convenient re-exports for common usage.
 pub mod prelude {
-    //! Convenient re-exports for common usage.
     pub use crate::config::{MhcConfig, MhcPreset};
     pub use crate::layer::{MhcLayer, MhcTransformerBlock};
     pub use crate::params::{MhcGradients, MhcMappings, MhcParams};
@@ -161,11 +162,11 @@ mod tests {
         let n = 4;
         let config = SinkhornConfig::default();
 
-        let h_pre_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i + j) as f32 * 0.1));
+        let h_pre_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| (i + j) as f32 * 0.1);
         let h_post_input =
-            Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i * j) as f32 * 0.05 + 0.1));
+            Array2::<f32>::from_shape_fn((n, n), |(i, j)| (i * j) as f32 * 0.05 + 0.1);
         let h_res_input =
-            Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i + j * 2) as f32 * 0.08));
+            Array2::<f32>::from_shape_fn((n, n), |(i, j)| (i + j * 2) as f32 * 0.08);
 
         let h_pre = sinkhorn_knopp(&h_pre_input, &config).matrix;
         let h_post = sinkhorn_knopp(&h_post_input, &config).matrix;
@@ -178,7 +179,7 @@ mod tests {
         // Amax gain should be close to 1 for doubly stochastic composite
         let amax = amax_gain_forward(&composite);
         assert!(
-            amax >= 0.5 && amax <= 2.0,
+            (0.5..=2.0).contains(&amax),
             "Amax gain out of expected range: {}",
             amax
         );

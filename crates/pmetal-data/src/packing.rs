@@ -124,11 +124,10 @@ impl PackedBatch {
     ///
     /// This is more efficient than building Vec<f32> and then converting,
     /// as it avoids an intermediate allocation.
-    #[cfg(feature = "mlx")]
     pub fn build_attention_mask_array(&self) -> mlx_rs::error::Result<mlx_rs::Array> {
         let n = self.total_tokens() as i32;
         let mask_data = self.build_attention_mask();
-        mlx_rs::Array::from_slice(&mask_data, &[n, n])
+        Ok(mlx_rs::Array::from_slice(&mask_data, &[n, n]))
     }
 
     /// Build a block diagonal attention mask with sliding window.
@@ -834,6 +833,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op, clippy::erasing_op)]
     fn test_block_diagonal_attention_mask() {
         // Create a batch with two sequences: [2 tokens] [3 tokens]
         let batch = PackedBatch {
@@ -929,6 +929,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op)]
     fn test_attention_mask_with_sliding_window() {
         let batch = PackedBatch {
             input_ids: vec![1, 2, 3, 4, 5],

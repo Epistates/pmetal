@@ -229,12 +229,12 @@ impl BatchedRlGenerator {
         );
 
         // Replicate for batch
-        let batched_prompt = self.replicate_for_batch(&prompt_input, batch_size)?;
+        let _batched_prompt = self.replicate_for_batch(&prompt_input, batch_size)?;
 
         // If we have a prefilled cache, copy it to all sequences
         if let Some(ref prefilled_cache) = prefilled {
             // Clone the prefilled cache for each sequence
-            for (i, cache) in caches.iter_mut().enumerate() {
+            for cache in caches.iter_mut() {
                 for layer_idx in 0..self.kv_config.num_layers {
                     if let Some((k, v)) = prefilled_cache.get(layer_idx) {
                         cache.update_and_fetch(layer_idx, &k, &v)?;
@@ -276,7 +276,7 @@ impl BatchedRlGenerator {
         }
 
         // Decode loop
-        for step in 0..self.config.max_new_tokens {
+        for _step in 0..self.config.max_new_tokens {
             // Check if all sequences are done
             if finished.iter().all(|&f| f) {
                 break;
@@ -366,7 +366,7 @@ impl BatchedRlGenerator {
         }
 
         // Tile the input along batch dimension
-        let mut tiles = vec![input.clone(); batch_size];
+        let tiles = vec![input.clone(); batch_size];
         let refs: Vec<&Array> = tiles.iter().collect();
         concatenate_axis(&refs, 0)
     }

@@ -139,7 +139,7 @@ impl GgmlType {
     /// Calculate the byte size for a tensor with given number of elements.
     pub fn tensor_size(&self, n_elements: usize) -> usize {
         let block_size = self.block_size();
-        let n_blocks = (n_elements + block_size - 1) / block_size;
+        let n_blocks = n_elements.div_ceil(block_size);
         n_blocks * self.type_size()
     }
 

@@ -27,12 +27,10 @@ pub fn cache_size() -> Result<u64> {
     }
 
     let mut size = 0u64;
-    for entry in walkdir::WalkDir::new(&cache) {
-        if let Ok(entry) = entry {
-            if entry.file_type().is_file() {
-                if let Ok(metadata) = entry.metadata() {
-                    size += metadata.len();
-                }
+    for entry in walkdir::WalkDir::new(&cache).into_iter().flatten() {
+        if entry.file_type().is_file() {
+            if let Ok(metadata) = entry.metadata() {
+                size += metadata.len();
             }
         }
     }

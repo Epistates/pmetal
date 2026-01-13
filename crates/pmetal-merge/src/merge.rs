@@ -4,7 +4,6 @@
 //! It coordinates loading models, applying merge algorithms, and saving results.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use mlx_rs::Array;
 use tracing::{debug, info, warn};
@@ -249,7 +248,7 @@ fn verify_shapes(name: &str, tensors: &[Array], base: Option<&Array>) -> Result<
 
     let expected_shape = tensors[0].shape().to_vec();
 
-    for (idx, tensor) in tensors.iter().enumerate().skip(1) {
+    for tensor in tensors.iter().skip(1) {
         let actual = tensor.shape().to_vec();
         if actual != expected_shape {
             return Err(MergeError::ShapeMismatch {
@@ -286,6 +285,7 @@ pub struct MergeBuilder {
 }
 
 impl MergeBuilder {
+    /// Create a new merge builder.
     pub fn new() -> Self {
         Self::default()
     }

@@ -137,7 +137,7 @@ impl TrainingContext {
     }
 }
 
-/// Thread-local training context for easy access.
+// Thread-local training context for easy access.
 thread_local! {
     static TRAINING_CONTEXT: std::cell::RefCell<Option<Arc<Mutex<TrainingContext>>>> =
         const { std::cell::RefCell::new(None) };

@@ -24,8 +24,10 @@ impl Default for MllamaImageProcessorConfig {
     fn default() -> Self {
         Self {
             size: (560, 560), // Default for Llama 3.2 11B Vision
-            // CLIP stats
+            // CLIP stats (canonical values from OpenAI CLIP)
+            #[allow(clippy::excessive_precision)]
             mean: [0.48145466, 0.4578275, 0.40821073],
+            #[allow(clippy::excessive_precision)]
             std: [0.26862954, 0.26130258, 0.27577711],
             rescale_factor: 1.0 / 255.0,
         }

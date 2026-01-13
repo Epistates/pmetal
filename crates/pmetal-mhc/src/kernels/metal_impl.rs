@@ -4,20 +4,18 @@
 //! mHC operations on Apple Silicon.
 
 use super::{KernelStats, MhcKernelConfig, MHC_METAL_SHADERS};
-use crate::config::MhcConfig;
 use crate::params::MhcMappings;
 use crate::sinkhorn::SinkhornConfig;
-use ndarray::{Array1, Array2, ArrayView1, ArrayView2};
-use std::sync::Arc;
+use ndarray::{Array2, ArrayView1, ArrayView2};
 
 #[cfg(feature = "metal")]
 use metal::{
-    Buffer, CommandQueue, ComputeCommandEncoder, ComputePipelineState, Device, Library,
-    MTLResourceOptions, MTLSize,
+    Buffer, CommandQueue, ComputePipelineState, Device, Library, MTLResourceOptions, MTLSize,
 };
 
 /// Metal context for mHC kernel execution.
 #[cfg(feature = "metal")]
+#[allow(dead_code)]
 pub struct MhcMetalContext {
     device: Device,
     queue: CommandQueue,
@@ -119,10 +117,10 @@ impl MhcMetalContext {
         b_pre: ArrayView1<f32>,
         b_post: ArrayView1<f32>,
         b_res: ArrayView1<f32>,
-        phi_pre: ArrayView2<f32>,
-        phi_post: ArrayView2<f32>,
-        phi_res: ArrayView2<f32>,
-        rmsnorm_weight: ArrayView1<f32>,
+        _phi_pre: ArrayView2<f32>,
+        _phi_post: ArrayView2<f32>,
+        _phi_res: ArrayView2<f32>,
+        _rmsnorm_weight: ArrayView1<f32>,
         sinkhorn_config: &SinkhornConfig,
     ) -> Result<MhcMappings, MhcMetalError> {
         let start = std::time::Instant::now();
@@ -163,7 +161,7 @@ impl MhcMetalContext {
 
         let threads_per_group = MTLSize::new(self.config.compute_mappings_threads as u64, 1, 1);
         let num_groups = MTLSize::new(
-            ((n * n) as u64 + threads_per_group.width - 1) / threads_per_group.width,
+            ((n * n) as u64).div_ceil(threads_per_group.width),
             1,
             1,
         );
@@ -187,8 +185,7 @@ impl MhcMetalContext {
             encoder.set_buffer(1, Some(&config_buf), 0);
 
             let sinkhorn_groups = MTLSize::new(
-                ((n) as u64 + self.config.sinkhorn_threads as u64 - 1)
-                    / self.config.sinkhorn_threads as u64,
+                (n as u64).div_ceil(self.config.sinkhorn_threads as u64),
                 1,
                 1,
             );
@@ -253,7 +250,7 @@ impl MhcMetalContext {
         encoder.set_buffer(3, Some(&config_buf), 0);
 
         let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
-        let groups = MTLSize::new(((n * c) as u64 + threads.width - 1) / threads.width, 1, 1);
+        let groups = MTLSize::new(((n * c) as u64).div_ceil(threads.width), 1, 1);
         encoder.dispatch_thread_groups(groups, threads);
 
         encoder.end_encoding();
@@ -303,7 +300,7 @@ impl MhcMetalContext {
         encoder.set_buffer(5, Some(&config_buf), 0);
 
         let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
-        let groups = MTLSize::new(((n * c) as u64 + threads.width - 1) / threads.width, 1, 1);
+        let groups = MTLSize::new(((n * c) as u64).div_ceil(threads.width), 1, 1);
         encoder.dispatch_thread_groups(groups, threads);
 
         encoder.end_encoding();
@@ -347,7 +344,7 @@ impl MhcMetalContext {
 
         let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
         let groups = MTLSize::new(
-            ((batch * n * c) as u64 + threads.width - 1) / threads.width,
+            ((batch * n * c) as u64).div_ceil(threads.width),
             1,
             1,
         );
@@ -389,7 +386,7 @@ impl MhcMetalContext {
         encoder.set_buffer(2, Some(&config_buf), 0);
 
         let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
-        let groups = MTLSize::new((c as u64 + threads.width - 1) / threads.width, 1, 1);
+        let groups = MTLSize::new((c as u64).div_ceil(threads.width), 1, 1);
         encoder.dispatch_thread_groups(groups, threads);
 
         encoder.end_encoding();
@@ -436,7 +433,7 @@ impl MhcMetalContext {
     fn create_buffer_from_slice(&self, data: &[f32]) -> Result<Buffer, MhcMetalError> {
         let buffer = self.device.new_buffer_with_data(
             data.as_ptr() as *const _,
-            (data.len() * std::mem::size_of::<f32>()) as u64,
+            std::mem::size_of_val(data) as u64,
             MTLResourceOptions::StorageModeShared,
         );
         Ok(buffer)

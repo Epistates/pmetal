@@ -39,7 +39,7 @@ pub fn sign_consensus(tensors: &[Array], weights: &[f32]) -> Result<Array> {
     for (tensor, weight) in tensors.iter().zip(weights.iter()) {
         // Get sign: +1 for positive, -1 for negative, 0 for zero
         let signs = sign(tensor)?;
-        let weighted = signs.multiply(&Array::from_f32(*weight))?;
+        let weighted = signs.multiply(Array::from_f32(*weight))?;
         weighted_signs = weighted_signs.add(&weighted)?;
     }
 
@@ -73,7 +73,7 @@ pub fn majority_sign(tensors: &[Array], weights: &[f32]) -> Result<Array> {
 
     for (tensor, weight) in tensors.iter().zip(weights.iter()) {
         let signs = sign(tensor)?;
-        let weighted = signs.multiply(&Array::from_f32(*weight))?;
+        let weighted = signs.multiply(Array::from_f32(*weight))?;
         weighted_signs = weighted_signs.add(&weighted)?;
     }
 

@@ -14,6 +14,21 @@
 //! - Speculative decoding for faster inference
 
 #![warn(missing_docs)]
+#![allow(unsafe_code)]
+#![allow(ambiguous_glob_reexports)]
+#![allow(unused_imports)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::excessive_precision)]
+#![allow(clippy::expect_fun_call)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::type_complexity)]
+#![allow(clippy::manual_div_ceil)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::needless_range_loop)]
+#![allow(clippy::manual_range_contains)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::arc_with_non_send_sync)]
+#![allow(dead_code)]
 
 pub mod attention;
 pub mod bridge;

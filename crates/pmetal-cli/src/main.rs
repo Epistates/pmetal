@@ -1,5 +1,14 @@
 //! PMetal CLI - LLM fine-tuning for Apple Silicon.
 
+#![allow(dead_code)]
+#![allow(unused_imports)]
+#![allow(unused_variables)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::derivable_impls)]
+#![allow(clippy::unnecessary_unwrap)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+
 use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};

@@ -752,8 +752,7 @@ impl MistralLoraForCausalLM {
         let params: Vec<&Array> = self
             .parameters()
             .flatten()
-            .into_iter()
-            .map(|(_, arr)| arr)
+            .into_values()
             .collect();
         eval(params)?;
         Ok(())

@@ -80,6 +80,7 @@ pub enum ElectionState {
 
 /// Information about a candidate in the election.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CandidateInfo {
     /// Peer ID of the candidate.
     peer_id: PeerId,
@@ -334,27 +335,38 @@ impl ElectionManager {
 
     /// Check if election is complete (all candidates agree on winner).
     pub async fn check_election_complete(&self, all_peers: &[PeerId]) -> Result<bool> {
-        let candidates = self.candidates.read();
+        // Extract values while holding locks, then drop locks before await
+        let winner_to_declare = {
+            let candidates = self.candidates.read();
 
-        // Need votes from all known peers
-        if candidates.len() < all_peers.len() {
-            return Ok(false);
-        }
-
-        // Check if all candidates vote for the same peer
-        let votes: Vec<_> = candidates.values().map(|c| c.peer_id).collect();
-
-        // For now, simple majority - find the candidate with most votes for themselves
-        // In a proper implementation, we'd track explicit votes
-        let our_vote = self.current_vote.read();
-
-        if let Some(winner) = our_vote.as_ref() {
-            // Check if winner is in our candidates
-            if candidates.contains_key(winner) {
-                // Declare winner
-                self.declare_winner(*winner).await?;
-                return Ok(true);
+            // Need votes from all known peers
+            if candidates.len() < all_peers.len() {
+                return Ok(false);
             }
+
+            // Check if all candidates vote for the same peer
+            let _votes: Vec<_> = candidates.values().map(|c| c.peer_id).collect();
+
+            // For now, simple majority - find the candidate with most votes for themselves
+            // In a proper implementation, we'd track explicit votes
+            let our_vote = self.current_vote.read();
+
+            if let Some(winner) = our_vote.as_ref() {
+                // Check if winner is in our candidates
+                if candidates.contains_key(winner) {
+                    Some(*winner)
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        }; // locks dropped here
+
+        if let Some(winner) = winner_to_declare {
+            // Declare winner
+            self.declare_winner(winner).await?;
+            return Ok(true);
         }
 
         Ok(false)
@@ -414,23 +426,29 @@ impl ElectionManager {
             return Ok(false);
         }
 
-        // Check if any candidate info is stale
-        let candidates = self.candidates.read();
-        let now = Instant::now();
+        // Check if any candidate info is stale - extract session while holding lock
+        let timed_out_session = {
+            let candidates = self.candidates.read();
+            let now = Instant::now();
 
-        for candidate in candidates.values() {
-            if now.duration_since(candidate.last_seen) > self.config.election_timeout {
-                drop(candidates);
-
-                let session = *self.session_id.read();
-                warn!("Election timeout, session={}", session);
-
-                let _ = self.event_tx.send(ElectionEvent::Timeout { session }).await;
-
-                // Start new election
-                self.start_election().await?;
-                return Ok(true);
+            let mut timed_out = None;
+            for candidate in candidates.values() {
+                if now.duration_since(candidate.last_seen) > self.config.election_timeout {
+                    timed_out = Some(*self.session_id.read());
+                    break;
+                }
             }
+            timed_out
+        }; // locks dropped here
+
+        if let Some(session) = timed_out_session {
+            warn!("Election timeout, session={}", session);
+
+            let _ = self.event_tx.send(ElectionEvent::Timeout { session }).await;
+
+            // Start new election
+            self.start_election().await?;
+            return Ok(true);
         }
 
         Ok(false)

@@ -124,7 +124,7 @@ impl Default for PeerHealth {
 
 impl PeerHealth {
     /// Record a successful heartbeat.
-    pub fn record_success(&mut self, latency: Duration, max_failures: u32) {
+    pub fn record_success(&mut self, latency: Duration, _max_failures: u32) {
         self.last_heartbeat = Some(Instant::now());
         self.consecutive_failures = 0;
         self.last_latency = Some(latency);

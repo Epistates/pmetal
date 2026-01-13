@@ -58,8 +58,9 @@ pub fn quantize(data: &[f32], dtype: GgmlType) -> Result<Vec<u8>> {
 }
 
 /// Convert a slice of any block type to raw bytes.
+#[allow(unsafe_code)]
 fn blocks_to_bytes<T: Copy>(blocks: &[T]) -> Vec<u8> {
-    let byte_len = blocks.len() * std::mem::size_of::<T>();
+    let byte_len = std::mem::size_of_val(blocks);
     let mut bytes = vec![0u8; byte_len];
     // SAFETY: We're reinterpreting the blocks as raw bytes
     // The blocks are repr(C) packed structs

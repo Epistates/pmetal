@@ -127,12 +127,11 @@ where
     let output = layer_fn(input)?;
 
     // Check if this is a checkpoint boundary
-    if config.enabled && (layer_idx + 1) % config.layers_per_block == 0 {
-        if config.eval_at_boundaries {
-            // Force evaluation to materialize the tensor
-            // This breaks the computation graph at this point
-            output.eval()?;
-        }
+    if config.enabled && (layer_idx + 1) % config.layers_per_block == 0 && config.eval_at_boundaries
+    {
+        // Force evaluation to materialize the tensor
+        // This breaks the computation graph at this point
+        output.eval()?;
     }
 
     Ok(output)

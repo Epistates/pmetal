@@ -799,7 +799,7 @@ impl BlockIq4Nl {
 
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
+        let n_blocks = n_elements.div_ceil(Self::BLOCK_SIZE);
         n_blocks * Self::SIZE
     }
 }
@@ -839,7 +839,7 @@ impl BlockIq4Xs {
 
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
+        let n_blocks = n_elements.div_ceil(Self::BLOCK_SIZE);
         n_blocks * Self::SIZE
     }
 }
@@ -867,7 +867,7 @@ impl BlockIq2Xxs {
 
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
+        let n_blocks = n_elements.div_ceil(Self::BLOCK_SIZE);
         n_blocks * Self::SIZE
     }
 }
@@ -898,7 +898,7 @@ impl BlockIq2Xs {
 
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
+        let n_blocks = n_elements.div_ceil(Self::BLOCK_SIZE);
         n_blocks * Self::SIZE
     }
 }
@@ -932,7 +932,7 @@ impl BlockIq2S {
 
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
+        let n_blocks = n_elements.div_ceil(Self::BLOCK_SIZE);
         n_blocks * Self::SIZE
     }
 }
@@ -960,7 +960,7 @@ impl BlockIq3Xxs {
 
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
+        let n_blocks = n_elements.div_ceil(Self::BLOCK_SIZE);
         n_blocks * Self::SIZE
     }
 }
@@ -1000,7 +1000,7 @@ impl BlockIq3S {
 
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
+        let n_blocks = n_elements.div_ceil(Self::BLOCK_SIZE);
         n_blocks * Self::SIZE
     }
 }
@@ -1031,7 +1031,7 @@ impl BlockIq1S {
 
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
+        let n_blocks = n_elements.div_ceil(Self::BLOCK_SIZE);
         n_blocks * Self::SIZE
     }
 }
@@ -1062,7 +1062,7 @@ impl BlockIq1M {
 
     /// Calculate byte size for n_elements.
     pub fn byte_size(n_elements: usize) -> usize {
-        let n_blocks = (n_elements + Self::BLOCK_SIZE - 1) / Self::BLOCK_SIZE;
+        let n_blocks = n_elements.div_ceil(Self::BLOCK_SIZE);
         n_blocks * Self::SIZE
     }
 }
@@ -1074,7 +1074,7 @@ impl BlockIq1M {
 /// Dequantize IQ4_NL bytes to f32 values.
 pub fn dequantize_iq4nl_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     let mut output = Vec::with_capacity(n_elements);
-    let n_blocks = (n_elements + BlockIq4Nl::BLOCK_SIZE - 1) / BlockIq4Nl::BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BlockIq4Nl::BLOCK_SIZE);
 
     for block_idx in 0..n_blocks {
         let block_start = block_idx * BlockIq4Nl::SIZE;
@@ -1089,8 +1089,7 @@ pub fn dequantize_iq4nl_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
         let qs = &block_data[2..];
 
         // Dequantize 32 values
-        for i in 0..16 {
-            let byte = qs[i];
+        for &byte in qs.iter().take(16) {
             let low_idx = (byte & 0x0F) as usize;
             let high_idx = ((byte >> 4) & 0x0F) as usize;
 
@@ -1106,7 +1105,7 @@ pub fn dequantize_iq4nl_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// Dequantize IQ4_XS bytes to f32 values.
 pub fn dequantize_iq4xs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     let mut output = Vec::with_capacity(n_elements);
-    let n_blocks = (n_elements + BlockIq4Xs::BLOCK_SIZE - 1) / BlockIq4Xs::BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BlockIq4Xs::BLOCK_SIZE);
 
     for block_idx in 0..n_blocks {
         let block_start = block_idx * BlockIq4Xs::SIZE;
@@ -1154,7 +1153,7 @@ pub fn dequantize_iq4xs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// IQ2_XXS uses a 256-entry lookup table where each entry encodes 8 values.
 pub fn dequantize_iq2xxs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     let mut output = Vec::with_capacity(n_elements);
-    let n_blocks = (n_elements + BlockIq2Xxs::BLOCK_SIZE - 1) / BlockIq2Xxs::BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BlockIq2Xxs::BLOCK_SIZE);
 
     for block_idx in 0..n_blocks {
         let block_start = block_idx * BlockIq2Xxs::SIZE;
@@ -1191,6 +1190,7 @@ pub fn dequantize_iq2xxs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                 let signs = KSIGNS_IQ2XS[signs_idx];
 
                 // Extract 8 values from grid
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..8 {
                     let byte_val = ((grid >> (8 * i)) & 0xFF) as i32;
                     let sign = if (signs & KMASK_IQ2XS[i]) != 0 {
@@ -1213,7 +1213,7 @@ pub fn dequantize_iq2xxs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// IQ2_XS uses a 512-entry lookup table with per-subblock scales.
 pub fn dequantize_iq2xs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     let mut output = Vec::with_capacity(n_elements);
-    let n_blocks = (n_elements + BlockIq2Xs::BLOCK_SIZE - 1) / BlockIq2Xs::BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BlockIq2Xs::BLOCK_SIZE);
 
     for block_idx in 0..n_blocks {
         let block_start = block_idx * BlockIq2Xs::SIZE;
@@ -1247,6 +1247,7 @@ pub fn dequantize_iq2xs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                 let signs = KSIGNS_IQ2XS[signs_idx];
 
                 // Extract 8 values from grid
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..8 {
                     let byte_val = ((grid >> (8 * i)) & 0xFF) as i32;
                     let sign = if (signs & KMASK_IQ2XS[i]) != 0 {
@@ -1269,7 +1270,7 @@ pub fn dequantize_iq2xs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// IQ3_XXS uses a 256-entry lookup table where each entry encodes 4 values.
 pub fn dequantize_iq3xxs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     let mut output = Vec::with_capacity(n_elements);
-    let n_blocks = (n_elements + BlockIq3Xxs::BLOCK_SIZE - 1) / BlockIq3Xxs::BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BlockIq3Xxs::BLOCK_SIZE);
 
     for block_idx in 0..n_blocks {
         let block_start = block_idx * BlockIq3Xxs::SIZE;
@@ -1308,6 +1309,7 @@ pub fn dequantize_iq3xxs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                 let signs = KSIGNS_IQ2XS[signs_idx];
 
                 // Extract 4 values from grid1
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..4 {
                     let byte_val = ((grid1 >> (8 * i)) & 0xFF) as i32;
                     let sign = if (signs & KMASK_IQ2XS[i]) != 0 {
@@ -1319,6 +1321,7 @@ pub fn dequantize_iq3xxs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                 }
 
                 // Extract 4 values from grid2
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..4 {
                     let byte_val = ((grid2 >> (8 * i)) & 0xFF) as i32;
                     let sign = if (signs & KMASK_IQ2XS[i + 4]) != 0 {
@@ -1337,6 +1340,7 @@ pub fn dequantize_iq3xxs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                 let signs2_idx = ((aux32 >> (14 * il + 7)) & 127) as usize;
                 let signs2 = KSIGNS_IQ2XS[signs2_idx];
 
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..4 {
                     let byte_val = ((grid3 >> (8 * i)) & 0xFF) as i32;
                     let sign = if (signs2 & KMASK_IQ2XS[i]) != 0 {
@@ -1369,7 +1373,7 @@ pub fn dequantize_iq3xxs_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// IQ3_S uses a 512-entry lookup table with per-subblock scales and explicit signs.
 pub fn dequantize_iq3s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     let mut output = Vec::with_capacity(n_elements);
-    let n_blocks = (n_elements + BlockIq3S::BLOCK_SIZE - 1) / BlockIq3S::BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BlockIq3S::BLOCK_SIZE);
 
     for block_idx in 0..n_blocks {
         let block_start = block_idx * BlockIq3S::SIZE;
@@ -1387,6 +1391,7 @@ pub fn dequantize_iq3s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
         let scales = &block_data[106..110]; // IQ3S_N_SCALE = 4 bytes
 
         // Process 8 groups of 32 elements each
+        #[allow(clippy::needless_range_loop)]
         for ib32 in 0..8 {
             let qs_offset = ib32 * 8;
             let qh_byte = qh[ib32];
@@ -1404,6 +1409,7 @@ pub fn dequantize_iq3s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                 let qh_shift = 4 * il;
 
                 // Process 4 values from each grid
+                #[allow(clippy::needless_range_loop)]
                 for j in 0..2 {
                     let qs_idx = qs_offset + 4 * il + j * 2;
                     let grid_idx = qs[qs_idx] as usize
@@ -1436,7 +1442,7 @@ pub fn dequantize_iq3s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// The grid index is 10 bits: qs[i] | ((qh << shift) & 0x300).
 pub fn dequantize_iq2s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     let mut output = Vec::with_capacity(n_elements);
-    let n_blocks = (n_elements + BlockIq2S::BLOCK_SIZE - 1) / BlockIq2S::BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BlockIq2S::BLOCK_SIZE);
 
     for block_idx in 0..n_blocks {
         let block_start = block_idx * BlockIq2S::SIZE;
@@ -1489,7 +1495,7 @@ pub fn dequantize_iq2s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                     // Extract 8 values from grid
                     for i in 0..8 {
                         let byte_val = ((grid >> (8 * i)) & 0xFF) as i32;
-                        let sign_bit = if j == 0 { i } else { i };
+                        let sign_bit = i;
                         let sign = if (sign_byte & KMASK_IQ2XS[sign_bit]) != 0 {
                             -1.0
                         } else {
@@ -1517,7 +1523,7 @@ pub fn dequantize_iq2s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// - qh: 16 bytes (8 x u16, containing high 3 bits for grid index + shift/sign info)
 pub fn dequantize_iq1s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     let mut output = Vec::with_capacity(n_elements);
-    let n_blocks = (n_elements + BlockIq1S::BLOCK_SIZE - 1) / BlockIq1S::BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BlockIq1S::BLOCK_SIZE);
 
     for block_idx in 0..n_blocks {
         let block_start = block_idx * BlockIq1S::SIZE;
@@ -1555,9 +1561,7 @@ pub fn dequantize_iq1s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                 // Bounds check for corrupted data (grid_idx must be < 2048)
                 if grid_idx >= IQ1S_GRID.len() {
                     // Corrupted data - output zeros for this group
-                    for _ in 0..8 {
-                        output.push(0.0);
-                    }
+                    output.extend(std::iter::repeat_n(0.0, 8));
                     continue;
                 }
 
@@ -1594,7 +1598,7 @@ pub fn dequantize_iq1s_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
 /// Reference: llama.cpp gguf-py/gguf/quants.py IQ1_M implementation
 pub fn dequantize_iq1m_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
     let mut output = Vec::with_capacity(n_elements);
-    let n_blocks = (n_elements + BlockIq1M::BLOCK_SIZE - 1) / BlockIq1M::BLOCK_SIZE;
+    let n_blocks = n_elements.div_ceil(BlockIq1M::BLOCK_SIZE);
 
     for block_idx in 0..n_blocks {
         let block_start = block_idx * BlockIq1M::SIZE;
@@ -1621,7 +1625,7 @@ pub fn dequantize_iq1m_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
         // Extract d from HIGH nibbles (bits [15:12]) of each u16
         // Reference: d = (scales & 0xF000) >> [12, 8, 4, 0]
         let d_bits = ((sc3 >> 12) << 12) | ((sc2 >> 12) << 8) | ((sc1 >> 12) << 4) | (sc0 >> 12);
-        let d = f16::from_bits(d_bits as u16).to_f32();
+        let d = f16::from_bits(d_bits).to_f32();
 
         // Pre-extract all 16 3-bit scale values from the four u16s
         // Each u16 provides 4 scales at bit positions 0, 3, 6, 9
@@ -1634,7 +1638,7 @@ pub fn dequantize_iq1m_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                 2 => sc2,
                 _ => sc3,
             };
-            scales[i * 4 + 0] = ((sc_val >> 0) & 0x07) as i32;
+            scales[i * 4] = (sc_val & 0x07) as i32;
             scales[i * 4 + 1] = ((sc_val >> 3) & 0x07) as i32;
             scales[i * 4 + 2] = ((sc_val >> 6) & 0x07) as i32;
             scales[i * 4 + 3] = ((sc_val >> 9) & 0x07) as i32;
@@ -1671,9 +1675,7 @@ pub fn dequantize_iq1m_bytes(data: &[u8], n_elements: usize) -> Vec<f32> {
                 // Lookup grid value (with bounds check for safety)
                 if grid_idx >= IQ1S_GRID.len() {
                     // Corrupted data - skip this group
-                    for _ in 0..8 {
-                        output.push(0.0);
-                    }
+                    output.extend(std::iter::repeat_n(0.0, 8));
                     continue;
                 }
                 let grid = IQ1S_GRID[grid_idx];
@@ -1769,9 +1771,7 @@ mod tests {
         let scale = f16::from_f32(1.0 / 127.0);
         data.extend_from_slice(&scale.to_le_bytes());
         // All indices = 8 (value = 1)
-        for _ in 0..16 {
-            data.push(0x88);
-        }
+        data.extend(std::iter::repeat_n(0x88, 16));
 
         let result = dequantize_iq4nl_bytes(&data, 32);
         assert_eq!(result.len(), 32);
@@ -1819,6 +1819,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn test_kmask_iq2xs() {
         // Verify bitmask table
         for i in 0..8 {
@@ -2189,7 +2190,7 @@ mod tests {
         let d_bits = ((sc3 >> 12) << 12) | ((sc2 >> 12) << 8) | ((sc1 >> 12) << 4) | (sc0 >> 12);
         assert_eq!(d_bits, 0x3800, "d_bits extraction failed");
 
-        let d = f16::from_bits(d_bits as u16).to_f32();
+        let d = f16::from_bits(d_bits).to_f32();
         assert!(
             (d - 0.5).abs() < 1e-4,
             "d extraction: expected 0.5, got {}",
@@ -2215,7 +2216,7 @@ mod tests {
         // Verify 3-bit scale extraction from scale bytes
         // Each sc_val provides 4 scales at bit positions 0, 3, 6, 9
 
-        let mut data = vec![0u8; 56];
+        let mut data = [0u8; 56];
 
         // Set d = 1.0
         data[52] = 0x00;

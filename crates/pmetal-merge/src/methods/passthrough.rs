@@ -10,6 +10,7 @@ use mlx_rs::Array;
 pub struct PassthroughMerge;
 
 impl PassthroughMerge {
+    /// Create a new passthrough merge instance.
     pub fn new() -> Self {
         Self
     }

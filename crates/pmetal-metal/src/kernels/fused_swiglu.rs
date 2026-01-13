@@ -249,6 +249,7 @@ impl FusedSwiGLU {
     /// * `gate_lora_b` - Gate LoRA B matrix [intermediate_size, lora_rank]
     /// * `up_lora_a` - Up LoRA A matrix [lora_rank, hidden_size]
     /// * `up_lora_b` - Up LoRA B matrix [intermediate_size, lora_rank]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_with_lora(
         &self,
         input: &MetalBuffer<f32>,
@@ -404,6 +405,7 @@ impl FusedSwiGLU {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_forward_lora(
         &self,
         input: &MetalBuffer<f32>,
@@ -460,7 +462,7 @@ impl FusedSwiGLU {
 
         let (grid_size, threadgroup_size) = if self.config.use_tiled {
             let tile_size = 128;
-            let num_tiles = (self.config.intermediate_size + tile_size - 1) / tile_size;
+            let num_tiles = self.config.intermediate_size.div_ceil(tile_size);
             (
                 objc2_metal::MTLSize {
                     width: self.config.batch_size,

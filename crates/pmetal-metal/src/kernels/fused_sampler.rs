@@ -280,7 +280,7 @@ impl FusedSampler {
         }
 
         // Allocate threadgroup memory for SIMD reduction
-        let simd_groups = (self.config.threadgroup_size + 31) / 32;
+        let simd_groups = self.config.threadgroup_size.div_ceil(32);
         // SAFETY:
         // 1. encoder is still valid (encoding not yet ended)
         // 2. Memory sizes are computed correctly based on simd_groups and type sizes
@@ -472,7 +472,7 @@ impl FusedSampler {
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of::<u32>(), 2);
         }
 
-        let simd_groups = (self.config.threadgroup_size + 31) / 32;
+        let simd_groups = self.config.threadgroup_size.div_ceil(32);
         // SAFETY: Same invariants as argmax() - see comments there
         unsafe {
             encoder.setThreadgroupMemoryLength_atIndex(simd_groups * std::mem::size_of::<f32>(), 0);

@@ -1489,7 +1489,7 @@ impl PagedKVCache {
         let block_size = self.config.block_size;
         let mut remaining = num_tokens;
 
-        for (i, &block_idx) in table.block_indices().iter().enumerate() {
+        for &block_idx in table.block_indices().iter() {
             let tokens_in_block = remaining.min(block_size);
 
             if let (Some(k_block), Some(v_block)) = (
@@ -1977,7 +1977,7 @@ mod tests {
 
         let k2 = Array::ones::<f32>(&[1, 4, 10, 64]).unwrap();
         let v2 = Array::ones::<f32>(&[1, 4, 10, 64]).unwrap();
-        let (cached_k, _) = cache.update_and_fetch(&k2, &v2).unwrap();
+        let (_cached_k, _) = cache.update_and_fetch(&k2, &v2).unwrap();
 
         // MLX-LM allows max_size + S - 1 to ensure every token gets at least max_size context
         // So cache can grow to max_size + num_steps - 1 before trimming
@@ -2367,9 +2367,9 @@ mod tests {
         let mut cache = PagedKVCache::new(config);
 
         // Allocate multiple sequences
-        let seq1 = cache.allocate_sequence(64).unwrap();
+        let _seq1 = cache.allocate_sequence(64).unwrap();
         let seq2 = cache.allocate_sequence(32).unwrap();
-        let seq3 = cache.allocate_sequence(48).unwrap();
+        let _seq3 = cache.allocate_sequence(48).unwrap();
 
         assert_eq!(cache.num_sequences(), 3);
 
@@ -2378,7 +2378,7 @@ mod tests {
         assert_eq!(cache.num_sequences(), 2);
 
         // Allocate new one (should reuse freed blocks)
-        let seq4 = cache.allocate_sequence(32).unwrap();
+        let _seq4 = cache.allocate_sequence(32).unwrap();
         assert_eq!(cache.num_sequences(), 3);
 
         // Reset all

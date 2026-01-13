@@ -185,7 +185,7 @@ mod tests {
     #[test]
     fn test_psk_verification() {
         let ns = NetworkNamespace::new("test", None);
-        let valid_psk = ns.psk().clone();
+        let valid_psk = *ns.psk();
         let mut invalid_psk = valid_psk;
         invalid_psk[0] ^= 0xFF;
 

@@ -34,7 +34,7 @@
 
 use mlx_rs::error::{Exception, Result};
 use mlx_rs::ops::indexing::TryIndexOp;
-use mlx_rs::{Array, Dtype, Stream};
+use mlx_rs::{Array, Dtype};
 
 /// Configuration for Cut Cross Entropy.
 #[derive(Debug, Clone)]
@@ -191,7 +191,7 @@ impl CutCrossEntropy {
         lm_head_bias: Option<&Array>,
     ) -> Result<CutCrossEntropyOutput> {
         let hidden_shape = hidden_states.shape();
-        let n_tokens = hidden_shape[0] as usize;
+        let _n_tokens = hidden_shape[0] as usize;
         let hidden_dim = hidden_shape[1] as usize;
 
         let weight_shape = lm_head_weight.shape();
@@ -449,7 +449,7 @@ impl CutCrossEntropy {
             // Compute softmax for this chunk
             // softmax_chunk = exp(logits - logsumexp)
             let shifted = chunk_logits.subtract(&lse_expanded)?;
-            let mut softmax_chunk = mlx_rs::ops::exp(&shifted)?;
+            let softmax_chunk = mlx_rs::ops::exp(&shifted)?;
 
             // Subtract 1 at target positions if target is in this chunk
             // Create mask for targets in this chunk range

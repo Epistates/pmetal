@@ -68,12 +68,12 @@ impl TiesMerge {
 
         for (sparse, weight) in sparse_vectors.iter().zip(weights.iter()) {
             let masked = sparse.multiply(&consensus_mask)?;
-            let weighted = masked.multiply(&Array::from_f32(*weight))?;
+            let weighted = masked.multiply(Array::from_f32(*weight))?;
             result = result.add(&weighted)?;
         }
 
         // Step 4: Scale by lambda
-        result = result.multiply(&Array::from_f32(lambda))?;
+        result = result.multiply(Array::from_f32(lambda))?;
 
         Ok(result)
     }
@@ -204,7 +204,7 @@ mod tests {
         };
 
         let result = merge
-            .merge(&[t1.clone()], Some(&base), &params, &global)
+            .merge(std::slice::from_ref(&t1), Some(&base), &params, &global)
             .unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();
 

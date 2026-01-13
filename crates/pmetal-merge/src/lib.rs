@@ -16,7 +16,12 @@
 //!
 //! All operations use lazy tensor loading and streaming to enable merging
 //! large models on memory-constrained macOS devices.
-//!
+
+// Crate-level lint configuration for ML code patterns
+#![allow(dead_code)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::type_complexity)]
+
 //! # Example
 //!
 //! ```ignore

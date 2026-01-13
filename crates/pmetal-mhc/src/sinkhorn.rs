@@ -21,7 +21,7 @@
 //! - Sinkhorn & Knopp (1967): "Concerning nonnegative matrices and doubly stochastic matrices"
 //! - arXiv:2512.24880: mHC paper
 
-use ndarray::{Array2, Array3, Axis};
+use ndarray::{Array2, Array3};
 
 /// Configuration for Sinkhorn-Knopp algorithm.
 #[derive(Debug, Clone, Copy)]
@@ -373,9 +373,8 @@ pub fn sinkhorn_knopp_backward(
 
     // Backward through exp: d/dH̃[exp(H̃)] = exp(H̃) ⊙ grad
     let m_0 = &intermediates[0];
-    let grad_h_tilde = m_0 * &grad;
 
-    grad_h_tilde
+    m_0 * &grad
 }
 
 #[cfg(test)]

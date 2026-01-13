@@ -197,7 +197,7 @@ impl CustomLoraTrainer {
         // d_logits *= mask / valid_count
 
         // Start with softmax probs
-        let mut d_flat_logits = probs.clone();
+        let d_flat_logits = probs.clone();
 
         // For gradient computation, we need to subtract 1 at label positions.
         // Use a loop-free approach: create index arrays and scatter.

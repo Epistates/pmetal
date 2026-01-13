@@ -372,10 +372,14 @@ impl MhcGradients {
 /// Errors during parameter validation.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ParamsValidationError {
+    /// Shape mismatch between expected and actual.
     #[error("Shape mismatch for {param}: expected {expected:?}, got {actual:?}")]
     ShapeMismatch {
+        /// Parameter name.
         param: String,
+        /// Expected shape.
         expected: Vec<usize>,
+        /// Actual shape.
         actual: Vec<usize>,
     },
 }

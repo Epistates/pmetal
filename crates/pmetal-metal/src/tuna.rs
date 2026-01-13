@@ -37,8 +37,11 @@ use tracing::{debug, info};
 /// Configuration for a tuned kernel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TunedConfig {
+    /// M dimension tile size.
     pub tile_m: u32,
+    /// N dimension tile size.
     pub tile_n: u32,
+    /// K dimension tile size.
     pub tile_k: u32,
 }
 
@@ -351,6 +354,7 @@ impl Tuner {
             })?;
 
         // Create params buffer
+        #[allow(dead_code)]
         struct FusedLoraParams {
             batch_size: u32,
             in_features: u32,
@@ -429,6 +433,7 @@ impl Tuner {
         Ok(elapsed.as_secs_f64() / iterations as f64)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn dispatch_kernel(
         &self,
         context: &MetalContext,
@@ -465,8 +470,8 @@ impl Tuner {
 
         // Calculate grid
         let grid_size = MTLSize {
-            width: (batch_size + config.tile_m as usize - 1) / config.tile_m as usize,
-            height: (out_features + config.tile_n as usize - 1) / config.tile_n as usize,
+            width: batch_size.div_ceil(config.tile_m as usize),
+            height: out_features.div_ceil(config.tile_n as usize),
             depth: 1,
         };
 

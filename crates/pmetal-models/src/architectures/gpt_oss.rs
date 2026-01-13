@@ -37,19 +37,14 @@ use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};
 
 /// Attention layer type for GPT-OSS.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionType {
     /// Sliding window attention (128 tokens).
     SlidingAttention,
     /// Full context attention.
+    #[default]
     FullAttention,
-}
-
-impl Default for AttentionType {
-    fn default() -> Self {
-        Self::FullAttention
-    }
 }
 
 /// GPT-OSS model configuration.

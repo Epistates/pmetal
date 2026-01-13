@@ -613,8 +613,8 @@ impl MoeKernel {
 
         // Estimate total tiles across all experts
         let total_tokens = self.config.total_tokens();
-        let num_m_tiles = (total_tokens + block_m - 1) / block_m;
-        let num_n_tiles = (output_dim + block_n - 1) / block_n;
+        let num_m_tiles = total_tokens.div_ceil(block_m);
+        let num_n_tiles = output_dim.div_ceil(block_n);
         let total_tiles = num_m_tiles * num_n_tiles;
 
         unsafe {

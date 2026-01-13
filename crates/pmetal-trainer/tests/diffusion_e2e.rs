@@ -8,6 +8,8 @@
 //! NOTE: These tests must run serially due to Metal's single-threaded
 //! command buffer model. Parallel execution causes command encoder conflicts.
 
+#![allow(clippy::manual_contains)]
+
 use mlx_rs::optimizers::Sgd;
 use mlx_rs::Array;
 use pmetal_core::{LoraConfig, TrainingConfig};

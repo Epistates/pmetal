@@ -60,10 +60,10 @@ impl SlerpMerge {
 
         // Handle degenerate cases
         if a_norm_val < 1e-8 {
-            return Ok(b.multiply(&Array::from_f32(t))?);
+            return Ok(b.multiply(Array::from_f32(t))?);
         }
         if b_norm_val < 1e-8 {
-            return Ok(a.multiply(&Array::from_f32(1.0 - t))?);
+            return Ok(a.multiply(Array::from_f32(1.0 - t))?);
         }
 
         // Normalize
@@ -80,8 +80,8 @@ impl SlerpMerge {
         // If vectors are very close, use linear interpolation
         if cos_theta.abs() > 0.9999 {
             let result_flat = a_flat
-                .multiply(&Array::from_f32(1.0 - t))?
-                .add(&b_flat.multiply(&Array::from_f32(t))?)?;
+                .multiply(Array::from_f32(1.0 - t))?
+                .add(&b_flat.multiply(Array::from_f32(t))?)?;
             return Ok(result_flat.reshape(&original_shape)?);
         }
 
@@ -103,8 +103,8 @@ impl SlerpMerge {
         if sin_theta.abs() < 1e-8 {
             // Fallback to linear interpolation
             let result_flat = a_flat
-                .multiply(&Array::from_f32(1.0 - t))?
-                .add(&b_flat.multiply(&Array::from_f32(t))?)?;
+                .multiply(Array::from_f32(1.0 - t))?
+                .add(&b_flat.multiply(Array::from_f32(t))?)?;
             return Ok(result_flat.reshape(&original_shape)?);
         }
 
@@ -113,14 +113,14 @@ impl SlerpMerge {
 
         // Interpolate unit vectors
         let result_unit = a_unit
-            .multiply(&Array::from_f32(s0))?
-            .add(&b_unit.multiply(&Array::from_f32(s1))?)?;
+            .multiply(Array::from_f32(s0))?
+            .add(&b_unit.multiply(Array::from_f32(s1))?)?;
 
         // Interpolate norms linearly
         let result_norm = a_norm_val * (1.0 - t) + b_norm_val * t;
 
         // Scale result
-        let result_flat = result_unit.multiply(&Array::from_f32(result_norm))?;
+        let result_flat = result_unit.multiply(Array::from_f32(result_norm))?;
         Ok(result_flat.reshape(&original_shape)?)
     }
 }

@@ -6,6 +6,10 @@
 //! - Optional Metal FlashAttention for forward pass
 //! - Checkpoint saving/loading
 
+#![allow(unused_variables)]
+#![allow(clippy::clone_on_copy)]
+#![allow(clippy::manual_range_contains)]
+
 use mlx_rs::optimizers::Sgd;
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};

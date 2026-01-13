@@ -272,7 +272,7 @@ impl GgufContent {
             })
             .unwrap_or(GGUF_DEFAULT_ALIGNMENT as u64);
 
-        let tensor_data_offset = ((position + alignment - 1) / alignment) * alignment;
+        let tensor_data_offset = position.div_ceil(alignment) * alignment;
 
         Ok(Self {
             version,

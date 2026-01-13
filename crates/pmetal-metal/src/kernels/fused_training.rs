@@ -53,7 +53,7 @@ use objc2_metal::{
 };
 
 use crate::async_scheduler::GpuCompletionToken;
-use crate::buffer::{BufferUsage, MetalBuffer};
+use crate::buffer::MetalBuffer;
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
 
@@ -442,6 +442,7 @@ impl FusedAdamW {
     ///
     /// This does NOT execute immediately - call `batch.execute()` after
     /// queueing all operations.
+    #[allow(clippy::too_many_arguments)]
     pub fn queue_update(
         &self,
         batch: &mut BatchedCommandBuffer,
@@ -479,7 +480,7 @@ impl FusedAdamW {
 
         // Grid: [ceil(max_param_size / 32), num_params, 1]
         let grid_size = MTLSize {
-            width: (self.max_param_size + 31) / 32,
+            width: self.max_param_size.div_ceil(32),
             height: self.num_params,
             depth: 1,
         };
@@ -538,7 +539,7 @@ impl FusedGradientClipping {
     pub fn new(ctx: Arc<MetalContext>, total_elements: usize) -> Self {
         // Each threadgroup processes 4 * 256 = 1024 elements
         let elements_per_tg = 1024;
-        let num_threadgroups = (total_elements + elements_per_tg - 1) / elements_per_tg;
+        let num_threadgroups = total_elements.div_ceil(elements_per_tg);
 
         Self {
             ctx,
@@ -618,7 +619,7 @@ impl FusedGradientClipping {
         }
 
         let grid_size = MTLSize {
-            width: (self.total_elements + 31) / 32,
+            width: self.total_elements.div_ceil(32),
             height: 1,
             depth: 1,
         };
@@ -670,6 +671,7 @@ impl FusedCrossEntropyTraining {
     /// * `n` - Number of positions (batch * seq after shift)
     /// * `vocab_size` - Vocabulary size
     /// * `ignore_index` - Label to ignore (-100 typically)
+    #[allow(clippy::too_many_arguments)]
     pub fn queue_forward_backward(
         &self,
         batch: &mut BatchedCommandBuffer,

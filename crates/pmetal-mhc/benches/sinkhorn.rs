@@ -10,10 +10,10 @@ fn bench_sinkhorn_sizes(c: &mut Criterion) {
 
     for n in [4, 8, 16, 32] {
         group.bench_with_input(BenchmarkId::new("n", n), &n, |b, &n| {
-            let mut matrix =
+            let matrix =
                 Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i + j) as f32 * 0.1).exp());
             b.iter(|| {
-                sinkhorn_knopp(black_box(&mut matrix), &config);
+                sinkhorn_knopp(black_box(&matrix), &config);
             });
         });
     }
@@ -32,10 +32,10 @@ fn bench_sinkhorn_iterations(c: &mut Criterion) {
         };
 
         group.bench_with_input(BenchmarkId::new("iters", iters), &iters, |b, _| {
-            let mut matrix =
+            let matrix =
                 Array2::<f32>::from_shape_fn((n, n), |(i, j)| ((i + j) as f32 * 0.1).exp());
             b.iter(|| {
-                sinkhorn_knopp(black_box(&mut matrix), &config);
+                sinkhorn_knopp(black_box(&matrix), &config);
             });
         });
     }

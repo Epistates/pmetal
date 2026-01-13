@@ -49,7 +49,7 @@ impl DistributedBackend for RingBackend {
             .into());
         }
 
-        if buffer.as_ptr() as usize % std::mem::align_of::<f32>() != 0 {
+        if !(buffer.as_ptr() as usize).is_multiple_of(std::mem::align_of::<f32>()) {
             return Err(DistributedError::Protocol(
                 "Buffer is not properly aligned for f32 operations".to_string(),
             )

@@ -203,7 +203,7 @@ impl Fp8TrainingKernel {
         k: usize,
     ) -> Result<Fp8QuantOutput> {
         let block_size = self.config.block_size;
-        let n_blocks = (k + block_size - 1) / block_size;
+        let n_blocks = k.div_ceil(block_size);
 
         let output_data = MetalBuffer::<u8>::new(&self.ctx, m * k, BufferUsage::Shared)?;
         let output_scales = MetalBuffer::<f32>::new(&self.ctx, m * n_blocks, BufferUsage::Shared)?;
@@ -303,26 +303,13 @@ impl Fp8TrainingKernel {
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
         }
 
-        let grid_size = MTLSize {
-            width: k,
-            height: m,
-            depth: 1,
-        };
-
-        // Simple 1D dispatch
-        let threadgroup_size = MTLSize {
-            width: 32,
-            height: 1,
-            depth: 1,
-        };
-
         // Use dispatchThreads if available (Metal 2) or standard grid
         // Here we use standard grid for compatibility, though inefficient for this kernel
         // Optimized would be 2D blocking
         let tg_width = 32;
         let tg_height = 8;
-        let grid_width = (k + tg_width - 1) / tg_width;
-        let grid_height = (m + tg_height - 1) / tg_height;
+        let grid_width = k.div_ceil(tg_width);
+        let grid_height = m.div_ceil(tg_height);
 
         let grid_size_dispatch = MTLSize {
             width: grid_width,
@@ -408,8 +395,8 @@ impl Fp8TrainingKernel {
         let block_m = 64;
         let block_n = 64;
 
-        let grid_width = (n + block_n - 1) / block_n;
-        let grid_height = (m + block_m - 1) / block_m;
+        let grid_width = n.div_ceil(block_n);
+        let grid_height = m.div_ceil(block_m);
 
         let grid_size = MTLSize {
             width: grid_width,
@@ -438,7 +425,7 @@ impl Fp8TrainingKernel {
         m: usize,
         k: usize,
     ) -> Result<(MetalBuffer<u8>, MetalBuffer<f32>)> {
-        let n_blocks = (k + self.config.block_size - 1) / self.config.block_size;
+        let n_blocks = k.div_ceil(self.config.block_size);
 
         let data_buf = MetalBuffer::<u8>::new(&self.ctx, m * k, BufferUsage::Shared)?;
         let scales_buf = MetalBuffer::<f32>::new(&self.ctx, m * n_blocks, BufferUsage::Shared)?;

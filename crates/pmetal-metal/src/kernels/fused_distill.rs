@@ -15,7 +15,6 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use half::f16;
 use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
 
 use crate::{

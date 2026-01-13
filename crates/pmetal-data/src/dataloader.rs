@@ -109,7 +109,7 @@ impl DataLoader {
         if self.config.drop_last {
             n / self.config.batch_size
         } else {
-            (n + self.config.batch_size - 1) / self.config.batch_size
+            n.div_ceil(self.config.batch_size)
         }
     }
 
@@ -220,21 +220,21 @@ impl DataLoader {
             // Input IDs
             input_ids_flat.extend(sample.input_ids.iter().take(seq_len).map(|&x| x as i32));
             input_ids_flat
-                .extend(std::iter::repeat(self.config.pad_token_id as i32).take(max_len - seq_len));
+                .extend(std::iter::repeat_n(self.config.pad_token_id as i32, max_len - seq_len));
 
             // Labels
             if let Some(ref labels) = sample.labels {
                 labels_flat.extend(labels.iter().take(seq_len).copied());
-                labels_flat.extend(std::iter::repeat(-100_i64).take(max_len - seq_len));
+                labels_flat.extend(std::iter::repeat_n(-100_i64, max_len - seq_len));
             } else {
                 // No labels - use input_ids shifted (causal LM)
                 labels_flat.extend(sample.input_ids.iter().take(seq_len).map(|&x| x as i64));
-                labels_flat.extend(std::iter::repeat(-100_i64).take(max_len - seq_len));
+                labels_flat.extend(std::iter::repeat_n(-100_i64, max_len - seq_len));
             }
 
             // Attention mask
-            attention_mask_flat.extend(std::iter::repeat(1_i32).take(seq_len));
-            attention_mask_flat.extend(std::iter::repeat(0_i32).take(max_len - seq_len));
+            attention_mask_flat.extend(std::iter::repeat_n(1_i32, seq_len));
+            attention_mask_flat.extend(std::iter::repeat_n(0_i32, max_len - seq_len));
         }
 
         // Convert to mlx Arrays

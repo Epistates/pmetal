@@ -14,10 +14,7 @@ fn random_logits(batch: usize, seq: usize, vocab: usize) -> Array {
     let size = batch * seq * vocab;
     // Use deterministic values for reproducibility
     let data: Vec<f32> = (0..size)
-        .map(|i| {
-            let x = (i as f32 * 0.1234567) % 10.0 - 5.0;
-            x
-        })
+        .map(|i| (i as f32 * 0.1234567) % 10.0 - 5.0)
         .collect();
     Array::from_slice(&data, &[batch as i32, seq as i32, vocab as i32])
 }
@@ -26,10 +23,7 @@ fn random_logits(batch: usize, seq: usize, vocab: usize) -> Array {
 fn random_hidden(batch: usize, seq: usize, hidden: usize) -> Array {
     let size = batch * seq * hidden;
     let data: Vec<f32> = (0..size)
-        .map(|i| {
-            let x = (i as f32 * 0.7654321) % 2.0 - 1.0;
-            x
-        })
+        .map(|i| (i as f32 * 0.7654321) % 2.0 - 1.0)
         .collect();
     Array::from_slice(&data, &[batch as i32, seq as i32, hidden as i32])
 }
@@ -336,10 +330,11 @@ fn bench_comparison_all_losses(c: &mut Criterion) {
     group.finish();
 }
 
+#[allow(dead_code)]
 fn gpu_status() {
     println!("\n=== GPU Distillation Loss Benchmarks ===");
     println!("GPU available: {}", is_gpu_available());
-    println!("");
+    println!();
 }
 
 criterion_group!(

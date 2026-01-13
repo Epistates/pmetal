@@ -146,8 +146,8 @@ impl QLoraLinear {
     /// Create a QLoRA layer by quantizing an existing weight matrix.
     ///
     /// # Arguments
-    /// * `weight` - Full-precision weight matrix [out_features, in_features]
-    ///              Supports Float32, Float16, and BFloat16 input (will be cast to Float32)
+    /// * `weight` - Full-precision weight matrix [out_features, in_features].
+    ///   Supports Float32, Float16, and BFloat16 input (will be cast to Float32)
     /// * `bias` - Optional bias vector [out_features]
     /// * `config` - QLoRA configuration
     pub fn from_weight(
@@ -418,7 +418,7 @@ impl QLoraLinear {
 
     /// Get the quantization scheme used.
     pub fn quant_scheme(&self) -> QuantScheme {
-        self.quantized_weight.scheme.clone()
+        self.quantized_weight.scheme
     }
 }
 

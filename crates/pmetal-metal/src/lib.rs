@@ -1,3 +1,6 @@
+// Metal GPU code inherently requires unsafe for buffer access, FFI, and thread safety.
+#![allow(unsafe_code)]
+
 //! Metal GPU compute kernels for PMetal.
 //!
 //! This crate provides high-performance Metal compute kernels optimized for

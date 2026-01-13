@@ -156,21 +156,27 @@ impl MhcConfig {
 /// Configuration errors for mHC.
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum MhcConfigError {
+    /// Expansion rate must be greater than 0.
     #[error("Invalid expansion rate: {0} (must be > 0)")]
     InvalidExpansionRate(usize),
 
+    /// Expansion rate exceeds maximum allowed value.
     #[error("Expansion rate too large: {0} (max 16)")]
     ExpansionRateTooLarge(usize),
 
+    /// Sinkhorn iterations must be greater than 0.
     #[error("Invalid Sinkhorn iterations: {0} (must be > 0)")]
     InvalidSinkhornIterations(usize),
 
+    /// Hidden dimension must be greater than 0.
     #[error("Invalid hidden dimension: {0} (must be > 0)")]
     InvalidHiddenDim(usize),
 
+    /// Alpha init must be in the range (0, 1).
     #[error("Invalid alpha init: {0} (must be in (0, 1))")]
     InvalidAlphaInit(f32),
 
+    /// Epsilon must be greater than 0.
     #[error("Invalid epsilon: {0} (must be > 0)")]
     InvalidEpsilon(f32),
 }
@@ -228,10 +234,11 @@ mod tests {
         let config = MhcConfig::default();
         // For n=4, L=30: sqrt(4*30/6) = sqrt(20) ≈ 4.47 → 5
         let block_size = config.optimal_recompute_block_size(30);
-        assert!(block_size >= 4 && block_size <= 6);
+        assert!((4..=6).contains(&block_size));
     }
 
     #[test]
+    #[allow(clippy::field_reassign_with_default)]
     fn test_validation_errors() {
         let mut config = MhcConfig::default();
 

@@ -299,8 +299,8 @@ mod tests {
         // Create logits where tokens 0-9 have high values, rest are very low
         // This tests that top-K correctly identifies the top candidates
         let mut logits_vec = vec![-100.0f32; 1000];
-        for i in 0..10 {
-            logits_vec[i] = 10.0 - (i as f32); // Token 0 = 10.0, Token 1 = 9.0, etc.
+        for (i, val) in logits_vec.iter_mut().take(10).enumerate() {
+            *val = 10.0 - (i as f32); // Token 0 = 10.0, Token 1 = 9.0, etc.
         }
         let logits = Array::from_slice(&logits_vec, &[1000]);
         logits.eval().unwrap();

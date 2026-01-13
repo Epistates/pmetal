@@ -29,9 +29,7 @@
 //!
 //! This maximizes GPU utilization by processing all experts in parallel.
 
-use mlx_rs::{
-    builder::Builder, error::Exception, nn::Linear, ops::indexing::TryIndexOp, Array, Dtype,
-};
+use mlx_rs::{error::Exception, ops::indexing::TryIndexOp, Array};
 
 /// Configuration for Grouped GEMM MoE.
 #[derive(Debug, Clone)]
@@ -365,7 +363,7 @@ impl GroupedGemmMoE {
         };
 
         // Reshape back to original shape
-        let output = output.reshape(&shape)?;
+        let output = output.reshape(shape)?;
 
         // Step 5: Compute auxiliary loss
         let aux_loss = if self.config.use_aux_loss {
@@ -457,7 +455,7 @@ impl GroupedGemmMoE {
         x: &Array,
         expert_indices: &Array,
     ) -> Result<Array, Exception> {
-        let n_tokens = x.dim(0);
+        let _n_tokens = x.dim(0);
 
         // Gather w1 for each token's expert: [n_tokens, hidden, intermediate]
         let w1_gathered = self.experts.w1.take_axis(expert_indices, 0)?;
@@ -466,7 +464,7 @@ impl GroupedGemmMoE {
         // For each token: x[b] @ w1_gathered[b]
         let gate = self.batched_matmul(x, &w1_gathered)?;
 
-        let hidden = if let Some(ref w3) = self.experts.w3 {
+        let hidden = if let Some(ref _w3) = self.experts.w3 {
             // SwiGLU path
             // Gather w3 for each token's expert
             let w3_gathered = self

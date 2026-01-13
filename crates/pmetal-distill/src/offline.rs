@@ -420,7 +420,7 @@ impl LogitCompressor {
         let zero_point = min;
 
         // Quantize to 4-bit and pack into bytes
-        let mut packed = Vec::with_capacity((data.len() + 1) / 2);
+        let mut packed = Vec::with_capacity(data.len().div_ceil(2));
 
         for chunk in data.chunks(2) {
             let q0 = ((chunk[0] - zero_point) / scale).round() as u8;

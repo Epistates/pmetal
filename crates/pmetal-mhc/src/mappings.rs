@@ -21,7 +21,7 @@
 
 use crate::config::MhcConfig;
 use crate::params::{MhcGradients, MhcMappings, MhcParams};
-use crate::sinkhorn::{sinkhorn_knopp, sinkhorn_knopp_backward, SinkhornConfig};
+use crate::sinkhorn::{sinkhorn_knopp_backward, SinkhornConfig};
 use ndarray::{Array1, Array2, Array3, Axis};
 
 /// Compute mHC mappings from input and parameters.
@@ -472,7 +472,7 @@ mod tests {
         let mappings = compute_mappings(&x, &params, &config);
 
         // H^pre should be non-negative (sigmoid output)
-        assert!(mappings.h_pre.iter().all(|&v| v >= 0.0 && v <= 1.0));
+        assert!(mappings.h_pre.iter().all(|&v| (0.0..=1.0).contains(&v)));
     }
 
     #[test]
@@ -484,7 +484,7 @@ mod tests {
         let mappings = compute_mappings(&x, &params, &config);
 
         // H^post should be in [0, 2] (2*sigmoid output)
-        assert!(mappings.h_post.iter().all(|&v| v >= 0.0 && v <= 2.0));
+        assert!(mappings.h_post.iter().all(|&v| (0.0..=2.0).contains(&v)));
     }
 
     #[test]
@@ -512,8 +512,8 @@ mod tests {
         let n = 4;
         let c = 8;
 
-        let x = Array3::from_shape_fn((batch, n, c), |(b, i, j)| ((b + i + j) as f32));
-        let h_pre = Array2::from_shape_fn((batch, n), |(_, i)| 0.25); // Uniform
+        let x = Array3::from_shape_fn((batch, n, c), |(b, i, j)| (b + i + j) as f32);
+        let h_pre = Array2::from_shape_fn((batch, n), |(_, _i)| 0.25); // Uniform
 
         let h_in = apply_pre_mapping(&x, &h_pre);
 
@@ -536,7 +536,7 @@ mod tests {
 
         let x = Array3::from_shape_fn((batch, n, c), |(b, i, j)| ((b + i + j) as f32) * 0.1);
         let h_out = Array2::from_shape_fn((batch, c), |(b, j)| ((b + j) as f32) * 0.1);
-        let h_post = Array2::from_shape_fn((batch, n), |(_, i)| 0.5);
+        let h_post = Array2::from_shape_fn((batch, n), |(_, _i)| 0.5);
 
         // Identity-like H^res
         let mut h_res = Array3::zeros((batch, n, n));

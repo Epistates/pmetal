@@ -13,7 +13,7 @@ use std::time::Duration;
 use tracing::debug;
 
 /// All-reduce algorithm strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum AllReduceStrategy {
     /// Ring all-reduce: O(n) latency, O(1) bandwidth per node.
     /// Best for large tensors on high-bandwidth networks.
@@ -25,47 +25,32 @@ pub enum AllReduceStrategy {
     /// Simple, works for small collectives.
     Centralized,
     /// Automatic selection based on tensor size and cluster topology.
+    #[default]
     Auto,
 }
 
-impl Default for AllReduceStrategy {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
 /// Reduce algorithm strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum ReduceStrategy {
     /// Tree reduce with configurable arity.
     Tree { arity: usize },
     /// Direct reduce to root.
     Direct,
     /// Automatic selection.
+    #[default]
     Auto,
 }
 
-impl Default for ReduceStrategy {
-    fn default() -> Self {
-        Self::Auto
-    }
-}
-
 /// Broadcast algorithm strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum BroadcastStrategy {
     /// Tree broadcast with configurable arity.
     Tree { arity: usize },
     /// Direct broadcast from root.
     Direct,
     /// Automatic selection.
+    #[default]
     Auto,
-}
-
-impl Default for BroadcastStrategy {
-    fn default() -> Self {
-        Self::Auto
-    }
 }
 
 /// Configuration for collective operations.
@@ -375,9 +360,10 @@ pub mod centralized {
     /// Simple but not bandwidth-optimal:
     /// - Root receives from all, reduces, broadcasts to all
     /// - O(n) messages, O(n) bandwidth on root
+    #[allow(clippy::too_many_arguments)]
     pub async fn all_reduce<S, R>(
         buffer: &mut [f32],
-        rank: usize,
+        _rank: usize,
         world_size: usize,
         is_root: bool,
         send_to_root: &S,

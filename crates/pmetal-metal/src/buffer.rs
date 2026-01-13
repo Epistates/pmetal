@@ -134,7 +134,7 @@ impl<T: Pod + Zeroable> MetalBuffer<T> {
             ));
         }
 
-        let size = data.len() * mem::size_of::<T>();
+        let size = std::mem::size_of_val(data);
         let options = usage.to_metal_options();
 
         // Create buffer with data
@@ -280,6 +280,7 @@ impl<T: Pod + Zeroable> MetalBuffer<T> {
     /// - The GPU is not concurrently accessing this data (data races)
     /// - The buffer has been properly initialized
     #[inline]
+    #[allow(clippy::mut_from_ref)] // Metal buffers have interior mutability via unified memory
     fn as_mut_slice_unchecked(&self) -> &mut [T] {
         // SAFETY:
         // 1. buffer.contents() returns a NonNull pointer to the buffer's memory

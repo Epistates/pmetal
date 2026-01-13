@@ -443,10 +443,8 @@ impl FusedLora {
 
         // Calculate grid size using tuned parameters
         let grid_size = MTLSize {
-            width: (self.config.batch_size + tuned_config.tile_m as usize - 1)
-                / tuned_config.tile_m as usize,
-            height: (self.config.out_features + tuned_config.tile_n as usize - 1)
-                / tuned_config.tile_n as usize,
+            width: self.config.batch_size.div_ceil(tuned_config.tile_m as usize),
+            height: self.config.out_features.div_ceil(tuned_config.tile_n as usize),
             depth: 1,
         };
 
@@ -509,7 +507,7 @@ impl FusedLora {
 
         let grid_size = MTLSize {
             width: self.config.batch_size,
-            height: (self.config.out_features + 31) / 32,
+            height: self.config.out_features.div_ceil(32),
             depth: 1,
         };
 
@@ -577,8 +575,8 @@ impl FusedLora {
             const TILE_K: usize = 32;
 
             let grid_size = MTLSize {
-                width: (self.config.out_features + TILE_N - 1) / TILE_N,
-                height: (self.config.rank + TILE_K - 1) / TILE_K,
+                width: self.config.out_features.div_ceil(TILE_N),
+                height: self.config.rank.div_ceil(TILE_K),
                 depth: 1,
             };
 
@@ -632,8 +630,8 @@ impl FusedLora {
             const TILE_M: usize = 32;
 
             let grid_size = MTLSize {
-                width: (self.config.in_features + TILE_K - 1) / TILE_K,
-                height: (self.config.rank + TILE_M - 1) / TILE_M,
+                width: self.config.in_features.div_ceil(TILE_K),
+                height: self.config.rank.div_ceil(TILE_M),
                 depth: 1,
             };
 
@@ -698,8 +696,8 @@ impl FusedLora {
         const TILE_K: usize = 32;
 
         let grid_size = MTLSize {
-            width: (self.config.batch_size + TILE_M - 1) / TILE_M,
-            height: (self.config.in_features + TILE_K - 1) / TILE_K,
+            width: self.config.batch_size.div_ceil(TILE_M),
+            height: self.config.in_features.div_ceil(TILE_K),
             depth: 1,
         };
 

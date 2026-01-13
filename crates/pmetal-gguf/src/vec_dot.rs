@@ -28,6 +28,7 @@ use crate::k_quants::{BlockQ2K, BlockQ3K, BlockQ4K, BlockQ5K, BlockQ6K, BlockQ8K
 // =============================================================================
 
 #[cfg(all(target_arch = "aarch64", target_feature = "neon"))]
+#[allow(unsafe_code)]
 mod neon {
     use super::*;
     use std::arch::aarch64::*;
@@ -100,7 +101,7 @@ mod neon {
                 for j in 0..8 {
                     // Extract scales from packed format
                     let sc_idx = j;
-                    let (sc, m) = crate::quantize::get_scale_min_k4(sc_idx, &x.scales);
+                    let (_sc, m) = crate::quantize::get_scale_min_k4(sc_idx, &x.scales);
                     // Sum of 32 q8 values for this sub-block
                     let bsum = y.bsums[j * 2] as i32 + y.bsums[j * 2 + 1] as i32;
                     mins_sum += m as i32 * bsum;
@@ -129,8 +130,8 @@ mod neon {
                     let q4l_1 = vreinterpretq_s8_u8(vandq_u8(q4_1, m4b));
 
                     // Load 32 bytes of 8-bit activations (for lower nibbles)
-                    let q8l_0 = vld1q_s8(q8.add(offset_q8) as *const i8);
-                    let q8l_1 = vld1q_s8(q8.add(offset_q8 + 16) as *const i8);
+                    let q8l_0 = vld1q_s8(q8.add(offset_q8));
+                    let q8l_1 = vld1q_s8(q8.add(offset_q8 + 16));
 
                     // Dot product for lower nibbles
                     let p0 = vdotq_s32(q4l_0, q8l_0);
@@ -143,8 +144,8 @@ mod neon {
                     let q4h_1 = vreinterpretq_s8_u8(vshrq_n_u8(q4_1, 4));
 
                     // Load 32 bytes of 8-bit activations (for upper nibbles)
-                    let q8h_0 = vld1q_s8(q8.add(offset_q8 + 32) as *const i8);
-                    let q8h_1 = vld1q_s8(q8.add(offset_q8 + 48) as *const i8);
+                    let q8h_0 = vld1q_s8(q8.add(offset_q8 + 32));
+                    let q8h_1 = vld1q_s8(q8.add(offset_q8 + 48));
 
                     // Dot product for upper nibbles
                     let p2 = vdotq_s32(q4h_0, q8h_0);
@@ -219,8 +220,8 @@ mod neon {
                     let q6_0h = vaddq_s8(vreinterpretq_s8_u8(q6_0h), m32s);
 
                     // Load q8
-                    let q8_0 = vld1q_s8(q8.add(offset_q8) as *const i8);
-                    let q8_1 = vld1q_s8(q8.add(offset_q8 + 16) as *const i8);
+                    let q8_0 = vld1q_s8(q8.add(offset_q8));
+                    let q8_1 = vld1q_s8(q8.add(offset_q8 + 16));
 
                     // Dot product
                     let p0 = vaddvq_s32(vdotq_s32(q6_0l, q8_0));
@@ -239,8 +240,8 @@ mod neon {
                     let q6_1l = vaddq_s8(vreinterpretq_s8_u8(q6_1l), m32s);
                     let q6_1h = vaddq_s8(vreinterpretq_s8_u8(q6_1h), m32s);
 
-                    let q8_2 = vld1q_s8(q8.add(offset_q8 + 32) as *const i8);
-                    let q8_3 = vld1q_s8(q8.add(offset_q8 + 48) as *const i8);
+                    let q8_2 = vld1q_s8(q8.add(offset_q8 + 32));
+                    let q8_3 = vld1q_s8(q8.add(offset_q8 + 48));
                     let p2 = vaddvq_s32(vdotq_s32(q6_1l, q8_2));
                     let p3 = vaddvq_s32(vdotq_s32(q6_1h, q8_3));
                     sumi += p2 * scale2 + p3 * scale3;
@@ -254,8 +255,8 @@ mod neon {
                     let q6_2l = vaddq_s8(vreinterpretq_s8_u8(q6_2l), m32s);
                     let q6_2h = vaddq_s8(vreinterpretq_s8_u8(q6_2h), m32s);
 
-                    let q8_4 = vld1q_s8(q8.add(offset_q8 + 64) as *const i8);
-                    let q8_5 = vld1q_s8(q8.add(offset_q8 + 80) as *const i8);
+                    let q8_4 = vld1q_s8(q8.add(offset_q8 + 64));
+                    let q8_5 = vld1q_s8(q8.add(offset_q8 + 80));
                     let p4 = vaddvq_s32(vdotq_s32(q6_2l, q8_4));
                     let p5 = vaddvq_s32(vdotq_s32(q6_2h, q8_5));
                     sumi += p4 * scale4 + p5 * scale5;
@@ -271,8 +272,8 @@ mod neon {
                     let q6_3l = vaddq_s8(vreinterpretq_s8_u8(q6_3l), m32s);
                     let q6_3h = vaddq_s8(vreinterpretq_s8_u8(q6_3h), m32s);
 
-                    let q8_6 = vld1q_s8(q8.add(offset_q8 + 96) as *const i8);
-                    let q8_7 = vld1q_s8(q8.add(offset_q8 + 112) as *const i8);
+                    let q8_6 = vld1q_s8(q8.add(offset_q8 + 96));
+                    let q8_7 = vld1q_s8(q8.add(offset_q8 + 112));
                     let p6 = vaddvq_s32(vdotq_s32(q6_3l, q8_6));
                     let p7 = vaddvq_s32(vdotq_s32(q6_3h, q8_7));
                     sumi += p6 * scale6 + p7 * scale7;
@@ -348,8 +349,8 @@ mod neon {
                     let q5_0h = vaddq_u8(vshrq_n_u8(q5l_0, 4), hbit1);
 
                     // Load q8
-                    let q8_0 = vld1q_s8(q8.add(offset_q8) as *const i8);
-                    let q8_1 = vld1q_s8(q8.add(offset_q8 + 16) as *const i8);
+                    let q8_0 = vld1q_s8(q8.add(offset_q8));
+                    let q8_1 = vld1q_s8(q8.add(offset_q8 + 16));
 
                     let p0 = vdotq_s32(vreinterpretq_s8_u8(q5_0l), q8_0);
                     let p1 = vdotq_s32(vreinterpretq_s8_u8(q5_0h), q8_1);
@@ -370,8 +371,8 @@ mod neon {
                     let q5_1l = vaddq_u8(vandq_u8(q5l_1, m4b), hbit2);
                     let q5_1h = vaddq_u8(vshrq_n_u8(q5l_1, 4), hbit3);
 
-                    let q8_2 = vld1q_s8(q8.add(offset_q8 + 32) as *const i8);
-                    let q8_3 = vld1q_s8(q8.add(offset_q8 + 48) as *const i8);
+                    let q8_2 = vld1q_s8(q8.add(offset_q8 + 32));
+                    let q8_3 = vld1q_s8(q8.add(offset_q8 + 48));
 
                     let p2 = vdotq_s32(vreinterpretq_s8_u8(q5_1l), q8_2);
                     let p3 = vdotq_s32(vreinterpretq_s8_u8(q5_1h), q8_3);
@@ -420,9 +421,11 @@ mod neon {
                     | ((x.scales[10] as i32) << 16)
                     | ((x.scales[11] as i32) << 24);
 
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..8 {
                     scales[i] = ((aux0 >> (4 * i)) & 0xF) as i8 - 8;
                 }
+                #[allow(clippy::needless_range_loop)]
                 for i in 0..8 {
                     scales[i + 8] = ((aux2 >> (4 * i)) & 0xF) as i8 - 8;
                 }
@@ -462,22 +465,22 @@ mod neon {
                     let q3_0 = vaddq_s8(vreinterpretq_s8_u8(q3_0), m4);
 
                     // Load q8
-                    let q8_0 = vld1q_s8(q8.add(offset_q8) as *const i8);
+                    let q8_0 = vld1q_s8(q8.add(offset_q8));
 
                     let scale = scales[j * 8] as i32;
                     sumi += vaddvq_s32(vdotq_s32(q3_0, q8_0)) * scale;
 
                     // Similar for remaining elements (simplified)
                     let q3_1 = vaddq_s8(vreinterpretq_s8_u8(q3_1), m4);
-                    let q8_1 = vld1q_s8(q8.add(offset_q8 + 16) as *const i8);
+                    let q8_1 = vld1q_s8(q8.add(offset_q8 + 16));
                     sumi += vaddvq_s32(vdotq_s32(q3_1, q8_1)) * scales[j * 8 + 1] as i32;
 
                     let q3_2 = vaddq_s8(vreinterpretq_s8_u8(q3_2), m4);
-                    let q8_2 = vld1q_s8(q8.add(offset_q8 + 32) as *const i8);
+                    let q8_2 = vld1q_s8(q8.add(offset_q8 + 32));
                     sumi += vaddvq_s32(vdotq_s32(q3_2, q8_2)) * scales[j * 8 + 2] as i32;
 
                     let q3_3 = vaddq_s8(vreinterpretq_s8_u8(q3_3), m4);
-                    let q8_3 = vld1q_s8(q8.add(offset_q8 + 48) as *const i8);
+                    let q8_3 = vld1q_s8(q8.add(offset_q8 + 48));
                     sumi += vaddvq_s32(vdotq_s32(q3_3, q8_3)) * scales[j * 8 + 3] as i32;
 
                     // Second 16 bytes
@@ -491,10 +494,10 @@ mod neon {
                     let q3_6 = vaddq_s8(vreinterpretq_s8_u8(q3_6), m4);
                     let q3_7 = vaddq_s8(vreinterpretq_s8_u8(q3_7), m4);
 
-                    let q8_4 = vld1q_s8(q8.add(offset_q8 + 64) as *const i8);
-                    let q8_5 = vld1q_s8(q8.add(offset_q8 + 80) as *const i8);
-                    let q8_6 = vld1q_s8(q8.add(offset_q8 + 96) as *const i8);
-                    let q8_7 = vld1q_s8(q8.add(offset_q8 + 112) as *const i8);
+                    let q8_4 = vld1q_s8(q8.add(offset_q8 + 64));
+                    let q8_5 = vld1q_s8(q8.add(offset_q8 + 80));
+                    let q8_6 = vld1q_s8(q8.add(offset_q8 + 96));
+                    let q8_7 = vld1q_s8(q8.add(offset_q8 + 112));
 
                     sumi += vaddvq_s32(vdotq_s32(q3_4, q8_4)) * scales[j * 8 + 4] as i32;
                     sumi += vaddvq_s32(vdotq_s32(q3_5, q8_5)) * scales[j * 8 + 5] as i32;
@@ -561,7 +564,7 @@ mod neon {
                     // Get scales for each 16-element group
                     for k in 0..8 {
                         let scale = (x.scales[j * 8 + k] & 0x0F) as i32;
-                        let q8_k = vld1q_s8(q8.add(offset_q8 + k * 16) as *const i8);
+                        let q8_k = vld1q_s8(q8.add(offset_q8 + k * 16));
 
                         let q2_k = match k {
                             0 => vreinterpretq_s8_u8(q2_00),
@@ -590,6 +593,7 @@ mod neon {
 // Scalar fallback implementations
 // =============================================================================
 
+#[allow(dead_code)]
 mod scalar {
     use super::*;
 
@@ -743,6 +747,7 @@ mod scalar {
                 | ((x.scales[1] as i32) << 8)
                 | ((x.scales[2] as i32) << 16)
                 | ((x.scales[3] as i32) << 24);
+            #[allow(clippy::needless_range_loop)]
             for i in 0..8 {
                 scales[i] = ((aux0 >> (4 * i)) & 0xF) as i8 - 8;
             }
@@ -918,6 +923,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::needless_range_loop)]
     fn test_vec_dot_q8k_q8k_alternating() {
         // Alternating signs should sum to 0
         let mut vals = [0i8; QK_K];

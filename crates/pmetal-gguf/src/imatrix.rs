@@ -71,8 +71,8 @@ impl IMatrix {
     /// - File is corrupted or has invalid format
     /// - Values exceed safety limits (DoS protection)
     pub fn load(path: &std::path::Path) -> Result<Self> {
-        let file = std::fs::File::open(path).map_err(|e| PMetalError::Io(e))?;
-        let file_size = file.metadata().map_err(|e| PMetalError::Io(e))?.len();
+        let file = std::fs::File::open(path).map_err(PMetalError::Io)?;
+        let file_size = file.metadata().map_err(PMetalError::Io)?.len();
         let mut reader = BufReader::new(file);
 
         Self::load_from_reader(&mut reader, file_size)
@@ -86,10 +86,10 @@ impl IMatrix {
         // Read number of entries (header)
         let n_entries = reader
             .read_i32::<LittleEndian>()
-            .map_err(|e| PMetalError::Io(e))?;
+            .map_err(PMetalError::Io)?;
 
         // Validate entry count
-        if n_entries < 0 || n_entries > MAX_ENTRIES {
+        if !(0..=MAX_ENTRIES).contains(&n_entries) {
             return Err(PMetalError::InvalidArgument(format!(
                 "Invalid imatrix entry count: {} (max: {})",
                 n_entries, MAX_ENTRIES
@@ -101,7 +101,7 @@ impl IMatrix {
             // Read name length
             let name_len = reader
                 .read_i32::<LittleEndian>()
-                .map_err(|e| PMetalError::Io(e))?;
+                .map_err(PMetalError::Io)?;
 
             // Validate name length
             if name_len <= 0 || name_len > MAX_NAME_LENGTH {
@@ -115,7 +115,7 @@ impl IMatrix {
             let mut name_bytes = vec![0u8; name_len as usize];
             reader
                 .read_exact(&mut name_bytes)
-                .map_err(|e| PMetalError::Io(e))?;
+                .map_err(PMetalError::Io)?;
             let name = String::from_utf8(name_bytes).map_err(|e| {
                 PMetalError::Serialization(format!(
                     "Invalid UTF-8 in tensor name at entry {}: {}",
@@ -126,15 +126,15 @@ impl IMatrix {
             // Read ncall (number of calibration chunks processed)
             let ncall = reader
                 .read_i32::<LittleEndian>()
-                .map_err(|e| PMetalError::Io(e))?;
+                .map_err(PMetalError::Io)?;
 
             // Read nval (number of values)
             let nval = reader
                 .read_i32::<LittleEndian>()
-                .map_err(|e| PMetalError::Io(e))?;
+                .map_err(PMetalError::Io)?;
 
             // Validate value count
-            if nval < 0 || nval > MAX_VALUES_COUNT {
+            if !(0..=MAX_VALUES_COUNT).contains(&nval) {
                 return Err(PMetalError::InvalidArgument(format!(
                     "Invalid value count for tensor '{}': {} (max: {})",
                     name, nval, MAX_VALUES_COUNT
@@ -143,7 +143,7 @@ impl IMatrix {
 
             // Check we have enough bytes remaining (early bounds check)
             let values_size = (nval as u64) * 4; // f32 = 4 bytes
-            let current_pos = reader.stream_position().map_err(|e| PMetalError::Io(e))?;
+            let current_pos = reader.stream_position().map_err(PMetalError::Io)?;
             if current_pos + values_size > file_size {
                 return Err(PMetalError::InvalidArgument(format!(
                     "Truncated file: tensor '{}' expects {} bytes but only {} remain",
@@ -157,7 +157,7 @@ impl IMatrix {
             let mut values = vec![0.0f32; nval as usize];
             reader
                 .read_f32_into::<LittleEndian>(&mut values)
-                .map_err(|e| PMetalError::Io(e))?;
+                .map_err(PMetalError::Io)?;
 
             data.insert(name.clone(), values);
             ncalls.insert(name, ncall);
@@ -190,7 +190,7 @@ impl IMatrix {
 
     /// Save IMatrix to a file (llama.cpp legacy .dat format).
     pub fn save(&self, path: &std::path::Path) -> Result<()> {
-        let file = std::fs::File::create(path).map_err(|e| PMetalError::Io(e))?;
+        let file = std::fs::File::create(path).map_err(PMetalError::Io)?;
         let mut writer = BufWriter::new(file);
 
         self.save_to_writer(&mut writer)
@@ -201,7 +201,7 @@ impl IMatrix {
         // Write number of entries
         writer
             .write_i32::<LittleEndian>(self.data.len() as i32)
-            .map_err(|e| PMetalError::Io(e))?;
+            .map_err(PMetalError::Io)?;
 
         // Write each entry
         for (name, values) in &self.data {
@@ -210,29 +210,29 @@ impl IMatrix {
             // Write name length
             writer
                 .write_i32::<LittleEndian>(name_bytes.len() as i32)
-                .map_err(|e| PMetalError::Io(e))?;
+                .map_err(PMetalError::Io)?;
 
             // Write name
             writer
                 .write_all(name_bytes)
-                .map_err(|e| PMetalError::Io(e))?;
+                .map_err(PMetalError::Io)?;
 
             // Write ncall
             let ncall = self.ncalls.get(name).copied().unwrap_or(1);
             writer
                 .write_i32::<LittleEndian>(ncall)
-                .map_err(|e| PMetalError::Io(e))?;
+                .map_err(PMetalError::Io)?;
 
             // Write nval
             writer
                 .write_i32::<LittleEndian>(values.len() as i32)
-                .map_err(|e| PMetalError::Io(e))?;
+                .map_err(PMetalError::Io)?;
 
             // Write values
             for &v in values {
                 writer
                     .write_f32::<LittleEndian>(v)
-                    .map_err(|e| PMetalError::Io(e))?;
+                    .map_err(PMetalError::Io)?;
             }
         }
 
@@ -240,18 +240,18 @@ impl IMatrix {
         let last_chunk = self.last_chunk.unwrap_or(0);
         writer
             .write_i32::<LittleEndian>(last_chunk)
-            .map_err(|e| PMetalError::Io(e))?;
+            .map_err(PMetalError::Io)?;
 
         let dataset = self.dataset_name.as_deref().unwrap_or("");
         let dataset_bytes = dataset.as_bytes();
         writer
             .write_i32::<LittleEndian>(dataset_bytes.len() as i32)
-            .map_err(|e| PMetalError::Io(e))?;
+            .map_err(PMetalError::Io)?;
         writer
             .write_all(dataset_bytes)
-            .map_err(|e| PMetalError::Io(e))?;
+            .map_err(PMetalError::Io)?;
 
-        writer.flush().map_err(|e| PMetalError::Io(e))?;
+        writer.flush().map_err(PMetalError::Io)?;
         Ok(())
     }
 

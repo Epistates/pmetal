@@ -61,6 +61,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::const_is_empty)]
     fn test_kernel_names_defined() {
         // Just verify the constants are valid strings
         assert!(!kernel_names::COMPUTE_MAPPINGS.is_empty());

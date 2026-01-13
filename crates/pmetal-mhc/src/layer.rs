@@ -160,6 +160,7 @@ impl MhcLayer {
     ///
     /// * Gradient w.r.t. input x. Shape: [batch, n, C]
     /// * Gradient w.r.t. h_in (for layer backward). Shape: [batch, C]
+    #[allow(clippy::assign_op_pattern)]
     pub fn backward(
         &self,
         x: &Array3<f32>,
@@ -538,7 +539,7 @@ mod tests {
 
     #[test]
     fn test_expand_collapse() {
-        let x = Array2::from_shape_fn((4, 8), |(b, j)| ((b + j) as f32));
+        let x = Array2::from_shape_fn((4, 8), |(b, j)| (b + j) as f32);
 
         let expanded = expand_to_streams(&x, 4);
         assert_eq!(expanded.shape(), &[4, 4, 8]);

@@ -79,7 +79,7 @@ impl DareMerge {
 
         // Rescale to maintain expected value
         if rescale && density > 0.0 && density < 1.0 {
-            mask_array = mask_array.divide(&Array::from_f32(density))?;
+            mask_array = mask_array.divide(Array::from_f32(density))?;
         }
 
         Ok(mask_array)
@@ -179,12 +179,12 @@ impl MergeMethod for DareMerge {
         let mut result = Array::zeros::<f32>(task_vectors[0].shape())?;
 
         for (vector, weight) in final_vectors.iter().zip(weights.iter()) {
-            let weighted = vector.multiply(&Array::from_f32(*weight))?;
+            let weighted = vector.multiply(Array::from_f32(*weight))?;
             result = result.add(&weighted)?;
         }
 
         // Scale by lambda
-        result = result.multiply(&Array::from_f32(lambda))?;
+        result = result.multiply(Array::from_f32(lambda))?;
 
         // Add back to base
         Ok(base.add(&result)?)

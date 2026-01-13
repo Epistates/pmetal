@@ -528,7 +528,7 @@ impl FlashAttention {
         }
 
         // Calculate grid and threadgroup sizes
-        let num_q_blocks = (self.config.query_seq_len + self.block_q - 1) / self.block_q;
+        let num_q_blocks = self.config.query_seq_len.div_ceil(self.block_q);
         let grid_size = objc2_metal::MTLSize {
             width: num_q_blocks,
             height: self.config.num_heads,
@@ -558,6 +558,7 @@ impl FlashAttention {
     }
 
     /// Execute the backward dQ kernel.
+    #[allow(clippy::too_many_arguments)]
     fn execute_backward_dq(
         &self,
         queries: &MetalBuffer<f16>,
@@ -608,7 +609,7 @@ impl FlashAttention {
         }
 
         // Calculate grid size (parallelize over query blocks)
-        let num_q_blocks = (self.config.query_seq_len + self.block_q - 1) / self.block_q;
+        let num_q_blocks = self.config.query_seq_len.div_ceil(self.block_q);
         let grid_size = objc2_metal::MTLSize {
             width: num_q_blocks,
             height: self.config.num_heads,
@@ -636,6 +637,7 @@ impl FlashAttention {
     /// Execute the backward dK/dV kernel.
     ///
     /// Note: The `output` buffer is required for exact gradient computation via D_i = rowsum(dO * O)
+    #[allow(clippy::too_many_arguments)]
     fn execute_backward_dkv(
         &self,
         queries: &MetalBuffer<f16>,
@@ -689,7 +691,7 @@ impl FlashAttention {
         }
 
         // Calculate grid size (parallelize over KV blocks)
-        let num_kv_blocks = (self.config.kv_seq_len + self.block_k - 1) / self.block_k;
+        let num_kv_blocks = self.config.kv_seq_len.div_ceil(self.block_k);
         let grid_size = objc2_metal::MTLSize {
             width: num_kv_blocks,
             height: self.config.num_kv_heads,
@@ -742,6 +744,7 @@ impl FlashAttention {
     }
 
     /// Get a configuration key for pipeline caching.
+    #[allow(dead_code)]
     fn config_key(&self) -> String {
         format!(
             "bq{}_bk{}_gqa{}",
@@ -1115,7 +1118,7 @@ impl FlashAttentionVarlen {
     fn compute_total_q_blocks(&self) -> usize {
         // Estimate: assuming average sequence length
         let avg_len = self.config.total_tokens / self.config.num_seqs.max(1);
-        let blocks_per_seq = (avg_len + self.block_q - 1) / self.block_q;
+        let blocks_per_seq = avg_len.div_ceil(self.block_q);
         blocks_per_seq * self.config.num_seqs
     }
 

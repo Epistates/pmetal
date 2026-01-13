@@ -26,18 +26,13 @@ use serde::{Deserialize, Serialize};
 use crate::traits::ModelConfig;
 
 /// Layer type for Granite Hybrid models.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub enum GraniteLayerType {
     /// Standard attention layer.
+    #[default]
     Attention,
     /// Mamba2 state-space layer.
     Mamba2,
-}
-
-impl Default for GraniteLayerType {
-    fn default() -> Self {
-        Self::Attention
-    }
 }
 
 /// Granite model configuration.
@@ -413,9 +408,9 @@ impl GraniteMamba2 {
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let batch = x.shape()[0];
-        let seq_len = x.shape()[1];
-        let hidden = x.shape()[2];
+        let _batch = x.shape()[0];
+        let _seq_len = x.shape()[1];
+        let _hidden = x.shape()[2];
 
         // Project input to 2x hidden for gate and value
         let xz = Module::forward(&mut self.in_proj, x)?;

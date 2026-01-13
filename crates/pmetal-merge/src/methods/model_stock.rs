@@ -65,7 +65,7 @@ impl ModelStockMerge {
         let norm_b = b_flat.square()?.sum(None)?.sqrt()?;
 
         // Cosine similarity = dot / (norm_a * norm_b + eps)
-        let denom = norm_a.multiply(&norm_b)?.add(&Array::from_f32(self.eps))?;
+        let denom = norm_a.multiply(&norm_b)?.add(Array::from_f32(self.eps))?;
         let sim = dot.divide(&denom)?;
 
         sim.eval()?;
@@ -89,7 +89,7 @@ impl ModelStockMerge {
 
         // Estimate center as average of fine-tuned weights
         // µ = (w1 + w2) / 2
-        let mu = w1.add(w2)?.multiply(&Array::from_f32(0.5))?;
+        let mu = w1.add(w2)?.multiply(Array::from_f32(0.5))?;
 
         // Vector from base to center: d = µ - w0
         let d = mu.subtract(base)?;
@@ -99,7 +99,7 @@ impl ModelStockMerge {
         // v2 = tau2 - proj(tau2 onto v1)
 
         let norm_tau1 = self.l2_norm(&tau1)?;
-        let v1 = tau1.divide(&norm_tau1.add(&Array::from_f32(self.eps))?)?;
+        let v1 = tau1.divide(&norm_tau1.add(Array::from_f32(self.eps))?)?;
 
         // Project tau2 onto v1
         let tau2_flat = tau2.flatten(None, None)?;
@@ -108,7 +108,7 @@ impl ModelStockMerge {
         let proj = v1.multiply(&proj_coeff)?;
         let v2_unnorm = tau2.subtract(&proj)?;
         let norm_v2 = self.l2_norm(&v2_unnorm)?;
-        let v2 = v2_unnorm.divide(&norm_v2.add(&Array::from_f32(self.eps))?)?;
+        let v2 = v2_unnorm.divide(&norm_v2.add(Array::from_f32(self.eps))?)?;
 
         // Project d onto the plane spanned by v1 and v2
         // wH = w0 + proj(d onto plane)
@@ -145,7 +145,7 @@ impl ModelStockMerge {
         for tau in task_vectors.iter().skip(1) {
             avg_tau = avg_tau.add(tau)?;
         }
-        avg_tau = avg_tau.multiply(&Array::from_f32(1.0 / n as f32))?;
+        avg_tau = avg_tau.multiply(Array::from_f32(1.0 / n as f32))?;
 
         if !self.use_cosine_weighting {
             // Simple averaging (Task Arithmetic)
@@ -174,9 +174,9 @@ impl ModelStockMerge {
         }
 
         // Weighted average of task vectors
-        let mut weighted_tau = task_vectors[0].multiply(&Array::from_f32(weights[0]))?;
+        let mut weighted_tau = task_vectors[0].multiply(Array::from_f32(weights[0]))?;
         for (tau, &w) in task_vectors.iter().skip(1).zip(weights.iter().skip(1)) {
-            weighted_tau = weighted_tau.add(&tau.multiply(&Array::from_f32(w))?)?;
+            weighted_tau = weighted_tau.add(&tau.multiply(Array::from_f32(w))?)?;
         }
 
         // Result: base + weighted_tau
@@ -286,7 +286,7 @@ mod tests {
         let w1 = Array::from_slice(&[1.5f32, 2.5], &[2]);
 
         let result = merger
-            .merge(&[w1.clone()], Some(&base), &[], &MergeParameters::default())
+            .merge(std::slice::from_ref(&w1), Some(&base), &[], &MergeParameters::default())
             .unwrap();
 
         result.eval().unwrap();

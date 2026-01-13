@@ -69,10 +69,10 @@ impl MergeMethod for LinearMerge {
         };
 
         // Compute weighted sum
-        let mut result = tensors[0].multiply(&Array::from_f32(weights[0]))?;
+        let mut result = tensors[0].multiply(Array::from_f32(weights[0]))?;
 
         for (tensor, weight) in tensors[1..].iter().zip(&weights[1..]) {
-            let weighted = tensor.multiply(&Array::from_f32(*weight))?;
+            let weighted = tensor.multiply(Array::from_f32(*weight))?;
             result = result.add(&weighted)?;
         }
 

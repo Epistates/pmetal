@@ -3,6 +3,8 @@
 //! These tests verify the complete training flow works correctly with our
 //! efficient O(n) backward pass implementation.
 
+#![allow(clippy::expect_fun_call)]
+
 use mlx_rs::random::uniform;
 use mlx_rs::Array;
 use pmetal_mlx::kernels::{

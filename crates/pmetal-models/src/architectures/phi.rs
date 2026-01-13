@@ -391,16 +391,16 @@ impl PhiAttention {
         let k = mlx_rs::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
 
         // Transpose for attention: [batch, n_heads, seq, head_dim]
-        let mut q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let mut k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let mut v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3])?;
+        let k_transposed = k.transpose_axes(&[0, 2, 1, 3])?;
+        let v_transposed = v.transpose_axes(&[0, 2, 1, 3])?;
 
         // Update KV cache
-        if let Some((cache, layer_idx)) = cache {
-            let (nk, nv) = cache.update_and_fetch(layer_idx, &k, &v)?;
-            k = nk;
-            v = nv;
-        }
+        let (k, v) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &k_transposed, &v_transposed)?
+        } else {
+            (k_transposed, v_transposed)
+        };
 
         // Use fused attention
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)

@@ -52,10 +52,11 @@ pub enum Device {
 }
 
 /// Quantization scheme.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Quantization {
     /// No quantization (full precision).
+    #[default]
     None,
     /// 4-bit Normal Float quantization.
     NF4,
@@ -65,12 +66,6 @@ pub enum Quantization {
     Int8,
     /// 8-bit floating point quantization.
     FP8,
-}
-
-impl Default for Quantization {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// Memory statistics.

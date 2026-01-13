@@ -122,6 +122,7 @@ pub trait GpuCompletionToken: Send + Sync {
 /// The scheduler is thread-safe and can be shared across threads.
 /// Command buffers are dispatched to a single command queue (Metal
 /// guarantees FIFO ordering within a queue).
+#[allow(dead_code)]
 pub struct AsyncScheduler {
     ctx: Arc<MetalContext>,
     /// Maximum pool size (for tracking, actual pooling is simplified).

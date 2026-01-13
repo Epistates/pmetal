@@ -313,7 +313,7 @@ pub struct DistributedMetrics {
 impl DistributedMetrics {
     /// Create a new metrics instance.
     pub fn new() -> Self {
-        let mut metrics = Self::default();
+        let metrics = Self::default();
         *metrics.start_time.write() = Some(Instant::now());
         metrics
     }

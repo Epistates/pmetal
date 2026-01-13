@@ -1988,8 +1988,8 @@ mod tests {
         assert!(filtered_vec[2] > f32::NEG_INFINITY);
 
         // Check that other tokens are filtered
-        for i in 3..10 {
-            assert!(filtered_vec[i].is_infinite());
+        for val in filtered_vec.iter().skip(3).take(7) {
+            assert!(val.is_infinite());
         }
     }
 

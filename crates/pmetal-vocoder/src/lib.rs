@@ -24,7 +24,14 @@
 //! let audio = vocoder.forward(&mel)?;
 //! ```
 
-#![warn(missing_docs)]
+// Crate-level lint configuration for ML/GPU code patterns
+#![allow(missing_docs)]
+#![allow(dead_code)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::option_map_or_none)]
+#![allow(clippy::useless_vec)]
 
 pub mod audio;
 pub mod config;

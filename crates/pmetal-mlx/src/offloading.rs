@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
 use mlx_rs::error::Exception;
-use mlx_rs::{Array, Dtype, Stream};
+use mlx_rs::{Array, Dtype};
 use serde::{Deserialize, Serialize};
 
 /// Offloading target for tensors.
