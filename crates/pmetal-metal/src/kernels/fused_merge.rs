@@ -234,9 +234,7 @@ impl FusedMergeMetal {
             cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
         };
 
-        let encoder = batch
-            .encoder()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = batch.encoder().ok_or(MetalError::CommandBufferCreation)?;
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
@@ -294,9 +292,7 @@ impl FusedMergeMetal {
             cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
         };
 
-        let encoder = batch
-            .encoder()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = batch.encoder().ok_or(MetalError::CommandBufferCreation)?;
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
@@ -355,9 +351,7 @@ impl FusedMergeMetal {
             cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
         };
 
-        let encoder = batch
-            .encoder()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = batch.encoder().ok_or(MetalError::CommandBufferCreation)?;
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
@@ -419,9 +413,7 @@ impl FusedMergeMetal {
             cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
         };
 
-        let encoder = batch
-            .encoder()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = batch.encoder().ok_or(MetalError::CommandBufferCreation)?;
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
@@ -478,9 +470,7 @@ impl FusedMergeMetal {
             cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
         };
 
-        let encoder = batch
-            .encoder()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = batch.encoder().ok_or(MetalError::CommandBufferCreation)?;
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
@@ -537,9 +527,7 @@ impl FusedMergeMetal {
             cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
         };
 
-        let encoder = batch
-            .encoder()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = batch.encoder().ok_or(MetalError::CommandBufferCreation)?;
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
@@ -617,9 +605,7 @@ impl FusedMergeMetal {
             cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
         };
 
-        let encoder = batch
-            .encoder()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = batch.encoder().ok_or(MetalError::CommandBufferCreation)?;
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
@@ -682,9 +668,7 @@ impl FusedMergeMetal {
             cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
         };
 
-        let encoder = batch
-            .encoder()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = batch.encoder().ok_or(MetalError::CommandBufferCreation)?;
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
@@ -756,9 +740,7 @@ impl FusedMergeMetal {
             cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
         };
 
-        let encoder = batch
-            .encoder()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = batch.encoder().ok_or(MetalError::CommandBufferCreation)?;
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
@@ -831,9 +813,7 @@ impl FusedMergeMetal {
             cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
         };
 
-        let encoder = batch
-            .encoder()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = batch.encoder().ok_or(MetalError::CommandBufferCreation)?;
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {
@@ -899,9 +879,7 @@ impl FusedMergeMetal {
             cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
         };
 
-        let encoder = batch
-            .encoder()
-            .ok_or(MetalError::CommandBufferCreation)?;
+        let encoder = batch.encoder().ok_or(MetalError::CommandBufferCreation)?;
         encoder.setComputePipelineState(&pipeline);
 
         unsafe {

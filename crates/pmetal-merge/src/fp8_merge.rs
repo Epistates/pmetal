@@ -343,9 +343,8 @@ impl Fp8Merger {
             for (fp8, &weight) in quantized.iter().zip(weights.iter()) {
                 let scale = fp8.scales[block_idx];
 
-                for (result_val, &quant_byte) in result[start..end]
-                    .iter_mut()
-                    .zip(&fp8.data[start..end])
+                for (result_val, &quant_byte) in
+                    result[start..end].iter_mut().zip(&fp8.data[start..end])
                 {
                     let quantized_val = quant_byte as i8;
                     // Dequantize and apply weight
@@ -451,10 +450,7 @@ impl Fp8Merger {
 
     /// Reset dynamic scale tracking.
     pub fn reset_scale(&mut self) {
-        self.dynamic_scale = DynamicScale::new(
-            self.config.scale_window_size,
-            self.config.format,
-        );
+        self.dynamic_scale = DynamicScale::new(self.config.scale_window_size, self.config.format);
     }
 }
 
@@ -559,7 +555,13 @@ mod tests {
             let expected = (i + 1) as f32;
             let error = (val - expected).abs();
             // Allow up to amax/127 * 2 quantization error
-            assert!(error < 0.1, "Value {} expected {}, error {}", val, expected, error);
+            assert!(
+                error < 0.1,
+                "Value {} expected {}, error {}",
+                val,
+                expected,
+                error
+            );
         }
     }
 
@@ -583,7 +585,13 @@ mod tests {
             let expected = (i + 3) as f32;
             let error = (val - expected).abs();
             // Allow larger error due to combining two quantized tensors
-            assert!(error < 0.5, "Value {} expected ~{}, error {}", val, expected, error);
+            assert!(
+                error < 0.5,
+                "Value {} expected ~{}, error {}",
+                val,
+                expected,
+                error
+            );
         }
     }
 

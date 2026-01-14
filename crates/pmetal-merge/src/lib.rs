@@ -59,7 +59,9 @@ pub use batched::{BatchConfig, BatchResult, BatchedMerger, MergeStats, TensorBat
 pub use config::*;
 pub use consensus::*;
 pub use error::*;
-pub use fp8_merge::{DynamicScale, Fp8Format, Fp8MergeConfig, Fp8Merger, Fp8Tensor, MemorySavingsReport};
+pub use fp8_merge::{
+    DynamicScale, Fp8Format, Fp8MergeConfig, Fp8Merger, Fp8Tensor, MemorySavingsReport,
+};
 pub use gpu_merge::{GpuMergeConfig, GpuMerger};
 pub use loader::*;
 pub use merge::*;

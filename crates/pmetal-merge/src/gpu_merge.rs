@@ -153,8 +153,7 @@ impl GpuMerger {
             .collect::<Result<Vec<_>>>()?;
 
         // Step 2: Batch sparsify (uses O(n) quickselect)
-        let sparse_vectors =
-            crate::sparsify_batch_by_magnitude(&task_vectors, densities)?;
+        let sparse_vectors = crate::sparsify_batch_by_magnitude(&task_vectors, densities)?;
 
         // Step 3: Compute sign consensus
         let consensus_mask = crate::sign_consensus(&sparse_vectors, weights)?;

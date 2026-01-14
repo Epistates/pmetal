@@ -174,7 +174,8 @@ impl AsyncMergePipeline {
         self.loaders[1..]
             .iter()
             .fold(first_names, |acc, loader| {
-                let names: std::collections::HashSet<_> = loader.tensor_names().into_iter().collect();
+                let names: std::collections::HashSet<_> =
+                    loader.tensor_names().into_iter().collect();
                 acc.intersection(&names).cloned().collect()
             })
             .into_iter()
@@ -196,13 +197,15 @@ impl AsyncMergePipeline {
         if weights.len() != num_models {
             return Err(MergeError::InvalidConfig(format!(
                 "Expected {} weights, got {}",
-                num_models, weights.len()
+                num_models,
+                weights.len()
             )));
         }
         if densities.len() != num_models {
             return Err(MergeError::InvalidConfig(format!(
                 "Expected {} densities, got {}",
-                num_models, densities.len()
+                num_models,
+                densities.len()
             )));
         }
 
@@ -219,12 +222,8 @@ impl AsyncMergePipeline {
             .collect();
 
         // Run pipelined merge
-        let results = self.run_pipelined_merge(
-            batches,
-            weights.to_vec(),
-            densities.to_vec(),
-            lambda,
-        )?;
+        let results =
+            self.run_pipelined_merge(batches, weights.to_vec(), densities.to_vec(), lambda)?;
 
         Ok(results.into_iter())
     }
@@ -240,7 +239,8 @@ impl AsyncMergePipeline {
         if weights.len() != num_models {
             return Err(MergeError::InvalidConfig(format!(
                 "Expected {} weights, got {}",
-                num_models, weights.len()
+                num_models,
+                weights.len()
             )));
         }
 
@@ -329,7 +329,8 @@ impl AsyncMergePipeline {
 
         info!(
             "Pipeline complete: {} batches, {} tensors merged",
-            self.stats.batches_processed, results.len()
+            self.stats.batches_processed,
+            results.len()
         );
 
         Ok(results)
@@ -371,7 +372,10 @@ impl AsyncMergePipeline {
         // Load base if needed
         let base = if let Some(base_loader) = &self.base_loader {
             // Use first tensor name for base
-            names.first().map(|name| base_loader.load_tensor(name)).transpose()?
+            names
+                .first()
+                .map(|name| base_loader.load_tensor(name))
+                .transpose()?
         } else {
             None
         };
@@ -407,7 +411,8 @@ impl AsyncMergePipeline {
             };
 
             // Perform TIES merge
-            let merged = self.ties_merge_tensor(&model_tensors, base, weights, densities, lambda)?;
+            let merged =
+                self.ties_merge_tensor(&model_tensors, base, weights, densities, lambda)?;
             results.push((name.clone(), merged));
         }
 

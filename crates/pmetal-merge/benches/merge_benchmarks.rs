@@ -27,15 +27,11 @@ fn bench_sparsification(c: &mut Criterion) {
 
         group.throughput(Throughput::Elements(*size as u64));
 
-        group.bench_with_input(
-            BenchmarkId::new("standard", size),
-            size,
-            |b, _| {
-                b.iter(|| {
-                    let _ = sparsify_by_magnitude(black_box(&tensor), black_box(0.5));
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("standard", size), size, |b, _| {
+            b.iter(|| {
+                let _ = sparsify_by_magnitude(black_box(&tensor), black_box(0.5));
+            });
+        });
 
         group.bench_with_input(
             BenchmarkId::new("online_quickselect", size),
@@ -57,7 +53,9 @@ fn bench_batch_sparsification(c: &mut Criterion) {
 
     for num_tensors in [2, 4, 8].iter() {
         let size = 65536;
-        let tensors: Vec<Array> = (0..*num_tensors).map(|_| generate_test_data(size)).collect();
+        let tensors: Vec<Array> = (0..*num_tensors)
+            .map(|_| generate_test_data(size))
+            .collect();
         let densities: Vec<f32> = vec![0.5; *num_tensors];
 
         group.throughput(Throughput::Elements((size * *num_tensors) as u64));

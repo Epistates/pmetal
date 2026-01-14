@@ -562,10 +562,7 @@ impl Tuner {
 
         // Generate candidates based on device tier
         let candidates = self.generate_merge_candidates(context);
-        debug!(
-            "Generated {} merge candidates for device",
-            candidates.len()
-        );
+        debug!("Generated {} merge candidates for device", candidates.len());
 
         let mut best_config = MergeTunedConfig::default();
         let mut best_time = f64::INFINITY;
@@ -710,25 +707,25 @@ impl Tuner {
 
         // Create test buffers
         let options = MTLResourceOptions::StorageModePrivate;
-        let buf_input =
-            device
-                .newBufferWithLength_options(num_elements * 4, options)
-                .ok_or(MetalError::BufferCreation {
-                    size: num_elements * 4,
-                    reason: "merge input".into(),
-                })?;
-        let buf_output =
-            device
-                .newBufferWithLength_options(num_elements * 4, options)
-                .ok_or(MetalError::BufferCreation {
-                    size: num_elements * 4,
-                    reason: "merge output".into(),
-                })?;
+        let buf_input = device
+            .newBufferWithLength_options(num_elements * 4, options)
+            .ok_or(MetalError::BufferCreation {
+                size: num_elements * 4,
+                reason: "merge input".into(),
+            })?;
+        let buf_output = device
+            .newBufferWithLength_options(num_elements * 4, options)
+            .ok_or(MetalError::BufferCreation {
+                size: num_elements * 4,
+                reason: "merge output".into(),
+            })?;
 
         // Get pipeline for simple magnitude computation
-        let pipeline = context
-            .pipeline_cache_mut()
-            .get_or_create_pipeline(context.device(), "fused_compute_magnitudes", None)?;
+        let pipeline = context.pipeline_cache_mut().get_or_create_pipeline(
+            context.device(),
+            "fused_compute_magnitudes",
+            None,
+        )?;
 
         // Create config buffer
         #[repr(C)]
@@ -826,8 +823,7 @@ impl Tuner {
         }
 
         // Calculate grid based on tuned config
-        let elements_per_group =
-            (config.threads_per_group * config.elements_per_thread) as usize;
+        let elements_per_group = (config.threads_per_group * config.elements_per_thread) as usize;
         let grid_size = MTLSize {
             width: num_elements.div_ceil(elements_per_group),
             height: 1,

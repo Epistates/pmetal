@@ -386,12 +386,9 @@ impl ZeroCopyLoader {
     ///
     /// Returns true if all tensors are f32 or f16 (no bf16 conversion needed).
     pub fn all_gpu_compatible(&self) -> bool {
-        self.tensor_info.values().all(|loc| {
-            matches!(
-                loc.dtype,
-                safetensors::Dtype::F32 | safetensors::Dtype::F16
-            )
-        })
+        self.tensor_info
+            .values()
+            .all(|loc| matches!(loc.dtype, safetensors::Dtype::F32 | safetensors::Dtype::F16))
     }
 }
 
@@ -785,20 +782,16 @@ mod tests {
 
         // Create a minimal safetensors file
         let tensor_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0];
-        let tensor_bytes: Vec<u8> = tensor_data
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect();
+        let tensor_bytes: Vec<u8> = tensor_data.iter().flat_map(|f| f.to_le_bytes()).collect();
 
-        let metadata = std::collections::HashMap::from([
-            ("test_tensor".to_string(), safetensors::tensor::TensorView::new(
-                safetensors::Dtype::F32,
-                vec![4],
-                &tensor_bytes,
-            ).unwrap()),
-        ]);
+        let metadata = std::collections::HashMap::from([(
+            "test_tensor".to_string(),
+            safetensors::tensor::TensorView::new(safetensors::Dtype::F32, vec![4], &tensor_bytes)
+                .unwrap(),
+        )]);
 
-        let serialized = serialize(metadata.iter().map(|(k, v)| (k.as_str(), v.clone())), &None).unwrap();
+        let serialized =
+            serialize(metadata.iter().map(|(k, v)| (k.as_str(), v.clone())), &None).unwrap();
 
         let mut file = std::fs::File::create(&file_path).unwrap();
         file.write_all(&serialized).unwrap();

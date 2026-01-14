@@ -289,12 +289,9 @@ impl<'a> BatchedMerger<'a> {
             let base = batch.base_tensors[i].as_ref();
 
             // Run the merge
-            let result = self.method.merge(
-                tensors,
-                base,
-                params,
-                &self.merge_config.parameters,
-            )?;
+            let result = self
+                .method
+                .merge(tensors, base, params, &self.merge_config.parameters)?;
 
             merged.insert(name.clone(), result);
         }
@@ -338,7 +335,10 @@ impl<'a, W: TensorWriter> StreamingBatchedMerger<'a, W> {
         let mut total_tensors = 0;
         let mut total_bytes = 0usize;
 
-        for (batch_idx, chunk) in tensor_names.chunks(self.inner.config.batch_size).enumerate() {
+        for (batch_idx, chunk) in tensor_names
+            .chunks(self.inner.config.batch_size)
+            .enumerate()
+        {
             debug!("Processing batch {}/{}", batch_idx + 1, batch_count);
 
             let batch = self.inner.load_batch(chunk)?;

@@ -1414,7 +1414,8 @@ mod tests {
 
         let teacher = MetalBuffer::from_slice(&ctx, &teacher_data, BufferUsage::Shared).unwrap();
         let student = MetalBuffer::from_slice(&ctx, &student_data, BufferUsage::Shared).unwrap();
-        let grad_loss = MetalBuffer::from_slice(&ctx, &vec![1.0f32; num_tokens], BufferUsage::Shared).unwrap();
+        let grad_loss =
+            MetalBuffer::from_slice(&ctx, &vec![1.0f32; num_tokens], BufferUsage::Shared).unwrap();
 
         // First compute forward pass
         let forward_output = distill
@@ -1432,7 +1433,10 @@ mod tests {
 
         // At least some gradients should be non-zero
         let any_nonzero = grad_data.iter().any(|&x| x.abs() > 1e-10);
-        assert!(any_nonzero, "Gradients are all zero - kernel may not have executed");
+        assert!(
+            any_nonzero,
+            "Gradients are all zero - kernel may not have executed"
+        );
 
         // Note: Fused kernel applies T^2 scaling while forward does not
         // The fused kernel loss = forward_loss * T^2
