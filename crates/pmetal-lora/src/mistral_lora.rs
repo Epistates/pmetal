@@ -749,11 +749,7 @@ impl MistralLoraForCausalLM {
         use mlx_rs::transforms::eval;
 
         // Evaluate all parameters
-        let params: Vec<&Array> = self
-            .parameters()
-            .flatten()
-            .into_values()
-            .collect();
+        let params: Vec<&Array> = self.parameters().flatten().into_values().collect();
         eval(params)?;
         Ok(())
     }

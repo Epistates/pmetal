@@ -443,8 +443,14 @@ impl FusedLora {
 
         // Calculate grid size using tuned parameters
         let grid_size = MTLSize {
-            width: self.config.batch_size.div_ceil(tuned_config.tile_m as usize),
-            height: self.config.out_features.div_ceil(tuned_config.tile_n as usize),
+            width: self
+                .config
+                .batch_size
+                .div_ceil(tuned_config.tile_m as usize),
+            height: self
+                .config
+                .out_features
+                .div_ceil(tuned_config.tile_n as usize),
             depth: 1,
         };
 

@@ -165,8 +165,7 @@ mod tests {
         let h_pre_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| (i + j) as f32 * 0.1);
         let h_post_input =
             Array2::<f32>::from_shape_fn((n, n), |(i, j)| (i * j) as f32 * 0.05 + 0.1);
-        let h_res_input =
-            Array2::<f32>::from_shape_fn((n, n), |(i, j)| (i + j * 2) as f32 * 0.08);
+        let h_res_input = Array2::<f32>::from_shape_fn((n, n), |(i, j)| (i + j * 2) as f32 * 0.08);
 
         let h_pre = sinkhorn_knopp(&h_pre_input, &config).matrix;
         let h_post = sinkhorn_knopp(&h_post_input, &config).matrix;

@@ -160,11 +160,7 @@ impl MhcMetalContext {
         encoder.set_buffer(3, Some(&config_buf), 0);
 
         let threads_per_group = MTLSize::new(self.config.compute_mappings_threads as u64, 1, 1);
-        let num_groups = MTLSize::new(
-            ((n * n) as u64).div_ceil(threads_per_group.width),
-            1,
-            1,
-        );
+        let num_groups = MTLSize::new(((n * n) as u64).div_ceil(threads_per_group.width), 1, 1);
         encoder.dispatch_thread_groups(num_groups, threads_per_group);
 
         // Repeat for post and res (or use batch kernel)
@@ -343,11 +339,7 @@ impl MhcMetalContext {
         encoder.set_buffer(2, Some(&config_buf), 0);
 
         let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
-        let groups = MTLSize::new(
-            ((batch * n * c) as u64).div_ceil(threads.width),
-            1,
-            1,
-        );
+        let groups = MTLSize::new(((batch * n * c) as u64).div_ceil(threads.width), 1, 1);
         encoder.dispatch_thread_groups(groups, threads);
 
         encoder.end_encoding();

@@ -84,9 +84,7 @@ impl IMatrix {
         let mut ncalls = HashMap::new();
 
         // Read number of entries (header)
-        let n_entries = reader
-            .read_i32::<LittleEndian>()
-            .map_err(PMetalError::Io)?;
+        let n_entries = reader.read_i32::<LittleEndian>().map_err(PMetalError::Io)?;
 
         // Validate entry count
         if !(0..=MAX_ENTRIES).contains(&n_entries) {
@@ -99,9 +97,7 @@ impl IMatrix {
         // Read each entry
         for entry_idx in 0..n_entries {
             // Read name length
-            let name_len = reader
-                .read_i32::<LittleEndian>()
-                .map_err(PMetalError::Io)?;
+            let name_len = reader.read_i32::<LittleEndian>().map_err(PMetalError::Io)?;
 
             // Validate name length
             if name_len <= 0 || name_len > MAX_NAME_LENGTH {
@@ -124,14 +120,10 @@ impl IMatrix {
             })?;
 
             // Read ncall (number of calibration chunks processed)
-            let ncall = reader
-                .read_i32::<LittleEndian>()
-                .map_err(PMetalError::Io)?;
+            let ncall = reader.read_i32::<LittleEndian>().map_err(PMetalError::Io)?;
 
             // Read nval (number of values)
-            let nval = reader
-                .read_i32::<LittleEndian>()
-                .map_err(PMetalError::Io)?;
+            let nval = reader.read_i32::<LittleEndian>().map_err(PMetalError::Io)?;
 
             // Validate value count
             if !(0..=MAX_VALUES_COUNT).contains(&nval) {
@@ -213,9 +205,7 @@ impl IMatrix {
                 .map_err(PMetalError::Io)?;
 
             // Write name
-            writer
-                .write_all(name_bytes)
-                .map_err(PMetalError::Io)?;
+            writer.write_all(name_bytes).map_err(PMetalError::Io)?;
 
             // Write ncall
             let ncall = self.ncalls.get(name).copied().unwrap_or(1);
@@ -247,9 +237,7 @@ impl IMatrix {
         writer
             .write_i32::<LittleEndian>(dataset_bytes.len() as i32)
             .map_err(PMetalError::Io)?;
-        writer
-            .write_all(dataset_bytes)
-            .map_err(PMetalError::Io)?;
+        writer.write_all(dataset_bytes).map_err(PMetalError::Io)?;
 
         writer.flush().map_err(PMetalError::Io)?;
         Ok(())

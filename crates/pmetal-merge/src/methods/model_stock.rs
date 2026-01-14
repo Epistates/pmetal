@@ -286,7 +286,12 @@ mod tests {
         let w1 = Array::from_slice(&[1.5f32, 2.5], &[2]);
 
         let result = merger
-            .merge(std::slice::from_ref(&w1), Some(&base), &[], &MergeParameters::default())
+            .merge(
+                std::slice::from_ref(&w1),
+                Some(&base),
+                &[],
+                &MergeParameters::default(),
+            )
             .unwrap();
 
         result.eval().unwrap();

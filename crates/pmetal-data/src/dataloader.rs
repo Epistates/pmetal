@@ -219,8 +219,10 @@ impl DataLoader {
 
             // Input IDs
             input_ids_flat.extend(sample.input_ids.iter().take(seq_len).map(|&x| x as i32));
-            input_ids_flat
-                .extend(std::iter::repeat_n(self.config.pad_token_id as i32, max_len - seq_len));
+            input_ids_flat.extend(std::iter::repeat_n(
+                self.config.pad_token_id as i32,
+                max_len - seq_len,
+            ));
 
             // Labels
             if let Some(ref labels) = sample.labels {

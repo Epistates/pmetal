@@ -79,7 +79,6 @@ impl fmt::Display for SecretString {
     }
 }
 
-
 impl From<String> for SecretString {
     fn from(s: String) -> Self {
         Self::new(s)
