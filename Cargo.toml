@@ -90,6 +90,7 @@ indicatif = "0.17"
 humansize = "2"
 dirs = "5"
 walkdir = "2"
+memmap2 = "0.9"
 
 # Testing
 criterion = "0.5"

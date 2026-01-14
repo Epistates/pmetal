@@ -27,9 +27,15 @@ rand = { workspace = true }
 hf-hub = { workspace = true }
 half = { workspace = true }
 bytemuck = { workspace = true }
+memmap2 = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "merge_benchmarks"
+harness = false
 
 [lints]
 workspace = true

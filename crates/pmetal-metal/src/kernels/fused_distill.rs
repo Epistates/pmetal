@@ -519,6 +519,317 @@ impl FusedDistill {
             ignore_index: self.config.ignore_index,
         }
     }
+
+    /// Compute backward pass for soft cross-entropy loss.
+    ///
+    /// # Arguments
+    /// * `teacher_logits` - Teacher logits [num_tokens, vocab_size]
+    /// * `student_logits` - Student logits [num_tokens, vocab_size]
+    /// * `grad_student` - Output gradient buffer [num_tokens, vocab_size]
+    /// * `grad_loss` - Upstream gradient [num_tokens]
+    pub fn backward_soft_ce(
+        &self,
+        teacher_logits: &MetalBuffer<f32>,
+        student_logits: &MetalBuffer<f32>,
+        grad_student: &mut MetalBuffer<f32>,
+        grad_loss: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        self.execute_backward_generic(
+            teacher_logits,
+            student_logits,
+            grad_student,
+            grad_loss,
+            "fused_soft_cross_entropy_backward",
+        )
+    }
+
+    /// Compute backward pass for Jensen-Shannon divergence.
+    pub fn backward_jensen_shannon(
+        &self,
+        teacher_logits: &MetalBuffer<f32>,
+        student_logits: &MetalBuffer<f32>,
+        grad_student: &mut MetalBuffer<f32>,
+        grad_loss: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        self.execute_backward_generic(
+            teacher_logits,
+            student_logits,
+            grad_student,
+            grad_loss,
+            "fused_jensen_shannon_backward",
+        )
+    }
+
+    /// Execute a generic backward kernel.
+    fn execute_backward_generic(
+        &self,
+        teacher_logits: &MetalBuffer<f32>,
+        student_logits: &MetalBuffer<f32>,
+        grad_student: &mut MetalBuffer<f32>,
+        grad_loss: &MetalBuffer<f32>,
+        function_name: &str,
+    ) -> Result<()> {
+        let pipeline = {
+            let mut cache = self.ctx.pipeline_cache_mut();
+            cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
+        };
+
+        let command_queue = self.ctx.command_queue();
+        let command_buffer = command_queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::EncoderCreation)?;
+
+        encoder.setComputePipelineState(&pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(teacher_logits.as_metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(student_logits.as_metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(grad_student.as_metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(grad_loss.as_metal_buffer()), 0, 3);
+
+            let params = self.create_params();
+            let params_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 4);
+        }
+
+        let grid_size = objc2_metal::MTLSize {
+            width: self.config.vocab_size,
+            height: self.config.num_tokens,
+            depth: 1,
+        };
+
+        let threadgroup_size = objc2_metal::MTLSize {
+            width: 32.min(self.config.vocab_size),
+            height: 1,
+            depth: 1,
+        };
+
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+
+        if let Some(error) = command_buffer.error() {
+            return Err(MetalError::ExecutionFailed(error.to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Fused forward+backward pass for KL divergence.
+    ///
+    /// Computes loss and gradient in a single kernel dispatch, avoiding
+    /// the need for separate forward and backward passes.
+    ///
+    /// # Returns
+    /// Tuple of (losses, grad_student) buffers.
+    pub fn forward_backward_kl(
+        &self,
+        teacher_logits: &impl AsMetalBuffer,
+        student_logits: &impl AsMetalBuffer,
+        grad_loss: &MetalBuffer<f32>,
+    ) -> Result<(MetalBuffer<f32>, MetalBuffer<f32>)> {
+        let losses = MetalBuffer::new(&self.ctx, self.config.num_tokens, BufferUsage::Shared)?;
+        let grad_student = MetalBuffer::new(
+            &self.ctx,
+            self.config.num_tokens * self.config.vocab_size,
+            BufferUsage::Shared,
+        )?;
+
+        self.execute_forward_backward_kl(
+            teacher_logits,
+            student_logits,
+            &losses,
+            &grad_student,
+            grad_loss,
+        )?;
+
+        Ok((losses, grad_student))
+    }
+
+    /// Execute fused KL forward+backward kernel.
+    fn execute_forward_backward_kl(
+        &self,
+        teacher_logits: &impl AsMetalBuffer,
+        student_logits: &impl AsMetalBuffer,
+        losses: &MetalBuffer<f32>,
+        grad_student: &MetalBuffer<f32>,
+        grad_loss: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        // Only one fused forward+backward kernel exists - it uses multi-SIMD internally
+        let function_name = "fused_kl_divergence_forward_backward";
+
+        let pipeline = {
+            let mut cache = self.ctx.pipeline_cache_mut();
+            cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
+        };
+
+        let command_queue = self.ctx.command_queue();
+        let command_buffer = command_queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::EncoderCreation)?;
+
+        encoder.setComputePipelineState(&pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(teacher_logits.as_metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(student_logits.as_metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(losses.as_metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(grad_student.as_metal_buffer()), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(grad_loss.as_metal_buffer()), 0, 4);
+
+            let params = self.create_params();
+            let params_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
+
+            // Threadgroup memory for reduction
+            // 4 values per SIMD group (t_max, t_sum, s_max, s_sum), 4 SIMD groups
+            let scratch_size = 16 * std::mem::size_of::<f32>();
+            encoder.setThreadgroupMemoryLength_atIndex(scratch_size, 0);
+        }
+
+        // Dispatch one threadgroup per token with 128 threads (DISTILL_THREADS_PER_TOKEN)
+        let grid_size = objc2_metal::MTLSize {
+            width: self.config.num_tokens,
+            height: 1,
+            depth: 1,
+        };
+
+        let threadgroup_size = objc2_metal::MTLSize {
+            width: 128, // DISTILL_THREADS_PER_TOKEN
+            height: 1,
+            depth: 1,
+        };
+
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+
+        if let Some(error) = command_buffer.error() {
+            return Err(MetalError::ExecutionFailed(error.to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Fused combined loss forward+backward (hard CE + soft KL).
+    ///
+    /// Computes both hard cross-entropy and soft KL losses with gradients
+    /// in a single kernel dispatch.
+    ///
+    /// # Arguments
+    /// * `teacher_logits` - Teacher logits [num_tokens, vocab_size]
+    /// * `student_logits` - Student logits [num_tokens, vocab_size]
+    /// * `labels` - Ground truth labels [num_tokens]
+    /// * `grad_loss` - Upstream gradient [num_tokens]
+    ///
+    /// # Returns
+    /// Tuple of (hard_loss, soft_loss, grad_student) buffers.
+    pub fn forward_backward_combined(
+        &self,
+        teacher_logits: &impl AsMetalBuffer,
+        student_logits: &impl AsMetalBuffer,
+        labels: &MetalBuffer<i32>,
+        grad_loss: &MetalBuffer<f32>,
+    ) -> Result<(MetalBuffer<f32>, MetalBuffer<f32>, MetalBuffer<f32>)> {
+        let hard_loss = MetalBuffer::new(&self.ctx, self.config.num_tokens, BufferUsage::Shared)?;
+        let soft_loss = MetalBuffer::new(&self.ctx, self.config.num_tokens, BufferUsage::Shared)?;
+        let grad_student = MetalBuffer::new(
+            &self.ctx,
+            self.config.num_tokens * self.config.vocab_size,
+            BufferUsage::Shared,
+        )?;
+
+        self.execute_forward_backward_combined(
+            teacher_logits,
+            student_logits,
+            labels,
+            &hard_loss,
+            &soft_loss,
+            &grad_student,
+            grad_loss,
+        )?;
+
+        Ok((hard_loss, soft_loss, grad_student))
+    }
+
+    /// Execute fused combined loss forward+backward kernel.
+    fn execute_forward_backward_combined(
+        &self,
+        teacher_logits: &impl AsMetalBuffer,
+        student_logits: &impl AsMetalBuffer,
+        labels: &MetalBuffer<i32>,
+        hard_loss: &MetalBuffer<f32>,
+        soft_loss: &MetalBuffer<f32>,
+        grad_student: &MetalBuffer<f32>,
+        grad_loss: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        let pipeline = {
+            let mut cache = self.ctx.pipeline_cache_mut();
+            cache.get_or_create_pipeline(
+                self.ctx.device(),
+                "fused_combined_loss_forward_backward",
+                None,
+            )?
+        };
+
+        let command_queue = self.ctx.command_queue();
+        let command_buffer = command_queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::EncoderCreation)?;
+
+        encoder.setComputePipelineState(&pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(teacher_logits.as_metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(student_logits.as_metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(labels.as_metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(hard_loss.as_metal_buffer()), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(soft_loss.as_metal_buffer()), 0, 4);
+            encoder.setBuffer_offset_atIndex(Some(grad_student.as_metal_buffer()), 0, 5);
+            encoder.setBuffer_offset_atIndex(Some(grad_loss.as_metal_buffer()), 0, 6);
+
+            let params = self.create_params();
+            let params_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 7);
+        }
+
+        let grid_size = objc2_metal::MTLSize {
+            width: self.config.num_tokens,
+            height: 1,
+            depth: 1,
+        };
+
+        let threadgroup_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+
+        if let Some(error) = command_buffer.error() {
+            return Err(MetalError::ExecutionFailed(error.to_string()));
+        }
+
+        Ok(())
+    }
 }
 
 /// Parameters passed to the kernel.
@@ -715,6 +1026,106 @@ impl FusedHiddenAlign {
             projection_dim: 0, // Not used yet
             weight: self.config.weight,
         }
+    }
+
+    /// Compute backward pass for hidden MSE loss.
+    ///
+    /// # Arguments
+    /// * `teacher_hidden` - Teacher hidden states [num_tokens, teacher_dim]
+    /// * `student_hidden` - Student hidden states [num_tokens, student_dim]
+    /// * `grad_student` - Output gradient buffer [num_tokens, student_dim]
+    /// * `grad_loss` - Upstream gradient [num_tokens]
+    pub fn backward_mse(
+        &self,
+        teacher_hidden: &MetalBuffer<f32>,
+        student_hidden: &MetalBuffer<f32>,
+        grad_student: &mut MetalBuffer<f32>,
+        grad_loss: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        self.execute_backward(
+            teacher_hidden,
+            student_hidden,
+            grad_student,
+            grad_loss,
+            "fused_hidden_mse_backward",
+        )
+    }
+
+    /// Compute backward pass for hidden cosine similarity loss.
+    pub fn backward_cosine(
+        &self,
+        teacher_hidden: &MetalBuffer<f32>,
+        student_hidden: &MetalBuffer<f32>,
+        grad_student: &mut MetalBuffer<f32>,
+        grad_loss: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        self.execute_backward(
+            teacher_hidden,
+            student_hidden,
+            grad_student,
+            grad_loss,
+            "fused_hidden_cosine_backward",
+        )
+    }
+
+    /// Execute backward kernel.
+    fn execute_backward(
+        &self,
+        teacher_hidden: &MetalBuffer<f32>,
+        student_hidden: &MetalBuffer<f32>,
+        grad_student: &mut MetalBuffer<f32>,
+        grad_loss: &MetalBuffer<f32>,
+        function_name: &str,
+    ) -> Result<()> {
+        let pipeline = {
+            let mut cache = self.ctx.pipeline_cache_mut();
+            cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
+        };
+
+        let command_queue = self.ctx.command_queue();
+        let command_buffer = command_queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::EncoderCreation)?;
+
+        encoder.setComputePipelineState(&pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(teacher_hidden.as_metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(student_hidden.as_metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(grad_student.as_metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(grad_loss.as_metal_buffer()), 0, 3);
+
+            let params = self.create_params();
+            let params_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 4);
+        }
+
+        let grid_size = objc2_metal::MTLSize {
+            width: self.config.student_dim,
+            height: self.config.num_tokens,
+            depth: 1,
+        };
+
+        let threadgroup_size = objc2_metal::MTLSize {
+            width: 32.min(self.config.student_dim),
+            height: 1,
+            depth: 1,
+        };
+
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+
+        if let Some(error) = command_buffer.error() {
+            return Err(MetalError::ExecutionFailed(error.to_string()));
+        }
+
+        Ok(())
     }
 }
 
@@ -973,6 +1384,83 @@ mod tests {
                 "MSE of identical vectors should be 0, got {} at token {}",
                 loss,
                 i
+            );
+        }
+    }
+
+    #[test]
+    fn test_fused_forward_backward_kl() {
+        let ctx = Arc::new(MetalContext::new().unwrap());
+        let num_tokens = 4;
+        let vocab_size = 32;
+        let temperature = 2.0;
+
+        let mut config = FusedDistillConfig::new(num_tokens, vocab_size);
+        config.temperature = temperature;
+        config.use_simd = false;
+
+        let distill = FusedDistill::new(ctx.clone(), config).unwrap();
+
+        // Create test data
+        let mut teacher_data = vec![0.0f32; num_tokens * vocab_size];
+        let mut student_data = vec![0.0f32; num_tokens * vocab_size];
+
+        for i in 0..num_tokens {
+            for j in 0..vocab_size {
+                teacher_data[i * vocab_size + j] = ((i * 7 + j * 3) % 10) as f32 - 5.0;
+                student_data[i * vocab_size + j] = ((i * 5 + j * 2) % 10) as f32 - 4.0;
+            }
+        }
+
+        let teacher = MetalBuffer::from_slice(&ctx, &teacher_data, BufferUsage::Shared).unwrap();
+        let student = MetalBuffer::from_slice(&ctx, &student_data, BufferUsage::Shared).unwrap();
+        let grad_loss = MetalBuffer::from_slice(&ctx, &vec![1.0f32; num_tokens], BufferUsage::Shared).unwrap();
+
+        // First compute forward pass
+        let forward_output = distill
+            .forward(&teacher, &student, DistillLossType::KlDivergence)
+            .unwrap();
+
+        // Now compute fused forward+backward
+        let (fused_losses, grad_student) = distill
+            .forward_backward_kl(&teacher, &student, &grad_loss)
+            .unwrap();
+
+        // Check if kernel executed by verifying gradients are non-zero
+        let grad_data = grad_student.as_slice();
+        assert_eq!(grad_data.len(), num_tokens * vocab_size);
+
+        // At least some gradients should be non-zero
+        let any_nonzero = grad_data.iter().any(|&x| x.abs() > 1e-10);
+        assert!(any_nonzero, "Gradients are all zero - kernel may not have executed");
+
+        // Note: Fused kernel applies T^2 scaling while forward does not
+        // The fused kernel loss = forward_loss * T^2
+        let forward_losses = forward_output.losses.as_slice();
+        let fused_loss_data = fused_losses.as_slice();
+        let t2 = temperature * temperature;
+
+        for i in 0..num_tokens {
+            let expected_fused = forward_losses[i] * t2;
+            assert!(
+                (expected_fused - fused_loss_data[i]).abs() < 1e-3,
+                "Fused loss mismatch at token {}: expected {} (forward {} * T^2 {}), got {}",
+                i,
+                expected_fused,
+                forward_losses[i],
+                t2,
+                fused_loss_data[i]
+            );
+        }
+
+        // Sum of gradients per token should be close to 0 (softmax derivative property)
+        for i in 0..num_tokens {
+            let grad_sum: f32 = grad_data[i * vocab_size..(i + 1) * vocab_size].iter().sum();
+            assert!(
+                grad_sum.abs() < 1e-3,
+                "Gradient sum should be ~0 at token {}: got {}",
+                i,
+                grad_sum
             );
         }
     }

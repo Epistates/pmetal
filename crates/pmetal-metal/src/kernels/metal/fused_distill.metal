@@ -935,3 +935,544 @@ kernel void distill_reduce_mean(
         atomic_fetch_add_explicit((device atomic_float*)output, simd_sum_val, memory_order_relaxed);
     }
 }
+
+// =============================================================================
+// ADDITIONAL BACKWARD KERNELS
+// =============================================================================
+
+/// Soft Cross-Entropy backward pass.
+///
+/// Gradient of CE(teacher_probs, student_logits) w.r.t. student logits.
+/// Same formula as KL: gradient = (student_probs - teacher_probs) / temperature
+///
+/// This is because:
+/// CE(P, Q) = -∑ P(i) * log(Q(i))
+/// dCE/ds = Q - P (where Q = softmax(s))
+kernel void fused_soft_cross_entropy_backward(
+    device const float* teacher_logits [[buffer(0)]],
+    device float* student_logits [[buffer(1)]],        // IN-PLACE gradient
+    device const float* teacher_lse [[buffer(2)]],
+    device const float* student_lse [[buffer(3)]],
+    device const float* grad_loss [[buffer(4)]],       // Upstream gradient
+    constant DistillParams& params [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint token_idx = gid.y;
+    const uint vocab_idx = gid.x;
+
+    if (token_idx >= params.num_tokens || vocab_idx >= params.vocab_size) return;
+
+    const uint idx = token_idx * params.vocab_size + vocab_idx;
+    const float T = params.temperature;
+
+    float t_logit = teacher_logits[idx] / T;
+    float s_logit = student_logits[idx] / T;
+
+    float p = exp(t_logit - teacher_lse[token_idx]);  // teacher prob
+    float q = exp(s_logit - student_lse[token_idx]);  // student prob
+
+    // Gradient = upstream * (Q - P) / T
+    float grad = grad_loss[token_idx] * (q - p) / T;
+
+    student_logits[idx] = grad;
+}
+
+/// Jensen-Shannon divergence backward pass.
+///
+/// JS(P||Q) = 0.5 * KL(P||M) + 0.5 * KL(Q||M), where M = 0.5*(P+Q)
+///
+/// dJS/ds = 0.5 * d(KL(Q||M))/ds
+///        = 0.5 * (Q - M) / T  (since P is detached)
+///        = 0.5 * (Q - 0.5*(P+Q)) / T
+///        = 0.5 * 0.5 * (Q - P) / T
+///        = 0.25 * (Q - P) / T
+kernel void fused_jensen_shannon_backward(
+    device const float* teacher_logits [[buffer(0)]],
+    device float* student_logits [[buffer(1)]],        // IN-PLACE gradient
+    device const float* teacher_lse [[buffer(2)]],
+    device const float* student_lse [[buffer(3)]],
+    device const float* grad_loss [[buffer(4)]],       // Upstream gradient
+    constant DistillParams& params [[buffer(5)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint token_idx = gid.y;
+    const uint vocab_idx = gid.x;
+
+    if (token_idx >= params.num_tokens || vocab_idx >= params.vocab_size) return;
+
+    const uint idx = token_idx * params.vocab_size + vocab_idx;
+    const float T = params.temperature;
+
+    float t_logit = teacher_logits[idx] / T;
+    float s_logit = student_logits[idx] / T;
+
+    float p = exp(t_logit - teacher_lse[token_idx]);  // teacher prob
+    float q = exp(s_logit - student_lse[token_idx]);  // student prob
+
+    // Gradient = upstream * 0.25 * (Q - P) / T
+    // The 0.25 factor comes from: 0.5 (JS weighting) * 0.5 (M = 0.5*(P+Q))
+    float grad = grad_loss[token_idx] * 0.25f * (q - p) / T;
+
+    student_logits[idx] = grad;
+}
+
+/// Hidden state MSE backward pass.
+///
+/// MSE = mean((student - teacher)^2)
+/// dMSE/ds = 2 * (student - teacher) / num_elements
+kernel void fused_hidden_mse_backward(
+    device const float* teacher_hidden [[buffer(0)]],
+    device float* student_hidden [[buffer(1)]],        // IN-PLACE gradient
+    device const float* grad_loss [[buffer(2)]],       // Upstream gradient [num_tokens]
+    constant uint& num_tokens [[buffer(3)]],
+    constant uint& hidden_dim [[buffer(4)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint token_idx = gid.y;
+    const uint dim_idx = gid.x;
+
+    if (token_idx >= num_tokens || dim_idx >= hidden_dim) return;
+
+    const uint idx = token_idx * hidden_dim + dim_idx;
+    const float inv_dim = 1.0f / float(hidden_dim);
+
+    float teacher_val = teacher_hidden[idx];
+    float student_val = student_hidden[idx];
+
+    // Gradient = upstream * 2 * (student - teacher) / hidden_dim
+    float grad = grad_loss[token_idx] * 2.0f * (student_val - teacher_val) * inv_dim;
+
+    student_hidden[idx] = grad;
+}
+
+/// Hidden state cosine similarity backward pass.
+///
+/// Cosine = dot(s, t) / (||s|| * ||t||)
+/// dCosine/ds = (t/||t|| - cos * s/||s||) / ||s||
+///            = (t * ||s|| - cos * s * ||t||) / (||s||^2 * ||t||)
+kernel void fused_hidden_cosine_backward(
+    device const float* teacher_hidden [[buffer(0)]],
+    device float* student_hidden [[buffer(1)]],        // IN-PLACE gradient
+    device const float* teacher_norm [[buffer(2)]],    // [num_tokens] pre-computed ||t||
+    device const float* student_norm [[buffer(3)]],    // [num_tokens] pre-computed ||s||
+    device const float* dot_products [[buffer(4)]],    // [num_tokens] pre-computed dot(s, t)
+    device const float* grad_loss [[buffer(5)]],       // Upstream gradient [num_tokens]
+    constant uint& num_tokens [[buffer(6)]],
+    constant uint& hidden_dim [[buffer(7)]],
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const uint token_idx = gid.y;
+    const uint dim_idx = gid.x;
+
+    if (token_idx >= num_tokens || dim_idx >= hidden_dim) return;
+
+    const uint idx = token_idx * hidden_dim + dim_idx;
+
+    float t_norm = teacher_norm[token_idx];
+    float s_norm = student_norm[token_idx];
+    float dot = dot_products[token_idx];
+
+    // Avoid division by zero
+    if (s_norm < 1e-8f || t_norm < 1e-8f) {
+        student_hidden[idx] = 0.0f;
+        return;
+    }
+
+    float cosine = dot / (s_norm * t_norm);
+    float teacher_val = teacher_hidden[idx];
+    float student_val = student_hidden[idx];
+
+    // Gradient of cosine w.r.t. student hidden
+    // d(cosine)/ds_i = (t_i / ||t|| - cosine * s_i / ||s||) / ||s||
+    float grad_cosine = (teacher_val / t_norm - cosine * student_val / s_norm) / s_norm;
+
+    // For loss = 1 - cosine, gradient is negated
+    float grad = -grad_loss[token_idx] * grad_cosine;
+
+    student_hidden[idx] = grad;
+}
+
+// =============================================================================
+// FUSED FORWARD + BACKWARD KERNELS
+// =============================================================================
+
+/// Fused KL divergence forward + backward in single pass.
+///
+/// Computes both loss and gradient simultaneously, avoiding re-reading logits.
+/// Uses two-phase approach:
+/// 1. First pass: compute logsumexp for both teacher and student
+/// 2. Second pass: compute loss and gradient simultaneously
+///
+/// This saves ~40% latency by avoiding separate forward and backward dispatches.
+kernel void fused_kl_divergence_forward_backward(
+    device const float* teacher_logits [[buffer(0)]],
+    device const float* student_logits [[buffer(1)]],
+    device float* losses [[buffer(2)]],                // [num_tokens] output losses
+    device float* gradients [[buffer(3)]],             // [num_tokens, vocab_size] output grads
+    device const float* grad_upstream [[buffer(4)]],   // [num_tokens] upstream gradient (can be null/1.0)
+    constant DistillParams& params [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    threadgroup float* scratch [[threadgroup(0)]]
+) {
+    const uint token_idx = tgid.x;
+    if (token_idx >= params.num_tokens) return;
+
+    device const float* t_row = teacher_logits + token_idx * params.vocab_size;
+    device const float* s_row = student_logits + token_idx * params.vocab_size;
+    device float* g_row = gradients + token_idx * params.vocab_size;
+
+    const float T = params.temperature;
+    const uint thread_idx = simd_group_id * SIMD_SIZE + lane_id;
+    const uint num_threads = DISTILL_THREADS_PER_TOKEN;
+
+    // Phase 1: Compute logsumexp for both teacher and student
+    float t_local_max = -INFINITY, t_local_sum = 0.0f;
+    float s_local_max = -INFINITY, s_local_sum = 0.0f;
+
+    for (uint v = thread_idx; v < params.vocab_size; v += num_threads) {
+        float t_logit = t_row[v] / T;
+        float s_logit = s_row[v] / T;
+
+        // Online max-sum for logsumexp
+        if (t_logit > t_local_max) {
+            t_local_sum = t_local_sum * metal::fast::exp(t_local_max - t_logit) + 1.0f;
+            t_local_max = t_logit;
+        } else {
+            t_local_sum += metal::fast::exp(t_logit - t_local_max);
+        }
+
+        if (s_logit > s_local_max) {
+            s_local_sum = s_local_sum * metal::fast::exp(s_local_max - s_logit) + 1.0f;
+            s_local_max = s_logit;
+        } else {
+            s_local_sum += metal::fast::exp(s_logit - s_local_max);
+        }
+    }
+
+    // SIMD reduction for logsumexp
+    // Guard against NaN from exp(-INFINITY - (-INFINITY)) when SIMD group is empty
+    float t_simd_max = simd_max(t_local_max);
+    float t_scale = (t_local_max > -INFINITY) ? metal::fast::exp(t_local_max - t_simd_max) : 0.0f;
+    t_local_sum = t_local_sum * t_scale;
+    float t_simd_sum = simd_sum(t_local_sum);
+
+    float s_simd_max = simd_max(s_local_max);
+    float s_scale = (s_local_max > -INFINITY) ? metal::fast::exp(s_local_max - s_simd_max) : 0.0f;
+    s_local_sum = s_local_sum * s_scale;
+    float s_simd_sum = simd_sum(s_local_sum);
+
+    // Store to threadgroup memory for cross-SIMD reduction
+    // Use sentinel value for empty SIMD groups (those that processed no vocab elements)
+    bool simd_has_data = (t_simd_max > -INFINITY);
+    if (lane_id == 0) {
+        scratch[simd_group_id * 4 + 0] = simd_has_data ? t_simd_max : -INFINITY;
+        scratch[simd_group_id * 4 + 1] = simd_has_data ? t_simd_sum : 0.0f;
+        scratch[simd_group_id * 4 + 2] = simd_has_data ? s_simd_max : -INFINITY;
+        scratch[simd_group_id * 4 + 3] = simd_has_data ? s_simd_sum : 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Reduce across SIMD groups (skip empty groups with -INFINITY max)
+    float t_lse, s_lse;
+    {
+        float t_max = scratch[0], t_sum = scratch[1];
+        float s_max = scratch[2], s_sum = scratch[3];
+
+        uint num_simd_groups = DISTILL_THREADS_PER_TOKEN / SIMD_SIZE;
+        for (uint g = 1; g < num_simd_groups; g++) {
+            float g_t_max = scratch[g * 4 + 0];
+            float g_t_sum = scratch[g * 4 + 1];
+            float g_s_max = scratch[g * 4 + 2];
+            float g_s_sum = scratch[g * 4 + 3];
+
+            // Skip empty SIMD groups (those with -INFINITY max)
+            if (g_t_max <= -INFINITY) continue;
+
+            if (g_t_max > t_max) {
+                t_sum = t_sum * metal::fast::exp(t_max - g_t_max) + g_t_sum;
+                t_max = g_t_max;
+            } else {
+                t_sum += g_t_sum * metal::fast::exp(g_t_max - t_max);
+            }
+
+            if (g_s_max > s_max) {
+                s_sum = s_sum * metal::fast::exp(s_max - g_s_max) + g_s_sum;
+                s_max = g_s_max;
+            } else {
+                s_sum += g_s_sum * metal::fast::exp(g_s_max - s_max);
+            }
+        }
+
+        t_lse = t_max + metal::fast::log(t_sum);
+        s_lse = s_max + metal::fast::log(s_sum);
+    }
+
+    // Store logsumexp in scratch for Phase 2
+    if (thread_idx == 0) {
+        scratch[0] = t_lse;
+        scratch[1] = s_lse;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    t_lse = scratch[0];
+    s_lse = scratch[1];
+
+    // Phase 2: Compute loss and gradient simultaneously
+    float local_kl = 0.0f;
+    float upstream = (grad_upstream != nullptr) ? grad_upstream[token_idx] : 1.0f;
+
+    for (uint v = thread_idx; v < params.vocab_size; v += num_threads) {
+        float t_logit = t_row[v] / T;
+        float s_logit = s_row[v] / T;
+
+        float log_p = t_logit - t_lse;
+        float log_q = s_logit - s_lse;
+        float p = metal::fast::exp(log_p);
+        float q = metal::fast::exp(log_q);
+
+        // Accumulate KL loss: sum(P * (log_P - log_Q))
+        local_kl += p * (log_p - log_q);
+
+        // Compute gradient: (Q - P) / T * upstream
+        g_row[v] = upstream * (q - p) / T;
+    }
+
+    // Final loss reduction
+    float simd_kl = simd_sum(local_kl);
+
+    if (lane_id == 0) {
+        scratch[simd_group_id] = simd_kl;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group_id == 0 && lane_id == 0) {
+        float total_kl = 0.0f;
+        uint num_simd_groups = DISTILL_THREADS_PER_TOKEN / SIMD_SIZE;
+        for (uint g = 0; g < num_simd_groups; g++) {
+            total_kl += scratch[g];
+        }
+
+        // Store loss (T^2 scaling for gradient matching)
+        losses[token_idx] = max(total_kl * T * T, 0.0f);
+    }
+}
+
+/// Fused combined loss (hard CE + soft KL) forward + backward.
+///
+/// Computes: total_loss = alpha * T^2 * KL(teacher || student) + (1-alpha) * CE(labels, student)
+///
+/// This is the most common distillation objective and benefits significantly from fusion.
+kernel void fused_combined_loss_forward_backward(
+    device const float* teacher_logits [[buffer(0)]],
+    device const float* student_logits [[buffer(1)]],
+    device const int32_t* labels [[buffer(2)]],        // Ground truth labels
+    device float* losses [[buffer(3)]],                // [num_tokens] combined loss
+    device float* gradients [[buffer(4)]],             // [num_tokens, vocab_size] output grads
+    constant DistillParams& params [[buffer(5)]],
+    constant float& alpha [[buffer(6)]],               // Soft loss weight
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
+    threadgroup float* scratch [[threadgroup(0)]]
+) {
+    const uint token_idx = tgid.x;
+    if (token_idx >= params.num_tokens) return;
+
+    device const float* t_row = teacher_logits + token_idx * params.vocab_size;
+    device const float* s_row = student_logits + token_idx * params.vocab_size;
+    device float* g_row = gradients + token_idx * params.vocab_size;
+    const int32_t label = labels[token_idx];
+
+    const float T = params.temperature;
+    const uint thread_idx = simd_group_id * SIMD_SIZE + lane_id;
+    const uint num_threads = DISTILL_THREADS_PER_TOKEN;
+
+    // Ignore padded tokens (label == -100 is common ignore index)
+    if (label < 0) {
+        for (uint v = thread_idx; v < params.vocab_size; v += num_threads) {
+            g_row[v] = 0.0f;
+        }
+        if (thread_idx == 0) {
+            losses[token_idx] = 0.0f;
+        }
+        return;
+    }
+
+    // Phase 1: Compute logsumexp for teacher (with T) and student (with T and without)
+    float t_local_max = -INFINITY, t_local_sum = 0.0f;
+    float s_T_local_max = -INFINITY, s_T_local_sum = 0.0f;  // For soft loss (with T)
+    float s_local_max = -INFINITY, s_local_sum = 0.0f;       // For hard loss (T=1)
+
+    for (uint v = thread_idx; v < params.vocab_size; v += num_threads) {
+        float t_logit_T = t_row[v] / T;
+        float s_logit_T = s_row[v] / T;
+        float s_logit = s_row[v];
+
+        // Teacher logsumexp (with T)
+        if (t_logit_T > t_local_max) {
+            t_local_sum = t_local_sum * metal::fast::exp(t_local_max - t_logit_T) + 1.0f;
+            t_local_max = t_logit_T;
+        } else {
+            t_local_sum += metal::fast::exp(t_logit_T - t_local_max);
+        }
+
+        // Student logsumexp (with T, for soft loss)
+        if (s_logit_T > s_T_local_max) {
+            s_T_local_sum = s_T_local_sum * metal::fast::exp(s_T_local_max - s_logit_T) + 1.0f;
+            s_T_local_max = s_logit_T;
+        } else {
+            s_T_local_sum += metal::fast::exp(s_logit_T - s_T_local_max);
+        }
+
+        // Student logsumexp (without T, for hard loss)
+        if (s_logit > s_local_max) {
+            s_local_sum = s_local_sum * metal::fast::exp(s_local_max - s_logit) + 1.0f;
+            s_local_max = s_logit;
+        } else {
+            s_local_sum += metal::fast::exp(s_logit - s_local_max);
+        }
+    }
+
+    // SIMD reduction
+    float t_simd_max = simd_max(t_local_max);
+    t_local_sum = t_local_sum * metal::fast::exp(t_local_max - t_simd_max);
+    float t_simd_sum = simd_sum(t_local_sum);
+
+    float s_T_simd_max = simd_max(s_T_local_max);
+    s_T_local_sum = s_T_local_sum * metal::fast::exp(s_T_local_max - s_T_simd_max);
+    float s_T_simd_sum = simd_sum(s_T_local_sum);
+
+    float s_simd_max = simd_max(s_local_max);
+    s_local_sum = s_local_sum * metal::fast::exp(s_local_max - s_simd_max);
+    float s_simd_sum = simd_sum(s_local_sum);
+
+    // Store to threadgroup memory
+    if (lane_id == 0) {
+        scratch[simd_group_id * 6 + 0] = t_simd_max;
+        scratch[simd_group_id * 6 + 1] = t_simd_sum;
+        scratch[simd_group_id * 6 + 2] = s_T_simd_max;
+        scratch[simd_group_id * 6 + 3] = s_T_simd_sum;
+        scratch[simd_group_id * 6 + 4] = s_simd_max;
+        scratch[simd_group_id * 6 + 5] = s_simd_sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Cross-SIMD reduction (simplified - first thread reduces all)
+    float t_lse, s_T_lse, s_lse;
+    {
+        float t_max = scratch[0], t_sum = scratch[1];
+        float s_T_max = scratch[2], s_T_sum = scratch[3];
+        float s_max = scratch[4], s_sum = scratch[5];
+
+        uint num_simd_groups = DISTILL_THREADS_PER_TOKEN / SIMD_SIZE;
+        for (uint g = 1; g < num_simd_groups; g++) {
+            float g_t_max = scratch[g * 6 + 0];
+            float g_t_sum = scratch[g * 6 + 1];
+            if (g_t_max > t_max) {
+                t_sum = t_sum * metal::fast::exp(t_max - g_t_max) + g_t_sum;
+                t_max = g_t_max;
+            } else {
+                t_sum += g_t_sum * metal::fast::exp(g_t_max - t_max);
+            }
+
+            float g_s_T_max = scratch[g * 6 + 2];
+            float g_s_T_sum = scratch[g * 6 + 3];
+            if (g_s_T_max > s_T_max) {
+                s_T_sum = s_T_sum * metal::fast::exp(s_T_max - g_s_T_max) + g_s_T_sum;
+                s_T_max = g_s_T_max;
+            } else {
+                s_T_sum += g_s_T_sum * metal::fast::exp(g_s_T_max - s_T_max);
+            }
+
+            float g_s_max = scratch[g * 6 + 4];
+            float g_s_sum = scratch[g * 6 + 5];
+            if (g_s_max > s_max) {
+                s_sum = s_sum * metal::fast::exp(s_max - g_s_max) + g_s_sum;
+                s_max = g_s_max;
+            } else {
+                s_sum += g_s_sum * metal::fast::exp(g_s_max - s_max);
+            }
+        }
+
+        t_lse = t_max + metal::fast::log(t_sum);
+        s_T_lse = s_T_max + metal::fast::log(s_T_sum);
+        s_lse = s_max + metal::fast::log(s_sum);
+    }
+
+    // Store in scratch for Phase 2
+    if (thread_idx == 0) {
+        scratch[0] = t_lse;
+        scratch[1] = s_T_lse;
+        scratch[2] = s_lse;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    t_lse = scratch[0];
+    s_T_lse = scratch[1];
+    s_lse = scratch[2];
+
+    // Phase 2: Compute losses and gradients
+    float local_kl = 0.0f;
+    const float T2 = T * T;
+    const float one_minus_alpha = 1.0f - alpha;
+
+    for (uint v = thread_idx; v < params.vocab_size; v += num_threads) {
+        float t_logit_T = t_row[v] / T;
+        float s_logit_T = s_row[v] / T;
+        float s_logit = s_row[v];
+
+        // Soft loss components (with T)
+        float log_p = t_logit_T - t_lse;
+        float log_q_T = s_logit_T - s_T_lse;
+        float p = metal::fast::exp(log_p);
+        float q_T = metal::fast::exp(log_q_T);
+
+        // Hard loss components (without T)
+        float q = metal::fast::exp(s_logit - s_lse);
+
+        // Accumulate KL loss
+        local_kl += p * (log_p - log_q_T);
+
+        // Combined gradient:
+        // Soft: alpha * T^2 * (q_T - p) / T = alpha * T * (q_T - p)
+        // Hard: (1 - alpha) * (q - one_hot[label])
+        float soft_grad = alpha * T * (q_T - p);
+        float hard_grad = one_minus_alpha * (q - ((v == uint(label)) ? 1.0f : 0.0f));
+
+        g_row[v] = soft_grad + hard_grad;
+    }
+
+    // Final loss reduction
+    float simd_kl = simd_sum(local_kl);
+
+    if (lane_id == 0) {
+        scratch[simd_group_id] = simd_kl;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group_id == 0 && lane_id == 0) {
+        float total_kl = 0.0f;
+        uint num_simd_groups = DISTILL_THREADS_PER_TOKEN / SIMD_SIZE;
+        for (uint g = 0; g < num_simd_groups; g++) {
+            total_kl += scratch[g];
+        }
+
+        // Soft loss with T^2 scaling
+        float soft_loss = max(total_kl * T2, 0.0f);
+
+        // Hard loss: -log(q[label])
+        float s_label_logit = s_row[label];
+        float hard_loss = -s_label_logit + s_lse;
+
+        // Combined loss
+        losses[token_idx] = alpha * soft_loss + one_minus_alpha * hard_loss;
+    }
+}

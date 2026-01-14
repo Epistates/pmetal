@@ -55,11 +55,36 @@ impl Default for TunedConfig {
     }
 }
 
+/// Configuration for tuned merge kernels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct MergeTunedConfig {
+    /// Threads per threadgroup for element-wise ops.
+    pub threads_per_group: u32,
+    /// Elements processed per thread (vectorization factor).
+    pub elements_per_thread: u32,
+    /// Use SIMD-optimized path.
+    pub use_simd: bool,
+}
+
+impl Default for MergeTunedConfig {
+    fn default() -> Self {
+        Self {
+            threads_per_group: 256,
+            elements_per_thread: 4,
+            use_simd: true,
+        }
+    }
+}
+
 /// The Auto-Tuner.
 pub struct Tuner {
-    /// Cache of best configurations.
+    /// Cache of best configurations for matrix ops.
     /// Key: "kernel_name:M:N:K" (problem size hash)
     cache: Mutex<HashMap<String, TunedConfig>>,
+
+    /// Cache of best configurations for merge ops.
+    /// Key: "merge_kernel:num_elements:num_models"
+    merge_cache: Mutex<HashMap<String, MergeTunedConfig>>,
 }
 
 impl Default for Tuner {
@@ -73,7 +98,20 @@ impl Tuner {
     pub fn new() -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
+            merge_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Get a cached merge configuration if available.
+    pub fn get_merge_config(&self, key: &str) -> Option<MergeTunedConfig> {
+        let cache = self.merge_cache.lock().unwrap();
+        cache.get(key).copied()
+    }
+
+    /// Store a merge configuration in the cache.
+    pub fn set_merge_config(&self, key: String, config: MergeTunedConfig) {
+        let mut cache = self.merge_cache.lock().unwrap();
+        cache.insert(key, config);
     }
 
     /// Tune the Fused LoRA Forward kernel.
@@ -479,6 +517,326 @@ impl Tuner {
         let threadgroup_size = MTLSize {
             width: config.tile_n as usize,
             height: (config.tile_m as usize) / 32, // SIMD_SIZE is 32
+            depth: 1,
+        };
+
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+        encoder.endEncoding();
+
+        buffer.commit();
+        buffer.waitUntilCompleted();
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // Merge Kernel Tuning
+    // =========================================================================
+
+    /// Tune merge kernels (sparsification, TIES, etc.) for the given problem size.
+    ///
+    /// # Arguments
+    /// * `context` - Metal context
+    /// * `num_elements` - Total number of elements to process
+    /// * `num_models` - Number of models being merged (for TIES)
+    ///
+    /// # Returns
+    /// Optimal configuration for merge operations on this hardware.
+    pub fn tune_merge(
+        &self,
+        context: &MetalContext,
+        num_elements: usize,
+        num_models: usize,
+    ) -> Result<MergeTunedConfig> {
+        let key = format!("merge:{}:{}", num_elements, num_models);
+
+        // Check cache
+        if let Some(config) = self.get_merge_config(&key) {
+            return Ok(config);
+        }
+
+        info!(
+            "Tuning merge kernel for {} elements, {} models...",
+            num_elements, num_models
+        );
+
+        // Generate candidates based on device tier
+        let candidates = self.generate_merge_candidates(context);
+        debug!(
+            "Generated {} merge candidates for device",
+            candidates.len()
+        );
+
+        let mut best_config = MergeTunedConfig::default();
+        let mut best_time = f64::INFINITY;
+
+        // Benchmark each candidate
+        for config in candidates {
+            match self.benchmark_merge(context, config, num_elements) {
+                Ok(time) => {
+                    debug!("Merge config {:?} took {:.3} ms", config, time * 1000.0);
+                    if time < best_time {
+                        best_time = time;
+                        best_config = config;
+                    }
+                }
+                Err(e) => {
+                    debug!("Merge config {:?} failed: {}", config, e);
+                }
+            }
+        }
+
+        info!(
+            "Best merge config: {:?} ({:.3} ms)",
+            best_config,
+            best_time * 1000.0
+        );
+
+        // Cache result
+        self.set_merge_config(key, best_config);
+
+        Ok(best_config)
+    }
+
+    /// Generate candidate configurations for merge kernels.
+    fn generate_merge_candidates(&self, context: &MetalContext) -> Vec<MergeTunedConfig> {
+        use crate::context::DeviceTier;
+
+        let props = context.properties();
+        let max_threads = props.max_threads_per_threadgroup as u32;
+
+        // Device tier-aware candidate ordering
+        let base_candidates: Vec<MergeTunedConfig> = match props.device_tier {
+            DeviceTier::Ultra | DeviceTier::Max => vec![
+                // High-end: larger threadgroups, more elements per thread
+                MergeTunedConfig {
+                    threads_per_group: 512,
+                    elements_per_thread: 8,
+                    use_simd: true,
+                },
+                MergeTunedConfig {
+                    threads_per_group: 256,
+                    elements_per_thread: 8,
+                    use_simd: true,
+                },
+                MergeTunedConfig {
+                    threads_per_group: 512,
+                    elements_per_thread: 4,
+                    use_simd: true,
+                },
+                MergeTunedConfig {
+                    threads_per_group: 256,
+                    elements_per_thread: 4,
+                    use_simd: true,
+                },
+            ],
+            DeviceTier::Pro => vec![
+                MergeTunedConfig {
+                    threads_per_group: 256,
+                    elements_per_thread: 8,
+                    use_simd: true,
+                },
+                MergeTunedConfig {
+                    threads_per_group: 256,
+                    elements_per_thread: 4,
+                    use_simd: true,
+                },
+                MergeTunedConfig {
+                    threads_per_group: 512,
+                    elements_per_thread: 4,
+                    use_simd: true,
+                },
+                MergeTunedConfig {
+                    threads_per_group: 128,
+                    elements_per_thread: 8,
+                    use_simd: true,
+                },
+            ],
+            DeviceTier::Base => vec![
+                // Base chips: smaller threadgroups, moderate vectorization
+                MergeTunedConfig {
+                    threads_per_group: 256,
+                    elements_per_thread: 4,
+                    use_simd: true,
+                },
+                MergeTunedConfig {
+                    threads_per_group: 128,
+                    elements_per_thread: 4,
+                    use_simd: true,
+                },
+                MergeTunedConfig {
+                    threads_per_group: 256,
+                    elements_per_thread: 2,
+                    use_simd: true,
+                },
+                MergeTunedConfig {
+                    threads_per_group: 128,
+                    elements_per_thread: 8,
+                    use_simd: true,
+                },
+            ],
+        };
+
+        // Filter by device max threads
+        base_candidates
+            .into_iter()
+            .filter(|c| c.threads_per_group <= max_threads)
+            .collect()
+    }
+
+    /// Benchmark merge kernel configuration.
+    fn benchmark_merge(
+        &self,
+        context: &MetalContext,
+        config: MergeTunedConfig,
+        num_elements: usize,
+    ) -> Result<f64> {
+        let device = context.device();
+
+        // Skip very large allocations
+        let total_bytes = num_elements * 4 * 2; // input + output
+        if total_bytes > 500 * 1024 * 1024 {
+            debug!(
+                "Skipping merge benchmark (memory too large: {} MB)",
+                total_bytes / 1024 / 1024
+            );
+            // Return default time penalty
+            return Ok(if config.threads_per_group == 256 {
+                1.0
+            } else {
+                100.0
+            });
+        }
+
+        // Create test buffers
+        let options = MTLResourceOptions::StorageModePrivate;
+        let buf_input =
+            device
+                .newBufferWithLength_options(num_elements * 4, options)
+                .ok_or(MetalError::BufferCreation {
+                    size: num_elements * 4,
+                    reason: "merge input".into(),
+                })?;
+        let buf_output =
+            device
+                .newBufferWithLength_options(num_elements * 4, options)
+                .ok_or(MetalError::BufferCreation {
+                    size: num_elements * 4,
+                    reason: "merge output".into(),
+                })?;
+
+        // Get pipeline for simple magnitude computation
+        let pipeline = context
+            .pipeline_cache_mut()
+            .get_or_create_pipeline(context.device(), "fused_compute_magnitudes", None)?;
+
+        // Create config buffer
+        #[repr(C)]
+        struct MergeConfigParams {
+            num_tensors: u32,
+            total_elements: u32,
+            epsilon: f32,
+            _pad: u32,
+        }
+        let params = MergeConfigParams {
+            num_tensors: 1,
+            total_elements: num_elements as u32,
+            epsilon: 1e-8,
+            _pad: 0,
+        };
+
+        // Tensor info
+        #[repr(C)]
+        struct TensorInfoParams {
+            offset: u32,
+            size: u32,
+            density: f32,
+            threshold: f32,
+        }
+        let tensor_info = TensorInfoParams {
+            offset: 0,
+            size: num_elements as u32,
+            density: 0.5,
+            threshold: 0.0,
+        };
+
+        // Warmup
+        self.dispatch_merge_kernel(
+            context,
+            &pipeline,
+            config,
+            &buf_input,
+            &buf_output,
+            &params,
+            &tensor_info,
+            num_elements,
+        )?;
+
+        // Benchmark
+        let start = Instant::now();
+        let iterations = 5;
+        for _ in 0..iterations {
+            self.dispatch_merge_kernel(
+                context,
+                &pipeline,
+                config,
+                &buf_input,
+                &buf_output,
+                &params,
+                &tensor_info,
+                num_elements,
+            )?;
+        }
+        let elapsed = start.elapsed();
+
+        Ok(elapsed.as_secs_f64() / iterations as f64)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_merge_kernel<P, T>(
+        &self,
+        context: &MetalContext,
+        pipeline: &ProtocolObject<dyn MTLComputePipelineState>,
+        config: MergeTunedConfig,
+        input: &ProtocolObject<dyn MTLBuffer>,
+        output: &ProtocolObject<dyn MTLBuffer>,
+        params: &P,
+        tensor_info: &T,
+        num_elements: usize,
+    ) -> Result<()> {
+        let queue = context.command_queue();
+        let buffer = queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandQueueCreation)?;
+        let encoder = buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::CommandQueueCreation)?;
+
+        encoder.setComputePipelineState(pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(input), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(output), 0, 1);
+
+            let tensor_info_ptr = NonNull::from(tensor_info).cast();
+            encoder.setBytes_length_atIndex(tensor_info_ptr, std::mem::size_of::<T>(), 2);
+
+            let params_ptr = NonNull::from(params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of::<P>(), 3);
+        }
+
+        // Calculate grid based on tuned config
+        let elements_per_group =
+            (config.threads_per_group * config.elements_per_thread) as usize;
+        let grid_size = MTLSize {
+            width: num_elements.div_ceil(elements_per_group),
+            height: 1,
+            depth: 1,
+        };
+
+        let threadgroup_size = MTLSize {
+            width: config.threads_per_group as usize,
+            height: 1,
             depth: 1,
         };
 

@@ -9,6 +9,7 @@ use mlx_rs::Array;
 use tracing::{debug, info, warn};
 
 use crate::{
+    batched::{BatchConfig, BatchedMerger, MergeStats, StreamingBatchedMerger},
     DareMerge, LinearMerge, MergeConfig, MergeError, MergeMethod, MergeMethodConfig,
     MergeParameters, ModelStockMerge, PassthroughMerge, Result, SafetensorsLoader, SlerpMerge,
     TaskArithmeticMerge, TensorLoader, TensorWriter, TiesMerge,
@@ -69,6 +70,80 @@ pub fn run_merge(config: &MergeConfig) -> Result<std::path::PathBuf> {
     info!("Merge complete! Output saved to: {:?}", output_path);
 
     Ok(output_path)
+}
+
+/// Run a model merge using batched processing for improved throughput.
+///
+/// This variant uses the optimized batched processing pipeline which:
+/// - Processes multiple tensors per GPU sync (reduces sync overhead)
+/// - Uses O(n) online thresholding instead of O(n log n) sorting
+/// - Writes merged tensors immediately (memory-efficient streaming)
+///
+/// # Arguments
+/// * `config` - Merge configuration specifying models, method, and parameters
+/// * `batch_config` - Optional batch processing configuration
+///
+/// # Returns
+/// Tuple of (output path, merge statistics)
+pub fn run_merge_batched(
+    config: &MergeConfig,
+    batch_config: Option<BatchConfig>,
+) -> Result<(std::path::PathBuf, MergeStats)> {
+    let batch_config = batch_config.unwrap_or_default();
+
+    info!(
+        "Starting batched merge with method: {:?} (batch_size={})",
+        config.merge_method, batch_config.batch_size
+    );
+
+    // Create the merge method
+    let method = create_merge_method(&config.merge_method);
+    info!(
+        "Using merge method: {} - {}",
+        method.name(),
+        method.description()
+    );
+
+    // Validate configuration
+    validate_config(config, &*method)?;
+
+    // Load models lazily
+    let loaders = load_models(config)?;
+    let base_loader = load_base_model(config)?;
+
+    // Get all tensor names (union across all models)
+    let tensor_names = collect_tensor_names(&loaders, &base_loader)?;
+    info!("Found {} tensors to merge", tensor_names.len());
+
+    // Determine output path
+    let output_path = config
+        .output_path
+        .clone()
+        .unwrap_or_else(|| std::path::PathBuf::from("merged_model"));
+
+    // Create output writer
+    let writer = TensorWriter::new(&output_path)?;
+
+    // Create batched merger
+    let merger = BatchedMerger::new(
+        batch_config,
+        &*method,
+        &loaders,
+        base_loader.as_ref(),
+        config,
+    );
+
+    // Create streaming merger and process
+    let mut streaming = StreamingBatchedMerger::new(merger, writer);
+    let stats = streaming.process_all(&tensor_names)?;
+
+    info!(
+        "Batched merge complete! {} tensors in {:.1}ms ({:.1} tensors/sec)",
+        stats.total_tensors, stats.elapsed_ms, stats.tensors_per_second
+    );
+    info!("Output saved to: {:?}", output_path);
+
+    Ok((output_path, stats))
 }
 
 /// Create the appropriate merge method from configuration.

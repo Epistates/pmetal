@@ -9,6 +9,7 @@ pub mod fp8_training;
 pub mod fused_cross_entropy;
 pub mod fused_distill;
 pub mod fused_lora;
+pub mod fused_merge;
 pub mod fused_norm_lora;
 pub mod fused_rope;
 pub mod fused_sampler;
@@ -38,6 +39,9 @@ pub use fused_distill::{
     HiddenAlignConfig, HiddenAlignLossType,
 };
 pub use fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
+pub use fused_merge::{
+    build_merge_config, build_tensor_info, FusedMergeMetal, MergeConfig, TensorInfo,
+};
 pub use fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};
 pub use fused_sampler::{FusedSampler, FusedSamplerConfig, SamplingParams};
