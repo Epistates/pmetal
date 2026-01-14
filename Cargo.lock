@@ -1376,7 +1376,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8d162beedaa69905488a8da94f5ac3edb4dd4788b732fadb7bd120b2625c1976"
 dependencies = [
  "data-encoding",
- "syn 2.0.111",
+ "syn 1.0.109",
 ]
 
 [[package]]
@@ -3536,7 +3536,7 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/nicholasjpaterno/mlx-rs.git?branch=main#7cf527172c8cc816f28e30b5b95f1616f7e56abf"
+source = "git+https://github.com/nicholasjpaterno/mlx-rs.git?branch=main#08387ae4b374041c3cd56fca5ea634f78d61c43c"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -3548,7 +3548,7 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/nicholasjpaterno/mlx-rs.git?branch=main#7cf527172c8cc816f28e30b5b95f1616f7e56abf"
+source = "git+https://github.com/nicholasjpaterno/mlx-rs.git?branch=main#08387ae4b374041c3cd56fca5ea634f78d61c43c"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
@@ -3559,7 +3559,7 @@ dependencies = [
 [[package]]
 name = "mlx-rs"
 version = "0.25.3"
-source = "git+https://github.com/nicholasjpaterno/mlx-rs.git?branch=main#7cf527172c8cc816f28e30b5b95f1616f7e56abf"
+source = "git+https://github.com/nicholasjpaterno/mlx-rs.git?branch=main#08387ae4b374041c3cd56fca5ea634f78d61c43c"
 dependencies = [
  "bytemuck",
  "dyn-clone",
@@ -3584,7 +3584,7 @@ dependencies = [
 [[package]]
 name = "mlx-sys"
 version = "0.2.0"
-source = "git+https://github.com/nicholasjpaterno/mlx-rs.git?branch=main#7cf527172c8cc816f28e30b5b95f1616f7e56abf"
+source = "git+https://github.com/nicholasjpaterno/mlx-rs.git?branch=main#08387ae4b374041c3cd56fca5ea634f78d61c43c"
 dependencies = [
  "bindgen",
  "cc",

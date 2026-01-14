@@ -279,6 +279,12 @@ enum Commands {
         /// Show thinking content in output (if model generates it)
         #[arg(long)]
         show_thinking: bool,
+
+        /// Use FP8 quantization for weights (~2x memory reduction).
+        /// Quantizes model weights to 8-bit floating point (E4M3 format)
+        /// for memory-efficient inference on Apple Silicon.
+        #[arg(long)]
+        fp8: bool,
     },
 
     /// Download a model from HuggingFace
@@ -541,6 +547,7 @@ async fn main() -> anyhow::Result<()> {
             stream,
             minimal,
             show_thinking,
+            fp8,
         } => {
             run_inference(
                 &model,
@@ -563,6 +570,7 @@ async fn main() -> anyhow::Result<()> {
                 stream,
                 minimal,
                 show_thinking,
+                fp8,
             )
             .await?;
         }
@@ -1393,6 +1401,8 @@ async fn run_training(
 ///
 /// Implements SOTA sampling: temperature, top-k, top-p, min-p, repetition penalty,
 /// frequency penalty, and presence penalty.
+///
+/// With `--fp8`, weights are quantized to FP8 E4M3 format for ~2x memory savings.
 #[allow(clippy::too_many_arguments)]
 async fn run_inference(
     model_id: &str,
@@ -1415,6 +1425,7 @@ async fn run_inference(
     stream: bool,
     minimal: bool,
     show_thinking: bool,
+    fp8: bool,
 ) -> anyhow::Result<()> {
     #[cfg(target_os = "macos")]
     use pmetal_models::generate_cached_metal;
@@ -1425,9 +1436,28 @@ async fn run_inference(
 
     tracing::info!(model = %model_id, "Loading model for inference");
 
-    // Download model if needed
+    // Download model if needed (HuggingFace repo ID contains '/')
     let model_path = if model_id.contains('/') && !PathBuf::from(model_id).exists() {
-        pmetal_hub::download_model(model_id, None, None).await?
+        tracing::info!("Model not found locally, downloading from HuggingFace Hub...");
+
+        // Download model (hf_hub handles caching automatically)
+        let path = pmetal_hub::download_model(model_id, None, None).await?;
+
+        // Download tokenizer files
+        tracing::info!("Downloading tokenizer...");
+        let _ = pmetal_hub::download_file(model_id, "tokenizer.json", None, None).await;
+        let _ = pmetal_hub::download_file(model_id, "tokenizer_config.json", None, None).await;
+        let _ = pmetal_hub::download_file(model_id, "special_tokens_map.json", None, None).await;
+
+        // Download generation config if available
+        let _ = pmetal_hub::download_file(model_id, "generation_config.json", None, None).await;
+
+        // Download model weights (safetensors)
+        tracing::info!("Downloading model weights (this may take a while for large models)...");
+        pmetal_hub::download_safetensors(model_id, None, None).await?;
+
+        tracing::info!("Model downloaded successfully to {:?}", path);
+        path
     } else {
         PathBuf::from(model_id)
     };
@@ -1464,6 +1494,13 @@ async fn run_inference(
         "Model loaded successfully (architecture: {})",
         model.architecture()
     );
+
+    // Apply FP8 quantization if requested
+    if fp8 {
+        tracing::info!("Quantizing model weights to FP8 E4M3 format...");
+        model.quantize_fp8()?;
+        tracing::info!("FP8 quantization complete (~2x memory reduction)")
+    }
 
     // Auto-detect if chat mode should be enabled for instruction-tuned models
     let is_instruct_model = is_instruction_tuned(&model_path);

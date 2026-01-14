@@ -1,31 +1,43 @@
 //! FP8 Quantization support for memory-efficient training and inference.
 //!
 //! FP8 (8-bit floating point) provides ~2x memory reduction compared to FP16/BF16
-//! with minimal accuracy loss for inference. There are two common FP8 formats:
+//! with minimal accuracy loss for inference. MLX uses the E4M3 format:
 //!
-//! - **E4M3**: 4-bit exponent, 3-bit mantissa - better for weights
-//! - **E5M2**: 5-bit exponent, 2-bit mantissa - better for activations/gradients
+//! - **E4M3**: 4-bit exponent, 3-bit mantissa - range ~±240
 //!
 //! This module provides:
-//! - FP8 weight quantization for inference
+//! - Native FP8 weight quantization via MLX's `to_fp8`/`from_fp8` operations
+//! - FP8 linear layers for inference
 //! - Dynamic scaling for FP8 training
-//! - FBGEMM-style FP8 linear layers
 //!
-//! Note: Full FP8 support requires mlx-rs bindings for FP8 operations.
-//! Currently uses BF16 fallback with scaling factors for the same interface.
+//! # Example
+//!
+//! ```ignore
+//! use pmetal_mlx::fp8_quantization::{Fp8Linear, Fp8Config};
+//!
+//! // Quantize weights for inference
+//! let fp8_linear = Fp8Linear::from_weights(&weight, None, Fp8Config::default())?;
+//!
+//! // Run inference (uses native FP8 operations)
+//! let output = fp8_linear.forward(&input)?;
+//! ```
 
 use mlx_rs::error::Exception;
+use mlx_rs::ops::{from_fp8, to_fp8};
 use mlx_rs::Array;
 use serde::{Deserialize, Serialize};
 
 /// FP8 format type.
+///
+/// MLX currently supports E4M3 format natively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Fp8Format {
     /// E4M3 format: 4-bit exponent, 3-bit mantissa.
-    /// Range: ~+-240, Best for weights.
+    /// Range: ~±240, Best for weights.
     E4M3,
     /// E5M2 format: 5-bit exponent, 2-bit mantissa.
-    /// Range: ~+-57344, Best for activations.
+    /// Range: ~±57344, Best for activations.
+    /// Note: Currently uses E4M3 internally as MLX only supports E4M3.
     E5M2,
 }
 
@@ -80,82 +92,64 @@ impl Default for Fp8Config {
     }
 }
 
-/// Quantized FP8 tensor with scale factor.
+/// Quantized FP8 tensor using native MLX FP8 operations.
+///
+/// Data is stored as uint8 in E4M3 format using MLX's native `to_fp8` operation.
 #[derive(Debug, Clone)]
 pub struct Fp8Tensor {
-    /// The quantized data (stored as bf16 until native FP8 support).
+    /// The quantized data (stored as uint8 in E4M3 format).
     pub data: Array,
-    /// Scale factor for dequantization.
-    pub scale: Array,
-    /// Inverse scale for efficient computation.
-    pub scale_inv: Array,
+    /// Original shape for reference.
+    pub shape: Vec<i32>,
     /// Format used for quantization.
     pub format: Fp8Format,
 }
 
 impl Fp8Tensor {
-    /// Quantize a tensor to FP8.
+    /// Quantize a tensor to FP8 using native MLX operations.
     ///
-    /// The quantization formula is: `q = clamp(x / scale, -max, max)`
-    pub fn quantize(x: &Array, format: Fp8Format, per_channel: bool) -> Result<Self, Exception> {
-        // Compute amax for scaling
-        let amax = if per_channel {
-            // Per-channel amax along last dimension
-            let abs_x = mlx_rs::ops::abs(x)?;
-            abs_x.max_axis(-1, true)?
-        } else {
-            // Per-tensor amax
-            let abs_x = mlx_rs::ops::abs(x)?;
-            abs_x.max(None)?
-        };
-
-        // Compute scale: scale = amax / max_fp8
-        let max_fp8 = Array::from_f32(format.max_value());
-        let eps = Array::from_f32(1e-12);
-        let scale = mlx_rs::ops::maximum(&amax, &eps)?.divide(&max_fp8)?;
-        let scale_inv = max_fp8.divide(&mlx_rs::ops::maximum(&amax, &eps)?)?;
-
-        // Quantize: q = x / scale (then clip to FP8 range)
-        let scaled = x.divide(&scale)?;
-        let neg_max = Array::from_f32(-format.max_value());
-        let data = mlx_rs::ops::maximum(&scaled, &neg_max)?;
-        let data = mlx_rs::ops::minimum(&data, &max_fp8)?;
-
-        // Convert to bf16 (FP8 storage emulation until native support)
-        let data = data.as_dtype(mlx_rs::Dtype::Bfloat16)?;
+    /// Uses MLX's `to_fp8` which converts to E4M3 format stored as uint8.
+    pub fn quantize(x: &Array, format: Fp8Format, _per_channel: bool) -> Result<Self, Exception> {
+        // Use native MLX FP8 conversion
+        let data = to_fp8(x)?;
 
         Ok(Self {
             data,
-            scale,
-            scale_inv,
+            shape: x.shape().to_vec(),
             format,
         })
     }
 
     /// Dequantize the FP8 tensor back to full precision.
+    ///
+    /// Uses MLX's `from_fp8` for native conversion.
     pub fn dequantize(&self) -> Result<Array, Exception> {
-        // Convert to float32 and multiply by scale
-        let float_data = self.data.as_dtype(mlx_rs::Dtype::Float32)?;
-        float_data.multiply(&self.scale)
+        from_fp8(&self.data, mlx_rs::Dtype::Float32)
     }
 
-    /// Get the quantized data (for FP8 matmul when available).
+    /// Dequantize to bfloat16 for efficient computation.
+    pub fn dequantize_bf16(&self) -> Result<Array, Exception> {
+        from_fp8(&self.data, mlx_rs::Dtype::Bfloat16)
+    }
+
+    /// Get the quantized data.
     pub fn data(&self) -> &Array {
         &self.data
     }
 
-    /// Get the scale factor.
-    pub fn scale(&self) -> &Array {
-        &self.scale
+    /// Memory size in bytes (1 byte per element for FP8).
+    pub fn memory_bytes(&self) -> usize {
+        self.data.size()
     }
 }
 
-/// FP8 Linear layer for inference.
+/// FP8 Linear layer for inference using native MLX FP8 operations.
 ///
-/// Weights are stored in FP8 format, activations are dynamically quantized.
+/// Weights are stored in native FP8 E4M3 format using MLX's `to_fp8`.
+/// Computation dequantizes to BF16 for matmul, providing ~2x memory savings.
 #[derive(Debug, Clone)]
 pub struct Fp8Linear {
-    /// Quantized weights.
+    /// Quantized weights in FP8 format.
     pub weight: Fp8Tensor,
     /// Optional bias (kept in full precision).
     pub bias: Option<Array>,
@@ -165,6 +159,8 @@ pub struct Fp8Linear {
 
 impl Fp8Linear {
     /// Create from a standard linear layer's weights.
+    ///
+    /// Weights are quantized to FP8 E4M3 format using native MLX operations.
     pub fn from_weights(
         weight: &Array,
         bias: Option<&Array>,
@@ -180,22 +176,17 @@ impl Fp8Linear {
         })
     }
 
-    /// Forward pass with FP8 quantization.
+    /// Forward pass with FP8 weights.
     ///
-    /// Currently uses BF16 emulation. When mlx-rs adds native FP8:
-    /// 1. Quantize input to FP8 E5M2
-    /// 2. Perform FP8 matmul
-    /// 3. Dequantize output with combined scale
+    /// Dequantizes weights to BF16 for the matmul operation.
+    /// This provides memory savings while maintaining computation precision.
     pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        // TODO: Replace with native FP8 matmul when available in mlx-rs
-
-        // For now: dequantize weights and compute in BF16
-        let weight = self.weight.dequantize()?;
-        let weight_bf16 = weight.as_dtype(mlx_rs::Dtype::Bfloat16)?;
+        // Dequantize weights to BF16 for computation
+        let weight = self.weight.dequantize_bf16()?;
         let x_bf16 = x.as_dtype(mlx_rs::Dtype::Bfloat16)?;
 
         // matmul: x @ weight.T
-        let weight_t = weight_bf16.t();
+        let weight_t = weight.t();
         let mut output = x_bf16.matmul(&weight_t)?;
 
         if let Some(ref bias) = self.bias {
@@ -207,10 +198,15 @@ impl Fp8Linear {
 
     /// Memory size in bytes.
     pub fn memory_bytes(&self) -> usize {
-        let weight_bytes = self.weight.data.size() * 2; // BF16 = 2 bytes
-        let scale_bytes = self.weight.scale.size() * 4; // F32 = 4 bytes
+        let weight_bytes = self.weight.memory_bytes();
         let bias_bytes = self.bias.as_ref().map(|b| b.size() * 4).unwrap_or(0);
-        weight_bytes + scale_bytes + bias_bytes
+        weight_bytes + bias_bytes
+    }
+
+    /// Calculate memory savings compared to FP16 weights.
+    pub fn memory_savings(&self) -> f32 {
+        // FP8 = 1 byte, FP16 = 2 bytes, so 50% savings
+        0.5
     }
 }
 
@@ -299,8 +295,8 @@ pub fn quantize_weights_fp8(
 
 /// Calculate memory savings from FP8 quantization.
 pub fn calculate_fp8_savings(original_size_bytes: usize, dtype_bits: usize) -> (usize, f32) {
-    // FP8 = 8 bits + ~4 bits overhead for scales (amortized)
-    let fp8_bits = 8 + 4;
+    // Native FP8 = exactly 8 bits per element
+    let fp8_bits = 8;
     let fp8_size = (original_size_bytes * fp8_bits) / dtype_bits;
     let savings = 1.0 - (fp8_size as f32 / original_size_bytes as f32);
     (fp8_size, savings)
@@ -317,16 +313,20 @@ mod tests {
     }
 
     #[test]
-    fn test_fp8_quantize_dequantize() {
+    fn test_native_fp8_quantize_dequantize() {
         let x = mlx_rs::random::normal::<f32>(&[4, 4], None, None, None).unwrap();
 
         let quantized = Fp8Tensor::quantize(&x, Fp8Format::E4M3, false).unwrap();
+
+        // FP8 data should be uint8
+        assert_eq!(quantized.data.dtype(), mlx_rs::Dtype::Uint8);
+
         let dequantized = quantized.dequantize().unwrap();
 
         // Check shape preserved
         assert_eq!(x.shape(), dequantized.shape());
 
-        // Values should be approximately equal
+        // Evaluate to check no errors
         x.eval().unwrap();
         dequantized.eval().unwrap();
     }
@@ -338,11 +338,29 @@ mod tests {
 
         let fp8_linear = Fp8Linear::from_weights(&weight, None, config).unwrap();
 
+        // Verify weight is in FP8 format
+        assert_eq!(fp8_linear.weight.data.dtype(), mlx_rs::Dtype::Uint8);
+
         let x = mlx_rs::random::normal::<f32>(&[2, 8], None, None, None).unwrap();
         let output = fp8_linear.forward(&x).unwrap();
         output.eval().unwrap();
 
         assert_eq!(output.shape(), &[2, 16]);
+    }
+
+    #[test]
+    fn test_fp8_memory_savings() {
+        let weight = mlx_rs::random::normal::<f32>(&[1024, 1024], None, None, None).unwrap();
+        let config = Fp8Config::default();
+
+        let fp8_linear = Fp8Linear::from_weights(&weight, None, config).unwrap();
+
+        // FP8 should use 1 byte per element vs 4 bytes for f32
+        let fp8_bytes = fp8_linear.memory_bytes();
+        let f32_bytes = 1024 * 1024 * 4;
+
+        // Should be ~75% savings (1 byte vs 4 bytes)
+        assert!(fp8_bytes < f32_bytes / 2);
     }
 
     #[test]
@@ -359,9 +377,15 @@ mod tests {
     }
 
     #[test]
-    fn test_memory_savings() {
+    fn test_memory_savings_calculation() {
+        // F32 to FP8: 4 bytes to 1 byte = 75% savings
+        let (fp8_size, savings) = calculate_fp8_savings(1000, 32);
+        assert_eq!(fp8_size, 250); // 1000 * 8 / 32 = 250
+        assert!((savings - 0.75).abs() < 0.01);
+
+        // F16 to FP8: 2 bytes to 1 byte = 50% savings
         let (fp8_size, savings) = calculate_fp8_savings(1000, 16);
-        assert!(fp8_size < 1000);
-        assert!(savings > 0.0 && savings < 1.0);
+        assert_eq!(fp8_size, 500); // 1000 * 8 / 16 = 500
+        assert!((savings - 0.5).abs() < 0.01);
     }
 }
