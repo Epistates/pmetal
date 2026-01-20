@@ -1604,14 +1604,20 @@ async fn run_inference(
     let mut cache = model.create_cache(max_seq_len);
     tracing::info!("Created KV cache for {} tokens", max_seq_len);
 
-    // Generate with KV cache
+    // Create Mamba cache for hybrid models (NemotronH)
+    let mut mamba_cache = model.create_mamba_cache();
+    if mamba_cache.is_some() {
+        tracing::info!("Created Mamba cache for hybrid model");
+    }
+
+    // Generate with KV cache (and Mamba cache for hybrid models)
     let start = std::time::Instant::now();
 
     #[cfg(target_os = "macos")]
     let output = if minimal {
         tracing::info!("Using minimal async generation (debugging)");
         generate_minimal_async(
-            |input, cache| model.forward_with_cache(input, None, Some(cache)),
+            |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
             &input_ids,
             gen_config,
             &mut cache,
@@ -1619,7 +1625,7 @@ async fn run_inference(
     } else if metal_sampler {
         tracing::info!("Using fused Metal sampling kernel");
         generate_cached_metal(
-            |input, cache| model.forward_with_cache(input, None, Some(cache)),
+            |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
             &input_ids,
             gen_config,
             &mut cache,
@@ -1627,7 +1633,7 @@ async fn run_inference(
     } else if compiled {
         tracing::info!("Using JIT-compiled sampling (mlx_lm style)");
         generate_cached_compiled(
-            |input, cache| model.forward_with_cache(input, None, Some(cache)),
+            |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
             &input_ids,
             gen_config,
             &mut cache,
@@ -1639,7 +1645,7 @@ async fn run_inference(
             tracing::info!("Using async generation with dedicated stream");
         }
         generate_cached_async(
-            |input, cache| model.forward_with_cache(input, None, Some(cache)),
+            |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
             &input_ids,
             gen_config,
             &mut cache,
@@ -1652,7 +1658,7 @@ async fn run_inference(
         if minimal {
             tracing::info!("Using minimal async generation (debugging)");
             generate_minimal_async(
-                |input, cache| model.forward_with_cache(input, None, Some(cache)),
+                |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
                 &input_ids,
                 gen_config,
                 &mut cache,
@@ -1660,7 +1666,7 @@ async fn run_inference(
         } else if compiled {
             tracing::info!("Using JIT-compiled sampling (mlx_lm style)");
             generate_cached_compiled(
-                |input, cache| model.forward_with_cache(input, None, Some(cache)),
+                |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
                 &input_ids,
                 gen_config,
                 &mut cache,
@@ -1672,7 +1678,7 @@ async fn run_inference(
                 tracing::info!("Using async generation with dedicated stream");
             }
             generate_cached_async(
-                |input, cache| model.forward_with_cache(input, None, Some(cache)),
+                |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
                 &input_ids,
                 gen_config,
                 &mut cache,
@@ -1941,11 +1947,12 @@ fn format_qwen3_chatml(
 ) -> String {
     let mut result = String::new();
 
+    // Always include system block (can be empty per NemotronH template)
+    result.push_str("<|im_start|>system\n");
     if let Some(sys) = system_message {
-        result.push_str("<|im_start|>system\n");
         result.push_str(sys);
-        result.push_str("<|im_end|>\n");
     }
+    result.push_str("<|im_end|>\n");
 
     result.push_str("<|im_start|>user\n");
     result.push_str(user_message);
@@ -1953,9 +1960,9 @@ fn format_qwen3_chatml(
     result.push_str("<|im_start|>assistant\n");
 
     if no_thinking {
-        // Force non-thinking: prefill empty think block
-        // This is the Qwen3 "hard switch" to disable reasoning
-        result.push_str("<think>\n\n</think>\n\n");
+        // Force non-thinking: prefill empty think block without newlines
+        // This matches NemotronH's expected format
+        result.push_str("<think></think>");
     } else {
         // Prefill <think> to ensure clean thinking output
         // Without this, model sometimes generates </think> first or skips thinking
@@ -2970,7 +2977,7 @@ async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
 
         // Extract current token (sync point)
         let t0 = Instant::now();
-        let _ = current_token.item::<i32>();
+        let _ = current_token.item::<u32>();
         times.get_mut("item").unwrap().push(t0.elapsed());
 
         times.get_mut("total").unwrap().push(total_start.elapsed());

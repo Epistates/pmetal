@@ -44,10 +44,9 @@ pmetal-merge = { path = "crates/pmetal-merge", version = "0.1.0" }
 pmetal-distill = { path = "crates/pmetal-distill", version = "0.1.0" }
 pmetal-mhc = { path = "crates/pmetal-mhc", version = "0.1.0" }
 
-# MLX bindings - using fork with compile_with_state optimizations
-# PRs: https://github.com/oxideai/mlx-rs/pull/305, https://github.com/oxideai/mlx-rs/pull/306
-mlx-rs = { git = "https://github.com/nicholasjpaterno/mlx-rs.git", branch = "main", features = ["safetensors"] }
-mlx-sys = { git = "https://github.com/nicholasjpaterno/mlx-rs.git", branch = "main" }
+# MLX bindings - using local fork for development
+mlx-rs = { path = "../reference/mlx-rs/mlx-rs", features = ["safetensors"] }
+mlx-sys = { path = "../reference/mlx-rs/mlx-sys" }
 
 # Async runtime
 tokio = { version = "1.42", features = ["full"] }
@@ -119,7 +118,7 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
-# Use fork with compile_with_state fix until PRs are merged
+# Use local mlx-rs for development
 [patch.crates-io]
-mlx-rs = { git = "https://github.com/nicholasjpaterno/mlx-rs.git", branch = "main" }
-mlx-sys = { git = "https://github.com/nicholasjpaterno/mlx-rs.git", branch = "main" }
+mlx-rs = { path = "../reference/mlx-rs/mlx-rs" }
+mlx-sys = { path = "../reference/mlx-rs/mlx-sys" }

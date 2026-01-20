@@ -763,6 +763,7 @@ impl FusedDistill {
     }
 
     /// Execute fused combined loss forward+backward kernel.
+    #[allow(clippy::too_many_arguments)]
     fn execute_forward_backward_combined(
         &self,
         teacher_logits: &impl AsMetalBuffer,

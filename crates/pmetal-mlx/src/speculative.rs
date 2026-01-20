@@ -386,7 +386,7 @@ impl SpeculativeDecoder {
             // Greedy
             let max_idx = argmax(logits, None)?;
             max_idx.eval()?;
-            Ok(max_idx.item::<i32>())
+            Ok(max_idx.item::<u32>() as i32)
         } else {
             // Temperature sampling
             let scaled = logits.divide(Array::from_f32(self.config.temperature))?;

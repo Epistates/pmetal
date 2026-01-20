@@ -811,7 +811,7 @@ impl Sampler {
 /// Note: item() internally calls eval(), so no explicit eval() needed.
 fn greedy_sample(logits: &Array) -> Result<u32, Exception> {
     let token_id = argmax(logits, None)?;
-    Ok(token_id.item::<i32>() as u32)
+    Ok(token_id.item::<u32>())
 }
 
 /// Greedy sampling returning Array for async pipelining.
@@ -1412,7 +1412,8 @@ where
             // Forward pass INSIDE stream context
             let (y, lp) = {
                 let _stream_ctx = StreamContext::new(&generation_stream);
-                let next_input = current_y.reshape(&[1, -1])?;
+                // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
+                let next_input = current_y.as_dtype(mlx_rs::Dtype::Int32)?.reshape(&[1, -1])?;
                 let next_output = forward_fn(&next_input, cache)?;
                 let next_logits = next_output.index((.., 0, ..));
                 sampler.sample_array(&next_logits)?
@@ -1435,7 +1436,7 @@ where
         }
 
         // 4. Extract current token - blocks naturally while GPU computes next
-        let token = current_y.item::<i32>() as u32;
+        let token = current_y.item::<u32>();
 
         // 5. Check stop token
         if sampler.is_stop_token(token) {
@@ -1735,7 +1736,8 @@ where
     loop {
         // Schedule NEXT (if not at max)
         let next_y = if n < max_tokens - 1 {
-            let input = y.reshape(&[1, 1])?;
+            // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
+            let input = y.as_dtype(mlx_rs::Dtype::Int32)?.reshape(&[1, 1])?;
             // step() wraps forward in stream context
             let next = step(&input, cache)?;
             // async_eval OUTSIDE stream context
@@ -1756,7 +1758,7 @@ where
         }
 
         // Extract current (blocks naturally)
-        let token = y.item::<i32>() as u32;
+        let token = y.item::<u32>();
 
         // Check stop
         if stop_tokens.contains(&token) {
@@ -1871,7 +1873,8 @@ where
         let next_y = if n + 1 < config.max_new_tokens {
             let y = {
                 let _stream_ctx = StreamContext::new(&generation_stream);
-                let next_input = current_y.reshape(&[1, 1])?;
+                // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
+                let next_input = current_y.as_dtype(mlx_rs::Dtype::Int32)?.reshape(&[1, 1])?;
                 let next_output = forward_fn(&next_input, cache)?;
                 let next_logits = next_output.index((.., 0..1, ..)).squeeze_axes(&[1])?;
                 compiled_sampler.sample(&next_logits)?
@@ -1889,7 +1892,7 @@ where
         }
 
         // 3. Extract current token - blocks naturally while GPU computes next
-        let token = current_y.item::<i32>() as u32;
+        let token = current_y.item::<u32>();
 
         // 4. Check stop token
         if sampler.is_stop_token(token) {

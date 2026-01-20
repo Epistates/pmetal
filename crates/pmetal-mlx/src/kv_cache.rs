@@ -61,6 +61,14 @@ pub struct KVCacheConfig {
     pub dtype: Dtype,
     /// Cache mode.
     pub mode: CacheMode,
+    /// Whether to eagerly pre-allocate the full context window upfront.
+    /// When true, allocates memory for max_seq_len tokens at creation time.
+    /// This provides predictable memory usage but uses more memory initially.
+    /// Default: false (lazy allocation in 256-token chunks).
+    pub eager_allocate: bool,
+    /// Batch size for eager allocation (only used when eager_allocate=true).
+    /// Default: 1
+    pub eager_batch_size: usize,
 }
 
 /// KV cache mode.
@@ -112,6 +120,8 @@ impl KVCacheConfig {
             head_dim,
             dtype: Dtype::Float32,
             mode: CacheMode::Standard,
+            eager_allocate: false,
+            eager_batch_size: 1,
         }
     }
 
@@ -160,6 +170,66 @@ impl KVCacheConfig {
         self.mode = CacheMode::Quantized { bits, group_size };
         self
     }
+
+    /// Enable eager pre-allocation of the full context window.
+    ///
+    /// When enabled, the KV cache will allocate memory for the full `max_seq_len`
+    /// at creation time rather than growing dynamically. This provides:
+    /// - **Predictable memory usage**: Know exactly how much memory is needed upfront
+    /// - **No allocation during generation**: Faster token generation
+    /// - **Memory fragmentation prevention**: Single contiguous allocation
+    ///
+    /// Trade-off: Uses more memory initially even for short sequences.
+    ///
+    /// # Arguments
+    /// * `batch_size` - Batch size to pre-allocate for (typically 1 for inference)
+    ///
+    /// # Example
+    /// ```ignore
+    /// let config = KVCacheConfig::new(32, 4096, 8, 128)
+    ///     .with_eager_allocate(1);  // Pre-allocate for batch_size=1
+    /// let cache = KVCache::new(config);  // ~1GB allocated immediately
+    /// ```
+    pub fn with_eager_allocate(mut self, batch_size: usize) -> Self {
+        self.eager_allocate = true;
+        self.eager_batch_size = batch_size;
+        self
+    }
+
+    /// Calculate the memory footprint for this configuration in bytes.
+    ///
+    /// Useful for understanding memory requirements before allocation.
+    pub fn memory_footprint(&self) -> usize {
+        let bytes_per_element = match self.dtype {
+            Dtype::Float32 => 4,
+            Dtype::Float16 | Dtype::Bfloat16 => 2,
+            _ => 4, // Default assumption
+        };
+
+        // Per layer: 2 tensors (K, V) × batch × heads × seq × head_dim × bytes
+        let per_layer = 2
+            * self.eager_batch_size
+            * self.num_kv_heads
+            * self.max_seq_len
+            * self.head_dim
+            * bytes_per_element;
+
+        per_layer * self.num_layers
+    }
+
+    /// Format the memory footprint as a human-readable string.
+    pub fn memory_footprint_human(&self) -> String {
+        let bytes = self.memory_footprint();
+        if bytes >= 1024 * 1024 * 1024 {
+            format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
+        } else if bytes >= 1024 * 1024 {
+            format!("{:.2} MB", bytes as f64 / (1024.0 * 1024.0))
+        } else if bytes >= 1024 {
+            format!("{:.2} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{} bytes", bytes)
+        }
+    }
 }
 
 /// Pre-allocation step size in tokens (matches Python mlx-lm).
@@ -188,7 +258,37 @@ impl LayerCache {
         }
     }
 
+    /// Create a new layer cache with pre-allocated buffers.
+    fn new_eager(
+        batch_size: usize,
+        num_kv_heads: usize,
+        max_seq_len: usize,
+        head_dim: usize,
+        dtype: Dtype,
+    ) -> Result<Self, Exception> {
+        let shape = [
+            batch_size as i32,
+            num_kv_heads as i32,
+            max_seq_len as i32,
+            head_dim as i32,
+        ];
+        let keys = Some(ops::zeros_dtype(&shape, dtype)?);
+        let values = Some(ops::zeros_dtype(&shape, dtype)?);
+
+        Ok(Self {
+            keys,
+            values,
+            offset: 0,
+        })
+    }
+
     fn reset(&mut self) {
+        // For eager allocation, just reset offset but keep buffers
+        self.offset = 0;
+        // Note: We don't set keys/values to None to preserve the pre-allocated buffers
+    }
+
+    fn reset_full(&mut self) {
         self.keys = None;
         self.values = None;
         self.offset = 0;
@@ -211,6 +311,9 @@ pub struct KVCache {
 
 impl KVCache {
     /// Create a new KV cache with the given configuration.
+    ///
+    /// If `eager_allocate` is enabled in the config, this will pre-allocate
+    /// the full context window immediately and may fail if memory is insufficient.
     pub fn new(config: KVCacheConfig) -> Self {
         let layer_caches = (0..config.num_layers).map(|_| LayerCache::new()).collect();
 
@@ -219,6 +322,56 @@ impl KVCache {
             layer_caches,
             total_tokens: 0,
         }
+    }
+
+    /// Create a new KV cache with eager pre-allocation.
+    ///
+    /// Pre-allocates the full `max_seq_len` context window for all layers.
+    /// Returns an error if memory allocation fails.
+    ///
+    /// # Memory Calculation
+    /// Memory = 2 × num_layers × batch_size × num_kv_heads × max_seq_len × head_dim × dtype_size
+    ///
+    /// # Example
+    /// ```ignore
+    /// let config = KVCacheConfig::new(32, 4096, 8, 128)
+    ///     .with_eager_allocate(1)
+    ///     .with_dtype(Dtype::Float16);
+    /// println!("Will allocate: {}", config.memory_footprint_human());
+    /// let cache = KVCache::new_eager(config)?;
+    /// ```
+    pub fn new_eager(config: KVCacheConfig) -> Result<Self, Exception> {
+        if !config.eager_allocate {
+            // Fall back to lazy allocation
+            return Ok(Self::new(config));
+        }
+
+        let mut layer_caches = Vec::with_capacity(config.num_layers);
+        for _ in 0..config.num_layers {
+            layer_caches.push(LayerCache::new_eager(
+                config.eager_batch_size,
+                config.num_kv_heads,
+                config.max_seq_len,
+                config.head_dim,
+                config.dtype,
+            )?);
+        }
+
+        // Evaluate all allocations to materialize them on device
+        for cache in &layer_caches {
+            if let Some(ref k) = cache.keys {
+                k.eval()?;
+            }
+            if let Some(ref v) = cache.values {
+                v.eval()?;
+            }
+        }
+
+        Ok(Self {
+            config,
+            layer_caches,
+            total_tokens: 0,
+        })
     }
 
     /// Get the cache configuration.
@@ -236,15 +389,44 @@ impl KVCache {
         self.total_tokens
     }
 
-    /// Check if the cache is empty.
+    /// Check if the cache is empty (no tokens stored).
     pub fn is_empty(&self) -> bool {
-        self.layer_caches.iter().all(|c| c.keys.is_none())
+        // For eager allocation, check offset instead of Option
+        self.layer_caches.iter().all(|c| c.offset == 0)
+    }
+
+    /// Check if the cache is pre-allocated (eager mode).
+    pub fn is_preallocated(&self) -> bool {
+        self.config.eager_allocate
+            && self.layer_caches.first().map(|c| c.keys.is_some()).unwrap_or(false)
     }
 
     /// Reset the cache for a new generation.
+    ///
+    /// For eager-allocated caches, this resets the offset but preserves the
+    /// pre-allocated buffers. For lazy caches, this deallocates all memory.
     pub fn reset(&mut self) {
+        if self.config.eager_allocate {
+            // Eager mode: preserve buffers, just reset offset
+            for cache in &mut self.layer_caches {
+                cache.reset();
+            }
+        } else {
+            // Lazy mode: deallocate to free memory
+            for cache in &mut self.layer_caches {
+                cache.reset_full();
+            }
+        }
+        self.total_tokens = 0;
+    }
+
+    /// Fully reset the cache, deallocating all memory.
+    ///
+    /// Unlike `reset()`, this always deallocates the buffers even for
+    /// eager-allocated caches. Use this to free memory when done.
+    pub fn reset_full(&mut self) {
         for cache in &mut self.layer_caches {
-            cache.reset();
+            cache.reset_full();
         }
         self.total_tokens = 0;
     }
@@ -1708,6 +1890,124 @@ pub fn create_paged_cache(
     ))
 }
 
+// ============================================================================
+// Mamba SSM State Cache
+// ============================================================================
+
+/// Cache for Mamba-2 SSM state during autoregressive generation.
+///
+/// Mamba layers require two types of state for incremental generation:
+/// 1. **Conv state**: Last (kernel_size - 1) conv1d inputs for causal convolution
+/// 2. **SSM state**: The hidden state matrix from the state space model
+///
+/// Without this cache, each generated token is processed without context from
+/// previous tokens through Mamba layers, producing incoherent output.
+#[derive(Debug, Clone)]
+pub struct MambaCache {
+    /// Per-layer cache entries.
+    /// Each entry is (conv_state, ssm_state) where both may be None initially.
+    layers: Vec<MambaCacheEntry>,
+}
+
+/// Cache entry for a single Mamba layer.
+#[derive(Debug, Clone, Default)]
+pub struct MambaCacheEntry {
+    /// Convolutional state - last (kernel_size - 1) inputs.
+    /// Shape: [batch, kernel_size - 1, conv_dim]
+    pub conv_state: Option<Array>,
+    /// SSM hidden state.
+    /// Shape: [batch, num_heads, head_dim, state_dim]
+    pub ssm_state: Option<Array>,
+}
+
+impl MambaCache {
+    /// Create a new Mamba cache with the specified number of layers.
+    pub fn new(num_layers: usize) -> Self {
+        let layers = (0..num_layers).map(|_| MambaCacheEntry::default()).collect();
+        Self { layers }
+    }
+
+    /// Get a mutable reference to a layer's cache entry.
+    pub fn get_mut(&mut self, layer_idx: usize) -> Option<&mut MambaCacheEntry> {
+        self.layers.get_mut(layer_idx)
+    }
+
+    /// Get an immutable reference to a layer's cache entry.
+    pub fn get(&self, layer_idx: usize) -> Option<&MambaCacheEntry> {
+        self.layers.get(layer_idx)
+    }
+
+    /// Reset all cache entries to None.
+    pub fn reset(&mut self) {
+        for entry in &mut self.layers {
+            entry.conv_state = None;
+            entry.ssm_state = None;
+        }
+    }
+
+    /// Check if the cache is empty (no state stored).
+    pub fn is_empty(&self) -> bool {
+        self.layers
+            .iter()
+            .all(|e| e.conv_state.is_none() && e.ssm_state.is_none())
+    }
+}
+
+impl MambaCacheEntry {
+    /// Update the conv state with new input, returning the padded input for conv1d.
+    ///
+    /// This implements causal convolution by:
+    /// 1. Concatenating stored state with new input
+    /// 2. Storing the last (kernel_size - 1) values for next call
+    /// 3. Returning the padded input for conv1d processing
+    ///
+    /// # Arguments
+    /// * `input` - New input tensor [batch, seq_len, conv_dim]
+    /// * `kernel_size` - Conv1d kernel size
+    ///
+    /// # Returns
+    /// Padded input [batch, seq_len + kernel_size - 1, conv_dim]
+    pub fn update_conv_state(
+        &mut self,
+        input: &Array,
+        kernel_size: i32,
+    ) -> Result<Array, Exception> {
+        let pad_len = (kernel_size - 1) as usize;
+        let shape = input.shape();
+        let batch = shape[0] as i32;
+        let conv_dim = shape[2] as i32;
+
+        // Get or initialize conv state with matching dtype
+        let conv_state = if let Some(ref state) = self.conv_state {
+            state.clone()
+        } else {
+            // Initialize to zeros with shape [batch, pad_len, conv_dim]
+            // Use same dtype as input to avoid dtype mismatch issues
+            Array::zeros::<f32>(&[batch, pad_len as i32, conv_dim])?.as_dtype(input.dtype())?
+        };
+
+        // Concatenate state with new input along sequence dimension
+        let padded = concatenate_axis(&[&conv_state, input], 1)?;
+
+        // Store last (kernel_size - 1) values for next call
+        let seq_len = padded.dim(1);
+        let start_idx = seq_len - pad_len as i32;
+        self.conv_state = Some(padded.index((.., start_idx.., ..)));
+
+        Ok(padded)
+    }
+
+    /// Get the current SSM state, returning None if not initialized.
+    pub fn get_ssm_state(&self) -> Option<&Array> {
+        self.ssm_state.as_ref()
+    }
+
+    /// Update the SSM state.
+    pub fn set_ssm_state(&mut self, state: Array) {
+        self.ssm_state = Some(state);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2411,5 +2711,257 @@ mod tests {
         assert_eq!(cache.config.num_kv_heads, 8);
         assert_eq!(cache.config.head_dim, 128);
         assert_eq!(cache.num_sequences(), 0);
+    }
+
+    // =========================================================================
+    // Eager Pre-Allocation Tests
+    // =========================================================================
+
+    #[test]
+    fn test_kv_cache_eager_config() {
+        let config = KVCacheConfig::new(32, 4096, 8, 128)
+            .with_eager_allocate(1)
+            .with_dtype(Dtype::Float16);
+
+        assert!(config.eager_allocate);
+        assert_eq!(config.eager_batch_size, 1);
+        assert_eq!(config.max_seq_len, 4096);
+        assert_eq!(config.dtype, Dtype::Float16);
+    }
+
+    #[test]
+    fn test_kv_cache_eager_config_batch_size() {
+        let config = KVCacheConfig::new(32, 2048, 8, 128).with_eager_allocate(4);
+
+        assert!(config.eager_allocate);
+        assert_eq!(config.eager_batch_size, 4);
+    }
+
+    #[test]
+    fn test_kv_cache_memory_footprint() {
+        // 32 layers × 2 (K+V) × 1 batch × 8 heads × 2048 seq × 128 dim × 2 bytes (fp16)
+        let config = KVCacheConfig::new(32, 2048, 8, 128)
+            .with_eager_allocate(1)
+            .with_dtype(Dtype::Float16);
+
+        let expected = 32 * 2 * 1 * 8 * 2048 * 128 * 2;
+        assert_eq!(config.memory_footprint(), expected);
+    }
+
+    #[test]
+    fn test_kv_cache_memory_footprint_fp32() {
+        // 16 layers × 2 (K+V) × 1 batch × 4 heads × 1024 seq × 64 dim × 4 bytes (fp32)
+        let config = KVCacheConfig::new(16, 1024, 4, 64)
+            .with_eager_allocate(1)
+            .with_dtype(Dtype::Float32);
+
+        let expected = 16 * 2 * 1 * 4 * 1024 * 64 * 4;
+        assert_eq!(config.memory_footprint(), expected);
+    }
+
+    #[test]
+    fn test_kv_cache_memory_footprint_batch() {
+        // Test with batch_size > 1
+        let config = KVCacheConfig::new(8, 512, 4, 64)
+            .with_eager_allocate(4)
+            .with_dtype(Dtype::Float16);
+
+        let expected = 8 * 2 * 4 * 4 * 512 * 64 * 2;
+        assert_eq!(config.memory_footprint(), expected);
+    }
+
+    #[test]
+    fn test_kv_cache_memory_footprint_human_bytes() {
+        let config = KVCacheConfig::new(1, 1, 1, 1)
+            .with_eager_allocate(1)
+            .with_dtype(Dtype::Float32);
+
+        // 1 × 2 × 1 × 1 × 1 × 1 × 4 = 8 bytes
+        assert_eq!(config.memory_footprint_human(), "8 bytes");
+    }
+
+    #[test]
+    fn test_kv_cache_memory_footprint_human_kb() {
+        let config = KVCacheConfig::new(1, 128, 1, 1)
+            .with_eager_allocate(1)
+            .with_dtype(Dtype::Float32);
+
+        // 1 × 2 × 1 × 1 × 128 × 1 × 4 = 1024 bytes = 1 KB
+        assert_eq!(config.memory_footprint_human(), "1.00 KB");
+    }
+
+    #[test]
+    fn test_kv_cache_memory_footprint_human_mb() {
+        let config = KVCacheConfig::new(1, 2048, 8, 64)
+            .with_eager_allocate(1)
+            .with_dtype(Dtype::Float32);
+
+        // 1 × 2 × 1 × 8 × 2048 × 64 × 4 = 8,388,608 bytes = 8 MB
+        let human = config.memory_footprint_human();
+        assert!(human.contains("MB"), "Expected MB, got: {}", human);
+    }
+
+    #[test]
+    fn test_kv_cache_memory_footprint_human_gb() {
+        // Need to exceed 1 GB (1,073,741,824 bytes)
+        // 32 layers × 2 × 1 batch × 8 heads × 8192 seq × 128 dim × 2 bytes = 1 GB
+        let config = KVCacheConfig::new(32, 8192, 8, 128)
+            .with_eager_allocate(1)
+            .with_dtype(Dtype::Float16);
+
+        let human = config.memory_footprint_human();
+        assert!(human.contains("GB"), "Expected GB, got: {}", human);
+    }
+
+    #[test]
+    fn test_kv_cache_new_eager() {
+        let config = KVCacheConfig::new(2, 128, 4, 64)
+            .with_eager_allocate(1)
+            .with_dtype(Dtype::Float32);
+
+        let cache = KVCache::new_eager(config).expect("Should create eager cache");
+
+        assert!(cache.is_preallocated());
+        assert!(cache.is_empty()); // Pre-allocated but no data
+        assert_eq!(cache.seq_len(), 0);
+    }
+
+    #[test]
+    fn test_kv_cache_new_eager_fallback() {
+        // When eager_allocate is false, new_eager should fall back to lazy
+        let config = KVCacheConfig::new(2, 128, 4, 64);
+
+        let cache = KVCache::new_eager(config).expect("Should create lazy cache");
+
+        assert!(!cache.is_preallocated());
+    }
+
+    #[test]
+    fn test_kv_cache_eager_is_preallocated() {
+        // Eager cache should report as preallocated
+        let eager_config = KVCacheConfig::new(2, 64, 4, 32).with_eager_allocate(1);
+        let eager_cache = KVCache::new_eager(eager_config).unwrap();
+        assert!(eager_cache.is_preallocated());
+
+        // Lazy cache should not report as preallocated
+        let lazy_config = KVCacheConfig::new(2, 64, 4, 32);
+        let lazy_cache = KVCache::new(lazy_config);
+        assert!(!lazy_cache.is_preallocated());
+    }
+
+    #[test]
+    fn test_kv_cache_eager_is_empty() {
+        let config = KVCacheConfig::new(2, 64, 4, 32).with_eager_allocate(1);
+        let mut cache = KVCache::new_eager(config).unwrap();
+
+        // Pre-allocated but empty (no data added)
+        assert!(cache.is_empty());
+
+        // Add some data
+        let keys = Array::zeros::<f32>(&[1, 4, 10, 32]).unwrap();
+        let values = Array::zeros::<f32>(&[1, 4, 10, 32]).unwrap();
+        cache.update_and_fetch(0, &keys, &values).unwrap();
+
+        // Now not empty
+        assert!(!cache.is_empty());
+    }
+
+    #[test]
+    fn test_kv_cache_eager_update() {
+        let config = KVCacheConfig::new(2, 128, 4, 64).with_eager_allocate(1);
+        let mut cache = KVCache::new_eager(config).unwrap();
+
+        // First update
+        let k1 = Array::ones::<f32>(&[1, 4, 10, 64]).unwrap();
+        let v1 = Array::ones::<f32>(&[1, 4, 10, 64]).unwrap();
+        let (cached_k, cached_v) = cache.update_and_fetch(0, &k1, &v1).unwrap();
+
+        assert_eq!(cached_k.dim(2), 10);
+        assert_eq!(cached_v.dim(2), 10);
+        assert_eq!(cache.seq_len(), 10);
+
+        // Second update (accumulation)
+        let k2 = Array::ones::<f32>(&[1, 4, 5, 64]).unwrap();
+        let v2 = Array::ones::<f32>(&[1, 4, 5, 64]).unwrap();
+        let (cached_k, cached_v) = cache.update_and_fetch(0, &k2, &v2).unwrap();
+
+        assert_eq!(cached_k.dim(2), 15);
+        assert_eq!(cached_v.dim(2), 15);
+        assert_eq!(cache.seq_len(), 15);
+    }
+
+    #[test]
+    fn test_kv_cache_eager_reset_preserves_buffers() {
+        let config = KVCacheConfig::new(2, 64, 4, 32).with_eager_allocate(1);
+        let mut cache = KVCache::new_eager(config).unwrap();
+
+        // Add some data
+        let keys = Array::zeros::<f32>(&[1, 4, 10, 32]).unwrap();
+        let values = Array::zeros::<f32>(&[1, 4, 10, 32]).unwrap();
+        cache.update_and_fetch(0, &keys, &values).unwrap();
+        assert!(!cache.is_empty());
+
+        // Reset should preserve buffers in eager mode
+        cache.reset();
+
+        assert!(cache.is_empty()); // Offset reset
+        assert!(cache.is_preallocated()); // Buffers preserved
+        assert_eq!(cache.seq_len(), 0);
+    }
+
+    #[test]
+    fn test_kv_cache_eager_reset_full_deallocates() {
+        let config = KVCacheConfig::new(2, 64, 4, 32).with_eager_allocate(1);
+        let mut cache = KVCache::new_eager(config).unwrap();
+
+        assert!(cache.is_preallocated());
+
+        // reset_full should deallocate even in eager mode
+        cache.reset_full();
+
+        assert!(!cache.is_preallocated()); // Buffers deallocated
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn test_kv_cache_lazy_reset_deallocates() {
+        let config = KVCacheConfig::new(2, 64, 4, 32);
+        let mut cache = KVCache::new(config);
+
+        // Add some data
+        let keys = Array::zeros::<f32>(&[1, 4, 10, 32]).unwrap();
+        let values = Array::zeros::<f32>(&[1, 4, 10, 32]).unwrap();
+        cache.update_and_fetch(0, &keys, &values).unwrap();
+        assert!(!cache.is_empty());
+
+        // Reset should deallocate in lazy mode
+        cache.reset();
+
+        assert!(cache.is_empty());
+        // Verify buffers are deallocated by checking get returns None
+        assert!(cache.get(0).is_none());
+    }
+
+    #[test]
+    fn test_kv_cache_eager_reuse_after_reset() {
+        let config = KVCacheConfig::new(2, 64, 4, 32).with_eager_allocate(1);
+        let mut cache = KVCache::new_eager(config).unwrap();
+
+        // First generation
+        let k1 = Array::ones::<f32>(&[1, 4, 20, 32]).unwrap();
+        let v1 = Array::ones::<f32>(&[1, 4, 20, 32]).unwrap();
+        cache.update_and_fetch(0, &k1, &v1).unwrap();
+        assert_eq!(cache.seq_len(), 20);
+
+        // Reset for new generation
+        cache.reset();
+        assert!(cache.is_empty());
+        assert!(cache.is_preallocated());
+
+        // Second generation (reuses pre-allocated buffers)
+        let k2 = Array::ones::<f32>(&[1, 4, 15, 32]).unwrap();
+        let v2 = Array::ones::<f32>(&[1, 4, 15, 32]).unwrap();
+        cache.update_and_fetch(0, &k2, &v2).unwrap();
+        assert_eq!(cache.seq_len(), 15);
     }
 }

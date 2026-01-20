@@ -18,7 +18,7 @@
 use std::path::Path;
 
 use mlx_rs::{error::Exception, module::ModuleParametersExt, Array};
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
+use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 use serde::Deserialize;
 
 use crate::architectures::{
@@ -29,6 +29,7 @@ use crate::architectures::{
     llama::{LlamaConfig, LlamaForCausalLM},
     llama4::{Llama4ForCausalLM, Llama4TextConfig},
     mistral::{MistralConfig, MistralForCausalLM},
+    nemotron_h::{load_nemotron_weights, NemotronHConfig, NemotronHForCausalLM},
     phi::{PhiConfig, PhiForCausalLM},
     qwen2::{Qwen2Config, Qwen2ForCausalLM},
     qwen3::{Qwen3Config, Qwen3ForCausalLM},
@@ -111,6 +112,8 @@ pub enum ModelArchitecture {
     Cohere,
     /// IBM Granite family.
     Granite,
+    /// NVIDIA Nemotron-H family (hybrid Mamba-Transformer).
+    NemotronH,
 }
 
 impl std::fmt::Display for ModelArchitecture {
@@ -128,6 +131,7 @@ impl std::fmt::Display for ModelArchitecture {
             Self::DeepSeek => write!(f, "DeepSeek"),
             Self::Cohere => write!(f, "Cohere"),
             Self::Granite => write!(f, "Granite"),
+            Self::NemotronH => write!(f, "NemotronH"),
         }
     }
 }
@@ -159,6 +163,8 @@ impl ModelArchitecture {
             "cohere" | "cohere2" | "command_r" | "command-r" => Some(Self::Cohere),
             // Granite
             "granite" | "granitehybrid" | "granite_moe" => Some(Self::Granite),
+            // Nemotron-H (hybrid Mamba-Transformer)
+            "nemotron_h" | "nemotronh" | "nemotron-h" => Some(Self::NemotronH),
             _ => None,
         }
     }
@@ -213,6 +219,9 @@ impl ModelArchitecture {
             if lower.contains("granite") {
                 return Some(Self::Granite);
             }
+            if lower.contains("nemotron") && lower.contains("h") {
+                return Some(Self::NemotronH);
+            }
         }
         None
     }
@@ -231,7 +240,8 @@ impl ModelArchitecture {
         }
 
         let config_content = std::fs::read_to_string(&config_path)?;
-        let minimal: MinimalConfig = serde_json::from_str(&config_content)?;
+        // Use json5 to handle Python-style values like Infinity, -Infinity, NaN
+        let minimal: MinimalConfig = json5::from_str(&config_content)?;
 
         // Try model_type first
         if let Some(ref model_type) = minimal.model_type {
@@ -297,6 +307,8 @@ pub enum DynamicModel {
     Cohere(CohereForCausalLM),
     /// IBM Granite model variant.
     Granite(GraniteForCausalLM),
+    /// NVIDIA Nemotron-H model variant (hybrid Mamba-Transformer).
+    NemotronH(NemotronHForCausalLM),
 }
 
 impl std::fmt::Debug for DynamicModel {
@@ -314,6 +326,7 @@ impl std::fmt::Debug for DynamicModel {
             Self::DeepSeek(_) => write!(f, "DynamicModel::DeepSeek"),
             Self::Cohere(_) => write!(f, "DynamicModel::Cohere"),
             Self::Granite(_) => write!(f, "DynamicModel::Granite"),
+            Self::NemotronH(_) => write!(f, "DynamicModel::NemotronH"),
         }
     }
 }
@@ -342,7 +355,7 @@ impl DynamicModel {
         // Detect architecture
         let arch = ModelArchitecture::detect(model_dir)?;
 
-        // Read config content
+        // Read config content (json5 handles Python-style Infinity, NaN, etc.)
         let config_path = model_dir.join("config.json");
         let config_content = std::fs::read_to_string(&config_path)?;
 
@@ -352,56 +365,56 @@ impl DynamicModel {
         // Load the appropriate model
         match arch {
             ModelArchitecture::Llama => {
-                let config: LlamaConfig = serde_json::from_str(&config_content)?;
+                let config: LlamaConfig = json5::from_str(&config_content)?;
                 let mut model = LlamaForCausalLM::new(config)?;
                 crate::loader::load_llama_weights(&mut model, &weights)?;
                 model.eval()?;
                 Ok(DynamicModel::Llama(model))
             }
             ModelArchitecture::Llama4 => {
-                let config: Llama4TextConfig = serde_json::from_str(&config_content)?;
+                let config: Llama4TextConfig = json5::from_str(&config_content)?;
                 let mut model = Llama4ForCausalLM::new(config)?;
                 load_generic_weights(&mut model, model_dir)?;
                 model.eval()?;
                 Ok(DynamicModel::Llama4(model))
             }
             ModelArchitecture::Qwen2 => {
-                let config: Qwen2Config = serde_json::from_str(&config_content)?;
+                let config: Qwen2Config = json5::from_str(&config_content)?;
                 let mut model = Qwen2ForCausalLM::new(config)?;
                 crate::loader::load_qwen_weights(&mut model, &weights)?;
                 model.eval()?;
                 Ok(DynamicModel::Qwen2(model))
             }
             ModelArchitecture::Qwen3 => {
-                let config: Qwen3Config = serde_json::from_str(&config_content)?;
+                let config: Qwen3Config = json5::from_str(&config_content)?;
                 let mut model = Qwen3ForCausalLM::new(config)?;
                 crate::loader::load_qwen3_weights(&mut model, &weights)?;
                 model.eval()?;
                 Ok(DynamicModel::Qwen3(model))
             }
             ModelArchitecture::Qwen3Moe => {
-                let config: Qwen3MoEConfig = serde_json::from_str(&config_content)?;
+                let config: Qwen3MoEConfig = json5::from_str(&config_content)?;
                 let mut model = Qwen3MoE::new(config)?;
                 load_generic_weights(&mut model, model_dir)?;
                 model.eval()?;
                 Ok(DynamicModel::Qwen3Moe(model))
             }
             ModelArchitecture::Gemma => {
-                let config: GemmaConfig = serde_json::from_str(&config_content)?;
+                let config: GemmaConfig = json5::from_str(&config_content)?;
                 let mut model = GemmaForCausalLM::new(config)?;
                 crate::loader::load_gemma_weights(&mut model, &weights)?;
                 model.eval()?;
                 Ok(DynamicModel::Gemma(model))
             }
             ModelArchitecture::Mistral => {
-                let config: MistralConfig = serde_json::from_str(&config_content)?;
+                let config: MistralConfig = json5::from_str(&config_content)?;
                 let mut model = MistralForCausalLM::new(config)?;
                 crate::loader::load_mistral_weights(&mut model, &weights)?;
                 model.eval()?;
                 Ok(DynamicModel::Mistral(model))
             }
             ModelArchitecture::Phi | ModelArchitecture::Phi4 => {
-                let config: PhiConfig = serde_json::from_str(&config_content)?;
+                let config: PhiConfig = json5::from_str(&config_content)?;
                 let mut model = PhiForCausalLM::new(config)?;
                 crate::loader::load_phi_weights(&mut model, &weights)?;
                 model.eval()?;
@@ -412,25 +425,35 @@ impl DynamicModel {
                 }
             }
             ModelArchitecture::DeepSeek => {
-                let config: DeepSeekConfig = serde_json::from_str(&config_content)?;
+                let config: DeepSeekConfig = json5::from_str(&config_content)?;
                 let mut model = DeepSeek::new(config)?;
                 load_generic_weights(&mut model, model_dir)?;
                 model.eval()?;
                 Ok(DynamicModel::DeepSeek(model))
             }
             ModelArchitecture::Cohere => {
-                let config: CohereConfig = serde_json::from_str(&config_content)?;
+                let config: CohereConfig = json5::from_str(&config_content)?;
                 let mut model = CohereForCausalLM::new(config)?;
                 load_generic_weights(&mut model, model_dir)?;
                 model.eval()?;
                 Ok(DynamicModel::Cohere(model))
             }
             ModelArchitecture::Granite => {
-                let config: GraniteConfig = serde_json::from_str(&config_content)?;
+                let config: GraniteConfig = json5::from_str(&config_content)?;
                 let mut model = GraniteForCausalLM::new(config)?;
                 load_generic_weights(&mut model, model_dir)?;
                 model.eval()?;
                 Ok(DynamicModel::Granite(model))
+            }
+            ModelArchitecture::NemotronH => {
+                let config: NemotronHConfig = json5::from_str(&config_content)?;
+                let mut model = NemotronHForCausalLM::new(config)?;
+                load_nemotron_weights(&mut model, &weights)?;
+                // Initialize stacked MoE weights for gather_mm optimization
+                // This provides ~10x speedup for MoE layers
+                model.backbone.init_stacked_moe()?;
+                model.eval()?;
+                Ok(DynamicModel::NemotronH(model))
             }
         }
     }
@@ -467,6 +490,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => m.forward(input_ids, mask, None),
             Self::Cohere(m) => m.forward(input_ids, mask, None),
             Self::Granite(m) => m.forward(input_ids, mask, None),
+            Self::NemotronH(m) => m.forward(input_ids, None),
         }
     }
 
@@ -502,9 +526,11 @@ impl DynamicModel {
             Self::Phi(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Phi4(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::DeepSeek(m) => m.forward(input_ids, mask, cache),
-            // Note: Cohere and Granite don't have KV cache support yet
+            // Note: Cohere and Granite use their own cache systems
             Self::Cohere(m) => m.forward(input_ids, mask, None),
             Self::Granite(m) => m.forward(input_ids, mask, None),
+            // NemotronH: pass KV cache but not Mamba cache (use forward_with_hybrid_cache for full caching)
+            Self::NemotronH(m) => m.forward_with_cache(input_ids, mask, cache, None),
         }
     }
 
@@ -579,6 +605,49 @@ impl DynamicModel {
                     config.head_dim as usize,
                 ))
             }
+            Self::NemotronH(m) => {
+                // NemotronH uses its own hybrid cache system (MambaCache + KVCache)
+                // Return a basic KV cache for attention layers
+                let config = m.config();
+                KVCache::new(KVCacheConfig::new(
+                    config.num_hidden_layers as usize,
+                    max_seq_len,
+                    config.num_key_value_heads as usize,
+                    config.attention_head_dim() as usize,
+                ))
+            }
+        }
+    }
+
+    /// Create a Mamba cache for models with Mamba/SSM layers.
+    ///
+    /// Returns Some(MambaCache) for NemotronH and other hybrid models,
+    /// None for pure transformer models.
+    pub fn create_mamba_cache(&self) -> Option<MambaCache> {
+        match self {
+            Self::NemotronH(m) => {
+                let num_layers = m.config().num_hidden_layers as usize;
+                Some(MambaCache::new(num_layers))
+            }
+            // Other models don't use Mamba
+            _ => None,
+        }
+    }
+
+    /// Forward pass with KV cache and optional Mamba cache (for hybrid models).
+    ///
+    /// This is the preferred method for autoregressive generation with NemotronH.
+    pub fn forward_with_hybrid_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::NemotronH(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
+            // For non-hybrid models, ignore mamba_cache and use normal forward
+            _ => self.forward_with_cache(input_ids, mask, kv_cache),
         }
     }
 
@@ -597,6 +666,7 @@ impl DynamicModel {
             Self::DeepSeek(_) => ModelArchitecture::DeepSeek,
             Self::Cohere(_) => ModelArchitecture::Cohere,
             Self::Granite(_) => ModelArchitecture::Granite,
+            Self::NemotronH(_) => ModelArchitecture::NemotronH,
         }
     }
 
@@ -615,6 +685,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => m.config.vocab_size,
             Self::Cohere(m) => m.config.vocab_size,
             Self::Granite(m) => m.config.vocab_size,
+            Self::NemotronH(m) => m.config().vocab_size,
         }
     }
 
@@ -633,6 +704,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => m.config.hidden_size,
             Self::Cohere(m) => m.config.hidden_size,
             Self::Granite(m) => m.config.hidden_size,
+            Self::NemotronH(m) => m.config().hidden_size,
         }
     }
 
@@ -651,6 +723,7 @@ impl DynamicModel {
             Self::DeepSeek(m) => m.eval(),
             Self::Cohere(m) => m.eval(),
             Self::Granite(m) => m.eval(),
+            Self::NemotronH(m) => m.eval(),
         }
     }
 
@@ -694,6 +767,9 @@ pub enum DispatchError {
     /// JSON parsing error.
     #[error("JSON parsing error: {0}")]
     Json(#[from] serde_json::Error),
+    /// JSON5 parsing error (handles Infinity, NaN, trailing commas, etc.).
+    #[error("JSON5 parsing error: {0}")]
+    Json5(#[from] json5::Error),
     /// Config file not found.
     #[error("Config file not found: {0}")]
     ConfigNotFound(String),

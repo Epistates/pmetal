@@ -432,7 +432,7 @@ impl CompiledSampler {
     #[inline]
     pub fn sample_token(&mut self, logits: &Array) -> Result<u32, Exception> {
         let token_array = self.sample(logits)?;
-        Ok(token_array.item::<i32>() as u32)
+        Ok(token_array.item::<u32>())
     }
 
     /// Get a reference to the internal sampler state.

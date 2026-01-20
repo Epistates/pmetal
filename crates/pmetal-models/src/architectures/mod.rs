@@ -15,6 +15,7 @@ pub mod qwen2;
 pub mod qwen2_vl;
 pub mod qwen3;
 pub mod qwen3_moe;
+pub mod nemotron_h;
 pub mod whisper;
 
 pub use cohere::*;
@@ -32,4 +33,5 @@ pub use qwen2::*;
 pub use qwen2_vl::*;
 pub use qwen3::*;
 pub use qwen3_moe::*;
+pub use nemotron_h::*;
 pub use whisper::*;
