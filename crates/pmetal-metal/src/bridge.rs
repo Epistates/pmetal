@@ -96,6 +96,10 @@ impl<T: Pod + Zeroable> AsMetalBuffer for MetalBufferView<T> {
     fn as_metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.buffer
     }
+
+    fn len(&self) -> usize {
+        self.len
+    }
 }
 
 impl<T: Pod + Zeroable> MetalBufferView<T> {

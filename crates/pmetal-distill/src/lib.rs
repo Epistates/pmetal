@@ -61,6 +61,7 @@ mod distill;
 mod error;
 pub mod losses;
 mod offline;
+pub mod reasoning;
 pub mod taid;
 
 pub use config::{
@@ -74,4 +75,5 @@ pub use losses::{
     SoftCrossEntropyLoss,
 };
 pub use offline::{LogitCache, LogitCompressor};
+pub use reasoning::RationaleLoss;
 pub use taid::{TaidConfig, TaidDistiller, TaidError, TaidLossOutput, TaidLossType, TaidSchedule};

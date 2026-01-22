@@ -90,6 +90,7 @@ pub use kernels::fused_cross_entropy::{
     FusedLinearCrossEntropyConfig,
     FusedLinearCrossEntropyOutput,
 };
+pub use kernels::batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
 pub use kernels::fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use kernels::fused_merge::{
     build_merge_config, build_tensor_info, FusedMergeMetal, MergeConfig as FusedMergeConfig,
@@ -121,6 +122,7 @@ pub mod prelude {
         FusedCrossEntropy, FusedCrossEntropyConfig, FusedLinearCrossEntropy,
         FusedLinearCrossEntropyConfig,
     };
+    pub use crate::kernels::batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
     pub use crate::kernels::fused_lora::{FusedLora, FusedLoraConfig};
     pub use crate::kernels::fused_sampler::{FusedSampler, FusedSamplerConfig};
     pub use crate::pipeline::PipelineCache;

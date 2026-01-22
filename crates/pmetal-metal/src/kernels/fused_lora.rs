@@ -37,6 +37,7 @@ use objc2_metal::{
 use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
+use crate::kernels::fused_sampler::AsMetalBuffer;
 
 /// Configuration for fused LoRA operations.
 #[derive(Debug, Clone)]
@@ -186,28 +187,15 @@ impl FusedLora {
         &self.config
     }
 
-    /// Execute fused LoRA forward pass (training mode).
-    ///
-    /// Computes: y = x @ W.T + scale * (x @ A.T) @ B.T
-    ///
-    /// Also saves the intermediate x @ A.T for backward pass.
-    ///
-    /// # Arguments
-    ///
-    /// * `x` - Input tensor [batch_size, in_features]
-    /// * `weight` - Base weight [out_features, in_features]
-    /// * `lora_a` - LoRA A matrix [rank, in_features]
-    /// * `lora_b` - LoRA B matrix [out_features, rank]
-    ///
-    /// # Returns
+    /// Returns
     ///
     /// Output tensor and intermediate for backward.
-    pub fn forward(
+    pub fn forward<B: AsMetalBuffer>(
         &self,
-        x: &MetalBuffer<f16>,
-        weight: &MetalBuffer<f16>,
-        lora_a: &MetalBuffer<f16>,
-        lora_b: &MetalBuffer<f16>,
+        x: &B,
+        weight: &B,
+        lora_a: &B,
+        lora_b: &B,
     ) -> Result<FusedLoraOutput> {
         // Validate input sizes
         self.validate_forward_inputs(x, weight, lora_a, lora_b)?;
@@ -249,28 +237,15 @@ impl FusedLora {
         Ok(output)
     }
 
-    /// Execute fused LoRA backward pass for A and B gradients.
-    ///
-    /// Computes:
-    /// - dA = scale * x.T @ (dY @ B.T)
-    /// - dB = scale * xA.T @ dY
-    ///
-    /// # Arguments
-    ///
-    /// * `grad_output` - Upstream gradient [batch_size, out_features]
-    /// * `x` - Input from forward [batch_size, in_features]
-    /// * `intermediate` - x @ A.T from forward [batch_size, rank]
-    /// * `lora_b` - LoRA B matrix [out_features, rank]
-    ///
-    /// # Returns
+    /// Returns
     ///
     /// Tuple of (grad_a, grad_b).
-    pub fn backward_ab(
+    pub fn backward_ab<B: AsMetalBuffer>(
         &self,
-        grad_output: &MetalBuffer<f16>,
-        x: &MetalBuffer<f16>,
-        intermediate: &MetalBuffer<f16>,
-        lora_b: &MetalBuffer<f16>,
+        grad_output: &B,
+        x: &B,
+        intermediate: &B,
+        lora_b: &B,
     ) -> Result<(MetalBuffer<f16>, MetalBuffer<f16>)> {
         // Validate sizes
         if grad_output.len() != self.config.output_size() {
@@ -306,26 +281,15 @@ impl FusedLora {
         Ok((grad_a, grad_b))
     }
 
-    /// Execute fused LoRA backward pass for input gradient.
-    ///
-    /// Computes: dX = dY @ W + scale * (dY @ B) @ A
-    ///
-    /// # Arguments
-    ///
-    /// * `grad_output` - Upstream gradient [batch_size, out_features]
-    /// * `weight` - Base weight [out_features, in_features]
-    /// * `lora_a` - LoRA A matrix [rank, in_features]
-    /// * `lora_b` - LoRA B matrix [out_features, rank]
-    ///
-    /// # Returns
+    /// Returns
     ///
     /// Input gradient [batch_size, in_features].
-    pub fn backward_x(
+    pub fn backward_x<B: AsMetalBuffer>(
         &self,
-        grad_output: &MetalBuffer<f16>,
-        weight: &MetalBuffer<f16>,
-        lora_a: &MetalBuffer<f16>,
-        lora_b: &MetalBuffer<f16>,
+        grad_output: &B,
+        weight: &B,
+        lora_a: &B,
+        lora_b: &B,
     ) -> Result<MetalBuffer<f16>> {
         // Validate sizes
         if grad_output.len() != self.config.output_size() {
@@ -344,12 +308,12 @@ impl FusedLora {
     }
 
     /// Validate input sizes for forward pass.
-    fn validate_forward_inputs(
+    fn validate_forward_inputs<B: AsMetalBuffer>(
         &self,
-        x: &MetalBuffer<f16>,
-        weight: &MetalBuffer<f16>,
-        lora_a: &MetalBuffer<f16>,
-        lora_b: &MetalBuffer<f16>,
+        x: &B,
+        weight: &B,
+        lora_a: &B,
+        lora_b: &B,
     ) -> Result<()> {
         if x.len() != self.config.input_size() {
             return Err(MetalError::DimensionMismatch {
@@ -383,12 +347,12 @@ impl FusedLora {
     }
 
     /// Execute the forward kernel.
-    fn execute_forward(
+    fn execute_forward<B: AsMetalBuffer>(
         &self,
-        x: &MetalBuffer<f16>,
-        weight: &MetalBuffer<f16>,
-        lora_a: &MetalBuffer<f16>,
-        lora_b: &MetalBuffer<f16>,
+        x: &B,
+        weight: &B,
+        lora_a: &B,
+        lora_b: &B,
         output: &MetalBuffer<f16>,
         intermediate: &MetalBuffer<f16>,
     ) -> Result<()> {
@@ -536,12 +500,12 @@ impl FusedLora {
     }
 
     /// Execute the backward AB kernel.
-    fn execute_backward_ab(
+    fn execute_backward_ab<B: AsMetalBuffer>(
         &self,
-        grad_output: &MetalBuffer<f16>,
-        x: &MetalBuffer<f16>,
-        intermediate: &MetalBuffer<f16>,
-        lora_b: &MetalBuffer<f16>,
+        grad_output: &B,
+        x: &B,
+        intermediate: &B,
+        lora_b: &B,
         grad_a: &MetalBuffer<f16>,
         grad_b: &MetalBuffer<f16>,
     ) -> Result<()> {
@@ -661,12 +625,12 @@ impl FusedLora {
     }
 
     /// Execute the backward X kernel.
-    fn execute_backward_x(
+    fn execute_backward_x<B: AsMetalBuffer>(
         &self,
-        grad_output: &MetalBuffer<f16>,
-        weight: &MetalBuffer<f16>,
-        lora_a: &MetalBuffer<f16>,
-        lora_b: &MetalBuffer<f16>,
+        grad_output: &B,
+        weight: &B,
+        lora_a: &B,
+        lora_b: &B,
         grad_x: &MetalBuffer<f16>,
     ) -> Result<()> {
         let function_name = "fused_lora_backward_x";

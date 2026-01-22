@@ -3,6 +3,7 @@
 //! This crate provides:
 //! - Standard LoRA (Low-Rank Adaptation)
 //! - QLoRA (Quantized LoRA with 4-bit base weights)
+//! - Q-BLoRA (Quantized Balanced LoRA - addresses underfitting in QLoRA)
 //! - DoRA (Weight-Decomposed Low-Rank Adaptation)
 //! - Fused training with Metal acceleration (~2x speedup)
 //! - Adapter management utilities
@@ -57,6 +58,7 @@ pub mod mistral_lora;
 pub mod mistral_qlora;
 mod patcher;
 pub mod phi_lora;
+mod qblora;
 mod qlora;
 pub mod qwen3_lora;
 pub mod qwen3_qlora;
@@ -95,6 +97,7 @@ pub use mistral_lora::*;
 pub use mistral_qlora::*;
 pub use patcher::*;
 pub use phi_lora::*;
+pub use qblora::*;
 pub use qlora::*;
 pub use qwen3_lora::*;
 pub use qwen3_qlora::*;

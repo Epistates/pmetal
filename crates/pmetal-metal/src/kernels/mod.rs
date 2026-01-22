@@ -4,6 +4,7 @@
 //! with a focus on transformer attention mechanisms, high-performance sampling,
 //! and efficient training operations.
 
+pub mod batched_lora;
 pub mod flash_attention;
 pub mod fp8_training;
 pub mod fused_cross_entropy;
@@ -18,6 +19,7 @@ pub mod fused_training;
 pub mod moe;
 
 // Re-export main types
+pub use batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
 pub use flash_attention::{
     FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,
     FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,

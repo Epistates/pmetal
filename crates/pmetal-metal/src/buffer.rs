@@ -20,6 +20,14 @@ use crate::error::{MetalError, Result};
 pub trait AsMetalBuffer {
     /// Get the underlying Metal buffer.
     fn as_metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer>;
+
+    /// Get the number of elements in the buffer.
+    fn len(&self) -> usize;
+
+    /// Check if the buffer is empty.
+    fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
 }
 
 /// Buffer usage flags.
@@ -72,6 +80,10 @@ pub struct MetalBuffer<T: Pod + Zeroable> {
 impl<T: Pod + Zeroable> AsMetalBuffer for MetalBuffer<T> {
     fn as_metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.buffer
+    }
+
+    fn len(&self) -> usize {
+        self.len
     }
 }
 

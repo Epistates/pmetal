@@ -1,20 +1,33 @@
 //! Merge method implementations.
 //!
 //! Each merge method implements a different algorithm for combining model weights.
+//!
+//! # Q1 2026 SOTA Methods
+//!
+//! - **TIES**: Task arithmetic with sparsification and sign consensus
+//! - **DARE**: Random pruning with rescaling
+//! - **Model Breadcrumbs**: Deterministic dual-masking (removes outliers AND noise)
+//! - **Souper**: Optimal coefficient model soup with inverse-deviation weighting
+//! - **DELLA**: Adaptive magnitude-based pruning
+//! - **Model Stock**: Geometric interpolation based on task vector similarity
 
+mod breadcrumbs;
 mod dare;
 mod linear;
 mod model_stock;
 mod passthrough;
 mod slerp;
+mod souper;
 mod task_arithmetic;
 mod ties;
 
+pub use breadcrumbs::BreadcrumbsMerge;
 pub use dare::DareMerge;
 pub use linear::LinearMerge;
 pub use model_stock::ModelStockMerge;
 pub use passthrough::PassthroughMerge;
 pub use slerp::SlerpMerge;
+pub use souper::SouperMerge;
 pub use task_arithmetic::TaskArithmeticMerge;
 pub use ties::TiesMerge;
 

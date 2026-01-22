@@ -27,6 +27,7 @@ use std::sync::Arc;
 
 #[cfg(feature = "metal-fused")]
 use pmetal_metal::{
+    bridge::metal_buffer_from_ptr,
     BufferUsage, FusedLora, FusedLoraConfig, FusedLoraOutput, MetalBuffer, MetalContext,
 };
 
@@ -172,8 +173,57 @@ impl FusedLoraTrainer {
         lora_a: &Array,
         lora_b: &Array,
     ) -> Result<FusedForwardOutput, FusedTrainingError> {
-        // For now, use MLX implementation
-        // Metal integration requires Array to Metal buffer bridge
+        #[cfg(feature = "metal-fused")]
+        if let Some(ctx) = &self.metal_ctx {
+            // Get shapes
+            let batch_size = x.dim(0) as usize;
+            // Support flattened input [batch * seq, hidden]
+            
+            // Create config for this batch size
+            let config = FusedLoraConfig::new(
+                batch_size,
+                self.config.in_features,
+                self.config.out_features,
+                self.config.rank,
+                self.config.scale,
+            );
+
+            // Create executor (pipelines are cached in ctx)
+            let fused = FusedLora::new(ctx.clone(), config)
+                .map_err(pmetal_metal::MetalError::from)?;
+
+            // Create views (unsafe - assuming Array memory is valid/unified)
+            // Note: We need to ensure arrays are evaluated and contiguous
+            x.eval()?;
+            weight.eval()?;
+            lora_a.eval()?;
+            lora_b.eval()?;
+
+            // Get pointers (via as_slice().as_ptr() - safe as long as Array lives)
+            // MLX arrays are usually contiguous.
+            unsafe {
+                let x_view = metal_buffer_from_ptr(ctx, x.as_slice().as_ptr() as *mut f16, x.size())?;
+                let w_view = metal_buffer_from_ptr(ctx, weight.as_slice().as_ptr() as *mut f16, weight.size())?;
+                let a_view = metal_buffer_from_ptr(ctx, lora_a.as_slice().as_ptr() as *mut f16, lora_a.size())?;
+                let b_view = metal_buffer_from_ptr(ctx, lora_b.as_slice().as_ptr() as *mut f16, lora_b.size())?;
+
+                let output = fused.forward(&x_view, &w_view, &a_view, &b_view)
+                    .map_err(pmetal_metal::MetalError::from)?;
+
+                // Convert back to Array (copying for now for safety)
+                let out_vec = output.output.to_vec()?;
+                let out_arr = Array::from_slice(&out_vec, &[batch_size as i32, self.config.out_features as i32]);
+                
+                let inter_vec = output.intermediate.as_ref().unwrap().to_vec()?;
+                let inter_arr = Array::from_slice(&inter_vec, &[batch_size as i32, self.config.rank as i32]);
+
+                return Ok(FusedForwardOutput {
+                    output: out_arr,
+                    intermediate: Some(inter_arr),
+                });
+            }
+        }
+
         self.forward_mlx(x, weight, lora_a, lora_b)
     }
 
@@ -230,6 +280,32 @@ impl FusedLoraTrainer {
         intermediate: &Array,
         lora_b: &Array,
     ) -> Result<(Array, Array), FusedTrainingError> {
+        #[cfg(feature = "metal-fused")]
+        if let Some(ctx) = &self.metal_ctx {
+            let batch_size = x.dim(0) as usize;
+            let config = FusedLoraConfig::new(
+                batch_size, self.config.in_features, self.config.out_features, self.config.rank, self.config.scale
+            );
+            let fused = FusedLora::new(ctx.clone(), config).map_err(pmetal_metal::MetalError::from)?;
+
+            grad_output.eval()?; x.eval()?; intermediate.eval()?; lora_b.eval()?;
+
+            unsafe {
+                let dy_view = metal_buffer_from_ptr(ctx, grad_output.as_slice().as_ptr() as *mut f16, grad_output.size())?;
+                let x_view = metal_buffer_from_ptr(ctx, x.as_slice().as_ptr() as *mut f16, x.size())?;
+                let inter_view = metal_buffer_from_ptr(ctx, intermediate.as_slice().as_ptr() as *mut f16, intermediate.size())?;
+                let b_view = metal_buffer_from_ptr(ctx, lora_b.as_slice().as_ptr() as *mut f16, lora_b.size())?;
+
+                let (grad_a_buf, grad_b_buf) = fused.backward_ab(&dy_view, &x_view, &inter_view, &b_view)
+                    .map_err(pmetal_metal::MetalError::from)?;
+
+                let grad_a = Array::from_slice(&grad_a_buf.to_vec()?, &[self.config.rank as i32, self.config.in_features as i32]);
+                let grad_b = Array::from_slice(&grad_b_buf.to_vec()?, &[self.config.out_features as i32, self.config.rank as i32]);
+                
+                return Ok((grad_a, grad_b));
+            }
+        }
+
         let scale_arr = Array::from_f32(self.config.scale);
 
         // dB = scale * dY.T @ xA
@@ -258,6 +334,30 @@ impl FusedLoraTrainer {
         lora_a: &Array,
         lora_b: &Array,
     ) -> Result<Array, FusedTrainingError> {
+        #[cfg(feature = "metal-fused")]
+        if let Some(ctx) = &self.metal_ctx {
+            let batch_size = grad_output.dim(0) as usize;
+            let config = FusedLoraConfig::new(
+                batch_size, self.config.in_features, self.config.out_features, self.config.rank, self.config.scale
+            );
+            let fused = FusedLora::new(ctx.clone(), config).map_err(pmetal_metal::MetalError::from)?;
+
+            grad_output.eval()?; weight.eval()?; lora_a.eval()?; lora_b.eval()?;
+
+            unsafe {
+                let dy_view = metal_buffer_from_ptr(ctx, grad_output.as_slice().as_ptr() as *mut f16, grad_output.size())?;
+                let w_view = metal_buffer_from_ptr(ctx, weight.as_slice().as_ptr() as *mut f16, weight.size())?;
+                let a_view = metal_buffer_from_ptr(ctx, lora_a.as_slice().as_ptr() as *mut f16, lora_a.size())?;
+                let b_view = metal_buffer_from_ptr(ctx, lora_b.as_slice().as_ptr() as *mut f16, lora_b.size())?;
+
+                let grad_x_buf = fused.backward_x(&dy_view, &w_view, &a_view, &b_view)
+                    .map_err(pmetal_metal::MetalError::from)?;
+
+                let grad_x = Array::from_slice(&grad_x_buf.to_vec()?, &[batch_size as i32, self.config.in_features as i32]);
+                return Ok(grad_x);
+            }
+        }
+
         // dX from base weights
         let dx_base = grad_output.matmul(weight)?;
 
