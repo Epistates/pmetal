@@ -40,6 +40,7 @@
 #![allow(clippy::type_complexity)]
 
 mod adapter;
+pub mod arch_config;
 pub mod autograd;
 pub mod custom_autograd_trainer;
 pub mod custom_backward;
@@ -51,6 +52,7 @@ pub mod fused_training;
 pub mod galore;
 pub mod gemma_lora;
 pub mod gemma_qlora;
+pub mod generic_lora;
 pub mod llama_lora;
 pub mod llama_qlora;
 mod lora;
@@ -65,6 +67,7 @@ pub mod qwen3_qlora;
 mod trainable;
 
 pub use adapter::*;
+pub use arch_config::LoraArchitectureConfig;
 pub use autograd::{
     fused_mlp_backward, fused_mlp_forward, lora_backward, lora_forward_with_grad,
     AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads, MlpForwardSaved,

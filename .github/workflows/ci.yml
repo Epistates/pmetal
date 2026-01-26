@@ -17,6 +17,12 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # Clone mlx-rs fork into expected location
+      - name: Clone mlx-rs
+        run: |
+          mkdir -p ../reference
+          git clone --depth 1 https://github.com/nicholasjpaterno/mlx-rs.git ../reference/mlx-rs
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -38,6 +44,12 @@ jobs:
 
     steps:
       - uses: actions/checkout@v5
+
+      # Clone mlx-rs fork into expected location
+      - name: Clone mlx-rs
+        run: |
+          mkdir -p ../reference
+          git clone --depth 1 https://github.com/nicholasjpaterno/mlx-rs.git ../reference/mlx-rs
 
       - uses: dtolnay/rust-toolchain@stable
 

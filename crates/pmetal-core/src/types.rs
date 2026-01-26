@@ -130,3 +130,74 @@ pub struct EvalMetrics {
     /// Custom metrics.
     pub custom: std::collections::HashMap<String, f64>,
 }
+
+/// Training state tracked during training loop.
+///
+/// This is the canonical training state used across all trainers.
+/// Algorithm-specific trainers can extend this with additional fields.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct TrainingState {
+    /// Current global step.
+    pub step: usize,
+    /// Current epoch.
+    pub epoch: usize,
+    /// Current loss value.
+    pub loss: f64,
+    /// Current learning rate.
+    pub learning_rate: f64,
+    /// Total tokens processed.
+    pub tokens_processed: usize,
+    /// Gradient norm (if computed).
+    pub grad_norm: Option<f64>,
+    /// Best validation loss seen.
+    pub best_val_loss: Option<f64>,
+    /// Samples processed in current epoch.
+    pub epoch_samples: usize,
+    /// Total training time in seconds.
+    pub elapsed_secs: f64,
+}
+
+impl TrainingState {
+    /// Create a new training state.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Tokens per second throughput.
+    #[must_use]
+    pub fn tokens_per_sec(&self) -> f64 {
+        if self.elapsed_secs > 0.0 {
+            self.tokens_processed as f64 / self.elapsed_secs
+        } else {
+            0.0
+        }
+    }
+
+    /// Update state after a training step.
+    pub fn update_step(&mut self, loss: f64, lr: f64, tokens: usize) {
+        self.step += 1;
+        self.loss = loss;
+        self.learning_rate = lr;
+        self.tokens_processed += tokens;
+        self.epoch_samples += 1;
+    }
+
+    /// Advance to next epoch.
+    pub fn next_epoch(&mut self) {
+        self.epoch += 1;
+        self.epoch_samples = 0;
+    }
+}
+
+/// Checkpoint metadata for saving/loading training state.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckpointMetadata {
+    /// Training state at checkpoint.
+    pub state: TrainingState,
+    /// Model configuration hash for validation.
+    pub config_hash: Option<String>,
+    /// Timestamp when checkpoint was created.
+    pub timestamp: String,
+    /// PMetal version.
+    pub version: String,
+}
