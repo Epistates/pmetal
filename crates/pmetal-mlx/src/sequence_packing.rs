@@ -102,6 +102,15 @@ pub struct PackedBatch {
     pub sequence_boundaries: Vec<Vec<(usize, usize)>>,
     /// Number of original sequences packed into each batch entry.
     pub sequences_per_batch: Vec<usize>,
+    /// Boundary mask for CE loss [batch_size, max_seq_len].
+    /// 1.0 for positions that should contribute to loss, 0.0 for boundary positions.
+    /// The last token of each packed sequence is masked to prevent cross-sequence gradients.
+    pub loss_mask: Array,
+    /// Cumulative sequence lengths for varlen attention [batch_size, max_sequences + 1].
+    /// Used with FlashAttention varlen kernels.
+    pub cu_seqlens: Vec<Vec<i32>>,
+    /// Maximum sequence length in each packed batch (for varlen attention).
+    pub max_seqlen_in_batch: Vec<i32>,
 }
 
 /// Sequence packer for efficient SFT training.
@@ -173,19 +182,26 @@ impl SequencePacker {
         let mut all_input_ids = Vec::new();
         let mut all_labels = Vec::new();
         let mut all_position_ids = Vec::new();
+        let mut all_loss_mask = Vec::new();
         let mut all_boundaries = Vec::new();
         let mut all_seq_counts = Vec::new();
+        let mut all_cu_seqlens = Vec::new();
+        let mut all_max_seqlen = Vec::new();
 
         for bin in &bins {
             let mut packed_ids = Vec::new();
             let mut packed_labels = Vec::new();
             let mut packed_positions = Vec::new();
+            let mut packed_loss_mask = Vec::new();
             let mut boundaries = Vec::new();
+            let mut cu_seqlens = vec![0i32]; // Start with 0
             let mut current_pos = 0usize;
+            let mut max_seqlen = 0i32;
 
             for &seq_idx in bin {
                 let (ids, labels) = &sequences[seq_idx];
                 let seq_len = ids.dim(0) as usize;
+                max_seqlen = max_seqlen.max(seq_len as i32);
 
                 // Record boundary
                 boundaries.push((current_pos, current_pos + seq_len));
@@ -208,7 +224,21 @@ impl SequencePacker {
                     );
                 }
 
+                // Loss mask: 1.0 for all positions EXCEPT the last token of each sequence
+                // This prevents cross-sequence gradient flow in packed batches
+                // (Unsloth-style boundary masking)
+                for i in 0..seq_len {
+                    if i == seq_len - 1 {
+                        // Last token of this sequence - mask it to prevent
+                        // predicting the first token of the next sequence
+                        packed_loss_mask.push(0.0f32);
+                    } else {
+                        packed_loss_mask.push(1.0f32);
+                    }
+                }
+
                 current_pos += seq_len;
+                cu_seqlens.push(current_pos as i32);
             }
 
             // Pad to max_len
@@ -216,12 +246,16 @@ impl SequencePacker {
             packed_ids.extend(vec![self.config.pad_token_id; pad_len]);
             packed_labels.extend(vec![-100; pad_len]); // Ignore index for loss
             packed_positions.extend(vec![0; pad_len]); // Padding positions
+            packed_loss_mask.extend(vec![0.0f32; pad_len]); // Mask padding
 
             all_input_ids.push(packed_ids);
             all_labels.push(packed_labels);
             all_position_ids.push(packed_positions);
+            all_loss_mask.push(packed_loss_mask);
             all_boundaries.push(boundaries);
             all_seq_counts.push(bin.len());
+            all_cu_seqlens.push(cu_seqlens);
+            all_max_seqlen.push(max_seqlen);
         }
 
         // Create tensors
@@ -229,6 +263,8 @@ impl SequencePacker {
         let labels = Array::from_slice(&all_labels.concat(), &[batch_size as i32, max_len]);
         let position_ids =
             Array::from_slice(&all_position_ids.concat(), &[batch_size as i32, max_len]);
+        let loss_mask =
+            Array::from_slice(&all_loss_mask.concat(), &[batch_size as i32, max_len]);
 
         // Create attention mask
         let attention_mask = if self.config.use_block_diagonal_attention {
@@ -245,6 +281,9 @@ impl SequencePacker {
             position_ids,
             sequence_boundaries: all_boundaries,
             sequences_per_batch: all_seq_counts,
+            loss_mask,
+            cu_seqlens: all_cu_seqlens,
+            max_seqlen_in_batch: all_max_seqlen,
         })
     }
 
@@ -328,6 +367,151 @@ impl SequencePacker {
 
         // Return collected losses
         Ok(losses.into_iter().flatten().collect())
+    }
+}
+
+/// Apply boundary mask to cross-entropy loss for packed sequences.
+///
+/// This prevents cross-sequence gradient flow by masking out the loss at
+/// sequence boundaries (last token of each packed sequence).
+///
+/// # Arguments
+/// * `per_token_loss` - Loss per token [batch_size, seq_len]
+/// * `loss_mask` - Boundary mask from PackedBatch [batch_size, seq_len]
+///
+/// # Returns
+/// Masked mean loss (scalar)
+pub fn apply_boundary_mask(per_token_loss: &Array, loss_mask: &Array) -> Result<Array, Exception> {
+    // Multiply loss by mask (0 for boundaries, 1 for valid positions)
+    let masked_loss = per_token_loss.multiply(loss_mask)?;
+
+    // Sum of valid losses (sum over all axes)
+    let total_loss = masked_loss.sum(None)?;
+
+    // Count of valid positions
+    let valid_count = loss_mask.sum(None)?;
+
+    // Mean over valid positions only
+    total_loss.divide(&valid_count)
+}
+
+/// Check if a model architecture is compatible with sequence packing.
+///
+/// Some architectures (especially vision-language models) are not compatible
+/// with sequence packing due to cross-modal attention patterns.
+///
+/// # Arguments
+/// * `model_type` - Model architecture identifier (e.g., "llama", "qwen2_vl")
+///
+/// # Returns
+/// true if packing is compatible, false otherwise
+pub fn is_packing_compatible(model_type: &str) -> bool {
+    // Vision-language models are incompatible with standard packing
+    // because vision tokens need to attend across the full sequence
+    let incompatible_models = [
+        "qwen2_vl",
+        "qwen_vl",
+        "mllama",
+        "llava",
+        "pixtral",
+        "cogvlm",
+        "internvl",
+        "idefics",
+        "paligemma",
+        "phi3_v",
+        "florence",
+    ];
+
+    let model_lower = model_type.to_lowercase();
+    !incompatible_models.iter().any(|m| model_lower.contains(m))
+}
+
+/// Smart packing configuration that auto-detects optimal settings.
+///
+/// Automatically disables packing for incompatible models and
+/// selects appropriate attention mask type.
+pub struct SmartPackingConfig {
+    /// Base packing configuration.
+    pub config: PackingConfig,
+    /// Whether packing is enabled (auto-detected).
+    pub enabled: bool,
+    /// Reason if packing is disabled.
+    pub disabled_reason: Option<String>,
+}
+
+impl SmartPackingConfig {
+    /// Create a smart packing configuration for a model.
+    ///
+    /// Automatically disables packing for incompatible models.
+    pub fn for_model(model_type: &str, max_seq_len: usize) -> Self {
+        if is_packing_compatible(model_type) {
+            Self {
+                config: PackingConfig::new(max_seq_len)
+                    .with_reset_position_ids(true)
+                    .with_block_diagonal_attention(true),
+                enabled: true,
+                disabled_reason: None,
+            }
+        } else {
+            Self {
+                config: PackingConfig::new(max_seq_len),
+                enabled: false,
+                disabled_reason: Some(format!(
+                    "Model type '{}' is not compatible with sequence packing",
+                    model_type
+                )),
+            }
+        }
+    }
+
+    /// Check if packing should be used.
+    pub fn should_pack(&self) -> bool {
+        self.enabled
+    }
+}
+
+/// Information for varlen FlashAttention.
+///
+/// This struct provides the necessary metadata for variable-length
+/// attention kernels (e.g., FlashAttention varlen).
+#[derive(Debug, Clone)]
+pub struct VarLenAttentionInfo {
+    /// Cumulative sequence lengths [total_seqs + 1].
+    /// First element is 0, subsequent elements are cumsum of sequence lengths.
+    pub cu_seqlens_q: Array,
+    /// Cumulative sequence lengths for keys (same as cu_seqlens_q for self-attention).
+    pub cu_seqlens_k: Array,
+    /// Maximum sequence length in the batch.
+    pub max_seqlen_q: i32,
+    /// Maximum key sequence length (same as max_seqlen_q for self-attention).
+    pub max_seqlen_k: i32,
+}
+
+impl VarLenAttentionInfo {
+    /// Create varlen attention info from a packed batch.
+    pub fn from_packed_batch(packed: &PackedBatch, batch_idx: usize) -> Result<Self, Exception> {
+        if batch_idx >= packed.cu_seqlens.len() {
+            return Err(Exception::custom("batch_idx out of range"));
+        }
+
+        let cu_seqlens = &packed.cu_seqlens[batch_idx];
+        let max_seqlen = packed.max_seqlen_in_batch[batch_idx];
+
+        let cu_seqlens_array = Array::from_slice(cu_seqlens, &[cu_seqlens.len() as i32]);
+
+        Ok(Self {
+            cu_seqlens_q: cu_seqlens_array.clone(),
+            cu_seqlens_k: cu_seqlens_array,
+            max_seqlen_q: max_seqlen,
+            max_seqlen_k: max_seqlen,
+        })
+    }
+
+    /// Create varlen attention info for a batch of packed sequences.
+    pub fn from_packed_batch_all(packed: &PackedBatch) -> Result<Vec<Self>, Exception> {
+        (0..packed.cu_seqlens.len())
+            .map(|i| Self::from_packed_batch(packed, i))
+            .collect()
     }
 }
 
@@ -570,5 +754,99 @@ mod tests {
         assert_eq!(labels[2], 30);
         // Rest should be -100 (ignore index)
         assert!(labels[3..].iter().all(|&l| l == -100));
+    }
+
+    #[test]
+    fn test_loss_mask_boundary() {
+        let config = PackingConfig::new(20)
+            .with_pad_token_id(0)
+            .with_block_diagonal_attention(false);
+        let packer = SequencePacker::new(config);
+
+        // Two sequences: 3 tokens and 2 tokens
+        let seq1 = Array::from_slice(&[1i32, 2, 3], &[3]);
+        let seq2 = Array::from_slice(&[4i32, 5], &[2]);
+
+        let sequences = vec![(&seq1, &seq1), (&seq2, &seq2)];
+        let packed = packer.pack_sequences(&sequences).unwrap();
+
+        packed.loss_mask.eval().unwrap();
+        let mask: Vec<f32> = packed.loss_mask.as_slice().to_vec();
+
+        // seq1: positions 0,1 should be 1.0, position 2 (last) should be 0.0
+        assert_eq!(mask[0], 1.0); // seq1 pos 0
+        assert_eq!(mask[1], 1.0); // seq1 pos 1
+        assert_eq!(mask[2], 0.0); // seq1 pos 2 (boundary)
+        // seq2: position 3 should be 1.0, position 4 (last) should be 0.0
+        assert_eq!(mask[3], 1.0); // seq2 pos 0
+        assert_eq!(mask[4], 0.0); // seq2 pos 1 (boundary)
+        // Rest should be 0.0 (padding)
+        assert!(mask[5..].iter().all(|&m| m == 0.0));
+    }
+
+    #[test]
+    fn test_cu_seqlens() {
+        let config = PackingConfig::new(20)
+            .with_pad_token_id(0)
+            .with_block_diagonal_attention(false);
+        let packer = SequencePacker::new(config);
+
+        // Two sequences: 3 tokens and 2 tokens
+        let seq1 = Array::from_slice(&[1i32, 2, 3], &[3]);
+        let seq2 = Array::from_slice(&[4i32, 5], &[2]);
+
+        let sequences = vec![(&seq1, &seq1), (&seq2, &seq2)];
+        let packed = packer.pack_sequences(&sequences).unwrap();
+
+        // cu_seqlens should be [0, 3, 5] for the packed batch
+        assert_eq!(packed.cu_seqlens.len(), 1); // One batch
+        assert_eq!(packed.cu_seqlens[0], vec![0, 3, 5]);
+        assert_eq!(packed.max_seqlen_in_batch[0], 3);
+    }
+
+    #[test]
+    fn test_is_packing_compatible() {
+        // Text-only models should be compatible
+        assert!(is_packing_compatible("llama"));
+        assert!(is_packing_compatible("qwen2"));
+        assert!(is_packing_compatible("mistral"));
+        assert!(is_packing_compatible("gemma"));
+
+        // Vision-language models should NOT be compatible
+        assert!(!is_packing_compatible("qwen2_vl"));
+        assert!(!is_packing_compatible("mllama"));
+        assert!(!is_packing_compatible("pixtral"));
+        assert!(!is_packing_compatible("llava"));
+    }
+
+    #[test]
+    fn test_smart_packing_config() {
+        // Text model should enable packing
+        let smart = SmartPackingConfig::for_model("llama", 4096);
+        assert!(smart.should_pack());
+        assert!(smart.disabled_reason.is_none());
+
+        // VLM should disable packing
+        let smart_vlm = SmartPackingConfig::for_model("qwen2_vl", 4096);
+        assert!(!smart_vlm.should_pack());
+        assert!(smart_vlm.disabled_reason.is_some());
+    }
+
+    #[test]
+    fn test_varlen_attention_info() {
+        let config = PackingConfig::new(20)
+            .with_pad_token_id(0)
+            .with_block_diagonal_attention(false);
+        let packer = SequencePacker::new(config);
+
+        let seq1 = Array::from_slice(&[1i32, 2, 3], &[3]);
+        let seq2 = Array::from_slice(&[4i32, 5], &[2]);
+
+        let sequences = vec![(&seq1, &seq1), (&seq2, &seq2)];
+        let packed = packer.pack_sequences(&sequences).unwrap();
+
+        let varlen_info = VarLenAttentionInfo::from_packed_batch(&packed, 0).unwrap();
+        assert_eq!(varlen_info.max_seqlen_q, 3);
+        assert_eq!(varlen_info.max_seqlen_k, 3);
     }
 }

@@ -151,12 +151,14 @@ impl SftTrainer {
     /// Perform a single training step on LoRA parameters.
     ///
     /// This computes gradients and updates LoRA A and B matrices.
+    /// Supports optional pixel values for multimodal models.
     pub fn train_step_lora(
         &mut self,
         lora_layers: &mut [&mut LoraLinear],
         input_ids: &Array,
+        pixel_values: Option<&Array>,
         labels: &Array,
-        forward_fn: impl Fn(&[&LoraLinear], &Array) -> Result<Array>,
+        forward_fn: impl Fn(&[&LoraLinear], &Array, Option<&Array>) -> Result<Array>,
     ) -> Result<f64> {
         // Collect LoRA parameters for gradient computation
         let _lora_params: Vec<(&Array, &Array)> =
@@ -164,7 +166,7 @@ impl SftTrainer {
 
         // Forward pass
         let lora_refs: Vec<&LoraLinear> = lora_layers.iter().map(|l| &**l).collect();
-        let logits = forward_fn(&lora_refs, input_ids)?;
+        let logits = forward_fn(&lora_refs, input_ids, pixel_values)?;
 
         // Compute loss
         let loss = self.compute_loss(&logits, labels, None)?;
