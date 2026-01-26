@@ -476,8 +476,8 @@ mod tests {
 
     #[test]
     fn test_dispatcher_preferred_backend() {
-        let dispatcher = AttentionDispatcher::new()
-            .with_preferred_backend(AttentionBackend::Standard);
+        let dispatcher =
+            AttentionDispatcher::new().with_preferred_backend(AttentionBackend::Standard);
         let config = AttentionConfig::default();
         let seq_info = SequenceInfo::packed(vec![0, 100], 100);
 

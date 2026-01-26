@@ -736,9 +736,7 @@ impl FrozenParameterManager {
             let name_str = name.as_ref();
 
             // Skip trainable parameters
-            let is_trainable = trainable_patterns
-                .iter()
-                .any(|p| name_str.contains(p));
+            let is_trainable = trainable_patterns.iter().any(|p| name_str.contains(p));
             if is_trainable {
                 continue;
             }
@@ -873,7 +871,10 @@ impl<'a> Drop for FrozenModuleForward<'a> {
         // Evict this layer's weights when forward pass is done
         // Find all params starting with this layer name and evict them
         let prefix = format!("{}.", self.layer_name);
-        let keys: Vec<_> = self.manager.frozen_params.keys()
+        let keys: Vec<_> = self
+            .manager
+            .frozen_params
+            .keys()
             .filter(|k| k.starts_with(&prefix))
             .cloned()
             .collect();
@@ -1080,7 +1081,9 @@ mod tests {
         assert!(config.should_keep_on_gpu("model.layers.0.input_layernorm.weight", 4096));
 
         // Regular linear layers should be offloaded
-        assert!(!config.should_keep_on_gpu("model.layers.0.self_attn.q_proj.weight", 1024 * 1024 * 10));
+        assert!(
+            !config.should_keep_on_gpu("model.layers.0.self_attn.q_proj.weight", 1024 * 1024 * 10)
+        );
     }
 
     #[test]
@@ -1095,15 +1098,24 @@ mod tests {
 
         // Large frozen param (should be offloaded)
         let frozen_weight = mlx_rs::random::normal::<f32>(&[1024, 4096], None, None, None).unwrap();
-        params.insert(Rc::from("model.layers.0.self_attn.q_proj.weight"), frozen_weight);
+        params.insert(
+            Rc::from("model.layers.0.self_attn.q_proj.weight"),
+            frozen_weight,
+        );
 
         // Small norm (should stay on GPU)
         let norm_weight = mlx_rs::random::normal::<f32>(&[4096], None, None, None).unwrap();
-        params.insert(Rc::from("model.layers.0.input_layernorm.weight"), norm_weight);
+        params.insert(
+            Rc::from("model.layers.0.input_layernorm.weight"),
+            norm_weight,
+        );
 
         // Trainable LoRA (should be skipped)
         let lora_weight = mlx_rs::random::normal::<f32>(&[4096, 16], None, None, None).unwrap();
-        params.insert(Rc::from("model.layers.0.self_attn.q_proj.lora_A"), lora_weight);
+        params.insert(
+            Rc::from("model.layers.0.self_attn.q_proj.lora_A"),
+            lora_weight,
+        );
 
         manager.register_frozen_params(&params, &["lora_"]).unwrap();
 

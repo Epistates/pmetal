@@ -77,6 +77,7 @@ pub use bridge::{metal_buffer_from_ptr, MetalBufferView, MetalBufferViewF16, Met
 pub use buffer::{BufferUsage, MetalBuffer};
 pub use context::MetalContext;
 pub use error::{MetalError, Result};
+pub use kernels::batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
 pub use kernels::flash_attention::{
     FlashAttention, FlashAttentionConfig, FlashAttentionOutput, FlashAttentionVarlen,
     FlashAttentionVarlenConfig, FlashAttentionVarlenOutput,
@@ -90,7 +91,6 @@ pub use kernels::fused_cross_entropy::{
     FusedLinearCrossEntropyConfig,
     FusedLinearCrossEntropyOutput,
 };
-pub use kernels::batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
 pub use kernels::fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use kernels::fused_merge::{
     build_merge_config, build_tensor_info, FusedMergeMetal, MergeConfig as FusedMergeConfig,
@@ -115,6 +115,7 @@ pub mod prelude {
     pub use crate::buffer::{BufferUsage, MetalBuffer};
     pub use crate::context::MetalContext;
     pub use crate::error::{MetalError, Result};
+    pub use crate::kernels::batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
     pub use crate::kernels::flash_attention::{
         FlashAttention, FlashAttentionConfig, FlashAttentionVarlen, FlashAttentionVarlenConfig,
     };
@@ -122,7 +123,6 @@ pub mod prelude {
         FusedCrossEntropy, FusedCrossEntropyConfig, FusedLinearCrossEntropy,
         FusedLinearCrossEntropyConfig,
     };
-    pub use crate::kernels::batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
     pub use crate::kernels::fused_lora::{FusedLora, FusedLoraConfig};
     pub use crate::kernels::fused_sampler::{FusedSampler, FusedSamplerConfig};
     pub use crate::pipeline::PipelineCache;

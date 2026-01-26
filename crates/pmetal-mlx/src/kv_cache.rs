@@ -398,7 +398,11 @@ impl KVCache {
     /// Check if the cache is pre-allocated (eager mode).
     pub fn is_preallocated(&self) -> bool {
         self.config.eager_allocate
-            && self.layer_caches.first().map(|c| c.keys.is_some()).unwrap_or(false)
+            && self
+                .layer_caches
+                .first()
+                .map(|c| c.keys.is_some())
+                .unwrap_or(false)
     }
 
     /// Reset the cache for a new generation.
@@ -1923,7 +1927,9 @@ pub struct MambaCacheEntry {
 impl MambaCache {
     /// Create a new Mamba cache with the specified number of layers.
     pub fn new(num_layers: usize) -> Self {
-        let layers = (0..num_layers).map(|_| MambaCacheEntry::default()).collect();
+        let layers = (0..num_layers)
+            .map(|_| MambaCacheEntry::default())
+            .collect();
         Self { layers }
     }
 

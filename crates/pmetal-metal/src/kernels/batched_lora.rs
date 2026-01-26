@@ -110,7 +110,9 @@ impl BatchedLoraConfig {
     /// Validate the configuration.
     pub fn validate(&self) -> Result<()> {
         if self.max_batch_size == 0 {
-            return Err(MetalError::InvalidConfig("max_batch_size must be > 0".into()));
+            return Err(MetalError::InvalidConfig(
+                "max_batch_size must be > 0".into(),
+            ));
         }
         if self.num_adapters == 0 {
             return Err(MetalError::InvalidConfig("num_adapters must be > 0".into()));

@@ -263,8 +263,7 @@ impl SequencePacker {
         let labels = Array::from_slice(&all_labels.concat(), &[batch_size as i32, max_len]);
         let position_ids =
             Array::from_slice(&all_position_ids.concat(), &[batch_size as i32, max_len]);
-        let loss_mask =
-            Array::from_slice(&all_loss_mask.concat(), &[batch_size as i32, max_len]);
+        let loss_mask = Array::from_slice(&all_loss_mask.concat(), &[batch_size as i32, max_len]);
 
         // Create attention mask
         let attention_mask = if self.config.use_block_diagonal_attention {
@@ -777,10 +776,10 @@ mod tests {
         assert_eq!(mask[0], 1.0); // seq1 pos 0
         assert_eq!(mask[1], 1.0); // seq1 pos 1
         assert_eq!(mask[2], 0.0); // seq1 pos 2 (boundary)
-        // seq2: position 3 should be 1.0, position 4 (last) should be 0.0
+                                  // seq2: position 3 should be 1.0, position 4 (last) should be 0.0
         assert_eq!(mask[3], 1.0); // seq2 pos 0
         assert_eq!(mask[4], 0.0); // seq2 pos 1 (boundary)
-        // Rest should be 0.0 (padding)
+                                  // Rest should be 0.0 (padding)
         assert!(mask[5..].iter().all(|&m| m == 0.0));
     }
 

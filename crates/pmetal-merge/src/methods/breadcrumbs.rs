@@ -315,8 +315,8 @@ mod tests {
         // Create tensor with some outliers
         let delta = Array::from_slice(
             &[
-                0.1_f32, 0.2, 0.3, 0.4, 0.5, // Normal values
-                10.0,  // Outlier (should be removed)
+                0.1_f32, 0.2, 0.3, 0.4, 0.5,  // Normal values
+                10.0, // Outlier (should be removed)
                 0.01, // Small noise (should be removed)
             ],
             &[7],
@@ -351,9 +351,7 @@ mod tests {
         ];
         let global = MergeParameters::default();
 
-        let result = bc
-            .merge(&[t1, t2], Some(&base), &params, &global)
-            .unwrap();
+        let result = bc.merge(&[t1, t2], Some(&base), &params, &global).unwrap();
         result.eval().unwrap();
 
         // Result should be close to average task vector added to base
@@ -434,9 +432,6 @@ mod tests {
 
         // Rescaled should have higher sum due to density compensation
         // (assuming we removed some values)
-        println!(
-            "Rescaled sum: {}, Plain sum: {}",
-            sum_rescaled, sum_plain
-        );
+        println!("Rescaled sum: {}, Plain sum: {}", sum_rescaled, sum_plain);
     }
 }

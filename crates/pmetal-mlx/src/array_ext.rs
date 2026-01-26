@@ -107,15 +107,21 @@ pub fn gather_mm_device(
     stream: &Stream,
 ) -> Result<Array> {
     unsafe {
-        let mut result = mlx_sys::mlx_array { ctx: std::ptr::null_mut() };
+        let mut result = mlx_sys::mlx_array {
+            ctx: std::ptr::null_mut(),
+        };
 
         let lhs_ptr = lhs_indices
             .map(|arr| arr.as_ptr())
-            .unwrap_or(mlx_sys::mlx_array { ctx: std::ptr::null_mut() });
+            .unwrap_or(mlx_sys::mlx_array {
+                ctx: std::ptr::null_mut(),
+            });
 
         let rhs_ptr = rhs_indices
             .map(|arr| arr.as_ptr())
-            .unwrap_or(mlx_sys::mlx_array { ctx: std::ptr::null_mut() });
+            .unwrap_or(mlx_sys::mlx_array {
+                ctx: std::ptr::null_mut(),
+            });
 
         let status = mlx_sys::mlx_gather_mm(
             &mut result,

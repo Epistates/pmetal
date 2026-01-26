@@ -124,8 +124,10 @@ pub use online_dpo::{
 pub use orpo::*;
 pub use param_groups::*;
 pub use ppo::*;
+pub use schedule_free::{
+    ScheduleFreeConfig, ScheduleFreeError, ScheduleFreeOptimizer, ScheduleFreeResult,
+};
 pub use scheduler::*;
 pub use sft::*;
-pub use schedule_free::{ScheduleFreeConfig, ScheduleFreeError, ScheduleFreeOptimizer, ScheduleFreeResult};
 pub use simpo::*;
 pub use training_loop::*;

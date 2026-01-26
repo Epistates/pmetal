@@ -175,10 +175,7 @@ impl SouperMerge {
     /// Models with lower deviation (closer to consensus) get higher weights.
     fn compute_weights(&self, deviations: &[f32], user_weights: Option<&[f32]>) -> Vec<f32> {
         // Compute inverse deviation scores
-        let scores: Vec<f32> = deviations
-            .iter()
-            .map(|&d| 1.0 / (d + self.eps))
-            .collect();
+        let scores: Vec<f32> = deviations.iter().map(|&d| 1.0 / (d + self.eps)).collect();
 
         // Apply temperature scaling (optional softmax-style normalization)
         let scaled_scores: Vec<f32> = if self.temperature != 1.0 {
@@ -379,9 +376,7 @@ mod tests {
         ];
         let global = MergeParameters::default();
 
-        let result = souper
-            .merge(&[t1, t2, t3], None, &params, &global)
-            .unwrap();
+        let result = souper.merge(&[t1, t2, t3], None, &params, &global).unwrap();
         result.eval().unwrap();
 
         let result_slice: Vec<f32> = result.as_slice().to_vec();

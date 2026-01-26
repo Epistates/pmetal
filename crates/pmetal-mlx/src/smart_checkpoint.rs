@@ -1040,7 +1040,11 @@ mod tests {
         // Formula: (4 Q/K/V/O + 3 MLP) * context * hidden * layers * dtype
         // = 7 * 100K * 4096 * 32 * 2 = ~171GB activation memory
         let actual_gb = memory / (1024 * 1024 * 1024);
-        assert!(actual_gb > 150 && actual_gb < 200, "Expected 150-200GB, got {}GB", actual_gb);
+        assert!(
+            actual_gb > 150 && actual_gb < 200,
+            "Expected 150-200GB, got {}GB",
+            actual_gb
+        );
     }
 
     #[test]
@@ -1048,9 +1052,9 @@ mod tests {
         // 32GB available, 8B model
         let segment_size = LongContextConfig::auto_segment_for_memory(
             32_usize * 1024 * 1024 * 1024, // 32GB
-            4096,                     // hidden
-            32,                       // layers
-            2,                        // bf16
+            4096,                          // hidden
+            32,                            // layers
+            2,                             // bf16
         );
 
         // Should compute a reasonable segment size
@@ -1091,21 +1095,21 @@ mod tests {
     fn test_requires_long_context_handling() {
         // Short context (1K) should not require long context handling
         let requires = requires_long_context_handling(
-            1_000,                        // 1K tokens
-            64 * 1024 * 1024 * 1024,      // 64GB available
-            4096,                          // hidden
-            32,                            // layers
-            2,                             // bf16
+            1_000,                   // 1K tokens
+            64 * 1024 * 1024 * 1024, // 64GB available
+            4096,                    // hidden
+            32,                      // layers
+            2,                       // bf16
         );
         assert!(!requires);
 
         // Very long context (500K) should require it
         let requires = requires_long_context_handling(
-            500_000,                       // 500K tokens
-            64 * 1024 * 1024 * 1024,       // 64GB available
-            4096,                          // hidden
-            32,                            // layers
-            2,                             // bf16
+            500_000,                 // 500K tokens
+            64 * 1024 * 1024 * 1024, // 64GB available
+            4096,                    // hidden
+            32,                      // layers
+            2,                       // bf16
         );
         assert!(requires);
     }

@@ -1617,7 +1617,9 @@ async fn run_inference(
     let output = if minimal {
         tracing::info!("Using minimal async generation (debugging)");
         generate_minimal_async(
-            |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
+            |input, cache| {
+                model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+            },
             &input_ids,
             gen_config,
             &mut cache,
@@ -1625,7 +1627,9 @@ async fn run_inference(
     } else if metal_sampler {
         tracing::info!("Using fused Metal sampling kernel");
         generate_cached_metal(
-            |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
+            |input, cache| {
+                model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+            },
             &input_ids,
             gen_config,
             &mut cache,
@@ -1633,7 +1637,9 @@ async fn run_inference(
     } else if compiled {
         tracing::info!("Using JIT-compiled sampling (mlx_lm style)");
         generate_cached_compiled(
-            |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
+            |input, cache| {
+                model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+            },
             &input_ids,
             gen_config,
             &mut cache,
@@ -1645,7 +1651,9 @@ async fn run_inference(
             tracing::info!("Using async generation with dedicated stream");
         }
         generate_cached_async(
-            |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
+            |input, cache| {
+                model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+            },
             &input_ids,
             gen_config,
             &mut cache,
@@ -1658,7 +1666,9 @@ async fn run_inference(
         if minimal {
             tracing::info!("Using minimal async generation (debugging)");
             generate_minimal_async(
-                |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
+                |input, cache| {
+                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+                },
                 &input_ids,
                 gen_config,
                 &mut cache,
@@ -1666,7 +1676,9 @@ async fn run_inference(
         } else if compiled {
             tracing::info!("Using JIT-compiled sampling (mlx_lm style)");
             generate_cached_compiled(
-                |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
+                |input, cache| {
+                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+                },
                 &input_ids,
                 gen_config,
                 &mut cache,
@@ -1678,7 +1690,9 @@ async fn run_inference(
                 tracing::info!("Using async generation with dedicated stream");
             }
             generate_cached_async(
-                |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut()),
+                |input, cache| {
+                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+                },
                 &input_ids,
                 gen_config,
                 &mut cache,

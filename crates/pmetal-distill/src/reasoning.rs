@@ -327,7 +327,10 @@ mod tests {
 
         // The weighted version should differ (could be higher or lower depending on
         // which position has more loss)
-        println!("Low weight loss: {}, High weight loss: {}", val_low, val_high);
+        println!(
+            "Low weight loss: {}, High weight loss: {}",
+            val_low, val_high
+        );
     }
 
     #[test]

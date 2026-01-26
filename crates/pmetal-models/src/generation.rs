@@ -1413,7 +1413,9 @@ where
             let (y, lp) = {
                 let _stream_ctx = StreamContext::new(&generation_stream);
                 // Convert Uint32 token to Int32 for model input (argmax returns Uint32)
-                let next_input = current_y.as_dtype(mlx_rs::Dtype::Int32)?.reshape(&[1, -1])?;
+                let next_input = current_y
+                    .as_dtype(mlx_rs::Dtype::Int32)?
+                    .reshape(&[1, -1])?;
                 let next_output = forward_fn(&next_input, cache)?;
                 let next_logits = next_output.index((.., 0, ..));
                 sampler.sample_array(&next_logits)?
