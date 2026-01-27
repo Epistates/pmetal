@@ -1,0 +1,1 @@
+{"config":{"batch_size":8,"epochs":1,"gradient_accumulation_steps":1,"gradient_checkpointing":false,"learning_rate":0.0002,"lora_r":32,"max_seq_len":4096,"model":"unsloth/Qwen3-0.6B-Base","quantization":"None"},"event":"train_start","run_name":"unsloth-Qwen3-0.6B-Base-20260122-181102","timestamp":"2026-01-22T18:11:02.403505+00:00"}
