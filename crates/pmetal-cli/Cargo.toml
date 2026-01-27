@@ -34,6 +34,12 @@ indicatif = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
 chrono = "0.4"
+parquet = { version = "55", features = ["arrow"] }
+arrow-array = "55"
+arrow-json = "55"
+rand = "0.8"
+regex = "1"
+tokenizers = { workspace = true }
 
 [lints]
 workspace = true

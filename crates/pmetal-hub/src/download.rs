@@ -215,35 +215,85 @@ pub async fn download_dataset_parquet(
     // Common patterns for parquet files in HuggingFace datasets:
     // 1. data/{split}-00000-of-00001.parquet (sharded)
     // 2. data/{split}.parquet (single file)
-    // 3. {split}/train-00000-of-00001.parquet (split directory)
+    // 3. default/{split}/0000.parquet (auto-converted format)
+    // 4. {split}/train-00000-of-00001.parquet (split directory)
 
-    // Try single file first
-    let single_file = format!("data/{}.parquet", split);
-    if let Ok(path) = repo.get(&single_file).await {
-        paths.push(path);
-        return Ok(paths);
+    // Try single file patterns
+    let single_patterns = [
+        format!("data/{}.parquet", split),
+        format!("default/{}/0000.parquet", split),
+        format!("{}/{}-00000-of-00001.parquet", split, split),
+        format!("{}.parquet", split),
+    ];
+
+    for pattern in &single_patterns {
+        if let Ok(path) = repo.get(pattern).await {
+            paths.push(path);
+            return Ok(paths);
+        }
     }
 
-    // Try numbered shards (up to 100 shards)
-    for i in 0..100 {
-        // We need to try common shard counts
-        for total in [1, 2, 4, 5, 10, 20, 50, 100] {
-            let exact_file = format!("data/{}-{:05}-of-{:05}.parquet", split, i, total);
-            if let Ok(path) = repo.get(&exact_file).await {
-                paths.push(path);
-                break;
+    // Try numbered shards in common locations
+    let shard_prefixes = [
+        format!("data/{}", split),
+        format!("default/{}", split),
+        split.to_string(),
+    ];
+
+    for prefix in &shard_prefixes {
+        for i in 0..100 {
+            // Try common shard naming patterns
+            let patterns = [
+                format!("{}-{:05}-of-{:05}.parquet", prefix, i, 1),
+                format!("{}/{:04}.parquet", prefix, i),
+                format!("{}-{:05}.parquet", prefix, i),
+            ];
+
+            let mut found_in_batch = false;
+            for pattern in &patterns {
+                if let Ok(path) = repo.get(pattern).await {
+                    paths.push(path);
+                    found_in_batch = true;
+                    break;
+                }
+            }
+
+            // For numbered shards, stop after finding some and then getting no more
+            if i > 0 && !found_in_batch && !paths.is_empty() {
+                return Ok(paths);
             }
         }
 
-        // Stop if we found no more shards after finding at least one
-        if i > 0 && paths.len() == i {
-            break;
+        if !paths.is_empty() {
+            return Ok(paths);
+        }
+    }
+
+    // Try using the parquet conversion branch which HuggingFace provides
+    let parquet_repo = api.repo(Repo::with_revision(
+        dataset_id.to_string(),
+        RepoType::Dataset,
+        "refs/convert/parquet".to_string(),
+    ));
+
+    // Try common paths in the parquet branch
+    let parquet_patterns = [
+        format!("default/{}/0000.parquet", split),
+        format!("{}/0000.parquet", split),
+        format!("default/{split}-00000-of-00001.parquet"),
+    ];
+
+    for pattern in &parquet_patterns {
+        if let Ok(path) = parquet_repo.get(pattern).await {
+            paths.push(path);
+            return Ok(paths);
         }
     }
 
     if paths.is_empty() {
         return Err(pmetal_core::PMetalError::Hub(format!(
-            "No parquet files found for split '{}' in dataset '{}'",
+            "No parquet files found for split '{}' in dataset '{}'. \
+            Try checking the dataset page for available files.",
             split, dataset_id
         )));
     }

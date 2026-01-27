@@ -930,7 +930,6 @@ mod tests {
     // the Metal command buffer has been committed.
 
     #[test]
-    #[ignore = "FFI JIT has Metal timing issues - see raw_ffi module"]
     fn test_compiled_rust_closure_simple() {
         use raw_ffi::CompiledRustClosure;
 
@@ -956,7 +955,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "FFI JIT has Metal timing issues - see raw_ffi module"]
     fn test_compiled_rust_closure_multiple_inputs_outputs() {
         use raw_ffi::CompiledRustClosure;
 

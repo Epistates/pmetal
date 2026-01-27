@@ -66,12 +66,38 @@ impl GenericLoraAttention {
         let use_rslora = lora_config.use_rslora;
 
         // Create LoRA linear layers for projections
-        let q_proj = LoraLinear::new(hidden_size, n_heads * head_dim, rank, alpha, use_rslora, false)?;
-        let k_proj =
-            LoraLinear::new(hidden_size, n_kv_heads * head_dim, rank, alpha, use_rslora, false)?;
-        let v_proj =
-            LoraLinear::new(hidden_size, n_kv_heads * head_dim, rank, alpha, use_rslora, false)?;
-        let o_proj = LoraLinear::new(n_heads * head_dim, hidden_size, rank, alpha, use_rslora, false)?;
+        let q_proj = LoraLinear::new(
+            hidden_size,
+            n_heads * head_dim,
+            rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
+        let k_proj = LoraLinear::new(
+            hidden_size,
+            n_kv_heads * head_dim,
+            rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
+        let v_proj = LoraLinear::new(
+            hidden_size,
+            n_kv_heads * head_dim,
+            rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
+        let o_proj = LoraLinear::new(
+            n_heads * head_dim,
+            hidden_size,
+            rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
 
         // Initialize RoPE
         let rope = nn::RopeBuilder::new(head_dim)
@@ -150,9 +176,11 @@ impl GenericLoraAttention {
         let output = weights.matmul(&values)?;
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, heads * head_dim]
-        let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+        let output = output.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+            batch,
+            seq_len,
+            self.n_heads * self.head_dim,
+        ])?;
 
         // Output projection
         self.o_proj.forward(&output)
@@ -201,12 +229,30 @@ impl GenericLoraMLP {
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
 
-        let gate_proj =
-            LoraLinear::new(hidden_size, intermediate_size, rank, alpha, use_rslora, false)?;
-        let up_proj =
-            LoraLinear::new(hidden_size, intermediate_size, rank, alpha, use_rslora, false)?;
-        let down_proj =
-            LoraLinear::new(intermediate_size, hidden_size, rank, alpha, use_rslora, false)?;
+        let gate_proj = LoraLinear::new(
+            hidden_size,
+            intermediate_size,
+            rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
+        let up_proj = LoraLinear::new(
+            hidden_size,
+            intermediate_size,
+            rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
+        let down_proj = LoraLinear::new(
+            intermediate_size,
+            hidden_size,
+            rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
 
         Ok(Self {
             gate_proj,
@@ -257,7 +303,8 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     // [B, kv_heads, L, head_dim] -> [B, kv_heads, 1, L, head_dim]
     let expanded = x.reshape(&[batch, kv_heads, 1, seq_len, head_dim])?;
     // Broadcast to [B, kv_heads, repeats, L, head_dim]
-    let tiled = mlx_rs::ops::broadcast_to(&expanded, &[batch, kv_heads, repeats, seq_len, head_dim])?;
+    let tiled =
+        mlx_rs::ops::broadcast_to(&expanded, &[batch, kv_heads, repeats, seq_len, head_dim])?;
     // Reshape to [B, kv_heads * repeats, L, head_dim]
     tiled.reshape(&[batch, kv_heads * repeats, seq_len, head_dim])
 }

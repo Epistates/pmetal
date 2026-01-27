@@ -357,7 +357,7 @@ impl MambaRMSNormGated {
                     );
 
                     // Find where the max result comes from by scanning all positions
-                    let res_max = result_g.max(None)?.item::<f32>();
+                    let _res_max = result_g.max(None)?.item::<f32>();
                     for pos in 0..self.group_size {
                         let x_val = x_g.index(pos as i32).item::<f32>();
                         let w_val = w_g.index(pos as i32).item::<f32>();
@@ -450,7 +450,7 @@ pub fn ssm_update_single(
     let shape = x.shape();
     let batch = shape[0];
     let num_heads = shape[2];
-    let head_dim = shape[3];
+    let _head_dim = shape[3];
 
     let b_shape = b.shape();
     let n_groups = b_shape[2];
@@ -1390,24 +1390,24 @@ impl MoELayer {
         let x_expanded = x_flat.reshape(&[num_tokens, 1, 1, hidden_size])?;
 
         // Transpose stacked weights for matmul: [num_experts, out, in] -> [num_experts, in, out]
-        let up_T = stacked_up.swap_axes(-1, -2)?;
-        let down_T = stacked_down.swap_axes(-1, -2)?;
+        let up_t = stacked_up.swap_axes(-1, -2)?;
+        let down_t = stacked_down.swap_axes(-1, -2)?;
 
         // Use gather_mm for up projection: selects expert weights based on indices
         // x_expanded: [B*L, 1, 1, hidden]
-        // up_T: [num_experts, hidden, intermediate]
+        // up_t: [num_experts, hidden, intermediate]
         // indices: [B*L, top_k]
         // Result: [B*L, top_k, intermediate]
-        let up_out = gather_mm(&x_expanded, &up_T, None, Some(&indices), false)?;
+        let up_out = gather_mm(&x_expanded, &up_t, None, Some(&indices), false)?;
 
         // Apply relu2 activation (relu squared)
         let activated = mlx_rs::nn::relu(&up_out)?.square()?;
 
         // Use gather_mm for down projection
         // activated: [B*L, top_k, intermediate]
-        // down_T: [num_experts, intermediate, hidden]
+        // down_t: [num_experts, intermediate, hidden]
         // Result: [B*L, top_k, hidden]
-        let down_out = gather_mm(&activated, &down_T, None, Some(&indices), false)?;
+        let down_out = gather_mm(&activated, &down_t, None, Some(&indices), false)?;
 
         // Weight and sum over top_k experts: [B*L, top_k, hidden] -> [B*L, hidden]
         // weights: [B*L, top_k] -> expand to [B*L, top_k, 1]

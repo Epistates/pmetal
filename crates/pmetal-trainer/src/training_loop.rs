@@ -198,6 +198,7 @@ fn trainable_training_step<M: TrainableModel, O: Optimizer>(
 fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
     state: &mut (M, O),
     packed_batch: &PackedTrainingBatch,
+    max_grad_norm: f32,
 ) -> std::result::Result<Array, Exception> {
     let (model, optimizer) = state;
 
@@ -253,10 +254,32 @@ fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
 
     // Compute loss and gradients - pass position_ids as 4th argument
     let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-    let (loss, grads) = loss_and_grad_fn(
+    let (loss, mut grads) = loss_and_grad_fn(
         model,
         (&input_ids_2d, &labels_2d, &attn_mask_4d, &position_ids),
     )?;
+
+    // Apply gradient clipping if max_grad_norm > 0
+    if max_grad_norm > 0.0 {
+        // Compute global gradient norm (GPU-based, no sync required)
+        let eps = Array::from_slice(&[1e-6_f32], &[1]);
+        let mut sq_sum = Array::from_slice(&[0.0_f32], &[1]);
+        for grad in grads.values() {
+            sq_sum = sq_sum.add(&grad.square()?.sum(None)?)?;
+        }
+        let norm = sq_sum.sqrt()?;
+
+        // Scale gradients: scale = max_norm / max(norm, max_norm)
+        // This clamps scale to [0, 1], only reducing large gradients
+        let max_norm_arr = Array::from_slice(&[max_grad_norm], &[1]);
+        let norm_clamped = mlx_rs::ops::maximum(&norm, &max_norm_arr)?;
+        let scale = max_norm_arr.divide(&norm_clamped.add(&eps)?)?;
+
+        // Apply scale to all gradients (in-place via replace)
+        for grad in grads.values_mut() {
+            *grad = grad.multiply(&scale)?;
+        }
+    }
 
     // Apply gradients via optimizer
     optimizer.update(model, grads)?;
@@ -1857,7 +1880,8 @@ impl TrainingLoop {
         );
 
         // Execute warmup step - this initializes optimizer momentum/velocity buffers
-        let warmup_loss = jit_training_step_packed(&mut state, &warmup_batch)?;
+        let max_grad_norm = self.config.training.max_grad_norm as f32;
+        let warmup_loss = jit_training_step_packed(&mut state, &warmup_batch, max_grad_norm)?;
         warmup_loss.eval()?;
         let warmup_loss_val: f32 = warmup_loss.item();
 
@@ -1902,9 +1926,13 @@ impl TrainingLoop {
 
                 let batch_tokens = packed_batch.total_tokens;
 
+                // Apply learning rate schedule before each step
+                let scheduled_lr = self.get_learning_rate();
+                state.1.set_learning_rate(scheduled_lr);
+
                 // Execute packed training step (forward + backward + optimizer update)
                 // DEFERRED EVAL: Loss remains a lazy Array, no GPU-CPU sync here
-                let loss = jit_training_step_packed(&mut state, &packed_batch)?;
+                let loss = jit_training_step_packed(&mut state, &packed_batch, max_grad_norm)?;
                 accumulated_losses.push(loss);
 
                 // Update step counters
