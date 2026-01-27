@@ -254,12 +254,12 @@ impl MergeMethod for BreadcrumbsMerge {
         let mut result = mlx_rs::ops::zeros::<f32>(task_vectors[0].shape())?;
 
         for (vector, weight) in final_vectors.iter().zip(weights.iter()) {
-            let weighted = vector.multiply(&Array::from_f32(*weight))?;
+            let weighted = vector.multiply(Array::from_f32(*weight))?;
             result = result.add(&weighted)?;
         }
 
         // Scale by lambda
-        result = result.multiply(&Array::from_f32(lambda))?;
+        result = result.multiply(Array::from_f32(lambda))?;
 
         // Add back to base
         Ok(base.add(&result)?)
@@ -305,7 +305,7 @@ mod tests {
 
         // 50th percentile should be median-ish
         let p50 = BreadcrumbsMerge::compute_percentile(&values, 0.5);
-        assert!(p50 >= 5.0 && p50 <= 6.0);
+        assert!((5.0..=6.0).contains(&p50));
     }
 
     #[test]

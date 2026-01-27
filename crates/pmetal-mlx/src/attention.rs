@@ -234,11 +234,8 @@ impl AttentionDispatcher {
         }
 
         // Priority 1: VarLen for packed sequences
-        if seq_info.is_packed {
-            if is_varlen_available() {
-                return (AttentionBackend::VarLen, "packed sequences");
-            }
-            // Fall through to other backends
+        if seq_info.is_packed && is_varlen_available() {
+            return (AttentionBackend::VarLen, "packed sequences");
         }
 
         // Priority 2: Metal kernel for special cases (softcap, sliding window)
@@ -495,6 +492,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::identity_op)]
     fn test_sliding_window_mask() {
         let mask = create_sliding_window_mask(5, 2);
         mask.eval().unwrap();

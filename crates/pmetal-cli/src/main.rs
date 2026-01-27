@@ -3630,34 +3630,32 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                         }
 
                         // If it has "messages" field, convert to ShareGPT format
-                        if let Some(messages) = obj.get("messages").cloned() {
-                            if let serde_json::Value::Array(msgs) = messages {
-                                let conversations: Vec<_> = msgs
-                                    .iter()
-                                    .filter_map(|m| {
-                                        let role = m.get("role")?.as_str()?;
-                                        let content = m.get("content")?.as_str()?;
-                                        let from = match role {
-                                            "user" => "human",
-                                            "assistant" => "gpt",
-                                            "system" => "system",
-                                            _ => role,
-                                        };
-                                        Some(serde_json::json!({
-                                            "from": from,
-                                            "value": content
-                                        }))
-                                    })
-                                    .collect();
+                        if let Some(serde_json::Value::Array(msgs)) = obj.get("messages").cloned() {
+                            let conversations: Vec<_> = msgs
+                                .iter()
+                                .filter_map(|m| {
+                                    let role = m.get("role")?.as_str()?;
+                                    let content = m.get("content")?.as_str()?;
+                                    let from = match role {
+                                        "user" => "human",
+                                        "assistant" => "gpt",
+                                        "system" => "system",
+                                        _ => role,
+                                    };
+                                    Some(serde_json::json!({
+                                        "from": from,
+                                        "value": content
+                                    }))
+                                })
+                                .collect();
 
-                                // Replace messages with conversations in ShareGPT format
-                                if let Some(obj_map) = obj.as_object_mut() {
-                                    obj_map.remove("messages");
-                                    obj_map.insert(
-                                        "conversations".to_string(),
-                                        serde_json::Value::Array(conversations),
-                                    );
-                                }
+                            // Replace messages with conversations in ShareGPT format
+                            if let Some(obj_map) = obj.as_object_mut() {
+                                obj_map.remove("messages");
+                                obj_map.insert(
+                                    "conversations".to_string(),
+                                    serde_json::Value::Array(conversations),
+                                );
                             }
                         }
 
@@ -3739,8 +3737,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                         for row_idx in 0..num_rows {
                             let mut obj = serde_json::Map::new();
 
-                            for col_idx in 0..batch.num_columns() {
-                                let col_name = &columns[col_idx];
+                            for (col_idx, col_name) in columns.iter().enumerate() {
                                 let target_name = col_map.get(col_name).unwrap_or(col_name);
                                 let col = batch.column(col_idx);
 
@@ -4315,7 +4312,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                 let reader = BufReader::new(file);
                 let samples: Vec<String> = reader
                     .lines()
-                    .filter_map(|l| l.ok())
+                    .map_while(Result::ok)
                     .filter(|l| !l.trim().is_empty())
                     .collect();
                 println!("Loaded {} samples from {}", samples.len(), input);
@@ -4401,7 +4398,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             let reader = BufReader::new(file);
             let mut samples: Vec<String> = reader
                 .lines()
-                .filter_map(|l| l.ok())
+                .map_while(Result::ok)
                 .filter(|l| !l.trim().is_empty())
                 .collect();
 
@@ -4588,33 +4585,33 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                             let mut obj: serde_json::Value = serde_json::from_str(line)?;
 
                             // Convert messages to ShareGPT format if needed
-                            if let Some(messages) = obj.get("messages").cloned() {
-                                if let serde_json::Value::Array(msgs) = messages {
-                                    let conversations: Vec<_> = msgs
-                                        .iter()
-                                        .filter_map(|m| {
-                                            let role = m.get("role")?.as_str()?;
-                                            let content = m.get("content")?.as_str()?;
-                                            let from = match role {
-                                                "user" => "human",
-                                                "assistant" => "gpt",
-                                                "system" => "system",
-                                                _ => role,
-                                            };
-                                            Some(serde_json::json!({
-                                                "from": from,
-                                                "value": content
-                                            }))
-                                        })
-                                        .collect();
+                            if let Some(serde_json::Value::Array(msgs)) =
+                                obj.get("messages").cloned()
+                            {
+                                let conversations: Vec<_> = msgs
+                                    .iter()
+                                    .filter_map(|m| {
+                                        let role = m.get("role")?.as_str()?;
+                                        let content = m.get("content")?.as_str()?;
+                                        let from = match role {
+                                            "user" => "human",
+                                            "assistant" => "gpt",
+                                            "system" => "system",
+                                            _ => role,
+                                        };
+                                        Some(serde_json::json!({
+                                            "from": from,
+                                            "value": content
+                                        }))
+                                    })
+                                    .collect();
 
-                                    if let Some(obj_map) = obj.as_object_mut() {
-                                        obj_map.remove("messages");
-                                        obj_map.insert(
-                                            "conversations".to_string(),
-                                            serde_json::Value::Array(conversations),
-                                        );
-                                    }
+                                if let Some(obj_map) = obj.as_object_mut() {
+                                    obj_map.remove("messages");
+                                    obj_map.insert(
+                                        "conversations".to_string(),
+                                        serde_json::Value::Array(conversations),
+                                    );
                                 }
                             }
 
@@ -4750,7 +4747,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             let templated_reader = BufReader::new(templated_file);
             let mut samples: Vec<String> = templated_reader
                 .lines()
-                .filter_map(|l| l.ok())
+                .map_while(Result::ok)
                 .filter(|l| !l.trim().is_empty())
                 .collect();
 

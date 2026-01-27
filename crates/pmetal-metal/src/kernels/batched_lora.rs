@@ -415,6 +415,7 @@ impl BatchedLora {
         Ok(output)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_forward(
         &self,
         x: &MetalBuffer<f16>,
@@ -492,6 +493,7 @@ impl BatchedLora {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn execute_forward_uniform(
         &self,
         x: &MetalBuffer<f16>,

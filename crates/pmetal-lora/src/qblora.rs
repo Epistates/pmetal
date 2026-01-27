@@ -40,7 +40,7 @@
 //! # References
 //!
 //! - "Accurate and Efficient Fine-Tuning of Quantized Large Language Models
-//!    Through Optimal Balance in Adaptation" (TACL 2025)
+//!   Through Optimal Balance in Adaptation" (TACL 2025)
 
 use std::cell::RefCell;
 

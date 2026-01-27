@@ -220,10 +220,10 @@ impl SouperMerge {
             });
         }
 
-        let mut result = tensors[0].multiply(&Array::from_f32(weights[0]))?;
+        let mut result = tensors[0].multiply(Array::from_f32(weights[0]))?;
 
         for (tensor, &weight) in tensors.iter().zip(weights.iter()).skip(1) {
-            let weighted = tensor.multiply(&Array::from_f32(weight))?;
+            let weighted = tensor.multiply(Array::from_f32(weight))?;
             result = result.add(&weighted)?;
         }
 
@@ -320,7 +320,9 @@ mod tests {
         let params = vec![MergeParameters::default()];
         let global = MergeParameters::default();
 
-        let result = souper.merge(&[t1.clone()], None, &params, &global).unwrap();
+        let result = souper
+            .merge(std::slice::from_ref(&t1), None, &params, &global)
+            .unwrap();
         result.eval().unwrap();
 
         let result_slice: Vec<f32> = result.as_slice().to_vec();

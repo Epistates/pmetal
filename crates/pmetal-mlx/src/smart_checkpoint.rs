@@ -733,7 +733,7 @@ impl LongContextManager {
         // TODO: Use safetensors for proper serialization
         let mut total_bytes = 0usize;
 
-        for (_name, array) in activations {
+        for array in activations.values() {
             array.eval()?;
             let data: Vec<f32> = array.as_slice().to_vec();
             total_bytes += data.len() * 4;

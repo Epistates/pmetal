@@ -166,6 +166,7 @@ impl FusedLoraTrainer {
     /// Computes: `y = x @ W.T + scale * (x @ A.T) @ B.T`
     ///
     /// Also saves the intermediate `x @ A.T` for efficient backward pass.
+    #[allow(unsafe_code)]
     pub fn forward(
         &self,
         x: &Array,
@@ -203,20 +204,20 @@ impl FusedLoraTrainer {
             // MLX arrays are usually contiguous.
             unsafe {
                 let x_view =
-                    metal_buffer_from_ptr(ctx, x.as_slice().as_ptr() as *mut f16, x.size())?;
+                    metal_buffer_from_ptr(ctx, x.as_slice::<f16>().as_ptr() as *mut f16, x.size())?;
                 let w_view = metal_buffer_from_ptr(
                     ctx,
-                    weight.as_slice().as_ptr() as *mut f16,
+                    weight.as_slice::<f16>().as_ptr() as *mut f16,
                     weight.size(),
                 )?;
                 let a_view = metal_buffer_from_ptr(
                     ctx,
-                    lora_a.as_slice().as_ptr() as *mut f16,
+                    lora_a.as_slice::<f16>().as_ptr() as *mut f16,
                     lora_a.size(),
                 )?;
                 let b_view = metal_buffer_from_ptr(
                     ctx,
-                    lora_b.as_slice().as_ptr() as *mut f16,
+                    lora_b.as_slice::<f16>().as_ptr() as *mut f16,
                     lora_b.size(),
                 )?;
 
@@ -291,6 +292,7 @@ impl FusedLoraTrainer {
     /// Gradients (using matrix calculus):
     /// - dB = dY.T @ intermediate: [out_features, batch] @ [batch, rank] = [out_features, rank]
     /// - dA = (dY @ B).T @ x: [rank, batch] @ [batch, in_features] = [rank, in_features]
+    #[allow(unsafe_code)]
     pub fn backward_lora(
         &self,
         grad_output: &Array,
@@ -319,19 +321,19 @@ impl FusedLoraTrainer {
             unsafe {
                 let dy_view = metal_buffer_from_ptr(
                     ctx,
-                    grad_output.as_slice().as_ptr() as *mut f16,
+                    grad_output.as_slice::<f16>().as_ptr() as *mut f16,
                     grad_output.size(),
                 )?;
                 let x_view =
-                    metal_buffer_from_ptr(ctx, x.as_slice().as_ptr() as *mut f16, x.size())?;
+                    metal_buffer_from_ptr(ctx, x.as_slice::<f16>().as_ptr() as *mut f16, x.size())?;
                 let inter_view = metal_buffer_from_ptr(
                     ctx,
-                    intermediate.as_slice().as_ptr() as *mut f16,
+                    intermediate.as_slice::<f16>().as_ptr() as *mut f16,
                     intermediate.size(),
                 )?;
                 let b_view = metal_buffer_from_ptr(
                     ctx,
-                    lora_b.as_slice().as_ptr() as *mut f16,
+                    lora_b.as_slice::<f16>().as_ptr() as *mut f16,
                     lora_b.size(),
                 )?;
 
@@ -373,6 +375,7 @@ impl FusedLoraTrainer {
     /// Backward pass to compute input gradient.
     ///
     /// Computes: `dX = dY @ W + scale * (dY @ B) @ A`
+    #[allow(unsafe_code)]
     pub fn backward_input(
         &self,
         grad_output: &Array,
@@ -401,22 +404,22 @@ impl FusedLoraTrainer {
             unsafe {
                 let dy_view = metal_buffer_from_ptr(
                     ctx,
-                    grad_output.as_slice().as_ptr() as *mut f16,
+                    grad_output.as_slice::<f16>().as_ptr() as *mut f16,
                     grad_output.size(),
                 )?;
                 let w_view = metal_buffer_from_ptr(
                     ctx,
-                    weight.as_slice().as_ptr() as *mut f16,
+                    weight.as_slice::<f16>().as_ptr() as *mut f16,
                     weight.size(),
                 )?;
                 let a_view = metal_buffer_from_ptr(
                     ctx,
-                    lora_a.as_slice().as_ptr() as *mut f16,
+                    lora_a.as_slice::<f16>().as_ptr() as *mut f16,
                     lora_a.size(),
                 )?;
                 let b_view = metal_buffer_from_ptr(
                     ctx,
-                    lora_b.as_slice().as_ptr() as *mut f16,
+                    lora_b.as_slice::<f16>().as_ptr() as *mut f16,
                     lora_b.size(),
                 )?;
 

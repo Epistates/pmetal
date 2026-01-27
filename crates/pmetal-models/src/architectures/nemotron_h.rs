@@ -137,6 +137,7 @@ impl MambaRMSNormGated {
     ///
     /// # Returns
     /// Normalized tensor [B, L, hidden_size]
+    #[allow(clippy::overly_complex_bool_expr)]
     pub fn forward(&self, x: &Array, gate: Option<&Array>) -> Result<Array, Exception> {
         // Debug: trace gated norm steps (disabled for performance)
         static GATED_NORM_LOG: std::sync::atomic::AtomicUsize =
@@ -544,6 +545,7 @@ pub fn ssm_update_single(
 ///
 /// # Returns
 /// (output [B, L, H, D], new_state [B, H, D, N])
+#[allow(clippy::overly_complex_bool_expr)]
 pub fn ssm_attention(
     x: &Array,             // [B, L, H, D] - input
     a_log: &Array,         // [H] - log state transition
@@ -1278,8 +1280,8 @@ impl MoELayer {
             let indices_flat: Vec<u32> = indices.as_slice().to_vec();
 
             // Process each top-k slot
-            for k in 0..self.top_k as usize {
-                let expert_idx = indices_flat[k] as usize;
+            for (k, &expert_idx_u32) in indices_flat.iter().take(self.top_k as usize).enumerate() {
+                let expert_idx = expert_idx_u32 as usize;
                 let ki = k as i32;
                 let expert_weight = weights.index((.., ki..ki + 1));
 
@@ -1986,6 +1988,7 @@ impl NemotronHMixer {
         }
     }
 
+    #[allow(clippy::overly_complex_bool_expr)]
     fn forward_mamba(
         &mut self,
         x: &Array,
@@ -2489,6 +2492,7 @@ impl NemotronHModel {
         Ok(())
     }
 
+    #[allow(clippy::overly_complex_bool_expr)]
     pub fn forward_with_cache(
         &mut self,
         input_ids: &Array,
@@ -2693,6 +2697,7 @@ impl NemotronHForCausalLM {
         static FORWARD_LOG_COUNT: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
         let forward_log = FORWARD_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[allow(clippy::overly_complex_bool_expr)]
         if false && forward_log < 3 {
             // Disabled
             hidden.eval()?;
@@ -2724,6 +2729,7 @@ impl NemotronHForCausalLM {
         };
 
         // Debug: trace logits (disabled for performance)
+        #[allow(clippy::overly_complex_bool_expr)]
         if false && forward_log < 3 {
             logits.eval()?;
             let last_logits = logits.index((.., -1, ..));

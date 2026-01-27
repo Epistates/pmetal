@@ -2750,7 +2750,7 @@ mod tests {
             .with_eager_allocate(1)
             .with_dtype(Dtype::Float16);
 
-        let expected = 32 * 2 * 1 * 8 * 2048 * 128 * 2;
+        let expected = 32 * 2 * 8 * 2048 * 128 * 2; // layers * K+V * heads * seq * dim * sizeof(f16)
         assert_eq!(config.memory_footprint(), expected);
     }
 
@@ -2761,7 +2761,7 @@ mod tests {
             .with_eager_allocate(1)
             .with_dtype(Dtype::Float32);
 
-        let expected = 16 * 2 * 1 * 4 * 1024 * 64 * 4;
+        let expected = 16 * 2 * 4 * 1024 * 64 * 4; // layers * K+V * heads * seq * dim * sizeof(f32)
         assert_eq!(config.memory_footprint(), expected);
     }
 
