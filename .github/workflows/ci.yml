@@ -21,7 +21,7 @@ jobs:
       - name: Clone mlx-rs
         run: |
           mkdir -p ../reference
-          git clone --depth 1 https://github.com/nicholasjpaterno/mlx-rs.git ../reference/mlx-rs
+          git clone --depth 1 --recurse-submodules https://github.com/nicholasjpaterno/mlx-rs.git ../reference/mlx-rs
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,7 +49,7 @@ jobs:
       - name: Clone mlx-rs
         run: |
           mkdir -p ../reference
-          git clone --depth 1 https://github.com/nicholasjpaterno/mlx-rs.git ../reference/mlx-rs
+          git clone --depth 1 --recurse-submodules https://github.com/nicholasjpaterno/mlx-rs.git ../reference/mlx-rs
 
       - uses: dtolnay/rust-toolchain@stable
 
