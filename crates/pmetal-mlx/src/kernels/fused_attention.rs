@@ -125,7 +125,7 @@ pub fn fused_sdpa(
     // Determine mask to use
     match (&config.mask_type, custom_mask) {
         // Custom mask provided - use it directly
-        (_, Some(mask)) => scaled_dot_product_attention(queries, keys, values, config.scale, mask),
+        (_, Some(mask)) => scaled_dot_product_attention(queries, keys, values, config.scale, mask, None),
 
         // Causal masking - use MLX's built-in causal mask
         (AttentionMaskType::Causal, None) => scaled_dot_product_attention(
@@ -134,6 +134,7 @@ pub fn fused_sdpa(
             values,
             config.scale,
             ScaledDotProductAttentionMask::Causal,
+            None,
         ),
 
         // No mask (bidirectional attention)
@@ -143,13 +144,14 @@ pub fn fused_sdpa(
             values,
             config.scale,
             Option::<ScaledDotProductAttentionMask>::None,
+            None,
         ),
 
         // Sliding window - create custom mask
         (AttentionMaskType::SlidingWindow(window_size), None) => {
             let seq_len = queries.dim(2);
             let mask = create_sliding_window_mask(seq_len, *window_size)?;
-            scaled_dot_product_attention(queries, keys, values, config.scale, &mask)
+            scaled_dot_product_attention(queries, keys, values, config.scale, &mask, None)
         }
     }
 }
