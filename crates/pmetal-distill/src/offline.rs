@@ -493,6 +493,7 @@ impl CompressionStats {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_topk_compression() {

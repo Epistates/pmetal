@@ -57,6 +57,7 @@ impl DistillLoss for MseLoss {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_mse_identical_logits() {

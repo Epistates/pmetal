@@ -234,6 +234,7 @@ impl DistillLoss for RationaleLoss {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_rationale_loss_default() {

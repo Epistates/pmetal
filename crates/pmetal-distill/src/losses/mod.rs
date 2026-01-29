@@ -202,6 +202,7 @@ fn gather_at_indices(values: &Array, indices: &Array) -> Result<Array> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_softmax() {

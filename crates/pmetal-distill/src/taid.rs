@@ -576,6 +576,7 @@ pub struct TaidLossOutput {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_taid_config_default() {

@@ -256,6 +256,7 @@ impl DistillLoss for KlDivergenceLoss {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_kl_identical_distributions() {
@@ -340,6 +341,7 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
+    #[serial]
     fn test_gpu_acceleration_available() {
         let loss = KlDivergenceLoss::new();
         // On Apple Silicon, GPU should be available
@@ -347,6 +349,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_larger_batch() {
         // Test with larger tensors to exercise GPU path
         let batch_size = 4;

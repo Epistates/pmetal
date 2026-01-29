@@ -401,6 +401,7 @@ fn compute_hard_loss(logits: &Array, labels: &Array) -> Result<Array> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     fn test_config() -> DistillConfig {
         DistillConfig {
@@ -415,6 +416,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_distiller_builder() {
         let config = test_config();
         let distiller = DistillerBuilder::new().with_config(config).build().unwrap();

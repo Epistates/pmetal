@@ -372,6 +372,7 @@ impl LayerDistillation {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_mse_hidden_loss() {
@@ -478,12 +479,14 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
+    #[serial]
     fn test_gpu_acceleration_available() {
         let loss = HiddenStateLoss::mse();
         println!("GPU available: {}", loss.is_gpu_available());
     }
 
     #[test]
+    #[serial]
     fn test_larger_batch() {
         // Test with larger tensors to exercise GPU path
         let batch_size = 4;

@@ -236,6 +236,7 @@ impl DistillLoss for JensenShannonLoss {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_js_identical_distributions() {
@@ -317,12 +318,14 @@ mod tests {
 
     #[cfg(feature = "metal")]
     #[test]
+    #[serial]
     fn test_gpu_acceleration_available() {
         let loss = JensenShannonLoss::new();
         println!("GPU available: {}", loss.is_gpu_available());
     }
 
     #[test]
+    #[serial]
     fn test_larger_batch() {
         // Test with larger tensors to exercise GPU path
         let batch_size = 4;
