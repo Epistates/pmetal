@@ -125,7 +125,9 @@ pub fn fused_sdpa(
     // Determine mask to use
     match (&config.mask_type, custom_mask) {
         // Custom mask provided - use it directly
-        (_, Some(mask)) => scaled_dot_product_attention(queries, keys, values, config.scale, mask, None),
+        (_, Some(mask)) => {
+            scaled_dot_product_attention(queries, keys, values, config.scale, mask, None)
+        }
 
         // Causal masking - use MLX's built-in causal mask
         (AttentionMaskType::Causal, None) => scaled_dot_product_attention(
