@@ -553,10 +553,9 @@ impl DapoTrainer {
 
     /// Compute entropy bonus.
     pub fn compute_entropy(&self, logits: &Array, mask: Option<&Array>) -> DapoResult<Array> {
-        let log_probs = mlx_rs::nn::log_softmax(logits, -1)?;
-        let probs = log_probs.exp()?;
-        let neg_entropy = probs.multiply(&log_probs)?.sum_axis(-1, None)?;
-        let entropy = neg_entropy.negative()?;
+        // Efficient entropy: H = logsumexp(x) - sum(softmax(x) * x)
+        // Only materializes softmax once instead of both softmax + log_softmax
+        let entropy = crate::logprob_utils::efficient_entropy(logits)?;
 
         if let Some(m) = mask {
             let masked_entropy = entropy.multiply(m)?;

@@ -374,7 +374,6 @@ impl KtoTrainer {
 
         let batch_size = logits_shape[0];
         let seq_len = logits_shape[1];
-        let vocab_size = logits_shape[2];
 
         if seq_len <= 1 {
             return Err(KtoError::Data(
@@ -383,69 +382,18 @@ impl KtoTrainer {
         }
 
         // Shift logits and labels for next-token prediction
-        // logits[:, :-1, :] -> predict next token
         let pred_logits = logits.index((.., ..seq_len - 1, ..));
-
-        // labels[:, 1:] -> target is next token
         let target_labels = labels.index((.., 1..));
 
-        // Compute log softmax (vectorized across entire batch)
-        let log_probs = mlx_rs::nn::log_softmax(&pred_logits, -1)?;
-        log_probs.eval()?;
+        // Selective log softmax: gather logit first, subtract logsumexp
+        // Never materializes full [B, S, V] log_softmax tensor
+        let (per_token_logps, valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
-        let pred_len = (seq_len - 1) as usize;
+        // Sum over sequence dimension -> [B] (masked positions are already 0)
+        let total_log_probs = per_token_logps.sum_axes(&[1i32], false)?;
 
-        // Create mask for valid (non -100) labels
-        let ignore_index = Array::from_int(-100);
-        let valid_mask = target_labels.ne(&ignore_index)?;
-        valid_mask.eval()?;
-
-        // Replace -100 with 0 for gathering (will be masked out anyway)
-        let gather_labels = mlx_rs::ops::maximum(&target_labels, &Array::from_int(0))?;
-        gather_labels.eval()?;
-
-        // Process each batch - gather operation still requires per-element access
-        // but we batch the eval calls for better GPU utilization
-        let mut total_log_probs = Vec::with_capacity(batch_size as usize);
-
-        for b in 0..batch_size {
-            let batch_log_probs = log_probs.index(b);
-            let batch_labels = gather_labels.index(b);
-            let batch_mask = valid_mask.index(b);
-
-            // Batch eval for this sample
-            batch_log_probs.eval()?;
-            batch_labels.eval()?;
-            batch_mask.eval()?;
-
-            let mut sum = 0.0f32;
-
-            for t in 0..pred_len {
-                let mask_val = batch_mask.index(t as i32);
-                mask_val.eval()?;
-
-                if mask_val.item::<bool>() {
-                    let label = batch_labels.index(t as i32);
-                    label.eval()?;
-                    let label_idx = label.item::<i32>();
-
-                    // Bounds check for vocab index
-                    if label_idx < 0 || label_idx >= vocab_size {
-                        return Err(KtoError::Data(format!(
-                            "Invalid token ID {} at batch {}, position {}. Vocab size is {}",
-                            label_idx, b, t, vocab_size
-                        )));
-                    }
-
-                    let log_prob = batch_log_probs.index((t as i32, label_idx));
-                    log_prob.eval()?;
-                    sum += log_prob.item::<f32>();
-                }
-            }
-            total_log_probs.push(sum);
-        }
-
-        Ok(Array::from_slice(&total_log_probs, &[batch_size]))
+        Ok(total_log_probs)
     }
 
     /// Compute KTO loss for a batch of samples.

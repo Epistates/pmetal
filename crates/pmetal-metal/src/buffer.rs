@@ -100,16 +100,16 @@ impl<T: Pod + Zeroable> MetalBuffer<T> {
     ///
     /// Returns an error if buffer creation fails (e.g., out of memory).
     pub fn new(ctx: &MetalContext, len: usize, usage: BufferUsage) -> Result<Self> {
-        let size = len.checked_mul(mem::size_of::<T>()).ok_or_else(|| {
-            MetalError::BufferCreation {
-                size: usize::MAX,
-                reason: format!(
-                    "Buffer size overflow: {} elements * {} bytes/element",
-                    len,
-                    mem::size_of::<T>()
-                ),
-            }
-        })?;
+        let size =
+            len.checked_mul(mem::size_of::<T>())
+                .ok_or_else(|| MetalError::BufferCreation {
+                    size: usize::MAX,
+                    reason: format!(
+                        "Buffer size overflow: {} elements * {} bytes/element",
+                        len,
+                        mem::size_of::<T>()
+                    ),
+                })?;
         let options = usage.to_metal_options();
 
         let buffer = ctx

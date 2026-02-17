@@ -302,30 +302,34 @@ pub fn diffusion_loss(
 ) -> std::result::Result<Array, Exception> {
     let vocab_size = logits.dim(2) as usize;
 
-    // Reshape for cross-entropy
+    // Reshape for selective computation: [N, V] and [N]
     let flat_logits = logits.reshape(&[-1, vocab_size as i32])?;
     let flat_targets = targets.reshape(&[-1])?;
 
-    // Compute log softmax
-    let log_probs = nn::log_softmax(&flat_logits, -1)?;
-    log_probs.eval()?;
+    // Selective log softmax: gather logit + logsumexp instead of full [N, V] log_softmax
+    // Clamp targets to valid range for gathering
+    let gather_targets = mlx_rs::ops::maximum(&flat_targets, &Array::from_int(0))?;
+    let gather_indices = gather_targets.expand_dims(-1i32)?; // [N, 1]
+    let selected_logits = flat_logits.take_along_axis(&gather_indices, -1)?; // [N, 1]
+    let lse = flat_logits.logsumexp_axis(-1, true)?; // [N, 1]
+    let log_probs_at_target = selected_logits.subtract(&lse)?; // [N, 1]
+    let log_probs_at_target = log_probs_at_target.squeeze_axes(&[-1i32])?; // [N]
+    log_probs_at_target.eval()?;
 
-    // Get targets as i64
+    // Get targets for masking logic
     let flat_targets_i64 = flat_targets.as_dtype(Dtype::Int64)?;
     flat_targets_i64.eval()?;
     let target_vec: Vec<i64> = flat_targets_i64.as_slice().to_vec();
 
-    // Get log probs as slice
-    let log_probs_data: Vec<f32> = log_probs.as_slice().to_vec();
+    let lp_data: &[f32] = log_probs_at_target.as_slice();
 
-    // Compute masked loss manually
+    // Compute masked loss
     let mut total_loss = 0.0_f32;
     let mut num_masked = 0_usize;
 
     for (i, (&target, &is_masked)) in target_vec.iter().zip(mask_flags.iter()).enumerate() {
         if is_masked && target != ignore_index && target >= 0 && (target as usize) < vocab_size {
-            let log_prob = log_probs_data[i * vocab_size + target as usize];
-            total_loss -= log_prob; // Cross-entropy = -log p
+            total_loss -= lp_data[i]; // Cross-entropy = -log p
             num_masked += 1;
         }
     }
@@ -874,10 +878,8 @@ impl DiffusionSampler {
                 .forward(&x_t, None)
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
-            // Get predictions and confidences
-            // softmax = exp(log_softmax)
-            let log_probs = nn::log_softmax(&logits, -1)?;
-            let probs = log_probs.exp()?;
+            // Get predictions and confidences via softmax directly
+            let probs = mlx_rs::ops::softmax_axis(&logits, -1, None)?;
             probs.eval()?;
 
             let probs_data: Vec<f32> = probs.as_slice().to_vec();

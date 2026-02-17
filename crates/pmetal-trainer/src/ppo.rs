@@ -311,39 +311,12 @@ impl PpoTrainer {
         let pred_logits = logits.index((.., ..seq_len - 1, ..));
         let target_labels = labels.index((.., 1..));
 
-        // Log softmax
-        let log_probs = mlx_rs::nn::log_softmax(&pred_logits, -1)?;
+        // Selective log softmax: gather logit first, subtract logsumexp
+        // Never materializes full [B, S, V] log_softmax tensor
+        let (logps_array, _valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
-        // Gather at target positions
-        let batch_size = logits.dim(0) as usize;
-        let pred_len = (seq_len - 1) as usize;
-
-        let mut token_logps = Vec::with_capacity(batch_size * pred_len);
-
-        log_probs.eval()?;
-        target_labels.eval()?;
-
-        for b in 0..batch_size {
-            let batch_log_probs = log_probs.index(b as i32);
-            let batch_labels = target_labels.index(b as i32);
-
-            batch_log_probs.eval()?;
-            batch_labels.eval()?;
-
-            for t in 0..pred_len {
-                let label = batch_labels.index(t as i32);
-                label.eval()?;
-                let label_idx = label.item::<i32>().max(0);
-                let log_prob = batch_log_probs.index((t as i32, label_idx));
-                log_prob.eval()?;
-                token_logps.push(log_prob.item::<f32>());
-            }
-        }
-
-        Ok(Array::from_slice(
-            &token_logps,
-            &[batch_size as i32, pred_len as i32],
-        ))
+        Ok(logps_array)
     }
 
     /// Compute advantages using GAE.
@@ -460,10 +433,9 @@ impl PpoTrainer {
         // Entropy bonus (optional)
         let entropy = if let Some(logits) = logits {
             if self.config.entropy_coef > 0.0 {
-                let log_probs = mlx_rs::nn::log_softmax(logits, -1)?;
-                let probs = log_probs.exp()?;
-                let entropy_per_token =
-                    probs.multiply(&log_probs)?.sum_axis(-1, None)?.negative()?;
+                // Efficient entropy: H = logsumexp(x) - sum(softmax(x) * x)
+                // Only materializes softmax once instead of both softmax + log_softmax
+                let entropy_per_token = crate::logprob_utils::efficient_entropy(logits)?;
                 let entropy_coef = Array::from_f32(self.config.entropy_coef as f32);
                 Some(
                     entropy_per_token

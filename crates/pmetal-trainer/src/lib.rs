@@ -82,6 +82,7 @@ pub mod grpo;
 pub mod gspo;
 pub mod jit_compile;
 pub mod kto;
+pub mod logprob_utils;
 pub mod lora_trainer;
 pub mod metal_fused;
 pub mod mlx_metal_optimizer;

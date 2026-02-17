@@ -42,7 +42,7 @@ use std::rc::Rc;
 use mlx_rs::{
     error::{Exception, Result},
     ops::indexing::IndexOp,
-    Array,
+    Array, Dtype,
 };
 
 /// Error type for 8-bit Adam operations.
@@ -87,8 +87,14 @@ pub struct Adam8bitConfig {
     /// Weight decay coefficient (decoupled, AdamW-style).
     pub weight_decay: f32,
     /// Block size for quantization (default: 2048).
+    ///
+    /// Smaller blocks preserve more precision for mixed-magnitude values
+    /// at the cost of more scale factors. Must be >= 1.
     pub block_size: usize,
     /// Minimum absolute value to quantize (values below become 0).
+    ///
+    /// When the maximum absolute value in a block is below this threshold,
+    /// the entire block is quantized to zeros. Default: 1e-12.
     pub eps_quantize: f32,
 }
 
@@ -111,6 +117,25 @@ impl Default for Adam8bitConfig {
 /// Memory-efficient Adam that stores first and second moments in 8-bit format
 /// with block-wise dynamic quantization. Achieves ~50% memory reduction for
 /// optimizer states compared to standard Adam.
+///
+/// # Quantization
+///
+/// Moments are stored per-block (default 2048 elements) with independent scaling:
+/// - First moment (m): signed int8 with ~0.4% typical precision loss
+/// - Second moment (v): unsigned uint8 with ~0.4% typical precision loss
+///
+/// Values much smaller than the block maximum may be quantized to zero.
+/// This is expected and matches the bitsandbytes behavior.
+///
+/// # Thread Safety
+///
+/// This optimizer is **not thread-safe**. It uses `Rc<str>` for parameter keys
+/// (matching the crate-wide convention) and `&mut self` for all update methods.
+/// Do not share across threads.
+///
+/// # Requirements
+///
+/// All gradient and parameter arrays must be `Float32` dtype.
 #[derive(Debug)]
 pub struct Adam8bit {
     /// Optimizer configuration.
@@ -293,9 +318,13 @@ impl Adam8bit {
         self.config.lr = lr;
     }
 
-    /// Apply a single parameter update (vectorized).
+    /// Apply a single parameter update (vectorized), incrementing the step counter.
     ///
-    /// This is the main update function following Adam's algorithm:
+    /// This is the public entry point for standalone single-parameter updates.
+    /// For batch updates, use [`update`] which increments the step counter once
+    /// for all parameters.
+    ///
+    /// Adam update rule:
     /// ```text
     /// m = beta1 * m + (1 - beta1) * g
     /// v = beta2 * v + (1 - beta2) * g^2
@@ -303,16 +332,46 @@ impl Adam8bit {
     /// v_hat = v / (1 - beta2^t)
     /// param = param - lr * m_hat / (sqrt(v_hat) + eps) - lr * weight_decay * param
     /// ```
-    ///
-    /// Uses vectorized operations for 100-1000x speedup over element-wise iteration.
     pub fn update_single(
         &mut self,
         key: &Rc<str>,
         gradient: &Array,
         parameter: &mut Array,
     ) -> Result<()> {
+        self.step += 1;
+        self.apply_update(key, gradient, parameter)
+    }
+
+    /// Internal: apply Adam update for one parameter using the current step counter.
+    ///
+    /// Does NOT increment `self.step` — caller is responsible for that.
+    fn apply_update(
+        &mut self,
+        key: &Rc<str>,
+        gradient: &Array,
+        parameter: &mut Array,
+    ) -> Result<()> {
+        debug_assert!(
+            self.step > 0,
+            "apply_update called with step=0; call update_single() or update() instead"
+        );
+
         gradient.eval()?;
         parameter.eval()?;
+
+        // Validate dtypes — quantization assumes Float32
+        if gradient.dtype() != Dtype::Float32 {
+            return Err(Exception::custom(format!(
+                "Adam8bit requires Float32 gradients, got {:?}",
+                gradient.dtype()
+            )));
+        }
+        if parameter.dtype() != Dtype::Float32 {
+            return Err(Exception::custom(format!(
+                "Adam8bit requires Float32 parameters, got {:?}",
+                parameter.dtype()
+            )));
+        }
 
         let shape: Vec<i32> = parameter.shape().to_vec();
         let size = parameter.size();
@@ -329,9 +388,12 @@ impl Adam8bit {
         let flat_grad = gradient.flatten(None, None)?;
         let flat_param = parameter.flatten(None, None)?;
 
-        // Bias correction terms
-        let beta1_t = self.config.beta1.powi(self.step as i32);
-        let beta2_t = self.config.beta2.powi(self.step as i32);
+        // Bias correction terms (step is already >= 1 by the time we get here).
+        // Clamp to i32::MAX to prevent truncation on very long runs (>2.1B steps).
+        // Beyond ~1000 steps, bias correction is negligible anyway (beta^1000 ≈ 0).
+        let step_i32 = self.step.min(i32::MAX as u64) as i32;
+        let beta1_t = self.config.beta1.powi(step_i32);
+        let beta2_t = self.config.beta2.powi(step_i32);
         let bias_correction1 = 1.0 - beta1_t;
         let bias_correction2 = 1.0 - beta2_t;
 
@@ -422,15 +484,26 @@ impl Adam8bit {
 
     /// Convert Array to Vec<f32> efficiently using as_slice.
     ///
-    /// This is much faster than element-by-element extraction.
+    /// # Panics
+    /// Debug-asserts that the array is Float32. In release builds, a dtype
+    /// mismatch would produce garbage data.
     fn array_to_vec(&self, arr: &Array) -> Result<Vec<f32>> {
         arr.eval()?;
         let flat = arr.flatten(None, None)?;
         flat.eval()?;
+        debug_assert_eq!(
+            flat.dtype(),
+            Dtype::Float32,
+            "array_to_vec called with {:?}, expected Float32",
+            flat.dtype()
+        );
         Ok(flat.as_slice::<f32>().to_vec())
     }
 
-    /// Apply updates to multiple parameters.
+    /// Apply updates to multiple parameters (one optimizer step).
+    ///
+    /// Increments the step counter once, then applies the Adam update to each
+    /// parameter that has a corresponding gradient.
     pub fn update(
         &mut self,
         gradients: &HashMap<Rc<str>, Array>,
@@ -440,7 +513,7 @@ impl Adam8bit {
 
         for (key, grad) in gradients {
             if let Some(param) = parameters.get_mut(key) {
-                self.update_single(key, grad, param)?;
+                self.apply_update(key, grad, param)?;
             }
         }
         Ok(())

@@ -187,22 +187,13 @@ impl OnlineDpoTrainer {
         let pred_logits = logits.index((.., ..seq_len - 1, ..));
         let target_labels = labels.index((.., 1..));
 
-        // Log softmax
-        let log_probs = nn::log_softmax(&pred_logits, -1)?;
+        // Selective log softmax: gather logit first, subtract logsumexp
+        // Never materializes full [B, S, V] log_softmax tensor
+        let (per_token_logps, _valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
-        // Mask for valid labels
-        let ignore_index = Array::from_int(-100);
-        let valid_mask = target_labels.ne(&ignore_index)?;
-
-        // Gather log probs
-        let gather_labels = mlx_rs::ops::maximum(&target_labels, &Array::from_int(0))?;
-        let gather_indices = gather_labels.expand_dims(-1i32)?;
-        let gathered = log_probs.take_along_axis(&gather_indices, -1)?;
-        let gathered = gathered.squeeze_axes(&[-1i32])?;
-
-        // Mask and sum
-        let masked = gathered.multiply(&valid_mask.as_dtype(Dtype::Float32)?)?;
-        masked.sum_axes(&[1i32], false)
+        // Sum over sequence dimension -> [B] (masked positions are already 0)
+        per_token_logps.sum_axes(&[1i32], false)
     }
 
     /// Compute DPO loss for a batch of pairs.
@@ -477,18 +468,13 @@ impl OnlineDpoTrainer {
         let pred_logits = logits.index((.., ..seq_len - 1, ..));
         let target_labels = labels.index((.., 1..));
 
-        let log_probs = nn::log_softmax(&pred_logits, -1)?;
+        // Selective log softmax: gather logit first, subtract logsumexp
+        // Never materializes full [B, S, V] log_softmax tensor
+        let (per_token_logps, _valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
-        let ignore_index = Array::from_int(-100);
-        let valid_mask = target_labels.ne(&ignore_index)?;
-
-        let gather_labels = mlx_rs::ops::maximum(&target_labels, &Array::from_int(0))?;
-        let gather_indices = gather_labels.expand_dims(-1i32)?;
-        let gathered = log_probs.take_along_axis(&gather_indices, -1)?;
-        let gathered = gathered.squeeze_axes(&[-1i32])?;
-
-        let masked = gathered.multiply(&valid_mask.as_dtype(Dtype::Float32)?)?;
-        masked.sum_axes(&[1i32], false)
+        // Sum over sequence dimension -> [B] (masked positions are already 0)
+        per_token_logps.sum_axes(&[1i32], false)
     }
 
     /// Static version of compute_dpo_loss for use in closures.

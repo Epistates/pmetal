@@ -116,34 +116,18 @@ impl OrpoTrainer {
         // labels[:, 1:] -> target is next token
         let target_labels = labels.index((.., 1..));
 
-        // Compute log softmax
-        let log_probs = mlx_rs::nn::log_softmax(&pred_logits, -1)?;
+        // Selective log softmax: gather logit first, subtract logsumexp
+        // Never materializes full [B, S, V] log_softmax tensor
+        let (per_token_logps, valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
-        // Create mask for valid labels
-        let ignore_index = Array::from_int(-100);
-        let valid_mask = target_labels.ne(&ignore_index)?;
+        // Sum over sequence dimension -> [B] (masked positions are already 0)
+        let total_log_probs = per_token_logps.sum_axes(&[1i32], false)?;
 
-        // Replace -100 with 0 for gathering
-        let gather_labels = mlx_rs::ops::maximum(&target_labels, &Array::from_int(0))?;
+        // Count valid tokens per sequence for averaging
+        let valid_counts = valid_mask.sum_axes(&[1i32], false)?;
 
-        // Expand dims for gather: [B, S] -> [B, S, 1]
-        let gather_indices = gather_labels.expand_dims(-1i32)?;
-
-        // Gather log probs: [B, S, V] take [B, S, 1] -> [B, S, 1]
-        let gathered_log_probs = log_probs.take_along_axis(&gather_indices, -1)?;
-        let gathered_log_probs = gathered_log_probs.squeeze_axes(&[-1i32])?;
-
-        // Mask out ignored tokens
-        let valid_mask_f32 = valid_mask.as_dtype(Dtype::Float32)?;
-        let masked_log_probs = gathered_log_probs.multiply(&valid_mask_f32)?;
-
-        // Sum over sequence dimension -> [B]
-        let total_log_probs = masked_log_probs.sum_axes(&[1i32], false)?;
-
-        // Count valid tokens per sequence
-        let valid_counts = valid_mask_f32.sum_axes(&[1i32], false)?;
-
-        // Compute average log probs (handle division by zero if needed, though unlikely with valid masks)
+        // Compute average log probs
         let average_log_probs = total_log_probs.divide(&valid_counts)?;
 
         Ok((total_log_probs, average_log_probs))

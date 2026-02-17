@@ -238,38 +238,12 @@ impl SimpoTrainer {
         let target_labels = labels.index((.., 1..));
         let target_mask = mask.index((.., 1..));
 
-        // Log softmax
-        let log_probs = mlx_rs::nn::log_softmax(&pred_logits, -1)?;
+        // Selective log softmax: gather logit first, subtract logsumexp
+        // Never materializes full [B, S, V] log_softmax tensor
+        let (logps_array, _valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
-        // Gather at target positions
-        let batch_size = logits.dim(0) as usize;
-        let pred_len = (seq_len - 1) as usize;
-
-        let mut token_logps = Vec::with_capacity(batch_size * pred_len);
-
-        log_probs.eval()?;
-        target_labels.eval()?;
-
-        for b in 0..batch_size {
-            let batch_log_probs = log_probs.index(b as i32);
-            let batch_labels = target_labels.index(b as i32);
-
-            batch_log_probs.eval()?;
-            batch_labels.eval()?;
-
-            for t in 0..pred_len {
-                let label = batch_labels.index(t as i32);
-                label.eval()?;
-                let label_idx = label.item::<i32>().max(0);
-                let log_prob = batch_log_probs.index((t as i32, label_idx));
-                log_prob.eval()?;
-                token_logps.push(log_prob.item::<f32>());
-            }
-        }
-
-        let logps_array = Array::from_slice(&token_logps, &[batch_size as i32, pred_len as i32]);
-
-        // Apply mask and get sequence-level log probability
+        // Apply the caller-provided mask (may differ from label-based mask)
         let target_mask_f32 = target_mask.as_dtype(mlx_rs::Dtype::Float32)?;
         let masked_logps = logps_array.multiply(&target_mask_f32)?;
 

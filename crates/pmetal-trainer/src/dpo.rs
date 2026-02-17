@@ -282,35 +282,13 @@ impl DpoTrainer {
         // labels[:, 1:] -> target is next token
         let target_labels = labels.index((.., 1..));
 
-        // Compute log softmax using mlx_rs::nn
-        let log_probs = mlx_rs::nn::log_softmax(&pred_logits, -1)?;
+        // Selective log softmax: gather logit first, subtract logsumexp
+        // Never materializes full [B, S, V] log_softmax tensor
+        let (per_token_logps, _valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
-        // Prepare gather indices
-        // Create mask for valid (non -100) labels
-        // CRITICAL: Match dtype of labels to avoid type mismatch errors
-        let labels_dtype = target_labels.dtype();
-        let ignore_index = Array::from_int(-100).as_dtype(labels_dtype)?;
-        let valid_mask = target_labels.ne(&ignore_index)?;
-
-        // Replace -100 with 0 for gathering (will be masked out anyway)
-        let zero = Array::from_int(0).as_dtype(labels_dtype)?;
-        let gather_labels = mlx_rs::ops::maximum(&target_labels, &zero)?;
-
-        // Expand dims for take_along_axis: [B, S] -> [B, S, 1]
-        let gather_indices = gather_labels.expand_dims(-1i32)?;
-
-        // Gather log probabilities: [B, S, V] take [B, S, 1] -> [B, S, 1]
-        let gathered_log_probs = log_probs.take_along_axis(&gather_indices, -1)?;
-        let gathered_log_probs = gathered_log_probs.squeeze_axes(&[-1i32])?; // [B, S]
-
-        // Mask out ignored tokens
-        // valid_mask is [B, S] boolean
-        // multiply by mask (cast to float)
-        let masked_log_probs =
-            gathered_log_probs.multiply(&valid_mask.as_dtype(Dtype::Float32)?)?;
-
-        // Sum over sequence dimension -> [B]
-        let total_log_probs = masked_log_probs.sum_axes(&[1i32], false)?;
+        // Sum over sequence dimension -> [B] (masked positions are already 0)
+        let total_log_probs = per_token_logps.sum_axes(&[1i32], false)?;
 
         Ok(total_log_probs)
     }

@@ -382,46 +382,12 @@ impl GrpoTrainer {
         let pred_logits = logits.index((.., ..seq_len - 1, ..));
         let target_labels = labels.index((.., 1..));
 
-        // Compute log softmax
-        let log_probs = mlx_rs::nn::log_softmax(&pred_logits, -1)?;
+        // Selective log softmax: gather logit first, subtract logsumexp
+        // Never materializes full [B, S, V] log_softmax tensor
+        let (logps_array, valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
-        // Create mask for valid (non -100) labels
-        let ignore_index = Array::from_int(-100);
-        let valid_mask = target_labels.ne(&ignore_index)?;
-
-        // Replace -100 with 0 for gathering
-        let gather_labels = mlx_rs::ops::maximum(&target_labels, &Array::from_int(0))?;
-
-        // Gather log probabilities at target positions
-        let batch_size = logits.dim(0);
-        let pred_len = seq_len - 1;
-
-        let mut token_logps = Vec::with_capacity(batch_size as usize);
-
-        for b in 0..batch_size {
-            let batch_log_probs = log_probs.index(b);
-            let batch_labels = gather_labels.index(b);
-
-            let mut seq_logps = Vec::with_capacity(pred_len as usize);
-            batch_log_probs.eval()?;
-            batch_labels.eval()?;
-
-            for t in 0..pred_len {
-                let label = batch_labels.index(t as i32);
-                label.eval()?;
-                let label_idx = label.item::<i32>();
-                let log_prob = batch_log_probs.index((t as i32, label_idx));
-                log_prob.eval()?;
-                seq_logps.push(log_prob.item::<f32>());
-            }
-            token_logps.push(seq_logps);
-        }
-
-        // Convert to arrays
-        let flat_logps: Vec<f32> = token_logps.iter().flatten().copied().collect();
-        let logps_array = Array::from_slice(&flat_logps, &[batch_size, pred_len]);
-
-        Ok((logps_array, valid_mask.as_dtype(mlx_rs::Dtype::Float32)?))
+        Ok((logps_array, valid_mask))
     }
 
     /// Compute summed log probabilities for each sequence.
@@ -648,11 +614,9 @@ impl GrpoTrainer {
     /// # Returns
     /// Mean entropy
     pub fn compute_entropy(&self, logits: &Array, mask: &Array) -> GrpoResult<Array> {
-        // entropy = -sum(p * log_p)
-        let log_probs = mlx_rs::nn::log_softmax(logits, -1)?;
-        let probs = log_probs.exp()?; // softmax = exp(log_softmax)
-        let neg_entropy = probs.multiply(&log_probs)?.sum_axis(-1, None)?;
-        let entropy = neg_entropy.negative()?;
+        // Efficient entropy: H = logsumexp(x) - sum(softmax(x) * x)
+        // Only materializes softmax once instead of both softmax + log_softmax
+        let entropy = crate::logprob_utils::efficient_entropy(logits)?;
 
         // Mask and average (guard against zero token count)
         let masked_entropy = entropy.multiply(mask)?;
