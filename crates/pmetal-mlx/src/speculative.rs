@@ -461,15 +461,35 @@ impl SpeculativeDecoder {
 }
 
 /// Generate a uniform random number in [0, 1).
+///
+/// Uses a thread-local xorshift64 PRNG seeded from system time on first use.
+/// This avoids the correlation problem of re-seeding from nanosecond time
+/// on every call.
 fn rand_uniform() -> f32 {
+    use std::cell::Cell;
     use std::time::{SystemTime, UNIX_EPOCH};
-    let seed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos() as u64;
-    // Simple LCG
-    let x = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
-    (x as f32) / (u64::MAX as f32)
+
+    thread_local! {
+        static STATE: Cell<u64> = Cell::new({
+            let seed = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            // Ensure non-zero initial state (xorshift requirement)
+            if seed == 0 { 0xdeadbeefcafe1234 } else { seed }
+        });
+    }
+
+    STATE.with(|s| {
+        let mut x = s.get();
+        // xorshift64
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        s.set(x);
+        // Map to [0, 1) — use upper 23 bits for f32 mantissa precision
+        (x >> 40) as f32 / (1u64 << 24) as f32
+    })
 }
 
 /// Estimate optimal K based on model size ratio.
