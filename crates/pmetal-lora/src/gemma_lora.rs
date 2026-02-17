@@ -700,8 +700,10 @@ impl GemmaLoraModel {
                 for (idx, layer) in layers.iter_mut().enumerate() {
                     hidden_states = layer.forward(&hidden_states, mask.as_ref())?;
 
+                    // Checkpoint boundary marker
+                    // NOTE: We do NOT call eval() here - that breaks the gradient computation graph.
                     if checkpointing_enabled && (idx + 1) % layers_per_block == 0 {
-                        hidden_states.eval().map_err(LoraError::Mlx)?;
+                        tracing::trace!("Checkpoint boundary at layer {}", idx + 1);
                     }
                 }
             }
@@ -709,8 +711,10 @@ impl GemmaLoraModel {
                 for (idx, layer) in layers.iter_mut().enumerate() {
                     hidden_states = layer.forward(&hidden_states, mask.as_ref())?;
 
+                    // Checkpoint boundary marker
+                    // NOTE: We do NOT call eval() here - that breaks the gradient computation graph.
                     if checkpointing_enabled && (idx + 1) % layers_per_block == 0 {
-                        hidden_states.eval().map_err(LoraError::Mlx)?;
+                        tracing::trace!("Checkpoint boundary at layer {}", idx + 1);
                     }
                 }
             }

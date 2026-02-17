@@ -42,7 +42,7 @@
 //! - [FlashAttention Variable Length](https://github.com/Dao-AILab/flash-attention)
 
 use super::Sample;
-use pmetal_core::Result;
+use pmetal_core::{PMetalError, Result};
 
 /// Error type for packing operations.
 #[derive(Debug, thiserror::Error)]
@@ -534,7 +534,14 @@ impl SequencePacker {
         let mut cu_seqlens = vec![0u32];
         let mut cumsum = 0u32;
         for sample in samples {
-            cumsum += sample.input_ids.len() as u32;
+            cumsum = cumsum
+                .checked_add(sample.input_ids.len() as u32)
+                .ok_or_else(|| {
+                    PMetalError::InvalidArgument(format!(
+                        "Packed batch total tokens exceed u32::MAX ({})",
+                        u32::MAX
+                    ))
+                })?;
             cu_seqlens.push(cumsum);
         }
 

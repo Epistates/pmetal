@@ -52,6 +52,23 @@ impl TiesMerge {
             });
         }
 
+        if densities.len() != task_vectors.len() {
+            return Err(MergeError::InvalidConfig(format!(
+                "densities length ({}) must match task_vectors length ({})",
+                densities.len(),
+                task_vectors.len()
+            )));
+        }
+
+        for (i, &d) in densities.iter().enumerate() {
+            if !(0.0..=1.0).contains(&d) {
+                return Err(MergeError::InvalidConfig(format!(
+                    "density[{}] = {} is out of valid range [0.0, 1.0]",
+                    i, d
+                )));
+            }
+        }
+
         // Step 1: Sparsify each task vector by magnitude
         let sparse_vectors: Vec<Array> = task_vectors
             .iter()

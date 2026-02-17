@@ -447,6 +447,13 @@ impl GrpoTrainer {
     /// # Returns
     /// Advantages [batch]
     pub fn compute_advantages(&self, rewards: &[f64], group_size: usize) -> GrpoResult<Vec<f64>> {
+        if group_size == 0 || rewards.len() % group_size != 0 {
+            return Err(GrpoError::Config(format!(
+                "rewards length ({}) must be a positive multiple of group_size ({})",
+                rewards.len(),
+                group_size
+            )));
+        }
         let num_groups = rewards.len() / group_size;
         let mut advantages = vec![0.0; rewards.len()];
 
@@ -605,10 +612,11 @@ impl GrpoTrainer {
         let one = Array::from_f32(1.0);
         let per_token_kl = ratio.subtract(&one)?.subtract(&log_ratio)?;
 
-        // Mask and average KL
+        // Mask and average KL (guard against zero token count)
         let masked_kl = per_token_kl.multiply(mask)?;
         let token_count = mask.sum(None)?;
-        let mean_kl = masked_kl.sum(None)?.divide(&token_count)?;
+        let safe_count = mlx_rs::ops::maximum(&token_count, &Array::from_f32(1.0))?;
+        let mean_kl = masked_kl.sum(None)?.divide(&safe_count)?;
 
         // Per-token policy loss with advantage broadcasting
         // advantages [batch] -> [batch, 1] for broadcasting
@@ -616,9 +624,9 @@ impl GrpoTrainer {
         let neg_logps = per_token_policy_logps.negative()?;
         let per_token_loss = neg_logps.multiply(&advantages_expanded)?;
 
-        // Mask and average
+        // Mask and average (reuse safe_count)
         let masked_loss = per_token_loss.multiply(mask)?;
-        let mean_loss = masked_loss.sum(None)?.divide(&token_count)?;
+        let mean_loss = masked_loss.sum(None)?.divide(&safe_count)?;
 
         // Total loss with KL penalty
         let total_loss = if self.config.use_kl_loss && self.config.beta > 0.0 {
@@ -646,10 +654,11 @@ impl GrpoTrainer {
         let neg_entropy = probs.multiply(&log_probs)?.sum_axis(-1, None)?;
         let entropy = neg_entropy.negative()?;
 
-        // Mask and average
+        // Mask and average (guard against zero token count)
         let masked_entropy = entropy.multiply(mask)?;
         let token_count = mask.sum(None)?;
-        Ok(masked_entropy.sum(None)?.divide(&token_count)?)
+        let safe_count = mlx_rs::ops::maximum(&token_count, &Array::from_f32(1.0))?;
+        Ok(masked_entropy.sum(None)?.divide(&safe_count)?)
     }
 
     /// Update running reward statistics for normalization.
@@ -811,6 +820,16 @@ impl GrpoMetrics {
         advantages: &[f64],
         completion_lengths: &[usize],
     ) -> Self {
+        if rewards.is_empty() {
+            return Self {
+                loss,
+                policy_loss,
+                kl_divergence: kl,
+                entropy,
+                ..Self::default()
+            };
+        }
+
         let n = rewards.len() as f32;
 
         let mean_reward = rewards.iter().sum::<f64>() as f32 / n;

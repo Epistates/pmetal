@@ -504,10 +504,12 @@ impl LlamaLoraModel {
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             hidden_states = layer.forward(&hidden_states, mask.as_ref())?;
 
-            // Checkpoint at block boundaries: eval() breaks computation graph
-            // This forces materialization, allowing earlier layers to be freed
+            // Checkpoint boundary marker
+            // NOTE: We do NOT call eval() here - that breaks the gradient computation graph.
+            // MLX's lazy evaluation with unified memory handles memory pressure reasonably well.
+            // True gradient checkpointing (save/recompute) would require custom VJP implementation.
             if checkpointing_enabled && (idx + 1) % layers_per_block == 0 {
-                hidden_states.eval().map_err(LoraError::Mlx)?;
+                tracing::trace!("Checkpoint boundary at layer {}", idx + 1);
             }
         }
 

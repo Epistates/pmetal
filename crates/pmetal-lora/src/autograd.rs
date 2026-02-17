@@ -187,8 +187,16 @@ pub fn lora_backward(
     // d_output: [..., out_features] -> [N, out_features]
 
     let (x_flat, x_a_flat, d_output_flat, original_shape) = if ndim > 2 {
-        // Flatten batch dimensions
-        let batch_size: i32 = shape[..ndim - 1].iter().product();
+        // Flatten batch dimensions with overflow check
+        let batch_size: i32 = shape[..ndim - 1]
+            .iter()
+            .try_fold(1i32, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| {
+                mlx_rs::error::Exception::custom(format!(
+                    "Integer overflow computing batch size from shape {:?}",
+                    shape
+                ))
+            })?;
         let x_flat = saved.x.reshape(&[batch_size, in_features])?;
         let x_a_flat = saved.x_a.reshape(&[batch_size, rank])?;
         let d_output_flat = d_output.reshape(&[batch_size, out_features])?;
@@ -436,7 +444,16 @@ pub fn fused_mlp_backward(
         mlp_hidden_flat,
         d_output_flat,
     ) = if ndim > 2 {
-        let batch_size: i32 = shape[..ndim - 1].iter().product();
+        // Flatten batch dimensions with overflow check
+        let batch_size: i32 = shape[..ndim - 1]
+            .iter()
+            .try_fold(1i32, |acc, &d| acc.checked_mul(d))
+            .ok_or_else(|| {
+                mlx_rs::error::Exception::custom(format!(
+                    "Integer overflow computing batch size from shape {:?}",
+                    shape
+                ))
+            })?;
         (
             saved.x.reshape(&[batch_size, hidden_size])?,
             saved

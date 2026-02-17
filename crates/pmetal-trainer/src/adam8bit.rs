@@ -311,8 +311,6 @@ impl Adam8bit {
         gradient: &Array,
         parameter: &mut Array,
     ) -> Result<()> {
-        self.step += 1;
-
         gradient.eval()?;
         parameter.eval()?;
 
@@ -438,6 +436,8 @@ impl Adam8bit {
         gradients: &HashMap<Rc<str>, Array>,
         parameters: &mut HashMap<Rc<str>, Array>,
     ) -> Result<()> {
+        self.step += 1;
+
         for (key, grad) in gradients {
             if let Some(param) = parameters.get_mut(key) {
                 self.update_single(key, grad, param)?;

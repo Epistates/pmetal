@@ -252,13 +252,13 @@ impl LoraTrainer {
             match self.config.lr_scheduler {
                 pmetal_core::LrSchedulerType::Constant => base_lr,
                 pmetal_core::LrSchedulerType::Linear => {
-                    let decay_steps = (total_steps - warmup) as f32;
-                    let current = (self.step - warmup) as f32;
+                    let decay_steps = total_steps.saturating_sub(warmup).max(1) as f32;
+                    let current = self.step.saturating_sub(warmup) as f32;
                     base_lr * (1.0 - current / decay_steps).max(0.0)
                 }
                 pmetal_core::LrSchedulerType::Cosine => {
-                    let decay_steps = (total_steps - warmup) as f32;
-                    let current = (self.step - warmup) as f32;
+                    let decay_steps = total_steps.saturating_sub(warmup).max(1) as f32;
+                    let current = self.step.saturating_sub(warmup) as f32;
                     let progress = current / decay_steps;
                     base_lr * 0.5 * (1.0 + (std::f64::consts::PI as f32 * progress).cos())
                 }

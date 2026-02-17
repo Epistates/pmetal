@@ -38,8 +38,9 @@ impl LrScheduler {
             return self.base_lr * (step as f64 / self.warmup_steps as f64);
         }
 
+        let decay_steps = self.total_steps.saturating_sub(self.warmup_steps).max(1);
         let progress =
-            (step - self.warmup_steps) as f64 / (self.total_steps - self.warmup_steps) as f64;
+            step.saturating_sub(self.warmup_steps) as f64 / decay_steps as f64;
 
         match self.scheduler_type {
             LrSchedulerType::Constant => self.base_lr,

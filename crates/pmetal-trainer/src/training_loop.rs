@@ -123,7 +123,9 @@ fn jit_training_step<M: TrainableModel, O: Optimizer>(
         let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
         let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
         let valid_count = ignore_mask_f32.sum(None)?;
-        masked_loss.sum(None)?.divide(&valid_count)
+        // Guard against division by zero when all tokens are masked (-100)
+        let safe_count = mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
+        masked_loss.sum(None)?.divide(&safe_count)
     };
 
     // Compute loss and gradients
@@ -178,7 +180,9 @@ fn trainable_training_step<M: TrainableModel, O: Optimizer>(
         let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
         let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
         let valid_count = ignore_mask_f32.sum(None)?;
-        masked_loss.sum(None)?.divide(&valid_count)
+        // Guard against division by zero when all tokens are masked (-100)
+        let safe_count = mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
+        masked_loss.sum(None)?.divide(&safe_count)
     };
 
     // Compute loss and gradients
@@ -243,13 +247,19 @@ fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
         let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
 
         // Mask out ignored tokens (label == -100) and compute mean
-        // Packed labels are i64, so use i64 for the comparison!
-        let ignore_idx = Array::from_slice(&[-100_i64], &[1]);
+        // Match ignore_index dtype to labels dtype to avoid silent type promotion issues
+        let ignore_idx = if flat_labels.dtype() == mlx_rs::Dtype::Int64 {
+            Array::from_slice(&[-100_i64], &[1])
+        } else {
+            Array::from_slice(&[-100_i32], &[1])
+        };
         let ignore_mask = flat_labels.ne(&ignore_idx)?;
         let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
         let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
         let valid_count = ignore_mask_f32.sum(None)?;
-        masked_loss.sum(None)?.divide(&valid_count)
+        // Guard against division by zero when all tokens are masked (-100)
+        let safe_count = mlx_rs::ops::maximum(&valid_count, &Array::from_f32(1.0))?;
+        masked_loss.sum(None)?.divide(&safe_count)
     };
 
     // Compute loss and gradients - pass position_ids as 4th argument
@@ -571,8 +581,8 @@ impl TrainingLoop {
         norm_sq_sum.eval()?;
         let total_norm = norm_sq_sum.item::<f32>().sqrt();
 
-        // Only clip if needed (avoids unnecessary multiply when not clipping)
-        if total_norm > max_norm {
+        // Only clip if norm exceeds max and is finite (NaN/Inf gradients should not be scaled)
+        if total_norm > max_norm && total_norm.is_finite() {
             let scale = max_norm / (total_norm + 1e-6);
             let scale_arr = Array::from_f32(scale);
             for (_, grad) in grads.iter_mut() {
@@ -602,10 +612,14 @@ impl TrainingLoop {
             Some(acc) => {
                 // Accumulate: acc += new_grads / accum_steps
                 let scale = 1.0 / accum_steps as f32;
+                let scale_arr = Array::from_f32(scale);
                 for (key, new_grad) in new_grads {
                     if let Some(existing) = acc.get_mut(&key) {
-                        let scaled = new_grad.multiply(&Array::from_f32(scale))?;
+                        let scaled = new_grad.multiply(&scale_arr)?;
                         *existing = existing.add(&scaled)?;
+                    } else {
+                        let scaled = new_grad.multiply(&scale_arr)?;
+                        acc.insert(key, scaled);
                     }
                 }
             }
@@ -1434,6 +1448,10 @@ impl TrainingLoop {
                     .checked_mul(batch.seq_len)
                     .unwrap_or(usize::MAX);
 
+                // Apply learning rate schedule before each step
+                let scheduled_lr = self.get_learning_rate();
+                state.1.set_learning_rate(scheduled_lr);
+
                 // Execute fused training step (forward + backward + optimizer update)
                 // DEFERRED EVAL: Loss remains a lazy Array, no GPU-CPU sync here
                 // MLX's lazy evaluation automatically fuses operations when not evaluated
@@ -1479,7 +1497,7 @@ impl TrainingLoop {
                         "Step {}: loss={:.4}, lr={:.2e}, tokens/s={:.0}",
                         self.step,
                         self.running_loss,
-                        self.config.training.learning_rate,
+                        self.get_learning_rate(),
                         tokens_per_sec,
                     );
                 }
@@ -1974,7 +1992,7 @@ impl TrainingLoop {
                         "Step {}: loss={:.4}, lr={:.2e}, tokens/s={:.0}",
                         self.step,
                         self.running_loss,
-                        self.config.training.learning_rate,
+                        self.get_learning_rate(),
                         tokens_per_sec,
                     );
                 }

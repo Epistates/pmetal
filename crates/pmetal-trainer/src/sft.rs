@@ -233,8 +233,8 @@ impl SftTrainer {
                     base_lr * (step as f64 / warmup as f64)
                 } else {
                     // Linear decay
-                    let decay_steps = (total_steps - warmup) as f64;
-                    let current = (step - warmup) as f64;
+                    let decay_steps = total_steps.saturating_sub(warmup).max(1) as f64;
+                    let current = step.saturating_sub(warmup) as f64;
                     base_lr * (1.0 - current / decay_steps).max(0.0)
                 }
             }
@@ -244,8 +244,8 @@ impl SftTrainer {
                     base_lr * (step as f64 / warmup as f64)
                 } else {
                     // Cosine decay
-                    let decay_steps = (total_steps - warmup) as f64;
-                    let current = (step - warmup) as f64;
+                    let decay_steps = total_steps.saturating_sub(warmup).max(1) as f64;
+                    let current = step.saturating_sub(warmup) as f64;
                     let progress = current / decay_steps;
                     base_lr * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
                 }

@@ -123,6 +123,11 @@ pub struct QLoraLinear {
 
     /// Cached dequantized weight (optional, for training performance).
     /// Uses RefCell for interior mutability to allow caching in immutable forward().
+    ///
+    // SAFETY: RefCell<Option<Array>> is not Sync. This type must only be used from a
+    // single thread. MLX training runs on a single thread with GPU dispatch, so this
+    // is safe in practice. If multi-threaded access is ever needed, replace with
+    // Mutex<Option<Array>> or use thread-local storage.
     weight_cache: RefCell<Option<Array>>,
     /// Whether weight caching is enabled.
     cache_enabled: bool,

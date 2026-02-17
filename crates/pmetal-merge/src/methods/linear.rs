@@ -59,11 +59,12 @@ impl MergeMethod for LinearMerge {
         // Optionally normalize weights
         let weights = if global_params.normalize() {
             let sum: f32 = weights.iter().sum();
-            if sum > 0.0 {
-                weights.iter().map(|w| w / sum).collect()
-            } else {
-                weights
+            if sum <= 0.0 {
+                return Err(MergeError::InvalidConfig(
+                    "Cannot normalize weights: sum is zero or negative".to_string(),
+                ));
             }
+            weights.iter().map(|w| w / sum).collect()
         } else {
             weights
         };

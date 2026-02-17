@@ -601,8 +601,7 @@ impl MlxMetalOptimizer {
                 offset += size;
             } else {
                 // No gradient for this parameter - zero it out
-                let size =
-                    self.layout.sizes[self.layout.names.iter().position(|n| n == name).unwrap()];
+                let size = self.layout.sizes[i];
                 for i in 0..size {
                     flat_slice[offset + i] = 0.0;
                 }
@@ -668,9 +667,13 @@ impl MlxMetalOptimizer {
         // Increment step
         self.step += 1;
 
-        // Create AdamW config
+        // Create AdamW config with scheduled learning rate
+        let scheduled_lr = self
+            .config
+            .lr_schedule
+            .get_lr_multiplier(self.step, self.config.learning_rate);
         let adamw_config = AdamWConfig {
-            learning_rate: self.config.learning_rate,
+            learning_rate: scheduled_lr,
             beta1: self.config.beta1,
             beta2: self.config.beta2,
             epsilon: self.config.epsilon,
@@ -931,8 +934,12 @@ impl MlxMetalOptimizer {
             self.flat_v = Some(Array::zeros::<f32>(&[self.layout.total_elements as i32])?);
         }
 
-        let flat_m = self.flat_m.as_ref().unwrap();
-        let flat_v = self.flat_v.as_ref().unwrap();
+        let flat_m = self.flat_m.as_ref().ok_or_else(|| {
+            mlx_rs::error::Exception::custom("Optimizer momentum state (flat_m) not initialized")
+        })?;
+        let flat_v = self.flat_v.as_ref().ok_or_else(|| {
+            mlx_rs::error::Exception::custom("Optimizer velocity state (flat_v) not initialized")
+        })?;
 
         // SINGLE VECTORIZED ADAMW UPDATE (4 MLX ops instead of 392 × 4)
         let beta1 = &self.cached_scalars.beta1;
