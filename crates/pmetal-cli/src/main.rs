@@ -106,7 +106,11 @@ enum Commands {
         #[arg(long, default_value = "16")]
         lora_r: usize,
 
-        /// Learning rate
+        /// LoRA alpha (scaling factor). Unsloth recommends 2x rank.
+        #[arg(long, default_value = "32")]
+        lora_alpha: f32,
+
+        /// Learning rate. Unsloth recommends 2e-4 for most tasks.
         #[arg(long, default_value = "2e-4")]
         learning_rate: f64,
 
@@ -115,11 +119,11 @@ enum Commands {
         batch_size: usize,
 
         /// Number of epochs
-        #[arg(long, default_value = "3")]
+        #[arg(long, default_value = "1")]
         epochs: usize,
 
-        /// Maximum sequence length
-        #[arg(long, default_value = "2048")]
+        /// Maximum sequence length (0 to auto-detect from model config)
+        #[arg(long, default_value = "0")]
         max_seq_len: usize,
 
         /// Gradient accumulation steps
@@ -788,6 +792,7 @@ async fn main() -> anyhow::Result<()> {
             eval_dataset,
             output,
             lora_r,
+            lora_alpha,
             learning_rate,
             batch_size,
             epochs,
@@ -823,6 +828,7 @@ async fn main() -> anyhow::Result<()> {
                 eval_dataset,
                 output,
                 lora_r,
+                lora_alpha,
                 learning_rate,
                 batch_size,
                 epochs,
@@ -1139,6 +1145,7 @@ async fn run_training(
     eval_dataset_path: Option<String>,
     output_dir: String,
     lora_r: usize,
+    lora_alpha: f32,
     learning_rate: f64,
     batch_size: usize,
     num_epochs: usize,
@@ -1181,6 +1188,7 @@ async fn run_training(
         config.dataset.dataset_id = ds.clone();
     }
     config.lora.r = lora_r;
+    config.lora.alpha = lora_alpha;
     config.training.learning_rate = learning_rate;
     config.training.batch_size = batch_size;
     config.training.num_epochs = num_epochs;
@@ -1189,111 +1197,55 @@ async fn run_training(
     config.training.max_grad_norm = max_grad_norm;
     config.training.output_dir = output_dir.clone();
 
-    // Validate required fields
-    if config.model.model_id.is_empty() {
-        anyhow::bail!("Model ID is required. Use --model or specify in config file.");
-    }
-    if config.dataset.dataset_id.is_empty() {
-        anyhow::bail!("Dataset path is required. Use --dataset or specify in config file.");
-    }
-
-    println!("========================================");
-    println!(
-        "  PMetal {} Fine-Tuning",
-        if use_qlora { "QLoRA" } else { "LoRA" }
-    );
-    println!("========================================");
-    println!("Model:         {}", config.model.model_id);
-    println!("Dataset:       {}", config.dataset.dataset_id);
-    if let Some(ref eval_path) = eval_dataset_path {
-        println!("Eval Dataset:  {}", eval_path);
-    }
-    println!("Output:        {}", config.training.output_dir);
-    println!("LoRA Rank:     {}", config.lora.r);
-    println!("LR:            {}", config.training.learning_rate);
-    println!("Batch Size:    {}", config.training.batch_size);
-    println!(
-        "Grad Accum:    {}",
-        config.training.gradient_accumulation_steps
-    );
-    println!("Epochs:        {}", config.training.num_epochs);
-    println!("Max Seq Len:   {}", config.training.max_seq_len);
-    println!("Max Grad Norm: {}", config.training.max_grad_norm);
-    println!(
-        "Metal FA:      {}",
-        if use_metal_flash_attention {
-            "enabled"
+    // Download model if needed
+    tracing::info!("Loading model: {}", config.model.model_id);
+    let model_path =
+        if config.model.model_id.contains('/') && !PathBuf::from(&config.model.model_id).exists() {
+            // HuggingFace model ID
+            pmetal_hub::download_model(
+                &config.model.model_id,
+                config.model.revision.as_deref(),
+                None,
+            )
+            .await?
         } else {
-            "disabled"
-        }
-    );
-    println!(
-        "Fused:         {}",
-        if fused { "enabled" } else { "disabled" }
-    );
-    println!(
-        "Metal Opt:     {}",
-        if use_metal_fused_optimizer {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-    println!(
-        "Packing:       {}",
-        if use_sequence_packing {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-    println!(
-        "JIT Compile:   {}",
-        if use_jit_compilation {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
-    if gradient_checkpointing {
-        println!(
-            "Grad Ckpt:     enabled ({} layers/block)",
-            gradient_checkpointing_layers
-        );
-    } else {
-        println!("Grad Ckpt:     disabled");
-    }
-    if use_qlora {
-        println!("Quantization:  {:?}", quantization);
-        println!("Block Size:    {}", quant_block_size);
-        println!(
-            "Double Quant:  {}",
-            if double_quant { "enabled" } else { "disabled" }
-        );
-    }
-    if let Some(ref metrics_path) = log_metrics {
-        println!("Metrics Log:   {}", metrics_path);
-    }
-    if let Some(emb_lr) = embedding_lr {
-        println!("Embedding LR:  {:.2e}", emb_lr);
-    }
-    println!("========================================\n");
-
-    // Initialize metrics callback if requested
-    let mut metrics_callback = if let Some(ref metrics_path) = log_metrics {
-        // Default to output_dir/metrics.jsonl if only filename given
-        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
-            PathBuf::from(metrics_path)
-        } else {
-            PathBuf::from(&output_dir).join(metrics_path)
+            PathBuf::from(&config.model.model_id)
         };
-        let callback = MetricsJsonCallback::new(&path)?
-            .with_run_name(format!(
-                "{}-{}",
-                config.model.model_id.replace('/', "-"),
-                chrono::Utc::now().format("%Y%m%d-%H%M%S")
-            ))
-            .with_config(serde_json::json!({
+
+    // Load model config (optional for GGUF - config is extracted from metadata)
+    let model_config_path = model_path.join("config.json");
+    let llama_config: Option<LlamaConfig> = if model_config_path.exists() {
+        let content = std::fs::read_to_string(&model_config_path)?;
+        Some(serde_json::from_str(&content)?)
+    } else {
+        // GGUF files don't have separate config.json
+        if WeightFormat::detect(&model_path) != Some(WeightFormat::Gguf) {
+            anyhow::bail!(
+                "Model config.json not found at {:?}. If using GGUF, pass the .gguf file directly.",
+                model_config_path
+            );
+        }
+        None
+    };
+
+    // Auto-detect max_seq_len if requested (0)
+    if config.training.max_seq_len == 0 {
+        if let Some(ref cfg) = llama_config {
+            // Llama/Qwen config uses max_position_embeddings
+            config.training.max_seq_len = cfg.max_position_embeddings as usize;
+            tracing::info!(
+                "Auto-detected max_seq_len: {} from model config",
+                config.training.max_seq_len
+            );
+        } else {
+            // GGUF fallback
+            config.training.max_seq_len = 2048;
+            tracing::info!(
+                "Defaulting max_seq_len to {} (GGUF or unknown config)",
+                config.training.max_seq_len
+            );
+        }
+    }
                 "model": config.model.model_id,
                 "lora_r": lora_r,
                 "learning_rate": learning_rate,
@@ -1363,6 +1315,10 @@ async fn run_training(
         anyhow::bail!("Tokenizer not found at {:?}", tokenizer_path);
     };
 
+    // Detect chat template from model name for OpenAI/ShareGPT formatting
+    let chat_template = pmetal_data::chat_templates::detect_template_from_model(&config.model.model_id);
+    tracing::info!("Using chat template: {:?}", chat_template.template_type);
+
     // Load and tokenize training dataset
     tracing::info!("Loading training dataset: {}", config.dataset.dataset_id);
     let train_dataset = TrainingDataset::from_jsonl_tokenized(
@@ -1370,6 +1326,7 @@ async fn run_training(
         &tokenizer,
         DatasetFormat::Auto,
         config.training.max_seq_len,
+        Some(&chat_template),
     )?;
     tracing::info!("Training dataset loaded: {} samples", train_dataset.len());
 
@@ -1381,6 +1338,7 @@ async fn run_training(
             &tokenizer,
             DatasetFormat::Auto,
             config.training.max_seq_len,
+            Some(&chat_template),
         )?;
         tracing::info!("Evaluation dataset loaded: {} samples", ds.len());
         Some(ds)

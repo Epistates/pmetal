@@ -15,7 +15,7 @@ LORA_ALPHA=32
 BATCH_SIZE=4
 LEARNING_RATE=2e-4
 EPOCHS=1
-MAX_SEQ_LEN=2048
+MAX_SEQ_LEN=0 # 0 = auto-detect from model context size
 
 echo "=== PMetal LoRA Fine-tuning ==="
 echo "Model: $MODEL"
@@ -32,9 +32,7 @@ echo ""
     --batch-size $BATCH_SIZE \
     --learning-rate $LEARNING_RATE \
     --epochs $EPOCHS \
-    --max-seq-len $MAX_SEQ_LEN \
-    --use-metal-flash-attention \
-    --use-sequence-packing
+    --max-seq-len $MAX_SEQ_LEN
 
 echo ""
 echo "Training complete! Adapter saved to: $OUTPUT"

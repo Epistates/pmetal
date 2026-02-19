@@ -24,28 +24,26 @@ cargo build --release
 ### Fine-tune a Model
 
 ```bash
-# LoRA fine-tuning with sequence packing
+# LoRA fine-tuning with auto-detected max-seq-len and sequence packing
 ./target/release/pmetal train \
   --model qwen/Qwen3-0.6B-Base \
   --dataset path/to/train.jsonl \
   --output ./output \
   --lora-r 16 \
   --batch-size 4 \
-  --learning-rate 2e-4 \
-  --epochs 1 \
-  --use-metal-flash-attention \
-  --use-sequence-packing
+  --learning-rate 2e-4
 ```
 
-### Run Inference
+### Run Reasoning Inference
 
 ```bash
-# Inference with trained LoRA adapter
+# Inference with thinking mode enabled
 ./target/release/pmetal infer \
   --model qwen/Qwen3-0.6B-Base \
   --lora ./output/lora_weights.safetensors \
-  --prompt "What is machine learning?" \
-  --max-tokens 256
+  --prompt "Does absolute truth exist?" \
+  --chat \
+  --show-thinking
 ```
 
 ## Architecture
@@ -186,13 +184,13 @@ Supported formats for training data:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `--lora-r` | 8 | LoRA rank |
-| `--lora-alpha` | 16.0 | LoRA scaling factor |
+| `--lora-r` | 16 | LoRA rank |
+| `--lora-alpha` | 32.0 | LoRA scaling factor (2x rank) |
 | `--batch-size` | 4 | Micro-batch size |
-| `--gradient-accumulation-steps` | 1 | Gradient accumulation |
 | `--learning-rate` | 2e-4 | Learning rate |
+| `--max-seq-len` | 0 | Max seq len (0 = auto-detect) |
+| `--epochs` | 1 | Number of training epochs |
 | `--max-grad-norm` | 1.0 | Gradient clipping |
-| `--warmup-steps` | 0 | LR warmup steps |
 
 ### Inference Parameters
 

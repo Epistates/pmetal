@@ -4,6 +4,7 @@ use arrow::array::{Array as ArrowArray, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pmetal_core::Result;
 use serde::Deserialize;
+use super::chat_templates::{ChatTemplate, Message};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -80,6 +81,19 @@ struct SimpleFormat {
     text: String,
 }
 
+/// OpenAI-style messages format.
+#[derive(Debug, Deserialize)]
+struct MessagesFormat {
+    messages: Vec<OpenAiMessage>,
+}
+
+/// OpenAI-style message.
+#[derive(Debug, Deserialize)]
+struct OpenAiMessage {
+    role: String,
+    content: String,
+}
+
 /// ShareGPT conversation message.
 #[derive(Debug, Deserialize)]
 struct ShareGptMessage {
@@ -102,6 +116,8 @@ pub enum DatasetFormat {
     Alpaca,
     /// ShareGPT format: {"conversations": [{"from": "human", "value": "..."}, ...]}
     ShareGpt,
+    /// OpenAI format: {"messages": [{"role": "user", "content": "..."}, ...]}
+    OpenAi,
     /// Auto-detect format from first line
     Auto,
 }
@@ -132,13 +148,15 @@ impl TrainingDataset {
     /// * `tokenizer` - Tokenizer to use
     /// * `format` - Dataset format (or Auto to detect)
     /// * `max_length` - Maximum sequence length
+    /// * `template` - Optional chat template for formatting (OpenAI/ShareGPT formats)
     pub fn from_jsonl_tokenized<P: AsRef<Path>>(
         path: P,
         tokenizer: &super::Tokenizer,
         format: DatasetFormat,
         max_length: usize,
+        template: Option<&ChatTemplate>,
     ) -> Result<Self> {
-        let text_samples = Self::load_jsonl_text(path, format)?;
+        let text_samples = Self::load_jsonl_text(path, format, template)?;
         let mut samples = Vec::with_capacity(text_samples.len());
 
         for text_sample in text_samples {
@@ -153,6 +171,7 @@ impl TrainingDataset {
     pub fn load_jsonl_text<P: AsRef<Path>>(
         path: P,
         format: DatasetFormat,
+        template: Option<&ChatTemplate>,
     ) -> Result<Vec<TextSample>> {
         let file = File::open(path.as_ref()).map_err(|e| {
             pmetal_core::PMetalError::Io(std::io::Error::new(
@@ -182,7 +201,7 @@ impl TrainingDataset {
                 detected_format = Self::detect_format(&line)?;
             }
 
-            let sample = Self::parse_line(&line, detected_format, line_num)?;
+            let sample = Self::parse_line(&line, detected_format, line_num, template)?;
             samples.push(sample);
         }
 
@@ -204,16 +223,23 @@ impl TrainingDataset {
             Ok(DatasetFormat::Alpaca)
         } else if value.get("conversations").is_some() {
             Ok(DatasetFormat::ShareGpt)
+        } else if value.get("messages").is_some() {
+            Ok(DatasetFormat::OpenAi)
         } else {
             Err(pmetal_core::PMetalError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Could not detect dataset format. Expected 'text', 'instruction', or 'conversations' field.",
+                "Could not detect dataset format. Expected 'text', 'instruction', 'conversations', or 'messages' field.",
             )))
         }
     }
 
     /// Parse a single JSONL line.
-    fn parse_line(line: &str, format: DatasetFormat, line_num: usize) -> Result<TextSample> {
+    fn parse_line(
+        line: &str,
+        format: DatasetFormat,
+        line_num: usize,
+        template: Option<&ChatTemplate>,
+    ) -> Result<TextSample> {
         match format {
             DatasetFormat::Simple => {
                 let parsed: SimpleFormat = serde_json::from_str(line).map_err(|e| {
@@ -262,40 +288,111 @@ impl TrainingDataset {
                     ))
                 })?;
 
-                // Build full multi-turn conversation text
-                // For SFT, we train on ALL assistant responses
-                let mut full_text = String::new();
-                let mut prompt_end = 0;
+                if let Some(tmpl) = template {
+                    let messages: Vec<Message> = parsed
+                        .conversations
+                        .iter()
+                        .map(|m| {
+                            let role = match m.from.as_str() {
+                                "human" | "user" | "system" => m.from.as_str(),
+                                "gpt" | "assistant" => "assistant",
+                                other => other,
+                            };
+                            Message::new(role, &m.value)
+                        })
+                        .collect();
 
-                for msg in parsed.conversations.iter() {
-                    let role = match msg.from.as_str() {
-                        "human" | "user" => "User",
-                        "gpt" | "assistant" => "Assistant",
-                        "system" => "System",
-                        other => other,
+                    let formatted = tmpl.apply(&messages);
+                    let prompt = formatted.prompt().to_string();
+                    Ok(TextSample {
+                        text: formatted.text,
+                        prompt: Some(prompt),
+                    })
+                } else {
+                    // Fallback to basic formatting if no template
+                    let mut full_text = String::new();
+                    let mut prompt_end = 0;
+
+                    for msg in parsed.conversations.iter() {
+                        let role = match msg.from.as_str() {
+                            "human" | "user" => "User",
+                            "gpt" | "assistant" => "Assistant",
+                            "system" => "System",
+                            other => other,
+                        };
+
+                        if msg.from == "human" || msg.from == "user" || msg.from == "system" {
+                            full_text.push_str(&format!("{}: {}\n\n", role, msg.value));
+                            prompt_end = full_text.len();
+                        } else {
+                            full_text.push_str(&format!("{}: {}\n\n", role, msg.value));
+                        }
+                    }
+
+                    let prompt = if prompt_end > 0 {
+                        Some(full_text[..prompt_end].to_string())
+                    } else {
+                        None
                     };
 
-                    // Track where LAST user/system message ends (for label masking)
-                    // Labels apply only to assistant responses
-                    if msg.from == "human" || msg.from == "user" || msg.from == "system" {
-                        full_text.push_str(&format!("{}: {}\n\n", role, msg.value));
-                        prompt_end = full_text.len();
-                    } else {
-                        // Assistant message - add to text but don't update prompt_end
-                        full_text.push_str(&format!("{}: {}\n\n", role, msg.value));
-                    }
+                    Ok(TextSample {
+                        text: full_text,
+                        prompt,
+                    })
                 }
+            }
+            DatasetFormat::OpenAi => {
+                let parsed: MessagesFormat = serde_json::from_str(line).map_err(|e| {
+                    pmetal_core::PMetalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Line {}: {}", line_num + 1, e),
+                    ))
+                })?;
 
-                let prompt = if prompt_end > 0 {
-                    Some(full_text[..prompt_end].to_string())
+                if let Some(tmpl) = template {
+                    let messages: Vec<Message> = parsed
+                        .messages
+                        .iter()
+                        .map(|m| Message::new(&m.role, &m.content))
+                        .collect();
+
+                    let formatted = tmpl.apply(&messages);
+                    let prompt = formatted.prompt().to_string();
+                    Ok(TextSample {
+                        text: formatted.text,
+                        prompt: Some(prompt),
+                    })
                 } else {
-                    None
-                };
+                    let mut full_text = String::new();
+                    let mut prompt_end = 0;
 
-                Ok(TextSample {
-                    text: full_text,
-                    prompt,
-                })
+                    for msg in parsed.messages.iter() {
+                        let role = match msg.role.as_str() {
+                            "user" => "User",
+                            "assistant" => "Assistant",
+                            "system" => "System",
+                            other => other,
+                        };
+
+                        if msg.role == "user" || msg.role == "system" {
+                            full_text.push_str(&format!("{}: {}\n\n", role, msg.content));
+                            prompt_end = full_text.len();
+                        } else {
+                            full_text.push_str(&format!("{}: {}\n\n", role, msg.content));
+                        }
+                    }
+
+                    let prompt = if prompt_end > 0 {
+                        Some(full_text[..prompt_end].to_string())
+                    } else {
+                        None
+                    };
+
+                    Ok(TextSample {
+                        text: full_text,
+                        prompt,
+                    })
+                }
             }
             DatasetFormat::Auto => {
                 // Should not reach here after detection
