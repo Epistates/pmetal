@@ -257,7 +257,11 @@ impl ScheduleFreeOptimizer {
             let z = p.clone();
             let v = mlx_rs::ops::zeros::<f32>(p.shape())?;
 
-            self.state.push(ParameterState { z, v, y_saved: None });
+            self.state.push(ParameterState {
+                z,
+                v,
+                y_saved: None,
+            });
         }
 
         self.initialized = true;

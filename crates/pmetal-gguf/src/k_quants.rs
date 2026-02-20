@@ -285,9 +285,24 @@ pub fn dequantize_q3k(block: &BlockQ3K, output: &mut [f32; QK_K]) {
     const KMASK2: u32 = 0x0f0f0f0f;
 
     let mut aux = [0u32; 4];
-    aux[0] = u32::from_le_bytes([block.scales[0], block.scales[1], block.scales[2], block.scales[3]]);
-    aux[1] = u32::from_le_bytes([block.scales[4], block.scales[5], block.scales[6], block.scales[7]]);
-    aux[2] = u32::from_le_bytes([block.scales[8], block.scales[9], block.scales[10], block.scales[11]]);
+    aux[0] = u32::from_le_bytes([
+        block.scales[0],
+        block.scales[1],
+        block.scales[2],
+        block.scales[3],
+    ]);
+    aux[1] = u32::from_le_bytes([
+        block.scales[4],
+        block.scales[5],
+        block.scales[6],
+        block.scales[7],
+    ]);
+    aux[2] = u32::from_le_bytes([
+        block.scales[8],
+        block.scales[9],
+        block.scales[10],
+        block.scales[11],
+    ]);
 
     let tmp = aux[2];
     aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
@@ -314,10 +329,7 @@ pub fn dequantize_q3k(block: &BlockQ3K, output: &mut [f32; QK_K]) {
     let mut is = 0usize;
     let mut m = 1u8; // bitmask into hmask bytes: cycles 1,2,4,8,16,32,64,128
 
-    for (out_128, qs) in output
-        .chunks_exact_mut(128)
-        .zip(block.qs.chunks_exact(32))
-    {
+    for (out_128, qs) in output.chunks_exact_mut(128).zip(block.qs.chunks_exact(32)) {
         let mut shift = 0u32;
         for shift_chunk in out_128.chunks_exact_mut(32) {
             for (scale_index, scale_chunk) in shift_chunk.chunks_exact_mut(16).enumerate() {
@@ -326,7 +338,11 @@ pub fn dequantize_q3k(block: &BlockQ3K, output: &mut [f32; QK_K]) {
                 for (i, out_val) in scale_chunk.iter_mut().enumerate() {
                     let qs_idx = i + 16 * scale_index;
                     let q_low = (qs[qs_idx] >> shift) & 3;
-                    let q_high = if block.hmask[qs_idx] & m != 0 { 0i8 } else { -4i8 };
+                    let q_high = if block.hmask[qs_idx] & m != 0 {
+                        0i8
+                    } else {
+                        -4i8
+                    };
                     let q = q_low as i8 + q_high;
                     *out_val = dl * q as f32;
                 }

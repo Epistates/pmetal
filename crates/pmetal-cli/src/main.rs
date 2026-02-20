@@ -1254,11 +1254,11 @@ async fn run_distillation_cli(
     epochs: usize,
     max_seq_len: usize,
 ) -> anyhow::Result<()> {
-    use pmetal_distill::{DistillConfig, DistillMethod, LossConfig, LossType, Distiller};
-    use pmetal_trainer::{DistillationTrainer, TrainingLoopConfig};
-    use pmetal_data::{DataLoaderConfig, DatasetFormat, TrainingDataset, Tokenizer};
-    use pmetal_lora::DynamicLoraModel;
     use pmetal_core::LoraConfig;
+    use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
+    use pmetal_distill::{DistillConfig, DistillMethod, Distiller, LossConfig, LossType};
+    use pmetal_lora::DynamicLoraModel;
+    use pmetal_trainer::{DistillationTrainer, TrainingLoopConfig};
     use std::path::{Path, PathBuf};
 
     println!("========================================");
@@ -1319,7 +1319,7 @@ async fn run_distillation_cli(
         ..Default::default()
     };
     let mut teacher_model = DynamicLoraModel::from_pretrained(&teacher_path, teacher_lora_config)?;
-    
+
     // 5. Load Student Model (Trainable LoRA)
     tracing::info!("Loading student model...");
     let student_lora_config = LoraConfig {
@@ -1404,13 +1404,15 @@ async fn run_distillation_cli(
     let mut trainer = DistillationTrainer::new(distiller, training_loop_config);
 
     // 8. Run Distillation
-    trainer.run(
-        &mut student_model,
-        &mut teacher_model,
-        train_dataset,
-        None,
-        None,
-    ).map_err(|e| anyhow::anyhow!("Distillation failed: {}", e))?;
+    trainer
+        .run(
+            &mut student_model,
+            &mut teacher_model,
+            train_dataset,
+            None,
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("Distillation failed: {}", e))?;
 
     // 9. Save Student Adapters
     let lora_output = PathBuf::from(output_dir).join("lora_weights.safetensors");
@@ -1418,7 +1420,10 @@ async fn run_distillation_cli(
     std::fs::create_dir_all(output_dir)?;
     student_model.save_lora_weights(&lora_output)?;
 
-    println!("\nDistillation complete! Adapters saved to {}", lora_output.display());
+    println!(
+        "\nDistillation complete! Adapters saved to {}",
+        lora_output.display()
+    );
     Ok(())
 }
 
@@ -1587,7 +1592,8 @@ async fn run_training(
     };
 
     // Detect chat template from model name for OpenAI/ShareGPT formatting
-    let chat_template = pmetal_data::chat_templates::detect_template_from_model(&config.model.model_id);
+    let chat_template =
+        pmetal_data::chat_templates::detect_template_from_model(&config.model.model_id);
     tracing::info!("Using chat template: {:?}", chat_template.template_type);
 
     // Load and tokenize training dataset

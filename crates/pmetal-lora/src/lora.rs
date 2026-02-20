@@ -164,7 +164,12 @@ impl LoraLinear {
             bound
         };
         let lora_a = if rank > 0 {
-            mlx_rs::random::uniform::<_, f32>(-lora_a_bound, lora_a_bound, &[rank, in_features], None)?
+            mlx_rs::random::uniform::<_, f32>(
+                -lora_a_bound,
+                lora_a_bound,
+                &[rank, in_features],
+                None,
+            )?
         } else {
             mlx_rs::ops::zeros::<f32>(&[1, in_features])?
         };
@@ -342,7 +347,6 @@ impl LoraLinear {
     /// and re-apply the LoRA adapter.
     // NOTE: unmerge() is intentionally omitted. The original base weight is
     // lost after merge(); callers must reload base weights to undo a merge.
-
 
     /// Get the LoRA A parameters (for gradient computation).
     pub fn lora_a_params(&self) -> &Array {

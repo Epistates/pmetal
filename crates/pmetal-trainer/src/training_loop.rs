@@ -486,9 +486,7 @@ impl TrainingLoop {
         // loss.mean(None) would incorrectly divide by all positions including
         // ignored ones, producing an underestimated loss.
         let mask = flat_labels.ne(&Array::from_slice(&[-100_i64], &[1]))?;
-        let valid_count_raw = mask
-            .as_dtype(mlx_rs::Dtype::Float32)?
-            .sum(None)?;
+        let valid_count_raw = mask.as_dtype(mlx_rs::Dtype::Float32)?.sum(None)?;
         let valid_count = mlx_rs::ops::maximum(&valid_count_raw, &Array::from_f32(1.0))?;
         let masked_loss = loss.multiply(&mask.as_dtype(loss.dtype())?)?;
         Ok(masked_loss.sum(None)?.divide(&valid_count)?)

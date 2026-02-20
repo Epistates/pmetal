@@ -188,7 +188,7 @@ impl DistillLoss for RationaleLoss {
         // 1. Compute per-token KL divergence stably
         let teacher_logprobs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
         let student_logprobs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
-        
+
         let teacher_probs = teacher_logprobs.exp()?;
         let log_ratio = teacher_logprobs.subtract(&student_logprobs)?;
         let kl_per_vocab = teacher_probs.multiply(&log_ratio)?;
@@ -196,7 +196,9 @@ impl DistillLoss for RationaleLoss {
 
         // 2. Compute per-token entropy stably
         let p_log_p = teacher_probs.multiply(&teacher_logprobs)?;
-        let entropy = p_log_p.sum_axis(-1, false)?.multiply(&Array::from_f32(-1.0))?;
+        let entropy = p_log_p
+            .sum_axis(-1, false)?
+            .multiply(&Array::from_f32(-1.0))?;
 
         // 3. Normalize entropy and compute weight map
         let max_entropy = entropy.max(false)?;
@@ -215,13 +217,13 @@ impl DistillLoss for RationaleLoss {
 
         // 4. Apply weights and compute mean
         let weighted_loss = kl_per_token.multiply(&weight_map)?;
-        
+
         let total_weighted_loss = weighted_loss.sum(false)?;
         let total_weights = weight_map.sum(false)?;
-        
+
         total_weighted_loss.eval()?;
         total_weights.eval()?;
-        
+
         let total_weights_val: f32 = total_weights.item();
         if total_weights_val > 1e-6 {
             Ok(total_weighted_loss.divide(&total_weights)?)

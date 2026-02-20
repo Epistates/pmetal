@@ -194,7 +194,9 @@ impl KlDivergenceLoss {
         if let Ok(t_max) = teacher_scaled.max(false) {
             t_max.eval().ok();
             if t_max.item::<f32>().is_infinite() || t_max.item::<f32>().is_nan() {
-                tracing::warn!("KL fallback: teacher_scaled contains Inf/NaN after temperature scaling");
+                tracing::warn!(
+                    "KL fallback: teacher_scaled contains Inf/NaN after temperature scaling"
+                );
             }
         }
 

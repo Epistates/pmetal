@@ -20,8 +20,8 @@
 use super::MergeMethod;
 use crate::{sign_consensus, MergeError, MergeParameters, Result};
 use mlx_rs::Array;
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 
 /// DARE merge implementation.
 #[derive(Debug, Clone)]

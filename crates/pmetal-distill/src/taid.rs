@@ -520,8 +520,7 @@ impl TaidDistiller {
                 let ce_array = target_log_probs.negative()?;
                 let masked_ce = ce_array.multiply(&valid_mask_f32)?;
                 let total_valid_sum = valid_mask_f32.sum(None)?;
-                let total_valid =
-                    mlx_rs::ops::maximum(&total_valid_sum, &Array::from_f32(1.0))?;
+                let total_valid = mlx_rs::ops::maximum(&total_valid_sum, &Array::from_f32(1.0))?;
                 Some(masked_ce.sum(None)?.divide(&total_valid)?)
             } else {
                 None

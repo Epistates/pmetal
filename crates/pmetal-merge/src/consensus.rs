@@ -195,7 +195,8 @@ mod tests {
         let t2 = Array::from_slice(&[-1.0_f32], &[1]);
         let t3 = Array::from_slice(&[1.0_f32], &[1]);
 
-        let result = sign_consensus(&[t1.clone(), t2.clone(), t3.clone()], &[1.0, 1.0, 1.0]).unwrap();
+        let result =
+            sign_consensus(&[t1.clone(), t2.clone(), t3.clone()], &[1.0, 1.0, 1.0]).unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();
         // Only t1 and t3 contribute (both agree with majority +1).
         assert!((result_slice[0] - 2.0).abs() < 1e-5);

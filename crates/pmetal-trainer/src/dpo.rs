@@ -306,11 +306,7 @@ impl DpoTrainer {
     ///
     /// # Returns
     /// Mean of log probabilities for non-ignored tokens [batch]
-    pub fn compute_log_probs_normalized(
-        &self,
-        logits: &Array,
-        labels: &Array,
-    ) -> DpoResult<Array> {
+    pub fn compute_log_probs_normalized(&self, logits: &Array, labels: &Array) -> DpoResult<Array> {
         // Shift logits and labels for next-token prediction
         let seq_len = logits.dim(1);
 
@@ -405,10 +401,7 @@ impl DpoTrainer {
             let ref_lp = mlx_rs::stop_gradient(&lp)?;
             (lp, ref_lp)
         } else {
-            self.compute_log_probs_with_stop_gradient_reference(
-                rejected_logits,
-                rejected_labels,
-            )?
+            self.compute_log_probs_with_stop_gradient_reference(rejected_logits, rejected_labels)?
         };
 
         // Compute DPO loss with these log probs

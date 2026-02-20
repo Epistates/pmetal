@@ -1,10 +1,10 @@
 //! Dataset types and loading.
 
+use super::chat_templates::{ChatTemplate, Message};
 use arrow::array::{Array as ArrowArray, StringArray};
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use pmetal_core::Result;
 use serde::Deserialize;
-use super::chat_templates::{ChatTemplate, Message};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -681,7 +681,8 @@ mod tests {
         writeln!(file, r#"{{"text": "Hello world"}}"#).unwrap();
         writeln!(file, r#"{{"text": "Another sample"}}"#).unwrap();
 
-        let samples = TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Simple, None).unwrap();
+        let samples =
+            TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Simple, None).unwrap();
 
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].text, "Hello world");
@@ -697,7 +698,8 @@ mod tests {
         )
         .unwrap();
 
-        let samples = TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Alpaca, None).unwrap();
+        let samples =
+            TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Alpaca, None).unwrap();
 
         assert_eq!(samples.len(), 1);
         assert!(samples[0].text.contains("Say hello"));
@@ -710,7 +712,8 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, r#"{{"text": "Auto detected"}}"#).unwrap();
 
-        let samples = TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Auto, None).unwrap();
+        let samples =
+            TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Auto, None).unwrap();
 
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].text, "Auto detected");
