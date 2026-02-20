@@ -32,9 +32,13 @@ struct RoPEParams {
 };
 
 /// Compute inverse frequency for a dimension index.
+/// Uses exp/log instead of pow for better throughput on Apple Silicon
+/// (pow is typically implemented as exp(log(x)*y) anyway, but explicit fast:: versions
+/// allow the compiler to use the fast-math unit).
 inline float inv_freq(uint dim_idx, uint dims, float base) {
-    // inv_freq = 1 / (base^(2i/dims))
-    return 1.0f / pow(base, float(2 * dim_idx) / float(dims));
+    // inv_freq = 1 / base^(2*i/dims)  =  exp(-log(base) * (2*i/dims))
+    float exponent = -metal::fast::log(base) * (float(2 * dim_idx) / float(dims));
+    return metal::fast::exp(exponent);
 }
 
 // =============================================================================
@@ -245,8 +249,8 @@ kernel void rope_qk_inplace(
 
     // Precompute sin/cos for this position (shared across heads)
     // Use threadgroup memory to share across threads
-    threadgroup float cos_cache[128];  // Max head_dim/2 = 128
-    threadgroup float sin_cache[128];
+    threadgroup float cos_cache[256];  // Support head_dim up to 512 (half_dim up to 256)
+    threadgroup float sin_cache[256];
 
     for (uint d = tid; d < half_dim; d += THREADS_PER_HEAD) {
         const float freq = inv_freq(d, params.head_dim, params.base);
@@ -306,8 +310,8 @@ kernel void rope_qk_with_positions(
     const float pos = float(position_ids[seq_idx]) * params.scale;
     const uint half_dim = params.head_dim / 2;
 
-    threadgroup float cos_cache[128];
-    threadgroup float sin_cache[128];
+    threadgroup float cos_cache[256];  // Support head_dim up to 512 (half_dim up to 256)
+    threadgroup float sin_cache[256];
 
     for (uint d = tid; d < half_dim; d += THREADS_PER_HEAD) {
         const float freq = inv_freq(d, params.head_dim, params.base);

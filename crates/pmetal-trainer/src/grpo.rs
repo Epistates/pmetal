@@ -358,7 +358,7 @@ impl GrpoTrainer {
             training_config,
             step: 0,
             reward_running_mean: 0.0,
-            reward_running_var: 1.0,
+            reward_running_var: 0.0,
             reward_count: 0,
         })
     }
@@ -434,13 +434,14 @@ impl GrpoTrainer {
                     // Compute group baseline (mean)
                     let baseline: f64 = group_rewards.iter().sum::<f64>() / group_size as f64;
 
-                    // Compute group std for optional whitening
+                    // Compute group std for optional whitening.
+                    // Use Bessel's correction (N-1) for an unbiased sample variance estimate.
                     let group_std = if self.config.whiten_advantages {
                         let var: f64 = group_rewards
                             .iter()
                             .map(|r| (r - baseline).powi(2))
                             .sum::<f64>()
-                            / group_size as f64;
+                            / (group_size - 1).max(1) as f64;
                         var.sqrt().max(1e-8)
                     } else {
                         1.0
@@ -453,11 +454,13 @@ impl GrpoTrainer {
                 }
             }
             AdvantageNormalization::Batch => {
-                // Batch-level normalization
+                // Batch-level normalization.
+                // Use Bessel's correction (N-1) for an unbiased sample variance estimate.
                 let mean: f64 = rewards.iter().sum::<f64>() / rewards.len() as f64;
                 let std = if self.config.whiten_advantages {
+                    let n = rewards.len();
                     let var: f64 = rewards.iter().map(|r| (r - mean).powi(2)).sum::<f64>()
-                        / rewards.len() as f64;
+                        / (n - 1).max(1) as f64;
                     var.sqrt().max(1e-8)
                 } else {
                     1.0
@@ -500,8 +503,17 @@ impl GrpoTrainer {
             policy_logps.subtract(ref_logps)?
         };
 
-        // KL divergence approximation: (ratio - 1) - log_ratio
-        // where ratio = exp(log_ratio)
+        // KL divergence approximation using the Schulman/GRPO form:
+        //   KL(ref || policy) ≈ (ratio - 1) - log(ratio)
+        // where ratio = p_ref / p_policy = exp(log_ref - log_policy).
+        //
+        // This computes reverse KL (mode-seeking), not forward KL.
+        // Reverse KL is the standard choice for GRPO per DeepSeekMath (2024) and
+        // the original PPO-clip derivation: it keeps the policy close to reference
+        // in a mode-seeking sense, avoiding averaging over reference modes.
+        //
+        // For forward KL KL(policy || ref), use instead:
+        //   ratio * log(ratio) - (ratio - 1)
         let ratio = log_ratio.exp()?;
         let one = Array::from_f32(1.0);
         let kl = ratio.subtract(&one)?.subtract(&log_ratio)?;
@@ -572,7 +584,8 @@ impl GrpoTrainer {
         advantages: &Array,
         mask: &Array,
     ) -> GrpoResult<(Array, Array)> {
-        // Per-token KL
+        // Per-token KL: same reverse-KL approximation as compute_grpo_loss.
+        // KL(ref || policy) ≈ (ratio - 1) - log(ratio), mode-seeking, standard for GRPO.
         let log_ratio = per_token_policy_logps.subtract(per_token_ref_logps)?;
         let ratio = log_ratio.exp()?;
         let one = Array::from_f32(1.0);

@@ -4544,6 +4544,7 @@ dependencies = [
  "parquet 55.2.0",
  "pmetal-core",
  "pmetal-data",
+ "pmetal-distill",
  "pmetal-gguf",
  "pmetal-hub",
  "pmetal-lora",

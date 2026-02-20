@@ -33,6 +33,14 @@ use crate::{LoraError, LoraLinear};
 /// Global counter for unique layer IDs (for FlashAttention caching).
 static LAYER_ID_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
+/// Reset the global layer ID counter to 0.
+///
+/// Must be called at model initialization to ensure layer IDs are assigned
+/// consistently from 0 for each new model instance.
+pub fn reset_layer_ids() {
+    LAYER_ID_COUNTER.store(0, Ordering::SeqCst);
+}
+
 /// LoRA-enabled attention layer for Qwen3.
 ///
 /// Applies LoRA to q_proj, k_proj, v_proj, and o_proj.
@@ -540,6 +548,9 @@ pub struct Qwen3LoraModel {
 impl Qwen3LoraModel {
     /// Create a new LoRA Qwen3 model.
     pub fn new(config: Qwen3Config, lora_config: LoraConfig) -> Result<Self, LoraError> {
+        // Reset layer ID counter so each model instance assigns IDs starting from 0.
+        reset_layer_ids();
+
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
 
         let layers = (0..config.num_hidden_layers)
@@ -624,9 +635,7 @@ impl Qwen3LoraModel {
             // MLX's lazy evaluation with unified memory handles memory pressure reasonably well.
             // True gradient checkpointing (save/recompute) would require custom VJP implementation.
             if checkpointing_enabled && (idx + 1) % layers_per_block == 0 {
-                tracing::trace!("Checkpoint boundary at layer {}", idx + 1);
-                // Future: Implement proper checkpointing with activation recomputation
-                // For now, rely on MLX's lazy evaluation for memory management
+                tracing::warn!("Gradient checkpointing requested but not yet implemented - no memory savings applied");
             }
         }
 
@@ -1265,6 +1274,7 @@ impl Qwen3LoraForCausalLM {
 
 /// Implement ModuleParameters for Qwen3LoraForCausalLM.
 impl ModuleParameters for Qwen3LoraForCausalLM {
+    /// Returns the number of trainable (LoRA) parameters.
     fn num_parameters(&self) -> usize {
         self.model.num_trainable_params()
     }
@@ -1584,7 +1594,7 @@ mod tests {
                 "v_proj".to_string(),
                 "o_proj".to_string(),
             ],
-            bias: "none".to_string(),
+            bias: pmetal_core::LoraBias::None,
             init_lora_weights: true,
             use_dora: false,
         }

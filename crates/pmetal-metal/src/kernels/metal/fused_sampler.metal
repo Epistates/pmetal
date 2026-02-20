@@ -112,12 +112,19 @@ inline float xorshift_random(thread uint& state) {
     return float(state) / float(0xFFFFFFFFu);
 }
 
+// HOST ALLOCATION NOTE for fused_sample_small:
+//   shared_logprobs [[threadgroup(0)]]: must be allocated as
+//       threads_per_tg * LOCAL_TOP_L * sizeof(float)   (= threads_per_tg * 4 * 4 bytes)
+//   shared_indices  [[threadgroup(1)]]: must be allocated as
+//       threads_per_tg * LOCAL_TOP_L * sizeof(uint)    (= threads_per_tg * 4 * 4 bytes)
+// where LOCAL_TOP_L = 4 (per-thread candidate count defined below).
+// Example: with 256 threads -> 256 * 4 * 4 = 4096 bytes each.
 kernel void fused_sample_small(
     device const float* logits [[buffer(0)]],
     device uint* output_token [[buffer(1)]],
     constant SamplingParams& params [[buffer(2)]],
-    threadgroup float* shared_logprobs [[threadgroup(0)]],
-    threadgroup uint* shared_indices [[threadgroup(1)]],
+    threadgroup float* shared_logprobs [[threadgroup(0)]],  // threads_per_tg * LOCAL_TOP_L floats
+    threadgroup uint* shared_indices [[threadgroup(1)]],    // threads_per_tg * LOCAL_TOP_L uints
     uint tid [[thread_index_in_threadgroup]],
     uint threads_per_tg [[threads_per_threadgroup]]
 ) {
@@ -214,8 +221,11 @@ kernel void fused_sample_small(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 3: Thread 0 merges all candidates into final top-K (serialized - no race)
+    // Threadgroup arrays must be declared at kernel function scope (MSL requirement),
+    // not inside conditional blocks.
     threadgroup float top_probs[MAX_TOP_K];
     threadgroup uint top_tokens[MAX_TOP_K];
+
     uint effective_k = (top_k > 0 && uint(top_k) < MAX_TOP_K) ? uint(top_k) : MAX_TOP_K;
 
     if (tid == 0) {

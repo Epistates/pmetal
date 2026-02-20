@@ -447,37 +447,23 @@ impl TrainingLoop {
     }
 
     /// Get current learning rate based on scheduler.
+    ///
+    /// Delegates to the canonical `pmetal_core::LearningRateScheduler` so all
+    /// trainers share a single, consistent LR computation path.
     pub fn get_learning_rate(&self) -> f32 {
-        let warmup = self.config.training.warmup_steps;
-        let total_steps = self.config.training.max_steps.unwrap_or(10000);
-        let base_lr = self.config.training.learning_rate as f32;
+        use pmetal_core::LearningRateScheduler;
 
-        if self.step < warmup {
-            // Linear warmup - protect against warmup=0
-            base_lr * (self.step as f32 / warmup.max(1) as f32)
-        } else {
-            // Protect against division-by-zero when total_steps <= warmup
-            let decay_steps = (total_steps.saturating_sub(warmup)).max(1) as f32;
-            let current = (self.step.saturating_sub(warmup)) as f32;
+        let cfg = &self.config.training;
+        let total_steps = cfg.max_steps.unwrap_or(10000);
 
-            match self.config.training.lr_scheduler {
-                LrSchedulerType::Constant => base_lr,
-                LrSchedulerType::Linear => base_lr * (1.0 - current / decay_steps).max(0.0),
-                LrSchedulerType::Cosine => {
-                    let progress = (current / decay_steps).min(1.0);
-                    base_lr * 0.5 * (1.0 + (std::f64::consts::PI as f32 * progress).cos())
-                }
-                LrSchedulerType::CosineWithRestarts => {
-                    // Simplified: treat as regular cosine
-                    let progress = (current / decay_steps).min(1.0);
-                    base_lr * 0.5 * (1.0 + (std::f64::consts::PI as f32 * progress).cos())
-                }
-                LrSchedulerType::Polynomial => {
-                    let progress = (current / decay_steps).min(1.0);
-                    base_lr * (1.0 - progress).powf(2.0) // power=2
-                }
-            }
-        }
+        let scheduler = LearningRateScheduler::new(
+            cfg.learning_rate,
+            total_steps,
+            cfg.warmup_steps,
+            cfg.lr_scheduler,
+        );
+
+        scheduler.get_lr(self.step) as f32
     }
 
     /// Compute loss for a batch.
@@ -495,7 +481,17 @@ impl TrainingLoop {
 
         // Compute cross entropy loss with ignore_index=-100
         let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
-        Ok(loss.mean(None)?)
+
+        // Compute masked mean: only average over non-ignored (-100) tokens.
+        // loss.mean(None) would incorrectly divide by all positions including
+        // ignored ones, producing an underestimated loss.
+        let mask = flat_labels.ne(&Array::from_slice(&[-100_i64], &[1]))?;
+        let valid_count_raw = mask
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .sum(None)?;
+        let valid_count = mlx_rs::ops::maximum(&valid_count_raw, &Array::from_f32(1.0))?;
+        let masked_loss = loss.multiply(&mask.as_dtype(loss.dtype())?)?;
+        Ok(masked_loss.sum(None)?.divide(&valid_count)?)
     }
 
     /// Clip gradients by global norm (GPU-based, no sync required).
@@ -524,12 +520,13 @@ impl TrainingLoop {
         // Compute norm = sqrt(sum) on GPU (lazy)
         let norm = norm_sq_sum.sqrt()?;
 
-        // Compute scale = min(1.0, max_norm / (norm + eps)) entirely on GPU
-        // Using: scale = max_norm / max(norm, max_norm) which clamps to [0, 1]
+        // Compute scale = min(1.0, max_norm / norm) entirely on GPU.
+        // `maximum(norm, max_norm)` clamps the denominator to [max_norm, ∞),
+        // so scale ∈ (0, 1].  No epsilon is needed: when norm < max_norm the
+        // clamped denominator equals max_norm (not zero), avoiding division by zero.
         let max_norm_arr = Array::from_f32(max_norm);
-        let eps = Array::from_f32(1e-6);
         let norm_clamped = mlx_rs::ops::maximum(&norm, &max_norm_arr)?;
-        let scale = max_norm_arr.divide(&norm_clamped.add(&eps)?)?;
+        let scale = max_norm_arr.divide(&norm_clamped)?;
 
         // Debug: check scale value
         static DEBUG_CLIP_ONCE: std::sync::Once = std::sync::Once::new();
@@ -1746,20 +1743,8 @@ impl TrainingLoop {
                         None => 0.0,
                     };
 
-                    // Compute learning rate from scheduler
-                    let total_steps = max_steps.unwrap_or(usize::MAX);
-                    let progress = (self.step as f64 / total_steps.max(1) as f64).min(1.0);
-                    let lr = match self.config.training.lr_scheduler {
-                        LrSchedulerType::Constant => base_lr as f64,
-                        LrSchedulerType::Linear => base_lr as f64 * (1.0 - progress),
-                        LrSchedulerType::Cosine | LrSchedulerType::CosineWithRestarts => {
-                            0.5 * base_lr as f64 * (1.0 + (std::f64::consts::PI * progress).cos())
-                        }
-                        LrSchedulerType::Polynomial => {
-                            let power = 2.0;
-                            base_lr as f64 * (1.0 - progress).powf(power)
-                        }
-                    };
+                    // Use canonical scheduler (includes warmup) for LR logging.
+                    let lr = self.get_learning_rate() as f64;
 
                     tracing::info!(
                         "Step {}: loss={:.4}, lr={:.2e}, tokens/s={:.0}",
@@ -2294,7 +2279,7 @@ mod tests {
                 "v_proj".to_string(),
                 "o_proj".to_string(),
             ],
-            bias: "none".to_string(),
+            bias: pmetal_core::LoraBias::None,
             init_lora_weights: true,
             use_dora: false,
         }

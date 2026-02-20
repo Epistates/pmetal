@@ -681,7 +681,7 @@ mod tests {
         writeln!(file, r#"{{"text": "Hello world"}}"#).unwrap();
         writeln!(file, r#"{{"text": "Another sample"}}"#).unwrap();
 
-        let samples = TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Simple).unwrap();
+        let samples = TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Simple, None).unwrap();
 
         assert_eq!(samples.len(), 2);
         assert_eq!(samples[0].text, "Hello world");
@@ -697,7 +697,7 @@ mod tests {
         )
         .unwrap();
 
-        let samples = TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Alpaca).unwrap();
+        let samples = TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Alpaca, None).unwrap();
 
         assert_eq!(samples.len(), 1);
         assert!(samples[0].text.contains("Say hello"));
@@ -710,7 +710,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         writeln!(file, r#"{{"text": "Auto detected"}}"#).unwrap();
 
-        let samples = TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Auto).unwrap();
+        let samples = TrainingDataset::load_jsonl_text(file.path(), DatasetFormat::Auto, None).unwrap();
 
         assert_eq!(samples.len(), 1);
         assert_eq!(samples[0].text, "Auto detected");

@@ -693,21 +693,18 @@ kernel void fused_hidden_mse_forward_simd(
 // KL DIVERGENCE BACKWARD
 // =============================================================================
 //
-// Gradient of KL(P || Q) w.r.t. student logits:
-//   dL/ds_i = -P(i) * (1/Q(i)) * dQ(i)/ds_i
-//           = -P(i) / Q(i) * Q(i) * (1{i=j} - Q(j))  [softmax jacobian]
-//           = -P(i) * (1 - Q(i))  for i=j
-//           = P(i) * Q(j)         for i≠j
+// Gradient of T^2 * KL(P || Q) w.r.t. unscaled student logit z_i:
+//   d/dz_i [T^2 * KL] = T^2 * d(KL)/d(z_i/T) * d(z_i/T)/dz_i
+//                      = T^2 * (Q(i) - P(i)) * (1/T)
+//                      = T * (Q(i) - P(i))
 //
-// Simplified: dL/ds = Q - P (gradient is student_probs - teacher_probs)
-//
-// With temperature: dL/ds = (Q - P) / T
+// Note: the loss is T^2-scaled so the gradient is (Q - P) * T, not (Q - P) / T.
 // =============================================================================
 
 /// KL divergence backward pass.
 ///
-/// Computes gradient of KL(teacher || student) w.r.t. student logits.
-/// Gradient = (student_probs - teacher_probs) / temperature
+/// Computes gradient of T^2 * KL(teacher || student) w.r.t. student logits.
+/// Gradient = (student_probs - teacher_probs) * temperature
 kernel void fused_kl_divergence_backward(
     device const float* teacher_logits [[buffer(0)]],
     device float* student_logits [[buffer(1)]],        // IN-PLACE gradient
@@ -731,8 +728,9 @@ kernel void fused_kl_divergence_backward(
     float p = exp(t_logit - teacher_lse[token_idx]);  // teacher prob
     float q = exp(s_logit - student_lse[token_idx]);  // student prob
 
-    // Gradient = upstream * (Q - P) / T
-    float grad = grad_loss[token_idx] * (q - p) / T;
+    // Gradient = upstream * (Q - P) * T
+    // Chain rule: d/dz [T^2 * KL] = T^2 * (Q-P) * (1/T) = T * (Q - P)
+    float grad = grad_loss[token_idx] * (q - p) * T;
 
     student_logits[idx] = grad;
 }
@@ -769,7 +767,8 @@ kernel void fused_kl_divergence_backward_simd(
         float p = exp(t_logit - t_lse);
         float q = exp(s_logit - s_lse);
 
-        student_logits[idx] = upstream * (q - p) / T;
+        // Gradient: T^2 * (Q-P) * (1/T) = T * (Q - P)
+        student_logits[idx] = upstream * (q - p) * T;
     }
 }
 
@@ -921,11 +920,12 @@ kernel void distill_reduce_mean(
     device float* output [[buffer(1)]],               // [1] scalar output
     constant uint& num_tokens [[buffer(2)]],
     uint tid [[thread_position_in_grid]],
-    uint lane_id [[thread_index_in_simdgroup]]
+    uint lane_id [[thread_index_in_simdgroup]],
+    uint grid_size [[threads_per_grid]]
 ) {
     float local_sum = 0.0f;
 
-    for (uint i = tid; i < num_tokens; i += 1024) {
+    for (uint i = tid; i < num_tokens; i += grid_size) {
         local_sum += losses[i];
     }
 
@@ -942,12 +942,12 @@ kernel void distill_reduce_mean(
 
 /// Soft Cross-Entropy backward pass.
 ///
-/// Gradient of CE(teacher_probs, student_logits) w.r.t. student logits.
-/// Same formula as KL: gradient = (student_probs - teacher_probs) / temperature
+/// Gradient of T^2 * CE(teacher_probs, student_logits) w.r.t. student logits.
+/// Same formula as KL: gradient = (student_probs - teacher_probs) * temperature
 ///
 /// This is because:
 /// CE(P, Q) = -∑ P(i) * log(Q(i))
-/// dCE/ds = Q - P (where Q = softmax(s))
+/// d/dz [T^2 * CE] = T^2 * (Q-P) * (1/T) = T * (Q - P) (where Q = softmax(z/T))
 kernel void fused_soft_cross_entropy_backward(
     device const float* teacher_logits [[buffer(0)]],
     device float* student_logits [[buffer(1)]],        // IN-PLACE gradient
@@ -971,8 +971,9 @@ kernel void fused_soft_cross_entropy_backward(
     float p = exp(t_logit - teacher_lse[token_idx]);  // teacher prob
     float q = exp(s_logit - student_lse[token_idx]);  // student prob
 
-    // Gradient = upstream * (Q - P) / T
-    float grad = grad_loss[token_idx] * (q - p) / T;
+    // Gradient = upstream * (Q - P) * T
+    // Chain rule: d/dz [T^2 * CE] = T^2 * (Q-P) * (1/T) = T * (Q - P)
+    float grad = grad_loss[token_idx] * (q - p) * T;
 
     student_logits[idx] = grad;
 }
@@ -1237,8 +1238,9 @@ kernel void fused_kl_divergence_forward_backward(
         // Accumulate KL loss: sum(P * (log_P - log_Q))
         local_kl += p * (log_p - log_q);
 
-        // Compute gradient: (Q - P) / T * upstream
-        g_row[v] = upstream * (q - p) / T;
+        // Compute gradient: T * (Q - P) * upstream
+        // Chain rule: d/dz [T^2 * KL] = T^2 * (Q-P) * (1/T) = T * (Q - P)
+        g_row[v] = upstream * (q - p) * T;
     }
 
     // Final loss reduction

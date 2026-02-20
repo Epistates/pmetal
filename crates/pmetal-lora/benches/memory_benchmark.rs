@@ -48,7 +48,7 @@ fn create_lora_config() -> LoraConfig {
             "up_proj".to_string(),
             "down_proj".to_string(),
         ],
-        bias: "none".to_string(),
+        bias: pmetal_core::LoraBias::None,
         init_lora_weights: true,
         use_dora: false,
     }

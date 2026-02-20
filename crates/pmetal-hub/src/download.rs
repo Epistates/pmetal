@@ -46,6 +46,10 @@ pub async fn download_model(
         .await
         .map_err(|e| pmetal_core::PMetalError::Hub(e.to_string()))?;
 
+    // Also download weights (safetensors)
+    tracing::info!("Downloading weights for {}...", model_id);
+    download_safetensors(model_id, revision, token).await?;
+
     // Return the parent directory (model cache location)
     Ok(config_path
         .parent()

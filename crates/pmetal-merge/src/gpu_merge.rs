@@ -155,20 +155,11 @@ impl GpuMerger {
         // Step 2: Batch sparsify (uses O(n) quickselect)
         let sparse_vectors = crate::sparsify_batch_by_magnitude(&task_vectors, densities)?;
 
-        // Step 3: Compute sign consensus
-        let consensus_mask = crate::sign_consensus(&sparse_vectors, weights)?;
+        // Step 3: Compute sign consensus (returns weighted sum of agreeing contributions).
+        let weighted_sum = crate::sign_consensus(&sparse_vectors, weights)?;
 
-        // Step 4: Compute masked weighted sum
-        let mut result = Array::zeros::<f32>(base.shape())?;
-
-        for (sparse, weight) in sparse_vectors.iter().zip(weights.iter()) {
-            let masked = sparse.multiply(&consensus_mask)?;
-            let weighted = masked.multiply(Array::from_f32(*weight))?;
-            result = result.add(&weighted)?;
-        }
-
-        // Step 5: Scale by lambda and add to base
-        result = result.multiply(Array::from_f32(lambda))?;
+        // Step 4: Scale by lambda and add to base
+        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
         Ok(base.add(&result)?)
     }
 
@@ -194,20 +185,11 @@ impl GpuMerger {
             .map(|(tv, &density)| sparsify_by_magnitude(tv, density))
             .collect::<Result<Vec<_>>>()?;
 
-        // Step 3: Compute sign consensus
-        let consensus_mask = crate::sign_consensus(&sparse_vectors, weights)?;
+        // Step 3: Compute sign consensus (returns weighted sum of agreeing contributions).
+        let weighted_sum = crate::sign_consensus(&sparse_vectors, weights)?;
 
-        // Step 4: Compute masked weighted sum
-        let mut result = Array::zeros::<f32>(base.shape())?;
-
-        for (sparse, weight) in sparse_vectors.iter().zip(weights.iter()) {
-            let masked = sparse.multiply(&consensus_mask)?;
-            let weighted = masked.multiply(Array::from_f32(*weight))?;
-            result = result.add(&weighted)?;
-        }
-
-        // Step 5: Scale by lambda and add to base
-        result = result.multiply(Array::from_f32(lambda))?;
+        // Step 4: Scale by lambda and add to base
+        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
         Ok(base.add(&result)?)
     }
 

@@ -25,6 +25,7 @@ use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 use mlx_rs::Dtype;
 use pmetal_core::TrainingConfig;
+use tracing;
 
 /// Error type for DPO training.
 #[derive(Debug, thiserror::Error)]
@@ -116,7 +117,7 @@ impl Default for DpoConfig {
             loss_type: DpoLossType::Sigmoid,
             label_smoothing: 0.0,
             reference_free: false,
-            use_stop_gradient_reference: true, // Recommended: memory-efficient reference
+            use_stop_gradient_reference: false, // Disabled by default: ref=policy eliminates KL
             simpo_gamma: 1.0,
             max_prompt_length: 512,
             max_completion_length: 512,
@@ -293,6 +294,43 @@ impl DpoTrainer {
         Ok(total_log_probs)
     }
 
+    /// Compute length-normalized log probabilities for SimPO.
+    ///
+    /// SimPO requires dividing by sequence length so that longer sequences are
+    /// not penalized relative to shorter ones. Uses mean instead of sum over
+    /// the token dimension.
+    ///
+    /// # Arguments
+    /// * `logits` - Model output logits [batch, seq_len, vocab_size]
+    /// * `labels` - Target labels [batch, seq_len] (-100 for ignored positions)
+    ///
+    /// # Returns
+    /// Mean of log probabilities for non-ignored tokens [batch]
+    pub fn compute_log_probs_normalized(
+        &self,
+        logits: &Array,
+        labels: &Array,
+    ) -> DpoResult<Array> {
+        // Shift logits and labels for next-token prediction
+        let seq_len = logits.dim(1);
+
+        let pred_logits = logits.index((.., ..seq_len - 1, ..));
+        let target_labels = labels.index((.., 1..));
+
+        let (per_token_logps, valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
+
+        // Length-normalize: divide sum by number of valid (non-ignored) tokens.
+        // This prevents bias toward longer sequences in SimPO.
+        let token_sum = per_token_logps.sum_axes(&[1i32], false)?;
+        let valid_count_raw = valid_mask
+            .as_dtype(mlx_rs::Dtype::Float32)?
+            .sum_axes(&[1i32], false)?;
+        let valid_count = mlx_rs::ops::maximum(&valid_count_raw, &Array::from_f32(1.0))?;
+
+        Ok(token_sum.divide(&valid_count)?)
+    }
+
     /// Compute both policy and reference log probabilities in a single pass.
     ///
     /// - Policy log probs: Normal computation (gradients flow)
@@ -315,6 +353,13 @@ impl DpoTrainer {
     ) -> DpoResult<(Array, Array)> {
         // Compute policy log probs normally (gradients will flow)
         let policy_log_probs = self.compute_log_probs(logits, labels)?;
+
+        // WARN: stop_gradient reference makes ref=policy, eliminating KL regularization.
+        // Users MUST provide a frozen reference model for proper DPO training.
+        tracing::warn!(
+            "DPO: stop_gradient reference makes ref=policy, eliminating KL regularization. \
+             Consider using a frozen reference model."
+        );
 
         // Create reference log probs using stop_gradient
         // This prevents gradient flow to reference, treating it as a constant
@@ -343,13 +388,28 @@ impl DpoTrainer {
         rejected_logits: &Array,
         rejected_labels: &Array,
     ) -> DpoResult<(Array, Array, Array)> {
-        // Compute policy and reference log probs for chosen
-        let (policy_chosen_logps, ref_chosen_logps) =
-            self.compute_log_probs_with_stop_gradient_reference(chosen_logits, chosen_labels)?;
+        // SimPO requires length-normalized log probs (mean over seq rather than sum)
+        let is_simpo = matches!(self.config.loss_type, DpoLossType::SimPo);
 
-        // Compute policy and reference log probs for rejected
-        let (policy_rejected_logps, ref_rejected_logps) =
-            self.compute_log_probs_with_stop_gradient_reference(rejected_logits, rejected_labels)?;
+        let (policy_chosen_logps, ref_chosen_logps) = if is_simpo {
+            // SimPO: use normalized log probs; reference is irrelevant but keep interface
+            let lp = self.compute_log_probs_normalized(chosen_logits, chosen_labels)?;
+            let ref_lp = mlx_rs::stop_gradient(&lp)?;
+            (lp, ref_lp)
+        } else {
+            self.compute_log_probs_with_stop_gradient_reference(chosen_logits, chosen_labels)?
+        };
+
+        let (policy_rejected_logps, ref_rejected_logps) = if is_simpo {
+            let lp = self.compute_log_probs_normalized(rejected_logits, rejected_labels)?;
+            let ref_lp = mlx_rs::stop_gradient(&lp)?;
+            (lp, ref_lp)
+        } else {
+            self.compute_log_probs_with_stop_gradient_reference(
+                rejected_logits,
+                rejected_labels,
+            )?
+        };
 
         // Compute DPO loss with these log probs
         self.compute_dpo_loss(
@@ -904,9 +964,9 @@ mod tests {
         let config_disabled = DpoConfig::new(0.1).with_stop_gradient_reference(false);
         assert!(!config_disabled.use_stop_gradient_reference);
 
-        // Default has stop_gradient enabled (recommended for memory efficiency)
+        // Default has stop_gradient disabled (ref=policy eliminates KL regularization)
         let config_default = DpoConfig::new(0.1);
-        assert!(config_default.use_stop_gradient_reference);
+        assert!(!config_default.use_stop_gradient_reference);
 
         // Can explicitly enable it
         let config_enabled = DpoConfig::new(0.1).with_stop_gradient_reference(true);

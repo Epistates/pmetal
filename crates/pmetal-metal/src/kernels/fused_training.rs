@@ -251,7 +251,7 @@ impl BatchCompletionToken {
     /// Wait and return an error if execution failed.
     ///
     /// Alias for `wait_checked()` for backwards compatibility.
-    #[deprecated(since = "0.2.0", note = "Use wait_checked() instead")]
+    #[deprecated(since = "0.1.0", note = "Use wait_checked() instead")]
     pub fn wait_and_check(&self) -> Result<()> {
         self.wait_checked()
     }

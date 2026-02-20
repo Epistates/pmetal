@@ -68,6 +68,14 @@ pub struct LossConfig {
     #[serde(default)]
     pub reverse_kl: bool,
 
+    /// Whether to use reasoning-aware (rationale) distillation.
+    #[serde(default)]
+    pub rationale: bool,
+
+    /// Weight for high-entropy (reasoning) tokens.
+    #[serde(default = "default_rationale_weight")]
+    pub rationale_weight: f32,
+
     /// Hidden state distillation configuration.
     #[serde(default)]
     pub hidden_state: Option<HiddenStateConfig>,
@@ -84,6 +92,8 @@ impl Default for LossConfig {
             temperature: default_temperature(),
             alpha: default_alpha(),
             reverse_kl: false,
+            rationale: false,
+            rationale_weight: default_rationale_weight(),
             hidden_state: None,
             attention: None,
         }
@@ -96,6 +106,10 @@ fn default_temperature() -> f32 {
 
 fn default_alpha() -> f32 {
     0.5
+}
+
+fn default_rationale_weight() -> f32 {
+    1.0
 }
 
 /// Loss function type.

@@ -150,8 +150,21 @@ impl SftTrainer {
 
     /// Perform a single training step on LoRA parameters.
     ///
-    /// This computes gradients and updates LoRA A and B matrices.
-    /// Supports optional pixel values for multimodal models.
+    /// # Deprecated
+    ///
+    /// This method only performs a forward pass and does **not** compute
+    /// gradients or update any parameters.  It exists for legacy compatibility
+    /// only and will be removed in a future release.
+    ///
+    /// The real training path lives in
+    /// `training_loop::TrainingLoop::compute_text_loss_and_grads`, which uses
+    /// `mlx_rs::nn::value_and_grad` to compute gradients and applies them via
+    /// the optimizer.  Use `TrainingLoop` directly for functional LoRA training.
+    #[deprecated(
+        since = "0.1.0",
+        note = "No backward pass is performed. Use `TrainingLoop::train` which calls \
+                `compute_text_loss_and_grads` for a complete forward+backward+update cycle."
+    )]
     pub fn train_step_lora(
         &mut self,
         lora_layers: &mut [&mut LoraLinear],
@@ -160,30 +173,15 @@ impl SftTrainer {
         labels: &Array,
         forward_fn: impl Fn(&[&LoraLinear], &Array, Option<&Array>) -> Result<Array>,
     ) -> Result<f64> {
-        // Collect LoRA parameters for gradient computation
-        let _lora_params: Vec<(&Array, &Array)> =
-            lora_layers.iter().map(|l| (&l.lora_a, &l.lora_b)).collect();
-
-        // Forward pass
+        // Forward pass only - no backward pass or parameter updates are
+        // performed here.  See the deprecation notice above.
         let lora_refs: Vec<&LoraLinear> = lora_layers.iter().map(|l| &**l).collect();
         let logits = forward_fn(&lora_refs, input_ids, pixel_values)?;
-
-        // Compute loss
         let loss = self.compute_loss(&logits, labels, None)?;
 
-        // Get scalar loss value
         loss.eval()?;
         let loss_value = loss.item::<f32>() as f64;
 
-        // Backward pass would be here using mlx_rs::transforms::grad
-        // For now, we just return the loss value
-        // In a full implementation, we would:
-        // 1. Use value_and_grad to get gradients
-        // 2. Accumulate gradients if using gradient accumulation
-        // 3. Apply gradient clipping if configured
-        // 4. Update parameters using the optimizer
-
-        // Update training state
         self.state.step += 1;
         self.state.loss = loss_value;
 
@@ -219,39 +217,22 @@ impl SftTrainer {
     }
 
     /// Update learning rate based on scheduler.
+    ///
+    /// Delegates to the canonical `pmetal_core::LearningRateScheduler`.
     pub fn update_learning_rate(&mut self) {
-        let step = self.state.step;
-        let warmup = self.config.warmup_steps;
-        let total_steps = self.config.max_steps.unwrap_or(10000);
-        let base_lr = self.config.learning_rate;
+        use pmetal_core::LearningRateScheduler;
 
-        self.state.learning_rate = match self.config.lr_scheduler {
-            pmetal_core::LrSchedulerType::Constant => base_lr,
-            pmetal_core::LrSchedulerType::Linear => {
-                if step < warmup {
-                    // Linear warmup
-                    base_lr * (step as f64 / warmup as f64)
-                } else {
-                    // Linear decay
-                    let decay_steps = total_steps.saturating_sub(warmup).max(1) as f64;
-                    let current = step.saturating_sub(warmup) as f64;
-                    base_lr * (1.0 - current / decay_steps).max(0.0)
-                }
-            }
-            pmetal_core::LrSchedulerType::Cosine => {
-                if step < warmup {
-                    // Linear warmup
-                    base_lr * (step as f64 / warmup as f64)
-                } else {
-                    // Cosine decay
-                    let decay_steps = total_steps.saturating_sub(warmup).max(1) as f64;
-                    let current = step.saturating_sub(warmup) as f64;
-                    let progress = current / decay_steps;
-                    base_lr * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
-                }
-            }
-            _ => base_lr,
-        };
+        let step = self.state.step;
+        let total_steps = self.config.max_steps.unwrap_or(10000);
+
+        let scheduler = LearningRateScheduler::new(
+            self.config.learning_rate,
+            total_steps,
+            self.config.warmup_steps,
+            self.config.lr_scheduler,
+        );
+
+        self.state.learning_rate = scheduler.get_lr(step);
     }
 
     /// Get current training state.

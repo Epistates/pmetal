@@ -23,8 +23,8 @@ use std::path::Path;
 /// [`Quantizable`]: pmetal_models::Quantizable
 /// [`TrainableModel`]: pmetal_lora::TrainableModel
 #[deprecated(
-    since = "0.2.0",
-    note = "Use CausalLMModel from pmetal_models instead. This trait will be removed in a future version."
+    since = "0.1.0",
+    note = "Use CausalLMModel from pmetal_models instead."
 )]
 pub trait PMetalModel: Send + Sync {
     /// The tensor type used by this model.
@@ -113,8 +113,8 @@ pub trait Dataset: Send + Sync {
 /// [`GrpoTrainer`]: pmetal_trainer::GrpoTrainer
 /// [`TrainingLoop`]: pmetal_trainer::TrainingLoop
 #[deprecated(
-    since = "0.2.0",
-    note = "Use concrete trainers from pmetal_trainer instead. This trait will be removed in a future version."
+    since = "0.1.0",
+    note = "Use concrete trainers from pmetal_trainer instead."
 )]
 #[allow(deprecated)]
 pub trait Trainer {

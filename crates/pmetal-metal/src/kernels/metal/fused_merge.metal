@@ -355,6 +355,17 @@ kernel void fused_partial_threshold(
 // DARE (Drop And REscale) Operations
 // =============================================================================
 
+/// Murmur3 finalization hash for deterministic per-element pseudo-randomness.
+/// Provides good avalanche effect: every output bit depends on every input bit.
+inline uint hash_murmur3(uint x) {
+    x ^= x >> 16;
+    x *= 0x85ebca6bu;
+    x ^= x >> 13;
+    x *= 0xc2b2ae35u;
+    x ^= x >> 16;
+    return x;
+}
+
 /// DARE sparsification: randomly drop elements and rescale
 /// Uses deterministic "random" based on element index and seed
 kernel void fused_dare_sparsify(
@@ -377,11 +388,9 @@ kernel void fused_dare_sparsify(
         return;
     }
 
-    // Simple hash-based "random" for reproducibility
-    uint hash = tid ^ seed;
-    hash = (hash * 0x45d9f3b + 0x12345678) ^ (hash >> 16);
-    hash = (hash * 0x45d9f3b + 0x12345678);
-    float rand = float(hash) / float(0xFFFFFFFF);
+    // Use Murmur3 finalization hash for better avalanche effect (MED-M5 fix).
+    // The previous 2-round hash had poor bit mixing and visible patterns.
+    float rand = float(hash_murmur3(tid ^ seed)) / float(0xFFFFFFFFu);
 
     // Keep with probability density, rescale by 1/density
     if (rand < density) {

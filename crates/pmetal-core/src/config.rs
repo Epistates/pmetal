@@ -58,6 +58,24 @@ impl Default for ModelConfig {
     }
 }
 
+/// Bias handling mode for LoRA layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LoraBias {
+    /// Do not train any bias parameters (recommended default).
+    None,
+    /// Train all bias parameters.
+    All,
+    /// Train only bias parameters associated with LoRA layers.
+    LoraOnly,
+}
+
+impl Default for LoraBias {
+    fn default() -> Self {
+        Self::None
+    }
+}
+
 /// LoRA configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoraConfig {
@@ -85,9 +103,9 @@ pub struct LoraConfig {
     #[serde(default)]
     pub use_dora: bool,
 
-    /// Bias handling: "none", "all", or "lora_only".
-    #[serde(default = "default_bias")]
-    pub bias: String,
+    /// Bias handling mode.
+    #[serde(default)]
+    pub bias: LoraBias,
 
     /// Initialize LoRA B to zero (recommended).
     #[serde(default = "default_true")]
@@ -103,7 +121,7 @@ impl Default for LoraConfig {
             target_modules: default_target_modules(),
             use_rslora: false,
             use_dora: false,
-            bias: default_bias(),
+            bias: LoraBias::default(),
             init_lora_weights: true,
         }
     }
@@ -341,9 +359,6 @@ fn default_target_modules() -> Vec<String> {
         "v_proj".into(),
         "o_proj".into(),
     ]
-}
-fn default_bias() -> String {
-    "none".into()
 }
 fn default_lr() -> f64 {
     2e-4

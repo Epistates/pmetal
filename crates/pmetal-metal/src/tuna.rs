@@ -104,14 +104,28 @@ impl Tuner {
 
     /// Get a cached merge configuration if available.
     pub fn get_merge_config(&self, key: &str) -> Option<MergeTunedConfig> {
-        let cache = self.merge_cache.lock().unwrap();
+        let cache = self
+            .merge_cache
+            .lock()
+            .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))
+            .ok()?;
         cache.get(key).copied()
     }
 
     /// Store a merge configuration in the cache.
     pub fn set_merge_config(&self, key: String, config: MergeTunedConfig) {
-        let mut cache = self.merge_cache.lock().unwrap();
-        cache.insert(key, config);
+        match self
+            .merge_cache
+            .lock()
+            .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))
+        {
+            Ok(mut cache) => {
+                cache.insert(key, config);
+            }
+            Err(e) => {
+                tracing::error!("Failed to acquire merge_cache lock: {}", e);
+            }
+        }
     }
 
     /// Tune the Fused LoRA Forward kernel.
@@ -130,7 +144,10 @@ impl Tuner {
 
         // 1. Check cache
         {
-            let cache = self.cache.lock().unwrap();
+            let cache = self
+                .cache
+                .lock()
+                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
             if let Some(&config) = cache.get(&key) {
                 return Ok(config);
             }
@@ -182,7 +199,10 @@ impl Tuner {
 
         // 4. Update cache
         {
-            let mut cache = self.cache.lock().unwrap();
+            let mut cache = self
+                .cache
+                .lock()
+                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
             cache.insert(key, best_config);
         }
 

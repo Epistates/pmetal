@@ -90,6 +90,15 @@ pub struct Adam8bitConfig {
     ///
     /// Smaller blocks preserve more precision for mixed-magnitude values
     /// at the cost of more scale factors. Must be >= 1.
+    ///
+    /// # Why 2048 instead of the standard 64
+    ///
+    /// The conventional bitsandbytes default is 64 elements per block.
+    /// This implementation uses 2048 (32× larger) as an intentional trade-off
+    /// tuned for Apple Silicon: larger blocks reduce the number of per-block
+    /// scale values stored, lowering memory overhead and improving cache
+    /// utilisation on the unified memory architecture.  The quantization
+    /// accuracy loss is acceptable for typical fine-tuning workloads.
     pub block_size: usize,
     /// Minimum absolute value to quantize (values below become 0).
     ///

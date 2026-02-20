@@ -66,23 +66,23 @@ pub struct RationaleLoss {
 
     /// Epsilon for numerical stability in log computations.
     pub eps: f32,
+
+    /// Cached Metal context for GPU acceleration.
+    #[cfg(feature = "metal")]
+    ctx: Option<std::sync::Arc<pmetal_metal::context::MetalContext>>,
 }
 
 impl RationaleLoss {
     /// Create a new Rationale Loss with the given reasoning weight.
-    ///
-    /// # Arguments
-    ///
-    /// * `reasoning_weight` - Multiplier for high-entropy tokens.
-    ///   A value of 1.0 means max weight is 2.0 (1.0 base + 1.0 * 1.0 max_entropy).
-    ///   A value of 2.0 means max weight is 3.0 for highest entropy tokens.
     pub fn new(reasoning_weight: f32) -> Self {
         Self {
             reasoning_weight,
             use_explicit_markers: false,
             start_marker: None,
             end_marker: None,
-            eps: 1e-10,
+            eps: 1e-6,
+            #[cfg(feature = "metal")]
+            ctx: pmetal_metal::context::MetalContext::global().ok(),
         }
     }
 
@@ -99,7 +99,9 @@ impl RationaleLoss {
             use_explicit_markers: true,
             start_marker: Some(start_marker.to_string()),
             end_marker: Some(end_marker.to_string()),
-            eps: 1e-10,
+            eps: 1e-6,
+            #[cfg(feature = "metal")]
+            ctx: pmetal_metal::context::MetalContext::global().ok(),
         }
     }
 
@@ -108,87 +110,63 @@ impl RationaleLoss {
         self.eps = eps;
         self
     }
-
-    /// Compute per-token KL divergence (not reduced to scalar).
-    ///
-    /// Returns shape: [batch, seq] (summed over vocab dimension only)
-    fn per_token_kl(
-        &self,
-        teacher_logits: &Array,
-        student_logits: &Array,
-        temperature: f32,
-    ) -> Result<Array> {
-        // Scale logits by temperature
-        let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp)?;
-        let student_scaled = student_logits.divide(&temp)?;
-
-        // Compute softmax probabilities
-        let teacher_probs = mlx_rs::ops::softmax_axis(&teacher_scaled, -1, None)?;
-        let student_probs = mlx_rs::ops::softmax_axis(&student_scaled, -1, None)?;
-
-        // Add epsilon for numerical stability
-        let eps = Array::from_f32(self.eps);
-        let teacher_safe = teacher_probs.add(&eps)?;
-        let student_safe = student_probs.add(&eps)?;
-
-        // Forward KL: KL(teacher || student) = sum(teacher * log(teacher / student))
-        let log_teacher = teacher_safe.log()?;
-        let log_student = student_safe.log()?;
-        let log_ratio = log_teacher.subtract(&log_student)?;
-        let kl_per_vocab = teacher_safe.multiply(&log_ratio)?;
-
-        // Sum over vocabulary dimension only → [batch, seq]
-        let kl_per_token = kl_per_vocab.sum_axis(-1, false)?;
-
-        Ok(kl_per_token)
-    }
-
-    /// Compute per-token entropy of teacher distribution.
-    ///
-    /// Returns shape: [batch, seq] (entropy of teacher at each position)
-    fn compute_entropy(&self, teacher_logits: &Array, temperature: f32) -> Result<Array> {
-        // Scale by temperature
-        let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp)?;
-
-        // Compute softmax probabilities
-        let probs = mlx_rs::ops::softmax_axis(&teacher_scaled, -1, None)?;
-
-        // Add epsilon for numerical stability
-        let eps = Array::from_f32(self.eps);
-        let probs_safe = probs.add(&eps)?;
-
-        // Entropy = -sum(p * log(p)) over vocab dimension
-        let log_probs = probs_safe.log()?;
-        let p_log_p = probs_safe.multiply(&log_probs)?;
-        let neg_entropy = p_log_p.sum_axis(-1, false)?; // [batch, seq]
-        let entropy = neg_entropy.multiply(&Array::from_f32(-1.0))?;
-
-        Ok(entropy)
-    }
-
-    /// Normalize entropy to [0, 1] range.
-    fn normalize_entropy(&self, entropy: &Array) -> Result<Array> {
-        // Max entropy for a distribution is log(vocab_size)
-        // But we use max observed entropy for relative weighting
-        let max_entropy = entropy.max(false)?;
-        max_entropy.eval()?;
-        let max_val: f32 = max_entropy.item();
-
-        if max_val > self.eps {
-            let normalized = entropy.divide(&Array::from_f32(max_val))?;
-            Ok(normalized)
-        } else {
-            // All zeros or very low entropy - return zeros
-            Ok(mlx_rs::ops::zeros::<f32>(entropy.shape())?)
-        }
-    }
 }
 
 impl Default for RationaleLoss {
     fn default() -> Self {
         Self::new(1.0)
+    }
+}
+
+impl RationaleLoss {
+    /// Compute per-token KL divergence between teacher and student distributions.
+    ///
+    /// Returns a `[batch, seq]` array containing KL(teacher_i || student_i) per token.
+    ///
+    /// # Arguments
+    /// * `teacher_logits` - Teacher logits `[batch, seq, vocab]`
+    /// * `student_logits` - Student logits `[batch, seq, vocab]`
+    /// * `temperature` - Softmax temperature
+    pub fn per_token_kl(
+        &self,
+        teacher_logits: &Array,
+        student_logits: &Array,
+        temperature: f32,
+    ) -> Result<Array> {
+        let temp = Array::from_f32(temperature);
+        let teacher_scaled = teacher_logits.divide(&temp)?;
+        let student_scaled = student_logits.divide(&temp)?;
+
+        let teacher_logprobs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
+        let student_logprobs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
+
+        let teacher_probs = teacher_logprobs.exp()?;
+        let log_ratio = teacher_logprobs.subtract(&student_logprobs)?;
+        let kl_per_vocab = teacher_probs.multiply(&log_ratio)?;
+
+        // Sum over vocab dimension -> [batch, seq]
+        Ok(kl_per_vocab.sum_axis(-1, false)?)
+    }
+
+    /// Compute per-token entropy of the teacher distribution.
+    ///
+    /// Returns a `[batch, seq]` array containing H(teacher_i) per token.
+    ///
+    /// # Arguments
+    /// * `teacher_logits` - Teacher logits `[batch, seq, vocab]`
+    /// * `temperature` - Softmax temperature
+    pub fn compute_entropy(&self, teacher_logits: &Array, temperature: f32) -> Result<Array> {
+        let temp = Array::from_f32(temperature);
+        let teacher_scaled = teacher_logits.divide(&temp)?;
+
+        let teacher_logprobs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
+        let teacher_probs = teacher_logprobs.exp()?;
+
+        // H = -sum(p * log(p)) over vocab -> [batch, seq]
+        let p_log_p = teacher_probs.multiply(&teacher_logprobs)?;
+        Ok(p_log_p
+            .sum_axis(-1, false)?
+            .multiply(&Array::from_f32(-1.0))?)
     }
 }
 
@@ -203,31 +181,53 @@ impl DistillLoss for RationaleLoss {
         student_logits: &Array,
         temperature: f32,
     ) -> Result<Array> {
-        // 1. Compute per-token KL divergence [batch, seq]
-        let kl_per_token = self.per_token_kl(teacher_logits, student_logits, temperature)?;
+        let temp = Array::from_f32(temperature);
+        let teacher_scaled = teacher_logits.divide(&temp)?;
+        let student_scaled = student_logits.divide(&temp)?;
 
-        // 2. Compute entropy of teacher distribution [batch, seq]
-        let entropy = self.compute_entropy(teacher_logits, temperature)?;
+        // 1. Compute per-token KL divergence stably
+        let teacher_logprobs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
+        let student_logprobs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
+        
+        let teacher_probs = teacher_logprobs.exp()?;
+        let log_ratio = teacher_logprobs.subtract(&student_logprobs)?;
+        let kl_per_vocab = teacher_probs.multiply(&log_ratio)?;
+        let kl_per_token = kl_per_vocab.sum_axis(-1, false)?;
 
-        // 3. Normalize entropy to [0, 1]
-        let normalized_entropy = self.normalize_entropy(&entropy)?;
+        // 2. Compute per-token entropy stably
+        let p_log_p = teacher_probs.multiply(&teacher_logprobs)?;
+        let entropy = p_log_p.sum_axis(-1, false)?.multiply(&Array::from_f32(-1.0))?;
 
-        // 4. Compute weight map: weight = 1.0 + reasoning_weight * normalized_entropy
-        // This gives higher weight to uncertain/reasoning tokens
+        // 3. Normalize entropy and compute weight map
+        let max_entropy = entropy.max(false)?;
+        max_entropy.eval()?;
+        let max_val: f32 = max_entropy.item();
+
+        let normalized_entropy = if max_val > 1e-6 {
+            entropy.divide(&Array::from_f32(max_val))?
+        } else {
+            mlx_rs::ops::zeros::<f32>(entropy.shape())?
+        };
+
         let weight_map = normalized_entropy
             .multiply(&Array::from_f32(self.reasoning_weight))?
             .add(&Array::from_f32(1.0))?;
 
-        // 5. Apply weights to per-token loss
+        // 4. Apply weights and compute mean
         let weighted_loss = kl_per_token.multiply(&weight_map)?;
-
-        // 6. Compute weighted mean (normalize by sum of weights for proper averaging)
+        
         let total_weighted_loss = weighted_loss.sum(false)?;
         let total_weights = weight_map.sum(false)?;
-
-        let mean_loss = total_weighted_loss.divide(&total_weights)?;
-
-        Ok(mean_loss)
+        
+        total_weighted_loss.eval()?;
+        total_weights.eval()?;
+        
+        let total_weights_val: f32 = total_weights.item();
+        if total_weights_val > 1e-6 {
+            Ok(total_weighted_loss.divide(&total_weights)?)
+        } else {
+            Ok(weighted_loss.mean(None)?)
+        }
     }
 }
 

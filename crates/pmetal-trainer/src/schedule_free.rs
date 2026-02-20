@@ -190,6 +190,10 @@ struct ParameterState {
     z: Array,
     /// Second moment estimate (v in the paper).
     v: Array,
+    /// Saved evaluation iterate (y before eval_mode clobbered params).
+    ///
+    /// Populated by `eval_mode`, cleared by `train_mode`.
+    y_saved: Option<Array>,
 }
 
 /// Schedule-Free AdamW Optimizer.
@@ -253,7 +257,7 @@ impl ScheduleFreeOptimizer {
             let z = p.clone();
             let v = mlx_rs::ops::zeros::<f32>(p.shape())?;
 
-            self.state.push(ParameterState { z, v });
+            self.state.push(ParameterState { z, v, y_saved: None });
         }
 
         self.initialized = true;
@@ -305,6 +309,12 @@ impl ScheduleFreeOptimizer {
             });
         }
 
+        // Compute c_k before incrementing the step counter so that step k uses
+        // the warmup factor for step k (not k+1).  See Defazio & Mishchenko 2024
+        // Algorithm 1: c_k = min(1, (k+1)/warmup) * beta1, where k is 0-indexed.
+        let c_k = self.compute_ck();
+
+        // Advance step counter after c_k is computed to avoid the off-by-one.
         self.step += 1;
 
         // Precompute scalars as arrays for broadcasting
@@ -313,9 +323,6 @@ impl ScheduleFreeOptimizer {
         let one_minus_beta2 = array!(1.0 - self.config.beta2);
         let eps = array!(self.config.eps);
         let wd = array!(self.config.weight_decay);
-
-        // Compute interpolation coefficient
-        let c_k = self.compute_ck();
         let ck_arr = array!(c_k);
         let one_minus_ck = array!(1.0 - c_k);
 
@@ -355,20 +362,79 @@ impl ScheduleFreeOptimizer {
         Ok(())
     }
 
-    /// Switch parameters to "Evaluation" mode.
+    /// Switch parameters to evaluation mode per the Schedule-Free paper.
     ///
-    /// In this implementation, `params` always holds `y` between steps,
-    /// so this is effectively a no-op. It's provided for API consistency.
-    pub fn eval_mode(&self) {
-        // No-op: params are already y (evaluation weights)
+    /// Computes the evaluation point via weighted interpolation between
+    /// the primal (z) and the current iterate (x = params):
+    ///
+    /// ```text
+    /// y = (1 - 1/c_k) * z + (1/c_k) * x
+    /// ```
+    ///
+    /// where `c_k` is the interpolation coefficient at the current step.
+    /// The original `y` (iterate) is saved internally so `train_mode` can
+    /// restore it.
+    ///
+    /// Call this before evaluation or checkpointing. Call `train_mode` before
+    /// resuming gradient steps.
+    ///
+    /// Reference: Defazio & Mishchenko (2024), Algorithm 1.
+    pub fn eval_mode(&mut self, params: &mut [Array]) -> ScheduleFreeResult<()> {
+        if !self.initialized {
+            return Err(ScheduleFreeError::StateNotInitialized);
+        }
+        if params.len() != self.state.len() {
+            return Err(ScheduleFreeError::ParameterMismatch {
+                expected: self.state.len(),
+                actual: params.len(),
+            });
+        }
+
+        let c_k = self.compute_ck();
+        // Guard against c_k == 0 at the very first step (before any updates).
+        let inv_ck = if c_k > 0.0 { 1.0 / c_k } else { 1.0 };
+        let w_z = array!(1.0 - inv_ck);
+        let w_x = array!(inv_ck);
+
+        for (i, param) in params.iter_mut().enumerate() {
+            let state = &mut self.state[i];
+            // Save the current iterate y so train_mode can restore it.
+            state.y_saved = Some(param.clone());
+            // Compute evaluation point: y = (1 - 1/c_k) * z + (1/c_k) * x
+            let z_part = state.z.multiply(&w_z)?;
+            let x_part = param.multiply(&w_x)?;
+            *param = z_part.add(&x_part)?;
+        }
+
+        Ok(())
     }
 
-    /// Switch parameters to "Train" mode.
+    /// Restore parameters to train mode after an `eval_mode` call.
     ///
-    /// In this implementation, `params` always holds `y` between steps,
-    /// so this is effectively a no-op. It's provided for API consistency.
-    pub fn train_mode(&self) {
-        // No-op: params are already y (evaluation weights)
+    /// Copies the saved iterate `y` back into `params`, reversing the
+    /// interpolation performed by `eval_mode`.
+    ///
+    /// Reference: Defazio & Mishchenko (2024), Algorithm 1.
+    pub fn train_mode(&mut self, params: &mut [Array]) -> ScheduleFreeResult<()> {
+        if !self.initialized {
+            return Err(ScheduleFreeError::StateNotInitialized);
+        }
+        if params.len() != self.state.len() {
+            return Err(ScheduleFreeError::ParameterMismatch {
+                expected: self.state.len(),
+                actual: params.len(),
+            });
+        }
+
+        for (i, param) in params.iter_mut().enumerate() {
+            let state = &mut self.state[i];
+            if let Some(y) = state.y_saved.take() {
+                *param = y;
+            }
+            // If y_saved is None we were already in train mode; leave param as-is.
+        }
+
+        Ok(())
     }
 
     /// Finalize the optimizer by copying the conservative estimate to params.

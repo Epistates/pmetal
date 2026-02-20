@@ -218,81 +218,121 @@ impl BlockQ8K {
 // =============================================================================
 
 /// Dequantize Q2K block to f32.
+///
+/// Layout: 256 elements split into 16 sub-blocks of 16 elements each.
+/// - `scales[i]`: lower nibble = scale for sub-block i, upper nibble = min for sub-block i
+/// - `qs[j]`: 4 elements packed as 2 bits each; within a 128-element chunk the same 32 qs
+///   bytes are re-used across 4 shift passes (shift = 0, 2, 4, 6), reading a fresh pair of
+///   scale bytes each pass.
+///
+/// Reference: Candle `BlockQ2K::to_float` (candle-core/src/quantized/k_quants.rs)
 pub fn dequantize_q2k(block: &BlockQ2K, output: &mut [f32; QK_K]) {
     let d = block.d.to_f32();
-    let dmin = block.dmin.to_f32();
+    let min = block.dmin.to_f32();
 
-    let mut idx = 0;
-    for j in (0..QK_K).step_by(128) {
-        // Process 8 sub-blocks of 16 elements
-        for l in 0..32 {
-            let scale_idx = j / 16 + l / 4;
-            let is_upper = (l / 4) % 2 == 1;
+    let mut out_idx = 0;
+    let mut is = 0usize; // index into block.scales
 
-            let sc = if is_upper {
-                (block.scales[scale_idx / 2] >> 4) & 0xF
-            } else {
-                block.scales[scale_idx / 2] & 0xF
-            };
-
-            let dl = d * sc as f32;
-
-            // Extract 2-bit values
-            let byte_idx = (j + l * 4) / 4;
-            for k in 0..4 {
-                let q = (block.qs[byte_idx] >> (k * 2)) & 3;
-                output[idx] = dl * q as f32 - dmin;
-                idx += 1;
+    // Two 128-element halves; each half uses 32 qs bytes and 8 scale bytes.
+    for qs in block.qs.chunks_exact(32) {
+        // 4 shift passes of 64 output elements each (2 sub-blocks of 16 per pass).
+        let mut shift = 0u32;
+        for _j in 0..4 {
+            // First sub-block of 16: qs bytes [0..16], scale byte `is`
+            let sc = block.scales[is];
+            is += 1;
+            let dl = d * (sc & 0xF) as f32;
+            let ml = min * (sc >> 4) as f32;
+            for q in &qs[..16] {
+                output[out_idx] = dl * ((q >> shift) & 3) as f32 - ml;
+                out_idx += 1;
             }
+
+            // Second sub-block of 16: qs bytes [16..32], scale byte `is`
+            let sc = block.scales[is];
+            is += 1;
+            let dl = d * (sc & 0xF) as f32;
+            let ml = min * (sc >> 4) as f32;
+            for q in &qs[16..] {
+                output[out_idx] = dl * ((q >> shift) & 3) as f32 - ml;
+                out_idx += 1;
+            }
+
+            shift += 2;
         }
     }
 }
 
 /// Dequantize Q3K block to f32.
+///
+/// Scale encoding: 12 bytes encode 16 signed 6-bit values (bias 32, range -32..31).
+/// The reconstruction uses a u32-mask approach identical to the GGML reference and Candle:
+///   aux[0..3] = little-endian u32 from scales[0..12] (3 values)
+///   tmp = aux[2]  (the third u32 holds the upper-2-bit extensions)
+///   aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4)
+///   aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4)
+///   aux[0] = ( aux[0]       & KMASK2) | (((tmp     ) & KMASK1) << 4)
+///   aux[1] = ( aux[1]       & KMASK2) | (((tmp >> 2) & KMASK1) << 4)
+/// The 16 bytes of aux[0..4] then hold the 16 unsigned 6-bit scale values; subtract 32 for
+/// the signed result.
+///
+/// Reference: Candle `BlockQ3K::to_float` (candle-core/src/quantized/k_quants.rs)
 pub fn dequantize_q3k(block: &BlockQ3K, output: &mut [f32; QK_K]) {
     let d = block.d.to_f32();
 
-    // Decode scales from packed representation
+    // Decode 16 x 6-bit signed scales from the 12-byte packed representation.
+    const KMASK1: u32 = 0x03030303;
+    const KMASK2: u32 = 0x0f0f0f0f;
+
+    let mut aux = [0u32; 4];
+    aux[0] = u32::from_le_bytes([block.scales[0], block.scales[1], block.scales[2], block.scales[3]]);
+    aux[1] = u32::from_le_bytes([block.scales[4], block.scales[5], block.scales[6], block.scales[7]]);
+    aux[2] = u32::from_le_bytes([block.scales[8], block.scales[9], block.scales[10], block.scales[11]]);
+
+    let tmp = aux[2];
+    aux[2] = ((aux[0] >> 4) & KMASK2) | (((tmp >> 4) & KMASK1) << 4);
+    aux[3] = ((aux[1] >> 4) & KMASK2) | (((tmp >> 6) & KMASK1) << 4);
+    aux[0] = (aux[0] & KMASK2) | (((tmp) & KMASK1) << 4);
+    aux[1] = (aux[1] & KMASK2) | (((tmp >> 2) & KMASK1) << 4);
+
+    // Reinterpret the 16 bytes as i8 and subtract 32 to get signed scales.
     let mut scales = [0i8; 16];
-    let mut aux = [0u8; 8];
-
-    for i in 0..4 {
-        aux[i] = block.scales[i] & 0x3F;
-        aux[i + 4] = block.scales[i + 4] & 0x3F;
+    for (i, chunk) in aux.iter().enumerate() {
+        let bytes = chunk.to_le_bytes();
+        for (j, &b) in bytes.iter().enumerate() {
+            scales[i * 4 + j] = (b as i8).wrapping_sub(32);
+        }
     }
 
-    // Handle upper bits
-    for i in 0..4 {
-        let upper = block.scales[8 + i] & 3;
-        aux[i] |= upper << 6;
-        let upper = (block.scales[8 + i] >> 2) & 3;
-        aux[i + 4] |= upper << 6;
-    }
+    // Dequantize elements.
+    //
+    // Layout: 256 elements, 2 x 128-element chunks. Each chunk has 32 qs bytes.
+    // Each qs byte holds one 2-bit value per shift pass (shift 0,2,4,6 across 4 passes).
+    // Each hmask byte (one per qs position) contributes one high bit per pass via bitmask m.
+    // Within a 128-chunk there are 4 passes of 32 output elements, each pass split into
+    // two 16-element sub-blocks with independent scales.
+    let mut is = 0usize;
+    let mut m = 1u8; // bitmask into hmask bytes: cycles 1,2,4,8,16,32,64,128
 
-    for i in 0..8 {
-        scales[i] = (aux[i] as i8).wrapping_sub(32);
-        scales[i + 8] = (aux[i] as i8).wrapping_sub(32);
-    }
-
-    let mut idx = 0;
-    for j in (0..QK_K).step_by(128) {
-        for l in 0..32 {
-            let scale_idx = j / 16 + l / 4;
-            let dl = d * scales[scale_idx] as f32;
-
-            for k in 0..4 {
-                let byte_idx = (j + l * 4 + k) / 4;
-                let shift = ((j + l * 4 + k) % 4) * 2;
-                let q_low = (block.qs[byte_idx] >> shift) & 3;
-
-                let hmask_idx = (j + l * 4 + k) / 8;
-                let hmask_shift = (j + l * 4 + k) % 8;
-                let q_high = ((block.hmask[hmask_idx] >> hmask_shift) & 1) << 2;
-
-                let q = (q_low | q_high) as i8 - 4;
-                output[idx] = dl * q as f32;
-                idx += 1;
+    for (out_128, qs) in output
+        .chunks_exact_mut(128)
+        .zip(block.qs.chunks_exact(32))
+    {
+        let mut shift = 0u32;
+        for shift_chunk in out_128.chunks_exact_mut(32) {
+            for (scale_index, scale_chunk) in shift_chunk.chunks_exact_mut(16).enumerate() {
+                let dl = d * scales[is] as f32;
+                is += 1;
+                for (i, out_val) in scale_chunk.iter_mut().enumerate() {
+                    let qs_idx = i + 16 * scale_index;
+                    let q_low = (qs[qs_idx] >> shift) & 3;
+                    let q_high = if block.hmask[qs_idx] & m != 0 { 0i8 } else { -4i8 };
+                    let q = q_low as i8 + q_high;
+                    *out_val = dl * q as f32;
+                }
             }
+            shift += 2;
+            m <<= 1;
         }
     }
 }
@@ -405,34 +445,35 @@ pub fn dequantize_q5k(block: &BlockQ5K, output: &mut [f32; QK_K]) {
 }
 
 /// Dequantize Q6K block to f32.
+///
+/// Layout: 256 elements split into two 128-element chunks, each processed with a single
+/// `for l in 0..32` loop that writes 4 output positions simultaneously:
+///   - ys[l]      uses ql[l]      (low nibble) | (qh[l] bits 0-1) << 4  -> scale sc[l/16]
+///   - ys[l+32]   uses ql[l+32]   (low nibble) | (qh[l] bits 2-3) << 4  -> scale sc[l/16 + 2]
+///   - ys[l+64]   uses ql[l]      (high nibble) | (qh[l] bits 4-5) << 4 -> scale sc[l/16 + 4]
+///   - ys[l+96]   uses ql[l+32]   (high nibble) | (qh[l] bits 6-7) << 4 -> scale sc[l/16 + 6]
+///
+/// Reference: Candle `BlockQ6K::to_float` (candle-core/src/quantized/k_quants.rs)
 pub fn dequantize_q6k(block: &BlockQ6K, output: &mut [f32; QK_K]) {
     let d = block.d.to_f32();
 
-    let mut idx = 0;
+    for n in (0..QK_K).step_by(128) {
+        let chunk_idx = n / 128;
+        let ys = &mut output[n..n + 128];
+        let sc = &block.scales[8 * chunk_idx..];
+        let ql = &block.ql[64 * chunk_idx..];
+        let qh = &block.qh[32 * chunk_idx..];
 
-    for j in (0..QK_K).step_by(128) {
         for l in 0..32 {
-            let scale_idx = j / 16 + l / 4;
-            let sc = block.scales[scale_idx];
-            let dl = d * sc as f32;
-
-            for k in 0..4 {
-                let global_idx = j + l * 4 + k;
-                let ql_idx = global_idx / 2;
-                let ql_nibble = if global_idx % 2 == 0 {
-                    block.ql[ql_idx] & 0xF
-                } else {
-                    block.ql[ql_idx] >> 4
-                };
-
-                let qh_idx = global_idx / 4;
-                let qh_shift = (global_idx % 4) * 2;
-                let qh_bits = (block.qh[qh_idx] >> qh_shift) & 3;
-
-                let q = (ql_nibble | (qh_bits << 4)) as i8 - 32;
-                output[idx] = dl * q as f32;
-                idx += 1;
-            }
+            let is = l / 16; // 0 or 1 within this chunk's 32-element l-range
+            let q1 = ((ql[l] & 0xF) | ((qh[l] & 3) << 4)) as i8 - 32;
+            let q2 = ((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) as i8 - 32;
+            let q3 = ((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) as i8 - 32;
+            let q4 = ((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) as i8 - 32;
+            ys[l] = d * sc[is] as f32 * q1 as f32;
+            ys[l + 32] = d * sc[is + 2] as f32 * q2 as f32;
+            ys[l + 64] = d * sc[is + 4] as f32 * q3 as f32;
+            ys[l + 96] = d * sc[is + 6] as f32 * q4 as f32;
         }
     }
 }

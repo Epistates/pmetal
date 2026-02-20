@@ -69,9 +69,9 @@ pub struct DapoConfig {
     /// Default: 0.28 (DAPO paper default)
     pub clip_eps_high: f64,
 
-    /// Lower clip bound is effectively disabled in DAPO.
-    /// Set to negative infinity for true DAPO, or small positive for stability.
-    /// Default: 0.2 (slightly positive for numerical stability)
+    /// Lower clip bound is effectively disabled in DAPO (Clip-Higher strategy).
+    /// True DAPO semantics require 0.0 here so only the upper bound is enforced.
+    /// Default: 0.0
     pub clip_eps_low: f64,
 
     /// Enable dynamic sampling - skip prompts where all completions have same reward.
@@ -123,6 +123,14 @@ pub struct DapoConfig {
     /// Minimum group size after dynamic sampling to proceed with update.
     /// Default: 2
     pub min_group_size: usize,
+
+    /// Reward threshold used when computing group accuracy.
+    ///
+    /// A completion is counted as "correct" when its reward strictly exceeds
+    /// this value.  Set to `0.0` (default) to count any positive reward as
+    /// correct, or to a higher value for stricter binary scoring.
+    /// Default: 0.0
+    pub accuracy_reward_threshold: f64,
 }
 
 impl Default for DapoConfig {
@@ -131,7 +139,7 @@ impl Default for DapoConfig {
             num_generations: 16,
             beta: 0.0, // DAPO disables KL
             clip_eps_high: 0.28,
-            clip_eps_low: 0.2, // Slightly positive for stability
+            clip_eps_low: 0.0, // True DAPO: Clip-Higher only (no lower clipping)
             dynamic_sampling: true,
             dynamic_sampling_min_accuracy: 0.01,
             overlong_penalty: -1.0,
@@ -144,6 +152,7 @@ impl Default for DapoConfig {
             entropy_coef: 0.001,
             normalize_advantages: true,
             min_group_size: 2,
+            accuracy_reward_threshold: 0.0,
         }
     }
 }
@@ -287,19 +296,27 @@ impl DapoPromptGroup {
     }
 
     /// Add a completion to this group.
-    pub fn add_completion(&mut self, completion: DapoCompletion) {
+    ///
+    /// `accuracy_threshold` should come from `DapoConfig::accuracy_reward_threshold`.
+    pub fn add_completion(&mut self, completion: DapoCompletion, accuracy_threshold: f64) {
         self.completions.push(completion);
-        self.update_accuracy();
+        self.update_accuracy(accuracy_threshold);
     }
 
-    /// Update computed accuracy.
-    fn update_accuracy(&mut self) {
+    /// Update computed accuracy using the given reward threshold.
+    ///
+    /// A completion is counted as correct when `reward > threshold`.
+    /// Use `DapoConfig::accuracy_reward_threshold` as the threshold value.
+    pub fn update_accuracy(&mut self, threshold: f64) {
         if self.completions.is_empty() {
             self.accuracy = 0.0;
             return;
         }
-        // Accuracy = fraction of positive rewards (correct answers)
-        let correct = self.completions.iter().filter(|c| c.reward > 0.0).count();
+        let correct = self
+            .completions
+            .iter()
+            .filter(|c| c.reward > threshold)
+            .count();
         self.accuracy = correct as f64 / self.completions.len() as f64;
     }
 
@@ -398,7 +415,7 @@ impl DapoTrainer {
                 }
             }
             // Update group accuracy after penalty
-            group.update_accuracy();
+            group.update_accuracy(self.config.accuracy_reward_threshold);
         }
     }
 
@@ -488,10 +505,11 @@ impl DapoTrainer {
         // Token-level loss: -clipped_ratio * advantage
         let token_loss = ratio_clipped.multiply(&adv_expanded)?.negative()?;
 
-        // Masked mean over all tokens
+        // Masked mean over all tokens, guarded against division by zero
         let masked_loss = token_loss.multiply(mask)?;
         let total_tokens = mask.sum(None)?;
-        let mean_loss = masked_loss.sum(None)?.divide(&total_tokens)?;
+        let safe_count = mlx_rs::ops::maximum(&total_tokens, &Array::from_f32(1.0))?;
+        let mean_loss = masked_loss.sum(None)?.divide(&safe_count)?;
 
         Ok((mean_loss, clip_frac))
     }
@@ -756,10 +774,10 @@ mod tests {
     fn test_dapo_prompt_group() {
         let mut group = DapoPromptGroup::new(vec![1, 2]);
 
-        group.add_completion(DapoCompletion::new(vec![3, 4], 1.0, false));
-        group.add_completion(DapoCompletion::new(vec![5, 6], 0.0, false));
-        group.add_completion(DapoCompletion::new(vec![7, 8], 1.0, true));
-        group.add_completion(DapoCompletion::new(vec![9, 10], -1.0, false));
+        group.add_completion(DapoCompletion::new(vec![3, 4], 1.0, false), 0.0);
+        group.add_completion(DapoCompletion::new(vec![5, 6], 0.0, false), 0.0);
+        group.add_completion(DapoCompletion::new(vec![7, 8], 1.0, true), 0.0);
+        group.add_completion(DapoCompletion::new(vec![9, 10], -1.0, false), 0.0);
 
         assert_eq!(group.len(), 4);
         // 2 positive, 2 non-positive -> accuracy = 0.5
@@ -774,8 +792,8 @@ mod tests {
         let trainer = DapoTrainer::new(config).unwrap();
 
         let mut groups = vec![DapoPromptGroup::new(vec![1, 2])];
-        groups[0].add_completion(DapoCompletion::new(vec![3, 4], 1.0, false));
-        groups[0].add_completion(DapoCompletion::new(vec![5, 6], 1.0, true)); // truncated
+        groups[0].add_completion(DapoCompletion::new(vec![3, 4], 1.0, false), 0.0);
+        groups[0].add_completion(DapoCompletion::new(vec![5, 6], 1.0, true), 0.0); // truncated
 
         trainer.apply_overlong_penalty(&mut groups);
 
@@ -790,18 +808,18 @@ mod tests {
 
         // Group 1: All correct (accuracy = 1.0) -> skip
         let mut g1 = DapoPromptGroup::new(vec![1]);
-        g1.add_completion(DapoCompletion::new(vec![2], 1.0, false));
-        g1.add_completion(DapoCompletion::new(vec![3], 1.0, false));
+        g1.add_completion(DapoCompletion::new(vec![2], 1.0, false), 0.0);
+        g1.add_completion(DapoCompletion::new(vec![3], 1.0, false), 0.0);
 
         // Group 2: All wrong (accuracy = 0.0) -> skip
         let mut g2 = DapoPromptGroup::new(vec![4]);
-        g2.add_completion(DapoCompletion::new(vec![5], 0.0, false));
-        g2.add_completion(DapoCompletion::new(vec![6], 0.0, false));
+        g2.add_completion(DapoCompletion::new(vec![5], 0.0, false), 0.0);
+        g2.add_completion(DapoCompletion::new(vec![6], 0.0, false), 0.0);
 
         // Group 3: Mixed (accuracy = 0.5) -> keep
         let mut g3 = DapoPromptGroup::new(vec![7]);
-        g3.add_completion(DapoCompletion::new(vec![8], 1.0, false));
-        g3.add_completion(DapoCompletion::new(vec![9], 0.0, false));
+        g3.add_completion(DapoCompletion::new(vec![8], 1.0, false), 0.0);
+        g3.add_completion(DapoCompletion::new(vec![9], 0.0, false), 0.0);
 
         let groups = vec![g1, g2, g3];
         let keep = trainer.dynamic_sample(&groups);
@@ -816,10 +834,10 @@ mod tests {
         let trainer = DapoTrainer::new(config).unwrap();
 
         let mut group = DapoPromptGroup::new(vec![1]);
-        group.add_completion(DapoCompletion::new(vec![2], 1.0, false));
-        group.add_completion(DapoCompletion::new(vec![3], 3.0, false));
-        group.add_completion(DapoCompletion::new(vec![4], 2.0, false));
-        group.add_completion(DapoCompletion::new(vec![5], 2.0, false));
+        group.add_completion(DapoCompletion::new(vec![2], 1.0, false), 0.0);
+        group.add_completion(DapoCompletion::new(vec![3], 3.0, false), 0.0);
+        group.add_completion(DapoCompletion::new(vec![4], 2.0, false), 0.0);
+        group.add_completion(DapoCompletion::new(vec![5], 2.0, false), 0.0);
 
         let mut groups = vec![group];
         trainer.compute_advantages(&mut groups);
@@ -863,10 +881,10 @@ mod tests {
             DapoPromptGroup::new(vec![3, 4]),
         ];
 
-        groups[0].add_completion(DapoCompletion::new(vec![5, 6], 1.0, false));
-        groups[0].add_completion(DapoCompletion::new(vec![7, 8], 0.0, false));
-        groups[1].add_completion(DapoCompletion::new(vec![9, 10], 2.0, false));
-        groups[1].add_completion(DapoCompletion::new(vec![11, 12], 1.0, true));
+        groups[0].add_completion(DapoCompletion::new(vec![5, 6], 1.0, false), 0.0);
+        groups[0].add_completion(DapoCompletion::new(vec![7, 8], 0.0, false), 0.0);
+        groups[1].add_completion(DapoCompletion::new(vec![9, 10], 2.0, false), 0.0);
+        groups[1].add_completion(DapoCompletion::new(vec![11, 12], 1.0, true), 0.0);
 
         let batch = trainer.prepare_batch(&mut groups).unwrap();
 

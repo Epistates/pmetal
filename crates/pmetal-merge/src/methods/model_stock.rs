@@ -152,26 +152,27 @@ impl ModelStockMerge {
             return base.add(&avg_tau).map_err(Into::into);
         }
 
-        // Compute cosine similarity weights
-        // Each model is weighted by how aligned its task vector is with the average
-        let mut weights: Vec<f32> = Vec::with_capacity(n);
+        // Compute softmax cosine similarity weights per the Model Stock paper.
+        // w_i = exp(sim_i) / sum_j( exp(sim_j) )
+        // This is strictly positive for all inputs and does not discard negative
+        // cosine similarities (which can arise for out-of-distribution models).
+        let mut raw_sims: Vec<f32> = Vec::with_capacity(n);
         for tau in &task_vectors {
             let sim = self.cosine_similarity(tau, &avg_tau)?;
-            // Use softmax-like weighting: exp(sim) / sum(exp(sim))
-            // But first just collect raw similarities
-            weights.push(sim.max(0.0)); // Clamp negative similarities
+            raw_sims.push(sim);
         }
 
-        // Normalize weights (softmax-style with temperature=1)
-        let sum_weights: f32 = weights.iter().sum();
-        if sum_weights < self.eps {
-            // Fallback to uniform if all weights are near zero
-            return base.add(&avg_tau).map_err(Into::into);
-        }
+        // Numerically stable softmax: subtract max before exponentiation.
+        let max_sim = raw_sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp_sims: Vec<f32> = raw_sims.iter().map(|&s| (s - max_sim).exp()).collect();
+        let sum_exp: f32 = exp_sims.iter().sum();
 
-        for w in &mut weights {
-            *w /= sum_weights;
-        }
+        let weights: Vec<f32> = if sum_exp < self.eps {
+            // Degenerate case: fall back to uniform weights.
+            vec![1.0 / n as f32; n]
+        } else {
+            exp_sims.iter().map(|&e| e / sum_exp).collect()
+        };
 
         // Weighted average of task vectors
         let mut weighted_tau = task_vectors[0].multiply(Array::from_f32(weights[0]))?;

@@ -29,7 +29,6 @@
 
 // Crate-level lint configuration for ML/LoRA code patterns
 #![allow(missing_docs)]
-#![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(clippy::too_many_arguments)]

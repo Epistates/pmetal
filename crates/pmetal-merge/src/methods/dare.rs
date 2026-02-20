@@ -20,7 +20,8 @@
 use super::MergeMethod;
 use crate::{sign_consensus, MergeError, MergeParameters, Result};
 use mlx_rs::Array;
-use rand::Rng;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
 
 /// DARE merge implementation.
 #[derive(Debug, Clone)]
@@ -66,14 +67,31 @@ impl DareMerge {
     }
 
     /// Apply random mask with rescaling.
-    fn random_mask(shape: &[i32], density: f32, rescale: bool) -> Result<Array> {
+    ///
+    /// # Arguments
+    /// * `shape` - Shape of the mask to generate.
+    /// * `density` - Fraction of parameters to keep (0.0 - 1.0).
+    /// * `rescale` - If true, divide kept values by `density` to preserve expected magnitude.
+    /// * `seed` - Optional RNG seed for reproducibility.
+    fn random_mask(shape: &[i32], density: f32, rescale: bool, seed: Option<u64>) -> Result<Array> {
         let size: usize = shape.iter().map(|&s| s as usize).product();
 
-        // Generate random mask
-        let mut rng = rand::thread_rng();
-        let mask: Vec<f32> = (0..size)
-            .map(|_| if rng.gen::<f32>() < density { 1.0 } else { 0.0 })
-            .collect();
+        // Seed-controlled RNG: use StdRng when a seed is provided so results
+        // are reproducible, fall back to the thread-local RNG otherwise.
+        let mask: Vec<f32> = match seed {
+            Some(s) => {
+                let mut rng = StdRng::seed_from_u64(s);
+                (0..size)
+                    .map(|_| if rng.gen::<f32>() < density { 1.0 } else { 0.0 })
+                    .collect()
+            }
+            None => {
+                let mut rng = rand::thread_rng();
+                (0..size)
+                    .map(|_| if rng.gen::<f32>() < density { 1.0 } else { 0.0 })
+                    .collect()
+            }
+        };
 
         let mut mask_array = Array::from_slice(&mask, shape);
 
@@ -86,7 +104,7 @@ impl DareMerge {
     }
 
     /// Apply DARE to a single task vector.
-    fn dare_sparsify(delta: &Array, density: f32, rescale: bool) -> Result<Array> {
+    fn dare_sparsify(&self, delta: &Array, density: f32, rescale: bool) -> Result<Array> {
         if density >= 1.0 {
             return Ok(delta.clone());
         }
@@ -94,7 +112,7 @@ impl DareMerge {
             return Ok(Array::zeros::<f32>(delta.shape())?);
         }
 
-        let mask = Self::random_mask(delta.shape(), density, rescale)?;
+        let mask = Self::random_mask(delta.shape(), density, rescale, self.seed)?;
         Ok(delta.multiply(&mask)?)
     }
 
@@ -160,33 +178,25 @@ impl MergeMethod for DareMerge {
         let sparse_vectors: Vec<Array> = task_vectors
             .iter()
             .zip(densities.iter())
-            .map(|(tv, &density)| Self::dare_sparsify(tv, density, rescale))
+            .map(|(tv, &density)| self.dare_sparsify(tv, density, rescale))
             .collect::<Result<Vec<_>>>()?;
 
-        // Optionally apply sign consensus
-        let final_vectors = if self.use_ties_consensus {
-            let consensus_mask = sign_consensus(&sparse_vectors, &weights)?;
-            let mut result_vecs = Vec::with_capacity(sparse_vectors.len());
-            for v in sparse_vectors.iter() {
-                result_vecs.push(v.multiply(&consensus_mask)?);
-            }
-            result_vecs
+        // Optionally apply sign consensus and compute the weighted sum.
+        // sign_consensus returns the weighted sum of agreeing contributions directly.
+        let weighted_sum = if self.use_ties_consensus {
+            sign_consensus(&sparse_vectors, &weights)?
         } else {
-            sparse_vectors
+            // Compute weighted sum without sign filtering.
+            let mut acc = Array::zeros::<f32>(task_vectors[0].shape())?;
+            for (vector, weight) in sparse_vectors.iter().zip(weights.iter()) {
+                let weighted = vector.multiply(Array::from_f32(*weight))?;
+                acc = acc.add(&weighted)?;
+            }
+            acc
         };
 
-        // Compute weighted sum
-        let mut result = Array::zeros::<f32>(task_vectors[0].shape())?;
-
-        for (vector, weight) in final_vectors.iter().zip(weights.iter()) {
-            let weighted = vector.multiply(Array::from_f32(*weight))?;
-            result = result.add(&weighted)?;
-        }
-
-        // Scale by lambda
-        result = result.multiply(Array::from_f32(lambda))?;
-
-        // Add back to base
+        // Scale by lambda and add back to base
+        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
         Ok(base.add(&result)?)
     }
 }
@@ -198,20 +208,30 @@ mod tests {
     #[test]
     fn test_dare_random_mask() {
         // With density=1.0, all elements should be kept
-        let mask = DareMerge::random_mask(&[100], 1.0, false).unwrap();
+        let mask = DareMerge::random_mask(&[100], 1.0, false, Some(42)).unwrap();
         let mask_slice: Vec<f32> = mask.as_slice().to_vec();
         assert!(mask_slice.iter().all(|&x| x == 1.0));
 
         // With density=0.0, all elements should be dropped
-        let mask = DareMerge::random_mask(&[100], 0.0, false).unwrap();
+        let mask = DareMerge::random_mask(&[100], 0.0, false, Some(42)).unwrap();
         let mask_slice: Vec<f32> = mask.as_slice().to_vec();
         assert!(mask_slice.iter().all(|&x| x == 0.0));
     }
 
     #[test]
+    fn test_dare_random_mask_seeded_reproducible() {
+        // Same seed must produce identical masks.
+        let m1 = DareMerge::random_mask(&[1000], 0.5, false, Some(99)).unwrap();
+        let m2 = DareMerge::random_mask(&[1000], 0.5, false, Some(99)).unwrap();
+        let s1: Vec<f32> = m1.as_slice().to_vec();
+        let s2: Vec<f32> = m2.as_slice().to_vec();
+        assert_eq!(s1, s2);
+    }
+
+    #[test]
     fn test_dare_rescaling() {
         // With rescale=true, kept values should be divided by density
-        let mask = DareMerge::random_mask(&[1000], 0.5, true).unwrap();
+        let mask = DareMerge::random_mask(&[1000], 0.5, true, Some(42)).unwrap();
         let mask_slice: Vec<f32> = mask.as_slice().to_vec();
 
         // Non-zero values should be 2.0 (1.0 / 0.5)

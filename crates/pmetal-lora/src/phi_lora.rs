@@ -1366,7 +1366,7 @@ mod tests {
                 "v_proj".to_string(),
                 "o_proj".to_string(),
             ],
-            bias: "none".to_string(),
+            bias: pmetal_core::LoraBias::None,
             init_lora_weights: true,
             use_dora: false,
         }

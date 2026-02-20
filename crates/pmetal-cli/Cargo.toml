@@ -22,6 +22,7 @@ pmetal-data = { workspace = true }
 pmetal-hub = { workspace = true }
 pmetal-gguf = { workspace = true }
 pmetal-trainer = { workspace = true }
+pmetal-distill = { workspace = true }
 mlx-rs = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }

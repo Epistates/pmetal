@@ -56,7 +56,7 @@ inline float fast_exp(float x) {
 }
 
 /// Warp-level max reduction.
-inline float simd_max_f32(float val, uint simd_lane_id) {
+inline float simd_max_f32(float val) {
     #pragma unroll
     for (uint offset = SIMD_SIZE / 2; offset > 0; offset /= 2) {
         val = max(val, simd_shuffle_xor(val, offset));
@@ -65,7 +65,7 @@ inline float simd_max_f32(float val, uint simd_lane_id) {
 }
 
 /// Warp-level sum reduction.
-inline float simd_sum_f32(float val, uint simd_lane_id) {
+inline float simd_sum_f32(float val) {
     #pragma unroll
     for (uint offset = SIMD_SIZE / 2; offset > 0; offset /= 2) {
         val += simd_shuffle_xor(val, offset);
@@ -82,10 +82,14 @@ inline float simd_sum_f32(float val, uint simd_lane_id) {
 /// Computes: O = softmax(Q @ K^T / sqrt(d)) @ V
 ///
 /// Uses block-wise computation to achieve O(n) memory complexity.
+/// Per-element online softmax for correct numerical stability.
 ///
 /// Thread organization:
 /// - Grid: [num_q_blocks, num_heads, batch_size]
-/// - Threadgroup: [32, 4, 1] = 128 threads
+/// - Threadgroup: [32, 4, 1] = 128 threads (4 SIMD groups of 32)
+/// - Each SIMD group processes 8 query rows (32 rows / 4 groups)
+/// - Each lane handles 4 consecutive D-elements (128 / 32 = 4)
+/// - Score computation uses SIMD-parallel dot products
 kernel void flash_attention_forward_d128_causal(
     device const half* Q [[buffer(0)]],           // [B, H, N, D]
     device const half* K [[buffer(1)]],           // [B, H_kv, N, D]
@@ -98,30 +102,24 @@ kernel void flash_attention_forward_d128_causal(
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
-    // Configuration
-    const uint Bq = 32;  // Block size for queries
-    const uint Bk = 32;  // Block size for keys
-    const uint D = 128;  // Head dimension
+    const uint Bq = 32;
+    const uint Bk = 32;
+    const uint D = 128;
+    const uint ROWS_PER_GROUP = 8;  // Bq / 4 SIMD groups
 
-    // Grid position
     const uint batch_idx = tgid.z;
     const uint head_idx = tgid.y;
     const uint q_block_idx = tgid.x;
-
-    // GQA: map query head to KV head
     const uint kv_head_idx = head_idx / params.gqa_ratio;
-
-    // Sequence positions
     const uint q_start = q_block_idx * Bq;
-    const uint q_end = min(q_start + Bq, params.query_seq_len);
 
-    // Strides for Q, K, V, O
+    // Strides
     const uint q_batch_stride = params.num_heads * params.query_seq_len * D;
     const uint q_head_stride = params.query_seq_len * D;
     const uint kv_batch_stride = params.num_kv_heads * params.kv_seq_len * D;
     const uint kv_head_stride = params.kv_seq_len * D;
 
-    // Pointers for this head
+    // Head pointers
     device const half* Q_head = Q + batch_idx * q_batch_stride + head_idx * q_head_stride;
     device const half* K_head = K + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
     device const half* V_head = V + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
@@ -129,170 +127,135 @@ kernel void flash_attention_forward_d128_causal(
     device float* L_head = L + batch_idx * params.num_heads * params.query_seq_len
                              + head_idx * params.query_seq_len;
 
-    // Threadgroup shared memory for loading tiles
+    // Shared memory: Q, K, V tiles only (no S_tile needed with online softmax)
+    // Total: 3 * 32 * 128 * 2 = 24576 bytes (under 32KB)
     threadgroup half Q_tile[Bq * D];
     threadgroup half K_tile[Bk * D];
     threadgroup half V_tile[Bk * D];
-    threadgroup float S_tile[Bq * Bk];  // Attention scores
 
-    // Thread-local accumulators
-    // Each thread handles a subset of the output
-    const uint threads_per_row = 32;  // Threads processing one query row
-    const uint rows_per_group = 4;    // Query rows per SIMD group
-    const uint my_row = simd_group_id * rows_per_group + tid.y;
-    const uint my_col_start = simd_lane_id;
+    // Each SIMD group handles ROWS_PER_GROUP consecutive query rows
+    const uint group_row_start = simd_group_id * ROWS_PER_GROUP;
 
-    // Local accumulators for output and softmax stats
-    float m_i = -INFINITY;  // Running max for numerical stability
-    float l_i = 0.0f;       // Running sum of exp
-    float o_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};  // Partial output accumulator
+    // Per-row accumulators: 8 rows * 4 D-elements per lane = 32 floats
+    float m_i[ROWS_PER_GROUP];
+    float l_i[ROWS_PER_GROUP];
+    float o_local[ROWS_PER_GROUP][4];
 
-    // Load Q tile into shared memory (collaborative load)
+    #pragma unroll
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        m_i[r] = -INFINITY;
+        l_i[r] = 0.0f;
+        o_local[r][0] = o_local[r][1] = o_local[r][2] = o_local[r][3] = 0.0f;
+    }
+
+    // Collaborative load of Q tile (all 128 threads participate)
     for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bq * D; i += 128) {
         uint q_row = i / D;
         uint q_col = i % D;
         uint global_q_row = q_start + q_row;
-        if (global_q_row < params.query_seq_len) {
-            Q_tile[i] = Q_head[global_q_row * D + q_col];
-        } else {
-            Q_tile[i] = half(0.0f);
-        }
+        Q_tile[i] = (global_q_row < params.query_seq_len)
+                   ? Q_head[global_q_row * D + q_col] : half(0.0f);
     }
-
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Causal: determine KV range to process
+    // Causal: only process KV positions up to the end of this Q block
     uint kv_end = IS_CAUSAL ? min(q_start + Bq, params.kv_seq_len) : params.kv_seq_len;
     uint num_kv_blocks = (kv_end + Bk - 1) / Bk;
 
-    // Iterate over KV blocks
+    // Main loop over KV blocks
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         uint k_start = kv_block * Bk;
-        uint k_end = min(k_start + Bk, params.kv_seq_len);
+        uint k_end_actual = min(k_start + Bk, params.kv_seq_len);
 
-        // Load K tile
+        // Collaborative load of K and V tiles
         for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
-            uint k_row = i / D;
-            uint k_col = i % D;
-            uint global_k_row = k_start + k_row;
-            if (global_k_row < k_end) {
-                K_tile[i] = K_head[global_k_row * D + k_col];
-            } else {
-                K_tile[i] = half(0.0f);
-            }
+            uint row = i / D;
+            uint col = i % D;
+            uint global_row = k_start + row;
+            K_tile[i] = (global_row < k_end_actual) ? K_head[global_row * D + col] : half(0.0f);
         }
-
-        // Load V tile
         for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
-            uint v_row = i / D;
-            uint v_col = i % D;
-            uint global_v_row = k_start + v_row;
-            if (global_v_row < k_end) {
-                V_tile[i] = V_head[global_v_row * D + v_col];
-            } else {
-                V_tile[i] = half(0.0f);
-            }
+            uint row = i / D;
+            uint col = i % D;
+            uint global_row = k_start + row;
+            V_tile[i] = (global_row < k_end_actual) ? V_head[global_row * D + col] : half(0.0f);
         }
-
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Compute S = Q @ K^T for this block
-        // Each thread computes one element of S
-        if (my_row < Bq) {
-            for (uint k_idx = 0; k_idx < Bk; k_idx++) {
-                float score = 0.0f;
+        // Process each query row assigned to this SIMD group
+        for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+            uint my_row = group_row_start + r;
+            uint global_q_pos = q_start + my_row;
+            if (my_row >= Bq || global_q_pos >= params.query_seq_len) continue;
 
-                // Dot product Q[my_row] @ K[k_idx]
-                for (uint d = 0; d < D; d++) {
-                    score += float(Q_tile[my_row * D + d]) * float(K_tile[k_idx * D + d]);
+            // Process each key with element-wise online softmax
+            for (uint k = 0; k < Bk && k_start + k < k_end_actual; k++) {
+                // SIMD-parallel dot product: each lane computes 4 multiply-adds
+                float partial = 0.0f;
+                #pragma unroll
+                for (uint dd = 0; dd < 4; dd++) {
+                    uint d = simd_lane_id * 4 + dd;
+                    partial += float(Q_tile[my_row * D + d]) * float(K_tile[k * D + d]);
                 }
+                float score = simd_sum_f32(partial) * params.scale;
 
-                // Scale
-                score *= params.scale;
-
-                // Apply causal mask
-                uint global_q_pos = q_start + my_row;
-                uint global_k_pos = k_start + k_idx;
-
-                bool masked = false;
+                // Causal mask
+                uint global_k_pos = k_start + k;
                 if (IS_CAUSAL && global_k_pos > global_q_pos) {
-                    masked = true;
+                    score = -INFINITY;
                 }
-                
                 // Sliding window mask
                 if (params.sliding_window > 0 && global_q_pos > global_k_pos + params.sliding_window) {
-                    masked = true;
-                }
-
-                if (masked) {
                     score = -INFINITY;
-                } else if (params.softcap > 0.0f) {
-                    // Tanh softcapping: softcap * tanh(score / softcap)
+                }
+                // Softcap
+                if (params.softcap > 0.0f && score > -INFINITY) {
                     score = params.softcap * tanh(score / params.softcap);
                 }
 
-                // Store in shared memory for softmax
-                if (my_row < Bq && k_idx < Bk) {
-                    S_tile[my_row * Bk + k_idx] = score;
+                // Online softmax: update max, correct previous accumulations, add new
+                float m_new = max(m_i[r], score);
+                float correction = fast_exp(m_i[r] - m_new);
+                float p = fast_exp(score - m_new);
+
+                l_i[r] = correction * l_i[r] + p;
+
+                #pragma unroll
+                for (uint dd = 0; dd < 4; dd++) {
+                    uint d = simd_lane_id * 4 + dd;
+                    o_local[r][dd] = correction * o_local[r][dd]
+                                   + p * float(V_tile[k * D + d]);
                 }
+                m_i[r] = m_new;
             }
         }
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Online softmax update
-        if (my_row < Bq && q_start + my_row < params.query_seq_len) {
-            // Find row max
-            float m_new = m_i;
-            for (uint k = 0; k < Bk && k_start + k < k_end; k++) {
-                m_new = max(m_new, S_tile[my_row * Bk + k]);
-            }
-
-            // Compute correction factor
-            float correction = fast_exp(m_i - m_new);
-
-            // Update running sum and output
-            float l_new = correction * l_i;
-
-            for (uint k = 0; k < Bk && k_start + k < k_end; k++) {
-                float p = fast_exp(S_tile[my_row * Bk + k] - m_new);
-                l_new += p;
-
-                // Accumulate weighted V
-                // Note: simplified - full implementation would vectorize this
-                for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-                    o_local[d / SIMD_SIZE % 4] = correction * o_local[d / SIMD_SIZE % 4]
-                                                  + p * float(V_tile[k * D + d]);
-                }
-            }
-
-            m_i = m_new;
-            l_i = l_new;
-        }
-
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     // Normalize output and write results
-    if (my_row < Bq && q_start + my_row < params.query_seq_len) {
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
         uint global_q_idx = q_start + my_row;
+        if (my_row >= Bq || global_q_idx >= params.query_seq_len) continue;
 
-        // Normalize by sum of exp
-        float inv_l = 1.0f / l_i;
+        float inv_l = (l_i[r] > 0.0f) ? 1.0f / l_i[r] : 0.0f;
 
-        // Write output
-        for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-            O_head[global_q_idx * D + d] = half(o_local[d / SIMD_SIZE % 4] * inv_l);
+        // Each lane writes its 4 consecutive D-elements
+        #pragma unroll
+        for (uint dd = 0; dd < 4; dd++) {
+            uint d = simd_lane_id * 4 + dd;
+            O_head[global_q_idx * D + d] = half(o_local[r][dd] * inv_l);
         }
 
-        // Write logsumexp for backward pass
+        // Lane 0 writes logsumexp
         if (simd_lane_id == 0) {
-            L_head[global_q_idx] = m_i + log(l_i);
+            L_head[global_q_idx] = m_i[r] + log(max(l_i[r], 1e-10f));
         }
     }
 }
 
-/// Non-causal variant
+/// FlashAttention forward pass without causal masking.
+/// Same algorithm as causal variant but processes all KV positions.
 kernel void flash_attention_forward_d128(
     device const half* Q [[buffer(0)]],
     device const half* K [[buffer(1)]],
@@ -305,9 +268,131 @@ kernel void flash_attention_forward_d128(
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
-    // Same as causal but without masking
-    // For brevity, this would be nearly identical with IS_CAUSAL = false
-    // In production, use function constants or templates
+    const uint Bq = 32;
+    const uint Bk = 32;
+    const uint D = 128;
+    const uint ROWS_PER_GROUP = 8;
+
+    const uint batch_idx = tgid.z;
+    const uint head_idx = tgid.y;
+    const uint q_block_idx = tgid.x;
+    const uint kv_head_idx = head_idx / params.gqa_ratio;
+    const uint q_start = q_block_idx * Bq;
+
+    const uint q_batch_stride = params.num_heads * params.query_seq_len * D;
+    const uint q_head_stride = params.query_seq_len * D;
+    const uint kv_batch_stride = params.num_kv_heads * params.kv_seq_len * D;
+    const uint kv_head_stride = params.kv_seq_len * D;
+
+    device const half* Q_head = Q + batch_idx * q_batch_stride + head_idx * q_head_stride;
+    device const half* K_head = K + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
+    device const half* V_head = V + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
+    device half* O_head = O + batch_idx * q_batch_stride + head_idx * q_head_stride;
+    device float* L_head = L + batch_idx * params.num_heads * params.query_seq_len
+                             + head_idx * params.query_seq_len;
+
+    threadgroup half Q_tile[Bq * D];
+    threadgroup half K_tile[Bk * D];
+    threadgroup half V_tile[Bk * D];
+
+    const uint group_row_start = simd_group_id * ROWS_PER_GROUP;
+
+    float m_i[ROWS_PER_GROUP];
+    float l_i[ROWS_PER_GROUP];
+    float o_local[ROWS_PER_GROUP][4];
+
+    #pragma unroll
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        m_i[r] = -INFINITY;
+        l_i[r] = 0.0f;
+        o_local[r][0] = o_local[r][1] = o_local[r][2] = o_local[r][3] = 0.0f;
+    }
+
+    for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bq * D; i += 128) {
+        uint q_row = i / D;
+        uint q_col = i % D;
+        uint global_q_row = q_start + q_row;
+        Q_tile[i] = (global_q_row < params.query_seq_len)
+                   ? Q_head[global_q_row * D + q_col] : half(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Non-causal: process all KV positions
+    uint num_kv_blocks = (params.kv_seq_len + Bk - 1) / Bk;
+
+    for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+        uint k_start = kv_block * Bk;
+        uint k_end_actual = min(k_start + Bk, params.kv_seq_len);
+
+        for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
+            uint row = i / D;
+            uint col = i % D;
+            uint global_row = k_start + row;
+            K_tile[i] = (global_row < k_end_actual) ? K_head[global_row * D + col] : half(0.0f);
+        }
+        for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
+            uint row = i / D;
+            uint col = i % D;
+            uint global_row = k_start + row;
+            V_tile[i] = (global_row < k_end_actual) ? V_head[global_row * D + col] : half(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+            uint my_row = group_row_start + r;
+            uint global_q_pos = q_start + my_row;
+            if (my_row >= Bq || global_q_pos >= params.query_seq_len) continue;
+
+            for (uint k = 0; k < Bk && k_start + k < k_end_actual; k++) {
+                float partial = 0.0f;
+                #pragma unroll
+                for (uint dd = 0; dd < 4; dd++) {
+                    uint d = simd_lane_id * 4 + dd;
+                    partial += float(Q_tile[my_row * D + d]) * float(K_tile[k * D + d]);
+                }
+                float score = simd_sum_f32(partial) * params.scale;
+
+                // Sliding window (no causal mask)
+                uint global_k_pos = k_start + k;
+                if (params.sliding_window > 0 && global_q_pos > global_k_pos + params.sliding_window) {
+                    score = -INFINITY;
+                }
+                if (params.softcap > 0.0f && score > -INFINITY) {
+                    score = params.softcap * tanh(score / params.softcap);
+                }
+
+                float m_new = max(m_i[r], score);
+                float correction = fast_exp(m_i[r] - m_new);
+                float p = fast_exp(score - m_new);
+                l_i[r] = correction * l_i[r] + p;
+
+                #pragma unroll
+                for (uint dd = 0; dd < 4; dd++) {
+                    uint d = simd_lane_id * 4 + dd;
+                    o_local[r][dd] = correction * o_local[r][dd]
+                                   + p * float(V_tile[k * D + d]);
+                }
+                m_i[r] = m_new;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
+        uint global_q_idx = q_start + my_row;
+        if (my_row >= Bq || global_q_idx >= params.query_seq_len) continue;
+
+        float inv_l = (l_i[r] > 0.0f) ? 1.0f / l_i[r] : 0.0f;
+        #pragma unroll
+        for (uint dd = 0; dd < 4; dd++) {
+            uint d = simd_lane_id * 4 + dd;
+            O_head[global_q_idx * D + d] = half(o_local[r][dd] * inv_l);
+        }
+        if (simd_lane_id == 0) {
+            L_head[global_q_idx] = m_i[r] + log(max(l_i[r], 1e-10f));
+        }
+    }
 }
 
 // =============================================================================
@@ -316,7 +401,11 @@ kernel void flash_attention_forward_d128(
 
 /// Backward pass computing dQ gradient.
 ///
-/// dQ = dO @ V^T * softmax'(S)
+/// dQ = scale * sum_k[ P_ij * (dP_ij - D_i) * K_j ]
+/// where D_i = rowsum(dO * O)
+///
+/// Threadgroup memory: Q_tile + K_tile + dO_tile = 3 * 8KB = 24KB (under 32KB)
+/// V, O, L read from device memory to avoid exceeding threadgroup limit.
 kernel void flash_attention_backward_dq_d128_causal(
     device const half* Q [[buffer(0)]],
     device const half* K [[buffer(1)]],
@@ -331,53 +420,51 @@ kernel void flash_attention_backward_dq_d128_causal(
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
-    // Configuration
     const uint Bq = 32;
     const uint Bk = 32;
     const uint D = 128;
+    const uint ROWS_PER_GROUP = 8;
 
-    // Grid position
     const uint batch_idx = tgid.z;
     const uint head_idx = tgid.y;
     const uint q_block_idx = tgid.x;
     const uint kv_head_idx = head_idx / params.gqa_ratio;
-
     const uint q_start = q_block_idx * Bq;
 
-    // Strides
     const uint q_batch_stride = params.num_heads * params.query_seq_len * D;
     const uint q_head_stride = params.query_seq_len * D;
     const uint kv_batch_stride = params.num_kv_heads * params.kv_seq_len * D;
     const uint kv_head_stride = params.kv_seq_len * D;
 
-    // Pointers
     device const half* Q_head = Q + batch_idx * q_batch_stride + head_idx * q_head_stride;
     device const half* K_head = K + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
     device const half* V_head = V + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
+    device const half* O_head = O + batch_idx * q_batch_stride + head_idx * q_head_stride;
     device const half* dO_head = dO + batch_idx * q_batch_stride + head_idx * q_head_stride;
     device const float* L_head = L + batch_idx * params.num_heads * params.query_seq_len
                                    + head_idx * params.query_seq_len;
     device half* dQ_head = dQ + batch_idx * q_batch_stride + head_idx * q_head_stride;
 
-    // Shared memory
+    // Shared memory: 3 tiles = 24576 bytes (under 32KB limit)
     threadgroup half Q_tile[Bq * D];
     threadgroup half K_tile[Bk * D];
-    threadgroup half V_tile[Bk * D];
     threadgroup half dO_tile[Bq * D];
-    threadgroup half O_tile[Bq * D];  // Output for D_i computation
-    threadgroup float L_tile[Bq];
-    threadgroup float D_tile[Bq];     // D_i = rowsum(dO * O) for softmax gradient correction
 
-    // Pointers for O (needed for D_i computation)
-    device const half* O_head = O + batch_idx * q_batch_stride + head_idx * q_head_stride;
+    const uint group_row_start = simd_group_id * ROWS_PER_GROUP;
 
-    // Thread-local dQ accumulator
-    float dq_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // Per-row accumulators
+    float dq_local[ROWS_PER_GROUP][4];
+    float d_i[ROWS_PER_GROUP];     // D_i = rowsum(dO * O) per row
+    float l_val[ROWS_PER_GROUP];   // Logsumexp per row
 
-    const uint my_row = simd_group_id * 4 + tid.y;
-    const uint my_col_start = simd_lane_id;
+    #pragma unroll
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        dq_local[r][0] = dq_local[r][1] = dq_local[r][2] = dq_local[r][3] = 0.0f;
+        d_i[r] = 0.0f;
+        l_val[r] = 0.0f;
+    }
 
-    // Load Q, dO, O, L tiles
+    // Load Q and dO tiles
     for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bq * D; i += 128) {
         uint row = i / D;
         uint col = i % D;
@@ -385,110 +472,106 @@ kernel void flash_attention_backward_dq_d128_causal(
         if (global_row < params.query_seq_len) {
             Q_tile[i] = Q_head[global_row * D + col];
             dO_tile[i] = dO_head[global_row * D + col];
-            O_tile[i] = O_head[global_row * D + col];
         } else {
             Q_tile[i] = half(0.0f);
             dO_tile[i] = half(0.0f);
-            O_tile[i] = half(0.0f);
         }
     }
-
-    if (tid.y * SIMD_SIZE + tid.x < Bq) {
-        uint row = tid.y * SIMD_SIZE + tid.x;
-        uint global_row = q_start + row;
-        if (global_row < params.query_seq_len) {
-            L_tile[row] = L_head[global_row];
-        } else {
-            L_tile[row] = 0.0f;
-        }
-    }
-
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Compute D_i = rowsum(dO * O) for each query row (FlashAttention-2 correction term)
-    // This is the key correction missing from simplified implementations
-    if (my_row < Bq && q_start + my_row < params.query_seq_len) {
-        float d_i = 0.0f;
-        for (uint d = 0; d < D; d++) {
-            d_i += float(dO_tile[my_row * D + d]) * float(O_tile[my_row * D + d]);
-        }
-        D_tile[my_row] = d_i;
-    }
+    // Compute D_i = rowsum(dO * O) from dO_tile and device O, and load L
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
+        uint global_q_row = q_start + my_row;
+        if (my_row >= Bq || global_q_row >= params.query_seq_len) continue;
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+        // SIMD-parallel D_i computation
+        float partial_di = 0.0f;
+        #pragma unroll
+        for (uint dd = 0; dd < 4; dd++) {
+            uint d = simd_lane_id * 4 + dd;
+            partial_di += float(dO_tile[my_row * D + d])
+                        * float(O_head[global_q_row * D + d]);
+        }
+        d_i[r] = simd_sum_f32(partial_di);
+
+        // Load logsumexp from device memory
+        if (simd_lane_id == 0) {
+            l_val[r] = L_head[global_q_row];
+        }
+        l_val[r] = simd_shuffle(l_val[r], 0);
+    }
 
     // Causal KV range
     uint kv_end = min(q_start + Bq, params.kv_seq_len);
     uint num_kv_blocks = (kv_end + Bk - 1) / Bk;
 
-    // Iterate over KV blocks
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         uint k_start = kv_block * Bk;
 
-        // Load K, V tiles
+        // Load K tile
         for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
             uint row = i / D;
             uint col = i % D;
             uint global_row = k_start + row;
-            if (global_row < params.kv_seq_len) {
-                K_tile[i] = K_head[global_row * D + col];
-                V_tile[i] = V_head[global_row * D + col];
-            } else {
-                K_tile[i] = half(0.0f);
-                V_tile[i] = half(0.0f);
-            }
+            K_tile[i] = (global_row < params.kv_seq_len)
+                       ? K_head[global_row * D + col] : half(0.0f);
         }
-
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Compute attention scores and gradients
-        if (my_row < Bq && q_start + my_row < params.query_seq_len) {
-            float l_i = L_tile[my_row];
+        for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+            uint my_row = group_row_start + r;
+            uint global_q_pos = q_start + my_row;
+            if (my_row >= Bq || global_q_pos >= params.query_seq_len) continue;
 
             for (uint k_idx = 0; k_idx < Bk; k_idx++) {
                 uint global_k_pos = k_start + k_idx;
-                uint global_q_pos = q_start + my_row;
+                if (global_k_pos > global_q_pos || global_k_pos >= params.kv_seq_len) continue;
 
-                // Skip masked positions
-                if (global_k_pos > global_q_pos || global_k_pos >= params.kv_seq_len) {
-                    continue;
+                // SIMD-parallel score: Q[my_row] · K[k_idx]
+                float partial_s = 0.0f;
+                #pragma unroll
+                for (uint dd = 0; dd < 4; dd++) {
+                    uint d = simd_lane_id * 4 + dd;
+                    partial_s += float(Q_tile[my_row * D + d]) * float(K_tile[k_idx * D + d]);
                 }
+                float s = simd_sum_f32(partial_s) * params.scale;
+                float p = fast_exp(s - l_val[r]);
 
-                // Recompute attention score
-                float s = 0.0f;
-                for (uint d = 0; d < D; d++) {
-                    s += float(Q_tile[my_row * D + d]) * float(K_tile[k_idx * D + d]);
+                // SIMD-parallel dov: dO[my_row] · V[k_idx] (V from device memory)
+                float partial_dov = 0.0f;
+                #pragma unroll
+                for (uint dd = 0; dd < 4; dd++) {
+                    uint d = simd_lane_id * 4 + dd;
+                    partial_dov += float(dO_tile[my_row * D + d])
+                                 * float(V_head[(k_start + k_idx) * D + d]);
                 }
-                s *= params.scale;
+                float dov = simd_sum_f32(partial_dov);
 
-                // Compute softmax probability using stored logsumexp
-                float p = fast_exp(s - l_i);
+                // dS_ij = P_ij * (dP_ij - D_i)
+                float ds = p * (dov - d_i[r]);
 
-                // Compute dO @ V^T for this position
-                float dov = 0.0f;
-                for (uint d = 0; d < D; d++) {
-                    dov += float(dO_tile[my_row * D + d]) * float(V_tile[k_idx * D + d]);
-                }
-
-                // Gradient through softmax (FlashAttention-2 correct formula)
-                // dS_ij = P_ij * (dP_ij - D_i) where D_i = rowsum(dO * O)
-                // dP_ij = dO @ V^T (computed as dov)
-                float ds = p * (dov - D_tile[my_row]);
-
-                for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-                    dq_local[d / SIMD_SIZE % 4] += ds * float(K_tile[k_idx * D + d]);
+                // Accumulate dQ
+                #pragma unroll
+                for (uint dd = 0; dd < 4; dd++) {
+                    uint d = simd_lane_id * 4 + dd;
+                    dq_local[r][dd] += ds * float(K_tile[k_idx * D + d]);
                 }
             }
         }
-
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write dQ output
-    if (my_row < Bq && q_start + my_row < params.query_seq_len) {
+    // Write dQ (scale applied once here)
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
         uint global_q_idx = q_start + my_row;
-        for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-            dQ_head[global_q_idx * D + d] = half(dq_local[d / SIMD_SIZE % 4] * params.scale);
+        if (my_row >= Bq || global_q_idx >= params.query_seq_len) continue;
+
+        #pragma unroll
+        for (uint dd = 0; dd < 4; dd++) {
+            uint d = simd_lane_id * 4 + dd;
+            dQ_head[global_q_idx * D + d] = half(dq_local[r][dd] * params.scale);
         }
     }
 }
@@ -498,12 +581,14 @@ kernel void flash_attention_backward_dq_d128_causal(
 // =============================================================================
 
 /// Backward pass computing dK and dV gradients.
-/// Note: O buffer is required for exact gradient computation via D_i = rowsum(dO * O)
+///
+/// Threadgroup memory: K_tile + V_tile + Q_tile + dO_tile = 4 * 8KB = 32KB (at limit)
+/// O and L read from device memory. D_i computed on the fly via SIMD reduction.
 kernel void flash_attention_backward_dkv_d128_causal(
     device const half* Q [[buffer(0)]],
     device const half* K [[buffer(1)]],
     device const half* V [[buffer(2)]],
-    device const half* O [[buffer(3)]],          // Forward output for D_i computation
+    device const half* O [[buffer(3)]],
     device const half* dO [[buffer(4)]],
     device const float* L [[buffer(5)]],
     device half* dK [[buffer(6)]],
@@ -514,45 +599,43 @@ kernel void flash_attention_backward_dkv_d128_causal(
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
-    // Configuration
     const uint Bq = 32;
     const uint Bk = 32;
     const uint D = 128;
+    const uint ROWS_PER_GROUP = 8;
 
-    // Grid position - parallelize over KV blocks
     const uint batch_idx = tgid.z;
     const uint kv_head_idx = tgid.y;
     const uint kv_block_idx = tgid.x;
-
     const uint k_start = kv_block_idx * Bk;
 
-    // Strides
     const uint q_batch_stride = params.num_heads * params.query_seq_len * D;
     const uint q_head_stride = params.query_seq_len * D;
     const uint kv_batch_stride = params.num_kv_heads * params.kv_seq_len * D;
     const uint kv_head_stride = params.kv_seq_len * D;
 
-    // For GQA, we need to sum gradients from all query heads mapping to this KV head
     device half* dK_head = dK + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
     device half* dV_head = dV + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
     device const half* K_head = K + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
     device const half* V_head = V + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
 
-    // Shared memory
-    threadgroup half K_tile[Bk * D];
-    threadgroup half V_tile[Bk * D];
-    threadgroup half Q_tile[Bq * D];
-    threadgroup half dO_tile[Bq * D];
-    threadgroup half O_tile[Bq * D];   // Output for D_i computation
-    threadgroup float L_tile[Bq];
-    threadgroup float D_tile[Bq];      // D_i = rowsum(dO * O) for gradient correction
+    // Shared memory: exactly 32768 bytes
+    threadgroup half K_tile[Bk * D];   // 8192
+    threadgroup half V_tile[Bk * D];   // 8192
+    threadgroup half Q_tile[Bq * D];   // 8192
+    threadgroup half dO_tile[Bq * D];  // 8192
 
-    // Thread-local accumulators
-    float dk_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float dv_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const uint group_row_start = simd_group_id * ROWS_PER_GROUP;
 
-    const uint my_row = simd_group_id * 4 + tid.y;
-    const uint my_col_start = simd_lane_id;
+    // Per-row accumulators for dK, dV
+    float dk_local[ROWS_PER_GROUP][4];
+    float dv_local[ROWS_PER_GROUP][4];
+
+    #pragma unroll
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        dk_local[r][0] = dk_local[r][1] = dk_local[r][2] = dk_local[r][3] = 0.0f;
+        dv_local[r][0] = dv_local[r][1] = dv_local[r][2] = dv_local[r][3] = 0.0f;
+    }
 
     // Load K, V tiles for this KV block
     for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
@@ -567,10 +650,9 @@ kernel void flash_attention_backward_dkv_d128_causal(
             V_tile[i] = half(0.0f);
         }
     }
-
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // For GQA, iterate over all query heads that map to this KV head
+    // Iterate over all query heads mapping to this KV head (GQA)
     for (uint q_head_offset = 0; q_head_offset < params.gqa_ratio; q_head_offset++) {
         uint head_idx = kv_head_idx * params.gqa_ratio + q_head_offset;
 
@@ -580,108 +662,109 @@ kernel void flash_attention_backward_dkv_d128_causal(
         device const float* L_head = L + batch_idx * params.num_heads * params.query_seq_len
                                        + head_idx * params.query_seq_len;
 
-        // Causal: only query positions >= k_start can attend to this KV block
-        uint q_start_min = k_start;  // Queries before this can't see these keys
-        uint num_q_blocks = (params.query_seq_len - q_start_min + Bq - 1) / Bq;
+        // Causal: only queries at positions >= k_start can attend to this KV block
+        uint q_start_min = k_start;
+        uint num_q_blocks = (params.query_seq_len > q_start_min)
+                          ? (params.query_seq_len - q_start_min + Bq - 1) / Bq : 0;
 
-        // Iterate over Q blocks
         for (uint q_block = 0; q_block < num_q_blocks; q_block++) {
             uint q_start = q_start_min + q_block * Bq;
 
-            // Load Q, O, dO, L tiles
+            // Load Q and dO tiles (reuse Q_tile and dO_tile memory)
             for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bq * D; i += 128) {
                 uint row = i / D;
                 uint col = i % D;
                 uint global_row = q_start + row;
                 if (global_row < params.query_seq_len) {
                     Q_tile[i] = Q_head[global_row * D + col];
-                    O_tile[i] = O_head[global_row * D + col];
                     dO_tile[i] = dO_head[global_row * D + col];
                 } else {
                     Q_tile[i] = half(0.0f);
-                    O_tile[i] = half(0.0f);
                     dO_tile[i] = half(0.0f);
                 }
             }
-
-            if (tid.y * SIMD_SIZE + tid.x < Bq) {
-                uint row = tid.y * SIMD_SIZE + tid.x;
-                uint global_row = q_start + row;
-                if (global_row < params.query_seq_len) {
-                    L_tile[row] = L_head[global_row];
-                }
-            }
-
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Compute D_i = rowsum(dO * O) for each query row
-            // This is the exact gradient computation for FlashAttention-2
-            if (tid.y * SIMD_SIZE + tid.x < Bq) {
-                uint row = tid.y * SIMD_SIZE + tid.x;
-                float d_sum = 0.0f;
-                for (uint d = 0; d < D; d++) {
-                    d_sum += float(dO_tile[row * D + d]) * float(O_tile[row * D + d]);
-                }
-                D_tile[row] = d_sum;
-            }
+            // Process each KV row assigned to this SIMD group
+            for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+                uint my_kv_row = group_row_start + r;
+                uint global_k_pos = k_start + my_kv_row;
+                if (my_kv_row >= Bk || global_k_pos >= params.kv_seq_len) continue;
 
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Compute gradients
-            if (my_row < Bk && k_start + my_row < params.kv_seq_len) {
                 for (uint q_idx = 0; q_idx < Bq; q_idx++) {
                     uint global_q_pos = q_start + q_idx;
-                    uint global_k_pos = k_start + my_row;
+                    if (global_q_pos >= params.query_seq_len || global_k_pos > global_q_pos) continue;
 
-                    // Causal check
-                    if (global_q_pos >= params.query_seq_len || global_k_pos > global_q_pos) {
-                        continue;
+                    // Read logsumexp from device memory
+                    float l_q;
+                    if (simd_lane_id == 0) {
+                        l_q = L_head[global_q_pos];
                     }
+                    l_q = simd_shuffle(l_q, 0);
 
-                    float l_q = L_tile[q_idx];
-
-                    // Recompute attention score
-                    float s = 0.0f;
-                    for (uint d = 0; d < D; d++) {
-                        s += float(Q_tile[q_idx * D + d]) * float(K_tile[my_row * D + d]);
+                    // SIMD-parallel score: Q[q_idx] · K[my_kv_row]
+                    float partial_s = 0.0f;
+                    #pragma unroll
+                    for (uint dd = 0; dd < 4; dd++) {
+                        uint d = simd_lane_id * 4 + dd;
+                        partial_s += float(Q_tile[q_idx * D + d])
+                                   * float(K_tile[my_kv_row * D + d]);
                     }
-                    s *= params.scale;
-
+                    float s = simd_sum_f32(partial_s) * params.scale;
                     float p = fast_exp(s - l_q);
 
                     // dV += P^T @ dO
-                    for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-                        dv_local[d / SIMD_SIZE % 4] += p * float(dO_tile[q_idx * D + d]);
+                    #pragma unroll
+                    for (uint dd = 0; dd < 4; dd++) {
+                        uint d = simd_lane_id * 4 + dd;
+                        dv_local[r][dd] += p * float(dO_tile[q_idx * D + d]);
                     }
 
-                    // dK += dS^T @ Q
-                    // dS_ij = P_ij * (dP_ij - D_i) where D_i = rowsum(dO * O)
-                    // dP_ij = dO @ V^T
-                    float dov = 0.0f;
-                    for (uint d = 0; d < D; d++) {
-                        dov += float(dO_tile[q_idx * D + d]) * float(V_tile[my_row * D + d]);
+                    // Compute D_i from device O and threadgroup dO via SIMD reduction
+                    float partial_di = 0.0f;
+                    #pragma unroll
+                    for (uint dd = 0; dd < 4; dd++) {
+                        uint d = simd_lane_id * 4 + dd;
+                        partial_di += float(dO_tile[q_idx * D + d])
+                                    * float(O_head[global_q_pos * D + d]);
                     }
+                    float d_i = simd_sum_f32(partial_di);
 
-                    // Use precomputed D_i = rowsum(dO * O) for exact FlashAttention-2 gradients
-                    float d_i = D_tile[q_idx];
+                    // dov = dO · V (SIMD-parallel)
+                    float partial_dov = 0.0f;
+                    #pragma unroll
+                    for (uint dd = 0; dd < 4; dd++) {
+                        uint d = simd_lane_id * 4 + dd;
+                        partial_dov += float(dO_tile[q_idx * D + d])
+                                     * float(V_tile[my_kv_row * D + d]);
+                    }
+                    float dov = simd_sum_f32(partial_dov);
+
                     float ds = p * (dov - d_i);
 
-                    for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-                        dk_local[d / SIMD_SIZE % 4] += ds * float(Q_tile[q_idx * D + d]);
+                    // dK += dS^T @ Q
+                    #pragma unroll
+                    for (uint dd = 0; dd < 4; dd++) {
+                        uint d = simd_lane_id * 4 + dd;
+                        dk_local[r][dd] += ds * float(Q_tile[q_idx * D + d]);
                     }
                 }
             }
-
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 
-    // Write dK, dV outputs
-    if (my_row < Bk && k_start + my_row < params.kv_seq_len) {
-        uint global_k_idx = k_start + my_row;
-        for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-            dK_head[global_k_idx * D + d] = half(dk_local[d / SIMD_SIZE % 4] * params.scale);
-            dV_head[global_k_idx * D + d] = half(dv_local[d / SIMD_SIZE % 4]);
+    // Write dK, dV (scale applied to dK only)
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_kv_row = group_row_start + r;
+        uint global_k_idx = k_start + my_kv_row;
+        if (my_kv_row >= Bk || global_k_idx >= params.kv_seq_len) continue;
+
+        #pragma unroll
+        for (uint dd = 0; dd < 4; dd++) {
+            uint d = simd_lane_id * 4 + dd;
+            dK_head[global_k_idx * D + d] = half(dk_local[r][dd] * params.scale);
+            dV_head[global_k_idx * D + d] = half(dv_local[r][dd]);
         }
     }
 }
@@ -690,7 +773,7 @@ kernel void flash_attention_backward_dkv_d128_causal(
 // Additional Head Dimension Variants
 // =============================================================================
 
-// D=64 variants
+// D=64 variant: each lane handles 2 D-elements (64/32), 8 rows per group
 kernel void flash_attention_forward_d64_causal(
     device const half* Q [[buffer(0)]],
     device const half* K [[buffer(1)]],
@@ -703,8 +786,131 @@ kernel void flash_attention_forward_d64_causal(
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
-    // Similar to D=128 but with D=64 and optimized block sizes
-    // Implementation follows same pattern
+    const uint Bq = 32;
+    const uint Bk = 32;
+    const uint D = 64;
+    const uint ROWS_PER_GROUP = 8;
+
+    const uint batch_idx = tgid.z;
+    const uint head_idx = tgid.y;
+    const uint q_block_idx = tgid.x;
+    const uint kv_head_idx = head_idx / params.gqa_ratio;
+    const uint q_start = q_block_idx * Bq;
+
+    const uint q_batch_stride = params.num_heads * params.query_seq_len * D;
+    const uint q_head_stride = params.query_seq_len * D;
+    const uint kv_batch_stride = params.num_kv_heads * params.kv_seq_len * D;
+    const uint kv_head_stride = params.kv_seq_len * D;
+
+    device const half* Q_head = Q + batch_idx * q_batch_stride + head_idx * q_head_stride;
+    device const half* K_head = K + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
+    device const half* V_head = V + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
+    device half* O_head = O + batch_idx * q_batch_stride + head_idx * q_head_stride;
+    device float* L_head = L + batch_idx * params.num_heads * params.query_seq_len
+                             + head_idx * params.query_seq_len;
+
+    // 3 tiles * 32 * 64 * 2 = 12288 bytes
+    threadgroup half Q_tile[Bq * D];
+    threadgroup half K_tile[Bk * D];
+    threadgroup half V_tile[Bk * D];
+
+    const uint group_row_start = simd_group_id * ROWS_PER_GROUP;
+
+    float m_i[ROWS_PER_GROUP];
+    float l_i[ROWS_PER_GROUP];
+    float o_local[ROWS_PER_GROUP][2];  // 2 elements per lane for D=64
+
+    #pragma unroll
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        m_i[r] = -INFINITY;
+        l_i[r] = 0.0f;
+        o_local[r][0] = o_local[r][1] = 0.0f;
+    }
+
+    for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bq * D; i += 128) {
+        uint q_row = i / D;
+        uint q_col = i % D;
+        uint global_q_row = q_start + q_row;
+        Q_tile[i] = (global_q_row < params.query_seq_len)
+                   ? Q_head[global_q_row * D + q_col] : half(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint kv_end = IS_CAUSAL ? min(q_start + Bq, params.kv_seq_len) : params.kv_seq_len;
+    uint num_kv_blocks = (kv_end + Bk - 1) / Bk;
+
+    for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+        uint k_start = kv_block * Bk;
+        uint k_end_actual = min(k_start + Bk, params.kv_seq_len);
+
+        for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
+            uint row = i / D;
+            uint col = i % D;
+            uint global_row = k_start + row;
+            K_tile[i] = (global_row < k_end_actual) ? K_head[global_row * D + col] : half(0.0f);
+        }
+        for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
+            uint row = i / D;
+            uint col = i % D;
+            uint global_row = k_start + row;
+            V_tile[i] = (global_row < k_end_actual) ? V_head[global_row * D + col] : half(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+            uint my_row = group_row_start + r;
+            uint global_q_pos = q_start + my_row;
+            if (my_row >= Bq || global_q_pos >= params.query_seq_len) continue;
+
+            for (uint k = 0; k < Bk && k_start + k < k_end_actual; k++) {
+                // SIMD-parallel dot: each lane does 2 mults for D=64
+                float partial = 0.0f;
+                #pragma unroll
+                for (uint dd = 0; dd < 2; dd++) {
+                    uint d = simd_lane_id * 2 + dd;
+                    partial += float(Q_tile[my_row * D + d]) * float(K_tile[k * D + d]);
+                }
+                float score = simd_sum_f32(partial) * params.scale;
+
+                uint global_k_pos = k_start + k;
+                if (IS_CAUSAL && global_k_pos > global_q_pos) score = -INFINITY;
+                if (params.sliding_window > 0 && global_q_pos > global_k_pos + params.sliding_window)
+                    score = -INFINITY;
+                if (params.softcap > 0.0f && score > -INFINITY)
+                    score = params.softcap * tanh(score / params.softcap);
+
+                float m_new = max(m_i[r], score);
+                float correction = fast_exp(m_i[r] - m_new);
+                float p = fast_exp(score - m_new);
+                l_i[r] = correction * l_i[r] + p;
+
+                #pragma unroll
+                for (uint dd = 0; dd < 2; dd++) {
+                    uint d = simd_lane_id * 2 + dd;
+                    o_local[r][dd] = correction * o_local[r][dd]
+                                   + p * float(V_tile[k * D + d]);
+                }
+                m_i[r] = m_new;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
+        uint global_q_idx = q_start + my_row;
+        if (my_row >= Bq || global_q_idx >= params.query_seq_len) continue;
+
+        float inv_l = (l_i[r] > 0.0f) ? 1.0f / l_i[r] : 0.0f;
+        #pragma unroll
+        for (uint dd = 0; dd < 2; dd++) {
+            uint d = simd_lane_id * 2 + dd;
+            O_head[global_q_idx * D + d] = half(o_local[r][dd] * inv_l);
+        }
+        if (simd_lane_id == 0) {
+            L_head[global_q_idx] = m_i[r] + log(max(l_i[r], 1e-10f));
+        }
+    }
 }
 
 kernel void flash_attention_backward_dq_d64_causal(
@@ -721,170 +927,146 @@ kernel void flash_attention_backward_dq_d64_causal(
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
-    // Configuration for D=64 (reduced block sizes to fit threadgroup memory)
     const uint Bq = 32;
     const uint Bk = 32;
     const uint D = 64;
-    const uint SIMD_SIZE = 32;
+    const uint ROWS_PER_GROUP = 8;
 
-    // Grid position
     const uint batch_idx = tgid.z;
     const uint head_idx = tgid.y;
     const uint q_block_idx = tgid.x;
-
+    const uint kv_head_idx = head_idx / params.gqa_ratio;
     const uint q_start = q_block_idx * Bq;
 
-    // Strides
     const uint q_batch_stride = params.num_heads * params.query_seq_len * D;
     const uint q_head_stride = params.query_seq_len * D;
     const uint kv_batch_stride = params.num_kv_heads * params.kv_seq_len * D;
     const uint kv_head_stride = params.kv_seq_len * D;
-    const uint l_batch_stride = params.num_heads * params.query_seq_len;
-    const uint l_head_stride = params.query_seq_len;
 
-    // GQA head mapping
-    const uint kv_head_idx = head_idx / params.gqa_ratio;
-
-    // Get pointers to this batch/head
     device const half* Q_head = Q + batch_idx * q_batch_stride + head_idx * q_head_stride;
     device const half* K_head = K + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
     device const half* V_head = V + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
+    device const half* O_head = O + batch_idx * q_batch_stride + head_idx * q_head_stride;
     device const half* dO_head = dO + batch_idx * q_batch_stride + head_idx * q_head_stride;
-    device const float* L_head = L + batch_idx * l_batch_stride + head_idx * l_head_stride;
+    device const float* L_head = L + batch_idx * params.num_heads * params.query_seq_len
+                                   + head_idx * params.query_seq_len;
     device half* dQ_head = dQ + batch_idx * q_batch_stride + head_idx * q_head_stride;
 
-    // Thread position (4 threadgroups with 32 threads each = 128 threads)
-    const uint my_row = simd_group_id;
-    const uint my_col_start = simd_lane_id;
+    // Q_tile + K_tile + dO_tile = 3 * 4KB = 12KB
+    threadgroup half Q_tile[Bq * D];
+    threadgroup half K_tile[Bk * D];
+    threadgroup half dO_tile[Bq * D];
 
-    // Pointer for O (needed for D_i computation)
-    device const half* O_head = O + batch_idx * q_batch_stride + head_idx * q_head_stride;
+    const uint group_row_start = simd_group_id * ROWS_PER_GROUP;
 
-    // Shared memory for tiles (reduced sizes to fit in 32KB)
-    // Bq*D*2 + Bk*D*2 + Bq*D*2 + Bq*D*2 + Bq*4 + Bq*4 = ~24KB
-    threadgroup half Q_tile[32 * 64];    // 4KB
-    threadgroup half K_tile[32 * 64];    // 4KB
-    threadgroup half V_tile[32 * 64];    // 4KB
-    threadgroup half dO_tile[32 * 64];   // 4KB
-    threadgroup half O_tile[32 * 64];    // 4KB - Output for D_i computation
-    threadgroup float L_tile[32];        // 128B
-    threadgroup float D_tile[32];        // 128B - D_i = rowsum(dO * O)
+    float dq_local[ROWS_PER_GROUP][2];
+    float d_i[ROWS_PER_GROUP];
+    float l_val[ROWS_PER_GROUP];
 
-    // Local gradient accumulator (2 registers for D=64 with stride 32)
-    float dq_local[2] = {0.0f, 0.0f};
+    #pragma unroll
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        dq_local[r][0] = dq_local[r][1] = 0.0f;
+        d_i[r] = 0.0f;
+        l_val[r] = 0.0f;
+    }
 
-    // Load Q, dO, and O tiles
-    for (uint i = tid.x; i < Bq * D; i += SIMD_SIZE * 4) {
+    // Load Q and dO tiles
+    for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bq * D; i += 128) {
         uint row = i / D;
         uint col = i % D;
         uint global_row = q_start + row;
-
         if (global_row < params.query_seq_len) {
             Q_tile[i] = Q_head[global_row * D + col];
             dO_tile[i] = dO_head[global_row * D + col];
-            O_tile[i] = O_head[global_row * D + col];
         } else {
             Q_tile[i] = half(0.0f);
             dO_tile[i] = half(0.0f);
-            O_tile[i] = half(0.0f);
         }
     }
-
-    // Load logsumexp
-    if (tid.x < Bq) {
-        uint global_row = q_start + tid.x;
-        if (global_row < params.query_seq_len) {
-            L_tile[tid.x] = L_head[global_row];
-        } else {
-            L_tile[tid.x] = 0.0f;
-        }
-    }
-
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Compute D_i = rowsum(dO * O) for each query row (FlashAttention-2 correction term)
-    if (my_row < Bq && q_start + my_row < params.query_seq_len) {
-        float d_i = 0.0f;
-        for (uint d = 0; d < D; d++) {
-            d_i += float(dO_tile[my_row * D + d]) * float(O_tile[my_row * D + d]);
+    // Compute D_i and load L (per-group, from device O)
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
+        uint global_q_row = q_start + my_row;
+        if (my_row >= Bq || global_q_row >= params.query_seq_len) continue;
+
+        float partial_di = 0.0f;
+        #pragma unroll
+        for (uint dd = 0; dd < 2; dd++) {
+            uint d = simd_lane_id * 2 + dd;
+            partial_di += float(dO_tile[my_row * D + d])
+                        * float(O_head[global_q_row * D + d]);
         }
-        D_tile[my_row] = d_i;
+        d_i[r] = simd_sum_f32(partial_di);
+
+        if (simd_lane_id == 0) l_val[r] = L_head[global_q_row];
+        l_val[r] = simd_shuffle(l_val[r], 0);
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    uint kv_end = min(q_start + Bq, params.kv_seq_len);
+    uint num_kv_blocks = (kv_end + Bk - 1) / Bk;
 
-    // Iterate over KV blocks
-    uint num_kv_blocks = (params.kv_seq_len + Bk - 1) / Bk;
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         uint k_start = kv_block * Bk;
 
-        // Load K and V tiles
-        for (uint i = tid.x; i < Bk * D; i += SIMD_SIZE * 4) {
+        for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
             uint row = i / D;
             uint col = i % D;
             uint global_row = k_start + row;
-
-            if (global_row < params.kv_seq_len) {
-                K_tile[i] = K_head[global_row * D + col];
-                V_tile[i] = V_head[global_row * D + col];
-            } else {
-                K_tile[i] = half(0.0f);
-                V_tile[i] = half(0.0f);
-            }
+            K_tile[i] = (global_row < params.kv_seq_len)
+                       ? K_head[global_row * D + col] : half(0.0f);
         }
-
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Compute attention scores and gradients
-        if (my_row < Bq && q_start + my_row < params.query_seq_len) {
-            float l_i = L_tile[my_row];
+        for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+            uint my_row = group_row_start + r;
+            uint global_q_pos = q_start + my_row;
+            if (my_row >= Bq || global_q_pos >= params.query_seq_len) continue;
 
             for (uint k_idx = 0; k_idx < Bk; k_idx++) {
                 uint global_k_pos = k_start + k_idx;
-                uint global_q_pos = q_start + my_row;
+                if (global_k_pos > global_q_pos || global_k_pos >= params.kv_seq_len) continue;
 
-                // Skip masked positions (causal)
-                if (global_k_pos > global_q_pos || global_k_pos >= params.kv_seq_len) {
-                    continue;
+                float partial_s = 0.0f;
+                #pragma unroll
+                for (uint dd = 0; dd < 2; dd++) {
+                    uint d = simd_lane_id * 2 + dd;
+                    partial_s += float(Q_tile[my_row * D + d]) * float(K_tile[k_idx * D + d]);
                 }
+                float s = simd_sum_f32(partial_s) * params.scale;
+                float p = fast_exp(s - l_val[r]);
 
-                // Recompute attention score
-                float s = 0.0f;
-                for (uint d = 0; d < D; d++) {
-                    s += float(Q_tile[my_row * D + d]) * float(K_tile[k_idx * D + d]);
+                float partial_dov = 0.0f;
+                #pragma unroll
+                for (uint dd = 0; dd < 2; dd++) {
+                    uint d = simd_lane_id * 2 + dd;
+                    partial_dov += float(dO_tile[my_row * D + d])
+                                 * float(V_head[(k_start + k_idx) * D + d]);
                 }
-                s *= params.scale;
+                float dov = simd_sum_f32(partial_dov);
 
-                // Compute softmax probability using stored logsumexp
-                float p = fast_exp(s - l_i);
+                float ds = p * (dov - d_i[r]);
 
-                // Compute dO @ V^T for this position
-                float dov = 0.0f;
-                for (uint d = 0; d < D; d++) {
-                    dov += float(dO_tile[my_row * D + d]) * float(V_tile[k_idx * D + d]);
-                }
-
-                // Gradient through softmax (FlashAttention-2 correct formula)
-                // dS_ij = P_ij * (dP_ij - D_i) where D_i = rowsum(dO * O)
-                float ds = p * (dov - D_tile[my_row]);
-
-                // Accumulate to local registers
-                for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-                    uint local_idx = d / SIMD_SIZE;
-                    dq_local[local_idx] += ds * float(K_tile[k_idx * D + d]);
+                #pragma unroll
+                for (uint dd = 0; dd < 2; dd++) {
+                    uint d = simd_lane_id * 2 + dd;
+                    dq_local[r][dd] += ds * float(K_tile[k_idx * D + d]);
                 }
             }
         }
-
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Write dQ output
-    if (my_row < Bq && q_start + my_row < params.query_seq_len) {
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
         uint global_q_idx = q_start + my_row;
-        for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-            uint local_idx = d / SIMD_SIZE;
-            dQ_head[global_q_idx * D + d] = half(dq_local[local_idx] * params.scale);
+        if (my_row >= Bq || global_q_idx >= params.query_seq_len) continue;
+
+        #pragma unroll
+        for (uint dd = 0; dd < 2; dd++) {
+            uint d = simd_lane_id * 2 + dd;
+            dQ_head[global_q_idx * D + d] = half(dq_local[r][dd] * params.scale);
         }
     }
 }
@@ -978,20 +1160,26 @@ kernel void flash_attention_varlen_forward_d128(
     device half* O_seq = O + seq_start * token_stride + head_idx * head_stride;
     device float* L_seq = L + seq_start * params.num_heads + head_idx;
 
-    // Shared memory
+    // Threadgroup memory: Q_tile + K_tile + V_tile = 3 * 8KB = 24KB
     threadgroup half Q_tile[Bq * D];
     threadgroup half K_tile[Bk * D];
     threadgroup half V_tile[Bk * D];
-    threadgroup float S_tile[Bq * Bk];
 
-    // Thread mapping
-    const uint my_row = simd_group_id * 4 + (tid.y % 4);
-    const uint my_col_start = simd_lane_id;
+    // 8 rows per SIMD group (4 groups × 8 rows = 32 = Bq)
+    const uint ROWS_PER_GROUP = 8;
+    const uint group_row_start = simd_group_id * ROWS_PER_GROUP;
 
-    // Local accumulators
-    float m_i = -INFINITY;
-    float l_i = 0.0f;
-    float o_local[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // Per-row accumulators
+    float m_i[ROWS_PER_GROUP];
+    float l_i[ROWS_PER_GROUP];
+    float o_local[ROWS_PER_GROUP][4]; // 4 D-elements per lane (128/32)
+
+    #pragma unroll
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        m_i[r] = -INFINITY;
+        l_i[r] = 0.0f;
+        o_local[r][0] = o_local[r][1] = o_local[r][2] = o_local[r][3] = 0.0f;
+    }
 
     // Load Q tile (NHD layout, stride by num_heads * D between tokens)
     for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bq * D; i += 128) {
@@ -1014,7 +1202,7 @@ kernel void flash_attention_varlen_forward_d128(
         uint k_start = kv_block * Bk;
         uint k_end = min(k_start + Bk, seq_len);
 
-        // Load K, V tiles
+        // Load K, V tiles (NHD layout)
         for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
             uint k_row = i / D;
             uint k_col = i % D;
@@ -1029,80 +1217,70 @@ kernel void flash_attention_varlen_forward_d128(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Compute S = Q @ K^T
-        if (my_row < Bq && q_start + my_row < seq_len) {
+        // Per-row, per-key online softmax with SIMD-parallel dot products
+        for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+            uint my_row = group_row_start + r;
+            uint global_q = q_start + my_row;
+            if (my_row >= Bq || global_q >= seq_len) continue;
+
             for (uint k_idx = 0; k_idx < Bk; k_idx++) {
-                float score = 0.0f;
-
-                for (uint d = 0; d < D; d++) {
-                    score += float(Q_tile[my_row * D + d]) * float(K_tile[k_idx * D + d]);
-                }
-                score *= params.scale;
-
-                // Block-diagonal mask (sequence boundary) + causal mask
-                uint global_q = q_start + my_row;
                 uint global_k = k_start + k_idx;
 
+                // Masking: sequence boundary + causal + sliding window
                 bool masked = false;
-                if (global_k >= seq_len || (params.is_causal && global_k > global_q)) {
-                    masked = true;
-                }
-                
-                // Sliding window mask
-                if (params.sliding_window > 0 && global_q > global_k + params.sliding_window) {
-                    masked = true;
-                }
+                if (global_k >= seq_len) masked = true;
+                if (params.is_causal && global_k > global_q) masked = true;
+                if (params.sliding_window > 0 && global_q > global_k + params.sliding_window) masked = true;
 
-                if (masked) {
-                    score = -INFINITY;
-                } else if (params.softcap > 0.0f) {
+                if (masked) continue;
+
+                // SIMD-parallel Q·K dot product
+                float partial = 0.0f;
+                #pragma unroll
+                for (uint dd = 0; dd < 4; dd++) {
+                    uint d = simd_lane_id * 4 + dd;
+                    partial += float(Q_tile[my_row * D + d]) * float(K_tile[k_idx * D + d]);
+                }
+                float score = simd_sum_f32(partial) * params.scale;
+
+                // Softcapping
+                if (params.softcap > 0.0f) {
                     score = params.softcap * tanh(score / params.softcap);
                 }
 
-                S_tile[my_row * Bk + k_idx] = score;
-            }
-        }
+                // Online softmax update (per-element, correct)
+                float m_new = max(m_i[r], score);
+                float correction = fast_exp(m_i[r] - m_new);
+                float p = fast_exp(score - m_new);
+                l_i[r] = correction * l_i[r] + p;
 
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        // Online softmax update
-        if (my_row < Bq && q_start + my_row < seq_len) {
-            float m_new = m_i;
-            for (uint k = 0; k < Bk && k_start + k < k_end; k++) {
-                m_new = max(m_new, S_tile[my_row * Bk + k]);
-            }
-
-            float correction = exp(m_i - m_new);
-            float l_new = correction * l_i;
-
-            for (uint k = 0; k < Bk && k_start + k < k_end; k++) {
-                float p = exp(S_tile[my_row * Bk + k] - m_new);
-                l_new += p;
-
-                for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-                    o_local[d / SIMD_SIZE % 4] = correction * o_local[d / SIMD_SIZE % 4]
-                                                  + p * float(V_tile[k * D + d]);
+                #pragma unroll
+                for (uint dd = 0; dd < 4; dd++) {
+                    uint d = simd_lane_id * 4 + dd;
+                    o_local[r][dd] = correction * o_local[r][dd]
+                                     + p * float(V_tile[k_idx * D + d]);
                 }
+                m_i[r] = m_new;
             }
-
-            m_i = m_new;
-            l_i = l_new;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Normalize and write output
-    if (my_row < Bq && q_start + my_row < seq_len) {
+    // Normalize and write output (NHD layout)
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
         uint global_q_idx = q_start + my_row;
-        float inv_l = 1.0f / l_i;
+        if (my_row >= Bq || global_q_idx >= seq_len) continue;
 
-        for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-            O_seq[global_q_idx * token_stride + d] = half(o_local[d / SIMD_SIZE % 4] * inv_l);
+        float inv_l = (l_i[r] > 0.0f) ? 1.0f / l_i[r] : 0.0f;
+        #pragma unroll
+        for (uint dd = 0; dd < 4; dd++) {
+            uint d = simd_lane_id * 4 + dd;
+            O_seq[global_q_idx * token_stride + d] = half(o_local[r][dd] * inv_l);
         }
-
         if (simd_lane_id == 0) {
-            L_seq[global_q_idx * params.num_heads] = m_i + log(l_i);
+            L_seq[global_q_idx * params.num_heads] = m_i[r] + log(max(l_i[r], 1e-10f));
         }
     }
 }
@@ -1162,17 +1340,28 @@ kernel void flash_attention_varlen_forward_d64(
     device half* O_seq = O + seq_start * token_stride + head_idx * head_stride;
     device float* L_seq = L + seq_start * params.num_heads + head_idx;
 
+    // Threadgroup memory: Q_tile + K_tile + V_tile = 3 * 8KB = 24KB
     threadgroup half Q_tile[Bq * D];
     threadgroup half K_tile[Bk * D];
     threadgroup half V_tile[Bk * D];
 
-    const uint my_row = simd_group_id * 4 + (tid.y % 4);
+    // 16 rows per SIMD group (4 groups × 16 rows = 64 = Bq)
+    const uint ROWS_PER_GROUP = 16;
+    const uint group_row_start = simd_group_id * ROWS_PER_GROUP;
 
-    float m_i = -INFINITY;
-    float l_i = 0.0f;
-    float o_local[2] = {0.0f, 0.0f};
+    // Per-row accumulators
+    float m_i[ROWS_PER_GROUP];
+    float l_i[ROWS_PER_GROUP];
+    float o_local[ROWS_PER_GROUP][2]; // 2 D-elements per lane (64/32)
 
-    // Load Q tile
+    #pragma unroll
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        m_i[r] = -INFINITY;
+        l_i[r] = 0.0f;
+        o_local[r][0] = o_local[r][1] = 0.0f;
+    }
+
+    // Load Q tile (NHD layout)
     for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bq * D; i += 128) {
         uint q_row = i / D;
         uint q_col = i % D;
@@ -1192,6 +1381,7 @@ kernel void flash_attention_varlen_forward_d64(
         uint k_start = kv_block * Bk;
         uint k_end = min(k_start + Bk, seq_len);
 
+        // Load K, V tiles (NHD layout)
         for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
             uint k_row = i / D;
             uint k_col = i % D;
@@ -1206,46 +1396,58 @@ kernel void flash_attention_varlen_forward_d64(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        if (my_row < Bq && q_start + my_row < seq_len) {
+        // Per-row, per-key online softmax with SIMD-parallel dot products
+        for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+            uint my_row = group_row_start + r;
+            uint global_q = q_start + my_row;
+            if (my_row >= Bq || global_q >= seq_len) continue;
+
             for (uint k_idx = 0; k_idx < Bk && k_start + k_idx < k_end; k_idx++) {
-                float score = 0.0f;
-                for (uint d = 0; d < D; d++) {
-                    score += float(Q_tile[my_row * D + d]) * float(K_tile[k_idx * D + d]);
-                }
-                score *= params.scale;
-
                 uint global_k = k_start + k_idx;
-                uint global_q = q_start + my_row;
-                if (params.is_causal && global_k > global_q) {
-                    score = -INFINITY;
-                }
+                if (params.is_causal && global_k > global_q) continue;
 
-                float m_new = max(m_i, score);
-                float correction = exp(m_i - m_new);
-                l_i = correction * l_i + exp(score - m_new);
-
-                float p = exp(score - m_new);
-                for (uint d = simd_lane_id; d < D; d += SIMD_SIZE) {
-                    o_local[d / SIMD_SIZE] = correction * o_local[d / SIMD_SIZE]
-                                              + p * float(V_tile[k_idx * D + d]);
+                // SIMD-parallel Q·K dot product
+                float partial = 0.0f;
+                #pragma unroll
+                for (uint dd = 0; dd < 2; dd++) {
+                    uint d = simd_lane_id * 2 + dd;
+                    partial += float(Q_tile[my_row * D + d]) * float(K_tile[k_idx * D + d]);
                 }
-                m_i = m_new;
+                float score = simd_sum_f32(partial) * params.scale;
+
+                // Online softmax update
+                float m_new = max(m_i[r], score);
+                float correction = fast_exp(m_i[r] - m_new);
+                float p = fast_exp(score - m_new);
+                l_i[r] = correction * l_i[r] + p;
+
+                #pragma unroll
+                for (uint dd = 0; dd < 2; dd++) {
+                    uint d = simd_lane_id * 2 + dd;
+                    o_local[r][dd] = correction * o_local[r][dd]
+                                     + p * float(V_tile[k_idx * D + d]);
+                }
+                m_i[r] = m_new;
             }
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (my_row < Bq && q_start + my_row < seq_len) {
+    // Normalize and write output (NHD layout)
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
         uint global_q_idx = q_start + my_row;
-        float inv_l = 1.0f / l_i;
+        if (my_row >= Bq || global_q_idx >= seq_len) continue;
 
-        for (uint d = simd_lane_id; d < D; d += SIMD_SIZE) {
-            O_seq[global_q_idx * token_stride + d] = half(o_local[d / SIMD_SIZE] * inv_l);
+        float inv_l = (l_i[r] > 0.0f) ? 1.0f / l_i[r] : 0.0f;
+        #pragma unroll
+        for (uint dd = 0; dd < 2; dd++) {
+            uint d = simd_lane_id * 2 + dd;
+            O_seq[global_q_idx * token_stride + d] = half(o_local[r][dd] * inv_l);
         }
-
         if (simd_lane_id == 0) {
-            L_seq[global_q_idx * params.num_heads] = m_i + log(l_i);
+            L_seq[global_q_idx * params.num_heads] = m_i[r] + log(max(l_i[r], 1e-10f));
         }
     }
 }
@@ -1293,29 +1495,31 @@ kernel void flash_attention_backward_dkv_d64_causal(
     device half* dK_head = dK + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
     device half* dV_head = dV + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
 
-    // Thread position
-    const uint my_row = simd_group_id;
-    const uint my_col_start = simd_lane_id;
+    // 8 rows per SIMD group (4 groups × 8 rows = 32 = Bk)
+    const uint ROWS_PER_GROUP = 8;
+    const uint group_row_start = simd_group_id * ROWS_PER_GROUP;
 
-    // Shared memory for tiles (reduced sizes to fit in 32KB)
-    threadgroup half K_tile[32 * 64];    // 4KB
-    threadgroup half V_tile[32 * 64];    // 4KB
-    threadgroup half Q_tile[32 * 64];    // 4KB
-    threadgroup half O_tile[32 * 64];    // 4KB - forward output for D_i
-    threadgroup half dO_tile[32 * 64];   // 4KB
-    threadgroup float L_tile[32];        // 128B
-    threadgroup float D_tile[32];        // 128B - D_i = rowsum(dO * O)
+    // Threadgroup memory: K_tile + V_tile + Q_tile + dO_tile = 4 * 4KB = 16KB
+    threadgroup half K_tile[Bk * D];     // 32 * 64 * 2 = 4KB
+    threadgroup half V_tile[Bk * D];     // 4KB
+    threadgroup half Q_tile[Bq * D];     // 4KB
+    threadgroup half dO_tile[Bq * D];    // 4KB
 
-    // Local gradient accumulators (2 registers for D=64 with stride 32)
-    float dk_local[2] = {0.0f, 0.0f};
-    float dv_local[2] = {0.0f, 0.0f};
+    // Per-row gradient accumulators
+    float dk_local[ROWS_PER_GROUP][2];
+    float dv_local[ROWS_PER_GROUP][2];
+
+    #pragma unroll
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        dk_local[r][0] = dk_local[r][1] = 0.0f;
+        dv_local[r][0] = dv_local[r][1] = 0.0f;
+    }
 
     // Load K and V tiles for this block
-    for (uint i = tid.x; i < Bk * D; i += SIMD_SIZE * 4) {
+    for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bk * D; i += 128) {
         uint row = i / D;
         uint col = i % D;
         uint global_row = k_start + row;
-
         if (global_row < params.kv_seq_len) {
             K_tile[i] = K_head[global_row * D + col];
             V_tile[i] = V_head[global_row * D + col];
@@ -1337,92 +1541,80 @@ kernel void flash_attention_backward_dkv_d64_causal(
         device const half* dO_head = dO + batch_idx * q_batch_stride + q_head_idx * q_head_stride;
         device const float* L_head = L + batch_idx * l_batch_stride + q_head_idx * l_head_stride;
 
-        // Iterate over Q blocks
         uint num_q_blocks = (params.query_seq_len + Bq - 1) / Bq;
         for (uint q_block = 0; q_block < num_q_blocks; q_block++) {
             uint q_start = q_block * Bq;
 
-            // Load Q, O, dO, and L tiles
-            for (uint i = tid.x; i < Bq * D; i += SIMD_SIZE * 4) {
+            // Load Q and dO tiles
+            for (uint i = tid.y * SIMD_SIZE + tid.x; i < Bq * D; i += 128) {
                 uint row = i / D;
                 uint col = i % D;
                 uint global_row = q_start + row;
-
                 if (global_row < params.query_seq_len) {
                     Q_tile[i] = Q_head[global_row * D + col];
-                    O_tile[i] = O_head[global_row * D + col];
                     dO_tile[i] = dO_head[global_row * D + col];
                 } else {
                     Q_tile[i] = half(0.0f);
-                    O_tile[i] = half(0.0f);
                     dO_tile[i] = half(0.0f);
                 }
             }
 
-            if (tid.x < Bq) {
-                uint global_row = q_start + tid.x;
-                if (global_row < params.query_seq_len) {
-                    L_tile[tid.x] = L_head[global_row];
-                } else {
-                    L_tile[tid.x] = 0.0f;
-                }
-            }
-
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Compute D_i = rowsum(dO * O) for exact FlashAttention-2 gradients
-            if (tid.x < Bq) {
-                float d_sum = 0.0f;
-                for (uint d = 0; d < D; d++) {
-                    d_sum += float(dO_tile[tid.x * D + d]) * float(O_tile[tid.x * D + d]);
-                }
-                D_tile[tid.x] = d_sum;
-            }
-
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-
-            // Compute gradients
-            if (my_row < Bk && k_start + my_row < params.kv_seq_len) {
+            // Compute gradients for each KV row
+            for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+                uint my_row = group_row_start + r;
+                if (my_row >= Bk || k_start + my_row >= params.kv_seq_len) continue;
                 uint global_k_pos = k_start + my_row;
 
                 for (uint q_idx = 0; q_idx < Bq; q_idx++) {
                     uint global_q_pos = q_start + q_idx;
                     if (global_q_pos >= params.query_seq_len) continue;
+                    if (global_k_pos > global_q_pos) continue; // causal mask
 
-                    // Skip if causal mask applies
-                    if (global_k_pos > global_q_pos) continue;
-
-                    float l_i = L_tile[q_idx];
-
-                    // Recompute attention score
-                    float s = 0.0f;
-                    for (uint d = 0; d < D; d++) {
-                        s += float(Q_tile[q_idx * D + d]) * float(K_tile[my_row * D + d]);
+                    // Compute D_i = dot(dO_i, O_i) via SIMD reduction
+                    float partial_di = 0.0f;
+                    #pragma unroll
+                    for (uint dd = 0; dd < 2; dd++) {
+                        uint d = simd_lane_id * 2 + dd;
+                        partial_di += float(dO_tile[q_idx * D + d])
+                                    * float(O_head[global_q_pos * D + d]);
                     }
-                    s *= params.scale;
+                    float d_i = simd_sum_f32(partial_di);
 
-                    // Softmax probability
-                    float p = fast_exp(s - l_i);
+                    // Read L from device, broadcast via SIMD shuffle
+                    float l_val = 0.0f;
+                    if (simd_lane_id == 0) l_val = L_head[global_q_pos];
+                    l_val = simd_shuffle(l_val, 0);
 
-                    // Compute dP_ij = dO @ V^T (once per q_idx, k_idx pair)
-                    float dov = 0.0f;
-                    for (uint dd = 0; dd < D; dd++) {
-                        dov += float(dO_tile[q_idx * D + dd]) * float(V_tile[my_row * D + dd]);
+                    // SIMD-parallel attention score recomputation
+                    float partial_s = 0.0f;
+                    #pragma unroll
+                    for (uint dd = 0; dd < 2; dd++) {
+                        uint d = simd_lane_id * 2 + dd;
+                        partial_s += float(Q_tile[q_idx * D + d]) * float(K_tile[my_row * D + d]);
                     }
+                    float s = simd_sum_f32(partial_s) * params.scale;
+                    float p = fast_exp(s - l_val);
 
-                    // dS_ij = P_ij * (dP_ij - D_i) where D_i = rowsum(dO * O)
-                    // Use precomputed D_i for exact FlashAttention-2 gradients
-                    float d_i = D_tile[q_idx];
+                    // Compute dov = dot(dO_i, V_j) via SIMD reduction
+                    float partial_dov = 0.0f;
+                    #pragma unroll
+                    for (uint dd = 0; dd < 2; dd++) {
+                        uint d = simd_lane_id * 2 + dd;
+                        partial_dov += float(dO_tile[q_idx * D + d])
+                                     * float(V_tile[my_row * D + d]);
+                    }
+                    float dov = simd_sum_f32(partial_dov);
+
                     float ds = p * (dov - d_i);
 
                     // Accumulate dK and dV
-                    for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-                        uint local_idx = d / SIMD_SIZE;
-                        // dV += P^T @ dO
-                        dv_local[local_idx] += p * float(dO_tile[q_idx * D + d]);
-
-                        // dK += dS^T @ Q
-                        dk_local[local_idx] += ds * float(Q_tile[q_idx * D + d]) * params.scale;
+                    #pragma unroll
+                    for (uint dd = 0; dd < 2; dd++) {
+                        uint d = simd_lane_id * 2 + dd;
+                        dv_local[r][dd] += p * float(dO_tile[q_idx * D + d]);
+                        dk_local[r][dd] += ds * float(Q_tile[q_idx * D + d]) * params.scale;
                     }
                 }
             }
@@ -1432,12 +1624,16 @@ kernel void flash_attention_backward_dkv_d64_causal(
     }
 
     // Write dK and dV output
-    if (my_row < Bk && k_start + my_row < params.kv_seq_len) {
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
+        if (my_row >= Bk || k_start + my_row >= params.kv_seq_len) continue;
         uint global_k_idx = k_start + my_row;
-        for (uint d = my_col_start; d < D; d += SIMD_SIZE) {
-            uint local_idx = d / SIMD_SIZE;
-            dK_head[global_k_idx * D + d] = half(dk_local[local_idx]);
-            dV_head[global_k_idx * D + d] = half(dv_local[local_idx]);
+
+        #pragma unroll
+        for (uint dd = 0; dd < 2; dd++) {
+            uint d = simd_lane_id * 2 + dd;
+            dK_head[global_k_idx * D + d] = half(dk_local[r][dd]);
+            dV_head[global_k_idx * D + d] = half(dv_local[r][dd]);
         }
     }
 }

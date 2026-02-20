@@ -634,7 +634,7 @@ mod tests {
             dropout: 0.0,
             use_rslora: false,
             target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
-            bias: "none".to_string(),
+            bias: pmetal_core::LoraBias::None,
             init_lora_weights: true,
             use_dora: false,
         }

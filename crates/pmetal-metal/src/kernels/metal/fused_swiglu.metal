@@ -24,6 +24,13 @@ using namespace metal;
 #define SIMD_SIZE 32
 #define THREADS_PER_TOKEN 256
 
+// Tile the intermediate computation to stay within 32KB threadgroup memory limit.
+// 2048 floats * 4 bytes = 8KB per chunk; two chunks (gate/up) = 16KB, well within 32KB.
+// Host must allocate threadgroup memory of SWIGLU_CHUNK_SIZE * sizeof(float) bytes
+// for scratch in the non-lora variants, and (2 * lora_rank + SWIGLU_CHUNK_SIZE) * sizeof(float)
+// bytes for the lora variants.
+#define SWIGLU_CHUNK_SIZE 2048
+
 /// Parameters for fused SwiGLU kernel
 struct FusedSwiGLUParams {
     uint batch_size;          // Number of tokens
@@ -381,8 +388,11 @@ kernel void fused_swiglu_lora_forward_tiled(
 
 /// Complete fused MLP: down_proj(silu(gate_proj(x)) * up_proj(x))
 ///
-/// This is the ultimate fusion - the entire MLP in one kernel.
-/// Requires more threadgroup memory but eliminates ALL intermediate tensors.
+/// Tiles the intermediate dimension in chunks of SWIGLU_CHUNK_SIZE to stay within
+/// the 32KB threadgroup memory limit.  The down projection accumulates contributions
+/// from each chunk into fp32 registers before writing the final result.
+///
+/// Host must allocate SWIGLU_CHUNK_SIZE * sizeof(float) bytes for scratch [[threadgroup(0)]].
 kernel void fused_mlp_forward(
     device const float* input [[buffer(0)]],          // [batch, hidden_size]
     device const float* gate_weight [[buffer(1)]],    // [intermediate_size, hidden_size]
@@ -392,49 +402,77 @@ kernel void fused_mlp_forward(
     constant FusedSwiGLUParams& params [[buffer(5)]],
     uint token_idx [[threadgroup_position_in_grid]],
     uint thread_idx [[thread_index_in_threadgroup]],
-    threadgroup float* scratch [[threadgroup(0)]]
+    threadgroup float* scratch [[threadgroup(0)]]     // SWIGLU_CHUNK_SIZE floats (8KB)
 ) {
     if (token_idx >= params.batch_size) return;
 
     device const float* x = input + token_idx * params.hidden_size;
     device float* out = output + token_idx * params.hidden_size;
 
-    // Scratch holds the intermediate SwiGLU output [intermediate_size]
-    threadgroup float* swiglu_out = scratch;
+    // scratch holds one chunk of SwiGLU activations [SWIGLU_CHUNK_SIZE]
+    threadgroup float* swiglu_chunk = scratch;
 
-    // Phase 1: Compute SwiGLU for all intermediate dimensions
-    for (uint i = thread_idx; i < params.intermediate_size; i += THREADS_PER_TOKEN) {
-        device const float* gate_row = gate_weight + i * params.hidden_size;
-        device const float* up_row = up_weight + i * params.hidden_size;
+    // Accumulators for the down-projection output (one per thread's output elements)
+    // Each thread accumulates THREADS_PER_TOKEN-strided hidden elements
+    // Process the intermediate dimension in SWIGLU_CHUNK_SIZE tiles
+    uint num_chunks = (params.intermediate_size + SWIGLU_CHUNK_SIZE - 1) / SWIGLU_CHUNK_SIZE;
 
-        float gate_val = 0.0f;
-        float up_val = 0.0f;
-
-        for (uint h = 0; h < params.hidden_size; h++) {
-            float x_val = x[h];
-            gate_val += x_val * gate_row[h];
-            up_val += x_val * up_row[h];
-        }
-
-        swiglu_out[i] = silu(gate_val) * up_val;
+    // Initialize per-thread hidden accumulators to zero
+    // We process hidden_size outputs, each thread owns hidden elements at stride THREADS_PER_TOKEN
+    // Use a second loop pass to accumulate
+    for (uint h = thread_idx; h < params.hidden_size; h += THREADS_PER_TOKEN) {
+        out[h] = 0.0f;
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint chunk = 0; chunk < num_chunks; chunk++) {
+        uint chunk_start = chunk * SWIGLU_CHUNK_SIZE;
+        uint chunk_end   = min(chunk_start + SWIGLU_CHUNK_SIZE, params.intermediate_size);
+        uint chunk_len   = chunk_end - chunk_start;
 
-    // Phase 2: Down projection
-    for (uint h = thread_idx; h < params.hidden_size; h += THREADS_PER_TOKEN) {
-        device const float* down_row = down_weight + h * params.intermediate_size;
+        // Phase A: Compute SwiGLU for this chunk
+        for (uint ci = thread_idx; ci < chunk_len; ci += THREADS_PER_TOKEN) {
+            uint i = chunk_start + ci;
+            device const float* gate_row = gate_weight + i * params.hidden_size;
+            device const float* up_row   = up_weight   + i * params.hidden_size;
 
-        float result = 0.0f;
-        for (uint i = 0; i < params.intermediate_size; i++) {
-            result += swiglu_out[i] * down_row[i];
+            float gate_val = 0.0f;
+            float up_val   = 0.0f;
+            for (uint h = 0; h < params.hidden_size; h++) {
+                float x_val = x[h];
+                gate_val += x_val * gate_row[h];
+                up_val   += x_val * up_row[h];
+            }
+            swiglu_chunk[ci] = silu(gate_val) * up_val;
         }
 
-        out[h] = result;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase B: Accumulate down-projection contributions from this chunk
+        for (uint h = thread_idx; h < params.hidden_size; h += THREADS_PER_TOKEN) {
+            device const float* down_row = down_weight + h * params.intermediate_size + chunk_start;
+            float partial = 0.0f;
+            for (uint ci = 0; ci < chunk_len; ci++) {
+                partial += swiglu_chunk[ci] * down_row[ci];
+            }
+            out[h] += partial;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
 /// Complete fused MLP with LoRA on all three projections.
+///
+/// Tiles the intermediate dimension in chunks of SWIGLU_CHUNK_SIZE to stay within
+/// the 32KB threadgroup memory limit.
+///
+/// Scratch layout (host must allocate):
+///   [0 .. lora_rank-1]               = x @ gate_A.T
+///   [lora_rank .. 2*lora_rank-1]      = x @ up_A.T
+///   [2*lora_rank .. 2*lora_rank+lora_rank-1]      = swiglu_chunk @ down_A.T (partial, per chunk)
+///   [3*lora_rank .. 3*lora_rank+SWIGLU_CHUNK_SIZE-1] = swiglu chunk activations
+/// Total: (3*lora_rank + SWIGLU_CHUNK_SIZE) * sizeof(float)
+/// At rank=256 and CHUNK_SIZE=2048: (768 + 2048)*4 = ~11KB, well within 32KB.
 kernel void fused_mlp_lora_forward(
     device const float* input [[buffer(0)]],
     device const float* gate_weight [[buffer(1)]],
@@ -458,99 +496,111 @@ kernel void fused_mlp_lora_forward(
     device float* out = output + token_idx * params.hidden_size;
 
     // Scratch layout:
-    // [0..lora_rank-1] = x @ gate_A.T
-    // [lora_rank..2*lora_rank-1] = x @ up_A.T
-    // [2*lora_rank..2*lora_rank+intermediate_size-1] = SwiGLU output
-    // [2*lora_rank+intermediate_size..] = swiglu @ down_A.T
+    // [0..lora_rank-1]                           = x @ gate_A.T
+    // [lora_rank..2*lora_rank-1]                 = x @ up_A.T
+    // [2*lora_rank..3*lora_rank-1]               = partial swiglu @ down_A.T (accumulated per chunk)
+    // [3*lora_rank..3*lora_rank+CHUNK_SIZE-1]    = swiglu chunk activations
+    threadgroup float* x_gate_a    = scratch;
+    threadgroup float* x_up_a      = scratch + params.lora_rank;
+    threadgroup float* down_a_acc  = scratch + 2 * params.lora_rank;  // running sum over chunks
+    threadgroup float* swiglu_chunk = scratch + 3 * params.lora_rank;
 
-    threadgroup float* x_gate_a = scratch;
-    threadgroup float* x_up_a = scratch + params.lora_rank;
-    threadgroup float* swiglu_out = scratch + 2 * params.lora_rank;
-    threadgroup float* swiglu_down_a = scratch + 2 * params.lora_rank + params.intermediate_size;
-
-    // Phase 1: Compute gate/up LoRA down projections
+    // Phase 1: Compute gate/up LoRA down projections (x @ gate_A.T, x @ up_A.T)
     for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
         device const float* gate_a_row = gate_lora_a + r * params.hidden_size;
-        device const float* up_a_row = up_lora_a + r * params.hidden_size;
+        device const float* up_a_row   = up_lora_a   + r * params.hidden_size;
 
         float gate_dot = 0.0f;
-        float up_dot = 0.0f;
-
+        float up_dot   = 0.0f;
         for (uint h = 0; h < params.hidden_size; h++) {
             float x_val = x[h];
             gate_dot += x_val * gate_a_row[h];
-            up_dot += x_val * up_a_row[h];
+            up_dot   += x_val * up_a_row[h];
         }
-
         x_gate_a[r] = gate_dot;
-        x_up_a[r] = up_dot;
+        x_up_a[r]   = up_dot;
     }
 
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Phase 2: Compute SwiGLU output
-    for (uint i = thread_idx; i < params.intermediate_size; i += THREADS_PER_TOKEN) {
-        device const float* gate_row = gate_weight + i * params.hidden_size;
-        device const float* up_row = up_weight + i * params.hidden_size;
-        device const float* gate_b_row = gate_lora_b + i * params.lora_rank;
-        device const float* up_b_row = up_lora_b + i * params.lora_rank;
-
-        float gate_val = 0.0f;
-        float up_val = 0.0f;
-
-        for (uint h = 0; h < params.hidden_size; h++) {
-            float x_val = x[h];
-            gate_val += x_val * gate_row[h];
-            up_val += x_val * up_row[h];
-        }
-
-        float gate_lora = 0.0f;
-        float up_lora = 0.0f;
-
-        for (uint r = 0; r < params.lora_rank; r++) {
-            gate_lora += x_gate_a[r] * gate_b_row[r];
-            up_lora += x_up_a[r] * up_b_row[r];
-        }
-
-        gate_val += params.lora_scale * gate_lora;
-        up_val += params.lora_scale * up_lora;
-
-        swiglu_out[i] = silu(gate_val) * up_val;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    // Phase 3: Compute down LoRA down projection: swiglu @ down_A.T
+    // Initialize down_a_acc to zero
     for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
-        device const float* down_a_row = down_lora_a + r * params.intermediate_size;
-
-        float dot = 0.0f;
-        for (uint i = 0; i < params.intermediate_size; i++) {
-            dot += swiglu_out[i] * down_a_row[i];
-        }
-
-        swiglu_down_a[r] = dot;
+        down_a_acc[r] = 0.0f;
     }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 4: Final down projection with LoRA
+    // Initialize output accumulators to zero
     for (uint h = thread_idx; h < params.hidden_size; h += THREADS_PER_TOKEN) {
-        device const float* down_row = down_weight + h * params.intermediate_size;
-        device const float* down_b_row = down_lora_b + h * params.lora_rank;
+        out[h] = 0.0f;
+    }
 
-        // Base projection
-        float result = 0.0f;
-        for (uint i = 0; i < params.intermediate_size; i++) {
-            result += swiglu_out[i] * down_row[i];
+    // Process intermediate dimension in SWIGLU_CHUNK_SIZE chunks
+    uint num_chunks = (params.intermediate_size + SWIGLU_CHUNK_SIZE - 1) / SWIGLU_CHUNK_SIZE;
+
+    for (uint chunk = 0; chunk < num_chunks; chunk++) {
+        uint chunk_start = chunk * SWIGLU_CHUNK_SIZE;
+        uint chunk_end   = min(chunk_start + uint(SWIGLU_CHUNK_SIZE), params.intermediate_size);
+        uint chunk_len   = chunk_end - chunk_start;
+
+        // Phase 2A: Compute SwiGLU for this chunk
+        for (uint ci = thread_idx; ci < chunk_len; ci += THREADS_PER_TOKEN) {
+            uint i = chunk_start + ci;
+            device const float* gate_row   = gate_weight + i * params.hidden_size;
+            device const float* up_row     = up_weight   + i * params.hidden_size;
+            device const float* gate_b_row = gate_lora_b + i * params.lora_rank;
+            device const float* up_b_row   = up_lora_b   + i * params.lora_rank;
+
+            float gate_val = 0.0f;
+            float up_val   = 0.0f;
+            for (uint h = 0; h < params.hidden_size; h++) {
+                float x_val = x[h];
+                gate_val += x_val * gate_row[h];
+                up_val   += x_val * up_row[h];
+            }
+
+            float gate_lora = 0.0f;
+            float up_lora   = 0.0f;
+            for (uint r = 0; r < params.lora_rank; r++) {
+                gate_lora += x_gate_a[r] * gate_b_row[r];
+                up_lora   += x_up_a[r]   * up_b_row[r];
+            }
+
+            gate_val += params.lora_scale * gate_lora;
+            up_val   += params.lora_scale * up_lora;
+            swiglu_chunk[ci] = silu(gate_val) * up_val;
         }
 
-        // LoRA contribution
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Phase 2B: Accumulate partial down_lora_a projection: swiglu_chunk @ down_A.T[:, chunk]
+        for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
+            device const float* down_a_row = down_lora_a + r * params.intermediate_size + chunk_start;
+            float dot = 0.0f;
+            for (uint ci = 0; ci < chunk_len; ci++) {
+                dot += swiglu_chunk[ci] * down_a_row[ci];
+            }
+            down_a_acc[r] += dot;
+        }
+
+        // Phase 2C: Accumulate down-projection base contribution from this chunk
+        for (uint h = thread_idx; h < params.hidden_size; h += THREADS_PER_TOKEN) {
+            device const float* down_row = down_weight + h * params.intermediate_size + chunk_start;
+            float partial = 0.0f;
+            for (uint ci = 0; ci < chunk_len; ci++) {
+                partial += swiglu_chunk[ci] * down_row[ci];
+            }
+            out[h] += partial;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Phase 3: Add LoRA contribution to down projection
+    for (uint h = thread_idx; h < params.hidden_size; h += THREADS_PER_TOKEN) {
+        device const float* down_b_row = down_lora_b + h * params.lora_rank;
         float lora = 0.0f;
         for (uint r = 0; r < params.lora_rank; r++) {
-            lora += swiglu_down_a[r] * down_b_row[r];
+            lora += down_a_acc[r] * down_b_row[r];
         }
-
-        out[h] = result + params.lora_scale * lora;
+        out[h] += params.lora_scale * lora;
     }
 }

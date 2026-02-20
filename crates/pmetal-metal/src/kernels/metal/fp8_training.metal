@@ -260,7 +260,9 @@ kernel void fp8_act_quant_block(
 
     // First thread writes scale
     if (lid == 0) {
-        uint scale_idx = row * (K / block_size) + block_idx;
+        // Use ceiling division so the scale index is correct when K is not
+        // divisible by block_size (fixes MED-M1 off-by-one on the last block).
+        uint scale_idx = row * ((K + block_size - 1) / block_size) + block_idx;
         scales[scale_idx] = scale;
     }
 
@@ -335,7 +337,9 @@ kernel void fp8_grad_quant_block(
 
     // First thread writes scale
     if (lid == 0) {
-        uint scale_idx = row * (K / block_size) + block_idx;
+        // Use ceiling division so the scale index is correct when K is not
+        // divisible by block_size (fixes MED-M1 off-by-one on the last block).
+        uint scale_idx = row * ((K + block_size - 1) / block_size) + block_idx;
         scales[scale_idx] = scale;
     }
 
@@ -418,9 +422,11 @@ kernel void fp8_block_gemm(
     uint tile_m = tgid.y * BLOCK_M;
     uint tile_n = tgid.x * BLOCK_N;
 
-    // Shared memory for tiles (stored as floats for compute)
-    threadgroup float A_tile[BLOCK_M][BLOCK_K];
-    threadgroup float B_tile[BLOCK_K][BLOCK_N];
+    // Shared memory for tiles (stored as floats for compute).
+    // Flattened to 1D: MSL does not support 2D threadgroup arrays (MED-M2 fix).
+    // Access: A_tile[row * BLOCK_K + col], B_tile[row * BLOCK_N + col]
+    threadgroup float A_tile[BLOCK_M * BLOCK_K];
+    threadgroup float B_tile[BLOCK_K * BLOCK_N];
 
     // Accumulator for this thread
     float acc[4][4] = {{0.0f}};
@@ -441,17 +447,17 @@ kernel void fp8_block_gemm(
             uint global_k = k_start + local_k;
 
             if (global_m < M && global_k < K) {
-                // Unpack Activation (E4M3 or E5M2?) 
+                // Unpack Activation (E4M3 or E5M2?)
                 // Usually Activations are E5M2, Weights are E4M3. Or both E4M3.
                 // We'll assume E4M3 for this general kernel.
                 float val = unpack_fp8_e4m3(A[global_m * K + global_k]);
-                
+
                 // Apply activation scale
                 uint scale_k = global_k / group_k;
                 float a_scale = A_scales[global_m * (K / group_k) + scale_k];
-                A_tile[local_m][local_k] = val * a_scale;
+                A_tile[local_m * BLOCK_K + local_k] = val * a_scale;
             } else {
-                A_tile[local_m][local_k] = 0.0f;
+                A_tile[local_m * BLOCK_K + local_k] = 0.0f;
             }
         }
 
@@ -465,14 +471,14 @@ kernel void fp8_block_gemm(
             if (global_n < N && global_k < K) {
                 // Unpack Weight (E4M3)
                 float val = unpack_fp8_e4m3(B[global_n * K + global_k]);
-                
+
                 // Apply weight scale
                 uint scale_n = global_n / group_n;
                 uint scale_k = global_k / group_k;
                 float b_scale = B_scales[scale_n * (K / group_k) + scale_k];
-                B_tile[local_k][local_n] = val * b_scale;
+                B_tile[local_k * BLOCK_N + local_n] = val * b_scale;
             } else {
-                B_tile[local_k][local_n] = 0.0f;
+                B_tile[local_k * BLOCK_N + local_n] = 0.0f;
             }
         }
 
@@ -487,8 +493,8 @@ kernel void fp8_block_gemm(
             float b_vals[4];
 
             for (uint i = 0; i < 4; i++) {
-                a_vals[i] = A_tile[thread_m + i][k];
-                b_vals[i] = B_tile[k][thread_n + i];
+                a_vals[i] = A_tile[(thread_m + i) * BLOCK_K + k];
+                b_vals[i] = B_tile[k * BLOCK_N + (thread_n + i)];
             }
 
             for (uint i = 0; i < 4; i++) {

@@ -167,9 +167,20 @@ impl AdamWGroups {
 impl Optimizer for AdamWGroups {
     type State = State<(Array, Array)>;
 
+    /// Returns the LoRA optimizer state.
+    ///
+    /// # Note on checkpoint completeness
+    ///
+    /// The `Optimizer` trait requires a single `&Self::State` reference, so
+    /// this method can only expose one of the two internal optimizers.  The
+    /// embedding optimizer momentum/velocity is intentionally included through
+    /// the `Updatable` implementation instead: `updatable_states()` chains
+    /// both `lora_optimizer` and `embedding_optimizer` states, ensuring that
+    /// mlx-rs checkpoint serialization captures all optimizer state.
+    ///
+    /// If you are checkpointing manually via `Optimizer::state()`, also call
+    /// `self.embedding_optimizer.state()` to persist embedding optimizer state.
     fn state(&self) -> &Self::State {
-        // Return the combined state (we'll need to handle this carefully)
-        // For now, just return the LoRA optimizer state
         &self.lora_optimizer.state
     }
 

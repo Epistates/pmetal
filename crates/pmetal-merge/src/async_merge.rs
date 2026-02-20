@@ -444,19 +444,11 @@ impl AsyncMergePipeline {
         // Step 2: Sparsify
         let sparse_vectors = crate::sparsify_batch_by_magnitude(&task_vectors, densities)?;
 
-        // Step 3: Sign consensus
-        let consensus_mask = crate::sign_consensus(&sparse_vectors, weights)?;
+        // Step 3: Sign consensus (returns weighted sum of agreeing contributions).
+        let weighted_sum = crate::sign_consensus(&sparse_vectors, weights)?;
 
-        // Step 4: Masked weighted sum
-        let mut result = Array::zeros::<f32>(base.shape())?;
-        for (sparse, weight) in sparse_vectors.iter().zip(weights.iter()) {
-            let masked = sparse.multiply(&consensus_mask)?;
-            let weighted = masked.multiply(Array::from_f32(*weight))?;
-            result = result.add(&weighted)?;
-        }
-
-        // Step 5: Scale and add to base
-        result = result.multiply(Array::from_f32(lambda))?;
+        // Step 4: Scale and add to base
+        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
         Ok(base.add(&result)?)
     }
 

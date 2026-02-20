@@ -238,30 +238,22 @@ impl MergeMethod for BreadcrumbsMerge {
             .map(|tv| self.sparsify(tv))
             .collect::<Result<Vec<_>>>()?;
 
-        // Optionally apply sign consensus
-        let final_vectors = if self.use_ties_consensus {
-            let consensus_mask = sign_consensus(&sparse_vectors, &weights)?;
-            let mut result_vecs = Vec::with_capacity(sparse_vectors.len());
-            for v in sparse_vectors.iter() {
-                result_vecs.push(v.multiply(&consensus_mask)?);
-            }
-            result_vecs
+        // Optionally apply sign consensus and compute the weighted sum.
+        // sign_consensus returns the weighted sum of agreeing contributions directly.
+        let weighted_sum = if self.use_ties_consensus {
+            sign_consensus(&sparse_vectors, &weights)?
         } else {
-            sparse_vectors
+            // Compute weighted sum without sign filtering.
+            let mut acc = mlx_rs::ops::zeros::<f32>(task_vectors[0].shape())?;
+            for (vector, weight) in sparse_vectors.iter().zip(weights.iter()) {
+                let weighted = vector.multiply(Array::from_f32(*weight))?;
+                acc = acc.add(&weighted)?;
+            }
+            acc
         };
 
-        // Compute weighted sum
-        let mut result = mlx_rs::ops::zeros::<f32>(task_vectors[0].shape())?;
-
-        for (vector, weight) in final_vectors.iter().zip(weights.iter()) {
-            let weighted = vector.multiply(Array::from_f32(*weight))?;
-            result = result.add(&weighted)?;
-        }
-
-        // Scale by lambda
-        result = result.multiply(Array::from_f32(lambda))?;
-
-        // Add back to base
+        // Scale by lambda and add back to base
+        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
         Ok(base.add(&result)?)
     }
 }

@@ -36,13 +36,16 @@ kernel void moe_topk_selection(
     if (tid >= params.num_tokens) return;
 
     uint num_experts = params.num_experts;
-    uint topk = params.topk;
+    // Clamp topk to num_experts to prevent out-of-bounds reads and garbage output
+    // when the caller passes topk > num_experts.
+    uint effective_topk = min(params.topk, num_experts);
 
     // Pointer to this token's logits
     device const float* logits = router_logits + tid * num_experts;
 
-    // Compute softmax or sigmoid
-    threadgroup float scores[256]; // Max experts
+    // Thread-private score buffer (not threadgroup — each thread owns its own token's scores).
+    // Declared at kernel function scope as required by MSL.
+    float scores[256]; // Max experts
 
     if (params.use_sigmoid) {
         // Sigmoid activation
@@ -70,11 +73,11 @@ kernel void moe_topk_selection(
         }
     }
 
-    // TopK selection using partial sort
-    device float* out_weights = topk_weights + tid * topk;
-    device uint* out_ids = topk_ids + tid * topk;
+    // TopK selection using partial sort (bounded by effective_topk <= num_experts)
+    device float* out_weights = topk_weights + tid * effective_topk;
+    device uint* out_ids = topk_ids + tid * effective_topk;
 
-    for (uint k = 0; k < topk; k++) {
+    for (uint k = 0; k < effective_topk; k++) {
         float best_score = -1e10f;
         uint best_idx = 0;
 
@@ -93,11 +96,11 @@ kernel void moe_topk_selection(
     // Renormalize if needed
     if (params.renormalize) {
         float sum = 0.0f;
-        for (uint k = 0; k < topk; k++) {
+        for (uint k = 0; k < effective_topk; k++) {
             sum += out_weights[k];
         }
         float inv_sum = 1.0f / sum;
-        for (uint k = 0; k < topk; k++) {
+        for (uint k = 0; k < effective_topk; k++) {
             out_weights[k] *= inv_sum;
         }
     }
@@ -120,9 +123,7 @@ kernel void moe_compute_indices(
     device uint* gather_indices [[buffer(2)]],
     device uint* expert_offsets [[buffer(3)]],  // Prefix sum workspace
     constant MoeRoutingParams& params [[buffer(4)]],
-    uint tid [[thread_position_in_grid]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint simd_lane [[thread_index_in_simdgroup]]
+    uint tid [[thread_position_in_grid]]
 ) {
     uint total_tokens = params.num_tokens * params.topk;
 
@@ -131,12 +132,11 @@ kernel void moe_compute_indices(
     // Get expert for this token-expert pair
     uint expert_id = topk_ids[tid];
 
-    // Atomically increment count and get position
-    uint pos = atomic_fetch_add_explicit(&token_counts[expert_id], 1, memory_order_relaxed);
+    // Atomically increment the per-expert token count (pos is intentionally discarded;
+    // the final sorted position is computed in moe_sort_indices using expert_offsets).
+    atomic_fetch_add_explicit(&token_counts[expert_id], 1, memory_order_relaxed);
 
-    // Store in gather_indices - will be sorted by expert
-    // The final position is: expert_offsets[expert_id] + pos
-    // But we compute expert_offsets in a separate pass
+    // Store the expert assignment; moe_sort_indices will later scatter into sorted order.
     gather_indices[tid] = expert_id;
 }
 

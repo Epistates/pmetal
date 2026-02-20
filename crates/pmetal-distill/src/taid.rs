@@ -336,11 +336,22 @@ impl TaidDistiller {
         let kl_per_sample = kl_per_token.sum_axis(-1, None)?.sum_axis(-1, None)?;
         kl_per_sample.eval()?;
 
-        // Normalize difficulty to [0, 1] range using sigmoid
-        // Higher KL = harder sample = higher alpha
+        // Normalize difficulty to [0, 1] range using a shifted sigmoid so that
+        // KL ≈ 0 (easy sample) maps to normalized_diff ≈ 0 → alpha ≈ base_alpha.
+        //
+        // Without shifting, sigmoid(0) = 0.5, so an easy sample with KL=0 would
+        // receive alpha = base_alpha + 0.5 * (max_alpha - base_alpha), i.e. always
+        // halfway to max_alpha even on trivially easy samples.
+        //
+        // The shift is: shifted_kl = scale * kl - kl_threshold
+        // where kl_threshold is chosen so sigmoid(-kl_threshold) ≈ 0.
+        // We use kl_threshold = 5.0 (sigmoid(-5) ≈ 0.007) as a practical value.
         let scale = Array::from_f32(self.config.difficulty_scale as f32);
-        let difficulty = kl_per_sample.multiply(&scale)?;
-        let sigmoid_diff = difficulty.negative()?.exp()?.add(&Array::from_f32(1.0))?;
+        let kl_threshold = Array::from_f32(5.0_f32);
+        let scaled_kl = kl_per_sample.multiply(&scale)?;
+        // shifted_kl < 0 when kl is small → sigmoid ≈ 0 → alpha ≈ base_alpha
+        let shifted_kl = scaled_kl.subtract(&kl_threshold)?;
+        let sigmoid_diff = shifted_kl.negative()?.exp()?.add(&Array::from_f32(1.0))?;
         let normalized_diff = Array::from_f32(1.0).divide(&sigmoid_diff)?;
 
         // Adjust alpha: alpha = base_alpha + difficulty_adjustment
@@ -485,40 +496,32 @@ impl TaidDistiller {
         // Optional hard target loss
         let hard_loss = if self.config.hard_target_weight > 0.0 {
             if let Some(lbl) = labels {
-                // Cross-entropy with ground truth
+                // Cross-entropy with ground truth using vectorized GPU gather.
+                // Replaces an O(B*S) element-wise loop with a single take_along_axis
+                // call, eliminating per-element GPU-CPU syncs.
                 let student_log_probs_unscaled = log_softmax(student_logits, -1)?;
-                // Gather log probs at label positions
-                // This is a simplified version - full implementation would handle padding
-                let batch_size = student_logits.dim(0);
-                let seq_len = student_logits.dim(1);
-                let _vocab_size = student_logits.dim(2);
 
                 // Create mask for valid labels (not -100)
                 let valid_mask = lbl.ne(&Array::from_int(-100))?;
                 let valid_mask_f32 = valid_mask.as_dtype(mlx_rs::Dtype::Float32)?;
 
-                // Replace -100 with 0 for gathering
+                // Replace -100 with 0 for safe gathering (masked out afterward)
                 let safe_labels = mlx_rs::ops::maximum(lbl, &Array::from_int(0))?;
 
-                // Manual gather - for each position, get the log prob at the label index
-                let mut ce_values = Vec::new();
-                student_log_probs_unscaled.eval()?;
-                safe_labels.eval()?;
+                // Vectorized gather: take_along_axis selects log_prob at label index
+                // for every (batch, seq) position in a single GPU operation.
+                // This replaces an O(B*S) nested loop of individual .item() reads.
+                let gather_indices = safe_labels.expand_dims(-1i32)?;
+                let target_log_probs = student_log_probs_unscaled
+                    .take_along_axis(&gather_indices, -1)?
+                    .squeeze_axes(&[-1i32])?;
 
-                for b in 0..batch_size {
-                    for s in 0..seq_len {
-                        let label_idx = safe_labels.index((b as i32, s as i32));
-                        label_idx.eval()?;
-                        let idx = label_idx.item::<i32>();
-                        let log_prob = student_log_probs_unscaled.index((b as i32, s as i32, idx));
-                        log_prob.eval()?;
-                        ce_values.push(-log_prob.item::<f32>());
-                    }
-                }
-
-                let ce_array = Array::from_slice(&ce_values, &[batch_size, seq_len]);
+                // CE = -log_prob at the target token
+                let ce_array = target_log_probs.negative()?;
                 let masked_ce = ce_array.multiply(&valid_mask_f32)?;
-                let total_valid = valid_mask_f32.sum(None)?;
+                let total_valid_sum = valid_mask_f32.sum(None)?;
+                let total_valid =
+                    mlx_rs::ops::maximum(&total_valid_sum, &Array::from_f32(1.0))?;
                 Some(masked_ce.sum(None)?.divide(&total_valid)?)
             } else {
                 None

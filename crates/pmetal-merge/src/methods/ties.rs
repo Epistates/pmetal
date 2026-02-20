@@ -76,21 +76,13 @@ impl TiesMerge {
             .map(|(tv, &density)| sparsify_by_magnitude(tv, density))
             .collect::<Result<Vec<_>>>()?;
 
-        // Step 2: Apply sign consensus
-        // Only keep parameters where the weighted majority agrees on the sign
-        let consensus_mask = sign_consensus(&sparse_vectors, weights)?;
+        // Step 2: Apply sign consensus and compute weighted sum.
+        // sign_consensus returns the sum of contributions whose sign agrees with
+        // the majority, with disagreeing model parameters zeroed out (TIES paper §3).
+        let result = sign_consensus(&sparse_vectors, weights)?;
 
-        // Step 3: Apply consensus mask and compute weighted sum
-        let mut result = Array::zeros::<f32>(task_vectors[0].shape())?;
-
-        for (sparse, weight) in sparse_vectors.iter().zip(weights.iter()) {
-            let masked = sparse.multiply(&consensus_mask)?;
-            let weighted = masked.multiply(Array::from_f32(*weight))?;
-            result = result.add(&weighted)?;
-        }
-
-        // Step 4: Scale by lambda
-        result = result.multiply(Array::from_f32(lambda))?;
+        // Step 3: Scale by lambda
+        let result = result.multiply(Array::from_f32(lambda))?;
 
         Ok(result)
     }

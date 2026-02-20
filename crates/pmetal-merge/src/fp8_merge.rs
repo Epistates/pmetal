@@ -1,12 +1,19 @@
-//! FP8 Quantized Merge Operations.
+//! Quantized Merge Operations (int8 block quantization).
 //!
-//! This module provides FP8-accelerated merge operations for ~2x memory reduction
-//! with dynamic scaling to maintain accuracy.
+//! This module provides int8-quantized merge operations for ~4x memory reduction
+//! relative to f32, with per-block dynamic scaling to maintain accuracy.
+//!
+//! # Implementation Note
+//!
+//! Despite the "Fp8" naming (retained for API compatibility), the quantization
+//! scheme stores values as signed int8 in the range [-127, 127] with a per-block
+//! f32 scale factor. This is standard symmetric int8 block quantization, not
+//! the IEEE FP8 (E4M3/E5M2) format.
 //!
 //! # Memory Savings
 //!
 //! - F32 merge: 4 bytes per element
-//! - FP8 merge: ~1.5 bytes per element (8 bits + scale overhead)
+//! - Int8 merge: ~1.5 bytes per element (8 bits + scale overhead per block)
 //! - Savings: ~60% memory reduction
 //!
 //! # Dynamic Scaling
@@ -22,7 +29,7 @@
 //! let config = Fp8MergeConfig::default();
 //! let merger = Fp8Merger::new(config);
 //!
-//! // Merge tensors in FP8
+//! // Merge tensors with int8 quantization
 //! let merged = merger.ties_merge_fp8(tensors, base, weights, densities, lambda)?;
 //! ```
 
@@ -31,30 +38,40 @@ use tracing::debug;
 
 use crate::{MergeError, Result};
 
-/// FP8 format type for quantization.
+/// Quantization format selector.
+///
+/// Note: the names `E4M3`/`E5M2` are retained for API compatibility, but the
+/// actual storage is always symmetric int8 (`[-127, 127]`) with a per-block
+/// f32 scale. The `max_value` field governs the dynamic-scale history window
+/// and does not represent an IEEE FP8 bit layout.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Fp8Format {
-    /// E4M3: 4-bit exponent, 3-bit mantissa. Range +-448. Best for weights.
+    /// "Standard" profile: scale history tuned for weights (narrower dynamic range).
+    /// Equivalent to int8 block quantization with 127-level precision.
     E4M3,
-    /// E5M2: 5-bit exponent, 2-bit mantissa. Range +-57344. Best for activations.
+    /// "Wide range" profile: scale history tuned for activations (wider dynamic range).
+    /// Equivalent to int8 block quantization with 127-level precision.
     E5M2,
 }
 
 impl Fp8Format {
-    /// Maximum representable value for this format.
+    /// Reference dynamic range used for scale history computation.
+    ///
+    /// This value does not correspond to an IEEE FP8 max; it is used as a
+    /// reference ceiling in the dynamic scale tracker.
     pub fn max_value(&self) -> f32 {
         match self {
-            Self::E4M3 => 448.0,
-            Self::E5M2 => 57344.0,
+            // Int8 stores 127 positive levels; reference ceiling kept at 127 for symmetry.
+            Self::E4M3 => 127.0,
+            Self::E5M2 => 127.0,
         }
     }
 
-    /// Minimum representable non-zero value.
+    /// Minimum representable non-zero absolute value (one int8 quantization step).
     pub fn min_value(&self) -> f32 {
-        match self {
-            Self::E4M3 => 1.0 / 448.0,   // 2^-9
-            Self::E5M2 => 1.0 / 16384.0, // 2^-14
-        }
+        // With scale = amax/127, the minimum non-zero value is 1/127 * amax.
+        // Expressed as a fraction of max_value:
+        1.0 / 127.0
     }
 }
 
@@ -412,20 +429,11 @@ impl Fp8Merger {
             crate::sparsify_batch_by_magnitude(&dequant_vectors, densities)?
         };
 
-        // Step 3: Sign consensus
-        let consensus_mask = crate::sign_consensus(&sparse_vectors, weights)?;
+        // Step 3: Sign consensus (returns weighted sum of agreeing contributions).
+        let weighted_sum = crate::sign_consensus(&sparse_vectors, weights)?;
 
-        // Step 4: Masked weighted sum - can use FP8
-        let mut result = Array::zeros::<f32>(base.shape())?;
-
-        for (sparse, weight) in sparse_vectors.iter().zip(weights.iter()) {
-            let masked = sparse.multiply(&consensus_mask)?;
-            let weighted = masked.multiply(Array::from_f32(*weight))?;
-            result = result.add(&weighted)?;
-        }
-
-        // Step 5: Scale and add to base
-        result = result.multiply(Array::from_f32(lambda))?;
+        // Step 4: Scale and add to base
+        let result = weighted_sum.multiply(Array::from_f32(lambda))?;
         Ok(base.add(&result)?)
     }
 
@@ -485,8 +493,9 @@ mod tests {
 
     #[test]
     fn test_fp8_format_values() {
-        assert_eq!(Fp8Format::E4M3.max_value(), 448.0);
-        assert_eq!(Fp8Format::E5M2.max_value(), 57344.0);
+        // Both profiles use int8 precision (127 levels).
+        assert_eq!(Fp8Format::E4M3.max_value(), 127.0);
+        assert_eq!(Fp8Format::E5M2.max_value(), 127.0);
     }
 
     #[test]

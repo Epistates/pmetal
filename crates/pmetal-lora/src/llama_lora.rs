@@ -988,18 +988,14 @@ impl LlamaLoraForCausalLM {
         Ok(())
     }
 
-    /// Unmerge LoRA weights from base weights.
+    /// Unmerge is not supported.
+    ///
+    /// Once merged, the original base weights are lost. To restore the adapter,
+    /// reload the base model weights from disk.
     pub fn unmerge_lora(&mut self) -> Result<(), LoraError> {
-        for layer in &mut self.model.layers {
-            layer.self_attn.q_proj.unmerge()?;
-            layer.self_attn.k_proj.unmerge()?;
-            layer.self_attn.v_proj.unmerge()?;
-            layer.self_attn.o_proj.unmerge()?;
-            layer.mlp.gate_proj.unmerge()?;
-            layer.mlp.up_proj.unmerge()?;
-            layer.mlp.down_proj.unmerge()?;
-        }
-        Ok(())
+        Err(LoraError::InvalidState(
+            "unmerge_lora is not supported: reload base model weights to undo a merge".to_string(),
+        ))
     }
 
     /// Save LoRA weights to safetensors.
@@ -1298,9 +1294,9 @@ impl LlamaLoraForCausalLM {
 /// The implementation returns ALL params for `parameters()` but only LoRA params
 /// for `trainable_parameters()` - this means gradients are only computed for LoRA params.
 impl ModuleParameters for LlamaLoraForCausalLM {
+    /// Returns the number of trainable (LoRA) parameters.
     fn num_parameters(&self) -> usize {
-        // Count all parameters (base + LoRA)
-        self.model.num_trainable_params() // For simplicity, just return LoRA count
+        self.model.num_trainable_params()
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
@@ -1622,7 +1618,7 @@ mod tests {
                 "v_proj".to_string(),
                 "o_proj".to_string(),
             ],
-            bias: "none".to_string(),
+            bias: pmetal_core::LoraBias::None,
             init_lora_weights: true,
             use_dora: false,
         }
@@ -1667,7 +1663,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lora_merge_unmerge() {
+    fn test_lora_merge() {
         let config = small_config();
         let lora_config = small_lora_config();
         let mut model = LlamaLoraForCausalLM::new(config, lora_config).unwrap();
@@ -1681,24 +1677,18 @@ mod tests {
         // Merge
         model.merge_lora().unwrap();
 
-        // Get output after merge
+        // Get output after merge - should be numerically equivalent
         let output_after = model.forward(&input_ids, None).unwrap();
         output_after.eval().unwrap();
 
-        // Outputs should be close
+        // Outputs should be close (LoRA merge is numerically equivalent)
         let diff = output_before.subtract(&output_after).unwrap();
         let max_diff = diff.abs().unwrap().max(None).unwrap();
         max_diff.eval().unwrap();
         assert!(max_diff.item::<f32>() < 1e-4);
 
-        // Unmerge and verify
-        model.unmerge_lora().unwrap();
-        let output_unmerged = model.forward(&input_ids, None).unwrap();
-        output_unmerged.eval().unwrap();
-
-        let diff2 = output_before.subtract(&output_unmerged).unwrap();
-        let max_diff2 = diff2.abs().unwrap().max(None).unwrap();
-        max_diff2.eval().unwrap();
-        assert!(max_diff2.item::<f32>() < 1e-4);
+        // unmerge_lora() is intentionally unsupported - verify it returns an error.
+        // To restore original weights after merging, reload the base model checkpoint.
+        assert!(model.unmerge_lora().is_err());
     }
 }

@@ -18,6 +18,7 @@
 use super::{softmax, DistillLoss};
 use crate::Result;
 use mlx_rs::Array;
+use tracing;
 
 #[cfg(feature = "metal")]
 use std::sync::Arc;
@@ -189,27 +190,30 @@ impl KlDivergenceLoss {
         let teacher_scaled = teacher_logits.divide(&temp)?;
         let student_scaled = student_logits.divide(&temp)?;
 
-        // Compute softmax probabilities
-        let teacher_probs = softmax(&teacher_scaled, -1)?;
-        let student_probs = softmax(&student_scaled, -1)?;
+        // Diagnostics
+        if let Ok(t_max) = teacher_scaled.max(false) {
+            t_max.eval().ok();
+            if t_max.item::<f32>().is_infinite() || t_max.item::<f32>().is_nan() {
+                tracing::warn!("KL fallback: teacher_scaled contains Inf/NaN after temperature scaling");
+            }
+        }
 
-        // Add small epsilon for numerical stability
-        let eps = Array::from_f32(1e-10);
-        let teacher_safe = teacher_probs.add(&eps)?;
-        let student_safe = student_probs.add(&eps)?;
+        // Use log-domain computation instead of adding epsilon to probabilities.
+        // Adding epsilon to softmax outputs biases the distribution; log_softmax
+        // avoids this by computing log-probabilities directly and numerically stably.
+        let teacher_log_probs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
+        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
+        let teacher_probs = teacher_log_probs.exp()?;
+        let student_probs = student_log_probs.exp()?;
 
         let kl = if self.reverse {
-            // Reverse KL: KL(student || teacher)
-            let log_student = student_safe.log()?;
-            let log_teacher = teacher_safe.log()?;
-            let log_ratio = log_student.subtract(&log_teacher)?;
-            student_safe.multiply(&log_ratio)?
+            // KL(student || teacher) = sum(student * (log_student - log_teacher))
+            let log_ratio = student_log_probs.subtract(&teacher_log_probs)?;
+            student_probs.multiply(&log_ratio)?
         } else {
-            // Forward KL: KL(teacher || student)
-            let log_student = student_safe.log()?;
-            let log_teacher = teacher_safe.log()?;
-            let log_ratio = log_teacher.subtract(&log_student)?;
-            teacher_safe.multiply(&log_ratio)?
+            // KL(teacher || student) = sum(teacher * (log_teacher - log_student))
+            let log_ratio = teacher_log_probs.subtract(&student_log_probs)?;
+            teacher_probs.multiply(&log_ratio)?
         };
 
         // Sum over vocabulary dimension, then mean over batch and sequence

@@ -85,16 +85,7 @@ impl SlerpMerge {
             return Ok(result_flat.reshape(&original_shape)?);
         }
 
-        // If vectors are nearly opposite, add small perturbation
-        let (a_unit, b_unit, cos_theta) = if cos_theta < 0.0 {
-            // Negate b to take the shorter path
-            let b_neg = b_unit.negative()?;
-            let new_dot = a_unit.multiply(&b_neg)?.sum(None)?;
-            let _new_cos: f32 = new_dot.item();
-            (a_unit, b_neg, -cos_theta)
-        } else {
-            (a_unit, b_unit, cos_theta)
-        };
+        // No negation needed - SLERP handles all angles correctly
 
         // Compute SLERP
         let theta = cos_theta.acos();

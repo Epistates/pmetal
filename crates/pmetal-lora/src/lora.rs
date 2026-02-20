@@ -8,21 +8,10 @@
 //! - `A` is the LoRA down-projection matrix (rank x in_features)
 //! - `B` is the LoRA up-projection matrix (out_features x rank)
 //! - `scale = alpha / rank` (or `alpha / sqrt(rank)` for RSLoRA)
-//!
-//! ## Optimized Mode
-//!
-//! When `use_optimized` is enabled, LoRA uses pre-transposed and pre-scaled
-//! matrices for ~30% faster forward passes:
-//! - No transpose at forward time (pre-computed)
-//! - Scale pre-baked into B matrix
-//!
-//! The optimized cache is automatically invalidated after gradient updates
-//! and lazily rebuilt on next forward pass.
 
 use mlx_rs::{error::Exception, nn, Array};
 
 use pmetal_core::LoraConfig;
-use pmetal_mlx::kernels::fast_lora::{optimized_lora_forward, OptimizedLoraParams};
 
 /// Error type for LoRA operations.
 #[derive(Debug, thiserror::Error)]
@@ -44,8 +33,6 @@ pub enum LoraError {
 /// LoRA Linear layer that wraps a base Linear layer with low-rank adaptation.
 ///
 /// Implements: `y = x @ W.T + scale * (x @ A.T) @ B.T`
-///
-/// When `use_optimized` is true, uses pre-transposed matrices for ~30% faster forward.
 #[derive(Debug)]
 pub struct LoraLinear {
     /// Input features dimension.
@@ -62,18 +49,13 @@ pub struct LoraLinear {
     pub use_bias: bool,
 
     /// Frozen base weight matrix [out_features, in_features].
-    pub weight: Array,
+    pub(crate) weight: Array,
     /// Optional bias [out_features].
-    pub bias: Option<Array>,
+    pub(crate) bias: Option<Array>,
     /// LoRA A matrix (rank x in_features) - trainable.
-    pub lora_a: Array,
+    pub(crate) lora_a: Array,
     /// LoRA B matrix (out_features x rank) - trainable.
-    pub lora_b: Array,
-
-    /// Whether to use optimized (pre-transposed) forward pass.
-    use_optimized: bool,
-    /// Cached optimized params (lazily created, invalidated on update).
-    optimized_cache: Option<OptimizedLoraParams>,
+    pub(crate) lora_b: Array,
 }
 
 impl LoraLinear {
@@ -89,18 +71,39 @@ impl LoraLinear {
         let out_features = weight.dim(-2);
 
         // Compute scaling factor
-        let scale = if use_rslora {
-            alpha / (rank as f32).sqrt()
+        let scale = if rank > 0 {
+            if use_rslora {
+                alpha / (rank as f32).sqrt()
+            } else {
+                alpha / rank as f32
+            }
         } else {
-            alpha / rank as f32
+            0.0
         };
 
-        // Initialize LoRA A with Kaiming uniform
-        let bound = (3.0_f32 / in_features as f32).sqrt();
-        let lora_a = mlx_rs::random::uniform::<_, f32>(-bound, bound, &[rank, in_features], None)?;
+        // Initialize LoRA A.
+        // - Standard LoRA: Kaiming uniform with bound = sqrt(3 / in_features).
+        // - rsLoRA: uses bound = sqrt(1 / rank) so that the initial A norm is
+        //   rank-independent, matching the rsLoRA paper (Kalajdzievski 2023).
+        //   The scale factor (alpha / sqrt(rank)) then keeps the effective
+        //   contribution stable across different ranks.
+        let lora_a = if rank > 0 {
+            let bound = if use_rslora {
+                (1.0_f32 / rank as f32).sqrt()
+            } else {
+                (3.0_f32 / in_features as f32).sqrt()
+            };
+            mlx_rs::random::uniform::<_, f32>(-bound, bound, &[rank, in_features], None)?
+        } else {
+            mlx_rs::ops::zeros::<f32>(&[1, in_features])? // Dummy small array
+        };
 
         // Initialize LoRA B with zeros
-        let lora_b = mlx_rs::ops::zeros::<f32>(&[out_features, rank])?;
+        let lora_b = if rank > 0 {
+            mlx_rs::ops::zeros::<f32>(&[out_features, rank])?
+        } else {
+            mlx_rs::ops::zeros::<f32>(&[out_features, 1])? // Dummy
+        };
 
         // Clone bias if present
         let bias = linear.bias.value.as_ref().cloned();
@@ -116,8 +119,6 @@ impl LoraLinear {
             bias,
             lora_a,
             lora_b,
-            use_optimized: false, // Disabled - pre-transpose doesn't help since .t() is a view in MLX
-            optimized_cache: None,
         })
     }
 
@@ -131,10 +132,14 @@ impl LoraLinear {
         use_bias: bool,
     ) -> Result<Self, LoraError> {
         // Compute scaling factor
-        let scale = if use_rslora {
-            alpha / (rank as f32).sqrt()
+        let scale = if rank > 0 {
+            if use_rslora {
+                alpha / (rank as f32).sqrt()
+            } else {
+                alpha / rank as f32
+            }
         } else {
-            alpha / rank as f32
+            0.0
         };
 
         // Initialize base weight with Kaiming uniform
@@ -149,11 +154,27 @@ impl LoraLinear {
             None
         };
 
-        // Initialize LoRA A with Kaiming uniform
-        let lora_a = mlx_rs::random::uniform::<_, f32>(-bound, bound, &[rank, in_features], None)?;
+        // Initialize LoRA A.
+        // - Standard LoRA: reuse the same Kaiming bound as the base weight.
+        // - rsLoRA: use bound = sqrt(1 / rank) (rank-dependent), matching the
+        //   rsLoRA paper (Kalajdzievski 2023) so the norm is rank-independent.
+        let lora_a_bound = if use_rslora {
+            (1.0_f32 / rank as f32).sqrt()
+        } else {
+            bound
+        };
+        let lora_a = if rank > 0 {
+            mlx_rs::random::uniform::<_, f32>(-lora_a_bound, lora_a_bound, &[rank, in_features], None)?
+        } else {
+            mlx_rs::ops::zeros::<f32>(&[1, in_features])?
+        };
 
         // Initialize LoRA B with zeros
-        let lora_b = mlx_rs::ops::zeros::<f32>(&[out_features, rank])?;
+        let lora_b = if rank > 0 {
+            mlx_rs::ops::zeros::<f32>(&[out_features, rank])?
+        } else {
+            mlx_rs::ops::zeros::<f32>(&[out_features, 1])?
+        };
 
         Ok(Self {
             in_features,
@@ -166,8 +187,6 @@ impl LoraLinear {
             bias,
             lora_a,
             lora_b,
-            use_optimized: false, // Disabled - pre-transpose doesn't help since .t() is a view in MLX
-            optimized_cache: None,
         })
     }
 
@@ -190,35 +209,12 @@ impl LoraLinear {
 
     /// Forward pass through the LoRA linear layer.
     ///
-    /// If `use_optimized` is true, uses pre-transposed matrices for ~30% faster forward.
     /// If merged, uses merged weights. Otherwise computes:
     /// `y = x @ W.T + scale * (x @ A.T) @ B.T`
-    ///
-    /// Note: The optimized cache is rebuilt on each forward pass because optimizer
-    /// updates parameters in-place without triggering cache invalidation.
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
-        if self.merged {
-            // Use merged weight directly
+        if self.merged || self.rank == 0 {
+            // Use base weight directly if merged or rank=0 (frozen)
             let y = x.matmul(&self.weight.t())?;
-            if let Some(ref bias) = self.bias {
-                Ok(y.add(bias)?)
-            } else {
-                Ok(y)
-            }
-        } else if self.use_optimized {
-            // Optimized forward: pre-scale B to eliminate multiply operation
-            // y = x @ W.T + (x @ A.T) @ (scale * B).T
-            // Note: .t() is a view operation in MLX (nearly free)
-            let y_base = x.matmul(&self.weight.t())?;
-
-            // Pre-scale B and compute LoRA contribution
-            let scale_arr = Array::from_f32(self.scale);
-            let lora_b_scaled = self.lora_b.multiply(&scale_arr)?;
-            let xa = x.matmul(&self.lora_a.t())?;
-            let y_lora = xa.matmul(&lora_b_scaled.t())?;
-
-            let y = y_base.add(&y_lora)?;
-
             if let Some(ref bias) = self.bias {
                 Ok(y.add(bias)?)
             } else {
@@ -244,39 +240,6 @@ impl LoraLinear {
                 Ok(y)
             }
         }
-    }
-
-    /// Ensure optimized cache is built.
-    fn ensure_optimized_cache(&mut self) -> Result<(), LoraError> {
-        if self.optimized_cache.is_none() {
-            let params = OptimizedLoraParams::from_standard(
-                &self.weight,
-                &self.lora_a,
-                &self.lora_b,
-                self.scale,
-                self.bias.clone(),
-            )?;
-            self.optimized_cache = Some(params);
-        }
-        Ok(())
-    }
-
-    /// Invalidate the optimized cache (call after gradient updates).
-    pub fn invalidate_cache(&mut self) {
-        self.optimized_cache = None;
-    }
-
-    /// Enable or disable optimized forward pass.
-    pub fn set_optimized(&mut self, enabled: bool) {
-        self.use_optimized = enabled;
-        if !enabled {
-            self.optimized_cache = None;
-        }
-    }
-
-    /// Check if optimized forward is enabled.
-    pub fn is_optimized(&self) -> bool {
-        self.use_optimized
     }
 
     /// Forward pass with gradient context for custom autograd.
@@ -353,7 +316,9 @@ impl LoraLinear {
     /// Merge LoRA weights into base weights.
     ///
     /// After merging: `W_merged = W + scale * B @ A`
-    /// Invalidates the optimized cache.
+    ///
+    /// Note: this operation is irreversible. The original base weight is lost.
+    /// To restore the base weights, reload the model checkpoint.
     pub fn merge(&mut self) -> Result<(), LoraError> {
         if self.merged {
             return Ok(());
@@ -367,30 +332,17 @@ impl LoraLinear {
 
         self.weight = merged_weight;
         self.merged = true;
-        self.optimized_cache = None;
         Ok(())
     }
 
-    /// Unmerge LoRA weights from base weights.
+    /// Unmerge is not supported.
     ///
-    /// After unmerging: `W_original = W_merged - scale * B @ A`
-    /// Invalidates the optimized cache.
-    pub fn unmerge(&mut self) -> Result<(), LoraError> {
-        if !self.merged {
-            return Ok(());
-        }
+    /// LoRA weights cannot be reliably unmerged once merged because the original
+    /// base weight is overwritten. To "unmerge", reload the base model weights
+    /// and re-apply the LoRA adapter.
+    // NOTE: unmerge() is intentionally omitted. The original base weight is
+    // lost after merge(); callers must reload base weights to undo a merge.
 
-        // W_original = W_merged - scale * B @ A
-        let ba = self.lora_b.matmul(&self.lora_a)?;
-        let scale_arr = Array::from_f32(self.scale);
-        let delta = ba.multiply(&scale_arr)?;
-        let original_weight = self.weight.subtract(&delta)?;
-
-        self.weight = original_weight;
-        self.merged = false;
-        self.optimized_cache = None;
-        Ok(())
-    }
 
     /// Get the LoRA A parameters (for gradient computation).
     pub fn lora_a_params(&self) -> &Array {
@@ -403,17 +355,13 @@ impl LoraLinear {
     }
 
     /// Set the LoRA A parameters.
-    /// Invalidates the optimized cache.
     pub fn set_lora_a(&mut self, a: Array) {
         self.lora_a = a;
-        self.optimized_cache = None;
     }
 
     /// Set the LoRA B parameters.
-    /// Invalidates the optimized cache.
     pub fn set_lora_b(&mut self, b: Array) {
         self.lora_b = b;
-        self.optimized_cache = None;
     }
 
     /// Get the number of trainable parameters.
@@ -442,47 +390,73 @@ impl LoraLinear {
     }
 }
 
-/// LoRA configuration for patching models.
+/// Per-layer LoRA configuration derived from `LoraConfig`.
+///
+/// Wraps `LoraConfig` rather than duplicating its fields, ensuring
+/// that model patching code always references a single source of truth.
 #[derive(Debug, Clone)]
 pub struct LoraLayerConfig {
-    /// LoRA rank.
-    pub rank: i32,
-    /// LoRA alpha.
-    pub alpha: f32,
-    /// Use RSLoRA scaling.
-    pub use_rslora: bool,
-    /// Dropout rate (not yet implemented).
-    pub dropout: f32,
+    /// Underlying core config this layer config is derived from.
+    config: LoraConfig,
 }
 
 impl LoraLayerConfig {
-    /// Create from core LoraConfig.
+    /// Create from core `LoraConfig`.
     pub fn from_core(config: &LoraConfig) -> Self {
         Self {
-            rank: config.r as i32,
-            alpha: config.alpha,
-            use_rslora: config.use_rslora,
-            dropout: config.dropout,
+            config: config.clone(),
         }
     }
 
-    /// Compute the scaling factor.
+    /// LoRA rank.
+    pub fn rank(&self) -> i32 {
+        self.config.r as i32
+    }
+
+    /// LoRA alpha.
+    pub fn alpha(&self) -> f32 {
+        self.config.alpha
+    }
+
+    /// Whether to use RSLoRA scaling.
+    pub fn use_rslora(&self) -> bool {
+        self.config.use_rslora
+    }
+
+    /// Dropout rate.
+    pub fn dropout(&self) -> f32 {
+        self.config.dropout
+    }
+
+    /// Compute the LoRA scaling factor (delegates to `LoraConfig::scaling()`).
     pub fn scale(&self) -> f32 {
-        if self.use_rslora {
-            self.alpha / (self.rank as f32).sqrt()
-        } else {
-            self.alpha / self.rank as f32
-        }
+        self.config.scaling()
+    }
+
+    /// Access the underlying `LoraConfig`.
+    pub fn as_core(&self) -> &LoraConfig {
+        &self.config
     }
 }
 
 impl Default for LoraLayerConfig {
     fn default() -> Self {
         Self {
-            rank: 16,
-            alpha: 32.0,
-            use_rslora: false,
-            dropout: 0.0,
+            config: LoraConfig::default(),
+        }
+    }
+}
+
+impl From<LoraConfig> for LoraLayerConfig {
+    fn from(config: LoraConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl From<&LoraConfig> for LoraLayerConfig {
+    fn from(config: &LoraConfig) -> Self {
+        Self {
+            config: config.clone(),
         }
     }
 }
@@ -578,7 +552,7 @@ mod tests {
     }
 
     #[test]
-    fn test_lora_merge_unmerge() {
+    fn test_lora_merge() {
         let mut lora = LoraLinear::new(32, 64, 4, 8.0, false, false).unwrap();
 
         // Initialize B to non-zero for merge to have effect
@@ -598,25 +572,11 @@ mod tests {
         let output_after = lora.forward(&x).unwrap();
         output_after.eval().unwrap();
 
-        // Outputs should be close
+        // Outputs should be close (merge is numerically equivalent to unmerged forward)
         let diff = output_before.subtract(&output_after).unwrap();
         let max_diff = diff.abs().unwrap().max(None).unwrap();
         max_diff.eval().unwrap();
         assert!(max_diff.item::<f32>() < 1e-4);
-
-        // Unmerge
-        lora.unmerge().unwrap();
-        assert!(!lora.merged);
-
-        // Get output after unmerge
-        let output_unmerged = lora.forward(&x).unwrap();
-        output_unmerged.eval().unwrap();
-
-        // Should still be close to original
-        let diff2 = output_before.subtract(&output_unmerged).unwrap();
-        let max_diff2 = diff2.abs().unwrap().max(None).unwrap();
-        max_diff2.eval().unwrap();
-        assert!(max_diff2.item::<f32>() < 1e-4);
     }
 
     #[test]

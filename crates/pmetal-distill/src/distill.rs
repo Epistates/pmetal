@@ -75,17 +75,25 @@ impl DistillerBuilder {
             .ok_or_else(|| DistillError::InvalidConfig("Configuration is required".to_string()))?;
 
         // Create loss function from config if not provided
-        let loss: Box<dyn DistillLoss> = self.loss.unwrap_or_else(|| match config.loss.loss_type {
-            LossType::KlDivergence => {
-                if config.loss.reverse_kl {
-                    Box::new(KlDivergenceLoss::reverse())
-                } else {
-                    Box::new(KlDivergenceLoss::new())
+        let loss: Box<dyn DistillLoss> = self.loss.unwrap_or_else(|| {
+            if config.loss.rationale {
+                Box::new(crate::reasoning::RationaleLoss::new(
+                    config.loss.rationale_weight,
+                ))
+            } else {
+                match config.loss.loss_type {
+                    LossType::KlDivergence => {
+                        if config.loss.reverse_kl {
+                            Box::new(KlDivergenceLoss::reverse())
+                        } else {
+                            Box::new(KlDivergenceLoss::new())
+                        }
+                    }
+                    LossType::JensenShannon => Box::new(JensenShannonLoss::new()),
+                    LossType::SoftCrossEntropy => Box::new(SoftCrossEntropyLoss::new()),
+                    LossType::MseLoss => Box::new(MseLoss::new()),
                 }
             }
-            LossType::JensenShannon => Box::new(JensenShannonLoss::new()),
-            LossType::SoftCrossEntropy => Box::new(SoftCrossEntropyLoss::new()),
-            LossType::MseLoss => Box::new(MseLoss::new()),
         });
 
         Ok(Distiller {
@@ -282,7 +290,7 @@ impl Distiller {
         let soft_scaled = soft_loss.multiply(&Array::from_f32(t_squared))?;
 
         // Combined with hard labels if provided
-        let total_loss = if let Some(labels) = labels {
+        let (total_loss, hard_loss_opt) = if let Some(labels) = labels {
             let hard_loss = compute_hard_loss(student_logits, labels)?;
 
             // total = alpha * soft + (1 - alpha) * hard
@@ -290,15 +298,16 @@ impl Distiller {
             let soft_weighted = soft_scaled.multiply(&Array::from_f32(alpha))?;
             let hard_weighted = hard_loss.multiply(&Array::from_f32(1.0 - alpha))?;
 
-            soft_weighted.add(&hard_weighted)?
+            let total = soft_weighted.add(&hard_weighted)?;
+            (total, Some(hard_loss))
         } else {
-            soft_scaled
+            (soft_scaled, None)
         };
 
         Ok(DistillLossOutput {
             total: total_loss,
             soft: soft_loss,
-            hard: None,
+            hard: hard_loss_opt,
             hidden: None,
         })
     }
@@ -382,19 +391,27 @@ fn compute_hard_loss(logits: &Array, labels: &Array) -> Result<Array> {
     let vocab_size = logits.dim(2) as usize;
 
     let log_probs_data: Vec<f32> = log_probs.as_slice().to_vec();
-    let labels_data: Vec<i32> = labels.as_slice().to_vec();
+    let labels_data: Vec<i64> = labels.as_slice().to_vec();
 
     let mut losses = Vec::with_capacity(batch_size * seq_len);
     for i in 0..(batch_size * seq_len) {
-        let label = labels_data.get(i).copied().unwrap_or(0) as usize;
-        if label < vocab_size {
-            losses.push(-log_probs_data[i * vocab_size + label]);
-        } else {
-            losses.push(0.0);
+        let label = labels_data.get(i).copied().unwrap_or(0);
+        // Explicitly skip ignore-index tokens (label == -100 or any negative value).
+        // Previously this relied on `label as usize` wrapping a negative i64 to a
+        // very large usize that is always >= vocab_size.  The explicit check is
+        // clearer and avoids relying on wrapping semantics.
+        if label < 0 || label as usize >= vocab_size {
+            continue; // Explicitly skip ignore-index tokens
         }
+        losses.push(-log_probs_data[i * vocab_size + label as usize]);
     }
 
-    let loss_array = Array::from_slice(&losses, &[(batch_size * seq_len) as i32]);
+    // Guard against the case where all tokens are ignored.
+    if losses.is_empty() {
+        return Ok(Array::from_f32(0.0));
+    }
+
+    let loss_array = Array::from_slice(&losses, &[losses.len() as i32]);
     Ok(loss_array.mean(None)?)
 }
 

@@ -40,6 +40,9 @@ constant uint SIMD_SIZE = 32;
 // Max tile size for static memory allocation
 constant uint MAX_TILE_M = 128;
 
+// Maximum supported LoRA rank (was 64, increased to 256)
+#define MAX_LORA_RANK 256
+
 // =============================================================================
 // Utility Functions
 // =============================================================================
@@ -107,7 +110,8 @@ kernel void fused_lora_forward(
     float acc_lora = 0.0f;
 
     // Threadgroup memory for intermediate xA values
-    threadgroup float xA_tile[MAX_TILE_M * 64];  // Max rank of 64
+    // Support ranks up to MAX_LORA_RANK (256)
+    threadgroup float xA_tile[MAX_TILE_M * MAX_LORA_RANK];
 
     // -------------------------------------------------------------------------
     // Phase 1: Compute x @ W.T (base linear)
@@ -141,9 +145,11 @@ kernel void fused_lora_forward(
         // SIMD reduction
         acc_a = simd_sum(acc_a, simd_lane_id);
 
-        // Store result (first lane writes)
+        // Store result (first lane writes); guard against ranks exceeding MAX_LORA_RANK
         if (simd_lane_id == 0) {
-            xA_tile[local_m * params.rank + r] = acc_a;
+            if (params.rank <= MAX_LORA_RANK) {
+                xA_tile[local_m * params.rank + r] = acc_a;
+            }
         }
     }
 
@@ -301,7 +307,8 @@ kernel void fused_lora_backward_x(
     }
 
     // Threadgroup memory for intermediate dY @ B
-    threadgroup float dyB_tile[MAX_TILE_M * 64];  // Max rank of 64
+    // Support ranks up to MAX_LORA_RANK (256)
+    threadgroup float dyB_tile[MAX_TILE_M * MAX_LORA_RANK];
 
     // -------------------------------------------------------------------------
     // Phase 1: Compute dY @ W (base gradient)

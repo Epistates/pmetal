@@ -1,6 +1,5 @@
 //! PMetal CLI - LLM fine-tuning for Apple Silicon.
 
-#![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(clippy::too_many_arguments)]
@@ -352,6 +351,69 @@ enum Commands {
         /// Quantization method (e.g., q4_k_m, q8_0) or "dynamic"
         #[arg(long, default_value = "dynamic")]
         method: String,
+    },
+
+    /// Knowledge Distillation from teacher to student
+    Distill {
+        /// Teacher model ID or path
+        #[arg(short, long)]
+        teacher: String,
+
+        /// Student model ID or path
+        #[arg(short, long)]
+        student: String,
+
+        /// Dataset path (JSONL file)
+        #[arg(short, long)]
+        dataset: String,
+
+        /// Output directory for distilled student
+        #[arg(short, long, default_value = "./output/distilled")]
+        output: String,
+
+        /// Distillation method (online, offline, progressive)
+        #[arg(long, default_value = "online")]
+        method: String,
+
+        /// Loss type (kl_divergence, jensen_shannon, soft_cross_entropy, mse_loss)
+        #[arg(long, default_value = "kl_divergence")]
+        loss_type: String,
+
+        /// Softmax temperature
+        #[arg(long, default_value = "2.0")]
+        temperature: f32,
+
+        /// Alpha for blending hard/soft targets (0.0 to 1.0)
+        #[arg(long, default_value = "0.5")]
+        alpha: f32,
+
+        /// Use reasoning-aware (rationale) distillation
+        #[arg(long)]
+        rationale: bool,
+
+        /// Weight for reasoning tokens (if rationale is enabled)
+        #[arg(long, default_value = "1.0")]
+        rationale_weight: f32,
+
+        /// LoRA rank for student
+        #[arg(long, default_value = "16")]
+        lora_r: usize,
+
+        /// Learning rate
+        #[arg(long, default_value = "2e-5")]
+        learning_rate: f32,
+
+        /// Batch size
+        #[arg(long, default_value = "1")]
+        batch_size: usize,
+
+        /// Number of epochs
+        #[arg(long, default_value = "1")]
+        epochs: usize,
+
+        /// Maximum sequence length
+        #[arg(long, default_value = "1024")]
+        max_seq_len: usize,
     },
 
     /// Dataset utilities for preparing and analyzing training data
@@ -951,6 +1013,43 @@ async fn main() -> anyhow::Result<()> {
             run_quantization(&model, &output, imatrix.as_deref(), &method).await?;
         }
 
+        Commands::Distill {
+            teacher,
+            student,
+            dataset,
+            output,
+            method,
+            loss_type,
+            temperature,
+            alpha,
+            rationale,
+            rationale_weight,
+            lora_r,
+            learning_rate,
+            batch_size,
+            epochs,
+            max_seq_len,
+        } => {
+            run_distillation_cli(
+                &teacher,
+                &student,
+                &dataset,
+                &output,
+                &method,
+                &loss_type,
+                temperature,
+                alpha,
+                rationale,
+                rationale_weight,
+                lora_r,
+                learning_rate,
+                batch_size,
+                epochs,
+                max_seq_len,
+            )
+            .await?;
+        }
+
         Commands::Dataset { action } => {
             run_dataset_command(action).await?;
         }
@@ -1136,6 +1235,193 @@ async fn run_quantization(
     Ok(())
 }
 
+/// Run knowledge distillation.
+#[allow(clippy::too_many_arguments)]
+async fn run_distillation_cli(
+    teacher_id: &str,
+    student_id: &str,
+    dataset_path: &str,
+    output_dir: &str,
+    method_str: &str,
+    loss_type_str: &str,
+    temperature: f32,
+    alpha: f32,
+    rationale: bool,
+    rationale_weight: f32,
+    lora_r: usize,
+    learning_rate: f32,
+    batch_size: usize,
+    epochs: usize,
+    max_seq_len: usize,
+) -> anyhow::Result<()> {
+    use pmetal_distill::{DistillConfig, DistillMethod, LossConfig, LossType, Distiller};
+    use pmetal_trainer::{DistillationTrainer, TrainingLoopConfig};
+    use pmetal_data::{DataLoaderConfig, DatasetFormat, TrainingDataset, Tokenizer};
+    use pmetal_lora::DynamicLoraModel;
+    use pmetal_core::LoraConfig;
+    use std::path::{Path, PathBuf};
+
+    println!("========================================");
+    println!("  PMetal Knowledge Distillation");
+    println!("========================================");
+    println!("Teacher:       {}", teacher_id);
+    println!("Student:       {}", student_id);
+    println!("Dataset:       {}", dataset_path);
+    println!("Output:        {}", output_dir);
+    println!("Method:        {}", method_str);
+    println!("Loss Type:     {}", loss_type_str);
+    println!("Temperature:   {}", temperature);
+    println!("Alpha:         {}", alpha);
+    if rationale {
+        println!("Rationale:     enabled (weight: {})", rationale_weight);
+    }
+    println!("LoRA Rank:     {}", lora_r);
+    println!("LR:            {:.2e}", learning_rate);
+    println!("Batch Size:    {}", batch_size);
+    println!("Epochs:        {}", epochs);
+    println!("Max Seq Len:   {}", max_seq_len);
+    println!("========================================\n");
+
+    // 1. Resolve and Download Models
+    tracing::info!("Resolving teacher model: {}", teacher_id);
+    let teacher_path = if teacher_id.contains('/') && !Path::new(teacher_id).exists() {
+        pmetal_hub::download_model(teacher_id, None, None).await?
+    } else {
+        PathBuf::from(teacher_id)
+    };
+
+    tracing::info!("Resolving student model: {}", student_id);
+    let student_path = if student_id.contains('/') && !Path::new(student_id).exists() {
+        pmetal_hub::download_model(student_id, None, None).await?
+    } else {
+        PathBuf::from(student_id)
+    };
+
+    // 2. Load Tokenizer (from student)
+    tracing::info!("Loading tokenizer...");
+    let tokenizer_path = student_path.join("tokenizer.json");
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
+
+    // 3. Load Dataset
+    tracing::info!("Loading dataset: {}", dataset_path);
+    let train_dataset = TrainingDataset::from_jsonl_tokenized(
+        dataset_path,
+        &tokenizer,
+        DatasetFormat::Auto,
+        max_seq_len,
+        None,
+    )?;
+
+    // 4. Load Teacher Model (Frozen)
+    tracing::info!("Loading teacher model...");
+    let teacher_lora_config = LoraConfig {
+        r: 0,
+        ..Default::default()
+    };
+    let mut teacher_model = DynamicLoraModel::from_pretrained(&teacher_path, teacher_lora_config)?;
+    
+    // 5. Load Student Model (Trainable LoRA)
+    tracing::info!("Loading student model...");
+    let student_lora_config = LoraConfig {
+        r: lora_r,
+        alpha: (lora_r * 2) as f32,
+        ..Default::default()
+    };
+    let mut student_model = DynamicLoraModel::from_pretrained(&student_path, student_lora_config)?;
+
+    // 6. Setup Distillation Engine
+    let method = match method_str.to_lowercase().as_str() {
+        "online" => DistillMethod::Online,
+        "offline" => DistillMethod::Offline,
+        "progressive" => DistillMethod::Progressive,
+        _ => DistillMethod::Online,
+    };
+
+    let loss_type = match loss_type_str.to_lowercase().as_str() {
+        "kl_divergence" => LossType::KlDivergence,
+        "jensen_shannon" => LossType::JensenShannon,
+        "soft_cross_entropy" => LossType::SoftCrossEntropy,
+        "mse_loss" => LossType::MseLoss,
+        _ => LossType::KlDivergence,
+    };
+
+    let distill_config = DistillConfig {
+        teacher: teacher_id.to_string(),
+        student: student_id.to_string(),
+        method,
+        loss: LossConfig {
+            loss_type,
+            temperature,
+            alpha,
+            rationale,
+            rationale_weight,
+            ..Default::default()
+        },
+        offline: None,
+        output_path: Some(PathBuf::from(output_dir)),
+        training: pmetal_distill::TrainingConfig {
+            batch_size,
+            learning_rate,
+            epochs,
+            max_seq_len,
+            ..Default::default()
+        },
+    };
+
+    let distiller = Distiller::new(distill_config)?;
+
+    // 7. Setup Trainer
+    let training_loop_config = TrainingLoopConfig {
+        training: pmetal_core::TrainingConfig {
+            learning_rate: learning_rate as f64,
+            batch_size,
+            num_epochs: epochs,
+            max_seq_len,
+            output_dir: output_dir.to_string(),
+            ..Default::default()
+        },
+        dataloader: DataLoaderConfig {
+            batch_size,
+            max_seq_len,
+            shuffle: true,
+            seed: 42,
+            pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
+            drop_last: false,
+        },
+        use_metal_flash_attention: true,
+        log_every: 1,
+        checkpoint_every: 100,
+        eval_every: 0,
+        use_jit_compilation: true,
+        use_sequence_packing: true,
+        gradient_checkpointing: true,
+        gradient_checkpointing_layers: 4,
+        embedding_lr: None,
+        eager_evaluation: false,
+        use_metal_fused_optimizer: true,
+    };
+
+    let mut trainer = DistillationTrainer::new(distiller, training_loop_config);
+
+    // 8. Run Distillation
+    trainer.run(
+        &mut student_model,
+        &mut teacher_model,
+        train_dataset,
+        None,
+        None,
+    ).map_err(|e| anyhow::anyhow!("Distillation failed: {}", e))?;
+
+    // 9. Save Student Adapters
+    let lora_output = PathBuf::from(output_dir).join("lora_weights.safetensors");
+    tracing::info!("Saving distilled student adapters to {:?}", lora_output);
+    std::fs::create_dir_all(output_dir)?;
+    student_model.save_lora_weights(&lora_output)?;
+
+    println!("\nDistillation complete! Adapters saved to {}", lora_output.display());
+    Ok(())
+}
+
 /// Run LoRA/QLoRA fine-tuning using the new TrainingLoop.
 #[allow(clippy::too_many_arguments)]
 async fn run_training(
@@ -1246,12 +1532,28 @@ async fn run_training(
             );
         }
     }
+
+    // Initialize metrics callback if requested
+    let mut metrics_callback = if let Some(ref metrics_path) = log_metrics {
+        // Default to output_dir/metrics.jsonl if only filename given
+        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
+            PathBuf::from(metrics_path)
+        } else {
+            PathBuf::from(&output_dir).join(metrics_path)
+        };
+        let callback = MetricsJsonCallback::new(&path)?
+            .with_run_name(format!(
+                "{}-{}",
+                config.model.model_id.replace('/', "-"),
+                chrono::Utc::now().format("%Y%m%d-%H%M%S")
+            ))
+            .with_config(serde_json::json!({
                 "model": config.model.model_id,
                 "lora_r": lora_r,
                 "learning_rate": learning_rate,
                 "batch_size": batch_size,
                 "epochs": num_epochs,
-                "max_seq_len": max_seq_len,
+                "max_seq_len": config.training.max_seq_len,
                 "gradient_accumulation_steps": gradient_accumulation_steps,
                 "gradient_checkpointing": gradient_checkpointing,
                 "quantization": format!("{:?}", quantization),
@@ -1261,37 +1563,6 @@ async fn run_training(
         cb.on_train_start();
         Some(cb)
     } else {
-        None
-    };
-
-    // Download model if needed
-    tracing::info!("Loading model: {}", config.model.model_id);
-    let model_path =
-        if config.model.model_id.contains('/') && !PathBuf::from(&config.model.model_id).exists() {
-            // HuggingFace model ID
-            pmetal_hub::download_model(
-                &config.model.model_id,
-                config.model.revision.as_deref(),
-                None,
-            )
-            .await?
-        } else {
-            PathBuf::from(&config.model.model_id)
-        };
-
-    // Load model config (optional for GGUF - config is extracted from metadata)
-    let model_config_path = model_path.join("config.json");
-    let llama_config: Option<LlamaConfig> = if model_config_path.exists() {
-        let content = std::fs::read_to_string(&model_config_path)?;
-        Some(serde_json::from_str(&content)?)
-    } else {
-        // GGUF files don't have separate config.json
-        if WeightFormat::detect(&model_path) != Some(WeightFormat::Gguf) {
-            anyhow::bail!(
-                "Model config.json not found at {:?}. If using GGUF, pass the .gguf file directly.",
-                model_config_path
-            );
-        }
         None
     };
 

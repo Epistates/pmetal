@@ -93,6 +93,7 @@ kernel void fused_cross_entropy_forward(
     // Online logsumexp computation (numerically stable)
     float m = -INFINITY;  // Running max
     float s = 0.0f;       // Running sum of exp(x - max)
+    float logit_sum = 0.0f;  // Sum of all logits for label smoothing
 
     for (uint v = 0; v < params.vocab_size; v++) {
         float logit = row[v];
@@ -101,6 +102,8 @@ kernel void fused_cross_entropy_forward(
         if (params.softcap != 0.0f) {
             logit = apply_softcap(logit, params.softcap);
         }
+
+        logit_sum += logit;
 
         // Online softmax update
         if (logit > m) {
@@ -123,9 +126,11 @@ kernel void fused_cross_entropy_forward(
     float loss = lse - target_logit;
 
     // Apply label smoothing if enabled
+    // Smoothed loss = (1 - eps) * CE + eps * (logsumexp - mean_logit)
+    // where mean_logit = sum(logits) / vocab_size (uniform distribution assumption)
     if (params.label_smoothing > 0.0f) {
-        // Smoothed loss = (1 - eps) * CE + eps * (logsumexp - mean_logit)
-        float smooth_loss = lse - (lse - log((float)params.vocab_size));
+        float mean_logit = logit_sum / (float)params.vocab_size;
+        float smooth_loss = lse - mean_logit;
         loss = (1.0f - params.label_smoothing) * loss + params.label_smoothing * smooth_loss;
     }
 
@@ -346,7 +351,9 @@ kernel void cross_entropy_reduce_mean(
     float local_sum = 0.0f;
     float local_count = 0.0f;
 
-    for (uint i = tid; i < num_tokens; i += threads_per_group * 256) {  // Assume max 256 threadgroups
+    // tid is thread_position_in_grid (global thread ID); stride by threads_per_group
+    // since this kernel is dispatched as a single threadgroup for reduction.
+    for (uint i = tid; i < num_tokens; i += threads_per_group) {
         if (targets[i] != ignore_index) {
             local_sum += losses[i];
             local_count += 1.0f;
@@ -511,10 +518,19 @@ kernel void fused_linear_cross_entropy_forward(
     // Pointer to this token's hidden state
     device const float* h = hidden_states + token_idx * params.hidden_size;
 
-    // Online logsumexp across vocabulary chunks
+    // Online logsumexp across vocabulary chunks.
+    // target_logit uses -INFINITY sentinel so simd_max correctly surfaces the
+    // one thread that actually computed the target vocab dot product.
     float running_max = -INFINITY;
     float running_sum = 0.0f;
-    float target_logit = 0.0f;
+    float target_logit = -INFINITY;  // Sentinel: only the thread owning target sets this
+    float local_logit_sum = 0.0f;    // Accumulate sum of logits for label smoothing
+
+    // Scratch layout (num_simd_groups = CE_THREADS_PER_TOKEN / SIMD_SIZE = 4):
+    //   [0..7]   logsumexp reduction: scratch[g*2] = max, scratch[g*2+1] = sum
+    //   [8..11]  target_logit per simd group (for cross-group broadcast)
+    //   [12..15] logit_sum per simd group (for label smoothing reduction)
+    const uint num_simd_groups = CE_THREADS_PER_TOKEN / SIMD_SIZE;
 
     // Process vocabulary in chunks
     for (uint chunk_start = 0; chunk_start < params.vocab_size; chunk_start += params.chunk_size) {
@@ -538,10 +554,14 @@ kernel void fused_linear_cross_entropy_forward(
                 logit += h[d] * w[d];
             }
 
-            // Track target logit
+            // Track target logit - only the thread processing vocab_idx==target sets this.
+            // Using -INFINITY sentinel ensures simd_max propagates the real value.
             if (vocab_idx == uint(target)) {
                 target_logit = logit;
             }
+
+            // Accumulate logit sum for label smoothing mean computation
+            local_logit_sum += logit;
 
             // Online logsumexp update
             if (logit > local_max) {
@@ -570,7 +590,6 @@ kernel void fused_linear_cross_entropy_forward(
             float chunk_max = -INFINITY;
             float chunk_sum = 0.0f;
 
-            uint num_simd_groups = CE_THREADS_PER_TOKEN / SIMD_SIZE;
             for (uint g = lane_id; g < num_simd_groups; g += SIMD_SIZE) {
                 float g_max = scratch[g * 2];
                 float g_sum = scratch[g * 2 + 1];
@@ -601,14 +620,49 @@ kernel void fused_linear_cross_entropy_forward(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // Compute final loss
-    if (lane_id == 0 && simd_group_id == 0) {
-        float lse = running_max + log(running_sum);
-        float loss = lse - target_logit;
+    // --- Broadcast target_logit across all SIMD groups ---
+    // Use simd_max with -INFINITY sentinel: the one thread that computed the
+    // target dot product has a real value; all others have -INFINITY.
+    {
+        float simd_target = simd_max(target_logit);
+        if (lane_id == 0) {
+            scratch[8 + simd_group_id] = simd_target;
+        }
+    }
 
-        // Apply label smoothing if enabled
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Reduce logit_sum across all SIMD groups for label smoothing ---
+    {
+        float simd_lsum = simd_sum(local_logit_sum);
+        if (lane_id == 0) {
+            scratch[12 + simd_group_id] = simd_lsum;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute final loss (simd_group 0, lane 0 only)
+    if (lane_id == 0 && simd_group_id == 0) {
+        // Collect target_logit from all simd groups
+        float global_target_logit = -INFINITY;
+        for (uint g = 0; g < num_simd_groups; g++) {
+            float v = scratch[8 + g];
+            if (v > global_target_logit) global_target_logit = v;
+        }
+
+        float lse = running_max + log(running_sum);
+        float loss = lse - global_target_logit;
+
+        // Apply label smoothing: smoothed = (1-eps)*CE + eps*(lse - mean_logit)
+        // mean_logit = sum(all logits) / vocab_size
         if (params.label_smoothing > 0.0f) {
-            float smooth_loss = lse - (lse - log((float)params.vocab_size));
+            float global_logit_sum = 0.0f;
+            for (uint g = 0; g < num_simd_groups; g++) {
+                global_logit_sum += scratch[12 + g];
+            }
+            float mean_logit = global_logit_sum / (float)params.vocab_size;
+            float smooth_loss = lse - mean_logit;
             loss = (1.0f - params.label_smoothing) * loss + params.label_smoothing * smooth_loss;
         }
 
@@ -648,9 +702,18 @@ kernel void fused_linear_cross_entropy_forward_f16(
 
     device const half* h = hidden_states + token_idx * params.hidden_size;
 
+    // target_logit uses -INFINITY sentinel so simd_max correctly surfaces the
+    // one thread that actually computed the target vocab dot product.
     float running_max = -INFINITY;
     float running_sum = 0.0f;
-    float target_logit = 0.0f;
+    float target_logit = -INFINITY;  // Sentinel: only the thread owning target sets this
+    float local_logit_sum = 0.0f;    // Accumulate sum of logits for label smoothing
+
+    // Scratch layout (num_simd_groups = CE_THREADS_PER_TOKEN / SIMD_SIZE = 4):
+    //   [0..7]   logsumexp reduction: scratch[g*2] = max, scratch[g*2+1] = sum
+    //   [8..11]  target_logit per simd group (for cross-group broadcast)
+    //   [12..15] logit_sum per simd group (for label smoothing reduction)
+    const uint num_simd_groups = CE_THREADS_PER_TOKEN / SIMD_SIZE;
 
     for (uint chunk_start = 0; chunk_start < params.vocab_size; chunk_start += params.chunk_size) {
         uint chunk_end = min(chunk_start + params.chunk_size, params.vocab_size);
@@ -672,9 +735,14 @@ kernel void fused_linear_cross_entropy_forward_f16(
                 logit += float(h[d]) * float(w[d]);
             }
 
+            // Track target logit - only the thread processing vocab_idx==target sets this.
+            // Using -INFINITY sentinel ensures simd_max propagates the real value.
             if (vocab_idx == uint(target)) {
                 target_logit = logit;
             }
+
+            // Accumulate logit sum for label smoothing mean computation
+            local_logit_sum += logit;
 
             if (logit > local_max) {
                 local_sum = local_sum * exp(local_max - logit) + 1.0f;
@@ -699,7 +767,6 @@ kernel void fused_linear_cross_entropy_forward_f16(
             float chunk_max = -INFINITY;
             float chunk_sum = 0.0f;
 
-            uint num_simd_groups = CE_THREADS_PER_TOKEN / SIMD_SIZE;
             for (uint g = lane_id; g < num_simd_groups; g += SIMD_SIZE) {
                 float g_max = scratch[g * 2];
                 float g_sum = scratch[g * 2 + 1];
@@ -728,12 +795,49 @@ kernel void fused_linear_cross_entropy_forward_f16(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    if (lane_id == 0 && simd_group_id == 0) {
-        float lse = running_max + log(running_sum);
-        float loss = lse - target_logit;
+    // --- Broadcast target_logit across all SIMD groups ---
+    // Use simd_max with -INFINITY sentinel: the one thread that computed the
+    // target dot product has a real value; all others have -INFINITY.
+    {
+        float simd_target = simd_max(target_logit);
+        if (lane_id == 0) {
+            scratch[8 + simd_group_id] = simd_target;
+        }
+    }
 
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- Reduce logit_sum across all SIMD groups for label smoothing ---
+    {
+        float simd_lsum = simd_sum(local_logit_sum);
+        if (lane_id == 0) {
+            scratch[12 + simd_group_id] = simd_lsum;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Compute final loss (simd_group 0, lane 0 only)
+    if (lane_id == 0 && simd_group_id == 0) {
+        // Collect target_logit from all simd groups
+        float global_target_logit = -INFINITY;
+        for (uint g = 0; g < num_simd_groups; g++) {
+            float v = scratch[8 + g];
+            if (v > global_target_logit) global_target_logit = v;
+        }
+
+        float lse = running_max + log(running_sum);
+        float loss = lse - global_target_logit;
+
+        // Apply label smoothing: smoothed = (1-eps)*CE + eps*(lse - mean_logit)
+        // mean_logit = sum(all logits) / vocab_size
         if (params.label_smoothing > 0.0f) {
-            float smooth_loss = lse - (lse - log((float)params.vocab_size));
+            float global_logit_sum = 0.0f;
+            for (uint g = 0; g < num_simd_groups; g++) {
+                global_logit_sum += scratch[12 + g];
+            }
+            float mean_logit = global_logit_sum / (float)params.vocab_size;
+            float smooth_loss = lse - mean_logit;
             loss = (1.0f - params.label_smoothing) * loss + params.label_smoothing * smooth_loss;
         }
 
