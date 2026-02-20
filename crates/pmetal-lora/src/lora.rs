@@ -340,13 +340,9 @@ impl LoraLinear {
         Ok(())
     }
 
-    /// Unmerge is not supported.
-    ///
-    /// LoRA weights cannot be reliably unmerged once merged because the original
-    /// base weight is overwritten. To "unmerge", reload the base model weights
-    /// and re-apply the LoRA adapter.
-    // NOTE: unmerge() is intentionally omitted. The original base weight is
-    // lost after merge(); callers must reload base weights to undo a merge.
+    // Unmerge is not supported: LoRA weights cannot be reliably unmerged once merged
+    // because the original base weight is overwritten. To "unmerge", reload the base
+    // model weights and re-apply the LoRA adapter.
 
     /// Get the LoRA A parameters (for gradient computation).
     pub fn lora_a_params(&self) -> &Array {
@@ -398,7 +394,7 @@ impl LoraLinear {
 ///
 /// Wraps `LoraConfig` rather than duplicating its fields, ensuring
 /// that model patching code always references a single source of truth.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct LoraLayerConfig {
     /// Underlying core config this layer config is derived from.
     config: LoraConfig,
@@ -440,14 +436,6 @@ impl LoraLayerConfig {
     /// Access the underlying `LoraConfig`.
     pub fn as_core(&self) -> &LoraConfig {
         &self.config
-    }
-}
-
-impl Default for LoraLayerConfig {
-    fn default() -> Self {
-        Self {
-            config: LoraConfig::default(),
-        }
     }
 }
 

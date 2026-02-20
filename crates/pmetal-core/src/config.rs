@@ -59,21 +59,16 @@ impl Default for ModelConfig {
 }
 
 /// Bias handling mode for LoRA layers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoraBias {
     /// Do not train any bias parameters (recommended default).
+    #[default]
     None,
     /// Train all bias parameters.
     All,
     /// Train only bias parameters associated with LoRA layers.
     LoraOnly,
-}
-
-impl Default for LoraBias {
-    fn default() -> Self {
-        Self::None
-    }
 }
 
 /// LoRA configuration.

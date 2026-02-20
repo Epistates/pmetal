@@ -2196,7 +2196,7 @@ impl NemotronHMixer {
             std::sync::atomic::AtomicUsize::new(0);
         static SLOW_PATH_COUNT: std::sync::atomic::AtomicUsize =
             std::sync::atomic::AtomicUsize::new(0);
-        let (y, next_state) = if seq_len == 1 && prev_state.is_some() {
+        let (y, next_state) = if let (1, Some(prev)) = (seq_len, prev_state) {
             let count = FAST_PATH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             if count < 5 || count % 1000 == 0 {
                 tracing::info!("SSM fast path: seq_len={}, count={}", seq_len, count);
@@ -2209,7 +2209,7 @@ impl NemotronHMixer {
                 d_param,
                 dt,
                 dt_bias,
-                prev_state.unwrap(),
+                prev,
                 (self.time_step_min, self.time_step_max),
             )?
         } else {
