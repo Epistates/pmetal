@@ -100,9 +100,6 @@ pub struct FusedLoraTrainer {
 
     #[cfg(feature = "metal-fused")]
     metal_ctx: Option<Arc<MetalContext>>,
-
-    #[cfg(feature = "metal-fused")]
-    fused_lora: Option<FusedLora>,
 }
 
 impl FusedLoraTrainer {
@@ -120,7 +117,6 @@ impl FusedLoraTrainer {
                         return Ok(Self {
                             config,
                             metal_ctx: Some(ctx),
-                            fused_lora: None, // Created lazily per batch size
                         });
                     }
                     Err(e) => {
@@ -139,8 +135,6 @@ impl FusedLoraTrainer {
             config,
             #[cfg(feature = "metal-fused")]
             metal_ctx: None,
-            #[cfg(feature = "metal-fused")]
-            fused_lora: None,
         })
     }
 
