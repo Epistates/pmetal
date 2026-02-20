@@ -1128,6 +1128,14 @@ kernel void fused_kl_divergence_forward_backward(
     const uint thread_idx = simd_group_id * SIMD_SIZE + lane_id;
     const uint num_threads = DISTILL_THREADS_PER_TOKEN;
 
+    // Initialize scratch to safe defaults for cross-SIMD reduction.
+    // Handles cases where fewer SIMD groups are dispatched than expected
+    // (e.g., GPU VM environments with lower maxTotalThreadsPerThreadgroup).
+    for (uint i = thread_idx; i < 16; i += num_threads) {
+        scratch[i] = ((i & 3) == 0 || (i & 3) == 2) ? -INFINITY : 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
     // Phase 1: Compute logsumexp for both teacher and student
     float t_local_max = -INFINITY, t_local_sum = 0.0f;
     float s_local_max = -INFINITY, s_local_sum = 0.0f;
@@ -1221,6 +1229,12 @@ kernel void fused_kl_divergence_forward_backward(
 
     t_lse = scratch[0];
     s_lse = scratch[1];
+
+    // Zero scratch for Phase 2 KL reduction (handles fewer SIMD groups than expected)
+    if (thread_idx < 4) {
+        scratch[thread_idx] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Phase 2: Compute loss and gradient simultaneously
     float local_kl = 0.0f;
