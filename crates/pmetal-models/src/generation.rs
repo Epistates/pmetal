@@ -102,13 +102,25 @@ fn set_wired_limit(limit: usize) -> usize {
 ///
 /// Returns the max recommended working set size.
 fn get_max_recommended_wired_limit() -> usize {
-    // SAFETY:
-    // 1. mlx_metal_device_info is a public MLX C API function
-    // 2. It returns a struct containing Metal device information
-    // 3. The function queries the default Metal device (GPU)
-    // 4. The returned struct is copied by value, no lifetime concerns
-    let info = unsafe { mlx_sys::mlx_metal_device_info() };
-    info.max_recommended_working_set_size
+    // SAFETY: All calls below are public mlx-c v0.5.0 APIs.
+    // We create device/info objects, query them, and free them properly.
+    unsafe {
+        let dev = mlx_sys::mlx_device_new_type(mlx_sys::mlx_device_type__MLX_GPU, 0);
+        let mut info = mlx_sys::mlx_device_info_new();
+        let ret = mlx_sys::mlx_device_info_get(&mut info, dev);
+        if ret != 0 {
+            mlx_sys::mlx_device_info_free(info);
+            mlx_sys::mlx_device_free(dev);
+            // Fallback: return 0 which means "no limit" effectively
+            return 0;
+        }
+        let mut value: usize = 0;
+        let key = c"max_recommended_working_set_size";
+        mlx_sys::mlx_device_info_get_size(&mut value, info, key.as_ptr());
+        mlx_sys::mlx_device_info_free(info);
+        mlx_sys::mlx_device_free(dev);
+        value
+    }
 }
 
 /// RAII guard for managing wired memory limit during generation.

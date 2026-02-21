@@ -66,7 +66,7 @@ use mlx_rs::{
     nn,
     ops::indexing::{argmax_axis, IndexOp},
     optimizers::{AdamW, AdamWBuilder, Optimizer},
-    transforms::compile::{compile_with_state, TrainableState},
+    transforms::compile::compile_with_state,
     utils::Updatable,
     Array,
 };
@@ -138,19 +138,16 @@ fn jit_training_step<M: TrainableModel, O: Optimizer>(
     Ok(loss)
 }
 
-/// Training step that works with TrainableState for JIT compilation.
+/// Training step for JIT compilation via `compile_with_state`.
 ///
-/// This function has the same logic as `jit_training_step` but operates on
-/// `TrainableState<M, O>` which only exposes trainable parameters. This
-/// enables successful JIT compilation via `compile_with_state` for large
-/// models with LoRA or other parameter-efficient fine-tuning.
+/// Operates on a `(Model, Optimizer)` tuple which implements `Updatable`,
+/// enabling JIT compilation for models with LoRA or other parameter-efficient
+/// fine-tuning.
 fn trainable_training_step<M: TrainableModel, O: Optimizer>(
-    state: &mut TrainableState<M, O>,
+    state: &mut (M, O),
     (input_ids, labels): (&Array, &Array),
 ) -> std::result::Result<Array, Exception> {
-    // Get mutable references to both model and optimizer at once
-    // This is necessary because Optimizer::update needs &mut Model
-    let (model, optimizer) = state.as_parts_mut();
+    let (model, optimizer) = state;
 
     // Define loss function that will be used by value_and_grad
     let loss_fn = |model: &mut M,
@@ -1287,9 +1284,9 @@ impl TrainingLoop {
             )));
         }
 
-        // If JIT compilation is enabled, use TrainableState for true JIT
+        // If JIT compilation is enabled, use compile_with_state for true JIT
         if self.config.use_jit_compilation {
-            tracing::info!("JIT compilation enabled, using TrainableState wrapper");
+            tracing::info!("JIT compilation enabled");
             return self.run_jit_compiled(model, train_dataset, _eval_dataset, checkpoint_manager);
         }
 
@@ -1558,24 +1555,11 @@ impl TrainingLoop {
         Ok(state.0)
     }
 
-    /// Run training with true JIT compilation using TrainableState.
+    /// Run training with true JIT compilation using `compile_with_state`.
     ///
-    /// This method uses mlx-rs's `compile_with_state` with the new `TrainableState`
-    /// wrapper that only exposes trainable parameters. This enables true JIT compilation
-    /// for large models with LoRA, achieving performance comparable to Python mlx-lm.
-    ///
-    /// ## How it works
-    ///
-    /// 1. Model and optimizer are wrapped in `TrainableState<M, O>`
-    /// 2. `TrainableState` implements `Updatable` returning only trainable params + optimizer state
-    /// 3. `compile_with_state` JIT compiles the training step with graph fusion
-    /// 4. The compiled function runs at maximum throughput
-    ///
-    /// ## Performance
-    ///
-    /// For LoRA fine-tuning, this reduces state count from ~10M to ~500K arrays,
-    /// enabling successful JIT compilation. Expected performance is comparable to
-    /// or exceeding Python mlx-lm.
+    /// Uses mlx-rs's `compile_with_state` with a `(Model, Optimizer)` tuple
+    /// that implements `Updatable`. This enables JIT compilation with graph
+    /// fusion for maximum throughput.
     ///
     /// **Requirements:**
     /// - gradient_accumulation_steps must be 1
@@ -1620,13 +1604,11 @@ impl TrainingLoop {
         let max_steps = self.config.training.max_steps;
         let num_epochs = self.config.training.num_epochs;
 
-        // Wrap model and optimizer in TrainableState
-        // This ensures compile_with_state only tracks trainable parameters
-        let mut state = TrainableState::new(model, optimizer);
+        let mut state = (model, optimizer);
 
         tracing::info!(
             "Starting JIT-compiled training: {} trainable params (state_count={})",
-            state.num_trainable_params(),
+            state.0.num_trainable_params(),
             state.updatable_states_len(),
         );
 
@@ -1653,8 +1635,6 @@ impl TrainingLoop {
         warmup_loss.eval()?;
         let warmup_loss_val = warmup_loss.item::<f32>();
 
-        // Refresh trainable keys after warmup (optimizer may have added state)
-        state.refresh_trainable_keys();
         let state_count_after = state.updatable_states_len();
 
         tracing::info!(
@@ -1678,7 +1658,7 @@ impl TrainingLoop {
         // PHASE 2: JIT COMPILE the training step
         // =========================================================================
         tracing::info!(
-            "JIT compiling training step with TrainableState (state_count={})",
+            "JIT compiling training step (state_count={})",
             state_count_after
         );
 
@@ -1777,8 +1757,7 @@ impl TrainingLoop {
             self.running_loss
         );
 
-        // Extract model from TrainableState
-        let (model, _optimizer) = state.into_parts();
+        let (model, _optimizer) = state;
         Ok(model)
     }
 
