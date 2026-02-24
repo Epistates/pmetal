@@ -14,13 +14,21 @@ jobs:
     runs-on: ubuntu-latest
     
     steps:
-    - uses: actions/checkout@v4
-    
+    - uses: actions/checkout@v5
+
+    # Clone mlx-rs so workspace Cargo.toml resolves (fuzz targets don't use it)
+    - name: Clone mlx-rs
+      run: |
+        mkdir -p ../reference
+        git clone --depth 1 --recurse-submodules https://github.com/nicholasjpaterno/mlx-rs.git ../reference/mlx-rs
+
     - name: Install nightly Rust
       uses: dtolnay/rust-toolchain@nightly
 
     - name: Install cargo-fuzz
       run: cargo install cargo-fuzz
+
+    - uses: Swatinem/rust-cache@v2
 
     - name: Fuzz GGUF Reader
       run: cargo +nightly fuzz run gguf_reader -- -max_total_time=300
