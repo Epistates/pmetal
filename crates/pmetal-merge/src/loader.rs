@@ -596,7 +596,10 @@ impl ModelSource {
                 let model_dir = first
                     .parent()
                     .ok_or_else(|| {
-                        MergeError::ModelLoad(format!("Failed to get parent directory of {:?}", first))
+                        MergeError::ModelLoad(format!(
+                            "Failed to get parent directory of {:?}",
+                            first
+                        ))
                     })?
                     .to_path_buf();
 
@@ -692,7 +695,9 @@ impl TensorWriter {
                     shape,
                     bytemuck::cast_slice(data),
                 )
-                .map_err(|e| MergeError::ModelLoad(format!("Failed to create TensorView: {}", e)))?;
+                .map_err(|e| {
+                    MergeError::ModelLoad(format!("Failed to create TensorView: {}", e))
+                })?;
                 Ok((name.as_str(), tensor_view))
             })
             .collect::<Result<Vec<_>>>()?;

@@ -1199,27 +1199,12 @@ impl QuantizedKVCache {
 
         // Reshape packed data back to [B, H, S, packed_dim].
         let packed_dim = w_q.dim(1);
-        let data = w_q.reshape(&[
-            batch as i32,
-            heads as i32,
-            seq as i32,
-            packed_dim,
-        ])?;
+        let data = w_q.reshape(&[batch as i32, heads as i32, seq as i32, packed_dim])?;
 
         // Reshape scales/biases back to [B, H, S, num_groups].
         let num_groups = scales_2d.dim(1);
-        let scales = scales_2d.reshape(&[
-            batch as i32,
-            heads as i32,
-            seq as i32,
-            num_groups,
-        ])?;
-        let biases = biases_2d.reshape(&[
-            batch as i32,
-            heads as i32,
-            seq as i32,
-            num_groups,
-        ])?;
+        let scales = scales_2d.reshape(&[batch as i32, heads as i32, seq as i32, num_groups])?;
+        let biases = biases_2d.reshape(&[batch as i32, heads as i32, seq as i32, num_groups])?;
 
         Ok(QuantizedTensor {
             data,
@@ -1266,12 +1251,7 @@ impl QuantizedKVCache {
         )?;
 
         // Restore 4-D layout [B, H, S, D] and cast to the original dtype.
-        let out_4d = flat_float.reshape(&[
-            batch as i32,
-            heads as i32,
-            seq as i32,
-            dim as i32,
-        ])?;
+        let out_4d = flat_float.reshape(&[batch as i32, heads as i32, seq as i32, dim as i32])?;
 
         // Cast back to the dtype we received (typically f16 / bf16).
         out_4d.as_dtype(self.dtype)

@@ -189,7 +189,9 @@ mod tests {
         let params = vec![MergeParameters::default()];
         let global = MergeParameters::default(); // lambda=1.0
 
-        let result = ns.merge(&[t1.clone()], Some(&base), &params, &global).unwrap();
+        let result = ns
+            .merge(&[t1.clone()], Some(&base), &params, &global)
+            .unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();
 
         // Single model, lambda=1 → passthrough
@@ -219,11 +221,23 @@ mod tests {
         let result_slice: Vec<f32> = result.as_slice().to_vec();
 
         // Position 0: |1-0|=1 vs |4-0|=4 → t1 wins → 1.0
-        assert!((result_slice[0] - 1.0).abs() < 1e-5, "pos 0: expected 1.0, got {}", result_slice[0]);
+        assert!(
+            (result_slice[0] - 1.0).abs() < 1e-5,
+            "pos 0: expected 1.0, got {}",
+            result_slice[0]
+        );
         // Position 1: |5-0|=5 vs |1-0|=1 → t2 wins → 1.0
-        assert!((result_slice[1] - 1.0).abs() < 1e-5, "pos 1: expected 1.0, got {}", result_slice[1]);
+        assert!(
+            (result_slice[1] - 1.0).abs() < 1e-5,
+            "pos 1: expected 1.0, got {}",
+            result_slice[1]
+        );
         // Position 2: |1-0|=1 vs |4-0|=4 → t1 wins → 1.0
-        assert!((result_slice[2] - 1.0).abs() < 1e-5, "pos 2: expected 1.0, got {}", result_slice[2]);
+        assert!(
+            (result_slice[2] - 1.0).abs() < 1e-5,
+            "pos 2: expected 1.0, got {}",
+            result_slice[2]
+        );
     }
 
     #[test]
@@ -246,9 +260,21 @@ mod tests {
         result.eval().unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();
 
-        assert!((result_slice[0] - 2.5).abs() < 1e-5, "pos 0: expected 2.5, got {}", result_slice[0]);
-        assert!((result_slice[1] - 2.1).abs() < 1e-5, "pos 1: expected 2.1, got {}", result_slice[1]);
-        assert!((result_slice[2] - 3.0).abs() < 1e-5, "pos 2: expected 3.0, got {}", result_slice[2]);
+        assert!(
+            (result_slice[0] - 2.5).abs() < 1e-5,
+            "pos 0: expected 2.5, got {}",
+            result_slice[0]
+        );
+        assert!(
+            (result_slice[1] - 2.1).abs() < 1e-5,
+            "pos 1: expected 2.1, got {}",
+            result_slice[1]
+        );
+        assert!(
+            (result_slice[2] - 3.0).abs() < 1e-5,
+            "pos 2: expected 3.0, got {}",
+            result_slice[2]
+        );
     }
 
     #[test]
@@ -272,7 +298,12 @@ mod tests {
         let base_slice: Vec<f32> = base.as_slice().to_vec();
 
         for (r, b) in result_slice.iter().zip(base_slice.iter()) {
-            assert!((r - b).abs() < 1e-5, "lambda=0 should give base: expected {}, got {}", b, r);
+            assert!(
+                (r - b).abs() < 1e-5,
+                "lambda=0 should give base: expected {}, got {}",
+                b,
+                r
+            );
         }
     }
 
@@ -298,7 +329,11 @@ mod tests {
         result.eval().unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();
 
-        assert!((result_slice[0] - 1.0).abs() < 1e-5, "expected 1.0, got {}", result_slice[0]);
+        assert!(
+            (result_slice[0] - 1.0).abs() < 1e-5,
+            "expected 1.0, got {}",
+            result_slice[0]
+        );
     }
 
     #[test]
@@ -320,11 +355,17 @@ mod tests {
         ];
         let global = MergeParameters::default();
 
-        let result = ns.merge(&[t1, t2, t3], Some(&base), &params, &global).unwrap();
+        let result = ns
+            .merge(&[t1, t2, t3], Some(&base), &params, &global)
+            .unwrap();
         result.eval().unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();
 
-        assert!((result_slice[0] - 0.5).abs() < 1e-5, "expected t3=0.5, got {}", result_slice[0]);
+        assert!(
+            (result_slice[0] - 0.5).abs() < 1e-5,
+            "expected t3=0.5, got {}",
+            result_slice[0]
+        );
     }
 
     #[test]
@@ -375,7 +416,12 @@ mod tests {
     fn test_nearswap_no_base_error() {
         let ns = NearswapMerge::new();
         let t1 = Array::from_slice(&[1.0_f32], &[1]);
-        let result = ns.merge(&[t1], None, &[MergeParameters::default()], &MergeParameters::default());
+        let result = ns.merge(
+            &[t1],
+            None,
+            &[MergeParameters::default()],
+            &MergeParameters::default(),
+        );
         assert!(result.is_err(), "should error when base model is missing");
     }
 }

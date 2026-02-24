@@ -845,20 +845,17 @@ impl DeepSeekSparseAttention {
         // Gather selected keys: for each query position, select its top_k keys
         // We need to gather along the key_len axis (axis=2) of keys [B, heads, key_len, head_dim]
         // Use take_along_axis: expand idx to match key_dim, then gather
-        let idx_for_keys = idx
-            .reshape(&[batch, n_heads, query_len * top_k, 1])?;
+        let idx_for_keys = idx.reshape(&[batch, n_heads, query_len * top_k, 1])?;
         let idx_for_keys = mlx_rs::ops::broadcast_to(
             &idx_for_keys,
             &[batch, n_heads, query_len * top_k, key_dim],
         )?;
         let keys_flat = keys.clone(); // [B, heads, key_len, head_dim]
         let gathered_keys = mlx_rs::ops::indexing::take_along_axis(&keys_flat, &idx_for_keys, 2)?;
-        let gathered_keys =
-            gathered_keys.reshape(&[batch, n_heads, query_len, top_k, key_dim])?;
+        let gathered_keys = gathered_keys.reshape(&[batch, n_heads, query_len, top_k, key_dim])?;
 
         // Gather selected values similarly
-        let idx_for_vals = idx
-            .reshape(&[batch, n_heads, query_len * top_k, 1])?;
+        let idx_for_vals = idx.reshape(&[batch, n_heads, query_len * top_k, 1])?;
         let idx_for_vals = mlx_rs::ops::broadcast_to(
             &idx_for_vals,
             &[batch, n_heads, query_len * top_k, val_dim],
@@ -881,8 +878,7 @@ impl DeepSeekSparseAttention {
         let attn_scores = attn_scores.squeeze_axes(&[3])?;
         // -> [B, heads, query_len, top_k]
 
-        let attn_scores =
-            attn_scores.multiply(&Array::from_f32(self.base_attention.scale))?;
+        let attn_scores = attn_scores.multiply(&Array::from_f32(self.base_attention.scale))?;
 
         // Apply softmax over the top_k dimension
         let attn_weights = mlx_rs::ops::softmax_axis(&attn_scores, -1, None)?;

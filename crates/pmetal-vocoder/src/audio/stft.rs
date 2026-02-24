@@ -225,22 +225,13 @@ pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
         let frame = windowed_frames.index((.., i, ..));
 
         // Pad frame along axis 1 (the sample axis): [batch, output_length]
-        let padded_frame = mlx_rs::ops::pad(
-            &frame,
-            &[(0i32, 0i32), (pad_before, pad_after)],
-            None,
-            None,
-        )?;
+        let padded_frame =
+            mlx_rs::ops::pad(&frame, &[(0i32, 0i32), (pad_before, pad_after)], None, None)?;
 
         output_sum = output_sum.add(&padded_frame)?;
 
         // Pad window_sq (1-D) along axis 0: [output_length]
-        let padded_wsq = mlx_rs::ops::pad(
-            &window_sq,
-            &[(pad_before, pad_after)],
-            None,
-            None,
-        )?;
+        let padded_wsq = mlx_rs::ops::pad(&window_sq, &[(pad_before, pad_after)], None, None)?;
         norm_sum = norm_sum.add(&padded_wsq)?;
     }
 

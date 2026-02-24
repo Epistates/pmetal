@@ -193,11 +193,7 @@ impl DistillationTrainer {
                     // Run evaluation if an eval dataset is provided.
                     let eval_loss: Option<f64> = if let Some(ref eval_ds) = eval_dataset {
                         let loss = self.run_eval(student, teacher, eval_ds)?;
-                        tracing::info!(
-                            "Step {}: eval_loss={:.4}",
-                            self.loop_state.step,
-                            loss
-                        );
+                        tracing::info!("Step {}: eval_loss={:.4}", self.loop_state.step, loss);
                         Some(loss)
                     } else {
                         None

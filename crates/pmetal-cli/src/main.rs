@@ -1179,9 +1179,9 @@ async fn run_quantization(
     keys.sort();
 
     for name in keys {
-        let tensor = weights.get(name).ok_or_else(|| {
-            anyhow::anyhow!("Tensor {} not found in loaded weights", name)
-        })?;
+        let tensor = weights
+            .get(name)
+            .ok_or_else(|| anyhow::anyhow!("Tensor {} not found in loaded weights", name))?;
         // Skip quantization for non-F32/F16 tensors (e.g. integer indices) if any
         // But most LLM weights are floats.
 
@@ -2929,10 +2929,14 @@ fn validate_file_path(path: &str, allow_creation: bool) -> anyhow::Result<std::p
         // If file doesn't exist yet, canonicalize parent
         if let Some(parent) = path.parent() {
             if parent.as_os_str().is_empty() {
-                let file_name = path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid path: no file name"))?;
+                let file_name = path
+                    .file_name()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid path: no file name"))?;
                 std::env::current_dir()?.join(file_name)
             } else {
-                let file_name = path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid path: no file name"))?;
+                let file_name = path
+                    .file_name()
+                    .ok_or_else(|| anyhow::anyhow!("Invalid path: no file name"))?;
                 parent.canonicalize()?.join(file_name)
             }
         } else {
@@ -3535,7 +3539,10 @@ async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
         // Extract last logits
         let t0 = Instant::now();
         let last_logits = next_logits.index((.., -1, ..));
-        times.entry("extract_logits").or_default().push(t0.elapsed());
+        times
+            .entry("extract_logits")
+            .or_default()
+            .push(t0.elapsed());
 
         // Argmax
         let t0 = Instant::now();
@@ -3552,7 +3559,10 @@ async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
         let _ = current_token.item::<u32>();
         times.entry("item").or_default().push(t0.elapsed());
 
-        times.entry("total").or_default().push(total_start.elapsed());
+        times
+            .entry("total")
+            .or_default()
+            .push(total_start.elapsed());
 
         current_token = next_token;
     }
@@ -3811,8 +3821,12 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                 format!("{}.jsonl", safe_name)
             });
 
-            let validated_download_output = validate_output_path(&output_path, "dataset download output")?;
-            println!("Converting to JSONL: {}", validated_download_output.display());
+            let validated_download_output =
+                validate_output_path(&output_path, "dataset download output")?;
+            println!(
+                "Converting to JSONL: {}",
+                validated_download_output.display()
+            );
 
             // Convert parquet to JSONL using arrow-parquet
             let mut output_file = std::fs::File::create(&validated_download_output)?;

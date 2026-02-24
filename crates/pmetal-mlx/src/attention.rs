@@ -303,20 +303,33 @@ impl AttentionDispatcher {
         };
 
         // Helper: call mlx_rs fast SDPA with correct mask type conversion
-        let fast_sdpa =
-            |q: &mlx_rs::Array, k: &mlx_rs::Array, v: &mlx_rs::Array, scale: f32, mask: &Option<mlx_rs::Array>|
-             -> std::result::Result<mlx_rs::Array, pmetal_core::PMetalError> {
-                let result = if let Some(ref m) = mask {
-                    mlx_rs::fast::scaled_dot_product_attention(q, k, v, scale, m, Option::<&mlx_rs::Array>::None)
-                } else {
-                    mlx_rs::fast::scaled_dot_product_attention(
-                        q, k, v, scale,
-                        Option::<mlx_rs::fast::ScaledDotProductAttentionMask>::None,
-                        Option::<&mlx_rs::Array>::None,
-                    )
-                };
-                result.map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))
+        let fast_sdpa = |q: &mlx_rs::Array,
+                         k: &mlx_rs::Array,
+                         v: &mlx_rs::Array,
+                         scale: f32,
+                         mask: &Option<mlx_rs::Array>|
+         -> std::result::Result<mlx_rs::Array, pmetal_core::PMetalError> {
+            let result = if let Some(ref m) = mask {
+                mlx_rs::fast::scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale,
+                    m,
+                    Option::<&mlx_rs::Array>::None,
+                )
+            } else {
+                mlx_rs::fast::scaled_dot_product_attention(
+                    q,
+                    k,
+                    v,
+                    scale,
+                    Option::<mlx_rs::fast::ScaledDotProductAttentionMask>::None,
+                    Option::<&mlx_rs::Array>::None,
+                )
             };
+            result.map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))
+        };
 
         let output = match backend {
             // MlxFast: delegate to mlx_rs::fast::scaled_dot_product_attention, which

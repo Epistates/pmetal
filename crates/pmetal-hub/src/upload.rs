@@ -108,11 +108,7 @@ struct LfsVerifyAction {
 /// * `model_path`  – Local directory containing the model files.
 /// * `repo_id`     – Hub repository in the form `"owner/repo-name"`.
 /// * `token`       – HuggingFace write token (Bearer auth).
-pub async fn upload_model<P: AsRef<Path>>(
-    model_path: P,
-    repo_id: &str,
-    token: &str,
-) -> Result<()> {
+pub async fn upload_model<P: AsRef<Path>>(model_path: P, repo_id: &str, token: &str) -> Result<()> {
     let model_path = model_path.as_ref();
 
     if !model_path.is_dir() {
@@ -145,8 +141,9 @@ pub async fn upload_model<P: AsRef<Path>>(
     );
 
     // 3. Partition into inline (small/text) vs LFS (large binary) files.
-    let (inline_files, lfs_files): (Vec<_>, Vec<_>) =
-        candidates.into_iter().partition(|c| c.size < LFS_THRESHOLD_BYTES);
+    let (inline_files, lfs_files): (Vec<_>, Vec<_>) = candidates
+        .into_iter()
+        .partition(|c| c.size < LFS_THRESHOLD_BYTES);
 
     // 4. Pre-upload LFS objects and gather their metadata.
     let lfs_entries = if lfs_files.is_empty() {
@@ -225,9 +222,10 @@ fn collect_files(model_path: &Path) -> Result<Vec<UploadCandidate>> {
         }
 
         let metadata = entry.metadata().map_err(|e| {
-            PMetalError::Io(std::io::Error::other(
-                format!("metadata error for {}: {e}", local_path.display()),
-            ))
+            PMetalError::Io(std::io::Error::other(format!(
+                "metadata error for {}: {e}",
+                local_path.display()
+            )))
         })?;
 
         let size = metadata.len();
@@ -235,9 +233,7 @@ fn collect_files(model_path: &Path) -> Result<Vec<UploadCandidate>> {
         // Build the repo-relative path (always use forward slashes).
         let rel = local_path
             .strip_prefix(model_path)
-            .map_err(|e| {
-                PMetalError::InvalidArgument(format!("path strip_prefix failed: {e}"))
-            })?;
+            .map_err(|e| PMetalError::InvalidArgument(format!("path strip_prefix failed: {e}")))?;
         let repo_path = rel
             .components()
             .map(|c| c.as_os_str().to_string_lossy())
@@ -362,10 +358,8 @@ async fn preupload_lfs_objects(
         .map_err(|e| PMetalError::Hub(format!("Failed to parse LFS batch response: {e}")))?;
 
     // Upload each object that the server indicated needs to be uploaded.
-    let oid_to_candidate: std::collections::HashMap<&str, &UploadCandidate> = hashed
-        .iter()
-        .map(|(c, oid)| (oid.as_str(), *c))
-        .collect();
+    let oid_to_candidate: std::collections::HashMap<&str, &UploadCandidate> =
+        hashed.iter().map(|(c, oid)| (oid.as_str(), *c)).collect();
 
     let mut entries: Vec<LfsEntry> = Vec::with_capacity(hashed.len());
 
@@ -419,10 +413,9 @@ async fn upload_lfs_object(
         req = req.header(k.as_str(), v.as_str());
     }
 
-    let resp = req
-        .send()
-        .await
-        .map_err(|e| PMetalError::Hub(format!("LFS PUT failed for '{}': {e}", candidate.repo_path)))?;
+    let resp = req.send().await.map_err(|e| {
+        PMetalError::Hub(format!("LFS PUT failed for '{}': {e}", candidate.repo_path))
+    })?;
 
     if !resp.status().is_success() {
         let status = resp.status();

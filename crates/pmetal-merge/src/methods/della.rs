@@ -139,10 +139,7 @@ impl DellaMerge {
         }
 
         // Numerically stable softmax: subtract max before exponentiating.
-        let max_val = abs_vals
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_val = abs_vals.iter().copied().fold(f32::NEG_INFINITY, f32::max);
 
         let exps: Vec<f32> = abs_vals
             .iter()
@@ -364,7 +361,11 @@ mod tests {
         let vals = vec![0.1, 0.5, 0.3, 1.0, 0.2];
         let probs = DellaMerge::drop_probs_exponential(&vals, 1.0);
         let sum: f32 = probs.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "probs should sum to 1, got {}", sum);
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "probs should sum to 1, got {}",
+            sum
+        );
         for &p in &probs {
             assert!(p >= 0.0 && p <= 1.0, "probability out of range: {}", p);
         }
@@ -387,7 +388,11 @@ mod tests {
         let vals = vec![0.2, 0.3, 0.5];
         let probs = DellaMerge::drop_probs_linear(&vals);
         let sum: f32 = probs.iter().sum();
-        assert!((sum - 1.0).abs() < 1e-5, "linear probs should sum to 1, got {}", sum);
+        assert!(
+            (sum - 1.0).abs() < 1e-5,
+            "linear probs should sum to 1, got {}",
+            sum
+        );
     }
 
     #[test]
@@ -451,7 +456,13 @@ mod tests {
 
         // density=1.0 means no dropout → result equals t1
         for (i, r) in result_slice.iter().enumerate() {
-            assert!((r - (i as f32 + 1.0)).abs() < 1e-5, "index {}: expected {}, got {}", i, i as f32 + 1.0, r);
+            assert!(
+                (r - (i as f32 + 1.0)).abs() < 1e-5,
+                "index {}: expected {}, got {}",
+                i,
+                i as f32 + 1.0,
+                r
+            );
         }
     }
 
