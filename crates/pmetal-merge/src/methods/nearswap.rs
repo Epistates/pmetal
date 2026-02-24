@@ -190,7 +190,7 @@ mod tests {
         let global = MergeParameters::default(); // lambda=1.0
 
         let result = ns
-            .merge(&[t1.clone()], Some(&base), &params, &global)
+            .merge(std::slice::from_ref(&t1), Some(&base), &params, &global)
             .unwrap();
         let result_slice: Vec<f32> = result.as_slice().to_vec();
 
