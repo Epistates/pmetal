@@ -1,10 +1,7 @@
 //! PMetal CLI - LLM fine-tuning for Apple Silicon.
 
-#![allow(unused_imports)]
-#![allow(unused_variables)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::derivable_impls)]
-#![allow(clippy::unnecessary_unwrap)]
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::needless_borrows_for_generic_args)]
 
@@ -1182,7 +1179,9 @@ async fn run_quantization(
     keys.sort();
 
     for name in keys {
-        let tensor = weights.get(name).unwrap();
+        let tensor = weights.get(name).ok_or_else(|| {
+            anyhow::anyhow!("Tensor {} not found in loaded weights", name)
+        })?;
         // Skip quantization for non-F32/F16 tensors (e.g. integer indices) if any
         // But most LLM weights are floats.
 
@@ -1227,8 +1226,9 @@ async fn run_quantization(
         builder.add_raw_tensor(name, shape_u64, target_type, quantized_data);
     }
 
-    // Write output file
-    let mut file = std::fs::File::create(output_path)?;
+    // Validate and write output file
+    let validated_output = validate_output_path(output_path, "quantization output")?;
+    let mut file = std::fs::File::create(&validated_output)?;
     builder.write(&mut file)?;
 
     println!("Quantization complete!");
@@ -1345,6 +1345,7 @@ async fn run_distillation_cli(
         _ => LossType::KlDivergence,
     };
 
+    let validated_distill_output = validate_output_path(output_dir, "distillation output")?;
     let distill_config = DistillConfig {
         teacher: teacher_id.to_string(),
         student: student_id.to_string(),
@@ -1358,7 +1359,7 @@ async fn run_distillation_cli(
             ..Default::default()
         },
         offline: None,
-        output_path: Some(PathBuf::from(output_dir)),
+        output_path: Some(validated_distill_output.clone()),
         training: pmetal_distill::TrainingConfig {
             batch_size,
             learning_rate,
@@ -1377,7 +1378,7 @@ async fn run_distillation_cli(
             batch_size,
             num_epochs: epochs,
             max_seq_len,
-            output_dir: output_dir.to_string(),
+            output_dir: validated_distill_output.display().to_string(),
             ..Default::default()
         },
         dataloader: DataLoaderConfig {
@@ -1415,9 +1416,9 @@ async fn run_distillation_cli(
         .map_err(|e| anyhow::anyhow!("Distillation failed: {}", e))?;
 
     // 9. Save Student Adapters
-    let lora_output = PathBuf::from(output_dir).join("lora_weights.safetensors");
+    let lora_output = validated_distill_output.join("lora_weights.safetensors");
     tracing::info!("Saving distilled student adapters to {:?}", lora_output);
-    std::fs::create_dir_all(output_dir)?;
+    std::fs::create_dir_all(&validated_distill_output)?;
     student_model.save_lora_weights(&lora_output)?;
 
     println!(
@@ -1669,7 +1670,7 @@ async fn run_training(
     progress.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) | Loss: {msg}")
-            .unwrap()
+            .expect("Stop tokens should format correctly")
             .progress_chars("#>-"),
     );
 
@@ -2036,7 +2037,7 @@ async fn run_inference(
         // LoRA uses default temperature if not specified
         return run_inference_with_lora(
             &model_path,
-            lora_path.unwrap(),
+            lora_path.unwrap_or("None"),
             &tokenizer,
             prompt,
             max_tokens,
@@ -2928,9 +2929,11 @@ fn validate_file_path(path: &str, allow_creation: bool) -> anyhow::Result<std::p
         // If file doesn't exist yet, canonicalize parent
         if let Some(parent) = path.parent() {
             if parent.as_os_str().is_empty() {
-                std::env::current_dir()?.join(path.file_name().unwrap())
+                let file_name = path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid path: no file name"))?;
+                std::env::current_dir()?.join(file_name)
             } else {
-                parent.canonicalize()?.join(path.file_name().unwrap())
+                let file_name = path.file_name().ok_or_else(|| anyhow::anyhow!("Invalid path: no file name"))?;
+                parent.canonicalize()?.join(file_name)
             }
         } else {
             std::env::current_dir()?.join(path)
@@ -2955,19 +2958,12 @@ fn create_ollama_model(
     // Validate model name to prevent command injection
     validate_ollama_model_name(name)?;
 
-    // Create secure temporary file
-    let temp_dir = std::env::temp_dir();
-    // Use a sanitized name for the temp file
-    let safe_name: String = name
-        .chars()
-        .filter(|c| c.is_alphanumeric() || *c == '-' || *c == '_')
-        .take(64)
-        .collect();
-    let modelfile_path = temp_dir.join(format!(
-        "pmetal-modelfile-{}-{}",
-        safe_name,
-        std::process::id()
-    ));
+    // Create secure temporary file (auto-cleaned on drop)
+    let modelfile = tempfile::Builder::new()
+        .prefix("pmetal-modelfile-")
+        .suffix(".txt")
+        .tempfile()?;
+    let modelfile_path = modelfile.path().to_path_buf();
     let modelfile_str = modelfile_path.to_string_lossy().to_string();
 
     generate_modelfile(
@@ -2995,25 +2991,28 @@ fn create_ollama_model(
             println!("\nModel '{}' created successfully!", name);
             println!("\nTo use the model, run:");
             println!("  ollama run {}", name);
-
-            // Clean up temp file
-            let _ = std::fs::remove_file(&modelfile_path);
+            // modelfile is auto-cleaned on drop
         }
         Ok(exit_status) => {
+            // Persist the temp file so user can inspect it
+            let persisted = modelfile.into_temp_path();
+            let kept_path = persisted.keep()?;
             anyhow::bail!(
                 "ollama create failed with exit code: {:?}. \
                  Modelfile saved at: {}",
                 exit_status.code(),
-                modelfile_str
+                kept_path.display()
             );
         }
         Err(e) => {
             if e.kind() == std::io::ErrorKind::NotFound {
+                let persisted = modelfile.into_temp_path();
+                let kept_path = persisted.keep()?;
                 println!("\nOllama not found. Please install Ollama first:");
                 println!("  https://ollama.ai/download");
-                println!("\nModelfile has been saved to: {}", modelfile_str);
+                println!("\nModelfile has been saved to: {}", kept_path.display());
                 println!("Once Ollama is installed, run:");
-                println!("  ollama create {} -f {}", name, modelfile_str);
+                println!("  ollama create {} -f {}", name, kept_path.display());
             } else {
                 anyhow::bail!("Failed to run ollama: {}", e);
             }
@@ -3526,34 +3525,34 @@ async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
         // Reshape token to [1, 1]
         let t0 = Instant::now();
         let next_input = current_token.reshape(&[1, 1])?;
-        times.get_mut("reshape").unwrap().push(t0.elapsed());
+        times.entry("reshape").or_default().push(t0.elapsed());
 
         // Forward pass
         let t0 = Instant::now();
         let next_logits = model.forward_with_cache(&next_input, None, Some(&mut cache))?;
-        times.get_mut("forward").unwrap().push(t0.elapsed());
+        times.entry("forward").or_default().push(t0.elapsed());
 
         // Extract last logits
         let t0 = Instant::now();
         let last_logits = next_logits.index((.., -1, ..));
-        times.get_mut("extract_logits").unwrap().push(t0.elapsed());
+        times.entry("extract_logits").or_default().push(t0.elapsed());
 
         // Argmax
         let t0 = Instant::now();
         let next_token = argmax(&last_logits, None)?;
-        times.get_mut("argmax").unwrap().push(t0.elapsed());
+        times.entry("argmax").or_default().push(t0.elapsed());
 
         // Async eval for next
         let t0 = Instant::now();
         async_eval([&next_token])?;
-        times.get_mut("async_eval").unwrap().push(t0.elapsed());
+        times.entry("async_eval").or_default().push(t0.elapsed());
 
         // Extract current token (sync point)
         let t0 = Instant::now();
         let _ = current_token.item::<u32>();
-        times.get_mut("item").unwrap().push(t0.elapsed());
+        times.entry("item").or_default().push(t0.elapsed());
 
-        times.get_mut("total").unwrap().push(total_start.elapsed());
+        times.entry("total").or_default().push(total_start.elapsed());
 
         current_token = next_token;
     }
@@ -3812,10 +3811,11 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                 format!("{}.jsonl", safe_name)
             });
 
-            println!("Converting to JSONL: {}", output_path);
+            let validated_download_output = validate_output_path(&output_path, "dataset download output")?;
+            println!("Converting to JSONL: {}", validated_download_output.display());
 
             // Convert parquet to JSONL using arrow-parquet
-            let mut output_file = std::fs::File::create(&output_path)?;
+            let mut output_file = std::fs::File::create(&validated_download_output)?;
             let mut total_rows = 0usize;
 
             for parquet_path in &parquet_paths {
@@ -3837,7 +3837,6 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
 
                 for batch_result in reader {
                     let batch = batch_result?;
-                    let num_rows = batch.num_rows();
 
                     // Use arrow-json for proper nested type serialization
                     let mut json_buf = Vec::new();
@@ -4028,8 +4027,9 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                 println!("Shuffled with seed {}", seed);
             }
 
-            // Write output
-            let mut output_file = std::fs::File::create(&output)?;
+            // Validate and write output
+            let validated_convert_output = validate_output_path(&output, "dataset convert output")?;
+            let mut output_file = std::fs::File::create(&validated_convert_output)?;
             for sample in &samples {
                 writeln!(output_file, "{}", serde_json::to_string(sample)?)?;
             }
@@ -4318,9 +4318,10 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             // For deduplication
             let mut seen_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
+            let validated_filter_output = validate_output_path(&output, "dataset filter output")?;
             let file = std::fs::File::open(&input)?;
             let reader = BufReader::new(file);
-            let mut output_file = std::fs::File::create(&output)?;
+            let mut output_file = std::fs::File::create(&validated_filter_output)?;
 
             let mut total = 0usize;
             let mut kept = 0usize;
@@ -4479,32 +4480,33 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             let val_count = (total as f64 * val_ratio).round() as usize;
             let train_count = total - test_count - val_count;
 
-            // Create output directory
-            std::fs::create_dir_all(&output_dir)?;
+            // Validate and create output directory
+            let validated_split_dir = validate_output_path(&output_dir, "dataset split output")?;
+            std::fs::create_dir_all(&validated_split_dir)?;
 
             // Write splits
-            let train_path = format!("{}/train.jsonl", output_dir);
-            let val_path = format!("{}/val.jsonl", output_dir);
-            let test_path = format!("{}/test.jsonl", output_dir);
+            let train_path = validated_split_dir.join("train.jsonl");
+            let val_path = validated_split_dir.join("val.jsonl");
+            let test_path = validated_split_dir.join("test.jsonl");
 
             let mut train_file = std::fs::File::create(&train_path)?;
             for sample in samples.iter().take(train_count) {
                 writeln!(train_file, "{}", sample)?;
             }
-            println!("Train: {} samples -> {}", train_count, train_path);
+            println!("Train: {} samples -> {}", train_count, train_path.display());
 
             let mut val_file = std::fs::File::create(&val_path)?;
             for sample in samples.iter().skip(train_count).take(val_count) {
                 writeln!(val_file, "{}", sample)?;
             }
-            println!("Val:   {} samples -> {}", val_count, val_path);
+            println!("Val:   {} samples -> {}", val_count, val_path.display());
 
             if test_count > 0 {
                 let mut test_file = std::fs::File::create(&test_path)?;
                 for sample in samples.iter().skip(train_count + val_count) {
                     writeln!(test_file, "{}", sample)?;
                 }
-                println!("Test:  {} samples -> {}", test_count, test_path);
+                println!("Test:  {} samples -> {}", test_count, test_path.display());
             }
 
             println!("\n========================================");
@@ -4664,9 +4666,9 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             output,
             template,
             system,
-            model,
+            model: _,
             add_generation_prompt,
-            mask_prompt,
+            mask_prompt: _,
         } => {
             println!("========================================");
             println!("  PMetal Chat Template");
@@ -4794,7 +4796,6 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                 let mut total_rows = 0usize;
 
                 for parquet_path in &parquet_paths {
-                    use arrow_array::RecordBatchReader;
                     use arrow_json::writer::LineDelimitedWriter;
                     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 

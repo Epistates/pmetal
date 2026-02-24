@@ -26,6 +26,7 @@
 //! )?;
 //! ```
 
+use mlx_rs::ops::{sign, stack_axis};
 use mlx_rs::Array;
 
 use crate::{sparsify_by_magnitude, MergeError, Result};
@@ -114,16 +115,24 @@ impl GpuMerger {
         }
     }
 
-    /// GPU path for TIES merge using fused kernels.
+    /// GPU path for TIES merge using batched MLX operations.
     ///
-    /// In a full implementation, this would:
-    /// 1. Stack tensors into a single buffer
-    /// 2. Create Metal buffers (zero-copy if possible)
-    /// 3. Run fused_ties_merge kernel
-    /// 4. Convert result back to MLX Array
+    /// All models are stacked into a single `[M, ...]` array so that MLX can
+    /// dispatch large batched GPU kernels rather than M separate small ones:
     ///
-    /// For now, uses optimized CPU path as Metal integration requires
-    /// additional infrastructure.
+    /// 1. `stack_axis(tensors, 0)` -> `[M, ...]`
+    /// 2. Broadcast-subtract base: `stacked - base` -> task vectors `[M, ...]`
+    /// 3. Batch sparsify each row (per-model density)
+    /// 4. Re-stack sparse vectors -> `[M, ...]`
+    /// 5. Sign consensus in a single vectorized pass:
+    ///    a. `sign(stacked_sparse)` -> `[M, ...]`
+    ///    b. Multiply by per-model weights broadcast-shaped `[M, 1, ...]`
+    ///    c. `sum_axis(0)` -> weighted sign vote `[...]`
+    ///    d. `sign(vote)` -> majority sign `[...]`
+    ///    e. Agreement: `sign(stacked_sparse) * maj_sign > 0` -> `[M, ...]` mask
+    ///    f. Weighted contributions: `stacked_sparse * weights * agreement`
+    ///    g. `sum_axis(0)` -> weighted sum of agreeing contributions `[...]`
+    /// 6. Scale by lambda and add to base.
     fn ties_merge_gpu(
         &self,
         tensors: &[Array],
@@ -132,9 +141,85 @@ impl GpuMerger {
         densities: &[f32],
         lambda: f32,
     ) -> Result<Array> {
-        // TODO: Implement full Metal kernel path
-        // For now, use optimized CPU path with batch sparsification
-        self.ties_merge_cpu_optimized(tensors, base, weights, densities, lambda)
+        let num_models = tensors.len();
+
+        // --- Step 1: Stack all fine-tuned tensors into a single [M, ...] array.
+        // This lets MLX schedule a single large GPU operation instead of M small ones.
+        let stacked = stack_axis(tensors, 0).map_err(MergeError::from)?;
+
+        // --- Step 2: Compute all task vectors at once via broadcast subtract.
+        // base has shape [...]; stacked has shape [M, ...].
+        // MLX broadcasts base against the leading model dimension automatically.
+        let task_vectors_stacked = stacked.subtract(base).map_err(MergeError::from)?;
+
+        // --- Step 3: Sparsify each task vector independently.
+        // Split the [M, ...] array into M slices of shape [1, ...], then reshape each
+        // to [...] to match the per-model API expected by sparsify_batch_by_magnitude.
+        let original_shape = base.shape().to_vec();
+        let task_vectors: Vec<Array> = task_vectors_stacked
+            .split(num_models as i32, Some(0))
+            .map_err(MergeError::from)?
+            .into_iter()
+            .map(|row| row.reshape(&original_shape).map_err(MergeError::from))
+            .collect::<Result<Vec<_>>>()?;
+
+        let sparse_vectors = crate::sparsify_batch_by_magnitude(&task_vectors, densities)?;
+
+        // --- Step 4: Re-stack sparse vectors into [M, ...] for vectorized sign consensus.
+        let stacked_sparse = stack_axis(&sparse_vectors, 0).map_err(MergeError::from)?;
+
+        // --- Step 5: Batched sign consensus using a single GPU reduction.
+        //
+        // Build a broadcastable [M, 1, 1, ..., 1] weights tensor so that a single
+        // element-wise multiply fans the per-model scalars across all parameter positions.
+        let tensor_ndim = base.ndim();
+        let mut weights_shape: Vec<i32> = Vec::with_capacity(1 + tensor_ndim);
+        weights_shape.push(num_models as i32);
+        weights_shape.extend(std::iter::repeat_n(1_i32, tensor_ndim));
+        let weights_bcast = Array::from_slice(weights, &[num_models as i32])
+            .reshape(&weights_shape)
+            .map_err(MergeError::from)?;
+
+        // 5a. Element-wise signs for every model and every parameter: [M, ...].
+        let signs = sign(&stacked_sparse).map_err(MergeError::from)?;
+
+        // 5b. Weighted sign vote collapsed over the model axis:
+        //     vote[i] = sum_m( weight_m * sign(sparse_m[i]) )  ->  shape [...]
+        let vote = signs
+            .multiply(&weights_bcast)
+            .map_err(MergeError::from)?
+            .sum_axis(0, None)
+            .map_err(MergeError::from)?;
+
+        // 5c. Majority sign at each parameter position (+1, -1, or 0 when tied).
+        let maj_sign = sign(&vote).map_err(MergeError::from)?;
+
+        // 5d. Agreement mask: 1.0 where sign(sparse_m[i]) == majority_sign[i], else 0.0.
+        // maj_sign has shape [...]; MLX broadcasts it against signs [M, ...] automatically.
+        let zero = Array::from_f32(0.0);
+        let agreement = signs
+            .multiply(&maj_sign)
+            .map_err(MergeError::from)?
+            .gt(&zero)
+            .map_err(MergeError::from)?
+            .as_type::<f32>()
+            .map_err(MergeError::from)?;
+
+        // 5e. Compute weighted, agreement-masked contributions and reduce over models.
+        // stacked_sparse * weights_bcast * agreement -> [M, ...] -> sum over axis 0 -> [...]
+        let weighted_sum = stacked_sparse
+            .multiply(&weights_bcast)
+            .map_err(MergeError::from)?
+            .multiply(&agreement)
+            .map_err(MergeError::from)?
+            .sum_axis(0, None)
+            .map_err(MergeError::from)?;
+
+        // --- Step 6: Scale by lambda and add to base.
+        let result = weighted_sum
+            .multiply(Array::from_f32(lambda))
+            .map_err(MergeError::from)?;
+        base.add(&result).map_err(MergeError::from)
     }
 
     /// Optimized CPU path using batch sparsification.

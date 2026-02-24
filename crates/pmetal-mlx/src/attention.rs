@@ -255,13 +255,23 @@ impl AttentionDispatcher {
 
     /// Dispatch attention computation to the selected backend.
     ///
-    /// This is a placeholder - actual implementation will call the appropriate
-    /// attention function based on the selected backend.
+    /// Selects the optimal attention implementation based on sequence characteristics
+    /// and hardware capabilities, then executes the computation.
+    ///
+    /// # Arguments
+    /// * `q` - Query tensor [batch, num_heads, seq_len, head_dim]
+    /// * `k` - Key tensor [batch, num_kv_heads, seq_len, head_dim]
+    /// * `v` - Value tensor [batch, num_kv_heads, seq_len, head_dim]
+    /// * `seq_info` - Sequence metadata for backend selection
+    /// * `config` - Attention configuration (scale, mask, GQA settings, etc.)
+    ///
+    /// # Returns
+    /// Tuple of (attention output [batch, num_heads, seq_len, head_dim], backend used)
     pub fn dispatch(
         &self,
-        _q: &mlx_rs::Array,
-        _k: &mlx_rs::Array,
-        _v: &mlx_rs::Array,
+        q: &mlx_rs::Array,
+        k: &mlx_rs::Array,
+        v: &mlx_rs::Array,
         seq_info: &SequenceInfo,
         config: &AttentionConfig,
     ) -> Result<(mlx_rs::Array, AttentionBackend)> {
@@ -277,11 +287,96 @@ impl AttentionDispatcher {
             );
         }
 
-        // TODO: Implement actual attention computation per backend
-        // For now, return a placeholder
-        Err(pmetal_core::PMetalError::NotImplemented(
-            "Attention dispatch pending full implementation".into(),
-        ))
+        let scale = config.scaling_factor();
+        let seq_len = seq_info.max_seqlen;
+
+        // Resolve the additive attention mask (0.0 for attend, -inf for mask).
+        // Both MlxFast and Standard paths share the same mask construction logic;
+        // the MlxFast path can also use the built-in causal string shortcut, but
+        // passing an explicit array works equally well and keeps the code uniform.
+        let mask: Option<mlx_rs::Array> = if config.is_causal {
+            Some(create_causal_mask_array(seq_len))
+        } else {
+            config
+                .sliding_window
+                .map(|window| create_sliding_window_mask(seq_len, window as i32))
+        };
+
+        // Helper: call mlx_rs fast SDPA with correct mask type conversion
+        let fast_sdpa =
+            |q: &mlx_rs::Array, k: &mlx_rs::Array, v: &mlx_rs::Array, scale: f32, mask: &Option<mlx_rs::Array>|
+             -> std::result::Result<mlx_rs::Array, pmetal_core::PMetalError> {
+                let result = if let Some(ref m) = mask {
+                    mlx_rs::fast::scaled_dot_product_attention(q, k, v, scale, m, Option::<&mlx_rs::Array>::None)
+                } else {
+                    mlx_rs::fast::scaled_dot_product_attention(
+                        q, k, v, scale,
+                        Option::<mlx_rs::fast::ScaledDotProductAttentionMask>::None,
+                        Option::<&mlx_rs::Array>::None,
+                    )
+                };
+                result.map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))
+            };
+
+        let output = match backend {
+            // MlxFast: delegate to mlx_rs::fast::scaled_dot_product_attention, which
+            // dispatches to an optimised Metal kernel for single-token generation and
+            // handles GQA/MQA natively without pre-expanding K/V heads.
+            AttentionBackend::MlxFast => fast_sdpa(q, k, v, scale, &mask)?,
+
+            // Standard: manual Q @ K^T * scale + mask -> softmax -> @ V.
+            // Caller is responsible for pre-expanding K/V heads for GQA/MQA before
+            // passing to dispatch; we simply compute the full attention here.
+            AttentionBackend::Standard => {
+                // scores = Q @ K^T  →  [batch, num_heads, seq_len_q, seq_len_k]
+                let k_t = k
+                    .transpose_axes(&[0, 1, 3, 2])
+                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+                let scores = q
+                    .matmul(&k_t)
+                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+
+                // Scale
+                let scale_arr = mlx_rs::Array::from_f32(scale);
+                let scores = scores
+                    .multiply(&scale_arr)
+                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+
+                // Apply additive mask (if any)
+                let scores = if let Some(ref m) = mask {
+                    scores
+                        .add(m)
+                        .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?
+                } else {
+                    scores
+                };
+
+                // Softmax over key dimension (axis = -1)
+                let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)
+                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?;
+
+                // output = weights @ V  →  [batch, num_heads, seq_len_q, head_dim]
+                weights
+                    .matmul(v)
+                    .map_err(|e| pmetal_core::PMetalError::Mlx(e.to_string()))?
+            }
+
+            // VarLen: packed sequence attention is handled at a higher level using
+            // cu_seqlens to demarcate per-sequence boundaries.  Within dispatch we
+            // fall back to MlxFast which still produces correct results; the caller
+            // should route packed batches through the dedicated VarLen path before
+            // reaching here when maximum efficiency is required.
+            AttentionBackend::VarLen => fast_sdpa(q, k, v, scale, &mask)?,
+
+            // MetalKernel: custom fused Metal kernels (e.g. softcap, sliding window)
+            // are invoked at the model level via crate::kernels::fused_sdpa.  For
+            // dispatch purposes we fall back to MlxFast which correctly handles the
+            // general case; model code that requires the fused kernel calls it
+            // directly rather than going through this dispatcher.
+            AttentionBackend::MetalKernel => fast_sdpa(q, k, v, scale, &mask)?,
+        };
+
+        Ok((output, backend))
     }
 }
 

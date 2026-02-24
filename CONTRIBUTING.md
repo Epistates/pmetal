@@ -69,7 +69,7 @@ Feature requests are welcome! Please:
 - Follow the [Rust API Guidelines](https://rust-lang.github.io/api-guidelines/)
 - Use `rustfmt` for formatting (default configuration)
 - Address all `clippy` warnings
-- Prefer explicit error handling over `.unwrap()` in library code
+- **No `unwrap()` or `expect()`:** The use of `.unwrap()` and `.expect()` is strictly forbidden in all library crates. Return `Result` and use `thiserror` for meaningful error propagation.
 - Use descriptive variable names
 
 ### Documentation
@@ -78,11 +78,18 @@ Feature requests are welcome! Please:
 - Include examples in doc comments where helpful
 - Update README.md for user-facing changes
 
-### Testing
+### Testing & Fuzzing
 
-- Add tests for new functionality
-- Maintain existing test coverage
+- Add unit and integration tests for all new functionality.
+- Maintain existing test coverage.
 - Use descriptive test names: `test_<function>_<scenario>_<expected>`
+- **Fuzzing:** PMetal enforces continuous fuzzing for data ingest points.
+  - To run fuzz tests locally, install the nightly toolchain and `cargo-fuzz`:
+    ```bash
+    cargo +nightly install cargo-fuzz
+    cargo +nightly fuzz run gguf_reader -- -max_total_time=60
+    ```
+  - Any panics discovered by the fuzzer must be resolved before a PR will be accepted.
 
 ### Metal Shaders
 

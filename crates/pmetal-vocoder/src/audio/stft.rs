@@ -142,15 +142,17 @@ pub fn stft(signal: &Array, config: &StftConfig) -> Result<Array> {
     }
 }
 
-/// Compute inverse STFT.
+/// Compute inverse STFT using overlap-add reconstruction.
 ///
 /// # Arguments
-/// * `stft_matrix` - STFT output [batch, n_fft/2+1, frames]
+/// * `stft_matrix` - STFT output [batch, n_fft/2+1, frames] or [n_fft/2+1, frames]
 /// * `config` - STFT configuration
 ///
 /// # Returns
-/// Reconstructed audio signal [batch, samples]
+/// Reconstructed audio signal [batch, samples] or [samples]
 pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
+    use mlx_rs::ops::indexing::IndexOp;
+
     let win_length = config.win_length.unwrap_or(config.n_fft);
 
     // Create Hann window
@@ -167,7 +169,7 @@ pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
         window
     };
 
-    // Handle batched input
+    // Handle batched input: normalize to [batch, n_fft/2+1, frames]
     let (stft_matrix, was_2d) = if stft_matrix.ndim() == 2 {
         (
             stft_matrix.reshape(&[1, stft_matrix.dim(0), stft_matrix.dim(1)])?,
@@ -179,23 +181,86 @@ pub fn istft(stft_matrix: &Array, config: &StftConfig) -> Result<Array> {
 
     let batch_size = stft_matrix.dim(0);
     let num_frames = stft_matrix.dim(2);
+    let n_fft = config.n_fft;
+    let hop_length = config.hop_length;
 
-    // Transpose to [batch, frames, freq]
-    let stft_matrix = stft_matrix.transpose_axes(&[0, 2, 1])?;
+    // Transpose to [batch, frames, freq] for irfft along last axis
+    let stft_transposed = stft_matrix.transpose_axes(&[0, 2, 1])?;
 
-    // Inverse FFT
-    let frames = mlx_rs::fft::irfft(&stft_matrix, Some(config.n_fft), -1)?;
+    // Inverse FFT: [batch, frames, n_fft]
+    let ifft_frames = mlx_rs::fft::irfft(&stft_transposed, Some(n_fft), -1)?;
 
-    // Apply synthesis window
-    let _frames = frames.multiply(&window)?;
+    // Apply synthesis window: [batch, frames, n_fft] * [n_fft]
+    let windowed_frames = ifft_frames.multiply(&window)?;
 
-    // Calculate output length
-    let output_length = config.n_fft + (num_frames - 1) * config.hop_length;
+    // Calculate full output length before optional center-trim
+    let output_length = n_fft + (num_frames - 1) * hop_length;
 
-    // Overlap-add - note: full implementation would require scatter_add
-    // For now, return zeros as placeholder
-    // TODO: Implement proper overlap-add with scatter or loop-based approach
-    let output = mlx_rs::ops::zeros::<f32>(&[batch_size, output_length])?;
+    // Precompute window norm denominator for each output position using the same
+    // pad-and-sum strategy applied to the squared window.
+    //
+    // window_sq shape: [n_fft]
+    let window_sq = window.multiply(&window)?;
+
+    // Overlap-add via pad-and-sum:
+    //
+    // For each frame index i (0..num_frames):
+    //   - Extract windowed frame: [batch, n_fft]
+    //   - Pad it to [batch, output_length] with `i * hop_length` zeros before
+    //     and `output_length - i * hop_length - n_fft` zeros after (along axis 1)
+    //   - Accumulate into a running sum
+    //
+    // Simultaneously build the normalization denominator using the same offsets
+    // applied to window_sq (shape [n_fft] -> padded [output_length]).
+
+    let mut output_sum = mlx_rs::ops::zeros::<f32>(&[batch_size, output_length])?;
+    let mut norm_sum = mlx_rs::ops::zeros::<f32>(&[output_length])?;
+
+    for i in 0..num_frames {
+        let offset = i * hop_length;
+        let pad_before = offset;
+        let pad_after = output_length - offset - n_fft;
+
+        // Extract frame i for all batches: [batch, n_fft]
+        let frame = windowed_frames.index((.., i, ..));
+
+        // Pad frame along axis 1 (the sample axis): [batch, output_length]
+        let padded_frame = mlx_rs::ops::pad(
+            &frame,
+            &[(0i32, 0i32), (pad_before, pad_after)],
+            None,
+            None,
+        )?;
+
+        output_sum = output_sum.add(&padded_frame)?;
+
+        // Pad window_sq (1-D) along axis 0: [output_length]
+        let padded_wsq = mlx_rs::ops::pad(
+            &window_sq,
+            &[(pad_before, pad_after)],
+            None,
+            None,
+        )?;
+        norm_sum = norm_sum.add(&padded_wsq)?;
+    }
+
+    // Normalize: divide by window norm, guarding against near-zero denominators.
+    // A threshold of 1e-8 avoids NaN in silence or edge regions.
+    let eps = Array::from_f32(1e-8_f32);
+    let norm_safe = mlx_rs::ops::maximum(&norm_sum, &eps)?;
+    // Broadcast norm_safe [output_length] across batch dimension for division.
+    let norm_broadcast = mlx_rs::ops::broadcast_to(&norm_safe, &[batch_size, output_length])?;
+    let output = output_sum.divide(&norm_broadcast)?;
+
+    // If center=true was used during forward STFT, trim the n_fft/2 padding on each side.
+    let output = if config.center {
+        let trim = n_fft / 2;
+        let trimmed_length = output_length - 2 * trim;
+        // Slice along axis 1: output[:, trim : trim + trimmed_length]
+        output.index((.., trim..trim + trimmed_length))
+    } else {
+        output
+    };
 
     if was_2d {
         Ok(output.squeeze()?)
@@ -287,5 +352,85 @@ mod tests {
         let config = StftConfig::default();
         assert_eq!(config.n_fft, 1024);
         assert_eq!(config.hop_length, 256);
+    }
+
+    /// Verify that istft(stft(x)) ≈ x for a simple sine wave.
+    ///
+    /// The Hann window satisfies the COLA (Constant Overlap-Add) condition for
+    /// hop_length = n_fft / 4, so perfect reconstruction is expected up to
+    /// floating-point tolerance.
+    #[test]
+    fn test_stft_istft_roundtrip() {
+        // Use small n_fft to keep the test fast; hop = n_fft/4 satisfies COLA.
+        let n_fft = 64;
+        let hop_length = n_fft / 4;
+        let num_samples = 512;
+
+        let config = StftConfig {
+            n_fft,
+            hop_length,
+            win_length: None,
+            center: true,
+            pad_mode: PadMode::Reflect,
+        };
+
+        // Build a 440 Hz sine wave at 16 kHz sample rate (unit amplitude).
+        let pi = std::f32::consts::PI;
+        let samples: Vec<f32> = (0..num_samples)
+            .map(|n| (2.0 * pi * 440.0 * n as f32 / 16000.0).sin())
+            .collect();
+        let signal = Array::from_slice(&samples, &[num_samples]);
+
+        // Forward STFT.
+        let spectrum = stft(&signal, &config).unwrap();
+
+        // Inverse STFT (overlap-add reconstruction).
+        let reconstructed = istft(&spectrum, &config).unwrap();
+        reconstructed.eval().unwrap();
+
+        // The reconstructed signal should have the same length as the original.
+        assert_eq!(reconstructed.shape(), &[num_samples]);
+
+        // Verify reconstruction quality: max absolute error should be < 1e-3.
+        let diff = reconstructed.subtract(&signal).unwrap();
+        let abs_diff = diff.abs().unwrap();
+        // Reduce to scalar maximum.
+        let max_err_arr = abs_diff.max(None).unwrap();
+        max_err_arr.eval().unwrap();
+        let max_err: f32 = max_err_arr.item();
+        assert!(
+            max_err < 1e-3,
+            "STFT round-trip error too large: max |error| = {max_err}"
+        );
+    }
+
+    /// Verify istft produces correct output shape for batched input.
+    #[test]
+    fn test_istft_batched_shape() {
+        let n_fft = 32;
+        let hop_length = 8;
+        let num_samples = 128;
+        let batch_size = 3;
+
+        let config = StftConfig {
+            n_fft,
+            hop_length,
+            win_length: None,
+            center: false,
+            pad_mode: PadMode::Zeros,
+        };
+
+        // Batch of signals: [batch, samples]
+        let samples: Vec<f32> = (0..(batch_size * num_samples))
+            .map(|i| (i as f32 / num_samples as f32).sin())
+            .collect();
+        let signal = Array::from_slice(&samples, &[batch_size, num_samples]);
+
+        let spectrum = stft(&signal, &config).unwrap();
+        let reconstructed = istft(&spectrum, &config).unwrap();
+        reconstructed.eval().unwrap();
+
+        // Output batch dimension must be preserved.
+        assert_eq!(reconstructed.dim(0), batch_size);
     }
 }

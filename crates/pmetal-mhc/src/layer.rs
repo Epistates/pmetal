@@ -3,7 +3,7 @@
 //! This module provides the main `MhcLayer` struct that wraps the mHC
 //! computation for use in transformer architectures.
 
-use crate::config::MhcConfig;
+use crate::config::{MhcConfig, MhcConfigError};
 use crate::mappings::{
     apply_post_res_mapping, apply_pre_mapping, compute_mappings, compute_mappings_backward,
 };
@@ -422,6 +422,29 @@ pub fn expand_to_streams(x: &Array2<f32>, n: usize) -> Array3<f32> {
     expanded
 }
 
+/// Collapse mode for multi-stream to single-stream reduction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CollapseMode {
+    /// Use only the first stream.
+    First,
+    /// Average across all streams.
+    Average,
+    /// Sum across all streams.
+    Sum,
+}
+
+impl CollapseMode {
+    /// Parse a collapse mode from a string.
+    pub fn from_str_name(s: &str) -> Result<Self, MhcConfigError> {
+        match s {
+            "first" => Ok(Self::First),
+            "average" => Ok(Self::Average),
+            "sum" => Ok(Self::Sum),
+            _ => Err(MhcConfigError::InvalidCollapseMode(s.to_string())),
+        }
+    }
+}
+
 /// Collapse n streams back to single stream.
 ///
 /// Takes the first stream (or averages, depending on mode).
@@ -429,12 +452,12 @@ pub fn expand_to_streams(x: &Array2<f32>, n: usize) -> Array3<f32> {
 /// # Arguments
 ///
 /// * `x` - Multi-stream tensor. Shape: [batch, n, C]
-/// * `mode` - Collapse mode: "first", "average", or "sum"
+/// * `mode` - Collapse mode
 ///
 /// # Returns
 ///
 /// Single-stream output. Shape: [batch, C]
-pub fn collapse_streams(x: &Array3<f32>, mode: &str) -> Array2<f32> {
+pub fn collapse_streams(x: &Array3<f32>, mode: CollapseMode) -> Array2<f32> {
     let batch_size = x.shape()[0];
     let n = x.shape()[1];
     let c = x.shape()[2];
@@ -442,14 +465,14 @@ pub fn collapse_streams(x: &Array3<f32>, mode: &str) -> Array2<f32> {
     let mut collapsed = Array2::zeros((batch_size, c));
 
     match mode {
-        "first" => {
+        CollapseMode::First => {
             for b in 0..batch_size {
                 for j in 0..c {
                     collapsed[[b, j]] = x[[b, 0, j]];
                 }
             }
         }
-        "average" => {
+        CollapseMode::Average => {
             let scale = 1.0 / n as f32;
             for b in 0..batch_size {
                 for j in 0..c {
@@ -458,7 +481,7 @@ pub fn collapse_streams(x: &Array3<f32>, mode: &str) -> Array2<f32> {
                 }
             }
         }
-        "sum" => {
+        CollapseMode::Sum => {
             for b in 0..batch_size {
                 for j in 0..c {
                     let sum: f32 = (0..n).map(|i| x[[b, i, j]]).sum();
@@ -466,7 +489,6 @@ pub fn collapse_streams(x: &Array3<f32>, mode: &str) -> Array2<f32> {
                 }
             }
         }
-        _ => panic!("Unknown collapse mode: {}", mode),
     }
 
     collapsed
@@ -553,7 +575,7 @@ mod tests {
             }
         }
 
-        let collapsed = collapse_streams(&expanded, "first");
+        let collapsed = collapse_streams(&expanded, CollapseMode::First);
         assert_eq!(collapsed.shape(), &[4, 8]);
 
         // Should match original
@@ -575,7 +597,7 @@ mod tests {
             }
         }
 
-        let collapsed = collapse_streams(&expanded, "average");
+        let collapsed = collapse_streams(&expanded, CollapseMode::Average);
 
         // Average of 1, 2, 3, 4 = 2.5
         for b in 0..2 {

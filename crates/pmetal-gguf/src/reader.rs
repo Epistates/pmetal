@@ -88,6 +88,9 @@ pub enum GgufReadError {
     /// Invalid tensor dtype.
     #[error("Invalid tensor dtype: {0}")]
     InvalidDtype(u32),
+    /// Invalid alignment value.
+    #[error("Invalid alignment: {0} (must be 1..=1048576)")]
+    InvalidAlignment(u64),
     /// Tensor not found.
     #[error("Tensor not found: {0}")]
     TensorNotFound(String),
@@ -272,6 +275,11 @@ impl GgufContent {
             })
             .unwrap_or(GGUF_DEFAULT_ALIGNMENT as u64);
 
+        // Validate alignment to prevent division-by-zero and unreasonable values
+        if alignment == 0 || alignment > 1_048_576 {
+            return Err(GgufReadError::InvalidAlignment(alignment));
+        }
+
         let tensor_data_offset = position.div_ceil(alignment) * alignment;
 
         Ok(Self {
@@ -342,7 +350,11 @@ impl GgufContent {
 
         let mut data = vec![0u8; byte_size];
 
-        reader.seek(SeekFrom::Start(self.tensor_data_offset + info.offset))?;
+        let seek_pos = self
+            .tensor_data_offset
+            .checked_add(info.offset)
+            .ok_or(GgufReadError::IntegerOverflow)?;
+        reader.seek(SeekFrom::Start(seek_pos))?;
         reader.read_exact(&mut data)?;
 
         Ok(data)

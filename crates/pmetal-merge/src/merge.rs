@@ -6,13 +6,13 @@
 use std::collections::HashMap;
 
 use mlx_rs::Array;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::{
     batched::{BatchConfig, BatchedMerger, MergeStats, StreamingBatchedMerger},
-    DareMerge, LinearMerge, MergeConfig, MergeError, MergeMethod, MergeMethodConfig,
-    MergeParameters, ModelStockMerge, PassthroughMerge, Result, SafetensorsLoader, SlerpMerge,
-    TaskArithmeticMerge, TensorLoader, TensorWriter, TiesMerge,
+    BreadcrumbsMerge, DareMerge, DellaMerge, LinearMerge, MergeConfig, MergeError, MergeMethod,
+    MergeMethodConfig, MergeParameters, ModelStockMerge, NearswapMerge, PassthroughMerge, Result,
+    SafetensorsLoader, SlerpMerge, TaskArithmeticMerge, TensorLoader, TensorWriter, TiesMerge,
 };
 
 /// Main entry point for running a model merge.
@@ -155,24 +155,11 @@ fn create_merge_method(method: &MergeMethodConfig) -> Box<dyn MergeMethod> {
         MergeMethodConfig::Ties => Box::new(TiesMerge::new()),
         MergeMethodConfig::DareTies => Box::new(DareMerge::with_ties()),
         MergeMethodConfig::DareLinear => Box::new(DareMerge::linear()),
-        // TODO: Implement remaining methods
-        MergeMethodConfig::Della => {
-            warn!("DELLA not yet implemented, falling back to TIES");
-            Box::new(TiesMerge::new())
-        }
-        MergeMethodConfig::DellaLinear => {
-            warn!("DELLA-Linear not yet implemented, falling back to linear");
-            Box::new(LinearMerge::new())
-        }
-        MergeMethodConfig::Breadcrumbs => {
-            warn!("Breadcrumbs not yet implemented, falling back to TIES");
-            Box::new(TiesMerge::new())
-        }
+        MergeMethodConfig::Della => Box::new(DellaMerge::new()),
+        MergeMethodConfig::DellaLinear => Box::new(DellaMerge::linear()),
+        MergeMethodConfig::Breadcrumbs => Box::new(BreadcrumbsMerge::new()),
         MergeMethodConfig::ModelStock => Box::new(ModelStockMerge::new()),
-        MergeMethodConfig::Nearswap => {
-            warn!("Nearswap not yet implemented, falling back to SLERP");
-            Box::new(SlerpMerge::new())
-        }
+        MergeMethodConfig::Nearswap => Box::new(NearswapMerge::new()),
         MergeMethodConfig::Passthrough => Box::new(PassthroughMerge::new()),
     }
 }

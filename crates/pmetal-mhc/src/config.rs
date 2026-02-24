@@ -179,6 +179,14 @@ pub enum MhcConfigError {
     /// Epsilon must be greater than 0.
     #[error("Invalid epsilon: {0} (must be > 0)")]
     InvalidEpsilon(f32),
+
+    /// Unknown collapse mode string.
+    #[error("Invalid collapse mode: '{0}' (expected 'first', 'average', or 'sum')")]
+    InvalidCollapseMode(String),
+
+    /// Empty matrix list for composite mapping.
+    #[error("Cannot compute composite of empty matrix list")]
+    EmptyComposite,
 }
 
 /// Presets for different model scales.

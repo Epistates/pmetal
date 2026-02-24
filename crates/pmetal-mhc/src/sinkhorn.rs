@@ -242,9 +242,9 @@ pub fn amax_gain_backward(m: &Array2<f32>) -> f32 {
 /// # Returns
 ///
 /// The product ∏ H^res, which should remain doubly stochastic.
-pub fn composite_mapping(matrices: &[Array2<f32>]) -> Array2<f32> {
+pub fn composite_mapping(matrices: &[Array2<f32>]) -> Result<Array2<f32>, crate::MhcConfigError> {
     if matrices.is_empty() {
-        panic!("Cannot compute composite of empty list");
+        return Err(crate::MhcConfigError::EmptyComposite);
     }
 
     let n = matrices[0].nrows();
@@ -254,7 +254,7 @@ pub fn composite_mapping(matrices: &[Array2<f32>]) -> Array2<f32> {
         result = result.dot(m);
     }
 
-    result
+    Ok(result)
 }
 
 /// Backward pass through Sinkhorn-Knopp.
@@ -463,7 +463,7 @@ mod tests {
             })
             .collect();
 
-        let composite = composite_mapping(&matrices);
+        let composite = composite_mapping(&matrices).unwrap();
 
         // Composite should still be doubly stochastic
         assert!(
@@ -563,7 +563,7 @@ mod tests {
             })
             .collect();
 
-        let composite = composite_mapping(&matrices);
+        let composite = composite_mapping(&matrices).unwrap();
 
         let forward_gain = amax_gain_forward(&composite);
         let backward_gain = amax_gain_backward(&composite);

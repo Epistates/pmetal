@@ -40,6 +40,7 @@ arrow-array = "55"
 arrow-json = "55"
 rand = "0.8"
 regex = "1"
+tempfile = { workspace = true }
 tokenizers = { workspace = true }
 
 [lints]

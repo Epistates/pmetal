@@ -305,10 +305,11 @@ impl TensorInfo {
     /// Get the number of elements in the tensor.
     ///
     /// # Panics
-    /// Panics if the calculation would overflow. Use [`n_elements_checked`] for fallible version.
+    /// Panics if the calculation would overflow. Prefer [`n_elements_checked`]
+    /// when processing untrusted input (e.g., GGUF files from external sources).
     pub fn n_elements(&self) -> usize {
         self.n_elements_checked()
-            .expect("tensor element count overflow")
+            .expect("tensor element count overflow — use n_elements_checked() for untrusted input")
     }
 
     /// Get the byte size of the tensor data with checked arithmetic.
@@ -324,9 +325,11 @@ impl TensorInfo {
     /// Get the byte size of the tensor data.
     ///
     /// # Panics
-    /// Panics if the calculation would overflow. Use [`byte_size_checked`] for fallible version.
+    /// Panics if the calculation would overflow. Prefer [`byte_size_checked`]
+    /// when processing untrusted input (e.g., GGUF files from external sources).
     pub fn byte_size(&self) -> usize {
-        self.byte_size_checked().expect("tensor byte size overflow")
+        self.byte_size_checked()
+            .expect("tensor byte size overflow — use byte_size_checked() for untrusted input")
     }
 }
 
