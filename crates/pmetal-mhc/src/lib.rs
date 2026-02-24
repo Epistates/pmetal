@@ -63,7 +63,7 @@ pub mod sinkhorn;
 
 // Re-exports for convenience
 pub use config::{MhcConfig, MhcConfigError, MhcPreset};
-pub use layer::{MhcCache, MhcLayer, MhcTransformerBlock};
+pub use layer::{CollapseMode, MhcCache, MhcLayer, MhcTransformerBlock};
 pub use mappings::{apply_post_res_mapping, apply_pre_mapping, compute_mappings};
 pub use params::{MhcGradients, MhcMappings, MhcParams};
 pub use sinkhorn::{
@@ -119,7 +119,7 @@ mod tests {
         let a = sinkhorn_knopp(&a_input, &config).matrix;
         let b = sinkhorn_knopp(&b_input, &config).matrix;
 
-        let c = composite_mapping(&[a, b]);
+        let c = composite_mapping(&[a, b]).unwrap();
 
         assert!(is_doubly_stochastic(&c, 1e-4));
     }
@@ -173,7 +173,7 @@ mod tests {
 
         // Compute composite for layer l
         let h_post_t = h_post.t().to_owned();
-        let composite = composite_mapping(&[h_res, h_post_t, h_pre]);
+        let composite = composite_mapping(&[h_res, h_post_t, h_pre]).unwrap();
 
         // Amax gain should be close to 1 for doubly stochastic composite
         let amax = amax_gain_forward(&composite);

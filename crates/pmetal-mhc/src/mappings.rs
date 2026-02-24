@@ -42,7 +42,10 @@ pub fn compute_mappings(x: &Array3<f32>, params: &MhcParams, config: &MhcConfig)
     let nc = n * c;
 
     // Step 1: Flatten input to [batch, nC]
-    let x_flat = x.to_shape((batch_size, nc)).unwrap().to_owned();
+    let x_flat = x
+        .to_shape((batch_size, nc))
+        .expect("Input shape [batch, n, C] inherently matches [batch, nC] when reshaping")
+        .to_owned();
 
     // Step 2: Apply RMSNorm
     let x_norm = rmsnorm(&x_flat, &params.rmsnorm_weight, config.epsilon);
@@ -272,7 +275,10 @@ pub fn compute_mappings_backward(
     let mut gradients = MhcGradients::zeros(config);
 
     // Flatten input
-    let x_flat = x.to_shape((batch_size, nc)).unwrap().to_owned();
+    let x_flat = x
+        .to_shape((batch_size, nc))
+        .expect("Input shape [batch, n, C] inherently matches [batch, nC]")
+        .to_owned();
 
     // Forward pass to get intermediates
     let x_norm = rmsnorm(&x_flat, &params.rmsnorm_weight, config.epsilon);
@@ -329,7 +335,7 @@ pub fn compute_mappings_backward(
         // Gradient for phi_res (reshape grad_h_tilde_res to [batch, n²])
         let grad_h_tilde_res_flat = grad_h_tilde_res
             .to_shape((batch_size, n * n))
-            .unwrap()
+            .expect("grad_h_tilde_res shape should exactly match [batch, n*n]")
             .to_owned();
         let grad_proj_res = &grad_h_tilde_res_flat * params.alpha_res;
         gradients.d_phi_res = x_norm.t().dot(&grad_proj_res);
@@ -355,7 +361,7 @@ pub fn compute_mappings_backward(
         // grad_x_norm from res
         let grad_h_tilde_res_flat = grad_h_tilde_res
             .to_shape((batch_size, n * n))
-            .unwrap()
+            .expect("grad_h_tilde_res shape should exactly match [batch, n*n]")
             .to_owned();
         let grad_from_res = grad_h_tilde_res_flat.dot(&params.phi_res.t()) * params.alpha_res;
 
@@ -377,7 +383,10 @@ pub fn compute_mappings_backward(
     gradients.d_rmsnorm_weight = (&grad_x_norm * &x_normalized).sum_axis(Axis(0));
 
     // Reshape gradient back to [batch, n, C]
-    let grad_x = grad_x_flat.to_shape((batch_size, n, c)).unwrap().to_owned();
+    let grad_x = grad_x_flat
+        .to_shape((batch_size, n, c))
+        .expect("grad_x_flat must be able to shape back to [batch, n, c]")
+        .to_owned();
 
     (grad_x, gradients)
 }

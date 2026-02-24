@@ -1,15 +1,18 @@
 //! Secure handling of sensitive data like API tokens and credentials.
 //!
-//! This module provides types that help prevent accidental exposure of secrets
-//! in logs, error messages, and debug output.
+//! This module wraps the [`secrecy`] crate to provide types that prevent
+//! accidental exposure of secrets in logs, error messages, and debug output.
+//! Secrets are zeroized on drop via the `zeroize` crate (transitive dep).
 
 use std::fmt;
 
+use secrecy::ExposeSecret;
+
 /// A string type that redacts its content in Debug and Display implementations.
 ///
-/// Use `SecretString` for handling sensitive data like API tokens, passwords,
-/// or other credentials. The underlying value can only be accessed explicitly
-/// via [`expose_secret`][SecretString::expose_secret].
+/// Backed by [`secrecy::SecretBox<str>`], which zeroizes the inner string on drop.
+/// The underlying value can only be accessed explicitly via
+/// [`expose_secret`][SecretString::expose_secret].
 ///
 /// # Example
 ///
@@ -27,16 +30,28 @@ use std::fmt;
 /// // Access the secret explicitly when needed
 /// assert_eq!(token.expose_secret(), "sk-secret-key-12345");
 /// ```
-#[derive(Clone, Default)]
 pub struct SecretString {
-    inner: String,
+    inner: secrecy::SecretString,
+}
+
+impl Clone for SecretString {
+    fn clone(&self) -> Self {
+        Self::new(self.expose_secret())
+    }
+}
+
+impl Default for SecretString {
+    fn default() -> Self {
+        Self::new("")
+    }
 }
 
 impl SecretString {
     /// Create a new `SecretString` from a string value.
     pub fn new(secret: impl Into<String>) -> Self {
+        let s: String = secret.into();
         Self {
-            inner: secret.into(),
+            inner: secrecy::SecretBox::new(s.into_boxed_str()),
         }
     }
 
@@ -53,17 +68,17 @@ impl SecretString {
     /// Use sparingly and ensure the exposed value is not logged or displayed.
     #[inline]
     pub fn expose_secret(&self) -> &str {
-        &self.inner
+        self.inner.expose_secret()
     }
 
     /// Check if the secret is empty.
     pub fn is_empty(&self) -> bool {
-        self.inner.is_empty()
+        self.inner.expose_secret().is_empty()
     }
 
     /// Get the length of the secret.
     pub fn len(&self) -> usize {
-        self.inner.len()
+        self.inner.expose_secret().len()
     }
 }
 
@@ -88,37 +103,6 @@ impl From<String> for SecretString {
 impl From<&str> for SecretString {
     fn from(s: &str) -> Self {
         Self::new(s)
-    }
-}
-
-/// Zeroize the secret on drop to reduce the window of exposure.
-#[allow(unsafe_code)]
-impl Drop for SecretString {
-    fn drop(&mut self) {
-        // Overwrite the string contents with zeros before deallocating.
-        // Note: This is a best-effort approach; the Rust optimizer or memory
-        // allocator may not guarantee complete erasure. For high-security
-        // applications, consider using the `secrecy` or `zeroize` crate.
-        //
-        // Safety: We're modifying our own string's bytes before it's deallocated.
-        // We use write_volatile to prevent the compiler from optimizing this away.
-        if !self.inner.is_empty() {
-            // SAFETY:
-            // 1. We own the String exclusively (Drop takes &mut self)
-            // 2. The pointer from as_mut_ptr() is valid for self.inner.len() bytes
-            // 3. We use write_volatile to prevent compiler optimization from eliding
-            //    the zeroing operation
-            // 4. The memory is properly aligned for u8 (1-byte alignment)
-            // 5. After this, the String contains only zeros but maintains valid UTF-8
-            //    (zeros are valid UTF-8 NUL characters)
-            unsafe {
-                let ptr = self.inner.as_mut_ptr();
-                let len = self.inner.len();
-                for i in 0..len {
-                    std::ptr::write_volatile(ptr.add(i), 0);
-                }
-            }
-        }
     }
 }
 

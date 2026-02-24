@@ -43,6 +43,7 @@ use mlx_rs::{
     ops,
     ops::concatenate_axis,
     ops::indexing::{IndexOp, TryIndexMutOp},
+    ops::{dequantize, quantize},
     Array, Dtype,
 };
 
@@ -1155,29 +1156,70 @@ impl QuantizedKVCache {
         self.offset = 0;
     }
 
-    /// Quantize a tensor.
+    /// Pack a 4-D float tensor `[B, H, S, D]` into a [`QuantizedTensor`].
+    ///
+    /// MLX's `quantize` operates on 2-D matrices where groups are formed along
+    /// the last dimension.  The strategy is:
+    ///
+    /// 1. Cast to float32 (quantize requires a floating-point input).
+    /// 2. Reshape `[B, H, S, D]` → `[B*H*S, D]` so the last axis is the head
+    ///    dimension, which is where the group structure lives.
+    /// 3. Invoke `mlx_rs::ops::quantize`, which returns
+    ///    `(w_q [rows, D/el_per_int], scales [rows, D/group_size], biases [rows, D/group_size])`.
+    /// 4. Reshape each of those 2-D results back to 4-D so they can be
+    ///    concatenated across the sequence dimension later.
+    ///
+    /// # Panics / Errors
+    ///
+    /// Returns an `Exception` if MLX rejects the shapes (e.g., `D` not
+    /// divisible by `group_size`).  The caller is responsible for ensuring the
+    /// head dimension satisfies this constraint or for padding prior to calling.
     fn quantize_tensor(&self, tensor: &Array) -> Result<QuantizedTensor, Exception> {
-        // Use MLX's built-in quantization if available
-        // For now, implement simple min-max quantization
         let shape = tensor.shape();
         let batch = shape[0] as usize;
         let heads = shape[1] as usize;
         let seq = shape[2] as usize;
         let dim = shape[3] as usize;
 
-        // Number of groups
-        let num_groups = (dim + self.group_size - 1) / self.group_size;
+        // MLX quantize requires a float32 input.
+        let float_tensor = tensor.as_type::<f32>()?;
 
-        // Compute min/max per group (simplified - in practice use MLX ops)
-        let scales_shape = [batch as i32, heads as i32, seq as i32, num_groups as i32];
-        let scales = Array::ones::<f32>(&scales_shape)?;
-        let biases = Array::zeros::<f32>(&scales_shape)?;
+        // Collapse the three leading dimensions into one so the last axis is
+        // the head dimension that we want to quantize over.
+        let rows = (batch * heads * seq) as i32;
+        let flat = float_tensor.reshape(&[rows, dim as i32])?;
 
-        // Pack data (simplified placeholder - actual quantization needs MLX ops)
-        let el_per_int = 32 / self.bits as usize;
-        let packed_dim = (dim + el_per_int - 1) / el_per_int;
-        let data_shape = [batch as i32, heads as i32, seq as i32, packed_dim as i32];
-        let data = Array::zeros::<u32>(&data_shape)?;
+        // mlx_rs::ops::quantize returns (w_q, scales, biases).
+        //   w_q    : [rows, dim * bits / 32]   (packed u32)
+        //   scales : [rows, dim / group_size]
+        //   biases : [rows, dim / group_size]
+        let group_size_i32 = self.group_size as i32;
+        let bits_i32 = self.bits as i32;
+        let (w_q, scales_2d, biases_2d) = quantize(&flat, group_size_i32, bits_i32)?;
+
+        // Reshape packed data back to [B, H, S, packed_dim].
+        let packed_dim = w_q.dim(1);
+        let data = w_q.reshape(&[
+            batch as i32,
+            heads as i32,
+            seq as i32,
+            packed_dim,
+        ])?;
+
+        // Reshape scales/biases back to [B, H, S, num_groups].
+        let num_groups = scales_2d.dim(1);
+        let scales = scales_2d.reshape(&[
+            batch as i32,
+            heads as i32,
+            seq as i32,
+            num_groups,
+        ])?;
+        let biases = biases_2d.reshape(&[
+            batch as i32,
+            heads as i32,
+            seq as i32,
+            num_groups,
+        ])?;
 
         Ok(QuantizedTensor {
             data,
@@ -1186,23 +1228,53 @@ impl QuantizedKVCache {
         })
     }
 
-    /// Dequantize a tensor.
+    /// Unpack a [`QuantizedTensor`] back into a float tensor `[B, H, S, D]`.
+    ///
+    /// This is the exact inverse of [`Self::quantize_tensor`]:
+    ///
+    /// 1. Flatten the 4-D packed data and metadata to 2-D.
+    /// 2. Invoke `mlx_rs::ops::dequantize`, which reconstructs a float32
+    ///    matrix `[rows, D]`.
+    /// 3. Reshape back to `[B, H, S, D]` and cast to the original dtype that
+    ///    was fed in (stored in `self.dtype`).
     fn dequantize_tensor(&self, qtensor: &QuantizedTensor) -> Result<Array, Exception> {
-        // Simplified placeholder - actual dequantization needs MLX ops
-        // Return the scales as a proxy for now (shape [B, H, S, groups])
-        // In real implementation, unpack data and apply scales/biases
-        let scales_shape = qtensor.scales.shape();
-        let batch = scales_shape[0];
-        let heads = scales_shape[1];
-        let seq = scales_shape[2];
-        let num_groups = scales_shape[3] as usize;
+        let shape = qtensor.data.shape();
+        let batch = shape[0] as usize;
+        let heads = shape[1] as usize;
+        let seq = shape[2] as usize;
+        // packed_dim = D * bits / 32 => D = packed_dim * 32 / bits
+        let packed_dim = shape[3] as usize;
+        let el_per_int = 32usize / self.bits as usize;
+        let dim = packed_dim * el_per_int;
 
-        // Reconstruct original dimension
-        let dim = num_groups * self.group_size;
-        let shape = [batch, heads, seq, dim as i32];
+        let rows = (batch * heads * seq) as i32;
 
-        // Return zeros for now - real implementation would dequantize
-        Array::zeros::<f32>(&shape)
+        // Flatten to 2D for the MLX op.
+        let flat_data = qtensor.data.reshape(&[rows, packed_dim as i32])?;
+        let flat_scales = qtensor.scales.reshape(&[rows, qtensor.scales.dim(3)])?;
+        let flat_biases = qtensor.biases.reshape(&[rows, qtensor.biases.dim(3)])?;
+
+        // dequantize returns a float32 array [rows, dim].
+        let group_size_i32 = self.group_size as i32;
+        let bits_i32 = self.bits as i32;
+        let flat_float = dequantize(
+            &flat_data,
+            &flat_scales,
+            &flat_biases,
+            group_size_i32,
+            bits_i32,
+        )?;
+
+        // Restore 4-D layout [B, H, S, D] and cast to the original dtype.
+        let out_4d = flat_float.reshape(&[
+            batch as i32,
+            heads as i32,
+            seq as i32,
+            dim as i32,
+        ])?;
+
+        // Cast back to the dtype we received (typically f16 / bf16).
+        out_4d.as_dtype(self.dtype)
     }
 
     /// Update cache with new keys and values.

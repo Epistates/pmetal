@@ -468,13 +468,15 @@ impl DeepSeekAttention {
         })
     }
 
-    /// Forward pass with Multi-Latent Attention.
-    pub fn forward(
+    /// Project input to Q, K, V tensors and apply RoPE.
+    ///
+    /// Returns `(queries, keys, values)` all in `[B, heads, seq, dim]` layout,
+    /// optionally updated via the KV cache.
+    pub fn project_qkv(
         &mut self,
         x: &Array,
-        mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
-    ) -> Result<Array, Exception> {
+    ) -> Result<(Array, Array, Array), Exception> {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
@@ -490,21 +492,18 @@ impl DeepSeekAttention {
 
         let q_head_dim = self.config.q_head_dim();
         let q = q.reshape(&[batch, seq_len, self.n_heads, q_head_dim])?;
-        let q = q.transpose_axes(&[0, 2, 1, 3])?; // [B, heads, seq, head_dim]
+        let q = q.transpose_axes(&[0, 2, 1, 3])?;
 
-        // Split Q into nope (no positional encoding) and pe (RoPE) parts
-        // mx.split(q, [qk_nope_head_dim], axis=-1) -> split_axis(&[idx], Some(-1))
         let q_parts = q.split_axis(&[self.config.qk_nope_head_dim as i32], Some(-1))?;
-        let q_nope = &q_parts[0]; // [B, heads, seq, qk_nope_head_dim]
-        let q_pe = &q_parts[1]; // [B, heads, seq, qk_rope_head_dim]
+        let q_nope = &q_parts[0];
+        let q_pe = &q_parts[1];
 
-        // Compute compressed KV: outputs [latent, k_pe]
+        // Compute compressed KV
         let compressed_kv = self.kv_a_proj_with_mqa.forward(x)?;
         let kv_parts = compressed_kv.split_axis(&[self.config.kv_lora_rank as i32], Some(-1))?;
-        let compressed_latent = &kv_parts[0]; // [B, seq, kv_lora_rank]
-        let k_pe = &kv_parts[1]; // [B, seq, qk_rope_head_dim]
+        let compressed_latent = &kv_parts[0];
+        let k_pe = &kv_parts[1];
 
-        // Reshape k_pe: [B, seq, rope_dim] -> [B, 1, seq, rope_dim]
         let k_pe = k_pe.reshape(&[batch, seq_len, 1, self.config.qk_rope_head_dim])?;
         let k_pe = k_pe.transpose_axes(&[0, 2, 1, 3])?;
 
@@ -513,21 +512,20 @@ impl DeepSeekAttention {
         let kv = self.kv_b_proj.forward(&kv_normalized)?;
         let kv_dim = self.config.qk_nope_head_dim + self.config.v_head_dim;
         let kv = kv.reshape(&[batch, seq_len, self.n_heads, kv_dim])?;
-        let kv = kv.transpose_axes(&[0, 2, 1, 3])?; // [B, heads, seq, kv_dim]
+        let kv = kv.transpose_axes(&[0, 2, 1, 3])?;
 
-        // Split into k_nope and values
         let kv_split = kv.split_axis(&[self.config.qk_nope_head_dim as i32], Some(-1))?;
-        let k_nope = &kv_split[0]; // [B, heads, seq, qk_nope_head_dim]
-        let values = &kv_split[1]; // [B, heads, seq, v_head_dim]
+        let k_nope = &kv_split[0];
+        let values = &kv_split[1];
 
-        // Apply RoPE to q_pe and k_pe
+        // Apply RoPE
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
         let q_pe = apply_rope(
             q_pe,
             self.config.qk_rope_head_dim,
-            false, // non-traditional (modern) RoPE
+            false,
             self.config.rope_theta,
-            1.0, // scale
+            1.0,
             offset as i32,
         )?;
         let k_pe = apply_rope(
@@ -539,13 +537,13 @@ impl DeepSeekAttention {
             offset as i32,
         )?;
 
-        // Repeat k_pe for all heads: [B, 1, seq, rope_dim] -> [B, heads, seq, rope_dim]
+        // Repeat k_pe for all heads
         let k_pe_repeated = mlx_rs::ops::broadcast_to(
             &k_pe,
             &[batch, self.n_heads, seq_len, self.config.qk_rope_head_dim],
         )?;
 
-        // Concatenate to form full keys and queries
+        // Full queries and keys
         let keys = mlx_rs::ops::concatenate_axis(&[k_nope, &k_pe_repeated], -1)?;
         let queries = mlx_rs::ops::concatenate_axis(&[q_nope, &q_pe], -1)?;
 
@@ -556,11 +554,25 @@ impl DeepSeekAttention {
             (keys, values.clone())
         };
 
+        Ok((queries, keys, values))
+    }
+
+    /// Compute attention output from projected Q, K, V.
+    pub fn attend(
+        &mut self,
+        queries: &Array,
+        keys: &Array,
+        values: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let shape = queries.shape();
+        let batch = shape[0];
+        let seq_len = shape[2];
+
         // Scaled dot-product attention
         let attn_weights = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?;
         let attn_weights = attn_weights.multiply(&Array::from_f32(self.scale))?;
 
-        // Apply mask if provided
         let attn_weights = if let Some(mask) = mask {
             attn_weights.add(mask)?
         } else {
@@ -568,12 +580,23 @@ impl DeepSeekAttention {
         };
 
         let attn_weights = mlx_rs::ops::softmax_axis(&attn_weights, -1, None)?;
-        let output = attn_weights.matmul(&values)?;
+        let output = attn_weights.matmul(values)?;
 
         // Reshape and project output
         let output = output.transpose_axes(&[0, 2, 1, 3])?;
         let output = output.reshape(&[batch, seq_len, -1])?;
         self.o_proj.forward(&output)
+    }
+
+    /// Forward pass with Multi-Latent Attention.
+    pub fn forward(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        let (queries, keys, values) = self.project_qkv(x, cache)?;
+        self.attend(&queries, &keys, &values, mask)
     }
 }
 
@@ -799,14 +822,85 @@ impl DeepSeekSparseAttention {
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0) as i32;
         let scores = self.indexer.compute_scores(x, offset)?;
 
-        // Select top-k tokens
+        // Select top-k tokens: [batch, query_len, top_k]
         let selected_indices = self.selector.select_tokens(&scores, mask)?;
 
-        // For now, fall back to dense attention
-        // Full sparse implementation would gather selected K/V and compute attention
-        // This requires significant changes to the attention computation
-        // TODO: Implement sparse gather + attention computation
-        let output = self.base_attention.forward(x, mask, cache)?;
+        // Project Q, K, V through MLA (without computing full dense attention)
+        let (queries, keys, values) = self.base_attention.project_qkv(x, cache)?;
+        // queries: [B, heads, query_len, head_dim]
+        // keys:    [B, heads, key_len, head_dim]
+        // values:  [B, heads, key_len, v_head_dim]
+
+        let batch = queries.shape()[0];
+        let n_heads = queries.shape()[1];
+        let query_len = queries.shape()[2];
+        let key_dim = keys.shape()[3];
+        let val_dim = values.shape()[3];
+
+        // Expand indices for gathering across heads:
+        // [B, query_len, top_k] -> [B, heads, query_len, top_k]
+        let idx = selected_indices.reshape(&[batch, 1, query_len, top_k])?;
+        let idx = mlx_rs::ops::broadcast_to(&idx, &[batch, n_heads, query_len, top_k])?;
+
+        // Gather selected keys: for each query position, select its top_k keys
+        // We need to gather along the key_len axis (axis=2) of keys [B, heads, key_len, head_dim]
+        // Use take_along_axis: expand idx to match key_dim, then gather
+        let idx_for_keys = idx
+            .reshape(&[batch, n_heads, query_len * top_k, 1])?;
+        let idx_for_keys = mlx_rs::ops::broadcast_to(
+            &idx_for_keys,
+            &[batch, n_heads, query_len * top_k, key_dim],
+        )?;
+        let keys_flat = keys.clone(); // [B, heads, key_len, head_dim]
+        let gathered_keys = mlx_rs::ops::indexing::take_along_axis(&keys_flat, &idx_for_keys, 2)?;
+        let gathered_keys =
+            gathered_keys.reshape(&[batch, n_heads, query_len, top_k, key_dim])?;
+
+        // Gather selected values similarly
+        let idx_for_vals = idx
+            .reshape(&[batch, n_heads, query_len * top_k, 1])?;
+        let idx_for_vals = mlx_rs::ops::broadcast_to(
+            &idx_for_vals,
+            &[batch, n_heads, query_len * top_k, val_dim],
+        )?;
+        let gathered_values = mlx_rs::ops::indexing::take_along_axis(&values, &idx_for_vals, 2)?;
+        let gathered_values =
+            gathered_values.reshape(&[batch, n_heads, query_len, top_k, val_dim])?;
+
+        // Compute sparse attention: Q @ gathered_K^T -> softmax -> @ gathered_V
+        // queries: [B, heads, query_len, head_dim]
+        // gathered_keys: [B, heads, query_len, top_k, head_dim]
+        // scores: [B, heads, query_len, top_k] via einsum-like batched matmul
+
+        // Expand queries for batched dot product with gathered keys
+        let q_expanded = queries.reshape(&[batch, n_heads, query_len, 1, key_dim])?;
+        // [B, heads, query_len, 1, head_dim] @ [B, heads, query_len, head_dim, top_k]
+        let gathered_keys_t = gathered_keys.transpose_axes(&[0, 1, 2, 4, 3])?;
+        let attn_scores = q_expanded.matmul(&gathered_keys_t)?;
+        // -> [B, heads, query_len, 1, top_k]
+        let attn_scores = attn_scores.squeeze_axes(&[3])?;
+        // -> [B, heads, query_len, top_k]
+
+        let attn_scores =
+            attn_scores.multiply(&Array::from_f32(self.base_attention.scale))?;
+
+        // Apply softmax over the top_k dimension
+        let attn_weights = mlx_rs::ops::softmax_axis(&attn_scores, -1, None)?;
+
+        // Weighted sum of gathered values
+        // attn_weights: [B, heads, query_len, top_k] -> [B, heads, query_len, 1, top_k]
+        let w = attn_weights.reshape(&[batch, n_heads, query_len, 1, top_k])?;
+        // gathered_values: [B, heads, query_len, top_k, v_head_dim]
+        // [B, heads, query_len, 1, top_k] @ [B, heads, query_len, top_k, v_head_dim]
+        let output = w.matmul(&gathered_values)?;
+        // -> [B, heads, query_len, 1, v_head_dim]
+        let output = output.squeeze_axes(&[3])?;
+        // -> [B, heads, query_len, v_head_dim]
+
+        // Reshape and project output
+        let output = output.transpose_axes(&[0, 2, 1, 3])?;
+        let output = output.reshape(&[batch, query_len, -1])?;
+        let output = self.base_attention.o_proj.forward(&output)?;
 
         Ok(SparseAttentionResult {
             output,

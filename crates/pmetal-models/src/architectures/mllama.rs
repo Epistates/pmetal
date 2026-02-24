@@ -706,12 +706,21 @@ impl MllamaTextModel {
     ) -> Result<Array, Exception> {
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
 
-        // TODO: Causal mask logic similar to LlamaModel
+        // Create causal attention mask for self-attention layers
+        let seq_len = input_ids.dim(1);
+        let mask = if seq_len > 1 {
+            let tri = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
+            let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+            let zero = Array::from_f32(0.0);
+            Some(mlx_rs::ops::r#where(&tri.eq(&zero)?, &neg_inf, &zero)?)
+        } else {
+            None
+        };
 
         for layer in &mut self.layers {
             hidden_states = layer.forward(
                 &hidden_states,
-                None, // Mask
+                mask.as_ref(),
                 cross_attention_states,
                 None, // Cache
             )?;

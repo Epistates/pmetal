@@ -13,8 +13,10 @@
 
 mod breadcrumbs;
 mod dare;
+mod della;
 mod linear;
 mod model_stock;
+mod nearswap;
 mod passthrough;
 mod slerp;
 mod souper;
@@ -23,8 +25,10 @@ mod ties;
 
 pub use breadcrumbs::BreadcrumbsMerge;
 pub use dare::DareMerge;
+pub use della::DellaMerge;
 pub use linear::LinearMerge;
 pub use model_stock::ModelStockMerge;
+pub use nearswap::NearswapMerge;
 pub use passthrough::PassthroughMerge;
 pub use slerp::SlerpMerge;
 pub use souper::SouperMerge;

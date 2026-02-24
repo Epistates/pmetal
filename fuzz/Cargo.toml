@@ -1,0 +1,21 @@
+[package]
+name = "anteater-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+pmetal-gguf = { path = "../crates/pmetal-gguf" }
+
+[target.'cfg(fuzzing)'.dependencies]
+arbitrary = { version = "1.3", features = ["derive"] }
+
+[[bin]]
+name = "gguf_reader"
+path = "fuzz_targets/gguf_reader.rs"
+test = false
+doc = false

@@ -75,6 +75,9 @@ parquet = "54"
 # HuggingFace integration
 hf-hub = "0.4"
 tokenizers = "0.21"
+reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+sha2 = "0.10"
+base64 = "0.22"
 
 # Serialization (binary)
 bincode = "1.3"

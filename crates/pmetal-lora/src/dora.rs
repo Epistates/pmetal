@@ -42,6 +42,10 @@ pub struct DoraLinear {
     pub lora_b: Array,
     /// Magnitude vector [out_features, 1] - trainable.
     pub magnitude: Array,
+    /// Snapshot of the base weight taken just before merging, used to restore
+    /// the original weight during [`Self::unmerge`].  `None` when the layer
+    /// is in the unmerged (normal training) state.
+    original_weight: Option<Array>,
 }
 
 impl DoraLinear {
@@ -90,6 +94,7 @@ impl DoraLinear {
             lora_a,
             lora_b,
             magnitude,
+            original_weight: None,
         })
     }
 
@@ -137,6 +142,7 @@ impl DoraLinear {
             lora_a,
             lora_b,
             magnitude,
+            original_weight: None,
         })
     }
 
@@ -200,22 +206,33 @@ impl DoraLinear {
         }
     }
 
-    /// Merge DoRA weights into base weights.
+    /// Merge DoRA weights into the base weight for efficient inference.
     ///
-    /// The merged weight is simply the final computed W used in forward pass.
+    /// Computes the final effective weight matrix:
+    /// `W_merged = m * (W + scale * B @ A) / ||W + scale * B @ A||`
+    /// and stores it in `self.weight`, replacing the frozen base weight.
+    ///
+    /// A snapshot of the pre-merge base weight is saved in `self.original_weight`
+    /// so that [`Self::unmerge`] can fully restore the original state.
     pub fn merge(&mut self) -> Result<(), LoraError> {
         if self.merged {
             return Ok(());
         }
 
-        // Reconstruct full weight
+        // Snapshot the original base weight before overwriting it.
+        self.original_weight = Some(self.weight.clone());
+
+        // Reconstruct the full effective weight: V = W + scale * B @ A
         let ba = self.lora_b.matmul(&self.lora_a)?;
         let scale_arr = Array::from_f32(self.scale);
         let update = ba.multiply(&scale_arr)?;
         let v = self.weight.add(&update)?;
 
+        // Normalise column-wise: V_norm = V / ||V||_c
         let v_norm = v.square()?.sum_axis(1, true)?.sqrt()?;
         let normalized_v = v.divide(&v_norm.add(&Array::from_f32(1e-6))?)?;
+
+        // Apply magnitude: W_merged = m * V_norm
         let w_final = normalized_v.multiply(&self.magnitude)?;
 
         self.weight = w_final;
@@ -223,30 +240,27 @@ impl DoraLinear {
         Ok(())
     }
 
-    /// Unmerge DoRA weights (restore base weight and params).
+    /// Unmerge DoRA weights, restoring the frozen base weight and LoRA params
+    /// to the state they were in before [`Self::merge`] was called.
     ///
-    /// WARNING: DoRA unmerge is non-trivial/approximate because the decomposition
-    /// fuses magnitude and direction. This implementation simply resets the merged flag
-    /// if the original weights were preserved or if we accept the merged state as new base.
-    ///
-    /// For this implementation, we follow the pattern of assuming `self.weight` holds
-    /// the *base* weight when unmerged, and *final* weight when merged.
-    /// HOWEVER, calculating the original W from W_final, m, A, B is complex.
-    ///
-    /// Current strategy: DoRA merging usually implies "baking in" for inference.
-    /// Unmerging for continued training would require saving the original W.
-    /// As `LoraLinear` modifies `self.weight` in place, we cannot perfectly unmerge
-    /// without extra storage.
-    ///
-    /// Throw error for now to be safe.
+    /// This relies on `self.original_weight`, which is populated by `merge()`.
+    /// If `merge()` was never called the layer is already in the unmerged state
+    /// and this is a no-op.
     pub fn unmerge(&mut self) -> Result<(), LoraError> {
         if !self.merged {
             return Ok(());
         }
-        // TODO: Store original weight for unmerging
-        Err(LoraError::Mlx(Exception::custom(
-            "DoRA unmerge not yet supported without original weight storage",
-        )))
+
+        let original = self.original_weight.take().ok_or_else(|| {
+            LoraError::Mlx(Exception::custom(
+                "DoRA unmerge failed: original_weight snapshot is missing. \
+                 This indicates merge() was not called before unmerge().",
+            ))
+        })?;
+
+        self.weight = original;
+        self.merged = false;
+        Ok(())
     }
 
     /// Get trainable parameters: LoRA A, LoRA B, and Magnitude.
@@ -302,5 +316,78 @@ mod tests {
 
         let output = dora.forward(&x).unwrap();
         assert_eq!(output.shape(), &[2, 4, 64]);
+    }
+
+    #[test]
+    fn test_dora_merge_unmerge_roundtrip() {
+        let mut dora = DoraLinear::new(32, 64, 4, 8.0, false, false).unwrap();
+
+        // Record the original base weight sum for comparison.
+        let original_sum = dora.weight.sum(None).unwrap().item::<f32>();
+
+        // Merge – weight is now the fused effective weight.
+        dora.merge().unwrap();
+        assert!(dora.merged);
+        assert!(dora.original_weight.is_some());
+
+        // The merged weight should differ from the original because lora_b @ lora_a
+        // contributes (even though lora_b is zero-init, the magnitude scaling changes it).
+        let merged_sum = dora.weight.sum(None).unwrap().item::<f32>();
+        // They don't have to differ numerically when lora_b=0, but the round-trip must work.
+        let _ = merged_sum; // suppress unused warning
+
+        // Double-merge is a no-op – should not change state.
+        dora.merge().unwrap();
+        assert!(dora.merged);
+
+        // Unmerge – weight must be restored to the original value.
+        dora.unmerge().unwrap();
+        assert!(!dora.merged);
+        assert!(dora.original_weight.is_none());
+
+        let restored_sum = dora.weight.sum(None).unwrap().item::<f32>();
+        let diff = (original_sum - restored_sum).abs();
+        assert!(
+            diff < 1e-4,
+            "Restored weight sum {restored_sum} differs from original {original_sum} by {diff}"
+        );
+
+        // Double-unmerge is a no-op.
+        dora.unmerge().unwrap();
+        assert!(!dora.merged);
+    }
+
+    #[test]
+    fn test_dora_unmerge_without_merge_is_noop() {
+        let mut dora = DoraLinear::new(16, 32, 2, 4.0, false, false).unwrap();
+        // Unmerging without a prior merge must succeed and leave state unchanged.
+        assert!(dora.unmerge().is_ok());
+        assert!(!dora.merged);
+        assert!(dora.original_weight.is_none());
+    }
+
+    #[test]
+    fn test_dora_merged_forward_matches_direct() {
+        // When lora_b is zero (as initialised), the merged weight should produce
+        // the same output as the unmerged forward pass.
+        let mut dora = DoraLinear::new(16, 32, 4, 8.0, false, false).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[1, 16], None, None, None).unwrap();
+
+        let unmerged_out = dora.forward(&x).unwrap();
+        dora.merge().unwrap();
+        let merged_out = dora.forward(&x).unwrap();
+
+        let diff = unmerged_out
+            .subtract(&merged_out)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(
+            diff < 1e-4,
+            "Merged and unmerged outputs differ by {diff} (max abs)"
+        );
     }
 }

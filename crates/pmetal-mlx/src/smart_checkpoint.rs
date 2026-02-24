@@ -17,6 +17,7 @@
 
 use mlx_rs::{error::Exception, Array};
 use std::collections::HashMap;
+use std::path::Path;
 
 /// Layer checkpoint policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,9 +229,6 @@ impl ActivationStore {
     }
 
     /// Store activation to disk.
-    ///
-    /// Note: Disk offload is currently a stub - full implementation requires
-    /// safetensors or numpy format support.
     pub fn store_disk(&mut self, key: &str, activation: &Array) -> Result<(), Exception> {
         let path = self
             .offload_path
@@ -239,13 +237,15 @@ impl ActivationStore {
 
         let file_path = format!("{}/{}.safetensors", path, key.replace('/', "_"));
 
-        // Evaluate first
+        // Evaluate before serializing.
         activation.eval()?;
 
-        // For now, store in memory as fallback
-        // TODO: Implement proper disk serialization using safetensors
-        self.memory_store
-            .insert(key.to_string(), activation.clone());
+        // Build a single-entry map and serialize to safetensors on disk.
+        let mut map = HashMap::new();
+        map.insert("activation".to_string(), activation.clone());
+        Array::save_safetensors(map, None, Path::new(&file_path))
+            .map_err(|e| Exception::custom(e.to_string()))?;
+
         self.disk_store.insert(key.to_string(), file_path);
 
         Ok(())
@@ -257,13 +257,14 @@ impl ActivationStore {
     }
 
     /// Retrieve activation from disk.
-    ///
-    /// Note: Currently falls back to memory store. Full disk implementation
-    /// requires safetensors support.
     pub fn get_disk(&self, key: &str) -> Result<Option<Array>, Exception> {
-        if self.disk_store.contains_key(key) {
-            // Currently stored in memory as fallback
-            Ok(self.memory_store.get(key).cloned())
+        if let Some(file_path) = self.disk_store.get(key) {
+            let mut map = Array::load_safetensors(Path::new(file_path))
+                .map_err(|e| Exception::custom(e.to_string()))?;
+            let array = map
+                .remove("activation")
+                .ok_or_else(|| Exception::custom("Missing 'activation' key in safetensors file"))?;
+            Ok(Some(array))
         } else {
             Ok(None)
         }
@@ -727,22 +728,28 @@ impl LongContextManager {
 
         let start = std::time::Instant::now();
 
-        let segment_path = format!("{}/segment_{}.bin", self.config.checkpoint_dir, segment_idx);
+        let segment_path = format!(
+            "{}/segment_{}.safetensors",
+            self.config.checkpoint_dir, segment_idx
+        );
 
-        // Serialize activations to disk
-        // TODO: Use safetensors for proper serialization
+        // Evaluate all arrays and accumulate byte counts before serializing.
         let mut total_bytes = 0usize;
-
         for array in activations.values() {
             array.eval()?;
-            let data: Vec<f32> = array.as_slice().to_vec();
-            total_bytes += data.len() * 4;
-
-            // For now, store in a simple format
-            // Full implementation would use safetensors
+            total_bytes += array.nbytes();
         }
 
-        self.segment_paths[segment_idx] = Some(segment_path.clone());
+        // Build owned map for serialization (keys are String which implements AsRef<str>).
+        let map: HashMap<String, Array> = activations
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+
+        Array::save_safetensors(map, None, Path::new(&segment_path))
+            .map_err(|e| Exception::custom(e.to_string()))?;
+
+        self.segment_paths[segment_idx] = Some(segment_path);
         self.stats.segments_processed += 1;
         self.stats.bytes_written += total_bytes;
         self.stats.write_time_ms += start.elapsed().as_millis() as u64;
@@ -764,15 +771,15 @@ impl LongContextManager {
         }
 
         // Load from disk
-        if let Some(ref _path) = self.segment_paths[segment_idx] {
+        if let Some(ref path) = self.segment_paths[segment_idx] {
             let start = std::time::Instant::now();
 
-            // TODO: Implement actual loading from safetensors
-            // For now, return empty
+            let map = Array::load_safetensors(Path::new(path))
+                .map_err(|e| Exception::custom(e.to_string()))?;
 
             self.stats.read_time_ms += start.elapsed().as_millis() as u64;
 
-            Ok(Some(HashMap::new()))
+            Ok(Some(map))
         } else {
             Ok(None)
         }

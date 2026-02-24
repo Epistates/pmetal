@@ -207,12 +207,9 @@ impl TensorLoader for SafetensorsLoader {
 pub trait ZeroCopyTensorLoader: TensorLoader {
     /// Get raw pointer to tensor data.
     ///
-    /// Returns (pointer, length in bytes, dtype) for the tensor.
-    ///
-    /// # Safety
-    /// The returned pointer is only valid while the loader is alive.
-    /// The caller must ensure proper synchronization for GPU access.
-    fn tensor_ptr(&self, name: &str) -> Result<TensorPtr>;
+    /// The returned [`TensorPtr`] borrows from `self`, ensuring the pointer
+    /// remains valid for the lifetime of the borrow.
+    fn tensor_ptr(&self, name: &str) -> Result<TensorPtr<'_>>;
 
     /// Check if a tensor can be accessed zero-copy.
     ///
@@ -221,8 +218,11 @@ pub trait ZeroCopyTensorLoader: TensorLoader {
 }
 
 /// Raw pointer to tensor data for zero-copy access.
+///
+/// The lifetime `'a` ties this pointer to the [`ZeroCopyLoader`] that created it,
+/// ensuring the underlying memory-mapped data remains valid.
 #[derive(Debug)]
-pub struct TensorPtr {
+pub struct TensorPtr<'a> {
     /// Pointer to the raw data.
     pub ptr: *const u8,
     /// Length in bytes.
@@ -231,9 +231,11 @@ pub struct TensorPtr {
     pub dtype: safetensors::Dtype,
     /// Shape of the tensor.
     pub shape: Vec<usize>,
+    /// Ties lifetime to the owning loader's memory-mapped data.
+    _lifetime: std::marker::PhantomData<&'a [u8]>,
 }
 
-impl TensorPtr {
+impl<'a> TensorPtr<'a> {
     /// Get number of elements.
     pub fn num_elements(&self) -> usize {
         self.shape.iter().product()
@@ -258,12 +260,13 @@ impl TensorPtr {
     }
 }
 
-// SAFETY: TensorPtr is just a view into data owned by the loader.
-// It can be sent between threads as long as the loader is alive.
+// SAFETY: TensorPtr borrows from memory-mapped data (&'a [u8]) which is
+// Send+Sync. The raw pointer points into this borrowed slice, so it is
+// safe to send across threads as long as the borrow is live.
 #[allow(unsafe_code)]
-unsafe impl Send for TensorPtr {}
+unsafe impl Send for TensorPtr<'_> {}
 #[allow(unsafe_code)]
-unsafe impl Sync for TensorPtr {}
+unsafe impl Sync for TensorPtr<'_> {}
 
 /// Memory-mapped loader for zero-copy tensor access.
 ///
@@ -453,7 +456,7 @@ impl TensorLoader for ZeroCopyLoader {
 
 impl ZeroCopyTensorLoader for ZeroCopyLoader {
     #[allow(unsafe_code)]
-    fn tensor_ptr(&self, name: &str) -> Result<TensorPtr> {
+    fn tensor_ptr(&self, name: &str) -> Result<TensorPtr<'_>> {
         let loc = self
             .tensor_info
             .get(name)
@@ -467,6 +470,7 @@ impl ZeroCopyTensorLoader for ZeroCopyLoader {
             len: loc.len,
             dtype: loc.dtype,
             shape: loc.shape.clone(),
+            _lifetime: std::marker::PhantomData,
         })
     }
 
@@ -589,7 +593,12 @@ impl ModelSource {
 
                 // Download first file to get the directory
                 let first = repo.get(&safetensor_files[0].rfilename)?;
-                let model_dir = first.parent().unwrap().to_path_buf();
+                let model_dir = first
+                    .parent()
+                    .ok_or_else(|| {
+                        MergeError::ModelLoad(format!("Failed to get parent directory of {:?}", first))
+                    })?
+                    .to_path_buf();
 
                 // Download remaining files
                 for file in &safetensor_files[1..] {
@@ -678,17 +687,15 @@ impl TensorWriter {
             .iter()
             .map(|(name, (shape, data))| {
                 let shape: Vec<usize> = shape.iter().map(|&s| s as usize).collect();
-                (
-                    name.as_str(),
-                    safetensors::tensor::TensorView::new(
-                        safetensors::Dtype::F32,
-                        shape,
-                        bytemuck::cast_slice(data),
-                    )
-                    .unwrap(),
+                let tensor_view = safetensors::tensor::TensorView::new(
+                    safetensors::Dtype::F32,
+                    shape,
+                    bytemuck::cast_slice(data),
                 )
+                .map_err(|e| MergeError::ModelLoad(format!("Failed to create TensorView: {}", e)))?;
+                Ok((name.as_str(), tensor_view))
             })
-            .collect();
+            .collect::<Result<Vec<_>>>()?;
 
         safetensors::serialize_to_file(tensors, &None, &shard_path)?;
 
@@ -739,6 +746,7 @@ mod tests {
             len: 1024,
             dtype: safetensors::Dtype::F32,
             shape: vec![4, 8, 32],
+            _lifetime: std::marker::PhantomData,
         };
 
         assert_eq!(ptr.num_elements(), 4 * 8 * 32);
@@ -747,7 +755,7 @@ mod tests {
     #[test]
     fn test_tensor_ptr_send_sync() {
         fn assert_send_sync<T: Send + Sync>() {}
-        assert_send_sync::<TensorPtr>();
+        assert_send_sync::<TensorPtr<'static>>();
     }
 
     #[test]
