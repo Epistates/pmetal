@@ -367,7 +367,7 @@ mod tests {
             sum
         );
         for &p in &probs {
-            assert!(p >= 0.0 && p <= 1.0, "probability out of range: {}", p);
+            assert!((0.0..=1.0).contains(&p), "probability out of range: {}", p);
         }
     }
 
@@ -529,7 +529,7 @@ mod tests {
 
         let r1 = DellaMerge::new()
             .with_seed(99)
-            .merge(&[t1.clone()], Some(&base), &params, &global)
+            .merge(std::slice::from_ref(&t1), Some(&base), &params, &global)
             .unwrap();
         let r2 = DellaMerge::new()
             .with_seed(99)
@@ -560,7 +560,7 @@ mod tests {
         // Use same seed to ensure the only difference is the probability computation.
         let exp_result = DellaMerge::new()
             .with_seed(42)
-            .merge(&[t1.clone()], Some(&base), &params, &global)
+            .merge(std::slice::from_ref(&t1), Some(&base), &params, &global)
             .unwrap();
         let lin_result = DellaMerge::linear()
             .with_seed(42)
