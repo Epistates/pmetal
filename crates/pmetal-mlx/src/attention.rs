@@ -309,7 +309,7 @@ impl AttentionDispatcher {
                          scale: f32,
                          mask: &Option<mlx_rs::Array>|
          -> std::result::Result<mlx_rs::Array, pmetal_core::PMetalError> {
-            let result = if let Some(ref m) = mask {
+            let result = if let Some(m) = mask {
                 mlx_rs::fast::scaled_dot_product_attention(
                     q,
                     k,

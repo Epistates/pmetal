@@ -547,8 +547,9 @@ pub mod raw_ffi {
         inputs: mlx_sys::mlx_vector_array,
         payload: *mut std::ffi::c_void,
     ) -> std::ffi::c_int {
-        // Safety: payload must be a valid pointer to a RustClosureFn
-        let closure = &*(payload as *const RustClosureFn);
+        // SAFETY: payload must be a valid pointer to a RustClosureFn, guaranteed by
+        // the caller which created it via Box::into_raw in register_closure.
+        let closure = unsafe { &*(payload as *const RustClosureFn) };
 
         // Convert inputs to Vec<Array>
         let input_vec = RawVectorArray { vec: inputs };
@@ -575,8 +576,9 @@ pub mod raw_ffi {
             Err(_) => return 1,
         };
 
-        // Transfer ownership of the output vector to the caller
-        *res = output_vec.vec;
+        // SAFETY: res is a valid pointer provided by MLX's C API; output_vec.vec
+        // is a valid mlx_vector_array we just created.
+        unsafe { *res = output_vec.vec };
         std::mem::forget(output_vec); // Don't free - caller owns it now
 
         0 // Success
@@ -585,8 +587,8 @@ pub mod raw_ffi {
     /// C destructor function for the Rust closure payload.
     unsafe extern "C" fn rust_closure_destructor(payload: *mut std::ffi::c_void) {
         if !payload.is_null() {
-            // Safety: We created this pointer from a Box<RustClosureFn>
-            let _ = Box::from_raw(payload as *mut RustClosureFn);
+            // SAFETY: We created this pointer from a Box<RustClosureFn> via Box::into_raw
+            unsafe { let _ = Box::from_raw(payload as *mut RustClosureFn); }
         }
     }
 

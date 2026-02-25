@@ -27,7 +27,7 @@ use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
 use pmetal_data::{DataLoader, DataLoaderConfig, TrainingBatch, TrainingDataset};
 use pmetal_lora::TrainableModel;
 use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rngs::StdRng, RngExt as _, SeedableRng};
 
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
 
@@ -236,7 +236,7 @@ pub fn forward_process(
     let mut mask_flags = Vec::with_capacity(total_elements);
 
     for &token in &original {
-        if rng.gen::<f32>() < t {
+        if rng.random::<f32>() < t {
             masked_tokens.push(mask_token_id as i32);
             mask_flags.push(true);
         } else {
@@ -501,7 +501,7 @@ impl DiffusionTrainingLoop {
             .unwrap_or(usize::MAX);
 
         // 1. Sample noise level t ~ U(min_noise, 1]
-        let t: f32 = self.rng.gen_range(self.config.min_noise_level..=1.0);
+        let t: f32 = self.rng.random_range(self.config.min_noise_level..=1.0);
 
         // 2. Apply GPU-native forward masking process
         // Use step as seed for reproducibility while staying on GPU
@@ -916,7 +916,7 @@ impl DiffusionSampler {
                         // Random remasking
                         let mut indices: Vec<usize> = (prompt_len..total_len).collect();
                         for i in 0..num_to_remask.min(indices.len()) {
-                            let j = self.rng.gen_range(i..indices.len());
+                            let j = self.rng.random_range(i..indices.len());
                             indices.swap(i, j);
                             let idx = indices[i];
                             tokens[idx] = self.mask_token_id as i32;

@@ -14,7 +14,7 @@ pmetal-core = { workspace = true }
 pmetal-metal = { workspace = true, optional = true }
 
 # Math
-ndarray = { version = "0.16", features = ["rayon", "serde"] }
+ndarray = { workspace = true, features = ["serde"] }
 num-traits = "0.2"
 
 # Async - use workspace
@@ -33,16 +33,22 @@ tracing = { workspace = true }
 thiserror = { workspace = true }
 
 # Random (for initialization)
-rand = "0.8"
-rand_distr = "0.4"
+rand = { workspace = true }
+rand_distr = "0.6"
 
-# Metal (optional)
-metal = { version = "0.29", optional = true }
+# Metal (optional, using modern objc2 ecosystem)
+objc2 = { version = "0.6", optional = true }
+objc2-foundation = { version = "0.3", optional = true, features = ["NSData", "NSError", "NSString"] }
+objc2-metal = { version = "0.3", optional = true, features = [
+    "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder",
+    "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary",
+    "MTLBuffer", "MTLResource",
+] }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { workspace = true, features = ["html_reports"] }
 approx = "0.5"
-proptest = "1.4"
+proptest = { workspace = true }
 
 [[bench]]
 name = "sinkhorn"
@@ -55,6 +61,6 @@ harness = false
 [features]
 default = ["metal"]
 # Enable Metal GPU acceleration for Apple Silicon (macOS)
-metal = ["dep:metal", "pmetal-metal"]
+metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "pmetal-metal"]
 # Enable CUDA backend for NVIDIA GPUs (future)
 cuda = []

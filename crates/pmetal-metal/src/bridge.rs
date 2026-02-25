@@ -67,13 +67,15 @@ pub unsafe fn metal_buffer_from_ptr<T: Pod + Zeroable>(
     // 4. deallocator is None because we don't own the memory - the caller
     //    (typically an MLX Array) is responsible for deallocation
     // 5. The Pod + Zeroable bounds ensure T has no padding or invariants
-    let buffer = ctx
-        .device()
-        .newBufferWithBytesNoCopy_length_options_deallocator(ptr_void, size, options, None)
-        .ok_or_else(|| MetalError::BufferCreation {
-            size,
-            reason: "Failed to create buffer view".to_string(),
-        })?;
+    // SAFETY: see above safety comment — all preconditions verified
+    let buffer = unsafe {
+        ctx.device()
+            .newBufferWithBytesNoCopy_length_options_deallocator(ptr_void, size, options, None)
+    }
+    .ok_or_else(|| MetalError::BufferCreation {
+        size,
+        reason: "Failed to create buffer view".to_string(),
+    })?;
 
     Ok(MetalBufferView {
         buffer,

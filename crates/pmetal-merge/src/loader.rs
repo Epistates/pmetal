@@ -567,7 +567,7 @@ impl ModelSource {
             Self::Hub { repo_id, revision } => {
                 info!("Downloading model from Hub: {}", repo_id);
 
-                let api = hf_hub::api::sync::Api::new()?;
+                let api = hf_hub::api::sync::ApiBuilder::from_env().build()?;
                 let repo = match revision {
                     Some(rev) => api.repo(hf_hub::Repo::with_revision(
                         repo_id.clone(),
@@ -702,7 +702,7 @@ impl TensorWriter {
             })
             .collect::<Result<Vec<_>>>()?;
 
-        safetensors::serialize_to_file(tensors, &None, &shard_path)?;
+        safetensors::serialize_to_file(tensors, None, &shard_path)?;
 
         self.current_shard.clear();
         self.current_size = 0;
@@ -804,7 +804,7 @@ mod tests {
         )]);
 
         let serialized =
-            serialize(metadata.iter().map(|(k, v)| (k.as_str(), v.clone())), &None).unwrap();
+            serialize(metadata.iter().map(|(k, v)| (k.as_str(), v.clone())), None).unwrap();
 
         let mut file = std::fs::File::create(&file_path).unwrap();
         file.write_all(&serialized).unwrap();

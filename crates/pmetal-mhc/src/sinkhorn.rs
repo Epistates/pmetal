@@ -451,13 +451,13 @@ mod tests {
     fn test_compositional_closure() {
         // Property: Product of doubly stochastic matrices is doubly stochastic
         let config = SinkhornConfig::default();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         let matrices: Vec<Array2<f32>> = (0..10)
             .map(|_| {
                 let h_tilde = Array2::from_shape_fn((4, 4), |_| {
-                    use rand::Rng;
-                    rng.gen_range(-2.0..2.0)
+                    use rand::RngExt;
+                    rng.random_range(-2.0..2.0)
                 });
                 sinkhorn_knopp(&h_tilde, &config).matrix
             })
@@ -551,13 +551,13 @@ mod tests {
     fn test_deep_composition_stability() {
         // Test that even 60 layers deep, the composite remains stable
         let config = SinkhornConfig::default();
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
 
         let matrices: Vec<Array2<f32>> = (0..60)
             .map(|_| {
                 let h_tilde = Array2::from_shape_fn((4, 4), |_| {
-                    use rand::Rng;
-                    rng.gen_range(-2.0..2.0)
+                    use rand::RngExt;
+                    rng.random_range(-2.0..2.0)
                 });
                 sinkhorn_knopp(&h_tilde, &config).matrix
             })

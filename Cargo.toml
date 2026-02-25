@@ -21,8 +21,8 @@ members = [
 
 [workspace.package]
 version = "0.1.0"
-edition = "2021"
-rust-version = "1.82"
+edition = "2024"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/pmetal"
 keywords = ["machine-learning", "llm", "fine-tuning", "apple-silicon", "mlx"]
@@ -50,12 +50,12 @@ mlx-rs = { path = "../reference/mlx-rs/mlx-rs", features = ["safetensors"] }
 mlx-sys = { path = "../reference/mlx-rs/mlx-sys" }
 
 # Async runtime
-tokio = { version = "1.42", features = ["full"] }
+tokio = { version = "1.49", features = ["full"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-serde_yaml = "0.9"
+serde_yaml = { package = "serde_yaml_ng", version = "0.10" }
 
 # Error handling
 thiserror = "2"
@@ -69,34 +69,36 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 # Data formats
-safetensors = "0.5"
-arrow = "54"
-parquet = "54"
+safetensors = "0.7"
+arrow = "58"
+parquet = "58"
+arrow-array = "58"
+arrow-json = "58"
 
 # HuggingFace integration
-hf-hub = "0.4"
-tokenizers = "0.21"
-reqwest = { version = "0.12", features = ["json", "multipart", "stream"] }
+hf-hub = "0.5"
+tokenizers = "0.22"
+reqwest = { version = "0.13", features = ["json", "multipart", "stream", "rustls"] }
 sha2 = "0.10"
 base64 = "0.22"
 
 # Serialization (binary)
-bincode = "1.3"
+bitcode = { version = "0.6", features = ["serde"] }
 
 # Utilities
 bytemuck = { version = "1", features = ["derive"] }
 half = { version = "2", features = ["bytemuck"] }
 num-traits = "0.2"
-ndarray = { version = "0.16", features = ["rayon"] }
-rand = "0.8"
-indicatif = "0.17"
+ndarray = { version = "0.17", features = ["rayon"] }
+rand = "0.10"
+indicatif = "0.18"
 humansize = "2"
-dirs = "5"
+dirs = "6"
 walkdir = "2"
 memmap2 = "0.9"
 
 # Testing
-criterion = "0.5"
+criterion = "0.8"
 tempfile = "3"
 proptest = "1.5"
 

@@ -4598,7 +4598,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                         use rand::SeedableRng;
                         let mut rng = rand::rngs::StdRng::seed_from_u64(seed + dataset_idx as u64);
                         for sample in samples {
-                            if rand::Rng::gen::<f64>(&mut rng) < weight {
+                            if rand::RngExt::random::<f64>(&mut rng) < weight {
                                 merged.push(sample.clone());
                             }
                         }

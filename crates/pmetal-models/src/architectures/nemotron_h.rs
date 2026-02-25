@@ -2037,7 +2037,7 @@ impl NemotronHMixer {
             // Dequantize weight and compute matmul (no input scaling for float inference)
             let weight = in_proj.weight.as_ref().multiply(ws)?;
             let out = x.matmul(&weight.t())?;
-            if let Some(ref bias) = in_proj.bias.as_ref() {
+            if let Some(bias) = in_proj.bias.as_ref() {
                 out.add(bias)?
             } else {
                 out
@@ -2288,7 +2288,7 @@ impl NemotronHMixer {
             // Dequantize weight and compute matmul (no input scaling for float inference)
             let weight = out_proj.weight.as_ref().multiply(ws)?;
             let out = y_normed.matmul(&weight.t())?;
-            if let Some(ref bias) = out_proj.bias.as_ref() {
+            if let Some(bias) = out_proj.bias.as_ref() {
                 out.add(bias)
             } else {
                 Ok(out)

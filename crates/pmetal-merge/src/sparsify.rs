@@ -374,18 +374,18 @@ pub fn sparsify_dare(tensor: &Array, density: f32, seed: Option<u64>) -> Result<
     let n = flat.dim(0) as usize;
 
     // Generate random mask with optional seed
-    use rand::{Rng, SeedableRng};
+    use rand::{RngExt, SeedableRng};
 
     let mut rng = if let Some(s) = seed {
         rand::rngs::StdRng::seed_from_u64(s)
     } else {
-        rand::rngs::StdRng::from_entropy()
+        rand::rngs::StdRng::from_rng(&mut rand::rng())
     };
 
     let mut mask_data = Vec::with_capacity(n);
 
     for _ in 0..n {
-        if rng.gen::<f32>() < density {
+        if rng.random::<f32>() < density {
             // Rescale by 1/density to maintain expected sum
             mask_data.push(1.0 / density);
         } else {

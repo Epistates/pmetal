@@ -465,7 +465,7 @@ impl SmartCheckpointContext {
             .layer_types
             .iter()
             .zip(self.save_layers.iter())
-            .filter(|(_, &saved)| !saved)
+            .filter(|(_, saved)| !**saved)
             .map(|(lt, _)| lt.memory_factor())
             .sum::<f32>();
 

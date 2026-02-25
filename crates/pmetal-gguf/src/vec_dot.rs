@@ -39,12 +39,14 @@ mod neon {
     /// so we expand to i16, multiply, then accumulate.
     #[inline(always)]
     unsafe fn vdotq_s32(a: int8x16_t, b: int8x16_t) -> int32x4_t {
-        // Multiply low 8 elements (expanded to i16)
-        let p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
-        // Multiply high 8 elements (expanded to i16)
-        let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
-        // Pairwise add i16->i32 and combine
-        vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
+        unsafe {
+            // Multiply low 8 elements (expanded to i16)
+            let p0 = vmull_s8(vget_low_s8(a), vget_low_s8(b));
+            // Multiply high 8 elements (expanded to i16)
+            let p1 = vmull_s8(vget_high_s8(a), vget_high_s8(b));
+            // Pairwise add i16->i32 and combine
+            vaddq_s32(vpaddlq_s16(p0), vpaddlq_s16(p1))
+        }
     }
 
     /// Vec dot Q8K x Q8K (simplest case: both are 8-bit).

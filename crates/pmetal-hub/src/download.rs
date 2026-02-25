@@ -7,7 +7,7 @@ use std::path::PathBuf;
 
 /// Build API with optional token authentication.
 fn build_api(token: Option<&SecretString>) -> Result<Api> {
-    let mut builder = ApiBuilder::new();
+    let mut builder = ApiBuilder::from_env();
 
     if let Some(secret) = token {
         builder = builder.with_token(Some(secret.expose_secret().to_string()));

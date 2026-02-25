@@ -215,11 +215,11 @@ impl ClusterTopology {
 
     /// Update a node's profile.
     pub fn update_profile(&mut self, peer_id: &PeerId, profile: NodeProfile) {
-        if let Some(&idx) = self.peer_to_node.get(peer_id) {
-            if let Some(node) = self.graph.node_weight_mut(idx) {
-                node.profile = profile;
-                node.last_seen = Instant::now();
-            }
+        if let Some(&idx) = self.peer_to_node.get(peer_id)
+            && let Some(node) = self.graph.node_weight_mut(idx)
+        {
+            node.profile = profile;
+            node.last_seen = Instant::now();
         }
     }
 

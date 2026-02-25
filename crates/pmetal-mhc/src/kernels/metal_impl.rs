@@ -9,27 +9,37 @@ use crate::sinkhorn::SinkhornConfig;
 use ndarray::{Array2, ArrayView1, ArrayView2};
 
 #[cfg(feature = "metal")]
-use metal::{
-    Buffer, CommandQueue, ComputePipelineState, Device, Library, MTLResourceOptions, MTLSize,
+use objc2::rc::Retained;
+#[cfg(feature = "metal")]
+use objc2::runtime::ProtocolObject;
+#[cfg(feature = "metal")]
+use objc2_foundation::NSString;
+#[cfg(feature = "metal")]
+use objc2_metal::{
+    MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLCreateSystemDefaultDevice, MTLDevice, MTLLibrary,
+    MTLResourceOptions, MTLSize,
 };
+#[cfg(feature = "metal")]
+use std::ptr::NonNull;
 
 /// Metal context for mHC kernel execution.
 #[cfg(feature = "metal")]
 #[allow(dead_code)]
 pub struct MhcMetalContext {
-    device: Device,
-    queue: CommandQueue,
-    library: Library,
+    device: Retained<ProtocolObject<dyn MTLDevice>>,
+    queue: Retained<ProtocolObject<dyn MTLCommandQueue>>,
+    library: Retained<ProtocolObject<dyn MTLLibrary>>,
 
     // Compiled pipelines
-    compute_mappings_pipeline: ComputePipelineState,
-    apply_constraints_pipeline: ComputePipelineState,
-    apply_pre_mapping_pipeline: ComputePipelineState,
-    apply_post_res_mapping_pipeline: ComputePipelineState,
-    sinkhorn_backward_pipeline: ComputePipelineState,
-    compute_amax_gain_pipeline: ComputePipelineState,
-    expand_to_streams_pipeline: ComputePipelineState,
-    collapse_streams_pipeline: ComputePipelineState,
+    compute_mappings_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    apply_constraints_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    apply_pre_mapping_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    apply_post_res_mapping_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    sinkhorn_backward_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    compute_amax_gain_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    expand_to_streams_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
+    collapse_streams_pipeline: Retained<ProtocolObject<dyn MTLComputePipelineState>>,
 
     // Configuration
     config: MhcKernelConfig,
@@ -41,12 +51,18 @@ pub struct MhcMetalContext {
 #[cfg(feature = "metal")]
 impl MhcMetalContext {
     /// Create a new Metal context for mHC operations.
-    pub fn new(device: Device, config: MhcKernelConfig) -> Result<Self, MhcMetalError> {
-        let queue = device.new_command_queue();
+    pub fn new(
+        device: Retained<ProtocolObject<dyn MTLDevice>>,
+        config: MhcKernelConfig,
+    ) -> Result<Self, MhcMetalError> {
+        let queue = device
+            .newCommandQueue()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
 
-        // Compile shader library
+        // Compile shader library from source
+        let source = NSString::from_str(MHC_METAL_SHADERS);
         let library = device
-            .new_library_with_source(MHC_METAL_SHADERS, &metal::CompileOptions::new())
+            .newLibraryWithSource_options_error(&source, None)
             .map_err(|e| MhcMetalError::CompileError(e.to_string()))?;
 
         // Create compute pipelines
@@ -85,16 +101,19 @@ impl MhcMetalContext {
     }
 
     fn create_pipeline(
-        device: &Device,
-        library: &Library,
+        device: &ProtocolObject<dyn MTLDevice>,
+        library: &ProtocolObject<dyn MTLLibrary>,
         name: &str,
-    ) -> Result<ComputePipelineState, MhcMetalError> {
+    ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, MhcMetalError> {
+        let ns_name = NSString::from_str(name);
         let function = library
-            .get_function(name, None)
-            .map_err(|e| MhcMetalError::FunctionNotFound(name.to_string(), e.to_string()))?;
+            .newFunctionWithName(&ns_name)
+            .ok_or_else(|| {
+                MhcMetalError::FunctionNotFound(name.to_string(), "not found in library".into())
+            })?;
 
         device
-            .new_compute_pipeline_state_with_function(&function)
+            .newComputePipelineStateWithFunction_error(&function)
             .map_err(|e| MhcMetalError::PipelineError(name.to_string(), e.to_string()))
     }
 
@@ -149,49 +168,66 @@ impl MhcMetalContext {
         let config_buf = self.create_buffer_from_struct(&config_data)?;
 
         // Create command buffer
-        let cmd_buffer = self.queue.new_command_buffer();
-        let encoder = cmd_buffer.new_compute_command_encoder();
+        let cmd_buffer = self
+            .queue
+            .commandBuffer()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
+        let encoder = cmd_buffer
+            .computeCommandEncoder()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
 
         // Stage 1: Compute mappings (flatten + RMSNorm + project)
-        encoder.set_compute_pipeline_state(&self.compute_mappings_pipeline);
-        encoder.set_buffer(0, Some(&alpha_pre_buf), 0);
-        encoder.set_buffer(1, Some(&b_pre_buf), 0);
-        encoder.set_buffer(2, Some(&h_pre_buf), 0);
-        encoder.set_buffer(3, Some(&config_buf), 0);
+        encoder.setComputePipelineState(&self.compute_mappings_pipeline);
+        self.set_buffer(&encoder, 0, &alpha_pre_buf);
+        self.set_buffer(&encoder, 1, &b_pre_buf);
+        self.set_buffer(&encoder, 2, &h_pre_buf);
+        self.set_buffer(&encoder, 3, &config_buf);
 
-        let threads_per_group = MTLSize::new(self.config.compute_mappings_threads as u64, 1, 1);
-        let num_groups = MTLSize::new(((n * n) as u64).div_ceil(threads_per_group.width), 1, 1);
-        encoder.dispatch_thread_groups(num_groups, threads_per_group);
+        let threads_per_group = MTLSize {
+            width: self.config.compute_mappings_threads as usize,
+            height: 1,
+            depth: 1,
+        };
+        let num_groups = MTLSize {
+            width: (n * n).div_ceil(threads_per_group.width),
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threads_per_group);
 
         // Repeat for post and res (or use batch kernel)
-        encoder.set_buffer(0, Some(&alpha_post_buf), 0);
-        encoder.set_buffer(1, Some(&b_post_buf), 0);
-        encoder.set_buffer(2, Some(&h_post_buf), 0);
-        encoder.dispatch_thread_groups(num_groups, threads_per_group);
+        self.set_buffer(&encoder, 0, &alpha_post_buf);
+        self.set_buffer(&encoder, 1, &b_post_buf);
+        self.set_buffer(&encoder, 2, &h_post_buf);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threads_per_group);
 
-        encoder.set_buffer(0, Some(&alpha_res_buf), 0);
-        encoder.set_buffer(1, Some(&b_res_buf), 0);
-        encoder.set_buffer(2, Some(&h_res_buf), 0);
-        encoder.dispatch_thread_groups(num_groups, threads_per_group);
+        self.set_buffer(&encoder, 0, &alpha_res_buf);
+        self.set_buffer(&encoder, 1, &b_res_buf);
+        self.set_buffer(&encoder, 2, &h_res_buf);
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(num_groups, threads_per_group);
 
         // Stage 2: Apply Sinkhorn constraints
-        encoder.set_compute_pipeline_state(&self.apply_constraints_pipeline);
+        encoder.setComputePipelineState(&self.apply_constraints_pipeline);
         for buf in [&h_pre_buf, &h_post_buf, &h_res_buf] {
-            encoder.set_buffer(0, Some(buf), 0);
-            encoder.set_buffer(1, Some(&config_buf), 0);
+            self.set_buffer(&encoder, 0, buf);
+            self.set_buffer(&encoder, 1, &config_buf);
 
-            let sinkhorn_groups = MTLSize::new(
-                (n as u64).div_ceil(self.config.sinkhorn_threads as u64),
-                1,
-                1,
-            );
-            let sinkhorn_threads = MTLSize::new(self.config.sinkhorn_threads as u64, 1, 1);
-            encoder.dispatch_thread_groups(sinkhorn_groups, sinkhorn_threads);
+            let sinkhorn_groups = MTLSize {
+                width: n.div_ceil(self.config.sinkhorn_threads as usize),
+                height: 1,
+                depth: 1,
+            };
+            let sinkhorn_threads = MTLSize {
+                width: self.config.sinkhorn_threads as usize,
+                height: 1,
+                depth: 1,
+            };
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(sinkhorn_groups, sinkhorn_threads);
         }
 
-        encoder.end_encoding();
+        encoder.endEncoding();
         cmd_buffer.commit();
-        cmd_buffer.wait_until_completed();
+        cmd_buffer.waitUntilCompleted();
 
         // Read back results - reshape to include batch dimension (batch=1)
         let h_pre_raw = self.read_buffer::<f32>(&h_pre_buf, n * n)?;
@@ -236,22 +272,35 @@ impl MhcMetalContext {
         };
         let config_buf = self.create_buffer_from_struct(&config_data)?;
 
-        let cmd_buffer = self.queue.new_command_buffer();
-        let encoder = cmd_buffer.new_compute_command_encoder();
+        let cmd_buffer = self
+            .queue
+            .commandBuffer()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
+        let encoder = cmd_buffer
+            .computeCommandEncoder()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
 
-        encoder.set_compute_pipeline_state(&self.apply_pre_mapping_pipeline);
-        encoder.set_buffer(0, Some(&h_pre_buf), 0);
-        encoder.set_buffer(1, Some(&x_buf), 0);
-        encoder.set_buffer(2, Some(&out_buf), 0);
-        encoder.set_buffer(3, Some(&config_buf), 0);
+        encoder.setComputePipelineState(&self.apply_pre_mapping_pipeline);
+        self.set_buffer(&encoder, 0, &h_pre_buf);
+        self.set_buffer(&encoder, 1, &x_buf);
+        self.set_buffer(&encoder, 2, &out_buf);
+        self.set_buffer(&encoder, 3, &config_buf);
 
-        let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
-        let groups = MTLSize::new(((n * c) as u64).div_ceil(threads.width), 1, 1);
-        encoder.dispatch_thread_groups(groups, threads);
+        let threads = MTLSize {
+            width: self.config.apply_threads as usize,
+            height: 1,
+            depth: 1,
+        };
+        let groups = MTLSize {
+            width: (n * c).div_ceil(threads.width),
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
 
-        encoder.end_encoding();
+        encoder.endEncoding();
         cmd_buffer.commit();
-        cmd_buffer.wait_until_completed();
+        cmd_buffer.waitUntilCompleted();
 
         let result = self.read_buffer_to_array2(&out_buf, n, c)?;
 
@@ -284,24 +333,37 @@ impl MhcMetalContext {
         };
         let config_buf = self.create_buffer_from_struct(&config_data)?;
 
-        let cmd_buffer = self.queue.new_command_buffer();
-        let encoder = cmd_buffer.new_compute_command_encoder();
+        let cmd_buffer = self
+            .queue
+            .commandBuffer()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
+        let encoder = cmd_buffer
+            .computeCommandEncoder()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
 
-        encoder.set_compute_pipeline_state(&self.apply_post_res_mapping_pipeline);
-        encoder.set_buffer(0, Some(&h_res_buf), 0);
-        encoder.set_buffer(1, Some(&h_post_buf), 0);
-        encoder.set_buffer(2, Some(&x_buf), 0);
-        encoder.set_buffer(3, Some(&h_out_buf), 0);
-        encoder.set_buffer(4, Some(&out_buf), 0);
-        encoder.set_buffer(5, Some(&config_buf), 0);
+        encoder.setComputePipelineState(&self.apply_post_res_mapping_pipeline);
+        self.set_buffer(&encoder, 0, &h_res_buf);
+        self.set_buffer(&encoder, 1, &h_post_buf);
+        self.set_buffer(&encoder, 2, &x_buf);
+        self.set_buffer(&encoder, 3, &h_out_buf);
+        self.set_buffer(&encoder, 4, &out_buf);
+        self.set_buffer(&encoder, 5, &config_buf);
 
-        let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
-        let groups = MTLSize::new(((n * c) as u64).div_ceil(threads.width), 1, 1);
-        encoder.dispatch_thread_groups(groups, threads);
+        let threads = MTLSize {
+            width: self.config.apply_threads as usize,
+            height: 1,
+            depth: 1,
+        };
+        let groups = MTLSize {
+            width: (n * c).div_ceil(threads.width),
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
 
-        encoder.end_encoding();
+        encoder.endEncoding();
         cmd_buffer.commit();
-        cmd_buffer.wait_until_completed();
+        cmd_buffer.waitUntilCompleted();
 
         let result = self.read_buffer_to_array2(&out_buf, n, c)?;
 
@@ -330,21 +392,34 @@ impl MhcMetalContext {
         };
         let config_buf = self.create_buffer_from_struct(&config_data)?;
 
-        let cmd_buffer = self.queue.new_command_buffer();
-        let encoder = cmd_buffer.new_compute_command_encoder();
+        let cmd_buffer = self
+            .queue
+            .commandBuffer()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
+        let encoder = cmd_buffer
+            .computeCommandEncoder()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
 
-        encoder.set_compute_pipeline_state(&self.expand_to_streams_pipeline);
-        encoder.set_buffer(0, Some(&x_buf), 0);
-        encoder.set_buffer(1, Some(&out_buf), 0);
-        encoder.set_buffer(2, Some(&config_buf), 0);
+        encoder.setComputePipelineState(&self.expand_to_streams_pipeline);
+        self.set_buffer(&encoder, 0, &x_buf);
+        self.set_buffer(&encoder, 1, &out_buf);
+        self.set_buffer(&encoder, 2, &config_buf);
 
-        let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
-        let groups = MTLSize::new(((batch * n * c) as u64).div_ceil(threads.width), 1, 1);
-        encoder.dispatch_thread_groups(groups, threads);
+        let threads = MTLSize {
+            width: self.config.apply_threads as usize,
+            height: 1,
+            depth: 1,
+        };
+        let groups = MTLSize {
+            width: (batch * n * c).div_ceil(threads.width),
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
 
-        encoder.end_encoding();
+        encoder.endEncoding();
         cmd_buffer.commit();
-        cmd_buffer.wait_until_completed();
+        cmd_buffer.waitUntilCompleted();
 
         self.read_buffer_to_array2(&out_buf, n, c)
     }
@@ -369,21 +444,34 @@ impl MhcMetalContext {
         };
         let config_buf = self.create_buffer_from_struct(&config_data)?;
 
-        let cmd_buffer = self.queue.new_command_buffer();
-        let encoder = cmd_buffer.new_compute_command_encoder();
+        let cmd_buffer = self
+            .queue
+            .commandBuffer()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
+        let encoder = cmd_buffer
+            .computeCommandEncoder()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
 
-        encoder.set_compute_pipeline_state(&self.collapse_streams_pipeline);
-        encoder.set_buffer(0, Some(&x_buf), 0);
-        encoder.set_buffer(1, Some(&out_buf), 0);
-        encoder.set_buffer(2, Some(&config_buf), 0);
+        encoder.setComputePipelineState(&self.collapse_streams_pipeline);
+        self.set_buffer(&encoder, 0, &x_buf);
+        self.set_buffer(&encoder, 1, &out_buf);
+        self.set_buffer(&encoder, 2, &config_buf);
 
-        let threads = MTLSize::new(self.config.apply_threads as u64, 1, 1);
-        let groups = MTLSize::new((c as u64).div_ceil(threads.width), 1, 1);
-        encoder.dispatch_thread_groups(groups, threads);
+        let threads = MTLSize {
+            width: self.config.apply_threads as usize,
+            height: 1,
+            depth: 1,
+        };
+        let groups = MTLSize {
+            width: c.div_ceil(threads.width),
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(groups, threads);
 
-        encoder.end_encoding();
+        encoder.endEncoding();
         cmd_buffer.commit();
-        cmd_buffer.wait_until_completed();
+        cmd_buffer.waitUntilCompleted();
 
         self.read_buffer_to_array2(&out_buf, 1, c)
     }
@@ -401,20 +489,34 @@ impl MhcMetalContext {
         };
         let config_buf = self.create_buffer_from_struct(&config_data)?;
 
-        let cmd_buffer = self.queue.new_command_buffer();
-        let encoder = cmd_buffer.new_compute_command_encoder();
+        let cmd_buffer = self
+            .queue
+            .commandBuffer()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
+        let encoder = cmd_buffer
+            .computeCommandEncoder()
+            .ok_or(MhcMetalError::DeviceNotFound)?;
 
-        encoder.set_compute_pipeline_state(&self.compute_amax_gain_pipeline);
-        encoder.set_buffer(0, Some(&h_buf), 0);
-        encoder.set_buffer(1, Some(&out_buf), 0);
-        encoder.set_buffer(2, Some(&config_buf), 0);
+        encoder.setComputePipelineState(&self.compute_amax_gain_pipeline);
+        self.set_buffer(&encoder, 0, &h_buf);
+        self.set_buffer(&encoder, 1, &out_buf);
+        self.set_buffer(&encoder, 2, &config_buf);
 
-        let threads = MTLSize::new(self.config.sinkhorn_threads as u64, 1, 1);
-        encoder.dispatch_thread_groups(MTLSize::new(1, 1, 1), threads);
+        let threads = MTLSize {
+            width: self.config.sinkhorn_threads as usize,
+            height: 1,
+            depth: 1,
+        };
+        let unit = MTLSize {
+            width: 1,
+            height: 1,
+            depth: 1,
+        };
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(unit, threads);
 
-        encoder.end_encoding();
+        encoder.endEncoding();
         cmd_buffer.commit();
-        cmd_buffer.wait_until_completed();
+        cmd_buffer.waitUntilCompleted();
 
         let result = self.read_buffer::<f32>(&out_buf, 1)?;
         Ok(result[0])
@@ -422,50 +524,93 @@ impl MhcMetalContext {
 
     // Helper methods for buffer management
 
-    fn create_buffer_from_slice(&self, data: &[f32]) -> Result<Buffer, MhcMetalError> {
-        let buffer = self.device.new_buffer_with_data(
-            data.as_ptr() as *const _,
-            std::mem::size_of_val(data) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+    fn set_buffer(
+        &self,
+        encoder: &ProtocolObject<dyn MTLComputeCommandEncoder>,
+        index: usize,
+        buffer: &ProtocolObject<dyn MTLBuffer>,
+    ) {
+        // SAFETY: The buffer is a valid MTLBuffer created by our device, and the index
+        // corresponds to a valid argument in the compute pipeline.
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(buffer), 0, index);
+        }
+    }
+
+    fn create_buffer_from_slice(
+        &self,
+        data: &[f32],
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MhcMetalError> {
+        let size = std::mem::size_of_val(data);
+        let ptr = NonNull::new(data.as_ptr() as *mut std::ffi::c_void)
+            .ok_or(MhcMetalError::NonContiguousArray)?;
+        // SAFETY: ptr is a valid non-null pointer from a live slice, and size matches.
+        // Metal copies the data into the buffer.
+        let buffer = unsafe {
+            self.device
+                .newBufferWithBytes_length_options(
+                    ptr,
+                    size,
+                    MTLResourceOptions::StorageModeShared,
+                )
+        }
+        .ok_or(MhcMetalError::DeviceNotFound)?;
         Ok(buffer)
     }
 
-    fn create_buffer_from_array2(&self, data: &ArrayView2<f32>) -> Result<Buffer, MhcMetalError> {
+    fn create_buffer_from_array2(
+        &self,
+        data: &ArrayView2<f32>,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MhcMetalError> {
         let slice = data.as_slice().ok_or(MhcMetalError::NonContiguousArray)?;
         self.create_buffer_from_slice(slice)
     }
 
-    fn create_buffer_from_struct<T>(&self, data: &T) -> Result<Buffer, MhcMetalError> {
-        let buffer = self.device.new_buffer_with_data(
-            data as *const T as *const _,
-            std::mem::size_of::<T>() as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
+    fn create_buffer_from_struct<T>(
+        &self,
+        data: &T,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MhcMetalError> {
+        let size = std::mem::size_of::<T>();
+        let ptr = NonNull::new(data as *const T as *mut std::ffi::c_void)
+            .ok_or(MhcMetalError::NonContiguousArray)?;
+        // SAFETY: ptr is a valid non-null pointer to a T, and size matches.
+        let buffer = unsafe {
+            self.device
+                .newBufferWithBytes_length_options(
+                    ptr,
+                    size,
+                    MTLResourceOptions::StorageModeShared,
+                )
+        }
+        .ok_or(MhcMetalError::DeviceNotFound)?;
         Ok(buffer)
     }
 
-    fn create_empty_buffer<T>(&self, count: usize) -> Result<Buffer, MhcMetalError> {
-        let buffer = self.device.new_buffer(
-            (count * std::mem::size_of::<T>()) as u64,
-            MTLResourceOptions::StorageModeShared,
-        );
-        Ok(buffer)
+    fn create_empty_buffer<T>(
+        &self,
+        count: usize,
+    ) -> Result<Retained<ProtocolObject<dyn MTLBuffer>>, MhcMetalError> {
+        let size = count * std::mem::size_of::<T>();
+        self.device
+            .newBufferWithLength_options(size, MTLResourceOptions::StorageModeShared)
+            .ok_or(MhcMetalError::DeviceNotFound)
     }
 
     fn read_buffer<T: Clone>(
         &self,
-        buffer: &Buffer,
+        buffer: &ProtocolObject<dyn MTLBuffer>,
         count: usize,
     ) -> Result<Vec<T>, MhcMetalError> {
-        let ptr = buffer.contents() as *const T;
+        let ptr = buffer.contents().as_ptr() as *const T;
+        // SAFETY: the buffer was created with StorageModeShared and the GPU has completed,
+        // so the pointer is valid for `count` elements of T.
         let slice = unsafe { std::slice::from_raw_parts(ptr, count) };
         Ok(slice.to_vec())
     }
 
     fn read_buffer_to_array2(
         &self,
-        buffer: &Buffer,
+        buffer: &ProtocolObject<dyn MTLBuffer>,
         rows: usize,
         cols: usize,
     ) -> Result<Array2<f32>, MhcMetalError> {
@@ -474,6 +619,13 @@ impl MhcMetalContext {
             .map_err(|e| MhcMetalError::ShapeError(e.to_string()))
     }
 }
+
+// SAFETY: Metal protocol objects are thread-safe when used correctly.
+// We ensure GPU work completes before reading back results.
+#[cfg(feature = "metal")]
+unsafe impl Send for MhcMetalContext {}
+#[cfg(feature = "metal")]
+unsafe impl Sync for MhcMetalContext {}
 
 /// Configuration struct for mappings kernel.
 #[repr(C)]
@@ -542,7 +694,7 @@ impl std::error::Error for MhcMetalError {}
 /// Create a Metal context using the system default device.
 #[cfg(feature = "metal")]
 pub fn create_default_context(config: MhcKernelConfig) -> Result<MhcMetalContext, MhcMetalError> {
-    let device = Device::system_default().ok_or(MhcMetalError::DeviceNotFound)?;
+    let device = MTLCreateSystemDefaultDevice().ok_or(MhcMetalError::DeviceNotFound)?;
     MhcMetalContext::new(device, config)
 }
 

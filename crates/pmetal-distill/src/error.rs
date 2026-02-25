@@ -67,9 +67,9 @@ pub enum DistillError {
     #[error("YAML error: {0}")]
     Yaml(#[from] serde_yaml::Error),
 
-    /// Bincode serialization error.
-    #[error("Bincode error: {0}")]
-    Bincode(#[from] Box<bincode::ErrorKind>),
+    /// Bitcode serialization error.
+    #[error("Bitcode error: {0}")]
+    Bitcode(#[from] bitcode::Error),
 
     /// Layer mapping error.
     #[error("Layer mapping error: {0}")]

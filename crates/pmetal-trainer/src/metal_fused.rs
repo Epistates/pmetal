@@ -201,7 +201,7 @@ impl MetalFusedOptimizer {
         let mut batch = BatchedCommandBuffer::new(self.ctx.clone())?;
 
         // Queue gradient clipping if configured
-        if let (Some(ref clipper), Some(_max_norm)) = (&self.grad_clip, self.config.max_grad_norm) {
+        if let (Some(clipper), Some(_max_norm)) = (&self.grad_clip, self.config.max_grad_norm) {
             // Note: Full gradient clipping requires reading back the norm,
             // which adds a sync point. For now, we skip this optimization.
             // The fused optimizer still provides significant speedup.

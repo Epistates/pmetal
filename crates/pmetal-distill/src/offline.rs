@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufReader, BufWriter, Write};
+use std::io::{BufReader, BufWriter, Read as _, Write};
 use std::path::{Path, PathBuf};
 
 use mlx_rs::Array;
@@ -131,7 +131,7 @@ impl LogitCache {
         let mut writer = BufWriter::new(file);
 
         // Write compressed data
-        bincode::serialize_into(&mut writer, &compressed)?;
+        writer.write_all(&bitcode::serialize(&compressed)?)?;
         writer.flush()?;
 
         self.metadata.num_sequences = self.metadata.num_sequences.max(sequence_id + 1);
@@ -146,9 +146,11 @@ impl LogitCache {
     pub fn load_sequence(&self, sequence_id: usize) -> Result<Array> {
         let path = self.cache_dir.join(format!("seq_{:06}.bin", sequence_id));
         let file = File::open(&path)?;
-        let reader = BufReader::new(file);
+        let mut reader = BufReader::new(file);
 
-        let compressed: CompressedLogits = bincode::deserialize_from(reader)?;
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        let compressed: CompressedLogits = bitcode::deserialize(&bytes)?;
         let compressor = LogitCompressor::new(self.compression.clone(), self.top_k);
         compressor.decompress(&compressed, self.metadata.vocab_size)
     }

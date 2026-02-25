@@ -35,10 +35,10 @@ indicatif = { workspace = true }
 anyhow = { workspace = true }
 dirs = { workspace = true }
 chrono = "0.4"
-parquet = { version = "55", features = ["arrow"] }
-arrow-array = "55"
-arrow-json = "55"
-rand = "0.8"
+parquet = { workspace = true, features = ["arrow"] }
+arrow-array = { workspace = true }
+arrow-json = { workspace = true }
+rand = { workspace = true }
 regex = "1"
 tempfile = { workspace = true }
 tokenizers = { workspace = true }

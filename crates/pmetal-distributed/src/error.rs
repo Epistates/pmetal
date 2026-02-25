@@ -125,7 +125,7 @@ pub enum DistributedError {
 
     // === Serialization Errors ===
     #[error("Serialization error: {0}")]
-    Serialization(#[from] bincode::Error),
+    Serialization(#[from] bitcode::Error),
 
     // === Health Check Errors ===
     #[error("Health check failed for peer {peer}: {reason}")]

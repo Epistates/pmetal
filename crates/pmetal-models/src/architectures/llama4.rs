@@ -480,7 +480,7 @@ impl Llama4Attention {
         let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
 
         // QK normalization (applied before RoPE)
-        if let (Some(ref mut qn), Some(ref mut kn)) = (&mut self.q_norm, &mut self.k_norm) {
+        if let (Some(qn), Some(kn)) = (&mut self.q_norm, &mut self.k_norm) {
             q = Module::forward(qn, &q)?;
             k = Module::forward(kn, &k)?;
         }

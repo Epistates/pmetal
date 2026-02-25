@@ -21,7 +21,7 @@ use super::MergeMethod;
 use crate::{sign_consensus, MergeError, MergeParameters, Result};
 use mlx_rs::Array;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// DARE merge implementation.
 #[derive(Debug, Clone)]
@@ -82,13 +82,13 @@ impl DareMerge {
             Some(s) => {
                 let mut rng = StdRng::seed_from_u64(s);
                 (0..size)
-                    .map(|_| if rng.gen::<f32>() < density { 1.0 } else { 0.0 })
+                    .map(|_| if rng.random::<f32>() < density { 1.0 } else { 0.0 })
                     .collect()
             }
             None => {
-                let mut rng = rand::thread_rng();
+                let mut rng = rand::rng();
                 (0..size)
-                    .map(|_| if rng.gen::<f32>() < density { 1.0 } else { 0.0 })
+                    .map(|_| if rng.random::<f32>() < density { 1.0 } else { 0.0 })
                     .collect()
             }
         };

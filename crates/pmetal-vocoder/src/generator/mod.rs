@@ -178,9 +178,11 @@ impl BigVGAN {
 
     /// Load pretrained model from HuggingFace Hub.
     pub fn from_pretrained(model_id: &str) -> Result<Self> {
-        use hf_hub::api::sync::Api;
+        use hf_hub::api::sync::ApiBuilder;
 
-        let api = Api::new().map_err(|e| VocoderError::Hub(e.to_string()))?;
+        let api = ApiBuilder::from_env()
+            .build()
+            .map_err(|e| VocoderError::Hub(e.to_string()))?;
         let repo = api.model(model_id.to_string());
 
         // Download config

@@ -45,7 +45,7 @@ use super::MergeMethod;
 use crate::{sign_consensus, MergeError, MergeParameters, Result};
 use mlx_rs::Array;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// DELLA merge implementation.
 ///
@@ -232,15 +232,15 @@ impl DellaMerge {
             .collect();
 
         // Sample Bernoulli mask: keep[i] = 1 with probability (1 - drop_probs[i]).
-        let mut rng: Box<dyn rand::RngCore> = match self.seed {
+        let mut rng: Box<dyn rand::Rng> = match self.seed {
             Some(s) => Box::new(StdRng::seed_from_u64(s)),
-            None => Box::new(rand::thread_rng()),
+            None => Box::new(rand::rng()),
         };
 
         let mut result_vals = vec![0.0_f32; n];
         for i in 0..n {
             let keep_prob = 1.0 - drop_probs[i];
-            if rng.gen::<f32>() < keep_prob {
+            if rng.random::<f32>() < keep_prob {
                 // Rescale to maintain expected value: divide by keep probability.
                 result_vals[i] = values[i] / keep_prob;
             }

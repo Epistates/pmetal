@@ -79,9 +79,9 @@ impl MhcParams {
         }
 
         // Initialize projections with small random values
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         let std_dev = 0.02; // Small initialization
-        let normal = Normal::new(0.0, std_dev).unwrap();
+        let normal = Normal::new(0.0, std_dev).expect("valid std_dev");
 
         let phi_pre = Array2::from_shape_fn((nc, n), |_| normal.sample(&mut rng) as f32);
         let phi_post = Array2::from_shape_fn((nc, n), |_| normal.sample(&mut rng) as f32);
@@ -111,8 +111,8 @@ impl MhcParams {
         let nc = n * c;
         let n_sq = n * n;
 
-        let mut rng = rand::thread_rng();
-        let uniform = Uniform::new(-1.0, 1.0);
+        let mut rng = rand::rng();
+        let uniform = Uniform::new(-1.0, 1.0).expect("valid range");
 
         Self {
             alpha_pre: config.alpha_init,
