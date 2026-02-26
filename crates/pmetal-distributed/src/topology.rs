@@ -605,10 +605,10 @@ mod tests {
         assert!(!topology.has_thunderbolt_ring());
 
         // Update local node with Thunderbolt address
-        if let Some(idx) = topology.peer_to_node.get(&local_id) {
-            if let Some(node) = topology.graph.node_weight_mut(*idx) {
-                node.socket_addr = Some("169.254.1.1:5000".parse().unwrap());
-            }
+        if let Some(idx) = topology.peer_to_node.get(&local_id)
+            && let Some(node) = topology.graph.node_weight_mut(*idx)
+        {
+            node.socket_addr = Some("169.254.1.1:5000".parse().unwrap());
         }
 
         // Now should be a Thunderbolt ring
