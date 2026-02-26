@@ -4428,6 +4428,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "pmetal"
+version = "0.1.0"
+dependencies = [
+ "pmetal-core",
+ "pmetal-data",
+ "pmetal-distill",
+ "pmetal-distributed",
+ "pmetal-gguf",
+ "pmetal-hub",
+ "pmetal-lora",
+ "pmetal-merge",
+ "pmetal-metal",
+ "pmetal-mhc",
+ "pmetal-mlx",
+ "pmetal-models",
+ "pmetal-trainer",
+ "pmetal-vocoder",
+]
+
+[[package]]
 name = "pmetal-cli"
 version = "0.1.0"
 dependencies = [

@@ -8,6 +8,7 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
 
 jobs:
   build:
@@ -27,7 +28,7 @@ jobs:
           shared-key: aarch64-apple-darwin
 
       - name: Build
-        run: cargo build --release --target aarch64-apple-darwin
+        run: cargo build --release --target aarch64-apple-darwin -p pmetal-cli
 
       # Optional code signing (requires secrets to be configured)
       - name: Import Apple Code Signing Certificate
@@ -42,14 +43,13 @@ jobs:
           BINARY="target/aarch64-apple-darwin/release/pmetal"
           CERT_IMPORTED=false
 
-          # Check if certificate was imported (if secrets exist, cert should be imported)
           if security find-identity -v -p codesigning | grep -q "Developer ID Application"; then
             CERT_IMPORTED=true
           fi
 
           if [ "$CERT_IMPORTED" = "true" ]; then
             echo "Signing with Developer ID..."
-            codesign --deep --force --verify --verbose \
+            codesign --force --verify --verbose \
               --timestamp --options runtime \
               --sign "${{ secrets.APPLE_DEVELOPER_ID }}" \
               "$BINARY"
@@ -64,6 +64,8 @@ jobs:
               --team-id "${{ secrets.APPLE_TEAM_ID }}" \
               --wait \
               --timeout 30m
+
+            rm -f pmetal-notarize.zip
 
             echo "Note: Stapling is not applicable to bare CLI binaries"
             echo "Binary is notarized server-side - users will be verified online"
@@ -99,12 +101,14 @@ jobs:
 
           # Create tar.gz to preserve permissions
           tar -czf "artifacts/${BINARY}.tar.gz" "$BINARY"
-          shasum -a 256 "$BINARY" > "artifacts/${BINARY}.sha256"
+
+          # Checksum the archive (what users download and verify)
+          shasum -a 256 "artifacts/${BINARY}.tar.gz" > "artifacts/${BINARY}.tar.gz.sha256"
 
           echo "Binary info:"
           ls -lh "$BINARY"
           file "$BINARY"
-          cat "artifacts/${BINARY}.sha256"
+          cat "artifacts/${BINARY}.tar.gz.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -112,7 +116,7 @@ jobs:
           name: aarch64-apple-darwin
           path: artifacts/*
           if-no-files-found: error
-          retention-days: 7
+          retention-days: ${{ startsWith(github.ref, 'refs/tags/v') && 7 || 1 }}
 
   release:
     name: Create Release
@@ -148,7 +152,7 @@ jobs:
           done
 
           # Generate combined checksums for archives
-          sha256sum *.tar.gz > SHA256SUMS
+          sha256sum *.tar.gz 2>/dev/null > SHA256SUMS || true
           cat SHA256SUMS
 
       - name: Create Release

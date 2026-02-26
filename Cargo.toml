@@ -16,6 +16,7 @@ members = [
     "crates/pmetal-distill",
     "crates/pmetal-distributed",
     "crates/pmetal-mhc",
+    "crates/pmetal",
     "crates/pmetal-cli",
 ]
 

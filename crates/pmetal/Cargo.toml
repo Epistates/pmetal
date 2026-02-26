@@ -1,0 +1,57 @@
+[package]
+name = "pmetal"
+description = "High-performance LLM fine-tuning framework for Apple Silicon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[features]
+default = ["core", "gguf", "metal", "hub", "mlx", "models", "lora", "trainer"]
+
+# Foundation crates (no mlx-rs dependency)
+core = ["dep:pmetal-core"]
+gguf = ["dep:pmetal-gguf", "core"]
+metal = ["dep:pmetal-metal", "core"]
+hub = ["dep:pmetal-hub", "core"]
+distributed = ["dep:pmetal-distributed"]
+mhc = ["dep:pmetal-mhc", "core", "metal"]
+
+# MLX-dependent crates
+mlx = ["dep:pmetal-mlx", "core", "metal"]
+models = ["dep:pmetal-models", "core", "gguf", "metal", "mlx"]
+lora = ["dep:pmetal-lora", "dep:pmetal-metal", "core", "gguf", "metal", "mlx", "models", "pmetal-lora/metal-fused"]
+data = ["dep:pmetal-data", "core", "mlx"]
+trainer = ["dep:pmetal-trainer", "core", "mlx", "metal", "lora", "models", "data", "distill"]
+distill = ["dep:pmetal-distill", "core", "mlx", "metal"]
+merge = ["dep:pmetal-merge", "core", "mlx"]
+vocoder = ["dep:pmetal-vocoder", "core", "mlx"]
+
+# Everything
+full = [
+    "core", "gguf", "metal", "hub", "distributed", "mhc",
+    "mlx", "models", "lora", "data", "trainer",
+    "distill", "merge", "vocoder",
+]
+
+[dependencies]
+pmetal-core = { workspace = true, optional = true }
+pmetal-gguf = { workspace = true, optional = true }
+pmetal-metal = { workspace = true, optional = true }
+pmetal-hub = { workspace = true, optional = true }
+pmetal-distributed = { workspace = true, optional = true }
+pmetal-mhc = { workspace = true, optional = true }
+pmetal-mlx = { workspace = true, optional = true }
+pmetal-models = { workspace = true, optional = true }
+pmetal-lora = { workspace = true, optional = true }
+pmetal-data = { workspace = true, optional = true }
+pmetal-trainer = { workspace = true, optional = true }
+pmetal-distill = { workspace = true, optional = true }
+pmetal-merge = { workspace = true, optional = true }
+pmetal-vocoder = { workspace = true, optional = true }
+
+[lints]
+workspace = true
