@@ -6,9 +6,12 @@ on:
       - 'v*'
   workflow_dispatch:
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
   build:
-    name: Build for Apple Silicon
+    name: Build (aarch64-apple-darwin)
     runs-on: macos-latest
 
     steps:
@@ -21,6 +24,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: aarch64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
+          shared-key: aarch64-apple-darwin
 
       - name: Build
         run: cargo build --release --target aarch64-apple-darwin
@@ -75,20 +79,32 @@ jobs:
             echo "Binary ad-hoc signed (users may see Gatekeeper warning)"
           fi
 
+      - name: Determine version
+        id: version
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            echo "version=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Prepare artifacts
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p artifacts
-          BINARY="pmetal-aarch64-apple-darwin"
+          BINARY="pmetal-${VERSION}-aarch64-apple-darwin"
           cp "target/aarch64-apple-darwin/release/pmetal" "$BINARY"
           chmod +x "$BINARY"
 
           # Create tar.gz to preserve permissions
-          tar -czf "artifacts/$BINARY.tar.gz" "$BINARY"
-          shasum -a 256 "$BINARY" > "artifacts/$BINARY.sha256"
+          tar -czf "artifacts/${BINARY}.tar.gz" "$BINARY"
+          shasum -a 256 "$BINARY" > "artifacts/${BINARY}.sha256"
 
           echo "Binary info:"
           ls -lh "$BINARY"
-          cat "artifacts/$BINARY.sha256"
+          file "$BINARY"
+          cat "artifacts/${BINARY}.sha256"
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -123,8 +139,15 @@ jobs:
           echo "Release contents:"
           ls -lah final-release/
 
-          # Generate combined checksums
+          echo "Verifying archive integrity:"
           cd final-release
+          for archive in *.tar.gz; do
+            [ -f "$archive" ] || continue
+            echo "Testing $archive:"
+            tar -tzf "$archive" | head -5
+          done
+
+          # Generate combined checksums for archives
           sha256sum *.tar.gz > SHA256SUMS
           cat SHA256SUMS
 

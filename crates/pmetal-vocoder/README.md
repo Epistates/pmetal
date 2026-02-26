@@ -77,10 +77,6 @@ let audio = vocoder.forward(&mel)?;
 | `audio` | Audio processing utilities |
 | `loss` | Training loss functions |
 
-## Status
-
-This crate is under active development. Core architecture is implemented but some utilities are pending completion.
-
 ## License
 
 MIT OR Apache-2.0
