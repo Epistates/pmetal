@@ -97,9 +97,7 @@ pub mod prelude {
 
     // MLX prelude minus Dtype (use mlx::Dtype explicitly to avoid ambiguity with core::Dtype)
     #[cfg(feature = "mlx")]
-    pub use pmetal_mlx::prelude::{
-        Array, Builder, Module, ModuleParameters, Param,
-    };
+    pub use pmetal_mlx::prelude::{Array, Builder, Module, ModuleParameters, Param};
 
     #[cfg(feature = "distributed")]
     pub use pmetal_distributed::prelude::*;
