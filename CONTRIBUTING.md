@@ -10,7 +10,7 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 ### Prerequisites
 
-- **Rust 1.82+**: Install via [rustup](https://rustup.rs/)
+- **Rust 1.85+**: Install via [rustup](https://rustup.rs/)
 - **macOS**: PMetal targets Apple Silicon exclusively
 - **Xcode Command Line Tools**: `xcode-select --install`
 - **Metal Toolchain**: `xcodebuild -downloadComponent MetalToolchain`
@@ -114,7 +114,7 @@ crates/
 ├── pmetal-distill/    # Knowledge distillation
 ├── pmetal-merge/      # Model merging algorithms
 ├── pmetal-gguf/       # GGUF format support
-├── pmetal-mhc/        # Memory-efficient Hierarchical Context
+├── pmetal-mhc/        # Manifold-Constrained Hyper-Connections
 ├── pmetal-distributed/# Distributed training
 ├── pmetal-vocoder/    # BigVGAN vocoder
 └── pmetal-cli/        # Command-line interface
