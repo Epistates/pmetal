@@ -20,8 +20,8 @@ safetensors = { workspace = true }
 hf-hub = { workspace = true }
 tracing = { workspace = true }
 num-traits = { workspace = true }
-half = { version = "2.4", features = ["bytemuck"] }
-bytemuck = { version = "1.14", features = ["derive"] }
+half = { workspace = true }
+bytemuck = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

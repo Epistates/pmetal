@@ -44,10 +44,11 @@ pmetal-vocoder = { path = "crates/pmetal-vocoder", version = "0.1.0" }
 pmetal-merge = { path = "crates/pmetal-merge", version = "0.1.0" }
 pmetal-distill = { path = "crates/pmetal-distill", version = "0.1.0" }
 pmetal-mhc = { path = "crates/pmetal-mhc", version = "0.1.0" }
+pmetal-distributed = { path = "crates/pmetal-distributed", version = "0.1.0" }
 
-# MLX bindings - using local fork for development
-mlx-rs = { path = "../reference/mlx-rs/mlx-rs", features = ["safetensors"] }
-mlx-sys = { path = "../reference/mlx-rs/mlx-sys" }
+# MLX bindings - upstream, pinned to commit including our RandomState PR (#321)
+mlx-rs = { git = "https://github.com/oxiglade/mlx-rs", rev = "d76d3888", features = ["safetensors"] }
+mlx-sys = { git = "https://github.com/oxiglade/mlx-rs", rev = "d76d3888" }
 
 # Async runtime
 tokio = { version = "1.49", features = ["full"] }
@@ -84,6 +85,17 @@ base64 = "0.22"
 
 # Serialization (binary)
 bitcode = { version = "0.6", features = ["serde"] }
+
+# Metal bindings (modern objc2 ecosystem)
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSData", "NSError", "NSString"] }
+objc2-metal = { version = "0.3", features = [
+    "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder",
+    "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary",
+    "MTLBuffer", "MTLResource", "MTLEvent", "MTLFence",
+] }
+dispatch2 = "0.3"
+block2 = "0.6"
 
 # Utilities
 bytemuck = { version = "1", features = ["derive"] }
@@ -124,7 +136,3 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
 
-# Use local mlx-rs for development
-[patch.crates-io]
-mlx-rs = { path = "../reference/mlx-rs/mlx-rs" }
-mlx-sys = { path = "../reference/mlx-rs/mlx-sys" }

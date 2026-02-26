@@ -19,7 +19,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 bytemuck = { workspace = true }
 num-traits = { workspace = true }
-half = { version = "2", features = ["bytemuck"] }
+half = { workspace = true }
 
 [lints]
 workspace = true

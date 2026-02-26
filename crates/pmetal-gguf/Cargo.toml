@@ -12,7 +12,7 @@ categories.workspace = true
 [dependencies]
 pmetal-core = { workspace = true }
 byteorder = "1.5"
-half = { version = "2.4", features = ["bytemuck"] }
+half = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]

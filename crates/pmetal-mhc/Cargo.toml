@@ -15,7 +15,7 @@ pmetal-metal = { workspace = true, optional = true }
 
 # Math
 ndarray = { workspace = true, features = ["serde"] }
-num-traits = "0.2"
+num-traits = { workspace = true }
 
 # Async - use workspace
 tokio = { workspace = true }
@@ -37,13 +37,9 @@ rand = { workspace = true }
 rand_distr = "0.6"
 
 # Metal (optional, using modern objc2 ecosystem)
-objc2 = { version = "0.6", optional = true }
-objc2-foundation = { version = "0.3", optional = true, features = ["NSData", "NSError", "NSString"] }
-objc2-metal = { version = "0.3", optional = true, features = [
-    "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder",
-    "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary",
-    "MTLBuffer", "MTLResource",
-] }
+objc2 = { workspace = true, optional = true }
+objc2-foundation = { workspace = true, optional = true }
+objc2-metal = { workspace = true, optional = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }

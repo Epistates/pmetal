@@ -29,7 +29,7 @@ tracing = { workspace = true }
 mlx-sys = { workspace = true }
 
 [dev-dependencies]
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { workspace = true, features = ["html_reports"] }
 
 [[bench]]
 name = "memory_benchmark"

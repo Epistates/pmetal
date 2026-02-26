@@ -20,7 +20,7 @@ anyhow = { workspace = true }
 futures = "0.3"
 bytes = "1.5"
 async-trait = "0.1"
-bytemuck = { version = "1.14", features = ["derive"] }
+bytemuck = { workspace = true }
 
 # Peer discovery and networking (libp2p stack)
 libp2p = { version = "0.56", features = [
@@ -48,3 +48,6 @@ rand = { workspace = true }
 parking_lot = "0.12"
 half = { workspace = true }
 ordered-float = "5"
+
+[lints]
+workspace = true

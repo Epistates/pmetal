@@ -36,7 +36,7 @@ tensorboard-rs = { version = "0.5", optional = true }
 
 [dev-dependencies]
 serial_test = "3.2.0"
-tempfile = "3.17"
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

@@ -15,12 +15,11 @@ build = "build.rs"
 pmetal-core = { workspace = true }
 
 # Metal bindings (modern objc2 ecosystem)
-# Using default features which include most Metal types we need
-objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSData", "NSError", "NSString"] }
-objc2-metal = { version = "0.3", features = ["MTLEvent", "MTLFence"] }
-dispatch2 = "0.3"
-block2 = "0.6"
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-metal = { workspace = true }
+dispatch2 = { workspace = true }
+block2 = { workspace = true }
 
 # Numeric types
 half = { workspace = true }
