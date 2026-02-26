@@ -46,9 +46,9 @@
 //! let undesirable = KtoSample::undesirable(prompt_ids, response_ids);
 //! ```
 
+use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::Array;
 use pmetal_core::TrainingConfig;
 
 /// Error type for KTO training.

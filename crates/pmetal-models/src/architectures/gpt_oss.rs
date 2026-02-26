@@ -23,15 +23,15 @@
 //! - Apache 2.0 license
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
     module::{Module, ModuleParameters as ModuleParametersTrait},
     nn,
     ops::indexing::IndexOp,
-    Array,
 };
-use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};
@@ -1260,10 +1260,12 @@ mod tests {
     fn test_lora_config_default_target_modules() {
         let lora_config = LoraConfig::default();
         // Default targets attention projections
-        assert!(lora_config
-            .target_modules
-            .iter()
-            .any(|m| m == "q_proj" || m.contains("q_proj")));
+        assert!(
+            lora_config
+                .target_modules
+                .iter()
+                .any(|m| m == "q_proj" || m.contains("q_proj"))
+        );
     }
 
     #[test]

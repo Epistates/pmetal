@@ -218,7 +218,7 @@ impl GradientCompressor {
         }
 
         // Extract indices and values
-        let mut indices: Vec<u32> = heap.iter().map(|x| x.0 .1).collect();
+        let mut indices: Vec<u32> = heap.iter().map(|x| x.0.1).collect();
         indices.sort_unstable();
 
         let values: Vec<f32> = indices.iter().map(|&i| gradients[i as usize]).collect();

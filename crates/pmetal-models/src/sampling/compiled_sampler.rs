@@ -53,15 +53,15 @@
 //! let token2 = sampler.sample(&logits)?;  // Different random key used
 //! ```
 
+use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::{
     argpartition_axis, argsort_axis, cumsum, exp,
-    indexing::{argmax, put_along_axis, take_along_axis, IndexOp},
+    indexing::{IndexOp, argmax, put_along_axis, take_along_axis},
     logsumexp_axis, which, zeros_like,
 };
-use mlx_rs::random::{categorical, RandomState};
+use mlx_rs::random::{RandomState, categorical};
 use mlx_rs::utils::Updatable;
-use mlx_rs::Array;
 
 // ============================================================================
 // SamplerState - Composite state for compiled sampling
@@ -418,11 +418,7 @@ impl CompiledSampler {
         }
 
         // Squeeze back once at end
-        if was_1d {
-            result.squeeze()
-        } else {
-            Ok(result)
-        }
+        if was_1d { result.squeeze() } else { Ok(result) }
     }
 
     /// Sample and immediately extract the token ID.

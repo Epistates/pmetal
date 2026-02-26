@@ -1,8 +1,8 @@
 //! DataLoader for creating training batches.
 
 use mlx_rs::Array;
-use rand::seq::SliceRandom;
 use rand::SeedableRng;
+use rand::seq::SliceRandom;
 use std::sync::Arc;
 
 use super::{Sample, TrainingDataset};

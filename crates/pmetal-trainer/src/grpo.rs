@@ -20,9 +20,9 @@
 //! - `pi` is the policy model (trainable)
 //! - `pi_ref` is the reference model (frozen)
 
+use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::Array;
 use pmetal_core::TrainingConfig;
 
 /// Error type for GRPO training.

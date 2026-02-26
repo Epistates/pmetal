@@ -7,11 +7,11 @@
 //! - Checkpoint saving
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     ops::indexing::IndexOp,
     optimizers::{AdamW, AdamWBuilder},
-    Array,
 };
 use pmetal_core::{EvalMetrics, TrainingConfig};
 use pmetal_lora::LoraLinear;

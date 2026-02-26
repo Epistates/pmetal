@@ -5,11 +5,11 @@
 
 #![allow(clippy::expect_fun_call)]
 
-use mlx_rs::random::uniform;
 use mlx_rs::Array;
+use mlx_rs::random::uniform;
 use pmetal_mlx::kernels::{
-    compute_attention_gradients, differentiable_attention, init_training_context,
-    with_training_mode, FusedAttentionConfig,
+    FusedAttentionConfig, compute_attention_gradients, differentiable_attention,
+    init_training_context, with_training_mode,
 };
 
 fn random_tensor(shape: &[i32]) -> Array {

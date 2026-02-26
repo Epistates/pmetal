@@ -6,8 +6,8 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use mlx_rs::module::ModuleParametersExt;
 use mlx_rs::Array;
+use mlx_rs::module::ModuleParametersExt;
 
 use crate::architectures::gemma::GemmaForCausalLM;
 use crate::architectures::llama::{LlamaConfig, LlamaForCausalLM};

@@ -42,11 +42,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use mlx_rs::{
+    Array,
     error::Exception,
     module::{FlattenedModuleParam, ModuleParameters},
     optimizers::Optimizer,
     utils::Updatable,
-    Array,
 };
 
 use crate::Result;
@@ -588,7 +588,9 @@ pub mod raw_ffi {
     unsafe extern "C" fn rust_closure_destructor(payload: *mut std::ffi::c_void) {
         if !payload.is_null() {
             // SAFETY: We created this pointer from a Box<RustClosureFn> via Box::into_raw
-            unsafe { let _ = Box::from_raw(payload as *mut RustClosureFn); }
+            unsafe {
+                let _ = Box::from_raw(payload as *mut RustClosureFn);
+            }
         }
     }
 

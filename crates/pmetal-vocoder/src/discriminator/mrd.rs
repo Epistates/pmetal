@@ -4,7 +4,7 @@
 //! both fine-grained and coarse spectral details.
 
 use super::DiscriminatorOutput;
-use crate::audio::{stft, StftConfig};
+use crate::audio::{StftConfig, stft};
 use crate::error::Result;
 use crate::nn::WeightNormConv1d;
 use mlx_rs::Array;

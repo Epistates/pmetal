@@ -16,7 +16,7 @@ pub mod metal_shaders;
 // Re-exports
 pub use metal_impl::MhcMetalError;
 #[cfg(feature = "metal")]
-pub use metal_impl::{create_default_context, MhcMetalContext};
+pub use metal_impl::{MhcMetalContext, create_default_context};
 
 /// Metal shader source code.
 pub const MHC_METAL_SHADERS: &str = include_str!("metal_shaders.metal");

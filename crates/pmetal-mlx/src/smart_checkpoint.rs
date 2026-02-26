@@ -15,7 +15,7 @@
 //! - Smart checkpointing: ~70-80% memory reduction
 //! - With offloading: Up to 90% reduction (slower)
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 use std::collections::HashMap;
 use std::path::Path;
 

@@ -52,7 +52,7 @@
 //! - [The Road Less Scheduled](https://arxiv.org/abs/2405.15682)
 //! - [Facebook Research Implementation](https://github.com/facebookresearch/schedule_free)
 
-use mlx_rs::{array, Array};
+use mlx_rs::{Array, array};
 
 /// Error type for Schedule-Free optimizer.
 #[derive(Debug, thiserror::Error)]

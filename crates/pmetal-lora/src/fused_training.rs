@@ -17,7 +17,7 @@
 //! When Metal is not available (or the feature is disabled), the module
 //! provides a pure MLX fallback that maintains API compatibility.
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 use tracing::{debug, warn};
 
 #[cfg(feature = "metal-fused")]
@@ -27,8 +27,8 @@ use std::sync::Arc;
 
 #[cfg(feature = "metal-fused")]
 use pmetal_metal::{
-    bridge::metal_buffer_from_ptr, BufferUsage, FusedLora, FusedLoraConfig, FusedLoraOutput,
-    MetalBuffer, MetalContext,
+    BufferUsage, FusedLora, FusedLoraConfig, FusedLoraOutput, MetalBuffer, MetalContext,
+    bridge::metal_buffer_from_ptr,
 };
 
 /// Error type for fused training operations.

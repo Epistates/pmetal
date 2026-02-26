@@ -16,8 +16,8 @@
 use std::collections::HashMap;
 
 use mlx_rs::{
-    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
-    ops::indexing::IndexOp, Array,
+    Array, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
+    ops::indexing::IndexOp,
 };
 use pmetal_mlx::kernels::rope::apply_rope;
 use pmetal_mlx::kv_cache::KVCache;

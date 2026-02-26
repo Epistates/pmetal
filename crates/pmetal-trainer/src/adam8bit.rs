@@ -40,9 +40,9 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use mlx_rs::{
+    Array, Dtype,
     error::{Exception, Result},
     ops::indexing::IndexOp,
-    Array, Dtype,
 };
 
 /// Error type for 8-bit Adam operations.

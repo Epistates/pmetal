@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use mlx_rs::{
-    error::Exception, module::ModuleParameters, nn, ops::indexing::IndexOp, optimizers::Optimizer,
-    transforms::eval_params, Array,
+    Array, error::Exception, module::ModuleParameters, nn, ops::indexing::IndexOp,
+    optimizers::Optimizer, transforms::eval_params,
 };
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_lora::LlamaLoraForCausalLM;

@@ -44,7 +44,7 @@
 
 use std::cell::RefCell;
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 use pmetal_core::LoraConfig;
 use pmetal_mlx::quantization::{
     NF4Config, NF4Quantizer, QuantScheme, QuantizedTensor, QuantizerOps,

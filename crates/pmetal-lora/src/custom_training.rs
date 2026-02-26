@@ -47,7 +47,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 
 use crate::autograd::{AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads};
 use crate::{LoraError, LoraLinear};

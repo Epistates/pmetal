@@ -12,18 +12,19 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     module::{ModuleParamMut, ModuleParamRef, ModuleParameters, Param},
     nested::NestedValue,
-    nn, Array,
+    nn,
 };
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kernels::{
-    differentiable_attention, fused_sdpa, get_training_context, rope::apply_rope,
-    AttentionMaskType, FusedAttentionConfig,
+    AttentionMaskType, FusedAttentionConfig, differentiable_attention, fused_sdpa,
+    get_training_context, rope::apply_rope,
 };
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::qwen3::Qwen3Config;
@@ -635,7 +636,9 @@ impl Qwen3LoraModel {
             // MLX's lazy evaluation with unified memory handles memory pressure reasonably well.
             // True gradient checkpointing (save/recompute) would require custom VJP implementation.
             if checkpointing_enabled && (idx + 1) % layers_per_block == 0 {
-                tracing::warn!("Gradient checkpointing requested but not yet implemented - no memory savings applied");
+                tracing::warn!(
+                    "Gradient checkpointing requested but not yet implemented - no memory savings applied"
+                );
             }
         }
 

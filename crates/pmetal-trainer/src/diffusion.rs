@@ -15,19 +15,19 @@
 use std::collections::HashMap;
 
 use mlx_rs::{
+    Array, Dtype,
     builder::Builder,
     error::Exception,
     module::{FlattenedModuleParam, ModuleParameters},
     nn,
     optimizers::{AdamWBuilder, Optimizer},
     transforms::eval_params,
-    Array, Dtype,
 };
 use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
 use pmetal_data::{DataLoader, DataLoaderConfig, TrainingBatch, TrainingDataset};
 use pmetal_lora::TrainableModel;
 use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
-use rand::{rngs::StdRng, RngExt as _, SeedableRng};
+use rand::{RngExt as _, SeedableRng, rngs::StdRng};
 
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
 

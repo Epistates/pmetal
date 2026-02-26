@@ -1,9 +1,9 @@
 //! Benchmarks for mHC Metal kernels.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use ndarray::Array3;
 use pmetal_mhc::{
-    apply_post_res_mapping, apply_pre_mapping, compute_mappings, MhcConfig, MhcParams, MhcPreset,
+    MhcConfig, MhcParams, MhcPreset, apply_post_res_mapping, apply_pre_mapping, compute_mappings,
 };
 
 fn bench_compute_mappings(c: &mut Criterion) {

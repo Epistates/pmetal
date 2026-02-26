@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 
 /// Configuration common to all causal LM architectures.
 ///
@@ -109,7 +109,7 @@ pub trait LoraCapable: CausalLMModel {
 
     /// Convert to LoRA-enabled model with the given configuration.
     fn into_lora(self, lora_config: &pmetal_core::LoraConfig)
-        -> Result<Self::LoraModel, Exception>;
+    -> Result<Self::LoraModel, Exception>;
 }
 
 /// Trait for models that can be quantized.

@@ -588,7 +588,7 @@ impl Default for SequencePacker {
 // MLX Training Integration
 // =============================================================================
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 
 /// A packed batch ready for training with MLX Arrays.
 ///
@@ -765,8 +765,8 @@ impl PackedDataLoader {
     pub fn reset(&mut self, new_seed: Option<u64>) {
         self.position = 0;
         if self.shuffle {
-            use rand::seq::SliceRandom;
             use rand::SeedableRng;
+            use rand::seq::SliceRandom;
             let seed = new_seed.unwrap_or(self.seed);
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             self.batches.shuffle(&mut rng);

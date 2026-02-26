@@ -42,7 +42,7 @@ pub use fused_distill::{
 };
 pub use fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use fused_merge::{
-    build_merge_config, build_tensor_info, FusedMergeMetal, MergeConfig, TensorInfo,
+    FusedMergeMetal, MergeConfig, TensorInfo, build_merge_config, build_tensor_info,
 };
 pub use fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};

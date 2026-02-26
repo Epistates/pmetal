@@ -17,15 +17,15 @@
 //! - `phi-4` (14B, 16K context)
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
     module::{Module, Param},
     nn::{self, Embedding, Linear, RopeBuilder},
     ops::indexing::IndexOp,
-    Array,
 };
-use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 
 use crate::traits::{CausalLMModel, ModelConfig};

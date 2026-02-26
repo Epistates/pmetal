@@ -23,12 +23,11 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use mlx_rs::{
-    array,
+    Array, array,
     builder::Builder,
     error::{Exception, Result},
     optimizers::{AdamW, AdamWBuilder, Optimizer, State},
     utils::Updatable,
-    Array,
 };
 
 use crate::ParameterGroupConfig;

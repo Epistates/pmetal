@@ -30,7 +30,7 @@
 //! let trainer = GspoTrainer::new(config)?;
 //! ```
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 
 /// Error type for GSPO training.
 #[derive(Debug, thiserror::Error)]

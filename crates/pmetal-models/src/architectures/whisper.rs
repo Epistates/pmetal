@@ -36,13 +36,13 @@
 //! - Implementation based on: candle-transformers/src/models/whisper
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
     module::{Module, Param},
     nn,
     ops::{indexing::IndexOp, softmax_axis},
-    Array,
 };
 use serde::{Deserialize, Serialize};
 

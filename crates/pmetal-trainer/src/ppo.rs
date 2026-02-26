@@ -27,9 +27,9 @@
 //! - "Proximal Policy Optimization Algorithms" (Schulman et al., 2017)
 //! - TRL/Unsloth implementations
 
+use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::Array;
 use pmetal_core::TrainingConfig;
 
 /// Error type for PPO training.

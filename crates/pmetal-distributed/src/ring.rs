@@ -1,8 +1,8 @@
 use crate::{
+    DistributedBackend,
     config::DistributedConfig,
     error::DistributedError,
     transport::{TcpTransport, TransportReceiver, TransportSender},
-    DistributedBackend,
 };
 use anyhow::Result;
 use async_trait::async_trait;

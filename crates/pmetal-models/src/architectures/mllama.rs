@@ -7,17 +7,17 @@
 use std::collections::HashMap;
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
     module::{Module, Param},
     nn,
     ops::softmax_axis,
-    Array,
 };
 use pmetal_mlx::kernels::{
-    differentiable_attention, fused_sdpa, get_training_context, rope::apply_rope,
-    AttentionMaskType, FusedAttentionConfig,
+    AttentionMaskType, FusedAttentionConfig, differentiable_attention, fused_sdpa,
+    get_training_context, rope::apply_rope,
 };
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
@@ -643,8 +643,8 @@ impl MllamaMultiModalProjector {
         let vision_dim = config.vision_config.hidden_size;
         let text_dim = config.text_config.hidden_size;
         let _intermediate_dim = config.vision_config.intermediate_size; // Or specific projector dim?
-                                                                        // Usually uses intermediate size or text dim.
-                                                                        // Llama 3.2 uses specific projection logic. Simplified to MLP here.
+        // Usually uses intermediate size or text dim.
+        // Llama 3.2 uses specific projection logic. Simplified to MLP here.
 
         let linear_1 = nn::LinearBuilder::new(vision_dim, text_dim)
             .bias(true)

@@ -11,8 +11,8 @@
 
 use crate::error::DistributedError;
 use anyhow::Result;
-use libp2p::identity::{ed25519, Keypair};
 use libp2p::PeerId;
+use libp2p::identity::{Keypair, ed25519};
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::PathBuf;

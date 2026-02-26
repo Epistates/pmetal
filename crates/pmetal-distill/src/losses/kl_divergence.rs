@@ -15,7 +15,7 @@
 //! zero-copy bridging to pass MLX array data directly to Metal kernels without
 //! copying, providing significant performance improvements for large tensors.
 
-use super::{softmax, DistillLoss};
+use super::{DistillLoss, softmax};
 use crate::Result;
 use mlx_rs::Array;
 use tracing;

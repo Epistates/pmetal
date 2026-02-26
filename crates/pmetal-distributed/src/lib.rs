@@ -221,6 +221,8 @@ impl DistributedContext {
 
 /// Prelude for convenient imports.
 pub mod prelude {
+    pub use crate::DistributedBackend;
+    pub use crate::DistributedContext;
     pub use crate::auto::{AutoDiscoveryBackend, AutoDiscoveryConfig};
     pub use crate::collective::{AllReduceStrategy, CollectiveConfig};
     pub use crate::compression::{CompressionStrategy, GradientCompressor};
@@ -233,6 +235,4 @@ pub mod prelude {
     pub use crate::namespace::NetworkNamespace;
     pub use crate::ring::RingBackend;
     pub use crate::topology::{ClusterTopology, NodeProfile};
-    pub use crate::DistributedBackend;
-    pub use crate::DistributedContext;
 }

@@ -6,8 +6,8 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::module::ModuleParameters;
 use mlx_rs::Array;
+use mlx_rs::module::ModuleParameters;
 use pmetal_mlx::kv_cache::KVCache;
 
 use crate::LoraError;

@@ -26,10 +26,10 @@
 //! )?;
 //! ```
 
-use mlx_rs::ops::{sign, stack_axis};
 use mlx_rs::Array;
+use mlx_rs::ops::{sign, stack_axis};
 
-use crate::{sparsify_by_magnitude, MergeError, Result};
+use crate::{MergeError, Result, sparsify_by_magnitude};
 
 /// GPU-accelerated merger using fused Metal kernels.
 ///

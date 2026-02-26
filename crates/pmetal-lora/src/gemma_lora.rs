@@ -17,17 +17,18 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     fast,
     module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param},
     nested::NestedValue,
-    nn, Array,
+    nn,
 };
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
-use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::gemma::GemmaConfig;
 

@@ -36,7 +36,7 @@
 //! let grads = lora_backward(&dY, &saved)?;
 //! ```
 
-use mlx_rs::{nn, Array};
+use mlx_rs::{Array, nn};
 use std::collections::HashMap;
 
 /// Context for tracking tensors needed in backward pass.

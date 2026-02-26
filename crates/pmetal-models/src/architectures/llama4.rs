@@ -12,13 +12,13 @@
 //! - **Llama 4 Maverick**: 402B total params (128 experts), 17B active, 1M context
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
     module::{Module, Param},
     nn,
     ops::softmax_axis,
-    Array,
 };
 use serde::{Deserialize, Serialize};
 

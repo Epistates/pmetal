@@ -54,7 +54,7 @@ pub use generation::*;
 pub use loader::*;
 pub use registry::*;
 pub use rl_generation::{
-    generate_rl_completions, BatchedGenerationOutput, BatchedRlConfig, BatchedRlGenerator,
+    BatchedGenerationOutput, BatchedRlConfig, BatchedRlGenerator, generate_rl_completions,
 };
 pub use traits::{CausalLMModel, LoraCapable, ModelConfig, Quantizable, QuantizationType};
 pub use weight_format::{GgufModelConfig, WeightFormat, WeightFormatError, WeightLoader};

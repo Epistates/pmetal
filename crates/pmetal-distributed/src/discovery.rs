@@ -21,8 +21,8 @@ use crate::identity::NodeIdentity;
 use anyhow::Result;
 use futures::StreamExt;
 use libp2p::{
-    gossipsub, identify, mdns, noise, ping, swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux,
-    Multiaddr, PeerId, Swarm, SwarmBuilder,
+    Multiaddr, PeerId, Swarm, SwarmBuilder, gossipsub, identify, mdns, noise, ping,
+    swarm::NetworkBehaviour, swarm::SwarmEvent, tcp, yamux,
 };
 use parking_lot::RwLock;
 use std::collections::HashMap;

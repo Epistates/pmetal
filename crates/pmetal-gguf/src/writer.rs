@@ -1,8 +1,8 @@
 //! GGUF file writer.
 
 use crate::{
-    GgmlType, MetadataValue, MetadataValueType, TensorInfo, GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC,
-    GGUF_VERSION,
+    GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC, GGUF_VERSION, GgmlType, MetadataValue, MetadataValueType,
+    TensorInfo,
 };
 use byteorder::{LittleEndian, WriteBytesExt};
 use pmetal_core::Result;

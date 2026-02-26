@@ -13,13 +13,13 @@
 //! - Shared input/output embeddings
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
     module::{Module, Param},
     nn,
     ops::softmax_axis,
-    Array,
 };
 use serde::{Deserialize, Serialize};
 

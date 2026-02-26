@@ -31,10 +31,10 @@
 //! 4. **Async Pipelining**: Overlap sampling with next forward pass
 
 use mlx_rs::{
+    Array,
     error::Exception,
     ops::{concatenate_axis, indexing::IndexOp},
     random::categorical,
-    Array,
 };
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_mlx::prefix_cache::PrefixCachedGenerator;

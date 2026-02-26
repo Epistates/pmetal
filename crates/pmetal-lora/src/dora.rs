@@ -13,7 +13,7 @@
 //! and direction of updates to be learned separately, closer to full fine-tuning.
 
 use crate::lora::LoraError;
-use mlx_rs::{error::Exception, nn, Array};
+use mlx_rs::{Array, error::Exception, nn};
 use pmetal_core::LoraConfig;
 
 /// DoRA Linear layer implementing weight decomposition.

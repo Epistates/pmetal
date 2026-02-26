@@ -9,10 +9,10 @@ use mlx_rs::Array;
 use tracing::{debug, info};
 
 use crate::{
-    batched::{BatchConfig, BatchedMerger, MergeStats, StreamingBatchedMerger},
     BreadcrumbsMerge, DareMerge, DellaMerge, LinearMerge, MergeConfig, MergeError, MergeMethod,
     MergeMethodConfig, MergeParameters, ModelStockMerge, NearswapMerge, PassthroughMerge, Result,
     SafetensorsLoader, SlerpMerge, TaskArithmeticMerge, TensorLoader, TensorWriter, TiesMerge,
+    batched::{BatchConfig, BatchedMerger, MergeStats, StreamingBatchedMerger},
 };
 
 /// Main entry point for running a model merge.

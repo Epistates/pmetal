@@ -59,16 +59,16 @@
 //! when mlx-rs improves its compile_with_state implementation.
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     losses::CrossEntropy,
     module::{FlattenedModuleParam, ModuleParameters},
     nn,
-    ops::indexing::{argmax_axis, IndexOp},
+    ops::indexing::{IndexOp, argmax_axis},
     optimizers::{AdamW, AdamWBuilder, Optimizer},
     transforms::compile::compile_with_state,
     utils::Updatable,
-    Array,
 };
 use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
 use pmetal_data::{
@@ -80,7 +80,7 @@ use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
 use pmetal_mlx::kernels::{init_training_context, with_training_mode};
 
 use crate::mlx_metal_optimizer::{
-    is_mlx_metal_optimizer_available, MlxMetalOptimizer, MlxMetalOptimizerBuilder,
+    MlxMetalOptimizer, MlxMetalOptimizerBuilder, is_mlx_metal_optimizer_available,
 };
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
 
@@ -1224,10 +1224,14 @@ impl TrainingLoop {
             tracing::info!(
                 "PROFILE step={}: fwd+bwd={}us ({:.1}%), accum={}us ({:.1}%), clip={}us ({:.1}%), opt={}us ({:.1}%), total={}us",
                 self.step,
-                fwd_bwd_us, 100.0 * fwd_bwd_us as f64 / total_us as f64,
-                accum_us, 100.0 * accum_us as f64 / total_us as f64,
-                clip_us, 100.0 * clip_us as f64 / total_us as f64,
-                opt_us, 100.0 * opt_us as f64 / total_us as f64,
+                fwd_bwd_us,
+                100.0 * fwd_bwd_us as f64 / total_us as f64,
+                accum_us,
+                100.0 * accum_us as f64 / total_us as f64,
+                clip_us,
+                100.0 * clip_us as f64 / total_us as f64,
+                opt_us,
+                100.0 * opt_us as f64 / total_us as f64,
                 total_us
             );
         }

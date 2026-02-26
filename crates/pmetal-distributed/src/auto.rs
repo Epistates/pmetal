@@ -19,12 +19,12 @@
 //! ctx.all_reduce(&mut gradients).await?;
 //! ```
 
+use crate::DistributedBackend;
 use crate::discovery::{DiscoveryEvent, DiscoveryService};
 use crate::error::DistributedError;
 use crate::identity::NodeIdentity;
-use crate::topology::{new_shared_topology, NodeProfile, SharedTopology};
+use crate::topology::{NodeProfile, SharedTopology, new_shared_topology};
 use crate::transport::{TcpTransport, TransportReceiver, TransportSender};
-use crate::DistributedBackend;
 use anyhow::Result;
 use async_trait::async_trait;
 use bytemuck::cast_slice_mut;
@@ -33,7 +33,7 @@ use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
 
 /// Default port for gradient exchange.

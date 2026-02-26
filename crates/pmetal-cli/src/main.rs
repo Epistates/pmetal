@@ -15,9 +15,9 @@ use pmetal_lora::{
     DynamicLoraModel, LlamaLoraForCausalLM, LlamaQloraForCausalLM, QLoraConfig, TrainableModel,
 };
 use pmetal_mlx::quantization::QuantScheme;
-use pmetal_models::architectures::llama::LlamaConfig;
-use pmetal_models::ollama::{templates as ollama_templates, ModelfileBuilder};
 use pmetal_models::WeightFormat;
+use pmetal_models::architectures::llama::LlamaConfig;
+use pmetal_models::ollama::{ModelfileBuilder, templates as ollama_templates};
 use pmetal_trainer::{CheckpointManager, MetricsJsonCallback, TrainingLoop, TrainingLoopConfig};
 use serde::{Deserialize, Serialize};
 
@@ -1063,11 +1063,11 @@ async fn run_quantization(
     method: &str,
 ) -> anyhow::Result<()> {
     use pmetal_gguf::{
+        GgmlType,
+        GgufBuilder,
         dynamic::{DynamicQuantizationConfig, DynamicQuantizer},
         imatrix::IMatrix,
         quantize::quantize, // Import the function explicitly
-        GgmlType,
-        GgufBuilder,
     };
     use std::path::{Path, PathBuf};
 
@@ -1898,7 +1898,9 @@ async fn run_training(
             tracing::info!("Saved LoRA weights to {:?}", final_path);
         } else {
             if (fused || use_jit_compilation) && config.training.gradient_accumulation_steps != 1 {
-                tracing::warn!("Fused/JIT training requires gradient_accumulation_steps=1, falling back to standard training");
+                tracing::warn!(
+                    "Fused/JIT training requires gradient_accumulation_steps=1, falling back to standard training"
+                );
             }
             training_loop.run(
                 &mut model,
@@ -1990,8 +1992,8 @@ async fn run_inference(
     #[cfg(target_os = "macos")]
     use pmetal_models::generate_cached_metal;
     use pmetal_models::{
-        generate_cached_async, generate_cached_compiled, generate_minimal_async, DynamicModel,
-        GenerationConfig,
+        DynamicModel, GenerationConfig, generate_cached_async, generate_cached_compiled,
+        generate_minimal_async,
     };
 
     tracing::info!(model = %model_id, "Loading model for inference");
@@ -2664,7 +2666,7 @@ async fn run_inference_with_lora(
 ) -> anyhow::Result<()> {
     use pmetal_core::LoraConfig;
     use pmetal_lora::{DynamicLoraModel, TrainableModel};
-    use pmetal_models::{generate_cached_async, GenerationConfig};
+    use pmetal_models::{GenerationConfig, generate_cached_async};
 
     // Create LoRA config - we'll load actual weights which override this
     let lora_config = LoraConfig {
@@ -3317,9 +3319,9 @@ fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
 /// Python baseline: ~7420 argmax ops/sec (~0.135ms per op) on Qwen3 vocab size.
 fn run_ffi_benchmark() -> anyhow::Result<()> {
     use mlx_rs::{
+        Array,
         ops::indexing::{argmax, argmax_axis},
         transforms::eval,
-        Array,
     };
     use std::time::Instant;
 
@@ -3471,9 +3473,9 @@ fn run_ffi_benchmark() -> anyhow::Result<()> {
 /// This profiles each step of the generation loop to compare with mlx_lm's timing.
 async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
     use mlx_rs::{
-        ops::indexing::{argmax, IndexOp},
-        transforms::{async_eval, eval},
         Array,
+        ops::indexing::{IndexOp, argmax},
+        transforms::{async_eval, eval},
     };
     use pmetal_models::DynamicModel;
     use std::path::PathBuf;
@@ -3989,7 +3991,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                                 let target_name = col_map.get(col_name).unwrap_or(col_name);
                                 let col = batch.column(col_idx);
 
-                                use arrow_array::{cast::AsArray, Array};
+                                use arrow_array::{Array, cast::AsArray};
                                 let value = if let Some(arr) = col.as_string_opt::<i32>() {
                                     if arr.is_null(row_idx) {
                                         serde_json::Value::Null
@@ -4034,8 +4036,8 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
 
             // Shuffle if requested
             if shuffle {
-                use rand::seq::SliceRandom;
                 use rand::SeedableRng;
+                use rand::seq::SliceRandom;
                 let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
                 samples.shuffle(&mut rng);
                 println!("Shuffled with seed {}", seed);
@@ -4483,8 +4485,8 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             println!("Loaded {} samples", samples.len());
 
             // Shuffle
-            use rand::seq::SliceRandom;
             use rand::SeedableRng;
+            use rand::seq::SliceRandom;
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             samples.shuffle(&mut rng);
 
@@ -4608,8 +4610,8 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
 
             // Shuffle if requested
             if shuffle {
-                use rand::seq::SliceRandom;
                 use rand::SeedableRng;
+                use rand::seq::SliceRandom;
                 let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
                 merged.shuffle(&mut rng);
                 println!("Shuffled with seed {}", seed);
@@ -4656,8 +4658,8 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             println!("Loaded {} samples", samples.len());
 
             // Shuffle and take first N
-            use rand::seq::SliceRandom;
             use rand::SeedableRng;
+            use rand::seq::SliceRandom;
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             samples.shuffle(&mut rng);
 
@@ -5001,8 +5003,8 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                 .filter(|l| !l.trim().is_empty())
                 .collect();
 
-            use rand::seq::SliceRandom;
             use rand::SeedableRng;
+            use rand::seq::SliceRandom;
             let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
             samples.shuffle(&mut rng);
 
@@ -5147,7 +5149,9 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             println!();
             println!("# Or step by step:");
             println!("pmetal dataset download tatsu-lab/alpaca -o raw.jsonl");
-            println!("pmetal dataset filter -i raw.jsonl -o filtered.jsonl --model ... --max-tokens 2048 --dedup");
+            println!(
+                "pmetal dataset filter -i raw.jsonl -o filtered.jsonl --model ... --max-tokens 2048 --dedup"
+            );
             println!(
                 "pmetal dataset template -i filtered.jsonl -o templated.jsonl --template chatml"
             );

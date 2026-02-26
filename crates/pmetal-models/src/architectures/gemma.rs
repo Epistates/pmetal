@@ -8,13 +8,14 @@
 //! - Gemma2: Attention logit softcapping, sliding window, extra normalization
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
     module::{Module, Param},
-    nn, Array,
+    nn,
 };
-use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 

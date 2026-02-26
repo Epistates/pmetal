@@ -10,14 +10,14 @@
 
 #![allow(clippy::manual_contains)]
 
-use mlx_rs::optimizers::Sgd;
 use mlx_rs::Array;
+use mlx_rs::optimizers::Sgd;
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
 use pmetal_lora::Qwen3LoraForCausalLM;
 use pmetal_models::architectures::qwen3::Qwen3Config;
 use pmetal_trainer::{
-    diffusion_loss_gpu, forward_process_gpu, DiffusionConfig, DiffusionTrainingLoop,
+    DiffusionConfig, DiffusionTrainingLoop, diffusion_loss_gpu, forward_process_gpu,
 };
 use serial_test::serial;
 

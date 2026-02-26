@@ -12,10 +12,10 @@
 //! - Native GQA support eliminates expand_kv_heads overhead
 
 use mlx_rs::{
-    error::Exception,
-    fast::{scaled_dot_product_attention, ScaledDotProductAttentionMask},
-    ops::indexing::{Ellipsis, IndexOp},
     Array,
+    error::Exception,
+    fast::{ScaledDotProductAttentionMask, scaled_dot_product_attention},
+    ops::indexing::{Ellipsis, IndexOp},
 };
 
 /// Attention mask type for fused attention.

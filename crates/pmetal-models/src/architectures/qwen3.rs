@@ -7,9 +7,9 @@
 //! - Backwards compatible with Qwen2 weight files
 
 use mlx_rs::{
-    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn, Array,
+    Array, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
 };
-use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 

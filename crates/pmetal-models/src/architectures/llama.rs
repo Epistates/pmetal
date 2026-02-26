@@ -5,11 +5,11 @@
 use std::collections::HashMap;
 
 use mlx_rs::{
-    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn, Array,
+    Array, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
 };
 use pmetal_mlx::kernels::{
-    differentiable_attention, fused_sdpa, get_training_context, rope::apply_rope,
-    AttentionMaskType, FusedAttentionConfig,
+    AttentionMaskType, FusedAttentionConfig, differentiable_attention, fused_sdpa,
+    get_training_context, rope::apply_rope,
 };
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};

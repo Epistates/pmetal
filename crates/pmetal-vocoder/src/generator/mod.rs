@@ -327,7 +327,7 @@ mod tests {
         // With 256x upsampling: 10 frames * 256 = 2560 samples
         assert_eq!(audio.dim(0), 1); // batch
         assert_eq!(audio.dim(1), 1); // mono channel
-                                     // Note: exact length may vary due to conv padding
+        // Note: exact length may vary due to conv padding
     }
 
     #[test]

@@ -19,15 +19,15 @@
 //! - All tensor operations stay on GPU until final token extraction
 
 use mlx_rs::{
+    Array, Device, Dtype, Stream,
     error::Exception,
     ops::{
         argpartition_axis, argsort_axis, exp, expand_dims_axes,
-        indexing::{argmax, argmax_axis, put_along_axis, take_along_axis, IndexOp},
+        indexing::{IndexOp, argmax, argmax_axis, put_along_axis, take_along_axis},
         logsumexp_axis, squeeze_axes, which, zeros_like,
     },
     random::{categorical, seed as mlx_seed},
     transforms::async_eval,
-    Array, Device, Dtype, Stream,
 };
 use pmetal_mlx::kv_cache::KVCache;
 use std::collections::HashMap;
@@ -730,11 +730,7 @@ impl Sampler {
         }
 
         // Squeeze back once at end
-        if was_1d {
-            result.squeeze()
-        } else {
-            Ok(result)
-        }
+        if was_1d { result.squeeze() } else { Ok(result) }
     }
 
     /// Internal top-k filter using cached arrays. Input must be 2D [1, vocab_size].

@@ -84,7 +84,10 @@ impl fmt::Display for MetalError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             MetalError::NoDevice => {
-                write!(f, "No Metal device found. Ensure running on Apple Silicon or macOS with Metal support.")
+                write!(
+                    f,
+                    "No Metal device found. Ensure running on Apple Silicon or macOS with Metal support."
+                )
             }
             MetalError::CommandQueueCreation => {
                 write!(f, "Failed to create Metal command queue")

@@ -10,11 +10,12 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use mlx_rs::{
+    Array,
     builder::Builder,
     error::Exception,
     module::{ModuleParamMut, ModuleParamRef, ModuleParameters},
     nested::NestedValue,
-    nn, Array,
+    nn,
 };
 
 use pmetal_core::LoraConfig;

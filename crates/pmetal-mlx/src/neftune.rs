@@ -39,7 +39,7 @@
 //! let noisy_embeds = apply_neftune(&embeds, &config)?;
 //! ```
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 
 /// Configuration for NEFTune.
 #[derive(Debug, Clone)]

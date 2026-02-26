@@ -7,10 +7,10 @@
 //! - SwitchGLU-style expert MLP with gather_mm
 
 use mlx_rs::{
-    builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
-    ops::indexing::IndexOp, Array,
+    Array, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
+    ops::indexing::IndexOp,
 };
-use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};

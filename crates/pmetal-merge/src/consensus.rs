@@ -10,8 +10,8 @@
 //! (Yadav et al., NeurIPS 2023, Algorithm 1 step 3).
 
 use crate::Result;
-use mlx_rs::ops::sign;
 use mlx_rs::Array;
+use mlx_rs::ops::sign;
 
 /// Compute sign consensus mask across multiple tensors.
 ///

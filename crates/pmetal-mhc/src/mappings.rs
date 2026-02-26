@@ -21,7 +21,7 @@
 
 use crate::config::MhcConfig;
 use crate::params::{MhcGradients, MhcMappings, MhcParams};
-use crate::sinkhorn::{sinkhorn_knopp_backward, SinkhornConfig};
+use crate::sinkhorn::{SinkhornConfig, sinkhorn_knopp_backward};
 use ndarray::{Array1, Array2, Array3, Axis};
 
 /// Compute mHC mappings from input and parameters.

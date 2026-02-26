@@ -7,8 +7,8 @@
 
 use std::time::Instant;
 
-use mlx_rs::transforms::eval;
 use mlx_rs::Array;
+use mlx_rs::transforms::eval;
 use pmetal_core::LoraConfig;
 use pmetal_lora::{Qwen3CustomTrainer, Qwen3LoraForCausalLM};
 use pmetal_models::architectures::qwen3::Qwen3Config;

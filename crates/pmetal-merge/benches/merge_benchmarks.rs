@@ -2,7 +2,7 @@
 //!
 //! Run with: cargo bench -p pmetal-merge
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use mlx_rs::Array;
 use pmetal_merge::{
     gpu_merge::GpuMerger, sign_consensus, sparsify_batch_by_magnitude, sparsify_by_magnitude,
@@ -99,11 +99,7 @@ fn bench_sign_consensus(c: &mut Criterion) {
                 let data: Vec<f32> = (0..size)
                     .map(|j| {
                         let x = ((i * size + j) as f32 * 1.234567).sin() * 10.0;
-                        if x > 0.0 {
-                            x
-                        } else {
-                            -x
-                        }
+                        if x > 0.0 { x } else { -x }
                     })
                     .collect();
                 Array::from_slice(&data, &[size as i32])

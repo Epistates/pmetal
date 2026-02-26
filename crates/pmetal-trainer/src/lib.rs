@@ -111,8 +111,8 @@ pub use gspo::*;
 pub use jit_compile::*;
 pub use metal_fused::*;
 pub use mlx_metal_optimizer::{
-    is_mlx_metal_optimizer_available, MlxMetalOptimizer, MlxMetalOptimizerBuilder,
-    MlxMetalOptimizerConfig, MlxMetalOptimizerError, MlxMetalOptimizerResult,
+    MlxMetalOptimizer, MlxMetalOptimizerBuilder, MlxMetalOptimizerConfig, MlxMetalOptimizerError,
+    MlxMetalOptimizerResult, is_mlx_metal_optimizer_available,
 };
 // Re-export online_dpo selectively to avoid ambiguous RewardFunction with grpo
 pub use grpo::*;

@@ -4,9 +4,9 @@
 //! periodic inductive bias for modeling audio harmonics.
 
 use crate::error::Result;
+use mlx_rs::Array;
 use mlx_rs::macros::ModuleParameters;
 use mlx_rs::module::Param;
-use mlx_rs::Array;
 
 /// Snake activation function.
 ///

@@ -24,12 +24,12 @@
 //! since only k experts are active per token.
 
 use mlx_rs::{
+    Array, Dtype,
     builder::Builder,
     error::Exception,
     module::Module,
     nn::{self, Linear},
     ops::indexing::IndexOp,
-    Array, Dtype,
 };
 
 /// Configuration for Mixture of Experts.

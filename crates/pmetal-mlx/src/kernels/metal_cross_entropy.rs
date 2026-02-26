@@ -41,9 +41,9 @@ use std::sync::Arc;
 use tracing::{debug, warn};
 
 use pmetal_metal::{
+    FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig,
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
-    FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig,
 };
 
 use super::cut_cross_entropy::{CutCrossEntropy, CutCrossEntropyConfig};

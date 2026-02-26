@@ -30,7 +30,7 @@
 //! let trainer = DapoTrainer::new(config)?;
 //! ```
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 use std::collections::HashMap;
 
 /// Error type for DAPO training.

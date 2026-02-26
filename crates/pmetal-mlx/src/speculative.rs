@@ -25,9 +25,9 @@
 //! - Most effective for greedy/low-temperature sampling
 
 use mlx_rs::{
-    error::Exception,
-    ops::indexing::{argmax, IndexOp},
     Array,
+    error::Exception,
+    ops::indexing::{IndexOp, argmax},
 };
 
 /// Configuration for speculative decoding.

@@ -16,7 +16,7 @@
 use std::sync::Arc;
 
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{error::Exception, nn, optimizers::Optimizer, Array, Dtype};
+use mlx_rs::{Array, Dtype, error::Exception, nn, optimizers::Optimizer};
 use pmetal_core::TrainingConfig;
 use pmetal_lora::TrainableModel;
 use tracing::{debug, info};

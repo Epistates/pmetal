@@ -27,9 +27,9 @@
 //! - Block bytes: 34 (2 bytes scale + 32 bytes data)
 //! - Dequantization: `value = quant * scale`
 
+use crate::GgmlType;
 use crate::iq_quants;
 use crate::k_quants;
-use crate::GgmlType;
 
 /// Error type for dequantization.
 #[derive(Debug, thiserror::Error)]

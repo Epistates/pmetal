@@ -73,7 +73,7 @@ pub mod kernels;
 pub mod pipeline;
 pub mod tuna;
 
-pub use bridge::{metal_buffer_from_ptr, MetalBufferView, MetalBufferViewF16, MetalBufferViewF32};
+pub use bridge::{MetalBufferView, MetalBufferViewF16, MetalBufferViewF32, metal_buffer_from_ptr};
 pub use buffer::{BufferUsage, MetalBuffer};
 pub use context::MetalContext;
 pub use error::{MetalError, Result};
@@ -93,8 +93,8 @@ pub use kernels::fused_cross_entropy::{
 };
 pub use kernels::fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use kernels::fused_merge::{
-    build_merge_config, build_tensor_info, FusedMergeMetal, MergeConfig as FusedMergeConfig,
-    TensorInfo,
+    FusedMergeMetal, MergeConfig as FusedMergeConfig, TensorInfo, build_merge_config,
+    build_tensor_info,
 };
 pub use kernels::fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use kernels::fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};
@@ -106,8 +106,8 @@ pub use pipeline::{FunctionConstant, PipelineCache};
 
 // Async command buffer scheduling
 pub use async_scheduler::{
-    AsyncBatchBuilder, AsyncScheduler, CompletionToken, DoubleBuffer, GpuCompletionToken,
-    InFlightBuffer, SchedulerStats, TripleBuffer, DEFAULT_GPU_TIMEOUT,
+    AsyncBatchBuilder, AsyncScheduler, CompletionToken, DEFAULT_GPU_TIMEOUT, DoubleBuffer,
+    GpuCompletionToken, InFlightBuffer, SchedulerStats, TripleBuffer,
 };
 
 /// Prelude for convenient imports.

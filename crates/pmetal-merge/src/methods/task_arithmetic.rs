@@ -1,6 +1,6 @@
 use mlx_rs::Array;
 
-use crate::{error::MergeError, MergeMethod, MergeParameters, Result};
+use crate::{MergeMethod, MergeParameters, Result, error::MergeError};
 
 /// Task Arithmetic Merging.
 ///

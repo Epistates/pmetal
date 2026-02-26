@@ -1,8 +1,8 @@
 //! Benchmarks for Sinkhorn-Knopp algorithm.
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, black_box, criterion_group, criterion_main};
 use ndarray::Array2;
-use pmetal_mhc::{sinkhorn_knopp, SinkhornConfig};
+use pmetal_mhc::{SinkhornConfig, sinkhorn_knopp};
 
 fn bench_sinkhorn_sizes(c: &mut Criterion) {
     let mut group = c.benchmark_group("sinkhorn_knopp");

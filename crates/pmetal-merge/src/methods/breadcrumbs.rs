@@ -34,7 +34,7 @@
 //! - arXiv:2312.06795 (2023), extended 2025
 
 use super::MergeMethod;
-use crate::{sign_consensus, MergeError, MergeParameters, Result};
+use crate::{MergeError, MergeParameters, Result, sign_consensus};
 use mlx_rs::Array;
 
 /// Model Breadcrumbs merge implementation.

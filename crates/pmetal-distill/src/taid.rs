@@ -33,10 +33,10 @@
 //! let loss = distiller.compute_loss(&teacher_logits, &student_logits, step, total_steps)?;
 //! ```
 
-use crate::losses::softmax;
 use crate::Result;
+use crate::losses::softmax;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 
 /// Log-softmax along specified axis.
 fn log_softmax(x: &Array, axis: i32) -> Result<Array> {

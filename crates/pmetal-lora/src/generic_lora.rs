@@ -15,10 +15,10 @@
 //! let attention = GenericLoraAttention::new(&config, &lora_config)?;
 //! ```
 
-use mlx_rs::{builder::Builder, error::Exception, nn, Array};
+use mlx_rs::{Array, builder::Builder, error::Exception, nn};
 use pmetal_core::LoraConfig;
 
-use crate::{arch_config::LoraArchitectureConfig, LoraError, LoraLinear};
+use crate::{LoraError, LoraLinear, arch_config::LoraArchitectureConfig};
 
 /// Generic LoRA-enabled attention layer.
 ///

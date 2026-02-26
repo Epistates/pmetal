@@ -9,7 +9,7 @@
 //! - `B` is the LoRA up-projection matrix (out_features x rank)
 //! - `scale = alpha / rank` (or `alpha / sqrt(rank)` for RSLoRA)
 
-use mlx_rs::{error::Exception, nn, Array};
+use mlx_rs::{Array, error::Exception, nn};
 
 use pmetal_core::LoraConfig;
 

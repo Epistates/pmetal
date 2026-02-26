@@ -609,8 +609,8 @@ impl TrainingDataset {
 
     /// Shuffle the dataset.
     pub fn shuffle(&mut self, seed: u64) {
-        use rand::seq::SliceRandom;
         use rand::SeedableRng;
+        use rand::seq::SliceRandom;
         let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
         self.samples.shuffle(&mut rng);
     }

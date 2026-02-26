@@ -32,7 +32,7 @@ use mlx_rs::Array;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::MTLCommandBuffer;
-use pmetal_metal::{bridge::metal_buffer_from_ptr, FusedSampler, MetalContext, MetalError};
+use pmetal_metal::{FusedSampler, MetalContext, MetalError, bridge::metal_buffer_from_ptr};
 
 /// Error type for MetalSampler operations.
 #[derive(Debug, thiserror::Error)]

@@ -22,9 +22,9 @@
 //! let output = fp8_linear.forward(&input)?;
 //! ```
 
+use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::{from_fp8, to_fp8};
-use mlx_rs::Array;
 use serde::{Deserialize, Serialize};
 
 /// FP8 format type.

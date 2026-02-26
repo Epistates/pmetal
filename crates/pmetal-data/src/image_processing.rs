@@ -3,8 +3,8 @@
 //! Provides efficient image preprocessing for VLMs like Llama 3.2 Vision.
 //! Uses CLIP-style normalization and supports batch processing.
 
-use image::{imageops::FilterType, DynamicImage};
-use mlx_rs::{error::Exception, Array};
+use image::{DynamicImage, imageops::FilterType};
+use mlx_rs::{Array, error::Exception};
 use std::path::Path;
 
 /// Configuration for Mllama image processing.

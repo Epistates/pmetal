@@ -38,8 +38,8 @@
 //! - Support for batched operations across multiple kernel dispatches
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use objc2::rc::Retained;

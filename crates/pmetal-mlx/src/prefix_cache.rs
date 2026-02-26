@@ -41,7 +41,7 @@
 //!
 //! Use `max_entries` to limit cache size and `clear()` to free memory when needed.
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 

@@ -322,10 +322,12 @@ mod tests {
         let mut cursor = Cursor::new(&buffer);
         let result = IMatrix::load_from_reader(&mut cursor, buffer.len() as u64);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid tensor name length"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid tensor name length")
+        );
     }
 
     #[test]
@@ -353,10 +355,12 @@ mod tests {
         let mut cursor = Cursor::new(&buffer);
         let result = IMatrix::load_from_reader(&mut cursor, buffer.len() as u64);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid value count"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid value count")
+        );
     }
 
     #[test]
@@ -432,10 +436,12 @@ mod tests {
         let mut cursor = Cursor::new(&buffer);
         let result = IMatrix::load_from_reader(&mut cursor, buffer.len() as u64);
         assert!(result.is_err());
-        assert!(result
-            .unwrap_err()
-            .to_string()
-            .contains("Invalid imatrix entry count"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Invalid imatrix entry count")
+        );
     }
 
     #[test]

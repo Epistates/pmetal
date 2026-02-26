@@ -940,9 +940,11 @@ mod tests {
 
         let formatted = template.apply(&messages);
         assert!(formatted.text.contains("<|begin_of_text|>"));
-        assert!(formatted
-            .text
-            .contains("<|start_header_id|>user<|end_header_id|>"));
+        assert!(
+            formatted
+                .text
+                .contains("<|start_header_id|>user<|end_header_id|>")
+        );
         assert!(formatted.text.contains("<|eot_id|>"));
     }
 
@@ -1049,9 +1051,11 @@ mod tests {
 
         // Check Harmony format tokens
         assert!(formatted.text.contains("<|start|>user<|message|>"));
-        assert!(formatted
-            .text
-            .contains("<|start|>assistant<|channel|>final<|message|>"));
+        assert!(
+            formatted
+                .text
+                .contains("<|start|>assistant<|channel|>final<|message|>")
+        );
         assert!(formatted.text.contains("<|end|>"));
         assert!(formatted.text.contains("<|return|>"));
 
@@ -1130,9 +1134,11 @@ mod tests {
         let formatted = template.apply(&messages);
 
         // Last message is user, so should add assistant header for training
-        assert!(formatted
-            .text
-            .contains("<|start|>assistant<|channel|>final<|message|>"));
+        assert!(
+            formatted
+                .text
+                .contains("<|start|>assistant<|channel|>final<|message|>")
+        );
 
         // Response start should be at the end, ready for model to generate
         assert_eq!(

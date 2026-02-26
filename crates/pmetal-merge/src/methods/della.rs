@@ -42,7 +42,7 @@
 //!   Sampling" (Yu et al., 2024), arXiv:2406.11617.
 
 use super::MergeMethod;
-use crate::{sign_consensus, MergeError, MergeParameters, Result};
+use crate::{MergeError, MergeParameters, Result, sign_consensus};
 use mlx_rs::Array;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};

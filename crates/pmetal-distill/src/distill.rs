@@ -9,12 +9,12 @@ use mlx_rs::Array;
 use tracing::{debug, info, warn};
 
 use crate::{
+    CompressionMethod, DistillConfig, DistillError, DistillMethod, LossType, Result,
     losses::{
         DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, MseLoss,
         SoftCrossEntropyLoss,
     },
     offline::{LogitCache, LogitCompressor},
-    CompressionMethod, DistillConfig, DistillError, DistillMethod, LossType, Result,
 };
 
 /// Run knowledge distillation with the given configuration.

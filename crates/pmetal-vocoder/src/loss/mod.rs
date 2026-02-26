@@ -5,7 +5,7 @@
 //! - Feature matching loss
 //! - Mel spectrogram reconstruction loss
 
-use crate::audio::{mel_spectrogram, MelConfig, StftConfig};
+use crate::audio::{MelConfig, StftConfig, mel_spectrogram};
 use crate::discriminator::DiscriminatorOutput;
 use crate::error::Result;
 use mlx_rs::Array;

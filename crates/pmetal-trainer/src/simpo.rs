@@ -27,9 +27,9 @@
 //! - "SimPO: Simple Preference Optimization with a Reference-Free Reward"
 //!   (Meng et al., 2024)
 
+use mlx_rs::Array;
 use mlx_rs::error::Exception;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::Array;
 use pmetal_core::TrainingConfig;
 
 /// Error type for SimPO training.

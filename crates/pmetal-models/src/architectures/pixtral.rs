@@ -12,7 +12,7 @@
 //!
 //! - Reference: <https://mistral.ai/news/pixtral-12b/>
 
-use mlx_rs::{error::Exception, macros::ModuleParameters, Array};
+use mlx_rs::{Array, error::Exception, macros::ModuleParameters};
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::mistral::{MistralConfig, MistralForCausalLM};

@@ -13,7 +13,7 @@
 //!
 //! - Paper: <https://arxiv.org/abs/2409.12191>
 
-use mlx_rs::{error::Exception, macros::ModuleParameters, Array};
+use mlx_rs::{Array, error::Exception, macros::ModuleParameters};
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::qwen2::{Qwen2Config, Qwen2ForCausalLM};

@@ -3,7 +3,7 @@
 //! Implements the training loop for distilling knowledge from a teacher model
 //! to a student model. Supports Online, Offline, and Progressive distillation.
 
-use mlx_rs::{error::Exception, nn, optimizers::Optimizer, Array};
+use mlx_rs::{Array, error::Exception, nn, optimizers::Optimizer};
 use pmetal_data::{DataLoader, TrainingDataset};
 use pmetal_distill::{DistillLossOutput, Distiller};
 use pmetal_lora::TrainableModel;

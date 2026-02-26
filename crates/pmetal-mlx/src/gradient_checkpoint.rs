@@ -25,7 +25,7 @@
 //! Explicit `eval()` calls can be used to control when tensors are materialized.
 //! This module provides utilities to work with MLX's memory model effectively.
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 
 /// Configuration for gradient checkpointing.
 #[derive(Debug, Clone)]

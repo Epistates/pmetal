@@ -69,19 +69,19 @@
 //! let (model, optimizer) = trainer.into_parts();
 //! ```
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::rc::Rc;
 
 use mlx_rs::{
+    Array,
     error::Exception,
     module::{FlattenedModuleParam, ModuleParameters},
     nn,
     ops::indexing::IndexOp,
     optimizers::Optimizer,
     utils::Updatable,
-    Array,
 };
 use pmetal_lora::TrainableModel;
 use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
@@ -108,7 +108,9 @@ pub enum ExplicitStateError {
     },
 
     /// Output count mismatch error.
-    #[error("Output count mismatch: expected {expected} ({output_count} outputs + {state_count} state), got {actual}")]
+    #[error(
+        "Output count mismatch: expected {expected} ({output_count} outputs + {state_count} state), got {actual}"
+    )]
     OutputCountMismatch {
         expected: usize,
         output_count: usize,

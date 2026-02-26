@@ -14,7 +14,7 @@
 
 use std::ops::Neg;
 
-use super::{softmax, DistillLoss};
+use super::{DistillLoss, softmax};
 use crate::Result;
 use mlx_rs::Array;
 

@@ -336,11 +336,11 @@ impl Fp8TrainingKernel {
         let m = a.shape[0];
         let k = a.shape[1];
         let n = b.shape[0]; // Assuming B is [N, K] layout for weights?
-                            // Wait, standard matmul is [M, K] @ [K, N].
-                            // If B is weights, it's often stored as [N, K] (transposed) or [K, N].
-                            // Our kernel 'fp8_block_gemm' comment says:
-                            // A: [M, K], B: [N, K] (Quantized weights (N, K))
-                            // So B is transposed.
+        // Wait, standard matmul is [M, K] @ [K, N].
+        // If B is weights, it's often stored as [N, K] (transposed) or [K, N].
+        // Our kernel 'fp8_block_gemm' comment says:
+        // A: [M, K], B: [N, K] (Quantized weights (N, K))
+        // So B is transposed.
 
         if a.shape[1] != b.shape[1] {
             return Err(MetalError::DimensionMismatch {

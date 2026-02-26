@@ -29,7 +29,7 @@
 //!
 //! This maximizes GPU utilization by processing all experts in parallel.
 
-use mlx_rs::{error::Exception, ops::indexing::TryIndexOp, Array};
+use mlx_rs::{Array, error::Exception, ops::indexing::TryIndexOp};
 
 /// Configuration for Grouped GEMM MoE.
 #[derive(Debug, Clone)]

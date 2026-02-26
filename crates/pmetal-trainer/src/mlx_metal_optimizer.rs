@@ -42,14 +42,14 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use mlx_rs::module::{FlattenedModuleParam, ModuleParameters};
 use mlx_rs::Array;
+use mlx_rs::module::{FlattenedModuleParam, ModuleParameters};
 use thiserror::Error;
 
 // Note: metal_buffer_from_ptr and MetalBufferView are available for future
 // zero-copy optimization, but current implementation uses copy for simplicity.
 #[allow(unused_imports)]
-use pmetal_metal::bridge::{metal_buffer_from_ptr, MetalBufferView};
+use pmetal_metal::bridge::{MetalBufferView, metal_buffer_from_ptr};
 use pmetal_metal::buffer::{BufferUsage, MetalBuffer};
 use pmetal_metal::context::MetalContext;
 use pmetal_metal::error::MetalError;

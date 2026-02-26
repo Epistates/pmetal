@@ -39,12 +39,12 @@
 //! ```
 
 use mlx_rs::{
+    Array, Dtype,
     error::Exception,
     ops,
     ops::concatenate_axis,
     ops::indexing::{IndexOp, TryIndexMutOp},
     ops::{dequantize, quantize},
-    Array, Dtype,
 };
 
 /// Configuration for KV cache.

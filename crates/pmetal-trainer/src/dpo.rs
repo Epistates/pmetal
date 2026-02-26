@@ -20,10 +20,10 @@
 //! - `pi_ref` is the reference model (frozen)
 //! - `beta` is the temperature parameter
 
-use mlx_rs::error::Exception;
-use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::Array;
 use mlx_rs::Dtype;
+use mlx_rs::error::Exception;
+use mlx_rs::ops::indexing::IndexOp;
 use pmetal_core::TrainingConfig;
 use tracing;
 

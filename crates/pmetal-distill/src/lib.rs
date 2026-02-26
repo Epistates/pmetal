@@ -68,11 +68,11 @@ pub use config::{
     AttentionConfig, CompressionMethod, DistillConfig, DistillMethod, HiddenStateConfig,
     HiddenStateLossType, LossConfig, LossType, OfflineConfig, TrainingConfig,
 };
-pub use distill::{run_distillation, DistillLossOutput, Distiller, DistillerBuilder};
+pub use distill::{DistillLossOutput, Distiller, DistillerBuilder, run_distillation};
 pub use error::{DistillError, Result};
 pub use losses::{
-    is_gpu_available, DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, MseLoss,
-    SoftCrossEntropyLoss,
+    DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, MseLoss,
+    SoftCrossEntropyLoss, is_gpu_available,
 };
 pub use offline::{LogitCache, LogitCompressor};
 pub use reasoning::RationaleLoss;

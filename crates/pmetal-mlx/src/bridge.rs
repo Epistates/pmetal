@@ -32,7 +32,7 @@
 use half::f16;
 use mlx_rs::{Array, Dtype};
 use pmetal_metal::{
-    bridge::{metal_buffer_from_ptr, MetalBufferView},
+    bridge::{MetalBufferView, metal_buffer_from_ptr},
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
     error::{MetalError, Result as MetalResult},

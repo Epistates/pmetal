@@ -17,15 +17,15 @@
 use std::collections::HashMap;
 
 use mlx_rs::{
+    Array, Dtype,
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
     module::{Module, ModuleParameters as ModuleParametersTrait, Param},
     nn,
     ops::indexing::IndexOp,
-    Array, Dtype,
 };
-use pmetal_mlx::kernels::{fused_sdpa, rope::apply_rope, AttentionMaskType, FusedAttentionConfig};
+use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use serde::{Deserialize, Serialize};
 
@@ -290,9 +290,12 @@ impl MambaRMSNormGated {
                 result_g.eval()?;
                 tracing::info!(
                     "GATED_NORM[{}] Group {}: x_normed [{:.4}, {:.4}], weight [{:.4}, {:.4}], result max={:.4}",
-                    log_count, g,
-                    x_g.min(None)?.item::<f32>(), x_g.max(None)?.item::<f32>(),
-                    w_g.min(None)?.item::<f32>(), w_g.max(None)?.item::<f32>(),
+                    log_count,
+                    g,
+                    x_g.min(None)?.item::<f32>(),
+                    x_g.max(None)?.item::<f32>(),
+                    w_g.min(None)?.item::<f32>(),
+                    w_g.max(None)?.item::<f32>(),
                     result_g.max(None)?.item::<f32>()
                 );
             }
@@ -347,14 +350,20 @@ impl MambaRMSNormGated {
                     let w_at_382 = w_g.index(382).item::<f32>();
                     tracing::info!(
                         "GATED_NORM[{}] Token {} Group 6: x_normed [{:.4}, {:.4}], weight max={:.4}, result max={:.4}",
-                        log_count, t,
-                        x_g.min(None)?.item::<f32>(), x_g.max(None)?.item::<f32>(),
+                        log_count,
+                        t,
+                        x_g.min(None)?.item::<f32>(),
+                        x_g.max(None)?.item::<f32>(),
                         w_g.max(None)?.item::<f32>(),
                         result_g.max(None)?.item::<f32>()
                     );
                     tracing::info!(
                         "GATED_NORM[{}] Token {} Group 6 at pos 382: x_normed={:.6}, weight={:.4}, product={:.6}",
-                        log_count, t, x_at_382, w_at_382, x_at_382 * w_at_382
+                        log_count,
+                        t,
+                        x_at_382,
+                        w_at_382,
+                        x_at_382 * w_at_382
                     );
 
                     // Find where the max result comes from by scanning all positions
@@ -367,7 +376,12 @@ impl MambaRMSNormGated {
                             // Find positions producing large products
                             tracing::info!(
                                 "GATED_NORM[{}] Token {} Group 6 pos {}: x={:.4}, w={:.4}, prod={:.4}",
-                                log_count, t, pos, x_val, w_val, prod
+                                log_count,
+                                t,
+                                pos,
+                                x_val,
+                                w_val,
+                                prod
                             );
                         }
                     }
@@ -709,7 +723,9 @@ pub fn ssm_attention(
             let dtx_val = dtx.index((0, 2, 54, 26)).item::<f32>(); // dtx is [B, L, H, D]
             tracing::info!(
                 "SSM[{}] y[head=54, token=2, dim=26] = {:.4}, dtx[token=2, head=54, dim=26] = {:.4}",
-                log_count, y_val, dtx_val
+                log_count,
+                y_val,
+                dtx_val
             );
 
             // Check the attn_weights row for head 54, token 2
@@ -915,7 +931,11 @@ pub fn ssm_attention(
             let d_val = d.index(54).item::<f32>();
             tracing::info!(
                 "SSM[{}] POSITION 3478 (token=2, head=54, dim=22): y_before_skip={:.4}, x={:.4}, D={:.4}, x*D={:.4}",
-                log_count, y_before, x_val, d_val, x_val * d_val
+                log_count,
+                y_before,
+                x_val,
+                d_val,
+                x_val * d_val
             );
         }
     }
@@ -2080,7 +2100,10 @@ impl NemotronHMixer {
                 };
                 tracing::info!(
                     "MAMBA[{}] CONV DEBUG: conv_input shape={:?}, padded_input shape={:?}, conv_input[0,2,3478]={:.4}",
-                    mamba_trace, conv_input.shape(), padded_input.shape(), ci_t2_3478
+                    mamba_trace,
+                    conv_input.shape(),
+                    padded_input.shape(),
+                    ci_t2_3478
                 );
             }
 
@@ -2097,7 +2120,11 @@ impl NemotronHMixer {
                 };
                 tracing::info!(
                     "MAMBA[{}] CONV DEBUG: conv_out shape={:?}, out_len={}, seq_len={}, conv_out[0,2,3478]={:.4}",
-                    mamba_trace, conv_out.shape(), out_len, seq_len, co_t2_3478
+                    mamba_trace,
+                    conv_out.shape(),
+                    out_len,
+                    seq_len,
+                    co_t2_3478
                 );
             }
 

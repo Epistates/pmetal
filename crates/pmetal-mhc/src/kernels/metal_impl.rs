@@ -3,7 +3,7 @@
 //! This module provides Rust bindings for the Metal compute shaders that accelerate
 //! mHC operations on Apple Silicon.
 
-use super::{KernelStats, MhcKernelConfig, MHC_METAL_SHADERS};
+use super::{KernelStats, MHC_METAL_SHADERS, MhcKernelConfig};
 use crate::params::MhcMappings;
 use crate::sinkhorn::SinkhornConfig;
 use ndarray::{Array2, ArrayView1, ArrayView2};
@@ -106,11 +106,9 @@ impl MhcMetalContext {
         name: &str,
     ) -> Result<Retained<ProtocolObject<dyn MTLComputePipelineState>>, MhcMetalError> {
         let ns_name = NSString::from_str(name);
-        let function = library
-            .newFunctionWithName(&ns_name)
-            .ok_or_else(|| {
-                MhcMetalError::FunctionNotFound(name.to_string(), "not found in library".into())
-            })?;
+        let function = library.newFunctionWithName(&ns_name).ok_or_else(|| {
+            MhcMetalError::FunctionNotFound(name.to_string(), "not found in library".into())
+        })?;
 
         device
             .newComputePipelineStateWithFunction_error(&function)
@@ -547,12 +545,11 @@ impl MhcMetalContext {
         // SAFETY: ptr is a valid non-null pointer from a live slice, and size matches.
         // Metal copies the data into the buffer.
         let buffer = unsafe {
-            self.device
-                .newBufferWithBytes_length_options(
-                    ptr,
-                    size,
-                    MTLResourceOptions::StorageModeShared,
-                )
+            self.device.newBufferWithBytes_length_options(
+                ptr,
+                size,
+                MTLResourceOptions::StorageModeShared,
+            )
         }
         .ok_or(MhcMetalError::DeviceNotFound)?;
         Ok(buffer)
@@ -575,12 +572,11 @@ impl MhcMetalContext {
             .ok_or(MhcMetalError::NonContiguousArray)?;
         // SAFETY: ptr is a valid non-null pointer to a T, and size matches.
         let buffer = unsafe {
-            self.device
-                .newBufferWithBytes_length_options(
-                    ptr,
-                    size,
-                    MTLResourceOptions::StorageModeShared,
-                )
+            self.device.newBufferWithBytes_length_options(
+                ptr,
+                size,
+                MTLResourceOptions::StorageModeShared,
+            )
         }
         .ok_or(MhcMetalError::DeviceNotFound)?;
         Ok(buffer)

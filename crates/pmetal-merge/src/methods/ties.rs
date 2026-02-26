@@ -14,7 +14,7 @@
 //! - When you have models with conflicting capabilities
 
 use super::MergeMethod;
-use crate::{sign_consensus, sparsify_by_magnitude, MergeError, MergeParameters, Result};
+use crate::{MergeError, MergeParameters, Result, sign_consensus, sparsify_by_magnitude};
 use mlx_rs::Array;
 
 /// TIES merge implementation.

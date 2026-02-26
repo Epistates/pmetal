@@ -50,15 +50,16 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use mlx_rs::{nn, Array};
+use mlx_rs::{Array, nn};
 
 use crate::autograd::{
-    lora_backward, lora_forward_with_grad, AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext,
-    LoraGrads,
+    AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads, lora_backward,
+    lora_forward_with_grad,
 };
 use crate::custom_backward::{
-    attention_backward, attention_forward_with_grad, rmsnorm_backward, rmsnorm_forward_with_grad,
-    silu_backward, silu_forward_with_grad, AttentionSaved, RmsNormSaved, RopeSaved, SiluSaved,
+    AttentionSaved, RmsNormSaved, RopeSaved, SiluSaved, attention_backward,
+    attention_forward_with_grad, rmsnorm_backward, rmsnorm_forward_with_grad, silu_backward,
+    silu_forward_with_grad,
 };
 use crate::custom_training::CustomLoraTrainer;
 use crate::{LoraError, LoraLinear};

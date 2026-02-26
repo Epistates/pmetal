@@ -67,8 +67,8 @@ pub use layer::{CollapseMode, MhcCache, MhcLayer, MhcTransformerBlock};
 pub use mappings::{apply_post_res_mapping, apply_pre_mapping, compute_mappings};
 pub use params::{MhcGradients, MhcMappings, MhcParams};
 pub use sinkhorn::{
-    amax_gain_backward, amax_gain_forward, composite_mapping, is_doubly_stochastic, sinkhorn_knopp,
-    sinkhorn_knopp_backward, sinkhorn_knopp_batch, SinkhornConfig,
+    SinkhornConfig, amax_gain_backward, amax_gain_forward, composite_mapping, is_doubly_stochastic,
+    sinkhorn_knopp, sinkhorn_knopp_backward, sinkhorn_knopp_batch,
 };
 
 /// Version of the mHC implementation.

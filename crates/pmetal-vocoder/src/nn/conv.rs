@@ -5,8 +5,8 @@
 //! normalization-induced artifacts in audio generation.
 
 use crate::error::Result;
-use mlx_rs::module::Param;
 use mlx_rs::Array;
+use mlx_rs::module::Param;
 
 /// Weight-normalized 1D convolution.
 ///

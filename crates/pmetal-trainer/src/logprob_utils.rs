@@ -12,8 +12,8 @@
 //!
 //! This is the technique used by DeepSeek V3/R1 and Unsloth.
 
-use mlx_rs::error::Exception;
 use mlx_rs::Array;
+use mlx_rs::error::Exception;
 
 /// Selective log softmax: compute log probabilities only at target indices.
 ///

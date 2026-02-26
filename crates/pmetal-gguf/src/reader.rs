@@ -32,7 +32,7 @@ use std::path::Path;
 
 use byteorder::{LittleEndian, ReadBytesExt};
 
-use crate::{GgmlType, MetadataValue, TensorInfo, GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC};
+use crate::{GGUF_DEFAULT_ALIGNMENT, GGUF_MAGIC, GgmlType, MetadataValue, TensorInfo};
 
 /// GGUF file version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

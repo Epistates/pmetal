@@ -11,8 +11,8 @@
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// Maximum number of samples to keep in rolling windows.
@@ -264,11 +264,7 @@ impl CompressionMetrics {
     pub fn compression_ratio(&self) -> f64 {
         let before = self.bytes_before.get() as f64;
         let after = self.bytes_after.get() as f64;
-        if after == 0.0 {
-            1.0
-        } else {
-            before / after
-        }
+        if after == 0.0 { 1.0 } else { before / after }
     }
 }
 

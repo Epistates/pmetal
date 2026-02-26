@@ -43,6 +43,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use mlx_rs::{
+    Array,
     error::Exception,
     losses::CrossEntropy,
     module::{FlattenedModuleParam, ModuleParameters},
@@ -50,7 +51,6 @@ use mlx_rs::{
     optimizers::Optimizer,
     transforms::compile::compile,
     utils::Updatable,
-    Array,
 };
 
 use crate::Result;

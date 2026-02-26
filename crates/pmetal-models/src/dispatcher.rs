@@ -17,7 +17,7 @@
 
 use std::path::Path;
 
-use mlx_rs::{error::Exception, module::ModuleParametersExt, Array};
+use mlx_rs::{Array, error::Exception, module::ModuleParametersExt};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 use serde::Deserialize;
 
@@ -29,7 +29,7 @@ use crate::architectures::{
     llama::{LlamaConfig, LlamaForCausalLM},
     llama4::{Llama4ForCausalLM, Llama4TextConfig},
     mistral::{MistralConfig, MistralForCausalLM},
-    nemotron_h::{load_nemotron_weights, NemotronHConfig, NemotronHForCausalLM},
+    nemotron_h::{NemotronHConfig, NemotronHForCausalLM, load_nemotron_weights},
     phi::{PhiConfig, PhiForCausalLM},
     qwen2::{Qwen2Config, Qwen2ForCausalLM},
     qwen3::{Qwen3Config, Qwen3ForCausalLM},

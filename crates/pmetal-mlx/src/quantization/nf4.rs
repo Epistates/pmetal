@@ -99,22 +99,14 @@ impl NF4Quantizer {
         if value < NF4_THRESHOLDS[7] {
             if value < NF4_THRESHOLDS[3] {
                 if value < NF4_THRESHOLDS[1] {
-                    if value < NF4_THRESHOLDS[0] {
-                        0
-                    } else {
-                        1
-                    }
+                    if value < NF4_THRESHOLDS[0] { 0 } else { 1 }
                 } else if value < NF4_THRESHOLDS[2] {
                     2
                 } else {
                     3
                 }
             } else if value < NF4_THRESHOLDS[5] {
-                if value < NF4_THRESHOLDS[4] {
-                    4
-                } else {
-                    5
-                }
+                if value < NF4_THRESHOLDS[4] { 4 } else { 5 }
             } else if value < NF4_THRESHOLDS[6] {
                 6
             } else {
@@ -122,22 +114,14 @@ impl NF4Quantizer {
             }
         } else if value < NF4_THRESHOLDS[11] {
             if value < NF4_THRESHOLDS[9] {
-                if value < NF4_THRESHOLDS[8] {
-                    8
-                } else {
-                    9
-                }
+                if value < NF4_THRESHOLDS[8] { 8 } else { 9 }
             } else if value < NF4_THRESHOLDS[10] {
                 10
             } else {
                 11
             }
         } else if value < NF4_THRESHOLDS[13] {
-            if value < NF4_THRESHOLDS[12] {
-                12
-            } else {
-                13
-            }
+            if value < NF4_THRESHOLDS[12] { 12 } else { 13 }
         } else if value < NF4_THRESHOLDS[14] {
             14
         } else {

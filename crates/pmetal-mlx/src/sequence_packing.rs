@@ -23,7 +23,7 @@
 //! let packed = packer.pack_sequences(&input_ids, &attention_mask, &labels)?;
 //! ```
 
-use mlx_rs::{error::Exception, Array};
+use mlx_rs::{Array, error::Exception};
 
 /// Configuration for sequence packing.
 #[derive(Debug, Clone)]
@@ -776,10 +776,10 @@ mod tests {
         assert_eq!(mask[0], 1.0); // seq1 pos 0
         assert_eq!(mask[1], 1.0); // seq1 pos 1
         assert_eq!(mask[2], 0.0); // seq1 pos 2 (boundary)
-                                  // seq2: position 3 should be 1.0, position 4 (last) should be 0.0
+        // seq2: position 3 should be 1.0, position 4 (last) should be 0.0
         assert_eq!(mask[3], 1.0); // seq2 pos 0
         assert_eq!(mask[4], 0.0); // seq2 pos 1 (boundary)
-                                  // Rest should be 0.0 (padding)
+        // Rest should be 0.0 (padding)
         assert!(mask[5..].iter().all(|&m| m == 0.0));
     }
 

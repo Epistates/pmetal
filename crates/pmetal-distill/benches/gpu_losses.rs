@@ -2,11 +2,11 @@
 //!
 //! Run with: cargo bench -p pmetal-distill
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main};
 use mlx_rs::Array;
 use pmetal_distill::losses::{
-    is_gpu_available, DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss,
-    SoftCrossEntropyLoss,
+    DistillLoss, HiddenStateLoss, JensenShannonLoss, KlDivergenceLoss, SoftCrossEntropyLoss,
+    is_gpu_available,
 };
 
 /// Generate random logits for benchmarking.
