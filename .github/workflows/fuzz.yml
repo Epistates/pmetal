@@ -16,11 +16,6 @@ jobs:
     steps:
     - uses: actions/checkout@v5
 
-    # Clone mlx-rs so workspace Cargo.toml resolves (fuzz targets don't use it)
-    - name: Clone mlx-rs
-      run: |
-        mkdir -p ../reference
-        git clone --depth 1 --recurse-submodules https://github.com/nicholasjpaterno/mlx-rs.git ../reference/mlx-rs
 
     - name: Install nightly Rust
       uses: dtolnay/rust-toolchain@nightly
