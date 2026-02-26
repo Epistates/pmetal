@@ -23,7 +23,9 @@ mhc = ["dep:pmetal-mhc", "core", "metal"]
 # MLX-dependent crates
 mlx = ["dep:pmetal-mlx", "core", "metal"]
 models = ["dep:pmetal-models", "core", "gguf", "metal", "mlx"]
-lora = ["dep:pmetal-lora", "dep:pmetal-metal", "core", "gguf", "metal", "mlx", "models", "pmetal-lora/metal-fused"]
+lora = ["dep:pmetal-lora", "core", "gguf", "metal", "mlx", "models"]
+# Opt-in: enables fused Metal kernels for ~2x LoRA training speedup (requires Float16 inputs)
+lora-metal-fused = ["lora", "pmetal-lora/metal-fused"]
 data = ["dep:pmetal-data", "core", "mlx"]
 trainer = ["dep:pmetal-trainer", "core", "mlx", "metal", "lora", "models", "data", "distill"]
 distill = ["dep:pmetal-distill", "core", "mlx", "metal"]
