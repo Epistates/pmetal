@@ -47,9 +47,9 @@ pmetal-distill = { path = "crates/pmetal-distill", version = "0.1.0" }
 pmetal-mhc = { path = "crates/pmetal-mhc", version = "0.1.0" }
 pmetal-distributed = { path = "crates/pmetal-distributed", version = "0.1.0" }
 
-# MLX bindings - upstream, pinned to commit including our RandomState PR (#321)
-mlx-rs = { git = "https://github.com/oxiglade/mlx-rs", rev = "d76d3888", features = ["safetensors"] }
-mlx-sys = { git = "https://github.com/oxiglade/mlx-rs", rev = "d76d3888" }
+# MLX bindings - pmetal-maintained fork (unblocks crates.io publishing)
+mlx-rs = { version = "0.25.4", package = "pmetal-mlx-rs", features = ["safetensors"] }
+mlx-sys = { version = "=0.2.1", package = "pmetal-mlx-sys" }
 
 # Async runtime
 tokio = { version = "1.49", features = ["full"] }

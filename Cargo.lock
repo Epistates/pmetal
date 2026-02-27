@@ -3615,7 +3615,8 @@ dependencies = [
 [[package]]
 name = "mlx-internal-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxiglade/mlx-rs?rev=d76d3888#d76d3888674ae62ddd78230d0d7d1ffa4a2ff06b"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7a7c4444d624bf6b93db5cc22ebff4fdfa13593fd56154fe33b1f302a557c2c6"
 dependencies = [
  "darling 0.21.3",
  "itertools 0.14.0",
@@ -3627,47 +3628,13 @@ dependencies = [
 [[package]]
 name = "mlx-macros"
 version = "0.25.3"
-source = "git+https://github.com/oxiglade/mlx-rs?rev=d76d3888#d76d3888674ae62ddd78230d0d7d1ffa4a2ff06b"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a819ee8b4434690572b6feb9c3ef0b6e90137e4190b340cf00150703b410aaf9"
 dependencies = [
  "darling 0.21.3",
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "mlx-rs"
-version = "0.25.3"
-source = "git+https://github.com/oxiglade/mlx-rs?rev=d76d3888#d76d3888674ae62ddd78230d0d7d1ffa4a2ff06b"
-dependencies = [
- "bytemuck",
- "dyn-clone",
- "half",
- "itertools 0.14.0",
- "libc",
- "mach-sys",
- "mlx-internal-macros",
- "mlx-macros",
- "mlx-sys",
- "num-complex",
- "num-traits",
- "num_enum",
- "parking_lot",
- "paste",
- "safetensors 0.6.2",
- "smallvec",
- "strum",
- "thiserror 2.0.18",
-]
-
-[[package]]
-name = "mlx-sys"
-version = "0.2.0"
-source = "git+https://github.com/oxiglade/mlx-rs?rev=d76d3888#d76d3888674ae62ddd78230d0d7d1ffa4a2ff06b"
-dependencies = [
- "bindgen",
- "cc",
- "cmake",
 ]
 
 [[package]]
@@ -4458,7 +4425,6 @@ dependencies = [
  "clap",
  "dirs",
  "indicatif",
- "mlx-rs",
  "parquet",
  "pmetal-core",
  "pmetal-data",
@@ -4467,6 +4433,7 @@ dependencies = [
  "pmetal-hub",
  "pmetal-lora",
  "pmetal-mlx",
+ "pmetal-mlx-rs",
  "pmetal-models",
  "pmetal-trainer",
  "rand 0.10.0",
@@ -4499,9 +4466,9 @@ version = "0.1.0"
 dependencies = [
  "arrow",
  "image 0.25.9",
- "mlx-rs",
  "parquet",
  "pmetal-core",
+ "pmetal-mlx-rs",
  "rand 0.10.0",
  "serde",
  "serde_json",
@@ -4521,11 +4488,11 @@ dependencies = [
  "half",
  "hf-hub",
  "indicatif",
- "mlx-rs",
- "mlx-sys",
  "pmetal-core",
  "pmetal-metal",
  "pmetal-mlx",
+ "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "safetensors 0.7.0",
  "serde",
  "serde_json",
@@ -4599,12 +4566,12 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "half",
- "mlx-rs",
- "mlx-sys",
  "pmetal-core",
  "pmetal-gguf",
  "pmetal-metal",
  "pmetal-mlx",
+ "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "pmetal-models",
  "serde",
  "serde_json",
@@ -4622,9 +4589,9 @@ dependencies = [
  "hf-hub",
  "indicatif",
  "memmap2",
- "mlx-rs",
  "pmetal-core",
  "pmetal-mlx",
+ "pmetal-mlx-rs",
  "rand 0.10.0",
  "safetensors 0.7.0",
  "serde",
@@ -4685,14 +4652,51 @@ version = "0.1.0"
 dependencies = [
  "bytemuck",
  "half",
- "mlx-rs",
- "mlx-sys",
  "num-traits",
  "pmetal-core",
  "pmetal-metal",
+ "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "serde",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "pmetal-mlx-rs"
+version = "0.25.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "544d1c776030740f55e90672bc94491965e08991e44ac8fb7e4ba15cc372f4e8"
+dependencies = [
+ "bytemuck",
+ "dyn-clone",
+ "half",
+ "itertools 0.14.0",
+ "libc",
+ "mach-sys",
+ "mlx-internal-macros",
+ "mlx-macros",
+ "num-complex",
+ "num-traits",
+ "num_enum",
+ "parking_lot",
+ "paste",
+ "pmetal-mlx-sys",
+ "safetensors 0.6.2",
+ "smallvec",
+ "strum",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "pmetal-mlx-sys"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0e8ed9b6a1464a10c3d417c9c6e793d4aac8a0ae1526bff15f124eb594419135"
+dependencies = [
+ "bindgen",
+ "cc",
+ "cmake",
 ]
 
 [[package]]
@@ -4700,14 +4704,14 @@ name = "pmetal-models"
 version = "0.1.0"
 dependencies = [
  "json5",
- "mlx-rs",
- "mlx-sys",
  "objc2",
  "objc2-metal",
  "pmetal-core",
  "pmetal-gguf",
  "pmetal-metal",
  "pmetal-mlx",
+ "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "safetensors 0.7.0",
  "serde",
  "serde_json",
@@ -4722,14 +4726,14 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "indicatif",
- "mlx-rs",
- "mlx-sys",
  "pmetal-core",
  "pmetal-data",
  "pmetal-distill",
  "pmetal-lora",
  "pmetal-metal",
  "pmetal-mlx",
+ "pmetal-mlx-rs",
+ "pmetal-mlx-sys",
  "pmetal-models",
  "rand 0.10.0",
  "serde",
@@ -4749,10 +4753,10 @@ dependencies = [
  "criterion",
  "half",
  "hf-hub",
- "mlx-rs",
  "num-traits",
  "pmetal-core",
  "pmetal-mlx",
+ "pmetal-mlx-rs",
  "safetensors 0.7.0",
  "serde",
  "serde_json",
