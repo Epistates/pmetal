@@ -49,7 +49,7 @@ jobs:
 
           if [ "$CERT_IMPORTED" = "true" ]; then
             echo "Signing with Developer ID..."
-            codesign --force --verify --verbose \
+            codesign --deep --force --verify --verbose \
               --timestamp --options runtime \
               --sign "${{ secrets.APPLE_DEVELOPER_ID }}" \
               "$BINARY"
@@ -99,14 +99,23 @@ jobs:
           cp "target/aarch64-apple-darwin/release/pmetal" "$BINARY"
           chmod +x "$BINARY"
 
-          # Create tar.gz to preserve permissions
-          tar -czf "artifacts/${BINARY}.tar.gz" "$BINARY"
+          # Bundle MLX Metal shader library (required at runtime)
+          MLX_METALLIB=$(find target/aarch64-apple-darwin/release/build/pmetal-mlx-sys-*/out/build/lib -name "mlx.metallib" | head -1)
+          if [ -z "$MLX_METALLIB" ]; then
+            echo "ERROR: mlx.metallib not found in build output"
+            exit 1
+          fi
+          cp "$MLX_METALLIB" mlx.metallib
+          echo "Bundled mlx.metallib ($(du -h mlx.metallib | cut -f1))"
 
-          # Checksum the archive (what users download and verify)
+          # Create tar.gz with binary + metallib
+          tar -czf "artifacts/${BINARY}.tar.gz" "$BINARY" mlx.metallib
+
+          # Checksum the archive
           shasum -a 256 "artifacts/${BINARY}.tar.gz" > "artifacts/${BINARY}.tar.gz.sha256"
 
-          echo "Binary info:"
-          ls -lh "$BINARY"
+          echo "Artifact contents:"
+          ls -lh "$BINARY" mlx.metallib
           file "$BINARY"
           cat "artifacts/${BINARY}.tar.gz.sha256"
 
