@@ -831,6 +831,142 @@ pub enum OllamaTemplate {
     DeepSeek,
 }
 
+/// Discover `mlx.metallib` and set `PMETAL_METALLIB_PATH` so the patched MLX
+/// C++ backend can find it regardless of where the binary is installed.
+///
+/// Search order: colocated → cache → Homebrew → auto-download → error.
+fn ensure_metallib() {
+    let metallib_name = "mlx.metallib";
+    let cache_dir = std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(".cache/pmetal/lib"));
+    let mut search_paths: Vec<PathBuf> = Vec::new();
+
+    // 1. Colocated with binary
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            search_paths.push(dir.join(metallib_name));
+        }
+    }
+    // 2. User cache ($HOME/.cache/pmetal/lib/) — matches C++ fallback path
+    if let Some(ref cache) = cache_dir {
+        search_paths.push(cache.join(metallib_name));
+    }
+    // 3. Homebrew Apple Silicon
+    search_paths.push("/opt/homebrew/lib/mlx.metallib".into());
+    // 4. Homebrew Intel / standard
+    search_paths.push("/usr/local/lib/mlx.metallib".into());
+
+    if let Some(path) = search_paths.iter().find(|p| p.is_file()) {
+        // SAFETY: called before any other threads; env var is process-internal
+        unsafe { std::env::set_var("PMETAL_METALLIB_PATH", path) };
+        tracing::debug!(path = %path.display(), "Found mlx.metallib");
+
+        // Auto-cache: if found colocated with binary, copy to cache dir for resilience
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                if path.as_path() == dir.join(metallib_name) {
+                    if let Some(ref cache) = cache_dir {
+                        let dest = cache.join(metallib_name);
+                        if !dest.exists() {
+                            let _ = std::fs::create_dir_all(cache);
+                            if std::fs::copy(path, &dest).is_ok() {
+                                tracing::debug!("Cached metallib to {}", dest.display());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // Not found locally — try to auto-download from GitHub releases
+    if let Some(ref cache) = cache_dir {
+        let dest = cache.join(metallib_name);
+        if download_metallib(&dest) {
+            unsafe { std::env::set_var("PMETAL_METALLIB_PATH", &dest) };
+            return;
+        }
+    }
+
+    // Download failed or no HOME — print actionable instructions
+    let locations = search_paths
+        .iter()
+        .map(|p| format!("  - {}", p.display()))
+        .collect::<Vec<_>>()
+        .join("\n");
+    eprintln!(
+        "\n\x1b[1;33mwarning:\x1b[0m mlx.metallib not found — Metal GPU acceleration will fail.\n\n\
+         Searched:\n{locations}\n\n\
+         To fix this, do ONE of the following:\n\
+         \x1b[1m  1. Rebuild from source:\x1b[0m  cargo install pmetal-cli  (auto-caches metallib)\n\
+         \x1b[1m  2. Download manually:\x1b[0m\n\
+             curl -fSL -o ~/.cache/pmetal/lib/mlx.metallib \\\n\
+               https://github.com/epistates/pmetal/releases/download/v{version}/mlx.metallib\n\
+         \x1b[1m  3. Homebrew:\x1b[0m             brew install epistates/tap/pmetal\n\n\
+         The metallib ships with every pmetal release and is built during compilation.\n\
+         See: https://github.com/epistates/pmetal#installation\n",
+        version = env!("CARGO_PKG_VERSION"),
+    );
+}
+
+/// Download `mlx.metallib` from the matching GitHub release.
+///
+/// Returns `true` if the download succeeded and the file is in place.
+fn download_metallib(dest: &std::path::Path) -> bool {
+    let version = env!("CARGO_PKG_VERSION");
+    let url = format!(
+        "https://github.com/epistates/pmetal/releases/download/v{version}/mlx.metallib"
+    );
+
+    eprintln!(
+        "\x1b[1;36minfo:\x1b[0m mlx.metallib not found locally. \
+         Downloading from GitHub releases (one-time setup)..."
+    );
+
+    if let Some(parent) = dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+
+    // Use a temp file so a partial download doesn't leave a broken metallib
+    let tmp = dest.with_extension("metallib.tmp");
+
+    let status = std::process::Command::new("curl")
+        .args([
+            "-fSL",           // fail on HTTP errors, show errors, follow redirects
+            "--progress-bar", // compact progress indicator
+            "-o",
+        ])
+        .arg(&tmp)
+        .arg(&url)
+        .status();
+
+    match status {
+        Ok(s) if s.success() => {
+            // Atomic-ish rename into place
+            if std::fs::rename(&tmp, dest).is_ok() {
+                eprintln!(
+                    "\x1b[1;32minfo:\x1b[0m Cached mlx.metallib to {}\n",
+                    dest.display()
+                );
+                true
+            } else {
+                let _ = std::fs::remove_file(&tmp);
+                false
+            }
+        }
+        _ => {
+            let _ = std::fs::remove_file(&tmp);
+            eprintln!(
+                "\x1b[1;33mwarning:\x1b[0m Download failed (offline or release v{version} \
+                 not published yet).\n"
+            );
+            false
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize logging
@@ -840,6 +976,8 @@ async fn main() -> anyhow::Result<()> {
                 .add_directive(tracing::Level::INFO.into()),
         )
         .init();
+
+    ensure_metallib();
 
     let cli = Cli::parse();
 

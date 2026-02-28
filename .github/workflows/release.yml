@@ -111,8 +111,12 @@ jobs:
           # Create tar.gz with binary + metallib
           tar -czf "artifacts/${BINARY}.tar.gz" "$BINARY" mlx.metallib
 
-          # Checksum the archive
+          # Also upload metallib as standalone asset (for auto-download on first run)
+          cp mlx.metallib artifacts/mlx.metallib
+
+          # Checksum the archive and metallib
           shasum -a 256 "artifacts/${BINARY}.tar.gz" > "artifacts/${BINARY}.tar.gz.sha256"
+          shasum -a 256 "artifacts/mlx.metallib" > "artifacts/mlx.metallib.sha256"
 
           echo "Artifact contents:"
           ls -lh "$BINARY" mlx.metallib
@@ -148,6 +152,7 @@ jobs:
           mkdir -p final-release
           find release-artifacts -name "*.tar.gz" -type f -exec cp {} final-release/ \;
           find release-artifacts -name "*.sha256" -type f -exec cp {} final-release/ \;
+          find release-artifacts -name "mlx.metallib" -type f -exec cp {} final-release/ \;
 
           echo "Release contents:"
           ls -lah final-release/
@@ -170,6 +175,7 @@ jobs:
           files: |
             final-release/*.tar.gz
             final-release/*.sha256
+            final-release/mlx.metallib
             final-release/SHA256SUMS
           generate_release_notes: true
           draft: false

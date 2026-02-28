@@ -4664,9 +4664,9 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mlx-rs"
-version = "0.25.4"
+version = "0.25.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "544d1c776030740f55e90672bc94491965e08991e44ac8fb7e4ba15cc372f4e8"
+checksum = "15e7d3414a54dc6b19b8078d293265e61050631b76ae775b8a7c1edc31d5aa6b"
 dependencies = [
  "bytemuck",
  "dyn-clone",
@@ -4690,9 +4690,9 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mlx-sys"
-version = "0.2.1"
+version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e8ed9b6a1464a10c3d417c9c6e793d4aac8a0ae1526bff15f124eb594419135"
+checksum = "63b442f328c86cd87198c139b67cdb94fe398c7ff75184d467817173f494d589"
 dependencies = [
  "bindgen",
  "cc",
