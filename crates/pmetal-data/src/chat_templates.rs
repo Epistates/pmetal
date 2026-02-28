@@ -814,6 +814,128 @@ impl ChatTemplate {
     }
 }
 
+/// Detect the appropriate chat template by inspecting the model's `tokenizer_config.json` Jinja
+/// string first, then falling back to model-name heuristics.
+///
+/// This is the preferred entry point — it gives consistent results across training, inference,
+/// and distillation because the same Jinja patterns are checked everywhere.
+pub fn detect_chat_template(model_path: &std::path::Path, model_name: &str) -> ChatTemplate {
+    // 1. Try tokenizer_config.json Jinja string
+    let config_path = model_path.join("tokenizer_config.json");
+    if let Ok(content) = std::fs::read_to_string(&config_path) {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+            if let Some(jinja) = extract_jinja_template(&json) {
+                if let Some(mut template) = detect_template_from_jinja(&jinja) {
+                    // Refine: if the Jinja matched generic ChatML but model_type is "qwen2",
+                    // upgrade to Qwen variant (adds default system message for training).
+                    if template.template_type == ChatTemplateType::ChatMl {
+                        let is_qwen = json
+                            .get("model_type")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|t| t.to_lowercase().contains("qwen"));
+                        if is_qwen {
+                            template = ChatTemplate::qwen();
+                        }
+                    }
+                    tracing::info!(
+                        "Chat template: {:?} (from tokenizer_config.json)",
+                        template.template_type
+                    );
+                    return template;
+                }
+            }
+        }
+    }
+
+    // 2. Fall back to model-name heuristics
+    let template = detect_template_from_model(model_name);
+    tracing::info!(
+        "Chat template: {:?} (from model name)",
+        template.template_type
+    );
+    template
+}
+
+/// Extract the Jinja template string from the `chat_template` field in tokenizer_config.json.
+///
+/// Handles two formats:
+/// - **String**: `"chat_template": "<jinja string>"` — returned directly.
+/// - **Array**: `"chat_template": [{"name": "default", "template": "..."}, ...]` —
+///   returns the `"default"` entry if present, otherwise the first entry.
+fn extract_jinja_template(json: &serde_json::Value) -> Option<String> {
+    let field = json.get("chat_template")?;
+
+    // Simple string
+    if let Some(s) = field.as_str() {
+        return Some(s.to_string());
+    }
+
+    // Array of {name, template} objects (HuggingFace Transformers ≥ v4.39)
+    if let Some(arr) = field.as_array() {
+        // Prefer "default", fall back to first entry
+        let default = arr.iter().find(|obj| {
+            obj.get("name")
+                .and_then(|n| n.as_str())
+                .is_some_and(|n| n == "default")
+        });
+        let chosen = default.or_else(|| arr.first())?;
+        return chosen
+            .get("template")
+            .and_then(|t| t.as_str())
+            .map(String::from);
+    }
+
+    None
+}
+
+/// Detect a chat template from a Jinja template string found in `tokenizer_config.json`.
+///
+/// Order matters — more specific patterns (Phi4's `<|im_sep|>`) are checked before
+/// generic ones (ChatML's `<|im_start|>`).
+fn detect_template_from_jinja(jinja: &str) -> Option<ChatTemplate> {
+    // Phi4: uses <|im_start|> + <|im_sep|> (distinct from plain ChatML)
+    if jinja.contains("<|im_start|>") && jinja.contains("<|im_sep|>") {
+        return Some(ChatTemplate::new(ChatTemplateType::Phi4));
+    }
+    // ChatML / Qwen: <|im_start|> without <|im_sep|>
+    if jinja.contains("<|im_start|>") {
+        return Some(ChatTemplate::chatml());
+    }
+    // Llama-3: <|begin_of_text|> or <|start_header_id|>
+    if jinja.contains("<|begin_of_text|>") || jinja.contains("<|start_header_id|>") {
+        return Some(ChatTemplate::llama3());
+    }
+    // Llama-2: <<SYS>> (must come before Mistral which also uses [INST])
+    if jinja.contains("<<SYS>>") {
+        return Some(ChatTemplate::llama2());
+    }
+    // Gemma: <start_of_turn>
+    if jinja.contains("<start_of_turn>") {
+        return Some(ChatTemplate::gemma());
+    }
+    // Mistral: [INST] without <<SYS>>
+    if jinja.contains("[INST]") {
+        return Some(ChatTemplate::mistral());
+    }
+    // Phi-3: <|user|> + <|end|>
+    if jinja.contains("<|user|>") && jinja.contains("<|end|>") {
+        return Some(ChatTemplate::phi3());
+    }
+    // GPT-OSS Harmony: <|start|> + <|message|>
+    if jinja.contains("<|start|>") && jinja.contains("<|message|>") {
+        return Some(ChatTemplate::gpt_oss());
+    }
+    // Alpaca: ### Instruction
+    if jinja.contains("### Instruction") {
+        return Some(ChatTemplate::alpaca());
+    }
+    // Vicuna: USER: + ASSISTANT:
+    if jinja.contains("USER:") && jinja.contains("ASSISTANT:") {
+        return Some(ChatTemplate::new(ChatTemplateType::Vicuna));
+    }
+    None
+}
+
 /// Detect the appropriate chat template from a model name.
 pub fn detect_template_from_model(model_name: &str) -> ChatTemplate {
     let name_lower = model_name.to_lowercase();

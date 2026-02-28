@@ -168,15 +168,21 @@ impl TrainingDataset {
     }
 
     /// Load raw text samples from JSONL without tokenizing.
+    ///
+    /// If `path` is a directory, auto-discovers a `.jsonl` file inside it:
+    /// tries `train.jsonl`, `data.jsonl`, `dataset.jsonl` in order, then
+    /// suggests any other `.jsonl` files found.
     pub fn load_jsonl_text<P: AsRef<Path>>(
         path: P,
         format: DatasetFormat,
         template: Option<&ChatTemplate>,
     ) -> Result<Vec<TextSample>> {
-        let file = File::open(path.as_ref()).map_err(|e| {
+        let path = Self::resolve_dataset_path(path.as_ref())?;
+
+        let file = File::open(&path).map_err(|e| {
             pmetal_core::PMetalError::Io(std::io::Error::new(
                 e.kind(),
-                format!("Failed to open dataset file: {}", e),
+                format!("Failed to open dataset file '{}': {}", path.display(), e),
             ))
         })?;
 
@@ -206,6 +212,65 @@ impl TrainingDataset {
         }
 
         Ok(samples)
+    }
+
+    /// Resolve a dataset path, handling the case where the user passes a directory.
+    fn resolve_dataset_path(path: &Path) -> Result<PathBuf> {
+        if !path.is_dir() {
+            return Ok(path.to_path_buf());
+        }
+
+        // Try well-known names in priority order
+        const WELL_KNOWN: &[&str] = &["train.jsonl", "data.jsonl", "dataset.jsonl"];
+        for name in WELL_KNOWN {
+            let candidate = path.join(name);
+            if candidate.exists() {
+                tracing::info!("Auto-discovered dataset file: {}", candidate.display());
+                return Ok(candidate);
+            }
+        }
+
+        // List any other .jsonl files as suggestions
+        let jsonl_files: Vec<String> = std::fs::read_dir(path)
+            .map_err(|e| {
+                pmetal_core::PMetalError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("Failed to read directory '{}': {}", path.display(), e),
+                ))
+            })?
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.ends_with(".jsonl") {
+                    Some(name)
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if !jsonl_files.is_empty() {
+            Err(pmetal_core::PMetalError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "'{}' is a directory. No standard dataset file found (tried: {}). \
+                     Did you mean one of these? {}",
+                    path.display(),
+                    WELL_KNOWN.join(", "),
+                    jsonl_files.join(", ")
+                ),
+            )))
+        } else {
+            Err(pmetal_core::PMetalError::Io(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!(
+                    "'{}' is a directory with no .jsonl files. \
+                     Pass a file path instead, e.g.: {}/train.jsonl",
+                    path.display(),
+                    path.display()
+                ),
+            )))
+        }
     }
 
     /// Detect the format from a JSON line.

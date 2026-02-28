@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 use mlx_rs::{
@@ -531,6 +532,8 @@ impl Qwen3LoraDecoderLayer {
     }
 }
 
+static GRAD_CKPT_WARN: Once = Once::new();
+
 /// LoRA-enabled Qwen3 model (without LM head).
 #[derive(Debug)]
 pub struct Qwen3LoraModel {
@@ -636,9 +639,12 @@ impl Qwen3LoraModel {
             // MLX's lazy evaluation with unified memory handles memory pressure reasonably well.
             // True gradient checkpointing (save/recompute) would require custom VJP implementation.
             if checkpointing_enabled && (idx + 1) % layers_per_block == 0 {
-                tracing::warn!(
-                    "Gradient checkpointing requested but not yet implemented - no memory savings applied"
-                );
+                GRAD_CKPT_WARN.call_once(|| {
+                    tracing::warn!(
+                        "Gradient checkpointing not yet implemented for Qwen3 - \
+                         no memory savings applied. Use --no-gradient-checkpointing to suppress."
+                    );
+                });
             }
         }
 

@@ -970,9 +970,21 @@ async fn main() -> anyhow::Result<()> {
             let stats = pmetal_mlx::memory::get_memory_stats();
             println!("Memory Statistics:");
             println!("  Total:     {:.2} GB", stats.total_gb());
-            println!("  Used:      {:.2} GB", stats.used_gb());
-            println!("  Available: {:.2} GB", stats.available_gb());
-            println!("  Peak:      {:.2} GB", stats.peak_gb());
+            if stats.total_gb() > 0.0 {
+                let used_pct = (stats.used_gb() / stats.total_gb()) * 100.0;
+                let peak_pct = (stats.peak_gb() / stats.total_gb()) * 100.0;
+                println!("  Used:      {:.2} GB ({:.0}%)", stats.used_gb(), used_pct);
+                println!(
+                    "  Available: {:.2} GB ({:.0}%)",
+                    stats.available_gb(),
+                    100.0 - used_pct
+                );
+                println!("  Peak:      {:.2} GB ({:.0}%)", stats.peak_gb(), peak_pct);
+            } else {
+                println!("  Used:      {:.2} GB", stats.used_gb());
+                println!("  Available: {:.2} GB", stats.available_gb());
+                println!("  Peak:      {:.2} GB", stats.peak_gb());
+            }
         }
 
         Commands::Bench {
@@ -1092,7 +1104,17 @@ async fn run_quantization(
             PathBuf::from(model_path)
         };
 
-    // 1. Load IMatrix if provided
+    // 1. Validate quantization method (fail fast before any I/O)
+    const VALID_METHODS: &[&str] = &["dynamic", "q8_0", "q4_k_m"];
+    if !VALID_METHODS.contains(&method) {
+        anyhow::bail!(
+            "Unknown quantization method '{}'. Valid methods: {}",
+            method,
+            VALID_METHODS.join(", ")
+        );
+    }
+
+    // 2. Load IMatrix if provided
     let imatrix = if let Some(path) = imatrix_path {
         tracing::info!("Loading IMatrix from {}", path);
         Some(IMatrix::load(Path::new(path))?)
@@ -1100,18 +1122,15 @@ async fn run_quantization(
         None
     };
 
-    // 2. Initialize Dynamic Quantizer
+    // 3. Initialize Dynamic Quantizer
     let quantizer = if method == "dynamic" {
         let config = DynamicQuantizationConfig::default();
         DynamicQuantizer::new(config, imatrix)
     } else {
-        // Static quantization fallback (mocking dynamic with fixed type)
-        // In real impl, we'd parse the method string to GgmlType
-        // For now, let's just support dynamic or fallback to Q4_K_M
         let base_type = match method {
             "q8_0" => GgmlType::Q8_0,
             "q4_k_m" => GgmlType::Q4K,
-            _ => GgmlType::Q4K,
+            _ => unreachable!("validated above"),
         };
 
         let config = DynamicQuantizationConfig {
@@ -1123,7 +1142,7 @@ async fn run_quantization(
         DynamicQuantizer::new(config, None)
     };
 
-    // 3. Load Model Weights
+    // 4. Load Model Weights
     tracing::info!("Scanning model weights from {:?}...", resolved_model_path);
     // Use the loader from pmetal_models to handle sharded safetensors
     let weights = pmetal_models::loader::load_weights(&resolved_model_path)
@@ -1131,7 +1150,7 @@ async fn run_quantization(
 
     tracing::info!("Loaded {} tensors", weights.len());
 
-    // 4. Detect Architecture
+    // 5. Detect Architecture
     let config_path = resolved_model_path.join("config.json");
     let mut architecture = "llama".to_string(); // Default fallback
 
@@ -1168,10 +1187,10 @@ async fn run_quantization(
         tracing::warn!("config.json not found, defaulting architecture to 'llama'");
     }
 
-    // 5. Initialize GGUF Builder
+    // 6. Initialize GGUF Builder
     let mut builder = GgufBuilder::with_model(&architecture, "quantized-model");
 
-    // 6. Quantize and Write
+    // 7. Quantize and Write
     tracing::info!("Starting quantization...");
 
     // Sort keys for deterministic output
@@ -1302,6 +1321,10 @@ async fn run_distillation_cli(
     let tokenizer_path = student_path.join("tokenizer.json");
     let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
 
+    // 2b. Detect chat template from student model
+    let chat_template =
+        pmetal_data::chat_templates::detect_chat_template(&student_path, student_id);
+
     // 3. Load Dataset
     tracing::info!("Loading dataset: {}", dataset_path);
     let train_dataset = TrainingDataset::from_jsonl_tokenized(
@@ -1309,7 +1332,7 @@ async fn run_distillation_cli(
         &tokenizer,
         DatasetFormat::Auto,
         max_seq_len,
-        None,
+        Some(&chat_template),
     )?;
 
     // 4. Load Teacher Model (Frozen)
@@ -1421,8 +1444,17 @@ async fn run_distillation_cli(
     std::fs::create_dir_all(&validated_distill_output)?;
     student_model.save_lora_weights(&lora_output)?;
 
+    println!("\n========================================");
+    println!("  Distillation Complete");
+    println!("========================================");
+    println!("  Adapters:  {}", lora_output.display());
+    println!("  Student:   {}", student_id);
+    println!("  Template:  {:?}", chat_template.template_type);
+    println!("========================================");
+    println!("\nNext steps:");
     println!(
-        "\nDistillation complete! Adapters saved to {}",
+        "  Inference:  pmetal run {} --lora {}",
+        student_id,
         lora_output.display()
     );
     Ok(())
@@ -1589,13 +1621,17 @@ async fn run_training(
     let tokenizer = if tokenizer_path.exists() {
         Tokenizer::from_file(&tokenizer_path)?
     } else {
-        anyhow::bail!("Tokenizer not found at {:?}", tokenizer_path);
+        anyhow::bail!(
+            "Tokenizer not found at {:?}. GGUF models don't bundle a tokenizer — \
+             download the source model first with: pmetal download {}",
+            tokenizer_path,
+            config.model.model_id
+        );
     };
 
-    // Detect chat template from model name for OpenAI/ShareGPT formatting
+    // Detect chat template for OpenAI/ShareGPT formatting (checks tokenizer_config.json first)
     let chat_template =
-        pmetal_data::chat_templates::detect_template_from_model(&config.model.model_id);
-    tracing::info!("Using chat template: {:?}", chat_template.template_type);
+        pmetal_data::chat_templates::detect_chat_template(&model_path, &config.model.model_id);
 
     // Load and tokenize training dataset
     tracing::info!("Loading training dataset: {}", config.dataset.dataset_id);
@@ -1953,6 +1989,16 @@ async fn run_training(
     println!("Output:       {}", output_dir);
     println!("========================================");
 
+    println!("\nNext steps:");
+    println!(
+        "  Inference:  pmetal infer -m {} --lora {}/lora_weights.safetensors -p \"Your prompt\"",
+        config.model.model_id, output_dir
+    );
+    println!(
+        "  Quantize:   pmetal quantize -m {} --lora {}/lora_weights.safetensors -o model.gguf",
+        config.model.model_id, output_dir
+    );
+
     Ok(())
 }
 
@@ -2007,12 +2053,28 @@ async fn run_inference(
 
         // Download tokenizer files
         tracing::info!("Downloading tokenizer...");
-        let _ = pmetal_hub::download_file(model_id, "tokenizer.json", None, None).await;
-        let _ = pmetal_hub::download_file(model_id, "tokenizer_config.json", None, None).await;
-        let _ = pmetal_hub::download_file(model_id, "special_tokens_map.json", None, None).await;
+        if let Err(e) = pmetal_hub::download_file(model_id, "tokenizer.json", None, None).await {
+            tracing::warn!("Failed to download tokenizer.json: {e} — tokenization may fail");
+        }
+        if let Err(e) =
+            pmetal_hub::download_file(model_id, "tokenizer_config.json", None, None).await
+        {
+            tracing::warn!(
+                "Failed to download tokenizer_config.json: {e} — chat template detection will fall back to model-name heuristics"
+            );
+        }
+        if let Err(e) =
+            pmetal_hub::download_file(model_id, "special_tokens_map.json", None, None).await
+        {
+            tracing::debug!("special_tokens_map.json not available: {e}");
+        }
 
         // Download generation config if available
-        let _ = pmetal_hub::download_file(model_id, "generation_config.json", None, None).await;
+        if let Err(e) =
+            pmetal_hub::download_file(model_id, "generation_config.json", None, None).await
+        {
+            tracing::debug!("generation_config.json not available: {e}");
+        }
 
         // Download model weights (safetensors)
         tracing::info!("Downloading model weights (this may take a while for large models)...");
@@ -2029,7 +2091,12 @@ async fn run_inference(
     let tokenizer = if tokenizer_path.exists() {
         Tokenizer::from_file(&tokenizer_path)?
     } else {
-        anyhow::bail!("Tokenizer not found at {:?}", tokenizer_path);
+        anyhow::bail!(
+            "Tokenizer not found at {:?}. GGUF models don't bundle a tokenizer — \
+             download the source model first with: pmetal download {}",
+            tokenizer_path,
+            model_id
+        );
     };
 
     // Check if LoRA is requested
@@ -2086,31 +2153,22 @@ async fn run_inference(
 
     // Apply chat template if needed
     // The template handles thinking mode - model decides when to think unless --no-thinking
-    let final_prompt = if use_chat {
+    let (final_prompt, template_type) = if use_chat {
         apply_chat_template(&tokenizer, prompt, system, &model_path, no_thinking)?
     } else {
-        prompt.to_string()
+        (
+            prompt.to_string(),
+            pmetal_data::chat_templates::ChatTemplateType::ChatMl,
+        )
     };
 
     // Tokenize prompt
     let input_ids = tokenizer.encode(&final_prompt)?;
     tracing::info!("Tokenized {} tokens", input_ids.len());
 
-    // Configure stop tokens for chat mode
-    // Only stop on <|im_end|> to allow thinking blocks to complete
+    // Configure stop tokens — template-aware for chat mode
     let stop_tokens = if use_chat {
-        let mut tokens = Vec::new();
-        // <|im_end|> token - stops at end of assistant response
-        if let Ok(im_end) = tokenizer.encode("<|im_end|>") {
-            if let Some(&token) = im_end.last() {
-                tokens.push(token);
-            }
-        }
-        // Fallback
-        if tokens.is_empty() {
-            tokens.push(151645); // Qwen3's <|im_end|> token
-        }
-        tokens
+        get_chat_stop_tokens(template_type, &tokenizer)
     } else {
         // Non-chat mode: use EOS tokens from generation_config.json
         get_eos_tokens(&model_path, &tokenizer)
@@ -2441,23 +2499,11 @@ fn load_sampling_defaults(model_path: &Path, thinking_mode: bool) -> SamplingDef
 /// - "instruct", "chat", "it" in model name
 /// - Known instruction-tuned model architectures
 fn is_instruction_tuned(model_path: &Path) -> bool {
-    // Check model name/path for instruction indicators
-    let path_str = model_path.to_string_lossy().to_lowercase();
-    if path_str.contains("instruct")
-        || path_str.contains("-it")
-        || path_str.contains("chat")
-        || path_str.contains("qwen3")
-        || path_str.contains("llama-3")
-    {
-        return true;
-    }
-
-    // Check for chat_template in tokenizer_config.json
+    // Primary: check for chat_template in tokenizer_config.json (authoritative)
     let config_path = model_path.join("tokenizer_config.json");
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                // Has chat template -> instruction tuned
                 if config.get("chat_template").is_some() {
                     return true;
                 }
@@ -2465,12 +2511,21 @@ fn is_instruction_tuned(model_path: &Path) -> bool {
         }
     }
 
-    false
+    // Fallback: only explicit instruct markers in model name
+    let path_str = model_path.to_string_lossy().to_lowercase();
+    path_str.contains("instruct")
+        || path_str.contains("-it-")
+        || path_str.contains("-it/")
+        || path_str.ends_with("-it")
+        || path_str.contains("chat")
 }
 
-/// Apply chat template to the prompt.
+/// Apply chat template to the prompt using unified detection.
 ///
-/// If `no_thinking` is true, prefills empty thinking block to disable reasoning.
+/// Returns the formatted prompt string and the detected `ChatTemplateType` so the caller
+/// can select the right stop tokens.
+///
+/// If `no_thinking` is true, prefills empty thinking block to disable reasoning (ChatML/Phi4 only).
 /// Otherwise, the model decides when to use thinking based on query complexity.
 fn apply_chat_template(
     _tokenizer: &Tokenizer,
@@ -2478,33 +2533,30 @@ fn apply_chat_template(
     system_message: Option<&str>,
     model_path: &Path,
     no_thinking: bool,
-) -> anyhow::Result<String> {
-    // Try to load chat template from tokenizer_config.json
-    let config_path = model_path.join("tokenizer_config.json");
-    if config_path.exists() {
-        let content = std::fs::read_to_string(&config_path)?;
-        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-            // Check for Qwen3/ChatML style template
-            if let Some(template) = config.get("chat_template").and_then(|t| t.as_str()) {
-                if template.contains("chatml") || template.contains("<|im_start|>") {
-                    return Ok(format_chatml(user_message, system_message, no_thinking));
-                }
-                if template.contains("llama") || template.contains("<|begin_of_text|>") {
-                    return Ok(format_llama3(user_message, system_message));
-                }
-            }
+) -> anyhow::Result<(String, pmetal_data::chat_templates::ChatTemplateType)> {
+    use pmetal_data::chat_templates::ChatTemplateType;
 
-            // Check model type hints
-            if let Some(model_type) = config.get("model_type").and_then(|t| t.as_str()) {
-                if model_type.to_lowercase().contains("qwen") {
-                    return Ok(format_chatml(user_message, system_message, no_thinking));
-                }
-            }
+    let detected = pmetal_data::chat_templates::detect_chat_template(
+        model_path,
+        &model_path.to_string_lossy(),
+    );
+
+    let formatted = match detected.template_type {
+        ChatTemplateType::ChatMl | ChatTemplateType::Qwen => {
+            format_chatml(user_message, system_message, no_thinking)
         }
-    }
+        ChatTemplateType::Llama3 => format_llama3(user_message, system_message),
+        ChatTemplateType::Llama2 => format_llama2_inference(user_message, system_message),
+        ChatTemplateType::Gemma => format_gemma_inference(user_message, system_message),
+        ChatTemplateType::Mistral => format_mistral_inference(user_message, system_message),
+        ChatTemplateType::Phi3 => format_phi3_inference(user_message, system_message),
+        ChatTemplateType::Phi4 => format_phi4_inference(user_message, system_message, no_thinking),
+        ChatTemplateType::GptOss => format_gpt_oss_inference(user_message, system_message),
+        // Alpaca, Vicuna, Zephyr, Custom — fall back to ChatML for inference
+        _ => format_chatml(user_message, system_message, no_thinking),
+    };
 
-    // Default to ChatML format (widely compatible)
-    Ok(format_chatml(user_message, system_message, no_thinking))
+    Ok((formatted, detected.template_type))
 }
 
 /// Format message using ChatML template (used by Qwen, many others).
@@ -2566,6 +2618,149 @@ fn format_llama3(user_message: &str, system_message: Option<&str>) -> String {
     result
 }
 
+/// Format message using Llama-2 template for inference.
+fn format_llama2_inference(user_message: &str, system_message: Option<&str>) -> String {
+    let mut result = String::from("<s>[INST] ");
+    if let Some(sys) = system_message {
+        result.push_str(&format!("<<SYS>>\n{}\n<</SYS>>\n\n", sys));
+    }
+    result.push_str(user_message);
+    result.push_str(" [/INST] ");
+    result
+}
+
+/// Format message using Gemma template for inference.
+fn format_gemma_inference(user_message: &str, system_message: Option<&str>) -> String {
+    let mut result = String::new();
+    if let Some(sys) = system_message {
+        // Gemma folds system into a user turn
+        result.push_str(&format!(
+            "<start_of_turn>user\n{}\n\n{}<end_of_turn>\n",
+            sys, user_message
+        ));
+    } else {
+        result.push_str(&format!(
+            "<start_of_turn>user\n{}<end_of_turn>\n",
+            user_message
+        ));
+    }
+    result.push_str("<start_of_turn>model\n");
+    result
+}
+
+/// Format message using Mistral template for inference.
+fn format_mistral_inference(user_message: &str, system_message: Option<&str>) -> String {
+    let mut result = String::from("[INST] ");
+    if let Some(sys) = system_message {
+        result.push_str(sys);
+        result.push_str("\n\n");
+    }
+    result.push_str(user_message);
+    result.push_str(" [/INST]");
+    result
+}
+
+/// Format message using Phi-3 template for inference.
+fn format_phi3_inference(user_message: &str, system_message: Option<&str>) -> String {
+    let mut result = String::new();
+    if let Some(sys) = system_message {
+        result.push_str("<|system|>\n");
+        result.push_str(sys);
+        result.push_str("<|end|>\n");
+    }
+    result.push_str("<|user|>\n");
+    result.push_str(user_message);
+    result.push_str("<|end|>\n");
+    result.push_str("<|assistant|>\n");
+    result
+}
+
+/// Format message using Phi-4 template for inference.
+///
+/// Phi-4 uses `<|im_sep|>` instead of the newline separator in standard ChatML.
+fn format_phi4_inference(
+    user_message: &str,
+    system_message: Option<&str>,
+    no_thinking: bool,
+) -> String {
+    let mut result = String::new();
+
+    if let Some(sys) = system_message {
+        result.push_str("<|im_start|>system<|im_sep|>");
+        result.push_str(sys);
+        result.push_str("<|im_end|>");
+    }
+
+    result.push_str("<|im_start|>user<|im_sep|>");
+    result.push_str(user_message);
+    result.push_str("<|im_end|>");
+    result.push_str("<|im_start|>assistant<|im_sep|>");
+
+    if no_thinking {
+        result.push_str("<think></think>");
+    }
+
+    result
+}
+
+/// Format message using GPT-OSS Harmony template for inference.
+fn format_gpt_oss_inference(user_message: &str, system_message: Option<&str>) -> String {
+    let mut result = String::new();
+    if let Some(sys) = system_message {
+        result.push_str("<|start|>system<|message|>");
+        result.push_str(sys);
+        result.push_str("<|end|>");
+    }
+    result.push_str("<|start|>user<|message|>");
+    result.push_str(user_message);
+    result.push_str("<|end|>");
+    result.push_str("<|start|>assistant<|channel|>final<|message|>");
+    result
+}
+
+/// Get stop tokens appropriate for a given chat template type.
+///
+/// Encodes the template's EOS token via the tokenizer; falls back to the generic
+/// `get_eos_tokens` if encoding fails.
+fn get_chat_stop_tokens(
+    template_type: pmetal_data::chat_templates::ChatTemplateType,
+    tokenizer: &Tokenizer,
+) -> Vec<u32> {
+    let eos_str = template_type.eos_token();
+    let mut tokens = Vec::new();
+    if let Ok(encoded) = tokenizer.encode(eos_str) {
+        if let Some(&tok) = encoded.last() {
+            tokens.push(tok);
+        }
+    }
+    // Hardcoded fallbacks for common models whose tokenizers might not cleanly encode
+    // the special-token string
+    if tokens.is_empty() {
+        match template_type {
+            pmetal_data::chat_templates::ChatTemplateType::ChatMl
+            | pmetal_data::chat_templates::ChatTemplateType::Qwen
+            | pmetal_data::chat_templates::ChatTemplateType::Phi4 => {
+                tokens.push(151645); // <|im_end|>
+            }
+            pmetal_data::chat_templates::ChatTemplateType::Llama3 => {
+                tokens.push(128009); // <|eot_id|>
+            }
+            _ => {
+                // Best-effort: try encoding </s> (common EOS across many models)
+                if let Ok(encoded) = tokenizer.encode("</s>") {
+                    if let Some(&tok) = encoded.last() {
+                        tokens.push(tok);
+                    }
+                }
+                if tokens.is_empty() {
+                    tokens.push(2); // Very common </s> id
+                }
+            }
+        }
+    }
+    tokens
+}
+
 /// Extract the final response after </think> tag, discarding thinking content.
 ///
 /// Handles several cases:
@@ -2580,11 +2775,8 @@ fn extract_final_response(text: &str) -> String {
         let cleaned = after_think
             .trim()
             .trim_start_matches("<think>")
-            .trim_start_matches('\n')
-            .trim_end_matches("<|im_end|>")
-            .trim_end_matches("<|endoftext|>")
-            .trim();
-        return cleaned.to_string();
+            .trim_start_matches('\n');
+        return strip_eos_tokens(cleaned).to_string();
     }
 
     // Case 2: Incomplete thinking - model started <think> but never finished
@@ -2594,10 +2786,34 @@ fn extract_final_response(text: &str) -> String {
     }
 
     // Case 3: No thinking block, return as-is
-    text.trim_end_matches("<|im_end|>")
-        .trim_end_matches("<|endoftext|>")
-        .trim()
-        .to_string()
+    strip_eos_tokens(text).to_string()
+}
+
+/// Strip any known EOS / stop tokens from the end of generated text.
+fn strip_eos_tokens(text: &str) -> &str {
+    // Order: longest tokens first to avoid partial matches
+    const EOS_TOKENS: &[&str] = &[
+        "<|endoftext|>",
+        "<|im_end|>",
+        "<|eot_id|>",
+        "<end_of_turn>",
+        "<|return|>",
+        "<|end|>",
+        "</s>",
+    ];
+
+    let mut s = text.trim();
+    // Loop in case multiple EOS tokens are concatenated
+    loop {
+        let before = s;
+        for tok in EOS_TOKENS {
+            s = s.trim_end_matches(tok).trim();
+        }
+        if s == before {
+            break;
+        }
+    }
+    s
 }
 
 /// Extract thinking content from response (for display purposes).
@@ -3298,7 +3514,10 @@ fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
         || temp_dir
             .as_ref()
             .map(|t| canonical.starts_with(t))
-            .unwrap_or(false);
+            .unwrap_or(false)
+        // macOS: /tmp symlinks to /private/tmp, but temp_dir() returns /var/folders/
+        || canonical.starts_with("/tmp")
+        || canonical.starts_with("/private/tmp");
 
     if !is_safe {
         anyhow::bail!(
