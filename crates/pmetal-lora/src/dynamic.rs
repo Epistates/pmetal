@@ -347,6 +347,28 @@ impl DynamicLoraModel {
             Self::Phi(_) => "Phi",
         }
     }
+
+    /// Merge LoRA weights into base weights.
+    pub fn merge_lora(&mut self) -> Result<(), LoraError> {
+        match self {
+            Self::Llama(m) => m.merge_lora(),
+            Self::Mistral(m) => m.merge_lora(),
+            Self::Qwen3(m) => m.merge_lora(),
+            Self::Gemma(m) => m.merge_lora(),
+            Self::Phi(m) => m.merge_lora(),
+        }
+    }
+
+    /// Unmerge is not supported.
+    pub fn unmerge_lora(&mut self) -> Result<(), LoraError> {
+        match self {
+            Self::Llama(m) => m.unmerge_lora(),
+            Self::Mistral(m) => m.unmerge_lora(),
+            Self::Qwen3(m) => m.unmerge_lora(),
+            Self::Gemma(m) => m.unmerge_lora(),
+            Self::Phi(m) => m.unmerge_lora(),
+        }
+    }
 }
 
 // Implement TrainableModel for DynamicLoraModel via dispatch

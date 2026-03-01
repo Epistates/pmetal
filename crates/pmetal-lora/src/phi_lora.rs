@@ -701,6 +701,26 @@ impl PhiLoraForCausalLM {
         KVCache::new(config)
     }
 
+    /// Merge LoRA weights into base weights.
+    pub fn merge_lora(&mut self) -> Result<(), LoraError> {
+        for layer in &mut self.model.layers {
+            layer.self_attn.q_proj.merge()?;
+            layer.self_attn.k_proj.merge()?;
+            layer.self_attn.v_proj.merge()?;
+            layer.self_attn.o_proj.merge()?;
+            layer.mlp.gate_up_proj.merge()?;
+            layer.mlp.down_proj.merge()?;
+        }
+        Ok(())
+    }
+
+    /// Unmerge is not supported.
+    pub fn unmerge_lora(&mut self) -> Result<(), LoraError> {
+        Err(LoraError::InvalidState(
+            "unmerge_lora is not supported: reload base model weights to undo a merge".to_string(),
+        ))
+    }
+
     /// Get all trainable LoRA parameters.
     pub fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
         let mut params = HashMap::new();
