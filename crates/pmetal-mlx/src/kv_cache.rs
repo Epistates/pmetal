@@ -1841,63 +1841,21 @@ impl PagedKVCache {
         key: &Array,
         value: &Array,
     ) -> Result<(), Exception> {
-        // Get or create the block
+        // Get or create the block as mutable
         let k_block = self.key_blocks[layer_idx][block_idx]
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| Exception::custom("Block not allocated"))?;
         let v_block = self.value_blocks[layer_idx][block_idx]
-            .as_ref()
+            .as_mut()
             .ok_or_else(|| Exception::custom("Block not allocated"))?;
 
         // Remove batch dimension from input [1, heads, 1, dim] -> [heads, 1, dim]
         let k_squeezed = key.squeeze_axes(&[0])?;
         let v_squeezed = value.squeeze_axes(&[0])?;
 
-        // Build new block with updated token
-        // This is a simplified implementation; optimal would use scatter operations
-        let before_k = if offset > 0 {
-            Some(k_block.index((.., ..offset as i32, ..)))
-        } else {
-            None
-        };
-        let after_k = if offset + 1 < self.config.block_size {
-            Some(k_block.index((.., (offset + 1) as i32.., ..)))
-        } else {
-            None
-        };
-
-        let before_v = if offset > 0 {
-            Some(v_block.index((.., ..offset as i32, ..)))
-        } else {
-            None
-        };
-        let after_v = if offset + 1 < self.config.block_size {
-            Some(v_block.index((.., (offset + 1) as i32.., ..)))
-        } else {
-            None
-        };
-
-        // Assemble new block
-        let mut k_parts: Vec<&Array> = Vec::new();
-        if let Some(ref b) = before_k {
-            k_parts.push(b);
-        }
-        k_parts.push(&k_squeezed);
-        if let Some(ref a) = after_k {
-            k_parts.push(a);
-        }
-
-        let mut v_parts: Vec<&Array> = Vec::new();
-        if let Some(ref b) = before_v {
-            v_parts.push(b);
-        }
-        v_parts.push(&v_squeezed);
-        if let Some(ref a) = after_v {
-            v_parts.push(a);
-        }
-
-        self.key_blocks[layer_idx][block_idx] = Some(concatenate_axis(&k_parts, 1)?);
-        self.value_blocks[layer_idx][block_idx] = Some(concatenate_axis(&v_parts, 1)?);
+        // In-place update using TryIndexMutOp (SOTA O(1) update)
+        k_block.try_index_mut((.., offset as i32..=offset as i32, ..), &k_squeezed)?;
+        v_block.try_index_mut((.., offset as i32..=offset as i32, ..), &v_squeezed)?;
 
         Ok(())
     }

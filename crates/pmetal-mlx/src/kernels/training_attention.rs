@@ -19,7 +19,7 @@ use pmetal_metal::{
 };
 
 use super::fused_attention::FusedAttentionConfig;
-use super::utils::{array_to_metal_buffer_f16, metal_buffer_to_array_f16};
+use super::utils::{array_to_metal_buffer_f16, metal_buffer_into_array_f16};
 use crate::error::MlxError;
 
 /// Result type for training attention.
@@ -158,8 +158,8 @@ pub fn training_attention_forward(
         .map_err(|e| MlxError::Metal(e.to_string()))?;
 
     // Convert output to MLX Array
-    let output_array = metal_buffer_to_array_f16(
-        &fa_output.output,
+    let output_array = metal_buffer_into_array_f16(
+        fa_output.output.clone(),
         &[q_shape[0], q_shape[1], q_shape[2], q_shape[3]],
     )?;
 
@@ -232,9 +232,9 @@ pub fn training_attention_backward(
     ];
 
     // Convert gradients to MLX Arrays
-    let d_queries = metal_buffer_to_array_f16(&d_q, &q_shape)?;
-    let d_keys = metal_buffer_to_array_f16(&d_k, &kv_shape)?;
-    let d_values = metal_buffer_to_array_f16(&d_v, &kv_shape)?;
+    let d_queries = metal_buffer_into_array_f16(d_q, &q_shape)?;
+    let d_keys = metal_buffer_into_array_f16(d_k, &kv_shape)?;
+    let d_values = metal_buffer_into_array_f16(d_v, &kv_shape)?;
 
     Ok(AttentionGradients {
         d_queries,

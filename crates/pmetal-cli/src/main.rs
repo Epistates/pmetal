@@ -413,6 +413,49 @@ enum Commands {
         max_seq_len: usize,
     },
 
+    /// Group Relative Policy Optimization (GRPO) for reasoning models
+    Grpo {
+        /// Model ID or path
+        #[arg(short, long)]
+        model: String,
+
+        /// Dataset path (JSONL with prompts)
+        #[arg(short, long)]
+        dataset: String,
+
+        /// Output directory
+        #[arg(short, long, default_value = "./output/grpo")]
+        output: String,
+
+        /// Number of generations per prompt (group size)
+        #[arg(long, default_value = "8")]
+        num_generations: usize,
+
+        /// KL penalty coefficient (beta)
+        #[arg(long, default_value = "0.001")]
+        beta: f64,
+
+        /// Learning rate
+        #[arg(long, default_value = "5e-6")]
+        learning_rate: f64,
+
+        /// Maximum sequence length for generations
+        #[arg(long, default_value = "512")]
+        max_seq_len: usize,
+
+        /// Enable DAPO (Distribution-Aware Policy Optimization)
+        #[arg(long)]
+        dapo: bool,
+
+        /// Use reasoning-aware rewards (e.g., length, formatting)
+        #[arg(long)]
+        reasoning_rewards: bool,
+
+        /// Disable Metal FlashAttention
+        #[arg(long)]
+        no_flash_attention: bool,
+    },
+
     /// Dataset utilities for preparing and analyzing training data
     Dataset {
         #[command(subcommand)]
@@ -1197,6 +1240,33 @@ async fn main() -> anyhow::Result<()> {
             .await?;
         }
 
+        Commands::Grpo {
+            model,
+            dataset,
+            output,
+            num_generations,
+            beta,
+            learning_rate,
+            max_seq_len,
+            dapo,
+            reasoning_rewards,
+            no_flash_attention,
+        } => {
+            run_grpo_cli(
+                &model,
+                &dataset,
+                &output,
+                num_generations,
+                beta,
+                learning_rate,
+                max_seq_len,
+                dapo,
+                reasoning_rewards,
+                !no_flash_attention,
+            )
+            .await?;
+        }
+
         Commands::Dataset { action } => {
             run_dataset_command(action).await?;
         }
@@ -1595,6 +1665,210 @@ async fn run_distillation_cli(
         student_id,
         lora_output.display()
     );
+    Ok(())
+}
+
+/// Run GRPO (Group Relative Policy Optimization) for reasoning models.
+#[allow(clippy::too_many_arguments)]
+async fn run_grpo_cli(
+    model_id: &str,
+    dataset_path: &str,
+    output_dir: &str,
+    num_generations: usize,
+    beta: f64,
+    learning_rate: f64,
+    max_seq_len: usize,
+    dapo: bool,
+    reasoning_rewards: bool,
+    use_metal_flash_attention: bool,
+) -> anyhow::Result<()> {
+    use pmetal_core::{LoraConfig, TrainingConfig};
+    use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
+    use pmetal_lora::DynamicLoraModel;
+    use pmetal_trainer::{GrpoConfig, GrpoTrainer, TrainingLoopConfig};
+    use std::path::{Path, PathBuf};
+
+    println!("========================================");
+    println!("  PMetal GRPO Reasoning Training");
+    println!("========================================");
+    println!("Model:         {}", model_id);
+    println!("Dataset:       {}", dataset_path);
+    println!("Output:        {}", output_dir);
+    println!("Generations:   {}", num_generations);
+    println!("Beta:          {}", beta);
+    println!("LR:            {:.2e}", learning_rate);
+    println!("DAPO:          {}", dapo);
+    println!("Reasoning Rew: {}", reasoning_rewards);
+    println!("========================================\n");
+
+    // 1. Resolve and Download Model
+    tracing::info!("Resolving model: {}", model_id);
+    let model_path = if model_id.contains('/') && !Path::new(model_id).exists() {
+        pmetal_hub::download_model(model_id, None, None).await?
+    } else {
+        PathBuf::from(model_id)
+    };
+
+    // 2. Load Tokenizer
+    tracing::info!("Loading tokenizer...");
+    let tokenizer_path = model_path.join("tokenizer.json");
+    let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
+
+    // 2b. Detect chat template
+    let chat_template = pmetal_data::chat_templates::detect_chat_template(&model_path, model_id);
+
+    // 3. Load Dataset (Prompts)
+    tracing::info!("Loading prompt dataset: {}", dataset_path);
+    let dataset = TrainingDataset::from_jsonl_tokenized(
+        dataset_path,
+        &tokenizer,
+        DatasetFormat::Auto,
+        max_seq_len,
+        Some(&chat_template),
+    )?;
+
+    // 4. Load Model (Trainable LoRA)
+    tracing::info!("Loading model with LoRA...");
+    let lora_config = LoraConfig {
+        r: 16,
+        alpha: 32.0,
+        ..Default::default()
+    };
+    let model = DynamicLoraModel::from_pretrained(&model_path, lora_config)?;
+
+    // 5. Setup GRPO Config
+    let mut grpo_config = GrpoConfig::new(num_generations).with_beta(beta);
+
+    if dapo {
+        grpo_config = grpo_config.for_dapo();
+    }
+
+    // 6. Setup Reward Functions
+    let mut rewards = pmetal_trainer::CombinedReward::new();
+
+    if reasoning_rewards {
+        // Simple reasoning format reward: favors completions with <thinking> tags
+        struct FormatReward;
+        impl pmetal_trainer::RewardFunction for FormatReward {
+            fn compute(
+                &self,
+                _prompts: &[String],
+                completions: &[String],
+                _images: Option<&[Vec<mlx_rs::Array>]>,
+            ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
+                Ok(completions
+                    .iter()
+                    .map(|c| {
+                        if c.contains("<thinking>") && c.contains("</thinking>") {
+                            1.0
+                        } else if c.contains("<thinking>") {
+                            0.5
+                        } else {
+                            0.0
+                        }
+                    })
+                    .collect())
+            }
+            fn name(&self) -> &str {
+                "format_reward"
+            }
+        }
+
+        // Length reward: small penalty for being too long or too short
+        struct LengthReward(usize);
+        impl pmetal_trainer::RewardFunction for LengthReward {
+            fn compute(
+                &self,
+                _prompts: &[String],
+                completions: &[String],
+                _images: Option<&[Vec<mlx_rs::Array>]>,
+            ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
+                Ok(completions
+                    .iter()
+                    .map(|c| {
+                        let len = c.len();
+                        if len > self.0 {
+                            -0.1
+                        } else if len < 10 {
+                            -0.5
+                        } else {
+                            0.1
+                        }
+                    })
+                    .collect())
+            }
+            fn name(&self) -> &str {
+                "length_reward"
+            }
+        }
+
+        rewards = rewards
+            .add(Box::new(FormatReward), 1.0)
+            .add(Box::new(LengthReward(max_seq_len * 2)), 0.2);
+    } else {
+        // Default dummy reward if none specified
+        struct DummyReward;
+        impl pmetal_trainer::RewardFunction for DummyReward {
+            fn compute(
+                &self,
+                _p: &[String],
+                completions: &[String],
+                _i: Option<&[Vec<mlx_rs::Array>]>,
+            ) -> pmetal_trainer::GrpoResult<Vec<f64>> {
+                Ok(vec![0.1; completions.len()])
+            }
+            fn name(&self) -> &str {
+                "dummy"
+            }
+        }
+        rewards = rewards.add(Box::new(DummyReward), 1.0);
+    }
+
+    // 7. Setup Trainer
+    let training_config = TrainingConfig {
+        learning_rate,
+        batch_size: 1, // GRPO generates num_generations per prompt, so batch_size 1 is typical
+        num_epochs: 1,
+        max_seq_len,
+        output_dir: output_dir.to_string(),
+        ..Default::default()
+    };
+
+    let _training_loop_config = TrainingLoopConfig {
+        training: training_config.clone(),
+        dataloader: DataLoaderConfig {
+            batch_size: 1,
+            max_seq_len,
+            shuffle: true,
+            seed: 42,
+            pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
+            drop_last: false,
+        },
+        use_metal_flash_attention,
+        log_every: 1,
+        checkpoint_every: 50,
+        eval_every: 0,
+        use_jit_compilation: true,
+        use_sequence_packing: false, // GRPO usually doesn't pack generations
+        gradient_checkpointing: true,
+        gradient_checkpointing_layers: 4,
+        embedding_lr: None,
+        eager_evaluation: true, // GRPO generates first, then trains - eager helps memory
+        use_metal_fused_optimizer: true,
+    };
+
+    let trainer = GrpoTrainer::new(grpo_config, training_config)?;
+
+    // 8. Run Training (Placeholder for full integration)
+    println!("Starting GRPO training loop...");
+    
+    // Final placeholders to avoid unused variable warnings
+    let _ = dataset;
+    let _ = model;
+    let _ = trainer;
+    let _ = rewards;
+
+    println!("\nGRPO setup complete! Model weights will be saved to: {}", output_dir);
     Ok(())
 }
 

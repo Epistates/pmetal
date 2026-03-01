@@ -174,18 +174,67 @@ impl MlxMetalBridge {
         MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)
     }
 
-    /// Convert a Metal buffer back to an MLX Array.
+    /// Convert a Metal buffer back to an MLX Array (Zero-Copy).
     ///
-    /// This always copies data from the Metal buffer into a new MLX array.
-    pub fn buffer_to_array_f32(buffer: &MetalBuffer<f32>, shape: &[i32]) -> MetalResult<Array> {
-        let data = buffer.to_vec()?;
-        Ok(Array::from_slice(&data, shape))
+    /// This takes ownership of the Metal buffer and passes it to MLX,
+    /// avoiding a copy back to CPU memory.
+    /// Convert a Metal buffer back to an MLX Array (Zero-Copy).
+    ///
+    /// This takes ownership of the Metal buffer and passes it to MLX,
+    /// avoiding a copy back to CPU memory.
+    pub fn buffer_into_array_f32(buffer: MetalBuffer<f32>, shape: &[i32]) -> MetalResult<Array> {
+        let ptr = buffer.contents_ptr() as *mut std::ffi::c_void;
+        let payload = Box::into_raw(Box::new(buffer)) as *mut std::ffi::c_void;
+
+        // Deleter function that drops the boxed MetalBuffer when MLX array is deallocated
+        unsafe extern "C" fn deleter(payload: *mut std::ffi::c_void) {
+            unsafe {
+                let _ = Box::from_raw(payload as *mut MetalBuffer<f32>);
+            }
+        }
+
+        let dim = shape.len() as i32;
+        let c_array = unsafe {
+            mlx_sys::mlx_array_new_data_managed_payload(
+                ptr,
+                shape.as_ptr(),
+                dim,
+                mlx_sys::mlx_dtype__MLX_FLOAT32,
+                payload,
+                Some(deleter),
+            )
+        };
+
+        // Create Array wrapper using official constructor
+        let array = unsafe { Array::from_ptr(c_array) };
+        Ok(array)
     }
 
-    /// Convert an f16 Metal buffer back to an MLX Array.
-    pub fn buffer_to_array_f16(buffer: &MetalBuffer<f16>, shape: &[i32]) -> MetalResult<Array> {
-        let data = buffer.to_vec()?;
-        Ok(Array::from_slice(&data, shape))
+    /// Convert an f16 Metal buffer back to an MLX Array (Zero-Copy).
+    pub fn buffer_into_array_f16(buffer: MetalBuffer<f16>, shape: &[i32]) -> MetalResult<Array> {
+        let ptr = buffer.contents_ptr() as *mut std::ffi::c_void;
+        let payload = Box::into_raw(Box::new(buffer)) as *mut std::ffi::c_void;
+
+        unsafe extern "C" fn deleter(payload: *mut std::ffi::c_void) {
+            unsafe {
+                let _ = Box::from_raw(payload as *mut MetalBuffer<f16>);
+            }
+        }
+
+        let dim = shape.len() as i32;
+        let c_array = unsafe {
+            mlx_sys::mlx_array_new_data_managed_payload(
+                ptr,
+                shape.as_ptr(),
+                dim,
+                mlx_sys::mlx_dtype__MLX_FLOAT16,
+                payload,
+                Some(deleter),
+            )
+        };
+
+        let array = unsafe { Array::from_ptr(c_array) };
+        Ok(array)
     }
 }
 
@@ -227,12 +276,12 @@ mod tests {
     }
 
     #[test]
-    fn test_buffer_to_array_f32() {
+    fn test_buffer_into_array_f32() {
         let ctx = MetalContext::new().unwrap();
         let data = vec![1.0f32, 2.0, 3.0, 4.0];
         let buffer = MetalBuffer::from_slice(&ctx, &data, BufferUsage::Shared).unwrap();
 
-        let array = MlxMetalBridge::buffer_to_array_f32(&buffer, &[2, 2]).unwrap();
+        let array = MlxMetalBridge::buffer_into_array_f32(buffer, &[2, 2]).unwrap();
         assert_eq!(array.shape(), &[2, 2]);
     }
 }

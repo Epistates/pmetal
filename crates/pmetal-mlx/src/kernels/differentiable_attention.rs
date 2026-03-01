@@ -29,7 +29,7 @@ use pmetal_metal::{
 };
 
 use super::fused_attention::{AttentionMaskType, FusedAttentionConfig};
-use super::utils::{array_to_metal_buffer_f16, metal_buffer_to_array_f16};
+use super::utils::{array_to_metal_buffer_f16, metal_buffer_into_array_f16};
 use crate::error::MlxError;
 
 /// Result type for differentiable attention operations.
@@ -250,8 +250,8 @@ pub fn differentiable_attention(
         .map_err(|e| MlxError::Metal(e.to_string()))?;
 
     // Convert output to MLX Array
-    let output_array = metal_buffer_to_array_f16(
-        &fa_output.output,
+    let output_array = metal_buffer_into_array_f16(
+        fa_output.output.clone(),
         &[q_shape[0], q_shape[1], q_shape[2], q_shape[3]],
     )?;
 
@@ -327,9 +327,9 @@ pub fn compute_attention_gradients(
         .map_err(|e| MlxError::Metal(e.to_string()))?;
 
     // Convert gradients to MLX Arrays
-    let d_queries = metal_buffer_to_array_f16(&d_q, &cache.query_shape)?;
-    let d_keys = metal_buffer_to_array_f16(&d_k, &cache.kv_shape)?;
-    let d_values = metal_buffer_to_array_f16(&d_v, &cache.kv_shape)?;
+    let d_queries = metal_buffer_into_array_f16(d_q, &cache.query_shape)?;
+    let d_keys = metal_buffer_into_array_f16(d_k, &cache.kv_shape)?;
+    let d_values = metal_buffer_into_array_f16(d_v, &cache.kv_shape)?;
 
     Ok((d_queries, d_keys, d_values))
 }

@@ -77,6 +77,17 @@ pub struct MetalBuffer<T: Pod + Zeroable> {
     _phantom: PhantomData<T>,
 }
 
+impl<T: Pod + Zeroable> Clone for MetalBuffer<T> {
+    fn clone(&self) -> Self {
+        Self {
+            buffer: self.buffer.clone(),
+            len: self.len,
+            usage: self.usage,
+            _phantom: PhantomData,
+        }
+    }
+}
+
 impl<T: Pod + Zeroable> AsMetalBuffer for MetalBuffer<T> {
     fn as_metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.buffer
@@ -243,6 +254,11 @@ impl<T: Pod + Zeroable> MetalBuffer<T> {
 
         let contents = self.buffer.contents();
         Some(contents.as_ptr() as *mut T)
+    }
+
+    /// Get the raw underlying pointer.
+    pub fn contents_ptr(&self) -> *mut std::ffi::c_void {
+        self.buffer.contents().as_ptr()
     }
 
     /// Get the buffer contents as a slice.

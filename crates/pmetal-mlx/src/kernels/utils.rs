@@ -3,7 +3,7 @@
 //! This module provides common functions for converting between MLX arrays
 //! and Metal buffers, used by training_attention and differentiable_attention.
 
-use crate::error::MlxError;
+use crate::{bridge::MlxMetalBridge, error::MlxError};
 use half::f16;
 use mlx_rs::{Array, Dtype};
 use pmetal_metal::{
@@ -42,20 +42,16 @@ pub fn array_to_metal_buffer_f16(ctx: &MetalContext, array: &Array) -> Result<Me
         .map_err(|e| MlxError::Metal(e.to_string()))
 }
 
-/// Convert f16 MetalBuffer back to MLX Array.
+/// Convert f16 MetalBuffer back to MLX Array (Zero-Copy).
 ///
 /// # Arguments
-/// * `buffer` - MetalBuffer to convert
+/// * `buffer` - MetalBuffer to consume
 /// * `shape` - Desired shape for the output array
 ///
 /// # Returns
-/// An MLX Array with the buffer data.
-pub fn metal_buffer_to_array_f16(buffer: &MetalBuffer<f16>, shape: &[i32]) -> Result<Array> {
-    let data = buffer
-        .to_vec()
-        .map_err(|e| MlxError::Metal(e.to_string()))?;
-
-    Ok(Array::from_slice(&data, shape))
+/// An MLX Array referencing the buffer data directly.
+pub fn metal_buffer_into_array_f16(buffer: MetalBuffer<f16>, shape: &[i32]) -> Result<Array> {
+    MlxMetalBridge::buffer_into_array_f16(buffer, shape).map_err(|e| MlxError::Metal(e.to_string()))
 }
 
 /// Convert MLX Array to f32 MetalBuffer.
@@ -75,13 +71,9 @@ pub fn array_to_metal_buffer_f32(ctx: &MetalContext, array: &Array) -> Result<Me
         .map_err(|e| MlxError::Metal(e.to_string()))
 }
 
-/// Convert f32 MetalBuffer back to MLX Array.
-pub fn metal_buffer_to_array_f32(buffer: &MetalBuffer<f32>, shape: &[i32]) -> Result<Array> {
-    let data = buffer
-        .to_vec()
-        .map_err(|e| MlxError::Metal(e.to_string()))?;
-
-    Ok(Array::from_slice(&data, shape))
+/// Convert f32 MetalBuffer back to MLX Array (Zero-Copy).
+pub fn metal_buffer_into_array_f32(buffer: MetalBuffer<f32>, shape: &[i32]) -> Result<Array> {
+    MlxMetalBridge::buffer_into_array_f32(buffer, shape).map_err(|e| MlxError::Metal(e.to_string()))
 }
 
 #[cfg(test)]
@@ -104,7 +96,7 @@ mod tests {
         let original = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]);
 
         let buffer = array_to_metal_buffer_f16(&ctx, &original).unwrap();
-        let recovered = metal_buffer_to_array_f16(&buffer, &[2, 2]).unwrap();
+        let recovered = metal_buffer_into_array_f16(buffer, &[2, 2]).unwrap();
 
         // Should match after f16 conversion (with potential precision loss)
         let orig_data: Vec<f32> = original.as_slice().to_vec();
