@@ -916,9 +916,8 @@ fn ensure_metallib() {
 /// Returns `true` if the download succeeded and the file is in place.
 fn download_metallib(dest: &std::path::Path) -> bool {
     let version = env!("CARGO_PKG_VERSION");
-    let url = format!(
-        "https://github.com/epistates/pmetal/releases/download/v{version}/mlx.metallib"
-    );
+    let url =
+        format!("https://github.com/epistates/pmetal/releases/download/v{version}/mlx.metallib");
 
     eprintln!(
         "\x1b[1;36minfo:\x1b[0m mlx.metallib not found locally. \
