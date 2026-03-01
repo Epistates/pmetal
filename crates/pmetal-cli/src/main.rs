@@ -835,6 +835,7 @@ pub enum OllamaTemplate {
 /// C++ backend can find it regardless of where the binary is installed.
 ///
 /// Search order: colocated → cache → Homebrew → auto-download → error.
+#[allow(unsafe_code)]
 fn ensure_metallib() {
     let metallib_name = "mlx.metallib";
     let cache_dir = std::env::var("HOME")
