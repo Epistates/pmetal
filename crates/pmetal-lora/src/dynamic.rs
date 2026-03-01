@@ -24,10 +24,11 @@ use std::path::Path;
 use std::rc::Rc;
 
 use mlx_rs::Array;
+use mlx_rs::error::Exception;
 use pmetal_core::LoraConfig;
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_models::{
-    DispatchError, GgufModelConfig, ModelArchitecture, WeightFormat, WeightFormatError,
+    GgufModelConfig, ModelArchitecture, WeightFormat, WeightFormatError,
     WeightLoader,
 };
 
@@ -266,11 +267,13 @@ impl DynamicLoraModel {
             "mistral" => ModelArchitecture::Mistral,
             "gemma" => ModelArchitecture::Gemma,
             "phi" => ModelArchitecture::Phi,
-            other => {
-                return Err(DynamicLoraError::Dispatch(
-                    DispatchError::UnsupportedArchitecture(other.to_string()),
-                ));
+            _ => {
+                return Err(DynamicLoraError::Mlx(Exception::custom(format!(
+                    "Unsupported architecture for LoRA: {}",
+                    gguf_config.architecture
+                ))));
             }
+
         };
 
         // Create model with extracted config and load weights
@@ -600,9 +603,9 @@ impl TrainableModel for DynamicLoraModel {
 /// Errors during dynamic LoRA model loading.
 #[derive(Debug, thiserror::Error)]
 pub enum DynamicLoraError {
-    /// Architecture dispatch error.
-    #[error("Dispatch error: {0}")]
-    Dispatch(#[from] DispatchError),
+    /// MLX exception.
+    #[error("MLX error: {0}")]
+    Mlx(#[from] mlx_rs::error::Exception),
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),

@@ -49,7 +49,7 @@ pub mod traits;
 pub mod weight_format;
 
 // Re-exports for convenience
-pub use dispatcher::{DispatchError, DynamicModel, ModelArchitecture};
+pub use dispatcher::{DynamicModel, ModelArchitecture};
 pub use generation::*;
 pub use loader::*;
 pub use registry::*;

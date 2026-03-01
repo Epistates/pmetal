@@ -216,6 +216,61 @@ impl SftTrainer {
         Ok(Some(total_norm))
     }
 
+    /// Compute MTP (Multi-Token Prediction) loss for a batch.
+    ///
+    /// # Arguments
+    /// * `all_logits` - List of logits for each prediction depth [D+1, batch, seq, vocab]
+    /// * `labels` - Target labels [batch, seq]
+    /// * `loss_weights` - Weights for each MTP depth (e.g. [1.0, 0.3, 0.3])
+    ///
+    /// # Returns
+    /// Weighted scalar loss value
+    pub fn compute_mtp_loss(
+        &self,
+        all_logits: &[Array],
+        labels: &Array,
+        loss_weights: &[f32],
+    ) -> Result<Array> {
+        if all_logits.is_empty() {
+            return Err(SftError::Mlx(Exception::custom("No logits provided for MTP loss")));
+        }
+
+        let mut total_loss = Array::from_f32(0.0);
+        let seq_len = all_logits[0].dim(1);
+        let vocab_size = all_logits[0].dim(2);
+
+        for (depth, logits) in all_logits.iter().enumerate() {
+            let weight = if depth < loss_weights.len() {
+                loss_weights[depth]
+            } else {
+                *loss_weights.last().unwrap_or(&0.1)
+            };
+
+            // Shift labels based on depth
+            // Depth 0: predicts labels[1:]
+            // Depth 1: predicts labels[2:]
+            // ...
+            let shift = depth + 1;
+            if shift >= seq_len as usize {
+                continue;
+            }
+
+            let d_logits = logits.index((.., ..seq_len - shift as i32, ..));
+            let d_labels = labels.index((.., shift as i32..));
+
+            let flat_logits = d_logits.reshape(&[-1, vocab_size])?;
+            let flat_labels = d_labels.reshape(&[-1])?;
+
+            let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
+            let mean_loss = loss.mean(None)?;
+            
+            let weighted_loss = mean_loss.multiply(&Array::from_f32(weight))?;
+            total_loss = total_loss.add(&weighted_loss)?;
+        }
+
+        Ok(total_loss)
+    }
+
     /// Update learning rate based on scheduler.
     ///
     /// Delegates to the canonical `pmetal_core::LearningRateScheduler`.

@@ -820,7 +820,7 @@ impl CausalLMModel for GemmaForCausalLM {
 
     fn load_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), Exception> {
         crate::loader::load_gemma_weights(self, weights)
-            .map_err(|e| Exception::custom(e.to_string()))
+            .map_err(|e: crate::loader::LoadError| Exception::custom(e.to_string()))
     }
 
     fn eval(&self) -> Result<(), Exception> {
