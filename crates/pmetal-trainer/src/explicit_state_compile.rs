@@ -286,7 +286,7 @@ impl FrozenState {
     }
 
     /// Create from a keyed container with key tracking (borrowed arrays).
-    pub fn from_keyed_container_ref<'a>(container: &HashMap<Rc<str>, &'a Array>) -> Self {
+    pub fn from_keyed_container_ref(container: &HashMap<Rc<str>, &Array>) -> Self {
         let mut keys: Vec<_> = container.keys().cloned().collect();
         keys.sort();
         let arrays = keys

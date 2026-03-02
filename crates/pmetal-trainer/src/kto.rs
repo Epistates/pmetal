@@ -441,12 +441,12 @@ impl KtoTrainer {
         let lambda_d = self.config.desirable_weight as f32;
         let lambda_u = self.config.undesirable_weight as f32;
 
-        for i in 0..batch_size {
+        for (i, &desirable) in is_desirable.iter().enumerate().take(batch_size) {
             let reward = rewards.index(i as i32);
             reward.eval()?;
             let r = reward.item::<f32>();
 
-            let loss = if is_desirable[i] {
+            let loss = if desirable {
                 // Desirable: λ_D * (1 - σ(β_d * r - z_ref))
                 // = λ_D * σ(z_ref - β_d * r)
                 let logit = (z_ref as f32) - beta_d * r;

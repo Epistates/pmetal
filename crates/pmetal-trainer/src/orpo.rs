@@ -211,7 +211,7 @@ mod tests {
         let config = OrpoConfig::default();
         let _trainer = OrpoTrainer::new(config, TrainingConfig::default()).unwrap();
 
-        let avg_log_p = Array::from_f32(-0.693147);
+        let avg_log_p = Array::from_f32(-std::f32::consts::LN_2);
         // Manually invoke logic (can't access closure directly)
         // Replicating closure logic for test:
         let p = avg_log_p.exp().unwrap();

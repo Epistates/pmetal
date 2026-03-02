@@ -886,10 +886,10 @@ mod tests {
         // logits=0.5 -> max(0, 0.5) = 0.5
         // logits=-1 -> max(0, 2) = 2
         let expected = [0.0f32, 0.5, 2.0];
-        for i in 0..3 {
+        for (i, &exp) in expected.iter().enumerate() {
             let val = loss.index(i as i32);
             val.eval().unwrap();
-            assert!((val.item::<f32>() - expected[i]).abs() < 0.01);
+            assert!((val.item::<f32>() - exp).abs() < 0.01);
         }
     }
 

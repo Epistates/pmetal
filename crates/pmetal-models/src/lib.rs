@@ -18,7 +18,7 @@
 //! [`CausalLMModel`]: traits::CausalLMModel
 //! [`DynamicModel`]: dispatcher::DynamicModel
 
-// Crate-level lint configuration for ML/GPU code patterns
+// Crate-level lint configuration
 #![allow(missing_docs)]
 #![allow(dead_code)]
 #![allow(unsafe_code)]
@@ -27,13 +27,9 @@
 #![allow(clippy::needless_borrows_for_generic_args)]
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::field_reassign_with_default)]
-#![allow(clippy::manual_div_ceil)]
 #![allow(clippy::type_complexity)]
-#![allow(clippy::len_zero)]
-#![allow(clippy::useless_vec)]
-#![allow(clippy::option_map_or_none)]
 #![allow(clippy::large_enum_variant)]
-#![allow(clippy::expect_fun_call)]
+#![allow(clippy::len_zero)]
 #![allow(ambiguous_glob_reexports)]
 
 pub mod architectures;

@@ -930,8 +930,8 @@ impl DiffusionSampler {
                             .collect();
                         indexed.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
 
-                        for i in 0..num_to_remask.min(indexed.len()) {
-                            let idx = indexed[i].0;
+                        for entry in indexed.iter().take(num_to_remask) {
+                            let idx = entry.0;
                             tokens[idx] = self.mask_token_id as i32;
                             is_masked[idx] = true;
                         }
