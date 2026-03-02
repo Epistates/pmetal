@@ -345,7 +345,7 @@ impl GemmaAttention {
         let rope_scaling_cfg = config
             .rope_scaling
             .as_ref()
-            .map(|map| RopeScaling::from_config_map(map))
+            .map(RopeScaling::from_config_map)
             .unwrap_or(RopeScaling::None);
         let rope_scale = rope_scaling_cfg.scale();
         let effective_base = rope_scaling_cfg.effective_base(rope_theta, head_dim);
@@ -533,8 +533,8 @@ impl GemmaMLP {
     fn apply_activation(&self, x: &Array) -> Result<Array, Exception> {
         match self.hidden_act.as_str() {
             "gelu" | "gelu_pytorch_tanh" | "gelu_tanh" => gelu_tanh(x),
-            "silu" | "swish" => mlx_rs::nn::silu(x).map_err(Into::into),
-            "relu" => mlx_rs::nn::relu(x).map_err(Into::into),
+            "silu" | "swish" => mlx_rs::nn::silu(x),
+            "relu" => mlx_rs::nn::relu(x),
             _ => gelu_tanh(x), // Default to gelu_tanh for Gemma
         }
     }

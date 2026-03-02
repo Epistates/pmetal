@@ -277,7 +277,7 @@ impl Qwen2Attention {
         let rope_scaling = config
             .rope_scaling
             .as_ref()
-            .map(|map| RopeScaling::from_config_map(map))
+            .map(RopeScaling::from_config_map)
             .unwrap_or(RopeScaling::None);
         let rope_scale = rope_scaling.scale();
         let effective_base = rope_scaling.effective_base(rope_theta, head_dim);

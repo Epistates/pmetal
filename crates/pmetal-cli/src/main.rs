@@ -918,7 +918,7 @@ fn ensure_metallib() {
                             && path
                                 .file_name()
                                 .and_then(|n| n.to_str())
-                                .map_or(false, |s| s.contains("pmetal-mlx-sys"))
+                                .is_some_and(|s| s.contains("pmetal-mlx-sys"))
                         {
                             let metallib_candidate = path.join("out/build/lib").join(metallib_name);
                             if metallib_candidate.is_file() {

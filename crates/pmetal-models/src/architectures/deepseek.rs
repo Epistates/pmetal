@@ -676,7 +676,7 @@ impl ModuleParameters for DeepSeekMoE {
                 && self
                     .shared_experts
                     .as_ref()
-                    .map_or(true, |s| s.all_frozen().unwrap_or(true)),
+                    .is_none_or(|s| s.all_frozen().unwrap_or(true)),
         )
     }
     fn any_frozen(&self) -> Option<bool> {
@@ -686,7 +686,7 @@ impl ModuleParameters for DeepSeekMoE {
                 || self
                     .shared_experts
                     .as_ref()
-                    .map_or(false, |s| s.any_frozen().unwrap_or(false)),
+                    .is_some_and(|s| s.any_frozen().unwrap_or(false)),
         )
     }
 }

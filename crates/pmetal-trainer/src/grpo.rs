@@ -692,12 +692,8 @@ impl GrpoTrainer {
                     group.add_completion(new_ids, rewards[j], gen_output.stopped_by_length[j]);
                 }
 
-                let stats = self.train_step(
-                    policy_model,
-                    ref_model.as_mut().map(|r| &mut **r),
-                    &[group],
-                    optimizer,
-                )?;
+                let stats =
+                    self.train_step(policy_model, ref_model.as_deref_mut(), &[group], optimizer)?;
 
                 if i % 10 == 0 {
                     info!(

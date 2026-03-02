@@ -297,7 +297,7 @@ impl CompiledSampler {
                 "top_p must be in (0.0, 1.0], got {top_p}"
             )));
         }
-        if min_p < 0.0 || min_p >= 1.0 {
+        if !(0.0..1.0).contains(&min_p) {
             return Err(Exception::custom(format!(
                 "min_p must be in [0.0, 1.0), got {min_p}"
             )));
@@ -340,7 +340,7 @@ impl CompiledSampler {
                 "top_p must be in (0.0, 1.0], got {top_p}"
             )));
         }
-        if min_p < 0.0 || min_p >= 1.0 {
+        if !(0.0..1.0).contains(&min_p) {
             return Err(Exception::custom(format!(
                 "min_p must be in [0.0, 1.0), got {min_p}"
             )));
