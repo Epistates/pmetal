@@ -23,6 +23,7 @@ use mlx_rs::{
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
+use pmetal_models::ModelConfig;
 use pmetal_models::architectures::qwen3::Qwen3Config;
 
 use crate::{LoraError, QLoraConfig, QLoraLinear};
@@ -66,21 +67,22 @@ impl Qwen3QLoraAttention {
         let head_dim = config.get_head_dim();
         let scale = (head_dim as f32).sqrt().recip();
 
-        // Create QLoRA linear layers for projections
-        let q_proj = QLoraLinear::new(config.hidden_size, n_heads * head_dim, qlora_config, false)?;
-        let k_proj = QLoraLinear::new(
-            config.hidden_size,
-            n_kv_heads * head_dim,
-            qlora_config,
-            false,
-        )?;
-        let v_proj = QLoraLinear::new(
-            config.hidden_size,
-            n_kv_heads * head_dim,
-            qlora_config,
-            false,
-        )?;
-        let o_proj = QLoraLinear::new(n_heads * head_dim, config.hidden_size, qlora_config, false)?;
+        // Create QLoRA linear layers for projections, respecting target_modules via effective_rank.
+        let mut q_config = qlora_config.clone();
+        q_config.lora.r = crate::effective_rank(&qlora_config.lora, "q_proj");
+        let q_proj = QLoraLinear::new(config.hidden_size, n_heads * head_dim, &q_config, false)?;
+
+        let mut k_config = qlora_config.clone();
+        k_config.lora.r = crate::effective_rank(&qlora_config.lora, "k_proj");
+        let k_proj = QLoraLinear::new(config.hidden_size, n_kv_heads * head_dim, &k_config, false)?;
+
+        let mut v_config = qlora_config.clone();
+        v_config.lora.r = crate::effective_rank(&qlora_config.lora, "v_proj");
+        let v_proj = QLoraLinear::new(config.hidden_size, n_kv_heads * head_dim, &v_config, false)?;
+
+        let mut o_config = qlora_config.clone();
+        o_config.lora.r = crate::effective_rank(&qlora_config.lora, "o_proj");
+        let o_proj = QLoraLinear::new(n_heads * head_dim, config.hidden_size, &o_config, false)?;
 
         // Qwen3-specific: Q and K normalization before RoPE
         let q_norm = nn::RmsNormBuilder::new(head_dim)
@@ -153,9 +155,22 @@ impl Qwen3QLoraAttention {
         let (queries, keys) = if let Some(pos_ids) = position_ids {
             // Use custom RoPE with explicit position IDs
             use pmetal_mlx::kernels::rope::apply_rope_with_positions;
-            let q =
-                apply_rope_with_positions(&queries, pos_ids, self.head_dim, self.rope.base, 1.0)?;
-            let k = apply_rope_with_positions(&keys, pos_ids, self.head_dim, self.rope.base, 1.0)?;
+            let q = apply_rope_with_positions(
+                &queries,
+                pos_ids,
+                self.head_dim,
+                false,
+                self.rope.base,
+                1.0,
+            )?;
+            let k = apply_rope_with_positions(
+                &keys,
+                pos_ids,
+                self.head_dim,
+                false,
+                self.rope.base,
+                1.0,
+            )?;
             (q, k)
         } else {
             // Use standard RoPE for sequential positions
@@ -254,22 +269,30 @@ pub struct Qwen3QloraMLP {
 impl Qwen3QloraMLP {
     /// Create a new QLoRA MLP layer with random weights.
     pub fn new(config: &Qwen3Config, qlora_config: &QLoraConfig) -> Result<Self, LoraError> {
+        let mut gate_config = qlora_config.clone();
+        gate_config.lora.r = crate::effective_rank(&qlora_config.lora, "gate_proj");
         let gate_proj = QLoraLinear::new(
             config.hidden_size,
             config.intermediate_size,
-            qlora_config,
+            &gate_config,
             false,
         )?;
+
+        let mut up_config = qlora_config.clone();
+        up_config.lora.r = crate::effective_rank(&qlora_config.lora, "up_proj");
         let up_proj = QLoraLinear::new(
             config.hidden_size,
             config.intermediate_size,
-            qlora_config,
+            &up_config,
             false,
         )?;
+
+        let mut down_config = qlora_config.clone();
+        down_config.lora.r = crate::effective_rank(&qlora_config.lora, "down_proj");
         let down_proj = QLoraLinear::new(
             config.intermediate_size,
             config.hidden_size,
-            qlora_config,
+            &down_config,
             false,
         )?;
 
@@ -281,7 +304,7 @@ impl Qwen3QloraMLP {
     }
 
     /// Forward pass (SwiGLU activation).
-    pub fn forward(&self, x: &Array) -> Result<Array, LoraError> {
+    pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         let gate = self.gate_proj.forward(x)?;
         let gate = nn::silu(gate)?;
         let up = self.up_proj.forward(x)?;

@@ -28,8 +28,7 @@ use mlx_rs::error::Exception;
 use pmetal_core::LoraConfig;
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_models::{
-    GgufModelConfig, ModelArchitecture, WeightFormat, WeightFormatError,
-    WeightLoader,
+    GgufModelConfig, ModelArchitecture, WeightFormat, WeightFormatError, WeightLoader,
 };
 
 use crate::{
@@ -273,7 +272,6 @@ impl DynamicLoraModel {
                     gguf_config.architecture
                 ))));
             }
-
         };
 
         // Create model with extracted config and load weights

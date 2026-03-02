@@ -28,6 +28,7 @@ use pmetal_mlx::kernels::{
     get_training_context, rope::apply_rope,
 };
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
+use pmetal_models::ModelConfig;
 use pmetal_models::architectures::qwen3::Qwen3Config;
 
 use crate::{LoraError, LoraLinear};
@@ -88,15 +89,18 @@ impl Qwen3LoraAttention {
         // Assign unique layer ID for FlashAttention caching
         let layer_id = LAYER_ID_COUNTER.fetch_add(1, Ordering::SeqCst);
 
-        let rank = lora_config.r as i32;
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
+        let q_rank = crate::effective_rank(lora_config, "q_proj") as i32;
+        let k_rank = crate::effective_rank(lora_config, "k_proj") as i32;
+        let v_rank = crate::effective_rank(lora_config, "v_proj") as i32;
+        let o_rank = crate::effective_rank(lora_config, "o_proj") as i32;
 
         // Create LoRA linear layers for projections
         let q_proj = LoraLinear::new(
             config.hidden_size,
             n_heads * head_dim,
-            rank,
+            q_rank,
             alpha,
             use_rslora,
             false,
@@ -104,7 +108,7 @@ impl Qwen3LoraAttention {
         let k_proj = LoraLinear::new(
             config.hidden_size,
             n_kv_heads * head_dim,
-            rank,
+            k_rank,
             alpha,
             use_rslora,
             false,
@@ -112,7 +116,7 @@ impl Qwen3LoraAttention {
         let v_proj = LoraLinear::new(
             config.hidden_size,
             n_kv_heads * head_dim,
-            rank,
+            v_rank,
             alpha,
             use_rslora,
             false,
@@ -120,7 +124,7 @@ impl Qwen3LoraAttention {
         let o_proj = LoraLinear::new(
             n_heads * head_dim,
             config.hidden_size,
-            rank,
+            o_rank,
             alpha,
             use_rslora,
             false,
@@ -198,9 +202,22 @@ impl Qwen3LoraAttention {
         let (queries, keys) = if let Some(pos_ids) = position_ids {
             // Use custom RoPE with explicit position IDs
             use pmetal_mlx::kernels::rope::apply_rope_with_positions;
-            let q =
-                apply_rope_with_positions(&queries, pos_ids, self.head_dim, self.rope.base, 1.0)?;
-            let k = apply_rope_with_positions(&keys, pos_ids, self.head_dim, self.rope.base, 1.0)?;
+            let q = apply_rope_with_positions(
+                &queries,
+                pos_ids,
+                self.head_dim,
+                false,
+                self.rope.base,
+                1.0,
+            )?;
+            let k = apply_rope_with_positions(
+                &keys,
+                pos_ids,
+                self.head_dim,
+                false,
+                self.rope.base,
+                1.0,
+            )?;
             (q, k)
         } else {
             // Use standard RoPE for sequential positions
@@ -391,14 +408,16 @@ pub struct Qwen3LoraMLP {
 impl Qwen3LoraMLP {
     /// Create a new LoRA MLP layer.
     pub fn new(config: &Qwen3Config, lora_config: &LoraConfig) -> Result<Self, LoraError> {
-        let rank = lora_config.r as i32;
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
+        let gate_rank = crate::effective_rank(lora_config, "gate_proj") as i32;
+        let up_rank = crate::effective_rank(lora_config, "up_proj") as i32;
+        let down_rank = crate::effective_rank(lora_config, "down_proj") as i32;
 
         let gate_proj = LoraLinear::new(
             config.hidden_size,
             config.intermediate_size,
-            rank,
+            gate_rank,
             alpha,
             use_rslora,
             false,
@@ -406,7 +425,7 @@ impl Qwen3LoraMLP {
         let up_proj = LoraLinear::new(
             config.hidden_size,
             config.intermediate_size,
-            rank,
+            up_rank,
             alpha,
             use_rslora,
             false,
@@ -414,7 +433,7 @@ impl Qwen3LoraMLP {
         let down_proj = LoraLinear::new(
             config.intermediate_size,
             config.hidden_size,
-            rank,
+            down_rank,
             alpha,
             use_rslora,
             false,
@@ -428,6 +447,14 @@ impl Qwen3LoraMLP {
     }
 
     /// Forward pass (SwiGLU activation).
+    ///
+    /// **Autograd note**: This uses the standard unfused SwiGLU path where
+    /// `gate_proj` and `up_proj` are computed separately. A fused
+    /// `gate_up_proj` variant (single matmul projecting to `2 * intermediate`)
+    /// would save one kernel launch but requires custom autograd support
+    /// because MLX's automatic differentiation cannot split the fused output
+    /// back into gate/up gradients. Until a custom VJP is implemented, the
+    /// unfused path is required for correct gradient computation during training.
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         let gate = self.gate_proj.forward(x)?;
         let gate = nn::silu(gate)?;
@@ -634,10 +661,19 @@ impl Qwen3LoraModel {
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             hidden_states = layer.forward(&hidden_states, mask.as_ref(), position_ids)?;
 
-            // Checkpoint boundary marker
-            // NOTE: We do NOT call eval() here - that breaks the gradient computation graph.
-            // MLX's lazy evaluation with unified memory handles memory pressure reasonably well.
-            // True gradient checkpointing (save/recompute) would require custom VJP implementation.
+            // Checkpoint boundary marker (NO-OP — see note below).
+            //
+            // Gradient checkpointing is not yet implemented for Qwen3 LoRA.
+            // True checkpointing requires a custom VJP that saves activations
+            // at block boundaries and recomputes intermediate activations
+            // during the backward pass. MLX does not provide a built-in
+            // `checkpoint()` primitive, so implementing this requires manually
+            // wrapping the per-block forward in a closure registered with
+            // `mlx_rs::transforms::vjp`. Until that is done, this code path
+            // only logs a warning — no memory savings are applied.
+            //
+            // Calling `eval()` here would materialize intermediates and break
+            // the lazy computation graph needed for automatic differentiation.
             if checkpointing_enabled && (idx + 1) % layers_per_block == 0 {
                 GRAD_CKPT_WARN.call_once(|| {
                     tracing::warn!(

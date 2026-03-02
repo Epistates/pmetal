@@ -233,21 +233,53 @@ impl Default for KlDivergenceLoss {
 }
 
 impl DistillLoss for KlDivergenceLoss {
-    fn compute(
+    fn compute_weighted(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
+        weights: Option<&Array>,
     ) -> Result<Array> {
-        // GPU-first: try Metal, fall back to MLX
-        #[cfg(feature = "metal")]
-        {
-            if self.ctx.is_some() {
-                return self.compute_gpu(teacher_logits, student_logits, temperature);
+        // GPU-first: try Metal if no weights, otherwise use MLX for weighted loss
+        // (Metal kernels for weighted distillation are planned for Q2 2026)
+        if weights.is_none() {
+            #[cfg(feature = "metal")]
+            {
+                if self.ctx.is_some() {
+                    return self.compute_gpu(teacher_logits, student_logits, temperature);
+                }
             }
         }
 
-        self.compute_mlx(teacher_logits, student_logits, temperature)
+        let temp = Array::from_f32(temperature);
+        let teacher_scaled = teacher_logits.divide(&temp)?;
+        let student_scaled = student_logits.divide(&temp)?;
+
+        let teacher_log_probs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
+        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
+        let teacher_probs = teacher_log_probs.exp()?;
+        let student_probs = student_log_probs.exp()?;
+
+        let kl_per_token = if self.reverse {
+            let log_ratio = student_log_probs.subtract(&teacher_log_probs)?;
+            student_probs
+                .multiply(&log_ratio)?
+                .sum_axes(&[-1], Some(false))?
+        } else {
+            let log_ratio = teacher_log_probs.subtract(&student_log_probs)?;
+            teacher_probs
+                .multiply(&log_ratio)?
+                .sum_axes(&[-1], Some(false))?
+        };
+
+        if let Some(w) = weights {
+            let weighted = kl_per_token.multiply(w)?;
+            let total_weight = w.sum(None)?;
+            let safe_weight = mlx_rs::ops::maximum(&total_weight, &Array::from_f32(1e-8))?;
+            Ok(weighted.sum(None)?.divide(&safe_weight)?)
+        } else {
+            Ok(kl_per_token.mean(None)?)
+        }
     }
 
     fn name(&self) -> &'static str {

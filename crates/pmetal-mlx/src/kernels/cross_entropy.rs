@@ -283,9 +283,10 @@ fn cross_entropy_loss_with_smoothing(
         let mask = flat_targets.ne(&ignore_arr)?;
         let mask_f32 = mask.as_dtype(Dtype::Float32)?;
         let count = mask_f32.sum(None)?;
+        let safe_count = mlx_rs::ops::maximum(&count, &Array::from_f32(1.0))?;
         let masked_loss = per_token_loss.multiply(&mask_f32)?;
         let total_loss = masked_loss.sum(None)?;
-        total_loss.divide(&count)
+        total_loss.divide(&safe_count)
     } else {
         per_token_loss.mean(None)
     }

@@ -11,18 +11,36 @@ env:
   CARGO_INCREMENTAL: "0"
 
 jobs:
+  test:
+    name: Test
+    runs-on: macos-latest
+    permissions:
+      contents: read
+
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+      - name: Check
+        run: cargo check --all
+      - name: Test
+        run: cargo test --all -- --test-threads=1
+
   build:
     name: Build (aarch64-apple-darwin)
     runs-on: macos-latest
+    needs: test
+    permissions:
+      contents: read
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           targets: aarch64-apple-darwin
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
         with:
           key: aarch64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
           shared-key: aarch64-apple-darwin
@@ -30,10 +48,22 @@ jobs:
       - name: Build
         run: cargo build --release --target aarch64-apple-darwin -p pmetal-cli
 
+      - name: Prepare build-time artifacts (before signing)
+        run: |
+          BINARY="target/aarch64-apple-darwin/release/pmetal"
+          # Find and copy MLX Metal shader library
+          MLX_METALLIB=$(find target/aarch64-apple-darwin/release/build/pmetal-mlx-sys-*/out/build/lib -name "mlx.metallib" | head -1)
+          if [ -z "$MLX_METALLIB" ]; then
+            echo "ERROR: mlx.metallib not found in build output"
+            exit 1
+          fi
+          cp "$MLX_METALLIB" "target/aarch64-apple-darwin/release/mlx.metallib"
+          echo "Found mlx.metallib and staged for signing"
+
       # Optional code signing (requires secrets to be configured)
       - name: Import Apple Code Signing Certificate
         continue-on-error: true
-        uses: Apple-Actions/import-codesign-certs@v3
+        uses: Apple-Actions/import-codesign-certs@63fff01cd422d4b7b855d40ca1e9d34d2de9427d # v3
         with:
           p12-file-base64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           p12-password: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
@@ -41,6 +71,7 @@ jobs:
       - name: Code sign and notarize macOS binary
         run: |
           BINARY="target/aarch64-apple-darwin/release/pmetal"
+          METALLIB="target/aarch64-apple-darwin/release/mlx.metallib"
           CERT_IMPORTED=false
 
           if security find-identity -v -p codesigning | grep -q "Developer ID Application"; then
@@ -49,14 +80,29 @@ jobs:
 
           if [ "$CERT_IMPORTED" = "true" ]; then
             echo "Signing with Developer ID..."
+            
+            # Sign the metallib first (best practice for Sequoia+)
+            codesign --force --verify --verbose \
+              --timestamp --options runtime \
+              --sign "${{ secrets.APPLE_DEVELOPER_ID }}" \
+              "$METALLIB"
+              
+            # Sign the main binary
             codesign --deep --force --verify --verbose \
               --timestamp --options runtime \
               --sign "${{ secrets.APPLE_DEVELOPER_ID }}" \
               "$BINARY"
+            
             codesign -v "$BINARY"
+            codesign -v "$METALLIB"
 
             echo "Notarizing with Apple..."
-            ditto -c -k --sequesterRsrc "$BINARY" pmetal-notarize.zip
+            # Create a zip containing both binary and metallib for notarization
+            # ditto requires a single source directory, so stage files first
+            mkdir -p notarize_staging
+            cp "$BINARY" "$METALLIB" notarize_staging/
+            ditto -c -k --sequesterRsrc notarize_staging pmetal-notarize.zip
+            rm -rf notarize_staging
 
             xcrun notarytool submit pmetal-notarize.zip \
               --apple-id "${{ secrets.APPLE_ID }}" \
@@ -72,12 +118,17 @@ jobs:
 
             echo "Verifying notarization status..."
             spctl -a -v "$BINARY" || true
-            echo "Binary signed and notarized"
+            echo "Binary and library signed and notarized"
           else
             echo "Developer ID certificate not configured. Using ad-hoc signing..."
             codesign --remove-signature "$BINARY" || true
             codesign -s - "$BINARY"
+            
+            codesign --remove-signature "$METALLIB" || true
+            codesign -s - "$METALLIB"
+            
             codesign -v "$BINARY"
+            codesign -v "$METALLIB"
             echo "Binary ad-hoc signed (users may see Gatekeeper warning)"
           fi
 
@@ -95,36 +146,30 @@ jobs:
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           mkdir -p artifacts
-          BINARY="pmetal-${VERSION}-aarch64-apple-darwin"
-          cp "target/aarch64-apple-darwin/release/pmetal" "$BINARY"
-          chmod +x "$BINARY"
+          BINARY_NAME="pmetal-${VERSION}-aarch64-apple-darwin"
+          cp "target/aarch64-apple-darwin/release/pmetal" "$BINARY_NAME"
+          cp "target/aarch64-apple-darwin/release/mlx.metallib" mlx.metallib
+          chmod +x "$BINARY_NAME"
 
-          # Bundle MLX Metal shader library (required at runtime)
-          MLX_METALLIB=$(find target/aarch64-apple-darwin/release/build/pmetal-mlx-sys-*/out/build/lib -name "mlx.metallib" | head -1)
-          if [ -z "$MLX_METALLIB" ]; then
-            echo "ERROR: mlx.metallib not found in build output"
-            exit 1
-          fi
-          cp "$MLX_METALLIB" mlx.metallib
           echo "Bundled mlx.metallib ($(du -h mlx.metallib | cut -f1))"
 
           # Create tar.gz with binary + metallib
-          tar -czf "artifacts/${BINARY}.tar.gz" "$BINARY" mlx.metallib
+          tar -czf "artifacts/${BINARY_NAME}.tar.gz" "$BINARY_NAME" mlx.metallib
 
           # Also upload metallib as standalone asset (for auto-download on first run)
           cp mlx.metallib artifacts/mlx.metallib
 
           # Checksum the archive and metallib
-          shasum -a 256 "artifacts/${BINARY}.tar.gz" > "artifacts/${BINARY}.tar.gz.sha256"
+          shasum -a 256 "artifacts/${BINARY_NAME}.tar.gz" > "artifacts/${BINARY_NAME}.tar.gz.sha256"
           shasum -a 256 "artifacts/mlx.metallib" > "artifacts/mlx.metallib.sha256"
 
           echo "Artifact contents:"
-          ls -lh "$BINARY" mlx.metallib
-          file "$BINARY"
-          cat "artifacts/${BINARY}.tar.gz.sha256"
+          ls -lh "$BINARY_NAME" mlx.metallib
+          file "$BINARY_NAME"
+          cat "artifacts/${BINARY_NAME}.tar.gz.sha256"
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: aarch64-apple-darwin
           path: artifacts/*
@@ -140,10 +185,10 @@ jobs:
       contents: write
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd # v5
 
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: release-artifacts
 
@@ -170,7 +215,7 @@ jobs:
           cat SHA256SUMS
 
       - name: Create Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@a06a81a03ee405af7f2048a818ed3f03bbf83c7b # v2
         with:
           files: |
             final-release/*.tar.gz

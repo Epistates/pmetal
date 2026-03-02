@@ -84,7 +84,7 @@ impl DistillationTrainer {
 
             let output: DistillLossOutput = self
                 .distiller
-                .compute_loss(teacher_logits, &student_logits, labels_opt)
+                .compute_loss(teacher_logits, &student_logits, labels_opt, None)
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
             Ok(output.total)
@@ -104,7 +104,6 @@ impl DistillationTrainer {
             loss_and_grad_fn(student, (&batch.input_ids, &batch.labels, &teacher_logits))?
         };
 
-        loss.eval()?;
         let loss_val = loss.item::<f32>();
 
         // Apply gradients (gradient accumulation logic handles the actual update)
@@ -268,10 +267,9 @@ impl DistillationTrainer {
 
             let output: DistillLossOutput = self
                 .distiller
-                .compute_loss(&teacher_logits, &student_logits, labels_opt)
+                .compute_loss(&teacher_logits, &student_logits, labels_opt, None)
                 .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
-            output.total.eval()?;
             total_loss += output.total.item::<f32>() as f64;
             num_batches += 1;
         }

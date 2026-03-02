@@ -119,20 +119,22 @@ impl GemmaQLoraAttention {
         let head_dim = config.get_head_dim();
         let scale = config.attention_scale();
 
-        let q_proj = QLoraLinear::new(config.hidden_size, n_heads * head_dim, qlora_config, false)?;
-        let k_proj = QLoraLinear::new(
-            config.hidden_size,
-            n_kv_heads * head_dim,
-            qlora_config,
-            false,
-        )?;
-        let v_proj = QLoraLinear::new(
-            config.hidden_size,
-            n_kv_heads * head_dim,
-            qlora_config,
-            false,
-        )?;
-        let o_proj = QLoraLinear::new(n_heads * head_dim, config.hidden_size, qlora_config, false)?;
+        // Create QLoRA linear layers for projections, respecting target_modules via effective_rank.
+        let mut q_config = qlora_config.clone();
+        q_config.lora.r = crate::effective_rank(&qlora_config.lora, "q_proj");
+        let q_proj = QLoraLinear::new(config.hidden_size, n_heads * head_dim, &q_config, false)?;
+
+        let mut k_config = qlora_config.clone();
+        k_config.lora.r = crate::effective_rank(&qlora_config.lora, "k_proj");
+        let k_proj = QLoraLinear::new(config.hidden_size, n_kv_heads * head_dim, &k_config, false)?;
+
+        let mut v_config = qlora_config.clone();
+        v_config.lora.r = crate::effective_rank(&qlora_config.lora, "v_proj");
+        let v_proj = QLoraLinear::new(config.hidden_size, n_kv_heads * head_dim, &v_config, false)?;
+
+        let mut o_config = qlora_config.clone();
+        o_config.lora.r = crate::effective_rank(&qlora_config.lora, "o_proj");
+        let o_proj = QLoraLinear::new(n_heads * head_dim, config.hidden_size, &o_config, false)?;
 
         let rope = nn::RopeBuilder::new(head_dim)
             .base(config.rope_theta)
@@ -269,22 +271,30 @@ pub struct GemmaQloraMLP {
 impl GemmaQloraMLP {
     /// Create a new QLoRA MLP layer.
     pub fn new(config: &GemmaConfig, qlora_config: &QLoraConfig) -> Result<Self, LoraError> {
+        let mut gate_config = qlora_config.clone();
+        gate_config.lora.r = crate::effective_rank(&qlora_config.lora, "gate_proj");
         let gate_proj = QLoraLinear::new(
             config.hidden_size,
             config.intermediate_size,
-            qlora_config,
+            &gate_config,
             false,
         )?;
+
+        let mut up_config = qlora_config.clone();
+        up_config.lora.r = crate::effective_rank(&qlora_config.lora, "up_proj");
         let up_proj = QLoraLinear::new(
             config.hidden_size,
             config.intermediate_size,
-            qlora_config,
+            &up_config,
             false,
         )?;
+
+        let mut down_config = qlora_config.clone();
+        down_config.lora.r = crate::effective_rank(&qlora_config.lora, "down_proj");
         let down_proj = QLoraLinear::new(
             config.intermediate_size,
             config.hidden_size,
-            qlora_config,
+            &down_config,
             false,
         )?;
 
@@ -296,7 +306,7 @@ impl GemmaQloraMLP {
     }
 
     /// Forward pass (GeGLU activation).
-    pub fn forward(&self, x: &Array) -> Result<Array, LoraError> {
+    pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         let gate = self.gate_proj.forward(x)?;
         let gate = gelu_tanh(&gate)?;
         let up = self.up_proj.forward(x)?;

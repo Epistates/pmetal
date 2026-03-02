@@ -28,25 +28,29 @@ impl Default for MseLoss {
 }
 
 impl DistillLoss for MseLoss {
-    fn compute(
+    fn compute_weighted(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
+        weights: Option<&Array>,
     ) -> Result<Array> {
-        // Scale logits by temperature for consistency with other losses
-        let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp)?;
-        let student_scaled = student_logits.divide(&temp)?;
+        // MSE on raw logits. Note: temperature scaling is intentionally NOT applied
+        // because MSE(x/T, y/T) * T^2 = MSE(x, y), making temperature a no-op after
+        // the T^2 re-scaling in Distiller::compute_loss. This is a fundamental property
+        // of MSE — use KL/JS/soft-CE losses when temperature softening is desired.
+        let _ = temperature; // explicitly unused
+        let diff = student_logits.subtract(teacher_logits)?;
+        let mse_per_token = diff.multiply(&diff)?.mean_axes(&[-1], false)?;
 
-        // Compute squared difference
-        let diff = student_scaled.subtract(&teacher_scaled)?;
-        let squared = diff.multiply(&diff)?;
-
-        // Mean over all dimensions
-        let loss = squared.mean(None)?;
-
-        Ok(loss)
+        if let Some(w) = weights {
+            let weighted = mse_per_token.multiply(w)?;
+            let total_weight = w.sum(None)?;
+            let safe_weight = mlx_rs::ops::maximum(&total_weight, &Array::from_f32(1e-8))?;
+            Ok(weighted.sum(None)?.divide(&safe_weight)?)
+        } else {
+            Ok(mse_per_token.mean(None)?)
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -92,28 +96,23 @@ mod tests {
     }
 
     #[test]
-    fn test_mse_temperature_scaling() {
+    fn test_mse_temperature_ignored() {
         let teacher = Array::from_slice(&[2.0_f32, 4.0, 6.0, 8.0], &[1, 1, 4]);
         let student = Array::from_slice(&[4.0_f32, 6.0, 8.0, 10.0], &[1, 1, 4]);
 
         let loss = MseLoss::new();
 
-        // At T=1: diff = 2, MSE = 4
+        // Temperature should not affect raw logit MSE
         let mse_t1 = loss.compute(&teacher, &student, 1.0).unwrap();
-        // At T=2: scaled_diff = 1, MSE = 1
         let mse_t2 = loss.compute(&teacher, &student, 2.0).unwrap();
 
         let v1: f32 = mse_t1.item();
         let v2: f32 = mse_t2.item();
 
         assert!(
-            (v1 - 4.0).abs() < 1e-5,
-            "MSE at T=1 should be 4, got {}",
-            v1
-        );
-        assert!(
-            (v2 - 1.0).abs() < 1e-5,
-            "MSE at T=2 should be 1, got {}",
+            (v1 - v2).abs() < 1e-5,
+            "MSE should be temperature-invariant on raw logits: T=1 ({}) vs T=2 ({})",
+            v1,
             v2
         );
     }
@@ -150,10 +149,10 @@ mod tests {
         // Result should be a scalar
         assert!(result.shape().is_empty());
         let value: f32 = result.item();
-        // All elements differ by 1, so MSE = 1
+        // Each element differs by 1, so per-token MSE = mean(1^2) = 1.0 for both batches
         assert!(
             (value - 1.0).abs() < 1e-5,
-            "MSE should be 1.0, got {}",
+            "Batch MSE should be 1.0, got {}",
             value
         );
     }

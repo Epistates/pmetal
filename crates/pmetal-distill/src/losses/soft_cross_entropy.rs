@@ -173,7 +173,7 @@ impl SoftCrossEntropyLoss {
         let teacher_probs = softmax(&teacher_scaled, -1)?;
 
         // Student log probabilities (log_softmax for numerical stability)
-        let student_log_probs = log_softmax(&student_scaled, -1)?;
+        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
 
         // Cross-entropy: -sum(p * log(q))
         let neg_ce = teacher_probs.multiply(&student_log_probs)?;
@@ -195,36 +195,49 @@ impl Default for SoftCrossEntropyLoss {
 }
 
 impl DistillLoss for SoftCrossEntropyLoss {
-    fn compute(
+    fn compute_weighted(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
+        weights: Option<&Array>,
     ) -> Result<Array> {
-        // GPU-first: try Metal, fall back to MLX
-        #[cfg(feature = "metal")]
-        {
-            if self.ctx.is_some() {
-                return self.compute_gpu(teacher_logits, student_logits, temperature);
+        // GPU-first: try Metal if no weights
+        if weights.is_none() {
+            #[cfg(feature = "metal")]
+            {
+                if self.ctx.is_some() {
+                    return self.compute_gpu(teacher_logits, student_logits, temperature);
+                }
             }
         }
 
-        self.compute_mlx(teacher_logits, student_logits, temperature)
+        // MLX fallback / weighted implementation
+        let temp = Array::from_f32(temperature);
+        let teacher_scaled = teacher_logits.divide(&temp)?;
+        let student_scaled = student_logits.divide(&temp)?;
+
+        let teacher_probs = softmax(&teacher_scaled, -1)?;
+        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
+
+        let neg_ce_per_token = teacher_probs
+            .multiply(&student_log_probs)?
+            .sum_axes(&[-1], Some(false))?;
+        let ce_per_token = neg_ce_per_token.neg();
+
+        if let Some(w) = weights {
+            let weighted = ce_per_token.multiply(w)?;
+            let total_weight = w.sum(None)?;
+            let safe_weight = mlx_rs::ops::maximum(&total_weight, &Array::from_f32(1e-8))?;
+            Ok(weighted.sum(None)?.divide(&safe_weight)?)
+        } else {
+            Ok(ce_per_token.mean(None)?)
+        }
     }
 
     fn name(&self) -> &'static str {
         "soft_cross_entropy"
     }
-}
-
-/// Log-softmax for numerical stability.
-fn log_softmax(x: &Array, axis: i32) -> Result<Array> {
-    let max_x = x.max_axes(&[axis], Some(true))?;
-    let shifted = x.subtract(&max_x)?;
-    let exp_shifted = shifted.exp()?;
-    let sum_exp = exp_shifted.sum_axes(&[axis], Some(true))?;
-    let log_sum_exp = sum_exp.log()?;
-    Ok(shifted.subtract(&log_sum_exp)?)
 }
 
 #[cfg(test)]

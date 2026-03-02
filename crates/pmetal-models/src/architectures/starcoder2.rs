@@ -7,14 +7,14 @@
 //! - Rotary Position Embeddings (RoPE)
 //! - Optimized for Fill-in-the-Middle (FIM) training
 
-use mlx_rs::{Array, nn};
-use mlx_rs::module::{Module, ModuleParameters};
-use mlx_rs::macros::ModuleParameters;
+use crate::architectures::llama::{LlamaAttention, LlamaConfig};
 use mlx_rs::error::Exception;
+use mlx_rs::macros::ModuleParameters;
+use mlx_rs::module::{Module, ModuleParameters};
+use mlx_rs::{Array, nn};
+use pmetal_core::ModelConfig;
 use pmetal_mlx::Builder;
 use serde::{Deserialize, Serialize};
-use pmetal_core::ModelConfig;
-use crate::architectures::llama::{LlamaAttention, LlamaConfig};
 
 /// StarCoder2 model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -53,17 +53,29 @@ impl Default for StarCoder2Config {
 /// StarCoder2 MLP block.
 #[derive(Debug, ModuleParameters)]
 pub struct StarCoder2MLP {
-    #[param] pub gate_proj: nn::Linear,
-    #[param] pub up_proj: nn::Linear,
-    #[param] pub down_proj: nn::Linear,
+    #[param]
+    pub gate_proj: nn::Linear,
+    #[param]
+    pub up_proj: nn::Linear,
+    #[param]
+    pub down_proj: nn::Linear,
 }
 
 impl StarCoder2MLP {
     pub fn new(config: &StarCoder2Config) -> Result<Self, Exception> {
         Ok(Self {
-            gate_proj: nn::LinearBuilder::new(config.hidden_size, config.intermediate_size).bias(false).build().map_err(|_| Exception::custom("Build error"))?,
-            up_proj: nn::LinearBuilder::new(config.hidden_size, config.intermediate_size).bias(false).build().map_err(|_| Exception::custom("Build error"))?,
-            down_proj: nn::LinearBuilder::new(config.intermediate_size, config.hidden_size).bias(false).build().map_err(|_| Exception::custom("Build error"))?,
+            gate_proj: nn::LinearBuilder::new(config.hidden_size, config.intermediate_size)
+                .bias(false)
+                .build()
+                .map_err(|_| Exception::custom("Build error"))?,
+            up_proj: nn::LinearBuilder::new(config.hidden_size, config.intermediate_size)
+                .bias(false)
+                .build()
+                .map_err(|_| Exception::custom("Build error"))?,
+            down_proj: nn::LinearBuilder::new(config.intermediate_size, config.hidden_size)
+                .bias(false)
+                .build()
+                .map_err(|_| Exception::custom("Build error"))?,
         })
     }
 
@@ -78,10 +90,14 @@ impl StarCoder2MLP {
 /// StarCoder2 Layer block.
 #[derive(Debug, ModuleParameters)]
 pub struct StarCoder2Layer {
-    #[param] pub attention: LlamaAttention,
-    #[param] pub mlp: StarCoder2MLP,
-    #[param] pub input_layernorm: nn::RmsNorm,
-    #[param] pub post_attention_layernorm: nn::RmsNorm,
+    #[param]
+    pub attention: LlamaAttention,
+    #[param]
+    pub mlp: StarCoder2MLP,
+    #[param]
+    pub input_layernorm: nn::RmsNorm,
+    #[param]
+    pub post_attention_layernorm: nn::RmsNorm,
 }
 
 impl StarCoder2Layer {
@@ -98,8 +114,14 @@ impl StarCoder2Layer {
         Ok(Self {
             attention: LlamaAttention::new(&attn_config, layer_idx)?,
             mlp: StarCoder2MLP::new(config)?,
-            input_layernorm: nn::RmsNormBuilder::new(config.hidden_size).eps(config.rms_norm_eps).build().map_err(|_| Exception::custom("Build error"))?,
-            post_attention_layernorm: nn::RmsNormBuilder::new(config.hidden_size).eps(config.rms_norm_eps).build().map_err(|_| Exception::custom("Build error"))?,
+            input_layernorm: nn::RmsNormBuilder::new(config.hidden_size)
+                .eps(config.rms_norm_eps)
+                .build()
+                .map_err(|_| Exception::custom("Build error"))?,
+            post_attention_layernorm: nn::RmsNormBuilder::new(config.hidden_size)
+                .eps(config.rms_norm_eps)
+                .build()
+                .map_err(|_| Exception::custom("Build error"))?,
         })
     }
 
@@ -110,7 +132,11 @@ impl StarCoder2Layer {
         mut cache: Option<(&mut pmetal_mlx::kv_cache::KVCache, usize)>,
     ) -> Result<Array, Exception> {
         let h = self.input_layernorm.forward(x)?;
-        let attn_out = self.attention.forward_with_cache(&h, mask, cache.as_mut().map(|(c, i)| (&mut **c, *i)))?;
+        let attn_out = self.attention.forward_with_cache(
+            &h,
+            mask,
+            cache.as_mut().map(|(c, i)| (&mut **c, *i)),
+        )?;
         let x = x.add(&attn_out)?;
         let h = self.post_attention_layernorm.forward(&x)?;
         let mlp_out = self.mlp.forward(&h)?;
@@ -121,10 +147,14 @@ impl StarCoder2Layer {
 /// StarCoder2 Model.
 #[derive(Debug, ModuleParameters)]
 pub struct StarCoder2Model {
-    #[param] pub embed_tokens: nn::Embedding,
-    #[param] pub layers: Vec<StarCoder2Layer>,
-    #[param] pub norm: nn::RmsNorm,
-    #[param] pub lm_head: nn::Linear,
+    #[param]
+    pub embed_tokens: nn::Embedding,
+    #[param]
+    pub layers: Vec<StarCoder2Layer>,
+    #[param]
+    pub norm: nn::RmsNorm,
+    #[param]
+    pub lm_head: nn::Linear,
     pub config: StarCoder2Config,
 }
 
@@ -137,8 +167,14 @@ impl StarCoder2Model {
         Ok(Self {
             embed_tokens: nn::Embedding::new(config.vocab_size, config.hidden_size)?,
             layers,
-            norm: nn::RmsNormBuilder::new(config.hidden_size).eps(config.rms_norm_eps).build().map_err(|_| Exception::custom("Build error"))?,
-            lm_head: nn::LinearBuilder::new(config.hidden_size, config.vocab_size).bias(false).build().map_err(|_| Exception::custom("Build error"))?,
+            norm: nn::RmsNormBuilder::new(config.hidden_size)
+                .eps(config.rms_norm_eps)
+                .build()
+                .map_err(|_| Exception::custom("Build error"))?,
+            lm_head: nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
+                .bias(false)
+                .build()
+                .map_err(|_| Exception::custom("Build error"))?,
             config,
         })
     }

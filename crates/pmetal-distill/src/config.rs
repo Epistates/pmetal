@@ -76,6 +76,16 @@ pub struct LossConfig {
     #[serde(default = "default_rationale_weight")]
     pub rationale_weight: f32,
 
+    /// Whether to use outcome-supervised distillation (requires correctness labels).
+    #[serde(default)]
+    pub outcome_supervised: bool,
+
+    /// Start marker for explicit reasoning (e.g., "<think>").
+    pub start_marker: Option<String>,
+
+    /// End marker for explicit reasoning (e.g., "</think>").
+    pub end_marker: Option<String>,
+
     /// Hidden state distillation configuration.
     #[serde(default)]
     pub hidden_state: Option<HiddenStateConfig>,
@@ -94,6 +104,9 @@ impl Default for LossConfig {
             reverse_kl: false,
             rationale: false,
             rationale_weight: default_rationale_weight(),
+            outcome_supervised: false,
+            start_marker: None,
+            end_marker: None,
             hidden_state: None,
             attention: None,
         }
@@ -310,6 +323,31 @@ impl DistillConfig {
 
         if self.loss.alpha < 0.0 || self.loss.alpha > 1.0 {
             return Err(crate::DistillError::InvalidAlpha(self.loss.alpha));
+        }
+
+        // Validate reasoning markers: if rationale is enabled and markers are used,
+        // both must be provided and non-empty
+        if self.loss.rationale {
+            match (&self.loss.start_marker, &self.loss.end_marker) {
+                (Some(start), Some(end)) => {
+                    if start.is_empty() || end.is_empty() {
+                        return Err(crate::DistillError::InvalidConfig(
+                            "reasoning markers must be non-empty when provided".into(),
+                        ));
+                    }
+                    if start == end {
+                        return Err(crate::DistillError::InvalidConfig(
+                            "start_marker and end_marker must be different".into(),
+                        ));
+                    }
+                }
+                (Some(_), None) | (None, Some(_)) => {
+                    return Err(crate::DistillError::InvalidConfig(
+                        "both start_marker and end_marker must be provided together".into(),
+                    ));
+                }
+                (None, None) => {} // OK: entropy-based detection
+            }
         }
 
         Ok(())

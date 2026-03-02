@@ -15,7 +15,10 @@ use mlx_rs::{
     module::{Module, Param},
     nn,
 };
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{RopeScaling, apply_rope},
+};
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
@@ -69,6 +72,9 @@ pub struct GemmaConfig {
     /// Whether this is a Gemma2 model.
     #[serde(default)]
     pub is_gemma2: bool,
+    /// RoPE scaling configuration.
+    #[serde(default)]
+    pub rope_scaling: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 fn default_model_type() -> String {
@@ -137,6 +143,7 @@ impl Default for GemmaConfig {
             query_pre_attn_scalar: None,
             sliding_window: None,
             is_gemma2: false,
+            rope_scaling: None,
         }
     }
 }
@@ -297,6 +304,16 @@ pub struct GemmaAttention {
     pub logit_softcapping: Option<f32>,
     /// RoPE base frequency.
     pub rope_theta: f32,
+    /// RoPE position scale (from rope_scaling config).
+    pub rope_scale: f32,
+    /// Effective RoPE base after scaling.
+    pub effective_base: f32,
+    /// Layer index (for Gemma2 alternating sliding window).
+    pub layer_idx: usize,
+    /// Whether this layer uses local (sliding window) attention (Gemma2: even layers).
+    pub is_local_attention: bool,
+    /// Sliding window size (Gemma2 only).
+    pub sliding_window: Option<i32>,
 
     /// Query projection.
     #[param]
@@ -317,12 +334,21 @@ pub struct GemmaAttention {
 
 impl GemmaAttention {
     /// Create a new attention layer.
-    pub fn new(config: &GemmaConfig) -> Result<Self, Exception> {
+    pub fn new(config: &GemmaConfig, layer_idx: usize) -> Result<Self, Exception> {
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_kv_heads();
         let head_dim = config.get_head_dim();
         let scale = config.attention_scale();
         let rope_theta = config.rope_theta;
+
+        // Parse rope_scaling from config
+        let rope_scaling_cfg = config
+            .rope_scaling
+            .as_ref()
+            .map(|map| RopeScaling::from_config_map(map))
+            .unwrap_or(RopeScaling::None);
+        let rope_scale = rope_scaling_cfg.scale();
+        let effective_base = rope_scaling_cfg.effective_base(rope_theta, head_dim);
 
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
             .bias(false)
@@ -338,9 +364,13 @@ impl GemmaAttention {
             .build()?;
 
         let rope = nn::RopeBuilder::new(head_dim)
-            .base(rope_theta)
+            .base(effective_base)
+            .scale(rope_scale)
             .traditional(false)
             .build()?;
+
+        // Gemma2: even layers use sliding window, odd layers use full causal
+        let is_local_attention = config.is_gemma2 && (layer_idx % 2 == 0);
 
         Ok(Self {
             n_heads,
@@ -349,6 +379,11 @@ impl GemmaAttention {
             scale,
             logit_softcapping: config.attn_logit_softcapping,
             rope_theta,
+            rope_scale,
+            effective_base,
+            layer_idx,
+            is_local_attention,
+            sliding_window: config.sliding_window,
             q_proj,
             k_proj,
             v_proj,
@@ -392,8 +427,22 @@ impl GemmaAttention {
         // Apply RoPE
         let (queries, keys, values) = if let Some((ref cache_ref, _)) = cache {
             let offset = cache_ref.rope_offset();
-            let queries = apply_rope(&queries, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-            let keys = apply_rope(&keys, self.head_dim, false, self.rope_theta, 1.0, offset)?;
+            let queries = apply_rope(
+                &queries,
+                self.head_dim,
+                false,
+                self.effective_base,
+                self.rope_scale,
+                offset,
+            )?;
+            let keys = apply_rope(
+                &keys,
+                self.head_dim,
+                false,
+                self.effective_base,
+                self.rope_scale,
+                offset,
+            )?;
             (queries, keys, values)
         } else {
             let queries = Module::forward(&mut self.rope, &queries)?;
@@ -409,14 +458,22 @@ impl GemmaAttention {
         };
 
         // Build fused attention config with optional softcapping
+        // Gemma2: even layers use sliding window, odd layers use full causal
+        let mask_type = if mask.is_some() {
+            AttentionMaskType::None // Custom mask provided
+        } else if self.is_local_attention {
+            if let Some(window) = self.sliding_window {
+                AttentionMaskType::SlidingWindow(window)
+            } else {
+                AttentionMaskType::Causal
+            }
+        } else {
+            AttentionMaskType::Causal
+        };
         let mut attn_config =
             FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
                 .with_scale(self.scale)
-                .with_mask_type(if mask.is_some() {
-                    AttentionMaskType::None // Custom mask provided
-                } else {
-                    AttentionMaskType::Causal
-                });
+                .with_mask_type(mask_type);
 
         // Add logit softcapping if configured (Gemma2)
         if let Some(cap) = self.logit_softcapping {
@@ -447,6 +504,8 @@ pub struct GemmaMLP {
     /// Down projection.
     #[param]
     pub down_proj: nn::Linear,
+    /// Hidden activation function name.
+    hidden_act: String,
 }
 
 impl GemmaMLP {
@@ -466,14 +525,24 @@ impl GemmaMLP {
             gate_proj,
             up_proj,
             down_proj,
+            hidden_act: config.hidden_act.clone(),
         })
     }
 
-    /// Forward pass (GeGLU activation).
+    /// Apply the configured activation function.
+    fn apply_activation(&self, x: &Array) -> Result<Array, Exception> {
+        match self.hidden_act.as_str() {
+            "gelu" | "gelu_pytorch_tanh" | "gelu_tanh" => gelu_tanh(x),
+            "silu" | "swish" => mlx_rs::nn::silu(x).map_err(Into::into),
+            "relu" => mlx_rs::nn::relu(x).map_err(Into::into),
+            _ => gelu_tanh(x), // Default to gelu_tanh for Gemma
+        }
+    }
+
+    /// Forward pass with configurable activation (GeGLU/SwiGLU/ReGLU).
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        // GeGLU: down_proj(gelu(gate_proj(x)) * up_proj(x))
         let gate = Module::forward(&mut self.gate_proj, x)?;
-        let gate = gelu_tanh(&gate)?;
+        let gate = self.apply_activation(&gate)?;
         let up = Module::forward(&mut self.up_proj, x)?;
         let hidden = gate.multiply(&up)?;
         Module::forward(&mut self.down_proj, &hidden)
@@ -499,8 +568,8 @@ pub struct GemmaDecoderLayer {
 
 impl GemmaDecoderLayer {
     /// Create a new decoder layer.
-    pub fn new(config: &GemmaConfig) -> Result<Self, Exception> {
-        let self_attn = GemmaAttention::new(config)?;
+    pub fn new(config: &GemmaConfig, layer_idx: usize) -> Result<Self, Exception> {
+        let self_attn = GemmaAttention::new(config, layer_idx)?;
         let mlp = GemmaMLP::new(config)?;
 
         let input_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
@@ -563,8 +632,8 @@ pub struct Gemma2DecoderLayer {
 
 impl Gemma2DecoderLayer {
     /// Create a new Gemma2 decoder layer.
-    pub fn new(config: &GemmaConfig) -> Result<Self, Exception> {
-        let self_attn = GemmaAttention::new(config)?;
+    pub fn new(config: &GemmaConfig, layer_idx: usize) -> Result<Self, Exception> {
+        let self_attn = GemmaAttention::new(config, layer_idx)?;
         let mlp = GemmaMLP::new(config)?;
 
         let input_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
@@ -644,7 +713,7 @@ impl GemmaModel {
                 gemma1: None,
                 gemma2: Some(
                     (0..config.num_hidden_layers)
-                        .map(|_| Gemma2DecoderLayer::new(&config))
+                        .map(|i| Gemma2DecoderLayer::new(&config, i as usize))
                         .collect::<Result<Vec<_>, _>>()?,
                 ),
             }
@@ -652,7 +721,7 @@ impl GemmaModel {
             GemmaLayers {
                 gemma1: Some(
                     (0..config.num_hidden_layers)
-                        .map(|_| GemmaDecoderLayer::new(&config))
+                        .map(|i| GemmaDecoderLayer::new(&config, i as usize))
                         .collect::<Result<Vec<_>, _>>()?,
                 ),
                 gemma2: None,
@@ -904,7 +973,7 @@ mod tests {
     #[serial]
     fn test_gemma_attention() {
         let config = small_config();
-        let mut attn = GemmaAttention::new(&config).unwrap();
+        let mut attn = GemmaAttention::new(&config, 0).unwrap();
 
         let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
         let output = attn.forward(&x, None).unwrap();
@@ -928,7 +997,7 @@ mod tests {
     #[serial]
     fn test_gemma_decoder_layer() {
         let config = small_config();
-        let mut layer = GemmaDecoderLayer::new(&config).unwrap();
+        let mut layer = GemmaDecoderLayer::new(&config, 0).unwrap();
 
         let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
         let output = layer.forward(&x, None).unwrap();
@@ -968,7 +1037,7 @@ mod tests {
         config.attn_logit_softcapping = Some(50.0);
         config.query_pre_attn_scalar = Some(256);
 
-        let mut layer = Gemma2DecoderLayer::new(&config).unwrap();
+        let mut layer = Gemma2DecoderLayer::new(&config, 0).unwrap();
 
         let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
         let output = layer.forward(&x, None).unwrap();
@@ -982,7 +1051,7 @@ mod tests {
         let mut config = small_config();
         config.attn_logit_softcapping = Some(50.0);
 
-        let mut attn = GemmaAttention::new(&config).unwrap();
+        let mut attn = GemmaAttention::new(&config, 0).unwrap();
         let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
         let output = attn.forward(&x, None).unwrap();
 

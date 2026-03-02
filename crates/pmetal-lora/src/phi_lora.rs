@@ -90,14 +90,18 @@ impl PhiLoraAttention {
         let head_dim = config.head_dim();
         let rope_dim = config.rope_dim();
 
-        let rank = lora_config.r as i32;
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
+        // Per-module ranks respecting target_modules
+        let q_rank = crate::effective_rank(lora_config, "q_proj") as i32;
+        let k_rank = crate::effective_rank(lora_config, "k_proj") as i32;
+        let v_rank = crate::effective_rank(lora_config, "v_proj") as i32;
+        let o_rank = crate::effective_rank(lora_config, "o_proj") as i32;
 
         let q_proj = LoraLinear::new(
             config.hidden_size,
             config.num_attention_heads * head_dim,
-            rank,
+            q_rank,
             alpha,
             use_rslora,
             config.qkv_bias,
@@ -105,7 +109,7 @@ impl PhiLoraAttention {
         let k_proj = LoraLinear::new(
             config.hidden_size,
             config.num_key_value_heads * head_dim,
-            rank,
+            k_rank,
             alpha,
             use_rslora,
             config.qkv_bias,
@@ -113,7 +117,7 @@ impl PhiLoraAttention {
         let v_proj = LoraLinear::new(
             config.hidden_size,
             config.num_key_value_heads * head_dim,
-            rank,
+            v_rank,
             alpha,
             use_rslora,
             config.qkv_bias,
@@ -121,7 +125,7 @@ impl PhiLoraAttention {
         let o_proj = LoraLinear::new(
             config.num_attention_heads * head_dim,
             config.hidden_size,
-            rank,
+            o_rank,
             alpha,
             use_rslora,
             false,
@@ -354,9 +358,11 @@ pub struct PhiLoraMLP {
 impl PhiLoraMLP {
     /// Create a new LoRA MLP layer.
     pub fn new(config: &PhiConfig, lora_config: &LoraConfig) -> Result<Self, LoraError> {
-        let rank = lora_config.r as i32;
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
+        // gate_up_proj is a fused gate+up projection; use gate_proj for target_modules lookup
+        let gate_up_rank = crate::effective_rank(lora_config, "gate_proj") as i32;
+        let down_rank = crate::effective_rank(lora_config, "down_proj") as i32;
 
         // For SwiGLU, gate_up_proj projects to 2x intermediate_size
         let proj_size = match config.hidden_act {
@@ -367,7 +373,7 @@ impl PhiLoraMLP {
         let gate_up_proj = LoraLinear::new(
             config.hidden_size,
             proj_size,
-            rank,
+            gate_up_rank,
             alpha,
             use_rslora,
             false,
@@ -375,7 +381,7 @@ impl PhiLoraMLP {
         let down_proj = LoraLinear::new(
             config.intermediate_size,
             config.hidden_size,
-            rank,
+            down_rank,
             alpha,
             use_rslora,
             false,

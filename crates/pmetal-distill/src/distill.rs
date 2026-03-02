@@ -77,9 +77,23 @@ impl DistillerBuilder {
         // Create loss function from config if not provided
         let loss: Box<dyn DistillLoss> = self.loss.unwrap_or_else(|| {
             if config.loss.rationale {
-                Box::new(crate::reasoning::RationaleLoss::new(
-                    config.loss.rationale_weight,
-                ))
+                if config.loss.outcome_supervised {
+                    Box::new(crate::reasoning::OutcomeSupervisedRationaleLoss::new(
+                        config.loss.rationale_weight,
+                    ))
+                } else if let (Some(start), Some(end)) =
+                    (&config.loss.start_marker, &config.loss.end_marker)
+                {
+                    Box::new(crate::reasoning::RationaleLoss::with_markers(
+                        config.loss.rationale_weight,
+                        start,
+                        end,
+                    ))
+                } else {
+                    Box::new(crate::reasoning::RationaleLoss::new(
+                        config.loss.rationale_weight,
+                    ))
+                }
             } else {
                 match config.loss.loss_type {
                     LossType::KlDivergence => {
@@ -279,11 +293,15 @@ impl Distiller {
         teacher_logits: &Array,
         student_logits: &Array,
         labels: Option<&Array>,
+        weights: Option<&Array>,
     ) -> Result<DistillLossOutput> {
         // Soft distillation loss
-        let soft_loss =
-            self.loss
-                .compute(teacher_logits, student_logits, self.config.loss.temperature)?;
+        let soft_loss = self.loss.compute_weighted(
+            teacher_logits,
+            student_logits,
+            self.config.loss.temperature,
+            weights,
+        )?;
 
         // Scale by temperature squared (to maintain gradient magnitude)
         let t_squared = self.config.loss.temperature * self.config.loss.temperature;
@@ -301,12 +319,12 @@ impl Distiller {
             let total = soft_weighted.add(&hard_weighted)?;
             (total, Some(hard_loss))
         } else {
-            (soft_scaled, None)
+            (soft_scaled.clone(), None)
         };
 
         Ok(DistillLossOutput {
             total: total_loss,
-            soft: soft_loss,
+            soft: soft_scaled.clone(),
             hard: hard_loss_opt,
             hidden: None,
         })
@@ -320,8 +338,9 @@ impl Distiller {
         teacher_hiddens: &[Array],
         student_hiddens: &[Array],
         labels: Option<&Array>,
+        weights: Option<&Array>,
     ) -> Result<DistillLossOutput> {
-        let mut output = self.compute_loss(teacher_logits, student_logits, labels)?;
+        let mut output = self.compute_loss(teacher_logits, student_logits, labels, weights)?;
 
         // Add hidden state loss if configured
         if let Some(_hidden_loss) = &self.hidden_loss {
@@ -378,41 +397,38 @@ pub struct DistillLossOutput {
 
 /// Compute hard cross-entropy loss with labels.
 fn compute_hard_loss(logits: &Array, labels: &Array) -> Result<Array> {
+    use mlx_rs::ops::indexing::take_along_axis;
+
+    // All operations stay in the MLX graph so gradients flow correctly.
+
     // Log-softmax for numerical stability
-    let max_logits = logits.max_axes(&[-1], Some(true))?;
-    let shifted = logits.subtract(&max_logits)?;
-    let exp_shifted = shifted.exp()?;
-    let sum_exp = exp_shifted.sum_axes(&[-1], Some(true))?;
-    let log_probs = shifted.subtract(&sum_exp.log()?)?;
+    let log_probs = mlx_rs::nn::log_softmax(logits, -1)?;
 
-    // Gather log probs at label positions
-    let batch_size = logits.dim(0) as usize;
-    let seq_len = logits.dim(1) as usize;
-    let vocab_size = logits.dim(2) as usize;
+    // Flatten to [batch*seq, vocab] for gather
+    let vocab_size = logits.dim(-1);
+    let log_probs_flat = log_probs.reshape(&[-1, vocab_size])?;
+    let labels_flat = labels.reshape(&[-1])?;
 
-    let log_probs_data: Vec<f32> = log_probs.as_slice().to_vec();
-    let labels_data: Vec<i64> = labels.as_slice().to_vec();
+    // Build ignore mask: labels >= 0 (ignore_index = -100 or any negative)
+    let zero_i = Array::from_int(0);
+    let valid_mask = labels_flat.ge(&zero_i)?.as_dtype(mlx_rs::Dtype::Float32)?;
 
-    let mut losses = Vec::with_capacity(batch_size * seq_len);
-    for i in 0..(batch_size * seq_len) {
-        let label = labels_data.get(i).copied().unwrap_or(0);
-        // Explicitly skip ignore-index tokens (label == -100 or any negative value).
-        // Previously this relied on `label as usize` wrapping a negative i64 to a
-        // very large usize that is always >= vocab_size.  The explicit check is
-        // clearer and avoids relying on wrapping semantics.
-        if label < 0 || label as usize >= vocab_size {
-            continue; // Explicitly skip ignore-index tokens
-        }
-        losses.push(-log_probs_data[i * vocab_size + label as usize]);
-    }
+    // Clamp labels to valid range for gather (ignored positions won't contribute to loss)
+    let labels_clamped = mlx_rs::ops::maximum(&labels_flat, &zero_i)?
+        .as_dtype(mlx_rs::Dtype::Int32)?
+        .reshape(&[-1, 1])?;
 
-    // Guard against the case where all tokens are ignored.
-    if losses.is_empty() {
-        return Ok(Array::from_f32(0.0));
-    }
+    // Gather log-probs at label positions using take_along_axis (stays in graph)
+    let gathered = take_along_axis(&log_probs_flat, &labels_clamped, -1)?;
+    let gathered = gathered.squeeze()?;
 
-    let loss_array = Array::from_slice(&losses, &[losses.len() as i32]);
-    Ok(loss_array.mean(None)?)
+    // Apply mask: only count non-ignored tokens
+    let neg_log_probs = gathered.negative()?.multiply(&valid_mask)?;
+
+    // Mean over valid tokens (avoid division by zero)
+    let num_valid = valid_mask.sum(None)?;
+    let safe_num = mlx_rs::ops::maximum(&num_valid, &Array::from_f32(1.0))?;
+    Ok(neg_log_probs.sum(None)?.divide(&safe_num)?)
 }
 
 #[cfg(test)]
@@ -462,7 +478,9 @@ mod tests {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
 
-        let output = distiller.compute_loss(&teacher, &student, None).unwrap();
+        let output = distiller
+            .compute_loss(&teacher, &student, None, None)
+            .unwrap();
 
         // Loss should be positive
         let value: f32 = output.total.item();

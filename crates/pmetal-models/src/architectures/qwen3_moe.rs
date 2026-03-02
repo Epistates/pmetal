@@ -7,12 +7,20 @@
 //! - SwitchGLU-style expert MLP with gather_mm
 
 use mlx_rs::{
-    Array, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
+    Array,
+    builder::Builder,
+    error::Exception,
+    macros::ModuleParameters,
+    module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param},
+    nn,
     ops::indexing::IndexOp,
 };
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{RopeScaling, apply_rope},
+};
 use pmetal_mlx::kv_cache::KVCache;
-use pmetal_mlx::moe::{MoEConfig, MoELayer};
+// MoE block uses pmetal_mlx::moe::Expert directly for individual expert MLPs
 use serde::{Deserialize, Serialize};
 
 /// Qwen3-MoE model configuration.
@@ -68,6 +76,9 @@ pub struct Qwen3MoEConfig {
     /// Whether to normalize top-k routing probabilities.
     #[serde(default = "default_norm_topk_prob")]
     pub norm_topk_prob: bool,
+    /// RoPE scaling configuration.
+    #[serde(default)]
+    pub rope_scaling: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 fn default_model_type() -> String {
@@ -148,6 +159,7 @@ impl Default for Qwen3MoEConfig {
             decoder_sparse_step: 1,
             mlp_only_layers: vec![],
             norm_topk_prob: true,
+            rope_scaling: None,
         }
     }
 }
@@ -156,7 +168,6 @@ impl Default for Qwen3MoEConfig {
 #[derive(Debug, ModuleParameters)]
 pub struct Qwen3MoEAttention {
     /// Configuration.
-    #[allow(dead_code)]
     config: Qwen3MoEConfig,
     /// Number of attention heads.
     n_heads: i32,
@@ -168,6 +179,10 @@ pub struct Qwen3MoEAttention {
     scale: f32,
     /// RoPE theta.
     rope_theta: f32,
+    /// RoPE position scale (from rope_scaling config).
+    rope_scale: f32,
+    /// Effective RoPE base after scaling.
+    effective_base: f32,
     /// Query projection.
     #[param]
     pub q_proj: nn::Linear,
@@ -197,6 +212,15 @@ impl Qwen3MoEAttention {
         let hidden_size = config.hidden_size;
         let scale = (head_dim as f32).powf(-0.5);
 
+        // Parse rope_scaling from config
+        let rope_scaling = config
+            .rope_scaling
+            .as_ref()
+            .map(|map| RopeScaling::from_config_map(map))
+            .unwrap_or(RopeScaling::None);
+        let rope_scale = rope_scaling.scale();
+        let effective_base = rope_scaling.effective_base(config.rope_theta, head_dim);
+
         let q_proj = nn::LinearBuilder::new(hidden_size, n_heads * head_dim)
             .bias(false)
             .build()?;
@@ -219,6 +243,8 @@ impl Qwen3MoEAttention {
 
         Ok(Self {
             rope_theta: config.rope_theta,
+            rope_scale,
+            effective_base,
             config,
             n_heads,
             n_kv_heads,
@@ -265,8 +291,22 @@ impl Qwen3MoEAttention {
 
         // Apply RoPE
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-        let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, offset)?;
+        let q = apply_rope(
+            &q,
+            self.head_dim,
+            false,
+            self.effective_base,
+            self.rope_scale,
+            offset,
+        )?;
+        let k = apply_rope(
+            &k,
+            self.head_dim,
+            false,
+            self.effective_base,
+            self.rope_scale,
+            offset,
+        )?;
 
         // Update cache if provided
         let (k, v) = if let Some((cache, layer_idx)) = cache {
@@ -339,18 +379,24 @@ impl Qwen3MoEDenseMLP {
 }
 
 /// MoE block with softmax routing for Qwen3-MoE.
-#[derive(Debug)]
+///
+/// C6: Fixed to perform proper per-expert token dispatch instead of
+/// ignoring routing results. Uses the same GPU-native top-k and
+/// per-expert gather/scatter pattern as [`MoELayer`].
+#[derive(Debug, ModuleParameters)]
 pub struct Qwen3MoEBlock {
     /// Number of experts.
     pub num_experts: usize,
     /// Top-k experts per token.
-    pub top_k: i32,
+    pub top_k: usize,
     /// Whether to normalize top-k probabilities.
     pub norm_topk_prob: bool,
     /// Gate projection (routes to experts).
+    #[param]
     pub gate: nn::Linear,
-    /// MoE layer with all experts.
-    pub moe: MoELayer,
+    /// Expert MLPs.
+    #[param]
+    pub experts: Vec<pmetal_mlx::moe::Expert>,
 }
 
 impl Qwen3MoEBlock {
@@ -363,58 +409,177 @@ impl Qwen3MoEBlock {
             .bias(false)
             .build()?;
 
-        let moe_config = MoEConfig::new(config.hidden_size, moe_intermediate, num_experts)
-            .with_num_experts_per_tok(config.num_experts_per_tok as usize)
-            .with_aux_loss(false, 0.0);
-
-        let moe = MoELayer::new(moe_config);
+        let experts = (0..num_experts)
+            .map(|_| pmetal_mlx::moe::Expert::new(config.hidden_size, moe_intermediate))
+            .collect();
 
         Ok(Self {
             num_experts,
-            top_k: config.num_experts_per_tok,
+            top_k: config.num_experts_per_tok as usize,
             norm_topk_prob: config.norm_topk_prob,
             gate,
-            moe,
+            experts,
         })
     }
 
-    /// Forward pass through MoE block.
+    /// Forward pass with proper routing.
+    ///
+    /// 1. Compute routing logits and softmax probabilities
+    /// 2. GPU-native top-k selection (argsort + slice)
+    /// 3. Per-expert token dispatch: gather assigned tokens, run expert, scatter back
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        // Compute routing scores
-        let gates = self.gate.forward(x)?;
-        let gates = mlx_rs::ops::softmax_axis(&gates, -1, None)?;
+        let shape = x.shape();
+        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
+        let hidden_size = shape[shape.len() - 1];
+        let hidden_flat = x.reshape(&[batch_seq, hidden_size])?;
 
-        // Select top-k experts
-        let neg_k = -self.top_k;
-        let inds = mlx_rs::ops::argpartition_axis(&gates, neg_k, -1)?;
-        // Get the last k elements (top-k)
-        let k = self.top_k as usize;
-        let inds_shape = inds.shape();
-        let last_dim = inds_shape[inds_shape.len() - 1] as usize;
-        let start = last_dim - k;
+        // Compute routing scores (cast to f32 for stability)
+        let gate_logits = self.gate.forward(&hidden_flat)?;
+        let gate_logits_f32 = if gate_logits.dtype() != mlx_rs::Dtype::Float32 {
+            gate_logits.as_type::<f32>()?
+        } else {
+            gate_logits
+        };
+        let routing_probs = mlx_rs::ops::softmax_axis(&gate_logits_f32, -1, None)?;
 
-        // Slice to get top-k indices using index
-        let inds = inds.index((.., .., start as i32..));
+        // GPU-native top-k
+        let neg_probs = routing_probs.negative()?;
+        let sorted_indices = mlx_rs::ops::argsort_axis(&neg_probs, -1)?;
+        let top_indices = sorted_indices.index((.., ..self.top_k as i32));
+        let top_weights = routing_probs.take_along_axis(&top_indices, -1)?;
 
-        // Get scores for selected experts
-        let _scores = gates.take_along_axis(&inds, -1)?;
+        // Normalize top-k weights
+        let normalized_weights = if self.norm_topk_prob {
+            let weight_sum = top_weights.sum_axis(-1, Some(true))?;
+            let safe_sum = mlx_rs::ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
+            top_weights.divide(&safe_sum)?
+        } else {
+            top_weights
+        };
 
-        // For now, use the MoE layer directly
-        // TODO: Use custom routing with inds and scores
-        self.moe.eval();
-        let (output, _aux_loss) = self.moe.forward(x)?;
+        // Eval for CPU-side index extraction (small tensor)
+        top_indices.eval()?;
+        normalized_weights.eval()?;
 
-        Ok(output)
+        let n_tokens = batch_seq as usize;
+        let expert_indices: Vec<i32> = top_indices.as_slice().to_vec();
+        let expert_weights: Vec<f32> = normalized_weights.as_slice().to_vec();
+
+        // Build per-expert token assignments
+        let mut expert_assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.num_experts];
+        for token_idx in 0..n_tokens {
+            for slot in 0..self.top_k {
+                let flat_idx = token_idx * self.top_k + slot;
+                let expert_id = expert_indices[flat_idx] as usize;
+                let weight = expert_weights[flat_idx];
+                if expert_id < self.num_experts {
+                    expert_assignments[expert_id].push((token_idx, weight));
+                }
+            }
+        }
+
+        // Per-expert dispatch
+        let mut final_output = Array::zeros::<f32>(&[batch_seq, hidden_size])?;
+        for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
+            if assignments.is_empty() {
+                continue;
+            }
+
+            let token_indices: Vec<i32> = assignments.iter().map(|&(idx, _)| idx as i32).collect();
+            let weights: Vec<f32> = assignments.iter().map(|&(_, w)| w).collect();
+
+            let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
+            let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
+
+            let expert_input = hidden_flat.take_axis(&idx_array, 0)?;
+            let expert_out = self.experts[expert_idx].forward(&expert_input)?;
+            let weighted_out = expert_out.multiply(&weight_array)?;
+
+            let idx_2d = idx_array.reshape(&[-1, 1])?;
+            let idx_broadcast = mlx_rs::ops::broadcast_to(&idx_2d, weighted_out.shape())?;
+            final_output = mlx_rs::ops::indexing::scatter_add_single(
+                &final_output,
+                &idx_broadcast,
+                &weighted_out,
+                0,
+            )?;
+        }
+
+        let mut output_shape = shape.to_vec();
+        output_shape[shape.len() - 1] = hidden_size;
+        final_output.reshape(&output_shape)
     }
 }
 
 /// Feed-forward for a decoder layer - either dense MLP or MoE.
+///
+/// C8: Implements `ModuleParameters` so that expert weights are visible to the
+/// optimizer and parameter loading. The derive macro cannot handle enums, so
+/// we implement the trait manually, delegating to the inner variant.
 #[derive(Debug)]
 pub enum Qwen3MoEFeedForward {
     /// Dense MLP.
     Dense(Qwen3MoEDenseMLP),
     /// Mixture of Experts.
     MoE(Qwen3MoEBlock),
+}
+
+impl ModuleParameters for Qwen3MoEFeedForward {
+    fn num_parameters(&self) -> usize {
+        match self {
+            Self::Dense(mlp) => mlp.num_parameters(),
+            Self::MoE(moe) => moe.num_parameters(),
+        }
+    }
+
+    fn parameters(&self) -> ModuleParamRef<'_> {
+        match self {
+            Self::Dense(mlp) => mlp.parameters(),
+            Self::MoE(moe) => moe.parameters(),
+        }
+    }
+
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+        match self {
+            Self::Dense(mlp) => mlp.parameters_mut(),
+            Self::MoE(moe) => moe.parameters_mut(),
+        }
+    }
+
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        match self {
+            Self::Dense(mlp) => mlp.trainable_parameters(),
+            Self::MoE(moe) => moe.trainable_parameters(),
+        }
+    }
+
+    fn freeze_parameters(&mut self, recursive: bool) {
+        match self {
+            Self::Dense(mlp) => mlp.freeze_parameters(recursive),
+            Self::MoE(moe) => moe.freeze_parameters(recursive),
+        }
+    }
+
+    fn unfreeze_parameters(&mut self, recursive: bool) {
+        match self {
+            Self::Dense(mlp) => mlp.unfreeze_parameters(recursive),
+            Self::MoE(moe) => moe.unfreeze_parameters(recursive),
+        }
+    }
+
+    fn all_frozen(&self) -> Option<bool> {
+        match self {
+            Self::Dense(mlp) => mlp.all_frozen(),
+            Self::MoE(moe) => moe.all_frozen(),
+        }
+    }
+
+    fn any_frozen(&self) -> Option<bool> {
+        match self {
+            Self::Dense(mlp) => mlp.any_frozen(),
+            Self::MoE(moe) => moe.any_frozen(),
+        }
+    }
 }
 
 impl Qwen3MoEFeedForward {
@@ -431,7 +596,6 @@ impl Qwen3MoEFeedForward {
 #[derive(Debug, ModuleParameters)]
 pub struct Qwen3MoEDecoderLayer {
     /// Configuration.
-    #[allow(dead_code)]
     pub config: Qwen3MoEConfig,
     /// Self-attention.
     #[param]
@@ -442,7 +606,8 @@ pub struct Qwen3MoEDecoderLayer {
     /// Post-attention layer norm.
     #[param]
     pub post_attention_layernorm: nn::RmsNorm,
-    /// Feed-forward (MLP or MoE) - not tracked as param since enum.
+    /// Feed-forward (MLP or MoE).
+    #[param]
     pub ffn: Qwen3MoEFeedForward,
 }
 
@@ -561,6 +726,9 @@ impl Qwen3MoEModel {
 }
 
 /// Full Qwen3-MoE model with LM head.
+///
+/// C7: When `tie_word_embeddings` is true, `lm_head` is `None` and the
+/// forward pass uses the embedding weight directly for the language model head.
 #[derive(Debug, ModuleParameters)]
 pub struct Qwen3MoE {
     /// Configuration.
@@ -568,9 +736,9 @@ pub struct Qwen3MoE {
     /// Base model.
     #[param]
     pub model: Qwen3MoEModel,
-    /// LM head.
+    /// LM head (None when tied to embedding weights).
     #[param]
-    pub lm_head: nn::Linear,
+    pub lm_head: Option<nn::Linear>,
 }
 
 impl Qwen3MoE {
@@ -579,15 +747,14 @@ impl Qwen3MoE {
         let model = Qwen3MoEModel::new(config.clone())?;
 
         let lm_head = if config.tie_word_embeddings {
-            // When tying embeddings, lm_head uses embed_tokens weights
-            // For now, create a separate linear layer
-            nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
-                .bias(false)
-                .build()?
+            // When tied, we use embed_tokens weight in forward - no separate lm_head
+            None
         } else {
-            nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
-                .bias(false)
-                .build()?
+            Some(
+                nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
+                    .bias(false)
+                    .build()?,
+            )
         };
 
         Ok(Self {
@@ -605,7 +772,15 @@ impl Qwen3MoE {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward(input_ids, mask, cache)?;
-        self.lm_head.forward(&hidden_states)
+
+        if let Some(ref mut head) = self.lm_head {
+            head.forward(&hidden_states)
+        } else {
+            // Tied embeddings: use embed_tokens weight as linear projection
+            // embed_tokens.weight is [vocab, hidden], so logits = hidden @ weight.T
+            let embed_weight = self.model.embed_tokens.weight.value.as_ref();
+            hidden_states.matmul(&embed_weight.t())
+        }
     }
 }
 

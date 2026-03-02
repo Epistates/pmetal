@@ -1,7 +1,9 @@
 //! Model architecture implementations.
 
+pub mod clip;
 pub mod cohere;
 pub mod deepseek;
+pub mod flux;
 pub mod gemma;
 pub mod gpt_oss;
 pub mod granite;
@@ -19,10 +21,14 @@ pub mod qwen3;
 pub mod qwen3_moe;
 pub mod recurrentgemma;
 pub mod starcoder2;
+pub mod t5;
+pub mod vae;
 pub mod whisper;
 
+pub use clip::*;
 pub use cohere::*;
 pub use deepseek::*;
+pub use flux::*;
 pub use gemma::*;
 pub use gpt_oss::*;
 pub use granite::*;
@@ -40,4 +46,6 @@ pub use qwen3::*;
 pub use qwen3_moe::*;
 pub use recurrentgemma::*;
 pub use starcoder2::*;
+pub use t5::*;
+pub use vae::*;
 pub use whisper::*;

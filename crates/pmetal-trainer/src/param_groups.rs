@@ -75,6 +75,9 @@ pub struct ParameterGroupConfig {
     pub weight_decay: f64,
     /// Pattern to match embedding parameters.
     pub embedding_patterns: Vec<String>,
+    /// Patterns for parameters that should NOT have weight decay applied.
+    /// Matches bias terms, layer norms, and scale parameters.
+    pub no_decay_patterns: Vec<String>,
 }
 
 impl Default for ParameterGroupConfig {
@@ -90,6 +93,12 @@ impl Default for ParameterGroupConfig {
                 "wpe".to_string(),        // Position embeddings
                 "token_embd".to_string(), // GGUF style
                 "output".to_string(),     // Output projection
+            ],
+            no_decay_patterns: vec![
+                "bias".to_string(),
+                "norm".to_string(), // Covers layernorm, rmsnorm, etc.
+                "scale".to_string(),
+                "ln_".to_string(), // GPT-2 / BLOOM style layer norms
             ],
         }
     }
@@ -121,6 +130,18 @@ impl ParameterGroupConfig {
         self.embedding_patterns.push(pattern.into());
         self
     }
+
+    /// Check if a parameter should have weight decay disabled.
+    ///
+    /// Returns true for bias terms, layer norms, and scale parameters,
+    /// which should not have weight decay applied per standard practice
+    /// (original AdamW paper, HuggingFace Transformers, PyTorch).
+    pub fn is_no_decay(&self, name: &str) -> bool {
+        let name_lower = name.to_lowercase();
+        self.no_decay_patterns
+            .iter()
+            .any(|pattern| name_lower.contains(&pattern.to_lowercase()))
+    }
 }
 
 /// Builder for creating parameter groups from model parameters.
@@ -128,6 +149,8 @@ pub struct ParameterGroupBuilder {
     config: ParameterGroupConfig,
     embeddings: ParameterGroup,
     non_embeddings: ParameterGroup,
+    /// Parameters that should NOT have weight decay (bias, norm, scale).
+    no_decay: ParameterGroup,
 }
 
 impl ParameterGroupBuilder {
@@ -142,13 +165,29 @@ impl ParameterGroupBuilder {
             non_embeddings: ParameterGroup::new("non_embeddings")
                 .with_lr(config.base_lr)
                 .with_weight_decay(config.weight_decay),
+            no_decay: ParameterGroup::new("no_decay")
+                .with_lr(config.base_lr)
+                .with_weight_decay(0.0),
             config,
         }
     }
 
     /// Classify a parameter by name.
+    ///
+    /// Parameters matching no-decay patterns (bias, norm, scale) are routed to
+    /// a group with weight_decay=0.0 regardless of whether they also match
+    /// embedding patterns. This follows standard practice from the AdamW paper
+    /// and HuggingFace Transformers.
     pub fn add_parameter(&mut self, name: &str) {
-        if self.is_embedding_param(name) {
+        if self.config.is_no_decay(name) {
+            // No-decay params use their appropriate LR but zero weight decay
+            if self.is_embedding_param(name) {
+                let embedding_lr = self.config.embedding_lr.unwrap_or(self.config.base_lr);
+                // For embedding no-decay params, still use embedding LR
+                self.no_decay.learning_rate = embedding_lr;
+            }
+            self.no_decay.add_param(name);
+        } else if self.is_embedding_param(name) {
             self.embeddings.add_param(name);
         } else {
             self.non_embeddings.add_param(name);
@@ -181,6 +220,9 @@ impl ParameterGroupBuilder {
         if !self.embeddings.is_empty() {
             groups.push(self.embeddings);
         }
+        if !self.no_decay.is_empty() {
+            groups.push(self.no_decay);
+        }
 
         groups
     }
@@ -188,11 +230,15 @@ impl ParameterGroupBuilder {
     /// Get summary of parameter grouping.
     pub fn summary(&self) -> String {
         format!(
-            "Parameter groups:\n  - {} non-embedding params (lr={:.2e})\n  - {} embedding params (lr={:.2e})",
+            "Parameter groups:\n  - {} non-embedding params (lr={:.2e}, wd={:.2e})\n  - {} embedding params (lr={:.2e}, wd={:.2e})\n  - {} no-decay params (lr={:.2e}, wd=0.0)",
             self.non_embeddings.len(),
             self.non_embeddings.learning_rate,
+            self.non_embeddings.weight_decay,
             self.embeddings.len(),
             self.embeddings.learning_rate,
+            self.embeddings.weight_decay,
+            self.no_decay.len(),
+            self.no_decay.learning_rate,
         )
     }
 }

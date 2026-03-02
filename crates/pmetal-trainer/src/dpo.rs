@@ -342,6 +342,13 @@ impl DpoTrainer {
     ///
     /// # Returns
     /// (policy_log_probs, reference_log_probs) both [batch]
+    /// Compute log probs with stop_gradient reference (memory-efficient but degenerate).
+    ///
+    /// **WARNING**: This method uses `stop_gradient` to create a reference from the policy
+    /// itself, which means `ref_logprobs == policy_logprobs` and the KL divergence term
+    /// is always zero. This effectively eliminates the regularization that prevents the
+    /// policy from diverging too far from the reference, making DPO degenerate into
+    /// simple reward maximization. **Always prefer providing a frozen reference model.**
     pub fn compute_log_probs_with_stop_gradient_reference(
         &self,
         logits: &Array,
@@ -350,11 +357,11 @@ impl DpoTrainer {
         // Compute policy log probs normally (gradients will flow)
         let policy_log_probs = self.compute_log_probs(logits, labels)?;
 
-        // WARN: stop_gradient reference makes ref=policy, eliminating KL regularization.
+        // ERROR: stop_gradient reference makes ref=policy, eliminating KL regularization.
         // Users MUST provide a frozen reference model for proper DPO training.
-        tracing::warn!(
+        tracing::error!(
             "DPO: stop_gradient reference makes ref=policy, eliminating KL regularization. \
-             Consider using a frozen reference model."
+             This produces degenerate training. Provide a frozen reference model."
         );
 
         // Create reference log probs using stop_gradient

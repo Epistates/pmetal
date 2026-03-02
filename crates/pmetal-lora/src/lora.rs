@@ -13,6 +13,20 @@ use mlx_rs::{Array, error::Exception, nn};
 
 use pmetal_core::LoraConfig;
 
+/// Apply inverted dropout to a tensor.
+///
+/// Zeros elements with probability `p` and scales remaining elements by `1/(1-p)`
+/// to preserve expected values. Returns a clone of `x` when `p == 0`.
+pub(crate) fn apply_dropout(x: &Array, p: f32) -> Result<Array, Exception> {
+    if p == 0.0 {
+        return Ok(x.clone());
+    }
+    let one_minus_p = 1.0 - p;
+    let mask = mlx_rs::random::bernoulli(&Array::from_f32(one_minus_p), x.shape(), None)?;
+    let scale = Array::from_f32(1.0 / one_minus_p);
+    Ok(x.multiply(&mask.multiply(&scale)?)?)
+}
+
 /// Error type for LoRA operations.
 #[derive(Debug, thiserror::Error)]
 pub enum LoraError {
@@ -47,6 +61,8 @@ pub struct LoraLinear {
     pub merged: bool,
     /// Whether to use bias.
     pub use_bias: bool,
+    /// Whether in training mode (controls dropout).
+    pub training: bool,
 
     /// Frozen base weight matrix [out_features, in_features].
     pub(crate) weight: Array,
@@ -56,6 +72,8 @@ pub struct LoraLinear {
     pub(crate) lora_a: Array,
     /// LoRA B matrix (out_features x rank) - trainable.
     pub(crate) lora_b: Array,
+    /// Optional dropout probability for LoRA input.
+    pub(crate) lora_dropout: f32,
 }
 
 impl LoraLinear {
@@ -115,10 +133,12 @@ impl LoraLinear {
             scale,
             merged: false,
             use_bias: bias.is_some(),
+            training: false,
             weight: weight.clone(),
             bias,
             lora_a,
             lora_b,
+            lora_dropout: 0.0,
         })
     }
 
@@ -188,10 +208,12 @@ impl LoraLinear {
             scale,
             merged: false,
             use_bias,
+            training: false,
             weight,
             bias,
             lora_a,
             lora_b,
+            lora_dropout: 0.0,
         })
     }
 
@@ -202,14 +224,28 @@ impl LoraLinear {
         config: &LoraConfig,
         use_bias: bool,
     ) -> Result<Self, LoraError> {
-        Self::new(
+        let mut layer = Self::new(
             in_features,
             out_features,
             config.r as i32,
             config.alpha,
             config.use_rslora,
             use_bias,
-        )
+        )?;
+        layer.lora_dropout = config.dropout;
+
+        // Honor init_lora_weights: if false, initialize B with random instead of zeros
+        if !config.init_lora_weights && layer.rank > 0 {
+            let bound = (1.0_f32 / layer.rank as f32).sqrt();
+            layer.lora_b = mlx_rs::random::uniform::<_, f32>(
+                -bound,
+                bound,
+                &[out_features, layer.rank],
+                None,
+            )?;
+        }
+
+        Ok(layer)
     }
 
     /// Forward pass through the LoRA linear layer.
@@ -229,8 +265,15 @@ impl LoraLinear {
             // Standard forward: y_base = x @ W.T
             let y_base = x.matmul(&self.weight.t())?;
 
-            // LoRA forward: y_lora = scale * (x @ A.T) @ B.T
-            let xa = x.matmul(&self.lora_a.t())?;
+            // Apply dropout to LoRA input when training
+            let x_lora = if self.training && self.lora_dropout > 0.0 {
+                apply_dropout(x, self.lora_dropout)?
+            } else {
+                x.clone()
+            };
+
+            // LoRA forward: y_lora = scale * (x_lora @ A.T) @ B.T
+            let xa = x_lora.matmul(&self.lora_a.t())?;
             let xab = xa.matmul(&self.lora_b.t())?;
             let scale_arr = Array::from_f32(self.scale);
             let y_lora = xab.multiply(&scale_arr)?;
@@ -245,6 +288,11 @@ impl LoraLinear {
                 Ok(y)
             }
         }
+    }
+
+    /// Set training mode (controls dropout).
+    pub fn set_training(&mut self, training: bool) {
+        self.training = training;
     }
 
     /// Forward pass with gradient context for custom autograd.
@@ -484,6 +532,26 @@ pub fn fused_lora_forward(
 
     // Combined output
     Ok(y_base.add(&y_lora)?)
+}
+
+/// Compute the effective LoRA rank for a given module name, respecting `target_modules`.
+///
+/// Returns `config.r` if the module should receive LoRA adapters, or `0` if it should
+/// remain frozen. A rank of `0` causes `LoraLinear` and `QLoraLinear` to skip the
+/// low-rank path entirely, acting as a plain linear (or quantized linear) layer.
+///
+/// # Rules
+/// - If `target_modules` is empty, all modules are targeted (returns `config.r`).
+/// - If `target_modules` contains the module name, returns `config.r`.
+/// - Otherwise returns `0`.
+pub fn effective_rank(config: &LoraConfig, module_name: &str) -> usize {
+    if config.target_modules.is_empty() {
+        config.r
+    } else if config.target_modules.iter().any(|m| m == module_name) {
+        config.r
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]

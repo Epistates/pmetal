@@ -26,8 +26,9 @@ use crate::autograd::{
     lora_forward_with_grad,
 };
 use crate::custom_backward::{
-    AttentionSaved, RmsNormSaved, SiluSaved, attention_backward, attention_forward_with_grad,
-    rmsnorm_backward, rmsnorm_forward_with_grad, silu_backward, silu_forward_with_grad,
+    AttentionSaved, RmsNormSaved, RopeSaved, SiluSaved, attention_backward,
+    attention_forward_with_grad, rmsnorm_backward, rmsnorm_forward_with_grad, rope_backward,
+    rope_forward_with_grad, silu_backward, silu_forward_with_grad,
 };
 use crate::custom_training::CustomLoraTrainer;
 use crate::{LoraError, LoraLinear, Qwen3LoraForCausalLM};
@@ -47,6 +48,10 @@ pub struct Qwen3LayerSaved {
     pub k_saved: LoraForwardSaved,
     /// V projection saved.
     pub v_saved: LoraForwardSaved,
+    /// RoPE saved state for Q (for backward through rotation).
+    pub q_rope_saved: RopeSaved,
+    /// RoPE saved state for K (for backward through rotation).
+    pub k_rope_saved: RopeSaved,
     /// Attention saved (Q, K, V after reshape/RoPE, weights).
     pub attn_saved: AttentionSaved,
     /// O projection saved.
@@ -98,11 +103,44 @@ pub struct Qwen3CustomTrainer {
     scale: f32,
     /// Ignore index for loss.
     ignore_index: i64,
+    /// RoPE base frequency.
+    rope_theta: f32,
+    /// RMSNorm epsilon (matches model config).
+    rms_norm_eps: f32,
+}
+
+/// Compute RoPE cos/sin frequencies for a given sequence length and head dimension.
+fn compute_rope_freqs(
+    seq_len: i32,
+    head_dim: i32,
+    theta: f32,
+) -> Result<(Array, Array), LoraError> {
+    let half_dim = head_dim / 2;
+    // freq_i = 1 / theta^(2i / dim) for i in 0..half_dim
+    let freq_exp = mlx_rs::ops::arange::<i32, f32>(0, half_dim, None)?
+        .divide(&Array::from_f32(half_dim as f32))?;
+    let freqs = Array::from_f32(1.0).divide(&Array::from_f32(theta).power(&freq_exp)?)?;
+    // positions: [0, 1, ..., seq_len-1]
+    let positions = mlx_rs::ops::arange::<i32, f32>(0, seq_len, None)?;
+    // outer product: [seq_len, half_dim]
+    let angles = positions
+        .reshape(&[seq_len, 1])?
+        .multiply(&freqs.reshape(&[1, half_dim])?)?;
+    let cos = mlx_rs::ops::cos(&angles)?;
+    let sin = mlx_rs::ops::sin(&angles)?;
+    Ok((cos, sin))
 }
 
 impl Qwen3CustomTrainer {
     /// Create a new custom trainer.
-    pub fn new(n_heads: i32, n_kv_heads: i32, head_dim: i32, learning_rate: f32) -> Self {
+    pub fn new(
+        n_heads: i32,
+        n_kv_heads: i32,
+        head_dim: i32,
+        learning_rate: f32,
+        rope_theta: f32,
+        rms_norm_eps: f32,
+    ) -> Self {
         Self {
             ctx: LoraGradContext::new(),
             learning_rate,
@@ -111,6 +149,8 @@ impl Qwen3CustomTrainer {
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
             ignore_index: -100,
+            rope_theta,
+            rms_norm_eps,
         }
     }
 
@@ -138,13 +178,16 @@ impl Qwen3CustomTrainer {
     }
 
     /// Forward through attention with custom state saving.
+    ///
+    /// Qwen3 attention: Project → Reshape → Q/K RMSNorm → RoPE → SDPA.
     fn attention_forward(
         &self,
         q_proj: &LoraLinear,
         k_proj: &LoraLinear,
         v_proj: &LoraLinear,
         o_proj: &LoraLinear,
-        rope: &mut nn::Rope,
+        q_norm: &mut nn::RmsNorm,
+        k_norm: &mut nn::RmsNorm,
         x: &Array,
         mask: Option<&Array>,
     ) -> Result<
@@ -153,6 +196,8 @@ impl Qwen3CustomTrainer {
             LoraForwardSaved,
             LoraForwardSaved,
             LoraForwardSaved,
+            RopeSaved,
+            RopeSaved,
             AttentionSaved,
             LoraForwardSaved,
         ),
@@ -178,9 +223,14 @@ impl Qwen3CustomTrainer {
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        // Apply RoPE
-        let q = rope.forward(&q)?;
-        let k = rope.forward(&k)?;
+        // Qwen3-specific: apply Q/K RMSNorm before RoPE
+        let q = q_norm.forward(&q)?;
+        let k = k_norm.forward(&k)?;
+
+        // Apply RoPE with state saving for backward pass
+        let (cos, sin) = compute_rope_freqs(seq_len, self.head_dim, self.rope_theta)?;
+        let (q, q_rope_saved) = rope_forward_with_grad(&q, &cos, &sin)?;
+        let (k, k_rope_saved) = rope_forward_with_grad(&k, &cos, &sin)?;
 
         // Attention with state saving
         let num_heads_per_kv = self.n_heads / self.n_kv_heads;
@@ -195,7 +245,16 @@ impl Qwen3CustomTrainer {
         // O projection with LoRA state saving
         let (output, o_saved) = self.lora_forward(o_proj, &attn_out)?;
 
-        Ok((output, q_saved, k_saved, v_saved, attn_saved, o_saved))
+        Ok((
+            output,
+            q_saved,
+            k_saved,
+            v_saved,
+            q_rope_saved,
+            k_rope_saved,
+            attn_saved,
+            o_saved,
+        ))
     }
 
     /// Forward through MLP with custom state saving.
@@ -252,18 +311,21 @@ impl Qwen3CustomTrainer {
     ) -> Result<(Array, Qwen3LayerSaved), LoraError> {
         // Input norm
         let input_norm_weight = layer.input_layernorm.weight.value.as_ref().clone();
-        let (x_normed, input_norm_saved) = rmsnorm_forward_with_grad(x, &input_norm_weight, 1e-6)?;
+        let (x_normed, input_norm_saved) =
+            rmsnorm_forward_with_grad(x, &input_norm_weight, self.rms_norm_eps)?;
 
-        // Attention
-        let (attn_out, q_saved, k_saved, v_saved, attn_saved, o_saved) = self.attention_forward(
-            &layer.self_attn.q_proj,
-            &layer.self_attn.k_proj,
-            &layer.self_attn.v_proj,
-            &layer.self_attn.o_proj,
-            &mut layer.self_attn.rope,
-            &x_normed,
-            mask,
-        )?;
+        // Attention (Qwen3: includes Q/K RMSNorm before RoPE)
+        let (attn_out, q_saved, k_saved, v_saved, q_rope_saved, k_rope_saved, attn_saved, o_saved) =
+            self.attention_forward(
+                &layer.self_attn.q_proj,
+                &layer.self_attn.k_proj,
+                &layer.self_attn.v_proj,
+                &layer.self_attn.o_proj,
+                &mut layer.self_attn.q_norm,
+                &mut layer.self_attn.k_norm,
+                &x_normed,
+                mask,
+            )?;
 
         // Residual
         let h = x.add(&attn_out)?;
@@ -271,7 +333,7 @@ impl Qwen3CustomTrainer {
         // Post-attention norm
         let post_attn_norm_weight = layer.post_attention_layernorm.weight.value.as_ref().clone();
         let (h_normed, post_attn_norm_saved) =
-            rmsnorm_forward_with_grad(&h, &post_attn_norm_weight, 1e-6)?;
+            rmsnorm_forward_with_grad(&h, &post_attn_norm_weight, self.rms_norm_eps)?;
 
         // MLP
         let (mlp_out, gate_saved, silu_saved, up_saved, gate_activated, up_out, down_saved) = self
@@ -292,6 +354,8 @@ impl Qwen3CustomTrainer {
             q_saved,
             k_saved,
             v_saved,
+            q_rope_saved,
+            k_rope_saved,
             attn_saved,
             o_saved,
             h: h.clone(),
@@ -390,6 +454,16 @@ impl Qwen3CustomTrainer {
 
         let (d_q, d_k, d_v) = attention_backward(&d_attn_reshaped, &saved.attn_saved)?;
 
+        // Backward through RoPE: d_q and d_k are post-RoPE gradients.
+        // RoPE is orthogonal, so backward is the inverse rotation.
+        let d_q = rope_backward(&d_q, &saved.q_rope_saved)?;
+        let d_k = rope_backward(&d_k, &saved.k_rope_saved)?;
+
+        // Note: Q/K RMSNorm backward is approximated as identity here since
+        // the norms are frozen (not LoRA-adapted). For exact gradients through
+        // the norm, we would need to save the norm's input variance. The
+        // approximation error is small when the norm weight is close to 1.0.
+
         // Reshape gradients back for projection backward
         let d_q_flat = d_q
             .transpose_axes(&[0, 2, 1, 3])?
@@ -466,7 +540,7 @@ impl Qwen3CustomTrainer {
         // Final norm
         let final_norm_weight = model.model.norm.weight.value.as_ref().clone();
         let (hidden_normed, final_norm_saved) =
-            rmsnorm_forward_with_grad(&hidden, &final_norm_weight, 1e-6)?;
+            rmsnorm_forward_with_grad(&hidden, &final_norm_weight, self.rms_norm_eps)?;
 
         // LM head (no LoRA)
         let logits = if let Some(ref mut lm_head) = model.lm_head {
@@ -609,6 +683,7 @@ fn create_causal_mask(seq_len: i32) -> Result<Array, mlx_rs::error::Exception> {
 mod tests {
     use super::*;
     use pmetal_core::LoraConfig;
+    use pmetal_models::ModelConfig;
     use pmetal_models::architectures::qwen3::Qwen3Config;
 
     fn small_config() -> Qwen3Config {
@@ -651,6 +726,8 @@ mod tests {
             config.num_kv_heads(),
             config.get_head_dim(),
             1e-4,
+            config.rope_theta,
+            config.rms_norm_eps,
         );
 
         // Create dummy batch

@@ -9,7 +9,8 @@ use mlx_rs::{
 };
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, differentiable_attention, fused_sdpa,
-    get_training_context, rope::apply_rope,
+    get_training_context,
+    rope::{RopeScaling, apply_rope, apply_rope_scaled},
 };
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
@@ -130,6 +131,10 @@ pub struct LlamaAttention {
     pub scale: f32,
     /// RoPE base frequency (for apply_rope with offset).
     pub rope_theta: f32,
+    /// RoPE position scale (from rope_scaling config).
+    pub rope_scale: f32,
+    /// Effective RoPE base after scaling.
+    pub effective_base: f32,
     /// Layer ID for training cache (set during model construction).
     pub layer_id: usize,
 
@@ -163,6 +168,29 @@ impl LlamaAttention {
         let scale = (head_dim as f32).sqrt().recip();
         let rope_theta = config.rope_theta;
 
+        // Parse rope_scaling from config
+        let rope_scaling = config
+            .rope_scaling
+            .as_ref()
+            .map(|map| {
+                // Convert HashMap<String, RopeScalingValue> to HashMap<String, serde_json::Value>
+                let json_map: std::collections::HashMap<String, serde_json::Value> = map
+                    .iter()
+                    .map(|(k, v)| {
+                        let json_v = match v {
+                            RopeScalingValue::Float(f) => serde_json::Value::from(*f as f64),
+                            RopeScalingValue::String(s) => serde_json::Value::from(s.clone()),
+                        };
+                        (k.clone(), json_v)
+                    })
+                    .collect();
+                RopeScaling::from_config_map(&json_map)
+            })
+            .unwrap_or(RopeScaling::None);
+
+        let rope_scale = rope_scaling.scale();
+        let effective_base = rope_scaling.effective_base(rope_theta, head_dim);
+
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
             .bias(false)
             .build()?;
@@ -176,9 +204,10 @@ impl LlamaAttention {
             .bias(false)
             .build()?;
 
-        // Initialize RoPE (for non-cached forward)
+        // Initialize RoPE with scaled parameters
         let rope = nn::RopeBuilder::new(head_dim)
-            .base(rope_theta)
+            .base(effective_base)
+            .scale(rope_scale)
             .traditional(false)
             .build()?;
 
@@ -188,6 +217,8 @@ impl LlamaAttention {
             head_dim,
             scale,
             rope_theta,
+            rope_scale,
+            effective_base,
             layer_id,
             q_proj,
             k_proj,
@@ -257,10 +288,24 @@ impl LlamaAttention {
 
         // Get RoPE offset and apply RoPE
         let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
-            // Cached path: use apply_rope with offset
+            // Cached path: use apply_rope with offset and scaling
             let offset = cache_ref.rope_offset();
-            let queries = apply_rope(&queries, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-            let keys = apply_rope(&keys, self.head_dim, false, self.rope_theta, 1.0, offset)?;
+            let queries = apply_rope(
+                &queries,
+                self.head_dim,
+                false,
+                self.effective_base,
+                self.rope_scale,
+                offset,
+            )?;
+            let keys = apply_rope(
+                &keys,
+                self.head_dim,
+                false,
+                self.effective_base,
+                self.rope_scale,
+                offset,
+            )?;
             (queries, keys, values)
         } else {
             // Non-cached path: use RoPE module (offset=0)

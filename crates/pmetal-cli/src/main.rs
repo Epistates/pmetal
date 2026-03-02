@@ -9,16 +9,20 @@ use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
+use mlx_rs::builder::Builder;
 use pmetal_core::{DatasetConfig, LoraConfig, ModelConfig, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
 use pmetal_lora::{
     DynamicLoraModel, LlamaLoraForCausalLM, LlamaQloraForCausalLM, QLoraConfig, TrainableModel,
 };
 use pmetal_mlx::quantization::QuantScheme;
-use pmetal_models::WeightFormat;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::ollama::{ModelfileBuilder, templates as ollama_templates};
-use pmetal_trainer::{CheckpointManager, MetricsJsonCallback, TrainingLoop, TrainingLoopConfig};
+use pmetal_models::{DynamicModel, WeightFormat};
+use pmetal_trainer::{
+    CheckpointManager, GrpoConfig, GrpoTrainer, MetricsJsonCallback, TrainingLoop,
+    TrainingLoopConfig,
+};
 use serde::{Deserialize, Serialize};
 
 /// Combined configuration for training.
@@ -892,6 +896,41 @@ fn ensure_metallib() {
             search_paths.push(dir.join(metallib_name));
         }
     }
+
+    // 1b. Search build directories (for local development)
+    if let Ok(cwd) = std::env::current_dir() {
+        // Search in common build output locations relative to workspace root
+        let build_patterns = [
+            "target/release/build",
+            "target/debug/build",
+            "target/aarch64-apple-darwin/release/build",
+            "target/aarch64-apple-darwin/debug/build",
+        ];
+
+        for pattern in build_patterns {
+            let build_dir = cwd.join(pattern);
+            if build_dir.exists() {
+                // Look for mlx-sys build output specifically
+                if let Ok(entries) = std::fs::read_dir(build_dir) {
+                    for entry in entries.flatten() {
+                        let path = entry.path();
+                        if path.is_dir()
+                            && path
+                                .file_name()
+                                .and_then(|n| n.to_str())
+                                .map_or(false, |s| s.contains("pmetal-mlx-sys"))
+                        {
+                            let metallib_candidate = path.join("out/build/lib").join(metallib_name);
+                            if metallib_candidate.is_file() {
+                                search_paths.push(metallib_candidate);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // 2. User cache ($HOME/.cache/pmetal/lib/) — matches C++ fallback path
     if let Some(ref cache) = cache_dir {
         search_paths.push(cache.join(metallib_name));
@@ -903,7 +942,11 @@ fn ensure_metallib() {
 
     if let Some(path) = search_paths.iter().find(|p| p.is_file()) {
         // SAFETY: called before any other threads; env var is process-internal
-        unsafe { std::env::set_var("PMETAL_METALLIB_PATH", path) };
+        unsafe {
+            std::env::set_var("PMETAL_METALLIB_PATH", path);
+            // Q1 2026 Best Practice: Enable JIT for architecture-specific optimizations (M4+)
+            std::env::set_var("MLX_METAL_JIT", "1");
+        };
         tracing::debug!(path = %path.display(), "Found mlx.metallib");
 
         // Auto-cache: if found colocated with binary, copy to cache dir for resilience
@@ -1682,10 +1725,6 @@ async fn run_grpo_cli(
     reasoning_rewards: bool,
     use_metal_flash_attention: bool,
 ) -> anyhow::Result<()> {
-    use pmetal_core::{LoraConfig, TrainingConfig};
-    use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
-    use pmetal_lora::DynamicLoraModel;
-    use pmetal_trainer::{GrpoConfig, GrpoTrainer, TrainingLoopConfig};
     use std::path::{Path, PathBuf};
 
     println!("========================================");
@@ -1734,7 +1773,7 @@ async fn run_grpo_cli(
         alpha: 32.0,
         ..Default::default()
     };
-    let model = DynamicLoraModel::from_pretrained(&model_path, lora_config)?;
+    let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config)?;
 
     // 5. Setup GRPO Config
     let mut grpo_config = GrpoConfig::new(num_generations).with_beta(beta);
@@ -1857,18 +1896,36 @@ async fn run_grpo_cli(
         use_metal_fused_optimizer: true,
     };
 
-    let trainer = GrpoTrainer::new(grpo_config, training_config)?;
+    let mut trainer = GrpoTrainer::new(grpo_config, training_config)?;
 
-    // 8. Run Training (Placeholder for full integration)
+    // 7b. Setup Optimizer
+    let mut optimizer = mlx_rs::optimizers::AdamWBuilder::new(learning_rate as f32)
+        .build()
+        .map_err(|e| anyhow::anyhow!("Failed to build optimizer: {}", e))?;
+
+    // 8. Run Training
     println!("Starting GRPO training loop...");
-    
-    // Final placeholders to avoid unused variable warnings
-    let _ = dataset;
-    let _ = model;
-    let _ = trainer;
-    let _ = rewards;
 
-    println!("\nGRPO setup complete! Model weights will be saved to: {}", output_dir);
+    // Load reference model (frozen)
+    println!("Loading reference model...");
+    let mut ref_model = DynamicModel::load(&model_path)
+        .map_err(|e| anyhow::anyhow!("Failed to load reference model: {}", e))?;
+
+    trainer
+        .run(
+            &mut model,
+            Some(&mut ref_model),
+            &tokenizer,
+            &dataset,
+            &rewards,
+            &mut optimizer,
+        )
+        .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
+
+    println!(
+        "\nGRPO training complete! Model weights saved to: {}",
+        output_dir
+    );
     Ok(())
 }
 
@@ -2529,7 +2586,7 @@ async fn run_inference(
 
     // Use DynamicModel for architecture-agnostic inference
     tracing::info!("Loading model with auto-detected architecture...");
-    let mut model = DynamicModel::from_pretrained(&model_path)?;
+    let mut model = DynamicModel::load(&model_path)?;
 
     tracing::info!(
         "Model loaded successfully (architecture: {})",
@@ -4124,7 +4181,7 @@ async fn run_gen_benchmark(model_id: &str) -> anyhow::Result<()> {
 
     // Load model
     println!("Loading model...");
-    let mut model = DynamicModel::from_pretrained(&model_path)?;
+    let mut model = DynamicModel::load(&model_path)?;
     println!("Model loaded.\n");
 
     // Create KV cache

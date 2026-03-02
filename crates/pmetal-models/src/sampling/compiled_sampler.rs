@@ -287,6 +287,22 @@ impl CompiledSampler {
     /// * `top_p` - Nucleus sampling threshold (1.0 = disabled)
     /// * `min_p` - Minimum probability threshold relative to top token (0.0 = disabled)
     pub fn new(temperature: f32, top_k: usize, top_p: f32, min_p: f32) -> Result<Self, Exception> {
+        if temperature < 0.0 {
+            return Err(Exception::custom(format!(
+                "temperature must be >= 0.0, got {temperature}"
+            )));
+        }
+        if top_p <= 0.0 || top_p > 1.0 {
+            return Err(Exception::custom(format!(
+                "top_p must be in (0.0, 1.0], got {top_p}"
+            )));
+        }
+        if min_p < 0.0 || min_p >= 1.0 {
+            return Err(Exception::custom(format!(
+                "min_p must be in [0.0, 1.0), got {min_p}"
+            )));
+        }
+
         let inv_temp = if temperature > 0.0 {
             Array::from_f32(1.0 / temperature)
         } else {
@@ -314,6 +330,22 @@ impl CompiledSampler {
         min_p: f32,
         seed: u64,
     ) -> Result<Self, Exception> {
+        if temperature < 0.0 {
+            return Err(Exception::custom(format!(
+                "temperature must be >= 0.0, got {temperature}"
+            )));
+        }
+        if top_p <= 0.0 || top_p > 1.0 {
+            return Err(Exception::custom(format!(
+                "top_p must be in (0.0, 1.0], got {top_p}"
+            )));
+        }
+        if min_p < 0.0 || min_p >= 1.0 {
+            return Err(Exception::custom(format!(
+                "min_p must be in [0.0, 1.0), got {min_p}"
+            )));
+        }
+
         let inv_temp = if temperature > 0.0 {
             Array::from_f32(1.0 / temperature)
         } else {

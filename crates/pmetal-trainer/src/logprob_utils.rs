@@ -28,6 +28,33 @@ use mlx_rs::error::Exception;
 /// `(per_token_logps, valid_mask)` — both `[B, S]` as `Float32`.
 /// Ignored positions (label == -100) get a log-prob of 0.0 and mask of 0.0.
 pub fn selective_log_softmax(logits: &Array, labels: &Array) -> Result<(Array, Array), Exception> {
+    selective_log_softmax_with_temperature(logits, labels, None)
+}
+
+/// Selective log softmax with optional temperature scaling.
+///
+/// When `temperature` is `Some(t)` with `t != 1.0`, logits are divided by `t`
+/// before computing log-softmax. This is used by RL trainers that sample at
+/// non-unit temperature and need log-probs under the tempered distribution.
+///
+/// # Arguments
+/// * `logits` - Model output logits `[B, S, V]`
+/// * `labels` - Target label indices `[B, S]`, with `-100` for ignored positions
+/// * `temperature` - Optional temperature scaling (logits /= temperature)
+///
+/// # Returns
+/// `(per_token_logps, valid_mask)` — both `[B, S]` as `Float32`.
+pub fn selective_log_softmax_with_temperature(
+    logits: &Array,
+    labels: &Array,
+    temperature: Option<f32>,
+) -> Result<(Array, Array), Exception> {
+    // Apply temperature scaling if requested
+    let logits = match temperature {
+        Some(t) if (t - 1.0).abs() > 1e-8 && t > 0.0 => logits.divide(&Array::from_f32(t))?,
+        _ => logits.clone(),
+    };
+    let logits = &logits;
     // Match label dtype for comparisons (labels may be Int32 or Int64)
     let labels_dtype = labels.dtype();
     let zero = Array::from_int(0).as_dtype(labels_dtype)?;

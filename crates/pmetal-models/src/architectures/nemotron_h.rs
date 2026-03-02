@@ -137,87 +137,11 @@ impl MambaRMSNormGated {
     ///
     /// # Returns
     /// Normalized tensor [B, L, hidden_size]
-    #[allow(clippy::overly_complex_bool_expr)]
     pub fn forward(&self, x: &Array, gate: Option<&Array>) -> Result<Array, Exception> {
-        // Debug: trace gated norm steps (disabled for performance)
-        static GATED_NORM_LOG: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let log_count = GATED_NORM_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let log_this = false && log_count < 2; // Disabled
-
-        if log_this {
-            x.eval()?;
-            tracing::info!(
-                "GATED_NORM[{}] input x: min={:.4}, max={:.4}",
-                log_count,
-                x.min(None)?.item::<f32>(),
-                x.max(None)?.item::<f32>()
-            );
-            if let Some(g) = gate {
-                g.eval()?;
-                tracing::info!(
-                    "GATED_NORM[{}] gate: min={:.4}, max={:.4}",
-                    log_count,
-                    g.min(None)?.item::<f32>(),
-                    g.max(None)?.item::<f32>()
-                );
-            }
-            // Check specific position 3478 (Group 6, pos 406) for tokens 2 and 19
-            // x is shape [B, L, hidden=4096], position 3478 = 6*512 + 406
-            let seq_len = x.dim(1) as usize;
-            if seq_len > 2 {
-                let x_t2_pos = x.index((0, 2, 3478)).item::<f32>();
-                let x_t19_pos = if seq_len > 19 {
-                    x.index((0, 19, 3478)).item::<f32>()
-                } else {
-                    f32::NAN
-                };
-                tracing::info!(
-                    "GATED_NORM[{}] SSM y at global pos 3478: Token 2={:.4}, Token 19={:.4}",
-                    log_count,
-                    x_t2_pos,
-                    x_t19_pos
-                );
-                if let Some(g) = gate {
-                    let z_t2_pos = g.index((0, 2, 3478)).item::<f32>();
-                    let z_t19_pos = if seq_len > 19 {
-                        g.index((0, 19, 3478)).item::<f32>()
-                    } else {
-                        f32::NAN
-                    };
-                    tracing::info!(
-                        "GATED_NORM[{}] Gate z at global pos 3478: Token 2={:.4}, Token 19={:.4}",
-                        log_count,
-                        z_t2_pos,
-                        z_t19_pos
-                    );
-                }
-            }
-        }
-
         // Apply gating if provided: x = x * silu(gate)
         let x = if let Some(g) = gate {
             let gate_activated = nn::silu(g)?;
-            if log_this {
-                gate_activated.eval()?;
-                tracing::info!(
-                    "GATED_NORM[{}] silu(gate): min={:.4}, max={:.4}",
-                    log_count,
-                    gate_activated.min(None)?.item::<f32>(),
-                    gate_activated.max(None)?.item::<f32>()
-                );
-            }
-            let gated = x.multiply(&gate_activated)?;
-            if log_this {
-                gated.eval()?;
-                tracing::info!(
-                    "GATED_NORM[{}] x * silu(gate): min={:.4}, max={:.4}",
-                    log_count,
-                    gated.min(None)?.item::<f32>(),
-                    gated.max(None)?.item::<f32>()
-                );
-            }
-            gated
+            x.multiply(&gate_activated)?
         } else {
             x.clone()
         };
@@ -228,15 +152,6 @@ impl MambaRMSNormGated {
         let num_groups = self.hidden_size / self.group_size;
 
         // Reshape to groups: [B, L, hidden] -> [B, L, num_groups, group_size]
-        if log_this {
-            tracing::info!(
-                "GATED_NORM[{}] hidden_size={}, group_size={}, num_groups={}",
-                log_count,
-                self.hidden_size,
-                self.group_size,
-                num_groups
-            );
-        }
         let x_grouped = x.reshape(&[batch, seq_len, num_groups, self.group_size])?;
 
         // Compute RMS norm within each group (axis -1)
@@ -245,149 +160,13 @@ impl MambaRMSNormGated {
         let mean_sq = x_sq.mean_axis(-1, true)?;
         let rms = mean_sq.add(&Array::from_f32(self.eps))?.sqrt()?;
 
-        if log_this {
-            rms.eval()?;
-            tracing::info!(
-                "GATED_NORM[{}] rms: min={:.4}, max={:.4}, mean={:.4}",
-                log_count,
-                rms.min(None)?.item::<f32>(),
-                rms.max(None)?.item::<f32>(),
-                rms.mean(None)?.item::<f32>()
-            );
-        }
-
         let x_normed = x_grouped.divide(&rms)?;
-
-        if log_this {
-            x_normed.eval()?;
-            tracing::info!(
-                "GATED_NORM[{}] x_normed (before weight): min={:.4}, max={:.4}",
-                log_count,
-                x_normed.min(None)?.item::<f32>(),
-                x_normed.max(None)?.item::<f32>()
-            );
-        }
 
         // Flatten back: [B, L, num_groups, group_size] -> [B, L, hidden]
         let x_flat = x_normed.reshape(&[batch, seq_len, self.hidden_size])?;
 
         // Apply learned weight
         let result = x_flat.multiply(&self.weight)?;
-
-        if log_this {
-            // Per-group analysis: reshape weight to see per-group stats
-            let weight_grouped = self
-                .weight
-                .reshape(&[num_groups as i32, self.group_size as i32])?;
-            for g in 0..num_groups {
-                // Get x_normed for this group - shape is [B, L, num_groups, group_size]
-                // Take last seq position for analysis: index [0, -1, g, ..]
-                let x_g = x_normed.index((0, -1, g as i32, ..));
-                let w_g = weight_grouped.index(g as i32);
-                x_g.eval()?;
-                w_g.eval()?;
-                let result_g = x_g.multiply(&w_g)?;
-                result_g.eval()?;
-                tracing::info!(
-                    "GATED_NORM[{}] Group {}: x_normed [{:.4}, {:.4}], weight [{:.4}, {:.4}], result max={:.4}",
-                    log_count,
-                    g,
-                    x_g.min(None)?.item::<f32>(),
-                    x_g.max(None)?.item::<f32>(),
-                    w_g.min(None)?.item::<f32>(),
-                    w_g.max(None)?.item::<f32>(),
-                    result_g.max(None)?.item::<f32>()
-                );
-            }
-
-            self.weight.eval()?;
-            result.eval()?;
-            tracing::info!(
-                "GATED_NORM[{}] weight: min={:.4}, max={:.4}, mean={:.4}",
-                log_count,
-                self.weight.min(None)?.item::<f32>(),
-                self.weight.max(None)?.item::<f32>(),
-                self.weight.mean(None)?.item::<f32>()
-            );
-            // Print first 20 weight values
-            let first_20: Vec<f32> = (0..20)
-                .map(|i| self.weight.index(i as i32).item::<f32>())
-                .collect();
-            tracing::info!("GATED_NORM[{}] weight first 20: {:?}", log_count, first_20);
-            tracing::info!(
-                "GATED_NORM[{}] final output: min={:.4}, max={:.4}",
-                log_count,
-                result.min(None)?.item::<f32>(),
-                result.max(None)?.item::<f32>()
-            );
-
-            // Find which token position produces the max - result is [B, L, hidden]
-            for t in 0..seq_len {
-                let result_t = result.index((0, t as i32, ..));
-                result_t.eval()?;
-                let max_t = result_t.max(None)?.item::<f32>();
-                if max_t > 5.0 {
-                    tracing::info!(
-                        "GATED_NORM[{}] Token {} has large max={:.4}",
-                        log_count,
-                        t,
-                        max_t
-                    );
-                    // Detailed per-group analysis for this token
-                    // Focus on Group 6 where the issue occurs
-                    let g = 6usize;
-                    let x_g = x_normed.index((0, t as i32, g as i32, ..));
-                    let w_g = weight_grouped.index(g as i32);
-                    x_g.eval()?;
-                    w_g.eval()?;
-                    let result_g = x_g.multiply(&w_g)?;
-                    result_g.eval()?;
-
-                    // Find max weight position and check x_normed there
-                    // Reference shows max weight is at position 382 with value 5.0
-                    // and y_normed at 382 is ~0.0003
-                    let x_at_382 = x_g.index(382).item::<f32>();
-                    let w_at_382 = w_g.index(382).item::<f32>();
-                    tracing::info!(
-                        "GATED_NORM[{}] Token {} Group 6: x_normed [{:.4}, {:.4}], weight max={:.4}, result max={:.4}",
-                        log_count,
-                        t,
-                        x_g.min(None)?.item::<f32>(),
-                        x_g.max(None)?.item::<f32>(),
-                        w_g.max(None)?.item::<f32>(),
-                        result_g.max(None)?.item::<f32>()
-                    );
-                    tracing::info!(
-                        "GATED_NORM[{}] Token {} Group 6 at pos 382: x_normed={:.6}, weight={:.4}, product={:.6}",
-                        log_count,
-                        t,
-                        x_at_382,
-                        w_at_382,
-                        x_at_382 * w_at_382
-                    );
-
-                    // Find where the max result comes from by scanning all positions
-                    let _res_max = result_g.max(None)?.item::<f32>();
-                    for pos in 0..self.group_size {
-                        let x_val = x_g.index(pos as i32).item::<f32>();
-                        let w_val = w_g.index(pos as i32).item::<f32>();
-                        let prod = x_val * w_val;
-                        if prod > 3.0 {
-                            // Find positions producing large products
-                            tracing::info!(
-                                "GATED_NORM[{}] Token {} Group 6 pos {}: x={:.4}, w={:.4}, prod={:.4}",
-                                log_count,
-                                t,
-                                pos,
-                                x_val,
-                                w_val,
-                                prod
-                            );
-                        }
-                    }
-                }
-            }
-        }
 
         Ok(result)
     }
@@ -559,7 +338,6 @@ pub fn ssm_update_single(
 ///
 /// # Returns
 /// (output [B, L, H, D], new_state [B, H, D, N])
-#[allow(clippy::overly_complex_bool_expr)]
 pub fn ssm_attention(
     x: &Array,             // [B, L, H, D] - input
     a_log: &Array,         // [H] - log state transition
@@ -590,48 +368,8 @@ pub fn ssm_attention(
     let a = mlx_rs::ops::negative(&mlx_rs::ops::exp(a_log)?)?;
     let a = a.as_dtype(dt_full.dtype())?;
 
-    // Debug: trace SSM intermediate values (disabled for performance)
-    static SSM_LOG_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let log_count = SSM_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let detailed_log = false && log_count < 2; // Disabled - set to true to debug
-
     // Compute dtA = dt * A: [B, L, H]
     let dt_a = dt_full.multiply(&a.reshape(&[1, 1, num_heads])?)?;
-
-    if detailed_log {
-        x.eval()?;
-        dt_full.eval()?;
-        a.eval()?;
-        dt_a.eval()?;
-        tracing::info!(
-            "SSM[{}] INPUTS: x shape={:?} min={:.4} max={:.4}",
-            log_count,
-            x.shape(),
-            x.min(None)?.item::<f32>(),
-            x.max(None)?.item::<f32>()
-        );
-        tracing::info!(
-            "SSM[{}] dt shape={:?} min={:.6} max={:.6}",
-            log_count,
-            dt_full.shape(),
-            dt_full.min(None)?.item::<f32>(),
-            dt_full.max(None)?.item::<f32>()
-        );
-        tracing::info!(
-            "SSM[{}] A shape={:?} min={:.4} max={:.4}",
-            log_count,
-            a.shape(),
-            a.min(None)?.item::<f32>(),
-            a.max(None)?.item::<f32>()
-        );
-        tracing::info!(
-            "SSM[{}] dtA shape={:?} min={:.4} max={:.4}",
-            log_count,
-            dt_a.shape(),
-            dt_a.min(None)?.item::<f32>(),
-            dt_a.max(None)?.item::<f32>()
-        );
-    }
 
     // Compute dtx = dt * x: [B, L, H, D]
     let dt_expanded = dt_full.reshape(&[batch, seq_len, num_heads, 1])?;
@@ -654,33 +392,6 @@ pub fn ssm_attention(
     let segsum_result = segsum(&dt_a_t)?;
     let decay = mlx_rs::ops::exp(&segsum_result)?;
 
-    if detailed_log {
-        cb.eval()?;
-        segsum_result.eval()?;
-        decay.eval()?;
-        tracing::info!(
-            "SSM[{}] CB shape={:?} min={:.4} max={:.4}",
-            log_count,
-            cb.shape(),
-            cb.min(None)?.item::<f32>(),
-            cb.max(None)?.item::<f32>()
-        );
-        tracing::info!(
-            "SSM[{}] segsum shape={:?} min={:.4} max={:.4}",
-            log_count,
-            segsum_result.shape(),
-            segsum_result.min(None)?.item::<f32>(),
-            segsum_result.max(None)?.item::<f32>()
-        );
-        tracing::info!(
-            "SSM[{}] decay shape={:?} min={:.6} max={:.6}",
-            log_count,
-            decay.shape(),
-            decay.min(None)?.item::<f32>(),
-            decay.max(None)?.item::<f32>()
-        );
-    }
-
     // Surrogate attention = tril(CB * decay)
     let attn_weights = cb_heads.multiply(&decay)?;
     let attn_weights = mlx_rs::ops::tril(&attn_weights, 0)?;
@@ -688,59 +399,6 @@ pub fn ssm_attention(
     // y = attn @ dtx.swapaxes(1,2): [B, H, L, L] @ [B, H, L, D] = [B, H, L, D]
     let dtx_t = dtx.transpose_axes(&[0, 2, 1, 3])?;
     let mut y = attn_weights.matmul(&dtx_t)?;
-
-    if detailed_log {
-        attn_weights.eval()?;
-        dtx.eval()?;
-        y.eval()?;
-        tracing::info!(
-            "SSM[{}] attn_weights shape={:?} min={:.4} max={:.4}",
-            log_count,
-            attn_weights.shape(),
-            attn_weights.min(None)?.item::<f32>(),
-            attn_weights.max(None)?.item::<f32>()
-        );
-        tracing::info!(
-            "SSM[{}] dtx shape={:?} min={:.4} max={:.4}",
-            log_count,
-            dtx.shape(),
-            dtx.min(None)?.item::<f32>(),
-            dtx.max(None)?.item::<f32>()
-        );
-        tracing::info!(
-            "SSM[{}] y (after attn@dtx) shape={:?} min={:.4} max={:.4}",
-            log_count,
-            y.shape(),
-            y.min(None)?.item::<f32>(),
-            y.max(None)?.item::<f32>()
-        );
-
-        // Position 3478 = head 54, pos 26 within head
-        // y is [B, H, L, D], head 54 is position 54 in dim 1
-        // Check y at head 54, token 2, dim 26
-        if seq_len > 2 {
-            let y_val = y.index((0, 54, 2, 26)).item::<f32>();
-            let dtx_val = dtx.index((0, 2, 54, 26)).item::<f32>(); // dtx is [B, L, H, D]
-            tracing::info!(
-                "SSM[{}] y[head=54, token=2, dim=26] = {:.4}, dtx[token=2, head=54, dim=26] = {:.4}",
-                log_count,
-                y_val,
-                dtx_val
-            );
-
-            // Check the attn_weights row for head 54, token 2
-            // attn_weights is [B, H, L, L], we want [0, 54, 2, :]
-            let attn_row = attn_weights.index((0, 54, 2, ..));
-            attn_row.eval()?;
-            tracing::info!(
-                "SSM[{}] attn_weights[head=54, token=2, :] min={:.4}, max={:.4}, sum={:.4}",
-                log_count,
-                attn_row.min(None)?.item::<f32>(),
-                attn_row.max(None)?.item::<f32>(),
-                attn_row.sum(None)?.item::<f32>()
-            );
-        }
-    }
 
     // Compute new state for caching
     // decay_last: [B, H, 1, L] -> [B, L, H, 1]
@@ -762,57 +420,10 @@ pub fn ssm_attention(
     // next_state = dtxdecay @ B_heads: [B, H, D, L] @ [B, H, L, N] = [B, H, D, N]
     let mut next_state = dtxdecay_t.matmul(&b_heads)?;
 
-    // Debug: trace state info when present
-    static STATE_PRESENT_LOG: std::sync::atomic::AtomicUsize =
-        std::sync::atomic::AtomicUsize::new(0);
-
     // If we have previous state, incorporate it
-    // TEMP DEBUG: test with state contribution disabled
-    let disable_state_contribution = std::env::var("DISABLE_STATE").is_ok();
     if let Some(prev_state) = state {
-        if disable_state_contribution {
-            tracing::warn!("SSM state contribution DISABLED for debugging");
-        }
-        // Separate counter for when state IS present (second+ pass)
-        let state_present_log =
-            STATE_PRESENT_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let log_state_present = state_present_log < 10;
-
-        if log_state_present {
-            prev_state.eval()?;
-            tracing::info!(
-                "SSM STATE PRESENT [{}]: shape={:?}, min={:.6}, max={:.6}, mean={:.6}, seq_len={}",
-                state_present_log,
-                prev_state.shape(),
-                prev_state.min(None)?.item::<f32>(),
-                prev_state.max(None)?.item::<f32>(),
-                prev_state.mean(None)?.item::<f32>(),
-                seq_len,
-            );
-
-            // Log y before state contribution
-            y.eval()?;
-            tracing::info!(
-                "SSM y BEFORE state[{}]: min={:.6}, max={:.6}",
-                state_present_log,
-                y.min(None)?.item::<f32>(),
-                y.max(None)?.item::<f32>(),
-            );
-        }
-
         // exp_dtA_cumsum = exp(cumsum(dtA, axis=-2)): [B, L, H]
         let exp_dta_cumsum = mlx_rs::ops::exp(&dt_a.cumsum(-2, None, None)?)?;
-
-        if log_state_present {
-            exp_dta_cumsum.eval()?;
-            tracing::info!(
-                "SSM STATE[{}]: exp_dta_cumsum shape={:?}, min={:.6}, max={:.6}",
-                state_present_log,
-                exp_dta_cumsum.shape(),
-                exp_dta_cumsum.min(None)?.item::<f32>(),
-                exp_dta_cumsum.max(None)?.item::<f32>(),
-            );
-        }
 
         // exp_dta_last: [B, 1, H] -> [B, H, 1, 1]
         let exp_dta_last = exp_dta_cumsum.index((.., (seq_len - 1)..seq_len, ..));
@@ -834,63 +445,21 @@ pub fn ssm_attention(
         let c_grouped = c.reshape(&[batch, seq_len, n_groups, 1, state_dim, 1])?;
 
         // y_prev = state_grouped @ C_grouped: [B, 1, G, repeats, D, N] @ [B, L, G, 1, N, 1]
-        // This is a batched matmul that broadcasts
         let y_prev_raw = state_grouped.matmul(&c_grouped)?; // [B, L, G, repeats, D, 1]
 
         let y_prev = y_prev_raw
             .squeeze_axes(&[-1])?
             .reshape(&[batch, seq_len, num_heads, head_dim])?;
 
-        if log_state_present {
-            y_prev.eval()?;
-            c.eval()?;
-            tracing::info!(
-                "SSM STATE[{}]: y_prev (state@C) shape={:?}, min={:.6}, max={:.6}",
-                state_present_log,
-                y_prev.shape(),
-                y_prev.min(None)?.item::<f32>(),
-                y_prev.max(None)?.item::<f32>(),
-            );
-            tracing::info!(
-                "SSM STATE[{}]: C shape={:?}, min={:.6}, max={:.6}",
-                state_present_log,
-                c.shape(),
-                c.min(None)?.item::<f32>(),
-                c.max(None)?.item::<f32>(),
-            );
-        }
-
         // exp_dta_cumsum: [B, L, H] -> [B, L, H, 1]
         let exp_dta_expanded = mlx_rs::ops::expand_dims(&exp_dta_cumsum, -1)?;
 
         // y_prev contribution: y += exp_dta_cumsum * y_prev
-        if !disable_state_contribution {
-            let y_prev_t = y_prev.transpose_axes(&[0, 2, 1, 3])?; // [B, H, L, D]
-            let exp_dta_t = exp_dta_expanded.transpose_axes(&[0, 2, 1, 3])?; // [B, H, L, 1]
-            let y_contribution = y_prev_t.multiply(&exp_dta_t)?;
+        let y_prev_t = y_prev.transpose_axes(&[0, 2, 1, 3])?; // [B, H, L, D]
+        let exp_dta_t = exp_dta_expanded.transpose_axes(&[0, 2, 1, 3])?; // [B, H, L, 1]
+        let y_contribution = y_prev_t.multiply(&exp_dta_t)?;
 
-            if log_state_present {
-                y_contribution.eval()?;
-                tracing::info!(
-                    "SSM STATE[{}]: y_contribution (exp_dta*y_prev) min={:.6}, max={:.6}",
-                    state_present_log,
-                    y_contribution.min(None)?.item::<f32>(),
-                    y_contribution.max(None)?.item::<f32>(),
-                );
-            }
-
-            y = y.add(&y_contribution)?;
-        }
-
-        if log_state_present {
-            y.eval()?;
-            tracing::info!(
-                "SSM y AFTER state[{}]: min={:.6}, max={:.6}",
-                state_present_log,
-                y.min(None)?.item::<f32>(),
-                y.max(None)?.item::<f32>(),
-            );
-        }
+        y = y.add(&y_contribution)?;
     }
 
     // y = y.swapaxes(1,2): [B, L, H, D]
@@ -898,74 +467,7 @@ pub fn ssm_attention(
 
     // Add skip connection: y += x * D
     let d_expanded = d.reshape(&[1, 1, num_heads, 1])?;
-
-    // Debug: trace D values
-    if detailed_log {
-        d.eval()?;
-        let skip = x.multiply(&d_expanded)?;
-        skip.eval()?;
-        y.eval()?;
-        tracing::info!(
-            "SSM[{}] D param: min={:.4}, max={:.4}",
-            log_count,
-            d.min(None)?.item::<f32>(),
-            d.max(None)?.item::<f32>()
-        );
-        tracing::info!(
-            "SSM[{}] x*D (skip): min={:.4}, max={:.4}",
-            log_count,
-            skip.min(None)?.item::<f32>(),
-            skip.max(None)?.item::<f32>()
-        );
-        tracing::info!(
-            "SSM[{}] y (before skip): min={:.4}, max={:.4}",
-            log_count,
-            y.min(None)?.item::<f32>(),
-            y.max(None)?.item::<f32>()
-        );
-
-        // Check position 3478 = (head 54, dim 22) before skip
-        if seq_len > 2 {
-            let y_before = y.index((0, 2, 54, 22)).item::<f32>(); // y is [B, L, H, D]
-            let x_val = x.index((0, 2, 54, 22)).item::<f32>();
-            let d_val = d.index(54).item::<f32>();
-            tracing::info!(
-                "SSM[{}] POSITION 3478 (token=2, head=54, dim=22): y_before_skip={:.4}, x={:.4}, D={:.4}, x*D={:.4}",
-                log_count,
-                y_before,
-                x_val,
-                d_val,
-                x_val * d_val
-            );
-        }
-    }
-
     let y = y.add(&x.multiply(&d_expanded)?)?;
-
-    if detailed_log && seq_len > 2 {
-        y.eval()?;
-        let y_after = y.index((0, 2, 54, 26)).item::<f32>();
-        tracing::info!(
-            "SSM[{}] POSITION (token=2, head=54, dim=26): y_after_skip={:.4}",
-            log_count,
-            y_after
-        );
-
-        // Position 3478 = head 54, dim 22 (3478 / 64 = 54, 3478 % 64 = 22)
-        let h = 54;
-        let d = 22;
-        let y_val_check = y.index((0, 2, h, d)).item::<f32>();
-        let x_val_check = x.index((0, 2, h, d)).item::<f32>();
-        let d_val_check = d_expanded.index((0, 0, h, 0)).item::<f32>();
-        tracing::info!(
-            "SSM[{}] Position 3478 = (head=54, dim=22): x={:.4}, D={:.4}, x*D={:.4}, y_final={:.4}",
-            log_count,
-            x_val_check,
-            d_val_check,
-            x_val_check * d_val_check,
-            y_val_check
-        );
-    }
 
     Ok((y, next_state))
 }
@@ -1019,46 +521,6 @@ impl Expert {
         } else {
             Module::forward(&mut self.up_proj, x)?
         };
-
-        // Debug: trace up projection before ReLU
-        static EXPERT_LOG_COUNT: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let log_count = EXPERT_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if log_count < 3 {
-            // Trace dequantized weight
-            if let Some(ref scale) = self.up_proj_weight_scale {
-                let raw_weight = self.up_proj.weight.as_ref();
-                raw_weight.eval()?;
-                scale.eval()?;
-                let dequant_weight = raw_weight.multiply(scale)?;
-                dequant_weight.eval()?;
-                tracing::debug!(
-                    "Expert weight - raw dtype={:?}, scale={:.6}, dequant min={:.4}, max={:.4}",
-                    raw_weight.dtype(),
-                    scale.item::<f32>(),
-                    dequant_weight.min(None)?.item::<f32>(),
-                    dequant_weight.max(None)?.item::<f32>()
-                );
-            }
-            // Trace input
-            x.eval()?;
-            tracing::debug!(
-                "Expert input - min={:.4}, max={:.4}, shape={:?}",
-                x.min(None)?.item::<f32>(),
-                x.max(None)?.item::<f32>(),
-                x.shape()
-            );
-            up.eval()?;
-            let positive_count = up.gt(&Array::from_f32(0.0))?.sum(None)?.item::<i32>();
-            let total = up.size() as i32;
-            tracing::debug!(
-                "Expert up proj (before ReLU) - min={:.4}, max={:.4}, positive={}/{}",
-                up.min(None)?.item::<f32>(),
-                up.max(None)?.item::<f32>(),
-                positive_count,
-                total
-            );
-        }
 
         // ReLU² activation
         let activated = nn::relu(&up)?.square()?;
@@ -1136,20 +598,6 @@ impl MoERouter {
     pub fn forward(&mut self, x: &Array) -> Result<(Array, Array), Exception> {
         // Compute logits: [B*L, num_experts]
         let logits = Module::forward(&mut self.gate, x)?;
-
-        // Debug: Check e_score_correction_bias is loaded
-        static LOGGED_BIAS: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED_BIAS.swap(true, std::sync::atomic::Ordering::Relaxed) {
-            self.e_score_correction_bias.eval()?;
-            tracing::info!(
-                "MoE e_score_correction_bias: shape={:?}, min={:.4}, max={:.4}, sum={:.4}",
-                self.e_score_correction_bias.shape(),
-                self.e_score_correction_bias.min(None)?.item::<f32>(),
-                self.e_score_correction_bias.max(None)?.item::<f32>(),
-                self.e_score_correction_bias.sum(None)?.item::<f32>()
-            );
-        }
 
         // Apply sigmoid (not softmax) for scoring
         let logits_f32 = logits.as_dtype(Dtype::Float32)?;
@@ -1607,6 +1055,46 @@ fn default_rope_theta() -> f32 {
     10000.0
 }
 
+impl crate::traits::ModelConfig for NemotronHConfig {
+    fn model_type(&self) -> &str {
+        &self.model_type
+    }
+    fn vocab_size(&self) -> i32 {
+        self.vocab_size
+    }
+    fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+    fn num_hidden_layers(&self) -> i32 {
+        self.num_hidden_layers
+    }
+    fn num_attention_heads(&self) -> i32 {
+        self.num_attention_heads
+    }
+    fn num_kv_heads(&self) -> i32 {
+        self.num_key_value_heads
+    }
+    fn head_dim(&self) -> i32 {
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+    fn intermediate_size(&self) -> i32 {
+        self.intermediate_size
+    }
+    fn max_position_embeddings(&self) -> i32 {
+        self.max_position_embeddings
+    }
+    fn norm_eps(&self) -> f32 {
+        self.layer_norm_epsilon
+    }
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+}
+
 impl NemotronHConfig {
     /// Parse the hybrid override pattern into a vector of layer types.
     pub fn layer_types(&self) -> Vec<char> {
@@ -2008,7 +1496,6 @@ impl NemotronHMixer {
         }
     }
 
-    #[allow(clippy::overly_complex_bool_expr)]
     fn forward_mamba(
         &mut self,
         x: &Array,
@@ -2034,23 +1521,6 @@ impl NemotronHMixer {
         let head_dim = self.mamba_head_dim;
         let conv_kernel = self.conv_kernel_size;
 
-        // Debug: trace Mamba forward values (disabled for performance)
-        static MAMBA_TRACE_LOG: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let mamba_trace = MAMBA_TRACE_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let log_mamba_trace = false && mamba_trace < 2; // Disabled
-
-        if log_mamba_trace {
-            x.eval()?;
-            tracing::info!(
-                "MAMBA[{}] input x: shape={:?}, min={:.4}, max={:.4}",
-                mamba_trace,
-                x.shape(),
-                x.min(None)?.item::<f32>(),
-                x.max(None)?.item::<f32>()
-            );
-        }
-
         // Input projection with FP8 weight dequantization
         // NOTE: Do NOT apply input_scale - that's for FP8 dynamic quantization
         let projected = if let Some(ref ws) = self.in_proj_weight_scale {
@@ -2066,17 +1536,6 @@ impl NemotronHMixer {
             Module::forward(in_proj, x)?
         };
 
-        if log_mamba_trace {
-            projected.eval()?;
-            tracing::info!(
-                "MAMBA[{}] projected: shape={:?}, min={:.4}, max={:.4}",
-                mamba_trace,
-                projected.shape(),
-                projected.min(None)?.item::<f32>(),
-                projected.max(None)?.item::<f32>()
-            );
-        }
-
         // Use split_sections for efficient splitting (optimization #1)
         // Split at: [intermediate_size, intermediate_size + conv_dim]
         let split_indices = &[intermediate_size, intermediate_size + conv_dim];
@@ -2090,43 +1549,9 @@ impl NemotronHMixer {
             // Use cached conv state for causal convolution
             let padded_input = mamba_cache.update_conv_state(conv_input, conv_kernel)?;
 
-            if log_mamba_trace {
-                conv_input.eval()?;
-                padded_input.eval()?;
-                let ci_t2_3478 = if seq_len > 2 {
-                    conv_input.index((0, 2, 3478)).item::<f32>()
-                } else {
-                    f32::NAN
-                };
-                tracing::info!(
-                    "MAMBA[{}] CONV DEBUG: conv_input shape={:?}, padded_input shape={:?}, conv_input[0,2,3478]={:.4}",
-                    mamba_trace,
-                    conv_input.shape(),
-                    padded_input.shape(),
-                    ci_t2_3478
-                );
-            }
-
             let conv_out = Module::forward(conv1d, &padded_input)?;
             // Output is [B, padded_len, conv_dim], truncate to [B, seq_len, conv_dim]
             let out_len = conv_out.dim(1);
-
-            if log_mamba_trace {
-                conv_out.eval()?;
-                let co_t2_3478 = if out_len > 2 {
-                    conv_out.index((0, 2, 3478)).item::<f32>()
-                } else {
-                    f32::NAN
-                };
-                tracing::info!(
-                    "MAMBA[{}] CONV DEBUG: conv_out shape={:?}, out_len={}, seq_len={}, conv_out[0,2,3478]={:.4}",
-                    mamba_trace,
-                    conv_out.shape(),
-                    out_len,
-                    seq_len,
-                    co_t2_3478
-                );
-            }
 
             let conv_out = conv_out.index((.., (out_len - seq_len).., ..));
             nn::silu(&conv_out)?
@@ -2155,40 +1580,6 @@ impl NemotronHMixer {
         let b_proj = &conv_parts[1]; // [B, L, n_groups * ssm_state_size]
         let c_proj = &conv_parts[2]; // [B, L, n_groups * ssm_state_size]
 
-        if log_mamba_trace {
-            conv_activated.eval()?;
-            hidden_states.eval()?;
-            tracing::info!(
-                "MAMBA[{}] conv_activated: shape={:?}, min={:.4}, max={:.4}",
-                mamba_trace,
-                conv_activated.shape(),
-                conv_activated.min(None)?.item::<f32>(),
-                conv_activated.max(None)?.item::<f32>()
-            );
-            tracing::info!(
-                "MAMBA[{}] hidden_states (SSM input): shape={:?}, min={:.4}, max={:.4}",
-                mamba_trace,
-                hidden_states.shape(),
-                hidden_states.min(None)?.item::<f32>(),
-                hidden_states.max(None)?.item::<f32>()
-            );
-            // Check position 3478 (head 54, dim 26) in SSM input for tokens 2 and 19
-            if seq_len > 2 {
-                let hs_t2 = hidden_states.index((0, 2, 3478)).item::<f32>();
-                let hs_t19 = if seq_len > 19 {
-                    hidden_states.index((0, 19, 3478)).item::<f32>()
-                } else {
-                    f32::NAN
-                };
-                tracing::info!(
-                    "MAMBA[{}] hidden_states at pos 3478: Token 2={:.4}, Token 19={:.4}",
-                    mamba_trace,
-                    hs_t2,
-                    hs_t19
-                );
-            }
-        }
-
         // Reshape for multi-head processing (combined reshape - optimization #2)
         // hidden_states: [B, L, num_heads * head_dim] -> [B, L, num_heads, head_dim]
         let x_heads = hidden_states.reshape(&[batch, seq_len, num_heads, head_dim])?;
@@ -2200,34 +1591,10 @@ impl NemotronHMixer {
         // Get previous SSM state from cache
         let prev_state = cache.as_ref().and_then(|c| c.get_ssm_state());
 
-        // Debug: trace cache state (disabled for performance)
-        static MAMBA_FWD_LOG: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let mamba_log = MAMBA_FWD_LOG.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if false && mamba_log < 10 {
-            // Disabled
-            let has_cache = cache.is_some();
-            let has_prev_state = prev_state.is_some();
-            tracing::debug!(
-                "forward_mamba[{}]: seq_len={}, has_cache={}, has_prev_state={}",
-                mamba_log,
-                seq_len,
-                has_cache,
-                has_prev_state
-            );
-        }
-
         // Use optimized single-token update when seq_len=1 and we have previous state
         // This avoids the expensive full SSM attention computation
-        static FAST_PATH_COUNT: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        static SLOW_PATH_COUNT: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
         let (y, next_state) = if let (1, Some(prev)) = (seq_len, prev_state) {
-            let count = FAST_PATH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count < 5 || count % 1000 == 0 {
-                tracing::info!("SSM fast path: seq_len={}, count={}", seq_len, count);
-            }
+            // Single-token fast path
             ssm_update_single(
                 &x_heads,
                 a_log,
@@ -2240,16 +1607,7 @@ impl NemotronHMixer {
                 (self.time_step_min, self.time_step_max),
             )?
         } else {
-            // Use full SSM attention computation
-            let count = SLOW_PATH_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            if count < 5 || count % 1000 == 0 {
-                tracing::info!(
-                    "SSM slow path: seq_len={}, has_state={}, count={}",
-                    seq_len,
-                    prev_state.is_some(),
-                    count
-                );
-            }
+            // Full SSM attention computation
             ssm_attention(
                 &x_heads,
                 a_log,
@@ -2271,43 +1629,9 @@ impl NemotronHMixer {
         // Reshape back to [B, L, intermediate_size]
         let y = y.reshape(&[batch, seq_len, intermediate_size])?;
 
-        if log_mamba_trace && seq_len > 2 {
-            y.eval()?;
-            // Check SSM output at position 3478 for tokens 2 and 19
-            let y_t2 = y.index((0, 2, 3478)).item::<f32>();
-            let y_t19 = if seq_len > 19 {
-                y.index((0, 19, 3478)).item::<f32>()
-            } else {
-                f32::NAN
-            };
-            tracing::info!(
-                "MAMBA[{}] SSM output y at pos 3478: Token 2={:.4}, Token 19={:.4}",
-                mamba_trace,
-                y_t2,
-                y_t19
-            );
-        }
-
         // Gated RMS norm with group-wise normalization
         // This handles: y = norm(y * silu(gate)) with groups
         let y_normed = gated_norm.forward(&y, Some(gate))?;
-
-        if log_mamba_trace {
-            y.eval()?;
-            y_normed.eval()?;
-            tracing::info!(
-                "MAMBA[{}] y (SSM out before norm): min={:.4}, max={:.4}",
-                mamba_trace,
-                y.min(None)?.item::<f32>(),
-                y.max(None)?.item::<f32>()
-            );
-            tracing::info!(
-                "MAMBA[{}] y_normed (after gated norm): min={:.4}, max={:.4}",
-                mamba_trace,
-                y_normed.min(None)?.item::<f32>(),
-                y_normed.max(None)?.item::<f32>()
-            );
-        }
 
         // Output projection with FP8 weight dequantization
         // NOTE: Do NOT apply input_scale - that's for FP8 dynamic quantization
@@ -2519,7 +1843,6 @@ impl NemotronHModel {
         Ok(())
     }
 
-    #[allow(clippy::overly_complex_bool_expr)]
     pub fn forward_with_cache(
         &mut self,
         input_ids: &Array,
@@ -2527,77 +1850,9 @@ impl NemotronHModel {
         mut kv_cache: Option<&mut KVCache>,
         mut mamba_cache: Option<&mut MambaCache>,
     ) -> Result<Array, Exception> {
-        // Debug: check embedding weights and input (disabled for performance)
-        const DEBUG_EMBEDDINGS: bool = false;
-        if DEBUG_EMBEDDINGS {
-            input_ids.eval()?;
-            tracing::info!(
-                "INPUT_IDS: shape={:?}, dtype={:?}, first few={:?}",
-                input_ids.shape(),
-                input_ids.dtype(),
-                if input_ids.size() <= 30 {
-                    input_ids.flatten(None, None)?.as_slice::<i32>().to_vec()
-                } else {
-                    input_ids
-                        .flatten(None, None)?
-                        .index(..30)
-                        .as_slice::<i32>()
-                        .to_vec()
-                }
-            );
-            let emb_w = &self.embeddings.weight.value;
-            emb_w.eval()?;
-            tracing::info!(
-                "EMBEDDING WEIGHTS: shape={:?}, dtype={:?}, min={:.6}, max={:.6}",
-                emb_w.shape(),
-                emb_w.dtype(),
-                emb_w.min(None)?.item::<f32>(),
-                emb_w.max(None)?.item::<f32>()
-            );
-            // Check specific token (22177 = "Hello")
-            let tok_22177 = emb_w.index((22177, ..));
-            tok_22177.eval()?;
-            tracing::info!(
-                "TOKEN 22177 embedding: min={:.6}, max={:.6}",
-                tok_22177.min(None)?.item::<f32>(),
-                tok_22177.max(None)?.item::<f32>()
-            );
-        }
-
         let mut hidden = Module::forward(&mut self.embeddings, input_ids)?;
 
-        // Debug: check embedding output immediately (disabled for performance)
-        if DEBUG_EMBEDDINGS {
-            hidden.eval()?;
-            let emb_min = hidden.min(None)?.item::<f32>();
-            let emb_max = hidden.max(None)?.item::<f32>();
-            let emb_mean = hidden.mean(None)?.item::<f32>();
-            tracing::info!(
-                "EMBEDDING OUTPUT: shape={:?}, dtype={:?}, min={:.6}, max={:.6}, mean={:.6}",
-                hidden.shape(),
-                hidden.dtype(),
-                emb_min,
-                emb_max,
-                emb_mean
-            );
-        }
-
         // Process layers - attention layers use KV cache, Mamba layers use Mamba cache
-        // Track timing for profiling
-        static PROFILE_COUNT: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let profile_iter = PROFILE_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let do_profile = false && profile_iter < 3; // Disabled - set to true to profile
-        let layer_start = if do_profile {
-            Some(std::time::Instant::now())
-        } else {
-            None
-        };
-        let mut mamba_time = std::time::Duration::ZERO;
-        let mut attn_time = std::time::Duration::ZERO;
-        let mut mlp_time = std::time::Duration::ZERO;
-        let mut moe_time = std::time::Duration::ZERO;
-
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let layer_mask = if layer.block_type() == '*' {
                 mask
@@ -2619,38 +1874,7 @@ impl NemotronHModel {
                 None
             };
 
-            let op_start = if do_profile {
-                Some(std::time::Instant::now())
-            } else {
-                None
-            };
             hidden = layer.forward_with_cache(&hidden, layer_mask, kv, mamba)?;
-
-            // Sync and time for profiling
-            if do_profile {
-                hidden.eval()?;
-                let elapsed = op_start.unwrap().elapsed();
-                match layer.block_type() {
-                    'M' => mamba_time += elapsed,
-                    '*' => attn_time += elapsed,
-                    '-' => mlp_time += elapsed,
-                    'E' => moe_time += elapsed,
-                    _ => {}
-                }
-            }
-        }
-
-        if do_profile {
-            let total = layer_start.unwrap().elapsed();
-            tracing::info!(
-                "LAYER TIMING[{}]: total={:.1}ms, mamba={:.1}ms, attn={:.1}ms, mlp={:.1}ms, moe={:.1}ms",
-                profile_iter,
-                total.as_secs_f64() * 1000.0,
-                mamba_time.as_secs_f64() * 1000.0,
-                attn_time.as_secs_f64() * 1000.0,
-                mlp_time.as_secs_f64() * 1000.0,
-                moe_time.as_secs_f64() * 1000.0,
-            );
         }
 
         Module::forward(&mut self.norm_f, &hidden)
@@ -2720,83 +1944,12 @@ impl NemotronHForCausalLM {
             .backbone
             .forward_with_cache(input_ids, mask, kv_cache, mamba_cache)?;
 
-        // Debug: trace hidden states after backbone (disabled for performance)
-        static FORWARD_LOG_COUNT: std::sync::atomic::AtomicUsize =
-            std::sync::atomic::AtomicUsize::new(0);
-        let forward_log = FORWARD_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        #[allow(clippy::overly_complex_bool_expr)]
-        if false && forward_log < 3 {
-            // Disabled
-            hidden.eval()?;
-            let last_hidden = hidden.index((.., -1, ..));
-            last_hidden.eval()?;
-            tracing::info!(
-                "FINAL HIDDEN[{}]: shape={:?}, min={:.4}, max={:.4}, mean={:.6}",
-                forward_log,
-                hidden.shape(),
-                hidden.min(None)?.item::<f32>(),
-                hidden.max(None)?.item::<f32>(),
-                hidden.mean(None)?.item::<f32>()
-            );
-            tracing::info!(
-                "LAST TOKEN HIDDEN[{}]: shape={:?}, min={:.4}, max={:.4}, mean={:.6}",
-                forward_log,
-                last_hidden.shape(),
-                last_hidden.min(None)?.item::<f32>(),
-                last_hidden.max(None)?.item::<f32>(),
-                last_hidden.mean(None)?.item::<f32>()
-            );
-        }
-
         let logits = if let Some(ref mut lm_head) = self.lm_head {
             Module::forward(lm_head, &hidden)?
         } else {
             // Tie weights: use embedding weight transposed
             self.backbone.embeddings.as_linear(&hidden)?
         };
-
-        // Debug: trace logits (disabled for performance)
-        #[allow(clippy::overly_complex_bool_expr)]
-        if false && forward_log < 3 {
-            logits.eval()?;
-            let last_logits = logits.index((.., -1, ..));
-            last_logits.eval()?;
-            tracing::info!(
-                "LOGITS[{}]: shape={:?}, min={:.4}, max={:.4}, mean={:.6}",
-                forward_log,
-                logits.shape(),
-                logits.min(None)?.item::<f32>(),
-                logits.max(None)?.item::<f32>(),
-                logits.mean(None)?.item::<f32>()
-            );
-            // Get top-5 token predictions
-            let neg_logits = last_logits.negative()?;
-            let top5_indices = mlx_rs::ops::argpartition_axis(&neg_logits, 4, -1)?;
-            let top5_indices = top5_indices.index((.., ..5));
-            top5_indices.eval()?;
-            let top5_vec: Vec<u32> = top5_indices.as_slice().to_vec();
-            let top5_logits: Vec<f32> = top5_vec
-                .iter()
-                .map(|&idx| last_logits.index((.., idx as i32)).item::<f32>())
-                .collect();
-            tracing::info!(
-                "TOP-5 TOKENS[{}]: indices={:?}, logits={:?}",
-                forward_log,
-                top5_vec,
-                top5_logits
-            );
-            // Check expected tokens: "I"=1073, "Hi"=37133, "Hello"=22177
-            let expected_tokens = [1073i32, 37133, 22177, 30859, 11564];
-            let expected_logits: Vec<f32> = expected_tokens
-                .iter()
-                .map(|&idx| last_logits.index((.., idx)).item::<f32>())
-                .collect();
-            tracing::info!(
-                "EXPECTED TOKENS[{}]: ids=[I, Hi, Hello, Thank, well], logits={:?}",
-                forward_log,
-                expected_logits
-            );
-        }
 
         Ok(logits)
     }
@@ -2869,25 +2022,16 @@ pub fn load_nemotron_weights(
     }
 
     // Load lm_head if not tied
-    tracing::info!("lm_head is Some: {}", model.lm_head.is_some());
     if let Some(ref mut lm_head) = model.lm_head {
         if let Some(w) = weights.get("lm_head.weight") {
-            tracing::info!(
-                "LOADED lm_head.weight: shape={:?}, dtype={:?}",
-                w.shape(),
-                w.dtype()
-            );
             lm_head.weight = Param::new(w.clone());
         } else {
-            // Try without prefix
             let lm_head_keys: Vec<_> = weights.keys().filter(|k| k.contains("lm_head")).collect();
             tracing::warn!(
-                "lm_head.weight NOT FOUND! Available lm_head keys: {:?}",
+                "lm_head.weight not found, available lm_head keys: {:?}",
                 lm_head_keys
             );
         }
-    } else {
-        tracing::info!("lm_head is None (tie_word_embeddings=true), using embedding weights");
     }
 
     Ok(())

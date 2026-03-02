@@ -326,7 +326,6 @@ impl Default for GptOssConfig {
 #[derive(Debug, ModuleParameters)]
 pub struct GptOssAttention {
     /// Configuration.
-    #[allow(dead_code)]
     config: GptOssConfig,
     /// Layer index.
     layer_idx: usize,
@@ -532,7 +531,6 @@ pub struct GptOssMoE {
     /// MoE layer from pmetal-mlx.
     moe_layer: MoELayer,
     /// SwiGLU limit for clamping.
-    #[allow(dead_code)]
     swiglu_limit: f32,
 }
 

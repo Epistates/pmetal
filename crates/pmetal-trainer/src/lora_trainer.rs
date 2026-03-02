@@ -240,31 +240,26 @@ impl LoraTrainer {
     }
 
     /// Get the current learning rate based on scheduler.
+    ///
+    /// Delegates to the canonical `pmetal_core::LearningRateScheduler` so all
+    /// trainers share a single, consistent LR computation path. This fixes:
+    /// - Missing min_lr floor
+    /// - Missing progress clamping past total_steps
+    /// - Correct warmup interpolation from min_lr (not 0)
+    /// - Support for all scheduler types (CosineWithRestarts, Polynomial)
     pub fn get_learning_rate(&self) -> f32 {
-        let warmup = self.config.warmup_steps;
-        let total_steps = self.config.max_steps.unwrap_or(10000);
-        let base_lr = self.config.learning_rate as f32;
+        use pmetal_core::LearningRateScheduler;
 
-        if self.step < warmup {
-            // Linear warmup
-            base_lr * (self.step as f32 / warmup as f32)
-        } else {
-            match self.config.lr_scheduler {
-                pmetal_core::LrSchedulerType::Constant => base_lr,
-                pmetal_core::LrSchedulerType::Linear => {
-                    let decay_steps = total_steps.saturating_sub(warmup).max(1) as f32;
-                    let current = self.step.saturating_sub(warmup) as f32;
-                    base_lr * (1.0 - current / decay_steps).max(0.0)
-                }
-                pmetal_core::LrSchedulerType::Cosine => {
-                    let decay_steps = total_steps.saturating_sub(warmup).max(1) as f32;
-                    let current = self.step.saturating_sub(warmup) as f32;
-                    let progress = current / decay_steps;
-                    base_lr * 0.5 * (1.0 + (std::f64::consts::PI as f32 * progress).cos())
-                }
-                _ => base_lr,
-            }
-        }
+        let total_steps = self.config.max_steps.unwrap_or(10000);
+
+        let scheduler = LearningRateScheduler::new(
+            self.config.learning_rate,
+            total_steps,
+            self.config.warmup_steps,
+            self.config.lr_scheduler,
+        );
+
+        scheduler.get_lr(self.step) as f32
     }
 
     /// Get current training step.

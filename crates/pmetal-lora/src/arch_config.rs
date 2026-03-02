@@ -63,6 +63,7 @@ pub trait LoraArchitectureConfig {
 // Implementations for existing model configs
 // ============================================================================
 
+use pmetal_models::ModelConfig;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::architectures::mistral::MistralConfig;
 use pmetal_models::architectures::qwen3::Qwen3Config;
@@ -77,7 +78,7 @@ impl LoraArchitectureConfig for LlamaConfig {
     }
 
     fn num_kv_heads(&self) -> i32 {
-        self.num_kv_heads()
+        ModelConfig::num_kv_heads(self)
     }
 
     fn head_dim(&self) -> i32 {
@@ -123,7 +124,7 @@ impl LoraArchitectureConfig for MistralConfig {
     }
 
     fn num_kv_heads(&self) -> i32 {
-        self.num_kv_heads()
+        ModelConfig::num_kv_heads(self)
     }
 
     fn head_dim(&self) -> i32 {
@@ -173,7 +174,7 @@ impl LoraArchitectureConfig for Qwen3Config {
     }
 
     fn num_kv_heads(&self) -> i32 {
-        self.num_kv_heads()
+        ModelConfig::num_kv_heads(self)
     }
 
     fn head_dim(&self) -> i32 {

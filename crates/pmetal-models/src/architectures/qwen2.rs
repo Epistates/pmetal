@@ -7,10 +7,14 @@
 //! - No RoPE scaling support
 //! - Optional sliding window attention (usually disabled)
 
+use crate::traits::ModelConfig;
 use mlx_rs::{
     Array, builder::Builder, error::Exception, macros::ModuleParameters, module::Module, nn,
 };
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{RopeScaling, apply_rope},
+};
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
@@ -61,6 +65,9 @@ pub struct Qwen2Config {
     /// Attention dropout (unused in inference).
     #[serde(default)]
     pub attention_dropout: f32,
+    /// RoPE scaling configuration.
+    #[serde(default)]
+    pub rope_scaling: Option<std::collections::HashMap<String, serde_json::Value>>,
 }
 
 fn default_model_type() -> String {
@@ -85,12 +92,46 @@ fn default_hidden_act() -> String {
     "silu".to_string()
 }
 
-impl Qwen2Config {
-    /// Get the number of KV heads (defaults to num_attention_heads if not specified).
-    pub fn num_kv_heads(&self) -> i32 {
+impl crate::traits::ModelConfig for Qwen2Config {
+    fn model_type(&self) -> &str {
+        &self.model_type
+    }
+    fn vocab_size(&self) -> i32 {
+        self.vocab_size
+    }
+    fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+    fn num_hidden_layers(&self) -> i32 {
+        self.num_hidden_layers
+    }
+    fn num_attention_heads(&self) -> i32 {
+        self.num_attention_heads
+    }
+    fn num_kv_heads(&self) -> i32 {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
     }
+    fn head_dim(&self) -> i32 {
+        self.head_dim
+    }
+    fn intermediate_size(&self) -> i32 {
+        self.intermediate_size
+    }
+    fn max_position_embeddings(&self) -> i32 {
+        self.max_position_embeddings
+    }
+    fn norm_eps(&self) -> f32 {
+        self.rms_norm_eps
+    }
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta
+    }
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+}
 
+impl Qwen2Config {
     /// Get the head dimension (always 128 for Qwen2).
     pub fn get_head_dim(&self) -> i32 {
         self.head_dim
@@ -122,6 +163,7 @@ impl Default for Qwen2Config {
             sliding_window: None,
             use_sliding_window: false,
             attention_dropout: 0.0,
+            rope_scaling: None,
         }
     }
 }
@@ -196,6 +238,10 @@ pub struct Qwen2Attention {
     pub scale: f32,
     /// RoPE base frequency.
     pub rope_theta: f32,
+    /// RoPE position scale (from rope_scaling config).
+    pub rope_scale: f32,
+    /// Effective RoPE base after scaling.
+    pub effective_base: f32,
     /// Whether to use sliding window attention.
     pub use_sliding_window: bool,
     /// Sliding window size.
@@ -227,6 +273,15 @@ impl Qwen2Attention {
         let scale = (head_dim as f32).sqrt().recip();
         let rope_theta = config.rope_theta;
 
+        // Parse rope_scaling from config
+        let rope_scaling = config
+            .rope_scaling
+            .as_ref()
+            .map(|map| RopeScaling::from_config_map(map))
+            .unwrap_or(RopeScaling::None);
+        let rope_scale = rope_scaling.scale();
+        let effective_base = rope_scaling.effective_base(rope_theta, head_dim);
+
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
             .bias(true) // Qwen2 uses bias in attention projections
             .build()?;
@@ -240,9 +295,10 @@ impl Qwen2Attention {
             .bias(false) // Output projection has no bias
             .build()?;
 
-        // Initialize RoPE with Qwen2's high theta
+        // Initialize RoPE with scaled parameters
         let rope = nn::RopeBuilder::new(head_dim)
-            .base(rope_theta)
+            .base(effective_base)
+            .scale(rope_scale)
             .traditional(false)
             .build()?;
 
@@ -252,6 +308,8 @@ impl Qwen2Attention {
             head_dim,
             scale,
             rope_theta,
+            rope_scale,
+            effective_base,
             use_sliding_window: config.use_sliding_window,
             sliding_window: config.sliding_window,
             q_proj,
@@ -310,8 +368,22 @@ impl Qwen2Attention {
         // Get RoPE offset and apply RoPE
         let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
             let offset = cache_ref.rope_offset();
-            let queries = apply_rope(&queries, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-            let keys = apply_rope(&keys, self.head_dim, false, self.rope_theta, 1.0, offset)?;
+            let queries = apply_rope(
+                &queries,
+                self.head_dim,
+                false,
+                self.effective_base,
+                self.rope_scale,
+                offset,
+            )?;
+            let keys = apply_rope(
+                &keys,
+                self.head_dim,
+                false,
+                self.effective_base,
+                self.rope_scale,
+                offset,
+            )?;
             (queries, keys, values)
         } else {
             let queries = Module::forward(&mut self.rope, &queries)?;
@@ -328,10 +400,15 @@ impl Qwen2Attention {
         };
 
         // Determine mask type for fused attention
+        // Gate on use_sliding_window flag before checking sliding_window size
         let mask_type = if mask.is_some() {
             AttentionMaskType::None // Custom mask provided
-        } else if let Some(window) = self.sliding_window {
-            AttentionMaskType::SlidingWindow(window)
+        } else if self.use_sliding_window {
+            if let Some(window) = self.sliding_window {
+                AttentionMaskType::SlidingWindow(window)
+            } else {
+                AttentionMaskType::Causal
+            }
         } else {
             AttentionMaskType::Causal
         };

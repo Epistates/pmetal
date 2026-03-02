@@ -34,10 +34,11 @@ use mlx_rs::{
     Array,
     error::Exception,
     ops::{concatenate_axis, indexing::IndexOp},
-    random::categorical,
 };
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_mlx::prefix_cache::PrefixCachedGenerator;
+
+use crate::sampling::compiled_sampler::CompiledSampler;
 
 use crate::generation::{GenerationConfig, GenerationOutput};
 
@@ -157,6 +158,9 @@ impl BatchedRlConfig {
 ///
 /// This generator efficiently produces multiple completions from the same prompt
 /// using batched forward passes and parallel sampling.
+///
+/// H10: Uses `CompiledSampler` for proper top-k/top-p/min-p filtering instead
+/// of temperature-only sampling.
 pub struct BatchedRlGenerator {
     /// Configuration.
     config: BatchedRlConfig,
@@ -164,6 +168,8 @@ pub struct BatchedRlGenerator {
     prefix_cache: Option<PrefixCachedGenerator>,
     /// KV cache config for creating new caches.
     kv_config: KVCacheConfig,
+    /// Compiled sampler with full filter chain (temperature, top-k, top-p, min-p).
+    sampler: CompiledSampler,
 }
 
 impl BatchedRlGenerator {
@@ -175,10 +181,25 @@ impl BatchedRlGenerator {
             None
         };
 
+        let sampler = if let Some(seed) = config.seed {
+            CompiledSampler::with_seed(
+                config.temperature,
+                config.top_k,
+                config.top_p,
+                config.min_p,
+                seed,
+            )
+            .expect("Failed to create seeded sampler")
+        } else {
+            CompiledSampler::new(config.temperature, config.top_k, config.top_p, config.min_p)
+                .expect("Failed to create sampler")
+        };
+
         Self {
             config,
             prefix_cache,
             kv_config,
+            sampler,
         }
     }
 
@@ -315,12 +336,8 @@ impl BatchedRlGenerator {
         let stopped_by_length: Vec<bool> = finished
             .iter()
             .zip(stopped_by_token.iter())
-            .map(|(&f, &st)| {
-                !st && f
-                    || num_generated
-                        .iter()
-                        .any(|&n| n >= self.config.max_new_tokens)
-            })
+            .zip(num_generated.iter())
+            .map(|((&f, &st), &n)| !st && (f || n >= self.config.max_new_tokens))
             .collect();
 
         Ok(BatchedGenerationOutput {
@@ -331,27 +348,14 @@ impl BatchedRlGenerator {
         })
     }
 
-    /// Sample a token from logits.
-    fn sample(&self, logits: &Array) -> RlGenResult<u32> {
-        // Apply temperature
-        let scaled = if self.config.temperature != 1.0 && self.config.temperature > 0.0 {
-            let inv_temp = Array::from_f32(1.0 / self.config.temperature);
-            logits.multiply(&inv_temp)?
-        } else {
-            logits.clone()
-        };
-
-        // Convert to log probs (log-softmax)
-        let log_probs = {
-            let lse = mlx_rs::ops::logsumexp_axis(&scaled, -1, true)?;
-            scaled.subtract(&lse)?
-        };
-
-        // Sample using categorical
-        let sampled = categorical(&log_probs, None, None, None)?;
-        sampled.eval()?;
-
-        Ok(sampled.item::<u32>())
+    /// Sample a token from logits using the compiled sampler.
+    ///
+    /// H10: Delegates to `CompiledSampler` which applies the full filter chain
+    /// (temperature scaling, top-k, top-p, min-p) before sampling. The previous
+    /// implementation only applied temperature, ignoring top-k/top-p/min-p
+    /// from the config.
+    fn sample(&mut self, logits: &Array) -> RlGenResult<u32> {
+        self.sampler.sample_token(logits)
     }
 
     /// Check if a token is a stop token.

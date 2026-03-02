@@ -62,6 +62,23 @@ pub trait DistillLoss: Send + Sync {
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
+    ) -> Result<Array> {
+        self.compute_weighted(teacher_logits, student_logits, temperature, None)
+    }
+
+    /// Compute weighted distillation loss.
+    ///
+    /// # Arguments
+    /// * `teacher_logits` - Teacher logits
+    /// * `student_logits` - Student logits
+    /// * `temperature` - Softmax temperature
+    /// * `weights` - Per-token weights `[batch, seq]`
+    fn compute_weighted(
+        &self,
+        teacher_logits: &Array,
+        student_logits: &Array,
+        temperature: f32,
+        weights: Option<&Array>,
     ) -> Result<Array>;
 
     /// Get the name of this loss function.
@@ -135,7 +152,7 @@ impl CombinedLoss {
 /// Standard cross-entropy loss with logits and integer labels.
 fn cross_entropy_with_logits(logits: &Array, labels: &Array) -> Result<Array> {
     // Log-softmax for numerical stability
-    let log_probs = log_softmax(logits, -1)?;
+    let log_probs = mlx_rs::nn::log_softmax(logits, -1)?;
 
     // Gather the log probabilities at label positions
     // Shape: logits [batch, seq, vocab], labels [batch, seq]
@@ -153,18 +170,6 @@ fn cross_entropy_with_logits(logits: &Array, labels: &Array) -> Result<Array> {
     let loss = neg_log_probs.mean(None)?;
 
     Ok(loss)
-}
-
-/// Log-softmax along specified axis.
-fn log_softmax(x: &Array, axis: i32) -> Result<Array> {
-    // log_softmax(x) = x - log(sum(exp(x)))
-    // For numerical stability: x - max(x) - log(sum(exp(x - max(x))))
-    let max_x = x.max_axes(&[axis], Some(true))?;
-    let shifted = x.subtract(&max_x)?;
-    let exp_shifted = shifted.exp()?;
-    let sum_exp = exp_shifted.sum_axes(&[axis], Some(true))?;
-    let log_sum_exp = sum_exp.log()?;
-    Ok(shifted.subtract(&log_sum_exp)?)
 }
 
 /// Softmax along specified axis.
@@ -222,7 +227,7 @@ mod tests {
     #[test]
     fn test_log_softmax() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[1, 3]);
-        let log_probs = log_softmax(&logits, -1).unwrap();
+        let log_probs = mlx_rs::nn::log_softmax(&logits, -1).unwrap();
         let log_probs_data: Vec<f32> = log_probs.as_slice().to_vec();
 
         // All log probs should be <= 0

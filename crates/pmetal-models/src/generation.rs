@@ -860,14 +860,8 @@ fn apply_repetition_penalty(
         logits.clone()
     };
 
-    // Create token indices array (only unique tokens, limit to reasonable context)
-    let context_size = 20.min(generated_tokens.len());
-    let recent_tokens: Vec<i32> = generated_tokens
-        .iter()
-        .rev()
-        .take(context_size)
-        .map(|&t| t as i32)
-        .collect();
+    // Use full generated context for repetition penalty (no artificial cap)
+    let recent_tokens: Vec<i32> = generated_tokens.iter().map(|&t| t as i32).collect();
 
     if recent_tokens.is_empty() {
         return Ok(logits.clone());

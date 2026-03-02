@@ -91,6 +91,47 @@ impl RopeScaling {
     }
 }
 
+impl RopeScaling {
+    /// Parse rope_scaling from a HuggingFace config HashMap.
+    ///
+    /// Expected keys:
+    /// - "type": "linear", "dynamic", "yarn" (String)
+    /// - "factor": scaling factor (Float)
+    /// - "original_max_position_embeddings": for YaRN (Float)
+    /// - "attention_factor": optional YaRN attention factor (Float)
+    pub fn from_config_map(map: &std::collections::HashMap<String, serde_json::Value>) -> Self {
+        let rope_type = map
+            .get("type")
+            .or_else(|| map.get("rope_type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+
+        let factor = map.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+
+        match rope_type {
+            "linear" => RopeScaling::Linear { factor },
+            "dynamic" => RopeScaling::DynamicNtk { factor },
+            "yarn" => {
+                let original_max_pos = map
+                    .get("original_max_position_embeddings")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(4096) as i32;
+                let mut config = YarnConfig::new(factor, original_max_pos);
+                if let Some(attn) = map.get("attention_factor").and_then(|v| v.as_f64()) {
+                    config = config.with_attention_factor(attn as f32);
+                }
+                if let Some(beta_fast) = map.get("beta_fast").and_then(|v| v.as_f64()) {
+                    if let Some(beta_slow) = map.get("beta_slow").and_then(|v| v.as_f64()) {
+                        config = config.with_betas(beta_fast as f32, beta_slow as f32);
+                    }
+                }
+                RopeScaling::Yarn(config)
+            }
+            _ => RopeScaling::None,
+        }
+    }
+}
+
 /// Configuration for YaRN (Yet another RoPE extensioN).
 ///
 /// YaRN provides high-quality context extension by applying different
@@ -146,22 +187,27 @@ impl YarnConfig {
     }
 
     /// Compute the modified base for YaRN.
+    ///
+    /// Uses the extension factor (not attention factor) to modify the base frequency,
+    /// matching the NTK-aware base modification: base * factor^(dims / (dims - 2))
     fn compute_base(&self, base: f32, dims: i32) -> f32 {
-        // YaRN modifies base similar to NTK but with attention factor
-        let attention_factor = self.get_attention_factor();
-        base * attention_factor.powf(dims as f32 / (dims - 2) as f32)
+        base * self.factor.powf(dims as f32 / (dims - 2) as f32)
     }
 
     /// Compute the interpolation factor for each dimension.
     ///
     /// Returns a tensor of shape [dims/2] with interpolation weights.
-    pub fn compute_mscale(&self, dims: i32) -> Vec<f32> {
+    ///
+    /// # Arguments
+    /// * `dims` - Number of RoPE dimensions
+    /// * `base` - RoPE base frequency (rope_theta from config, e.g. 10000.0)
+    pub fn compute_mscale(&self, dims: i32, base: f32) -> Vec<f32> {
         let mut mscale = Vec::with_capacity((dims / 2) as usize);
 
         for i in 0..(dims / 2) {
             let dim = 2 * i;
-            // Compute wavelength for this dimension
-            let wavelength = 2.0 * std::f32::consts::PI * 10000_f32.powf(dim as f32 / dims as f32);
+            // Compute wavelength for this dimension using the configured base
+            let wavelength = 2.0 * std::f32::consts::PI * base.powf(dim as f32 / dims as f32);
 
             // Compute bounds
             let low = self.original_max_position as f32 / self.beta_fast;
@@ -233,12 +279,13 @@ pub fn apply_rope(
 /// // Position IDs:     [0,         1,         0,         1,         2]
 /// let x = Array::zeros::<f32>(&[1, 4, 5, 64]); // batch=1, heads=4, seq=5, dim=64
 /// let position_ids = Array::from_slice(&[0_i32, 1, 0, 1, 2], &[5]);
-/// let output = apply_rope_with_positions(&x, &position_ids, 64, 10000.0, 1.0)?;
+/// let output = apply_rope_with_positions(&x, &position_ids, 64, false, 10000.0, 1.0)?;
 /// ```
 pub fn apply_rope_with_positions(
     x: &mlx_rs::Array,
     position_ids: &mlx_rs::Array,
     dims: i32,
+    traditional: bool,
     base: f32,
     scale: f32,
 ) -> mlx_rs::error::Result<mlx_rs::Array> {
@@ -274,37 +321,74 @@ pub fn apply_rope_with_positions(
     let cos_theta = cos_theta.reshape(&[1, 1, -1, half_dims])?;
     let sin_theta = sin_theta.reshape(&[1, 1, -1, half_dims])?;
 
-    // Split x along last dimension into parts for rotation
-    // x shape: [batch, heads, seq_len, head_dim]
-    // Use split_axis to split at the half_dims point along axis -1
-    let parts = if dims == head_dim {
-        // Split into exactly 2 equal parts
-        x.split(2, -1)?
+    if traditional {
+        // Traditional (interleaved) RoPE: pairs are (x[0], x[1]), (x[2], x[3]), ...
+        // x shape: [batch, heads, seq_len, head_dim]
+        use mlx_rs::ops::indexing::IndexOp;
+
+        let x_rope = if dims < head_dim {
+            let parts = x.split_axis(&[dims], -1)?;
+            parts[0].clone()
+        } else {
+            x.clone()
+        };
+
+        // Reshape to [..., half_dims, 2] for interleaved pairs
+        let rope_shape = x_rope.shape();
+        let batch = rope_shape[0];
+        let heads = rope_shape[1];
+        let seq_len = rope_shape[2];
+        let x_pairs = x_rope.reshape(&[batch, heads, seq_len, half_dims, 2])?;
+
+        // Extract even and odd elements
+        let x_even = x_pairs.index((.., .., .., .., 0));
+        let x_odd = x_pairs.index((.., .., .., .., 1));
+
+        // Apply rotation
+        let r_even = x_even
+            .multiply(&cos_theta)?
+            .subtract(&x_odd.multiply(&sin_theta)?)?;
+        let r_odd = x_even
+            .multiply(&sin_theta)?
+            .add(&x_odd.multiply(&cos_theta)?)?;
+
+        // Interleave back: stack along last dim then reshape
+        let stacked = mlx_rs::ops::stack_axis(&[r_even, r_odd], -1)?; // [..., half_dims, 2]
+        let x_rotated = stacked.reshape(&[batch, heads, seq_len, dims])?;
+
+        if dims < head_dim {
+            let parts = x.split_axis(&[dims], -1)?;
+            concatenate_axis(&[x_rotated, parts[1].clone()], -1)
+        } else {
+            Ok(x_rotated)
+        }
     } else {
-        // Split at specific indices: [half_dims, dims]
-        x.split_axis(&[half_dims, dims], -1)?
-    };
+        // Non-traditional (split-half) RoPE: first half and second half
+        let parts = if dims == head_dim {
+            x.split(2, -1)?
+        } else {
+            x.split_axis(&[half_dims, dims], -1)?
+        };
 
-    let x1 = &parts[0]; // [batch, heads, seq_len, half_dims]
-    let x2 = &parts[1]; // [batch, heads, seq_len, half_dims] or [batch, heads, seq_len, dims - half_dims]
+        let x1 = &parts[0]; // [batch, heads, seq_len, half_dims]
+        let x2 = &parts[1];
 
-    // Apply rotation (non-traditional RoPE):
-    // rx1 = x1 * cos - x2 * sin
-    // rx2 = x1 * sin + x2 * cos
-    let rx1 = x1
-        .multiply(&cos_theta)?
-        .subtract(&x2.multiply(&sin_theta)?)?;
-    let rx2 = x1.multiply(&sin_theta)?.add(&x2.multiply(&cos_theta)?)?;
+        // Apply rotation:
+        // rx1 = x1 * cos - x2 * sin
+        // rx2 = x1 * sin + x2 * cos
+        let rx1 = x1
+            .multiply(&cos_theta)?
+            .subtract(&x2.multiply(&sin_theta)?)?;
+        let rx2 = x1.multiply(&sin_theta)?.add(&x2.multiply(&cos_theta)?)?;
 
-    // Concatenate rotated halves
-    let x_rotated = concatenate_axis(&[rx1, rx2], -1)?;
+        let x_rotated = concatenate_axis(&[rx1, rx2], -1)?;
 
-    // If dims < head_dim, concatenate passthrough dimensions
-    if dims < head_dim && parts.len() > 2 {
-        let x_pass = &parts[2];
-        concatenate_axis(&[x_rotated, x_pass.clone()], -1)
-    } else {
-        Ok(x_rotated)
+        if dims < head_dim && parts.len() > 2 {
+            let x_pass = &parts[2];
+            concatenate_axis(&[x_rotated, x_pass.clone()], -1)
+        } else {
+            Ok(x_rotated)
+        }
     }
 }
 
@@ -486,7 +570,7 @@ mod tests {
     #[test]
     fn test_yarn_mscale() {
         let config = YarnConfig::new(8.0, 4096);
-        let mscale = config.compute_mscale(64);
+        let mscale = config.compute_mscale(64, 10000.0);
 
         assert_eq!(mscale.len(), 32); // dims / 2
 

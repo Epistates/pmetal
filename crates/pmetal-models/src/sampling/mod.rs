@@ -28,11 +28,13 @@
 //! ```
 
 pub mod compiled_sampler;
+pub mod diffusion;
 
 #[cfg(target_os = "macos")]
 pub mod metal_sampler;
 
 pub use compiled_sampler::{CompiledSampler, SamplerState};
+pub use diffusion::*;
 
 #[cfg(target_os = "macos")]
 pub use metal_sampler::MetalSampler;

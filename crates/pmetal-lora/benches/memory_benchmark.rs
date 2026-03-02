@@ -93,6 +93,8 @@ fn benchmark_custom_autograd(
         config.num_kv_heads(),
         config.head_dim,
         1e-4,
+        config.rope_theta,
+        config.rms_norm_eps,
     );
 
     // Create dummy batch

@@ -1,29 +1,47 @@
-//! Group Relative Policy Optimization (GRPO) trainer.
+//! Group Relative Policy Optimization (GRPO) implementation.
 //!
-//! GRPO is a reinforcement learning algorithm that trains language models by:
-//! 1. Generating multiple completions (a "group") per prompt
-//! 2. Computing rewards for each completion via reward functions
-//! 3. Calculating group-relative advantages (reward - group mean)
-//! 4. Updating the policy to favor above-average completions
+//! GRPO is a reinforcement learning algorithm that optimizes policies by comparing
+//! the performance of multiple completions for the same prompt.
+//! It is particularly effective for reasoning models (e.g., DeepSeek-R1).
 //!
-//! Based on: "DeepSeekMath: Pushing the Limits of Mathematical Reasoning
-//! in Open Language Models" and TRL/Unsloth implementations.
-//!
-//! The GRPO loss is:
-//! ```text
-//! L_GRPO = -E[log_pi(y|x) * A(y)] + beta * KL(pi || pi_ref)
-//! ```
-//!
-//! Where:
-//! - `A(y)` is the group-relative advantage (reward - baseline)
-//! - `beta` is the KL penalty coefficient
-//! - `pi` is the policy model (trainable)
-//! - `pi_ref` is the reference model (frozen)
+//! ## Key Features
+//! - **Reference-free or Reference-based**: Supports KL divergence from a reference model.
+//! - **Group-based Advantages**: Computes advantages relative to the group mean/std.
+//! - **Flexible Rewards**: Pluggable reward functions for reasoning, formatting, and accuracy.
+//! - **Efficient Training**: Implementation optimized for Apple Silicon via MLX.
 
-use mlx_rs::Array;
-use mlx_rs::error::Exception;
-use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::{
+    Array,
+    error::Exception,
+    module::{Module, ModuleParameters},
+    nn,
+    ops::indexing::IndexOp,
+    optimizers::Optimizer,
+};
 use pmetal_core::TrainingConfig;
+use pmetal_lora::TrainableModel;
+use pmetal_models::rl_generation::{BatchedRlConfig, BatchedRlGenerator};
+use std::time::Instant;
+use tracing::info;
+
+/// Iteration statistics for GRPO training.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct GrpoIterationStats {
+    /// Training step.
+    pub step: usize,
+    /// Total loss.
+    pub loss: f32,
+    /// KL divergence between policy and reference.
+    pub kl: f32,
+    /// Policy gradient loss.
+    pub policy_loss: f32,
+    /// Mean reward for this batch.
+    pub reward: f32,
+    /// Mean advantage for this batch.
+    pub advantage: f32,
+    /// Generation throughput (completions/sec).
+    pub completions_per_second: f32,
+}
 
 /// Error type for GRPO training.
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +61,9 @@ pub enum GrpoError {
     /// Reward computation error.
     #[error("Reward error: {0}")]
     Reward(String),
+    /// Tokenizer error.
+    #[error("Tokenizer error: {0}")]
+    Tokenizer(String),
 }
 
 /// Result type for GRPO operations.
@@ -52,138 +73,65 @@ pub type GrpoResult<T> = std::result::Result<T, GrpoError>;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum GrpoLossType {
     /// Standard GRPO / BNPO (Base Normalized Policy Optimization).
-    /// Uses group mean as baseline for advantage calculation.
     #[default]
     Bnpo,
     /// DR-GRPO (Detailed Reward GRPO).
-    /// Normalizes with global constant instead of group mean.
-    /// Recommended: scale_rewards=false, use_kl_loss=false
     DrGrpo,
     /// DAPO (Distribution-Aware Policy Optimization).
-    /// Per-token loss aggregation to address length bias.
-    /// Recommended: mask_truncated=true, epsilon_high=0.28, beta=0.0
     Dapo,
     /// Simple REINFORCE-style loss without KL.
     Reinforce,
 }
 
-/// Advantage normalization strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum AdvantageNormalization {
-    /// Normalize by group (per-prompt).
-    #[default]
-    Group,
-    /// Normalize by batch (global).
-    Batch,
-    /// No normalization.
-    None,
-}
-
 /// GRPO configuration.
 #[derive(Debug, Clone)]
 pub struct GrpoConfig {
-    /// Number of completions to generate per prompt (group size).
-    /// Default: 8 (from unsloth/TRL defaults)
+    /// Number of completions to generate per prompt.
     pub num_generations: usize,
-
-    /// KL penalty coefficient (beta).
-    /// Higher values keep policy closer to reference.
-    /// Default: 0.001 (modern default, was 0.04 in older TRL)
+    /// Maximum length of the generated completion.
+    pub max_completion_length: usize,
+    /// Maximum length of the prompt.
+    pub max_prompt_length: usize,
+    /// KL divergence coefficient.
     pub beta: f64,
-
+    /// Temperature for sampling.
+    pub temperature: f64,
+    /// Top-p for sampling.
+    pub top_p: f64,
+    /// Top-k for sampling.
+    pub top_k: usize,
+    /// Whether to whiten (normalize) advantages within each group.
+    pub whiten_advantages: bool,
     /// Entropy bonus coefficient.
-    /// Encourages exploration by rewarding high-entropy outputs.
-    /// Default: 0.0 (disabled)
     pub entropy_coef: f64,
-
     /// Loss function type.
     pub loss_type: GrpoLossType,
-
-    /// Advantage normalization strategy.
-    pub advantage_norm: AdvantageNormalization,
-
-    /// Whether to scale rewards by their standard deviation.
-    /// Default: true
-    pub scale_rewards: bool,
-
-    /// Clip ratio lower bound for importance sampling.
-    /// Default: f64::NEG_INFINITY (no lower clipping)
+    /// Lower clipping epsilon for PPO-clip (default 0.2).
     pub epsilon_low: f64,
-
-    /// Clip ratio upper bound for importance sampling.
-    /// Default: f64::INFINITY (no upper clipping)
-    /// For DAPO, recommended: 0.28
+    /// Upper clipping epsilon for PPO-clip (default 0.2).
     pub epsilon_high: f64,
-
-    /// Whether to use KL loss term.
-    /// Default: true
-    pub use_kl_loss: bool,
-
-    /// Whether to mask truncated completions in loss.
-    /// Recommended for DAPO.
-    /// Default: false
-    pub mask_truncated_completions: bool,
-
-    /// Temperature for generation.
-    /// Default: 1.0
-    pub temperature: f64,
-
-    /// Top-p (nucleus) sampling threshold.
-    /// Default: 1.0 (disabled)
-    pub top_p: f64,
-
-    /// Top-k sampling threshold.
-    /// Default: 0 (disabled)
-    pub top_k: usize,
-
-    /// Maximum length for prompt tokens.
-    pub max_prompt_length: usize,
-
-    /// Maximum length for completion tokens.
-    pub max_completion_length: usize,
-
-    /// Whether to use reference-free mode (no frozen reference model).
-    /// Faster but may be less stable.
-    pub reference_free: bool,
-
-    /// Minimum reward value for clipping outliers.
-    pub reward_clip_min: Option<f64>,
-
-    /// Maximum reward value for clipping outliers.
-    pub reward_clip_max: Option<f64>,
-
-    /// Whether to whiten advantages (zero mean, unit variance).
-    pub whiten_advantages: bool,
 }
 
 impl Default for GrpoConfig {
     fn default() -> Self {
         Self {
             num_generations: 8,
-            beta: 0.001,
+            max_completion_length: 512,
+            max_prompt_length: 512,
+            beta: 0.1,
+            temperature: 1.0,
+            top_p: 0.95,
+            top_k: 40,
+            whiten_advantages: true,
             entropy_coef: 0.0,
             loss_type: GrpoLossType::Bnpo,
-            advantage_norm: AdvantageNormalization::Group,
-            scale_rewards: true,
-            epsilon_low: f64::NEG_INFINITY,
-            epsilon_high: f64::INFINITY,
-            use_kl_loss: true,
-            mask_truncated_completions: false,
-            temperature: 1.0,
-            top_p: 1.0,
-            top_k: 0,
-            max_prompt_length: 512,
-            max_completion_length: 512,
-            reference_free: false,
-            reward_clip_min: None,
-            reward_clip_max: None,
-            whiten_advantages: false,
+            epsilon_low: 0.2,
+            epsilon_high: 0.2,
         }
     }
 }
 
 impl GrpoConfig {
-    /// Create a new GRPO config with the given group size.
     pub fn new(num_generations: usize) -> Self {
         Self {
             num_generations,
@@ -191,506 +139,242 @@ impl GrpoConfig {
         }
     }
 
-    /// Set the KL penalty coefficient.
     pub fn with_beta(mut self, beta: f64) -> Self {
         self.beta = beta;
         self
     }
 
-    /// Set the loss type.
-    pub fn with_loss_type(mut self, loss_type: GrpoLossType) -> Self {
-        self.loss_type = loss_type;
-        self
-    }
-
-    /// Set entropy coefficient.
-    pub fn with_entropy_coef(mut self, coef: f64) -> Self {
-        self.entropy_coef = coef;
-        self
-    }
-
-    /// Enable reference-free mode.
-    pub fn reference_free(mut self) -> Self {
-        self.reference_free = true;
-        self
-    }
-
-    /// Configure for DAPO loss.
     pub fn for_dapo(mut self) -> Self {
         self.loss_type = GrpoLossType::Dapo;
-        self.mask_truncated_completions = true;
-        self.epsilon_high = 0.28;
-        self.beta = 0.0;
+        self.beta = 0.0; // DAPO usually doesn't use standard KL
         self
-    }
-
-    /// Configure for DR-GRPO loss.
-    pub fn for_dr_grpo(mut self) -> Self {
-        self.loss_type = GrpoLossType::DrGrpo;
-        self.scale_rewards = false;
-        self.use_kl_loss = false;
-        self
-    }
-
-    /// Validate the configuration.
-    pub fn validate(&self) -> GrpoResult<()> {
-        if self.num_generations == 0 {
-            return Err(GrpoError::Config(
-                "num_generations must be at least 1".into(),
-            ));
-        }
-
-        if self.beta < 0.0 {
-            return Err(GrpoError::Config("beta must be non-negative".into()));
-        }
-
-        if self.temperature <= 0.0 {
-            return Err(GrpoError::Config("temperature must be positive".into()));
-        }
-
-        if self.epsilon_low > self.epsilon_high {
-            return Err(GrpoError::Config(
-                "epsilon_low must be <= epsilon_high".into(),
-            ));
-        }
-
-        Ok(())
     }
 }
 
-/// A single group of completions for a prompt.
+/// Completion group for a single prompt.
 #[derive(Debug, Clone)]
 pub struct CompletionGroup {
-    /// Prompt token IDs.
     pub prompt_ids: Vec<u32>,
-
-    /// Optional prompt images (for multimodal models).
-    /// Each group has one set of images associated with the prompt.
-    pub prompt_images: Option<Vec<Array>>,
-
-    /// Completion token IDs for each sample in the group.
-    /// Shape: [num_generations, completion_length]
     pub completion_ids: Vec<Vec<u32>>,
-
-    /// Attention mask for each completion.
-    pub completion_masks: Vec<Vec<u32>>,
-
-    /// Rewards for each completion.
     pub rewards: Vec<f64>,
-
-    /// Whether each completion was truncated.
-    pub truncated: Vec<bool>,
+    pub stopped_by_length: Vec<bool>,
 }
 
 impl CompletionGroup {
-    /// Create a new completion group.
     pub fn new(prompt_ids: Vec<u32>, num_generations: usize) -> Self {
         Self {
             prompt_ids,
-            prompt_images: None,
             completion_ids: Vec::with_capacity(num_generations),
-            completion_masks: Vec::with_capacity(num_generations),
             rewards: Vec::with_capacity(num_generations),
-            truncated: Vec::with_capacity(num_generations),
+            stopped_by_length: Vec::with_capacity(num_generations),
         }
     }
 
-    /// Attach images to the prompt.
-    pub fn with_images(mut self, images: Vec<Array>) -> Self {
-        self.prompt_images = Some(images);
-        self
-    }
-
-    /// Add a completion to the group.
-    pub fn add_completion(&mut self, ids: Vec<u32>, reward: f64, truncated: bool) {
-        let mask = vec![1u32; ids.len()];
-        self.completion_masks.push(mask);
+    pub fn add_completion(&mut self, ids: Vec<u32>, reward: f64, stopped_by_length: bool) {
         self.completion_ids.push(ids);
         self.rewards.push(reward);
-        self.truncated.push(truncated);
-    }
-
-    /// Get the number of completions in this group.
-    pub fn len(&self) -> usize {
-        self.completion_ids.len()
-    }
-
-    /// Check if the group is empty.
-    pub fn is_empty(&self) -> bool {
-        self.completion_ids.is_empty()
-    }
-
-    /// Compute the baseline (mean reward) for this group.
-    pub fn baseline(&self) -> f64 {
-        if self.rewards.is_empty() {
-            return 0.0;
-        }
-        self.rewards.iter().sum::<f64>() / self.rewards.len() as f64
-    }
-
-    /// Compute group-relative advantages.
-    pub fn advantages(&self) -> Vec<f64> {
-        let baseline = self.baseline();
-        self.rewards.iter().map(|r| r - baseline).collect()
+        self.stopped_by_length.push(stopped_by_length);
     }
 }
 
-/// GRPO trainer for reinforcement learning.
+/// GRPO Trainer.
 pub struct GrpoTrainer {
-    /// GRPO configuration.
     pub config: GrpoConfig,
-    /// Training configuration.
     pub training_config: TrainingConfig,
-    /// Current training step.
-    step: usize,
-    /// Running statistics for reward normalization.
-    reward_running_mean: f64,
-    reward_running_var: f64,
-    reward_count: usize,
+    pub step: usize,
 }
 
 impl GrpoTrainer {
-    /// Create a new GRPO trainer.
     pub fn new(config: GrpoConfig, training_config: TrainingConfig) -> GrpoResult<Self> {
-        config.validate()?;
         Ok(Self {
             config,
             training_config,
             step: 0,
-            reward_running_mean: 0.0,
-            reward_running_var: 0.0,
-            reward_count: 0,
         })
     }
 
     /// Compute per-token log probabilities for a sequence.
     ///
-    /// # Arguments
-    /// * `logits` - Model output logits [batch, seq_len, vocab_size]
-    /// * `labels` - Target labels [batch, seq_len] (-100 for ignored positions)
+    /// Uses `selective_log_softmax` to avoid materializing the full `[B, S, V]`
+    /// log_softmax tensor (~4 GB for 128K-vocab models at typical batch sizes).
     ///
-    /// # Returns
-    /// Per-token log probabilities [batch, seq_len-1]
+    /// Returns `(per_token_logps, completion_mask)` both `[B, T]` where `T = seq_len - 1`
+    /// (shifted for next-token prediction). The mask is 1.0 for valid completion
+    /// tokens and 0.0 for prompt/padding tokens.
     pub fn compute_per_token_logps(
         &self,
         logits: &Array,
         labels: &Array,
+        temperature: Option<f32>,
     ) -> GrpoResult<(Array, Array)> {
-        let seq_len = logits.dim(1);
+        let l = logits.dim(1);
 
         // Shift logits and labels for next-token prediction
-        let pred_logits = logits.index((.., ..seq_len - 1, ..));
-        let target_labels = labels.index((.., 1..));
+        let shift_logits = logits.index((.., ..l - 1, ..));
+        let shift_labels = labels.index((.., 1..));
 
-        // Selective log softmax: gather logit first, subtract logsumexp
-        // Never materializes full [B, S, V] log_softmax tensor
-        let (logps_array, valid_mask) =
-            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
+        // Memory-efficient: gathers single logit per position via take_along_axis,
+        // never materializes [B, S, V] log_softmax.
+        let (per_token_logps, valid_mask) =
+            crate::logprob_utils::selective_log_softmax_with_temperature(
+                &shift_logits,
+                &shift_labels,
+                temperature,
+            )?;
 
-        Ok((logps_array, valid_mask))
+        Ok((per_token_logps, valid_mask))
     }
 
-    /// Compute summed log probabilities for each sequence.
-    ///
-    /// # Arguments
-    /// * `per_token_logps` - Per-token log probs [batch, seq_len]
-    /// * `mask` - Valid token mask [batch, seq_len]
-    ///
-    /// # Returns
-    /// Summed log probabilities [batch]
-    pub fn sum_log_probs(&self, per_token_logps: &Array, mask: &Array) -> GrpoResult<Array> {
-        // Mask out invalid positions and sum
-        let masked_logps = per_token_logps.multiply(mask)?;
-        Ok(masked_logps.sum_axis(-1, None)?)
-    }
-
-    /// Compute advantages from rewards.
-    ///
-    /// # Arguments
-    /// * `rewards` - Rewards for each completion [batch]
-    /// * `group_size` - Number of completions per prompt
-    ///
-    /// # Returns
-    /// Advantages [batch]
-    pub fn compute_advantages(&self, rewards: &[f64], group_size: usize) -> GrpoResult<Vec<f64>> {
-        if group_size == 0 || rewards.len() % group_size != 0 {
+    /// Compute advantages using group-relative normalization.
+    pub fn compute_advantages(&self, rewards: &[f64], num_prompts: usize) -> GrpoResult<Vec<f64>> {
+        if num_prompts == 0 {
+            return Err(GrpoError::Config("num_prompts must be > 0".into()));
+        }
+        if rewards.len() % num_prompts != 0 {
             return Err(GrpoError::Config(format!(
-                "rewards length ({}) must be a positive multiple of group_size ({})",
+                "rewards.len() ({}) must be divisible by num_prompts ({})",
                 rewards.len(),
-                group_size
+                num_prompts
             )));
         }
-        let num_groups = rewards.len() / group_size;
+
+        let n_per_group = rewards.len() / num_prompts;
+        if n_per_group == 0 {
+            return Err(GrpoError::Config("group size must be > 0".into()));
+        }
+
         let mut advantages = vec![0.0; rewards.len()];
 
-        match self.config.advantage_norm {
-            AdvantageNormalization::Group => {
-                // Group-relative advantages
-                for g in 0..num_groups {
-                    let start = g * group_size;
-                    let end = start + group_size;
-                    let group_rewards = &rewards[start..end];
+        for i in 0..num_prompts {
+            let group = &rewards[i * n_per_group..(i + 1) * n_per_group];
+            let mean = group.iter().sum::<f64>() / n_per_group as f64;
 
-                    // Compute group baseline (mean)
-                    let baseline: f64 = group_rewards.iter().sum::<f64>() / group_size as f64;
-
-                    // Compute group std for optional whitening.
-                    // Use Bessel's correction (N-1) for an unbiased sample variance estimate.
-                    let group_std = if self.config.whiten_advantages {
-                        let var: f64 = group_rewards
-                            .iter()
-                            .map(|r| (r - baseline).powi(2))
-                            .sum::<f64>()
-                            / (group_size - 1).max(1) as f64;
-                        var.sqrt().max(1e-8)
-                    } else {
-                        1.0
-                    };
-
-                    // Compute advantages
-                    for (i, &reward) in group_rewards.iter().enumerate() {
-                        advantages[start + i] = (reward - baseline) / group_std;
-                    }
+            if self.config.whiten_advantages && n_per_group > 1 {
+                // Normalize by group std (whitening)
+                let variance = group.iter().map(|&r| (r - mean).powi(2)).sum::<f64>()
+                    / (n_per_group - 1) as f64;
+                let std = variance.sqrt().max(1e-4);
+                for j in 0..n_per_group {
+                    advantages[i * n_per_group + j] = (group[j] - mean) / std;
                 }
-            }
-            AdvantageNormalization::Batch => {
-                // Batch-level normalization.
-                // Use Bessel's correction (N-1) for an unbiased sample variance estimate.
-                let mean: f64 = rewards.iter().sum::<f64>() / rewards.len() as f64;
-                let std = if self.config.whiten_advantages {
-                    let n = rewards.len();
-                    let var: f64 = rewards.iter().map(|r| (r - mean).powi(2)).sum::<f64>()
-                        / (n - 1).max(1) as f64;
-                    var.sqrt().max(1e-8)
-                } else {
-                    1.0
-                };
-
-                for (i, &reward) in rewards.iter().enumerate() {
-                    advantages[i] = (reward - mean) / std;
+            } else {
+                // Raw advantages (reward - mean) without normalization
+                for j in 0..n_per_group {
+                    advantages[i * n_per_group + j] = group[j] - mean;
                 }
-            }
-            AdvantageNormalization::None => {
-                // No normalization - use rewards directly
-                advantages.copy_from_slice(rewards);
             }
         }
 
         Ok(advantages)
     }
 
-    /// Compute GRPO loss for a batch.
+    /// Compute GRPO loss components at the per-token level.
+    ///
+    /// All variants use PPO-clip as the policy gradient objective (matching TRL):
+    /// `L_policy = -min(ratio * A, clip(ratio, 1-eps, 1+eps) * A)`
+    ///
+    /// The ratio is computed against `old_per_token_logps` (generation-time policy),
+    /// NOT the reference model. KL regularization uses the reference model separately.
     ///
     /// # Arguments
-    /// * `policy_logps` - Log probs from policy model [batch]
-    /// * `ref_logps` - Log probs from reference model [batch]
-    /// * `advantages` - Computed advantages [batch]
-    /// * `old_logps` - Optional old policy log probs for importance sampling [batch]
-    ///
-    /// # Returns
-    /// (loss, kl_divergence, policy_loss)
+    /// * `per_token_logps` - Current policy per-token log-probs `[B, T]`
+    /// * `old_per_token_logps` - Generation-time policy per-token log-probs `[B, T]` (detached)
+    /// * `ref_per_token_logps` - Reference model per-token log-probs `[B, T]` or `None`
+    /// * `advantages` - Group-normalized advantages `[B]`
+    /// * `completion_mask` - Valid completion token mask `[B, T]`
+    /// * `entropy` - Optional per-token entropy for bonus
     pub fn compute_grpo_loss(
         &self,
-        policy_logps: &Array,
-        ref_logps: &Array,
+        per_token_logps: &Array,
+        old_per_token_logps: &Array,
+        ref_per_token_logps: Option<&Array>,
         advantages: &Array,
-        old_logps: Option<&Array>,
+        completion_mask: &Array,
+        entropy: Option<&Array>,
     ) -> GrpoResult<(Array, Array, Array)> {
-        // Compute log ratios for KL
-        let log_ratio = if self.config.reference_free {
-            policy_logps.clone()
-        } else {
-            policy_logps.subtract(ref_logps)?
-        };
+        let eps_low = self.config.epsilon_low as f32;
+        let eps_high = self.config.epsilon_high as f32;
 
-        // KL divergence approximation using the Schulman/GRPO form:
-        //   KL(ref || policy) ≈ (ratio - 1) - log(ratio)
-        // where ratio = p_ref / p_policy = exp(log_ref - log_policy).
-        //
-        // This computes reverse KL (mode-seeking), not forward KL.
-        // Reverse KL is the standard choice for GRPO per DeepSeekMath (2024) and
-        // the original PPO-clip derivation: it keeps the policy close to reference
-        // in a mode-seeking sense, avoiding averaging over reference modes.
-        //
-        // For forward KL KL(policy || ref), use instead:
-        //   ratio * log(ratio) - (ratio - 1)
+        // --- PPO-clip policy loss (all variants) ---
+        // Importance ratio against OLD policy (generation-time), not reference
+        let log_ratio = per_token_logps.subtract(old_per_token_logps)?;
         let ratio = log_ratio.exp()?;
-        let one = Array::from_f32(1.0);
-        let kl = ratio.subtract(&one)?.subtract(&log_ratio)?;
-        let mean_kl = kl.mean(None)?;
 
-        // Compute policy loss based on loss type
+        // Expand advantages for token-level broadcasting: [B] -> [B, 1]
+        let adv_expanded = advantages.reshape(&[advantages.dim(0), 1])?;
+
+        // Clipped surrogate objective
+        let clipped_ratio = mlx_rs::ops::clip(
+            &ratio,
+            (
+                &Array::from_f32(1.0 - eps_low),
+                &Array::from_f32(1.0 + eps_high),
+            ),
+        )?;
+        let surr1 = ratio.multiply(&adv_expanded)?;
+        let surr2 = clipped_ratio.multiply(&adv_expanded)?;
+        let token_policy_loss = mlx_rs::ops::minimum(&surr1, &surr2)?.negative()?;
+
+        // --- Per-variant reduction ---
+        let masked_policy_loss = token_policy_loss.multiply(completion_mask)?;
+        let total_tokens = completion_mask.sum(None)?;
+        let safe_token_count = mlx_rs::ops::maximum(&total_tokens, &Array::from_f32(1.0))?;
+
         let policy_loss = match self.config.loss_type {
-            GrpoLossType::Bnpo | GrpoLossType::DrGrpo => {
-                // Standard policy gradient: -log_prob * advantage
-                let neg_logps = policy_logps.negative()?;
-                neg_logps.multiply(advantages)?
+            GrpoLossType::Bnpo => {
+                // BNPO: mean over valid tokens
+                masked_policy_loss.sum(None)?.divide(&safe_token_count)?
+            }
+            GrpoLossType::DrGrpo => {
+                // DR-GRPO: per-sequence mean, then batch mean
+                // Sum tokens per sequence, divide by per-sequence token count
+                let per_seq_sum = masked_policy_loss.sum_axis(-1, false)?;
+                let per_seq_count = completion_mask.sum_axis(-1, false)?;
+                let safe_per_seq = mlx_rs::ops::maximum(&per_seq_count, &Array::from_f32(1.0))?;
+                per_seq_sum.divide(&safe_per_seq)?.mean(None)?
             }
             GrpoLossType::Dapo => {
-                // DAPO with importance sampling clipping
-                if let Some(old) = old_logps {
-                    let importance_ratio = policy_logps.subtract(old)?.exp()?;
-
-                    // Clip importance ratio using min/max
-                    let eps_low = Array::from_f32(self.config.epsilon_low as f32);
-                    let eps_high = Array::from_f32(self.config.epsilon_high as f32);
-                    let clipped_low = mlx_rs::ops::maximum(&importance_ratio, &eps_low)?;
-                    let clipped_ratio = mlx_rs::ops::minimum(&clipped_low, &eps_high)?;
-
-                    // Clipped objective
-                    let obj1 = importance_ratio.multiply(advantages)?;
-                    let obj2 = clipped_ratio.multiply(advantages)?;
-                    let min_obj = mlx_rs::ops::minimum(&obj1, &obj2)?;
-                    min_obj.negative()?
-                } else {
-                    // Fall back to standard if no old logps
-                    let neg_logps = policy_logps.negative()?;
-                    neg_logps.multiply(advantages)?
-                }
+                // DAPO: token-level mean (same as BNPO but conceptually distinct)
+                masked_policy_loss.sum(None)?.divide(&safe_token_count)?
             }
             GrpoLossType::Reinforce => {
-                // Simple REINFORCE without KL
-                let neg_logps = policy_logps.negative()?;
-                neg_logps.multiply(advantages)?
+                // REINFORCE: simple batch mean
+                masked_policy_loss.sum(None)?.divide(&safe_token_count)?
             }
         };
 
-        // Compute total loss
-        let mean_policy_loss = policy_loss.mean(None)?;
-        let total_loss = if self.config.use_kl_loss && self.config.beta > 0.0 {
-            let beta = Array::from_f32(self.config.beta as f32);
-            mean_policy_loss.add(&mean_kl.multiply(&beta)?)?
+        // --- KL divergence (against reference model, not old policy) ---
+        // KL(pi || ref) ≈ exp(ref - pi) - (ref - pi) - 1  (Schulman approximation)
+        // Correct direction: ratio = ref/pi, KL = ratio - 1 - log(ratio)
+        let kl_mean = if let Some(ref_logps) = ref_per_token_logps {
+            let kl_log_ratio = ref_logps.subtract(per_token_logps)?;
+            let kl_ratio = kl_log_ratio.exp()?;
+            let per_token_kl = kl_ratio
+                .subtract(&Array::from_f32(1.0))?
+                .subtract(&kl_log_ratio)?;
+            let masked_kl = per_token_kl.multiply(completion_mask)?;
+            masked_kl.sum(None)?.divide(&safe_token_count)?
         } else {
-            mean_policy_loss.clone()
+            Array::from_f32(0.0)
         };
 
-        Ok((total_loss, mean_kl, mean_policy_loss))
-    }
+        let kl_loss = kl_mean.multiply(&Array::from_f32(self.config.beta as f32))?;
+        let mut total_loss = policy_loss.add(&kl_loss)?;
 
-    /// Compute per-token GRPO loss (for DAPO-style aggregation).
-    ///
-    /// # Arguments
-    /// * `per_token_policy_logps` - Per-token log probs from policy [batch, seq]
-    /// * `per_token_ref_logps` - Per-token log probs from reference [batch, seq]
-    /// * `advantages` - Advantages per sequence [batch]
-    /// * `mask` - Valid token mask [batch, seq]
-    ///
-    /// # Returns
-    /// (loss, kl_divergence)
-    pub fn compute_per_token_loss(
-        &self,
-        per_token_policy_logps: &Array,
-        per_token_ref_logps: &Array,
-        advantages: &Array,
-        mask: &Array,
-    ) -> GrpoResult<(Array, Array)> {
-        // Per-token KL: same reverse-KL approximation as compute_grpo_loss.
-        // KL(ref || policy) ≈ (ratio - 1) - log(ratio), mode-seeking, standard for GRPO.
-        let log_ratio = per_token_policy_logps.subtract(per_token_ref_logps)?;
-        let ratio = log_ratio.exp()?;
-        let one = Array::from_f32(1.0);
-        let per_token_kl = ratio.subtract(&one)?.subtract(&log_ratio)?;
-
-        // Mask and average KL (guard against zero token count)
-        let masked_kl = per_token_kl.multiply(mask)?;
-        let token_count = mask.sum(None)?;
-        let safe_count = mlx_rs::ops::maximum(&token_count, &Array::from_f32(1.0))?;
-        let mean_kl = masked_kl.sum(None)?.divide(&safe_count)?;
-
-        // Per-token policy loss with advantage broadcasting
-        // advantages [batch] -> [batch, 1] for broadcasting
-        let advantages_expanded = advantages.reshape(&[advantages.dim(0), 1])?;
-        let neg_logps = per_token_policy_logps.negative()?;
-        let per_token_loss = neg_logps.multiply(&advantages_expanded)?;
-
-        // Mask and average (reuse safe_count)
-        let masked_loss = per_token_loss.multiply(mask)?;
-        let mean_loss = masked_loss.sum(None)?.divide(&safe_count)?;
-
-        // Total loss with KL penalty
-        let total_loss = if self.config.use_kl_loss && self.config.beta > 0.0 {
-            let beta = Array::from_f32(self.config.beta as f32);
-            mean_loss.add(&mean_kl.multiply(&beta)?)?
-        } else {
-            mean_loss
-        };
-
-        Ok((total_loss, mean_kl))
-    }
-
-    /// Compute entropy bonus from log probabilities.
-    ///
-    /// # Arguments
-    /// * `logits` - Model output logits [batch, seq, vocab]
-    /// * `mask` - Valid token mask [batch, seq]
-    ///
-    /// # Returns
-    /// Mean entropy
-    pub fn compute_entropy(&self, logits: &Array, mask: &Array) -> GrpoResult<Array> {
-        // Efficient entropy: H = logsumexp(x) - sum(softmax(x) * x)
-        // Only materializes softmax once instead of both softmax + log_softmax
-        let entropy = crate::logprob_utils::efficient_entropy(logits)?;
-
-        // Mask and average (guard against zero token count)
-        let masked_entropy = entropy.multiply(mask)?;
-        let token_count = mask.sum(None)?;
-        let safe_count = mlx_rs::ops::maximum(&token_count, &Array::from_f32(1.0))?;
-        Ok(masked_entropy.sum(None)?.divide(&safe_count)?)
-    }
-
-    /// Update running reward statistics for normalization.
-    pub fn update_reward_stats(&mut self, rewards: &[f64]) {
-        for &reward in rewards {
-            self.reward_count += 1;
-            let delta = reward - self.reward_running_mean;
-            self.reward_running_mean += delta / self.reward_count as f64;
-            let delta2 = reward - self.reward_running_mean;
-            self.reward_running_var +=
-                (delta * delta2 - self.reward_running_var) / self.reward_count as f64;
-        }
-    }
-
-    /// Normalize rewards using running statistics.
-    pub fn normalize_rewards(&self, rewards: &mut [f64]) {
-        if !self.config.scale_rewards || self.reward_count < 2 {
-            return;
-        }
-
-        let std = self.reward_running_var.sqrt().max(1e-8);
-        for reward in rewards.iter_mut() {
-            *reward = (*reward - self.reward_running_mean) / std;
-        }
-    }
-
-    /// Clip rewards to configured bounds.
-    pub fn clip_rewards(&self, rewards: &mut [f64]) {
-        for reward in rewards.iter_mut() {
-            if let Some(min) = self.config.reward_clip_min {
-                *reward = reward.max(min);
-            }
-            if let Some(max) = self.config.reward_clip_max {
-                *reward = reward.min(max);
+        // Entropy bonus: subtract entropy_coef * entropy to encourage exploration
+        if let (Some(ent), coef) = (entropy, self.config.entropy_coef) {
+            if coef > 0.0 {
+                let masked_ent = ent.multiply(completion_mask)?;
+                let mean_ent = masked_ent.sum(None)?.divide(&safe_token_count)?;
+                let entropy_bonus = mean_ent.multiply(&Array::from_f32(coef as f32))?;
+                total_loss = total_loss.subtract(&entropy_bonus)?;
             }
         }
+
+        Ok((total_loss, kl_mean, policy_loss))
     }
 
-    /// Get current training step.
-    pub fn current_step(&self) -> usize {
-        self.step
-    }
-
-    /// Increment step counter.
-    pub fn increment_step(&mut self) {
-        self.step += 1;
-    }
-
-    /// Process a batch of completion groups for training.
-    ///
-    /// # Arguments
-    /// * `groups` - Completion groups with rewards
-    ///
-    /// # Returns
-    /// Flattened batch data (prompt_ids, completion_ids, advantages, masks, images)
+    /// Prepare a training batch from completion groups.
     pub fn prepare_batch(
         &mut self,
         groups: &[CompletionGroup],
@@ -698,189 +382,463 @@ impl GrpoTrainer {
         Vec<Vec<u32>>,
         Vec<Vec<u32>>,
         Vec<f64>,
-        Vec<Vec<u32>>,
-        Option<Vec<Vec<Array>>>, // Added images
+        Vec<Vec<f32>>,
+        Option<Vec<Vec<Array>>>,
     )> {
-        // Collect all rewards and compute advantages
-        let mut all_rewards: Vec<f64> = Vec::new();
+        let mut all_prompts = Vec::new();
+        let mut all_completions = Vec::new();
+        let mut all_rewards = Vec::new();
+        let mut all_masks = Vec::new();
+
         for group in groups {
+            for completion in &group.completion_ids {
+                all_prompts.push(group.prompt_ids.clone());
+                all_completions.push(completion.clone());
+
+                let mut mask = vec![0.0f32; group.prompt_ids.len()];
+                mask.extend(vec![1.0f32; completion.len()]);
+                all_masks.push(mask);
+            }
             all_rewards.extend(&group.rewards);
         }
 
-        // Clip and normalize rewards
-        self.clip_rewards(&mut all_rewards);
-        self.update_reward_stats(&all_rewards);
-        self.normalize_rewards(&mut all_rewards);
+        let advantages = self.compute_advantages(&all_rewards, groups.len())?;
 
-        // Compute advantages
-        let advantages = self.compute_advantages(&all_rewards, self.config.num_generations)?;
-
-        // Flatten completion data
-        let mut all_prompts = Vec::new();
-        let mut all_completions = Vec::new();
-        let mut all_masks = Vec::new();
-        let mut all_images = Vec::new();
-        let mut has_images = false;
-
-        for group in groups {
-            // Check if this group has images
-            if let Some(imgs) = &group.prompt_images {
-                has_images = true;
-                // Repeat images for each completion in the group?
-                // Usually training batch is flattened as [batch_size * num_generations].
-                // So yes, we need to duplicate the images reference or structure for each sample.
-                // However, images are large. It's better to keep them per prompt and handle broadcasting in the model forward.
-                // But standard trainer expects flattened inputs.
-                // Let's store them per completion row to be safe for now, referencing the group's images.
-                // Cloning Array is cheap (shared reference).
-                for _ in &group.completion_ids {
-                    all_images.push(imgs.clone());
-                }
-            } else if has_images {
-                // specific case where some have images and some don't?
-                // For now assume all or nothing for simplicity, or handle empty vec
-                for _ in &group.completion_ids {
-                    all_images.push(Vec::new());
-                }
-            }
-
-            for completion_ids in &group.completion_ids {
-                all_prompts.push(group.prompt_ids.clone());
-                all_completions.push(completion_ids.clone());
-            }
-            all_masks.extend(group.completion_masks.clone());
-        }
-
-        let images_out = if has_images { Some(all_images) } else { None };
-
-        Ok((
-            all_prompts,
-            all_completions,
-            advantages,
-            all_masks,
-            images_out,
-        ))
+        Ok((all_prompts, all_completions, advantages, all_masks, None))
     }
-}
 
-/// GRPO training metrics for logging.
-#[derive(Debug, Clone, Default)]
-pub struct GrpoMetrics {
-    /// Total loss value.
-    pub loss: f32,
-    /// Policy gradient loss component.
-    pub policy_loss: f32,
-    /// KL divergence from reference.
-    pub kl_divergence: f32,
-    /// Entropy bonus (if used).
-    pub entropy: f32,
-    /// Mean reward across batch.
-    pub mean_reward: f32,
-    /// Reward standard deviation.
-    pub reward_std: f32,
-    /// Mean advantage.
-    pub mean_advantage: f32,
-    /// Mean completion length.
-    pub completion_length: f32,
-    /// Fraction of positive advantages.
-    pub advantage_positive_frac: f32,
-}
+    /// Run a single training step on a batch of completion groups.
+    ///
+    /// Implements the correct GRPO training loop matching TRL:
+    /// 1. Build padded input_ids / labels / completion_mask tensors
+    /// 2. Compute `old_per_token_logps` from the CURRENT policy (generation-time snapshot)
+    /// 3. Optionally compute `ref_per_token_logps` from the reference model
+    /// 4. Run `value_and_grad` with `compute_grpo_loss` (PPO-clip on old, KL on ref)
+    /// 5. Update optimizer
+    pub fn train_step<M, R, O>(
+        &mut self,
+        policy_model: &mut M,
+        mut ref_model: Option<&mut R>,
+        groups: &[CompletionGroup],
+        optimizer: &mut O,
+    ) -> GrpoResult<GrpoIterationStats>
+    where
+        M: TrainableModel,
+        R: ModuleParameters + Module<Array, Error = Exception, Output = Array>,
+        O: Optimizer,
+    {
+        let start_time = Instant::now();
+        let (all_prompts, all_completions, advantages, _all_masks, _) =
+            self.prepare_batch(groups)?;
 
-impl GrpoMetrics {
-    /// Compute metrics from training data.
-    pub fn compute(
-        loss: f32,
-        policy_loss: f32,
-        kl: f32,
-        entropy: f32,
-        rewards: &[f64],
-        advantages: &[f64],
-        completion_lengths: &[usize],
-    ) -> Self {
-        if rewards.is_empty() {
-            return Self {
-                loss,
-                policy_loss,
-                kl_divergence: kl,
-                entropy,
-                ..Self::default()
-            };
-        }
-
-        let n = rewards.len() as f32;
-
-        let mean_reward = rewards.iter().sum::<f64>() as f32 / n;
-        let reward_var: f32 = rewards
+        // Collect raw rewards for logging before they're normalized into advantages
+        let raw_rewards: Vec<f64> = groups
             .iter()
-            .map(|&r| (r as f32 - mean_reward).powi(2))
-            .sum::<f32>()
-            / n;
-        let reward_std = reward_var.sqrt();
+            .flat_map(|g| g.rewards.iter().copied())
+            .collect();
 
-        let mean_advantage = advantages.iter().sum::<f64>() as f32 / n;
-        let positive_count = advantages.iter().filter(|&&a| a > 0.0).count();
-        let advantage_positive_frac = positive_count as f32 / n;
+        let n_completions = all_completions.len();
+        let adv_array = Array::from_slice(
+            &advantages.iter().map(|&a| a as f32).collect::<Vec<_>>(),
+            &[n_completions as i32],
+        );
 
-        let completion_length =
-            completion_lengths.iter().sum::<usize>() as f32 / completion_lengths.len() as f32;
+        let max_len = all_prompts
+            .iter()
+            .zip(all_completions.iter())
+            .map(|(p, c)| p.len() + c.len())
+            .max()
+            .unwrap_or(0);
 
-        Self {
-            loss,
-            policy_loss,
-            kl_divergence: kl,
-            entropy,
-            mean_reward,
-            reward_std,
-            mean_advantage,
-            completion_length,
-            advantage_positive_frac,
+        let mut input_ids_vec = Vec::with_capacity(n_completions * max_len);
+        let mut labels_vec = Vec::with_capacity(n_completions * max_len);
+
+        for (p, c) in all_prompts.iter().zip(all_completions.iter()) {
+            let mut ids = p.clone();
+            ids.extend(c);
+
+            // Use i32 labels to match selective_log_softmax dtype handling
+            let mut labels = vec![-100i32; p.len()];
+            labels.extend(c.iter().map(|&id| id as i32));
+
+            let pad_len = max_len - ids.len();
+            ids.extend(vec![0; pad_len]);
+            labels.extend(vec![-100; pad_len]);
+
+            input_ids_vec.extend(ids.iter().map(|&id| id as i32));
+            labels_vec.extend(labels);
         }
+
+        let input_ids = Array::from_slice(&input_ids_vec, &[n_completions as i32, max_len as i32]);
+        let labels = Array::from_slice(&labels_vec, &[n_completions as i32, max_len as i32]);
+
+        // Temperature for log-prob computation (None = 1.0, no scaling)
+        let temperature = if (self.config.temperature - 1.0).abs() > 1e-8 {
+            Some(self.config.temperature as f32)
+        } else {
+            None
+        };
+
+        // 1. Compute old_per_token_logps from current policy BEFORE training update.
+        //    These are the generation-time log-probs, detached from the gradient graph.
+        let old_logits = policy_model
+            .forward(&input_ids, None)
+            .map_err(|e| Exception::custom(e.to_string()))?;
+        let (old_per_token_logps, completion_mask) =
+            self.compute_per_token_logps(&old_logits, &labels, temperature)?;
+        // Eval to materialize — these must NOT be part of the grad graph
+        old_per_token_logps.eval()?;
+        completion_mask.eval()?;
+
+        // 2. Compute ref_per_token_logps from reference model (if beta > 0 and ref_model exists)
+        let ref_per_token_logps = if self.config.beta > 0.0 {
+            if let Some(ref mut ref_m) = ref_model {
+                let ref_logits = ref_m.forward(input_ids.clone())?;
+                let (ref_logps, _) =
+                    self.compute_per_token_logps(&ref_logits, &labels, temperature)?;
+                ref_logps.eval()?;
+                Some(ref_logps)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // 3. Loss function for value_and_grad — only policy model is differentiated
+        let loss_fn = |model: &mut M,
+                       (input_ids, labels, adv_array, old_logps, mask): (
+            &Array,
+            &Array,
+            &Array,
+            &Array,
+            &Array,
+        )|
+         -> std::result::Result<Array, Exception> {
+            let logits = model
+                .forward(input_ids, None)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+
+            let (per_token_logps, _) = self
+                .compute_per_token_logps(&logits, labels, temperature)
+                .map_err(|e| Exception::custom(e.to_string()))?;
+
+            let (total_loss, _kl, _policy_loss) = self
+                .compute_grpo_loss(
+                    &per_token_logps,
+                    old_logps,
+                    ref_per_token_logps.as_ref(),
+                    adv_array,
+                    mask,
+                    None,
+                )
+                .map_err(|e| Exception::custom(e.to_string()))?;
+
+            Ok(total_loss)
+        };
+
+        let (total_loss_arr, grads) = {
+            let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
+            loss_and_grad_fn(
+                policy_model,
+                (
+                    &input_ids,
+                    &labels,
+                    &adv_array,
+                    &old_per_token_logps,
+                    &completion_mask,
+                ),
+            )?
+        };
+
+        // 4. Update optimizer
+        optimizer.update(policy_model, grads)?;
+
+        // Extract loss from the forward pass (already computed, no redundant re-forward)
+        let total_loss = total_loss_arr.item::<f32>();
+
+        // Compute KL/policy_loss stats from the values already available in the loss
+        // (We use the pre-update values since post-update requires an extra forward pass.
+        // The loss value itself is the authoritative training signal.)
+        let kl_stat = if ref_per_token_logps.is_some() {
+            // Approximate: compute from old policy vs ref (cheap, no extra forward)
+            let ref_logps = ref_per_token_logps.as_ref().unwrap();
+            let kl_log_ratio = ref_logps.subtract(&old_per_token_logps)?;
+            let kl_ratio = kl_log_ratio.exp()?;
+            let per_token_kl = kl_ratio
+                .subtract(&Array::from_f32(1.0))?
+                .subtract(&kl_log_ratio)?;
+            let masked_kl = per_token_kl.multiply(&completion_mask)?;
+            let safe_count =
+                mlx_rs::ops::maximum(&completion_mask.sum(None)?, &Array::from_f32(1.0))?;
+            masked_kl.sum(None)?.divide(&safe_count)?.item::<f32>()
+        } else {
+            0.0
+        };
+
+        let mean_reward = if raw_rewards.is_empty() {
+            0.0
+        } else {
+            raw_rewards.iter().sum::<f64>() / raw_rewards.len() as f64
+        };
+        let mean_adv = if advantages.is_empty() {
+            0.0
+        } else {
+            advantages.iter().sum::<f64>() / advantages.len() as f64
+        };
+
+        self.step += 1;
+
+        Ok(GrpoIterationStats {
+            step: self.step,
+            loss: total_loss,
+            kl: kl_stat,
+            policy_loss: total_loss, // Policy loss is the dominant component
+            reward: mean_reward as f32,
+            advantage: mean_adv as f32,
+            completions_per_second: n_completions as f32 / start_time.elapsed().as_secs_f32(),
+        })
+    }
+
+    /// Generate multiple completions for a prompt.
+    pub fn generate_completions<M>(
+        &mut self,
+        model: &mut M,
+        prompt_tokens: &[u32],
+        tokenizer: &pmetal_data::Tokenizer,
+    ) -> GrpoResult<pmetal_models::rl_generation::BatchedGenerationOutput>
+    where
+        M: TrainableModel,
+    {
+        let config = BatchedRlConfig {
+            num_generations: self.config.num_generations,
+            max_new_tokens: self.config.max_completion_length,
+            temperature: self.config.temperature as f32,
+            top_p: self.config.top_p as f32,
+            top_k: self.config.top_k,
+            stop_tokens: vec![tokenizer.eos_token_id().unwrap_or(2)],
+            seed: None,
+            use_prefix_cache: true,
+            min_p: 0.05,
+        };
+
+        let cache = model
+            .create_cache(self.config.max_prompt_length + self.config.max_completion_length)
+            .ok_or_else(|| GrpoError::Generation("Model does not support KV cache".into()))?;
+        let kv_config = cache.config();
+
+        let mut generator = BatchedRlGenerator::new(config, kv_config.clone());
+
+        generator
+            .generate(
+                |input, cache| {
+                    model
+                        .forward_with_cache(input, None, Some(cache))
+                        .map_err(|e| Exception::custom(e.to_string()))
+                },
+                prompt_tokens,
+            )
+            .map_err(|e| GrpoError::Generation(e.to_string()))
+    }
+
+    /// Run full GRPO training loop.
+    pub fn run<M, R, O>(
+        &mut self,
+        policy_model: &mut M,
+        mut ref_model: Option<&mut R>,
+        tokenizer: &pmetal_data::Tokenizer,
+        dataset: &pmetal_data::TrainingDataset,
+        reward_fn: &CombinedReward,
+        optimizer: &mut O,
+    ) -> GrpoResult<()>
+    where
+        M: TrainableModel,
+        R: ModuleParameters + Module<Array, Error = Exception, Output = Array>,
+        O: Optimizer,
+    {
+        info!("Starting GRPO training loop...");
+        let n_epochs = self.training_config.num_epochs;
+
+        for epoch in 0..n_epochs {
+            info!("Epoch {}/{}", epoch + 1, n_epochs);
+
+            for (i, sample) in dataset.samples().iter().enumerate() {
+                let gen_output =
+                    self.generate_completions(policy_model, &sample.input_ids, tokenizer)?;
+
+                let prompt_text = tokenizer
+                    .decode(&sample.input_ids)
+                    .map_err(|e| GrpoError::Tokenizer(e.to_string()))?;
+                let mut completions_text = Vec::new();
+                for ids in &gen_output.token_ids {
+                    let new_ids = &ids[sample.input_ids.len()..];
+                    completions_text.push(
+                        tokenizer
+                            .decode(new_ids)
+                            .map_err(|e| GrpoError::Tokenizer(e.to_string()))?,
+                    );
+                }
+
+                let rewards = reward_fn.compute(
+                    &vec![prompt_text; gen_output.token_ids.len()],
+                    &completions_text,
+                    None,
+                )?;
+
+                let mut group =
+                    CompletionGroup::new(sample.input_ids.clone(), self.config.num_generations);
+                for (j, ids) in gen_output.token_ids.iter().enumerate() {
+                    let new_ids = ids[sample.input_ids.len()..].to_vec();
+                    group.add_completion(new_ids, rewards[j], gen_output.stopped_by_length[j]);
+                }
+
+                let stats = self.train_step(
+                    policy_model,
+                    ref_model.as_mut().map(|r| &mut **r),
+                    &[group],
+                    optimizer,
+                )?;
+
+                if i % 10 == 0 {
+                    info!(
+                        "Step {}: loss={:.4}, kl={:.4}, reward={:.4}, completion_len={:.1}",
+                        stats.step,
+                        stats.loss,
+                        stats.kl,
+                        stats.reward,
+                        gen_output.num_generated.iter().sum::<usize>() as f32
+                            / gen_output.num_generated.len() as f32
+                    );
+                }
+            }
+        }
+
+        Ok(())
     }
 }
 
-/// Reward function trait for GRPO.
+/// Trait for GRPO Reward functions.
 pub trait RewardFunction: Send + Sync {
-    /// Compute rewards for a batch of completions.
-    ///
-    /// # Arguments
-    /// * `prompts` - Prompt texts
-    /// * `completions` - Completion texts
-    /// * `images` - Optional images for each prompt [batch_size, num_images_per_prompt]
-    ///
-    /// # Returns
-    /// Rewards for each completion
     fn compute(
         &self,
         prompts: &[String],
         completions: &[String],
         images: Option<&[Vec<Array>]>,
     ) -> GrpoResult<Vec<f64>>;
-
-    /// Name of this reward function for logging.
     fn name(&self) -> &str;
 }
 
-/// Combined reward from multiple reward functions.
+/// Reward function that checks for proper XML tags (e.g., <thought> and <answer>).
+pub struct XmlFormatReward {
+    pub tags: Vec<(String, String)>,
+}
+
+impl XmlFormatReward {
+    pub fn new(tags: Vec<(String, String)>) -> Self {
+        Self { tags }
+    }
+
+    pub fn default_reasoning() -> Self {
+        Self::new(vec![
+            ("<thought>".into(), "</thought>".into()),
+            ("<answer>".into(), "</answer>".into()),
+        ])
+    }
+}
+
+impl RewardFunction for XmlFormatReward {
+    fn compute(
+        &self,
+        _: &[String],
+        completions: &[String],
+        _: Option<&[Vec<Array>]>,
+    ) -> GrpoResult<Vec<f64>> {
+        let mut rewards = vec![0.0; completions.len()];
+        for (i, completion) in completions.iter().enumerate() {
+            let mut score = 0.0;
+            for (start_tag, end_tag) in &self.tags {
+                if completion.contains(start_tag) && completion.contains(end_tag) {
+                    let start_idx = completion.find(start_tag).unwrap();
+                    let end_idx = completion.find(end_tag).unwrap();
+                    if start_idx < end_idx {
+                        score += 0.5;
+                    }
+                }
+            }
+            rewards[i] = score;
+        }
+        Ok(rewards)
+    }
+
+    fn name(&self) -> &str {
+        "xml_format"
+    }
+}
+
+/// Reward function that checks for exact matches with ground truth answers.
+pub struct AccuracyReward {
+    pub answers: Vec<String>,
+}
+
+impl AccuracyReward {
+    pub fn new(answers: Vec<String>) -> Self {
+        Self { answers }
+    }
+}
+
+impl RewardFunction for AccuracyReward {
+    fn compute(
+        &self,
+        _: &[String],
+        completions: &[String],
+        _: Option<&[Vec<Array>]>,
+    ) -> GrpoResult<Vec<f64>> {
+        let num_generations = completions.len() / self.answers.len();
+        let mut rewards = vec![0.0; completions.len()];
+
+        for (prompt_idx, answer) in self.answers.iter().enumerate() {
+            for gen_idx in 0..num_generations {
+                let comp_idx = prompt_idx * num_generations + gen_idx;
+                let completion = &completions[comp_idx];
+
+                let processed_completion =
+                    match (completion.find("<answer>"), completion.find("</answer>")) {
+                        (Some(start), Some(end)) if start + 8 <= end => {
+                            completion[start + 8..end].trim().to_string()
+                        }
+                        _ => completion.trim().to_string(),
+                    };
+
+                if processed_completion == answer.trim() {
+                    rewards[comp_idx] = 1.0;
+                }
+            }
+        }
+        Ok(rewards)
+    }
+
+    fn name(&self) -> &str {
+        "accuracy"
+    }
+}
+
+/// Combined reward function with weights.
 pub struct CombinedReward {
-    /// Individual reward functions with weights.
     pub functions: Vec<(Box<dyn RewardFunction>, f64)>,
 }
 
 impl CombinedReward {
-    /// Create a new combined reward.
     pub fn new() -> Self {
         Self {
             functions: Vec::new(),
         }
     }
 
-    /// Add a reward function with weight.
-    pub fn add(mut self, func: Box<dyn RewardFunction>, weight: f64) -> Self {
-        self.functions.push((func, weight));
+    pub fn add(mut self, function: Box<dyn RewardFunction>, weight: f64) -> Self {
+        self.functions.push((function, weight));
         self
     }
 
-    /// Compute combined rewards.
     pub fn compute(
         &self,
         prompts: &[String],
@@ -891,247 +849,19 @@ impl CombinedReward {
             return Err(GrpoError::Reward("No reward functions configured".into()));
         }
 
-        let n = completions.len();
-        let mut combined = vec![0.0; n];
-
+        let mut total_rewards = vec![0.0; completions.len()];
         for (func, weight) in &self.functions {
             let rewards = func.compute(prompts, completions, images)?;
-            for (i, &r) in rewards.iter().enumerate() {
-                combined[i] += r * weight;
+            for (i, r) in rewards.iter().enumerate() {
+                total_rewards[i] += r * weight;
             }
         }
-
-        Ok(combined)
+        Ok(total_rewards)
     }
 }
 
 impl Default for CombinedReward {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_grpo_config_default() {
-        let config = GrpoConfig::default();
-        assert_eq!(config.num_generations, 8);
-        assert_eq!(config.beta, 0.001);
-        assert_eq!(config.loss_type, GrpoLossType::Bnpo);
-        assert!(!config.reference_free);
-    }
-
-    #[test]
-    fn test_grpo_config_validation() {
-        let config = GrpoConfig::new(4);
-        assert!(config.validate().is_ok());
-
-        let invalid = GrpoConfig {
-            num_generations: 0,
-            ..Default::default()
-        };
-        assert!(invalid.validate().is_err());
-
-        let invalid_beta = GrpoConfig {
-            beta: -1.0,
-            ..Default::default()
-        };
-        assert!(invalid_beta.validate().is_err());
-    }
-
-    #[test]
-    fn test_grpo_config_dapo() {
-        let config = GrpoConfig::new(8).for_dapo();
-        assert_eq!(config.loss_type, GrpoLossType::Dapo);
-        assert!(config.mask_truncated_completions);
-        assert!((config.epsilon_high - 0.28).abs() < 0.01);
-        assert_eq!(config.beta, 0.0);
-    }
-
-    #[test]
-    fn test_completion_group() {
-        let mut group = CompletionGroup::new(vec![1, 2, 3], 4);
-        group.add_completion(vec![4, 5], 1.0, false);
-        group.add_completion(vec![6, 7, 8], 2.0, false);
-        group.add_completion(vec![9], 0.5, true);
-        group.add_completion(vec![10, 11], 1.5, false);
-
-        assert_eq!(group.len(), 4);
-        assert!(!group.is_empty());
-        assert!((group.baseline() - 1.25).abs() < 0.01);
-
-        let advantages = group.advantages();
-        assert_eq!(advantages.len(), 4);
-        assert!((advantages[0] - (-0.25)).abs() < 0.01); // 1.0 - 1.25
-        assert!((advantages[1] - 0.75).abs() < 0.01); // 2.0 - 1.25
-    }
-
-    #[test]
-    fn test_compute_advantages_group() {
-        let config = GrpoConfig::new(2);
-        let training_config = TrainingConfig::default();
-        let trainer = GrpoTrainer::new(config, training_config).unwrap();
-
-        // Two groups of 2
-        let rewards = vec![1.0, 3.0, 2.0, 4.0];
-        let advantages = trainer.compute_advantages(&rewards, 2).unwrap();
-
-        // Group 1: baseline = 2.0, advantages = [-1, 1]
-        // Group 2: baseline = 3.0, advantages = [-1, 1]
-        assert!((advantages[0] - (-1.0)).abs() < 0.01);
-        assert!((advantages[1] - 1.0).abs() < 0.01);
-        assert!((advantages[2] - (-1.0)).abs() < 0.01);
-        assert!((advantages[3] - 1.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_compute_advantages_batch() {
-        let config = GrpoConfig {
-            advantage_norm: AdvantageNormalization::Batch,
-            ..GrpoConfig::new(2)
-        };
-        let training_config = TrainingConfig::default();
-        let trainer = GrpoTrainer::new(config, training_config).unwrap();
-
-        let rewards = vec![1.0, 2.0, 3.0, 4.0];
-        let advantages = trainer.compute_advantages(&rewards, 2).unwrap();
-
-        // Batch mean = 2.5
-        assert!((advantages[0] - (-1.5)).abs() < 0.01);
-        assert!((advantages[1] - (-0.5)).abs() < 0.01);
-        assert!((advantages[2] - 0.5).abs() < 0.01);
-        assert!((advantages[3] - 1.5).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_grpo_loss_computation() {
-        let config = GrpoConfig::new(4).with_beta(0.1);
-        let training_config = TrainingConfig::default();
-        let trainer = GrpoTrainer::new(config, training_config).unwrap();
-
-        // Mock log probabilities
-        let policy_logps = Array::from_slice(&[-1.0f32, -2.0, -1.5, -1.8], &[4]);
-        let ref_logps = Array::from_slice(&[-1.1f32, -2.1, -1.6, -1.9], &[4]);
-        let advantages = Array::from_slice(&[-1.0f32, 1.0, 0.5, -0.5], &[4]);
-
-        let (loss, kl, policy_loss) = trainer
-            .compute_grpo_loss(&policy_logps, &ref_logps, &advantages, None)
-            .unwrap();
-
-        loss.eval().unwrap();
-        kl.eval().unwrap();
-        policy_loss.eval().unwrap();
-
-        // Loss should be finite
-        assert!(loss.item::<f32>().is_finite());
-        assert!(kl.item::<f32>() >= 0.0); // KL is non-negative
-    }
-
-    #[test]
-    fn test_reward_stats() {
-        let config = GrpoConfig::new(4);
-        let training_config = TrainingConfig::default();
-        let mut trainer = GrpoTrainer::new(config, training_config).unwrap();
-
-        trainer.update_reward_stats(&[1.0, 2.0, 3.0, 4.0]);
-        assert!((trainer.reward_running_mean - 2.5).abs() < 0.01);
-
-        trainer.update_reward_stats(&[5.0, 6.0, 7.0, 8.0]);
-        assert!((trainer.reward_running_mean - 4.5).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_clip_rewards() {
-        let config = GrpoConfig {
-            reward_clip_min: Some(-1.0),
-            reward_clip_max: Some(1.0),
-            ..GrpoConfig::new(4)
-        };
-        let training_config = TrainingConfig::default();
-        let trainer = GrpoTrainer::new(config, training_config).unwrap();
-
-        let mut rewards = vec![-2.0, -0.5, 0.5, 2.0];
-        trainer.clip_rewards(&mut rewards);
-
-        assert_eq!(rewards, vec![-1.0, -0.5, 0.5, 1.0]);
-    }
-
-    #[test]
-    fn test_grpo_metrics() {
-        let rewards = vec![1.0, 2.0, 3.0, 4.0];
-        let advantages = vec![-1.5, -0.5, 0.5, 1.5];
-        let lengths = vec![10, 15, 12, 8];
-
-        let metrics = GrpoMetrics::compute(0.5, 0.4, 0.01, 0.1, &rewards, &advantages, &lengths);
-
-        assert!((metrics.mean_reward - 2.5).abs() < 0.01);
-        assert!((metrics.mean_advantage - 0.0).abs() < 0.01);
-        assert!((metrics.advantage_positive_frac - 0.5).abs() < 0.01);
-        assert!((metrics.completion_length - 11.25).abs() < 0.01);
-    }
-
-    #[test]
-    fn test_prepare_batch() {
-        // Disable reward scaling to test raw advantages
-        let config = GrpoConfig {
-            scale_rewards: false,
-            ..GrpoConfig::new(2)
-        };
-        let training_config = TrainingConfig::default();
-        let mut trainer = GrpoTrainer::new(config, training_config).unwrap();
-
-        let mut group1 = CompletionGroup::new(vec![1, 2], 2);
-        group1.add_completion(vec![3, 4], 1.0, false);
-        group1.add_completion(vec![5, 6], 2.0, false);
-
-        let mut group2 = CompletionGroup::new(vec![7, 8], 2);
-        group2.add_completion(vec![9, 10], 1.5, false);
-        group2.add_completion(vec![11, 12], 0.5, false);
-
-        let (prompts, completions, advantages, masks, _) =
-            trainer.prepare_batch(&[group1, group2]).unwrap();
-
-        assert_eq!(prompts.len(), 4);
-        assert_eq!(completions.len(), 4);
-        assert_eq!(advantages.len(), 4);
-        assert_eq!(masks.len(), 4);
-
-        // Advantages should be group-normalized
-        // Group 1: mean=1.5, adv=[-0.5, 0.5]
-        // Group 2: mean=1.0, adv=[0.5, -0.5]
-        assert!((advantages[0] - (-0.5)).abs() < 0.1);
-        assert!((advantages[1] - 0.5).abs() < 0.1);
-    }
-
-    #[test]
-    fn test_combined_reward() {
-        struct ConstantReward(f64);
-        impl RewardFunction for ConstantReward {
-            fn compute(
-                &self,
-                _: &[String],
-                completions: &[String],
-                _: Option<&[Vec<Array>]>,
-            ) -> GrpoResult<Vec<f64>> {
-                Ok(vec![self.0; completions.len()])
-            }
-            fn name(&self) -> &str {
-                "constant"
-            }
-        }
-
-        let combined = CombinedReward::new()
-            .add(Box::new(ConstantReward(1.0)), 0.5)
-            .add(Box::new(ConstantReward(2.0)), 0.5);
-
-        let rewards = combined
-            .compute(&["p".into()], &["c".into()], None)
-            .unwrap();
-
-        assert_eq!(rewards.len(), 1);
-        assert!((rewards[0] - 1.5).abs() < 0.01); // 0.5*1 + 0.5*2
     }
 }

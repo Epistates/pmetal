@@ -15,9 +15,19 @@
 //! zero-copy bridging to pass MLX array data directly to Metal kernels without
 //! copying, providing significant performance improvements for large tensors.
 
-use super::{DistillLoss, softmax};
+use super::DistillLoss;
 use crate::Result;
 use mlx_rs::Array;
+
+/// Numerically stable log(exp(a) + exp(b)) = max(a,b) + log(1 + exp(-|a-b|)).
+fn log_sum_exp(a: &Array, b: &Array) -> std::result::Result<Array, mlx_rs::error::Exception> {
+    let max_ab = mlx_rs::ops::maximum(a, b)?;
+    let diff = a.subtract(b)?.abs()?;
+    let log1p_term = mlx_rs::ops::exp(&diff.negative()?)?
+        .add(&Array::from_f32(1.0))?
+        .log()?;
+    max_ab.add(&log1p_term)
+}
 
 #[cfg(feature = "metal")]
 use std::sync::Arc;
@@ -158,7 +168,7 @@ impl JensenShannonLoss {
         Ok(Array::from_f32(mean_loss))
     }
 
-    /// MLX fallback implementation.
+    /// MLX fallback implementation using log-domain computation for numerical stability.
     fn compute_mlx(
         &self,
         teacher_logits: &Array,
@@ -170,37 +180,30 @@ impl JensenShannonLoss {
         let teacher_scaled = teacher_logits.divide(&temp)?;
         let student_scaled = student_logits.divide(&temp)?;
 
-        // Compute softmax probabilities
-        let teacher_probs = softmax(&teacher_scaled, -1)?;
-        let student_probs = softmax(&student_scaled, -1)?;
+        // Log-softmax for numerical stability
+        let teacher_log_probs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
+        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
+        let teacher_probs = teacher_log_probs.exp()?;
 
-        // Compute mixture distribution M = 0.5 * (P + Q)
+        // log(M) = log(0.5*(P+Q)) via log-sum-exp for stability (avoids 0*-inf = NaN)
+        // log(M) = -ln(2) + log(exp(log_P) + exp(log_Q))
+        let log2 = Array::from_f32(2.0_f32.ln());
+        let log_mixture = log_sum_exp(&teacher_log_probs, &student_log_probs)?.subtract(&log2)?;
+
+        // KL(P || M) = sum(P * (log_P - log_M))
+        let kl_teacher_m = teacher_probs.multiply(&teacher_log_probs.subtract(&log_mixture)?)?;
+
+        // KL(Q || M) = sum(Q * (log_Q - log_M))
+        let student_probs = student_log_probs.exp()?;
+        let kl_student_m = student_probs.multiply(&student_log_probs.subtract(&log_mixture)?)?;
+
+        // JS = 0.5 * (KL(P||M) + KL(Q||M))
         let half = Array::from_f32(0.5);
-        let mixture = teacher_probs.add(&student_probs)?.multiply(&half)?;
-
-        // Add epsilon for numerical stability
-        let eps = Array::from_f32(1e-10);
-        let teacher_safe = teacher_probs.add(&eps)?;
-        let student_safe = student_probs.add(&eps)?;
-        let mixture_safe = mixture.add(&eps)?;
-
-        // Compute KL(teacher || mixture)
-        let log_teacher = teacher_safe.log()?;
-        let log_mixture = mixture_safe.log()?;
-        let kl_teacher_m = teacher_safe.multiply(&log_teacher.subtract(&log_mixture)?)?;
-
-        // Compute KL(student || mixture)
-        let log_student = student_safe.log()?;
-        let kl_student_m = student_safe.multiply(&log_student.subtract(&log_mixture)?)?;
-
-        // JS = 0.5 * KL(P || M) + 0.5 * KL(Q || M)
         let js = kl_teacher_m.add(&kl_student_m)?.multiply(&half)?;
 
-        // Sum over vocabulary, mean over batch and sequence
+        // Sum over vocab, mean over batch and sequence
         let js_sum = js.sum_axes(&[-1], Some(false))?;
-        let loss = js_sum.mean(None)?;
-
-        Ok(loss)
+        Ok(js_sum.mean(None)?)
     }
 }
 
@@ -211,21 +214,54 @@ impl Default for JensenShannonLoss {
 }
 
 impl DistillLoss for JensenShannonLoss {
-    fn compute(
+    fn compute_weighted(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
         temperature: f32,
+        weights: Option<&Array>,
     ) -> Result<Array> {
-        // GPU-first: try Metal, fall back to MLX
-        #[cfg(feature = "metal")]
-        {
-            if self.ctx.is_some() {
-                return self.compute_gpu(teacher_logits, student_logits, temperature);
+        // GPU-first: try Metal if no weights
+        if weights.is_none() {
+            #[cfg(feature = "metal")]
+            {
+                if self.ctx.is_some() {
+                    return self.compute_gpu(teacher_logits, student_logits, temperature);
+                }
             }
         }
 
-        self.compute_mlx(teacher_logits, student_logits, temperature)
+        // MLX fallback / weighted implementation using log-domain computation
+        let temp = Array::from_f32(temperature);
+        let teacher_scaled = teacher_logits.divide(&temp)?;
+        let student_scaled = student_logits.divide(&temp)?;
+
+        let teacher_log_probs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
+        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
+        let teacher_probs = teacher_log_probs.exp()?;
+
+        // log(M) via log-sum-exp for stability (avoids 0*-inf = NaN for disjoint distributions)
+        let log2 = Array::from_f32(2.0_f32.ln());
+        let log_mixture = log_sum_exp(&teacher_log_probs, &student_log_probs)?.subtract(&log2)?;
+
+        let kl_teacher_m = teacher_probs.multiply(&teacher_log_probs.subtract(&log_mixture)?)?;
+        let student_probs = student_log_probs.exp()?;
+        let kl_student_m = student_probs.multiply(&student_log_probs.subtract(&log_mixture)?)?;
+
+        let half = Array::from_f32(0.5);
+        let js_per_token = kl_teacher_m
+            .add(&kl_student_m)?
+            .multiply(&half)?
+            .sum_axes(&[-1], Some(false))?;
+
+        if let Some(w) = weights {
+            let weighted = js_per_token.multiply(w)?;
+            let total_weight = w.sum(None)?;
+            let safe_weight = mlx_rs::ops::maximum(&total_weight, &Array::from_f32(1e-8))?;
+            Ok(weighted.sum(None)?.divide(&safe_weight)?)
+        } else {
+            Ok(js_per_token.mean(None)?)
+        }
     }
 
     fn name(&self) -> &'static str {

@@ -32,21 +32,35 @@ use mlx_rs::{
 
 use crate::ParameterGroupConfig;
 
+/// Parameter classification for routing to the correct optimizer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParamClass {
+    /// Regular parameters (LoRA weights, projections) — full weight decay.
+    Regular,
+    /// Embedding parameters — separate learning rate, full weight decay.
+    Embedding,
+    /// No-decay parameters (bias, norm, scale) — zero weight decay.
+    NoDecay,
+}
+
 /// AdamW optimizer with support for parameter groups.
 ///
 /// This optimizer routes parameters to different AdamW instances based on
 /// pattern matching, allowing separate learning rates and weight decay for
-/// embeddings vs other parameters.
+/// embeddings vs other parameters. Bias, norm, and scale parameters are
+/// automatically routed to a no-decay optimizer (weight_decay=0).
 #[derive(Debug)]
 pub struct AdamWGroups {
     /// Optimizer for LoRA and other non-embedding parameters.
     lora_optimizer: AdamW,
     /// Optimizer for embedding parameters (lower learning rate).
     embedding_optimizer: AdamW,
+    /// Optimizer for bias/norm/scale parameters (zero weight decay).
+    no_decay_optimizer: AdamW,
     /// Configuration for identifying embedding parameters.
     config: ParameterGroupConfig,
     /// Cached parameter classifications.
-    param_cache: HashMap<Rc<str>, bool>, // true = embedding
+    param_cache: HashMap<Rc<str>, ParamClass>,
 }
 
 impl AdamWGroups {
@@ -56,7 +70,7 @@ impl AdamWGroups {
     ///
     /// * `base_lr` - Learning rate for non-embedding parameters
     /// * `embedding_lr` - Learning rate for embedding parameters (None = same as base)
-    /// * `weight_decay` - Weight decay for all parameters
+    /// * `weight_decay` - Weight decay for regular parameters (bias/norm always get 0)
     pub fn new(base_lr: f32, embedding_lr: Option<f32>, weight_decay: f32) -> Result<Self> {
         let embedding_lr = embedding_lr.unwrap_or(base_lr);
 
@@ -69,6 +83,11 @@ impl AdamWGroups {
             .weight_decay(weight_decay)
             .build()
             .map_err(|_| Exception::custom("Failed to build embedding optimizer"))?;
+
+        let no_decay_optimizer = AdamWBuilder::new(base_lr)
+            .weight_decay(0.0)
+            .build()
+            .map_err(|_| Exception::custom("Failed to build no-decay optimizer"))?;
 
         let config = ParameterGroupConfig {
             base_lr: base_lr as f64,
@@ -84,28 +103,41 @@ impl AdamWGroups {
         Ok(Self {
             lora_optimizer,
             embedding_optimizer,
+            no_decay_optimizer,
             config,
             param_cache: HashMap::new(),
         })
     }
 
-    /// Check if a parameter name matches embedding patterns.
-    fn is_embedding_param(&mut self, name: &Rc<str>) -> bool {
+    /// Classify a parameter by name into Regular, Embedding, or NoDecay.
+    ///
+    /// No-decay check takes priority: bias/norm/scale parameters always get
+    /// zero weight decay regardless of whether they also match embedding patterns.
+    fn classify_param(&mut self, name: &Rc<str>) -> ParamClass {
         // Check cache first
-        if let Some(&is_embedding) = self.param_cache.get(name) {
-            return is_embedding;
+        if let Some(&class) = self.param_cache.get(name) {
+            return class;
         }
 
-        // Classify and cache
-        let name_lower = name.to_lowercase();
-        let is_embedding = self
-            .config
-            .embedding_patterns
-            .iter()
-            .any(|pattern| name_lower.contains(&pattern.to_lowercase()));
+        // Classify: no-decay check first, then embedding check
+        let class = if self.config.is_no_decay(name) {
+            ParamClass::NoDecay
+        } else {
+            let name_lower = name.to_lowercase();
+            let is_embedding = self
+                .config
+                .embedding_patterns
+                .iter()
+                .any(|pattern| name_lower.contains(&pattern.to_lowercase()));
+            if is_embedding {
+                ParamClass::Embedding
+            } else {
+                ParamClass::Regular
+            }
+        };
 
-        self.param_cache.insert(name.clone(), is_embedding);
-        is_embedding
+        self.param_cache.insert(name.clone(), class);
+        class
     }
 
     /// Get the learning rates used by this optimizer.
@@ -145,9 +177,10 @@ impl AdamWGroups {
 
         let new_embedding_lr = base_lr * ratio;
 
-        // Update both optimizers
+        // Update all three optimizers
         self.lora_optimizer.lr = array!(base_lr);
         self.embedding_optimizer.lr = array!(new_embedding_lr);
+        self.no_decay_optimizer.lr = array!(base_lr);
     }
 
     /// Get summary of parameter grouping.
@@ -155,10 +188,11 @@ impl AdamWGroups {
         let (base_lr, emb_lr) = self.learning_rates();
         let lora_count = self.lora_optimizer.state.len();
         let emb_count = self.embedding_optimizer.state.len();
+        let no_decay_count = self.no_decay_optimizer.state.len();
 
         format!(
-            "AdamWGroups: {} LoRA params (lr={:.2e}), {} embedding params (lr={:.2e})",
-            lora_count, base_lr, emb_count, emb_lr
+            "AdamWGroups: {} regular params (lr={:.2e}), {} embedding params (lr={:.2e}), {} no-decay params (wd=0)",
+            lora_count, base_lr, emb_count, emb_lr, no_decay_count
         )
     }
 }
@@ -193,18 +227,23 @@ impl Optimizer for AdamWGroups {
         gradient: &Array,
         parameter: &mut Array,
     ) -> Result<()> {
-        if self.is_embedding_param(key) {
-            self.embedding_optimizer
-                .update_single(key, gradient, parameter)
-        } else {
-            self.lora_optimizer.update_single(key, gradient, parameter)
+        match self.classify_param(key) {
+            ParamClass::NoDecay => self
+                .no_decay_optimizer
+                .update_single(key, gradient, parameter),
+            ParamClass::Embedding => self
+                .embedding_optimizer
+                .update_single(key, gradient, parameter),
+            ParamClass::Regular => self.lora_optimizer.update_single(key, gradient, parameter),
         }
     }
 }
 
 impl Updatable for AdamWGroups {
     fn updatable_states_len(&self) -> usize {
-        self.lora_optimizer.updatable_states_len() + self.embedding_optimizer.updatable_states_len()
+        self.lora_optimizer.updatable_states_len()
+            + self.embedding_optimizer.updatable_states_len()
+            + self.no_decay_optimizer.updatable_states_len()
     }
 
     fn updatable_states(&self) -> impl IntoIterator<Item = &Array> {
@@ -212,6 +251,7 @@ impl Updatable for AdamWGroups {
             .updatable_states()
             .into_iter()
             .chain(self.embedding_optimizer.updatable_states())
+            .chain(self.no_decay_optimizer.updatable_states())
     }
 
     fn updatable_states_mut(&mut self) -> impl IntoIterator<Item = &mut Array> {
@@ -219,6 +259,7 @@ impl Updatable for AdamWGroups {
             .updatable_states_mut()
             .into_iter()
             .chain(self.embedding_optimizer.updatable_states_mut())
+            .chain(self.no_decay_optimizer.updatable_states_mut())
     }
 }
 
@@ -303,6 +344,13 @@ impl AdamWGroupsBuilder {
             .build()
             .map_err(|_| Exception::custom("Failed to build embedding optimizer"))?;
 
+        let no_decay_optimizer = AdamWBuilder::new(self.base_lr)
+            .betas(self.betas)
+            .eps(self.eps)
+            .weight_decay(0.0)
+            .build()
+            .map_err(|_| Exception::custom("Failed to build no-decay optimizer"))?;
+
         let config = ParameterGroupConfig {
             base_lr: self.base_lr as f64,
             embedding_lr: if self.embedding_lr.is_some() {
@@ -312,11 +360,13 @@ impl AdamWGroupsBuilder {
             },
             weight_decay: self.weight_decay as f64,
             embedding_patterns: self.embedding_patterns,
+            ..Default::default()
         };
 
         Ok(AdamWGroups {
             lora_optimizer,
             embedding_optimizer,
+            no_decay_optimizer,
             config,
             param_cache: HashMap::new(),
         })
@@ -342,7 +392,7 @@ mod tests {
     }
 
     #[test]
-    fn test_embedding_pattern_matching() {
+    fn test_parameter_classification() {
         let mut optimizer = AdamWGroupsBuilder::new(2e-4)
             .with_embedding_lr(5e-5)
             .build()
@@ -350,14 +400,24 @@ mod tests {
 
         // Test embedding patterns
         let embed_key: Rc<str> = Rc::from("model.embed_tokens.weight");
-        assert!(optimizer.is_embedding_param(&embed_key));
+        assert_eq!(optimizer.classify_param(&embed_key), ParamClass::Embedding);
 
         let lm_head_key: Rc<str> = Rc::from("lm_head.weight");
-        assert!(optimizer.is_embedding_param(&lm_head_key));
+        assert_eq!(
+            optimizer.classify_param(&lm_head_key),
+            ParamClass::Embedding
+        );
 
-        // Test LoRA patterns
+        // Test LoRA patterns → Regular
         let lora_key: Rc<str> = Rc::from("model.layers.0.self_attn.q_proj.lora_A.weight");
-        assert!(!optimizer.is_embedding_param(&lora_key));
+        assert_eq!(optimizer.classify_param(&lora_key), ParamClass::Regular);
+
+        // Test no-decay patterns (bias, norm)
+        let bias_key: Rc<str> = Rc::from("model.layers.0.self_attn.q_proj.bias");
+        assert_eq!(optimizer.classify_param(&bias_key), ParamClass::NoDecay);
+
+        let norm_key: Rc<str> = Rc::from("model.layers.0.input_layernorm.weight");
+        assert_eq!(optimizer.classify_param(&norm_key), ParamClass::NoDecay);
     }
 
     #[test]
@@ -371,25 +431,32 @@ mod tests {
         let mut param = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
         let grad = Array::from_slice(&[0.1f32, 0.2, 0.3], &[3]);
 
-        // Test LoRA parameter update
+        // Test LoRA parameter update → lora_optimizer
         let lora_key: Rc<str> = Rc::from("model.layers.0.q_proj.lora_A.weight");
         optimizer
             .update_single(&lora_key, &grad, &mut param)
             .unwrap();
-
-        // State should be in lora_optimizer
         assert!(optimizer.lora_optimizer.state.contains_key(&lora_key));
         assert!(!optimizer.embedding_optimizer.state.contains_key(&lora_key));
+        assert!(!optimizer.no_decay_optimizer.state.contains_key(&lora_key));
 
-        // Test embedding parameter update
+        // Test embedding parameter update → embedding_optimizer
         let mut embed_param = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
         let embed_key: Rc<str> = Rc::from("model.embed_tokens.weight");
         optimizer
             .update_single(&embed_key, &grad, &mut embed_param)
             .unwrap();
-
-        // State should be in embedding_optimizer
         assert!(optimizer.embedding_optimizer.state.contains_key(&embed_key));
         assert!(!optimizer.lora_optimizer.state.contains_key(&embed_key));
+
+        // Test bias parameter update → no_decay_optimizer
+        let mut bias_param = Array::from_slice(&[1.0f32, 2.0, 3.0], &[3]);
+        let bias_key: Rc<str> = Rc::from("model.layers.0.self_attn.q_proj.bias");
+        optimizer
+            .update_single(&bias_key, &grad, &mut bias_param)
+            .unwrap();
+        assert!(optimizer.no_decay_optimizer.state.contains_key(&bias_key));
+        assert!(!optimizer.lora_optimizer.state.contains_key(&bias_key));
+        assert!(!optimizer.embedding_optimizer.state.contains_key(&bias_key));
     }
 }

@@ -131,6 +131,10 @@ pub struct QLoraLinear {
     weight_cache: RefCell<Option<Array>>,
     /// Whether weight caching is enabled.
     cache_enabled: bool,
+    /// Whether in training mode (controls dropout).
+    pub training: bool,
+    /// LoRA dropout probability.
+    pub lora_dropout: f32,
 }
 
 impl std::fmt::Debug for QLoraLinear {
@@ -188,28 +192,36 @@ impl QLoraLinear {
 
         // Compute LoRA scaling
         let lora_config = &config.lora;
-        let scale = if lora_config.use_rslora {
-            lora_config.alpha / (lora_config.r as f32).sqrt()
+        let rank = lora_config.r as i32;
+        let scale = if rank > 0 {
+            if lora_config.use_rslora {
+                lora_config.alpha / (rank as f32).sqrt()
+            } else {
+                lora_config.alpha / rank as f32
+            }
         } else {
-            lora_config.alpha / lora_config.r as f32
+            0.0
         };
 
-        // Initialize LoRA A with Kaiming uniform
-        let bound = (3.0_f32 / in_features as f32).sqrt();
-        let lora_a = mlx_rs::random::uniform::<_, f32>(
-            -bound,
-            bound,
-            &[lora_config.r as i32, in_features],
-            None,
-        )?;
+        // Initialize LoRA A with Kaiming uniform (dummy when rank=0)
+        let lora_a = if rank > 0 {
+            let bound = (3.0_f32 / in_features as f32).sqrt();
+            mlx_rs::random::uniform::<_, f32>(-bound, bound, &[rank, in_features], None)?
+        } else {
+            mlx_rs::ops::zeros::<f32>(&[1, in_features])?
+        };
 
-        // Initialize LoRA B with zeros (ensures initial output matches base model)
-        let lora_b = mlx_rs::ops::zeros::<f32>(&[out_features, lora_config.r as i32])?;
+        // Initialize LoRA B with zeros (dummy when rank=0)
+        let lora_b = if rank > 0 {
+            mlx_rs::ops::zeros::<f32>(&[out_features, rank])?
+        } else {
+            mlx_rs::ops::zeros::<f32>(&[out_features, 1])?
+        };
 
         Ok(Self {
             in_features,
             out_features,
-            rank: lora_config.r as i32,
+            rank,
             scale,
             use_bias: bias.is_some(),
             quantized_weight,
@@ -219,6 +231,8 @@ impl QLoraLinear {
             lora_b,
             weight_cache: RefCell::new(None),
             cache_enabled: false,
+            training: false,
+            lora_dropout: 0.0,
         })
     }
 
@@ -327,21 +341,36 @@ impl QLoraLinear {
     ///
     /// The base weights are dequantized on-the-fly and immediately discarded,
     /// keeping peak memory usage low.
-    pub fn forward(&self, x: &Array) -> Result<Array, LoraError> {
+    ///
+    /// When `rank == 0` the layer acts as a frozen quantized linear — only the
+    /// base weight is applied, skipping the LoRA path entirely.
+    pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         // Dequantize base weights on-the-fly
         let weight = self.dequantize_weight()?;
 
         // Base forward: y_base = x @ W.T
         let y_base = x.matmul(&weight.t())?;
 
-        // LoRA forward: y_lora = scale * (x @ A.T) @ B.T
-        let xa = x.matmul(&self.lora_a.t())?;
-        let xab = xa.matmul(&self.lora_b.t())?;
-        let scale_arr = Array::from_f32(self.scale);
-        let y_lora = xab.multiply(&scale_arr)?;
+        // Skip LoRA path when rank=0 (frozen module not in target_modules)
+        let y = if self.rank == 0 {
+            y_base
+        } else {
+            // Apply dropout to LoRA input when training
+            let x_lora = if self.training && self.lora_dropout > 0.0 {
+                crate::lora::apply_dropout(x, self.lora_dropout)?
+            } else {
+                x.clone()
+            };
 
-        // Combined output
-        let y = y_base.add(&y_lora)?;
+            // LoRA forward: y_lora = scale * (x_lora @ A.T) @ B.T
+            let xa = x_lora.matmul(&self.lora_a.t())?;
+            let xab = xa.matmul(&self.lora_b.t())?;
+            let scale_arr = Array::from_f32(self.scale);
+            let y_lora = xab.multiply(&scale_arr)?;
+
+            // Combined output
+            y_base.add(&y_lora)?
+        };
 
         // Add bias if present
         if let Some(ref bias) = self.bias {
@@ -349,6 +378,22 @@ impl QLoraLinear {
         } else {
             Ok(y)
         }
+    }
+
+    /// Merge LoRA weights into the base weight.
+    ///
+    /// Returns `dequant(W) + scale * B @ A` as a full-precision array.
+    pub fn merge(&self) -> Result<Array, LoraError> {
+        let weight = self.dequantize_weight()?;
+        let ba = self.lora_b.matmul(&self.lora_a)?;
+        let scale_arr = Array::from_f32(self.scale);
+        let update = ba.multiply(&scale_arr)?;
+        Ok(weight.add(&update)?)
+    }
+
+    /// Set training mode (controls dropout).
+    pub fn set_training(&mut self, training: bool) {
+        self.training = training;
     }
 
     /// Get the LoRA A parameters (for gradient computation).
@@ -393,9 +438,15 @@ impl QLoraLinear {
     ///
     /// Returns (quantized_bytes, lora_bytes, total_bytes)
     pub fn memory_usage(&self) -> (usize, usize, usize) {
-        // Quantized weight: packed 4-bit + absmax
-        let quantized_bytes =
-            self.quantized_weight.data.len() + self.quantized_weight.absmax.len() * 4; // f32 absmax
+        // Quantized weight: packed 4-bit data
+        let absmax_bytes = if self.quantized_weight.absmax_quant.is_some() {
+            // Double quantization: 1 byte per absmax + 8 bytes overhead (offset + scale)
+            self.quantized_weight.absmax.len() + 8
+        } else {
+            // Standard: f32 per absmax
+            self.quantized_weight.absmax.len() * 4
+        };
+        let quantized_bytes = self.quantized_weight.data.len() + absmax_bytes;
 
         // LoRA params in f32
         let lora_bytes = self.num_trainable_params() * 4;
@@ -468,7 +519,7 @@ mod tests {
     #[test]
     fn test_qlora_forward() {
         let config = default_config();
-        let qlora = QLoraLinear::new(32, 64, &config, false).unwrap();
+        let mut qlora = QLoraLinear::new(32, 64, &config, false).unwrap();
 
         let x = mlx_rs::random::normal::<f32>(&[2, 4, 32], None, None, None).unwrap();
         let output = qlora.forward(&x).unwrap();
@@ -479,7 +530,7 @@ mod tests {
     #[test]
     fn test_qlora_with_bias() {
         let config = default_config();
-        let qlora = QLoraLinear::new(32, 64, &config, true).unwrap();
+        let mut qlora = QLoraLinear::new(32, 64, &config, true).unwrap();
 
         let x = mlx_rs::random::normal::<f32>(&[2, 4, 32], None, None, None).unwrap();
         let output = qlora.forward(&x).unwrap();
@@ -492,7 +543,7 @@ mod tests {
     fn test_qlora_zero_lora_contribution() {
         // With B initialized to zeros, LoRA should have minimal effect
         let config = default_config();
-        let qlora = QLoraLinear::new(32, 64, &config, false).unwrap();
+        let mut qlora = QLoraLinear::new(32, 64, &config, false).unwrap();
 
         let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
         let output = qlora.forward(&x).unwrap();

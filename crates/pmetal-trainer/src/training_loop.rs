@@ -119,7 +119,9 @@ fn jit_training_step<M: TrainableModel, O: Optimizer>(
         let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
 
         // Mask out ignored tokens (label == -100) and compute mean
-        let ignore_mask = flat_labels.ne(&Array::from_int(-100_i32))?;
+        // Cast ignore value to match labels dtype (may be i32 or i64)
+        let ignore_val = Array::from_int(-100_i32).as_dtype(flat_labels.dtype())?;
+        let ignore_mask = flat_labels.ne(&ignore_val)?;
         let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
         let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
         let valid_count = ignore_mask_f32.sum(None)?;
@@ -173,7 +175,9 @@ fn trainable_training_step<M: TrainableModel, O: Optimizer>(
         let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
 
         // Mask out ignored tokens (label == -100) and compute mean
-        let ignore_mask = flat_labels.ne(&Array::from_int(-100_i32))?;
+        // Cast ignore value to match labels dtype (may be i32 or i64)
+        let ignore_val = Array::from_int(-100_i32).as_dtype(flat_labels.dtype())?;
+        let ignore_mask = flat_labels.ne(&ignore_val)?;
         let ignore_mask_f32 = ignore_mask.as_dtype(mlx_rs::Dtype::Float32)?;
         let masked_loss = per_token_loss.multiply(&ignore_mask_f32)?;
         let valid_count = ignore_mask_f32.sum(None)?;
@@ -411,6 +415,10 @@ pub struct TrainingLoop {
     pub(crate) tokens_since_log: usize,
     /// Time of last log (for throughput calculation).
     pub(crate) last_log_time: Option<std::time::Instant>,
+    /// Accumulated loss across micro-batches for gradient accumulation.
+    pub(crate) accumulated_loss: f64,
+    /// Number of micro-batches accumulated (for averaging).
+    pub(crate) loss_accumulation_count: usize,
 }
 
 impl TrainingLoop {
@@ -440,6 +448,8 @@ impl TrainingLoop {
             metal_fa_available,
             tokens_since_log: 0,
             last_log_time: None,
+            accumulated_loss: 0.0,
+            loss_accumulation_count: 0,
         }
     }
 
@@ -663,12 +673,16 @@ impl TrainingLoop {
             self.compute_text_loss_and_grads(model, batch)?
         };
 
-        // Evaluate loss for this step
+        // Evaluate loss for this micro-batch
         // NOTE: Unlike mlx-lm which uses mx.compile for JIT fusion, we need to
         // evaluate each step. mlx-rs doesn't expose mx.compile, so deferring
         // evaluation just builds up a massive computation graph.
         loss.eval()?;
-        let loss_val = loss.item::<f32>();
+        let micro_batch_loss = loss.item::<f32>();
+
+        // Accumulate loss across micro-batches for accurate reporting
+        self.accumulated_loss += micro_batch_loss as f64;
+        self.loss_accumulation_count += 1;
 
         // Accumulate gradients
         self.accumulate_gradients(grads)?;
@@ -717,6 +731,18 @@ impl TrainingLoop {
             }
         } else {
             None
+        };
+
+        // Compute the reported loss: average across micro-batches when gradient
+        // accumulation completes, otherwise report the current micro-batch loss.
+        let loss_val = if grad_norm.is_some() {
+            // Gradients were applied — report averaged loss across all micro-batches
+            let avg = self.accumulated_loss / self.loss_accumulation_count.max(1) as f64;
+            self.accumulated_loss = 0.0;
+            self.loss_accumulation_count = 0;
+            avg as f32
+        } else {
+            micro_batch_loss
         };
 
         // Update stats

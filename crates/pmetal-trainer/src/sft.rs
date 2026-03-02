@@ -232,7 +232,9 @@ impl SftTrainer {
         loss_weights: &[f32],
     ) -> Result<Array> {
         if all_logits.is_empty() {
-            return Err(SftError::Mlx(Exception::custom("No logits provided for MTP loss")));
+            return Err(SftError::Mlx(Exception::custom(
+                "No logits provided for MTP loss",
+            )));
         }
 
         let mut total_loss = Array::from_f32(0.0);
@@ -263,7 +265,7 @@ impl SftTrainer {
 
             let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
             let mean_loss = loss.mean(None)?;
-            
+
             let weighted_loss = mean_loss.multiply(&Array::from_f32(weight))?;
             total_loss = total_loss.add(&weighted_loss)?;
         }

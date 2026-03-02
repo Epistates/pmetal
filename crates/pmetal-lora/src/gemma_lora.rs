@@ -133,14 +133,18 @@ impl GemmaLoraAttention {
         let head_dim = config.get_head_dim();
         let scale = config.attention_scale();
 
-        let rank = lora_config.r as i32;
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
+        // Per-module ranks respecting target_modules
+        let q_rank = crate::effective_rank(lora_config, "q_proj") as i32;
+        let k_rank = crate::effective_rank(lora_config, "k_proj") as i32;
+        let v_rank = crate::effective_rank(lora_config, "v_proj") as i32;
+        let o_rank = crate::effective_rank(lora_config, "o_proj") as i32;
 
         let q_proj = LoraLinear::new(
             config.hidden_size,
             n_heads * head_dim,
-            rank,
+            q_rank,
             alpha,
             use_rslora,
             false,
@@ -148,7 +152,7 @@ impl GemmaLoraAttention {
         let k_proj = LoraLinear::new(
             config.hidden_size,
             n_kv_heads * head_dim,
-            rank,
+            k_rank,
             alpha,
             use_rslora,
             false,
@@ -156,7 +160,7 @@ impl GemmaLoraAttention {
         let v_proj = LoraLinear::new(
             config.hidden_size,
             n_kv_heads * head_dim,
-            rank,
+            v_rank,
             alpha,
             use_rslora,
             false,
@@ -164,7 +168,7 @@ impl GemmaLoraAttention {
         let o_proj = LoraLinear::new(
             n_heads * head_dim,
             config.hidden_size,
-            rank,
+            o_rank,
             alpha,
             use_rslora,
             false,
@@ -369,14 +373,16 @@ pub struct GemmaLoraMLP {
 impl GemmaLoraMLP {
     /// Create a new LoRA MLP layer.
     pub fn new(config: &GemmaConfig, lora_config: &LoraConfig) -> Result<Self, LoraError> {
-        let rank = lora_config.r as i32;
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
+        let gate_rank = crate::effective_rank(lora_config, "gate_proj") as i32;
+        let up_rank = crate::effective_rank(lora_config, "up_proj") as i32;
+        let down_rank = crate::effective_rank(lora_config, "down_proj") as i32;
 
         let gate_proj = LoraLinear::new(
             config.hidden_size,
             config.intermediate_size,
-            rank,
+            gate_rank,
             alpha,
             use_rslora,
             false,
@@ -384,7 +390,7 @@ impl GemmaLoraMLP {
         let up_proj = LoraLinear::new(
             config.hidden_size,
             config.intermediate_size,
-            rank,
+            up_rank,
             alpha,
             use_rslora,
             false,
@@ -392,7 +398,7 @@ impl GemmaLoraMLP {
         let down_proj = LoraLinear::new(
             config.intermediate_size,
             config.hidden_size,
-            rank,
+            down_rank,
             alpha,
             use_rslora,
             false,

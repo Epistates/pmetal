@@ -46,6 +46,10 @@ pub struct DoraLinear {
     /// the original weight during [`Self::unmerge`].  `None` when the layer
     /// is in the unmerged (normal training) state.
     original_weight: Option<Array>,
+    /// Whether in training mode (controls dropout).
+    pub training: bool,
+    /// LoRA dropout probability.
+    pub lora_dropout: f32,
 }
 
 impl DoraLinear {
@@ -95,6 +99,8 @@ impl DoraLinear {
             lora_b,
             magnitude,
             original_weight: None,
+            training: false,
+            lora_dropout: 0.0,
         })
     }
 
@@ -143,6 +149,8 @@ impl DoraLinear {
             lora_b,
             magnitude,
             original_weight: None,
+            training: false,
+            lora_dropout: 0.0,
         })
     }
 

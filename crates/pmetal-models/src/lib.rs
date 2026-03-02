@@ -42,6 +42,7 @@ pub mod generation;
 pub mod loader;
 pub mod moe;
 pub mod ollama;
+pub mod pipelines;
 pub mod registry;
 pub mod rl_generation;
 pub mod sampling;
