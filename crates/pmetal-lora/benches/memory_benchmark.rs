@@ -11,6 +11,7 @@ use mlx_rs::Array;
 use mlx_rs::transforms::eval;
 use pmetal_core::LoraConfig;
 use pmetal_lora::{Qwen3CustomTrainer, Qwen3LoraForCausalLM};
+use pmetal_models::ModelConfig;
 use pmetal_models::architectures::qwen3::Qwen3Config;
 
 fn create_model_config(hidden_size: i32, num_layers: i32) -> Qwen3Config {

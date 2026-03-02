@@ -57,8 +57,8 @@ pub fn load_clip_weights(
     weights: &HashMap<String, Array>,
 ) -> Result<(), LoadError> {
     for (name, weight) in weights {
-        let name = if name.starts_with("text_model.") {
-            &name["text_model.".len()..]
+        let name = if let Some(stripped) = name.strip_prefix("text_model.") {
+            stripped
         } else {
             name
         };
@@ -466,8 +466,8 @@ pub fn load_flux_weights(
     weights: &HashMap<String, Array>,
 ) -> Result<(), LoadError> {
     for (name, weight) in weights {
-        let name = if name.starts_with("model.diffusion_model.") {
-            &name["model.diffusion_model.".len()..]
+        let name = if let Some(stripped) = name.strip_prefix("model.diffusion_model.") {
+            stripped
         } else {
             name
         };

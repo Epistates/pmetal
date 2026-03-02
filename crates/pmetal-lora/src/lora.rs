@@ -24,7 +24,7 @@ pub(crate) fn apply_dropout(x: &Array, p: f32) -> Result<Array, Exception> {
     let one_minus_p = 1.0 - p;
     let mask = mlx_rs::random::bernoulli(&Array::from_f32(one_minus_p), x.shape(), None)?;
     let scale = Array::from_f32(1.0 / one_minus_p);
-    Ok(x.multiply(&mask.multiply(&scale)?)?)
+    x.multiply(&mask.multiply(&scale)?)
 }
 
 /// Error type for LoRA operations.
@@ -545,9 +545,7 @@ pub fn fused_lora_forward(
 /// - If `target_modules` contains the module name, returns `config.r`.
 /// - Otherwise returns `0`.
 pub fn effective_rank(config: &LoraConfig, module_name: &str) -> usize {
-    if config.target_modules.is_empty() {
-        config.r
-    } else if config.target_modules.iter().any(|m| m == module_name) {
+    if config.target_modules.is_empty() || config.target_modules.iter().any(|m| m == module_name) {
         config.r
     } else {
         0
