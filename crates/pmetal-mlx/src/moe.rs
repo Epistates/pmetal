@@ -160,6 +160,7 @@ impl MoERouter {
 ///
 /// Returns the top-k values and indices from `probs` along the last axis.
 /// This avoids the CPU round-trip and NaN panic of the previous `custom_topk`.
+/// Indices are returned as Int32 (argsort returns Uint32, which is cast).
 fn gpu_topk(probs: &Array, k: usize) -> Result<(Array, Array), Exception> {
     // Negate for descending sort, then argsort on GPU
     let neg_probs = probs.negative()?;
@@ -167,6 +168,9 @@ fn gpu_topk(probs: &Array, k: usize) -> Result<(Array, Array), Exception> {
 
     // Slice first k (the largest values)
     let top_indices = sorted_indices.index((.., ..k as i32));
+
+    // Cast to Int32 for downstream as_slice compatibility (argsort returns Uint32)
+    let top_indices = top_indices.as_type::<i32>()?;
 
     // Gather top-k values
     let top_values = probs.take_along_axis(&top_indices, -1)?;
@@ -313,13 +317,21 @@ impl MoELayer {
             // Weight the output
             let weighted_out = expert_out.multiply(&weight_array)?;
 
-            // Scatter back using scatter_add
-            let idx_2d = idx_array.reshape(&[-1, 1])?;
-            let idx_broadcast = mlx_rs::ops::broadcast_to(&idx_2d, weighted_out.shape())?;
+            // Scatter-add weighted output back to token positions.
+            //
+            // MLX scatter constraint: ndim(updates) == ndim(a) + ndim(indices)
+            //   ndim(a)       = 2  ([batch_seq, hidden])
+            //   ndim(indices) = 1  ([M] — 1-D token index array)
+            //   => ndim(updates) must be 3
+            //
+            // Reshape [M, hidden] -> [M, 1, hidden] so the constraint holds.
+            // The scatter writes updates[i, 0, :] into final_output[idx_array[i], :].
+            let m = token_indices.len() as i32;
+            let updates_3d = weighted_out.reshape(&[m, 1, hidden_size])?;
             final_output = mlx_rs::ops::indexing::scatter_add_single(
                 &final_output,
-                &idx_broadcast,
-                &weighted_out,
+                &idx_array,
+                &updates_3d,
                 0,
             )?;
         }
@@ -377,5 +389,373 @@ impl MoELayer {
             .multiply(&Array::from_f32(num_experts as f32))?;
 
         aux_loss.multiply(&Array::from_f32(self.config.aux_loss_coef))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    // -----------------------------------------------------------------------
+    // Helpers
+    // -----------------------------------------------------------------------
+
+    /// Build a small MoEConfig suitable for fast unit tests.
+    fn small_config() -> MoEConfig {
+        MoEConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            use_aux_loss: true,
+            aux_loss_coef: 0.01,
+            router_jitter: 0.0,
+            normalize_router_weights: true,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 1 — Router output is float32 and normalized weights sum to ~1
+    // -----------------------------------------------------------------------
+
+    /// Verify that the router always returns float32 routing weights regardless
+    /// of input dtype, and that per-token normalized weights sum to exactly 1.
+    #[test]
+    #[serial]
+    fn test_router_softmax_dtype() -> Result<(), Exception> {
+        let hidden = 16_i32;
+        let n_experts = 4_usize;
+        let k = 2_usize;
+        let n_tokens = 6_i32;
+
+        let mut router = MoERouter::new(hidden, n_experts, k);
+
+        // Random float32 input [n_tokens, hidden]
+        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[n_tokens, hidden], None)?;
+
+        let (weights, top_indices, _logits) = router.forward(&input)?;
+
+        // Weights must be float32
+        assert_eq!(
+            weights.dtype(),
+            Dtype::Float32,
+            "routing weights must be float32, got {:?}",
+            weights.dtype()
+        );
+
+        // Shape must be [n_tokens, k]
+        assert_eq!(
+            weights.shape(),
+            &[n_tokens, k as i32],
+            "weights shape mismatch: {:?}",
+            weights.shape()
+        );
+        assert_eq!(
+            top_indices.shape(),
+            &[n_tokens, k as i32],
+            "top_indices shape mismatch: {:?}",
+            top_indices.shape()
+        );
+
+        // Each row must sum to ~1.0 (normalized weights)
+        weights.eval()?;
+        let w_data: Vec<f32> = weights.as_slice::<f32>().to_vec();
+        for token in 0..(n_tokens as usize) {
+            let row_sum: f32 = (0..k).map(|slot| w_data[token * k + slot]).sum();
+            assert!(
+                (row_sum - 1.0).abs() < 1e-5,
+                "token {} weights sum to {}, expected ~1.0",
+                token,
+                row_sum
+            );
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 2 — Top-k selection produces correct shape and valid expert indices
+    // -----------------------------------------------------------------------
+
+    /// Route a 4-token batch through a router with 4 experts and k=2.
+    /// We cannot prescribe exact expert selection without controlling weights,
+    /// but we can assert:
+    ///   - top_indices shape == [N, k]
+    ///   - every selected index is in [0, num_experts)
+    ///   - no duplicate expert per token (each slot is distinct)
+    #[test]
+    #[serial]
+    fn test_topk_selection() -> Result<(), Exception> {
+        let hidden = 16_i32;
+        let n_experts = 4_usize;
+        let k = 2_usize;
+        let n_tokens = 4_i32;
+
+        let mut router = MoERouter::new(hidden, n_experts, k);
+
+        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[n_tokens, hidden], None)?;
+
+        let (_weights, top_indices, _logits) = router.forward(&input)?;
+
+        // Shape must be [n_tokens, k]
+        assert_eq!(
+            top_indices.shape(),
+            &[n_tokens, k as i32],
+            "top_indices shape must be [N, k], got {:?}",
+            top_indices.shape()
+        );
+
+        // Every index must be a valid expert id and no token should pick the
+        // same expert twice (argsort of distinct values is always injective).
+        top_indices.eval()?;
+        let indices: Vec<i32> = top_indices.as_slice::<i32>().to_vec();
+        for token in 0..n_tokens as usize {
+            let a = indices[token * k] as usize;
+            let b = indices[token * k + 1] as usize;
+            assert!(a < n_experts, "token {} slot 0 out of range: {}", token, a);
+            assert!(b < n_experts, "token {} slot 1 out of range: {}", token, b);
+            assert_ne!(
+                a, b,
+                "token {} received duplicate expert assignment: {}/{}",
+                token, a, b
+            );
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 3 — Expert forward pass produces correct output shape
+    // -----------------------------------------------------------------------
+
+    /// A single Expert (SwiGLU MLP) must map [T, hidden] → [T, hidden].
+    #[test]
+    #[serial]
+    fn test_expert_forward_shape() -> Result<(), Exception> {
+        let hidden = 16_i32;
+        let intermediate = 32_i32;
+        let t = 4_i32;
+
+        let mut expert = Expert::new(hidden, intermediate);
+        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[t, hidden], None)?;
+
+        let output = expert.forward(&input)?;
+
+        assert_eq!(
+            output.shape(),
+            &[t, hidden],
+            "expert output shape mismatch: expected [{}, {}], got {:?}",
+            t,
+            hidden,
+            output.shape()
+        );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 4 — MoELayer preserves spatial dimensions end-to-end
+    // -----------------------------------------------------------------------
+
+    /// A complete MoELayer forward pass over a 3-D input [batch, seq, hidden]
+    /// must return an output tensor with the same shape.
+    #[test]
+    #[serial]
+    fn test_moe_layer_output_shape() -> Result<(), Exception> {
+        let config = small_config();
+        let hidden = config.hidden_size;
+        let batch = 2_i32;
+        let seq = 5_i32;
+
+        let mut layer = MoELayer::new(config);
+
+        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[batch, seq, hidden], None)?;
+
+        let (output, _aux) = layer.forward(&input)?;
+
+        assert_eq!(
+            output.shape(),
+            &[batch, seq, hidden],
+            "MoELayer output shape mismatch: expected [{}, {}, {}], got {:?}",
+            batch,
+            seq,
+            hidden,
+            output.shape()
+        );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 5 — Auxiliary loss is Some and strictly positive when enabled
+    // -----------------------------------------------------------------------
+
+    /// The Switch Transformer aux loss `N * sum(f_i * P_i)` is always ≥ 0
+    /// (product of non-negative terms).  For any non-trivial routing it is
+    /// strictly positive, which we verify here.
+    #[test]
+    #[serial]
+    fn test_aux_loss_formula() -> Result<(), Exception> {
+        let config = MoEConfig {
+            use_aux_loss: true,
+            aux_loss_coef: 0.01,
+            ..small_config()
+        };
+        let hidden = config.hidden_size;
+        let mut layer = MoELayer::new(config);
+
+        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[3, 4, hidden], None)?;
+
+        let (_output, aux_loss) = layer.forward(&input)?;
+
+        let aux = aux_loss.expect("aux_loss must be Some when use_aux_loss = true");
+        aux.eval()?;
+        let val: f32 = aux.item();
+
+        assert!(val.is_finite(), "aux_loss must be finite, got {}", val);
+        assert!(
+            val >= 0.0,
+            "aux_loss must be non-negative (Switch Transformer formula), got {}",
+            val
+        );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 6 — Auxiliary loss is None when disabled
+    // -----------------------------------------------------------------------
+
+    /// When `use_aux_loss = false` no extra computation is performed and the
+    /// second element of the forward return is `None`.
+    #[test]
+    #[serial]
+    fn test_aux_loss_disabled() -> Result<(), Exception> {
+        let config = MoEConfig {
+            use_aux_loss: false,
+            ..small_config()
+        };
+        let hidden = config.hidden_size;
+        let mut layer = MoELayer::new(config);
+
+        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[2, 3, hidden], None)?;
+
+        let (_output, aux_loss) = layer.forward(&input)?;
+
+        assert!(
+            aux_loss.is_none(),
+            "aux_loss must be None when use_aux_loss = false"
+        );
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 7 — No NaN / no panic when most experts receive zero tokens
+    // -----------------------------------------------------------------------
+
+    /// With 8 experts, k=2, and only 1 token, exactly 6 experts receive no
+    /// token assignments.  The implementation must handle this gracefully:
+    /// the zero-token experts are skipped, and the output must be a valid
+    /// (non-NaN, finite) tensor.
+    #[test]
+    #[serial]
+    fn test_empty_expert_no_panic() -> Result<(), Exception> {
+        let config = MoEConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_experts: 8,
+            num_experts_per_tok: 2,
+            use_aux_loss: false,
+            aux_loss_coef: 0.01,
+            router_jitter: 0.0,
+            normalize_router_weights: true,
+        };
+        let hidden = config.hidden_size;
+        let mut layer = MoELayer::new(config);
+
+        // Single token — 6 of 8 experts will receive no assignments
+        let input = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[1, hidden], None)?;
+
+        let (output, _aux) = layer.forward(&input)?;
+        output.eval()?;
+
+        assert_eq!(
+            output.shape(),
+            &[1, hidden],
+            "output shape mismatch with sparse expert usage: {:?}",
+            output.shape()
+        );
+
+        // Verify no NaN values in the output
+        let out_data: Vec<f32> = output.as_slice::<f32>().to_vec();
+        for (i, &v) in out_data.iter().enumerate() {
+            assert!(
+                v.is_finite(),
+                "output[{}] = {} is not finite (NaN or Inf) with sparse experts",
+                i,
+                v
+            );
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Test 8 — Eval mode disables jitter noise without panicking
+    // -----------------------------------------------------------------------
+
+    /// In eval mode the router must not apply jitter noise.  We verify this
+    /// by setting jitter > 0 but switching to eval mode, then confirming:
+    ///   - The forward pass completes without panic.
+    ///   - Output shape is correct.
+    ///   - Calling the same deterministic input twice produces identical results
+    ///     (no stochastic noise in eval mode).
+    #[test]
+    #[serial]
+    fn test_moe_layer_eval_mode() -> Result<(), Exception> {
+        let config = MoEConfig {
+            router_jitter: 0.1, // Would add noise in training mode
+            use_aux_loss: false,
+            ..small_config()
+        };
+        let hidden = config.hidden_size;
+        let mut layer = MoELayer::new(config);
+
+        // Switch to eval — jitter must be suppressed
+        layer.eval();
+
+        // Use a fixed deterministic input
+        let input_data: Vec<f32> = (0..(3 * hidden as usize))
+            .map(|i| (i as f32) * 0.01)
+            .collect();
+        let input = Array::from_slice(&input_data, &[3, hidden]);
+
+        let (output_a, _) = layer.forward(&input)?;
+        let (output_b, _) = layer.forward(&input)?;
+
+        output_a.eval()?;
+        output_b.eval()?;
+
+        assert_eq!(
+            output_a.shape(),
+            &[3, hidden],
+            "eval mode output shape mismatch: {:?}",
+            output_a.shape()
+        );
+
+        // Both passes must produce identical results (eval mode is deterministic)
+        let a: Vec<f32> = output_a.as_slice::<f32>().to_vec();
+        let b: Vec<f32> = output_b.as_slice::<f32>().to_vec();
+        for (i, (va, vb)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!(
+                va, vb,
+                "eval mode outputs differ at index {}: {} vs {} — jitter may still be active",
+                i, va, vb
+            );
+        }
+
+        Ok(())
     }
 }

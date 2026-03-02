@@ -861,3 +861,580 @@ impl Default for CombinedReward {
         Self::new()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::Array;
+    use serial_test::serial;
+
+    // ---------------------------------------------------------------------------
+    // Helpers
+    // ---------------------------------------------------------------------------
+
+    /// Build a GrpoTrainer with a minimal config, overriding fields as needed.
+    fn make_trainer(config: GrpoConfig) -> GrpoTrainer {
+        GrpoTrainer {
+            config,
+            training_config: pmetal_core::TrainingConfig::default(),
+            step: 0,
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // 1. compute_advantages — whitened
+    // ---------------------------------------------------------------------------
+
+    /// Group 1: rewards=[1,2,3,4], mean=2.5, std=sqrt(5/3)≈1.291
+    /// Group 2: rewards=[10,10,10,10], mean=10.0, std≈0 → all advantages ≈ 0
+    #[test]
+    fn test_compute_advantages_whitened() {
+        let trainer = make_trainer(GrpoConfig {
+            whiten_advantages: true,
+            ..GrpoConfig::default()
+        });
+
+        let rewards = [1.0, 2.0, 3.0, 4.0, 10.0, 10.0, 10.0, 10.0];
+        let advantages = trainer.compute_advantages(&rewards, 2).unwrap();
+
+        assert_eq!(advantages.len(), 8);
+
+        // Group 1 — values should be non-zero (distinct rewards)
+        let g1 = &advantages[0..4];
+        let g1_max_abs = g1.iter().cloned().fold(0.0_f64, f64::max);
+        assert!(
+            g1_max_abs > 0.1,
+            "group 1 advantages should be non-zero; got {g1:?}"
+        );
+
+        // The whitened advantages for group 1 should sum to ~0
+        let g1_sum: f64 = g1.iter().sum();
+        assert!(
+            g1_sum.abs() < 1e-10,
+            "whitened advantages should sum to 0; got {g1_sum}"
+        );
+
+        // Verify ordering preserved: reward 4 should yield the highest advantage
+        assert!(
+            g1[3] > g1[2] && g1[2] > g1[1] && g1[1] > g1[0],
+            "advantages should be monotone with rewards; got {g1:?}"
+        );
+
+        // Group 2 — all same reward → variance ≈ 0 → clamped by 1e-4 floor
+        // The advantages will be (10 - 10) / std ≈ 0 / 1e-4 = 0
+        let g2 = &advantages[4..8];
+        for (i, &adv) in g2.iter().enumerate() {
+            assert!(
+                adv.abs() < 1e-9,
+                "group 2 advantage[{i}] should be ~0; got {adv}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // 2. compute_advantages — unwhitened
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_advantages_unwhitened() {
+        let trainer = make_trainer(GrpoConfig {
+            whiten_advantages: false,
+            ..GrpoConfig::default()
+        });
+
+        let rewards = [1.0, 2.0, 3.0, 4.0, 10.0, 10.0, 10.0, 10.0];
+        let advantages = trainer.compute_advantages(&rewards, 2).unwrap();
+
+        assert_eq!(advantages.len(), 8);
+
+        // Group 1: mean = 2.5 → advantages = [-1.5, -0.5, 0.5, 1.5]
+        let g1 = &advantages[0..4];
+        let expected_g1 = [-1.5_f64, -0.5, 0.5, 1.5];
+        for (i, (&got, &exp)) in g1.iter().zip(expected_g1.iter()).enumerate() {
+            assert!(
+                (got - exp).abs() < 1e-12,
+                "g1[{i}]: expected {exp}, got {got}"
+            );
+        }
+
+        // Group 2: mean = 10.0 → all advantages = 0.0
+        let g2 = &advantages[4..8];
+        for (i, &adv) in g2.iter().enumerate() {
+            assert!(adv.abs() < 1e-12, "g2[{i}]: expected 0.0, got {adv}");
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // 3. compute_advantages — error cases
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_compute_advantages_errors() {
+        let trainer = make_trainer(GrpoConfig::default());
+
+        // num_prompts = 0 → Config error
+        let err = trainer.compute_advantages(&[1.0, 2.0], 0).unwrap_err();
+        assert!(
+            matches!(err, GrpoError::Config(_)),
+            "expected Config error for num_prompts=0, got {err:?}"
+        );
+
+        // rewards.len() not divisible by num_prompts
+        let err = trainer.compute_advantages(&[1.0, 2.0, 3.0], 2).unwrap_err();
+        assert!(
+            matches!(err, GrpoError::Config(_)),
+            "expected Config error for indivisible len, got {err:?}"
+        );
+
+        // Empty rewards with num_prompts=1 → group size 0 → Config error
+        let err = trainer.compute_advantages(&[], 1).unwrap_err();
+        assert!(
+            matches!(err, GrpoError::Config(_)),
+            "expected Config error for empty rewards, got {err:?}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // 4. compute_grpo_loss — ratio = 1 (per_token_logps == old_per_token_logps)
+    // ---------------------------------------------------------------------------
+
+    /// When the current and old log-probs are identical the importance ratio is
+    /// exactly 1, so the PPO-clip surrogate is:
+    ///   L = -min(1 * A, clip(1, 1-ε, 1+ε) * A) = -A
+    /// The final loss (averaged over tokens) should equal -mean(advantages).
+    #[test]
+    #[serial]
+    fn test_compute_grpo_loss_ratio_one() {
+        let trainer = make_trainer(GrpoConfig {
+            beta: 0.0, // no KL penalty
+            ..GrpoConfig::default()
+        });
+
+        // [2 sequences, 4 tokens]
+        let logps_data: Vec<f32> = vec![
+            -0.5, -0.5, -0.5, -0.5, // seq 0
+            -1.0, -1.0, -1.0, -1.0, // seq 1
+        ];
+        let per_token_logps = Array::from_slice(&logps_data, &[2, 4]);
+        let old_per_token_logps = Array::from_slice(&logps_data, &[2, 4]);
+
+        // advantages: [2] — one per sequence
+        let advantages_data = [1.0f32, -1.0];
+        let advantages = Array::from_slice(&advantages_data, &[2]);
+
+        // completion_mask: all valid tokens
+        let mask_data = [1.0f32; 8];
+        let completion_mask = Array::from_slice(&mask_data, &[2, 4]);
+
+        let (total_loss, kl_mean, policy_loss) = trainer
+            .compute_grpo_loss(
+                &per_token_logps,
+                &old_per_token_logps,
+                None,
+                &advantages,
+                &completion_mask,
+                None,
+            )
+            .unwrap();
+
+        total_loss.eval().unwrap();
+        kl_mean.eval().unwrap();
+        policy_loss.eval().unwrap();
+
+        let loss_val: f32 = total_loss.item();
+        let kl_val: f32 = kl_mean.item();
+
+        assert!(
+            loss_val.is_finite(),
+            "total loss must be finite, got {loss_val}"
+        );
+
+        // KL is 0 when beta=0 and no ref model
+        assert!(
+            kl_val.abs() < 1e-6,
+            "KL should be ~0 with no ref model; got {kl_val}"
+        );
+
+        // When ratio=1 and clipping is inactive, L = -mean(A).
+        // mean(A) for the whole batch over equal token counts =
+        //   (-A[0] * 4 tokens + -A[1] * 4 tokens) / 8  = -(1.0 - 1.0)/2 = 0.0
+        // The per-token loss is -A (broadcast), so the mean should be ~0
+        // (advantages cancel: one positive, one negative with equal weight).
+        assert!(
+            loss_val.abs() < 1e-5,
+            "loss should be ~0 when advantages cancel; got {loss_val}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // 5. compute_grpo_loss — PPO clipping
+    // ---------------------------------------------------------------------------
+
+    /// Drive the ratio far outside [0.8, 1.2] by using very different log-probs.
+    /// The loss should still be finite (clipping prevents exploding gradients).
+    #[test]
+    #[serial]
+    fn test_compute_grpo_loss_clipping() {
+        let trainer = make_trainer(GrpoConfig {
+            beta: 0.0,
+            epsilon_low: 0.2,
+            epsilon_high: 0.2,
+            ..GrpoConfig::default()
+        });
+
+        // Current policy: very different from old (log ratio ~ +5)
+        let per_token_logps = Array::from_slice(
+            &[-0.1f32, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1],
+            &[2, 4],
+        );
+        // Old policy: much lower log-probs → log_ratio = (-0.1) - (-5.1) = 5.0
+        let old_per_token_logps = Array::from_slice(
+            &[-5.1f32, -5.1, -5.1, -5.1, -5.1, -5.1, -5.1, -5.1],
+            &[2, 4],
+        );
+
+        let advantages = Array::from_slice(&[1.0f32, 1.0], &[2]);
+        let completion_mask = Array::from_slice(&[1.0f32; 8], &[2, 4]);
+
+        let (total_loss, _kl, _policy_loss) = trainer
+            .compute_grpo_loss(
+                &per_token_logps,
+                &old_per_token_logps,
+                None,
+                &advantages,
+                &completion_mask,
+                None,
+            )
+            .unwrap();
+
+        total_loss.eval().unwrap();
+
+        let loss_val: f32 = total_loss.item();
+
+        assert!(!loss_val.is_nan(), "loss must not be NaN; got {loss_val}");
+        assert!(loss_val.is_finite(), "loss must be finite; got {loss_val}");
+
+        // With positive advantages and clipping at 1.2, the clipped surrogate yields:
+        //   surr2 = clip(ratio, 0.8, 1.2) * A = 1.2 * 1.0 = 1.2  (ratio >> 1.2)
+        //   surr1 = ratio * A >> 1.2
+        //   min(surr1, surr2) = 1.2
+        //   token_policy_loss = -min(...) = -1.2
+        // Averaged across all tokens and both sequences → loss = -1.2.
+        // This is correct: gradient descent on a negative loss ascends reward.
+        let expected = -1.2f32;
+        assert!(
+            (loss_val - expected).abs() < 1e-4,
+            "clipped loss should be ~{expected}, got {loss_val}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // 6. KL penalty is non-negative
+    // ---------------------------------------------------------------------------
+
+    /// KL(pi || ref) estimated via the Schulman approximation:
+    ///   kl ≈ exp(ref - pi) - 1 - (ref - pi)
+    /// This is always >= 0. Verify that:
+    ///   a) kl_mean >= 0 when policy ≠ reference
+    ///   b) kl_mean ≈ 0 when policy == reference
+    #[test]
+    #[serial]
+    fn test_kl_penalty_non_negative() {
+        let trainer = make_trainer(GrpoConfig {
+            beta: 0.1,
+            ..GrpoConfig::default()
+        });
+
+        let per_token_logps = Array::from_slice(
+            &[-0.5f32, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5],
+            &[2, 4],
+        );
+        // Reference is much more certain (higher log-probs)
+        let ref_per_token_logps = Array::from_slice(
+            &[-0.1f32, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1, -0.1],
+            &[2, 4],
+        );
+
+        let advantages = Array::from_slice(&[0.0f32, 0.0], &[2]);
+        let completion_mask = Array::from_slice(&[1.0f32; 8], &[2, 4]);
+
+        // Case A: different ref → KL should be > 0
+        let (_total, kl_mean_a, _policy) = trainer
+            .compute_grpo_loss(
+                &per_token_logps,
+                &per_token_logps, // old == current (ratio=1)
+                Some(&ref_per_token_logps),
+                &advantages,
+                &completion_mask,
+                None,
+            )
+            .unwrap();
+
+        kl_mean_a.eval().unwrap();
+        let kl_val_a: f32 = kl_mean_a.item();
+        assert!(kl_val_a >= 0.0, "KL must be >= 0; got {kl_val_a}");
+        assert!(kl_val_a.is_finite(), "KL must be finite; got {kl_val_a}");
+        // Expectation: ref is closer to 0 than policy, so KL > 0 is expected.
+        // The Schulman approx: exp(ref-pi) - 1 - (ref-pi) = exp(0.4) - 1 - 0.4 ≈ 0.092
+        assert!(
+            kl_val_a > 0.01,
+            "KL should be noticeably positive; got {kl_val_a}"
+        );
+
+        // Case B: ref == policy → KL should be ~0
+        let (_total, kl_mean_b, _policy) = trainer
+            .compute_grpo_loss(
+                &per_token_logps,
+                &per_token_logps,
+                Some(&per_token_logps), // ref == policy
+                &advantages,
+                &completion_mask,
+                None,
+            )
+            .unwrap();
+
+        kl_mean_b.eval().unwrap();
+        let kl_val_b: f32 = kl_mean_b.item();
+        assert!(
+            kl_val_b.abs() < 1e-5,
+            "KL should be ~0 when ref==policy; got {kl_val_b}"
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // 7. All four loss types produce finite scalars
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    #[serial]
+    fn test_grpo_loss_reduction_variants() {
+        let loss_types = [
+            GrpoLossType::Bnpo,
+            GrpoLossType::DrGrpo,
+            GrpoLossType::Dapo,
+            GrpoLossType::Reinforce,
+        ];
+
+        let per_token_logps = Array::from_slice(
+            &[-0.5f32, -0.6, -0.7, -0.8, -0.4, -0.5, -0.6, -0.7],
+            &[2, 4],
+        );
+        let old_per_token_logps = Array::from_slice(
+            &[-0.5f32, -0.6, -0.7, -0.8, -0.4, -0.5, -0.6, -0.7],
+            &[2, 4],
+        );
+        let advantages = Array::from_slice(&[0.5f32, -0.5], &[2]);
+        let completion_mask = Array::from_slice(&[1.0f32; 8], &[2, 4]);
+
+        for loss_type in loss_types {
+            let trainer = make_trainer(GrpoConfig {
+                beta: 0.0,
+                loss_type,
+                ..GrpoConfig::default()
+            });
+
+            let (total_loss, _kl, _policy_loss) = trainer
+                .compute_grpo_loss(
+                    &per_token_logps,
+                    &old_per_token_logps,
+                    None,
+                    &advantages,
+                    &completion_mask,
+                    None,
+                )
+                .unwrap();
+
+            total_loss.eval().unwrap();
+            let loss_val: f32 = total_loss.item();
+
+            assert!(
+                !loss_val.is_nan(),
+                "loss_type={loss_type:?}: loss must not be NaN, got {loss_val}"
+            );
+            assert!(
+                loss_val.is_finite(),
+                "loss_type={loss_type:?}: loss must be finite, got {loss_val}"
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // 8. XmlFormatReward
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_xml_format_reward() {
+        let reward = XmlFormatReward::default_reasoning();
+
+        // Proper XML with correct tag ordering → 2 tag-pairs × 0.5 = 1.0
+        let good = "<thought>I need to think.</thought><answer>42</answer>".to_string();
+        let rewards = reward
+            .compute(&["prompt".to_string()], &[good], None)
+            .unwrap();
+        assert_eq!(rewards.len(), 1, "should return one reward per completion");
+        assert!(
+            (rewards[0] - 1.0).abs() < 1e-12,
+            "proper XML should score 1.0, got {}",
+            rewards[0]
+        );
+
+        // Missing both thought tags entirely → only answer pair can score → 0.5
+        let missing_thought = "<answer>42</answer>".to_string();
+        let rewards = reward
+            .compute(&["prompt".to_string()], &[missing_thought], None)
+            .unwrap();
+        assert!(
+            (rewards[0] - 0.5).abs() < 1e-12,
+            "missing thought tags should score 0.5 (only answer pair valid), got {}",
+            rewards[0]
+        );
+
+        // Missing ALL closing tags → score 0.0
+        let missing_close = "<thought>no close tag <answer>42".to_string();
+        let rewards = reward
+            .compute(&["prompt".to_string()], &[missing_close], None)
+            .unwrap();
+        assert!(
+            rewards[0].abs() < 1e-12,
+            "missing all closing tags should score 0, got {}",
+            rewards[0]
+        );
+
+        // Reversed tags (end before start) → the start_idx < end_idx check fails → 0.0
+        let reversed = "</thought>content<thought><answer>42</answer>".to_string();
+        let rewards = reward
+            .compute(&["prompt".to_string()], &[reversed], None)
+            .unwrap();
+        // <thought> score: </thought> appears first → start_idx > end_idx → 0
+        // <answer> score: correct → 0.5
+        // Total: 0.5 (only the answer pair is valid)
+        assert!(
+            rewards[0] < 1.0,
+            "reversed <thought> tags should not score full 1.0, got {}",
+            rewards[0]
+        );
+
+        // Completely empty completion → 0.0
+        let empty = "".to_string();
+        let rewards = reward
+            .compute(&["prompt".to_string()], &[empty], None)
+            .unwrap();
+        assert!(
+            rewards[0].abs() < 1e-12,
+            "empty completion should score 0.0, got {}",
+            rewards[0]
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // 9. AccuracyReward
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_accuracy_reward() {
+        // 1 prompt, 2 generations → answers has 1 entry, completions has 2
+        let reward = AccuracyReward::new(vec!["42".to_string()]);
+
+        // Exact match inside <answer> tags
+        let exact = "<thought>some thought</thought><answer>42</answer>".to_string();
+        // Non-matching completion
+        let wrong = "<answer>99</answer>".to_string();
+
+        let rewards = reward
+            .compute(
+                &["what is 6*7?".to_string(), "what is 6*7?".to_string()],
+                &[exact, wrong],
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(rewards.len(), 2);
+        assert!(
+            (rewards[0] - 1.0).abs() < 1e-12,
+            "exact match should score 1.0, got {}",
+            rewards[0]
+        );
+        assert!(
+            rewards[1].abs() < 1e-12,
+            "wrong answer should score 0.0, got {}",
+            rewards[1]
+        );
+
+        // No <answer> tags: raw completion compared directly to ground truth
+        let raw_exact = AccuracyReward::new(vec!["hello".to_string()]);
+        let completions = vec!["  hello  ".to_string(), "goodbye".to_string()];
+        let rewards = raw_exact
+            .compute(
+                &["prompt".to_string(), "prompt".to_string()],
+                &completions,
+                None,
+            )
+            .unwrap();
+
+        assert!(
+            (rewards[0] - 1.0).abs() < 1e-12,
+            "trimmed raw match should score 1.0, got {}",
+            rewards[0]
+        );
+        assert!(
+            rewards[1].abs() < 1e-12,
+            "non-matching raw completion should score 0.0, got {}",
+            rewards[1]
+        );
+    }
+
+    // ---------------------------------------------------------------------------
+    // 10. CombinedReward
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_combined_reward() {
+        // Build a combined reward: 0.5 * xml_format + 0.5 * accuracy
+        let combined = CombinedReward::new()
+            .add(Box::new(XmlFormatReward::default_reasoning()), 0.5)
+            .add(Box::new(AccuracyReward::new(vec!["42".to_string()])), 0.5);
+
+        // Perfect completion: correct XML AND correct answer
+        let perfect = "<thought>some reasoning</thought><answer>42</answer>".to_string();
+        // Xml only: correct formatting but wrong answer
+        let xml_only = "<thought>some reasoning</thought><answer>99</answer>".to_string();
+        // Neither: no tags, wrong answer
+        let neither = "the answer is probably 7".to_string();
+
+        let completions = vec![perfect, xml_only, neither];
+        let prompts = vec!["what is 6*7?".to_string(); 3];
+
+        let rewards = combined.compute(&prompts, &completions, None).unwrap();
+
+        assert_eq!(rewards.len(), 3);
+
+        // Perfect: xml=1.0*0.5 + accuracy=1.0*0.5 = 1.0
+        assert!(
+            (rewards[0] - 1.0).abs() < 1e-12,
+            "perfect completion should score 1.0, got {}",
+            rewards[0]
+        );
+
+        // Xml only: xml=1.0*0.5 + accuracy=0.0*0.5 = 0.5
+        assert!(
+            (rewards[1] - 0.5).abs() < 1e-12,
+            "xml-only should score 0.5, got {}",
+            rewards[1]
+        );
+
+        // Neither: 0.0
+        assert!(
+            rewards[2].abs() < 1e-12,
+            "neither should score 0.0, got {}",
+            rewards[2]
+        );
+
+        // Empty functions list → error
+        let empty = CombinedReward::new();
+        let err = empty.compute(&[], &[], None).unwrap_err();
+        assert!(
+            matches!(err, GrpoError::Reward(_)),
+            "empty CombinedReward should error, got {err:?}"
+        );
+    }
+}

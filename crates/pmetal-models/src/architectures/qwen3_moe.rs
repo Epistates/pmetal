@@ -458,6 +458,8 @@ impl Qwen3MoEBlock {
         };
 
         // Eval for CPU-side index extraction (small tensor)
+        // argsort returns Uint32; cast to Int32 for as_slice compatibility
+        let top_indices = top_indices.as_type::<i32>()?;
         top_indices.eval()?;
         normalized_weights.eval()?;
 
@@ -495,12 +497,16 @@ impl Qwen3MoEBlock {
             let expert_out = self.experts[expert_idx].forward(&expert_input)?;
             let weighted_out = expert_out.multiply(&weight_array)?;
 
-            let idx_2d = idx_array.reshape(&[-1, 1])?;
-            let idx_broadcast = mlx_rs::ops::broadcast_to(&idx_2d, weighted_out.shape())?;
+            // Scatter-add weighted expert output back to the correct token positions.
+            // MLX scatter constraint: ndim(updates) == ndim(a) + ndim(indices)
+            //   ndim(a)=2, ndim(indices)=1 => ndim(updates) must be 3
+            // Reshape [M, hidden] -> [M, 1, hidden] so the constraint holds.
+            let m = token_indices.len() as i32;
+            let updates_3d = weighted_out.reshape(&[m, 1, hidden_size])?;
             final_output = mlx_rs::ops::indexing::scatter_add_single(
                 &final_output,
-                &idx_broadcast,
-                &weighted_out,
+                &idx_array,
+                &updates_3d,
                 0,
             )?;
         }
@@ -826,5 +832,167 @@ mod tests {
     fn test_create_dense_mlp() {
         let mlp = Qwen3MoEDenseMLP::new(2048, 5632);
         assert!(mlp.is_ok());
+    }
+
+    fn tiny_moe_config() -> Qwen3MoEConfig {
+        Qwen3MoEConfig {
+            hidden_size: 32,
+            intermediate_size: 64,
+            moe_intermediate_size: Some(32),
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(1),
+            head_dim: 16,
+            vocab_size: 100,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            decoder_sparse_step: 1,
+            tie_word_embeddings: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_feed_forward_dense_dispatch() {
+        let config = tiny_moe_config();
+        let mut ffn = Qwen3MoEFeedForward::Dense(
+            Qwen3MoEDenseMLP::new(config.hidden_size, config.intermediate_size).unwrap(),
+        );
+        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
+            .unwrap();
+        let out = ffn.forward(&x).unwrap();
+        assert_eq!(out.shape(), &[1, 4, config.hidden_size]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_feed_forward_moe_dispatch() {
+        let config = tiny_moe_config();
+        let mut ffn = Qwen3MoEFeedForward::MoE(Qwen3MoEBlock::new(&config).unwrap());
+        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
+            .unwrap();
+        let out = ffn.forward(&x).unwrap();
+        assert_eq!(out.shape(), &[1, 4, config.hidden_size]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_tie_word_embeddings_none_lm_head() {
+        let mut config = tiny_moe_config();
+        config.tie_word_embeddings = true;
+        let model = Qwen3MoE::new(config).unwrap();
+        assert!(
+            model.lm_head.is_none(),
+            "lm_head should be None when tie_word_embeddings is true"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_separate_lm_head() {
+        let mut config = tiny_moe_config();
+        config.tie_word_embeddings = false;
+        let model = Qwen3MoE::new(config).unwrap();
+        assert!(
+            model.lm_head.is_some(),
+            "lm_head should be Some when tie_word_embeddings is false"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_module_parameters_delegation() {
+        let config = tiny_moe_config();
+
+        // Test Dense variant exposes parameters
+        let ffn_dense = Qwen3MoEFeedForward::Dense(
+            Qwen3MoEDenseMLP::new(config.hidden_size, config.intermediate_size).unwrap(),
+        );
+        assert!(
+            ffn_dense.num_parameters() > 0,
+            "Dense FFN should have parameters"
+        );
+        let params = ffn_dense.parameters();
+        assert!(
+            !params.entries.is_empty(),
+            "Dense FFN parameters() should be non-empty"
+        );
+
+        // Test MoE variant exposes parameters
+        let ffn_moe = Qwen3MoEFeedForward::MoE(Qwen3MoEBlock::new(&config).unwrap());
+        assert!(
+            ffn_moe.num_parameters() > 0,
+            "MoE FFN should have parameters"
+        );
+        let params = ffn_moe.parameters();
+        assert!(
+            !params.entries.is_empty(),
+            "MoE FFN parameters() should be non-empty"
+        );
+
+        // MoE should have more parameters than Dense (4 experts × 3 linear each + gate)
+        assert!(
+            ffn_moe.num_parameters() > ffn_dense.num_parameters(),
+            "MoE should have more parameters than Dense"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_moe_block_forward_shape() {
+        let config = tiny_moe_config();
+        let mut block = Qwen3MoEBlock::new(&config).unwrap();
+        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
+            .unwrap();
+        let out = block.forward(&x).unwrap();
+        assert_eq!(out.shape(), &[2, 5, config.hidden_size]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_full_model_forward_shape() {
+        let config = tiny_moe_config();
+        let mut model = Qwen3MoE::new(config.clone()).unwrap();
+        let input_ids = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
+        let out = model.forward(&input_ids, None, None).unwrap();
+        assert_eq!(out.shape(), &[1, 4, config.vocab_size]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_decoder_layer_moe_vs_dense() {
+        let config = tiny_moe_config();
+
+        // Layer 0 with sparse_step=1 should be MoE
+        let layer_moe = Qwen3MoEDecoderLayer::new(config.clone(), 0).unwrap();
+        assert!(
+            matches!(layer_moe.ffn, Qwen3MoEFeedForward::MoE(_)),
+            "Layer 0 should be MoE with sparse_step=1"
+        );
+
+        // Force layer 0 to be dense via mlp_only_layers
+        let mut config_dense = config.clone();
+        config_dense.mlp_only_layers = vec![0];
+        let layer_dense = Qwen3MoEDecoderLayer::new(config_dense, 0).unwrap();
+        assert!(
+            matches!(layer_dense.ffn, Qwen3MoEFeedForward::Dense(_)),
+            "Layer 0 should be Dense when in mlp_only_layers"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_freeze_unfreeze_delegation() {
+        let config = tiny_moe_config();
+        let mut ffn = Qwen3MoEFeedForward::MoE(Qwen3MoEBlock::new(&config).unwrap());
+
+        // Freeze all parameters
+        ffn.freeze_parameters(true);
+        assert_eq!(ffn.all_frozen(), Some(true));
+
+        // Unfreeze all parameters
+        ffn.unfreeze_parameters(true);
+        assert_eq!(ffn.all_frozen(), Some(false));
     }
 }

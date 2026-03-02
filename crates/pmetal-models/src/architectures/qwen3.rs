@@ -629,3 +629,179 @@ impl crate::traits::CausalLMModel for Qwen3ForCausalLM {
         ModuleParametersExt::eval(self)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn tiny_config() -> Qwen3Config {
+        Qwen3Config {
+            hidden_size: 32,
+            intermediate_size: 64,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: Some(1),
+            head_dim: 16,
+            vocab_size: 100,
+            ..Default::default()
+        }
+    }
+
+    // --- Sliding window logic (pure CPU, no GPU) ---
+
+    #[test]
+    fn test_sliding_window_layer_types() {
+        let mut config = tiny_config();
+        config.layer_types = Some(vec![
+            "dense".to_string(),
+            "sliding_window".to_string(),
+            "dense".to_string(),
+            "sliding_window".to_string(),
+        ]);
+
+        assert!(!config.use_sliding_window_at(0), "layer 0 should be dense");
+        assert!(
+            config.use_sliding_window_at(1),
+            "layer 1 should be sliding_window"
+        );
+        assert!(!config.use_sliding_window_at(2), "layer 2 should be dense");
+        assert!(
+            config.use_sliding_window_at(3),
+            "layer 3 should be sliding_window"
+        );
+    }
+
+    #[test]
+    fn test_sliding_window_max_layers() {
+        let mut config = tiny_config();
+        config.use_sliding_window = true;
+        config.max_window_layers = Some(2);
+
+        // Layers below max_window_layers should NOT use sliding window
+        assert!(
+            !config.use_sliding_window_at(0),
+            "layer 0 < max_window_layers, should be dense"
+        );
+        assert!(
+            !config.use_sliding_window_at(1),
+            "layer 1 < max_window_layers, should be dense"
+        );
+        // Layers at or above max_window_layers SHOULD use sliding window
+        assert!(
+            config.use_sliding_window_at(2),
+            "layer 2 >= max_window_layers, should be sliding"
+        );
+        assert!(
+            config.use_sliding_window_at(3),
+            "layer 3 >= max_window_layers, should be sliding"
+        );
+    }
+
+    #[test]
+    fn test_sliding_window_default() {
+        let config = tiny_config();
+        // Default config has use_sliding_window=false and no layer_types/max_window_layers
+        assert!(!config.use_sliding_window_at(0));
+        assert!(!config.use_sliding_window_at(1));
+        assert!(!config.use_sliding_window_at(10));
+    }
+
+    // --- Forward shape tests (GPU-backed via MLX) ---
+
+    #[test]
+    #[serial]
+    fn test_qwen3_mlp_forward_shape() {
+        let config = tiny_config();
+        let mut mlp = Qwen3MLP::new(&config).unwrap();
+
+        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let output = mlp.forward(x).unwrap();
+
+        assert_eq!(output.shape(), &[1, 4, 32]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_qwen3_attention_output_shape() {
+        let config = tiny_config();
+        let mut attn = Qwen3Attention::new(&config, false).unwrap();
+
+        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let output = attn.forward(&x, None, None).unwrap();
+
+        assert_eq!(output.shape(), &[1, 4, 32]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_qwen3_layer_forward_shape() {
+        let config = tiny_config();
+        let mut layer = Qwen3Layer::new(&config, false).unwrap();
+
+        let x = mlx_rs::random::normal::<f32>(&[1, 4, 32], None, None, None).unwrap();
+        let output = layer.forward(&x, None, None).unwrap();
+
+        assert_eq!(output.shape(), &[1, 4, 32]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_qwen3_causal_lm_forward_shape() {
+        let config = tiny_config();
+        let vocab_size = config.vocab_size;
+        let mut model = Qwen3ForCausalLM::new(config).unwrap();
+
+        let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let logits = model.forward(&input_ids, None).unwrap();
+
+        assert_eq!(logits.shape(), &[1, 4, vocab_size]);
+    }
+
+    // --- tie_word_embeddings ---
+
+    #[test]
+    #[serial]
+    fn test_tie_word_embeddings_true() {
+        let mut config = tiny_config();
+        config.tie_word_embeddings = true;
+        let model = Qwen3ForCausalLM::new(config).unwrap();
+
+        assert!(
+            model.lm_head.is_none(),
+            "lm_head should be None when tie_word_embeddings=true"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_tie_word_embeddings_false() {
+        let mut config = tiny_config();
+        config.tie_word_embeddings = false;
+        let model = Qwen3ForCausalLM::new(config).unwrap();
+
+        assert!(
+            model.lm_head.is_some(),
+            "lm_head should be Some when tie_word_embeddings=false"
+        );
+    }
+
+    // --- ModelConfig trait ---
+
+    #[test]
+    fn test_model_config_trait() {
+        let config = tiny_config();
+
+        assert_eq!(config.model_type(), "qwen3");
+        assert_eq!(config.vocab_size(), 100);
+        assert_eq!(config.hidden_size(), 32);
+        assert_eq!(config.num_hidden_layers(), 2);
+        assert_eq!(config.num_attention_heads(), 2);
+        assert_eq!(config.num_kv_heads(), 1);
+        assert_eq!(config.head_dim(), 16);
+        assert_eq!(config.intermediate_size(), 64);
+        assert_eq!(config.norm_eps(), 1e-6_f32);
+        assert_eq!(config.rope_theta(), 1_000_000.0_f32);
+        assert!(config.tie_word_embeddings());
+    }
+}
