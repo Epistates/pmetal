@@ -296,16 +296,22 @@ kernel void gradient_norm_squared_partial(
     // Threadgroup-local reduction buffer
     threadgroup float shared_sum[256];
 
-    // Each thread accumulates multiple elements
+    // Each thread accumulates 4 elements via float4 vectorized load + dot product
     float local_sum = 0.0f;
-    uint start = tgid * tg_size * 4 + tid;
+    uint base = tgid * tg_size * 4 + tid * 4;
 
-    // Process 4 elements per thread for better throughput
-    for (uint i = 0; i < 4; i++) {
-        uint idx = start + i * tg_size;
-        if (idx < total_elements) {
-            float g = grads[idx];
-            local_sum += g * g;
+    if (base + 3 < total_elements) {
+        // Full float4 load — 128-bit aligned for maximum bandwidth
+        float4 g4 = *(device const float4*)(grads + base);
+        local_sum = dot(g4, g4);
+    } else {
+        // Scalar fallback for boundary
+        for (uint i = 0; i < 4; i++) {
+            uint idx = base + i;
+            if (idx < total_elements) {
+                float g = grads[idx];
+                local_sum += g * g;
+            }
         }
     }
 
@@ -339,8 +345,16 @@ kernel void scale_gradients(
     constant uint& total_elements [[buffer(2)]],
     uint tid [[thread_position_in_grid]]
 ) {
-    if (tid < total_elements) {
-        grads[tid] *= scale;
+    // Process 4 elements per thread via float4 for 4x bandwidth
+    uint base = tid * 4;
+    if (base + 3 < total_elements) {
+        float4 g4 = *(device const float4*)(grads + base);
+        *(device float4*)(grads + base) = g4 * scale;
+    } else {
+        // Scalar fallback for remainder
+        for (uint i = base; i < min(base + 4u, total_elements); i++) {
+            grads[i] *= scale;
+        }
     }
 }
 
@@ -351,8 +365,15 @@ kernel void scale_gradients_f16(
     constant uint& total_elements [[buffer(2)]],
     uint tid [[thread_position_in_grid]]
 ) {
-    if (tid < total_elements) {
-        grads[tid] = half(float(grads[tid]) * scale);
+    // Process 4 elements per thread via half4 for 4x bandwidth
+    uint base = tid * 4;
+    if (base + 3 < total_elements) {
+        half4 g4 = *(device const half4*)(grads + base);
+        *(device half4*)(grads + base) = half4(float4(g4) * scale);
+    } else {
+        for (uint i = base; i < min(base + 4u, total_elements); i++) {
+            grads[i] = half(float(grads[i]) * scale);
+        }
     }
 }
 

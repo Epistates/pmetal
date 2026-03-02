@@ -32,6 +32,13 @@ thiserror = { workspace = true }
 # Logging
 tracing = { workspace = true }
 
+# Serialization (for persistent disk cache)
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Directory resolution (for ~/.cache path)
+dirs = { workspace = true }
+
 # Synchronization
 parking_lot = "0.12"
 
@@ -41,6 +48,7 @@ cc = "1"
 [dev-dependencies]
 criterion = { workspace = true }
 rand = { workspace = true }
+tempfile = { workspace = true }
 
 [lints]
 workspace = true

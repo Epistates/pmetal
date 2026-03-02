@@ -134,42 +134,85 @@ kernel void fused_norm_lora_forward(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 3: Compute x @ A.T (LoRA intermediate) [batch, rank]
+    // Step 3: Compute x @ A.T (LoRA intermediate) [batch, rank] (vectorized)
     // Each thread handles part of the rank dimension
     for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
         device const float* a_row = lora_a + r * params.hidden_size;
-        float dot = 0.0f;
-        for (uint h = 0; h < params.hidden_size; h++) {
+        float4 acc4 = float4(0.0f);
+        uint h4 = params.hidden_size & ~3u;
+        for (uint h = 0; h < h4; h += 4) {
+            acc4 += *(threadgroup const float4*)(norm_x + h) * *(device const float4*)(a_row + h);
+        }
+        float dot = acc4.x + acc4.y + acc4.z + acc4.w;
+        for (uint h = h4; h < params.hidden_size; h++) {
             dot += norm_x[h] * a_row[h];
         }
         x_a[r] = dot;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 4: Compute base output and LoRA output for this output index
-    // base_out[out_idx] = norm_x @ W[out_idx].T
-    // lora_out[out_idx] = scale * (x_a @ B[out_idx])
+    // Step 4: Compute base output and LoRA output for this output index.
+    // All threads participate in parallel reductions across hidden_size and lora_rank.
 
-    // Only thread 0 computes the final output for this (token, out_idx) pair
-    if (thread_idx == 0) {
+    // --- All threads participate in base dot product (parallel reduction) ---
+    {
         device const float* w_row = weight + out_idx * params.hidden_size;
+
+        float partial_base = 0.0f;
+        float4 base_acc4 = float4(0.0f);
+        uint h4 = params.hidden_size & ~3u;
+        for (uint h = thread_idx * 4; h < h4; h += THREADS_PER_TOKEN * 4) {
+            base_acc4 += *(threadgroup const float4*)(norm_x + h) * *(device const float4*)(w_row + h);
+        }
+        partial_base = base_acc4.x + base_acc4.y + base_acc4.z + base_acc4.w;
+        for (uint h = h4 + thread_idx; h < params.hidden_size; h += THREADS_PER_TOKEN) {
+            partial_base += norm_x[h] * w_row[h];
+        }
+
+        // SIMD reduce
+        partial_base = simd_sum(partial_base);
+
+        // Cross-SIMD-group reduction via scratch
+        uint simd_group_id = thread_idx / SIMD_SIZE;
+        uint lane_id = thread_idx % SIMD_SIZE;
+        // Reuse scratch past hidden_size + lora_rank for reduction
+        threadgroup float* reduce_scratch = scratch + params.hidden_size + params.lora_rank;
+
+        if (lane_id == 0) {
+            reduce_scratch[simd_group_id] = partial_base;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float base_total = 0.0f;
+        if (simd_group_id == 0) {
+            uint num_simd_groups = (THREADS_PER_TOKEN + SIMD_SIZE - 1) / SIMD_SIZE;
+            float v = (lane_id < num_simd_groups) ? reduce_scratch[lane_id] : 0.0f;
+            base_total = simd_sum(v);
+        }
+
+        // --- All threads participate in LoRA dot product ---
         device const float* b_row = lora_b + out_idx * params.lora_rank;
+        float partial_lora = 0.0f;
+        for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
+            partial_lora += x_a[r] * b_row[r];
+        }
+        partial_lora = simd_sum(partial_lora);
 
-        // Base projection
-        float base_out = 0.0f;
-        for (uint h = 0; h < params.hidden_size; h++) {
-            base_out += norm_x[h] * w_row[h];
+        if (lane_id == 0) {
+            reduce_scratch[simd_group_id] = partial_lora;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float lora_total = 0.0f;
+        if (simd_group_id == 0) {
+            uint num_simd_groups = (THREADS_PER_TOKEN + SIMD_SIZE - 1) / SIMD_SIZE;
+            float v = (lane_id < num_simd_groups) ? reduce_scratch[lane_id] : 0.0f;
+            lora_total = simd_sum(v);
         }
 
-        // LoRA projection
-        float lora_out = 0.0f;
-        for (uint r = 0; r < params.lora_rank; r++) {
-            lora_out += x_a[r] * b_row[r];
+        if (thread_idx == 0) {
+            output[token_idx * params.out_features + out_idx] = base_total + params.lora_scale * lora_total;
         }
-        lora_out *= params.lora_scale;
-
-        // Final output
-        output[token_idx * params.out_features + out_idx] = base_out + lora_out;
     }
 }
 
@@ -237,33 +280,77 @@ kernel void fused_norm_lora_forward_f16(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // x @ A.T
+    // x @ A.T (vectorized)
     for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
         device const half* a_row = lora_a + r * params.hidden_size;
-        float dot = 0.0f;
-        for (uint h = 0; h < params.hidden_size; h++) {
+        float4 acc4 = float4(0.0f);
+        uint h4 = params.hidden_size & ~3u;
+        for (uint h = 0; h < h4; h += 4) {
+            acc4 += *(threadgroup const float4*)(norm_x + h) * float4(*(device const half4*)(a_row + h));
+        }
+        float dot = acc4.x + acc4.y + acc4.z + acc4.w;
+        for (uint h = h4; h < params.hidden_size; h++) {
             dot += norm_x[h] * float(a_row[h]);
         }
         x_a[r] = dot;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    if (thread_idx == 0) {
+    // --- All threads participate in base dot product (parallel reduction) ---
+    {
         device const half* w_row = weight + out_idx * params.hidden_size;
+
+        float partial_base = 0.0f;
+        float4 base_acc4 = float4(0.0f);
+        uint h4 = params.hidden_size & ~3u;
+        for (uint h = thread_idx * 4; h < h4; h += THREADS_PER_TOKEN * 4) {
+            base_acc4 += *(threadgroup const float4*)(norm_x + h) * float4(*(device const half4*)(w_row + h));
+        }
+        partial_base = base_acc4.x + base_acc4.y + base_acc4.z + base_acc4.w;
+        for (uint h = h4 + thread_idx; h < params.hidden_size; h += THREADS_PER_TOKEN) {
+            partial_base += norm_x[h] * float(w_row[h]);
+        }
+
+        partial_base = simd_sum(partial_base);
+
+        uint simd_group_id = thread_idx / SIMD_SIZE;
+        uint lane_id = thread_idx % SIMD_SIZE;
+        threadgroup float* reduce_scratch = scratch + params.hidden_size + params.lora_rank;
+
+        if (lane_id == 0) {
+            reduce_scratch[simd_group_id] = partial_base;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float base_total = 0.0f;
+        if (simd_group_id == 0) {
+            uint num_simd_groups = (THREADS_PER_TOKEN + SIMD_SIZE - 1) / SIMD_SIZE;
+            float v = (lane_id < num_simd_groups) ? reduce_scratch[lane_id] : 0.0f;
+            base_total = simd_sum(v);
+        }
+
         device const half* b_row = lora_b + out_idx * params.lora_rank;
+        float partial_lora = 0.0f;
+        for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
+            partial_lora += x_a[r] * float(b_row[r]);
+        }
+        partial_lora = simd_sum(partial_lora);
 
-        float base_out = 0.0f;
-        for (uint h = 0; h < params.hidden_size; h++) {
-            base_out += norm_x[h] * float(w_row[h]);
+        if (lane_id == 0) {
+            reduce_scratch[simd_group_id] = partial_lora;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float lora_total = 0.0f;
+        if (simd_group_id == 0) {
+            uint num_simd_groups = (THREADS_PER_TOKEN + SIMD_SIZE - 1) / SIMD_SIZE;
+            float v = (lane_id < num_simd_groups) ? reduce_scratch[lane_id] : 0.0f;
+            lora_total = simd_sum(v);
         }
 
-        float lora_out = 0.0f;
-        for (uint r = 0; r < params.lora_rank; r++) {
-            lora_out += x_a[r] * float(b_row[r]);
+        if (thread_idx == 0) {
+            output[token_idx * params.out_features + out_idx] = half(base_total + params.lora_scale * lora_total);
         }
-        lora_out *= params.lora_scale;
-
-        output[token_idx * params.out_features + out_idx] = half(base_out + lora_out);
     }
 }
 
@@ -301,24 +388,34 @@ kernel void fused_norm_lora_forward_tiled(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Compute x @ A.T
+    // Compute x @ A.T (vectorized)
     for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
         device const float* a_row = lora_a + r * params.hidden_size;
-        float dot = 0.0f;
-        for (uint h = 0; h < params.hidden_size; h++) {
+        float4 acc4 = float4(0.0f);
+        uint h4 = params.hidden_size & ~3u;
+        for (uint h = 0; h < h4; h += 4) {
+            acc4 += *(threadgroup const float4*)(norm_x + h) * *(device const float4*)(a_row + h);
+        }
+        float dot = acc4.x + acc4.y + acc4.z + acc4.w;
+        for (uint h = h4; h < params.hidden_size; h++) {
             dot += norm_x[h] * a_row[h];
         }
         x_a[r] = dot;
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Each thread computes one or more output elements
+    // Each thread computes one or more output elements (vectorized)
     for (uint o = thread_idx; o < params.out_features; o += THREADS_PER_TOKEN) {
         device const float* w_row = weight + o * params.hidden_size;
         device const float* b_row = lora_b + o * params.lora_rank;
 
-        float base_out = 0.0f;
-        for (uint h = 0; h < params.hidden_size; h++) {
+        float4 base_acc4 = float4(0.0f);
+        uint h4 = params.hidden_size & ~3u;
+        for (uint h = 0; h < h4; h += 4) {
+            base_acc4 += *(threadgroup const float4*)(norm_x + h) * *(device const float4*)(w_row + h);
+        }
+        float base_out = base_acc4.x + base_acc4.y + base_acc4.z + base_acc4.w;
+        for (uint h = h4; h < params.hidden_size; h++) {
             base_out += norm_x[h] * w_row[h];
         }
 

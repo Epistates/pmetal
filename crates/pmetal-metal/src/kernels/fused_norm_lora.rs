@@ -60,6 +60,10 @@ pub struct FusedNormLoraConfig {
 
 impl FusedNormLoraConfig {
     /// Create a new config.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hidden_size` is not a multiple of 4 (required for float4 vectorized loads).
     pub fn new(
         batch_size: usize,
         hidden_size: usize,
@@ -67,6 +71,10 @@ impl FusedNormLoraConfig {
         lora_rank: usize,
         lora_alpha: f32,
     ) -> Self {
+        assert!(
+            hidden_size % 4 == 0,
+            "hidden_size ({hidden_size}) must be a multiple of 4 for vectorized Metal kernels"
+        );
         Self {
             batch_size,
             hidden_size,
@@ -275,10 +283,18 @@ impl FusedNormLora {
             let params_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 6);
 
-            // Threadgroup memory for scratch space
-            // Need: hidden_size floats for norm_x + lora_rank floats for x_a
-            let scratch_size =
-                (self.config.hidden_size + self.config.lora_rank) * std::mem::size_of::<f32>();
+            // Threadgroup memory for scratch space.
+            // Tiled kernel needs: hidden_size floats for norm_x + lora_rank floats for x_a.
+            // Non-tiled kernels additionally need space for the cross-SIMD-group parallel
+            // reduction scratch: num_simd_groups = THREADS_PER_TOKEN / SIMD_SIZE = 128 / 32 = 4
+            // floats appended after norm_x and x_a.
+            let num_simd_groups = self.threads_per_token.div_ceil(32);
+            let scratch_floats = if self.config.use_tiled {
+                self.config.hidden_size + self.config.lora_rank
+            } else {
+                self.config.hidden_size + self.config.lora_rank + num_simd_groups
+            };
+            let scratch_size = scratch_floats * std::mem::size_of::<f32>();
             encoder.setThreadgroupMemoryLength_atIndex(scratch_size, 0);
         }
 

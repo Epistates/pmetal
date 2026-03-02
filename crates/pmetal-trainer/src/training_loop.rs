@@ -419,6 +419,13 @@ pub struct TrainingLoop {
     pub(crate) accumulated_loss: f64,
     /// Number of micro-batches accumulated (for averaging).
     pub(crate) loss_accumulation_count: usize,
+    /// Background thread handle for the most recent async checkpoint write.
+    ///
+    /// Checkpoint I/O (safetensors serialization + JSON metadata) is offloaded to a
+    /// background thread so the training loop is not stalled by disk latency.
+    /// The handle is polled before each new checkpoint spawn; errors are logged as
+    /// warnings rather than terminating training.
+    pub(crate) pending_checkpoint: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
 }
 
 impl TrainingLoop {
@@ -450,6 +457,7 @@ impl TrainingLoop {
             last_log_time: None,
             accumulated_loss: 0.0,
             loss_accumulation_count: 0,
+            pending_checkpoint: None,
         }
     }
 
@@ -898,7 +906,15 @@ impl TrainingLoop {
                 None, // No image processor for text-only training
             );
 
-            while let Some(batch) = dataloader.next_batch() {
+            // Double-buffered batch prefetch: fetch the next batch while the GPU
+            // processes the current one, overlapping CPU data prep with GPU compute.
+            let mut prefetched_batch = dataloader.next_batch();
+            while let Some(batch) = prefetched_batch {
+                // Prefetch the next batch before submitting the current one to the GPU.
+                // DataLoader::next_batch() is CPU-bound (tokenization + array construction),
+                // so starting it now lets it run while MLX evaluates the training step.
+                prefetched_batch = dataloader.next_batch();
+
                 // Apply learning rate schedule (warmup, cosine decay, etc.)
                 let scheduled_lr = self.get_learning_rate();
                 optimizer.set_learning_rate(scheduled_lr);
@@ -1067,7 +1083,12 @@ impl TrainingLoop {
             let mut dataloader =
                 DataLoader::new(train_dataset.clone(), self.config.dataloader.clone(), None);
 
-            while let Some(batch) = dataloader.next_batch() {
+            // Double-buffered batch prefetch: overlap CPU data prep with GPU compute.
+            let mut prefetched_batch = dataloader.next_batch();
+            while let Some(batch) = prefetched_batch {
+                // Kick off the next batch fetch before submitting the current one.
+                prefetched_batch = dataloader.next_batch();
+
                 // Training step with Metal optimizer
                 let stats = self.train_step_metal(model, &batch, &mut metal_optimizer)?;
 
@@ -1461,7 +1482,14 @@ impl TrainingLoop {
                 tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
             }
 
-            while let Some(batch) = dataloader.next_batch() {
+            // Double-buffered batch prefetch: overlap CPU data prep with GPU compute.
+            // Fetching the next batch before the current training step completes allows
+            // tokenization and array construction to run while MLX builds its lazy graph.
+            let mut prefetched_batch = dataloader.next_batch();
+            while let Some(batch) = prefetched_batch {
+                // Prefetch next batch before the GPU executes the current step.
+                prefetched_batch = dataloader.next_batch();
+
                 let batch_tokens = batch
                     .batch_size
                     .checked_mul(batch.seq_len)
@@ -1714,7 +1742,12 @@ impl TrainingLoop {
 
             tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
 
-            while let Some(batch) = dataloader.next_batch() {
+            // Double-buffered batch prefetch for the JIT-compiled path.
+            let mut prefetched_batch = dataloader.next_batch();
+            while let Some(batch) = prefetched_batch {
+                // Prefetch next batch while MLX traces/executes the compiled step.
+                prefetched_batch = dataloader.next_batch();
+
                 let batch_tokens = batch
                     .batch_size
                     .checked_mul(batch.seq_len)
@@ -1928,7 +1961,14 @@ impl TrainingLoop {
 
             tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
 
-            while let Some(batch_result) = packed_dataloader.next_batch() {
+            // Double-buffered batch prefetch for packed sequences.
+            // PackedDataLoader::next_batch() packs and tokenizes sequences on the CPU,
+            // so prefetching overlaps that work with the GPU training step.
+            let mut prefetched_batch_result = packed_dataloader.next_batch();
+            while let Some(batch_result) = prefetched_batch_result {
+                // Prefetch next packed batch before executing the current training step.
+                prefetched_batch_result = packed_dataloader.next_batch();
+
                 let packed_batch = batch_result.map_err(|e| SftError::Mlx(e))?;
 
                 let batch_tokens = packed_batch.total_tokens;
@@ -2159,9 +2199,17 @@ impl TrainingLoop {
         Ok((correct_count, total_tokens))
     }
 
-    /// Save a checkpoint.
+    /// Save a checkpoint, offloading the I/O to a background thread.
+    ///
+    /// The LoRA parameter arrays are evaluated (materialized) on the calling thread
+    /// before the background thread is spawned. This ensures the GPU computation
+    /// graph is resolved here, and only the file-write work crosses the thread boundary.
+    ///
+    /// Errors in the background write are logged as warnings. The returned `PathBuf`
+    /// is the expected step directory path (computed eagerly); the actual write may
+    /// still be in flight.
     pub fn save_checkpoint<M>(
-        &self,
+        &mut self,
         model: &M,
         manager: &CheckpointManager,
         is_best: bool,
@@ -2183,10 +2231,21 @@ impl TrainingLoop {
             metadata = metadata.with_best_val_loss(loss);
         }
 
-        let path = manager.save_checkpoint(&lora_params, &metadata, is_best)?;
-        tracing::info!("Saved checkpoint to {:?}", path);
+        // Compute the expected output path so callers can log it immediately.
+        let step_dir = manager
+            .checkpoint_dir()
+            .join(format!("step_{}", metadata.step));
 
-        Ok(path)
+        tracing::info!(
+            "Queuing async checkpoint write for step {} to {:?}",
+            self.step,
+            step_dir
+        );
+
+        // Offload the blocking I/O to a background thread.
+        self.spawn_async_checkpoint(lora_params, metadata, manager, is_best)?;
+
+        Ok(step_dir)
     }
 
     /// Get current training step.
@@ -2217,6 +2276,106 @@ impl TrainingLoop {
     /// Set epoch (for testing and checkpoint restore).
     pub fn set_epoch(&mut self, epoch: usize) {
         self.epoch = epoch;
+    }
+
+    /// Poll the pending checkpoint background thread.
+    ///
+    /// If the previous checkpoint I/O has completed, this checks for errors and
+    /// logs a warning if the write failed. Must be called before spawning a new
+    /// checkpoint thread to avoid unbounded handle accumulation.
+    fn poll_pending_checkpoint(&mut self) {
+        if let Some(handle) = self.pending_checkpoint.take() {
+            if handle.is_finished() {
+                match handle.join() {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::warn!("Async checkpoint write failed: {}", e);
+                    }
+                    Err(_) => {
+                        tracing::warn!("Async checkpoint thread panicked");
+                    }
+                }
+            } else {
+                // Still running — put it back so we don't lose the handle
+                self.pending_checkpoint = Some(handle);
+            }
+        }
+    }
+
+    /// Spawn checkpoint I/O on a background thread so the training loop is not stalled
+    /// by safetensors serialization or metadata JSON writes.
+    ///
+    /// The method:
+    /// 1. Forces evaluation of all LoRA parameter arrays (materializes GPU tensors on CPU).
+    /// 2. Converts the `Rc<str>`-keyed map to a `String`-keyed map that is `Send`.
+    /// 3. Clones the metadata and extracts the manager state needed on the background thread.
+    /// 4. Polls the previous handle for completion/errors before spawning the new one.
+    ///
+    /// Failures are logged as warnings rather than propagated, so a transient I/O error
+    /// does not abort training.
+    fn spawn_async_checkpoint(
+        &mut self,
+        lora_params: std::collections::HashMap<std::rc::Rc<str>, Array>,
+        metadata: CheckpointMetadata,
+        manager: &CheckpointManager,
+        is_best: bool,
+    ) -> Result<()> {
+        // Poll the previous handle so we surface any errors and free the handle.
+        self.poll_pending_checkpoint();
+
+        // Force evaluation of all arrays before crossing the thread boundary.
+        // This materializes the MLX lazy computation graph so the background thread
+        // only performs the I/O work (no GPU/CPU work happens on the other side).
+        {
+            let arrays: Vec<&Array> = lora_params.values().collect();
+            if !arrays.is_empty() {
+                mlx_rs::transforms::eval(arrays)?;
+            }
+        }
+
+        // Convert Rc<str> keys → String keys so the map is Send.
+        let params_send: std::collections::HashMap<String, Array> = lora_params
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+
+        // Clone the manager data we need on the background thread.
+        let checkpoint_dir = manager.checkpoint_dir().to_path_buf();
+        let max_checkpoints = manager.max_checkpoints_limit();
+        let save_best_flag = manager.save_best_flag();
+
+        let step_for_log = metadata.step;
+
+        let handle = std::thread::spawn(move || -> std::result::Result<(), String> {
+            // Reconstruct a local CheckpointManager on the background thread
+            // using the cloned configuration data.
+            let bg_manager =
+                CheckpointManager::from_parts(checkpoint_dir, max_checkpoints, save_best_flag);
+
+            bg_manager
+                .save_checkpoint_owned(params_send, &metadata, is_best)
+                .map_err(|e| e.to_string())?;
+
+            tracing::info!("Async checkpoint write complete (step {})", step_for_log);
+            Ok(())
+        });
+
+        self.pending_checkpoint = Some(handle);
+        Ok(())
+    }
+}
+
+impl Drop for TrainingLoop {
+    fn drop(&mut self) {
+        if let Some(handle) = self.pending_checkpoint.take() {
+            // Wait for the final checkpoint write to complete so we don't
+            // exit the process with a half-written safetensors file.
+            match handle.join() {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!("Final async checkpoint failed: {e}"),
+                Err(_) => tracing::warn!("Final async checkpoint thread panicked"),
+            }
+        }
     }
 }
 

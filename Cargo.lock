@@ -4609,6 +4609,7 @@ dependencies = [
  "bytemuck",
  "cc",
  "criterion",
+ "dirs",
  "dispatch2",
  "half",
  "num-traits",
@@ -4618,6 +4619,9 @@ dependencies = [
  "parking_lot",
  "pmetal-core",
  "rand 0.10.0",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
  "tracing",
 ]
@@ -4658,6 +4662,7 @@ dependencies = [
  "pmetal-mlx-sys",
  "serde",
  "serde_json",
+ "serial_test",
  "thiserror 2.0.18",
  "tracing",
 ]

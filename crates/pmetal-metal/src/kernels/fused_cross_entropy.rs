@@ -599,7 +599,15 @@ impl FusedLinearCrossEntropyConfig {
     /// * `num_tokens` - Number of tokens in the batch
     /// * `hidden_size` - Dimension of the hidden states
     /// * `vocab_size` - Size of the vocabulary
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hidden_size` is not a multiple of 4 (required for float4/half4 vectorized loads).
     pub fn new(num_tokens: usize, hidden_size: usize, vocab_size: usize) -> Self {
+        assert!(
+            hidden_size % 4 == 0,
+            "hidden_size ({hidden_size}) must be a multiple of 4 for vectorized Metal kernels"
+        );
         Self {
             num_tokens,
             hidden_size,

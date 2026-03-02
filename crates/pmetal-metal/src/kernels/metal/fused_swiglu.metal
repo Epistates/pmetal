@@ -46,6 +46,156 @@ inline float silu(float x) {
 }
 
 // =============================================================================
+// VECTORIZED DOT PRODUCT HELPERS
+// =============================================================================
+// Metal GPU hardware has 128-bit load units. Loading float4 (16 bytes) per cycle
+// instead of float (4 bytes) provides 4x memory bandwidth utilization.
+// For half, half4 (8 bytes) gives 2x per load.
+// =============================================================================
+
+/// Vectorized dual dot product: computes dot(x, a) and dot(x, b) simultaneously
+/// using float4 loads for 4x memory bandwidth.
+inline void dual_dot_f32(
+    device const float* x,
+    device const float* a,
+    device const float* b,
+    uint size,
+    thread float& out_a,
+    thread float& out_b
+) {
+    float4 acc_a = float4(0.0f);
+    float4 acc_b = float4(0.0f);
+    uint s4 = size & ~3u;
+    for (uint i = 0; i < s4; i += 4) {
+        float4 x4 = *(device const float4*)(x + i);
+        acc_a += x4 * *(device const float4*)(a + i);
+        acc_b += x4 * *(device const float4*)(b + i);
+    }
+    out_a = acc_a.x + acc_a.y + acc_a.z + acc_a.w;
+    out_b = acc_b.x + acc_b.y + acc_b.z + acc_b.w;
+    for (uint i = s4; i < size; i++) {
+        float xv = x[i];
+        out_a += xv * a[i];
+        out_b += xv * b[i];
+    }
+}
+
+/// Vectorized dual dot product for half inputs with float accumulation.
+inline void dual_dot_f16(
+    device const half* x,
+    device const half* a,
+    device const half* b,
+    uint size,
+    thread float& out_a,
+    thread float& out_b
+) {
+    float4 acc_a = float4(0.0f);
+    float4 acc_b = float4(0.0f);
+    uint s4 = size & ~3u;
+    for (uint i = 0; i < s4; i += 4) {
+        half4 x4 = *(device const half4*)(x + i);
+        float4 x4f = float4(x4);
+        acc_a += x4f * float4(*(device const half4*)(a + i));
+        acc_b += x4f * float4(*(device const half4*)(b + i));
+    }
+    out_a = acc_a.x + acc_a.y + acc_a.z + acc_a.w;
+    out_b = acc_b.x + acc_b.y + acc_b.z + acc_b.w;
+    for (uint i = s4; i < size; i++) {
+        float xv = float(x[i]);
+        out_a += xv * float(a[i]);
+        out_b += xv * float(b[i]);
+    }
+}
+
+/// Vectorized single dot product using float4 loads.
+inline float dot_f32(
+    device const float* a,
+    device const float* b,
+    uint size
+) {
+    float4 acc = float4(0.0f);
+    uint s4 = size & ~3u;
+    for (uint i = 0; i < s4; i += 4) {
+        acc += *(device const float4*)(a + i) * *(device const float4*)(b + i);
+    }
+    float result = acc.x + acc.y + acc.z + acc.w;
+    for (uint i = s4; i < size; i++) {
+        result += a[i] * b[i];
+    }
+    return result;
+}
+
+/// Vectorized dot product: threadgroup src * device src, float.
+inline float dot_tg_dev_f32(
+    threadgroup const float* a,
+    device const float* b,
+    uint size
+) {
+    float4 acc = float4(0.0f);
+    uint s4 = size & ~3u;
+    for (uint i = 0; i < s4; i += 4) {
+        acc += *(threadgroup const float4*)(a + i) * *(device const float4*)(b + i);
+    }
+    float result = acc.x + acc.y + acc.z + acc.w;
+    for (uint i = s4; i < size; i++) {
+        result += a[i] * b[i];
+    }
+    return result;
+}
+
+/// Vectorized dual dot product: threadgroup x * device a, threadgroup x * device b (float).
+inline void dual_dot_tg_f32(
+    threadgroup const float* x,
+    device const float* a,
+    device const float* b,
+    uint size,
+    thread float& out_a,
+    thread float& out_b
+) {
+    float4 acc_a = float4(0.0f);
+    float4 acc_b = float4(0.0f);
+    uint s4 = size & ~3u;
+    for (uint i = 0; i < s4; i += 4) {
+        float4 x4 = *(threadgroup const float4*)(x + i);
+        acc_a += x4 * *(device const float4*)(a + i);
+        acc_b += x4 * *(device const float4*)(b + i);
+    }
+    out_a = acc_a.x + acc_a.y + acc_a.z + acc_a.w;
+    out_b = acc_b.x + acc_b.y + acc_b.z + acc_b.w;
+    for (uint i = s4; i < size; i++) {
+        float xv = x[i];
+        out_a += xv * a[i];
+        out_b += xv * b[i];
+    }
+}
+
+/// Vectorized dual dot product: threadgroup x * device a (half), with float accumulation.
+inline void dual_dot_tg_f16(
+    threadgroup const float* x,
+    device const half* a,
+    device const half* b,
+    uint size,
+    thread float& out_a,
+    thread float& out_b
+) {
+    float4 acc_a = float4(0.0f);
+    float4 acc_b = float4(0.0f);
+    uint s4 = size & ~3u;
+    for (uint i = 0; i < s4; i += 4) {
+        float4 x4 = *(threadgroup const float4*)(x + i);
+        acc_a += x4 * float4(*(device const half4*)(a + i));
+        acc_b += x4 * float4(*(device const half4*)(b + i));
+    }
+    out_a = acc_a.x + acc_a.y + acc_a.z + acc_a.w;
+    out_b = acc_b.x + acc_b.y + acc_b.z + acc_b.w;
+    for (uint i = s4; i < size; i++) {
+        float xv = x[i];
+        out_a += xv * float(a[i]);
+        out_b += xv * float(b[i]);
+    }
+}
+
+// =============================================================================
 // FUSED SwiGLU FORWARD (No LoRA)
 // =============================================================================
 
@@ -74,17 +224,10 @@ kernel void fused_swiglu_forward(
         device const float* gate_row = gate_weight + i * params.hidden_size;
         device const float* up_row = up_weight + i * params.hidden_size;
 
-        // Compute gate = x @ gate_weight[i].T
+        // Vectorized dual dot product: gate = x @ gate_weight[i].T, up = x @ up_weight[i].T
         float gate_val = 0.0f;
-        for (uint h = 0; h < params.hidden_size; h++) {
-            gate_val += x[h] * gate_row[h];
-        }
-
-        // Compute up = x @ up_weight[i].T
         float up_val = 0.0f;
-        for (uint h = 0; h < params.hidden_size; h++) {
-            up_val += x[h] * up_row[h];
-        }
+        dual_dot_f32(x, gate_row, up_row, params.hidden_size, gate_val, up_val);
 
         // Apply SiLU and multiply: silu(gate) * up
         out[i] = silu(gate_val) * up_val;
@@ -110,15 +253,10 @@ kernel void fused_swiglu_forward_f16(
         device const half* gate_row = gate_weight + i * params.hidden_size;
         device const half* up_row = up_weight + i * params.hidden_size;
 
-        // Use fp32 accumulation for numerical stability
+        // Vectorized dual dot product with fp32 accumulation for numerical stability
         float gate_val = 0.0f;
         float up_val = 0.0f;
-
-        for (uint h = 0; h < params.hidden_size; h++) {
-            float x_val = float(x[h]);
-            gate_val += x_val * float(gate_row[h]);
-            up_val += x_val * float(up_row[h]);
-        }
+        dual_dot_f16(x, gate_row, up_row, params.hidden_size, gate_val, up_val);
 
         out[i] = half(silu(gate_val) * up_val);
     }
@@ -163,6 +301,7 @@ kernel void fused_swiglu_lora_forward(
 
     // -------------------------------------------------------------------------
     // Phase 1: Compute x @ gate_A.T and x @ up_A.T (LoRA down projections)
+    // Vectorized with float4 loads for 4x memory bandwidth.
     // -------------------------------------------------------------------------
     for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
         device const float* gate_a_row = gate_lora_a + r * params.hidden_size;
@@ -170,12 +309,7 @@ kernel void fused_swiglu_lora_forward(
 
         float gate_dot = 0.0f;
         float up_dot = 0.0f;
-
-        for (uint h = 0; h < params.hidden_size; h++) {
-            float x_val = x[h];
-            gate_dot += x_val * gate_a_row[h];
-            up_dot += x_val * up_a_row[h];
-        }
+        dual_dot_f32(x, gate_a_row, up_a_row, params.hidden_size, gate_dot, up_dot);
 
         x_gate_a[r] = gate_dot;
         x_up_a[r] = up_dot;
@@ -185,6 +319,7 @@ kernel void fused_swiglu_lora_forward(
 
     // -------------------------------------------------------------------------
     // Phase 2: Compute full projections and SwiGLU for each output element
+    // Vectorized with float4 loads for 4x memory bandwidth.
     // -------------------------------------------------------------------------
     for (uint i = thread_idx; i < params.intermediate_size; i += THREADS_PER_TOKEN) {
         device const float* gate_row = gate_weight + i * params.hidden_size;
@@ -192,15 +327,10 @@ kernel void fused_swiglu_lora_forward(
         device const float* gate_b_row = gate_lora_b + i * params.lora_rank;
         device const float* up_b_row = up_lora_b + i * params.lora_rank;
 
-        // Base projections
+        // Base projections (vectorized)
         float gate_val = 0.0f;
         float up_val = 0.0f;
-
-        for (uint h = 0; h < params.hidden_size; h++) {
-            float x_val = x[h];
-            gate_val += x_val * gate_row[h];
-            up_val += x_val * up_row[h];
-        }
+        dual_dot_f32(x, gate_row, up_row, params.hidden_size, gate_val, up_val);
 
         // LoRA contributions: (x @ A.T) @ B.T
         float gate_lora = 0.0f;
@@ -243,19 +373,14 @@ kernel void fused_swiglu_lora_forward_f16(
     threadgroup float* x_gate_a = scratch;
     threadgroup float* x_up_a = scratch + params.lora_rank;
 
-    // Phase 1: LoRA down projections with fp32 accumulation
+    // Phase 1: LoRA down projections with fp32 accumulation (vectorized with half4)
     for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
         device const half* gate_a_row = gate_lora_a + r * params.hidden_size;
         device const half* up_a_row = up_lora_a + r * params.hidden_size;
 
         float gate_dot = 0.0f;
         float up_dot = 0.0f;
-
-        for (uint h = 0; h < params.hidden_size; h++) {
-            float x_val = float(x[h]);
-            gate_dot += x_val * float(gate_a_row[h]);
-            up_dot += x_val * float(up_a_row[h]);
-        }
+        dual_dot_f16(x, gate_a_row, up_a_row, params.hidden_size, gate_dot, up_dot);
 
         x_gate_a[r] = gate_dot;
         x_up_a[r] = up_dot;
@@ -263,7 +388,7 @@ kernel void fused_swiglu_lora_forward_f16(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Phase 2: Full projections and SwiGLU
+    // Phase 2: Full projections and SwiGLU (vectorized with half4)
     for (uint i = thread_idx; i < params.intermediate_size; i += THREADS_PER_TOKEN) {
         device const half* gate_row = gate_weight + i * params.hidden_size;
         device const half* up_row = up_weight + i * params.hidden_size;
@@ -272,12 +397,7 @@ kernel void fused_swiglu_lora_forward_f16(
 
         float gate_val = 0.0f;
         float up_val = 0.0f;
-
-        for (uint h = 0; h < params.hidden_size; h++) {
-            float x_val = float(x[h]);
-            gate_val += x_val * float(gate_row[h]);
-            up_val += x_val * float(up_row[h]);
-        }
+        dual_dot_f16(x, gate_row, up_row, params.hidden_size, gate_val, up_val);
 
         float gate_lora = 0.0f;
         float up_lora = 0.0f;
@@ -330,19 +450,14 @@ kernel void fused_swiglu_lora_forward_tiled(
     threadgroup float* x_gate_a = scratch;
     threadgroup float* x_up_a = scratch + params.lora_rank;
 
-    // Compute LoRA down projections (shared across tile)
+    // Compute LoRA down projections (shared across tile, vectorized)
     for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
         device const float* gate_a_row = gate_lora_a + r * params.hidden_size;
         device const float* up_a_row = up_lora_a + r * params.hidden_size;
 
         float gate_dot = 0.0f;
         float up_dot = 0.0f;
-
-        for (uint h = 0; h < params.hidden_size; h++) {
-            float x_val = x[h];
-            gate_dot += x_val * gate_a_row[h];
-            up_dot += x_val * up_a_row[h];
-        }
+        dual_dot_f32(x, gate_a_row, up_a_row, params.hidden_size, gate_dot, up_dot);
 
         x_gate_a[r] = gate_dot;
         x_up_a[r] = up_dot;
@@ -350,7 +465,7 @@ kernel void fused_swiglu_lora_forward_tiled(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Process tile
+    // Process tile (vectorized)
     uint tile_end = min(tile_start + tile_size, params.intermediate_size);
     for (uint i = tile_start + thread_idx; i < tile_end; i += THREADS_PER_TOKEN) {
         device const float* gate_row = gate_weight + i * params.hidden_size;
@@ -360,12 +475,7 @@ kernel void fused_swiglu_lora_forward_tiled(
 
         float gate_val = 0.0f;
         float up_val = 0.0f;
-
-        for (uint h = 0; h < params.hidden_size; h++) {
-            float x_val = x[h];
-            gate_val += x_val * gate_row[h];
-            up_val += x_val * up_row[h];
-        }
+        dual_dot_f32(x, gate_row, up_row, params.hidden_size, gate_val, up_val);
 
         float gate_lora = 0.0f;
         float up_lora = 0.0f;
@@ -429,7 +539,7 @@ kernel void fused_mlp_forward(
         uint chunk_end   = min(chunk_start + SWIGLU_CHUNK_SIZE, params.intermediate_size);
         uint chunk_len   = chunk_end - chunk_start;
 
-        // Phase A: Compute SwiGLU for this chunk
+        // Phase A: Compute SwiGLU for this chunk (vectorized)
         for (uint ci = thread_idx; ci < chunk_len; ci += THREADS_PER_TOKEN) {
             uint i = chunk_start + ci;
             device const float* gate_row = gate_weight + i * params.hidden_size;
@@ -437,23 +547,16 @@ kernel void fused_mlp_forward(
 
             float gate_val = 0.0f;
             float up_val   = 0.0f;
-            for (uint h = 0; h < params.hidden_size; h++) {
-                float x_val = x[h];
-                gate_val += x_val * gate_row[h];
-                up_val   += x_val * up_row[h];
-            }
+            dual_dot_f32(x, gate_row, up_row, params.hidden_size, gate_val, up_val);
             swiglu_chunk[ci] = silu(gate_val) * up_val;
         }
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Phase B: Accumulate down-projection contributions from this chunk
+        // Phase B: Accumulate down-projection contributions from this chunk (vectorized)
         for (uint h = thread_idx; h < params.hidden_size; h += THREADS_PER_TOKEN) {
             device const float* down_row = down_weight + h * params.intermediate_size + chunk_start;
-            float partial = 0.0f;
-            for (uint ci = 0; ci < chunk_len; ci++) {
-                partial += swiglu_chunk[ci] * down_row[ci];
-            }
+            float partial = dot_tg_dev_f32(swiglu_chunk, down_row, chunk_len);
             out[h] += partial;
         }
 
@@ -505,18 +608,14 @@ kernel void fused_mlp_lora_forward(
     threadgroup float* down_a_acc  = scratch + 2 * params.lora_rank;  // running sum over chunks
     threadgroup float* swiglu_chunk = scratch + 3 * params.lora_rank;
 
-    // Phase 1: Compute gate/up LoRA down projections (x @ gate_A.T, x @ up_A.T)
+    // Phase 1: Compute gate/up LoRA down projections (vectorized)
     for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
         device const float* gate_a_row = gate_lora_a + r * params.hidden_size;
         device const float* up_a_row   = up_lora_a   + r * params.hidden_size;
 
         float gate_dot = 0.0f;
         float up_dot   = 0.0f;
-        for (uint h = 0; h < params.hidden_size; h++) {
-            float x_val = x[h];
-            gate_dot += x_val * gate_a_row[h];
-            up_dot   += x_val * up_a_row[h];
-        }
+        dual_dot_f32(x, gate_a_row, up_a_row, params.hidden_size, gate_dot, up_dot);
         x_gate_a[r] = gate_dot;
         x_up_a[r]   = up_dot;
     }
@@ -541,7 +640,7 @@ kernel void fused_mlp_lora_forward(
         uint chunk_end   = min(chunk_start + uint(SWIGLU_CHUNK_SIZE), params.intermediate_size);
         uint chunk_len   = chunk_end - chunk_start;
 
-        // Phase 2A: Compute SwiGLU for this chunk
+        // Phase 2A: Compute SwiGLU for this chunk (vectorized)
         for (uint ci = thread_idx; ci < chunk_len; ci += THREADS_PER_TOKEN) {
             uint i = chunk_start + ci;
             device const float* gate_row   = gate_weight + i * params.hidden_size;
@@ -551,11 +650,7 @@ kernel void fused_mlp_lora_forward(
 
             float gate_val = 0.0f;
             float up_val   = 0.0f;
-            for (uint h = 0; h < params.hidden_size; h++) {
-                float x_val = x[h];
-                gate_val += x_val * gate_row[h];
-                up_val   += x_val * up_row[h];
-            }
+            dual_dot_f32(x, gate_row, up_row, params.hidden_size, gate_val, up_val);
 
             float gate_lora = 0.0f;
             float up_lora   = 0.0f;
@@ -571,23 +666,17 @@ kernel void fused_mlp_lora_forward(
 
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // Phase 2B: Accumulate partial down_lora_a projection: swiglu_chunk @ down_A.T[:, chunk]
+        // Phase 2B: Accumulate partial down_lora_a projection (vectorized)
         for (uint r = thread_idx; r < params.lora_rank; r += THREADS_PER_TOKEN) {
             device const float* down_a_row = down_lora_a + r * params.intermediate_size + chunk_start;
-            float dot = 0.0f;
-            for (uint ci = 0; ci < chunk_len; ci++) {
-                dot += swiglu_chunk[ci] * down_a_row[ci];
-            }
+            float dot = dot_tg_dev_f32(swiglu_chunk, down_a_row, chunk_len);
             down_a_acc[r] += dot;
         }
 
-        // Phase 2C: Accumulate down-projection base contribution from this chunk
+        // Phase 2C: Accumulate down-projection base contribution (vectorized)
         for (uint h = thread_idx; h < params.hidden_size; h += THREADS_PER_TOKEN) {
             device const float* down_row = down_weight + h * params.intermediate_size + chunk_start;
-            float partial = 0.0f;
-            for (uint ci = 0; ci < chunk_len; ci++) {
-                partial += swiglu_chunk[ci] * down_row[ci];
-            }
+            float partial = dot_tg_dev_f32(swiglu_chunk, down_row, chunk_len);
             out[h] += partial;
         }
 

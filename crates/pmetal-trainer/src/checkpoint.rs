@@ -87,6 +87,48 @@ fn chrono_timestamp() -> String {
     format!("{}", duration.as_secs())
 }
 
+/// Write checkpoint files (safetensors + metadata JSON) to a directory.
+///
+/// Creates the directory if it doesn't exist, writes `lora_weights.safetensors`
+/// and `metadata.json`. Used by both `save_checkpoint` and `save_checkpoint_owned`
+/// to eliminate duplicated file I/O logic.
+fn write_checkpoint_to_dir<'a>(
+    dir: &Path,
+    params: impl IntoIterator<Item = (&'a str, &'a Array)>,
+    metadata_json: &str,
+) -> Result<()> {
+    fs::create_dir_all(dir).map_err(|e| {
+        SftError::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to create directory: {e}"),
+        ))
+    })?;
+
+    let weights_path = dir.join("lora_weights.safetensors");
+    Array::save_safetensors(params, None, &weights_path).map_err(|e| {
+        SftError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to save weights: {e}"),
+        ))
+    })?;
+
+    let metadata_path = dir.join("metadata.json");
+    let mut file = File::create(&metadata_path).map_err(|e| {
+        SftError::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to create metadata file: {e}"),
+        ))
+    })?;
+    file.write_all(metadata_json.as_bytes()).map_err(|e| {
+        SftError::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to write metadata: {e}"),
+        ))
+    })?;
+
+    Ok(())
+}
+
 /// Checkpoint manager for saving and loading training state.
 pub struct CheckpointManager {
     /// Base directory for checkpoints.
@@ -139,54 +181,32 @@ impl CheckpointManager {
         metadata: &CheckpointMetadata,
         is_best: bool,
     ) -> Result<PathBuf> {
-        // Create step-specific directory
-        let step_dir = self.checkpoint_dir.join(format!("step_{}", metadata.step));
-        fs::create_dir_all(&step_dir).map_err(|e| {
-            SftError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to create checkpoint directory: {}", e),
-            ))
-        })?;
-
-        // Save LoRA weights
-        let weights_path = step_dir.join("lora_weights.safetensors");
-        Array::save_safetensors(lora_params.clone(), None, &weights_path).map_err(|e| {
-            SftError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to save weights: {}", e),
-            ))
-        })?;
-
-        // Save metadata
-        let metadata_path = step_dir.join("metadata.json");
         let metadata_json = serde_json::to_string_pretty(metadata).map_err(|e| {
             SftError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize metadata: {}", e),
-            ))
-        })?;
-        let mut file = File::create(&metadata_path).map_err(|e| {
-            SftError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to create metadata file: {}", e),
-            ))
-        })?;
-        file.write_all(metadata_json.as_bytes()).map_err(|e| {
-            SftError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to write metadata: {}", e),
+                format!("Failed to serialize metadata: {e}"),
             ))
         })?;
 
-        // Update latest symlink
+        let step_dir = self.checkpoint_dir.join(format!("step_{}", metadata.step));
+        write_checkpoint_to_dir(
+            &step_dir,
+            lora_params.iter().map(|(k, v)| (k.as_ref(), v)),
+            &metadata_json,
+        )?;
+
         self.update_latest_link(metadata.step)?;
 
-        // Save as best if applicable
         if is_best && self.save_best {
-            self.save_best_checkpoint(lora_params, metadata)?;
+            let best_dir = self.checkpoint_dir.join("best");
+            write_checkpoint_to_dir(
+                &best_dir,
+                lora_params.iter().map(|(k, v)| (k.as_ref(), v)),
+                &metadata_json,
+            )?;
+            tracing::info!("Saved best checkpoint at step {}", metadata.step);
         }
 
-        // Clean up old checkpoints
         self.cleanup_old_checkpoints()?;
 
         tracing::info!(
@@ -196,54 +216,6 @@ impl CheckpointManager {
         );
 
         Ok(step_dir)
-    }
-
-    /// Save as best checkpoint.
-    fn save_best_checkpoint(
-        &self,
-        lora_params: &HashMap<Rc<str>, Array>,
-        metadata: &CheckpointMetadata,
-    ) -> Result<()> {
-        let best_dir = self.checkpoint_dir.join("best");
-        fs::create_dir_all(&best_dir).map_err(|e| {
-            SftError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to create best directory: {}", e),
-            ))
-        })?;
-
-        // Save weights
-        let weights_path = best_dir.join("lora_weights.safetensors");
-        Array::save_safetensors(lora_params.clone(), None, &weights_path).map_err(|e| {
-            SftError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to save best weights: {}", e),
-            ))
-        })?;
-
-        // Save metadata
-        let metadata_path = best_dir.join("metadata.json");
-        let metadata_json = serde_json::to_string_pretty(metadata).map_err(|e| {
-            SftError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Failed to serialize metadata: {}", e),
-            ))
-        })?;
-        let mut file = File::create(&metadata_path).map_err(|e| {
-            SftError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to create metadata file: {}", e),
-            ))
-        })?;
-        file.write_all(metadata_json.as_bytes()).map_err(|e| {
-            SftError::Io(std::io::Error::new(
-                e.kind(),
-                format!("Failed to write metadata: {}", e),
-            ))
-        })?;
-
-        tracing::info!("Saved best checkpoint at step {}", metadata.step);
-        Ok(())
     }
 
     /// Update the "latest" symlink/marker.
@@ -428,6 +400,80 @@ impl CheckpointManager {
     /// Get the checkpoint directory.
     pub fn checkpoint_dir(&self) -> &Path {
         &self.checkpoint_dir
+    }
+
+    /// Return the configured maximum number of checkpoints to retain.
+    pub fn max_checkpoints_limit(&self) -> Option<usize> {
+        self.max_checkpoints
+    }
+
+    /// Return whether the best-checkpoint-separately flag is set.
+    pub fn save_best_flag(&self) -> bool {
+        self.save_best
+    }
+
+    /// Construct a `CheckpointManager` from raw parts without creating directories.
+    ///
+    /// Used by background checkpoint threads that operate on directories that have
+    /// already been created by the foreground trainer thread.
+    pub(crate) fn from_parts(
+        checkpoint_dir: PathBuf,
+        max_checkpoints: Option<usize>,
+        save_best: bool,
+    ) -> Self {
+        Self {
+            checkpoint_dir,
+            max_checkpoints,
+            save_best,
+        }
+    }
+
+    /// Save a checkpoint using `String`-keyed (i.e. `Send`) parameter maps.
+    ///
+    /// This is the background-thread-compatible counterpart of `save_checkpoint`.
+    /// It accepts `HashMap<String, Array>` (where both `String` and `Array` are `Send`)
+    /// rather than the `Rc<str>`-keyed variant used in the public API.
+    pub(crate) fn save_checkpoint_owned(
+        &self,
+        lora_params: HashMap<String, Array>,
+        metadata: &CheckpointMetadata,
+        is_best: bool,
+    ) -> Result<PathBuf> {
+        let metadata_json = serde_json::to_string_pretty(metadata).map_err(|e| {
+            SftError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to serialize metadata: {e}"),
+            ))
+        })?;
+
+        let step_dir = self.checkpoint_dir.join(format!("step_{}", metadata.step));
+        write_checkpoint_to_dir(
+            &step_dir,
+            lora_params.iter().map(|(k, v)| (k.as_str(), v)),
+            &metadata_json,
+        )?;
+
+        self.update_latest_link(metadata.step)?;
+
+        if is_best && self.save_best {
+            let best_dir = self.checkpoint_dir.join("best");
+            write_checkpoint_to_dir(
+                &best_dir,
+                lora_params.iter().map(|(k, v)| (k.as_str(), v)),
+                &metadata_json,
+            )?;
+            tracing::info!("Saved best checkpoint at step {}", metadata.step);
+        }
+
+        self.cleanup_old_checkpoints()?;
+
+        tracing::info!(
+            "Saved checkpoint at step {} to {:?}",
+            metadata.step,
+            step_dir
+        );
+
+        Ok(step_dir)
     }
 }
 

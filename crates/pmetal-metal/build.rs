@@ -30,6 +30,9 @@ fn main() {
 
     // Re-run if shaders change
     println!("cargo:rerun-if-changed=src/kernels/metal");
+
+    // Link against Accelerate.framework for vDSP vector operations
+    println!("cargo:rustc-link-lib=framework=Accelerate");
 }
 
 fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path) {

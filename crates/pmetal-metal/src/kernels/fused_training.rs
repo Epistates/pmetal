@@ -618,8 +618,10 @@ impl FusedGradientClipping {
             encoder.setBytes_length_atIndex(total_ptr, std::mem::size_of::<u32>(), 2);
         }
 
+        // Each thread processes 4 elements via float4/half4 vectorization,
+        // so we need total_elements / (32 threads * 4 elements/thread) threadgroups.
         let grid_size = MTLSize {
-            width: self.total_elements.div_ceil(32),
+            width: self.total_elements.div_ceil(128),
             height: 1,
             depth: 1,
         };

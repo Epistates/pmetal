@@ -57,6 +57,53 @@ inline float simd_sum(float val, uint simd_lane_id) {
 }
 
 // =============================================================================
+// Vectorized Dot Product Helpers for half precision
+// =============================================================================
+// Metal GPU hardware has 128-bit load units. Loading half4 (8 bytes) per cycle
+// instead of half (2 bytes) provides 4x load throughput. Pairing two half4
+// loads fills the 128-bit bus completely.
+// =============================================================================
+
+/// Vectorized dot product: half inputs, float accumulation, strided access
+inline float dot_h4(
+    device const half* a,
+    device const half* b,
+    uint size
+) {
+    float4 acc = float4(0.0f);
+    uint s4 = size & ~3u;
+    for (uint i = 0; i < s4; i += 4) {
+        acc += float4(*(device const half4*)(a + i)) * float4(*(device const half4*)(b + i));
+    }
+    float result = acc.x + acc.y + acc.z + acc.w;
+    for (uint i = s4; i < size; i++) {
+        result += float(a[i]) * float(b[i]);
+    }
+    return result;
+}
+
+/// Vectorized dot product with SIMD stride: half inputs, float accumulation
+inline float dot_h4_simd(
+    device const half* a,
+    device const half* b,
+    uint size,
+    uint lane_id,
+    uint stride
+) {
+    float4 acc = float4(0.0f);
+    uint s4 = size & ~3u;
+    for (uint i = lane_id * 4; i < s4; i += stride * 4) {
+        acc += float4(*(device const half4*)(a + i)) * float4(*(device const half4*)(b + i));
+    }
+    float result = acc.x + acc.y + acc.z + acc.w;
+    // Handle elements not covered by vectorized stride
+    for (uint i = s4 + lane_id; i < size; i += stride) {
+        result += float(a[i]) * float(b[i]);
+    }
+    return result;
+}
+
+// =============================================================================
 // Fused LoRA Forward Kernel
 // =============================================================================
 
@@ -84,6 +131,7 @@ kernel void fused_lora_forward(
     device half* y [[buffer(4)]],                 // [batch, out_features]
     device half* xA [[buffer(5)]],                // [batch, rank] - intermediate for backward
     constant FusedLoraParams& params [[buffer(6)]],
+    threadgroup float* scratch [[threadgroup(0)]],  // host allocates tile_m * rank floats
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
@@ -109,45 +157,56 @@ kernel void fused_lora_forward(
     float acc_base = 0.0f;
     float acc_lora = 0.0f;
 
-    // Threadgroup memory for intermediate xA values
-    // Support ranks up to MAX_LORA_RANK (256)
-    threadgroup float xA_tile[MAX_TILE_M * MAX_LORA_RANK];
+    // Dynamic threadgroup memory for intermediate xA values
+    // Size is tile_m * rank floats, allocated by the host via setThreadgroupMemoryLength
+    threadgroup float* xA_tile = scratch;
 
     // -------------------------------------------------------------------------
-    // Phase 1: Compute x @ W.T (base linear)
+    // Phase 1: Compute x @ W.T (base linear) — vectorized with half4 loads
     // -------------------------------------------------------------------------
-    for (uint k = 0; k < params.in_features; k += TILE_K) {
-        uint k_end = min(k + TILE_K, params.in_features);
-
-        #pragma unroll 4
-        for (uint kk = k; kk < k_end; kk++) {
-            float x_val = float(x[batch_idx * params.in_features + kk]);
-            float w_val = float(W[out_idx * params.in_features + kk]);
-            acc_base += x_val * w_val;
+    {
+        device const half* x_row = x + batch_idx * params.in_features;
+        device const half* w_row = W + out_idx * params.in_features;
+        float4 base_acc4 = float4(0.0f);
+        uint k4 = params.in_features & ~3u;
+        for (uint k = 0; k < k4; k += 4) {
+            base_acc4 += float4(*(device const half4*)(x_row + k)) *
+                         float4(*(device const half4*)(w_row + k));
+        }
+        acc_base = base_acc4.x + base_acc4.y + base_acc4.z + base_acc4.w;
+        for (uint k = k4; k < params.in_features; k++) {
+            acc_base += float(x_row[k]) * float(w_row[k]);
         }
     }
 
     // -------------------------------------------------------------------------
-    // Phase 2: Compute x @ A.T (LoRA down projection)
+    // Phase 2: Compute x @ A.T (LoRA down projection) — vectorized with half4
     // Only compute once per batch element, stored in threadgroup memory
     // -------------------------------------------------------------------------
-    // Each SIMD group handles one batch element
-    for (uint r = 0; r < params.rank; r++) {
-        float acc_a = 0.0f;
+    {
+        device const half* x_row = x + batch_idx * params.in_features;
+        for (uint r = 0; r < params.rank; r++) {
+            device const half* a_row = A + r * params.in_features;
+            float4 acc_a4 = float4(0.0f);
+            uint k4 = params.in_features & ~3u;
 
-        // Each thread in SIMD contributes to the reduction
-        for (uint k = simd_lane_id; k < params.in_features; k += SIMD_SIZE) {
-            float x_val = float(x[batch_idx * params.in_features + k]);
-            float a_val = float(A[r * params.in_features + k]);
-            acc_a += x_val * a_val;
-        }
+            // SIMD-strided vectorized reduction
+            for (uint k = simd_lane_id * 4; k < k4; k += SIMD_SIZE * 4) {
+                acc_a4 += float4(*(device const half4*)(x_row + k)) *
+                          float4(*(device const half4*)(a_row + k));
+            }
+            float acc_a = acc_a4.x + acc_a4.y + acc_a4.z + acc_a4.w;
 
-        // SIMD reduction
-        acc_a = simd_sum(acc_a, simd_lane_id);
+            // Scalar remainder
+            for (uint k = k4 + simd_lane_id; k < params.in_features; k += SIMD_SIZE) {
+                acc_a += float(x_row[k]) * float(a_row[k]);
+            }
 
-        // Store result (first lane writes); guard against ranks exceeding MAX_LORA_RANK
-        if (simd_lane_id == 0) {
-            if (params.rank <= MAX_LORA_RANK) {
+            // SIMD reduction
+            acc_a = simd_sum(acc_a, simd_lane_id);
+
+            // Store result (first lane writes)
+            if (simd_lane_id == 0) {
                 xA_tile[local_m * params.rank + r] = acc_a;
             }
         }
@@ -218,7 +277,8 @@ kernel void fused_lora_backward_ab(
     if (out_idx < params.out_features && rank_idx < params.rank) {
         float acc = 0.0f;
 
-        // Accumulate over batch
+        // Accumulate over batch — note: non-contiguous access pattern
+        // (strided by rank/out_features), so vectorization applies to batch dim
         for (uint b = 0; b < params.batch_size; b++) {
             float xa_val = float(xA[b * params.rank + rank_idx]);
             float dy_val = float(dY[b * params.out_features + out_idx]);
@@ -257,7 +317,8 @@ kernel void fused_lora_backward_a(
     float acc = 0.0f;
 
     for (uint b = 0; b < params.batch_size; b++) {
-        // First compute dY[b] @ B[:, r] (dot product for this rank)
+        // Compute dY[b] @ B[:, r] — B is strided (B[o * rank + rank_idx]),
+        // so we can't vectorize contiguously. But dY is contiguous per batch row.
         float dy_b = 0.0f;
         for (uint o = 0; o < params.out_features; o++) {
             dy_b += float(dY[b * params.out_features + o]) * float(B[o * params.rank + rank_idx]);
@@ -292,6 +353,7 @@ kernel void fused_lora_backward_x(
     device const half* B [[buffer(3)]],           // [out_features, rank]
     device half* dX [[buffer(4)]],                // [batch, in_features]
     constant FusedLoraParams& params [[buffer(5)]],
+    threadgroup float* scratch [[threadgroup(0)]],  // host allocates tile_m * rank floats
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
@@ -306,12 +368,14 @@ kernel void fused_lora_backward_x(
         return;
     }
 
-    // Threadgroup memory for intermediate dY @ B
-    // Support ranks up to MAX_LORA_RANK (256)
-    threadgroup float dyB_tile[MAX_TILE_M * MAX_LORA_RANK];
+    // Dynamic threadgroup memory for intermediate dY @ B
+    // Size is tile_m * rank floats, allocated by the host via setThreadgroupMemoryLength
+    threadgroup float* dyB_tile = scratch;
 
     // -------------------------------------------------------------------------
     // Phase 1: Compute dY @ W (base gradient)
+    // W is [out_features, in_features], accessed as W[o * in_features + in_idx]
+    // which is strided, so we can't vectorize on the contiguous dim here.
     // -------------------------------------------------------------------------
     float acc_base = 0.0f;
     for (uint o = 0; o < params.out_features; o++) {
@@ -322,11 +386,11 @@ kernel void fused_lora_backward_x(
 
     // -------------------------------------------------------------------------
     // Phase 2: Compute dY @ B (LoRA intermediate)
+    // B is [out_features, rank], accessed as B[o * rank + r] — strided.
     // -------------------------------------------------------------------------
     for (uint r = 0; r < params.rank; r++) {
         float acc = 0.0f;
 
-        // Each thread contributes to reduction over output features
         for (uint o = simd_lane_id; o < params.out_features; o += SIMD_SIZE) {
             float dy_val = float(dY[batch_idx * params.out_features + o]);
             float b_val = float(B[o * params.rank + r]);
@@ -384,24 +448,16 @@ kernel void lora_forward_inference(
         return;
     }
 
-    // Base linear
-    float acc = 0.0f;
-    for (uint k = 0; k < params.in_features; k++) {
-        acc += float(x[batch_idx * params.in_features + k]) *
-               float(W[out_idx * params.in_features + k]);
-    }
+    // Base linear — vectorized with half4 loads
+    device const half* x_row = x + batch_idx * params.in_features;
+    device const half* w_row = W + out_idx * params.in_features;
+    float acc = dot_h4(x_row, w_row, params.in_features);
 
-    // LoRA contribution
+    // LoRA contribution — vectorized x @ A^T per rank
     float lora_acc = 0.0f;
     for (uint r = 0; r < params.rank; r++) {
-        // x @ A^T for this rank
-        float xa = 0.0f;
-        for (uint k = 0; k < params.in_features; k++) {
-            xa += float(x[batch_idx * params.in_features + k]) *
-                  float(A[r * params.in_features + k]);
-        }
-
-        // Multiply by B
+        device const half* a_row = A + r * params.in_features;
+        float xa = dot_h4(x_row, a_row, params.in_features);
         lora_acc += xa * float(B[out_idx * params.rank + r]);
     }
 

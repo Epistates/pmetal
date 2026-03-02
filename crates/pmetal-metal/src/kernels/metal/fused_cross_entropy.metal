@@ -303,32 +303,40 @@ kernel void fused_cross_entropy_backward_simd(
     const float lse = logsumexp[token_idx];
     const float upstream = grad_loss[token_idx];
 
-    // Compute gradients using cached logsumexp
-    for (uint v = lane_id; v < params.vocab_size; v += SIMD_SIZE) {
-        float x = row[v];
-        float orig_x = x;
+    // Compute gradients using cached logsumexp — vectorized with float4
+    uint v4 = params.vocab_size & ~3u;
+    for (uint v = lane_id * 4; v < v4; v += SIMD_SIZE * 4) {
+        float4 x4 = *(device const float4*)(row + v);
+        float4 grad4;
 
-        // Apply softcap if enabled
+        if (params.softcap != 0.0f) {
+            float4 partial4 = tanh(x4 / params.softcap);
+            float4 capped4 = params.softcap * partial4;
+            grad4 = exp(capped4 - lse);
+            // Subtract 1 for target
+            for (int i = 0; i < 4; i++) {
+                if ((int)(v + i) == target) grad4[i] -= 1.0f;
+            }
+            grad4 *= (1.0f - partial4 * partial4);
+        } else {
+            grad4 = exp(x4 - lse);
+            for (int i = 0; i < 4; i++) {
+                if ((int)(v + i) == target) grad4[i] -= 1.0f;
+            }
+        }
+        *(device float4*)(row + v) = upstream * grad4;
+    }
+    // Scalar remainder
+    for (uint v = v4 + lane_id; v < params.vocab_size; v += SIMD_SIZE) {
+        float x = row[v];
         float partial = x;
         if (params.softcap != 0.0f) {
             partial = tanh(x / params.softcap);
             x = params.softcap * partial;
         }
-
-        // exp(x - logsumexp) = softmax(x)
         float grad = exp(x - lse);
-
-        // Subtract 1 for target position
-        if ((int)v == target) {
-            grad -= 1.0f;
-        }
-
-        // Softcap gradient: d/dx [t * tanh(x/t)] = 1 - tanh^2(x/t)
-        if (params.softcap != 0.0f) {
-            grad *= (1.0f - partial * partial);
-        }
-
-        // Scale by upstream and write in-place
+        if ((int)v == target) grad -= 1.0f;
+        if (params.softcap != 0.0f) grad *= (1.0f - partial * partial);
         row[v] = upstream * grad;
     }
 }
@@ -548,9 +556,14 @@ kernel void fused_linear_cross_entropy_forward(
             uint vocab_idx = chunk_start + v;
             device const float* w = lm_head_weight + vocab_idx * params.hidden_size;
 
-            // Compute dot product: hidden[token] @ lm_head[vocab].T
-            float logit = 0.0f;
-            for (uint d = 0; d < params.hidden_size; d++) {
+            // Compute dot product: hidden[token] @ lm_head[vocab].T (vectorized float4)
+            float4 logit_acc = float4(0.0f);
+            uint d4 = params.hidden_size & ~3u;
+            for (uint d = 0; d < d4; d += 4) {
+                logit_acc += *(device const float4*)(h + d) * *(device const float4*)(w + d);
+            }
+            float logit = logit_acc.x + logit_acc.y + logit_acc.z + logit_acc.w;
+            for (uint d = d4; d < params.hidden_size; d++) {
                 logit += h[d] * w[d];
             }
 
@@ -729,9 +742,14 @@ kernel void fused_linear_cross_entropy_forward_f16(
             uint vocab_idx = chunk_start + v;
             device const half* w = lm_head_weight + vocab_idx * params.hidden_size;
 
-            // fp32 accumulation for dot product
-            float logit = 0.0f;
-            for (uint d = 0; d < params.hidden_size; d++) {
+            // fp32 accumulation for dot product (vectorized half4)
+            float4 logit_acc = float4(0.0f);
+            uint d4 = params.hidden_size & ~3u;
+            for (uint d = 0; d < d4; d += 4) {
+                logit_acc += float4(*(device const half4*)(h + d)) * float4(*(device const half4*)(w + d));
+            }
+            float logit = logit_acc.x + logit_acc.y + logit_acc.z + logit_acc.w;
+            for (uint d = d4; d < params.hidden_size; d++) {
                 logit += float(h[d]) * float(w[d]);
             }
 

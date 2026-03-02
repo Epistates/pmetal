@@ -62,7 +62,15 @@ pub struct FusedSwiGLUConfig {
 
 impl FusedSwiGLUConfig {
     /// Create a new config without LoRA.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hidden_size` is not a multiple of 4 (required for float4 vectorized loads).
     pub fn new(batch_size: usize, hidden_size: usize, intermediate_size: usize) -> Self {
+        assert!(
+            hidden_size % 4 == 0,
+            "hidden_size ({hidden_size}) must be a multiple of 4 for vectorized Metal kernels"
+        );
         Self {
             batch_size,
             hidden_size,
@@ -75,6 +83,10 @@ impl FusedSwiGLUConfig {
     }
 
     /// Create a new config with LoRA.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `hidden_size` is not a multiple of 4 (required for float4 vectorized loads).
     pub fn with_lora(
         batch_size: usize,
         hidden_size: usize,
@@ -82,6 +94,10 @@ impl FusedSwiGLUConfig {
         lora_rank: usize,
         lora_alpha: f32,
     ) -> Self {
+        assert!(
+            hidden_size % 4 == 0,
+            "hidden_size ({hidden_size}) must be a multiple of 4 for vectorized Metal kernels"
+        );
         Self {
             batch_size,
             hidden_size,

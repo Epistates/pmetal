@@ -60,6 +60,10 @@ pub struct FusedLoraConfig {
 
 impl FusedLoraConfig {
     /// Create a new configuration.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `in_features` is not a multiple of 4 (required for half4 vectorized loads).
     pub fn new(
         batch_size: usize,
         in_features: usize,
@@ -67,6 +71,10 @@ impl FusedLoraConfig {
         rank: usize,
         scale: f32,
     ) -> Self {
+        assert!(
+            in_features % 4 == 0,
+            "in_features ({in_features}) must be a multiple of 4 for vectorized Metal kernels"
+        );
         Self {
             batch_size,
             in_features,
@@ -90,9 +98,9 @@ impl FusedLoraConfig {
         if self.rank == 0 {
             return Err(MetalError::InvalidConfig("rank must be > 0".into()));
         }
-        if self.rank > 64 {
+        if self.rank > 256 {
             return Err(MetalError::InvalidConfig(
-                "rank must be <= 64 (kernel limitation)".into(),
+                "rank must be <= 256 (kernel limitation)".into(),
             ));
         }
         Ok(())
@@ -405,6 +413,13 @@ impl FusedLora {
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 6);
         }
 
+        // Allocate dynamic threadgroup memory for xA_tile: tile_m * rank floats
+        let tg_mem_size =
+            tuned_config.tile_m as usize * self.config.rank * std::mem::size_of::<f32>();
+        unsafe {
+            encoder.setThreadgroupMemoryLength_atIndex(tg_mem_size, 0);
+        }
+
         // Calculate grid size using tuned parameters
         let grid_size = MTLSize {
             width: self
@@ -665,6 +680,12 @@ impl FusedLora {
         const TILE_M: usize = 32;
         const TILE_K: usize = 32;
 
+        // Allocate dynamic threadgroup memory for dyB_tile: tile_m * rank floats
+        let tg_mem_size = TILE_M * self.config.rank * std::mem::size_of::<f32>();
+        unsafe {
+            encoder.setThreadgroupMemoryLength_atIndex(tg_mem_size, 0);
+        }
+
         let grid_size = MTLSize {
             width: self.config.batch_size.div_ceil(TILE_M),
             height: self.config.in_features.div_ceil(TILE_K),
@@ -711,7 +732,7 @@ mod tests {
         let valid = FusedLoraConfig::new(128, 512, 1024, 8, 2.0);
         assert!(valid.validate().is_ok());
 
-        let invalid_rank = FusedLoraConfig::new(128, 512, 1024, 128, 2.0);
+        let invalid_rank = FusedLoraConfig::new(128, 512, 1024, 512, 2.0);
         assert!(invalid_rank.validate().is_err());
 
         let invalid_batch = FusedLoraConfig::new(0, 512, 1024, 8, 2.0);

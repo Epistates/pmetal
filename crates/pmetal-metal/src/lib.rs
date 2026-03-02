@@ -64,12 +64,14 @@
 #![warn(missing_docs)]
 #![cfg(target_os = "macos")]
 
+pub mod accelerate;
 pub mod async_scheduler;
 pub mod bridge;
 pub mod buffer;
 pub mod context;
 pub mod error;
 pub mod kernels;
+pub mod neon_convert;
 pub mod pipeline;
 pub mod tuna;
 
