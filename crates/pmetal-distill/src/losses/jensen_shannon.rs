@@ -352,6 +352,78 @@ mod tests {
         );
     }
 
+    /// Verify gradients flow through Jensen-Shannon loss (finite + non-zero).
+    #[test]
+    #[serial]
+    fn test_jensen_shannon_gradient_flow() {
+        use mlx_rs::transforms::value_and_grad;
+
+        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+
+        let loss_fn = |inputs: &[Array]| -> Vec<Array> {
+            let student = &inputs[0];
+            let temp = Array::from_f32(2.0);
+            let teacher_scaled = teacher.divide(&temp).unwrap();
+            let student_scaled = student.divide(&temp).unwrap();
+
+            let teacher_log_probs = mlx_rs::nn::log_softmax(&teacher_scaled, -1).unwrap();
+            let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1).unwrap();
+            let teacher_probs = teacher_log_probs.exp().unwrap();
+
+            // log(M) = log(0.5*(P+Q)) via log-sum-exp
+            let log2 = Array::from_f32(2.0_f32.ln());
+            let log_mixture = log_sum_exp(&teacher_log_probs, &student_log_probs)
+                .unwrap()
+                .subtract(&log2)
+                .unwrap();
+
+            let kl_teacher_m = teacher_probs
+                .multiply(&teacher_log_probs.subtract(&log_mixture).unwrap())
+                .unwrap();
+            let student_probs = student_log_probs.exp().unwrap();
+            let kl_student_m = student_probs
+                .multiply(&student_log_probs.subtract(&log_mixture).unwrap())
+                .unwrap();
+
+            let half = Array::from_f32(0.5);
+            let js = kl_teacher_m
+                .add(&kl_student_m)
+                .unwrap()
+                .multiply(&half)
+                .unwrap();
+            let js_sum = js.sum_axes(&[-1], Some(false)).unwrap();
+            let loss = js_sum.mean(None).unwrap();
+            vec![loss]
+        };
+
+        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let (values, grads) = value_and_grad(loss_fn)(&[student]).unwrap();
+
+        values[0].eval().unwrap();
+        grads[0].eval().unwrap();
+
+        let loss_val: f32 = values[0].item();
+        assert!(
+            loss_val.is_finite(),
+            "JS loss must be finite, got {}",
+            loss_val
+        );
+        assert!(loss_val > 0.0, "JS loss must be positive, got {}", loss_val);
+
+        let grad_data: Vec<f32> = grads[0].as_slice().to_vec();
+        let grad_norm: f32 = grad_data.iter().map(|&g| g * g).sum::<f32>().sqrt();
+        assert!(
+            grad_norm.is_finite(),
+            "gradient must be finite, got norm={}",
+            grad_norm
+        );
+        assert!(
+            grad_norm > 1e-10,
+            "gradient must be non-zero, got norm={}",
+            grad_norm
+        );
+    }
+
     #[cfg(feature = "metal")]
     #[test]
     #[serial]

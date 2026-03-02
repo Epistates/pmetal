@@ -92,7 +92,7 @@ impl MoERouter {
         let gate = nn::LinearBuilder::new(hidden_size, num_experts as i32)
             .bias(false)
             .build()
-            .unwrap();
+            .expect("MoERouter gate linear layer creation cannot fail with valid dimensions");
         Self {
             gate,
             num_experts,
@@ -194,15 +194,15 @@ impl Expert {
         let w1 = nn::LinearBuilder::new(hidden_size, intermediate_size)
             .bias(false)
             .build()
-            .unwrap();
+            .expect("Expert w1 linear layer creation cannot fail with valid dimensions");
         let w3 = nn::LinearBuilder::new(hidden_size, intermediate_size)
             .bias(false)
             .build()
-            .unwrap();
+            .expect("Expert w3 linear layer creation cannot fail with valid dimensions");
         let w2 = nn::LinearBuilder::new(intermediate_size, hidden_size)
             .bias(false)
             .build()
-            .unwrap();
+            .expect("Expert w2 linear layer creation cannot fail with valid dimensions");
         Self { w1, w3, w2 }
     }
 

@@ -386,6 +386,61 @@ mod tests {
         println!("GPU available: {}", loss.is_gpu_available());
     }
 
+    /// Verify that gradients flow through the KL divergence loss and are
+    /// finite + non-zero.  This guards against accidentally detaching the
+    /// computation graph (e.g. via `.item()` or `.eval()` mid-graph).
+    #[test]
+    #[serial]
+    fn test_kl_divergence_gradient_flow() {
+        use mlx_rs::transforms::value_and_grad;
+
+        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+
+        let loss_fn = |inputs: &[Array]| -> Vec<Array> {
+            let student = &inputs[0];
+            let temp = Array::from_f32(2.0);
+            let teacher_scaled = teacher.divide(&temp).unwrap();
+            let student_scaled = student.divide(&temp).unwrap();
+
+            let teacher_log_probs = mlx_rs::nn::log_softmax(&teacher_scaled, -1).unwrap();
+            let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1).unwrap();
+            let teacher_probs = teacher_log_probs.exp().unwrap();
+
+            let log_ratio = teacher_log_probs.subtract(&student_log_probs).unwrap();
+            let kl = teacher_probs.multiply(&log_ratio).unwrap();
+            let kl_sum = kl.sum_axes(&[-1], Some(false)).unwrap();
+            let loss = kl_sum.mean(None).unwrap();
+            vec![loss]
+        };
+
+        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let (values, grads) = value_and_grad(loss_fn)(&[student]).unwrap();
+
+        values[0].eval().unwrap();
+        grads[0].eval().unwrap();
+
+        let loss_val: f32 = values[0].item();
+        assert!(
+            loss_val.is_finite(),
+            "loss must be finite, got {}",
+            loss_val
+        );
+        assert!(loss_val > 0.0, "KL loss must be positive, got {}", loss_val);
+
+        let grad_data: Vec<f32> = grads[0].as_slice().to_vec();
+        let grad_norm: f32 = grad_data.iter().map(|&g| g * g).sum::<f32>().sqrt();
+        assert!(
+            grad_norm.is_finite(),
+            "gradient must be finite, got norm={}",
+            grad_norm
+        );
+        assert!(
+            grad_norm > 1e-10,
+            "gradient must be non-zero, got norm={}",
+            grad_norm
+        );
+    }
+
     #[test]
     #[serial]
     fn test_larger_batch() {

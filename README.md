@@ -104,31 +104,55 @@ pmetal/
 
 | Family | Variants | LoRA | QLoRA | Full FT |
 |--------|----------|------|-------|---------|
-| Llama | 2, 3, 3.1, 3.2, 3.3, 4 | ✓ | ✓ | ✓ |
+| Llama | 2, 3, 3.1, 3.2, 3.3 | ✓ | ✓ | ✓ |
+| Llama 4 | Scout, Maverick | ✓ | - | ✓ |
 | Qwen | 2, 2.5, 3, 3-MoE | ✓ | - | ✓ |
 | DeepSeek | V3, V3.2, V3.2-Speciale | ✓ | - | ✓ |
 | Mistral | 7B, 8x7B | ✓ | ✓ | ✓ |
 | Gemma | 2, 3 | ✓ | - | ✓ |
 | Phi | 3, 4 | ✓ | - | ✓ |
-| GPT-OSS | 20B, 120B | ✓ | - | - |
-| Granite | 3.0, 3.1 | ✓ | - | ✓ |
 | Cohere | Command R | ✓ | - | ✓ |
+| Granite | 3.0, 3.1 | ✓ | - | ✓ |
+| NemotronH | Hybrid (Mamba+Attention) | ✓ | - | ✓ |
+| StarCoder2 | 3B, 7B, 15B | ✓ | - | ✓ |
+| RecurrentGemma | Griffin | ✓ | - | ✓ |
+| Jamba | 1.5 | ✓ | - | ✓ |
+| GPT-OSS | 20B, 120B | ✓ | - | - |
 
-### Vision Models
+### Vision & Multimodal Models (In Progress)
 
-| Family | Variants | Inference |
-|--------|----------|-----------|
-| Pixtral | 12B | ✓ |
-| Qwen2-VL | 2B, 7B | ✓ |
-| MLlama | 3.2-Vision | ✓ |
+Architecture implementations exist but are not yet integrated into the CLI dispatcher.
+
+| Family | Variants | Status |
+|--------|----------|--------|
+| Pixtral | 12B | Architecture implemented |
+| Qwen2-VL | 2B, 7B | Architecture implemented |
+| MLlama | 3.2-Vision | Architecture implemented |
+| CLIP | ViT-L/14 | Architecture implemented |
+| Whisper | Base, Small, Medium, Large | Architecture implemented |
+
+### Diffusion Models (Experimental)
+
+| Family | Variants | Status |
+|--------|----------|--------|
+| Flux | 1-dev, 1-schnell | Dispatcher + pipeline implemented |
 
 ## Training Methods
 
 - **Supervised Fine-Tuning (SFT)**: Standard next-token prediction
 - **LoRA**: Low-Rank Adaptation with configurable rank and alpha
 - **QLoRA**: 4-bit quantized base weights with LoRA adapters
+- **DoRA**: Weight-Decomposed Low-Rank Adaptation
 - **DPO**: Direct Preference Optimization for RLHF
 - **GRPO**: Group Relative Policy Optimization
+- **DAPO**: Decoupled Clip and Dynamic Sampling Policy Optimization
+- **GSPO**: Group Sequence Policy Optimization (fixes GRPO length bias)
+- **PPO**: Proximal Policy Optimization
+- **ORPO**: Odds Ratio Preference Optimization (reference-free)
+- **SimPO**: Simple Preference Optimization
+- **KTO**: Kahneman-Tversky Optimization (unpaired preference data)
+- **Online DPO**: Online Direct Preference Optimization with reward models
+- **Diffusion Training**: LLaDA-style masked diffusion for language models
 
 ## Key Features
 

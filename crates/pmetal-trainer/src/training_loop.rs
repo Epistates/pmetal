@@ -940,31 +940,30 @@ impl TrainingLoop {
                 }
 
                 // Evaluation
-                if self.config.eval_every > 0
-                    && self.step % self.config.eval_every == 0
-                    && eval_dataset.is_some()
-                {
-                    let metrics = self.evaluate(model, eval_dataset.as_ref().unwrap())?;
+                if self.config.eval_every > 0 && self.step % self.config.eval_every == 0 {
+                    if let Some(eval_ds) = eval_dataset.as_ref() {
+                        let metrics = self.evaluate(model, eval_ds)?;
 
-                    // Log comprehensive metrics
-                    let acc_str = metrics
-                        .accuracy
-                        .map(|a| format!(", acc={:.2}%", a))
-                        .unwrap_or_default();
-                    tracing::info!(
-                        "Step {}: eval_loss={:.4}, ppl={:.2}{}",
-                        self.step,
-                        metrics.loss,
-                        metrics.perplexity,
-                        acc_str
-                    );
+                        // Log comprehensive metrics
+                        let acc_str = metrics
+                            .accuracy
+                            .map(|a| format!(", acc={:.2}%", a))
+                            .unwrap_or_default();
+                        tracing::info!(
+                            "Step {}: eval_loss={:.4}, ppl={:.2}{}",
+                            self.step,
+                            metrics.loss,
+                            metrics.perplexity,
+                            acc_str
+                        );
 
-                    if metrics.loss < best_eval_loss {
-                        best_eval_loss = metrics.loss;
+                        if metrics.loss < best_eval_loss {
+                            best_eval_loss = metrics.loss;
 
-                        // Save best checkpoint
-                        if let Some(manager) = checkpoint_manager {
-                            self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
+                            // Save best checkpoint
+                            if let Some(manager) = checkpoint_manager {
+                                self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
+                            }
                         }
                     }
                 }
@@ -1104,22 +1103,20 @@ impl TrainingLoop {
                 }
 
                 // Evaluation
-                if self.config.eval_every > 0
-                    && self.step % self.config.eval_every == 0
-                    && eval_dataset.is_some()
-                {
-                    let eval_ds = eval_dataset.as_ref().unwrap();
-                    let metrics = self.evaluate(model, eval_ds)?;
-                    let acc_str = metrics
-                        .accuracy
-                        .map(|a| format!(", accuracy={:.2}%", a * 100.0))
-                        .unwrap_or_default();
-                    tracing::info!("Eval: loss={:.4}{}", metrics.loss, acc_str);
+                if self.config.eval_every > 0 && self.step % self.config.eval_every == 0 {
+                    if let Some(eval_ds) = eval_dataset.as_ref() {
+                        let metrics = self.evaluate(model, eval_ds)?;
+                        let acc_str = metrics
+                            .accuracy
+                            .map(|a| format!(", accuracy={:.2}%", a * 100.0))
+                            .unwrap_or_default();
+                        tracing::info!("Eval: loss={:.4}{}", metrics.loss, acc_str);
 
-                    if metrics.loss < best_eval_loss {
-                        best_eval_loss = metrics.loss;
-                        if let Some(manager) = checkpoint_manager {
-                            self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
+                        if metrics.loss < best_eval_loss {
+                            best_eval_loss = metrics.loss;
+                            if let Some(manager) = checkpoint_manager {
+                                self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
+                            }
                         }
                     }
                 }

@@ -7,14 +7,17 @@
 //! - Group Relative Policy Optimization (GRPO)
 //! - DAPO (Decoupled Clip and Dynamic Sampling Policy Optimization)
 //! - GSPO (Group Sequence Policy Optimization)
+//! - PPO (Proximal Policy Optimization)
+//! - ORPO (Odds Ratio Preference Optimization)
+//! - SimPO (Simple Preference Optimization)
+//! - KTO (Kahneman-Tversky Optimization)
+//! - Online DPO with reward models
 //! - LLaDA-style Diffusion Training
 //! - Learning rate schedulers
 //! - Training callbacks
 //! - Parameter grouping for per-layer learning rates
 //!
 //! # Q4 2025 SOTA Algorithms
-//!
-//! This crate includes the latest SOTA algorithms from Q4 2025:
 //!
 //! - **DAPO**: ByteDance's algorithm with Clip-Higher, Dynamic Sampling,
 //!   Token-Level Policy Gradient, and Overlong Reward Penalty

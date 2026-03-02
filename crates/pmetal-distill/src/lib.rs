@@ -28,17 +28,6 @@
 //! # GPU Acceleration
 //!
 //! When the `metal` feature is enabled (default), all loss implementations
-
-// Crate-level lint configuration for ML/GPU code patterns
-#![allow(missing_docs)]
-#![allow(dead_code)]
-#![allow(unsafe_code)]
-#![allow(unused_imports)]
-#![allow(clippy::too_many_arguments)]
-#![allow(clippy::needless_borrows_for_generic_args)]
-#![allow(clippy::unnecessary_cast)]
-#![allow(clippy::field_reassign_with_default)]
-#![allow(clippy::type_complexity)]
 //! automatically use custom Metal kernels with these optimizations:
 //!
 //! - **Online softmax**: O(1) memory per token instead of O(vocab) probability tensors
@@ -55,6 +44,17 @@
 //! let config = DistillConfig::from_yaml_file("distill_config.yaml")?;
 //! run_distillation(&config).await?;
 //! ```
+
+// Crate-level lint configuration for ML/GPU code patterns
+#![allow(missing_docs)]
+#![allow(dead_code)]
+#![allow(unsafe_code)]
+#![allow(unused_imports)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::unnecessary_cast)]
+#![allow(clippy::field_reassign_with_default)]
+#![allow(clippy::type_complexity)]
 
 mod config;
 mod distill;

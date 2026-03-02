@@ -560,9 +560,8 @@ impl GrpoTrainer {
         // Compute KL/policy_loss stats from the values already available in the loss
         // (We use the pre-update values since post-update requires an extra forward pass.
         // The loss value itself is the authoritative training signal.)
-        let kl_stat = if ref_per_token_logps.is_some() {
+        let kl_stat = if let Some(ref_logps) = ref_per_token_logps.as_ref() {
             // Approximate: compute from old policy vs ref (cheap, no extra forward)
-            let ref_logps = ref_per_token_logps.as_ref().unwrap();
             let kl_log_ratio = ref_logps.subtract(&old_per_token_logps)?;
             let kl_ratio = kl_log_ratio.exp()?;
             let per_token_kl = kl_ratio
@@ -753,9 +752,9 @@ impl RewardFunction for XmlFormatReward {
         for (i, completion) in completions.iter().enumerate() {
             let mut score = 0.0;
             for (start_tag, end_tag) in &self.tags {
-                if completion.contains(start_tag) && completion.contains(end_tag) {
-                    let start_idx = completion.find(start_tag).unwrap();
-                    let end_idx = completion.find(end_tag).unwrap();
+                if let (Some(start_idx), Some(end_idx)) =
+                    (completion.find(start_tag), completion.find(end_tag))
+                {
                     if start_idx < end_idx {
                         score += 0.5;
                     }

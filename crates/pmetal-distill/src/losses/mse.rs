@@ -138,6 +138,53 @@ mod tests {
         );
     }
 
+    /// Verify gradients flow through MSE loss (finite + non-zero).
+    #[test]
+    #[serial]
+    fn test_mse_gradient_flow() {
+        use mlx_rs::transforms::value_and_grad;
+
+        let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
+
+        let loss_fn = |inputs: &[Array]| -> Vec<Array> {
+            let student = &inputs[0];
+            let diff = student.subtract(&teacher).unwrap();
+            let mse = diff.multiply(&diff).unwrap().mean(None).unwrap();
+            vec![mse]
+        };
+
+        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+        let (values, grads) = value_and_grad(loss_fn)(&[student]).unwrap();
+
+        values[0].eval().unwrap();
+        grads[0].eval().unwrap();
+
+        let loss_val: f32 = values[0].item();
+        assert!(
+            loss_val.is_finite(),
+            "MSE loss must be finite, got {}",
+            loss_val
+        );
+        assert!(
+            loss_val > 0.0,
+            "MSE loss must be positive, got {}",
+            loss_val
+        );
+
+        let grad_data: Vec<f32> = grads[0].as_slice().to_vec();
+        let grad_norm: f32 = grad_data.iter().map(|&g| g * g).sum::<f32>().sqrt();
+        assert!(
+            grad_norm.is_finite(),
+            "gradient must be finite, got norm={}",
+            grad_norm
+        );
+        assert!(
+            grad_norm > 1e-10,
+            "gradient must be non-zero, got norm={}",
+            grad_norm
+        );
+    }
+
     #[test]
     fn test_mse_batch_processing() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 1, 4]);
