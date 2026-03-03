@@ -1,16 +1,22 @@
 //! ANE inference engine for autoregressive generation.
 //!
-//! Provides forward-only ANE kernels with CPU-side embedding, RMSNorm,
-//! sampling, and autoregressive generation. Uses lean forward kernels
-//! (no concat taps) for ~6x smaller IOSurface transfers vs training.
+//! Provides a hybrid ANE prefill + CPU decode architecture for efficient
+//! autoregressive text generation:
 //!
-//! # Known Limitations (v0.2, deferred to v0.3)
+//! - **Prefill (ANE)**: Processes the full prompt in one shot, extracting
+//!   K/V projections for the KV cache via 3-way concat output.
+//! - **Decode (CPU)**: Generates one token per step using cached KV pairs
+//!   with `cblas_sgemv` for matrix-vector multiplies.
 //!
-//! - No KV cache — full-sequence recomputation per token, O(n² × L)
-//! - Fixed sequence length — compiled for `max_seq_len`, shorter inputs zero-padded
-//! - Flat weight format only — requires `model.bin`
-//! - No GQA/MQA — assumes `n_kv_heads == n_heads`
-//! - No LoRA fusion — adapters must be merged before ANE inference
+//! # Features
+//!
+//! - KV cache eliminates O(n²×L) recomputation per token
+//! - GQA/MQA support via `n_kv_heads` config field
+//! - SafeTensors weight loading (single and multi-file)
+//! - LoRA adapter fusion (merge before ANE kernel compilation)
+//! - Legacy full-recomputation path preserved for backward compatibility
+
+use std::path::Path;
 
 use rand::RngExt;
 
@@ -30,6 +36,8 @@ pub struct AneInferenceConfig {
     pub hidden_dim: usize,
     /// Number of attention heads (e.g., 12).
     pub n_heads: usize,
+    /// Number of key/value heads for GQA/MQA (defaults to `n_heads`).
+    pub n_kv_heads: usize,
     /// Number of transformer layers (e.g., 12).
     pub n_layers: usize,
     /// Vocabulary size (e.g., 32000).
@@ -54,6 +62,7 @@ impl Default for AneInferenceConfig {
             dim: 768,
             hidden_dim: 2048,
             n_heads: 12,
+            n_kv_heads: 12,
             n_layers: 12,
             vocab_size: 32000,
             max_seq_len: 256,
@@ -81,20 +90,60 @@ struct InferenceLayerWeights {
 
 /// Per-layer compiled ANE kernels (inference-only, no backward).
 struct InferenceLayerKernels {
-    fwd_attn: AneModel,
+    /// Prefill attention kernel: outputs concat(oo, K_proj, V_proj).
+    fwd_attn_kv: AneModel,
+    /// FFN kernel (unchanged between prefill/decode on ANE).
     fwd_ffn: AneModel,
 }
 
 /// IOSurface pool reused across layers and generation steps.
 struct IoSurfacePool {
     input: IoSurface,
-    output: IoSurface,
+    /// Output surface sized for the larger KV-tapped attention output.
+    output_attn: IoSurface,
+    /// Output surface for FFN (same size as input).
+    output_ffn: IoSurface,
+}
+
+/// Per-layer KV cache (f32, channel-first `[kv_dim, max_seq_len]`).
+struct LayerKvCache {
+    /// K cache: `[kv_dim, max_seq_len]` f32.
+    k: Vec<f32>,
+    /// V cache: `[kv_dim, max_seq_len]` f32.
+    v: Vec<f32>,
+}
+
+/// KV cache pool across all transformer layers.
+struct KvCachePool {
+    layers: Vec<LayerKvCache>,
+    /// Current position (number of tokens cached).
+    pos: usize,
+    /// Maximum sequence length.
+    max_seq_len: usize,
+}
+
+impl KvCachePool {
+    fn new(n_layers: usize, kv_dim: usize, max_seq_len: usize) -> Self {
+        let mut layers = Vec::with_capacity(n_layers);
+        for _ in 0..n_layers {
+            layers.push(LayerKvCache {
+                k: vec![0.0; kv_dim * max_seq_len],
+                v: vec![0.0; kv_dim * max_seq_len],
+            });
+        }
+        Self {
+            layers,
+            pos: 0,
+            max_seq_len,
+        }
+    }
 }
 
 /// ANE inference engine for autoregressive text generation.
 ///
-/// Uses forward-only ANE kernels (no concat taps) with CPU-side
-/// embedding, residual adds, final RMSNorm, and sampling.
+/// Supports two generation modes:
+/// - **`generate()`**: Legacy full-recomputation path (backward compat)
+/// - **`generate_cached()`**: Hybrid ANE prefill + CPU decode with KV cache
 pub struct AneInferenceEngine {
     config: AneInferenceConfig,
     kernel_config: TransformerKernelConfig,
@@ -104,6 +153,8 @@ pub struct AneInferenceEngine {
     rms_final: Vec<f32>,
     budget: CompileBudget,
     io_pool: Option<IoSurfacePool>,
+    /// Set to true after `compile_kernels()` is called.
+    compiled: bool,
 }
 
 impl AneInferenceEngine {
@@ -115,20 +166,23 @@ impl AneInferenceEngine {
         let v = config.vocab_size;
         let hd = d / config.n_heads;
 
+        let n_kv_heads = config.n_kv_heads;
         let kernel_config = TransformerKernelConfig {
             dim: d,
             hidden_dim: h,
             n_heads: config.n_heads,
+            n_kv_heads,
             head_dim: hd,
             seq_len: config.max_seq_len,
         };
 
+        let kv_dim = n_kv_heads * hd;
         let mut layer_weights = Vec::with_capacity(nl);
         for _ in 0..nl {
             layer_weights.push(InferenceLayerWeights {
                 wq: vec![0.0; d * d],
-                wk: vec![0.0; d * d],
-                wv: vec![0.0; d * d],
+                wk: vec![0.0; kv_dim * d],
+                wv: vec![0.0; kv_dim * d],
                 wo: vec![0.0; d * d],
                 w1: vec![0.0; h * d],
                 w2: vec![0.0; d * h],
@@ -150,6 +204,7 @@ impl AneInferenceEngine {
             rms_final: vec![0.0; d],
             budget,
             io_pool: None,
+            compiled: false,
         }
     }
 
@@ -173,6 +228,7 @@ impl AneInferenceEngine {
         let h = self.config.hidden_dim;
         let nl = self.config.n_layers;
         let v = self.config.vocab_size;
+        let kv_dim = self.kernel_config.kv_dim();
 
         let mut offset = 0;
 
@@ -189,10 +245,10 @@ impl AneInferenceEngine {
 
             lw.wq.copy_from_slice(&weights[offset..offset + d * d]);
             offset += d * d;
-            lw.wk.copy_from_slice(&weights[offset..offset + d * d]);
-            offset += d * d;
-            lw.wv.copy_from_slice(&weights[offset..offset + d * d]);
-            offset += d * d;
+            lw.wk.copy_from_slice(&weights[offset..offset + kv_dim * d]);
+            offset += kv_dim * d;
+            lw.wv.copy_from_slice(&weights[offset..offset + kv_dim * d]);
+            offset += kv_dim * d;
             lw.wo.copy_from_slice(&weights[offset..offset + d * d]);
             offset += d * d;
 
@@ -213,7 +269,8 @@ impl AneInferenceEngine {
 
     /// Compile forward-only kernels for all layers.
     ///
-    /// Uses 2 compilations per layer (fwd_attn + fwd_ffn).
+    /// Uses 2 compilations per layer (fwd_attn_kv + fwd_ffn).
+    /// Must be called after loading weights and before any LoRA fusion.
     pub fn compile_kernels(&mut self) -> Result<()> {
         let rt = AneRuntime::global()?;
 
@@ -231,15 +288,16 @@ impl AneInferenceEngine {
         let cfg = &self.kernel_config;
         let d = cfg.dim;
         let s = cfg.seq_len;
+        let kv_d = cfg.kv_dim();
         let mut layer_kernels = Vec::with_capacity(self.config.n_layers);
 
         for l in 0..self.config.n_layers {
             let lw = &self.layer_weights[l];
 
-            // Forward attention (inference — no taps)
+            // Forward attention with KV cache output
             let fwd_attn_out =
-                kernel::gen_sdpa_fwd(cfg, &lw.rms_att, &lw.wq, &lw.wk, &lw.wv, &lw.wo);
-            let fwd_attn = rt.compile(
+                kernel::gen_sdpa_fwd_kv(cfg, &lw.rms_att, &lw.wq, &lw.wk, &lw.wv, &lw.wo);
+            let fwd_attn_kv = rt.compile(
                 fwd_attn_out.mil_text.as_bytes(),
                 Some(&fwd_attn_out.weights),
             )?;
@@ -251,18 +309,25 @@ impl AneInferenceEngine {
                 rt.compile(fwd_ffn_out.mil_text.as_bytes(), Some(&fwd_ffn_out.weights))?;
             self.budget.record_compile();
 
-            layer_kernels.push(InferenceLayerKernels { fwd_attn, fwd_ffn });
+            layer_kernels.push(InferenceLayerKernels {
+                fwd_attn_kv,
+                fwd_ffn,
+            });
         }
 
         self.layer_kernels = Some(layer_kernels);
 
-        // Allocate IOSurface pool (both input and output are [D, S] fp16)
-        let surface_bytes = d * s * 2;
+        // Allocate IOSurface pool
+        let input_bytes = d * s * 2;
+        let attn_output_bytes = (d + 2 * kv_d) * s * 2; // concat(oo, kf, vf)
+        let ffn_output_bytes = d * s * 2;
         self.io_pool = Some(IoSurfacePool {
-            input: IoSurface::new(surface_bytes)?,
-            output: IoSurface::new(surface_bytes)?,
+            input: IoSurface::new(input_bytes)?,
+            output_attn: IoSurface::new(attn_output_bytes)?,
+            output_ffn: IoSurface::new(ffn_output_bytes)?,
         });
 
+        self.compiled = true;
         Ok(())
     }
 
@@ -270,6 +335,9 @@ impl AneInferenceEngine {
     ///
     /// `token_ids` are padded/truncated to `max_seq_len`. Positions beyond
     /// input length are masked by the causal mask compiled into the kernels.
+    ///
+    /// This is the legacy full-recomputation path. Prefer `generate_cached()`
+    /// for production use.
     pub fn forward(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
         let d = self.config.dim;
         let s = self.config.max_seq_len;
@@ -307,11 +375,11 @@ impl AneInferenceEngine {
         let mut ffn_out = vec![0.0f32; d * s];
 
         for lk in kernels {
-            // Attention: write x → ANE fwd_attn → read o_out
+            // Attention: write x → ANE fwd_attn_kv → read oo (first D channels)
             io_pool.input.write_f32_as_fp16(&x, d, s);
-            lk.fwd_attn
-                .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output.as_ptr()])?;
-            io_pool.output.read_fp16_as_f32(&mut o_out, 0, d, s);
+            lk.fwd_attn_kv
+                .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_attn.as_ptr()])?;
+            io_pool.output_attn.read_fp16_as_f32(&mut o_out, 0, d, s);
 
             // Residual: x2 = x + o_out
             accelerate::vadd(&x, &o_out, &mut x2);
@@ -319,8 +387,8 @@ impl AneInferenceEngine {
             // FFN: write x2 → ANE fwd_ffn → read ffn_out
             io_pool.input.write_f32_as_fp16(&x2, d, s);
             lk.fwd_ffn
-                .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output.as_ptr()])?;
-            io_pool.output.read_fp16_as_f32(&mut ffn_out, 0, d, s);
+                .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_ffn.as_ptr()])?;
+            io_pool.output_ffn.read_fp16_as_f32(&mut ffn_out, 0, d, s);
 
             // Residual: x = x2 + ffn_out
             accelerate::vadd(&x2, &ffn_out, &mut x);
@@ -403,6 +471,680 @@ impl AneInferenceEngine {
 
         Ok(sequence)
     }
+
+    // ========================================================================
+    // KV-cached generation (ANE prefill + CPU decode)
+    // ========================================================================
+
+    /// Generate tokens with KV cache (ANE prefill + CPU decode).
+    ///
+    /// This is the recommended generation method. Uses ANE for the initial
+    /// prompt processing and CPU for single-token decode steps with cached
+    /// KV pairs.
+    pub fn generate_cached(&self, input_ids: &[u32]) -> Result<Vec<u32>> {
+        self.generate_cached_streaming(input_ids, |_| true)
+    }
+
+    /// Generate tokens with KV cache and streaming callback.
+    ///
+    /// `on_token` is called with each generated token. Return `false` to stop.
+    pub fn generate_cached_streaming<F>(
+        &self,
+        input_ids: &[u32],
+        mut on_token: F,
+    ) -> Result<Vec<u32>>
+    where
+        F: FnMut(u32) -> bool,
+    {
+        let s = self.config.max_seq_len;
+        let v = self.config.vocab_size;
+        let kv_dim = self.kernel_config.kv_dim();
+
+        if input_ids.is_empty() {
+            return Err(MetalError::InvalidConfig("Input must not be empty".into()));
+        }
+        if input_ids.len() > s {
+            return Err(MetalError::InvalidConfig(format!(
+                "Input length {} exceeds max_seq_len {}",
+                input_ids.len(),
+                s
+            )));
+        }
+
+        let mut kv_cache = KvCachePool::new(self.config.n_layers, kv_dim, s);
+
+        // Prefill: process full prompt via ANE, populate KV cache
+        let logits = self.prefill(input_ids, &mut kv_cache)?;
+        let pos = input_ids.len() - 1;
+
+        // Extract logits column at last input position
+        let mut logits_col = vec![0.0f32; v];
+        for tok in 0..v {
+            logits_col[tok] = logits[tok * s + pos];
+        }
+
+        let next = sample(&logits_col, self.config.temperature, self.config.top_k);
+
+        let mut sequence = input_ids.to_vec();
+
+        if let Some(eos) = self.config.eos_token_id {
+            if next == eos {
+                return Ok(sequence);
+            }
+        }
+        if !on_token(next) {
+            return Ok(sequence);
+        }
+        sequence.push(next);
+
+        // Decode loop: CPU-only with KV cache
+        for _ in 1..self.config.max_tokens {
+            if kv_cache.pos >= s {
+                break;
+            }
+
+            let logits_vec = self.decode_step(*sequence.last().unwrap(), &mut kv_cache)?;
+            let next = sample(&logits_vec, self.config.temperature, self.config.top_k);
+
+            if let Some(eos) = self.config.eos_token_id {
+                if next == eos {
+                    break;
+                }
+            }
+            if !on_token(next) {
+                break;
+            }
+            sequence.push(next);
+        }
+
+        Ok(sequence)
+    }
+
+    /// ANE prefill: process full prompt, populate KV cache, return logits.
+    fn prefill(&self, token_ids: &[u32], kv_cache: &mut KvCachePool) -> Result<Vec<f32>> {
+        let d = self.config.dim;
+        let s = self.config.max_seq_len;
+        let v = self.config.vocab_size;
+        let kv_dim = self.kernel_config.kv_dim();
+        let input_len = token_ids.len();
+
+        let kernels = self
+            .layer_kernels
+            .as_ref()
+            .ok_or_else(|| MetalError::InvalidConfig("Kernels not compiled".into()))?;
+        let io_pool = self
+            .io_pool
+            .as_ref()
+            .ok_or_else(|| MetalError::InvalidConfig("IO pool not allocated".into()))?;
+
+        // Embedding lookup → x [D, S] channel-first, zero-padded
+        let mut padded_tokens = vec![0u16; s];
+        for (i, &tid) in token_ids.iter().enumerate() {
+            padded_tokens[i] = tid as u16;
+        }
+
+        let mut x = vec![0.0f32; d * s];
+        accelerate::embed_lookup(&mut x, &self.embed_weights, &padded_tokens, d, s);
+
+        let mut o_out = vec![0.0f32; d * s];
+        let mut kf_buf = vec![0.0f32; kv_dim * s];
+        let mut vf_buf = vec![0.0f32; kv_dim * s];
+        let mut x2 = vec![0.0f32; d * s];
+        let mut ffn_out = vec![0.0f32; d * s];
+
+        for (layer_idx, lk) in kernels.iter().enumerate() {
+            // Attention: write x → ANE fwd_attn_kv → read concat(oo, kf, vf)
+            io_pool.input.write_f32_as_fp16(&x, d, s);
+            lk.fwd_attn_kv
+                .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_attn.as_ptr()])?;
+
+            // Read oo (channels 0..D)
+            io_pool.output_attn.read_fp16_as_f32(&mut o_out, 0, d, s);
+            // Read kf (channels D..D+kv_dim)
+            io_pool
+                .output_attn
+                .read_fp16_as_f32(&mut kf_buf, d, kv_dim, s);
+            // Read vf (channels D+kv_dim..D+2*kv_dim)
+            io_pool
+                .output_attn
+                .read_fp16_as_f32(&mut vf_buf, d + kv_dim, kv_dim, s);
+
+            // Cache K, V for positions 0..input_len
+            // KV data is in channel-first [kv_dim, S] layout
+            let lc = &mut kv_cache.layers[layer_idx];
+            for ch in 0..kv_dim {
+                for t in 0..input_len {
+                    lc.k[ch * s + t] = kf_buf[ch * s + t];
+                    lc.v[ch * s + t] = vf_buf[ch * s + t];
+                }
+            }
+
+            // Residual: x2 = x + o_out
+            accelerate::vadd(&x, &o_out, &mut x2);
+
+            // FFN
+            io_pool.input.write_f32_as_fp16(&x2, d, s);
+            lk.fwd_ffn
+                .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_ffn.as_ptr()])?;
+            io_pool.output_ffn.read_fp16_as_f32(&mut ffn_out, 0, d, s);
+
+            // Residual: x = x2 + ffn_out
+            accelerate::vadd(&x2, &ffn_out, &mut x);
+        }
+
+        kv_cache.pos = input_len;
+
+        // Final RMSNorm → logits
+        let mut x_final = vec![0.0f32; d * s];
+        accelerate::rmsnorm(&mut x_final, &x, &self.rms_final, d, s);
+
+        let mut logits = vec![0.0f32; v * s];
+        accelerate::gemm(
+            &self.embed_weights,
+            &x_final,
+            &mut logits,
+            v,
+            s,
+            d,
+            1.0,
+            0.0,
+            false,
+            false,
+        );
+
+        Ok(logits)
+    }
+
+    /// CPU-only decode step: process single token with cached KV pairs.
+    ///
+    /// Returns logits vector `[V]` for the new token.
+    #[allow(clippy::needless_range_loop)]
+    fn decode_step(&self, token_id: u32, kv_cache: &mut KvCachePool) -> Result<Vec<f32>> {
+        let d = self.config.dim;
+        let v = self.config.vocab_size;
+        let h = self.config.n_heads;
+        let hd = self.kernel_config.head_dim;
+        let kv_dim = self.kernel_config.kv_dim();
+        let n_groups = self.kernel_config.n_groups();
+        let s = kv_cache.max_seq_len;
+        let pos = kv_cache.pos;
+        let seq_through = pos + 1; // positions 0..=pos
+
+        // Embed single token → x [D]
+        let mut x = vec![0.0f32; d];
+        for dim_i in 0..d {
+            x[dim_i] = self.embed_weights[token_id as usize * d + dim_i];
+        }
+
+        let mut xnorm = vec![0.0f32; d];
+        let mut q = vec![0.0f32; d];
+        let mut k_new = vec![0.0f32; kv_dim];
+        let mut v_new = vec![0.0f32; kv_dim];
+        let mut attn_out = vec![0.0f32; d];
+        let mut wo_out = vec![0.0f32; d];
+        let mut x2 = vec![0.0f32; d];
+        let mut h1 = vec![0.0f32; self.config.hidden_dim];
+        let mut h3 = vec![0.0f32; self.config.hidden_dim];
+        let mut ffn_out = vec![0.0f32; d];
+
+        for (layer_idx, lw) in self.layer_weights.iter().enumerate() {
+            // RMSNorm (seq=1, channel-first layout collapses to simple vector)
+            rmsnorm_vec(&mut xnorm, &x, &lw.rms_att, d);
+
+            // Q, K, V projections via gemv: out = W @ xnorm
+            gemv(&lw.wq, &xnorm, &mut q, d, d);
+            gemv(&lw.wk, &xnorm, &mut k_new, kv_dim, d);
+            gemv(&lw.wv, &xnorm, &mut v_new, kv_dim, d);
+
+            // Store K_new, V_new at cache position
+            let lc = &mut kv_cache.layers[layer_idx];
+            for ch in 0..kv_dim {
+                lc.k[ch * s + pos] = k_new[ch];
+                lc.v[ch * s + pos] = v_new[ch];
+            }
+
+            // Multi-head attention with GQA
+            // Q is [D] = [n_heads * head_dim], K/V cache is [kv_dim, max_seq_len]
+            attn_out.fill(0.0);
+            let scale = 1.0 / (hd as f32).sqrt();
+
+            for head in 0..h {
+                let kv_head = head / n_groups;
+                let q_off = head * hd;
+                let kv_off = kv_head * hd;
+
+                // scores[t] = sum_i(Q[q_off+i] * K_cache[kv_off+i, t]) for t in 0..seq_through
+                let mut scores = vec![0.0f32; seq_through];
+                for t in 0..seq_through {
+                    let mut dot = 0.0f32;
+                    for i in 0..hd {
+                        dot += q[q_off + i] * lc.k[(kv_off + i) * s + t];
+                    }
+                    scores[t] = dot * scale;
+                }
+
+                // Softmax over scores
+                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for sc in &mut scores {
+                    *sc = (*sc - max_s).exp();
+                    sum += *sc;
+                }
+                let inv_sum = 1.0 / sum;
+                for sc in &mut scores {
+                    *sc *= inv_sum;
+                }
+
+                // attn_out[q_off+i] = sum_t(scores[t] * V_cache[kv_off+i, t])
+                for i in 0..hd {
+                    let mut val = 0.0f32;
+                    for t in 0..seq_through {
+                        val += scores[t] * lc.v[(kv_off + i) * s + t];
+                    }
+                    attn_out[q_off + i] = val;
+                }
+            }
+
+            // Wo projection: wo_out = Wo @ attn_out
+            gemv(&lw.wo, &attn_out, &mut wo_out, d, d);
+
+            // Residual: x2 = x + wo_out
+            for i in 0..d {
+                x2[i] = x[i] + wo_out[i];
+            }
+
+            // FFN: RMSNorm → SwiGLU
+            rmsnorm_vec(&mut xnorm, &x2, &lw.rms_ffn, d);
+
+            // h1 = W1 @ xnorm, h3 = W3 @ xnorm
+            gemv(&lw.w1, &xnorm, &mut h1, self.config.hidden_dim, d);
+            gemv(&lw.w3, &xnorm, &mut h3, self.config.hidden_dim, d);
+
+            // SiLU gate: gate = silu(h1) * h3
+            accelerate::silu_inplace(&mut h1);
+            for i in 0..self.config.hidden_dim {
+                h1[i] *= h3[i];
+            }
+
+            // Down projection: ffn_out = W2 @ h1
+            gemv(&lw.w2, &h1, &mut ffn_out, d, self.config.hidden_dim);
+
+            // Residual: x = x2 + ffn_out
+            for i in 0..d {
+                x[i] = x2[i] + ffn_out[i];
+            }
+        }
+
+        kv_cache.pos = pos + 1;
+
+        // Final RMSNorm
+        let mut x_final = vec![0.0f32; d];
+        rmsnorm_vec(&mut x_final, &x, &self.rms_final, d);
+
+        // Logits: embed^T @ x_final → [V]
+        let mut logits = vec![0.0f32; v];
+        accelerate::gemm(
+            &self.embed_weights,
+            &x_final,
+            &mut logits,
+            v,
+            1,
+            d,
+            1.0,
+            0.0,
+            false,
+            false,
+        );
+
+        Ok(logits)
+    }
+
+    // ========================================================================
+    // SafeTensors loading
+    // ========================================================================
+
+    /// Load weights from a SafeTensors file (HuggingFace format).
+    ///
+    /// Supports single-file (`model.safetensors`) and multi-file formats
+    /// (via `model.safetensors.index.json`).
+    ///
+    /// Must be called before `compile_kernels()`.
+    pub fn load_weights_safetensors(&mut self, path: &Path) -> Result<()> {
+        use memmap2::Mmap;
+        use safetensors::SafeTensors;
+
+        let d = self.config.dim;
+        let kv_dim = self.kernel_config.kv_dim();
+
+        // Determine files to load
+        let files = if path.is_file() {
+            vec![path.to_path_buf()]
+        } else {
+            // Look for index.json for multi-file format
+            let index_path = path.join("model.safetensors.index.json");
+            if index_path.exists() {
+                let index_text = std::fs::read_to_string(&index_path).map_err(|e| {
+                    MetalError::InvalidConfig(format!("Failed to read index.json: {e}"))
+                })?;
+                let index: serde_json::Value = serde_json::from_str(&index_text).map_err(|e| {
+                    MetalError::InvalidConfig(format!("Failed to parse index.json: {e}"))
+                })?;
+                let weight_map = index["weight_map"]
+                    .as_object()
+                    .ok_or_else(|| MetalError::InvalidConfig("Missing weight_map".into()))?;
+
+                let mut unique_files: Vec<String> = weight_map
+                    .values()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                unique_files.sort();
+                unique_files.dedup();
+                unique_files.iter().map(|f| path.join(f)).collect()
+            } else {
+                let single = path.join("model.safetensors");
+                if single.exists() {
+                    vec![single]
+                } else {
+                    return Err(MetalError::InvalidConfig(
+                        "No safetensors files found".into(),
+                    ));
+                }
+            }
+        };
+
+        for file_path in &files {
+            let file = std::fs::File::open(file_path).map_err(|e| {
+                MetalError::InvalidConfig(format!("Failed to open {:?}: {e}", file_path))
+            })?;
+            let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+                MetalError::InvalidConfig(format!("Failed to mmap {:?}: {e}", file_path))
+            })?;
+            let tensors = SafeTensors::deserialize(&mmap).map_err(|e| {
+                MetalError::InvalidConfig(format!("Failed to parse safetensors: {e}"))
+            })?;
+
+            for (name, tensor) in tensors.tensors() {
+                let data_f32 = safetensors_to_f32(&tensor);
+
+                if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
+                    if name == "model.embed_tokens.weight" {
+                        let expected = self.config.vocab_size * d;
+                        if data_f32.len() >= expected {
+                            self.embed_weights[..expected].copy_from_slice(&data_f32[..expected]);
+                        }
+                    }
+                    continue;
+                }
+
+                if name == "model.norm.weight" {
+                    if data_f32.len() == d {
+                        self.rms_final.copy_from_slice(&data_f32);
+                    }
+                    continue;
+                }
+
+                // Parse layer index from "model.layers.{i}.xxx"
+                if let Some(rest) = name.strip_prefix("model.layers.") {
+                    let parts: Vec<&str> = rest.splitn(2, '.').collect();
+                    if parts.len() < 2 {
+                        continue;
+                    }
+                    let layer_idx: usize = match parts[0].parse() {
+                        Ok(i) => i,
+                        Err(_) => continue,
+                    };
+                    if layer_idx >= self.config.n_layers {
+                        continue;
+                    }
+
+                    let lw = &mut self.layer_weights[layer_idx];
+                    let suffix = parts[1];
+
+                    match suffix {
+                        "self_attn.q_proj.weight" => copy_weight(&data_f32, &mut lw.wq, d * d),
+                        "self_attn.k_proj.weight" => {
+                            copy_weight(&data_f32, &mut lw.wk, kv_dim * d);
+                        }
+                        "self_attn.v_proj.weight" => {
+                            copy_weight(&data_f32, &mut lw.wv, kv_dim * d);
+                        }
+                        "self_attn.o_proj.weight" => copy_weight(&data_f32, &mut lw.wo, d * d),
+                        "mlp.gate_proj.weight" => {
+                            copy_weight(&data_f32, &mut lw.w1, self.config.hidden_dim * d);
+                        }
+                        "mlp.down_proj.weight" => {
+                            copy_weight(&data_f32, &mut lw.w2, d * self.config.hidden_dim);
+                        }
+                        "mlp.up_proj.weight" => {
+                            copy_weight(&data_f32, &mut lw.w3, self.config.hidden_dim * d);
+                        }
+                        "input_layernorm.weight" => copy_weight(&data_f32, &mut lw.rms_att, d),
+                        "post_attention_layernorm.weight" => {
+                            copy_weight(&data_f32, &mut lw.rms_ffn, d);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    // ========================================================================
+    // LoRA fusion
+    // ========================================================================
+
+    /// Load and merge a LoRA adapter into the base weights.
+    ///
+    /// Reads `adapter_config.json` and `adapter_model.safetensors` from `adapter_dir`.
+    /// Merges each target module's weights: `W += (alpha/rank) * B @ A`.
+    ///
+    /// **Must be called before `compile_kernels()`** — weights are baked into
+    /// ANE kernels at compile time.
+    pub fn load_lora_adapter(&mut self, adapter_dir: &Path) -> Result<()> {
+        use memmap2::Mmap;
+        use safetensors::SafeTensors;
+
+        if self.compiled {
+            return Err(MetalError::InvalidConfig(
+                "LoRA adapter must be loaded before compile_kernels()".into(),
+            ));
+        }
+
+        // Read adapter config
+        let config_path = adapter_dir.join("adapter_config.json");
+        let config_text = std::fs::read_to_string(&config_path).map_err(|e| {
+            MetalError::InvalidConfig(format!("Failed to read adapter_config.json: {e}"))
+        })?;
+        let config: serde_json::Value = serde_json::from_str(&config_text).map_err(|e| {
+            MetalError::InvalidConfig(format!("Failed to parse adapter_config.json: {e}"))
+        })?;
+
+        let rank = config["r"]
+            .as_u64()
+            .ok_or_else(|| MetalError::InvalidConfig("adapter_config.json missing 'r'".into()))?
+            as usize;
+        let alpha = config["lora_alpha"].as_f64().ok_or_else(|| {
+            MetalError::InvalidConfig("adapter_config.json missing 'lora_alpha'".into())
+        })? as f32;
+        let scale = alpha / rank as f32;
+
+        // Load adapter weights
+        let adapter_path = adapter_dir.join("adapter_model.safetensors");
+        let file = std::fs::File::open(&adapter_path).map_err(|e| {
+            MetalError::InvalidConfig(format!("Failed to open adapter safetensors: {e}"))
+        })?;
+        let mmap = unsafe { Mmap::map(&file) }
+            .map_err(|e| MetalError::InvalidConfig(format!("Failed to mmap adapter: {e}")))?;
+        let tensors = SafeTensors::deserialize(&mmap).map_err(|e| {
+            MetalError::InvalidConfig(format!("Failed to parse adapter safetensors: {e}"))
+        })?;
+
+        // Collect LoRA A/B pairs per layer and module
+        // Tensor names: "base_model.model.model.layers.{i}.self_attn.{proj}.lora_A.weight"
+        // or simpler: "model.layers.{i}.self_attn.{proj}.lora_A.weight"
+        let tensor_map: std::collections::HashMap<String, Vec<f32>> = tensors
+            .tensors()
+            .into_iter()
+            .map(|(name, view)| (name, safetensors_to_f32(&view)))
+            .collect();
+
+        for layer_idx in 0..self.config.n_layers {
+            let lw = &mut self.layer_weights[layer_idx];
+
+            for (proj_name, weight_field, rows, cols) in lora_target_modules(
+                self.config.dim,
+                self.kernel_config.kv_dim(),
+                self.config.hidden_dim,
+            ) {
+                // Try both naming conventions
+                let a_key = find_lora_key(&tensor_map, layer_idx, proj_name, "lora_A");
+                let b_key = find_lora_key(&tensor_map, layer_idx, proj_name, "lora_B");
+
+                if let (Some(a_data), Some(b_data)) = (
+                    a_key.and_then(|k| tensor_map.get(&k)),
+                    b_key.and_then(|k| tensor_map.get(&k)),
+                ) {
+                    // A: [rank, cols], B: [rows, rank]
+                    // W += scale * B @ A
+                    let target = match weight_field {
+                        "wq" => &mut lw.wq,
+                        "wk" => &mut lw.wk,
+                        "wv" => &mut lw.wv,
+                        "wo" => &mut lw.wo,
+                        "w1" => &mut lw.w1,
+                        "w2" => &mut lw.w2,
+                        "w3" => &mut lw.w3,
+                        _ => continue,
+                    };
+
+                    // Compute scale * B @ A and add to target
+                    let mut ba = vec![0.0f32; rows * cols];
+                    accelerate::gemm(
+                        b_data, a_data, &mut ba, rows, cols, rank, scale, 0.0, false, false,
+                    );
+                    for i in 0..rows * cols {
+                        target[i] += ba[i];
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+}
+
+/// RMSNorm for a single vector (seq=1).
+#[allow(clippy::needless_range_loop)]
+fn rmsnorm_vec(out: &mut [f32], x: &[f32], w: &[f32], dim: usize) {
+    let mut ss = 0.0f32;
+    for i in 0..dim {
+        ss += x[i] * x[i];
+    }
+    ss = 1.0 / (ss / dim as f32 + 1e-5).sqrt();
+    for i in 0..dim {
+        out[i] = w[i] * x[i] * ss;
+    }
+}
+
+/// Matrix-vector multiply: out = W @ x, where W is [rows, cols] row-major.
+fn gemv(w: &[f32], x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
+    accelerate::gemm(w, x, out, rows, 1, cols, 1.0, 0.0, false, false);
+}
+
+/// Copy weight data, clamping to target size.
+fn copy_weight(src: &[f32], dst: &mut [f32], expected: usize) {
+    let len = src.len().min(dst.len()).min(expected);
+    dst[..len].copy_from_slice(&src[..len]);
+}
+
+/// Convert safetensors tensor data to f32.
+fn safetensors_to_f32(tensor: &safetensors::tensor::TensorView<'_>) -> Vec<f32> {
+    use safetensors::Dtype;
+    match tensor.dtype() {
+        Dtype::F32 => {
+            let bytes = tensor.data();
+            let n = bytes.len() / 4;
+            let mut out = vec![0.0f32; n];
+            // SAFETY: f32 is 4 bytes, no alignment requirement for byte copy
+            unsafe {
+                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, n * 4);
+            }
+            out
+        }
+        Dtype::F16 => {
+            let bytes = tensor.data();
+            let n = bytes.len() / 2;
+            let mut out = vec![0.0f32; n];
+            for i in 0..n {
+                let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                out[i] = half::f16::from_bits(bits).to_f32();
+            }
+            out
+        }
+        Dtype::BF16 => {
+            let bytes = tensor.data();
+            let n = bytes.len() / 2;
+            let mut out = vec![0.0f32; n];
+            for i in 0..n {
+                let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                out[i] = half::bf16::from_bits(bits).to_f32();
+            }
+            out
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Return the list of LoRA target modules with their weight field name and dimensions.
+fn lora_target_modules(
+    dim: usize,
+    kv_dim: usize,
+    hidden_dim: usize,
+) -> Vec<(&'static str, &'static str, usize, usize)> {
+    vec![
+        ("q_proj", "wq", dim, dim),
+        ("k_proj", "wk", kv_dim, dim),
+        ("v_proj", "wv", kv_dim, dim),
+        ("o_proj", "wo", dim, dim),
+        ("gate_proj", "w1", hidden_dim, dim),
+        ("down_proj", "w2", dim, hidden_dim),
+        ("up_proj", "w3", hidden_dim, dim),
+    ]
+}
+
+/// Find a LoRA tensor key trying both naming conventions.
+fn find_lora_key(
+    tensor_map: &std::collections::HashMap<String, Vec<f32>>,
+    layer_idx: usize,
+    proj_name: &str,
+    ab: &str,
+) -> Option<String> {
+    // Convention 1: "base_model.model.model.layers.{i}.self_attn.{proj}.lora_{AB}.weight"
+    let key1 =
+        format!("base_model.model.model.layers.{layer_idx}.self_attn.{proj_name}.{ab}.weight");
+    if tensor_map.contains_key(&key1) {
+        return Some(key1);
+    }
+
+    // Convention 2: "model.layers.{i}.self_attn.{proj}.lora_{AB}.weight"
+    let key2 = format!("model.layers.{layer_idx}.self_attn.{proj_name}.{ab}.weight");
+    if tensor_map.contains_key(&key2) {
+        return Some(key2);
+    }
+
+    // MLP modules
+    let key3 = format!("base_model.model.model.layers.{layer_idx}.mlp.{proj_name}.{ab}.weight");
+    if tensor_map.contains_key(&key3) {
+        return Some(key3);
+    }
+    let key4 = format!("model.layers.{layer_idx}.mlp.{proj_name}.{ab}.weight");
+    if tensor_map.contains_key(&key4) {
+        return Some(key4);
+    }
+
+    None
 }
 
 /// Sample a token from a logits vector.
@@ -490,6 +1232,7 @@ mod tests {
             dim: 64,
             hidden_dim: 128,
             n_heads: 4,
+            n_kv_heads: 4,
             n_layers: 2,
             vocab_size: 100,
             max_seq_len: 16,
@@ -530,9 +1273,10 @@ mod tests {
         let h = config.hidden_dim;
         let nl = config.n_layers;
         let v = config.vocab_size;
+        let kv_dim = config.n_kv_heads * (d / config.n_heads);
 
         let total = v * d // embed
-            + nl * (d + d * d * 4 + d + h * d + d * h + h * d) // per-layer
+            + nl * (d + d * d + kv_dim * d * 2 + d * d + d + h * d + d * h + h * d) // per-layer
             + d; // rms_final
 
         let weights = vec![1.0f32; total];
@@ -585,7 +1329,9 @@ mod tests {
         let h = config.hidden_dim;
         let nl = config.n_layers;
         let v = config.vocab_size;
-        let total = v * d + nl * (d + d * d * 4 + d + h * d + d * h + h * d) + d;
+        let kv_dim = config.n_kv_heads * (d / config.n_heads);
+        let total =
+            v * d + nl * (d + d * d + kv_dim * d * 2 + d * d + d + h * d + d * h + h * d) + d;
         let weights = vec![0.0f32; total];
         engine.load_weights_flat(&weights);
 
@@ -631,5 +1377,79 @@ mod tests {
             !saw_outside_topk,
             "top_k=2 should never sample tokens outside top 2"
         );
+    }
+
+    #[test]
+    fn test_rmsnorm_vec() {
+        let x = vec![1.0, 2.0, 3.0, 4.0];
+        let w = vec![1.0; 4];
+        let mut out = vec![0.0f32; 4];
+        rmsnorm_vec(&mut out, &x, &w, 4);
+
+        let rms = ((1.0 + 4.0 + 9.0 + 16.0) / 4.0 + 1e-5f32).sqrt();
+        assert!((out[0] - 1.0 / rms).abs() < 1e-4);
+        assert!((out[3] - 4.0 / rms).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_kv_cache_pool_creation() {
+        let pool = KvCachePool::new(2, 256, 128);
+        assert_eq!(pool.layers.len(), 2);
+        assert_eq!(pool.pos, 0);
+        assert_eq!(pool.max_seq_len, 128);
+        assert_eq!(pool.layers[0].k.len(), 256 * 128);
+    }
+
+    #[test]
+    fn test_lora_merge_before_compile() {
+        let config = small_config();
+        let mut engine = AneInferenceEngine::new(config);
+        assert!(!engine.compiled);
+
+        // After compile, LoRA should be rejected
+        // (We can't actually compile without ANE, but we can test the flag)
+        engine.compiled = true;
+        let result = engine.load_lora_adapter(Path::new("/nonexistent"));
+        assert!(result.is_err());
+        let err_msg = format!("{}", result.unwrap_err());
+        assert!(err_msg.contains("before compile_kernels"));
+    }
+
+    #[test]
+    fn test_safetensors_name_mapping() {
+        // Verify that our module name → weight field mapping is correct
+        let modules = lora_target_modules(768, 256, 2048);
+        assert_eq!(modules.len(), 7);
+        assert_eq!(modules[0], ("q_proj", "wq", 768, 768));
+        assert_eq!(modules[1], ("k_proj", "wk", 256, 768));
+        assert_eq!(modules[2], ("v_proj", "wv", 256, 768));
+        assert_eq!(modules[3], ("o_proj", "wo", 768, 768));
+        assert_eq!(modules[4], ("gate_proj", "w1", 2048, 768));
+        assert_eq!(modules[5], ("down_proj", "w2", 768, 2048));
+        assert_eq!(modules[6], ("up_proj", "w3", 2048, 768));
+    }
+
+    #[test]
+    fn test_lora_merge_identity() {
+        // Test that scale * B @ A adds correctly to weights
+        let dim = 4;
+        let rank = 2;
+        let scale = 1.0f32;
+
+        // Identity-like merge: B = I_rows, A = I_cols (cropped)
+        let a = vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]; // [rank=2, cols=4]
+        let b = vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]; // [rows=4, rank=2]
+
+        let mut target = vec![0.0f32; dim * dim];
+        let mut ba = vec![0.0f32; dim * dim];
+        accelerate::gemm(&b, &a, &mut ba, dim, dim, rank, scale, 0.0, false, false);
+        for i in 0..dim * dim {
+            target[i] += ba[i];
+        }
+
+        // B @ A should give a 4x4 matrix with 1s at (0,0) and (1,1)
+        assert!((target[0] - 1.0).abs() < 1e-6); // (0,0)
+        assert!((target[5] - 1.0).abs() < 1e-6); // (1,1)
+        assert!((target[1] - 0.0).abs() < 1e-6); // off-diagonal
     }
 }

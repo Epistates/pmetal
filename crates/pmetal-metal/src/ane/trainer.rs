@@ -213,6 +213,7 @@ impl AneTrainer {
             dim: d,
             hidden_dim: h,
             n_heads: config.n_heads,
+            n_kv_heads: config.n_heads, // training path assumes MHA
             head_dim: hd,
             seq_len: s,
         };

@@ -299,6 +299,17 @@ impl MilProgram {
         .unwrap();
     }
 
+    /// Emit tile operation (repeat tensor along dimensions).
+    pub fn emit_tile(&mut self, result_name: &str, shape: &[usize], reps_var: &str, input: &str) {
+        let shape_str = format_shape(shape);
+        write!(
+            self.text,
+            "        tensor<fp16, {}> {} = tile(reps={},x={})[name=string(\"{}\")];\n",
+            shape_str, result_name, reps_var, input, result_name
+        )
+        .unwrap();
+    }
+
     /// Emit a raw line of MIL text.
     pub fn emit_raw(&mut self, line: &str) {
         self.text.push_str(line);
@@ -379,6 +390,16 @@ mod tests {
         let text = prog.finalize("x");
         assert!(text.contains("BLOBFILE(path=string(\"@model_path/weights/wq.bin\")"));
         assert!(text.contains("[768, 768, 1, 1]"));
+    }
+
+    #[test]
+    fn test_mil_tile() {
+        let mut prog = MilProgram::new(768, 256);
+        prog.emit_tensor_const("reps", &[4], "int32", "[1,4,1,1]");
+        prog.emit_tile("tiled", &[1, 48, 256, 64], "reps", "x");
+        let text = prog.finalize("tiled");
+        assert!(text.contains("tile(reps=reps,x=x)"));
+        assert!(text.contains("[1, 48, 256, 64]"));
     }
 
     #[test]

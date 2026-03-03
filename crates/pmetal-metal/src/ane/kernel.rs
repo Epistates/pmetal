@@ -24,6 +24,8 @@ pub struct TransformerKernelConfig {
     pub hidden_dim: usize,
     /// Number of attention heads (e.g., 12).
     pub n_heads: usize,
+    /// Number of key/value heads for GQA/MQA (defaults to `n_heads`).
+    pub n_kv_heads: usize,
     /// Head dimension (dim / n_heads).
     pub head_dim: usize,
     /// Sequence length (e.g., 256).
@@ -31,26 +33,26 @@ pub struct TransformerKernelConfig {
 }
 
 impl TransformerKernelConfig {
+    /// KV dimension = n_kv_heads * head_dim.
+    pub fn kv_dim(&self) -> usize {
+        self.n_kv_heads * self.head_dim
+    }
+
+    /// Number of Q heads per KV head group (for GQA tiling).
+    pub fn n_groups(&self) -> usize {
+        self.n_heads / self.n_kv_heads
+    }
+
     /// Score channels = n_heads * seq_len (attention score tensor channels).
     pub fn score_ch(&self) -> usize {
         self.n_heads * self.seq_len
     }
 
-    /// Attention forward output channels: o_out + Q + K + V + attn_scores_flat + xnorm
+    /// Attention forward output channels: o_out + Q + K + V + attn_out + xnorm
+    ///
+    /// With GQA: oo(DIM) + qf(DIM) + kf(KV_DIM) + vf(KV_DIM) + af(DIM) + xn(DIM)
     pub fn sdpa_fwd_output_ch(&self) -> usize {
-        // concat(oo, qf, kf, vf, af, xn) where af is reshaped from [H,S,S] to [H*S, S]
-        // Actually from the reference: af is [DIM,SEQ] after reshape from attention scores
-        // Total = DIM + DIM + DIM + DIM + SCORE_CH + DIM = 5*DIM + SCORE_CH
-        // But the reference uses concat(oo,qf,kf,vf,af,xn) = 6*DIM
-        // Wait, looking at reference: af = [1, DIM, 1, SEQ] reshaped attention output
-        // and attn scores are [HEADS,SEQ,SEQ] reshaped to [SCORE_CH,SEQ]
-        // Reference line: concat channels = 6*DIM, SEQ  -- but that seems wrong
-        // Actually re-reading: it concats oo(DIM) + qf(DIM) + kf(DIM) + vf(DIM) + af(DIM) + xn(DIM) = 6*DIM
-        // Wait no - af is the attention scores after reshape, which is [SCORE_CH, SEQ]
-        // Let me recheck the reference gen_sdpa_fwd_taps output:
-        // concat(oo, qf, kf, vf, af, xn) where af is attention output [DIM,SEQ]
-        // So oo=DIM, qf=DIM, kf=DIM, vf=DIM, af=DIM, xn=DIM => 6*DIM
-        6 * self.dim
+        4 * self.dim + 2 * self.kv_dim()
     }
 
     /// FFN forward output channels: ffn_out + h1 + h3 + silu_out + x2norm
@@ -239,6 +241,25 @@ pub fn build_causal_mask(seq_len: usize) -> Vec<u8> {
 // Kernel generators
 // ============================================================================
 
+/// Emit inline RMSNorm into a MIL program.
+///
+/// Reads from `x`, writes normalized output to `xn`.
+fn emit_rmsnorm(p: &mut MilProgram, d: usize, s: usize, inv_d: f32) {
+    p.emit_mul("sq", &[1, d, 1, s], "x", "x");
+    p.emit_tensor_const("rax", &[1], "int32", "[1]");
+    p.emit_scalar_const("kd", "bool", "true");
+    p.emit_reduce_sum("ss", &[1, 1, 1, s], "sq", "rax", "kd");
+    p.emit_scalar_const("invd", "fp16", &format!("{inv_d}"));
+    p.emit_mul("ss2", &[1, 1, 1, s], "ss", "invd");
+    p.emit_scalar_const("eps", "fp16", "0.00001");
+    p.emit_add("ss3", &[1, 1, 1, s], "ss2", "eps");
+    p.emit_scalar_const("nhalf", "fp16", "-0.5");
+    p.emit_pow("rrms", &[1, 1, 1, s], "ss3", "nhalf");
+    p.emit_mul("xr", &[1, d, 1, s], "x", "rrms");
+    p.emit_weight_const("rw", &[1, d, 1, 1], "@model_path/weights/rms1.bin");
+    p.emit_mul("xn", &[1, d, 1, s], "xr", "rw");
+}
+
 /// Generate the SDPA forward kernel with feature taps.
 ///
 /// Input: `[1, DIM, 1, SEQ]`
@@ -257,50 +278,53 @@ pub fn gen_sdpa_fwd_taps(
     let s = cfg.seq_len;
     let h = cfg.n_heads;
     let hd = cfg.head_dim;
+    let kv_h = cfg.n_kv_heads;
+    let kv_d = cfg.kv_dim();
+    let n_groups = cfg.n_groups();
     let sc = 1.0 / (hd as f32).sqrt();
     let inv_d = 1.0 / d as f32;
 
     let mut p = MilProgram::new(d, s);
 
     // RMSNorm inline
-    p.emit_mul("sq", &[1, d, 1, s], "x", "x");
-    p.emit_tensor_const("rax", &[1], "int32", "[1]");
-    p.emit_scalar_const("kd", "bool", "true");
-    p.emit_reduce_sum("ss", &[1, 1, 1, s], "sq", "rax", "kd");
-    p.emit_scalar_const("invd", "fp16", &format!("{inv_d}"));
-    p.emit_mul("ss2", &[1, 1, 1, s], "ss", "invd");
-    p.emit_scalar_const("eps", "fp16", "0.00001");
-    p.emit_add("ss3", &[1, 1, 1, s], "ss2", "eps");
-    p.emit_scalar_const("nhalf", "fp16", "-0.5");
-    p.emit_pow("rrms", &[1, 1, 1, s], "ss3", "nhalf");
-    p.emit_mul("xr", &[1, d, 1, s], "x", "rrms");
-    p.emit_weight_const("rw", &[1, d, 1, 1], "@model_path/weights/rms1.bin");
-    p.emit_mul("xn", &[1, d, 1, s], "xr", "rw");
+    emit_rmsnorm(&mut p, d, s, inv_d);
 
     // QKV convolutions
     p.emit_conv_constants();
     p.emit_weight_const("Wq", &[d, d, 1, 1], "@model_path/weights/wq.bin");
-    p.emit_weight_const("Wk", &[d, d, 1, 1], "@model_path/weights/wk.bin");
-    p.emit_weight_const("Wv", &[d, d, 1, 1], "@model_path/weights/wv.bin");
+    p.emit_weight_const("Wk", &[kv_d, d, 1, 1], "@model_path/weights/wk.bin");
+    p.emit_weight_const("Wv", &[kv_d, d, 1, 1], "@model_path/weights/wv.bin");
     p.emit_weight_const("Wo", &[d, d, 1, 1], "@model_path/weights/wo.bin");
     p.emit_conv("qf", &[1, d, 1, s], "Wq", "xn");
-    p.emit_conv("kf", &[1, d, 1, s], "Wk", "xn");
-    p.emit_conv("vf", &[1, d, 1, s], "Wv", "xn");
+    p.emit_conv("kf", &[1, kv_d, 1, s], "Wk", "xn");
+    p.emit_conv("vf", &[1, kv_d, 1, s], "Wv", "xn");
 
     // Reshape and transpose for multi-head attention
     p.emit_tensor_const("qsh", &[4], "int32", &format!("[1,{h},{hd},{s}]"));
     p.emit_tensor_const("pm", &[4], "int32", "[0,1,3,2]");
     p.emit_reshape("q4", &[1, h, hd, s], "qsh", "qf");
     p.emit_transpose("q", &[1, h, s, hd], "pm", "q4");
-    p.emit_reshape("k4", &[1, h, hd, s], "qsh", "kf");
-    p.emit_transpose("k", &[1, h, s, hd], "pm", "k4");
-    p.emit_reshape("v4", &[1, h, hd, s], "qsh", "vf");
-    p.emit_transpose("v", &[1, h, s, hd], "pm", "v4");
+
+    // K, V: reshape to [1, kv_h, hd, S] then transpose, then tile if GQA
+    p.emit_tensor_const("kvsh", &[4], "int32", &format!("[1,{kv_h},{hd},{s}]"));
+    p.emit_reshape("k4", &[1, kv_h, hd, s], "kvsh", "kf");
+    p.emit_transpose("k0", &[1, kv_h, s, hd], "pm", "k4");
+    p.emit_reshape("v4", &[1, kv_h, hd, s], "kvsh", "vf");
+    p.emit_transpose("v0", &[1, kv_h, s, hd], "pm", "v4");
+
+    let (k_name, v_name) = if n_groups > 1 {
+        p.emit_tensor_const("greps", &[4], "int32", &format!("[1,{n_groups},1,1]"));
+        p.emit_tile("k", &[1, h, s, hd], "greps", "k0");
+        p.emit_tile("v", &[1, h, s, hd], "greps", "v0");
+        ("k", "v")
+    } else {
+        ("k0", "v0")
+    };
 
     // Attention: scores = Q @ K^T * scale + mask
     p.emit_scalar_const("tx", "bool", "false");
     p.emit_scalar_const("ty", "bool", "true");
-    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", "k");
+    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", k_name);
     p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
     p.emit_mul("sc2", &[1, h, s, s], "sc1", "scv");
     p.emit_weight_const("cm", &[1, 1, s, s], "@model_path/weights/mask.bin");
@@ -311,14 +335,15 @@ pub fn gen_sdpa_fwd_taps(
     p.emit_softmax("aw", &[1, h, s, s], "sax", "ms");
 
     // Attention output: scores @ V, reshape back
-    p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", "v");
+    p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", v_name);
     p.emit_transpose("at", &[1, h, hd, s], "pm", "a4");
     p.emit_tensor_const("os", &[4], "int32", &format!("[1,{d},1,{s}]"));
     p.emit_reshape("af", &[1, d, 1, s], "os", "at");
     p.emit_conv("oo", &[1, d, 1, s], "Wo", "af");
 
-    // Concat output taps
-    let out_ch = 6 * d;
+    // Concat output taps: oo + qf + kf + vf + af + xn
+    // Note: kf/vf are kv_dim, qf/oo/af/xn are dim
+    let out_ch = 4 * d + 2 * kv_d;
     p.emit_scalar_const("cax", "int32", "1");
     p.emit_scalar_const("cid", "bool", "false");
     p.emit_concat(
@@ -338,8 +363,14 @@ pub fn gen_sdpa_fwd_taps(
         WeightBlob::from_rms_weights(rms_att),
     );
     weights.add("@model_path/weights/wq.bin", WeightBlob::from_f32(wq, d, d));
-    weights.add("@model_path/weights/wk.bin", WeightBlob::from_f32(wk, d, d));
-    weights.add("@model_path/weights/wv.bin", WeightBlob::from_f32(wv, d, d));
+    weights.add(
+        "@model_path/weights/wk.bin",
+        WeightBlob::from_f32(wk, kv_d, d),
+    );
+    weights.add(
+        "@model_path/weights/wv.bin",
+        WeightBlob::from_f32(wv, kv_d, d),
+    );
     weights.add("@model_path/weights/wo.bin", WeightBlob::from_f32(wo, d, d));
     weights.add("@model_path/weights/mask.bin", build_causal_mask(s));
 
@@ -369,50 +400,54 @@ pub fn gen_sdpa_fwd(
     let s = cfg.seq_len;
     let h = cfg.n_heads;
     let hd = cfg.head_dim;
+    let kv_h = cfg.n_kv_heads;
+    let kv_d = cfg.kv_dim();
+    let n_groups = cfg.n_groups();
     let sc = 1.0 / (hd as f32).sqrt();
     let inv_d = 1.0 / d as f32;
 
     let mut p = MilProgram::new(d, s);
 
     // RMSNorm inline
-    p.emit_mul("sq", &[1, d, 1, s], "x", "x");
-    p.emit_tensor_const("rax", &[1], "int32", "[1]");
-    p.emit_scalar_const("kd", "bool", "true");
-    p.emit_reduce_sum("ss", &[1, 1, 1, s], "sq", "rax", "kd");
-    p.emit_scalar_const("invd", "fp16", &format!("{inv_d}"));
-    p.emit_mul("ss2", &[1, 1, 1, s], "ss", "invd");
-    p.emit_scalar_const("eps", "fp16", "0.00001");
-    p.emit_add("ss3", &[1, 1, 1, s], "ss2", "eps");
-    p.emit_scalar_const("nhalf", "fp16", "-0.5");
-    p.emit_pow("rrms", &[1, 1, 1, s], "ss3", "nhalf");
-    p.emit_mul("xr", &[1, d, 1, s], "x", "rrms");
-    p.emit_weight_const("rw", &[1, d, 1, 1], "@model_path/weights/rms1.bin");
-    p.emit_mul("xn", &[1, d, 1, s], "xr", "rw");
+    emit_rmsnorm(&mut p, d, s, inv_d);
 
     // QKV convolutions
     p.emit_conv_constants();
     p.emit_weight_const("Wq", &[d, d, 1, 1], "@model_path/weights/wq.bin");
-    p.emit_weight_const("Wk", &[d, d, 1, 1], "@model_path/weights/wk.bin");
-    p.emit_weight_const("Wv", &[d, d, 1, 1], "@model_path/weights/wv.bin");
+    p.emit_weight_const("Wk", &[kv_d, d, 1, 1], "@model_path/weights/wk.bin");
+    p.emit_weight_const("Wv", &[kv_d, d, 1, 1], "@model_path/weights/wv.bin");
     p.emit_weight_const("Wo", &[d, d, 1, 1], "@model_path/weights/wo.bin");
     p.emit_conv("qf", &[1, d, 1, s], "Wq", "xn");
-    p.emit_conv("kf", &[1, d, 1, s], "Wk", "xn");
-    p.emit_conv("vf", &[1, d, 1, s], "Wv", "xn");
+    p.emit_conv("kf", &[1, kv_d, 1, s], "Wk", "xn");
+    p.emit_conv("vf", &[1, kv_d, 1, s], "Wv", "xn");
 
     // Reshape and transpose for multi-head attention
     p.emit_tensor_const("qsh", &[4], "int32", &format!("[1,{h},{hd},{s}]"));
     p.emit_tensor_const("pm", &[4], "int32", "[0,1,3,2]");
     p.emit_reshape("q4", &[1, h, hd, s], "qsh", "qf");
     p.emit_transpose("q", &[1, h, s, hd], "pm", "q4");
-    p.emit_reshape("k4", &[1, h, hd, s], "qsh", "kf");
-    p.emit_transpose("k", &[1, h, s, hd], "pm", "k4");
-    p.emit_reshape("v4", &[1, h, hd, s], "qsh", "vf");
-    p.emit_transpose("v", &[1, h, s, hd], "pm", "v4");
+
+    // K, V: reshape to [1, kv_h, hd, S] then transpose, then tile if GQA
+    p.emit_tensor_const("kvsh", &[4], "int32", &format!("[1,{kv_h},{hd},{s}]"));
+    p.emit_reshape("k4", &[1, kv_h, hd, s], "kvsh", "kf");
+    p.emit_transpose("k0", &[1, kv_h, s, hd], "pm", "k4");
+    p.emit_reshape("v4", &[1, kv_h, hd, s], "kvsh", "vf");
+    p.emit_transpose("v0", &[1, kv_h, s, hd], "pm", "v4");
+
+    // GQA: tile K, V along head axis to match n_heads
+    let (k_name, v_name) = if n_groups > 1 {
+        p.emit_tensor_const("greps", &[4], "int32", &format!("[1,{n_groups},1,1]"));
+        p.emit_tile("k", &[1, h, s, hd], "greps", "k0");
+        p.emit_tile("v", &[1, h, s, hd], "greps", "v0");
+        ("k", "v")
+    } else {
+        ("k0", "v0")
+    };
 
     // Attention: scores = Q @ K^T * scale + mask
     p.emit_scalar_const("tx", "bool", "false");
     p.emit_scalar_const("ty", "bool", "true");
-    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", "k");
+    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", k_name);
     p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
     p.emit_mul("sc2", &[1, h, s, s], "sc1", "scv");
     p.emit_weight_const("cm", &[1, 1, s, s], "@model_path/weights/mask.bin");
@@ -423,7 +458,7 @@ pub fn gen_sdpa_fwd(
     p.emit_softmax("aw", &[1, h, s, s], "sax", "ms");
 
     // Attention output: scores @ V, reshape back
-    p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", "v");
+    p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", v_name);
     p.emit_transpose("at", &[1, h, hd, s], "pm", "a4");
     p.emit_tensor_const("os", &[4], "int32", &format!("[1,{d},1,{s}]"));
     p.emit_reshape("af", &[1, d, 1, s], "os", "at");
@@ -439,8 +474,14 @@ pub fn gen_sdpa_fwd(
         WeightBlob::from_rms_weights(rms_att),
     );
     weights.add("@model_path/weights/wq.bin", WeightBlob::from_f32(wq, d, d));
-    weights.add("@model_path/weights/wk.bin", WeightBlob::from_f32(wk, d, d));
-    weights.add("@model_path/weights/wv.bin", WeightBlob::from_f32(wv, d, d));
+    weights.add(
+        "@model_path/weights/wk.bin",
+        WeightBlob::from_f32(wk, kv_d, d),
+    );
+    weights.add(
+        "@model_path/weights/wv.bin",
+        WeightBlob::from_f32(wv, kv_d, d),
+    );
     weights.add("@model_path/weights/wo.bin", WeightBlob::from_f32(wo, d, d));
     weights.add("@model_path/weights/mask.bin", build_causal_mask(s));
 
@@ -449,6 +490,122 @@ pub fn gen_sdpa_fwd(
         weights,
         input_bytes: d * s * 2,
         output_bytes: d * s * 2,
+    }
+}
+
+/// Generate the SDPA forward kernel with KV cache output (prefill).
+///
+/// Input: `[1, DIM, 1, SEQ]`
+/// Output: `[1, DIM + 2*KV_DIM, 1, SEQ]` = concat(o_out, K_proj, V_proj)
+///
+/// Weights: rms1, Wq, Wk, Wv, Wo, causal mask
+pub fn gen_sdpa_fwd_kv(
+    cfg: &TransformerKernelConfig,
+    rms_att: &[f32],
+    wq: &[f32],
+    wk: &[f32],
+    wv: &[f32],
+    wo: &[f32],
+) -> KernelOutput {
+    let d = cfg.dim;
+    let s = cfg.seq_len;
+    let h = cfg.n_heads;
+    let hd = cfg.head_dim;
+    let kv_h = cfg.n_kv_heads;
+    let kv_d = cfg.kv_dim();
+    let n_groups = cfg.n_groups();
+    let sc = 1.0 / (hd as f32).sqrt();
+    let inv_d = 1.0 / d as f32;
+
+    let mut p = MilProgram::new(d, s);
+
+    // RMSNorm inline
+    emit_rmsnorm(&mut p, d, s, inv_d);
+
+    // QKV convolutions
+    p.emit_conv_constants();
+    p.emit_weight_const("Wq", &[d, d, 1, 1], "@model_path/weights/wq.bin");
+    p.emit_weight_const("Wk", &[kv_d, d, 1, 1], "@model_path/weights/wk.bin");
+    p.emit_weight_const("Wv", &[kv_d, d, 1, 1], "@model_path/weights/wv.bin");
+    p.emit_weight_const("Wo", &[d, d, 1, 1], "@model_path/weights/wo.bin");
+    p.emit_conv("qf", &[1, d, 1, s], "Wq", "xn");
+    p.emit_conv("kf", &[1, kv_d, 1, s], "Wk", "xn");
+    p.emit_conv("vf", &[1, kv_d, 1, s], "Wv", "xn");
+
+    // Reshape and transpose for multi-head attention
+    p.emit_tensor_const("qsh", &[4], "int32", &format!("[1,{h},{hd},{s}]"));
+    p.emit_tensor_const("pm", &[4], "int32", "[0,1,3,2]");
+    p.emit_reshape("q4", &[1, h, hd, s], "qsh", "qf");
+    p.emit_transpose("q", &[1, h, s, hd], "pm", "q4");
+
+    // K, V: reshape to [1, kv_h, hd, S] then transpose, then tile if GQA
+    p.emit_tensor_const("kvsh", &[4], "int32", &format!("[1,{kv_h},{hd},{s}]"));
+    p.emit_reshape("k4", &[1, kv_h, hd, s], "kvsh", "kf");
+    p.emit_transpose("k0", &[1, kv_h, s, hd], "pm", "k4");
+    p.emit_reshape("v4", &[1, kv_h, hd, s], "kvsh", "vf");
+    p.emit_transpose("v0", &[1, kv_h, s, hd], "pm", "v4");
+
+    // GQA: tile K, V along head axis to match n_heads
+    let (k_name, v_name) = if n_groups > 1 {
+        p.emit_tensor_const("greps", &[4], "int32", &format!("[1,{n_groups},1,1]"));
+        p.emit_tile("k", &[1, h, s, hd], "greps", "k0");
+        p.emit_tile("v", &[1, h, s, hd], "greps", "v0");
+        ("k", "v")
+    } else {
+        ("k0", "v0")
+    };
+
+    // Attention: scores = Q @ K^T * scale + mask
+    p.emit_scalar_const("tx", "bool", "false");
+    p.emit_scalar_const("ty", "bool", "true");
+    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", k_name);
+    p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
+    p.emit_mul("sc2", &[1, h, s, s], "sc1", "scv");
+    p.emit_weight_const("cm", &[1, 1, s, s], "@model_path/weights/mask.bin");
+    p.emit_add("ms", &[1, h, s, s], "sc2", "cm");
+
+    // Softmax
+    p.emit_scalar_const("sax", "int32", "-1");
+    p.emit_softmax("aw", &[1, h, s, s], "sax", "ms");
+
+    // Attention output: scores @ V, reshape back
+    p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", v_name);
+    p.emit_transpose("at", &[1, h, hd, s], "pm", "a4");
+    p.emit_tensor_const("os", &[4], "int32", &format!("[1,{d},1,{s}]"));
+    p.emit_reshape("af", &[1, d, 1, s], "os", "at");
+    p.emit_conv("oo", &[1, d, 1, s], "Wo", "af");
+
+    // 3-way concat: (oo, kf, vf) for KV cache extraction
+    let out_ch = d + 2 * kv_d;
+    p.emit_scalar_const("cax", "int32", "1");
+    p.emit_scalar_const("cid", "bool", "false");
+    p.emit_concat("out", &[1, out_ch, 1, s], "cax", "cid", &["oo", "kf", "vf"]);
+
+    let mil_text = p.finalize("out");
+
+    // Build weight dictionary
+    let mut weights = WeightDict::new();
+    weights.add(
+        "@model_path/weights/rms1.bin",
+        WeightBlob::from_rms_weights(rms_att),
+    );
+    weights.add("@model_path/weights/wq.bin", WeightBlob::from_f32(wq, d, d));
+    weights.add(
+        "@model_path/weights/wk.bin",
+        WeightBlob::from_f32(wk, kv_d, d),
+    );
+    weights.add(
+        "@model_path/weights/wv.bin",
+        WeightBlob::from_f32(wv, kv_d, d),
+    );
+    weights.add("@model_path/weights/wo.bin", WeightBlob::from_f32(wo, d, d));
+    weights.add("@model_path/weights/mask.bin", build_causal_mask(s));
+
+    KernelOutput {
+        mil_text,
+        weights,
+        input_bytes: d * s * 2,
+        output_bytes: out_ch * s * 2,
     }
 }
 
@@ -936,6 +1093,7 @@ mod tests {
             dim: 768,
             hidden_dim: 2048,
             n_heads: 12,
+            n_kv_heads: 12,
             head_dim: 64,
             seq_len: 256,
         }
@@ -975,10 +1133,12 @@ mod tests {
     fn test_sdpa_fwd_infer_generates_valid_mil() {
         let cfg = test_config();
         let d = cfg.dim;
+        let kv_d = cfg.kv_dim();
         let zeros_d = vec![0.0f32; d];
         let zeros_dd = vec![0.0f32; d * d];
+        let zeros_kvd = vec![0.0f32; kv_d * d];
 
-        let output = gen_sdpa_fwd(&cfg, &zeros_d, &zeros_dd, &zeros_dd, &zeros_dd, &zeros_dd);
+        let output = gen_sdpa_fwd(&cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd);
 
         assert!(output.mil_text.contains("program(1.3)"));
         assert!(output.mil_text.contains("func main<ios18>"));
@@ -1019,10 +1179,13 @@ mod tests {
     fn test_sdpa_fwd_taps_generates_valid_mil() {
         let cfg = test_config();
         let d = cfg.dim;
+        let kv_d = cfg.kv_dim();
         let zeros_d = vec![0.0f32; d];
         let zeros_dd = vec![0.0f32; d * d];
+        let zeros_kvd = vec![0.0f32; kv_d * d];
 
-        let output = gen_sdpa_fwd_taps(&cfg, &zeros_d, &zeros_dd, &zeros_dd, &zeros_dd, &zeros_dd);
+        let output =
+            gen_sdpa_fwd_taps(&cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd);
 
         assert!(output.mil_text.contains("program(1.3)"));
         assert!(output.mil_text.contains("func main<ios18>"));
@@ -1030,7 +1193,8 @@ mod tests {
         assert!(output.mil_text.contains("softmax"));
         assert!(output.mil_text.contains("} -> (out);"));
         assert_eq!(output.input_bytes, d * 256 * 2);
-        assert_eq!(output.output_bytes, 6 * d * 256 * 2);
+        let expected_out_ch = 4 * d + 2 * kv_d;
+        assert_eq!(output.output_bytes, expected_out_ch * 256 * 2);
     }
 
     #[test]
@@ -1084,6 +1248,77 @@ mod tests {
 
         assert!(output.mil_text.contains("slice_by_size"));
         assert_eq!(output.weights.entries.len(), 3);
+        assert_eq!(output.output_bytes, d * 256 * 2);
+    }
+
+    #[test]
+    fn test_sdpa_fwd_kv_generates_valid_mil() {
+        let cfg = test_config();
+        let d = cfg.dim;
+        let kv_d = cfg.kv_dim();
+        let zeros_d = vec![0.0f32; d];
+        let zeros_dd = vec![0.0f32; d * d];
+        let zeros_kvd = vec![0.0f32; kv_d * d];
+
+        let output = gen_sdpa_fwd_kv(&cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd);
+
+        assert!(output.mil_text.contains("program(1.3)"));
+        assert!(output.mil_text.contains("concat"));
+        assert!(output.mil_text.contains("softmax"));
+        assert!(output.mil_text.contains("} -> (out);"));
+        assert_eq!(output.input_bytes, d * 256 * 2);
+        let expected_out_ch = d + 2 * kv_d;
+        assert_eq!(output.output_bytes, expected_out_ch * 256 * 2);
+        assert_eq!(output.weights.entries.len(), 6);
+    }
+
+    #[test]
+    fn test_sdpa_fwd_kv_gqa() {
+        // GQA config: 12 Q heads, 4 KV heads
+        let cfg = TransformerKernelConfig {
+            dim: 768,
+            hidden_dim: 2048,
+            n_heads: 12,
+            n_kv_heads: 4,
+            head_dim: 64,
+            seq_len: 256,
+        };
+        let d = cfg.dim;
+        let kv_d = cfg.kv_dim(); // 4 * 64 = 256
+        assert_eq!(kv_d, 256);
+
+        let zeros_d = vec![0.0f32; d];
+        let zeros_dd = vec![0.0f32; d * d];
+        let zeros_kvd = vec![0.0f32; kv_d * d];
+
+        let output = gen_sdpa_fwd_kv(&cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd);
+
+        assert!(output.mil_text.contains("tile"));
+        let expected_out_ch = d + 2 * kv_d; // 768 + 512 = 1280
+        assert_eq!(output.output_bytes, expected_out_ch * 256 * 2);
+    }
+
+    #[test]
+    fn test_sdpa_fwd_gqa() {
+        // GQA config: 12 Q heads, 4 KV heads
+        let cfg = TransformerKernelConfig {
+            dim: 768,
+            hidden_dim: 2048,
+            n_heads: 12,
+            n_kv_heads: 4,
+            head_dim: 64,
+            seq_len: 256,
+        };
+        let d = cfg.dim;
+        let kv_d = cfg.kv_dim();
+        let zeros_d = vec![0.0f32; d];
+        let zeros_dd = vec![0.0f32; d * d];
+        let zeros_kvd = vec![0.0f32; kv_d * d];
+
+        let output = gen_sdpa_fwd(&cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd);
+
+        assert!(output.mil_text.contains("tile"));
+        assert!(!output.mil_text.contains("concat"));
         assert_eq!(output.output_bytes, d * 256 * 2);
     }
 

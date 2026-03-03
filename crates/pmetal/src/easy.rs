@@ -558,7 +558,7 @@ impl InferBuilder {
         })
     }
 
-    /// Inference via ANE with flat weight format.
+    /// Inference via ANE with SafeTensors/flat weight loading, LoRA fusion, KV cache.
     #[cfg(feature = "ane")]
     fn generate_ane(
         &self,
@@ -568,7 +568,7 @@ impl InferBuilder {
     ) -> Result<InferResult> {
         use pmetal_metal::ane::inference::{AneInferenceConfig, AneInferenceEngine};
 
-        // Read model config — parse with pmetal_core's serde_json re-export
+        // Read model config
         let config_path = model_path.join("config.json");
         let config_text = std::fs::read_to_string(&config_path).map_err(|e| {
             PMetalError::ModelLoad(format!(
@@ -576,15 +576,12 @@ impl InferBuilder {
             ))
         })?;
 
-        // Extract model dimensions from JSON config
         fn extract_usize(json: &str, key: &str) -> std::result::Result<usize, PMetalError> {
-            // Find "key": <number> pattern
             let needle = format!("\"{key}\"");
             let pos = json
                 .find(&needle)
                 .ok_or_else(|| PMetalError::ModelLoad(format!("config.json missing '{key}'")))?;
             let after_key = &json[pos + needle.len()..];
-            // Skip whitespace and colon
             let num_start = after_key
                 .find(|c: char| c.is_ascii_digit())
                 .ok_or_else(|| {
@@ -599,16 +596,24 @@ impl InferBuilder {
             })
         }
 
+        fn extract_usize_optional(json: &str, key: &str) -> Option<usize> {
+            extract_usize(json, key).ok()
+        }
+
         let dim = extract_usize(&config_text, "hidden_size")?;
         let hidden_dim = extract_usize(&config_text, "intermediate_size")?;
         let n_heads = extract_usize(&config_text, "num_attention_heads")?;
         let n_layers = extract_usize(&config_text, "num_hidden_layers")?;
         let vocab_size = extract_usize(&config_text, "vocab_size")?;
+        // GQA: read n_kv_heads, default to n_heads
+        let n_kv_heads =
+            extract_usize_optional(&config_text, "num_key_value_heads").unwrap_or(n_heads);
 
         let ane_config = AneInferenceConfig {
             dim,
             hidden_dim,
             n_heads,
+            n_kv_heads,
             n_layers,
             vocab_size,
             max_seq_len: 256,
@@ -621,35 +626,61 @@ impl InferBuilder {
 
         let mut engine = AneInferenceEngine::new(ane_config);
 
-        // Load flat weights from model.bin
-        let weights_path = model_path.join("model.bin");
-        if !weights_path.exists() {
+        // Try SafeTensors first, fall back to model.bin
+        let safetensors_single = model_path.join("model.safetensors");
+        let safetensors_multi = model_path.join("model-00001-of-00002.safetensors");
+        let safetensors_index = model_path.join("model.safetensors.index.json");
+        let weights_bin = model_path.join("model.bin");
+
+        if safetensors_single.exists() {
+            engine
+                .load_weights_safetensors(&safetensors_single)
+                .map_err(|e| PMetalError::ModelLoad(format!("SafeTensors load failed: {e}")))?;
+        } else if safetensors_index.exists() || safetensors_multi.exists() {
+            engine
+                .load_weights_safetensors(model_path)
+                .map_err(|e| PMetalError::ModelLoad(format!("SafeTensors load failed: {e}")))?;
+        } else if weights_bin.exists() {
+            let weight_data = std::fs::read(&weights_bin)
+                .map_err(|e| PMetalError::ModelLoad(format!("Failed to read model.bin: {e}")))?;
+            if weight_data.len() % 4 != 0 {
+                return Err(PMetalError::ModelLoad(
+                    "model.bin size must be a multiple of 4 bytes".into(),
+                ));
+            }
+            #[allow(unsafe_code)]
+            let (prefix, weights, suffix) = unsafe { weight_data.align_to::<f32>() };
+            if !prefix.is_empty() || !suffix.is_empty() {
+                return Err(PMetalError::ModelLoad(
+                    "model.bin data is not properly aligned for f32".into(),
+                ));
+            }
+            engine.load_weights_flat(weights);
+        } else {
             return Err(PMetalError::ModelLoad(format!(
-                "ANE inference requires flat weight format at {:?}. \
-                 Convert from safetensors with `pmetal export --format flat`.",
-                weights_path
+                "No weight files found in {:?}. Expected model.safetensors or model.bin.",
+                model_path
             )));
         }
-        let weight_data = std::fs::read(&weights_path)
-            .map_err(|e| PMetalError::ModelLoad(format!("Failed to read model.bin: {e}")))?;
 
-        // Reinterpret bytes as f32 slice (safe via align_to)
-        if weight_data.len() % 4 != 0 {
-            return Err(PMetalError::ModelLoad(
-                "model.bin size must be a multiple of 4 bytes".into(),
-            ));
+        // Check for LoRA adapter and merge if present
+        let adapter_config = model_path.join("adapter_config.json");
+        let adapter_weights = model_path.join("adapter_model.safetensors");
+        if adapter_config.exists() && adapter_weights.exists() {
+            engine
+                .load_lora_adapter(model_path)
+                .map_err(|e| PMetalError::ModelLoad(format!("LoRA merge failed: {e}")))?;
         }
-        // align_to is safe; verify no unaligned prefix/suffix bytes
-        #[allow(unsafe_code)]
-        let (prefix, weights, suffix) = unsafe { weight_data.align_to::<f32>() };
-        if !prefix.is_empty() || !suffix.is_empty() {
-            return Err(PMetalError::ModelLoad(
-                "model.bin data is not properly aligned for f32".into(),
-            ));
-        }
-        engine.load_weights_flat(weights);
 
-        // Compile kernels
+        // Also check user-specified LoRA path
+        if let Some(ref lora_path) = self.lora_path {
+            let lora_dir = Path::new(lora_path);
+            engine
+                .load_lora_adapter(lora_dir)
+                .map_err(|e| PMetalError::ModelLoad(format!("LoRA merge failed: {e}")))?;
+        }
+
+        // Compile kernels (after LoRA merge)
         engine
             .compile_kernels()
             .map_err(|e| PMetalError::Training(format!("ANE compile failed: {e}")))?;
@@ -657,10 +688,10 @@ impl InferBuilder {
         // Tokenize
         let input_ids_u32 = tokenizer.encode(prompt)?;
 
-        // Generate
+        // Generate with KV cache
         let start = std::time::Instant::now();
         let output_ids = engine
-            .generate(&input_ids_u32)
+            .generate_cached(&input_ids_u32)
             .map_err(|e| PMetalError::Training(format!("ANE generate failed: {e}")))?;
         let elapsed = start.elapsed();
 

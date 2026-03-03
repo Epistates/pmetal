@@ -720,6 +720,48 @@ pub fn adam_update(
     }
 }
 
+/// SiLU activation in-place: `x[i] = x[i] * sigmoid(x[i])`.
+///
+/// Uses vDSP for vectorized exp computation on macOS.
+pub fn silu_inplace(data: &mut [f32]) {
+    let n = data.len();
+    if n == 0 {
+        return;
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // sigmoid(x) = 1 / (1 + exp(-x))
+        // silu(x) = x * sigmoid(x)
+        let mut neg = vec![0.0f32; n];
+        let minus_one = -1.0f32;
+        unsafe {
+            ffi::vDSP_vsmul(data.as_ptr(), 1, &minus_one, neg.as_mut_ptr(), 1, n);
+        }
+        let ni = n as i32;
+        unsafe {
+            ffi::vvexpf(neg.as_mut_ptr(), neg.as_ptr(), &ni);
+        }
+        let one = 1.0f32;
+        unsafe {
+            ffi::vDSP_vsadd(neg.as_ptr(), 1, &one, neg.as_mut_ptr(), 1, n);
+        }
+        // neg[i] = 1 + exp(-x[i]), so sigmoid = 1/neg
+        // silu = x / neg
+        for i in 0..n {
+            data[i] /= neg[i];
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        for x in data.iter_mut() {
+            let sig = 1.0 / (1.0 + (-*x).exp());
+            *x *= sig;
+        }
+    }
+}
+
 /// Embedding lookup: token_ids → x `[dim, seq]` (channel-first).
 ///
 /// `embed` is `[vocab, dim]` row-major. Transposes from row-major embedding
@@ -952,6 +994,19 @@ mod tests {
         assert!(w[0] < 1.0);
         assert!(w[1] < 2.0);
         assert!(w[2] < 3.0);
+    }
+
+    #[test]
+    fn test_silu_inplace() {
+        let mut data = vec![0.0f32, 1.0, -1.0, 2.0, -2.0];
+        silu_inplace(&mut data);
+
+        // silu(0) = 0 * 0.5 = 0
+        assert!((data[0] - 0.0).abs() < 1e-5);
+        // silu(1) = 1 * sigmoid(1) ≈ 0.7311
+        assert!((data[1] - 0.7311).abs() < 1e-3);
+        // silu(-1) = -1 * sigmoid(-1) ≈ -0.2689
+        assert!((data[2] - (-0.2689)).abs() < 1e-3);
     }
 
     #[test]

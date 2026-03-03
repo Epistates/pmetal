@@ -12,7 +12,7 @@ build = "build.rs"
 
 [features]
 default = []
-ane = ["pmetal-core/ane", "dep:rand"]
+ane = ["pmetal-core/ane", "dep:rand", "dep:safetensors", "dep:memmap2"]
 
 [dependencies]
 # Internal crates
@@ -45,6 +45,10 @@ dirs = { workspace = true }
 
 # Sampling (optional, for ANE inference)
 rand = { workspace = true, optional = true }
+
+# SafeTensors loading (optional, for ANE inference)
+safetensors = { workspace = true, optional = true }
+memmap2 = { workspace = true, optional = true }
 
 # Synchronization
 parking_lot = "0.12"
