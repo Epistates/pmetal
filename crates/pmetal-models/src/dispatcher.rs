@@ -69,7 +69,7 @@ impl ModelArchitecture {
             "llama4" => Some(Self::Llama4),
             "llama" | "llama3" => Some(Self::Llama),
             "qwen3_moe" => Some(Self::Qwen3MoE),
-            "qwen3_next" | "qwen3_5" | "qwen3.5" => Some(Self::Qwen3Next),
+            "qwen3_next" | "qwen3_5" | "qwen3.5" | "qwen3_5_text" => Some(Self::Qwen3Next),
             "qwen3" => Some(Self::Qwen3),
             "qwen2" | "qwen2_5" => Some(Self::Qwen2),
             "gemma" | "gemma2" | "gemma3" => Some(Self::Gemma),
@@ -384,8 +384,20 @@ impl DynamicModel {
                 Ok(Self::NemotronH(model))
             }
             ModelArchitecture::Qwen3Next => {
-                let config: Qwen3NextConfig = json5::from_str(&config_content)
+                // Qwen 3.5 configs may have text_config nesting (VLM wrapper format)
+                let config_json: serde_json::Value = serde_json::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
+                let text_config_str = if config_json.get("text_config").is_some()
+                    && config_json.get("hidden_size").is_none()
+                {
+                    serde_json::to_string(&config_json["text_config"])
+                        .map_err(|e| Exception::custom(e.to_string()))?
+                } else {
+                    config_content.clone()
+                };
+                let mut config: Qwen3NextConfig = serde_json::from_str(&text_config_str)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                config.apply_rope_parameters();
                 let mut model = Qwen3NextForCausalLM::new(config.clone())?;
                 load_qwen3_next_weights(&mut model, model_dir, &config)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;

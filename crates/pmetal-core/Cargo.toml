@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = []
+default = ["ane"]
 ane = []
 
 [dependencies]

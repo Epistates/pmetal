@@ -192,8 +192,18 @@ impl DynamicLoraModel {
                 Ok(DynamicLoraModel::Phi(model))
             }
             ModelArchitecture::Qwen3Next => {
-                let qwen_config: pmetal_models::architectures::qwen3_next::Qwen3NextConfig =
-                    serde_json::from_str(&config_content)?;
+                // Qwen 3.5 configs may nest model params inside `text_config`
+                let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
+                let text_config_str = if config_json.get("text_config").is_some()
+                    && config_json.get("hidden_size").is_none()
+                {
+                    serde_json::to_string(&config_json["text_config"])?
+                } else {
+                    config_content.clone()
+                };
+                let mut qwen_config: pmetal_models::architectures::qwen3_next::Qwen3NextConfig =
+                    serde_json::from_str(&text_config_str)?;
+                qwen_config.apply_rope_parameters();
 
                 let mut model = Qwen3NextLoraForCausalLM::new(qwen_config, lora_config)?;
                 model.load_base_weights_from_dir(model_dir)?;

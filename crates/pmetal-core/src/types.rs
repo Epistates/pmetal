@@ -47,10 +47,11 @@ pub enum Device {
     /// CPU computation.
     Cpu,
     /// GPU computation (Metal on macOS).
-    #[default]
+    #[cfg_attr(not(feature = "ane"), default)]
     Gpu,
     /// Apple Neural Engine (ANE) computation.
     #[cfg(feature = "ane")]
+    #[cfg_attr(feature = "ane", default)]
     Ane,
 }
 

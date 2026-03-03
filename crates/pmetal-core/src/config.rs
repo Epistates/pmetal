@@ -336,7 +336,7 @@ impl Default for DatasetConfig {
 
 // Default value functions
 fn default_max_seq_len() -> usize {
-    2048
+    8192
 }
 fn default_true() -> bool {
     true

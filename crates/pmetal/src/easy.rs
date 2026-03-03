@@ -385,7 +385,7 @@ impl InferBuilder {
             seed: None,
             fp8: false,
             #[cfg(feature = "ane")]
-            device: None,
+            device: Some(pmetal_core::Device::Ane),
         }
     }
 
@@ -441,6 +441,13 @@ impl InferBuilder {
     #[cfg(feature = "ane")]
     pub fn device(mut self, device: pmetal_core::Device) -> Self {
         self.device = Some(device);
+        self
+    }
+
+    /// Use GPU (Metal) instead of ANE for inference.
+    #[cfg(feature = "ane")]
+    pub fn gpu(mut self) -> Self {
+        self.device = Some(pmetal_core::Device::Gpu);
         self
     }
 

@@ -966,6 +966,23 @@ impl TrainingLoop {
                             .map(|n| format!(", grad_norm={:.2}", n))
                             .unwrap_or_default()
                     );
+
+                    // Dispatch to callbacks
+                    if !self.callbacks.is_empty() {
+                        let step_metrics = pmetal_core::StepMetrics {
+                            step: self.step,
+                            loss: self.running_loss,
+                            lr: stats.learning_rate as f64,
+                            tok_sec: tokens_per_sec,
+                            total_ms: now.elapsed().as_secs_f64() * 1000.0,
+                            tokens: stats.tokens,
+                            grad_norm: stats.grad_norm.map(|n| n as f64),
+                            ..Default::default()
+                        };
+                        for cb in &mut self.callbacks {
+                            cb.on_step_end_with_metrics(&step_metrics);
+                        }
+                    }
                 }
 
                 // Evaluation

@@ -13,7 +13,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use mlx_rs::builder::Builder;
 use pmetal_core::{DatasetConfig, LoraConfig, ModelConfig, TrainingConfig};
-use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
+use pmetal_data::{DataLoaderConfig, DatasetFormat, DatasetSource, Tokenizer, TrainingDataset, resolve_dataset_source};
 use pmetal_lora::{
     DynamicLoraModel, LlamaLoraForCausalLM, LlamaQloraForCausalLM, QLoraConfig, TrainableModel,
 };
@@ -192,10 +192,10 @@ enum Commands {
         #[arg(long)]
         embedding_lr: Option<f32>,
 
-        /// Use ANE (Apple Neural Engine) for training.
+        /// Disable ANE (Apple Neural Engine) for training, falling back to GPU/MLX.
         #[cfg(feature = "ane")]
         #[arg(long)]
-        ane: bool,
+        no_ane: bool,
     },
 
     /// Run inference with a model
@@ -290,11 +290,10 @@ enum Commands {
         #[arg(long)]
         fp8: bool,
 
-        /// Use ANE (Apple Neural Engine) for inference (hybrid ANE prefill + CPU decode).
-        /// High power efficiency for long-running reasoning sessions.
+        /// Disable ANE (Apple Neural Engine) for inference, falling back to GPU/Metal.
         #[cfg(feature = "ane")]
         #[arg(long)]
-        ane: bool,
+        no_ane: bool,
     },
 
     /// Download a model from HuggingFace
@@ -1116,7 +1115,7 @@ async fn main() -> anyhow::Result<()> {
             log_metrics,
             embedding_lr,
             #[cfg(feature = "ane")]
-            ane,
+            no_ane,
         } => {
             // Optimizations enabled by default (invert no_* flags)
             let use_metal_flash_attention = !no_flash_attention;
@@ -1154,7 +1153,7 @@ async fn main() -> anyhow::Result<()> {
                 log_metrics,
                 embedding_lr,
                 #[cfg(feature = "ane")]
-                ane,
+                !no_ane,
                 #[cfg(not(feature = "ane"))]
                 false,
             )
@@ -1184,7 +1183,7 @@ async fn main() -> anyhow::Result<()> {
             show_thinking,
             fp8,
             #[cfg(feature = "ane")]
-            ane,
+            no_ane,
         } => {
             run_inference(
                 &model,
@@ -1209,7 +1208,7 @@ async fn main() -> anyhow::Result<()> {
                 show_thinking,
                 fp8,
                 #[cfg(feature = "ane")]
-                ane,
+                !no_ane,
                 #[cfg(not(feature = "ane"))]
                 false,
             )
@@ -2003,124 +2002,135 @@ async fn run_training(
     if ane {
         use pmetal_trainer::{AneTrainingLoop, AneTrainingLoopConfig, DynamicAneTrainerConfig};
 
-        tracing::info!("Using ANE dynamic weight pipeline (compile-once, 9 kernels)");
+        tracing::info!("Attempting ANE dynamic weight pipeline (compile-once, 9 kernels)");
 
-        // Resolve model path
-        let model_name = model_id
-            .as_deref()
-            .or(config_path.as_deref())
-            .ok_or_else(|| anyhow::anyhow!("--model is required for ANE training"))?;
-        let model_path = if model_name.contains('/') && !PathBuf::from(model_name).exists() {
-            pmetal_hub::download_model(model_name, None, None).await?
-        } else {
-            PathBuf::from(model_name)
-        };
+        let ane_result: anyhow::Result<()> = (|| async {
+            // Resolve model path
+            let model_name = model_id
+                .as_deref()
+                .or(config_path.as_deref())
+                .ok_or_else(|| anyhow::anyhow!("--model is required for ANE training"))?;
+            let model_path = if model_name.contains('/') && !PathBuf::from(model_name).exists() {
+                pmetal_hub::download_model(model_name, None, None).await?
+            } else {
+                PathBuf::from(model_name)
+            };
 
-        // Read model config
-        let config_text = std::fs::read_to_string(model_path.join("config.json"))?;
-        let config_json: serde_json::Value = serde_json::from_str(&config_text)?;
-        let get_usize = |key: &str| -> anyhow::Result<usize> {
-            config_json
-                .get(key)
-                .and_then(|v| v.as_u64())
-                .map(|v| v as usize)
-                .ok_or_else(|| anyhow::anyhow!("config.json missing '{key}'"))
-        };
-        let dim = get_usize("hidden_size")?;
-        let hidden_dim = get_usize("intermediate_size")?;
-        let n_heads = get_usize("num_attention_heads")?;
-        let n_layers = get_usize("num_hidden_layers")?;
-        let vocab_size = get_usize("vocab_size")?;
+            // Read model config
+            let config_text = std::fs::read_to_string(model_path.join("config.json"))?;
+            let config_json: serde_json::Value = serde_json::from_str(&config_text)?;
+            let get_usize = |key: &str| -> anyhow::Result<usize> {
+                config_json
+                    .get(key)
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .ok_or_else(|| anyhow::anyhow!("config.json missing '{key}'"))
+            };
+            let dim = get_usize("hidden_size")?;
+            let hidden_dim = get_usize("intermediate_size")?;
+            let n_heads = get_usize("num_attention_heads")?;
+            let n_layers = get_usize("num_hidden_layers")?;
+            let vocab_size = get_usize("vocab_size")?;
 
-        // Load tokenizer (with config-aware special token resolution) and dataset
-        let tokenizer = Tokenizer::from_model_dir(&model_path)?;
-        let ds_path = dataset_path
-            .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("--dataset is required for ANE training"))?;
-        let text_samples = TrainingDataset::load_jsonl_text(ds_path, DatasetFormat::Auto, None)?;
+            // Load tokenizer (with config-aware special token resolution) and dataset
+            let tokenizer = Tokenizer::from_model_dir(&model_path)?;
+            let ds_path = dataset_path
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("--dataset is required for ANE training"))?;
+            let text_samples =
+                TrainingDataset::load_jsonl_text(ds_path, DatasetFormat::Auto, None)?;
 
-        // Tokenize and prepare batches: Vec<Vec<(Vec<u16>, Vec<u16>)>>
-        // Each batch contains `gradient_accumulation_steps` examples.
-        // Each example is (input, target) where target = input shifted by 1.
-        let mut batches: Vec<Vec<(Vec<u16>, Vec<u16>)>> = Vec::new();
-        let mut current_batch: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
+            // Tokenize and prepare batches: Vec<Vec<(Vec<u16>, Vec<u16>)>>
+            // Each batch contains `gradient_accumulation_steps` examples.
+            // Each example is (input, target) where target = input shifted by 1.
+            let mut batches: Vec<Vec<(Vec<u16>, Vec<u16>)>> = Vec::new();
+            let mut current_batch: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
 
-        for sample in &text_samples {
-            let tokens = tokenizer.encode(&sample.text)?;
-            if tokens.len() < 2 {
-                continue;
+            for sample in &text_samples {
+                let tokens = tokenizer.encode(&sample.text)?;
+                if tokens.len() < 2 {
+                    continue;
+                }
+                let len = tokens.len().min(max_seq_len + 1);
+                let input: Vec<u16> = tokens[..len - 1].iter().map(|&t| t as u16).collect();
+                let target: Vec<u16> = tokens[1..len].iter().map(|&t| t as u16).collect();
+                current_batch.push((input, target));
+
+                if current_batch.len() >= gradient_accumulation_steps.max(1) {
+                    batches.push(std::mem::take(&mut current_batch));
+                }
             }
-            let len = tokens.len().min(max_seq_len + 1);
-            let input: Vec<u16> = tokens[..len - 1].iter().map(|&t| t as u16).collect();
-            let target: Vec<u16> = tokens[1..len].iter().map(|&t| t as u16).collect();
-            current_batch.push((input, target));
-
-            if current_batch.len() >= gradient_accumulation_steps.max(1) {
-                batches.push(std::mem::take(&mut current_batch));
+            if !current_batch.is_empty() {
+                batches.push(current_batch);
             }
-        }
-        if !current_batch.is_empty() {
-            batches.push(current_batch);
-        }
 
-        if batches.is_empty() {
-            anyhow::bail!("No training examples after tokenization");
-        }
+            if batches.is_empty() {
+                anyhow::bail!("No training examples after tokenization");
+            }
 
-        let total_batches = batches.len() * num_epochs;
-        tracing::info!(
-            examples = text_samples.len(),
-            batches = batches.len(),
-            epochs = num_epochs,
-            total_steps = total_batches,
-            "Prepared ANE training data"
-        );
-
-        let trainer_config = DynamicAneTrainerConfig {
-            dim,
-            hidden_dim,
-            n_heads,
-            n_layers,
-            vocab_size,
-            seq_len: max_seq_len,
-            learning_rate: learning_rate as f32,
-            accum_steps: gradient_accumulation_steps.max(1),
-            ..Default::default()
-        };
-
-        let loop_config = AneTrainingLoopConfig {
-            trainer: trainer_config,
-            num_batches: total_batches,
-            max_steps: total_batches,
-            log_every: 10,
-            save_every: Some(100),
-            output_dir: PathBuf::from(&output_dir),
-        };
-
-        let mut training_loop = AneTrainingLoop::new(loop_config);
-
-        // Load model weights from SafeTensors
-        tracing::info!("Loading model weights for ANE training...");
-        training_loop.load_weights_safetensors(&model_path)?;
-
-        // Compile 9 dynamic ANE kernels (one-time, no recompilation ever)
-        tracing::info!("Compiling 9 dynamic ANE kernels (one-time)...");
-        training_loop.compile_kernels()?;
-
-        // Run training
-        for epoch in 0..num_epochs {
-            tracing::info!(epoch = epoch + 1, total = num_epochs, "Starting epoch");
-            let state = training_loop.train(&batches)?;
+            let total_batches = batches.len() * num_epochs;
             tracing::info!(
-                loss = state.loss,
-                tokens = state.tokens_processed,
-                tok_per_sec = format!("{:.1}", state.tokens_per_sec()),
-                "Epoch complete"
+                examples = text_samples.len(),
+                batches = batches.len(),
+                epochs = num_epochs,
+                total_steps = total_batches,
+                "Prepared ANE training data"
             );
-        }
 
-        tracing::info!("ANE training complete");
-        return Ok(());
+            let trainer_config = DynamicAneTrainerConfig {
+                dim,
+                hidden_dim,
+                n_heads,
+                n_layers,
+                vocab_size,
+                seq_len: max_seq_len,
+                learning_rate: learning_rate as f32,
+                accum_steps: gradient_accumulation_steps.max(1),
+                ..Default::default()
+            };
+
+            let loop_config = AneTrainingLoopConfig {
+                trainer: trainer_config,
+                num_batches: total_batches,
+                max_steps: total_batches,
+                log_every: 10,
+                save_every: Some(100),
+                output_dir: PathBuf::from(&output_dir),
+            };
+
+            let mut training_loop = AneTrainingLoop::new(loop_config);
+
+            // Load model weights from SafeTensors
+            tracing::info!("Loading model weights for ANE training...");
+            training_loop.load_weights_safetensors(&model_path)?;
+
+            // Compile 9 dynamic ANE kernels (one-time, no recompilation ever)
+            tracing::info!("Compiling 9 dynamic ANE kernels (one-time)...");
+            training_loop.compile_kernels()?;
+
+            // Run training
+            for epoch in 0..num_epochs {
+                tracing::info!(epoch = epoch + 1, total = num_epochs, "Starting epoch");
+                let state = training_loop.train(&batches)?;
+                tracing::info!(
+                    loss = state.loss,
+                    tokens = state.tokens_processed,
+                    tok_per_sec = format!("{:.1}", state.tokens_per_sec()),
+                    "Epoch complete"
+                );
+            }
+
+            tracing::info!("ANE training complete");
+            Ok(())
+        })()
+        .await;
+
+        match ane_result {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                tracing::warn!("ANE training failed ({}), falling back to GPU training", e);
+            }
+        }
     }
 
     let use_qlora = !matches!(quantization, QuantizationMethod::None);
@@ -2188,15 +2198,17 @@ async fn run_training(
     // Auto-detect max_seq_len if requested (0)
     if config.training.max_seq_len == 0 {
         if let Some(ref cfg) = llama_config {
-            // Llama/Qwen config uses max_position_embeddings
-            config.training.max_seq_len = cfg.max_position_embeddings as usize;
+            // Llama/Qwen config uses max_position_embeddings — cap to prevent OOM
+            let model_max = cfg.max_position_embeddings as usize;
+            config.training.max_seq_len = model_max.min(8192);
             tracing::info!(
-                "Auto-detected max_seq_len: {} from model config",
-                config.training.max_seq_len
+                "Auto-detected max_seq_len: {} (model supports {}, capped at 8192)",
+                config.training.max_seq_len,
+                model_max
             );
         } else {
             // GGUF fallback
-            config.training.max_seq_len = 2048;
+            config.training.max_seq_len = 8192;
             tracing::info!(
                 "Defaulting max_seq_len to {} (GGUF or unknown config)",
                 config.training.max_seq_len
@@ -2268,10 +2280,34 @@ async fn run_training(
     let chat_template =
         pmetal_data::chat_templates::detect_chat_template(&model_path, &config.model.model_id);
 
+    // Resolve dataset source — local path or HuggingFace dataset ID
+    let dataset_path_resolved =
+        match resolve_dataset_source(&config.dataset.dataset_id) {
+            DatasetSource::Local(p) => p,
+            DatasetSource::HuggingFace(id) => {
+                tracing::info!("Downloading dataset from HuggingFace: {}", id);
+                // Download the dataset repo (contains JSONL/Parquet files)
+                let dir = pmetal_hub::download_dataset(&id, None, None, None).await?;
+                // Try to resolve a JSONL file in the downloaded directory
+                let resolved = TrainingDataset::resolve_dataset_path_pub(&dir);
+                if let Ok(p) = resolved {
+                    p
+                } else {
+                    // Fall back to parquet
+                    let parquet_paths =
+                        pmetal_hub::download_dataset_parquet(&id, "train", None, None).await?;
+                    if parquet_paths.is_empty() {
+                        anyhow::bail!("No JSONL or Parquet files found for dataset {}", id);
+                    }
+                    parquet_paths[0].clone()
+                }
+            }
+        };
+
     // Load and tokenize training dataset
-    tracing::info!("Loading training dataset: {}", config.dataset.dataset_id);
+    tracing::info!("Loading training dataset: {}", dataset_path_resolved.display());
     let train_dataset = TrainingDataset::from_jsonl_tokenized(
-        &config.dataset.dataset_id,
+        &dataset_path_resolved,
         &tokenizer,
         DatasetFormat::Auto,
         config.training.max_seq_len,
@@ -2869,14 +2905,17 @@ async fn run_inference(
     #[cfg(target_os = "macos")]
     let output = {
         // ANE branch: separate engine with its own weight loading and KV cache
+        // Falls back to GPU if ANE compilation fails (e.g., hybrid architectures)
         #[cfg(feature = "ane")]
         let ane_output: Option<GenerationOutput> = if ane {
-            tracing::info!("Using ANE-hybrid inference engine (Prefill: ANE, Decode: CPU/vDSP)");
-            Some(pmetal_models::generate_cached_ane(
-                &model_path,
-                &input_ids,
-                &gen_config,
-            )?)
+            tracing::info!("Attempting ANE-hybrid inference engine (Prefill: ANE, Decode: CPU/vDSP)");
+            match pmetal_models::generate_cached_ane(&model_path, &input_ids, &gen_config) {
+                Ok(output) => Some(output),
+                Err(e) => {
+                    tracing::warn!("ANE inference failed ({}), falling back to GPU", e);
+                    None
+                }
+            }
         } else {
             None
         };

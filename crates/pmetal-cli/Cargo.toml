@@ -46,7 +46,7 @@ ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", optional = true }
 
 [features]
-default = []
+default = ["ane", "dashboard"]
 ane = ["pmetal-trainer/ane", "pmetal-models/ane"]
 dashboard = ["dep:ratatui", "dep:crossterm"]
 

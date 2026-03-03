@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["core", "gguf", "metal", "hub", "mlx", "models", "lora", "trainer", "easy"]
+default = ["core", "gguf", "metal", "hub", "mlx", "models", "lora", "trainer", "easy", "ane"]
 
 # Foundation crates (no mlx-rs dependency)
 core = ["dep:pmetal-core"]
@@ -42,7 +42,7 @@ ane = ["metal", "pmetal-metal/ane", "pmetal-core/ane"]
 full = [
     "core", "gguf", "metal", "hub", "distributed", "mhc",
     "mlx", "models", "lora", "data", "trainer",
-    "distill", "merge", "vocoder", "easy",
+    "distill", "merge", "vocoder", "easy", "ane",
 ]
 
 [dependencies]

@@ -130,6 +130,30 @@ pub struct Qwen3NextConfig {
     /// RoPE scaling configuration.
     #[serde(default)]
     pub rope_scaling: Option<HashMap<String, serde_json::Value>>,
+
+    /// Nested rope_parameters (HF format). Fields extracted during post-processing.
+    #[serde(default)]
+    pub rope_parameters: Option<RopeParameters>,
+
+    /// Explicit layer types (e.g., ["linear_attention", "full_attention", ...]).
+    /// When present, overrides full_attention_interval-based layer type detection.
+    #[serde(default)]
+    pub layer_types: Option<Vec<String>>,
+}
+
+/// Nested RoPE parameters from HuggingFace config format.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RopeParameters {
+    #[serde(default)]
+    pub rope_theta: Option<f64>,
+    #[serde(default)]
+    pub partial_rotary_factor: Option<f32>,
+    #[serde(default)]
+    pub rope_type: Option<String>,
+    #[serde(default)]
+    pub mrope_interleaved: Option<bool>,
+    #[serde(default)]
+    pub mrope_section: Option<Vec<i32>>,
 }
 
 fn default_model_type() -> String {
@@ -176,6 +200,26 @@ fn default_partial_rotary_factor() -> f32 {
 }
 
 impl Qwen3NextConfig {
+    /// Apply post-deserialization fixups.
+    ///
+    /// Extracts rope_theta and partial_rotary_factor from nested `rope_parameters`
+    /// if they weren't set at the top level.
+    pub fn apply_rope_parameters(&mut self) {
+        if let Some(ref rp) = self.rope_parameters {
+            // Only override if still at default values
+            if self.rope_theta == default_rope_theta() {
+                if let Some(theta) = rp.rope_theta {
+                    self.rope_theta = theta as f32;
+                }
+            }
+            if self.partial_rotary_factor == default_partial_rotary_factor() {
+                if let Some(prf) = rp.partial_rotary_factor {
+                    self.partial_rotary_factor = prf;
+                }
+            }
+        }
+    }
+
     /// Get head dimension.
     pub fn get_head_dim(&self) -> i32 {
         self.head_dim
@@ -189,6 +233,11 @@ impl Qwen3NextConfig {
 
     /// Check if layer at index is a linear (GDN) layer.
     pub fn is_linear_layer(&self, layer_idx: usize) -> bool {
+        if let Some(ref layer_types) = self.layer_types {
+            if layer_idx < layer_types.len() {
+                return layer_types[layer_idx] == "linear_attention";
+            }
+        }
         ((layer_idx as i32) + 1) % self.full_attention_interval != 0
     }
 
@@ -277,6 +326,8 @@ impl Default for Qwen3NextConfig {
             partial_rotary_factor: 0.25,
             attention_bias: false,
             rope_scaling: None,
+            rope_parameters: None,
+            layer_types: None,
         }
     }
 }
@@ -525,14 +576,20 @@ pub struct Qwen3NextGatedDeltaNet {
     #[param]
     pub conv1d: nn::Conv1d,
     #[param]
-    pub in_proj_qkvz: nn::Linear,
+    pub in_proj_qkv: nn::Linear,
     #[param]
-    pub in_proj_ba: nn::Linear,
+    pub in_proj_z: nn::Linear,
+    #[param]
+    pub in_proj_b: nn::Linear,
+    #[param]
+    pub in_proj_a: nn::Linear,
     #[param]
     pub norm: Qwen3NextRMSNormGated,
     #[param]
     pub out_proj: nn::Linear,
+    #[param]
     pub dt_bias: Param<Array>,
+    #[param]
     pub a_log: Param<Array>,
 
     pub hidden_size: i32,
@@ -568,10 +625,17 @@ impl Qwen3NextGatedDeltaNet {
             .padding(0)
             .build()?;
 
-        let in_proj_qkvz = nn::LinearBuilder::new(hidden_size, key_dim * 2 + value_dim * 2)
+        // 4 separate projections matching HF weight format (qwen3_5.py)
+        let in_proj_qkv = nn::LinearBuilder::new(hidden_size, key_dim * 2 + value_dim)
             .bias(false)
             .build()?;
-        let in_proj_ba = nn::LinearBuilder::new(hidden_size, num_v_heads * 2)
+        let in_proj_z = nn::LinearBuilder::new(hidden_size, value_dim)
+            .bias(false)
+            .build()?;
+        let in_proj_b = nn::LinearBuilder::new(hidden_size, num_v_heads)
+            .bias(false)
+            .build()?;
+        let in_proj_a = nn::LinearBuilder::new(hidden_size, num_v_heads)
             .bias(false)
             .build()?;
 
@@ -586,8 +650,10 @@ impl Qwen3NextGatedDeltaNet {
 
         Ok(Self {
             conv1d,
-            in_proj_qkvz,
-            in_proj_ba,
+            in_proj_qkv,
+            in_proj_z,
+            in_proj_b,
+            in_proj_a,
             norm,
             out_proj,
             dt_bias,
@@ -604,59 +670,6 @@ impl Qwen3NextGatedDeltaNet {
         })
     }
 
-    /// Reorder interleaved qkvz projection outputs into separate tensors.
-    fn fix_query_key_value_ordering(
-        &self,
-        mixed_qkvz: &Array,
-        mixed_ba: &Array,
-    ) -> Result<(Array, Array, Array, Array, Array, Array), Exception> {
-        let nk = self.num_k_heads;
-        let dn = self.head_k_dim;
-        let nv = self.num_v_heads;
-        let dv = self.head_v_dim;
-        let leading = &mixed_qkvz.shape()[..mixed_qkvz.ndim() - 1];
-
-        // Reshape to [..., nk, -1]
-        let mut qkvz_shape = leading.to_vec();
-        qkvz_shape.push(nk);
-        qkvz_shape.push(-1);
-        let mixed = mixed_qkvz.reshape(&qkvz_shape)?;
-
-        let mut ba_shape = mixed_ba.shape()[..mixed_ba.ndim() - 1].to_vec();
-        ba_shape.push(nk);
-        ba_shape.push(-1);
-        let mixed_ba = mixed_ba.reshape(&ba_shape)?;
-
-        // Split: q=[dn], k=[dn], v=[nv/nk*dv], z=[nv/nk*dv]
-        let split1 = dn;
-        let split2 = 2 * dn;
-        let split3 = 2 * dn + (nv / nk) * dv;
-
-        let q = mixed.index((.., .., .., ..split1));
-        let k = mixed.index((.., .., .., split1..split2));
-        let v_raw = mixed.index((.., .., .., split2..split3));
-        let z_raw = mixed.index((.., .., .., split3..));
-
-        // Split ba: b=[nv/nk], a=[nv/nk]
-        let b_split = nv / nk;
-        let b_raw = mixed_ba.index((.., .., .., ..b_split));
-        let a_raw = mixed_ba.index((.., .., .., b_split..));
-
-        // Reshape v, z to [..., nv, dv] and b, a to [..., nv]
-        let batch_seq = &leading[..2]; // [B, S]
-        let mut v_shape = batch_seq.to_vec();
-        v_shape.extend_from_slice(&[nv, dv]);
-        let mut ba_out_shape = batch_seq.to_vec();
-        ba_out_shape.push(nv);
-
-        let v = v_raw.reshape(&v_shape)?;
-        let z = z_raw.reshape(&v_shape)?;
-        let b = b_raw.reshape(&ba_out_shape)?;
-        let a = a_raw.reshape(&ba_out_shape)?;
-
-        Ok((q, k, v, z, b, a))
-    }
-
     pub fn forward(
         &mut self,
         inputs: &Array,
@@ -667,11 +680,16 @@ impl Qwen3NextGatedDeltaNet {
         let b = shape[0];
         let s = shape[1];
 
-        // Project inputs (compute before passing to fix_query_key_value_ordering
-        // to avoid simultaneous mutable/immutable borrow of self)
-        let qkvz_proj = self.in_proj_qkvz.forward(inputs)?;
-        let ba_proj = self.in_proj_ba.forward(inputs)?;
-        let (q, k, v, z, b_val, a) = self.fix_query_key_value_ordering(&qkvz_proj, &ba_proj)?;
+        // 4 separate projections matching HF weight format (qwen3_5.py:136-139)
+        let qkv = self.in_proj_qkv.forward(inputs)?;
+        let z = self.in_proj_z.forward(inputs)?.reshape(&[
+            b,
+            s,
+            self.num_v_heads,
+            self.head_v_dim,
+        ])?;
+        let b_val = self.in_proj_b.forward(inputs)?;
+        let a = self.in_proj_a.forward(inputs)?;
 
         // Convolution state management
         let conv_state = if let Some(ref cache) = cache {
@@ -683,27 +701,16 @@ impl Qwen3NextGatedDeltaNet {
             Array::zeros::<f32>(&[b, self.conv_kernel_size - 1, self.conv_dim]).unwrap()
         });
 
-        // Concatenate q, k, v for conv input
-        let mixed_qkv = ops::concatenate_axis(
-            &[
-                &q.reshape(&[b, s, -1])?,
-                &k.reshape(&[b, s, -1])?,
-                &v.reshape(&[b, s, -1])?,
-            ],
-            -1,
-        )?;
-
-        // Apply mask to conv input if present
-        let mixed_qkv = if let Some(mask) = mask {
-            // mask: [B, T] -> [B, T, 1]
+        // Mask QKV BEFORE conv (Python line 149-150)
+        let qkv = if let Some(mask) = mask {
             let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1])?;
-            ops::r#where(&mask_expanded, &mixed_qkv, &Array::from_f32(0.0))?
+            ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))?
         } else {
-            mixed_qkv
+            qkv
         };
 
-        // Prepend conv state and run conv1d
-        let conv_input = ops::concatenate_axis(&[&conv_state, &mixed_qkv], 1)?;
+        // Prepend conv state and run conv1d + silu
+        let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1)?;
 
         // Update conv state in cache
         if let Some(cache) = cache.as_deref_mut() {
@@ -714,7 +721,8 @@ impl Qwen3NextGatedDeltaNet {
 
         let conv_out = nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?;
 
-        // Split conv output back into q, k, v
+        // Split conv output — simple positional split on last dim (Python line 156-163)
+        // Split at [key_dim, 2*key_dim] into q, k, v
         let q_conv = conv_out.index((.., .., ..self.key_dim));
         let k_conv = conv_out.index((.., .., self.key_dim..self.key_dim * 2));
         let v_conv = conv_out.index((.., .., self.key_dim * 2..));
@@ -740,7 +748,7 @@ impl Qwen3NextGatedDeltaNet {
             self.head_v_dim,
         ])?;
 
-        // Apply Q/K RMS normalization with scaling
+        // Apply Q/K RMS normalization with scaling (Python line 166-168)
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
         let q_normed =
             mlx_rs::fast::rms_norm(&q_conv, &Array::ones::<f32>(&[self.head_k_dim])?, 1e-6)?
@@ -982,75 +990,19 @@ impl Qwen3NextFeedForward {
 }
 
 // ============================================================================
-// Attention/GDN mixer enum
-// ============================================================================
-
-#[derive(Debug)]
-pub enum Qwen3NextMixer {
-    FullAttention(Qwen3NextAttention),
-    LinearAttention(Qwen3NextGatedDeltaNet),
-}
-
-impl ModuleParameters for Qwen3NextMixer {
-    fn num_parameters(&self) -> usize {
-        match self {
-            Self::FullAttention(m) => m.num_parameters(),
-            Self::LinearAttention(m) => m.num_parameters(),
-        }
-    }
-    fn parameters(&self) -> ModuleParamRef<'_> {
-        match self {
-            Self::FullAttention(m) => m.parameters(),
-            Self::LinearAttention(m) => m.parameters(),
-        }
-    }
-    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
-        match self {
-            Self::FullAttention(m) => m.parameters_mut(),
-            Self::LinearAttention(m) => m.parameters_mut(),
-        }
-    }
-    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
-        match self {
-            Self::FullAttention(m) => m.trainable_parameters(),
-            Self::LinearAttention(m) => m.trainable_parameters(),
-        }
-    }
-    fn freeze_parameters(&mut self, recurse: bool) {
-        match self {
-            Self::FullAttention(m) => m.freeze_parameters(recurse),
-            Self::LinearAttention(m) => m.freeze_parameters(recurse),
-        }
-    }
-    fn unfreeze_parameters(&mut self, recurse: bool) {
-        match self {
-            Self::FullAttention(m) => m.unfreeze_parameters(recurse),
-            Self::LinearAttention(m) => m.unfreeze_parameters(recurse),
-        }
-    }
-    fn all_frozen(&self) -> Option<bool> {
-        match self {
-            Self::FullAttention(m) => m.all_frozen(),
-            Self::LinearAttention(m) => m.all_frozen(),
-        }
-    }
-    fn any_frozen(&self) -> Option<bool> {
-        match self {
-            Self::FullAttention(m) => m.any_frozen(),
-            Self::LinearAttention(m) => m.any_frozen(),
-        }
-    }
-}
-
-// ============================================================================
 // Decoder Layer
 // ============================================================================
 
+/// Hybrid decoder layer: uses `linear_attn` (GDN) OR `self_attn` (full attention)
+/// based on layer index. Option fields produce correct HF weight key names
+/// (e.g. `model.layers.0.linear_attn.in_proj_qkv.weight`).
 #[derive(Debug, ModuleParameters)]
 pub struct Qwen3NextDecoderLayer {
     pub is_linear: bool,
     #[param]
-    pub mixer: Qwen3NextMixer,
+    pub linear_attn: Option<Qwen3NextGatedDeltaNet>,
+    #[param]
+    pub self_attn: Option<Qwen3NextAttention>,
     #[param]
     pub input_layernorm: nn::RmsNorm,
     #[param]
@@ -1063,10 +1015,15 @@ impl Qwen3NextDecoderLayer {
     pub fn new(config: &Qwen3NextConfig, layer_idx: usize) -> Result<Self, Exception> {
         let is_linear = config.is_linear_layer(layer_idx);
 
-        let mixer = if is_linear {
-            Qwen3NextMixer::LinearAttention(Qwen3NextGatedDeltaNet::new(config)?)
+        let linear_attn = if is_linear {
+            Some(Qwen3NextGatedDeltaNet::new(config)?)
         } else {
-            Qwen3NextMixer::FullAttention(Qwen3NextAttention::new(config)?)
+            None
+        };
+        let self_attn = if !is_linear {
+            Some(Qwen3NextAttention::new(config)?)
+        } else {
+            None
         };
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
@@ -1087,7 +1044,8 @@ impl Qwen3NextDecoderLayer {
 
         Ok(Self {
             is_linear,
-            mixer,
+            linear_attn,
+            self_attn,
             input_layernorm,
             post_attention_layernorm,
             mlp,
@@ -1102,9 +1060,16 @@ impl Qwen3NextDecoderLayer {
         mamba_cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x)?;
-        let r = match &mut self.mixer {
-            Qwen3NextMixer::LinearAttention(gdn) => gdn.forward(&normed, mask, mamba_cache)?,
-            Qwen3NextMixer::FullAttention(attn) => attn.forward(&normed, mask, kv_cache)?,
+        let r = if self.is_linear {
+            self.linear_attn
+                .as_mut()
+                .expect("linear_attn must be Some for linear layers")
+                .forward(&normed, mask, mamba_cache)?
+        } else {
+            self.self_attn
+                .as_mut()
+                .expect("self_attn must be Some for attention layers")
+                .forward(&normed, mask, kv_cache)?
         };
         let h = x.add(&r)?;
         let mlp_in = self.post_attention_layernorm.forward(&h)?;
@@ -1158,6 +1123,14 @@ impl Qwen3NextModel {
     ) -> Result<Array, Exception> {
         let mut hidden = Module::forward(&mut self.embed_tokens, input_ids)?;
 
+        // Create separate masks for full attention vs GDN layers (matching MLX reference):
+        // - Full attention: uses the causal mask from the caller (or None for cached decode)
+        // - GDN (linear attention): uses None (no left-padding in our MambaCache impl)
+        // Passing a causal mask [1,1,T,T] to GDN layers causes garbage output because
+        // GDN interprets the mask as a token-validity boolean [B,T], not attention weights.
+        let fa_mask = mask;
+        let ssm_mask: Option<&Array> = None;
+
         for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             let kv = if !layer.is_linear {
                 kv_cache.as_deref_mut().map(|c| (c, layer_idx))
@@ -1172,8 +1145,8 @@ impl Qwen3NextModel {
                 None
             };
 
-            // Use mask for both layer types; the layer will use it appropriately
-            hidden = layer.forward(&hidden, mask, kv, mamba)?;
+            let layer_mask = if layer.is_linear { ssm_mask } else { fa_mask };
+            hidden = layer.forward(&hidden, layer_mask, kv, mamba)?;
         }
 
         self.norm.forward(&hidden)
@@ -1250,13 +1223,45 @@ impl Qwen3NextForCausalLM {
 /// Sanitize weights for Qwen3Next models.
 ///
 /// Handles:
-/// 1. Stacking per-expert weights into SwitchGLU format
-/// 2. Adding +1 offset to (1+w) RMSNorm weights
-/// 3. Transposing conv1d weights if needed
+/// 1. Stripping HF prefix `model.language_model.` → `model.` (VLM wrapper format)
+/// 2. Renaming `A_log` → `a_log` (Python uses `self.A_log`, Rust uses lowercase)
+/// 3. Stacking per-expert weights into SwitchGLU format
+/// 4. Conditional (1+w) RMSNorm offset (only when MTP or unsanitized conv detected)
+/// 5. Transposing conv1d weights if needed
 pub fn sanitize_weights(
     weights: &mut HashMap<String, Array>,
     config: &Qwen3NextConfig,
 ) -> Result<(), Exception> {
+    // Detect shift condition BEFORE removing MTP (matching Python line 289-293)
+    let has_mtp = weights.keys().any(|k| k.contains("mtp."));
+    let has_unsanitized_conv = weights
+        .iter()
+        .any(|(k, v)| k.contains("conv1d.weight") && v.ndim() == 3 && v.dim(2) != 1);
+    let should_shift_norms = has_mtp || has_unsanitized_conv;
+
+    // Strip HF prefix: model.language_model. → model. (VLM wrapper format)
+    // Also rename A_log → a_log
+    let original_keys: Vec<String> = weights.keys().cloned().collect();
+    for old_key in original_keys {
+        let mut new_key = old_key.clone();
+
+        // Strip VLM wrapper prefix
+        if new_key.starts_with("model.language_model.") {
+            new_key = new_key.replacen("model.language_model.", "model.", 1);
+        }
+
+        // Rename A_log → a_log (Python field self.A_log, Rust uses lowercase)
+        if new_key.contains(".A_log") {
+            new_key = new_key.replace(".A_log", ".a_log");
+        }
+
+        if new_key != old_key {
+            if let Some(v) = weights.remove(&old_key) {
+                weights.insert(new_key, v);
+            }
+        }
+    }
+
     // Check if expert stacking is needed
     let needs_stacking = weights.contains_key("model.layers.0.mlp.experts.0.up_proj.weight");
 
@@ -1290,7 +1295,7 @@ pub fn sanitize_weights(
         weights.remove(&k);
     }
 
-    // Apply (1+w) offset to norm weights and transpose conv1d
+    // Apply conv1d transpose and conditional (1+w) norm offset
     let norm_suffixes = [
         ".input_layernorm.weight",
         ".post_attention_layernorm.weight",
@@ -1311,8 +1316,8 @@ pub fn sanitize_weights(
             }
         }
 
-        // Add +1 to (1+w) norm weights
-        if norm_suffixes.iter().any(|sfx| k.ends_with(sfx)) {
+        // Add +1 to (1+w) norm weights — only when should_shift_norms
+        if should_shift_norms && norm_suffixes.iter().any(|sfx| k.ends_with(sfx)) {
             if let Some(v) = weights.get(k) {
                 if v.ndim() == 1 {
                     let offset = v.add(&Array::from_f32(1.0))?;
@@ -1517,5 +1522,81 @@ mod tests {
         config.tie_word_embeddings = false;
         let model = Qwen3NextForCausalLM::new(config).unwrap();
         assert!(model.lm_head.is_some());
+    }
+
+    #[test]
+    fn test_text_config_nesting_parse() {
+        // Simulates the real Qwen 3.5 config.json from HuggingFace which wraps
+        // model params inside `text_config` (VLM wrapper format).
+        let nested_json = r#"{
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_config": {
+                "model_type": "qwen3_next",
+                "hidden_size": 1536,
+                "intermediate_size": 8960,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 12,
+                "num_key_value_heads": 4,
+                "head_dim": 128,
+                "vocab_size": 151936,
+                "rms_norm_eps": 1e-6,
+                "tie_word_embeddings": true,
+                "linear_num_value_heads": 8,
+                "linear_num_key_heads": 4,
+                "linear_key_head_dim": 128,
+                "linear_value_head_dim": 128,
+                "linear_conv_kernel_dim": 4,
+                "full_attention_interval": 4,
+                "partial_rotary_factor": 0.25,
+                "attention_bias": false,
+                "num_experts": 0,
+                "num_experts_per_tok": 0,
+                "decoder_sparse_step": 1,
+                "moe_intermediate_size": 0,
+                "shared_expert_intermediate_size": 0,
+                "norm_topk_prob": false,
+                "rope_parameters": {
+                    "rope_theta": 10000000.0,
+                    "partial_rotary_factor": 0.25,
+                    "rope_type": "default"
+                },
+                "layer_types": [
+                    "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                    "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                    "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                    "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                    "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                    "linear_attention", "linear_attention", "linear_attention", "full_attention",
+                    "linear_attention", "linear_attention", "linear_attention", "full_attention"
+                ]
+            }
+        }"#;
+
+        // Simulate the dispatcher's text_config extraction logic
+        let config_json: serde_json::Value = serde_json::from_str(nested_json).unwrap();
+        let text_config_str = if config_json.get("text_config").is_some()
+            && config_json.get("hidden_size").is_none()
+        {
+            serde_json::to_string(&config_json["text_config"]).unwrap()
+        } else {
+            nested_json.to_string()
+        };
+        let mut config: Qwen3NextConfig = serde_json::from_str(&text_config_str).unwrap();
+        config.apply_rope_parameters();
+
+        assert_eq!(config.hidden_size, 1536);
+        assert_eq!(config.num_hidden_layers, 28);
+        assert_eq!(config.rope_theta, 10_000_000.0);
+        assert_eq!(config.partial_rotary_factor, 0.25);
+        assert_eq!(config.layer_types.as_ref().unwrap().len(), 28);
+
+        // Verify layer type detection using the explicit array
+        assert!(config.is_linear_layer(0));
+        assert!(config.is_linear_layer(1));
+        assert!(config.is_linear_layer(2));
+        assert!(!config.is_linear_layer(3)); // full_attention
+        assert!(config.is_linear_layer(4));
+        assert!(!config.is_linear_layer(7)); // full_attention
     }
 }

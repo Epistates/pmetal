@@ -11,7 +11,7 @@ categories.workspace = true
 build = "build.rs"
 
 [features]
-default = []
+default = ["ane"]
 ane = ["pmetal-core/ane", "dep:rand", "dep:safetensors", "dep:memmap2"]
 
 [dependencies]

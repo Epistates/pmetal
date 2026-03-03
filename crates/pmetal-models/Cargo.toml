@@ -32,7 +32,7 @@ objc2-metal = { workspace = true }
 serial_test = "3.2"
 
 [features]
-default = []
+default = ["ane"]
 ane = ["pmetal-metal/ane", "pmetal-core/ane"]
 
 [lints]

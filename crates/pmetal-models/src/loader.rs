@@ -806,10 +806,27 @@ pub fn load_qwen3_next_weights(
 
     // Apply sanitized weights to model parameters
     let mut params = model.parameters_mut().flatten();
-    for (key, value) in weights {
-        if let Some(param) = params.get_mut(&*key) {
-            **param = value;
+    let mut matched = 0usize;
+    let mut unmatched = Vec::new();
+    for (key, value) in &weights {
+        if let Some(param) = params.get_mut(&**key) {
+            **param = value.clone();
+            matched += 1;
+        } else {
+            unmatched.push(key.clone());
         }
+    }
+    if !unmatched.is_empty() {
+        tracing::warn!(
+            "Qwen3Next weight loading: {}/{} unmatched weights: {:?}",
+            unmatched.len(),
+            matched + unmatched.len(),
+            &unmatched[..unmatched.len().min(20)]
+        );
+    } else {
+        tracing::info!(
+            "Qwen3Next weight loading: all {matched} weights matched successfully"
+        );
     }
     Ok(())
 }

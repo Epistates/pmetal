@@ -118,8 +118,33 @@ pub enum DatasetFormat {
     ShareGpt,
     /// OpenAI format: {"messages": [{"role": "user", "content": "..."}, ...]}
     OpenAi,
+    /// Reasoning format: {"problem": "...", "thinking": "...", "solution": "..."}
+    Reasoning,
     /// Auto-detect format from first line
     Auto,
+}
+
+/// Resolved dataset source — either a local path or HuggingFace dataset ID.
+#[derive(Debug, Clone)]
+pub enum DatasetSource {
+    /// Local file or directory path.
+    Local(PathBuf),
+    /// HuggingFace dataset ID (e.g., "nohurry/Opus-4.6-Reasoning-3000x-filtered").
+    HuggingFace(String),
+}
+
+/// Resolve a dataset source — either a local path or HuggingFace dataset ID.
+///
+/// HF IDs contain '/' but aren't existing file paths or relative paths.
+pub fn resolve_dataset_source(source: &str) -> DatasetSource {
+    let path = Path::new(source);
+    if path.exists() {
+        DatasetSource::Local(path.to_path_buf())
+    } else if source.contains('/') && !source.starts_with('.') && !source.starts_with('/') {
+        DatasetSource::HuggingFace(source.to_string())
+    } else {
+        DatasetSource::Local(path.to_path_buf()) // Let it error naturally on open
+    }
 }
 
 /// Dataset for training.
@@ -273,6 +298,11 @@ impl TrainingDataset {
         }
     }
 
+    /// Public wrapper for resolve_dataset_path, used by CLI for HF dataset resolution.
+    pub fn resolve_dataset_path_pub(path: &Path) -> Result<PathBuf> {
+        Self::resolve_dataset_path(path)
+    }
+
     /// Detect the format from a JSON line.
     fn detect_format(line: &str) -> Result<DatasetFormat> {
         let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
@@ -290,10 +320,12 @@ impl TrainingDataset {
             Ok(DatasetFormat::ShareGpt)
         } else if value.get("messages").is_some() {
             Ok(DatasetFormat::OpenAi)
+        } else if value.get("problem").is_some() || value.get("thinking").is_some() {
+            Ok(DatasetFormat::Reasoning)
         } else {
             Err(pmetal_core::PMetalError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                "Could not detect dataset format. Expected 'text', 'instruction', 'conversations', or 'messages' field.",
+                "Could not detect dataset format. Expected 'text', 'instruction', 'conversations', 'messages', or 'problem' field.",
             )))
         }
     }
@@ -458,6 +490,36 @@ impl TrainingDataset {
                         prompt,
                     })
                 }
+            }
+            DatasetFormat::Reasoning => {
+                let obj: serde_json::Value = serde_json::from_str(line).map_err(|e| {
+                    pmetal_core::PMetalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!("Line {}: {}", line_num + 1, e),
+                    ))
+                })?;
+
+                let problem = obj.get("problem").and_then(|v| v.as_str()).unwrap_or("");
+                let thinking = obj
+                    .get("thinking")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                let solution = obj
+                    .get("solution")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+
+                let prompt = problem.to_string();
+                let response = if thinking.is_empty() {
+                    solution.to_string()
+                } else {
+                    format!("<think>\n{}\n</think>\n\n{}", thinking, solution)
+                };
+
+                Ok(TextSample {
+                    text: format!("{}\n\n{}", prompt, response),
+                    prompt: Some(prompt),
+                })
             }
             DatasetFormat::Auto => {
                 // Should not reach here after detection

@@ -7,8 +7,8 @@
 //!   LoRA on q_proj, k_proj, v_proj, o_proj.
 //!   Note: q_proj outputs `n_heads * head_dim * 2` (for gated output split).
 //! - **GDN linear attention layers** (all other layers):
-//!   LoRA on in_proj_qkvz and out_proj only.
-//!   conv1d, in_proj_ba, dt_bias, a_log, and norm remain frozen.
+//!   LoRA on in_proj_qkv, in_proj_z, and out_proj.
+//!   conv1d, in_proj_b, in_proj_a, dt_bias, a_log, and norm remain frozen.
 //! - **Dense MLP layers**: LoRA on gate_proj, up_proj, down_proj.
 //! - **MoE layers**: LoRA on shared_expert's gate_proj, up_proj, down_proj only.
 //!   The 512 routed experts (switch_mlp) are frozen.
@@ -366,31 +366,35 @@ impl Qwen3NextLoraAttention {
 }
 
 // ============================================================================
-// Qwen3NextLoraGDN — Gated Delta Net with LoRA on in_proj_qkvz + out_proj
+// Qwen3NextLoraGDN — Gated Delta Net with LoRA on in_proj_qkv + in_proj_z + out_proj
 // ============================================================================
 
 /// LoRA-enabled Gated Delta Net linear attention.
 ///
 /// LoRA is applied to:
-/// - `in_proj_qkvz`: hidden -> key_dim*2 + value_dim*2
+/// - `in_proj_qkv`: hidden -> key_dim*2 + value_dim
+/// - `in_proj_z`: hidden -> value_dim
 /// - `out_proj`: value_dim -> hidden
 ///
 /// Frozen components (no LoRA):
 /// - `conv1d`: depthwise temporal convolution over q/k/v
-/// - `in_proj_ba`: projects beta and alpha scalars for the GDN kernel
+/// - `in_proj_b`: projects beta scalars for the GDN kernel
+/// - `in_proj_a`: projects alpha scalars for the GDN kernel
 /// - `dt_bias`, `a_log`: SSM state-space parameters
 /// - `norm`: per-head RMSNorm with optional silu gate
 #[derive(Debug)]
 pub struct Qwen3NextLoraGDN {
     // Frozen base components
     pub conv1d: nn::Conv1d,
-    pub in_proj_ba: nn::Linear,
+    pub in_proj_b: nn::Linear,
+    pub in_proj_a: nn::Linear,
     pub norm: Qwen3NextRMSNormGated,
     pub dt_bias: Param<Array>,
     pub a_log: Param<Array>,
 
     // LoRA projections
-    pub in_proj_qkvz: LoraLinear,
+    pub in_proj_qkv: LoraLinear,
+    pub in_proj_z: LoraLinear,
     pub out_proj: LoraLinear,
 
     // Scalar dims (derived from config)
@@ -418,24 +422,19 @@ impl Qwen3NextLoraGDN {
         let conv_dim = key_dim * 2 + value_dim;
 
         // Frozen conv1d: depthwise over [q, k, v] concatenated.
-        //
-        // The Conv1dBuilder always initializes weights as [out, kernel, in_channels].
-        // For a depthwise conv (groups = conv_dim), MLX expects weights of shape
-        // [out, kernel, in_channels / groups] = [conv_dim, kernel, 1].
-        // We build with in=1 so the initial weight has the correct shape, then
-        // rely on load_base_weights to replace it with the pretrained weights.
         let conv1d = nn::Conv1dBuilder::new(1, conv_dim, conv_kernel_size)
             .bias(false)
             .groups(conv_dim)
             .padding(0)
             .build()
             .map_err(LoraError::Mlx)?;
-        // Re-initialize weight to the correct depthwise shape [conv_dim, kernel, 1]
-        // (Conv1dBuilder already produces this shape when in_channels=1)
-        // — no additional fixup needed; shape is [conv_dim, kernel_size, 1].
 
-        // Frozen in_proj_ba: projects to [beta, a] per v-head
-        let in_proj_ba = nn::LinearBuilder::new(hidden_size, num_v_heads * 2)
+        // Frozen in_proj_b / in_proj_a: separate projections to per v-head scalars
+        let in_proj_b = nn::LinearBuilder::new(hidden_size, num_v_heads)
+            .bias(false)
+            .build()
+            .map_err(LoraError::Mlx)?;
+        let in_proj_a = nn::LinearBuilder::new(hidden_size, num_v_heads)
             .bias(false)
             .build()
             .map_err(LoraError::Mlx)?;
@@ -453,18 +452,25 @@ impl Qwen3NextLoraGDN {
         let norm =
             Qwen3NextRMSNormGated::new(head_v_dim, config.rms_norm_eps).map_err(LoraError::Mlx)?;
 
-        // LoRA projections
+        // LoRA projections — 3 separate linears matching HF weight format
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
-        let in_proj_rank = crate::effective_rank(lora_config, "in_proj_qkvz") as i32;
+        let in_proj_qkv_rank = crate::effective_rank(lora_config, "in_proj_qkv") as i32;
+        let in_proj_z_rank = crate::effective_rank(lora_config, "in_proj_z") as i32;
         let out_proj_rank = crate::effective_rank(lora_config, "out_proj") as i32;
 
-        // in_proj_qkvz: hidden -> key_dim*2 + value_dim*2
-        let qkvz_dim = key_dim * 2 + value_dim * 2;
-        let in_proj_qkvz = LoraLinear::new(
+        let in_proj_qkv = LoraLinear::new(
             hidden_size,
-            qkvz_dim,
-            in_proj_rank,
+            key_dim * 2 + value_dim,
+            in_proj_qkv_rank,
+            alpha,
+            use_rslora,
+            false,
+        )?;
+        let in_proj_z = LoraLinear::new(
+            hidden_size,
+            value_dim,
+            in_proj_z_rank,
             alpha,
             use_rslora,
             false,
@@ -480,11 +486,13 @@ impl Qwen3NextLoraGDN {
 
         Ok(Self {
             conv1d,
-            in_proj_ba,
+            in_proj_b,
+            in_proj_a,
             norm,
             dt_bias,
             a_log,
-            in_proj_qkvz,
+            in_proj_qkv,
+            in_proj_z,
             out_proj,
             hidden_size,
             num_v_heads,
@@ -498,61 +506,6 @@ impl Qwen3NextLoraGDN {
         })
     }
 
-    /// Reorder the combined qkvz projection into separate q, k, v, z tensors.
-    ///
-    /// Layout matches the base architecture's `fix_query_key_value_ordering`.
-    fn split_qkvz(
-        &self,
-        qkvz: &Array,
-        ba: &Array,
-    ) -> Result<(Array, Array, Array, Array, Array, Array), LoraError> {
-        let nk = self.num_k_heads;
-        let dn = self.head_k_dim;
-        let nv = self.num_v_heads;
-        let dv = self.head_v_dim;
-        let leading = &qkvz.shape()[..qkvz.ndim() - 1];
-
-        // Reshape to [..., nk, 2*dn + (nv/nk)*dv*2]
-        let mut shape = leading.to_vec();
-        shape.push(nk);
-        shape.push(-1);
-        let mixed = qkvz.reshape(&shape)?;
-
-        let mut ba_shape = ba.shape()[..ba.ndim() - 1].to_vec();
-        ba_shape.push(nk);
-        ba_shape.push(-1);
-        let mixed_ba = ba.reshape(&ba_shape)?;
-
-        // Split: q=[dn], k=[dn], v=[(nv/nk)*dv], z=[(nv/nk)*dv]
-        let split1 = dn;
-        let split2 = 2 * dn;
-        let split3 = 2 * dn + (nv / nk) * dv;
-
-        let q = mixed.index((.., .., .., ..split1));
-        let k = mixed.index((.., .., .., split1..split2));
-        let v_raw = mixed.index((.., .., .., split2..split3));
-        let z_raw = mixed.index((.., .., .., split3..));
-
-        // Split ba: b=[nv/nk], a=[nv/nk]
-        let b_split = nv / nk;
-        let b_raw = mixed_ba.index((.., .., .., ..b_split));
-        let a_raw = mixed_ba.index((.., .., .., b_split..));
-
-        // Reshape v, z to [B, S, nv, dv] and b, a to [B, S, nv]
-        let batch_seq = &leading[..2];
-        let mut v_shape = batch_seq.to_vec();
-        v_shape.extend_from_slice(&[nv, dv]);
-        let mut ba_out_shape = batch_seq.to_vec();
-        ba_out_shape.push(nv);
-
-        let v = v_raw.reshape(&v_shape)?;
-        let z = z_raw.reshape(&v_shape)?;
-        let b = b_raw.reshape(&ba_out_shape)?;
-        let a = a_raw.reshape(&ba_out_shape)?;
-
-        Ok((q, k, v, z, b, a))
-    }
-
     pub fn forward(
         &mut self,
         inputs: &Array,
@@ -563,12 +516,16 @@ impl Qwen3NextLoraGDN {
         let b = shape[0];
         let s = shape[1];
 
-        // LoRA'd projections
-        let qkvz_proj = self.in_proj_qkvz.forward(inputs)?;
-        // Frozen ba projection
-        let ba_proj = self.in_proj_ba.forward(inputs)?;
-
-        let (q, k, v, z, b_val, a) = self.split_qkvz(&qkvz_proj, &ba_proj)?;
+        // 4 separate projections matching HF weight format (qwen3_5.py:136-139)
+        let qkv = self.in_proj_qkv.forward(inputs)?;
+        let z = self.in_proj_z.forward(inputs)?.reshape(&[
+            b,
+            s,
+            self.num_v_heads,
+            self.head_v_dim,
+        ])?;
+        let b_val = Module::forward(&mut self.in_proj_b, inputs)?;
+        let a = Module::forward(&mut self.in_proj_a, inputs)?;
 
         // Convolution state management (from MambaCache)
         let conv_state = if let Some(ref c) = cache {
@@ -580,26 +537,16 @@ impl Qwen3NextLoraGDN {
             Array::zeros::<f32>(&[b, self.conv_kernel_size - 1, self.conv_dim]).unwrap()
         });
 
-        // Concatenate q, k, v along feature dim for conv input
-        let mixed_qkv = ops::concatenate_axis(
-            &[
-                &q.reshape(&[b, s, -1])?,
-                &k.reshape(&[b, s, -1])?,
-                &v.reshape(&[b, s, -1])?,
-            ],
-            -1,
-        )?;
-
-        // Apply attention mask to conv input if present
-        let mixed_qkv = if let Some(msk) = mask {
+        // Mask QKV BEFORE conv (Python line 149-150)
+        let qkv = if let Some(msk) = mask {
             let mask_expanded = msk.reshape(&[msk.dim(0), msk.dim(1), 1])?;
-            ops::r#where(&mask_expanded, &mixed_qkv, &Array::from_f32(0.0))?
+            ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))?
         } else {
-            mixed_qkv
+            qkv
         };
 
-        // Prepend conv state and run depthwise conv1d
-        let conv_input = ops::concatenate_axis(&[&conv_state, &mixed_qkv], 1)?;
+        // Prepend conv state and run depthwise conv1d + silu
+        let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1)?;
 
         // Update conv state in cache
         if let Some(c) = cache.as_deref_mut() {
@@ -610,7 +557,7 @@ impl Qwen3NextLoraGDN {
 
         let conv_out = nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?;
 
-        // Split conv output back into q, k, v
+        // Split conv output — simple positional split on last dim (Python line 156-163)
         let q_conv = conv_out.index((.., .., ..self.key_dim));
         let k_conv = conv_out.index((.., .., self.key_dim..self.key_dim * 2));
         let v_conv = conv_out.index((.., .., self.key_dim * 2..));
@@ -672,7 +619,9 @@ impl Qwen3NextLoraGDN {
     }
 
     pub fn num_trainable_params(&self) -> usize {
-        self.in_proj_qkvz.num_trainable_params() + self.out_proj.num_trainable_params()
+        self.in_proj_qkv.num_trainable_params()
+            + self.in_proj_z.num_trainable_params()
+            + self.out_proj.num_trainable_params()
     }
 }
 
@@ -931,35 +880,17 @@ impl Qwen3NextLoraFeedForward {
 }
 
 // ============================================================================
-// Mixer enum (Full attention or GDN)
-// ============================================================================
-
-#[derive(Debug)]
-pub enum Qwen3NextLoraMixer {
-    FullAttention(Qwen3NextLoraAttention),
-    GDN(Qwen3NextLoraGDN),
-}
-
-impl Qwen3NextLoraMixer {
-    pub fn num_trainable_params(&self) -> usize {
-        match self {
-            Self::FullAttention(m) => m.num_trainable_params(),
-            Self::GDN(m) => m.num_trainable_params(),
-        }
-    }
-}
-
-// ============================================================================
 // Qwen3NextLoraDecoderLayer — hybrid transformer block
 // ============================================================================
 
-/// Hybrid decoder layer dispatching to either full attention or GDN, and
-/// to either dense MLP or MoE, based on layer index.
+/// Hybrid decoder layer: uses `linear_attn` (GDN) OR `self_attn` (full attention)
+/// based on layer index. Option fields produce correct HF weight key names.
 #[derive(Debug)]
 pub struct Qwen3NextLoraDecoderLayer {
     pub is_linear: bool,
     pub is_moe: bool,
-    pub mixer: Qwen3NextLoraMixer,
+    pub linear_attn: Option<Qwen3NextLoraGDN>,
+    pub self_attn: Option<Qwen3NextLoraAttention>,
     pub mlp: Qwen3NextLoraFeedForward,
     /// Input layernorm (frozen — uses (1+w) pattern, applied by sanitize_weights).
     pub input_layernorm: nn::RmsNorm,
@@ -976,10 +907,15 @@ impl Qwen3NextLoraDecoderLayer {
         let is_linear = config.is_linear_layer(layer_idx);
         let is_moe = config.use_moe_at(layer_idx);
 
-        let mixer = if is_linear {
-            Qwen3NextLoraMixer::GDN(Qwen3NextLoraGDN::new(config, lora_config)?)
+        let linear_attn = if is_linear {
+            Some(Qwen3NextLoraGDN::new(config, lora_config)?)
         } else {
-            Qwen3NextLoraMixer::FullAttention(Qwen3NextLoraAttention::new(config, lora_config)?)
+            None
+        };
+        let self_attn = if !is_linear {
+            Some(Qwen3NextLoraAttention::new(config, lora_config)?)
+        } else {
+            None
         };
 
         let mlp = if is_moe {
@@ -1004,7 +940,8 @@ impl Qwen3NextLoraDecoderLayer {
         Ok(Self {
             is_linear,
             is_moe,
-            mixer,
+            linear_attn,
+            self_attn,
             mlp,
             input_layernorm,
             post_attention_layernorm,
@@ -1020,9 +957,16 @@ impl Qwen3NextLoraDecoderLayer {
     ) -> Result<Array, LoraError> {
         let normed = Module::forward(&mut self.input_layernorm, x)?;
 
-        let r = match &mut self.mixer {
-            Qwen3NextLoraMixer::GDN(gdn) => gdn.forward(&normed, mask, mamba_cache)?,
-            Qwen3NextLoraMixer::FullAttention(attn) => attn.forward(&normed, mask)?,
+        let r = if self.is_linear {
+            self.linear_attn
+                .as_mut()
+                .expect("linear_attn must be Some for linear layers")
+                .forward(&normed, mask, mamba_cache)?
+        } else {
+            self.self_attn
+                .as_mut()
+                .expect("self_attn must be Some for attention layers")
+                .forward(&normed, mask)?
         };
         let h = x.add(&r)?;
 
@@ -1040,11 +984,16 @@ impl Qwen3NextLoraDecoderLayer {
     ) -> Result<Array, LoraError> {
         let normed = Module::forward(&mut self.input_layernorm, x)?;
 
-        let r = match &mut self.mixer {
-            Qwen3NextLoraMixer::GDN(gdn) => gdn.forward(&normed, mask, mamba_cache)?,
-            Qwen3NextLoraMixer::FullAttention(attn) => {
-                attn.forward_with_cache(&normed, mask, kv_cache)?
-            }
+        let r = if self.is_linear {
+            self.linear_attn
+                .as_mut()
+                .expect("linear_attn must be Some for linear layers")
+                .forward(&normed, mask, mamba_cache)?
+        } else {
+            self.self_attn
+                .as_mut()
+                .expect("self_attn must be Some for attention layers")
+                .forward_with_cache(&normed, mask, kv_cache)?
         };
         let h = x.add(&r)?;
 
@@ -1053,7 +1002,14 @@ impl Qwen3NextLoraDecoderLayer {
     }
 
     pub fn num_trainable_params(&self) -> usize {
-        self.mixer.num_trainable_params() + self.mlp.num_trainable_params()
+        let mixer_params = if let Some(ref gdn) = self.linear_attn {
+            gdn.num_trainable_params()
+        } else if let Some(ref attn) = self.self_attn {
+            attn.num_trainable_params()
+        } else {
+            0
+        };
+        mixer_params + self.mlp.num_trainable_params()
     }
 }
 
@@ -1222,40 +1178,37 @@ impl Qwen3NextLoraForCausalLM {
         for (i, layer) in self.model.layers.iter().enumerate() {
             let prefix = format!("layers.{i}");
 
-            match &layer.mixer {
-                Qwen3NextLoraMixer::FullAttention(attn) => {
-                    for (proj_name, lora) in [
-                        ("q_proj", &attn.q_proj),
-                        ("k_proj", &attn.k_proj),
-                        ("v_proj", &attn.v_proj),
-                        ("o_proj", &attn.o_proj),
-                    ] {
-                        params.insert(
-                            Rc::from(format!("{prefix}.self_attn.{proj_name}.lora_a")),
-                            lora.lora_a.clone(),
-                        );
-                        params.insert(
-                            Rc::from(format!("{prefix}.self_attn.{proj_name}.lora_b")),
-                            lora.lora_b.clone(),
-                        );
-                    }
+            if let Some(ref attn) = layer.self_attn {
+                for (proj_name, lora) in [
+                    ("q_proj", &attn.q_proj),
+                    ("k_proj", &attn.k_proj),
+                    ("v_proj", &attn.v_proj),
+                    ("o_proj", &attn.o_proj),
+                ] {
+                    params.insert(
+                        Rc::from(format!("{prefix}.self_attn.{proj_name}.lora_a")),
+                        lora.lora_a.clone(),
+                    );
+                    params.insert(
+                        Rc::from(format!("{prefix}.self_attn.{proj_name}.lora_b")),
+                        lora.lora_b.clone(),
+                    );
                 }
-                Qwen3NextLoraMixer::GDN(gdn) => {
+            }
+
+            if let Some(ref gdn) = layer.linear_attn {
+                for (proj_name, lora) in [
+                    ("in_proj_qkv", &gdn.in_proj_qkv),
+                    ("in_proj_z", &gdn.in_proj_z),
+                    ("out_proj", &gdn.out_proj),
+                ] {
                     params.insert(
-                        Rc::from(format!("{prefix}.self_attn.in_proj_qkvz.lora_a")),
-                        gdn.in_proj_qkvz.lora_a.clone(),
+                        Rc::from(format!("{prefix}.linear_attn.{proj_name}.lora_a")),
+                        lora.lora_a.clone(),
                     );
                     params.insert(
-                        Rc::from(format!("{prefix}.self_attn.in_proj_qkvz.lora_b")),
-                        gdn.in_proj_qkvz.lora_b.clone(),
-                    );
-                    params.insert(
-                        Rc::from(format!("{prefix}.self_attn.out_proj.lora_a")),
-                        gdn.out_proj.lora_a.clone(),
-                    );
-                    params.insert(
-                        Rc::from(format!("{prefix}.self_attn.out_proj.lora_b")),
-                        gdn.out_proj.lora_b.clone(),
+                        Rc::from(format!("{prefix}.linear_attn.{proj_name}.lora_b")),
+                        lora.lora_b.clone(),
                     );
                 }
             }
@@ -1313,59 +1266,66 @@ impl Qwen3NextLoraForCausalLM {
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let prefix = format!("layers.{i}");
 
-            match &mut layer.mixer {
-                Qwen3NextLoraMixer::FullAttention(attn) => {
-                    set_param!(
-                        attn.q_proj.lora_a,
-                        format!("{prefix}.self_attn.q_proj.lora_a")
-                    );
-                    set_param!(
-                        attn.q_proj.lora_b,
-                        format!("{prefix}.self_attn.q_proj.lora_b")
-                    );
-                    set_param!(
-                        attn.k_proj.lora_a,
-                        format!("{prefix}.self_attn.k_proj.lora_a")
-                    );
-                    set_param!(
-                        attn.k_proj.lora_b,
-                        format!("{prefix}.self_attn.k_proj.lora_b")
-                    );
-                    set_param!(
-                        attn.v_proj.lora_a,
-                        format!("{prefix}.self_attn.v_proj.lora_a")
-                    );
-                    set_param!(
-                        attn.v_proj.lora_b,
-                        format!("{prefix}.self_attn.v_proj.lora_b")
-                    );
-                    set_param!(
-                        attn.o_proj.lora_a,
-                        format!("{prefix}.self_attn.o_proj.lora_a")
-                    );
-                    set_param!(
-                        attn.o_proj.lora_b,
-                        format!("{prefix}.self_attn.o_proj.lora_b")
-                    );
-                }
-                Qwen3NextLoraMixer::GDN(gdn) => {
-                    set_param!(
-                        gdn.in_proj_qkvz.lora_a,
-                        format!("{prefix}.self_attn.in_proj_qkvz.lora_a")
-                    );
-                    set_param!(
-                        gdn.in_proj_qkvz.lora_b,
-                        format!("{prefix}.self_attn.in_proj_qkvz.lora_b")
-                    );
-                    set_param!(
-                        gdn.out_proj.lora_a,
-                        format!("{prefix}.self_attn.out_proj.lora_a")
-                    );
-                    set_param!(
-                        gdn.out_proj.lora_b,
-                        format!("{prefix}.self_attn.out_proj.lora_b")
-                    );
-                }
+            if let Some(ref mut attn) = layer.self_attn {
+                set_param!(
+                    attn.q_proj.lora_a,
+                    format!("{prefix}.self_attn.q_proj.lora_a")
+                );
+                set_param!(
+                    attn.q_proj.lora_b,
+                    format!("{prefix}.self_attn.q_proj.lora_b")
+                );
+                set_param!(
+                    attn.k_proj.lora_a,
+                    format!("{prefix}.self_attn.k_proj.lora_a")
+                );
+                set_param!(
+                    attn.k_proj.lora_b,
+                    format!("{prefix}.self_attn.k_proj.lora_b")
+                );
+                set_param!(
+                    attn.v_proj.lora_a,
+                    format!("{prefix}.self_attn.v_proj.lora_a")
+                );
+                set_param!(
+                    attn.v_proj.lora_b,
+                    format!("{prefix}.self_attn.v_proj.lora_b")
+                );
+                set_param!(
+                    attn.o_proj.lora_a,
+                    format!("{prefix}.self_attn.o_proj.lora_a")
+                );
+                set_param!(
+                    attn.o_proj.lora_b,
+                    format!("{prefix}.self_attn.o_proj.lora_b")
+                );
+            }
+
+            if let Some(ref mut gdn) = layer.linear_attn {
+                set_param!(
+                    gdn.in_proj_qkv.lora_a,
+                    format!("{prefix}.linear_attn.in_proj_qkv.lora_a")
+                );
+                set_param!(
+                    gdn.in_proj_qkv.lora_b,
+                    format!("{prefix}.linear_attn.in_proj_qkv.lora_b")
+                );
+                set_param!(
+                    gdn.in_proj_z.lora_a,
+                    format!("{prefix}.linear_attn.in_proj_z.lora_a")
+                );
+                set_param!(
+                    gdn.in_proj_z.lora_b,
+                    format!("{prefix}.linear_attn.in_proj_z.lora_b")
+                );
+                set_param!(
+                    gdn.out_proj.lora_a,
+                    format!("{prefix}.linear_attn.out_proj.lora_a")
+                );
+                set_param!(
+                    gdn.out_proj.lora_b,
+                    format!("{prefix}.linear_attn.out_proj.lora_b")
+                );
             }
 
             match &mut layer.mlp {
@@ -1451,59 +1411,66 @@ impl Qwen3NextLoraForCausalLM {
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let prefix = format!("layers.{i}");
 
-            match &mut layer.mixer {
-                Qwen3NextLoraMixer::FullAttention(attn) => {
-                    load_param!(
-                        attn.q_proj.lora_a,
-                        format!("{prefix}.self_attn.q_proj.lora_a")
-                    );
-                    load_param!(
-                        attn.q_proj.lora_b,
-                        format!("{prefix}.self_attn.q_proj.lora_b")
-                    );
-                    load_param!(
-                        attn.k_proj.lora_a,
-                        format!("{prefix}.self_attn.k_proj.lora_a")
-                    );
-                    load_param!(
-                        attn.k_proj.lora_b,
-                        format!("{prefix}.self_attn.k_proj.lora_b")
-                    );
-                    load_param!(
-                        attn.v_proj.lora_a,
-                        format!("{prefix}.self_attn.v_proj.lora_a")
-                    );
-                    load_param!(
-                        attn.v_proj.lora_b,
-                        format!("{prefix}.self_attn.v_proj.lora_b")
-                    );
-                    load_param!(
-                        attn.o_proj.lora_a,
-                        format!("{prefix}.self_attn.o_proj.lora_a")
-                    );
-                    load_param!(
-                        attn.o_proj.lora_b,
-                        format!("{prefix}.self_attn.o_proj.lora_b")
-                    );
-                }
-                Qwen3NextLoraMixer::GDN(gdn) => {
-                    load_param!(
-                        gdn.in_proj_qkvz.lora_a,
-                        format!("{prefix}.self_attn.in_proj_qkvz.lora_a")
-                    );
-                    load_param!(
-                        gdn.in_proj_qkvz.lora_b,
-                        format!("{prefix}.self_attn.in_proj_qkvz.lora_b")
-                    );
-                    load_param!(
-                        gdn.out_proj.lora_a,
-                        format!("{prefix}.self_attn.out_proj.lora_a")
-                    );
-                    load_param!(
-                        gdn.out_proj.lora_b,
-                        format!("{prefix}.self_attn.out_proj.lora_b")
-                    );
-                }
+            if let Some(ref mut attn) = layer.self_attn {
+                load_param!(
+                    attn.q_proj.lora_a,
+                    format!("{prefix}.self_attn.q_proj.lora_a")
+                );
+                load_param!(
+                    attn.q_proj.lora_b,
+                    format!("{prefix}.self_attn.q_proj.lora_b")
+                );
+                load_param!(
+                    attn.k_proj.lora_a,
+                    format!("{prefix}.self_attn.k_proj.lora_a")
+                );
+                load_param!(
+                    attn.k_proj.lora_b,
+                    format!("{prefix}.self_attn.k_proj.lora_b")
+                );
+                load_param!(
+                    attn.v_proj.lora_a,
+                    format!("{prefix}.self_attn.v_proj.lora_a")
+                );
+                load_param!(
+                    attn.v_proj.lora_b,
+                    format!("{prefix}.self_attn.v_proj.lora_b")
+                );
+                load_param!(
+                    attn.o_proj.lora_a,
+                    format!("{prefix}.self_attn.o_proj.lora_a")
+                );
+                load_param!(
+                    attn.o_proj.lora_b,
+                    format!("{prefix}.self_attn.o_proj.lora_b")
+                );
+            }
+
+            if let Some(ref mut gdn) = layer.linear_attn {
+                load_param!(
+                    gdn.in_proj_qkv.lora_a,
+                    format!("{prefix}.linear_attn.in_proj_qkv.lora_a")
+                );
+                load_param!(
+                    gdn.in_proj_qkv.lora_b,
+                    format!("{prefix}.linear_attn.in_proj_qkv.lora_b")
+                );
+                load_param!(
+                    gdn.in_proj_z.lora_a,
+                    format!("{prefix}.linear_attn.in_proj_z.lora_a")
+                );
+                load_param!(
+                    gdn.in_proj_z.lora_b,
+                    format!("{prefix}.linear_attn.in_proj_z.lora_b")
+                );
+                load_param!(
+                    gdn.out_proj.lora_a,
+                    format!("{prefix}.linear_attn.out_proj.lora_a")
+                );
+                load_param!(
+                    gdn.out_proj.lora_b,
+                    format!("{prefix}.linear_attn.out_proj.lora_b")
+                );
             }
 
             match &mut layer.mlp {
@@ -1586,52 +1553,57 @@ impl Qwen3NextLoraForCausalLM {
                 layer.post_attention_layernorm.weight = Param::new(w.clone());
             }
 
-            // Mixer weights
-            match &mut layer.mixer {
-                Qwen3NextLoraMixer::FullAttention(attn) => {
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_proj.weight")) {
-                        attn.q_proj.weight = w.clone();
-                    }
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.k_proj.weight")) {
-                        attn.k_proj.weight = w.clone();
-                    }
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.v_proj.weight")) {
-                        attn.v_proj.weight = w.clone();
-                    }
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.o_proj.weight")) {
-                        attn.o_proj.weight = w.clone();
-                    }
-                    // Q/K norms (frozen)
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_norm.weight")) {
-                        attn.q_norm.weight = Param::new(w.clone());
-                    }
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.k_norm.weight")) {
-                        attn.k_norm.weight = Param::new(w.clone());
-                    }
+            // Full attention layers
+            if let Some(ref mut attn) = layer.self_attn {
+                if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_proj.weight")) {
+                    attn.q_proj.weight = w.clone();
                 }
-                Qwen3NextLoraMixer::GDN(gdn) => {
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.in_proj_qkvz.weight")) {
-                        gdn.in_proj_qkvz.weight = w.clone();
-                    }
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.in_proj_ba.weight")) {
-                        gdn.in_proj_ba.weight = Param::new(w.clone());
-                    }
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.out_proj.weight")) {
-                        gdn.out_proj.weight = w.clone();
-                    }
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.conv1d.weight")) {
-                        gdn.conv1d.weight = Param::new(w.clone());
-                    }
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.dt_bias")) {
-                        gdn.dt_bias = Param::new(w.clone());
-                    }
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.a_log")) {
-                        gdn.a_log = Param::new(w.clone());
-                    }
-                    // Gated RMSNorm weight
-                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.norm.weight")) {
-                        gdn.norm.weight = Param::new(w.clone());
-                    }
+                if let Some(w) = weights.get(&format!("{pfx}.self_attn.k_proj.weight")) {
+                    attn.k_proj.weight = w.clone();
+                }
+                if let Some(w) = weights.get(&format!("{pfx}.self_attn.v_proj.weight")) {
+                    attn.v_proj.weight = w.clone();
+                }
+                if let Some(w) = weights.get(&format!("{pfx}.self_attn.o_proj.weight")) {
+                    attn.o_proj.weight = w.clone();
+                }
+                if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_norm.weight")) {
+                    attn.q_norm.weight = Param::new(w.clone());
+                }
+                if let Some(w) = weights.get(&format!("{pfx}.self_attn.k_norm.weight")) {
+                    attn.k_norm.weight = Param::new(w.clone());
+                }
+            }
+
+            // GDN (linear attention) layers
+            if let Some(ref mut gdn) = layer.linear_attn {
+                if let Some(w) = weights.get(&format!("{pfx}.linear_attn.in_proj_qkv.weight")) {
+                    gdn.in_proj_qkv.weight = w.clone();
+                }
+                if let Some(w) = weights.get(&format!("{pfx}.linear_attn.in_proj_z.weight")) {
+                    gdn.in_proj_z.weight = w.clone();
+                }
+                if let Some(w) = weights.get(&format!("{pfx}.linear_attn.in_proj_b.weight")) {
+                    gdn.in_proj_b.weight = Param::new(w.clone());
+                }
+                if let Some(w) = weights.get(&format!("{pfx}.linear_attn.in_proj_a.weight")) {
+                    gdn.in_proj_a.weight = Param::new(w.clone());
+                }
+                if let Some(w) = weights.get(&format!("{pfx}.linear_attn.out_proj.weight")) {
+                    gdn.out_proj.weight = w.clone();
+                }
+                if let Some(w) = weights.get(&format!("{pfx}.linear_attn.conv1d.weight")) {
+                    gdn.conv1d.weight = Param::new(w.clone());
+                }
+                if let Some(w) = weights.get(&format!("{pfx}.linear_attn.dt_bias")) {
+                    gdn.dt_bias = Param::new(w.clone());
+                }
+                if let Some(w) = weights.get(&format!("{pfx}.linear_attn.a_log")) {
+                    gdn.a_log = Param::new(w.clone());
+                }
+                // Gated RMSNorm weight
+                if let Some(w) = weights.get(&format!("{pfx}.linear_attn.norm.weight")) {
+                    gdn.norm.weight = Param::new(w.clone());
                 }
             }
 
@@ -1766,39 +1738,41 @@ impl Qwen3NextLoraForCausalLM {
                 .as_ref()
                 .eval()?;
 
-            match &layer.mixer {
-                Qwen3NextLoraMixer::FullAttention(attn) => {
-                    attn.q_proj.weight.eval()?;
-                    attn.k_proj.weight.eval()?;
-                    attn.v_proj.weight.eval()?;
-                    attn.o_proj.weight.eval()?;
-                    attn.q_norm.weight.value.as_ref().eval()?;
-                    attn.k_norm.weight.value.as_ref().eval()?;
-                    // LoRA adapters
-                    attn.q_proj.lora_a.eval()?;
-                    attn.q_proj.lora_b.eval()?;
-                    attn.k_proj.lora_a.eval()?;
-                    attn.k_proj.lora_b.eval()?;
-                    attn.v_proj.lora_a.eval()?;
-                    attn.v_proj.lora_b.eval()?;
-                    attn.o_proj.lora_a.eval()?;
-                    attn.o_proj.lora_b.eval()?;
-                }
-                Qwen3NextLoraMixer::GDN(gdn) => {
-                    gdn.in_proj_qkvz.weight.eval()?;
-                    gdn.out_proj.weight.eval()?;
-                    // LoRA adapters
-                    gdn.in_proj_qkvz.lora_a.eval()?;
-                    gdn.in_proj_qkvz.lora_b.eval()?;
-                    gdn.out_proj.lora_a.eval()?;
-                    gdn.out_proj.lora_b.eval()?;
-                    // Frozen components
-                    gdn.in_proj_ba.weight.value.as_ref().eval()?;
-                    gdn.conv1d.weight.value.as_ref().eval()?;
-                    gdn.dt_bias.value.as_ref().eval()?;
-                    gdn.a_log.value.as_ref().eval()?;
-                    gdn.norm.weight.value.as_ref().eval()?;
-                }
+            if let Some(ref attn) = layer.self_attn {
+                attn.q_proj.weight.eval()?;
+                attn.k_proj.weight.eval()?;
+                attn.v_proj.weight.eval()?;
+                attn.o_proj.weight.eval()?;
+                attn.q_norm.weight.value.as_ref().eval()?;
+                attn.k_norm.weight.value.as_ref().eval()?;
+                // LoRA adapters
+                attn.q_proj.lora_a.eval()?;
+                attn.q_proj.lora_b.eval()?;
+                attn.k_proj.lora_a.eval()?;
+                attn.k_proj.lora_b.eval()?;
+                attn.v_proj.lora_a.eval()?;
+                attn.v_proj.lora_b.eval()?;
+                attn.o_proj.lora_a.eval()?;
+                attn.o_proj.lora_b.eval()?;
+            }
+            if let Some(ref gdn) = layer.linear_attn {
+                gdn.in_proj_qkv.weight.eval()?;
+                gdn.in_proj_z.weight.eval()?;
+                gdn.out_proj.weight.eval()?;
+                // LoRA adapters
+                gdn.in_proj_qkv.lora_a.eval()?;
+                gdn.in_proj_qkv.lora_b.eval()?;
+                gdn.in_proj_z.lora_a.eval()?;
+                gdn.in_proj_z.lora_b.eval()?;
+                gdn.out_proj.lora_a.eval()?;
+                gdn.out_proj.lora_b.eval()?;
+                // Frozen components
+                gdn.in_proj_b.weight.value.as_ref().eval()?;
+                gdn.in_proj_a.weight.value.as_ref().eval()?;
+                gdn.conv1d.weight.value.as_ref().eval()?;
+                gdn.dt_bias.value.as_ref().eval()?;
+                gdn.a_log.value.as_ref().eval()?;
+                gdn.norm.weight.value.as_ref().eval()?;
             }
 
             match &layer.mlp {
@@ -1845,17 +1819,16 @@ impl Qwen3NextLoraForCausalLM {
     /// Merge LoRA weights into base weights for deployment.
     pub fn merge_lora(&mut self) -> Result<(), LoraError> {
         for layer in &mut self.model.layers {
-            match &mut layer.mixer {
-                Qwen3NextLoraMixer::FullAttention(attn) => {
-                    attn.q_proj.merge()?;
-                    attn.k_proj.merge()?;
-                    attn.v_proj.merge()?;
-                    attn.o_proj.merge()?;
-                }
-                Qwen3NextLoraMixer::GDN(gdn) => {
-                    gdn.in_proj_qkvz.merge()?;
-                    gdn.out_proj.merge()?;
-                }
+            if let Some(ref mut attn) = layer.self_attn {
+                attn.q_proj.merge()?;
+                attn.k_proj.merge()?;
+                attn.v_proj.merge()?;
+                attn.o_proj.merge()?;
+            }
+            if let Some(ref mut gdn) = layer.linear_attn {
+                gdn.in_proj_qkv.merge()?;
+                gdn.in_proj_z.merge()?;
+                gdn.out_proj.merge()?;
             }
             match &mut layer.mlp {
                 Qwen3NextLoraFeedForward::Dense(mlp) => {
@@ -1899,48 +1872,63 @@ impl ModuleParameters for Qwen3NextLoraForCausalLM {
             let mut layer_map = HashMap::new();
 
             // --- Mixer parameters ---
-            let mut attn_map = HashMap::new();
-            match &layer.mixer {
-                Qwen3NextLoraMixer::FullAttention(attn) => {
-                    let mut q_params = HashMap::new();
-                    q_params.insert(Rc::from("lora_a"), NestedValue::Value(&attn.q_proj.lora_a));
-                    q_params.insert(Rc::from("lora_b"), NestedValue::Value(&attn.q_proj.lora_b));
-                    attn_map.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
+            if let Some(ref attn) = layer.self_attn {
+                let mut attn_map = HashMap::new();
 
-                    let mut k_params = HashMap::new();
-                    k_params.insert(Rc::from("lora_a"), NestedValue::Value(&attn.k_proj.lora_a));
-                    k_params.insert(Rc::from("lora_b"), NestedValue::Value(&attn.k_proj.lora_b));
-                    attn_map.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
+                let mut q_params = HashMap::new();
+                q_params.insert(Rc::from("lora_a"), NestedValue::Value(&attn.q_proj.lora_a));
+                q_params.insert(Rc::from("lora_b"), NestedValue::Value(&attn.q_proj.lora_b));
+                attn_map.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
 
-                    let mut v_params = HashMap::new();
-                    v_params.insert(Rc::from("lora_a"), NestedValue::Value(&attn.v_proj.lora_a));
-                    v_params.insert(Rc::from("lora_b"), NestedValue::Value(&attn.v_proj.lora_b));
-                    attn_map.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
+                let mut k_params = HashMap::new();
+                k_params.insert(Rc::from("lora_a"), NestedValue::Value(&attn.k_proj.lora_a));
+                k_params.insert(Rc::from("lora_b"), NestedValue::Value(&attn.k_proj.lora_b));
+                attn_map.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
 
-                    let mut o_params = HashMap::new();
-                    o_params.insert(Rc::from("lora_a"), NestedValue::Value(&attn.o_proj.lora_a));
-                    o_params.insert(Rc::from("lora_b"), NestedValue::Value(&attn.o_proj.lora_b));
-                    attn_map.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
-                }
-                Qwen3NextLoraMixer::GDN(gdn) => {
-                    let mut qkvz_params = HashMap::new();
-                    qkvz_params.insert(
-                        Rc::from("lora_a"),
-                        NestedValue::Value(&gdn.in_proj_qkvz.lora_a),
-                    );
-                    qkvz_params.insert(
-                        Rc::from("lora_b"),
-                        NestedValue::Value(&gdn.in_proj_qkvz.lora_b),
-                    );
-                    attn_map.insert(Rc::from("in_proj_qkvz"), NestedValue::Map(qkvz_params));
+                let mut v_params = HashMap::new();
+                v_params.insert(Rc::from("lora_a"), NestedValue::Value(&attn.v_proj.lora_a));
+                v_params.insert(Rc::from("lora_b"), NestedValue::Value(&attn.v_proj.lora_b));
+                attn_map.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
 
-                    let mut out_params = HashMap::new();
-                    out_params.insert(Rc::from("lora_a"), NestedValue::Value(&gdn.out_proj.lora_a));
-                    out_params.insert(Rc::from("lora_b"), NestedValue::Value(&gdn.out_proj.lora_b));
-                    attn_map.insert(Rc::from("out_proj"), NestedValue::Map(out_params));
-                }
+                let mut o_params = HashMap::new();
+                o_params.insert(Rc::from("lora_a"), NestedValue::Value(&attn.o_proj.lora_a));
+                o_params.insert(Rc::from("lora_b"), NestedValue::Value(&attn.o_proj.lora_b));
+                attn_map.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
+
+                layer_map.insert(Rc::from("self_attn"), NestedValue::Map(attn_map));
             }
-            layer_map.insert(Rc::from("self_attn"), NestedValue::Map(attn_map));
+            if let Some(ref gdn) = layer.linear_attn {
+                let mut gdn_map = HashMap::new();
+
+                let mut qkv_params = HashMap::new();
+                qkv_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&gdn.in_proj_qkv.lora_a),
+                );
+                qkv_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&gdn.in_proj_qkv.lora_b),
+                );
+                gdn_map.insert(Rc::from("in_proj_qkv"), NestedValue::Map(qkv_params));
+
+                let mut z_params = HashMap::new();
+                z_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&gdn.in_proj_z.lora_a),
+                );
+                z_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&gdn.in_proj_z.lora_b),
+                );
+                gdn_map.insert(Rc::from("in_proj_z"), NestedValue::Map(z_params));
+
+                let mut out_params = HashMap::new();
+                out_params.insert(Rc::from("lora_a"), NestedValue::Value(&gdn.out_proj.lora_a));
+                out_params.insert(Rc::from("lora_b"), NestedValue::Value(&gdn.out_proj.lora_b));
+                gdn_map.insert(Rc::from("out_proj"), NestedValue::Map(out_params));
+
+                layer_map.insert(Rc::from("linear_attn"), NestedValue::Map(gdn_map));
+            }
 
             // --- MLP parameters ---
             let mut mlp_map = HashMap::new();
@@ -2014,78 +2002,93 @@ impl ModuleParameters for Qwen3NextLoraForCausalLM {
             let layer_key: Rc<str> = Rc::from(format!("layers.{i}"));
             let mut layer_map = HashMap::new();
 
-            let mut attn_map = HashMap::new();
-            match &mut layer.mixer {
-                Qwen3NextLoraMixer::FullAttention(attn) => {
-                    let mut q_params = HashMap::new();
-                    q_params.insert(
-                        Rc::from("lora_a"),
-                        NestedValue::Value(&mut attn.q_proj.lora_a),
-                    );
-                    q_params.insert(
-                        Rc::from("lora_b"),
-                        NestedValue::Value(&mut attn.q_proj.lora_b),
-                    );
-                    attn_map.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
+            if let Some(ref mut attn) = layer.self_attn {
+                let mut attn_map = HashMap::new();
 
-                    let mut k_params = HashMap::new();
-                    k_params.insert(
-                        Rc::from("lora_a"),
-                        NestedValue::Value(&mut attn.k_proj.lora_a),
-                    );
-                    k_params.insert(
-                        Rc::from("lora_b"),
-                        NestedValue::Value(&mut attn.k_proj.lora_b),
-                    );
-                    attn_map.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
+                let mut q_params = HashMap::new();
+                q_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut attn.q_proj.lora_a),
+                );
+                q_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut attn.q_proj.lora_b),
+                );
+                attn_map.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
 
-                    let mut v_params = HashMap::new();
-                    v_params.insert(
-                        Rc::from("lora_a"),
-                        NestedValue::Value(&mut attn.v_proj.lora_a),
-                    );
-                    v_params.insert(
-                        Rc::from("lora_b"),
-                        NestedValue::Value(&mut attn.v_proj.lora_b),
-                    );
-                    attn_map.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
+                let mut k_params = HashMap::new();
+                k_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut attn.k_proj.lora_a),
+                );
+                k_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut attn.k_proj.lora_b),
+                );
+                attn_map.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
 
-                    let mut o_params = HashMap::new();
-                    o_params.insert(
-                        Rc::from("lora_a"),
-                        NestedValue::Value(&mut attn.o_proj.lora_a),
-                    );
-                    o_params.insert(
-                        Rc::from("lora_b"),
-                        NestedValue::Value(&mut attn.o_proj.lora_b),
-                    );
-                    attn_map.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
-                }
-                Qwen3NextLoraMixer::GDN(gdn) => {
-                    let mut qkvz_params = HashMap::new();
-                    qkvz_params.insert(
-                        Rc::from("lora_a"),
-                        NestedValue::Value(&mut gdn.in_proj_qkvz.lora_a),
-                    );
-                    qkvz_params.insert(
-                        Rc::from("lora_b"),
-                        NestedValue::Value(&mut gdn.in_proj_qkvz.lora_b),
-                    );
-                    attn_map.insert(Rc::from("in_proj_qkvz"), NestedValue::Map(qkvz_params));
+                let mut v_params = HashMap::new();
+                v_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut attn.v_proj.lora_a),
+                );
+                v_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut attn.v_proj.lora_b),
+                );
+                attn_map.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
 
-                    let mut out_params = HashMap::new();
-                    out_params.insert(
-                        Rc::from("lora_a"),
-                        NestedValue::Value(&mut gdn.out_proj.lora_a),
-                    );
-                    out_params.insert(
-                        Rc::from("lora_b"),
-                        NestedValue::Value(&mut gdn.out_proj.lora_b),
-                    );
-                    attn_map.insert(Rc::from("out_proj"), NestedValue::Map(out_params));
-                }
+                let mut o_params = HashMap::new();
+                o_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut attn.o_proj.lora_a),
+                );
+                o_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut attn.o_proj.lora_b),
+                );
+                attn_map.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
+
+                layer_map.insert(Rc::from("self_attn"), NestedValue::Map(attn_map));
             }
-            layer_map.insert(Rc::from("self_attn"), NestedValue::Map(attn_map));
+            if let Some(ref mut gdn) = layer.linear_attn {
+                let mut gdn_map = HashMap::new();
+
+                let mut qkv_params = HashMap::new();
+                qkv_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut gdn.in_proj_qkv.lora_a),
+                );
+                qkv_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut gdn.in_proj_qkv.lora_b),
+                );
+                gdn_map.insert(Rc::from("in_proj_qkv"), NestedValue::Map(qkv_params));
+
+                let mut z_params = HashMap::new();
+                z_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut gdn.in_proj_z.lora_a),
+                );
+                z_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut gdn.in_proj_z.lora_b),
+                );
+                gdn_map.insert(Rc::from("in_proj_z"), NestedValue::Map(z_params));
+
+                let mut out_params = HashMap::new();
+                out_params.insert(
+                    Rc::from("lora_a"),
+                    NestedValue::Value(&mut gdn.out_proj.lora_a),
+                );
+                out_params.insert(
+                    Rc::from("lora_b"),
+                    NestedValue::Value(&mut gdn.out_proj.lora_b),
+                );
+                gdn_map.insert(Rc::from("out_proj"), NestedValue::Map(out_params));
+
+                layer_map.insert(Rc::from("linear_attn"), NestedValue::Map(gdn_map));
+            }
 
             let mut mlp_map = HashMap::new();
             match &mut layer.mlp {
@@ -2315,7 +2318,8 @@ mod tests {
                 "k_proj".to_string(),
                 "v_proj".to_string(),
                 "o_proj".to_string(),
-                "in_proj_qkvz".to_string(),
+                "in_proj_qkv".to_string(),
+                "in_proj_z".to_string(),
                 "out_proj".to_string(),
                 "gate_proj".to_string(),
                 "up_proj".to_string(),
@@ -2350,8 +2354,8 @@ mod tests {
         // Layers 0, 1, 2 are linear (GDN), layer 3 is full attention
         // (full_attention_interval = 4)
         assert!(
-            params.contains_key(&Rc::from("layers.0.self_attn.in_proj_qkvz.lora_a")),
-            "GDN layer should have in_proj_qkvz.lora_a"
+            params.contains_key(&Rc::from("layers.0.linear_attn.in_proj_qkv.lora_a")),
+            "GDN layer should have linear_attn.in_proj_qkv.lora_a"
         );
         assert!(
             params.contains_key(&Rc::from("layers.3.self_attn.q_proj.lora_a")),
