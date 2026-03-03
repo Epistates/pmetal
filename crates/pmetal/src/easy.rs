@@ -609,6 +609,25 @@ impl InferBuilder {
         let n_kv_heads =
             extract_usize_optional(&config_text, "num_key_value_heads").unwrap_or(n_heads);
 
+        // Parse rope_theta and rms_norm_eps from config.json
+        fn extract_float(json: &str, key: &str) -> Option<f32> {
+            let needle = format!("\"{key}\"");
+            let pos = json.find(&needle)?;
+            let after_key = &json[pos + needle.len()..];
+            // Skip to colon, then whitespace
+            let after_colon = after_key.find(':').map(|i| &after_key[i + 1..])?;
+            let trimmed = after_colon.trim_start();
+            // Extract the numeric value (may contain digits, '.', 'e', 'E', '+', '-')
+            let end = trimmed
+                .find(|c: char| {
+                    !c.is_ascii_digit() && c != '.' && c != 'e' && c != 'E' && c != '+' && c != '-'
+                })
+                .unwrap_or(trimmed.len());
+            trimmed[..end].parse::<f64>().ok().map(|v| v as f32)
+        }
+        let rope_theta = extract_float(&config_text, "rope_theta").unwrap_or(1_000_000.0);
+        let rms_norm_eps = extract_float(&config_text, "rms_norm_eps").unwrap_or(1e-6);
+
         let ane_config = AneInferenceConfig {
             dim,
             hidden_dim,
@@ -621,10 +640,13 @@ impl InferBuilder {
             top_k: self.top_k,
             max_tokens: self.max_tokens,
             eos_token_id: tokenizer.eos_token_id(),
+            rope_theta,
+            rms_norm_eps,
             ..Default::default()
         };
 
-        let mut engine = AneInferenceEngine::new(ane_config);
+        let mut engine = AneInferenceEngine::new(ane_config)
+            .map_err(|e| PMetalError::ModelLoad(format!("ANE engine init failed: {e}")))?;
 
         // Try SafeTensors first, fall back to model.bin
         let safetensors_single = model_path.join("model.safetensors");

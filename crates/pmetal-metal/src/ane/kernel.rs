@@ -30,6 +30,10 @@ pub struct TransformerKernelConfig {
     pub head_dim: usize,
     /// Sequence length (e.g., 256).
     pub seq_len: usize,
+    /// RoPE base frequency.
+    pub rope_theta: f32,
+    /// RMSNorm epsilon.
+    pub rms_norm_eps: f32,
 }
 
 impl TransformerKernelConfig {
@@ -244,7 +248,7 @@ pub fn build_causal_mask(seq_len: usize) -> Vec<u8> {
 /// Emit inline RMSNorm into a MIL program.
 ///
 /// Reads from `x`, writes normalized output to `xn`.
-fn emit_rmsnorm(p: &mut MilProgram, d: usize, s: usize, inv_d: f32) {
+fn emit_rmsnorm(p: &mut MilProgram, d: usize, s: usize, inv_d: f32, weight_path: &str) {
     p.emit_mul("sq", &[1, d, 1, s], "x", "x");
     p.emit_tensor_const("rax", &[1], "int32", "[1]");
     p.emit_scalar_const("kd", "bool", "true");
@@ -256,8 +260,210 @@ fn emit_rmsnorm(p: &mut MilProgram, d: usize, s: usize, inv_d: f32) {
     p.emit_scalar_const("nhalf", "fp16", "-0.5");
     p.emit_pow("rrms", &[1, 1, 1, s], "ss3", "nhalf");
     p.emit_mul("xr", &[1, d, 1, s], "x", "rrms");
-    p.emit_weight_const("rw", &[1, d, 1, 1], "@model_path/weights/rms1.bin");
+    p.emit_weight_const("rw", &[1, d, 1, 1], weight_path);
     p.emit_mul("xn", &[1, d, 1, s], "xr", "rw");
+}
+
+/// Build precomputed cos/sin RoPE tables as weight blobs.
+///
+/// Returns `(cos_blob, sin_blob)` each of shape `[1, 1, half_dim, seq_len]`.
+/// Uses non-traditional split-half RoPE frequencies:
+/// `inv_freq[d] = 1 / rope_theta^(2d / head_dim)` for `d in 0..half_dim`.
+fn build_rope_tables(head_dim: usize, seq_len: usize, rope_theta: f32) -> (Vec<u8>, Vec<u8>) {
+    let half_dim = head_dim / 2;
+    let n = half_dim * seq_len;
+    let mut cos_data = vec![0.0f32; n];
+    let mut sin_data = vec![0.0f32; n];
+
+    for d in 0..half_dim {
+        let inv_freq = 1.0 / rope_theta.powf(2.0 * d as f32 / head_dim as f32);
+        for t in 0..seq_len {
+            let angle = t as f32 * inv_freq;
+            // Layout: [half_dim, seq_len] channel-first
+            cos_data[d * seq_len + t] = angle.cos();
+            sin_data[d * seq_len + t] = angle.sin();
+        }
+    }
+
+    (
+        WeightBlob::from_f32(&cos_data, half_dim, seq_len),
+        WeightBlob::from_f32(&sin_data, half_dim, seq_len),
+    )
+}
+
+/// Emit MIL for per-head RMSNorm on a `[1, n_heads, head_dim, seq]` tensor.
+///
+/// Applies independent RMSNorm per head: reduce along axis 2 (head_dim),
+/// compute rsqrt, scale by broadcast weight `[1, 1, head_dim, 1]`.
+#[allow(clippy::too_many_arguments)]
+fn emit_per_head_rmsnorm(
+    p: &mut MilProgram,
+    input: &str,
+    output: &str,
+    n_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    eps: f32,
+    weight_path: &str,
+) {
+    let pfx = p.next_var("phrn");
+
+    // sq = x * x → [1, n_heads, head_dim, seq]
+    let sq = p.next_var("sq");
+    p.emit_mul(&sq, &[1, n_heads, head_dim, seq_len], input, input);
+
+    // reduce_sum along axis 2 (head_dim) → [1, n_heads, 1, seq]
+    let rax = p.next_var("rax");
+    p.emit_tensor_const(&rax, &[1], "int32", "[2]");
+    let kd = p.next_var("kd");
+    p.emit_scalar_const(&kd, "bool", "true");
+    let ss = p.next_var("ss");
+    p.emit_reduce_sum(&ss, &[1, n_heads, 1, seq_len], &sq, &rax, &kd);
+
+    // Multiply by 1/head_dim
+    let inv_hd = p.next_var("inv");
+    let inv_val = 1.0 / head_dim as f32;
+    p.emit_scalar_const(&inv_hd, "fp16", &format!("{inv_val}"));
+    let ss2 = p.next_var("ss2");
+    p.emit_mul(&ss2, &[1, n_heads, 1, seq_len], &ss, &inv_hd);
+
+    // Add eps
+    let eps_c = p.next_var("eps");
+    p.emit_scalar_const(&eps_c, "fp16", &format!("{eps}"));
+    let ss3 = p.next_var("ss3");
+    p.emit_add(&ss3, &[1, n_heads, 1, seq_len], &ss2, &eps_c);
+
+    // rsqrt = pow(ss3, -0.5)
+    let nhalf = p.next_var("nh");
+    p.emit_scalar_const(&nhalf, "fp16", "-0.5");
+    let rsqrt = p.next_var("rsq");
+    p.emit_pow(&rsqrt, &[1, n_heads, 1, seq_len], &ss3, &nhalf);
+
+    // xr = input * rsqrt (broadcasts over head_dim)
+    let xr = p.next_var("xr");
+    p.emit_mul(&xr, &[1, n_heads, head_dim, seq_len], input, &rsqrt);
+
+    // Load weight [1, 1, head_dim, 1] and multiply (broadcasts over heads and seq)
+    let rw = format!("{pfx}_rw");
+    p.emit_weight_const(&rw, &[1, 1, head_dim, 1], weight_path);
+    p.emit_mul(output, &[1, n_heads, head_dim, seq_len], &xr, &rw);
+}
+
+/// Emit MIL for non-traditional split-half RoPE on `[1, n_heads, head_dim, seq]`.
+///
+/// Splits the head_dim axis into first/second halves, applies rotation using
+/// precomputed cos/sin tables of shape `[1, 1, half_dim, seq]`.
+#[allow(clippy::too_many_arguments)]
+fn emit_rope(
+    p: &mut MilProgram,
+    input: &str,
+    output: &str,
+    n_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    cos_path: &str,
+    sin_path: &str,
+) {
+    let half_dim = head_dim / 2;
+    let pfx = p.next_var("rope");
+
+    // Load cos, sin tables: [1, 1, half_dim, seq]
+    let cos_w = format!("{pfx}_cos");
+    p.emit_weight_const(&cos_w, &[1, 1, half_dim, seq_len], cos_path);
+    let sin_w = format!("{pfx}_sin");
+    p.emit_weight_const(&sin_w, &[1, 1, half_dim, seq_len], sin_path);
+
+    // Slice first half: begin=[0,0,0,0], size=[1,n_heads,half_dim,seq]
+    let b0 = format!("{pfx}_b0");
+    p.emit_tensor_const(&b0, &[4], "int32", "[0,0,0,0]");
+    let sz_h = format!("{pfx}_szh");
+    p.emit_tensor_const(
+        &sz_h,
+        &[4],
+        "int32",
+        &format!("[1,{n_heads},{half_dim},{seq_len}]"),
+    );
+    let x_first = format!("{pfx}_xf");
+    p.emit_slice_by_size(
+        &x_first,
+        &[1, n_heads, half_dim, seq_len],
+        input,
+        &b0,
+        &sz_h,
+    );
+
+    // Slice second half: begin=[0,0,half_dim,0]
+    let b1 = format!("{pfx}_b1");
+    p.emit_tensor_const(&b1, &[4], "int32", &format!("[0,0,{half_dim},0]"));
+    let x_second = format!("{pfx}_xs");
+    p.emit_slice_by_size(
+        &x_second,
+        &[1, n_heads, half_dim, seq_len],
+        input,
+        &b1,
+        &sz_h,
+    );
+
+    // rot_first = x_first * cos - x_second * sin
+    let fc = format!("{pfx}_fc");
+    p.emit_mul(&fc, &[1, n_heads, half_dim, seq_len], &x_first, &cos_w);
+    let ss = format!("{pfx}_ss");
+    p.emit_mul(&ss, &[1, n_heads, half_dim, seq_len], &x_second, &sin_w);
+    let rot_first = format!("{pfx}_rf");
+    p.emit_sub(&rot_first, &[1, n_heads, half_dim, seq_len], &fc, &ss);
+
+    // rot_second = x_first * sin + x_second * cos
+    let fs = format!("{pfx}_fs");
+    p.emit_mul(&fs, &[1, n_heads, half_dim, seq_len], &x_first, &sin_w);
+    let sc = format!("{pfx}_sc");
+    p.emit_mul(&sc, &[1, n_heads, half_dim, seq_len], &x_second, &cos_w);
+    let rot_second = format!("{pfx}_rs");
+    p.emit_add(&rot_second, &[1, n_heads, half_dim, seq_len], &fs, &sc);
+
+    // Concat halves back on axis 2
+    let cax = format!("{pfx}_cax");
+    p.emit_scalar_const(&cax, "int32", "2");
+    let cid = format!("{pfx}_cid");
+    p.emit_scalar_const(&cid, "bool", "false");
+    p.emit_concat(
+        output,
+        &[1, n_heads, head_dim, seq_len],
+        &cax,
+        &cid,
+        &[&rot_first, &rot_second],
+    );
+}
+
+/// Validate the kernel configuration.
+pub fn validate_config(cfg: &TransformerKernelConfig) -> crate::error::Result<()> {
+    use crate::error::MetalError;
+    if cfg.n_heads == 0 {
+        return Err(MetalError::InvalidConfig("n_heads must be > 0".into()));
+    }
+    if cfg.n_kv_heads == 0 {
+        return Err(MetalError::InvalidConfig("n_kv_heads must be > 0".into()));
+    }
+    if cfg.n_kv_heads > cfg.n_heads {
+        return Err(MetalError::InvalidConfig(
+            "n_kv_heads must be <= n_heads".into(),
+        ));
+    }
+    if cfg.n_heads % cfg.n_kv_heads != 0 {
+        return Err(MetalError::InvalidConfig(
+            "n_heads must be divisible by n_kv_heads".into(),
+        ));
+    }
+    if cfg.dim == 0 || cfg.dim % cfg.n_heads != 0 {
+        return Err(MetalError::InvalidConfig(
+            "dim must be > 0 and divisible by n_heads".into(),
+        ));
+    }
+    if cfg.head_dim != cfg.dim / cfg.n_heads {
+        return Err(MetalError::InvalidConfig(
+            "head_dim must equal dim / n_heads".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Generate the SDPA forward kernel with feature taps.
@@ -287,7 +493,7 @@ pub fn gen_sdpa_fwd_taps(
     let mut p = MilProgram::new(d, s);
 
     // RMSNorm inline
-    emit_rmsnorm(&mut p, d, s, inv_d);
+    emit_rmsnorm(&mut p, d, s, inv_d, "@model_path/weights/rms1.bin");
 
     // QKV convolutions
     p.emit_conv_constants();
@@ -409,7 +615,7 @@ pub fn gen_sdpa_fwd(
     let mut p = MilProgram::new(d, s);
 
     // RMSNorm inline
-    emit_rmsnorm(&mut p, d, s, inv_d);
+    emit_rmsnorm(&mut p, d, s, inv_d, "@model_path/weights/rms1.bin");
 
     // QKV convolutions
     p.emit_conv_constants();
@@ -496,9 +702,13 @@ pub fn gen_sdpa_fwd(
 /// Generate the SDPA forward kernel with KV cache output (prefill).
 ///
 /// Input: `[1, DIM, 1, SEQ]`
-/// Output: `[1, DIM + 2*KV_DIM, 1, SEQ]` = concat(o_out, K_proj, V_proj)
+/// Output: `[1, DIM + 2*KV_DIM, 1, SEQ]` = concat(o_out, K_roped, V_proj)
 ///
-/// Weights: rms1, Wq, Wk, Wv, Wo, causal mask
+/// Includes per-head QK-norm and RoPE before attention computation.
+/// The output K is post-RoPE so the CPU decode path can use it directly.
+///
+/// Weights: rms1, Wq, Wk, Wv, Wo, causal mask, q_norm, k_norm, cos, sin
+#[allow(clippy::too_many_arguments)]
 pub fn gen_sdpa_fwd_kv(
     cfg: &TransformerKernelConfig,
     rms_att: &[f32],
@@ -506,6 +716,8 @@ pub fn gen_sdpa_fwd_kv(
     wk: &[f32],
     wv: &[f32],
     wo: &[f32],
+    q_norm: &[f32],
+    k_norm: &[f32],
 ) -> KernelOutput {
     let d = cfg.dim;
     let s = cfg.seq_len;
@@ -520,7 +732,7 @@ pub fn gen_sdpa_fwd_kv(
     let mut p = MilProgram::new(d, s);
 
     // RMSNorm inline
-    emit_rmsnorm(&mut p, d, s, inv_d);
+    emit_rmsnorm(&mut p, d, s, inv_d, "@model_path/weights/rms1.bin");
 
     // QKV convolutions
     p.emit_conv_constants();
@@ -532,16 +744,63 @@ pub fn gen_sdpa_fwd_kv(
     p.emit_conv("kf", &[1, kv_d, 1, s], "Wk", "xn");
     p.emit_conv("vf", &[1, kv_d, 1, s], "Wv", "xn");
 
-    // Reshape and transpose for multi-head attention
+    // Reshape Q to [1, h, hd, s], K to [1, kv_h, hd, s]
     p.emit_tensor_const("qsh", &[4], "int32", &format!("[1,{h},{hd},{s}]"));
-    p.emit_tensor_const("pm", &[4], "int32", "[0,1,3,2]");
     p.emit_reshape("q4", &[1, h, hd, s], "qsh", "qf");
-    p.emit_transpose("q", &[1, h, s, hd], "pm", "q4");
 
-    // K, V: reshape to [1, kv_h, hd, S] then transpose, then tile if GQA
     p.emit_tensor_const("kvsh", &[4], "int32", &format!("[1,{kv_h},{hd},{s}]"));
     p.emit_reshape("k4", &[1, kv_h, hd, s], "kvsh", "kf");
-    p.emit_transpose("k0", &[1, kv_h, s, hd], "pm", "k4");
+
+    // Per-head QK-norm on Q and K (in [1, heads, head_dim, seq] layout)
+    emit_per_head_rmsnorm(
+        &mut p,
+        "q4",
+        "qn",
+        h,
+        hd,
+        s,
+        cfg.rms_norm_eps,
+        "@model_path/weights/qnorm.bin",
+    );
+    emit_per_head_rmsnorm(
+        &mut p,
+        "k4",
+        "kn",
+        kv_h,
+        hd,
+        s,
+        cfg.rms_norm_eps,
+        "@model_path/weights/knorm.bin",
+    );
+
+    // RoPE on Q and K (both in [1, heads, head_dim, seq] layout)
+    emit_rope(
+        &mut p,
+        "qn",
+        "qr",
+        h,
+        hd,
+        s,
+        "@model_path/weights/cos.bin",
+        "@model_path/weights/sin.bin",
+    );
+    emit_rope(
+        &mut p,
+        "kn",
+        "kr",
+        kv_h,
+        hd,
+        s,
+        "@model_path/weights/cos.bin",
+        "@model_path/weights/sin.bin",
+    );
+
+    // Transpose Q to [1, h, s, hd], K to [1, kv_h, s, hd]
+    p.emit_tensor_const("pm", &[4], "int32", "[0,1,3,2]");
+    p.emit_transpose("q", &[1, h, s, hd], "pm", "qr");
+    p.emit_transpose("k0", &[1, kv_h, s, hd], "pm", "kr");
+
+    // V: reshape and transpose (no QK-norm or RoPE on V)
     p.emit_reshape("v4", &[1, kv_h, hd, s], "kvsh", "vf");
     p.emit_transpose("v0", &[1, kv_h, s, hd], "pm", "v4");
 
@@ -575,11 +834,22 @@ pub fn gen_sdpa_fwd_kv(
     p.emit_reshape("af", &[1, d, 1, s], "os", "at");
     p.emit_conv("oo", &[1, d, 1, s], "Wo", "af");
 
-    // 3-way concat: (oo, kf, vf) for KV cache extraction
+    // Output post-RoPE K (not raw kf) for the KV cache:
+    // Reshape kr [1, kv_h, hd, s] back to [1, kv_d, 1, s]
+    p.emit_tensor_const("kvfs", &[4], "int32", &format!("[1,{kv_d},1,{s}]"));
+    p.emit_reshape("kr_flat", &[1, kv_d, 1, s], "kvfs", "kr");
+
+    // 3-way concat: (oo, kr_flat, vf) — post-RoPE K, raw V
     let out_ch = d + 2 * kv_d;
     p.emit_scalar_const("cax", "int32", "1");
     p.emit_scalar_const("cid", "bool", "false");
-    p.emit_concat("out", &[1, out_ch, 1, s], "cax", "cid", &["oo", "kf", "vf"]);
+    p.emit_concat(
+        "out",
+        &[1, out_ch, 1, s],
+        "cax",
+        "cid",
+        &["oo", "kr_flat", "vf"],
+    );
 
     let mil_text = p.finalize("out");
 
@@ -600,6 +870,17 @@ pub fn gen_sdpa_fwd_kv(
     );
     weights.add("@model_path/weights/wo.bin", WeightBlob::from_f32(wo, d, d));
     weights.add("@model_path/weights/mask.bin", build_causal_mask(s));
+    weights.add(
+        "@model_path/weights/qnorm.bin",
+        WeightBlob::from_rms_weights(q_norm),
+    );
+    weights.add(
+        "@model_path/weights/knorm.bin",
+        WeightBlob::from_rms_weights(k_norm),
+    );
+    let (cos_blob, sin_blob) = build_rope_tables(hd, s, cfg.rope_theta);
+    weights.add("@model_path/weights/cos.bin", cos_blob);
+    weights.add("@model_path/weights/sin.bin", sin_blob);
 
     KernelOutput {
         mil_text,
@@ -1096,6 +1377,8 @@ mod tests {
             n_kv_heads: 12,
             head_dim: 64,
             seq_len: 256,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
         }
     }
 
@@ -1255,12 +1538,16 @@ mod tests {
     fn test_sdpa_fwd_kv_generates_valid_mil() {
         let cfg = test_config();
         let d = cfg.dim;
+        let hd = cfg.head_dim;
         let kv_d = cfg.kv_dim();
         let zeros_d = vec![0.0f32; d];
         let zeros_dd = vec![0.0f32; d * d];
         let zeros_kvd = vec![0.0f32; kv_d * d];
+        let ones_hd = vec![1.0f32; hd];
 
-        let output = gen_sdpa_fwd_kv(&cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd);
+        let output = gen_sdpa_fwd_kv(
+            &cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd, &ones_hd, &ones_hd,
+        );
 
         assert!(output.mil_text.contains("program(1.3)"));
         assert!(output.mil_text.contains("concat"));
@@ -1269,7 +1556,8 @@ mod tests {
         assert_eq!(output.input_bytes, d * 256 * 2);
         let expected_out_ch = d + 2 * kv_d;
         assert_eq!(output.output_bytes, expected_out_ch * 256 * 2);
-        assert_eq!(output.weights.entries.len(), 6);
+        // 10 weights: rms1, wq, wk, wv, wo, mask, qnorm, knorm, cos, sin
+        assert_eq!(output.weights.entries.len(), 10);
     }
 
     #[test]
@@ -1282,16 +1570,22 @@ mod tests {
             n_kv_heads: 4,
             head_dim: 64,
             seq_len: 256,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
         };
         let d = cfg.dim;
+        let hd = cfg.head_dim;
         let kv_d = cfg.kv_dim(); // 4 * 64 = 256
         assert_eq!(kv_d, 256);
 
         let zeros_d = vec![0.0f32; d];
         let zeros_dd = vec![0.0f32; d * d];
         let zeros_kvd = vec![0.0f32; kv_d * d];
+        let ones_hd = vec![1.0f32; hd];
 
-        let output = gen_sdpa_fwd_kv(&cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd);
+        let output = gen_sdpa_fwd_kv(
+            &cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd, &ones_hd, &ones_hd,
+        );
 
         assert!(output.mil_text.contains("tile"));
         let expected_out_ch = d + 2 * kv_d; // 768 + 512 = 1280
@@ -1308,6 +1602,8 @@ mod tests {
             n_kv_heads: 4,
             head_dim: 64,
             seq_len: 256,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
         };
         let d = cfg.dim;
         let kv_d = cfg.kv_dim();

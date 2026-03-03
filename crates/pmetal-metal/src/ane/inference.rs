@@ -54,6 +54,10 @@ pub struct AneInferenceConfig {
     pub max_tokens: usize,
     /// EOS token ID for early stopping.
     pub eos_token_id: Option<u32>,
+    /// RoPE base frequency (Qwen3 default: 1_000_000.0).
+    pub rope_theta: f32,
+    /// RMSNorm epsilon (Qwen3 default: 1e-6).
+    pub rms_norm_eps: f32,
 }
 
 impl Default for AneInferenceConfig {
@@ -71,6 +75,8 @@ impl Default for AneInferenceConfig {
             top_k: 0,
             max_tokens: 128,
             eos_token_id: None,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
         }
     }
 }
@@ -86,6 +92,10 @@ struct InferenceLayerWeights {
     w3: Vec<f32>,
     rms_att: Vec<f32>,
     rms_ffn: Vec<f32>,
+    /// Per-head RMSNorm weights for Q, shape `[head_dim]`.
+    q_norm: Vec<f32>,
+    /// Per-head RMSNorm weights for K, shape `[head_dim]`.
+    k_norm: Vec<f32>,
 }
 
 /// Per-layer compiled ANE kernels (inference-only, no backward).
@@ -159,7 +169,32 @@ pub struct AneInferenceEngine {
 
 impl AneInferenceEngine {
     /// Create a new ANE inference engine.
-    pub fn new(config: AneInferenceConfig) -> Self {
+    ///
+    /// Returns an error if the configuration is invalid (e.g., `n_heads == 0`,
+    /// `n_heads % n_kv_heads != 0`, `dim % n_heads != 0`).
+    pub fn new(config: AneInferenceConfig) -> Result<Self> {
+        if config.n_heads == 0 {
+            return Err(MetalError::InvalidConfig("n_heads must be > 0".into()));
+        }
+        if config.n_kv_heads == 0 {
+            return Err(MetalError::InvalidConfig("n_kv_heads must be > 0".into()));
+        }
+        if config.n_kv_heads > config.n_heads {
+            return Err(MetalError::InvalidConfig(
+                "n_kv_heads must be <= n_heads".into(),
+            ));
+        }
+        if config.n_heads % config.n_kv_heads != 0 {
+            return Err(MetalError::InvalidConfig(
+                "n_heads must be divisible by n_kv_heads".into(),
+            ));
+        }
+        if config.dim == 0 || config.dim % config.n_heads != 0 {
+            return Err(MetalError::InvalidConfig(
+                "dim must be > 0 and divisible by n_heads".into(),
+            ));
+        }
+
         let d = config.dim;
         let h = config.hidden_dim;
         let nl = config.n_layers;
@@ -174,6 +209,8 @@ impl AneInferenceEngine {
             n_kv_heads,
             head_dim: hd,
             seq_len: config.max_seq_len,
+            rope_theta: config.rope_theta,
+            rms_norm_eps: config.rms_norm_eps,
         };
 
         let kv_dim = n_kv_heads * hd;
@@ -189,13 +226,15 @@ impl AneInferenceEngine {
                 w3: vec![0.0; h * d],
                 rms_att: vec![0.0; d],
                 rms_ffn: vec![0.0; d],
+                q_norm: vec![1.0; hd],
+                k_norm: vec![1.0; hd],
             });
         }
 
         // 2 kernels per layer (fwd_attn + fwd_ffn)
         let budget = CompileBudget::new(config.max_compiles, 2 * nl);
 
-        Self {
+        Ok(Self {
             config,
             kernel_config,
             layer_weights,
@@ -205,7 +244,7 @@ impl AneInferenceEngine {
             budget,
             io_pool: None,
             compiled: false,
-        }
+        })
     }
 
     /// Get a reference to the engine configuration.
@@ -272,6 +311,7 @@ impl AneInferenceEngine {
     /// Uses 2 compilations per layer (fwd_attn_kv + fwd_ffn).
     /// Must be called after loading weights and before any LoRA fusion.
     pub fn compile_kernels(&mut self) -> Result<()> {
+        kernel::validate_config(&self.kernel_config)?;
         let rt = AneRuntime::global()?;
 
         if !self.budget.can_compile_batch() {
@@ -294,9 +334,17 @@ impl AneInferenceEngine {
         for l in 0..self.config.n_layers {
             let lw = &self.layer_weights[l];
 
-            // Forward attention with KV cache output
-            let fwd_attn_out =
-                kernel::gen_sdpa_fwd_kv(cfg, &lw.rms_att, &lw.wq, &lw.wk, &lw.wv, &lw.wo);
+            // Forward attention with KV cache output (includes QK-norm + RoPE)
+            let fwd_attn_out = kernel::gen_sdpa_fwd_kv(
+                cfg,
+                &lw.rms_att,
+                &lw.wq,
+                &lw.wk,
+                &lw.wv,
+                &lw.wo,
+                &lw.q_norm,
+                &lw.k_norm,
+            );
             let fwd_attn_kv = rt.compile(
                 fwd_attn_out.mil_text.as_bytes(),
                 Some(&fwd_attn_out.weights),
@@ -670,12 +718,21 @@ impl AneInferenceEngine {
         let pos = kv_cache.pos;
         let seq_through = pos + 1; // positions 0..=pos
 
+        // Bounds check token ID
+        if token_id as usize >= v {
+            return Err(MetalError::InvalidConfig(format!(
+                "Token ID {} exceeds vocab size {}",
+                token_id, v
+            )));
+        }
+
         // Embed single token → x [D]
         let mut x = vec![0.0f32; d];
         for dim_i in 0..d {
             x[dim_i] = self.embed_weights[token_id as usize * d + dim_i];
         }
 
+        let n_kv_heads = self.kernel_config.n_kv_heads;
         let mut xnorm = vec![0.0f32; d];
         let mut q = vec![0.0f32; d];
         let mut k_new = vec![0.0f32; kv_dim];
@@ -686,6 +743,8 @@ impl AneInferenceEngine {
         let mut h1 = vec![0.0f32; self.config.hidden_dim];
         let mut h3 = vec![0.0f32; self.config.hidden_dim];
         let mut ffn_out = vec![0.0f32; d];
+        // Pooled scores buffer — allocated once, reused across heads/layers
+        let mut scores = vec![0.0f32; s];
 
         for (layer_idx, lw) in self.layer_weights.iter().enumerate() {
             // RMSNorm (seq=1, channel-first layout collapses to simple vector)
@@ -696,10 +755,34 @@ impl AneInferenceEngine {
             gemv(&lw.wk, &xnorm, &mut k_new, kv_dim, d);
             gemv(&lw.wv, &xnorm, &mut v_new, kv_dim, d);
 
-            // Store K_new, V_new at cache position
+            // Per-head QK-norm
+            let mut q_normed = vec![0.0f32; d];
+            rmsnorm_per_head(
+                &mut q_normed,
+                &q,
+                &lw.q_norm,
+                h,
+                hd,
+                self.config.rms_norm_eps,
+            );
+            let mut k_normed = vec![0.0f32; kv_dim];
+            rmsnorm_per_head(
+                &mut k_normed,
+                &k_new,
+                &lw.k_norm,
+                n_kv_heads,
+                hd,
+                self.config.rms_norm_eps,
+            );
+
+            // RoPE at position `pos`
+            apply_rope_vec(&mut q_normed, h, hd, pos, self.config.rope_theta);
+            apply_rope_vec(&mut k_normed, n_kv_heads, hd, pos, self.config.rope_theta);
+
+            // Store RoPE'd K, raw V at cache position
             let lc = &mut kv_cache.layers[layer_idx];
             for ch in 0..kv_dim {
-                lc.k[ch * s + pos] = k_new[ch];
+                lc.k[ch * s + pos] = k_normed[ch];
                 lc.v[ch * s + pos] = v_new[ch];
             }
 
@@ -714,25 +797,32 @@ impl AneInferenceEngine {
                 let kv_off = kv_head * hd;
 
                 // scores[t] = sum_i(Q[q_off+i] * K_cache[kv_off+i, t]) for t in 0..seq_through
-                let mut scores = vec![0.0f32; seq_through];
                 for t in 0..seq_through {
                     let mut dot = 0.0f32;
                     for i in 0..hd {
-                        dot += q[q_off + i] * lc.k[(kv_off + i) * s + t];
+                        dot += q_normed[q_off + i] * lc.k[(kv_off + i) * s + t];
                     }
                     scores[t] = dot * scale;
                 }
 
                 // Softmax over scores
-                let max_s = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+                let max_s = scores[..seq_through]
+                    .iter()
+                    .cloned()
+                    .fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0f32;
-                for sc in &mut scores {
+                for sc in &mut scores[..seq_through] {
                     *sc = (*sc - max_s).exp();
                     sum += *sc;
                 }
-                let inv_sum = 1.0 / sum;
-                for sc in &mut scores {
-                    *sc *= inv_sum;
+                if sum > 0.0 {
+                    let inv_sum = 1.0 / sum;
+                    for sc in &mut scores[..seq_through] {
+                        *sc *= inv_sum;
+                    }
+                } else {
+                    let uniform = 1.0 / seq_through as f32;
+                    scores[..seq_through].fill(uniform);
                 }
 
                 // attn_out[q_off+i] = sum_t(scores[t] * V_cache[kv_off+i, t])
@@ -815,6 +905,7 @@ impl AneInferenceEngine {
 
         let d = self.config.dim;
         let kv_dim = self.kernel_config.kv_dim();
+        let hd = d / self.config.n_heads;
 
         // Determine files to load
         let files = if path.is_file() {
@@ -864,7 +955,10 @@ impl AneInferenceEngine {
             })?;
 
             for (name, tensor) in tensors.tensors() {
-                let data_f32 = safetensors_to_f32(&tensor);
+                let data_f32 = match safetensors_to_f32(&tensor) {
+                    Ok(data) => data,
+                    Err(_) => continue, // skip unsupported dtypes
+                };
 
                 if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
                     if name == "model.embed_tokens.weight" {
@@ -909,6 +1003,8 @@ impl AneInferenceEngine {
                             copy_weight(&data_f32, &mut lw.wv, kv_dim * d);
                         }
                         "self_attn.o_proj.weight" => copy_weight(&data_f32, &mut lw.wo, d * d),
+                        "self_attn.q_norm.weight" => copy_weight(&data_f32, &mut lw.q_norm, hd),
+                        "self_attn.k_norm.weight" => copy_weight(&data_f32, &mut lw.k_norm, hd),
                         "mlp.gate_proj.weight" => {
                             copy_weight(&data_f32, &mut lw.w1, self.config.hidden_dim * d);
                         }
@@ -965,6 +1061,9 @@ impl AneInferenceEngine {
             .as_u64()
             .ok_or_else(|| MetalError::InvalidConfig("adapter_config.json missing 'r'".into()))?
             as usize;
+        if rank == 0 {
+            return Err(MetalError::InvalidConfig("LoRA rank must be > 0".into()));
+        }
         let alpha = config["lora_alpha"].as_f64().ok_or_else(|| {
             MetalError::InvalidConfig("adapter_config.json missing 'lora_alpha'".into())
         })? as f32;
@@ -987,7 +1086,7 @@ impl AneInferenceEngine {
         let tensor_map: std::collections::HashMap<String, Vec<f32>> = tensors
             .tensors()
             .into_iter()
-            .map(|(name, view)| (name, safetensors_to_f32(&view)))
+            .filter_map(|(name, view)| safetensors_to_f32(&view).ok().map(|data| (name, data)))
             .collect();
 
         for layer_idx in 0..self.config.n_layers {
@@ -1007,6 +1106,10 @@ impl AneInferenceEngine {
                     b_key.and_then(|k| tensor_map.get(&k)),
                 ) {
                     // A: [rank, cols], B: [rows, rank]
+                    // Validate tensor shapes
+                    if a_data.len() != rank * cols || b_data.len() != rows * rank {
+                        continue;
+                    }
                     // W += scale * B @ A
                     let target = match weight_field {
                         "wq" => &mut lw.wq,
@@ -1048,6 +1151,56 @@ fn rmsnorm_vec(out: &mut [f32], x: &[f32], w: &[f32], dim: usize) {
     }
 }
 
+/// Per-head RMSNorm: independent RMSNorm on each head's `[head_dim]` slice.
+///
+/// `x` has `n_heads * head_dim` elements. Each head's slice is normalized
+/// independently using the shared `weights` of length `head_dim`.
+#[allow(clippy::needless_range_loop)]
+fn rmsnorm_per_head(
+    out: &mut [f32],
+    x: &[f32],
+    weights: &[f32],
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) {
+    for head in 0..n_heads {
+        let off = head * head_dim;
+        let mut ss = 0.0f32;
+        for i in 0..head_dim {
+            ss += x[off + i] * x[off + i];
+        }
+        ss = 1.0 / (ss / head_dim as f32 + eps).sqrt();
+        for i in 0..head_dim {
+            out[off + i] = weights[i] * x[off + i] * ss;
+        }
+    }
+}
+
+/// Apply non-traditional split-half RoPE to a vector with `n_heads * head_dim` elements.
+///
+/// For each head, splits into first/second halves along head_dim and applies:
+/// ```text
+/// out[d]           = x[d] * cos(angle) - x[d+half] * sin(angle)
+/// out[d+half]      = x[d] * sin(angle) + x[d+half] * cos(angle)
+/// ```
+fn apply_rope_vec(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, rope_theta: f32) {
+    let half_dim = head_dim / 2;
+    for head in 0..n_heads {
+        let off = head * head_dim;
+        for d in 0..half_dim {
+            let inv_freq = 1.0 / rope_theta.powf(2.0 * d as f32 / head_dim as f32);
+            let angle = pos as f32 * inv_freq;
+            let cos_a = angle.cos();
+            let sin_a = angle.sin();
+            let x_first = x[off + d];
+            let x_second = x[off + d + half_dim];
+            x[off + d] = x_first * cos_a - x_second * sin_a;
+            x[off + d + half_dim] = x_first * sin_a + x_second * cos_a;
+        }
+    }
+}
+
 /// Matrix-vector multiply: out = W @ x, where W is [rows, cols] row-major.
 fn gemv(w: &[f32], x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
     accelerate::gemm(w, x, out, rows, 1, cols, 1.0, 0.0, false, false);
@@ -1060,40 +1213,58 @@ fn copy_weight(src: &[f32], dst: &mut [f32], expected: usize) {
 }
 
 /// Convert safetensors tensor data to f32.
-fn safetensors_to_f32(tensor: &safetensors::tensor::TensorView<'_>) -> Vec<f32> {
+fn safetensors_to_f32(tensor: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>> {
     use safetensors::Dtype;
     match tensor.dtype() {
         Dtype::F32 => {
             let bytes = tensor.data();
+            if bytes.len() % 4 != 0 {
+                return Err(MetalError::UnsupportedDtype(format!(
+                    "F32 tensor data length {} is not a multiple of 4",
+                    bytes.len()
+                )));
+            }
             let n = bytes.len() / 4;
             let mut out = vec![0.0f32; n];
             // SAFETY: f32 is 4 bytes, no alignment requirement for byte copy
             unsafe {
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, n * 4);
             }
-            out
+            Ok(out)
         }
         Dtype::F16 => {
             let bytes = tensor.data();
+            if bytes.len() % 2 != 0 {
+                return Err(MetalError::UnsupportedDtype(format!(
+                    "F16 tensor data length {} is not a multiple of 2",
+                    bytes.len()
+                )));
+            }
             let n = bytes.len() / 2;
             let mut out = vec![0.0f32; n];
             for i in 0..n {
                 let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
                 out[i] = half::f16::from_bits(bits).to_f32();
             }
-            out
+            Ok(out)
         }
         Dtype::BF16 => {
             let bytes = tensor.data();
+            if bytes.len() % 2 != 0 {
+                return Err(MetalError::UnsupportedDtype(format!(
+                    "BF16 tensor data length {} is not a multiple of 2",
+                    bytes.len()
+                )));
+            }
             let n = bytes.len() / 2;
             let mut out = vec![0.0f32; n];
             for i in 0..n {
                 let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
                 out[i] = half::bf16::from_bits(bits).to_f32();
             }
-            out
+            Ok(out)
         }
-        _ => Vec::new(),
+        dtype => Err(MetalError::UnsupportedDtype(format!("{dtype:?}"))),
     }
 }
 
@@ -1241,13 +1412,15 @@ mod tests {
             top_k: 0,
             max_tokens: 32,
             eos_token_id: None,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
         }
     }
 
     #[test]
     fn test_inference_engine_creation() {
         let config = small_config();
-        let engine = AneInferenceEngine::new(config);
+        let engine = AneInferenceEngine::new(config).unwrap();
         assert_eq!(engine.config().dim, 64);
         assert_eq!(engine.config().n_layers, 2);
         assert!(engine.layer_kernels.is_none());
@@ -1257,7 +1430,7 @@ mod tests {
     #[test]
     fn test_inference_engine_budget() {
         let config = small_config();
-        let engine = AneInferenceEngine::new(config);
+        let engine = AneInferenceEngine::new(config).unwrap();
         // 2 kernels per layer * 2 layers = 4 per compile batch
         assert_eq!(engine.budget().kernels_per_batch(), 4);
         assert!(engine.budget().can_compile_batch());
@@ -1266,7 +1439,7 @@ mod tests {
     #[test]
     fn test_load_weights_flat() {
         let config = small_config();
-        let mut engine = AneInferenceEngine::new(config.clone());
+        let mut engine = AneInferenceEngine::new(config.clone()).unwrap();
 
         // Calculate expected total weight count
         let d = config.dim;
@@ -1322,7 +1495,7 @@ mod tests {
     #[test]
     fn test_input_length_validation() {
         let config = small_config();
-        let mut engine = AneInferenceEngine::new(config.clone());
+        let mut engine = AneInferenceEngine::new(config.clone()).unwrap();
 
         // Allocate minimal weight data so engine is in a valid state
         let d = config.dim;
@@ -1403,7 +1576,7 @@ mod tests {
     #[test]
     fn test_lora_merge_before_compile() {
         let config = small_config();
-        let mut engine = AneInferenceEngine::new(config);
+        let mut engine = AneInferenceEngine::new(config).unwrap();
         assert!(!engine.compiled);
 
         // After compile, LoRA should be rejected

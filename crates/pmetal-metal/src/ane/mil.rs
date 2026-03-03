@@ -20,11 +20,11 @@ use std::fmt::Write;
 /// MIL program header with build info matching the ANE reference.
 const MIL_HEADER: &str = concat!(
     "program(1.3)\n",
-    "[buildInfo = dict<string, string>({{",
+    "[buildInfo = dict<string, string>({",
     "\"coremlc-component-MIL\", \"3510.2.1\"}, ",
     "{\"coremlc-version\", \"3505.4.1\"}, ",
     "{\"coremltools-component-milinternal\", \"\"}, ",
-    "{\"coremltools-version\", \"9.0\"}})]",
+    "{\"coremltools-version\", \"9.0\"})]",
     "\n{\n"
 );
 
@@ -75,7 +75,7 @@ impl MilProgram {
         let shape_str = format_shape(shape);
         write!(
             self.text,
-            "        tensor<fp16, {}> {} = const()[name=string(\"{}\"), val=tensor<fp16, {}>(BLOBFILE(path=string(\"{}\"), offset=uint64(64)))];\n",
+            "        tensor<fp16, {}> {} = const()[name=string(\"{}\"), val=tensor<fp16, {}>(BLOBFILE(path=string(\"{}\"), offset=uint64(128)))];\n",
             shape_str, name, name, shape_str, blob_path
         )
         .unwrap();

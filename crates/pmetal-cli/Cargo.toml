@@ -43,5 +43,9 @@ regex = "1"
 tempfile = { workspace = true }
 tokenizers = { workspace = true }
 
+[features]
+default = []
+ane = ["pmetal-trainer/ane", "pmetal-models/ane"]
+
 [lints]
 workspace = true

@@ -31,5 +31,9 @@ objc2-metal = { workspace = true }
 [dev-dependencies]
 serial_test = "3.2"
 
+[features]
+default = []
+ane = ["pmetal-metal/ane", "pmetal-core/ane"]
+
 [lints]
 workspace = true
