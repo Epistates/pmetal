@@ -86,7 +86,9 @@ impl AneRuntime {
         // Probe for chaining API (M4/M5 only, no working invocation known)
         let chaining_class = AnyClass::get(c"_ANEChainingRequest");
         if chaining_class.is_some() {
-            tracing::info!("ANE chaining API (_ANEChainingRequest) detected — available for future research");
+            tracing::info!(
+                "ANE chaining API (_ANEChainingRequest) detected — available for future research"
+            );
         } else {
             tracing::debug!("ANE chaining API not available on this hardware");
         }

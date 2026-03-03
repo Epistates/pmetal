@@ -420,15 +420,16 @@ impl DynamicAneTrainer {
         info!("Compiling 9 dynamic ANE kernels (one-time)...");
 
         // Generate and compile each kernel
-        let compile = |out: &DynamicKernelOutput, rt: &AneRuntime, name: &str| -> Result<AneModel> {
-            let wd = if out.static_weights.entries.is_empty() {
-                None
-            } else {
-                Some(&out.static_weights)
+        let compile =
+            |out: &DynamicKernelOutput, rt: &AneRuntime, name: &str| -> Result<AneModel> {
+                let wd = if out.static_weights.entries.is_empty() {
+                    None
+                } else {
+                    Some(&out.static_weights)
+                };
+                debug!("Compiling dynamic kernel: {name}");
+                rt.compile(out.mil_text.as_bytes(), wd)
             };
-            debug!("Compiling dynamic kernel: {name}");
-            rt.compile(out.mil_text.as_bytes(), wd)
-        };
 
         let k1 = dynamic_kernel::gen_dynamic_sdpa_fwd(&dkc);
         let sdpa_fwd = compile(&k1, rt, "sdpa_fwd")?;
@@ -466,7 +467,10 @@ impl DynamicAneTrainer {
         let qkv_bwd = compile(&k9, rt, "qkv_bwd")?;
         self.compile_count += 1;
 
-        info!("All 9 dynamic kernels compiled. Total compiles: {}", self.compile_count);
+        info!(
+            "All 9 dynamic kernels compiled. Total compiles: {}",
+            self.compile_count
+        );
 
         // Allocate IOSurface pool
         let io_pool = DynIoPool {
@@ -548,9 +552,13 @@ impl DynamicAneTrainer {
         let lw = &self.layer_weights[l];
         let acts = &mut self.layer_acts[l];
 
-        let kernels = self.kernels.as_ref()
+        let kernels = self
+            .kernels
+            .as_ref()
             .ok_or_else(|| MetalError::InvalidConfig("Kernels not compiled".into()))?;
-        let io = self.io_pool.as_ref()
+        let io = self
+            .io_pool
+            .as_ref()
             .ok_or_else(|| MetalError::InvalidConfig("IO pool not allocated".into()))?;
 
         // 1. Attention Block
@@ -566,10 +574,9 @@ impl DynamicAneTrainer {
         );
 
         // ANE evaluate sdpa_fwd
-        kernels.sdpa_fwd.evaluate(
-            &[io.sdpa_fwd_in.as_ptr()],
-            &[io.sdpa_fwd_out.as_ptr()],
-        )?;
+        kernels
+            .sdpa_fwd
+            .evaluate(&[io.sdpa_fwd_in.as_ptr()], &[io.sdpa_fwd_out.as_ptr()])?;
 
         // Read taps: [o_out, Q, K, V, attn_out, xnorm] each [D, S]
         io.sdpa_fwd_out.read_f32(&mut acts.o_out, 0, d, s);
@@ -586,18 +593,13 @@ impl DynamicAneTrainer {
         accelerate::rmsnorm(&mut acts.x2norm, &acts.x2, &lw.rms_ffn, d, s);
 
         // Pack x2norm + W1 + W3 into ffn_w13 input
-        io.ffn_w13_in.write_packed_f32(
-            &acts.x2norm,
-            &[(&lw.w1, h), (&lw.w3, h)],
-            d,
-            s,
-        );
+        io.ffn_w13_in
+            .write_packed_f32(&acts.x2norm, &[(&lw.w1, h), (&lw.w3, h)], d, s);
 
         // ANE evaluate ffn_w13
-        kernels.ffn_w13.evaluate(
-            &[io.ffn_w13_in.as_ptr()],
-            &[io.ffn_w13_out.as_ptr()],
-        )?;
+        kernels
+            .ffn_w13
+            .evaluate(&[io.ffn_w13_in.as_ptr()], &[io.ffn_w13_out.as_ptr()])?;
 
         // Read taps: [h1, h3, gate] each [HIDDEN, S]
         io.ffn_w13_out.read_f32(&mut acts.h1, 0, h, s);
@@ -605,18 +607,13 @@ impl DynamicAneTrainer {
         io.ffn_w13_out.read_f32(&mut acts.silu_out, 2 * h, h, s);
 
         // Pack gate + W2 into ffn_w2 input
-        io.ffn_w2_in.write_packed_f32(
-            &acts.silu_out,
-            &[(&lw.w2, d)],
-            h,
-            s,
-        );
+        io.ffn_w2_in
+            .write_packed_f32(&acts.silu_out, &[(&lw.w2, d)], h, s);
 
         // ANE evaluate ffn_w2
-        kernels.ffn_w2.evaluate(
-            &[io.ffn_w2_in.as_ptr()],
-            &[io.ffn_w2_out.as_ptr()],
-        )?;
+        kernels
+            .ffn_w2
+            .evaluate(&[io.ffn_w2_in.as_ptr()], &[io.ffn_w2_out.as_ptr()])?;
 
         // Read ffn_out
         io.ffn_w2_out.read_f32(&mut acts.ffn_out, 0, d, s);
@@ -634,20 +631,20 @@ impl DynamicAneTrainer {
         let s = self.config.seq_len;
         let score_ch = self.kernel_config.score_ch();
 
-        let kernels = self.kernels.as_ref()
+        let kernels = self
+            .kernels
+            .as_ref()
             .ok_or_else(|| MetalError::InvalidConfig("Kernels not compiled".into()))?;
-        let io = self.io_pool.as_ref()
+        let io = self
+            .io_pool
+            .as_ref()
             .ok_or_else(|| MetalError::InvalidConfig("IO pool not allocated".into()))?;
 
         // ====== FFN Backward ======
 
         // 1. dffn @ W2^T → dsilu_raw
-        io.ffn_bwd_w2t_in.write_packed_f32(
-            dx,
-            &[(&self.layer_weights[l].w2_t, h)],
-            d,
-            s,
-        );
+        io.ffn_bwd_w2t_in
+            .write_packed_f32(dx, &[(&self.layer_weights[l].w2_t, h)], d, s);
         kernels.ffn_bwd_w2t.evaluate(
             &[io.ffn_bwd_w2t_in.as_ptr()],
             &[io.ffn_bwd_w2t_out.as_ptr()],
@@ -665,12 +662,19 @@ impl DynamicAneTrainer {
             let h_val = h;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
-                let w2_grad = unsafe {
-                    std::slice::from_raw_parts_mut(w2_grad_ptr as *mut f32, w2_grad_len)
-                };
+                let w2_grad =
+                    unsafe { std::slice::from_raw_parts_mut(w2_grad_ptr as *mut f32, w2_grad_len) };
                 accelerate::gemm(
-                    &dy_clone, &silu_clone, w2_grad,
-                    d_val, h_val, s_val, 1.0, 1.0, false, true,
+                    &dy_clone,
+                    &silu_clone,
+                    w2_grad,
+                    d_val,
+                    h_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
             }));
         }
@@ -708,19 +712,33 @@ impl DynamicAneTrainer {
             let h_val = h;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
-                let w1_grad = unsafe {
-                    std::slice::from_raw_parts_mut(w1_grad_ptr as *mut f32, w1_grad_len)
-                };
+                let w1_grad =
+                    unsafe { std::slice::from_raw_parts_mut(w1_grad_ptr as *mut f32, w1_grad_len) };
                 accelerate::gemm(
-                    &dh1_clone, &x2norm_clone, w1_grad,
-                    h_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dh1_clone,
+                    &x2norm_clone,
+                    w1_grad,
+                    h_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
-                let w3_grad = unsafe {
-                    std::slice::from_raw_parts_mut(w3_grad_ptr as *mut f32, w3_grad_len)
-                };
+                let w3_grad =
+                    unsafe { std::slice::from_raw_parts_mut(w3_grad_ptr as *mut f32, w3_grad_len) };
                 accelerate::gemm(
-                    &dh3_clone, &x2norm_clone, w3_grad,
-                    h_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dh3_clone,
+                    &x2norm_clone,
+                    w3_grad,
+                    h_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
             }));
         }
@@ -728,7 +746,10 @@ impl DynamicAneTrainer {
         // 4. dh1@W1^T + dh3@W3^T → dx_ffn
         io.ffn_bwd_w13t_in.write_packed_f32_multi(
             &[(&dh1, s), (&dh3, s)],
-            &[(&self.layer_weights[l].w1_t, d), (&self.layer_weights[l].w3_t, d)],
+            &[
+                (&self.layer_weights[l].w1_t, d),
+                (&self.layer_weights[l].w3_t, d),
+            ],
             h,
         );
         kernels.ffn_bwd_w13t.evaluate(
@@ -753,16 +774,11 @@ impl DynamicAneTrainer {
         // ====== Attention Backward ======
 
         // 6. dy @ Wo^T → da (attention backward input)
-        io.wo_bwd_in.write_packed_f32(
-            &dx_ffn_norm,
-            &[(&self.layer_weights[l].wo_t, d)],
-            d,
-            s,
-        );
-        kernels.wo_bwd.evaluate(
-            &[io.wo_bwd_in.as_ptr()],
-            &[io.wo_bwd_out.as_ptr()],
-        )?;
+        io.wo_bwd_in
+            .write_packed_f32(&dx_ffn_norm, &[(&self.layer_weights[l].wo_t, d)], d, s);
+        kernels
+            .wo_bwd
+            .evaluate(&[io.wo_bwd_in.as_ptr()], &[io.wo_bwd_out.as_ptr()])?;
         let mut da = vec![0.0f32; d * s];
         io.wo_bwd_out.read_f32(&mut da, 0, d, s);
 
@@ -775,12 +791,19 @@ impl DynamicAneTrainer {
             let d_val = d;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
-                let wo_grad = unsafe {
-                    std::slice::from_raw_parts_mut(wo_grad_ptr as *mut f32, wo_grad_len)
-                };
+                let wo_grad =
+                    unsafe { std::slice::from_raw_parts_mut(wo_grad_ptr as *mut f32, wo_grad_len) };
                 accelerate::gemm(
-                    &dx_clone, &attn_clone, wo_grad,
-                    d_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dx_clone,
+                    &attn_clone,
+                    wo_grad,
+                    d_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
             }));
         }
@@ -792,10 +815,9 @@ impl DynamicAneTrainer {
         io.sdpa_bwd1_in.write_f32_as_fp16_at(2 * d, &acts.v, d, s);
         io.sdpa_bwd1_in.write_f32_as_fp16_at(3 * d, &da, d, s);
 
-        kernels.sdpa_bwd1.evaluate(
-            &[io.sdpa_bwd1_in.as_ptr()],
-            &[io.sdpa_bwd1_out.as_ptr()],
-        )?;
+        kernels
+            .sdpa_bwd1
+            .evaluate(&[io.sdpa_bwd1_in.as_ptr()], &[io.sdpa_bwd1_out.as_ptr()])?;
 
         // Read dV, and copy probs+dp for bwd2 input
         let mut dv = vec![0.0f32; d * s];
@@ -803,15 +825,17 @@ impl DynamicAneTrainer {
 
         // 8. SDPA backward part 2: probs, dp, Q, K → dQ, dK (fp16 surface-to-surface copy)
         // Copy probs and dp from bwd1 output to bwd2 input
-        io.sdpa_bwd2_in.copy_from(0, &io.sdpa_bwd1_out, d, 2 * score_ch, s);
+        io.sdpa_bwd2_in
+            .copy_from(0, &io.sdpa_bwd1_out, d, 2 * score_ch, s);
         // Copy Q and K
-        io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch, &acts.q, d, s);
-        io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch + d, &acts.k, d, s);
+        io.sdpa_bwd2_in
+            .write_f32_as_fp16_at(2 * score_ch, &acts.q, d, s);
+        io.sdpa_bwd2_in
+            .write_f32_as_fp16_at(2 * score_ch + d, &acts.k, d, s);
 
-        kernels.sdpa_bwd2.evaluate(
-            &[io.sdpa_bwd2_in.as_ptr()],
-            &[io.sdpa_bwd2_out.as_ptr()],
-        )?;
+        kernels
+            .sdpa_bwd2
+            .evaluate(&[io.sdpa_bwd2_in.as_ptr()], &[io.sdpa_bwd2_out.as_ptr()])?;
 
         let mut dq = vec![0.0f32; d * s];
         let mut dk = vec![0.0f32; d * s];
@@ -833,26 +857,47 @@ impl DynamicAneTrainer {
             let d_val = d;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
-                let wq_grad = unsafe {
-                    std::slice::from_raw_parts_mut(wq_grad_ptr as *mut f32, wq_grad_len)
-                };
+                let wq_grad =
+                    unsafe { std::slice::from_raw_parts_mut(wq_grad_ptr as *mut f32, wq_grad_len) };
                 accelerate::gemm(
-                    &dq_clone, &xnorm_clone, wq_grad,
-                    d_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dq_clone,
+                    &xnorm_clone,
+                    wq_grad,
+                    d_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
-                let wk_grad = unsafe {
-                    std::slice::from_raw_parts_mut(wk_grad_ptr as *mut f32, wk_grad_len)
-                };
+                let wk_grad =
+                    unsafe { std::slice::from_raw_parts_mut(wk_grad_ptr as *mut f32, wk_grad_len) };
                 accelerate::gemm(
-                    &dk_clone, &xnorm_clone, wk_grad,
-                    d_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dk_clone,
+                    &xnorm_clone,
+                    wk_grad,
+                    d_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
-                let wv_grad = unsafe {
-                    std::slice::from_raw_parts_mut(wv_grad_ptr as *mut f32, wv_grad_len)
-                };
+                let wv_grad =
+                    unsafe { std::slice::from_raw_parts_mut(wv_grad_ptr as *mut f32, wv_grad_len) };
                 accelerate::gemm(
-                    &dv_clone, &xnorm_clone, wv_grad,
-                    d_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dv_clone,
+                    &xnorm_clone,
+                    wv_grad,
+                    d_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
             }));
         }
@@ -867,10 +912,9 @@ impl DynamicAneTrainer {
             ],
             d,
         );
-        kernels.qkv_bwd.evaluate(
-            &[io.qkv_bwd_in.as_ptr()],
-            &[io.qkv_bwd_out.as_ptr()],
-        )?;
+        kernels
+            .qkv_bwd
+            .evaluate(&[io.qkv_bwd_in.as_ptr()], &[io.qkv_bwd_out.as_ptr()])?;
         let mut dx_attn = vec![0.0f32; d * s];
         io.qkv_bwd_out.read_f32(&mut dx_attn, 0, d, s);
 
@@ -919,8 +963,16 @@ impl DynamicAneTrainer {
         // Classifier: logits = embed^T @ x_final
         let mut logits = vec![0.0f32; v * s];
         accelerate::gemm(
-            &self.embed_weights, &x_final, &mut logits,
-            v, s, d, 1.0, 0.0, false, false,
+            &self.embed_weights,
+            &x_final,
+            &mut logits,
+            v,
+            s,
+            d,
+            1.0,
+            0.0,
+            false,
+            false,
         );
 
         // Cross-entropy loss
@@ -932,8 +984,16 @@ impl DynamicAneTrainer {
         // dEmbed (classifier gradient): dx = embed^T @ dlogits
         let mut dx = vec![0.0f32; d * s];
         accelerate::gemm(
-            &self.embed_weights, &dlogits, &mut dx,
-            d, s, v, 1.0, 0.0, true, false,
+            &self.embed_weights,
+            &dlogits,
+            &mut dx,
+            d,
+            s,
+            v,
+            1.0,
+            0.0,
+            true,
+            false,
         );
 
         // Async embed gradient accumulation
@@ -950,8 +1010,16 @@ impl DynamicAneTrainer {
                     std::slice::from_raw_parts_mut(embed_grad_ptr as *mut f32, embed_len)
                 };
                 accelerate::gemm(
-                    &dlogits_clone, &x_final_clone, embed_grad,
-                    v_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dlogits_clone,
+                    &x_final_clone,
+                    embed_grad,
+                    v_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
             }));
         }
@@ -999,11 +1067,7 @@ impl DynamicAneTrainer {
     /// Run a complete training batch (accumulate + Adam update).
     ///
     /// No recompilation needed — weights are injected via IOSurface writes.
-    pub fn train_batch(
-        &mut self,
-        data: &[(Vec<u16>, Vec<u16>)],
-        max_steps: usize,
-    ) -> Result<f32> {
+    pub fn train_batch(&mut self, data: &[(Vec<u16>, Vec<u16>)], max_steps: usize) -> Result<f32> {
         // Zero gradients
         for lg in &mut self.layer_grads {
             lg.zero();
@@ -1089,8 +1153,15 @@ impl DynamicAneTrainer {
             macro_rules! adam {
                 ($w:ident, $g:ident, $a:ident) => {
                     accelerate::adam_update(
-                        &mut lw.$w, &lg.$g, &mut la.$a.m, &mut la.$a.v,
-                        t, lr, b1, b2, eps,
+                        &mut lw.$w,
+                        &lg.$g,
+                        &mut la.$a.m,
+                        &mut la.$a.v,
+                        t,
+                        lr,
+                        b1,
+                        b2,
+                        eps,
                     );
                 };
             }
@@ -1107,14 +1178,26 @@ impl DynamicAneTrainer {
         }
 
         accelerate::adam_update(
-            &mut self.embed_weights, &self.embed_grad,
-            &mut self.embed_adam.m, &mut self.embed_adam.v,
-            t, lr, b1, b2, eps,
+            &mut self.embed_weights,
+            &self.embed_grad,
+            &mut self.embed_adam.m,
+            &mut self.embed_adam.v,
+            t,
+            lr,
+            b1,
+            b2,
+            eps,
         );
         accelerate::adam_update(
-            &mut self.rms_final, &self.rms_final_grad,
-            &mut self.rms_final_adam.m, &mut self.rms_final_adam.v,
-            t, lr, b1, b2, eps,
+            &mut self.rms_final,
+            &self.rms_final_grad,
+            &mut self.rms_final_adam.m,
+            &mut self.rms_final_adam.v,
+            t,
+            lr,
+            b1,
+            b2,
+            eps,
         );
 
         // Refresh transposed weights for backward kernels
@@ -1177,19 +1260,25 @@ impl DynamicAneTrainer {
             match tensor.dtype() {
                 Dtype::F32 => {
                     let bytes = tensor.data();
-                    if bytes.len() % 4 != 0 { return None; }
+                    if bytes.len() % 4 != 0 {
+                        return None;
+                    }
                     let n = bytes.len() / 4;
                     let mut out = vec![0.0f32; n];
                     unsafe {
                         std::ptr::copy_nonoverlapping(
-                            bytes.as_ptr(), out.as_mut_ptr() as *mut u8, n * 4,
+                            bytes.as_ptr(),
+                            out.as_mut_ptr() as *mut u8,
+                            n * 4,
                         );
                     }
                     Some(out)
                 }
                 Dtype::F16 => {
                     let bytes = tensor.data();
-                    if bytes.len() % 2 != 0 { return None; }
+                    if bytes.len() % 2 != 0 {
+                        return None;
+                    }
                     let n = bytes.len() / 2;
                     let mut out = vec![0.0f32; n];
                     for i in 0..n {
@@ -1200,7 +1289,9 @@ impl DynamicAneTrainer {
                 }
                 Dtype::BF16 => {
                     let bytes = tensor.data();
-                    if bytes.len() % 2 != 0 { return None; }
+                    if bytes.len() % 2 != 0 {
+                        return None;
+                    }
                     let n = bytes.len() / 2;
                     let mut out = vec![0.0f32; n];
                     for i in 0..n {
@@ -1223,13 +1314,17 @@ impl DynamicAneTrainer {
         } else {
             let index_path = path.join("model.safetensors.index.json");
             if index_path.exists() {
-                let index_text = std::fs::read_to_string(&index_path)
-                    .map_err(|e| MetalError::InvalidConfig(format!("Failed to read index.json: {e}")))?;
-                let index: serde_json::Value = serde_json::from_str(&index_text)
-                    .map_err(|e| MetalError::InvalidConfig(format!("Failed to parse index.json: {e}")))?;
-                let weight_map = index["weight_map"].as_object()
+                let index_text = std::fs::read_to_string(&index_path).map_err(|e| {
+                    MetalError::InvalidConfig(format!("Failed to read index.json: {e}"))
+                })?;
+                let index: serde_json::Value = serde_json::from_str(&index_text).map_err(|e| {
+                    MetalError::InvalidConfig(format!("Failed to parse index.json: {e}"))
+                })?;
+                let weight_map = index["weight_map"]
+                    .as_object()
                     .ok_or_else(|| MetalError::InvalidConfig("Missing weight_map".into()))?;
-                let mut unique_files: Vec<String> = weight_map.values()
+                let mut unique_files: Vec<String> = weight_map
+                    .values()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect();
                 unique_files.sort();
@@ -1240,19 +1335,24 @@ impl DynamicAneTrainer {
                 if single.exists() {
                     vec![single]
                 } else {
-                    return Err(MetalError::InvalidConfig("No safetensors files found".into()));
+                    return Err(MetalError::InvalidConfig(
+                        "No safetensors files found".into(),
+                    ));
                 }
             }
         };
 
         for file_path in &files {
-            let file = std::fs::File::open(file_path)
-                .map_err(|e| MetalError::InvalidConfig(format!("Failed to open {:?}: {e}", file_path)))?;
+            let file = std::fs::File::open(file_path).map_err(|e| {
+                MetalError::InvalidConfig(format!("Failed to open {:?}: {e}", file_path))
+            })?;
             #[allow(unsafe_code)]
-            let mmap = unsafe { Mmap::map(&file) }
-                .map_err(|e| MetalError::InvalidConfig(format!("Failed to mmap {:?}: {e}", file_path)))?;
-            let tensors = SafeTensors::deserialize(&mmap)
-                .map_err(|e| MetalError::InvalidConfig(format!("Failed to parse safetensors: {e}")))?;
+            let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+                MetalError::InvalidConfig(format!("Failed to mmap {:?}: {e}", file_path))
+            })?;
+            let tensors = SafeTensors::deserialize(&mmap).map_err(|e| {
+                MetalError::InvalidConfig(format!("Failed to parse safetensors: {e}"))
+            })?;
 
             for (name, tensor) in tensors.tensors() {
                 let data = match st_to_f32(&tensor) {
@@ -1272,12 +1372,16 @@ impl DynamicAneTrainer {
 
                 if let Some(rest) = name.strip_prefix("model.layers.") {
                     let parts: Vec<&str> = rest.splitn(2, '.').collect();
-                    if parts.len() < 2 { continue; }
+                    if parts.len() < 2 {
+                        continue;
+                    }
                     let layer_idx: usize = match parts[0].parse() {
                         Ok(i) => i,
                         Err(_) => continue,
                     };
-                    if layer_idx >= self.config.n_layers { continue; }
+                    if layer_idx >= self.config.n_layers {
+                        continue;
+                    }
 
                     let lw = &mut self.layer_weights[layer_idx];
                     match parts[1] {

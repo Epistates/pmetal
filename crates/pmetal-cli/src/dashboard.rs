@@ -15,11 +15,12 @@ pub mod app {
     use std::path::PathBuf;
     use std::time::{Duration, Instant};
 
+    use crossterm::ExecutableCommand;
     use crossterm::event::{self, Event, KeyCode, KeyModifiers};
     use crossterm::terminal::{
         EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
     };
-    use crossterm::ExecutableCommand;
+    use ratatui::Terminal;
     use ratatui::backend::CrosstermBackend;
     use ratatui::layout::{Constraint, Direction, Layout, Rect};
     use ratatui::style::{Color, Modifier, Style};
@@ -28,7 +29,6 @@ pub mod app {
     use ratatui::widgets::{
         Axis, Block, Borders, Chart, Dataset, GraphType, List, ListItem, Paragraph,
     };
-    use ratatui::Terminal;
 
     /// A single metric sample from the training log.
     #[derive(Debug, Clone)]
@@ -78,8 +78,12 @@ pub mod app {
 
         /// Poll for new data from the metrics JSONL file.
         fn poll_metrics(&mut self) {
-            let Some(path) = &self.metrics_path else { return };
-            let Ok(file) = std::fs::File::open(path) else { return };
+            let Some(path) = &self.metrics_path else {
+                return;
+            };
+            let Ok(file) = std::fs::File::open(path) else {
+                return;
+            };
 
             let mut reader = BufReader::new(file);
             if reader.seek(SeekFrom::Start(self.last_read_pos)).is_err() {
@@ -214,12 +218,14 @@ pub mod app {
                 .fold(f64::MIN, f64::max);
             let max_step = self.loss_data.last().map(|(x, _)| *x).unwrap_or(1.0);
 
-            let datasets = vec![Dataset::default()
-                .name("loss")
-                .marker(symbols::Marker::Braille)
-                .graph_type(GraphType::Line)
-                .style(Style::default().fg(Color::Green))
-                .data(&self.loss_data)];
+            let datasets = vec![
+                Dataset::default()
+                    .name("loss")
+                    .marker(symbols::Marker::Braille)
+                    .graph_type(GraphType::Line)
+                    .style(Style::default().fg(Color::Green))
+                    .data(&self.loss_data),
+            ];
 
             let chart = Chart::new(datasets)
                 .block(Block::default().title(" Loss Curve ").borders(Borders::ALL))
@@ -265,8 +271,8 @@ pub mod app {
                 vec![ListItem::new("Waiting...")]
             };
 
-            let stats_list = List::new(stats)
-                .block(Block::default().title(" Stats ").borders(Borders::ALL));
+            let stats_list =
+                List::new(stats).block(Block::default().title(" Stats ").borders(Borders::ALL));
             f.render_widget(stats_list, stats_chunks[0]);
 
             // Timing breakdown
@@ -305,8 +311,8 @@ pub mod app {
                 vec![ListItem::new("No timing data")]
             };
 
-            let timing_list = List::new(timing)
-                .block(Block::default().title(" Timing ").borders(Borders::ALL));
+            let timing_list =
+                List::new(timing).block(Block::default().title(" Timing ").borders(Borders::ALL));
             f.render_widget(timing_list, stats_chunks[1]);
         }
     }

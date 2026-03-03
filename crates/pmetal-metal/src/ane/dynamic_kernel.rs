@@ -98,7 +98,12 @@ fn emit_dyn_matmul(
 ) -> String {
     // Slice activations: [1, ic, 1, seq] from spatial offset
     let act_begin = p.next_var(&format!("{prefix}_ab"));
-    p.emit_tensor_const(&act_begin, &[4], "int32", &format!("[0,0,0,{}]", act_sp_off));
+    p.emit_tensor_const(
+        &act_begin,
+        &[4],
+        "int32",
+        &format!("[0,0,0,{}]", act_sp_off),
+    );
     let act_size = p.next_var(&format!("{prefix}_as"));
     p.emit_tensor_const(&act_size, &[4], "int32", &format!("[1,{ic},1,{seq}]"));
     let act = p.next_var(&format!("{prefix}_act"));
@@ -302,14 +307,7 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 
     // matmul: [1, 1, S, D] @ [1, 1, D, D] → [1, 1, S, D]
     let oo_mm = p.next_var("oom");
-    p.emit_matmul(
-        &oo_mm,
-        &[1, 1, s, d],
-        &mm_false,
-        &mm_false,
-        &af_t,
-        &wo_r,
-    );
+    p.emit_matmul(&oo_mm, &[1, 1, s, d], &mm_false, &mm_false, &af_t, &wo_r);
 
     // Transpose + reshape back: [1, 1, S, D] → [1, 1, D, S] → [1, D, 1, S]
     let oo_t = p.next_var("oot");
@@ -408,7 +406,13 @@ pub fn gen_dynamic_ffn_w13(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let cat_il = p.next_var("cil");
     p.emit_scalar_const(&cat_il, "bool", "false");
     let out16 = p.next_var("out16");
-    p.emit_concat(&out16, &[1, out_ch, 1, s], &cat_ax, &cat_il, &[&h1, &h3, &gate]);
+    p.emit_concat(
+        &out16,
+        &[1, out_ch, 1, s],
+        &cat_ax,
+        &cat_il,
+        &[&h1, &h3, &gate],
+    );
 
     // Cast fp16 → fp32
     let out32 = p.next_var("out32");
@@ -755,14 +759,7 @@ pub fn gen_dynamic_sdpa_bwd1(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 
     // dV = probs^T @ da: [1, nh, S, S]^T @ [1, nh, S, hd] → [1, nh, S, hd]
     let dv_h = p.next_var("dvh");
-    p.emit_matmul(
-        &dv_h,
-        &[1, nh, s, hd],
-        &mm_true,
-        &mm_false,
-        &probs_h,
-        &da_t,
-    );
+    p.emit_matmul(&dv_h, &[1, nh, s, hd], &mm_true, &mm_false, &probs_h, &da_t);
 
     // Transpose dV: [1, nh, S, hd] → [1, nh, hd, S] → [1, KV_DIM, 1, S]
     let dv_t = p.next_var("dvt");
@@ -774,23 +771,11 @@ pub fn gen_dynamic_sdpa_bwd1(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 
     // dp = da @ V^T: [1, nh, S, hd] @ [1, nh, hd, S] → [1, nh, S, S]
     let dp_h = p.next_var("dph");
-    p.emit_matmul(
-        &dp_h,
-        &[1, nh, s, s],
-        &mm_false,
-        &mm_false,
-        &da_t,
-        &v_h,
-    );
+    p.emit_matmul(&dp_h, &[1, nh, s, s], &mm_false, &mm_false, &da_t, &v_h);
 
     // Reshape probs and dp to flat: [1, nh, S, S] → [1, nh*S, 1, S]
     let score_rsh = p.next_var("srs");
-    p.emit_tensor_const(
-        &score_rsh,
-        &[4],
-        "int32",
-        &format!("[1,{score_ch},1,{s}]"),
-    );
+    p.emit_tensor_const(&score_rsh, &[4], "int32", &format!("[1,{score_ch},1,{s}]"));
     let probs_flat = p.next_var("pf");
     p.emit_reshape(&probs_flat, &[1, score_ch, 1, s], &score_rsh, &probs_h);
     let dp_flat = p.next_var("dpf");
@@ -888,12 +873,7 @@ pub fn gen_dynamic_sdpa_bwd2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 
     // Reshape to multi-head
     let score_rsh = p.next_var("srs");
-    p.emit_tensor_const(
-        &score_rsh,
-        &[4],
-        "int32",
-        &format!("[1,{nh},{s},{s}]"),
-    );
+    p.emit_tensor_const(&score_rsh, &[4], "int32", &format!("[1,{nh},{s},{s}]"));
     let head_rsh = p.next_var("hrs");
     p.emit_tensor_const(&head_rsh, &[4], "int32", &format!("[1,{nh},{hd},{s}]"));
     let perm23 = p.next_var("p23");
@@ -952,25 +932,11 @@ pub fn gen_dynamic_sdpa_bwd2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 
     // dQ = dS @ K_t: [1, nh, S, S] @ [1, nh, S, hd] → [1, nh, S, hd]
     let dq_h = p.next_var("dqh");
-    p.emit_matmul(
-        &dq_h,
-        &[1, nh, s, hd],
-        &mm_false,
-        &mm_false,
-        &ds,
-        &kt,
-    );
+    p.emit_matmul(&dq_h, &[1, nh, s, hd], &mm_false, &mm_false, &ds, &kt);
 
     // dK = dS^T @ Q: [1, nh, S, S]^T @ [1, nh, S, hd] → [1, nh, S, hd]
     let dk_h = p.next_var("dkh");
-    p.emit_matmul(
-        &dk_h,
-        &[1, nh, s, hd],
-        &mm_true,
-        &mm_false,
-        &ds,
-        &qt,
-    );
+    p.emit_matmul(&dk_h, &[1, nh, s, hd], &mm_true, &mm_false, &ds, &qt);
 
     // Reshape dQ to flat: [1, nh, S, hd] → [1, nh, hd, S] → [1, Q_DIM, 1, S]
     let dq_t = p.next_var("dqt");
@@ -1348,7 +1314,7 @@ mod tests {
     /// Qwen3-0.6B style config: dim=1024, n_heads=16, head_dim=128 → q_dim=2048.
     fn qwen3_config() -> DynamicKernelConfig {
         DynamicKernelConfig::new(TransformerKernelConfig {
-            dim: 64,       // small dim for fast tests
+            dim: 64, // small dim for fast tests
             hidden_dim: 128,
             n_heads: 4,
             n_kv_heads: 4, // MHA

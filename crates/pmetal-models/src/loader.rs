@@ -18,10 +18,10 @@ use crate::architectures::mllama::MllamaForConditionalGeneration;
 use crate::architectures::nemotron_h::{
     NemotronHForCausalLM, load_nemotron_weights as load_nemotron,
 };
-use crate::architectures::qwen3_next::{Qwen3NextConfig, Qwen3NextForCausalLM, sanitize_weights};
 use crate::architectures::phi::PhiForCausalLM;
 use crate::architectures::qwen2::Qwen2ForCausalLM;
 use crate::architectures::qwen3::Qwen3ForCausalLM;
+use crate::architectures::qwen3_next::{Qwen3NextConfig, Qwen3NextForCausalLM, sanitize_weights};
 use crate::architectures::t5::T5EncoderModel;
 use crate::architectures::vae::FluxVAE;
 

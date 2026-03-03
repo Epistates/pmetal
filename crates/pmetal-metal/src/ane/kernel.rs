@@ -1765,8 +1765,13 @@ mod tests {
         let expected_out_ch = cfg.sdpa_bwd1_output_ch();
         assert_eq!(out.output_bytes, expected_out_ch * cfg.seq_len * 2);
         // Wo^T weight blob should be q_dim * dim * 2 (fp16) + 128 header
-        let wot_blob = &out.weights.entries.iter()
-            .find(|(k, _)| k.contains("wot.bin")).unwrap().1;
+        let wot_blob = &out
+            .weights
+            .entries
+            .iter()
+            .find(|(k, _)| k.contains("wot.bin"))
+            .unwrap()
+            .1;
         assert_eq!(wot_blob.len(), 128 + qd * d * 2);
     }
 
@@ -1805,11 +1810,21 @@ mod tests {
         // Output: dx (dim)
         assert_eq!(out.output_bytes, d * cfg.seq_len * 2);
         // Weight blobs: Wq^T (qd*d), Wk^T (kvd*d), Wv^T (kvd*d)
-        let wqt = &out.weights.entries.iter()
-            .find(|(k, _)| k.contains("wqt.bin")).unwrap().1;
+        let wqt = &out
+            .weights
+            .entries
+            .iter()
+            .find(|(k, _)| k.contains("wqt.bin"))
+            .unwrap()
+            .1;
         assert_eq!(wqt.len(), 128 + qd * d * 2);
-        let wkt = &out.weights.entries.iter()
-            .find(|(k, _)| k.contains("wkt.bin")).unwrap().1;
+        let wkt = &out
+            .weights
+            .entries
+            .iter()
+            .find(|(k, _)| k.contains("wkt.bin"))
+            .unwrap()
+            .1;
         assert_eq!(wkt.len(), 128 + kvd * d * 2);
     }
 

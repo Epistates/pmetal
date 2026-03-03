@@ -100,7 +100,12 @@ impl ModelArchitecture {
             if lower.contains("qwen3moe") || lower.contains("qwen3_moe") {
                 return Some(Self::Qwen3MoE);
             }
-            if lower.contains("qwen3next") || lower.contains("qwen3_next") || lower.contains("qwen35") || lower.contains("qwen3_5") || lower.contains("qwen3.5") {
+            if lower.contains("qwen3next")
+                || lower.contains("qwen3_next")
+                || lower.contains("qwen35")
+                || lower.contains("qwen3_5")
+                || lower.contains("qwen3.5")
+            {
                 return Some(Self::Qwen3Next);
             }
             if lower.contains("qwen3") {

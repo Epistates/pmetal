@@ -2001,7 +2001,7 @@ async fn run_training(
     }
     #[cfg(feature = "ane")]
     if ane {
-        use pmetal_trainer::{DynamicAneTrainerConfig, AneTrainingLoop, AneTrainingLoopConfig};
+        use pmetal_trainer::{AneTrainingLoop, AneTrainingLoopConfig, DynamicAneTrainerConfig};
 
         tracing::info!("Using ANE dynamic weight pipeline (compile-once, 9 kernels)");
 

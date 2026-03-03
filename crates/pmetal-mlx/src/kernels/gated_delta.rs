@@ -220,15 +220,8 @@ pub fn gated_delta_ops(
             None => None,
         };
 
-        let (y, new_state) = gated_delta_step_ops(
-            &q_t,
-            &k_t,
-            &v_t,
-            &g_t,
-            &beta_t,
-            &state,
-            mask_t.as_ref(),
-        )?;
+        let (y, new_state) =
+            gated_delta_step_ops(&q_t, &k_t, &v_t, &g_t, &beta_t, &state, mask_t.as_ref())?;
         state = new_state;
         ys.push(y);
     }

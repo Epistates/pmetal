@@ -16,13 +16,16 @@ use mlx_rs::{
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, ModuleParamMut, ModuleParamRef, ModuleParameters, ModuleParametersExt, Param},
+    module::{
+        Module, ModuleParamMut, ModuleParamRef, ModuleParameters, ModuleParametersExt, Param,
+    },
     nn,
     ops::{self, indexing::IndexOp},
 };
 use serde::{Deserialize, Serialize};
 
 use crate::traits::ModelConfig;
+use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use pmetal_mlx::{
     gather_mm,
     kernels::{
@@ -31,7 +34,6 @@ use pmetal_mlx::{
         rope::{RopeScaling, apply_rope},
     },
 };
-use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 
 // ============================================================================
 // Configuration
@@ -329,9 +331,15 @@ pub struct Qwen3NextMLP {
 
 impl Qwen3NextMLP {
     pub fn new(dim: i32, hidden_dim: i32) -> Result<Self, Exception> {
-        let gate_proj = nn::LinearBuilder::new(dim, hidden_dim).bias(false).build()?;
-        let up_proj = nn::LinearBuilder::new(dim, hidden_dim).bias(false).build()?;
-        let down_proj = nn::LinearBuilder::new(hidden_dim, dim).bias(false).build()?;
+        let gate_proj = nn::LinearBuilder::new(dim, hidden_dim)
+            .bias(false)
+            .build()?;
+        let up_proj = nn::LinearBuilder::new(dim, hidden_dim)
+            .bias(false)
+            .build()?;
+        let down_proj = nn::LinearBuilder::new(hidden_dim, dim)
+            .bias(false)
+            .build()?;
         Ok(Self {
             gate_proj,
             up_proj,
@@ -440,18 +448,20 @@ impl Qwen3NextAttention {
         // Reshape to [B, L, n_heads, head_dim * 2], split into queries and gate
         let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2])?;
         let queries = q_gate.index((.., .., .., ..self.head_dim));
-        let gate = q_gate
-            .index((.., .., .., self.head_dim..))
-            .reshape(&[b, l, self.n_heads * self.head_dim])?;
+        let gate = q_gate.index((.., .., .., self.head_dim..)).reshape(&[
+            b,
+            l,
+            self.n_heads * self.head_dim,
+        ])?;
 
         let keys = self.k_proj.forward(x)?;
         let values = self.v_proj.forward(x)?;
 
         // Reshape and apply Q/K norm
         let mut queries = self.q_norm.forward(&queries)?;
-        let mut keys = self.k_norm.forward(
-            &keys.reshape(&[b, l, self.n_kv_heads, self.head_dim])?,
-        )?;
+        let mut keys =
+            self.k_norm
+                .forward(&keys.reshape(&[b, l, self.n_kv_heads, self.head_dim])?)?;
         let values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
 
         // Transpose to [B, heads, L, head_dim]
@@ -495,9 +505,10 @@ impl Qwen3NextAttention {
             });
 
         let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?;
-        let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, l, self.n_heads * self.head_dim])?;
+        let output =
+            output
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, l, self.n_heads * self.head_dim])?;
 
         // Gated output: o_proj(output * sigmoid(gate))
         let gated = output.multiply(&nn::sigmoid(&gate)?)?;
@@ -557,20 +568,16 @@ impl Qwen3NextGatedDeltaNet {
             .padding(0)
             .build()?;
 
-        let in_proj_qkvz =
-            nn::LinearBuilder::new(hidden_size, key_dim * 2 + value_dim * 2)
-                .bias(false)
-                .build()?;
-        let in_proj_ba =
-            nn::LinearBuilder::new(hidden_size, num_v_heads * 2)
-                .bias(false)
-                .build()?;
+        let in_proj_qkvz = nn::LinearBuilder::new(hidden_size, key_dim * 2 + value_dim * 2)
+            .bias(false)
+            .build()?;
+        let in_proj_ba = nn::LinearBuilder::new(hidden_size, num_v_heads * 2)
+            .bias(false)
+            .build()?;
 
         let dt_bias = Param::new(Array::ones::<f32>(&[num_v_heads])?);
-        let a_log = Param::new(
-            mlx_rs::random::uniform::<_, f32>(0.0, 16.0, &[num_v_heads], None)?
-                .log()?,
-        );
+        let a_log =
+            Param::new(mlx_rs::random::uniform::<_, f32>(0.0, 16.0, &[num_v_heads], None)?.log()?);
 
         let norm = Qwen3NextRMSNormGated::new(head_v_dim, config.rms_norm_eps)?;
         let out_proj = nn::LinearBuilder::new(value_dim, hidden_size)
@@ -664,10 +671,7 @@ impl Qwen3NextGatedDeltaNet {
         // to avoid simultaneous mutable/immutable borrow of self)
         let qkvz_proj = self.in_proj_qkvz.forward(inputs)?;
         let ba_proj = self.in_proj_ba.forward(inputs)?;
-        let (q, k, v, z, b_val, a) = self.fix_query_key_value_ordering(
-            &qkvz_proj,
-            &ba_proj,
-        )?;
+        let (q, k, v, z, b_val, a) = self.fix_query_key_value_ordering(&qkvz_proj, &ba_proj)?;
 
         // Convolution state management
         let conv_state = if let Some(ref cache) = cache {
@@ -717,35 +721,36 @@ impl Qwen3NextGatedDeltaNet {
 
         // Take only the last S timesteps (conv adds padding)
         let out_len = q_conv.dim(1);
-        let q_conv = q_conv
-            .index((.., (out_len - s).., ..))
-            .reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
-        let k_conv = k_conv
-            .index((.., (out_len - s).., ..))
-            .reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
-        let v_conv = v_conv
-            .index((.., (out_len - s).., ..))
-            .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?;
+        let q_conv = q_conv.index((.., (out_len - s).., ..)).reshape(&[
+            b,
+            s,
+            self.num_k_heads,
+            self.head_k_dim,
+        ])?;
+        let k_conv = k_conv.index((.., (out_len - s).., ..)).reshape(&[
+            b,
+            s,
+            self.num_k_heads,
+            self.head_k_dim,
+        ])?;
+        let v_conv = v_conv.index((.., (out_len - s).., ..)).reshape(&[
+            b,
+            s,
+            self.num_v_heads,
+            self.head_v_dim,
+        ])?;
 
         // Apply Q/K RMS normalization with scaling
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
-        let q_normed = mlx_rs::fast::rms_norm(
-            &q_conv,
-            &Array::ones::<f32>(&[self.head_k_dim])?,
-            1e-6,
-        )?
-        .multiply(&Array::from_f32(inv_scale * inv_scale))?;
-        let k_normed = mlx_rs::fast::rms_norm(
-            &k_conv,
-            &Array::ones::<f32>(&[self.head_k_dim])?,
-            1e-6,
-        )?
-        .multiply(&Array::from_f32(inv_scale))?;
+        let q_normed =
+            mlx_rs::fast::rms_norm(&q_conv, &Array::ones::<f32>(&[self.head_k_dim])?, 1e-6)?
+                .multiply(&Array::from_f32(inv_scale * inv_scale))?;
+        let k_normed =
+            mlx_rs::fast::rms_norm(&k_conv, &Array::ones::<f32>(&[self.head_k_dim])?, 1e-6)?
+                .multiply(&Array::from_f32(inv_scale))?;
 
         // Get SSM state from cache
-        let ssm_state = cache
-            .as_ref()
-            .and_then(|c| c.ssm_state.as_ref());
+        let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
 
         // Run GDN recurrence
         let (out, new_state) = gated_delta_update(
@@ -1253,8 +1258,7 @@ pub fn sanitize_weights(
     config: &Qwen3NextConfig,
 ) -> Result<(), Exception> {
     // Check if expert stacking is needed
-    let needs_stacking =
-        weights.contains_key("model.layers.0.mlp.experts.0.up_proj.weight");
+    let needs_stacking = weights.contains_key("model.layers.0.mlp.experts.0.up_proj.weight");
 
     if needs_stacking {
         for l in 0..config.num_hidden_layers {
@@ -1369,7 +1373,10 @@ mod tests {
         assert!(config.is_linear_layer(0), "Layer 0 should be linear");
         assert!(config.is_linear_layer(1), "Layer 1 should be linear");
         assert!(config.is_linear_layer(2), "Layer 2 should be linear");
-        assert!(!config.is_linear_layer(3), "Layer 3 should be full attention");
+        assert!(
+            !config.is_linear_layer(3),
+            "Layer 3 should be full attention"
+        );
     }
 
     #[test]

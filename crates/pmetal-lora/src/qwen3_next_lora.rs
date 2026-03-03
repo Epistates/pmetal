@@ -29,15 +29,15 @@ use mlx_rs::{
 };
 
 use pmetal_core::LoraConfig;
+use pmetal_mlx::gather_mm;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, differentiable_attention, fused_sdpa,
-    get_training_context,
     gated_delta::gated_delta_update,
+    get_training_context,
     rope::{RopeScaling, apply_rope},
 };
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache, MambaCacheEntry};
-use pmetal_mlx::gather_mm;
 use pmetal_models::ModelConfig;
 use pmetal_models::architectures::qwen3_next::{
     Qwen3NextConfig, Qwen3NextRMSNormGated, Qwen3NextSparseMoeBlock, sanitize_weights,
@@ -184,11 +184,7 @@ impl Qwen3NextLoraAttention {
 
     /// Training forward — uses differentiable_attention for O(n) memory when
     /// the sequence length crosses the Metal FlashAttention threshold.
-    pub fn forward(
-        &mut self,
-        x: &Array,
-        mask: Option<&Array>,
-    ) -> Result<Array, LoraError> {
+    pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         let shape = x.shape();
         let b = shape[0];
         let l = shape[1];
@@ -199,9 +195,11 @@ impl Qwen3NextLoraAttention {
         let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2])?;
         let queries = q_gate.index((.., .., .., ..self.head_dim));
         // gate: [B, L, n_heads * head_dim] — used after attention output
-        let gate = q_gate
-            .index((.., .., .., self.head_dim..))
-            .reshape(&[b, l, self.n_heads * self.head_dim])?;
+        let gate = q_gate.index((.., .., .., self.head_dim..)).reshape(&[
+            b,
+            l,
+            self.n_heads * self.head_dim,
+        ])?;
 
         let keys = self.k_proj.forward(x)?;
         let values = self.v_proj.forward(x)?;
@@ -275,9 +273,10 @@ impl Qwen3NextLoraAttention {
         };
 
         // [B, heads, L, head_dim] -> [B, L, n_heads * head_dim]
-        let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, l, self.n_heads * self.head_dim])?;
+        let output =
+            output
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, l, self.n_heads * self.head_dim])?;
 
         // Gated output: o_proj(output * sigmoid(gate))
         let gated = output.multiply(&nn::sigmoid(&gate)?)?;
@@ -298,9 +297,11 @@ impl Qwen3NextLoraAttention {
         let q_proj_out = self.q_proj.forward(x)?;
         let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2])?;
         let queries = q_gate.index((.., .., .., ..self.head_dim));
-        let gate = q_gate
-            .index((.., .., .., self.head_dim..))
-            .reshape(&[b, l, self.n_heads * self.head_dim])?;
+        let gate = q_gate.index((.., .., .., self.head_dim..)).reshape(&[
+            b,
+            l,
+            self.n_heads * self.head_dim,
+        ])?;
 
         let keys = self.k_proj.forward(x)?;
         let values = self.v_proj.forward(x)?;
@@ -344,12 +345,13 @@ impl Qwen3NextLoraAttention {
             .with_scale(self.scale)
             .with_mask_type(AttentionMaskType::Causal);
 
-        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)
-            .map_err(LoraError::Mlx)?;
+        let output =
+            fused_sdpa(&queries, &keys, &values, &attn_config, mask).map_err(LoraError::Mlx)?;
 
-        let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, l, self.n_heads * self.head_dim])?;
+        let output =
+            output
+                .transpose_axes(&[0, 2, 1, 3])?
+                .reshape(&[b, l, self.n_heads * self.head_dim])?;
 
         let gated = output.multiply(&nn::sigmoid(&gate)?)?;
         self.o_proj.forward(&gated)
@@ -439,9 +441,7 @@ impl Qwen3NextLoraGDN {
             .map_err(LoraError::Mlx)?;
 
         // Frozen SSM parameters
-        let dt_bias = Param::new(
-            Array::ones::<f32>(&[num_v_heads]).map_err(LoraError::Mlx)?,
-        );
+        let dt_bias = Param::new(Array::ones::<f32>(&[num_v_heads]).map_err(LoraError::Mlx)?);
         let a_log = Param::new(
             mlx_rs::random::uniform::<_, f32>(0.0, 16.0, &[num_v_heads], None)
                 .map_err(LoraError::Mlx)?
@@ -450,8 +450,8 @@ impl Qwen3NextLoraGDN {
         );
 
         // Frozen norm
-        let norm = Qwen3NextRMSNormGated::new(head_v_dim, config.rms_norm_eps)
-            .map_err(LoraError::Mlx)?;
+        let norm =
+            Qwen3NextRMSNormGated::new(head_v_dim, config.rms_norm_eps).map_err(LoraError::Mlx)?;
 
         // LoRA projections
         let alpha = lora_config.alpha;
@@ -617,30 +617,33 @@ impl Qwen3NextLoraGDN {
 
         // Trim to last S timesteps (conv prepended state adds padding)
         let out_len = q_conv.dim(1);
-        let q_conv = q_conv
-            .index((.., (out_len - s).., ..))
-            .reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
-        let k_conv = k_conv
-            .index((.., (out_len - s).., ..))
-            .reshape(&[b, s, self.num_k_heads, self.head_k_dim])?;
-        let v_conv = v_conv
-            .index((.., (out_len - s).., ..))
-            .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?;
+        let q_conv = q_conv.index((.., (out_len - s).., ..)).reshape(&[
+            b,
+            s,
+            self.num_k_heads,
+            self.head_k_dim,
+        ])?;
+        let k_conv = k_conv.index((.., (out_len - s).., ..)).reshape(&[
+            b,
+            s,
+            self.num_k_heads,
+            self.head_k_dim,
+        ])?;
+        let v_conv = v_conv.index((.., (out_len - s).., ..)).reshape(&[
+            b,
+            s,
+            self.num_v_heads,
+            self.head_v_dim,
+        ])?;
 
         // Q/K RMS normalization with scaling (frozen, using identity weight)
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
-        let q_normed = mlx_rs::fast::rms_norm(
-            &q_conv,
-            &Array::ones::<f32>(&[self.head_k_dim])?,
-            1e-6,
-        )?
-        .multiply(&Array::from_f32(inv_scale * inv_scale))?;
-        let k_normed = mlx_rs::fast::rms_norm(
-            &k_conv,
-            &Array::ones::<f32>(&[self.head_k_dim])?,
-            1e-6,
-        )?
-        .multiply(&Array::from_f32(inv_scale))?;
+        let q_normed =
+            mlx_rs::fast::rms_norm(&q_conv, &Array::ones::<f32>(&[self.head_k_dim])?, 1e-6)?
+                .multiply(&Array::from_f32(inv_scale * inv_scale))?;
+        let k_normed =
+            mlx_rs::fast::rms_norm(&k_conv, &Array::ones::<f32>(&[self.head_k_dim])?, 1e-6)?
+                .multiply(&Array::from_f32(inv_scale))?;
 
         // Get SSM state from cache
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
@@ -784,10 +787,7 @@ pub struct Qwen3NextLoraSparseMoE {
 }
 
 impl Qwen3NextLoraSparseMoE {
-    pub fn new(
-        config: &Qwen3NextConfig,
-        lora_config: &LoraConfig,
-    ) -> Result<Self, LoraError> {
+    pub fn new(config: &Qwen3NextConfig, lora_config: &LoraConfig) -> Result<Self, LoraError> {
         let dim = config.hidden_size;
         let intermediate_size = config.moe_intermediate_size;
         let num_experts = config.num_experts;
@@ -798,12 +798,12 @@ impl Qwen3NextLoraSparseMoE {
             .map_err(LoraError::Mlx)?;
 
         // Stacked expert weights — frozen
-        let gate_proj = Array::zeros::<f32>(&[num_experts, intermediate_size, dim])
-            .map_err(LoraError::Mlx)?;
-        let up_proj = Array::zeros::<f32>(&[num_experts, intermediate_size, dim])
-            .map_err(LoraError::Mlx)?;
-        let down_proj = Array::zeros::<f32>(&[num_experts, dim, intermediate_size])
-            .map_err(LoraError::Mlx)?;
+        let gate_proj =
+            Array::zeros::<f32>(&[num_experts, intermediate_size, dim]).map_err(LoraError::Mlx)?;
+        let up_proj =
+            Array::zeros::<f32>(&[num_experts, intermediate_size, dim]).map_err(LoraError::Mlx)?;
+        let down_proj =
+            Array::zeros::<f32>(&[num_experts, dim, intermediate_size]).map_err(LoraError::Mlx)?;
 
         let shared_expert_gate = nn::LinearBuilder::new(dim, 1)
             .bias(false)
@@ -892,9 +892,7 @@ impl Qwen3NextLoraSparseMoE {
 
         // LoRA'd shared expert with sigmoid gate
         let shared_y = self.shared_expert.forward(&x_flat)?;
-        let shared_gate = nn::sigmoid(
-            &Module::forward(&mut self.shared_expert_gate, &x_flat)?,
-        )?;
+        let shared_gate = nn::sigmoid(&Module::forward(&mut self.shared_expert_gate, &x_flat)?)?;
         let shared_y = shared_gate.multiply(&shared_y)?;
 
         let result = y.add(&shared_y)?;
@@ -1098,11 +1096,7 @@ impl Qwen3NextLoraModel {
         })
     }
 
-    pub fn forward(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-    ) -> Result<Array, LoraError> {
+    pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         self.forward_with_checkpoint(input_ids, mask, None)
     }
 
@@ -1189,17 +1183,11 @@ impl Qwen3NextLoraForCausalLM {
         self.checkpoint_config = None;
     }
 
-    pub fn forward(
-        &mut self,
-        input_ids: &Array,
-        mask: Option<&Array>,
-    ) -> Result<Array, LoraError> {
+    pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         let checkpoint_config = self.checkpoint_config.clone();
-        let hidden_states = self.model.forward_with_checkpoint(
-            input_ids,
-            mask,
-            checkpoint_config.as_ref(),
-        )?;
+        let hidden_states =
+            self.model
+                .forward_with_checkpoint(input_ids, mask, checkpoint_config.as_ref())?;
         self.lm_head_forward(&hidden_states)
     }
 
@@ -1297,15 +1285,11 @@ impl Qwen3NextLoraForCausalLM {
                         ("down_proj", &se.down_proj),
                     ] {
                         params.insert(
-                            Rc::from(format!(
-                                "{prefix}.mlp.shared_expert.{proj_name}.lora_a"
-                            )),
+                            Rc::from(format!("{prefix}.mlp.shared_expert.{proj_name}.lora_a")),
                             lora.lora_a.clone(),
                         );
                         params.insert(
-                            Rc::from(format!(
-                                "{prefix}.mlp.shared_expert.{proj_name}.lora_b"
-                            )),
+                            Rc::from(format!("{prefix}.mlp.shared_expert.{proj_name}.lora_b")),
                             lora.lora_b.clone(),
                         );
                     }
@@ -1394,14 +1378,8 @@ impl Qwen3NextLoraForCausalLM {
                         mlp.gate_proj.lora_b,
                         format!("{prefix}.mlp.gate_proj.lora_b")
                     );
-                    set_param!(
-                        mlp.up_proj.lora_a,
-                        format!("{prefix}.mlp.up_proj.lora_a")
-                    );
-                    set_param!(
-                        mlp.up_proj.lora_b,
-                        format!("{prefix}.mlp.up_proj.lora_b")
-                    );
+                    set_param!(mlp.up_proj.lora_a, format!("{prefix}.mlp.up_proj.lora_a"));
+                    set_param!(mlp.up_proj.lora_b, format!("{prefix}.mlp.up_proj.lora_b"));
                     set_param!(
                         mlp.down_proj.lora_a,
                         format!("{prefix}.mlp.down_proj.lora_a")
@@ -1538,14 +1516,8 @@ impl Qwen3NextLoraForCausalLM {
                         mlp.gate_proj.lora_b,
                         format!("{prefix}.mlp.gate_proj.lora_b")
                     );
-                    load_param!(
-                        mlp.up_proj.lora_a,
-                        format!("{prefix}.mlp.up_proj.lora_a")
-                    );
-                    load_param!(
-                        mlp.up_proj.lora_b,
-                        format!("{prefix}.mlp.up_proj.lora_b")
-                    );
+                    load_param!(mlp.up_proj.lora_a, format!("{prefix}.mlp.up_proj.lora_a"));
+                    load_param!(mlp.up_proj.lora_b, format!("{prefix}.mlp.up_proj.lora_b"));
                     load_param!(
                         mlp.down_proj.lora_a,
                         format!("{prefix}.mlp.down_proj.lora_a")
@@ -1597,10 +1569,7 @@ impl Qwen3NextLoraForCausalLM {
     /// Weight name convention mirrors the Python HuggingFace/MLX-LM layout.
     /// `sanitize_weights` must be called before invoking this method so that
     /// expert weights are stacked and norm offsets are applied.
-    pub fn load_base_weights(
-        &mut self,
-        weights: &HashMap<String, Array>,
-    ) -> Result<(), LoraError> {
+    pub fn load_base_weights(&mut self, weights: &HashMap<String, Array>) -> Result<(), LoraError> {
         // Embedding
         if let Some(w) = weights.get("model.embed_tokens.weight") {
             self.model.embed_tokens.weight = Param::new(w.clone());
@@ -1613,80 +1582,54 @@ impl Qwen3NextLoraForCausalLM {
             if let Some(w) = weights.get(&format!("{pfx}.input_layernorm.weight")) {
                 layer.input_layernorm.weight = Param::new(w.clone());
             }
-            if let Some(w) =
-                weights.get(&format!("{pfx}.post_attention_layernorm.weight"))
-            {
+            if let Some(w) = weights.get(&format!("{pfx}.post_attention_layernorm.weight")) {
                 layer.post_attention_layernorm.weight = Param::new(w.clone());
             }
 
             // Mixer weights
             match &mut layer.mixer {
                 Qwen3NextLoraMixer::FullAttention(attn) => {
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.q_proj.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_proj.weight")) {
                         attn.q_proj.weight = w.clone();
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.k_proj.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.k_proj.weight")) {
                         attn.k_proj.weight = w.clone();
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.v_proj.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.v_proj.weight")) {
                         attn.v_proj.weight = w.clone();
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.o_proj.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.o_proj.weight")) {
                         attn.o_proj.weight = w.clone();
                     }
                     // Q/K norms (frozen)
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.q_norm.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.q_norm.weight")) {
                         attn.q_norm.weight = Param::new(w.clone());
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.k_norm.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.k_norm.weight")) {
                         attn.k_norm.weight = Param::new(w.clone());
                     }
                 }
                 Qwen3NextLoraMixer::GDN(gdn) => {
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.in_proj_qkvz.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.in_proj_qkvz.weight")) {
                         gdn.in_proj_qkvz.weight = w.clone();
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.in_proj_ba.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.in_proj_ba.weight")) {
                         gdn.in_proj_ba.weight = Param::new(w.clone());
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.out_proj.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.out_proj.weight")) {
                         gdn.out_proj.weight = w.clone();
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.conv1d.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.conv1d.weight")) {
                         gdn.conv1d.weight = Param::new(w.clone());
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.dt_bias"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.dt_bias")) {
                         gdn.dt_bias = Param::new(w.clone());
                     }
                     if let Some(w) = weights.get(&format!("{pfx}.self_attn.a_log")) {
                         gdn.a_log = Param::new(w.clone());
                     }
                     // Gated RMSNorm weight
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.self_attn.norm.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.self_attn.norm.weight")) {
                         gdn.norm.weight = Param::new(w.clone());
                     }
                 }
@@ -1711,25 +1654,19 @@ impl Qwen3NextLoraForCausalLM {
                         moe.gate.weight = Param::new(w.clone());
                     }
                     // Frozen stacked expert weights (post sanitize_weights)
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.mlp.switch_mlp.gate_proj.weight"))
+                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp.gate_proj.weight"))
                     {
                         moe.switch_mlp_gate_proj = Param::new(w.clone());
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.mlp.switch_mlp.up_proj.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp.up_proj.weight")) {
                         moe.switch_mlp_up_proj = Param::new(w.clone());
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.mlp.switch_mlp.down_proj.weight"))
+                    if let Some(w) = weights.get(&format!("{pfx}.mlp.switch_mlp.down_proj.weight"))
                     {
                         moe.switch_mlp_down_proj = Param::new(w.clone());
                     }
                     // Frozen shared expert gate
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.mlp.shared_expert_gate.weight"))
-                    {
+                    if let Some(w) = weights.get(&format!("{pfx}.mlp.shared_expert_gate.weight")) {
                         moe.shared_expert_gate.weight = Param::new(w.clone());
                     }
                     // LoRA'd shared expert
@@ -1739,8 +1676,7 @@ impl Qwen3NextLoraForCausalLM {
                     {
                         se.gate_proj.weight = w.clone();
                     }
-                    if let Some(w) =
-                        weights.get(&format!("{pfx}.mlp.shared_expert.up_proj.weight"))
+                    if let Some(w) = weights.get(&format!("{pfx}.mlp.shared_expert.up_proj.weight"))
                     {
                         se.up_proj.weight = w.clone();
                     }
@@ -1804,8 +1740,7 @@ impl Qwen3NextLoraForCausalLM {
         let index: WeightIndex = serde_json::from_str(&index_content)
             .map_err(|e| LoraError::Mlx(Exception::custom(e.to_string())))?;
 
-        let shard_files: std::collections::HashSet<&String> =
-            index.weight_map.values().collect();
+        let shard_files: std::collections::HashSet<&String> = index.weight_map.values().collect();
 
         let mut all_weights: HashMap<String, Array> = HashMap::new();
         for shard_file in shard_files {
@@ -1942,8 +1877,7 @@ impl Qwen3NextLoraForCausalLM {
     /// Unmerge is not reversible — reload base weights to undo a merge.
     pub fn unmerge_lora(&mut self) -> Result<(), LoraError> {
         Err(LoraError::InvalidState(
-            "unmerge_lora is not supported: reload base model weights to undo a merge"
-                .to_string(),
+            "unmerge_lora is not supported: reload base model weights to undo a merge".to_string(),
         ))
     }
 }
@@ -1990,8 +1924,14 @@ impl ModuleParameters for Qwen3NextLoraForCausalLM {
                 }
                 Qwen3NextLoraMixer::GDN(gdn) => {
                     let mut qkvz_params = HashMap::new();
-                    qkvz_params.insert(Rc::from("lora_a"), NestedValue::Value(&gdn.in_proj_qkvz.lora_a));
-                    qkvz_params.insert(Rc::from("lora_b"), NestedValue::Value(&gdn.in_proj_qkvz.lora_b));
+                    qkvz_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&gdn.in_proj_qkvz.lora_a),
+                    );
+                    qkvz_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&gdn.in_proj_qkvz.lora_b),
+                    );
                     attn_map.insert(Rc::from("in_proj_qkvz"), NestedValue::Map(qkvz_params));
 
                     let mut out_params = HashMap::new();
@@ -2007,8 +1947,14 @@ impl ModuleParameters for Qwen3NextLoraForCausalLM {
             match &layer.mlp {
                 Qwen3NextLoraFeedForward::Dense(mlp) => {
                     let mut gate_params = HashMap::new();
-                    gate_params.insert(Rc::from("lora_a"), NestedValue::Value(&mlp.gate_proj.lora_a));
-                    gate_params.insert(Rc::from("lora_b"), NestedValue::Value(&mlp.gate_proj.lora_b));
+                    gate_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mlp.gate_proj.lora_a),
+                    );
+                    gate_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mlp.gate_proj.lora_b),
+                    );
                     mlp_map.insert(Rc::from("gate_proj"), NestedValue::Map(gate_params));
 
                     let mut up_params = HashMap::new();
@@ -2017,8 +1963,14 @@ impl ModuleParameters for Qwen3NextLoraForCausalLM {
                     mlp_map.insert(Rc::from("up_proj"), NestedValue::Map(up_params));
 
                     let mut down_params = HashMap::new();
-                    down_params.insert(Rc::from("lora_a"), NestedValue::Value(&mlp.down_proj.lora_a));
-                    down_params.insert(Rc::from("lora_b"), NestedValue::Value(&mlp.down_proj.lora_b));
+                    down_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mlp.down_proj.lora_a),
+                    );
+                    down_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mlp.down_proj.lora_b),
+                    );
                     mlp_map.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
                 }
                 Qwen3NextLoraFeedForward::MoE(moe) => {
@@ -2026,8 +1978,10 @@ impl ModuleParameters for Qwen3NextLoraForCausalLM {
                     let mut se_map = HashMap::new();
 
                     let mut gate_params = HashMap::new();
-                    gate_params.insert(Rc::from("lora_a"), NestedValue::Value(&se.gate_proj.lora_a));
-                    gate_params.insert(Rc::from("lora_b"), NestedValue::Value(&se.gate_proj.lora_b));
+                    gate_params
+                        .insert(Rc::from("lora_a"), NestedValue::Value(&se.gate_proj.lora_a));
+                    gate_params
+                        .insert(Rc::from("lora_b"), NestedValue::Value(&se.gate_proj.lora_b));
                     se_map.insert(Rc::from("gate_proj"), NestedValue::Map(gate_params));
 
                     let mut up_params = HashMap::new();
@@ -2036,8 +1990,10 @@ impl ModuleParameters for Qwen3NextLoraForCausalLM {
                     se_map.insert(Rc::from("up_proj"), NestedValue::Map(up_params));
 
                     let mut down_params = HashMap::new();
-                    down_params.insert(Rc::from("lora_a"), NestedValue::Value(&se.down_proj.lora_a));
-                    down_params.insert(Rc::from("lora_b"), NestedValue::Value(&se.down_proj.lora_b));
+                    down_params
+                        .insert(Rc::from("lora_a"), NestedValue::Value(&se.down_proj.lora_a));
+                    down_params
+                        .insert(Rc::from("lora_b"), NestedValue::Value(&se.down_proj.lora_b));
                     se_map.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
 
                     mlp_map.insert(Rc::from("shared_expert"), NestedValue::Map(se_map));
@@ -2062,34 +2018,70 @@ impl ModuleParameters for Qwen3NextLoraForCausalLM {
             match &mut layer.mixer {
                 Qwen3NextLoraMixer::FullAttention(attn) => {
                     let mut q_params = HashMap::new();
-                    q_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.q_proj.lora_a));
-                    q_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.q_proj.lora_b));
+                    q_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.q_proj.lora_a),
+                    );
+                    q_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.q_proj.lora_b),
+                    );
                     attn_map.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
 
                     let mut k_params = HashMap::new();
-                    k_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.k_proj.lora_a));
-                    k_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.k_proj.lora_b));
+                    k_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.k_proj.lora_a),
+                    );
+                    k_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.k_proj.lora_b),
+                    );
                     attn_map.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
 
                     let mut v_params = HashMap::new();
-                    v_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.v_proj.lora_a));
-                    v_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.v_proj.lora_b));
+                    v_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.v_proj.lora_a),
+                    );
+                    v_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.v_proj.lora_b),
+                    );
                     attn_map.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
 
                     let mut o_params = HashMap::new();
-                    o_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut attn.o_proj.lora_a));
-                    o_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut attn.o_proj.lora_b));
+                    o_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut attn.o_proj.lora_a),
+                    );
+                    o_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut attn.o_proj.lora_b),
+                    );
                     attn_map.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
                 }
                 Qwen3NextLoraMixer::GDN(gdn) => {
                     let mut qkvz_params = HashMap::new();
-                    qkvz_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut gdn.in_proj_qkvz.lora_a));
-                    qkvz_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut gdn.in_proj_qkvz.lora_b));
+                    qkvz_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut gdn.in_proj_qkvz.lora_a),
+                    );
+                    qkvz_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut gdn.in_proj_qkvz.lora_b),
+                    );
                     attn_map.insert(Rc::from("in_proj_qkvz"), NestedValue::Map(qkvz_params));
 
                     let mut out_params = HashMap::new();
-                    out_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut gdn.out_proj.lora_a));
-                    out_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut gdn.out_proj.lora_b));
+                    out_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut gdn.out_proj.lora_a),
+                    );
+                    out_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut gdn.out_proj.lora_b),
+                    );
                     attn_map.insert(Rc::from("out_proj"), NestedValue::Map(out_params));
                 }
             }
@@ -2099,18 +2091,36 @@ impl ModuleParameters for Qwen3NextLoraForCausalLM {
             match &mut layer.mlp {
                 Qwen3NextLoraFeedForward::Dense(mlp) => {
                     let mut gate_params = HashMap::new();
-                    gate_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut mlp.gate_proj.lora_a));
-                    gate_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut mlp.gate_proj.lora_b));
+                    gate_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut mlp.gate_proj.lora_a),
+                    );
+                    gate_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut mlp.gate_proj.lora_b),
+                    );
                     mlp_map.insert(Rc::from("gate_proj"), NestedValue::Map(gate_params));
 
                     let mut up_params = HashMap::new();
-                    up_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut mlp.up_proj.lora_a));
-                    up_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut mlp.up_proj.lora_b));
+                    up_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut mlp.up_proj.lora_a),
+                    );
+                    up_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut mlp.up_proj.lora_b),
+                    );
                     mlp_map.insert(Rc::from("up_proj"), NestedValue::Map(up_params));
 
                     let mut down_params = HashMap::new();
-                    down_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut mlp.down_proj.lora_a));
-                    down_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut mlp.down_proj.lora_b));
+                    down_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut mlp.down_proj.lora_a),
+                    );
+                    down_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut mlp.down_proj.lora_b),
+                    );
                     mlp_map.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
                 }
                 Qwen3NextLoraFeedForward::MoE(moe) => {
@@ -2118,18 +2128,36 @@ impl ModuleParameters for Qwen3NextLoraForCausalLM {
                     let mut se_map = HashMap::new();
 
                     let mut gate_params = HashMap::new();
-                    gate_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut se.gate_proj.lora_a));
-                    gate_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut se.gate_proj.lora_b));
+                    gate_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut se.gate_proj.lora_a),
+                    );
+                    gate_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut se.gate_proj.lora_b),
+                    );
                     se_map.insert(Rc::from("gate_proj"), NestedValue::Map(gate_params));
 
                     let mut up_params = HashMap::new();
-                    up_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut se.up_proj.lora_a));
-                    up_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut se.up_proj.lora_b));
+                    up_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut se.up_proj.lora_a),
+                    );
+                    up_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut se.up_proj.lora_b),
+                    );
                     se_map.insert(Rc::from("up_proj"), NestedValue::Map(up_params));
 
                     let mut down_params = HashMap::new();
-                    down_params.insert(Rc::from("lora_a"), NestedValue::Value(&mut se.down_proj.lora_a));
-                    down_params.insert(Rc::from("lora_b"), NestedValue::Value(&mut se.down_proj.lora_b));
+                    down_params.insert(
+                        Rc::from("lora_a"),
+                        NestedValue::Value(&mut se.down_proj.lora_a),
+                    );
+                    down_params.insert(
+                        Rc::from("lora_b"),
+                        NestedValue::Value(&mut se.down_proj.lora_b),
+                    );
                     se_map.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
 
                     mlp_map.insert(Rc::from("shared_expert"), NestedValue::Map(se_map));
@@ -2349,7 +2377,11 @@ mod tests {
 
         let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let result = model.forward(&input_ids, None);
-        assert!(result.is_ok(), "Forward pass should succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "Forward pass should succeed: {:?}",
+            result.err()
+        );
         let logits = result.unwrap();
         assert_eq!(logits.shape(), &[1, 4, 100], "Logits shape mismatch");
     }

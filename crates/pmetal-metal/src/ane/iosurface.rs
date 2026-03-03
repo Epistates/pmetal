@@ -194,11 +194,7 @@ impl IoSurface {
 
             for ch in 0..ic {
                 // Copy activation row: act[ch*seq .. ch*seq + seq]
-                std::ptr::copy_nonoverlapping(
-                    act.as_ptr().add(ch * seq),
-                    base.add(ch * sp),
-                    seq,
-                );
+                std::ptr::copy_nonoverlapping(act.as_ptr().add(ch * seq), base.add(ch * sp), seq);
 
                 // Copy weight rows at spatial offsets
                 let mut w_off = seq;
@@ -273,13 +269,7 @@ impl IoSurface {
     ///
     /// Reads `channels * spatial` fp32 elements starting at `ch_offset`.
     /// No dtype conversion — used with dynamic pipeline fp32 output surfaces.
-    pub fn read_f32(
-        &self,
-        dst: &mut [f32],
-        ch_offset: usize,
-        channels: usize,
-        spatial: usize,
-    ) {
+    pub fn read_f32(&self, dst: &mut [f32], ch_offset: usize, channels: usize, spatial: usize) {
         let n = channels * spatial;
         let offset = ch_offset * spatial;
         debug_assert_eq!(dst.len(), n);
