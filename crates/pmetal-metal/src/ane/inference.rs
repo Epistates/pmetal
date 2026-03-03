@@ -58,6 +58,12 @@ pub struct AneInferenceConfig {
     pub rope_theta: f32,
     /// RMSNorm epsilon (Qwen3 default: 1e-6).
     pub rms_norm_eps: f32,
+    /// Per-head dimension. Defaults to `dim / n_heads` if `None`.
+    ///
+    /// Models like Qwen3 may specify `head_dim` explicitly in config.json
+    /// when it differs from `dim / n_heads` (e.g., Qwen3-0.6B uses head_dim=128
+    /// with dim=2048, n_heads=16).
+    pub head_dim: Option<usize>,
 }
 
 impl Default for AneInferenceConfig {
@@ -77,6 +83,7 @@ impl Default for AneInferenceConfig {
             eos_token_id: None,
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
+            head_dim: None,
         }
     }
 }
@@ -189,17 +196,27 @@ impl AneInferenceEngine {
                 "n_heads must be divisible by n_kv_heads".into(),
             ));
         }
-        if config.dim == 0 || config.dim % config.n_heads != 0 {
-            return Err(MetalError::InvalidConfig(
-                "dim must be > 0 and divisible by n_heads".into(),
-            ));
-        }
+        // Resolve head_dim: use explicit value if provided, otherwise derive from dim/n_heads
+        let hd = if let Some(explicit_hd) = config.head_dim {
+            if explicit_hd == 0 {
+                return Err(MetalError::InvalidConfig("head_dim must be > 0".into()));
+            }
+            explicit_hd
+        } else {
+            if config.dim == 0 || config.dim % config.n_heads != 0 {
+                return Err(MetalError::InvalidConfig(
+                    "dim must be > 0 and divisible by n_heads (or specify head_dim explicitly)"
+                        .into(),
+                ));
+            }
+            config.dim / config.n_heads
+        };
 
         let d = config.dim;
         let h = config.hidden_dim;
         let nl = config.n_layers;
         let v = config.vocab_size;
-        let hd = d / config.n_heads;
+        let q_dim = config.n_heads * hd; // May differ from d
 
         let n_kv_heads = config.n_kv_heads;
         let kernel_config = TransformerKernelConfig {
@@ -217,10 +234,10 @@ impl AneInferenceEngine {
         let mut layer_weights = Vec::with_capacity(nl);
         for _ in 0..nl {
             layer_weights.push(InferenceLayerWeights {
-                wq: vec![0.0; d * d],
+                wq: vec![0.0; q_dim * d],
                 wk: vec![0.0; kv_dim * d],
                 wv: vec![0.0; kv_dim * d],
-                wo: vec![0.0; d * d],
+                wo: vec![0.0; d * q_dim],
                 w1: vec![0.0; h * d],
                 w2: vec![0.0; d * h],
                 w3: vec![0.0; h * d],
@@ -268,6 +285,7 @@ impl AneInferenceEngine {
         let nl = self.config.n_layers;
         let v = self.config.vocab_size;
         let kv_dim = self.kernel_config.kv_dim();
+        let q_dim = self.kernel_config.q_dim();
 
         let mut offset = 0;
 
@@ -282,14 +300,14 @@ impl AneInferenceEngine {
             lw.rms_att.copy_from_slice(&weights[offset..offset + d]);
             offset += d;
 
-            lw.wq.copy_from_slice(&weights[offset..offset + d * d]);
-            offset += d * d;
+            lw.wq.copy_from_slice(&weights[offset..offset + q_dim * d]);
+            offset += q_dim * d;
             lw.wk.copy_from_slice(&weights[offset..offset + kv_dim * d]);
             offset += kv_dim * d;
             lw.wv.copy_from_slice(&weights[offset..offset + kv_dim * d]);
             offset += kv_dim * d;
-            lw.wo.copy_from_slice(&weights[offset..offset + d * d]);
-            offset += d * d;
+            lw.wo.copy_from_slice(&weights[offset..offset + d * q_dim]);
+            offset += d * q_dim;
 
             lw.rms_ffn.copy_from_slice(&weights[offset..offset + d]);
             offset += d;
@@ -733,11 +751,12 @@ impl AneInferenceEngine {
         }
 
         let n_kv_heads = self.kernel_config.n_kv_heads;
+        let q_dim = self.kernel_config.q_dim();
         let mut xnorm = vec![0.0f32; d];
-        let mut q = vec![0.0f32; d];
+        let mut q = vec![0.0f32; q_dim];
         let mut k_new = vec![0.0f32; kv_dim];
         let mut v_new = vec![0.0f32; kv_dim];
-        let mut attn_out = vec![0.0f32; d];
+        let mut attn_out = vec![0.0f32; q_dim];
         let mut wo_out = vec![0.0f32; d];
         let mut x2 = vec![0.0f32; d];
         let mut h1 = vec![0.0f32; self.config.hidden_dim];
@@ -751,12 +770,12 @@ impl AneInferenceEngine {
             rmsnorm_vec(&mut xnorm, &x, &lw.rms_att, d);
 
             // Q, K, V projections via gemv: out = W @ xnorm
-            gemv(&lw.wq, &xnorm, &mut q, d, d);
+            gemv(&lw.wq, &xnorm, &mut q, q_dim, d);
             gemv(&lw.wk, &xnorm, &mut k_new, kv_dim, d);
             gemv(&lw.wv, &xnorm, &mut v_new, kv_dim, d);
 
             // Per-head QK-norm
-            let mut q_normed = vec![0.0f32; d];
+            let mut q_normed = vec![0.0f32; q_dim];
             rmsnorm_per_head(
                 &mut q_normed,
                 &q,
@@ -835,8 +854,8 @@ impl AneInferenceEngine {
                 }
             }
 
-            // Wo projection: wo_out = Wo @ attn_out
-            gemv(&lw.wo, &attn_out, &mut wo_out, d, d);
+            // Wo projection: wo_out = Wo @ attn_out (projects q_dim→dim)
+            gemv(&lw.wo, &attn_out, &mut wo_out, d, q_dim);
 
             // Residual: x2 = x + wo_out
             for i in 0..d {
@@ -905,7 +924,8 @@ impl AneInferenceEngine {
 
         let d = self.config.dim;
         let kv_dim = self.kernel_config.kv_dim();
-        let hd = d / self.config.n_heads;
+        let q_dim = self.kernel_config.q_dim();
+        let hd = self.kernel_config.head_dim;
 
         // Determine files to load
         let files = if path.is_file() {
@@ -995,14 +1015,18 @@ impl AneInferenceEngine {
                     let suffix = parts[1];
 
                     match suffix {
-                        "self_attn.q_proj.weight" => copy_weight(&data_f32, &mut lw.wq, d * d),
+                        "self_attn.q_proj.weight" => {
+                            copy_weight(&data_f32, &mut lw.wq, q_dim * d);
+                        }
                         "self_attn.k_proj.weight" => {
                             copy_weight(&data_f32, &mut lw.wk, kv_dim * d);
                         }
                         "self_attn.v_proj.weight" => {
                             copy_weight(&data_f32, &mut lw.wv, kv_dim * d);
                         }
-                        "self_attn.o_proj.weight" => copy_weight(&data_f32, &mut lw.wo, d * d),
+                        "self_attn.o_proj.weight" => {
+                            copy_weight(&data_f32, &mut lw.wo, d * q_dim);
+                        }
                         "self_attn.q_norm.weight" => copy_weight(&data_f32, &mut lw.q_norm, hd),
                         "self_attn.k_norm.weight" => copy_weight(&data_f32, &mut lw.k_norm, hd),
                         "mlp.gate_proj.weight" => {
@@ -1414,6 +1438,7 @@ mod tests {
             eos_token_id: None,
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
+            head_dim: None,
         }
     }
 

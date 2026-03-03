@@ -426,6 +426,8 @@ pub struct TrainingLoop {
     /// The handle is polled before each new checkpoint spawn; errors are logged as
     /// warnings rather than terminating training.
     pub(crate) pending_checkpoint: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
+    /// Training callbacks for metrics logging, progress reporting, and dashboard.
+    pub(crate) callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
 }
 
 impl TrainingLoop {
@@ -458,7 +460,13 @@ impl TrainingLoop {
             accumulated_loss: 0.0,
             loss_accumulation_count: 0,
             pending_checkpoint: None,
+            callbacks: Vec::new(),
         }
+    }
+
+    /// Add a training callback for metrics logging or dashboard integration.
+    pub fn add_callback(&mut self, callback: Box<dyn pmetal_core::TrainingCallback>) {
+        self.callbacks.push(callback);
     }
 
     /// Get current learning rate based on scheduler.
@@ -1092,10 +1100,11 @@ impl TrainingLoop {
                 // Training step with Metal optimizer
                 let stats = self.train_step_metal(model, &batch, &mut metal_optimizer)?;
 
-                // Logging
+                // Logging + callback dispatch
+                let mut tokens_per_sec = 0.0f64;
                 if self.step % self.config.log_every == 0 {
                     let now = std::time::Instant::now();
-                    let tokens_per_sec = match self.last_log_time {
+                    tokens_per_sec = match self.last_log_time {
                         Some(last) => {
                             let elapsed_secs = now.duration_since(last).as_secs_f64();
                             if elapsed_secs > 0.0 {
@@ -1121,6 +1130,23 @@ impl TrainingLoop {
                             .map(|n| format!(", grad_norm={:.2}", n))
                             .unwrap_or_default()
                     );
+                }
+
+                // Dispatch to callbacks
+                if !self.callbacks.is_empty() {
+                    let step_metrics = pmetal_core::StepMetrics {
+                        step: stats.step,
+                        loss: stats.loss as f64,
+                        lr: stats.learning_rate as f64,
+                        tok_sec: tokens_per_sec,
+                        total_ms: stats.step_time_ms as f64,
+                        tokens: stats.tokens,
+                        grad_norm: stats.grad_norm.map(|n| n as f64),
+                        ..Default::default()
+                    };
+                    for cb in &mut self.callbacks {
+                        cb.on_step_end_with_metrics(&step_metrics);
+                    }
                 }
 
                 // Evaluation

@@ -43,13 +43,20 @@ pub struct MilProgram {
     var_counter: usize,
 }
 
+/// The dtype of the MIL program's input tensor.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum MilDtype {
+    Fp16,
+    Fp32,
+}
+
 // MIL text generation uses explicit \n in write!() — each line is a complete
 // MIL statement and the trailing \n is part of the generated program text.
 #[allow(clippy::write_with_newline)]
 impl MilProgram {
-    /// Create a new MIL program with header and function signature.
+    /// Create a new MIL program with header and fp16 function signature.
     ///
-    /// `input_shape` is the NCHW shape `[1, C, 1, S]` of the input tensor.
+    /// Input is `tensor<fp16, [1, C, 1, S]> x`.
     pub fn new(input_channels: usize, seq_len: usize) -> Self {
         let mut text = String::with_capacity(8192);
         text.push_str(MIL_HEADER);
@@ -57,6 +64,25 @@ impl MilProgram {
             text,
             "    func main<ios18>(tensor<fp16, [1, {}, 1, {}]> x) {{\n",
             input_channels, seq_len
+        )
+        .unwrap();
+        Self {
+            text,
+            var_counter: 0,
+        }
+    }
+
+    /// Create a new MIL program with fp32 input signature.
+    ///
+    /// Input is `tensor<fp32, [1, C, 1, S]> x`. Used for dynamic weight
+    /// pipeline where activations + weights are packed in fp32 IOSurfaces.
+    pub fn new_fp32(input_channels: usize, spatial: usize) -> Self {
+        let mut text = String::with_capacity(16384);
+        text.push_str(MIL_HEADER);
+        write!(
+            text,
+            "    func main<ios18>(tensor<fp32, [1, {}, 1, {}]> x) {{\n",
+            input_channels, spatial
         )
         .unwrap();
         Self {
@@ -310,6 +336,25 @@ impl MilProgram {
         .unwrap();
     }
 
+    /// Emit a dtype cast operation.
+    ///
+    /// `from_dtype` / `to_dtype` are MIL dtype strings like `"fp16"`, `"fp32"`.
+    pub fn emit_cast(
+        &mut self,
+        result_name: &str,
+        shape: &[usize],
+        input: &str,
+        to_dtype: &str,
+    ) {
+        let shape_str = format_shape(shape);
+        write!(
+            self.text,
+            "        tensor<{}, {}> {} = cast(dtype=string(\"{}\"),x={})[name=string(\"{}\")];\n",
+            to_dtype, shape_str, result_name, to_dtype, input, result_name
+        )
+        .unwrap();
+    }
+
     /// Emit a raw line of MIL text.
     pub fn emit_raw(&mut self, line: &str) {
         self.text.push_str(line);
@@ -321,6 +366,13 @@ impl MilProgram {
     /// Finalize the program with the output variable.
     pub fn finalize(mut self, output_name: &str) -> String {
         write!(self.text, "    }} -> ({});\n}}\n", output_name).unwrap();
+        self.text
+    }
+
+    /// Finalize the program with multiple output variables (tuple output).
+    pub fn finalize_multi(mut self, output_names: &[&str]) -> String {
+        let outs = output_names.join(", ");
+        write!(self.text, "    }} -> ({});\n}}\n", outs).unwrap();
         self.text
     }
 
@@ -400,6 +452,22 @@ mod tests {
         let text = prog.finalize("tiled");
         assert!(text.contains("tile(reps=reps,x=x)"));
         assert!(text.contains("[1, 48, 256, 64]"));
+    }
+
+    #[test]
+    fn test_mil_fp32_input() {
+        let prog = MilProgram::new_fp32(768, 512);
+        let text = prog.finalize("x");
+        assert!(text.contains("tensor<fp32, [1, 768, 1, 512]> x"));
+    }
+
+    #[test]
+    fn test_mil_cast() {
+        let mut prog = MilProgram::new_fp32(768, 512);
+        prog.emit_cast("x16", &[1, 768, 1, 512], "x", "fp16");
+        let text = prog.finalize("x16");
+        assert!(text.contains("cast(dtype=string(\"fp16\"),x=x)"));
+        assert!(text.contains("tensor<fp16, [1, 768, 1, 512]> x16"));
     }
 
     #[test]

@@ -37,6 +37,14 @@ pub struct TransformerKernelConfig {
 }
 
 impl TransformerKernelConfig {
+    /// Q projection output dimension = n_heads * head_dim.
+    ///
+    /// Equals `dim` for standard architectures but differs for models like
+    /// Qwen3 where `head_dim != dim / n_heads`.
+    pub fn q_dim(&self) -> usize {
+        self.n_heads * self.head_dim
+    }
+
     /// KV dimension = n_kv_heads * head_dim.
     pub fn kv_dim(&self) -> usize {
         self.n_kv_heads * self.head_dim
@@ -54,9 +62,10 @@ impl TransformerKernelConfig {
 
     /// Attention forward output channels: o_out + Q + K + V + attn_out + xnorm
     ///
-    /// With GQA: oo(DIM) + qf(DIM) + kf(KV_DIM) + vf(KV_DIM) + af(DIM) + xn(DIM)
+    /// oo(DIM) + qf(Q_DIM) + kf(KV_DIM) + vf(KV_DIM) + af(Q_DIM) + xn(DIM)
+    /// where Q_DIM = n_heads * head_dim (equals DIM when head_dim = dim/n_heads).
     pub fn sdpa_fwd_output_ch(&self) -> usize {
-        4 * self.dim + 2 * self.kv_dim()
+        2 * self.dim + 2 * self.q_dim() + 2 * self.kv_dim()
     }
 
     /// FFN forward output channels: ffn_out + h1 + h3 + silu_out + x2norm
@@ -70,19 +79,19 @@ impl TransformerKernelConfig {
         self.dim + 2 * self.hidden_dim
     }
 
-    /// SDPA backward part 1 input channels: Q + K + V + dy = 4*DIM
+    /// SDPA backward part 1 input channels: Q(q_dim) + K(kv_dim) + V(kv_dim) + dy(dim)
     pub fn sdpa_bwd1_input_ch(&self) -> usize {
-        4 * self.dim
+        self.q_dim() + 2 * self.kv_dim() + self.dim
     }
 
-    /// SDPA backward part 1 output channels: dV + probs + dp
+    /// SDPA backward part 1 output channels: dV(kv_dim) + probs + dp
     pub fn sdpa_bwd1_output_ch(&self) -> usize {
-        self.dim + 2 * self.score_ch()
+        self.kv_dim() + 2 * self.score_ch()
     }
 
-    /// SDPA backward part 2 input channels: probs + dp + Q + K
+    /// SDPA backward part 2 input channels: probs + dp + Q(q_dim) + K(kv_dim)
     pub fn sdpa_bwd2_input_ch(&self) -> usize {
-        2 * self.score_ch() + 2 * self.dim
+        2 * self.score_ch() + self.q_dim() + self.kv_dim()
     }
 }
 
@@ -486,6 +495,7 @@ pub fn gen_sdpa_fwd_taps(
     let hd = cfg.head_dim;
     let kv_h = cfg.n_kv_heads;
     let kv_d = cfg.kv_dim();
+    let q_dim = cfg.q_dim();
     let n_groups = cfg.n_groups();
     let sc = 1.0 / (hd as f32).sqrt();
     let inv_d = 1.0 / d as f32;
@@ -495,13 +505,13 @@ pub fn gen_sdpa_fwd_taps(
     // RMSNorm inline
     emit_rmsnorm(&mut p, d, s, inv_d, "@model_path/weights/rms1.bin");
 
-    // QKV convolutions
+    // QKV convolutions — Wq projects dim→q_dim, Wo projects q_dim→dim
     p.emit_conv_constants();
-    p.emit_weight_const("Wq", &[d, d, 1, 1], "@model_path/weights/wq.bin");
+    p.emit_weight_const("Wq", &[q_dim, d, 1, 1], "@model_path/weights/wq.bin");
     p.emit_weight_const("Wk", &[kv_d, d, 1, 1], "@model_path/weights/wk.bin");
     p.emit_weight_const("Wv", &[kv_d, d, 1, 1], "@model_path/weights/wv.bin");
-    p.emit_weight_const("Wo", &[d, d, 1, 1], "@model_path/weights/wo.bin");
-    p.emit_conv("qf", &[1, d, 1, s], "Wq", "xn");
+    p.emit_weight_const("Wo", &[d, q_dim, 1, 1], "@model_path/weights/wo.bin");
+    p.emit_conv("qf", &[1, q_dim, 1, s], "Wq", "xn");
     p.emit_conv("kf", &[1, kv_d, 1, s], "Wk", "xn");
     p.emit_conv("vf", &[1, kv_d, 1, s], "Wv", "xn");
 
@@ -540,16 +550,16 @@ pub fn gen_sdpa_fwd_taps(
     p.emit_scalar_const("sax", "int32", "-1");
     p.emit_softmax("aw", &[1, h, s, s], "sax", "ms");
 
-    // Attention output: scores @ V, reshape back
+    // Attention output: scores @ V, reshape back to [1, q_dim, 1, s], project to dim
     p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", v_name);
     p.emit_transpose("at", &[1, h, hd, s], "pm", "a4");
-    p.emit_tensor_const("os", &[4], "int32", &format!("[1,{d},1,{s}]"));
-    p.emit_reshape("af", &[1, d, 1, s], "os", "at");
+    p.emit_tensor_const("os", &[4], "int32", &format!("[1,{q_dim},1,{s}]"));
+    p.emit_reshape("af", &[1, q_dim, 1, s], "os", "at");
     p.emit_conv("oo", &[1, d, 1, s], "Wo", "af");
 
     // Concat output taps: oo + qf + kf + vf + af + xn
-    // Note: kf/vf are kv_dim, qf/oo/af/xn are dim
-    let out_ch = 4 * d + 2 * kv_d;
+    // oo=dim, qf=q_dim, kf=kv_dim, vf=kv_dim, af=q_dim, xn=dim
+    let out_ch = 2 * d + 2 * q_dim + 2 * kv_d;
     p.emit_scalar_const("cax", "int32", "1");
     p.emit_scalar_const("cid", "bool", "false");
     p.emit_concat(
@@ -568,7 +578,10 @@ pub fn gen_sdpa_fwd_taps(
         "@model_path/weights/rms1.bin",
         WeightBlob::from_rms_weights(rms_att),
     );
-    weights.add("@model_path/weights/wq.bin", WeightBlob::from_f32(wq, d, d));
+    weights.add(
+        "@model_path/weights/wq.bin",
+        WeightBlob::from_f32(wq, q_dim, d),
+    );
     weights.add(
         "@model_path/weights/wk.bin",
         WeightBlob::from_f32(wk, kv_d, d),
@@ -577,7 +590,10 @@ pub fn gen_sdpa_fwd_taps(
         "@model_path/weights/wv.bin",
         WeightBlob::from_f32(wv, kv_d, d),
     );
-    weights.add("@model_path/weights/wo.bin", WeightBlob::from_f32(wo, d, d));
+    weights.add(
+        "@model_path/weights/wo.bin",
+        WeightBlob::from_f32(wo, d, q_dim),
+    );
     weights.add("@model_path/weights/mask.bin", build_causal_mask(s));
 
     KernelOutput {
@@ -608,6 +624,7 @@ pub fn gen_sdpa_fwd(
     let hd = cfg.head_dim;
     let kv_h = cfg.n_kv_heads;
     let kv_d = cfg.kv_dim();
+    let q_dim = cfg.q_dim();
     let n_groups = cfg.n_groups();
     let sc = 1.0 / (hd as f32).sqrt();
     let inv_d = 1.0 / d as f32;
@@ -617,13 +634,13 @@ pub fn gen_sdpa_fwd(
     // RMSNorm inline
     emit_rmsnorm(&mut p, d, s, inv_d, "@model_path/weights/rms1.bin");
 
-    // QKV convolutions
+    // QKV convolutions — Wq projects dim→q_dim, Wo projects q_dim→dim
     p.emit_conv_constants();
-    p.emit_weight_const("Wq", &[d, d, 1, 1], "@model_path/weights/wq.bin");
+    p.emit_weight_const("Wq", &[q_dim, d, 1, 1], "@model_path/weights/wq.bin");
     p.emit_weight_const("Wk", &[kv_d, d, 1, 1], "@model_path/weights/wk.bin");
     p.emit_weight_const("Wv", &[kv_d, d, 1, 1], "@model_path/weights/wv.bin");
-    p.emit_weight_const("Wo", &[d, d, 1, 1], "@model_path/weights/wo.bin");
-    p.emit_conv("qf", &[1, d, 1, s], "Wq", "xn");
+    p.emit_weight_const("Wo", &[d, q_dim, 1, 1], "@model_path/weights/wo.bin");
+    p.emit_conv("qf", &[1, q_dim, 1, s], "Wq", "xn");
     p.emit_conv("kf", &[1, kv_d, 1, s], "Wk", "xn");
     p.emit_conv("vf", &[1, kv_d, 1, s], "Wv", "xn");
 
@@ -663,11 +680,11 @@ pub fn gen_sdpa_fwd(
     p.emit_scalar_const("sax", "int32", "-1");
     p.emit_softmax("aw", &[1, h, s, s], "sax", "ms");
 
-    // Attention output: scores @ V, reshape back
+    // Attention output: scores @ V, reshape back to [1, q_dim, 1, s], project to dim
     p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", v_name);
     p.emit_transpose("at", &[1, h, hd, s], "pm", "a4");
-    p.emit_tensor_const("os", &[4], "int32", &format!("[1,{d},1,{s}]"));
-    p.emit_reshape("af", &[1, d, 1, s], "os", "at");
+    p.emit_tensor_const("os", &[4], "int32", &format!("[1,{q_dim},1,{s}]"));
+    p.emit_reshape("af", &[1, q_dim, 1, s], "os", "at");
     p.emit_conv("oo", &[1, d, 1, s], "Wo", "af");
 
     // No concat — finalize directly on attention output
@@ -679,7 +696,10 @@ pub fn gen_sdpa_fwd(
         "@model_path/weights/rms1.bin",
         WeightBlob::from_rms_weights(rms_att),
     );
-    weights.add("@model_path/weights/wq.bin", WeightBlob::from_f32(wq, d, d));
+    weights.add(
+        "@model_path/weights/wq.bin",
+        WeightBlob::from_f32(wq, q_dim, d),
+    );
     weights.add(
         "@model_path/weights/wk.bin",
         WeightBlob::from_f32(wk, kv_d, d),
@@ -688,7 +708,10 @@ pub fn gen_sdpa_fwd(
         "@model_path/weights/wv.bin",
         WeightBlob::from_f32(wv, kv_d, d),
     );
-    weights.add("@model_path/weights/wo.bin", WeightBlob::from_f32(wo, d, d));
+    weights.add(
+        "@model_path/weights/wo.bin",
+        WeightBlob::from_f32(wo, d, q_dim),
+    );
     weights.add("@model_path/weights/mask.bin", build_causal_mask(s));
 
     KernelOutput {
@@ -725,6 +748,7 @@ pub fn gen_sdpa_fwd_kv(
     let hd = cfg.head_dim;
     let kv_h = cfg.n_kv_heads;
     let kv_d = cfg.kv_dim();
+    let q_dim = cfg.q_dim(); // n_heads * head_dim — may differ from dim (e.g. Qwen3)
     let n_groups = cfg.n_groups();
     let sc = 1.0 / (hd as f32).sqrt();
     let inv_d = 1.0 / d as f32;
@@ -734,13 +758,13 @@ pub fn gen_sdpa_fwd_kv(
     // RMSNorm inline
     emit_rmsnorm(&mut p, d, s, inv_d, "@model_path/weights/rms1.bin");
 
-    // QKV convolutions
+    // QKV convolutions — Wq projects dim→q_dim, Wo projects q_dim→dim
     p.emit_conv_constants();
-    p.emit_weight_const("Wq", &[d, d, 1, 1], "@model_path/weights/wq.bin");
+    p.emit_weight_const("Wq", &[q_dim, d, 1, 1], "@model_path/weights/wq.bin");
     p.emit_weight_const("Wk", &[kv_d, d, 1, 1], "@model_path/weights/wk.bin");
     p.emit_weight_const("Wv", &[kv_d, d, 1, 1], "@model_path/weights/wv.bin");
-    p.emit_weight_const("Wo", &[d, d, 1, 1], "@model_path/weights/wo.bin");
-    p.emit_conv("qf", &[1, d, 1, s], "Wq", "xn");
+    p.emit_weight_const("Wo", &[d, q_dim, 1, 1], "@model_path/weights/wo.bin");
+    p.emit_conv("qf", &[1, q_dim, 1, s], "Wq", "xn");
     p.emit_conv("kf", &[1, kv_d, 1, s], "Wk", "xn");
     p.emit_conv("vf", &[1, kv_d, 1, s], "Wv", "xn");
 
@@ -827,11 +851,11 @@ pub fn gen_sdpa_fwd_kv(
     p.emit_scalar_const("sax", "int32", "-1");
     p.emit_softmax("aw", &[1, h, s, s], "sax", "ms");
 
-    // Attention output: scores @ V, reshape back
+    // Attention output: scores @ V, reshape back to [1, q_dim, 1, s], project to dim
     p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", v_name);
     p.emit_transpose("at", &[1, h, hd, s], "pm", "a4");
-    p.emit_tensor_const("os", &[4], "int32", &format!("[1,{d},1,{s}]"));
-    p.emit_reshape("af", &[1, d, 1, s], "os", "at");
+    p.emit_tensor_const("os", &[4], "int32", &format!("[1,{q_dim},1,{s}]"));
+    p.emit_reshape("af", &[1, q_dim, 1, s], "os", "at");
     p.emit_conv("oo", &[1, d, 1, s], "Wo", "af");
 
     // Output post-RoPE K (not raw kf) for the KV cache:
@@ -859,7 +883,10 @@ pub fn gen_sdpa_fwd_kv(
         "@model_path/weights/rms1.bin",
         WeightBlob::from_rms_weights(rms_att),
     );
-    weights.add("@model_path/weights/wq.bin", WeightBlob::from_f32(wq, d, d));
+    weights.add(
+        "@model_path/weights/wq.bin",
+        WeightBlob::from_f32(wq, q_dim, d),
+    );
     weights.add(
         "@model_path/weights/wk.bin",
         WeightBlob::from_f32(wk, kv_d, d),
@@ -868,7 +895,10 @@ pub fn gen_sdpa_fwd_kv(
         "@model_path/weights/wv.bin",
         WeightBlob::from_f32(wv, kv_d, d),
     );
-    weights.add("@model_path/weights/wo.bin", WeightBlob::from_f32(wo, d, d));
+    weights.add(
+        "@model_path/weights/wo.bin",
+        WeightBlob::from_f32(wo, d, q_dim),
+    );
     weights.add("@model_path/weights/mask.bin", build_causal_mask(s));
     weights.add(
         "@model_path/weights/qnorm.bin",
@@ -1128,39 +1158,53 @@ pub fn gen_ffn_bwd(
 
 /// Generate the SDPA backward part 1 kernel.
 ///
-/// Input: `[1, 4*DIM, 1, SEQ]` = concat(Q, K, V, dy)
-/// Output: `[1, DIM + 2*SCORE_CH, 1, SEQ]` = concat(dV, probs, dp)
+/// Input: `[1, Q_DIM+2*KV_DIM+DIM, 1, SEQ]` = concat(Q, K, V, dy)
+/// Output: `[1, KV_DIM + 2*SCORE_CH, 1, SEQ]` = concat(dV, probs, dp)
 ///
 /// Weights: Wo^T, causal mask
+///
+/// Note: Requires MHA (n_kv_heads == n_heads). GQA backward would need
+/// K/V tiling and gradient accumulation, which is not yet implemented.
 pub fn gen_sdpa_bwd1(cfg: &TransformerKernelConfig, wo: &[f32]) -> KernelOutput {
     let d = cfg.dim;
+    let qd = cfg.q_dim(); // n_heads * head_dim (may differ from dim)
+    let kvd = cfg.kv_dim(); // n_kv_heads * head_dim (= qd for MHA)
     let s = cfg.seq_len;
     let h = cfg.n_heads;
     let hd = cfg.head_dim;
     let sc_ch = cfg.score_ch();
     let sc = 1.0 / (hd as f32).sqrt();
-    let in_ch = 4 * d;
-    let out_ch = d + 2 * sc_ch;
+    let in_ch = qd + 2 * kvd + d; // Q(qd) + K(kvd) + V(kvd) + dy(d)
+    let out_ch = kvd + 2 * sc_ch; // dV(kvd) + probs + dp
+
+    debug_assert_eq!(
+        cfg.n_kv_heads, cfg.n_heads,
+        "Backward SDPA kernels require MHA (n_kv_heads == n_heads)"
+    );
 
     let mut p = MilProgram::new(in_ch, s);
     p.emit_conv_constants();
 
-    // Slice inputs
-    p.emit_tensor_const("sz", &[4], "int32", &format!("[1,{d},1,{s}]"));
+    // Slice inputs: Q(qd), K(kvd), V(kvd), dy(d)
+    p.emit_tensor_const("szq", &[4], "int32", &format!("[1,{qd},1,{s}]"));
     p.emit_tensor_const("b0", &[4], "int32", "[0,0,0,0]");
-    p.emit_slice_by_size("qf", &[1, d, 1, s], "x", "b0", "sz");
-    p.emit_tensor_const("b1", &[4], "int32", &format!("[0,{d},0,0]"));
-    p.emit_slice_by_size("kf", &[1, d, 1, s], "x", "b1", "sz");
-    p.emit_tensor_const("b2", &[4], "int32", &format!("[0,{},0,0]", 2 * d));
-    p.emit_slice_by_size("vf", &[1, d, 1, s], "x", "b2", "sz");
-    p.emit_tensor_const("b3", &[4], "int32", &format!("[0,{},0,0]", 3 * d));
-    p.emit_slice_by_size("dx2f", &[1, d, 1, s], "x", "b3", "sz");
+    p.emit_slice_by_size("qf", &[1, qd, 1, s], "x", "b0", "szq");
+    p.emit_tensor_const("szkv", &[4], "int32", &format!("[1,{kvd},1,{s}]"));
+    p.emit_tensor_const("b1", &[4], "int32", &format!("[0,{qd},0,0]"));
+    p.emit_slice_by_size("kf", &[1, kvd, 1, s], "x", "b1", "szkv");
+    p.emit_tensor_const("b2", &[4], "int32", &format!("[0,{},0,0]", qd + kvd));
+    p.emit_slice_by_size("vf", &[1, kvd, 1, s], "x", "b2", "szkv");
+    p.emit_tensor_const("szd", &[4], "int32", &format!("[1,{d},1,{s}]"));
+    p.emit_tensor_const("b3", &[4], "int32", &format!("[0,{},0,0]", qd + 2 * kvd));
+    p.emit_slice_by_size("dx2f", &[1, d, 1, s], "x", "b3", "szd");
 
     // Wo^T @ dy → df (attention gradient)
-    p.emit_weight_const("Wot", &[d, d, 1, 1], "@model_path/weights/wot.bin");
-    p.emit_conv("df", &[1, d, 1, s], "Wot", "dx2f");
+    // Wo is [dim, q_dim], so Wo^T is [q_dim, dim]
+    p.emit_weight_const("Wot", &[qd, d, 1, 1], "@model_path/weights/wot.bin");
+    p.emit_conv("df", &[1, qd, 1, s], "Wot", "dx2f");
 
-    // Reshape to multi-head format
+    // Reshape to multi-head format [1, n_heads, head_dim, seq]
+    // MHA: qd = kvd = n_heads * head_dim, so one reshape const works for all
     p.emit_tensor_const("rsh", &[4], "int32", &format!("[1,{h},{hd},{s}]"));
     p.emit_tensor_const("pm", &[4], "int32", "[0,1,3,2]");
 
@@ -1186,9 +1230,10 @@ pub fn gen_sdpa_bwd1(cfg: &TransformerKernelConfig, wo: &[f32]) -> KernelOutput 
     p.emit_matmul("dp4", &[1, h, s, s], "bF", "bT", "da", "v");
 
     // Reshape outputs to flat format
+    // dV has kv_dim channels (= q_dim for MHA)
     p.emit_transpose("dvt", &[1, h, hd, s], "pm", "dv4");
-    p.emit_tensor_const("dvs", &[4], "int32", &format!("[1,{d},1,{s}]"));
-    p.emit_reshape("dvf", &[1, d, 1, s], "dvs", "dvt");
+    p.emit_tensor_const("dvs", &[4], "int32", &format!("[1,{kvd},1,{s}]"));
+    p.emit_reshape("dvf", &[1, kvd, 1, s], "dvs", "dvt");
 
     p.emit_tensor_const("scs", &[4], "int32", &format!("[1,{sc_ch},1,{s}]"));
     p.emit_reshape("pf", &[1, sc_ch, 1, s], "scs", "probs");
@@ -1210,7 +1255,8 @@ pub fn gen_sdpa_bwd1(cfg: &TransformerKernelConfig, wo: &[f32]) -> KernelOutput 
     let mut weights = WeightDict::new();
     weights.add(
         "@model_path/weights/wot.bin",
-        WeightBlob::from_f32_transposed(wo, d, d),
+        // Wo is [dim, q_dim], transposed to [q_dim, dim]
+        WeightBlob::from_f32_transposed(wo, d, qd),
     );
     weights.add("@model_path/weights/mask.bin", build_causal_mask(s));
 
@@ -1224,38 +1270,50 @@ pub fn gen_sdpa_bwd1(cfg: &TransformerKernelConfig, wo: &[f32]) -> KernelOutput 
 
 /// Generate the SDPA backward part 2 kernel (weight-free).
 ///
-/// Input: `[1, 2*SCORE_CH + 2*DIM, 1, SEQ]` = concat(probs, dp, Q, K)
-/// Output: `[1, 2*DIM, 1, SEQ]` = concat(dQ, dK)
+/// Input: `[1, 2*SCORE_CH + Q_DIM + KV_DIM, 1, SEQ]` = concat(probs, dp, Q, K)
+/// Output: `[1, Q_DIM + KV_DIM, 1, SEQ]` = concat(dQ, dK)
 ///
 /// No weights — compiled once and shared across layers.
+///
+/// Note: Requires MHA (n_kv_heads == n_heads). GQA backward would need
+/// gradient accumulation from n_heads back to n_kv_heads.
 pub fn gen_sdpa_bwd2(cfg: &TransformerKernelConfig) -> KernelOutput {
-    let d = cfg.dim;
+    let qd = cfg.q_dim(); // n_heads * head_dim
+    let kvd = cfg.kv_dim(); // n_kv_heads * head_dim (= qd for MHA)
     let s = cfg.seq_len;
     let h = cfg.n_heads;
     let hd = cfg.head_dim;
     let sc_ch = cfg.score_ch();
     let sc = 1.0 / (hd as f32).sqrt();
-    let in_ch = 2 * sc_ch + 2 * d;
+    let in_ch = 2 * sc_ch + qd + kvd;
+    let out_ch = qd + kvd;
+
+    debug_assert_eq!(
+        cfg.n_kv_heads, cfg.n_heads,
+        "Backward SDPA kernels require MHA (n_kv_heads == n_heads)"
+    );
 
     let mut p = MilProgram::new(in_ch, s);
 
-    // Slice inputs
+    // Slice inputs: probs(sc_ch), dp(sc_ch), Q(qd), K(kvd)
     p.emit_tensor_const("sz_sc", &[4], "int32", &format!("[1,{sc_ch},1,{s}]"));
     p.emit_tensor_const("b0", &[4], "int32", "[0,0,0,0]");
     p.emit_slice_by_size("pf", &[1, sc_ch, 1, s], "x", "b0", "sz_sc");
     p.emit_tensor_const("b1", &[4], "int32", &format!("[0,{sc_ch},0,0]"));
     p.emit_slice_by_size("dpf", &[1, sc_ch, 1, s], "x", "b1", "sz_sc");
-    p.emit_tensor_const("sz_d", &[4], "int32", &format!("[1,{d},1,{s}]"));
+    p.emit_tensor_const("szq", &[4], "int32", &format!("[1,{qd},1,{s}]"));
     p.emit_tensor_const("b2", &[4], "int32", &format!("[0,{},0,0]", 2 * sc_ch));
-    p.emit_slice_by_size("qf", &[1, d, 1, s], "x", "b2", "sz_d");
-    p.emit_tensor_const("b3", &[4], "int32", &format!("[0,{},0,0]", 2 * sc_ch + d));
-    p.emit_slice_by_size("kf", &[1, d, 1, s], "x", "b3", "sz_d");
+    p.emit_slice_by_size("qf", &[1, qd, 1, s], "x", "b2", "szq");
+    p.emit_tensor_const("szkv", &[4], "int32", &format!("[1,{kvd},1,{s}]"));
+    p.emit_tensor_const("b3", &[4], "int32", &format!("[0,{},0,0]", 2 * sc_ch + qd));
+    p.emit_slice_by_size("kf", &[1, kvd, 1, s], "x", "b3", "szkv");
 
     // Reshape to multi-head
     p.emit_tensor_const("ssh", &[4], "int32", &format!("[1,{h},{s},{s}]"));
     p.emit_reshape("probs", &[1, h, s, s], "ssh", "pf");
     p.emit_reshape("dp", &[1, h, s, s], "ssh", "dpf");
 
+    // MHA: qd = kvd = h*hd, so one reshape const works for both Q and K
     p.emit_tensor_const("rsh", &[4], "int32", &format!("[1,{h},{hd},{s}]"));
     p.emit_tensor_const("pm", &[4], "int32", "[0,1,3,2]");
     p.emit_reshape("qr", &[1, h, hd, s], "rsh", "qf");
@@ -1282,14 +1340,15 @@ pub fn gen_sdpa_bwd2(cfg: &TransformerKernelConfig) -> KernelOutput {
     // Reshape back to flat
     p.emit_transpose("dqt", &[1, h, hd, s], "pm", "dq4");
     p.emit_transpose("dkt", &[1, h, hd, s], "pm", "dk4");
-    p.emit_tensor_const("fs", &[4], "int32", &format!("[1,{d},1,{s}]"));
-    p.emit_reshape("dqf", &[1, d, 1, s], "fs", "dqt");
-    p.emit_reshape("dkf", &[1, d, 1, s], "fs", "dkt");
+    p.emit_tensor_const("fsq", &[4], "int32", &format!("[1,{qd},1,{s}]"));
+    p.emit_reshape("dqf", &[1, qd, 1, s], "fsq", "dqt");
+    p.emit_tensor_const("fskv", &[4], "int32", &format!("[1,{kvd},1,{s}]"));
+    p.emit_reshape("dkf", &[1, kvd, 1, s], "fskv", "dkt");
 
     // Output concat
     p.emit_scalar_const("cax", "int32", "1");
     p.emit_scalar_const("cid", "bool", "false");
-    p.emit_concat("out", &[1, 2 * d, 1, s], "cax", "cid", &["dqf", "dkf"]);
+    p.emit_concat("out", &[1, out_ch, 1, s], "cax", "cid", &["dqf", "dkf"]);
 
     let mil_text = p.finalize("out");
 
@@ -1297,16 +1356,19 @@ pub fn gen_sdpa_bwd2(cfg: &TransformerKernelConfig) -> KernelOutput {
         mil_text,
         weights: WeightDict::new(),
         input_bytes: in_ch * s * 2,
-        output_bytes: 2 * d * s * 2,
+        output_bytes: out_ch * s * 2,
     }
 }
 
 /// Generate the QKV backward kernel.
 ///
-/// Input: `[1, 3*DIM, 1, SEQ]` = concat(dQ, dK, dV)
+/// Input: `[1, Q_DIM + 2*KV_DIM, 1, SEQ]` = concat(dQ, dK, dV)
 /// Output: `[1, DIM, 1, SEQ]` = dx (sum of three transposed projections)
 ///
 /// Weights: Wq^T, Wk^T, Wv^T
+///
+/// Wq is [q_dim, dim], so Wq^T is [dim, q_dim]. Conv(Wq^T, dQ) → [dim, s].
+/// Same pattern for Wk^T [dim, kv_dim] and Wv^T [dim, kv_dim].
 pub fn gen_qkv_bwd(
     cfg: &TransformerKernelConfig,
     wq: &[f32],
@@ -1314,30 +1376,34 @@ pub fn gen_qkv_bwd(
     wv: &[f32],
 ) -> KernelOutput {
     let d = cfg.dim;
+    let qd = cfg.q_dim(); // n_heads * head_dim
+    let kvd = cfg.kv_dim(); // n_kv_heads * head_dim
     let s = cfg.seq_len;
-    let in_ch = 3 * d;
+    let in_ch = qd + 2 * kvd; // dQ(qd) + dK(kvd) + dV(kvd)
 
     let mut p = MilProgram::new(in_ch, s);
     p.emit_conv_constants();
 
-    // Slice inputs
-    p.emit_tensor_const("sz", &[4], "int32", &format!("[1,{d},1,{s}]"));
+    // Slice inputs: dQ(qd), dK(kvd), dV(kvd)
+    p.emit_tensor_const("szq", &[4], "int32", &format!("[1,{qd},1,{s}]"));
     p.emit_tensor_const("b0", &[4], "int32", "[0,0,0,0]");
-    p.emit_slice_by_size("dq", &[1, d, 1, s], "x", "b0", "sz");
-    p.emit_tensor_const("b1", &[4], "int32", &format!("[0,{d},0,0]"));
-    p.emit_slice_by_size("dk", &[1, d, 1, s], "x", "b1", "sz");
-    p.emit_tensor_const("b2", &[4], "int32", &format!("[0,{},0,0]", 2 * d));
-    p.emit_slice_by_size("dv", &[1, d, 1, s], "x", "b2", "sz");
+    p.emit_slice_by_size("dq", &[1, qd, 1, s], "x", "b0", "szq");
+    p.emit_tensor_const("szkv", &[4], "int32", &format!("[1,{kvd},1,{s}]"));
+    p.emit_tensor_const("b1", &[4], "int32", &format!("[0,{qd},0,0]"));
+    p.emit_slice_by_size("dk", &[1, kvd, 1, s], "x", "b1", "szkv");
+    p.emit_tensor_const("b2", &[4], "int32", &format!("[0,{},0,0]", qd + kvd));
+    p.emit_slice_by_size("dv", &[1, kvd, 1, s], "x", "b2", "szkv");
 
     // Transposed weight projections
-    p.emit_weight_const("Wqt", &[d, d, 1, 1], "@model_path/weights/wqt.bin");
-    p.emit_weight_const("Wkt", &[d, d, 1, 1], "@model_path/weights/wkt.bin");
-    p.emit_weight_const("Wvt", &[d, d, 1, 1], "@model_path/weights/wvt.bin");
+    // Wq^T: [dim, q_dim, 1, 1], Wk^T: [dim, kv_dim, 1, 1], Wv^T: [dim, kv_dim, 1, 1]
+    p.emit_weight_const("Wqt", &[d, qd, 1, 1], "@model_path/weights/wqt.bin");
+    p.emit_weight_const("Wkt", &[d, kvd, 1, 1], "@model_path/weights/wkt.bin");
+    p.emit_weight_const("Wvt", &[d, kvd, 1, 1], "@model_path/weights/wvt.bin");
     p.emit_conv("dxq", &[1, d, 1, s], "Wqt", "dq");
     p.emit_conv("dxk", &[1, d, 1, s], "Wkt", "dk");
     p.emit_conv("dxv", &[1, d, 1, s], "Wvt", "dv");
 
-    // Sum
+    // Sum all contributions to get dx
     p.emit_add("dxqk", &[1, d, 1, s], "dxq", "dxk");
     p.emit_add("out", &[1, d, 1, s], "dxqk", "dxv");
 
@@ -1346,15 +1412,18 @@ pub fn gen_qkv_bwd(
     let mut weights = WeightDict::new();
     weights.add(
         "@model_path/weights/wqt.bin",
-        WeightBlob::from_f32_transposed(wq, d, d),
+        // Wq is [q_dim, dim], transposed to [dim, q_dim]
+        WeightBlob::from_f32_transposed(wq, qd, d),
     );
     weights.add(
         "@model_path/weights/wkt.bin",
-        WeightBlob::from_f32_transposed(wk, d, d),
+        // Wk is [kv_dim, dim], transposed to [dim, kv_dim]
+        WeightBlob::from_f32_transposed(wk, kvd, d),
     );
     weights.add(
         "@model_path/weights/wvt.bin",
-        WeightBlob::from_f32_transposed(wv, d, d),
+        // Wv is [kv_dim, dim], transposed to [dim, kv_dim]
+        WeightBlob::from_f32_transposed(wv, kvd, d),
     );
 
     KernelOutput {
@@ -1633,5 +1702,140 @@ mod tests {
         assert_eq!(half::f16::from_bits(fp16[1]).to_f32(), 4.0);
         assert_eq!(half::f16::from_bits(fp16[2]).to_f32(), 2.0);
         assert_eq!(half::f16::from_bits(fp16[3]).to_f32(), 5.0);
+    }
+
+    // ================================================================
+    // Non-standard head_dim tests (Qwen3-style: head_dim != dim/n_heads)
+    // ================================================================
+
+    /// Qwen3-0.6B style config where q_dim (2048) != dim (1024).
+    fn qwen3_config() -> TransformerKernelConfig {
+        TransformerKernelConfig {
+            dim: 1024,        // hidden_size
+            hidden_dim: 3072, // intermediate_size
+            n_heads: 16,      // num_attention_heads
+            n_kv_heads: 16,   // MHA for Qwen3-0.6B
+            head_dim: 128,    // explicit head_dim → q_dim = 16*128 = 2048
+            seq_len: 64,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
+        }
+    }
+
+    #[test]
+    fn test_qwen3_config_dimensions() {
+        let cfg = qwen3_config();
+        assert_eq!(cfg.q_dim(), 2048); // 16 * 128
+        assert_eq!(cfg.kv_dim(), 2048); // 16 * 128 (MHA)
+        assert_ne!(cfg.q_dim(), cfg.dim); // Key invariant: q_dim != dim
+        assert_eq!(cfg.sdpa_fwd_output_ch(), 2 * 1024 + 2 * 2048 + 2 * 2048);
+        assert_eq!(cfg.sdpa_bwd1_input_ch(), 2048 + 2 * 2048 + 1024);
+        assert_eq!(cfg.sdpa_bwd2_input_ch(), 2 * (16 * 64) + 2048 + 2048);
+    }
+
+    #[test]
+    fn test_qwen3_sdpa_fwd_taps_shapes() {
+        let cfg = qwen3_config();
+        let d = cfg.dim;
+        let qd = cfg.q_dim();
+        let kvd = cfg.kv_dim();
+        let wq = vec![0.01f32; qd * d];
+        let wk = vec![0.01f32; kvd * d];
+        let wv = vec![0.01f32; kvd * d];
+        let wo = vec![0.01f32; d * qd];
+        let rms = vec![0.01f32; d];
+
+        let out = gen_sdpa_fwd_taps(&cfg, &rms, &wq, &wk, &wv, &wo);
+        assert!(out.mil_text.contains("program(1.3)"));
+        assert!(out.mil_text.contains("func main<ios18>"));
+        // Output should have the correct total channels
+        let expected_out_ch = cfg.sdpa_fwd_output_ch();
+        assert_eq!(out.output_bytes, expected_out_ch * cfg.seq_len * 2);
+    }
+
+    #[test]
+    fn test_qwen3_sdpa_bwd1_shapes() {
+        let cfg = qwen3_config();
+        let d = cfg.dim;
+        let qd = cfg.q_dim();
+        let wo = vec![0.01f32; d * qd]; // Wo: [dim, q_dim]
+
+        let out = gen_sdpa_bwd1(&cfg, &wo);
+        assert!(out.mil_text.contains("program(1.3)"));
+        // Input: Q(qd) + K(kvd) + V(kvd) + dy(d)
+        let expected_in_ch = cfg.sdpa_bwd1_input_ch();
+        assert_eq!(out.input_bytes, expected_in_ch * cfg.seq_len * 2);
+        // Output: dV(kvd) + 2*score_ch
+        let expected_out_ch = cfg.sdpa_bwd1_output_ch();
+        assert_eq!(out.output_bytes, expected_out_ch * cfg.seq_len * 2);
+        // Wo^T weight blob should be q_dim * dim * 2 (fp16) + 128 header
+        let wot_blob = &out.weights.entries.iter()
+            .find(|(k, _)| k.contains("wot.bin")).unwrap().1;
+        assert_eq!(wot_blob.len(), 128 + qd * d * 2);
+    }
+
+    #[test]
+    fn test_qwen3_sdpa_bwd2_shapes() {
+        let cfg = qwen3_config();
+        let qd = cfg.q_dim();
+        let kvd = cfg.kv_dim();
+
+        let out = gen_sdpa_bwd2(&cfg);
+        assert!(out.mil_text.contains("program(1.3)"));
+        // Input: probs + dp + Q(qd) + K(kvd)
+        let expected_in_ch = cfg.sdpa_bwd2_input_ch();
+        assert_eq!(out.input_bytes, expected_in_ch * cfg.seq_len * 2);
+        // Output: dQ(qd) + dK(kvd)
+        assert_eq!(out.output_bytes, (qd + kvd) * cfg.seq_len * 2);
+        // No weights
+        assert!(out.weights.entries.is_empty());
+    }
+
+    #[test]
+    fn test_qwen3_qkv_bwd_shapes() {
+        let cfg = qwen3_config();
+        let d = cfg.dim;
+        let qd = cfg.q_dim();
+        let kvd = cfg.kv_dim();
+        let wq = vec![0.01f32; qd * d]; // Wq: [q_dim, dim]
+        let wk = vec![0.01f32; kvd * d]; // Wk: [kv_dim, dim]
+        let wv = vec![0.01f32; kvd * d]; // Wv: [kv_dim, dim]
+
+        let out = gen_qkv_bwd(&cfg, &wq, &wk, &wv);
+        assert!(out.mil_text.contains("program(1.3)"));
+        // Input: dQ(qd) + dK(kvd) + dV(kvd)
+        let expected_in_ch = qd + 2 * kvd;
+        assert_eq!(out.input_bytes, expected_in_ch * cfg.seq_len * 2);
+        // Output: dx (dim)
+        assert_eq!(out.output_bytes, d * cfg.seq_len * 2);
+        // Weight blobs: Wq^T (qd*d), Wk^T (kvd*d), Wv^T (kvd*d)
+        let wqt = &out.weights.entries.iter()
+            .find(|(k, _)| k.contains("wqt.bin")).unwrap().1;
+        assert_eq!(wqt.len(), 128 + qd * d * 2);
+        let wkt = &out.weights.entries.iter()
+            .find(|(k, _)| k.contains("wkt.bin")).unwrap().1;
+        assert_eq!(wkt.len(), 128 + kvd * d * 2);
+    }
+
+    #[test]
+    fn test_qwen3_sdpa_fwd_kv_shapes() {
+        let cfg = qwen3_config();
+        let d = cfg.dim;
+        let qd = cfg.q_dim();
+        let kvd = cfg.kv_dim();
+        let hd = cfg.head_dim;
+        let rms = vec![0.01f32; d];
+        let wq = vec![0.01f32; qd * d];
+        let wk = vec![0.01f32; kvd * d];
+        let wv = vec![0.01f32; kvd * d];
+        let wo = vec![0.01f32; d * qd];
+        let q_norm = vec![0.01f32; hd];
+        let k_norm = vec![0.01f32; hd];
+
+        let out = gen_sdpa_fwd_kv(&cfg, &rms, &wq, &wk, &wv, &wo, &q_norm, &k_norm);
+        assert!(out.mil_text.contains("program(1.3)"));
+        // Output: o_out(dim) + k_cache(kv_dim) + v_cache(kv_dim) = d + 2*kvd
+        let expected_out_ch = d + 2 * kvd;
+        assert_eq!(out.output_bytes, expected_out_ch * cfg.seq_len * 2);
     }
 }

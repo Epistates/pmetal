@@ -5,7 +5,7 @@
 //!     --dim 768 --seq 256 --steps 5
 //! ```
 
-use pmetal_metal::ane::trainer::AneTrainerConfig;
+use pmetal_metal::ane::dynamic_trainer::DynamicAneTrainerConfig;
 use pmetal_trainer::ane_training::{AneTrainingLoop, AneTrainingLoopConfig};
 use std::env;
 use std::path::PathBuf;
@@ -46,7 +46,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let h_dim = dim * 4;
     let v_size = 32000;
 
-    let trainer_config = AneTrainerConfig {
+    let trainer_config = DynamicAneTrainerConfig {
         dim,
         hidden_dim: h_dim,
         n_heads: 12,
@@ -60,6 +60,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loop_config = AneTrainingLoopConfig {
         trainer: trainer_config,
         num_batches: steps,
+        max_steps: steps,
         log_every: 1,
         save_every: None,
         output_dir: PathBuf::from("./pmetal-ane-test"),

@@ -25,7 +25,7 @@
 //! pmetal-trainer = { version = "0.1", features = ["tensorboard"] }
 //! ```
 
-use pmetal_core::{EvalMetrics, TrainingCallback};
+use pmetal_core::{EvalMetrics, StepMetrics, TrainingCallback};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -272,6 +272,30 @@ impl TrainingCallback for MetricsJsonCallback {
         }
     }
 
+    fn on_step_end_with_metrics(&mut self, metrics: &StepMetrics) {
+        let timestamp = chrono::Utc::now().to_rfc3339();
+        self.write_entry(serde_json::json!({
+            "step": metrics.step,
+            "epoch": self.current_epoch,
+            "loss": metrics.loss,
+            "lr": metrics.lr,
+            "tok_sec": metrics.tok_sec,
+            "ane_fwd_ms": metrics.ane_fwd_ms,
+            "ane_bwd_ms": metrics.ane_bwd_ms,
+            "rmsnorm_ms": metrics.rmsnorm_ms,
+            "cblas_ms": metrics.cblas_ms,
+            "adam_ms": metrics.adam_ms,
+            "total_ms": metrics.total_ms,
+            "tokens": metrics.tokens,
+            "grad_norm": metrics.grad_norm,
+            "timestamp": timestamp,
+        }));
+
+        if metrics.step % 10 == 0 {
+            let _ = self.writer.flush();
+        }
+    }
+
     fn on_save(&mut self, path: &Path) {
         let timestamp = chrono::Utc::now().to_rfc3339();
         self.write_entry(serde_json::json!({
@@ -469,6 +493,12 @@ impl TrainingCallback for CompositeCallback {
     fn on_step_end(&mut self, step: usize, loss: f64) {
         for cb in &mut self.callbacks {
             cb.on_step_end(step, loss);
+        }
+    }
+
+    fn on_step_end_with_metrics(&mut self, metrics: &StepMetrics) {
+        for cb in &mut self.callbacks {
+            cb.on_step_end_with_metrics(metrics);
         }
     }
 

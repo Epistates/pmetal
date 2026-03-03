@@ -42,10 +42,13 @@ rand = { workspace = true }
 regex = "1"
 tempfile = { workspace = true }
 tokenizers = { workspace = true }
+ratatui = { version = "0.29", optional = true }
+crossterm = { version = "0.28", optional = true }
 
 [features]
 default = []
 ane = ["pmetal-trainer/ane", "pmetal-models/ane"]
+dashboard = ["dep:ratatui", "dep:crossterm"]
 
 [lints]
 workspace = true

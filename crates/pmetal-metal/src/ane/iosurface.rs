@@ -71,6 +71,14 @@ impl IoSurface {
         Self::new(channels * spatial * 2) // 2 bytes per fp16
     }
 
+    /// Create an IOSurface sized for `channels * spatial` fp32 elements.
+    ///
+    /// Used by the dynamic weight pipeline where activations and weights are
+    /// packed as fp32 in the spatial dimension (MIL handles fp32→fp16 cast).
+    pub fn for_tensor_f32(channels: usize, spatial: usize) -> Result<Self> {
+        Self::new(channels * spatial * 4) // 4 bytes per fp32
+    }
+
     /// Get the raw IOSurfaceRef pointer (for use with ANE APIs).
     pub fn as_ptr(&self) -> *mut c_void {
         self.surface
@@ -146,6 +154,145 @@ impl IoSurface {
             let base = ffi::IOSurfaceGetBaseAddress(self.surface) as *const u16;
             let src = std::slice::from_raw_parts(base.add(offset), n);
             f16_to_f32_bulk(src, dst);
+            ffi::IOSurfaceUnlock(
+                self.surface,
+                ffi::K_IO_SURFACE_LOCK_READ_ONLY,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    /// Write packed fp32 data for the dynamic weight pipeline.
+    ///
+    /// Packs activations and weight columns into a single IOSurface using
+    /// per-channel interleaved layout: `surface[ch][0:seq] = act[ch][0:seq]`,
+    /// then `surface[ch][seq:seq+wc] = weight_row[ch][0:wc]` for each weight.
+    ///
+    /// Layout: `[1, IC, 1, SEQ + total_weight_cols]` fp32
+    /// - `sp[0:seq]` = activations `[ic, seq]`
+    /// - `sp[seq:seq+w0_cols]` = weight0 row per channel
+    /// - `sp[seq+w0_cols:seq+w0_cols+w1_cols]` = weight1 row per channel
+    /// - etc.
+    ///
+    /// `weights` is a slice of `(data, cols)` pairs. Each weight matrix is
+    /// `[ic, cols]` row-major f32.
+    pub fn write_packed_f32(
+        &self,
+        act: &[f32],
+        weights: &[(&[f32], usize)],
+        ic: usize,
+        seq: usize,
+    ) {
+        let total_weight_cols: usize = weights.iter().map(|(_, c)| *c).sum();
+        let sp = seq + total_weight_cols;
+        debug_assert!(ic * sp * 4 <= self.size_bytes);
+        debug_assert_eq!(act.len(), ic * seq);
+
+        unsafe {
+            ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
+            let base = ffi::IOSurfaceGetBaseAddress(self.surface) as *mut f32;
+
+            for ch in 0..ic {
+                // Copy activation row: act[ch*seq .. ch*seq + seq]
+                std::ptr::copy_nonoverlapping(
+                    act.as_ptr().add(ch * seq),
+                    base.add(ch * sp),
+                    seq,
+                );
+
+                // Copy weight rows at spatial offsets
+                let mut w_off = seq;
+                for &(w_data, w_cols) in weights {
+                    debug_assert_eq!(w_data.len(), ic * w_cols);
+                    std::ptr::copy_nonoverlapping(
+                        w_data.as_ptr().add(ch * w_cols),
+                        base.add(ch * sp + w_off),
+                        w_cols,
+                    );
+                    w_off += w_cols;
+                }
+            }
+
+            ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut());
+        }
+    }
+
+    /// Write packed fp32 data with multiple activation streams.
+    ///
+    /// Like `write_packed_f32` but supports multiple activation buffers packed
+    /// sequentially in the spatial dimension before the weight columns.
+    ///
+    /// Layout: `[1, IC, 1, act0_cols + act1_cols + ... + total_weight_cols]`
+    /// `acts` is `[(data, cols)]`, `weights` is `[(data, cols)]`.
+    pub fn write_packed_f32_multi(
+        &self,
+        acts: &[(&[f32], usize)],
+        weights: &[(&[f32], usize)],
+        ic: usize,
+    ) {
+        let total_act_cols: usize = acts.iter().map(|(_, c)| *c).sum();
+        let total_weight_cols: usize = weights.iter().map(|(_, c)| *c).sum();
+        let sp = total_act_cols + total_weight_cols;
+        debug_assert!(ic * sp * 4 <= self.size_bytes);
+
+        unsafe {
+            ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
+            let base = ffi::IOSurfaceGetBaseAddress(self.surface) as *mut f32;
+
+            for ch in 0..ic {
+                let mut off = 0;
+
+                // Copy activation rows
+                for &(a_data, a_cols) in acts {
+                    debug_assert_eq!(a_data.len(), ic * a_cols);
+                    std::ptr::copy_nonoverlapping(
+                        a_data.as_ptr().add(ch * a_cols),
+                        base.add(ch * sp + off),
+                        a_cols,
+                    );
+                    off += a_cols;
+                }
+
+                // Copy weight rows
+                for &(w_data, w_cols) in weights {
+                    debug_assert_eq!(w_data.len(), ic * w_cols);
+                    std::ptr::copy_nonoverlapping(
+                        w_data.as_ptr().add(ch * w_cols),
+                        base.add(ch * sp + off),
+                        w_cols,
+                    );
+                    off += w_cols;
+                }
+            }
+
+            ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut());
+        }
+    }
+
+    /// Read fp32 data directly from an fp32 IOSurface.
+    ///
+    /// Reads `channels * spatial` fp32 elements starting at `ch_offset`.
+    /// No dtype conversion — used with dynamic pipeline fp32 output surfaces.
+    pub fn read_f32(
+        &self,
+        dst: &mut [f32],
+        ch_offset: usize,
+        channels: usize,
+        spatial: usize,
+    ) {
+        let n = channels * spatial;
+        let offset = ch_offset * spatial;
+        debug_assert_eq!(dst.len(), n);
+        debug_assert!((offset + n) * 4 <= self.size_bytes);
+
+        unsafe {
+            ffi::IOSurfaceLock(
+                self.surface,
+                ffi::K_IO_SURFACE_LOCK_READ_ONLY,
+                std::ptr::null_mut(),
+            );
+            let base = ffi::IOSurfaceGetBaseAddress(self.surface) as *const f32;
+            std::ptr::copy_nonoverlapping(base.add(offset), dst.as_mut_ptr(), n);
             ffi::IOSurfaceUnlock(
                 self.surface,
                 ffi::K_IO_SURFACE_LOCK_READ_ONLY,
@@ -286,6 +433,68 @@ mod tests {
                 (read - expected).abs() < 0.01,
                 "Mismatch at {i}: orig={orig}, read={read}, expected={expected}"
             );
+        }
+    }
+
+    #[test]
+    fn test_iosurface_f32_write_read() {
+        let channels = 4;
+        let spatial = 8;
+        let surface = match IoSurface::for_tensor_f32(channels, spatial) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        // Write known f32 data using packed write (no weights)
+        let data: Vec<f32> = (0..channels * spatial).map(|i| i as f32 * 0.5).collect();
+        surface.write_packed_f32(&data, &[], channels, spatial);
+
+        // Read it back
+        let mut out = vec![0.0f32; channels * spatial];
+        surface.read_f32(&mut out, 0, channels, spatial);
+
+        for (i, (orig, read)) in data.iter().zip(out.iter()).enumerate() {
+            assert!(
+                (read - orig).abs() < 1e-6,
+                "Mismatch at {i}: orig={orig}, read={read}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_iosurface_packed_f32_with_weights() {
+        let ic = 4;
+        let seq = 8;
+        let oc = 3;
+        let sp = seq + oc;
+        let surface = match IoSurface::for_tensor_f32(ic, sp) {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+
+        let act: Vec<f32> = (0..ic * seq).map(|i| i as f32).collect();
+        let weight: Vec<f32> = (0..ic * oc).map(|i| 100.0 + i as f32).collect();
+
+        surface.write_packed_f32(&act, &[(&weight, oc)], ic, seq);
+
+        // Read back the full spatial extent and verify layout
+        let mut out = vec![0.0f32; ic * sp];
+        surface.read_f32(&mut out, 0, ic, sp);
+
+        // Verify per-channel: out[ch*sp .. ch*sp+seq] == act, out[ch*sp+seq .. ch*sp+sp] == weight
+        for ch in 0..ic {
+            for t in 0..seq {
+                assert!(
+                    (out[ch * sp + t] - act[ch * seq + t]).abs() < 1e-6,
+                    "Act mismatch at ch={ch}, t={t}"
+                );
+            }
+            for w in 0..oc {
+                assert!(
+                    (out[ch * sp + seq + w] - weight[ch * oc + w]).abs() < 1e-6,
+                    "Weight mismatch at ch={ch}, w={w}"
+                );
+            }
         }
     }
 

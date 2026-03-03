@@ -47,6 +47,9 @@ pub struct AneRuntime {
     request_class: &'static AnyClass,
     /// `_ANEIOSurfaceObject`
     io_surface_class: &'static AnyClass,
+    /// `_ANEChainingRequest` — probe-only, None if unavailable.
+    /// Available on M4/M5 hardware but no known working invocation exists.
+    chaining_class: Option<&'static AnyClass>,
 }
 
 // SAFETY: The ObjC classes are process-global singletons and thread-safe for class method dispatch.
@@ -80,11 +83,20 @@ impl AneRuntime {
         let request_class = resolve_class(c"_ANERequest")?;
         let io_surface_class = resolve_class(c"_ANEIOSurfaceObject")?;
 
+        // Probe for chaining API (M4/M5 only, no working invocation known)
+        let chaining_class = AnyClass::get(c"_ANEChainingRequest");
+        if chaining_class.is_some() {
+            tracing::info!("ANE chaining API (_ANEChainingRequest) detected — available for future research");
+        } else {
+            tracing::debug!("ANE chaining API not available on this hardware");
+        }
+
         Ok(AneRuntime {
             descriptor_class,
             model_class,
             request_class,
             io_surface_class,
+            chaining_class,
         })
     }
 
@@ -222,6 +234,14 @@ impl AneRuntime {
     /// Get a reference to the `_ANERequest` class.
     pub fn request_class(&self) -> &'static AnyClass {
         self.request_class
+    }
+
+    /// Check if the ANE chaining API is available (M4/M5 hardware).
+    ///
+    /// Returns `Some` if `_ANEChainingRequest` was resolved. No working
+    /// invocation pattern exists yet — this is telemetry for future research.
+    pub fn chaining_available(&self) -> bool {
+        self.chaining_class.is_some()
     }
 }
 

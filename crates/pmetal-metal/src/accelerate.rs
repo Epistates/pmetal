@@ -1011,7 +1011,7 @@ mod tests {
 
     #[test]
     fn test_embed_lookup_roundtrip() {
-        let vocab = 3;
+        let _vocab = 3;
         let dim = 2;
         let seq = 3;
         // embed: [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]

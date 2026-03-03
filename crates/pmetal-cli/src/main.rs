@@ -5,6 +5,8 @@
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::needless_borrows_for_generic_args)]
 
+mod dashboard;
+
 use std::path::{Component, Path, PathBuf};
 
 use clap::{Parser, Subcommand, ValueEnum};
@@ -189,6 +191,11 @@ enum Commands {
         /// Improves training stability for large vocabulary models.
         #[arg(long)]
         embedding_lr: Option<f32>,
+
+        /// Use ANE (Apple Neural Engine) for training.
+        #[cfg(feature = "ane")]
+        #[arg(long)]
+        ane: bool,
     },
 
     /// Run inference with a model
@@ -282,6 +289,12 @@ enum Commands {
         /// for memory-efficient inference on Apple Silicon.
         #[arg(long)]
         fp8: bool,
+
+        /// Use ANE (Apple Neural Engine) for inference (hybrid ANE prefill + CPU decode).
+        /// High power efficiency for long-running reasoning sessions.
+        #[cfg(feature = "ane")]
+        #[arg(long)]
+        ane: bool,
     },
 
     /// Download a model from HuggingFace
@@ -464,6 +477,13 @@ enum Commands {
     Dataset {
         #[command(subcommand)]
         action: DatasetAction,
+    },
+
+    /// Real-time training dashboard (loss curves, ANE utilization, timing)
+    Dashboard {
+        /// Path to training metrics JSONL file to visualize
+        #[arg(short, long)]
+        metrics_file: Option<String>,
     },
 }
 
@@ -1095,6 +1115,8 @@ async fn main() -> anyhow::Result<()> {
             gradient_checkpointing_layers,
             log_metrics,
             embedding_lr,
+            #[cfg(feature = "ane")]
+            ane,
         } => {
             // Optimizations enabled by default (invert no_* flags)
             let use_metal_flash_attention = !no_flash_attention;
@@ -1131,6 +1153,10 @@ async fn main() -> anyhow::Result<()> {
                 gradient_checkpointing_layers,
                 log_metrics,
                 embedding_lr,
+                #[cfg(feature = "ane")]
+                ane,
+                #[cfg(not(feature = "ane"))]
+                false,
             )
             .await?;
         }
@@ -1157,6 +1183,8 @@ async fn main() -> anyhow::Result<()> {
             minimal,
             show_thinking,
             fp8,
+            #[cfg(feature = "ane")]
+            ane,
         } => {
             run_inference(
                 &model,
@@ -1180,6 +1208,10 @@ async fn main() -> anyhow::Result<()> {
                 minimal,
                 show_thinking,
                 fp8,
+                #[cfg(feature = "ane")]
+                ane,
+                #[cfg(not(feature = "ane"))]
+                false,
             )
             .await?;
         }
@@ -1312,6 +1344,11 @@ async fn main() -> anyhow::Result<()> {
 
         Commands::Dataset { action } => {
             run_dataset_command(action).await?;
+        }
+
+        Commands::Dashboard { metrics_file } => {
+            let path = metrics_file.map(std::path::PathBuf::from);
+            dashboard::run_dashboard(path)?;
         }
     }
 
@@ -1958,7 +1995,136 @@ async fn run_training(
     gradient_checkpointing_layers: usize,
     log_metrics: Option<String>,
     embedding_lr: Option<f32>,
+    ane: bool,
 ) -> anyhow::Result<()> {
+    #[cfg(not(feature = "ane"))]
+    if ane {
+        anyhow::bail!("ANE training requires the 'ane' feature: cargo build --features ane");
+    }
+    #[cfg(feature = "ane")]
+    if ane {
+        use pmetal_trainer::{DynamicAneTrainerConfig, AneTrainingLoop, AneTrainingLoopConfig};
+
+        tracing::info!("Using ANE dynamic weight pipeline (compile-once, 9 kernels)");
+
+        // Resolve model path
+        let model_name = model_id
+            .as_deref()
+            .or(config_path.as_deref())
+            .ok_or_else(|| anyhow::anyhow!("--model is required for ANE training"))?;
+        let model_path = if model_name.contains('/') && !PathBuf::from(model_name).exists() {
+            pmetal_hub::download_model(model_name, None, None).await?
+        } else {
+            PathBuf::from(model_name)
+        };
+
+        // Read model config
+        let config_text = std::fs::read_to_string(model_path.join("config.json"))?;
+        let config_json: serde_json::Value = serde_json::from_str(&config_text)?;
+        let get_usize = |key: &str| -> anyhow::Result<usize> {
+            config_json
+                .get(key)
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .ok_or_else(|| anyhow::anyhow!("config.json missing '{key}'"))
+        };
+        let dim = get_usize("hidden_size")?;
+        let hidden_dim = get_usize("intermediate_size")?;
+        let n_heads = get_usize("num_attention_heads")?;
+        let n_layers = get_usize("num_hidden_layers")?;
+        let vocab_size = get_usize("vocab_size")?;
+
+        // Load tokenizer and dataset
+        let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))?;
+        let ds_path = dataset_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--dataset is required for ANE training"))?;
+        let text_samples = TrainingDataset::load_jsonl_text(ds_path, DatasetFormat::Auto, None)?;
+
+        // Tokenize and prepare batches: Vec<Vec<(Vec<u16>, Vec<u16>)>>
+        // Each batch contains `gradient_accumulation_steps` examples.
+        // Each example is (input, target) where target = input shifted by 1.
+        let mut batches: Vec<Vec<(Vec<u16>, Vec<u16>)>> = Vec::new();
+        let mut current_batch: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
+
+        for sample in &text_samples {
+            let tokens = tokenizer.encode(&sample.text)?;
+            if tokens.len() < 2 {
+                continue;
+            }
+            let len = tokens.len().min(max_seq_len + 1);
+            let input: Vec<u16> = tokens[..len - 1].iter().map(|&t| t as u16).collect();
+            let target: Vec<u16> = tokens[1..len].iter().map(|&t| t as u16).collect();
+            current_batch.push((input, target));
+
+            if current_batch.len() >= gradient_accumulation_steps.max(1) {
+                batches.push(std::mem::take(&mut current_batch));
+            }
+        }
+        if !current_batch.is_empty() {
+            batches.push(current_batch);
+        }
+
+        if batches.is_empty() {
+            anyhow::bail!("No training examples after tokenization");
+        }
+
+        let total_batches = batches.len() * num_epochs;
+        tracing::info!(
+            examples = text_samples.len(),
+            batches = batches.len(),
+            epochs = num_epochs,
+            total_steps = total_batches,
+            "Prepared ANE training data"
+        );
+
+        let trainer_config = DynamicAneTrainerConfig {
+            dim,
+            hidden_dim,
+            n_heads,
+            n_layers,
+            vocab_size,
+            seq_len: max_seq_len,
+            learning_rate: learning_rate as f32,
+            accum_steps: gradient_accumulation_steps.max(1),
+            ..Default::default()
+        };
+
+        let loop_config = AneTrainingLoopConfig {
+            trainer: trainer_config,
+            num_batches: total_batches,
+            max_steps: total_batches,
+            log_every: 10,
+            save_every: Some(100),
+            output_dir: PathBuf::from(&output_dir),
+        };
+
+        let mut training_loop = AneTrainingLoop::new(loop_config);
+
+        // Load model weights from SafeTensors
+        tracing::info!("Loading model weights for ANE training...");
+        training_loop.load_weights_safetensors(&model_path)?;
+
+        // Compile 9 dynamic ANE kernels (one-time, no recompilation ever)
+        tracing::info!("Compiling 9 dynamic ANE kernels (one-time)...");
+        training_loop.compile_kernels()?;
+
+        // Run training
+        for epoch in 0..num_epochs {
+            tracing::info!(epoch = epoch + 1, total = num_epochs, "Starting epoch");
+            let state = training_loop.train(&batches)?;
+            tracing::info!(
+                loss = state.loss,
+                tokens = state.tokens_processed,
+                tok_per_sec = format!("{:.1}", state.tokens_per_sec()),
+                "Epoch complete"
+            );
+        }
+
+        tracing::info!("ANE training complete");
+        return Ok(());
+    }
+
     let use_qlora = !matches!(quantization, QuantizationMethod::None);
 
     // Validate output directory to prevent path traversal attacks
@@ -2503,12 +2669,17 @@ async fn run_inference(
     minimal: bool,
     show_thinking: bool,
     fp8: bool,
+    ane: bool,
 ) -> anyhow::Result<()> {
+    #[cfg(not(feature = "ane"))]
+    if ane {
+        anyhow::bail!("ANE inference requires the 'ane' feature: cargo build --features ane");
+    }
     #[cfg(target_os = "macos")]
     use pmetal_models::generate_cached_metal;
     use pmetal_models::{
-        DynamicModel, GenerationConfig, generate_cached_async, generate_cached_compiled,
-        generate_minimal_async,
+        DynamicModel, GenerationConfig, GenerationOutput, generate_cached_async,
+        generate_cached_compiled, generate_minimal_async,
     };
 
     tracing::info!(model = %model_id, "Loading model for inference");
@@ -2703,55 +2874,75 @@ async fn run_inference(
     let start = std::time::Instant::now();
 
     #[cfg(target_os = "macos")]
-    let output = if minimal {
-        tracing::info!("Using minimal async generation (debugging)");
-        generate_minimal_async(
-            |input, cache| {
-                model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-            },
-            &input_ids,
-            gen_config,
-            &mut cache,
-        )?
-    } else if metal_sampler {
-        tracing::info!("Using fused Metal sampling kernel");
-        generate_cached_metal(
-            |input, cache| {
-                model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-            },
-            &input_ids,
-            gen_config,
-            &mut cache,
-        )?
-    } else if compiled {
-        tracing::info!("Using JIT-compiled sampling (mlx_lm style)");
-        generate_cached_compiled(
-            |input, cache| {
-                model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-            },
-            &input_ids,
-            gen_config,
-            &mut cache,
-        )?
-    } else {
-        // Default: async generation with dedicated stream (matches mlx_lm)
-        // Note: --stream flag is now a no-op since async is the default
-        if stream {
-            tracing::info!("Using async generation with dedicated stream");
+    let output = {
+        // ANE branch: separate engine with its own weight loading and KV cache
+        #[cfg(feature = "ane")]
+        let ane_output: Option<GenerationOutput> = if ane {
+            tracing::info!("Using ANE-hybrid inference engine (Prefill: ANE, Decode: CPU/vDSP)");
+            Some(pmetal_models::generate_cached_ane(
+                &model_path,
+                &input_ids,
+                &gen_config,
+            )?)
+        } else {
+            None
+        };
+        #[cfg(not(feature = "ane"))]
+        let ane_output: Option<GenerationOutput> = None;
+
+        if let Some(output) = ane_output {
+            output
+        } else if minimal {
+            tracing::info!("Using minimal async generation (debugging)");
+            generate_minimal_async(
+                |input, cache| {
+                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+                },
+                &input_ids,
+                gen_config,
+                &mut cache,
+            )?
+        } else if metal_sampler {
+            tracing::info!("Using fused Metal sampling kernel");
+            generate_cached_metal(
+                |input, cache| {
+                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+                },
+                &input_ids,
+                gen_config,
+                &mut cache,
+            )?
+        } else if compiled {
+            tracing::info!("Using JIT-compiled sampling (mlx_lm style)");
+            generate_cached_compiled(
+                |input, cache| {
+                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+                },
+                &input_ids,
+                gen_config,
+                &mut cache,
+            )?
+        } else {
+            // Default: async generation with dedicated stream (matches mlx_lm)
+            // Note: --stream flag is now a no-op since async is the default
+            if stream {
+                tracing::info!("Using async generation with dedicated stream");
+            }
+            generate_cached_async(
+                |input, cache| {
+                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
+                },
+                &input_ids,
+                gen_config,
+                &mut cache,
+            )?
         }
-        generate_cached_async(
-            |input, cache| {
-                model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-            },
-            &input_ids,
-            gen_config,
-            &mut cache,
-        )?
     };
 
     #[cfg(not(target_os = "macos"))]
     let output = {
         let _ = metal_sampler; // Suppress unused warning
+        let _ = ane;
         if minimal {
             tracing::info!("Using minimal async generation (debugging)");
             generate_minimal_async(

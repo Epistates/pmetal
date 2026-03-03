@@ -3,7 +3,7 @@
 //! Note: Some traits in this module are deprecated. See individual trait documentation
 //! for current recommended patterns.
 
-use crate::{EvalMetrics, LoraConfig, MemoryStats, ModelConfig, Result, TrainingConfig};
+use crate::{EvalMetrics, LoraConfig, MemoryStats, ModelConfig, Result, StepMetrics, TrainingConfig};
 use std::path::Path;
 
 /// Core model trait for all LLM architectures.
@@ -213,6 +213,15 @@ pub trait TrainingCallback: Send + Sync {
 
     /// Called at the end of each step.
     fn on_step_end(&mut self, _step: usize, _loss: f64) {}
+
+    /// Called at the end of each step with rich metrics (timing, throughput, lr).
+    ///
+    /// Default implementation delegates to [`on_step_end`](TrainingCallback::on_step_end).
+    /// Override this method in callbacks that need timing breakdown or throughput data
+    /// (e.g., dashboard, detailed JSONL logging).
+    fn on_step_end_with_metrics(&mut self, metrics: &StepMetrics) {
+        self.on_step_end(metrics.step, metrics.loss);
+    }
 
     /// Called when a checkpoint is saved.
     fn on_save(&mut self, _path: &Path) {}

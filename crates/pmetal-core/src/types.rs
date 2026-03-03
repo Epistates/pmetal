@@ -207,6 +207,39 @@ impl TrainingState {
     }
 }
 
+/// Rich per-step metrics for dashboard and callback consumption.
+///
+/// Carries timing breakdown, throughput, and learning rate alongside loss.
+/// Used by [`TrainingCallback::on_step_end_with_metrics`] to feed real-time
+/// dashboards and JSONL loggers with complete training telemetry.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StepMetrics {
+    /// Step number.
+    pub step: usize,
+    /// Loss value.
+    pub loss: f64,
+    /// Learning rate.
+    pub lr: f64,
+    /// Tokens processed per second.
+    pub tok_sec: f64,
+    /// ANE forward pass time (ms). Zero for GPU-only training.
+    pub ane_fwd_ms: f64,
+    /// ANE backward pass time (ms). Zero for GPU-only training.
+    pub ane_bwd_ms: f64,
+    /// RMSNorm CPU time (ms).
+    pub rmsnorm_ms: f64,
+    /// cblas weight gradient time (ms).
+    pub cblas_ms: f64,
+    /// Adam optimizer time (ms).
+    pub adam_ms: f64,
+    /// Total step time (ms).
+    pub total_ms: f64,
+    /// Number of tokens in this step.
+    pub tokens: usize,
+    /// Gradient norm (if computed).
+    pub grad_norm: Option<f64>,
+}
+
 /// Checkpoint metadata for saving/loading training state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointMetadata {

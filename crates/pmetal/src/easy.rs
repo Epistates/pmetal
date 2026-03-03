@@ -627,6 +627,7 @@ impl InferBuilder {
         }
         let rope_theta = extract_float(&config_text, "rope_theta").unwrap_or(1_000_000.0);
         let rms_norm_eps = extract_float(&config_text, "rms_norm_eps").unwrap_or(1e-6);
+        let head_dim = extract_usize_optional(&config_text, "head_dim");
 
         let ane_config = AneInferenceConfig {
             dim,
@@ -642,6 +643,7 @@ impl InferBuilder {
             eos_token_id: tokenizer.eos_token_id(),
             rope_theta,
             rms_norm_eps,
+            head_dim,
             ..Default::default()
         };
 

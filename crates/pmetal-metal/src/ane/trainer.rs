@@ -414,6 +414,170 @@ impl AneTrainer {
         self.rms_final.copy_from_slice(&weights[offset..offset + d]);
     }
 
+    /// Load weights from SafeTensors files on disk.
+    ///
+    /// Supports both single-file (`model.safetensors`) and sharded formats
+    /// (with `model.safetensors.index.json`). Handles F32, F16, and BF16 dtypes.
+    ///
+    /// Note: The trainer assumes MHA (n_kv_heads == n_heads), so K/V projection
+    /// weights must be `[D, D]`. GQA models are not currently supported for training.
+    pub fn load_weights_safetensors(&mut self, path: &std::path::Path) -> Result<()> {
+        use memmap2::Mmap;
+        use safetensors::SafeTensors;
+
+        let d = self.config.dim;
+        let h = self.config.hidden_dim;
+
+        fn st_to_f32(tensor: &safetensors::tensor::TensorView<'_>) -> Option<Vec<f32>> {
+            use safetensors::Dtype;
+            match tensor.dtype() {
+                Dtype::F32 => {
+                    let bytes = tensor.data();
+                    if bytes.len() % 4 != 0 {
+                        return None;
+                    }
+                    let n = bytes.len() / 4;
+                    let mut out = vec![0.0f32; n];
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            bytes.as_ptr(),
+                            out.as_mut_ptr() as *mut u8,
+                            n * 4,
+                        );
+                    }
+                    Some(out)
+                }
+                Dtype::F16 => {
+                    let bytes = tensor.data();
+                    if bytes.len() % 2 != 0 {
+                        return None;
+                    }
+                    let n = bytes.len() / 2;
+                    let mut out = vec![0.0f32; n];
+                    for i in 0..n {
+                        let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                        out[i] = half::f16::from_bits(bits).to_f32();
+                    }
+                    Some(out)
+                }
+                Dtype::BF16 => {
+                    let bytes = tensor.data();
+                    if bytes.len() % 2 != 0 {
+                        return None;
+                    }
+                    let n = bytes.len() / 2;
+                    let mut out = vec![0.0f32; n];
+                    for i in 0..n {
+                        let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
+                        out[i] = f32::from_bits((bits as u32) << 16);
+                    }
+                    Some(out)
+                }
+                _ => None,
+            }
+        }
+
+        fn copy_w(src: &[f32], dst: &mut [f32], expected: usize) {
+            let n = src.len().min(expected).min(dst.len());
+            dst[..n].copy_from_slice(&src[..n]);
+        }
+
+        // Determine files to load
+        let files = if path.is_file() {
+            vec![path.to_path_buf()]
+        } else {
+            let index_path = path.join("model.safetensors.index.json");
+            if index_path.exists() {
+                let index_text = std::fs::read_to_string(&index_path).map_err(|e| {
+                    MetalError::InvalidConfig(format!("Failed to read index.json: {e}"))
+                })?;
+                let index: serde_json::Value = serde_json::from_str(&index_text).map_err(|e| {
+                    MetalError::InvalidConfig(format!("Failed to parse index.json: {e}"))
+                })?;
+                let weight_map = index["weight_map"]
+                    .as_object()
+                    .ok_or_else(|| MetalError::InvalidConfig("Missing weight_map".into()))?;
+                let mut unique_files: Vec<String> = weight_map
+                    .values()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect();
+                unique_files.sort();
+                unique_files.dedup();
+                unique_files.iter().map(|f| path.join(f)).collect()
+            } else {
+                let single = path.join("model.safetensors");
+                if single.exists() {
+                    vec![single]
+                } else {
+                    return Err(MetalError::InvalidConfig(
+                        "No safetensors files found".into(),
+                    ));
+                }
+            }
+        };
+
+        for file_path in &files {
+            let file = std::fs::File::open(file_path).map_err(|e| {
+                MetalError::InvalidConfig(format!("Failed to open {:?}: {e}", file_path))
+            })?;
+            #[allow(unsafe_code)]
+            let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
+                MetalError::InvalidConfig(format!("Failed to mmap {:?}: {e}", file_path))
+            })?;
+            let tensors = SafeTensors::deserialize(&mmap).map_err(|e| {
+                MetalError::InvalidConfig(format!("Failed to parse safetensors: {e}"))
+            })?;
+
+            for (name, tensor) in tensors.tensors() {
+                let data = match st_to_f32(&tensor) {
+                    Some(d) => d,
+                    None => continue,
+                };
+
+                if name == "model.embed_tokens.weight" {
+                    let expected = self.config.vocab_size * d;
+                    copy_w(&data, &mut self.embed_weights, expected);
+                    continue;
+                }
+                if name == "model.norm.weight" {
+                    copy_w(&data, &mut self.rms_final, d);
+                    continue;
+                }
+
+                // Parse "model.layers.{i}.{suffix}"
+                if let Some(rest) = name.strip_prefix("model.layers.") {
+                    let parts: Vec<&str> = rest.splitn(2, '.').collect();
+                    if parts.len() < 2 {
+                        continue;
+                    }
+                    let layer_idx: usize = match parts[0].parse() {
+                        Ok(i) => i,
+                        Err(_) => continue,
+                    };
+                    if layer_idx >= self.config.n_layers {
+                        continue;
+                    }
+
+                    let lw = &mut self.layer_weights[layer_idx];
+                    match parts[1] {
+                        "self_attn.q_proj.weight" => copy_w(&data, &mut lw.wq, d * d),
+                        "self_attn.k_proj.weight" => copy_w(&data, &mut lw.wk, d * d),
+                        "self_attn.v_proj.weight" => copy_w(&data, &mut lw.wv, d * d),
+                        "self_attn.o_proj.weight" => copy_w(&data, &mut lw.wo, d * d),
+                        "mlp.gate_proj.weight" => copy_w(&data, &mut lw.w1, h * d),
+                        "mlp.down_proj.weight" => copy_w(&data, &mut lw.w2, d * h),
+                        "mlp.up_proj.weight" => copy_w(&data, &mut lw.w3, h * d),
+                        "input_layernorm.weight" => copy_w(&data, &mut lw.rms_att, d),
+                        "post_attention_layernorm.weight" => copy_w(&data, &mut lw.rms_ffn, d),
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     /// Compile all kernels for the current weights.
     ///
     /// Frees any previously compiled kernels, generates MIL + weight blobs,

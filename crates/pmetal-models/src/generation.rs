@@ -1933,6 +1933,106 @@ where
     })
 }
 
+// ============================================================================
+// ANE generation (Apple Neural Engine)
+// ============================================================================
+
+/// Generate text using the ANE hybrid inference engine (ANE prefill + CPU decode).
+///
+/// Loads model weights from SafeTensors on disk, compiles ANE kernels for the
+/// prompt length, and runs autoregressive generation with KV caching.
+///
+/// Returns a [`GenerationOutput`] compatible with the GPU generation functions.
+#[cfg(feature = "ane")]
+pub fn generate_cached_ane(
+    model_path: &std::path::Path,
+    input_ids: &[u32],
+    gen_config: &GenerationConfig,
+) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError> {
+    use pmetal_metal::ane::inference::{AneInferenceConfig, AneInferenceEngine};
+
+    // Read and parse config.json for model architecture parameters
+    let config_text = std::fs::read_to_string(model_path.join("config.json")).map_err(|e| {
+        pmetal_metal::error::MetalError::InvalidConfig(format!("Failed to read config.json: {e}"))
+    })?;
+    let config_json: serde_json::Value = serde_json::from_str(&config_text).map_err(|e| {
+        pmetal_metal::error::MetalError::InvalidConfig(format!("Failed to parse config.json: {e}"))
+    })?;
+
+    let get_usize = |key: &str| -> std::result::Result<usize, pmetal_metal::error::MetalError> {
+        config_json
+            .get(key)
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .ok_or_else(|| {
+                pmetal_metal::error::MetalError::InvalidConfig(format!(
+                    "config.json missing '{key}'"
+                ))
+            })
+    };
+    let get_float_or = |key: &str, default: f64| -> f32 {
+        config_json
+            .get(key)
+            .and_then(|v| v.as_f64())
+            .unwrap_or(default) as f32
+    };
+
+    let dim = get_usize("hidden_size")?;
+    let hidden_dim = get_usize("intermediate_size")?;
+    let n_heads = get_usize("num_attention_heads")?;
+    let n_layers = get_usize("num_hidden_layers")?;
+    let vocab_size = get_usize("vocab_size")?;
+    let n_kv_heads = config_json
+        .get("num_key_value_heads")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize)
+        .unwrap_or(n_heads);
+    let rope_theta = get_float_or("rope_theta", 1_000_000.0);
+    let rms_norm_eps = get_float_or("rms_norm_eps", 1e-6);
+    let head_dim = config_json
+        .get("head_dim")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+
+    let ane_config = AneInferenceConfig {
+        dim,
+        hidden_dim,
+        n_heads,
+        n_kv_heads,
+        n_layers,
+        vocab_size,
+        max_seq_len: input_ids.len() + gen_config.max_new_tokens + 64,
+        temperature: gen_config.temperature,
+        top_k: gen_config.top_k,
+        max_tokens: gen_config.max_new_tokens,
+        eos_token_id: gen_config.stop_tokens.first().copied(),
+        rope_theta,
+        rms_norm_eps,
+        head_dim,
+        ..Default::default()
+    };
+
+    let mut engine = AneInferenceEngine::new(ane_config)?;
+    engine.load_weights_safetensors(model_path)?;
+    engine.compile_kernels()?;
+
+    let prompt_len = input_ids.len();
+    let token_ids = engine.generate_cached(input_ids)?;
+    let num_generated = token_ids.len() - prompt_len;
+
+    let stopped_by_token = gen_config
+        .stop_tokens
+        .iter()
+        .any(|eos| token_ids.last() == Some(eos));
+
+    Ok(GenerationOutput {
+        token_ids,
+        num_generated,
+        stopped_by_token,
+        stopped_by_length: !stopped_by_token && num_generated >= gen_config.max_new_tokens,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

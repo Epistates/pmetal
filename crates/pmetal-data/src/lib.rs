@@ -17,6 +17,7 @@ pub mod dataset;
 pub mod image_processing;
 pub mod packing;
 pub mod tokenizer;
+pub mod vocab_compact;
 
 pub use collator::*;
 pub use dataloader::*;
@@ -24,3 +25,4 @@ pub use dataset::*;
 pub use image_processing::*;
 pub use packing::*;
 pub use tokenizer::*;
+pub use vocab_compact::VocabCompactor;
