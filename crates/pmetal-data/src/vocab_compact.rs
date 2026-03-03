@@ -71,7 +71,10 @@ impl VocabCompactor {
     ///
     /// Returns `None` if the token was not seen in the training data.
     pub fn to_compact(&self, full_id: u16) -> Option<u16> {
-        self.full_to_compact.get(full_id as usize).copied().flatten()
+        self.full_to_compact
+            .get(full_id as usize)
+            .copied()
+            .flatten()
     }
 
     /// Map a compact token ID back to the full vocabulary ID.
@@ -98,8 +101,7 @@ impl VocabCompactor {
         for (compact_id, &full_id) in self.compact_to_full.iter().enumerate() {
             let src_off = full_id as usize * dim;
             let dst_off = compact_id * dim;
-            compact[dst_off..dst_off + dim]
-                .copy_from_slice(&full_embed[src_off..src_off + dim]);
+            compact[dst_off..dst_off + dim].copy_from_slice(&full_embed[src_off..src_off + dim]);
         }
         compact
     }
@@ -138,10 +140,7 @@ mod tests {
     #[test]
     fn test_vocab_compaction_basic() {
         // Full vocab of 100, but only tokens 5, 10, 20 appear
-        let samples: Vec<Vec<u16>> = vec![
-            vec![5, 10, 20],
-            vec![10, 5],
-        ];
+        let samples: Vec<Vec<u16>> = vec![vec![5, 10, 20], vec![10, 5]];
         let sample_refs: Vec<&[u16]> = samples.iter().map(|s| s.as_slice()).collect();
         let compactor = VocabCompactor::from_dataset(sample_refs, 100);
 
@@ -174,9 +173,7 @@ mod tests {
         let compactor = VocabCompactor::from_dataset(sample_refs, full_vocab);
 
         // Full embedding: row[i] = [i, i, i, i]
-        let full_embed: Vec<f32> = (0..full_vocab * dim)
-            .map(|i| (i / dim) as f32)
-            .collect();
+        let full_embed: Vec<f32> = (0..full_vocab * dim).map(|i| (i / dim) as f32).collect();
 
         // Extract compact embedding
         let compact = compactor.extract_compact_embedding(&full_embed, dim);

@@ -34,8 +34,7 @@ use pmetal_models::{
 use crate::{
     LoraError, TrainableModel, gemma_lora::GemmaLoraForCausalLM, llama_lora::LlamaLoraForCausalLM,
     mistral_lora::MistralLoraForCausalLM, phi_lora::PhiLoraForCausalLM,
-    qwen3_lora::Qwen3LoraForCausalLM,
-    qwen3_next_lora::Qwen3NextLoraForCausalLM,
+    qwen3_lora::Qwen3LoraForCausalLM, qwen3_next_lora::Qwen3NextLoraForCausalLM,
 };
 
 /// Dynamic LoRA model container using enum dispatch.

@@ -3,7 +3,9 @@
 //! Note: Some traits in this module are deprecated. See individual trait documentation
 //! for current recommended patterns.
 
-use crate::{EvalMetrics, LoraConfig, MemoryStats, ModelConfig, Result, StepMetrics, TrainingConfig};
+use crate::{
+    EvalMetrics, LoraConfig, MemoryStats, ModelConfig, Result, StepMetrics, TrainingConfig,
+};
 use std::path::Path;
 
 /// Core model trait for all LLM architectures.

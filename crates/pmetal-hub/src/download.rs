@@ -20,19 +20,19 @@ fn build_api(token: Option<&SecretString>) -> Result<Api> {
 
 /// Files to skip during full-repo download (large binaries, metadata, etc.).
 const SKIP_EXTENSIONS: &[&str] = &[
-    ".bin",          // PyTorch weights — we use safetensors
-    ".pt",           // PyTorch checkpoint
-    ".pth",          // PyTorch checkpoint
-    ".onnx",         // ONNX export
-    ".ot",           // ONNX export
-    ".msgpack",      // Flax weights
-    ".h5",           // TensorFlow/Keras weights
-    ".pb",           // TensorFlow protobuf
-    ".tflite",       // TensorFlow Lite
-    ".gguf",         // GGUF quantized (download separately if needed)
-    ".zip",          // Archives
-    ".tar",          // Archives
-    ".gz",           // Archives (except .json.gz which is handled)
+    ".bin",     // PyTorch weights — we use safetensors
+    ".pt",      // PyTorch checkpoint
+    ".pth",     // PyTorch checkpoint
+    ".onnx",    // ONNX export
+    ".ot",      // ONNX export
+    ".msgpack", // Flax weights
+    ".h5",      // TensorFlow/Keras weights
+    ".pb",      // TensorFlow protobuf
+    ".tflite",  // TensorFlow Lite
+    ".gguf",    // GGUF quantized (download separately if needed)
+    ".zip",     // Archives
+    ".tar",     // Archives
+    ".gz",      // Archives (except .json.gz which is handled)
 ];
 
 /// Files to skip by exact name.
@@ -95,10 +95,7 @@ pub async fn download_model(
 
     for filename in &all_files {
         // Skip files by extension
-        if SKIP_EXTENSIONS
-            .iter()
-            .any(|ext| filename.ends_with(ext))
-        {
+        if SKIP_EXTENSIONS.iter().any(|ext| filename.ends_with(ext)) {
             tracing::debug!("Skipping {} (excluded format)", filename);
             skipped += 1;
             continue;

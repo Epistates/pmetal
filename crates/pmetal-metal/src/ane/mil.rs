@@ -339,13 +339,7 @@ impl MilProgram {
     /// Emit a dtype cast operation.
     ///
     /// `from_dtype` / `to_dtype` are MIL dtype strings like `"fp16"`, `"fp32"`.
-    pub fn emit_cast(
-        &mut self,
-        result_name: &str,
-        shape: &[usize],
-        input: &str,
-        to_dtype: &str,
-    ) {
+    pub fn emit_cast(&mut self, result_name: &str, shape: &[usize], input: &str, to_dtype: &str) {
         let shape_str = format_shape(shape);
         write!(
             self.text,

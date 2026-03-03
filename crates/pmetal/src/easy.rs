@@ -229,9 +229,7 @@ impl FinetuneBuilder {
 
         // Load tokenizer (reads special_tokens_map.json and tokenizer_config.json too)
         let tokenizer = Tokenizer::from_model_dir(&model_path).map_err(|e| {
-            PMetalError::ModelLoad(format!(
-                "Failed to load tokenizer from {model_path:?}: {e}"
-            ))
+            PMetalError::ModelLoad(format!("Failed to load tokenizer from {model_path:?}: {e}"))
         })?;
 
         // Detect chat template
@@ -453,9 +451,7 @@ impl InferBuilder {
 
         // Load tokenizer (reads special_tokens_map.json and tokenizer_config.json too)
         let tokenizer = Tokenizer::from_model_dir(&model_path).map_err(|e| {
-            PMetalError::ModelLoad(format!(
-                "Failed to load tokenizer from {model_path:?}: {e}"
-            ))
+            PMetalError::ModelLoad(format!("Failed to load tokenizer from {model_path:?}: {e}"))
         })?;
 
         // Branch: ANE inference

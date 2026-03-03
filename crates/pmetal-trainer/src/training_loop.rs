@@ -1586,10 +1586,13 @@ impl TrainingLoop {
                             loss: self.running_loss,
                             lr: self.get_learning_rate() as f64,
                             tok_sec: tokens_per_sec,
-                            total_ms: self.last_log_time.map(|t| {
-                                let interval = self.config.log_every as f64;
-                                t.elapsed().as_secs_f64() * 1000.0 / interval
-                            }).unwrap_or(0.0),
+                            total_ms: self
+                                .last_log_time
+                                .map(|t| {
+                                    let interval = self.config.log_every as f64;
+                                    t.elapsed().as_secs_f64() * 1000.0 / interval
+                                })
+                                .unwrap_or(0.0),
                             tokens: self.tokens_since_log,
                             ..Default::default()
                         };
@@ -1849,7 +1852,11 @@ impl TrainingLoop {
                             loss: self.running_loss,
                             lr,
                             tok_sec: tokens_per_sec,
-                            total_ms: now.duration_since(self.last_log_time.unwrap_or(now)).as_secs_f64() * 1000.0 / self.config.log_every as f64,
+                            total_ms: now
+                                .duration_since(self.last_log_time.unwrap_or(now))
+                                .as_secs_f64()
+                                * 1000.0
+                                / self.config.log_every as f64,
                             tokens: self.tokens_since_log,
                             ..Default::default()
                         };
@@ -2098,9 +2105,11 @@ impl TrainingLoop {
                             loss: self.running_loss,
                             lr: self.get_learning_rate() as f64,
                             tok_sec: tokens_per_sec,
-                            total_ms: now.duration_since(
-                                self.last_log_time.unwrap_or(now)
-                            ).as_secs_f64() * 1000.0 / self.config.log_every as f64,
+                            total_ms: now
+                                .duration_since(self.last_log_time.unwrap_or(now))
+                                .as_secs_f64()
+                                * 1000.0
+                                / self.config.log_every as f64,
                             tokens: self.tokens_since_log,
                             ..Default::default()
                         };
