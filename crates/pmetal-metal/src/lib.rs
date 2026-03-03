@@ -65,6 +65,8 @@
 #![cfg(target_os = "macos")]
 
 pub mod accelerate;
+#[cfg(feature = "ane")]
+pub mod ane;
 pub mod async_scheduler;
 pub mod bridge;
 pub mod buffer;

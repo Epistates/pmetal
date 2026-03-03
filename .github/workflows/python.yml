@@ -1,0 +1,45 @@
+name: Python Bindings
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Python wheel (macOS aarch64)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install maturin
+        run: pip install "maturin>=1.8"
+
+      - name: Build wheel
+        working-directory: crates/pmetal-py
+        run: maturin build --release --strip
+
+      - name: Install wheel and run tests
+        run: |
+          pip install target/wheels/*.whl
+          pip install pytest
+          cd crates/pmetal-py
+          pytest tests/ -v
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: pmetal-wheel-macos-aarch64
+          path: target/wheels/*.whl

@@ -59,3 +59,18 @@ venv/
 *.gcno
 coverage/
 lcov.info
+
+# Build outputs
+*.metallib
+
+# Release artifacts
+*.tar.gz
+
+# Training artifacts
+pmetal-test-train/
+metrics.jsonl
+
+# Dataset files (user-generated)
+dataset_*.jsonl
+prepared_dataset.jsonl
+sample_config.yaml

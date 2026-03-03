@@ -1,0 +1,31 @@
+[build-system]
+requires = ["maturin>=1.8,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "pmetal"
+requires-python = ">=3.11"
+description = "High-performance LLM fine-tuning for Apple Silicon"
+license = { text = "MIT OR Apache-2.0" }
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: Implementation :: CPython",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Operating System :: MacOS",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dynamic = ["version"]
+
+[project.urls]
+Repository = "https://github.com/epistates/pmetal"
+
+[tool.maturin]
+python-source = "py_src"
+module-name = "pmetal.pmetal"
+bindings = "pyo3"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

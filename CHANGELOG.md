@@ -5,6 +5,26 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-03-02
+
+### Added
+
+- **Apple Neural Engine (ANE) integration** behind `ane` feature flag — MIL 1.3 program generation, private API FFI via dlopen, IOSurface zero-copy, compilation budget tracking, hybrid CPU/ANE trainer with async gradient accumulation
+- **Python bindings** (`pmetal-py`) via PyO3/maturin with type stubs
+- **High-level Easy API** (`pmetal::easy`) — builder pattern for fine-tuning and inference
+- **Version and device introspection** (`pmetal::version`)
+- **Examples**: `device_info`, `finetune_easy`, `finetune_manual`, `inference_easy`
+- **Python CI workflow** (`.github/workflows/python.yml`)
+- `Device::Ane` variant with feature-gated support
+- ANE-specific error types in `pmetal-core` and `pmetal-metal`
+- ANE training loop integration in `pmetal-trainer`
+
+### Improved
+
+- NEON f16↔f32 conversion upgraded from 4-wide to 8-wide (`fcvtn2`/`fcvtl2`)
+- Accelerate/vDSP wrappers expanded with 12 new functions: `rmsnorm`, `rmsnorm_backward`, `cross_entropy_loss`, `softmax_inplace`, `adam_update`, `embed_lookup`, `embed_backward`, `matrix_transpose`, `gemm`, `vadd`, `vmul` (with scalar fallbacks on non-macOS)
+- `supports_neural_engine()` now performs real ANE detection via framework dlopen
+
 ## [0.1.2] - 2026-03-02
 
 ### Fixed

@@ -78,6 +78,35 @@ pub enum MetalError {
 
     /// Internal error (should not happen in normal operation).
     Internal(String),
+
+    /// ANE not available on this device.
+    #[cfg(feature = "ane")]
+    AneNotAvailable,
+
+    /// ANE model compilation failed.
+    #[cfg(feature = "ane")]
+    AneCompileFailed(String),
+
+    /// ANE model loading failed.
+    #[cfg(feature = "ane")]
+    AneLoadFailed(String),
+
+    /// ANE model evaluation failed.
+    #[cfg(feature = "ane")]
+    AneEvalFailed(String),
+
+    /// IOSurface creation failed.
+    #[cfg(feature = "ane")]
+    IoSurfaceCreation {
+        /// Requested size in bytes.
+        size: usize,
+        /// Reason for failure.
+        reason: String,
+    },
+
+    /// MIL program generation error.
+    #[cfg(feature = "ane")]
+    MilGeneration(String),
 }
 
 impl fmt::Display for MetalError {
@@ -152,6 +181,34 @@ impl fmt::Display for MetalError {
             }
             MetalError::Internal(msg) => {
                 write!(f, "Internal error: {}", msg)
+            }
+            #[cfg(feature = "ane")]
+            MetalError::AneNotAvailable => {
+                write!(f, "Apple Neural Engine not available on this device")
+            }
+            #[cfg(feature = "ane")]
+            MetalError::AneCompileFailed(msg) => {
+                write!(f, "ANE compilation failed: {}", msg)
+            }
+            #[cfg(feature = "ane")]
+            MetalError::AneLoadFailed(msg) => {
+                write!(f, "ANE model loading failed: {}", msg)
+            }
+            #[cfg(feature = "ane")]
+            MetalError::AneEvalFailed(msg) => {
+                write!(f, "ANE evaluation failed: {}", msg)
+            }
+            #[cfg(feature = "ane")]
+            MetalError::IoSurfaceCreation { size, reason } => {
+                write!(
+                    f,
+                    "Failed to create IOSurface of {} bytes: {}",
+                    size, reason
+                )
+            }
+            #[cfg(feature = "ane")]
+            MetalError::MilGeneration(msg) => {
+                write!(f, "MIL program generation error: {}", msg)
             }
         }
     }

@@ -82,4 +82,19 @@ pub enum PMetalError {
     /// Operation not implemented.
     #[error("Not implemented: {0}")]
     NotImplemented(String),
+
+    /// ANE (Apple Neural Engine) error.
+    #[cfg(feature = "ane")]
+    #[error("ANE error: {0}")]
+    Ane(String),
+
+    /// ANE compilation budget exhausted.
+    #[cfg(feature = "ane")]
+    #[error("ANE compile budget exhausted: {used}/{max} compilations used")]
+    AneCompileBudgetExhausted {
+        /// Compilations used so far.
+        used: usize,
+        /// Maximum allowed compilations per process.
+        max: usize,
+    },
 }

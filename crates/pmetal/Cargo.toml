@@ -10,7 +10,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [features]
-default = ["core", "gguf", "metal", "hub", "mlx", "models", "lora", "trainer"]
+default = ["core", "gguf", "metal", "hub", "mlx", "models", "lora", "trainer", "easy"]
 
 # Foundation crates (no mlx-rs dependency)
 core = ["dep:pmetal-core"]
@@ -21,7 +21,7 @@ distributed = ["dep:pmetal-distributed"]
 mhc = ["dep:pmetal-mhc", "core", "metal"]
 
 # MLX-dependent crates
-mlx = ["dep:pmetal-mlx", "core", "metal"]
+mlx = ["dep:pmetal-mlx", "dep:mlx-rs", "core", "metal"]
 models = ["dep:pmetal-models", "core", "gguf", "metal", "mlx"]
 lora = ["dep:pmetal-lora", "core", "gguf", "metal", "mlx", "models"]
 # Opt-in: enables fused Metal kernels for ~2x LoRA training speedup (requires Float16 inputs)
@@ -32,11 +32,17 @@ distill = ["dep:pmetal-distill", "core", "mlx", "metal"]
 merge = ["dep:pmetal-merge", "core", "mlx"]
 vocoder = ["dep:pmetal-vocoder", "core", "mlx"]
 
+# Easy API: high-level builders for fine-tuning and inference
+easy = ["trainer", "hub", "data", "models", "lora", "dep:tokio"]
+
+# ANE: Apple Neural Engine direct programming
+ane = ["metal", "pmetal-metal/ane", "pmetal-core/ane"]
+
 # Everything
 full = [
     "core", "gguf", "metal", "hub", "distributed", "mhc",
     "mlx", "models", "lora", "data", "trainer",
-    "distill", "merge", "vocoder",
+    "distill", "merge", "vocoder", "easy",
 ]
 
 [dependencies]
@@ -54,6 +60,30 @@ pmetal-trainer = { workspace = true, optional = true }
 pmetal-distill = { workspace = true, optional = true }
 pmetal-merge = { workspace = true, optional = true }
 pmetal-vocoder = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+mlx-rs = { workspace = true, optional = true }
+
+[dev-dependencies]
+tracing-subscriber = { workspace = true }
+
+[[example]]
+name = "device_info"
+path = "examples/device_info.rs"
+
+[[example]]
+name = "finetune_easy"
+path = "examples/finetune_easy.rs"
+required-features = ["easy"]
+
+[[example]]
+name = "inference_easy"
+path = "examples/inference_easy.rs"
+required-features = ["easy"]
+
+[[example]]
+name = "finetune_manual"
+path = "examples/finetune_manual.rs"
+required-features = ["data", "lora", "trainer"]
 
 [lints]
 workspace = true

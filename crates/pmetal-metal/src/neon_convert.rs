@@ -67,27 +67,53 @@ pub fn f16_to_f32_bulk(src: &[u16], dst: &mut [f32]) {
     }
 }
 
-/// Convert 4 f32 values to fp16 per iteration using `fcvtn` (stable inline asm).
+/// Convert 8 f32 values to fp16 per iteration using `fcvtn`/`fcvtn2` (stable inline asm).
 ///
-/// `fcvtn Vd.4H, Vn.4S` narrows four single-precision floats in a 128-bit
-/// register into four fp16 values packed into the lower 64 bits of the
-/// destination register.
+/// Primary loop processes 8 elements at a time:
+/// - `fcvtn v2.4h, v0.4s` narrows lower 4 floats into lower 64 bits
+/// - `fcvtn2 v2.8h, v1.4s` narrows upper 4 floats into upper 64 bits
+/// - Single `st1 {v2.8h}` stores all 8 fp16 values
+///
+/// Falls back to 4-wide for 4-7 remainders, scalar for 1-3.
 #[cfg(target_arch = "aarch64")]
 unsafe fn f32_to_f16_neon(src: &[f32], dst: &mut [u16]) {
-    let chunks = src.len() / 4;
+    let n = src.len();
+    let chunks8 = n / 8;
     let mut i = 0;
 
-    for _ in 0..chunks {
-        // SAFETY: i + 4 <= src.len() and i + 4 <= dst.len() (asserted by caller).
+    // 8-wide loop: process 8 f32 → 8 f16 per iteration
+    for _ in 0..chunks8 {
         unsafe {
             let src_ptr = src.as_ptr().add(i);
             let dst_ptr = dst.as_mut_ptr().add(i);
             std::arch::asm!(
-                // Load four f32 values into a 128-bit NEON register (v0.4s).
+                // Load 8 f32 values into two 128-bit registers
+                "ld1 {{v0.4s, v1.4s}}, [{src}]",
+                // Convert lower 4 f32 → lower 4 f16 in v2
+                "fcvtn v2.4h, v0.4s",
+                // Convert upper 4 f32 → upper 4 f16 in v2 (same register)
+                "fcvtn2 v2.8h, v1.4s",
+                // Store 8 f16 values (128 bits)
+                "st1 {{v2.8h}}, [{dst}]",
+                src = in(reg) src_ptr,
+                dst = in(reg) dst_ptr,
+                out("v0") _,
+                out("v1") _,
+                out("v2") _,
+                options(nostack),
+            );
+        }
+        i += 8;
+    }
+
+    // 4-wide remainder for 4-7 leftover elements
+    if i + 4 <= n {
+        unsafe {
+            let src_ptr = src.as_ptr().add(i);
+            let dst_ptr = dst.as_mut_ptr().add(i);
+            std::arch::asm!(
                 "ld1 {{v0.4s}}, [{src}]",
-                // Convert v0.4s (4x f32) → v1.4h (4x f16), packed into lower 64 bits.
                 "fcvtn v1.4h, v0.4s",
-                // Store the four f16 values (64 bits = 4 x u16) to dst.
                 "st1 {{v1.4h}}, [{dst}]",
                 src = in(reg) src_ptr,
                 dst = in(reg) dst_ptr,
@@ -99,32 +125,60 @@ unsafe fn f32_to_f16_neon(src: &[f32], dst: &mut [u16]) {
         i += 4;
     }
 
-    // Scalar remainder for elements that don't fill a full 4-wide chunk.
-    for j in i..src.len() {
+    // Scalar remainder for 1-3 leftover elements
+    for j in i..n {
         dst[j] = half::f16::from_f32(src[j]).to_bits();
     }
 }
 
-/// Convert 4 fp16 values to f32 per iteration using `fcvtl` (stable inline asm).
+/// Convert 8 fp16 values to f32 per iteration using `fcvtl`/`fcvtl2` (stable inline asm).
 ///
-/// `fcvtl Vd.4S, Vn.4H` widens four fp16 values from the lower 64 bits of
-/// the source register into four single-precision floats in a 128-bit register.
+/// Primary loop processes 8 elements at a time:
+/// - `ld1 {v0.8h}` loads 8 fp16 values into one 128-bit register
+/// - `fcvtl v1.4s, v0.4h` widens lower 4 fp16 → 4 f32
+/// - `fcvtl2 v2.4s, v0.8h` widens upper 4 fp16 → 4 f32
+/// - `st1 {v1.4s, v2.4s}` stores all 8 f32 values
+///
+/// Falls back to 4-wide for 4-7 remainders, scalar for 1-3.
 #[cfg(target_arch = "aarch64")]
 unsafe fn f16_to_f32_neon(src: &[u16], dst: &mut [f32]) {
-    let chunks = src.len() / 4;
+    let n = src.len();
+    let chunks8 = n / 8;
     let mut i = 0;
 
-    for _ in 0..chunks {
-        // SAFETY: i + 4 <= src.len() and i + 4 <= dst.len() (asserted by caller).
+    // 8-wide loop: process 8 f16 → 8 f32 per iteration
+    for _ in 0..chunks8 {
         unsafe {
             let src_ptr = src.as_ptr().add(i);
             let dst_ptr = dst.as_mut_ptr().add(i);
             std::arch::asm!(
-                // Load four u16 values (four fp16 bit patterns) into lower 64 bits of v0.
-                "ld1 {{v0.4h}}, [{src}]",
-                // Widen v0.4h (4x f16) → v1.4s (4x f32).
+                // Load 8 f16 values into one 128-bit register
+                "ld1 {{v0.8h}}, [{src}]",
+                // Widen lower 4 f16 → 4 f32
                 "fcvtl v1.4s, v0.4h",
-                // Store four f32 results.
+                // Widen upper 4 f16 → 4 f32
+                "fcvtl2 v2.4s, v0.8h",
+                // Store 8 f32 values (two 128-bit registers)
+                "st1 {{v1.4s, v2.4s}}, [{dst}]",
+                src = in(reg) src_ptr,
+                dst = in(reg) dst_ptr,
+                out("v0") _,
+                out("v1") _,
+                out("v2") _,
+                options(nostack),
+            );
+        }
+        i += 8;
+    }
+
+    // 4-wide remainder for 4-7 leftover elements
+    if i + 4 <= n {
+        unsafe {
+            let src_ptr = src.as_ptr().add(i);
+            let dst_ptr = dst.as_mut_ptr().add(i);
+            std::arch::asm!(
+                "ld1 {{v0.4h}}, [{src}]",
+                "fcvtl v1.4s, v0.4h",
                 "st1 {{v1.4s}}, [{dst}]",
                 src = in(reg) src_ptr,
                 dst = in(reg) dst_ptr,
@@ -136,8 +190,8 @@ unsafe fn f16_to_f32_neon(src: &[u16], dst: &mut [f32]) {
         i += 4;
     }
 
-    // Scalar remainder.
-    for j in i..src.len() {
+    // Scalar remainder for 1-3 leftover elements
+    for j in i..n {
         dst[j] = half::f16::from_bits(src[j]).to_f32();
     }
 }

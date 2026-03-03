@@ -1,0 +1,33 @@
+[package]
+name = "pmetal-py"
+description = "Python bindings for PMetal — high-performance LLM fine-tuning on Apple Silicon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+name = "pmetal"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { workspace = true, features = ["extension-module", "abi3-py311"] }
+pmetal = { path = "../pmetal", features = ["easy"] }
+pmetal-core = { workspace = true }
+pmetal-hub = { workspace = true }
+pmetal-mlx = { workspace = true }
+pmetal-models = { workspace = true }
+pmetal-lora = { workspace = true }
+pmetal-data = { workspace = true }
+pmetal-trainer = { workspace = true }
+tokio = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+mlx-rs = { workspace = true }
+
+[build-dependencies]
+pyo3-build-config = { workspace = true }
+
+[lints]
+workspace = true

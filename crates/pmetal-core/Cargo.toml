@@ -9,6 +9,10 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[features]
+default = []
+ane = []
+
 [dependencies]
 secrecy = "0.10"
 serde = { workspace = true }

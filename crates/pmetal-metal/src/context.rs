@@ -296,14 +296,21 @@ impl MetalContext {
         self.pipeline_cache.write()
     }
 
-    /// Check if this device supports the Neural Engine (M5+).
+    /// Check if this device supports the Neural Engine.
     ///
-    /// Neural Engine support requires macOS 26.2+ and an M5 chip.
+    /// When the `ane` feature is enabled, this attempts to load the private
+    /// `AppleNeuralEngine.framework` at runtime. Returns `true` on M1+ hardware.
+    /// Without the `ane` feature, always returns `false`.
     #[inline]
     pub fn supports_neural_engine(&self) -> bool {
-        // Check for macOS 26.2+ and M5 chip
-        // This is a placeholder - actual detection would use system APIs
-        self.properties.name.contains("M5")
+        #[cfg(feature = "ane")]
+        {
+            crate::ane::runtime::AneRuntime::global().is_ok()
+        }
+        #[cfg(not(feature = "ane"))]
+        {
+            false
+        }
     }
 
     /// Get the maximum recommended batch size for a given operation.

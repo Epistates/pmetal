@@ -29,7 +29,37 @@
 //! | `vocoder` | [`pmetal-vocoder`] | no |
 //! | `distributed` | [`pmetal-distributed`] | no |
 //! | `mhc` | [`pmetal-mhc`] | no |
+//! | `easy` | all training/inference crates | yes |
 //! | `full` | all of the above | no |
+//!
+//! ## Easy API
+//!
+//! The [`easy`] module provides high-level builders for common workflows:
+//!
+//! ```rust,no_run
+//! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
+//! // Fine-tune a model in one call
+//! let result = pmetal::easy::finetune("Qwen/Qwen3-0.6B", "data.jsonl")
+//!     .lora(16, 32.0)
+//!     .epochs(3)
+//!     .learning_rate(2e-4)
+//!     .output("./output")
+//!     .run()
+//!     .await?;
+//!
+//! // Run inference
+//! let result = pmetal::easy::infer("Qwen/Qwen3-0.6B")
+//!     .lora("./output/lora_weights.safetensors")
+//!     .generate("What is 2+2?")
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+
+pub mod version;
+
+#[cfg(feature = "easy")]
+pub mod easy;
 
 // NOTE: `core` below shadows the Rust built-in `core` crate within this file.
 // Any code added here that needs `core::fmt`, `core::mem`, etc. must use `::core::`.
@@ -104,4 +134,36 @@ pub mod prelude {
 
     #[cfg(feature = "mhc")]
     pub use pmetal_mhc::prelude::*;
+
+    // Trainer types
+    #[cfg(feature = "trainer")]
+    pub use pmetal_trainer::{
+        AdamWGroupsBuilder, CheckpointManager, TrainingLoop, TrainingLoopConfig,
+    };
+
+    // Data types
+    #[cfg(feature = "data")]
+    pub use pmetal_data::{
+        DataLoader, DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset,
+    };
+
+    // Model types
+    #[cfg(feature = "models")]
+    pub use pmetal_models::{DynamicModel, GenerationConfig, ModelArchitecture};
+
+    // LoRA types
+    #[cfg(feature = "lora")]
+    pub use pmetal_lora::{DynamicLoraModel, TrainableModel};
+
+    // Hub functions
+    #[cfg(feature = "hub")]
+    pub use pmetal_hub::{download_file, download_model};
+
+    // Callback types (defined in core, but only useful with trainer)
+    #[cfg(feature = "core")]
+    pub use pmetal_core::TrainingCallback;
+
+    // Trainer callbacks
+    #[cfg(feature = "trainer")]
+    pub use pmetal_trainer::{LoggingCallback, MetricsJsonCallback, ProgressCallback};
 }

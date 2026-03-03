@@ -33,6 +33,13 @@ fn main() {
 
     // Link against Accelerate.framework for vDSP vector operations
     println!("cargo:rustc-link-lib=framework=Accelerate");
+
+    // Conditionally link IOSurface.framework when ANE feature is active
+    if env::var("CARGO_FEATURE_ANE").is_ok() {
+        println!("cargo:rustc-link-lib=framework=IOSurface");
+        println!("cargo:rustc-link-lib=framework=CoreFoundation");
+        // AppleNeuralEngine.framework is loaded at runtime via dlopen, not linked here
+    }
 }
 
 fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path) {

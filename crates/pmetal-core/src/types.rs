@@ -49,6 +49,24 @@ pub enum Device {
     /// GPU computation (Metal on macOS).
     #[default]
     Gpu,
+    /// Apple Neural Engine (ANE) computation.
+    #[cfg(feature = "ane")]
+    Ane,
+}
+
+impl Device {
+    /// Returns true if this device targets the Apple Neural Engine.
+    #[inline]
+    pub fn is_ane(&self) -> bool {
+        #[cfg(feature = "ane")]
+        {
+            matches!(self, Self::Ane)
+        }
+        #[cfg(not(feature = "ane"))]
+        {
+            false
+        }
+    }
 }
 
 /// Quantization scheme.

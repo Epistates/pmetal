@@ -12,6 +12,7 @@ categories.workspace = true
 [features]
 default = []
 tensorboard = ["dep:tensorboard-rs"]
+ane = ["pmetal-metal/ane", "pmetal-core/ane"]
 
 [dependencies]
 pmetal-core = { workspace = true }

@@ -93,6 +93,9 @@ pub mod sft;
 pub mod simpo;
 pub mod training_loop;
 
+#[cfg(feature = "ane")]
+pub mod ane_training;
+
 pub use adam8bit::*;
 pub use adamw_groups::*;
 pub use callbacks::*;
