@@ -23,9 +23,11 @@
 //! - [`mil`]: MIL 1.3 program builder (builder pattern)
 //! - [`kernel`]: Transformer kernel generators + weight blob format
 //! - [`budget`]: Compilation budget tracker (~100 compiles/process)
+//! - [`inference`]: Forward-only ANE inference engine with autoregressive generation
 //! - [`trainer`]: Hybrid CPU/ANE training loop
 
 pub mod budget;
+pub mod inference;
 pub mod iosurface;
 pub mod kernel;
 pub mod mil;

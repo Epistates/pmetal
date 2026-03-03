@@ -43,6 +43,9 @@ pub struct MilProgram {
     var_counter: usize,
 }
 
+// MIL text generation uses explicit \n in write!() — each line is a complete
+// MIL statement and the trailing \n is part of the generated program text.
+#[allow(clippy::write_with_newline)]
 impl MilProgram {
     /// Create a new MIL program with header and function signature.
     ///

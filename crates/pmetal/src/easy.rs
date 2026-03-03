@@ -370,6 +370,8 @@ pub struct InferBuilder {
     repetition_penalty: f32,
     seed: Option<u64>,
     fp8: bool,
+    #[cfg(feature = "ane")]
+    device: Option<pmetal_core::Device>,
 }
 
 impl InferBuilder {
@@ -385,6 +387,8 @@ impl InferBuilder {
             repetition_penalty: 1.0,
             seed: None,
             fp8: false,
+            #[cfg(feature = "ane")]
+            device: None,
         }
     }
 
@@ -436,6 +440,13 @@ impl InferBuilder {
         self
     }
 
+    /// Set the compute device (ANE inference requires `ane` feature).
+    #[cfg(feature = "ane")]
+    pub fn device(mut self, device: pmetal_core::Device) -> Self {
+        self.device = Some(device);
+        self
+    }
+
     /// Generate text from the given prompt.
     pub async fn generate(self, prompt: &str) -> Result<InferResult> {
         // Resolve model path
@@ -448,6 +459,12 @@ impl InferBuilder {
                 "Failed to load tokenizer at {tokenizer_path:?}: {e}"
             ))
         })?;
+
+        // Branch: ANE inference
+        #[cfg(feature = "ane")]
+        if matches!(self.device, Some(pmetal_core::Device::Ane)) {
+            return self.generate_ane(&model_path, &tokenizer, prompt);
+        }
 
         // Branch: LoRA inference vs standard inference
         if let Some(lora_path) = &self.lora_path {
@@ -538,6 +555,124 @@ impl InferBuilder {
             text,
             tokens_generated: output.num_generated,
             tokens_per_sec: output.num_generated as f64 / elapsed.as_secs_f64(),
+        })
+    }
+
+    /// Inference via ANE with flat weight format.
+    #[cfg(feature = "ane")]
+    fn generate_ane(
+        &self,
+        model_path: &Path,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+    ) -> Result<InferResult> {
+        use pmetal_metal::ane::inference::{AneInferenceConfig, AneInferenceEngine};
+
+        // Read model config — parse with pmetal_core's serde_json re-export
+        let config_path = model_path.join("config.json");
+        let config_text = std::fs::read_to_string(&config_path).map_err(|e| {
+            PMetalError::ModelLoad(format!(
+                "Failed to read config.json at {config_path:?}: {e}"
+            ))
+        })?;
+
+        // Extract model dimensions from JSON config
+        fn extract_usize(json: &str, key: &str) -> std::result::Result<usize, PMetalError> {
+            // Find "key": <number> pattern
+            let needle = format!("\"{key}\"");
+            let pos = json
+                .find(&needle)
+                .ok_or_else(|| PMetalError::ModelLoad(format!("config.json missing '{key}'")))?;
+            let after_key = &json[pos + needle.len()..];
+            // Skip whitespace and colon
+            let num_start = after_key
+                .find(|c: char| c.is_ascii_digit())
+                .ok_or_else(|| {
+                    PMetalError::ModelLoad(format!("config.json: no value for '{key}'"))
+                })?;
+            let num_str = &after_key[num_start..];
+            let num_end = num_str
+                .find(|c: char| !c.is_ascii_digit())
+                .unwrap_or(num_str.len());
+            num_str[..num_end].parse::<usize>().map_err(|_| {
+                PMetalError::ModelLoad(format!("config.json: invalid value for '{key}'"))
+            })
+        }
+
+        let dim = extract_usize(&config_text, "hidden_size")?;
+        let hidden_dim = extract_usize(&config_text, "intermediate_size")?;
+        let n_heads = extract_usize(&config_text, "num_attention_heads")?;
+        let n_layers = extract_usize(&config_text, "num_hidden_layers")?;
+        let vocab_size = extract_usize(&config_text, "vocab_size")?;
+
+        let ane_config = AneInferenceConfig {
+            dim,
+            hidden_dim,
+            n_heads,
+            n_layers,
+            vocab_size,
+            max_seq_len: 256,
+            temperature: self.temperature,
+            top_k: self.top_k,
+            max_tokens: self.max_tokens,
+            eos_token_id: tokenizer.eos_token_id(),
+            ..Default::default()
+        };
+
+        let mut engine = AneInferenceEngine::new(ane_config);
+
+        // Load flat weights from model.bin
+        let weights_path = model_path.join("model.bin");
+        if !weights_path.exists() {
+            return Err(PMetalError::ModelLoad(format!(
+                "ANE inference requires flat weight format at {:?}. \
+                 Convert from safetensors with `pmetal export --format flat`.",
+                weights_path
+            )));
+        }
+        let weight_data = std::fs::read(&weights_path)
+            .map_err(|e| PMetalError::ModelLoad(format!("Failed to read model.bin: {e}")))?;
+
+        // Reinterpret bytes as f32 slice (safe via align_to)
+        if weight_data.len() % 4 != 0 {
+            return Err(PMetalError::ModelLoad(
+                "model.bin size must be a multiple of 4 bytes".into(),
+            ));
+        }
+        // align_to is safe; verify no unaligned prefix/suffix bytes
+        #[allow(unsafe_code)]
+        let (prefix, weights, suffix) = unsafe { weight_data.align_to::<f32>() };
+        if !prefix.is_empty() || !suffix.is_empty() {
+            return Err(PMetalError::ModelLoad(
+                "model.bin data is not properly aligned for f32".into(),
+            ));
+        }
+        engine.load_weights_flat(weights);
+
+        // Compile kernels
+        engine
+            .compile_kernels()
+            .map_err(|e| PMetalError::Training(format!("ANE compile failed: {e}")))?;
+
+        // Tokenize
+        let input_ids_u32 = tokenizer.encode(prompt)?;
+
+        // Generate
+        let start = std::time::Instant::now();
+        let output_ids = engine
+            .generate(&input_ids_u32)
+            .map_err(|e| PMetalError::Training(format!("ANE generate failed: {e}")))?;
+        let elapsed = start.elapsed();
+
+        // Decode generated tokens
+        let prompt_len = input_ids_u32.len();
+        let generated: Vec<u32> = output_ids[prompt_len..].to_vec();
+        let text = tokenizer.decode(&generated)?;
+
+        Ok(InferResult {
+            text,
+            tokens_generated: generated.len(),
+            tokens_per_sec: generated.len() as f64 / elapsed.as_secs_f64(),
         })
     }
 

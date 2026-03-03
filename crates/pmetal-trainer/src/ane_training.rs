@@ -96,6 +96,7 @@ impl AneTrainingLoop {
         let num_batches = data.len().min(self.config.num_batches);
         let seq_len = self.config.trainer.seq_len;
 
+        #[allow(clippy::needless_range_loop)]
         for batch_idx in 0..num_batches {
             // Notify callbacks
             for cb in &mut self.callbacks {

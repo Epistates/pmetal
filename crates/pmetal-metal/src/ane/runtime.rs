@@ -59,7 +59,7 @@ impl AneRuntime {
     /// Returns `Ok(&AneRuntime)` on M1+ hardware, `Err(AneNotAvailable)` otherwise.
     pub fn global() -> Result<&'static AneRuntime> {
         ANE_RUNTIME
-            .get_or_init(|| AneRuntime::init())
+            .get_or_init(AneRuntime::init)
             .as_ref()
             .map_err(|e| e.clone())
     }
@@ -104,7 +104,7 @@ impl AneRuntime {
 
             // Create descriptor: modelWithMILText:weights:optionsPlist:
             let wdict_ptr: *const AnyObject = match &wdict_obj {
-                Some(d) => d.as_ref() as *const _ as *const AnyObject,
+                Some(d) => d.as_ref() as *const _,
                 None => std::ptr::null(),
             };
 

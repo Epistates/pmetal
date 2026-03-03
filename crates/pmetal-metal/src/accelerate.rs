@@ -235,6 +235,7 @@ pub fn vmul(a: &[f32], b: &[f32], out: &mut [f32]) {
 /// - `m`: rows of op(A) and C
 /// - `n`: cols of op(B) and C
 /// - `k`: cols of op(A) = rows of op(B)
+#[allow(clippy::too_many_arguments)]
 pub fn gemm(
     a: &[f32],
     b: &[f32],
@@ -690,6 +691,7 @@ pub fn softmax_inplace(data: &mut [f32], dim: usize, seq: usize) {
 ///
 /// Updates weights `w` using gradient `g` with moment estimates `m` and `v`.
 /// `t` is the 1-based step count for bias correction.
+#[allow(clippy::too_many_arguments)]
 pub fn adam_update(
     w: &mut [f32],
     g: &[f32],
