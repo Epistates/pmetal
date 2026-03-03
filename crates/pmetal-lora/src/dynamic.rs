@@ -642,7 +642,37 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(_) => true,
             Self::Gemma(_) => true,
             Self::Phi(_) => true,
-            Self::Qwen3Next(_) => false,
+            Self::Qwen3Next(_) => true,
+        }
+    }
+}
+
+impl DynamicLoraModel {
+    /// Create a Mamba cache for hybrid models (GDN recurrent state).
+    pub fn create_mamba_cache(&self) -> Option<pmetal_mlx::kv_cache::MambaCache> {
+        match self {
+            Self::Qwen3Next(m) => Some(m.create_mamba_cache()),
+            _ => None,
+        }
+    }
+
+    /// Forward with hybrid cache support (KV cache + Mamba cache).
+    ///
+    /// For non-hybrid models, the mamba_cache is ignored and standard
+    /// KV-cached forward is used.
+    pub fn forward_with_hybrid_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut pmetal_mlx::kv_cache::MambaCache>,
+    ) -> Result<Array, LoraError> {
+        match self {
+            Self::Qwen3Next(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
+            _ => {
+                // Non-hybrid: delegate to standard forward_with_cache (ignore mamba_cache)
+                TrainableModel::forward_with_cache(self, input_ids, mask, kv_cache)
+            }
         }
     }
 }

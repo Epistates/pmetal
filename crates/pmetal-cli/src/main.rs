@@ -2304,15 +2304,47 @@ async fn run_training(
             }
         };
 
-    // Load and tokenize training dataset
+    // Load and tokenize training dataset — dispatch on file extension
     tracing::info!("Loading training dataset: {}", dataset_path_resolved.display());
-    let train_dataset = TrainingDataset::from_jsonl_tokenized(
-        &dataset_path_resolved,
-        &tokenizer,
-        DatasetFormat::Auto,
-        config.training.max_seq_len,
-        Some(&chat_template),
-    )?;
+    let is_parquet = dataset_path_resolved
+        .extension()
+        .map_or(false, |ext| ext == "parquet");
+    let train_dataset = if is_parquet {
+        tracing::info!("Detected Parquet format");
+        // Try "text" column first, then fall back to common alternatives
+        let result = TrainingDataset::from_parquet_tokenized(
+            &dataset_path_resolved,
+            &tokenizer,
+            "text",
+            config.training.max_seq_len,
+            None,
+        );
+        match result {
+            Ok(ds) => ds,
+            Err(_) => {
+                // Try "content" column
+                TrainingDataset::from_parquet_tokenized(
+                    &dataset_path_resolved,
+                    &tokenizer,
+                    "content",
+                    config.training.max_seq_len,
+                    None,
+                ).map_err(|_| anyhow::anyhow!(
+                    "Parquet file does not have a 'text' or 'content' column. \
+                     For multi-column formats (e.g., reasoning with problem/thinking/solution), \
+                     convert to JSONL first using `pmetal data prepare`."
+                ))?
+            }
+        }
+    } else {
+        TrainingDataset::from_jsonl_tokenized(
+            &dataset_path_resolved,
+            &tokenizer,
+            DatasetFormat::Auto,
+            config.training.max_seq_len,
+            Some(&chat_template),
+        )?
+    };
     tracing::info!("Training dataset loaded: {} samples", train_dataset.len());
 
     // Load evaluation dataset if provided
@@ -2359,8 +2391,9 @@ async fn run_training(
         gradient_checkpointing_layers,
         embedding_lr,
         // Eager evaluation: forces immediate GPU computation after each step.
-        // Reduces memory but may lower throughput. Useful for large models/sequences.
-        eager_evaluation: false, // Default: disabled for throughput
+        // Prevents Metal resource exhaustion from deferred evaluation graph buildup.
+        // Essential for models without true gradient checkpointing (e.g., Qwen3.5 hybrid).
+        eager_evaluation: true,
         use_metal_fused_optimizer,
     };
 
@@ -3618,13 +3651,19 @@ async fn run_inference_with_lora(
         .ok_or_else(|| anyhow::anyhow!("Model does not support KV cache"))?;
     tracing::info!("Created KV cache for {} tokens", max_seq_len);
 
+    // Create Mamba cache for hybrid models (Qwen3.5 GDN layers)
+    let mut mamba_cache = model.create_mamba_cache();
+    if mamba_cache.is_some() {
+        tracing::info!("Created Mamba cache for hybrid LoRA model");
+    }
+
     let start = std::time::Instant::now();
 
-    // Generate with KV cache (O(n+k) complexity - fast!)
+    // Generate with hybrid cache (KV + Mamba for hybrid models)
     let output = generate_cached_async(
         |input, cache| {
             model
-                .forward_with_cache(input, None, Some(cache))
+                .forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
                 .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
         },
         &input_ids,

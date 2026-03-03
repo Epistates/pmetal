@@ -1064,13 +1064,21 @@ impl Qwen3NextLoraModel {
     ) -> Result<Array, LoraError> {
         let mut hidden = Module::forward(&mut self.embed_tokens, input_ids)?;
 
+        // Create separate masks for full attention vs GDN layers (matching base model):
+        // - Full attention: uses the causal mask from the caller (4D [1,1,T,T])
+        // - GDN (linear attention): uses None — GDN expects 2D [B,T] token-validity,
+        //   not a 4D attention mask. Passing 4D causes reshape errors.
+        let fa_mask = mask;
+        let ssm_mask: Option<&Array> = None;
+
         let layers_per_block = checkpoint_config
             .map(|c| c.layers_per_block)
             .unwrap_or(usize::MAX);
         let checkpointing_enabled = checkpoint_config.map(|c| c.enabled).unwrap_or(false);
 
         for (idx, layer) in self.layers.iter_mut().enumerate() {
-            hidden = layer.forward(&hidden, mask, None)?;
+            let layer_mask = if layer.is_linear { ssm_mask } else { fa_mask };
+            hidden = layer.forward(&hidden, layer_mask, None)?;
 
             if checkpointing_enabled && (idx + 1) % layers_per_block == 0 {
                 GRAD_CKPT_WARN.call_once(|| {
@@ -1080,6 +1088,46 @@ impl Qwen3NextLoraModel {
                     );
                 });
             }
+        }
+
+        Ok(Module::forward(&mut self.norm, &hidden)?)
+    }
+
+    /// Cache-aware forward for inference with both KV cache and Mamba cache.
+    ///
+    /// This mirrors the base model's `forward_with_cache`: attention layers use
+    /// KV cache for efficient autoregressive decoding, GDN layers use MambaCache
+    /// for recurrent state.
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        mut kv_cache: Option<&mut KVCache>,
+        mut mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, LoraError> {
+        let mut hidden = Module::forward(&mut self.embed_tokens, input_ids)?;
+
+        // Dual mask split (same as training forward and base model):
+        // - Full attention layers: causal mask from caller
+        // - GDN layers: None (recurrent, no attention mask needed)
+        let fa_mask = mask;
+        let ssm_mask: Option<&Array> = None;
+
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
+            let kv = if !layer.is_linear {
+                kv_cache.as_deref_mut().map(|c| (c, layer_idx))
+            } else {
+                None
+            };
+            let mamba = if layer.is_linear {
+                mamba_cache
+                    .as_deref_mut()
+                    .and_then(|c| c.get_mut(layer_idx))
+            } else {
+                None
+            };
+            let layer_mask = if layer.is_linear { ssm_mask } else { fa_mask };
+            hidden = layer.forward_with_cache(&hidden, layer_mask, kv, mamba)?;
         }
 
         Ok(Module::forward(&mut self.norm, &hidden)?)
@@ -1145,6 +1193,36 @@ impl Qwen3NextLoraForCausalLM {
             self.model
                 .forward_with_checkpoint(input_ids, mask, checkpoint_config.as_ref())?;
         self.lm_head_forward(&hidden_states)
+    }
+
+    /// Cache-aware forward for autoregressive inference.
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, LoraError> {
+        let h = self
+            .model
+            .forward_with_cache(input_ids, mask, kv_cache, mamba_cache)?;
+        self.lm_head_forward(&h)
+    }
+
+    /// Create a KV cache sized for the attention layers.
+    pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
+        let config = &self.model.config;
+        KVCache::new(KVCacheConfig::new(
+            config.num_hidden_layers as usize,
+            max_seq_len,
+            config.num_kv_heads() as usize,
+            config.head_dim() as usize,
+        ))
+    }
+
+    /// Create a Mamba cache for GDN layers.
+    pub fn create_mamba_cache(&self) -> MambaCache {
+        MambaCache::new(self.model.config.num_hidden_layers as usize)
     }
 
     fn lm_head_forward(&mut self, h: &Array) -> Result<Array, LoraError> {
@@ -2240,18 +2318,12 @@ impl crate::TrainableModel for Qwen3NextLoraForCausalLM {
         true
     }
 
-    /// KV cache is not supported for this hybrid model.
-    ///
-    /// GDN layers use MambaCache (recurrent SSM state), not KV cache. The
-    /// TrainableModel interface exposes a single KVCache type, which cannot
-    /// represent the mixed cache needed by a hybrid architecture. Use
-    /// `Qwen3NextForCausalLM::forward_with_cache` directly for inference.
     fn supports_kv_cache(&self) -> bool {
-        false
+        true
     }
 
-    fn create_cache(&self, _max_seq_len: usize) -> Option<KVCache> {
-        None
+    fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {
+        Some(Qwen3NextLoraForCausalLM::create_cache(self, max_seq_len))
     }
 }
 
