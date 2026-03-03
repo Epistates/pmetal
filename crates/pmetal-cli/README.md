@@ -17,6 +17,9 @@ Or build from source:
 ```bash
 cargo build --release -p pmetal-cli
 ./target/release/pmetal --help
+
+# With ANE and dashboard support
+cargo build --release -p pmetal-cli --features "ane dashboard"
 ```
 
 ## Commands
@@ -55,6 +58,7 @@ pmetal train \
 | `--use-sequence-packing` | Enable packing | false |
 | `--gradient-checkpointing` | Save memory | false |
 | `--resume` | Resume from checkpoint | false |
+| `--ane` | Use Apple Neural Engine (requires `--features ane`) | false |
 
 ### Infer
 
@@ -84,6 +88,18 @@ pmetal infer \
 | `--chat` | Use chat template | Auto |
 | `--no-thinking` | Disable thinking | false |
 | `--stream` | Stream output | false |
+| `--ane` | Use ANE inference (hybrid prefill + CPU decode, requires `--features ane`) | false |
+
+### Dashboard
+
+Real-time TUI dashboard for monitoring training progress (requires `--features dashboard`):
+
+```bash
+# Monitor a running training session
+pmetal dashboard --metrics-file ./output/metrics.jsonl
+```
+
+Displays loss curves (braille), learning rate schedule, per-component timing breakdown (ANE forward/backward, RMSNorm, cblas, Adam), and token throughput. Reads the same JSONL file produced by `--log-metrics`.
 
 ### Benchmark
 
@@ -97,6 +113,17 @@ pmetal benchmark \
 ```
 
 ## Examples
+
+### ANE Training
+
+```bash
+pmetal train \
+  --model qwen/Qwen3-0.6B-Base \
+  --dataset train.jsonl \
+  --output ./ane-output \
+  --ane \
+  --log-metrics ./ane-output/metrics.jsonl
+```
 
 ### LoRA Training with Sequence Packing
 

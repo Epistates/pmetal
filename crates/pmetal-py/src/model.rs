@@ -56,9 +56,8 @@ impl PyModel {
             model.quantize_fp8().map_err(runtime_err)?;
         }
 
-        let tokenizer_path = model_path.join("tokenizer.json");
-        let tokenizer = if tokenizer_path.exists() {
-            pmetal_data::Tokenizer::from_file(&tokenizer_path).ok()
+        let tokenizer = if model_path.join("tokenizer.json").exists() {
+            pmetal_data::Tokenizer::from_model_dir(&model_path).ok()
         } else {
             None
         };

@@ -7,9 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.2.1] - 2026-03-03
 
+### Added
+
+- **Dynamic weight pipeline**: 9 MIL kernels compiled once at startup; weights packed alongside activations in IOSurface spatial dimension — zero recompilation during training
+- **`DynamicAneTrainer`**: compile-once training loop replacing the static trainer that consumed ~76% of training time in recompilation
+- **`DynamicKernelConfig`** and 9 dynamic kernel generators in `dynamic_kernel.rs`
+- **fp32 IOSurface support**: `IoSurface::new_f32()` with packed write/read for dynamic weight pipeline
+- **MIL builder extensions**: `emit_cast`, `emit_slice_by_size`, `new_fp32_input` for dynamic kernel generation
+- **Non-standard `head_dim` support**: Full forward and backward kernel support for models where `head_dim != dim/n_heads` (e.g., Qwen3 with `head_dim=128`, `dim/n_heads=64`)
+- **Training dashboard (TUI)**: `pmetal dashboard` subcommand using ratatui for real-time loss curves, timing breakdown, and throughput monitoring
+- **`MetricsJsonCallback`**: Emits full `StepMetrics` including ANE timing, Adam timing, and throughput to JSONL
+- **GSPO trainer**: Group Sequence Policy Optimization (fixes GRPO length bias)
+- **DAPO trainer**: Decoupled Clip and Dynamic Sampling Policy Optimization (all 4 ByteDance innovations)
+
 ### Fixed
 
 - ANE inference gibberish output: added RoPE and per-head QK-norm to prefill kernel and CPU decode
+- ANE inference missing `compile_kernels()` call in `generate_cached_ane`
+- All backward kernels (static + dynamic) now use `q_dim()`/`kv_dim()` instead of hardcoded `dim` — fixes incorrect gradient shapes for non-standard architectures
+- `sdpa_bwd1_input_ch`: `4*dim` → `q_dim + 2*kv_dim + dim`
+- `sdpa_bwd1_output_ch`: `dim + 2*score_ch` → `kv_dim + 2*score_ch`
+- `sdpa_bwd2_input_ch`: `2*score_ch + 2*dim` → `2*score_ch + q_dim + kv_dim`
+- Dynamic backward kernels: `wo_bwd`, `sdpa_bwd1`, `sdpa_bwd2`, `qkv_bwd` all updated for q_dim/kv_dim
 - SafeTensors dtype/alignment error handling
 - Token ID bounds check in CPU decode
 - Softmax numerical stability for zero-sum edge case
@@ -20,6 +39,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Kernel config validation (`TransformerKernelConfig::validate()`)
 - LoRA safety: rank=0 guard and tensor shape validation
 - Decode memory efficiency: pooled scores buffer
+- 15 new tests for non-standard head_dim kernels (7 static + 8 dynamic)
 
 ## [0.2.0] - 2026-03-02
 

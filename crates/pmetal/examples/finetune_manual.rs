@@ -36,7 +36,7 @@ async fn main() -> BoxResult<()> {
 
     // 1. Load tokenizer
     println!("Loading tokenizer...");
-    let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))?;
+    let tokenizer = Tokenizer::from_model_dir(&model_path)?;
 
     // 2. Detect chat template
     let chat_template = pmetal::data::chat_templates::detect_chat_template(

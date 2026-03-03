@@ -7,7 +7,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
 pub use mlx_rs::module::ModuleParametersExt;
-use mlx_rs::{Array, nn};
+use mlx_rs::{Array, module::ModuleParameters, nn};
 
 use crate::architectures::clip::CLIPTextModel;
 use crate::architectures::flux::FluxDiT;
@@ -18,6 +18,7 @@ use crate::architectures::mllama::MllamaForConditionalGeneration;
 use crate::architectures::nemotron_h::{
     NemotronHForCausalLM, load_nemotron_weights as load_nemotron,
 };
+use crate::architectures::qwen3_next::{Qwen3NextConfig, Qwen3NextForCausalLM, sanitize_weights};
 use crate::architectures::phi::PhiForCausalLM;
 use crate::architectures::qwen2::Qwen2ForCausalLM;
 use crate::architectures::qwen3::Qwen3ForCausalLM;
@@ -789,6 +790,28 @@ pub fn load_nemotron_weights(
 ) -> Result<(), LoadError> {
     let weights = load_weights(model_dir)?;
     load_nemotron(model, &weights).map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))
+}
+
+/// Load weights for Qwen3Next models with sanitization.
+///
+/// Handles expert weight stacking, (1+w) RMSNorm offset, and conv1d transposition.
+pub fn load_qwen3_next_weights(
+    model: &mut Qwen3NextForCausalLM,
+    model_dir: impl AsRef<Path>,
+    config: &Qwen3NextConfig,
+) -> Result<(), LoadError> {
+    let mut weights = load_weights(model_dir)?;
+    sanitize_weights(&mut weights, config)
+        .map_err(|e| LoadError::SafeTensors(format!("{:?}", e)))?;
+
+    // Apply sanitized weights to model parameters
+    let mut params = model.parameters_mut().flatten();
+    for (key, value) in weights {
+        if let Some(param) = params.get_mut(&*key) {
+            **param = value;
+        }
+    }
+    Ok(())
 }
 
 /// Load all safetensor weights from a model directory.

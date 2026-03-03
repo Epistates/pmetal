@@ -469,6 +469,11 @@ impl TrainingLoop {
         self.callbacks.push(callback);
     }
 
+    /// Take all callbacks out of the training loop (transfers ownership back to caller).
+    pub fn take_callbacks(&mut self) -> Vec<Box<dyn pmetal_core::TrainingCallback>> {
+        std::mem::take(&mut self.callbacks)
+    }
+
     /// Get current learning rate based on scheduler.
     ///
     /// Delegates to the canonical `pmetal_core::LearningRateScheduler` so all
@@ -1573,6 +1578,25 @@ impl TrainingLoop {
                         self.get_learning_rate(),
                         tokens_per_sec,
                     );
+
+                    // Dispatch to callbacks
+                    if !self.callbacks.is_empty() {
+                        let step_metrics = pmetal_core::StepMetrics {
+                            step: self.step,
+                            loss: self.running_loss,
+                            lr: self.get_learning_rate() as f64,
+                            tok_sec: tokens_per_sec,
+                            total_ms: self.last_log_time.map(|t| {
+                                let interval = self.config.log_every as f64;
+                                t.elapsed().as_secs_f64() * 1000.0 / interval
+                            }).unwrap_or(0.0),
+                            tokens: self.tokens_since_log,
+                            ..Default::default()
+                        };
+                        for cb in &mut self.callbacks {
+                            cb.on_step_end_with_metrics(&step_metrics);
+                        }
+                    }
                 }
 
                 // Regular checkpointing - need to eval before checkpoint
@@ -1818,6 +1842,22 @@ impl TrainingLoop {
                         tokens_per_sec
                     );
 
+                    // Dispatch to callbacks
+                    if !self.callbacks.is_empty() {
+                        let step_metrics = pmetal_core::StepMetrics {
+                            step: self.step,
+                            loss: self.running_loss,
+                            lr,
+                            tok_sec: tokens_per_sec,
+                            total_ms: now.duration_since(self.last_log_time.unwrap_or(now)).as_secs_f64() * 1000.0 / self.config.log_every as f64,
+                            tokens: self.tokens_since_log,
+                            ..Default::default()
+                        };
+                        for cb in &mut self.callbacks {
+                            cb.on_step_end_with_metrics(&step_metrics);
+                        }
+                    }
+
                     self.last_log_time = Some(now);
                     self.tokens_since_log = 0;
                 }
@@ -2050,6 +2090,24 @@ impl TrainingLoop {
                         self.get_learning_rate(),
                         tokens_per_sec,
                     );
+
+                    // Dispatch to callbacks
+                    if !self.callbacks.is_empty() {
+                        let step_metrics = pmetal_core::StepMetrics {
+                            step: self.step,
+                            loss: self.running_loss,
+                            lr: self.get_learning_rate() as f64,
+                            tok_sec: tokens_per_sec,
+                            total_ms: now.duration_since(
+                                self.last_log_time.unwrap_or(now)
+                            ).as_secs_f64() * 1000.0 / self.config.log_every as f64,
+                            tokens: self.tokens_since_log,
+                            ..Default::default()
+                        };
+                        for cb in &mut self.callbacks {
+                            cb.on_step_end_with_metrics(&step_metrics);
+                        }
+                    }
                 }
 
                 // Regular checkpointing

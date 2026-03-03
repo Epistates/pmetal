@@ -31,8 +31,9 @@ use crate::error::{MetalError, Result};
 
 /// Configuration for the dynamic ANE trainer.
 ///
-/// No `accum_steps`, `max_compiles`, or `exhaustion_strategy` — those are
-/// irrelevant when kernels compile exactly once.
+/// No `max_compiles` or `exhaustion_strategy` — those are irrelevant when
+/// kernels compile exactly once. `accum_steps` controls gradient accumulation
+/// before each Adam update.
 #[derive(Debug, Clone)]
 pub struct DynamicAneTrainerConfig {
     /// Model dimension.

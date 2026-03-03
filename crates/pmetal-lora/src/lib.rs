@@ -62,6 +62,7 @@ pub mod phi_lora;
 mod qblora;
 mod qlora;
 pub mod qwen3_lora;
+pub mod qwen3_next_lora;
 pub mod qwen3_qlora;
 mod trainable;
 
@@ -101,5 +102,6 @@ pub use phi_lora::*;
 pub use qblora::*;
 pub use qlora::*;
 pub use qwen3_lora::*;
+pub use qwen3_next_lora::*;
 pub use qwen3_qlora::*;
 pub use trainable::*;

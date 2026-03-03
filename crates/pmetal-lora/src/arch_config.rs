@@ -67,6 +67,7 @@ use pmetal_models::ModelConfig;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::architectures::mistral::MistralConfig;
 use pmetal_models::architectures::qwen3::Qwen3Config;
+use pmetal_models::architectures::qwen3_next::Qwen3NextConfig;
 
 impl LoraArchitectureConfig for LlamaConfig {
     fn hidden_size(&self) -> i32 {
@@ -195,6 +196,48 @@ impl LoraArchitectureConfig for Qwen3Config {
 
     fn hidden_act(&self) -> &str {
         &self.hidden_act
+    }
+
+    fn num_hidden_layers(&self) -> i32 {
+        self.num_hidden_layers
+    }
+
+    fn vocab_size(&self) -> i32 {
+        self.vocab_size
+    }
+
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+}
+
+impl LoraArchitectureConfig for Qwen3NextConfig {
+    fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+
+    fn num_attention_heads(&self) -> i32 {
+        self.num_attention_heads
+    }
+
+    fn num_kv_heads(&self) -> i32 {
+        ModelConfig::num_kv_heads(self)
+    }
+
+    fn head_dim(&self) -> i32 {
+        self.get_head_dim()
+    }
+
+    fn intermediate_size(&self) -> i32 {
+        self.intermediate_size
+    }
+
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta
+    }
+
+    fn rms_norm_eps(&self) -> f32 {
+        self.rms_norm_eps
     }
 
     fn num_hidden_layers(&self) -> i32 {

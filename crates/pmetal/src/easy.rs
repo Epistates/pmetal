@@ -227,11 +227,10 @@ impl FinetuneBuilder {
         // Resolve model path (download if HuggingFace ID)
         let model_path = resolve_model_path(&self.model_id).await?;
 
-        // Load tokenizer
-        let tokenizer_path = model_path.join("tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+        // Load tokenizer (reads special_tokens_map.json and tokenizer_config.json too)
+        let tokenizer = Tokenizer::from_model_dir(&model_path).map_err(|e| {
             PMetalError::ModelLoad(format!(
-                "Failed to load tokenizer at {tokenizer_path:?}: {e}"
+                "Failed to load tokenizer from {model_path:?}: {e}"
             ))
         })?;
 
@@ -452,11 +451,10 @@ impl InferBuilder {
         // Resolve model path
         let model_path = resolve_model_path(&self.model_id).await?;
 
-        // Load tokenizer
-        let tokenizer_path = model_path.join("tokenizer.json");
-        let tokenizer = Tokenizer::from_file(&tokenizer_path).map_err(|e| {
+        // Load tokenizer (reads special_tokens_map.json and tokenizer_config.json too)
+        let tokenizer = Tokenizer::from_model_dir(&model_path).map_err(|e| {
             PMetalError::ModelLoad(format!(
-                "Failed to load tokenizer at {tokenizer_path:?}: {e}"
+                "Failed to load tokenizer from {model_path:?}: {e}"
             ))
         })?;
 
@@ -759,13 +757,8 @@ impl InferBuilder {
 /// Resolve a model ID to a local path, downloading from HuggingFace Hub if necessary.
 async fn resolve_model_path(model_id: &str) -> Result<PathBuf> {
     if is_hf_model_id(model_id) {
-        // HuggingFace model ID — download_model already handles weight downloads
+        // HuggingFace model ID — download_model fetches all repo files
         let path = pmetal_hub::download_model(model_id, None, None).await?;
-
-        // Also download tokenizer files (download_model may not include these)
-        let _ = pmetal_hub::download_file(model_id, "tokenizer.json", None, None).await;
-        let _ = pmetal_hub::download_file(model_id, "tokenizer_config.json", None, None).await;
-
         Ok(path)
     } else {
         Ok(PathBuf::from(model_id))

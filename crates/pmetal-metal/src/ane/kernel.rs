@@ -462,15 +462,11 @@ pub fn validate_config(cfg: &TransformerKernelConfig) -> crate::error::Result<()
             "n_heads must be divisible by n_kv_heads".into(),
         ));
     }
-    if cfg.dim == 0 || cfg.dim % cfg.n_heads != 0 {
-        return Err(MetalError::InvalidConfig(
-            "dim must be > 0 and divisible by n_heads".into(),
-        ));
+    if cfg.dim == 0 {
+        return Err(MetalError::InvalidConfig("dim must be > 0".into()));
     }
-    if cfg.head_dim != cfg.dim / cfg.n_heads {
-        return Err(MetalError::InvalidConfig(
-            "head_dim must equal dim / n_heads".into(),
-        ));
+    if cfg.head_dim == 0 {
+        return Err(MetalError::InvalidConfig("head_dim must be > 0".into()));
     }
     Ok(())
 }

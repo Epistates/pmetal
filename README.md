@@ -2,7 +2,7 @@
 
 **Powdered Metal** — High-performance LLM fine-tuning framework for Apple Silicon, written in Rust.
 
-PMetal is a machine learning framework that brings [Unsloth](https://github.com/unslothai/unsloth)-style optimizations to macOS. It leverages custom Metal shaders and the MLX framework to achieve state-of-the-art training throughput on Apple Silicon GPUs.
+PMetal is a machine learning framework that brings [Unsloth](https://github.com/unslothai/unsloth)-style optimizations to macOS. It leverages custom Metal shaders, the MLX framework, and native Apple Neural Engine (ANE) integration to achieve state-of-the-art training and inference throughput on Apple Silicon.
 
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
@@ -44,6 +44,31 @@ cargo build --release
   --prompt "Does absolute truth exist?" \
   --chat \
   --show-thinking
+```
+
+### ANE (Apple Neural Engine) Training & Inference
+
+PMetal includes a native ANE pipeline behind the `ane` feature flag. This uses private `AppleNeuralEngine.framework` APIs to run MIL 1.3 programs directly on the Neural Engine with zero-copy IOSurface data transfer.
+
+```bash
+# Build with ANE support
+cargo build --release --features ane
+
+# Train on ANE (dynamic weight pipeline — 9 kernels, compiled once)
+./target/release/pmetal train \
+  --model qwen/Qwen3-0.6B-Base \
+  --dataset path/to/train.jsonl \
+  --output ./output \
+  --ane
+
+# Inference on ANE (hybrid ANE prefill + CPU decode with KV cache)
+./target/release/pmetal infer \
+  --model qwen/Qwen3-0.6B-Base \
+  --prompt "Explain quantum entanglement" \
+  --ane
+
+# Real-time training dashboard (TUI)
+./target/release/pmetal dashboard --metrics-file ./output/metrics.jsonl
 ```
 
 ## Architecture
@@ -145,8 +170,9 @@ Architecture implementations exist but are not yet integrated into the CLI dispa
 - **DoRA**: Weight-Decomposed Low-Rank Adaptation
 - **DPO**: Direct Preference Optimization for RLHF
 - **GRPO**: Group Relative Policy Optimization
-- **DAPO**: Decoupled Clip and Dynamic Sampling Policy Optimization
+- **DAPO**: Decoupled Clip and Dynamic Sampling Policy Optimization (ByteDance)
 - **GSPO**: Group Sequence Policy Optimization (fixes GRPO length bias)
+- **ANE Training**: Native Apple Neural Engine training with dynamic weight pipeline (compile once, zero recompilation)
 - **PPO**: Proximal Policy Optimization
 - **ORPO**: Odds Ratio Preference Optimization (reference-free)
 - **SimPO**: Simple Preference Optimization
@@ -156,7 +182,7 @@ Architecture implementations exist but are not yet integrated into the CLI dispa
 
 ## Key Features
 
-### Metal Optimizations
+### Metal GPU Optimizations
 
 Custom Metal shaders provide significant speedups:
 
@@ -165,6 +191,25 @@ Custom Metal shaders provide significant speedups:
 - **Fused Cross-Entropy**: Unsloth-style chunked loss computation
 - **Fused RoPE**: Rotary position embeddings in-kernel
 - **Fused Sampler**: JIT-compiled token sampling
+
+### ANE (Neural Engine) Pipeline
+
+Native ANE integration for power-efficient training and inference (requires `--features ane`):
+
+- **Dynamic Weight Pipeline**: 9 MIL kernels compiled once at startup; weights packed alongside activations in IOSurface spatial dimension. Zero recompilation during training.
+- **Hybrid Inference**: ANE prefill + CPU decode with KV cache for autoregressive generation.
+- **IOSurface Zero-Copy**: fp32 shared memory surfaces for CPU↔ANE data transfer with no serialization overhead.
+- **GQA/MQA Support**: Grouped-query and multi-query attention via MIL `tile` ops for KV head expansion.
+- **Non-Standard Architectures**: Full support for models where `head_dim != dim/n_heads` (e.g., Qwen3).
+
+### Training Dashboard (TUI)
+
+Real-time terminal dashboard via `pmetal dashboard`:
+
+- Loss curve visualization (braille characters)
+- Learning rate schedule tracking
+- Per-component timing breakdown (ANE forward/backward, RMSNorm, cblas, Adam)
+- Token throughput monitoring
 
 ### Sequence Packing
 
@@ -236,6 +281,15 @@ cargo build
 
 # Release build with optimizations
 cargo build --release
+
+# Build with ANE support
+cargo build --release --features ane
+
+# Build with TUI dashboard
+cargo build --release --features dashboard
+
+# Build with all optional features
+cargo build --release --features "ane dashboard"
 
 # Run tests
 cargo test --all

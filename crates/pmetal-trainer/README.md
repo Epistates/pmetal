@@ -14,6 +14,9 @@ This crate provides the training infrastructure for PMetal, including various tr
 | **LoRA** | Low-Rank Adaptation | Parameter-efficient fine-tuning |
 | **DPO** | Direct Preference Optimization | Preference-based alignment |
 | **GRPO** | Group Relative Policy Optimization | Efficient PPO alternative |
+| **GSPO** | Group Sequence Policy Optimization | Fixes GRPO length bias |
+| **DAPO** | Decoupled Clip and Dynamic Sampling PO | ByteDance's 4 GRPO improvements |
+| **ANE** | Apple Neural Engine training | Power-efficient on-device training |
 | **Diffusion** | LLaDA-style diffusion training | Experimental |
 
 ## Usage
@@ -72,10 +75,13 @@ trainer.train_with_checkpoints(&dataloader, &checkpoint_mgr, save_every: 500)?;
 | `lora_trainer` | LoRA-specific training |
 | `dpo` | Direct Preference Optimization |
 | `grpo` | Group Relative Policy Optimization |
+| `gspo` | Group Sequence Policy Optimization |
+| `dapo` | Decoupled Clip and Dynamic Sampling PO |
+| `ane_training` | ANE training loop (`AneTrainingLoop` + `DynamicAneTrainer`) |
 | `diffusion` | Diffusion-based training |
 | `checkpoint` | Checkpoint save/load |
 | `scheduler` | Learning rate schedulers |
-| `callbacks` | Training callbacks |
+| `callbacks` | Training callbacks (`MetricsJsonCallback`, `StepMetrics`) |
 | `param_groups` | Per-layer learning rates |
 
 ## Configuration

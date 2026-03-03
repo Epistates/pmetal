@@ -4,7 +4,7 @@
 //! eliminating the need for hardcoded model types in application code.
 
 use crate::architectures::*;
-use crate::loader::{load_generic_weights, load_nemotron_weights};
+use crate::loader::{load_generic_weights, load_nemotron_weights, load_qwen3_next_weights};
 use crate::traits::{CausalLMModel, ModelConfig};
 use mlx_rs::{
     Array,
@@ -30,6 +30,7 @@ pub enum ModelArchitecture {
     Cohere,
     Granite,
     NemotronH,
+    Qwen3Next,
     StarCoder2,
     RecurrentGemma,
     Jamba,
@@ -52,6 +53,7 @@ impl std::fmt::Display for ModelArchitecture {
             Self::Cohere => write!(f, "Cohere"),
             Self::Granite => write!(f, "Granite"),
             Self::NemotronH => write!(f, "NemotronH"),
+            Self::Qwen3Next => write!(f, "Qwen 3.5"),
             Self::StarCoder2 => write!(f, "StarCoder2"),
             Self::RecurrentGemma => write!(f, "RecurrentGemma"),
             Self::Jamba => write!(f, "Jamba"),
@@ -67,6 +69,7 @@ impl ModelArchitecture {
             "llama4" => Some(Self::Llama4),
             "llama" | "llama3" => Some(Self::Llama),
             "qwen3_moe" => Some(Self::Qwen3MoE),
+            "qwen3_next" | "qwen3_5" | "qwen3.5" => Some(Self::Qwen3Next),
             "qwen3" => Some(Self::Qwen3),
             "qwen2" | "qwen2_5" => Some(Self::Qwen2),
             "gemma" | "gemma2" | "gemma3" => Some(Self::Gemma),
@@ -96,6 +99,9 @@ impl ModelArchitecture {
             }
             if lower.contains("qwen3moe") || lower.contains("qwen3_moe") {
                 return Some(Self::Qwen3MoE);
+            }
+            if lower.contains("qwen3next") || lower.contains("qwen3_next") || lower.contains("qwen35") || lower.contains("qwen3_5") || lower.contains("qwen3.5") {
+                return Some(Self::Qwen3Next);
             }
             if lower.contains("qwen3") {
                 return Some(Self::Qwen3);
@@ -189,6 +195,7 @@ pub enum DynamicModel {
     Cohere(CohereForCausalLM),
     Granite(GraniteForCausalLM),
     NemotronH(NemotronHForCausalLM),
+    Qwen3Next(Qwen3NextForCausalLM),
     StarCoder2(StarCoder2Model),
     RecurrentGemma(RecurrentGemmaModel),
     Jamba(JambaModel),
@@ -211,6 +218,7 @@ impl std::fmt::Debug for DynamicModel {
             Self::Cohere(_) => write!(f, "DynamicModel::Cohere"),
             Self::Granite(_) => write!(f, "DynamicModel::Granite"),
             Self::NemotronH(_) => write!(f, "DynamicModel::NemotronH"),
+            Self::Qwen3Next(_) => write!(f, "DynamicModel::Qwen3Next"),
             Self::StarCoder2(_) => write!(f, "DynamicModel::StarCoder2"),
             Self::RecurrentGemma(_) => write!(f, "DynamicModel::RecurrentGemma"),
             Self::Jamba(_) => write!(f, "DynamicModel::Jamba"),
@@ -370,6 +378,15 @@ impl DynamicModel {
                 ModuleParametersExt::eval(&model)?;
                 Ok(Self::NemotronH(model))
             }
+            ModelArchitecture::Qwen3Next => {
+                let config: Qwen3NextConfig = json5::from_str(&config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model = Qwen3NextForCausalLM::new(config.clone())?;
+                load_qwen3_next_weights(&mut model, model_dir, &config)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                ModuleParametersExt::eval(&model)?;
+                Ok(Self::Qwen3Next(model))
+            }
             ModelArchitecture::StarCoder2 => {
                 let config: StarCoder2Config = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
@@ -426,6 +443,7 @@ impl DynamicModel {
             Self::Cohere(m) => m.forward(input_ids, mask, None),
             Self::Granite(m) => m.forward(input_ids, mask, None),
             Self::NemotronH(m) => m.forward(input_ids, None),
+            Self::Qwen3Next(m) => m.forward(input_ids, mask),
             Self::StarCoder2(m) => m.forward(input_ids, mask, None),
             Self::RecurrentGemma(m) => m.forward(input_ids),
             Self::Jamba(m) => m.forward(input_ids),
@@ -450,6 +468,7 @@ impl DynamicModel {
             | Self::Cohere(_)
             | Self::Granite(_)
             | Self::NemotronH(_)
+            | Self::Qwen3Next(_)
             | Self::StarCoder2(_)
             | Self::Llama4(_)
             | Self::RecurrentGemma(_)
@@ -520,6 +539,12 @@ impl DynamicModel {
                 m.config().num_kv_heads() as usize,
                 m.config().head_dim() as usize,
             )),
+            Self::Qwen3Next(m) => KVCache::new(KVCacheConfig::new(
+                m.config().num_hidden_layers() as usize,
+                max_seq_len,
+                m.config().num_kv_heads() as usize,
+                m.config().head_dim() as usize,
+            )),
             Self::StarCoder2(m) => KVCache::new(KVCacheConfig::new(
                 m.config.num_hidden_layers as usize,
                 max_seq_len,
@@ -540,6 +565,7 @@ impl DynamicModel {
     pub fn create_mamba_cache(&self) -> Option<MambaCache> {
         match self {
             Self::NemotronH(m) => Some(MambaCache::new(m.config().num_hidden_layers() as usize)),
+            Self::Qwen3Next(m) => Some(MambaCache::new(m.config().num_hidden_layers() as usize)),
             _ => None,
         }
     }
@@ -553,6 +579,7 @@ impl DynamicModel {
     ) -> Result<Array, Exception> {
         match self {
             Self::NemotronH(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
+            Self::Qwen3Next(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
             _ => self.forward_with_cache(input_ids, mask, kv_cache),
         }
     }
@@ -572,6 +599,7 @@ impl DynamicModel {
             Self::Cohere(_) => ModelArchitecture::Cohere,
             Self::Granite(_) => ModelArchitecture::Granite,
             Self::NemotronH(_) => ModelArchitecture::NemotronH,
+            Self::Qwen3Next(_) => ModelArchitecture::Qwen3Next,
             Self::StarCoder2(_) => ModelArchitecture::StarCoder2,
             Self::RecurrentGemma(_) => ModelArchitecture::RecurrentGemma,
             Self::Jamba(_) => ModelArchitecture::Jamba,
@@ -594,6 +622,7 @@ impl DynamicModel {
             Self::Cohere(m) => m.config.vocab_size,
             Self::Granite(m) => m.config.vocab_size,
             Self::NemotronH(m) => m.config().vocab_size(),
+            Self::Qwen3Next(m) => m.config().vocab_size(),
             Self::StarCoder2(m) => m.config.vocab_size,
             Self::RecurrentGemma(m) => m.config.vocab_size,
             Self::Jamba(m) => m.config.vocab_size,
@@ -616,6 +645,7 @@ impl DynamicModel {
             Self::Cohere(m) => m.config.hidden_size,
             Self::Granite(m) => m.config.hidden_size,
             Self::NemotronH(m) => m.config().hidden_size(),
+            Self::Qwen3Next(m) => m.config().hidden_size(),
             Self::StarCoder2(m) => m.config.hidden_size,
             Self::RecurrentGemma(m) => m.config.hidden_size,
             Self::Jamba(m) => m.config.hidden_size,
@@ -638,6 +668,7 @@ impl DynamicModel {
             Self::Cohere(m) => ModuleParametersExt::eval(m),
             Self::Granite(m) => ModuleParametersExt::eval(m),
             Self::NemotronH(m) => ModuleParametersExt::eval(m),
+            Self::Qwen3Next(m) => ModuleParametersExt::eval(m),
             Self::StarCoder2(m) => ModuleParametersExt::eval(m),
             Self::RecurrentGemma(m) => ModuleParametersExt::eval(m),
             Self::Jamba(m) => ModuleParametersExt::eval(m),
@@ -662,6 +693,7 @@ impl ModuleParameters for DynamicModel {
             Self::Cohere(m) => m.parameters(),
             Self::Granite(m) => m.parameters(),
             Self::NemotronH(m) => m.parameters(),
+            Self::Qwen3Next(m) => m.parameters(),
             Self::StarCoder2(m) => m.parameters(),
             Self::RecurrentGemma(m) => m.parameters(),
             Self::Jamba(m) => m.parameters(),
@@ -684,6 +716,7 @@ impl ModuleParameters for DynamicModel {
             Self::Cohere(m) => m.trainable_parameters(),
             Self::Granite(m) => m.trainable_parameters(),
             Self::NemotronH(m) => m.trainable_parameters(),
+            Self::Qwen3Next(m) => m.trainable_parameters(),
             Self::StarCoder2(m) => m.trainable_parameters(),
             Self::RecurrentGemma(m) => m.trainable_parameters(),
             Self::Jamba(m) => m.trainable_parameters(),
@@ -706,6 +739,7 @@ impl ModuleParameters for DynamicModel {
             Self::Cohere(m) => m.parameters_mut(),
             Self::Granite(m) => m.parameters_mut(),
             Self::NemotronH(m) => m.parameters_mut(),
+            Self::Qwen3Next(m) => m.parameters_mut(),
             Self::StarCoder2(m) => m.parameters_mut(),
             Self::RecurrentGemma(m) => m.parameters_mut(),
             Self::Jamba(m) => m.parameters_mut(),
@@ -728,6 +762,7 @@ impl ModuleParameters for DynamicModel {
             Self::Cohere(m) => m.num_parameters(),
             Self::Granite(m) => m.num_parameters(),
             Self::NemotronH(m) => m.num_parameters(),
+            Self::Qwen3Next(m) => m.num_parameters(),
             Self::StarCoder2(m) => m.num_parameters(),
             Self::RecurrentGemma(m) => m.num_parameters(),
             Self::Jamba(m) => m.num_parameters(),
@@ -750,6 +785,7 @@ impl ModuleParameters for DynamicModel {
             Self::Cohere(m) => m.freeze_parameters(recurse),
             Self::Granite(m) => m.freeze_parameters(recurse),
             Self::NemotronH(m) => m.freeze_parameters(recurse),
+            Self::Qwen3Next(m) => m.freeze_parameters(recurse),
             Self::StarCoder2(m) => m.freeze_parameters(recurse),
             Self::RecurrentGemma(m) => m.freeze_parameters(recurse),
             Self::Jamba(m) => m.freeze_parameters(recurse),
@@ -772,6 +808,7 @@ impl ModuleParameters for DynamicModel {
             Self::Cohere(m) => m.unfreeze_parameters(recurse),
             Self::Granite(m) => m.unfreeze_parameters(recurse),
             Self::NemotronH(m) => m.unfreeze_parameters(recurse),
+            Self::Qwen3Next(m) => m.unfreeze_parameters(recurse),
             Self::StarCoder2(m) => m.unfreeze_parameters(recurse),
             Self::RecurrentGemma(m) => m.unfreeze_parameters(recurse),
             Self::Jamba(m) => m.unfreeze_parameters(recurse),
@@ -794,6 +831,7 @@ impl ModuleParameters for DynamicModel {
             Self::Cohere(m) => m.all_frozen(),
             Self::Granite(m) => m.all_frozen(),
             Self::NemotronH(m) => m.all_frozen(),
+            Self::Qwen3Next(m) => m.all_frozen(),
             Self::StarCoder2(m) => m.all_frozen(),
             Self::RecurrentGemma(m) => m.all_frozen(),
             Self::Jamba(m) => m.all_frozen(),
@@ -816,6 +854,7 @@ impl ModuleParameters for DynamicModel {
             Self::Cohere(m) => m.any_frozen(),
             Self::Granite(m) => m.any_frozen(),
             Self::NemotronH(m) => m.any_frozen(),
+            Self::Qwen3Next(m) => m.any_frozen(),
             Self::StarCoder2(m) => m.any_frozen(),
             Self::RecurrentGemma(m) => m.any_frozen(),
             Self::Jamba(m) => m.any_frozen(),

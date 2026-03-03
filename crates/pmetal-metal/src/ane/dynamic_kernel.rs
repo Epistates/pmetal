@@ -26,6 +26,10 @@
 //! | 7 | `sdpa_bwd1` | 2*Q_DIM+2*KV_DIM | SEQ | None (mask const only) |
 //! | 8 | `sdpa_bwd2` | 2*SCORE+Q_DIM+KV_DIM | SEQ | None (weight-free) |
 //! | 9 | `qkv_bwd` | Q_DIM | 3*SEQ + 3*DIM | Wq^T, Wk^T, Wv^T |
+//! | 10 | `rmsnorm_bwd` | 2*DIM | SEQ + 1 | RMSNorm weight (1 spatial col) |
+//!
+//! **Note:** Backward kernels 6-9 require MHA (`n_kv_heads == n_heads`).
+//! GQA backward is not yet supported.
 
 use crate::ane::kernel::{TransformerKernelConfig, WeightBlob};
 use crate::ane::mil::MilProgram;
@@ -172,8 +176,8 @@ fn build_causal_mask(seq_len: usize) -> Vec<u8> {
 /// - `sp[SEQ+2*DIM:SEQ+3*DIM]` = Wv
 /// - `sp[SEQ+3*DIM:SEQ+4*DIM]` = Wo
 ///
-/// Output: `[1, 6*DIM, 1, SEQ]` fp32
-/// - `concat(o_out, Q, K, V, attn_out, xnorm)`
+/// Output: `[1, 6*DIM, 1, SEQ]` fp32 (assumes MHA: q_dim == kv_dim == dim)
+/// - `concat(o_out[DIM], Q[DIM], K[DIM], V[DIM], attn_out[DIM], xnorm[DIM])`
 pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let c = &dkc.cfg;
     let d = c.dim;

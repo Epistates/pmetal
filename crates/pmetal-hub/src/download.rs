@@ -18,7 +18,37 @@ fn build_api(token: Option<&SecretString>) -> Result<Api> {
         .map_err(|e| pmetal_core::PMetalError::Hub(e.to_string()))
 }
 
+/// Files to skip during full-repo download (large binaries, metadata, etc.).
+const SKIP_EXTENSIONS: &[&str] = &[
+    ".bin",          // PyTorch weights — we use safetensors
+    ".pt",           // PyTorch checkpoint
+    ".pth",          // PyTorch checkpoint
+    ".onnx",         // ONNX export
+    ".ot",           // ONNX export
+    ".msgpack",      // Flax weights
+    ".h5",           // TensorFlow/Keras weights
+    ".pb",           // TensorFlow protobuf
+    ".tflite",       // TensorFlow Lite
+    ".gguf",         // GGUF quantized (download separately if needed)
+    ".zip",          // Archives
+    ".tar",          // Archives
+    ".gz",           // Archives (except .json.gz which is handled)
+];
+
+/// Files to skip by exact name.
+const SKIP_FILES: &[&str] = &[
+    ".gitattributes",
+    "flax_model.msgpack",
+    "tf_model.h5",
+    "pytorch_model.bin",
+    "rust_model.ot",
+];
+
 /// Download a model from HuggingFace Hub.
+///
+/// Lists all files in the repo via `info()` and downloads everything needed:
+/// configs, tokenizer files, safetensors weights, and any other small metadata.
+/// Skips PyTorch `.bin`, ONNX, TensorFlow, and other non-safetensors weight formats.
 ///
 /// # Arguments
 /// * `model_id` - Model identifier (e.g., "meta-llama/Llama-3.2-1B")
@@ -40,21 +70,79 @@ pub async fn download_model(
         None => api.model(model_id.to_string()),
     };
 
-    // Download config.json to get the model path
-    let config_path = repo
-        .get("config.json")
+    // List all files in the repository
+    let repo_info = repo
+        .info()
         .await
-        .map_err(|e| pmetal_core::PMetalError::Hub(e.to_string()))?;
+        .map_err(|e| pmetal_core::PMetalError::Hub(format!("Failed to list repo files: {e}")))?;
 
-    // Also download weights (safetensors)
-    tracing::info!("Downloading weights for {}...", model_id);
-    download_safetensors(model_id, revision, token).await?;
+    let all_files: Vec<&str> = repo_info
+        .siblings
+        .iter()
+        .map(|s| s.rfilename.as_str())
+        .collect();
 
-    // Return the parent directory (model cache location)
-    Ok(config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".")))
+    tracing::info!(
+        "Found {} files in {}, downloading...",
+        all_files.len(),
+        model_id
+    );
+
+    // Partition files into those we want and those we skip
+    let mut model_dir: Option<PathBuf> = None;
+    let mut downloaded = 0usize;
+    let mut skipped = 0usize;
+
+    for filename in &all_files {
+        // Skip files by extension
+        if SKIP_EXTENSIONS
+            .iter()
+            .any(|ext| filename.ends_with(ext))
+        {
+            tracing::debug!("Skipping {} (excluded format)", filename);
+            skipped += 1;
+            continue;
+        }
+
+        // Skip files by exact name
+        if SKIP_FILES.iter().any(|f| *filename == *f) {
+            tracing::debug!("Skipping {} (excluded file)", filename);
+            skipped += 1;
+            continue;
+        }
+
+        // Skip directories / hidden files
+        if filename.starts_with('.') {
+            skipped += 1;
+            continue;
+        }
+
+        // Download the file
+        match repo.get(filename).await {
+            Ok(path) => {
+                tracing::info!("  {}", filename);
+                downloaded += 1;
+                // Capture model directory from the first downloaded file
+                if model_dir.is_none() {
+                    model_dir = path.parent().map(PathBuf::from);
+                }
+            }
+            Err(e) => {
+                tracing::warn!("Failed to download {}: {}", filename, e);
+            }
+        }
+    }
+
+    tracing::info!(
+        "Downloaded {} files, skipped {} ({})",
+        downloaded,
+        skipped,
+        model_id
+    );
+
+    model_dir.ok_or_else(|| {
+        pmetal_core::PMetalError::Hub(format!("No files downloaded for {}", model_id))
+    })
 }
 
 /// Download a specific file from a model repository.

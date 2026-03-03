@@ -1,7 +1,7 @@
 //! Real-time training dashboard using ratatui TUI.
 //!
-//! Displays loss curves, ANE utilization, component timing breakdown,
-//! and system power metrics in a terminal-based UI.
+//! Displays loss curves, learning rate schedule, ANE utilization,
+//! and per-component timing breakdown in a terminal-based UI.
 //!
 //! # Usage
 //!

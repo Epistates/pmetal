@@ -1604,10 +1604,9 @@ async fn run_distillation_cli(
         PathBuf::from(student_id)
     };
 
-    // 2. Load Tokenizer (from student)
+    // 2. Load Tokenizer (from student, with config-aware special token resolution)
     tracing::info!("Loading tokenizer...");
-    let tokenizer_path = student_path.join("tokenizer.json");
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
+    let tokenizer = Tokenizer::from_model_dir(&student_path)?;
 
     // 2b. Detect chat template from student model
     let chat_template =
@@ -1785,10 +1784,9 @@ async fn run_grpo_cli(
         PathBuf::from(model_id)
     };
 
-    // 2. Load Tokenizer
+    // 2. Load Tokenizer (with config-aware special token resolution)
     tracing::info!("Loading tokenizer...");
-    let tokenizer_path = model_path.join("tokenizer.json");
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)?;
+    let tokenizer = Tokenizer::from_model_dir(&model_path)?;
 
     // 2b. Detect chat template
     let chat_template = pmetal_data::chat_templates::detect_chat_template(&model_path, model_id);
@@ -2034,8 +2032,8 @@ async fn run_training(
         let n_layers = get_usize("num_hidden_layers")?;
         let vocab_size = get_usize("vocab_size")?;
 
-        // Load tokenizer and dataset
-        let tokenizer = Tokenizer::from_file(model_path.join("tokenizer.json"))?;
+        // Load tokenizer (with config-aware special token resolution) and dataset
+        let tokenizer = Tokenizer::from_model_dir(&model_path)?;
         let ds_path = dataset_path
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("--dataset is required for ANE training"))?;
@@ -2207,37 +2205,39 @@ async fn run_training(
     }
 
     // Initialize metrics callback if requested
-    let mut metrics_callback = if let Some(ref metrics_path) = log_metrics {
-        // Default to output_dir/metrics.jsonl if only filename given
-        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
+    let metrics_path_resolved = log_metrics.as_ref().map(|metrics_path| {
+        if metrics_path.contains('/') || metrics_path.contains('\\') {
             PathBuf::from(metrics_path)
         } else {
             PathBuf::from(&output_dir).join(metrics_path)
+        }
+    });
+    let mut metrics_callback: Option<Box<dyn pmetal_core::TrainingCallback>> =
+        if let Some(ref path) = metrics_path_resolved {
+            let callback = MetricsJsonCallback::new(path)?
+                .with_run_name(format!(
+                    "{}-{}",
+                    config.model.model_id.replace('/', "-"),
+                    chrono::Utc::now().format("%Y%m%d-%H%M%S")
+                ))
+                .with_config(serde_json::json!({
+                    "model": config.model.model_id,
+                    "lora_r": lora_r,
+                    "learning_rate": learning_rate,
+                    "batch_size": batch_size,
+                    "epochs": num_epochs,
+                    "max_seq_len": config.training.max_seq_len,
+                    "gradient_accumulation_steps": gradient_accumulation_steps,
+                    "gradient_checkpointing": gradient_checkpointing,
+                    "quantization": format!("{:?}", quantization),
+                }));
+            use pmetal_core::TrainingCallback;
+            let mut cb = callback;
+            cb.on_train_start();
+            Some(Box::new(cb) as Box<dyn pmetal_core::TrainingCallback>)
+        } else {
+            None
         };
-        let callback = MetricsJsonCallback::new(&path)?
-            .with_run_name(format!(
-                "{}-{}",
-                config.model.model_id.replace('/', "-"),
-                chrono::Utc::now().format("%Y%m%d-%H%M%S")
-            ))
-            .with_config(serde_json::json!({
-                "model": config.model.model_id,
-                "lora_r": lora_r,
-                "learning_rate": learning_rate,
-                "batch_size": batch_size,
-                "epochs": num_epochs,
-                "max_seq_len": config.training.max_seq_len,
-                "gradient_accumulation_steps": gradient_accumulation_steps,
-                "gradient_checkpointing": gradient_checkpointing,
-                "quantization": format!("{:?}", quantization),
-            }));
-        use pmetal_core::TrainingCallback;
-        let mut cb = callback;
-        cb.on_train_start();
-        Some(cb)
-    } else {
-        None
-    };
 
     if let Some(ref cfg) = llama_config {
         tracing::info!(
@@ -2250,11 +2250,11 @@ async fn run_training(
         tracing::info!("Model config will be extracted from GGUF metadata");
     }
 
-    // Load tokenizer
+    // Load tokenizer (with config-aware special token resolution)
     tracing::info!("Loading tokenizer...");
     let tokenizer_path = model_path.join("tokenizer.json");
     let tokenizer = if tokenizer_path.exists() {
-        Tokenizer::from_file(&tokenizer_path)?
+        Tokenizer::from_model_dir(&model_path)?
     } else {
         anyhow::bail!(
             "Tokenizer not found at {:?}. GGUF models don't bundle a tokenizer — \
@@ -2418,6 +2418,11 @@ async fn run_training(
         // Create training loop
         let mut training_loop = TrainingLoop::new(training_loop_config);
 
+        // Wire metrics callback into training loop for step-level dispatch
+        if let Some(cb) = metrics_callback.take() {
+            training_loop.add_callback(cb);
+        }
+
         // Resume from checkpoint if requested
         if resume {
             if let Some((lora_params, metadata)) = checkpoint_manager.load_latest()? {
@@ -2452,6 +2457,12 @@ async fn run_training(
         let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
         model.save_lora_weights(&final_path)?;
         tracing::info!("Saved LoRA weights to {:?}", final_path);
+
+        // Recover metrics callback from training loop for finalization
+        let mut cbs = training_loop.take_callbacks();
+        if !cbs.is_empty() && metrics_callback.is_none() {
+            metrics_callback = Some(cbs.remove(0));
+        }
 
         (
             training_loop.current_loss(),
@@ -2502,6 +2513,11 @@ async fn run_training(
 
         // Create training loop
         let mut training_loop = TrainingLoop::new(training_loop_config);
+
+        // Wire metrics callback into training loop for step-level dispatch
+        if let Some(cb) = metrics_callback.take() {
+            training_loop.add_callback(cb);
+        }
 
         // Resume from checkpoint if requested
         if resume {
@@ -2588,6 +2604,12 @@ async fn run_training(
             tracing::info!("Saved LoRA weights to {:?}", final_path);
         }
 
+        // Recover metrics callback from training loop for finalization
+        let mut cbs = training_loop.take_callbacks();
+        if !cbs.is_empty() && metrics_callback.is_none() {
+            metrics_callback = Some(cbs.remove(0));
+        }
+
         (
             training_loop.current_loss(),
             training_loop.current_step(),
@@ -2597,7 +2619,6 @@ async fn run_training(
 
     // Finalize metrics callback
     if let Some(ref mut callback) = metrics_callback {
-        use pmetal_core::TrainingCallback;
         // Write final epoch metrics
         let mut custom = std::collections::HashMap::new();
         custom.insert("total_tokens".to_string(), total_tokens as f64);
@@ -2612,7 +2633,9 @@ async fn run_training(
             },
         );
         callback.on_train_end();
-        tracing::info!("Metrics saved to {:?}", callback.path());
+        if let Some(ref path) = metrics_path_resolved {
+            tracing::info!("Metrics saved to {:?}", path);
+        }
     }
 
     println!("\n========================================");
@@ -2688,48 +2711,18 @@ async fn run_inference(
     let model_path = if model_id.contains('/') && !PathBuf::from(model_id).exists() {
         tracing::info!("Model not found locally, downloading from HuggingFace Hub...");
 
-        // Download model (hf_hub handles caching automatically)
+        // Download all repo files (configs, tokenizer, weights, etc.)
         let path = pmetal_hub::download_model(model_id, None, None).await?;
-
-        // Download tokenizer files
-        tracing::info!("Downloading tokenizer...");
-        if let Err(e) = pmetal_hub::download_file(model_id, "tokenizer.json", None, None).await {
-            tracing::warn!("Failed to download tokenizer.json: {e} — tokenization may fail");
-        }
-        if let Err(e) =
-            pmetal_hub::download_file(model_id, "tokenizer_config.json", None, None).await
-        {
-            tracing::warn!(
-                "Failed to download tokenizer_config.json: {e} — chat template detection will fall back to model-name heuristics"
-            );
-        }
-        if let Err(e) =
-            pmetal_hub::download_file(model_id, "special_tokens_map.json", None, None).await
-        {
-            tracing::debug!("special_tokens_map.json not available: {e}");
-        }
-
-        // Download generation config if available
-        if let Err(e) =
-            pmetal_hub::download_file(model_id, "generation_config.json", None, None).await
-        {
-            tracing::debug!("generation_config.json not available: {e}");
-        }
-
-        // Download model weights (safetensors)
-        tracing::info!("Downloading model weights (this may take a while for large models)...");
-        pmetal_hub::download_safetensors(model_id, None, None).await?;
-
         tracing::info!("Model downloaded successfully to {:?}", path);
         path
     } else {
         PathBuf::from(model_id)
     };
 
-    // Load tokenizer
+    // Load tokenizer (with config-aware special token resolution)
     let tokenizer_path = model_path.join("tokenizer.json");
     let tokenizer = if tokenizer_path.exists() {
-        Tokenizer::from_file(&tokenizer_path)?
+        Tokenizer::from_model_dir(&model_path)?
     } else {
         anyhow::bail!(
             "Tokenizer not found at {:?}. GGUF models don't bundle a tokenizer — \
@@ -4500,8 +4493,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                     } else {
                         std::path::PathBuf::from(model_id)
                     };
-                let tok_path = model_path.join("tokenizer.json");
-                Some(Tokenizer::from_file(&tok_path)?)
+                Some(Tokenizer::from_model_dir(&model_path)?)
             } else {
                 None
             };
@@ -4958,8 +4950,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                     } else {
                         std::path::PathBuf::from(model_id)
                     };
-                let tok_path = model_path.join("tokenizer.json");
-                Some(Tokenizer::from_file(&tok_path)?)
+                Some(Tokenizer::from_model_dir(&model_path)?)
             } else {
                 None
             };
@@ -5192,8 +5183,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                         } else {
                             std::path::PathBuf::from(model_id)
                         };
-                    let tok_path = model_path.join("tokenizer.json");
-                    Some(Tokenizer::from_file(&tok_path)?)
+                    Some(Tokenizer::from_model_dir(&model_path)?)
                 } else {
                     return Err(anyhow::anyhow!(
                         "--model required for token-based filtering"
@@ -5765,9 +5755,8 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             } else {
                 std::path::PathBuf::from(&model)
             };
-            let tok_path = model_path.join("tokenizer.json");
-            let tokenizer = Tokenizer::from_file(&tok_path)?;
-            println!("  Loaded tokenizer from {}", tok_path.display());
+            let tokenizer = Tokenizer::from_model_dir(&model_path)?;
+            println!("  Loaded tokenizer from {}", model_path.display());
 
             // Step 3: Apply template and filter
             println!("[3/5] Applying template and filtering...");

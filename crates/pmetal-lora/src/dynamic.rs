@@ -35,6 +35,7 @@ use crate::{
     LoraError, TrainableModel, gemma_lora::GemmaLoraForCausalLM, llama_lora::LlamaLoraForCausalLM,
     mistral_lora::MistralLoraForCausalLM, phi_lora::PhiLoraForCausalLM,
     qwen3_lora::Qwen3LoraForCausalLM,
+    qwen3_next_lora::Qwen3NextLoraForCausalLM,
 };
 
 /// Dynamic LoRA model container using enum dispatch.
@@ -70,6 +71,8 @@ pub enum DynamicLoraModel {
     Gemma(GemmaLoraForCausalLM),
     /// Phi family with LoRA adapters (supports partial RoPE and fused gate_up).
     Phi(PhiLoraForCausalLM),
+    /// Qwen3.5 (qwen3_next) hybrid family with LoRA adapters.
+    Qwen3Next(Qwen3NextLoraForCausalLM),
 }
 
 impl std::fmt::Debug for DynamicLoraModel {
@@ -80,6 +83,7 @@ impl std::fmt::Debug for DynamicLoraModel {
             Self::Qwen3(_) => write!(f, "DynamicLoraModel::Qwen3"),
             Self::Gemma(_) => write!(f, "DynamicLoraModel::Gemma"),
             Self::Phi(_) => write!(f, "DynamicLoraModel::Phi"),
+            Self::Qwen3Next(_) => write!(f, "DynamicLoraModel::Qwen3Next"),
         }
     }
 }
@@ -187,6 +191,17 @@ impl DynamicLoraModel {
 
                 tracing::info!("Loaded Phi LoRA model");
                 Ok(DynamicLoraModel::Phi(model))
+            }
+            ModelArchitecture::Qwen3Next => {
+                let qwen_config: pmetal_models::architectures::qwen3_next::Qwen3NextConfig =
+                    serde_json::from_str(&config_content)?;
+
+                let mut model = Qwen3NextLoraForCausalLM::new(qwen_config, lora_config)?;
+                model.load_base_weights_from_dir(model_dir)?;
+                model.eval_all()?;
+
+                tracing::info!("Loaded Qwen3.5 (qwen3_next) LoRA model");
+                Ok(DynamicLoraModel::Qwen3Next(model))
             }
             // Other architectures not yet supported for LoRA training
             arch => Err(DynamicLoraError::NotImplemented(arch)),
@@ -335,6 +350,7 @@ impl DynamicLoraModel {
             Self::Qwen3(_) => ModelArchitecture::Qwen3,
             Self::Gemma(_) => ModelArchitecture::Gemma,
             Self::Phi(_) => ModelArchitecture::Phi,
+            Self::Qwen3Next(_) => ModelArchitecture::Qwen3Next,
         }
     }
 
@@ -346,6 +362,7 @@ impl DynamicLoraModel {
             Self::Qwen3(_) => "Qwen3",
             Self::Gemma(_) => "Gemma",
             Self::Phi(_) => "Phi",
+            Self::Qwen3Next(_) => "Qwen3Next",
         }
     }
 
@@ -357,6 +374,7 @@ impl DynamicLoraModel {
             Self::Qwen3(m) => m.merge_lora(),
             Self::Gemma(m) => m.merge_lora(),
             Self::Phi(m) => m.merge_lora(),
+            Self::Qwen3Next(m) => m.merge_lora(),
         }
     }
 
@@ -368,6 +386,7 @@ impl DynamicLoraModel {
             Self::Qwen3(m) => m.unmerge_lora(),
             Self::Gemma(m) => m.unmerge_lora(),
             Self::Phi(m) => m.unmerge_lora(),
+            Self::Qwen3Next(m) => m.unmerge_lora(),
         }
     }
 }
@@ -381,6 +400,7 @@ impl mlx_rs::module::ModuleParameters for DynamicLoraModel {
             Self::Qwen3(m) => m.num_trainable_params(),
             Self::Gemma(m) => m.num_trainable_params(),
             Self::Phi(m) => m.num_trainable_params(),
+            Self::Qwen3Next(m) => m.num_trainable_params(),
         }
     }
 
@@ -391,6 +411,7 @@ impl mlx_rs::module::ModuleParameters for DynamicLoraModel {
             Self::Qwen3(m) => m.parameters(),
             Self::Gemma(m) => m.parameters(),
             Self::Phi(m) => m.parameters(),
+            Self::Qwen3Next(m) => m.parameters(),
         }
     }
 
@@ -401,6 +422,7 @@ impl mlx_rs::module::ModuleParameters for DynamicLoraModel {
             Self::Qwen3(m) => m.parameters_mut(),
             Self::Gemma(m) => m.parameters_mut(),
             Self::Phi(m) => m.parameters_mut(),
+            Self::Qwen3Next(m) => m.parameters_mut(),
         }
     }
 
@@ -411,6 +433,7 @@ impl mlx_rs::module::ModuleParameters for DynamicLoraModel {
             Self::Qwen3(m) => m.trainable_parameters(),
             Self::Gemma(m) => m.trainable_parameters(),
             Self::Phi(m) => m.trainable_parameters(),
+            Self::Qwen3Next(m) => m.trainable_parameters(),
         }
     }
 
@@ -421,6 +444,7 @@ impl mlx_rs::module::ModuleParameters for DynamicLoraModel {
             Self::Qwen3(m) => m.freeze_parameters(recursive),
             Self::Gemma(m) => m.freeze_parameters(recursive),
             Self::Phi(m) => m.freeze_parameters(recursive),
+            Self::Qwen3Next(m) => m.freeze_parameters(recursive),
         }
     }
 
@@ -431,6 +455,7 @@ impl mlx_rs::module::ModuleParameters for DynamicLoraModel {
             Self::Qwen3(m) => m.unfreeze_parameters(recursive),
             Self::Gemma(m) => m.unfreeze_parameters(recursive),
             Self::Phi(m) => m.unfreeze_parameters(recursive),
+            Self::Qwen3Next(m) => m.unfreeze_parameters(recursive),
         }
     }
 
@@ -441,6 +466,7 @@ impl mlx_rs::module::ModuleParameters for DynamicLoraModel {
             Self::Qwen3(m) => m.all_frozen(),
             Self::Gemma(m) => m.all_frozen(),
             Self::Phi(m) => m.all_frozen(),
+            Self::Qwen3Next(m) => m.all_frozen(),
         }
     }
 
@@ -451,6 +477,7 @@ impl mlx_rs::module::ModuleParameters for DynamicLoraModel {
             Self::Qwen3(m) => m.any_frozen(),
             Self::Gemma(m) => m.any_frozen(),
             Self::Phi(m) => m.any_frozen(),
+            Self::Qwen3Next(m) => m.any_frozen(),
         }
     }
 }
@@ -463,6 +490,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(m) => TrainableModel::forward(m, input_ids, mask),
             Self::Gemma(m) => TrainableModel::forward(m, input_ids, mask),
             Self::Phi(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Qwen3Next(m) => TrainableModel::forward(m, input_ids, mask),
         }
     }
 
@@ -476,9 +504,10 @@ impl TrainableModel for DynamicLoraModel {
             Self::Llama(m) => m.forward_with_positions(input_ids, mask, position_ids),
             Self::Mistral(m) => m.forward_with_positions(input_ids, mask, position_ids),
             Self::Qwen3(m) => m.forward_with_positions(input_ids, mask, position_ids),
-            // Gemma and Phi don't have forward_with_positions yet, fallback to standard forward
+            // Gemma, Phi, and Qwen3Next don't have forward_with_positions yet, fallback to standard forward
             Self::Gemma(m) => TrainableModel::forward(m, input_ids, mask),
             Self::Phi(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Qwen3Next(m) => TrainableModel::forward(m, input_ids, mask),
         }
     }
 
@@ -489,6 +518,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(m) => m.num_trainable_params(),
             Self::Gemma(m) => m.num_trainable_params(),
             Self::Phi(m) => m.num_trainable_params(),
+            Self::Qwen3Next(m) => m.num_trainable_params(),
         }
     }
 
@@ -499,6 +529,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(m) => m.lora_parameters(),
             Self::Gemma(m) => m.lora_parameters(),
             Self::Phi(m) => m.lora_parameters(),
+            Self::Qwen3Next(m) => m.lora_parameters(),
         }
     }
 
@@ -509,6 +540,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(m) => m.set_lora_parameters(params),
             Self::Gemma(m) => m.set_lora_parameters(params),
             Self::Phi(m) => m.set_lora_parameters(params),
+            Self::Qwen3Next(m) => m.set_lora_parameters(params),
         }
     }
 
@@ -519,6 +551,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(m) => m.save_lora_weights(path),
             Self::Gemma(m) => m.save_lora_weights(path),
             Self::Phi(m) => m.save_lora_weights(path),
+            Self::Qwen3Next(m) => m.save_lora_weights(path),
         }
     }
 
@@ -529,6 +562,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(m) => m.load_lora_weights(path),
             Self::Gemma(m) => m.load_lora_weights(path),
             Self::Phi(m) => m.load_lora_weights(path),
+            Self::Qwen3Next(m) => m.load_lora_weights(path),
         }
     }
 
@@ -539,6 +573,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(m) => m.enable_gradient_checkpointing(layers_per_block),
             Self::Gemma(m) => m.enable_gradient_checkpointing(layers_per_block),
             Self::Phi(m) => m.enable_gradient_checkpointing(layers_per_block),
+            Self::Qwen3Next(m) => m.enable_gradient_checkpointing(layers_per_block),
         }
     }
 
@@ -549,16 +584,18 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(m) => m.disable_gradient_checkpointing(),
             Self::Gemma(m) => m.disable_gradient_checkpointing(),
             Self::Phi(m) => m.disable_gradient_checkpointing(),
+            Self::Qwen3Next(m) => m.disable_gradient_checkpointing(),
         }
     }
 
     fn supports_gradient_checkpointing(&self) -> bool {
         match self {
-            Self::Llama(_) => true,   // Implemented
-            Self::Mistral(_) => true, // Implemented
-            Self::Qwen3(_) => true,   // Implemented
-            Self::Gemma(_) => true,   // Implemented
-            Self::Phi(_) => true,     // Implemented
+            Self::Llama(_) => true,
+            Self::Mistral(_) => true,
+            Self::Qwen3(_) => true,
+            Self::Gemma(_) => true,
+            Self::Phi(_) => true,
+            Self::Qwen3Next(_) => true,
         }
     }
 
@@ -574,6 +611,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
             Self::Gemma(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
             Self::Phi(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Qwen3Next(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
         }
     }
 
@@ -584,6 +622,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(m) => TrainableModel::create_cache(m, max_seq_len),
             Self::Gemma(m) => TrainableModel::create_cache(m, max_seq_len),
             Self::Phi(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::Qwen3Next(m) => TrainableModel::create_cache(m, max_seq_len),
         }
     }
 
@@ -594,6 +633,7 @@ impl TrainableModel for DynamicLoraModel {
             Self::Qwen3(_) => true,
             Self::Gemma(_) => true,
             Self::Phi(_) => true,
+            Self::Qwen3Next(_) => false,
         }
     }
 }

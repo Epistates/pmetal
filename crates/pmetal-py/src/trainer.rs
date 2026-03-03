@@ -142,9 +142,8 @@ impl PyTrainer {
                         PathBuf::from(&model_id)
                     };
 
-                    // Load tokenizer
-                    let tokenizer_path = model_path.join("tokenizer.json");
-                    let tokenizer = pmetal_data::Tokenizer::from_file(&tokenizer_path)?;
+                    // Load tokenizer (with config-aware special token resolution)
+                    let tokenizer = pmetal_data::Tokenizer::from_model_dir(&model_path)?;
 
                     // Detect chat template
                     let chat_template =

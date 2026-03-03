@@ -18,20 +18,19 @@ impl PyTokenizer {
         Ok(Self { inner })
     }
 
-    /// Load a tokenizer from a HuggingFace model (downloads tokenizer.json).
+    /// Load a tokenizer from a HuggingFace model (downloads all config files).
     ///
     /// Releases the GIL during the network download.
     #[staticmethod]
     fn from_pretrained(py: Python<'_>, model_id: &str) -> PyResult<Self> {
         let id = model_id.to_string();
         // Release GIL during download
-        let tokenizer_path = py.allow_threads(move || {
+        let model_dir = py.allow_threads(move || {
             crate::hub::shared_runtime()
-                .block_on(pmetal_hub::download_file(&id, "tokenizer.json", None, None))
+                .block_on(pmetal_hub::download_model(&id, None, None))
                 .map_err(crate::error::runtime_err)
         })?;
-        let inner = pmetal_data::Tokenizer::from_file(tokenizer_path.to_string_lossy().as_ref())
-            .into_pyresult()?;
+        let inner = pmetal_data::Tokenizer::from_model_dir(&model_dir).into_pyresult()?;
         Ok(Self { inner })
     }
 
@@ -61,6 +60,18 @@ impl PyTokenizer {
     #[getter]
     fn eos_token_id(&self) -> Option<u32> {
         self.inner.eos_token_id()
+    }
+
+    /// Get the BOS token ID, if available.
+    #[getter]
+    fn bos_token_id(&self) -> Option<u32> {
+        self.inner.bos_token_id()
+    }
+
+    /// Get the UNK token ID, if available.
+    #[getter]
+    fn unk_token_id(&self) -> Option<u32> {
+        self.inner.unk_token_id()
     }
 
     fn __repr__(&self) -> String {

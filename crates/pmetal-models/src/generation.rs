@@ -378,6 +378,81 @@ impl GenerationConfig {
         }
     }
 
+    /// Load model-default generation parameters from `generation_config.json`.
+    ///
+    /// Reads the file if present and applies any fields found as defaults.
+    /// Fields not present in the file keep their current values.
+    /// User-specified CLI overrides should be applied after calling this.
+    pub fn from_model_dir(model_dir: &std::path::Path) -> Self {
+        let path = model_dir.join("generation_config.json");
+        let mut config = Self::default();
+
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(_) => return config,
+        };
+
+        let json: serde_json::Value = match serde_json::from_str(&content) {
+            Ok(v) => v,
+            Err(e) => {
+                tracing::warn!("Failed to parse generation_config.json: {e}");
+                return config;
+            }
+        };
+
+        if let Some(t) = json.get("temperature").and_then(|v| v.as_f64()) {
+            config.temperature = t as f32;
+        }
+        if let Some(k) = json.get("top_k").and_then(|v| v.as_u64()) {
+            config.top_k = k as usize;
+        }
+        if let Some(p) = json.get("top_p").and_then(|v| v.as_f64()) {
+            config.top_p = p as f32;
+        }
+        if let Some(rp) = json.get("repetition_penalty").and_then(|v| v.as_f64()) {
+            config.repetition_penalty = rp as f32;
+        }
+        if let Some(ds) = json.get("do_sample").and_then(|v| v.as_bool()) {
+            config.do_sample = ds;
+        }
+        if let Some(ml) = json.get("max_new_tokens").and_then(|v| v.as_u64()) {
+            config.max_new_tokens = ml as usize;
+        } else if let Some(ml) = json.get("max_length").and_then(|v| v.as_u64()) {
+            // max_length is the total context length; use as fallback if max_new_tokens absent
+            config.max_new_tokens = ml as usize;
+        }
+
+        // Stop token IDs — can be a single int or array
+        if let Some(eos) = json.get("eos_token_id") {
+            match eos {
+                serde_json::Value::Number(n) => {
+                    if let Some(id) = n.as_u64() {
+                        config.stop_tokens.push(id as u32);
+                    }
+                }
+                serde_json::Value::Array(arr) => {
+                    for v in arr {
+                        if let Some(id) = v.as_u64() {
+                            config.stop_tokens.push(id as u32);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        tracing::debug!(
+            "Loaded generation defaults: temp={}, top_k={}, top_p={}, do_sample={}, stop_tokens={:?}",
+            config.temperature,
+            config.top_k,
+            config.top_p,
+            config.do_sample,
+            config.stop_tokens,
+        );
+
+        config
+    }
+
     /// Set top-k sampling.
     pub fn with_top_k(mut self, top_k: usize) -> Self {
         self.top_k = top_k;
