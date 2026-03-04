@@ -658,6 +658,62 @@ pub fn cross_entropy_loss(
     }
 }
 
+/// NLL loss + gradient from pre-computed softmax probabilities.
+///
+/// When softmax is computed on ANE, the CPU only needs to:
+/// 1. Extract -log(probs[target]) for the loss
+/// 2. Compute gradient: dlogits[i] = probs[i] - one_hot[i], scaled by 1/seq_len
+///
+/// `probs` and `dlogits` are channel-first `[V, S]` layout.
+/// `targets` contains the target token index for each sequence position.
+pub fn nll_loss_from_probs(
+    dlogits: &mut [f32],
+    probs: &[f32],
+    targets: &[u16],
+    vocab: usize,
+    seq: usize,
+) -> f32 {
+    debug_assert_eq!(probs.len(), vocab * seq);
+    debug_assert_eq!(dlogits.len(), vocab * seq);
+    debug_assert_eq!(targets.len(), seq);
+
+    let inv_s = 1.0f32 / seq as f32;
+    let mut total_loss = 0.0f32;
+
+    // Copy probs → dlogits, then adjust for gradient
+    dlogits.copy_from_slice(probs);
+
+    for t in 0..seq {
+        let tgt = targets[t] as usize;
+        // Loss: -log(prob[target])
+        total_loss -= (probs[tgt * seq + t] + 1e-10).ln();
+        // Gradient: probs - one_hot, scaled by 1/S
+        dlogits[tgt * seq + t] -= 1.0;
+    }
+
+    // Scale all gradients by 1/seq_len
+    #[cfg(target_os = "macos")]
+    unsafe {
+        ffi::vDSP_vsmul(
+            dlogits.as_ptr(),
+            1,
+            &inv_s,
+            dlogits.as_mut_ptr(),
+            1,
+            vocab * seq,
+        );
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        for val in dlogits.iter_mut() {
+            *val *= inv_s;
+        }
+    }
+
+    total_loss / seq as f32
+}
+
 /// Softmax in-place on channel-first `[D, S]` layout.
 ///
 /// Computes softmax along the channel dimension for each sequence position.

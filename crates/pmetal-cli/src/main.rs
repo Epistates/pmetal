@@ -2388,9 +2388,9 @@ async fn run_training(
                 )
                 .map_err(|_| {
                     anyhow::anyhow!(
-                        "Parquet file does not have a 'text' or 'content' column. \
-                     For multi-column formats (e.g., reasoning with problem/thinking/solution), \
-                     convert to JSONL first using `pmetal data prepare`."
+                        "Parquet file does not have a recognized column layout. \
+                     Supported: 'text' column, 'content' column, or reasoning format \
+                     (problem/thinking/solution columns)."
                     )
                 })?
             }
@@ -2997,18 +2997,40 @@ async fn run_inference(
     #[cfg(target_os = "macos")]
     let output = {
         // ANE branch: separate engine with its own weight loading and KV cache
-        // Falls back to GPU if ANE compilation fails (e.g., hybrid architectures)
+        // Validates architecture compatibility before attempting compilation.
         #[cfg(feature = "ane")]
         let ane_output: Option<GenerationOutput> = if ane {
-            tracing::info!(
-                "Attempting ANE-hybrid inference engine (Prefill: ANE, Decode: CPU/vDSP)"
-            );
-            match pmetal_models::generate_cached_ane(&model_path, &input_ids, &gen_config) {
-                Ok(output) => Some(output),
-                Err(e) => {
-                    tracing::warn!("ANE inference failed ({}), falling back to GPU", e);
-                    None
+            // Validate architecture before attempting ANE (saves ~7s on incompatible models)
+            let ane_compatible = match std::fs::read_to_string(model_path.join("config.json")) {
+                Ok(config_text) => match serde_json::from_str::<serde_json::Value>(&config_text) {
+                    Ok(config_json) => {
+                        use pmetal_trainer::DynamicAneTrainerConfig;
+                        match DynamicAneTrainerConfig::is_ane_compatible(&config_json) {
+                            Ok(()) => true,
+                            Err(reason) => {
+                                tracing::info!("Skipping ANE inference: {}", reason);
+                                false
+                            }
+                        }
+                    }
+                    Err(_) => true, // Can't parse config, let ANE try anyway
+                },
+                Err(_) => true, // No config.json, let ANE try anyway
+            };
+
+            if ane_compatible {
+                tracing::info!(
+                    "Attempting ANE-hybrid inference engine (Prefill: ANE, Decode: CPU/vDSP)"
+                );
+                match pmetal_models::generate_cached_ane(&model_path, &input_ids, &gen_config) {
+                    Ok(output) => Some(output),
+                    Err(e) => {
+                        tracing::warn!("ANE inference failed ({}), falling back to GPU", e);
+                        None
+                    }
                 }
+            } else {
+                None
             }
         } else {
             None

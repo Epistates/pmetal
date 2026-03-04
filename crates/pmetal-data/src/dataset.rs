@@ -618,8 +618,31 @@ impl TrainingDataset {
 
         let schema = builder.schema();
 
-        // Find column indices
-        let text_idx = schema.index_of(text_column).map_err(|_| {
+        // Find column indices — if primary text column not found, try reasoning format
+        let text_idx_result = schema.index_of(text_column);
+
+        if text_idx_result.is_err() {
+            // Check for reasoning format columns (problem/solution)
+            let has_problem = schema.index_of("problem").is_ok();
+            let has_solution = schema.index_of("solution").is_ok();
+
+            if has_problem && has_solution {
+                tracing::info!(
+                    "Column '{}' not found, auto-detected reasoning format (problem/thinking/solution)",
+                    text_column
+                );
+                // Rebuild the reader (builder was consumed by schema())
+                let file2 = File::open(path.as_ref()).map_err(|e| {
+                    pmetal_core::PMetalError::Io(std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to reopen Parquet file: {}", e),
+                    ))
+                })?;
+                return Self::load_parquet_reasoning(file2);
+            }
+        }
+
+        let text_idx = text_idx_result.map_err(|_| {
             pmetal_core::PMetalError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!(
@@ -696,6 +719,119 @@ impl TrainingDataset {
                 });
 
                 samples.push(TextSample { text, prompt });
+            }
+        }
+
+        Ok(samples)
+    }
+
+    /// Load reasoning format samples from a Parquet file.
+    ///
+    /// Reads `problem`, `thinking` (optional), and `solution` columns,
+    /// composing text the same way as JSONL `DatasetFormat::Reasoning`:
+    /// `text = "{problem}\n\n<think>\n{thinking}\n</think>\n\n{solution}"`
+    fn load_parquet_reasoning(file: File) -> Result<Vec<TextSample>> {
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file).map_err(|e| {
+            pmetal_core::PMetalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to create Parquet reader: {}", e),
+            ))
+        })?;
+
+        let schema = builder.schema();
+        let problem_idx = schema.index_of("problem").map_err(|_| {
+            pmetal_core::PMetalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Missing 'problem' column in reasoning Parquet",
+            ))
+        })?;
+        let solution_idx = schema.index_of("solution").map_err(|_| {
+            pmetal_core::PMetalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Missing 'solution' column in reasoning Parquet",
+            ))
+        })?;
+        let thinking_idx = schema.index_of("thinking").ok();
+
+        let reader = builder.build().map_err(|e| {
+            pmetal_core::PMetalError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Failed to build Parquet reader: {}", e),
+            ))
+        })?;
+
+        let mut samples = Vec::new();
+
+        for batch_result in reader {
+            let batch = batch_result.map_err(|e| {
+                pmetal_core::PMetalError::Io(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Failed to read Parquet batch: {}", e),
+                ))
+            })?;
+
+            let problem_arr = batch
+                .column(problem_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    pmetal_core::PMetalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "'problem' column is not a string type",
+                    ))
+                })?;
+
+            let solution_arr = batch
+                .column(solution_idx)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    pmetal_core::PMetalError::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "'solution' column is not a string type",
+                    ))
+                })?;
+
+            let thinking_arr = thinking_idx.map(|idx| {
+                batch
+                    .column(idx)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+            });
+
+            for i in 0..batch.num_rows() {
+                if problem_arr.is_null(i) {
+                    continue;
+                }
+
+                let problem = problem_arr.value(i);
+                let solution = if solution_arr.is_null(i) {
+                    ""
+                } else {
+                    solution_arr.value(i)
+                };
+                let thinking = thinking_arr
+                    .as_ref()
+                    .and_then(|opt| opt.as_ref())
+                    .and_then(|arr| {
+                        if arr.is_null(i) {
+                            None
+                        } else {
+                            let v = arr.value(i);
+                            if v.is_empty() { None } else { Some(v) }
+                        }
+                    });
+
+                let prompt = problem.to_string();
+                let response = match thinking {
+                    Some(t) => format!("<think>\n{}\n</think>\n\n{}", t, solution),
+                    None => solution.to_string(),
+                };
+
+                samples.push(TextSample {
+                    text: format!("{}\n\n{}", prompt, response),
+                    prompt: Some(prompt),
+                });
             }
         }
 
@@ -935,7 +1071,7 @@ mod tests {
         writer.write(&batch).unwrap();
         writer.close().unwrap();
 
-        // Should fail when requesting non-existent column
+        // Should fail when requesting non-existent column (and no reasoning columns)
         let result = TrainingDataset::load_parquet_text(&path, "text", None);
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -944,5 +1080,68 @@ mod tests {
             "Error should mention column not found: {}",
             err
         );
+    }
+
+    #[test]
+    fn test_parquet_reasoning_format() {
+        use arrow::array::StringBuilder;
+        use arrow::datatypes::{DataType, Field, Schema};
+        use arrow::record_batch::RecordBatch;
+        use parquet::arrow::arrow_writer::ArrowWriter;
+        use std::sync::Arc;
+
+        let temp_file = tempfile::NamedTempFile::new().unwrap();
+        let path = temp_file.path().to_path_buf();
+
+        // Create reasoning format Parquet with problem/thinking/solution columns
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("problem", DataType::Utf8, false),
+            Field::new("thinking", DataType::Utf8, true),
+            Field::new("solution", DataType::Utf8, false),
+        ]));
+
+        let mut problem_builder = StringBuilder::new();
+        problem_builder.append_value("What is 2+2?");
+        problem_builder.append_value("Explain gravity.");
+        let problem_array = Arc::new(problem_builder.finish());
+
+        let mut thinking_builder = StringBuilder::new();
+        thinking_builder.append_value("Let me add 2 and 2.");
+        thinking_builder.append_null(); // No thinking for second sample
+        let thinking_array = Arc::new(thinking_builder.finish());
+
+        let mut solution_builder = StringBuilder::new();
+        solution_builder.append_value("4");
+        solution_builder.append_value("Gravity is a force of attraction.");
+        let solution_array = Arc::new(solution_builder.finish());
+
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![problem_array, thinking_array, solution_array],
+        )
+        .unwrap();
+
+        let file = File::create(&path).unwrap();
+        let mut writer = ArrowWriter::try_new(file, schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+
+        // Requesting "text" column should auto-detect reasoning format
+        let samples = TrainingDataset::load_parquet_text(&path, "text", None).unwrap();
+        assert_eq!(samples.len(), 2);
+
+        // First sample: has thinking
+        assert!(samples[0].text.contains("What is 2+2?"));
+        assert!(samples[0].text.contains("<think>"));
+        assert!(samples[0].text.contains("Let me add 2 and 2."));
+        assert!(samples[0].text.contains("</think>"));
+        assert!(samples[0].text.contains("4"));
+        assert_eq!(samples[0].prompt, Some("What is 2+2?".to_string()));
+
+        // Second sample: no thinking
+        assert!(samples[1].text.contains("Explain gravity."));
+        assert!(!samples[1].text.contains("<think>"));
+        assert!(samples[1].text.contains("Gravity is a force of attraction."));
+        assert_eq!(samples[1].prompt, Some("Explain gravity.".to_string()));
     }
 }

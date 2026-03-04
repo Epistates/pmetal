@@ -331,6 +331,9 @@ struct DynamicKernels {
     sdpa_bwd1: AneModel,
     /// SDPA backward part 2 (dQ, dK).
     sdpa_bwd2: AneModel,
+    /// Softmax kernel for cross-entropy (no weights, compile once).
+    /// None if compilation failed (falls back to CPU softmax).
+    softmax: Option<AneModel>,
 }
 
 /// IOSurface pool for the decomposed dynamic pipeline.
@@ -346,6 +349,10 @@ struct DynIoPool {
     sdpa_bwd1_out: IoSurface,
     sdpa_bwd2_in: IoSurface,
     sdpa_bwd2_out: IoSurface,
+    /// Softmax IO surfaces (fp16, compact_vocab × seq).
+    /// None if softmax kernel compilation failed.
+    softmax_in: Option<IoSurface>,
+    softmax_out: Option<IoSurface>,
 }
 
 /// Dynamic weight ANE trainer. Compiles 9+ kernels once, then trains forever.
@@ -680,12 +687,39 @@ impl DynamicAneTrainer {
         let sdpa_bwd2 = compile(&k8, rt, "sdpa_bwd2")?;
         self.compile_count += 1;
 
+        // 5. Compile softmax kernel (optional — falls back to CPU on failure)
+        let softmax_vocab = self
+            .vocab_map
+            .as_ref()
+            .map(|vm| vm.compact_vocab)
+            .unwrap_or(self.config.vocab_size);
+        let (softmax_kern, softmax_in, softmax_out) = {
+            let sm_out = dynamic_kernel::gen_dynamic_softmax(softmax_vocab, s);
+            match compile(&sm_out, rt, "softmax") {
+                Ok(model) => {
+                    self.compile_count += 1;
+                    info!(
+                        vocab = softmax_vocab,
+                        seq = s,
+                        "Compiled softmax kernel for ANE cross-entropy"
+                    );
+                    let sm_in = IoSurface::for_tensor(softmax_vocab, s)?;
+                    let sm_out_io = IoSurface::for_tensor(softmax_vocab, s)?;
+                    (Some(model), Some(sm_in), Some(sm_out_io))
+                }
+                Err(e) => {
+                    info!("Softmax kernel compilation failed ({}), using CPU softmax", e);
+                    (None, None, None)
+                }
+            }
+        };
+
         info!(
             "All {} dynamic kernels compiled. Total compiles: {}",
             kernel_count, self.compile_count
         );
 
-        // 5. Allocate IOSurface pool
+        // 6. Allocate IOSurface pool
         let attn_in_ch = qd + 2 * kvd;
         let bwd1_in_ch = 2 * qd + 2 * kvd;
         let bwd1_out_ch = kvd + 2 * score_ch;
@@ -701,6 +735,8 @@ impl DynamicAneTrainer {
             sdpa_bwd1_out: IoSurface::for_tensor(bwd1_out_ch, s)?,
             sdpa_bwd2_in: IoSurface::for_tensor(bwd2_in_ch, s)?,
             sdpa_bwd2_out: IoSurface::for_tensor(bwd2_out_ch, s)?,
+            softmax_in,
+            softmax_out,
         };
 
         self.kernels = Some(DynamicKernels {
@@ -708,6 +744,7 @@ impl DynamicAneTrainer {
             sdpa_attn,
             sdpa_bwd1,
             sdpa_bwd2,
+            softmax: softmax_kern,
         });
         self.io_pool = Some(io_pool);
 
@@ -1269,9 +1306,31 @@ impl DynamicAneTrainer {
             );
 
             // Cross-entropy loss on compact vocab
+            // Try ANE softmax first, fall back to CPU
             let mut dlogits = vec![0.0f32; cv * s];
-            let loss =
-                accelerate::cross_entropy_loss(&mut dlogits, &logits, &compact_targets, cv, s);
+            let loss = if let (
+                Some(kernels),
+                Some(io),
+            ) = (&self.kernels, &self.io_pool) {
+                if let (Some(sm_kern), Some(sm_in), Some(sm_out)) =
+                    (&kernels.softmax, &io.softmax_in, &io.softmax_out)
+                {
+                    // ANE softmax path: logits → ANE → probs → CPU NLL
+                    sm_in.write_f32_as_fp16(&logits, cv, s);
+                    if let Ok(()) = sm_kern.evaluate(&[sm_in.as_ptr()], &[sm_out.as_ptr()]) {
+                        let mut probs = vec![0.0f32; cv * s];
+                        sm_out.read_fp16_as_f32(&mut probs, 0, cv, s);
+                        accelerate::nll_loss_from_probs(&mut dlogits, &probs, &compact_targets, cv, s)
+                    } else {
+                        // ANE eval failed, fall back to CPU
+                        accelerate::cross_entropy_loss(&mut dlogits, &logits, &compact_targets, cv, s)
+                    }
+                } else {
+                    accelerate::cross_entropy_loss(&mut dlogits, &logits, &compact_targets, cv, s)
+                }
+            } else {
+                accelerate::cross_entropy_loss(&mut dlogits, &logits, &compact_targets, cv, s)
+            };
 
             // dx = compact_embed^T @ dlogits: [d, cv] @ [cv, s] → [d, s]
             let mut dx = vec![0.0f32; d * s];
