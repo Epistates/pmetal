@@ -792,12 +792,8 @@ impl TrainingDataset {
                     ))
                 })?;
 
-            let thinking_arr = thinking_idx.map(|idx| {
-                batch
-                    .column(idx)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-            });
+            let thinking_arr =
+                thinking_idx.map(|idx| batch.column(idx).as_any().downcast_ref::<StringArray>());
 
             for i in 0..batch.num_rows() {
                 if problem_arr.is_null(i) {
@@ -1141,7 +1137,11 @@ mod tests {
         // Second sample: no thinking
         assert!(samples[1].text.contains("Explain gravity."));
         assert!(!samples[1].text.contains("<think>"));
-        assert!(samples[1].text.contains("Gravity is a force of attraction."));
+        assert!(
+            samples[1]
+                .text
+                .contains("Gravity is a force of attraction.")
+        );
         assert_eq!(samples[1].prompt, Some("Explain gravity.".to_string()));
     }
 }

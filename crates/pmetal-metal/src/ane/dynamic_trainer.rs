@@ -708,7 +708,10 @@ impl DynamicAneTrainer {
                     (Some(model), Some(sm_in), Some(sm_out_io))
                 }
                 Err(e) => {
-                    info!("Softmax kernel compilation failed ({}), using CPU softmax", e);
+                    info!(
+                        "Softmax kernel compilation failed ({}), using CPU softmax",
+                        e
+                    );
                     (None, None, None)
                 }
             }
@@ -1308,10 +1311,7 @@ impl DynamicAneTrainer {
             // Cross-entropy loss on compact vocab
             // Try ANE softmax first, fall back to CPU
             let mut dlogits = vec![0.0f32; cv * s];
-            let loss = if let (
-                Some(kernels),
-                Some(io),
-            ) = (&self.kernels, &self.io_pool) {
+            let loss = if let (Some(kernels), Some(io)) = (&self.kernels, &self.io_pool) {
                 if let (Some(sm_kern), Some(sm_in), Some(sm_out)) =
                     (&kernels.softmax, &io.softmax_in, &io.softmax_out)
                 {
@@ -1320,10 +1320,22 @@ impl DynamicAneTrainer {
                     if let Ok(()) = sm_kern.evaluate(&[sm_in.as_ptr()], &[sm_out.as_ptr()]) {
                         let mut probs = vec![0.0f32; cv * s];
                         sm_out.read_fp16_as_f32(&mut probs, 0, cv, s);
-                        accelerate::nll_loss_from_probs(&mut dlogits, &probs, &compact_targets, cv, s)
+                        accelerate::nll_loss_from_probs(
+                            &mut dlogits,
+                            &probs,
+                            &compact_targets,
+                            cv,
+                            s,
+                        )
                     } else {
                         // ANE eval failed, fall back to CPU
-                        accelerate::cross_entropy_loss(&mut dlogits, &logits, &compact_targets, cv, s)
+                        accelerate::cross_entropy_loss(
+                            &mut dlogits,
+                            &logits,
+                            &compact_targets,
+                            cv,
+                            s,
+                        )
                     }
                 } else {
                     accelerate::cross_entropy_loss(&mut dlogits, &logits, &compact_targets, cv, s)
