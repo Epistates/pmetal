@@ -543,6 +543,7 @@ fn gated_delta_chunk_ops(
 ///
 /// # Returns
 /// (output `[B, T, Hv, Dv]`, final_state `[B, Hv, Dv, Dk]`)
+#[allow(clippy::too_many_arguments)]
 pub fn gated_delta_update(
     q: &Array,
     k: &Array,
