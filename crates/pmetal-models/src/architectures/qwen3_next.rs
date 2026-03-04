@@ -338,8 +338,10 @@ impl Default for Qwen3NextConfig {
 
 /// RMSNorm with optional gating: `rms_norm(x, w, eps) * silu(gate)`.
 ///
-/// Note: Weights use (1+w) convention — the `+1` offset is applied during
-/// weight sanitization, so at runtime we use standard RMSNorm.
+/// Used by GDN linear attention layers (`linear_attn.norm`). Unlike the other
+/// RMSNorm layers in the model, this norm does NOT use the (1+w) convention —
+/// its weights are initialized at 1.0 and used directly. The (1+w) offset in
+/// `sanitize_weights` intentionally excludes `.linear_attn.norm.weight`.
 #[derive(Debug, ModuleParameters)]
 pub struct Qwen3NextRMSNormGated {
     #[param]
@@ -1294,6 +1296,9 @@ pub fn sanitize_weights(
     }
 
     // Apply conv1d transpose and conditional (1+w) norm offset
+    // (1+w) RMSNorm offset applies to these norms only.
+    // `.linear_attn.norm.weight` (Qwen3NextRMSNormGated) is intentionally absent —
+    // the GDN norm uses standard weights (initialized at 1.0, no offset needed).
     let norm_suffixes = [
         ".input_layernorm.weight",
         ".post_attention_layernorm.weight",
