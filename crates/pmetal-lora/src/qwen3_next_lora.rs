@@ -1080,9 +1080,9 @@ impl Qwen3NextLoraModel {
 
             if checkpointing_enabled && (idx + 1) % layers_per_block == 0 {
                 GRAD_CKPT_WARN.call_once(|| {
-                    tracing::warn!(
-                        "Gradient checkpointing not yet implemented for Qwen3Next LoRA — \
-                         no memory savings applied. Use --no-gradient-checkpointing to suppress."
+                    tracing::info!(
+                        "Qwen3Next uses eager evaluation for memory management \
+                         (gradient checkpointing requires custom_vjp not yet in MLX-rs)"
                     );
                 });
             }

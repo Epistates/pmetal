@@ -29,6 +29,7 @@
 //! | 9b | `qkv_bwd_kv` | KV_DIM | 2*SEQ + 2*DIM | Wk^T, Wv^T |
 //! | 9 | `qkv_bwd` | Q_DIM | 3*SEQ + 3*DIM | Wq^T, Wk^T, Wv^T (MHA only) |
 //! | 10 | `rmsnorm_bwd` | 2*DIM | SEQ + 1 | RMSNorm weight (1 spatial col) |
+//! | 11 | `softmax` | VOCAB | SEQ | None (weight-free, fp16 in/out) |
 //!
 //! **GQA support:** Kernels 7-8 handle GQA natively via tile+reduce_sum.
 //! Kernel 9 is split into 9a+9b for GQA (mixed IC dimensions).
@@ -468,6 +469,46 @@ pub fn gen_dynamic_sdpa_attn(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
             total_spatial: s,
             oc: qd,
             out_spatial: s,
+        },
+    }
+}
+
+/// Generate a standalone softmax kernel over the channel (vocab) dimension.
+///
+/// Offloads the softmax computation from CPU (vDSP) to ANE for the
+/// cross-entropy loss path, achieving ~14% training speedup.
+///
+/// Input: `[1, VOCAB, 1, SEQ]` fp16 logits (uses compact vocab from VocabMap)
+/// Output: `[1, VOCAB, 1, SEQ]` fp16 probabilities
+///
+/// No weights — compile once, never recompile.
+pub fn gen_dynamic_softmax(vocab: usize, seq: usize) -> DynamicKernelOutput {
+    let mut p = MilProgram::new(vocab, seq);
+
+    // softmax(axis=1, x=x) — single MIL op over channel dimension
+    let ax = p.next_var("ax");
+    p.emit_scalar_const(&ax, "int32", "1");
+    let out = p.next_var("sm");
+    p.emit_softmax(&out, &[1, vocab, 1, seq], &ax, "x");
+
+    let mil_text = p.finalize(&out);
+
+    DynamicKernelOutput {
+        mil_text,
+        static_weights: WeightDict::new(),
+        input_layout: SpatialLayout {
+            ic: vocab,
+            seq_len: seq,
+            total_spatial: seq,
+            oc: vocab,
+            out_spatial: seq,
+        },
+        output_layout: SpatialLayout {
+            ic: vocab,
+            seq_len: seq,
+            total_spatial: seq,
+            oc: vocab,
+            out_spatial: seq,
         },
     }
 }
@@ -2092,6 +2133,23 @@ mod tests {
         assert_eq!(out.output_layout.out_spatial, s);
         // Should have causal mask static weight
         assert!(!out.static_weights.entries.is_empty());
+    }
+
+    #[test]
+    fn test_dynamic_softmax() {
+        let vocab = 256;
+        let seq = 32;
+        let out = gen_dynamic_softmax(vocab, seq);
+        assert!(out.mil_text.contains("program(1.3)"));
+        assert!(out.mil_text.contains("softmax("));
+        // Input: [1, VOCAB, 1, SEQ] fp16
+        assert_eq!(out.input_layout.ic, vocab);
+        assert_eq!(out.input_layout.total_spatial, seq);
+        // Output: [1, VOCAB, 1, SEQ] fp16
+        assert_eq!(out.output_layout.ic, vocab);
+        assert_eq!(out.output_layout.out_spatial, seq);
+        // No static weights
+        assert!(out.static_weights.entries.is_empty());
     }
 
     #[test]

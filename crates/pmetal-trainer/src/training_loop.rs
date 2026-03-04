@@ -1558,6 +1558,23 @@ impl TrainingLoop {
                 self.total_tokens += batch_tokens;
                 self.tokens_since_log += batch_tokens;
 
+                // Safety valve: prevent unbounded graph growth in deferred eval mode.
+                // Without gradient checkpointing (not available in MLX-rs), the computation
+                // graph grows per step. Evaluating every MAX_DEFERRED_STEPS prevents
+                // Metal resource limit (499000) exhaustion on complex architectures.
+                const MAX_DEFERRED_STEPS: usize = 50;
+                if accumulated_losses.len() >= MAX_DEFERRED_STEPS
+                    && self.step % self.config.log_every != 0
+                {
+                    let loss_refs: Vec<&Array> = accumulated_losses.iter().collect();
+                    mlx_rs::transforms::eval(loss_refs)?;
+                    for loss in &accumulated_losses {
+                        let loss_val = loss.item::<f32>();
+                        self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
+                    }
+                    accumulated_losses.clear();
+                }
+
                 // Logging boundary: NOW we evaluate accumulated losses
                 if self.step % self.config.log_every == 0 {
                     // Batch evaluate all accumulated losses together
