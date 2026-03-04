@@ -485,11 +485,8 @@ impl DynamicAneTrainer {
         let dw_thread = thread::Builder::new()
             .name("ane-dw-cblas".to_string())
             .spawn(move || {
-                loop {
-                    match dw_receiver.recv() {
-                        Ok(task) => task(),
-                        Err(_) => break,
-                    }
+                while let Ok(task) = dw_receiver.recv() {
+                    task();
                 }
             })
             .expect("Failed to spawn dW worker thread");
@@ -750,6 +747,7 @@ impl DynamicAneTrainer {
     }
 
     /// Execute a single projection kernel: act @ W → output.
+    #[allow(clippy::too_many_arguments)]
     fn run_projection(
         kernels: &DynamicKernels,
         io: &DynIoPool,

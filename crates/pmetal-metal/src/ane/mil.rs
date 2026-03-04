@@ -47,7 +47,9 @@ pub struct MilProgram {
 /// The dtype of the MIL program's input tensor.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum MilDtype {
+    /// 16-bit floating point.
     Fp16,
+    /// 32-bit floating point.
     Fp32,
 }
 

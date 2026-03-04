@@ -88,6 +88,7 @@ pub struct DynamicKernelOutput {
 /// dimension, reshapes/transposes, performs matmul, and reshapes back.
 ///
 /// Returns the name of the output variable `[1, oc, 1, seq]` fp16.
+#[allow(clippy::too_many_arguments)]
 fn emit_dyn_matmul(
     p: &mut MilProgram,
     prefix: &str,
@@ -168,6 +169,7 @@ fn emit_dyn_matmul(
 ///
 /// `kv_var` must already be [1, nkv, hd, S]. Returns the name of the
 /// expanded tensor [1, nh, hd, S].
+#[allow(clippy::too_many_arguments)]
 fn emit_gqa_expand(
     p: &mut MilProgram,
     prefix: &str,
@@ -212,6 +214,7 @@ fn emit_gqa_expand(
 /// - Reshape → [1, nkv, hd, S] → [1, kvd, 1, S]
 ///
 /// `grad_var` must be [1, nh, hd, S]. Returns name of [1, kvd, 1, S] result.
+#[allow(clippy::too_many_arguments)]
 fn emit_gqa_reduce(
     p: &mut MilProgram,
     prefix: &str,

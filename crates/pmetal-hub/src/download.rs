@@ -102,6 +102,7 @@ pub async fn download_model(
         }
 
         // Skip files by exact name
+        #[allow(clippy::manual_contains)]
         if SKIP_FILES.iter().any(|f| *filename == *f) {
             tracing::debug!("Skipping {} (excluded file)", filename);
             skipped += 1;
