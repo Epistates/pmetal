@@ -88,7 +88,17 @@ impl AneTrainingLoop {
         self.trainer.load_weights_safetensors(path)
     }
 
-    /// Compile the 9 dynamic ANE kernels (one-time operation).
+    /// Install vocab compaction for faster classifier operations.
+    ///
+    /// Must be called after `load_weights_*` and before `compile_kernels()`.
+    pub fn install_vocab_map(
+        &mut self,
+        vocab_map: pmetal_metal::ane::dynamic_trainer::VocabMap,
+    ) {
+        self.trainer.install_vocab_map(vocab_map);
+    }
+
+    /// Compile dynamic ANE kernels (one-time operation).
     pub fn compile_kernels(&mut self) -> Result<(), pmetal_metal::error::MetalError> {
         self.trainer.compile_kernels()
     }

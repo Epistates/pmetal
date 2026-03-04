@@ -112,15 +112,18 @@ impl AneRuntime {
         unsafe {
             let mil_data = NSData::with_bytes(mil_text);
 
-            // Build weight dictionary (or nil)
-            let wdict_obj: Option<objc2::rc::Retained<NSDictionary<NSString, AnyObject>>> =
-                weight_dict.map(|wd| wd.to_ns_dict());
+            // Build weight dictionary (empty dict if no weights — ANE requires non-nil)
+            let empty_wd_storage;
+            let wdict_obj = match weight_dict {
+                Some(wd) => wd.to_ns_dict(),
+                None => {
+                    empty_wd_storage = WeightDict::new();
+                    empty_wd_storage.to_ns_dict()
+                }
+            };
 
             // Create descriptor: modelWithMILText:weights:optionsPlist:
-            let wdict_ptr: *const AnyObject = match &wdict_obj {
-                Some(d) => d.as_ref() as *const _,
-                None => std::ptr::null(),
-            };
+            let wdict_ptr: *const AnyObject = wdict_obj.as_ref() as *const _;
 
             let desc: *mut AnyObject = msg_send![
                 self.descriptor_class,

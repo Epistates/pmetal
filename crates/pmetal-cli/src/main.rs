@@ -2002,7 +2002,7 @@ async fn run_training(
     if ane {
         use pmetal_trainer::{AneTrainingLoop, AneTrainingLoopConfig, DynamicAneTrainerConfig};
 
-        tracing::info!("Attempting ANE dynamic weight pipeline (compile-once, 9 kernels)");
+        tracing::info!("Attempting ANE dynamic weight pipeline");
 
         let ane_result: anyhow::Result<()> = (|| async {
             // Resolve model path
@@ -2019,6 +2019,12 @@ async fn run_training(
             // Read model config
             let config_text = std::fs::read_to_string(model_path.join("config.json"))?;
             let config_json: serde_json::Value = serde_json::from_str(&config_text)?;
+
+            // Validate architecture compatibility before attempting ANE
+            if let Err(reason) = DynamicAneTrainerConfig::is_ane_compatible(&config_json) {
+                anyhow::bail!("{}", reason);
+            }
+
             let get_usize = |key: &str| -> anyhow::Result<usize> {
                 config_json
                     .get(key)
@@ -2029,8 +2035,33 @@ async fn run_training(
             let dim = get_usize("hidden_size")?;
             let hidden_dim = get_usize("intermediate_size")?;
             let n_heads = get_usize("num_attention_heads")?;
+            let n_kv_heads = config_json
+                .get("num_key_value_heads")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize)
+                .unwrap_or(n_heads);
             let n_layers = get_usize("num_hidden_layers")?;
             let vocab_size = get_usize("vocab_size")?;
+
+            // Auto-detect max_seq_len from model config if not specified (0)
+            let max_seq_len = if max_seq_len == 0 {
+                let model_max = config_json
+                    .get("max_position_embeddings")
+                    .and_then(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .unwrap_or(2048);
+                // ANE kernels compile seq_len into static shapes — cap to prevent
+                // excessively large IOSurface allocations.
+                let capped = model_max.min(2048);
+                tracing::info!(
+                    model_max = model_max,
+                    capped = capped,
+                    "Auto-detected ANE seq_len from max_position_embeddings"
+                );
+                capped
+            } else {
+                max_seq_len
+            };
 
             // Load tokenizer (with config-aware special token resolution) and dataset
             let tokenizer = Tokenizer::from_model_dir(&model_path)?;
@@ -2077,10 +2108,18 @@ async fn run_training(
                 "Prepared ANE training data"
             );
 
+            // Read head_dim from config (models like Qwen3 use non-standard head_dim)
+            let head_dim = config_json
+                .get("head_dim")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+
             let trainer_config = DynamicAneTrainerConfig {
                 dim,
                 hidden_dim,
                 n_heads,
+                n_kv_heads,
+                head_dim,
                 n_layers,
                 vocab_size,
                 seq_len: max_seq_len,
@@ -2104,8 +2143,20 @@ async fn run_training(
             tracing::info!("Loading model weights for ANE training...");
             training_loop.load_weights_safetensors(&model_path)?;
 
-            // Compile 9 dynamic ANE kernels (one-time, no recompilation ever)
-            tracing::info!("Compiling 9 dynamic ANE kernels (one-time)...");
+            // Install vocab compaction (scan all batch tokens, build compact map)
+            {
+                use pmetal_trainer::VocabMap;
+                let vocab_map = VocabMap::from_batches(&batches, vocab_size);
+                tracing::info!(
+                    compact_vocab = vocab_map.compact_vocab,
+                    full_vocab = vocab_size,
+                    "Vocab compaction ready"
+                );
+                training_loop.install_vocab_map(vocab_map);
+            }
+
+            // Compile dynamic ANE kernels (one-time, no recompilation ever)
+            tracing::info!("Compiling dynamic ANE kernels (one-time)...");
             training_loop.compile_kernels()?;
 
             // Run training

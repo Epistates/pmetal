@@ -98,7 +98,9 @@ pub mod ane_training;
 #[cfg(feature = "ane")]
 pub use ane_training::{AneTrainingLoop, AneTrainingLoopConfig};
 #[cfg(feature = "ane")]
-pub use pmetal_metal::ane::dynamic_trainer::{DynamicAneTrainer, DynamicAneTrainerConfig};
+pub use pmetal_metal::ane::dynamic_trainer::{
+    DynamicAneTrainer, DynamicAneTrainerConfig, VocabMap,
+};
 
 pub use adam8bit::*;
 pub use adamw_groups::*;

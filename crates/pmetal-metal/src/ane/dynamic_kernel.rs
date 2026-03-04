@@ -25,11 +25,13 @@
 //! | 6 | `wo_bwd` | DIM | SEQ + Q_DIM | Wo^T |
 //! | 7 | `sdpa_bwd1` | 2*Q_DIM+2*KV_DIM | SEQ | None (mask const only) |
 //! | 8 | `sdpa_bwd2` | 2*SCORE+Q_DIM+KV_DIM | SEQ | None (weight-free) |
-//! | 9 | `qkv_bwd` | Q_DIM | 3*SEQ + 3*DIM | Wq^T, Wk^T, Wv^T |
+//! | 9a | `qkv_bwd_q` | Q_DIM | SEQ + DIM | Wq^T |
+//! | 9b | `qkv_bwd_kv` | KV_DIM | 2*SEQ + 2*DIM | Wk^T, Wv^T |
+//! | 9 | `qkv_bwd` | Q_DIM | 3*SEQ + 3*DIM | Wq^T, Wk^T, Wv^T (MHA only) |
 //! | 10 | `rmsnorm_bwd` | 2*DIM | SEQ + 1 | RMSNorm weight (1 spatial col) |
 //!
-//! **Note:** Backward kernels 6-9 require MHA (`n_kv_heads == n_heads`).
-//! GQA backward is not yet supported.
+//! **GQA support:** Kernels 7-8 handle GQA natively via tile+reduce_sum.
+//! Kernel 9 is split into 9a+9b for GQA (mixed IC dimensions).
 
 use crate::ane::kernel::{TransformerKernelConfig, WeightBlob};
 use crate::ane::mil::MilProgram;
@@ -156,6 +158,323 @@ fn emit_dyn_matmul(
     out
 }
 
+/// Expand a KV tensor from [1, nkv, hd, S] to [1, nh, hd, S] for GQA using concat.
+///
+/// ANE's tile op is unreliable, so we use concat to replicate each KV head
+/// `groups` times. Pattern:
+/// - Merge hd*S dims: [1, nkv, hd, S] → [1, nkv, 1, hd*S]
+/// - Concat `groups` copies along axis=2: [1, nkv, groups, hd*S]
+/// - Reshape back: [1, nh, hd, S]
+///
+/// `kv_var` must already be [1, nkv, hd, S]. Returns the name of the
+/// expanded tensor [1, nh, hd, S].
+fn emit_gqa_expand(
+    p: &mut MilProgram,
+    prefix: &str,
+    kv_var: &str,
+    nkv: usize,
+    nh: usize,
+    hd: usize,
+    s: usize,
+    groups: usize,
+) -> String {
+    let hds = hd * s;
+
+    // Merge last 2 dims: [1, nkv, hd, S] → [1, nkv, 1, hd*S]
+    let merge_rsh = p.next_var(&format!("{prefix}_mrs"));
+    p.emit_tensor_const(&merge_rsh, &[4], "int32", &format!("[1,{nkv},1,{hds}]"));
+    let merged = p.next_var(&format!("{prefix}_mg"));
+    p.emit_reshape(&merged, &[1, nkv, 1, hds], &merge_rsh, kv_var);
+
+    // Concat `groups` copies along axis=2
+    let cat_ax = p.next_var(&format!("{prefix}_ca"));
+    p.emit_scalar_const(&cat_ax, "int32", "2");
+    let cat_il = p.next_var(&format!("{prefix}_ci"));
+    p.emit_scalar_const(&cat_il, "bool", "false");
+    let copies: Vec<&str> = (0..groups).map(|_| merged.as_str()).collect();
+    let expanded = p.next_var(&format!("{prefix}_ex"));
+    p.emit_concat(
+        &expanded,
+        &[1, nkv, groups, hds],
+        &cat_ax,
+        &cat_il,
+        &copies,
+    );
+
+    // Reshape to [1, nh, hd, S]
+    let nh_rsh = p.next_var(&format!("{prefix}_nr"));
+    p.emit_tensor_const(&nh_rsh, &[4], "int32", &format!("[1,{nh},{hd},{s}]"));
+    let result = p.next_var(&format!("{prefix}_fn"));
+    p.emit_reshape(&result, &[1, nh, hd, s], &nh_rsh, &expanded);
+
+    result
+}
+
+/// Reduce a gradient tensor from [1, nh, hd, S] to [1, nkv, hd, S] for GQA.
+///
+/// Groups consecutive heads and sums them:
+/// - Reshape [1, nh, hd, S] → [1, nkv, groups, hd*S] (4D, merge hd+S)
+/// - reduce_sum(axis=2, keepdim=true) → [1, nkv, 1, hd*S]
+/// - Reshape → [1, nkv, hd, S] → [1, kvd, 1, S]
+///
+/// `grad_var` must be [1, nh, hd, S]. Returns name of [1, kvd, 1, S] result.
+fn emit_gqa_reduce(
+    p: &mut MilProgram,
+    prefix: &str,
+    grad_var: &str,
+    nkv: usize,
+    groups: usize,
+    hd: usize,
+    s: usize,
+    kvd: usize,
+) -> String {
+    let hds = hd * s;
+
+    // Reshape [1, nh, hd, S] → [1, nkv, groups, hd*S]
+    let grp_rsh = p.next_var(&format!("{prefix}_gr"));
+    p.emit_tensor_const(
+        &grp_rsh,
+        &[4],
+        "int32",
+        &format!("[1,{nkv},{groups},{hds}]"),
+    );
+    let grp = p.next_var(&format!("{prefix}_g"));
+    p.emit_reshape(&grp, &[1, nkv, groups, hds], &grp_rsh, grad_var);
+
+    // reduce_sum(axis=2, keepdim=true) → [1, nkv, 1, hd*S]
+    let ax2 = p.next_var(&format!("{prefix}_a2"));
+    p.emit_tensor_const(&ax2, &[1], "int32", "[2]");
+    let kd = p.next_var(&format!("{prefix}_kd"));
+    p.emit_scalar_const(&kd, "bool", "true");
+    let reduced = p.next_var(&format!("{prefix}_rd"));
+    p.emit_reduce_sum(&reduced, &[1, nkv, 1, hds], &grp, &ax2, &kd);
+
+    // Reshape [1, nkv, 1, hd*S] → [1, nkv, hd, S]
+    let kv_head_rsh = p.next_var(&format!("{prefix}_hr"));
+    p.emit_tensor_const(&kv_head_rsh, &[4], "int32", &format!("[1,{nkv},{hd},{s}]"));
+    let heads = p.next_var(&format!("{prefix}_hd"));
+    p.emit_reshape(&heads, &[1, nkv, hd, s], &kv_head_rsh, &reduced);
+
+    // Flatten to [1, kvd, 1, S]
+    let flat_rsh = p.next_var(&format!("{prefix}_fr"));
+    p.emit_tensor_const(&flat_rsh, &[4], "int32", &format!("[1,{kvd},1,{s}]"));
+    let result = p.next_var(&format!("{prefix}_fl"));
+    p.emit_reshape(&result, &[1, kvd, 1, s], &flat_rsh, &heads);
+
+    result
+}
+
+// ============================================================================
+// Decomposed kernels: single-projection + attention-only
+// ============================================================================
+
+/// Generate a standalone single linear projection kernel.
+///
+/// This is the fundamental building block for the decomposed ANE pipeline.
+/// Each projection (Q, K, V, Wo, W1, W2, W3, and their transposes for
+/// backward) gets its own compiled kernel. This keeps IOSurface sizes
+/// manageable and avoids the "too complex" MIL compilation failures that
+/// occur when multiple matmuls are packed into a single kernel.
+///
+/// Input: `[1, IC, 1, SEQ + OC]` fp32
+/// - `sp[0:SEQ]`      = activations `[IC, SEQ]`
+/// - `sp[SEQ:SEQ+OC]` = weight matrix columns `[IC, OC]`
+///
+/// Output: `[1, OC, 1, SEQ]` fp32
+/// - `y = act @ W`
+pub fn gen_dynamic_projection(ic: usize, oc: usize, seq: usize) -> DynamicKernelOutput {
+    let sp = seq + oc;
+    let mut p = MilProgram::new_fp32(ic, sp);
+
+    // Cast fp32 → fp16
+    p.emit_cast("x16", &[1, ic, 1, sp], "x", "fp16");
+
+    // Single matmul: act[ic, seq] @ W[ic, oc] → out[oc, seq]
+    let out16 = emit_dyn_matmul(&mut p, "mm", "x16", ic, oc, seq, 0, seq);
+
+    // Cast fp16 → fp32
+    let out32 = p.next_var("out32");
+    p.emit_cast(&out32, &[1, oc, 1, seq], &out16, "fp32");
+
+    let mil_text = p.finalize(&out32);
+
+    DynamicKernelOutput {
+        mil_text,
+        static_weights: WeightDict::new(),
+        input_layout: SpatialLayout {
+            ic,
+            seq_len: seq,
+            total_spatial: sp,
+            oc,
+            out_spatial: seq,
+        },
+        output_layout: SpatialLayout {
+            ic: oc,
+            seq_len: seq,
+            total_spatial: seq,
+            oc,
+            out_spatial: seq,
+        },
+    }
+}
+
+/// Generate the attention-only SDPA kernel (no weight projections).
+///
+/// Takes pre-projected Q, K, V concatenated along channels and computes
+/// scaled dot-product attention with causal mask.
+///
+/// Input: `[1, QD + 2*KVD, 1, SEQ]` fp32
+/// - `ch[0:QD]`                = Q (pre-projected)
+/// - `ch[QD:QD+KVD]`           = K (pre-projected)
+/// - `ch[QD+KVD:QD+2*KVD]`     = V (pre-projected)
+///
+/// Output: `[1, QD, 1, SEQ]` fp32
+/// - attention output (before Wo projection)
+///
+/// Supports both MHA and GQA. For GQA, K/V are expanded via concat
+/// to full head count before attention computation.
+pub fn gen_dynamic_sdpa_attn(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
+    let c = &dkc.cfg;
+    let qd = c.q_dim();
+    let kvd = c.kv_dim();
+    let s = c.seq_len;
+    let nh = c.n_heads;
+    let nkv = c.n_kv_heads;
+    let groups = c.n_groups();
+    let hd = c.head_dim;
+    let in_ch = qd + 2 * kvd;
+    let scale = 1.0 / (hd as f32).sqrt();
+
+    let mut p = MilProgram::new_fp32(in_ch, s);
+
+    // Cast fp32 → fp16
+    p.emit_cast("x16", &[1, in_ch, 1, s], "x", "fp16");
+
+    // Slice Q, K, V from channels
+    let sb = |p: &mut MilProgram, name: &str, ch_off: usize, ch: usize| -> String {
+        let begin = p.next_var(&format!("{name}_b"));
+        p.emit_tensor_const(&begin, &[4], "int32", &format!("[0,{ch_off},0,0]"));
+        let size = p.next_var(&format!("{name}_s"));
+        p.emit_tensor_const(&size, &[4], "int32", &format!("[1,{ch},1,{s}]"));
+        let out = p.next_var(name);
+        p.emit_slice_by_size(&out, &[1, ch, 1, s], "x16", &begin, &size);
+        out
+    };
+
+    let q_flat = sb(&mut p, "qf", 0, qd);
+    let k_flat = sb(&mut p, "kf", qd, kvd);
+    let v_flat = sb(&mut p, "vf", qd + kvd, kvd);
+
+    // Reshape Q: [1, qd, 1, S] → [1, nh, hd, S]
+    let q_rsh = p.next_var("qrs");
+    p.emit_tensor_const(&q_rsh, &[4], "int32", &format!("[1,{nh},{hd},{s}]"));
+    let q_heads = p.next_var("qh");
+    p.emit_reshape(&q_heads, &[1, nh, hd, s], &q_rsh, &q_flat);
+
+    // Transpose Q: [1, nh, hd, S] → [1, nh, S, hd]
+    let perm23 = p.next_var("p23");
+    p.emit_tensor_const(&perm23, &[4], "int32", "[0,1,3,2]");
+    let qt = p.next_var("qt");
+    p.emit_transpose(&qt, &[1, nh, s, hd], &perm23, &q_heads);
+
+    // K/V: reshape to [nkv, hd, S], expand to [nh, hd, S] if GQA
+    let kv_rsh = p.next_var("kvrs");
+    p.emit_tensor_const(&kv_rsh, &[4], "int32", &format!("[1,{nkv},{hd},{s}]"));
+    let k_kv = p.next_var("kkv");
+    p.emit_reshape(&k_kv, &[1, nkv, hd, s], &kv_rsh, &k_flat);
+
+    let (k_heads, v_h) = if groups > 1 {
+        let k_final = emit_gqa_expand(&mut p, "ke", &k_kv, nkv, nh, hd, s, groups);
+        let v_kv = p.next_var("vkv");
+        p.emit_reshape(&v_kv, &[1, nkv, hd, s], &kv_rsh, &v_flat);
+        let v_final = emit_gqa_expand(&mut p, "ve", &v_kv, nkv, nh, hd, s, groups);
+        (k_final, v_final)
+    } else {
+        let k_h = p.next_var("kh");
+        p.emit_reshape(&k_h, &[1, nh, hd, s], &q_rsh, &k_flat);
+        let v_h = p.next_var("vh");
+        p.emit_reshape(&v_h, &[1, nh, hd, s], &q_rsh, &v_flat);
+        (k_h, v_h)
+    };
+
+    // scores = Q @ K^T: [1, nh, S, hd] @ [1, nh, hd, S] → [1, nh, S, S]
+    let mm_false = p.next_var("mmf");
+    p.emit_scalar_const(&mm_false, "bool", "false");
+    let scores_raw = p.next_var("sr");
+    p.emit_matmul(
+        &scores_raw,
+        &[1, nh, s, s],
+        &mm_false,
+        &mm_false,
+        &qt,
+        &k_heads,
+    );
+
+    // Scale
+    let scale_var = p.next_var("sc");
+    p.emit_scalar_const(&scale_var, "fp16", &format!("{scale}"));
+    let scores_scaled = p.next_var("ss");
+    p.emit_mul(&scores_scaled, &[1, nh, s, s], &scores_raw, &scale_var);
+
+    // Causal mask
+    let mask_path = "@model_path/weights/mask.bin";
+    p.emit_weight_const("mask", &[1, 1, s, s], mask_path);
+    let scores_masked = p.next_var("sm");
+    p.emit_add(&scores_masked, &[1, nh, s, s], &scores_scaled, "mask");
+
+    // Softmax
+    let ax3 = p.next_var("ax3");
+    p.emit_scalar_const(&ax3, "int32", "3");
+    let probs = p.next_var("probs");
+    p.emit_softmax(&probs, &[1, nh, s, s], &ax3, &scores_masked);
+
+    // Transpose V: [1, nh, hd, S] → [1, nh, S, hd]
+    let vt = p.next_var("vt");
+    p.emit_transpose(&vt, &[1, nh, s, hd], &perm23, &v_h);
+
+    // attn = probs @ V_t: [1, nh, S, S] @ [1, nh, S, hd] → [1, nh, S, hd]
+    let attn = p.next_var("attn");
+    p.emit_matmul(&attn, &[1, nh, s, hd], &mm_false, &mm_false, &probs, &vt);
+
+    // Transpose: [1, nh, S, hd] → [1, nh, hd, S]
+    let attn_t = p.next_var("at");
+    p.emit_transpose(&attn_t, &[1, nh, hd, s], &perm23, &attn);
+
+    // Reshape: [1, nh, hd, S] → [1, qd, 1, S]
+    let qd_rsh = p.next_var("qdrs");
+    p.emit_tensor_const(&qd_rsh, &[4], "int32", &format!("[1,{qd},1,{s}]"));
+    let attn_flat = p.next_var("af");
+    p.emit_reshape(&attn_flat, &[1, qd, 1, s], &qd_rsh, &attn_t);
+
+    // Cast fp16 → fp32
+    let out32 = p.next_var("out32");
+    p.emit_cast(&out32, &[1, qd, 1, s], &attn_flat, "fp32");
+
+    let mil_text = p.finalize(&out32);
+
+    let mut static_weights = WeightDict::new();
+    static_weights.add(mask_path, build_causal_mask(s));
+
+    DynamicKernelOutput {
+        mil_text,
+        static_weights,
+        input_layout: SpatialLayout {
+            ic: in_ch,
+            seq_len: s,
+            total_spatial: s,
+            oc: in_ch,
+            out_spatial: s,
+        },
+        output_layout: SpatialLayout {
+            ic: qd,
+            seq_len: s,
+            total_spatial: s,
+            oc: qd,
+            out_spatial: s,
+        },
+    }
+}
+
 /// Build the causal mask blob (fp16). Same format as kernel.rs.
 fn build_causal_mask(seq_len: usize) -> Vec<u8> {
     let n = seq_len * seq_len;
@@ -188,9 +507,17 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let d = c.dim;
     let s = c.seq_len;
     let nh = c.n_heads;
+    let nkv = c.n_kv_heads;
+    let groups = c.n_groups();
     let hd = c.head_dim;
-    let sp = s + 4 * d;
-    let out_ch = 6 * d;
+    let qd = c.q_dim(); // n_heads * head_dim
+    let kvd = c.kv_dim(); // n_kv_heads * head_dim
+
+    // Spatial: xnorm(s) + Wq(qd cols) + Wk(kvd cols) + Wv(kvd cols) + Wo(qd cols)
+    let wo_offset = s + qd + kvd + kvd;
+    let sp = wo_offset + qd;
+    // Output taps: [o_out(d), Q(qd), K(kvd), V(kvd), attn(qd), xnorm(d)]
+    let out_ch = 2 * d + 2 * qd + 2 * kvd;
     let scale = 1.0 / (hd as f32).sqrt();
 
     let mut p = MilProgram::new_fp32(d, sp);
@@ -198,10 +525,12 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     // Cast input fp32 → fp16
     p.emit_cast("x16", &[1, d, 1, sp], "x", "fp16");
 
-    // 3 dynamic matmuls: Q, K, V projections (Wo applied separately to attn output)
-    let q = emit_dyn_matmul(&mut p, "q", "x16", d, d, s, 0, s);
-    let k = emit_dyn_matmul(&mut p, "k", "x16", d, d, s, 0, s + d);
-    let v = emit_dyn_matmul(&mut p, "v", "x16", d, d, s, 0, s + 2 * d);
+    // Q projection: xnorm[d, s] @ Wq[d, qd] → Q[qd, s]
+    let q = emit_dyn_matmul(&mut p, "q", "x16", d, qd, s, 0, s);
+    // K projection: xnorm[d, s] @ Wk[d, kvd] → K[kvd, s]
+    let k = emit_dyn_matmul(&mut p, "k", "x16", d, kvd, s, 0, s + qd);
+    // V projection: xnorm[d, s] @ Wv[d, kvd] → V[kvd, s]
+    let v = emit_dyn_matmul(&mut p, "v", "x16", d, kvd, s, 0, s + qd + kvd);
 
     // Save xnorm (slice from input)
     let xn_begin = p.next_var("xnb");
@@ -211,7 +540,7 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let xnorm = p.next_var("xnorm");
     p.emit_slice_by_size(&xnorm, &[1, d, 1, s], "x16", &xn_begin, &xn_size);
 
-    // Reshape Q to multi-head: [1, D, 1, S] → [1, nh, hd, S]
+    // Reshape Q to multi-head: [1, qd, 1, S] → [1, nh, hd, S]
     let q_rsh = p.next_var("qrs");
     p.emit_tensor_const(&q_rsh, &[4], "int32", &format!("[1,{nh},{hd},{s}]"));
     let q_heads = p.next_var("qh");
@@ -223,9 +552,29 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let qt = p.next_var("qt");
     p.emit_transpose(&qt, &[1, nh, s, hd], &perm23, &q_heads);
 
-    // Reshape K to multi-head
-    let k_heads = p.next_var("kh");
-    p.emit_reshape(&k_heads, &[1, nh, hd, s], &q_rsh, &k);
+    // Reshape K to [nkv, hd, S], then expand to [nh, hd, S] if GQA
+    let kv_rsh = p.next_var("kvrs");
+    p.emit_tensor_const(&kv_rsh, &[4], "int32", &format!("[1,{nkv},{hd},{s}]"));
+    let k_kv = p.next_var("kkv");
+    p.emit_reshape(&k_kv, &[1, nkv, hd, s], &kv_rsh, &k);
+
+    let (k_heads, v_h) = if groups > 1 {
+        // GQA K/V expansion using concat (tile op unreliable on ANE)
+        let k_final = emit_gqa_expand(&mut p, "ke", &k_kv, nkv, nh, hd, s, groups);
+
+        let v_kv = p.next_var("vkv");
+        p.emit_reshape(&v_kv, &[1, nkv, hd, s], &kv_rsh, &v);
+        let v_final = emit_gqa_expand(&mut p, "ve", &v_kv, nkv, nh, hd, s, groups);
+
+        (k_final, v_final)
+    } else {
+        // MHA: K and V are already at full head count
+        let k_h = p.next_var("kh");
+        p.emit_reshape(&k_h, &[1, nh, hd, s], &q_rsh, &k);
+        let v_h = p.next_var("vh");
+        p.emit_reshape(&v_h, &[1, nh, hd, s], &q_rsh, &v);
+        (k_h, v_h)
+    };
 
     // scores = Q @ K^T: [1, nh, S, hd] @ [1, nh, hd, S] → [1, nh, S, S]
     let mm_false = p.next_var("mmf");
@@ -258,15 +607,11 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let probs = p.next_var("probs");
     p.emit_softmax(&probs, &[1, nh, s, s], &ax3, &scores_masked);
 
-    // Reshape V to multi-head: [1, D, 1, S] → [1, nh, hd, S]
-    let v_heads = p.next_var("vh");
-    p.emit_reshape(&v_heads, &[1, nh, hd, s], &q_rsh, &v);
-
     // Transpose V: [1, nh, hd, S] → [1, nh, S, hd]
     let vt = p.next_var("vt");
-    p.emit_transpose(&vt, &[1, nh, s, hd], &perm23, &v_heads);
+    p.emit_transpose(&vt, &[1, nh, s, hd], &perm23, &v_h);
 
-    // attn_out = probs @ V^T: [1, nh, S, S] @ [1, nh, S, hd] → [1, nh, S, hd]
+    // attn_out = probs @ V_t: [1, nh, S, S] @ [1, nh, S, hd] → [1, nh, S, hd]
     let attn = p.next_var("attn");
     p.emit_matmul(&attn, &[1, nh, s, hd], &mm_false, &mm_false, &probs, &vt);
 
@@ -274,48 +619,58 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let attn_t = p.next_var("at");
     p.emit_transpose(&attn_t, &[1, nh, hd, s], &perm23, &attn);
 
-    // Reshape: [1, nh, hd, S] → [1, D, 1, S]
+    // Reshape: [1, nh, hd, S] → [1, qd, 1, S]
+    let qd_rsh = p.next_var("qdrs");
+    p.emit_tensor_const(&qd_rsh, &[4], "int32", &format!("[1,{qd},1,{s}]"));
+    let attn_flat = p.next_var("af");
+    p.emit_reshape(&attn_flat, &[1, qd, 1, s], &qd_rsh, &attn_t);
+
+    // Wo projection: attn_flat[qd, S] @ Wo → o_out[d, S]
+    // Wo is packed in input as [1, d, 1, qd] at offset wo_offset.
+    // Wo weight matrix is [d, qd] (d outputs, qd inputs) stored row-major.
+    // Packed column-wise: qd columns of d channels each.
+    // Reshape to [1, 1, d, qd] then matmul: attn[1,1,s,qd] @ Wo^T[1,1,qd,d] → [1,1,s,d]
+    let wo_begin = p.next_var("wob");
+    p.emit_tensor_const(
+        &wo_begin,
+        &[4],
+        "int32",
+        &format!("[0,0,0,{}]", wo_offset),
+    );
+    let wo_size = p.next_var("wos");
+    p.emit_tensor_const(&wo_size, &[4], "int32", &format!("[1,{d},1,{qd}]"));
+    let wo_raw = p.next_var("wor");
+    p.emit_slice_by_size(&wo_raw, &[1, d, 1, qd], "x16", &wo_begin, &wo_size);
+
+    // Reshape attn_flat for matmul: [1, qd, 1, S] → [1, 1, qd, S] → [1, 1, S, qd]
+    let af_rsh = p.next_var("afrs");
+    p.emit_tensor_const(&af_rsh, &[4], "int32", &format!("[1,1,{qd},{s}]"));
+    let af_r = p.next_var("afr");
+    p.emit_reshape(&af_r, &[1, 1, qd, s], &af_rsh, &attn_flat);
+    let af_t = p.next_var("aft");
+    p.emit_transpose(&af_t, &[1, 1, s, qd], &perm23, &af_r);
+
+    // Reshape Wo: [1, d, 1, qd] → [1, 1, d, qd] → transpose → [1, 1, qd, d]
+    let wo_rsh = p.next_var("wrs");
+    p.emit_tensor_const(&wo_rsh, &[4], "int32", &format!("[1,1,{d},{qd}]"));
+    let wo_r = p.next_var("wrr");
+    p.emit_reshape(&wo_r, &[1, 1, d, qd], &wo_rsh, &wo_raw);
+    let wo_t = p.next_var("wot");
+    p.emit_transpose(&wo_t, &[1, 1, qd, d], &perm23, &wo_r);
+
+    // matmul: [1, 1, S, qd] @ [1, 1, qd, d] → [1, 1, S, d]
+    let oo_mm = p.next_var("oom");
+    p.emit_matmul(&oo_mm, &[1, 1, s, d], &mm_false, &mm_false, &af_t, &wo_t);
+
+    // Transpose + reshape back: [1, 1, S, d] → [1, 1, d, S] → [1, d, 1, S]
     let out_rsh = p.next_var("ors");
     p.emit_tensor_const(&out_rsh, &[4], "int32", &format!("[1,{d},1,{s}]"));
-    let attn_flat = p.next_var("af");
-    p.emit_reshape(&attn_flat, &[1, d, 1, s], &out_rsh, &attn_t);
-
-    // Wo projection applied to attn_flat (not to input activations).
-    // Wo weight is sliced from the packed input, but the activation is attn_flat.
-
-    // Slice Wo from input: [1, D, 1, D] at sp offset s+3*d
-    let wo_begin = p.next_var("wob");
-    p.emit_tensor_const(&wo_begin, &[4], "int32", &format!("[0,0,0,{}]", s + 3 * d));
-    let wo_size = p.next_var("wos");
-    p.emit_tensor_const(&wo_size, &[4], "int32", &format!("[1,{d},1,{d}]"));
-    let wo_raw = p.next_var("wor");
-    p.emit_slice_by_size(&wo_raw, &[1, d, 1, d], "x16", &wo_begin, &wo_size);
-
-    // Reshape attn_flat for matmul: [1, D, 1, S] → [1, 1, D, S] → [1, 1, S, D]
-    let af_rsh = p.next_var("afrs");
-    p.emit_tensor_const(&af_rsh, &[4], "int32", &format!("[1,1,{d},{s}]"));
-    let af_r = p.next_var("afr");
-    p.emit_reshape(&af_r, &[1, 1, d, s], &af_rsh, &attn_flat);
-    let af_t = p.next_var("aft");
-    p.emit_transpose(&af_t, &[1, 1, s, d], &perm23, &af_r);
-
-    // Reshape Wo: [1, D, 1, D] → [1, 1, D, D]
-    let wo_rsh = p.next_var("wrs");
-    p.emit_tensor_const(&wo_rsh, &[4], "int32", &format!("[1,1,{d},{d}]"));
-    let wo_r = p.next_var("wrr");
-    p.emit_reshape(&wo_r, &[1, 1, d, d], &wo_rsh, &wo_raw);
-
-    // matmul: [1, 1, S, D] @ [1, 1, D, D] → [1, 1, S, D]
-    let oo_mm = p.next_var("oom");
-    p.emit_matmul(&oo_mm, &[1, 1, s, d], &mm_false, &mm_false, &af_t, &wo_r);
-
-    // Transpose + reshape back: [1, 1, S, D] → [1, 1, D, S] → [1, D, 1, S]
     let oo_t = p.next_var("oot");
     p.emit_transpose(&oo_t, &[1, 1, d, s], &perm23, &oo_mm);
     let o_out = p.next_var("oo");
     p.emit_reshape(&o_out, &[1, d, 1, s], &out_rsh, &oo_t);
 
-    // Concat taps: [o_out, Q, K, V, attn_flat, xnorm] = [6*D, S]
+    // Concat taps: [o_out(d), Q(qd), K(kvd), V(kvd), attn_flat(qd), xnorm(d)]
     let cat_ax = p.next_var("cax");
     p.emit_scalar_const(&cat_ax, "int32", "1");
     let cat_il = p.next_var("cil");
@@ -664,30 +1019,23 @@ pub fn gen_dynamic_wo_bwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 /// Output: `[1, KV_DIM + 2*SCORE_CH, 1, SEQ]` fp16
 /// - concat(dV(kv_dim), probs, dp)
 ///
-/// This kernel uses fp16 throughout (no fp32 IOSurface) and has only a
-/// static causal mask constant. It recomputes the forward attention to get
-/// probs, then computes dV = probs^T @ da and dp = da @ V^T.
-///
-/// Note: Requires MHA (n_kv_heads == n_heads). da comes from wo_bwd
-/// and has q_dim channels. For MHA, q_dim == kv_dim.
+/// Supports both MHA (`n_kv_heads == n_heads`) and GQA (`n_kv_heads < n_heads`).
+/// For GQA, K/V are expanded via tile to full head count before attention,
+/// and dV_full is reduced (group-summed) back to `n_kv_heads` dimension.
 pub fn gen_dynamic_sdpa_bwd1(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let c = &dkc.cfg;
     let qd = c.q_dim(); // n_heads * head_dim
-    let kvd = c.kv_dim(); // n_kv_heads * head_dim (= qd for MHA)
+    let kvd = c.kv_dim(); // n_kv_heads * head_dim
     let s = c.seq_len;
     let nh = c.n_heads;
+    let nkv = c.n_kv_heads;
+    let groups = c.n_groups(); // nh / nkv
     let hd = c.head_dim;
     let score_ch = nh * s;
     let in_ch = 2 * qd + 2 * kvd; // Q(qd) + K(kvd) + V(kvd) + da(qd)
     let out_ch = kvd + 2 * score_ch; // dV(kvd) + probs + dp
     let scale = 1.0 / (hd as f32).sqrt();
 
-    debug_assert_eq!(
-        c.n_kv_heads, c.n_heads,
-        "Dynamic backward SDPA kernels require MHA (n_kv_heads == n_heads)"
-    );
-
-    // This kernel uses fp16 in/out (matching static trainer pattern)
     let mut p = MilProgram::new(in_ch, s);
 
     // Slice Q(qd), K(kvd), V(kvd), da(qd) from input
@@ -706,9 +1054,9 @@ pub fn gen_dynamic_sdpa_bwd1(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let v_flat = sb(&mut p, "vf", qd + kvd, kvd);
     let da_flat = sb(&mut p, "daf", qd + 2 * kvd, qd);
 
-    // Reshape to multi-head
-    let head_rsh = p.next_var("hrs");
-    p.emit_tensor_const(&head_rsh, &[4], "int32", &format!("[1,{nh},{hd},{s}]"));
+    // Reshape Q to multi-head: [1, qd, 1, S] → [1, nh, hd, S]
+    let q_rsh = p.next_var("qrs");
+    p.emit_tensor_const(&q_rsh, &[4], "int32", &format!("[1,{nh},{hd},{s}]"));
     let perm23 = p.next_var("p23");
     p.emit_tensor_const(&perm23, &[4], "int32", "[0,1,3,2]");
     let mm_false = p.next_var("mmf");
@@ -716,19 +1064,35 @@ pub fn gen_dynamic_sdpa_bwd1(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let mm_true = p.next_var("mmt");
     p.emit_scalar_const(&mm_true, "bool", "true");
 
-    // Q → [1, nh, hd, S] → [1, nh, S, hd]
     let q_h = p.next_var("qh");
-    p.emit_reshape(&q_h, &[1, nh, hd, s], &head_rsh, &q_flat);
+    p.emit_reshape(&q_h, &[1, nh, hd, s], &q_rsh, &q_flat);
     let qt = p.next_var("qt");
     p.emit_transpose(&qt, &[1, nh, s, hd], &perm23, &q_h);
 
-    // K → [1, nh, hd, S]
-    let k_h = p.next_var("kh");
-    p.emit_reshape(&k_h, &[1, nh, hd, s], &head_rsh, &k_flat);
+    // K/V: reshape to [1, nkv, hd, S], then expand to [1, nh, hd, S] if GQA
+    let kv_rsh = p.next_var("kvrs");
+    p.emit_tensor_const(&kv_rsh, &[4], "int32", &format!("[1,{nkv},{hd},{s}]"));
 
-    // V → [1, nh, hd, S] → [1, nh, S, hd]
-    let v_h = p.next_var("vvh");
-    p.emit_reshape(&v_h, &[1, nh, hd, s], &head_rsh, &v_flat);
+    let k_kv = p.next_var("kkv");
+    p.emit_reshape(&k_kv, &[1, nkv, hd, s], &kv_rsh, &k_flat);
+    let v_kv = p.next_var("vkv");
+    p.emit_reshape(&v_kv, &[1, nkv, hd, s], &kv_rsh, &v_flat);
+
+    // Expand K/V to full head count for GQA
+    let (k_h, v_h) = if groups > 1 {
+        let k_final = emit_gqa_expand(&mut p, "ke", &k_kv, nkv, nh, hd, s, groups);
+        let v_final = emit_gqa_expand(&mut p, "ve", &v_kv, nkv, nh, hd, s, groups);
+        (k_final, v_final)
+    } else {
+        // MHA: K/V already at full head count
+        let k_h = p.next_var("kh");
+        p.emit_reshape(&k_h, &[1, nh, hd, s], &q_rsh, &k_flat);
+        let v_h = p.next_var("vvh");
+        p.emit_reshape(&v_h, &[1, nh, hd, s], &q_rsh, &v_flat);
+        (k_h, v_h)
+    };
+
+    // V transposed for dp computation
     let vt = p.next_var("vt");
     p.emit_transpose(&vt, &[1, nh, s, hd], &perm23, &v_h);
 
@@ -753,21 +1117,34 @@ pub fn gen_dynamic_sdpa_bwd1(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 
     // da → [1, nh, hd, S] → [1, nh, S, hd]
     let da_h = p.next_var("dah");
-    p.emit_reshape(&da_h, &[1, nh, hd, s], &head_rsh, &da_flat);
+    p.emit_reshape(&da_h, &[1, nh, hd, s], &q_rsh, &da_flat);
     let da_t = p.next_var("dat");
     p.emit_transpose(&da_t, &[1, nh, s, hd], &perm23, &da_h);
 
-    // dV = probs^T @ da: [1, nh, S, S]^T @ [1, nh, S, hd] → [1, nh, S, hd]
-    let dv_h = p.next_var("dvh");
-    p.emit_matmul(&dv_h, &[1, nh, s, hd], &mm_true, &mm_false, &probs_h, &da_t);
+    // dV_full = probs^T @ da: [1, nh, S, S]^T @ [1, nh, S, hd] → [1, nh, S, hd]
+    let dv_full = p.next_var("dvfl");
+    p.emit_matmul(
+        &dv_full,
+        &[1, nh, s, hd],
+        &mm_true,
+        &mm_false,
+        &probs_h,
+        &da_t,
+    );
 
-    // Transpose dV: [1, nh, S, hd] → [1, nh, hd, S] → [1, KV_DIM, 1, S]
+    // dV: transpose [1, nh, S, hd] → [1, nh, hd, S], then reduce groups for GQA
     let dv_t = p.next_var("dvt");
-    p.emit_transpose(&dv_t, &[1, nh, hd, s], &perm23, &dv_h);
-    let flat_rsh = p.next_var("frs");
-    p.emit_tensor_const(&flat_rsh, &[4], "int32", &format!("[1,{kvd},1,{s}]"));
-    let dv_flat = p.next_var("dvf");
-    p.emit_reshape(&dv_flat, &[1, kvd, 1, s], &flat_rsh, &dv_t);
+    p.emit_transpose(&dv_t, &[1, nh, hd, s], &perm23, &dv_full);
+
+    let dv_flat = if groups > 1 {
+        emit_gqa_reduce(&mut p, "dv", &dv_t, nkv, groups, hd, s, kvd)
+    } else {
+        let flat_rsh = p.next_var("frs");
+        p.emit_tensor_const(&flat_rsh, &[4], "int32", &format!("[1,{kvd},1,{s}]"));
+        let dv_out = p.next_var("dvf");
+        p.emit_reshape(&dv_out, &[1, kvd, 1, s], &flat_rsh, &dv_t);
+        dv_out
+    };
 
     // dp = da @ V^T: [1, nh, S, hd] @ [1, nh, hd, S] → [1, nh, S, S]
     let dp_h = p.next_var("dph");
@@ -833,25 +1210,23 @@ pub fn gen_dynamic_sdpa_bwd1(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 /// - concat(dQ(q_dim), dK(kv_dim))
 ///
 /// Computes softmax backward: `dS = probs * (dp - sum(probs*dp, axis=-1))`
-/// Then: `dQ = dS @ K`, `dK = dS^T @ Q`
+/// Then: `dQ = dS @ K_expanded`, `dK_full = dS^T @ Q`, reduced for GQA.
 ///
-/// Note: Requires MHA (n_kv_heads == n_heads).
+/// Supports both MHA and GQA. For GQA, K is expanded via tile and
+/// dK_full is reduced (group-summed) back to `n_kv_heads` dimension.
 pub fn gen_dynamic_sdpa_bwd2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let c = &dkc.cfg;
     let qd = c.q_dim(); // n_heads * head_dim
-    let kvd = c.kv_dim(); // n_kv_heads * head_dim (= qd for MHA)
+    let kvd = c.kv_dim(); // n_kv_heads * head_dim
     let s = c.seq_len;
     let nh = c.n_heads;
+    let nkv = c.n_kv_heads;
+    let groups = c.n_groups();
     let hd = c.head_dim;
     let score_ch = nh * s;
     let in_ch = 2 * score_ch + qd + kvd;
     let out_ch = qd + kvd;
     let scale = 1.0 / (hd as f32).sqrt();
-
-    debug_assert_eq!(
-        c.n_kv_heads, c.n_heads,
-        "Dynamic backward SDPA kernels require MHA (n_kv_heads == n_heads)"
-    );
 
     let mut p = MilProgram::new(in_ch, s);
 
@@ -871,11 +1246,11 @@ pub fn gen_dynamic_sdpa_bwd2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let q_flat = sb(&mut p, "qf", 2 * score_ch, qd);
     let k_flat = sb(&mut p, "kf", 2 * score_ch + qd, kvd);
 
-    // Reshape to multi-head
+    // Reshape score matrices to multi-head
     let score_rsh = p.next_var("srs");
     p.emit_tensor_const(&score_rsh, &[4], "int32", &format!("[1,{nh},{s},{s}]"));
-    let head_rsh = p.next_var("hrs");
-    p.emit_tensor_const(&head_rsh, &[4], "int32", &format!("[1,{nh},{hd},{s}]"));
+    let q_rsh = p.next_var("qrs");
+    p.emit_tensor_const(&q_rsh, &[4], "int32", &format!("[1,{nh},{hd},{s}]"));
     let perm23 = p.next_var("p23");
     p.emit_tensor_const(&perm23, &[4], "int32", "[0,1,3,2]");
     let mm_false = p.next_var("mmf");
@@ -890,20 +1265,28 @@ pub fn gen_dynamic_sdpa_bwd2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 
     // Q → [1, nh, hd, S] → [1, nh, S, hd]
     let q_h = p.next_var("qh");
-    p.emit_reshape(&q_h, &[1, nh, hd, s], &head_rsh, &q_flat);
+    p.emit_reshape(&q_h, &[1, nh, hd, s], &q_rsh, &q_flat);
     let qt = p.next_var("qt");
     p.emit_transpose(&qt, &[1, nh, s, hd], &perm23, &q_h);
 
-    // K → [1, nh, hd, S]
-    let k_h = p.next_var("kh");
-    p.emit_reshape(&k_h, &[1, nh, hd, s], &head_rsh, &k_flat);
+    // K: reshape to [1, nkv, hd, S], then expand to [1, nh, hd, S] if GQA
+    let kv_rsh = p.next_var("kvrs");
+    p.emit_tensor_const(&kv_rsh, &[4], "int32", &format!("[1,{nkv},{hd},{s}]"));
+    let k_kv = p.next_var("kkv");
+    p.emit_reshape(&k_kv, &[1, nkv, hd, s], &kv_rsh, &k_flat);
+
+    let k_h = if groups > 1 {
+        emit_gqa_expand(&mut p, "ke", &k_kv, nkv, nh, hd, s, groups)
+    } else {
+        let k_h = p.next_var("kh");
+        p.emit_reshape(&k_h, &[1, nh, hd, s], &q_rsh, &k_flat);
+        k_h
+    };
 
     // Softmax backward: dS = probs * (dp - sum(probs * dp, axis=-1))
-    // pd = probs * dp
     let pd = p.next_var("pd");
     p.emit_mul(&pd, &[1, nh, s, s], &probs_h, &dp_h);
 
-    // sum_pd = sum(pd, axis=3, keepdims=true) → [1, nh, S, 1]
     let ax3 = p.next_var("ax3");
     p.emit_tensor_const(&ax3, &[1], "int32", "[3]");
     let kd_true = p.next_var("kdt");
@@ -911,22 +1294,18 @@ pub fn gen_dynamic_sdpa_bwd2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let sum_pd = p.next_var("spd");
     p.emit_reduce_sum(&sum_pd, &[1, nh, s, 1], &pd, &ax3, &kd_true);
 
-    // dp_shifted = dp - sum_pd (broadcast)
     let dp_sub = p.next_var("dps");
     p.emit_sub(&dp_sub, &[1, nh, s, s], &dp_h, &sum_pd);
 
-    // ds_raw = probs * dp_shifted
     let ds_raw = p.next_var("dsr");
     p.emit_mul(&ds_raw, &[1, nh, s, s], &probs_h, &dp_sub);
 
-    // ds = ds_raw * scale
     let scale_var = p.next_var("sc");
     p.emit_scalar_const(&scale_var, "fp16", &format!("{scale}"));
     let ds = p.next_var("ds");
     p.emit_mul(&ds, &[1, nh, s, s], &ds_raw, &scale_var);
 
-    // dQ = dS @ K: [1, nh, S, S] @ [1, nh, hd, S]^T → need K transposed
-    // K is [1, nh, hd, S], transpose to [1, nh, S, hd]
+    // K expanded → transpose for dQ computation
     let kt = p.next_var("kt");
     p.emit_transpose(&kt, &[1, nh, s, hd], &perm23, &k_h);
 
@@ -934,9 +1313,9 @@ pub fn gen_dynamic_sdpa_bwd2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let dq_h = p.next_var("dqh");
     p.emit_matmul(&dq_h, &[1, nh, s, hd], &mm_false, &mm_false, &ds, &kt);
 
-    // dK = dS^T @ Q: [1, nh, S, S]^T @ [1, nh, S, hd] → [1, nh, S, hd]
-    let dk_h = p.next_var("dkh");
-    p.emit_matmul(&dk_h, &[1, nh, s, hd], &mm_true, &mm_false, &ds, &qt);
+    // dK_full = dS^T @ Q: [1, nh, S, S]^T @ [1, nh, S, hd] → [1, nh, S, hd]
+    let dk_full = p.next_var("dkfl");
+    p.emit_matmul(&dk_full, &[1, nh, s, hd], &mm_true, &mm_false, &ds, &qt);
 
     // Reshape dQ to flat: [1, nh, S, hd] → [1, nh, hd, S] → [1, Q_DIM, 1, S]
     let dq_t = p.next_var("dqt");
@@ -946,13 +1325,19 @@ pub fn gen_dynamic_sdpa_bwd2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let dq_flat = p.next_var("dqf");
     p.emit_reshape(&dq_flat, &[1, qd, 1, s], &flat_rsh_q, &dq_t);
 
-    // Reshape dK to flat: [1, nh, S, hd] → [1, nh, hd, S] → [1, KV_DIM, 1, S]
+    // dK: transpose + reduce groups for GQA
     let dk_t = p.next_var("dkt");
-    p.emit_transpose(&dk_t, &[1, nh, hd, s], &perm23, &dk_h);
-    let flat_rsh_kv = p.next_var("frskv");
-    p.emit_tensor_const(&flat_rsh_kv, &[4], "int32", &format!("[1,{kvd},1,{s}]"));
-    let dk_flat = p.next_var("dkf");
-    p.emit_reshape(&dk_flat, &[1, kvd, 1, s], &flat_rsh_kv, &dk_t);
+    p.emit_transpose(&dk_t, &[1, nh, hd, s], &perm23, &dk_full);
+
+    let dk_flat = if groups > 1 {
+        emit_gqa_reduce(&mut p, "dk", &dk_t, nkv, groups, hd, s, kvd)
+    } else {
+        let flat_rsh_kv = p.next_var("frskv");
+        p.emit_tensor_const(&flat_rsh_kv, &[4], "int32", &format!("[1,{kvd},1,{s}]"));
+        let dk_out = p.next_var("dkf");
+        p.emit_reshape(&dk_out, &[1, kvd, 1, s], &flat_rsh_kv, &dk_t);
+        dk_out
+    };
 
     // Concat output: [dQ, dK]
     let cat_ax = p.next_var("cax");
@@ -994,41 +1379,143 @@ pub fn gen_dynamic_sdpa_bwd2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
 // Kernel 9: QKV Backward (dynamic Wq^T, Wk^T, Wv^T)
 // ============================================================================
 
-/// Generate the dynamic QKV backward kernel.
+/// Generate the dynamic QKV backward Q kernel.
 ///
-/// Input: `[1, Q_DIM, 1, 3*SEQ + 3*DIM]` fp32
+/// Input: `[1, Q_DIM, 1, SEQ + DIM]` fp32
 /// - `sp[0:SEQ]` = dQ (IC=q_dim channels)
-/// - `sp[SEQ:2*SEQ]` = dK (IC=q_dim channels, MHA: kv_dim=q_dim)
-/// - `sp[2*SEQ:3*SEQ]` = dV (IC=q_dim channels, MHA: kv_dim=q_dim)
-/// - `sp[3*SEQ:3*SEQ+DIM]` = Wq^T columns (q_dim→dim, dim output cols)
-/// - `sp[3*SEQ+DIM:3*SEQ+2*DIM]` = Wk^T columns (kv_dim→dim, dim output cols)
-/// - `sp[3*SEQ+2*DIM:3*SEQ+3*DIM]` = Wv^T columns (kv_dim→dim, dim output cols)
+/// - `sp[SEQ:SEQ+DIM]` = Wq^T columns (q_dim→dim)
 ///
 /// Output: `[1, DIM, 1, SEQ]` fp32
-/// - dx = dQ@Wq^T + dK@Wk^T + dV@Wv^T
+/// - dxq = dQ @ Wq^T
 ///
-/// Note: Requires MHA (n_kv_heads == n_heads) so that all gradients share
-/// IC=q_dim and can be packed in the same IOSurface channel dimension.
-pub fn gen_dynamic_qkv_bwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
+/// This is the Q-only portion of the QKV backward. For MHA it produces
+/// the same result as the combined kernel; for GQA it is paired with
+/// `gen_dynamic_qkv_bwd_kv` which handles the different KV channel count.
+pub fn gen_dynamic_qkv_bwd_q(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let c = &dkc.cfg;
     let d = c.dim;
-    let qd = c.q_dim(); // n_heads * head_dim (IC for all gradients under MHA)
+    let qd = c.q_dim();
     let s = c.seq_len;
-    // Weight matrices Wq^T[qd,d], Wk^T[kvd,d], Wv^T[kvd,d] each have d output columns
-    let sp = 3 * s + 3 * d;
+    let sp = s + d;
 
     let mut p = MilProgram::new_fp32(qd, sp);
 
     p.emit_cast("x16", &[1, qd, 1, sp], "x", "fp16");
 
-    // dxq = dQ[s, qd] @ Wq^T[qd, d] → [s, d]
+    let dxq = emit_dyn_matmul(&mut p, "wqt", "x16", qd, d, s, 0, s);
+
+    let out32 = p.next_var("out32");
+    p.emit_cast(&out32, &[1, d, 1, s], &dxq, "fp32");
+
+    let mil_text = p.finalize(&out32);
+
+    DynamicKernelOutput {
+        mil_text,
+        static_weights: WeightDict::new(),
+        input_layout: SpatialLayout {
+            ic: qd,
+            seq_len: s,
+            total_spatial: sp,
+            oc: qd,
+            out_spatial: s,
+        },
+        output_layout: SpatialLayout {
+            ic: d,
+            seq_len: s,
+            total_spatial: s,
+            oc: d,
+            out_spatial: s,
+        },
+    }
+}
+
+/// Generate the dynamic QKV backward KV kernel.
+///
+/// Input: `[1, KV_DIM, 1, 2*SEQ + 2*DIM]` fp32
+/// - `sp[0:SEQ]` = dK (IC=kv_dim channels)
+/// - `sp[SEQ:2*SEQ]` = dV (IC=kv_dim channels)
+/// - `sp[2*SEQ:2*SEQ+DIM]` = Wk^T columns (kv_dim→dim)
+/// - `sp[2*SEQ+DIM:2*SEQ+2*DIM]` = Wv^T columns (kv_dim→dim)
+///
+/// Output: `[1, DIM, 1, SEQ]` fp32
+/// - dxkv = dK @ Wk^T + dV @ Wv^T
+///
+/// For MHA (kv_dim == q_dim), this can be combined with `qkv_bwd_q` output
+/// via simple addition. For GQA, the IC (kv_dim) differs from Q's IC (q_dim),
+/// requiring a separate kernel.
+pub fn gen_dynamic_qkv_bwd_kv(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
+    let c = &dkc.cfg;
+    let d = c.dim;
+    let kvd = c.kv_dim();
+    let s = c.seq_len;
+    let sp = 2 * s + 2 * d;
+
+    let mut p = MilProgram::new_fp32(kvd, sp);
+
+    p.emit_cast("x16", &[1, kvd, 1, sp], "x", "fp16");
+
+    // dxk = dK[s, kvd] @ Wk^T[kvd, d] → [s, d]
+    let dxk = emit_dyn_matmul(&mut p, "wkt", "x16", kvd, d, s, 0, 2 * s);
+    // dxv = dV[s, kvd] @ Wv^T[kvd, d] → [s, d]
+    let dxv = emit_dyn_matmul(&mut p, "wvt", "x16", kvd, d, s, s, 2 * s + d);
+
+    // dxkv = dxk + dxv
+    let dxkv = p.next_var("dxkv");
+    p.emit_add(&dxkv, &[1, d, 1, s], &dxk, &dxv);
+
+    let out32 = p.next_var("out32");
+    p.emit_cast(&out32, &[1, d, 1, s], &dxkv, "fp32");
+
+    let mil_text = p.finalize(&out32);
+
+    DynamicKernelOutput {
+        mil_text,
+        static_weights: WeightDict::new(),
+        input_layout: SpatialLayout {
+            ic: kvd,
+            seq_len: s,
+            total_spatial: sp,
+            oc: kvd,
+            out_spatial: s,
+        },
+        output_layout: SpatialLayout {
+            ic: d,
+            seq_len: s,
+            total_spatial: s,
+            oc: d,
+            out_spatial: s,
+        },
+    }
+}
+
+/// Generate the combined QKV backward kernel (MHA-only convenience).
+///
+/// For models where `n_kv_heads == n_heads`, this packs all three gradients
+/// into a single kernel with shared IC=q_dim. For GQA models, use the split
+/// `gen_dynamic_qkv_bwd_q` + `gen_dynamic_qkv_bwd_kv` instead.
+///
+/// Input: `[1, Q_DIM, 1, 3*SEQ + 3*DIM]` fp32
+/// Output: `[1, DIM, 1, SEQ]` fp32 = dQ@Wq^T + dK@Wk^T + dV@Wv^T
+pub fn gen_dynamic_qkv_bwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
+    let c = &dkc.cfg;
+    let d = c.dim;
+    let qd = c.q_dim();
+    let s = c.seq_len;
+    let sp = 3 * s + 3 * d;
+
+    debug_assert_eq!(
+        c.n_kv_heads, c.n_heads,
+        "Combined QKV backward requires MHA. Use split qkv_bwd_q + qkv_bwd_kv for GQA."
+    );
+
+    let mut p = MilProgram::new_fp32(qd, sp);
+
+    p.emit_cast("x16", &[1, qd, 1, sp], "x", "fp16");
+
     let dxq = emit_dyn_matmul(&mut p, "wqt", "x16", qd, d, s, 0, 3 * s);
-    // dxk = dK[s, qd] @ Wk^T[qd, d] → [s, d]  (MHA: kv_dim = q_dim)
     let dxk = emit_dyn_matmul(&mut p, "wkt", "x16", qd, d, s, s, 3 * s + d);
-    // dxv = dV[s, qd] @ Wv^T[qd, d] → [s, d]  (MHA: kv_dim = q_dim)
     let dxv = emit_dyn_matmul(&mut p, "wvt", "x16", qd, d, s, 2 * s, 3 * s + 2 * d);
 
-    // dx = dxq + dxk + dxv
     let dx12 = p.next_var("dx12");
     p.emit_add(&dx12, &[1, d, 1, s], &dxq, &dxk);
     let dx = p.next_var("dx");
@@ -1405,5 +1892,225 @@ mod tests {
         assert_eq!(out.input_layout.total_spatial, 3 * s + 3 * d);
         // Output IC = dim (64)
         assert_eq!(out.output_layout.ic, d);
+    }
+
+    // ================================================================
+    // GQA tests (n_kv_heads != n_heads)
+    // ================================================================
+
+    /// GQA config: n_heads=4, n_kv_heads=2 (groups=2), head_dim=16.
+    /// q_dim = 4*16 = 64, kv_dim = 2*16 = 32.
+    fn gqa_config() -> DynamicKernelConfig {
+        DynamicKernelConfig::new(TransformerKernelConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_heads: 4,
+            n_kv_heads: 2, // GQA: 2 KV heads, 4 Q heads
+            head_dim: 16,
+            seq_len: 32,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
+        })
+    }
+
+    #[test]
+    fn test_gqa_config_invariants() {
+        let dkc = gqa_config();
+        let c = &dkc.cfg;
+        assert_eq!(c.q_dim(), 64);  // 4 * 16
+        assert_eq!(c.kv_dim(), 32); // 2 * 16
+        assert_eq!(c.n_groups(), 2);
+        assert_ne!(c.q_dim(), c.kv_dim()); // Key: GQA means q_dim != kv_dim
+    }
+
+    #[test]
+    fn test_gqa_sdpa_fwd() {
+        let dkc = gqa_config();
+        let qd = dkc.cfg.q_dim();  // 64
+        let kvd = dkc.cfg.kv_dim(); // 32
+        let d = dkc.cfg.dim;        // 64
+        let s = dkc.cfg.seq_len;    // 32
+
+        let out = gen_dynamic_sdpa_fwd(&dkc);
+        assert!(out.mil_text.contains("program(1.3)"));
+        // Should have concat for GQA K/V expansion in forward
+        assert!(out.mil_text.contains("concat("));
+        // IC is dim
+        assert_eq!(out.input_layout.ic, d);
+        // Spatial: s + 2*qd + 2*kvd = 32 + 128 + 64 = 224
+        assert_eq!(out.input_layout.total_spatial, s + 2 * qd + 2 * kvd);
+        // Output channels: 2*d + 2*qd + 2*kvd = 128 + 128 + 64 = 320
+        assert_eq!(out.output_layout.ic, 2 * d + 2 * qd + 2 * kvd);
+    }
+
+    #[test]
+    fn test_gqa_sdpa_bwd1() {
+        let dkc = gqa_config();
+        let qd = dkc.cfg.q_dim();  // 64
+        let kvd = dkc.cfg.kv_dim(); // 32
+        let score_ch = dkc.cfg.n_heads * dkc.cfg.seq_len; // 4 * 32 = 128
+
+        let out = gen_dynamic_sdpa_bwd1(&dkc);
+        // Should have concat for GQA K/V expansion
+        assert!(out.mil_text.contains("concat("));
+        // Should have reduce_sum for dV group reduction
+        assert!(out.mil_text.contains("reduce_sum("));
+        // IC = 2*qd + 2*kvd = 2*64 + 2*32 = 192
+        assert_eq!(out.input_layout.ic, 2 * qd + 2 * kvd);
+        // Output IC = kvd + 2*score_ch = 32 + 256 = 288
+        assert_eq!(out.output_layout.ic, kvd + 2 * score_ch);
+    }
+
+    #[test]
+    fn test_gqa_sdpa_bwd2() {
+        let dkc = gqa_config();
+        let qd = dkc.cfg.q_dim();  // 64
+        let kvd = dkc.cfg.kv_dim(); // 32
+        let score_ch = dkc.cfg.n_heads * dkc.cfg.seq_len; // 4 * 32 = 128
+
+        let out = gen_dynamic_sdpa_bwd2(&dkc);
+        // Should have concat for GQA K expansion
+        assert!(out.mil_text.contains("concat("));
+        // Should have reduce_sum for dK group reduction
+        assert!(out.mil_text.contains("reduce_sum("));
+        // Input IC = 2*score_ch + qd + kvd = 256 + 64 + 32 = 352
+        assert_eq!(out.input_layout.ic, 2 * score_ch + qd + kvd);
+        // Output IC = qd + kvd = 64 + 32 = 96
+        assert_eq!(out.output_layout.ic, qd + kvd);
+    }
+
+    #[test]
+    fn test_gqa_qkv_bwd_q() {
+        let dkc = gqa_config();
+        let qd = dkc.cfg.q_dim(); // 64
+        let d = dkc.cfg.dim;      // 64
+        let s = dkc.cfg.seq_len;  // 32
+
+        let out = gen_dynamic_qkv_bwd_q(&dkc);
+        assert!(out.mil_text.contains("matmul("));
+        // Input IC = q_dim (64)
+        assert_eq!(out.input_layout.ic, qd);
+        // Spatial: s + d = 32 + 64 = 96
+        assert_eq!(out.input_layout.total_spatial, s + d);
+        // Output IC = dim (64)
+        assert_eq!(out.output_layout.ic, d);
+    }
+
+    #[test]
+    fn test_gqa_qkv_bwd_kv() {
+        let dkc = gqa_config();
+        let kvd = dkc.cfg.kv_dim(); // 32
+        let d = dkc.cfg.dim;        // 64
+        let s = dkc.cfg.seq_len;    // 32
+
+        let out = gen_dynamic_qkv_bwd_kv(&dkc);
+        assert!(out.mil_text.contains("add("));
+        // Input IC = kv_dim (32)
+        assert_eq!(out.input_layout.ic, kvd);
+        // Spatial: 2*s + 2*d = 64 + 128 = 192
+        assert_eq!(out.input_layout.total_spatial, 2 * s + 2 * d);
+        // Output IC = dim (64)
+        assert_eq!(out.output_layout.ic, d);
+    }
+
+    #[test]
+    fn test_gqa_split_kernels_valid_mil() {
+        let dkc = gqa_config();
+
+        // Both split kernels should produce valid MIL programs
+        let q_out = gen_dynamic_qkv_bwd_q(&dkc);
+        assert!(q_out.mil_text.contains("program(1.3)"));
+        assert!(q_out.mil_text.contains("cast(dtype=string(\"fp16\")"));
+        assert!(q_out.mil_text.contains("cast(dtype=string(\"fp32\")"));
+
+        let kv_out = gen_dynamic_qkv_bwd_kv(&dkc);
+        assert!(kv_out.mil_text.contains("program(1.3)"));
+        assert!(kv_out.mil_text.contains("cast(dtype=string(\"fp16\")"));
+        assert!(kv_out.mil_text.contains("cast(dtype=string(\"fp32\")"));
+
+        // Both produce the same output dim
+        assert_eq!(q_out.output_layout.ic, kv_out.output_layout.ic);
+        assert_eq!(q_out.output_layout.ic, dkc.cfg.dim);
+    }
+
+    #[test]
+    #[should_panic(expected = "Combined QKV backward requires MHA")]
+    fn test_gqa_combined_qkv_bwd_panics() {
+        let dkc = gqa_config();
+        // Combined kernel should panic for GQA configs (debug_assert)
+        let _ = gen_dynamic_qkv_bwd(&dkc);
+    }
+
+    // ── Tests for decomposed single-projection kernels ──
+
+    #[test]
+    fn test_dynamic_projection_basic() {
+        let out = gen_dynamic_projection(64, 128, 16);
+        assert!(out.mil_text.contains("program(1.3)"));
+        assert!(out.mil_text.contains("matmul("));
+        // fp32→fp16→matmul→fp32
+        assert!(out.mil_text.contains("cast(dtype=string(\"fp16\")"));
+        assert!(out.mil_text.contains("cast(dtype=string(\"fp32\")"));
+        // Input: [1, IC=64, 1, S+OC=16+128=144]
+        assert_eq!(out.input_layout.ic, 64);
+        assert_eq!(out.input_layout.total_spatial, 16 + 128);
+        // Output: [1, OC=128, 1, S=16]
+        assert_eq!(out.output_layout.ic, 128);
+        assert_eq!(out.output_layout.out_spatial, 16);
+    }
+
+    #[test]
+    fn test_dynamic_projection_qwen3_shapes() {
+        // Qwen3-0.6B: dim=1024, q_dim=2048, kv_dim=1024, hidden=3072
+        let shapes = [(1024, 2048), (1024, 1024), (2048, 1024), (1024, 3072), (3072, 1024)];
+        let seq = 64;
+        for (ic, oc) in shapes {
+            let out = gen_dynamic_projection(ic, oc, seq);
+            assert!(out.mil_text.contains("program(1.3)"));
+            assert_eq!(out.input_layout.ic, ic);
+            assert_eq!(out.input_layout.total_spatial, seq + oc);
+            assert_eq!(out.output_layout.ic, oc);
+            assert_eq!(out.output_layout.out_spatial, seq);
+            assert!(out.static_weights.entries.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_dynamic_sdpa_attn_mha() {
+        let dkc = test_config();
+        let s = dkc.cfg.seq_len; // 16
+        let qd = dkc.cfg.q_dim(); // 64 (MHA: n_heads * head_dim = 4 * 16)
+        let kvd = dkc.cfg.kv_dim(); // 64
+
+        let out = gen_dynamic_sdpa_attn(&dkc);
+        assert!(out.mil_text.contains("program(1.3)"));
+        assert!(out.mil_text.contains("matmul("));
+        assert!(out.mil_text.contains("softmax("));
+        // Input: [1, QD + 2*KVD, 1, S]
+        assert_eq!(out.input_layout.ic, qd + 2 * kvd);
+        assert_eq!(out.input_layout.total_spatial, s);
+        // Output: [1, QD, 1, S]
+        assert_eq!(out.output_layout.ic, qd);
+        assert_eq!(out.output_layout.out_spatial, s);
+        // Should have causal mask static weight
+        assert!(!out.static_weights.entries.is_empty());
+    }
+
+    #[test]
+    fn test_dynamic_sdpa_attn_gqa() {
+        let dkc = gqa_config();
+        let qd = dkc.cfg.q_dim(); // 64
+        let kvd = dkc.cfg.kv_dim(); // 32
+        let s = dkc.cfg.seq_len; // 32
+
+        let out = gen_dynamic_sdpa_attn(&dkc);
+        assert!(out.mil_text.contains("program(1.3)"));
+        assert!(out.mil_text.contains("concat(")); // GQA expansion
+        // Input: [1, QD + 2*KVD, 1, S] = [1, 128, 1, 32]
+        assert_eq!(out.input_layout.ic, qd + 2 * kvd);
+        assert_eq!(out.input_layout.total_spatial, s);
+        // Output: [1, QD, 1, S] = [1, 64, 1, 32]
+        assert_eq!(out.output_layout.ic, qd);
+        assert_eq!(out.output_layout.out_spatial, s);
     }
 }

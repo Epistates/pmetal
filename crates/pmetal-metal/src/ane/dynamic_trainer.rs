@@ -17,6 +17,7 @@
 //! └────────────────┘
 //! ```
 
+use std::collections::HashMap;
 use std::sync::mpsc;
 use std::thread;
 
@@ -42,6 +43,11 @@ pub struct DynamicAneTrainerConfig {
     pub hidden_dim: usize,
     /// Number of attention heads.
     pub n_heads: usize,
+    /// Number of key/value heads (GQA/MQA). Defaults to `n_heads` (MHA).
+    pub n_kv_heads: usize,
+    /// Per-head dimension. If `None`, computed as `dim / n_heads`.
+    /// Models like Qwen3 use `head_dim=128` even when `dim/n_heads=64`.
+    pub head_dim: Option<usize>,
     /// Number of transformer layers.
     pub n_layers: usize,
     /// Vocabulary size.
@@ -72,6 +78,8 @@ impl Default for DynamicAneTrainerConfig {
             dim: 768,
             hidden_dim: 2048,
             n_heads: 12,
+            n_kv_heads: 12,
+            head_dim: None,
             n_layers: 12,
             vocab_size: 32000,
             seq_len: 256,
@@ -84,6 +92,113 @@ impl Default for DynamicAneTrainerConfig {
             warmup_steps: 100,
             min_lr_ratio: 0.1,
         }
+    }
+}
+
+/// Vocabulary compaction map for classifier speedup.
+///
+/// Reduces full vocab (e.g. 32K) to only tokens actually seen in training data
+/// (e.g. ~9K), yielding ~3.5x speedup on the classifier matmul + cross-entropy.
+/// Built once at training start from all batch tokens.
+pub struct VocabMap {
+    /// Number of active (compacted) tokens.
+    pub compact_vocab: usize,
+    /// Maps full vocab id → compact id (-1 if token unused).
+    full_to_compact: Vec<i32>,
+    /// Maps compact id → full vocab id.
+    compact_to_full: Vec<usize>,
+}
+
+impl VocabMap {
+    /// Build a VocabMap by scanning all tokens in the training batches.
+    pub fn from_batches(batches: &[Vec<(Vec<u16>, Vec<u16>)>], full_vocab: usize) -> Self {
+        let mut used = vec![false; full_vocab];
+        for batch in batches {
+            for (input, target) in batch {
+                for &tok in input.iter().chain(target.iter()) {
+                    let idx = tok as usize;
+                    if idx < full_vocab {
+                        used[idx] = true;
+                    }
+                }
+            }
+        }
+        let mut full_to_compact = vec![-1i32; full_vocab];
+        let mut compact_to_full = Vec::new();
+        for (i, &u) in used.iter().enumerate() {
+            if u {
+                full_to_compact[i] = compact_to_full.len() as i32;
+                compact_to_full.push(i);
+            }
+        }
+        let compact_vocab = compact_to_full.len();
+        Self {
+            compact_vocab,
+            full_to_compact,
+            compact_to_full,
+        }
+    }
+
+    /// Remap a slice of full-vocab token ids to compact ids.
+    pub fn remap_tokens(&self, tokens: &[u16]) -> Vec<u16> {
+        tokens
+            .iter()
+            .map(|&t| {
+                let c = self.full_to_compact[t as usize];
+                debug_assert!(c >= 0, "Token {} not in VocabMap", t);
+                c as u16
+            })
+            .collect()
+    }
+
+}
+
+impl DynamicAneTrainerConfig {
+    /// Check if a model architecture is compatible with ANE training/inference.
+    ///
+    /// Rejects hybrid/recurrent architectures (GDN, Mamba, RG-LRU) and MoE models
+    /// that cannot be mapped to ANE's transformer-only kernel set.
+    pub fn is_ane_compatible(config_json: &serde_json::Value) -> std::result::Result<(), String> {
+        let model_type = config_json
+            .get("model_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        // Reject known incompatible architectures
+        const INCOMPATIBLE: &[&str] = &[
+            "qwen3_5",
+            "qwen3_5_text",
+            "qwen3_next",    // GDN hybrid
+            "nemotron_h",    // Mamba hybrid
+            "recurrentgemma", // RG-LRU hybrid
+            "jamba",         // Mamba hybrid
+        ];
+        if INCOMPATIBLE.contains(&model_type) {
+            return Err(format!(
+                "Model type '{}' uses hybrid/recurrent layers not supported by ANE. Use GPU training.",
+                model_type
+            ));
+        }
+
+        // Reject MoE (no expert routing on ANE)
+        if config_json
+            .get("num_experts")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            > 0
+        {
+            return Err("MoE models with routed experts are not supported by ANE training.".into());
+        }
+        if config_json
+            .get("num_local_experts")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            > 0
+        {
+            return Err("MoE models with routed experts are not supported by ANE training.".into());
+        }
+
+        Ok(())
     }
 }
 
@@ -201,46 +316,40 @@ pub struct StepTimings {
     pub total_us: u64,
 }
 
-/// The 9 compiled ANE kernels (shared across all layers).
+/// Compiled ANE kernels (shared across all layers).
+///
+/// Uses decomposed single-projection kernels indexed by `(IC, OC)` shape,
+/// plus attention-only and backward kernels. Each projection is a simple
+/// single-matmul kernel that compiles reliably at any model scale.
 struct DynamicKernels {
-    sdpa_fwd: AneModel,
-    ffn_w13: AneModel,
-    ffn_w2: AneModel,
-    ffn_bwd_w2t: AneModel,
-    ffn_bwd_w13t: AneModel,
-    wo_bwd: AneModel,
+    /// Projection kernels indexed by (input_channels, output_channels).
+    /// Shared across forward and backward (e.g. Q fwd and Wo^T bwd use
+    /// the same (dim, q_dim) kernel with different weights).
+    projections: HashMap<(usize, usize), AneModel>,
+    /// Attention-only kernel (Q, K, V → attn_out).
+    sdpa_attn: AneModel,
+    /// SDPA backward part 1 (dV, probs, dp).
     sdpa_bwd1: AneModel,
+    /// SDPA backward part 2 (dQ, dK).
     sdpa_bwd2: AneModel,
-    qkv_bwd: AneModel,
 }
 
-/// IOSurface pool for the dynamic pipeline.
-///
-/// Each kernel has dedicated input/output surfaces sized for its dimensions.
+/// IOSurface pool for the decomposed dynamic pipeline.
 struct DynIoPool {
-    // Forward surfaces (fp32)
-    sdpa_fwd_in: IoSurface,
-    sdpa_fwd_out: IoSurface,
-    ffn_w13_in: IoSurface,
-    ffn_w13_out: IoSurface,
-    ffn_w2_in: IoSurface,
-    ffn_w2_out: IoSurface,
-    // Backward surfaces (fp32 for dynamic, fp16 for bwd1/bwd2)
-    ffn_bwd_w2t_in: IoSurface,
-    ffn_bwd_w2t_out: IoSurface,
-    ffn_bwd_w13t_in: IoSurface,
-    ffn_bwd_w13t_out: IoSurface,
-    wo_bwd_in: IoSurface,
-    wo_bwd_out: IoSurface,
+    /// Projection IO surfaces indexed by (IC, OC).
+    proj_inputs: HashMap<(usize, usize), IoSurface>,
+    proj_outputs: HashMap<(usize, usize), IoSurface>,
+    /// Attention IO surfaces (fp32).
+    sdpa_attn_in: IoSurface,
+    sdpa_attn_out: IoSurface,
+    /// SDPA backward IO surfaces (fp16).
     sdpa_bwd1_in: IoSurface,
     sdpa_bwd1_out: IoSurface,
     sdpa_bwd2_in: IoSurface,
     sdpa_bwd2_out: IoSurface,
-    qkv_bwd_in: IoSurface,
-    qkv_bwd_out: IoSurface,
 }
 
-/// Dynamic weight ANE trainer. Compiles 9 kernels once, then trains forever.
+/// Dynamic weight ANE trainer. Compiles 9+ kernels once, then trains forever.
 pub struct DynamicAneTrainer {
     config: DynamicAneTrainerConfig,
     kernel_config: TransformerKernelConfig,
@@ -264,6 +373,15 @@ pub struct DynamicAneTrainer {
     _dw_thread: thread::JoinHandle<()>,
     /// Latest step timings.
     pub last_timings: StepTimings,
+    // --- Vocab compaction state ---
+    /// Optional vocab compaction map (built from training data).
+    vocab_map: Option<VocabMap>,
+    /// Compact embedding matrix `[compact_vocab * dim]`.
+    compact_embed: Vec<f32>,
+    /// Compact embedding gradient accumulator.
+    compact_embed_grad: Vec<f32>,
+    /// Compact embedding Adam state.
+    compact_embed_adam: AdamParam,
 }
 
 impl DynamicAneTrainer {
@@ -274,13 +392,19 @@ impl DynamicAneTrainer {
         let s = config.seq_len;
         let nl = config.n_layers;
         let v = config.vocab_size;
-        let hd = d / config.n_heads;
+        let hd = config.head_dim.unwrap_or(d / config.n_heads);
+
+        let nkv = if config.n_kv_heads > 0 {
+            config.n_kv_heads
+        } else {
+            config.n_heads
+        };
 
         let kernel_config = TransformerKernelConfig {
             dim: d,
             hidden_dim: h,
             n_heads: config.n_heads,
-            n_kv_heads: config.n_heads,
+            n_kv_heads: nkv,
             head_dim: hd,
             seq_len: s,
             rope_theta: 1_000_000.0,
@@ -292,21 +416,24 @@ impl DynamicAneTrainer {
         let mut layer_grads = Vec::with_capacity(nl);
         let mut layer_adam = Vec::with_capacity(nl);
 
+        let qd = kernel_config.q_dim();   // n_heads * head_dim
+        let kvd = kernel_config.kv_dim(); // n_kv_heads * head_dim
+
         for _ in 0..nl {
             layer_weights.push(LayerWeights {
-                wq: vec![0.0; d * d],
-                wk: vec![0.0; d * d],
-                wv: vec![0.0; d * d],
-                wo: vec![0.0; d * d],
+                wq: vec![0.0; qd * d],   // [q_dim, dim]
+                wk: vec![0.0; kvd * d],  // [kv_dim, dim]
+                wv: vec![0.0; kvd * d],  // [kv_dim, dim]
+                wo: vec![0.0; d * qd],   // [dim, q_dim]
                 w1: vec![0.0; h * d],
                 w2: vec![0.0; d * h],
                 w3: vec![0.0; h * d],
                 rms_att: vec![0.0; d],
                 rms_ffn: vec![0.0; d],
-                wq_t: vec![0.0; d * d],
-                wk_t: vec![0.0; d * d],
-                wv_t: vec![0.0; d * d],
-                wo_t: vec![0.0; d * d],
+                wq_t: vec![0.0; d * qd],  // [dim, q_dim]
+                wk_t: vec![0.0; d * kvd], // [dim, kv_dim]
+                wv_t: vec![0.0; d * kvd], // [dim, kv_dim]
+                wo_t: vec![0.0; qd * d],  // [q_dim, dim]
                 w1_t: vec![0.0; h * d],
                 w2_t: vec![0.0; d * h],
                 w3_t: vec![0.0; h * d],
@@ -315,10 +442,10 @@ impl DynamicAneTrainer {
             layer_acts.push(LayerActivations {
                 layer_in: vec![0.0; d * s],
                 xnorm: vec![0.0; d * s],
-                q: vec![0.0; d * s],
-                k: vec![0.0; d * s],
-                v: vec![0.0; d * s],
-                attn_out: vec![0.0; d * s],
+                q: vec![0.0; qd * s],   // [q_dim, seq]
+                k: vec![0.0; kvd * s],  // [kv_dim, seq]
+                v: vec![0.0; kvd * s],  // [kv_dim, seq]
+                attn_out: vec![0.0; qd * s], // [q_dim, seq] (before Wo)
                 o_out: vec![0.0; d * s],
                 x2: vec![0.0; d * s],
                 x2norm: vec![0.0; d * s],
@@ -329,10 +456,10 @@ impl DynamicAneTrainer {
             });
 
             layer_grads.push(LayerGradients {
-                wq: vec![0.0; d * d],
-                wk: vec![0.0; d * d],
-                wv: vec![0.0; d * d],
-                wo: vec![0.0; d * d],
+                wq: vec![0.0; qd * d],
+                wk: vec![0.0; kvd * d],
+                wv: vec![0.0; kvd * d],
+                wo: vec![0.0; d * qd],
                 w1: vec![0.0; h * d],
                 w2: vec![0.0; d * h],
                 w3: vec![0.0; h * d],
@@ -341,10 +468,10 @@ impl DynamicAneTrainer {
             });
 
             layer_adam.push(LayerAdamState {
-                wq: AdamParam::new(d * d),
-                wk: AdamParam::new(d * d),
-                wv: AdamParam::new(d * d),
-                wo: AdamParam::new(d * d),
+                wq: AdamParam::new(qd * d),
+                wk: AdamParam::new(kvd * d),
+                wv: AdamParam::new(kvd * d),
+                wo: AdamParam::new(d * qd),
                 w1: AdamParam::new(h * d),
                 w2: AdamParam::new(d * h),
                 w3: AdamParam::new(h * d),
@@ -388,6 +515,10 @@ impl DynamicAneTrainer {
             dw_sender,
             _dw_thread: dw_thread,
             last_timings: StepTimings::default(),
+            vocab_map: None,
+            compact_embed: Vec::new(),
+            compact_embed_grad: Vec::new(),
+            compact_embed_adam: AdamParam::new(0),
         }
     }
 
@@ -401,25 +532,76 @@ impl DynamicAneTrainer {
         self.adam_t
     }
 
-    /// Number of ANE compilations performed (should be 9 after compile_kernels).
+    /// Number of ANE compilations performed (should be 9+ after compile_kernels).
     pub fn compile_count(&self) -> usize {
         self.compile_count
     }
 
-    /// Compile all 9 dynamic kernels (called once at startup).
+    /// Install a VocabMap for compact classifier/embedding operations.
     ///
-    /// After this call, no further compilations are needed.
+    /// Must be called after `load_weights_*` and before `compile_kernels()`.
+    /// Builds the compact embedding matrix from the full embedding table.
+    pub fn install_vocab_map(&mut self, vocab_map: VocabMap) {
+        let d = self.config.dim;
+        let cv = vocab_map.compact_vocab;
+
+        // Build compact embedding from full
+        let mut compact = vec![0.0f32; cv * d];
+        for c in 0..cv {
+            let full_row = vocab_map.compact_to_full[c] * d;
+            let compact_row = c * d;
+            compact[compact_row..compact_row + d]
+                .copy_from_slice(&self.embed_weights[full_row..full_row + d]);
+        }
+
+        info!(
+            full_vocab = self.config.vocab_size,
+            compact_vocab = cv,
+            ratio = format!("{:.1}x", self.config.vocab_size as f64 / cv as f64),
+            "Vocab compaction installed"
+        );
+
+        self.compact_embed = compact;
+        self.compact_embed_grad = vec![0.0f32; cv * d];
+        self.compact_embed_adam = AdamParam::new(cv * d);
+        self.vocab_map = Some(vocab_map);
+    }
+
+    /// Whether vocab compaction is active.
+    pub fn has_vocab_compaction(&self) -> bool {
+        self.vocab_map.is_some()
+    }
+
+    /// Scatter compact embedding weights back to the full embedding table.
+    fn scatter_compact_to_full(&mut self) {
+        if let Some(ref vm) = self.vocab_map {
+            let d = self.config.dim;
+            for c in 0..vm.compact_vocab {
+                let full_row = vm.compact_to_full[c] * d;
+                let compact_row = c * d;
+                self.embed_weights[full_row..full_row + d]
+                    .copy_from_slice(&self.compact_embed[compact_row..compact_row + d]);
+            }
+        }
+    }
+
+    /// Compile all dynamic ANE kernels (called once at startup).
+    ///
+    /// Decomposed pipeline: one kernel per unique projection shape (IC, OC),
+    /// plus attention-only and backward kernels. Each projection kernel is a
+    /// simple single-matmul that compiles reliably at any model dimension.
     pub fn compile_kernels(&mut self) -> Result<()> {
         let rt = AneRuntime::global()?;
         let dkc = DynamicKernelConfig::new(self.kernel_config.clone());
         let d = self.kernel_config.dim;
         let h = self.kernel_config.hidden_dim;
         let s = self.kernel_config.seq_len;
+        let qd = self.kernel_config.q_dim();
+        let kvd = self.kernel_config.kv_dim();
         let score_ch = self.kernel_config.score_ch();
+        let is_gqa = self.kernel_config.n_kv_heads != self.kernel_config.n_heads;
 
-        info!("Compiling 9 dynamic ANE kernels (one-time)...");
-
-        // Generate and compile each kernel
+        // Compile helper with debug MIL dump on failure
         let compile =
             |out: &DynamicKernelOutput, rt: &AneRuntime, name: &str| -> Result<AneModel> {
                 let wd = if out.static_weights.entries.is_empty() {
@@ -427,34 +609,66 @@ impl DynamicAneTrainer {
                 } else {
                     Some(&out.static_weights)
                 };
-                debug!("Compiling dynamic kernel: {name}");
+                debug!(name, ic = out.input_layout.ic, sp = out.input_layout.total_spatial,
+                    "Compiling dynamic kernel");
+                if let Err(e) = rt.compile(out.mil_text.as_bytes(), wd) {
+                    tracing::error!("Failed to compile {name}: {e}");
+                    let mil_path = format!("/tmp/ane_debug_{name}.mil");
+                    if let Err(we) = std::fs::write(&mil_path, &out.mil_text) {
+                        tracing::error!("Could not write debug MIL to {mil_path}: {we}");
+                    } else {
+                        tracing::error!("Full MIL written to {mil_path} ({} bytes)", out.mil_text.len());
+                    }
+                    return Err(e);
+                }
                 rt.compile(out.mil_text.as_bytes(), wd)
             };
 
-        let k1 = dynamic_kernel::gen_dynamic_sdpa_fwd(&dkc);
-        let sdpa_fwd = compile(&k1, rt, "sdpa_fwd")?;
+        // 1. Determine unique projection shapes needed
+        let mut proj_shapes: Vec<(usize, usize)> = vec![
+            (d, qd),   // Q fwd, Wo^T bwd
+            (d, kvd),  // K fwd, V fwd
+            (qd, d),   // Wo fwd, Wq^T bwd
+            (d, h),    // W1 fwd, W3 fwd, W2^T bwd
+            (h, d),    // W2 fwd, W1^T bwd, W3^T bwd
+            (kvd, d),  // Wk^T bwd, Wv^T bwd
+        ];
+        proj_shapes.sort();
+        proj_shapes.dedup();
+
+        let kernel_count = proj_shapes.len() + 3; // projections + attn + bwd1 + bwd2
+        info!(
+            kernels = kernel_count,
+            projection_shapes = proj_shapes.len(),
+            gqa = is_gqa,
+            n_heads = self.kernel_config.n_heads,
+            n_kv_heads = self.kernel_config.n_kv_heads,
+            "Compiling decomposed ANE kernels (one-time)..."
+        );
+
+        // 2. Compile one projection kernel per unique (IC, OC) shape
+        let mut projections = HashMap::new();
+        let mut proj_inputs = HashMap::new();
+        let mut proj_outputs = HashMap::new();
+
+        for &(ic, oc) in &proj_shapes {
+            let out = dynamic_kernel::gen_dynamic_projection(ic, oc, s);
+            let name = format!("proj_{ic}x{oc}");
+            let io_mb = ic as f64 * (s + oc) as f64 * 4.0 / 1_048_576.0;
+            debug!(ic, oc, io_mb = format!("{io_mb:.1}"), "Projection kernel");
+            let model = compile(&out, rt, &name)?;
+            projections.insert((ic, oc), model);
+            proj_inputs.insert((ic, oc), IoSurface::for_tensor_f32(ic, s + oc)?);
+            proj_outputs.insert((ic, oc), IoSurface::for_tensor_f32(oc, s)?);
+            self.compile_count += 1;
+        }
+
+        // 3. Compile attention-only kernel
+        let attn_out = dynamic_kernel::gen_dynamic_sdpa_attn(&dkc);
+        let sdpa_attn = compile(&attn_out, rt, "sdpa_attn")?;
         self.compile_count += 1;
 
-        let k2 = dynamic_kernel::gen_dynamic_ffn_w13(&dkc);
-        let ffn_w13 = compile(&k2, rt, "ffn_w13")?;
-        self.compile_count += 1;
-
-        let k3 = dynamic_kernel::gen_dynamic_ffn_w2(&dkc);
-        let ffn_w2 = compile(&k3, rt, "ffn_w2")?;
-        self.compile_count += 1;
-
-        let k4 = dynamic_kernel::gen_dynamic_ffn_bwd_w2t(&dkc);
-        let ffn_bwd_w2t = compile(&k4, rt, "ffn_bwd_w2t")?;
-        self.compile_count += 1;
-
-        let k5 = dynamic_kernel::gen_dynamic_ffn_bwd_w13t(&dkc);
-        let ffn_bwd_w13t = compile(&k5, rt, "ffn_bwd_w13t")?;
-        self.compile_count += 1;
-
-        let k6 = dynamic_kernel::gen_dynamic_wo_bwd(&dkc);
-        let wo_bwd = compile(&k6, rt, "wo_bwd")?;
-        self.compile_count += 1;
-
+        // 4. Compile SDPA backward kernels (unchanged — no dynamic weights)
         let k7 = dynamic_kernel::gen_dynamic_sdpa_bwd1(&dkc);
         let sdpa_bwd1 = compile(&k7, rt, "sdpa_bwd1")?;
         self.compile_count += 1;
@@ -463,51 +677,34 @@ impl DynamicAneTrainer {
         let sdpa_bwd2 = compile(&k8, rt, "sdpa_bwd2")?;
         self.compile_count += 1;
 
-        let k9 = dynamic_kernel::gen_dynamic_qkv_bwd(&dkc);
-        let qkv_bwd = compile(&k9, rt, "qkv_bwd")?;
-        self.compile_count += 1;
-
         info!(
-            "All 9 dynamic kernels compiled. Total compiles: {}",
-            self.compile_count
+            "All {} dynamic kernels compiled. Total compiles: {}",
+            kernel_count, self.compile_count
         );
 
-        // Allocate IOSurface pool
+        // 5. Allocate IOSurface pool
+        let attn_in_ch = qd + 2 * kvd;
+        let bwd1_in_ch = 2 * qd + 2 * kvd;
+        let bwd1_out_ch = kvd + 2 * score_ch;
+        let bwd2_in_ch = 2 * score_ch + qd + kvd;
+        let bwd2_out_ch = qd + kvd;
+
         let io_pool = DynIoPool {
-            // Forward (fp32 surfaces)
-            sdpa_fwd_in: IoSurface::for_tensor_f32(d, s + 4 * d)?,
-            sdpa_fwd_out: IoSurface::for_tensor_f32(6 * d, s)?,
-            ffn_w13_in: IoSurface::for_tensor_f32(d, s + 2 * h)?,
-            ffn_w13_out: IoSurface::for_tensor_f32(3 * h, s)?,
-            ffn_w2_in: IoSurface::for_tensor_f32(h, s + d)?,
-            ffn_w2_out: IoSurface::for_tensor_f32(d, s)?,
-            // Backward (fp32 for dynamic weight kernels)
-            ffn_bwd_w2t_in: IoSurface::for_tensor_f32(d, s + h)?,
-            ffn_bwd_w2t_out: IoSurface::for_tensor_f32(h, s)?,
-            ffn_bwd_w13t_in: IoSurface::for_tensor_f32(h, 2 * s + 2 * d)?,
-            ffn_bwd_w13t_out: IoSurface::for_tensor_f32(d, s)?,
-            wo_bwd_in: IoSurface::for_tensor_f32(d, s + d)?,
-            wo_bwd_out: IoSurface::for_tensor_f32(d, s)?,
-            // Backward (fp16 for bwd1/bwd2 — no dynamic weights)
-            sdpa_bwd1_in: IoSurface::for_tensor(4 * d, s)?,
-            sdpa_bwd1_out: IoSurface::for_tensor(d + 2 * score_ch, s)?,
-            sdpa_bwd2_in: IoSurface::for_tensor(2 * score_ch + 2 * d, s)?,
-            sdpa_bwd2_out: IoSurface::for_tensor(2 * d, s)?,
-            // QKV backward (fp32)
-            qkv_bwd_in: IoSurface::for_tensor_f32(d, 3 * s + 3 * d)?,
-            qkv_bwd_out: IoSurface::for_tensor_f32(d, s)?,
+            proj_inputs,
+            proj_outputs,
+            sdpa_attn_in: IoSurface::for_tensor_f32(attn_in_ch, s)?,
+            sdpa_attn_out: IoSurface::for_tensor_f32(qd, s)?,
+            sdpa_bwd1_in: IoSurface::for_tensor(bwd1_in_ch, s)?,
+            sdpa_bwd1_out: IoSurface::for_tensor(bwd1_out_ch, s)?,
+            sdpa_bwd2_in: IoSurface::for_tensor(bwd2_in_ch, s)?,
+            sdpa_bwd2_out: IoSurface::for_tensor(bwd2_out_ch, s)?,
         };
 
         self.kernels = Some(DynamicKernels {
-            sdpa_fwd,
-            ffn_w13,
-            ffn_w2,
-            ffn_bwd_w2t,
-            ffn_bwd_w13t,
-            wo_bwd,
+            projections,
+            sdpa_attn,
             sdpa_bwd1,
             sdpa_bwd2,
-            qkv_bwd,
         });
         self.io_pool = Some(io_pool);
 
@@ -518,12 +715,14 @@ impl DynamicAneTrainer {
     fn refresh_transposed_weights(&mut self) {
         let d = self.config.dim;
         let h = self.config.hidden_dim;
+        let qd = self.kernel_config.q_dim();
+        let kvd = self.kernel_config.kv_dim();
 
         for lw in &mut self.layer_weights {
-            transpose_weight(&lw.wq, &mut lw.wq_t, d, d);
-            transpose_weight(&lw.wk, &mut lw.wk_t, d, d);
-            transpose_weight(&lw.wv, &mut lw.wv_t, d, d);
-            transpose_weight(&lw.wo, &mut lw.wo_t, d, d);
+            transpose_weight(&lw.wq, &mut lw.wq_t, qd, d);   // [qd, d] → [d, qd]
+            transpose_weight(&lw.wk, &mut lw.wk_t, kvd, d);  // [kvd, d] → [d, kvd]
+            transpose_weight(&lw.wv, &mut lw.wv_t, kvd, d);  // [kvd, d] → [d, kvd]
+            transpose_weight(&lw.wo, &mut lw.wo_t, d, qd);   // [d, qd] → [qd, d]
             transpose_weight(&lw.w1, &mut lw.w1_t, h, d);
             transpose_weight(&lw.w2, &mut lw.w2_t, d, h);
             transpose_weight(&lw.w3, &mut lw.w3_t, h, d);
@@ -544,11 +743,41 @@ impl DynamicAneTrainer {
         let _ = done_rx.recv();
     }
 
-    /// Forward pass for a single layer using dynamic ANE kernels.
+    /// Execute a single projection kernel: act @ W → output.
+    fn run_projection(
+        kernels: &DynamicKernels,
+        io: &DynIoPool,
+        ic: usize,
+        oc: usize,
+        seq: usize,
+        act: &[f32],
+        weight: &[f32],
+        output: &mut [f32],
+    ) -> Result<()> {
+        let key = (ic, oc);
+        let kernel = kernels
+            .projections
+            .get(&key)
+            .ok_or_else(|| MetalError::InvalidConfig(format!("No projection kernel for ({ic}, {oc})")))?;
+        let io_in = io.proj_inputs.get(&key).unwrap();
+        let io_out = io.proj_outputs.get(&key).unwrap();
+
+        io_in.write_packed_f32(act, &[(weight, oc)], ic, seq);
+        kernel.evaluate(&[io_in.as_ptr()], &[io_out.as_ptr()])?;
+        io_out.read_f32(output, 0, oc, seq);
+        Ok(())
+    }
+
+    /// Forward pass for a single layer using decomposed ANE kernels.
+    ///
+    /// Each projection (Q, K, V, Wo, W1, W3, W2) is a separate ANE kernel.
+    /// Attention is a standalone weight-free kernel. SiLU gate runs on CPU.
     fn forward_layer(&mut self, l: usize, x: &mut [f32]) -> Result<()> {
         let d = self.config.dim;
         let h = self.config.hidden_dim;
         let s = self.config.seq_len;
+        let qd = self.kernel_config.q_dim();
+        let kvd = self.kernel_config.kv_dim();
         let lw = &self.layer_weights[l];
         let acts = &mut self.layer_acts[l];
 
@@ -561,74 +790,72 @@ impl DynamicAneTrainer {
             .as_ref()
             .ok_or_else(|| MetalError::InvalidConfig("IO pool not allocated".into()))?;
 
-        // 1. Attention Block
-        // RMSNorm on CPU
+        // ====== Attention Block ======
+
+        // 1. RMSNorm on CPU
         accelerate::rmsnorm(&mut acts.xnorm, x, &lw.rms_att, d, s);
 
-        // Pack xnorm + Wq + Wk + Wv + Wo into sdpa_fwd input
-        io.sdpa_fwd_in.write_packed_f32(
-            &acts.xnorm,
-            &[(&lw.wq, d), (&lw.wk, d), (&lw.wv, d), (&lw.wo, d)],
-            d,
-            s,
-        );
+        // 2. Q projection: xnorm @ Wq → Q
+        Self::run_projection(kernels, io, d, qd, s, &acts.xnorm, &lw.wq, &mut acts.q)?;
 
-        // ANE evaluate sdpa_fwd
+        // 3. K projection: xnorm @ Wk → K
+        Self::run_projection(kernels, io, d, kvd, s, &acts.xnorm, &lw.wk, &mut acts.k)?;
+
+        // 4. V projection: xnorm @ Wv → V
+        Self::run_projection(kernels, io, d, kvd, s, &acts.xnorm, &lw.wv, &mut acts.v)?;
+
+        // 5. Attention: Q, K, V → attn_out (ANE)
+        // Write Q[qd, s], K[kvd, s], V[kvd, s] concatenated along channels
+        io.sdpa_attn_in.write_f32_at(0, &acts.q, qd, s);
+        io.sdpa_attn_in.write_f32_at(qd, &acts.k, kvd, s);
+        io.sdpa_attn_in.write_f32_at(qd + kvd, &acts.v, kvd, s);
         kernels
-            .sdpa_fwd
-            .evaluate(&[io.sdpa_fwd_in.as_ptr()], &[io.sdpa_fwd_out.as_ptr()])?;
+            .sdpa_attn
+            .evaluate(&[io.sdpa_attn_in.as_ptr()], &[io.sdpa_attn_out.as_ptr()])?;
+        io.sdpa_attn_out.read_f32(&mut acts.attn_out, 0, qd, s);
 
-        // Read taps: [o_out, Q, K, V, attn_out, xnorm] each [D, S]
-        io.sdpa_fwd_out.read_f32(&mut acts.o_out, 0, d, s);
-        io.sdpa_fwd_out.read_f32(&mut acts.q, d, d, s);
-        io.sdpa_fwd_out.read_f32(&mut acts.k, 2 * d, d, s);
-        io.sdpa_fwd_out.read_f32(&mut acts.v, 3 * d, d, s);
-        io.sdpa_fwd_out.read_f32(&mut acts.attn_out, 4 * d, d, s);
+        // 6. Wo projection: attn_out @ Wo → o_out
+        Self::run_projection(kernels, io, qd, d, s, &acts.attn_out, &lw.wo, &mut acts.o_out)?;
 
-        // Residual: x2 = x + o_out
+        // 7. Residual: x2 = x + o_out
         accelerate::vadd(x, &acts.o_out, &mut acts.x2);
 
-        // 2. FFN Block
-        // RMSNorm on CPU
+        // ====== FFN Block ======
+
+        // 8. RMSNorm on CPU
         accelerate::rmsnorm(&mut acts.x2norm, &acts.x2, &lw.rms_ffn, d, s);
 
-        // Pack x2norm + W1 + W3 into ffn_w13 input
-        io.ffn_w13_in
-            .write_packed_f32(&acts.x2norm, &[(&lw.w1, h), (&lw.w3, h)], d, s);
+        // 9. W1 projection: x2norm @ W1 → h1
+        Self::run_projection(kernels, io, d, h, s, &acts.x2norm, &lw.w1, &mut acts.h1)?;
 
-        // ANE evaluate ffn_w13
-        kernels
-            .ffn_w13
-            .evaluate(&[io.ffn_w13_in.as_ptr()], &[io.ffn_w13_out.as_ptr()])?;
+        // 10. W3 projection: x2norm @ W3 → h3
+        Self::run_projection(kernels, io, d, h, s, &acts.x2norm, &lw.w3, &mut acts.h3)?;
 
-        // Read taps: [h1, h3, gate] each [HIDDEN, S]
-        io.ffn_w13_out.read_f32(&mut acts.h1, 0, h, s);
-        io.ffn_w13_out.read_f32(&mut acts.h3, h, h, s);
-        io.ffn_w13_out.read_f32(&mut acts.silu_out, 2 * h, h, s);
+        // 11. SiLU gate on CPU: silu_out = silu(h1) * h3
+        for i in 0..(h * s) {
+            let sig = 1.0 / (1.0 + (-acts.h1[i]).exp());
+            acts.silu_out[i] = acts.h1[i] * sig * acts.h3[i];
+        }
 
-        // Pack gate + W2 into ffn_w2 input
-        io.ffn_w2_in
-            .write_packed_f32(&acts.silu_out, &[(&lw.w2, d)], h, s);
+        // 12. W2 projection: silu_out @ W2 → ffn_out
+        Self::run_projection(kernels, io, h, d, s, &acts.silu_out, &lw.w2, &mut acts.ffn_out)?;
 
-        // ANE evaluate ffn_w2
-        kernels
-            .ffn_w2
-            .evaluate(&[io.ffn_w2_in.as_ptr()], &[io.ffn_w2_out.as_ptr()])?;
-
-        // Read ffn_out
-        io.ffn_w2_out.read_f32(&mut acts.ffn_out, 0, d, s);
-
-        // Residual: x = x2 + ffn_out
+        // 13. Residual: x = x2 + ffn_out
         accelerate::vadd(&acts.x2, &acts.ffn_out, x);
 
         Ok(())
     }
 
-    /// Backward pass for a single layer using dynamic ANE kernels.
+    /// Backward pass for a single layer using decomposed ANE kernels.
+    ///
+    /// Each weight-transpose projection is a separate ANE kernel dispatch.
+    /// Results are combined on CPU via vadd.
     fn backward_layer(&mut self, l: usize, dx: &mut [f32]) -> Result<()> {
         let d = self.config.dim;
         let h = self.config.hidden_dim;
         let s = self.config.seq_len;
+        let qd = self.kernel_config.q_dim();
+        let kvd = self.kernel_config.kv_dim();
         let score_ch = self.kernel_config.score_ch();
 
         let kernels = self
@@ -642,15 +869,9 @@ impl DynamicAneTrainer {
 
         // ====== FFN Backward ======
 
-        // 1. dffn @ W2^T → dsilu_raw
-        io.ffn_bwd_w2t_in
-            .write_packed_f32(dx, &[(&self.layer_weights[l].w2_t, h)], d, s);
-        kernels.ffn_bwd_w2t.evaluate(
-            &[io.ffn_bwd_w2t_in.as_ptr()],
-            &[io.ffn_bwd_w2t_out.as_ptr()],
-        )?;
+        // 1. dffn @ W2^T → dsilu_raw (projection kernel)
         let mut dsilu_raw = vec![0.0f32; h * s];
-        io.ffn_bwd_w2t_out.read_f32(&mut dsilu_raw, 0, h, s);
+        Self::run_projection(kernels, io, d, h, s, dx, &self.layer_weights[l].w2_t, &mut dsilu_raw)?;
 
         // 2. Async dW2 = dx @ silu_out^T (on cblas worker)
         {
@@ -680,9 +901,6 @@ impl DynamicAneTrainer {
         }
 
         // 3. SiLU derivative on CPU
-        // dsilu_raw already has dffn @ W2^T
-        // We need: dh1 = dsilu_raw * h3 * silu_deriv(h1)
-        //          dh3 = dsilu_raw * sigmoid(h1)
         let acts = &self.layer_acts[l];
         let mut dh1 = vec![0.0f32; h * s];
         let mut dh3 = vec![0.0f32; h * s];
@@ -691,11 +909,6 @@ impl DynamicAneTrainer {
             let sig = 1.0 / (1.0 + (-h1_val).exp());
             let silu_d = sig * (1.0 + h1_val * (1.0 - sig));
             dh1[i] = dsilu_raw[i] * acts.h3[i] * silu_d;
-            dh3[i] = dsilu_raw[i] * sig * acts.h1[i]; // dsilu * h1 * sig = dsilu * silu(h1) ... no
-            // Actually: gate = silu(h1) * h3, dsilu = dgate * h3, dh3 = dgate * silu(h1)
-            // dgate = dsilu_raw (from W2^T backward)
-            // dh1 = dgate * h3 * silu_deriv = dsilu_raw * h3 * (sig + h1*sig*(1-sig))
-            // dh3 = dgate * silu(h1) = dsilu_raw * h1 * sig
             dh3[i] = dsilu_raw[i] * h1_val * sig;
         }
 
@@ -715,49 +928,25 @@ impl DynamicAneTrainer {
                 let w1_grad =
                     unsafe { std::slice::from_raw_parts_mut(w1_grad_ptr as *mut f32, w1_grad_len) };
                 accelerate::gemm(
-                    &dh1_clone,
-                    &x2norm_clone,
-                    w1_grad,
-                    h_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
+                    &dh1_clone, &x2norm_clone, w1_grad,
+                    h_val, d_val, s_val, 1.0, 1.0, false, true,
                 );
                 let w3_grad =
                     unsafe { std::slice::from_raw_parts_mut(w3_grad_ptr as *mut f32, w3_grad_len) };
                 accelerate::gemm(
-                    &dh3_clone,
-                    &x2norm_clone,
-                    w3_grad,
-                    h_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
+                    &dh3_clone, &x2norm_clone, w3_grad,
+                    h_val, d_val, s_val, 1.0, 1.0, false, true,
                 );
             }));
         }
 
-        // 4. dh1@W1^T + dh3@W3^T → dx_ffn
-        io.ffn_bwd_w13t_in.write_packed_f32_multi(
-            &[(&dh1, s), (&dh3, s)],
-            &[
-                (&self.layer_weights[l].w1_t, d),
-                (&self.layer_weights[l].w3_t, d),
-            ],
-            h,
-        );
-        kernels.ffn_bwd_w13t.evaluate(
-            &[io.ffn_bwd_w13t_in.as_ptr()],
-            &[io.ffn_bwd_w13t_out.as_ptr()],
-        )?;
+        // 4. dh1@W1^T → dx1, dh3@W3^T → dx3, then dx_ffn = dx1 + dx3
+        let mut dx1 = vec![0.0f32; d * s];
+        Self::run_projection(kernels, io, h, d, s, &dh1, &self.layer_weights[l].w1_t, &mut dx1)?;
+        let mut dx3 = vec![0.0f32; d * s];
+        Self::run_projection(kernels, io, h, d, s, &dh3, &self.layer_weights[l].w3_t, &mut dx3)?;
         let mut dx_ffn = vec![0.0f32; d * s];
-        io.ffn_bwd_w13t_out.read_f32(&mut dx_ffn, 0, d, s);
+        accelerate::vadd(&dx1, &dx3, &mut dx_ffn);
 
         // 5. FFN RMSNorm backward
         let mut dx_ffn_norm = vec![0.0f32; d * s];
@@ -773,14 +962,9 @@ impl DynamicAneTrainer {
 
         // ====== Attention Backward ======
 
-        // 6. dy @ Wo^T → da (attention backward input)
-        io.wo_bwd_in
-            .write_packed_f32(&dx_ffn_norm, &[(&self.layer_weights[l].wo_t, d)], d, s);
-        kernels
-            .wo_bwd
-            .evaluate(&[io.wo_bwd_in.as_ptr()], &[io.wo_bwd_out.as_ptr()])?;
-        let mut da = vec![0.0f32; d * s];
-        io.wo_bwd_out.read_f32(&mut da, 0, d, s);
+        // 6. dy @ Wo^T → da (projection kernel)
+        let mut da = vec![0.0f32; qd * s];
+        Self::run_projection(kernels, io, d, qd, s, &dx_ffn_norm, &self.layer_weights[l].wo_t, &mut da)?;
 
         // Async dWo = dx_ffn_norm @ attn_out^T
         {
@@ -789,58 +973,45 @@ impl DynamicAneTrainer {
             let wo_grad_ptr = self.layer_grads[l].wo.as_mut_ptr() as usize;
             let wo_grad_len = self.layer_grads[l].wo.len();
             let d_val = d;
+            let qd_val = qd;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
                 let wo_grad =
                     unsafe { std::slice::from_raw_parts_mut(wo_grad_ptr as *mut f32, wo_grad_len) };
                 accelerate::gemm(
-                    &dx_clone,
-                    &attn_clone,
-                    wo_grad,
-                    d_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
+                    &dx_clone, &attn_clone, wo_grad,
+                    d_val, qd_val, s_val, 1.0, 1.0, false, true,
                 );
             }));
         }
 
         // 7. SDPA backward part 1: Q, K, V, da → dV, probs, dp (fp16 path)
         let acts = &self.layer_acts[l];
-        io.sdpa_bwd1_in.write_f32_as_fp16_at(0, &acts.q, d, s);
-        io.sdpa_bwd1_in.write_f32_as_fp16_at(d, &acts.k, d, s);
-        io.sdpa_bwd1_in.write_f32_as_fp16_at(2 * d, &acts.v, d, s);
-        io.sdpa_bwd1_in.write_f32_as_fp16_at(3 * d, &da, d, s);
+        io.sdpa_bwd1_in.write_f32_as_fp16_at(0, &acts.q, qd, s);
+        io.sdpa_bwd1_in.write_f32_as_fp16_at(qd, &acts.k, kvd, s);
+        io.sdpa_bwd1_in.write_f32_as_fp16_at(qd + kvd, &acts.v, kvd, s);
+        io.sdpa_bwd1_in.write_f32_as_fp16_at(qd + 2 * kvd, &da, qd, s);
 
         kernels
             .sdpa_bwd1
             .evaluate(&[io.sdpa_bwd1_in.as_ptr()], &[io.sdpa_bwd1_out.as_ptr()])?;
 
-        // Read dV, and copy probs+dp for bwd2 input
-        let mut dv = vec![0.0f32; d * s];
-        io.sdpa_bwd1_out.read_fp16_as_f32(&mut dv, 0, d, s);
+        let mut dv = vec![0.0f32; kvd * s];
+        io.sdpa_bwd1_out.read_fp16_as_f32(&mut dv, 0, kvd, s);
 
-        // 8. SDPA backward part 2: probs, dp, Q, K → dQ, dK (fp16 surface-to-surface copy)
-        // Copy probs and dp from bwd1 output to bwd2 input
-        io.sdpa_bwd2_in
-            .copy_from(0, &io.sdpa_bwd1_out, d, 2 * score_ch, s);
-        // Copy Q and K
-        io.sdpa_bwd2_in
-            .write_f32_as_fp16_at(2 * score_ch, &acts.q, d, s);
-        io.sdpa_bwd2_in
-            .write_f32_as_fp16_at(2 * score_ch + d, &acts.k, d, s);
+        // 8. SDPA backward part 2: probs, dp, Q, K → dQ, dK
+        io.sdpa_bwd2_in.copy_from(0, &io.sdpa_bwd1_out, kvd, 2 * score_ch, s);
+        io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch, &acts.q, qd, s);
+        io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch + qd, &acts.k, kvd, s);
 
         kernels
             .sdpa_bwd2
             .evaluate(&[io.sdpa_bwd2_in.as_ptr()], &[io.sdpa_bwd2_out.as_ptr()])?;
 
-        let mut dq = vec![0.0f32; d * s];
-        let mut dk = vec![0.0f32; d * s];
-        io.sdpa_bwd2_out.read_fp16_as_f32(&mut dq, 0, d, s);
-        io.sdpa_bwd2_out.read_fp16_as_f32(&mut dk, d, d, s);
+        let mut dq = vec![0.0f32; qd * s];
+        let mut dk = vec![0.0f32; kvd * s];
+        io.sdpa_bwd2_out.read_fp16_as_f32(&mut dq, 0, qd, s);
+        io.sdpa_bwd2_out.read_fp16_as_f32(&mut dk, qd, kvd, s);
 
         // Async dWq, dWk, dWv
         {
@@ -855,68 +1026,43 @@ impl DynamicAneTrainer {
             let wv_grad_ptr = self.layer_grads[l].wv.as_mut_ptr() as usize;
             let wv_grad_len = self.layer_grads[l].wv.len();
             let d_val = d;
+            let qd_val = qd;
+            let kvd_val = kvd;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
                 let wq_grad =
                     unsafe { std::slice::from_raw_parts_mut(wq_grad_ptr as *mut f32, wq_grad_len) };
                 accelerate::gemm(
-                    &dq_clone,
-                    &xnorm_clone,
-                    wq_grad,
-                    d_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
+                    &dq_clone, &xnorm_clone, wq_grad,
+                    qd_val, d_val, s_val, 1.0, 1.0, false, true,
                 );
                 let wk_grad =
                     unsafe { std::slice::from_raw_parts_mut(wk_grad_ptr as *mut f32, wk_grad_len) };
                 accelerate::gemm(
-                    &dk_clone,
-                    &xnorm_clone,
-                    wk_grad,
-                    d_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
+                    &dk_clone, &xnorm_clone, wk_grad,
+                    kvd_val, d_val, s_val, 1.0, 1.0, false, true,
                 );
                 let wv_grad =
                     unsafe { std::slice::from_raw_parts_mut(wv_grad_ptr as *mut f32, wv_grad_len) };
                 accelerate::gemm(
-                    &dv_clone,
-                    &xnorm_clone,
-                    wv_grad,
-                    d_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
+                    &dv_clone, &xnorm_clone, wv_grad,
+                    kvd_val, d_val, s_val, 1.0, 1.0, false, true,
                 );
             }));
         }
 
-        // 9. QKV backward: dq@Wq^T + dk@Wk^T + dv@Wv^T → dx_attn
-        io.qkv_bwd_in.write_packed_f32_multi(
-            &[(&dq, s), (&dk, s), (&dv, s)],
-            &[
-                (&self.layer_weights[l].wq_t, d),
-                (&self.layer_weights[l].wk_t, d),
-                (&self.layer_weights[l].wv_t, d),
-            ],
-            d,
-        );
-        kernels
-            .qkv_bwd
-            .evaluate(&[io.qkv_bwd_in.as_ptr()], &[io.qkv_bwd_out.as_ptr()])?;
+        // 9. QKV backward: individual projections + CPU add
         let mut dx_attn = vec![0.0f32; d * s];
-        io.qkv_bwd_out.read_f32(&mut dx_attn, 0, d, s);
+        let mut dxq = vec![0.0f32; d * s];
+        Self::run_projection(kernels, io, qd, d, s, &dq, &self.layer_weights[l].wq_t, &mut dxq)?;
+        let mut dxk = vec![0.0f32; d * s];
+        Self::run_projection(kernels, io, kvd, d, s, &dk, &self.layer_weights[l].wk_t, &mut dxk)?;
+        let mut dxv = vec![0.0f32; d * s];
+        Self::run_projection(kernels, io, kvd, d, s, &dv, &self.layer_weights[l].wv_t, &mut dxv)?;
+        // dx_attn = dxq + dxk + dxv
+        accelerate::vadd(&dxq, &dxk, &mut dx_attn);
+        accelerate::vadd(&dx_attn, &dxv, &mut dxq); // reuse dxq as temp
+        dx_attn.copy_from_slice(&dxq);
 
         // 10. Attention RMSNorm backward
         let mut dx_attn_norm = vec![0.0f32; d * s];
@@ -931,23 +1077,25 @@ impl DynamicAneTrainer {
         );
 
         // Output: dx = dx_ffn_norm + dx_attn_norm (residual)
-        // Actually both residual paths add: dx_attn flows through attention residual,
-        // dx_ffn flows through FFN residual. Combined:
         accelerate::vadd(&dx_ffn_norm, &dx_attn_norm, dx);
 
         Ok(())
     }
 
     /// Run a single training step (forward + backward + grad accumulation).
+    ///
+    /// When vocab compaction is active, the classifier operates on the compact
+    /// embedding (`compact_vocab * dim`) instead of the full one, giving ~3.5x
+    /// speedup on the classifier matmul and cross-entropy.
     pub fn train_step(&mut self, input_tokens: &[u16], target_tokens: &[u16]) -> Result<f32> {
         let d = self.config.dim;
         let s = self.config.seq_len;
-        let v = self.config.vocab_size;
 
         assert_eq!(input_tokens.len(), s);
         assert_eq!(target_tokens.len(), s);
 
         // === Forward pass ===
+        // Embedding lookup always uses the full table (input tokens are full-vocab ids)
         let mut x = vec![0.0f32; d * s];
         accelerate::embed_lookup(&mut x, &self.embed_weights, input_tokens, d, s);
 
@@ -960,69 +1108,144 @@ impl DynamicAneTrainer {
         let mut x_final = vec![0.0f32; d * s];
         accelerate::rmsnorm(&mut x_final, &x, &self.rms_final, d, s);
 
-        // Classifier: logits = embed^T @ x_final
-        let mut logits = vec![0.0f32; v * s];
-        accelerate::gemm(
-            &self.embed_weights,
-            &x_final,
-            &mut logits,
-            v,
-            s,
-            d,
-            1.0,
-            0.0,
-            false,
-            false,
-        );
+        // Classifier + loss + backward: compact or full path
+        let (loss, mut dx) = if let Some(ref vm) = self.vocab_map {
+            // === Compact classifier path ===
+            let cv = vm.compact_vocab;
 
-        // Cross-entropy loss
-        let mut dlogits = vec![0.0f32; v * s];
-        let loss = accelerate::cross_entropy_loss(&mut dlogits, &logits, target_tokens, v, s);
+            // Remap target tokens to compact ids
+            let compact_targets = vm.remap_tokens(target_tokens);
 
-        // === Backward pass ===
+            // logits = compact_embed @ x_final: [cv, d] @ [d, s] → [cv, s]
+            let mut logits = vec![0.0f32; cv * s];
+            accelerate::gemm(
+                &self.compact_embed,
+                &x_final,
+                &mut logits,
+                cv,
+                s,
+                d,
+                1.0,
+                0.0,
+                false,
+                false,
+            );
 
-        // dEmbed (classifier gradient): dx = embed^T @ dlogits
-        let mut dx = vec![0.0f32; d * s];
-        accelerate::gemm(
-            &self.embed_weights,
-            &dlogits,
-            &mut dx,
-            d,
-            s,
-            v,
-            1.0,
-            0.0,
-            true,
-            false,
-        );
+            // Cross-entropy loss on compact vocab
+            let mut dlogits = vec![0.0f32; cv * s];
+            let loss =
+                accelerate::cross_entropy_loss(&mut dlogits, &logits, &compact_targets, cv, s);
 
-        // Async embed gradient accumulation
-        {
-            let dlogits_clone = dlogits;
-            let x_final_clone = x_final;
-            let embed_grad_ptr = self.embed_grad.as_mut_ptr() as usize;
-            let embed_len = self.embed_grad.len();
-            let v_val = v;
-            let d_val = d;
-            let s_val = s;
-            self.dispatch_dw(Box::new(move || {
-                let embed_grad = unsafe {
-                    std::slice::from_raw_parts_mut(embed_grad_ptr as *mut f32, embed_len)
-                };
-                accelerate::gemm(
-                    &dlogits_clone,
-                    &x_final_clone,
-                    embed_grad,
-                    v_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
-            }));
-        }
+            // dx = compact_embed^T @ dlogits: [d, cv] @ [cv, s] → [d, s]
+            let mut dx = vec![0.0f32; d * s];
+            accelerate::gemm(
+                &self.compact_embed,
+                &dlogits,
+                &mut dx,
+                d,
+                s,
+                cv,
+                1.0,
+                0.0,
+                true,
+                false,
+            );
+
+            // Async compact embed gradient: dE = dlogits @ x_final^T: [cv, s] @ [s, d] → [cv, d]
+            {
+                let dlogits_clone = dlogits;
+                let x_final_clone = x_final;
+                let grad_ptr = self.compact_embed_grad.as_mut_ptr() as usize;
+                let grad_len = self.compact_embed_grad.len();
+                let cv_val = cv;
+                let d_val = d;
+                let s_val = s;
+                self.dispatch_dw(Box::new(move || {
+                    let grad = unsafe {
+                        std::slice::from_raw_parts_mut(grad_ptr as *mut f32, grad_len)
+                    };
+                    accelerate::gemm(
+                        &dlogits_clone,
+                        &x_final_clone,
+                        grad,
+                        cv_val,
+                        d_val,
+                        s_val,
+                        1.0,
+                        1.0,
+                        false,
+                        true,
+                    );
+                }));
+            }
+
+            (loss, dx)
+        } else {
+            // === Full vocab classifier path ===
+            let v = self.config.vocab_size;
+
+            let mut logits = vec![0.0f32; v * s];
+            accelerate::gemm(
+                &self.embed_weights,
+                &x_final,
+                &mut logits,
+                v,
+                s,
+                d,
+                1.0,
+                0.0,
+                false,
+                false,
+            );
+
+            let mut dlogits = vec![0.0f32; v * s];
+            let loss =
+                accelerate::cross_entropy_loss(&mut dlogits, &logits, target_tokens, v, s);
+
+            let mut dx = vec![0.0f32; d * s];
+            accelerate::gemm(
+                &self.embed_weights,
+                &dlogits,
+                &mut dx,
+                d,
+                s,
+                v,
+                1.0,
+                0.0,
+                true,
+                false,
+            );
+
+            // Async embed gradient accumulation (full vocab)
+            {
+                let dlogits_clone = dlogits;
+                let x_final_clone = x_final;
+                let embed_grad_ptr = self.embed_grad.as_mut_ptr() as usize;
+                let embed_len = self.embed_grad.len();
+                let v_val = v;
+                let d_val = d;
+                let s_val = s;
+                self.dispatch_dw(Box::new(move || {
+                    let embed_grad = unsafe {
+                        std::slice::from_raw_parts_mut(embed_grad_ptr as *mut f32, embed_len)
+                    };
+                    accelerate::gemm(
+                        &dlogits_clone,
+                        &x_final_clone,
+                        embed_grad,
+                        v_val,
+                        d_val,
+                        s_val,
+                        1.0,
+                        1.0,
+                        false,
+                        true,
+                    );
+                }));
+            }
+
+            (loss, dx)
+        };
 
         // Final RMSNorm backward
         let x_before_final = x;
@@ -1068,11 +1291,17 @@ impl DynamicAneTrainer {
     ///
     /// No recompilation needed — weights are injected via IOSurface writes.
     pub fn train_batch(&mut self, data: &[(Vec<u16>, Vec<u16>)], max_steps: usize) -> Result<f32> {
+        let use_compact = self.vocab_map.is_some();
+
         // Zero gradients
         for lg in &mut self.layer_grads {
             lg.zero();
         }
-        self.embed_grad.fill(0.0);
+        if use_compact {
+            self.compact_embed_grad.fill(0.0);
+        } else {
+            self.embed_grad.fill(0.0);
+        }
         self.rms_final_grad.fill(0.0);
 
         // Accumulate gradients
@@ -1100,7 +1329,11 @@ impl DynamicAneTrainer {
             accelerate::scale_inplace(&mut lg.rms_att, scale);
             accelerate::scale_inplace(&mut lg.rms_ffn, scale);
         }
-        accelerate::scale_inplace(&mut self.embed_grad, scale);
+        if use_compact {
+            accelerate::scale_inplace(&mut self.compact_embed_grad, scale);
+        } else {
+            accelerate::scale_inplace(&mut self.embed_grad, scale);
+        }
         accelerate::scale_inplace(&mut self.rms_final_grad, scale);
 
         // Gradient clipping
@@ -1116,7 +1349,11 @@ impl DynamicAneTrainer {
             grad_norm_sq += accelerate::sum_of_squares(&lg.rms_att);
             grad_norm_sq += accelerate::sum_of_squares(&lg.rms_ffn);
         }
-        grad_norm_sq += accelerate::sum_of_squares(&self.embed_grad);
+        if use_compact {
+            grad_norm_sq += accelerate::sum_of_squares(&self.compact_embed_grad);
+        } else {
+            grad_norm_sq += accelerate::sum_of_squares(&self.embed_grad);
+        }
         grad_norm_sq += accelerate::sum_of_squares(&self.rms_final_grad);
 
         let grad_norm = grad_norm_sq.sqrt();
@@ -1133,7 +1370,11 @@ impl DynamicAneTrainer {
                 accelerate::scale_inplace(&mut lg.rms_att, clip_scale);
                 accelerate::scale_inplace(&mut lg.rms_ffn, clip_scale);
             }
-            accelerate::scale_inplace(&mut self.embed_grad, clip_scale);
+            if use_compact {
+                accelerate::scale_inplace(&mut self.compact_embed_grad, clip_scale);
+            } else {
+                accelerate::scale_inplace(&mut self.embed_grad, clip_scale);
+            }
             accelerate::scale_inplace(&mut self.rms_final_grad, clip_scale);
         }
 
@@ -1177,17 +1418,34 @@ impl DynamicAneTrainer {
             adam!(rms_ffn, rms_ffn, rms_ffn);
         }
 
-        accelerate::adam_update(
-            &mut self.embed_weights,
-            &self.embed_grad,
-            &mut self.embed_adam.m,
-            &mut self.embed_adam.v,
-            t,
-            lr,
-            b1,
-            b2,
-            eps,
-        );
+        if use_compact {
+            // Adam update on compact embedding, then scatter back to full
+            accelerate::adam_update(
+                &mut self.compact_embed,
+                &self.compact_embed_grad,
+                &mut self.compact_embed_adam.m,
+                &mut self.compact_embed_adam.v,
+                t,
+                lr,
+                b1,
+                b2,
+                eps,
+            );
+            self.scatter_compact_to_full();
+        } else {
+            accelerate::adam_update(
+                &mut self.embed_weights,
+                &self.embed_grad,
+                &mut self.embed_adam.m,
+                &mut self.embed_adam.v,
+                t,
+                lr,
+                b1,
+                b2,
+                eps,
+            );
+        }
+
         accelerate::adam_update(
             &mut self.rms_final,
             &self.rms_final_grad,
@@ -1212,6 +1470,8 @@ impl DynamicAneTrainer {
         let h = self.config.hidden_dim;
         let nl = self.config.n_layers;
         let v = self.config.vocab_size;
+        let qd = self.kernel_config.q_dim();
+        let kvd = self.kernel_config.kv_dim();
 
         let mut offset = 0;
 
@@ -1223,14 +1483,14 @@ impl DynamicAneTrainer {
 
             lw.rms_att.copy_from_slice(&weights[offset..offset + d]);
             offset += d;
-            lw.wq.copy_from_slice(&weights[offset..offset + d * d]);
-            offset += d * d;
-            lw.wk.copy_from_slice(&weights[offset..offset + d * d]);
-            offset += d * d;
-            lw.wv.copy_from_slice(&weights[offset..offset + d * d]);
-            offset += d * d;
-            lw.wo.copy_from_slice(&weights[offset..offset + d * d]);
-            offset += d * d;
+            lw.wq.copy_from_slice(&weights[offset..offset + qd * d]);
+            offset += qd * d;
+            lw.wk.copy_from_slice(&weights[offset..offset + kvd * d]);
+            offset += kvd * d;
+            lw.wv.copy_from_slice(&weights[offset..offset + kvd * d]);
+            offset += kvd * d;
+            lw.wo.copy_from_slice(&weights[offset..offset + d * qd]);
+            offset += d * qd;
             lw.rms_ffn.copy_from_slice(&weights[offset..offset + d]);
             offset += d;
             lw.w1.copy_from_slice(&weights[offset..offset + h * d]);
@@ -1383,12 +1643,14 @@ impl DynamicAneTrainer {
                         continue;
                     }
 
+                    let qd = self.kernel_config.q_dim();
+                    let kvd = self.kernel_config.kv_dim();
                     let lw = &mut self.layer_weights[layer_idx];
                     match parts[1] {
-                        "self_attn.q_proj.weight" => copy_w(&data, &mut lw.wq, d * d),
-                        "self_attn.k_proj.weight" => copy_w(&data, &mut lw.wk, d * d),
-                        "self_attn.v_proj.weight" => copy_w(&data, &mut lw.wv, d * d),
-                        "self_attn.o_proj.weight" => copy_w(&data, &mut lw.wo, d * d),
+                        "self_attn.q_proj.weight" => copy_w(&data, &mut lw.wq, qd * d),
+                        "self_attn.k_proj.weight" => copy_w(&data, &mut lw.wk, kvd * d),
+                        "self_attn.v_proj.weight" => copy_w(&data, &mut lw.wv, kvd * d),
+                        "self_attn.o_proj.weight" => copy_w(&data, &mut lw.wo, d * qd),
                         "mlp.gate_proj.weight" => copy_w(&data, &mut lw.w1, h * d),
                         "mlp.down_proj.weight" => copy_w(&data, &mut lw.w2, d * h),
                         "mlp.up_proj.weight" => copy_w(&data, &mut lw.w3, h * d),
@@ -1424,6 +1686,7 @@ mod tests {
             dim: 64,
             hidden_dim: 128,
             n_heads: 4,
+            n_kv_heads: 4,
             n_layers: 2,
             vocab_size: 100,
             seq_len: 16,
@@ -1436,20 +1699,196 @@ mod tests {
     }
 
     #[test]
-    fn test_dynamic_trainer_no_recompile_needed() {
+    fn test_dynamic_trainer_gqa_creation() {
         let config = DynamicAneTrainerConfig {
             dim: 64,
             hidden_dim: 128,
             n_heads: 4,
+            n_kv_heads: 2,
             n_layers: 2,
             vocab_size: 100,
             seq_len: 16,
             ..Default::default()
         };
         let trainer = DynamicAneTrainer::new(config);
-        // compile_count stays at 0 until compile_kernels() is called
-        assert_eq!(trainer.compile_count(), 0);
-        // After compile_kernels(), it should be exactly 9
-        // (can't test without actual ANE hardware)
+        assert_eq!(trainer.kernel_config.n_heads, 4);
+        assert_eq!(trainer.kernel_config.n_kv_heads, 2);
+        assert_eq!(trainer.kernel_config.n_groups(), 2);
     }
+
+    #[test]
+    fn test_dynamic_trainer_no_recompile_needed() {
+        let config = DynamicAneTrainerConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_heads: 4,
+            n_kv_heads: 4,
+            n_layers: 2,
+            vocab_size: 100,
+            seq_len: 16,
+            ..Default::default()
+        };
+        let trainer = DynamicAneTrainer::new(config);
+        assert_eq!(trainer.compile_count(), 0);
+    }
+
+    // ======== Vocab Compaction Tests ========
+
+    #[test]
+    fn test_vocab_map_from_batches() {
+        let batches = vec![vec![
+            (vec![0u16, 5, 10, 50], vec![5u16, 10, 50, 99]),
+            (vec![1u16, 3, 5, 10], vec![3u16, 5, 10, 50]),
+        ]];
+        let vm = VocabMap::from_batches(&batches, 100);
+
+        // Used tokens: 0, 1, 3, 5, 10, 50, 99 = 7 unique
+        assert_eq!(vm.compact_vocab, 7);
+        assert_eq!(vm.compact_to_full.len(), 7);
+
+        // Verify roundtrip: full→compact→full
+        for &full_id in &vm.compact_to_full {
+            let compact_id = vm.full_to_compact[full_id];
+            assert!(compact_id >= 0);
+            assert_eq!(vm.compact_to_full[compact_id as usize], full_id);
+        }
+
+        // Verify unused tokens map to -1
+        assert_eq!(vm.full_to_compact[2], -1);
+        assert_eq!(vm.full_to_compact[4], -1);
+        assert_eq!(vm.full_to_compact[98], -1);
+    }
+
+    #[test]
+    fn test_vocab_map_remap_tokens() {
+        let batches = vec![vec![(vec![0u16, 5, 10], vec![5u16, 10, 0])]];
+        let vm = VocabMap::from_batches(&batches, 100);
+        assert_eq!(vm.compact_vocab, 3);
+
+        let remapped = vm.remap_tokens(&[0, 5, 10]);
+        // All remapped ids should be in [0, 3)
+        for &r in &remapped {
+            assert!((r as usize) < vm.compact_vocab);
+        }
+
+        // Same full token → same compact token
+        let r2 = vm.remap_tokens(&[5, 5, 0]);
+        assert_eq!(r2[0], r2[1]); // both are token 5
+    }
+
+    #[test]
+    fn test_vocab_compaction_install() {
+        let config = DynamicAneTrainerConfig {
+            dim: 8,
+            hidden_dim: 16,
+            n_heads: 2,
+            n_kv_heads: 2,
+            n_layers: 1,
+            vocab_size: 100,
+            seq_len: 4,
+            ..Default::default()
+        };
+        let mut trainer = DynamicAneTrainer::new(config);
+
+        // Set some embedding weights
+        for i in 0..trainer.embed_weights.len() {
+            trainer.embed_weights[i] = i as f32 * 0.01;
+        }
+
+        let batches = vec![vec![(vec![0u16, 5, 10, 50], vec![5u16, 10, 50, 0])]];
+        let vm = VocabMap::from_batches(&batches, 100);
+        assert_eq!(vm.compact_vocab, 4);
+
+        trainer.install_vocab_map(vm);
+        assert!(trainer.has_vocab_compaction());
+        assert_eq!(trainer.compact_embed.len(), 4 * 8);
+
+        // Verify compact embed contains correct rows
+        let vm = trainer.vocab_map.as_ref().unwrap();
+        for c in 0..vm.compact_vocab {
+            let full_row = vm.compact_to_full[c] * 8;
+            let compact_row = c * 8;
+            assert_eq!(
+                &trainer.compact_embed[compact_row..compact_row + 8],
+                &trainer.embed_weights[full_row..full_row + 8]
+            );
+        }
+    }
+
+    // ======== Architecture Validation Tests ========
+
+    #[test]
+    fn test_ane_compatible_llama() {
+        let config = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 768,
+            "num_attention_heads": 12,
+            "num_hidden_layers": 12,
+        });
+        assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_ok());
+    }
+
+    #[test]
+    fn test_ane_compatible_qwen3() {
+        let config = serde_json::json!({
+            "model_type": "qwen3",
+            "hidden_size": 768,
+            "num_attention_heads": 12,
+            "num_key_value_heads": 4,
+        });
+        assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_ok());
+    }
+
+    #[test]
+    fn test_ane_incompatible_qwen3_5() {
+        let config = serde_json::json!({
+            "model_type": "qwen3_next",
+            "hidden_size": 768,
+            "num_attention_heads": 12,
+        });
+        let result = DynamicAneTrainerConfig::is_ane_compatible(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("hybrid/recurrent"));
+    }
+
+    #[test]
+    fn test_ane_incompatible_nemotron_h() {
+        let config = serde_json::json!({
+            "model_type": "nemotron_h",
+            "hidden_size": 768,
+        });
+        assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_err());
+    }
+
+    #[test]
+    fn test_ane_incompatible_jamba() {
+        let config = serde_json::json!({
+            "model_type": "jamba",
+            "hidden_size": 768,
+        });
+        assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_err());
+    }
+
+    #[test]
+    fn test_ane_incompatible_moe() {
+        let config = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 768,
+            "num_experts": 8,
+        });
+        let result = DynamicAneTrainerConfig::is_ane_compatible(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("MoE"));
+    }
+
+    #[test]
+    fn test_ane_incompatible_moe_local_experts() {
+        let config = serde_json::json!({
+            "model_type": "llama",
+            "hidden_size": 768,
+            "num_local_experts": 8,
+        });
+        assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_err());
+    }
+
 }

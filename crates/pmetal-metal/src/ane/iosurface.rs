@@ -162,6 +162,31 @@ impl IoSurface {
         }
     }
 
+    /// Write f32 data at a channel offset within an fp32 IOSurface.
+    ///
+    /// Writes `channels * spatial` f32 elements starting at `ch_offset * spatial`.
+    /// No dtype conversion — used for writing activations into fp32 surfaces
+    /// (e.g. concatenating Q, K, V for the attention kernel).
+    pub fn write_f32_at(
+        &self,
+        ch_offset: usize,
+        data: &[f32],
+        channels: usize,
+        spatial: usize,
+    ) {
+        let n = channels * spatial;
+        let offset = ch_offset * spatial;
+        debug_assert_eq!(data.len(), n);
+        debug_assert!((offset + n) * 4 <= self.size_bytes);
+
+        unsafe {
+            ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
+            let base = ffi::IOSurfaceGetBaseAddress(self.surface) as *mut f32;
+            std::ptr::copy_nonoverlapping(data.as_ptr(), base.add(offset), n);
+            ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut());
+        }
+    }
+
     /// Write packed fp32 data for the dynamic weight pipeline.
     ///
     /// Packs activations and weight columns into a single IOSurface using
