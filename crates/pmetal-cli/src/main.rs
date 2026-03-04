@@ -13,7 +13,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 use indicatif::{ProgressBar, ProgressStyle};
 use mlx_rs::builder::Builder;
 use pmetal_core::{DatasetConfig, LoraConfig, ModelConfig, TrainingConfig};
-use pmetal_data::{DataLoaderConfig, DatasetFormat, DatasetSource, Tokenizer, TrainingDataset, resolve_dataset_source};
+use pmetal_data::{
+    DataLoaderConfig, DatasetFormat, DatasetSource, Tokenizer, TrainingDataset,
+    resolve_dataset_source,
+};
 use pmetal_lora::{
     DynamicLoraModel, LlamaLoraForCausalLM, LlamaQloraForCausalLM, QLoraConfig, TrainableModel,
 };
@@ -2332,31 +2335,33 @@ async fn run_training(
         pmetal_data::chat_templates::detect_chat_template(&model_path, &config.model.model_id);
 
     // Resolve dataset source — local path or HuggingFace dataset ID
-    let dataset_path_resolved =
-        match resolve_dataset_source(&config.dataset.dataset_id) {
-            DatasetSource::Local(p) => p,
-            DatasetSource::HuggingFace(id) => {
-                tracing::info!("Downloading dataset from HuggingFace: {}", id);
-                // Download the dataset repo (contains JSONL/Parquet files)
-                let dir = pmetal_hub::download_dataset(&id, None, None, None).await?;
-                // Try to resolve a JSONL file in the downloaded directory
-                let resolved = TrainingDataset::resolve_dataset_path_pub(&dir);
-                if let Ok(p) = resolved {
-                    p
-                } else {
-                    // Fall back to parquet
-                    let parquet_paths =
-                        pmetal_hub::download_dataset_parquet(&id, "train", None, None).await?;
-                    if parquet_paths.is_empty() {
-                        anyhow::bail!("No JSONL or Parquet files found for dataset {}", id);
-                    }
-                    parquet_paths[0].clone()
+    let dataset_path_resolved = match resolve_dataset_source(&config.dataset.dataset_id) {
+        DatasetSource::Local(p) => p,
+        DatasetSource::HuggingFace(id) => {
+            tracing::info!("Downloading dataset from HuggingFace: {}", id);
+            // Download the dataset repo (contains JSONL/Parquet files)
+            let dir = pmetal_hub::download_dataset(&id, None, None, None).await?;
+            // Try to resolve a JSONL file in the downloaded directory
+            let resolved = TrainingDataset::resolve_dataset_path_pub(&dir);
+            if let Ok(p) = resolved {
+                p
+            } else {
+                // Fall back to parquet
+                let parquet_paths =
+                    pmetal_hub::download_dataset_parquet(&id, "train", None, None).await?;
+                if parquet_paths.is_empty() {
+                    anyhow::bail!("No JSONL or Parquet files found for dataset {}", id);
                 }
+                parquet_paths[0].clone()
             }
-        };
+        }
+    };
 
     // Load and tokenize training dataset — dispatch on file extension
-    tracing::info!("Loading training dataset: {}", dataset_path_resolved.display());
+    tracing::info!(
+        "Loading training dataset: {}",
+        dataset_path_resolved.display()
+    );
     let is_parquet = dataset_path_resolved
         .extension()
         .map_or(false, |ext| ext == "parquet");
@@ -2380,11 +2385,14 @@ async fn run_training(
                     "content",
                     config.training.max_seq_len,
                     None,
-                ).map_err(|_| anyhow::anyhow!(
-                    "Parquet file does not have a 'text' or 'content' column. \
+                )
+                .map_err(|_| {
+                    anyhow::anyhow!(
+                        "Parquet file does not have a 'text' or 'content' column. \
                      For multi-column formats (e.g., reasoning with problem/thinking/solution), \
                      convert to JSONL first using `pmetal data prepare`."
-                ))?
+                    )
+                })?
             }
         }
     } else {
@@ -2992,7 +3000,9 @@ async fn run_inference(
         // Falls back to GPU if ANE compilation fails (e.g., hybrid architectures)
         #[cfg(feature = "ane")]
         let ane_output: Option<GenerationOutput> = if ane {
-            tracing::info!("Attempting ANE-hybrid inference engine (Prefill: ANE, Decode: CPU/vDSP)");
+            tracing::info!(
+                "Attempting ANE-hybrid inference engine (Prefill: ANE, Decode: CPU/vDSP)"
+            );
             match pmetal_models::generate_cached_ane(&model_path, &input_ids, &gen_config) {
                 Ok(output) => Some(output),
                 Err(e) => {

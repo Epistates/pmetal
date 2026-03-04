@@ -518,12 +518,10 @@ impl Qwen3NextLoraGDN {
 
         // 4 separate projections matching HF weight format (qwen3_5.py:136-139)
         let qkv = self.in_proj_qkv.forward(inputs)?;
-        let z = self.in_proj_z.forward(inputs)?.reshape(&[
-            b,
-            s,
-            self.num_v_heads,
-            self.head_v_dim,
-        ])?;
+        let z =
+            self.in_proj_z
+                .forward(inputs)?
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?;
         let b_val = Module::forward(&mut self.in_proj_b, inputs)?;
         let a = Module::forward(&mut self.in_proj_a, inputs)?;
 

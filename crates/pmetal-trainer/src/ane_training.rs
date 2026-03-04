@@ -91,10 +91,7 @@ impl AneTrainingLoop {
     /// Install vocab compaction for faster classifier operations.
     ///
     /// Must be called after `load_weights_*` and before `compile_kernels()`.
-    pub fn install_vocab_map(
-        &mut self,
-        vocab_map: pmetal_metal::ane::dynamic_trainer::VocabMap,
-    ) {
+    pub fn install_vocab_map(&mut self, vocab_map: pmetal_metal::ane::dynamic_trainer::VocabMap) {
         self.trainer.install_vocab_map(vocab_map);
     }
 

@@ -824,9 +824,7 @@ pub fn load_qwen3_next_weights(
             &unmatched[..unmatched.len().min(20)]
         );
     } else {
-        tracing::info!(
-            "Qwen3Next weight loading: all {matched} weights matched successfully"
-        );
+        tracing::info!("Qwen3Next weight loading: all {matched} weights matched successfully");
     }
     Ok(())
 }

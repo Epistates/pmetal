@@ -150,7 +150,6 @@ impl VocabMap {
             })
             .collect()
     }
-
 }
 
 impl DynamicAneTrainerConfig {
@@ -168,10 +167,10 @@ impl DynamicAneTrainerConfig {
         const INCOMPATIBLE: &[&str] = &[
             "qwen3_5",
             "qwen3_5_text",
-            "qwen3_next",    // GDN hybrid
-            "nemotron_h",    // Mamba hybrid
+            "qwen3_next",     // GDN hybrid
+            "nemotron_h",     // Mamba hybrid
             "recurrentgemma", // RG-LRU hybrid
-            "jamba",         // Mamba hybrid
+            "jamba",          // Mamba hybrid
         ];
         if INCOMPATIBLE.contains(&model_type) {
             return Err(format!(
@@ -416,15 +415,15 @@ impl DynamicAneTrainer {
         let mut layer_grads = Vec::with_capacity(nl);
         let mut layer_adam = Vec::with_capacity(nl);
 
-        let qd = kernel_config.q_dim();   // n_heads * head_dim
+        let qd = kernel_config.q_dim(); // n_heads * head_dim
         let kvd = kernel_config.kv_dim(); // n_kv_heads * head_dim
 
         for _ in 0..nl {
             layer_weights.push(LayerWeights {
-                wq: vec![0.0; qd * d],   // [q_dim, dim]
-                wk: vec![0.0; kvd * d],  // [kv_dim, dim]
-                wv: vec![0.0; kvd * d],  // [kv_dim, dim]
-                wo: vec![0.0; d * qd],   // [dim, q_dim]
+                wq: vec![0.0; qd * d],  // [q_dim, dim]
+                wk: vec![0.0; kvd * d], // [kv_dim, dim]
+                wv: vec![0.0; kvd * d], // [kv_dim, dim]
+                wo: vec![0.0; d * qd],  // [dim, q_dim]
                 w1: vec![0.0; h * d],
                 w2: vec![0.0; d * h],
                 w3: vec![0.0; h * d],
@@ -442,9 +441,9 @@ impl DynamicAneTrainer {
             layer_acts.push(LayerActivations {
                 layer_in: vec![0.0; d * s],
                 xnorm: vec![0.0; d * s],
-                q: vec![0.0; qd * s],   // [q_dim, seq]
-                k: vec![0.0; kvd * s],  // [kv_dim, seq]
-                v: vec![0.0; kvd * s],  // [kv_dim, seq]
+                q: vec![0.0; qd * s],        // [q_dim, seq]
+                k: vec![0.0; kvd * s],       // [kv_dim, seq]
+                v: vec![0.0; kvd * s],       // [kv_dim, seq]
                 attn_out: vec![0.0; qd * s], // [q_dim, seq] (before Wo)
                 o_out: vec![0.0; d * s],
                 x2: vec![0.0; d * s],
@@ -609,15 +608,22 @@ impl DynamicAneTrainer {
                 } else {
                     Some(&out.static_weights)
                 };
-                debug!(name, ic = out.input_layout.ic, sp = out.input_layout.total_spatial,
-                    "Compiling dynamic kernel");
+                debug!(
+                    name,
+                    ic = out.input_layout.ic,
+                    sp = out.input_layout.total_spatial,
+                    "Compiling dynamic kernel"
+                );
                 if let Err(e) = rt.compile(out.mil_text.as_bytes(), wd) {
                     tracing::error!("Failed to compile {name}: {e}");
                     let mil_path = format!("/tmp/ane_debug_{name}.mil");
                     if let Err(we) = std::fs::write(&mil_path, &out.mil_text) {
                         tracing::error!("Could not write debug MIL to {mil_path}: {we}");
                     } else {
-                        tracing::error!("Full MIL written to {mil_path} ({} bytes)", out.mil_text.len());
+                        tracing::error!(
+                            "Full MIL written to {mil_path} ({} bytes)",
+                            out.mil_text.len()
+                        );
                     }
                     return Err(e);
                 }
@@ -626,12 +632,12 @@ impl DynamicAneTrainer {
 
         // 1. Determine unique projection shapes needed
         let mut proj_shapes: Vec<(usize, usize)> = vec![
-            (d, qd),   // Q fwd, Wo^T bwd
-            (d, kvd),  // K fwd, V fwd
-            (qd, d),   // Wo fwd, Wq^T bwd
-            (d, h),    // W1 fwd, W3 fwd, W2^T bwd
-            (h, d),    // W2 fwd, W1^T bwd, W3^T bwd
-            (kvd, d),  // Wk^T bwd, Wv^T bwd
+            (d, qd),  // Q fwd, Wo^T bwd
+            (d, kvd), // K fwd, V fwd
+            (qd, d),  // Wo fwd, Wq^T bwd
+            (d, h),   // W1 fwd, W3 fwd, W2^T bwd
+            (h, d),   // W2 fwd, W1^T bwd, W3^T bwd
+            (kvd, d), // Wk^T bwd, Wv^T bwd
         ];
         proj_shapes.sort();
         proj_shapes.dedup();
@@ -719,10 +725,10 @@ impl DynamicAneTrainer {
         let kvd = self.kernel_config.kv_dim();
 
         for lw in &mut self.layer_weights {
-            transpose_weight(&lw.wq, &mut lw.wq_t, qd, d);   // [qd, d] → [d, qd]
-            transpose_weight(&lw.wk, &mut lw.wk_t, kvd, d);  // [kvd, d] → [d, kvd]
-            transpose_weight(&lw.wv, &mut lw.wv_t, kvd, d);  // [kvd, d] → [d, kvd]
-            transpose_weight(&lw.wo, &mut lw.wo_t, d, qd);   // [d, qd] → [qd, d]
+            transpose_weight(&lw.wq, &mut lw.wq_t, qd, d); // [qd, d] → [d, qd]
+            transpose_weight(&lw.wk, &mut lw.wk_t, kvd, d); // [kvd, d] → [d, kvd]
+            transpose_weight(&lw.wv, &mut lw.wv_t, kvd, d); // [kvd, d] → [d, kvd]
+            transpose_weight(&lw.wo, &mut lw.wo_t, d, qd); // [d, qd] → [qd, d]
             transpose_weight(&lw.w1, &mut lw.w1_t, h, d);
             transpose_weight(&lw.w2, &mut lw.w2_t, d, h);
             transpose_weight(&lw.w3, &mut lw.w3_t, h, d);
@@ -755,10 +761,9 @@ impl DynamicAneTrainer {
         output: &mut [f32],
     ) -> Result<()> {
         let key = (ic, oc);
-        let kernel = kernels
-            .projections
-            .get(&key)
-            .ok_or_else(|| MetalError::InvalidConfig(format!("No projection kernel for ({ic}, {oc})")))?;
+        let kernel = kernels.projections.get(&key).ok_or_else(|| {
+            MetalError::InvalidConfig(format!("No projection kernel for ({ic}, {oc})"))
+        })?;
         let io_in = io.proj_inputs.get(&key).unwrap();
         let io_out = io.proj_outputs.get(&key).unwrap();
 
@@ -815,7 +820,16 @@ impl DynamicAneTrainer {
         io.sdpa_attn_out.read_f32(&mut acts.attn_out, 0, qd, s);
 
         // 6. Wo projection: attn_out @ Wo → o_out
-        Self::run_projection(kernels, io, qd, d, s, &acts.attn_out, &lw.wo, &mut acts.o_out)?;
+        Self::run_projection(
+            kernels,
+            io,
+            qd,
+            d,
+            s,
+            &acts.attn_out,
+            &lw.wo,
+            &mut acts.o_out,
+        )?;
 
         // 7. Residual: x2 = x + o_out
         accelerate::vadd(x, &acts.o_out, &mut acts.x2);
@@ -838,7 +852,16 @@ impl DynamicAneTrainer {
         }
 
         // 12. W2 projection: silu_out @ W2 → ffn_out
-        Self::run_projection(kernels, io, h, d, s, &acts.silu_out, &lw.w2, &mut acts.ffn_out)?;
+        Self::run_projection(
+            kernels,
+            io,
+            h,
+            d,
+            s,
+            &acts.silu_out,
+            &lw.w2,
+            &mut acts.ffn_out,
+        )?;
 
         // 13. Residual: x = x2 + ffn_out
         accelerate::vadd(&acts.x2, &acts.ffn_out, x);
@@ -871,7 +894,16 @@ impl DynamicAneTrainer {
 
         // 1. dffn @ W2^T → dsilu_raw (projection kernel)
         let mut dsilu_raw = vec![0.0f32; h * s];
-        Self::run_projection(kernels, io, d, h, s, dx, &self.layer_weights[l].w2_t, &mut dsilu_raw)?;
+        Self::run_projection(
+            kernels,
+            io,
+            d,
+            h,
+            s,
+            dx,
+            &self.layer_weights[l].w2_t,
+            &mut dsilu_raw,
+        )?;
 
         // 2. Async dW2 = dx @ silu_out^T (on cblas worker)
         {
@@ -928,23 +960,57 @@ impl DynamicAneTrainer {
                 let w1_grad =
                     unsafe { std::slice::from_raw_parts_mut(w1_grad_ptr as *mut f32, w1_grad_len) };
                 accelerate::gemm(
-                    &dh1_clone, &x2norm_clone, w1_grad,
-                    h_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dh1_clone,
+                    &x2norm_clone,
+                    w1_grad,
+                    h_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
                 let w3_grad =
                     unsafe { std::slice::from_raw_parts_mut(w3_grad_ptr as *mut f32, w3_grad_len) };
                 accelerate::gemm(
-                    &dh3_clone, &x2norm_clone, w3_grad,
-                    h_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dh3_clone,
+                    &x2norm_clone,
+                    w3_grad,
+                    h_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
             }));
         }
 
         // 4. dh1@W1^T → dx1, dh3@W3^T → dx3, then dx_ffn = dx1 + dx3
         let mut dx1 = vec![0.0f32; d * s];
-        Self::run_projection(kernels, io, h, d, s, &dh1, &self.layer_weights[l].w1_t, &mut dx1)?;
+        Self::run_projection(
+            kernels,
+            io,
+            h,
+            d,
+            s,
+            &dh1,
+            &self.layer_weights[l].w1_t,
+            &mut dx1,
+        )?;
         let mut dx3 = vec![0.0f32; d * s];
-        Self::run_projection(kernels, io, h, d, s, &dh3, &self.layer_weights[l].w3_t, &mut dx3)?;
+        Self::run_projection(
+            kernels,
+            io,
+            h,
+            d,
+            s,
+            &dh3,
+            &self.layer_weights[l].w3_t,
+            &mut dx3,
+        )?;
         let mut dx_ffn = vec![0.0f32; d * s];
         accelerate::vadd(&dx1, &dx3, &mut dx_ffn);
 
@@ -964,7 +1030,16 @@ impl DynamicAneTrainer {
 
         // 6. dy @ Wo^T → da (projection kernel)
         let mut da = vec![0.0f32; qd * s];
-        Self::run_projection(kernels, io, d, qd, s, &dx_ffn_norm, &self.layer_weights[l].wo_t, &mut da)?;
+        Self::run_projection(
+            kernels,
+            io,
+            d,
+            qd,
+            s,
+            &dx_ffn_norm,
+            &self.layer_weights[l].wo_t,
+            &mut da,
+        )?;
 
         // Async dWo = dx_ffn_norm @ attn_out^T
         {
@@ -979,8 +1054,16 @@ impl DynamicAneTrainer {
                 let wo_grad =
                     unsafe { std::slice::from_raw_parts_mut(wo_grad_ptr as *mut f32, wo_grad_len) };
                 accelerate::gemm(
-                    &dx_clone, &attn_clone, wo_grad,
-                    d_val, qd_val, s_val, 1.0, 1.0, false, true,
+                    &dx_clone,
+                    &attn_clone,
+                    wo_grad,
+                    d_val,
+                    qd_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
             }));
         }
@@ -989,8 +1072,10 @@ impl DynamicAneTrainer {
         let acts = &self.layer_acts[l];
         io.sdpa_bwd1_in.write_f32_as_fp16_at(0, &acts.q, qd, s);
         io.sdpa_bwd1_in.write_f32_as_fp16_at(qd, &acts.k, kvd, s);
-        io.sdpa_bwd1_in.write_f32_as_fp16_at(qd + kvd, &acts.v, kvd, s);
-        io.sdpa_bwd1_in.write_f32_as_fp16_at(qd + 2 * kvd, &da, qd, s);
+        io.sdpa_bwd1_in
+            .write_f32_as_fp16_at(qd + kvd, &acts.v, kvd, s);
+        io.sdpa_bwd1_in
+            .write_f32_as_fp16_at(qd + 2 * kvd, &da, qd, s);
 
         kernels
             .sdpa_bwd1
@@ -1000,9 +1085,12 @@ impl DynamicAneTrainer {
         io.sdpa_bwd1_out.read_fp16_as_f32(&mut dv, 0, kvd, s);
 
         // 8. SDPA backward part 2: probs, dp, Q, K → dQ, dK
-        io.sdpa_bwd2_in.copy_from(0, &io.sdpa_bwd1_out, kvd, 2 * score_ch, s);
-        io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch, &acts.q, qd, s);
-        io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch + qd, &acts.k, kvd, s);
+        io.sdpa_bwd2_in
+            .copy_from(0, &io.sdpa_bwd1_out, kvd, 2 * score_ch, s);
+        io.sdpa_bwd2_in
+            .write_f32_as_fp16_at(2 * score_ch, &acts.q, qd, s);
+        io.sdpa_bwd2_in
+            .write_f32_as_fp16_at(2 * score_ch + qd, &acts.k, kvd, s);
 
         kernels
             .sdpa_bwd2
@@ -1033,20 +1121,44 @@ impl DynamicAneTrainer {
                 let wq_grad =
                     unsafe { std::slice::from_raw_parts_mut(wq_grad_ptr as *mut f32, wq_grad_len) };
                 accelerate::gemm(
-                    &dq_clone, &xnorm_clone, wq_grad,
-                    qd_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dq_clone,
+                    &xnorm_clone,
+                    wq_grad,
+                    qd_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
                 let wk_grad =
                     unsafe { std::slice::from_raw_parts_mut(wk_grad_ptr as *mut f32, wk_grad_len) };
                 accelerate::gemm(
-                    &dk_clone, &xnorm_clone, wk_grad,
-                    kvd_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dk_clone,
+                    &xnorm_clone,
+                    wk_grad,
+                    kvd_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
                 let wv_grad =
                     unsafe { std::slice::from_raw_parts_mut(wv_grad_ptr as *mut f32, wv_grad_len) };
                 accelerate::gemm(
-                    &dv_clone, &xnorm_clone, wv_grad,
-                    kvd_val, d_val, s_val, 1.0, 1.0, false, true,
+                    &dv_clone,
+                    &xnorm_clone,
+                    wv_grad,
+                    kvd_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
                 );
             }));
         }
@@ -1054,11 +1166,38 @@ impl DynamicAneTrainer {
         // 9. QKV backward: individual projections + CPU add
         let mut dx_attn = vec![0.0f32; d * s];
         let mut dxq = vec![0.0f32; d * s];
-        Self::run_projection(kernels, io, qd, d, s, &dq, &self.layer_weights[l].wq_t, &mut dxq)?;
+        Self::run_projection(
+            kernels,
+            io,
+            qd,
+            d,
+            s,
+            &dq,
+            &self.layer_weights[l].wq_t,
+            &mut dxq,
+        )?;
         let mut dxk = vec![0.0f32; d * s];
-        Self::run_projection(kernels, io, kvd, d, s, &dk, &self.layer_weights[l].wk_t, &mut dxk)?;
+        Self::run_projection(
+            kernels,
+            io,
+            kvd,
+            d,
+            s,
+            &dk,
+            &self.layer_weights[l].wk_t,
+            &mut dxk,
+        )?;
         let mut dxv = vec![0.0f32; d * s];
-        Self::run_projection(kernels, io, kvd, d, s, &dv, &self.layer_weights[l].wv_t, &mut dxv)?;
+        Self::run_projection(
+            kernels,
+            io,
+            kvd,
+            d,
+            s,
+            &dv,
+            &self.layer_weights[l].wv_t,
+            &mut dxv,
+        )?;
         // dx_attn = dxq + dxk + dxv
         accelerate::vadd(&dxq, &dxk, &mut dx_attn);
         accelerate::vadd(&dx_attn, &dxv, &mut dxq); // reuse dxq as temp
@@ -1161,9 +1300,8 @@ impl DynamicAneTrainer {
                 let d_val = d;
                 let s_val = s;
                 self.dispatch_dw(Box::new(move || {
-                    let grad = unsafe {
-                        std::slice::from_raw_parts_mut(grad_ptr as *mut f32, grad_len)
-                    };
+                    let grad =
+                        unsafe { std::slice::from_raw_parts_mut(grad_ptr as *mut f32, grad_len) };
                     accelerate::gemm(
                         &dlogits_clone,
                         &x_final_clone,
@@ -1199,8 +1337,7 @@ impl DynamicAneTrainer {
             );
 
             let mut dlogits = vec![0.0f32; v * s];
-            let loss =
-                accelerate::cross_entropy_loss(&mut dlogits, &logits, target_tokens, v, s);
+            let loss = accelerate::cross_entropy_loss(&mut dlogits, &logits, target_tokens, v, s);
 
             let mut dx = vec![0.0f32; d * s];
             accelerate::gemm(
@@ -1890,5 +2027,4 @@ mod tests {
         });
         assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_err());
     }
-
 }

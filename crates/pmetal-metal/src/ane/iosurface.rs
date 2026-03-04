@@ -167,13 +167,7 @@ impl IoSurface {
     /// Writes `channels * spatial` f32 elements starting at `ch_offset * spatial`.
     /// No dtype conversion — used for writing activations into fp32 surfaces
     /// (e.g. concatenating Q, K, V for the attention kernel).
-    pub fn write_f32_at(
-        &self,
-        ch_offset: usize,
-        data: &[f32],
-        channels: usize,
-        spatial: usize,
-    ) {
+    pub fn write_f32_at(&self, ch_offset: usize, data: &[f32], channels: usize, spatial: usize) {
         let n = channels * spatial;
         let offset = ch_offset * spatial;
         debug_assert_eq!(data.len(), n);

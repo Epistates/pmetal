@@ -500,14 +500,8 @@ impl TrainingDataset {
                 })?;
 
                 let problem = obj.get("problem").and_then(|v| v.as_str()).unwrap_or("");
-                let thinking = obj
-                    .get("thinking")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let solution = obj
-                    .get("solution")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let thinking = obj.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+                let solution = obj.get("solution").and_then(|v| v.as_str()).unwrap_or("");
 
                 let prompt = problem.to_string();
                 let response = if thinking.is_empty() {

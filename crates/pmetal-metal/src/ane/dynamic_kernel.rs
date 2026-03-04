@@ -193,13 +193,7 @@ fn emit_gqa_expand(
     p.emit_scalar_const(&cat_il, "bool", "false");
     let copies: Vec<&str> = (0..groups).map(|_| merged.as_str()).collect();
     let expanded = p.next_var(&format!("{prefix}_ex"));
-    p.emit_concat(
-        &expanded,
-        &[1, nkv, groups, hds],
-        &cat_ax,
-        &cat_il,
-        &copies,
-    );
+    p.emit_concat(&expanded, &[1, nkv, groups, hds], &cat_ax, &cat_il, &copies);
 
     // Reshape to [1, nh, hd, S]
     let nh_rsh = p.next_var(&format!("{prefix}_nr"));
@@ -631,12 +625,7 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     // Packed column-wise: qd columns of d channels each.
     // Reshape to [1, 1, d, qd] then matmul: attn[1,1,s,qd] @ Wo^T[1,1,qd,d] → [1,1,s,d]
     let wo_begin = p.next_var("wob");
-    p.emit_tensor_const(
-        &wo_begin,
-        &[4],
-        "int32",
-        &format!("[0,0,0,{}]", wo_offset),
-    );
+    p.emit_tensor_const(&wo_begin, &[4], "int32", &format!("[0,0,0,{}]", wo_offset));
     let wo_size = p.next_var("wos");
     p.emit_tensor_const(&wo_size, &[4], "int32", &format!("[1,{d},1,{qd}]"));
     let wo_raw = p.next_var("wor");
@@ -1917,7 +1906,7 @@ mod tests {
     fn test_gqa_config_invariants() {
         let dkc = gqa_config();
         let c = &dkc.cfg;
-        assert_eq!(c.q_dim(), 64);  // 4 * 16
+        assert_eq!(c.q_dim(), 64); // 4 * 16
         assert_eq!(c.kv_dim(), 32); // 2 * 16
         assert_eq!(c.n_groups(), 2);
         assert_ne!(c.q_dim(), c.kv_dim()); // Key: GQA means q_dim != kv_dim
@@ -1926,10 +1915,10 @@ mod tests {
     #[test]
     fn test_gqa_sdpa_fwd() {
         let dkc = gqa_config();
-        let qd = dkc.cfg.q_dim();  // 64
+        let qd = dkc.cfg.q_dim(); // 64
         let kvd = dkc.cfg.kv_dim(); // 32
-        let d = dkc.cfg.dim;        // 64
-        let s = dkc.cfg.seq_len;    // 32
+        let d = dkc.cfg.dim; // 64
+        let s = dkc.cfg.seq_len; // 32
 
         let out = gen_dynamic_sdpa_fwd(&dkc);
         assert!(out.mil_text.contains("program(1.3)"));
@@ -1946,7 +1935,7 @@ mod tests {
     #[test]
     fn test_gqa_sdpa_bwd1() {
         let dkc = gqa_config();
-        let qd = dkc.cfg.q_dim();  // 64
+        let qd = dkc.cfg.q_dim(); // 64
         let kvd = dkc.cfg.kv_dim(); // 32
         let score_ch = dkc.cfg.n_heads * dkc.cfg.seq_len; // 4 * 32 = 128
 
@@ -1964,7 +1953,7 @@ mod tests {
     #[test]
     fn test_gqa_sdpa_bwd2() {
         let dkc = gqa_config();
-        let qd = dkc.cfg.q_dim();  // 64
+        let qd = dkc.cfg.q_dim(); // 64
         let kvd = dkc.cfg.kv_dim(); // 32
         let score_ch = dkc.cfg.n_heads * dkc.cfg.seq_len; // 4 * 32 = 128
 
@@ -1983,8 +1972,8 @@ mod tests {
     fn test_gqa_qkv_bwd_q() {
         let dkc = gqa_config();
         let qd = dkc.cfg.q_dim(); // 64
-        let d = dkc.cfg.dim;      // 64
-        let s = dkc.cfg.seq_len;  // 32
+        let d = dkc.cfg.dim; // 64
+        let s = dkc.cfg.seq_len; // 32
 
         let out = gen_dynamic_qkv_bwd_q(&dkc);
         assert!(out.mil_text.contains("matmul("));
@@ -2000,8 +1989,8 @@ mod tests {
     fn test_gqa_qkv_bwd_kv() {
         let dkc = gqa_config();
         let kvd = dkc.cfg.kv_dim(); // 32
-        let d = dkc.cfg.dim;        // 64
-        let s = dkc.cfg.seq_len;    // 32
+        let d = dkc.cfg.dim; // 64
+        let s = dkc.cfg.seq_len; // 32
 
         let out = gen_dynamic_qkv_bwd_kv(&dkc);
         assert!(out.mil_text.contains("add("));
@@ -2062,7 +2051,13 @@ mod tests {
     #[test]
     fn test_dynamic_projection_qwen3_shapes() {
         // Qwen3-0.6B: dim=1024, q_dim=2048, kv_dim=1024, hidden=3072
-        let shapes = [(1024, 2048), (1024, 1024), (2048, 1024), (1024, 3072), (3072, 1024)];
+        let shapes = [
+            (1024, 2048),
+            (1024, 1024),
+            (2048, 1024),
+            (1024, 3072),
+            (3072, 1024),
+        ];
         let seq = 64;
         for (ic, oc) in shapes {
             let out = gen_dynamic_projection(ic, oc, seq);

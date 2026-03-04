@@ -682,12 +682,10 @@ impl Qwen3NextGatedDeltaNet {
 
         // 4 separate projections matching HF weight format (qwen3_5.py:136-139)
         let qkv = self.in_proj_qkv.forward(inputs)?;
-        let z = self.in_proj_z.forward(inputs)?.reshape(&[
-            b,
-            s,
-            self.num_v_heads,
-            self.head_v_dim,
-        ])?;
+        let z =
+            self.in_proj_z
+                .forward(inputs)?
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?;
         let b_val = self.in_proj_b.forward(inputs)?;
         let a = self.in_proj_a.forward(inputs)?;
 
