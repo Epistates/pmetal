@@ -152,7 +152,7 @@ pub struct TrainingConfig {
     pub batch_size: usize,
 
     /// Gradient accumulation steps.
-    #[serde(default = "default_one")]
+    #[serde(default = "default_gradient_accumulation_steps")]
     pub gradient_accumulation_steps: usize,
 
     /// Number of training epochs.
@@ -226,7 +226,7 @@ impl Default for TrainingConfig {
             learning_rate: default_lr(),
             embedding_learning_rate: None,
             batch_size: default_batch_size(),
-            gradient_accumulation_steps: default_one(),
+            gradient_accumulation_steps: default_gradient_accumulation_steps(),
             num_epochs: default_epochs(),
             max_steps: None,
             warmup_steps: default_warmup(),
@@ -265,15 +265,19 @@ pub enum LrSchedulerType {
 }
 
 /// Gradient checkpointing strategy.
+///
+/// **Not yet implemented for the MLX backend** — selecting a strategy other than
+/// `None` has no effect on peak memory usage. The option is retained so configs
+/// remain forward-compatible once backend support lands.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointStrategy {
-    /// No checkpointing.
+    /// No checkpointing (default — gradient checkpointing is not yet implemented).
+    #[default]
     None,
     /// Checkpoint every N layers.
     EveryN(usize),
     /// Smart checkpointing based on memory budget.
-    #[default]
     Smart,
     /// Selective attention-only checkpointing.
     SelectiveAttention,
@@ -359,10 +363,10 @@ fn default_lr() -> f64 {
     2e-4
 }
 fn default_batch_size() -> usize {
-    4
-}
-fn default_one() -> usize {
     1
+}
+fn default_gradient_accumulation_steps() -> usize {
+    4
 }
 fn default_epochs() -> usize {
     3

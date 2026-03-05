@@ -70,7 +70,7 @@ async fn main() -> BoxResult<()> {
     // 6. Configure training
     let training_config = pmetal::core::TrainingConfig {
         learning_rate: 2e-4,
-        batch_size: 4,
+        batch_size: 1,
         num_epochs: 3,
         max_seq_len: 2048,
         output_dir: output_dir.to_string_lossy().to_string(),
@@ -78,7 +78,7 @@ async fn main() -> BoxResult<()> {
     };
 
     let dataloader_config = DataLoaderConfig {
-        batch_size: 4,
+        batch_size: 1,
         max_seq_len: 2048,
         shuffle: true,
         seed: 42,

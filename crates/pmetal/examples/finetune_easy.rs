@@ -31,7 +31,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .lora(16, 32.0)
         .epochs(3)
         .learning_rate(2e-4)
-        .batch_size(4)
+        .batch_size(1)
         .output("./output")
         .run()
         .await?;

@@ -264,8 +264,8 @@ pub mod app {
                     ListItem::new(format!("Tok/sec:   {:.0}", last.tok_sec)),
                     ListItem::new(format!("Samples:   {}", self.samples.len())),
                     ListItem::new(""),
-                    ListItem::new(format!("Pipeline:  Dynamic (9 kernels)")),
-                    ListItem::new(format!("Compiles:  9 (one-time)")),
+                    ListItem::new("Pipeline:  Dynamic (9 kernels)".to_string()),
+                    ListItem::new("Compiles:  9 (one-time)".to_string()),
                 ]
             } else {
                 vec![ListItem::new("Waiting...")]

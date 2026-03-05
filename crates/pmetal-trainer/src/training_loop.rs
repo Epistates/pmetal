@@ -298,6 +298,30 @@ fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
     Ok(loss)
 }
 
+/// Evaluate all accumulated losses plus model params and optimizer states.
+///
+/// A single consolidated eval prevents the computation graph from growing
+/// unbounded in deferred-eval mode. Evaluating only the losses (as prior
+/// code did) leaves params and optimizer states (momentum, velocity) as
+/// lazy nodes, causing Metal resource exhaustion on long runs.
+fn eval_training_state<M: Updatable, O: Updatable>(
+    accumulated_losses: &[Array],
+    state: &(M, O),
+) -> std::result::Result<(), Exception> {
+    let mut all_arrays: Vec<&Array> = accumulated_losses.iter().collect();
+
+    // Model parameters (flattened via Updatable blanket impl over ModuleParameters)
+    all_arrays.extend(state.0.updatable_states().into_iter());
+
+    // Optimizer states (momentum, velocity buffers)
+    all_arrays.extend(state.1.updatable_states().into_iter());
+
+    if !all_arrays.is_empty() {
+        mlx_rs::transforms::eval(all_arrays)?;
+    }
+    Ok(())
+}
+
 /// Training loop configuration.
 #[derive(Debug, Clone)]
 pub struct TrainingLoopConfig {
@@ -1567,8 +1591,7 @@ impl TrainingLoop {
                 if accumulated_losses.len() >= MAX_DEFERRED_STEPS
                     && self.step % self.config.log_every != 0
                 {
-                    let loss_refs: Vec<&Array> = accumulated_losses.iter().collect();
-                    mlx_rs::transforms::eval(loss_refs)?;
+                    eval_training_state(&accumulated_losses, &state)?;
                     for loss in &accumulated_losses {
                         let loss_val = loss.item::<f32>();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
@@ -1578,10 +1601,9 @@ impl TrainingLoop {
 
                 // Logging boundary: NOW we evaluate accumulated losses
                 if self.step % self.config.log_every == 0 {
-                    // Batch evaluate all accumulated losses together
-                    // This is much more efficient than per-step eval
-                    let loss_refs: Vec<&Array> = accumulated_losses.iter().collect();
-                    mlx_rs::transforms::eval(loss_refs)?;
+                    // Batch evaluate all accumulated losses, model params, and
+                    // optimizer states together to prevent graph growth
+                    eval_training_state(&accumulated_losses, &state)?;
 
                     // Now extract values and compute running loss
                     for loss in &accumulated_losses {
@@ -1642,8 +1664,7 @@ impl TrainingLoop {
                 {
                     // Eval any pending losses before checkpointing
                     if !accumulated_losses.is_empty() {
-                        let loss_refs: Vec<&Array> = accumulated_losses.iter().collect();
-                        mlx_rs::transforms::eval(loss_refs)?;
+                        eval_training_state(&accumulated_losses, &state)?;
                         for loss in &accumulated_losses {
                             let loss_val = loss.item::<f32>();
                             self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
@@ -1662,8 +1683,7 @@ impl TrainingLoop {
                     if self.step >= max {
                         // Eval any remaining losses before returning
                         if !accumulated_losses.is_empty() {
-                            let loss_refs: Vec<&Array> = accumulated_losses.iter().collect();
-                            mlx_rs::transforms::eval(loss_refs)?;
+                            eval_training_state(&accumulated_losses, &state)?;
                             for loss in &accumulated_losses {
                                 let loss_val = loss.item::<f32>();
                                 self.running_loss =
@@ -1680,8 +1700,7 @@ impl TrainingLoop {
 
         // Eval any remaining accumulated losses at end of training
         if !accumulated_losses.is_empty() {
-            let loss_refs: Vec<&Array> = accumulated_losses.iter().collect();
-            mlx_rs::transforms::eval(loss_refs)?;
+            eval_training_state(&accumulated_losses, &state)?;
             for loss in &accumulated_losses {
                 let loss_val = loss.item::<f32>();
                 self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
@@ -2097,9 +2116,9 @@ impl TrainingLoop {
 
                 // Logging boundary: NOW we evaluate accumulated losses
                 if self.step % self.config.log_every == 0 {
-                    // Batch evaluate all accumulated losses together
-                    let loss_refs: Vec<&Array> = accumulated_losses.iter().collect();
-                    mlx_rs::transforms::eval(loss_refs)?;
+                    // Batch evaluate all accumulated losses, model params, and
+                    // optimizer states together to prevent graph growth
+                    eval_training_state(&accumulated_losses, &state)?;
 
                     // Extract values and compute running loss via EMA
                     // Note: running_loss was initialized to warmup loss, so EMA works from step 1
@@ -2159,8 +2178,7 @@ impl TrainingLoop {
                 {
                     // Eval any pending losses before checkpointing
                     if !accumulated_losses.is_empty() {
-                        let loss_refs: Vec<&Array> = accumulated_losses.iter().collect();
-                        mlx_rs::transforms::eval(loss_refs)?;
+                        eval_training_state(&accumulated_losses, &state)?;
                         for loss in &accumulated_losses {
                             let loss_val = loss.item::<f32>();
                             self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
@@ -2178,8 +2196,7 @@ impl TrainingLoop {
                     if self.step >= max {
                         // Eval any remaining losses before returning
                         if !accumulated_losses.is_empty() {
-                            let loss_refs: Vec<&Array> = accumulated_losses.iter().collect();
-                            mlx_rs::transforms::eval(loss_refs)?;
+                            eval_training_state(&accumulated_losses, &state)?;
                         }
                         tracing::info!("Reached max_steps={}, stopping", max);
                         return Ok(state.0);
@@ -2190,8 +2207,7 @@ impl TrainingLoop {
 
         // Eval any remaining accumulated losses at end of training
         if !accumulated_losses.is_empty() {
-            let loss_refs: Vec<&Array> = accumulated_losses.iter().collect();
-            mlx_rs::transforms::eval(loss_refs)?;
+            eval_training_state(&accumulated_losses, &state)?;
             for loss in &accumulated_losses {
                 let loss_val = loss.item::<f32>();
                 self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;

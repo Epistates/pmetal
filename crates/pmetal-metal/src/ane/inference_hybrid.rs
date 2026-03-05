@@ -1504,7 +1504,7 @@ mod tests {
 
     #[test]
     fn test_softplus() {
-        assert!((softplus(0.0) - 0.6931).abs() < 0.01);
+        assert!((softplus(0.0) - std::f32::consts::LN_2).abs() < 0.01);
         assert!((softplus(30.0) - 30.0).abs() < 0.01); // Large x → x
         assert!(softplus(-30.0).abs() < 0.01); // Very negative → 0
     }
