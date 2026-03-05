@@ -363,16 +363,36 @@ impl AneInferenceEngine {
                 &lw.q_norm,
                 &lw.k_norm,
             );
-            let fwd_attn_kv = rt.compile(
+            let fwd_attn_kv = match rt.compile(
                 fwd_attn_out.mil_text.as_bytes(),
                 Some(&fwd_attn_out.weights),
-            )?;
+            ) {
+                Ok(model) => model,
+                Err(e) => {
+                    let _ = std::fs::write(
+                        format!("/tmp/ane_debug_layer{l}_attn.mil"),
+                        &fwd_attn_out.mil_text,
+                    );
+                    tracing::error!("SDPA kernel compile failed layer {l}: {e}");
+                    return Err(e);
+                }
+            };
             self.budget.record_compile();
 
             // Forward FFN (inference — no taps)
             let fwd_ffn_out = kernel::gen_ffn_fwd(cfg, &lw.rms_ffn, &lw.w1, &lw.w3, &lw.w2);
             let fwd_ffn =
-                rt.compile(fwd_ffn_out.mil_text.as_bytes(), Some(&fwd_ffn_out.weights))?;
+                match rt.compile(fwd_ffn_out.mil_text.as_bytes(), Some(&fwd_ffn_out.weights)) {
+                    Ok(model) => model,
+                    Err(e) => {
+                        let _ = std::fs::write(
+                            format!("/tmp/ane_debug_layer{l}_ffn.mil"),
+                            &fwd_ffn_out.mil_text,
+                        );
+                        tracing::error!("FFN kernel compile failed layer {l}: {e}");
+                        return Err(e);
+                    }
+                };
             self.budget.record_compile();
 
             layer_kernels.push(InferenceLayerKernels {
@@ -427,9 +447,9 @@ impl AneInferenceEngine {
         }
 
         // Embedding lookup → x [D, S] channel-first, zero-padded
-        let mut padded_tokens = vec![0u16; s];
+        let mut padded_tokens = vec![0u32; s];
         for (i, &tid) in token_ids.iter().enumerate() {
-            padded_tokens[i] = tid as u16;
+            padded_tokens[i] = tid;
         }
 
         let mut x = vec![0.0f32; d * s];
@@ -644,9 +664,9 @@ impl AneInferenceEngine {
             .ok_or_else(|| MetalError::InvalidConfig("IO pool not allocated".into()))?;
 
         // Embedding lookup → x [D, S] channel-first, zero-padded
-        let mut padded_tokens = vec![0u16; s];
+        let mut padded_tokens = vec![0u32; s];
         for (i, &tid) in token_ids.iter().enumerate() {
-            padded_tokens[i] = tid as u16;
+            padded_tokens[i] = tid;
         }
 
         let mut x = vec![0.0f32; d * s];

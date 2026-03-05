@@ -593,7 +593,10 @@ impl Qwen3NextLoraGDN {
         // Get SSM state from cache
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
 
-        // Run GDN recurrence (frozen kernel)
+        // Run GDN recurrence (frozen kernel).
+        // Training (cache=None) must use sequential path — tri_inv has no VJP.
+        // Inference (cache=Some) uses fast chunk path for prefill.
+        let is_training = cache.is_none();
         let (out, new_state) = gated_delta_update(
             &q_normed,
             &k_normed,
@@ -604,6 +607,7 @@ impl Qwen3NextLoraGDN {
             self.dt_bias.as_ref(),
             ssm_state,
             mask,
+            is_training,
         )?;
 
         // Update SSM state

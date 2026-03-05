@@ -1560,9 +1560,10 @@ impl TrainingLoop {
 
                 // Safety valve: prevent unbounded graph growth in deferred eval mode.
                 // Without gradient checkpointing (not available in MLX-rs), the computation
-                // graph grows per step. Evaluating every MAX_DEFERRED_STEPS prevents
-                // Metal resource limit (499000) exhaustion on complex architectures.
-                const MAX_DEFERRED_STEPS: usize = 50;
+                // graph grows per step. For architectures with sequential recurrence (GDN),
+                // each step creates O(T * n_layers) allocation nodes.  Evaluating every
+                // MAX_DEFERRED_STEPS prevents Metal resource limit (499000) exhaustion.
+                const MAX_DEFERRED_STEPS: usize = 5;
                 if accumulated_losses.len() >= MAX_DEFERRED_STEPS
                     && self.step % self.config.log_every != 0
                 {

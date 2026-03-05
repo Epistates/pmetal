@@ -709,8 +709,9 @@ impl AneTrainer {
         // === Forward pass ===
 
         // Embedding lookup → x [D, S] channel-first
+        let tokens_u32: Vec<u32> = input_tokens.iter().map(|&t| t as u32).collect();
         let mut x = vec![0.0f32; d * s];
-        accelerate::embed_lookup(&mut x, &self.embed_weights, input_tokens, d, s);
+        accelerate::embed_lookup(&mut x, &self.embed_weights, &tokens_u32, d, s);
 
         // Per-layer forward
         for l in 0..self.config.n_layers {
@@ -807,7 +808,8 @@ impl AneTrainer {
         }
 
         // Embedding backward
-        accelerate::embed_backward(&mut self.embed_grad, &dx, input_tokens, d, s);
+        let tokens_u32: Vec<u32> = input_tokens.iter().map(|&t| t as u32).collect();
+        accelerate::embed_backward(&mut self.embed_grad, &dx, &tokens_u32, d, s);
 
         Ok(loss)
     }

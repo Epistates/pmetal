@@ -42,6 +42,7 @@
 pub mod dynamic_kernel;
 pub mod dynamic_trainer;
 pub mod inference;
+pub mod inference_hybrid;
 pub mod iosurface;
 pub mod kernel;
 pub mod mil;

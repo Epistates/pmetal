@@ -760,7 +760,7 @@ impl Qwen3NextGatedDeltaNet {
         // Get SSM state from cache
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
 
-        // Run GDN recurrence
+        // Run GDN recurrence (inference only — base model has no training path)
         let (out, new_state) = gated_delta_update(
             &q_normed,
             &k_normed,
@@ -771,6 +771,7 @@ impl Qwen3NextGatedDeltaNet {
             self.dt_bias.as_ref(),
             ssm_state,
             mask,
+            false, // inference: use fast chunk path for long sequences
         )?;
 
         // Update SSM state in cache

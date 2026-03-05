@@ -822,7 +822,7 @@ pub fn silu_inplace(data: &mut [f32]) {
 ///
 /// `embed` is `[vocab, dim]` row-major. Transposes from row-major embedding
 /// to channel-first output layout.
-pub fn embed_lookup(x: &mut [f32], embed: &[f32], tokens: &[u16], dim: usize, seq: usize) {
+pub fn embed_lookup(x: &mut [f32], embed: &[f32], tokens: &[u32], dim: usize, seq: usize) {
     debug_assert_eq!(x.len(), dim * seq);
     debug_assert_eq!(tokens.len(), seq);
 
@@ -837,7 +837,7 @@ pub fn embed_lookup(x: &mut [f32], embed: &[f32], tokens: &[u16], dim: usize, se
 /// Embedding backward: accumulate gradients into `d_embed`.
 ///
 /// `dx` is channel-first `[dim, seq]`, `d_embed` is `[vocab, dim]` row-major.
-pub fn embed_backward(d_embed: &mut [f32], dx: &[f32], tokens: &[u16], dim: usize, seq: usize) {
+pub fn embed_backward(d_embed: &mut [f32], dx: &[f32], tokens: &[u32], dim: usize, seq: usize) {
     debug_assert_eq!(dx.len(), dim * seq);
     debug_assert_eq!(tokens.len(), seq);
 
@@ -1072,7 +1072,7 @@ mod tests {
         let seq = 3;
         // embed: [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
         let embed = vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6];
-        let tokens = vec![2u16, 0, 1];
+        let tokens = vec![2u32, 0, 1];
         let mut x = vec![0.0f32; dim * seq];
 
         embed_lookup(&mut x, &embed, &tokens, dim, seq);
@@ -1091,7 +1091,7 @@ mod tests {
         let seq = 2;
         let vocab = 3;
         let dx = vec![1.0, 2.0, 3.0, 4.0]; // [dim=2, seq=2] channel-first
-        let tokens = vec![1u16, 1]; // both positions point to token 1
+        let tokens = vec![1u32, 1]; // both positions point to token 1
         let mut d_embed = vec![0.0f32; vocab * dim];
 
         embed_backward(&mut d_embed, &dx, &tokens, dim, seq);

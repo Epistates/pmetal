@@ -37,6 +37,7 @@ use mlx_rs::{
     error::Exception,
     linalg, nn,
     ops::{self, indexing::IndexOp},
+    stop_gradient,
 };
 
 /// Chunk size for the chunkwise parallel GDN algorithm.
@@ -445,12 +446,19 @@ fn gated_delta_chunk_ops(
     // ========================================================================
     let i_plus_a_refs: Vec<&Array> = i_plus_a_list.iter().collect();
     let batched_ipa = ops::concatenate_axis(&i_plus_a_refs, 0)?; // [N*B*H, C, C]
-    let batched_inv = linalg::tri_inv_device(&batched_ipa, None, StreamOrDevice::cpu())?;
+    // stop_gradient: tri_inv has no VJP in MLX. The inverse is a fixed preconditioner
+    // in the WY factorization — gradients should not flow through matrix inversion.
+    // This matches the FLA reference impl which computes tri_inv in torch.no_grad().
+    let batched_inv = stop_gradient(&linalg::tri_inv_device(
+        &batched_ipa,
+        None,
+        StreamOrDevice::cpu(),
+    )?)?;
 
     // Split back per-chunk and precompute delta_v, t_inv_bg
     struct ChunkInvData {
-        delta_v: Array,    // [B, H, C, Dv]  = T_inv @ beta_v
-        t_inv_bg: Array,   // [B, H, C, C]   = T_inv * beta_gamma_row
+        delta_v: Array,  // [B, H, C, Dv]  = T_inv @ beta_v
+        t_inv_bg: Array, // [B, H, C, C]   = T_inv * beta_gamma_row
     }
 
     let mut inv_data: Vec<ChunkInvData> = Vec::with_capacity(n_chunks as usize);
@@ -540,6 +548,9 @@ fn gated_delta_chunk_ops(
 /// * `dt_bias` - Learnable bias, shape `[Hv]`
 /// * `state` - Optional initial state `[B, Hv, Dv, Dk]`
 /// * `mask` - Optional mask `[B, T]`
+/// * `training` - If true, forces sequential path (chunk path's `tri_inv` has no VJP
+///   and produces NaN inside `value_and_grad`). If false, dispatches to the chunk path
+///   for sequences longer than `GDN_CHUNK_SIZE` for O(T/64) prefill.
 ///
 /// # Returns
 /// (output `[B, T, Hv, Dv]`, final_state `[B, Hv, Dv, Dk]`)
@@ -554,6 +565,7 @@ pub fn gated_delta_update(
     dt_bias: &Array,
     state: Option<&Array>,
     mask: Option<&Array>,
+    training: bool,
 ) -> Result<(Array, Array), Exception> {
     // beta = sigmoid(b)
     let beta = nn::sigmoid(b)?;
@@ -575,14 +587,16 @@ pub fn gated_delta_update(
         }
     };
 
-    let t = q.dim(1);
-    if t > GDN_CHUNK_SIZE {
-        // Chunkwise parallel path: O(T/64) sequential steps with parallel matmuls
-        gated_delta_chunk_ops(q, k, v, &g, &beta, state_ref, mask)
-    } else {
-        // Sequential path: O(T) steps, optimal for short sequences / decode
-        gated_delta_ops(q, k, v, &g, &beta, Some(state_ref), mask)
+    // Training must use sequential path: tri_inv (CPU-only) has no VJP and produces
+    // NaN inside value_and_grad due to CPU↔GPU stream sync issues.
+    // Inference can use the fast chunk path (O(T/64) vs O(T) for prefill).
+    if !training {
+        let t = q.dim(1);
+        if t > GDN_CHUNK_SIZE {
+            return gated_delta_chunk_ops(q, k, v, &g, &beta, state_ref, mask);
+        }
     }
+    gated_delta_ops(q, k, v, &g, &beta, Some(state_ref), mask)
 }
 
 #[cfg(test)]
@@ -647,8 +661,10 @@ mod tests {
         let a_log = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[hv]);
         let dt_bias = Array::from_slice(&[0.1f32, 0.2, 0.3, 0.4], &[hv]);
 
-        let (y, state) =
-            gated_delta_update(&q, &k, &v, &a, &b_input, &a_log, &dt_bias, None, None).unwrap();
+        let (y, state) = gated_delta_update(
+            &q, &k, &v, &a, &b_input, &a_log, &dt_bias, None, None, false,
+        )
+        .unwrap();
 
         assert_eq!(y.shape(), &[b, t, hv, dv]);
         assert_eq!(state.shape(), &[b, hv, dv, dk]);
@@ -758,8 +774,7 @@ mod tests {
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Sequential reference
-        let (y_seq, state_seq) =
-            gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
+        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Chunk path
         let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
@@ -786,8 +801,7 @@ mod tests {
         mlx_rs::random::seed(456).unwrap();
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
-        let (y_seq, state_seq) =
-            gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
+        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
         let (y_chunk, state_chunk) =
@@ -859,15 +873,18 @@ mod tests {
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Sequential reference
-        let (y_seq, state_seq) =
-            gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
+        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Chunk path (will pad to 128)
         let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
         let (y_chunk, state_chunk) =
             gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
 
-        assert_eq!(y_chunk.shape(), &[b, t, hv, dv], "Output shape should be unpadded");
+        assert_eq!(
+            y_chunk.shape(),
+            &[b, t, hv, dv],
+            "Output shape should be unpadded"
+        );
         assert_close(&y_chunk, &y_seq, 1e-3, "T=100 output mismatch");
         assert_close(&state_chunk, &state_seq, 1e-3, "T=100 state mismatch");
     }
@@ -887,8 +904,7 @@ mod tests {
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Sequential reference
-        let (y_seq, state_seq) =
-            gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
+        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Chunk path
         let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
@@ -939,12 +955,7 @@ mod tests {
 
         assert_eq!(y_chunk.shape(), &[b, t, hv, dv]);
         // States should match since masked positions shouldn't update state
-        assert_close(
-            &state_chunk,
-            &state_ref,
-            1e-3,
-            "Masked state mismatch",
-        );
+        assert_close(&state_chunk, &state_ref, 1e-3, "Masked state mismatch");
     }
 
     #[test]
@@ -967,8 +978,10 @@ mod tests {
         let a_log = Array::from_slice(&[0.5f32, 1.0], &[hv]);
         let dt_bias = Array::from_slice(&[0.1f32, 0.2], &[hv]);
 
-        let (y, state) =
-            gated_delta_update(&q, &k, &v, &a, &b_input, &a_log, &dt_bias, None, None).unwrap();
+        let (y, state) = gated_delta_update(
+            &q, &k, &v, &a, &b_input, &a_log, &dt_bias, None, None, false,
+        )
+        .unwrap();
 
         assert_eq!(y.shape(), &[b, t, hv, dv]);
         assert_eq!(state.shape(), &[b, hv, dv, dk]);
@@ -993,15 +1006,18 @@ mod tests {
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Sequential reference
-        let (y_seq, state_seq) =
-            gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
+        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Chunk path (pads to 128)
         let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
         let (y_chunk, state_chunk) =
             gated_delta_chunk_ops(&q, &k, &v, &g, &beta, &state_init, None).unwrap();
 
-        assert_eq!(y_chunk.shape(), &[b, t, hv, dv], "Output shape should be unpadded");
+        assert_eq!(
+            y_chunk.shape(),
+            &[b, t, hv, dv],
+            "Output shape should be unpadded"
+        );
         assert_close(&y_chunk, &y_seq, 1e-3, "T=65 output mismatch");
         assert_close(&state_chunk, &state_seq, 1e-3, "T=65 state mismatch");
     }
@@ -1021,8 +1037,7 @@ mod tests {
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Sequential reference
-        let (y_seq, state_seq) =
-            gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
+        let (y_seq, state_seq) = gated_delta_ops(&q, &k, &v, &g, &beta, None, None).unwrap();
 
         // Chunk path
         let state_init = ops::zeros_dtype(&[b, hv, dv, dk], q.dtype()).unwrap();
@@ -1049,8 +1064,7 @@ mod tests {
         let (q, k, v, g, beta) = random_gdn_inputs(b, t, hk, dk, hv, dv);
 
         // Non-zero initial state
-        let state_init =
-            mlx_rs::random::normal::<f32>(&[b, hv, dv, dk], None, None, None).unwrap();
+        let state_init = mlx_rs::random::normal::<f32>(&[b, hv, dv, dk], None, None, None).unwrap();
 
         // Sequential reference with same initial state
         let (y_seq, state_seq) =

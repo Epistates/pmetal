@@ -257,14 +257,14 @@ pub fn build_causal_mask(seq_len: usize) -> Vec<u8> {
 /// Emit inline RMSNorm into a MIL program.
 ///
 /// Reads from `x`, writes normalized output to `xn`.
-fn emit_rmsnorm(p: &mut MilProgram, d: usize, s: usize, inv_d: f32, weight_path: &str) {
+fn emit_rmsnorm(p: &mut MilProgram, d: usize, s: usize, inv_d: f32, eps: f32, weight_path: &str) {
     p.emit_mul("sq", &[1, d, 1, s], "x", "x");
     p.emit_tensor_const("rax", &[1], "int32", "[1]");
     p.emit_scalar_const("kd", "bool", "true");
     p.emit_reduce_sum("ss", &[1, 1, 1, s], "sq", "rax", "kd");
     p.emit_scalar_const("invd", "fp16", &format!("{inv_d}"));
     p.emit_mul("ss2", &[1, 1, 1, s], "ss", "invd");
-    p.emit_scalar_const("eps", "fp16", "0.00001");
+    p.emit_scalar_const("eps", "fp16", &format!("{eps}"));
     p.emit_add("ss3", &[1, 1, 1, s], "ss2", "eps");
     p.emit_scalar_const("nhalf", "fp16", "-0.5");
     p.emit_pow("rrms", &[1, 1, 1, s], "ss3", "nhalf");
@@ -443,6 +443,59 @@ fn emit_rope(
     );
 }
 
+/// Expand a KV tensor from [1, kv_h, S, hd] to [1, nh, S, hd] for GQA using concat.
+///
+/// ANE's tile op is unreliable, so we use concat to replicate each KV head
+/// `groups` times. Pattern (post-transpose layout):
+/// - Merge S*hd dims: [1, kv_h, S, hd] → [1, kv_h, 1, S*hd]
+/// - Concat `groups` copies along axis=2: [1, kv_h, groups, S*hd]
+/// - Reshape back: [1, nh, S, hd]
+///
+/// `kv_var` must already be [1, kv_h, S, hd]. Returns the name of the
+/// expanded tensor [1, nh, S, hd].
+#[allow(clippy::too_many_arguments)]
+fn emit_gqa_expand_post_transpose(
+    p: &mut MilProgram,
+    prefix: &str,
+    kv_var: &str,
+    kv_h: usize,
+    nh: usize,
+    s: usize,
+    hd: usize,
+    groups: usize,
+) -> String {
+    let shd = s * hd;
+
+    // Merge last 2 dims: [1, kv_h, S, hd] → [1, kv_h, 1, S*hd]
+    let merge_rsh = format!("{prefix}_mrs");
+    p.emit_tensor_const(&merge_rsh, &[4], "int32", &format!("[1,{kv_h},1,{shd}]"));
+    let merged = format!("{prefix}_mg");
+    p.emit_reshape(&merged, &[1, kv_h, 1, shd], &merge_rsh, kv_var);
+
+    // Concat `groups` copies along axis=2
+    let cat_ax = format!("{prefix}_ca");
+    p.emit_scalar_const(&cat_ax, "int32", "2");
+    let cat_il = format!("{prefix}_ci");
+    p.emit_scalar_const(&cat_il, "bool", "false");
+    let copies: Vec<&str> = (0..groups).map(|_| merged.as_str()).collect();
+    let expanded = format!("{prefix}_ex");
+    p.emit_concat(
+        &expanded,
+        &[1, kv_h, groups, shd],
+        &cat_ax,
+        &cat_il,
+        &copies,
+    );
+
+    // Reshape to [1, nh, S, hd]
+    let nh_rsh = format!("{prefix}_nr");
+    p.emit_tensor_const(&nh_rsh, &[4], "int32", &format!("[1,{nh},{s},{hd}]"));
+    let result = format!("{prefix}_fn");
+    p.emit_reshape(&result, &[1, nh, s, hd], &nh_rsh, &expanded);
+
+    result
+}
+
 /// Validate the kernel configuration.
 pub fn validate_config(cfg: &TransformerKernelConfig) -> crate::error::Result<()> {
     use crate::error::MetalError;
@@ -499,7 +552,14 @@ pub fn gen_sdpa_fwd_taps(
     let mut p = MilProgram::new(d, s);
 
     // RMSNorm inline
-    emit_rmsnorm(&mut p, d, s, inv_d, "@model_path/weights/rms1.bin");
+    emit_rmsnorm(
+        &mut p,
+        d,
+        s,
+        inv_d,
+        cfg.rms_norm_eps,
+        "@model_path/weights/rms1.bin",
+    );
 
     // QKV convolutions — Wq projects dim→q_dim, Wo projects q_dim→dim
     p.emit_conv_constants();
@@ -524,19 +584,19 @@ pub fn gen_sdpa_fwd_taps(
     p.emit_reshape("v4", &[1, kv_h, hd, s], "kvsh", "vf");
     p.emit_transpose("v0", &[1, kv_h, s, hd], "pm", "v4");
 
+    // GQA: expand K, V along head axis to match n_heads using concat
     let (k_name, v_name) = if n_groups > 1 {
-        p.emit_tensor_const("greps", &[4], "int32", &format!("[1,{n_groups},1,1]"));
-        p.emit_tile("k", &[1, h, s, hd], "greps", "k0");
-        p.emit_tile("v", &[1, h, s, hd], "greps", "v0");
-        ("k", "v")
+        let k_exp = emit_gqa_expand_post_transpose(&mut p, "ke", "k0", kv_h, h, s, hd, n_groups);
+        let v_exp = emit_gqa_expand_post_transpose(&mut p, "ve", "v0", kv_h, h, s, hd, n_groups);
+        (k_exp, v_exp)
     } else {
-        ("k0", "v0")
+        ("k0".to_string(), "v0".to_string())
     };
 
     // Attention: scores = Q @ K^T * scale + mask
     p.emit_scalar_const("tx", "bool", "false");
     p.emit_scalar_const("ty", "bool", "true");
-    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", k_name);
+    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", &k_name);
     p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
     p.emit_mul("sc2", &[1, h, s, s], "sc1", "scv");
     p.emit_weight_const("cm", &[1, 1, s, s], "@model_path/weights/mask.bin");
@@ -547,7 +607,7 @@ pub fn gen_sdpa_fwd_taps(
     p.emit_softmax("aw", &[1, h, s, s], "sax", "ms");
 
     // Attention output: scores @ V, reshape back to [1, q_dim, 1, s], project to dim
-    p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", v_name);
+    p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", &v_name);
     p.emit_transpose("at", &[1, h, hd, s], "pm", "a4");
     p.emit_tensor_const("os", &[4], "int32", &format!("[1,{q_dim},1,{s}]"));
     p.emit_reshape("af", &[1, q_dim, 1, s], "os", "at");
@@ -628,7 +688,14 @@ pub fn gen_sdpa_fwd(
     let mut p = MilProgram::new(d, s);
 
     // RMSNorm inline
-    emit_rmsnorm(&mut p, d, s, inv_d, "@model_path/weights/rms1.bin");
+    emit_rmsnorm(
+        &mut p,
+        d,
+        s,
+        inv_d,
+        cfg.rms_norm_eps,
+        "@model_path/weights/rms1.bin",
+    );
 
     // QKV convolutions — Wq projects dim→q_dim, Wo projects q_dim→dim
     p.emit_conv_constants();
@@ -653,20 +720,19 @@ pub fn gen_sdpa_fwd(
     p.emit_reshape("v4", &[1, kv_h, hd, s], "kvsh", "vf");
     p.emit_transpose("v0", &[1, kv_h, s, hd], "pm", "v4");
 
-    // GQA: tile K, V along head axis to match n_heads
+    // GQA: expand K, V along head axis to match n_heads using concat
     let (k_name, v_name) = if n_groups > 1 {
-        p.emit_tensor_const("greps", &[4], "int32", &format!("[1,{n_groups},1,1]"));
-        p.emit_tile("k", &[1, h, s, hd], "greps", "k0");
-        p.emit_tile("v", &[1, h, s, hd], "greps", "v0");
-        ("k", "v")
+        let k_exp = emit_gqa_expand_post_transpose(&mut p, "ke", "k0", kv_h, h, s, hd, n_groups);
+        let v_exp = emit_gqa_expand_post_transpose(&mut p, "ve", "v0", kv_h, h, s, hd, n_groups);
+        (k_exp, v_exp)
     } else {
-        ("k0", "v0")
+        ("k0".to_string(), "v0".to_string())
     };
 
     // Attention: scores = Q @ K^T * scale + mask
     p.emit_scalar_const("tx", "bool", "false");
     p.emit_scalar_const("ty", "bool", "true");
-    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", k_name);
+    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", &k_name);
     p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
     p.emit_mul("sc2", &[1, h, s, s], "sc1", "scv");
     p.emit_weight_const("cm", &[1, 1, s, s], "@model_path/weights/mask.bin");
@@ -677,7 +743,7 @@ pub fn gen_sdpa_fwd(
     p.emit_softmax("aw", &[1, h, s, s], "sax", "ms");
 
     // Attention output: scores @ V, reshape back to [1, q_dim, 1, s], project to dim
-    p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", v_name);
+    p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", &v_name);
     p.emit_transpose("at", &[1, h, hd, s], "pm", "a4");
     p.emit_tensor_const("os", &[4], "int32", &format!("[1,{q_dim},1,{s}]"));
     p.emit_reshape("af", &[1, q_dim, 1, s], "os", "at");
@@ -752,7 +818,14 @@ pub fn gen_sdpa_fwd_kv(
     let mut p = MilProgram::new(d, s);
 
     // RMSNorm inline
-    emit_rmsnorm(&mut p, d, s, inv_d, "@model_path/weights/rms1.bin");
+    emit_rmsnorm(
+        &mut p,
+        d,
+        s,
+        inv_d,
+        cfg.rms_norm_eps,
+        "@model_path/weights/rms1.bin",
+    );
 
     // QKV convolutions — Wq projects dim→q_dim, Wo projects q_dim→dim
     p.emit_conv_constants();
@@ -824,20 +897,19 @@ pub fn gen_sdpa_fwd_kv(
     p.emit_reshape("v4", &[1, kv_h, hd, s], "kvsh", "vf");
     p.emit_transpose("v0", &[1, kv_h, s, hd], "pm", "v4");
 
-    // GQA: tile K, V along head axis to match n_heads
+    // GQA: expand K, V along head axis to match n_heads using concat
     let (k_name, v_name) = if n_groups > 1 {
-        p.emit_tensor_const("greps", &[4], "int32", &format!("[1,{n_groups},1,1]"));
-        p.emit_tile("k", &[1, h, s, hd], "greps", "k0");
-        p.emit_tile("v", &[1, h, s, hd], "greps", "v0");
-        ("k", "v")
+        let k_exp = emit_gqa_expand_post_transpose(&mut p, "ke", "k0", kv_h, h, s, hd, n_groups);
+        let v_exp = emit_gqa_expand_post_transpose(&mut p, "ve", "v0", kv_h, h, s, hd, n_groups);
+        (k_exp, v_exp)
     } else {
-        ("k0", "v0")
+        ("k0".to_string(), "v0".to_string())
     };
 
     // Attention: scores = Q @ K^T * scale + mask
     p.emit_scalar_const("tx", "bool", "false");
     p.emit_scalar_const("ty", "bool", "true");
-    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", k_name);
+    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", &k_name);
     p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
     p.emit_mul("sc2", &[1, h, s, s], "sc1", "scv");
     p.emit_weight_const("cm", &[1, 1, s, s], "@model_path/weights/mask.bin");
@@ -848,7 +920,7 @@ pub fn gen_sdpa_fwd_kv(
     p.emit_softmax("aw", &[1, h, s, s], "sax", "ms");
 
     // Attention output: scores @ V, reshape back to [1, q_dim, 1, s], project to dim
-    p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", v_name);
+    p.emit_matmul("a4", &[1, h, s, hd], "tx", "tx", "aw", &v_name);
     p.emit_transpose("at", &[1, h, hd, s], "pm", "a4");
     p.emit_tensor_const("os", &[4], "int32", &format!("[1,{q_dim},1,{s}]"));
     p.emit_reshape("af", &[1, q_dim, 1, s], "os", "at");
@@ -943,7 +1015,7 @@ pub fn gen_ffn_fwd(
     p.emit_reduce_sum("ss", &[1, 1, 1, s], "sq", "rax", "kd");
     p.emit_scalar_const("invd", "fp16", &format!("{inv_d}"));
     p.emit_mul("ss2", &[1, 1, 1, s], "ss", "invd");
-    p.emit_scalar_const("eps", "fp16", "0.00001");
+    p.emit_scalar_const("eps", "fp16", &format!("{}", cfg.rms_norm_eps));
     p.emit_add("ss3", &[1, 1, 1, s], "ss2", "eps");
     p.emit_scalar_const("nhalf", "fp16", "-0.5");
     p.emit_pow("rrms", &[1, 1, 1, s], "ss3", "nhalf");
@@ -1010,7 +1082,7 @@ pub fn gen_ffn_fwd_taps(
     p.emit_reduce_sum("ss", &[1, 1, 1, s], "sq", "rax", "kd");
     p.emit_scalar_const("invd", "fp16", &format!("{inv_d}"));
     p.emit_mul("ss2", &[1, 1, 1, s], "ss", "invd");
-    p.emit_scalar_const("eps", "fp16", "0.00001");
+    p.emit_scalar_const("eps", "fp16", &format!("{}", cfg.rms_norm_eps));
     p.emit_add("ss3", &[1, 1, 1, s], "ss2", "eps");
     p.emit_scalar_const("nhalf", "fp16", "-0.5");
     p.emit_pow("rrms", &[1, 1, 1, s], "ss3", "nhalf");
@@ -1652,7 +1724,14 @@ mod tests {
             &cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd, &ones_hd, &ones_hd,
         );
 
-        assert!(output.mil_text.contains("tile"));
+        assert!(
+            !output.mil_text.contains("tile"),
+            "GQA kernel must use concat, not tile"
+        );
+        assert!(
+            output.mil_text.contains("concat"),
+            "GQA kernel must contain concat-based expansion"
+        );
         let expected_out_ch = d + 2 * kv_d; // 768 + 512 = 1280
         assert_eq!(output.output_bytes, expected_out_ch * 256 * 2);
     }
@@ -1678,8 +1757,12 @@ mod tests {
 
         let output = gen_sdpa_fwd(&cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd);
 
-        assert!(output.mil_text.contains("tile"));
-        assert!(!output.mil_text.contains("concat"));
+        assert!(
+            !output.mil_text.contains("tile"),
+            "GQA kernel must use concat, not tile"
+        );
+        // GQA concat adds concat ops for K/V expansion
+        assert!(output.mil_text.contains("concat"));
         assert_eq!(output.output_bytes, d * 256 * 2);
     }
 
@@ -1848,5 +1931,72 @@ mod tests {
         // Output: o_out(dim) + k_cache(kv_dim) + v_cache(kv_dim) = d + 2*kvd
         let expected_out_ch = d + 2 * kvd;
         assert_eq!(out.output_bytes, expected_out_ch * cfg.seq_len * 2);
+    }
+
+    // ================================================================
+    // Qwen3 GQA test (n_heads=16, n_kv_heads=8 — concat-based expand)
+    // ================================================================
+
+    #[test]
+    fn test_qwen3_gqa_no_tile() {
+        // Qwen3-0.6B-style with GQA: 16 Q heads, 8 KV heads
+        let cfg = TransformerKernelConfig {
+            dim: 1024,
+            hidden_dim: 3072,
+            n_heads: 16,
+            n_kv_heads: 8,
+            head_dim: 128,
+            seq_len: 64,
+            rope_theta: 1_000_000.0,
+            rms_norm_eps: 1e-6,
+        };
+        let d = cfg.dim;
+        let qd = cfg.q_dim(); // 16 * 128 = 2048
+        let kvd = cfg.kv_dim(); // 8 * 128 = 1024
+        let hd = cfg.head_dim;
+        assert_eq!(qd, 2048);
+        assert_eq!(kvd, 1024);
+        assert_eq!(cfg.n_groups(), 2);
+
+        let rms = vec![0.01f32; d];
+        let wq = vec![0.01f32; qd * d];
+        let wk = vec![0.01f32; kvd * d];
+        let wv = vec![0.01f32; kvd * d];
+        let wo = vec![0.01f32; d * qd];
+        let q_norm = vec![0.01f32; hd];
+        let k_norm = vec![0.01f32; hd];
+
+        let out = gen_sdpa_fwd_kv(&cfg, &rms, &wq, &wk, &wv, &wo, &q_norm, &k_norm);
+
+        // Must NOT contain tile (ANE-unreliable)
+        assert!(
+            !out.mil_text.contains("tile"),
+            "GQA kernel must not use tile — ANE tile is unreliable"
+        );
+        // Must contain concat for GQA expansion
+        assert!(
+            out.mil_text.contains("concat"),
+            "GQA kernel must contain concat-based head expansion"
+        );
+        // Output channels: d + 2*kv_dim = 1024 + 2*1024 = 3072
+        let expected_out_ch = d + 2 * kvd;
+        assert_eq!(expected_out_ch, 3072);
+        assert_eq!(out.output_bytes, expected_out_ch * cfg.seq_len * 2);
+
+        // Also verify gen_sdpa_fwd (no taps, no KV output)
+        let out_fwd = gen_sdpa_fwd(&cfg, &rms, &wq, &wk, &wv, &wo);
+        assert!(
+            !out_fwd.mil_text.contains("tile"),
+            "gen_sdpa_fwd GQA must not use tile"
+        );
+        assert!(out_fwd.mil_text.contains("concat"));
+
+        // And gen_sdpa_fwd_taps
+        let out_taps = gen_sdpa_fwd_taps(&cfg, &rms, &wq, &wk, &wv, &wo);
+        assert!(
+            !out_taps.mil_text.contains("tile"),
+            "gen_sdpa_fwd_taps GQA must not use tile"
+        );
+        assert!(out_taps.mil_text.contains("concat"));
     }
 }
