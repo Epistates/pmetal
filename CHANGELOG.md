@@ -32,6 +32,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SafeTensors dtype/alignment error handling
 - Token ID bounds check in CPU decode
 - Softmax numerical stability for zero-sum edge case
+- ANE GQA inference failure (`status=0x1d`): replaced unreliable `tile` MIL op with concat-based KV head expansion in all 3 SDPA kernels
+- Token ID truncation: `embed_lookup`/`embed_backward` changed from `u16` to `u32` (Qwen3 vocab=151936 exceeds u16 max)
+- RMSNorm epsilon hardcoded to 1e-5: now configurable via `cfg.rms_norm_eps` (Qwen3 requires 1e-6)
 
 ### Improved
 
@@ -40,6 +43,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - LoRA safety: rank=0 guard and tensor shape validation
 - Decode memory efficiency: pooled scores buffer
 - 15 new tests for non-standard head_dim kernels (7 static + 8 dynamic)
+- MIL debug dump on ANE compile failure (`/tmp/ane_debug_layer{N}_{attn|ffn}.mil`)
+- Qwen3 GQA kernel test (n_heads=16, n_kv_heads=8, verifies no `tile` ops)
 
 ## [0.2.0] - 2026-03-02
 
