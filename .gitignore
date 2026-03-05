@@ -74,3 +74,5 @@ metrics.jsonl
 dataset_*.jsonl
 prepared_dataset.jsonl
 sample_config.yaml
+
+output/
