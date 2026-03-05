@@ -120,19 +120,19 @@ impl AneTrainingLoop {
         let seq_len = self.config.trainer.seq_len;
         let max_steps = self.config.max_steps;
 
-        for batch_idx in 0..num_batches {
+        for (batch_idx, batch) in data.iter().enumerate().take(num_batches) {
             for cb in &mut self.callbacks {
                 cb.on_step_start(batch_idx);
             }
 
             // No budget check needed — dynamic pipeline never recompiles
-            let loss = self.trainer.train_batch(&data[batch_idx], max_steps)?;
+            let loss = self.trainer.train_batch(batch, max_steps)?;
 
             // Update state
             self.state.step = batch_idx + 1;
             self.state.loss = loss as f64;
             self.state.learning_rate = self.config.trainer.learning_rate as f64;
-            self.state.tokens_processed += data[batch_idx].len() * seq_len;
+            self.state.tokens_processed += batch.len() * seq_len;
             self.state.elapsed_secs = start.elapsed().as_secs_f64();
 
             // Log
@@ -160,7 +160,7 @@ impl AneTrainingLoop {
                 cblas_ms: timings.cblas_dw_us as f64 / 1000.0,
                 adam_ms: timings.adam_us as f64 / 1000.0,
                 total_ms: timings.total_us as f64 / 1000.0,
-                tokens: data[batch_idx].len() * seq_len,
+                tokens: batch.len() * seq_len,
                 grad_norm: None,
             };
             for cb in &mut self.callbacks {

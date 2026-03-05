@@ -120,7 +120,7 @@ enum Commands {
         learning_rate: f64,
 
         /// Batch size
-        #[arg(long, default_value = "4")]
+        #[arg(long, default_value = "1")]
         batch_size: usize,
 
         /// Number of epochs
@@ -132,7 +132,7 @@ enum Commands {
         max_seq_len: usize,
 
         /// Gradient accumulation steps
-        #[arg(long, default_value = "1")]
+        #[arg(long, default_value = "4")]
         gradient_accumulation_steps: usize,
 
         /// Disable Metal FlashAttention (enabled by default for O(n) memory)
@@ -2007,7 +2007,7 @@ async fn run_training(
 
         tracing::info!("Attempting ANE dynamic weight pipeline");
 
-        let ane_result: anyhow::Result<()> = (|| async {
+        let ane_result: anyhow::Result<()> = async {
             // Resolve model path
             let model_name = model_id
                 .as_deref()
@@ -2176,7 +2176,7 @@ async fn run_training(
 
             tracing::info!("ANE training complete");
             Ok(())
-        })()
+        }
         .await;
 
         match ane_result {
@@ -2364,7 +2364,7 @@ async fn run_training(
     );
     let is_parquet = dataset_path_resolved
         .extension()
-        .map_or(false, |ext| ext == "parquet");
+        .is_some_and(|ext| ext == "parquet");
     let train_dataset = if is_parquet {
         tracing::info!("Detected Parquet format");
         // Try "text" column first, then fall back to common alternatives
