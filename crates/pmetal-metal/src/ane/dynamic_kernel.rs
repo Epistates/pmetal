@@ -130,6 +130,7 @@ fn emit_rmsnorm_fuse(
 }
 
 /// Helper for matmul using pre-computed activations and sliced weights from spatial dimension.
+#[allow(clippy::too_many_arguments)]
 fn emit_dyn_matmul_with_act(
     p: &mut MilProgram,
     prefix: &str,
@@ -181,6 +182,7 @@ fn emit_dyn_matmul_with_act(
 }
 
 /// Helper for matmul where input activations are at a specific channel offset.
+#[allow(clippy::too_many_arguments)]
 fn emit_dyn_matmul_at_ch(
     p: &mut MilProgram,
     prefix: &str,

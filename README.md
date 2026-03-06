@@ -194,11 +194,10 @@ Efficiently pack multiple sequences into single batches for 2-5x throughput impr
 
 ### Gradient Checkpointing
 
-Trade compute for memory on large models. **Enabled by default**.
+Trade compute for memory on large models. The config option exists for forward-compatibility, but **gradient checkpointing is not yet implemented in the MLX backend** — enabling it currently has no effect on peak memory.
 
 ```bash
---no-gradient-checkpointing  # Disable memory-efficient training
---gradient-checkpointing-layers 4  # Layers per checkpoint block
+--gradient-checkpointing smart  # No-op until backend support lands
 ```
 
 ### Dataset Formats
@@ -226,6 +225,7 @@ Supported formats for training data (Auto-detected):
 | `--epochs` | 1 | Number of training epochs |
 | `--max-grad-norm` | 1.0 | Gradient clipping |
 | `--quantization` | none | QLoRA method (nf4, fp4, int8) |
+| `--gradient-accumulation-steps` | 4 | Gradient accumulation steps |
 | `--no-ane` | false | Disable ANE training |
 | `--embedding-lr` | None | Separate LR for embeddings |
 

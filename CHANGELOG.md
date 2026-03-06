@@ -5,6 +5,26 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] - 2026-03-06
+
+### Added
+
+- **MIL program fragment helpers**: `emit_rmsnorm_fuse` and `emit_dyn_matmul_with_act` for composable RMSNorm fusion and dynamic matmul in ANE kernel generation
+- **`rmsnorm_fwd` dynamic kernel**: New kernel #11 for fused RMSNorm forward pass on ANE
+
+### Fixed
+
+- **Metal resource exhaustion on long training runs**: `eval_training_state()` now evaluates model params and optimizer states (momentum, velocity) alongside losses, preventing unbounded computation graph growth in deferred-eval mode
+- **Gradient checkpointing default honesty**: `CheckpointStrategy` default changed from `Smart` to `None` with documentation noting the MLX backend does not implement it yet — configs remain forward-compatible
+- **Training defaults**: batch_size default 4→1, gradient_accumulation_steps default 1→4 (same effective batch size, lower per-step memory pressure)
+- **CI**: Exclude `pmetal-py` from CI clippy/build/test (requires Python dev libs not available on runner)
+- **Async closure lint**: Replaced immediately-invoked async closure with plain async block in ANE training path
+- **Idiomatic Rust**: `map_or(false, ...)` → `is_some_and(...)` for Parquet extension check
+
+### Improved
+
+- **Dynamic kernel documentation**: All 12 kernels now document detailed input tensor names alongside dimension formulas
+
 ## [0.2.1] - 2026-03-03
 
 ### Added
