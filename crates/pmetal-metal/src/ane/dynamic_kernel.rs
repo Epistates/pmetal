@@ -266,7 +266,12 @@ fn emit_dyn_matmul(
 ) -> String {
     // Slice activations: [1, ic, 1, seq] from spatial offset
     let act_begin = p.next_var(&format!("{prefix}_ab"));
-    p.emit_tensor_const(&act_begin, &[4], "int32", &format!("[0,0,0,{}]", act_sp_off));
+    p.emit_tensor_const(
+        &act_begin,
+        &[4],
+        "int32",
+        &format!("[0,0,0,{}]", act_sp_off),
+    );
     let act_size = p.next_var(&format!("{prefix}_as"));
     p.emit_tensor_const(&act_size, &[4], "int32", &format!("[1,{ic},1,{seq}]"));
     let act = p.next_var(&format!("{prefix}_act"));
@@ -366,7 +371,12 @@ fn emit_gqa_reduce(
 ) -> String {
     let hds = hd * s;
     let grp_rsh = p.next_var(&format!("{prefix}_gr"));
-    p.emit_tensor_const(&grp_rsh, &[4], "int32", &format!("[1,{nkv},{groups},{hds}]"));
+    p.emit_tensor_const(
+        &grp_rsh,
+        &[4],
+        "int32",
+        &format!("[1,{nkv},{groups},{hds}]"),
+    );
     let grp = p.next_var(&format!("{prefix}_g"));
     p.emit_reshape(&grp, &[1, nkv, groups, hds], &grp_rsh, grad_var);
 
@@ -485,7 +495,14 @@ pub fn gen_dynamic_sdpa_attn(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let mm_false = p.next_var("mmf");
     p.emit_scalar_const(&mm_false, "bool", "false");
     let scores_raw = p.next_var("sr");
-    p.emit_matmul(&scores_raw, &[1, nh, s, s], &mm_false, &mm_false, &qt, &k_heads);
+    p.emit_matmul(
+        &scores_raw,
+        &[1, nh, s, s],
+        &mm_false,
+        &mm_false,
+        &qt,
+        &k_heads,
+    );
 
     let scale_var = p.next_var("sc");
     p.emit_scalar_const(&scale_var, "fp16", &format!("{scale}"));
@@ -662,7 +679,14 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let mm_false = p.next_var("mmf");
     p.emit_scalar_const(&mm_false, "bool", "false");
     let scores_raw = p.next_var("sr");
-    p.emit_matmul(&scores_raw, &[1, nh, s, s], &mm_false, &mm_false, &qt, &k_heads);
+    p.emit_matmul(
+        &scores_raw,
+        &[1, nh, s, s],
+        &mm_false,
+        &mm_false,
+        &qt,
+        &k_heads,
+    );
 
     let scale_var = p.next_var("sc");
     p.emit_scalar_const(&scale_var, "fp16", &format!("{scale}"));
@@ -728,7 +752,13 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let cat_il = p.next_var("cil");
     p.emit_scalar_const(&cat_il, "bool", "false");
     let taps16 = p.next_var("taps16");
-    p.emit_concat(&taps16, &[1, out_ch, 1, s], &cat_ax, &cat_il, &[&o_out, &q, &k, &v, &attn_flat, &xnorm]);
+    p.emit_concat(
+        &taps16,
+        &[1, out_ch, 1, s],
+        &cat_ax,
+        &cat_il,
+        &[&o_out, &q, &k, &v, &attn_flat, &xnorm],
+    );
 
     let taps32 = p.next_var("taps32");
     p.emit_cast(&taps32, &[1, out_ch, 1, s], &taps16, "fp32");
@@ -805,7 +835,13 @@ pub fn gen_dynamic_ffn_w13(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let cat_il = p.next_var("cil");
     p.emit_scalar_const(&cat_il, "bool", "false");
     let out16 = p.next_var("out16");
-    p.emit_concat(&out16, &[1, out_ch, 1, s], &cat_ax, &cat_il, &[&h1, &h3, &gate]);
+    p.emit_concat(
+        &out16,
+        &[1, out_ch, 1, s],
+        &cat_ax,
+        &cat_il,
+        &[&h1, &h3, &gate],
+    );
 
     let out32 = p.next_var("out32");
     p.emit_cast(&out32, &[1, out_ch, 1, s], &out16, "fp32");
@@ -1091,7 +1127,14 @@ pub fn gen_dynamic_sdpa_bwd1(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     p.emit_transpose(&da_t, &[1, nh, s, hd], &perm23, &da_h);
 
     let dv_full = p.next_var("dvfl");
-    p.emit_matmul(&dv_full, &[1, nh, s, hd], &mm_true, &mm_false, &probs_h, &da_t);
+    p.emit_matmul(
+        &dv_full,
+        &[1, nh, s, hd],
+        &mm_true,
+        &mm_false,
+        &probs_h,
+        &da_t,
+    );
 
     let dv_t = p.next_var("dvt");
     p.emit_transpose(&dv_t, &[1, nh, hd, s], &perm23, &dv_full);
@@ -1121,7 +1164,13 @@ pub fn gen_dynamic_sdpa_bwd1(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let cat_il = p.next_var("cil");
     p.emit_scalar_const(&cat_il, "bool", "false");
     let out = p.next_var("out");
-    p.emit_concat(&out, &[1, out_ch, 1, s], &cat_ax, &cat_il, &[&dv_flat, &probs_flat, &dp_flat]);
+    p.emit_concat(
+        &out,
+        &[1, out_ch, 1, s],
+        &cat_ax,
+        &cat_il,
+        &[&dv_flat, &probs_flat, &dp_flat],
+    );
 
     let mil_text = p.finalize(&out);
     let mut static_weights = WeightDict::new();
@@ -1272,7 +1321,13 @@ pub fn gen_dynamic_sdpa_bwd2(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let cat_il = p.next_var("cil");
     p.emit_scalar_const(&cat_il, "bool", "false");
     let out = p.next_var("out");
-    p.emit_concat(&out, &[1, out_ch, 1, s], &cat_ax, &cat_il, &[&dq_flat, &dk_flat]);
+    p.emit_concat(
+        &out,
+        &[1, out_ch, 1, s],
+        &cat_ax,
+        &cat_il,
+        &[&dq_flat, &dk_flat],
+    );
 
     let mil_text = p.finalize(&out);
 
@@ -1378,7 +1433,10 @@ pub fn gen_dynamic_qkv_bwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let qd = c.q_dim();
     let s = c.seq_len;
     let sp = 3 * s + 3 * d;
-    assert_eq!(c.n_kv_heads, c.n_heads, "Combined QKV backward requires MHA.");
+    assert_eq!(
+        c.n_kv_heads, c.n_heads,
+        "Combined QKV backward requires MHA."
+    );
     let mut p = MilProgram::new_fp32(qd, sp);
     p.emit_cast("x16", &[1, qd, 1, sp], "x", "fp16");
     let dxq = emit_dyn_matmul(&mut p, "wqt", "x16", qd, d, s, 0, 3 * s);
