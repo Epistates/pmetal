@@ -5,7 +5,7 @@
 set -e
 
 # Configuration
-MODEL="unsloth/Llama-3.2-3B-bnb-4bit"
+MODEL="meta-llama/Llama-3.2-3B"
 DATASET="./examples/sample_dataset.jsonl"
 OUTPUT="./output/qlora_finetune"
 
@@ -18,10 +18,13 @@ EPOCHS=1
 MAX_SEQ_LEN=4096
 
 echo "=== PMetal QLoRA Fine-tuning ==="
-echo "Model: $MODEL (4-bit quantized)"
+echo "Model: $MODEL"
 echo "Dataset: $DATASET"
 echo "LoRA rank: $LORA_R"
 echo ""
+
+# FlashAttention, Sequence Packing, and Gradient Checkpointing are ENABLED BY DEFAULT.
+# QLoRA requires specifying the quantization method (nf4, fp4, or int8).
 
 ./target/release/pmetal train \
     --model "$MODEL" \
@@ -33,9 +36,8 @@ echo ""
     --learning-rate $LEARNING_RATE \
     --epochs $EPOCHS \
     --max-seq-len $MAX_SEQ_LEN \
-    --use-metal-flash-attention \
-    --use-sequence-packing \
-    --gradient-checkpointing
+    --quantization nf4 \
+    --double-quant
 
 echo ""
 echo "Training complete! Adapter saved to: $OUTPUT"
