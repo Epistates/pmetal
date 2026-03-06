@@ -1536,7 +1536,7 @@ pub fn gen_dynamic_qkv_bwd(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let s = c.seq_len;
     let sp = 3 * s + 3 * d;
 
-    debug_assert_eq!(
+    assert_eq!(
         c.n_kv_heads, c.n_heads,
         "Combined QKV backward requires MHA. Use split qkv_bwd_q + qkv_bwd_kv for GQA."
     );
