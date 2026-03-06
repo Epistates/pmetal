@@ -18,15 +18,15 @@ Or build from source:
 cargo build --release -p pmetal-cli
 ./target/release/pmetal --help
 
-# With ANE and dashboard support
+# With ANE and dashboard support (default)
 cargo build --release -p pmetal-cli --features "ane dashboard"
 ```
 
 ## Commands
 
-### Train
+### `train`
 
-Fine-tune a model with LoRA:
+Fine-tune a model with LoRA or QLoRA:
 
 ```bash
 pmetal train \
@@ -35,8 +35,7 @@ pmetal train \
   --output ./output \
   --lora-r 16 \
   --batch-size 4 \
-  --learning-rate 2e-4 \
-  --epochs 1
+  --learning-rate 2e-4
 ```
 
 #### Training Options
@@ -45,22 +44,21 @@ pmetal train \
 |--------|-------------|---------|
 | `--model` | Model ID or path | Required |
 | `--dataset` | Training data (JSONL) | Required |
-| `--output` | Output directory | Required |
-| `--lora-r` | LoRA rank | 8 |
-| `--lora-alpha` | LoRA alpha | 16.0 |
-| `--batch-size` | Batch size | 4 |
-| `--gradient-accumulation-steps` | Grad accumulation | 1 |
+| `--output` | Output directory | `./output` |
+| `--lora-r` | LoRA rank | 16 |
+| `--lora-alpha` | LoRA alpha | 32.0 |
+| `--batch-size` | Micro-batch size | 1 |
+| `--gradient-accumulation-steps` | Grad accumulation | 4 |
 | `--learning-rate` | Learning rate | 2e-4 |
 | `--epochs` | Training epochs | 1 |
-| `--max-seq-len` | Max sequence length | 2048 |
-| `--max-grad-norm` | Gradient clipping | 1.0 |
-| `--use-metal-flash-attention` | Enable FlashAttention | false |
-| `--use-sequence-packing` | Enable packing | false |
-| `--gradient-checkpointing` | Save memory | false |
-| `--resume` | Resume from checkpoint | false |
-| `--ane` | Use Apple Neural Engine (requires `--features ane`) | false |
+| `--max-seq-len` | Max sequence length | 0 (Auto) |
+| `--no-flash-attention` | Disable FlashAttention | false |
+| `--no-sequence-packing` | Disable packing | false |
+| `--no-gradient-checkpointing` | Disable memory savings | false |
+| `--quantization` | QLoRA method (nf4, fp4, int8) | none |
+| `--no-ane` | Disable Apple Neural Engine | false |
 
-### Infer
+### `infer`
 
 Run inference with optional LoRA adapter:
 
@@ -68,9 +66,9 @@ Run inference with optional LoRA adapter:
 pmetal infer \
   --model qwen/Qwen3-0.6B-Base \
   --lora ./output/lora_weights.safetensors \
-  --prompt "What is machine learning?" \
-  --max-tokens 256 \
-  --temperature 0.7
+  --prompt "Does absolute truth exist?" \
+  --chat \
+  --show-thinking
 ```
 
 #### Inference Options
@@ -84,74 +82,32 @@ pmetal infer \
 | `--temperature` | Sampling temp | Model default |
 | `--top-k` | Top-k sampling | Model default |
 | `--top-p` | Nucleus sampling | Model default |
-| `--repetition-penalty` | Rep penalty | 1.0 |
-| `--chat` | Use chat template | Auto |
-| `--no-thinking` | Disable thinking | false |
-| `--stream` | Stream output | false |
-| `--ane` | Use ANE inference (hybrid prefill + CPU decode, requires `--features ane`) | false |
+| `--min-p` | Min-p dynamic sampling | Model default |
+| `--chat` | Apply chat template | false |
+| `--show-thinking` | Show reasoning content | false |
+| `--fp8` | Use FP8 weights | false |
+| `--no-ane` | Disable ANE inference | false |
 
-### Dashboard
+### `dashboard`
 
-Real-time TUI dashboard for monitoring training progress (requires `--features dashboard`):
+Real-time TUI dashboard for monitoring training progress (requires `dashboard` feature):
 
 ```bash
-# Monitor a running training session
 pmetal dashboard --metrics-file ./output/metrics.jsonl
 ```
 
-Displays loss curves (braille), learning rate schedule, per-component timing breakdown (ANE forward/backward, RMSNorm, cblas, Adam), and token throughput. Reads the same JSONL file produced by `--log-metrics`.
+### `bench`
 
-### Benchmark
-
-Run performance benchmarks:
+Benchmark training performance:
 
 ```bash
-pmetal benchmark \
+pmetal bench \
   --model qwen/Qwen3-0.6B-Base \
   --batch-size 4 \
   --seq-len 512
 ```
 
-## Examples
-
-### ANE Training
-
-```bash
-pmetal train \
-  --model qwen/Qwen3-0.6B-Base \
-  --dataset train.jsonl \
-  --output ./ane-output \
-  --ane \
-  --log-metrics ./ane-output/metrics.jsonl
-```
-
-### LoRA Training with Sequence Packing
-
-```bash
-pmetal train \
-  --model unsloth/Llama-3.2-1B \
-  --dataset conversations.jsonl \
-  --output ./llama-lora \
-  --lora-r 16 \
-  --batch-size 4 \
-  --gradient-accumulation-steps 4 \
-  --learning-rate 2e-4 \
-  --epochs 1 \
-  --max-seq-len 2048 \
-  --use-metal-flash-attention \
-  --use-sequence-packing
-```
-
-### Interactive Chat
-
-```bash
-pmetal infer \
-  --model qwen/Qwen3-0.6B-Base \
-  --chat \
-  --prompt "Hello! How are you?" \
-  --max-tokens 512 \
-  --temperature 0.7
-```
+Use `bench-ffi` for overhead analysis and `bench-gen` for generation loop profiling.
 
 ## Environment Variables
 
