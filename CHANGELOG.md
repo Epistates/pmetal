@@ -5,33 +5,21 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.2.2] - 2026-03-06
+## [0.2.0] - 2026-03-06
 
 ### Added
 
-- **MIL program fragment helpers**: `emit_rmsnorm_fuse` and `emit_dyn_matmul_with_act` for composable RMSNorm fusion and dynamic matmul in ANE kernel generation
-- **`rmsnorm_fwd` dynamic kernel**: New kernel #11 for fused RMSNorm forward pass on ANE
-
-### Fixed
-
-- **Metal resource exhaustion on long training runs**: `eval_training_state()` now evaluates model params and optimizer states (momentum, velocity) alongside losses, preventing unbounded computation graph growth in deferred-eval mode
-- **Gradient checkpointing default honesty**: `CheckpointStrategy` default changed from `Smart` to `None` with documentation noting the MLX backend does not implement it yet — configs remain forward-compatible
-- **Training defaults**: batch_size default 4→1, gradient_accumulation_steps default 1→4 (same effective batch size, lower per-step memory pressure)
-- **CI**: Exclude `pmetal-py` from CI clippy/build/test (requires Python dev libs not available on runner)
-- **Async closure lint**: Replaced immediately-invoked async closure with plain async block in ANE training path
-- **Idiomatic Rust**: `map_or(false, ...)` → `is_some_and(...)` for Parquet extension check
-
-### Improved
-
-- **Dynamic kernel documentation**: All 12 kernels now document detailed input tensor names alongside dimension formulas
-
-## [0.2.1] - 2026-03-03
-
-### Added
-
+- **Apple Neural Engine (ANE) integration** behind `ane` feature flag — MIL 1.3 program generation, private API FFI via dlopen, IOSurface zero-copy, compilation budget tracking, hybrid CPU/ANE trainer with async gradient accumulation
+- **`AneInferenceEngine`** — forward-only ANE kernels (no concat taps, ~6x smaller IO vs training) with CPU-side embedding, RMSNorm, sampling (greedy/temperature/top-k), and autoregressive generation via Easy API `.device(Device::Ane)`
+- **KV cache for autoregressive generation** — hybrid ANE prefill + CPU decode architecture eliminates O(n²×L) recomputation per token; ANE processes the full prompt, CPU handles single-token decode steps with cached KV pairs via `cblas_sgemv`
+- **GQA/MQA support** — `n_kv_heads` config field enables grouped-query attention (Llama 3, Mistral, etc.); concat-based KV head expansion in ANE kernels
+- **SafeTensors weight loading** — direct loading of HuggingFace safetensors format (single and multi-file) with automatic bf16/f16/f32 dtype conversion
+- **LoRA adapter fusion** — merge adapter weights (`W += (alpha/rank) * B @ A`) before ANE kernel compilation; supports both `self_attn` and `mlp` target modules
 - **Dynamic weight pipeline**: 9 MIL kernels compiled once at startup; weights packed alongside activations in IOSurface spatial dimension — zero recompilation during training
 - **`DynamicAneTrainer`**: compile-once training loop replacing the static trainer that consumed ~76% of training time in recompilation
-- **`DynamicKernelConfig`** and 9 dynamic kernel generators in `dynamic_kernel.rs`
+- **`DynamicKernelConfig`** and 12 dynamic kernel generators in `dynamic_kernel.rs`
+- **MIL program fragment helpers**: `emit_rmsnorm_fuse` and `emit_dyn_matmul_with_act` for composable RMSNorm fusion and dynamic matmul in ANE kernel generation
+- **`rmsnorm_fwd` dynamic kernel**: Fused RMSNorm forward pass on ANE
 - **fp32 IOSurface support**: `IoSurface::new_f32()` with packed write/read for dynamic weight pipeline
 - **MIL builder extensions**: `emit_cast`, `emit_slice_by_size`, `new_fp32_input` for dynamic kernel generation
 - **Non-standard `head_dim` support**: Full forward and backward kernel support for models where `head_dim != dim/n_heads` (e.g., Qwen3 with `head_dim=128`, `dim/n_heads=64`)
@@ -39,9 +27,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`MetricsJsonCallback`**: Emits full `StepMetrics` including ANE timing, Adam timing, and throughput to JSONL
 - **GSPO trainer**: Group Sequence Policy Optimization (fixes GRPO length bias)
 - **DAPO trainer**: Decoupled Clip and Dynamic Sampling Policy Optimization (all 4 ByteDance innovations)
+- **Python bindings** (`pmetal-py`) via PyO3/maturin with type stubs
+- **High-level Easy API** (`pmetal::easy`) — builder pattern for fine-tuning and inference
+- **Version and device introspection** (`pmetal::version`)
+- **Examples**: `device_info`, `finetune_easy`, `finetune_manual`, `inference_easy`
+- **Python CI workflow** (`.github/workflows/python.yml`)
+- `Device::Ane` variant with feature-gated support
+- ANE-specific error types in `pmetal-core` and `pmetal-metal`
+- ANE training loop integration in `pmetal-trainer`
+- `silu_inplace` in Accelerate wrappers for CPU decode SwiGLU
 
 ### Fixed
 
+- **Metal resource exhaustion on long training runs**: `eval_training_state()` now evaluates model params and optimizer states (momentum, velocity) alongside losses, preventing unbounded computation graph growth in deferred-eval mode
+- **Gradient checkpointing default**: `CheckpointStrategy` default changed from `Smart` to `None` — MLX backend does not implement it yet; configs remain forward-compatible
+- **Training defaults**: batch_size default 4→1, gradient_accumulation_steps default 1→4 (same effective batch size, lower per-step memory pressure)
 - ANE inference gibberish output: added RoPE and per-head QK-norm to prefill kernel and CPU decode
 - ANE inference missing `compile_kernels()` call in `generate_cached_ane`
 - All backward kernels (static + dynamic) now use `q_dim()`/`kv_dim()` instead of hardcoded `dim` — fixes incorrect gradient shapes for non-standard architectures
@@ -55,36 +55,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - ANE GQA inference failure (`status=0x1d`): replaced unreliable `tile` MIL op with concat-based KV head expansion in all 3 SDPA kernels
 - Token ID truncation: `embed_lookup`/`embed_backward` changed from `u16` to `u32` (Qwen3 vocab=151936 exceeds u16 max)
 - RMSNorm epsilon hardcoded to 1e-5: now configurable via `cfg.rms_norm_eps` (Qwen3 requires 1e-6)
-
-### Improved
-
-- ANE config validation (`new()` returns `Result`)
-- Kernel config validation (`TransformerKernelConfig::validate()`)
-- LoRA safety: rank=0 guard and tensor shape validation
-- Decode memory efficiency: pooled scores buffer
-- 15 new tests for non-standard head_dim kernels (7 static + 8 dynamic)
-- MIL debug dump on ANE compile failure (`/tmp/ane_debug_layer{N}_{attn|ffn}.mil`)
-- Qwen3 GQA kernel test (n_heads=16, n_kv_heads=8, verifies no `tile` ops)
-
-## [0.2.0] - 2026-03-02
-
-### Added
-
-- **Apple Neural Engine (ANE) integration** behind `ane` feature flag — MIL 1.3 program generation, private API FFI via dlopen, IOSurface zero-copy, compilation budget tracking, hybrid CPU/ANE trainer with async gradient accumulation
-- **`AneInferenceEngine`** — forward-only ANE kernels (no concat taps, ~6x smaller IO vs training) with CPU-side embedding, RMSNorm, sampling (greedy/temperature/top-k), and autoregressive generation via Easy API `.device(Device::Ane)`
-- **KV cache for autoregressive generation** — hybrid ANE prefill + CPU decode architecture eliminates O(n²×L) recomputation per token; ANE processes the full prompt, CPU handles single-token decode steps with cached KV pairs via `cblas_sgemv`
-- **GQA/MQA support** — `n_kv_heads` config field enables grouped-query attention (Llama 3, Mistral, etc.); MIL `tile` op handles KV head expansion in ANE kernels
-- **SafeTensors weight loading** — direct loading of HuggingFace safetensors format (single and multi-file) with automatic bf16/f16/f32 dtype conversion
-- **LoRA adapter fusion** — merge adapter weights (`W += (alpha/rank) * B @ A`) before ANE kernel compilation; supports both `self_attn` and `mlp` target modules
-- **Python bindings** (`pmetal-py`) via PyO3/maturin with type stubs
-- **High-level Easy API** (`pmetal::easy`) — builder pattern for fine-tuning and inference
-- **Version and device introspection** (`pmetal::version`)
-- **Examples**: `device_info`, `finetune_easy`, `finetune_manual`, `inference_easy`
-- **Python CI workflow** (`.github/workflows/python.yml`)
-- `Device::Ane` variant with feature-gated support
-- ANE-specific error types in `pmetal-core` and `pmetal-metal`
-- ANE training loop integration in `pmetal-trainer`
-- `silu_inplace` in Accelerate wrappers for CPU decode SwiGLU
+- CI: Exclude `pmetal-py` from CI clippy/build/test (requires Python dev libs not available on runner)
 
 ### Improved
 
@@ -92,6 +63,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Accelerate/vDSP wrappers expanded with 12 new functions: `rmsnorm`, `rmsnorm_backward`, `cross_entropy_loss`, `softmax_inplace`, `adam_update`, `embed_lookup`, `embed_backward`, `matrix_transpose`, `gemm`, `vadd`, `vmul` (with scalar fallbacks on non-macOS)
 - `supports_neural_engine()` now performs real ANE detection via framework dlopen
 - Easy API ANE path now auto-detects SafeTensors/flat weights, LoRA adapters, and GQA config; uses `generate_cached()` for KV-cached inference
+- ANE config validation (`new()` returns `Result`)
+- Kernel config validation (`TransformerKernelConfig::validate()`)
+- LoRA safety: rank=0 guard and tensor shape validation
+- Decode memory efficiency: pooled scores buffer
+- 15 new tests for non-standard head_dim kernels (7 static + 8 dynamic)
+- MIL debug dump on ANE compile failure (`/tmp/ane_debug_layer{N}_{attn|ffn}.mil`)
+- Qwen3 GQA kernel test (n_heads=16, n_kv_heads=8, verifies no `tile` ops)
+- Dynamic kernel documentation: All 12 kernels now document detailed input tensor names alongside dimension formulas
 
 ## [0.1.2] - 2026-03-02
 
