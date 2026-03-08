@@ -1,9 +1,7 @@
 name: Python Bindings
 
+# Disabled until Python bindings are stabilized
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
 
 permissions:
