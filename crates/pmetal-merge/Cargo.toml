@@ -26,7 +26,7 @@ indicatif = { workspace = true }
 rand = { workspace = true }
 hf-hub = { workspace = true }
 half = { workspace = true }
-bytemuck = { workspace = true }
+zerocopy = { workspace = true }
 memmap2 = { workspace = true }
 
 [dev-dependencies]

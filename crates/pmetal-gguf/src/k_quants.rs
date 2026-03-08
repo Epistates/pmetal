@@ -22,6 +22,7 @@ use crate::quantize::{
     get_scale_min_k4, make_q3_quants, make_qkx1_quants, make_qx_quants, nearest_int,
 };
 use half::f16;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Block size for all K-quants (256 elements per block).
 pub const QK_K: usize = 256;
@@ -41,7 +42,7 @@ pub const K_SCALE_SIZE: usize = 12;
 /// - d: 2 bytes (f16 scale factor)
 /// - dmin: 2 bytes (f16 minimum scale factor)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockQ2K {
     /// 4-bit scale pairs for 16 sub-blocks.
     pub scales: [u8; QK_K / 16],
@@ -61,7 +62,7 @@ pub struct BlockQ2K {
 /// - scales: 12 bytes (complex scale encoding)
 /// - d: 2 bytes (f16 scale factor)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockQ3K {
     /// High bit mask (1 bit per element, 8 per byte).
     pub hmask: [u8; QK_K / 8],
@@ -81,7 +82,7 @@ pub struct BlockQ3K {
 /// - scales: 12 bytes (6-bit scales for 8 sub-blocks of 32 elements)
 /// - qs: 128 bytes (4-bit quantized values, 2 per byte)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockQ4K {
     /// Scale factor.
     pub d: f16,
@@ -102,7 +103,7 @@ pub struct BlockQ4K {
 /// - qh: 32 bytes (high bit for each element)
 /// - qs: 128 bytes (lower 4 bits of quantized values)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockQ5K {
     /// Scale factor.
     pub d: f16,
@@ -124,7 +125,7 @@ pub struct BlockQ5K {
 /// - scales: 16 bytes (signed 8-bit scales for 16 sub-blocks)
 /// - d: 2 bytes (f16 scale factor)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockQ6K {
     /// Lower 4 bits of 6-bit quantized values.
     pub ql: [u8; QK_K / 2],
@@ -143,7 +144,7 @@ pub struct BlockQ6K {
 /// - qs: 256 bytes (8-bit signed quantized values)
 /// - bsums: 32 bytes (pre-computed sums for 16 sub-blocks, for fast dot product)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockQ8K {
     /// Scale factor (f32 for higher precision).
     pub d: f32,
@@ -1322,18 +1323,8 @@ pub fn quantize_q2k(xs: &[f32]) -> Vec<BlockQ2K> {
 }
 
 /// Convert K-quant blocks to bytes for GGUF export.
-#[allow(unsafe_code)]
-pub fn blocks_to_bytes<T: Copy>(blocks: &[T]) -> Vec<u8> {
-    let byte_len = std::mem::size_of_val(blocks);
-    let mut bytes = vec![0u8; byte_len];
-
-    // Safety: We're copying the raw bytes of the block structures
-    // This is safe because our blocks are #[repr(C)] with known layout
-    unsafe {
-        std::ptr::copy_nonoverlapping(blocks.as_ptr() as *const u8, bytes.as_mut_ptr(), byte_len);
-    }
-
-    bytes
+pub fn blocks_to_bytes<T: IntoBytes + Immutable>(blocks: &[T]) -> Vec<u8> {
+    blocks.as_bytes().to_vec()
 }
 
 #[cfg(test)]

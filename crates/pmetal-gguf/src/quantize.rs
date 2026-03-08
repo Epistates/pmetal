@@ -8,6 +8,7 @@ use crate::k_quants::{
 };
 use crate::types::GgmlType;
 use pmetal_core::{PMetalError, Result};
+use zerocopy::IntoBytes;
 
 /// Quantize a float slice to the specified GGUF type.
 ///
@@ -58,16 +59,8 @@ pub fn quantize(data: &[f32], dtype: GgmlType) -> Result<Vec<u8>> {
 }
 
 /// Convert a slice of any block type to raw bytes.
-#[allow(unsafe_code)]
-fn blocks_to_bytes<T: Copy>(blocks: &[T]) -> Vec<u8> {
-    let byte_len = std::mem::size_of_val(blocks);
-    let mut bytes = vec![0u8; byte_len];
-    // SAFETY: We're reinterpreting the blocks as raw bytes
-    // The blocks are repr(C) packed structs
-    unsafe {
-        std::ptr::copy_nonoverlapping(blocks.as_ptr() as *const u8, bytes.as_mut_ptr(), byte_len);
-    }
-    bytes
+fn blocks_to_bytes<T: zerocopy::IntoBytes + zerocopy::Immutable>(blocks: &[T]) -> Vec<u8> {
+    blocks.as_bytes().to_vec()
 }
 
 /// Round to nearest integer.

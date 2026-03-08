@@ -6,7 +6,7 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use bytemuck::cast_slice_mut;
+use zerocopy::{FromBytes, IntoBytes};
 use tokio::sync::Mutex;
 
 pub struct RingBackend {
@@ -56,8 +56,8 @@ impl DistributedBackend for RingBackend {
             .into());
         }
 
-        // Safe cast using bytemuck (validates alignment at compile time for Pod types)
-        let floats: &mut [f32] = cast_slice_mut(buffer);
+        let floats: &mut [f32] = <[f32]>::mut_from_bytes(buffer)
+            .map_err(|e| DistributedError::Protocol(format!("Buffer cast failed: {e}")))?;
         let len = floats.len();
 
         let chunk_size = len / self.world_size;
@@ -94,19 +94,7 @@ impl DistributedBackend for RingBackend {
             // Wait, we can't borrow `sender` and `receiver` into `try_join` if they are MutexGuards?
             // Yes we can, they are distinct.
 
-            let send_bytes_len = (s_end - s_start) * 4;
-            // Create a temporary send buffer to avoid borrow checker issues with `floats`
-            // (One future reads floats, the other writes floats).
-            // Rust borrow checker will complain if we access `floats` in join! blocks if one is mutable.
-
-            let mut send_buf = vec![0u8; send_bytes_len];
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    floats[s_start..s_end].as_ptr() as *const u8,
-                    send_buf.as_mut_ptr(),
-                    send_bytes_len,
-                );
-            }
+            let send_buf = floats[s_start..s_end].as_bytes().to_vec();
 
             let recv_bytes_len = (r_end - r_start) * 4;
             let recv_slice = &mut recv_buf[..recv_bytes_len];
@@ -118,9 +106,8 @@ impl DistributedBackend for RingBackend {
             tokio::try_join!(send_fut, recv_fut)?;
 
             // Reduce
-            let recv_floats = unsafe {
-                std::slice::from_raw_parts(recv_slice.as_ptr() as *const f32, r_end - r_start)
-            };
+            let recv_floats = <[f32]>::ref_from_bytes(recv_slice)
+                .expect("recv buffer aligned for f32");
 
             for i in 0..recv_floats.len() {
                 floats[r_start + i] += recv_floats[i];
@@ -138,15 +125,7 @@ impl DistributedBackend for RingBackend {
             let (s_start, s_end) = get_chunk_range(send_chunk_idx);
             let (r_start, r_end) = get_chunk_range(recv_chunk_idx);
 
-            let send_bytes_len = (s_end - s_start) * 4;
-            let mut send_buf = vec![0u8; send_bytes_len];
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    floats[s_start..s_end].as_ptr() as *const u8,
-                    send_buf.as_mut_ptr(),
-                    send_bytes_len,
-                );
-            }
+            let send_buf = floats[s_start..s_end].as_bytes().to_vec();
 
             let recv_bytes_len = (r_end - r_start) * 4;
             let recv_slice = &mut recv_buf[..recv_bytes_len];
@@ -157,13 +136,9 @@ impl DistributedBackend for RingBackend {
             tokio::try_join!(send_fut, recv_fut)?;
 
             // Copy (Gather)
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    recv_slice.as_ptr(),
-                    floats[r_start..r_end].as_mut_ptr() as *mut u8,
-                    recv_bytes_len,
-                );
-            }
+            let recv_floats = <[f32]>::ref_from_bytes(recv_slice)
+                .expect("recv buffer aligned for f32");
+            floats[r_start..r_end].copy_from_slice(recv_floats);
 
             send_chunk_idx = recv_chunk_idx;
             recv_chunk_idx = (recv_chunk_idx + self.world_size - 1) % self.world_size;

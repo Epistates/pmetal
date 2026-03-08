@@ -3,7 +3,7 @@
 //! This module provides typed GPU buffers that work with Metal's unified memory,
 //! enabling zero-copy interop with MLX and CPU code.
 
-use bytemuck::{Pod, Zeroable};
+use zerocopy::{FromBytes, IntoBytes};
 use half::f16;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -66,7 +66,7 @@ impl BufferUsage {
 /// This wrapper provides type-safe access to Metal buffers with unified memory support.
 /// On Apple Silicon, the buffer can be accessed from both CPU and GPU without explicit
 /// copies.
-pub struct MetalBuffer<T: Pod + Zeroable> {
+pub struct MetalBuffer<T: Copy + FromBytes + IntoBytes> {
     /// The underlying Metal buffer.
     buffer: Retained<ProtocolObject<dyn MTLBuffer>>,
     /// Number of elements in the buffer.
@@ -77,7 +77,7 @@ pub struct MetalBuffer<T: Pod + Zeroable> {
     _phantom: PhantomData<T>,
 }
 
-impl<T: Pod + Zeroable> Clone for MetalBuffer<T> {
+impl<T: Copy + FromBytes + IntoBytes> Clone for MetalBuffer<T> {
     fn clone(&self) -> Self {
         Self {
             buffer: self.buffer.clone(),
@@ -88,7 +88,7 @@ impl<T: Pod + Zeroable> Clone for MetalBuffer<T> {
     }
 }
 
-impl<T: Pod + Zeroable> AsMetalBuffer for MetalBuffer<T> {
+impl<T: Copy + FromBytes + IntoBytes> AsMetalBuffer for MetalBuffer<T> {
     fn as_metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.buffer
     }
@@ -98,7 +98,7 @@ impl<T: Pod + Zeroable> AsMetalBuffer for MetalBuffer<T> {
     }
 }
 
-impl<T: Pod + Zeroable> MetalBuffer<T> {
+impl<T: Copy + FromBytes + IntoBytes> MetalBuffer<T> {
     /// Create a new buffer with uninitialized contents.
     ///
     /// # Arguments
@@ -146,7 +146,7 @@ impl<T: Pod + Zeroable> MetalBuffer<T> {
         if usage != BufferUsage::Private {
             // Zero the buffer contents
             let slice = buffer.as_mut_slice_unchecked();
-            slice.fill(T::zeroed());
+            slice.fill(T::new_zeroed());
         }
 
         Ok(buffer)
@@ -183,7 +183,7 @@ impl<T: Pod + Zeroable> MetalBuffer<T> {
         // 2. The size is computed from data.len() * size_of::<T>(), matching the slice's memory
         // 3. Metal's newBufferWithBytes_length_options copies the data into the buffer,
         //    so the source slice can be safely dropped after this call
-        // 4. The Pod + Zeroable bounds on T ensure the data is safely transmutable
+        // 4. The Copy + FromBytes + IntoBytes bounds on T ensure the data is safely transmutable
         let buffer = unsafe {
             ctx.device()
                 .newBufferWithBytes_length_options(data_ptr, size, options)
@@ -300,7 +300,7 @@ impl<T: Pod + Zeroable> MetalBuffer<T> {
         // SAFETY:
         // 1. buffer.contents() returns a NonNull pointer to the buffer's memory
         // 2. The memory is valid for self.len elements of type T
-        // 3. T: Pod + Zeroable ensures safe transmutation from raw bytes
+        // 3. T: Copy + FromBytes + IntoBytes ensures safe transmutation from raw bytes
         // 4. The buffer's StorageModeShared ensures CPU-accessible unified memory
         // 5. Caller is responsible for ensuring no concurrent GPU writes
         unsafe {
@@ -323,7 +323,7 @@ impl<T: Pod + Zeroable> MetalBuffer<T> {
         // SAFETY:
         // 1. buffer.contents() returns a NonNull pointer to the buffer's memory
         // 2. The memory is valid for self.len elements of type T
-        // 3. T: Pod + Zeroable ensures safe transmutation from raw bytes
+        // 3. T: Copy + FromBytes + IntoBytes ensures safe transmutation from raw bytes
         // 4. The buffer's StorageModeShared ensures CPU-accessible unified memory
         // 5. Caller is responsible for ensuring no concurrent GPU access
         // 6. The &self receiver is intentional - Metal buffers allow interior
@@ -417,7 +417,7 @@ impl<T: Pod + Zeroable> MetalBuffer<T> {
 // 3. PhantomData<T> ensures T's Send/Sync requirements are respected
 // 4. Data access methods require proper synchronization (GPU work must complete
 //    before CPU access)
-unsafe impl<T: Pod + Zeroable> Send for MetalBuffer<T> {}
+unsafe impl<T: Copy + FromBytes + IntoBytes> Send for MetalBuffer<T> {}
 
 // SAFETY: MetalBuffer can be shared between threads via &reference
 //
@@ -428,9 +428,9 @@ unsafe impl<T: Pod + Zeroable> Send for MetalBuffer<T> {}
 //
 // Read-only access via as_slice() is safe to share between threads as long as
 // no concurrent writes are happening (standard Rust borrowing rules).
-unsafe impl<T: Pod + Zeroable> Sync for MetalBuffer<T> {}
+unsafe impl<T: Copy + FromBytes + IntoBytes> Sync for MetalBuffer<T> {}
 
-impl<T: Pod + Zeroable> std::fmt::Debug for MetalBuffer<T> {
+impl<T: Copy + FromBytes + IntoBytes> std::fmt::Debug for MetalBuffer<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("MetalBuffer")
             .field("len", &self.len)

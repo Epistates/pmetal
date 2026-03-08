@@ -24,6 +24,7 @@ use safetensors::SafeTensors;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::{debug, info};
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::{MergeError, Result};
 
@@ -147,16 +148,16 @@ impl TensorLoader for SafetensorsLoader {
 
         let array = match tensor.dtype() {
             safetensors::Dtype::F32 => {
-                let floats: &[f32] = bytemuck::cast_slice(data);
+                let floats: &[f32] = <[f32]>::ref_from_bytes(data).expect("safetensors data aligned");
                 Array::from_slice(floats, &shape)
             }
             safetensors::Dtype::F16 => {
-                let halfs: &[half::f16] = bytemuck::cast_slice(data);
+                let halfs: &[half::f16] = <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
                 Array::from_slice(&floats, &shape)
             }
             safetensors::Dtype::BF16 => {
-                let halfs: &[half::bf16] = bytemuck::cast_slice(data);
+                let halfs: &[half::bf16] = <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
                 Array::from_slice(&floats, &shape)
             }
@@ -413,16 +414,16 @@ impl TensorLoader for ZeroCopyLoader {
 
         let array = match loc.dtype {
             safetensors::Dtype::F32 => {
-                let floats: &[f32] = bytemuck::cast_slice(data);
+                let floats: &[f32] = <[f32]>::ref_from_bytes(data).expect("safetensors data aligned");
                 Array::from_slice(floats, &shape)
             }
             safetensors::Dtype::F16 => {
-                let halfs: &[half::f16] = bytemuck::cast_slice(data);
+                let halfs: &[half::f16] = <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
                 Array::from_slice(&floats, &shape)
             }
             safetensors::Dtype::BF16 => {
-                let halfs: &[half::bf16] = bytemuck::cast_slice(data);
+                let halfs: &[half::bf16] = <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
                 Array::from_slice(&floats, &shape)
             }
@@ -693,7 +694,7 @@ impl TensorWriter {
                 let tensor_view = safetensors::tensor::TensorView::new(
                     safetensors::Dtype::F32,
                     shape,
-                    bytemuck::cast_slice(data),
+                    data.as_bytes(),
                 )
                 .map_err(|e| {
                     MergeError::ModelLoad(format!("Failed to create TensorView: {}", e))

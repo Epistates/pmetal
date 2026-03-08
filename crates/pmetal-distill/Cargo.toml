@@ -27,7 +27,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 indicatif = { workspace = true }
 half = { workspace = true }
-bytemuck = { workspace = true }
+zerocopy = { workspace = true }
 hf-hub = { workspace = true }
 bitcode = { workspace = true }
 

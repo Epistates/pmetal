@@ -3,7 +3,7 @@
 //! On Apple Silicon, MLX and Metal share unified memory. This module provides
 //! utilities to pass data between them without copying.
 
-use bytemuck::{Pod, Zeroable};
+use zerocopy::{FromBytes, IntoBytes};
 use half::f16;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
@@ -41,7 +41,7 @@ use crate::error::{MetalError, Result};
 /// let mlx_ptr = mlx_sys::mlx_array_data_float32(array.as_ptr());
 /// let view = unsafe { metal_buffer_from_ptr(&ctx, mlx_ptr, array.size())? };
 /// ```
-pub unsafe fn metal_buffer_from_ptr<T: Pod + Zeroable>(
+pub unsafe fn metal_buffer_from_ptr<T: Copy + FromBytes + IntoBytes>(
     ctx: &MetalContext,
     ptr: *mut T,
     len: usize,
@@ -66,7 +66,7 @@ pub unsafe fn metal_buffer_from_ptr<T: Pod + Zeroable>(
     // 3. newBufferWithBytesNoCopy creates a view without copying data
     // 4. deallocator is None because we don't own the memory - the caller
     //    (typically an MLX Array) is responsible for deallocation
-    // 5. The Pod + Zeroable bounds ensure T has no padding or invariants
+    // 5. The Copy + FromBytes + IntoBytes bounds ensure T has no padding or invariants
     // SAFETY: see above safety comment — all preconditions verified
     let buffer = unsafe {
         ctx.device()
@@ -88,13 +88,13 @@ pub unsafe fn metal_buffer_from_ptr<T: Pod + Zeroable>(
 ///
 /// Unlike `MetalBuffer`, this does not own its memory - it's a view into
 /// memory owned elsewhere (e.g., an MLX array).
-pub struct MetalBufferView<T: Pod + Zeroable> {
+pub struct MetalBufferView<T: Copy + FromBytes + IntoBytes> {
     buffer: objc2::rc::Retained<ProtocolObject<dyn MTLBuffer>>,
     len: usize,
     _phantom: std::marker::PhantomData<T>,
 }
 
-impl<T: Pod + Zeroable> AsMetalBuffer for MetalBufferView<T> {
+impl<T: Copy + FromBytes + IntoBytes> AsMetalBuffer for MetalBufferView<T> {
     fn as_metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.buffer
     }
@@ -104,7 +104,7 @@ impl<T: Pod + Zeroable> AsMetalBuffer for MetalBufferView<T> {
     }
 }
 
-impl<T: Pod + Zeroable> MetalBufferView<T> {
+impl<T: Copy + FromBytes + IntoBytes> MetalBufferView<T> {
     /// Get the number of elements.
     #[inline]
     pub fn len(&self) -> usize {
@@ -140,7 +140,7 @@ impl<T: Pod + Zeroable> MetalBufferView<T> {
 // 1. The source memory (e.g., MLX array) must remain valid across all threads
 // 2. The source memory must not be modified while any thread holds this view
 // 3. GPU operations using this buffer must be properly synchronized
-unsafe impl<T: Pod + Zeroable> Send for MetalBufferView<T> {}
+unsafe impl<T: Copy + FromBytes + IntoBytes> Send for MetalBufferView<T> {}
 
 // SAFETY: MetalBufferView can be shared between threads via &reference
 //
@@ -149,7 +149,7 @@ unsafe impl<T: Pod + Zeroable> Send for MetalBufferView<T> {}
 // 1. MTLBuffer is thread-safe for concurrent reads
 // 2. The view's methods only provide read access to the buffer metadata
 // 3. The underlying memory is immutable from this view's perspective
-unsafe impl<T: Pod + Zeroable> Sync for MetalBufferView<T> {}
+unsafe impl<T: Copy + FromBytes + IntoBytes> Sync for MetalBufferView<T> {}
 
 /// Type alias for f16 buffer views (common for attention).
 pub type MetalBufferViewF16 = MetalBufferView<f16>;
