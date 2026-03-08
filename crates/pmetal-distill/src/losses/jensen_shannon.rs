@@ -275,6 +275,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_js_identical_distributions() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let loss = JensenShannonLoss::new();
@@ -290,6 +291,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_js_symmetry() {
         let p = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let q = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
@@ -311,6 +313,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_js_bounded() {
         // Even for very different distributions, JS should be bounded by log(2)
         let p = Array::from_slice(&[10.0_f32, 0.0, 0.0, 0.0], &[1, 1, 4]);
@@ -331,6 +334,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_js_temperature_effect() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);

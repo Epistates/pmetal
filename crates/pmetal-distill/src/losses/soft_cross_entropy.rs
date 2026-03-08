@@ -246,6 +246,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_soft_ce_identical_distributions() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let loss = SoftCrossEntropyLoss::new();
@@ -259,6 +260,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_soft_ce_different_distributions() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
@@ -283,6 +285,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_soft_ce_temperature_effect() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
@@ -307,6 +310,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_soft_ce_batch_processing() {
         // Test with batch of sequences
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 2.0, 3.0, 4.0, 5.0], &[2, 1, 4]);

@@ -471,6 +471,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_compute_loss() {
         let config = test_config();
         let distiller = Distiller::new(config).unwrap();

@@ -498,6 +498,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_topk_compression() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
 
@@ -527,6 +528,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_topk_roundtrip() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 10.0, 4.0, 5.0, 6.0, 20.0, 8.0], &[2, 4]);
 
@@ -543,6 +545,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_int8_roundtrip() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
 
@@ -560,6 +563,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_int4_roundtrip() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 4]);
 
@@ -577,6 +581,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_none_compression() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[2, 2]);
 

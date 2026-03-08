@@ -210,6 +210,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_softmax() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[1, 3]);
         let probs = softmax(&logits, -1).unwrap();
@@ -225,6 +226,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_log_softmax() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0], &[1, 3]);
         let log_probs = mlx_rs::nn::log_softmax(&logits, -1).unwrap();
@@ -243,6 +245,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_gather_at_indices() {
         let values = Array::from_slice(&[0.1_f32, 0.2, 0.3, 0.4, 0.5, 0.6], &[2, 3]);
         let indices = Array::from_slice(&[1_i32, 2], &[2]);
@@ -255,6 +258,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_gpu_availability_check() {
         // Should return true on Apple Silicon with Metal feature
         let available = is_gpu_available();

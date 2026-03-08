@@ -64,6 +64,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_mse_identical_logits() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let loss = MseLoss::new();
@@ -79,6 +80,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_mse_different_logits() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let student = Array::from_slice(&[2.0_f32, 3.0, 4.0, 5.0], &[1, 1, 4]);
@@ -96,6 +98,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_mse_temperature_ignored() {
         let teacher = Array::from_slice(&[2.0_f32, 4.0, 6.0, 8.0], &[1, 1, 4]);
         let student = Array::from_slice(&[4.0_f32, 6.0, 8.0, 10.0], &[1, 1, 4]);
@@ -118,6 +121,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_mse_symmetry() {
         let a = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let b = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
@@ -186,6 +190,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_mse_batch_processing() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], &[2, 1, 4]);
         let student = Array::from_slice(&[2.0_f32, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], &[2, 1, 4]);

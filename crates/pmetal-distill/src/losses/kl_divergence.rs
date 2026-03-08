@@ -297,6 +297,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_kl_identical_distributions() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let loss = KlDivergenceLoss::new();
@@ -312,6 +313,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_kl_different_distributions() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
@@ -329,6 +331,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_kl_temperature_effect() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
@@ -359,6 +362,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_forward_vs_reverse_kl() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);

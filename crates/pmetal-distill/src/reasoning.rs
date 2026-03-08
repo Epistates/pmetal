@@ -311,6 +311,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_generate_reasoning_mask() {
         // Tokens: [CLS, "Hello", "<think>", " reasoning", " steps", "</think>", " final", " answer"]
         // Indices:  0,      1,         2,          3,        4,         5,        6,        7
@@ -331,6 +332,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_outcome_supervised_loss() {
         // Use asymmetric logits so the two samples have different KL divergences
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 1.0], &[2, 1, 2]);
@@ -385,6 +387,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_identical_distributions() {
         let logits = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let loss = RationaleLoss::new(1.0);
@@ -401,6 +404,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_different_distributions() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 1, 4]);
         let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
@@ -415,6 +419,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_reasoning_weight_effect() {
         // Create distributions where some positions have higher entropy
         // Position 0: low entropy (peaked distribution)
@@ -461,6 +466,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_per_token_kl_shape() {
         let teacher = Array::from_slice(
             &[
@@ -484,6 +490,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_entropy_shape() {
         let teacher = Array::from_slice(
             &[
@@ -507,6 +514,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_larger_batch() {
         let batch_size = 4;
         let seq_len = 16;

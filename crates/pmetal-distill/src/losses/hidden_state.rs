@@ -375,6 +375,7 @@ mod tests {
     use serial_test::serial;
 
     #[test]
+    #[serial]
     fn test_mse_hidden_loss() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
         let student = Array::from_slice(&[2.0_f32, 3.0, 4.0, 5.0], &[1, 2, 2]);
@@ -392,6 +393,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cosine_identical_vectors() {
         let hidden = Array::from_slice(&[1.0_f32, 0.0, 0.0, 1.0], &[1, 2, 2]);
 
@@ -408,6 +410,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_cosine_orthogonal_vectors() {
         // Orthogonal vectors: [1, 0] and [0, 1]
         let teacher = Array::from_slice(&[1.0_f32, 0.0], &[1, 1, 2]);
@@ -426,6 +429,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_l1_hidden_loss() {
         let teacher = Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 2, 2]);
         let student = Array::from_slice(&[2.0_f32, 3.0, 4.0, 5.0], &[1, 2, 2]);
@@ -455,6 +459,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_layer_distillation_compute() {
         let teacher_hiddens: Vec<Array> = (0..4)
             .map(|_| Array::from_slice(&[1.0_f32, 2.0, 3.0, 4.0], &[1, 2, 2]))

@@ -652,6 +652,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_interpolate_distributions() {
         let config = TaidConfig::default();
         let distiller = TaidDistiller::new(config).unwrap();
@@ -677,6 +678,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_taid_loss_computation() {
         let config = TaidConfig {
             difficulty_aware: false, // Simpler test
@@ -703,6 +705,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_taid_with_hard_targets() {
         let config = TaidConfig {
             difficulty_aware: false,
@@ -747,6 +750,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_difficulty_alpha() {
         let config = TaidConfig {
             difficulty_aware: true,
