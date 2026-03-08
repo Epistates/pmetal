@@ -27,7 +27,7 @@ use crate::topology::{NodeProfile, SharedTopology, new_shared_topology};
 use crate::transport::{TcpTransport, TransportReceiver, TransportSender};
 use anyhow::Result;
 use async_trait::async_trait;
-use bytemuck::cast_slice_mut;
+use zerocopy::{FromBytes, IntoBytes};
 use libp2p::PeerId;
 use parking_lot::RwLock;
 use std::net::SocketAddr;
@@ -330,7 +330,8 @@ impl DistributedBackend for AutoDiscoveryBackend {
             .into());
         }
 
-        let floats: &mut [f32] = cast_slice_mut(buffer);
+        let floats: &mut [f32] = <[f32]>::mut_from_bytes(buffer)
+            .map_err(|e| DistributedError::Protocol(format!("Buffer cast failed: {e}")))?;
         let len = floats.len();
         let world_size = self.world_size();
         let rank = self.rank();
@@ -361,25 +362,18 @@ impl DistributedBackend for AutoDiscoveryBackend {
             let (send_start, send_end) = get_chunk_range(send_idx);
             let (recv_start, recv_end) = get_chunk_range(recv_idx);
 
-            let send_bytes_len = (send_end - send_start) * 4;
             let recv_bytes_len = (recv_end - recv_start) * 4;
 
             // Copy data to send buffer
-            let mut send_buf = vec![0u8; send_bytes_len];
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    floats[send_start..send_end].as_ptr() as *const u8,
-                    send_buf.as_mut_ptr(),
-                    send_bytes_len,
-                );
-            }
+            let send_buf = floats[send_start..send_end].as_bytes().to_vec();
 
             // Send and receive concurrently
             let mut recv_buf = vec![0u8; recv_bytes_len];
             tokio::try_join!(sender.send(&send_buf), receiver.recv(&mut recv_buf))?;
 
             // Reduce received data into local buffer
-            let recv_floats: &[f32] = bytemuck::cast_slice(&recv_buf);
+            let recv_floats = <[f32]>::ref_from_bytes(&recv_buf)
+                .expect("recv buffer aligned for f32");
             for (i, &val) in recv_floats.iter().enumerate() {
                 floats[recv_start + i] += val;
             }
@@ -395,19 +389,15 @@ impl DistributedBackend for AutoDiscoveryBackend {
 
             let recv_bytes_len = (recv_end - recv_start) * 4;
 
-            let send_buf: &[u8] = bytemuck::cast_slice(&floats[send_start..send_end]);
+            let send_buf: &[u8] = floats[send_start..send_end].as_bytes();
 
             let mut recv_buf = vec![0u8; recv_bytes_len];
             tokio::try_join!(sender.send(send_buf), receiver.recv(&mut recv_buf))?;
 
             // Copy received data to local buffer
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    recv_buf.as_ptr(),
-                    floats[recv_start..recv_end].as_mut_ptr() as *mut u8,
-                    recv_bytes_len,
-                );
-            }
+            let recv_floats = <[f32]>::ref_from_bytes(&recv_buf)
+                .expect("recv buffer aligned for f32");
+            floats[recv_start..recv_end].copy_from_slice(recv_floats);
         }
 
         Ok(())

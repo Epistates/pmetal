@@ -14,6 +14,7 @@
 
 use crate::ane::mil::MilProgram;
 use crate::ane::runtime::WeightDict;
+use zerocopy::{FromBytes, IntoBytes};
 
 /// Configuration for transformer kernel generation.
 #[derive(Debug, Clone)]
@@ -138,8 +139,8 @@ impl WeightBlob {
         write_header(&mut blob, data_size);
 
         // Convert f32 → fp16 (row-major, no transpose)
-        let fp16_ptr = blob[128..].as_mut_ptr() as *mut u16;
-        let fp16_slice = unsafe { std::slice::from_raw_parts_mut(fp16_ptr, n) };
+        let fp16_slice: &mut [u16] = <[u16]>::mut_from_bytes(&mut blob[128..128 + data_size])
+            .expect("blob data region is u16-aligned (offset 128)");
         crate::neon_convert::f32_to_f16_bulk(weights, fp16_slice);
 
         blob
@@ -159,13 +160,11 @@ impl WeightBlob {
         write_header(&mut blob, data_size);
 
         // Transpose and convert
-        let fp16_ptr = blob[128..].as_mut_ptr() as *mut u16;
+        let fp16_slice: &mut [u16] = <[u16]>::mut_from_bytes(&mut blob[128..128 + data_size])
+            .expect("blob data region is u16-aligned (offset 128)");
         for i in 0..rows {
             for j in 0..cols {
-                let val = half::f16::from_f32(weights[i * cols + j]).to_bits();
-                unsafe {
-                    *fp16_ptr.add(j * rows + i) = val;
-                }
+                fp16_slice[j * rows + i] = half::f16::from_f32(weights[i * cols + j]).to_bits();
             }
         }
 
@@ -181,13 +180,7 @@ impl WeightBlob {
         write_header(&mut blob, data_size);
 
         // Copy raw fp16 data
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                fp16_data.as_ptr() as *const u8,
-                blob[128..].as_mut_ptr(),
-                data_size,
-            );
-        }
+        blob[128..128 + data_size].copy_from_slice(fp16_data.as_bytes());
 
         blob
     }
@@ -203,8 +196,8 @@ impl WeightBlob {
 
         write_header(&mut blob, data_size);
 
-        let fp16_ptr = blob[128..].as_mut_ptr() as *mut u16;
-        let fp16_slice = unsafe { std::slice::from_raw_parts_mut(fp16_ptr, n) };
+        let fp16_slice: &mut [u16] = <[u16]>::mut_from_bytes(&mut blob[128..128 + data_size])
+            .expect("blob data region is u16-aligned (offset 128)");
         crate::neon_convert::f32_to_f16_bulk(weights, fp16_slice);
 
         blob

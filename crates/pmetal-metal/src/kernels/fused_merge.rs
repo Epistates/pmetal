@@ -28,7 +28,7 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use bytemuck::{Pod, Zeroable};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
 
 use crate::buffer::MetalBuffer;
@@ -45,7 +45,7 @@ use crate::tuna::{MergeTunedConfig, Tuner};
 ///
 /// Enables processing multiple tensors with different sizes in a single dispatch.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct TensorInfo {
     /// Offset into the flattened buffer.
     pub offset: u32,
@@ -59,7 +59,7 @@ pub struct TensorInfo {
 
 /// Configuration for merge operations.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct MergeConfig {
     /// Number of tensors in batch.
     pub num_tensors: u32,
@@ -73,7 +73,7 @@ pub struct MergeConfig {
 
 /// Configuration for TIES merge operations.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct TiesConfig {
     /// Number of models being merged.
     pub num_models: u32,

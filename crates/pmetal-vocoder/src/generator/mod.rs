@@ -8,6 +8,7 @@ use crate::error::{Result, VocoderError};
 use crate::nn::{AMPBlock, Activation1d, SnakeBeta, WeightNormConv1d, WeightNormConvTranspose1d};
 use mlx_rs::Array;
 use std::path::Path;
+use zerocopy::FromBytes;
 
 /// BigVGAN neural vocoder.
 ///
@@ -278,18 +279,18 @@ fn tensor_to_array(tensor: safetensors::tensor::TensorView<'_>) -> Result<Array>
     // Handle different dtypes
     match tensor.dtype() {
         safetensors::Dtype::F32 => {
-            let floats: &[f32] = bytemuck::cast_slice(data);
+            let floats: &[f32] = <[f32]>::ref_from_bytes(data).expect("safetensors data aligned");
             Ok(Array::from_slice(floats, &shape))
         }
         safetensors::Dtype::F16 => {
             // Convert f16 to f32
-            let f16s: &[half::f16] = bytemuck::cast_slice(data);
+            let f16s: &[half::f16] = <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
             let floats: Vec<f32> = f16s.iter().map(|f| f.to_f32()).collect();
             Ok(Array::from_slice(&floats, &shape))
         }
         safetensors::Dtype::BF16 => {
             // Convert bf16 to f32
-            let bf16s: &[half::bf16] = bytemuck::cast_slice(data);
+            let bf16s: &[half::bf16] = <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
             let floats: Vec<f32> = bf16s.iter().map(|f| f.to_f32()).collect();
             Ok(Array::from_slice(&floats, &shape))
         }

@@ -44,7 +44,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use bytemuck::{Pod, Zeroable};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -331,7 +331,7 @@ impl Drop for BatchedCommandBuffer {
 
 /// AdamW optimizer hyperparameters.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct AdamWConfig {
     /// Learning rate (after scheduling).
     pub learning_rate: f32,
@@ -362,7 +362,7 @@ impl Default for AdamWConfig {
 
 /// Parameter metadata for batched processing.
 #[repr(C)]
-#[derive(Debug, Clone, Copy, Pod, Zeroable)]
+#[derive(Debug, Clone, Copy, FromBytes, IntoBytes, KnownLayout, Immutable)]
 pub struct ParamInfo {
     /// Offset into the flattened parameter buffer.
     pub offset: u32,

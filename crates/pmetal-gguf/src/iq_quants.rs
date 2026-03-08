@@ -22,6 +22,7 @@
 //! Based on llama.cpp/GGML IQ implementation.
 
 use half::f16;
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Block size for IQ4_NL (32 elements per block, like Q4_0).
 pub const QK4_NL: usize = 32;
@@ -782,7 +783,7 @@ pub const IQ1S_DELTA: f32 = 0.125;
 ///
 /// Dequantization: `value = d * KVALUES_IQ4NL[index]`
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockIq4Nl {
     /// Scale factor (f16).
     pub d: f16,
@@ -812,7 +813,7 @@ impl BlockIq4Nl {
 /// - scales_l: 4 bytes (low 4 bits of 8 sub-block scales, packed)
 /// - qs: 128 bytes (4-bit quantized indices, 2 per byte)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockIq4Xs {
     /// Super-block scale factor (f16).
     pub d: f16,
@@ -850,7 +851,7 @@ impl BlockIq4Xs {
 /// - d: 2 bytes (f16 scale)
 /// - qs: 64 bytes (16-bit packed indices, 32 x u16)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockIq2Xxs {
     /// Scale factor (f16).
     pub d: f16,
@@ -879,7 +880,7 @@ impl BlockIq2Xxs {
 /// - qs: 64 bytes (32 x u16)
 /// - scales: 8 bytes (per-subblock 4-bit scales)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockIq2Xs {
     /// Scale factor (f16).
     pub d: f16,
@@ -911,7 +912,7 @@ impl BlockIq2Xs {
 /// - qh: 8 bytes (high bits)
 /// - scales: 8 bytes
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockIq2S {
     /// Scale factor (f16).
     pub d: f16,
@@ -943,7 +944,7 @@ impl BlockIq2S {
 /// - d: 2 bytes (f16 scale)
 /// - qs: 96 bytes (3*QK_K/8 packed values)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockIq3Xxs {
     /// Scale factor (f16).
     pub d: f16,
@@ -977,7 +978,7 @@ pub const IQ3S_N_SCALE: usize = QK_K / 64;
 /// - signs: 32 bytes
 /// - scales: 4 bytes
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockIq3S {
     /// Scale factor (f16).
     pub d: f16,
@@ -1012,7 +1013,7 @@ impl BlockIq3S {
 /// - qs: 32 bytes (grid indices)
 /// - qh: 16 bytes (high bits/shifts)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockIq1S {
     /// Scale factor (f16).
     pub d: f16,
@@ -1043,7 +1044,7 @@ impl BlockIq1S {
 /// - qh: 16 bytes (high 3 bits + shift)
 /// - scales: 8 bytes (3-bit block scales)
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, FromBytes, KnownLayout, Immutable)]
 pub struct BlockIq1M {
     /// Grid indices (low 8 bits).
     pub qs: [u8; QK_K / 8],

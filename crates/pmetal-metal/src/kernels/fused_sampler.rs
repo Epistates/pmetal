@@ -33,7 +33,7 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use bytemuck::{Pod, Zeroable};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
@@ -61,7 +61,7 @@ pub trait AsMetalBuffer {
     }
 }
 
-impl<T: Pod + Zeroable> AsMetalBuffer for MetalBuffer<T> {
+impl<T: Copy + FromBytes + IntoBytes> AsMetalBuffer for MetalBuffer<T> {
     fn metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         MetalBuffer::metal_buffer(self)
     }
@@ -71,7 +71,7 @@ impl<T: Pod + Zeroable> AsMetalBuffer for MetalBuffer<T> {
     }
 }
 
-impl<T: Pod + Zeroable> AsMetalBuffer for MetalBufferView<T> {
+impl<T: Copy + FromBytes + IntoBytes> AsMetalBuffer for MetalBufferView<T> {
     fn metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         MetalBufferView::metal_buffer(self)
     }
@@ -83,7 +83,7 @@ impl<T: Pod + Zeroable> AsMetalBuffer for MetalBufferView<T> {
 
 /// Sampling parameters matching the Metal kernel's SamplingParams struct.
 #[repr(C)]
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, IntoBytes, KnownLayout, Immutable)]
 pub struct SamplingParams {
     /// Vocabulary size.
     pub vocab_size: u32,

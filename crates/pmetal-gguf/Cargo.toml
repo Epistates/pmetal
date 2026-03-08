@@ -13,6 +13,7 @@ categories.workspace = true
 pmetal-core = { workspace = true }
 byteorder = "1.5"
 half = { workspace = true }
+zerocopy = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
