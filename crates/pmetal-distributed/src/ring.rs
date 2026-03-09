@@ -6,8 +6,8 @@ use crate::{
 };
 use anyhow::Result;
 use async_trait::async_trait;
-use zerocopy::{FromBytes, IntoBytes};
 use tokio::sync::Mutex;
+use zerocopy::{FromBytes, IntoBytes};
 
 pub struct RingBackend {
     rank: usize,
@@ -106,8 +106,8 @@ impl DistributedBackend for RingBackend {
             tokio::try_join!(send_fut, recv_fut)?;
 
             // Reduce
-            let recv_floats = <[f32]>::ref_from_bytes(recv_slice)
-                .expect("recv buffer aligned for f32");
+            let recv_floats =
+                <[f32]>::ref_from_bytes(recv_slice).expect("recv buffer aligned for f32");
 
             for i in 0..recv_floats.len() {
                 floats[r_start + i] += recv_floats[i];
@@ -136,8 +136,8 @@ impl DistributedBackend for RingBackend {
             tokio::try_join!(send_fut, recv_fut)?;
 
             // Copy (Gather)
-            let recv_floats = <[f32]>::ref_from_bytes(recv_slice)
-                .expect("recv buffer aligned for f32");
+            let recv_floats =
+                <[f32]>::ref_from_bytes(recv_slice).expect("recv buffer aligned for f32");
             floats[r_start..r_end].copy_from_slice(recv_floats);
 
             send_chunk_idx = recv_chunk_idx;

@@ -30,7 +30,7 @@ Fine-tune a model with LoRA or QLoRA:
 
 ```bash
 pmetal train \
-  --model qwen/Qwen3-0.6B-Base \
+  --model Qwen/Qwen3-0.6B-Base \
   --dataset train.jsonl \
   --output ./output \
   --lora-r 16 \
@@ -64,7 +64,7 @@ Run inference with optional LoRA adapter:
 
 ```bash
 pmetal infer \
-  --model qwen/Qwen3-0.6B-Base \
+  --model Qwen/Qwen3-0.6B-Base \
   --lora ./output/lora_weights.safetensors \
   --prompt "Does absolute truth exist?" \
   --chat \
@@ -102,12 +102,76 @@ Benchmark training performance:
 
 ```bash
 pmetal bench \
-  --model qwen/Qwen3-0.6B-Base \
+  --model Qwen/Qwen3-0.6B-Base \
   --batch-size 4 \
   --seq-len 512
 ```
 
 Use `bench-ffi` for overhead analysis and `bench-gen` for generation loop profiling.
+
+### `distill`
+
+Knowledge distillation from teacher to student model:
+
+```bash
+pmetal distill \
+  --teacher Qwen/Qwen3-4B \
+  --student unsloth/Qwen3.5-0.8B-Base \
+  --dataset train.jsonl \
+  --output ./output/distilled \
+  --method online \
+  --loss-type kl_divergence \
+  --temperature 2.0
+```
+
+Supports cross-vocabulary distillation (teacher and student can have different vocab sizes).
+
+#### Distillation Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `--teacher` | Teacher model ID | Required |
+| `--student` | Student model ID | Required |
+| `--dataset` | Training data (JSONL) | Required |
+| `--method` | online, offline, progressive | online |
+| `--loss-type` | kl_divergence, jensen_shannon, soft_cross_entropy | kl_divergence |
+| `--temperature` | Softmax temperature | 2.0 |
+| `--alpha` | Hard/soft label balance | 0.5 |
+| `--rationale` | Reasoning-aware distillation | false |
+| `--lora-r` | Student LoRA rank | 16 |
+
+### `dataset`
+
+Dataset utilities for preparing and analyzing training data:
+
+```bash
+pmetal dataset analyze --path train.jsonl
+pmetal dataset validate --path train.jsonl --model Qwen/Qwen3-0.6B
+pmetal dataset prepare TeichAI/dataset-id --output-dir ./data --model Qwen/Qwen3-0.6B
+```
+
+### `grpo`
+
+Group Relative Policy Optimization for reasoning models:
+
+```bash
+pmetal grpo \
+  --model unsloth/Qwen3-0.6B-Base \
+  --dataset problems.jsonl \
+  --output ./output/grpo
+```
+
+Use `--dapo` for Decoupled Clip and Dynamic Sampling Policy Optimization.
+
+### Other Commands
+
+| Command | Description |
+|---------|-------------|
+| `download` | Download model from HuggingFace |
+| `memory` | Show memory usage and capacity |
+| `quantize` | Quantize model to GGUF (Dynamic 2.0) |
+| `ollama` | Export trained model for Ollama |
+| `init` | Generate sample config file |
 
 ## Environment Variables
 

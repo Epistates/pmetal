@@ -3,11 +3,11 @@
 //! On Apple Silicon, MLX and Metal share unified memory. This module provides
 //! utilities to pass data between them without copying.
 
-use zerocopy::{FromBytes, IntoBytes};
 use half::f16;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
 use std::ptr::NonNull;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::buffer::AsMetalBuffer;
 use crate::context::MetalContext;

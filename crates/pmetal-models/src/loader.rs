@@ -726,12 +726,23 @@ pub struct WeightIndex {
 }
 
 /// Validate that a shard path does not escape the model directory (path traversal protection).
+///
+/// HuggingFace cache uses symlinks: snapshot files point to `../../blobs/`.
+/// We validate that the canonical shard path stays within the HF repo root
+/// (the common ancestor of both `snapshots/` and `blobs/`), not just the
+/// snapshot directory itself.
 fn validate_shard_path(
     model_dir: &Path,
     shard_file: &str,
 ) -> Result<std::path::PathBuf, LoadError> {
+    // Reject path traversal in the shard filename itself
+    if shard_file.contains("..") || shard_file.starts_with('/') {
+        return Err(LoadError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("Shard filename contains path traversal: {}", shard_file),
+        )));
+    }
     let shard_path = model_dir.join(shard_file);
-    // Canonicalize both paths to resolve symlinks and ../ components
     let canonical_dir = model_dir.canonicalize()?;
     let canonical_shard = shard_path.canonicalize().map_err(|e| {
         LoadError::Io(std::io::Error::new(
@@ -743,13 +754,41 @@ fn validate_shard_path(
             ),
         ))
     })?;
-    if !canonical_shard.starts_with(&canonical_dir) {
-        return Err(LoadError::Io(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            format!("Shard path escapes model directory: {:?}", shard_path),
-        )));
+    // First check: shard is directly inside model_dir (non-symlinked case)
+    if canonical_shard.starts_with(&canonical_dir) {
+        // Return original path to preserve .safetensors extension for mlx-rs
+        return Ok(shard_path);
     }
-    Ok(canonical_shard)
+    // Second check: HF cache layout — shard symlinks to ../../blobs/ within
+    // the same repo directory (e.g. models--Org--Name/{snapshots,blobs}/)
+    // Allow if both canonical paths share the same HF repo root.
+    if let Some(repo_root) = find_hf_repo_root(&canonical_dir) {
+        if canonical_shard.starts_with(&repo_root) {
+            // Return original symlink path to preserve .safetensors extension
+            return Ok(shard_path);
+        }
+    }
+    Err(LoadError::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        format!("Shard path escapes model directory: {:?}", shard_path),
+    )))
+}
+
+/// Find the HuggingFace repo root directory for a given path.
+///
+/// HF cache layout: `~/.cache/huggingface/hub/models--Org--Name/snapshots/<hash>/`
+/// The repo root is `models--Org--Name/` which contains both `snapshots/` and `blobs/`.
+fn find_hf_repo_root(path: &Path) -> Option<std::path::PathBuf> {
+    let mut current = Some(path);
+    while let Some(p) = current {
+        if let Some(name) = p.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("models--") || name.starts_with("datasets--") {
+                return Some(p.to_path_buf());
+            }
+        }
+        current = p.parent();
+    }
+    None
 }
 
 /// Load generic weights using safetensors.

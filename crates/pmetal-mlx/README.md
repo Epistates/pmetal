@@ -32,7 +32,8 @@ let packed = SequencePacker::pack(&sequences, max_length)?;
 
 | Module | Description |
 |--------|-------------|
-| `kernels` | Custom MLX kernels (cross entropy, RMS norm, etc.) |
+| `kernels` | Custom MLX kernels (cross entropy, RMS norm, GDN, etc.) |
+| `kernels/gated_delta` | Gated Delta Network (GDN) recurrence with fused Metal shader |
 | `quantization` | Weight quantization implementations |
 | `gradient_checkpoint` | Memory-efficient gradient computation |
 | `kv_cache` | Key-value cache for efficient inference |

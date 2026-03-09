@@ -284,13 +284,15 @@ fn tensor_to_array(tensor: safetensors::tensor::TensorView<'_>) -> Result<Array>
         }
         safetensors::Dtype::F16 => {
             // Convert f16 to f32
-            let f16s: &[half::f16] = <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
+            let f16s: &[half::f16] =
+                <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
             let floats: Vec<f32> = f16s.iter().map(|f| f.to_f32()).collect();
             Ok(Array::from_slice(&floats, &shape))
         }
         safetensors::Dtype::BF16 => {
             // Convert bf16 to f32
-            let bf16s: &[half::bf16] = <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
+            let bf16s: &[half::bf16] =
+                <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
             let floats: Vec<f32> = bf16s.iter().map(|f| f.to_f32()).collect();
             Ok(Array::from_slice(&floats, &shape))
         }

@@ -33,12 +33,12 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
 };
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::bridge::MetalBufferView;
 use crate::buffer::{BufferUsage, MetalBuffer};

@@ -32,6 +32,8 @@
 //! - Chunkwise algorithm: Yang et al., "Gated Linear Attention Transformers with
 //!   Hardware-Efficient Training" (FLA, ICLR 2025).
 
+use std::sync::{Arc, Mutex, OnceLock};
+
 use mlx_rs::{
     Array, Dtype, StreamOrDevice,
     error::Exception,
@@ -39,10 +41,44 @@ use mlx_rs::{
     ops::{self, indexing::IndexOp},
     stop_gradient,
 };
+use pmetal_metal::{
+    buffer::{BufferUsage, MetalBuffer},
+    context::MetalContext,
+    kernels::fused_gdn::{FusedGdn, FusedGdnConfig},
+};
+
+use crate::bridge::MlxMetalBridge;
 
 /// Chunk size for the chunkwise parallel GDN algorithm.
 /// Sequences longer than this use the parallel chunk path.
 const GDN_CHUNK_SIZE: i32 = 64;
+
+/// Cached FusedGdn instance. Reused across decode steps to avoid
+/// re-creating Metal pipeline state on every call.
+/// Key: (key_dim, value_dim) — one instance per GDN configuration.
+static FUSED_GDN_CACHE: OnceLock<Mutex<Vec<(u32, u32, Arc<FusedGdn>)>>> = OnceLock::new();
+
+fn get_or_create_fused_gdn(dk: u32, dv: u32) -> Result<Arc<FusedGdn>, Exception> {
+    let cache = FUSED_GDN_CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let mut entries = cache.lock().unwrap();
+
+    // Check for existing instance with matching config.
+    for (k, v, gdn) in entries.iter() {
+        if *k == dk && *v == dv {
+            return Ok(gdn.clone());
+        }
+    }
+
+    // Create new instance.
+    let ctx = MetalContext::global().map_err(|e| Exception::custom(e.to_string()))?;
+    let config = FusedGdnConfig::new(dk, dv);
+    let gdn = Arc::new(
+        FusedGdn::new(ctx, config)
+            .map_err(|e| Exception::custom(format!("FusedGdn init: {}", e)))?,
+    );
+    entries.push((dk, dv, gdn.clone()));
+    Ok(gdn)
+}
 
 /// Compute gating decay: g = exp(-exp(A_log) * softplus(a + dt_bias))
 ///
@@ -592,11 +628,117 @@ pub fn gated_delta_update(
     // Inference can use the fast chunk path (O(T/64) vs O(T) for prefill).
     if !training {
         let t = q.dim(1);
+
+        // For short sequences (decode T=1 or short prefill T≤64), try the fused
+        // Metal kernel which replaces ~10 MLX ops/step with a single GPU dispatch.
+        let dk = q.dim(3) as u32;
+        if dk % 32 == 0 && dk <= 256 && mask.is_none() {
+            match gated_delta_fused_metal(q, k, v, &g, &beta, state_ref) {
+                Ok(result) => return Ok(result),
+                Err(_) => {
+                    // Fall through to MLX ops path on failure (e.g., unsupported config).
+                }
+            }
+        }
+
         if t > GDN_CHUNK_SIZE {
             return gated_delta_chunk_ops(q, k, v, &g, &beta, state_ref, mask);
         }
     }
     gated_delta_ops(q, k, v, &g, &beta, Some(state_ref), mask)
+}
+
+/// Fused Metal GDN recurrence for inference decode/short prefill.
+///
+/// Replaces the sequential MLX ops path with a single Metal kernel dispatch,
+/// eliminating ~10 MLX op dispatches per timestep per layer.
+///
+/// # Arguments
+/// Same as `gated_delta_ops` but q/k must already be GQA-expanded and
+/// g/beta must already be computed (exp-space and sigmoid-space respectively).
+///
+/// # Returns
+/// (output `[B, T, Hv, Dv]`, final_state `[B, Hv, Dv, Dk]`)
+fn gated_delta_fused_metal(
+    q: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+    state: &Array,
+) -> Result<(Array, Array), Exception> {
+    let b = q.dim(0);
+    let t = q.dim(1);
+    let hk = q.dim(2);
+    let dk = q.dim(3);
+    let hv = v.dim(2);
+    let dv = v.dim(3);
+
+    // GQA expansion: repeat q, k heads to match Hv
+    let repeat_factor = hv / hk;
+    let (q_exp, k_exp);
+    let (q_ref, k_ref) = if repeat_factor > 1 {
+        q_exp = ops::repeat_axis::<f32>(q.clone(), repeat_factor, 2)?;
+        k_exp = ops::repeat_axis::<f32>(k.clone(), repeat_factor, 2)?;
+        (&q_exp, &k_exp)
+    } else {
+        (q, k)
+    };
+
+    // Ensure all inputs are f32 and evaluated. MLX arrays from ops are
+    // typically row-contiguous; copy_as_f32 in the bridge handles eval+copy.
+    let q_c = q_ref.as_dtype(Dtype::Float32)?;
+    let k_c = k_ref.as_dtype(Dtype::Float32)?;
+    let v_c = v.as_dtype(Dtype::Float32)?;
+    let g_c = g.as_dtype(Dtype::Float32)?;
+    let beta_c = beta.as_dtype(Dtype::Float32)?;
+    let state_c = state.as_dtype(Dtype::Float32)?;
+
+    let gdn = get_or_create_fused_gdn(dk as u32, dv as u32)?;
+    let ctx = MetalContext::global().map_err(|e| Exception::custom(e.to_string()))?;
+
+    // Copy inputs to Metal buffers. For decode (T=1), these are tiny (a few KB)
+    // so copy overhead is negligible vs the 10 MLX op dispatches we're eliminating.
+    let q_buf =
+        MlxMetalBridge::copy_as_f32(&ctx, &q_c).map_err(|e| Exception::custom(e.to_string()))?;
+    let k_buf =
+        MlxMetalBridge::copy_as_f32(&ctx, &k_c).map_err(|e| Exception::custom(e.to_string()))?;
+    let v_buf =
+        MlxMetalBridge::copy_as_f32(&ctx, &v_c).map_err(|e| Exception::custom(e.to_string()))?;
+    let g_buf =
+        MlxMetalBridge::copy_as_f32(&ctx, &g_c).map_err(|e| Exception::custom(e.to_string()))?;
+    let beta_buf =
+        MlxMetalBridge::copy_as_f32(&ctx, &beta_c).map_err(|e| Exception::custom(e.to_string()))?;
+    let state_buf = MlxMetalBridge::copy_as_f32(&ctx, &state_c)
+        .map_err(|e| Exception::custom(e.to_string()))?;
+
+    // Allocate output buffer.
+    let output_size = (b * t * hv * dv) as usize;
+    let output_buf = MetalBuffer::<f32>::new(&ctx, output_size, BufferUsage::Shared)
+        .map_err(|e| Exception::custom(e.to_string()))?;
+
+    // Run the fused kernel.
+    gdn.forward(
+        b as u32,
+        hv as u32,
+        t as u32,
+        &q_buf,
+        &k_buf,
+        &v_buf,
+        &g_buf,
+        &beta_buf,
+        &state_buf,
+        &output_buf,
+    )
+    .map_err(|e| Exception::custom(format!("FusedGdn forward: {}", e)))?;
+
+    // Convert results back to MLX arrays.
+    let output = MlxMetalBridge::buffer_into_array_f32(output_buf, &[b, t, hv, dv])
+        .map_err(|e| Exception::custom(e.to_string()))?;
+    let new_state = MlxMetalBridge::buffer_into_array_f32(state_buf, &[b, hv, dv, dk])
+        .map_err(|e| Exception::custom(e.to_string()))?;
+
+    Ok((output, new_state))
 }
 
 #[cfg(test)]
@@ -1077,5 +1219,89 @@ mod tests {
         assert_eq!(y_chunk.shape(), &[b, t, hv, dv]);
         assert_close(&y_chunk, &y_seq, 1e-3, "Nonzero S₀ output mismatch");
         assert_close(&state_chunk, &state_seq, 1e-3, "Nonzero S₀ state mismatch");
+    }
+
+    #[test]
+    #[serial]
+    fn test_fused_metal_vs_ops_decode() {
+        // Compare fused Metal kernel against MLX ops reference for T=1 decode.
+        // Uses dk=64 (divisible by 32) to exercise the fused path.
+        let b = 1;
+        let t = 1;
+        let hk = 2;
+        let dk = 64;
+        let hv = 4; // GQA: 4 value heads, 2 key heads
+        let dv = 64;
+
+        mlx_rs::random::seed(42).unwrap();
+        let q = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
+        let k = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
+        let v = mlx_rs::random::normal::<f32>(&[b, t, hv, dv], None, None, None).unwrap();
+        let g = mlx_rs::random::uniform::<_, f32>(0.5, 1.0, &[b, t, hv], None).unwrap();
+        let beta = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[b, t, hv], None).unwrap();
+
+        let state = ops::zeros_dtype(&[b, hv, dv, dk], Dtype::Float32).unwrap();
+
+        // MLX ops reference path
+        let (y_ref, state_ref) =
+            gated_delta_ops(&q, &k, &v, &g, &beta, Some(&state), None).unwrap();
+
+        // Fused Metal path
+        let (y_fused, state_fused) =
+            gated_delta_fused_metal(&q, &k, &v, &g, &beta, &state).unwrap();
+
+        y_ref.eval().unwrap();
+        state_ref.eval().unwrap();
+        y_fused.eval().unwrap();
+        state_fused.eval().unwrap();
+
+        assert_eq!(y_fused.shape(), y_ref.shape());
+        assert_eq!(state_fused.shape(), state_ref.shape());
+        assert_close(&y_fused, &y_ref, 1e-3, "Fused vs ops output mismatch");
+        assert_close(
+            &state_fused,
+            &state_ref,
+            1e-3,
+            "Fused vs ops state mismatch",
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_fused_metal_multi_step() {
+        // Test fused Metal kernel for T>1 (short prefill) vs ops reference.
+        let b = 1;
+        let t = 8;
+        let hk = 2;
+        let dk = 32;
+        let hv = 2;
+        let dv = 32;
+
+        mlx_rs::random::seed(123).unwrap();
+        let q = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
+        let k = mlx_rs::random::normal::<f32>(&[b, t, hk, dk], None, None, None).unwrap();
+        let v = mlx_rs::random::normal::<f32>(&[b, t, hv, dv], None, None, None).unwrap();
+        let g = mlx_rs::random::uniform::<_, f32>(0.5, 1.0, &[b, t, hv], None).unwrap();
+        let beta = mlx_rs::random::uniform::<_, f32>(0.0, 1.0, &[b, t, hv], None).unwrap();
+
+        let state = ops::zeros_dtype(&[b, hv, dv, dk], Dtype::Float32).unwrap();
+
+        let (y_ref, state_ref) =
+            gated_delta_ops(&q, &k, &v, &g, &beta, Some(&state), None).unwrap();
+        let (y_fused, state_fused) =
+            gated_delta_fused_metal(&q, &k, &v, &g, &beta, &state).unwrap();
+
+        y_ref.eval().unwrap();
+        state_ref.eval().unwrap();
+        y_fused.eval().unwrap();
+        state_fused.eval().unwrap();
+
+        assert_close(&y_fused, &y_ref, 1e-3, "Fused multi-step output mismatch");
+        assert_close(
+            &state_fused,
+            &state_ref,
+            1e-3,
+            "Fused multi-step state mismatch",
+        );
     }
 }

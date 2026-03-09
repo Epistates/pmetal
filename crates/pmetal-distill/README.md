@@ -20,9 +20,11 @@ This crate provides knowledge distillation utilities for training smaller studen
 
 - **Online Softmax**: O(1) memory per token via streaming computation
 - **Fused Operations**: Temperature scaling + softmax + loss in one kernel
+- **Cross-Vocabulary Distillation**: Sparse top-k alignment for teacher/student vocab mismatch (e.g. Qwen3 → Qwen3.5)
 - **Progressive Distillation**: Temperature annealing schedules
 - **Offline Distillation**: Compressed logit caching for large teachers
 - **Layer Matching**: Align intermediate representations
+- **Reasoning-Aware**: Rationale distillation with weighted reasoning tokens
 
 ## Usage
 

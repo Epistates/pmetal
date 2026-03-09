@@ -27,7 +27,6 @@ use crate::topology::{NodeProfile, SharedTopology, new_shared_topology};
 use crate::transport::{TcpTransport, TransportReceiver, TransportSender};
 use anyhow::Result;
 use async_trait::async_trait;
-use zerocopy::{FromBytes, IntoBytes};
 use libp2p::PeerId;
 use parking_lot::RwLock;
 use std::net::SocketAddr;
@@ -35,6 +34,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Mutex, mpsc};
 use tracing::{debug, error, info, warn};
+use zerocopy::{FromBytes, IntoBytes};
 
 /// Default port for gradient exchange.
 const DEFAULT_GRADIENT_PORT: u16 = 52416;
@@ -372,8 +372,8 @@ impl DistributedBackend for AutoDiscoveryBackend {
             tokio::try_join!(sender.send(&send_buf), receiver.recv(&mut recv_buf))?;
 
             // Reduce received data into local buffer
-            let recv_floats = <[f32]>::ref_from_bytes(&recv_buf)
-                .expect("recv buffer aligned for f32");
+            let recv_floats =
+                <[f32]>::ref_from_bytes(&recv_buf).expect("recv buffer aligned for f32");
             for (i, &val) in recv_floats.iter().enumerate() {
                 floats[recv_start + i] += val;
             }
@@ -395,8 +395,8 @@ impl DistributedBackend for AutoDiscoveryBackend {
             tokio::try_join!(sender.send(send_buf), receiver.recv(&mut recv_buf))?;
 
             // Copy received data to local buffer
-            let recv_floats = <[f32]>::ref_from_bytes(&recv_buf)
-                .expect("recv buffer aligned for f32");
+            let recv_floats =
+                <[f32]>::ref_from_bytes(&recv_buf).expect("recv buffer aligned for f32");
             floats[recv_start..recv_end].copy_from_slice(recv_floats);
         }
 

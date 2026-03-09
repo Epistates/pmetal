@@ -70,6 +70,8 @@ pub struct DynamicAneTrainerConfig {
     pub warmup_steps: usize,
     /// Minimum LR ratio for cosine decay.
     pub min_lr_ratio: f32,
+    /// RMSNorm epsilon (must match ANE kernel eps). Default: 1e-6.
+    pub rms_norm_eps: f32,
 }
 
 impl Default for DynamicAneTrainerConfig {
@@ -91,6 +93,7 @@ impl Default for DynamicAneTrainerConfig {
             accum_steps: 10,
             warmup_steps: 100,
             min_lr_ratio: 0.1,
+            rms_norm_eps: 1e-6,
         }
     }
 }
@@ -836,7 +839,14 @@ impl DynamicAneTrainer {
         // ====== Attention Block ======
 
         // 1. RMSNorm on CPU
-        accelerate::rmsnorm(&mut acts.xnorm, x, &lw.rms_att, d, s);
+        accelerate::rmsnorm(
+            &mut acts.xnorm,
+            x,
+            &lw.rms_att,
+            d,
+            s,
+            self.config.rms_norm_eps,
+        );
 
         // 2. Q projection: xnorm @ Wq → Q
         Self::run_projection(kernels, io, d, qd, s, &acts.xnorm, &lw.wq, &mut acts.q)?;
@@ -875,7 +885,14 @@ impl DynamicAneTrainer {
         // ====== FFN Block ======
 
         // 8. RMSNorm on CPU
-        accelerate::rmsnorm(&mut acts.x2norm, &acts.x2, &lw.rms_ffn, d, s);
+        accelerate::rmsnorm(
+            &mut acts.x2norm,
+            &acts.x2,
+            &lw.rms_ffn,
+            d,
+            s,
+            self.config.rms_norm_eps,
+        );
 
         // 9. W1 projection: x2norm @ W1 → h1
         Self::run_projection(kernels, io, d, h, s, &acts.x2norm, &lw.w1, &mut acts.h1)?;
@@ -1062,6 +1079,7 @@ impl DynamicAneTrainer {
             &self.layer_weights[l].rms_ffn,
             d,
             s,
+            self.config.rms_norm_eps,
         );
 
         // ====== Attention Backward ======
@@ -1251,6 +1269,7 @@ impl DynamicAneTrainer {
             &self.layer_weights[l].rms_att,
             d,
             s,
+            self.config.rms_norm_eps,
         );
 
         // Output: dx = dx_ffn_norm + dx_attn_norm (residual)
@@ -1284,7 +1303,14 @@ impl DynamicAneTrainer {
 
         // Final RMSNorm
         let mut x_final = vec![0.0f32; d * s];
-        accelerate::rmsnorm(&mut x_final, &x, &self.rms_final, d, s);
+        accelerate::rmsnorm(
+            &mut x_final,
+            &x,
+            &self.rms_final,
+            d,
+            s,
+            self.config.rms_norm_eps,
+        );
 
         // Classifier + loss + backward: compact or full path
         let (loss, mut dx) = if let Some(ref vm) = self.vocab_map {
@@ -1465,6 +1491,7 @@ impl DynamicAneTrainer {
             &self.rms_final,
             d,
             s,
+            self.config.rms_norm_eps,
         );
 
         // Per-layer backward (reverse order)

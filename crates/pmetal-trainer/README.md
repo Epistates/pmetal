@@ -16,6 +16,12 @@ This crate provides the training infrastructure for PMetal, including various tr
 | **GRPO** | Group Relative Policy Optimization | Efficient PPO alternative |
 | **GSPO** | Group Sequence Policy Optimization | Fixes GRPO length bias |
 | **DAPO** | Decoupled Clip and Dynamic Sampling PO | ByteDance's 4 GRPO improvements |
+| **PPO** | Proximal Policy Optimization | RLHF with reward model |
+| **ORPO** | Odds Ratio Preference Optimization | Reference-free alignment |
+| **SimPO** | Simple Preference Optimization | Simplified preference learning |
+| **KTO** | Kahneman-Tversky Optimization | Unpaired preference data |
+| **Online DPO** | Online Direct Preference Optimization | DPO with online sampling |
+| **Distillation** | Knowledge distillation | Teacher→student transfer |
 | **ANE** | Apple Neural Engine training | Power-efficient on-device training |
 | **Diffusion** | LLaDA-style diffusion training | Experimental |
 
@@ -78,6 +84,12 @@ trainer.train_with_checkpoints(&dataloader, &checkpoint_mgr, save_every: 500)?;
 | `gspo` | Group Sequence Policy Optimization |
 | `dapo` | Decoupled Clip and Dynamic Sampling PO |
 | `ane_training` | ANE training loop (`AneTrainingLoop` + `DynamicAneTrainer`) |
+| `ppo` | Proximal Policy Optimization |
+| `orpo` | Odds Ratio Preference Optimization |
+| `simpo` | Simple Preference Optimization |
+| `kto` | Kahneman-Tversky Optimization |
+| `online_dpo` | Online DPO with sampling |
+| `distillation` | Knowledge distillation orchestration |
 | `diffusion` | Diffusion-based training |
 | `checkpoint` | Checkpoint save/load |
 | `scheduler` | Learning rate schedulers |

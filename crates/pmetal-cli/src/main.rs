@@ -297,6 +297,14 @@ enum Commands {
         #[cfg(feature = "ane")]
         #[arg(long)]
         no_ane: bool,
+
+        /// Maximum ANE kernel sequence length (power-of-2 bucket cap).
+        /// ANE kernels are compiled for a fixed spatial dimension — larger values
+        /// allow longer prompts to be processed on ANE but may fail to compile
+        /// for models with many attention heads. Default: 1024.
+        #[cfg(feature = "ane")]
+        #[arg(long, default_value = "1024")]
+        ane_max_seq_len: usize,
     },
 
     /// Download a model from HuggingFace
@@ -1187,6 +1195,8 @@ async fn main() -> anyhow::Result<()> {
             fp8,
             #[cfg(feature = "ane")]
             no_ane,
+            #[cfg(feature = "ane")]
+            ane_max_seq_len,
         } => {
             run_inference(
                 &model,
@@ -1214,6 +1224,10 @@ async fn main() -> anyhow::Result<()> {
                 !no_ane,
                 #[cfg(not(feature = "ane"))]
                 false,
+                #[cfg(feature = "ane")]
+                ane_max_seq_len,
+                #[cfg(not(feature = "ane"))]
+                1024,
             )
             .await?;
         }
@@ -2617,6 +2631,19 @@ async fn run_training(
             model.architecture_name()
         );
 
+        // GDN (Gated Delta Networks) training resource guard: models like Qwen3.5
+        // use sequential recurrence that creates O(T * n_layers) allocation nodes.
+        // Without gradient checkpointing (custom_vjp not yet available in mlx-rs),
+        // this exceeds Metal's 499K buffer limit at seq_len > 512.
+        if model.architecture_name() == "Qwen3Next" && config.training.max_seq_len > 512 {
+            tracing::warn!(
+                "Qwen3.5 (GDN) training with max_seq_len={} may exceed Metal resource limits (499K buffers). \
+                 Recommended: --max-seq-len 512 or lower. Gradient checkpointing for GDN requires \
+                 custom_vjp which is not yet available in mlx-rs.",
+                config.training.max_seq_len
+            );
+        }
+
         tracing::info!(
             "Trainable parameters: {}",
             format_param_count(model.num_trainable_params())
@@ -2821,6 +2848,7 @@ async fn run_inference(
     show_thinking: bool,
     fp8: bool,
     ane: bool,
+    ane_max_seq_len: usize,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "ane"))]
     if ane {
@@ -3022,7 +3050,12 @@ async fn run_inference(
                 tracing::info!(
                     "Attempting ANE-hybrid inference engine (Prefill: ANE, Decode: CPU/vDSP)"
                 );
-                match pmetal_models::generate_cached_ane(&model_path, &input_ids, &gen_config) {
+                match pmetal_models::generate_cached_ane(
+                    &model_path,
+                    &input_ids,
+                    &gen_config,
+                    ane_max_seq_len,
+                ) {
                     Ok(output) => Some(output),
                     Err(e) => {
                         tracing::warn!("ANE inference failed ({}), falling back to GPU", e);

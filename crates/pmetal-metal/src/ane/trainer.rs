@@ -50,6 +50,8 @@ pub struct AneTrainerConfig {
     pub max_compiles: usize,
     /// Strategy when compile budget is exhausted.
     pub exhaustion_strategy: BudgetExhaustionStrategy,
+    /// RMSNorm epsilon (must match ANE kernel eps). Default: 1e-6.
+    pub rms_norm_eps: f32,
 }
 
 impl Default for AneTrainerConfig {
@@ -69,6 +71,7 @@ impl Default for AneTrainerConfig {
             accum_steps: 10,
             max_compiles: 100,
             exhaustion_strategy: BudgetExhaustionStrategy::Error,
+            rms_norm_eps: 1e-6,
         }
     }
 }
@@ -724,7 +727,14 @@ impl AneTrainer {
 
         // Final RMSNorm
         let mut x_final = vec![0.0f32; d * s];
-        accelerate::rmsnorm(&mut x_final, &x, &self.rms_final, d, s);
+        accelerate::rmsnorm(
+            &mut x_final,
+            &x,
+            &self.rms_final,
+            d,
+            s,
+            self.config.rms_norm_eps,
+        );
 
         // Classifier: logits = embed^T @ x_final via cblas_sgemm
         let v = self.config.vocab_size;
@@ -800,6 +810,7 @@ impl AneTrainer {
             &self.rms_final,
             d,
             s,
+            self.config.rms_norm_eps,
         );
 
         // Per-layer backward (reverse order)
@@ -833,7 +844,14 @@ impl AneTrainer {
 
         // 1. Attention Block
         // RMSNorm on CPU
-        accelerate::rmsnorm(&mut acts.xnorm, x, &lw.rms_att, d, s);
+        accelerate::rmsnorm(
+            &mut acts.xnorm,
+            x,
+            &lw.rms_att,
+            d,
+            s,
+            self.config.rms_norm_eps,
+        );
 
         // ANE fwd_attn
         io.input.write_f32_as_fp16(&acts.xnorm, d, s);
@@ -854,7 +872,14 @@ impl AneTrainer {
 
         // 2. FFN Block
         // RMSNorm on CPU
-        accelerate::rmsnorm(&mut acts.x2norm, &acts.x2, &lw.rms_ffn, d, s);
+        accelerate::rmsnorm(
+            &mut acts.x2norm,
+            &acts.x2,
+            &lw.rms_ffn,
+            d,
+            s,
+            self.config.rms_norm_eps,
+        );
 
         // ANE fwd_ffn
         io.input.write_f32_as_fp16(&acts.x2norm, d, s);
@@ -943,6 +968,7 @@ impl AneTrainer {
             &lw.rms_ffn,
             d,
             s,
+            self.config.rms_norm_eps,
         );
 
         // 2. Attention Backward (simplified logic matching SDPA BWD 1/2)

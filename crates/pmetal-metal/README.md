@@ -15,6 +15,8 @@ This crate provides custom Metal shaders that accelerate LLM training and infere
 - **Fused Sampler**: JIT-compiled token sampling
 - **Fused SwiGLU**: MLP activation fusion
 - **Fused Norm+LoRA**: Combined layer norm and adapter application
+- **Fused GDN**: Gated Delta Network recurrence (Metal shader, 32-thread SIMD)
+- **MoE Routing**: Expert selection and dispatch kernel
 
 ## Architecture
 
@@ -37,12 +39,16 @@ pmetal-metal/
 │       ├── kernel.rs         # Static kernel generators + TransformerKernelConfig
 │       ├── dynamic_kernel.rs # Dynamic weight kernel generators (9 kernels)
 │       ├── dynamic_trainer.rs# Compile-once training loop
-│       └── inference.rs      # ANE inference engine (prefill + CPU decode)
+│       ├── inference.rs      # ANE inference engine (prefill + CPU decode)
+│       ├── inference_hybrid.rs # Hybrid ANE+CPU inference for large models
+│       └── budget.rs         # ANE compile budget tracking
 ```
 
 ### ANE Dynamic Weight Pipeline
 
 The ANE module provides a complete training and inference pipeline using Apple's private `AppleNeuralEngine.framework` APIs. The dynamic weight pipeline compiles 9 MIL kernels once at startup and packs weights alongside activations in the IOSurface spatial dimension — eliminating all recompilation during training.
+
+**Inference** uses a hybrid ANE prefill + CPU decode architecture with KV cache. RMSNorm is computed on CPU in f32 to avoid fp16 overflow (ANE uses saturation arithmetic that silently clips values instead of producing NaN/inf). Per-head QK-norm stays on ANE.
 
 | # | Kernel | Purpose |
 |---|--------|---------|

@@ -15,7 +15,7 @@
 //! zero-copy bridging to pass MLX array data directly to Metal kernels without
 //! copying, providing significant performance improvements for large tensors.
 
-use super::{DistillLoss, softmax};
+use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, softmax};
 use crate::Result;
 use mlx_rs::Array;
 use tracing;
@@ -51,6 +51,12 @@ pub struct KlDivergenceLoss {
     /// Whether to use reverse KL (student || teacher).
     reverse: bool,
 
+    /// Number of top-k teacher tokens to retain when vocab sizes differ.
+    ///
+    /// Only used when teacher and student have different vocabulary sizes
+    /// (cross-architecture distillation).  Defaults to [`SPARSE_TOPK_DEFAULT`].
+    sparse_top_k: i32,
+
     /// Cached Metal context for GPU acceleration.
     #[cfg(feature = "metal")]
     ctx: Option<Arc<MetalContext>>,
@@ -61,6 +67,7 @@ impl KlDivergenceLoss {
     pub fn new() -> Self {
         Self {
             reverse: false,
+            sparse_top_k: SPARSE_TOPK_DEFAULT,
             #[cfg(feature = "metal")]
             ctx: MetalContext::global().ok(),
         }
@@ -70,6 +77,7 @@ impl KlDivergenceLoss {
     pub fn reverse() -> Self {
         Self {
             reverse: true,
+            sparse_top_k: SPARSE_TOPK_DEFAULT,
             #[cfg(feature = "metal")]
             ctx: MetalContext::global().ok(),
         }
@@ -78,6 +86,17 @@ impl KlDivergenceLoss {
     /// Set whether to use reverse KL.
     pub fn with_reverse(mut self, reverse: bool) -> Self {
         self.reverse = reverse;
+        self
+    }
+
+    /// Set the number of top-k teacher tokens used in cross-vocab distillation.
+    ///
+    /// When teacher and student vocabularies differ, the loss is computed only
+    /// over the top-`k` teacher tokens (by logit magnitude).  Higher values
+    /// capture more of the teacher distribution but increase computation.
+    /// Must be ≥ 1; defaults to [`SPARSE_TOPK_DEFAULT`] (128).
+    pub fn with_sparse_top_k(mut self, k: i32) -> Self {
+        self.sparse_top_k = k.max(1);
         self
     }
 
@@ -240,9 +259,16 @@ impl DistillLoss for KlDivergenceLoss {
         temperature: f32,
         weights: Option<&Array>,
     ) -> Result<Array> {
-        // GPU-first: try Metal if no weights, otherwise use MLX for weighted loss
+        // Align vocab sizes.  When they differ we take the sparse top-k path
+        // which always uses MLX (Metal kernels require equal vocab sizes).
+        let (teacher_logits, student_logits, vocab_mismatched) =
+            align_vocab_with_k(teacher_logits, student_logits, self.sparse_top_k)?;
+        let teacher_logits = &teacher_logits;
+        let student_logits = &student_logits;
+
+        // GPU-first: try Metal if no weights and no vocab mismatch.
         // (Metal kernels for weighted distillation are planned for Q2 2026)
-        if weights.is_none() {
+        if weights.is_none() && !vocab_mismatched {
             #[cfg(feature = "metal")]
             {
                 if self.ctx.is_some() {
@@ -476,5 +502,145 @@ mod tests {
         // Should be positive and finite
         assert!(value > 0.0, "KL should be positive");
         assert!(value.is_finite(), "KL should be finite");
+    }
+
+    // -----------------------------------------------------------------
+    // Cross-vocab / sparse top-k tests
+    // -----------------------------------------------------------------
+
+    /// KL divergence with mismatched vocab (teacher smaller than student).
+    /// Mirrors Qwen3-4B (151936) → Qwen3.5-0.8B (152080).
+    #[test]
+    #[serial]
+    fn test_kl_cross_vocab_teacher_smaller() {
+        let teacher_vocab = 80_i32;
+        let student_vocab = 100_i32;
+        let batch = 2_i32;
+        let seq = 4_i32;
+
+        let teacher_data: Vec<f32> = (0..(batch * seq * teacher_vocab))
+            .map(|i| (i % 40) as f32 - 20.0)
+            .collect();
+        let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
+            .map(|i| (i * 3 % 40) as f32 - 20.0)
+            .collect();
+        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+
+        let loss = KlDivergenceLoss::new().with_sparse_top_k(32);
+        let result = loss.compute(&teacher, &student, 2.0).unwrap();
+        let value: f32 = result.item();
+
+        assert!(value >= 0.0, "KL must be non-negative, got {}", value);
+        assert!(value.is_finite(), "KL must be finite, got {}", value);
+    }
+
+    /// KL divergence with mismatched vocab (teacher larger than student).
+    #[test]
+    #[serial]
+    fn test_kl_cross_vocab_teacher_larger() {
+        let teacher_vocab = 100_i32;
+        let student_vocab = 80_i32;
+        let batch = 2_i32;
+        let seq = 4_i32;
+
+        let teacher_data: Vec<f32> = (0..(batch * seq * teacher_vocab))
+            .map(|i| (i % 40) as f32 - 20.0)
+            .collect();
+        let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
+            .map(|i| (i * 3 % 40) as f32 - 20.0)
+            .collect();
+        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+
+        let loss = KlDivergenceLoss::new().with_sparse_top_k(32);
+        let result = loss.compute(&teacher, &student, 2.0).unwrap();
+        let value: f32 = result.item();
+
+        assert!(value >= 0.0, "KL must be non-negative, got {}", value);
+        assert!(value.is_finite(), "KL must be finite, got {}", value);
+    }
+
+    /// Cross-vocab KL should return higher loss when distributions differ.
+    #[test]
+    #[serial]
+    fn test_kl_cross_vocab_ordered_distributions() {
+        // teacher: vocab=6, student: vocab=4
+        // Same ordering: teacher top tokens overlap with student → lower KL
+        // vs. completely inverted: → higher KL
+        let teacher_same = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0, 0.5, 0.1], &[1, 1, 6]);
+        let teacher_inv = Array::from_slice(&[0.1_f32, 0.5, 1.0, 2.0, 3.0, 4.0], &[1, 1, 6]);
+        let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
+
+        let loss = KlDivergenceLoss::new().with_sparse_top_k(4);
+        let kl_same = loss
+            .compute(&teacher_same, &student, 1.0)
+            .unwrap()
+            .item::<f32>();
+        let kl_inv = loss
+            .compute(&teacher_inv, &student, 1.0)
+            .unwrap()
+            .item::<f32>();
+
+        assert!(kl_same.is_finite());
+        assert!(kl_inv.is_finite());
+        // The inverted teacher puts all mass on tokens 4-5 which are out-of-range
+        // for the 4-token student, so the student cannot match it → higher KL.
+        assert!(
+            kl_inv >= kl_same,
+            "inverted teacher should give >= KL vs aligned teacher: inv={}, same={}",
+            kl_inv,
+            kl_same
+        );
+    }
+
+    /// Configurable top-k builder compiles and produces valid output.
+    #[test]
+    #[serial]
+    fn test_kl_with_sparse_top_k_builder() {
+        let teacher = Array::from_slice(
+            &(0..200).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 1, 200],
+        );
+        let student = Array::from_slice(
+            &(0..150).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 1, 150],
+        );
+
+        for k in [8, 32, 64, 128] {
+            let loss = KlDivergenceLoss::new().with_sparse_top_k(k);
+            let result = loss.compute(&teacher, &student, 2.0).unwrap();
+            let value: f32 = result.item();
+            assert!(
+                value.is_finite(),
+                "KL should be finite for k={}: {}",
+                k,
+                value
+            );
+        }
+    }
+
+    /// Reverse KL also works across mismatched vocabs.
+    #[test]
+    #[serial]
+    fn test_reverse_kl_cross_vocab() {
+        let teacher_vocab = 90_i32;
+        let student_vocab = 70_i32;
+        let batch = 1_i32;
+        let seq = 3_i32;
+
+        let teacher_data: Vec<f32> = (0..(batch * seq * teacher_vocab))
+            .map(|i| (i % 30) as f32 - 15.0)
+            .collect();
+        let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
+            .map(|i| (i % 30) as f32 - 15.0)
+            .collect();
+        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+
+        let loss = KlDivergenceLoss::reverse().with_sparse_top_k(16);
+        let result = loss.compute(&teacher, &student, 2.0).unwrap();
+        let value: f32 = result.item();
+        assert!(value.is_finite(), "reverse KL cross-vocab must be finite");
     }
 }

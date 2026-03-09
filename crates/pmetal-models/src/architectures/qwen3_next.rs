@@ -857,11 +857,13 @@ impl Qwen3NextSparseMoeBlock {
             None,
         )?;
 
-        // Top-k selection
+        // Top-k selection via argpartition: O(E) vs O(E log E) argsort.
+        // argpartition(-gates, -k, -1) places the k largest at the end.
         let k = self.top_k;
         let neg_gates = gates.negative()?;
-        let sorted_indices = ops::argsort_axis(&neg_gates, -1)?;
-        let top_indices = sorted_indices.index((.., ..k));
+        let neg_k = -k;
+        let part_indices = ops::argpartition_axis(&neg_gates, neg_k, -1)?;
+        let top_indices = part_indices.index((.., neg_k..));
         let top_weights = gates.take_along_axis(&top_indices, -1)?;
 
         let top_weights = if self.norm_topk_prob {

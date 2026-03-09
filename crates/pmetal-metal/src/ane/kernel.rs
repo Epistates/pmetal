@@ -250,6 +250,9 @@ pub fn build_causal_mask(seq_len: usize) -> Vec<u8> {
 /// Emit inline RMSNorm into a MIL program.
 ///
 /// Reads from `x`, writes normalized output to `xn`.
+///
+/// Uses per-position max-abs normalization to prevent fp16 overflow in x*x
+/// while maintaining precision for small values.
 fn emit_rmsnorm(p: &mut MilProgram, d: usize, s: usize, inv_d: f32, eps: f32, weight_path: &str) {
     p.emit_mul("sq", &[1, d, 1, s], "x", "x");
     p.emit_tensor_const("rax", &[1], "int32", "[1]");
@@ -514,6 +517,16 @@ pub fn validate_config(cfg: &TransformerKernelConfig) -> crate::error::Result<()
     if cfg.head_dim == 0 {
         return Err(MetalError::InvalidConfig("head_dim must be > 0".into()));
     }
+    if cfg.seq_len == 0 {
+        return Err(MetalError::InvalidConfig("seq_len must be > 0".into()));
+    }
+    if !cfg.seq_len.is_power_of_two() {
+        tracing::warn!(
+            "ANE seq_len={} is not a power of 2 — ANE performance may be suboptimal. \
+             Consider using 64, 128, 256, 512, or 1024.",
+            cfg.seq_len,
+        );
+    }
     Ok(())
 }
 
@@ -586,12 +599,14 @@ pub fn gen_sdpa_fwd_taps(
         ("k0".to_string(), "v0".to_string())
     };
 
-    // Attention: scores = Q @ K^T * scale + mask
+    // Attention: scores = (Q * scale) @ K^T + mask
+    // Scale Q BEFORE matmul to prevent fp16 overflow in QK-norm'd models
+    // (e.g. Qwen3 k_norm.weight max=96.5 → unscaled Q@K^T exceeds fp16 max 65504)
+    p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
+    p.emit_mul("qs", &[1, h, s, hd], "q", "scv");
     p.emit_scalar_const("tx", "bool", "false");
     p.emit_scalar_const("ty", "bool", "true");
-    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", &k_name);
-    p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
-    p.emit_mul("sc2", &[1, h, s, s], "sc1", "scv");
+    p.emit_matmul("sc2", &[1, h, s, s], "tx", "ty", "qs", &k_name);
     p.emit_weight_const("cm", &[1, 1, s, s], "@model_path/weights/mask.bin");
     p.emit_add("ms", &[1, h, s, s], "sc2", "cm");
 
@@ -722,12 +737,14 @@ pub fn gen_sdpa_fwd(
         ("k0".to_string(), "v0".to_string())
     };
 
-    // Attention: scores = Q @ K^T * scale + mask
+    // Attention: scores = (Q * scale) @ K^T + mask
+    // Scale Q BEFORE matmul to prevent fp16 overflow in QK-norm'd models
+    // (e.g. Qwen3 k_norm.weight max=96.5 → unscaled Q@K^T exceeds fp16 max 65504)
+    p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
+    p.emit_mul("qs", &[1, h, s, hd], "q", "scv");
     p.emit_scalar_const("tx", "bool", "false");
     p.emit_scalar_const("ty", "bool", "true");
-    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", &k_name);
-    p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
-    p.emit_mul("sc2", &[1, h, s, s], "sc1", "scv");
+    p.emit_matmul("sc2", &[1, h, s, s], "tx", "ty", "qs", &k_name);
     p.emit_weight_const("cm", &[1, 1, s, s], "@model_path/weights/mask.bin");
     p.emit_add("ms", &[1, h, s, s], "sc2", "cm");
 
@@ -796,6 +813,7 @@ pub fn gen_sdpa_fwd_kv(
     wo: &[f32],
     q_norm: &[f32],
     k_norm: &[f32],
+    cpu_rmsnorm: bool,
 ) -> KernelOutput {
     let d = cfg.dim;
     let s = cfg.seq_len;
@@ -810,15 +828,22 @@ pub fn gen_sdpa_fwd_kv(
 
     let mut p = MilProgram::new(d, s);
 
-    // RMSNorm inline
-    emit_rmsnorm(
-        &mut p,
-        d,
-        s,
-        inv_d,
-        cfg.rms_norm_eps,
-        "@model_path/weights/rms1.bin",
-    );
+    if cpu_rmsnorm {
+        // RMSNorm computed on CPU in f32 — input is already normalized.
+        // Emit identity: xn = x (ANE requires an op, so multiply by 1.0)
+        p.emit_scalar_const("rms_one", "fp16", "1.0");
+        p.emit_mul("xn", &[1, d, 1, s], "x", "rms_one");
+    } else {
+        // RMSNorm inline (fp16 — can overflow for large residuals)
+        emit_rmsnorm(
+            &mut p,
+            d,
+            s,
+            inv_d,
+            cfg.rms_norm_eps,
+            "@model_path/weights/rms1.bin",
+        );
+    }
 
     // QKV convolutions — Wq projects dim→q_dim, Wo projects q_dim→dim
     p.emit_conv_constants();
@@ -899,12 +924,14 @@ pub fn gen_sdpa_fwd_kv(
         ("k0".to_string(), "v0".to_string())
     };
 
-    // Attention: scores = Q @ K^T * scale + mask
+    // Attention: scores = (Q * scale) @ K^T + mask
+    // Scale Q BEFORE matmul to prevent fp16 overflow in QK-norm'd models
+    // (e.g. Qwen3 k_norm.weight max=96.5 → unscaled Q@K^T exceeds fp16 max 65504)
+    p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
+    p.emit_mul("qs", &[1, h, s, hd], "q", "scv");
     p.emit_scalar_const("tx", "bool", "false");
     p.emit_scalar_const("ty", "bool", "true");
-    p.emit_matmul("sc1", &[1, h, s, s], "tx", "ty", "q", &k_name);
-    p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
-    p.emit_mul("sc2", &[1, h, s, s], "sc1", "scv");
+    p.emit_matmul("sc2", &[1, h, s, s], "tx", "ty", "qs", &k_name);
     p.emit_weight_const("cm", &[1, 1, s, s], "@model_path/weights/mask.bin");
     p.emit_add("ms", &[1, h, s, s], "sc2", "cm");
 
@@ -940,10 +967,12 @@ pub fn gen_sdpa_fwd_kv(
 
     // Build weight dictionary
     let mut weights = WeightDict::new();
-    weights.add(
-        "@model_path/weights/rms1.bin",
-        WeightBlob::from_rms_weights(rms_att),
-    );
+    if !cpu_rmsnorm {
+        weights.add(
+            "@model_path/weights/rms1.bin",
+            WeightBlob::from_rms_weights(rms_att),
+        );
+    }
     weights.add(
         "@model_path/weights/wq.bin",
         WeightBlob::from_f32(wq, q_dim, d),
@@ -993,6 +1022,7 @@ pub fn gen_ffn_fwd(
     w1: &[f32],
     w3: &[f32],
     w2: &[f32],
+    cpu_rmsnorm: bool,
 ) -> KernelOutput {
     let d = cfg.dim;
     let h = cfg.hidden_dim;
@@ -1001,20 +1031,26 @@ pub fn gen_ffn_fwd(
 
     let mut p = MilProgram::new(d, s);
 
-    // RMSNorm inline
-    p.emit_mul("sq", &[1, d, 1, s], "x", "x");
-    p.emit_tensor_const("rax", &[1], "int32", "[1]");
-    p.emit_scalar_const("kd", "bool", "true");
-    p.emit_reduce_sum("ss", &[1, 1, 1, s], "sq", "rax", "kd");
-    p.emit_scalar_const("invd", "fp16", &format!("{inv_d}"));
-    p.emit_mul("ss2", &[1, 1, 1, s], "ss", "invd");
-    p.emit_scalar_const("eps", "fp16", &format!("{}", cfg.rms_norm_eps));
-    p.emit_add("ss3", &[1, 1, 1, s], "ss2", "eps");
-    p.emit_scalar_const("nhalf", "fp16", "-0.5");
-    p.emit_pow("rrms", &[1, 1, 1, s], "ss3", "nhalf");
-    p.emit_mul("xr", &[1, d, 1, s], "x", "rrms");
-    p.emit_weight_const("rw", &[1, d, 1, 1], "@model_path/weights/rms2.bin");
-    p.emit_mul("xn", &[1, d, 1, s], "xr", "rw");
+    if cpu_rmsnorm {
+        // RMSNorm computed on CPU in f32 — input is already normalized
+        p.emit_scalar_const("rms_one", "fp16", "1.0");
+        p.emit_mul("xn", &[1, d, 1, s], "x", "rms_one");
+    } else {
+        // RMSNorm inline (fp16 — can overflow for large residuals)
+        p.emit_mul("sq", &[1, d, 1, s], "x", "x");
+        p.emit_tensor_const("rax", &[1], "int32", "[1]");
+        p.emit_scalar_const("kd", "bool", "true");
+        p.emit_reduce_sum("ss", &[1, 1, 1, s], "sq", "rax", "kd");
+        p.emit_scalar_const("invd", "fp16", &format!("{inv_d}"));
+        p.emit_mul("ss2", &[1, 1, 1, s], "ss", "invd");
+        p.emit_scalar_const("eps", "fp16", &format!("{}", cfg.rms_norm_eps));
+        p.emit_add("ss3", &[1, 1, 1, s], "ss2", "eps");
+        p.emit_scalar_const("nhalf", "fp16", "-0.5");
+        p.emit_pow("rrms", &[1, 1, 1, s], "ss3", "nhalf");
+        p.emit_mul("xr", &[1, d, 1, s], "x", "rrms");
+        p.emit_weight_const("rw", &[1, d, 1, 1], "@model_path/weights/rms2.bin");
+        p.emit_mul("xn", &[1, d, 1, s], "xr", "rw");
+    }
 
     // FFN: SwiGLU
     p.emit_conv_constants();
@@ -1032,10 +1068,12 @@ pub fn gen_ffn_fwd(
     let mil_text = p.finalize("y");
 
     let mut weights = WeightDict::new();
-    weights.add(
-        "@model_path/weights/rms2.bin",
-        WeightBlob::from_rms_weights(rms_ffn),
-    );
+    if !cpu_rmsnorm {
+        weights.add(
+            "@model_path/weights/rms2.bin",
+            WeightBlob::from_rms_weights(rms_ffn),
+        );
+    }
     weights.add("@model_path/weights/w1.bin", WeightBlob::from_f32(w1, h, d));
     weights.add("@model_path/weights/w3.bin", WeightBlob::from_f32(w3, h, d));
     weights.add("@model_path/weights/w2.bin", WeightBlob::from_f32(w2, d, h));
@@ -1276,11 +1314,12 @@ pub fn gen_sdpa_bwd1(cfg: &TransformerKernelConfig, wo: &[f32]) -> KernelOutput 
     }
 
     // Recompute attention scores + softmax
+    // Scale Q before matmul to prevent fp16 overflow (matches forward pass)
+    p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
+    p.emit_mul("qs", &[1, h, s, hd], "q", "scv");
     p.emit_scalar_const("bF", "bool", "false");
     p.emit_scalar_const("bT", "bool", "true");
-    p.emit_matmul("sc1", &[1, h, s, s], "bF", "bT", "q", "k");
-    p.emit_scalar_const("scv", "fp16", &format!("{sc}"));
-    p.emit_mul("sc2", &[1, h, s, s], "sc1", "scv");
+    p.emit_matmul("sc2", &[1, h, s, s], "bF", "bT", "qs", "k");
     p.emit_weight_const("cm", &[1, 1, s, s], "@model_path/weights/mask.bin");
     p.emit_add("ms", &[1, h, s, s], "sc2", "cm");
     p.emit_scalar_const("sax", "int32", "-1");
@@ -1575,7 +1614,7 @@ mod tests {
         let zeros_hd = vec![0.0f32; h * d];
         let zeros_dh = vec![0.0f32; d * h];
 
-        let output = gen_ffn_fwd(&cfg, &zeros_d, &zeros_hd, &zeros_hd, &zeros_dh);
+        let output = gen_ffn_fwd(&cfg, &zeros_d, &zeros_hd, &zeros_hd, &zeros_dh, false);
 
         assert!(output.mil_text.contains("sigmoid"));
         assert!(
@@ -1676,7 +1715,7 @@ mod tests {
         let ones_hd = vec![1.0f32; hd];
 
         let output = gen_sdpa_fwd_kv(
-            &cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd, &ones_hd, &ones_hd,
+            &cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd, &ones_hd, &ones_hd, false,
         );
 
         assert!(output.mil_text.contains("program(1.3)"));
@@ -1688,6 +1727,54 @@ mod tests {
         assert_eq!(output.output_bytes, expected_out_ch * 256 * 2);
         // 10 weights: rms1, wq, wk, wv, wo, mask, qnorm, knorm, cos, sin
         assert_eq!(output.weights.entries.len(), 10);
+    }
+
+    #[test]
+    fn test_sdpa_fwd_kv_cpu_rmsnorm() {
+        let cfg = test_config();
+        let d = cfg.dim;
+        let hd = cfg.head_dim;
+        let kv_d = cfg.kv_dim();
+        let zeros_d = vec![0.0f32; d];
+        let zeros_dd = vec![0.0f32; d * d];
+        let zeros_kvd = vec![0.0f32; kv_d * d];
+        let ones_hd = vec![1.0f32; hd];
+
+        let output = gen_sdpa_fwd_kv(
+            &cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd, &ones_hd, &ones_hd, true,
+        );
+
+        assert!(output.mil_text.contains("program(1.3)"));
+        // Should NOT contain reduce_sum (RMSNorm skipped)
+        assert!(
+            !output.mil_text.contains("reduce_sum(sq"),
+            "cpu_rmsnorm kernel must not contain input RMSNorm reduce_sum"
+        );
+        // Should still contain per-head QK-norm reduce_sum
+        assert!(output.mil_text.contains("reduce_sum"));
+        // 9 weights: no rms1, but wq, wk, wv, wo, mask, qnorm, knorm, cos, sin
+        assert_eq!(output.weights.entries.len(), 9);
+    }
+
+    #[test]
+    fn test_ffn_fwd_cpu_rmsnorm() {
+        let cfg = test_config();
+        let d = cfg.dim;
+        let h = cfg.hidden_dim;
+        let zeros_d = vec![0.0f32; d];
+        let zeros_hd = vec![0.0f32; h * d];
+        let zeros_dh = vec![0.0f32; d * h];
+
+        let output = gen_ffn_fwd(&cfg, &zeros_d, &zeros_hd, &zeros_hd, &zeros_dh, true);
+
+        assert!(output.mil_text.contains("sigmoid"));
+        // Should NOT contain reduce_sum (RMSNorm skipped)
+        assert!(
+            !output.mil_text.contains("reduce_sum"),
+            "cpu_rmsnorm FFN kernel must not contain RMSNorm"
+        );
+        // 3 weights: w1, w3, w2 (no rms2)
+        assert_eq!(output.weights.entries.len(), 3);
     }
 
     #[test]
@@ -1714,7 +1801,7 @@ mod tests {
         let ones_hd = vec![1.0f32; hd];
 
         let output = gen_sdpa_fwd_kv(
-            &cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd, &ones_hd, &ones_hd,
+            &cfg, &zeros_d, &zeros_dd, &zeros_kvd, &zeros_kvd, &zeros_dd, &ones_hd, &ones_hd, false,
         );
 
         assert!(
@@ -1919,7 +2006,7 @@ mod tests {
         let q_norm = vec![0.01f32; hd];
         let k_norm = vec![0.01f32; hd];
 
-        let out = gen_sdpa_fwd_kv(&cfg, &rms, &wq, &wk, &wv, &wo, &q_norm, &k_norm);
+        let out = gen_sdpa_fwd_kv(&cfg, &rms, &wq, &wk, &wv, &wo, &q_norm, &k_norm, false);
         assert!(out.mil_text.contains("program(1.3)"));
         // Output: o_out(dim) + k_cache(kv_dim) + v_cache(kv_dim) = d + 2*kvd
         let expected_out_ch = d + 2 * kvd;
@@ -1959,7 +2046,7 @@ mod tests {
         let q_norm = vec![0.01f32; hd];
         let k_norm = vec![0.01f32; hd];
 
-        let out = gen_sdpa_fwd_kv(&cfg, &rms, &wq, &wk, &wv, &wo, &q_norm, &k_norm);
+        let out = gen_sdpa_fwd_kv(&cfg, &rms, &wq, &wk, &wv, &wo, &q_norm, &k_norm, false);
 
         // Must NOT contain tile (ANE-unreliable)
         assert!(

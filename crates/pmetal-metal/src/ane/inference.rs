@@ -42,8 +42,32 @@ pub struct AneInferenceConfig {
     pub n_layers: usize,
     /// Vocabulary size (e.g., 32000).
     pub vocab_size: usize,
-    /// Maximum sequence length — kernels compiled for this fixed shape.
+    /// Maximum sequence length for the KV cache (decode steps).
+    ///
+    /// This determines how many tokens the CPU decode loop can generate
+    /// before running out of cache space. Does NOT affect ANE kernel shape.
     pub max_seq_len: usize,
+    /// ANE kernel compilation sequence length.
+    ///
+    /// ANE kernels are compiled for this fixed spatial dimension. The attention
+    /// score matrix is `[n_heads, ane_seq_len, ane_seq_len]`, so large values
+    /// cause ANE compilation failure. Use power-of-2 values for best ANE
+    /// compatibility (e.g., 64, 128, 256, 512, 1024).
+    ///
+    /// If `None`, automatically computed as `next_power_of_2(prompt_len)`
+    /// capped at `max_ane_seq_len`.
+    pub ane_seq_len: Option<usize>,
+    /// Maximum ANE kernel sequence length (caps automatic bucketing).
+    ///
+    /// When `ane_seq_len` is `None`, the engine computes
+    /// `next_pow2(prompt_len).min(max_ane_seq_len)`. Prompts longer than
+    /// this are partially prefilled on ANE with overflow processed via CPU
+    /// decode.
+    ///
+    /// Default: 1024. The ANE compiler can typically handle up to ~1024 for
+    /// models with 16+ attention heads; 256 is the reference implementation
+    /// default.
+    pub max_ane_seq_len: usize,
     /// Maximum ANE compilations per process (default 100).
     pub max_compiles: usize,
     /// Sampling temperature (0.0 = greedy).
@@ -66,6 +90,11 @@ pub struct AneInferenceConfig {
     pub head_dim: Option<usize>,
 }
 
+/// Round up to the next power of 2 (minimum 64).
+fn next_power_of_2(n: usize) -> usize {
+    n.next_power_of_two().max(64)
+}
+
 impl Default for AneInferenceConfig {
     fn default() -> Self {
         Self {
@@ -76,6 +105,8 @@ impl Default for AneInferenceConfig {
             n_layers: 12,
             vocab_size: 32000,
             max_seq_len: 256,
+            ane_seq_len: None,
+            max_ane_seq_len: 1024,
             max_compiles: 100,
             temperature: 0.0,
             top_k: 0,
@@ -85,6 +116,19 @@ impl Default for AneInferenceConfig {
             rms_norm_eps: 1e-6,
             head_dim: None,
         }
+    }
+}
+
+impl AneInferenceConfig {
+    /// Resolve the effective ANE kernel sequence length.
+    ///
+    /// If `ane_seq_len` is explicitly set, uses that value.
+    /// Otherwise, computes `next_power_of_2(prompt_len).min(max_ane_seq_len)`.
+    pub fn resolve_ane_seq_len(&self, prompt_len: usize) -> usize {
+        if let Some(explicit) = self.ane_seq_len {
+            return explicit;
+        }
+        next_power_of_2(prompt_len).min(self.max_ane_seq_len)
     }
 }
 
@@ -109,8 +153,9 @@ struct InferenceLayerWeights {
 struct InferenceLayerKernels {
     /// Prefill attention kernel: outputs concat(oo, K_proj, V_proj).
     fwd_attn_kv: AneModel,
-    /// FFN kernel (unchanged between prefill/decode on ANE).
-    fwd_ffn: AneModel,
+    /// FFN kernel. `None` when ANE compilation fails (e.g., model too large);
+    /// the engine falls back to CPU/Accelerate BLAS for those layers.
+    fwd_ffn: Option<AneModel>,
 }
 
 /// IOSurface pool reused across layers and generation steps.
@@ -161,9 +206,15 @@ impl KvCachePool {
 /// Supports two generation modes:
 /// - **`generate()`**: Legacy full-recomputation path (backward compat)
 /// - **`generate_cached()`**: Hybrid ANE prefill + CPU decode with KV cache
+///
+/// ANE kernels are compiled for a fixed `ane_seq_len` (power-of-2 bucket),
+/// while the KV cache is sized at `max_seq_len` for the full generation window.
 pub struct AneInferenceEngine {
     config: AneInferenceConfig,
+    /// Kernel config uses `ane_seq_len` as its `seq_len` field.
     kernel_config: TransformerKernelConfig,
+    /// The effective ANE kernel sequence length (power-of-2 bucket).
+    ane_seq_len: usize,
     layer_weights: Vec<InferenceLayerWeights>,
     layer_kernels: Option<Vec<InferenceLayerKernels>>,
     embed_weights: Vec<f32>,
@@ -177,9 +228,12 @@ pub struct AneInferenceEngine {
 impl AneInferenceEngine {
     /// Create a new ANE inference engine.
     ///
+    /// `prompt_len` is used to resolve the ANE kernel bucket size when
+    /// `config.ane_seq_len` is `None`. Pass 0 to use the default bucket.
+    ///
     /// Returns an error if the configuration is invalid (e.g., `n_heads == 0`,
     /// `n_heads % n_kv_heads != 0`, `dim % n_heads != 0`).
-    pub fn new(config: AneInferenceConfig) -> Result<Self> {
+    pub fn new(config: AneInferenceConfig, prompt_len: usize) -> Result<Self> {
         if config.n_heads == 0 {
             return Err(MetalError::InvalidConfig("n_heads must be > 0".into()));
         }
@@ -212,6 +266,10 @@ impl AneInferenceEngine {
             config.dim / config.n_heads
         };
 
+        // Resolve ANE kernel sequence length (power-of-2 bucketing)
+        let effective_prompt = if prompt_len > 0 { prompt_len } else { 256 };
+        let ane_seq_len = config.resolve_ane_seq_len(effective_prompt);
+
         let d = config.dim;
         let h = config.hidden_dim;
         let nl = config.n_layers;
@@ -219,16 +277,25 @@ impl AneInferenceEngine {
         let q_dim = config.n_heads * hd; // May differ from d
 
         let n_kv_heads = config.n_kv_heads;
+        // Kernel config uses ane_seq_len (not max_seq_len) for ANE compilation
         let kernel_config = TransformerKernelConfig {
             dim: d,
             hidden_dim: h,
             n_heads: config.n_heads,
             n_kv_heads,
             head_dim: hd,
-            seq_len: config.max_seq_len,
+            seq_len: ane_seq_len,
             rope_theta: config.rope_theta,
             rms_norm_eps: config.rms_norm_eps,
         };
+
+        tracing::info!(
+            "ANE kernel bucket: seq_len={} (prompt={}, max_ane={}), KV cache={}",
+            ane_seq_len,
+            effective_prompt,
+            config.max_ane_seq_len,
+            config.max_seq_len,
+        );
 
         let kv_dim = n_kv_heads * hd;
         let mut layer_weights = Vec::with_capacity(nl);
@@ -254,6 +321,7 @@ impl AneInferenceEngine {
         Ok(Self {
             config,
             kernel_config,
+            ane_seq_len,
             layer_weights,
             layer_kernels: None,
             embed_weights: vec![0.0; v * d],
@@ -348,11 +416,14 @@ impl AneInferenceEngine {
         let s = cfg.seq_len;
         let kv_d = cfg.kv_dim();
         let mut layer_kernels = Vec::with_capacity(self.config.n_layers);
+        let mut cpu_ffn_count = 0usize;
 
         for l in 0..self.config.n_layers {
             let lw = &self.layer_weights[l];
 
             // Forward attention with KV cache output (includes QK-norm + RoPE)
+            // cpu_rmsnorm=true: RMSNorm computed on CPU in f32 during prefill to avoid
+            // fp16 overflow in reduce_sum(x², axis=channel) for large residual values.
             let fwd_attn_out = kernel::gen_sdpa_fwd_kv(
                 cfg,
                 &lw.rms_att,
@@ -362,6 +433,7 @@ impl AneInferenceEngine {
                 &lw.wo,
                 &lw.q_norm,
                 &lw.k_norm,
+                true,
             );
             let fwd_attn_kv = match rt.compile(
                 fwd_attn_out.mil_text.as_bytes(),
@@ -380,20 +452,32 @@ impl AneInferenceEngine {
             self.budget.record_compile();
 
             // Forward FFN (inference — no taps)
-            let fwd_ffn_out = kernel::gen_ffn_fwd(cfg, &lw.rms_ffn, &lw.w1, &lw.w3, &lw.w2);
+            // If FFN compilation fails (e.g., model too large for ANE), fall back
+            // to CPU/Accelerate BLAS for this layer's FFN while keeping SDPA on ANE.
+            let fwd_ffn_out = kernel::gen_ffn_fwd(cfg, &lw.rms_ffn, &lw.w1, &lw.w3, &lw.w2, true);
             let fwd_ffn =
                 match rt.compile(fwd_ffn_out.mil_text.as_bytes(), Some(&fwd_ffn_out.weights)) {
-                    Ok(model) => model,
+                    Ok(model) => {
+                        self.budget.record_compile();
+                        Some(model)
+                    }
                     Err(e) => {
-                        let _ = std::fs::write(
-                            format!("/tmp/ane_debug_layer{l}_ffn.mil"),
-                            &fwd_ffn_out.mil_text,
-                        );
-                        tracing::error!("FFN kernel compile failed layer {l}: {e}");
-                        return Err(e);
+                        self.budget.record_compile(); // ANE compiler was still invoked
+                        if cpu_ffn_count == 0 {
+                            // Only log full error on first failure (all layers share the same arch)
+                            let _ = std::fs::write(
+                                format!("/tmp/ane_debug_layer{l}_ffn.mil"),
+                                &fwd_ffn_out.mil_text,
+                            );
+                            tracing::warn!(
+                                "FFN kernel too large for ANE (layer {l}): {e}. \
+                                 Falling back to CPU/Accelerate BLAS for FFN layers."
+                            );
+                        }
+                        cpu_ffn_count += 1;
+                        None
                     }
                 };
-            self.budget.record_compile();
 
             layer_kernels.push(InferenceLayerKernels {
                 fwd_attn_kv,
@@ -403,7 +487,18 @@ impl AneInferenceEngine {
 
         self.layer_kernels = Some(layer_kernels);
 
-        // Allocate IOSurface pool
+        let ane_ffn_count = self.config.n_layers - cpu_ffn_count;
+        if cpu_ffn_count > 0 {
+            tracing::info!(
+                "Compiled {} layers: {} ANE SDPA + {} ANE FFN, {} CPU FFN fallback",
+                self.config.n_layers,
+                self.config.n_layers,
+                ane_ffn_count,
+                cpu_ffn_count,
+            );
+        }
+
+        // Allocate IOSurface pool (needed even with CPU FFN fallback for SDPA + any ANE FFN layers)
         let input_bytes = d * s * 2;
         let attn_output_bytes = (d + 2 * kv_d) * s * 2; // concat(oo, kf, vf)
         let ffn_output_bytes = d * s * 2;
@@ -417,16 +512,56 @@ impl AneInferenceEngine {
         Ok(())
     }
 
+    /// CPU fallback for FFN forward pass (SwiGLU).
+    ///
+    /// Used when ANE FFN compilation fails (model too large). Computes
+    /// RMSNorm + W1/W3 projections + SiLU gating + W2 down-projection
+    /// using Accelerate BLAS (sgemm).
+    ///
+    /// `input` and `output` are channel-first `[dim, seq]` f32.
+    fn cpu_ffn_forward(&self, layer_idx: usize, input: &[f32], output: &mut [f32]) {
+        let d = self.config.dim;
+        let h = self.config.hidden_dim;
+        let s = self.ane_seq_len;
+        let lw = &self.layer_weights[layer_idx];
+
+        // 1. RMSNorm (must match ANE kernel eps)
+        let mut normed = vec![0.0f32; d * s];
+        accelerate::rmsnorm(
+            &mut normed,
+            input,
+            &lw.rms_ffn,
+            d,
+            s,
+            self.config.rms_norm_eps,
+        );
+
+        // 2. W1 @ normed → h1 [H, S] and W3 @ normed → h3 [H, S]
+        let mut h1 = vec![0.0f32; h * s];
+        let mut h3 = vec![0.0f32; h * s];
+        accelerate::gemm(&lw.w1, &normed, &mut h1, h, s, d, 1.0, 0.0, false, false);
+        accelerate::gemm(&lw.w3, &normed, &mut h3, h, s, d, 1.0, 0.0, false, false);
+
+        // 3. SiLU(h1) * h3 → gate
+        accelerate::silu_inplace(&mut h1);
+        for i in 0..h * s {
+            h1[i] *= h3[i];
+        }
+
+        // 4. W2 @ gate → output [D, S]
+        accelerate::gemm(&lw.w2, &h1, output, d, s, h, 1.0, 0.0, false, false);
+    }
+
     /// Run a forward pass and return logits `[V, S]` (channel-first).
     ///
-    /// `token_ids` are padded/truncated to `max_seq_len`. Positions beyond
+    /// `token_ids` are padded/truncated to `ane_seq_len`. Positions beyond
     /// input length are masked by the causal mask compiled into the kernels.
     ///
     /// This is the legacy full-recomputation path. Prefer `generate_cached()`
     /// for production use.
     pub fn forward(&self, token_ids: &[u32]) -> Result<Vec<f32>> {
         let d = self.config.dim;
-        let s = self.config.max_seq_len;
+        let s = self.ane_seq_len;
         let v = self.config.vocab_size;
 
         let kernels = self
@@ -440,7 +575,7 @@ impl AneInferenceEngine {
 
         if token_ids.is_empty() || token_ids.len() > s {
             return Err(MetalError::InvalidConfig(format!(
-                "Input length {} must be in [1, {}]",
+                "Input length {} must be in [1, {}] (ane_seq_len)",
                 token_ids.len(),
                 s
             )));
@@ -459,10 +594,15 @@ impl AneInferenceEngine {
         let mut o_out = vec![0.0f32; d * s];
         let mut x2 = vec![0.0f32; d * s];
         let mut ffn_out = vec![0.0f32; d * s];
+        let mut xn_buf = vec![0.0f32; d * s];
+        let eps = self.config.rms_norm_eps;
 
-        for lk in kernels {
-            // Attention: write x → ANE fwd_attn_kv → read oo (first D channels)
-            io_pool.input.write_f32_as_fp16(&x, d, s);
+        for (layer_idx, lk) in kernels.iter().enumerate() {
+            let lw = &self.layer_weights[layer_idx];
+
+            // CPU RMSNorm in f32 (avoids fp16 overflow on ANE)
+            accelerate::rmsnorm(&mut xn_buf, &x, &lw.rms_att, d, s, eps);
+            io_pool.input.write_f32_as_fp16(&xn_buf, d, s);
             lk.fwd_attn_kv
                 .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_attn.as_ptr()])?;
             io_pool.output_attn.read_fp16_as_f32(&mut o_out, 0, d, s);
@@ -470,11 +610,15 @@ impl AneInferenceEngine {
             // Residual: x2 = x + o_out
             accelerate::vadd(&x, &o_out, &mut x2);
 
-            // FFN: write x2 → ANE fwd_ffn → read ffn_out
-            io_pool.input.write_f32_as_fp16(&x2, d, s);
-            lk.fwd_ffn
-                .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_ffn.as_ptr()])?;
-            io_pool.output_ffn.read_fp16_as_f32(&mut ffn_out, 0, d, s);
+            // FFN: ANE if compiled, otherwise CPU/Accelerate BLAS fallback
+            if let Some(ref ffn_kernel) = lk.fwd_ffn {
+                accelerate::rmsnorm(&mut xn_buf, &x2, &lw.rms_ffn, d, s, eps);
+                io_pool.input.write_f32_as_fp16(&xn_buf, d, s);
+                ffn_kernel.evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_ffn.as_ptr()])?;
+                io_pool.output_ffn.read_fp16_as_f32(&mut ffn_out, 0, d, s);
+            } else {
+                self.cpu_ffn_forward(layer_idx, &x2, &mut ffn_out);
+            }
 
             // Residual: x = x2 + ffn_out
             accelerate::vadd(&x2, &ffn_out, &mut x);
@@ -482,7 +626,14 @@ impl AneInferenceEngine {
 
         // Final RMSNorm
         let mut x_final = vec![0.0f32; d * s];
-        accelerate::rmsnorm(&mut x_final, &x, &self.rms_final, d, s);
+        accelerate::rmsnorm(
+            &mut x_final,
+            &x,
+            &self.rms_final,
+            d,
+            s,
+            self.config.rms_norm_eps,
+        );
 
         // Classifier: logits = embed @ x_final → [V, S]
         let mut logits = vec![0.0f32; v * s];
@@ -517,7 +668,7 @@ impl AneInferenceEngine {
     where
         F: FnMut(u32) -> bool,
     {
-        let s = self.config.max_seq_len;
+        let s = self.ane_seq_len;
         let v = self.config.vocab_size;
 
         if input_ids.is_empty() {
@@ -574,6 +725,10 @@ impl AneInferenceEngine {
     /// Generate tokens with KV cache and streaming callback.
     ///
     /// `on_token` is called with each generated token. Return `false` to stop.
+    ///
+    /// If the prompt exceeds `ane_seq_len`, the first `ane_seq_len` tokens are
+    /// prefilled on ANE, and the remaining prompt tokens are processed via CPU
+    /// decode steps (building the KV cache incrementally).
     pub fn generate_cached_streaming<F>(
         &self,
         input_ids: &[u32],
@@ -582,34 +737,56 @@ impl AneInferenceEngine {
     where
         F: FnMut(u32) -> bool,
     {
-        let s = self.config.max_seq_len;
+        let max_s = self.config.max_seq_len;
+        let ane_s = self.ane_seq_len;
         let v = self.config.vocab_size;
         let kv_dim = self.kernel_config.kv_dim();
 
         if input_ids.is_empty() {
             return Err(MetalError::InvalidConfig("Input must not be empty".into()));
         }
-        if input_ids.len() > s {
+        if input_ids.len() > max_s {
             return Err(MetalError::InvalidConfig(format!(
                 "Input length {} exceeds max_seq_len {}",
                 input_ids.len(),
-                s
+                max_s
             )));
         }
 
-        let mut kv_cache = KvCachePool::new(self.config.n_layers, kv_dim, s);
+        let mut kv_cache = KvCachePool::new(self.config.n_layers, kv_dim, max_s);
 
-        // Prefill: process full prompt via ANE, populate KV cache
-        let logits = self.prefill(input_ids, &mut kv_cache)?;
-        let pos = input_ids.len() - 1;
+        // Determine how many tokens ANE can prefill vs CPU overflow
+        let ane_prefill_len = input_ids.len().min(ane_s);
+        let overflow_tokens = &input_ids[ane_prefill_len..];
 
-        // Extract logits column at last input position
-        let mut logits_col = vec![0.0f32; v];
-        for tok in 0..v {
-            logits_col[tok] = logits[tok * s + pos];
-        }
+        // ANE prefill: process first ane_prefill_len tokens, populate KV cache
+        let prefill_logits = self.prefill(&input_ids[..ane_prefill_len], &mut kv_cache)?;
 
-        let next = sample(&logits_col, self.config.temperature, self.config.top_k);
+        // Get logits for the last prompt token
+        let last_logits = if overflow_tokens.is_empty() {
+            // All tokens fit in ANE bucket — extract column at last position
+            let pos = ane_prefill_len - 1;
+            let mut col = vec![0.0f32; v];
+            for tok in 0..v {
+                col[tok] = prefill_logits[tok * ane_s + pos];
+            }
+            col
+        } else {
+            // Prompt overflows ANE bucket — process remaining via CPU decode
+            tracing::info!(
+                "Prompt ({} tokens) exceeds ANE bucket ({}), processing {} overflow tokens via CPU",
+                input_ids.len(),
+                ane_s,
+                overflow_tokens.len()
+            );
+            let mut last = vec![0.0f32; v];
+            for &token in overflow_tokens {
+                last = self.decode_step(token, &mut kv_cache)?;
+            }
+            last
+        };
+
+        let next = sample(&last_logits, self.config.temperature, self.config.top_k);
 
         let mut sequence = input_ids.to_vec();
 
@@ -625,7 +802,7 @@ impl AneInferenceEngine {
 
         // Decode loop: CPU-only with KV cache
         for _ in 1..self.config.max_tokens {
-            if kv_cache.pos >= s {
+            if kv_cache.pos >= max_s {
                 break;
             }
 
@@ -646,13 +823,24 @@ impl AneInferenceEngine {
         Ok(sequence)
     }
 
-    /// ANE prefill: process full prompt, populate KV cache, return logits.
+    /// ANE prefill: process tokens via ANE, populate KV cache, return logits.
+    ///
+    /// `token_ids` must have length <= `ane_seq_len`. Tokens are zero-padded
+    /// to `ane_seq_len` for the ANE kernel; the causal mask ensures padding
+    /// positions don't affect the output.
     fn prefill(&self, token_ids: &[u32], kv_cache: &mut KvCachePool) -> Result<Vec<f32>> {
         let d = self.config.dim;
-        let s = self.config.max_seq_len;
+        let s = self.ane_seq_len; // ANE kernel spatial dimension
         let v = self.config.vocab_size;
         let kv_dim = self.kernel_config.kv_dim();
         let input_len = token_ids.len();
+
+        if input_len > s {
+            return Err(MetalError::InvalidConfig(format!(
+                "Prefill input length {} exceeds ane_seq_len {}",
+                input_len, s
+            )));
+        }
 
         let kernels = self
             .layer_kernels
@@ -678,9 +866,17 @@ impl AneInferenceEngine {
         let mut x2 = vec![0.0f32; d * s];
         let mut ffn_out = vec![0.0f32; d * s];
 
+        let eps = self.config.rms_norm_eps;
+        let mut xn_buf = vec![0.0f32; d * s]; // pre-normalized buffer for CPU RMSNorm
+
         for (layer_idx, lk) in kernels.iter().enumerate() {
-            // Attention: write x → ANE fwd_attn_kv → read concat(oo, kf, vf)
-            io_pool.input.write_f32_as_fp16(&x, d, s);
+            let lw = &self.layer_weights[layer_idx];
+
+            // CPU RMSNorm in f32 to avoid fp16 overflow in reduce_sum(x², axis=channel).
+            // ANE kernels compiled with cpu_rmsnorm=true expect pre-normalized input.
+            accelerate::rmsnorm(&mut xn_buf, &x, &lw.rms_att, d, s, eps);
+            io_pool.input.write_f32_as_fp16(&xn_buf, d, s);
+
             lk.fwd_attn_kv
                 .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_attn.as_ptr()])?;
 
@@ -696,23 +892,30 @@ impl AneInferenceEngine {
                 .read_fp16_as_f32(&mut vf_buf, d + kv_dim, kv_dim, s);
 
             // Cache K, V for positions 0..input_len
-            // KV data is in channel-first [kv_dim, S] layout
+            // KV buffers are [kv_dim, ane_seq_len] from ANE output;
+            // KV cache is [kv_dim, max_seq_len]. Copy only valid positions.
+            let cache_stride = kv_cache.max_seq_len;
             let lc = &mut kv_cache.layers[layer_idx];
             for ch in 0..kv_dim {
                 for t in 0..input_len {
-                    lc.k[ch * s + t] = kf_buf[ch * s + t];
-                    lc.v[ch * s + t] = vf_buf[ch * s + t];
+                    lc.k[ch * cache_stride + t] = kf_buf[ch * s + t];
+                    lc.v[ch * cache_stride + t] = vf_buf[ch * s + t];
                 }
             }
 
             // Residual: x2 = x + o_out
             accelerate::vadd(&x, &o_out, &mut x2);
 
-            // FFN
-            io_pool.input.write_f32_as_fp16(&x2, d, s);
-            lk.fwd_ffn
-                .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_ffn.as_ptr()])?;
-            io_pool.output_ffn.read_fp16_as_f32(&mut ffn_out, 0, d, s);
+            // FFN: ANE if compiled, otherwise CPU/Accelerate BLAS fallback
+            if let Some(ref ffn_kernel) = lk.fwd_ffn {
+                // CPU RMSNorm for FFN input (same fp16 overflow avoidance)
+                accelerate::rmsnorm(&mut xn_buf, &x2, &lw.rms_ffn, d, s, eps);
+                io_pool.input.write_f32_as_fp16(&xn_buf, d, s);
+                ffn_kernel.evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_ffn.as_ptr()])?;
+                io_pool.output_ffn.read_fp16_as_f32(&mut ffn_out, 0, d, s);
+            } else {
+                self.cpu_ffn_forward(layer_idx, &x2, &mut ffn_out);
+            }
 
             // Residual: x = x2 + ffn_out
             accelerate::vadd(&x2, &ffn_out, &mut x);
@@ -722,7 +925,14 @@ impl AneInferenceEngine {
 
         // Final RMSNorm → logits
         let mut x_final = vec![0.0f32; d * s];
-        accelerate::rmsnorm(&mut x_final, &x, &self.rms_final, d, s);
+        accelerate::rmsnorm(
+            &mut x_final,
+            &x,
+            &self.rms_final,
+            d,
+            s,
+            self.config.rms_norm_eps,
+        );
 
         let mut logits = vec![0.0f32; v * s];
         accelerate::gemm(
@@ -1450,7 +1660,9 @@ mod tests {
             n_kv_heads: 4,
             n_layers: 2,
             vocab_size: 100,
-            max_seq_len: 16,
+            max_seq_len: 64,
+            ane_seq_len: Some(16), // Explicit small bucket for tests
+            max_ane_seq_len: 1024,
             max_compiles: 100,
             temperature: 0.0,
             top_k: 0,
@@ -1465,7 +1677,7 @@ mod tests {
     #[test]
     fn test_inference_engine_creation() {
         let config = small_config();
-        let engine = AneInferenceEngine::new(config).unwrap();
+        let engine = AneInferenceEngine::new(config, 0).unwrap();
         assert_eq!(engine.config().dim, 64);
         assert_eq!(engine.config().n_layers, 2);
         assert!(engine.layer_kernels.is_none());
@@ -1475,7 +1687,7 @@ mod tests {
     #[test]
     fn test_inference_engine_budget() {
         let config = small_config();
-        let engine = AneInferenceEngine::new(config).unwrap();
+        let engine = AneInferenceEngine::new(config, 0).unwrap();
         // 2 kernels per layer * 2 layers = 4 per compile batch
         assert_eq!(engine.budget().kernels_per_batch(), 4);
         assert!(engine.budget().can_compile_batch());
@@ -1484,7 +1696,7 @@ mod tests {
     #[test]
     fn test_load_weights_flat() {
         let config = small_config();
-        let mut engine = AneInferenceEngine::new(config.clone()).unwrap();
+        let mut engine = AneInferenceEngine::new(config.clone(), 0).unwrap();
 
         // Calculate expected total weight count
         let d = config.dim;
@@ -1540,7 +1752,7 @@ mod tests {
     #[test]
     fn test_input_length_validation() {
         let config = small_config();
-        let mut engine = AneInferenceEngine::new(config.clone()).unwrap();
+        let mut engine = AneInferenceEngine::new(config.clone(), 0).unwrap();
 
         // Allocate minimal weight data so engine is in a valid state
         let d = config.dim;
@@ -1621,7 +1833,7 @@ mod tests {
     #[test]
     fn test_lora_merge_before_compile() {
         let config = small_config();
-        let mut engine = AneInferenceEngine::new(config).unwrap();
+        let mut engine = AneInferenceEngine::new(config, 0).unwrap();
         assert!(!engine.compiled);
 
         // After compile, LoRA should be rejected

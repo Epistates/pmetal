@@ -28,8 +28,8 @@
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use objc2_metal::{MTLComputeCommandEncoder, MTLSize};
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::buffer::MetalBuffer;
 use crate::context::MetalContext;

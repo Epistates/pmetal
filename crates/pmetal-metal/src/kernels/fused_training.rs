@@ -44,13 +44,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{
     MTLCommandBuffer, MTLCommandBufferStatus, MTLCommandEncoder, MTLCommandQueue,
     MTLComputeCommandEncoder, MTLSize,
 };
+use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::async_scheduler::GpuCompletionToken;
 use crate::buffer::MetalBuffer;

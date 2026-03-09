@@ -630,6 +630,10 @@ impl InferBuilder {
         let rms_norm_eps = extract_float(&config_text, "rms_norm_eps").unwrap_or(1e-6);
         let head_dim = extract_usize_optional(&config_text, "head_dim");
 
+        // Tokenize early so we know prompt length for ANE bucketing
+        let input_ids_u32 = tokenizer.encode(prompt)?;
+        let prompt_len = input_ids_u32.len();
+
         let ane_config = AneInferenceConfig {
             dim,
             hidden_dim,
@@ -637,7 +641,8 @@ impl InferBuilder {
             n_kv_heads,
             n_layers,
             vocab_size,
-            max_seq_len: 256,
+            max_seq_len: prompt_len + self.max_tokens + 64,
+            ane_seq_len: None, // auto-bucket from prompt length
             temperature: self.temperature,
             top_k: self.top_k,
             max_tokens: self.max_tokens,
@@ -648,7 +653,7 @@ impl InferBuilder {
             ..Default::default()
         };
 
-        let mut engine = AneInferenceEngine::new(ane_config)
+        let mut engine = AneInferenceEngine::new(ane_config, prompt_len)
             .map_err(|e| PMetalError::ModelLoad(format!("ANE engine init failed: {e}")))?;
 
         // Try SafeTensors first, fall back to model.bin
@@ -710,18 +715,12 @@ impl InferBuilder {
             .compile_kernels()
             .map_err(|e| PMetalError::Training(format!("ANE compile failed: {e}")))?;
 
-        // Tokenize
-        let input_ids_u32 = tokenizer.encode(prompt)?;
-
-        // Generate with KV cache
+        // Generate with KV cache (input_ids_u32 already tokenized above)
         let start = std::time::Instant::now();
         let output_ids = engine
             .generate_cached(&input_ids_u32)
             .map_err(|e| PMetalError::Training(format!("ANE generate failed: {e}")))?;
         let elapsed = start.elapsed();
-
-        // Decode generated tokens
-        let prompt_len = input_ids_u32.len();
         let generated: Vec<u32> = output_ids[prompt_len..].to_vec();
         let text = tokenizer.decode(&generated)?;
 

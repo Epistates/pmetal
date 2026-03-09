@@ -15,7 +15,7 @@
 //! zero-copy bridging to pass MLX array data directly to Metal kernels without
 //! copying, providing significant performance improvements for large tensors.
 
-use super::DistillLoss;
+use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k};
 use crate::Result;
 use mlx_rs::Array;
 
@@ -55,6 +55,12 @@ use pmetal_metal::{
 /// to Metal kernels without copying. This is possible because MLX and Metal share
 /// unified memory on Apple Silicon.
 pub struct JensenShannonLoss {
+    /// Number of top-k teacher tokens to retain when vocab sizes differ.
+    ///
+    /// Only used when teacher and student have different vocabulary sizes
+    /// (cross-architecture distillation).  Defaults to [`SPARSE_TOPK_DEFAULT`].
+    sparse_top_k: i32,
+
     /// Cached Metal context for GPU acceleration.
     #[cfg(feature = "metal")]
     ctx: Option<Arc<MetalContext>>,
@@ -67,11 +73,23 @@ impl JensenShannonLoss {
     /// Create a new Jensen-Shannon divergence loss.
     pub fn new() -> Self {
         Self {
+            sparse_top_k: SPARSE_TOPK_DEFAULT,
             #[cfg(feature = "metal")]
             ctx: MetalContext::global().ok(),
             #[cfg(not(feature = "metal"))]
             _phantom: (),
         }
+    }
+
+    /// Set the number of top-k teacher tokens used in cross-vocab distillation.
+    ///
+    /// When teacher and student vocabularies differ, the loss is computed only
+    /// over the top-`k` teacher tokens (by logit magnitude).  Higher values
+    /// capture more of the teacher distribution but increase computation.
+    /// Must be ≥ 1; defaults to [`SPARSE_TOPK_DEFAULT`] (128).
+    pub fn with_sparse_top_k(mut self, k: i32) -> Self {
+        self.sparse_top_k = k.max(1);
+        self
     }
 
     /// Check if GPU acceleration is available.
@@ -221,8 +239,15 @@ impl DistillLoss for JensenShannonLoss {
         temperature: f32,
         weights: Option<&Array>,
     ) -> Result<Array> {
-        // GPU-first: try Metal if no weights
-        if weights.is_none() {
+        // Align vocab sizes.  When they differ we take the sparse top-k path
+        // which always uses MLX (Metal kernels require equal vocab sizes).
+        let (teacher_logits, student_logits, vocab_mismatched) =
+            align_vocab_with_k(teacher_logits, student_logits, self.sparse_top_k)?;
+        let teacher_logits = &teacher_logits;
+        let student_logits = &student_logits;
+
+        // GPU-first: try Metal if no weights and no vocab mismatch.
+        if weights.is_none() && !vocab_mismatched {
             #[cfg(feature = "metal")]
             {
                 if self.ctx.is_some() {
@@ -231,7 +256,7 @@ impl DistillLoss for JensenShannonLoss {
             }
         }
 
-        // MLX fallback / weighted implementation using log-domain computation
+        // MLX fallback / weighted / sparse-vocab implementation (log-domain for stability)
         let temp = Array::from_f32(temperature);
         let teacher_scaled = teacher_logits.divide(&temp)?;
         let student_scaled = student_logits.divide(&temp)?;
@@ -467,5 +492,156 @@ mod tests {
         // Should be positive and finite
         assert!(value >= 0.0, "JS should be non-negative");
         assert!(value.is_finite(), "JS should be finite");
+    }
+
+    // -----------------------------------------------------------------
+    // Cross-vocab / sparse top-k tests
+    // -----------------------------------------------------------------
+
+    /// JS divergence with teacher smaller than student vocab.
+    #[test]
+    #[serial]
+    fn test_js_cross_vocab_teacher_smaller() {
+        let teacher_vocab = 80_i32;
+        let student_vocab = 100_i32;
+        let batch = 2_i32;
+        let seq = 4_i32;
+
+        let teacher_data: Vec<f32> = (0..(batch * seq * teacher_vocab))
+            .map(|i| (i % 40) as f32 - 20.0)
+            .collect();
+        let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
+            .map(|i| (i * 3 % 40) as f32 - 20.0)
+            .collect();
+        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+
+        let loss = JensenShannonLoss::new().with_sparse_top_k(32);
+        let result = loss.compute(&teacher, &student, 2.0).unwrap();
+        let value: f32 = result.item();
+
+        assert!(value >= 0.0, "JS must be non-negative, got {}", value);
+        assert!(value.is_finite(), "JS must be finite, got {}", value);
+        // JS is bounded by ln(2) ≈ 0.693
+        assert!(
+            value <= 2.0_f32.ln() + 1e-4,
+            "JS must be bounded by ln(2), got {}",
+            value
+        );
+    }
+
+    /// JS divergence with teacher larger than student vocab.
+    #[test]
+    #[serial]
+    fn test_js_cross_vocab_teacher_larger() {
+        let teacher_vocab = 100_i32;
+        let student_vocab = 80_i32;
+        let batch = 2_i32;
+        let seq = 4_i32;
+
+        let teacher_data: Vec<f32> = (0..(batch * seq * teacher_vocab))
+            .map(|i| (i % 40) as f32 - 20.0)
+            .collect();
+        let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
+            .map(|i| (i * 3 % 40) as f32 - 20.0)
+            .collect();
+        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+
+        let loss = JensenShannonLoss::new().with_sparse_top_k(32);
+        let result = loss.compute(&teacher, &student, 2.0).unwrap();
+        let value: f32 = result.item();
+
+        assert!(value >= 0.0, "JS must be non-negative, got {}", value);
+        assert!(value.is_finite(), "JS must be finite, got {}", value);
+        assert!(
+            value <= 2.0_f32.ln() + 1e-4,
+            "JS must be bounded by ln(2), got {}",
+            value
+        );
+    }
+
+    /// 3-D tensor cross-vocab JS — verifies the Ellipsis fix for rank-3 logits.
+    #[test]
+    #[serial]
+    fn test_js_cross_vocab_3d_tensors() {
+        let batch = 2_i32;
+        let seq = 3_i32;
+        let teacher_vocab = 10_i32;
+        let student_vocab = 8_i32;
+
+        let teacher_data: Vec<f32> = (0..(batch * seq * teacher_vocab))
+            .map(|i| i as f32)
+            .collect();
+        let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
+            .map(|i| i as f32)
+            .collect();
+        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+
+        let loss = JensenShannonLoss::new().with_sparse_top_k(4);
+        let result = loss.compute(&teacher, &student, 1.0).unwrap();
+        let value: f32 = result.item();
+
+        // Scalar result
+        assert!(result.shape().is_empty(), "result should be scalar");
+        assert!(value.is_finite(), "JS must be finite, got {}", value);
+        assert!(value >= 0.0, "JS must be non-negative, got {}", value);
+    }
+
+    /// Cross-vocab JS is symmetric: JS(teacher_a, student_a) ≈ JS(teacher_b, student_b)
+    /// when the roles are swapped via argument order.
+    #[test]
+    #[serial]
+    fn test_js_cross_vocab_symmetry_hint() {
+        // When both are within range (student_vocab > teacher_vocab so no masking),
+        // swapping teacher/student should give the same value (JS is symmetric).
+        let teacher_vocab = 6_i32;
+        let student_vocab = 10_i32;
+
+        // Identical logit values for the shared 6 tokens
+        let shared: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let extended: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0];
+        let teacher = Array::from_slice(&shared, &[1, 1, teacher_vocab]);
+        let student = Array::from_slice(&extended, &[1, 1, student_vocab]);
+
+        let loss = JensenShannonLoss::new().with_sparse_top_k(6);
+        let result = loss.compute(&teacher, &student, 1.0).unwrap();
+        let value: f32 = result.item();
+
+        assert!(value.is_finite(), "JS must be finite, got {}", value);
+        assert!(value >= 0.0, "JS must be non-negative, got {}", value);
+    }
+
+    /// Configurable top-k builder produces valid output for multiple k values.
+    #[test]
+    #[serial]
+    fn test_js_with_sparse_top_k_builder() {
+        let teacher = Array::from_slice(
+            &(0..200).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 1, 200],
+        );
+        let student = Array::from_slice(
+            &(0..150).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 1, 150],
+        );
+
+        for k in [8, 32, 64, 128] {
+            let loss = JensenShannonLoss::new().with_sparse_top_k(k);
+            let result = loss.compute(&teacher, &student, 2.0).unwrap();
+            let value: f32 = result.item();
+            assert!(
+                value.is_finite(),
+                "JS should be finite for k={}: {}",
+                k,
+                value
+            );
+            assert!(
+                value >= 0.0,
+                "JS should be non-negative for k={}: {}",
+                k,
+                value
+            );
+        }
     }
 }

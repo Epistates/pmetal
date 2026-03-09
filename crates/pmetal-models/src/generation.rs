@@ -2023,6 +2023,7 @@ pub fn generate_cached_ane(
     model_path: &std::path::Path,
     input_ids: &[u32],
     gen_config: &GenerationConfig,
+    ane_max_seq_len: usize,
 ) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError> {
     use pmetal_metal::ane::inference::{AneInferenceConfig, AneInferenceEngine};
 
@@ -2076,7 +2077,11 @@ pub fn generate_cached_ane(
         n_kv_heads,
         n_layers,
         vocab_size,
+        // KV cache sized for full generation window (prompt + output)
         max_seq_len: input_ids.len() + gen_config.max_new_tokens + 64,
+        // ANE kernel seq_len: auto-bucketed to next power of 2, capped
+        ane_seq_len: None, // auto-compute from prompt_len
+        max_ane_seq_len: ane_max_seq_len,
         temperature: gen_config.temperature,
         top_k: gen_config.top_k,
         max_tokens: gen_config.max_new_tokens,
@@ -2087,7 +2092,7 @@ pub fn generate_cached_ane(
         ..Default::default()
     };
 
-    let mut engine = AneInferenceEngine::new(ane_config)?;
+    let mut engine = AneInferenceEngine::new(ane_config, input_ids.len())?;
     engine.load_weights_safetensors(model_path)?;
     engine.compile_kernels()?;
 

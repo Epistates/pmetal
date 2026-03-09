@@ -1105,13 +1105,13 @@ pub fn gen_dynamic_sdpa_bwd1(dkc: &DynamicKernelConfig) -> DynamicKernelOutput {
     let mm_true = p.next_var("mmt");
     p.emit_scalar_const(&mm_true, "bool", "true");
 
-    let scores = p.next_var("scr");
-    p.emit_matmul(&scores, &[1, nh, s, s], &mm_false, &mm_false, &qt, &k_h);
-
+    // Scale Q BEFORE matmul to prevent fp16 overflow in QK-norm'd models
     let scale_var = p.next_var("sc");
     p.emit_scalar_const(&scale_var, "fp16", &format!("{scale}"));
+    let qt_scaled = p.next_var("qts");
+    p.emit_mul(&qt_scaled, &[1, nh, s, hd], &qt, &scale_var);
     let ss = p.next_var("ss");
-    p.emit_mul(&ss, &[1, nh, s, s], &scores, &scale_var);
+    p.emit_matmul(&ss, &[1, nh, s, s], &mm_false, &mm_false, &qt_scaled, &k_h);
 
     let mask_path = "@model_path/weights/mask.bin";
     p.emit_weight_const("mask", &[1, 1, s, s], mask_path);

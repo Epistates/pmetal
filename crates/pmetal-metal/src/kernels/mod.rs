@@ -9,6 +9,7 @@ pub mod flash_attention;
 pub mod fp8_training;
 pub mod fused_cross_entropy;
 pub mod fused_distill;
+pub mod fused_gdn;
 pub mod fused_lora;
 pub mod fused_merge;
 pub mod fused_norm_lora;
@@ -40,6 +41,7 @@ pub use fused_distill::{
     DistillLossType, FusedDistill, FusedDistillConfig, FusedDistillOutput, FusedHiddenAlign,
     HiddenAlignConfig, HiddenAlignLossType,
 };
+pub use fused_gdn::{FusedGdn, FusedGdnConfig};
 pub use fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use fused_merge::{
     FusedMergeMetal, MergeConfig, TensorInfo, build_merge_config, build_tensor_info,

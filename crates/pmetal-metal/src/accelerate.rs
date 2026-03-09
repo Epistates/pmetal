@@ -331,7 +331,7 @@ pub fn matrix_transpose(dst: &mut [f32], src: &[f32], rows: usize, cols: usize) 
 /// `out[d*S+t] = w[d] * x[d*S+t] / sqrt(mean(x[:,t]^2) + eps)`
 ///
 /// This matches the ANE reference `rmsnorm()` implementation using vDSP.
-pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], dim: usize, seq: usize) {
+pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], dim: usize, seq: usize, eps: f32) {
     debug_assert_eq!(x.len(), dim * seq);
     debug_assert_eq!(out.len(), dim * seq);
     debug_assert_eq!(w.len(), dim);
@@ -352,7 +352,6 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], dim: usize, seq: usize) {
 
         // ss = ss / dim + eps
         let inv_d = 1.0f32 / dim as f32;
-        let eps = 1e-5f32;
         unsafe {
             ffi::vDSP_vsmsa(ss.as_ptr(), 1, &inv_d, &eps, ss.as_mut_ptr(), 1, seq);
         }
@@ -390,7 +389,7 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], dim: usize, seq: usize) {
                 let v = x[d * seq + t];
                 ss += v * v;
             }
-            ss = 1.0 / (ss / dim as f32 + 1e-5).sqrt();
+            ss = 1.0 / (ss / dim as f32 + eps).sqrt();
             for d in 0..dim {
                 out[d * seq + t] = w[d] * x[d * seq + t] * ss;
             }
@@ -402,6 +401,7 @@ pub fn rmsnorm(out: &mut [f32], x: &[f32], w: &[f32], dim: usize, seq: usize) {
 ///
 /// Computes `dx` (gradient w.r.t. input) and accumulates into `dw` (gradient w.r.t. weights).
 /// Matches the ANE reference `rmsnorm_bwd()` implementation.
+#[allow(clippy::too_many_arguments)]
 pub fn rmsnorm_backward(
     dx: &mut [f32],
     dw: &mut [f32],
@@ -410,6 +410,7 @@ pub fn rmsnorm_backward(
     w: &[f32],
     dim: usize,
     seq: usize,
+    eps: f32,
 ) {
     debug_assert_eq!(x.len(), dim * seq);
     debug_assert_eq!(dy.len(), dim * seq);
@@ -431,7 +432,6 @@ pub fn rmsnorm_backward(
             }
         }
         let inv_d = 1.0f32 / dim as f32;
-        let eps = 1e-5f32;
         unsafe {
             ffi::vDSP_vsmsa(ss.as_ptr(), 1, &inv_d, &eps, ss.as_mut_ptr(), 1, seq);
         }
@@ -535,7 +535,7 @@ pub fn rmsnorm_backward(
                 let v = x[d * seq + t];
                 ss += v * v;
             }
-            let variance = ss / dim as f32 + 1e-5;
+            let variance = ss / dim as f32 + eps;
             let rrms = 1.0 / variance.sqrt();
             let mut dot = 0.0f32;
             for d in 0..dim {
@@ -1003,7 +1003,7 @@ mod tests {
         let x = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]; // 4 channels, 2 positions
         let w = vec![1.0, 1.0, 1.0, 1.0]; // identity weights
         let mut out = vec![0.0f32; dim * seq];
-        rmsnorm(&mut out, &x, &w, dim, seq);
+        rmsnorm(&mut out, &x, &w, dim, seq, 1e-5);
 
         // Verify: for position 0: values are 1,3,5,7
         // rms = sqrt((1+9+25+49)/4 + 1e-5) = sqrt(21.00001) ≈ 4.58258

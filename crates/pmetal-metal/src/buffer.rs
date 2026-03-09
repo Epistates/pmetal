@@ -3,7 +3,6 @@
 //! This module provides typed GPU buffers that work with Metal's unified memory,
 //! enabling zero-copy interop with MLX and CPU code.
 
-use zerocopy::{FromBytes, IntoBytes};
 use half::f16;
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
@@ -12,6 +11,7 @@ use std::marker::PhantomData;
 use std::mem;
 use std::ptr::NonNull;
 use std::slice;
+use zerocopy::{FromBytes, IntoBytes};
 
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};

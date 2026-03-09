@@ -45,7 +45,8 @@ kernel void moe_topk_selection(
 
     // Thread-private score buffer (not threadgroup — each thread owns its own token's scores).
     // Declared at kernel function scope as required by MSL.
-    float scores[256]; // Max experts
+    // Must accommodate the largest expert count (Qwen3.5 uses 512 routed experts).
+    float scores[1024]; // Max experts
 
     if (params.use_sigmoid) {
         // Sigmoid activation

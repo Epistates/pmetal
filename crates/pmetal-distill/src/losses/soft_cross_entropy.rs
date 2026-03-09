@@ -14,7 +14,7 @@
 
 use std::ops::Neg;
 
-use super::{DistillLoss, softmax};
+use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, softmax};
 use crate::Result;
 use mlx_rs::Array;
 
@@ -44,6 +44,12 @@ use pmetal_metal::{
 /// to Metal kernels without copying. This is possible because MLX and Metal share
 /// unified memory on Apple Silicon.
 pub struct SoftCrossEntropyLoss {
+    /// Number of top-k teacher tokens to retain when vocab sizes differ.
+    ///
+    /// Only used when teacher and student have different vocabulary sizes
+    /// (cross-architecture distillation).  Defaults to [`SPARSE_TOPK_DEFAULT`].
+    sparse_top_k: i32,
+
     /// Cached Metal context for GPU acceleration.
     #[cfg(feature = "metal")]
     ctx: Option<Arc<MetalContext>>,
@@ -56,11 +62,23 @@ impl SoftCrossEntropyLoss {
     /// Create a new soft cross-entropy loss.
     pub fn new() -> Self {
         Self {
+            sparse_top_k: SPARSE_TOPK_DEFAULT,
             #[cfg(feature = "metal")]
             ctx: MetalContext::global().ok(),
             #[cfg(not(feature = "metal"))]
             _phantom: (),
         }
+    }
+
+    /// Set the number of top-k teacher tokens used in cross-vocab distillation.
+    ///
+    /// When teacher and student vocabularies differ, the loss is computed only
+    /// over the top-`k` teacher tokens (by logit magnitude).  Higher values
+    /// capture more of the teacher distribution but increase computation.
+    /// Must be ≥ 1; defaults to [`SPARSE_TOPK_DEFAULT`] (128).
+    pub fn with_sparse_top_k(mut self, k: i32) -> Self {
+        self.sparse_top_k = k.max(1);
+        self
     }
 
     /// Check if GPU acceleration is available.
@@ -202,8 +220,15 @@ impl DistillLoss for SoftCrossEntropyLoss {
         temperature: f32,
         weights: Option<&Array>,
     ) -> Result<Array> {
-        // GPU-first: try Metal if no weights
-        if weights.is_none() {
+        // Align vocab sizes.  When they differ we take the sparse top-k path
+        // which always uses MLX (Metal kernels require equal vocab sizes).
+        let (teacher_logits, student_logits, vocab_mismatched) =
+            align_vocab_with_k(teacher_logits, student_logits, self.sparse_top_k)?;
+        let teacher_logits = &teacher_logits;
+        let student_logits = &student_logits;
+
+        // GPU-first: try Metal if no weights and no vocab mismatch.
+        if weights.is_none() && !vocab_mismatched {
             #[cfg(feature = "metal")]
             {
                 if self.ctx.is_some() {
@@ -212,7 +237,7 @@ impl DistillLoss for SoftCrossEntropyLoss {
             }
         }
 
-        // MLX fallback / weighted implementation
+        // MLX fallback / weighted / sparse-vocab implementation
         let temp = Array::from_f32(temperature);
         let teacher_scaled = teacher_logits.divide(&temp)?;
         let student_scaled = student_logits.divide(&temp)?;
@@ -420,5 +445,124 @@ mod tests {
         // Should be positive and finite
         assert!(value > 0.0, "Soft CE should be positive");
         assert!(value.is_finite(), "Soft CE should be finite");
+    }
+
+    // -----------------------------------------------------------------
+    // Cross-vocab / sparse top-k tests
+    // -----------------------------------------------------------------
+
+    /// Soft CE with teacher smaller than student vocab.
+    #[test]
+    #[serial]
+    fn test_soft_ce_cross_vocab_teacher_smaller() {
+        let teacher_vocab = 80_i32;
+        let student_vocab = 100_i32;
+        let batch = 2_i32;
+        let seq = 4_i32;
+
+        let teacher_data: Vec<f32> = (0..(batch * seq * teacher_vocab))
+            .map(|i| (i % 40) as f32 - 20.0)
+            .collect();
+        let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
+            .map(|i| (i * 3 % 40) as f32 - 20.0)
+            .collect();
+        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+
+        let loss = SoftCrossEntropyLoss::new().with_sparse_top_k(32);
+        let result = loss.compute(&teacher, &student, 2.0).unwrap();
+        let value: f32 = result.item();
+
+        assert!(value > 0.0, "soft CE must be positive, got {}", value);
+        assert!(value.is_finite(), "soft CE must be finite, got {}", value);
+    }
+
+    /// Soft CE with teacher larger than student vocab.
+    #[test]
+    #[serial]
+    fn test_soft_ce_cross_vocab_teacher_larger() {
+        let teacher_vocab = 100_i32;
+        let student_vocab = 80_i32;
+        let batch = 2_i32;
+        let seq = 4_i32;
+
+        let teacher_data: Vec<f32> = (0..(batch * seq * teacher_vocab))
+            .map(|i| (i % 40) as f32 - 20.0)
+            .collect();
+        let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
+            .map(|i| (i * 3 % 40) as f32 - 20.0)
+            .collect();
+        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+
+        let loss = SoftCrossEntropyLoss::new().with_sparse_top_k(32);
+        let result = loss.compute(&teacher, &student, 2.0).unwrap();
+        let value: f32 = result.item();
+
+        assert!(value > 0.0, "soft CE must be positive, got {}", value);
+        assert!(value.is_finite(), "soft CE must be finite, got {}", value);
+    }
+
+    /// 3-D tensor cross-vocab CE — verifies the Ellipsis fix for rank-3 logits.
+    #[test]
+    #[serial]
+    fn test_soft_ce_cross_vocab_3d_tensors() {
+        let batch = 2_i32;
+        let seq = 3_i32;
+        let teacher_vocab = 10_i32;
+        let student_vocab = 8_i32;
+
+        let teacher_data: Vec<f32> = (0..(batch * seq * teacher_vocab))
+            .map(|i| i as f32)
+            .collect();
+        let student_data: Vec<f32> = (0..(batch * seq * student_vocab))
+            .map(|i| i as f32)
+            .collect();
+        let teacher = Array::from_slice(&teacher_data, &[batch, seq, teacher_vocab]);
+        let student = Array::from_slice(&student_data, &[batch, seq, student_vocab]);
+
+        let loss = SoftCrossEntropyLoss::new().with_sparse_top_k(4);
+        let result = loss.compute(&teacher, &student, 1.0).unwrap();
+        let value: f32 = result.item();
+
+        // Scalar result
+        assert!(result.shape().is_empty(), "result should be scalar");
+        assert!(value.is_finite(), "soft CE must be finite, got {}", value);
+    }
+
+    /// Configurable top-k builder produces consistent results across k values.
+    #[test]
+    #[serial]
+    fn test_soft_ce_with_sparse_top_k_builder() {
+        let teacher = Array::from_slice(
+            &(0..200).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 1, 200],
+        );
+        let student = Array::from_slice(
+            &(0..150).map(|i| i as f32).collect::<Vec<_>>(),
+            &[1, 1, 150],
+        );
+
+        for k in [8, 32, 64, 128] {
+            let loss = SoftCrossEntropyLoss::new().with_sparse_top_k(k);
+            let result = loss.compute(&teacher, &student, 2.0).unwrap();
+            let value: f32 = result.item();
+            assert!(
+                value.is_finite(),
+                "soft CE should be finite for k={}: {}",
+                k,
+                value
+            );
+            // CE = -sum(p * log(q)).  When the top-k teacher and student logits share the
+            // same relative ordering (both are monotone ascending slices), the distributions
+            // become nearly identical after softmax, making CE ≈ entropy ≈ a small positive
+            // or effectively 0.  The important invariant is that it is non-negative and finite.
+            assert!(
+                value >= -1e-5,
+                "soft CE must be >= 0 for k={}: {}",
+                k,
+                value
+            );
+        }
     }
 }

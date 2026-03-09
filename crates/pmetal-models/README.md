@@ -11,7 +11,7 @@ This crate provides implementations of popular LLM architectures optimized for A
 | Family | Variants | Status |
 |--------|----------|--------|
 | **Llama** | 2, 3, 3.1, 3.2, 3.3, 4 | Production |
-| **Qwen** | 2, 2.5, 3, 3-MoE | Production |
+| **Qwen** | 2, 2.5, 3, 3-MoE, 3.5 (Next) | Production |
 | **DeepSeek** | V3, V3.2, V3.2-Speciale | Production |
 | **Mistral** | 7B, 8x7B (MoE) | Production |
 | **Gemma** | 2, 3 | Production |
@@ -19,6 +19,10 @@ This crate provides implementations of popular LLM architectures optimized for A
 | **GPT-OSS** | 20B, 120B | Production |
 | **Granite** | 3.0, 3.1 | Production |
 | **Cohere** | Command R | Production |
+| **NemotronH** | Hybrid (Mamba+Attention) | Production |
+| **StarCoder2** | 3B, 7B, 15B | Production |
+| **RecurrentGemma** | Griffin | Production |
+| **Jamba** | 1.5 | Production |
 
 ### Vision Models
 

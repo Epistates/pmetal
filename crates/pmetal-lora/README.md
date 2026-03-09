@@ -59,17 +59,19 @@ let logits = model.forward(&input_ids, None)?;
 
 ## Architecture Support
 
-| Architecture | LoRA | QLoRA | Grad Checkpoint |
-|--------------|------|-------|-----------------|
-| Llama | Yes | Yes | Yes |
-| Qwen | Yes | No | Yes |
-| DeepSeek | Yes | No | Yes |
-| Mistral | Yes | Yes | Yes |
-| Gemma | Yes | No | Yes |
-| Phi | Yes | No | Yes |
-| GPT-OSS | Yes | No | No |
-| Granite | Yes | No | Yes |
-| Cohere | Yes | No | Yes |
+| Architecture | LoRA | QLoRA | Notes |
+|--------------|------|-------|-------|
+| Llama (2/3/3.x/4) | Yes | Yes | Includes Granite, Cohere, StarCoder2 (Llama-based) |
+| Qwen (2/2.5/3) | Yes | Yes | Shared Qwen3 LoRA implementation |
+| Qwen 3.5 (Next) | Yes | No | Hybrid GDN + Attention |
+| Mistral (7B/8x7B) | Yes | Yes | |
+| Gemma (2/3) | Yes | Yes | |
+| Phi (3/4) | Yes | No | |
+| DeepSeek (V3) | Yes | No | Uses generic LoRA path |
+| GPT-OSS | Yes | No | Uses generic LoRA path |
+| NemotronH | Yes | No | Uses generic LoRA path |
+| Jamba | Yes | No | Uses generic LoRA path |
+| RecurrentGemma | Yes | No | Uses generic LoRA path |
 
 ## Configuration
 
@@ -85,11 +87,15 @@ let logits = model.forward(&input_ids, None)?;
 | Module | Description |
 |--------|-------------|
 | `dynamic` | `DynamicLoraModel` with auto-detection |
-| `llama_lora` | LLaMA-specific LoRA implementation |
-| `llama_qlora` | LLaMA QLoRA with 4-bit quantization |
-| `qwen3_lora` | Qwen3-specific LoRA with grad checkpointing |
+| `llama_lora` | LLaMA-specific LoRA (also covers Granite, Cohere, StarCoder2) |
+| `qwen3_lora` | Qwen3-specific LoRA |
+| `qwen3_next_lora` | Qwen 3.5 (Next) hybrid LoRA |
+| `mistral_lora` | Mistral-specific LoRA |
+| `gemma_lora` | Gemma-specific LoRA |
+| `phi_lora` | Phi-specific LoRA |
+| `generic_lora` | Generic LoRA for architectures without dedicated implementations |
 | `trainable` | `TrainableModel` trait definition |
-| `fused_training` | Metal-accelerated training utilities |
+| `arch_config` | Per-architecture LoRA configuration |
 
 ## Performance
 

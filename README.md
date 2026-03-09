@@ -26,7 +26,7 @@ cargo build --release
 ```bash
 # LoRA fine-tuning with auto-detected max-seq-len and sequence packing
 ./target/release/pmetal train \
-  --model qwen/Qwen3-0.6B-Base \
+  --model Qwen/Qwen3-0.6B-Base \
   --dataset path/to/train.jsonl \
   --output ./output \
   --lora-r 16 \
@@ -39,7 +39,7 @@ cargo build --release
 ```bash
 # Inference with thinking mode enabled
 ./target/release/pmetal infer \
-  --model qwen/Qwen3-0.6B-Base \
+  --model Qwen/Qwen3-0.6B-Base \
   --lora ./output/lora_weights.safetensors \
   --prompt "Does absolute truth exist?" \
   --chat \
@@ -51,21 +51,28 @@ cargo build --release
 PMetal includes a native ANE pipeline behind the `ane` feature flag. This uses private `AppleNeuralEngine.framework` APIs to run MIL 1.3 programs directly on the Neural Engine with zero-copy IOSurface data transfer. **ANE support is enabled by default** when the `ane` feature is included.
 
 ```bash
-# Build with ANE support
-cargo build --release --features ane
+# ANE is enabled by default. Just build:
+cargo build --release
 
 # Train on ANE (dynamic weight pipeline — 9 kernels, compiled once)
 ./target/release/pmetal train \
-  --model qwen/Qwen3-0.6B-Base \
+  --model Qwen/Qwen3-0.6B-Base \
   --dataset path/to/train.jsonl \
   --output ./output
   # ANE is used automatically. Use --no-ane to disable.
 
 # Inference on ANE (hybrid ANE prefill + CPU decode with KV cache)
 ./target/release/pmetal infer \
-  --model qwen/Qwen3-0.6B-Base \
-  --prompt "Explain quantum entanglement"
+  --model Qwen/Qwen3-0.6B \
+  --prompt "Explain quantum entanglement" \
+  --chat
   # ANE is used automatically. Use --no-ane to disable.
+
+# Knowledge distillation (supports cross-vocabulary teacher/student)
+./target/release/pmetal distill \
+  --teacher Qwen/Qwen3-4B \
+  --student unsloth/Qwen3.5-0.8B-Base \
+  --dataset train.jsonl
 
 # Real-time training dashboard (TUI)
 ./target/release/pmetal dashboard --metrics-file ./output/metrics.jsonl
@@ -141,7 +148,7 @@ The PMetal framework supports a wide range of training methods. Methods marked w
 - **QLoRA (CLI)**: 4-bit quantized base weights with LoRA adapters
 - **GRPO (CLI)**: Group Relative Policy Optimization for reasoning models
 - **DAPO (CLI)**: Decoupled Clip and Dynamic Sampling Policy Optimization (available via `grpo --dapo`)
-- **Knowledge Distillation (CLI)**: Online, Offline, and Progressive methods with reasoning (rationale) support
+- **Knowledge Distillation (CLI)**: Online, Offline, and Progressive methods with reasoning (rationale) support. Cross-vocabulary distillation via sparse top-k alignment.
 - **GSPO**: Group Sequence Policy Optimization (fixes GRPO length bias)
 - **ANE Training**: Native Apple Neural Engine training with dynamic weight pipeline
 - **DoRA**: Weight-Decomposed Low-Rank Adaptation
@@ -171,6 +178,7 @@ Native ANE integration for power-efficient training and inference:
 
 - **Dynamic Weight Pipeline**: 9 MIL kernels compiled once at startup; weights packed alongside activations in IOSurface spatial dimension. Zero recompilation during training.
 - **Hybrid Inference**: ANE prefill + CPU decode with KV cache for autoregressive generation.
+- **CPU RMSNorm**: RMSNorm computed in f32 on CPU to avoid fp16 overflow on ANE (saturation arithmetic). Per-head QK-norm stays on ANE.
 - **IOSurface Zero-Copy**: fp32 shared memory surfaces for CPU↔ANE data transfer with no serialization overhead.
 - **GQA/MQA Support**: Grouped-query and multi-query attention via MIL KV head expansion (replaces unreliable `tile` ops).
 
@@ -194,11 +202,14 @@ Efficiently pack multiple sequences into single batches for 2-5x throughput impr
 
 ### Gradient Checkpointing
 
-Trade compute for memory on large models. The config option exists for forward-compatibility, but **gradient checkpointing is not yet implemented in the MLX backend** — enabling it currently has no effect on peak memory.
+Trade compute for memory on large models. Enabled by default with configurable layer grouping:
 
 ```bash
---gradient-checkpointing smart  # No-op until backend support lands
+--gradient-checkpointing-layers 4  # Layers per checkpoint block (default)
+--no-gradient-checkpointing        # Disable
 ```
+
+Note: Currently implemented for Llama-family architectures. Qwen3 will log a warning that checkpointing is not yet applied.
 
 ### Dataset Formats
 
@@ -228,6 +239,7 @@ Supported formats for training data (Auto-detected):
 | `--gradient-accumulation-steps` | 4 | Gradient accumulation steps |
 | `--no-ane` | false | Disable ANE training |
 | `--embedding-lr` | None | Separate LR for embeddings |
+| `--no-metal-fused-optimizer` | false | Disable Metal fused optimizer |
 
 ### `pmetal infer` Parameters
 
@@ -243,6 +255,8 @@ Supported formats for training data (Auto-detected):
 | `--show-thinking` | false | Show reasoning content |
 | `--fp8` | false | Use FP8 weights (~2x mem reduction) |
 | `--compiled` | false | Use JIT-compiled sampling |
+| `--no-ane` | false | Disable ANE inference |
+| `--ane-max-seq-len` | 1024 | Max ANE kernel sequence length |
 
 ## Development
 

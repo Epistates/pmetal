@@ -148,16 +148,19 @@ impl TensorLoader for SafetensorsLoader {
 
         let array = match tensor.dtype() {
             safetensors::Dtype::F32 => {
-                let floats: &[f32] = <[f32]>::ref_from_bytes(data).expect("safetensors data aligned");
+                let floats: &[f32] =
+                    <[f32]>::ref_from_bytes(data).expect("safetensors data aligned");
                 Array::from_slice(floats, &shape)
             }
             safetensors::Dtype::F16 => {
-                let halfs: &[half::f16] = <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
+                let halfs: &[half::f16] =
+                    <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
                 Array::from_slice(&floats, &shape)
             }
             safetensors::Dtype::BF16 => {
-                let halfs: &[half::bf16] = <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
+                let halfs: &[half::bf16] =
+                    <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
                 Array::from_slice(&floats, &shape)
             }
@@ -414,16 +417,19 @@ impl TensorLoader for ZeroCopyLoader {
 
         let array = match loc.dtype {
             safetensors::Dtype::F32 => {
-                let floats: &[f32] = <[f32]>::ref_from_bytes(data).expect("safetensors data aligned");
+                let floats: &[f32] =
+                    <[f32]>::ref_from_bytes(data).expect("safetensors data aligned");
                 Array::from_slice(floats, &shape)
             }
             safetensors::Dtype::F16 => {
-                let halfs: &[half::f16] = <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
+                let halfs: &[half::f16] =
+                    <[half::f16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
                 Array::from_slice(&floats, &shape)
             }
             safetensors::Dtype::BF16 => {
-                let halfs: &[half::bf16] = <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
+                let halfs: &[half::bf16] =
+                    <[half::bf16]>::ref_from_bytes(data).expect("safetensors data aligned");
                 let floats: Vec<f32> = halfs.iter().map(|h| h.to_f32()).collect();
                 Array::from_slice(&floats, &shape)
             }

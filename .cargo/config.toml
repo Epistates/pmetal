@@ -1,0 +1,5 @@
+[env]
+# Serialize test execution to prevent SIGSEGV from concurrent MLX GPU access.
+# MLX's internal device/memory state is not thread-safe for parallel test execution.
+# Full suite (650+ tests) runs in ~1s serial, so no performance impact.
+RUST_TEST_THREADS = "1"
