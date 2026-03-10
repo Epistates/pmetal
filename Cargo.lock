@@ -4548,6 +4548,7 @@ dependencies = [
  "pmetal-gguf",
  "pmetal-hub",
  "pmetal-lora",
+ "pmetal-metal",
  "pmetal-mlx",
  "pmetal-mlx-rs",
  "pmetal-models",
@@ -4563,6 +4564,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "walkdir",
 ]
 
 [[package]]

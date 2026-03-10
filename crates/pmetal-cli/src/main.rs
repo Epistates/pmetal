@@ -6,6 +6,8 @@
 #![allow(clippy::needless_borrows_for_generic_args)]
 
 mod dashboard;
+#[cfg(feature = "dashboard")]
+mod tui;
 
 use std::path::{Component, Path, PathBuf};
 
@@ -492,6 +494,14 @@ enum Commands {
     /// Real-time training dashboard (loss curves, ANE utilization, timing)
     Dashboard {
         /// Path to training metrics JSONL file to visualize
+        #[arg(short, long)]
+        metrics_file: Option<String>,
+    },
+
+    /// Full TUI control center (device, models, datasets, training, inference)
+    #[cfg(feature = "dashboard")]
+    Tui {
+        /// Path to training metrics JSONL file to visualize in the dashboard tab
         #[arg(short, long)]
         metrics_file: Option<String>,
     },
@@ -1365,6 +1375,12 @@ async fn main() -> anyhow::Result<()> {
         Commands::Dashboard { metrics_file } => {
             let path = metrics_file.map(std::path::PathBuf::from);
             dashboard::run_dashboard(path)?;
+        }
+
+        #[cfg(feature = "dashboard")]
+        Commands::Tui { metrics_file } => {
+            let path = metrics_file.map(std::path::PathBuf::from);
+            tui::run(path)?;
         }
     }
 
