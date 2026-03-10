@@ -200,6 +200,32 @@ impl JobsTab {
     pub fn selected_job(&self) -> Option<&JobEntry> {
         self.table_state.selected().and_then(|i| self.jobs.get(i))
     }
+
+    pub fn scroll_log_down(&mut self) {
+        if let Some(job) = self.selected_job() {
+            if self.log_scroll + 1 < job.log_lines.len() {
+                self.log_scroll += 1;
+            }
+        }
+    }
+
+    pub fn scroll_log_up(&mut self) {
+        self.log_scroll = self.log_scroll.saturating_sub(1);
+    }
+
+    /// Append a line of live output from a running job.
+    pub fn append_live_output(&mut self, job_id: &str, line: &str) {
+        // Find the job index first to avoid borrow conflicts
+        let job_idx = self.jobs.iter().position(|j| j.id == *job_id);
+        let Some(idx) = job_idx else { return };
+
+        self.jobs[idx].log_lines.push(line.to_string());
+
+        // Auto-scroll if viewing this job
+        if self.table_state.selected() == Some(idx) {
+            self.log_scroll = self.jobs[idx].log_lines.len().saturating_sub(1);
+        }
+    }
 }
 
 impl Widget for &mut JobsTab {
