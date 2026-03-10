@@ -995,6 +995,9 @@ impl TrainingLoop {
                     if !self.callbacks.is_empty() {
                         let step_metrics = pmetal_core::StepMetrics {
                             step: self.step,
+                            epoch,
+                            total_epochs: num_epochs,
+                            total_steps: max_steps.unwrap_or(0),
                             loss: self.running_loss,
                             lr: stats.learning_rate as f64,
                             tok_sec: tokens_per_sec,
@@ -1182,6 +1185,9 @@ impl TrainingLoop {
                 if !self.callbacks.is_empty() {
                     let step_metrics = pmetal_core::StepMetrics {
                         step: stats.step,
+                        epoch,
+                        total_epochs: num_epochs,
+                        total_steps: max_steps.unwrap_or(0),
                         loss: stats.loss as f64,
                         lr: stats.learning_rate as f64,
                         tok_sec: tokens_per_sec,
@@ -1640,6 +1646,9 @@ impl TrainingLoop {
                     if !self.callbacks.is_empty() {
                         let step_metrics = pmetal_core::StepMetrics {
                             step: self.step,
+                            epoch,
+                            total_epochs: num_epochs,
+                            total_steps: max_steps.unwrap_or(0),
                             loss: self.running_loss,
                             lr: self.get_learning_rate() as f64,
                             tok_sec: tokens_per_sec,
@@ -1903,6 +1912,9 @@ impl TrainingLoop {
                     if !self.callbacks.is_empty() {
                         let step_metrics = pmetal_core::StepMetrics {
                             step: self.step,
+                            epoch,
+                            total_epochs: num_epochs,
+                            total_steps: max_steps.unwrap_or(0),
                             loss: self.running_loss,
                             lr,
                             tok_sec: tokens_per_sec,
@@ -2156,6 +2168,9 @@ impl TrainingLoop {
                     if !self.callbacks.is_empty() {
                         let step_metrics = pmetal_core::StepMetrics {
                             step: self.step,
+                            epoch,
+                            total_epochs: num_epochs,
+                            total_steps: max_steps.unwrap_or(0),
                             loss: self.running_loss,
                             lr: self.get_learning_rate() as f64,
                             tok_sec: tokens_per_sec,

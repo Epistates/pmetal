@@ -67,6 +67,12 @@ pub enum ChatTemplateType {
     /// GPT-OSS Harmony format: <|start|>role<|message|>content<|end|>
     /// OpenAI's first open-weight models with multi-channel support.
     GptOss,
+    /// Llama-4 format: <|header_start|>role<|header_end|>content<|eot|>
+    Llama4,
+    /// DeepSeek format: <｜User｜>content<｜end▁of▁sentence｜>
+    DeepSeek,
+    /// Cohere Command R format: <|START_OF_TURN_TOKEN|><|USER_TOKEN|>content<|END_OF_TURN_TOKEN|>
+    Cohere,
     /// Custom template defined by user
     Custom,
 }
@@ -85,6 +91,9 @@ impl ChatTemplateType {
             Self::Vicuna => "</s>",
             Self::Zephyr => "</s>",
             Self::GptOss => "<|return|>",
+            Self::Llama4 => "<|eot|>",
+            Self::DeepSeek => "<｜end▁of▁sentence｜>",
+            Self::Cohere => "<|END_OF_TURN_TOKEN|>",
             Self::Custom => "</s>",
         }
     }
@@ -94,6 +103,9 @@ impl ChatTemplateType {
         match self {
             Self::Llama2 => Some("<s>"),
             Self::Llama3 => Some("<|begin_of_text|>"),
+            Self::Llama4 => Some("<|begin_of_text|>"),
+            Self::DeepSeek => Some("<｜begin▁of▁sentence｜>"),
+            Self::Cohere => Some("<BOS_TOKEN>"),
             _ => None,
         }
     }
@@ -150,7 +162,11 @@ impl ChatTemplate {
             eos_token: template_type.eos_token().to_string(),
             add_bos: matches!(
                 template_type,
-                ChatTemplateType::Llama2 | ChatTemplateType::Llama3
+                ChatTemplateType::Llama2
+                    | ChatTemplateType::Llama3
+                    | ChatTemplateType::Llama4
+                    | ChatTemplateType::DeepSeek
+                    | ChatTemplateType::Cohere
             ),
             add_eos: true,
         }
@@ -215,6 +231,25 @@ impl ChatTemplate {
         template
     }
 
+    /// Create a Llama-4 template.
+    pub fn llama4() -> Self {
+        let mut template = Self::new(ChatTemplateType::Llama4);
+        template.bos_token = Some("<|begin_of_text|>".to_string());
+        template
+    }
+
+    /// Create a DeepSeek template.
+    pub fn deepseek() -> Self {
+        Self::new(ChatTemplateType::DeepSeek)
+    }
+
+    /// Create a Cohere Command R template.
+    pub fn cohere() -> Self {
+        let mut template = Self::new(ChatTemplateType::Cohere);
+        template.bos_token = Some("<BOS_TOKEN>".to_string());
+        template
+    }
+
     /// Set the default system message.
     pub fn with_system_message(mut self, message: impl Into<String>) -> Self {
         self.default_system_message = Some(message.into());
@@ -250,6 +285,9 @@ impl ChatTemplate {
             ChatTemplateType::Vicuna => self.format_vicuna(messages),
             ChatTemplateType::Zephyr => self.format_zephyr(messages),
             ChatTemplateType::GptOss => self.format_gpt_oss(messages),
+            ChatTemplateType::Llama4 => self.format_llama4(messages),
+            ChatTemplateType::DeepSeek => self.format_deepseek(messages),
+            ChatTemplateType::Cohere => self.format_cohere(messages),
             ChatTemplateType::Custom => self.format_chatml(messages), // Fallback
         }
     }
@@ -812,6 +850,163 @@ impl ChatTemplate {
             template_type: self.template_type,
         }
     }
+
+    /// Format using Llama-4 format.
+    ///
+    /// Llama 4 uses different header tokens than Llama 3:
+    /// - `<|header_start|>` / `<|header_end|>` (not `<|start_header_id|>` / `<|end_header_id|>`)
+    /// - `<|eot|>` (not `<|eot_id|>`)
+    fn format_llama4(&self, messages: &[Message]) -> FormattedChat {
+        let mut text = String::new();
+        let mut response_start = 0;
+
+        if self.add_bos {
+            text.push_str("<|begin_of_text|>");
+        }
+
+        let has_system = messages.iter().any(|m| m.role == "system");
+        let all_messages: Vec<Message> = if !has_system {
+            if let Some(ref system_msg) = self.default_system_message {
+                let mut msgs = vec![Message::system(system_msg.clone())];
+                msgs.extend(messages.iter().cloned());
+                msgs
+            } else {
+                messages.to_vec()
+            }
+        } else {
+            messages.to_vec()
+        };
+
+        for (i, msg) in all_messages.iter().enumerate() {
+            let formatted = format!(
+                "<|header_start|>{}<|header_end|>\n\n{}<|eot|>",
+                msg.role,
+                msg.content.trim()
+            );
+
+            if msg.role == "assistant" && i == all_messages.len() - 1 {
+                let header = format!("<|header_start|>{}<|header_end|>\n\n", msg.role);
+                response_start = text.len() + header.len();
+            }
+
+            text.push_str(&formatted);
+        }
+
+        if let Some(last) = all_messages.last() {
+            if last.role == "user" {
+                text.push_str("<|header_start|>assistant<|header_end|>\n\n");
+                response_start = text.len();
+            }
+        }
+
+        FormattedChat {
+            text,
+            response_start,
+            template_type: self.template_type,
+        }
+    }
+
+    /// Format using DeepSeek format.
+    ///
+    /// DeepSeek uses full-width unicode pipe characters (U+FF5C) and
+    /// lower-one-eighth-block (U+2581) for underscores in token names.
+    fn format_deepseek(&self, messages: &[Message]) -> FormattedChat {
+        let mut text = String::new();
+        let mut response_start = 0;
+
+        if self.add_bos {
+            text.push_str("<｜begin▁of▁sentence｜>");
+        }
+
+        for (i, msg) in messages.iter().enumerate() {
+            match msg.role.as_str() {
+                "system" => {
+                    text.push_str(&msg.content);
+                }
+                "user" => {
+                    text.push_str("<｜User｜>");
+                    text.push_str(&msg.content);
+                }
+                "assistant" => {
+                    text.push_str("<｜Assistant｜>");
+                    if i == messages.len() - 1 {
+                        response_start = text.len();
+                    }
+                    text.push_str(&msg.content);
+                    if i < messages.len() - 1 {
+                        text.push_str("<｜end▁of▁sentence｜>");
+                    }
+                }
+                _ => {
+                    text.push_str("<｜User｜>");
+                    text.push_str(&msg.content);
+                }
+            }
+        }
+
+        if let Some(last) = messages.last() {
+            if last.role == "user" {
+                text.push_str("<｜Assistant｜>");
+                response_start = text.len();
+            }
+        }
+
+        if self.add_eos && !text.ends_with("<｜end▁of▁sentence｜>") {
+            text.push_str("<｜end▁of▁sentence｜>");
+        }
+
+        FormattedChat {
+            text,
+            response_start,
+            template_type: self.template_type,
+        }
+    }
+
+    /// Format using Cohere Command R format.
+    ///
+    /// Uses `<|START_OF_TURN_TOKEN|>`, `<|USER_TOKEN|>`, `<|CHATBOT_TOKEN|>`,
+    /// and `<|END_OF_TURN_TOKEN|>` tokens.
+    fn format_cohere(&self, messages: &[Message]) -> FormattedChat {
+        let mut text = String::new();
+        let mut response_start = 0;
+
+        if self.add_bos {
+            if let Some(ref bos) = self.bos_token {
+                text.push_str(bos);
+            }
+        }
+
+        for (i, msg) in messages.iter().enumerate() {
+            let role_token = match msg.role.as_str() {
+                "system" => "<|SYSTEM_TOKEN|>",
+                "user" => "<|USER_TOKEN|>",
+                "assistant" => "<|CHATBOT_TOKEN|>",
+                _ => "<|USER_TOKEN|>",
+            };
+
+            text.push_str("<|START_OF_TURN_TOKEN|>");
+            text.push_str(role_token);
+            text.push_str(&msg.content);
+            text.push_str("<|END_OF_TURN_TOKEN|>");
+
+            if msg.role == "assistant" && i == messages.len() - 1 {
+                response_start = text.len() - msg.content.len() - "<|END_OF_TURN_TOKEN|>".len();
+            }
+        }
+
+        if let Some(last) = messages.last() {
+            if last.role == "user" {
+                text.push_str("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>");
+                response_start = text.len();
+            }
+        }
+
+        FormattedChat {
+            text,
+            response_start,
+            template_type: self.template_type,
+        }
+    }
 }
 
 /// Detect the appropriate chat template by inspecting the model's `tokenizer_config.json` Jinja
@@ -897,9 +1092,21 @@ fn detect_template_from_jinja(jinja: &str) -> Option<ChatTemplate> {
     if jinja.contains("<|im_start|>") && jinja.contains("<|im_sep|>") {
         return Some(ChatTemplate::new(ChatTemplateType::Phi4));
     }
+    // DeepSeek: full-width unicode pipe character ｜ (U+FF5C)
+    if jinja.contains("｜") || jinja.contains("<｜") {
+        return Some(ChatTemplate::deepseek());
+    }
+    // Cohere Command R: <|START_OF_TURN_TOKEN|>
+    if jinja.contains("<|START_OF_TURN_TOKEN|>") || jinja.contains("<|CHATBOT_TOKEN|>") {
+        return Some(ChatTemplate::cohere());
+    }
     // ChatML / Qwen: <|im_start|> without <|im_sep|>
     if jinja.contains("<|im_start|>") {
         return Some(ChatTemplate::chatml());
+    }
+    // Llama-4: <|header_start|> (must check before Llama-3's <|start_header_id|>)
+    if jinja.contains("<|header_start|>") {
+        return Some(ChatTemplate::llama4());
     }
     // Llama-3: <|begin_of_text|> or <|start_header_id|>
     if jinja.contains("<|begin_of_text|>") || jinja.contains("<|start_header_id|>") {
@@ -948,6 +1155,15 @@ pub fn detect_template_from_model(model_name: &str) -> ChatTemplate {
         || name_lower.contains("harmony")
     {
         ChatTemplate::gpt_oss()
+    } else if name_lower.contains("deepseek") {
+        ChatTemplate::deepseek()
+    } else if name_lower.contains("cohere")
+        || name_lower.contains("command-r")
+        || name_lower.contains("command_r")
+    {
+        ChatTemplate::cohere()
+    } else if name_lower.contains("llama-4") || name_lower.contains("llama4") {
+        ChatTemplate::llama4()
     } else if name_lower.contains("llama-3") || name_lower.contains("llama3") {
         ChatTemplate::llama3()
     } else if name_lower.contains("llama-2") || name_lower.contains("llama2") {

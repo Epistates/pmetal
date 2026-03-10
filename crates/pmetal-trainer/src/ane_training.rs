@@ -151,6 +151,9 @@ impl AneTrainingLoop {
             let tok_sec = self.state.tokens_processed as f64 / self.state.elapsed_secs.max(0.001);
             let metrics = StepMetrics {
                 step: batch_idx,
+                epoch: 0,
+                total_epochs: 1,
+                total_steps: max_steps,
                 loss: loss as f64,
                 lr: self.config.trainer.learning_rate as f64,
                 tok_sec,

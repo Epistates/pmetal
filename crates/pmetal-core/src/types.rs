@@ -217,6 +217,12 @@ impl TrainingState {
 pub struct StepMetrics {
     /// Step number.
     pub step: usize,
+    /// Current epoch (0-indexed).
+    pub epoch: usize,
+    /// Total number of epochs.
+    pub total_epochs: usize,
+    /// Total number of training steps (if known).
+    pub total_steps: usize,
     /// Loss value.
     pub loss: f64,
     /// Learning rate.
