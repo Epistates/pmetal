@@ -5,7 +5,7 @@ use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Gauge, Paragraph, Widget, Wrap};
 
-use crate::tui::theme::{gauge_color, THEME};
+use crate::tui::theme::{THEME, gauge_color};
 use crate::tui::widgets::KeyValueList;
 use crate::tui::widgets::key_value::KvPair;
 
@@ -115,8 +115,7 @@ impl Widget for &DeviceTab {
             Layout::vertical([Constraint::Percentage(55), Constraint::Percentage(45)]).areas(area);
 
         let [gpu_area, features_area] =
-            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
-                .areas(top);
+            Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)]).areas(top);
 
         let [memory_area, tuning_area] =
             Layout::horizontal([Constraint::Percentage(50), Constraint::Percentage(50)])
@@ -150,19 +149,31 @@ impl DeviceTab {
             KvPair::new("Device", &dev.name),
             KvPair::new("GPU Family", &dev.gpu_family),
             KvPair::new("Tier", &dev.device_tier),
-            KvPair::new("Unified Memory", if dev.has_unified_memory { "Yes" } else { "No" }),
-            KvPair::new("Max Threads/TG", dev.max_threads_per_threadgroup.to_string()),
+            KvPair::new(
+                "Unified Memory",
+                if dev.has_unified_memory { "Yes" } else { "No" },
+            ),
+            KvPair::new(
+                "Max Threads/TG",
+                dev.max_threads_per_threadgroup.to_string(),
+            ),
             KvPair::new(
                 "TG Memory",
                 format!("{} KB", dev.max_threadgroup_memory / 1024),
             ),
             KvPair::new(
                 "Working Set",
-                format!("{:.1} GB", dev.recommended_working_set as f64 / (1024.0 * 1024.0 * 1024.0)),
+                format!(
+                    "{:.1} GB",
+                    dev.recommended_working_set as f64 / (1024.0 * 1024.0 * 1024.0)
+                ),
             ),
             KvPair::new(
                 "Max Buffer",
-                format!("{:.1} GB", dev.max_buffer_length as f64 / (1024.0 * 1024.0 * 1024.0)),
+                format!(
+                    "{:.1} GB",
+                    dev.max_buffer_length as f64 / (1024.0 * 1024.0 * 1024.0)
+                ),
             ),
         ];
 
@@ -219,10 +230,7 @@ impl DeviceTab {
             let row = Rect::new(inner.x, inner.y + y_offset, inner.width, 1);
             Line::from(vec![
                 Span::styled("Batch Multiplier: ", THEME.kv_key),
-                Span::styled(
-                    format!("{}x", dev.batch_size_multiplier),
-                    THEME.kv_value,
-                ),
+                Span::styled(format!("{}x", dev.batch_size_multiplier), THEME.kv_value),
             ])
             .render(row, buf);
         }
@@ -263,7 +271,11 @@ impl DeviceTab {
             ratio * 100.0
         );
         Gauge::default()
-            .block(Block::default().title("Used").title_style(THEME.gauge_label))
+            .block(
+                Block::default()
+                    .title("Used")
+                    .title_style(THEME.gauge_label),
+            )
             .gauge_style(gauge_color(ratio))
             .ratio(ratio.clamp(0.0, 1.0))
             .label(gauge_label)
@@ -276,7 +288,12 @@ impl DeviceTab {
             KvPair::new("Available", format!("{:.2}", mem.available_gb)).with_unit("GB"),
             KvPair::new("Peak", format!("{:.2}", mem.peak_gb)).with_unit("GB"),
         ];
-        let stats_inner = Rect::new(stats_area.x, stats_area.y + 1, stats_area.width, stats_area.height.saturating_sub(1));
+        let stats_inner = Rect::new(
+            stats_area.x,
+            stats_area.y + 1,
+            stats_area.width,
+            stats_area.height.saturating_sub(1),
+        );
         KeyValueList::new(&pairs).render(stats_inner, buf);
     }
 
@@ -327,12 +344,10 @@ impl DeviceTab {
                 ),
             ]),
             Line::from(""),
-            Line::from(vec![
-                Span::styled(
-                    "Tuning is tier-based. See docs/hardware-support.md",
-                    THEME.text_muted,
-                ),
-            ]),
+            Line::from(vec![Span::styled(
+                "Tuning is tier-based. See docs/hardware-support.md",
+                THEME.text_muted,
+            )]),
         ];
 
         Paragraph::new(lines)

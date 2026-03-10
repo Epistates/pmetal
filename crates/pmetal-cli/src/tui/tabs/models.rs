@@ -7,8 +7,8 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Scrollbar,
-    ScrollbarOrientation, ScrollbarState, StatefulWidget, Table, TableState, Widget, Wrap,
+    Block, Borders, Cell, HighlightSpacing, Paragraph, Row, Scrollbar, ScrollbarOrientation,
+    ScrollbarState, StatefulWidget, Table, TableState, Widget, Wrap,
 };
 
 use crate::tui::theme::THEME;
@@ -227,19 +227,17 @@ impl ModelsTab {
             // Find the latest snapshot
             let snapshots_dir = path.join("snapshots");
             let snapshot_path = if snapshots_dir.exists() {
-                std::fs::read_dir(&snapshots_dir)
-                    .ok()
-                    .and_then(|entries| {
-                        entries
-                            .flatten()
-                            .filter(|e| e.path().is_dir())
-                            .max_by_key(|e| {
-                                e.metadata()
-                                    .and_then(|m| m.modified())
-                                    .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
-                            })
-                            .map(|e| e.path())
-                    })
+                std::fs::read_dir(&snapshots_dir).ok().and_then(|entries| {
+                    entries
+                        .flatten()
+                        .filter(|e| e.path().is_dir())
+                        .max_by_key(|e| {
+                            e.metadata()
+                                .and_then(|m| m.modified())
+                                .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                        })
+                        .map(|e| e.path())
+                })
             } else {
                 None
             };
@@ -679,8 +677,7 @@ fn estimate_params(config: &serde_json::Value) -> Option<String> {
 }
 
 fn detect_weight_format(path: &std::path::Path) -> Option<String> {
-    if path.join("model.safetensors").exists()
-        || path.join("model.safetensors.index.json").exists()
+    if path.join("model.safetensors").exists() || path.join("model.safetensors.index.json").exists()
     {
         Some("SafeTensors".to_string())
     } else if path.join("pytorch_model.bin").exists() {
@@ -689,11 +686,7 @@ fn detect_weight_format(path: &std::path::Path) -> Option<String> {
         let has_shards = std::fs::read_dir(path)
             .ok()?
             .flatten()
-            .any(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .ends_with(".safetensors")
-            });
+            .any(|e| e.file_name().to_string_lossy().ends_with(".safetensors"));
         if has_shards {
             Some("SafeTensors (sharded)".to_string())
         } else {

@@ -58,10 +58,7 @@ pub enum Modal {
         list_state: ListState,
     },
     /// Error display.
-    Error {
-        title: String,
-        message: String,
-    },
+    Error { title: String, message: String },
     /// Progress indicator for ongoing operations.
     Progress {
         title: String,
@@ -152,9 +149,7 @@ impl Modal {
                     None
                 }
                 KeyCode::Char('y') | KeyCode::Char('Y') => Some(ModalAction::Confirmed),
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => {
-                    Some(ModalAction::None)
-                }
+                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc => Some(ModalAction::None),
                 KeyCode::Enter => {
                     if *selected {
                         Some(ModalAction::Confirmed)
@@ -165,9 +160,7 @@ impl Modal {
                 _ => None,
             },
 
-            Modal::TextInput {
-                value, cursor, ..
-            } => match key.code {
+            Modal::TextInput { value, cursor, .. } => match key.code {
                 KeyCode::Char(c) => {
                     value.insert(*cursor, c);
                     *cursor += c.len_utf8();
@@ -291,9 +284,7 @@ impl Modal {
                 KeyCode::Up | KeyCode::Char('k') => {
                     let count = datasets.len();
                     if count > 0 {
-                        let i = list_state
-                            .selected()
-                            .map_or(0, |i| (i + count - 1) % count);
+                        let i = list_state.selected().map_or(0, |i| (i + count - 1) % count);
                         list_state.select(Some(i));
                     }
                     None
@@ -595,8 +586,11 @@ fn render_error(area: Rect, buf: &mut Buffer, title: &str, message: &str) {
         .wrap(Wrap { trim: false })
         .render(msg_area, buf);
 
-    Line::from(Span::styled("Press Enter or Esc to close", THEME.text_muted))
-        .render(help_area, buf);
+    Line::from(Span::styled(
+        "Press Enter or Esc to close",
+        THEME.text_muted,
+    ))
+    .render(help_area, buf);
 }
 
 fn render_progress(area: Rect, buf: &mut Buffer, title: &str, message: &str, progress: f64) {

@@ -242,8 +242,7 @@ async fn run_command(
                     }
 
                     // Also check "---\n" at the very start (no leading newline)
-                    if accum.starts_with("---\n") {
-                        let after = &accum["---\n".len()..];
+                    if let Some(after) = accum.strip_prefix("---\n") {
                         if let Some(stats_line) = after.lines().next() {
                             let (total_tokens, tok_sec) = parse_inference_stats(stats_line);
                             let _ = tx_out.send(AppMsg::InferenceDone {
@@ -270,9 +269,7 @@ async fn run_command(
 
                 // Send any remaining content
                 if !accum.is_empty() && !accum.starts_with("---") {
-                    let _ = tx_out.send(AppMsg::InferenceToken {
-                        token: accum,
-                    });
+                    let _ = tx_out.send(AppMsg::InferenceToken { token: accum });
                 }
 
                 if !got_stats {
@@ -309,12 +306,12 @@ async fn run_command(
                 // For inference, send errors as InferenceError
                 if is_inference && !line.is_empty() {
                     // Skip tracing/debug lines (they start with timestamp or level)
-                    let is_tracing = line.contains("INFO") || line.contains("DEBUG")
-                        || line.contains("TRACE") || line.contains("WARN");
+                    let is_tracing = line.contains("INFO")
+                        || line.contains("DEBUG")
+                        || line.contains("TRACE")
+                        || line.contains("WARN");
                     if !is_tracing {
-                        let _ = tx_err.send(AppMsg::InferenceError {
-                            message: line,
-                        });
+                        let _ = tx_err.send(AppMsg::InferenceError { message: line });
                         continue;
                     }
                 }

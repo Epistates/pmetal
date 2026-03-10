@@ -104,7 +104,11 @@ impl JobsTab {
                     continue;
                 }
 
-                let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                let name = path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
 
                 // Try to read training metadata
                 let (model, method, final_loss) = read_training_meta(&path);
@@ -191,7 +195,10 @@ impl JobsTab {
         if count == 0 {
             return;
         }
-        let i = self.table_state.selected().map_or(0, |i| (i + count - 1) % count);
+        let i = self
+            .table_state
+            .selected()
+            .map_or(0, |i| (i + count - 1) % count);
         self.table_state.select(Some(i));
         self.scrollbar_state = self.scrollbar_state.position(i);
         self.log_scroll = 0;
@@ -231,8 +238,7 @@ impl JobsTab {
 impl Widget for &mut JobsTab {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let [table_area, detail_area] =
-            Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)])
-                .areas(area);
+            Layout::vertical([Constraint::Percentage(40), Constraint::Percentage(60)]).areas(area);
 
         self.render_table(table_area, buf);
         self.render_detail(detail_area, buf);
@@ -399,9 +405,7 @@ impl JobsTab {
     }
 }
 
-fn read_training_meta(
-    path: &std::path::Path,
-) -> (Option<String>, Option<String>, Option<f64>) {
+fn read_training_meta(path: &std::path::Path) -> (Option<String>, Option<String>, Option<f64>) {
     let config_path = path.join("adapter_config.json");
     if let Ok(content) = std::fs::read_to_string(&config_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {

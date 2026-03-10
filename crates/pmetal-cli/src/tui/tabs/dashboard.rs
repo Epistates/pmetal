@@ -15,7 +15,7 @@ use ratatui::widgets::{
     Widget,
 };
 
-use crate::tui::theme::{palette, THEME};
+use crate::tui::theme::{THEME, palette};
 
 /// A single metric sample from the training log.
 #[derive(Debug, Clone)]
@@ -103,8 +103,7 @@ impl DashboardTab {
         }
 
         let mut reader = std::io::BufReader::new(file);
-        if std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(self.last_read_pos)).is_err()
-        {
+        if std::io::Seek::seek(&mut reader, std::io::SeekFrom::Start(self.last_read_pos)).is_err() {
             return;
         }
 
@@ -160,8 +159,7 @@ impl Widget for &DashboardTab {
             Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)]).areas(area);
 
         let [chart_area, stats_area] =
-            Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)])
-                .areas(top);
+            Layout::horizontal([Constraint::Percentage(65), Constraint::Percentage(35)]).areas(top);
 
         let [throughput_area, timing_area] =
             Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)])
@@ -198,16 +196,26 @@ impl DashboardTab {
             return;
         }
 
-        let min_loss = self.loss_data.iter().map(|(_, y)| *y).fold(f64::MAX, f64::min);
-        let max_loss = self.loss_data.iter().map(|(_, y)| *y).fold(f64::MIN, f64::max);
+        let min_loss = self
+            .loss_data
+            .iter()
+            .map(|(_, y)| *y)
+            .fold(f64::MAX, f64::min);
+        let max_loss = self
+            .loss_data
+            .iter()
+            .map(|(_, y)| *y)
+            .fold(f64::MIN, f64::max);
         let max_step = self.loss_data.last().map(|(x, _)| *x).unwrap_or(1.0);
 
-        let datasets = vec![Dataset::default()
-            .name("loss")
-            .marker(symbols::Marker::Braille)
-            .graph_type(GraphType::Line)
-            .style(palette::CHART_1)
-            .data(&self.loss_data)];
+        let datasets = vec![
+            Dataset::default()
+                .name("loss")
+                .marker(symbols::Marker::Braille)
+                .graph_type(GraphType::Line)
+                .style(palette::CHART_1)
+                .data(&self.loss_data),
+        ];
 
         // Avoid zero-width Y axis when all loss values are identical
         let y_range = (max_loss - min_loss).max(0.001);
@@ -247,9 +255,11 @@ impl DashboardTab {
 
         let items: Vec<ListItem> = if let Some(last) = self.samples.last() {
             let loss_trend = if self.samples.len() >= 10 {
-                let recent_avg: f64 =
-                    self.samples[self.samples.len() - 5..].iter().map(|s| s.loss).sum::<f64>()
-                        / 5.0;
+                let recent_avg: f64 = self.samples[self.samples.len() - 5..]
+                    .iter()
+                    .map(|s| s.loss)
+                    .sum::<f64>()
+                    / 5.0;
                 let prev_avg: f64 = self.samples[self.samples.len() - 10..self.samples.len() - 5]
                     .iter()
                     .map(|s| s.loss)
@@ -300,7 +310,12 @@ impl DashboardTab {
                 ])),
                 ListItem::new(""),
                 {
-                    let min_loss = self.samples.iter().map(|s| s.loss).filter(|l| *l > 0.0).fold(f64::MAX, f64::min);
+                    let min_loss = self
+                        .samples
+                        .iter()
+                        .map(|s| s.loss)
+                        .filter(|l| *l > 0.0)
+                        .fold(f64::MAX, f64::min);
                     if min_loss < f64::MAX {
                         ListItem::new(Line::from(vec![
                             Span::styled("Min loss:", THEME.kv_key),
@@ -314,12 +329,25 @@ impl DashboardTab {
                     }
                 },
                 {
-                    let valid: Vec<f64> = self.samples.iter().map(|s| s.loss).filter(|l| *l > 0.0).collect();
-                    let avg = if valid.is_empty() { 0.0 } else { valid.iter().sum::<f64>() / valid.len() as f64 };
+                    let valid: Vec<f64> = self
+                        .samples
+                        .iter()
+                        .map(|s| s.loss)
+                        .filter(|l| *l > 0.0)
+                        .collect();
+                    let avg = if valid.is_empty() {
+                        0.0
+                    } else {
+                        valid.iter().sum::<f64>() / valid.len() as f64
+                    };
                     ListItem::new(Line::from(vec![
                         Span::styled("Avg loss:", THEME.kv_key),
                         Span::styled(
-                            if valid.is_empty() { " —".to_string() } else { format!(" {:.4}", avg) },
+                            if valid.is_empty() {
+                                " —".to_string()
+                            } else {
+                                format!(" {:.4}", avg)
+                            },
                             THEME.text_dim,
                         ),
                     ]))
@@ -456,8 +484,10 @@ impl DashboardTab {
 
             // Show avg step time over recent samples
             if self.samples.len() >= 5 {
-                let recent: Vec<&MetricSample> =
-                    self.samples[self.samples.len().saturating_sub(10)..].iter().collect();
+                let recent: Vec<&MetricSample> = self.samples
+                    [self.samples.len().saturating_sub(10)..]
+                    .iter()
+                    .collect();
                 let avg_ms = recent.iter().map(|s| s.total_ms).sum::<f64>() / recent.len() as f64;
                 Line::from(vec![
                     Span::styled("  Avg step:  ", THEME.kv_key),

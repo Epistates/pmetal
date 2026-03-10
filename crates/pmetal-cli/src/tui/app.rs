@@ -17,9 +17,9 @@ use ratatui::widgets::Widget;
 use crate::tui::command_runner::CommandRunner;
 use crate::tui::event::{AppMsg, CommandSpec, Event, EventHandler, JobType};
 use crate::tui::modal::{Modal, ModalAction, PickerEntry};
-use crate::tui::tabs::*;
-use crate::tui::tabs::dashboard::MetricSample;
 use crate::tui::tabs::ModelSource;
+use crate::tui::tabs::dashboard::MetricSample;
+use crate::tui::tabs::*;
 use crate::tui::theme::THEME;
 use crate::tui::widgets::{Footer, Header};
 
@@ -220,15 +220,10 @@ impl App {
             KeyCode::F(2) => {
                 self.mouse_captured = !self.mouse_captured;
                 if self.mouse_captured {
-                    let _ = crossterm::execute!(
-                        io::stdout(),
-                        crossterm::event::EnableMouseCapture
-                    );
+                    let _ = crossterm::execute!(io::stdout(), crossterm::event::EnableMouseCapture);
                 } else {
-                    let _ = crossterm::execute!(
-                        io::stdout(),
-                        crossterm::event::DisableMouseCapture
-                    );
+                    let _ =
+                        crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
                 }
                 return;
             }
@@ -280,14 +275,18 @@ impl App {
                 KeyCode::Char('d') if !self.models.searching => {
                     // Download a new model
                     self.pending_modal_context = Some(PendingModalTarget::DownloadModel);
-                    self.modal_stack
-                        .push(Modal::text_input("Download Model", "Model ID (e.g. unsloth/Qwen3-0.6B):"));
+                    self.modal_stack.push(Modal::text_input(
+                        "Download Model",
+                        "Model ID (e.g. unsloth/Qwen3-0.6B):",
+                    ));
                 }
                 KeyCode::Char('a') if !self.models.searching => {
                     // Add custom model directory
                     self.pending_modal_context = Some(PendingModalTarget::AddModelDir);
-                    self.modal_stack
-                        .push(Modal::text_input("Add Model Directory", "Path to directory containing models:"));
+                    self.modal_stack.push(Modal::text_input(
+                        "Add Model Directory",
+                        "Path to directory containing models:",
+                    ));
                 }
                 KeyCode::Char('t') if !self.models.searching => {
                     // Train with selected model → switch to Training tab with model loaded
@@ -342,14 +341,9 @@ impl App {
                                 let base_display = base.clone();
                                 let output_default = format!(
                                     "./output/{}-fused",
-                                    model
-                                        .path
-                                        .file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
+                                    model.path.file_name().unwrap_or_default().to_string_lossy()
                                 );
-                                self.pending_modal_context =
-                                    Some(PendingModalTarget::FuseStart);
+                                self.pending_modal_context = Some(PendingModalTarget::FuseStart);
                                 self.modal_stack.push(Modal::confirm(
                                     "Fuse LoRA Adapter",
                                     vec![
@@ -391,14 +385,17 @@ impl App {
                 KeyCode::Char('a') => {
                     // Add custom dataset directory
                     self.pending_modal_context = Some(PendingModalTarget::AddDatasetDir);
-                    self.modal_stack
-                        .push(Modal::text_input("Add Dataset Directory", "Path to directory containing datasets:"));
+                    self.modal_stack.push(Modal::text_input(
+                        "Add Dataset Directory",
+                        "Path to directory containing datasets:",
+                    ));
                 }
                 KeyCode::Char('c') => {
                     // Convert selected dataset to pmetal-compatible JSONL
                     if let Some(ds) = self.datasets.selected_dataset() {
                         let input_path = ds.path.display().to_string();
-                        let output_name = ds.path
+                        let output_name = ds
+                            .path
                             .file_stem()
                             .unwrap_or_default()
                             .to_string_lossy()
@@ -407,17 +404,18 @@ impl App {
                         self.pending_modal_context = Some(PendingModalTarget::ConvertDataset);
                         self.modal_stack.push(Modal::text_input(
                             "Convert Dataset",
-                            format!(
-                                "Input: {input_path}\nOutput path (JSONL):"
-                            ),
+                            format!("Input: {input_path}\nOutput path (JSONL):"),
                         ));
                         // Pre-fill the output path
-                        if let Some(Modal::TextInput { value, cursor, .. }) = self.modal_stack.last_mut() {
+                        if let Some(Modal::TextInput { value, cursor, .. }) =
+                            self.modal_stack.last_mut()
+                        {
                             *value = output_path.clone();
                             *cursor = output_path.len();
                         }
                     } else {
-                        self.modal_stack.push(Modal::error("No Dataset", "Select a dataset first."));
+                        self.modal_stack
+                            .push(Modal::error("No Dataset", "Select a dataset first."));
                     }
                 }
                 _ => {}
@@ -460,8 +458,7 @@ impl App {
                             self.modal_stack.push(Modal::model_picker(entries));
                         }
                         TrainingAction::OpenDatasetPicker => {
-                            self.pending_modal_context =
-                                Some(PendingModalTarget::TrainingDataset);
+                            self.pending_modal_context = Some(PendingModalTarget::TrainingDataset);
                             let entries = self.dataset_picker_entries();
                             self.modal_stack.push(Modal::dataset_picker(entries));
                         }
@@ -520,9 +517,7 @@ impl App {
                     self.inference.generating = false;
                 }
             }
-            KeyCode::Char('s')
-                if key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 // Toggle settings focus
                 self.inference.toggle_settings_focus();
             }
@@ -604,20 +599,17 @@ impl App {
                 if let Some(action) = self.distillation.handle_enter() {
                     match action {
                         DistillAction::OpenTeacherPicker => {
-                            self.pending_modal_context =
-                                Some(PendingModalTarget::DistillTeacher);
+                            self.pending_modal_context = Some(PendingModalTarget::DistillTeacher);
                             let entries = self.model_picker_entries();
                             self.modal_stack.push(Modal::model_picker(entries));
                         }
                         DistillAction::OpenStudentPicker => {
-                            self.pending_modal_context =
-                                Some(PendingModalTarget::DistillStudent);
+                            self.pending_modal_context = Some(PendingModalTarget::DistillStudent);
                             let entries = self.model_picker_entries();
                             self.modal_stack.push(Modal::model_picker(entries));
                         }
                         DistillAction::OpenDatasetPicker => {
-                            self.pending_modal_context =
-                                Some(PendingModalTarget::DistillDataset);
+                            self.pending_modal_context = Some(PendingModalTarget::DistillDataset);
                             let entries = self.dataset_picker_entries();
                             self.modal_stack.push(Modal::dataset_picker(entries));
                         }
@@ -711,17 +703,15 @@ impl App {
                     _ => {}
                 }
             }
-            MouseEventKind::ScrollDown => {
-                match self.active_tab {
-                    Tab::Models => self.models.next_row(),
-                    Tab::Datasets => self.datasets.next_row(),
-                    Tab::Training => self.training.next_param(),
-                    Tab::Jobs => self.jobs.next_row(),
-                    Tab::Distillation => self.distillation.next_param(),
-                    Tab::Grpo => self.grpo.next_param(),
-                    _ => {}
-                }
-            }
+            MouseEventKind::ScrollDown => match self.active_tab {
+                Tab::Models => self.models.next_row(),
+                Tab::Datasets => self.datasets.next_row(),
+                Tab::Training => self.training.next_param(),
+                Tab::Jobs => self.jobs.next_row(),
+                Tab::Distillation => self.distillation.next_param(),
+                Tab::Grpo => self.grpo.next_param(),
+                _ => {}
+            },
             _ => {}
         }
     }
@@ -729,7 +719,10 @@ impl App {
     /// Handle a message from a background process.
     fn handle_app_msg(&mut self, msg: AppMsg) {
         match msg {
-            AppMsg::JobStarted { job_id: _, job_type } => match job_type {
+            AppMsg::JobStarted {
+                job_id: _,
+                job_type,
+            } => match job_type {
                 JobType::Train | JobType::Distill | JobType::Grpo => {
                     self.training.set_status_running(0, 0, 0, 0, 0.0);
                 }
@@ -816,7 +809,8 @@ impl App {
                 if matches!(self.modal_stack.last(), Some(Modal::Progress { .. })) {
                     self.modal_stack.pop();
                     if !success {
-                        self.modal_stack.push(Modal::error("Job Failed", message.clone()));
+                        self.modal_stack
+                            .push(Modal::error("Job Failed", message.clone()));
                     }
                     // Rescan datasets in case a conversion produced new files
                     self.datasets.scan_datasets();
@@ -922,7 +916,7 @@ impl App {
                     }
 
                     // Check if this is a LoRA adapter without base model info
-                    let needs_base = model.as_ref().map_or(false, |m| {
+                    let needs_base = model.as_ref().is_some_and(|m| {
                         is_lora_adapter(&m.path) && m.base_model.is_none()
                     });
 
@@ -963,16 +957,13 @@ impl App {
                 Some(PendingModalTarget::FuseBaseModel(adapter_id)) => {
                     // User picked a base model for fusing — store it and confirm
                     let model_path = self.resolve_model_path(&id);
-                    if let Some(entry) =
-                        self.models.models.iter_mut().find(|m| m.id == adapter_id)
+                    if let Some(entry) = self.models.models.iter_mut().find(|m| m.id == adapter_id)
                     {
                         entry.base_model = Some(id.clone());
                         write_training_info(&entry.path, &id, &model_path);
                     }
                     // Now show fuse confirmation
-                    let adapter_name = adapter_id
-                        .strip_prefix("trained/")
-                        .unwrap_or(&adapter_id);
+                    let adapter_name = adapter_id.strip_prefix("trained/").unwrap_or(&adapter_id);
                     let output_default = format!("./output/{adapter_name}--fused");
                     self.pending_modal_context = Some(PendingModalTarget::FuseStart);
                     self.modal_stack.push(Modal::confirm(
@@ -1012,8 +1003,10 @@ impl App {
                     if path.is_dir() {
                         self.models.add_custom_dir(path);
                     } else {
-                        self.modal_stack
-                            .push(Modal::error("Invalid Path", format!("'{}' is not a directory.", text)));
+                        self.modal_stack.push(Modal::error(
+                            "Invalid Path",
+                            format!("'{}' is not a directory.", text),
+                        ));
                     }
                 }
                 Some(PendingModalTarget::AddDatasetDir) => {
@@ -1021,8 +1014,10 @@ impl App {
                     if path.is_dir() {
                         self.datasets.add_custom_dir(path);
                     } else {
-                        self.modal_stack
-                            .push(Modal::error("Invalid Path", format!("'{}' is not a directory.", text)));
+                        self.modal_stack.push(Modal::error(
+                            "Invalid Path",
+                            format!("'{}' is not a directory.", text),
+                        ));
                     }
                 }
                 Some(PendingModalTarget::ConvertDataset) => {
@@ -1305,21 +1300,15 @@ impl App {
         }
 
         let Some(model_id) = self.inference.model_id.clone() else {
-            self.modal_stack.push(Modal::error(
-                "No Model",
-                "Select a model first (Ctrl+P).",
-            ));
+            self.modal_stack
+                .push(Modal::error("No Model", "Select a model first (Ctrl+P)."));
             // Put the input back
             self.inference.set_input(&prompt);
             return;
         };
 
         // Resolve model: for LoRA adapters, pass base model + --lora; for others, pass path
-        let model_entry = self
-            .models
-            .models
-            .iter()
-            .find(|m| m.id == model_id);
+        let model_entry = self.models.models.iter().find(|m| m.id == model_id);
 
         let model_arg = model_entry
             .map(|m| m.path.display().to_string())
@@ -1375,7 +1364,10 @@ impl App {
         args.push("--show-thinking".to_string());
 
         if self.inference.temperature > 0.0 {
-            args.extend(["--temperature".to_string(), self.inference.temperature.to_string()]);
+            args.extend([
+                "--temperature".to_string(),
+                self.inference.temperature.to_string(),
+            ]);
         }
         if self.inference.top_k > 0 {
             args.extend(["--top-k".to_string(), self.inference.top_k.to_string()]);
@@ -1506,14 +1498,22 @@ impl App {
             Tab::Models => (&mut self.models).render(content_area, buf),
             Tab::Datasets => (&mut self.datasets).render(content_area, buf),
             Tab::Training => {
-                self.training
-                    .render_with_metrics(content_area, buf, &dash_samples, &dash_throughput);
+                self.training.render_with_metrics(
+                    content_area,
+                    buf,
+                    &dash_samples,
+                    &dash_throughput,
+                );
             }
             Tab::Inference => (&mut self.inference).render(content_area, buf),
             Tab::Jobs => (&mut self.jobs).render(content_area, buf),
             Tab::Distillation => {
-                self.distillation
-                    .render_with_metrics(content_area, buf, &dash_samples, &dash_throughput);
+                self.distillation.render_with_metrics(
+                    content_area,
+                    buf,
+                    &dash_samples,
+                    &dash_throughput,
+                );
             }
             Tab::Grpo => {
                 self.grpo

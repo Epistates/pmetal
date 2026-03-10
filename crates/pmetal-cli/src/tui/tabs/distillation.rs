@@ -12,7 +12,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState};
 
 use crate::tui::tabs::dashboard::MetricSample;
-use crate::tui::tabs::training::{render_status_with_metrics, TrainingStatus};
+use crate::tui::tabs::training::{TrainingStatus, render_status_with_metrics};
 use crate::tui::theme::THEME;
 use crate::tui::widgets::{FieldKind, FormField};
 
@@ -92,10 +92,7 @@ impl DistillationTab {
             FormField::new(
                 "Alpha",
                 "0.5",
-                FieldKind::Number {
-                    min: 0.0,
-                    max: 1.0,
-                },
+                FieldKind::Number { min: 0.0, max: 1.0 },
                 "Distillation",
             ),
             FormField::new("Rationale", "Disabled", FieldKind::Toggle, "Distillation"),
@@ -133,7 +130,10 @@ impl DistillationTab {
             FormField::new(
                 "Max Seq Len",
                 "1024",
-                FieldKind::Integer { min: 64, max: 131072 },
+                FieldKind::Integer {
+                    min: 64,
+                    max: 131072,
+                },
                 "Training",
             ),
             FormField::new(
@@ -152,7 +152,12 @@ impl DistillationTab {
                 "LoRA",
             ),
             // Data
-            FormField::new("Dataset", "(not selected)", FieldKind::DatasetPicker, "Data"),
+            FormField::new(
+                "Dataset",
+                "(not selected)",
+                FieldKind::DatasetPicker,
+                "Data",
+            ),
             // Output
             FormField::new(
                 "Output Dir",
@@ -164,7 +169,7 @@ impl DistillationTab {
     }
 
     pub fn is_editing(&self) -> bool {
-        self.fields.get(self.field_idx).map_or(false, |f| f.editing)
+        self.fields.get(self.field_idx).is_some_and(|f| f.editing)
     }
 
     pub fn handle_edit_key(&mut self, key: KeyEvent) {

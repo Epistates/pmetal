@@ -3,7 +3,10 @@
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget, Widget};
+use ratatui::widgets::{
+    Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
+    Widget,
+};
 
 use crate::tui::theme::THEME;
 
@@ -286,10 +289,7 @@ impl InferenceTab {
                     for line in think_text.lines() {
                         let wrapped = wrap_text(line, wrap_width.saturating_sub(4) as usize);
                         for w in wrapped {
-                            lines.push(Line::from(Span::styled(
-                                format!("  {w}"),
-                                THEME.text_dim,
-                            )));
+                            lines.push(Line::from(Span::styled(format!("  {w}"), THEME.text_dim)));
                         }
                     }
                     lines.push(Line::from(Span::styled(
@@ -302,25 +302,22 @@ impl InferenceTab {
                 for line in response.lines() {
                     let wrapped = wrap_text(line, wrap_width.saturating_sub(4) as usize);
                     for w in wrapped {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {w}"),
-                            THEME.text,
-                        )));
+                        lines.push(Line::from(Span::styled(format!("  {w}"), THEME.text)));
                     }
                 }
                 // If still generating and response is empty, show cursor
                 if response.is_empty() && generating && thinking.is_some() {
-                    lines.push(Line::from(Span::styled("  ...".to_string(), THEME.text_muted)));
+                    lines.push(Line::from(Span::styled(
+                        "  ...".to_string(),
+                        THEME.text_muted,
+                    )));
                 }
             } else {
                 // User/system messages — wrap normally
                 for line in msg.content.lines() {
                     let wrapped = wrap_text(line, wrap_width.saturating_sub(4) as usize);
                     for w in wrapped {
-                        lines.push(Line::from(Span::styled(
-                            format!("  {w}"),
-                            THEME.text,
-                        )));
+                        lines.push(Line::from(Span::styled(format!("  {w}"), THEME.text)));
                     }
                 }
             }
@@ -354,7 +351,11 @@ fn parse_thinking(text: &str) -> (Option<&str>, &str) {
             let thinking = after_header[..resp_start].trim();
             let response = after_header[resp_start + "=== Response ===".len()..].trim();
             return (
-                if thinking.is_empty() { None } else { Some(thinking) },
+                if thinking.is_empty() {
+                    None
+                } else {
+                    Some(thinking)
+                },
                 response,
             );
         }
@@ -367,14 +368,22 @@ fn parse_thinking(text: &str) -> (Option<&str>, &str) {
             let thinking = text[content_start..think_end].trim();
             let response = text[think_end + "</think>".len()..].trim();
             return (
-                if thinking.is_empty() { None } else { Some(thinking) },
+                if thinking.is_empty() {
+                    None
+                } else {
+                    Some(thinking)
+                },
                 response,
             );
         } else {
             // Incomplete thinking (still generating)
             let thinking = text[content_start..].trim();
             return (
-                if thinking.is_empty() { None } else { Some(thinking) },
+                if thinking.is_empty() {
+                    None
+                } else {
+                    Some(thinking)
+                },
                 "",
             );
         }
@@ -511,10 +520,12 @@ impl InferenceTab {
 
         // Scrollbar
         if total_lines > visible_height {
-            let mut scrollbar_state = ScrollbarState::new(max_scroll)
-                .position(self.message_scroll);
-            Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                .render(inner, buf, &mut scrollbar_state);
+            let mut scrollbar_state = ScrollbarState::new(max_scroll).position(self.message_scroll);
+            Scrollbar::new(ScrollbarOrientation::VerticalRight).render(
+                inner,
+                buf,
+                &mut scrollbar_state,
+            );
         }
     }
 
@@ -582,7 +593,10 @@ impl InferenceTab {
         let model_label = self.model_id.as_deref().unwrap_or("(none)");
         let max_val_width = inner.width.saturating_sub(10) as usize;
         let truncated_model = if model_label.len() > max_val_width {
-            format!("..{}", &model_label[model_label.len() - max_val_width + 2..])
+            format!(
+                "..{}",
+                &model_label[model_label.len() - max_val_width + 2..]
+            )
         } else {
             model_label.to_string()
         };

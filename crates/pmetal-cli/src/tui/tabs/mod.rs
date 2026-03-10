@@ -17,17 +17,13 @@ pub use distillation::{DistillAction, DistillationTab};
 pub use grpo::{GrpoAction, GrpoTab};
 pub use inference::InferenceTab;
 pub use jobs::JobsTab;
-pub use models::{write_training_info, ModelSource, ModelsTab};
+pub use models::{ModelSource, ModelsTab, write_training_info};
 pub use training::{TrainingAction, TrainingTab};
 
 /// Extract a short model name from a model ID.
 /// e.g. "unsloth/Qwen3-0.6B" → "Qwen3-0.6B", "trained/foo" → "foo"
 pub fn model_short_name(model_id: &str) -> String {
-    model_id
-        .rsplit('/')
-        .next()
-        .unwrap_or(model_id)
-        .to_string()
+    model_id.rsplit('/').next().unwrap_or(model_id).to_string()
 }
 
 /// All available tabs in the TUI.

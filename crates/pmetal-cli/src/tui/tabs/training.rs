@@ -16,7 +16,7 @@ use ratatui::widgets::{
 
 use crate::tui::tabs::dashboard::MetricSample;
 use crate::tui::tabs::model_short_name;
-use crate::tui::theme::{palette, THEME};
+use crate::tui::theme::{THEME, palette};
 use crate::tui::widgets::{FieldKind, FormField};
 
 /// Actions the training tab can request from the app.
@@ -94,7 +94,10 @@ impl TrainingTab {
             FormField::new(
                 "Max Seq Len",
                 "2048",
-                FieldKind::Integer { min: 0, max: 131072 },
+                FieldKind::Integer {
+                    min: 0,
+                    max: 131072,
+                },
                 "Training",
             ),
             FormField::new(
@@ -115,16 +118,16 @@ impl TrainingTab {
             FormField::new(
                 "Warmup Steps",
                 "100",
-                FieldKind::Integer { min: 0, max: 100000 },
+                FieldKind::Integer {
+                    min: 0,
+                    max: 100000,
+                },
                 "Training",
             ),
             FormField::new(
                 "Weight Decay",
                 "0.01",
-                FieldKind::Number {
-                    min: 0.0,
-                    max: 1.0,
-                },
+                FieldKind::Number { min: 0.0, max: 1.0 },
                 "Training",
             ),
             // LoRA
@@ -147,43 +150,38 @@ impl TrainingTab {
                 "Quantization",
                 "None",
                 FieldKind::Enum {
-                    options: vec![
-                        "None".into(),
-                        "NF4".into(),
-                        "FP4".into(),
-                        "INT8".into(),
-                    ],
+                    options: vec!["None".into(), "NF4".into(), "FP4".into(), "INT8".into()],
                 },
                 "LoRA",
             ),
             // Data
-            FormField::new("Dataset", "(not selected)", FieldKind::DatasetPicker, "Data"),
             FormField::new(
-                "Eval Dataset",
-                "(none)",
-                FieldKind::Text,
+                "Dataset",
+                "(not selected)",
+                FieldKind::DatasetPicker,
                 "Data",
             ),
-            FormField::new(
-                "Sequence Packing",
-                "Enabled",
-                FieldKind::Toggle,
-                "Data",
-            ),
+            FormField::new("Eval Dataset", "(none)", FieldKind::Text, "Data"),
+            FormField::new("Sequence Packing", "Enabled", FieldKind::Toggle, "Data"),
             // Hardware
             FormField::new("Flash Attention", "Enabled", FieldKind::Toggle, "Hardware"),
             FormField::new("Fused Optimizer", "Enabled", FieldKind::Toggle, "Hardware"),
             FormField::new("JIT Compilation", "Enabled", FieldKind::Toggle, "Hardware"),
-            FormField::new("ANE", "Auto", FieldKind::Enum {
-                options: vec!["Auto".into(), "Enabled".into(), "Disabled".into()],
-            }, "Hardware"),
+            FormField::new(
+                "ANE",
+                "Auto",
+                FieldKind::Enum {
+                    options: vec!["Auto".into(), "Enabled".into(), "Disabled".into()],
+                },
+                "Hardware",
+            ),
             // Output
             FormField::new("Output Dir", "./output", FieldKind::Text, "Output"),
         ]
     }
 
     pub fn is_editing(&self) -> bool {
-        self.fields.get(self.field_idx).map_or(false, |f| f.editing)
+        self.fields.get(self.field_idx).is_some_and(|f| f.editing)
     }
 
     pub fn handle_edit_key(&mut self, key: KeyEvent) {
@@ -523,10 +521,7 @@ pub fn render_status_with_metrics(
                 )),
                 Line::from(Span::styled("  Press S to start training", THEME.text_dim)),
                 Line::from(""),
-                Line::from(Span::styled(
-                    "  Toggles cycle on Enter",
-                    THEME.text_muted,
-                )),
+                Line::from(Span::styled("  Toggles cycle on Enter", THEME.text_muted)),
                 Line::from(Span::styled(
                     "  Pickers open a selection dialog",
                     THEME.text_muted,
@@ -555,8 +550,11 @@ pub fn render_status_with_metrics(
             // --- Stats ---
             let last = samples.last();
             let loss_trend = if samples.len() >= 10 {
-                let recent: f64 =
-                    samples[samples.len() - 5..].iter().map(|s| s.loss).sum::<f64>() / 5.0;
+                let recent: f64 = samples[samples.len() - 5..]
+                    .iter()
+                    .map(|s| s.loss)
+                    .sum::<f64>()
+                    / 5.0;
                 let prev: f64 = samples[samples.len() - 10..samples.len() - 5]
                     .iter()
                     .map(|s| s.loss)
@@ -730,8 +728,7 @@ pub fn render_status_with_metrics(
                             break;
                         }
                         let ratio = (ms / total).clamp(0.0, 1.0);
-                        let label =
-                            format!("{:>8}: {:5.1}ms ({:.0}%)", name, ms, ratio * 100.0);
+                        let label = format!("{:>8}: {:5.1}ms ({:.0}%)", name, ms, ratio * 100.0);
                         Gauge::default()
                             .gauge_style(*color)
                             .ratio(ratio)
@@ -784,24 +781,17 @@ pub fn render_status_with_metrics(
             }
 
             // Hint
-            Line::from(Span::styled("  Press x to stop", THEME.text_dim))
-                .render(hint_area, buf);
+            Line::from(Span::styled("  Press x to stop", THEME.text_dim)).render(hint_area, buf);
         }
         TrainingStatus::Completed {
             final_loss,
             total_steps,
         } => {
             // Show final stats plus the loss sparkline
-            let [stats_area, spark_area] = Layout::vertical([
-                Constraint::Length(8),
-                Constraint::Fill(1),
-            ])
-            .areas(inner);
+            let [stats_area, spark_area] =
+                Layout::vertical([Constraint::Length(8), Constraint::Fill(1)]).areas(inner);
 
-            let min_loss = samples
-                .iter()
-                .map(|s| s.loss)
-                .fold(f64::MAX, f64::min);
+            let min_loss = samples.iter().map(|s| s.loss).fold(f64::MAX, f64::min);
             let avg_loss = if samples.is_empty() {
                 0.0
             } else {

@@ -1640,23 +1640,19 @@ async fn run_fuse(
     println!("========================================");
 
     // Resolve model path (could be HF ID or local path)
-    let model_dir: PathBuf =
-        if model_path.contains('/') && !PathBuf::from(model_path).exists() {
-            tracing::info!("Resolving HuggingFace model: {}", model_path);
-            pmetal_hub::download_model(model_path, None, None).await?
-        } else {
-            PathBuf::from(model_path)
-        };
+    let model_dir: PathBuf = if model_path.contains('/') && !PathBuf::from(model_path).exists() {
+        tracing::info!("Resolving HuggingFace model: {}", model_path);
+        pmetal_hub::download_model(model_path, None, None).await?
+    } else {
+        PathBuf::from(model_path)
+    };
     println!("Base model:   {}", model_dir.display());
 
     // Resolve LoRA adapter path
     let lora_file = if Path::new(lora_path).is_dir() {
         let f = Path::new(lora_path).join("lora_weights.safetensors");
         if !f.exists() {
-            anyhow::bail!(
-                "No lora_weights.safetensors found in {}",
-                lora_path
-            );
+            anyhow::bail!("No lora_weights.safetensors found in {}", lora_path);
         }
         f
     } else {
@@ -3097,8 +3093,8 @@ async fn run_inference(
     #[cfg(target_os = "macos")]
     use pmetal_models::generate_cached_metal;
     use pmetal_models::{
-        DynamicModel, GenerationConfig, GenerationOutput,
-        generate_cached_compiled, generate_minimal_async,
+        DynamicModel, GenerationConfig, GenerationOutput, generate_cached_compiled,
+        generate_minimal_async,
     };
 
     tracing::info!(model = %model_id, "Loading model for inference");
@@ -3603,7 +3599,7 @@ fn collect_all_stop_tokens(
         "</s>",
     ];
     for candidate in &candidates {
-        if let Ok(encoded) = tokenizer.encode(*candidate) {
+        if let Ok(encoded) = tokenizer.encode(candidate) {
             if encoded.len() == 1 {
                 tokens.push(encoded[0]);
             }
@@ -4076,7 +4072,7 @@ fn get_chat_stop_tokens(
         "</s>",
     ];
     for candidate in &candidates {
-        if let Ok(encoded) = tokenizer.encode(*candidate) {
+        if let Ok(encoded) = tokenizer.encode(candidate) {
             if encoded.len() == 1 && !tokens.contains(&encoded[0]) {
                 tokens.push(encoded[0]);
             }
@@ -4248,8 +4244,12 @@ async fn run_inference_with_lora(
     // Auto-detect chat mode: LoRA fine-tuned models almost always use chat format,
     // so enable chat if the model has chat special tokens even if it's a "base" model.
     let is_instruct = is_instruction_tuned(model_path);
-    let has_chat_tokens = tokenizer.encode("<|im_end|>").map_or(false, |t| t.len() == 1)
-        || tokenizer.encode("<|eot_id|>").map_or(false, |t| t.len() == 1);
+    let has_chat_tokens = tokenizer
+        .encode("<|im_end|>")
+        .is_ok_and(|t| t.len() == 1)
+        || tokenizer
+            .encode("<|eot_id|>")
+            .is_ok_and(|t| t.len() == 1);
     let use_chat = chat || is_instruct || has_chat_tokens;
 
     if !chat && use_chat {

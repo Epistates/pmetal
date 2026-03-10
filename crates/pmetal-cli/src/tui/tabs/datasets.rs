@@ -211,7 +211,11 @@ impl DatasetsTab {
                 _ => continue,
             };
 
-            let name = path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let name = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .to_string();
             let size_bytes = path.metadata().map(|m| m.len()).unwrap_or(0);
 
             let sample_count = if ext == "jsonl" {
@@ -245,11 +249,7 @@ impl DatasetsTab {
     /// Structure: {hub_cache}/datasets--{org}--{name}/snapshots/{hash}/[nested/]
     /// Uses a recursive walkdir (max depth 4) inside each snapshot to find
     /// .jsonl, .json, .parquet, .csv files in any subdirectory layout.
-    fn scan_hf_datasets_cache(
-        &mut self,
-        cache_dir: &std::path::Path,
-        seen: &mut HashSet<PathBuf>,
-    ) {
+    fn scan_hf_datasets_cache(&mut self, cache_dir: &std::path::Path, seen: &mut HashSet<PathBuf>) {
         if !cache_dir.exists() {
             return;
         }
@@ -307,7 +307,9 @@ impl DatasetsTab {
                     continue;
                 }
 
-                let canonical = file_path.canonicalize().unwrap_or_else(|_| file_path.to_path_buf());
+                let canonical = file_path
+                    .canonicalize()
+                    .unwrap_or_else(|_| file_path.to_path_buf());
                 if seen.contains(&canonical) {
                     continue;
                 }
@@ -327,13 +329,15 @@ impl DatasetsTab {
                 };
 
                 // Build a display name: dataset_id/relative_path_from_snapshot
-                let rel = file_path
-                    .strip_prefix(&snapshot)
-                    .unwrap_or(file_path);
+                let rel = file_path.strip_prefix(&snapshot).unwrap_or(file_path);
                 let name = format!("{}/{}", dataset_id, rel.display());
 
                 let size_bytes = file_path.metadata().map(|m| m.len()).unwrap_or(0);
-                let sample_count = if ext == "jsonl" { count_lines(file_path) } else { None };
+                let sample_count = if ext == "jsonl" {
+                    count_lines(file_path)
+                } else {
+                    None
+                };
                 let preview = read_first_line(file_path);
 
                 let columns = detect_columns(file_path, format);
@@ -370,13 +374,18 @@ impl DatasetsTab {
         if count == 0 {
             return;
         }
-        let i = self.table_state.selected().map_or(0, |i| (i + count - 1) % count);
+        let i = self
+            .table_state
+            .selected()
+            .map_or(0, |i| (i + count - 1) % count);
         self.table_state.select(Some(i));
         self.scrollbar_state = self.scrollbar_state.position(i);
     }
 
     pub fn selected_dataset(&self) -> Option<&DatasetEntry> {
-        self.table_state.selected().and_then(|i| self.datasets.get(i))
+        self.table_state
+            .selected()
+            .and_then(|i| self.datasets.get(i))
     }
 }
 
@@ -528,10 +537,7 @@ impl DatasetsTab {
         // Detected columns
         if !ds.columns.is_empty() {
             lines.push(Line::from(""));
-            lines.push(Line::from(Span::styled(
-                "Columns:",
-                THEME.kv_key,
-            )));
+            lines.push(Line::from(Span::styled("Columns:", THEME.kv_key)));
             for col in &ds.columns {
                 lines.push(Line::from(Span::styled(
                     format!("  - {col}"),
@@ -541,10 +547,7 @@ impl DatasetsTab {
         }
 
         lines.push(Line::from(""));
-        lines.push(Line::from(Span::styled(
-            "First sample:",
-            THEME.text_dim,
-        )));
+        lines.push(Line::from(Span::styled("First sample:", THEME.text_dim)));
 
         if let Some(preview) = &ds.preview {
             // Pretty-print JSON if possible
@@ -734,10 +737,7 @@ fn extract_parquet_column_names(footer: &[u8]) -> Vec<String> {
         // Look for Thrift string pattern: length (varint) followed by UTF-8 bytes
         // In compact protocol, strings are preceded by their length as a varint
         if let Some((str_len, varint_size)) = decode_varint(&footer[i..]) {
-            if str_len > 0
-                && str_len < 256
-                && i + varint_size + str_len <= footer.len()
-            {
+            if str_len > 0 && str_len < 256 && i + varint_size + str_len <= footer.len() {
                 let start = i + varint_size;
                 let end = start + str_len;
                 if let Ok(s) = std::str::from_utf8(&footer[start..end]) {
@@ -745,7 +745,9 @@ fn extract_parquet_column_names(footer: &[u8]) -> Vec<String> {
                     if !s.is_empty()
                         && s.chars()
                             .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.')
-                        && s.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_')
+                        && s.chars()
+                            .next()
+                            .is_some_and(|c| c.is_alphabetic() || c == '_')
                         && !names.contains(&s.to_string())
                     {
                         names.push(s.to_string());

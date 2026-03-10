@@ -31,10 +31,7 @@ pub enum Event {
 #[allow(dead_code)]
 pub enum AppMsg {
     /// A background job has started.
-    JobStarted {
-        job_id: String,
-        job_type: JobType,
-    },
+    JobStarted { job_id: String, job_type: JobType },
     /// Real-time metrics from a running training job.
     JobMetrics {
         job_id: String,
@@ -53,10 +50,7 @@ pub enum AppMsg {
         total_ms: f64,
     },
     /// A line of stdout/stderr from a running job.
-    JobOutput {
-        job_id: String,
-        line: String,
-    },
+    JobOutput { job_id: String, line: String },
     /// A background job has finished.
     JobFinished {
         job_id: String,
@@ -64,10 +58,7 @@ pub enum AppMsg {
         message: String,
     },
     /// Progress update for a model download (0.0..1.0).
-    DownloadProgress {
-        model_id: String,
-        progress: f64,
-    },
+    DownloadProgress { model_id: String, progress: f64 },
     /// A model download completed.
     DownloadComplete {
         model_id: String,
@@ -75,18 +66,11 @@ pub enum AppMsg {
         message: String,
     },
     /// A single token from streaming inference.
-    InferenceToken {
-        token: String,
-    },
+    InferenceToken { token: String },
     /// Inference generation completed.
-    InferenceDone {
-        tok_sec: f64,
-        total_tokens: usize,
-    },
+    InferenceDone { tok_sec: f64, total_tokens: usize },
     /// Inference encountered an error.
-    InferenceError {
-        message: String,
-    },
+    InferenceError { message: String },
 }
 
 /// The type of background job.

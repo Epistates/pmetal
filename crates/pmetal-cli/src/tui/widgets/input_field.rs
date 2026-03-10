@@ -63,9 +63,7 @@ impl FormField {
     pub fn is_inline_editable(&self) -> bool {
         matches!(
             self.kind,
-            FieldKind::Text
-                | FieldKind::Number { .. }
-                | FieldKind::Integer { .. }
+            FieldKind::Text | FieldKind::Number { .. } | FieldKind::Integer { .. }
         )
     }
 

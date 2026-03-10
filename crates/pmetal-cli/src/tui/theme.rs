@@ -142,9 +142,7 @@ pub const THEME: Theme = Theme {
     tab_inactive: Style::new().fg(palette::TEXT_DIM).bg(palette::SURFACE_1),
 
     block: Style::new().fg(palette::BORDER),
-    block_title: Style::new()
-        .fg(palette::TEXT)
-        .add_modifier(Modifier::BOLD),
+    block_title: Style::new().fg(palette::TEXT).add_modifier(Modifier::BOLD),
     block_focused: Style::new().fg(palette::BORDER_FOCUS),
     block_title_focused: Style::new()
         .fg(palette::PRIMARY_BRIGHT)
@@ -174,9 +172,7 @@ pub const THEME: Theme = Theme {
     chart_axis: Style::new().fg(palette::TEXT_DIM),
     chart_label: Style::new().fg(palette::TEXT_MUTED),
 
-    gauge_label: Style::new()
-        .fg(palette::TEXT)
-        .add_modifier(Modifier::BOLD),
+    gauge_label: Style::new().fg(palette::TEXT).add_modifier(Modifier::BOLD),
 
     kv_key: Style::new().fg(palette::TEXT_DIM),
     kv_value: Style::new()
@@ -190,9 +186,7 @@ pub const THEME: Theme = Theme {
     status_success: Style::new()
         .fg(palette::SUCCESS)
         .add_modifier(Modifier::BOLD),
-    status_error: Style::new()
-        .fg(palette::ERROR)
-        .add_modifier(Modifier::BOLD),
+    status_error: Style::new().fg(palette::ERROR).add_modifier(Modifier::BOLD),
     status_idle: Style::new().fg(palette::TEXT_MUTED),
 
     logo: Style::new()
@@ -210,7 +204,13 @@ pub fn lerp_color(a: Color, b: Color, t: f64) -> Color {
             let b = (b1 as f32 + (b2 as f32 - b1 as f32) * t) as u8;
             Color::Rgb(r, g, b)
         }
-        _ => if t < 0.5 { a } else { b },
+        _ => {
+            if t < 0.5 {
+                a
+            } else {
+                b
+            }
+        }
     }
 }
 
