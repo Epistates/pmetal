@@ -76,3 +76,4 @@ prepared_dataset.jsonl
 sample_config.yaml
 
 output/
+data/
