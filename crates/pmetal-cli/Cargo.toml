@@ -45,12 +45,14 @@ tokenizers = { workspace = true }
 pmetal-metal = { workspace = true }
 walkdir = { workspace = true }
 ratatui = { version = "0.29", optional = true }
-crossterm = { version = "0.28", optional = true }
+crossterm = { version = "0.28", features = ["event-stream"], optional = true }
+futures = { version = "0.3", optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
 
 [features]
 default = ["ane", "dashboard"]
 ane = ["pmetal-trainer/ane", "pmetal-models/ane"]
-dashboard = ["dep:ratatui", "dep:crossterm"]
+dashboard = ["dep:ratatui", "dep:crossterm", "dep:futures", "dep:tokio-util"]
 
 [lints]
 workspace = true

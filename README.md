@@ -12,6 +12,10 @@ PMetal is a machine learning framework that brings [Unsloth](https://github.com/
 
 ### Installation
 
+Prebuilt signed binaries are available on the [Releases](https://github.com/Epistates/pmetal/releases) page.
+
+To build from source:
+
 ```bash
 # Clone the repository
 git clone https://github.com/epistates/pmetal.git
@@ -74,7 +78,13 @@ cargo build --release
   --student unsloth/Qwen3.5-0.8B-Base \
   --dataset train.jsonl
 
-# Real-time training dashboard (TUI)
+# Full TUI control center (device, models, datasets, training, inference, jobs)
+./target/release/pmetal tui
+
+# TUI with live training metrics
+./target/release/pmetal tui --metrics-file ./output/metrics.jsonl
+
+# Legacy: simple training dashboard only
 ./target/release/pmetal dashboard --metrics-file ./output/metrics.jsonl
 ```
 
@@ -182,14 +192,23 @@ Native ANE integration for power-efficient training and inference:
 - **IOSurface Zero-Copy**: fp32 shared memory surfaces for CPU↔ANE data transfer with no serialization overhead.
 - **GQA/MQA Support**: Grouped-query and multi-query attention via MIL KV head expansion (replaces unreliable `tile` ops).
 
-### Training Dashboard (TUI)
+### TUI Control Center
 
-Real-time terminal dashboard via `pmetal dashboard`:
+Full terminal interface via `pmetal tui` with 7 tabs:
 
-- Loss curve visualization (braille characters)
-- Learning rate schedule tracking
-- Per-component timing breakdown (ANE, Adam, RMSNorm, cblas)
-- Token throughput monitoring
+| Tab | Description |
+|-----|-------------|
+| **Dashboard** | Live loss curves (braille), LR schedule, throughput sparklines, timing breakdown gauges |
+| **Device** | GPU info, Metal feature detection, memory utilization gauge, kernel tuning params |
+| **Models** | Browse cached HuggingFace models with architecture, size, and format details |
+| **Datasets** | Scan and preview local datasets (JSONL, Parquet, CSV) with line counts |
+| **Training** | Configure and monitor training runs with sectioned parameter view |
+| **Inference** | Interactive chat interface with generation settings sidebar |
+| **Jobs** | Training run history with log viewer, status tracking, and metadata |
+
+Keybindings: `Tab`/`Shift+Tab` to switch tabs, `Alt+1-7` for direct access, `q` to quit.
+
+The legacy `pmetal dashboard` command is still available for simple metrics-only monitoring.
 
 ### Sequence Packing
 

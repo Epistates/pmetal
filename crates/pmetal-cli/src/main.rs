@@ -360,6 +360,29 @@ enum Commands {
         action: OllamaAction,
     },
 
+    /// Fuse LoRA adapter weights into a base model and save as a complete model
+    Fuse {
+        /// Base model ID or path
+        #[arg(short, long)]
+        model: String,
+
+        /// LoRA adapter path (directory containing lora_weights.safetensors, or the file itself)
+        #[arg(short, long)]
+        lora: String,
+
+        /// Output directory for the fused model
+        #[arg(short, long)]
+        output: String,
+
+        /// LoRA scaling alpha (default: auto-detect from adapter)
+        #[arg(long)]
+        alpha: Option<f32>,
+
+        /// LoRA rank (default: auto-detect from adapter)
+        #[arg(long)]
+        rank: Option<usize>,
+    },
+
     /// Quantize a model to GGUF format (supports Dynamic 2.0)
     Quantize {
         /// Source model path (Safetensors/HF)
@@ -377,6 +400,10 @@ enum Commands {
         /// Quantization method (e.g., q4_k_m, q8_0) or "dynamic"
         #[arg(long, default_value = "dynamic")]
         method: String,
+
+        /// LoRA adapter to fuse before quantizing (optional)
+        #[arg(long)]
+        lora: Option<String>,
     },
 
     /// Knowledge Distillation from teacher to student
@@ -1295,13 +1322,33 @@ async fn main() -> anyhow::Result<()> {
             run_ollama_command(action).await?;
         }
 
+        Commands::Fuse {
+            model,
+            lora,
+            output,
+            alpha,
+            rank,
+        } => {
+            run_fuse(&model, &lora, &output, alpha, rank).await?;
+        }
+
         Commands::Quantize {
             model,
             output,
             imatrix,
             method,
+            lora,
         } => {
-            run_quantization(&model, &output, imatrix.as_deref(), &method).await?;
+            if let Some(lora_path) = &lora {
+                // Fuse LoRA first, then quantize the fused model
+                let fused_dir = format!("{output}.fused_tmp");
+                run_fuse(&model, lora_path, &fused_dir, None, None).await?;
+                run_quantization(&fused_dir, &output, imatrix.as_deref(), &method).await?;
+                // Clean up temp dir
+                let _ = std::fs::remove_dir_all(&fused_dir);
+            } else {
+                run_quantization(&model, &output, imatrix.as_deref(), &method).await?;
+            }
         }
 
         Commands::Distill {
@@ -1380,7 +1427,7 @@ async fn main() -> anyhow::Result<()> {
         #[cfg(feature = "dashboard")]
         Commands::Tui { metrics_file } => {
             let path = metrics_file.map(std::path::PathBuf::from);
-            tui::run(path)?;
+            tui::run(path).await?;
         }
     }
 
@@ -1571,6 +1618,183 @@ async fn run_quantization(
     builder.write(&mut file)?;
 
     println!("Quantization complete!");
+    Ok(())
+}
+
+/// Fuse LoRA adapter weights into a base model and save as a complete model.
+///
+/// This performs weight-level fusion: loads base model weights and LoRA adapter
+/// weights, computes `W_fused = W_base + (alpha/r) * (B @ A)` for each targeted
+/// layer, copies all other files (config, tokenizer, etc.), and saves the result.
+async fn run_fuse(
+    model_path: &str,
+    lora_path: &str,
+    output_path: &str,
+    alpha_override: Option<f32>,
+    rank_override: Option<usize>,
+) -> anyhow::Result<()> {
+    use std::collections::HashMap;
+    use std::path::Path;
+
+    println!("  PMetal LoRA Fuse");
+    println!("========================================");
+
+    // Resolve model path (could be HF ID or local path)
+    let model_dir: PathBuf =
+        if model_path.contains('/') && !PathBuf::from(model_path).exists() {
+            tracing::info!("Resolving HuggingFace model: {}", model_path);
+            pmetal_hub::download_model(model_path, None, None).await?
+        } else {
+            PathBuf::from(model_path)
+        };
+    println!("Base model:   {}", model_dir.display());
+
+    // Resolve LoRA adapter path
+    let lora_file = if Path::new(lora_path).is_dir() {
+        let f = Path::new(lora_path).join("lora_weights.safetensors");
+        if !f.exists() {
+            anyhow::bail!(
+                "No lora_weights.safetensors found in {}",
+                lora_path
+            );
+        }
+        f
+    } else {
+        PathBuf::from(lora_path)
+    };
+    println!("LoRA adapter: {}", lora_file.display());
+    println!("Output:       {}", output_path);
+
+    // Load base model weights
+    print!("\nLoading base model weights... ");
+    let mut base_weights = pmetal_models::loader::load_weights(&model_dir)?;
+    println!("OK ({} tensors)", base_weights.len());
+
+    // Load LoRA adapter weights
+    print!("Loading LoRA adapter weights... ");
+    let lora_weights =
+        mlx_rs::Array::load_safetensors(&lora_file).map_err(|e| anyhow::anyhow!("{e}"))?;
+    println!("OK ({} tensors)", lora_weights.len());
+
+    // Detect LoRA rank from adapter weights
+    let rank = if let Some(r) = rank_override {
+        r
+    } else {
+        // Find any lora_a weight to determine rank from its shape
+        lora_weights
+            .iter()
+            .find(|(k, _)| k.contains("lora_a"))
+            .map(|(_, v)| {
+                let shape = v.shape();
+                // lora_a is [r, in_features] or [in_features, r] depending on convention
+                *shape.iter().min().unwrap_or(&16) as usize
+            })
+            .unwrap_or(16)
+    };
+    let alpha = alpha_override.unwrap_or(rank as f32);
+    let scale = alpha / rank as f32;
+    println!("LoRA rank: {rank}, alpha: {alpha}, scale: {scale:.3}");
+
+    // Apply LoRA: W_fused = W_base + scale * (B @ A)
+    print!("Fusing weights... ");
+    let mut fused_count = 0usize;
+
+    // Group LoRA weights by layer: find matching (lora_a, lora_b) pairs
+    let mut lora_a_map: HashMap<String, &mlx_rs::Array> = HashMap::new();
+    let mut lora_b_map: HashMap<String, &mlx_rs::Array> = HashMap::new();
+
+    for (name, array) in &lora_weights {
+        if let Some(base_name) = name.strip_suffix(".lora_a") {
+            lora_a_map.insert(base_name.to_string(), array);
+        } else if let Some(base_name) = name.strip_suffix(".lora_b") {
+            lora_b_map.insert(base_name.to_string(), array);
+        }
+    }
+
+    for (layer_name, lora_a) in &lora_a_map {
+        let Some(lora_b) = lora_b_map.get(layer_name) else {
+            tracing::warn!("Missing lora_b for {layer_name}, skipping");
+            continue;
+        };
+
+        // Map LoRA layer name to base weight name
+        // LoRA names: "layers.0.self_attn.q_proj.lora_a" → base: "model.layers.0.self_attn.q_proj.weight"
+        let base_key = if layer_name.starts_with("model.") {
+            format!("{layer_name}.weight")
+        } else {
+            format!("model.{layer_name}.weight")
+        };
+
+        let Some(base_weight) = base_weights.get(&base_key) else {
+            tracing::warn!("Base weight {base_key} not found, skipping");
+            continue;
+        };
+
+        // Compute delta = scale * (B @ A) and add to base weight
+        // lora_a: [r, in_features], lora_b: [out_features, r]
+        // delta: [out_features, in_features]
+        let delta = mlx_rs::ops::matmul(lora_b, lora_a)?;
+        let scaled_delta = mlx_rs::ops::multiply(&delta, mlx_rs::array!(scale))?;
+        let fused = mlx_rs::ops::add(base_weight, &scaled_delta)?;
+
+        base_weights.insert(base_key, fused);
+        fused_count += 1;
+    }
+    println!("OK ({fused_count} layers fused)");
+
+    // Create output directory
+    let output_dir = Path::new(output_path);
+    std::fs::create_dir_all(output_dir)?;
+
+    // Copy non-weight files from base model (config.json, tokenizer, etc.)
+    print!("Copying model files... ");
+    let mut copied = 0usize;
+    for entry in std::fs::read_dir(&model_dir)?.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        // Skip weight files (we'll save our own) and symlinks
+        if name_str.ends_with(".safetensors")
+            || name_str == "model.safetensors.index.json"
+            || name_str.starts_with(".")
+        {
+            continue;
+        }
+        let dest = output_dir.join(&name);
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), &dest)?;
+            copied += 1;
+        }
+    }
+    println!("OK ({copied} files)");
+
+    // Save fused weights as a single safetensors file
+    print!("Saving fused model... ");
+    let output_file = output_dir.join("model.safetensors");
+    mlx_rs::Array::save_safetensors(&base_weights, None, &output_file)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+
+    let size = std::fs::metadata(&output_file)
+        .map(|m| m.len())
+        .unwrap_or(0);
+    let gb = size as f64 / (1024.0 * 1024.0 * 1024.0);
+    println!("OK ({:.2} GB)", gb);
+
+    println!("\n========================================");
+    println!("Fused model saved to: {output_path}");
+    println!("\nNext steps:");
+    println!(
+        "  Inference:  pmetal infer -m {} -p \"Your prompt\"",
+        output_path
+    );
+    println!(
+        "  Quantize:   pmetal quantize -m {} -o {}.gguf",
+        output_path, output_path
+    );
+    println!(
+        "  Ollama:     pmetal ollama create -n my-model -b {}",
+        output_path
+    );
+
     Ok(())
 }
 
@@ -2859,7 +3083,7 @@ async fn run_inference(
     no_thinking: bool,
     metal_sampler: bool,
     compiled: bool,
-    stream: bool,
+    _stream: bool,
     minimal: bool,
     show_thinking: bool,
     fp8: bool,
@@ -2873,7 +3097,7 @@ async fn run_inference(
     #[cfg(target_os = "macos")]
     use pmetal_models::generate_cached_metal;
     use pmetal_models::{
-        DynamicModel, GenerationConfig, GenerationOutput, generate_cached_async,
+        DynamicModel, GenerationConfig, GenerationOutput,
         generate_cached_compiled, generate_minimal_async,
     };
 
@@ -2905,17 +3129,25 @@ async fn run_inference(
     };
 
     // Check if LoRA is requested
-    if lora_path.is_some() {
-        // LoRA requires architecture-specific handling
-        // For now, only Llama is supported with LoRA
-        // LoRA uses default temperature if not specified
+    if let Some(lora) = lora_path {
         return run_inference_with_lora(
             &model_path,
-            lora_path.unwrap_or("None"),
+            lora,
             &tokenizer,
             prompt,
             max_tokens,
-            temperature.unwrap_or(0.7),
+            temperature,
+            top_k,
+            top_p,
+            min_p,
+            repetition_penalty,
+            frequency_penalty,
+            presence_penalty,
+            seed,
+            chat,
+            system,
+            no_thinking,
+            show_thinking,
         )
         .await;
     }
@@ -2971,13 +3203,12 @@ async fn run_inference(
     let input_ids = tokenizer.encode(&final_prompt)?;
     tracing::info!("Tokenized {} tokens", input_ids.len());
 
-    // Configure stop tokens — template-aware for chat mode
-    let stop_tokens = if use_chat {
-        get_chat_stop_tokens(template_type, &tokenizer)
-    } else {
-        // Non-chat mode: use EOS tokens from generation_config.json
-        get_eos_tokens(&model_path, &tokenizer)
-    };
+    // Configure stop tokens — unified collection from all sources
+    let stop_tokens = collect_all_stop_tokens(
+        &model_path,
+        &tokenizer,
+        if use_chat { Some(template_type) } else { None },
+    );
 
     // Configure generation with user-specified parameters
     let gen_config = if temperature == 0.0 {
@@ -3037,6 +3268,7 @@ async fn run_inference(
 
     // Generate with KV cache (and Mamba cache for hybrid models)
     let start = std::time::Instant::now();
+    let mut already_streamed = false;
 
     #[cfg(target_os = "macos")]
     let output = {
@@ -3162,18 +3394,34 @@ async fn run_inference(
                 &mut cache,
             )?
         } else {
-            // Default: async generation with dedicated stream (matches mlx_lm)
-            // Note: --stream flag is now a no-op since async is the default
-            if stream {
-                tracing::info!("Using async generation with dedicated stream");
-            }
-            generate_cached_async(
+            // Default: streaming async generation — tokens printed as they're produced
+            already_streamed = true;
+            use pmetal_models::generate_cached_async_streaming;
+            use std::io::Write;
+
+            let mut token_buf: Vec<u32> = Vec::new();
+            let mut streamed_text = String::new();
+            let tokenizer_ref = &tokenizer;
+
+            generate_cached_async_streaming(
                 |input, cache| {
                     model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
                 },
                 &input_ids,
                 gen_config,
                 &mut cache,
+                |token_id| {
+                    token_buf.push(token_id);
+                    if let Ok(text) = tokenizer_ref.decode(&token_buf) {
+                        if text.len() > streamed_text.len() {
+                            let delta = &text[streamed_text.len()..];
+                            let _ = std::io::stdout().write_all(delta.as_bytes());
+                            let _ = std::io::stdout().flush();
+                        }
+                        streamed_text = text;
+                    }
+                    true
+                },
             )?
         }
     };
@@ -3203,63 +3451,65 @@ async fn run_inference(
                 &mut cache,
             )?
         } else {
-            // Default: async generation with dedicated stream (matches mlx_lm)
-            // Note: --stream flag is now a no-op since async is the default
-            if stream {
-                tracing::info!("Using async generation with dedicated stream");
-            }
-            generate_cached_async(
+            // Default: streaming async generation
+            already_streamed = true;
+            use pmetal_models::generate_cached_async_streaming;
+            use std::io::Write;
+
+            let mut token_buf: Vec<u32> = Vec::new();
+            let mut streamed_text = String::new();
+            let tokenizer_ref = &tokenizer;
+
+            generate_cached_async_streaming(
                 |input, cache| {
                     model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
                 },
                 &input_ids,
                 gen_config,
                 &mut cache,
+                |token_id| {
+                    token_buf.push(token_id);
+                    if let Ok(text) = tokenizer_ref.decode(&token_buf) {
+                        if text.len() > streamed_text.len() {
+                            let delta = &text[streamed_text.len()..];
+                            let _ = std::io::stdout().write_all(delta.as_bytes());
+                            let _ = std::io::stdout().flush();
+                        }
+                        streamed_text = text;
+                    }
+                    true
+                },
             )?
         }
     };
     let elapsed = start.elapsed();
 
-    // Decode only the GENERATED tokens (not the prompt)
-    // output.token_ids includes prompt, so slice off the prompt portion
-    let prompt_len = input_ids.len();
-    let generated_tokens = &output.token_ids[prompt_len..];
-    let raw_generated_text = tokenizer.decode(generated_tokens)?;
-
-    // When in thinking mode, we prefill <think>\n in the prompt, so the generated
-    // text doesn't include the opening tag. Prepend it for correct extraction.
-    let generated_text = if use_chat && !no_thinking {
-        format!("<think>{}", raw_generated_text)
-    } else {
-        raw_generated_text
-    };
-
-    // For chat mode, handle thinking content and extract response
-    if use_chat {
-        if show_thinking {
-            // Show thinking separately with banners, then show response
-            if let Some(thinking) = extract_thinking_content(&generated_text) {
+    // For non-streaming paths, decode and print the generated text now
+    if !already_streamed {
+        let generated_tokens = &output.token_ids[input_ids.len()..];
+        let raw_text = tokenizer.decode(generated_tokens)?;
+        let text = if use_chat && !no_thinking {
+            format!("<think>{}", raw_text)
+        } else {
+            raw_text
+        };
+        if use_chat && show_thinking {
+            if let Some(thinking) = extract_thinking_content(&text) {
                 println!("=== Thinking ===");
                 println!("{}", thinking);
                 println!("=== Response ===");
-                // Extract just the response (after </think>)
-                let response = extract_final_response(&generated_text);
-                println!("{}", response);
-            } else {
-                // No complete thinking found, show truncation or raw content
-                let response = extract_final_response(&generated_text);
-                println!("{}", response);
             }
+            println!("{}", extract_final_response(&text));
+        } else if use_chat {
+            println!("{}", extract_final_response(&text));
         } else {
-            // Don't show thinking, just extract final response
-            let response = extract_final_response(&generated_text);
-            println!("{}", response);
+            println!("{}", text);
         }
     } else {
-        println!("{}", generated_text);
+        println!(); // finish the streamed line
     }
 
-    println!("\n---");
+    println!("---");
     println!(
         "Generated {} tokens in {:.2}s ({:.1} tok/s)",
         output.num_generated,
@@ -3278,15 +3528,34 @@ async fn run_inference(
 /// Get EOS token IDs from model's generation_config.json.
 ///
 /// Many models (like Qwen3) have multiple EOS tokens that should all stop generation.
+#[allow(dead_code)]
 fn get_eos_tokens(model_path: &Path, tokenizer: &Tokenizer) -> Vec<u32> {
+    collect_all_stop_tokens(model_path, tokenizer, None)
+}
+
+/// Collect all stop tokens from every available source.
+///
+/// Merges tokens from:
+/// 1. `generation_config.json` — the model's declared `eos_token_id` (single or array)
+/// 2. Chat template EOS — the template-specific end token (e.g. `<|im_end|>` for ChatML)
+/// 3. Tokenizer's `eos_token_id` — resolved from special_tokens_map / heuristics
+/// 4. Well-known special tokens — if they exist in the vocabulary as single tokens,
+///    they're likely EOS candidates (e.g. `<|im_end|>`, `<|eot_id|>`, `<|endoftext|>`)
+///
+/// Returns a deduplicated list. This ensures fine-tuned models stop correctly
+/// regardless of whether they produce the base model's EOS or the chat EOS.
+fn collect_all_stop_tokens(
+    model_path: &Path,
+    tokenizer: &Tokenizer,
+    template_type: Option<pmetal_data::chat_templates::ChatTemplateType>,
+) -> Vec<u32> {
     let mut tokens = Vec::new();
 
-    // Try to read from generation_config.json
+    // 1. generation_config.json
     let config_path = model_path.join("generation_config.json");
     if config_path.exists() {
         if let Ok(content) = std::fs::read_to_string(&config_path) {
             if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                // Handle eos_token_id as array or single value
                 if let Some(eos) = config.get("eos_token_id") {
                     if let Some(arr) = eos.as_array() {
                         for v in arr {
@@ -3302,11 +3571,55 @@ fn get_eos_tokens(model_path: &Path, tokenizer: &Tokenizer) -> Vec<u32> {
         }
     }
 
-    // Fallback to tokenizer's eos_token_id
-    if tokens.is_empty() {
-        tokens.push(tokenizer.eos_token_id().unwrap_or(2));
+    // 2. Chat template EOS (if template type is known)
+    if let Some(tt) = template_type {
+        let eos_str = tt.eos_token();
+        if let Ok(encoded) = tokenizer.encode(eos_str) {
+            if encoded.len() == 1 {
+                tokens.push(encoded[0]);
+            }
+        }
     }
 
+    // 3. Tokenizer's resolved eos_token_id
+    if let Some(eos) = tokenizer.eos_token_id() {
+        tokens.push(eos);
+    }
+
+    // 4. Well-known special tokens — probe the vocabulary for common EOS tokens.
+    //    Only add tokens that encode to exactly 1 token (i.e. they're real special tokens,
+    //    not subword sequences).
+    let candidates = [
+        "<|im_end|>",
+        "<|eot_id|>",
+        "<|eot|>",
+        "<|endoftext|>",
+        "<|end_of_text|>",
+        "<end_of_turn>",
+        "<|end|>",
+        "<|return|>",
+        "<|END_OF_TURN_TOKEN|>",
+        "<｜end▁of▁sentence｜>",
+        "</s>",
+    ];
+    for candidate in &candidates {
+        if let Ok(encoded) = tokenizer.encode(*candidate) {
+            if encoded.len() == 1 {
+                tokens.push(encoded[0]);
+            }
+        }
+    }
+
+    // Deduplicate
+    tokens.sort_unstable();
+    tokens.dedup();
+
+    // Final fallback
+    if tokens.is_empty() {
+        tokens.push(2);
+    }
+
+    tracing::debug!("Collected stop tokens: {:?}", tokens);
     tokens
 }
 
@@ -3451,6 +3764,11 @@ fn apply_chat_template(
         ChatTemplateType::Phi3 => format_phi3_inference(user_message, system_message),
         ChatTemplateType::Phi4 => format_phi4_inference(user_message, system_message, no_thinking),
         ChatTemplateType::GptOss => format_gpt_oss_inference(user_message, system_message),
+        ChatTemplateType::Llama4 => format_llama4_inference(user_message, system_message),
+        ChatTemplateType::DeepSeek => {
+            format_deepseek_inference(user_message, system_message, no_thinking)
+        }
+        ChatTemplateType::Cohere => format_cohere_inference(user_message, system_message),
         // Alpaca, Vicuna, Zephyr, Custom — fall back to ChatML for inference
         _ => format_chatml(user_message, system_message, no_thinking),
     };
@@ -3617,23 +3935,101 @@ fn format_gpt_oss_inference(user_message: &str, system_message: Option<&str>) ->
     result
 }
 
+/// Format message using Llama 4 template for inference.
+///
+/// Llama 4 uses `<|header_start|>`/`<|header_end|>` and `<|eot|>` (not Llama 3's tokens).
+fn format_llama4_inference(user_message: &str, system_message: Option<&str>) -> String {
+    let mut result = String::from("<|begin_of_text|>");
+
+    if let Some(sys) = system_message {
+        result.push_str("<|header_start|>system<|header_end|>\n\n");
+        result.push_str(sys);
+        result.push_str("<|eot|>");
+    }
+
+    result.push_str("<|header_start|>user<|header_end|>\n\n");
+    result.push_str(user_message);
+    result.push_str("<|eot|>");
+    result.push_str("<|header_start|>assistant<|header_end|>\n\n");
+
+    result
+}
+
+/// Format message using DeepSeek template for inference.
+///
+/// Uses full-width unicode characters in token names.
+/// V3.1+ supports thinking mode via `<think>` / `</think>` prefill.
+fn format_deepseek_inference(
+    user_message: &str,
+    system_message: Option<&str>,
+    no_thinking: bool,
+) -> String {
+    let mut result = String::from("<｜begin▁of▁sentence｜>");
+
+    if let Some(sys) = system_message {
+        result.push_str(sys);
+    }
+
+    result.push_str("<｜User｜>");
+    result.push_str(user_message);
+    result.push_str("<｜Assistant｜>");
+
+    if no_thinking {
+        result.push_str("</think>");
+    } else {
+        result.push_str("<think>\n");
+    }
+
+    result
+}
+
+/// Format message using Cohere Command R template for inference.
+fn format_cohere_inference(user_message: &str, system_message: Option<&str>) -> String {
+    let mut result = String::from("<BOS_TOKEN>");
+
+    if let Some(sys) = system_message {
+        result.push_str("<|START_OF_TURN_TOKEN|><|SYSTEM_TOKEN|>");
+        result.push_str(sys);
+        result.push_str("<|END_OF_TURN_TOKEN|>");
+    }
+
+    result.push_str("<|START_OF_TURN_TOKEN|><|USER_TOKEN|>");
+    result.push_str(user_message);
+    result.push_str("<|END_OF_TURN_TOKEN|>");
+    result.push_str("<|START_OF_TURN_TOKEN|><|CHATBOT_TOKEN|>");
+
+    result
+}
+
 /// Get stop tokens appropriate for a given chat template type.
 ///
 /// Encodes the template's EOS token via the tokenizer; falls back to the generic
 /// `get_eos_tokens` if encoding fails.
+#[allow(dead_code)]
 fn get_chat_stop_tokens(
     template_type: pmetal_data::chat_templates::ChatTemplateType,
     tokenizer: &Tokenizer,
 ) -> Vec<u32> {
+    // Delegate to the unified collector — merges generation_config.json EOS,
+    // chat template EOS, tokenizer EOS, and well-known special tokens.
+    // This ensures that chat-mode inference on a base model with LoRA
+    // still stops on both <|im_end|> AND <|endoftext|>.
+    //
+    // NOTE: We need model_path here. Since we don't have it in scope,
+    // reconstruct from tokenizer's directory (callers always loaded the tokenizer
+    // from model_path). For now, use the old approach enhanced with the
+    // well-known tokens probe.
     let eos_str = template_type.eos_token();
     let mut tokens = Vec::new();
+
+    // Template-specific EOS
     if let Ok(encoded) = tokenizer.encode(eos_str) {
-        if let Some(&tok) = encoded.last() {
-            tokens.push(tok);
+        if encoded.len() == 1 {
+            tokens.push(encoded[0]);
         }
     }
-    // Hardcoded fallbacks for common models whose tokenizers might not cleanly encode
-    // the special-token string
+
+    // Hardcoded fallbacks for common models
     if tokens.is_empty() {
         match template_type {
             pmetal_data::chat_templates::ChatTemplateType::ChatMl
@@ -3645,18 +4041,48 @@ fn get_chat_stop_tokens(
                 tokens.push(128009); // <|eot_id|>
             }
             _ => {
-                // Best-effort: try encoding </s> (common EOS across many models)
                 if let Ok(encoded) = tokenizer.encode("</s>") {
-                    if let Some(&tok) = encoded.last() {
-                        tokens.push(tok);
+                    if encoded.len() == 1 {
+                        tokens.push(encoded[0]);
                     }
                 }
                 if tokens.is_empty() {
-                    tokens.push(2); // Very common </s> id
+                    tokens.push(2);
                 }
             }
         }
     }
+
+    // Also include the tokenizer's native EOS — critical for base models
+    // fine-tuned with LoRA that might emit either the chat EOS or the base EOS.
+    if let Some(eos) = tokenizer.eos_token_id() {
+        if !tokens.contains(&eos) {
+            tokens.push(eos);
+        }
+    }
+
+    // Probe well-known special tokens in vocabulary
+    let candidates = [
+        "<|im_end|>",
+        "<|eot_id|>",
+        "<|eot|>",
+        "<|endoftext|>",
+        "<|end_of_text|>",
+        "<end_of_turn>",
+        "<|end|>",
+        "<|return|>",
+        "<|END_OF_TURN_TOKEN|>",
+        "<｜end▁of▁sentence｜>",
+        "</s>",
+    ];
+    for candidate in &candidates {
+        if let Ok(encoded) = tokenizer.encode(*candidate) {
+            if encoded.len() == 1 && !tokens.contains(&encoded[0]) {
+                tokens.push(encoded[0]);
+            }
+        }
+    }
+
     tokens
 }
 
@@ -3695,7 +4121,10 @@ fn strip_eos_tokens(text: &str) -> &str {
         "<|endoftext|>",
         "<|im_end|>",
         "<|eot_id|>",
+        "<|eot|>",
         "<end_of_turn>",
+        "<|END_OF_TURN_TOKEN|>",
+        "<｜end▁of▁sentence｜>",
         "<|return|>",
         "<|end|>",
         "</s>",
@@ -3771,17 +4200,32 @@ fn extract_thinking_content(text: &str) -> Option<String> {
 }
 
 /// Run inference with LoRA adapter (supports all architectures via DynamicLoraModel).
+///
+/// Mirrors the main inference path: auto-detects chat mode, applies chat template,
+/// configures stop tokens (including chat EOS), and respects all sampling parameters.
+#[allow(clippy::too_many_arguments)]
 async fn run_inference_with_lora(
     model_path: &Path,
     lora_path: &str,
     tokenizer: &Tokenizer,
     prompt: &str,
     max_tokens: usize,
-    temperature: f32,
+    temperature: Option<f32>,
+    top_k: Option<usize>,
+    top_p: Option<f32>,
+    min_p: Option<f32>,
+    repetition_penalty: Option<f32>,
+    frequency_penalty: Option<f32>,
+    presence_penalty: Option<f32>,
+    seed: Option<u64>,
+    chat: bool,
+    system: Option<&str>,
+    no_thinking: bool,
+    show_thinking: bool,
 ) -> anyhow::Result<()> {
     use pmetal_core::LoraConfig;
     use pmetal_lora::{DynamicLoraModel, TrainableModel};
-    use pmetal_models::{GenerationConfig, generate_cached_async};
+    use pmetal_models::{GenerationConfig, generate_cached_async_streaming};
 
     // Create LoRA config - we'll load actual weights which override this
     let lora_config = LoraConfig {
@@ -3801,24 +4245,91 @@ async fn run_inference_with_lora(
 
     tracing::info!("Model loaded successfully");
 
-    // Tokenize prompt
-    let input_ids = tokenizer.encode(prompt)?;
-    tracing::info!("Tokenized {} tokens", input_ids.len());
+    // Auto-detect chat mode: LoRA fine-tuned models almost always use chat format,
+    // so enable chat if the model has chat special tokens even if it's a "base" model.
+    let is_instruct = is_instruction_tuned(model_path);
+    let has_chat_tokens = tokenizer.encode("<|im_end|>").map_or(false, |t| t.len() == 1)
+        || tokenizer.encode("<|eot_id|>").map_or(false, |t| t.len() == 1);
+    let use_chat = chat || is_instruct || has_chat_tokens;
 
-    // Configure generation
-    let gen_config = if temperature > 0.0 {
-        GenerationConfig::sampling(max_tokens, temperature)
-            .with_stop_tokens(vec![tokenizer.eos_token_id().unwrap_or(2)])
+    if !chat && use_chat {
+        tracing::info!(
+            "Auto-enabled chat mode for LoRA inference ({})",
+            if is_instruct {
+                "instruction-tuned model"
+            } else {
+                "model has chat special tokens"
+            }
+        );
+    }
+
+    // Load sampling defaults from model's generation_config.json
+    let defaults = load_sampling_defaults(model_path, use_chat && !no_thinking);
+
+    // Apply CLI overrides over model defaults
+    let temperature = temperature.unwrap_or(defaults.temperature);
+    let top_k = top_k.unwrap_or(defaults.top_k);
+    let top_p = top_p.unwrap_or(defaults.top_p);
+    let min_p = min_p.unwrap_or(defaults.min_p);
+    let repetition_penalty = repetition_penalty.unwrap_or(defaults.repetition_penalty);
+    let frequency_penalty = frequency_penalty.unwrap_or(defaults.frequency_penalty);
+    let presence_penalty = presence_penalty.unwrap_or(defaults.presence_penalty);
+
+    // Apply chat template if using chat mode
+    let (final_prompt, template_type) = if use_chat {
+        apply_chat_template(tokenizer, prompt, system, model_path, no_thinking)?
     } else {
-        GenerationConfig::greedy(max_tokens)
-            .with_stop_tokens(vec![tokenizer.eos_token_id().unwrap_or(2)])
+        (
+            prompt.to_string(),
+            pmetal_data::chat_templates::ChatTemplateType::ChatMl,
+        )
     };
 
-    println!("\nPrompt: {}\n", prompt);
+    // Tokenize prompt
+    let input_ids = tokenizer.encode(&final_prompt)?;
+    tracing::info!("Tokenized {} tokens", input_ids.len());
+
+    // Configure stop tokens — unified collection from all sources
+    let stop_tokens = collect_all_stop_tokens(
+        model_path,
+        tokenizer,
+        if use_chat { Some(template_type) } else { None },
+    );
+
+    // Configure generation with all sampling parameters
+    let gen_config = if temperature == 0.0 {
+        GenerationConfig::greedy(max_tokens).with_stop_tokens(stop_tokens)
+    } else {
+        let mut config = GenerationConfig::sampling(max_tokens, temperature)
+            .with_top_k(top_k)
+            .with_top_p(top_p)
+            .with_min_p(min_p)
+            .with_repetition_penalty(repetition_penalty)
+            .with_frequency_penalty(frequency_penalty)
+            .with_presence_penalty(presence_penalty)
+            .with_stop_tokens(stop_tokens);
+
+        if let Some(s) = seed {
+            config = config.with_seed(s);
+        }
+
+        config
+    };
+
+    // Print configuration
+    println!("\n========================================");
+    println!("  PMetal Inference (LoRA)");
+    println!("========================================");
+    println!("LoRA:        {}", lora_path);
+    println!("Chat mode:   {}", use_chat);
+    println!("Temperature: {}", gen_config.temperature);
+    println!("Stop tokens: {:?}", gen_config.stop_tokens);
+    println!("========================================\n");
+
+    println!("Prompt: {}\n", prompt);
     println!("Generating with KV cache...\n");
 
     // Create KV cache for efficient generation
-    // Cache size = prompt_len + max_tokens + buffer
     let max_seq_len = input_ids.len() + max_tokens + 64;
     let mut cache = model
         .create_cache(max_seq_len)
@@ -3833,8 +4344,12 @@ async fn run_inference_with_lora(
 
     let start = std::time::Instant::now();
 
-    // Generate with hybrid cache (KV + Mamba for hybrid models)
-    let output = generate_cached_async(
+    // Generate with hybrid cache — stream tokens as they're produced
+    let mut token_buf: Vec<u32> = Vec::new();
+    let mut streamed_text = String::new();
+    let tokenizer_ref = tokenizer;
+
+    let output = generate_cached_async_streaming(
         |input, cache| {
             model
                 .forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
@@ -3843,15 +4358,34 @@ async fn run_inference_with_lora(
         &input_ids,
         gen_config,
         &mut cache,
+        |token_id| {
+            use std::io::Write;
+            token_buf.push(token_id);
+            if let Ok(text) = tokenizer_ref.decode(&token_buf) {
+                if text.len() > streamed_text.len() {
+                    let delta = &text[streamed_text.len()..];
+                    let _ = std::io::stdout().write_all(delta.as_bytes());
+                    let _ = std::io::stdout().flush();
+                }
+                streamed_text = text;
+            }
+            true
+        },
     )?;
 
     let elapsed = start.elapsed();
+    println!(); // finish streamed line
 
-    // Decode only the generated tokens (not the prompt)
-    let prompt_len = input_ids.len();
-    let generated_tokens = &output.token_ids[prompt_len..];
-    let generated_text = tokenizer.decode(generated_tokens)?;
-    println!("{}", generated_text);
+    // Post-process: extract thinking and clean up EOS tokens
+    if use_chat && show_thinking {
+        if let Some(thinking) = extract_thinking_content(&streamed_text) {
+            if !thinking.is_empty() {
+                println!("\n--- Thinking ---");
+                println!("{}", thinking.trim());
+                println!("--- End Thinking ---\n");
+            }
+        }
+    }
 
     let tokens_per_sec = output.num_generated as f64 / elapsed.as_secs_f64();
     println!("\n---");
