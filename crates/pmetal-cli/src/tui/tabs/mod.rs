@@ -1,8 +1,10 @@
 //! Tab definitions and implementations for the PMetal TUI.
 
-mod dashboard;
+pub mod dashboard;
 mod datasets;
 mod device;
+mod distillation;
+mod grpo;
 mod inference;
 mod jobs;
 mod models;
@@ -11,10 +13,22 @@ mod training;
 pub use dashboard::DashboardTab;
 pub use datasets::DatasetsTab;
 pub use device::DeviceTab;
+pub use distillation::{DistillAction, DistillationTab};
+pub use grpo::{GrpoAction, GrpoTab};
 pub use inference::InferenceTab;
 pub use jobs::JobsTab;
-pub use models::ModelsTab;
-pub use training::TrainingTab;
+pub use models::{write_training_info, ModelSource, ModelsTab};
+pub use training::{TrainingAction, TrainingTab};
+
+/// Extract a short model name from a model ID.
+/// e.g. "unsloth/Qwen3-0.6B" → "Qwen3-0.6B", "trained/foo" → "foo"
+pub fn model_short_name(model_id: &str) -> String {
+    model_id
+        .rsplit('/')
+        .next()
+        .unwrap_or(model_id)
+        .to_string()
+}
 
 /// All available tabs in the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +38,8 @@ pub enum Tab {
     Models,
     Datasets,
     Training,
+    Distillation,
+    Grpo,
     Inference,
     Jobs,
 }
@@ -36,6 +52,8 @@ impl Tab {
         Tab::Models,
         Tab::Datasets,
         Tab::Training,
+        Tab::Distillation,
+        Tab::Grpo,
         Tab::Inference,
         Tab::Jobs,
     ];
@@ -48,6 +66,8 @@ impl Tab {
             Tab::Models => "~",
             Tab::Datasets => "&",
             Tab::Training => ">",
+            Tab::Distillation => "^",
+            Tab::Grpo => "!",
             Tab::Inference => "$",
             Tab::Jobs => "%",
         }
@@ -76,6 +96,8 @@ impl std::fmt::Display for Tab {
             Tab::Models => write!(f, "Models"),
             Tab::Datasets => write!(f, "Datasets"),
             Tab::Training => write!(f, "Training"),
+            Tab::Distillation => write!(f, "Distill"),
+            Tab::Grpo => write!(f, "GRPO"),
             Tab::Inference => write!(f, "Inference"),
             Tab::Jobs => write!(f, "Jobs"),
         }
