@@ -23,7 +23,7 @@ impl Widget for Footer {
             Span::styled(" switch  ", THEME.footer_desc),
         ];
 
-        // Tab-specific bindings — only advertise implemented features
+        // Tab-specific bindings
         match self.tab {
             Tab::Dashboard => {
                 spans.extend([
@@ -36,47 +36,85 @@ impl Widget for Footer {
             Tab::Models => {
                 spans.extend([
                     Span::styled("jk", THEME.footer_key),
+                    Span::styled(" nav  ", THEME.footer_desc),
+                    Span::styled("t", THEME.footer_key),
+                    Span::styled(" train  ", THEME.footer_desc),
+                    Span::styled("s", THEME.footer_key),
+                    Span::styled(" distill  ", THEME.footer_desc),
+                    Span::styled("i", THEME.footer_key),
+                    Span::styled(" infer  ", THEME.footer_desc),
+                    Span::styled("f", THEME.footer_key),
+                    Span::styled(" fuse  ", THEME.footer_desc),
+                    Span::styled("d", THEME.footer_key),
+                    Span::styled(" download  ", THEME.footer_desc),
+                ]);
+            }
+            Tab::Datasets => {
+                spans.extend([
+                    Span::styled("jk", THEME.footer_key),
                     Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("/", THEME.footer_key),
-                    Span::styled(" search  ", THEME.footer_desc),
+                    Span::styled("c", THEME.footer_key),
+                    Span::styled(" convert  ", THEME.footer_desc),
+                    Span::styled("a", THEME.footer_key),
+                    Span::styled(" add dir  ", THEME.footer_desc),
                     Span::styled("R", THEME.footer_key),
                     Span::styled(" refresh  ", THEME.footer_desc),
                 ]);
             }
-            Tab::Datasets | Tab::Jobs => {
+            Tab::Training | Tab::Distillation | Tab::Grpo => {
                 spans.extend([
                     Span::styled("jk", THEME.footer_key),
                     Span::styled(" navigate  ", THEME.footer_desc),
-                    Span::styled("R", THEME.footer_key),
-                    Span::styled(" refresh  ", THEME.footer_desc),
+                    Span::styled("Enter", THEME.footer_key),
+                    Span::styled(" edit/pick  ", THEME.footer_desc),
+                    Span::styled("S", THEME.footer_key),
+                    Span::styled(" start  ", THEME.footer_desc),
+                    Span::styled("x", THEME.footer_key),
+                    Span::styled(" stop  ", THEME.footer_desc),
                 ]);
             }
             Tab::Inference => {
                 spans.extend([
                     Span::styled("Enter", THEME.footer_key),
                     Span::styled(" send  ", THEME.footer_desc),
+                    Span::styled("Ctrl+P", THEME.footer_key),
+                    Span::styled(" model  ", THEME.footer_desc),
+                    Span::styled("Ctrl+S", THEME.footer_key),
+                    Span::styled(" settings  ", THEME.footer_desc),
+                    Span::styled("PgUp/Dn", THEME.footer_key),
+                    Span::styled(" scroll  ", THEME.footer_desc),
                     Span::styled("Esc", THEME.footer_key),
                     Span::styled(" stop  ", THEME.footer_desc),
-                    Span::styled("C-q", THEME.footer_key),
+                    Span::styled("Ctrl+Q", THEME.footer_key),
                     Span::styled(" quit  ", THEME.footer_desc),
                 ]);
             }
-            Tab::Training => {
+            Tab::Jobs => {
                 spans.extend([
                     Span::styled("jk", THEME.footer_key),
                     Span::styled(" navigate  ", THEME.footer_desc),
+                    Span::styled("JK", THEME.footer_key),
+                    Span::styled(" scroll log  ", THEME.footer_desc),
+                    Span::styled("R", THEME.footer_key),
+                    Span::styled(" refresh  ", THEME.footer_desc),
                 ]);
             }
-            Tab::Device => {}
+            Tab::Device => {
+                // Device tab is read-only; no tab-specific bindings
+            }
         }
 
-        // Global quit (not shown for Inference since it has its own)
+        // Global keybindings (not shown for Inference since it has its own quit)
         if self.tab != Tab::Inference {
             spans.extend([
                 Span::styled("q", THEME.footer_key),
-                Span::styled(" quit", THEME.footer_desc),
+                Span::styled(" quit  ", THEME.footer_desc),
             ]);
         }
+        spans.extend([
+            Span::styled("F2", THEME.footer_key),
+            Span::styled(" mouse/select", THEME.footer_desc),
+        ]);
 
         Line::from(spans).render(area, buf);
     }
