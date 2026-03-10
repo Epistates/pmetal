@@ -1556,6 +1556,122 @@ where
     })
 }
 
+/// Streaming variant of [`generate_cached_async`] that calls `on_token` with each
+/// generated token ID as it's produced, enabling real-time display.
+///
+/// The callback returns `true` to continue generation or `false` to stop early.
+pub fn generate_cached_async_streaming<F, C>(
+    mut forward_fn: F,
+    input_ids: &[u32],
+    config: GenerationConfig,
+    cache: &mut KVCache,
+    mut on_token: C,
+) -> Result<GenerationOutput, Exception>
+where
+    F: FnMut(&Array, &mut KVCache) -> Result<Array, Exception>,
+    C: FnMut(u32) -> bool,
+{
+    let _wired_guard = WiredLimitGuard::new();
+    let generation_stream = create_generation_stream();
+
+    let mut all_tokens: Vec<u32> = input_ids.to_vec();
+    let sampler = Sampler::new(config.clone());
+    let prompt_len = input_ids.len();
+
+    let extract_logits = |logits: &Array| -> Array {
+        let last_idx = logits.dim(1) - 1;
+        logits.index((.., last_idx, ..))
+    };
+
+    // Prefill
+    let prompt_input = Array::from_slice(
+        &input_ids.iter().map(|&t| t as i32).collect::<Vec<_>>(),
+        &[1, prompt_len as i32],
+    );
+
+    let (mut current_y, mut current_logprobs) = {
+        let _stream_ctx = StreamContext::new(&generation_stream);
+        let logits = forward_fn(&prompt_input, cache)?;
+        let current_logits = extract_logits(&logits);
+        sampler.sample_array(&current_logits)?
+    };
+    async_eval([&current_y, &current_logprobs])?;
+
+    let mut n = 0;
+
+    loop {
+        let next_pair = if n + 1 < config.max_new_tokens {
+            let (y, lp) = {
+                let _stream_ctx = StreamContext::new(&generation_stream);
+                let next_input = current_y
+                    .as_dtype(mlx_rs::Dtype::Int32)?
+                    .reshape(&[1, -1])?;
+                let next_output = forward_fn(&next_input, cache)?;
+                let next_logits = next_output.index((.., 0, ..));
+                sampler.sample_array(&next_logits)?
+            };
+            async_eval([&y, &lp])?;
+            Some((y, lp))
+        } else {
+            None
+        };
+
+        if n == 0 {
+            current_y.eval()?;
+        }
+
+        if n >= config.max_new_tokens {
+            break;
+        }
+
+        let token = current_y.item::<u32>();
+
+        if sampler.is_stop_token(token) {
+            let num_generated = all_tokens.len() - prompt_len;
+            return Ok(GenerationOutput {
+                token_ids: all_tokens,
+                num_generated,
+                stopped_by_token: true,
+                stopped_by_length: false,
+            });
+        }
+
+        all_tokens.push(token);
+
+        // Stream token to caller
+        if !on_token(token) {
+            let num_generated = all_tokens.len() - prompt_len;
+            return Ok(GenerationOutput {
+                token_ids: all_tokens,
+                num_generated,
+                stopped_by_token: false,
+                stopped_by_length: false,
+            });
+        }
+
+        if n % 256 == 0 && n > 0 {
+            mlx_rs::transforms::compile::clear_cache();
+        }
+
+        if let Some((y, lp)) = next_pair {
+            current_y = y;
+            current_logprobs = lp;
+        }
+
+        n += 1;
+    }
+
+    let _ = current_logprobs;
+
+    let num_generated = all_tokens.len() - prompt_len;
+    Ok(GenerationOutput {
+        token_ids: all_tokens,
+        num_generated,
+        stopped_by_token: false,
+        stopped_by_length: true,
+    })
+}
+
 /// High-performance generation using fused Metal sampling kernel.
 ///
 /// This function uses a custom Metal kernel that fuses all sampling operations

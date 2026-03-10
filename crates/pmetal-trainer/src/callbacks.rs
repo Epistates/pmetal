@@ -276,7 +276,9 @@ impl TrainingCallback for MetricsJsonCallback {
         let timestamp = chrono::Utc::now().to_rfc3339();
         self.write_entry(serde_json::json!({
             "step": metrics.step,
-            "epoch": self.current_epoch,
+            "epoch": metrics.epoch,
+            "total_epochs": metrics.total_epochs,
+            "total_steps": metrics.total_steps,
             "loss": metrics.loss,
             "lr": metrics.lr,
             "tok_sec": metrics.tok_sec,
