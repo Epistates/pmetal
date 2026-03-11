@@ -2,6 +2,7 @@
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, StatefulWidget,
@@ -39,6 +40,17 @@ impl std::fmt::Display for ChatRole {
 /// Inference settings that can be navigated with arrow keys.
 const SETTING_NAMES: &[&str] = &["Temperature", "Max Tokens", "Top-k", "Top-p"];
 
+/// Focus mode for the inference tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InferenceFocus {
+    /// Typing in the input box.
+    Input,
+    /// Navigating settings sidebar.
+    Settings,
+    /// Browsing messages (sidebar hidden, message selection active).
+    Browse,
+}
+
 /// Inference tab state.
 pub struct InferenceTab {
     pub model_id: Option<String>,
@@ -51,10 +63,24 @@ pub struct InferenceTab {
     pub max_tokens: usize,
     pub top_k: usize,
     pub top_p: f32,
-    pub input_focused: bool,
-    pub settings_focused: bool,
+    pub focus: InferenceFocus,
     pub settings_selected: usize,
     message_scroll: usize,
+    /// Currently selected message index in Browse mode.
+    pub selected_message: Option<usize>,
+    /// Whether the sidebar is visible.
+    pub sidebar_visible: bool,
+}
+
+// Keep backwards-compat public fields as computed properties
+impl InferenceTab {
+    pub fn input_focused(&self) -> bool {
+        self.focus == InferenceFocus::Input
+    }
+
+    pub fn settings_focused(&self) -> bool {
+        self.focus == InferenceFocus::Settings
+    }
 }
 
 impl InferenceTab {
@@ -69,10 +95,11 @@ impl InferenceTab {
             max_tokens: 2048,
             top_k: 50,
             top_p: 0.9,
-            input_focused: true,
-            settings_focused: false,
+            focus: InferenceFocus::Input,
             settings_selected: 0,
             message_scroll: 0,
+            selected_message: None,
+            sidebar_visible: true,
         }
     }
 
@@ -204,9 +231,92 @@ impl InferenceTab {
         }
     }
 
+    /// Toggle settings sidebar focus (Ctrl+S).
     pub fn toggle_settings_focus(&mut self) {
-        self.settings_focused = !self.settings_focused;
-        self.input_focused = !self.settings_focused;
+        match self.focus {
+            InferenceFocus::Input => {
+                self.focus = InferenceFocus::Settings;
+                self.sidebar_visible = true;
+            }
+            InferenceFocus::Settings => {
+                self.focus = InferenceFocus::Input;
+            }
+            InferenceFocus::Browse => {
+                self.focus = InferenceFocus::Settings;
+                self.sidebar_visible = true;
+                self.selected_message = None;
+            }
+        }
+    }
+
+    /// Toggle sidebar visibility (Ctrl+H).
+    pub fn toggle_sidebar(&mut self) {
+        self.sidebar_visible = !self.sidebar_visible;
+        if !self.sidebar_visible && self.focus == InferenceFocus::Settings {
+            self.focus = InferenceFocus::Input;
+        }
+    }
+
+    /// Enter browse mode (F2 or Ctrl+B): hide sidebar, enable message selection.
+    pub fn enter_browse_mode(&mut self) {
+        if self.messages.is_empty() {
+            return;
+        }
+        self.focus = InferenceFocus::Browse;
+        self.sidebar_visible = false;
+        // Start at the last message
+        self.selected_message = Some(self.messages.len() - 1);
+    }
+
+    /// Exit browse mode back to input.
+    pub fn exit_browse_mode(&mut self) {
+        self.focus = InferenceFocus::Input;
+        self.selected_message = None;
+    }
+
+    /// Select next message (down in browse mode).
+    pub fn next_message(&mut self) {
+        if let Some(idx) = self.selected_message {
+            if idx + 1 < self.messages.len() {
+                self.selected_message = Some(idx + 1);
+            }
+        }
+    }
+
+    /// Select previous message (up in browse mode).
+    pub fn prev_message(&mut self) {
+        if let Some(idx) = self.selected_message {
+            if idx > 0 {
+                self.selected_message = Some(idx - 1);
+            }
+        }
+    }
+
+    /// Get the content of the currently selected message (for yanking).
+    pub fn selected_message_content(&self) -> Option<&str> {
+        self.selected_message
+            .and_then(|idx| self.messages.get(idx))
+            .map(|msg| {
+                // For assistant messages, extract just the response (strip thinking)
+                msg.content.as_str()
+            })
+    }
+
+    /// Yank (copy) the selected message content to the system clipboard.
+    pub fn yank_selected(&self) -> Option<String> {
+        let content = self.selected_message_content()?;
+
+        // For assistant messages, extract the response part (strip thinking blocks)
+        let idx = self.selected_message?;
+        let msg = &self.messages[idx];
+        let text = if msg.role == ChatRole::Assistant {
+            let (_thinking, response) = parse_thinking(content);
+            response.to_string()
+        } else {
+            content.to_string()
+        };
+
+        Some(text)
     }
 
     pub fn next_setting(&mut self) {
@@ -251,25 +361,45 @@ impl InferenceTab {
         self.message_scroll = usize::MAX;
     }
 
-    /// Build the chat lines for rendering.
+    /// Build the chat lines for rendering, with optional message highlighting.
     fn build_chat_lines(
         messages: &[ChatMessage],
         generating: bool,
         wrap_width: u16,
+        selected_message: Option<usize>,
     ) -> Vec<Line<'static>> {
         let mut lines: Vec<Line<'static>> = Vec::new();
+        let code_style = Style::default()
+            .fg(Color::Rgb(190, 200, 220))
+            .bg(Color::Rgb(30, 41, 59));
+        let code_fence_style = Style::default().fg(Color::Rgb(100, 116, 139));
 
-        for msg in messages {
+        for (msg_idx, msg) in messages.iter().enumerate() {
+            let is_selected = selected_message == Some(msg_idx);
+
             // Role header
-            let role_style = match msg.role {
-                ChatRole::System => THEME.text_muted,
-                ChatRole::User => THEME.text_success,
-                ChatRole::Assistant => THEME.text_bright,
+            let role_style = if is_selected {
+                Style::default()
+                    .fg(match msg.role {
+                        ChatRole::System => Color::Rgb(100, 116, 139),
+                        ChatRole::User => Color::Rgb(34, 197, 94),
+                        ChatRole::Assistant => Color::Rgb(248, 250, 252),
+                    })
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                match msg.role {
+                    ChatRole::System => THEME.text_muted,
+                    ChatRole::User => THEME.text_success,
+                    ChatRole::Assistant => THEME.text_bright,
+                }
             };
-            lines.push(Line::from(Span::styled(
-                format!("[{}]", msg.role),
-                role_style,
-            )));
+
+            let header = if is_selected {
+                format!(" [{}] (y to copy) ", msg.role)
+            } else {
+                format!("[{}]", msg.role)
+            };
+            lines.push(Line::from(Span::styled(header, role_style)));
 
             if msg.content.is_empty() && msg.role == ChatRole::Assistant {
                 // Streaming placeholder
@@ -298,13 +428,15 @@ impl InferenceTab {
                     )));
                 }
 
-                // Render response content
-                for line in response.lines() {
-                    let wrapped = wrap_text(line, wrap_width.saturating_sub(4) as usize);
-                    for w in wrapped {
-                        lines.push(Line::from(Span::styled(format!("  {w}"), THEME.text)));
-                    }
-                }
+                // Render response content with code block detection
+                render_markdown_content(
+                    response,
+                    wrap_width.saturating_sub(4) as usize,
+                    &mut lines,
+                    THEME.text,
+                    code_style,
+                    code_fence_style,
+                );
                 // If still generating and response is empty, show cursor
                 if response.is_empty() && generating && thinking.is_some() {
                     lines.push(Line::from(Span::styled(
@@ -339,6 +471,67 @@ impl InferenceTab {
 
         lines
     }
+}
+
+/// Render text content with basic markdown code block detection.
+///
+/// Detects ``` fenced code blocks and renders them with a distinct background style
+/// and without word wrapping (code should preserve its formatting).
+fn render_markdown_content(
+    text: &str,
+    wrap_width: usize,
+    lines: &mut Vec<Line<'static>>,
+    text_style: Style,
+    code_style: Style,
+    fence_style: Style,
+) {
+    let mut in_code_block = false;
+    let mut code_lang = String::new();
+
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("```") {
+            if !in_code_block {
+                // Opening fence
+                code_lang = trimmed.strip_prefix("```").unwrap_or("").trim().to_string();
+                let label = if code_lang.is_empty() {
+                    "  ``` ".to_string()
+                } else {
+                    format!("  ```{code_lang} ")
+                };
+                lines.push(Line::from(Span::styled(label, fence_style)));
+                in_code_block = true;
+            } else {
+                // Closing fence
+                lines.push(Line::from(Span::styled("  ```", fence_style)));
+                in_code_block = false;
+                code_lang.clear();
+            }
+            continue;
+        }
+
+        if in_code_block {
+            // Code lines: no word wrap, use code style, indent with 4 spaces
+            // Truncate if wider than available width
+            let display = if line.len() > wrap_width {
+                &line[..wrap_width]
+            } else {
+                line
+            };
+            lines.push(Line::from(Span::styled(
+                format!("    {display}"),
+                code_style,
+            )));
+        } else {
+            // Normal text: word wrap
+            let wrapped = wrap_text(line, wrap_width);
+            for w in wrapped {
+                lines.push(Line::from(Span::styled(format!("  {w}"), text_style)));
+            }
+        }
+    }
+
+    // If we ended inside a code block (incomplete generation), that's fine
 }
 
 /// Parse `<think>...</think>` content from assistant response.
@@ -449,31 +642,53 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
 
 impl Widget for &mut InferenceTab {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        // Settings sidebar on the right, chat on the left
-        let sidebar_width = if self.settings_focused { 28 } else { 24 };
-        let [chat_area, sidebar_area] =
-            Layout::horizontal([Constraint::Fill(1), Constraint::Length(sidebar_width)])
-                .areas(area);
+        if self.sidebar_visible {
+            let sidebar_width = if self.focus == InferenceFocus::Settings {
+                28
+            } else {
+                24
+            };
+            let [chat_area, sidebar_area] =
+                Layout::horizontal([Constraint::Fill(1), Constraint::Length(sidebar_width)])
+                    .areas(area);
 
-        let [messages_area, input_area] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(chat_area);
+            let [messages_area, input_area] =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(chat_area);
 
-        self.render_messages(messages_area, buf);
-        self.render_input(input_area, buf);
-        self.render_settings(sidebar_area, buf);
+            self.render_messages(messages_area, buf);
+            self.render_input(input_area, buf);
+            self.render_settings(sidebar_area, buf);
+        } else {
+            // No sidebar — full width for chat
+            let [messages_area, input_area] =
+                Layout::vertical([Constraint::Fill(1), Constraint::Length(3)]).areas(area);
+
+            self.render_messages(messages_area, buf);
+            self.render_input(input_area, buf);
+        }
     }
 }
 
 impl InferenceTab {
     fn render_messages(&mut self, area: Rect, buf: &mut Buffer) {
+        let title = match (&self.model_id, self.focus) {
+            (Some(id), InferenceFocus::Browse) => format!(" Chat -- {id} [BROWSE] "),
+            (Some(id), _) => format!(" Chat -- {id} "),
+            (None, _) => " Chat (Ctrl+P to select model) ".to_string(),
+        };
         let block = Block::default()
-            .title(match &self.model_id {
-                Some(id) => format!(" Chat -- {id} "),
-                None => " Chat (Ctrl+P to select model) ".to_string(),
+            .title(title)
+            .title_style(if self.focus == InferenceFocus::Browse {
+                THEME.block_title_focused
+            } else {
+                THEME.block_title
             })
-            .title_style(THEME.block_title)
             .borders(Borders::ALL)
-            .border_style(THEME.block);
+            .border_style(if self.focus == InferenceFocus::Browse {
+                THEME.block_focused
+            } else {
+                THEME.block
+            });
         let inner = block.inner(area);
         block.render(area, buf);
 
@@ -492,11 +707,7 @@ impl InferenceTab {
                 )),
                 Line::from(""),
                 Line::from(Span::styled(
-                    "  Ctrl+S: toggle settings  Ctrl+P: pick model",
-                    THEME.text_muted,
-                )),
-                Line::from(Span::styled(
-                    "  +/- to adjust settings, Esc to stop generation",
+                    "  Ctrl+S: settings  Ctrl+H: toggle sidebar  F2: browse/yank",
                     THEME.text_muted,
                 )),
             ];
@@ -504,7 +715,12 @@ impl InferenceTab {
             return;
         }
 
-        let chat_lines = Self::build_chat_lines(&self.messages, self.generating, inner.width);
+        let chat_lines = Self::build_chat_lines(
+            &self.messages,
+            self.generating,
+            inner.width,
+            self.selected_message,
+        );
         let total_lines = chat_lines.len();
         let visible_height = inner.height as usize;
 
@@ -530,23 +746,28 @@ impl InferenceTab {
     }
 
     fn render_input(&self, area: Rect, buf: &mut Buffer) {
-        let border_style = if self.input_focused {
+        let is_focused = self.focus == InferenceFocus::Input;
+        let border_style = if is_focused {
             THEME.block_focused
         } else {
             THEME.block
         };
-        let title_style = if self.input_focused {
+        let title_style = if is_focused {
             THEME.block_title_focused
         } else {
             THEME.block_title
         };
 
+        let title = if self.generating {
+            " Generating... (Esc to stop) "
+        } else if self.focus == InferenceFocus::Browse {
+            " Input (Esc to exit browse) "
+        } else {
+            " Input "
+        };
+
         let block = Block::default()
-            .title(if self.generating {
-                " Generating... (Esc to stop) "
-            } else {
-                " Input "
-            })
+            .title(title)
             .title_style(title_style)
             .borders(Borders::ALL)
             .border_style(border_style);
@@ -570,14 +791,15 @@ impl InferenceTab {
     }
 
     fn render_settings(&self, area: Rect, buf: &mut Buffer) {
-        let border_style = if self.settings_focused {
+        let is_focused = self.focus == InferenceFocus::Settings;
+        let border_style = if is_focused {
             THEME.block_focused
         } else {
             THEME.block
         };
         let block = Block::default()
             .title(" Settings ")
-            .title_style(if self.settings_focused {
+            .title_style(if is_focused {
                 THEME.block_title_focused
             } else {
                 THEME.block_title
@@ -615,7 +837,7 @@ impl InferenceTab {
         ];
 
         for (i, (name, val)) in SETTING_NAMES.iter().zip(setting_values.iter()).enumerate() {
-            let selected = self.settings_focused && i == self.settings_selected;
+            let selected = is_focused && i == self.settings_selected;
             let style = if selected {
                 THEME.table_selected
             } else {
@@ -630,17 +852,18 @@ impl InferenceTab {
         }
 
         lines.push(Line::from(""));
-        if self.settings_focused {
-            lines.push(Line::from(Span::styled(
-                " Ctrl+S: back to input",
-                THEME.text_muted,
-            )));
-        } else {
-            lines.push(Line::from(Span::styled(
-                " Ctrl+S: edit settings",
-                THEME.text_muted,
-            )));
-        }
+        lines.push(Line::from(Span::styled(
+            if is_focused {
+                " Ctrl+S: back to input"
+            } else {
+                " Ctrl+S: edit settings"
+            },
+            THEME.text_muted,
+        )));
+        lines.push(Line::from(Span::styled(
+            " Ctrl+H: hide sidebar",
+            THEME.text_muted,
+        )));
 
         Paragraph::new(lines).render(inner, buf);
     }

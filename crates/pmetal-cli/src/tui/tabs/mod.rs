@@ -15,7 +15,7 @@ pub use datasets::DatasetsTab;
 pub use device::DeviceTab;
 pub use distillation::{DistillAction, DistillationTab};
 pub use grpo::{GrpoAction, GrpoTab};
-pub use inference::InferenceTab;
+pub use inference::{InferenceFocus, InferenceTab};
 pub use jobs::JobsTab;
 pub use models::{ModelSource, ModelsTab, write_training_info};
 pub use training::{TrainingAction, TrainingTab};

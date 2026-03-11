@@ -484,31 +484,89 @@ impl App {
 
     // --- Inference tab key handler ---
     fn handle_inference_key(&mut self, key: crossterm::event::KeyEvent) {
+        use crate::tui::tabs::InferenceFocus;
+
         match key.code {
-            KeyCode::Enter if self.inference.input_focused => {
-                self.submit_inference();
-            }
-            KeyCode::Backspace if self.inference.input_focused => {
-                self.inference.delete_char();
-            }
-            KeyCode::Left if self.inference.input_focused => {
-                self.inference.move_cursor_left();
-            }
-            KeyCode::Right if self.inference.input_focused => {
-                self.inference.move_cursor_right();
-            }
+            // --- Global keybindings (any focus mode) ---
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.should_quit = true;
             }
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Open model picker (Ctrl+P)
                 self.pending_modal_context = Some(PendingModalTarget::InferenceModel);
                 let entries = self.model_picker_entries();
                 self.modal_stack.push(Modal::model_picker(entries));
             }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.inference.toggle_settings_focus();
+            }
+            KeyCode::Char('h') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.inference.toggle_sidebar();
+            }
+            KeyCode::F(2) => {
+                if self.inference.focus == InferenceFocus::Browse {
+                    self.inference.exit_browse_mode();
+                } else {
+                    self.inference.enter_browse_mode();
+                }
+            }
+            // Scroll chat history
+            KeyCode::PageUp => self.inference.scroll_up(),
+            KeyCode::PageDown => self.inference.scroll_down(),
+
+            // --- Browse mode keybindings ---
+            KeyCode::Up | KeyCode::Char('k') if self.inference.focus == InferenceFocus::Browse => {
+                self.inference.prev_message();
+            }
+            KeyCode::Down | KeyCode::Char('j')
+                if self.inference.focus == InferenceFocus::Browse =>
+            {
+                self.inference.next_message();
+            }
+            KeyCode::Char('y') if self.inference.focus == InferenceFocus::Browse => {
+                // Yank selected message to clipboard
+                if let Some(text) = self.inference.yank_selected() {
+                    copy_to_clipboard(&text);
+                }
+            }
+            KeyCode::Esc if self.inference.focus == InferenceFocus::Browse => {
+                self.inference.exit_browse_mode();
+            }
+
+            // --- Settings mode keybindings ---
+            KeyCode::Up if self.inference.settings_focused() => {
+                self.inference.prev_setting();
+            }
+            KeyCode::Down if self.inference.settings_focused() => {
+                self.inference.next_setting();
+            }
+            KeyCode::Char('+') | KeyCode::Char('=') if self.inference.settings_focused() => {
+                self.inference.increment_setting();
+            }
+            KeyCode::Char('-') if self.inference.settings_focused() => {
+                self.inference.decrement_setting();
+            }
+
+            // --- Input mode keybindings ---
+            KeyCode::Enter if self.inference.input_focused() => {
+                self.submit_inference();
+            }
+            KeyCode::Backspace if self.inference.input_focused() => {
+                self.inference.delete_char();
+            }
+            KeyCode::Left if self.inference.input_focused() => {
+                self.inference.move_cursor_left();
+            }
+            KeyCode::Right if self.inference.input_focused() => {
+                self.inference.move_cursor_right();
+            }
+            KeyCode::Up if self.inference.input_focused() => {
+                self.inference.scroll_up();
+            }
+            KeyCode::Down if self.inference.input_focused() => {
+                self.inference.scroll_down();
+            }
             KeyCode::Esc => {
                 if self.inference.generating {
-                    // Stop inference
                     if let Some(ref job_id) = self.active_inference_job.clone() {
                         if let Some(runner) = &mut self.runner {
                             runner.cancel(job_id);
@@ -517,36 +575,7 @@ impl App {
                     self.inference.generating = false;
                 }
             }
-            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                // Toggle settings focus
-                self.inference.toggle_settings_focus();
-            }
-            KeyCode::Up if self.inference.settings_focused => {
-                self.inference.prev_setting();
-            }
-            KeyCode::Down if self.inference.settings_focused => {
-                self.inference.next_setting();
-            }
-            KeyCode::Char('+') | KeyCode::Char('=') if self.inference.settings_focused => {
-                self.inference.increment_setting();
-            }
-            KeyCode::Char('-') if self.inference.settings_focused => {
-                self.inference.decrement_setting();
-            }
-            // Scroll chat history
-            KeyCode::PageUp => {
-                self.inference.scroll_up();
-            }
-            KeyCode::PageDown => {
-                self.inference.scroll_down();
-            }
-            KeyCode::Up if self.inference.input_focused => {
-                self.inference.scroll_up();
-            }
-            KeyCode::Down if self.inference.input_focused => {
-                self.inference.scroll_down();
-            }
-            KeyCode::Char(c) if self.inference.input_focused => {
+            KeyCode::Char(c) if self.inference.input_focused() => {
                 self.inference.insert_char(c);
             }
             _ => {}
@@ -916,9 +945,9 @@ impl App {
                     }
 
                     // Check if this is a LoRA adapter without base model info
-                    let needs_base = model.as_ref().is_some_and(|m| {
-                        is_lora_adapter(&m.path) && m.base_model.is_none()
-                    });
+                    let needs_base = model
+                        .as_ref()
+                        .is_some_and(|m| is_lora_adapter(&m.path) && m.base_model.is_none());
 
                     if needs_base {
                         // Store the adapter model id, prompt user to pick base model
@@ -1545,6 +1574,19 @@ fn extract_arg_value(args: &[String], flag: &str) -> Option<String> {
         .position(|a| a == flag)
         .and_then(|i| args.get(i + 1))
         .cloned()
+}
+
+/// Copy text to the system clipboard using macOS `pbcopy`.
+fn copy_to_clipboard(text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    if let Ok(mut child) = Command::new("pbcopy").stdin(Stdio::piped()).spawn() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
 }
 
 /// Expand `~` prefix to the user's home directory.
