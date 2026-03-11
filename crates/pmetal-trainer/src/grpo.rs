@@ -771,6 +771,14 @@ impl RewardFunction for XmlFormatReward {
 }
 
 /// Reward function that checks for exact matches with ground truth answers.
+///
+/// Extracts the model's answer using multiple strategies (in priority order):
+/// 1. Last `<answer>...</answer>` tag pair (handles retries within CoT)
+/// 2. Last `\boxed{...}` expression (common in math)
+/// 3. Last non-empty line of the completion (best-effort fallback)
+///
+/// Comparison normalizes internal whitespace (collapses runs to single space)
+/// so that formatting differences don't cause false negatives.
 pub struct AccuracyReward {
     pub answers: Vec<String>,
 }
@@ -779,6 +787,63 @@ impl AccuracyReward {
     pub fn new(answers: Vec<String>) -> Self {
         Self { answers }
     }
+}
+
+/// Normalize whitespace for answer comparison: trim + collapse internal runs to single space.
+fn normalize_answer(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Extract the model's answer from a completion string.
+///
+/// Tries (in order):
+/// 1. Last `<answer>...</answer>` tag pair
+/// 2. Last `\boxed{...}` expression (with brace-depth tracking)
+/// 3. Last non-empty line
+fn extract_answer(completion: &str) -> &str {
+    // Strategy 1: Last <answer>...</answer> pair
+    if let Some(end_pos) = completion.rfind("</answer>") {
+        let search_region = &completion[..end_pos];
+        if let Some(start_pos) = search_region.rfind("<answer>") {
+            let content_start = start_pos + "<answer>".len();
+            if content_start <= end_pos {
+                return completion[content_start..end_pos].trim();
+            }
+        }
+    }
+
+    // Strategy 2: Last \boxed{...} with brace-depth tracking
+    if let Some(boxed_pos) = completion.rfind("\\boxed{") {
+        let brace_start = boxed_pos + "\\boxed{".len();
+        let mut depth = 1i32;
+        let mut end = brace_start;
+        for (i, ch) in completion[brace_start..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = brace_start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth == 0 {
+            return completion[brace_start..end].trim();
+        }
+    }
+
+    // Strategy 3: Last non-empty line
+    for line in completion.lines().rev() {
+        let trimmed = line.trim();
+        if !trimmed.is_empty() {
+            return trimmed;
+        }
+    }
+
+    completion.trim()
 }
 
 impl RewardFunction for AccuracyReward {
@@ -792,19 +857,15 @@ impl RewardFunction for AccuracyReward {
         let mut rewards = vec![0.0; completions.len()];
 
         for (prompt_idx, answer) in self.answers.iter().enumerate() {
+            let norm_answer = normalize_answer(answer);
             for gen_idx in 0..num_generations {
                 let comp_idx = prompt_idx * num_generations + gen_idx;
                 let completion = &completions[comp_idx];
 
-                let processed_completion =
-                    match (completion.find("<answer>"), completion.find("</answer>")) {
-                        (Some(start), Some(end)) if start + 8 <= end => {
-                            completion[start + 8..end].trim().to_string()
-                        }
-                        _ => completion.trim().to_string(),
-                    };
+                let extracted = extract_answer(completion);
+                let norm_extracted = normalize_answer(extracted);
 
-                if processed_completion == answer.trim() {
+                if norm_extracted == norm_answer {
                     rewards[comp_idx] = 1.0;
                 }
             }

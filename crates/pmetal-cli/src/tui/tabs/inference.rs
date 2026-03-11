@@ -473,10 +473,49 @@ impl InferenceTab {
     }
 }
 
+/// Normalize code fences so they always appear on their own line.
+///
+/// Models sometimes emit text without real newline characters, causing ```
+/// to appear inline (e.g. "Here's the code:```pythondef fizzbuzz()...```Done!").
+/// This preprocessor inserts `\n` before/after ``` markers so that
+/// `render_markdown_content` can detect fences reliably via `.lines()`.
+fn normalize_code_fences(text: &str) -> String {
+    let mut result = String::with_capacity(text.len() + 128);
+    let mut rest = text;
+
+    while let Some(pos) = rest.find("```") {
+        let before = &rest[..pos];
+        // Insert \n before ``` if preceded by non-newline content
+        result.push_str(before);
+        if !result.is_empty() && !result.ends_with('\n') {
+            result.push('\n');
+        }
+        result.push_str("```");
+        rest = &rest[pos + 3..];
+
+        // Consume optional language tag (alphanumeric, _, -, +, .)
+        let lang_end = rest
+            .find(|c: char| {
+                !c.is_ascii_alphanumeric() && c != '_' && c != '-' && c != '+' && c != '.'
+            })
+            .unwrap_or(rest.len());
+        if lang_end > 0 {
+            result.push_str(&rest[..lang_end]);
+            rest = &rest[lang_end..];
+        }
+        // Insert \n after fence+lang if not already followed by newline/EOF
+        if !rest.is_empty() && !rest.starts_with('\n') {
+            result.push('\n');
+        }
+    }
+    result.push_str(rest);
+    result
+}
+
 /// Render text content with basic markdown code block detection.
 ///
-/// Detects ``` fenced code blocks and renders them with a distinct background style
-/// and without word wrapping (code should preserve its formatting).
+/// Detects ``` fenced code blocks and renders them with a distinct background style.
+/// Code lines are indented and truncated (not wrapped). Normal text is word-wrapped.
 fn render_markdown_content(
     text: &str,
     wrap_width: usize,
@@ -485,10 +524,12 @@ fn render_markdown_content(
     code_style: Style,
     fence_style: Style,
 ) {
+    let normalized = normalize_code_fences(text);
     let mut in_code_block = false;
     let mut code_lang = String::new();
+    let code_inner_width = wrap_width.saturating_sub(4); // account for 4-space indent
 
-    for line in text.lines() {
+    for line in normalized.lines() {
         let trimmed = line.trim();
         if trimmed.starts_with("```") {
             if !in_code_block {
@@ -511,12 +552,12 @@ fn render_markdown_content(
         }
 
         if in_code_block {
-            // Code lines: no word wrap, use code style, indent with 4 spaces
-            // Truncate if wider than available width
-            let display = if line.len() > wrap_width {
-                &line[..wrap_width]
+            // Code lines: truncate to fit (no word wrap), indent with 4 spaces
+            let char_count = line.chars().count();
+            let display: String = if char_count > code_inner_width {
+                line.chars().take(code_inner_width).collect()
             } else {
-                line
+                line.to_string()
             };
             lines.push(Line::from(Span::styled(
                 format!("    {display}"),
@@ -524,9 +565,13 @@ fn render_markdown_content(
             )));
         } else {
             // Normal text: word wrap
-            let wrapped = wrap_text(line, wrap_width);
-            for w in wrapped {
-                lines.push(Line::from(Span::styled(format!("  {w}"), text_style)));
+            if trimmed.is_empty() {
+                lines.push(Line::from(Span::styled("  ", text_style)));
+            } else {
+                let wrapped = wrap_text(line, wrap_width);
+                for w in wrapped {
+                    lines.push(Line::from(Span::styled(format!("  {w}"), text_style)));
+                }
             }
         }
     }
@@ -587,45 +632,57 @@ fn parse_thinking(text: &str) -> (Option<&str>, &str) {
 }
 
 /// Simple word wrap that breaks at word boundaries.
+/// Uses char-count width (safe for UTF-8).
 fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     if max_width == 0 {
         return vec![text.to_string()];
     }
-    if text.len() <= max_width {
+    // Use char count for width measurement (handles multi-byte UTF-8)
+    let text_width: usize = text.chars().count();
+    if text_width <= max_width {
         return vec![text.to_string()];
     }
 
     let mut lines = Vec::new();
     let mut current = String::new();
+    let mut current_width: usize = 0;
 
     for word in text.split_whitespace() {
+        let word_width = word.chars().count();
         if current.is_empty() {
-            // If a single word exceeds max_width, force-break it
-            if word.len() > max_width {
-                let mut remaining = word;
-                while remaining.len() > max_width {
-                    lines.push(remaining[..max_width].to_string());
-                    remaining = &remaining[max_width..];
-                }
-                current = remaining.to_string();
+            if word_width > max_width {
+                // Force-break long word at char boundaries
+                force_break_word(
+                    word,
+                    max_width,
+                    &mut lines,
+                    &mut current,
+                    &mut current_width,
+                );
             } else {
                 current = word.to_string();
+                current_width = word_width;
             }
-        } else if current.len() + 1 + word.len() > max_width {
+        } else if current_width + 1 + word_width > max_width {
             lines.push(current);
-            if word.len() > max_width {
-                let mut remaining = word;
-                while remaining.len() > max_width {
-                    lines.push(remaining[..max_width].to_string());
-                    remaining = &remaining[max_width..];
-                }
-                current = remaining.to_string();
+            current = String::new();
+            current_width = 0;
+            if word_width > max_width {
+                force_break_word(
+                    word,
+                    max_width,
+                    &mut lines,
+                    &mut current,
+                    &mut current_width,
+                );
             } else {
                 current = word.to_string();
+                current_width = word_width;
             }
         } else {
             current.push(' ');
             current.push_str(word);
+            current_width += 1 + word_width;
         }
     }
 
@@ -638,6 +695,30 @@ fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
     }
 
     lines
+}
+
+/// Force-break a word that exceeds max_width at char boundaries.
+fn force_break_word(
+    word: &str,
+    max_width: usize,
+    lines: &mut Vec<String>,
+    current: &mut String,
+    current_width: &mut usize,
+) {
+    let mut chars = word.chars();
+    let mut chunk = String::new();
+    let mut chunk_len = 0;
+    for ch in &mut chars {
+        if chunk_len >= max_width {
+            lines.push(chunk);
+            chunk = String::new();
+            chunk_len = 0;
+        }
+        chunk.push(ch);
+        chunk_len += 1;
+    }
+    *current = chunk;
+    *current_width = chunk_len;
 }
 
 impl Widget for &mut InferenceTab {
