@@ -23,9 +23,16 @@ pub struct DeviceInfo {
     pub has_dynamic_caching: bool,
     pub has_ray_tracing: bool,
     pub has_mesh_shaders: bool,
+    pub has_nax: bool,
     pub supports_ane: bool,
     pub batch_size_multiplier: usize,
     pub tile_size: (u32, u32, u32),
+    pub architecture_gen: u32,
+    pub memory_bandwidth_gbps: f64,
+    pub gpu_core_count: u32,
+    pub ane_core_count: u32,
+    pub is_ultra_fusion: bool,
+    pub die_count: u32,
 }
 
 impl DeviceInfo {
@@ -45,9 +52,16 @@ impl DeviceInfo {
             has_dynamic_caching: props.has_dynamic_caching,
             has_ray_tracing: props.has_hardware_ray_tracing,
             has_mesh_shaders: props.has_mesh_shaders,
+            has_nax: props.has_nax,
             supports_ane: ctx.supports_neural_engine(),
             batch_size_multiplier: props.batch_size_multiplier(),
             tile_size: props.recommended_tile_size(),
+            architecture_gen: props.architecture_gen,
+            memory_bandwidth_gbps: props.memory_bandwidth_gbps,
+            gpu_core_count: props.gpu_core_count,
+            ane_core_count: props.ane_core_count,
+            is_ultra_fusion: props.is_ultra_fusion,
+            die_count: props.die_count,
         })
     }
 }
@@ -145,21 +159,52 @@ impl DeviceTab {
             return;
         };
 
+        let gpu_cores_str = if dev.gpu_core_count > 0 {
+            if dev.is_ultra_fusion {
+                format!(
+                    "{} ({}x{} dies)",
+                    dev.gpu_core_count,
+                    dev.gpu_core_count / dev.die_count,
+                    dev.die_count
+                )
+            } else {
+                format!("{}", dev.gpu_core_count)
+            }
+        } else {
+            "Unknown".to_string()
+        };
+        let ane_cores_str = if dev.ane_core_count > 0 {
+            if dev.is_ultra_fusion {
+                format!(
+                    "{} ({}x{} dies)",
+                    dev.ane_core_count,
+                    dev.ane_core_count / dev.die_count,
+                    dev.die_count
+                )
+            } else {
+                format!("{}", dev.ane_core_count)
+            }
+        } else {
+            "N/A".to_string()
+        };
+        let tier_str = if dev.is_ultra_fusion {
+            format!("{} (UltraFusion)", dev.device_tier)
+        } else {
+            dev.device_tier.clone()
+        };
+
         let pairs = [
             KvPair::new("Device", &dev.name),
-            KvPair::new("GPU Family", &dev.gpu_family),
-            KvPair::new("Tier", &dev.device_tier),
             KvPair::new(
-                "Unified Memory",
-                if dev.has_unified_memory { "Yes" } else { "No" },
+                "GPU Family",
+                format!("{} (gen {})", dev.gpu_family, dev.architecture_gen),
             ),
+            KvPair::new("Tier", &tier_str),
+            KvPair::new("GPU Cores", &gpu_cores_str),
+            KvPair::new("ANE Cores", &ane_cores_str),
             KvPair::new(
-                "Max Threads/TG",
-                dev.max_threads_per_threadgroup.to_string(),
-            ),
-            KvPair::new(
-                "TG Memory",
-                format!("{} KB", dev.max_threadgroup_memory / 1024),
+                "Bandwidth",
+                format!("{:.0} GB/s", dev.memory_bandwidth_gbps),
             ),
             KvPair::new(
                 "Working Set",
@@ -205,7 +250,9 @@ impl DeviceTab {
             ("Dynamic Caching", dev.has_dynamic_caching),
             ("Ray Tracing", dev.has_ray_tracing),
             ("Mesh Shaders", dev.has_mesh_shaders),
+            ("NAX (GPU Neural)", dev.has_nax),
             ("Neural Engine", dev.supports_ane),
+            ("UltraFusion", dev.is_ultra_fusion),
         ];
 
         for (i, (name, enabled)) in features.iter().enumerate() {
