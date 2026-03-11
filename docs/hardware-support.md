@@ -8,37 +8,85 @@ Status of hardware-specific optimizations in PMetal.
 |-----------|------|--------|
 | GPU family (`Apple7`–`Apple10`) | `pmetal-metal/src/context.rs` | Name-string based |
 | Device tier (`Base`/`Pro`/`Max`/`Ultra`) | `pmetal-metal/src/context.rs` | Name-string based |
-| Feature flags (dynamic caching, mesh shaders) | `pmetal-metal/src/context.rs` | Derived from family |
-| GPU core count | — | Not detected |
-| Memory bandwidth | — | Hardcoded per tier |
+| Feature flags (dynamic caching, mesh shaders, NAX) | `pmetal-metal/src/context.rs` | Derived from family |
+| Architecture generation (14–17) | `pmetal-metal/src/context.rs` | Mapped from GPU family |
+| GPU core count | `pmetal-metal/src/context.rs` | Estimated from name + tier |
+| ANE core count | `pmetal-metal/src/context.rs` | Tier-based (16/32) |
+| Memory bandwidth | `pmetal-metal/src/context.rs` | Tier + family lookup table |
+| NAX (Neural Accelerators in GPU) | `pmetal-metal/src/context.rs` | Apple10+ (M5) |
+| ANE perf stats | `pmetal-metal/src/ane/runtime.rs` | `_ANEPerformanceStats` API |
 | UltraFusion topology | — | Not detected |
 
 ## Per-Chip Support Matrix
 
-| Chip | GPU Family | Tier | Kernel Tuning | Multi-Die | Notes |
-|------|-----------|------|---------------|-----------|-------|
-| M1 | Apple7 | Base | Baseline | N/A | |
-| M1 Pro | Apple7 | Pro | Yes | N/A | |
-| M1 Max | Apple7 | Max | Yes | N/A | |
-| M1 Ultra | Apple7 | Ultra | Yes | No | UltraFusion, 2 dies |
-| M2 | Apple8 | Base | Baseline | N/A | |
-| M2 Pro | Apple8 | Pro | Yes | N/A | |
-| M2 Max | Apple8 | Max | Yes | N/A | |
-| M2 Ultra | Apple8 | Ultra | Yes | No | UltraFusion, 2 dies |
-| M3 | Apple9 | Base | Baseline | N/A | Dynamic caching |
-| M3 Pro | Apple9 | Pro | Yes | N/A | |
-| M3 Max | Apple9 | Max | Yes | N/A | |
-| M3 Ultra | Apple9 | Ultra | Yes | No | UltraFusion, 2 dies |
-| M4 | Apple9 | Base | Baseline | N/A | Dynamic caching |
-| M4 Pro | Apple9 | Pro | Yes | N/A | |
-| M4 Max | Apple9 | Max | Yes | N/A | |
-| M4 Ultra | Apple9 | Ultra | Yes | No | UltraFusion, 2 dies |
-| M5 | Apple10 | Base | No (falls through to Apple9) | N/A | Not yet shipping |
-| M5 Pro | Apple10 | Pro | No | N/A | |
-| M5 Max | Apple10 | Max | No | N/A | |
-| M5 Ultra | Apple10 | Ultra | No | No | |
+| Chip | GPU Family | Arch Gen | Tier | GPU Cores | BW (GB/s) | ANE TFLOPS | NAX | Notes |
+|------|-----------|----------|------|-----------|-----------|------------|-----|-------|
+| M1 | Apple7 | 14 | Base | 8 | 100 | ~11 | No | |
+| M1 Pro | Apple7 | 14 | Pro | 14 | 200 | ~11 | No | |
+| M1 Max | Apple7 | 14 | Max | 24 | 400 | ~11 | No | |
+| M1 Ultra | Apple7 | 14 | Ultra | 48 | 800 | ~22 | No | 2-die UltraFusion |
+| M2 | Apple8 | 15 | Base | 8 | 100 | ~15 | No | |
+| M2 Pro | Apple8 | 15 | Pro | 16 | 200 | ~15 | No | |
+| M2 Max | Apple8 | 15 | Max | 30 | 400 | ~15 | No | |
+| M2 Ultra | Apple8 | 15 | Ultra | 48 | 800 | ~30 | No | 2-die UltraFusion |
+| M3 | Apple9 | 16 | Base | 10 | 120 | 15.8 | No | Dynamic caching |
+| M3 Pro | Apple9 | 16 | Pro | 18 | 273 | 15.8 | No | |
+| M3 Max | Apple9 | 16 | Max | 30 | 546 | 15.8 | No | |
+| M3 Ultra | Apple9 | 16 | Ultra | 60 | 800 | 31.6 | No | 2-die, 32 NE cores |
+| M4 | Apple9 | 16 | Base | 10 | 120 | ~12.2* | No | Dynamic caching |
+| M4 Pro | Apple9 | 16 | Pro | 20 | 273 | 12.57* | No | |
+| M4 Max | Apple9 | 16 | Max | 40 | 546 | 10.93* | No | 64 ms/step training |
+| M4 Ultra | Apple9 | 16 | Ultra | 80 | 800 | ~24* | No | 2-die UltraFusion |
+| **M5** | **Apple10** | **17** | **Base** | **10** | **120** | **~12.2*** | **Yes** | NAX, same H16 ANE |
+| **M5 Pro** | **Apple10** | **17** | **Pro** | **20** | **273** | **12.17-12.44*** | **Yes** | |
+| **M5 Max** | **Apple10** | **17** | **Max** | **40** | **546** | **TBD** | **Yes** | |
+| **M5 Ultra** | **Apple10** | **17** | **Ultra** | **80** | **800** | **TBD** | **Yes** | 2-die UltraFusion |
+
+*ANE TFLOPS measured at FP16 via pmetal benchmarks. Apple's rated "TOPS" for M4+ uses INT8/mixed precision (~38 TOPS for M4 Pro), not comparable to FP16 measurements.
+
+## M5-Specific Features
+
+### NAX (Neural Accelerators in GPU Cores)
+
+M5 (Apple10, arch gen 17) introduces Neural Accelerator units within GPU cores, enabling hardware-accelerated:
+- GEMM (fused matrix multiply)
+- Quantized inference (FP4/FP8)
+- Scaled dot-product attention
+
+These are accessed via Metal 4.0 (`-std=metal4.0`) kernels. MLX upstream has production NAX kernel libraries (`steel_gemm_fused_nax.metal`, `quantized_nax.metal`, `steel_attention_nax.metal`). NAX availability: `architecture_gen >= 17` (checked via `DeviceProperties::has_nax()`).
+
+### ANE (Apple Neural Engine) on M5
+
+- **ANE Family**: H16 (same as M4 — no architectural upgrade)
+- **NE Cores**: 16 (Pro/Max/Base), 32 (Ultra via UltraFusion)
+- **Measured FP16 TFLOPS**: 12.17–12.44 (comparable to M4 Pro)
+- **Training**: 101–120 ms/step (vs M4 Max at 64 ms/step)
+- **Weight reload**: NOT supported (weights baked at compile time)
+- **Chaining API**: `_ANEChainingRequest` available (research — no working invocation yet)
+- **Real-time eval**: `evaluateRealTimeWithModel:` available
+- **Perf stats**: `_ANEPerformanceStats.hwExecutionTime` provides ns-precision hardware timing
+
+### ANE MIL Compatibility
+
+| Feature | M1 | M3 | M4 | M5 |
+|---------|-----|-----|-----|-----|
+| `program(1.3) / ios18` | Partial | Yes | Yes | Yes |
+| Single-blob weights | Fail | Yes | Yes | Yes |
+| Per-matrix weight blobs | Yes | Yes | Yes | Yes |
+| Channel flexibility | Unknown | ch=512 only | Flexible | Flexible |
+| BLOBFILE offset refs | Fail | Yes | Yes | Yes |
+| CPU RMSNorm workaround | N/A | Needed | Needed | Needed |
 
 ## Kernel Tuning by Tier
+
+### Matrix Tile Size (GEMM, LoRA forward)
+
+| Tier | Apple7–9 | Apple10 (M5+, NAX) |
+|------|----------|-------------------|
+| Base | 32×32×32 | 64×32×32 |
+| Pro | 64×32×32 | 64×64×32 |
+| Max | 64×64×32 | 128×64×32 |
+| Ultra | 64×64×32 | 128×64×32 |
 
 ### FlashAttention (`flash_attention.rs`)
 
@@ -81,31 +129,33 @@ Block size selection per head dimension:
 
 ## Gaps & Future Work
 
-### P0 — M4 Ultra multi-die awareness
+### P0 — NAX kernel integration
 
-Metal presents UltraFusion as a single unified GPU, so correctness is not affected. However, kernel dispatch is not topology-aware — threadgroup placement doesn't account for cross-die latency or NUMA-like memory affinity. Potential wins:
+MLX upstream has NAX-optimized kernels for M5. Integration path:
 
-- [ ] Query actual GPU core count via Metal API (`maxThreadgroupMemoryLength`, recommended threadgroup size hints) instead of hardcoding per tier
-- [ ] Profile whether large reductions (RMSNorm, softmax) benefit from die-aware partitioning
-- [ ] Benchmark current FlashAttention block sizes on M4 Ultra — the 2-die topology may favor different tiling
+- [x] M5 detection (Apple10, arch gen 17)
+- [x] NAX availability flag (`has_nax`)
+- [x] NAX-aware tile size tuning
+- [ ] Upstream mlx-rs NAX kernel passthrough (requires mlx-rs update to MLX with NAX)
+- [ ] Profile NAX vs standard kernels on M5 for quantized inference
+- [ ] Benchmark NAX SDPA vs FlashAttention on M5
 
-### P1 — M5 kernel tuning
+### P1 — ANE chaining API
 
-Apple10 family falls through to Apple9 paths. When M5 ships:
+`_ANEChainingRequest` with loopback could pipeline multiple layers as a single ANE program:
 
-- [ ] Profile all fused kernels on M5 hardware
-- [ ] Identify new Metal GPU family capabilities (Apple10-specific features)
-- [ ] Tune block sizes, threadgroup sizes, and tile dimensions
-- [ ] Check if `has_neural_accelerators_in_gpu` (speculated Apple10 feature) enables new kernel patterns
+- [x] Class detection + telemetry
+- [ ] Prototype single-chain invocation (2 layers, loopback input→output)
+- [ ] Benchmark chained vs sequential dispatch latency
+- [ ] If viable: integrate into ANE inference engine for multi-layer dispatch
 
-### P2 — Dynamic tuning
+### P2 — ANE real-time evaluation path
 
-Replace hardcoded tier-based parameters with runtime-queried values:
+`_ANEClient.evaluateRealTimeWithModel:` may provide lower/more predictable latency:
 
-- [ ] Use `MTLDevice.maxThreadsPerThreadgroup` for threadgroup sizing
-- [ ] Use `MTLDevice.recommendedMaxWorkingSetSize` for buffer allocation strategy
-- [ ] Query actual memory bandwidth via IOKit/sysctl instead of tier lookup table
-- [ ] Auto-benchmark kernel configs on first run and cache optimal parameters
+- [ ] Prototype RT eval path
+- [ ] Compare RT vs standard eval latency distribution
+- [ ] If beneficial: add `--ane-realtime` CLI flag
 
 ### P3 — UltraFusion-aware distributed
 
@@ -114,3 +164,11 @@ Current distributed crate (`pmetal-distributed`) is multi-machine over TCP/mDNS.
 - [ ] Intra-machine model parallelism across dies (pipeline or tensor parallel)
 - [ ] Die-affine buffer placement for large models that exceed single-die cache
 - [ ] Hybrid: UltraFusion tensor parallel + network data parallel across machines
+
+### P4 — Dynamic auto-tuning
+
+Replace hardcoded tier-based parameters with runtime optimization:
+
+- [ ] Auto-benchmark kernel configs on first run and cache optimal parameters
+- [ ] Query actual memory bandwidth via IOKit/sysctl instead of tier lookup table
+- [ ] M5 Pro/Max/Ultra profiling once hardware is available
