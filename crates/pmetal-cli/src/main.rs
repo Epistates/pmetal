@@ -3254,12 +3254,12 @@ async fn run_inference(
     // Cache size = prompt_len + max_tokens + buffer
     let max_seq_len = input_ids.len() + max_tokens + 64;
     let mut cache = model.create_cache(max_seq_len);
-    tracing::info!("Created KV cache for {} tokens", max_seq_len);
+    tracing::debug!("Created KV cache for {} tokens", max_seq_len);
 
     // Create Mamba cache for hybrid models (NemotronH)
     let mut mamba_cache = model.create_mamba_cache();
     if mamba_cache.is_some() {
-        tracing::info!("Created Mamba cache for hybrid model");
+        tracing::debug!("Created Mamba cache for hybrid model");
     }
 
     // Generate with KV cache (and Mamba cache for hybrid models)
@@ -4244,12 +4244,8 @@ async fn run_inference_with_lora(
     // Auto-detect chat mode: LoRA fine-tuned models almost always use chat format,
     // so enable chat if the model has chat special tokens even if it's a "base" model.
     let is_instruct = is_instruction_tuned(model_path);
-    let has_chat_tokens = tokenizer
-        .encode("<|im_end|>")
-        .is_ok_and(|t| t.len() == 1)
-        || tokenizer
-            .encode("<|eot_id|>")
-            .is_ok_and(|t| t.len() == 1);
+    let has_chat_tokens = tokenizer.encode("<|im_end|>").is_ok_and(|t| t.len() == 1)
+        || tokenizer.encode("<|eot_id|>").is_ok_and(|t| t.len() == 1);
     let use_chat = chat || is_instruct || has_chat_tokens;
 
     if !chat && use_chat {
@@ -4334,12 +4330,12 @@ async fn run_inference_with_lora(
     let mut cache = model
         .create_cache(max_seq_len)
         .ok_or_else(|| anyhow::anyhow!("Model does not support KV cache"))?;
-    tracing::info!("Created KV cache for {} tokens", max_seq_len);
+    tracing::debug!("Created KV cache for {} tokens", max_seq_len);
 
     // Create Mamba cache for hybrid models (Qwen3.5 GDN layers)
     let mut mamba_cache = model.create_mamba_cache();
     if mamba_cache.is_some() {
-        tracing::info!("Created Mamba cache for hybrid LoRA model");
+        tracing::debug!("Created Mamba cache for hybrid LoRA model");
     }
 
     let start = std::time::Instant::now();
