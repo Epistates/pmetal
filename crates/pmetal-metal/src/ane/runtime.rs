@@ -50,6 +50,9 @@ pub struct AneRuntime {
     /// `_ANEChainingRequest` — probe-only, None if unavailable.
     /// Available on M4/M5 hardware but no known working invocation exists.
     chaining_class: Option<&'static AnyClass>,
+    /// `_ANEPerformanceStats` — hardware execution time counters.
+    /// Available on all Apple Silicon; populated after eval when perfStatsMask is set.
+    perf_stats_class: Option<&'static AnyClass>,
 }
 
 // SAFETY: The ObjC classes are process-global singletons and thread-safe for class method dispatch.
@@ -93,12 +96,19 @@ impl AneRuntime {
             tracing::debug!("ANE chaining API not available on this hardware");
         }
 
+        // Probe for performance stats API
+        let perf_stats_class = AnyClass::get(c"_ANEPerformanceStats");
+        if perf_stats_class.is_some() {
+            tracing::debug!("ANE performance stats API (_ANEPerformanceStats) detected");
+        }
+
         Ok(AneRuntime {
             descriptor_class,
             model_class,
             request_class,
             io_surface_class,
             chaining_class,
+            perf_stats_class,
         })
     }
 
@@ -248,6 +258,18 @@ impl AneRuntime {
     pub fn chaining_available(&self) -> bool {
         self.chaining_class.is_some()
     }
+
+    /// Check if ANE performance stats API is available.
+    pub fn perf_stats_available(&self) -> bool {
+        self.perf_stats_class.is_some()
+    }
+}
+
+/// ANE hardware performance stats from a single evaluation.
+#[derive(Debug, Clone, Default)]
+pub struct AnePerformanceStats {
+    /// Hardware execution time in nanoseconds.
+    pub hw_execution_time_ns: u64,
 }
 
 /// A compiled ANE model ready for evaluation.
@@ -337,6 +359,109 @@ impl AneModel {
             }
 
             Ok(())
+        }
+    }
+
+    /// Evaluate the model and collect hardware performance stats.
+    ///
+    /// Returns the performance stats including hardware execution time.
+    /// Requires the ANE perf stats class to be available (always true on M1+).
+    /// Falls back to regular evaluation silently if the class is absent.
+    pub fn evaluate_with_stats(
+        &self,
+        inputs: &[*mut c_void],
+        outputs: &[*mut c_void],
+    ) -> Result<AnePerformanceStats> {
+        unsafe {
+            let rt = AneRuntime::global()?;
+            let Some(perf_class) = rt.perf_stats_class else {
+                // Fall back to regular eval if perf stats not available
+                self.evaluate(inputs, outputs)?;
+                return Ok(AnePerformanceStats::default());
+            };
+
+            // Create perf stats object via factory: +statsWithHardwareExecutionNS:
+            let zero = NSNumber::new_u64(0);
+            let perf_stats: *mut AnyObject = msg_send![
+                perf_class,
+                statsWithHardwareExecutionNS: &*zero
+            ];
+            if perf_stats.is_null() {
+                // Factory failed — fall back to regular eval
+                self.evaluate(inputs, outputs)?;
+                return Ok(AnePerformanceStats::default());
+            }
+
+            // Wrap IOSurfaces
+            let mut wrapped_inputs: Vec<*mut AnyObject> = Vec::with_capacity(inputs.len());
+            let mut input_indices: Vec<objc2::rc::Retained<NSNumber>> =
+                Vec::with_capacity(inputs.len());
+            for (i, &surface) in inputs.iter().enumerate() {
+                let wrapped: *mut AnyObject = msg_send![
+                    self.io_surface_class,
+                    objectWithIOSurface: surface
+                ];
+                wrapped_inputs.push(wrapped);
+                input_indices.push(NSNumber::new_usize(i));
+            }
+
+            let mut wrapped_outputs: Vec<*mut AnyObject> = Vec::with_capacity(outputs.len());
+            let mut output_indices: Vec<objc2::rc::Retained<NSNumber>> =
+                Vec::with_capacity(outputs.len());
+            for (i, &surface) in outputs.iter().enumerate() {
+                let wrapped: *mut AnyObject = msg_send![
+                    self.io_surface_class,
+                    objectWithIOSurface: surface
+                ];
+                wrapped_outputs.push(wrapped);
+                output_indices.push(NSNumber::new_usize(i));
+            }
+
+            // Build NSArrays
+            let ns_inputs = ns_array_from_raw(&wrapped_inputs);
+            let ns_input_idx = ns_array_from_numbers(&input_indices);
+            let ns_outputs = ns_array_from_raw(&wrapped_outputs);
+            let ns_output_idx = ns_array_from_numbers(&output_indices);
+            let zero_idx = NSNumber::new_usize(0);
+
+            // Build request WITH perf stats
+            let request: *mut AnyObject = msg_send![
+                self.request_class,
+                requestWithInputs: &*ns_inputs,
+                inputIndices: &*ns_input_idx,
+                outputs: &*ns_outputs,
+                outputIndices: &*ns_output_idx,
+                weightsBuffer: std::ptr::null::<AnyObject>(),
+                perfStats: perf_stats,
+                procedureIndex: &*zero_idx
+            ];
+
+            // Evaluate
+            let mut error: *mut NSError = std::ptr::null_mut();
+            let empty_dict = NSDictionary::<NSString, AnyObject>::new();
+            let ok: Bool = msg_send![
+                self.model,
+                evaluateWithQoS: ANE_QOS,
+                options: &*empty_dict,
+                request: request,
+                error: &mut error
+            ];
+
+            if !ok.as_bool() {
+                let msg = if !error.is_null() {
+                    ns_error_description(error)
+                } else {
+                    "unknown error".to_string()
+                };
+                return Err(MetalError::AneEvalFailed(msg));
+            }
+
+            // Read hwExecutionTime from perf stats
+            let hw_time: u64 = msg_send![perf_stats, hwExecutionTime];
+
+            Ok(AnePerformanceStats {
+                hw_execution_time_ns: hw_time,
+            })
         }
     }
 
