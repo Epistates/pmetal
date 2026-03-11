@@ -2,15 +2,20 @@
 
 **Powdered Metal** — High-performance LLM fine-tuning framework for Apple Silicon, written in Rust.
 
-PMetal is a machine learning framework that brings [Unsloth](https://github.com/unslothai/unsloth)-style optimizations to macOS. It leverages custom Metal shaders, the MLX framework, and native Apple Neural Engine (ANE) integration to achieve state-of-the-art training and inference throughput on Apple Silicon.
+PMetal is a full-featured machine learning framework for Apple Silicon. It leverages custom Metal shaders, the MLX framework, and native Apple Neural Engine (ANE) integration to achieve state-of-the-art training and inference throughput on Apple Silicon.
 
+[![Crates.io](https://img.shields.io/crates/v/pmetal.svg)](https://crates.io/crates/pmetal)
 [![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](https://www.apple.com/macos)
 
+<img src="public/pmetal_tui.png" alt="pmetal screenshot showing TUI" style="width: 100%; max-width: 100%; margin: 20px 0;"/>
+
 ## Quick Start
 
 ### Installation
+
+Crates are available on [crates.io](https://crates.io/crates/pmetal).
 
 Prebuilt signed binaries are available on the [Releases](https://github.com/Epistates/pmetal/releases) page.
 
