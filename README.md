@@ -93,14 +93,30 @@ cargo build --release
 ./target/release/pmetal dashboard --metrics-file ./output/metrics.jsonl
 ```
 
+## Hardware Support
+
+PMetal automatically detects Apple Silicon capabilities at startup and tunes kernel parameters accordingly.
+
+| Chip Family | GPU Family | NAX | ANE | UltraFusion | Status |
+|-------------|-----------|-----|-----|-------------|--------|
+| M1 / Pro / Max / Ultra | Apple7 | - | 16 cores | Ultra: 2-die | Fully supported |
+| M2 / Pro / Max / Ultra | Apple8 | - | 16 cores | Ultra: 2-die | Fully supported |
+| M3 / Pro / Max / Ultra | Apple9 | - | 16 cores | Ultra: 2-die | Fully supported |
+| M4 / Pro / Max / Ultra | Apple9 | - | 16 cores | Ultra: 2-die | Fully supported |
+| **M5 / Pro / Max / Ultra** | **Apple10** | **Yes** | **16 cores** | **Ultra: 2-die** | **Fully supported** |
+
+**Auto-detected features**: GPU family, device tier, core counts, memory bandwidth, dynamic caching, mesh shaders, NAX (M5+), UltraFusion topology (via `sysctl hw.packages`), ANE availability.
+
+**Tier-based kernel tuning**: Matrix tile sizes, FlashAttention block sizes, fused kernel threadgroup sizes, and batch multipliers are automatically selected based on device tier (Base/Pro/Max/Ultra) and GPU family. See [`docs/hardware-support.md`](docs/hardware-support.md) for the full tuning matrix.
+
 ## Architecture
 
-PMetal is organized as a Rust workspace with 15 specialized crates:
+PMetal is organized as a Rust workspace with 16 specialized crates:
 
 ```
 pmetal/
 ├── pmetal-core         # Foundation: configs, traits, types
-├── pmetal-metal        # Custom Metal GPU kernels
+├── pmetal-metal        # Custom Metal GPU kernels + ANE runtime
 ├── pmetal-mlx          # MLX backend integration (KV cache, RoPE, etc.)
 ├── pmetal-models       # LLM architectures (Llama, Qwen, DeepSeek, etc.)
 ├── pmetal-lora         # LoRA/QLoRA training implementations
@@ -113,7 +129,8 @@ pmetal/
 ├── pmetal-mhc          # Manifold-Constrained Hyper-Connections
 ├── pmetal-distributed  # Distributed training support (mDNS, Ring All-Reduce)
 ├── pmetal-vocoder      # BigVGAN neural vocoder
-└── pmetal-cli          # Command-line interface
+├── pmetal-py           # Python bindings (maturin/PyO3)
+└── pmetal-cli          # Command-line interface + TUI
 ```
 
 ## Supported Models
@@ -181,10 +198,13 @@ The PMetal framework supports a wide range of training methods. Methods marked w
 
 Custom Metal shaders provide significant speedups:
 
-- **FlashAttention**: O(n) memory attention with fused softmax
+- **FlashAttention**: O(n) memory attention with fused softmax, tier-aware block sizes
+- **Fused GDN**: Gated Delta Network recurrence kernel (ported from FLA Triton) — single-pass state update with SIMD reductions, no threadgroup memory
 - **Fused LoRA**: Combined forward pass for adapter layers
 - **Fused Cross-Entropy**: Unsloth-style chunked loss computation
 - **Fused RoPE**: Rotary position embeddings in-kernel
+- **Fused SwiGLU**: Fused gate + activation with tier-tuned threadgroups
+- **Fused RMSNorm + LoRA**: Combined normalization and adapter projection
 - **Fused Sampler**: JIT-compiled token sampling
 
 ### ANE (Neural Engine) Pipeline
@@ -192,26 +212,30 @@ Custom Metal shaders provide significant speedups:
 Native ANE integration for power-efficient training and inference:
 
 - **Dynamic Weight Pipeline**: 9 MIL kernels compiled once at startup; weights packed alongside activations in IOSurface spatial dimension. Zero recompilation during training.
-- **Hybrid Inference**: ANE prefill + CPU decode with KV cache for autoregressive generation.
+- **Hybrid Inference**: ANE prefill + CPU decode with KV cache for autoregressive generation. Power-of-2 sequence bucketing for optimal kernel compilation.
 - **CPU RMSNorm**: RMSNorm computed in f32 on CPU to avoid fp16 overflow on ANE (saturation arithmetic). Per-head QK-norm stays on ANE.
 - **IOSurface Zero-Copy**: fp32 shared memory surfaces for CPU↔ANE data transfer with no serialization overhead.
 - **GQA/MQA Support**: Grouped-query and multi-query attention via MIL KV head expansion (replaces unreliable `tile` ops).
+- **Performance Stats**: Hardware execution timing via `_ANEPerformanceStats` API (nanosecond precision).
+- **M1–M5 Compatibility**: Per-matrix weight blobs for M1, single-blob for M3+. CPU FFN fallback for 4B+ models where ANE compilation exceeds resource limits.
 
 ### TUI Control Center
 
-Full terminal interface via `pmetal tui` with 7 tabs:
+Full terminal interface via `pmetal tui` with 9 tabs:
 
 | Tab | Description |
 |-----|-------------|
 | **Dashboard** | Live loss curves (braille), LR schedule, throughput sparklines, timing breakdown gauges |
-| **Device** | GPU info, Metal feature detection, memory utilization gauge, kernel tuning params |
+| **Device** | GPU/ANE info, Metal feature detection, memory gauge, kernel tuning, UltraFusion topology |
 | **Models** | Browse cached HuggingFace models with architecture, size, and format details |
 | **Datasets** | Scan and preview local datasets (JSONL, Parquet, CSV) with line counts |
-| **Training** | Configure and monitor training runs with sectioned parameter view |
-| **Inference** | Interactive chat interface with generation settings sidebar |
+| **Training** | Configure and launch SFT/LoRA/QLoRA training runs with sectioned parameter forms |
+| **Distillation** | Configure knowledge distillation runs (online, offline, progressive, cross-vocab) |
+| **GRPO** | Configure GRPO/DAPO reasoning training with reward functions and sampling params |
+| **Inference** | Interactive chat interface with markdown rendering and generation settings sidebar |
 | **Jobs** | Training run history with log viewer, status tracking, and metadata |
 
-Keybindings: `Tab`/`Shift+Tab` to switch tabs, `Alt+1-7` for direct access, `q` to quit.
+Keybindings: `Tab`/`Shift+Tab` to switch tabs, `Alt+1-9` for direct access, `q` to quit.
 
 The legacy `pmetal dashboard` command is still available for simple metrics-only monitoring.
 
