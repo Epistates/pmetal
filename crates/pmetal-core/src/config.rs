@@ -262,6 +262,9 @@ pub enum LrSchedulerType {
     CosineWithRestarts,
     /// Polynomial decay.
     Polynomial,
+    /// Warmup-Stable-Decay: linear warmup → constant plateau → linear decay.
+    /// Modern default for LLM training. Stable phase ratio defaults to 0.7.
+    Wsd,
 }
 
 /// Gradient checkpointing strategy.

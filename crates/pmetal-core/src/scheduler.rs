@@ -25,6 +25,8 @@ pub struct LearningRateScheduler {
     scheduler_type: LrSchedulerType,
     /// Number of restarts for cosine with restarts.
     num_restarts: usize,
+    /// Fraction of post-warmup steps at stable (peak) LR for WSD (0.0-1.0).
+    stable_ratio: f64,
     /// Current step.
     current_step: usize,
 }
@@ -44,6 +46,7 @@ impl LearningRateScheduler {
             warmup_steps,
             scheduler_type,
             num_restarts: 1,
+            stable_ratio: 0.7,
             current_step: 0,
         }
     }
@@ -57,6 +60,12 @@ impl LearningRateScheduler {
     /// Set number of restarts for cosine with restarts.
     pub fn with_num_restarts(mut self, num_restarts: usize) -> Self {
         self.num_restarts = num_restarts;
+        self
+    }
+
+    /// Set stable phase ratio for WSD scheduler (default 0.7).
+    pub fn with_stable_ratio(mut self, ratio: f64) -> Self {
+        self.stable_ratio = ratio.clamp(0.0, 1.0);
         self
     }
 
@@ -105,6 +114,26 @@ impl LearningRateScheduler {
                 let power = 2.0; // Quadratic decay
                 self.min_lr + (self.base_lr - self.min_lr) * (1.0 - progress).powf(power)
             }
+
+            LrSchedulerType::Wsd => {
+                // Warmup-Stable-Decay: constant plateau then linear decay-to-zero.
+                // stable_ratio controls how much of post-warmup is at peak LR.
+                let stable_steps = (decay_steps as f64 * self.stable_ratio) as usize;
+                if current_decay_step < stable_steps {
+                    // Stable phase: hold at peak LR
+                    self.base_lr
+                } else {
+                    // Decay phase: linear decay from base_lr to min_lr
+                    let decay_phase_steps = decay_steps.saturating_sub(stable_steps);
+                    let decay_progress = if decay_phase_steps > 0 {
+                        ((current_decay_step - stable_steps) as f64 / decay_phase_steps as f64)
+                            .min(1.0)
+                    } else {
+                        1.0
+                    };
+                    self.min_lr + (self.base_lr - self.min_lr) * (1.0 - decay_progress)
+                }
+            }
         }
     }
 
@@ -147,6 +176,7 @@ pub struct SchedulerBuilder {
     warmup_ratio: Option<f64>,
     scheduler_type: LrSchedulerType,
     num_restarts: usize,
+    stable_ratio: f64,
 }
 
 impl Default for SchedulerBuilder {
@@ -166,6 +196,7 @@ impl SchedulerBuilder {
             warmup_ratio: None,
             scheduler_type: LrSchedulerType::Cosine,
             num_restarts: 1,
+            stable_ratio: 0.7,
         }
     }
 
@@ -212,6 +243,12 @@ impl SchedulerBuilder {
         self
     }
 
+    /// Set WSD stable phase ratio (fraction of post-warmup at peak LR).
+    pub fn stable_ratio(mut self, ratio: f64) -> Self {
+        self.stable_ratio = ratio;
+        self
+    }
+
     /// Build the scheduler.
     pub fn build(self) -> Result<LearningRateScheduler> {
         let warmup_steps = if let Some(ratio) = self.warmup_ratio {
@@ -227,7 +264,8 @@ impl SchedulerBuilder {
             self.scheduler_type,
         )
         .with_min_lr(self.min_lr)
-        .with_num_restarts(self.num_restarts))
+        .with_num_restarts(self.num_restarts)
+        .with_stable_ratio(self.stable_ratio))
     }
 }
 
@@ -291,5 +329,60 @@ mod tests {
 
         // Warmup should be 10% of total steps = 100
         assert!(scheduler.get_lr(50) < scheduler.get_lr(99));
+    }
+
+    #[test]
+    fn test_wsd_scheduler() {
+        // 1000 steps, 100 warmup, stable_ratio=0.7 → 630 stable steps, 270 decay steps
+        let scheduler = LearningRateScheduler::new(1e-4, 1000, 100, LrSchedulerType::Wsd)
+            .with_stable_ratio(0.7);
+
+        // During warmup: increasing
+        assert!(scheduler.get_lr(0) < scheduler.get_lr(50));
+        assert!((scheduler.get_lr(100) - 1e-4).abs() < 1e-10);
+
+        // During stable phase (steps 100-730): at base LR
+        assert!((scheduler.get_lr(200) - 1e-4).abs() < 1e-10);
+        assert!((scheduler.get_lr(500) - 1e-4).abs() < 1e-10);
+        assert!((scheduler.get_lr(729) - 1e-4).abs() < 1e-10);
+
+        // During decay phase (steps 730-1000): decreasing
+        assert!(scheduler.get_lr(800) < 1e-4);
+        assert!(scheduler.get_lr(900) < scheduler.get_lr(800));
+        assert!(scheduler.get_lr(999) < scheduler.get_lr(900));
+    }
+
+    #[test]
+    fn test_wsd_stable_ratio_zero() {
+        // stable_ratio=0 → no stable phase, immediate decay after warmup
+        let scheduler =
+            LearningRateScheduler::new(1e-4, 100, 10, LrSchedulerType::Wsd).with_stable_ratio(0.0);
+
+        // Warmup finishes at step 10
+        assert!((scheduler.get_lr(10) - 1e-4).abs() < 1e-10);
+        // Step 11 should already be in decay
+        assert!(scheduler.get_lr(50) < 1e-4);
+    }
+
+    #[test]
+    fn test_wsd_stable_ratio_one() {
+        // stable_ratio=1.0 → all stable, no decay phase
+        let scheduler =
+            LearningRateScheduler::new(1e-4, 100, 10, LrSchedulerType::Wsd).with_stable_ratio(1.0);
+
+        // All post-warmup steps at base LR
+        assert!((scheduler.get_lr(50) - 1e-4).abs() < 1e-10);
+        assert!((scheduler.get_lr(99) - 1e-4).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_wsd_warmup_exceeds_total() {
+        // warmup_steps > total_steps → always in warmup phase
+        let scheduler = LearningRateScheduler::new(1e-4, 50, 100, LrSchedulerType::Wsd);
+
+        // Should be partway through warmup, not crash
+        let lr = scheduler.get_lr(25);
+        assert!(lr > 0.0);
+        assert!(lr < 1e-4);
     }
 }

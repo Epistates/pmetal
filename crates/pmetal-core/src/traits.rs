@@ -227,6 +227,9 @@ pub trait TrainingCallback: Send + Sync {
 
     /// Called when a checkpoint is saved.
     fn on_save(&mut self, _path: &Path) {}
+
+    /// Called when the adaptive LR controller triggers an event.
+    fn on_lr_event(&mut self, _event: &str) {}
 }
 
 // ============================================================================
