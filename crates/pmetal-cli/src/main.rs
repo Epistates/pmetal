@@ -975,10 +975,55 @@ pub enum OllamaTemplate {
     DeepSeek,
 }
 
+/// Gzip-compressed `mlx.metallib` bytes (baked in at compile time by build.rs).
+/// ~31MB compressed in the binary, ~102MB decompressed on disk.
+#[cfg(target_os = "macos")]
+static MLX_METALLIB_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mlx.metallib.gz"));
+
+/// Extract the embedded `mlx.metallib` to `~/.cache/pmetal/lib/mlx.metallib`,
+/// decompressing the gzip'd blob on first run. Skips if a file of non-zero
+/// size already exists at the destination.
+/// Returns the path if extraction succeeded.
+#[cfg(target_os = "macos")]
+fn extract_embedded_metallib() -> Option<PathBuf> {
+    use flate2::read::GzDecoder;
+    use std::io::Read;
+
+    if MLX_METALLIB_GZ.is_empty() {
+        return None;
+    }
+    let home = std::env::var("HOME").ok()?;
+    let cache_dir = PathBuf::from(home).join(".cache/pmetal/lib");
+    let dest = cache_dir.join("mlx.metallib");
+
+    // Skip if already present with non-zero size
+    if dest.is_file() {
+        if let Ok(meta) = dest.metadata() {
+            if meta.len() > 0 {
+                return Some(dest);
+            }
+        }
+    }
+
+    std::fs::create_dir_all(&cache_dir).ok()?;
+    let tmp = dest.with_extension("metallib.tmp");
+
+    let mut decoder = GzDecoder::new(MLX_METALLIB_GZ);
+    let mut decompressed = Vec::new();
+    if decoder.read_to_end(&mut decompressed).is_err() {
+        return None;
+    }
+
+    std::fs::write(&tmp, &decompressed).ok()?;
+    std::fs::rename(&tmp, &dest).ok()?;
+    tracing::info!("Extracted embedded mlx.metallib to {}", dest.display());
+    Some(dest)
+}
+
 /// Discover `mlx.metallib` and set `PMETAL_METALLIB_PATH` so the patched MLX
 /// C++ backend can find it regardless of where the binary is installed.
 ///
-/// Search order: colocated → cache → Homebrew → auto-download → error.
+/// Search order: colocated → build dir → cache → Homebrew → embedded → download → error.
 #[allow(unsafe_code)]
 fn ensure_metallib() {
     let metallib_name = "mlx.metallib";
@@ -1062,6 +1107,16 @@ fn ensure_metallib() {
                 }
             }
         }
+        return;
+    }
+
+    // Try extracting the embedded metallib (baked in at compile time)
+    if let Some(path) = extract_embedded_metallib() {
+        unsafe {
+            std::env::set_var("PMETAL_METALLIB_PATH", &path);
+            std::env::set_var("MLX_METAL_JIT", "1");
+        };
+        tracing::debug!(path = %path.display(), "Using embedded mlx.metallib");
         return;
     }
 

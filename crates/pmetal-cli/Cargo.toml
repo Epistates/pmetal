@@ -44,6 +44,7 @@ tempfile = { workspace = true }
 tokenizers = { workspace = true }
 pmetal-metal = { workspace = true }
 walkdir = { workspace = true }
+flate2 = "1"
 ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", features = ["event-stream"], optional = true }
 futures = { version = "0.3", optional = true }
@@ -53,6 +54,9 @@ tokio-util = { version = "0.7", features = ["rt"], optional = true }
 default = ["ane", "dashboard"]
 ane = ["pmetal-trainer/ane", "pmetal-models/ane"]
 dashboard = ["dep:ratatui", "dep:crossterm", "dep:futures", "dep:tokio-util"]
+
+[build-dependencies]
+flate2 = "1"
 
 [lints]
 workspace = true

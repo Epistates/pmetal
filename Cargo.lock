@@ -4541,6 +4541,7 @@ dependencies = [
  "clap",
  "crossterm",
  "dirs",
+ "flate2",
  "futures",
  "indicatif",
  "parquet",
