@@ -39,6 +39,11 @@ impl CommandRunner {
         }
     }
 
+    /// Get a clone of the app message sender (for background tasks).
+    pub fn app_tx(&self) -> mpsc::UnboundedSender<AppMsg> {
+        self.app_tx.clone()
+    }
+
     /// Spawn a background job from a command spec. Returns the job ID.
     pub fn spawn(&mut self, spec: CommandSpec) -> String {
         let job_id = format!("job-{}", self.next_id);
@@ -168,12 +173,23 @@ async fn run_command(
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
 
+    // Log the full command to the job output for debugging
+    let cmd_display = format!("{} {}", binary.display(), spec.args.join(" "));
+    let _ = tx.send(AppMsg::JobOutput {
+        job_id: job_id.to_string(),
+        line: format!("$ {cmd_display}"),
+    });
+
     let mut child = cmd.spawn()?;
 
     let stdout = child.stdout.take();
     let stderr = child.stderr.take();
     let job_id_owned = job_id.to_string();
     let is_inference = spec.job_type == JobType::Infer;
+
+    // Shared ring buffer to capture last stderr lines for error reporting
+    let last_stderr = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    const MAX_STDERR_LINES: usize = 10;
 
     // Stream stdout — for inference jobs, parse output and route as InferenceToken/InferenceDone
     if let Some(stdout) = stdout {
@@ -297,12 +313,22 @@ async fn run_command(
     }
 
     // Stream stderr
+    let stderr_capture = last_stderr.clone();
     if let Some(stderr) = stderr {
         let tx_err = tx.clone();
         let jid = job_id_owned.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
+                // Capture recent stderr lines for error reporting
+                {
+                    let mut buf = stderr_capture.lock().unwrap();
+                    buf.push(line.clone());
+                    if buf.len() > MAX_STDERR_LINES {
+                        buf.remove(0);
+                    }
+                }
+
                 // For inference, send errors as InferenceError
                 if is_inference && !line.is_empty() {
                     // Skip tracing/debug lines (they start with timestamp or level)
@@ -351,10 +377,34 @@ async fn run_command(
             if status.success() {
                 Ok(())
             } else {
-                Err(anyhow::anyhow!(
-                    "Process exited with code {}",
-                    status.code().unwrap_or(-1)
-                ))
+                // Give stderr reader a moment to flush remaining lines
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+                // Include last stderr lines in error for better diagnostics
+                let code = status.code().unwrap_or(-1);
+                let stderr_lines = last_stderr.lock().unwrap();
+                let context: Vec<&str> = stderr_lines
+                    .iter()
+                    .rev()
+                    .filter(|l| {
+                        let l = l.trim();
+                        !l.is_empty() && !l.contains("INFO") && !l.contains("DEBUG") && !l.contains("TRACE")
+                    })
+                    .take(5)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .map(|s| s.as_str())
+                    .collect();
+
+                if context.is_empty() {
+                    Err(anyhow::anyhow!("Process exited with code {code}"))
+                } else {
+                    Err(anyhow::anyhow!(
+                        "Process exited with code {code}:\n{}",
+                        context.join("\n")
+                    ))
+                }
             }
         }
         _ = cancel.cancelled() => {

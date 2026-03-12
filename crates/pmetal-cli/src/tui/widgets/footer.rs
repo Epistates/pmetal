@@ -47,6 +47,8 @@ impl Widget for Footer {
                     Span::styled(" fuse  ", THEME.footer_desc),
                     Span::styled("d", THEME.footer_key),
                     Span::styled(" download  ", THEME.footer_desc),
+                    Span::styled("S", THEME.footer_key),
+                    Span::styled(" search HF  ", THEME.footer_desc),
                 ]);
             }
             Tab::Datasets => {
@@ -71,6 +73,8 @@ impl Widget for Footer {
                     Span::styled(" start  ", THEME.footer_desc),
                     Span::styled("x", THEME.footer_key),
                     Span::styled(" stop  ", THEME.footer_desc),
+                    Span::styled("L", THEME.footer_key),
+                    Span::styled(" set LR  ", THEME.footer_desc),
                 ]);
             }
             Tab::Inference => {

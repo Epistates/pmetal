@@ -57,8 +57,11 @@ pub struct App {
     /// Background command runner.
     runner: Option<CommandRunner>,
 
-    /// Currently active training job ID (if any).
+    /// Currently active training/distill/grpo job ID (if any).
     active_training_job: Option<String>,
+
+    /// The type of the active training job (Train, Distill, or Grpo).
+    active_job_type: Option<JobType>,
 
     /// Output directory of the currently active training job (for auto-registering on completion).
     active_training_output_dir: Option<PathBuf>,
@@ -92,9 +95,12 @@ enum PendingModalTarget {
     GrpoDataset,
     GrpoStart,
     DownloadModel,
+    HfSearch,
     AddModelDir,
     AddDatasetDir,
     ConvertDataset,
+    /// User wants to set learning rate for active training job.
+    SetLearningRate,
 }
 
 impl App {
@@ -102,7 +108,7 @@ impl App {
     pub fn new(metrics_file: Option<PathBuf>) -> Self {
         Self {
             should_quit: false,
-            active_tab: Tab::Dashboard,
+            active_tab: Tab::Device,
             mouse_captured: true,
             dashboard: DashboardTab::new(metrics_file),
             device: DeviceTab::new(),
@@ -118,6 +124,7 @@ impl App {
             pending_modal_context: None,
             runner: None,
             active_training_job: None,
+            active_job_type: None,
             active_training_output_dir: None,
             active_inference_job: None,
             header_area: ratatui::layout::Rect::default(),
@@ -376,6 +383,14 @@ impl App {
                         }
                     }
                 }
+                KeyCode::Char('S') if !self.models.searching => {
+                    // Search HuggingFace Hub
+                    self.pending_modal_context = Some(PendingModalTarget::HfSearch);
+                    self.modal_stack.push(Modal::text_input(
+                        "Search HuggingFace Hub",
+                        "Search query (e.g. 'qwen3 0.6B', 'llama 8b'):",
+                    ));
+                }
                 _ => {}
             },
             Tab::Datasets => match key.code {
@@ -477,6 +492,9 @@ impl App {
                         runner.cancel(job_id);
                     }
                 }
+            }
+            KeyCode::Char('L') => {
+                self.open_lr_override_modal();
             }
             _ => {}
         }
@@ -649,6 +667,9 @@ impl App {
             KeyCode::Char('S') => {
                 self.start_distillation_prompt();
             }
+            KeyCode::Char('L') => {
+                self.open_lr_override_modal();
+            }
             _ => {}
         }
     }
@@ -693,6 +714,9 @@ impl App {
             KeyCode::Char('S') => {
                 self.start_grpo_prompt();
             }
+            KeyCode::Char('L') => {
+                self.open_lr_override_modal();
+            }
             _ => {}
         }
     }
@@ -711,11 +735,19 @@ impl App {
 
                 // Check if click is in header/tab area
                 if y < self.header_area.y + self.header_area.height {
-                    // Approximate tab positions: logo takes 20 cols, then each tab ~15 cols
+                    // Logo takes 20 cols, then tabs with variable widths
                     if x >= 20 {
-                        let tab_idx = ((x - 20) / 15) as usize;
-                        if let Some(&tab) = Tab::ALL.get(tab_idx) {
-                            self.active_tab = tab;
+                        let click_x = (x - 20) as usize;
+                        let mut offset = 0usize;
+                        for &tab in Tab::ALL.iter() {
+                            // Each tab renders as " {icon} {name} " + 1 char divider
+                            let tab_width = tab.to_string().len() + 4;
+                            let with_divider = tab_width + 1;
+                            if click_x >= offset && click_x < offset + tab_width {
+                                self.active_tab = tab;
+                                break;
+                            }
+                            offset += with_divider;
                         }
                     }
                 }
@@ -752,8 +784,26 @@ impl App {
                 job_id: _,
                 job_type,
             } => match job_type {
-                JobType::Train | JobType::Distill | JobType::Grpo => {
+                JobType::Train => {
                     self.training.set_status_running(0, 0, 0, 0, 0.0);
+                }
+                JobType::Distill => {
+                    self.distillation.status = TrainingStatus::Running {
+                        step: 0,
+                        epoch: 0,
+                        total_epochs: 0,
+                        total_steps: 0,
+                        loss: 0.0,
+                    };
+                }
+                JobType::Grpo => {
+                    self.grpo.status = TrainingStatus::Running {
+                        step: 0,
+                        epoch: 0,
+                        total_epochs: 0,
+                        total_steps: 0,
+                        loss: 0.0,
+                    };
                 }
                 _ => {}
             },
@@ -790,9 +840,25 @@ impl App {
                     total_ms,
                 });
 
-                // Update training status
-                self.training
-                    .set_status_running(step, epoch, total_epochs, total_steps, loss);
+                // Update status on the tab that owns the active job
+                let running = TrainingStatus::Running {
+                    step,
+                    epoch,
+                    total_epochs,
+                    total_steps,
+                    loss,
+                };
+                match self.active_job_type {
+                    Some(JobType::Distill) => self.distillation.status = running,
+                    Some(JobType::Grpo) => self.grpo.status = running,
+                    _ => self.training.set_status_running(
+                        step,
+                        epoch,
+                        total_epochs,
+                        total_steps,
+                        loss,
+                    ),
+                }
             }
             AppMsg::JobOutput { job_id, line } => {
                 // Route to jobs tab live log
@@ -804,10 +870,29 @@ impl App {
                 message,
             } => {
                 if self.active_training_job.as_deref() == Some(&job_id) {
+                    let loss = self.dashboard.samples.last().map(|s| s.loss).unwrap_or(0.0);
+                    let steps = self.dashboard.samples.len();
+                    let job_type = self.active_job_type.unwrap_or(JobType::Train);
+
                     if success {
-                        let loss = self.dashboard.samples.last().map(|s| s.loss).unwrap_or(0.0);
-                        let steps = self.dashboard.samples.len();
-                        self.training.set_status_completed(loss, steps);
+                        // Update status on the correct tab
+                        match job_type {
+                            JobType::Distill => {
+                                self.distillation.status = TrainingStatus::Completed {
+                                    final_loss: loss,
+                                    total_steps: steps,
+                                };
+                            }
+                            JobType::Grpo => {
+                                self.grpo.status = TrainingStatus::Completed {
+                                    final_loss: loss,
+                                    total_steps: steps,
+                                };
+                            }
+                            _ => {
+                                self.training.set_status_completed(loss, steps);
+                            }
+                        }
                         // Auto-register the training output directory so it persists across sessions
                         if let Some(ref dir) = self.active_training_output_dir {
                             let canonical = dir.canonicalize().unwrap_or_else(|_| dir.clone());
@@ -815,10 +900,16 @@ impl App {
                         }
                         // Rescan models to pick up the trained output
                         self.models.scan_models();
+
+                        let job_label = match job_type {
+                            JobType::Distill => "Distillation",
+                            JobType::Grpo => "GRPO Training",
+                            _ => "Training",
+                        };
                         // Offer to test inference with the trained model
                         self.pending_modal_context = Some(PendingModalTarget::TestInference);
                         self.modal_stack.push(Modal::confirm(
-                            "Training Complete",
+                            &format!("{job_label} Complete"),
                             vec![
                                 format!("Final loss: {loss:.4} over {steps} steps"),
                                 String::new(),
@@ -826,9 +917,21 @@ impl App {
                             ],
                         ));
                     } else {
-                        self.training.set_status_failed(&message);
+                        // Update failure status on the correct tab
+                        match job_type {
+                            JobType::Distill => {
+                                self.distillation.status = TrainingStatus::Failed(message.clone());
+                            }
+                            JobType::Grpo => {
+                                self.grpo.status = TrainingStatus::Failed(message.clone());
+                            }
+                            _ => {
+                                self.training.set_status_failed(&message);
+                            }
+                        }
                     }
                     self.active_training_job = None;
+                    self.active_job_type = None;
                     self.active_training_output_dir = None;
                 }
                 if self.active_inference_job.as_deref() == Some(&job_id) {
@@ -893,6 +996,74 @@ impl App {
                 self.active_inference_job = None;
                 self.modal_stack
                     .push(Modal::error("Inference Error", message));
+            }
+            AppMsg::HfSearchResults { results } => {
+                // Pop any progress modal
+                if matches!(self.modal_stack.last(), Some(Modal::Progress { .. })) {
+                    self.modal_stack.pop();
+                }
+
+                // Build search entries with fit estimation
+                let entries: Vec<_> = results
+                    .iter()
+                    .map(|r| {
+                        let params_b = r.estimated_params_b.unwrap_or(0.0);
+                        let params_str = pmetal_hub::fit::format_params(params_b);
+                        let downloads_str = pmetal_hub::search::format_downloads(r.downloads);
+
+                        let (mem_str, fit_level, tps_str) = if let Some(dev) =
+                            &self.models.device_spec
+                        {
+                            let quant = pmetal_hub::fit::detect_quantization_from_id(&r.model_id);
+                            let model_spec = pmetal_hub::ModelSpec {
+                                params_b,
+                                quantization: quant,
+                                context_length: 4096,
+                                num_kv_heads: None,
+                                head_dim: None,
+                                num_layers: None,
+                                is_moe: r.tags.iter().any(|t| t == "moe"),
+                                num_experts: None,
+                                active_experts: None,
+                            };
+                            let fit = pmetal_hub::estimate_fit(&model_spec, dev);
+                            (
+                                format!("{:.1}GB", fit.total_required_gb),
+                                fit.fit_level,
+                                format!("{:.0}", fit.estimated_tps),
+                            )
+                        } else {
+                            let mem = r
+                                .safetensors_bytes
+                                .map(pmetal_hub::fit::format_bytes)
+                                .unwrap_or_else(|| "?".to_string());
+                            (mem, pmetal_hub::FitLevel::Fits, "-".to_string())
+                        };
+
+                        crate::tui::modal::HfSearchEntry {
+                            model_id: r.model_id.clone(),
+                            params: params_str,
+                            downloads: downloads_str,
+                            memory: mem_str,
+                            fit_level,
+                            estimated_tps: tps_str,
+                        }
+                    })
+                    .collect();
+
+                if entries.is_empty() {
+                    self.modal_stack
+                        .push(Modal::error("No Results", "No models found."));
+                } else {
+                    self.modal_stack.push(Modal::hf_search(entries));
+                }
+            }
+            AppMsg::HfSearchError { message } => {
+                if matches!(self.modal_stack.last(), Some(Modal::Progress { .. })) {
+                    self.modal_stack.pop();
+                }
+                self.modal_stack
+                    .push(Modal::error("Search Failed", message));
             }
         }
     }
@@ -1023,7 +1194,13 @@ impl App {
                 }
                 _ => {}
             },
+            ModalAction::HfDownload(model_id) => {
+                self.download_model(&model_id);
+            }
             ModalAction::TextSubmitted(text) => match target {
+                Some(PendingModalTarget::HfSearch) => {
+                    self.search_hf(&text);
+                }
                 Some(PendingModalTarget::DownloadModel) => {
                     self.download_model(&text);
                 }
@@ -1051,6 +1228,20 @@ impl App {
                 }
                 Some(PendingModalTarget::ConvertDataset) => {
                     self.convert_dataset(&text);
+                }
+                Some(PendingModalTarget::SetLearningRate) => {
+                    // Parse scientific notation like "1e-5" or decimal "0.0001"
+                    match text.trim().parse::<f64>() {
+                        Ok(lr) if lr > 0.0 && lr <= 1.0 => {
+                            self.write_lr_control(lr);
+                        }
+                        _ => {
+                            self.modal_stack.push(Modal::error(
+                                "Invalid Learning Rate",
+                                format!("'{}' is not a valid learning rate (must be > 0 and <= 1.0). Use e.g. 1e-5 or 0.0001", text),
+                            ));
+                        }
+                    }
                 }
                 _ => {}
             },
@@ -1174,6 +1365,7 @@ impl App {
         if let Some(runner) = &mut self.runner {
             let job_id = runner.spawn(spec);
             self.active_training_job = Some(job_id);
+            self.active_job_type = Some(JobType::Train);
             self.active_training_output_dir = Some(output_dir);
             // Point dashboard at the (now-empty) metrics file
             self.dashboard.set_metrics_path(Some(metrics_file));
@@ -1216,6 +1408,7 @@ impl App {
         if let Some(runner) = &mut self.runner {
             let job_id = runner.spawn(spec);
             self.active_training_job = Some(job_id);
+            self.active_job_type = Some(JobType::Distill);
             self.active_training_output_dir = Some(output_dir);
             self.dashboard.set_metrics_path(Some(metrics_file));
             self.active_tab = Tab::Dashboard;
@@ -1256,9 +1449,50 @@ impl App {
         if let Some(runner) = &mut self.runner {
             let job_id = runner.spawn(spec);
             self.active_training_job = Some(job_id);
+            self.active_job_type = Some(JobType::Grpo);
             self.active_training_output_dir = Some(output_dir);
             self.dashboard.set_metrics_path(Some(metrics_file));
             self.active_tab = Tab::Dashboard;
+        }
+    }
+
+    /// Open a text-input modal to let the user override the learning rate of the active job.
+    fn open_lr_override_modal(&mut self) {
+        // Check that there's an active job with an existing output directory
+        match &self.active_training_output_dir {
+            Some(dir) if dir.exists() && self.active_training_job.is_some() => {}
+            _ => {
+                self.modal_stack.push(Modal::error(
+                    "No Active Job",
+                    "Start a training job first. The learning rate can only be adjusted while a job is running.",
+                ));
+                return;
+            }
+        }
+        self.pending_modal_context = Some(PendingModalTarget::SetLearningRate);
+        self.modal_stack.push(Modal::text_input(
+            "Set Learning Rate",
+            "Enter new LR (e.g. 1e-5, 0.0001):",
+        ));
+    }
+
+    /// Write an LR control command to the active job's control file.
+    fn write_lr_control(&mut self, lr: f64) {
+        if let Some(ref dir) = self.active_training_output_dir {
+            let control_file = dir.join(".lr_control.json");
+            let cmd = serde_json::json!({
+                "action": "set_lr",
+                "value": lr,
+            });
+            match std::fs::write(&control_file, cmd.to_string()) {
+                Ok(()) => {}
+                Err(e) => {
+                    self.modal_stack.push(Modal::error(
+                        "LR Override Failed",
+                        format!("Could not write control file: {e}"),
+                    ));
+                }
+            }
         }
     }
 
@@ -1316,6 +1550,7 @@ impl App {
             });
             // Track as training job so completion triggers rescan
             self.active_training_job = Some(job_id);
+            self.active_job_type = Some(JobType::Train);
         }
     }
 
@@ -1416,6 +1651,30 @@ impl App {
             let job_id = runner.spawn(spec);
             self.active_inference_job = Some(job_id);
         }
+    }
+
+    fn search_hf(&mut self, query: &str) {
+        let Some(runner) = &self.runner else { return };
+        let query = query.to_string();
+        let tx = runner.app_tx();
+
+        self.modal_stack.push(Modal::progress(
+            "Searching",
+            format!("Searching HuggingFace for '{query}'..."),
+        ));
+
+        tokio::spawn(async move {
+            match pmetal_hub::search_models(&query, 20, None).await {
+                Ok(results) => {
+                    let _ = tx.send(AppMsg::HfSearchResults { results });
+                }
+                Err(e) => {
+                    let _ = tx.send(AppMsg::HfSearchError {
+                        message: e.to_string(),
+                    });
+                }
+            }
+        });
     }
 
     fn download_model(&mut self, model_id: &str) {

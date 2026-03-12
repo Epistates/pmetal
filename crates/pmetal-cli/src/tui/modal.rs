@@ -28,6 +28,8 @@ pub enum ModalAction {
     SelectDataset(String),
     /// User submitted text input.
     TextSubmitted(String),
+    /// User wants to download a model from HF search results.
+    HfDownload(String),
 }
 
 /// A modal dialog.
@@ -65,6 +67,28 @@ pub enum Modal {
         message: String,
         progress: f64,
     },
+    /// HuggingFace Hub search results.
+    HfSearch {
+        entries: Vec<HfSearchEntry>,
+        table_state: TableState,
+    },
+}
+
+/// An entry in the HF search results modal.
+#[derive(Debug, Clone)]
+pub struct HfSearchEntry {
+    /// Model ID (e.g., "Qwen/Qwen3-0.6B").
+    pub model_id: String,
+    /// Formatted parameter count (e.g., "0.6B").
+    pub params: String,
+    /// Formatted download count (e.g., "1.2M").
+    pub downloads: String,
+    /// Formatted memory requirement (e.g., "1.8 GB").
+    pub memory: String,
+    /// Fit level on this device.
+    pub fit_level: pmetal_hub::FitLevel,
+    /// Estimated tokens per second.
+    pub estimated_tps: String,
 }
 
 /// A simple entry for picker modals.
@@ -131,6 +155,17 @@ impl Modal {
             title: title.into(),
             message: message.into(),
             progress: 0.0,
+        }
+    }
+
+    pub fn hf_search(entries: Vec<HfSearchEntry>) -> Self {
+        let mut state = TableState::default();
+        if !entries.is_empty() {
+            state.select(Some(0));
+        }
+        Modal::HfSearch {
+            entries,
+            table_state: state,
         }
     }
 
@@ -309,6 +344,41 @@ impl Modal {
                 KeyCode::Esc => Some(ModalAction::None),
                 _ => None,
             },
+
+            Modal::HfSearch {
+                entries,
+                table_state,
+            } => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => Some(ModalAction::None),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let count = entries.len();
+                    if count > 0 {
+                        let i = table_state.selected().map_or(0, |i| (i + 1) % count);
+                        table_state.select(Some(i));
+                    }
+                    None
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let count = entries.len();
+                    if count > 0 {
+                        let i = table_state
+                            .selected()
+                            .map_or(0, |i| (i + count - 1) % count);
+                        table_state.select(Some(i));
+                    }
+                    None
+                }
+                KeyCode::Enter | KeyCode::Char('d') => {
+                    // Download selected model
+                    if let Some(idx) = table_state.selected() {
+                        if let Some(entry) = entries.get(idx) {
+                            return Some(ModalAction::HfDownload(entry.model_id.clone()));
+                        }
+                    }
+                    None
+                }
+                _ => None,
+            },
         }
     }
 
@@ -349,6 +419,10 @@ impl Modal {
                 message,
                 progress,
             } => render_progress(popup_area, buf, title, message, *progress),
+            Modal::HfSearch {
+                entries,
+                table_state,
+            } => render_hf_search(popup_area, buf, entries, table_state),
         }
     }
 
@@ -357,6 +431,7 @@ impl Modal {
             Modal::Confirm { .. } | Modal::Error { .. } | Modal::Progress { .. } => 50,
             Modal::TextInput { .. } => 60,
             Modal::ModelPicker { .. } | Modal::DatasetPicker { .. } => 70,
+            Modal::HfSearch { .. } => 85,
         }
     }
 
@@ -366,6 +441,7 @@ impl Modal {
             Modal::TextInput { .. } => 20,
             Modal::Error { .. } | Modal::Progress { .. } => 25,
             Modal::ModelPicker { .. } | Modal::DatasetPicker { .. } => 60,
+            Modal::HfSearch { .. } => 70,
         }
     }
 }
@@ -616,6 +692,99 @@ fn render_progress(area: Rect, buf: &mut Buffer, title: &str, message: &str, pro
         .ratio(progress.clamp(0.0, 1.0))
         .label(format!("{pct}%"))
         .render(gauge_area, buf);
+}
+
+fn render_hf_search(
+    area: Rect,
+    buf: &mut Buffer,
+    entries: &[HfSearchEntry],
+    table_state: &mut TableState,
+) {
+    use ratatui::style::{Color, Style};
+
+    let block = Block::default()
+        .title(" HuggingFace Hub Search ")
+        .title_style(THEME.block_title_focused)
+        .borders(Borders::ALL)
+        .border_style(THEME.block_focused);
+
+    if entries.is_empty() {
+        Paragraph::new("\n  No results found.")
+            .style(THEME.text_muted)
+            .block(block)
+            .render(area, buf);
+        return;
+    }
+
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let [table_area, help_area] =
+        Layout::vertical([Constraint::Fill(1), Constraint::Length(1)]).areas(inner);
+
+    let header = Row::new(vec![
+        "Model",
+        "Params",
+        "Downloads",
+        "Memory",
+        "Fit",
+        "tok/s",
+    ])
+    .style(THEME.table_header)
+    .height(1);
+
+    let rows: Vec<Row> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let base_style = if i % 2 == 0 {
+                THEME.table_row
+            } else {
+                THEME.table_row_alt
+            };
+            let fit_style = match entry.fit_level {
+                pmetal_hub::FitLevel::Fits => Style::default().fg(Color::Green),
+                pmetal_hub::FitLevel::Tight => Style::default().fg(Color::Yellow),
+                pmetal_hub::FitLevel::TooLarge => Style::default().fg(Color::Red),
+            };
+            Row::new(vec![
+                Cell::new(entry.model_id.clone()),
+                Cell::new(entry.params.clone()),
+                Cell::new(entry.downloads.clone()),
+                Cell::new(entry.memory.clone()),
+                Cell::new(entry.fit_level.label()).style(fit_style),
+                Cell::new(entry.estimated_tps.clone()),
+            ])
+            .style(base_style)
+        })
+        .collect();
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Fill(1),
+            Constraint::Length(8),
+            Constraint::Length(10),
+            Constraint::Length(9),
+            Constraint::Length(10),
+            Constraint::Length(8),
+        ],
+    )
+    .header(header)
+    .row_highlight_style(THEME.table_selected)
+    .highlight_spacing(HighlightSpacing::Always);
+
+    StatefulWidget::render(table, table_area, buf, table_state);
+
+    Line::from(vec![
+        Span::styled("j/k", THEME.footer_key),
+        Span::styled(" navigate  ", THEME.text_muted),
+        Span::styled("Enter/d", THEME.footer_key),
+        Span::styled(" download  ", THEME.text_muted),
+        Span::styled("Esc", THEME.footer_key),
+        Span::styled(" close", THEME.text_muted),
+    ])
+    .render(help_area, buf);
 }
 
 // --- Helpers ---

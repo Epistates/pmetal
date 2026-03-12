@@ -189,10 +189,24 @@ impl DashboardTab {
             .border_style(THEME.block);
 
         if self.loss_data.is_empty() {
-            Paragraph::new("\n  Waiting for training data...")
-                .style(THEME.text_muted)
-                .block(block)
-                .render(area, buf);
+            Paragraph::new(vec![
+                ratatui::text::Line::from(""),
+                ratatui::text::Line::from(Span::styled(
+                    "  No active training run.",
+                    THEME.text_muted,
+                )),
+                ratatui::text::Line::from(""),
+                ratatui::text::Line::from(Span::styled(
+                    "  Start a run from the Training, Distill, or GRPO tab.",
+                    THEME.text_dim,
+                )),
+                ratatui::text::Line::from(Span::styled(
+                    "  Loss curve and metrics will appear here automatically.",
+                    THEME.text_dim,
+                )),
+            ])
+            .block(block)
+            .render(area, buf);
             return;
         }
 
@@ -354,10 +368,7 @@ impl DashboardTab {
                 },
             ]
         } else {
-            vec![ListItem::new(Span::styled(
-                "Waiting for data...",
-                THEME.text_muted,
-            ))]
+            vec![ListItem::new(Span::styled("No data yet", THEME.text_muted))]
         };
 
         List::new(items).render(inner, buf);
