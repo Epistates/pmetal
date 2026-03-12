@@ -9,8 +9,12 @@
 
 mod cache;
 mod download;
+pub mod fit;
+pub mod search;
 mod upload;
 
 pub use cache::*;
 pub use download::*;
+pub use fit::*;
+pub use search::*;
 pub use upload::*;
