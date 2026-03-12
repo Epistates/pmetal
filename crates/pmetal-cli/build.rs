@@ -28,6 +28,10 @@ fn main() {
         compress_metallib(&src, &dest);
         emit(&dest);
     } else {
+        // Write an empty file so `include_bytes!` compiles even without the metallib.
+        // The runtime check (`MLX_METALLIB_GZ.is_empty()`) handles this gracefully.
+        std::fs::write(&dest, b"").unwrap();
+        emit(&dest);
         println!(
             "cargo:warning=mlx.metallib not found at build time — \
              embedded metallib will not be available. \
