@@ -27,6 +27,8 @@ pub struct ModelEntry {
     pub source: ModelSource,
     /// For LoRA adapters: the base model ID or path needed to load the adapter.
     pub base_model: Option<String>,
+    /// Memory fit estimation for this device.
+    pub fit_estimate: Option<pmetal_hub::FitEstimate>,
 }
 
 /// Where a model was discovered from.
@@ -62,11 +64,27 @@ pub struct ModelsTab {
     pub searching: bool,
     /// User-configured custom directories to scan for models.
     pub custom_dirs: Vec<PathBuf>,
+    /// Device spec for fit estimation (queried once at startup).
+    pub device_spec: Option<pmetal_hub::DeviceSpec>,
 }
 
 impl ModelsTab {
     pub fn new() -> Self {
         let custom_dirs = load_custom_model_dirs();
+
+        // Query device spec for fit estimation
+        let device_spec = pmetal_metal::context::MetalContext::global()
+            .ok()
+            .map(|ctx| {
+                let props = ctx.properties();
+                pmetal_hub::DeviceSpec {
+                    memory_gb: props.recommended_working_set_size as f64
+                        / (1024.0 * 1024.0 * 1024.0),
+                    bandwidth_gbps: props.memory_bandwidth_gbps,
+                    unified_memory: props.has_unified_memory,
+                }
+            });
+
         let mut tab = Self {
             models: Vec::new(),
             table_state: TableState::default(),
@@ -75,6 +93,7 @@ impl ModelsTab {
             search_query: String::new(),
             searching: false,
             custom_dirs,
+            device_spec,
         };
         tab.scan_models();
         tab
@@ -123,11 +142,35 @@ impl ModelsTab {
             b_trained.cmp(&a_trained).then(a.id.cmp(&b.id))
         });
 
+        // Compute fit estimates for all models
+        self.compute_fit_estimates();
+
         if !self.models.is_empty() {
             self.table_state.select(Some(0));
         }
         self.scrollbar_state = ScrollbarState::new(self.models.len());
         self.loading = false;
+    }
+
+    /// Compute fit estimates for all local models.
+    fn compute_fit_estimates(&mut self) {
+        let Some(device) = &self.device_spec else {
+            return;
+        };
+        for model in &mut self.models {
+            let config_path = model.path.join("config.json");
+            if !config_path.exists() {
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&config_path) else {
+                continue;
+            };
+            let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) else {
+                continue;
+            };
+            let model_spec = pmetal_hub::model_spec_from_config(&config, Some(model.size_bytes));
+            model.fit_estimate = Some(pmetal_hub::estimate_fit(&model_spec, device));
+        }
     }
 
     /// Scan common output directories for trained/fine-tuned models.
@@ -419,7 +462,7 @@ impl ModelsTab {
             return;
         }
 
-        let header = Row::new(vec!["Model", "Size", "Arch / Base", "Source"])
+        let header = Row::new(vec!["Model", "Size", "Arch / Base", "Fit", "Source"])
             .style(THEME.table_header)
             .height(1);
 
@@ -427,6 +470,8 @@ impl ModelsTab {
             .iter()
             .enumerate()
             .map(|(i, model)| {
+                use ratatui::style::{Color, Style};
+
                 let style = if i % 2 == 0 {
                     THEME.table_row
                 } else {
@@ -443,10 +488,21 @@ impl ModelsTab {
                     .map(String::from)
                     .or_else(|| model.base_model.as_ref().map(|b| format!("< {b}")))
                     .unwrap_or_else(|| "-".to_string());
+                let fit_cell = if let Some(fit) = &model.fit_estimate {
+                    let fit_style = match fit.fit_level {
+                        pmetal_hub::FitLevel::Fits => Style::default().fg(Color::Green),
+                        pmetal_hub::FitLevel::Tight => Style::default().fg(Color::Yellow),
+                        pmetal_hub::FitLevel::TooLarge => Style::default().fg(Color::Red),
+                    };
+                    Cell::new(format!("{:.1}GB", fit.total_required_gb)).style(fit_style)
+                } else {
+                    Cell::new("-")
+                };
                 Row::new(vec![
                     Cell::new(model.id.clone()),
                     Cell::new(model.size_display()),
                     Cell::new(arch_display),
+                    fit_cell,
                     source_cell,
                 ])
                 .style(style)
@@ -458,7 +514,8 @@ impl ModelsTab {
             [
                 Constraint::Fill(1),
                 Constraint::Length(10),
-                Constraint::Length(20),
+                Constraint::Length(18),
+                Constraint::Length(9),
                 Constraint::Length(10),
             ],
         )
@@ -551,6 +608,62 @@ impl ModelsTab {
             Span::styled(&model.modified, THEME.text_dim),
         ]));
 
+        // Fit estimation section
+        if let Some(fit) = &model.fit_estimate {
+            use ratatui::style::{Color, Style};
+
+            lines.push(Line::from(""));
+            let fit_style = match fit.fit_level {
+                pmetal_hub::FitLevel::Fits => Style::default().fg(Color::Green),
+                pmetal_hub::FitLevel::Tight => Style::default().fg(Color::Yellow),
+                pmetal_hub::FitLevel::TooLarge => Style::default().fg(Color::Red),
+            };
+            lines.push(Line::from(vec![Span::styled(
+                "--- Memory Fit ---",
+                THEME.kv_key,
+            )]));
+            lines.push(Line::from(vec![
+                Span::styled("Status: ", THEME.kv_key),
+                Span::styled(fit.fit_level.label(), fit_style),
+                Span::styled(
+                    format!(
+                        " ({:.0}% of {:.0}GB)",
+                        fit.utilization_pct, fit.available_gb
+                    ),
+                    THEME.text_dim,
+                ),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Weights: ", THEME.kv_key),
+                Span::styled(format!("{:.1} GB", fit.weights_gb), THEME.kv_value),
+                Span::styled("  KV: ", THEME.kv_key),
+                Span::styled(format!("{:.1} GB", fit.kv_cache_gb), THEME.kv_value),
+            ]));
+            lines.push(Line::from(vec![
+                Span::styled("Decode:  ", THEME.kv_key),
+                Span::styled(format!("~{:.0} tok/s", fit.estimated_tps), THEME.kv_value),
+            ]));
+
+            // Training info
+            let train_style = match fit.training_fit {
+                pmetal_hub::FitLevel::Fits => Style::default().fg(Color::Green),
+                pmetal_hub::FitLevel::Tight => Style::default().fg(Color::Yellow),
+                pmetal_hub::FitLevel::TooLarge => Style::default().fg(Color::Red),
+            };
+            lines.push(Line::from(vec![
+                Span::styled("Train:   ", THEME.kv_key),
+                Span::styled(format!("{:.1} GB", fit.training_memory_gb), train_style),
+                Span::styled(
+                    format!("  batch {}", fit.recommended_batch_size),
+                    THEME.text_dim,
+                ),
+            ]));
+
+            for note in &fit.notes {
+                lines.push(Line::from(Span::styled(note.as_str(), THEME.text_muted)));
+            }
+        }
+
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
             .render(inner, buf);
@@ -625,6 +738,7 @@ fn build_model_entry(
         modified,
         source,
         base_model,
+        fit_estimate: None, // computed after scan in compute_fit_estimates()
     })
 }
 

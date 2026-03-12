@@ -18,7 +18,7 @@ pub use grpo::{GrpoAction, GrpoTab};
 pub use inference::{InferenceFocus, InferenceTab};
 pub use jobs::JobsTab;
 pub use models::{ModelSource, ModelsTab, write_training_info};
-pub use training::{TrainingAction, TrainingTab};
+pub use training::{TrainingAction, TrainingStatus, TrainingTab};
 
 /// Extract a short model name from a model ID.
 /// e.g. "unsloth/Qwen3-0.6B" → "Qwen3-0.6B", "trained/foo" → "foo"
@@ -43,13 +43,13 @@ pub enum Tab {
 impl Tab {
     /// All tabs in display order.
     pub const ALL: &[Tab] = &[
-        Tab::Dashboard,
         Tab::Device,
         Tab::Models,
         Tab::Datasets,
         Tab::Training,
         Tab::Distillation,
         Tab::Grpo,
+        Tab::Dashboard,
         Tab::Inference,
         Tab::Jobs,
     ];
@@ -87,8 +87,8 @@ impl Tab {
 impl std::fmt::Display for Tab {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Tab::Dashboard => write!(f, "Dashboard"),
-            Tab::Device => write!(f, "Device"),
+            Tab::Dashboard => write!(f, "Monitor"),
+            Tab::Device => write!(f, "System"),
             Tab::Models => write!(f, "Models"),
             Tab::Datasets => write!(f, "Datasets"),
             Tab::Training => write!(f, "Training"),

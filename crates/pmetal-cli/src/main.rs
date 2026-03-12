@@ -319,6 +319,24 @@ enum Commands {
         revision: Option<String>,
     },
 
+    /// Search HuggingFace Hub for models and show device fit
+    Search {
+        /// Search query (e.g. "qwen3 0.6B", "llama 8b")
+        query: String,
+
+        /// Maximum number of results
+        #[arg(short, long, default_value = "15")]
+        limit: usize,
+
+        /// Download the first result that fits on your device
+        #[arg(long)]
+        download: bool,
+
+        /// Show detailed fit analysis (memory breakdown, training estimates)
+        #[arg(long)]
+        detailed: bool,
+    },
+
     /// Show memory usage and available capacity
     Memory,
 
@@ -452,6 +470,10 @@ enum Commands {
         #[arg(long, default_value = "16")]
         lora_r: usize,
 
+        /// LoRA alpha scaling factor
+        #[arg(long, default_value = "32")]
+        lora_alpha: usize,
+
         /// Learning rate
         #[arg(long, default_value = "2e-5")]
         learning_rate: f32,
@@ -467,6 +489,10 @@ enum Commands {
         /// Maximum sequence length
         #[arg(long, default_value = "1024")]
         max_seq_len: usize,
+
+        /// Path to write JSONL metrics log (for TUI dashboard)
+        #[arg(long)]
+        log_metrics: Option<String>,
     },
 
     /// Group Relative Policy Optimization (GRPO) for reasoning models
@@ -510,6 +536,10 @@ enum Commands {
         /// Disable Metal FlashAttention
         #[arg(long)]
         no_flash_attention: bool,
+
+        /// Path to write JSONL metrics log (for TUI dashboard)
+        #[arg(long)]
+        log_metrics: Option<String>,
     },
 
     /// Dataset utilities for preparing and analyzing training data
@@ -1275,6 +1305,15 @@ async fn main() -> anyhow::Result<()> {
             println!("Model downloaded to: {}", path.display());
         }
 
+        Commands::Search {
+            query,
+            limit,
+            download,
+            detailed,
+        } => {
+            run_search(&query, limit, download, detailed).await?;
+        }
+
         Commands::Memory => {
             let stats = pmetal_mlx::memory::get_memory_stats();
             println!("Memory Statistics:");
@@ -1363,10 +1402,12 @@ async fn main() -> anyhow::Result<()> {
             rationale,
             rationale_weight,
             lora_r,
+            lora_alpha,
             learning_rate,
             batch_size,
             epochs,
             max_seq_len,
+            log_metrics,
         } => {
             run_distillation_cli(
                 &teacher,
@@ -1380,10 +1421,12 @@ async fn main() -> anyhow::Result<()> {
                 rationale,
                 rationale_weight,
                 lora_r,
+                lora_alpha,
                 learning_rate,
                 batch_size,
                 epochs,
                 max_seq_len,
+                log_metrics,
             )
             .await?;
         }
@@ -1399,6 +1442,7 @@ async fn main() -> anyhow::Result<()> {
             dapo,
             reasoning_rewards,
             no_flash_attention,
+            log_metrics,
         } => {
             run_grpo_cli(
                 &model,
@@ -1411,6 +1455,7 @@ async fn main() -> anyhow::Result<()> {
                 dapo,
                 reasoning_rewards,
                 !no_flash_attention,
+                log_metrics,
             )
             .await?;
         }
@@ -1432,6 +1477,164 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// Run HuggingFace Hub search with device fit analysis.
+async fn run_search(
+    query: &str,
+    limit: usize,
+    download: bool,
+    detailed: bool,
+) -> anyhow::Result<()> {
+    use pmetal_hub::{DeviceSpec, FitLevel, ModelSpec, estimate_fit, search_models};
+
+    // Get device info for fit estimation
+    let device_spec = match pmetal_metal::context::MetalContext::global() {
+        Ok(ctx) => {
+            let props = ctx.properties();
+            Some(DeviceSpec {
+                memory_gb: props.recommended_working_set_size as f64 / (1024.0 * 1024.0 * 1024.0),
+                bandwidth_gbps: props.memory_bandwidth_gbps,
+                unified_memory: props.has_unified_memory,
+            })
+        }
+        Err(_) => None,
+    };
+
+    let bar = ProgressBar::new_spinner();
+    bar.set_message(format!("Searching HuggingFace for '{query}'..."));
+    bar.enable_steady_tick(std::time::Duration::from_millis(100));
+
+    let results = search_models(query, limit, None).await?;
+    bar.finish_and_clear();
+
+    if results.is_empty() {
+        println!("No models found for '{query}'.");
+        return Ok(());
+    }
+
+    // Print header
+    if let Some(dev) = &device_spec {
+        println!(
+            "Device: {:.0} GB unified memory, {:.0} GB/s bandwidth\n",
+            dev.memory_gb, dev.bandwidth_gbps
+        );
+    }
+
+    println!(
+        "{:<40} {:>7} {:>10} {:>8} {:>9} {:>10}",
+        "Model", "Params", "Downloads", "Mem", "Fit", "tok/s"
+    );
+    println!("{}", "-".repeat(88));
+
+    let mut first_fit: Option<String> = None;
+
+    for result in &results {
+        let params_str = result
+            .estimated_params_b
+            .map(pmetal_hub::fit::format_params)
+            .unwrap_or_else(|| "?".to_string());
+
+        let downloads_str = pmetal_hub::search::format_downloads(result.downloads);
+
+        // Compute fit if we have device info and param estimate
+        let (mem_str, fit_str, tps_str) =
+            if let (Some(dev), Some(params_b)) = (&device_spec, result.estimated_params_b) {
+                let quant = pmetal_hub::fit::detect_quantization_from_id(&result.model_id);
+                let model_spec = ModelSpec {
+                    params_b,
+                    quantization: quant,
+                    context_length: 4096, // reasonable default for search results
+                    num_kv_heads: None,
+                    head_dim: None,
+                    num_layers: None,
+                    is_moe: result.tags.iter().any(|t| t == "moe"),
+                    num_experts: None,
+                    active_experts: None,
+                };
+                let fit = estimate_fit(&model_spec, dev);
+
+                if first_fit.is_none() && fit.fit_level != FitLevel::TooLarge {
+                    first_fit = Some(result.model_id.clone());
+                }
+
+                (
+                    format!("{:.1}GB", fit.total_required_gb),
+                    fit.fit_level.label().to_string(),
+                    format!("{:.0}", fit.estimated_tps),
+                )
+            } else {
+                let mem_str = result
+                    .safetensors_bytes
+                    .map(pmetal_hub::fit::format_bytes)
+                    .unwrap_or_else(|| "?".to_string());
+                (mem_str, "-".to_string(), "-".to_string())
+            };
+
+        println!(
+            "{:<40} {:>7} {:>10} {:>8} {:>9} {:>10}",
+            truncate_str(&result.model_id, 40),
+            params_str,
+            downloads_str,
+            mem_str,
+            fit_str,
+            tps_str,
+        );
+
+        // Detailed output
+        if detailed {
+            if let (Some(dev), Some(params_b)) = (&device_spec, result.estimated_params_b) {
+                let quant = pmetal_hub::fit::detect_quantization_from_id(&result.model_id);
+                let model_spec = ModelSpec {
+                    params_b,
+                    quantization: quant,
+                    context_length: 4096,
+                    num_kv_heads: None,
+                    head_dim: None,
+                    num_layers: None,
+                    is_moe: result.tags.iter().any(|t| t == "moe"),
+                    num_experts: None,
+                    active_experts: None,
+                };
+                let fit = estimate_fit(&model_spec, dev);
+                println!(
+                    "  Weights: {:.1}GB  KV: {:.1}GB  Overhead: {:.1}GB  Training: {:.1}GB ({})  Batch: {}",
+                    fit.weights_gb,
+                    fit.kv_cache_gb,
+                    fit.overhead_gb,
+                    fit.training_memory_gb,
+                    fit.training_fit.label(),
+                    fit.recommended_batch_size,
+                );
+                for note in &fit.notes {
+                    println!("  {note}");
+                }
+            }
+        }
+    }
+
+    // Auto-download first fitting model
+    if download {
+        if let Some(model_id) = first_fit {
+            println!("\nDownloading {model_id}...");
+            let path = pmetal_hub::download_model(&model_id, None, None).await?;
+            println!("Downloaded to: {}", path.display());
+        } else {
+            println!("\nNo models fit on this device. Try a smaller model or quantized variant.");
+        }
+    }
+
+    Ok(())
+}
+
+/// Truncate a string to max_len, appending ".." if truncated.
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.chars().count() <= max_len {
+        s.to_string()
+    } else {
+        let truncated: String = s.chars().take(max_len.saturating_sub(2)).collect();
+        format!("{truncated}..")
+    }
 }
 
 /// Run model quantization.
@@ -1808,10 +2011,12 @@ async fn run_distillation_cli(
     rationale: bool,
     rationale_weight: f32,
     lora_r: usize,
+    lora_alpha: usize,
     learning_rate: f32,
     batch_size: usize,
     epochs: usize,
     max_seq_len: usize,
+    log_metrics: Option<String>,
 ) -> anyhow::Result<()> {
     use pmetal_core::LoraConfig;
     use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
@@ -1864,15 +2069,39 @@ async fn run_distillation_cli(
     let chat_template =
         pmetal_data::chat_templates::detect_chat_template(&student_path, student_id);
 
-    // 3. Load Dataset
+    // 3. Load Dataset (supports both JSONL and Parquet)
     tracing::info!("Loading dataset: {}", dataset_path);
-    let train_dataset = TrainingDataset::from_jsonl_tokenized(
-        dataset_path,
-        &tokenizer,
-        DatasetFormat::Auto,
-        max_seq_len,
-        Some(&chat_template),
-    )?;
+    let is_parquet = Path::new(dataset_path)
+        .extension()
+        .is_some_and(|ext| ext == "parquet");
+    let train_dataset = if is_parquet {
+        tracing::info!("Detected Parquet format");
+        let result = TrainingDataset::from_parquet_tokenized(
+            dataset_path,
+            &tokenizer,
+            "text",
+            max_seq_len,
+            None,
+        );
+        match result {
+            Ok(ds) => ds,
+            Err(_) => TrainingDataset::from_parquet_tokenized(
+                dataset_path,
+                &tokenizer,
+                "content",
+                max_seq_len,
+                None,
+            )?,
+        }
+    } else {
+        TrainingDataset::from_jsonl_tokenized(
+            dataset_path,
+            &tokenizer,
+            DatasetFormat::Auto,
+            max_seq_len,
+            Some(&chat_template),
+        )?
+    };
 
     // 4. Load Teacher Model (Frozen)
     tracing::info!("Loading teacher model...");
@@ -1886,7 +2115,7 @@ async fn run_distillation_cli(
     tracing::info!("Loading student model...");
     let student_lora_config = LoraConfig {
         r: lora_r,
-        alpha: (lora_r * 2) as f32,
+        alpha: lora_alpha as f32,
         ..Default::default()
     };
     let mut student_model = DynamicLoraModel::from_pretrained(&student_path, student_lora_config)?;
@@ -1966,6 +2195,27 @@ async fn run_distillation_cli(
 
     let mut trainer = DistillationTrainer::new(distiller, training_loop_config);
 
+    // 7b. Enable adaptive LR for distillation (more conservative config)
+    {
+        let adaptive_config = pmetal_trainer::AdaptiveLrConfig::for_distillation();
+        let control_file = validated_distill_output.join(".lr_control.json");
+        trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
+        tracing::info!("Adaptive LR enabled (spike/plateau/divergence detection)");
+    }
+
+    // 7c. Add metrics callback if requested (TUI dashboard)
+    if let Some(ref metrics_path) = log_metrics {
+        use pmetal_trainer::callbacks::MetricsJsonCallback;
+        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
+            std::path::PathBuf::from(metrics_path)
+        } else {
+            validated_distill_output.join(metrics_path)
+        };
+        let callback =
+            MetricsJsonCallback::new(&path)?.with_run_name(format!("distill-{}", student_id));
+        trainer.add_callback(Box::new(callback));
+    }
+
     // 8. Run Distillation
     trainer
         .run(
@@ -2012,6 +2262,7 @@ async fn run_grpo_cli(
     dapo: bool,
     reasoning_rewards: bool,
     use_metal_flash_attention: bool,
+    _log_metrics: Option<String>,
 ) -> anyhow::Result<()> {
     use std::path::{Path, PathBuf};
 
@@ -2043,15 +2294,39 @@ async fn run_grpo_cli(
     // 2b. Detect chat template
     let chat_template = pmetal_data::chat_templates::detect_chat_template(&model_path, model_id);
 
-    // 3. Load Dataset (Prompts)
+    // 3. Load Dataset (Prompts — supports both JSONL and Parquet)
     tracing::info!("Loading prompt dataset: {}", dataset_path);
-    let dataset = TrainingDataset::from_jsonl_tokenized(
-        dataset_path,
-        &tokenizer,
-        DatasetFormat::Auto,
-        max_seq_len,
-        Some(&chat_template),
-    )?;
+    let is_parquet = std::path::Path::new(dataset_path)
+        .extension()
+        .is_some_and(|ext| ext == "parquet");
+    let dataset = if is_parquet {
+        tracing::info!("Detected Parquet format");
+        let result = TrainingDataset::from_parquet_tokenized(
+            dataset_path,
+            &tokenizer,
+            "text",
+            max_seq_len,
+            None,
+        );
+        match result {
+            Ok(ds) => ds,
+            Err(_) => TrainingDataset::from_parquet_tokenized(
+                dataset_path,
+                &tokenizer,
+                "content",
+                max_seq_len,
+                None,
+            )?,
+        }
+    } else {
+        TrainingDataset::from_jsonl_tokenized(
+            dataset_path,
+            &tokenizer,
+            DatasetFormat::Auto,
+            max_seq_len,
+            Some(&chat_template),
+        )?
+    };
 
     // 4. Load Model (Trainable LoRA)
     tracing::info!("Loading model with LoRA...");
@@ -2185,6 +2460,24 @@ async fn run_grpo_cli(
 
     let mut trainer = GrpoTrainer::new(grpo_config, training_config)?;
 
+    // Wire metrics callback if --log-metrics was provided
+    if let Some(ref metrics_path) = _log_metrics {
+        use pmetal_trainer::callbacks::MetricsJsonCallback;
+        let path = PathBuf::from(output_dir).join(metrics_path);
+        let callback = MetricsJsonCallback::new(&path)?.with_run_name(format!(
+            "grpo-{}",
+            model_id.split('/').next_back().unwrap_or(model_id)
+        ));
+        trainer.add_callback(Box::new(callback));
+    }
+
+    // Enable adaptive LR with control file for TUI communication
+    {
+        let adaptive_config = pmetal_trainer::AdaptiveLrConfig::default();
+        let control_file = PathBuf::from(output_dir).join(".lr_control.json");
+        trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
+    }
+
     // 7b. Setup Optimizer
     let mut optimizer = mlx_rs::optimizers::AdamWBuilder::new(learning_rate as f32)
         .build()
@@ -2206,6 +2499,9 @@ async fn run_grpo_cli(
             &dataset,
             &rewards,
             &mut optimizer,
+            |opt, lr| {
+                opt.lr = mlx_rs::array!(lr);
+            },
         )
         .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
 
@@ -2801,6 +3097,13 @@ async fn run_training(
             training_loop.add_callback(cb);
         }
 
+        // Enable adaptive LR with control file for TUI communication
+        {
+            let adaptive_config = pmetal_trainer::AdaptiveLrConfig::default();
+            let control_file = PathBuf::from(&output_dir).join(".lr_control.json");
+            training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
+        }
+
         // Resume from checkpoint if requested
         if resume {
             if let Some((lora_params, metadata)) = checkpoint_manager.load_latest()? {
@@ -2908,6 +3211,13 @@ async fn run_training(
         // Wire metrics callback into training loop for step-level dispatch
         if let Some(cb) = metrics_callback.take() {
             training_loop.add_callback(cb);
+        }
+
+        // Enable adaptive LR with control file for TUI communication
+        {
+            let adaptive_config = pmetal_trainer::AdaptiveLrConfig::default();
+            let control_file = PathBuf::from(&output_dir).join(".lr_control.json");
+            training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
         }
 
         // Resume from checkpoint if requested

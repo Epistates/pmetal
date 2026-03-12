@@ -5,6 +5,50 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] - 2026-03-11
+
+### Added
+
+- **Adaptive learning rate controller**: EMA-based z-score spike detection, patience-based plateau detection, and linear regression divergence detection — automatically adjusts LR multiplier during training to recover from loss spikes, reduce LR on plateaus, and halt on divergence
+- **Manual LR override via TUI**: Press `L` in Training, Distillation, or GRPO tabs to set a custom learning rate mid-run; uses atomic control file protocol (`{output_dir}/.lr_control.json`) for safe subprocess communication
+- **WSD (Warmup-Stable-Decay) scheduler**: New `LrSchedulerType::Wsd` with configurable `stable_ratio` — holds peak LR for a plateau phase before linear decay, popular for large-scale pretraining
+- **GRPO adaptive LR + callbacks**: `GrpoTrainer` now supports adaptive LR, `TrainingCallback` lifecycle events, and `StepMetrics` emission for live TUI monitoring
+- **HuggingFace Hub search** (`pmetal search`): CLI command and TUI integration (press `S` in Models tab) to search HF Hub for text-generation models with download counts, parameter estimates, and memory fit assessment
+- **Memory fit estimation**: New `pmetal-hub` module estimates inference/training memory requirements, tok/s throughput, and color-coded fit levels (green/yellow/red) based on device specs and model architecture
+- **Model detail panel**: Models tab shows memory breakdown — weights, KV cache, overhead, training estimate, and recommended batch size
+- **Distillation metrics callbacks**: `DistillationTrainer` now emits step-by-step metrics via `TrainingCallback`, enabling live TUI dashboard during distillation runs
+- **Command logging in Jobs tab**: Spawned commands are logged with the full CLI invocation for easier debugging
+
+### Fixed
+
+- **NaN/Inf loss guard**: Adaptive LR skips EMA updates on non-finite losses to prevent EMA poisoning — returns scheduled LR unchanged
+- **EMA variance bias correction**: Early-training z-scores now use bias-corrected variance (`raw_var / (1 - alpha^n)`), matching Adam's moment correction — prevents false spike detection in first ~20 steps
+- **Zero-variance z-score fallback**: When loss variance is near zero (std_dev < 1e-8), uses absolute deviation threshold instead of division-by-zero; returns z=10 for >50% deviation, z=0 otherwise
+- **Atomic control file protocol**: LR control file is renamed to `.lr_control.claimed` before reading and deleted after — prevents race conditions between TUI writer and training subprocess reader
+- **Distillation metrics LR**: Distillation step metrics now report post-adaptive LR instead of pre-adjustment scheduled LR
+- **Adaptive LR in all training paths**: `apply_adaptive_lr()` now called in `run_metal_fused()`, `run_compiled()`, `run_jit_compiled()`, and `run_packed()` paths (was only in `run_standard()`)
+- **TUI LR override validation**: LR range check now accepts 1.0 (was exclusive upper bound); shows error modal on invalid input instead of silent log warning
+- **Distillation/GRPO job routing**: Status updates were always routed to the Training tab regardless of job type. Added `active_job_type` tracking to route metrics, completion, and failure to the correct tab (Distill, GRPO, or Training)
+- **Distillation CLI args**: TUI sent `--lora-alpha` and `--log-metrics` flags that the CLI didn't accept, causing immediate exit code 2. Added both args to the `Distill` command and `--log-metrics` to `Grpo`
+- **Parquet dataset support in distill/GRPO**: Distillation and GRPO commands only supported JSONL datasets. Now auto-detect `.parquet` files and route to the parquet loader, matching the training command's behavior
+- **Tab click targeting**: Mouse clicks on Monitor, Inference, and Jobs tabs selected the wrong tab due to hardcoded fixed-width hit-testing. Now computes actual tab widths from rendered text
+- **Error diagnostics**: Failed jobs now show the last 5 stderr lines in the tab status panel instead of just "Process exited with code N", with a hint to check the Jobs tab for full output
+- **UTF-8 safe string truncation**: `truncate_str` used byte indexing which panics on multi-byte characters; switched to `chars()` iterator
+- **Leaked channel in HF search**: `search_hf()` created a sender/receiver pair even without a CommandRunner, silently dropping results
+- **Integer overflow in fit estimation**: `estimate_params_from_config` used plain multiplication; switched to `saturating_mul`/`saturating_add`
+- **Context length truncation**: u64→u32 cast could wrap for extreme values; capped at 1M before cast
+
+### Improved
+
+- **TUI tab ordering**: System (formerly Device) is now the default first tab; Dashboard renamed to Monitor
+- **Empty state messaging**: Monitor tab shows actionable guidance ("Start a run from Training, Distill, or GRPO tab") instead of "Waiting for training data..."
+- **Idle state hint**: Tabs show "Press S to start" instead of "Press S to start training" (generic across all job types)
+
+### Security
+
+- **Bounded API responses**: `bounded_json()` caps HF API response bodies at 4MB to prevent heap exhaustion
+- **Model ID validation**: `is_valid_model_id()` rejects path traversal, URL injection, and malformed values in HF API paths
+
 ## [0.3.1] - 2026-03-11
 
 ### Added

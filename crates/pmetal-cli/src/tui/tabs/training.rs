@@ -519,7 +519,7 @@ pub fn render_status_with_metrics(
                     "  Navigate with j/k, Edit with Enter",
                     THEME.text_dim,
                 )),
-                Line::from(Span::styled("  Press S to start training", THEME.text_dim)),
+                Line::from(Span::styled("  Press S to start", THEME.text_dim)),
                 Line::from(""),
                 Line::from(Span::styled("  Toggles cycle on Enter", THEME.text_muted)),
                 Line::from(Span::styled(
@@ -861,12 +861,22 @@ pub fn render_status_with_metrics(
             }
         }
         TrainingStatus::Failed(msg) => {
-            let lines = vec![
+            let mut lines = vec![
                 Line::from(""),
                 Line::from(Span::styled("  Status: Failed", THEME.status_error)),
                 Line::from(""),
-                Line::from(Span::styled(format!("  {msg}"), THEME.text_error)),
             ];
+            for line in msg.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("  {line}"),
+                    THEME.text_error,
+                )));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Check Jobs tab for full output",
+                THEME.text_muted,
+            )));
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .render(inner, buf);

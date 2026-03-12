@@ -71,6 +71,12 @@ pub enum AppMsg {
     InferenceDone { tok_sec: f64, total_tokens: usize },
     /// Inference encountered an error.
     InferenceError { message: String },
+    /// HuggingFace Hub search results arrived.
+    HfSearchResults {
+        results: Vec<pmetal_hub::HfSearchResult>,
+    },
+    /// HuggingFace Hub search failed.
+    HfSearchError { message: String },
 }
 
 /// The type of background job.
