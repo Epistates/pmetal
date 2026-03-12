@@ -227,18 +227,26 @@ impl GrpoTrainer {
     }
 
     /// Feed loss to the adaptive LR controller and update the override.
-    fn apply_adaptive_lr(&mut self, loss: f64) {
+    ///
+    /// Returns `true` if the controller signals early stop.
+    fn apply_adaptive_lr(&mut self, loss: f64) -> bool {
         let scheduled = self.training_config.learning_rate;
         let step = self.step;
         if let Some(ref mut ctrl) = self.adaptive_lr {
             let (adjusted, event) = ctrl.step(step, loss, scheduled);
             self.adaptive_lr_override = Some(adjusted as f32);
 
+            let early_stop = matches!(event, crate::adaptive_lr::LrEvent::EarlyStop { .. });
+
             if !matches!(event, crate::adaptive_lr::LrEvent::Scheduled) {
                 for cb in &mut self.callbacks {
                     cb.on_lr_event(&format!("{event}"));
                 }
             }
+
+            early_stop
+        } else {
+            false
         }
     }
 
@@ -758,7 +766,11 @@ impl GrpoTrainer {
                     self.train_step(policy_model, ref_model.as_deref_mut(), &[group], optimizer)?;
 
                 // Feed loss to adaptive LR controller for next step
-                self.apply_adaptive_lr(stats.loss as f64);
+                let early_stop = self.apply_adaptive_lr(stats.loss as f64);
+                if early_stop {
+                    tracing::info!("Early stopping GRPO training — adaptive LR exhausted rollbacks.");
+                    return Ok(());
+                }
 
                 let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 

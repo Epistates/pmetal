@@ -417,6 +417,18 @@ pub struct StepStats {
     pub step_time_ms: u64,
 }
 
+/// Action signalled by the adaptive LR controller after processing a training step.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AdaptiveAction {
+    /// No intervention needed.
+    Continue,
+    /// Restore weights from the best in-memory snapshot, reset optimizer momentum,
+    /// and continue training with reduced LR.
+    Rollback,
+    /// Too many rollbacks — stop training and use the best checkpoint.
+    EarlyStop,
+}
+
 /// Training loop that connects all components.
 pub struct TrainingLoop {
     /// Configuration.
@@ -456,6 +468,9 @@ pub struct TrainingLoop {
     pub(crate) adaptive_lr: Option<crate::adaptive_lr::AdaptiveLrController>,
     /// Adaptive-adjusted LR for the next step (set by `apply_adaptive_lr`).
     pub(crate) adaptive_lr_override: Option<f32>,
+    /// In-memory snapshot of the best LoRA weights for rollback.
+    /// LoRA params are typically a few MB, so this is cheap to hold in memory.
+    pub(crate) best_lora_snapshot: Option<std::collections::HashMap<std::rc::Rc<str>, Array>>,
 }
 
 impl TrainingLoop {
@@ -491,6 +506,7 @@ impl TrainingLoop {
             callbacks: Vec::new(),
             adaptive_lr: None,
             adaptive_lr_override: None,
+            best_lora_snapshot: None,
         }
     }
 
@@ -551,21 +567,96 @@ impl TrainingLoop {
     }
 
     /// Feed loss to the adaptive LR controller and update the override.
+    ///
+    /// Returns an `AdaptiveAction` indicating whether the training loop should
+    /// continue normally, roll back to the best checkpoint, or stop early.
+    ///
     /// Call this after each training step.
-    pub fn apply_adaptive_lr(&mut self, loss: f64) {
+    pub fn apply_adaptive_lr(&mut self, loss: f64) -> AdaptiveAction {
         let scheduled = self.get_scheduled_lr() as f64;
         let step = self.step;
         if let Some(ref mut ctrl) = self.adaptive_lr {
             let (adjusted, event) = ctrl.step(step, loss, scheduled);
             self.adaptive_lr_override = Some(adjusted as f32);
 
+            // Determine action from event
+            let action = match &event {
+                crate::adaptive_lr::LrEvent::RollbackTriggered { .. } => AdaptiveAction::Rollback,
+                crate::adaptive_lr::LrEvent::EarlyStop { .. } => AdaptiveAction::EarlyStop,
+                crate::adaptive_lr::LrEvent::Scheduled => {
+                    // Check if we should snapshot the current weights as best
+                    if ctrl.should_snapshot_best(step) {
+                        // Signal that the training loop should take a snapshot
+                        // (actual snapshotting happens in the training method,
+                        //  since we don't have access to the model here)
+                        AdaptiveAction::Continue
+                    } else {
+                        AdaptiveAction::Continue
+                    }
+                }
+                _ => AdaptiveAction::Continue,
+            };
+
             // Log non-scheduled events
             if !matches!(event, crate::adaptive_lr::LrEvent::Scheduled) {
                 for cb in &mut self.callbacks {
-                    // Emit the event description via the existing metrics path
                     cb.on_lr_event(&format!("{event}"));
                 }
             }
+
+            action
+        } else {
+            AdaptiveAction::Continue
+        }
+    }
+
+    /// Take a snapshot of the model's LoRA weights as the best checkpoint.
+    ///
+    /// Called when the adaptive LR controller indicates loss has improved.
+    /// The snapshot is held in memory for fast rollback (LoRA params are small).
+    pub fn snapshot_best_weights<M: TrainableModel>(&mut self, model: &M) {
+        let params = model.lora_parameters();
+        tracing::debug!(
+            "Snapshot: saved best LoRA weights at step {} ({} params, ~{:.1} MB)",
+            self.step,
+            params.len(),
+            params.values().map(|a| a.nbytes()).sum::<usize>() as f64 / 1_048_576.0,
+        );
+        self.best_lora_snapshot = Some(params);
+    }
+
+    /// Restore model weights from the best in-memory snapshot.
+    ///
+    /// Returns `true` if weights were successfully restored.
+    pub fn restore_best_weights<M: TrainableModel>(&mut self, model: &mut M) -> bool {
+        if let Some(ref snapshot) = self.best_lora_snapshot {
+            model.set_lora_parameters(snapshot);
+
+            // Notify the controller that rollback is complete
+            if let Some(ref mut ctrl) = self.adaptive_lr {
+                ctrl.on_rollback_complete();
+            }
+
+            // Reset running loss to approximate the best loss
+            if let Some(ref ctrl) = self.adaptive_lr {
+                self.running_loss = ctrl.best_ema_loss();
+            }
+
+            true
+        } else {
+            tracing::warn!("Rollback requested but no best snapshot available");
+            false
+        }
+    }
+
+    /// Check if the adaptive LR controller recommends snapshotting (new best EMA loss).
+    pub fn should_snapshot_best(&self) -> bool {
+        if let Some(ref ctrl) = self.adaptive_lr {
+            // The controller's should_snapshot_best was already called in apply_adaptive_lr,
+            // so we check if the current EMA is the best we've seen
+            ctrl.best_ema_step() == self.step
+        } else {
+            false
         }
     }
 
@@ -983,6 +1074,11 @@ impl TrainingLoop {
 
         let mut best_eval_loss = f64::MAX;
 
+        // Compute total steps: max_steps takes priority, otherwise estimate from dataset
+        let steps_per_epoch_est = (train_dataset.len() + self.config.training.batch_size - 1)
+            / self.config.training.batch_size;
+        let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
+
         for epoch in 0..num_epochs {
             self.epoch = epoch;
             tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
@@ -1011,7 +1107,24 @@ impl TrainingLoop {
                 let stats = self.train_step(model, &batch, &mut optimizer)?;
 
                 // Feed loss to adaptive LR controller for next step
-                self.apply_adaptive_lr(stats.loss as f64);
+                let action = self.apply_adaptive_lr(stats.loss as f64);
+
+                // Snapshot best weights when loss improves
+                if action == AdaptiveAction::Continue && self.should_snapshot_best() {
+                    self.snapshot_best_weights(model);
+                }
+                // Handle rollback
+                if action == AdaptiveAction::Rollback {
+                    self.restore_best_weights(model);
+                }
+                // Handle early stop
+                if action == AdaptiveAction::EarlyStop {
+                    self.restore_best_weights(model);
+                    if let Some(manager) = checkpoint_manager {
+                        self.save_checkpoint(model, manager, true, Some(self.running_loss))?;
+                    }
+                    return Ok(());
+                }
 
                 // Logging
                 if self.step % self.config.log_every == 0 {
@@ -1051,7 +1164,7 @@ impl TrainingLoop {
                             step: self.step,
                             epoch,
                             total_epochs: num_epochs,
-                            total_steps: max_steps.unwrap_or(0),
+                            total_steps: computed_total_steps,
                             loss: self.running_loss,
                             lr: stats.learning_rate as f64,
                             tok_sec: tokens_per_sec,
@@ -1186,6 +1299,11 @@ impl TrainingLoop {
 
         let mut best_eval_loss = f64::MAX;
 
+        // Compute total steps: max_steps takes priority, otherwise estimate from dataset
+        let steps_per_epoch_est = (train_dataset.len() + self.config.training.batch_size - 1)
+            / self.config.training.batch_size;
+        let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
+
         for epoch in 0..num_epochs {
             self.epoch = epoch;
             tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
@@ -1204,7 +1322,21 @@ impl TrainingLoop {
                 let stats = self.train_step_metal(model, &batch, &mut metal_optimizer)?;
 
                 // Feed loss to adaptive LR controller for next step
-                self.apply_adaptive_lr(stats.loss as f64);
+                let action = self.apply_adaptive_lr(stats.loss as f64);
+
+                if action == AdaptiveAction::Continue && self.should_snapshot_best() {
+                    self.snapshot_best_weights(model);
+                }
+                if action == AdaptiveAction::Rollback {
+                    self.restore_best_weights(model);
+                }
+                if action == AdaptiveAction::EarlyStop {
+                    self.restore_best_weights(model);
+                    if let Some(manager) = checkpoint_manager {
+                        self.save_checkpoint(model, manager, true, Some(self.running_loss))?;
+                    }
+                    return Ok(());
+                }
 
                 // Logging + callback dispatch
                 let mut tokens_per_sec = 0.0f64;
@@ -1244,7 +1376,7 @@ impl TrainingLoop {
                         step: stats.step,
                         epoch,
                         total_epochs: num_epochs,
-                        total_steps: max_steps.unwrap_or(0),
+                        total_steps: computed_total_steps,
                         loss: stats.loss as f64,
                         lr: stats.learning_rate as f64,
                         tok_sec: tokens_per_sec,
@@ -1506,6 +1638,11 @@ impl TrainingLoop {
         // This allows jit_training_step to mutate both in a single function
         let mut state = (model, optimizer);
 
+        // Compute total steps: max_steps takes priority, otherwise estimate from dataset
+        let steps_per_epoch_est = (train_dataset.len() + self.config.training.batch_size - 1)
+            / self.config.training.batch_size;
+        let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
+
         // =========================================================================
         // PHASE 1: WARMUP - Initialize optimizer states with one step
         // =========================================================================
@@ -1658,7 +1795,20 @@ impl TrainingLoop {
                     for loss in &accumulated_losses {
                         let loss_val = loss.item::<f32>();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
-                        self.apply_adaptive_lr(loss_val as f64);
+                        let action = self.apply_adaptive_lr(loss_val as f64);
+                        if action == AdaptiveAction::Continue && self.should_snapshot_best() {
+                            self.snapshot_best_weights(&state.0);
+                        }
+                        if action == AdaptiveAction::Rollback {
+                            self.restore_best_weights(&mut state.0);
+                        }
+                        if action == AdaptiveAction::EarlyStop {
+                            self.restore_best_weights(&mut state.0);
+                            if let Some(manager) = checkpoint_manager {
+                                self.save_checkpoint(&state.0, manager, true, Some(self.running_loss))?;
+                            }
+                            return Ok(state.0);
+                        }
                     }
                     accumulated_losses.clear();
                 }
@@ -1670,13 +1820,32 @@ impl TrainingLoop {
                     eval_training_state(&accumulated_losses, &state)?;
 
                     // Now extract values and compute running loss
+                    let mut adaptive_action = AdaptiveAction::Continue;
                     for loss in &accumulated_losses {
                         let loss_val = loss.item::<f32>();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
-                        // Feed materialized loss to adaptive LR controller
-                        self.apply_adaptive_lr(loss_val as f64);
+                        let action = self.apply_adaptive_lr(loss_val as f64);
+                        match action {
+                            AdaptiveAction::EarlyStop => { adaptive_action = AdaptiveAction::EarlyStop; break; }
+                            AdaptiveAction::Rollback if adaptive_action != AdaptiveAction::EarlyStop => { adaptive_action = AdaptiveAction::Rollback; }
+                            _ => {}
+                        }
                     }
                     accumulated_losses.clear();
+
+                    if adaptive_action == AdaptiveAction::Continue && self.should_snapshot_best() {
+                        self.snapshot_best_weights(&state.0);
+                    }
+                    if adaptive_action == AdaptiveAction::Rollback {
+                        self.restore_best_weights(&mut state.0);
+                    }
+                    if adaptive_action == AdaptiveAction::EarlyStop {
+                        self.restore_best_weights(&mut state.0);
+                        if let Some(manager) = checkpoint_manager {
+                            self.save_checkpoint(&state.0, manager, true, Some(self.running_loss))?;
+                        }
+                        return Ok(state.0);
+                    }
 
                     // Calculate throughput
                     let now = std::time::Instant::now();
@@ -1708,7 +1877,7 @@ impl TrainingLoop {
                             step: self.step,
                             epoch,
                             total_epochs: num_epochs,
-                            total_steps: max_steps.unwrap_or(0),
+                            total_steps: computed_total_steps,
                             loss: self.running_loss,
                             lr: self.get_learning_rate() as f64,
                             tok_sec: tokens_per_sec,
@@ -1837,6 +2006,11 @@ impl TrainingLoop {
 
         let mut state = (model, optimizer);
 
+        // Compute total steps: max_steps takes priority, otherwise estimate from dataset
+        let steps_per_epoch_est = (train_dataset.len() + self.config.training.batch_size - 1)
+            / self.config.training.batch_size;
+        let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
+
         tracing::info!(
             "Starting JIT-compiled training: {} trainable params (state_count={})",
             state.0.num_trainable_params(),
@@ -1942,7 +2116,21 @@ impl TrainingLoop {
                     loss.eval()?;
                     let loss_val = loss.item::<f32>();
                     self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
-                    self.apply_adaptive_lr(loss_val as f64);
+                    let action = self.apply_adaptive_lr(loss_val as f64);
+
+                    if action == AdaptiveAction::Continue && self.should_snapshot_best() {
+                        self.snapshot_best_weights(&state.0);
+                    }
+                    if action == AdaptiveAction::Rollback {
+                        self.restore_best_weights(&mut state.0);
+                    }
+                    if action == AdaptiveAction::EarlyStop {
+                        self.restore_best_weights(&mut state.0);
+                        if let Some(manager) = checkpoint_manager {
+                            self.save_checkpoint(&state.0, manager, true, Some(self.running_loss))?;
+                        }
+                        return Ok(state.0);
+                    }
 
                     // Calculate throughput
                     let now = std::time::Instant::now();
@@ -1975,7 +2163,7 @@ impl TrainingLoop {
                             step: self.step,
                             epoch,
                             total_epochs: num_epochs,
-                            total_steps: max_steps.unwrap_or(0),
+                            total_steps: computed_total_steps,
                             loss: self.running_loss,
                             lr,
                             tok_sec: tokens_per_sec,
@@ -2092,6 +2280,9 @@ impl TrainingLoop {
             stats.avg_sequences_per_batch
         );
 
+        // Compute actual total steps: max_steps takes priority, otherwise epochs * batches_per_epoch
+        let computed_total_steps = max_steps.unwrap_or(num_epochs * stats.num_batches);
+
         // Create state tuple for training
         let mut state = (model, optimizer);
 
@@ -2194,13 +2385,53 @@ impl TrainingLoop {
                     eval_training_state(&accumulated_losses, &state)?;
 
                     // Extract values and compute running loss via EMA
-                    // Note: running_loss was initialized to warmup loss, so EMA works from step 1
+                    // Track adaptive action across all accumulated losses
+                    let mut adaptive_action = AdaptiveAction::Continue;
                     for loss in accumulated_losses.iter() {
                         let loss_val = loss.item::<f32>();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
-                        self.apply_adaptive_lr(loss_val as f64);
+                        let action = self.apply_adaptive_lr(loss_val as f64);
+                        match action {
+                            AdaptiveAction::EarlyStop => {
+                                adaptive_action = AdaptiveAction::EarlyStop;
+                                break;
+                            }
+                            AdaptiveAction::Rollback if adaptive_action != AdaptiveAction::EarlyStop => {
+                                adaptive_action = AdaptiveAction::Rollback;
+                            }
+                            _ => {}
+                        }
                     }
                     accumulated_losses.clear();
+
+                    // Snapshot best weights when adaptive controller detects improvement
+                    if adaptive_action == AdaptiveAction::Continue && self.should_snapshot_best() {
+                        self.snapshot_best_weights(&state.0);
+                    }
+
+                    // Handle rollback: restore best weights + let optimizer adapt
+                    if adaptive_action == AdaptiveAction::Rollback {
+                        if self.restore_best_weights(&mut state.0) {
+                            tracing::info!(
+                                "Weights restored from best snapshot. \
+                                 Continuing training with LR {:.2e}.",
+                                self.get_learning_rate(),
+                            );
+                        }
+                    }
+
+                    // Handle early stop
+                    if adaptive_action == AdaptiveAction::EarlyStop {
+                        tracing::info!(
+                            "Early stopping triggered. Restoring best weights and exiting."
+                        );
+                        self.restore_best_weights(&mut state.0);
+                        // Save the best checkpoint before exiting
+                        if let Some(manager) = checkpoint_manager {
+                            self.save_checkpoint(&state.0, manager, true, Some(self.running_loss))?;
+                        }
+                        return Ok(state.0);
+                    }
 
                     // Calculate throughput
                     let now = std::time::Instant::now();
@@ -2232,7 +2463,7 @@ impl TrainingLoop {
                             step: self.step,
                             epoch,
                             total_epochs: num_epochs,
-                            total_steps: max_steps.unwrap_or(0),
+                            total_steps: computed_total_steps,
                             loss: self.running_loss,
                             lr: self.get_learning_rate() as f64,
                             tok_sec: tokens_per_sec,

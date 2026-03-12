@@ -39,6 +39,23 @@ pub enum LrEvent {
         new_lr: f64,
         trend_slope: f64,
     },
+    /// Divergence detected with rollback to best checkpoint.
+    ///
+    /// The training loop should restore model weights from the best snapshot,
+    /// reset optimizer momentum, and continue with the reduced LR.
+    RollbackTriggered {
+        best_step: usize,
+        best_loss: f64,
+        current_loss: f64,
+        new_lr: f64,
+        rollback_count: usize,
+    },
+    /// Too many rollbacks — training should stop and use the best checkpoint.
+    EarlyStop {
+        best_step: usize,
+        best_loss: f64,
+        rollback_count: usize,
+    },
     /// User manually set LR via control file.
     ManualOverride { lr: f64 },
     /// LR restored after temporary spike reduction.
@@ -56,6 +73,16 @@ impl std::fmt::Display for LrEvent {
             } => write!(f, "spike(z={z_score:.1}, lr={adjusted_lr:.2e})"),
             LrEvent::PlateauReduced { new_lr, .. } => write!(f, "plateau(lr={new_lr:.2e})"),
             LrEvent::DivergenceReduced { new_lr, .. } => write!(f, "diverge(lr={new_lr:.2e})"),
+            LrEvent::RollbackTriggered {
+                new_lr,
+                rollback_count,
+                ..
+            } => write!(f, "rollback({rollback_count}, lr={new_lr:.2e})"),
+            LrEvent::EarlyStop {
+                rollback_count,
+                best_loss,
+                ..
+            } => write!(f, "early_stop(n={rollback_count}, best={best_loss:.4})"),
             LrEvent::ManualOverride { lr } => write!(f, "manual(lr={lr:.2e})"),
             LrEvent::SpikeRecovered => write!(f, "recovered"),
         }
@@ -108,6 +135,18 @@ pub struct AdaptiveLrConfig {
 
     /// How often to poll the control file (in steps). 0 = disabled.
     pub control_poll_interval: usize,
+
+    // --- Best-loss checkpoint rollback ---
+    /// Enable weight rollback on sustained divergence.
+    /// When true, divergence triggers weight restoration from the best in-memory
+    /// snapshot instead of just reducing LR.
+    pub rollback_enabled: bool,
+
+    /// Maximum number of rollback attempts before early stopping.
+    pub max_rollbacks: usize,
+
+    /// LR multiplier applied on each rollback (cumulative with existing reductions).
+    pub rollback_lr_factor: f64,
 }
 
 impl Default for AdaptiveLrConfig {
@@ -127,6 +166,9 @@ impl Default for AdaptiveLrConfig {
             divergence_slope_threshold: 0.01,
             min_lr: 1e-7,
             control_poll_interval: 10,
+            rollback_enabled: true,
+            max_rollbacks: 3,
+            rollback_lr_factor: 0.5,
         }
     }
 }
@@ -189,6 +231,16 @@ pub struct AdaptiveLrController {
     /// Starts at 1.0, reduced by plateau/divergence events.
     lr_multiplier: f64,
 
+    // --- Best-loss rollback ---
+    /// Best EMA loss observed (for rollback decisions).
+    best_ema_loss: f64,
+    /// Step at which best EMA loss was recorded.
+    best_ema_step: usize,
+    /// Whether a best-loss snapshot is held by the training loop.
+    has_best_snapshot: bool,
+    /// Number of rollbacks performed so far.
+    rollback_count: usize,
+
     // --- Manual override ---
     manual_lr: Option<f64>,
     control_file: Option<PathBuf>,
@@ -217,6 +269,10 @@ impl AdaptiveLrController {
             plateau_reductions: 0,
             loss_window: VecDeque::with_capacity(config.divergence_window + 1),
             lr_multiplier: 1.0,
+            best_ema_loss: f64::MAX,
+            best_ema_step: 0,
+            has_best_snapshot: false,
+            rollback_count: 0,
             manual_lr: None,
             control_file: None,
             last_control_poll: 0,
@@ -325,14 +381,80 @@ impl AdaptiveLrController {
                 return (lr, event);
             }
 
-            // 4b. Divergence detection (permanent reduction)
+            // 4b. Divergence detection (permanent reduction, optionally with rollback)
             if self.loss_window.len() >= self.config.divergence_window {
                 let slope = self.compute_trend_slope();
                 if slope > self.config.divergence_slope_threshold {
                     let old_mult = self.lr_multiplier;
-                    self.lr_multiplier *= self.config.divergence_factor;
                     self.total_divergence_reductions += 1;
 
+                    // Check rollback eligibility: enabled + have snapshot + not exhausted
+                    if self.config.rollback_enabled && self.has_best_snapshot {
+                        if self.rollback_count >= self.config.max_rollbacks {
+                            // Exhausted rollback budget → early stop
+                            let event = LrEvent::EarlyStop {
+                                best_step: self.best_ema_step,
+                                best_loss: self.best_ema_loss,
+                                rollback_count: self.rollback_count,
+                            };
+                            self.last_event = event.clone();
+
+                            tracing::error!(
+                                "Early stopping: {} rollbacks exhausted. \
+                                 Best loss {:.4} at step {}.",
+                                self.rollback_count,
+                                self.best_ema_loss,
+                                self.best_ema_step,
+                            );
+
+                            // Reset window to prevent repeated triggers
+                            self.loss_window.clear();
+
+                            let lr = (scheduled_lr * self.lr_multiplier).max(self.config.min_lr);
+                            return (lr, event);
+                        }
+
+                        // Trigger rollback: reduce LR + signal weight restoration
+                        self.lr_multiplier *= self.config.rollback_lr_factor;
+                        self.rollback_count += 1;
+
+                        let new_lr = (scheduled_lr * self.lr_multiplier).max(self.config.min_lr);
+
+                        let event = LrEvent::RollbackTriggered {
+                            best_step: self.best_ema_step,
+                            best_loss: self.best_ema_loss,
+                            current_loss: self.loss_ema,
+                            new_lr,
+                            rollback_count: self.rollback_count,
+                        };
+                        self.last_event = event.clone();
+
+                        tracing::warn!(
+                            "Rollback #{}: restoring weights from step {} (loss {:.4} → {:.4}). \
+                             LR {:.2e} → {:.2e} (multiplier: {:.3}).",
+                            self.rollback_count,
+                            self.best_ema_step,
+                            self.loss_ema,
+                            self.best_ema_loss,
+                            scheduled_lr * old_mult,
+                            new_lr,
+                            self.lr_multiplier,
+                        );
+
+                        // Reset tracking state post-rollback
+                        self.loss_window.clear();
+                        self.plateau_counter = 0;
+                        self.best_loss = self.best_ema_loss;
+                        // Reset EMA to best loss so spike/divergence detection starts fresh
+                        self.loss_ema = self.best_ema_loss;
+                        self.loss_ema_var = 0.0;
+                        self.warmup_samples = 10; // Brief warmup to re-stabilize EMA
+
+                        return (new_lr, event);
+                    }
+
+                    // No rollback — plain divergence reduction (original behavior)
+                    self.lr_multiplier *= self.config.divergence_factor;
                     let new_lr = (scheduled_lr * self.lr_multiplier).max(self.config.min_lr);
                     let old_lr = scheduled_lr * old_mult;
 
@@ -423,12 +545,62 @@ impl AdaptiveLrController {
     /// Get summary statistics.
     pub fn stats_summary(&self) -> String {
         format!(
-            "spikes={}, plateaus={}, divergences={}, multiplier={:.3}",
+            "spikes={}, plateaus={}, divergences={}, rollbacks={}, multiplier={:.3}",
             self.total_spikes,
             self.total_plateau_reductions,
             self.total_divergence_reductions,
+            self.rollback_count,
             self.lr_multiplier,
         )
+    }
+
+    /// Check if the current EMA loss is a new best and a weight snapshot should be taken.
+    ///
+    /// Call this after `step()` returns `LrEvent::Scheduled` (i.e., loss is improving
+    /// or stable). Returns `true` if the EMA loss improved and the training loop
+    /// should snapshot the current model weights.
+    pub fn should_snapshot_best(&mut self, step: usize) -> bool {
+        if !self.config.rollback_enabled || !self.ema_initialized {
+            return false;
+        }
+
+        if self.loss_ema < self.best_ema_loss {
+            self.best_ema_loss = self.loss_ema;
+            self.best_ema_step = step;
+            self.has_best_snapshot = true;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Notify the controller that a rollback was completed by the training loop.
+    ///
+    /// Call this after weights have been restored from the best snapshot.
+    pub fn on_rollback_complete(&mut self) {
+        // EMA and loss window were already reset in the rollback trigger path.
+        // This is a hook for any additional post-rollback bookkeeping.
+        tracing::info!(
+            "Rollback complete. Resuming from step {} (loss {:.4}), LR multiplier {:.3}.",
+            self.best_ema_step,
+            self.best_ema_loss,
+            self.lr_multiplier,
+        );
+    }
+
+    /// Get the number of rollbacks performed.
+    pub fn rollback_count(&self) -> usize {
+        self.rollback_count
+    }
+
+    /// Get the best EMA loss seen.
+    pub fn best_ema_loss(&self) -> f64 {
+        self.best_ema_loss
+    }
+
+    /// Get the step at which the best EMA loss was observed.
+    pub fn best_ema_step(&self) -> usize {
+        self.best_ema_step
     }
 
     // --- Internal methods ---
@@ -565,6 +737,10 @@ impl AdaptiveLrController {
                 self.plateau_reductions = 0;
                 self.in_spike_cooldown = false;
                 self.best_loss = f64::MAX;
+                self.best_ema_loss = f64::MAX;
+                self.best_ema_step = 0;
+                self.has_best_snapshot = false;
+                self.rollback_count = 0;
                 let event = LrEvent::Scheduled;
                 self.last_event = event.clone();
                 tracing::info!("LR reset to schedule: {scheduled_lr:.2e}");
@@ -788,5 +964,151 @@ mod tests {
             "Expected spike detection with zero-variance fallback, got {event:?}"
         );
         assert!(lr < 1e-4);
+    }
+
+    #[test]
+    fn test_rollback_triggered_on_divergence() {
+        let config = AdaptiveLrConfig {
+            divergence_window: 10,
+            divergence_slope_threshold: 0.005,
+            rollback_enabled: true,
+            max_rollbacks: 3,
+            rollback_lr_factor: 0.5,
+            ..Default::default()
+        };
+        let mut ctrl = AdaptiveLrController::new(config);
+        ctrl.warmup_samples = 0;
+        ctrl.ema_initialized = true;
+
+        // Simulate a good training phase to establish best EMA loss
+        for i in 0..5 {
+            ctrl.step(i, 3.0, 1e-4);
+            ctrl.should_snapshot_best(i);
+        }
+        // Mark that the training loop has taken a snapshot
+        ctrl.has_best_snapshot = true;
+        assert!(ctrl.best_ema_loss < f64::MAX);
+
+        // Feed steadily increasing losses to trigger divergence + rollback
+        let mut triggered = false;
+        for i in 5..25 {
+            let loss = 3.0 + (i as f64 - 5.0) * 0.5;
+            let (lr, event) = ctrl.step(i, loss, 1e-4);
+            if let LrEvent::RollbackTriggered {
+                rollback_count, ..
+            } = &event
+            {
+                assert_eq!(*rollback_count, 1);
+                assert!(lr < 1e-4);
+                triggered = true;
+                break;
+            }
+        }
+        assert!(triggered, "Rollback should have been triggered");
+        assert_eq!(ctrl.rollback_count(), 1);
+    }
+
+    #[test]
+    fn test_early_stop_after_max_rollbacks() {
+        let config = AdaptiveLrConfig {
+            divergence_window: 5,
+            divergence_slope_threshold: 0.005,
+            rollback_enabled: true,
+            max_rollbacks: 2,
+            rollback_lr_factor: 0.5,
+            spike_threshold: 100.0, // Disable spike detection
+            ..Default::default()
+        };
+        let mut ctrl = AdaptiveLrController::new(config);
+        ctrl.warmup_samples = 0;
+        ctrl.ema_initialized = true;
+        ctrl.has_best_snapshot = true;
+        ctrl.best_ema_loss = 2.0;
+        ctrl.best_ema_step = 5;
+        ctrl.loss_ema = 2.0;
+
+        let mut early_stopped = false;
+        let mut step = 0;
+
+        // Keep triggering divergence until we exhaust rollbacks
+        for _ in 0..10 {
+            // Feed diverging losses
+            for j in 0..10 {
+                let loss = 2.0 + (j as f64) * 0.5;
+                let (_lr, event) = ctrl.step(step, loss, 1e-4);
+                step += 1;
+
+                match event {
+                    LrEvent::RollbackTriggered { .. } => {
+                        // Reset state as training loop would
+                        ctrl.on_rollback_complete();
+                    }
+                    LrEvent::EarlyStop { rollback_count, .. } => {
+                        assert_eq!(rollback_count, 2);
+                        early_stopped = true;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+            if early_stopped {
+                break;
+            }
+        }
+        assert!(early_stopped, "Should have triggered early stop after 2 rollbacks");
+    }
+
+    #[test]
+    fn test_rollback_disabled_falls_through_to_divergence() {
+        let config = AdaptiveLrConfig {
+            divergence_window: 10,
+            divergence_slope_threshold: 0.005,
+            divergence_factor: 0.3,
+            rollback_enabled: false,
+            ..Default::default()
+        };
+        let mut ctrl = AdaptiveLrController::new(config);
+        ctrl.warmup_samples = 0;
+        ctrl.ema_initialized = true;
+
+        // Feed steadily increasing losses
+        let mut diverged = false;
+        for i in 0..15 {
+            let loss = 5.0 + (i as f64) * 0.5;
+            let (lr, event) = ctrl.step(i, loss, 1e-4);
+            if matches!(event, LrEvent::DivergenceReduced { .. }) {
+                assert!(lr < 1e-4);
+                diverged = true;
+                break;
+            }
+        }
+        assert!(diverged, "Should have triggered plain divergence (not rollback)");
+        assert_eq!(ctrl.rollback_count(), 0);
+    }
+
+    #[test]
+    fn test_should_snapshot_best_tracks_ema_improvement() {
+        let config = AdaptiveLrConfig {
+            rollback_enabled: true,
+            ..Default::default()
+        };
+        let mut ctrl = AdaptiveLrController::new(config);
+
+        // Not initialized yet — should not snapshot
+        assert!(!ctrl.should_snapshot_best(0));
+
+        // Initialize EMA
+        ctrl.step(0, 5.0, 1e-4);
+        assert!(ctrl.should_snapshot_best(0)); // First real loss → new best
+
+        // Worse loss — should not snapshot
+        ctrl.step(1, 6.0, 1e-4);
+        assert!(!ctrl.should_snapshot_best(1));
+
+        // Better loss — should snapshot
+        for i in 2..30 {
+            ctrl.step(i, 3.0, 1e-4); // Drive EMA below 5.0
+        }
+        assert!(ctrl.should_snapshot_best(30)); // EMA should now be < initial best
     }
 }

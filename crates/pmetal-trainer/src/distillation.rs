@@ -10,8 +10,8 @@ use pmetal_lora::TrainableModel;
 use pmetal_mlx::kernels::with_training_mode;
 
 use crate::{
-    AdamWGroups, CheckpointManager, CheckpointMetadata, Result, SftError, StepStats, TrainingLoop,
-    TrainingLoopConfig,
+    AdamWGroups, AdaptiveAction, CheckpointManager, CheckpointMetadata, Result, SftError,
+    StepStats, TrainingLoop, TrainingLoopConfig,
 };
 
 /// Trainer for Knowledge Distillation.
@@ -212,7 +212,19 @@ impl DistillationTrainer {
                 self.loop_state.step += 1;
 
                 // Feed loss to adaptive LR controller for next step
-                self.loop_state.apply_adaptive_lr(stats.loss as f64);
+                let action = self.loop_state.apply_adaptive_lr(stats.loss as f64);
+
+                if action == AdaptiveAction::Continue && self.loop_state.should_snapshot_best() {
+                    self.loop_state.snapshot_best_weights(student);
+                }
+                if action == AdaptiveAction::Rollback {
+                    self.loop_state.restore_best_weights(student);
+                }
+                if action == AdaptiveAction::EarlyStop {
+                    self.loop_state.restore_best_weights(student);
+                    tracing::info!("Early stopping distillation — best checkpoint restored.");
+                    return Ok(());
+                }
 
                 // Apply adjusted LR to optimizer
                 let next_lr = self.loop_state.get_learning_rate();
