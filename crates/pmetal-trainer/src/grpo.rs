@@ -182,6 +182,12 @@ pub struct GrpoTrainer {
     pub config: GrpoConfig,
     pub training_config: TrainingConfig,
     pub step: usize,
+    /// Adaptive LR controller (spike/plateau/divergence detection + manual override).
+    adaptive_lr: Option<crate::adaptive_lr::AdaptiveLrController>,
+    /// Cached adaptive LR override value.
+    adaptive_lr_override: Option<f32>,
+    /// Training callbacks for metrics/dashboard integration.
+    callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
 }
 
 impl GrpoTrainer {
@@ -190,7 +196,50 @@ impl GrpoTrainer {
             config,
             training_config,
             step: 0,
+            adaptive_lr: None,
+            adaptive_lr_override: None,
+            callbacks: Vec::new(),
         })
+    }
+
+    /// Add a training callback for metrics logging or dashboard integration.
+    pub fn add_callback(&mut self, callback: Box<dyn pmetal_core::TrainingCallback>) {
+        self.callbacks.push(callback);
+    }
+
+    /// Enable adaptive LR with control file for TUI communication.
+    pub fn enable_adaptive_lr_with_control(
+        &mut self,
+        config: crate::adaptive_lr::AdaptiveLrConfig,
+        control_file: std::path::PathBuf,
+    ) {
+        self.adaptive_lr = Some(
+            crate::adaptive_lr::AdaptiveLrController::new(config).with_control_file(control_file),
+        );
+    }
+
+    /// Get the current learning rate, respecting adaptive override.
+    fn get_learning_rate(&self) -> f32 {
+        if let Some(lr) = self.adaptive_lr_override {
+            return lr;
+        }
+        self.training_config.learning_rate as f32
+    }
+
+    /// Feed loss to the adaptive LR controller and update the override.
+    fn apply_adaptive_lr(&mut self, loss: f64) {
+        let scheduled = self.training_config.learning_rate;
+        let step = self.step;
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            let (adjusted, event) = ctrl.step(step, loss, scheduled);
+            self.adaptive_lr_override = Some(adjusted as f32);
+
+            if !matches!(event, crate::adaptive_lr::LrEvent::Scheduled) {
+                for cb in &mut self.callbacks {
+                    cb.on_lr_event(&format!("{event}"));
+                }
+            }
+        }
     }
 
     /// Compute per-token log probabilities for a sequence.
@@ -641,7 +690,7 @@ impl GrpoTrainer {
     }
 
     /// Run full GRPO training loop.
-    pub fn run<M, R, O>(
+    pub fn run<M, R, O, F>(
         &mut self,
         policy_model: &mut M,
         mut ref_model: Option<&mut R>,
@@ -649,19 +698,29 @@ impl GrpoTrainer {
         dataset: &pmetal_data::TrainingDataset,
         reward_fn: &CombinedReward,
         optimizer: &mut O,
+        mut set_optimizer_lr: F,
     ) -> GrpoResult<()>
     where
         M: TrainableModel,
         R: ModuleParameters + Module<Array, Error = Exception, Output = Array>,
         O: Optimizer,
+        F: FnMut(&mut O, f32),
     {
         info!("Starting GRPO training loop...");
         let n_epochs = self.training_config.num_epochs;
+        let n_samples = dataset.samples().len();
+        let total_steps = n_samples * n_epochs;
+
+        for cb in &mut self.callbacks {
+            cb.on_train_start();
+        }
 
         for epoch in 0..n_epochs {
             info!("Epoch {}/{}", epoch + 1, n_epochs);
 
             for (i, sample) in dataset.samples().iter().enumerate() {
+                let step_start = std::time::Instant::now();
+
                 let gen_output =
                     self.generate_completions(policy_model, &sample.input_ids, tokenizer)?;
 
@@ -691,21 +750,56 @@ impl GrpoTrainer {
                     group.add_completion(new_ids, rewards[j], gen_output.stopped_by_length[j]);
                 }
 
+                // Apply adaptive LR override to optimizer before step
+                let current_lr = self.get_learning_rate();
+                set_optimizer_lr(optimizer, current_lr);
+
                 let stats =
                     self.train_step(policy_model, ref_model.as_deref_mut(), &[group], optimizer)?;
 
+                // Feed loss to adaptive LR controller for next step
+                self.apply_adaptive_lr(stats.loss as f64);
+
+                let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
+
                 if i % 10 == 0 {
+                    let adjusted_lr = self.get_learning_rate();
                     info!(
-                        "Step {}: loss={:.4}, kl={:.4}, reward={:.4}, completion_len={:.1}",
+                        "Step {}: loss={:.4}, kl={:.4}, reward={:.4}, lr={:.2e}, completion_len={:.1}",
                         stats.step,
                         stats.loss,
                         stats.kl,
                         stats.reward,
+                        adjusted_lr,
                         gen_output.num_generated.iter().sum::<usize>() as f32
                             / gen_output.num_generated.len() as f32
                     );
                 }
+
+                // Emit metrics to callbacks
+                if !self.callbacks.is_empty() {
+                    let adjusted_lr = self.get_learning_rate();
+                    let metrics = pmetal_core::StepMetrics {
+                        step: self.step,
+                        epoch,
+                        total_epochs: n_epochs,
+                        total_steps,
+                        loss: stats.loss as f64,
+                        lr: adjusted_lr as f64,
+                        tok_sec: 0.0, // GRPO doesn't track tokens the same way
+                        total_ms: step_ms,
+                        tokens: 0,
+                        ..Default::default()
+                    };
+                    for cb in &mut self.callbacks {
+                        cb.on_step_end_with_metrics(&metrics);
+                    }
+                }
             }
+        }
+
+        for cb in &mut self.callbacks {
+            cb.on_train_end();
         }
 
         Ok(())
@@ -938,6 +1032,9 @@ mod tests {
             config,
             training_config: pmetal_core::TrainingConfig::default(),
             step: 0,
+            adaptive_lr: None,
+            adaptive_lr_override: None,
+            callbacks: Vec::new(),
         }
     }
 

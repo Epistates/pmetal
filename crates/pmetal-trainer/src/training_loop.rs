@@ -452,6 +452,10 @@ pub struct TrainingLoop {
     pub(crate) pending_checkpoint: Option<std::thread::JoinHandle<std::result::Result<(), String>>>,
     /// Training callbacks for metrics logging, progress reporting, and dashboard.
     pub(crate) callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
+    /// Optional adaptive LR controller for reactive scheduling.
+    pub(crate) adaptive_lr: Option<crate::adaptive_lr::AdaptiveLrController>,
+    /// Adaptive-adjusted LR for the next step (set by `apply_adaptive_lr`).
+    pub(crate) adaptive_lr_override: Option<f32>,
 }
 
 impl TrainingLoop {
@@ -485,12 +489,30 @@ impl TrainingLoop {
             loss_accumulation_count: 0,
             pending_checkpoint: None,
             callbacks: Vec::new(),
+            adaptive_lr: None,
+            adaptive_lr_override: None,
         }
     }
 
     /// Add a training callback for metrics logging or dashboard integration.
     pub fn add_callback(&mut self, callback: Box<dyn pmetal_core::TrainingCallback>) {
         self.callbacks.push(callback);
+    }
+
+    /// Enable adaptive LR control with the given config.
+    pub fn enable_adaptive_lr(&mut self, config: crate::adaptive_lr::AdaptiveLrConfig) {
+        self.adaptive_lr = Some(crate::adaptive_lr::AdaptiveLrController::new(config));
+    }
+
+    /// Enable adaptive LR with control file for TUI communication.
+    pub fn enable_adaptive_lr_with_control(
+        &mut self,
+        config: crate::adaptive_lr::AdaptiveLrConfig,
+        control_file: std::path::PathBuf,
+    ) {
+        self.adaptive_lr = Some(
+            crate::adaptive_lr::AdaptiveLrController::new(config).with_control_file(control_file),
+        );
     }
 
     /// Take all callbacks out of the training loop (transfers ownership back to caller).
@@ -503,6 +525,16 @@ impl TrainingLoop {
     /// Delegates to the canonical `pmetal_core::LearningRateScheduler` so all
     /// trainers share a single, consistent LR computation path.
     pub fn get_learning_rate(&self) -> f32 {
+        // If adaptive controller has set an override, use it
+        if let Some(lr) = self.adaptive_lr_override {
+            return lr;
+        }
+
+        self.get_scheduled_lr()
+    }
+
+    /// Get the base scheduled LR (ignoring adaptive adjustments).
+    fn get_scheduled_lr(&self) -> f32 {
         use pmetal_core::LearningRateScheduler;
 
         let cfg = &self.config.training;
@@ -516,6 +548,25 @@ impl TrainingLoop {
         );
 
         scheduler.get_lr(self.step) as f32
+    }
+
+    /// Feed loss to the adaptive LR controller and update the override.
+    /// Call this after each training step.
+    pub fn apply_adaptive_lr(&mut self, loss: f64) {
+        let scheduled = self.get_scheduled_lr() as f64;
+        let step = self.step;
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            let (adjusted, event) = ctrl.step(step, loss, scheduled);
+            self.adaptive_lr_override = Some(adjusted as f32);
+
+            // Log non-scheduled events
+            if !matches!(event, crate::adaptive_lr::LrEvent::Scheduled) {
+                for cb in &mut self.callbacks {
+                    // Emit the event description via the existing metrics path
+                    cb.on_lr_event(&format!("{event}"));
+                }
+            }
+        }
     }
 
     /// Compute loss for a batch.
@@ -959,6 +1010,9 @@ impl TrainingLoop {
                 // Training step
                 let stats = self.train_step(model, &batch, &mut optimizer)?;
 
+                // Feed loss to adaptive LR controller for next step
+                self.apply_adaptive_lr(stats.loss as f64);
+
                 // Logging
                 if self.step % self.config.log_every == 0 {
                     // Calculate throughput over the entire logging interval
@@ -1148,6 +1202,9 @@ impl TrainingLoop {
 
                 // Training step with Metal optimizer
                 let stats = self.train_step_metal(model, &batch, &mut metal_optimizer)?;
+
+                // Feed loss to adaptive LR controller for next step
+                self.apply_adaptive_lr(stats.loss as f64);
 
                 // Logging + callback dispatch
                 let mut tokens_per_sec = 0.0f64;
@@ -1601,6 +1658,7 @@ impl TrainingLoop {
                     for loss in &accumulated_losses {
                         let loss_val = loss.item::<f32>();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
+                        self.apply_adaptive_lr(loss_val as f64);
                     }
                     accumulated_losses.clear();
                 }
@@ -1615,6 +1673,8 @@ impl TrainingLoop {
                     for loss in &accumulated_losses {
                         let loss_val = loss.item::<f32>();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
+                        // Feed materialized loss to adaptive LR controller
+                        self.apply_adaptive_lr(loss_val as f64);
                     }
                     accumulated_losses.clear();
 
@@ -1882,6 +1942,7 @@ impl TrainingLoop {
                     loss.eval()?;
                     let loss_val = loss.item::<f32>();
                     self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
+                    self.apply_adaptive_lr(loss_val as f64);
 
                     // Calculate throughput
                     let now = std::time::Instant::now();
@@ -2137,6 +2198,7 @@ impl TrainingLoop {
                     for loss in accumulated_losses.iter() {
                         let loss_val = loss.item::<f32>();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
+                        self.apply_adaptive_lr(loss_val as f64);
                     }
                     accumulated_losses.clear();
 
