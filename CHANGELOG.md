@@ -5,6 +5,28 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.3] - 2026-03-12
+
+### Added
+
+- **Self-contained binary**: `mlx.metallib` is now gzip-compressed and embedded into the `pmetal` binary at build time via `build.rs` + `include_bytes!`. On first run it extracts to `~/.cache/pmetal/lib/` if not already present. `cargo install pmetal-cli` now produces a fully self-contained binary with no external metallib dependency (~31MB added to binary, 70% smaller than the raw 102MB metallib)
+- **Adaptive LR rollback**: When divergence is detected and `rollback_enabled = true`, the adaptive LR controller emits `LrEvent::RollbackTriggered` — the training loop restores LoRA weights from the best in-memory EMA snapshot, resets optimizer momentum, and continues with a halved LR multiplier
+- **Early-stop on repeated divergence**: After `max_rollbacks` exhausted rollbacks, the controller emits `LrEvent::EarlyStop` — the training loop saves a final checkpoint and exits cleanly instead of spiraling deeper into loss divergence
+- **In-memory LoRA snapshot**: `TrainingLoop` holds the best LoRA weight snapshot in RAM via `snapshot_best_weights()` / `restore_best_weights()`. LoRA params are typically 1–20 MB, making this negligible overhead vs checkpoint I/O
+- **`AdaptiveAction` enum**: `apply_adaptive_lr()` now returns `AdaptiveAction::Continue | Rollback | EarlyStop` so training loops can react to controller decisions without re-parsing event strings
+
+### Fixed
+
+- **`apply_adaptive_lr` return type**: Previously returned `()`, discarding rollback/early-stop events — callers had no way to react. Now returns `AdaptiveAction`
+- **Divergence rollback vs plain reduction ambiguity**: Divergence path now checks `rollback_enabled` and `has_best_snapshot` before deciding between rollback and plain LR reduction — prevents silent rollback when no snapshot exists
+- **EMA state reset on rollback**: Spike EMA and variance are reset alongside LR multiplier on rollback so z-score anomaly detection re-stabilizes correctly after weight restoration
+- **`total_steps` in metrics**: `run_standard()` and `run_jit_compiled()` computed `total_steps: max_steps.unwrap_or(0)` — now estimates from `dataset.len() / batch_size * epochs` when `max_steps` is `None`, giving accurate progress in the TUI
+- **`stats_summary` missing rollback count**: `AdaptiveLrController::stats_summary()` now includes `rollbacks=N` in its output string
+
+### Improved
+
+- **Rollback tests**: Four new unit tests — `test_rollback_triggered_on_divergence`, `test_early_stop_after_max_rollbacks`, `test_rollback_disabled_falls_through_to_divergence`, `test_should_snapshot_best_tracks_ema_improvement`
+
 ## [0.3.2] - 2026-03-11
 
 ### Added
