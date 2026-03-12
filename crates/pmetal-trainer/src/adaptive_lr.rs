@@ -994,10 +994,7 @@ mod tests {
         for i in 5..25 {
             let loss = 3.0 + (i as f64 - 5.0) * 0.5;
             let (lr, event) = ctrl.step(i, loss, 1e-4);
-            if let LrEvent::RollbackTriggered {
-                rollback_count, ..
-            } = &event
-            {
+            if let LrEvent::RollbackTriggered { rollback_count, .. } = &event {
                 assert_eq!(*rollback_count, 1);
                 assert!(lr < 1e-4);
                 triggered = true;
@@ -1055,7 +1052,10 @@ mod tests {
                 break;
             }
         }
-        assert!(early_stopped, "Should have triggered early stop after 2 rollbacks");
+        assert!(
+            early_stopped,
+            "Should have triggered early stop after 2 rollbacks"
+        );
     }
 
     #[test]
@@ -1082,7 +1082,10 @@ mod tests {
                 break;
             }
         }
-        assert!(diverged, "Should have triggered plain divergence (not rollback)");
+        assert!(
+            diverged,
+            "Should have triggered plain divergence (not rollback)"
+        );
         assert_eq!(ctrl.rollback_count(), 0);
     }
 

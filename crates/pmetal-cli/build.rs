@@ -37,18 +37,14 @@ fn main() {
 }
 
 fn emit(path: &std::path::Path) {
-    println!(
-        "cargo:rustc-env=MLX_METALLIB_EMBED_PATH={}",
-        path.display()
-    );
+    println!("cargo:rustc-env=MLX_METALLIB_EMBED_PATH={}", path.display());
 }
 
 fn compress_metallib(src: &std::path::Path, dest: &std::path::Path) {
     use std::io::Write;
 
-    let raw = std::fs::read(src).unwrap_or_else(|e| {
-        panic!("Failed to read mlx.metallib from {}: {e}", src.display())
-    });
+    let raw = std::fs::read(src)
+        .unwrap_or_else(|e| panic!("Failed to read mlx.metallib from {}: {e}", src.display()));
 
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::best());
     encoder.write_all(&raw).expect("gzip compression failed");
