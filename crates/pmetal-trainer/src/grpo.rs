@@ -768,7 +768,9 @@ impl GrpoTrainer {
                 // Feed loss to adaptive LR controller for next step
                 let early_stop = self.apply_adaptive_lr(stats.loss as f64);
                 if early_stop {
-                    tracing::info!("Early stopping GRPO training — adaptive LR exhausted rollbacks.");
+                    tracing::info!(
+                        "Early stopping GRPO training — adaptive LR exhausted rollbacks."
+                    );
                     return Ok(());
                 }
 

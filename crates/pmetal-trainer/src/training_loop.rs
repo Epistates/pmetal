@@ -1075,8 +1075,7 @@ impl TrainingLoop {
         let mut best_eval_loss = f64::MAX;
 
         // Compute total steps: max_steps takes priority, otherwise estimate from dataset
-        let steps_per_epoch_est = (train_dataset.len() + self.config.training.batch_size - 1)
-            / self.config.training.batch_size;
+        let steps_per_epoch_est = train_dataset.len().div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
 
         for epoch in 0..num_epochs {
@@ -1300,8 +1299,7 @@ impl TrainingLoop {
         let mut best_eval_loss = f64::MAX;
 
         // Compute total steps: max_steps takes priority, otherwise estimate from dataset
-        let steps_per_epoch_est = (train_dataset.len() + self.config.training.batch_size - 1)
-            / self.config.training.batch_size;
+        let steps_per_epoch_est = train_dataset.len().div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
 
         for epoch in 0..num_epochs {
@@ -1639,8 +1637,7 @@ impl TrainingLoop {
         let mut state = (model, optimizer);
 
         // Compute total steps: max_steps takes priority, otherwise estimate from dataset
-        let steps_per_epoch_est = (train_dataset.len() + self.config.training.batch_size - 1)
-            / self.config.training.batch_size;
+        let steps_per_epoch_est = train_dataset.len().div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
 
         // =========================================================================
@@ -1805,7 +1802,12 @@ impl TrainingLoop {
                         if action == AdaptiveAction::EarlyStop {
                             self.restore_best_weights(&mut state.0);
                             if let Some(manager) = checkpoint_manager {
-                                self.save_checkpoint(&state.0, manager, true, Some(self.running_loss))?;
+                                self.save_checkpoint(
+                                    &state.0,
+                                    manager,
+                                    true,
+                                    Some(self.running_loss),
+                                )?;
                             }
                             return Ok(state.0);
                         }
@@ -1826,8 +1828,15 @@ impl TrainingLoop {
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         let action = self.apply_adaptive_lr(loss_val as f64);
                         match action {
-                            AdaptiveAction::EarlyStop => { adaptive_action = AdaptiveAction::EarlyStop; break; }
-                            AdaptiveAction::Rollback if adaptive_action != AdaptiveAction::EarlyStop => { adaptive_action = AdaptiveAction::Rollback; }
+                            AdaptiveAction::EarlyStop => {
+                                adaptive_action = AdaptiveAction::EarlyStop;
+                                break;
+                            }
+                            AdaptiveAction::Rollback
+                                if adaptive_action != AdaptiveAction::EarlyStop =>
+                            {
+                                adaptive_action = AdaptiveAction::Rollback;
+                            }
                             _ => {}
                         }
                     }
@@ -2007,8 +2016,7 @@ impl TrainingLoop {
         let mut state = (model, optimizer);
 
         // Compute total steps: max_steps takes priority, otherwise estimate from dataset
-        let steps_per_epoch_est = (train_dataset.len() + self.config.training.batch_size - 1)
-            / self.config.training.batch_size;
+        let steps_per_epoch_est = train_dataset.len().div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
 
         tracing::info!(
@@ -2396,7 +2404,9 @@ impl TrainingLoop {
                                 adaptive_action = AdaptiveAction::EarlyStop;
                                 break;
                             }
-                            AdaptiveAction::Rollback if adaptive_action != AdaptiveAction::EarlyStop => {
+                            AdaptiveAction::Rollback
+                                if adaptive_action != AdaptiveAction::EarlyStop =>
+                            {
                                 adaptive_action = AdaptiveAction::Rollback;
                             }
                             _ => {}
@@ -2410,14 +2420,14 @@ impl TrainingLoop {
                     }
 
                     // Handle rollback: restore best weights + let optimizer adapt
-                    if adaptive_action == AdaptiveAction::Rollback {
-                        if self.restore_best_weights(&mut state.0) {
-                            tracing::info!(
-                                "Weights restored from best snapshot. \
-                                 Continuing training with LR {:.2e}.",
-                                self.get_learning_rate(),
-                            );
-                        }
+                    if adaptive_action == AdaptiveAction::Rollback
+                        && self.restore_best_weights(&mut state.0)
+                    {
+                        tracing::info!(
+                            "Weights restored from best snapshot. \
+                             Continuing training with LR {:.2e}.",
+                            self.get_learning_rate(),
+                        );
                     }
 
                     // Handle early stop
