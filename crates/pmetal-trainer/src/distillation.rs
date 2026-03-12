@@ -31,6 +31,21 @@ impl DistillationTrainer {
         }
     }
 
+    /// Add a training callback for metrics logging or dashboard integration.
+    pub fn add_callback(&mut self, callback: Box<dyn pmetal_core::TrainingCallback>) {
+        self.loop_state.add_callback(callback);
+    }
+
+    /// Enable adaptive LR with control file for TUI communication.
+    pub fn enable_adaptive_lr_with_control(
+        &mut self,
+        config: crate::adaptive_lr::AdaptiveLrConfig,
+        control_file: std::path::PathBuf,
+    ) {
+        self.loop_state
+            .enable_adaptive_lr_with_control(config, control_file);
+    }
+
     /// Perform a single distillation step.
     ///
     /// # Arguments
@@ -158,7 +173,23 @@ impl DistillationTrainer {
         // Track the best eval (or train) loss seen so far for "is_best" tagging.
         let mut best_loss = f64::MAX;
 
-        tracing::info!("Starting distillation...");
+        // Estimate total steps for progress reporting
+        let steps_per_epoch = {
+            let dl = DataLoader::new(
+                train_dataset.clone(),
+                self.loop_state.config.dataloader.clone(),
+                None,
+            );
+            dl.num_batches()
+        };
+        let total_steps = steps_per_epoch * num_epochs;
+
+        // Notify callbacks
+        for cb in &mut self.loop_state.callbacks {
+            cb.on_train_start();
+        }
+
+        tracing::info!("Starting distillation ({total_steps} steps)...");
 
         for epoch in 0..num_epochs {
             self.loop_state.epoch = epoch;
@@ -174,17 +205,51 @@ impl DistillationTrainer {
             }
 
             while let Some(batch) = dataloader.next_batch() {
+                let step_start = std::time::Instant::now();
                 let stats = self.train_step(student, teacher, &batch, &mut optimizer)?;
+                let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
 
                 self.loop_state.step += 1;
+
+                // Feed loss to adaptive LR controller for next step
+                self.loop_state.apply_adaptive_lr(stats.loss as f64);
+
+                // Apply adjusted LR to optimizer
+                let next_lr = self.loop_state.get_learning_rate();
+                optimizer.set_learning_rate(next_lr);
+
+                // Use the adjusted LR (post-adaptive) for logging and metrics
+                let adjusted_lr = next_lr;
 
                 if self.loop_state.step % self.loop_state.config.log_every == 0 {
                     tracing::info!(
                         "Step {}: loss={:.4}, lr={:.2e}",
                         stats.step,
                         stats.loss,
-                        stats.learning_rate
+                        adjusted_lr
                     );
+                }
+
+                // Emit metrics to callbacks
+                let tok_sec = if step_ms > 0.0 {
+                    stats.tokens as f64 / (step_ms / 1000.0)
+                } else {
+                    0.0
+                };
+                let metrics = pmetal_core::StepMetrics {
+                    step: self.loop_state.step,
+                    epoch,
+                    total_epochs: num_epochs,
+                    total_steps,
+                    loss: stats.loss as f64,
+                    lr: adjusted_lr as f64,
+                    tok_sec,
+                    total_ms: step_ms,
+                    tokens: stats.tokens,
+                    ..Default::default()
+                };
+                for cb in &mut self.loop_state.callbacks {
+                    cb.on_step_end_with_metrics(&metrics);
                 }
 
                 // Checkpointing and Evaluation logic
@@ -220,6 +285,10 @@ impl DistillationTrainer {
                     }
                 }
             }
+        }
+
+        for cb in &mut self.loop_state.callbacks {
+            cb.on_train_end();
         }
 
         Ok(())

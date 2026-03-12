@@ -66,6 +66,7 @@
 
 pub mod adam8bit;
 pub mod adamw_groups;
+pub mod adaptive_lr;
 pub mod callbacks;
 pub mod checkpoint;
 pub mod checkpointing;
@@ -104,6 +105,7 @@ pub use pmetal_metal::ane::dynamic_trainer::{
 
 pub use adam8bit::*;
 pub use adamw_groups::*;
+pub use adaptive_lr::{AdaptiveLrConfig, AdaptiveLrController, LrControlCommand, LrEvent};
 pub use callbacks::*;
 pub use checkpoint::*;
 pub use checkpointing::*;
