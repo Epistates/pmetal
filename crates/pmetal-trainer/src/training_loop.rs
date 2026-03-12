@@ -1075,7 +1075,9 @@ impl TrainingLoop {
         let mut best_eval_loss = f64::MAX;
 
         // Compute total steps: max_steps takes priority, otherwise estimate from dataset
-        let steps_per_epoch_est = train_dataset.len().div_ceil(self.config.training.batch_size);
+        let steps_per_epoch_est = train_dataset
+            .len()
+            .div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
 
         for epoch in 0..num_epochs {
@@ -1299,7 +1301,9 @@ impl TrainingLoop {
         let mut best_eval_loss = f64::MAX;
 
         // Compute total steps: max_steps takes priority, otherwise estimate from dataset
-        let steps_per_epoch_est = train_dataset.len().div_ceil(self.config.training.batch_size);
+        let steps_per_epoch_est = train_dataset
+            .len()
+            .div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
 
         for epoch in 0..num_epochs {
@@ -1637,7 +1641,9 @@ impl TrainingLoop {
         let mut state = (model, optimizer);
 
         // Compute total steps: max_steps takes priority, otherwise estimate from dataset
-        let steps_per_epoch_est = train_dataset.len().div_ceil(self.config.training.batch_size);
+        let steps_per_epoch_est = train_dataset
+            .len()
+            .div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
 
         // =========================================================================
@@ -2016,7 +2022,9 @@ impl TrainingLoop {
         let mut state = (model, optimizer);
 
         // Compute total steps: max_steps takes priority, otherwise estimate from dataset
-        let steps_per_epoch_est = train_dataset.len().div_ceil(self.config.training.batch_size);
+        let steps_per_epoch_est = train_dataset
+            .len()
+            .div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
 
         tracing::info!(
