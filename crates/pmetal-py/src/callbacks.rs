@@ -20,7 +20,7 @@ pub struct PythonCallbackBridge {
 
 impl TrainingCallback for PythonCallbackBridge {
     fn on_train_start(&mut self) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for cb in &self.py_callbacks {
                 let _ = cb.call_method0(py, "on_train_start");
             }
@@ -28,7 +28,7 @@ impl TrainingCallback for PythonCallbackBridge {
     }
 
     fn on_train_end(&mut self) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for cb in &self.py_callbacks {
                 let _ = cb.call_method0(py, "on_train_end");
             }
@@ -36,7 +36,7 @@ impl TrainingCallback for PythonCallbackBridge {
     }
 
     fn on_epoch_start(&mut self, epoch: usize) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for cb in &self.py_callbacks {
                 let _ = cb.call_method1(py, "on_epoch_start", (epoch,));
             }
@@ -44,7 +44,7 @@ impl TrainingCallback for PythonCallbackBridge {
     }
 
     fn on_epoch_end(&mut self, epoch: usize, metrics: &pmetal_core::EvalMetrics) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for cb in &self.py_callbacks {
                 let _ = cb.call_method1(
                     py,
@@ -56,7 +56,7 @@ impl TrainingCallback for PythonCallbackBridge {
     }
 
     fn on_step_start(&mut self, step: usize) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for cb in &self.py_callbacks {
                 let _ = cb.call_method1(py, "on_step_start", (step,));
             }
@@ -64,7 +64,7 @@ impl TrainingCallback for PythonCallbackBridge {
     }
 
     fn on_step_end(&mut self, step: usize, loss: f64) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for cb in &self.py_callbacks {
                 let _ = cb.call_method1(py, "on_step_end", (step, loss));
             }
@@ -72,7 +72,7 @@ impl TrainingCallback for PythonCallbackBridge {
     }
 
     fn on_save(&mut self, path: &std::path::Path) {
-        Python::with_gil(|py| {
+        Python::attach(|py| {
             for cb in &self.py_callbacks {
                 let _ = cb.call_method1(py, "on_save", (path.to_string_lossy().to_string(),));
             }

@@ -34,7 +34,7 @@ impl PyModel {
         // Release GIL during download (network I/O is Send-safe)
         let model_path = if is_hf_model_id(path_or_id) {
             let id = path_or_id.to_string();
-            py.allow_threads(move || {
+            py.detach(move || {
                 crate::hub::shared_runtime()
                     .block_on(async {
                         let path = pmetal_hub::download_model(&id, None, None).await?;

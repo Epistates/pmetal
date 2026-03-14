@@ -3,6 +3,8 @@
 use std::path::PathBuf;
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
+use tracing::info_span;
 
 use crate::config::{PyLoraConfig, PyTrainingConfig};
 use crate::error::pmetal_to_pyerr;
@@ -99,7 +101,7 @@ impl PyTrainer {
     ///
     /// Returns:
     ///     dict with keys: final_loss, total_steps, total_tokens, output_dir, lora_weights_path
-    fn train(&mut self, py: Python<'_>) -> PyResult<PyObject> {
+    fn train<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         // Warn if callbacks are registered but not yet functional
         if !self.py_callbacks.is_empty() {
             let warnings = py.import("warnings")?;
@@ -109,7 +111,7 @@ impl PyTrainer {
             )?;
         }
 
-        // Capture all settings before entering allow_threads
+        // Capture all settings before releasing the GIL
         let model_id = self.model_id.clone();
         let lora_config = self.lora_config.clone();
         let training_config = self.training_config.clone();
@@ -123,57 +125,84 @@ impl PyTrainer {
 
         // Use PMetalError as the intermediate error type to preserve exception fidelity
         let result = py
-            .allow_threads(move || {
+            .detach(move || {
                 crate::hub::shared_runtime().block_on(async {
                     // Resolve model path
-                    let model_path = if is_hf_model_id(&model_id) {
-                        let path = pmetal_hub::download_model(&model_id, None, None).await?;
-                        let _ = pmetal_hub::download_file(&model_id, "tokenizer.json", None, None)
+                    let model_path = {
+                        let _span = info_span!("model_resolve", model_id = %model_id).entered();
+                        if is_hf_model_id(&model_id) {
+                            let path =
+                                pmetal_hub::download_model(&model_id, None, None).await?;
+                            let _ = pmetal_hub::download_file(
+                                &model_id,
+                                "tokenizer.json",
+                                None,
+                                None,
+                            )
                             .await;
-                        let _ = pmetal_hub::download_file(
-                            &model_id,
-                            "tokenizer_config.json",
-                            None,
-                            None,
-                        )
-                        .await;
-                        path
-                    } else {
-                        PathBuf::from(&model_id)
+                            let _ = pmetal_hub::download_file(
+                                &model_id,
+                                "tokenizer_config.json",
+                                None,
+                                None,
+                            )
+                            .await;
+                            path
+                        } else {
+                            PathBuf::from(&model_id)
+                        }
                     };
 
                     // Load tokenizer (with config-aware special token resolution)
-                    let tokenizer = pmetal_data::Tokenizer::from_model_dir(&model_path)?;
+                    let tokenizer = {
+                        let _span =
+                            info_span!("load_tokenizer", path = %model_path.display()).entered();
+                        pmetal_data::Tokenizer::from_model_dir(&model_path)?
+                    };
 
                     // Detect chat template
                     let chat_template =
                         pmetal_data::chat_templates::detect_chat_template(&model_path, &model_id);
 
                     // Load dataset
-                    let train_dataset = pmetal_data::TrainingDataset::from_jsonl_tokenized(
-                        &dataset_path,
-                        &tokenizer,
-                        pmetal_data::DatasetFormat::Auto,
-                        training_config.max_seq_len,
-                        Some(&chat_template),
-                    )?;
+                    let (train_dataset, eval_dataset) = {
+                        let _span = info_span!(
+                            "load_dataset",
+                            path = %dataset_path,
+                            has_eval = eval_dataset_path.is_some(),
+                        )
+                        .entered();
 
-                    let eval_dataset = if let Some(ref eval_path) = eval_dataset_path {
-                        Some(pmetal_data::TrainingDataset::from_jsonl_tokenized(
-                            eval_path,
+                        let train = pmetal_data::TrainingDataset::from_jsonl_tokenized(
+                            &dataset_path,
                             &tokenizer,
                             pmetal_data::DatasetFormat::Auto,
                             training_config.max_seq_len,
                             Some(&chat_template),
-                        )?)
-                    } else {
-                        None
+                        )?;
+
+                        let eval = if let Some(ref eval_path) = eval_dataset_path {
+                            Some(pmetal_data::TrainingDataset::from_jsonl_tokenized(
+                                eval_path,
+                                &tokenizer,
+                                pmetal_data::DatasetFormat::Auto,
+                                training_config.max_seq_len,
+                                Some(&chat_template),
+                            )?)
+                        } else {
+                            None
+                        };
+
+                        (train, eval)
                     };
 
                     // Load model
-                    let model =
+                    let model = {
+                        let _span =
+                            info_span!("load_model", path = %model_path.display()).entered();
                         pmetal_lora::DynamicLoraModel::from_pretrained(&model_path, lora_config)
-                            .map_err(model_err)?;
+                            .map_err(model_err)?
+                    };
 
                     // Set up checkpoint manager
                     let output_dir = PathBuf::from(&training_config.output_dir);
@@ -213,34 +242,47 @@ impl PyTrainer {
                     let mut training_loop = pmetal_trainer::TrainingLoop::new(loop_config);
 
                     // Run training
-                    let model = if sequence_packing {
-                        training_loop
-                            .run_packed(
-                                model,
-                                train_dataset,
-                                eval_dataset,
-                                Some(&checkpoint_manager),
-                            )
-                            .map_err(training_err)?
-                    } else {
-                        let mut model = model;
-                        training_loop
-                            .run(
-                                &mut model,
-                                train_dataset,
-                                eval_dataset,
-                                Some(&checkpoint_manager),
-                            )
-                            .map_err(training_err)?;
-                        model
+                    let model = {
+                        let _span = info_span!(
+                            "training_loop",
+                            model = %model_path.display(),
+                            sequence_packing,
+                        )
+                        .entered();
+
+                        if sequence_packing {
+                            training_loop
+                                .run_packed(
+                                    model,
+                                    train_dataset,
+                                    eval_dataset,
+                                    Some(&checkpoint_manager),
+                                )
+                                .map_err(training_err)?
+                        } else {
+                            let mut model = model;
+                            training_loop
+                                .run(
+                                    &mut model,
+                                    train_dataset,
+                                    eval_dataset,
+                                    Some(&checkpoint_manager),
+                                )
+                                .map_err(training_err)?;
+                            model
+                        }
                     };
 
                     // Save weights
-                    use pmetal_lora::TrainableModel;
-                    let weights_path = output_dir.join("lora_weights.safetensors");
-                    model
-                        .save_lora_weights(&weights_path)
-                        .map_err(training_err)?;
+                    let weights_path = {
+                        let _span =
+                            info_span!("save_weights", output_dir = %output_dir.display())
+                                .entered();
+                        use pmetal_lora::TrainableModel;
+                        let path = output_dir.join("lora_weights.safetensors");
+                        model.save_lora_weights(&path).map_err(training_err)?;
+                        path
+                    };
 
                     Ok::<_, pmetal_core::PMetalError>((
                         training_loop.current_loss(),
@@ -254,13 +296,13 @@ impl PyTrainer {
             .map_err(pmetal_to_pyerr)?;
 
         // Build Python dict result
-        let dict = pyo3::types::PyDict::new(py);
+        let dict = PyDict::new(py);
         dict.set_item("final_loss", result.0)?;
         dict.set_item("total_steps", result.1)?;
         dict.set_item("total_tokens", result.2)?;
         dict.set_item("output_dir", result.3)?;
         dict.set_item("lora_weights_path", result.4)?;
-        Ok(dict.into())
+        Ok(dict)
     }
 
     fn __repr__(&self) -> String {

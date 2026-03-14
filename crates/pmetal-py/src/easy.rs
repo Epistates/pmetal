@@ -1,6 +1,7 @@
 //! Top-level easy API functions for Python.
 
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use crate::error::runtime_err;
 
@@ -32,8 +33,8 @@ use crate::error::runtime_err;
     output="./output",
 ))]
 #[allow(clippy::too_many_arguments)]
-pub fn finetune(
-    py: Python<'_>,
+pub fn finetune<'py>(
+    py: Python<'py>,
     model_id: &str,
     dataset_path: &str,
     lora_r: usize,
@@ -43,13 +44,13 @@ pub fn finetune(
     batch_size: usize,
     max_seq_len: usize,
     output: &str,
-) -> PyResult<PyObject> {
+) -> PyResult<Bound<'py, PyDict>> {
     let model_id = model_id.to_string();
     let dataset_path = dataset_path.to_string();
     let output = output.to_string();
 
     let result = py
-        .allow_threads(move || {
+        .detach(move || {
             crate::hub::shared_runtime().block_on(async {
                 let result = pmetal::easy::finetune(&model_id, &dataset_path)
                     .lora(lora_r, lora_alpha)
@@ -73,13 +74,13 @@ pub fn finetune(
         })
         .map_err(runtime_err)?;
 
-    let dict = pyo3::types::PyDict::new(py);
+    let dict = PyDict::new(py);
     dict.set_item("final_loss", result.0)?;
     dict.set_item("total_steps", result.1)?;
     dict.set_item("total_tokens", result.2)?;
     dict.set_item("output_dir", result.3)?;
     dict.set_item("lora_weights_path", result.4)?;
-    Ok(dict.into())
+    Ok(dict)
 }
 
 /// Run inference with a model.
@@ -109,7 +110,7 @@ pub fn infer(
     let prompt = prompt.to_string();
     let lora = lora.map(String::from);
 
-    py.allow_threads(move || {
+    py.detach(move || {
         crate::hub::shared_runtime().block_on(async {
             let mut builder = pmetal::easy::infer(&model_id)
                 .temperature(temperature)

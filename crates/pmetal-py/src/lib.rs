@@ -18,7 +18,7 @@ mod trainer;
 
 /// PMetal Python module.
 #[pymodule]
-fn pmetal(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn pmetal(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Version
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
 
@@ -58,6 +58,11 @@ fn pmetal(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Easy API
     m.add_function(wrap_pyfunction!(easy::finetune, m)?)?;
     m.add_function(wrap_pyfunction!(easy::infer, m)?)?;
+
+    // Tracing subscriber submodule (enabled via --features tracing)
+    // Uncomment when pyo3-tracing-subscriber is added to Cargo.toml:
+    // #[cfg(feature = "tracing")]
+    // pyo3_tracing_subscriber::add_submodule("pmetal", "tracing_subscriber", py, m)?;
 
     Ok(())
 }

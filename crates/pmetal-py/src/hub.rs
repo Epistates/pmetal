@@ -22,7 +22,7 @@ fn runtime() -> &'static tokio::runtime::Runtime {
 #[pyfunction]
 #[pyo3(signature = (model_id, revision=None))]
 pub fn download_model(py: Python<'_>, model_id: &str, revision: Option<&str>) -> PyResult<String> {
-    py.allow_threads(|| {
+    py.detach(|| {
         runtime()
             .block_on(pmetal_hub::download_model(model_id, revision, None))
             .map(|p| p.to_string_lossy().to_string())
@@ -47,7 +47,7 @@ pub fn download_file(
     filename: &str,
     revision: Option<&str>,
 ) -> PyResult<String> {
-    py.allow_threads(|| {
+    py.detach(|| {
         runtime()
             .block_on(pmetal_hub::download_file(
                 model_id, filename, revision, None,

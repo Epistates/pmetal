@@ -25,7 +25,7 @@ impl PyTokenizer {
     fn from_pretrained(py: Python<'_>, model_id: &str) -> PyResult<Self> {
         let id = model_id.to_string();
         // Release GIL during download
-        let model_dir = py.allow_threads(move || {
+        let model_dir = py.detach(move || {
             crate::hub::shared_runtime()
                 .block_on(pmetal_hub::download_model(&id, None, None))
                 .map_err(crate::error::runtime_err)
