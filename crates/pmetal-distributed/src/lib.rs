@@ -83,7 +83,6 @@ use async_trait::async_trait;
 
 // Core modules
 pub mod auto;
-#[cfg(not(kani))]
 pub mod cloud_bridge;
 pub mod config;
 pub mod discovery;
