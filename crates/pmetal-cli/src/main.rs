@@ -4762,19 +4762,26 @@ async fn run_inference_with_lora(
     // Load LoRA adapter weights
     tracing::info!("Loading LoRA adapter from {:?}...", lora_path);
     model.load_lora_weights(lora_path)?;
-    // Force evaluation of all parameters (base weights + loaded LoRA adapters)
+
+    // Merge LoRA into base weights for inference (W_merged = W + scale * B @ A).
+    // This matches mlx-lm's approach where adapters are applied to the base model,
+    // producing correct inference without needing separate LoRA forward computation.
+    tracing::info!("Merging LoRA weights into base model for inference...");
+    model
+        .merge_lora()
+        .map_err(|e| anyhow::anyhow!("Failed to merge LoRA weights: {}", e))?;
+
+    // Force evaluation of all parameters
     model
         .eval_all()
         .map_err(|e| anyhow::anyhow!("Failed to eval LoRA model: {}", e))?;
 
-    tracing::info!("Model loaded successfully");
+    tracing::info!("Model loaded successfully (LoRA merged)");
 
-    // Auto-detect chat mode: LoRA fine-tuned models almost always use chat format,
-    // so enable chat if the model has chat special tokens even if it's a "base" model.
+    // Use chat mode only if explicitly requested or model is instruction-tuned.
+    // Don't auto-enable for base models just because they have chat tokens in vocab.
     let is_instruct = is_instruction_tuned(model_path);
-    let has_chat_tokens = tokenizer.encode("<|im_end|>").is_ok_and(|t| t.len() == 1)
-        || tokenizer.encode("<|eot_id|>").is_ok_and(|t| t.len() == 1);
-    let use_chat = chat || is_instruct || has_chat_tokens;
+    let use_chat = chat || is_instruct;
 
     if !chat && use_chat {
         tracing::info!(
