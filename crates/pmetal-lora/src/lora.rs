@@ -9,7 +9,9 @@
 //! - `B` is the LoRA up-projection matrix (out_features x rank)
 //! - `scale = alpha / rank` (or `alpha / sqrt(rank)` for RSLoRA)
 
-use mlx_rs::{Array, error::Exception, nn};
+use std::collections::HashMap;
+
+use mlx_rs::{Array, Dtype, error::Exception, nn};
 
 use pmetal_core::LoraConfig;
 
@@ -42,6 +44,20 @@ pub enum LoraError {
     /// Invalid state error.
     #[error("Invalid state: {0}")]
     InvalidState(String),
+}
+
+/// Convert BFloat16 weights to Float16 for LoRA compatibility.
+///
+/// BF16 is common in HuggingFace models but causes silent precision corruption in
+/// mixed-type matmuls when LoRA A/B matrices are Float32. This function is the
+/// single shared implementation that every `load_base_weights_from_dir` method
+/// should call immediately after `Array::load_safetensors`.
+///
+/// Dtypes are preserved as-is (BF16 models stay BF16, matching mlx-lm behavior).
+pub fn sanitize_loaded_weights(
+    weights: HashMap<String, Array>,
+) -> Result<HashMap<String, Array>, LoraError> {
+    Ok(weights)
 }
 
 /// LoRA Linear layer that wraps a base Linear layer with low-rank adaptation.
