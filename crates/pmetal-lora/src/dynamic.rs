@@ -656,6 +656,21 @@ impl DynamicLoraModel {
         }
     }
 
+    /// Evaluate all model parameters (force GPU computation).
+    ///
+    /// Call this after loading LoRA weights to ensure the adapter parameters
+    /// are materialized on the device before running inference.
+    pub fn eval_all(&mut self) -> Result<(), LoraError> {
+        match self {
+            Self::Llama(m) => m.eval_all(),
+            Self::Mistral(m) => m.eval_all(),
+            Self::Qwen3(m) => m.eval_all(),
+            Self::Gemma(m) => m.eval_all(),
+            Self::Phi(m) => m.eval_all(),
+            Self::Qwen3Next(m) => m.eval_all(),
+        }
+    }
+
     /// Forward with hybrid cache support (KV cache + Mamba cache).
     ///
     /// For non-hybrid models, the mamba_cache is ignored and standard

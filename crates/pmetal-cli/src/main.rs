@@ -2178,7 +2178,8 @@ async fn run_distillation_cli(
         alpha: lora_alpha as f32,
         ..Default::default()
     };
-    let mut student_model = DynamicLoraModel::from_pretrained(&student_path, student_lora_config)?;
+    let mut student_model =
+        DynamicLoraModel::from_pretrained(&student_path, student_lora_config.clone())?;
 
     // 6. Setup Distillation Engine
     let method = match method_str.to_lowercase().as_str() {
@@ -2292,6 +2293,21 @@ async fn run_distillation_cli(
     tracing::info!("Saving distilled student adapters to {:?}", lora_output);
     std::fs::create_dir_all(&validated_distill_output)?;
     student_model.save_lora_weights(&lora_output)?;
+    // Save adapter config so inference knows r/alpha/target_modules without guessing
+    {
+        let adapter_config = serde_json::json!({
+            "r": student_lora_config.r,
+            "alpha": student_lora_config.alpha,
+            "target_modules": student_lora_config.target_modules,
+            "use_rslora": student_lora_config.use_rslora,
+        });
+        let config_path = lora_output
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .join("adapter_config.json");
+        std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
+        tracing::info!("Saved adapter config to {:?}", config_path);
+    }
 
     println!("\n========================================");
     println!("  Distillation Complete");
@@ -3198,6 +3214,21 @@ async fn run_training(
         let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
         model.save_lora_weights(&final_path)?;
         tracing::info!("Saved LoRA weights to {:?}", final_path);
+        // Save adapter config for inference (r, alpha, target_modules)
+        {
+            let adapter_config = serde_json::json!({
+                "r": config.lora.r,
+                "alpha": config.lora.alpha,
+                "target_modules": config.lora.target_modules,
+                "use_rslora": config.lora.use_rslora,
+            });
+            let config_path = final_path
+                .parent()
+                .unwrap_or(std::path::Path::new("."))
+                .join("adapter_config.json");
+            std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
+            tracing::info!("Saved adapter config to {:?}", config_path);
+        }
 
         // Recover metrics callback from training loop for finalization
         let mut cbs = training_loop.take_callbacks();
@@ -3311,6 +3342,21 @@ async fn run_training(
             let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
             model.save_lora_weights(&final_path)?;
             tracing::info!("Saved LoRA weights to {:?}", final_path);
+            // Save adapter config for inference (r, alpha, target_modules)
+            {
+                let adapter_config = serde_json::json!({
+                    "r": config.lora.r,
+                    "alpha": config.lora.alpha,
+                    "target_modules": config.lora.target_modules,
+                    "use_rslora": config.lora.use_rslora,
+                });
+                let config_path = final_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("adapter_config.json");
+                std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
+                tracing::info!("Saved adapter config to {:?}", config_path);
+            }
         } else if (fused || use_jit_compilation) && config.training.gradient_accumulation_steps == 1
         {
             // Fused training step (combines forward/backward/optimizer)
@@ -3328,6 +3374,21 @@ async fn run_training(
             let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
             model.save_lora_weights(&final_path)?;
             tracing::info!("Saved LoRA weights to {:?}", final_path);
+            // Save adapter config for inference (r, alpha, target_modules)
+            {
+                let adapter_config = serde_json::json!({
+                    "r": config.lora.r,
+                    "alpha": config.lora.alpha,
+                    "target_modules": config.lora.target_modules,
+                    "use_rslora": config.lora.use_rslora,
+                });
+                let config_path = final_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("adapter_config.json");
+                std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
+                tracing::info!("Saved adapter config to {:?}", config_path);
+            }
         } else if use_metal_fused_optimizer {
             // Metal fused optimizer for maximum throughput
             tracing::info!("Using Metal fused optimizer for training");
@@ -3344,6 +3405,21 @@ async fn run_training(
             let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
             model.save_lora_weights(&final_path)?;
             tracing::info!("Saved LoRA weights to {:?}", final_path);
+            // Save adapter config for inference (r, alpha, target_modules)
+            {
+                let adapter_config = serde_json::json!({
+                    "r": config.lora.r,
+                    "alpha": config.lora.alpha,
+                    "target_modules": config.lora.target_modules,
+                    "use_rslora": config.lora.use_rslora,
+                });
+                let config_path = final_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("adapter_config.json");
+                std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
+                tracing::info!("Saved adapter config to {:?}", config_path);
+            }
         } else {
             if (fused || use_jit_compilation) && config.training.gradient_accumulation_steps != 1 {
                 tracing::warn!(
@@ -3363,6 +3439,21 @@ async fn run_training(
             let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
             model.save_lora_weights(&final_path)?;
             tracing::info!("Saved LoRA weights to {:?}", final_path);
+            // Save adapter config for inference (r, alpha, target_modules)
+            {
+                let adapter_config = serde_json::json!({
+                    "r": config.lora.r,
+                    "alpha": config.lora.alpha,
+                    "target_modules": config.lora.target_modules,
+                    "use_rslora": config.lora.use_rslora,
+                });
+                let config_path = final_path
+                    .parent()
+                    .unwrap_or(std::path::Path::new("."))
+                    .join("adapter_config.json");
+                std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
+                tracing::info!("Saved adapter config to {:?}", config_path);
+            }
         }
 
         // Recover metrics callback from training loop for finalization
@@ -4593,11 +4684,52 @@ async fn run_inference_with_lora(
     use pmetal_lora::{DynamicLoraModel, TrainableModel};
     use pmetal_models::{GenerationConfig, generate_cached_async_streaming};
 
-    // Create LoRA config - we'll load actual weights which override this
-    let lora_config = LoraConfig {
-        r: 16, // Will be overridden by loaded weights
-        alpha: 16.0,
-        ..Default::default()
+    // Try to load adapter config from the LoRA weights directory
+    let lora_path_buf = std::path::Path::new(lora_path);
+    let lora_dir = lora_path_buf.parent().unwrap_or(std::path::Path::new("."));
+    let adapter_config_path = lora_dir.join("adapter_config.json");
+
+    let lora_config = if adapter_config_path.exists() {
+        let config_str = std::fs::read_to_string(&adapter_config_path)?;
+        let config_json: serde_json::Value = serde_json::from_str(&config_str)?;
+
+        let r = config_json["r"].as_u64().unwrap_or(16) as usize;
+        let alpha = config_json["alpha"].as_f64().unwrap_or(32.0) as f32;
+        let target_modules: Vec<String> = config_json["target_modules"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let use_rslora = config_json["use_rslora"].as_bool().unwrap_or(false);
+
+        tracing::info!(
+            "Loaded adapter config: r={}, alpha={}, use_rslora={}, targets={:?}",
+            r,
+            alpha,
+            use_rslora,
+            target_modules
+        );
+        LoraConfig {
+            r,
+            alpha,
+            target_modules,
+            use_rslora,
+            ..Default::default()
+        }
+    } else {
+        tracing::warn!(
+            "No adapter_config.json found at {:?}, using defaults (r=16, alpha=32.0, all modules)",
+            adapter_config_path
+        );
+        LoraConfig {
+            r: 16,
+            alpha: 32.0,
+            target_modules: vec![],
+            ..Default::default()
+        }
     };
 
     // Use DynamicLoraModel for automatic architecture detection
@@ -4608,6 +4740,10 @@ async fn run_inference_with_lora(
     // Load LoRA adapter weights
     tracing::info!("Loading LoRA adapter from {:?}...", lora_path);
     model.load_lora_weights(lora_path)?;
+    // Force evaluation of all parameters (base weights + loaded LoRA adapters)
+    model
+        .eval_all()
+        .map_err(|e| anyhow::anyhow!("Failed to eval LoRA model: {}", e))?;
 
     tracing::info!("Model loaded successfully");
 
