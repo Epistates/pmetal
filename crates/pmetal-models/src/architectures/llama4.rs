@@ -393,15 +393,12 @@ impl Llama4ModRouter {
             .max(1)
             .min(seq_len);
 
-        // argpartition(-weights, -k, axis=-1) places the k largest at positions [-k..]
+        // argpartition(weights, -k, axis=-1) places the k largest at positions [-k..]
         // This is O(T) vs O(T log T) for argsort.
-        let neg_weights = weights.negative()?;
-        let neg_k = -k;
-        let part_indices = ops::argpartition_axis(&neg_weights, neg_k, -1)?;
+        let part_indices = ops::argpartition_axis(&weights, -k, -1)?;
 
         // Slice the last k indices — these correspond to the top-k tokens.
-        // part_indices shape: [B, T]; the k largest (negated smallest) are at positions [-k..].
-        let selected_indices = part_indices.index((.., neg_k..));
+        let selected_indices = part_indices.index((.., -k..));
         // selected_indices: [B, k]
 
         // Build a binary top-k mask [B, T] of zeros with 1s at selected positions.
@@ -617,8 +614,30 @@ impl Llama4Attention {
 
         // Transpose for attention: [B, n_heads, seq, head_dim]
         let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let mut k = k.transpose_axes(&[0, 2, 1, 3])?;
+        let mut v = v.transpose_axes(&[0, 2, 1, 3])?;
+
+        // GQA: repeat KV heads to match query heads
+        let repeat = self.n_heads / self.n_kv_heads;
+        if repeat > 1 {
+            // [B, n_kv, T, D] -> [B, n_kv, 1, T, D] -> broadcast -> [B, n_heads, T, D]
+            let k_shape = k.shape().to_vec();
+            let v_shape = v.shape().to_vec();
+            k = k
+                .reshape(&[k_shape[0], self.n_kv_heads, 1, k_shape[2], self.head_dim])?;
+            k = ops::broadcast_to(
+                &k,
+                &[k_shape[0], self.n_kv_heads, repeat, k_shape[2], self.head_dim],
+            )?;
+            k = k.reshape(&[k_shape[0], self.n_heads, k_shape[2], self.head_dim])?;
+            v = v
+                .reshape(&[v_shape[0], self.n_kv_heads, 1, v_shape[2], self.head_dim])?;
+            v = ops::broadcast_to(
+                &v,
+                &[v_shape[0], self.n_kv_heads, repeat, v_shape[2], self.head_dim],
+            )?;
+            v = v.reshape(&[v_shape[0], self.n_heads, v_shape[2], self.head_dim])?;
+        }
 
         // Attention scores
         let k_t = k.transpose_axes(&[0, 1, 3, 2])?;
@@ -914,7 +933,7 @@ impl Llama4TextModel {
     ///
     /// Returns the mean BCE loss across all MoD layers, or `None` if no MoD layers fired.
     /// Callers should scale by `config.router_aux_loss_coef` before adding to the task loss.
-    pub fn mod_aux_loss(&self) -> Option<Array> {
+    pub fn mod_aux_loss(&self) -> Result<Option<Array>, Exception> {
         let mut total: Option<Array> = None;
         let mut count = 0usize;
 
@@ -922,15 +941,19 @@ impl Llama4TextModel {
             if let Some(loss) = layer.mod_aux_loss() {
                 total = Some(match total {
                     None => loss.clone(),
-                    Some(acc) => acc.add(loss).ok()?,
+                    Some(acc) => acc.add(loss)?,
                 });
                 count += 1;
             }
         }
 
-        let sum = total?;
-        let denom = Array::from_f32(count as f32);
-        sum.divide(&denom).ok()
+        match total {
+            None => Ok(None),
+            Some(sum) => {
+                let denom = Array::from_f32(count as f32);
+                Ok(Some(sum.divide(&denom)?))
+            }
+        }
     }
 }
 
@@ -974,7 +997,7 @@ impl Llama4ForCausalLM {
     ///
     /// Callers should add `config.router_aux_loss_coef * mod_aux_loss()` to the
     /// task loss when training with MoD enabled.
-    pub fn mod_aux_loss(&self) -> Option<Array> {
+    pub fn mod_aux_loss(&self) -> Result<Option<Array>, Exception> {
         self.model.mod_aux_loss()
     }
 }
@@ -1276,7 +1299,7 @@ mod tests {
         let logits = model.forward(&input_ids, None, None).unwrap();
         logits.eval().unwrap();
 
-        let aux = model.mod_aux_loss();
+        let aux = model.mod_aux_loss().unwrap();
         assert!(
             aux.is_some(),
             "mod_aux_loss should be Some after a forward pass with MoD enabled"
