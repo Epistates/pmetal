@@ -1950,7 +1950,25 @@ async fn run_fuse(
             })
             .unwrap_or(16)
     };
-    let alpha = alpha_override.unwrap_or(rank as f32);
+    // Read alpha from adapter_config.json if no override, else fall back to rank (scale=1)
+    let alpha = alpha_override.unwrap_or_else(|| {
+        let lora_dir = std::path::Path::new(lora_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."));
+        let config_path = if std::path::Path::new(lora_path).is_dir() {
+            std::path::Path::new(lora_path).join("adapter_config.json")
+        } else {
+            lora_dir.join("adapter_config.json")
+        };
+        if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+            if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                let a = config_json["alpha"].as_f64().unwrap_or(rank as f64) as f32;
+                tracing::info!("Loaded alpha={} from adapter_config.json", a);
+                return a;
+            }
+        }
+        rank as f32
+    });
     let scale = alpha / rank as f32;
     println!("LoRA rank: {rank}, alpha: {alpha}, scale: {scale:.3}");
 
@@ -6839,7 +6857,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             output,
             template,
             system,
-            model: _,
+            model,
             add_generation_prompt,
             mask_prompt: _,
         } => {
@@ -6856,6 +6874,39 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                 println!("Add generation prompt: yes");
             }
             println!("========================================\n");
+
+            // Resolve EOS token from the model's tokenizer when a model is
+            // provided and we are in training mode (not generation prompt).
+            let template_eos_token: Option<String> = if !add_generation_prompt {
+                if let Some(ref model_id) = model {
+                    let model_dir =
+                        if model_id.contains('/') && !std::path::Path::new(model_id).exists() {
+                            pmetal_hub::download_model(model_id, None, None).await?
+                        } else {
+                            std::path::PathBuf::from(model_id)
+                        };
+                    match Tokenizer::from_model_dir(&model_dir) {
+                        Ok(tok) => {
+                            let eos = tok.eos_token_str();
+                            if let Some(ref s) = eos {
+                                println!("EOS token: {:?}", s);
+                            }
+                            eos
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "Warning: could not load tokenizer for EOS resolution: {}",
+                                e
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
 
             let file = std::fs::File::open(&input)?;
             let reader = BufReader::new(file);
@@ -6913,6 +6964,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                     &conversations,
                     system.as_deref(),
                     add_generation_prompt,
+                    template_eos_token.as_deref(),
                 );
 
                 // Write output
@@ -7050,6 +7102,20 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             let tokenizer = Tokenizer::from_model_dir(&model_path)?;
             println!("  Loaded tokenizer from {}", model_path.display());
 
+            // Resolve the model's true EOS token string from the tokenizer
+            // vocabulary.  This is authoritative: e.g. Qwen3 resolves to
+            // `<|endoftext|>` (ID 151643) rather than `<|im_end|>` (turn
+            // delimiter).  Training sequences must end with this token so
+            // the model learns to terminate generation.
+            let eos_token_str: Option<String> = tokenizer.eos_token_str();
+            if let Some(ref eos) = eos_token_str {
+                println!("  EOS token:  {:?}", eos);
+            } else {
+                println!(
+                    "  EOS token:  (not found — training sequences will not have EOS appended)"
+                );
+            }
+
             // Step 3: Apply template and filter
             println!("[3/5] Applying template and filtering...");
             let templated_path = format!("{}/templated.jsonl", output_dir);
@@ -7137,8 +7203,17 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                             ("gpt".to_string(), output_text.to_string()),
                         ]
                     } else if let Some(text) = json.get("text").and_then(|v| v.as_str()) {
+                        // Raw text path: append EOS if missing so the model
+                        // learns to stop generating.
+                        let text_with_eos = match eos_token_str.as_deref() {
+                            Some(eos) if !text.ends_with(eos) => {
+                                format!("{}{}", text, eos)
+                            }
+                            _ => text.to_string(),
+                        };
+
                         // Check length
-                        let tokens = tokenizer.encode(text)?;
+                        let tokens = tokenizer.encode(&text_with_eos)?;
                         if tokens.len() > max_seq_len {
                             filtered_long += 1;
                             continue;
@@ -7148,7 +7223,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                         if !no_dedup {
                             use std::hash::{Hash, Hasher};
                             let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                            text.hash(&mut hasher);
+                            text_with_eos.hash(&mut hasher);
                             let hash = hasher.finish();
                             if !seen_hashes.insert(hash) {
                                 filtered_dedup += 1;
@@ -7156,15 +7231,26 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                             }
                         }
 
-                        writeln!(templated_file, "{}", serde_json::json!({"text": text}))?;
+                        writeln!(
+                            templated_file,
+                            "{}",
+                            serde_json::json!({"text": text_with_eos})
+                        )?;
                         kept += 1;
                         continue;
                     } else {
                         continue;
                     };
 
-                // Apply template
-                let formatted = format_conversations(&template, &conversations, None, false);
+                // Apply template (training mode: add_generation_prompt=false,
+                // EOS token appended by format_conversations).
+                let formatted = format_conversations(
+                    &template,
+                    &conversations,
+                    None,
+                    false,
+                    eos_token_str.as_deref(),
+                );
 
                 // Check token length
                 let tokens = tokenizer.encode(&formatted)?;
@@ -7401,11 +7487,17 @@ fn extract_text_from_sample(json: &serde_json::Value) -> String {
 }
 
 /// Format conversations with a chat template.
+///
+/// When `eos_token` is `Some` and `add_generation_prompt` is `false` (i.e.
+/// training mode), the EOS token is appended after the final turn so the model
+/// learns to terminate generation.  Callers in inference / generation-prompt
+/// mode should pass `None` or `add_generation_prompt = true`.
 fn format_conversations(
     template: &ChatTemplate,
     conversations: &[(String, String)],
     system_msg: Option<&str>,
     add_generation_prompt: bool,
+    eos_token: Option<&str>,
 ) -> String {
     let mut output = String::new();
 
@@ -7566,6 +7658,17 @@ fn format_conversations(
             }
             if add_generation_prompt {
                 output.push_str("<|im_start|>assistant\n");
+            }
+        }
+    }
+
+    // Append EOS token at the end of training sequences so the model learns
+    // to stop generating.  Skip in generation-prompt mode (inference) and for
+    // Raw template (pre-formatted text may already contain EOS).
+    if !add_generation_prompt && !matches!(template, ChatTemplate::Raw) {
+        if let Some(eos) = eos_token {
+            if !output.ends_with(eos) {
+                output.push_str(eos);
             }
         }
     }

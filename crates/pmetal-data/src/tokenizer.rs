@@ -146,6 +146,16 @@ impl Tokenizer {
         })
     }
 
+    /// Get the EOS token string if available.
+    ///
+    /// Resolves the EOS token ID and converts it back to the token's surface
+    /// form using the vocabulary, preserving the exact string representation
+    /// (e.g. `<|endoftext|>` for Qwen3, `</s>` for Llama 2/Mistral).
+    pub fn eos_token_str(&self) -> Option<String> {
+        self.eos_token_id()
+            .and_then(|id| self.inner.id_to_token(id))
+    }
+
     /// Get BOS token ID if available.
     ///
     /// Resolution order:
