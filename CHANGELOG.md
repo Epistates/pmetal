@@ -22,25 +22,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CloudBridge**: Complete training state export (weights, optimizer state, RNG, dataloader position, metadata) with working Python bootstrap scripts for FSDP/DeepSpeed cluster resumption and Rust-side loader functions
 - **Formal verification**: `cargo-kani` proofs for ring all-reduce chunk arithmetic (95 checks) and k-ary tree topology consistency (607 checks), with justfile recipes
 - **Reasoning templates**: `MathReasoningTemplate` (GRPO + accuracy/format rewards) and `CodeReasoningTemplate` (structural code fence + test case matching)
+- **Reasoning dataset auto-detection**: `pmetal dataset prepare` automatically detects `problem`/`thinking`/`solution` columns and formats them as `<think>` tagged ChatML conversations
+- **`--columns` flag**: General column remapping for `dataset prepare` (e.g., `--columns "instruction=question,output=answer"`)
+- **`adapter_config.json`**: Saved alongside LoRA weights during training (r, alpha, target_modules, use_rslora). Loaded automatically at inference and fuse time — eliminates config guesswork
 - **Supply chain**: `cargo-vet` initialized with Mozilla, Google, and Bytecode Alliance audit imports; 17 workspace crates covered; 5 transitive dependency exemptions with exact lockfile versions
 - **Tracing spans**: 6 `info_span!` markers in Python trainer for phase-level observability (model_resolve, load_tokenizer, load_dataset, load_model, training_loop, save_weights)
 
 ### Fixed
 
+- **LoRA inference garbage output**: Merged LoRA weights into base model at inference time (`W += scale*B@A`), matching mlx-lm's pattern. The separate-forward path had dtype mismatch issues (BF16 base × F32 LoRA)
+- **Auto-chat mode regression**: Removed heuristic that forced chat template on base models just because their tokenizer has `<|im_end|>`. Chat mode now requires explicit `--chat` or an instruction-tuned model
+- **Missing EOS in training data**: Training sequences now end with the model's actual EOS token (e.g., `<|endoftext|>` for Qwen). Previously only had turn delimiter (`<|im_end|>`) — model never learned to stop generating
+- **Fuse command wrong alpha/rank**: `pmetal fuse` now reads `adapter_config.json` for correct alpha and rank instead of defaulting to `scale=1.0`. Also filters MLP LoRA weights (rank=0) when auto-detecting rank from shapes
 - **ANE `x2norm` backward bug**: FFN weight gradients (`dW1`, `dW3`) were computed against the wrong pre-norm tensor (`xnorm` from attention block instead of `x2norm` from FFN block). Restored `x2norm` field and CPU RMSNorm recomputation for gradient correctness
 - **ANE `sdpa_bwd` surface dtype**: Backward SDPA output surfaces were allocated as fp32 but ANE kernels produce fp16 — stride mismatch corrupted dV/dQ/dK gradients. Fixed to `IoSurface::for_tensor()` (fp16)
 - **MoD argpartition sign**: Router negated weights before `argpartition_axis`, selecting bottom-k (least important) tokens instead of top-k. Removed negation
-- **`mod_aux_loss` error swallowing**: `Array::add()` errors were silently converted to `None` via `.ok()?`. Changed return type to `Result<Option<Array>, Exception>` with proper propagation
 - **MLX bridge `copy_as_f32` regression**: Renamed methods dropped auto dtype conversion — callers passing wrong dtype would panic. Restored `copy_as_f32` / `copy_as_f16` with auto-conversion
 - **MLX bridge `view_f32` eval**: Removed `.eval()` call before accessing data pointer — unevaluated arrays returned null. Restored defensive eval
 - **Python API surface**: Restored `ProgressCallback`, `LoggingCallback(log_every=10)`, `__version__`, and `PythonCallbackBridge` that were deleted during PyO3 migration
+- **TUI training completion**: Reads final metrics from JSONL file on disk (immune to polling lag). Shows actual loss and step count instead of `0.0000` / sample count
+- **TUI Steps/min overflow**: Guards against divide-by-zero when `total_ms=0` — shows `—` instead of `60000`
+- **Dataset prepare panic**: Empty results no longer crash with index-out-of-bounds. Shows diagnostic message with format hints
 
 ### Changed
 
+- **LoRA inference uses merge**: `merge_lora()` is called before generation, producing a single merged weight matrix per layer. This is equivalent to the fuse command but happens in-memory without saving
 - **PyO3 0.23 → 0.28**: `allow_threads` → `detach`, `with_gil` → `attach`, `from_py_object` on all pyclass types, `Bound<'py, PyDict>` return types
 - **tokio 1.49 → 1.50**
 - **`unsafe_code` lint**: Escalated from `warn` to `deny` workspace-wide
-- **Dashboard strings**: Replaced hardcoded marketing text with accurate dynamic pipeline labels
 
 ## [0.3.3] - 2026-03-12
 
