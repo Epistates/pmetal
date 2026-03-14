@@ -57,7 +57,12 @@ impl MlxMetalBridge {
         let in_buf = MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)?;
         let out_buf = MetalBuffer::<f32>::new(ctx, n_elements, BufferUsage::Shared)?;
 
-        dequant.dequantize_q4_0(ctx, &in_buf.as_retained(), &out_buf.as_retained(), n_elements)?;
+        dequant.dequantize_q4_0(
+            ctx,
+            &in_buf.as_retained(),
+            &out_buf.as_retained(),
+            n_elements,
+        )?;
 
         Self::buffer_into_array_f32(out_buf, shape)
     }
@@ -73,7 +78,12 @@ impl MlxMetalBridge {
         let in_buf = MetalBuffer::from_slice(ctx, data, BufferUsage::Shared)?;
         let out_buf = MetalBuffer::<f32>::new(ctx, n_elements, BufferUsage::Shared)?;
 
-        dequant.dequantize_iq4_xs(ctx, &in_buf.as_retained(), &out_buf.as_retained(), n_elements)?;
+        dequant.dequantize_iq4_xs(
+            ctx,
+            &in_buf.as_retained(),
+            &out_buf.as_retained(),
+            n_elements,
+        )?;
 
         Self::buffer_into_array_f32(out_buf, shape)
     }
@@ -105,12 +115,16 @@ impl MlxMetalBridge {
         }
 
         // Ensure array is evaluated before accessing data pointer
-        array.eval().map_err(|e| MetalError::InvalidConfig(format!("Failed to eval array: {e}")))?;
+        array
+            .eval()
+            .map_err(|e| MetalError::InvalidConfig(format!("Failed to eval array: {e}")))?;
 
         // Get pointer to array data via sys call
         let ptr = unsafe { mlx_sys::mlx_array_data_float32(array.as_ptr()) };
         if ptr.is_null() {
-            return Err(MetalError::InvalidConfig("MLX array data pointer is null".into()));
+            return Err(MetalError::InvalidConfig(
+                "MLX array data pointer is null".into(),
+            ));
         }
 
         // Create a view (unsafe - we assume the array outlives the view)
@@ -128,12 +142,16 @@ impl MlxMetalBridge {
         }
 
         // Ensure array is evaluated before accessing data pointer
-        array.eval().map_err(|e| MetalError::InvalidConfig(format!("Failed to eval array: {e}")))?;
+        array
+            .eval()
+            .map_err(|e| MetalError::InvalidConfig(format!("Failed to eval array: {e}")))?;
 
         // Get pointer to array data via sys call
         let ptr = unsafe { mlx_sys::mlx_array_data_float16(array.as_ptr()) };
         if ptr.is_null() {
-            return Err(MetalError::InvalidConfig("MLX array data pointer is null".into()));
+            return Err(MetalError::InvalidConfig(
+                "MLX array data pointer is null".into(),
+            ));
         }
 
         // Create a view (unsafe - we assume the array outlives the view)
@@ -146,7 +164,9 @@ impl MlxMetalBridge {
     /// due to the copy operation. Auto-converts non-f32 arrays.
     pub fn copy_as_f32(ctx: &MetalContext, array: &Array) -> MetalResult<MetalBuffer<f32>> {
         let converted = if array.dtype() != Dtype::Float32 {
-            array.as_dtype(Dtype::Float32).map_err(|e| MetalError::InvalidConfig(format!("dtype conversion failed: {e}")))?
+            array
+                .as_dtype(Dtype::Float32)
+                .map_err(|e| MetalError::InvalidConfig(format!("dtype conversion failed: {e}")))?
         } else {
             array.clone()
         };
@@ -157,7 +177,9 @@ impl MlxMetalBridge {
     /// Copy MLX array data to a new f16 Metal buffer, converting dtype if needed.
     pub fn copy_as_f16(ctx: &MetalContext, array: &Array) -> MetalResult<MetalBuffer<f16>> {
         let converted = if array.dtype() != Dtype::Float16 {
-            array.as_dtype(Dtype::Float16).map_err(|e| MetalError::InvalidConfig(format!("dtype conversion failed: {e}")))?
+            array
+                .as_dtype(Dtype::Float16)
+                .map_err(|e| MetalError::InvalidConfig(format!("dtype conversion failed: {e}")))?
         } else {
             array.clone()
         };

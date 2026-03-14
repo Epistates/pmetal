@@ -40,9 +40,9 @@
 //! CloudBridge::export_bundle("/tmp/my_bundle", meta, &model_weights_bytes, None, None)?;
 //! ```
 
-use std::path::Path;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
+use std::path::Path;
 use tracing::{debug, info};
 
 // ── Metadata ─────────────────────────────────────────────────────────────────
@@ -207,16 +207,16 @@ impl CloudBridge {
     /// Read the raw model weights bytes from an existing bundle.
     pub fn load_model_weights(bundle_dir: impl AsRef<Path>) -> Result<Vec<u8>> {
         let path = bundle_dir.as_ref().join(bundle_files::MODEL_WEIGHTS);
-        std::fs::read(&path)
-            .with_context(|| format!("read model weights from {}", path.display()))
+        std::fs::read(&path).with_context(|| format!("read model weights from {}", path.display()))
     }
 
     /// Read the optimizer state bytes from an existing bundle, if present.
     pub fn load_optimizer_state(bundle_dir: impl AsRef<Path>) -> Result<Option<Vec<u8>>> {
         let path = bundle_dir.as_ref().join(bundle_files::OPTIMIZER_STATE);
         if path.exists() {
-            Ok(Some(std::fs::read(&path)
-                .with_context(|| format!("read optimizer state from {}", path.display()))?))
+            Ok(Some(std::fs::read(&path).with_context(|| {
+                format!("read optimizer state from {}", path.display())
+            })?))
         } else {
             Ok(None)
         }
@@ -226,8 +226,9 @@ impl CloudBridge {
     pub fn load_rng_state(bundle_dir: impl AsRef<Path>) -> Result<Option<Vec<u8>>> {
         let path = bundle_dir.as_ref().join(bundle_files::RNG_STATE);
         if path.exists() {
-            Ok(Some(std::fs::read(&path)
-                .with_context(|| format!("read rng state from {}", path.display()))?))
+            Ok(Some(std::fs::read(&path).with_context(|| {
+                format!("read rng state from {}", path.display())
+            })?))
         } else {
             Ok(None)
         }
@@ -572,21 +573,21 @@ def main():
 if __name__ == "__main__":
     main()
 "#,
-            pmetal_version           = meta.pmetal_version,
-            target_cluster           = meta.target_cluster,
-            preferred_dtype          = meta.preferred_dtype,
-            distributed_strategy     = meta.distributed_strategy,
-            global_step              = meta.global_step,
-            epoch                    = meta.epoch,
-            learning_rate            = meta.learning_rate,
-            best_loss_repr           = best_loss_repr,
-            ema_loss_repr            = ema_loss_repr,
-            model_architecture       = meta.model_architecture,
-            hidden_size              = meta.hidden_size,
-            num_layers               = meta.num_layers,
-            dataloader_epoch         = meta.dataloader_epoch,
-            dataloader_sample_index  = meta.dataloader_sample_index,
-            dataloader_shuffle_seed  = meta.dataloader_shuffle_seed,
+            pmetal_version = meta.pmetal_version,
+            target_cluster = meta.target_cluster,
+            preferred_dtype = meta.preferred_dtype,
+            distributed_strategy = meta.distributed_strategy,
+            global_step = meta.global_step,
+            epoch = meta.epoch,
+            learning_rate = meta.learning_rate,
+            best_loss_repr = best_loss_repr,
+            ema_loss_repr = ema_loss_repr,
+            model_architecture = meta.model_architecture,
+            hidden_size = meta.hidden_size,
+            num_layers = meta.num_layers,
+            dataloader_epoch = meta.dataloader_epoch,
+            dataloader_sample_index = meta.dataloader_sample_index,
+            dataloader_shuffle_seed = meta.dataloader_shuffle_seed,
         )
     }
 }
@@ -723,16 +724,18 @@ mod tests {
     #[test]
     fn load_optimizer_state_absent_returns_none() {
         let dir = tempfile::tempdir().expect("tempdir");
-        CloudBridge::export_bundle(dir.path(), sample_meta(), b"w", None, None)
-            .expect("export");
-        assert!(CloudBridge::load_optimizer_state(dir.path()).unwrap().is_none());
+        CloudBridge::export_bundle(dir.path(), sample_meta(), b"w", None, None).expect("export");
+        assert!(
+            CloudBridge::load_optimizer_state(dir.path())
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
     fn load_rng_state_absent_returns_none() {
         let dir = tempfile::tempdir().expect("tempdir");
-        CloudBridge::export_bundle(dir.path(), sample_meta(), b"w", None, None)
-            .expect("export");
+        CloudBridge::export_bundle(dir.path(), sample_meta(), b"w", None, None).expect("export");
         assert!(CloudBridge::load_rng_state(dir.path()).unwrap().is_none());
     }
 }

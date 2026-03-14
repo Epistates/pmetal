@@ -713,7 +713,11 @@ impl DynamicAneTrainer {
         self.compile_count += 1;
 
         // 5. Softmax (optional)
-        let softmax_vocab = self.vocab_map.as_ref().map(|vm| vm.compact_vocab).unwrap_or(self.config.vocab_size);
+        let softmax_vocab = self
+            .vocab_map
+            .as_ref()
+            .map(|vm| vm.compact_vocab)
+            .unwrap_or(self.config.vocab_size);
         let (softmax_kern, softmax_in, softmax_out) = {
             let sm_out = dynamic_kernel::gen_dynamic_softmax(softmax_vocab, s);
             match compile(&sm_out, rt, "softmax") {
@@ -974,8 +978,12 @@ impl DynamicAneTrainer {
         // ====== FFN Backward ======
 
         // 1. dffn @ W2^T → dsilu_raw (fused ANE kernel)
-        io.ffn_bwd_w2t_in.write_packed_f32(dx, &[(&self.layer_weights[l].w2_t, h)], d, s);
-        kernels.ffn_bwd_w2t.evaluate(&[io.ffn_bwd_w2t_in.as_ptr()], &[io.ffn_bwd_w2t_out.as_ptr()])?;
+        io.ffn_bwd_w2t_in
+            .write_packed_f32(dx, &[(&self.layer_weights[l].w2_t, h)], d, s);
+        kernels.ffn_bwd_w2t.evaluate(
+            &[io.ffn_bwd_w2t_in.as_ptr()],
+            &[io.ffn_bwd_w2t_out.as_ptr()],
+        )?;
         let mut dsilu_raw = vec![0.0f32; h * s];
         io.ffn_bwd_w2t_out.read_f32(&mut dsilu_raw, 0, h, s);
 
@@ -989,8 +997,20 @@ impl DynamicAneTrainer {
             let h_val = h;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
-                let w2_grad = unsafe { std::slice::from_raw_parts_mut(w2_grad_ptr as *mut f32, w2_grad_len) };
-                accelerate::gemm(&dy_clone, &silu_clone, w2_grad, d_val, h_val, s_val, 1.0, 1.0, false, true);
+                let w2_grad =
+                    unsafe { std::slice::from_raw_parts_mut(w2_grad_ptr as *mut f32, w2_grad_len) };
+                accelerate::gemm(
+                    &dy_clone,
+                    &silu_clone,
+                    w2_grad,
+                    d_val,
+                    h_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
+                );
             }));
         }
 
@@ -1019,16 +1039,52 @@ impl DynamicAneTrainer {
             let h_val = h;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
-                let w1_grad = unsafe { std::slice::from_raw_parts_mut(w1_grad_ptr as *mut f32, w1_grad_len) };
-                accelerate::gemm(&dh1_clone, &x2norm_clone, w1_grad, h_val, d_val, s_val, 1.0, 1.0, false, true);
-                let w3_grad = unsafe { std::slice::from_raw_parts_mut(w3_grad_ptr as *mut f32, w3_grad_len) };
-                accelerate::gemm(&dh3_clone, &x2norm_clone, w3_grad, h_val, d_val, s_val, 1.0, 1.0, false, true);
+                let w1_grad =
+                    unsafe { std::slice::from_raw_parts_mut(w1_grad_ptr as *mut f32, w1_grad_len) };
+                accelerate::gemm(
+                    &dh1_clone,
+                    &x2norm_clone,
+                    w1_grad,
+                    h_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
+                );
+                let w3_grad =
+                    unsafe { std::slice::from_raw_parts_mut(w3_grad_ptr as *mut f32, w3_grad_len) };
+                accelerate::gemm(
+                    &dh3_clone,
+                    &x2norm_clone,
+                    w3_grad,
+                    h_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
+                );
             }));
         }
 
         // 4. dh1@W1^T + dh3@W3^T → dx_ffn (fused ANE kernel)
-        io.ffn_bwd_w13t_in.write_packed_f32(&dh1, &[(&dh3, s), (&self.layer_weights[l].w1_t, d), (&self.layer_weights[l].w3_t, d)], h, s);
-        kernels.ffn_bwd_w13t.evaluate(&[io.ffn_bwd_w13t_in.as_ptr()], &[io.ffn_bwd_w13t_out.as_ptr()])?;
+        io.ffn_bwd_w13t_in.write_packed_f32(
+            &dh1,
+            &[
+                (&dh3, s),
+                (&self.layer_weights[l].w1_t, d),
+                (&self.layer_weights[l].w3_t, d),
+            ],
+            h,
+            s,
+        );
+        kernels.ffn_bwd_w13t.evaluate(
+            &[io.ffn_bwd_w13t_in.as_ptr()],
+            &[io.ffn_bwd_w13t_out.as_ptr()],
+        )?;
         let mut dx_ffn = vec![0.0f32; d * s];
         io.ffn_bwd_w13t_out.read_f32(&mut dx_ffn, 0, d, s);
 
@@ -1065,19 +1121,24 @@ impl DynamicAneTrainer {
         // Zero the entire surface once to clear stale weight-column values in the
         // Q/K/V rows (those rows have activation data in sp[0..s] only; sp[s..s+qd]
         // must be zero so the kernel's Wo^T matmul sees zeros there).
-        io.sdpa_bwd1_in.zero_channel_range_f32(0, bwd1_in_ch, bwd1_sp);
+        io.sdpa_bwd1_in
+            .zero_channel_range_f32(0, bwd1_in_ch, bwd1_sp);
 
         // Q [qd, s] → ch 0..qd, sp[0..s]
-        io.sdpa_bwd1_in.write_f32_strided_at(0, &acts.q, qd, s, bwd1_sp);
+        io.sdpa_bwd1_in
+            .write_f32_strided_at(0, &acts.q, qd, s, bwd1_sp);
 
         // K [kvd, s] → ch qd..qd+kvd, sp[0..s]
-        io.sdpa_bwd1_in.write_f32_strided_at(qd, &acts.k, kvd, s, bwd1_sp);
+        io.sdpa_bwd1_in
+            .write_f32_strided_at(qd, &acts.k, kvd, s, bwd1_sp);
 
         // V [kvd, s] → ch qd+kvd..qd+2*kvd, sp[0..s]
-        io.sdpa_bwd1_in.write_f32_strided_at(qd + kvd, &acts.v, kvd, s, bwd1_sp);
+        io.sdpa_bwd1_in
+            .write_f32_strided_at(qd + kvd, &acts.v, kvd, s, bwd1_sp);
 
         // dy [d, s] → ch dy_ch_off..in_ch, sp[0..s]
-        io.sdpa_bwd1_in.write_f32_strided_at(dy_ch_off, &dx_ffn_norm, d, s, bwd1_sp);
+        io.sdpa_bwd1_in
+            .write_f32_strided_at(dy_ch_off, &dx_ffn_norm, d, s, bwd1_sp);
 
         // Wo^T = wo [d, qd] → ch dy_ch_off..in_ch, sp[s..s+qd]
         io.sdpa_bwd1_in.write_f32_at_col_offset(
@@ -1089,7 +1150,9 @@ impl DynamicAneTrainer {
             bwd1_sp,
         );
 
-        kernels.sdpa_bwd1.evaluate(&[io.sdpa_bwd1_in.as_ptr()], &[io.sdpa_bwd1_out.as_ptr()])?;
+        kernels
+            .sdpa_bwd1
+            .evaluate(&[io.sdpa_bwd1_in.as_ptr()], &[io.sdpa_bwd1_out.as_ptr()])?;
 
         let mut dv = vec![0.0f32; kvd * s];
         io.sdpa_bwd1_out.read_fp16_as_f32(&mut dv, 0, kvd, s);
@@ -1104,17 +1167,34 @@ impl DynamicAneTrainer {
             let qd_val = qd;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
-                let wo_grad = unsafe { std::slice::from_raw_parts_mut(wo_grad_ptr as *mut f32, wo_grad_len) };
-                accelerate::gemm(&dx_clone, &attn_clone, wo_grad, d_val, qd_val, s_val, 1.0, 1.0, false, true);
+                let wo_grad =
+                    unsafe { std::slice::from_raw_parts_mut(wo_grad_ptr as *mut f32, wo_grad_len) };
+                accelerate::gemm(
+                    &dx_clone,
+                    &attn_clone,
+                    wo_grad,
+                    d_val,
+                    qd_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
+                );
             }));
         }
 
         // 7. SDPA backward part 2: Q, K, probs, dp → dQ, dK
-        io.sdpa_bwd2_in.copy_from(0, &io.sdpa_bwd1_out, kvd, 2 * score_ch, s);
-        io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch, &acts.q, qd, s);
-        io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch + qd, &acts.k, kvd, s);
+        io.sdpa_bwd2_in
+            .copy_from(0, &io.sdpa_bwd1_out, kvd, 2 * score_ch, s);
+        io.sdpa_bwd2_in
+            .write_f32_as_fp16_at(2 * score_ch, &acts.q, qd, s);
+        io.sdpa_bwd2_in
+            .write_f32_as_fp16_at(2 * score_ch + qd, &acts.k, kvd, s);
 
-        kernels.sdpa_bwd2.evaluate(&[io.sdpa_bwd2_in.as_ptr()], &[io.sdpa_bwd2_out.as_ptr()])?;
+        kernels
+            .sdpa_bwd2
+            .evaluate(&[io.sdpa_bwd2_in.as_ptr()], &[io.sdpa_bwd2_out.as_ptr()])?;
 
         let mut dq = vec![0.0f32; qd * s];
         let mut dk = vec![0.0f32; kvd * s];
@@ -1127,37 +1207,100 @@ impl DynamicAneTrainer {
             let dk_clone = dk.clone();
             let dv_clone = dv.clone();
             let xnorm_clone = self.layer_acts[l].xnorm.to_vec();
-            
+
             let wq_grad_ptr = self.layer_grads[l].wq.as_mut_ptr() as usize;
             let wq_grad_len = self.layer_grads[l].wq.len();
             let wk_grad_ptr = self.layer_grads[l].wk.as_mut_ptr() as usize;
             let wk_grad_len = self.layer_grads[l].wk.len();
             let wv_grad_ptr = self.layer_grads[l].wv.as_mut_ptr() as usize;
             let wv_grad_len = self.layer_grads[l].wv.len();
-            
+
             let d_val = d;
             let qd_val = qd;
             let kvd_val = kvd;
             let s_val = s;
-            
+
             self.dispatch_dw(Box::new(move || {
-                let wq_grad = unsafe { std::slice::from_raw_parts_mut(wq_grad_ptr as *mut f32, wq_grad_len) };
-                accelerate::gemm(&dq_clone, &xnorm_clone, wq_grad, qd_val, d_val, s_val, 1.0, 1.0, false, true);
-                let wk_grad = unsafe { std::slice::from_raw_parts_mut(wk_grad_ptr as *mut f32, wk_grad_len) };
-                accelerate::gemm(&dk_clone, &xnorm_clone, wk_grad, kvd_val, d_val, s_val, 1.0, 1.0, false, true);
-                let wv_grad = unsafe { std::slice::from_raw_parts_mut(wv_grad_ptr as *mut f32, wv_grad_len) };
-                accelerate::gemm(&dv_clone, &xnorm_clone, wv_grad, kvd_val, d_val, s_val, 1.0, 1.0, false, true);
+                let wq_grad =
+                    unsafe { std::slice::from_raw_parts_mut(wq_grad_ptr as *mut f32, wq_grad_len) };
+                accelerate::gemm(
+                    &dq_clone,
+                    &xnorm_clone,
+                    wq_grad,
+                    qd_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
+                );
+                let wk_grad =
+                    unsafe { std::slice::from_raw_parts_mut(wk_grad_ptr as *mut f32, wk_grad_len) };
+                accelerate::gemm(
+                    &dk_clone,
+                    &xnorm_clone,
+                    wk_grad,
+                    kvd_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
+                );
+                let wv_grad =
+                    unsafe { std::slice::from_raw_parts_mut(wv_grad_ptr as *mut f32, wv_grad_len) };
+                accelerate::gemm(
+                    &dv_clone,
+                    &xnorm_clone,
+                    wv_grad,
+                    kvd_val,
+                    d_val,
+                    s_val,
+                    1.0,
+                    1.0,
+                    false,
+                    true,
+                );
             }));
         }
 
         // 8. QKV backward projections (dxq, dxk, dxv)
         let mut dxq = vec![0.0f32; d * s];
-        Self::run_projection(kernels, io, qd, d, s, &dq, &self.layer_weights[l].wq_t, &mut dxq)?;
+        Self::run_projection(
+            kernels,
+            io,
+            qd,
+            d,
+            s,
+            &dq,
+            &self.layer_weights[l].wq_t,
+            &mut dxq,
+        )?;
         let mut dxk = vec![0.0f32; d * s];
-        Self::run_projection(kernels, io, kvd, d, s, &dk, &self.layer_weights[l].wk_t, &mut dxk)?;
+        Self::run_projection(
+            kernels,
+            io,
+            kvd,
+            d,
+            s,
+            &dk,
+            &self.layer_weights[l].wk_t,
+            &mut dxk,
+        )?;
         let mut dxv = vec![0.0f32; d * s];
-        Self::run_projection(kernels, io, kvd, d, s, &dv, &self.layer_weights[l].wv_t, &mut dxv)?;
-        
+        Self::run_projection(
+            kernels,
+            io,
+            kvd,
+            d,
+            s,
+            &dv,
+            &self.layer_weights[l].wv_t,
+            &mut dxv,
+        )?;
+
         let mut dx_attn = vec![0.0f32; d * s];
         accelerate::vadd(&dxq, &dxk, &mut dx_attn);
         accelerate::vadd(&dx_attn, &dxv, &mut dxq); // reuse dxq

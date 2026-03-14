@@ -208,7 +208,11 @@ impl AsyncScheduler {
         command_buffer.commit();
         self.stats.write().async_dispatches += 1;
 
-        Ok(CompletionToken::new(command_buffer, operation_id, resources))
+        Ok(CompletionToken::new(
+            command_buffer,
+            operation_id,
+            resources,
+        ))
     }
 
     /// Commit and wait for completion (blocking).

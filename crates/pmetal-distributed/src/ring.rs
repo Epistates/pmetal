@@ -162,7 +162,7 @@ mod verification {
     fn verify_get_chunk_range() {
         let len: usize = kani::any();
         let world_size: usize = kani::any();
-        
+
         // Preconditions
         kani::assume(world_size > 0 && world_size <= 16);
         kani::assume(len >= world_size && len < 1024);
@@ -181,14 +181,14 @@ mod verification {
 
         for i in 0..world_size {
             let (start, end) = get_chunk_range(i);
-            
+
             // Chunks must be valid ranges
             assert!(start <= end);
             // Chunks must be contiguous
             assert!(start == last_end);
             // Chunks must be within bounds
             assert!(end <= len);
-            
+
             total_elements += end - start;
             last_end = end;
         }

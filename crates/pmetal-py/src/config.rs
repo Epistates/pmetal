@@ -6,7 +6,7 @@ use pyo3::prelude::*;
 // LoRA Configuration
 // ---------------------------------------------------------------------------
 
-#[pyclass(from_py_object,name = "LoraConfig")]
+#[pyclass(from_py_object, name = "LoraConfig")]
 #[derive(Clone)]
 pub struct PyLoraConfig(pub(crate) pmetal_core::LoraConfig);
 
@@ -81,7 +81,7 @@ impl PyLoraConfig {
 // Training Configuration
 // ---------------------------------------------------------------------------
 
-#[pyclass(from_py_object,name = "TrainingConfig")]
+#[pyclass(from_py_object, name = "TrainingConfig")]
 #[derive(Clone)]
 pub struct PyTrainingConfig(pub(crate) pmetal_core::TrainingConfig);
 
@@ -197,7 +197,7 @@ impl PyTrainingConfig {
 // Generation Configuration
 // ---------------------------------------------------------------------------
 
-#[pyclass(from_py_object,name = "GenerationConfig")]
+#[pyclass(from_py_object, name = "GenerationConfig")]
 #[derive(Clone)]
 pub struct PyGenerationConfig(pub(crate) pmetal_models::GenerationConfig);
 
@@ -274,7 +274,7 @@ impl PyGenerationConfig {
 // DataLoader Configuration
 // ---------------------------------------------------------------------------
 
-#[pyclass(from_py_object,name = "DataLoaderConfig")]
+#[pyclass(from_py_object, name = "DataLoaderConfig")]
 #[derive(Clone)]
 pub struct PyDataLoaderConfig(pub(crate) pmetal_data::DataLoaderConfig);
 
@@ -337,7 +337,7 @@ impl PyDataLoaderConfig {
 // Enum wrappers
 // ---------------------------------------------------------------------------
 
-#[pyclass(from_py_object,name = "Dtype", eq)]
+#[pyclass(from_py_object, name = "Dtype", eq)]
 #[derive(Clone, PartialEq)]
 pub enum PyDtype {
     Float32,
@@ -383,7 +383,7 @@ impl From<pmetal_core::Dtype> for PyDtype {
     }
 }
 
-#[pyclass(from_py_object,name = "Quantization", eq)]
+#[pyclass(from_py_object, name = "Quantization", eq)]
 #[derive(Clone, PartialEq)]
 pub enum PyQuantization {
     None,
@@ -405,7 +405,7 @@ impl From<PyQuantization> for pmetal_core::Quantization {
     }
 }
 
-#[pyclass(from_py_object,name = "LoraBias", eq)]
+#[pyclass(from_py_object, name = "LoraBias", eq)]
 #[derive(Clone, PartialEq)]
 pub enum PyLoraBias {
     None,
@@ -413,7 +413,7 @@ pub enum PyLoraBias {
     LoraOnly,
 }
 
-#[pyclass(from_py_object,name = "LrSchedulerType", eq)]
+#[pyclass(from_py_object, name = "LrSchedulerType", eq)]
 #[derive(Clone, PartialEq)]
 pub enum PyLrSchedulerType {
     Constant,
@@ -423,7 +423,7 @@ pub enum PyLrSchedulerType {
     Polynomial,
 }
 
-#[pyclass(from_py_object,name = "OptimizerType", eq)]
+#[pyclass(from_py_object, name = "OptimizerType", eq)]
 #[derive(Clone, PartialEq)]
 pub enum PyOptimizerType {
     AdamW,
@@ -432,7 +432,7 @@ pub enum PyOptimizerType {
     Lion,
 }
 
-#[pyclass(from_py_object,name = "DatasetFormat", eq)]
+#[pyclass(from_py_object, name = "DatasetFormat", eq)]
 #[derive(Clone, PartialEq)]
 pub enum PyDatasetFormat {
     Simple,
@@ -454,7 +454,7 @@ impl From<PyDatasetFormat> for pmetal_data::DatasetFormat {
     }
 }
 
-#[pyclass(from_py_object,name = "ModelArchitecture", eq)]
+#[pyclass(from_py_object, name = "ModelArchitecture", eq)]
 #[derive(Clone, PartialEq)]
 pub enum PyModelArchitecture {
     Llama,

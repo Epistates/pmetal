@@ -131,15 +131,10 @@ impl PyTrainer {
                     let model_path = {
                         let _span = info_span!("model_resolve", model_id = %model_id).entered();
                         if is_hf_model_id(&model_id) {
-                            let path =
-                                pmetal_hub::download_model(&model_id, None, None).await?;
-                            let _ = pmetal_hub::download_file(
-                                &model_id,
-                                "tokenizer.json",
-                                None,
-                                None,
-                            )
-                            .await;
+                            let path = pmetal_hub::download_model(&model_id, None, None).await?;
+                            let _ =
+                                pmetal_hub::download_file(&model_id, "tokenizer.json", None, None)
+                                    .await;
                             let _ = pmetal_hub::download_file(
                                 &model_id,
                                 "tokenizer_config.json",
@@ -275,9 +270,8 @@ impl PyTrainer {
 
                     // Save weights
                     let weights_path = {
-                        let _span =
-                            info_span!("save_weights", output_dir = %output_dir.display())
-                                .entered();
+                        let _span = info_span!("save_weights", output_dir = %output_dir.display())
+                            .entered();
                         use pmetal_lora::TrainableModel;
                         let path = output_dir.join("lora_weights.safetensors");
                         model.save_lora_weights(&path).map_err(training_err)?;

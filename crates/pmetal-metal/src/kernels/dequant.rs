@@ -1,14 +1,11 @@
 //! Metal-accelerated dequantization kernels.
 
-use crate::{
-    context::MetalContext,
-    error::Result,
-};
-use objc2_metal::{
-    MTLSize, MTLCommandQueue, MTLComputeCommandEncoder, MTLCommandBuffer,
-    MTLComputePipelineState, MTLCommandEncoder
-};
+use crate::{context::MetalContext, error::Result};
 use objc2::runtime::ProtocolObject;
+use objc2_metal::{
+    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
+    MTLComputePipelineState, MTLSize,
+};
 
 /// Dequantization backend using Metal kernels.
 pub struct DequantKernels;

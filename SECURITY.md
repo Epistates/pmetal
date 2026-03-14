@@ -12,7 +12,7 @@ We take all security issues seriously and will respond to your initial report wi
 
 ## Security Practices
 
-PMetal follows "Google-Grade" security and robustness standards:
+PMetal follows "Enterprise-Grade" security and robustness standards:
 
 ### Continuous Fuzzing
 All parser endpoints, including the GGUF reader, are subjected to continuous fuzz testing via `cargo-fuzz`. This ensures that malformed inputs cannot cause panics, memory leaks, or execution of arbitrary code. Continuous fuzzing runs automatically on every Pull Request and via scheduled GitHub Actions.

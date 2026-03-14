@@ -363,9 +363,7 @@ pub struct Llama4ModRouter {
 
 impl Llama4ModRouter {
     pub fn new(hidden_size: i32) -> Result<Self, Exception> {
-        let gate = nn::LinearBuilder::new(hidden_size, 1)
-            .bias(false)
-            .build()?;
+        let gate = nn::LinearBuilder::new(hidden_size, 1).bias(false).build()?;
         Ok(Self { gate })
     }
 
@@ -380,11 +378,7 @@ impl Llama4ModRouter {
     /// - `selected_indices`: `[batch, k]` — positions of the selected tokens (i32)
     /// - `router_logits`:    `[batch, seq_len, 1]` — raw scalar logits from the linear gate
     /// - `top_k_mask`:       `[batch, seq_len]` — binary mask, 1.0 for selected tokens
-    pub fn route(
-        &mut self,
-        x: &Array,
-        capacity: f32,
-    ) -> Result<(Array, Array, Array), Exception> {
+    pub fn route(&mut self, x: &Array, capacity: f32) -> Result<(Array, Array, Array), Exception> {
         let batch = x.shape()[0];
         let seq_len = x.shape()[1];
 
@@ -395,7 +389,9 @@ impl Llama4ModRouter {
         let weights = router_logits.reshape(&[batch, seq_len])?;
 
         // k = floor(C * T), clamped to [1, T]
-        let k = ((capacity * seq_len as f32).floor() as i32).max(1).min(seq_len);
+        let k = ((capacity * seq_len as f32).floor() as i32)
+            .max(1)
+            .min(seq_len);
 
         // argpartition(-weights, -k, axis=-1) places the k largest at positions [-k..]
         // This is O(T) vs O(T log T) for argsort.
@@ -791,10 +787,15 @@ impl Llama4DecoderLayer {
         let batch = x.shape()[0];
         let seq_len = x.shape()[1];
         let hidden = x.shape()[2];
-        let k = ((capacity * seq_len as f32).floor() as i32).max(1).min(seq_len);
+        let k = ((capacity * seq_len as f32).floor() as i32)
+            .max(1)
+            .min(seq_len);
 
         // ---- Router ----
-        let router = self.mod_router.as_mut().expect("mod_router must be Some when forward_mod is called");
+        let router = self
+            .mod_router
+            .as_mut()
+            .expect("mod_router must be Some when forward_mod is called");
         let (selected_indices, router_logits, top_k_mask) = router.route(x, capacity)?;
         // selected_indices: [B, k]  (i32, seq-axis positions)
         // router_logits:    [B, T, 1]
@@ -1211,7 +1212,10 @@ mod tests {
         config.use_mod = false; // MoD globally disabled
 
         let mut layer = Llama4DecoderLayer::new(&config, 0).unwrap();
-        assert!(layer.mod_router.is_none(), "No MoD router when MoD is disabled");
+        assert!(
+            layer.mod_router.is_none(),
+            "No MoD router when MoD is disabled"
+        );
 
         let x = mlx_rs::random::normal::<f32>(&[1, 6, 32], None, None, None).unwrap();
         let out = layer.forward(&x, None, None).unwrap();
@@ -1273,7 +1277,10 @@ mod tests {
         logits.eval().unwrap();
 
         let aux = model.mod_aux_loss();
-        assert!(aux.is_some(), "mod_aux_loss should be Some after a forward pass with MoD enabled");
+        assert!(
+            aux.is_some(),
+            "mod_aux_loss should be Some after a forward pass with MoD enabled"
+        );
         let aux_val = aux.unwrap();
         aux_val.eval().unwrap();
         // Scalar or 0-d tensor expected.
