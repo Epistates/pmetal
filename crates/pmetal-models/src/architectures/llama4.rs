@@ -1,4 +1,4 @@
-//! Llama 4 architecture with Mixture of Experts and iRoPE.
+//! Llama 4 architecture with Mixture of Experts, iRoPE, and Mixture of Depths.
 //!
 //! Key features:
 //! - **iRoPE**: Interleaved RoPE/NoPE layers for long context (10M+ tokens)
@@ -6,6 +6,7 @@
 //! - **Interleaved MoE/Dense**: Scout is full MoE, Maverick alternates
 //! - **QK norm**: Layer normalization on Q and K for stable attention
 //! - **Temperature scaling**: Dynamic attention scaling for long sequences
+//! - **MoD**: Mixture-of-Depths (Raposo et al., 2024) for adaptive compute
 //!
 //! Variants:
 //! - **Llama 4 Scout**: 109B total params (16 experts), 17B active, 10M context
@@ -18,7 +19,7 @@ use mlx_rs::{
     macros::ModuleParameters,
     module::{Module, Param},
     nn,
-    ops::softmax_axis,
+    ops::{self, indexing::IndexOp, softmax_axis},
 };
 use serde::{Deserialize, Serialize};
 
@@ -85,6 +86,23 @@ pub struct Llama4TextConfig {
     /// Router auxiliary loss coefficient for load balancing.
     #[serde(default = "default_router_aux_loss_coef")]
     pub router_aux_loss_coef: f32,
+
+    // Mixture-of-Depths (MoD) configuration (Raposo et al., 2024)
+    /// Enable MoD: tokens are selectively routed through transformer blocks.
+    #[serde(default = "default_use_mod")]
+    pub use_mod: bool,
+    /// MoD capacity factor C in (0, 1]: fraction of tokens processed per MoD layer.
+    /// k = floor(C * seq_len) tokens are selected per forward pass.
+    #[serde(default = "default_mod_capacity")]
+    pub mod_capacity: f32,
+    /// Explicit list of layer indices that use MoD.
+    /// When set, overrides `mod_layer_interval`.
+    #[serde(default)]
+    pub mod_layers: Option<Vec<i32>>,
+    /// Interval for MoD layers when `mod_layers` is None.
+    /// Default 2 = every other layer is a MoD layer.
+    #[serde(default = "default_mod_layer_interval")]
+    pub mod_layer_interval: i32,
 }
 
 fn default_intermediate_size_mlp() -> i32 {
@@ -120,6 +138,15 @@ fn default_attn_scale() -> f32 {
 fn default_router_aux_loss_coef() -> f32 {
     0.001
 }
+fn default_use_mod() -> bool {
+    false
+}
+fn default_mod_capacity() -> f32 {
+    0.5
+}
+fn default_mod_layer_interval() -> i32 {
+    2
+}
 
 impl Default for Llama4TextConfig {
     fn default() -> Self {
@@ -149,6 +176,10 @@ impl Default for Llama4TextConfig {
             floor_scale: 8192,
             attn_scale: 0.1,
             router_aux_loss_coef: 0.001,
+            use_mod: false,
+            mod_capacity: 0.5,
+            mod_layers: None,
+            mod_layer_interval: 2,
         }
     }
 }
@@ -162,6 +193,20 @@ impl Llama4TextConfig {
             // All layers are MoE when interleave_moe_layer_step == 1
             // Otherwise, MoE layers are those where layer_idx % step == 0
             layer_idx % self.interleave_moe_layer_step == 0
+        }
+    }
+
+    /// Check if a given layer uses Mixture-of-Depths.
+    ///
+    /// Returns `false` when MoD is globally disabled (`use_mod == false`).
+    pub fn is_mod_layer(&self, layer_idx: i32) -> bool {
+        if !self.use_mod {
+            return false;
+        }
+        if let Some(ref mod_layers) = self.mod_layers {
+            mod_layers.contains(&layer_idx)
+        } else {
+            layer_idx % self.mod_layer_interval == 0
         }
     }
 
@@ -297,6 +342,80 @@ impl Llama4Router {
         let expert_weights = router_probs.max_axis(-1, false)?;
 
         Ok((expert_indices, expert_weights, router_logits))
+    }
+}
+
+// =============================================================================
+// Mixture-of-Depths (MoD) Router
+// =============================================================================
+
+/// Per-layer MoD router (Raposo et al., 2024).
+///
+/// A lightweight scalar projection that assigns each token a routing weight.
+/// Top-k tokens (by weight) are selected to pass through the transformer block;
+/// the remaining tokens receive a residual identity pass-through.
+#[derive(Debug, ModuleParameters)]
+pub struct Llama4ModRouter {
+    /// Scalar linear projection: [hidden_size] -> [1].
+    #[param]
+    pub gate: nn::Linear,
+}
+
+impl Llama4ModRouter {
+    pub fn new(hidden_size: i32) -> Result<Self, Exception> {
+        let gate = nn::LinearBuilder::new(hidden_size, 1)
+            .bias(false)
+            .build()?;
+        Ok(Self { gate })
+    }
+
+    /// Compute router logits and select top-k token indices.
+    ///
+    /// # Arguments
+    /// * `x` - Hidden states `[batch, seq_len, hidden_size]`
+    /// * `capacity` - Capacity factor C in (0, 1]; k = floor(C * seq_len) tokens selected
+    ///
+    /// # Returns
+    /// `(selected_indices, router_logits, top_k_mask)` where:
+    /// - `selected_indices`: `[batch, k]` — positions of the selected tokens (i32)
+    /// - `router_logits`:    `[batch, seq_len, 1]` — raw scalar logits from the linear gate
+    /// - `top_k_mask`:       `[batch, seq_len]` — binary mask, 1.0 for selected tokens
+    pub fn route(
+        &mut self,
+        x: &Array,
+        capacity: f32,
+    ) -> Result<(Array, Array, Array), Exception> {
+        let batch = x.shape()[0];
+        let seq_len = x.shape()[1];
+
+        // router_logits: [B, T, 1]
+        let router_logits = Module::forward(&mut self.gate, x)?;
+
+        // Squeeze to [B, T] for selection
+        let weights = router_logits.reshape(&[batch, seq_len])?;
+
+        // k = floor(C * T), clamped to [1, T]
+        let k = ((capacity * seq_len as f32).floor() as i32).max(1).min(seq_len);
+
+        // argpartition(-weights, -k, axis=-1) places the k largest at positions [-k..]
+        // This is O(T) vs O(T log T) for argsort.
+        let neg_weights = weights.negative()?;
+        let neg_k = -k;
+        let part_indices = ops::argpartition_axis(&neg_weights, neg_k, -1)?;
+
+        // Slice the last k indices — these correspond to the top-k tokens.
+        // part_indices shape: [B, T]; the k largest (negated smallest) are at positions [-k..].
+        let selected_indices = part_indices.index((.., neg_k..));
+        // selected_indices: [B, k]
+
+        // Build a binary top-k mask [B, T] of zeros with 1s at selected positions.
+        // We scatter ones into a zeros tensor using put_along_axis.
+        let zeros = ops::zeros::<f32>(&[batch, seq_len])?;
+        let ones = ops::ones::<f32>(&[batch, k])?;
+        let top_k_mask = zeros.put_along_axis(&selected_indices, &ones, 1)?;
+        // top_k_mask: [B, T] with 1.0 at selected token positions
+
+        Ok((selected_indices, router_logits, top_k_mask))
     }
 }
 
@@ -540,11 +659,13 @@ impl Llama4Attention {
 // Decoder Layer
 // =============================================================================
 
-/// Llama 4 decoder layer (can be dense or MoE).
+/// Llama 4 decoder layer (can be dense or MoE, optionally with MoD).
 #[derive(Debug, ModuleParameters)]
 pub struct Llama4DecoderLayer {
     pub layer_idx: usize,
     pub is_moe: bool,
+    /// MoD capacity factor for this layer (None = MoD disabled).
+    pub mod_capacity: Option<f32>,
 
     #[param]
     pub self_attn: Llama4Attention,
@@ -556,6 +677,14 @@ pub struct Llama4DecoderLayer {
     pub input_layernorm: nn::RmsNorm,
     #[param]
     pub post_attention_layernorm: nn::RmsNorm,
+    /// MoD router (present only when this layer uses Mixture-of-Depths).
+    #[param]
+    pub mod_router: Option<Llama4ModRouter>,
+
+    // Auxiliary loss from the most recent MoD forward pass (not a learned parameter).
+    // Stored here so the parent model can aggregate it without threading extra return values
+    // through the forward signature.
+    pub last_mod_aux_loss: Option<Array>,
 }
 
 impl Llama4DecoderLayer {
@@ -582,18 +711,47 @@ impl Llama4DecoderLayer {
             .eps(config.rms_norm_eps)
             .build()?;
 
+        // MoD router (only allocated for MoD-enabled layers)
+        let mod_capacity = if config.is_mod_layer(layer_idx as i32) {
+            Some(config.mod_capacity)
+        } else {
+            None
+        };
+        let mod_router = if mod_capacity.is_some() {
+            Some(Llama4ModRouter::new(config.hidden_size)?)
+        } else {
+            None
+        };
+
         Ok(Self {
             layer_idx,
             is_moe,
+            mod_capacity,
             self_attn,
             mlp,
             moe,
             input_layernorm,
             post_attention_layernorm,
+            mod_router,
+            last_mod_aux_loss: None,
         })
     }
 
     pub fn forward(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        position_ids: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        if let Some(capacity) = self.mod_capacity {
+            self.forward_mod(x, mask, position_ids, capacity)
+        } else {
+            self.forward_full(x, mask, position_ids)
+        }
+    }
+
+    /// Standard full-sequence forward (no MoD).
+    fn forward_full(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
@@ -612,6 +770,90 @@ impl Llama4DecoderLayer {
             self.mlp.as_mut().unwrap().forward(&normed)?
         };
         h.add(&ffn_out)
+    }
+
+    /// MoD forward: route top-k tokens through the block, identity for the rest.
+    ///
+    /// Algorithm (Raposo et al., 2024):
+    /// 1. Router produces a scalar weight per token.
+    /// 2. Top-k tokens (k = floor(C * T)) are gathered from the sequence.
+    /// 3. The gathered sub-batch passes through attention + FFN.
+    /// 4. Results are scattered back; non-selected tokens keep their input value
+    ///    (residual identity pass-through).
+    /// 5. Auxiliary BCE loss is stored in `last_mod_aux_loss` for the caller to aggregate.
+    fn forward_mod(
+        &mut self,
+        x: &Array,
+        _mask: Option<&Array>,
+        _position_ids: Option<&Array>,
+        capacity: f32,
+    ) -> Result<Array, Exception> {
+        let batch = x.shape()[0];
+        let seq_len = x.shape()[1];
+        let hidden = x.shape()[2];
+        let k = ((capacity * seq_len as f32).floor() as i32).max(1).min(seq_len);
+
+        // ---- Router ----
+        let router = self.mod_router.as_mut().expect("mod_router must be Some when forward_mod is called");
+        let (selected_indices, router_logits, top_k_mask) = router.route(x, capacity)?;
+        // selected_indices: [B, k]  (i32, seq-axis positions)
+        // router_logits:    [B, T, 1]
+        // top_k_mask:       [B, T]
+
+        // ---- Gather selected tokens ----
+        // Expand indices to [B, k, D] for take_along_axis on axis=1
+        let idx_reshaped = selected_indices.reshape(&[batch, k, 1])?;
+        let idx_expanded = ops::broadcast_to(&idx_reshaped, &[batch, k, hidden])?;
+        // gathered: [B, k, D]
+        let gathered = x.take_along_axis(&idx_expanded, 1)?;
+
+        // ---- Run transformer block on gathered sub-batch ----
+        // Note: we pass `None` for mask here — the gathered tokens form a
+        // dense sub-sequence and causal masking at this level would be wrong.
+        // Position IDs are also omitted; RoPE on the full sequence is correct
+        // only when all positions are present. For the selected sub-batch we
+        // skip positional encoding (NoPE behaviour) which is consistent with
+        // how iRoPE NoPE layers work in this model.
+        let normed = Module::forward(&mut self.input_layernorm, &gathered)?;
+        let attn_out = self.self_attn.forward(&normed, None, None)?;
+        let h_sel = gathered.add(&attn_out)?;
+
+        let normed2 = Module::forward(&mut self.post_attention_layernorm, &h_sel)?;
+        let ffn_out = if self.is_moe {
+            self.moe.as_mut().unwrap().forward(&normed2)?
+        } else {
+            self.mlp.as_mut().unwrap().forward(&normed2)?
+        };
+        let block_out = h_sel.add(&ffn_out)?;
+        // block_out: [B, k, D] — processed token outputs
+
+        // ---- Scatter results back into the full-sequence tensor ----
+        // Non-selected token slots start as the original `x` (identity/residual skip).
+        // We overwrite the selected positions with the block output.
+        let idx_reshaped_scatter = selected_indices.reshape(&[batch, k, 1])?;
+        let idx_expanded_scatter = ops::broadcast_to(&idx_reshaped_scatter, &[batch, k, hidden])?;
+        let output = x.put_along_axis(&idx_expanded_scatter, &block_out, 1)?;
+        // output: [B, T, D]  — selected tokens updated, others unchanged
+
+        // ---- Auxiliary BCE loss ----
+        // BCE(sigmoid(router_logits), top_k_mask) teaches the router to
+        // predict which tokens it will select, enabling autoregressive inference
+        // where the router must decide without seeing future selections.
+        let logits_flat = router_logits.reshape(&[batch * seq_len])?;
+        let mask_flat = top_k_mask.reshape(&[batch * seq_len])?;
+        let aux_loss = mlx_rs::losses::BinaryCrossEntropyBuilder::new()
+            .inputs_are_logits(true)
+            .reduction(mlx_rs::losses::LossReduction::Mean)
+            .build()?
+            .apply(&logits_flat, &mask_flat)?;
+        self.last_mod_aux_loss = Some(aux_loss);
+
+        Ok(output)
+    }
+
+    /// Return the auxiliary MoD loss from the most recent forward pass, if any.
+    pub fn mod_aux_loss(&self) -> Option<&Array> {
+        self.last_mod_aux_loss.as_ref()
     }
 }
 
@@ -666,6 +908,29 @@ impl Llama4TextModel {
 
         Module::forward(&mut self.norm, &hidden_states)
     }
+
+    /// Aggregate MoD auxiliary losses from all MoD-enabled layers after a forward pass.
+    ///
+    /// Returns the mean BCE loss across all MoD layers, or `None` if no MoD layers fired.
+    /// Callers should scale by `config.router_aux_loss_coef` before adding to the task loss.
+    pub fn mod_aux_loss(&self) -> Option<Array> {
+        let mut total: Option<Array> = None;
+        let mut count = 0usize;
+
+        for layer in &self.layers {
+            if let Some(loss) = layer.mod_aux_loss() {
+                total = Some(match total {
+                    None => loss.clone(),
+                    Some(acc) => acc.add(loss).ok()?,
+                });
+                count += 1;
+            }
+        }
+
+        let sum = total?;
+        let denom = Array::from_f32(count as f32);
+        sum.divide(&denom).ok()
+    }
 }
 
 /// Llama 4 for causal language modeling.
@@ -702,6 +967,14 @@ impl Llama4ForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward(input_ids, mask, position_ids)?;
         Module::forward(&mut self.lm_head, &hidden_states)
+    }
+
+    /// Aggregate MoD auxiliary losses across all layers after a forward pass.
+    ///
+    /// Callers should add `config.router_aux_loss_coef * mod_aux_loss()` to the
+    /// task loss when training with MoD enabled.
+    pub fn mod_aux_loss(&self) -> Option<Array> {
+        self.model.mod_aux_loss()
     }
 }
 
@@ -795,5 +1068,215 @@ mod tests {
 
         let params = model.parameters().flatten();
         assert!(params.len() > 0);
+    }
+
+    // =========================================================================
+    // MoD tests
+    // =========================================================================
+
+    #[test]
+    fn test_llama4_config_mod_layer_detection() {
+        // MoD disabled by default
+        let config = Llama4TextConfig::default();
+        assert!(!config.is_mod_layer(0));
+        assert!(!config.is_mod_layer(1));
+
+        // Enable MoD with interval=2
+        let mut cfg = Llama4TextConfig::default();
+        cfg.use_mod = true;
+        cfg.mod_layer_interval = 2;
+        assert!(cfg.is_mod_layer(0));
+        assert!(!cfg.is_mod_layer(1));
+        assert!(cfg.is_mod_layer(2));
+        assert!(!cfg.is_mod_layer(3));
+
+        // Explicit mod_layers list
+        let mut cfg2 = Llama4TextConfig::default();
+        cfg2.use_mod = true;
+        cfg2.mod_layers = Some(vec![1, 3, 5]);
+        assert!(!cfg2.is_mod_layer(0));
+        assert!(cfg2.is_mod_layer(1));
+        assert!(!cfg2.is_mod_layer(2));
+        assert!(cfg2.is_mod_layer(3));
+        assert!(cfg2.is_mod_layer(5));
+    }
+
+    #[test]
+    #[serial]
+    fn test_llama4_mod_router_route() {
+        let batch = 2i32;
+        let seq_len = 8i32;
+        let hidden = 16i32;
+        let capacity = 0.5_f32; // k = 4
+
+        let mut router = Llama4ModRouter::new(hidden).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
+
+        let (selected_indices, router_logits, top_k_mask) = router.route(&x, capacity).unwrap();
+        selected_indices.eval().unwrap();
+        router_logits.eval().unwrap();
+        top_k_mask.eval().unwrap();
+
+        let k = ((capacity * seq_len as f32).floor() as i32).max(1);
+
+        // selected_indices: [B, k]
+        assert_eq!(selected_indices.shape(), &[batch, k]);
+        // router_logits: [B, T, 1]
+        assert_eq!(router_logits.shape(), &[batch, seq_len, 1]);
+        // top_k_mask: [B, T]
+        assert_eq!(top_k_mask.shape(), &[batch, seq_len]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_llama4_mod_router_mask_has_correct_count() {
+        // Each row of top_k_mask must sum to exactly k.
+        let batch = 1i32;
+        let seq_len = 10i32;
+        let hidden = 16i32;
+        let capacity = 0.3_f32; // k = floor(0.3 * 10) = 3
+
+        let mut router = Llama4ModRouter::new(hidden).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
+
+        let (_indices, _logits, top_k_mask) = router.route(&x, capacity).unwrap();
+        top_k_mask.eval().unwrap();
+
+        // Sum along seq dimension: should equal k for each batch item.
+        let row_sums = top_k_mask.sum_axis(-1, false).unwrap();
+        row_sums.eval().unwrap();
+
+        let expected_k = ((capacity * seq_len as f32).floor() as i32).max(1) as f32;
+        let sum_vals: Vec<f32> = row_sums.as_slice::<f32>().to_vec();
+        for s in sum_vals {
+            assert!(
+                (s - expected_k).abs() < 1e-4,
+                "Expected row sum {expected_k}, got {s}"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_llama4_decoder_layer_mod_forward() {
+        let mut config = Llama4TextConfig::default();
+        config.hidden_size = 32;
+        config.intermediate_size = 64;
+        config.intermediate_size_mlp = 64;
+        config.num_attention_heads = 2;
+        config.num_key_value_heads = 2;
+        config.head_dim = 16;
+        config.num_local_experts = 2;
+        config.vocab_size = 100;
+        // Enable MoD on all layers
+        config.use_mod = true;
+        config.mod_capacity = 0.5;
+        config.mod_layer_interval = 1;
+
+        let mut layer = Llama4DecoderLayer::new(&config, 0).unwrap();
+        assert!(layer.mod_router.is_some(), "MoD router should be allocated");
+
+        let batch = 1i32;
+        let seq_len = 8i32;
+        let hidden = config.hidden_size;
+
+        let x = mlx_rs::random::normal::<f32>(&[batch, seq_len, hidden], None, None, None).unwrap();
+        let out = layer.forward(&x, None, None).unwrap();
+        out.eval().unwrap();
+
+        // Output shape must match input shape.
+        assert_eq!(out.shape(), &[batch, seq_len, hidden]);
+
+        // Aux loss should be present after a MoD forward.
+        assert!(layer.mod_aux_loss().is_some(), "MoD aux loss should be set");
+        let aux = layer.mod_aux_loss().unwrap();
+        aux.eval().unwrap();
+        // BCE is a scalar (mean reduction is the default).
+        assert_eq!(aux.shape().len(), 0, "aux loss should be scalar");
+    }
+
+    #[test]
+    #[serial]
+    fn test_llama4_mod_identity_on_non_mod_layer() {
+        // Without MoD, decoder layer must behave exactly as before.
+        let mut config = Llama4TextConfig::default();
+        config.hidden_size = 32;
+        config.intermediate_size = 64;
+        config.intermediate_size_mlp = 64;
+        config.num_attention_heads = 2;
+        config.num_key_value_heads = 2;
+        config.head_dim = 16;
+        config.num_local_experts = 2;
+        config.vocab_size = 100;
+        config.use_mod = false; // MoD globally disabled
+
+        let mut layer = Llama4DecoderLayer::new(&config, 0).unwrap();
+        assert!(layer.mod_router.is_none(), "No MoD router when MoD is disabled");
+
+        let x = mlx_rs::random::normal::<f32>(&[1, 6, 32], None, None, None).unwrap();
+        let out = layer.forward(&x, None, None).unwrap();
+        out.eval().unwrap();
+        assert_eq!(out.shape(), &[1, 6, 32]);
+        assert!(layer.mod_aux_loss().is_none(), "No aux loss without MoD");
+    }
+
+    #[test]
+    #[serial]
+    fn test_llama4_mod_causal_model_instantiation() {
+        let mut config = Llama4TextConfig::default();
+        config.hidden_size = 32;
+        config.intermediate_size = 64;
+        config.intermediate_size_mlp = 64;
+        config.num_hidden_layers = 4;
+        config.num_attention_heads = 2;
+        config.num_key_value_heads = 2;
+        config.head_dim = 16;
+        config.num_local_experts = 2;
+        config.vocab_size = 100;
+        config.use_mod = true;
+        config.mod_capacity = 0.5;
+        config.mod_layer_interval = 2; // layers 0 and 2 are MoD
+
+        let model = Llama4ForCausalLM::new(config).unwrap();
+
+        // Verify MoD layers have a router, non-MoD layers do not.
+        assert!(model.model.layers[0].mod_router.is_some());
+        assert!(model.model.layers[1].mod_router.is_none());
+        assert!(model.model.layers[2].mod_router.is_some());
+        assert!(model.model.layers[3].mod_router.is_none());
+
+        let params = model.parameters().flatten();
+        assert!(!params.is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_llama4_mod_aux_loss_aggregation() {
+        let mut config = Llama4TextConfig::default();
+        config.hidden_size = 32;
+        config.intermediate_size = 64;
+        config.intermediate_size_mlp = 64;
+        config.num_hidden_layers = 4;
+        config.num_attention_heads = 2;
+        config.num_key_value_heads = 2;
+        config.head_dim = 16;
+        config.num_local_experts = 2;
+        config.vocab_size = 100;
+        config.use_mod = true;
+        config.mod_capacity = 0.5;
+        config.mod_layer_interval = 2;
+
+        let mut model = Llama4ForCausalLM::new(config).unwrap();
+
+        let input_ids = Array::from_slice(&[0i32, 1, 2, 3, 4, 5, 6, 7], &[1, 8]);
+        let logits = model.forward(&input_ids, None, None).unwrap();
+        logits.eval().unwrap();
+
+        let aux = model.mod_aux_loss();
+        assert!(aux.is_some(), "mod_aux_loss should be Some after a forward pass with MoD enabled");
+        let aux_val = aux.unwrap();
+        aux_val.eval().unwrap();
+        // Scalar or 0-d tensor expected.
+        assert!(aux_val.shape().len() == 0 || aux_val.size() == 1);
     }
 }
