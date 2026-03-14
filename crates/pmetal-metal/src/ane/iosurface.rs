@@ -181,6 +181,96 @@ impl IoSurface {
         }
     }
 
+    /// Write `[channels, act_cols]` f32 data into a surface with a larger spatial stride.
+    ///
+    /// The surface has `sp = stride_sp` total spatial columns per channel.
+    /// This writes `data[ch * act_cols .. (ch+1) * act_cols]` into
+    /// `surface[ch_offset + ch][0 .. act_cols]`, leaving the remaining
+    /// `stride_sp - act_cols` columns in each row **unchanged**.
+    ///
+    /// Used when a single channel block needs its activation columns filled while
+    /// weight columns in the same row are written separately (e.g., `sdpa_bwd1`
+    /// where `Q, K, V` blocks have only activation data and `dy` block has both
+    /// activation data and weight columns for the `Wo^T` matmul).
+    pub fn write_f32_strided_at(
+        &self,
+        ch_offset: usize,
+        data: &[f32],
+        channels: usize,
+        act_cols: usize,
+        stride_sp: usize,
+    ) {
+        debug_assert_eq!(data.len(), channels * act_cols);
+        debug_assert!((ch_offset + channels) * stride_sp * 4 <= self.size_bytes);
+
+        unsafe {
+            ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
+            let base = ffi::IOSurfaceGetBaseAddress(self.surface) as *mut f32;
+
+            for ch in 0..channels {
+                let src = data.as_ptr().add(ch * act_cols);
+                let dst = base.add((ch_offset + ch) * stride_sp);
+                std::ptr::copy_nonoverlapping(src, dst, act_cols);
+            }
+
+            ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut());
+        }
+    }
+
+    /// Write `[channels, data_cols]` f32 data at a specific channel AND column offset.
+    ///
+    /// Writes `data[ch * data_cols .. (ch+1) * data_cols]` into
+    /// `surface[ch_offset + ch][col_offset .. col_offset + data_cols]`
+    /// for each `ch` in `0..channels`, leaving other columns unchanged.
+    ///
+    /// Used to write weight rows (e.g., Wo^T) into the spatial weight columns of
+    /// a packed IOSurface where activation columns start at 0 and weight columns
+    /// start at `col_offset = seq_len`.
+    pub fn write_f32_at_col_offset(
+        &self,
+        ch_offset: usize,
+        data: &[f32],
+        channels: usize,
+        data_cols: usize,
+        col_offset: usize,
+        stride_sp: usize,
+    ) {
+        debug_assert_eq!(data.len(), channels * data_cols);
+        debug_assert!((ch_offset + channels) * stride_sp * 4 <= self.size_bytes);
+        debug_assert!(col_offset + data_cols <= stride_sp);
+
+        unsafe {
+            ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
+            let base = ffi::IOSurfaceGetBaseAddress(self.surface) as *mut f32;
+
+            for ch in 0..channels {
+                let src = data.as_ptr().add(ch * data_cols);
+                let dst = base.add((ch_offset + ch) * stride_sp + col_offset);
+                std::ptr::copy_nonoverlapping(src, dst, data_cols);
+            }
+
+            ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut());
+        }
+    }
+
+    /// Zero-fill a channel range within an fp32 IOSurface.
+    ///
+    /// Zeroes `channels * stride_sp` f32 elements starting at `ch_offset`.
+    /// Used to clear padding columns before writing activation data with
+    /// `write_f32_strided_at`.
+    pub fn zero_channel_range_f32(&self, ch_offset: usize, channels: usize, stride_sp: usize) {
+        let n = channels * stride_sp;
+        let offset = ch_offset * stride_sp;
+        debug_assert!((offset + n) * 4 <= self.size_bytes);
+
+        unsafe {
+            ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
+            let base = ffi::IOSurfaceGetBaseAddress(self.surface) as *mut f32;
+            std::ptr::write_bytes(base.add(offset), 0, n);
+            ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut());
+        }
+    }
+
     /// Write packed fp32 data for the dynamic weight pipeline.
     ///
     /// Packs activations and weight columns into a single IOSurface using

@@ -283,13 +283,20 @@ impl LayerGradients {
 /// Per-layer saved activations (f32, channel-first [D, S]).
 struct LayerActivations {
     layer_in: Vec<f32>,
+    /// Pre-norm for the attention block: RMSNorm(layer_in).
     xnorm: Vec<f32>,
     q: Vec<f32>,
     k: Vec<f32>,
     v: Vec<f32>,
     attn_out: Vec<f32>,
     o_out: Vec<f32>,
+    /// Residual after attention: x2 = layer_in + o_out.
     x2: Vec<f32>,
+    /// Pre-norm for the FFN block: RMSNorm(x2).
+    ///
+    /// Computed on CPU so the backward pass can form dW1 = dh1 @ x2norm^T
+    /// and dW3 = dh3 @ x2norm^T correctly. The fused ANE FFN kernel also
+    /// computes this norm internally but does not surface it as a tap.
     x2norm: Vec<f32>,
     h1: Vec<f32>,
     h3: Vec<f32>,
@@ -325,17 +332,20 @@ pub struct StepTimings {
 /// single-matmul kernel that compiles reliably at any model scale.
 struct DynamicKernels {
     /// Projection kernels indexed by (input_channels, output_channels).
-    /// Shared across forward and backward (e.g. Q fwd and Wo^T bwd use
-    /// the same (dim, q_dim) kernel with different weights).
     projections: HashMap<(usize, usize), AneModel>,
-    /// Attention-only kernel (Q, K, V → attn_out).
-    sdpa_attn: AneModel,
+    /// Fused SDPA forward (RMSNorm + QKV + Attn + Wo).
+    sdpa_fwd: AneModel,
+    /// Fused FFN forward (RMSNorm + W1 + W3 + SiLU + W2).
+    ffn_fwd: AneModel,
     /// SDPA backward part 1 (dV, probs, dp).
     sdpa_bwd1: AneModel,
     /// SDPA backward part 2 (dQ, dK).
     sdpa_bwd2: AneModel,
-    /// Softmax kernel for cross-entropy (no weights, compile once).
-    /// None if compilation failed (falls back to CPU softmax).
+    /// FFN backward W2^T.
+    ffn_bwd_w2t: AneModel,
+    /// FFN backward W1^T + W3^T.
+    ffn_bwd_w13t: AneModel,
+    /// Softmax kernel for cross-entropy.
     softmax: Option<AneModel>,
 }
 
@@ -344,16 +354,22 @@ struct DynIoPool {
     /// Projection IO surfaces indexed by (IC, OC).
     proj_inputs: HashMap<(usize, usize), IoSurface>,
     proj_outputs: HashMap<(usize, usize), IoSurface>,
-    /// Attention IO surfaces (fp32).
-    sdpa_attn_in: IoSurface,
-    sdpa_attn_out: IoSurface,
+    /// Fused forward IOSurfaces.
+    sdpa_fwd_in: IoSurface,
+    sdpa_fwd_out: IoSurface,
+    ffn_fwd_in: IoSurface,
+    ffn_fwd_out: IoSurface,
     /// SDPA backward IO surfaces (fp16).
     sdpa_bwd1_in: IoSurface,
     sdpa_bwd1_out: IoSurface,
     sdpa_bwd2_in: IoSurface,
     sdpa_bwd2_out: IoSurface,
+    /// FFN backward IO surfaces.
+    ffn_bwd_w2t_in: IoSurface,
+    ffn_bwd_w2t_out: IoSurface,
+    ffn_bwd_w13t_in: IoSurface,
+    ffn_bwd_w13t_out: IoSurface,
     /// Softmax IO surfaces (fp16, compact_vocab × seq).
-    /// None if softmax kernel compilation failed.
     softmax_in: Option<IoSurface>,
     softmax_out: Option<IoSurface>,
 }
@@ -637,7 +653,7 @@ impl DynamicAneTrainer {
                 rt.compile(out.mil_text.as_bytes(), wd)
             };
 
-        // 1. Determine unique projection shapes needed
+        // 1. Determine unique projection shapes needed (Fallback/Hybrid)
         let mut proj_shapes: Vec<(usize, usize)> = vec![
             (d, qd),  // Q fwd, Wo^T bwd
             (d, kvd), // K fwd, V fwd
@@ -649,39 +665,37 @@ impl DynamicAneTrainer {
         proj_shapes.sort();
         proj_shapes.dedup();
 
-        let kernel_count = proj_shapes.len() + 3; // projections + attn + bwd1 + bwd2
+        let kernel_count = proj_shapes.len() + 6; // projections + fused(2) + bwd1 + bwd2 + bwd_ffn(2)
         info!(
             kernels = kernel_count,
             projection_shapes = proj_shapes.len(),
             gqa = is_gqa,
-            n_heads = self.kernel_config.n_heads,
-            n_kv_heads = self.kernel_config.n_kv_heads,
-            "Compiling decomposed ANE kernels (one-time)..."
+            "Compiling ANE performance frontier kernels..."
         );
 
-        // 2. Compile one projection kernel per unique (IC, OC) shape
+        // 2. Compile projection kernels (retained for flexibility/caching)
         let mut projections = HashMap::new();
         let mut proj_inputs = HashMap::new();
         let mut proj_outputs = HashMap::new();
-
         for &(ic, oc) in &proj_shapes {
             let out = dynamic_kernel::gen_dynamic_projection(ic, oc, s);
-            let name = format!("proj_{ic}x{oc}");
-            let io_mb = ic as f64 * (s + oc) as f64 * 4.0 / 1_048_576.0;
-            debug!(ic, oc, io_mb = format!("{io_mb:.1}"), "Projection kernel");
-            let model = compile(&out, rt, &name)?;
+            let model = compile(&out, rt, &format!("proj_{ic}x{oc}"))?;
             projections.insert((ic, oc), model);
             proj_inputs.insert((ic, oc), IoSurface::for_tensor_f32(ic, s + oc)?);
             proj_outputs.insert((ic, oc), IoSurface::for_tensor_f32(oc, s)?);
             self.compile_count += 1;
         }
 
-        // 3. Compile attention-only kernel
-        let attn_out = dynamic_kernel::gen_dynamic_sdpa_attn(&dkc);
-        let sdpa_attn = compile(&attn_out, rt, "sdpa_attn")?;
+        // 3. Compile Fused Forward Kernels
+        let k1 = dynamic_kernel::gen_dynamic_sdpa_fwd(&dkc);
+        let sdpa_fwd = compile(&k1, rt, "sdpa_fwd")?;
         self.compile_count += 1;
 
-        // 4. Compile SDPA backward kernels (unchanged — no dynamic weights)
+        let k2 = dynamic_kernel::gen_dynamic_ffn_w13(&dkc);
+        let ffn_fwd = compile(&k2, rt, "ffn_fwd")?;
+        self.compile_count += 1;
+
+        // 4. Compile Backward Kernels
         let k7 = dynamic_kernel::gen_dynamic_sdpa_bwd1(&dkc);
         let sdpa_bwd1 = compile(&k7, rt, "sdpa_bwd1")?;
         self.compile_count += 1;
@@ -690,44 +704,33 @@ impl DynamicAneTrainer {
         let sdpa_bwd2 = compile(&k8, rt, "sdpa_bwd2")?;
         self.compile_count += 1;
 
-        // 5. Compile softmax kernel (optional — falls back to CPU on failure)
-        let softmax_vocab = self
-            .vocab_map
-            .as_ref()
-            .map(|vm| vm.compact_vocab)
-            .unwrap_or(self.config.vocab_size);
+        let k4 = dynamic_kernel::gen_dynamic_ffn_bwd_w2t(&dkc);
+        let ffn_bwd_w2t = compile(&k4, rt, "ffn_bwd_w2t")?;
+        self.compile_count += 1;
+
+        let k5 = dynamic_kernel::gen_dynamic_ffn_bwd_w13t(&dkc);
+        let ffn_bwd_w13t = compile(&k5, rt, "ffn_bwd_w13t")?;
+        self.compile_count += 1;
+
+        // 5. Softmax (optional)
+        let softmax_vocab = self.vocab_map.as_ref().map(|vm| vm.compact_vocab).unwrap_or(self.config.vocab_size);
         let (softmax_kern, softmax_in, softmax_out) = {
             let sm_out = dynamic_kernel::gen_dynamic_softmax(softmax_vocab, s);
             match compile(&sm_out, rt, "softmax") {
                 Ok(model) => {
                     self.compile_count += 1;
-                    info!(
-                        vocab = softmax_vocab,
-                        seq = s,
-                        "Compiled softmax kernel for ANE cross-entropy"
-                    );
                     let sm_in = IoSurface::for_tensor(softmax_vocab, s)?;
                     let sm_out_io = IoSurface::for_tensor(softmax_vocab, s)?;
                     (Some(model), Some(sm_in), Some(sm_out_io))
                 }
-                Err(e) => {
-                    info!(
-                        "Softmax kernel compilation failed ({}), using CPU softmax",
-                        e
-                    );
-                    (None, None, None)
-                }
+                Err(_) => (None, None, None),
             }
         };
 
-        info!(
-            "All {} dynamic kernels compiled. Total compiles: {}",
-            kernel_count, self.compile_count
-        );
-
-        // 6. Allocate IOSurface pool
-        let attn_in_ch = qd + 2 * kvd;
-        let bwd1_in_ch = 2 * qd + 2 * kvd;
+        // 6. Allocate IOSurface pool for fused kernels
+        let sdpa_fwd_sp = s + 1 + 2 * qd + 2 * kvd;
+        let ffn_fwd_sp = s + 1 + 2 * h;
+        let bwd1_in_ch = qd + 2 * kvd + d;
         let bwd1_out_ch = kvd + 2 * score_ch;
         let bwd2_in_ch = 2 * score_ch + qd + kvd;
         let bwd2_out_ch = qd + kvd;
@@ -735,21 +738,30 @@ impl DynamicAneTrainer {
         let io_pool = DynIoPool {
             proj_inputs,
             proj_outputs,
-            sdpa_attn_in: IoSurface::for_tensor_f32(attn_in_ch, s)?,
-            sdpa_attn_out: IoSurface::for_tensor_f32(qd, s)?,
-            sdpa_bwd1_in: IoSurface::for_tensor(bwd1_in_ch, s)?,
-            sdpa_bwd1_out: IoSurface::for_tensor(bwd1_out_ch, s)?,
-            sdpa_bwd2_in: IoSurface::for_tensor(bwd2_in_ch, s)?,
-            sdpa_bwd2_out: IoSurface::for_tensor(bwd2_out_ch, s)?,
+            sdpa_fwd_in: IoSurface::for_tensor_f32(d, sdpa_fwd_sp)?,
+            sdpa_fwd_out: IoSurface::for_tensor_f32(2 * d + 2 * qd + 2 * kvd, s)?,
+            ffn_fwd_in: IoSurface::for_tensor_f32(d, ffn_fwd_sp)?,
+            ffn_fwd_out: IoSurface::for_tensor_f32(3 * h, s)?,
+            sdpa_bwd1_in: IoSurface::for_tensor_f32(bwd1_in_ch, s + qd)?,
+            sdpa_bwd1_out: IoSurface::for_tensor_f32(bwd1_out_ch, s)?,
+            sdpa_bwd2_in: IoSurface::for_tensor_f32(bwd2_in_ch, s)?,
+            sdpa_bwd2_out: IoSurface::for_tensor_f32(bwd2_out_ch, s)?,
+            ffn_bwd_w2t_in: IoSurface::for_tensor_f32(d, s + h)?,
+            ffn_bwd_w2t_out: IoSurface::for_tensor_f32(h, s)?,
+            ffn_bwd_w13t_in: IoSurface::for_tensor_f32(h, 2 * s + 2 * d)?,
+            ffn_bwd_w13t_out: IoSurface::for_tensor_f32(d, s)?,
             softmax_in,
             softmax_out,
         };
 
         self.kernels = Some(DynamicKernels {
             projections,
-            sdpa_attn,
+            sdpa_fwd,
+            ffn_fwd,
             sdpa_bwd1,
             sdpa_bwd2,
+            ffn_bwd_w2t,
+            ffn_bwd_w13t,
             softmax: softmax_kern,
         });
         self.io_pool = Some(io_pool);
@@ -836,55 +848,54 @@ impl DynamicAneTrainer {
             .as_ref()
             .ok_or_else(|| MetalError::InvalidConfig("IO pool not allocated".into()))?;
 
-        // ====== Attention Block ======
-
-        // 1. RMSNorm on CPU
-        accelerate::rmsnorm(
-            &mut acts.xnorm,
+        // ====== Fused Attention Block (ANE) ======
+        // Input layout: x [d, s], rms_w [d, 1], wq [d, qd], wk [d, kvd], wv [d, kvd], wo [d, qd]
+        io.sdpa_fwd_in.write_packed_f32(
             x,
-            &lw.rms_att,
+            &[
+                (&lw.rms_att, 1),
+                (&lw.wq, qd),
+                (&lw.wk, kvd),
+                (&lw.wv, kvd),
+                (&lw.wo, qd),
+            ],
             d,
             s,
-            self.config.rms_norm_eps,
         );
 
-        // 2. Q projection: xnorm @ Wq → Q
-        Self::run_projection(kernels, io, d, qd, s, &acts.xnorm, &lw.wq, &mut acts.q)?;
-
-        // 3. K projection: xnorm @ Wk → K
-        Self::run_projection(kernels, io, d, kvd, s, &acts.xnorm, &lw.wk, &mut acts.k)?;
-
-        // 4. V projection: xnorm @ Wv → V
-        Self::run_projection(kernels, io, d, kvd, s, &acts.xnorm, &lw.wv, &mut acts.v)?;
-
-        // 5. Attention: Q, K, V → attn_out (ANE)
-        // Write Q[qd, s], K[kvd, s], V[kvd, s] concatenated along channels
-        io.sdpa_attn_in.write_f32_at(0, &acts.q, qd, s);
-        io.sdpa_attn_in.write_f32_at(qd, &acts.k, kvd, s);
-        io.sdpa_attn_in.write_f32_at(qd + kvd, &acts.v, kvd, s);
         kernels
-            .sdpa_attn
-            .evaluate(&[io.sdpa_attn_in.as_ptr()], &[io.sdpa_attn_out.as_ptr()])?;
-        io.sdpa_attn_out.read_f32(&mut acts.attn_out, 0, qd, s);
+            .sdpa_fwd
+            .evaluate(&[io.sdpa_fwd_in.as_ptr()], &[io.sdpa_fwd_out.as_ptr()])?;
 
-        // 6. Wo projection: attn_out @ Wo → o_out
-        Self::run_projection(
-            kernels,
-            io,
-            qd,
-            d,
-            s,
-            &acts.attn_out,
-            &lw.wo,
-            &mut acts.o_out,
-        )?;
+        // Read back all taps for backward pass
+        // Taps: [o_out, q, k, v, attn_flat, xnorm]
+        let out_ch = 2 * d + 2 * qd + 2 * kvd;
+        let mut taps = vec![0.0f32; out_ch * s];
+        io.sdpa_fwd_out.read_f32(&mut taps, 0, out_ch, s);
 
-        // 7. Residual: x2 = x + o_out
+        // De-interleave taps into acts
+        let mut tap_off = 0;
+        let mut copy_tap = |dst: &mut [f32], ch: usize| {
+            dst.copy_from_slice(&taps[tap_off * s..(tap_off + ch) * s]);
+            tap_off += ch;
+        };
+
+        copy_tap(&mut acts.o_out, d);
+        copy_tap(&mut acts.q, qd);
+        copy_tap(&mut acts.k, kvd);
+        copy_tap(&mut acts.v, kvd);
+        copy_tap(&mut acts.attn_out, qd);
+        copy_tap(&mut acts.xnorm, d);
+
+        // Residual: x2 = x + o_out (CPU for now, or could be in ANE if we pass x)
         accelerate::vadd(x, &acts.o_out, &mut acts.x2);
 
-        // ====== FFN Block ======
-
-        // 8. RMSNorm on CPU
+        // Compute x2norm = RMSNorm(x2) on CPU for the backward pass.
+        //
+        // The fused FFN kernel computes this internally but does not surface it
+        // as a tap.  We need it to form dW1 = dh1 @ x2norm^T and
+        // dW3 = dh3 @ x2norm^T in backward_layer.  This is a tiny CPU cost
+        // (one RMSNorm of [d, s]) — negligible compared to the ANE kernel.
         accelerate::rmsnorm(
             &mut acts.x2norm,
             &acts.x2,
@@ -894,19 +905,34 @@ impl DynamicAneTrainer {
             self.config.rms_norm_eps,
         );
 
-        // 9. W1 projection: x2norm @ W1 → h1
-        Self::run_projection(kernels, io, d, h, s, &acts.x2norm, &lw.w1, &mut acts.h1)?;
+        // ====== Fused FFN Block (ANE) ======
+        // Input layout: x2 [d, s], rms_ffn [d, 1], w1 [d, h], w3 [d, h]
+        io.ffn_fwd_in.write_packed_f32(
+            &acts.x2,
+            &[(&lw.rms_ffn, 1), (&lw.w1, h), (&lw.w3, h)],
+            d,
+            s,
+        );
 
-        // 10. W3 projection: x2norm @ W3 → h3
-        Self::run_projection(kernels, io, d, h, s, &acts.x2norm, &lw.w3, &mut acts.h3)?;
+        kernels
+            .ffn_fwd
+            .evaluate(&[io.ffn_fwd_in.as_ptr()], &[io.ffn_fwd_out.as_ptr()])?;
 
-        // 11. SiLU gate on CPU: silu_out = silu(h1) * h3
-        for i in 0..(h * s) {
-            let sig = 1.0 / (1.0 + (-acts.h1[i]).exp());
-            acts.silu_out[i] = acts.h1[i] * sig * acts.h3[i];
-        }
+        // Read back taps: [h1, h3, gate]
+        let ffn_out_ch = 3 * h;
+        let mut ffn_taps = vec![0.0f32; ffn_out_ch * s];
+        io.ffn_fwd_out.read_f32(&mut ffn_taps, 0, ffn_out_ch, s);
 
-        // 12. W2 projection: silu_out @ W2 → ffn_out
+        let mut ft_off = 0;
+        let mut copy_ft = |dst: &mut [f32], ch: usize| {
+            dst.copy_from_slice(&ffn_taps[ft_off * s..(ft_off + ch) * s]);
+            ft_off += ch;
+        };
+        copy_ft(&mut acts.h1, h);
+        copy_ft(&mut acts.h3, h);
+        copy_ft(&mut acts.silu_out, h); // ANE gen_dynamic_ffn_w13 outputs 'gate' here
+
+        // W2 projection (standalone for now to keep things simple)
         Self::run_projection(
             kernels,
             io,
@@ -918,7 +944,7 @@ impl DynamicAneTrainer {
             &mut acts.ffn_out,
         )?;
 
-        // 13. Residual: x = x2 + ffn_out
+        // Final residual
         accelerate::vadd(&acts.x2, &acts.ffn_out, x);
 
         Ok(())
@@ -947,18 +973,11 @@ impl DynamicAneTrainer {
 
         // ====== FFN Backward ======
 
-        // 1. dffn @ W2^T → dsilu_raw (projection kernel)
+        // 1. dffn @ W2^T → dsilu_raw (fused ANE kernel)
+        io.ffn_bwd_w2t_in.write_packed_f32(dx, &[(&self.layer_weights[l].w2_t, h)], d, s);
+        kernels.ffn_bwd_w2t.evaluate(&[io.ffn_bwd_w2t_in.as_ptr()], &[io.ffn_bwd_w2t_out.as_ptr()])?;
         let mut dsilu_raw = vec![0.0f32; h * s];
-        Self::run_projection(
-            kernels,
-            io,
-            d,
-            h,
-            s,
-            dx,
-            &self.layer_weights[l].w2_t,
-            &mut dsilu_raw,
-        )?;
+        io.ffn_bwd_w2t_out.read_f32(&mut dsilu_raw, 0, h, s);
 
         // 2. Async dW2 = dx @ silu_out^T (on cblas worker)
         {
@@ -970,20 +989,8 @@ impl DynamicAneTrainer {
             let h_val = h;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
-                let w2_grad =
-                    unsafe { std::slice::from_raw_parts_mut(w2_grad_ptr as *mut f32, w2_grad_len) };
-                accelerate::gemm(
-                    &dy_clone,
-                    &silu_clone,
-                    w2_grad,
-                    d_val,
-                    h_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
+                let w2_grad = unsafe { std::slice::from_raw_parts_mut(w2_grad_ptr as *mut f32, w2_grad_len) };
+                accelerate::gemm(&dy_clone, &silu_clone, w2_grad, d_val, h_val, s_val, 1.0, 1.0, false, true);
             }));
         }
 
@@ -999,7 +1006,7 @@ impl DynamicAneTrainer {
             dh3[i] = dsilu_raw[i] * h1_val * sig;
         }
 
-        // Async dW1 = dh1 @ x2norm^T, dW3 = dh3 @ x2norm^T
+        // Async dW1, dW3
         {
             let dh1_clone = dh1.clone();
             let dh3_clone = dh3.clone();
@@ -1012,64 +1019,20 @@ impl DynamicAneTrainer {
             let h_val = h;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
-                let w1_grad =
-                    unsafe { std::slice::from_raw_parts_mut(w1_grad_ptr as *mut f32, w1_grad_len) };
-                accelerate::gemm(
-                    &dh1_clone,
-                    &x2norm_clone,
-                    w1_grad,
-                    h_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
-                let w3_grad =
-                    unsafe { std::slice::from_raw_parts_mut(w3_grad_ptr as *mut f32, w3_grad_len) };
-                accelerate::gemm(
-                    &dh3_clone,
-                    &x2norm_clone,
-                    w3_grad,
-                    h_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
+                let w1_grad = unsafe { std::slice::from_raw_parts_mut(w1_grad_ptr as *mut f32, w1_grad_len) };
+                accelerate::gemm(&dh1_clone, &x2norm_clone, w1_grad, h_val, d_val, s_val, 1.0, 1.0, false, true);
+                let w3_grad = unsafe { std::slice::from_raw_parts_mut(w3_grad_ptr as *mut f32, w3_grad_len) };
+                accelerate::gemm(&dh3_clone, &x2norm_clone, w3_grad, h_val, d_val, s_val, 1.0, 1.0, false, true);
             }));
         }
 
-        // 4. dh1@W1^T → dx1, dh3@W3^T → dx3, then dx_ffn = dx1 + dx3
-        let mut dx1 = vec![0.0f32; d * s];
-        Self::run_projection(
-            kernels,
-            io,
-            h,
-            d,
-            s,
-            &dh1,
-            &self.layer_weights[l].w1_t,
-            &mut dx1,
-        )?;
-        let mut dx3 = vec![0.0f32; d * s];
-        Self::run_projection(
-            kernels,
-            io,
-            h,
-            d,
-            s,
-            &dh3,
-            &self.layer_weights[l].w3_t,
-            &mut dx3,
-        )?;
+        // 4. dh1@W1^T + dh3@W3^T → dx_ffn (fused ANE kernel)
+        io.ffn_bwd_w13t_in.write_packed_f32(&dh1, &[(&dh3, s), (&self.layer_weights[l].w1_t, d), (&self.layer_weights[l].w3_t, d)], h, s);
+        kernels.ffn_bwd_w13t.evaluate(&[io.ffn_bwd_w13t_in.as_ptr()], &[io.ffn_bwd_w13t_out.as_ptr()])?;
         let mut dx_ffn = vec![0.0f32; d * s];
-        accelerate::vadd(&dx1, &dx3, &mut dx_ffn);
+        io.ffn_bwd_w13t_out.read_f32(&mut dx_ffn, 0, d, s);
 
-        // 5. FFN RMSNorm backward
+        // 5. FFN RMSNorm backward (CPU)
         let mut dx_ffn_norm = vec![0.0f32; d * s];
         accelerate::rmsnorm_backward(
             &mut dx_ffn_norm,
@@ -1084,20 +1047,54 @@ impl DynamicAneTrainer {
 
         // ====== Attention Backward ======
 
-        // 6. dy @ Wo^T → da (projection kernel)
-        let mut da = vec![0.0f32; qd * s];
-        Self::run_projection(
-            kernels,
-            io,
+        // 6. Fused sdpa_bwd1: computes dA (via Wo^T) and sets up for dV/probs/dp.
+        //
+        // Surface layout: [in_ch = qd+2*kvd+d, sp = s+qd] fp32
+        //   ch [0 .. qd]:            Q activations in sp[0..s], zeros in sp[s..s+qd]
+        //   ch [qd .. qd+kvd]:       K activations in sp[0..s], zeros in sp[s..s+qd]
+        //   ch [qd+kvd .. qd+2*kvd]: V activations in sp[0..s], zeros in sp[s..s+qd]
+        //   ch [qd+2*kvd .. in_ch]:  dy activations in sp[0..s],
+        //                            Wo^T rows in sp[s..s+qd]  (wo [d,qd] row-major)
+        //
+        // wo [d, qd] row-major gives exactly the Wo^T rows needed: row `ch` of `wo`
+        // is `Wo^T[ch, 0..qd]` (output-projection weight row for input channel ch).
+        let bwd1_sp = s + qd;
+        let bwd1_in_ch = qd + 2 * kvd + d;
+        let dy_ch_off = qd + 2 * kvd;
+
+        // Zero the entire surface once to clear stale weight-column values in the
+        // Q/K/V rows (those rows have activation data in sp[0..s] only; sp[s..s+qd]
+        // must be zero so the kernel's Wo^T matmul sees zeros there).
+        io.sdpa_bwd1_in.zero_channel_range_f32(0, bwd1_in_ch, bwd1_sp);
+
+        // Q [qd, s] → ch 0..qd, sp[0..s]
+        io.sdpa_bwd1_in.write_f32_strided_at(0, &acts.q, qd, s, bwd1_sp);
+
+        // K [kvd, s] → ch qd..qd+kvd, sp[0..s]
+        io.sdpa_bwd1_in.write_f32_strided_at(qd, &acts.k, kvd, s, bwd1_sp);
+
+        // V [kvd, s] → ch qd+kvd..qd+2*kvd, sp[0..s]
+        io.sdpa_bwd1_in.write_f32_strided_at(qd + kvd, &acts.v, kvd, s, bwd1_sp);
+
+        // dy [d, s] → ch dy_ch_off..in_ch, sp[0..s]
+        io.sdpa_bwd1_in.write_f32_strided_at(dy_ch_off, &dx_ffn_norm, d, s, bwd1_sp);
+
+        // Wo^T = wo [d, qd] → ch dy_ch_off..in_ch, sp[s..s+qd]
+        io.sdpa_bwd1_in.write_f32_at_col_offset(
+            dy_ch_off,
+            &self.layer_weights[l].wo,
             d,
             qd,
             s,
-            &dx_ffn_norm,
-            &self.layer_weights[l].wo_t,
-            &mut da,
-        )?;
+            bwd1_sp,
+        );
 
-        // Async dWo = dx_ffn_norm @ attn_out^T
+        kernels.sdpa_bwd1.evaluate(&[io.sdpa_bwd1_in.as_ptr()], &[io.sdpa_bwd1_out.as_ptr()])?;
+
+        let mut dv = vec![0.0f32; kvd * s];
+        io.sdpa_bwd1_out.read_fp16_as_f32(&mut dv, 0, kvd, s);
+
+        // Async dWo
         {
             let dx_clone = dx_ffn_norm.clone();
             let attn_clone = self.layer_acts[l].attn_out.to_vec();
@@ -1107,50 +1104,17 @@ impl DynamicAneTrainer {
             let qd_val = qd;
             let s_val = s;
             self.dispatch_dw(Box::new(move || {
-                let wo_grad =
-                    unsafe { std::slice::from_raw_parts_mut(wo_grad_ptr as *mut f32, wo_grad_len) };
-                accelerate::gemm(
-                    &dx_clone,
-                    &attn_clone,
-                    wo_grad,
-                    d_val,
-                    qd_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
+                let wo_grad = unsafe { std::slice::from_raw_parts_mut(wo_grad_ptr as *mut f32, wo_grad_len) };
+                accelerate::gemm(&dx_clone, &attn_clone, wo_grad, d_val, qd_val, s_val, 1.0, 1.0, false, true);
             }));
         }
 
-        // 7. SDPA backward part 1: Q, K, V, da → dV, probs, dp (fp16 path)
-        let acts = &self.layer_acts[l];
-        io.sdpa_bwd1_in.write_f32_as_fp16_at(0, &acts.q, qd, s);
-        io.sdpa_bwd1_in.write_f32_as_fp16_at(qd, &acts.k, kvd, s);
-        io.sdpa_bwd1_in
-            .write_f32_as_fp16_at(qd + kvd, &acts.v, kvd, s);
-        io.sdpa_bwd1_in
-            .write_f32_as_fp16_at(qd + 2 * kvd, &da, qd, s);
+        // 7. SDPA backward part 2: Q, K, probs, dp → dQ, dK
+        io.sdpa_bwd2_in.copy_from(0, &io.sdpa_bwd1_out, kvd, 2 * score_ch, s);
+        io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch, &acts.q, qd, s);
+        io.sdpa_bwd2_in.write_f32_as_fp16_at(2 * score_ch + qd, &acts.k, kvd, s);
 
-        kernels
-            .sdpa_bwd1
-            .evaluate(&[io.sdpa_bwd1_in.as_ptr()], &[io.sdpa_bwd1_out.as_ptr()])?;
-
-        let mut dv = vec![0.0f32; kvd * s];
-        io.sdpa_bwd1_out.read_fp16_as_f32(&mut dv, 0, kvd, s);
-
-        // 8. SDPA backward part 2: probs, dp, Q, K → dQ, dK
-        io.sdpa_bwd2_in
-            .copy_from(0, &io.sdpa_bwd1_out, kvd, 2 * score_ch, s);
-        io.sdpa_bwd2_in
-            .write_f32_as_fp16_at(2 * score_ch, &acts.q, qd, s);
-        io.sdpa_bwd2_in
-            .write_f32_as_fp16_at(2 * score_ch + qd, &acts.k, kvd, s);
-
-        kernels
-            .sdpa_bwd2
-            .evaluate(&[io.sdpa_bwd2_in.as_ptr()], &[io.sdpa_bwd2_out.as_ptr()])?;
+        kernels.sdpa_bwd2.evaluate(&[io.sdpa_bwd2_in.as_ptr()], &[io.sdpa_bwd2_out.as_ptr()])?;
 
         let mut dq = vec![0.0f32; qd * s];
         let mut dk = vec![0.0f32; kvd * s];
@@ -1163,103 +1127,43 @@ impl DynamicAneTrainer {
             let dk_clone = dk.clone();
             let dv_clone = dv.clone();
             let xnorm_clone = self.layer_acts[l].xnorm.to_vec();
+            
             let wq_grad_ptr = self.layer_grads[l].wq.as_mut_ptr() as usize;
             let wq_grad_len = self.layer_grads[l].wq.len();
             let wk_grad_ptr = self.layer_grads[l].wk.as_mut_ptr() as usize;
             let wk_grad_len = self.layer_grads[l].wk.len();
             let wv_grad_ptr = self.layer_grads[l].wv.as_mut_ptr() as usize;
             let wv_grad_len = self.layer_grads[l].wv.len();
+            
             let d_val = d;
             let qd_val = qd;
             let kvd_val = kvd;
             let s_val = s;
+            
             self.dispatch_dw(Box::new(move || {
-                let wq_grad =
-                    unsafe { std::slice::from_raw_parts_mut(wq_grad_ptr as *mut f32, wq_grad_len) };
-                accelerate::gemm(
-                    &dq_clone,
-                    &xnorm_clone,
-                    wq_grad,
-                    qd_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
-                let wk_grad =
-                    unsafe { std::slice::from_raw_parts_mut(wk_grad_ptr as *mut f32, wk_grad_len) };
-                accelerate::gemm(
-                    &dk_clone,
-                    &xnorm_clone,
-                    wk_grad,
-                    kvd_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
-                let wv_grad =
-                    unsafe { std::slice::from_raw_parts_mut(wv_grad_ptr as *mut f32, wv_grad_len) };
-                accelerate::gemm(
-                    &dv_clone,
-                    &xnorm_clone,
-                    wv_grad,
-                    kvd_val,
-                    d_val,
-                    s_val,
-                    1.0,
-                    1.0,
-                    false,
-                    true,
-                );
+                let wq_grad = unsafe { std::slice::from_raw_parts_mut(wq_grad_ptr as *mut f32, wq_grad_len) };
+                accelerate::gemm(&dq_clone, &xnorm_clone, wq_grad, qd_val, d_val, s_val, 1.0, 1.0, false, true);
+                let wk_grad = unsafe { std::slice::from_raw_parts_mut(wk_grad_ptr as *mut f32, wk_grad_len) };
+                accelerate::gemm(&dk_clone, &xnorm_clone, wk_grad, kvd_val, d_val, s_val, 1.0, 1.0, false, true);
+                let wv_grad = unsafe { std::slice::from_raw_parts_mut(wv_grad_ptr as *mut f32, wv_grad_len) };
+                accelerate::gemm(&dv_clone, &xnorm_clone, wv_grad, kvd_val, d_val, s_val, 1.0, 1.0, false, true);
             }));
         }
 
-        // 9. QKV backward: individual projections + CPU add
-        let mut dx_attn = vec![0.0f32; d * s];
+        // 8. QKV backward projections (dxq, dxk, dxv)
         let mut dxq = vec![0.0f32; d * s];
-        Self::run_projection(
-            kernels,
-            io,
-            qd,
-            d,
-            s,
-            &dq,
-            &self.layer_weights[l].wq_t,
-            &mut dxq,
-        )?;
+        Self::run_projection(kernels, io, qd, d, s, &dq, &self.layer_weights[l].wq_t, &mut dxq)?;
         let mut dxk = vec![0.0f32; d * s];
-        Self::run_projection(
-            kernels,
-            io,
-            kvd,
-            d,
-            s,
-            &dk,
-            &self.layer_weights[l].wk_t,
-            &mut dxk,
-        )?;
+        Self::run_projection(kernels, io, kvd, d, s, &dk, &self.layer_weights[l].wk_t, &mut dxk)?;
         let mut dxv = vec![0.0f32; d * s];
-        Self::run_projection(
-            kernels,
-            io,
-            kvd,
-            d,
-            s,
-            &dv,
-            &self.layer_weights[l].wv_t,
-            &mut dxv,
-        )?;
-        // dx_attn = dxq + dxk + dxv
+        Self::run_projection(kernels, io, kvd, d, s, &dv, &self.layer_weights[l].wv_t, &mut dxv)?;
+        
+        let mut dx_attn = vec![0.0f32; d * s];
         accelerate::vadd(&dxq, &dxk, &mut dx_attn);
-        accelerate::vadd(&dx_attn, &dxv, &mut dxq); // reuse dxq as temp
+        accelerate::vadd(&dx_attn, &dxv, &mut dxq); // reuse dxq
         dx_attn.copy_from_slice(&dxq);
 
-        // 10. Attention RMSNorm backward
+        // 9. Attention RMSNorm backward
         let mut dx_attn_norm = vec![0.0f32; d * s];
         accelerate::rmsnorm_backward(
             &mut dx_attn_norm,
@@ -1272,7 +1176,7 @@ impl DynamicAneTrainer {
             self.config.rms_norm_eps,
         );
 
-        // Output: dx = dx_ffn_norm + dx_attn_norm (residual)
+        // Final dx (residual)
         accelerate::vadd(&dx_ffn_norm, &dx_attn_norm, dx);
 
         Ok(())
