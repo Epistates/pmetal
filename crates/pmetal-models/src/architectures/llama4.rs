@@ -21,6 +21,7 @@ use mlx_rs::{
     nn,
     ops::{self, indexing::IndexOp, softmax_axis},
 };
+use pmetal_mlx::kernels::rope::apply_rope as rope_apply;
 use serde::{Deserialize, Serialize};
 
 use crate::traits::ModelConfig;
@@ -326,20 +327,30 @@ impl Llama4Router {
 
     /// Route tokens to experts.
     ///
-    /// Returns (expert_indices, expert_weights, router_logits).
+    /// Returns `(expert_indices, expert_weights, router_logits)` where:
+    /// - `expert_indices`: `[total_tokens, top_k]` — selected expert IDs (i32)
+    /// - `expert_weights`: `[total_tokens, top_k]` — normalized routing weights
+    /// - `router_logits`:  `[total_tokens, num_experts]` — raw pre-softmax logits
     pub fn forward(&mut self, x: &Array) -> Result<(Array, Array, Array), Exception> {
-        // x: [batch, seq, hidden] or [total_tokens, hidden]
+        // x: [total_tokens, hidden]
         let router_logits = Module::forward(&mut self.gate, x)?;
 
         // Softmax over experts
         let router_probs = softmax_axis(&router_logits, -1, None)?;
 
-        // Top-k selection
-        // For now, we assume top_k=1 and use argmax
-        let expert_indices = mlx_rs::ops::indexing::argmax_axis(&router_probs, -1, false)?;
+        // Top-k selection via argpartition — O(n) vs O(n log n) for argsort.
+        // argpartition places the k largest elements at the last k positions.
+        let neg_k = -(self.top_k as i32);
+        let part_indices = ops::argpartition_axis(&router_probs, neg_k, -1)?;
+        // Slice the last top_k entries: [total_tokens, top_k]
+        let expert_indices = part_indices.index((.., neg_k..));
 
-        // Get the weights for selected experts
-        let expert_weights = router_probs.max_axis(-1, false)?;
+        // Gather the corresponding probabilities for the selected experts.
+        let expert_weights = router_probs.take_along_axis(&expert_indices, -1)?;
+
+        // Normalize weights so they sum to 1 across the top_k dimension.
+        let weight_sum = expert_weights.sum_axis(-1, true)?;
+        let expert_weights = expert_weights.divide(&weight_sum)?;
 
         Ok((expert_indices, expert_weights, router_logits))
     }
@@ -455,34 +466,45 @@ impl Llama4MoE {
         let total_tokens = shape.iter().take(shape.len() - 1).product::<i32>();
         let flat_x = x.reshape(&[total_tokens, hidden_size])?;
 
-        // Route tokens
+        // Route tokens.
+        // expert_indices: [total_tokens, top_k]
+        // expert_weights: [total_tokens, top_k]  (normalized)
         let (expert_indices, expert_weights, _router_logits) = self.router.forward(&flat_x)?;
 
-        // Shared expert output (always applied)
+        // Shared expert output (always applied to all tokens)
         let shared_out = self.shared_expert.forward(&flat_x)?;
 
-        // Expert routing - for simplicity, process each expert sequentially
-        // In production, this would use grouped GEMM for efficiency
-        let mut expert_out = mlx_rs::ops::zeros::<f32>(&[total_tokens, hidden_size])?;
+        // Accumulator for routed expert outputs, summed over all top_k slots.
+        let mut combined_out = ops::zeros::<f32>(&[total_tokens, hidden_size])?;
 
-        for (expert_idx, expert) in self.experts.iter_mut().enumerate() {
-            // Create mask for tokens routed to this expert
-            let expert_id = Array::from_int(expert_idx as i32);
-            let mask = expert_indices.eq(&expert_id)?;
-            let mask_f32 = mask.as_dtype(mlx_rs::Dtype::Float32)?;
+        // For each top_k slot, dispatch to the corresponding expert and weight.
+        // This is the naive O(num_experts * top_k) masked-dispatch loop.
+        // In production this would use grouped GEMM per-slot.
+        let top_k = self.config.num_experts_per_tok;
+        for slot in 0..top_k {
+            // slot_indices: [total_tokens]  — which expert each token chose in this slot
+            let slot_indices = expert_indices
+                .index((.., slot..slot + 1))
+                .squeeze_axes(&[-1])?;
+            // slot_weights: [total_tokens, 1]  — normalized weight for this slot
+            let slot_weights = expert_weights.index((.., slot..slot + 1));
 
-            // Process all tokens through expert and mask
-            let exp_output = expert.forward(&flat_x)?;
-            let masked = exp_output.multiply(&mask_f32.reshape(&[total_tokens, 1])?)?;
-            expert_out = expert_out.add(&masked)?;
+            let mut slot_out = ops::zeros::<f32>(&[total_tokens, hidden_size])?;
+            for (expert_idx, expert) in self.experts.iter_mut().enumerate() {
+                let expert_id = Array::from_int(expert_idx as i32);
+                let mask = slot_indices.eq(&expert_id)?;
+                let mask_f32 = mask.as_dtype(mlx_rs::Dtype::Float32)?;
+                let exp_output = expert.forward(&flat_x)?;
+                let masked = exp_output.multiply(&mask_f32.reshape(&[total_tokens, 1])?)?;
+                slot_out = slot_out.add(&masked)?;
+            }
+
+            let weighted = slot_out.multiply(&slot_weights)?;
+            combined_out = combined_out.add(&weighted)?;
         }
 
-        // Weight expert output and add shared
-        let expert_weights_2d = expert_weights.reshape(&[total_tokens, 1])?;
-        let weighted_expert = expert_out.multiply(&expert_weights_2d)?;
-        let output = shared_out.add(&weighted_expert)?;
-
-        // Reshape back
+        // Add shared expert contribution and reshape to original shape
+        let output = shared_out.add(&combined_out)?;
         output.reshape(&shape)
     }
 }
@@ -500,6 +522,11 @@ pub struct Llama4Attention {
     pub n_kv_heads: i32,
     pub head_dim: i32,
     pub scale: f32,
+    pub rope_theta: f32,
+    pub rope_scale: f32,
+    pub attn_temperature_tuning: bool,
+    pub floor_scale: f32,
+    pub attn_scale: f32,
 
     #[param]
     pub q_proj: nn::Linear,
@@ -564,6 +591,11 @@ impl Llama4Attention {
             n_kv_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
+            rope_theta: config.rope_theta,
+            rope_scale: 1.0,
+            attn_temperature_tuning: config.attn_temperature_tuning,
+            floor_scale: config.floor_scale as f32,
+            attn_scale: config.attn_scale,
             q_proj,
             k_proj,
             v_proj,
@@ -623,21 +655,50 @@ impl Llama4Attention {
             // [B, n_kv, T, D] -> [B, n_kv, 1, T, D] -> broadcast -> [B, n_heads, T, D]
             let k_shape = k.shape().to_vec();
             let v_shape = v.shape().to_vec();
-            k = k
-                .reshape(&[k_shape[0], self.n_kv_heads, 1, k_shape[2], self.head_dim])?;
+            k = k.reshape(&[k_shape[0], self.n_kv_heads, 1, k_shape[2], self.head_dim])?;
             k = ops::broadcast_to(
                 &k,
-                &[k_shape[0], self.n_kv_heads, repeat, k_shape[2], self.head_dim],
+                &[
+                    k_shape[0],
+                    self.n_kv_heads,
+                    repeat,
+                    k_shape[2],
+                    self.head_dim,
+                ],
             )?;
             k = k.reshape(&[k_shape[0], self.n_heads, k_shape[2], self.head_dim])?;
-            v = v
-                .reshape(&[v_shape[0], self.n_kv_heads, 1, v_shape[2], self.head_dim])?;
+            v = v.reshape(&[v_shape[0], self.n_kv_heads, 1, v_shape[2], self.head_dim])?;
             v = ops::broadcast_to(
                 &v,
-                &[v_shape[0], self.n_kv_heads, repeat, v_shape[2], self.head_dim],
+                &[
+                    v_shape[0],
+                    self.n_kv_heads,
+                    repeat,
+                    v_shape[2],
+                    self.head_dim,
+                ],
             )?;
             v = v.reshape(&[v_shape[0], self.n_heads, v_shape[2], self.head_dim])?;
         }
+
+        // Temperature scaling for NoPE layers (long-context attention stabilization).
+        // Formula: scale_i = log(floor((i + 1) / floor_scale) + 1) * attn_scale + 1
+        // Applied to Q states before QK matmul, only when attn_temperature_tuning is enabled.
+        let q = if !self.uses_rope && self.attn_temperature_tuning {
+            let ones = ops::ones::<f32>(&[seq_len])?;
+            let positions = ops::arange::<i32, f32>(0, seq_len, None)?;
+            let pos_plus_one = positions.add(&ones)?;
+            let floored = ops::floor(&pos_plus_one.divide(&Array::from_f32(self.floor_scale))?)?;
+            let log_vals = ops::log(&floored.add(&ones)?)?;
+            let scales = log_vals
+                .multiply(&Array::from_f32(self.attn_scale))?
+                .add(&ones)?;
+            // [T] -> [1, 1, T, 1] to broadcast over [B, H, T, D]
+            let scales = scales.reshape(&[1, 1, seq_len, 1])?;
+            q.multiply(&scales)?
+        } else {
+            q
+        };
 
         // Attention scores
         let k_t = k.transpose_axes(&[0, 1, 3, 2])?;
@@ -659,14 +720,22 @@ impl Llama4Attention {
     }
 
     /// Apply RoPE embeddings.
-    fn apply_rope(&self, x: &Array, position_ids: &Array) -> Result<Array, Exception> {
-        // Simplified RoPE implementation
-        // Full implementation would use precomputed cos/sin tables
-        let _seq_len = position_ids.shape()[0];
-
-        // For now, return x unchanged (full RoPE implementation needed)
-        // In production, this would compute rotary embeddings
-        Ok(x.clone())
+    ///
+    /// `x` arrives as `[B, T, n_heads, head_dim]`.  `rope_apply` (mlx_rs::fast::rope)
+    /// expects `[B, heads, T, head_dim]`, so we transpose before and after.
+    fn apply_rope(&self, x: &Array, _position_ids: &Array) -> Result<Array, Exception> {
+        // [B, T, H, D] -> [B, H, T, D]
+        let x_t = x.transpose_axes(&[0, 2, 1, 3])?;
+        let result = rope_apply(
+            &x_t,
+            self.head_dim,
+            false,
+            self.rope_theta,
+            self.rope_scale,
+            0,
+        )?;
+        // [B, H, T, D] -> [B, T, H, D]
+        result.transpose_axes(&[0, 2, 1, 3])
     }
 }
 
