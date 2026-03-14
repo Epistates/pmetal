@@ -737,13 +737,17 @@ pub fn render_status_with_metrics(
                     }
 
                     if let Some(&total_row) = rows.last() {
+                        // Only show steps/min when total_ms is populated (> 1.0 guards the
+                        // max(1.0) floor that prevents divide-by-zero but yields 60000).
+                        let steps_per_min_label = if last.total_ms > 1.0 {
+                            format!("  ({:.0} steps/min)", 60000.0 / total)
+                        } else {
+                            String::new()
+                        };
                         Line::from(vec![
                             Span::styled("   Total: ", THEME.kv_key),
                             Span::styled(format!("{:.1}ms", total), THEME.kv_value),
-                            Span::styled(
-                                format!("  ({:.0} steps/min)", 60000.0 / total),
-                                THEME.text_dim,
-                            ),
+                            Span::styled(steps_per_min_label, THEME.text_dim),
                         ])
                         .render(total_row, buf);
                     }
@@ -757,18 +761,33 @@ pub fn render_status_with_metrics(
                     ])
                     .split(timing_inner);
 
-                    // Step time gauge
-                    let ratio = (total / 1000.0).clamp(0.0, 1.0);
-                    let label = format!("Step time: {:.1}ms", total);
+                    // Step time gauge — only render meaningful values when total_ms is populated.
+                    // total = last.total_ms.max(1.0); total_ms == 0 → total == 1.0 (no data).
+                    let has_timing = last.total_ms > 1.0;
+                    let ratio = if has_timing {
+                        (total / 1000.0).clamp(0.0, 1.0)
+                    } else {
+                        0.0
+                    };
+                    let label = if has_timing {
+                        format!("Step time: {:.1}ms", total)
+                    } else {
+                        "Step time: —".to_string()
+                    };
                     Gauge::default()
                         .gauge_style(palette::CHART_2)
                         .ratio(ratio)
                         .label(Span::styled(label, THEME.text))
                         .render(rows[0], buf);
 
+                    let steps_per_min = if has_timing {
+                        format!("{:.0}", 60000.0 / total)
+                    } else {
+                        "—".to_string()
+                    };
                     Line::from(vec![
                         Span::styled(" Steps/min: ", THEME.kv_key),
-                        Span::styled(format!("{:.0}", 60000.0 / total), THEME.kv_value),
+                        Span::styled(steps_per_min, THEME.kv_value),
                     ])
                     .render(rows[1], buf);
 

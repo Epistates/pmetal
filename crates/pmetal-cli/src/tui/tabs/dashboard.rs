@@ -450,13 +450,17 @@ impl DashboardTab {
             }
 
             let total_row = rows[rows.len() - 1];
+            // Only display steps/min when we have real timing data (total_ms was populated).
+            // total = last.total_ms.max(1.0), so total == 1.0 means no real timing data.
+            let steps_per_min_label = if last.total_ms > 1.0 {
+                format!("  ({:.0} steps/min)", 60000.0 / total)
+            } else {
+                String::new()
+            };
             Line::from(vec![
                 Span::styled("   Total: ", THEME.kv_key),
                 Span::styled(format!("{:.1}ms", total), THEME.kv_value),
-                Span::styled(
-                    format!("  ({:.0} steps/min)", 60000.0 / total),
-                    THEME.text_dim,
-                ),
+                Span::styled(steps_per_min_label, THEME.text_dim),
             ])
             .render(total_row, buf);
         } else {
@@ -481,9 +485,15 @@ impl DashboardTab {
                 .label(Span::styled(label, THEME.text))
                 .render(rows[0], buf);
 
+            // Avoid division by zero: only show steps/min when we have real timing data.
+            let steps_per_min = if total > 1.0 {
+                format!("{:.0}", 60000.0 / total)
+            } else {
+                "—".to_string()
+            };
             Line::from(vec![
                 Span::styled("  Steps/min: ", THEME.kv_key),
-                Span::styled(format!("{:.0}", 60000.0 / total), THEME.kv_value),
+                Span::styled(steps_per_min, THEME.kv_value),
             ])
             .render(rows[2], buf);
 
@@ -493,16 +503,21 @@ impl DashboardTab {
             ])
             .render(rows[3], buf);
 
-            // Show avg step time over recent samples
+            // Show avg step time over recent samples, only when timing data is present.
             if self.samples.len() >= 5 {
                 let recent: Vec<&MetricSample> = self.samples
                     [self.samples.len().saturating_sub(10)..]
                     .iter()
                     .collect();
                 let avg_ms = recent.iter().map(|s| s.total_ms).sum::<f64>() / recent.len() as f64;
+                let avg_label = if avg_ms > 0.0 {
+                    format!("{:.1}ms", avg_ms)
+                } else {
+                    "—".to_string()
+                };
                 Line::from(vec![
                     Span::styled("  Avg step:  ", THEME.kv_key),
-                    Span::styled(format!("{:.1}ms", avg_ms), THEME.text_dim),
+                    Span::styled(avg_label, THEME.text_dim),
                 ])
                 .render(rows[4], buf);
             }

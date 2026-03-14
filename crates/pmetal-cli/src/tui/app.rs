@@ -870,8 +870,40 @@ impl App {
                 message,
             } => {
                 if self.active_training_job.as_deref() == Some(&job_id) {
-                    let loss = self.dashboard.samples.last().map(|s| s.loss).unwrap_or(0.0);
-                    let steps = self.dashboard.samples.len();
+                    // Derive the final loss and step count from the metrics file directly.
+                    // This avoids a race condition where AppMsg::JobFinished is processed
+                    // before the metrics polling task has flushed all AppMsg::JobMetrics
+                    // messages — which causes samples.last() to return stale or empty data.
+                    let metrics_path = self
+                        .active_training_output_dir
+                        .as_ref()
+                        .map(|d| d.join("metrics.jsonl"));
+                    let (loss, last_step, total_steps_from_file) = metrics_path
+                        .as_deref()
+                        .and_then(read_final_metrics_from_file)
+                        .unwrap_or_else(|| {
+                            // Fall back to in-memory samples when the file is unavailable.
+                            let l = self.dashboard.samples.last().map(|s| s.loss).unwrap_or(0.0);
+                            let s = self
+                                .dashboard
+                                .samples
+                                .last()
+                                .map(|s| s.step)
+                                .unwrap_or(self.dashboard.samples.len());
+                            let ts = self
+                                .dashboard
+                                .samples
+                                .last()
+                                .map(|s| s.total_steps)
+                                .unwrap_or(0);
+                            (l, s, ts)
+                        });
+                    // Prefer the total_steps reported by the trainer; fall back to last step.
+                    let steps = if total_steps_from_file > 0 {
+                        total_steps_from_file
+                    } else {
+                        last_step
+                    };
                     let job_type = self.active_job_type.unwrap_or(JobType::Train);
 
                     if success {
@@ -1846,6 +1878,40 @@ fn copy_to_clipboard(text: &str) {
         }
         let _ = child.wait();
     }
+}
+
+/// Read the last JSON line from a JSONL metrics file and extract (loss, step, total_steps).
+///
+/// This is used at job completion to get accurate final metrics regardless of any in-memory
+/// polling lag between the metrics poller task and the process-exit notification.
+fn read_final_metrics_from_file(metrics_file: &std::path::Path) -> Option<(f64, usize, usize)> {
+    use std::io::{Read, Seek};
+
+    let file = std::fs::File::open(metrics_file).ok()?;
+    let len = file.metadata().ok()?.len();
+    if len == 0 {
+        return None;
+    }
+
+    // Seek backwards to find the last non-empty line efficiently.
+    // Read at most the last 4 KiB — more than enough for one JSONL entry.
+    let scan_bytes = len.min(4096);
+    let mut reader = std::io::BufReader::new(file);
+    reader
+        .seek(std::io::SeekFrom::End(-(scan_bytes as i64)))
+        .ok()?;
+
+    let mut tail = String::new();
+    reader.read_to_string(&mut tail).ok()?;
+
+    // Find the last non-empty line.
+    let last_line = tail.lines().rev().find(|l| !l.trim().is_empty())?;
+
+    let json: serde_json::Value = serde_json::from_str(last_line).ok()?;
+    let loss = json["loss"].as_f64()?;
+    let step = json["step"].as_u64().unwrap_or(0) as usize;
+    let total_steps = json["total_steps"].as_u64().unwrap_or(0) as usize;
+    Some((loss, step, total_steps))
 }
 
 /// Expand `~` prefix to the user's home directory.
