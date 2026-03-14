@@ -668,7 +668,7 @@ impl MistralLoraForCausalLM {
         // Check for single file model
         let single_file = model_dir.join("model.safetensors");
         if single_file.exists() {
-            let weights = Array::load_safetensors(&single_file)?;
+            let weights = crate::sanitize_loaded_weights(Array::load_safetensors(&single_file)?)?;
             return self.load_base_weights(&weights);
         }
 
@@ -698,10 +698,9 @@ impl MistralLoraForCausalLM {
         let mut all_weights: HashMap<String, Array> = HashMap::new();
         for shard_file in shard_files {
             let shard_path = model_dir.join(shard_file);
-            let weights = Array::load_safetensors(&shard_path)?;
-            for (key, value) in weights {
-                all_weights.insert(key.to_string(), value);
-            }
+            let shard_weights =
+                crate::sanitize_loaded_weights(Array::load_safetensors(&shard_path)?)?;
+            all_weights.extend(shard_weights);
         }
 
         self.load_base_weights(&all_weights)

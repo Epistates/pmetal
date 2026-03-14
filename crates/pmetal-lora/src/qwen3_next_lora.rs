@@ -1768,7 +1768,8 @@ impl Qwen3NextLoraForCausalLM {
 
         let single_file = model_dir.join("model.safetensors");
         if single_file.exists() {
-            let mut weights = Array::load_safetensors(&single_file)?;
+            let mut weights =
+                crate::sanitize_loaded_weights(Array::load_safetensors(&single_file)?)?;
             sanitize_weights(&mut weights, &self.model.config).map_err(LoraError::Mlx)?;
             return self.load_base_weights(&weights);
         }
@@ -1797,7 +1798,8 @@ impl Qwen3NextLoraForCausalLM {
         let mut all_weights: HashMap<String, Array> = HashMap::new();
         for shard_file in shard_files {
             let shard_path = model_dir.join(shard_file);
-            let shard_weights = Array::load_safetensors(&shard_path)?;
+            let shard_weights =
+                crate::sanitize_loaded_weights(Array::load_safetensors(&shard_path)?)?;
             all_weights.extend(shard_weights);
         }
 

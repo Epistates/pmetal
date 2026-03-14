@@ -1935,36 +1935,40 @@ async fn run_fuse(
         mlx_rs::Array::load_safetensors(&lora_file).map_err(|e| anyhow::anyhow!("{e}"))?;
     println!("OK ({} tensors)", lora_weights.len());
 
-    // Detect LoRA rank from adapter weights
-    let rank = if let Some(r) = rank_override {
-        r
+    // Read rank and alpha from adapter_config.json, with CLI overrides taking precedence
+    let lora_dir = if std::path::Path::new(lora_path).is_dir() {
+        std::path::PathBuf::from(lora_path)
     } else {
-        // Find any lora_a weight to determine rank from its shape
+        std::path::Path::new(lora_path)
+            .parent()
+            .unwrap_or(std::path::Path::new("."))
+            .to_path_buf()
+    };
+    let adapter_config = std::fs::read_to_string(lora_dir.join("adapter_config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+    let rank = rank_override.unwrap_or_else(|| {
+        // Prefer adapter_config.json, then fall back to shape detection
+        if let Some(ref cfg) = adapter_config {
+            if let Some(r) = cfg["r"].as_u64() {
+                return r as usize;
+            }
+        }
+        // Fallback: detect from attention lora_a shapes (skip rank-0 MLP weights)
         lora_weights
             .iter()
-            .find(|(k, _)| k.contains("lora_a"))
-            .map(|(_, v)| {
-                let shape = v.shape();
-                // lora_a is [r, in_features] or [in_features, r] depending on convention
-                *shape.iter().min().unwrap_or(&16) as usize
-            })
+            .filter(|(k, _)| k.contains("self_attn") && k.contains("lora_a"))
+            .map(|(_, v)| *v.shape().iter().min().unwrap_or(&16) as usize)
+            .next()
             .unwrap_or(16)
-    };
-    // Read alpha from adapter_config.json if no override, else fall back to rank (scale=1)
+    });
+
     let alpha = alpha_override.unwrap_or_else(|| {
-        let lora_dir = std::path::Path::new(lora_path)
-            .parent()
-            .unwrap_or(std::path::Path::new("."));
-        let config_path = if std::path::Path::new(lora_path).is_dir() {
-            std::path::Path::new(lora_path).join("adapter_config.json")
-        } else {
-            lora_dir.join("adapter_config.json")
-        };
-        if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-            if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
-                let a = config_json["alpha"].as_f64().unwrap_or(rank as f64) as f32;
-                tracing::info!("Loaded alpha={} from adapter_config.json", a);
-                return a;
+        if let Some(ref cfg) = adapter_config {
+            if let Some(a) = cfg["alpha"].as_f64() {
+                tracing::info!("Loaded r={}, alpha={} from adapter_config.json", rank, a);
+                return a as f32;
             }
         }
         rank as f32
