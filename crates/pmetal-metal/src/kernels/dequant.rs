@@ -44,7 +44,7 @@ impl DequantKernels {
             depth: 1,
         };
         let thread_group_size = MTLSize {
-            width: (pipeline.maxTotalThreadsPerThreadgroup() as usize).min(n_elements),
+            width: pipeline.maxTotalThreadsPerThreadgroup().min(n_elements),
             height: 1,
             depth: 1,
         };
@@ -85,7 +85,7 @@ impl DequantKernels {
             depth: 1,
         };
         let thread_group_size = MTLSize {
-            width: (pipeline.maxTotalThreadsPerThreadgroup() as usize).min(n_elements),
+            width: pipeline.maxTotalThreadsPerThreadgroup().min(n_elements),
             height: 1,
             depth: 1,
         };
