@@ -232,6 +232,11 @@ impl<T: Copy + FromBytes + IntoBytes> MetalBuffer<T> {
         &self.buffer
     }
 
+    /// Get a retained clone of the underlying Metal buffer.
+    pub fn as_retained(&self) -> Retained<ProtocolObject<dyn MTLBuffer>> {
+        self.buffer.clone()
+    }
+
     /// Get a raw pointer to the buffer contents.
     ///
     /// Returns `None` for private buffers (no CPU access).

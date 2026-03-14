@@ -37,6 +37,7 @@
 //! - Enable 40%+ throughput improvement via overlapping execution
 //! - Support for batched operations across multiple kernel dispatches
 
+use std::any::Any;
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -199,6 +200,7 @@ impl AsyncScheduler {
     /// Returns a completion token that can be used to wait for completion.
     pub fn commit_async(&self, mut buffer: InFlightBuffer) -> Result<CompletionToken> {
         buffer.end_encoding();
+        let resources = buffer.take_resources();
         let command_buffer = buffer.take_command_buffer()?;
 
         let operation_id = self.operation_counter.fetch_add(1, Ordering::SeqCst);
@@ -206,7 +208,7 @@ impl AsyncScheduler {
         command_buffer.commit();
         self.stats.write().async_dispatches += 1;
 
-        Ok(CompletionToken::new(command_buffer, operation_id))
+        Ok(CompletionToken::new(command_buffer, operation_id, resources))
     }
 
     /// Commit and wait for completion (blocking).
@@ -247,6 +249,8 @@ pub struct InFlightBuffer {
     encoder: Option<Retained<ProtocolObject<dyn MTLComputeCommandEncoder>>>,
     dispatch_count: usize,
     encoding_ended: bool,
+    /// Resources that must be kept alive until the command buffer completes.
+    resources: Vec<Arc<dyn Any + Send + Sync>>,
 }
 
 impl InFlightBuffer {
@@ -260,7 +264,13 @@ impl InFlightBuffer {
             encoder: Some(encoder),
             dispatch_count: 0,
             encoding_ended: false,
+            resources: Vec::new(),
         }
+    }
+
+    /// Add a resource to be kept alive until completion.
+    pub fn retain_resource(&mut self, resource: Arc<dyn Any + Send + Sync>) {
+        self.resources.push(resource);
     }
 
     /// Get the encoder for adding dispatches.
@@ -304,6 +314,11 @@ impl InFlightBuffer {
             .take()
             .ok_or(MetalError::CommandBufferCreation)
     }
+
+    /// Take the resources (consumes self).
+    pub fn take_resources(&mut self) -> Vec<Arc<dyn Any + Send + Sync>> {
+        std::mem::take(&mut self.resources)
+    }
 }
 
 impl Drop for InFlightBuffer {
@@ -324,6 +339,8 @@ impl Drop for InFlightBuffer {
 pub struct CompletionToken {
     command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
     operation_id: u64,
+    /// Resources kept alive until completion.
+    _resources: Vec<Arc<dyn Any + Send + Sync>>,
 }
 
 impl CompletionToken {
@@ -331,10 +348,24 @@ impl CompletionToken {
     pub(crate) fn new(
         command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
         operation_id: u64,
+        resources: Vec<Arc<dyn Any + Send + Sync>>,
     ) -> Self {
         Self {
             command_buffer,
             operation_id,
+            _resources: resources,
+        }
+    }
+}
+
+impl Drop for CompletionToken {
+    fn drop(&mut self) {
+        // SAFETY: Cancellation Safety
+        // If the token is dropped while the GPU is still executing, we must
+        // block to ensure that any resources held by this token (e.g. MLX arrays)
+        // are not reclaimed while the GPU is still accessing them.
+        if !self.is_complete() {
+            self.command_buffer.waitUntilCompleted();
         }
     }
 }
