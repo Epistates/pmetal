@@ -5,6 +5,7 @@
 //! and efficient training operations.
 
 pub mod batched_lora;
+pub mod dequant;
 pub mod flash_attention;
 pub mod fp8_training;
 pub mod fused_cross_entropy;
