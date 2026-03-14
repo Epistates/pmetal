@@ -51,6 +51,18 @@ audit-as-crate-author = true
 [policy.pmetal]
 audit-as-crate-author = true
 
+[policy.pmetal-vocoder]
+audit-as-crate-author = true
+
+[policy.pmetal-merge]
+audit-as-crate-author = true
+
+[policy.pmetal-distill]
+audit-as-crate-author = true
+
+[policy.pmetal-mhc]
+audit-as-crate-author = true
+
 [[exemptions.zerocopy]]
 version = "0.8.42"
 criteria = "safe-to-deploy"
