@@ -1167,9 +1167,12 @@ impl Qwen3LoraForCausalLM {
         &mut self,
         weights: &std::collections::HashMap<String, Array>,
     ) -> Result<(), LoraError> {
+        let mut loaded_count = 0usize;
+
         // Load embed_tokens
         if let Some(w) = weights.get("model.embed_tokens.weight") {
             self.model.embed_tokens.weight = Param::new(w.clone());
+            loaded_count += 1;
         }
 
         // Load transformer layers
@@ -1179,42 +1182,53 @@ impl Qwen3LoraForCausalLM {
             // Self-attention projections
             if let Some(w) = weights.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
                 layer.self_attn.q_proj.weight = w.clone();
+                loaded_count += 1;
             }
             if let Some(w) = weights.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
                 layer.self_attn.k_proj.weight = w.clone();
+                loaded_count += 1;
             }
             if let Some(w) = weights.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
                 layer.self_attn.v_proj.weight = w.clone();
+                loaded_count += 1;
             }
             if let Some(w) = weights.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
                 layer.self_attn.o_proj.weight = w.clone();
+                loaded_count += 1;
             }
 
             // Qwen3-specific: Q/K norms
             if let Some(w) = weights.get(&format!("{}.self_attn.q_norm.weight", prefix)) {
                 layer.self_attn.q_norm.weight = Param::new(w.clone());
+                loaded_count += 1;
             }
             if let Some(w) = weights.get(&format!("{}.self_attn.k_norm.weight", prefix)) {
                 layer.self_attn.k_norm.weight = Param::new(w.clone());
+                loaded_count += 1;
             }
 
             // MLP projections
             if let Some(w) = weights.get(&format!("{}.mlp.gate_proj.weight", prefix)) {
                 layer.mlp.gate_proj.weight = w.clone();
+                loaded_count += 1;
             }
             if let Some(w) = weights.get(&format!("{}.mlp.up_proj.weight", prefix)) {
                 layer.mlp.up_proj.weight = w.clone();
+                loaded_count += 1;
             }
             if let Some(w) = weights.get(&format!("{}.mlp.down_proj.weight", prefix)) {
                 layer.mlp.down_proj.weight = w.clone();
+                loaded_count += 1;
             }
 
             // Layer norms
             if let Some(w) = weights.get(&format!("{}.input_layernorm.weight", prefix)) {
                 layer.input_layernorm.weight = Param::new(w.clone());
+                loaded_count += 1;
             }
             if let Some(w) = weights.get(&format!("{}.post_attention_layernorm.weight", prefix)) {
                 layer.post_attention_layernorm.weight = Param::new(w.clone());
+                loaded_count += 1;
             }
         }
 
@@ -1227,8 +1241,21 @@ impl Qwen3LoraForCausalLM {
         if let Some(ref mut lm_head) = self.lm_head {
             if let Some(w) = weights.get("lm_head.weight") {
                 lm_head.weight = Param::new(w.clone());
+                loaded_count += 1;
             }
         }
+
+        // Log weight loading summary with dtype info
+        let q_dtype = self.model.layers[0].self_attn.q_proj.weight.dtype();
+        let lora_a_dtype = self.model.layers[0].self_attn.q_proj.lora_a.dtype();
+        tracing::info!(
+            "Loaded {} base weight tensors (from {} available, {} layers, base_dtype={:?}, lora_dtype={:?})",
+            loaded_count,
+            weights.len(),
+            self.model.layers.len(),
+            q_dtype,
+            lora_a_dtype,
+        );
 
         Ok(())
     }
