@@ -513,3 +513,59 @@ mod tests {
         assert_eq!(tree::child_ranks(1, world_size, arity), vec![3, 4]);
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    #[kani::unwind(9)]
+    fn verify_tree_topology() {
+        let world_size: usize = kani::any();
+        let arity: usize = kani::any();
+
+        // Reduced bounds for tractable verification — Vec heap allocations
+        // and nested iterator loops in child_ranks/contains make larger
+        // bounds prohibitively expensive for CBMC.
+        kani::assume(world_size > 0 && world_size <= 8);
+        kani::assume(arity >= 2 && arity <= 4);
+
+        for rank in 0..world_size {
+            let role = tree::compute_role(rank, world_size, arity);
+            let parent = tree::parent_rank(rank, arity);
+            let children = tree::child_ranks(rank, world_size, arity);
+
+            match role {
+                tree::TreeRole::Root { num_children } => {
+                    assert!(rank == 0);
+                    assert!(parent.is_none());
+                    assert!(children.len() == num_children);
+                }
+                tree::TreeRole::Internal { num_children } => {
+                    assert!(rank > 0);
+                    assert!(parent.is_some());
+                    assert!(children.len() == num_children);
+                    assert!(num_children > 0);
+                }
+                tree::TreeRole::Leaf => {
+                    assert!(rank > 0);
+                    assert!(parent.is_some());
+                    assert!(children.is_empty());
+                }
+            }
+
+            // Verify parent-child consistency
+            for &child in &children {
+                assert!(child < world_size);
+                assert!(child > rank);
+                assert!(tree::parent_rank(child, arity) == Some(rank));
+            }
+
+            if let Some(p) = parent {
+                assert!(p < rank);
+                let p_children = tree::child_ranks(p, world_size, arity);
+                assert!(p_children.contains(&rank));
+            }
+        }
+    }
+}

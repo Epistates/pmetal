@@ -91,3 +91,18 @@ watch:
 # Run specific test by name
 test-name name:
     cargo test {{name}} -- --test-threads=1 --nocapture
+
+# --- Formal Verification (Kani) ---
+
+# Install Kani verifier and setup toolchain
+kani-setup:
+    cargo install --locked kani-verifier
+    cargo kani setup
+
+# Run Kani verification on distributed primitives
+kani-verify:
+    cargo kani --package pmetal-distributed
+
+# Run Kani with concrete playback (generates tests on failure)
+kani-playback:
+    cargo kani --package pmetal-distributed --concrete-playback=inplace

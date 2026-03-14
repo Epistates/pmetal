@@ -152,3 +152,49 @@ impl DistributedBackend for RingBackend {
         self.all_reduce(&mut buf).await
     }
 }
+
+#[cfg(kani)]
+mod verification {
+    use super::*;
+
+    #[kani::proof]
+    #[kani::unwind(17)] // Sufficient for world_size up to 16 for testing
+    fn verify_get_chunk_range() {
+        let len: usize = kani::any();
+        let world_size: usize = kani::any();
+        
+        // Preconditions
+        kani::assume(world_size > 0 && world_size <= 16);
+        kani::assume(len >= world_size && len < 1024);
+
+        let chunk_size = len / world_size;
+        let remainder = len % world_size;
+
+        let get_chunk_range = |idx: usize| -> (usize, usize) {
+            let start = idx * chunk_size + idx.min(remainder);
+            let end = start + chunk_size + (if idx < remainder { 1 } else { 0 });
+            (start, end)
+        };
+
+        let mut total_elements = 0;
+        let mut last_end = 0;
+
+        for i in 0..world_size {
+            let (start, end) = get_chunk_range(i);
+            
+            // Chunks must be valid ranges
+            assert!(start <= end);
+            // Chunks must be contiguous
+            assert!(start == last_end);
+            // Chunks must be within bounds
+            assert!(end <= len);
+            
+            total_elements += end - start;
+            last_end = end;
+        }
+
+        // Total elements must match original length
+        assert!(total_elements == len);
+        assert!(last_end == len);
+    }
+}

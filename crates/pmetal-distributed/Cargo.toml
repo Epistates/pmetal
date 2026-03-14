@@ -49,5 +49,8 @@ parking_lot = "0.12"
 half = { workspace = true }
 ordered-float = "5"
 
+[dev-dependencies]
+tempfile = { workspace = true }
+
 [lints]
 workspace = true
