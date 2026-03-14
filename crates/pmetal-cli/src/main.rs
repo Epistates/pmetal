@@ -831,6 +831,11 @@ enum DatasetAction {
         /// Skip deduplication
         #[arg(long)]
         no_dedup: bool,
+
+        /// Column mapping: remap source columns to standard names.
+        /// Format: "target=source,target=source" (e.g., "instruction=problem,output=solution")
+        #[arg(long)]
+        columns: Option<String>,
     },
 
     /// Show supported formats and templates
@@ -6798,6 +6803,7 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             val_ratio,
             seed,
             no_dedup,
+            columns,
         } => {
             println!("========================================");
             println!("  PMetal Dataset Prepare");
@@ -6809,6 +6815,9 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             println!("Max seq len: {}", max_seq_len);
             println!("Val ratio:   {:.2}", val_ratio);
             println!("Seed:        {}", seed);
+            if let Some(ref col_str) = columns {
+                println!("Columns:     {}", col_str);
+            }
             println!("========================================\n");
 
             // Create output directory
@@ -6912,6 +6921,20 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             let raw_reader = BufReader::new(raw_file);
             let mut templated_file = std::fs::File::create(&templated_path)?;
 
+            // Parse column mapping once: "target=source,..." => { source -> target }
+            // The user writes "target=source" meaning "rename source column to target".
+            let col_map: Option<std::collections::HashMap<String, String>> =
+                columns.as_deref().map(|s| {
+                    s.split(',')
+                        .filter_map(|pair| {
+                            let mut parts = pair.splitn(2, '=');
+                            let target = parts.next()?.trim().to_string();
+                            let source = parts.next()?.trim().to_string();
+                            Some((source, target))
+                        })
+                        .collect()
+                });
+
             let mut seen_hashes: std::collections::HashSet<u64> = std::collections::HashSet::new();
             let mut total = 0usize;
             let mut kept = 0usize;
@@ -6925,7 +6948,21 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                 }
                 total += 1;
 
-                let json: serde_json::Value = serde_json::from_str(&line)?;
+                let raw_json: serde_json::Value = serde_json::from_str(&line)?;
+
+                // Apply column mapping if provided: rename source keys to target keys.
+                let json = if let Some(ref map) = col_map {
+                    let mut obj = serde_json::Map::new();
+                    if let Some(src_obj) = raw_json.as_object() {
+                        for (k, v) in src_obj {
+                            let new_key = map.get(k.as_str()).cloned().unwrap_or_else(|| k.clone());
+                            obj.insert(new_key, v.clone());
+                        }
+                    }
+                    serde_json::Value::Object(obj)
+                } else {
+                    raw_json
+                };
 
                 // Extract conversations
                 let conversations =
@@ -6938,6 +6975,19 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
                                 Some((from.to_string(), value.to_string()))
                             })
                             .collect::<Vec<_>>()
+                    } else if let Some(problem) = json.get("problem").and_then(|v| v.as_str()) {
+                        // Reasoning format: problem / thinking / solution
+                        let thinking = json.get("thinking").and_then(|v| v.as_str()).unwrap_or("");
+                        let solution = json.get("solution").and_then(|v| v.as_str()).unwrap_or("");
+                        let assistant_msg = if thinking.is_empty() {
+                            solution.to_string()
+                        } else {
+                            format!("<think>\n{}\n</think>\n\n{}", thinking, solution)
+                        };
+                        vec![
+                            ("human".to_string(), problem.to_string()),
+                            ("gpt".to_string(), assistant_msg),
+                        ]
                     } else if let Some(inst) = json.get("instruction").and_then(|v| v.as_str()) {
                         let input_text = json.get("input").and_then(|v| v.as_str()).unwrap_or("");
                         let output_text = json.get("output").and_then(|v| v.as_str()).unwrap_or("");
@@ -7061,6 +7111,16 @@ async fn run_dataset_command(action: DatasetAction) -> anyhow::Result<()> {
             }
 
             token_lengths.sort();
+
+            if token_lengths.is_empty() {
+                println!("\n  No samples to compute statistics for.");
+                println!(
+                    "  Check your dataset format — supported: conversations, problem/solution, instruction/output, text"
+                );
+                println!("  Use --columns to remap custom column names.");
+                return Ok(());
+            }
+
             let p50 = token_lengths[token_lengths.len() / 2];
             let p95 = token_lengths[(token_lengths.len() as f64 * 0.95) as usize];
             let max_len = *token_lengths.last().unwrap_or(&0);
