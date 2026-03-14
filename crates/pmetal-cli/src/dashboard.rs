@@ -186,7 +186,7 @@ pub mod app {
             // Status bar
             let status = if let Some(last) = self.samples.last() {
                 format!(
-                    " Step {} | Loss: {:.4} | {:.0} tok/s | Compiles: 9 (dynamic) ",
+                    " Step {} | Loss: {:.4} | {:.0} tok/s | Pipeline: Fused ANE (dynamic) ",
                     last.step, last.loss, last.tok_sec
                 )
             } else {
@@ -264,8 +264,8 @@ pub mod app {
                     ListItem::new(format!("Tok/sec:   {:.0}", last.tok_sec)),
                     ListItem::new(format!("Samples:   {}", self.samples.len())),
                     ListItem::new(""),
-                    ListItem::new("Pipeline:  Dynamic (9 kernels)".to_string()),
-                    ListItem::new("Compiles:  9 (one-time)".to_string()),
+                    ListItem::new("Pipeline:  Fused ANE (dynamic)".to_string()),
+                    ListItem::new("Compiles:  dynamic (one-time)".to_string()),
                 ]
             } else {
                 vec![ListItem::new("Waiting...")]

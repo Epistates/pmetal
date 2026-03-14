@@ -1,0 +1,72 @@
+# cargo-vet config file
+
+[cargo-vet]
+version = "0.10"
+
+[imports.mozilla]
+url = "https://raw.githubusercontent.com/mozilla/supply-chain/main/audits.toml"
+
+[imports.google]
+url = "https://raw.githubusercontent.com/google/supply-chain/main/audits.toml"
+
+[imports.bytecodealliance]
+url = "https://raw.githubusercontent.com/bytecodealliance/wasmtime/main/supply-chain/audits.toml"
+
+[policy.pmetal-core]
+audit-as-crate-author = true
+
+[policy.pmetal-distributed]
+audit-as-crate-author = true
+
+[policy.pmetal-metal]
+audit-as-crate-author = true
+
+[policy.pmetal-mlx]
+audit-as-crate-author = true
+
+[policy.pmetal-models]
+audit-as-crate-author = true
+
+[policy.pmetal-trainer]
+audit-as-crate-author = true
+
+[policy.pmetal-data]
+audit-as-crate-author = true
+
+[policy.pmetal-lora]
+audit-as-crate-author = true
+
+[policy.pmetal-gguf]
+audit-as-crate-author = true
+
+[policy.pmetal-hub]
+audit-as-crate-author = true
+
+[policy.pmetal-cli]
+audit-as-crate-author = true
+
+[policy.pmetal-py]
+audit-as-crate-author = true
+
+[policy.pmetal]
+audit-as-crate-author = true
+
+[[exemptions.zerocopy]]
+version = "0.8.42"
+criteria = "safe-to-deploy"
+
+[[exemptions.bitcode]]
+version = "0.6.9"
+criteria = "safe-to-deploy"
+
+[[exemptions.objc2]]
+version = "0.6.4"
+criteria = "safe-to-deploy"
+
+[[exemptions.half]]
+version = "2.7.1"
+criteria = "safe-to-deploy"
+
+[[exemptions.num-traits]]
+version = "0.2.19"
+criteria = "safe-to-deploy"

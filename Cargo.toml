@@ -53,7 +53,7 @@ mlx-rs = { version = "0.25.7", package = "pmetal-mlx-rs", features = ["safetenso
 mlx-sys = { version = "=0.2.4", package = "pmetal-mlx-sys" }
 
 # Async runtime
-tokio = { version = "1.49", features = ["full"] }
+tokio = { version = "1.50", features = ["full"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -112,8 +112,8 @@ walkdir = "2"
 memmap2 = "0.9"
 
 # Python bindings
-pyo3 = "0.23"
-pyo3-build-config = "0.23"
+pyo3 = "0.28"
+pyo3-build-config = "0.28"
 
 # Testing
 criterion = "0.8"
@@ -121,7 +121,8 @@ tempfile = "3"
 proptest = "1.5"
 
 [workspace.lints.rust]
-unsafe_code = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
