@@ -1,0 +1,251 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Custom base styles */
+@layer base {
+  :root {
+    --color-bg-primary: theme('colors.white');
+    --color-bg-secondary: theme('colors.surface.50');
+    --color-text-primary: theme('colors.surface.900');
+    --color-text-secondary: theme('colors.surface.500');
+    --color-border: theme('colors.surface.200');
+  }
+
+  .dark {
+    --color-bg-primary: theme('colors.surface.900');
+    --color-bg-secondary: theme('colors.surface.800');
+    --color-text-primary: theme('colors.surface.50');
+    --color-text-secondary: theme('colors.surface.400');
+    --color-border: theme('colors.surface.700');
+  }
+
+  html {
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  body {
+    @apply bg-surface-50 text-surface-900 dark:bg-surface-900 dark:text-surface-50;
+    @apply antialiased;
+  }
+}
+
+/* Custom component styles */
+@layer components {
+  .btn {
+    @apply inline-flex items-center justify-center gap-2;
+    @apply px-4 py-2 rounded-lg font-medium;
+    @apply transition-all duration-150;
+    @apply focus:outline-none focus:ring-2 focus:ring-offset-2;
+    @apply disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .btn-primary {
+    @apply btn;
+    @apply bg-primary-600 text-white;
+    @apply hover:bg-primary-700;
+    @apply focus:ring-primary-500;
+  }
+
+  .btn-accent {
+    @apply btn;
+    @apply bg-accent-500 text-white;
+    @apply hover:bg-accent-600;
+    @apply focus:ring-accent-400;
+  }
+
+  .btn-secondary {
+    @apply btn;
+    @apply bg-surface-200 text-surface-900 dark:bg-surface-700 dark:text-surface-100;
+    @apply hover:bg-surface-300 dark:hover:bg-surface-600;
+    @apply focus:ring-surface-400;
+  }
+
+  .btn-danger {
+    @apply btn;
+    @apply bg-red-600 text-white;
+    @apply hover:bg-red-700;
+    @apply focus:ring-red-500;
+  }
+
+  .btn-ghost {
+    @apply btn;
+    @apply text-surface-600 dark:text-surface-400;
+    @apply hover:bg-surface-100 dark:hover:bg-surface-800;
+    @apply focus:ring-surface-400;
+  }
+
+  .btn-sm {
+    @apply px-3 py-1.5 text-sm;
+  }
+
+  .btn-lg {
+    @apply px-6 py-3 text-lg;
+  }
+
+  .card {
+    @apply bg-white dark:bg-surface-800;
+    @apply rounded-xl border border-surface-200 dark:border-surface-700;
+    @apply shadow-sm;
+  }
+
+  .card-header {
+    @apply px-6 py-4 border-b border-surface-200 dark:border-surface-700;
+  }
+
+  .card-body {
+    @apply p-6;
+  }
+
+  .card-footer {
+    @apply px-6 py-4 border-t border-surface-200 dark:border-surface-700;
+  }
+
+  .input {
+    @apply block w-full rounded-lg;
+    @apply bg-white dark:bg-surface-800;
+    @apply border border-surface-300 dark:border-surface-600;
+    @apply px-4 py-2;
+    @apply text-surface-900 dark:text-surface-100;
+    @apply placeholder-surface-400 dark:placeholder-surface-500;
+    @apply focus:outline-none focus:ring-2 focus:ring-primary-500 focus:border-primary-500;
+    @apply disabled:opacity-50 disabled:cursor-not-allowed;
+  }
+
+  .label {
+    @apply block text-sm font-medium text-surface-700 dark:text-surface-300 mb-1;
+  }
+
+  .badge {
+    @apply inline-flex items-center;
+    @apply px-2.5 py-0.5 rounded-full text-xs font-medium;
+  }
+
+  .badge-primary {
+    @apply badge bg-primary-100 text-primary-800 dark:bg-primary-900 dark:text-primary-200;
+  }
+
+  .badge-accent {
+    @apply badge bg-accent-100 text-accent-800 dark:bg-accent-900/40 dark:text-accent-300;
+  }
+
+  .badge-success {
+    @apply badge bg-green-100 text-green-800 dark:bg-green-900 dark:text-green-200;
+  }
+
+  .badge-warning {
+    @apply badge bg-yellow-100 text-yellow-800 dark:bg-yellow-900 dark:text-yellow-200;
+  }
+
+  .badge-danger {
+    @apply badge bg-red-100 text-red-800 dark:bg-red-900 dark:text-red-200;
+  }
+
+  .badge-neutral {
+    @apply badge bg-surface-100 text-surface-800 dark:bg-surface-700 dark:text-surface-200;
+  }
+
+  .nav-link {
+    @apply flex items-center gap-3 px-4 py-2.5 rounded-lg;
+    @apply text-surface-600 dark:text-surface-400;
+    @apply hover:bg-surface-100 dark:hover:bg-surface-800;
+    @apply hover:text-surface-900 dark:hover:text-surface-100;
+    @apply transition-colors duration-150;
+  }
+
+  .nav-link-active {
+    @apply bg-primary-50 dark:bg-primary-900/30;
+    @apply text-primary-700 dark:text-primary-300;
+    @apply hover:bg-primary-100 dark:hover:bg-primary-900/50;
+  }
+
+  .stat-card {
+    @apply card p-6;
+  }
+
+  .stat-value {
+    @apply text-3xl font-bold text-surface-900 dark:text-surface-100;
+  }
+
+  .stat-label {
+    @apply text-sm text-surface-500 dark:text-surface-400;
+  }
+
+  .progress-bar {
+    @apply h-2 bg-surface-200 dark:bg-surface-700 rounded-full overflow-hidden;
+  }
+
+  .progress-bar-fill {
+    @apply h-full bg-primary-600 rounded-full transition-all duration-300;
+  }
+
+  .progress-bar-fill-accent {
+    @apply h-full bg-accent-500 rounded-full transition-all duration-300;
+  }
+
+  .section-title {
+    @apply text-sm font-semibold text-surface-500 dark:text-surface-400 uppercase tracking-wider mb-3;
+  }
+}
+
+/* Custom utility classes */
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+
+  .scrollbar-thin {
+    scrollbar-width: thin;
+    scrollbar-color: theme('colors.surface.300') theme('colors.surface.100');
+  }
+
+  .dark .scrollbar-thin {
+    scrollbar-color: theme('colors.surface.600') theme('colors.surface.800');
+  }
+
+  .scrollbar-thin::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-track {
+    @apply bg-surface-100 dark:bg-surface-800;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb {
+    @apply bg-surface-300 dark:bg-surface-600 rounded-full;
+  }
+
+  .scrollbar-thin::-webkit-scrollbar-thumb:hover {
+    @apply bg-surface-400 dark:bg-surface-500;
+  }
+}
+
+/* Markdown content rendered in inference chat */
+.markdown-content p.md-p {
+  @apply mb-2 last:mb-0 leading-relaxed;
+}
+
+.markdown-content h1.md-h1 {
+  @apply text-lg font-bold text-surface-900 dark:text-surface-100 mb-2 mt-3;
+}
+
+.markdown-content h2.md-h2 {
+  @apply text-base font-bold text-surface-900 dark:text-surface-100 mb-2 mt-3;
+}
+
+.markdown-content h3.md-h3 {
+  @apply text-sm font-bold text-surface-900 dark:text-surface-100 mb-1 mt-2;
+}
+
+.markdown-content li.md-li {
+  @apply ml-4 mb-1 list-disc;
+}
+
+.markdown-content pre.code-block {
+  @apply bg-surface-900 dark:bg-surface-950 text-surface-100 rounded-lg p-4 my-2 overflow-x-auto text-xs font-mono leading-relaxed;
+}
+
+.markdown-content code.inline-code {
+  @apply bg-surface-100 dark:bg-surface-700 text-surface-800 dark:text-surface-200 rounded px-1.5 py-0.5 text-xs font-mono;
+}

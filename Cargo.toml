@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["fuzz"]
+exclude = ["fuzz", "crates/pmetal-gui/src-tauri"]
 members = [
     "crates/pmetal-core",
     "crates/pmetal-metal",

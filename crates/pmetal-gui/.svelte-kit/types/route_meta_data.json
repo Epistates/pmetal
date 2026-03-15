@@ -1,0 +1,33 @@
+{
+	"/": [
+		"src/routes/+layout.ts",
+		"src/routes/+layout.ts"
+	],
+	"/datasets": [
+		"src/routes/+layout.ts"
+	],
+	"/distillation": [
+		"src/routes/+layout.ts"
+	],
+	"/grpo": [
+		"src/routes/+layout.ts"
+	],
+	"/inference": [
+		"src/routes/+layout.ts"
+	],
+	"/merging": [
+		"src/routes/+layout.ts"
+	],
+	"/models": [
+		"src/routes/+layout.ts"
+	],
+	"/quantize": [
+		"src/routes/+layout.ts"
+	],
+	"/settings": [
+		"src/routes/+layout.ts"
+	],
+	"/training": [
+		"src/routes/+layout.ts"
+	]
+}
