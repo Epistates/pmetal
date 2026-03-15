@@ -14,6 +14,7 @@ By participating in this project, you agree to maintain a respectful and inclusi
 - **macOS**: PMetal targets Apple Silicon exclusively
 - **Xcode Command Line Tools**: `xcode-select --install`
 - **Metal Toolchain**: `xcodebuild -downloadComponent MetalToolchain`
+- **bun** (optional, for GUI development): `brew install oven-sh/bun/bun`
 
 ### Setting Up the Development Environment
 
@@ -22,7 +23,7 @@ By participating in this project, you agree to maintain a respectful and inclusi
 git clone https://github.com/epistates/pmetal.git
 cd pmetal
 
-# Build in debug mode
+# Build CLI + TUI
 cargo build
 
 # Run tests
@@ -30,6 +31,11 @@ cargo test --all
 
 # Run clippy
 cargo clippy --all -- -D warnings
+
+# GUI development (requires bun + Tauri CLI)
+cd crates/pmetal-gui
+bun install
+bun tauri dev
 ```
 
 ## How to Contribute
