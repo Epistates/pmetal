@@ -5,6 +5,21 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.5] - 2026-03-15
+
+### Fixed
+
+- **Premature early stop during LoRA training**: The adaptive LR controller was falsely detecting "divergence" from the normal LoRA initialization loss rise (LoRA B starts at zero → first 5-10% of steps naturally increase loss). This triggered rollback cycles that exhausted `max_rollbacks` and killed training at ~5% progress. Fixed with three changes:
+  - **Grace period** (`warmup_fraction: 0.1`): No spike/plateau/divergence detection fires during the first 10% of training steps. EMA and loss window still accumulate during this period so detection is primed when it activates
+  - **Rollback disabled by default** (`rollback_enabled: false`): Weight rollback undoes valid LoRA weight updates and causes the same initialization pattern to repeat. Now opt-in for long pre-training runs
+  - **Less sensitive thresholds**: `divergence_slope_threshold` 0.01 → 0.05, `divergence_window` 20 → 40, `plateau_patience` 50 → 100, `spike_threshold` 3.0 → 3.5
+- **Adaptive LR grace period not applied**: `set_total_steps()` is now called by all 7 training entry points (5 in `TrainingLoop`, 1 in `GrpoTrainer`, 1 in `DistillationTrainer`) to compute the grace period from total steps
+
+### Changed
+
+- **Adaptive LR defaults**: Retuned for LoRA fine-tuning rather than pre-training. The controller now acts as a safety net (catches NaN, true catastrophic divergence) rather than an aggressive optimizer
+- **Distillation adaptive LR**: `for_distillation()` config uses shorter 5% grace period (distillation has smoother early loss) and tighter divergence thresholds
+
 ## [0.3.4] - 2026-03-14
 
 ### Added
