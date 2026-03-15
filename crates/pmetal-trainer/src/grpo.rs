@@ -718,6 +718,9 @@ impl GrpoTrainer {
         let n_epochs = self.training_config.num_epochs;
         let n_samples = dataset.samples().len();
         let total_steps = n_samples * n_epochs;
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            ctrl.set_total_steps(total_steps);
+        }
 
         for cb in &mut self.callbacks {
             cb.on_train_start();

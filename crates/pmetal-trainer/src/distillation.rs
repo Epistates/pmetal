@@ -183,6 +183,9 @@ impl DistillationTrainer {
             dl.num_batches()
         };
         let total_steps = steps_per_epoch * num_epochs;
+        if let Some(ref mut ctrl) = self.loop_state.adaptive_lr {
+            ctrl.set_total_steps(total_steps);
+        }
 
         // Notify callbacks
         for cb in &mut self.loop_state.callbacks {

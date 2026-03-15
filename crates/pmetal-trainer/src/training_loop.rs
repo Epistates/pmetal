@@ -1079,6 +1079,9 @@ impl TrainingLoop {
             .len()
             .div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            ctrl.set_total_steps(computed_total_steps);
+        }
 
         for epoch in 0..num_epochs {
             self.epoch = epoch;
@@ -1305,6 +1308,9 @@ impl TrainingLoop {
             .len()
             .div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            ctrl.set_total_steps(computed_total_steps);
+        }
 
         for epoch in 0..num_epochs {
             self.epoch = epoch;
@@ -1645,6 +1651,9 @@ impl TrainingLoop {
             .len()
             .div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            ctrl.set_total_steps(computed_total_steps);
+        }
 
         // =========================================================================
         // PHASE 1: WARMUP - Initialize optimizer states with one step
@@ -2026,6 +2035,9 @@ impl TrainingLoop {
             .len()
             .div_ceil(self.config.training.batch_size);
         let computed_total_steps = max_steps.unwrap_or(num_epochs * steps_per_epoch_est);
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            ctrl.set_total_steps(computed_total_steps);
+        }
 
         tracing::info!(
             "Starting JIT-compiled training: {} trainable params (state_count={})",
@@ -2298,6 +2310,9 @@ impl TrainingLoop {
 
         // Compute actual total steps: max_steps takes priority, otherwise epochs * batches_per_epoch
         let computed_total_steps = max_steps.unwrap_or(num_epochs * stats.num_batches);
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            ctrl.set_total_steps(computed_total_steps);
+        }
 
         // Create state tuple for training
         let mut state = (model, optimizer);

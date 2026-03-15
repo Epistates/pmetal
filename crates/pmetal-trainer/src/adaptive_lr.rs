@@ -140,6 +140,10 @@ pub struct AdaptiveLrConfig {
     /// Enable weight rollback on sustained divergence.
     /// When true, divergence triggers weight restoration from the best in-memory
     /// snapshot instead of just reducing LR.
+    ///
+    /// **Off by default.** Rollback is counterproductive for typical LoRA fine-tuning
+    /// where early loss increases are expected (LoRA B initializes at zero). Enable
+    /// this for long pre-training runs or when you know the loss landscape is stable.
     pub rollback_enabled: bool,
 
     /// Maximum number of rollback attempts before early stopping.
@@ -147,6 +151,14 @@ pub struct AdaptiveLrConfig {
 
     /// LR multiplier applied on each rollback (cumulative with existing reductions).
     pub rollback_lr_factor: f64,
+
+    /// Fraction of total training steps to skip before activating any adaptive logic
+    /// (spike, plateau, divergence detection). During this grace period, only manual
+    /// overrides are processed. This prevents false triggers from the normal
+    /// early-training loss rise in LoRA fine-tuning.
+    ///
+    /// Default: 0.1 (10% of total steps). Set to 0.0 to disable.
+    pub warmup_fraction: f64,
 }
 
 impl Default for AdaptiveLrConfig {
@@ -154,21 +166,22 @@ impl Default for AdaptiveLrConfig {
         Self {
             enabled: true,
             ema_alpha: 0.97,
-            spike_threshold: 3.0,
+            spike_threshold: 3.5,
             spike_cooldown_steps: 10,
             spike_reduction_factor: 0.3,
-            plateau_patience: 50,
+            plateau_patience: 100,
             plateau_factor: 0.5,
             plateau_min_delta: 1e-4,
             plateau_max_reductions: 5,
-            divergence_window: 20,
-            divergence_factor: 0.3,
-            divergence_slope_threshold: 0.01,
+            divergence_window: 40,
+            divergence_factor: 0.5,
+            divergence_slope_threshold: 0.05,
             min_lr: 1e-7,
             control_poll_interval: 10,
-            rollback_enabled: true,
-            max_rollbacks: 3,
+            rollback_enabled: false,
+            max_rollbacks: 5,
             rollback_lr_factor: 0.5,
+            warmup_fraction: 0.1,
         }
     }
 }
@@ -177,12 +190,13 @@ impl AdaptiveLrConfig {
     /// Config tuned for knowledge distillation (more conservative).
     pub fn for_distillation() -> Self {
         Self {
-            spike_threshold: 2.5, // More sensitive — distillation losses are smoother
+            spike_threshold: 3.0, // Slightly more sensitive — distillation losses are smoother
             spike_cooldown_steps: 15,
-            plateau_patience: 30, // React faster to plateaus
+            plateau_patience: 50, // React faster than SFT
             plateau_factor: 0.5,
-            divergence_window: 15,
-            divergence_slope_threshold: 0.005, // More sensitive to divergence
+            divergence_window: 30,
+            divergence_slope_threshold: 0.03, // More sensitive to divergence than SFT
+            warmup_fraction: 0.05, // Shorter grace period (distillation has stable early loss)
             ..Self::default()
         }
     }
@@ -206,6 +220,12 @@ pub enum LrControlCommand {
 /// adjustments based on training dynamics.
 pub struct AdaptiveLrController {
     config: AdaptiveLrConfig,
+
+    // --- Training duration (for warmup_fraction) ---
+    total_steps: usize,
+    /// Computed from warmup_fraction * total_steps. No adaptive logic fires
+    /// before this step (except manual overrides and NaN detection).
+    grace_period_steps: usize,
 
     // --- EMA loss tracking (spike detection) ---
     loss_ema: f64,
@@ -257,7 +277,9 @@ impl AdaptiveLrController {
     /// Create a new adaptive LR controller.
     pub fn new(config: AdaptiveLrConfig) -> Self {
         Self {
-            warmup_samples: 20, // Need 20 loss samples before spike detection activates
+            total_steps: 0,
+            grace_period_steps: 30, // Minimum default; recomputed by set_total_steps()
+            warmup_samples: 30, // Need 30 loss samples before spike detection activates
             loss_ema: 0.0,
             loss_ema_var: 0.0,
             ema_initialized: false,
@@ -282,6 +304,32 @@ impl AdaptiveLrController {
             total_divergence_reductions: 0,
             config,
         }
+    }
+
+    /// Set the total number of training steps.
+    ///
+    /// This is used to compute the grace period from `warmup_fraction`.
+    /// Call this before training starts (e.g., after computing total steps
+    /// from epochs × batches). If not called, the grace period defaults to
+    /// `warmup_samples` (30 steps).
+    pub fn set_total_steps(&mut self, total_steps: usize) {
+        self.total_steps = total_steps;
+        self.grace_period_steps =
+            (total_steps as f64 * self.config.warmup_fraction).ceil() as usize;
+        // Ensure grace period is at least as long as EMA warmup
+        if self.grace_period_steps < self.warmup_samples {
+            self.grace_period_steps = self.warmup_samples;
+        }
+        tracing::info!(
+            "Adaptive LR: grace period = {} steps ({:.0}% of {} total). \
+             Rollback: {}. Divergence window: {}, slope threshold: {:.3}.",
+            self.grace_period_steps,
+            self.config.warmup_fraction * 100.0,
+            total_steps,
+            if self.config.rollback_enabled { "enabled" } else { "disabled" },
+            self.config.divergence_window,
+            self.config.divergence_slope_threshold,
+        );
     }
 
     /// Set the control file path for TUI → training communication.
@@ -324,13 +372,21 @@ impl AdaptiveLrController {
             return (manual, LrEvent::ManualOverride { lr: manual });
         }
 
-        // 2. Update EMA loss tracking
+        // 2. Update EMA loss tracking (always, even during grace period)
         self.update_ema(loss);
 
         // 3. Update loss window for divergence detection
         self.loss_window.push_back(loss);
         if self.loss_window.len() > self.config.divergence_window {
             self.loss_window.pop_front();
+        }
+
+        // 3a. Grace period: skip all adaptive logic during early training.
+        // This prevents false triggers from the normal LoRA initialization
+        // loss increase (LoRA B starts at zero → first steps increase loss).
+        if step < self.grace_period_steps {
+            let base_lr = scheduled_lr * self.lr_multiplier;
+            return (base_lr.max(self.config.min_lr), LrEvent::Scheduled);
         }
 
         // 4. Apply adaptive logic (in priority order)
@@ -764,15 +820,44 @@ pub fn write_lr_control(output_dir: &Path, command: &LrControlCommand) -> std::i
 mod tests {
     use super::*;
 
+    /// Helper: create a controller with grace period disabled for unit testing.
+    fn test_controller(config: AdaptiveLrConfig) -> AdaptiveLrController {
+        let mut ctrl = AdaptiveLrController::new(config);
+        ctrl.grace_period_steps = 0; // Disable grace period for unit tests
+        ctrl
+    }
+
     #[test]
     fn test_no_intervention_during_warmup() {
         let config = AdaptiveLrConfig::default();
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
 
-        // During EMA warmup (first 20 steps), no adaptive logic should fire
-        for i in 0..20 {
+        // During EMA warmup (first 30 steps), no adaptive logic should fire
+        for i in 0..30 {
             let (lr, event) = ctrl.step(i, 10.0 + (i as f64) * 0.5, 1e-4);
             assert!(matches!(event, LrEvent::Scheduled));
+            assert!((lr - 1e-4).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn test_grace_period_blocks_detection() {
+        let config = AdaptiveLrConfig {
+            warmup_fraction: 0.1,
+            spike_threshold: 2.0,
+            ..Default::default()
+        };
+        let mut ctrl = AdaptiveLrController::new(config);
+        ctrl.set_total_steps(1000); // grace = 100 steps
+
+        // Feed wildly increasing losses during grace period — should NOT trigger
+        for i in 0..99 {
+            let loss = 5.0 + (i as f64) * 2.0;
+            let (lr, event) = ctrl.step(i, loss, 1e-4);
+            assert!(
+                matches!(event, LrEvent::Scheduled),
+                "No detection should fire during grace period, got {event:?} at step {i}"
+            );
             assert!((lr - 1e-4).abs() < 1e-10);
         }
     }
@@ -785,15 +870,15 @@ mod tests {
             spike_reduction_factor: 0.1,
             ..Default::default()
         };
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
 
         // Feed stable losses to build EMA
-        for i in 0..25 {
+        for i in 0..35 {
             ctrl.step(i, 5.0, 1e-4);
         }
 
         // Inject a massive spike
-        let (lr, event) = ctrl.step(25, 50.0, 1e-4);
+        let (lr, event) = ctrl.step(35, 50.0, 1e-4);
         assert!(matches!(event, LrEvent::SpikeDetected { .. }));
         assert!(lr < 1e-4); // LR should be reduced
     }
@@ -807,7 +892,7 @@ mod tests {
             spike_threshold: 100.0, // High threshold so spike detection doesn't interfere
             ..Default::default()
         };
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
         // Manually set up stable EMA so spike detection doesn't trigger
         ctrl.warmup_samples = 0;
         ctrl.ema_initialized = true;
@@ -816,7 +901,6 @@ mod tests {
         ctrl.best_loss = 4.5;
 
         // Feed flat losses (no improvement beyond min_delta)
-        // Patience=5 means 5 flat steps before reduction: steps 0-4 increment counter, step 5 triggers
         let mut found_plateau = false;
         for i in 0..10 {
             let (lr, event) = ctrl.step(i, 4.5, 1e-4);
@@ -840,7 +924,7 @@ mod tests {
             divergence_factor: 0.3,
             ..Default::default()
         };
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
         ctrl.warmup_samples = 0;
         ctrl.ema_initialized = true;
 
@@ -859,7 +943,7 @@ mod tests {
     #[test]
     fn test_manual_override() {
         let config = AdaptiveLrConfig::default();
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
         ctrl.manual_lr = Some(5e-6);
 
         let (lr, event) = ctrl.step(0, 10.0, 1e-4);
@@ -876,7 +960,7 @@ mod tests {
             plateau_max_reductions: 100,
             ..Default::default()
         };
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
         ctrl.warmup_samples = 0;
         ctrl.ema_initialized = true;
         ctrl.best_loss = 1.0;
@@ -896,49 +980,46 @@ mod tests {
             spike_reduction_factor: 0.1,
             ..Default::default()
         };
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
 
         // Build stable EMA
-        for i in 0..25 {
+        for i in 0..35 {
             ctrl.step(i, 5.0, 1e-4);
         }
 
         // Spike
-        let (lr, _) = ctrl.step(25, 100.0, 1e-4);
+        let (lr, _) = ctrl.step(35, 100.0, 1e-4);
         assert!(lr < 1e-4);
 
         // Cooldown steps
-        ctrl.step(26, 5.0, 1e-4);
-        ctrl.step(27, 5.0, 1e-4);
+        ctrl.step(36, 5.0, 1e-4);
+        ctrl.step(37, 5.0, 1e-4);
 
         // Recovery
-        let (lr, event) = ctrl.step(28, 5.0, 1e-4);
+        let (lr, event) = ctrl.step(38, 5.0, 1e-4);
         assert!(matches!(event, LrEvent::SpikeRecovered));
-        // LR should be back to normal (possibly with multiplier but no spike reduction)
         assert!((lr - 1e-4).abs() < 1e-8);
     }
 
     #[test]
     fn test_nan_loss_does_not_poison_ema() {
         let config = AdaptiveLrConfig::default();
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
 
         // Build stable EMA
-        for i in 0..25 {
+        for i in 0..35 {
             ctrl.step(i, 5.0, 1e-4);
         }
         let ema_before = ctrl.loss_ema;
 
         // Feed NaN — should be skipped
-        let (lr, event) = ctrl.step(25, f64::NAN, 1e-4);
+        let (lr, event) = ctrl.step(35, f64::NAN, 1e-4);
         assert!(matches!(event, LrEvent::Scheduled));
         assert!(lr.is_finite());
-
-        // EMA should be unchanged
         assert!((ctrl.loss_ema - ema_before).abs() < 1e-12);
 
         // Feed Inf — should be skipped
-        let (lr, event) = ctrl.step(26, f64::INFINITY, 1e-4);
+        let (lr, event) = ctrl.step(36, f64::INFINITY, 1e-4);
         assert!(matches!(event, LrEvent::Scheduled));
         assert!(lr.is_finite());
         assert!((ctrl.loss_ema - ema_before).abs() < 1e-12);
@@ -950,14 +1031,13 @@ mod tests {
             spike_threshold: 3.0,
             ..Default::default()
         };
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
         ctrl.warmup_samples = 0;
         ctrl.ema_initialized = true;
-        ctrl.ema_step_count = 100; // Enough steps for bias correction to be ~1.0
+        ctrl.ema_step_count = 100;
         ctrl.loss_ema = 5.0;
-        ctrl.loss_ema_var = 0.0; // Zero variance
+        ctrl.loss_ema_var = 0.0;
 
-        // Large deviation from EMA should trigger spike via fallback
         let (lr, event) = ctrl.step(0, 50.0, 1e-4);
         assert!(
             matches!(event, LrEvent::SpikeDetected { .. }),
@@ -976,7 +1056,7 @@ mod tests {
             rollback_lr_factor: 0.5,
             ..Default::default()
         };
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
         ctrl.warmup_samples = 0;
         ctrl.ema_initialized = true;
 
@@ -985,7 +1065,6 @@ mod tests {
             ctrl.step(i, 3.0, 1e-4);
             ctrl.should_snapshot_best(i);
         }
-        // Mark that the training loop has taken a snapshot
         ctrl.has_best_snapshot = true;
         assert!(ctrl.best_ema_loss < f64::MAX);
 
@@ -1013,10 +1092,10 @@ mod tests {
             rollback_enabled: true,
             max_rollbacks: 2,
             rollback_lr_factor: 0.5,
-            spike_threshold: 100.0, // Disable spike detection
+            spike_threshold: 100.0,
             ..Default::default()
         };
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
         ctrl.warmup_samples = 0;
         ctrl.ema_initialized = true;
         ctrl.has_best_snapshot = true;
@@ -1027,9 +1106,7 @@ mod tests {
         let mut early_stopped = false;
         let mut step = 0;
 
-        // Keep triggering divergence until we exhaust rollbacks
         for _ in 0..10 {
-            // Feed diverging losses
             for j in 0..10 {
                 let loss = 2.0 + (j as f64) * 0.5;
                 let (_lr, event) = ctrl.step(step, loss, 1e-4);
@@ -1037,7 +1114,6 @@ mod tests {
 
                 match event {
                     LrEvent::RollbackTriggered { .. } => {
-                        // Reset state as training loop would
                         ctrl.on_rollback_complete();
                     }
                     LrEvent::EarlyStop { rollback_count, .. } => {
@@ -1067,11 +1143,10 @@ mod tests {
             rollback_enabled: false,
             ..Default::default()
         };
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
         ctrl.warmup_samples = 0;
         ctrl.ema_initialized = true;
 
-        // Feed steadily increasing losses
         let mut diverged = false;
         for i in 0..15 {
             let loss = 5.0 + (i as f64) * 0.5;
@@ -1095,23 +1170,49 @@ mod tests {
             rollback_enabled: true,
             ..Default::default()
         };
-        let mut ctrl = AdaptiveLrController::new(config);
+        let mut ctrl = test_controller(config);
 
-        // Not initialized yet — should not snapshot
         assert!(!ctrl.should_snapshot_best(0));
 
-        // Initialize EMA
         ctrl.step(0, 5.0, 1e-4);
-        assert!(ctrl.should_snapshot_best(0)); // First real loss → new best
+        assert!(ctrl.should_snapshot_best(0));
 
-        // Worse loss — should not snapshot
         ctrl.step(1, 6.0, 1e-4);
         assert!(!ctrl.should_snapshot_best(1));
 
-        // Better loss — should snapshot
         for i in 2..30 {
-            ctrl.step(i, 3.0, 1e-4); // Drive EMA below 5.0
+            ctrl.step(i, 3.0, 1e-4);
         }
-        assert!(ctrl.should_snapshot_best(30)); // EMA should now be < initial best
+        assert!(ctrl.should_snapshot_best(30));
+    }
+
+    #[test]
+    fn test_default_rollback_disabled() {
+        let config = AdaptiveLrConfig::default();
+        assert!(!config.rollback_enabled, "Rollback should be off by default");
+    }
+
+    #[test]
+    fn test_lora_early_loss_rise_completes_training() {
+        // Simulate the exact pattern that caused premature early stop:
+        // LoRA init causes loss to rise from 0.95 → 1.3, then steadily drops.
+        // With default config (rollback off, 10% grace period), training should continue.
+        let config = AdaptiveLrConfig::default();
+        let mut ctrl = AdaptiveLrController::new(config);
+        ctrl.set_total_steps(2500); // Grace period = 250 steps
+
+        // Simulate: steps 0-30 loss rises (LoRA init), steps 30-250 loss drops
+        for i in 0..250 {
+            let loss = if i < 30 {
+                0.95 + (i as f64) * 0.015 // Rise from 0.95 to ~1.4
+            } else {
+                1.4 - ((i - 30) as f64) * 0.003 // Drop from 1.4 to ~0.74
+            };
+            let (_lr, event) = ctrl.step(i, loss, 1e-4);
+            assert!(
+                !matches!(event, LrEvent::EarlyStop { .. } | LrEvent::RollbackTriggered { .. }),
+                "Should NOT trigger rollback/early-stop during grace period at step {i}, got {event:?}"
+            );
+        }
     }
 }
