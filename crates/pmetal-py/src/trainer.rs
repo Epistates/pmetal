@@ -6,6 +6,9 @@ use pyo3::prelude::*;
 use pyo3::types::PyDict;
 use tracing::info_span;
 
+use crate::callbacks::{
+    PyLoggingCallback, PyMetricsJsonCallback, PyProgressCallback, PythonCallbackBridge,
+};
 use crate::config::{PyLoraConfig, PyTrainingConfig};
 use crate::error::pmetal_to_pyerr;
 use crate::hub::is_hf_model_id;
@@ -18,6 +21,49 @@ fn training_err(e: impl std::fmt::Display) -> pmetal_core::PMetalError {
 /// Map any Display error to `PMetalError::ModelLoad`.
 fn model_err(e: impl std::fmt::Display) -> pmetal_core::PMetalError {
     pmetal_core::PMetalError::ModelLoad(e.to_string())
+}
+
+fn build_training_callbacks(
+    py: Python<'_>,
+    py_callbacks: &[Py<PyAny>],
+) -> PyResult<Vec<Box<dyn pmetal_core::TrainingCallback>>> {
+    let mut rust_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = Vec::new();
+    let mut bridged_callbacks = Vec::new();
+
+    for callback in py_callbacks {
+        let bound = callback.bind(py);
+
+        if let Ok(progress) = bound.extract::<PyRef<'_, PyProgressCallback>>() {
+            rust_callbacks.push(Box::new(pmetal_trainer::ProgressCallback::new(
+                progress.total_steps,
+            )));
+            continue;
+        }
+
+        if let Ok(logging) = bound.extract::<PyRef<'_, PyLoggingCallback>>() {
+            rust_callbacks.push(Box::new(pmetal_trainer::LoggingCallback::new(
+                logging.log_every,
+            )));
+            continue;
+        }
+
+        if let Ok(metrics) = bound.extract::<PyRef<'_, PyMetricsJsonCallback>>() {
+            let callback = pmetal_trainer::MetricsJsonCallback::new(&metrics.path)
+                .map_err(|e| pyo3::exceptions::PyIOError::new_err(e.to_string()))?;
+            rust_callbacks.push(Box::new(callback));
+            continue;
+        }
+
+        bridged_callbacks.push(callback.clone_ref(py));
+    }
+
+    if !bridged_callbacks.is_empty() {
+        rust_callbacks.push(Box::new(PythonCallbackBridge {
+            py_callbacks: bridged_callbacks,
+        }));
+    }
+
+    Ok(rust_callbacks)
 }
 
 #[pyclass(name = "Trainer")]
@@ -71,8 +117,9 @@ impl PyTrainer {
 
     /// Add a Python callback object.
     ///
-    /// Note: Callbacks are not yet wired into the training loop.
-    /// This method stores the callback for future use.
+    /// Built-in PMetal callback classes are mapped to their native Rust
+    /// implementations. Arbitrary Python objects are bridged through the
+    /// training callback interface if they implement callback methods.
     fn add_callback(&mut self, callback: Py<PyAny>) {
         self.py_callbacks.push(callback);
     }
@@ -102,14 +149,7 @@ impl PyTrainer {
     /// Returns:
     ///     dict with keys: final_loss, total_steps, total_tokens, output_dir, lora_weights_path
     fn train<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
-        // Warn if callbacks are registered but not yet functional
-        if !self.py_callbacks.is_empty() {
-            let warnings = py.import("warnings")?;
-            warnings.call_method1(
-                "warn",
-                ("Callbacks are registered but not yet connected to the training loop. They will not fire.",),
-            )?;
-        }
+        let rust_callbacks = build_training_callbacks(py, &self.py_callbacks)?;
 
         // Capture all settings before releasing the GIL
         let model_id = self.model_id.clone();
@@ -122,6 +162,7 @@ impl PyTrainer {
         let gradient_checkpointing = self.gradient_checkpointing;
         let metal_fused_optimizer = self.metal_fused_optimizer;
         let embedding_lr = self.embedding_lr;
+        let mut rust_callbacks = rust_callbacks;
 
         // Use PMetalError as the intermediate error type to preserve exception fidelity
         let result = py
@@ -235,6 +276,9 @@ impl PyTrainer {
                     };
 
                     let mut training_loop = pmetal_trainer::TrainingLoop::new(loop_config);
+                    for callback in rust_callbacks.drain(..) {
+                        training_loop.add_callback(callback);
+                    }
 
                     // Run training
                     let model = {
