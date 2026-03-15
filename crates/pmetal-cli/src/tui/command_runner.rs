@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
-use futures::FutureExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -137,24 +136,13 @@ fn pmetal_binary() -> PathBuf {
     PathBuf::from("pmetal")
 }
 
-#[derive(Debug)]
-struct CancelledRun;
-
 struct CancelOnToken {
     token: CancellationToken,
 }
 
 impl pmetal_core::TrainingCallback for CancelOnToken {
-    fn on_step_start(&mut self, _step: usize) {
-        if self.token.is_cancelled() {
-            std::panic::panic_any(CancelledRun);
-        }
-    }
-
-    fn on_step_end(&mut self, _step: usize, _loss: f64) {
-        if self.token.is_cancelled() {
-            std::panic::panic_any(CancelledRun);
-        }
+    fn should_stop(&self) -> bool {
+        self.token.is_cancelled()
     }
 }
 
@@ -483,7 +471,7 @@ async fn run_training_direct(
         token: cancel.clone(),
     })];
 
-    let result = std::panic::AssertUnwindSafe(crate::run_training(
+    crate::run_training(
         None,
         Some(model),
         Some(dataset),
@@ -513,11 +501,8 @@ async fn run_training_direct(
         callbacks,
         None,
         !has_flag(&spec.args, "--no-ane"),
-    ))
-    .catch_unwind()
-    .await;
-
-    map_cancelled_result(result)
+    )
+    .await
 }
 
 async fn run_distillation_direct(
@@ -535,7 +520,7 @@ async fn run_distillation_direct(
         token: cancel.clone(),
     })];
 
-    let result = std::panic::AssertUnwindSafe(crate::run_distillation_cli(
+    crate::run_distillation_cli(
         &teacher,
         &student,
         &dataset,
@@ -555,11 +540,8 @@ async fn run_distillation_direct(
         spec.metrics_file.as_ref().map(|p| p.display().to_string()),
         false,
         callbacks,
-    ))
-    .catch_unwind()
-    .await;
-
-    map_cancelled_result(result)
+    )
+    .await
 }
 
 async fn run_grpo_direct(
@@ -575,7 +557,7 @@ async fn run_grpo_direct(
 
     let grpo_type = optional_arg(&spec.args, "--grpo-type").unwrap_or_else(|| "bnpo".to_string());
 
-    let result = std::panic::AssertUnwindSafe(crate::run_grpo_cli(
+    crate::run_grpo_cli(
         &model,
         &dataset,
         &output,
@@ -593,21 +575,8 @@ async fn run_grpo_direct(
         spec.metrics_file.as_ref().map(|p| p.display().to_string()),
         false,
         callbacks,
-    ))
-    .catch_unwind()
-    .await;
-
-    map_cancelled_result(result)
-}
-
-fn map_cancelled_result(
-    result: std::result::Result<Result<(), anyhow::Error>, Box<dyn std::any::Any + Send>>,
-) -> Result<(), anyhow::Error> {
-    match result {
-        Ok(inner) => inner,
-        Err(payload) if payload.is::<CancelledRun>() => Err(anyhow::anyhow!("Cancelled by user")),
-        Err(_) => Err(anyhow::anyhow!("Background task panicked")),
-    }
+    )
+    .await
 }
 
 fn optional_arg(args: &[String], flag: &str) -> Option<String> {

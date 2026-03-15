@@ -538,6 +538,11 @@ impl TrainingLoop {
         std::mem::take(&mut self.callbacks)
     }
 
+    /// Returns true if any callback has requested training to stop.
+    fn check_cancelled(&self) -> bool {
+        self.callbacks.iter().any(|cb| cb.should_stop())
+    }
+
     /// Get current learning rate based on scheduler.
     ///
     /// Delegates to the canonical `pmetal_core::LearningRateScheduler` so all
@@ -1186,6 +1191,10 @@ impl TrainingLoop {
                         for cb in &mut self.callbacks {
                             cb.on_step_end_with_metrics(&step_metrics);
                         }
+                        if self.check_cancelled() {
+                            tracing::info!("Training cancelled by callback at step {}", self.step);
+                            return Err(SftError::Cancelled);
+                        }
                     }
                 }
 
@@ -1405,6 +1414,10 @@ impl TrainingLoop {
                     };
                     for cb in &mut self.callbacks {
                         cb.on_step_end_with_metrics(&step_metrics);
+                    }
+                    if self.check_cancelled() {
+                        tracing::info!("Training cancelled by callback at step {}", self.step);
+                        return Err(SftError::Cancelled);
                     }
                 }
 
@@ -1933,6 +1946,10 @@ impl TrainingLoop {
                         for cb in &mut self.callbacks {
                             cb.on_step_end_with_metrics(&step_metrics);
                         }
+                        if self.check_cancelled() {
+                            tracing::info!("Training cancelled by callback at step {}", self.step);
+                            return Err(SftError::Cancelled);
+                        }
                     }
                 }
 
@@ -2225,6 +2242,10 @@ impl TrainingLoop {
                         };
                         for cb in &mut self.callbacks {
                             cb.on_step_end_with_metrics(&step_metrics);
+                        }
+                        if self.check_cancelled() {
+                            tracing::info!("Training cancelled by callback at step {}", self.step);
+                            return Err(SftError::Cancelled);
                         }
                     }
 
@@ -2530,6 +2551,10 @@ impl TrainingLoop {
                         };
                         for cb in &mut self.callbacks {
                             cb.on_step_end_with_metrics(&step_metrics);
+                        }
+                        if self.check_cancelled() {
+                            tracing::info!("Training cancelled by callback at step {}", self.step);
+                            return Err(SftError::Cancelled);
                         }
                     }
                 }

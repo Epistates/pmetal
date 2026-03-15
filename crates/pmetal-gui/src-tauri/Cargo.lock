@@ -5570,7 +5570,6 @@ version = "0.3.6"
 dependencies = [
  "chrono",
  "dirs",
- "futures-util",
  "pmetal",
  "pmetal-mlx-rs",
  "reqwest 0.13.2",
@@ -5583,7 +5582,6 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
- "which",
 ]
 
 [[package]]
@@ -8952,15 +8950,6 @@ name = "weezl"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
-
-[[package]]
-name = "which"
-version = "8.0.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81995fafaaaf6ae47a7d0cc83c67caf92aeb7e5331650ae6ff856f7c0c60c459"
-dependencies = [
- "libc",
-]
 
 [[package]]
 name = "widestring"

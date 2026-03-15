@@ -34,6 +34,9 @@ pub enum OrpoError {
     /// Configuration error.
     #[error("Configuration error: {0}")]
     Config(String),
+    /// Training was cancelled by a callback.
+    #[error("Training cancelled")]
+    Cancelled,
 }
 
 /// Result type for ORPO operations.
@@ -164,53 +167,13 @@ impl OrpoTrainer {
         chosen_avg_log_probs: &Array,
         rejected_avg_log_probs: &Array,
     ) -> OrpoResult<(Array, Array, Array, Array, Array)> {
-        // 1. SFT Loss: Negative Log Likelihood of chosen response
-        // chosen_log_probs is sum(log P(y_w|x))
-        // We want -mean(chosen_log_probs) / mean(sequence_length) usually,
-        // but here we return per-batch losses to be averaged later if needed.
-        // Standard PyTorch CrossEntropy is -log_prob.
-        let sft_loss = chosen_log_probs.negative()?;
-
-        // 2. Odds Ratio Loss
-        // log_odds = log(P / (1 - P))
-        // Since we have log_P (average per token), we can approximate P per token as exp(avg_log_P)
-        // log_odds = avg_log_P - log(1 - exp(avg_log_P))
-
-        let compute_log_odds = |avg_log_p: &Array| -> OrpoResult<Array> {
-            let p = avg_log_p.exp()?;
-            let one = Array::from_f32(1.0);
-            let one_minus_p = one.subtract(&p)?;
-
-            // Numerical stability: clip 1-p to avoid log(0)
-            let epsilon = Array::from_f32(1e-10);
-            let one_minus_p_safe = mlx_rs::ops::maximum(&one_minus_p, &epsilon)?;
-
-            let log_one_minus_p = one_minus_p_safe.log()?;
-            Ok(avg_log_p.subtract(&log_one_minus_p)?)
-        };
-
-        let log_odds_chosen = compute_log_odds(chosen_avg_log_probs)?;
-        let log_odds_rejected = compute_log_odds(rejected_avg_log_probs)?;
-
-        // ratio = log_odds_chosen - log_odds_rejected
-        // loss = -log(sigmoid(ratio)) = softplus(-ratio)
-        let ratio = log_odds_chosen.subtract(&log_odds_rejected)?;
-        let neg_ratio = ratio.negative()?;
-        let or_loss = mlx_rs::nn::softplus(&neg_ratio)?;
-
-        // Total loss = SFT_loss + beta * OR_loss
-        let beta = Array::from_f32(self.config.beta as f32);
-        let weighted_or_loss = or_loss.multiply(&beta)?;
-        let total_loss = sft_loss.add(&weighted_or_loss)?;
-
-        // Return mean losses over batch
-        Ok((
-            total_loss.mean(None)?,
-            sft_loss.mean(None)?,
-            or_loss.mean(None)?,
-            log_odds_chosen,
-            log_odds_rejected,
-        ))
+        Self::compute_orpo_loss_static(
+            &self.config,
+            chosen_log_probs,
+            chosen_avg_log_probs,
+            rejected_avg_log_probs,
+        )
+        .map_err(OrpoError::Mlx)
     }
 
     /// Get current training step.
@@ -259,6 +222,10 @@ impl OrpoTrainer {
                 let (chosen_inputs, chosen_labels, rejected_inputs, rejected_labels) =
                     Self::batch_preference_pairs(batch)?;
                 let config = self.config.clone();
+                // Capture metric arrays from inside the closure to avoid a second forward pass.
+                let metrics_cell: std::cell::RefCell<
+                    Option<(Array, Array, Array, Array)>,
+                > = std::cell::RefCell::new(None);
                 let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
                     let chosen_logits = model
                         .forward(&chosen_inputs, None)
@@ -270,12 +237,15 @@ impl OrpoTrainer {
                         Self::compute_log_probs_static(&chosen_logits, &chosen_labels)?;
                     let (_, rejected_avg_logps) =
                         Self::compute_log_probs_static(&rejected_logits, &rejected_labels)?;
-                    let (loss, _, _, _, _) = Self::compute_orpo_loss_static(
-                        &config,
-                        &chosen_total_logps,
-                        &chosen_avg_logps,
-                        &rejected_avg_logps,
-                    )?;
+                    let (loss, sft_loss, or_loss, log_odds_chosen, log_odds_rejected) =
+                        Self::compute_orpo_loss_static(
+                            &config,
+                            &chosen_total_logps,
+                            &chosen_avg_logps,
+                            &rejected_avg_logps,
+                        )?;
+                    *metrics_cell.borrow_mut() =
+                        Some((sft_loss, or_loss, log_odds_chosen, log_odds_rejected));
                     Ok(loss)
                 };
 
@@ -286,17 +256,8 @@ impl OrpoTrainer {
                 optimizer.update(policy_model, grads)?;
                 loss.eval()?;
 
-                let chosen_logits = policy_model
-                    .forward(&chosen_inputs, None)
-                    .map_err(|e| OrpoError::Config(format!("Forward failed: {e}")))?;
-                let rejected_logits = policy_model
-                    .forward(&rejected_inputs, None)
-                    .map_err(|e| OrpoError::Config(format!("Forward failed: {e}")))?;
-                let (chosen_total_logps, chosen_avg_logps) =
-                    self.compute_log_probs(&chosen_logits, &chosen_labels)?;
-                let (_, rejected_avg_logps) = self.compute_log_probs(&rejected_logits, &rejected_labels)?;
-                let (_loss_arr, sft_loss, or_loss, log_odds_chosen, log_odds_rejected) =
-                    self.compute_orpo_loss(&chosen_total_logps, &chosen_avg_logps, &rejected_avg_logps)?;
+                let (sft_loss, or_loss, log_odds_chosen, log_odds_rejected) =
+                    metrics_cell.into_inner().expect("loss_fn must have been called");
                 sft_loss.eval()?;
                 or_loss.eval()?;
                 log_odds_chosen.eval()?;
@@ -333,6 +294,9 @@ impl OrpoTrainer {
                 };
                 for callback in &mut self.callbacks {
                     callback.on_step_end_with_metrics(&step_metrics);
+                }
+                if self.callbacks.iter().any(|cb| cb.should_stop()) {
+                    return Err(OrpoError::Cancelled);
                 }
                 history.push(metrics);
             }
@@ -389,15 +353,40 @@ impl OrpoTrainer {
         chosen_avg_log_probs: &Array,
         rejected_avg_log_probs: &Array,
     ) -> Result<(Array, Array, Array, Array, Array), Exception> {
-        let trainer = Self {
-            config: config.clone(),
-            training_config: TrainingConfig::default(),
-            step: 0,
-            callbacks: Vec::new(),
+        // SFT loss: negative log-likelihood of the chosen response
+        let sft_loss = chosen_log_probs.negative()?;
+
+        // Odds ratio computation: log_odds = avg_log_p - log(1 - exp(avg_log_p))
+        let compute_log_odds = |avg_log_p: &Array| -> Result<Array, Exception> {
+            let p = avg_log_p.exp()?;
+            let one = Array::from_f32(1.0);
+            let one_minus_p = one.subtract(&p)?;
+            let epsilon = Array::from_f32(1e-10);
+            let one_minus_p_safe = mlx_rs::ops::maximum(&one_minus_p, &epsilon)?;
+            let log_one_minus_p = one_minus_p_safe.log()?;
+            avg_log_p.subtract(&log_one_minus_p)
         };
-        trainer
-            .compute_orpo_loss(chosen_log_probs, chosen_avg_log_probs, rejected_avg_log_probs)
-            .map_err(|e| Exception::custom(e.to_string()))
+
+        let log_odds_chosen = compute_log_odds(chosen_avg_log_probs)?;
+        let log_odds_rejected = compute_log_odds(rejected_avg_log_probs)?;
+
+        // OR loss: -log(sigmoid(log_odds_chosen - log_odds_rejected))
+        let ratio = log_odds_chosen.subtract(&log_odds_rejected)?;
+        let neg_ratio = ratio.negative()?;
+        let or_loss = mlx_rs::nn::softplus(&neg_ratio)?;
+
+        // Total loss = SFT_loss + beta * OR_loss
+        let beta = Array::from_f32(config.beta as f32);
+        let weighted_or_loss = or_loss.multiply(&beta)?;
+        let total_loss = sft_loss.add(&weighted_or_loss)?;
+
+        Ok((
+            total_loss.mean(None)?,
+            sft_loss.mean(None)?,
+            or_loss.mean(None)?,
+            log_odds_chosen,
+            log_odds_rejected,
+        ))
     }
 }
 

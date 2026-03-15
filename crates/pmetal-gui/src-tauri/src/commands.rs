@@ -3,7 +3,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::Utc;
-use futures_util::FutureExt;
 use mlx_rs::builder::Builder as _;
 use mlx_rs::ops;
 use pmetal::easy;
@@ -50,24 +49,13 @@ impl From<serde_json::Error> for AppError {
 
 type Result<T> = std::result::Result<T, AppError>;
 
-#[derive(Debug)]
-struct CancelledRun;
-
 struct CancelOnFlag {
     cancelled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl TrainingCallback for CancelOnFlag {
-    fn on_step_start(&mut self, _step: usize) {
-        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-            std::panic::panic_any(CancelledRun);
-        }
-    }
-
-    fn on_step_end(&mut self, _step: usize, _loss: f64) {
-        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
-            std::panic::panic_any(CancelledRun);
-        }
+    fn should_stop(&self) -> bool {
+        self.cancelled.load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 
@@ -714,6 +702,13 @@ Selected method '{}' is not library-backed here yet.",
         )));
     }
 
+    if config.resume_from.is_some() {
+        return Err(AppError(
+            "Resume from checkpoint is not yet supported in GUI direct mode. \
+             Use the CLI instead: pmetal train --resume-from <path>".to_string(),
+        ));
+    }
+
     let total_epochs = config.epochs.unwrap_or(3);
     let output_dir = config.output_dir.as_deref()
         .unwrap_or("./output")
@@ -763,12 +758,11 @@ Selected method '{}' is not library-backed here yet.",
         });
 
         let result = if config.method == "qlora" || config.load_in_4bit == Some(true) {
-            std::panic::AssertUnwindSafe(run_qlora_training_in_process(
+            run_qlora_training_in_process(
                 &config,
                 &metrics_path,
                 cancel_flag.clone(),
-            ))
-            .catch_unwind()
+            )
             .await
         } else {
             let mut builder = easy::finetune(
@@ -796,70 +790,28 @@ Selected method '{}' is not library-backed here yet.",
             if let Some(rank) = config.lora_rank {
                 builder = builder.lora(rank as usize, config.lora_alpha.unwrap_or(32) as f32);
             }
-            if let Some(eval) = config.resume_from.as_ref() {
-                let _ = eval;
-            }
             if let Some(eval) = config.embedding_lr {
                 builder = builder.embedding_lr(eval as f32);
             }
 
-            std::panic::AssertUnwindSafe(async move {
-                builder
-                    .run()
-                    .await
-                    .map(|_| ())
-                    .map_err(|e| AppError(e.to_string()))
-            })
-            .catch_unwind()
-            .await
+            builder
+                .run()
+                .await
+                .map(|_| ())
+                .map_err(|e| AppError(e.to_string()))
         };
 
-        match result {
-            Ok(Ok(_summary)) => {
-                finalize_training_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    true,
-                    None,
-                )
-                .await;
-            }
-            Ok(Err(e)) => {
-                finalize_training_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    false,
-                    Some(e.to_string()),
-                )
-                .await;
-            }
-            Err(payload) if payload.is::<CancelledRun>() => {
-                finalize_training_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    false,
-                    None,
-                )
-                .await;
-            }
-            Err(_) => {
-                finalize_training_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    false,
-                    Some("Training panicked".to_string()),
-                )
-                .await;
-            }
-        }
+        let success = result.is_ok();
+        let error = result.err().map(|e| e.to_string());
+        finalize_training_run(
+            &state_arc,
+            &event_tx,
+            &run_id_task,
+            &cancel_flag,
+            success,
+            error,
+        )
+        .await;
 
         cancel_flags.write().await.remove(&run_id_task);
     });
@@ -944,60 +896,24 @@ pub async fn start_distillation(
             .await;
         });
 
-        let result = std::panic::AssertUnwindSafe(run_distillation_in_process(
+        let result = run_distillation_in_process(
             &config,
             &metrics_path,
             cancel_flag.clone(),
-        ))
-        .catch_unwind()
+        )
         .await;
 
-        match result {
-            Ok(Ok(())) => {
-                finalize_distillation_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    true,
-                    None,
-                )
-                .await;
-            }
-            Ok(Err(e)) => {
-                finalize_distillation_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    false,
-                    Some(e.to_string()),
-                )
-                .await;
-            }
-            Err(payload) if payload.is::<CancelledRun>() => {
-                finalize_distillation_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    false,
-                    None,
-                )
-                .await;
-            }
-            Err(_) => {
-                finalize_distillation_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    false,
-                    Some("Distillation panicked".to_string()),
-                )
-                .await;
-            }
-        }
+        let success = result.is_ok();
+        let error = result.err().map(|e| e.to_string());
+        finalize_distillation_run(
+            &state_arc,
+            &event_tx,
+            &run_id_task,
+            &cancel_flag,
+            success,
+            error,
+        )
+        .await;
 
         cancel_flags.write().await.remove(&run_id_task);
     });
@@ -1081,60 +997,24 @@ pub async fn start_grpo(
             .await;
         });
 
-        let result = std::panic::AssertUnwindSafe(run_grpo_in_process(
+        let result = run_grpo_in_process(
             &config,
             &metrics_path,
             cancel_flag.clone(),
-        ))
-        .catch_unwind()
+        )
         .await;
 
-        match result {
-            Ok(Ok(())) => {
-                finalize_grpo_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    true,
-                    None,
-                )
-                .await;
-            }
-            Ok(Err(e)) => {
-                finalize_grpo_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    false,
-                    Some(e.to_string()),
-                )
-                .await;
-            }
-            Err(payload) if payload.is::<CancelledRun>() => {
-                finalize_grpo_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    false,
-                    None,
-                )
-                .await;
-            }
-            Err(_) => {
-                finalize_grpo_run(
-                    &state_arc,
-                    &event_tx,
-                    &run_id_task,
-                    &cancel_flag,
-                    false,
-                    Some("GRPO panicked".to_string()),
-                )
-                .await;
-            }
-        }
+        let success = result.is_ok();
+        let error = result.err().map(|e| e.to_string());
+        finalize_grpo_run(
+            &state_arc,
+            &event_tx,
+            &run_id_task,
+            &cancel_flag,
+            success,
+            error,
+        )
+        .await;
 
         cancel_flags.write().await.remove(&run_id_task);
     });
@@ -1809,8 +1689,27 @@ async fn run_qlora_training_in_process(
             config_path.display()
         ))
     })?;
-    let llama_config: pmetal::models::architectures::llama::LlamaConfig =
-        serde_json::from_str(&config_text).map_err(|e| AppError(e.to_string()))?;
+
+    let config_json: serde_json::Value = serde_json::from_str(&config_text)
+        .map_err(|e| AppError(format!("Failed to parse config.json: {e}")))?;
+    let model_type = config_json
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("llama")
+        .to_lowercase();
+
+    let llama_config: pmetal::models::architectures::llama::LlamaConfig = match model_type.as_str() {
+        "llama" | "mistral" => {
+            serde_json::from_str(&config_text).map_err(|e| AppError(e.to_string()))?
+        }
+        other => {
+            return Err(AppError(format!(
+                "QLoRA in GUI currently supports Llama/Mistral architectures only. \
+                 Detected model_type '{}'. Use LoRA instead, or the CLI for other architectures.",
+                other
+            )));
+        }
+    };
 
     let tokenizer = pmetal::data::Tokenizer::from_model_dir(&model_path)
         .map_err(|e| AppError(e.to_string()))?;
@@ -2222,23 +2121,10 @@ async fn run_grpo_in_process(
             1.0,
         );
     } else {
-        struct DummyReward;
-        impl pmetal::trainer::RewardFunction for DummyReward {
-            fn compute(
-                &self,
-                _prompts: &[String],
-                completions: &[String],
-                _images: Option<&[Vec<mlx_rs::Array>]>,
-            ) -> pmetal::trainer::GrpoResult<Vec<f64>> {
-                Ok(vec![0.1; completions.len()])
-            }
-
-            fn name(&self) -> &str {
-                "dummy"
-            }
-        }
-
-        rewards = rewards.add(Box::new(DummyReward), 1.0);
+        return Err(AppError(
+            "GRPO requires a reward function. Enable 'Use Reasoning Rewards' or use the CLI \
+             with a custom reward configuration.".to_string(),
+        ));
     }
 
     let output_dir = config

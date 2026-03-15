@@ -230,6 +230,14 @@ pub trait TrainingCallback: Send + Sync {
 
     /// Called when the adaptive LR controller triggers an event.
     fn on_lr_event(&mut self, _event: &str) {}
+
+    /// Return `true` to request a clean early stop of the training loop.
+    ///
+    /// Checked after each step. When any callback returns `true`, the loop
+    /// finishes the current step, saves the best weights, and returns cleanly.
+    fn should_stop(&self) -> bool {
+        false
+    }
 }
 
 // ============================================================================

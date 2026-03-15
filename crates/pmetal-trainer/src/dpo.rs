@@ -45,6 +45,9 @@ pub enum DpoError {
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Training was cancelled by a callback.
+    #[error("Training cancelled")]
+    Cancelled,
 }
 
 /// Result type for DPO operations.
@@ -630,6 +633,8 @@ impl DpoTrainer {
 
                 let (loss_value, metrics) = if self.config.use_stop_gradient_reference {
                     let config = self.config.clone();
+                    let metrics_cell: std::cell::RefCell<Option<(Array, Array)>> =
+                        std::cell::RefCell::new(None);
                     let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
                         let chosen_logits = model
                             .forward(&chosen_inputs, None)
@@ -650,13 +655,14 @@ impl DpoTrainer {
                         )?;
                         let chosen_ref_logps = mlx_rs::stop_gradient(&chosen_policy_logps)?;
                         let rejected_ref_logps = mlx_rs::stop_gradient(&rejected_policy_logps)?;
-                        let (loss, _, _) = Self::compute_dpo_loss_static(
+                        let (loss, chosen_rewards, rejected_rewards) = Self::compute_dpo_loss_static(
                             &config,
                             &chosen_policy_logps,
                             &rejected_policy_logps,
                             &chosen_ref_logps,
                             &rejected_ref_logps,
                         )?;
+                        *metrics_cell.borrow_mut() = Some((chosen_rewards, rejected_rewards));
                         Ok(loss)
                     };
 
@@ -667,31 +673,9 @@ impl DpoTrainer {
                     optimizer.update(policy_model, grads)?;
                     loss.eval()?;
 
-                    let chosen_logits = policy_model
-                        .forward(&chosen_inputs, None)
-                        .map_err(|e| DpoError::Config(format!("Forward failed: {e}")))?;
-                    let rejected_logits = policy_model
-                        .forward(&rejected_inputs, None)
-                        .map_err(|e| DpoError::Config(format!("Forward failed: {e}")))?;
-                    let chosen_policy_logps = Self::compute_log_probs_static(
-                        &chosen_logits,
-                        &chosen_labels,
-                        matches!(self.config.loss_type, DpoLossType::SimPo),
-                    )?;
-                    let rejected_policy_logps = Self::compute_log_probs_static(
-                        &rejected_logits,
-                        &rejected_labels,
-                        matches!(self.config.loss_type, DpoLossType::SimPo),
-                    )?;
-                    let chosen_ref_logps = mlx_rs::stop_gradient(&chosen_policy_logps)?;
-                    let rejected_ref_logps = mlx_rs::stop_gradient(&rejected_policy_logps)?;
-                    let (_loss_arr, chosen_rewards, rejected_rewards) = Self::compute_dpo_loss_static(
-                        &self.config,
-                        &chosen_policy_logps,
-                        &rejected_policy_logps,
-                        &chosen_ref_logps,
-                        &rejected_ref_logps,
-                    )?;
+                    let (chosen_rewards, rejected_rewards) = metrics_cell
+                        .into_inner()
+                        .expect("loss_fn must have been called");
                     chosen_rewards.eval()?;
                     rejected_rewards.eval()?;
                     let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
@@ -715,6 +699,8 @@ impl DpoTrainer {
                     };
 
                     let config = self.config.clone();
+                    let metrics_cell: std::cell::RefCell<Option<(Array, Array)>> =
+                        std::cell::RefCell::new(None);
                     let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
                         let chosen_logits = model
                             .forward(&chosen_inputs, None)
@@ -733,13 +719,14 @@ impl DpoTrainer {
                             &rejected_labels,
                             matches!(config.loss_type, DpoLossType::SimPo),
                         )?;
-                        let (loss, _, _) = Self::compute_dpo_loss_static(
+                        let (loss, chosen_rewards, rejected_rewards) = Self::compute_dpo_loss_static(
                             &config,
                             &chosen_policy_logps,
                             &rejected_policy_logps,
                             &ref_chosen_logps,
                             &ref_rejected_logps,
                         )?;
+                        *metrics_cell.borrow_mut() = Some((chosen_rewards, rejected_rewards));
                         Ok(loss)
                     };
 
@@ -750,29 +737,9 @@ impl DpoTrainer {
                     optimizer.update(policy_model, grads)?;
                     loss.eval()?;
 
-                    let chosen_logits = policy_model
-                        .forward(&chosen_inputs, None)
-                        .map_err(|e| DpoError::Config(format!("Forward failed: {e}")))?;
-                    let rejected_logits = policy_model
-                        .forward(&rejected_inputs, None)
-                        .map_err(|e| DpoError::Config(format!("Forward failed: {e}")))?;
-                    let chosen_policy_logps = Self::compute_log_probs_static(
-                        &chosen_logits,
-                        &chosen_labels,
-                        matches!(self.config.loss_type, DpoLossType::SimPo),
-                    )?;
-                    let rejected_policy_logps = Self::compute_log_probs_static(
-                        &rejected_logits,
-                        &rejected_labels,
-                        matches!(self.config.loss_type, DpoLossType::SimPo),
-                    )?;
-                    let (_loss_arr, chosen_rewards, rejected_rewards) = Self::compute_dpo_loss_static(
-                        &self.config,
-                        &chosen_policy_logps,
-                        &rejected_policy_logps,
-                        &ref_chosen_logps,
-                        &ref_rejected_logps,
-                    )?;
+                    let (chosen_rewards, rejected_rewards) = metrics_cell
+                        .into_inner()
+                        .expect("loss_fn must have been called");
                     chosen_rewards.eval()?;
                     rejected_rewards.eval()?;
                     let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
@@ -806,6 +773,9 @@ impl DpoTrainer {
                 };
                 for callback in &mut self.callbacks {
                     callback.on_step_end_with_metrics(&step_metrics);
+                }
+                if self.callbacks.iter().any(|cb| cb.should_stop()) {
+                    return Err(DpoError::Cancelled);
                 }
                 history.push(metrics);
             }

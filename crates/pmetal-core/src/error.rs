@@ -79,6 +79,10 @@ pub enum PMetalError {
     #[error("Invalid argument: {0}")]
     InvalidArgument(String),
 
+    /// Training cancelled by user or callback.
+    #[error("Training cancelled")]
+    Cancelled,
+
     /// Operation not implemented.
     #[error("Not implemented: {0}")]
     NotImplemented(String),

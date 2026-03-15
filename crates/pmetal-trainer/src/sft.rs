@@ -31,6 +31,9 @@ pub enum SftError {
     /// IO error.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+    /// Training was cancelled by a callback.
+    #[error("Training cancelled")]
+    Cancelled,
 }
 
 /// Result type for SFT operations.

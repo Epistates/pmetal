@@ -47,6 +47,9 @@ pub enum SimpoError {
     /// Configuration error.
     #[error("Configuration error: {0}")]
     Config(String),
+    /// Training was cancelled by a callback.
+    #[error("Training cancelled")]
+    Cancelled,
 }
 
 /// Result type for SimPO operations.
@@ -548,6 +551,11 @@ impl SimpoTrainer {
                 };
 
                 let config = self.config.clone();
+                // Capture intermediate arrays from inside the closure to avoid a second forward pass.
+                // Tuple: (simpo_loss, chosen_rewards, rejected_rewards, margin, cpo_loss, sft_loss)
+                let metrics_cell: std::cell::RefCell<
+                    Option<(Array, Array, Array, Array, Option<Array>, Option<Array>)>,
+                > = std::cell::RefCell::new(None);
                 let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
                     let chosen_logits = model
                         .forward(&chosen_inputs, None)
@@ -566,7 +574,15 @@ impl SimpoTrainer {
                         &rejected_labels,
                         &rejected_mask_full,
                     )?;
-                    let (loss, _metrics) = Self::compute_loss_with_cpo_static(
+                    let (
+                        total_loss,
+                        simpo_loss,
+                        chosen_rewards,
+                        rejected_rewards,
+                        margin,
+                        cpo_loss,
+                        sft_loss,
+                    ) = Self::compute_loss_with_cpo_for_grad(
                         &config,
                         &chosen_logps,
                         &rejected_logps,
@@ -574,7 +590,9 @@ impl SimpoTrainer {
                         &rejected_mask,
                         ref_chosen_logps.as_ref(),
                     )?;
-                    Ok(loss)
+                    *metrics_cell.borrow_mut() =
+                        Some((simpo_loss, chosen_rewards, rejected_rewards, margin, cpo_loss, sft_loss));
+                    Ok(total_loss)
                 };
 
                 let (loss, grads) = {
@@ -584,23 +602,49 @@ impl SimpoTrainer {
                 optimizer.update(policy_model, grads)?;
                 loss.eval()?;
 
-                let chosen_logits = policy_model
-                    .forward(&chosen_inputs, None)
-                    .map_err(|e| SimpoError::Config(format!("Forward failed: {e}")))?;
-                let rejected_logits = policy_model
-                    .forward(&rejected_inputs, None)
-                    .map_err(|e| SimpoError::Config(format!("Forward failed: {e}")))?;
-                let chosen_logps =
-                    self.compute_log_probs(&chosen_logits, &chosen_labels, &chosen_mask_full)?;
-                let rejected_logps =
-                    self.compute_log_probs(&rejected_logits, &rejected_labels, &rejected_mask_full)?;
-                let (_loss_arr, metrics) = self.compute_loss_with_cpo(
-                    &chosen_logps,
-                    &rejected_logps,
-                    &chosen_mask,
-                    &rejected_mask,
-                    ref_chosen_logps.as_ref(),
-                )?;
+                let (simpo_loss, chosen_rewards, rejected_rewards, margin, cpo_loss_opt, sft_loss_opt) =
+                    metrics_cell.into_inner().expect("loss_fn must have been called");
+                simpo_loss.eval()?;
+                chosen_rewards.eval()?;
+                rejected_rewards.eval()?;
+                margin.eval()?;
+
+                let chosen_reward_mean = chosen_rewards.mean(None)?;
+                let rejected_reward_mean = rejected_rewards.mean(None)?;
+                let margin_mean = margin.mean(None)?;
+                chosen_reward_mean.eval()?;
+                rejected_reward_mean.eval()?;
+                margin_mean.eval()?;
+
+                let accuracy = margin
+                    .gt(&Array::from_f32(0.0))?
+                    .as_dtype(mlx_rs::Dtype::Float32)?
+                    .mean(None)?;
+                accuracy.eval()?;
+
+                let cpo_loss_val = if let Some(cpo) = cpo_loss_opt {
+                    cpo.eval()?;
+                    cpo.item::<f32>()
+                } else {
+                    0.0
+                };
+                let sft_loss_val = if let Some(sft) = sft_loss_opt {
+                    sft.eval()?;
+                    sft.item::<f32>()
+                } else {
+                    0.0
+                };
+
+                let metrics = SimpoMetrics {
+                    loss: loss.item::<f32>(),
+                    simpo_loss: simpo_loss.item::<f32>(),
+                    cpo_loss: cpo_loss_val,
+                    sft_loss: sft_loss_val,
+                    chosen_reward: chosen_reward_mean.item::<f32>(),
+                    rejected_reward: rejected_reward_mean.item::<f32>(),
+                    margin: margin_mean.item::<f32>(),
+                    accuracy: accuracy.item::<f32>(),
+                };
 
                 self.step += 1;
                 let elapsed = step_start.elapsed().as_secs_f64();
@@ -626,6 +670,9 @@ impl SimpoTrainer {
                 };
                 for callback in &mut self.callbacks {
                     callback.on_step_end_with_metrics(&step_metrics);
+                }
+                if self.callbacks.iter().any(|cb| cb.should_stop()) {
+                    return Err(SimpoError::Cancelled);
                 }
                 history.push(metrics);
             }
@@ -745,6 +792,124 @@ impl SimpoTrainer {
                 ref_chosen_logps,
             )
             .map_err(|e| Exception::custom(e.to_string()))
+    }
+
+    /// Gradient-safe variant of `compute_loss_with_cpo` for use inside autograd closures.
+    ///
+    /// Unlike the instance method, this function does NOT call `.eval()` or `.item()` on any
+    /// intermediate value, so the full computation graph stays lazy and `value_and_grad` can
+    /// differentiate through it.
+    ///
+    /// Returns `(total_loss, simpo_loss, chosen_rewards, rejected_rewards, margin, cpo_loss, sft_loss)`.
+    /// The caller evaluates and extracts scalar metrics after the grad step.
+    fn compute_loss_with_cpo_for_grad(
+        config: &SimpoConfig,
+        chosen_logps: &Array,
+        rejected_logps: &Array,
+        chosen_mask: &Array,
+        rejected_mask: &Array,
+        ref_chosen_logps: Option<&Array>,
+    ) -> Result<(Array, Array, Array, Array, Array, Option<Array>, Option<Array>), Exception> {
+        // --- Compute length-normalized rewards ---
+        let compute_rewards = |logps: &Array, mask: &Array| -> Result<Array, Exception> {
+            let masked_logps = logps.multiply(mask)?;
+            let sum_logps = masked_logps.sum_axis(-1, None)?;
+            if config.length_norm {
+                let lengths = mask.sum_axis(-1, None)?;
+                let eps = Array::from_f32(1e-8);
+                let lengths_safe = lengths.add(&eps)?;
+                sum_logps.divide(&lengths_safe)
+            } else {
+                Ok(sum_logps)
+            }
+        };
+
+        let chosen_rewards = compute_rewards(chosen_logps, chosen_mask)?;
+        let rejected_rewards = compute_rewards(rejected_logps, rejected_mask)?;
+
+        // Scale by beta
+        let beta = Array::from_f32(config.beta as f32);
+        let chosen_scaled = chosen_rewards.multiply(&beta)?;
+        let rejected_scaled = rejected_rewards.multiply(&beta)?;
+
+        // Margin: chosen - rejected - gamma
+        let gamma = Array::from_f32(config.gamma as f32);
+        let margin = chosen_scaled.subtract(&rejected_scaled)?.subtract(&gamma)?;
+
+        // Base loss
+        let loss = match config.loss_type {
+            SimpoLossType::Sigmoid => mlx_rs::nn::log_sigmoid(&margin)?.negative()?,
+            SimpoLossType::Hinge => {
+                let one = Array::from_f32(1.0);
+                let hinge = one.subtract(&margin)?;
+                let zero = Array::from_f32(0.0);
+                mlx_rs::ops::maximum(&hinge, &zero)?
+            }
+            SimpoLossType::Ipo => {
+                let one = Array::from_f32(1.0);
+                margin.subtract(&one)?.square()?
+            }
+        };
+
+        // Label smoothing
+        let loss = if config.label_smoothing > 0.0 {
+            let smooth = Array::from_f32(config.label_smoothing as f32);
+            let one_minus_smooth = Array::from_f32(1.0 - config.label_smoothing as f32);
+            let flipped_margin = rejected_scaled.subtract(&chosen_scaled)?.subtract(&gamma)?;
+            let flipped_loss = match config.loss_type {
+                SimpoLossType::Sigmoid => mlx_rs::nn::log_sigmoid(&flipped_margin)?.negative()?,
+                SimpoLossType::Hinge => {
+                    let one = Array::from_f32(1.0);
+                    let hinge = one.subtract(&flipped_margin)?;
+                    let zero = Array::from_f32(0.0);
+                    mlx_rs::ops::maximum(&hinge, &zero)?
+                }
+                SimpoLossType::Ipo => {
+                    let one = Array::from_f32(1.0);
+                    flipped_margin.subtract(&one)?.square()?
+                }
+            };
+            loss.multiply(&one_minus_smooth)?
+                .add(&flipped_loss.multiply(&smooth)?)?
+        } else {
+            loss
+        };
+
+        let simpo_loss = loss.mean(None)?;
+        let mut total_loss = simpo_loss.clone();
+
+        // CPO regularization
+        let cpo_loss = if config.cpo_alpha > 0.0 {
+            if let Some(ref_logps) = ref_chosen_logps {
+                let kl = chosen_logps.subtract(ref_logps)?;
+                let masked_kl = kl.multiply(chosen_mask)?;
+                let mean_kl =
+                    masked_kl.sum(None)?.divide(&chosen_mask.sum(None)?)?;
+                let alpha = Array::from_f32(config.cpo_alpha as f32);
+                let cpo = mean_kl.multiply(&alpha)?;
+                total_loss = total_loss.add(&cpo)?;
+                Some(cpo)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        // SFT auxiliary loss
+        let sft_loss = if config.sft_weight > 0.0 {
+            let masked_nll = chosen_logps.negative()?.multiply(chosen_mask)?;
+            let mean_nll =
+                masked_nll.sum(None)?.divide(&chosen_mask.sum(None)?)?;
+            let weight = Array::from_f32(config.sft_weight as f32);
+            let sft = mean_nll.multiply(&weight)?;
+            total_loss = total_loss.add(&sft)?;
+            Some(sft)
+        } else {
+            None
+        };
+
+        Ok((total_loss, simpo_loss, chosen_rewards, rejected_rewards, margin, cpo_loss, sft_loss))
     }
 }
 

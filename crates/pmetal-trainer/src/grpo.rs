@@ -64,6 +64,9 @@ pub enum GrpoError {
     /// Tokenizer error.
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
+    /// Training was cancelled by a callback.
+    #[error("Training cancelled")]
+    Cancelled,
 }
 
 /// Result type for GRPO operations.
@@ -810,6 +813,9 @@ impl GrpoTrainer {
                     };
                     for cb in &mut self.callbacks {
                         cb.on_step_end_with_metrics(&metrics);
+                    }
+                    if self.callbacks.iter().any(|cb| cb.should_stop()) {
+                        return Err(GrpoError::Cancelled);
                     }
                 }
             }

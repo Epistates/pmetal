@@ -72,6 +72,9 @@ pub enum KtoError {
     /// Data error.
     #[error("Data error: {0}")]
     Data(String),
+    /// Training was cancelled by a callback.
+    #[error("Training cancelled")]
+    Cancelled,
 }
 
 /// Result type for KTO operations.
@@ -548,6 +551,11 @@ impl KtoTrainer {
                 };
                 let config = self.config.clone();
                 let z_ref = self.z_ref();
+                // Capture rewards arrays from inside the closure to avoid a second forward pass.
+                // Type: (raw_rewards, scaled_rewards, desirable_losses_arr, undesirable_losses_arr)
+                let metrics_cell: std::cell::RefCell<
+                    Option<(Array, Array, Array, Array)>,
+                > = std::cell::RefCell::new(None);
                 let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
                     let logits = model
                         .forward(&inputs, None)
@@ -558,8 +566,15 @@ impl KtoTrainer {
                     } else {
                         policy_logps.subtract(&ref_logps)?
                     };
-                    let (loss, _, _, _) =
-                        Self::compute_kto_loss_arrays(&config, &rewards, &desirability, z_ref)?;
+                    let (loss, scaled_rewards, desirable_losses_arr, undesirable_losses_arr) =
+                        Self::compute_kto_loss_arrays_for_grad(
+                            &config,
+                            &rewards,
+                            &desirability,
+                            z_ref,
+                        )?;
+                    *metrics_cell.borrow_mut() =
+                        Some((rewards, scaled_rewards, desirable_losses_arr, undesirable_losses_arr));
                     Ok(loss)
                 };
 
@@ -570,20 +585,48 @@ impl KtoTrainer {
                 optimizer.update(policy_model, grads)?;
                 loss.eval()?;
 
-                let logits = policy_model
-                    .forward(&inputs, None)
-                    .map_err(|e| KtoError::Config(format!("Forward failed: {e}")))?;
-                let policy_logps = self.compute_log_probs(&logits, &labels)?;
-                let output = self.compute_kto_loss(&policy_logps, &ref_logps, &desirability)?;
-                output.rewards.eval()?;
-                let rewards = output.rewards.as_slice::<f32>().to_vec();
+                let (raw_rewards, scaled_rewards, desirable_losses_arr, undesirable_losses_arr) =
+                    metrics_cell.into_inner().expect("loss_fn must have been called");
+
+                // Update z_ref estimate before evaluating arrays
+                if self.config.estimate_z_ref {
+                    self.update_z_ref_estimate(&raw_rewards)?;
+                }
+
+                scaled_rewards.eval()?;
+                desirable_losses_arr.eval()?;
+                undesirable_losses_arr.eval()?;
+
+                let desirable_mask_values: Vec<f32> = desirability
+                    .iter()
+                    .map(|&v| if v { 1.0 } else { 0.0 })
+                    .collect();
+                let desirable_mask =
+                    Array::from_slice(&desirable_mask_values, &[desirability.len() as i32]);
+                let undesirable_mask = Array::from_f32(1.0).subtract(&desirable_mask)?;
+                let desirable_count = desirable_mask.sum(None)?;
+                let undesirable_count = undesirable_mask.sum(None)?;
+                let desirable_count_safe =
+                    mlx_rs::ops::maximum(&desirable_count, &Array::from_f32(1.0))?;
+                let undesirable_count_safe =
+                    mlx_rs::ops::maximum(&undesirable_count, &Array::from_f32(1.0))?;
+                let desirable_loss = desirable_losses_arr
+                    .sum(None)?
+                    .divide(&desirable_count_safe)?
+                    .item::<f32>();
+                let undesirable_loss = undesirable_losses_arr
+                    .sum(None)?
+                    .divide(&undesirable_count_safe)?
+                    .item::<f32>();
+
+                let rewards_vec = scaled_rewards.as_slice::<f32>().to_vec();
                 let metrics = KtoMetrics::compute(
                     loss.item::<f32>(),
-                    &rewards,
+                    &rewards_vec,
                     &desirability,
-                    output.z_ref as f32,
-                    output.desirable_loss,
-                    output.undesirable_loss,
+                    z_ref as f32,
+                    desirable_loss,
+                    undesirable_loss,
                 );
 
                 self.step += 1;
@@ -607,6 +650,9 @@ impl KtoTrainer {
                 };
                 for callback in &mut self.callbacks {
                     callback.on_step_end_with_metrics(&step_metrics);
+                }
+                if self.callbacks.iter().any(|cb| cb.should_stop()) {
+                    return Err(KtoError::Cancelled);
                 }
                 history.push(metrics);
             }
@@ -694,6 +740,48 @@ impl KtoTrainer {
 
         let scaled_rewards = rewards.multiply(&Array::from_f32(config.beta as f32))?;
         Ok((mean_loss, scaled_rewards, desirable_loss, undesirable_loss))
+    }
+
+    /// Gradient-safe variant of `compute_kto_loss_arrays` for use inside autograd closures.
+    ///
+    /// Unlike the standard variant, this function does NOT call `.eval()` or `.item()` on any
+    /// intermediate value, keeping the entire computation as a lazy MLX graph so that
+    /// `value_and_grad` can differentiate through it.
+    ///
+    /// Returns `(mean_loss, scaled_rewards, desirable_losses_arr, undesirable_losses_arr)`.
+    /// The caller is responsible for evaluating and extracting scalar metrics after the grad step.
+    fn compute_kto_loss_arrays_for_grad(
+        config: &KtoConfig,
+        rewards: &Array,
+        is_desirable: &[bool],
+        z_ref: f64,
+    ) -> Result<(Array, Array, Array, Array), Exception> {
+        let batch_size = is_desirable.len();
+        let desirable_mask_values: Vec<f32> = is_desirable
+            .iter()
+            .map(|&value| if value { 1.0 } else { 0.0 })
+            .collect();
+        let desirable_mask = Array::from_slice(&desirable_mask_values, &[batch_size as i32]);
+        let undesirable_mask = Array::from_f32(1.0).subtract(&desirable_mask)?;
+
+        let z_ref_arr = Array::from_f32(z_ref as f32);
+        let desirable_logits =
+            z_ref_arr.subtract(&rewards.multiply(&Array::from_f32(config.effective_beta_desirable() as f32))?)?;
+        let undesirable_logits =
+            rewards.multiply(&Array::from_f32(config.effective_beta_undesirable() as f32))?
+                .subtract(&z_ref_arr)?;
+
+        let desirable_losses = mlx_rs::ops::sigmoid(&desirable_logits)?
+            .multiply(&Array::from_f32(config.desirable_weight as f32))?
+            .multiply(&desirable_mask)?;
+        let undesirable_losses = mlx_rs::ops::sigmoid(&undesirable_logits)?
+            .multiply(&Array::from_f32(config.undesirable_weight as f32))?
+            .multiply(&undesirable_mask)?;
+        let total_losses = desirable_losses.add(&undesirable_losses)?;
+        let mean_loss = total_losses.mean(None)?;
+
+        let scaled_rewards = rewards.multiply(&Array::from_f32(config.beta as f32))?;
+        Ok((mean_loss, scaled_rewards, desirable_losses, undesirable_losses))
     }
 }
 
