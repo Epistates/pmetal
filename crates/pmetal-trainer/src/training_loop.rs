@@ -475,7 +475,9 @@ pub struct TrainingLoop {
 
 impl TrainingLoop {
     /// Create a new training loop.
-    pub fn new(config: TrainingLoopConfig) -> Self {
+    pub fn new(mut config: TrainingLoopConfig) -> Self {
+        config.log_every = config.log_every.max(1);
+
         // Try to initialize Metal FlashAttention context
         let metal_fa_available = if config.use_metal_flash_attention {
             init_training_context().is_ok()
@@ -1096,12 +1098,16 @@ impl TrainingLoop {
 
             // Double-buffered batch prefetch: fetch the next batch while the GPU
             // processes the current one, overlapping CPU data prep with GPU compute.
-            let mut prefetched_batch = dataloader.next_batch();
+            let mut prefetched_batch = dataloader
+                .try_next_batch()
+                .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
             while let Some(batch) = prefetched_batch {
                 // Prefetch the next batch before submitting the current one to the GPU.
                 // DataLoader::next_batch() is CPU-bound (tokenization + array construction),
                 // so starting it now lets it run while MLX evaluates the training step.
-                prefetched_batch = dataloader.next_batch();
+                prefetched_batch = dataloader
+                    .try_next_batch()
+                    .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
                 // Apply learning rate schedule (warmup, cosine decay, etc.)
                 let scheduled_lr = self.get_learning_rate();
@@ -1321,10 +1327,14 @@ impl TrainingLoop {
                 DataLoader::new(train_dataset.clone(), self.config.dataloader.clone(), None);
 
             // Double-buffered batch prefetch: overlap CPU data prep with GPU compute.
-            let mut prefetched_batch = dataloader.next_batch();
+            let mut prefetched_batch = dataloader
+                .try_next_batch()
+                .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
             while let Some(batch) = prefetched_batch {
                 // Kick off the next batch fetch before submitting the current one.
-                prefetched_batch = dataloader.next_batch();
+                prefetched_batch = dataloader
+                    .try_next_batch()
+                    .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
                 // Training step with Metal optimizer
                 let stats = self.train_step_metal(model, &batch, &mut metal_optimizer)?;
@@ -1671,7 +1681,8 @@ impl TrainingLoop {
 
         // Get first batch for warmup
         let warmup_batch = dataloader
-            .next_batch()
+            .try_next_batch()
+            .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
             .ok_or_else(|| SftError::Mlx(Exception::custom("Dataset is empty, cannot warmup")))?;
 
         // Record state count BEFORE warmup (optimizer states not yet initialized)
@@ -1769,10 +1780,14 @@ impl TrainingLoop {
             // Double-buffered batch prefetch: overlap CPU data prep with GPU compute.
             // Fetching the next batch before the current training step completes allows
             // tokenization and array construction to run while MLX builds its lazy graph.
-            let mut prefetched_batch = dataloader.next_batch();
+            let mut prefetched_batch = dataloader
+                .try_next_batch()
+                .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
             while let Some(batch) = prefetched_batch {
                 // Prefetch next batch before the GPU executes the current step.
-                prefetched_batch = dataloader.next_batch();
+                prefetched_batch = dataloader
+                    .try_next_batch()
+                    .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
                 let batch_tokens = batch
                     .batch_size
@@ -2052,7 +2067,8 @@ impl TrainingLoop {
             DataLoader::new(train_dataset.clone(), self.config.dataloader.clone(), None);
 
         let warmup_batch = dataloader
-            .next_batch()
+            .try_next_batch()
+            .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
             .ok_or_else(|| SftError::Mlx(Exception::custom("Dataset is empty, cannot warmup")))?;
 
         let state_count_before = state.updatable_states_len();
@@ -2121,10 +2137,14 @@ impl TrainingLoop {
             tracing::info!("Epoch {}/{}", epoch + 1, num_epochs);
 
             // Double-buffered batch prefetch for the JIT-compiled path.
-            let mut prefetched_batch = dataloader.next_batch();
+            let mut prefetched_batch = dataloader
+                .try_next_batch()
+                .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
             while let Some(batch) = prefetched_batch {
                 // Prefetch next batch while MLX traces/executes the compiled step.
-                prefetched_batch = dataloader.next_batch();
+                prefetched_batch = dataloader
+                    .try_next_batch()
+                    .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
                 let batch_tokens = batch
                     .batch_size

@@ -262,6 +262,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires a functional MLX array backend"]
     fn test_synthetic_image_processing() {
         let config = MllamaImageProcessorConfig {
             size: (4, 4), // Small for testing

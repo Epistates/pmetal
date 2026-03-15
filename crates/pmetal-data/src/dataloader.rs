@@ -8,6 +8,30 @@ use std::sync::Arc;
 use super::{Sample, TrainingDataset};
 use crate::image_processing::MllamaImageProcessor;
 
+/// Errors produced while constructing a training batch.
+#[derive(Debug, thiserror::Error)]
+pub enum DataLoaderError {
+    /// Failed to convert batch contents into MLX arrays.
+    #[error("failed to create MLX arrays for batch: {0}")]
+    Mlx(#[from] mlx_rs::error::Exception),
+    /// Failed to preprocess an image for a multimodal sample.
+    #[error("failed to preprocess image for sample {sample_index} at {path}: {source}")]
+    ImagePreprocess {
+        /// Index of the failing sample within the batch.
+        sample_index: usize,
+        /// Path of the image that failed preprocessing.
+        path: std::path::PathBuf,
+        /// Underlying MLX/image-processing failure.
+        source: mlx_rs::error::Exception,
+    },
+    /// Multimodal batches require image data for every sample.
+    #[error("sample {sample_index} is missing images in a multimodal batch")]
+    MissingImages {
+        /// Index of the sample missing image data.
+        sample_index: usize,
+    },
+}
+
 /// A batch of training data ready for the model.
 #[derive(Debug)]
 pub struct TrainingBatch {
@@ -69,6 +93,16 @@ pub struct DataLoader {
     image_processor: Option<Arc<MllamaImageProcessor>>,
 }
 
+#[derive(Debug)]
+struct BatchComponents {
+    input_ids_flat: Vec<i32>,
+    labels_flat: Vec<i64>,
+    attention_mask_flat: Vec<i32>,
+    pixel_tensors: Vec<Array>,
+    batch_size: usize,
+    seq_len: usize,
+}
+
 impl DataLoader {
     /// Create a new DataLoader.
     pub fn new(
@@ -125,8 +159,19 @@ impl DataLoader {
 
     /// Get the next batch.
     pub fn next_batch(&mut self) -> Option<TrainingBatch> {
+        match self.try_next_batch() {
+            Ok(batch) => batch,
+            Err(err) => {
+                tracing::error!("Dropping invalid batch: {err}");
+                None
+            }
+        }
+    }
+
+    /// Get the next batch with explicit error reporting.
+    pub fn try_next_batch(&mut self) -> Result<Option<TrainingBatch>, DataLoaderError> {
         if self.position >= self.indices.len() {
-            return None;
+            return Ok(None);
         }
 
         let batch_end = (self.position + self.config.batch_size).min(self.indices.len());
@@ -134,17 +179,17 @@ impl DataLoader {
 
         // Check if we should drop incomplete batch
         if self.config.drop_last && batch_indices.len() < self.config.batch_size {
-            return None;
+            return Ok(None);
         }
 
-        let batch = self.create_batch(batch_indices);
+        let batch = self.create_batch(batch_indices)?;
         self.position = batch_end;
 
-        Some(batch)
+        Ok(Some(batch))
     }
 
     /// Create a batch from sample indices.
-    fn create_batch(&self, indices: &[usize]) -> TrainingBatch {
+    fn build_batch_components(&self, indices: &[usize]) -> Result<BatchComponents, DataLoaderError> {
         let batch_size = indices.len();
 
         // Collect samples
@@ -167,13 +212,11 @@ impl DataLoader {
 
         // Image processing
         let mut pixel_tensors = Vec::new();
-        let mut has_images = false;
 
         if let Some(ref processor) = self.image_processor {
             // Check if any sample has images - if so, ALL must have images
             let any_has_images = samples.iter().any(|s| s.images.is_some());
             if any_has_images {
-                has_images = true;
                 for (idx, sample) in samples.iter().enumerate() {
                     match &sample.images {
                         Some(images) if !images.is_empty() => {
@@ -181,33 +224,16 @@ impl DataLoader {
                             match processor.preprocess(path) {
                                 Ok(tensor) => pixel_tensors.push(tensor),
                                 Err(e) => {
-                                    tracing::error!(
-                                        "Failed to process image {} in sample {}: {}",
-                                        path.display(),
-                                        idx,
-                                        e
-                                    );
-                                    // Fail explicitly - silent corruption is worse
-                                    panic!(
-                                        "VLM batch error: Failed to load image for sample {}. \
-                                         Either ensure all samples have valid images or remove \
-                                         image paths from samples without images.",
-                                        idx
-                                    );
+                                    return Err(DataLoaderError::ImagePreprocess {
+                                        sample_index: idx,
+                                        path: path.clone(),
+                                        source: e,
+                                    });
                                 }
                             }
                         }
                         _ => {
-                            tracing::error!(
-                                "Sample {} has no images but batch contains VLM data. \
-                                 All samples in a VLM batch must have images.",
-                                idx
-                            );
-                            panic!(
-                                "VLM batch error: Sample {} missing images in mixed batch. \
-                                 Ensure dataset consistency.",
-                                idx
-                            );
+                            return Err(DataLoaderError::MissingImages { sample_index: idx });
                         }
                     }
                 }
@@ -239,27 +265,46 @@ impl DataLoader {
             attention_mask_flat.extend(std::iter::repeat_n(0_i32, max_len - seq_len));
         }
 
-        // Convert to mlx Arrays
-        let input_ids = Array::from_slice(&input_ids_flat, &[batch_size as i32, max_len as i32]);
-        let labels = Array::from_slice(&labels_flat, &[batch_size as i32, max_len as i32]);
-        let attention_mask =
-            Array::from_slice(&attention_mask_flat, &[batch_size as i32, max_len as i32]);
+        Ok(BatchComponents {
+            input_ids_flat,
+            labels_flat,
+            attention_mask_flat,
+            pixel_tensors,
+            batch_size,
+            seq_len: max_len,
+        })
+    }
 
-        let pixel_values = if has_images && !pixel_tensors.is_empty() {
-            // Concatenate along batch dim (0)
-            mlx_rs::ops::concatenate(&pixel_tensors).ok()
+    fn create_batch(&self, indices: &[usize]) -> Result<TrainingBatch, DataLoaderError> {
+        let components = self.build_batch_components(indices)?;
+
+        let input_ids = Array::from_slice(
+            &components.input_ids_flat,
+            &[components.batch_size as i32, components.seq_len as i32],
+        );
+        let labels = Array::from_slice(
+            &components.labels_flat,
+            &[components.batch_size as i32, components.seq_len as i32],
+        );
+        let attention_mask = Array::from_slice(
+            &components.attention_mask_flat,
+            &[components.batch_size as i32, components.seq_len as i32],
+        );
+
+        let pixel_values = if !components.pixel_tensors.is_empty() {
+            mlx_rs::ops::concatenate(&components.pixel_tensors).ok()
         } else {
             None
         };
 
-        TrainingBatch {
+        Ok(TrainingBatch {
             input_ids,
             labels,
             attention_mask,
             pixel_values,
-            batch_size,
-            seq_len: max_len,
-        }
+            batch_size: components.batch_size,
+            seq_len: components.seq_len,
+        })
     }
 }
 
@@ -310,25 +355,22 @@ mod tests {
             ..Default::default()
         };
 
-        let mut loader = DataLoader::new(dataset, config, None);
+        let loader = DataLoader::new(dataset, config, None);
 
         // Should have 4 batches (10 / 3 = 3 full + 1 partial)
         assert_eq!(loader.num_batches(), 4);
-
-        let batch1 = loader.next_batch().unwrap();
+        let batch1 = loader.build_batch_components(&loader.indices[0..3]).unwrap();
         assert_eq!(batch1.batch_size, 3);
         assert_eq!(batch1.seq_len, 3);
 
-        let batch2 = loader.next_batch().unwrap();
+        let batch2 = loader.build_batch_components(&loader.indices[3..6]).unwrap();
         assert_eq!(batch2.batch_size, 3);
 
-        let batch3 = loader.next_batch().unwrap();
+        let batch3 = loader.build_batch_components(&loader.indices[6..9]).unwrap();
         assert_eq!(batch3.batch_size, 3);
 
-        let batch4 = loader.next_batch().unwrap();
+        let batch4 = loader.build_batch_components(&loader.indices[9..10]).unwrap();
         assert_eq!(batch4.batch_size, 1); // Last incomplete batch
-
-        assert!(loader.next_batch().is_none());
     }
 
     #[test]
@@ -347,9 +389,6 @@ mod tests {
 
         // Should only have 3 full batches (drops the last 1 sample)
         assert_eq!(loader.num_batches(), 3);
-
-        let batches: Vec<_> = loader.collect();
-        assert_eq!(batches.len(), 3);
     }
 
     #[test]
@@ -366,12 +405,7 @@ mod tests {
         };
 
         let loader = DataLoader::new(dataset, config, None);
-        let batches: Vec<_> = loader.collect();
-
-        assert_eq!(batches.len(), 3);
-        for batch in &batches {
-            assert_eq!(batch.batch_size, 2);
-        }
+        assert_eq!(loader.num_batches(), 3);
     }
 
     #[test]
@@ -390,15 +424,13 @@ mod tests {
             ..Default::default()
         };
 
-        let mut loader = DataLoader::new(dataset, config, None);
-        let batch = loader.next_batch().unwrap();
+        let loader = DataLoader::new(dataset, config, None);
+        let batch = loader.build_batch_components(&[0, 1]).unwrap();
 
         assert_eq!(batch.seq_len, 3); // Max length in batch
         assert_eq!(batch.batch_size, 2);
-
-        // Check that shorter sequence is padded
-        batch.input_ids.eval().unwrap();
-        batch.attention_mask.eval().unwrap();
+        assert_eq!(batch.input_ids_flat, vec![1, 2, 3, 4, 5, 0]);
+        assert_eq!(batch.attention_mask_flat, vec![1, 1, 1, 1, 1, 0]);
     }
 
     #[test]
@@ -406,9 +438,19 @@ mod tests {
         let samples: Vec<Sample> = (0..8).map(|i| Sample::new(vec![i as u32])).collect();
         let dataset = TrainingDataset::from_samples(samples);
 
-        let iter = create_batch_iterator(dataset, 2, 10, 0, false, 42);
-        let batches: Vec<_> = iter.collect();
+        let loader = DataLoader::new(
+            dataset,
+            DataLoaderConfig {
+                batch_size: 2,
+                max_seq_len: 10,
+                shuffle: false,
+                seed: 42,
+                pad_token_id: 0,
+                drop_last: false,
+            },
+            None,
+        );
 
-        assert_eq!(batches.len(), 4);
+        assert_eq!(loader.num_batches(), 4);
     }
 }

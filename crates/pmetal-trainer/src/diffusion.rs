@@ -637,7 +637,10 @@ impl DiffusionTrainingLoop {
             let mut dataloader =
                 DataLoader::new(train_dataset.clone(), self.config.dataloader.clone(), None);
 
-            while let Some(batch) = dataloader.next_batch() {
+            while let Some(batch) = dataloader
+                .try_next_batch()
+                .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
+            {
                 let stats = self.train_step(model, &batch, &mut optimizer)?;
 
                 if self.step % self.config.log_every == 0 {

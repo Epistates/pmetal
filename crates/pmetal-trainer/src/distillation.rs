@@ -207,7 +207,10 @@ impl DistillationTrainer {
                 dataloader.reset(Some(self.loop_state.config.dataloader.seed + epoch as u64));
             }
 
-            while let Some(batch) = dataloader.next_batch() {
+            while let Some(batch) = dataloader
+                .try_next_batch()
+                .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
+            {
                 let step_start = std::time::Instant::now();
                 let stats = self.train_step(student, teacher, &batch, &mut optimizer)?;
                 let step_ms = step_start.elapsed().as_secs_f64() * 1000.0;
@@ -332,7 +335,10 @@ impl DistillationTrainer {
         let mut total_loss = 0.0_f64;
         let mut num_batches = 0_usize;
 
-        while let Some(batch) = dataloader.next_batch() {
+        while let Some(batch) = dataloader
+            .try_next_batch()
+            .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?
+        {
             // Teacher forward (no gradient needed; teacher is outside autodiff scope).
             let teacher_logits = teacher
                 .forward(&batch.input_ids, None)
