@@ -46,13 +46,7 @@ const SKIP_FILES: &[&str] = &[
 
 /// Dataset files worth downloading for local consumption.
 const DATASET_EXTENSIONS: &[&str] = &[
-    ".parquet",
-    ".json",
-    ".jsonl",
-    ".csv",
-    ".tsv",
-    ".txt",
-    ".arrow",
+    ".parquet", ".json", ".jsonl", ".csv", ".tsv", ".txt", ".arrow",
 ];
 
 /// Download a model from HuggingFace Hub.
@@ -158,18 +152,16 @@ pub async fn download_model(
     }
 
     if !failures.is_empty() {
-        let preview = failures
-            .into_iter()
-            .take(10)
-            .collect::<Vec<_>>()
-            .join(", ");
+        let preview = failures.into_iter().take(10).collect::<Vec<_>>().join(", ");
         return Err(pmetal_core::PMetalError::Hub(format!(
             "Download incomplete for {}: {}",
             model_id, preview
         )));
     }
 
-    model_dir.ok_or_else(|| pmetal_core::PMetalError::Hub(format!("No files downloaded for {}", model_id)))
+    model_dir.ok_or_else(|| {
+        pmetal_core::PMetalError::Hub(format!("No files downloaded for {}", model_id))
+    })
 }
 
 /// Download a specific file from a model repository.
