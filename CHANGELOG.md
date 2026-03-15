@@ -9,12 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Desktop GUI (Tauri + Svelte)**: Full desktop application for model management, training, distillation, GRPO, inference, merging, and quantization. 10 pages: Dashboard, Models, Datasets, Training, Distillation, GRPO, Inference, Merging, Quantize, Settings. Real-time training metrics with live loss charts via broadcast events. Model download with HuggingFace Hub integration, dataset browser, and inference chat interface with streaming token display
+- **GUI in-process execution**: Training, distillation, GRPO, inference, model merging, LoRA fuse, and quantization run as direct library calls instead of shelling out to the `pmetal` binary. Eliminates binary discovery issues, reduces process overhead, and enables richer progress reporting. Device info and model metadata also read from library APIs
+- **`easy::dpo()` / `easy::simpo()` / `easy::orpo()` / `easy::kto()` builders**: `PreferenceTuneBuilder` in `easy.rs` for preference optimization methods. Full pipeline: model download → tokenizer → dataset loading → LoRA setup → training loop → weight saving. Supports method-specific config (DPO beta/loss type, SimPO gamma/CPO, ORPO beta, KTO desirable/undesirable weights)
+- **`easy::infer().generate_streaming()`**: Streaming inference API with per-delta callback. Supports both base models and LoRA adapters. Returns `false` from callback to cancel early. ANE fallback emits full result as single delta
+- **Preference trainer `train()` methods**: DPO, KTO, ORPO, and SimPO trainers now have self-contained `train()` methods with optimizer integration, batching, epoch loops, callback lifecycle, and metrics collection. Previously only exposed per-step primitives
+- **`TrainingCallback::should_stop()`**: Clean cancellation mechanism — callbacks return `true` to request training loop to finish the current step and exit with `Cancelled` error. Checked after every step in all 5 `TrainingLoop::run*` methods, all 4 preference trainer `train()` loops, and `GrpoTrainer::run()`
+- **`PMetalError::Cancelled`**: New error variant for clean training cancellation. Corresponding `Cancelled` variants added to `SftError`, `DpoError`, `KtoError`, `OrpoError`, `SimpoError`, and `GrpoError`
+- **Preference batch padding utilities**: `pad_u32_sequences`, `pad_i64_sequences`, `pad_f32_sequences` in `preference_batch.rs` for batching variable-length preference pairs
 - **NemotronH runtime FP8 quantization**: `quantize_fp8()` converts float weights to FP8 (E4M3) at runtime for all four block types (Mamba, attention, MLP, MoE). Shared helpers `materialize_linear_weight` and `linear_forward_with_optional_fp8` consolidate FP8 dequantization across the model. MoE weights are restacked after quantization for batched dispatch
 - **FluxPipeline::from_pretrained**: Load Flux diffusion pipelines from HuggingFace-style model directories. Discovers components via `model_index.json`, parses both native and diffusers-style config keys for CLIP, T5, FluxDiT, and VAE
 - **Python training callbacks**: `Trainer.add_callback()` now wires callbacks into the training loop. Built-in `ProgressCallback`, `LoggingCallback`, and `MetricsJsonCallback` map to native Rust implementations; arbitrary Python objects bridge through `PythonCallbackBridge`
 
 ### Fixed
 
+- **Training cancellation via `panic_any` replaced**: GUI and TUI previously used `std::panic::panic_any(CancelledRun)` + `catch_unwind` to abort training — fragile, UB-prone through FFI, and could be swallowed by intermediate catch_unwind. Replaced with `TrainingCallback::should_stop()` returning a clean `Err(Cancelled)` from the training loop
+- **GUI QLoRA silently failed on non-Llama models**: `run_qlora_training_in_process` hardcoded `LlamaConfig` deserialization, causing confusing errors or silent misconfiguration for Gemma/Qwen/Phi models. Now detects `model_type` from config.json and returns a clear error for unsupported architectures
+- **GUI `resume_from` silently ignored**: Training config accepted `resume_from` but discarded it (`let _ = eval`). Now returns an error directing users to the CLI
+- **GUI GRPO with no reward function produced noise**: `DummyReward` returning constant 0.1 for all completions made GRPO training meaningless when reasoning rewards were disabled. Now requires explicit reward configuration
+- **Preference trainers doubled compute per step**: DPO, KTO, ORPO, and SimPO `train()` methods ran a second full forward pass after the gradient step solely for logging metrics. Replaced with `RefCell` side-channels that capture metric arrays from within the autograd closure — same metrics, zero extra compute
 - **Base model thinking mode**: Auto-detect base vs instruct models and disable `<think>` tag prefill for base models. Base models don't understand thinking tags, causing infinite generation without a closing tag
 - **Fused model 5x slower than LoRA**: Skip ANE-hybrid path for models under 2B parameters where GPU KV-cache decode is significantly faster (115 vs 20 tok/s). ANE-hybrid benefits larger models where prefill dominates
 - **DataLoader panics on bad images**: Replace `panic!()` in VLM batch construction with proper `DataLoaderError` enum and `try_next_batch()` method. Image preprocessing failures and missing-image errors now propagate as `Result` instead of crashing
@@ -28,6 +41,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **GUI architecture: library calls replace subprocess spawning**: Training, distillation, GRPO, inference, merge, fuse, and quantize commands now call `pmetal` library functions directly instead of spawning `pmetal` CLI as a child process. System info reads from `MetalContext::global()` instead of parsing `pmetal memory` stdout. Removes `which` and `futures-util` dependencies
+- **TUI direct training execution**: `command_runner.rs` dispatches `train`, `distill`, and `grpo` commands as in-process library calls via `run_direct_command()`, falling back to subprocess for other commands. Training parameters parsed from `CommandSpec` args with `parse_arg`/`required_arg`/`optional_arg` helpers
+- **ORPO loss computation refactored**: `compute_orpo_loss_static` now contains the full computation directly instead of creating a throwaway `OrpoTrainer` instance. The instance method `compute_orpo_loss` delegates to it
+- **SimPO gradient-safe loss path**: New `compute_loss_with_cpo_for_grad` static method keeps the computation graph lazy (no `.eval()`/`.item()` calls) for correct autograd. The existing `compute_loss_with_cpo` remains for non-grad contexts
+- **`FinetuneBuilder` expanded**: New builder methods — `lora_dropout()`, `use_rslora()`, `use_dora()`, `gradient_checkpointing_layers()`, `callback()`, `metrics_path()`. LoRA config now forwards dropout, RSLoRA, and DoRA settings
+- **GRPO CLI gains new parameters**: `epochs`, `lora_r`, `lora_alpha`, `max_completion_length` exposed as CLI arguments and TUI form fields. GRPO now saves `adapter_config.json` alongside LoRA weights
+- **CLI `emit_console_output` flag**: Training, distillation, and GRPO CLI functions accept `emit_console_output: bool` and `extra_callbacks: Vec<Box<dyn TrainingCallback>>` to suppress terminal output when called from GUI/TUI
 - **DataLoader error handling**: New `DataLoaderError` enum with `Mlx`, `ImagePreprocess`, and `MissingImages` variants. All 7 training loop entry points migrated from `next_batch()` to `try_next_batch()`
 - **AdapterManager validation**: `load()` now validates path existence, checks for adapter artifacts in directories, and rejects unsupported file types
 - **Metal shader build isolation**: Shader compiler cache redirected to build output directory, preventing pollution of user's home directory
