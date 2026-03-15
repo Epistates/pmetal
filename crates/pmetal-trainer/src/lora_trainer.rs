@@ -105,35 +105,12 @@ impl LoraTrainer {
     /// Training statistics for this step
     pub fn train_step_finite_diff(
         &mut self,
-        input_ids: &Array,
-        labels: &Array,
+        _input_ids: &Array,
+        _labels: &Array,
     ) -> Result<TrainStepStats> {
-        // Compute current loss
-        let loss = self.compute_loss(input_ids, labels)?;
-        loss.eval()?;
-        let loss_val = loss.item::<f32>();
-
-        // Get current learning rate
-        let lr = self.get_learning_rate();
-
-        // Epsilon for finite differences
-        let epsilon = 1e-4_f32;
-
-        // Note: Finite differences is impractical for real training.
-        // This is a placeholder demonstrating the API structure.
-        // For actual training, use train_step_sgd with computed gradients
-        // or implement proper autodiff with mlx-rs transforms.
-        let _ = (epsilon, lr); // Suppress unused warnings
-
-        self.step += 1;
-        self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
-
-        Ok(TrainStepStats {
-            loss: loss_val,
-            learning_rate: lr,
-            num_tokens: (input_ids.dim(0) * input_ids.dim(1)) as usize,
-            grad_norm: None,
-        })
+        Err(SftError::Mlx(Exception::custom(
+            "train_step_finite_diff is not implemented for production use. Use train_step with mlx-rs autodiff or TrainingLoop instead.",
+        )))
     }
 
     /// Perform a training step with SGD using numerical gradients.
@@ -576,5 +553,17 @@ mod tests {
 
         // Loss should have been computed
         assert!((stats.loss - initial_loss_val).abs() < 0.1);
+    }
+
+    #[test]
+    fn test_train_step_finite_diff_fails_explicitly() {
+        let mut trainer =
+            LoraTrainer::new(small_config(), small_lora_config(), small_training_config()).unwrap();
+
+        let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let labels = Array::from_slice(&[2_i32, 3, 4, 5], &[1, 4]);
+
+        let err = trainer.train_step_finite_diff(&input_ids, &labels).unwrap_err();
+        assert!(err.to_string().contains("not implemented"));
     }
 }
