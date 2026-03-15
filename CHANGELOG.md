@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.6] - 2026-03-15
 
+### Added
+
+- **NemotronH runtime FP8 quantization**: `quantize_fp8()` converts float weights to FP8 (E4M3) at runtime for all four block types (Mamba, attention, MLP, MoE). Shared helpers `materialize_linear_weight` and `linear_forward_with_optional_fp8` consolidate FP8 dequantization across the model. MoE weights are restacked after quantization for batched dispatch
+- **FluxPipeline::from_pretrained**: Load Flux diffusion pipelines from HuggingFace-style model directories. Discovers components via `model_index.json`, parses both native and diffusers-style config keys for CLIP, T5, FluxDiT, and VAE
+- **Python training callbacks**: `Trainer.add_callback()` now wires callbacks into the training loop. Built-in `ProgressCallback`, `LoggingCallback`, and `MetricsJsonCallback` map to native Rust implementations; arbitrary Python objects bridge through `PythonCallbackBridge`
+
 ### Fixed
 
 - **Base model thinking mode**: Auto-detect base vs instruct models and disable `<think>` tag prefill for base models. Base models don't understand thinking tags, causing infinite generation without a closing tag
@@ -18,12 +24,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Qwen3Next silent weight mismatch**: Weight loading now returns errors for unmatched or missing parameters instead of logging a warning and continuing with a partially loaded model
 - **Dataset download only fetched README**: `download_dataset()` now enumerates repo files and downloads actual data files (parquet, json, jsonl, csv, arrow, etc.) with split-aware filtering
 - **Model download silent failures**: `download_model()` tracks per-file failures and reports them instead of silently skipping failed downloads
+- **Flux loading via DynamicModel**: `DynamicModel::load()` for Flux now returns an error directing to `FluxPipeline` instead of incorrectly loading a diffusion model as a causal LM
 
 ### Changed
 
 - **DataLoader error handling**: New `DataLoaderError` enum with `Mlx`, `ImagePreprocess`, and `MissingImages` variants. All 7 training loop entry points migrated from `next_batch()` to `try_next_batch()`
 - **AdapterManager validation**: `load()` now validates path existence, checks for adapter artifacts in directories, and rejects unsupported file types
 - **Metal shader build isolation**: Shader compiler cache redirected to build output directory, preventing pollution of user's home directory
+- **unsafe_code lint scoping**: Moved blanket `#![allow(unsafe_code)]` from crate-level `lib.rs` into individual modules that contain unsafe blocks across pmetal-metal, pmetal-mlx, pmetal-models, pmetal-trainer, pmetal-distill, and pmetal-distributed
 
 ## [0.3.5] - 2026-03-15
 
