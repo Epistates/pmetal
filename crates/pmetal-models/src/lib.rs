@@ -17,11 +17,11 @@
 //! - Jamba (1.5)
 //! - GPT-OSS (architecture only, not dispatched)
 //!
-//! ## Diffusion (dispatched, experimental)
+//! ## Diffusion (pipeline components available)
 //!
-//! - Flux (1-dev, 1-schnell)
+//! - Flux (1-dev, 1-schnell) via [`pipelines::FluxPipeline`]
 //!
-//! ## Vision & Multimodal (architecture only, not yet dispatched)
+//! ## Vision & Multimodal (architecture components only, not yet dispatched)
 //!
 //! - Pixtral, Qwen2-VL, MLlama, CLIP, T5, VAE, Whisper
 //!

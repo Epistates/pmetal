@@ -432,15 +432,9 @@ impl DynamicModel {
                 Ok(Self::Jamba(model))
             }
             ModelArchitecture::Flux => {
-                let config: FluxConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = FluxDiT::new(config);
-                let weights = crate::loader::load_weights(model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                crate::loader::load_flux_weights(&mut model, &weights)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
-                Ok(Self::Flux(model))
+                Err(Exception::custom(
+                    "Flux models are diffusion pipelines, not causal language models. Load them via pmetal_models::pipelines::FluxPipeline instead of DynamicModel::load.",
+                ))
             }
         }
     }
