@@ -563,7 +563,9 @@ mod tests {
         let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let labels = Array::from_slice(&[2_i32, 3, 4, 5], &[1, 4]);
 
-        let err = trainer.train_step_finite_diff(&input_ids, &labels).unwrap_err();
+        let err = trainer
+            .train_step_finite_diff(&input_ids, &labels)
+            .unwrap_err();
         assert!(err.to_string().contains("not implemented"));
     }
 }

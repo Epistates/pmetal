@@ -4,7 +4,9 @@
 //! high-quality image generation on Apple Silicon.
 
 use mlx_rs::{
-    Array, error::Exception, module::{Module, ModuleParametersExt}
+    Array,
+    error::Exception,
+    module::{Module, ModuleParametersExt},
 };
 use pmetal_core::Result;
 use serde_json::Value;
@@ -310,10 +312,9 @@ fn load_clip_config(component_dir: &Path) -> Result<CLIPConfig> {
         value_usize(&raw, &["num_heads", "num_attention_heads"]).unwrap_or(config.num_heads);
     config.intermediate_size =
         value_usize(&raw, &["intermediate_size"]).unwrap_or(config.intermediate_size);
-    config.max_position_embeddings = value_usize(&raw, &["max_position_embeddings"])
-        .unwrap_or(config.max_position_embeddings);
-    config.layer_norm_eps =
-        value_f32(&raw, &["layer_norm_eps"]).unwrap_or(config.layer_norm_eps);
+    config.max_position_embeddings =
+        value_usize(&raw, &["max_position_embeddings"]).unwrap_or(config.max_position_embeddings);
+    config.layer_norm_eps = value_f32(&raw, &["layer_norm_eps"]).unwrap_or(config.layer_norm_eps);
     config.use_quick_gelu = match value_str(&raw, &["hidden_act", "activation_function"]) {
         Some("quick_gelu") => true,
         Some("gelu") | Some("gelu_new") => false,
@@ -335,16 +336,11 @@ fn load_t5_config(component_dir: &Path) -> Result<T5Config> {
         value_usize(&raw, &["num_layers", "num_hidden_layers"]).unwrap_or(config.num_layers);
     config.num_heads =
         value_usize(&raw, &["num_heads", "num_attention_heads"]).unwrap_or(config.num_heads);
-    config.relative_attention_num_buckets = value_usize(
-        &raw,
-        &["relative_attention_num_buckets"],
-    )
-    .unwrap_or(config.relative_attention_num_buckets);
-    config.relative_attention_max_distance = value_usize(
-        &raw,
-        &["relative_attention_max_distance"],
-    )
-    .unwrap_or(config.relative_attention_max_distance);
+    config.relative_attention_num_buckets = value_usize(&raw, &["relative_attention_num_buckets"])
+        .unwrap_or(config.relative_attention_num_buckets);
+    config.relative_attention_max_distance =
+        value_usize(&raw, &["relative_attention_max_distance"])
+            .unwrap_or(config.relative_attention_max_distance);
     config.dropout_rate = value_f32(&raw, &["dropout_rate"]).unwrap_or(config.dropout_rate);
     config.layer_norm_epsilon =
         value_f32(&raw, &["layer_norm_epsilon"]).unwrap_or(config.layer_norm_epsilon);
@@ -378,8 +374,8 @@ fn load_flux_config(component_dir: &Path) -> Result<FluxConfig> {
     let mut config = FluxConfig::default();
 
     config.input_dim = value_usize(&raw, &["input_dim", "in_channels"]).unwrap_or(config.input_dim);
-    config.num_attention_heads = value_usize(&raw, &["num_attention_heads"])
-        .unwrap_or(config.num_attention_heads);
+    config.num_attention_heads =
+        value_usize(&raw, &["num_attention_heads"]).unwrap_or(config.num_attention_heads);
     let attention_head_dim = value_usize(&raw, &["attention_head_dim"]);
     config.hidden_size = value_usize(&raw, &["hidden_size"])
         .or_else(|| attention_head_dim.map(|dim| dim * config.num_attention_heads))
@@ -398,14 +394,12 @@ fn load_flux_config(component_dir: &Path) -> Result<FluxConfig> {
                 .map(|enabled| !enabled)
                 .unwrap_or(config.disable_guidance_embedder)
         });
-    config.timestep_dim =
-        value_usize(&raw, &["timestep_dim"]).unwrap_or(config.timestep_dim);
+    config.timestep_dim = value_usize(&raw, &["timestep_dim"]).unwrap_or(config.timestep_dim);
     config.pooled_embed_dim = value_usize(&raw, &["pooled_embed_dim", "pooled_projection_dim"])
         .unwrap_or(config.pooled_embed_dim);
     config.context_embed_dim = value_usize(&raw, &["context_embed_dim", "joint_attention_dim"])
         .unwrap_or(config.context_embed_dim);
-    config.norm_epsilon =
-        value_f32(&raw, &["norm_epsilon"]).unwrap_or(config.norm_epsilon);
+    config.norm_epsilon = value_f32(&raw, &["norm_epsilon"]).unwrap_or(config.norm_epsilon);
 
     Ok(config)
 }

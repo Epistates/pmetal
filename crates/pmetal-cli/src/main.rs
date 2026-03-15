@@ -3676,7 +3676,9 @@ async fn run_inference(
 
     // Base models don't understand <think> tags — force no_thinking for them
     let no_thinking = if !is_instruct_model && !no_thinking && use_chat {
-        tracing::info!("Base model detected, disabling thinking mode (use an instruct model for thinking)");
+        tracing::info!(
+            "Base model detected, disabling thinking mode (use an instruct model for thinking)"
+        );
         true
     } else {
         no_thinking
@@ -3788,62 +3790,76 @@ async fn run_inference(
         let ane_output: Option<GenerationOutput> = if ane {
             // Skip ANE for small models (<2B params) — GPU KV-cache is faster for decode.
             // ANE-hybrid shines on larger models (4B+) where prefill dominates.
-            let param_count_too_small = match std::fs::read_to_string(model_path.join("config.json")) {
-                Ok(config_text) => match serde_json::from_str::<serde_json::Value>(&config_text) {
-                    Ok(config_json) => {
-                        let hidden = config_json.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let layers = config_json.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(0);
-                        let vocab = config_json.get("vocab_size").and_then(|v| v.as_u64()).unwrap_or(0);
-                        // Rough param estimate: 12 * hidden^2 * layers + hidden * vocab
-                        let est_params = 12 * hidden * hidden * layers + hidden * vocab;
-                        est_params < 2_000_000_000 // <2B params
+            let param_count_too_small =
+                match std::fs::read_to_string(model_path.join("config.json")) {
+                    Ok(config_text) => {
+                        match serde_json::from_str::<serde_json::Value>(&config_text) {
+                            Ok(config_json) => {
+                                let hidden = config_json
+                                    .get("hidden_size")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let layers = config_json
+                                    .get("num_hidden_layers")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let vocab = config_json
+                                    .get("vocab_size")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                // Rough param estimate: 12 * hidden^2 * layers + hidden * vocab
+                                let est_params = 12 * hidden * hidden * layers + hidden * vocab;
+                                est_params < 2_000_000_000 // <2B params
+                            }
+                            Err(_) => false,
+                        }
                     }
                     Err(_) => false,
-                },
-                Err(_) => false,
-            };
+                };
 
             if param_count_too_small {
                 tracing::info!("Small model (<2B) — using GPU path for faster decode");
                 None
             } else {
-            // Validate architecture before attempting ANE (saves ~7s on incompatible models)
-            let ane_compatible = match std::fs::read_to_string(model_path.join("config.json")) {
-                Ok(config_text) => match serde_json::from_str::<serde_json::Value>(&config_text) {
-                    Ok(config_json) => {
-                        use pmetal_trainer::DynamicAneTrainerConfig;
-                        match DynamicAneTrainerConfig::is_ane_compatible(&config_json) {
-                            Ok(()) => true,
-                            Err(reason) => {
-                                tracing::info!("Skipping ANE inference: {}", reason);
-                                false
+                // Validate architecture before attempting ANE (saves ~7s on incompatible models)
+                let ane_compatible = match std::fs::read_to_string(model_path.join("config.json")) {
+                    Ok(config_text) => {
+                        match serde_json::from_str::<serde_json::Value>(&config_text) {
+                            Ok(config_json) => {
+                                use pmetal_trainer::DynamicAneTrainerConfig;
+                                match DynamicAneTrainerConfig::is_ane_compatible(&config_json) {
+                                    Ok(()) => true,
+                                    Err(reason) => {
+                                        tracing::info!("Skipping ANE inference: {}", reason);
+                                        false
+                                    }
+                                }
                             }
+                            Err(_) => true, // Can't parse config, let ANE try anyway
                         }
                     }
-                    Err(_) => true, // Can't parse config, let ANE try anyway
-                },
-                Err(_) => true, // No config.json, let ANE try anyway
-            };
+                    Err(_) => true, // No config.json, let ANE try anyway
+                };
 
-            if ane_compatible {
-                tracing::info!(
-                    "Attempting ANE-hybrid inference engine (Prefill: ANE, Decode: CPU/vDSP)"
-                );
-                match pmetal_models::generate_cached_ane(
-                    &model_path,
-                    &input_ids,
-                    &gen_config,
-                    ane_max_seq_len,
-                ) {
-                    Ok(output) => Some(output),
-                    Err(e) => {
-                        tracing::warn!("ANE inference failed ({}), falling back to GPU", e);
-                        None
+                if ane_compatible {
+                    tracing::info!(
+                        "Attempting ANE-hybrid inference engine (Prefill: ANE, Decode: CPU/vDSP)"
+                    );
+                    match pmetal_models::generate_cached_ane(
+                        &model_path,
+                        &input_ids,
+                        &gen_config,
+                        ane_max_seq_len,
+                    ) {
+                        Ok(output) => Some(output),
+                        Err(e) => {
+                            tracing::warn!("ANE inference failed ({}), falling back to GPU", e);
+                            None
+                        }
                     }
+                } else {
+                    None
                 }
-            } else {
-                None
-            }
             } // close else for param_count_too_small
         } else {
             None

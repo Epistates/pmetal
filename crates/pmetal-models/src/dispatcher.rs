@@ -431,11 +431,9 @@ impl DynamicModel {
                 ModuleParametersExt::eval(&model)?;
                 Ok(Self::Jamba(model))
             }
-            ModelArchitecture::Flux => {
-                Err(Exception::custom(
-                    "Flux models are diffusion pipelines, not causal language models. Load them via pmetal_models::pipelines::FluxPipeline instead of DynamicModel::load.",
-                ))
-            }
+            ModelArchitecture::Flux => Err(Exception::custom(
+                "Flux models are diffusion pipelines, not causal language models. Load them via pmetal_models::pipelines::FluxPipeline instead of DynamicModel::load.",
+            )),
         }
     }
 

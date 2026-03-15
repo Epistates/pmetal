@@ -189,7 +189,10 @@ impl DataLoader {
     }
 
     /// Create a batch from sample indices.
-    fn build_batch_components(&self, indices: &[usize]) -> Result<BatchComponents, DataLoaderError> {
+    fn build_batch_components(
+        &self,
+        indices: &[usize],
+    ) -> Result<BatchComponents, DataLoaderError> {
         let batch_size = indices.len();
 
         // Collect samples
@@ -359,17 +362,25 @@ mod tests {
 
         // Should have 4 batches (10 / 3 = 3 full + 1 partial)
         assert_eq!(loader.num_batches(), 4);
-        let batch1 = loader.build_batch_components(&loader.indices[0..3]).unwrap();
+        let batch1 = loader
+            .build_batch_components(&loader.indices[0..3])
+            .unwrap();
         assert_eq!(batch1.batch_size, 3);
         assert_eq!(batch1.seq_len, 3);
 
-        let batch2 = loader.build_batch_components(&loader.indices[3..6]).unwrap();
+        let batch2 = loader
+            .build_batch_components(&loader.indices[3..6])
+            .unwrap();
         assert_eq!(batch2.batch_size, 3);
 
-        let batch3 = loader.build_batch_components(&loader.indices[6..9]).unwrap();
+        let batch3 = loader
+            .build_batch_components(&loader.indices[6..9])
+            .unwrap();
         assert_eq!(batch3.batch_size, 3);
 
-        let batch4 = loader.build_batch_components(&loader.indices[9..10]).unwrap();
+        let batch4 = loader
+            .build_batch_components(&loader.indices[9..10])
+            .unwrap();
         assert_eq!(batch4.batch_size, 1); // Last incomplete batch
     }
 

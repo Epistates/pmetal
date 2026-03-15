@@ -47,7 +47,8 @@ impl AdapterManager {
 
             path.to_path_buf()
         } else {
-            let is_safetensors = path.extension().and_then(|ext| ext.to_str()) == Some("safetensors");
+            let is_safetensors =
+                path.extension().and_then(|ext| ext.to_str()) == Some("safetensors");
             if !is_safetensors {
                 return Err(pmetal_core::PMetalError::InvalidArgument(format!(
                     "unsupported adapter file: {}",
@@ -107,7 +108,9 @@ mod tests {
     #[test]
     fn load_rejects_missing_path() {
         let mut manager = AdapterManager::new();
-        let err = manager.load("/tmp/does-not-exist-pmetal", "missing").unwrap_err();
+        let err = manager
+            .load("/tmp/does-not-exist-pmetal", "missing")
+            .unwrap_err();
         assert!(err.to_string().contains("does not exist"));
     }
 

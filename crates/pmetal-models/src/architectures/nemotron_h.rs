@@ -854,7 +854,10 @@ impl MoELayer {
             .experts
             .iter()
             .map(|e| {
-                materialize_linear_weight(e.up_proj.weight.as_ref(), e.up_proj_weight_scale.as_ref())
+                materialize_linear_weight(
+                    e.up_proj.weight.as_ref(),
+                    e.up_proj_weight_scale.as_ref(),
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
         let up_weight_refs: Vec<&Array> = up_weights.iter().collect();
@@ -2441,20 +2444,38 @@ mod tests {
         model.quantize_fp8_weights().unwrap();
 
         let mamba = &model.backbone.layers[0].mixer;
-        assert_eq!(mamba.in_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
+        assert_eq!(
+            mamba.in_proj.as_ref().unwrap().weight.as_ref().dtype(),
+            Dtype::Uint8
+        );
         assert_eq!(
             mamba.out_proj.as_ref().unwrap().weight.as_ref().dtype(),
             Dtype::Uint8
         );
 
         let attention = &model.backbone.layers[1].mixer;
-        assert_eq!(attention.q_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
-        assert_eq!(attention.k_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
-        assert_eq!(attention.v_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
-        assert_eq!(attention.o_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
+        assert_eq!(
+            attention.q_proj.as_ref().unwrap().weight.as_ref().dtype(),
+            Dtype::Uint8
+        );
+        assert_eq!(
+            attention.k_proj.as_ref().unwrap().weight.as_ref().dtype(),
+            Dtype::Uint8
+        );
+        assert_eq!(
+            attention.v_proj.as_ref().unwrap().weight.as_ref().dtype(),
+            Dtype::Uint8
+        );
+        assert_eq!(
+            attention.o_proj.as_ref().unwrap().weight.as_ref().dtype(),
+            Dtype::Uint8
+        );
 
         let mlp = &model.backbone.layers[2].mixer;
-        assert_eq!(mlp.up_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
+        assert_eq!(
+            mlp.up_proj.as_ref().unwrap().weight.as_ref().dtype(),
+            Dtype::Uint8
+        );
         assert_eq!(
             mlp.down_proj.as_ref().unwrap().weight.as_ref().dtype(),
             Dtype::Uint8
@@ -2463,7 +2484,10 @@ mod tests {
         let moe = model.backbone.layers[3].mixer.moe_layer.as_ref().unwrap();
         assert_eq!(moe.router.gate.weight.as_ref().dtype(), Dtype::Uint8);
         assert_eq!(moe.experts[0].up_proj.weight.as_ref().dtype(), Dtype::Uint8);
-        assert_eq!(moe.experts[0].down_proj.weight.as_ref().dtype(), Dtype::Uint8);
+        assert_eq!(
+            moe.experts[0].down_proj.weight.as_ref().dtype(),
+            Dtype::Uint8
+        );
     }
 
     #[test]
