@@ -2,7 +2,7 @@
   import { onMount, onDestroy, tick } from 'svelte';
   import { page } from '$app/stores';
   import { modelsStore } from '$lib/stores.svelte';
-  import { startInference, stopInference, onInferenceToken, onInferenceDone } from '$lib/api';
+  import { startInference, stopInference, onInferenceToken, onInferenceDone, onInferenceError } from '$lib/api';
   import { renderMarkdown } from '$lib/utils';
   import type { UnlistenFn } from '@tauri-apps/api/event';
 
@@ -39,6 +39,7 @@
   // Listeners
   let unlistenToken: UnlistenFn | null = null;
   let unlistenDone: UnlistenFn | null = null;
+  let unlistenError: UnlistenFn | null = null;
 
   let models = $derived(modelsStore.models);
 
@@ -51,6 +52,7 @@
   onDestroy(() => {
     unlistenToken?.();
     unlistenDone?.();
+    unlistenError?.();
   });
 
   async function scrollToBottom() {
@@ -111,6 +113,7 @@
       // Set up listeners before invoking
       unlistenToken?.();
       unlistenDone?.();
+      unlistenError?.();
 
       unlistenToken = await onInferenceToken((token) => {
         currentContent += token;
@@ -133,6 +136,12 @@
         });
         isGenerating = false;
         scrollToBottom();
+      });
+
+      unlistenError = await onInferenceError((message) => {
+        error = message;
+        messages = messages.filter((m, i) => !(i === messages.length - 1 && m.isStreaming));
+        isGenerating = false;
       });
 
       // Build full conversation prompt for context

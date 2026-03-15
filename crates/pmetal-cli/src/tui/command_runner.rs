@@ -7,12 +7,14 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
 
+use futures::FutureExt;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::tui::event::{AppMsg, CommandSpec, JobType};
+use crate::QuantizationMethod;
 
 /// A currently running background job.
 #[allow(dead_code)]
@@ -135,6 +137,27 @@ fn pmetal_binary() -> PathBuf {
     PathBuf::from("pmetal")
 }
 
+#[derive(Debug)]
+struct CancelledRun;
+
+struct CancelOnToken {
+    token: CancellationToken,
+}
+
+impl pmetal_core::TrainingCallback for CancelOnToken {
+    fn on_step_start(&mut self, _step: usize) {
+        if self.token.is_cancelled() {
+            std::panic::panic_any(CancelledRun);
+        }
+    }
+
+    fn on_step_end(&mut self, _step: usize, _loss: f64) {
+        if self.token.is_cancelled() {
+            std::panic::panic_any(CancelledRun);
+        }
+    }
+}
+
 /// Run a command spec as a child process, streaming output back to the TUI.
 async fn run_command(
     spec: CommandSpec,
@@ -142,6 +165,41 @@ async fn run_command(
     tx: mpsc::UnboundedSender<AppMsg>,
     cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
+    // If this is a training-type job, write a sentinel file
+    if let Some(ref output_dir) = spec.output_dir {
+        if matches!(
+            spec.job_type,
+            JobType::Train | JobType::Distill | JobType::Grpo
+        ) {
+            let running_file = output_dir.join(".running");
+            let _ = tokio::fs::create_dir_all(output_dir).await;
+            let _ = tokio::fs::write(&running_file, job_id).await;
+        }
+    }
+
+    // Log the full command to the job output for debugging
+    let cmd_display = format!("pmetal {}", spec.args.join(" "));
+    let _ = tx.send(AppMsg::JobOutput {
+        job_id: job_id.to_string(),
+        line: format!("$ {cmd_display}"),
+    });
+
+    // Poll metrics file for training jobs
+    if let Some(ref metrics_path) = spec.metrics_file {
+        let tx_metrics = tx.clone();
+        let jid = job_id.to_string();
+        let path = metrics_path.clone();
+        let cancel_metrics = cancel.clone();
+        tokio::spawn(async move {
+            poll_metrics_file(&path, &jid, tx_metrics, cancel_metrics).await;
+        });
+    }
+
+    if let Some(result) = run_direct_command(&spec, cancel.clone()).await {
+        cleanup_running_file(&spec).await;
+        return result;
+    }
+
     let binary = pmetal_binary();
     let mut cmd = Command::new(&binary);
 
@@ -158,27 +216,8 @@ async fn run_command(
         }
     }
 
-    // If this is a training-type job, write a sentinel file
-    if let Some(ref output_dir) = spec.output_dir {
-        if matches!(
-            spec.job_type,
-            JobType::Train | JobType::Distill | JobType::Grpo
-        ) {
-            let running_file = output_dir.join(".running");
-            let _ = tokio::fs::create_dir_all(output_dir).await;
-            let _ = tokio::fs::write(&running_file, job_id).await;
-        }
-    }
-
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
-
-    // Log the full command to the job output for debugging
-    let cmd_display = format!("{} {}", binary.display(), spec.args.join(" "));
-    let _ = tx.send(AppMsg::JobOutput {
-        job_id: job_id.to_string(),
-        line: format!("$ {cmd_display}"),
-    });
 
     let mut child = cmd.spawn()?;
 
@@ -354,26 +393,11 @@ async fn run_command(
         });
     }
 
-    // Poll metrics file for training jobs
-    if let Some(ref metrics_path) = spec.metrics_file {
-        let tx_metrics = tx.clone();
-        let jid = job_id_owned.clone();
-        let path = metrics_path.clone();
-        let cancel_metrics = cancel.clone();
-        tokio::spawn(async move {
-            poll_metrics_file(&path, &jid, tx_metrics, cancel_metrics).await;
-        });
-    }
-
     // Wait for the child to exit, or cancel
     tokio::select! {
         status = child.wait() => {
             let status = status?;
-            // Clean up sentinel file
-            if let Some(ref output_dir) = spec.output_dir {
-                let running_file = output_dir.join(".running");
-                let _ = tokio::fs::remove_file(&running_file).await;
-            }
+            cleanup_running_file(&spec).await;
             if status.success() {
                 Ok(())
             } else {
@@ -409,13 +433,207 @@ async fn run_command(
         }
         _ = cancel.cancelled() => {
             let _ = child.kill().await;
-            // Clean up sentinel file
-            if let Some(ref output_dir) = spec.output_dir {
-                let running_file = output_dir.join(".running");
-                let _ = tokio::fs::remove_file(&running_file).await;
-            }
+            cleanup_running_file(&spec).await;
             Err(anyhow::anyhow!("Cancelled by user"))
         }
+    }
+}
+
+async fn cleanup_running_file(spec: &CommandSpec) {
+    if let Some(ref output_dir) = spec.output_dir {
+        let running_file = output_dir.join(".running");
+        let _ = tokio::fs::remove_file(&running_file).await;
+    }
+}
+
+async fn run_direct_command(
+    spec: &CommandSpec,
+    cancel: CancellationToken,
+) -> Option<Result<(), anyhow::Error>> {
+    let subcommand = spec.args.first()?.as_str();
+
+    match subcommand {
+        "train" => Some(run_training_direct(spec, cancel).await),
+        "distill" => Some(run_distillation_direct(spec, cancel).await),
+        "grpo" => Some(run_grpo_direct(spec, cancel).await),
+        _ => None,
+    }
+}
+
+async fn run_training_direct(
+    spec: &CommandSpec,
+    cancel: CancellationToken,
+) -> Result<(), anyhow::Error> {
+    let model = required_arg(&spec.args, "--model")?;
+    let dataset = required_arg(&spec.args, "--dataset")?;
+    let output = required_arg(&spec.args, "--output")?;
+    let eval_dataset = optional_arg(&spec.args, "--eval-dataset");
+    let quantization = match optional_arg(&spec.args, "--quantization")
+        .unwrap_or_else(|| "none".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "nf4" => QuantizationMethod::Nf4,
+        "fp4" => QuantizationMethod::Fp4,
+        "int8" => QuantizationMethod::Int8,
+        _ => QuantizationMethod::None,
+    };
+
+    let callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = vec![Box::new(CancelOnToken {
+        token: cancel.clone(),
+    })];
+
+    let result = std::panic::AssertUnwindSafe(crate::run_training(
+        None,
+        Some(model),
+        Some(dataset),
+        eval_dataset,
+        output,
+        parse_arg(&spec.args, "--lora-r", 16usize)?,
+        parse_arg(&spec.args, "--lora-alpha", 32.0f32)?,
+        parse_arg(&spec.args, "--learning-rate", 2e-4f64)?,
+        parse_arg(&spec.args, "--batch-size", 1usize)?,
+        parse_arg(&spec.args, "--epochs", 1usize)?,
+        parse_arg(&spec.args, "--max-seq-len", 2048usize)?,
+        parse_arg(&spec.args, "--gradient-accumulation-steps", 4usize)?,
+        !has_flag(&spec.args, "--no-flash-attention"),
+        parse_arg(&spec.args, "--max-grad-norm", 1.0f64)?,
+        false,
+        quantization,
+        64,
+        false,
+        true,
+        !has_flag(&spec.args, "--no-metal-fused-optimizer"),
+        !has_flag(&spec.args, "--no-sequence-packing"),
+        !has_flag(&spec.args, "--no-jit-compilation"),
+        true,
+        4,
+        spec.metrics_file.as_ref().map(|p| p.display().to_string()),
+        false,
+        callbacks,
+        None,
+        !has_flag(&spec.args, "--no-ane"),
+    ))
+    .catch_unwind()
+    .await;
+
+    map_cancelled_result(result)
+}
+
+async fn run_distillation_direct(
+    spec: &CommandSpec,
+    cancel: CancellationToken,
+) -> Result<(), anyhow::Error> {
+    let teacher = required_arg(&spec.args, "--teacher")?;
+    let student = required_arg(&spec.args, "--student")?;
+    let dataset = required_arg(&spec.args, "--dataset")?;
+    let output = required_arg(&spec.args, "--output")?;
+    let method = optional_arg(&spec.args, "--method").unwrap_or_else(|| "online".to_string());
+    let loss_type =
+        optional_arg(&spec.args, "--loss-type").unwrap_or_else(|| "kl_divergence".to_string());
+    let callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = vec![Box::new(CancelOnToken {
+        token: cancel.clone(),
+    })];
+
+    let result = std::panic::AssertUnwindSafe(crate::run_distillation_cli(
+        &teacher,
+        &student,
+        &dataset,
+        &output,
+        &method,
+        &loss_type,
+        parse_arg(&spec.args, "--temperature", 2.0f32)?,
+        parse_arg(&spec.args, "--alpha", 0.5f32)?,
+        has_flag(&spec.args, "--rationale"),
+        parse_arg(&spec.args, "--rationale-weight", 1.0f32)?,
+        parse_arg(&spec.args, "--lora-r", 16usize)?,
+        parse_arg(&spec.args, "--lora-alpha", 32usize)?,
+        parse_arg(&spec.args, "--learning-rate", 2e-5f32)?,
+        parse_arg(&spec.args, "--batch-size", 1usize)?,
+        parse_arg(&spec.args, "--epochs", 1usize)?,
+        parse_arg(&spec.args, "--max-seq-len", 1024usize)?,
+        spec.metrics_file.as_ref().map(|p| p.display().to_string()),
+        false,
+        callbacks,
+    ))
+    .catch_unwind()
+    .await;
+
+    map_cancelled_result(result)
+}
+
+async fn run_grpo_direct(
+    spec: &CommandSpec,
+    cancel: CancellationToken,
+) -> Result<(), anyhow::Error> {
+    let model = required_arg(&spec.args, "--model")?;
+    let dataset = required_arg(&spec.args, "--dataset")?;
+    let output = required_arg(&spec.args, "--output")?;
+    let callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = vec![Box::new(CancelOnToken {
+        token: cancel.clone(),
+    })];
+
+    let grpo_type = optional_arg(&spec.args, "--grpo-type").unwrap_or_else(|| "bnpo".to_string());
+
+    let result = std::panic::AssertUnwindSafe(crate::run_grpo_cli(
+        &model,
+        &dataset,
+        &output,
+        parse_arg(&spec.args, "--num-generations", 8usize)?,
+        parse_arg(&spec.args, "--beta", 0.001f64)?,
+        parse_arg(&spec.args, "--learning-rate", 5e-6f64)?,
+        parse_arg(&spec.args, "--epochs", 1usize)?,
+        parse_arg(&spec.args, "--lora-r", 16usize)?,
+        parse_arg(&spec.args, "--lora-alpha", 32usize)?,
+        parse_arg(&spec.args, "--max-seq-len", 512usize)?,
+        parse_arg(&spec.args, "--max-completion-length", 512usize)?,
+        grpo_type == "dapo" || has_flag(&spec.args, "--dapo"),
+        has_flag(&spec.args, "--reasoning-rewards"),
+        !has_flag(&spec.args, "--no-flash-attention"),
+        spec.metrics_file.as_ref().map(|p| p.display().to_string()),
+        false,
+        callbacks,
+    ))
+    .catch_unwind()
+    .await;
+
+    map_cancelled_result(result)
+}
+
+fn map_cancelled_result(
+    result: std::result::Result<Result<(), anyhow::Error>, Box<dyn std::any::Any + Send>>,
+) -> Result<(), anyhow::Error> {
+    match result {
+        Ok(inner) => inner,
+        Err(payload) if payload.is::<CancelledRun>() => Err(anyhow::anyhow!("Cancelled by user")),
+        Err(_) => Err(anyhow::anyhow!("Background task panicked")),
+    }
+}
+
+fn optional_arg(args: &[String], flag: &str) -> Option<String> {
+    args.windows(2)
+        .find(|window| window[0] == flag)
+        .map(|window| window[1].clone())
+}
+
+fn required_arg(args: &[String], flag: &str) -> Result<String, anyhow::Error> {
+    optional_arg(args, flag).ok_or_else(|| anyhow::anyhow!("Missing required argument: {flag}"))
+}
+
+fn has_flag(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+fn parse_arg<T>(args: &[String], flag: &str, default: T) -> Result<T, anyhow::Error>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    match optional_arg(args, flag) {
+        Some(value) => value
+            .parse::<T>()
+            .map_err(|e| anyhow::anyhow!("Invalid value for {flag}: {e}")),
+        None => Ok(default),
     }
 }
 

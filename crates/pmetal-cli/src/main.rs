@@ -1295,6 +1295,8 @@ async fn main() -> anyhow::Result<()> {
                 gradient_checkpointing,
                 gradient_checkpointing_layers,
                 log_metrics,
+                true,
+                Vec::new(),
                 embedding_lr,
                 #[cfg(feature = "ane")]
                 !no_ane,
@@ -1509,6 +1511,8 @@ async fn main() -> anyhow::Result<()> {
                 epochs,
                 max_seq_len,
                 log_metrics,
+                true,
+                Vec::new(),
             )
             .await?;
         }
@@ -1533,11 +1537,17 @@ async fn main() -> anyhow::Result<()> {
                 num_generations,
                 beta,
                 learning_rate,
+                1,
+                16,
+                32,
                 max_seq_len,
+                512,
                 dapo,
                 reasoning_rewards,
                 !no_flash_attention,
                 log_metrics,
+                true,
+                Vec::new(),
             )
             .await?;
         }
@@ -2121,6 +2131,8 @@ async fn run_distillation_cli(
     epochs: usize,
     max_seq_len: usize,
     log_metrics: Option<String>,
+    emit_console_output: bool,
+    extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
 ) -> anyhow::Result<()> {
     use pmetal_core::LoraConfig;
     use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
@@ -2129,26 +2141,28 @@ async fn run_distillation_cli(
     use pmetal_trainer::{DistillationTrainer, TrainingLoopConfig};
     use std::path::{Path, PathBuf};
 
-    println!("========================================");
-    println!("  PMetal Knowledge Distillation");
-    println!("========================================");
-    println!("Teacher:       {}", teacher_id);
-    println!("Student:       {}", student_id);
-    println!("Dataset:       {}", dataset_path);
-    println!("Output:        {}", output_dir);
-    println!("Method:        {}", method_str);
-    println!("Loss Type:     {}", loss_type_str);
-    println!("Temperature:   {}", temperature);
-    println!("Alpha:         {}", alpha);
-    if rationale {
-        println!("Rationale:     enabled (weight: {})", rationale_weight);
+    if emit_console_output {
+        println!("========================================");
+        println!("  PMetal Knowledge Distillation");
+        println!("========================================");
+        println!("Teacher:       {}", teacher_id);
+        println!("Student:       {}", student_id);
+        println!("Dataset:       {}", dataset_path);
+        println!("Output:        {}", output_dir);
+        println!("Method:        {}", method_str);
+        println!("Loss Type:     {}", loss_type_str);
+        println!("Temperature:   {}", temperature);
+        println!("Alpha:         {}", alpha);
+        if rationale {
+            println!("Rationale:     enabled (weight: {})", rationale_weight);
+        }
+        println!("LoRA Rank:     {}", lora_r);
+        println!("LR:            {:.2e}", learning_rate);
+        println!("Batch Size:    {}", batch_size);
+        println!("Epochs:        {}", epochs);
+        println!("Max Seq Len:   {}", max_seq_len);
+        println!("========================================\n");
     }
-    println!("LoRA Rank:     {}", lora_r);
-    println!("LR:            {:.2e}", learning_rate);
-    println!("Batch Size:    {}", batch_size);
-    println!("Epochs:        {}", epochs);
-    println!("Max Seq Len:   {}", max_seq_len);
-    println!("========================================\n");
 
     // 1. Resolve and Download Models
     tracing::info!("Resolving teacher model: {}", teacher_id);
@@ -2320,6 +2334,9 @@ async fn run_distillation_cli(
             MetricsJsonCallback::new(&path)?.with_run_name(format!("distill-{}", student_id));
         trainer.add_callback(Box::new(callback));
     }
+    for callback in extra_callbacks {
+        trainer.add_callback(callback);
+    }
 
     // 8. Run Distillation
     trainer
@@ -2353,19 +2370,21 @@ async fn run_distillation_cli(
         tracing::info!("Saved adapter config to {:?}", config_path);
     }
 
-    println!("\n========================================");
-    println!("  Distillation Complete");
-    println!("========================================");
-    println!("  Adapters:  {}", lora_output.display());
-    println!("  Student:   {}", student_id);
-    println!("  Template:  {:?}", chat_template.template_type);
-    println!("========================================");
-    println!("\nNext steps:");
-    println!(
-        "  Inference:  pmetal run {} --lora {}",
-        student_id,
-        lora_output.display()
-    );
+    if emit_console_output {
+        println!("\n========================================");
+        println!("  Distillation Complete");
+        println!("========================================");
+        println!("  Adapters:  {}", lora_output.display());
+        println!("  Student:   {}", student_id);
+        println!("  Template:  {:?}", chat_template.template_type);
+        println!("========================================");
+        println!("\nNext steps:");
+        println!(
+            "  Inference:  pmetal run {} --lora {}",
+            student_id,
+            lora_output.display()
+        );
+    }
     Ok(())
 }
 
@@ -2378,26 +2397,34 @@ async fn run_grpo_cli(
     num_generations: usize,
     beta: f64,
     learning_rate: f64,
+    epochs: usize,
+    lora_r: usize,
+    lora_alpha: usize,
     max_seq_len: usize,
+    max_completion_length: usize,
     dapo: bool,
     reasoning_rewards: bool,
     use_metal_flash_attention: bool,
     _log_metrics: Option<String>,
+    emit_console_output: bool,
+    extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
 ) -> anyhow::Result<()> {
     use std::path::{Path, PathBuf};
 
-    println!("========================================");
-    println!("  PMetal GRPO Reasoning Training");
-    println!("========================================");
-    println!("Model:         {}", model_id);
-    println!("Dataset:       {}", dataset_path);
-    println!("Output:        {}", output_dir);
-    println!("Generations:   {}", num_generations);
-    println!("Beta:          {}", beta);
-    println!("LR:            {:.2e}", learning_rate);
-    println!("DAPO:          {}", dapo);
-    println!("Reasoning Rew: {}", reasoning_rewards);
-    println!("========================================\n");
+    if emit_console_output {
+        println!("========================================");
+        println!("  PMetal GRPO Reasoning Training");
+        println!("========================================");
+        println!("Model:         {}", model_id);
+        println!("Dataset:       {}", dataset_path);
+        println!("Output:        {}", output_dir);
+        println!("Generations:   {}", num_generations);
+        println!("Beta:          {}", beta);
+        println!("LR:            {:.2e}", learning_rate);
+        println!("DAPO:          {}", dapo);
+        println!("Reasoning Rew: {}", reasoning_rewards);
+        println!("========================================\n");
+    }
 
     // 1. Resolve and Download Model
     tracing::info!("Resolving model: {}", model_id);
@@ -2451,14 +2478,16 @@ async fn run_grpo_cli(
     // 4. Load Model (Trainable LoRA)
     tracing::info!("Loading model with LoRA...");
     let lora_config = LoraConfig {
-        r: 16,
-        alpha: 32.0,
+        r: lora_r,
+        alpha: lora_alpha as f32,
         ..Default::default()
     };
-    let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config)?;
+    let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())?;
 
     // 5. Setup GRPO Config
     let mut grpo_config = GrpoConfig::new(num_generations).with_beta(beta);
+    grpo_config.max_completion_length = max_completion_length;
+    grpo_config.max_prompt_length = max_seq_len;
 
     if dapo {
         grpo_config = grpo_config.for_dapo();
@@ -2549,7 +2578,7 @@ async fn run_grpo_cli(
     let training_config = TrainingConfig {
         learning_rate,
         batch_size: 1, // GRPO generates num_generations per prompt, so batch_size 1 is typical
-        num_epochs: 1,
+        num_epochs: epochs,
         max_seq_len,
         output_dir: output_dir.to_string(),
         ..Default::default()
@@ -2590,6 +2619,9 @@ async fn run_grpo_cli(
         ));
         trainer.add_callback(Box::new(callback));
     }
+    for callback in extra_callbacks {
+        trainer.add_callback(callback);
+    }
 
     // Enable adaptive LR with control file for TUI communication
     {
@@ -2604,10 +2636,14 @@ async fn run_grpo_cli(
         .map_err(|e| anyhow::anyhow!("Failed to build optimizer: {}", e))?;
 
     // 8. Run Training
-    println!("Starting GRPO training loop...");
+    if emit_console_output {
+        println!("Starting GRPO training loop...");
+    }
 
     // Load reference model (frozen)
-    println!("Loading reference model...");
+    if emit_console_output {
+        println!("Loading reference model...");
+    }
     let mut ref_model = DynamicModel::load(&model_path)
         .map_err(|e| anyhow::anyhow!("Failed to load reference model: {}", e))?;
 
@@ -2625,10 +2661,27 @@ async fn run_grpo_cli(
         )
         .map_err(|e| anyhow::anyhow!("GRPO training error: {}", e))?;
 
-    println!(
-        "\nGRPO training complete! Model weights saved to: {}",
-        output_dir
-    );
+    let output_dir_path = PathBuf::from(output_dir);
+    std::fs::create_dir_all(&output_dir_path)?;
+    let final_path = output_dir_path.join("lora_weights.safetensors");
+    model.save_lora_weights(&final_path)?;
+    let adapter_config = serde_json::json!({
+        "r": lora_config.r,
+        "alpha": lora_config.alpha,
+        "target_modules": lora_config.target_modules,
+        "use_rslora": lora_config.use_rslora,
+    });
+    std::fs::write(
+        output_dir_path.join("adapter_config.json"),
+        serde_json::to_string_pretty(&adapter_config)?,
+    )?;
+
+    if emit_console_output {
+        println!(
+            "\nGRPO training complete! Model weights saved to: {}",
+            output_dir
+        );
+    }
     Ok(())
 }
 
@@ -2660,6 +2713,8 @@ async fn run_training(
     gradient_checkpointing: bool,
     gradient_checkpointing_layers: usize,
     log_metrics: Option<String>,
+    emit_console_output: bool,
+    extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
     embedding_lr: Option<f32>,
     ane: bool,
 ) -> anyhow::Result<()> {
@@ -3131,13 +3186,19 @@ async fn run_training(
     };
 
     // Set up progress bar
-    let progress = ProgressBar::new(total_steps as u64);
+    let progress = if emit_console_output {
+        ProgressBar::new(total_steps as u64)
+    } else {
+        ProgressBar::hidden()
+    };
     progress.set_style(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {pos}/{len} ({eta}) | Loss: {msg}")
             .expect("Stop tokens should format correctly")
             .progress_chars("#>-"),
     );
+
+    let mut extra_callbacks = Some(extra_callbacks);
 
     // Run training with either LoRA or QLoRA model
     let (final_loss, final_step, total_tokens) = if use_qlora {
@@ -3215,6 +3276,11 @@ async fn run_training(
         // Wire metrics callback into training loop for step-level dispatch
         if let Some(cb) = metrics_callback.take() {
             training_loop.add_callback(cb);
+        }
+        if let Some(callbacks) = extra_callbacks.take() {
+            for callback in callbacks {
+                training_loop.add_callback(callback);
+            }
         }
 
         // Enable adaptive LR with control file for TUI communication
@@ -3346,6 +3412,11 @@ async fn run_training(
         // Wire metrics callback into training loop for step-level dispatch
         if let Some(cb) = metrics_callback.take() {
             training_loop.add_callback(cb);
+        }
+        if let Some(callbacks) = extra_callbacks.take() {
+            for callback in callbacks {
+                training_loop.add_callback(callback);
+            }
         }
 
         // Enable adaptive LR with control file for TUI communication
@@ -3534,24 +3605,26 @@ async fn run_training(
         }
     }
 
-    println!("\n========================================");
-    println!("  Training Complete!");
-    println!("========================================");
-    println!("Final Loss:   {:.4}", final_loss);
-    println!("Total Steps:  {}", final_step);
-    println!("Total Tokens: {}", total_tokens);
-    println!("Output:       {}", output_dir);
-    println!("========================================");
+    if emit_console_output {
+        println!("\n========================================");
+        println!("  Training Complete!");
+        println!("========================================");
+        println!("Final Loss:   {:.4}", final_loss);
+        println!("Total Steps:  {}", final_step);
+        println!("Total Tokens: {}", total_tokens);
+        println!("Output:       {}", output_dir);
+        println!("========================================");
 
-    println!("\nNext steps:");
-    println!(
-        "  Inference:  pmetal infer -m {} --lora {}/lora_weights.safetensors -p \"Your prompt\"",
-        config.model.model_id, output_dir
-    );
-    println!(
-        "  Quantize:   pmetal quantize -m {} --lora {}/lora_weights.safetensors -o model.gguf",
-        config.model.model_id, output_dir
-    );
+        println!("\nNext steps:");
+        println!(
+            "  Inference:  pmetal infer -m {} --lora {}/lora_weights.safetensors -p \"Your prompt\"",
+            config.model.model_id, output_dir
+        );
+        println!(
+            "  Quantize:   pmetal quantize -m {} --lora {}/lora_weights.safetensors -o model.gguf",
+            config.model.model_id, output_dir
+        );
+    }
 
     Ok(())
 }

@@ -1,9 +1,13 @@
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
 use std::sync::Arc;
 
 use chrono::Utc;
+use futures_util::FutureExt;
+use mlx_rs::builder::Builder as _;
+use mlx_rs::ops;
+use pmetal::easy;
+use pmetal::prelude::TrainingCallback;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -45,6 +49,27 @@ impl From<serde_json::Error> for AppError {
 }
 
 type Result<T> = std::result::Result<T, AppError>;
+
+#[derive(Debug)]
+struct CancelledRun;
+
+struct CancelOnFlag {
+    cancelled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl TrainingCallback for CancelOnFlag {
+    fn on_step_start(&mut self, _step: usize) {
+        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            std::panic::panic_any(CancelledRun);
+        }
+    }
+
+    fn on_step_end(&mut self, _step: usize, _loss: f64) {
+        if self.cancelled.load(std::sync::atomic::Ordering::SeqCst) {
+            std::panic::panic_any(CancelledRun);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Response DTOs — names match api.ts interfaces exactly
@@ -279,18 +304,16 @@ pub struct MergeModelEntry {
 // System commands
 // ---------------------------------------------------------------------------
 
-/// Returns combined `SystemInfo` / `DeviceInfo` by parsing `pmetal memory` stdout.
-/// Falls back gracefully if the binary is not found.
+/// Returns combined `SystemInfo` / `DeviceInfo` from the library runtime.
 async fn get_system_info_inner() -> SystemInfo {
-    let version = get_pmetal_version().await;
+    let version = pmetal::version::VERSION.to_string();
     let platform = std::env::consts::OS.to_string();
     let arch = std::env::consts::ARCH.to_string();
     let is_apple_silicon = arch == "aarch64" && platform == "macos";
 
-    // Try to get memory via sysctl for a baseline
-    let total_memory = get_total_memory_bytes().await;
-    // available memory: use vm_stat parsing on macOS
-    let available_memory = get_available_memory_bytes().await.unwrap_or(total_memory / 4);
+    let device_info = pmetal::version::device_info();
+    let total_memory = (device_info.memory_total_gb * 1024.0_f64.powi(3)) as u64;
+    let available_memory = (device_info.memory_available_gb * 1024.0_f64.powi(3)) as u64;
 
     let mut gpu_name = "Apple GPU".to_string();
     let mut chip_tier: Option<String> = None;
@@ -300,27 +323,15 @@ async fn get_system_info_inner() -> SystemInfo {
     let mut has_ane = is_apple_silicon;
     let mut has_nax = false;
 
-    // Parse `pmetal memory` text output
-    if let Ok(pmetal_bin) = which::which("pmetal") {
-        if let Ok(out) = tokio::process::Command::new(&pmetal_bin)
-            .arg("memory")
-            .output()
-            .await
-        {
-            if out.status.success() {
-                let text = String::from_utf8_lossy(&out.stdout);
-                parse_pmetal_memory_output(
-                    &text,
-                    &mut gpu_name,
-                    &mut chip_tier,
-                    &mut gpu_cores,
-                    &mut ane_cores,
-                    &mut memory_bandwidth_gbps,
-                    &mut has_ane,
-                    &mut has_nax,
-                );
-            }
-        }
+    if let Ok(ctx) = pmetal::metal::MetalContext::global() {
+        let props = ctx.properties();
+        gpu_name = props.name.clone();
+        gpu_cores = Some(props.gpu_core_count);
+        ane_cores = Some(props.ane_core_count);
+        memory_bandwidth_gbps = Some(props.memory_bandwidth_gbps);
+        has_ane = props.ane_core_count > 0;
+        has_nax = props.has_nax;
+        chip_tier = Some(format!("{:?}", props.device_tier).to_lowercase());
     }
 
     SystemInfo {
@@ -339,67 +350,6 @@ async fn get_system_info_inner() -> SystemInfo {
         memory_bandwidth_gbps,
         has_ane,
         has_nax,
-    }
-}
-
-/// Parse lines such as:
-///   Device: Apple M4 Max
-///   GPU Cores: 40
-///   Memory: 128.00 GB (125.47 GB available)
-///   Bandwidth: 546 GB/s
-///   ANE: 16 cores
-///   NAX: true
-fn parse_pmetal_memory_output(
-    text: &str,
-    gpu_name: &mut String,
-    chip_tier: &mut Option<String>,
-    gpu_cores: &mut Option<u32>,
-    ane_cores: &mut Option<u32>,
-    memory_bandwidth_gbps: &mut Option<f64>,
-    has_ane: &mut bool,
-    has_nax: &mut bool,
-) {
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("Device:") {
-            let name = rest.trim().to_string();
-            // Infer chip tier from device name
-            let lower = name.to_lowercase();
-            *chip_tier = if lower.contains("ultra") {
-                Some("ultra".to_string())
-            } else if lower.contains("max") {
-                Some("max".to_string())
-            } else if lower.contains("pro") {
-                Some("pro".to_string())
-            } else {
-                None
-            };
-            *gpu_name = name;
-        } else if let Some(rest) = line.strip_prefix("GPU Cores:") {
-            if let Ok(n) = rest.trim().parse::<u32>() {
-                *gpu_cores = Some(n);
-            }
-        } else if let Some(rest) = line.strip_prefix("Bandwidth:") {
-            // e.g. "546 GB/s"
-            let val = rest.trim().split_whitespace().next().unwrap_or("0");
-            if let Ok(v) = val.parse::<f64>() {
-                *memory_bandwidth_gbps = Some(v);
-            }
-        } else if let Some(rest) = line.strip_prefix("ANE:") {
-            // e.g. "16 cores" or "none"
-            let val = rest.trim();
-            if val == "none" || val == "false" {
-                *has_ane = false;
-            } else {
-                *has_ane = true;
-                // parse core count
-                if let Ok(n) = val.split_whitespace().next().unwrap_or("0").parse::<u32>() {
-                    *ane_cores = Some(n);
-                }
-            }
-        } else if let Some(rest) = line.strip_prefix("NAX:") {
-            *has_nax = rest.trim().eq_ignore_ascii_case("true");
-        }
     }
 }
 
@@ -550,9 +500,6 @@ pub async fn download_model(
     model_id: String,
     revision: Option<String>,
 ) -> Result<String> {
-    let pmetal_bin = which::which("pmetal")
-        .map_err(|_| AppError("pmetal binary not found in PATH".to_string()))?;
-
     let run_id = uuid::Uuid::new_v4().to_string();
     let run_id_task = run_id.clone();
     let model_id_task = model_id.clone();
@@ -562,44 +509,33 @@ pub async fn download_model(
     let cache_dir = state.config.read().await.cache_dir.clone();
 
     tokio::spawn(async move {
-        let mut cmd = tokio::process::Command::new(&pmetal_bin);
-        cmd.arg("download").arg(&model_id_task);
-        if let Some(rev) = revision {
-            cmd.args(["--revision", &rev]);
-        }
-        if let Some(token) = hf_token {
-            cmd.args(["--hf-token", &token]);
-        }
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
-
         let _ = app_handle.emit("download-started", &run_id_task);
 
-        match cmd.spawn() {
-            Ok(mut child) => {
-                let stdout = child.stdout.take().unwrap();
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = app_handle.emit(
-                        "download-progress",
-                        serde_json::json!({ "run_id": run_id_task, "line": line }),
-                    );
-                }
-                let status = child.wait().await.ok();
-                let success = status.map(|s| s.success()).unwrap_or(false);
+        let _ = app_handle.emit(
+            "download-progress",
+            serde_json::json!({
+                "run_id": run_id_task,
+                "line": format!("Resolving {model_id_task}"),
+            }),
+        );
 
-                if success {
-                    // Refresh the model cache so the new model appears immediately
-                    let hub_dir = PathBuf::from(&cache_dir).join("hub");
-                    let models = crate::state::scan_hub_cache_pub(&hub_dir).await;
-                    *cached_models.write().await = models;
+        let token = hf_token.as_ref().map(|s| pmetal::core::SecretString::from(s.clone()));
+        match pmetal::hub::download_model(&model_id_task, revision.as_deref(), token.as_ref()).await
+        {
+            Ok(path) => {
+                let _ = app_handle.emit(
+                    "download-progress",
+                    serde_json::json!({
+                        "run_id": run_id_task,
+                        "line": format!("Downloaded to {}", path.display()),
+                    }),
+                );
 
-                    let _ = app_handle.emit("download-completed", &run_id_task);
-                } else {
-                    let _ = app_handle.emit(
-                        "download-error",
-                        serde_json::json!({ "run_id": run_id_task, "error": "Download failed" }),
-                    );
-                }
+                let hub_dir = PathBuf::from(&cache_dir).join("hub");
+                let models = crate::state::scan_hub_cache_pub(&hub_dir).await;
+                *cached_models.write().await = models;
+
+                let _ = app_handle.emit("download-completed", &run_id_task);
             }
             Err(e) => {
                 let _ = app_handle.emit(
@@ -767,16 +703,22 @@ pub async fn list_cached_datasets(
 #[tauri::command]
 pub async fn start_training(
     state: State<'_, AppState>,
-    app_handle: AppHandle,
+    _app_handle: AppHandle,
     config: TrainingConfig,
 ) -> Result<String> {
-    let pmetal_bin = which::which("pmetal")
-        .map_err(|_| AppError("pmetal binary not found in PATH".to_string()))?;
+    if !matches!(config.method.as_str(), "sft" | "lora" | "qlora") {
+        return Err(AppError(format!(
+            "GUI training currently supports direct-library SFT/LoRA/QLoRA only. \
+Selected method '{}' is not library-backed here yet.",
+            config.method
+        )));
+    }
 
     let total_epochs = config.epochs.unwrap_or(3);
     let output_dir = config.output_dir.as_deref()
         .unwrap_or("./output")
         .to_string();
+    let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
 
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -798,143 +740,128 @@ pub async fn start_training(
     let run_id_task = run_id.clone();
     let state_arc = state.training_runs.clone();
     let event_tx = state.event_tx.clone();
-    let procs_arc = state.active_processes.clone();
     let cancel_flags = state.cancel_flags.clone();
 
     tokio::spawn(async move {
-        let mut cmd = tokio::process::Command::new(&pmetal_bin);
-        cmd.arg("train");
-        cmd.args(["--model", &config.model]);
-        cmd.args(["--method", &config.method]);
-        cmd.args(["--output", &output_dir]);
+        let _ = tokio::fs::create_dir_all(&output_dir).await;
+        let _ = tokio::fs::write(&metrics_path, "").await;
 
-        if let Some(ref ds) = config.dataset {
-            cmd.args(["--dataset", ds]);
-        }
-        if let Some(v) = config.epochs {
-            cmd.args(["--epochs", &v.to_string()]);
-        }
-        if let Some(v) = config.learning_rate {
-            cmd.args(["--learning-rate", &v.to_string()]);
-        }
-        if let Some(v) = config.batch_size {
-            cmd.args(["--batch-size", &v.to_string()]);
-        }
-        if let Some(v) = config.max_seq_len {
-            cmd.args(["--max-seq-len", &v.to_string()]);
-        }
-        if let Some(v) = config.lora_rank {
-            cmd.args(["--lora-r", &v.to_string()]);
-        }
-        if let Some(v) = config.lora_alpha {
-            cmd.args(["--lora-alpha", &v.to_string()]);
-        }
-        if let Some(v) = config.lora_dropout {
-            cmd.args(["--lora-dropout", &v.to_string()]);
-        }
-        if config.use_rslora == Some(true) {
-            cmd.arg("--rslora");
-        }
-        if config.use_dora == Some(true) {
-            cmd.arg("--dora");
-        }
-        if let Some(v) = config.gradient_accumulation_steps {
-            cmd.args(["--gradient-accumulation-steps", &v.to_string()]);
-        }
-        if let Some(v) = config.gradient_checkpointing_layers {
-            cmd.args(["--gradient-checkpointing-layers", &v.to_string()]);
-        }
-        if let Some(v) = config.weight_decay {
-            cmd.args(["--weight-decay", &v.to_string()]);
-        }
-        if let Some(v) = config.max_grad_norm {
-            cmd.args(["--max-grad-norm", &v.to_string()]);
-        }
-        if let Some(ref s) = config.lr_scheduler {
-            cmd.args(["--lr-scheduler", s]);
-        }
-        if let Some(ref s) = config.text_column {
-            cmd.args(["--text-column", s]);
-        }
-        if let Some(ref s) = config.dataset_format {
-            cmd.args(["--dataset-format", s]);
-        }
-        if let Some(v) = config.embedding_lr {
-            cmd.args(["--embedding-lr", &v.to_string()]);
-        }
-        if let Some(ref s) = config.resume_from {
-            cmd.args(["--resume-from", s]);
-        }
-        // load_in_4bit → qlora style quantization
-        if config.load_in_4bit == Some(true) {
-            cmd.args(["--quantization", "nf4"]);
-        }
-        // Boolean negation flags
-        if config.sequence_packing == Some(false) {
-            cmd.arg("--no-sequence-packing");
-        }
-        if config.jit_compilation == Some(false) {
-            cmd.arg("--no-jit-compilation");
-        }
-        if config.gradient_checkpointing == Some(false) {
-            cmd.arg("--no-gradient-checkpointing");
-        }
-        if config.flash_attention == Some(false) {
-            cmd.arg("--no-flash-attention");
-        }
-        if config.fused_optimizer == Some(false) {
-            cmd.arg("--no-metal-fused-optimizer");
-        }
-        // Method-specific flags
-        if let Some(v) = config.dpo_beta {
-            cmd.args(["--beta", &v.to_string()]);
-        }
-        if let Some(ref s) = config.dpo_loss_type {
-            cmd.args(["--dpo-loss-type", s]);
-        }
-        if let Some(ref s) = config.ref_model {
-            cmd.args(["--ref-model", s]);
-        }
-        if let Some(v) = config.simpo_beta {
-            cmd.args(["--beta", &v.to_string()]);
-        }
-        if let Some(v) = config.simpo_gamma {
-            cmd.args(["--gamma", &v.to_string()]);
-        }
-        if let Some(v) = config.orpo_lambda {
-            cmd.args(["--lambda", &v.to_string()]);
-        }
-        if let Some(v) = config.kto_desirable_weight {
-            cmd.args(["--desirable-weight", &v.to_string()]);
-        }
-        if let Some(v) = config.kto_undesirable_weight {
-            cmd.args(["--undesirable-weight", &v.to_string()]);
-        }
+        let watcher_state = state_arc.clone();
+        let watcher_event_tx = event_tx.clone();
+        let watcher_run_id = run_id_task.clone();
+        let watcher_metrics = metrics_path.clone();
+        let watcher_cancel = cancel_flag.clone();
+        tokio::spawn(async move {
+            watch_training_metrics_file(
+                watcher_metrics,
+                watcher_run_id,
+                watcher_state,
+                watcher_event_tx,
+                watcher_cancel,
+            )
+            .await;
+        });
 
-        // Use a temp file for metrics instead of --metrics-format jsonl
-        let metrics_path = std::env::temp_dir().join(format!("pmetal_train_{}.jsonl", run_id_task));
-        cmd.args(["--log-metrics", &metrics_path.to_string_lossy()]);
+        let result = if config.method == "qlora" || config.load_in_4bit == Some(true) {
+            std::panic::AssertUnwindSafe(run_qlora_training_in_process(
+                &config,
+                &metrics_path,
+                cancel_flag.clone(),
+            ))
+            .catch_unwind()
+            .await
+        } else {
+            let mut builder = easy::finetune(
+                config.model.clone(),
+                config.dataset.clone().unwrap_or_default(),
+            )
+            .epochs(config.epochs.unwrap_or(3) as usize)
+            .learning_rate(config.learning_rate.unwrap_or(2e-4))
+            .batch_size(config.batch_size.unwrap_or(4) as usize)
+            .max_seq_len(config.max_seq_len.unwrap_or(2048) as usize)
+            .output(output_dir.clone())
+            .lora_dropout(config.lora_dropout.unwrap_or(0.0) as f32)
+            .use_rslora(config.use_rslora.unwrap_or(false))
+            .use_dora(config.use_dora.unwrap_or(false))
+            .flash_attention(config.flash_attention.unwrap_or(true))
+            .sequence_packing(config.sequence_packing.unwrap_or(true))
+            .gradient_checkpointing(config.gradient_checkpointing.unwrap_or(false))
+            .gradient_checkpointing_layers(config.gradient_checkpointing_layers.unwrap_or(4) as usize)
+            .metal_fused_optimizer(config.fused_optimizer.unwrap_or(false))
+            .metrics_path(metrics_path.clone())
+            .callback(Box::new(CancelOnFlag {
+                cancelled: cancel_flag.clone(),
+            }));
 
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+            if let Some(rank) = config.lora_rank {
+                builder = builder.lora(rank as usize, config.lora_alpha.unwrap_or(32) as f32);
+            }
+            if let Some(eval) = config.resume_from.as_ref() {
+                let _ = eval;
+            }
+            if let Some(eval) = config.embedding_lr {
+                builder = builder.embedding_lr(eval as f32);
+            }
 
-        match cmd.spawn() {
-            Ok(child) => {
-                spawn_and_monitor_training(
-                    child,
-                    run_id_task,
-                    state_arc,
-                    event_tx,
-                    procs_arc,
-                    cancel_flags,
-                    cancel_flag,
-                    app_handle,
+            std::panic::AssertUnwindSafe(async move {
+                builder
+                    .run()
+                    .await
+                    .map(|_| ())
+                    .map_err(|e| AppError(e.to_string()))
+            })
+            .catch_unwind()
+            .await
+        };
+
+        match result {
+            Ok(Ok(_summary)) => {
+                finalize_training_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    true,
+                    None,
                 )
                 .await;
             }
-            Err(e) => {
-                mark_training_failed(&state_arc, &event_tx, &run_id_task, &e.to_string()).await;
+            Ok(Err(e)) => {
+                finalize_training_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    false,
+                    Some(e.to_string()),
+                )
+                .await;
+            }
+            Err(payload) if payload.is::<CancelledRun>() => {
+                finalize_training_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    false,
+                    None,
+                )
+                .await;
+            }
+            Err(_) => {
+                finalize_training_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    false,
+                    Some("Training panicked".to_string()),
+                )
+                .await;
             }
         }
+
+        cancel_flags.write().await.remove(&run_id_task);
     });
 
     Ok(run_id)
@@ -966,16 +893,14 @@ pub async fn stop_training(state: State<'_, AppState>, run_id: String) -> Result
 #[tauri::command]
 pub async fn start_distillation(
     state: State<'_, AppState>,
-    app_handle: AppHandle,
+    _app_handle: AppHandle,
     config: DistillationConfig,
 ) -> Result<String> {
-    let pmetal_bin = which::which("pmetal")
-        .map_err(|_| AppError("pmetal binary not found in PATH".to_string()))?;
-
     let temperature = config.temperature.unwrap_or(2.0) as f64;
     let loss_type = config.loss_type.clone().unwrap_or_else(|| "kl".to_string());
     let total_epochs = config.epochs.unwrap_or(3) as u64;
     let output_dir = config.output_dir.as_deref().unwrap_or("./output").to_string();
+    let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
 
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -997,67 +922,84 @@ pub async fn start_distillation(
     let run_id_task = run_id.clone();
     let state_arc = state.distillation_runs.clone();
     let event_tx = state.event_tx.clone();
-    let procs_arc = state.active_processes.clone();
     let cancel_flags = state.cancel_flags.clone();
 
     tokio::spawn(async move {
-        let mut cmd = tokio::process::Command::new(&pmetal_bin);
-        cmd.arg("distill");
-        cmd.args(["--student", &config.student_model]);
-        cmd.args(["--teacher", &config.teacher_model]);
-        cmd.args(["--output", &output_dir]);
-        cmd.args(["--temperature", &temperature.to_string()]);
-        cmd.args(["--loss-type", &loss_type]);
+        let _ = tokio::fs::create_dir_all(&output_dir).await;
+        let _ = tokio::fs::write(&metrics_path, "").await;
 
-        if let Some(ref ds) = config.dataset {
-            cmd.args(["--dataset", ds]);
-        }
-        if let Some(v) = config.alpha {
-            cmd.args(["--alpha", &v.to_string()]);
-        }
-        if let Some(v) = config.epochs {
-            cmd.args(["--epochs", &v.to_string()]);
-        }
-        if let Some(v) = config.learning_rate {
-            cmd.args(["--learning-rate", &v.to_string()]);
-        }
-        if let Some(v) = config.batch_size {
-            cmd.args(["--batch-size", &v.to_string()]);
-        }
-        if let Some(v) = config.max_seq_len {
-            cmd.args(["--max-seq-len", &v.to_string()]);
-        }
-        if let Some(v) = config.lora_rank {
-            cmd.args(["--lora-r", &v.to_string()]);
-        }
-        if let Some(v) = config.lora_alpha {
-            cmd.args(["--lora-alpha", &v.to_string()]);
-        }
+        let watcher_state = state_arc.clone();
+        let watcher_event_tx = event_tx.clone();
+        let watcher_run_id = run_id_task.clone();
+        let watcher_metrics = metrics_path.clone();
+        let watcher_cancel = cancel_flag.clone();
+        tokio::spawn(async move {
+            watch_distillation_metrics_file(
+                watcher_metrics,
+                watcher_run_id,
+                watcher_state,
+                watcher_event_tx,
+                watcher_cancel,
+            )
+            .await;
+        });
 
-        let metrics_path = std::env::temp_dir()
-            .join(format!("pmetal_distill_{}.jsonl", run_id_task));
-        cmd.args(["--log-metrics", &metrics_path.to_string_lossy()]);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let result = std::panic::AssertUnwindSafe(run_distillation_in_process(
+            &config,
+            &metrics_path,
+            cancel_flag.clone(),
+        ))
+        .catch_unwind()
+        .await;
 
-        match cmd.spawn() {
-            Ok(child) => {
-                spawn_and_monitor_distillation(
-                    child,
-                    run_id_task,
-                    state_arc,
-                    event_tx,
-                    procs_arc,
-                    cancel_flags,
-                    cancel_flag,
-                    app_handle,
+        match result {
+            Ok(Ok(())) => {
+                finalize_distillation_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    true,
+                    None,
                 )
                 .await;
             }
-            Err(e) => {
-                mark_distillation_failed(&state_arc, &event_tx, &run_id_task, &e.to_string())
-                    .await;
+            Ok(Err(e)) => {
+                finalize_distillation_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    false,
+                    Some(e.to_string()),
+                )
+                .await;
+            }
+            Err(payload) if payload.is::<CancelledRun>() => {
+                finalize_distillation_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    false,
+                    None,
+                )
+                .await;
+            }
+            Err(_) => {
+                finalize_distillation_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    false,
+                    Some("Distillation panicked".to_string()),
+                )
+                .await;
             }
         }
+
+        cancel_flags.write().await.remove(&run_id_task);
     });
 
     Ok(run_id)
@@ -1091,15 +1033,13 @@ pub async fn stop_distillation(state: State<'_, AppState>, run_id: String) -> Re
 #[tauri::command]
 pub async fn start_grpo(
     state: State<'_, AppState>,
-    app_handle: AppHandle,
+    _app_handle: AppHandle,
     config: GrpoConfig,
 ) -> Result<String> {
-    let pmetal_bin = which::which("pmetal")
-        .map_err(|_| AppError("pmetal binary not found in PATH".to_string()))?;
-
     let group_size = config.group_size.unwrap_or(8);
     let beta = config.beta.unwrap_or(0.04);
     let output_dir = config.output_dir.as_deref().unwrap_or("./output").to_string();
+    let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
 
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
@@ -1119,62 +1059,84 @@ pub async fn start_grpo(
     let run_id_task = run_id.clone();
     let state_arc = state.grpo_runs.clone();
     let event_tx = state.event_tx.clone();
-    let procs_arc = state.active_processes.clone();
     let cancel_flags = state.cancel_flags.clone();
 
     tokio::spawn(async move {
-        let mut cmd = tokio::process::Command::new(&pmetal_bin);
-        cmd.arg("grpo");
-        cmd.args(["--model", &config.model]);
-        cmd.args(["--output", &output_dir]);
-        cmd.args(["--num-generations", &group_size.to_string()]);
-        cmd.args(["--beta", &beta.to_string()]);
+        let _ = tokio::fs::create_dir_all(&output_dir).await;
+        let _ = tokio::fs::write(&metrics_path, "").await;
 
-        if let Some(ref ds) = config.dataset {
-            cmd.args(["--dataset", ds]);
-        }
-        if let Some(v) = config.epochs {
-            cmd.args(["--epochs", &v.to_string()]);
-        }
-        if let Some(v) = config.learning_rate {
-            cmd.args(["--learning-rate", &v.to_string()]);
-        }
-        if let Some(v) = config.lora_rank {
-            cmd.args(["--lora-r", &v.to_string()]);
-        }
-        if let Some(v) = config.lora_alpha {
-            cmd.args(["--lora-alpha", &v.to_string()]);
-        }
-        if let Some(v) = config.max_seq_len {
-            cmd.args(["--max-seq-len", &v.to_string()]);
-        }
-        if config.use_reasoning_rewards == Some(true) {
-            cmd.arg("--reasoning-rewards");
-        }
+        let watcher_state = state_arc.clone();
+        let watcher_event_tx = event_tx.clone();
+        let watcher_run_id = run_id_task.clone();
+        let watcher_metrics = metrics_path.clone();
+        let watcher_cancel = cancel_flag.clone();
+        tokio::spawn(async move {
+            watch_grpo_metrics_file(
+                watcher_metrics,
+                watcher_run_id,
+                watcher_state,
+                watcher_event_tx,
+                watcher_cancel,
+            )
+            .await;
+        });
 
-        let metrics_path = std::env::temp_dir()
-            .join(format!("pmetal_grpo_{}.jsonl", run_id_task));
-        cmd.args(["--log-metrics", &metrics_path.to_string_lossy()]);
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let result = std::panic::AssertUnwindSafe(run_grpo_in_process(
+            &config,
+            &metrics_path,
+            cancel_flag.clone(),
+        ))
+        .catch_unwind()
+        .await;
 
-        match cmd.spawn() {
-            Ok(child) => {
-                spawn_and_monitor_grpo(
-                    child,
-                    run_id_task,
-                    state_arc,
-                    event_tx,
-                    procs_arc,
-                    cancel_flags,
-                    cancel_flag,
-                    app_handle,
+        match result {
+            Ok(Ok(())) => {
+                finalize_grpo_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    true,
+                    None,
                 )
                 .await;
             }
-            Err(e) => {
-                mark_grpo_failed(&state_arc, &event_tx, &run_id_task, &e.to_string()).await;
+            Ok(Err(e)) => {
+                finalize_grpo_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    false,
+                    Some(e.to_string()),
+                )
+                .await;
+            }
+            Err(payload) if payload.is::<CancelledRun>() => {
+                finalize_grpo_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    false,
+                    None,
+                )
+                .await;
+            }
+            Err(_) => {
+                finalize_grpo_run(
+                    &state_arc,
+                    &event_tx,
+                    &run_id_task,
+                    &cancel_flag,
+                    false,
+                    Some("GRPO panicked".to_string()),
+                )
+                .await;
             }
         }
+
+        cancel_flags.write().await.remove(&run_id_task);
     });
 
     Ok(run_id)
@@ -1209,81 +1171,44 @@ pub async fn start_inference(
     app_handle: AppHandle,
     config: InferenceConfig,
 ) -> Result<()> {
-    let pmetal_bin = which::which("pmetal")
-        .map_err(|_| AppError("pmetal binary not found in PATH".to_string()))?;
-
     let session_id = uuid::Uuid::new_v4().to_string();
     let session_id_task = session_id.clone();
-    let procs_arc = state.active_processes.clone();
+    let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let inference_flags = state.inference_cancel_flags.clone();
+    state
+        .inference_cancel_flags
+        .write()
+        .await
+        .insert(session_id.clone(), cancel_flag.clone());
 
     tokio::spawn(async move {
-        let mut cmd = tokio::process::Command::new(&pmetal_bin);
-        cmd.arg("infer");
-        cmd.args(["--model", &config.model]);
-        cmd.args(["--prompt", &config.prompt]);
-        cmd.arg("--chat");
-        cmd.arg("--stream");
+        let mut builder = easy::infer(config.model.clone())
+            .temperature(config.temperature.unwrap_or(0.7))
+            .max_tokens(config.max_tokens.unwrap_or(1024) as usize)
+            .top_k(config.top_k.unwrap_or(50) as usize)
+            .top_p(config.top_p.unwrap_or(0.9))
+            .repetition_penalty(config.repetition_penalty.unwrap_or(1.0));
 
         if let Some(ref lora) = config.lora_path {
-            cmd.args(["--lora", lora]);
-        }
-        if let Some(ref sys) = config.system_message {
-            cmd.args(["--system", sys]);
-        }
-        if let Some(v) = config.temperature {
-            cmd.args(["--temperature", &v.to_string()]);
-        }
-        if let Some(v) = config.top_k {
-            cmd.args(["--top-k", &v.to_string()]);
-        }
-        if let Some(v) = config.top_p {
-            cmd.args(["--top-p", &v.to_string()]);
-        }
-        if let Some(v) = config.max_tokens {
-            cmd.args(["--max-tokens", &v.to_string()]);
-        }
-        if let Some(v) = config.repetition_penalty {
-            cmd.args(["--repetition-penalty", &v.to_string()]);
+            builder = builder.lora(lora.clone());
         }
 
-        cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let prompt = match &config.system_message {
+            Some(system) if !system.is_empty() => format!("{system}\n\n{}", config.prompt),
+            _ => config.prompt.clone(),
+        };
 
-        match cmd.spawn() {
-            Ok(mut child) => {
-                let stdout = child.stdout.take().unwrap();
-                let ah = app_handle.clone();
+        let result = builder.generate_streaming(&prompt, |delta| {
+            if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                return false;
+            }
+            let _ = app_handle.emit("inference-token", delta);
+            true
+        }).await;
 
-                // Forward stderr as logs
-                if let Some(stderr) = child.stderr.take() {
-                    let ah2 = app_handle.clone();
-                    let sid2 = session_id_task.clone();
-                    tokio::spawn(async move {
-                        let mut lines = BufReader::new(stderr).lines();
-                        while let Ok(Some(line)) = lines.next_line().await {
-                            let _ = ah2.emit(
-                                "process-log",
-                                serde_json::json!({ "run_id": sid2, "line": line }),
-                            );
-                        }
-                    });
-                }
-
-                {
-                    let mut procs = procs_arc.write().await;
-                    procs.insert(session_id_task.clone(), child);
-                }
-
-                // Stream stdout tokens
-                let mut lines = BufReader::new(stdout).lines();
-                while let Ok(Some(line)) = lines.next_line().await {
-                    let _ = ah.emit("inference-token", &line);
-                }
-
-                // Signal completion
-                let _ = ah.emit("inference-done", ());
-
-                // Remove from active processes
-                procs_arc.write().await.remove(&session_id_task);
+        match result {
+            Ok(_) => {
+                let _ = app_handle.emit("inference-done", ());
             }
             Err(e) => {
                 let _ = app_handle.emit(
@@ -1292,6 +1217,8 @@ pub async fn start_inference(
                 );
             }
         }
+
+        inference_flags.write().await.remove(&session_id_task);
     });
 
     Ok(())
@@ -1302,15 +1229,15 @@ pub async fn stop_inference(
     state: State<'_, AppState>,
     session_id: Option<String>,
 ) -> Result<()> {
-    let mut procs = state.active_processes.write().await;
     if let Some(id) = session_id {
-        if let Some(mut child) = procs.remove(&id) {
-            let _ = child.kill().await;
+        let flags = state.inference_cancel_flags.read().await;
+        if let Some(flag) = flags.get(&id) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     } else {
-        // Kill all inference sessions (no session_id provided)
-        for (_, mut child) in procs.drain() {
-            let _ = child.kill().await;
+        let flags = state.inference_cancel_flags.read().await;
+        for flag in flags.values() {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
         }
     }
     Ok(())
@@ -1356,120 +1283,1248 @@ pub async fn merge_models(
     _app_handle: AppHandle,
     config: MergeConfig,
 ) -> Result<String> {
-    // pmetal merge CLI is not yet fully implemented.
-    // Log and return the output path so the frontend can track the operation.
-    tracing::warn!(
-        "merge_models called with strategy={} base={} output={} — pmetal merge pipeline not yet implemented",
-        config.strategy,
-        config.base_model,
-        config.output
-    );
-    Ok(config.output)
+    let merge_method = match config.strategy.as_str() {
+        "linear" => pmetal::merge::MergeMethodConfig::Linear,
+        "slerp" => pmetal::merge::MergeMethodConfig::Slerp,
+        "ties" => pmetal::merge::MergeMethodConfig::Ties,
+        "dare" => pmetal::merge::MergeMethodConfig::DareTies,
+        "model_stock" => pmetal::merge::MergeMethodConfig::ModelStock,
+        other => return Err(AppError(format!("Unsupported merge strategy: {other}"))),
+    };
+
+    let merge_config = pmetal::merge::MergeConfig {
+        merge_method,
+        base_model: Some(config.base_model.clone()),
+        models: config
+            .models
+            .into_iter()
+            .map(|model| pmetal::merge::ModelConfig {
+                model: model.model,
+                parameters: pmetal::merge::MergeParameters {
+                    weight: Some(model.weight as f32),
+                    ..Default::default()
+                },
+            })
+            .collect(),
+        output_path: Some(PathBuf::from(&config.output)),
+        parameters: pmetal::merge::MergeParameters {
+            normalize: Some(true),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+
+    let output = tokio::task::spawn_blocking(move || pmetal::merge::run_merge(&merge_config))
+        .await
+        .map_err(|e| AppError(format!("merge task failed: {e}")))?
+        .map_err(|e| AppError(e.to_string()))?;
+
+    Ok(output.display().to_string())
 }
 
 #[tauri::command]
 pub async fn fuse_lora(
-    app_handle: AppHandle,
+    _app_handle: AppHandle,
     base_model: String,
     lora_path: String,
     output_dir: String,
 ) -> Result<FuseResult> {
-    let pmetal_bin = which::which("pmetal")
-        .map_err(|_| AppError("pmetal binary not found in PATH".to_string()))?;
-
-    let op_id = uuid::Uuid::new_v4().to_string();
-    let op_id_task = op_id.clone();
+    let base_model_task = base_model.clone();
+    let lora_path_task = lora_path.clone();
     let output_dir_task = output_dir.clone();
 
-    // Run synchronously so we can return FuseResult
-    let mut cmd = tokio::process::Command::new(&pmetal_bin);
-    cmd.arg("fuse");
-    cmd.args(["--model", &base_model]);
-    cmd.args(["--lora", &lora_path]);
-    cmd.args(["--output", &output_dir]);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    tokio::task::spawn_blocking(move || {
+        run_fuse_in_process(&base_model_task, &lora_path_task, &output_dir_task)
+    })
+    .await
+    .map_err(|e| AppError(format!("fuse task failed: {e}")))?
+    .map_err(|e| AppError(e.to_string()))?;
 
-    let mut child = cmd.spawn()?;
-
-    // Stream progress events
-    if let Some(stdout) = child.stdout.take() {
-        let ah = app_handle.clone();
-        let oid = op_id_task.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = ah.emit(
-                    "fuse-progress",
-                    serde_json::json!({ "op_id": oid, "line": line }),
-                );
-            }
-        });
-    }
-
-    let status = child.wait().await?;
-    if !status.success() {
-        return Err(AppError(format!(
-            "fuse exited with status {}",
-            status
-        )));
-    }
-
-    // Compute output model size
-    let output_path = PathBuf::from(&output_dir_task);
+    let output_path = PathBuf::from(&output_dir);
     let model_size_bytes = dir_size_simple(&output_path).await;
 
     Ok(FuseResult {
-        output_dir: output_dir_task,
+        output_dir,
         model_size_bytes,
     })
 }
 
 #[tauri::command]
 pub async fn quantize_model(
-    app_handle: AppHandle,
+    _app_handle: AppHandle,
     model_id: String,
     quant_type: String,
     output_dir: String,
 ) -> Result<String> {
-    let pmetal_bin = which::which("pmetal")
-        .map_err(|_| AppError("pmetal binary not found in PATH".to_string()))?;
-
-    let op_id = uuid::Uuid::new_v4().to_string();
-    let op_id_task = op_id.clone();
+    let model_id_task = model_id.clone();
+    let quant_type_task = quant_type.clone();
     let output_dir_task = output_dir.clone();
 
-    let mut cmd = tokio::process::Command::new(&pmetal_bin);
-    cmd.arg("quantize");
-    cmd.args(["--model", &model_id]);
-    cmd.args(["--method", &quant_type]);
-    cmd.args(["--output", &output_dir]);
-    cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
+    tokio::task::spawn_blocking(move || {
+        run_quantize_in_process(&model_id_task, &quant_type_task, &output_dir_task)
+    })
+    .await
+    .map_err(|e| AppError(format!("quantize task failed: {e}")))?
+    .map_err(|e| AppError(e.to_string()))?;
 
-    let mut child = cmd.spawn()?;
+    Ok(output_dir)
+}
 
-    if let Some(stdout) = child.stdout.take() {
-        let ah = app_handle.clone();
-        let oid = op_id_task.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = ah.emit(
-                    "quantize-progress",
-                    serde_json::json!({ "op_id": oid, "line": line }),
-                );
+async fn watch_training_metrics_file(
+    metrics_path: PathBuf,
+    run_id: String,
+    state_arc: Arc<tokio::sync::RwLock<Vec<TrainingRun>>>,
+    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut last_pos: u64 = 0;
+    let started_at = Utc::now();
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+
+    loop {
+        interval.tick().await;
+
+        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+
+        let Ok(file) = tokio::fs::File::open(&metrics_path).await else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata().await else {
+            continue;
+        };
+        let file_len = metadata.len();
+        if file_len <= last_pos {
+            continue;
+        }
+
+        let path = metrics_path.clone();
+        let run_id_inner = run_id.clone();
+        let read_result = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Seek};
+
+            let Ok(file) = std::fs::File::open(&path) else {
+                return (last_pos, Vec::<serde_json::Value>::new());
+            };
+            let mut reader = std::io::BufReader::new(file);
+            if reader.seek(std::io::SeekFrom::Start(last_pos)).is_err() {
+                return (last_pos, Vec::new());
             }
+
+            let mut line = String::new();
+            let mut rows = Vec::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                    rows.push(json);
+                }
+                line.clear();
+            }
+
+            let pos = reader.stream_position().unwrap_or(last_pos);
+            (pos, rows)
+        })
+        .await;
+
+        let Ok((new_pos, rows)) = read_result else {
+            continue;
+        };
+        last_pos = new_pos;
+
+        if rows.is_empty() {
+            continue;
+        }
+
+        let mut runs = state_arc.write().await;
+        if let Some(run) = runs.iter_mut().find(|r| r.id == run_id_inner) {
+            for row in rows {
+                apply_metrics_to_training(run, &row, started_at);
+            }
+            let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
+        }
+    }
+}
+
+async fn finalize_training_run(
+    state_arc: &Arc<tokio::sync::RwLock<Vec<TrainingRun>>>,
+    event_tx: &tokio::sync::broadcast::Sender<AppEvent>,
+    run_id: &str,
+    cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
+    success: bool,
+    error: Option<String>,
+) {
+    let mut runs = state_arc.write().await;
+    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+        run.status = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            TrainingStatus::Cancelled
+        } else if success {
+            TrainingStatus::Completed
+        } else {
+            TrainingStatus::Failed
+        };
+        run.ended_at = Some(Utc::now());
+        run.error_message = error;
+        let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
+        let _ = event_tx.send(AppEvent::TrainingStopped {
+            run_id: run_id.to_string(),
         });
     }
+}
 
-    let status = child.wait().await?;
-    if !status.success() {
-        return Err(AppError(format!(
-            "quantize exited with status {}",
-            status
-        )));
+async fn watch_distillation_metrics_file(
+    metrics_path: PathBuf,
+    run_id: String,
+    state_arc: Arc<tokio::sync::RwLock<Vec<DistillationRun>>>,
+    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut last_pos: u64 = 0;
+    let started_at = Utc::now();
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+
+    loop {
+        interval.tick().await;
+
+        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+
+        let Ok(file) = tokio::fs::File::open(&metrics_path).await else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata().await else {
+            continue;
+        };
+        let file_len = metadata.len();
+        if file_len <= last_pos {
+            continue;
+        }
+
+        let path = metrics_path.clone();
+        let read_result = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Seek};
+
+            let Ok(file) = std::fs::File::open(&path) else {
+                return (last_pos, Vec::<serde_json::Value>::new());
+            };
+            let mut reader = std::io::BufReader::new(file);
+            if reader.seek(std::io::SeekFrom::Start(last_pos)).is_err() {
+                return (last_pos, Vec::new());
+            }
+
+            let mut line = String::new();
+            let mut rows = Vec::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                    rows.push(json);
+                }
+                line.clear();
+            }
+
+            let pos = reader.stream_position().unwrap_or(last_pos);
+            (pos, rows)
+        })
+        .await;
+
+        let Ok((new_pos, rows)) = read_result else {
+            continue;
+        };
+        last_pos = new_pos;
+
+        if rows.is_empty() {
+            continue;
+        }
+
+        let mut runs = state_arc.write().await;
+        if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+            for row in rows {
+                apply_metrics_to_distillation(run, &row, started_at);
+            }
+            let _ = event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
+        }
+    }
+}
+
+fn apply_metrics_to_distillation(
+    run: &mut DistillationRun,
+    metrics: &serde_json::Value,
+    started_at: chrono::DateTime<Utc>,
+) {
+    if let Some(v) = metrics["step"].as_u64() {
+        run.step = v;
+    }
+    if let Some(v) = metrics["total_steps"].as_u64() {
+        run.total_steps = Some(v);
+    }
+    if let Some(v) = metrics["epoch"].as_u64() {
+        run.epoch = v;
+    }
+    if let Some(v) = metrics["loss"].as_f64() {
+        run.loss = Some(v);
+        if run.best_loss.map_or(true, |best| v < best) {
+            run.best_loss = Some(v);
+        }
+    }
+    if let Some(v) = metrics["lr"].as_f64().or_else(|| metrics["learning_rate"].as_f64()) {
+        run.learning_rate = Some(v);
+    }
+    if let Some(v) = metrics["tok_sec"]
+        .as_f64()
+        .or_else(|| metrics["tokens_per_second"].as_f64())
+    {
+        run.tokens_per_second = Some(v);
+    }
+    if let (Some(total_steps), step) = (run.total_steps, run.step) {
+        if step > 0 {
+            let elapsed = (Utc::now() - started_at).num_seconds().max(1) as f64;
+            let remaining = total_steps.saturating_sub(step) as f64;
+            run.eta_seconds = Some(((elapsed / step as f64) * remaining) as u64);
+        }
+    }
+}
+
+async fn finalize_distillation_run(
+    state_arc: &Arc<tokio::sync::RwLock<Vec<DistillationRun>>>,
+    event_tx: &tokio::sync::broadcast::Sender<AppEvent>,
+    run_id: &str,
+    cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
+    success: bool,
+    error: Option<String>,
+) {
+    let mut runs = state_arc.write().await;
+    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+        run.status = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            DistillationStatus::Cancelled
+        } else if success {
+            DistillationStatus::Completed
+        } else {
+            DistillationStatus::Failed
+        };
+        run.ended_at = Some(Utc::now());
+        run.error_message = error;
+        let _ = event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
+        let _ = event_tx.send(AppEvent::DistillationStopped {
+            run_id: run_id.to_string(),
+        });
+    }
+}
+
+async fn watch_grpo_metrics_file(
+    metrics_path: PathBuf,
+    run_id: String,
+    state_arc: Arc<tokio::sync::RwLock<Vec<GrpoRun>>>,
+    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+) {
+    let mut last_pos: u64 = 0;
+    let started_at = Utc::now();
+    let mut interval = tokio::time::interval(std::time::Duration::from_millis(500));
+
+    loop {
+        interval.tick().await;
+
+        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
+
+        let Ok(file) = tokio::fs::File::open(&metrics_path).await else {
+            continue;
+        };
+        let Ok(metadata) = file.metadata().await else {
+            continue;
+        };
+        let file_len = metadata.len();
+        if file_len <= last_pos {
+            continue;
+        }
+
+        let path = metrics_path.clone();
+        let read_result = tokio::task::spawn_blocking(move || {
+            use std::io::{BufRead, Seek};
+
+            let Ok(file) = std::fs::File::open(&path) else {
+                return (last_pos, Vec::<serde_json::Value>::new());
+            };
+            let mut reader = std::io::BufReader::new(file);
+            if reader.seek(std::io::SeekFrom::Start(last_pos)).is_err() {
+                return (last_pos, Vec::new());
+            }
+
+            let mut line = String::new();
+            let mut rows = Vec::new();
+            while reader.read_line(&mut line).unwrap_or(0) > 0 {
+                if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
+                    rows.push(json);
+                }
+                line.clear();
+            }
+
+            let pos = reader.stream_position().unwrap_or(last_pos);
+            (pos, rows)
+        })
+        .await;
+
+        let Ok((new_pos, rows)) = read_result else {
+            continue;
+        };
+        last_pos = new_pos;
+
+        if rows.is_empty() {
+            continue;
+        }
+
+        let mut runs = state_arc.write().await;
+        if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+            for row in rows {
+                apply_metrics_to_grpo(run, &row, started_at);
+            }
+            let _ = event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
+        }
+    }
+}
+
+fn apply_metrics_to_grpo(
+    run: &mut GrpoRun,
+    metrics: &serde_json::Value,
+    started_at: chrono::DateTime<Utc>,
+) {
+    if let Some(v) = metrics["step"].as_u64() {
+        run.step = v;
+    }
+    if let Some(v) = metrics["total_steps"].as_u64() {
+        run.total_steps = Some(v);
+    }
+    if let Some(v) = metrics["loss"].as_f64() {
+        run.loss = Some(v);
+        if run.best_loss.map_or(true, |best| v < best) {
+            run.best_loss = Some(v);
+        }
+    }
+    if let Some(v) = metrics["reward_mean"].as_f64() {
+        run.reward_mean = Some(v);
+    }
+    if let Some(v) = metrics["reward_std"].as_f64() {
+        run.reward_std = Some(v);
+    }
+    if let Some(v) = metrics["kl_div"].as_f64() {
+        run.kl_div = Some(v);
+    }
+    if let Some(v) = metrics["lr"].as_f64().or_else(|| metrics["learning_rate"].as_f64()) {
+        run.learning_rate = Some(v);
+    }
+    if let Some(v) = metrics["tok_sec"]
+        .as_f64()
+        .or_else(|| metrics["tokens_per_second"].as_f64())
+    {
+        run.tokens_per_second = Some(v);
+    }
+    if let (Some(total_steps), step) = (run.total_steps, run.step) {
+        if step > 0 {
+            let elapsed = (Utc::now() - started_at).num_seconds().max(1) as f64;
+            let remaining = total_steps.saturating_sub(step) as f64;
+            run.eta_seconds = Some(((elapsed / step as f64) * remaining) as u64);
+        }
+    }
+}
+
+async fn finalize_grpo_run(
+    state_arc: &Arc<tokio::sync::RwLock<Vec<GrpoRun>>>,
+    event_tx: &tokio::sync::broadcast::Sender<AppEvent>,
+    run_id: &str,
+    cancel_flag: &Arc<std::sync::atomic::AtomicBool>,
+    success: bool,
+    error: Option<String>,
+) {
+    let mut runs = state_arc.write().await;
+    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
+        run.status = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+            GrpoStatus::Cancelled
+        } else if success {
+            GrpoStatus::Completed
+        } else {
+            GrpoStatus::Failed
+        };
+        run.ended_at = Some(Utc::now());
+        run.error_message = error;
+        let _ = event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
+        let _ = event_tx.send(AppEvent::GrpoStopped {
+            run_id: run_id.to_string(),
+        });
+    }
+}
+
+async fn resolve_model_path(model_id: &str) -> Result<PathBuf> {
+    if model_id.contains('/') && !PathBuf::from(model_id).exists() {
+        pmetal::hub::download_model(model_id, None, None)
+            .await
+            .map_err(|e| AppError(e.to_string()))
+    } else {
+        Ok(PathBuf::from(model_id))
+    }
+}
+
+async fn resolve_dataset_path(dataset_id: &str) -> Result<PathBuf> {
+    match pmetal::data::resolve_dataset_source(dataset_id) {
+        pmetal::data::DatasetSource::Local(path) => Ok(path),
+        pmetal::data::DatasetSource::HuggingFace(id) => {
+            let dir = pmetal::hub::download_dataset(&id, None, None, None)
+                .await
+                .map_err(|e| AppError(e.to_string()))?;
+            if let Ok(path) = pmetal::data::TrainingDataset::resolve_dataset_path_pub(&dir) {
+                return Ok(path);
+            }
+            let parquet_paths = pmetal::hub::download_dataset_parquet(&id, "train", None, None)
+                .await
+                .map_err(|e| AppError(e.to_string()))?;
+            parquet_paths
+                .into_iter()
+                .next()
+                .ok_or_else(|| AppError(format!("No dataset files found for {id}")))
+        }
+    }
+}
+
+async fn run_qlora_training_in_process(
+    config: &TrainingConfig,
+    metrics_path: &PathBuf,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use pmetal::lora::TrainableModel;
+
+    let model_path = resolve_model_path(&config.model).await?;
+    let dataset_id = config
+        .dataset
+        .as_deref()
+        .ok_or_else(|| AppError("Dataset is required for training".to_string()))?;
+    let dataset_path = resolve_dataset_path(dataset_id).await?;
+    let output_dir = config
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| "./output".to_string());
+
+    let config_path = model_path.join("config.json");
+    let config_text = std::fs::read_to_string(&config_path).map_err(|e| {
+        AppError(format!(
+            "QLoRA requires config.json; failed to read {}: {e}",
+            config_path.display()
+        ))
+    })?;
+    let llama_config: pmetal::models::architectures::llama::LlamaConfig =
+        serde_json::from_str(&config_text).map_err(|e| AppError(e.to_string()))?;
+
+    let tokenizer = pmetal::data::Tokenizer::from_model_dir(&model_path)
+        .map_err(|e| AppError(e.to_string()))?;
+    let chat_template =
+        pmetal::data::chat_templates::detect_chat_template(&model_path, &config.model);
+
+    let max_seq_len = config.max_seq_len.unwrap_or(2048) as usize;
+    let train_dataset = if dataset_path
+        .extension()
+        .is_some_and(|ext| ext == "parquet")
+    {
+        pmetal::data::TrainingDataset::from_parquet_tokenized(
+            &dataset_path,
+            &tokenizer,
+            "text",
+            max_seq_len,
+            None,
+        )
+        .or_else(|_| {
+            pmetal::data::TrainingDataset::from_parquet_tokenized(
+                &dataset_path,
+                &tokenizer,
+                "content",
+                max_seq_len,
+                None,
+            )
+        })
+        .map_err(|e| AppError(e.to_string()))?
+    } else {
+        pmetal::data::TrainingDataset::from_jsonl_tokenized(
+            &dataset_path,
+            &tokenizer,
+            pmetal::data::DatasetFormat::Auto,
+            max_seq_len,
+            Some(&chat_template),
+        )
+        .map_err(|e| AppError(e.to_string()))?
+    };
+
+    let quant_scheme = pmetal::mlx::quantization::QuantScheme::NF4;
+    let qlora_config = pmetal::lora::QLoraConfig {
+        lora: pmetal::core::LoraConfig {
+            r: config.lora_rank.unwrap_or(16) as usize,
+            alpha: config.lora_alpha.unwrap_or(32) as f32,
+            dropout: config.lora_dropout.unwrap_or(0.0) as f32,
+            use_rslora: config.use_rslora.unwrap_or(false),
+            use_dora: config.use_dora.unwrap_or(false),
+            ..Default::default()
+        },
+        quant_scheme,
+        block_size: 64,
+        double_quant: false,
+        compute_in_half: true,
+    };
+
+    let mut model =
+        pmetal::lora::LlamaQloraForCausalLM::with_qlora_config(llama_config, qlora_config.clone())
+            .map_err(|e| AppError(e.to_string()))?;
+    model
+        .load_and_quantize_from_dir(&model_path)
+        .map_err(|e| AppError(e.to_string()))?;
+
+    if config.gradient_checkpointing.unwrap_or(false) && model.supports_gradient_checkpointing() {
+        model.enable_gradient_checkpointing(
+            config.gradient_checkpointing_layers.unwrap_or(4) as usize,
+        );
     }
 
-    Ok(output_dir_task)
+    let checkpoint_dir = PathBuf::from(&output_dir).join("checkpoints");
+    let checkpoint_manager = pmetal::trainer::CheckpointManager::new(&checkpoint_dir)
+        .map_err(|e| AppError(e.to_string()))?
+        .with_max_checkpoints(3);
+
+    let training_loop_config = pmetal::trainer::TrainingLoopConfig {
+        training: pmetal::core::TrainingConfig {
+            learning_rate: config.learning_rate.unwrap_or(2e-4),
+            batch_size: config.batch_size.unwrap_or(4) as usize,
+            num_epochs: config.epochs.unwrap_or(3) as usize,
+            max_seq_len,
+            gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(1) as usize,
+            weight_decay: config.weight_decay.unwrap_or(0.0),
+            max_grad_norm: config.max_grad_norm.unwrap_or(1.0),
+            output_dir: output_dir.clone(),
+            ..Default::default()
+        },
+        dataloader: pmetal::data::DataLoaderConfig {
+            batch_size: config.batch_size.unwrap_or(4) as usize,
+            max_seq_len,
+            shuffle: true,
+            seed: 42,
+            pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
+            drop_last: false,
+        },
+        use_metal_flash_attention: config.flash_attention.unwrap_or(true),
+        log_every: config.logging_steps.unwrap_or(10) as usize,
+        checkpoint_every: config.save_steps.unwrap_or(500) as usize,
+        eval_every: 0,
+        use_jit_compilation: config.jit_compilation.unwrap_or(true),
+        use_sequence_packing: config.sequence_packing.unwrap_or(true),
+        gradient_checkpointing: config.gradient_checkpointing.unwrap_or(false),
+        gradient_checkpointing_layers: config.gradient_checkpointing_layers.unwrap_or(4) as usize,
+        embedding_lr: config.embedding_lr.map(|v| v as f32),
+        eager_evaluation: true,
+        use_metal_fused_optimizer: config.fused_optimizer.unwrap_or(false),
+    };
+
+    let mut training_loop = pmetal::trainer::TrainingLoop::new(training_loop_config);
+    let callback = pmetal::trainer::MetricsJsonCallback::new(metrics_path)
+        .map_err(|e| AppError(e.to_string()))?
+        .with_run_name(format!("train-{}", config.model.replace('/', "-")));
+    training_loop.add_callback(Box::new(callback));
+    training_loop.add_callback(Box::new(CancelOnFlag {
+        cancelled: cancel_flag,
+    }));
+
+    let adaptive_config = pmetal::trainer::AdaptiveLrConfig::default();
+    let control_file = PathBuf::from(&output_dir).join(".lr_control.json");
+    training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
+
+    training_loop
+        .run(&mut model, train_dataset, None, Some(&checkpoint_manager))
+        .map_err(|e| AppError(e.to_string()))?;
+
+    let output_dir_path = PathBuf::from(&output_dir);
+    std::fs::create_dir_all(&output_dir_path).map_err(|e| AppError(e.to_string()))?;
+    let final_path = output_dir_path.join("lora_weights.safetensors");
+    model
+        .save_lora_weights(&final_path)
+        .map_err(|e| AppError(e.to_string()))?;
+    let adapter_config = serde_json::json!({
+        "r": qlora_config.lora.r,
+        "alpha": qlora_config.lora.alpha,
+        "target_modules": qlora_config.lora.target_modules,
+        "use_rslora": qlora_config.lora.use_rslora,
+    });
+    std::fs::write(
+        output_dir_path.join("adapter_config.json"),
+        serde_json::to_string_pretty(&adapter_config).map_err(|e| AppError(e.to_string()))?,
+    )
+    .map_err(|e| AppError(e.to_string()))?;
+
+    Ok(())
+}
+
+async fn run_distillation_in_process(
+    config: &DistillationConfig,
+    metrics_path: &PathBuf,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use pmetal::lora::TrainableModel;
+
+    let teacher_path = resolve_model_path(&config.teacher_model).await?;
+    let student_path = resolve_model_path(&config.student_model).await?;
+    let dataset_id = config
+        .dataset
+        .as_deref()
+        .ok_or_else(|| AppError("Dataset is required for distillation".to_string()))?;
+    let dataset_path = resolve_dataset_path(dataset_id).await?;
+
+    let tokenizer = pmetal::data::Tokenizer::from_model_dir(&student_path)
+        .map_err(|e| AppError(e.to_string()))?;
+    let chat_template =
+        pmetal::data::chat_templates::detect_chat_template(&student_path, &config.student_model);
+
+    let max_seq_len = config.max_seq_len.unwrap_or(1024) as usize;
+    let train_dataset = if dataset_path
+        .extension()
+        .is_some_and(|ext| ext == "parquet")
+    {
+        pmetal::data::TrainingDataset::from_parquet_tokenized(
+            &dataset_path,
+            &tokenizer,
+            "text",
+            max_seq_len,
+            None,
+        )
+        .or_else(|_| {
+            pmetal::data::TrainingDataset::from_parquet_tokenized(
+                &dataset_path,
+                &tokenizer,
+                "content",
+                max_seq_len,
+                None,
+            )
+        })
+        .map_err(|e| AppError(e.to_string()))?
+    } else {
+        pmetal::data::TrainingDataset::from_jsonl_tokenized(
+            &dataset_path,
+            &tokenizer,
+            pmetal::data::DatasetFormat::Auto,
+            max_seq_len,
+            Some(&chat_template),
+        )
+        .map_err(|e| AppError(e.to_string()))?
+    };
+
+    let teacher_lora_config = pmetal::core::LoraConfig {
+        r: 0,
+        ..Default::default()
+    };
+    let mut teacher_model = pmetal::lora::DynamicLoraModel::from_pretrained(
+        &teacher_path,
+        teacher_lora_config,
+    )
+    .map_err(|e| AppError(e.to_string()))?;
+
+    let student_lora_config = pmetal::core::LoraConfig {
+        r: config.lora_rank.unwrap_or(16) as usize,
+        alpha: config.lora_alpha.unwrap_or(32) as f32,
+        ..Default::default()
+    };
+    let mut student_model = pmetal::lora::DynamicLoraModel::from_pretrained(
+        &student_path,
+        student_lora_config.clone(),
+    )
+    .map_err(|e| AppError(e.to_string()))?;
+
+    let loss_type = match config
+        .loss_type
+        .clone()
+        .unwrap_or_else(|| "kl_divergence".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "kl" | "kl_divergence" => pmetal::distill::LossType::KlDivergence,
+        "js" | "jensen_shannon" => pmetal::distill::LossType::JensenShannon,
+        "soft_cross_entropy" => pmetal::distill::LossType::SoftCrossEntropy,
+        "mse" | "mse_loss" => pmetal::distill::LossType::MseLoss,
+        other => return Err(AppError(format!("Unsupported distillation loss type: {other}"))),
+    };
+
+    let distill_config = pmetal::distill::DistillConfig {
+        teacher: config.teacher_model.clone(),
+        student: config.student_model.clone(),
+        method: pmetal::distill::DistillMethod::Online,
+        loss: pmetal::distill::LossConfig {
+            loss_type,
+            temperature: config.temperature.unwrap_or(2.0),
+            alpha: config.alpha.unwrap_or(0.5),
+            ..Default::default()
+        },
+        offline: None,
+        output_path: config.output_dir.as_ref().map(PathBuf::from),
+        training: pmetal::distill::TrainingConfig {
+            batch_size: config.batch_size.unwrap_or(1) as usize,
+            learning_rate: config.learning_rate.unwrap_or(2e-5) as f32,
+            epochs: config.epochs.unwrap_or(3) as usize,
+            max_seq_len,
+            ..Default::default()
+        },
+    };
+
+    let distiller = pmetal::distill::Distiller::new(distill_config)
+        .map_err(|e| AppError(e.to_string()))?;
+
+    let training_loop_config = pmetal::trainer::TrainingLoopConfig {
+        training: pmetal::core::TrainingConfig {
+            learning_rate: config.learning_rate.unwrap_or(2e-5),
+            batch_size: config.batch_size.unwrap_or(1) as usize,
+            num_epochs: config.epochs.unwrap_or(3) as usize,
+            max_seq_len,
+            output_dir: config
+                .output_dir
+                .clone()
+                .unwrap_or_else(|| "./output".to_string()),
+            ..Default::default()
+        },
+        dataloader: pmetal::data::DataLoaderConfig {
+            batch_size: config.batch_size.unwrap_or(1) as usize,
+            max_seq_len,
+            shuffle: true,
+            seed: 42,
+            pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
+            drop_last: false,
+        },
+        use_metal_flash_attention: true,
+        log_every: 1,
+        checkpoint_every: 100,
+        eval_every: 0,
+        use_jit_compilation: true,
+        use_sequence_packing: true,
+        gradient_checkpointing: true,
+        gradient_checkpointing_layers: 4,
+        embedding_lr: None,
+        eager_evaluation: false,
+        use_metal_fused_optimizer: true,
+    };
+
+    let mut trainer = pmetal::trainer::DistillationTrainer::new(distiller, training_loop_config);
+    let adaptive_config = pmetal::trainer::AdaptiveLrConfig::for_distillation();
+    let control_file = PathBuf::from(
+        config
+            .output_dir
+            .clone()
+            .unwrap_or_else(|| "./output".to_string()),
+    )
+    .join(".lr_control.json");
+    trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
+
+    let callback = pmetal::trainer::MetricsJsonCallback::new(metrics_path)
+        .map_err(|e| AppError(e.to_string()))?
+        .with_run_name(format!("distill-{}", config.student_model.replace('/', "-")));
+    trainer.add_callback(Box::new(callback));
+    trainer.add_callback(Box::new(CancelOnFlag {
+        cancelled: cancel_flag,
+    }));
+
+    trainer
+        .run(&mut student_model, &mut teacher_model, train_dataset, None, None)
+        .map_err(|e| AppError(e.to_string()))?;
+
+    let output_dir = PathBuf::from(
+        config
+            .output_dir
+            .clone()
+            .unwrap_or_else(|| "./output".to_string()),
+    );
+    std::fs::create_dir_all(&output_dir).map_err(|e| AppError(e.to_string()))?;
+    let lora_output = output_dir.join("lora_weights.safetensors");
+    student_model
+        .save_lora_weights(&lora_output)
+        .map_err(|e| AppError(e.to_string()))?;
+    let adapter_config = serde_json::json!({
+        "r": student_lora_config.r,
+        "alpha": student_lora_config.alpha,
+        "target_modules": student_lora_config.target_modules,
+        "use_rslora": student_lora_config.use_rslora,
+    });
+    std::fs::write(
+        output_dir.join("adapter_config.json"),
+        serde_json::to_string_pretty(&adapter_config).map_err(|e| AppError(e.to_string()))?,
+    )
+    .map_err(|e| AppError(e.to_string()))?;
+
+    Ok(())
+}
+
+async fn run_grpo_in_process(
+    config: &GrpoConfig,
+    metrics_path: &PathBuf,
+    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
+) -> Result<()> {
+    use pmetal::lora::TrainableModel;
+
+    let model_path = resolve_model_path(&config.model).await?;
+    let dataset_id = config
+        .dataset
+        .as_deref()
+        .ok_or_else(|| AppError("Dataset is required for GRPO".to_string()))?;
+    let dataset_path = resolve_dataset_path(dataset_id).await?;
+    let tokenizer = pmetal::data::Tokenizer::from_model_dir(&model_path)
+        .map_err(|e| AppError(e.to_string()))?;
+    let chat_template =
+        pmetal::data::chat_templates::detect_chat_template(&model_path, &config.model);
+
+    let max_seq_len = config.max_seq_len.unwrap_or(512) as usize;
+    let dataset = if dataset_path
+        .extension()
+        .is_some_and(|ext| ext == "parquet")
+    {
+        pmetal::data::TrainingDataset::from_parquet_tokenized(
+            &dataset_path,
+            &tokenizer,
+            "text",
+            max_seq_len,
+            None,
+        )
+        .or_else(|_| {
+            pmetal::data::TrainingDataset::from_parquet_tokenized(
+                &dataset_path,
+                &tokenizer,
+                "content",
+                max_seq_len,
+                None,
+            )
+        })
+        .map_err(|e| AppError(e.to_string()))?
+    } else {
+        pmetal::data::TrainingDataset::from_jsonl_tokenized(
+            &dataset_path,
+            &tokenizer,
+            pmetal::data::DatasetFormat::Auto,
+            max_seq_len,
+            Some(&chat_template),
+        )
+        .map_err(|e| AppError(e.to_string()))?
+    };
+
+    let lora_config = pmetal::core::LoraConfig {
+        r: config.lora_rank.unwrap_or(16) as usize,
+        alpha: config.lora_alpha.unwrap_or(32) as f32,
+        ..Default::default()
+    };
+    let mut model =
+        pmetal::lora::DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())
+            .map_err(|e| AppError(e.to_string()))?;
+
+    let mut grpo_config =
+        pmetal::trainer::GrpoConfig::new(config.group_size.unwrap_or(8) as usize)
+            .with_beta(config.beta.unwrap_or(0.04));
+    grpo_config.max_prompt_length = max_seq_len;
+    grpo_config.max_completion_length = 512;
+
+    let mut rewards = pmetal::trainer::CombinedReward::new();
+    if config.use_reasoning_rewards.unwrap_or(false) {
+        rewards = rewards.add(
+            Box::new(pmetal::trainer::XmlFormatReward::default_reasoning()),
+            1.0,
+        );
+    } else {
+        struct DummyReward;
+        impl pmetal::trainer::RewardFunction for DummyReward {
+            fn compute(
+                &self,
+                _prompts: &[String],
+                completions: &[String],
+                _images: Option<&[Vec<mlx_rs::Array>]>,
+            ) -> pmetal::trainer::GrpoResult<Vec<f64>> {
+                Ok(vec![0.1; completions.len()])
+            }
+
+            fn name(&self) -> &str {
+                "dummy"
+            }
+        }
+
+        rewards = rewards.add(Box::new(DummyReward), 1.0);
+    }
+
+    let output_dir = config
+        .output_dir
+        .clone()
+        .unwrap_or_else(|| "./output".to_string());
+    let training_config = pmetal::core::TrainingConfig {
+        learning_rate: config.learning_rate.unwrap_or(5e-6),
+        batch_size: 1,
+        num_epochs: config.epochs.unwrap_or(1) as usize,
+        max_seq_len,
+        output_dir: output_dir.clone(),
+        ..Default::default()
+    };
+
+    let mut trainer = pmetal::trainer::GrpoTrainer::new(grpo_config, training_config)
+        .map_err(|e| AppError(e.to_string()))?;
+    let callback = pmetal::trainer::MetricsJsonCallback::new(metrics_path)
+        .map_err(|e| AppError(e.to_string()))?
+        .with_run_name(format!("grpo-{}", config.model.replace('/', "-")));
+    trainer.add_callback(Box::new(callback));
+    trainer.add_callback(Box::new(CancelOnFlag {
+        cancelled: cancel_flag,
+    }));
+
+    let adaptive_config = pmetal::trainer::AdaptiveLrConfig::default();
+    let control_file = PathBuf::from(&output_dir).join(".lr_control.json");
+    trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
+
+    let mut optimizer = mlx_rs::optimizers::AdamWBuilder::new(
+        config.learning_rate.unwrap_or(5e-6) as f32,
+    )
+    .build()
+    .map_err(|e| AppError(e.to_string()))?;
+    let mut ref_model =
+        pmetal::models::DynamicModel::load(&model_path).map_err(|e| AppError(e.to_string()))?;
+
+    trainer
+        .run(
+            &mut model,
+            Some(&mut ref_model),
+            &tokenizer,
+            &dataset,
+            &rewards,
+            &mut optimizer,
+            |opt, lr| {
+                opt.lr = mlx_rs::array!(lr);
+            },
+        )
+        .map_err(|e| AppError(e.to_string()))?;
+
+    let output_dir = PathBuf::from(output_dir);
+    std::fs::create_dir_all(&output_dir).map_err(|e| AppError(e.to_string()))?;
+    let lora_output = output_dir.join("lora_weights.safetensors");
+    model
+        .save_lora_weights(&lora_output)
+        .map_err(|e| AppError(e.to_string()))?;
+    let adapter_config = serde_json::json!({
+        "r": lora_config.r,
+        "alpha": lora_config.alpha,
+        "target_modules": lora_config.target_modules,
+        "use_rslora": lora_config.use_rslora,
+    });
+    std::fs::write(
+        output_dir.join("adapter_config.json"),
+        serde_json::to_string_pretty(&adapter_config).map_err(|e| AppError(e.to_string()))?,
+    )
+    .map_err(|e| AppError(e.to_string()))?;
+
+    Ok(())
+}
+
+fn run_fuse_in_process(
+    model_path: &str,
+    lora_path: &str,
+    output_path: &str,
+) -> std::result::Result<(), AppError> {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+
+    let model_dir: PathBuf = if model_path.contains('/') && !PathBuf::from(model_path).exists() {
+        return Err(AppError(
+            "Fuse with remote base models is not supported in the GUI yet.".to_string(),
+        ));
+    } else {
+        PathBuf::from(model_path)
+    };
+
+    let lora_file = if Path::new(lora_path).is_dir() {
+        let f = Path::new(lora_path).join("lora_weights.safetensors");
+        if !f.exists() {
+            return Err(AppError(format!(
+                "No lora_weights.safetensors found in {lora_path}"
+            )));
+        }
+        f
+    } else {
+        PathBuf::from(lora_path)
+    };
+
+    let mut base_weights =
+        pmetal::models::loader::load_weights(&model_dir).map_err(|e| AppError(e.to_string()))?;
+    let lora_weights = pmetal::mlx::Array::load_safetensors(&lora_file)
+        .map_err(|e| AppError(e.to_string()))?;
+
+    let lora_dir = if Path::new(lora_path).is_dir() {
+        PathBuf::from(lora_path)
+    } else {
+        Path::new(lora_path)
+            .parent()
+            .unwrap_or(Path::new("."))
+            .to_path_buf()
+    };
+    let adapter_config = std::fs::read_to_string(lora_dir.join("adapter_config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok());
+
+    let rank = adapter_config
+        .as_ref()
+        .and_then(|cfg| cfg["r"].as_u64())
+        .map(|r| r as usize)
+        .or_else(|| {
+            lora_weights
+                .iter()
+                .filter(|(k, _)| k.contains("self_attn") && k.contains("lora_a"))
+                .map(|(_, v)| *v.shape().iter().min().unwrap_or(&16) as usize)
+                .next()
+        })
+        .unwrap_or(16);
+    let alpha = adapter_config
+        .as_ref()
+        .and_then(|cfg| cfg["alpha"].as_f64())
+        .map(|a| a as f32)
+        .unwrap_or(rank as f32);
+    let scale = alpha / rank as f32;
+
+    let mut lora_a_map: HashMap<String, &pmetal::mlx::Array> = HashMap::new();
+    let mut lora_b_map: HashMap<String, &pmetal::mlx::Array> = HashMap::new();
+    for (name, array) in &lora_weights {
+        if let Some(base_name) = name.strip_suffix(".lora_a") {
+            lora_a_map.insert(base_name.to_string(), array);
+        } else if let Some(base_name) = name.strip_suffix(".lora_b") {
+            lora_b_map.insert(base_name.to_string(), array);
+        }
+    }
+
+    for (layer_name, lora_a) in &lora_a_map {
+        let Some(lora_b) = lora_b_map.get(layer_name) else {
+            continue;
+        };
+        let base_key = if layer_name.starts_with("model.") {
+            format!("{layer_name}.weight")
+        } else {
+            format!("model.{layer_name}.weight")
+        };
+        let Some(base_weight) = base_weights.get(&base_key) else {
+            continue;
+        };
+
+        let delta = ops::matmul(lora_b, lora_a)
+            .map_err(|e| AppError(e.to_string()))?;
+        let scaled_delta = ops::multiply(&delta, pmetal::mlx::Array::from_f32(scale))
+            .map_err(|e| AppError(e.to_string()))?;
+        let fused = ops::add(base_weight, &scaled_delta)
+            .map_err(|e| AppError(e.to_string()))?;
+        base_weights.insert(base_key, fused);
+    }
+
+    let output_dir = Path::new(output_path);
+    std::fs::create_dir_all(output_dir)?;
+    for entry in std::fs::read_dir(&model_dir).map_err(|e| AppError(e.to_string()))?.flatten() {
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if name_str.ends_with(".safetensors")
+            || name_str == "model.safetensors.index.json"
+            || name_str.starts_with('.')
+        {
+            continue;
+        }
+        let dest = output_dir.join(&name);
+        if entry.path().is_file() {
+            std::fs::copy(entry.path(), &dest).map_err(|e| AppError(e.to_string()))?;
+        }
+    }
+
+    let output_file = output_dir.join("model.safetensors");
+    pmetal::mlx::Array::save_safetensors(&base_weights, None, &output_file)
+        .map_err(|e| AppError(e.to_string()))?;
+    Ok(())
+}
+
+fn run_quantize_in_process(
+    model_path: &str,
+    method: &str,
+    output_path: &str,
+) -> std::result::Result<(), AppError> {
+    use pmetal::gguf::{
+        GgmlType,
+        GgufBuilder,
+        dynamic::{DynamicQuantizationConfig, DynamicQuantizer},
+        quantize::quantize,
+    };
+
+    let resolved_model_path = if model_path.contains('/') && !PathBuf::from(model_path).exists() {
+        return Err(AppError(
+            "Quantizing remote models is not supported in the GUI yet.".to_string(),
+        ));
+    } else {
+        PathBuf::from(model_path)
+    };
+
+    let quantizer = if method == "dynamic" {
+        DynamicQuantizer::new(DynamicQuantizationConfig::default(), None)
+    } else {
+        let base_type = match method {
+            "q8_0" => GgmlType::Q8_0,
+            "q4_k_m" => GgmlType::Q4K,
+            other => return Err(AppError(format!("Unsupported quantization method: {other}"))),
+        };
+        DynamicQuantizer::new(
+            DynamicQuantizationConfig {
+                base_type,
+                high_precision_type: base_type,
+                fallback_type: base_type,
+                ..Default::default()
+            },
+            None,
+        )
+    };
+
+    let weights = pmetal::models::loader::load_weights(&resolved_model_path)
+        .map_err(|e| AppError(e.to_string()))?;
+
+    let config_path = resolved_model_path.join("config.json");
+    let mut architecture = "llama".to_string();
+    if config_path.exists() {
+        if let Ok(content) = std::fs::read_to_string(&config_path) {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
+                if let Some(archs) = json.get("architectures").and_then(|v| v.as_array()) {
+                    if let Some(arch_str) = archs.first().and_then(|v| v.as_str()) {
+                        architecture = match arch_str {
+                            "LlamaForCausalLM" => "llama".to_string(),
+                            "MistralForCausalLM" => "mistral".to_string(),
+                            "Qwen2ForCausalLM" => "qwen2".to_string(),
+                            "GemmaForCausalLM" | "Gemma2ForCausalLM" => "gemma".to_string(),
+                            "PhiForCausalLM" | "Phi3ForCausalLM" => "phi".to_string(),
+                            _ => "llama".to_string(),
+                        };
+                    }
+                }
+            }
+        }
+    }
+
+    let mut builder = GgufBuilder::with_model(&architecture, "quantized-model");
+    let mut keys: Vec<_> = weights.keys().collect();
+    keys.sort();
+
+    for name in keys {
+        let tensor = weights
+            .get(name)
+            .ok_or_else(|| AppError(format!("Tensor {name} not found")))?;
+        let shape_u64: Vec<u64> = tensor.shape().iter().map(|&d| d as u64).collect();
+        let target_type = quantizer.get_tensor_type(name, &shape_u64);
+        tensor.eval().map_err(|e| AppError(e.to_string()))?;
+
+        let data_f32: Vec<f32> = match tensor.dtype() {
+            pmetal::mlx::Dtype::Float32 => tensor.as_slice::<f32>().to_vec(),
+            pmetal::mlx::Dtype::Float16 | pmetal::mlx::Dtype::Bfloat16 => {
+                let t_f32 = tensor
+                    .as_dtype(pmetal::mlx::Dtype::Float32)
+                    .map_err(|e| AppError(e.to_string()))?;
+                t_f32.eval().map_err(|e| AppError(e.to_string()))?;
+                t_f32.as_slice::<f32>().to_vec()
+            }
+            _ => continue,
+        };
+
+        let quantized_data =
+            quantize(&data_f32, target_type).map_err(|e| AppError(format!("{e:?}")))?;
+        builder.add_raw_tensor(name, shape_u64, target_type, quantized_data);
+    }
+
+    let mut file = std::fs::File::create(output_path).map_err(|e| AppError(e.to_string()))?;
+    builder.write(&mut file).map_err(|e| AppError(e.to_string()))?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2030,19 +3085,7 @@ async fn search_hf_datasets_inner(
 // ---------------------------------------------------------------------------
 
 async fn get_pmetal_version() -> String {
-    if let Ok(pmetal_bin) = which::which("pmetal") {
-        let out = tokio::process::Command::new(&pmetal_bin)
-            .arg("--version")
-            .output()
-            .await
-            .ok();
-        if let Some(o) = out {
-            if let Ok(s) = String::from_utf8(o.stdout) {
-                return s.trim().to_string();
-            }
-        }
-    }
-    "unknown".to_string()
+    pmetal::version::VERSION.to_string()
 }
 
 async fn get_total_memory_bytes() -> u64 {
@@ -2091,23 +3134,9 @@ async fn get_available_memory_bytes() -> Option<u64> {
 
 /// Try to get memory bandwidth via `pmetal memory` output, or return None.
 async fn get_bandwidth_gbps() -> Option<f64> {
-    let pmetal_bin = which::which("pmetal").ok()?;
-    let out = tokio::process::Command::new(&pmetal_bin)
-        .arg("memory")
-        .output()
-        .await
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        if let Some(rest) = line.trim().strip_prefix("Bandwidth:") {
-            let val = rest.trim().split_whitespace().next()?;
-            return val.parse::<f64>().ok();
-        }
-    }
-    None
+    pmetal::metal::MetalContext::global()
+        .ok()
+        .map(|ctx| ctx.properties().memory_bandwidth_gbps)
 }
 
 /// Percent-encode a string for use in a URL query parameter value.

@@ -4501,6 +4501,7 @@ dependencies = [
  "pmetal-models",
  "pmetal-trainer",
  "pmetal-vocoder",
+ "serde_json",
  "tokio",
  "tracing-subscriber",
 ]

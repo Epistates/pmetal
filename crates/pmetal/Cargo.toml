@@ -62,6 +62,7 @@ pmetal-merge = { workspace = true, optional = true }
 pmetal-vocoder = { workspace = true, optional = true }
 tokio = { workspace = true, optional = true }
 mlx-rs = { workspace = true, optional = true }
+serde_json = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }

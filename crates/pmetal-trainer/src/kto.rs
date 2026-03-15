@@ -48,8 +48,14 @@
 
 use mlx_rs::Array;
 use mlx_rs::error::Exception;
+use mlx_rs::nn;
 use mlx_rs::ops::indexing::IndexOp;
-use pmetal_core::TrainingConfig;
+use mlx_rs::optimizers::Optimizer;
+use pmetal_core::{StepMetrics, TrainingCallback, TrainingConfig};
+use pmetal_lora::TrainableModel;
+use std::time::Instant;
+
+use crate::preference_batch::{pad_i64_sequences, pad_u32_sequences};
 
 /// Error type for KTO training.
 #[derive(Debug, thiserror::Error)]
@@ -327,6 +333,7 @@ pub struct KtoTrainer {
     z_ref_estimate: f64,
     /// Number of samples used in z_ref estimation.
     z_ref_count: usize,
+    callbacks: Vec<Box<dyn TrainingCallback>>,
 }
 
 impl KtoTrainer {
@@ -339,7 +346,13 @@ impl KtoTrainer {
             step: 0,
             z_ref_estimate: 0.0,
             z_ref_count: 0,
+            callbacks: Vec::new(),
         })
+    }
+
+    /// Add a training callback.
+    pub fn add_callback(&mut self, callback: Box<dyn TrainingCallback>) {
+        self.callbacks.push(callback);
     }
 
     /// Compute log probabilities for a sequence.
@@ -411,85 +424,28 @@ impl KtoTrainer {
         ref_logps: &Array,
         is_desirable: &[bool],
     ) -> KtoResult<KtoLossOutput> {
-        let batch_size = policy_logps.dim(0) as usize;
-
-        // Compute implicit rewards: r = log π(y|x) - log π_ref(y|x)
         let rewards = if self.config.reference_free {
             policy_logps.clone()
         } else {
             policy_logps.subtract(ref_logps)?
         };
-
-        rewards.eval()?;
-
-        // Get z_ref (either fixed or estimated)
         let z_ref = if self.config.estimate_z_ref {
-            // BCO-style: estimate from batch
-            self.update_z_ref_estimate(&rewards)?;
             self.z_ref_estimate
         } else {
             self.config.z_ref
         };
-
-        // Compute loss for each sample based on desirability
-        let mut losses = Vec::with_capacity(batch_size);
-        let mut desirable_losses = Vec::new();
-        let mut undesirable_losses = Vec::new();
-
-        let beta_d = self.config.effective_beta_desirable() as f32;
-        let beta_u = self.config.effective_beta_undesirable() as f32;
-        let lambda_d = self.config.desirable_weight as f32;
-        let lambda_u = self.config.undesirable_weight as f32;
-
-        for (i, &desirable) in is_desirable.iter().enumerate().take(batch_size) {
-            let reward = rewards.index(i as i32);
-            reward.eval()?;
-            let r = reward.item::<f32>();
-
-            let loss = if desirable {
-                // Desirable: λ_D * (1 - σ(β_d * r - z_ref))
-                // = λ_D * σ(z_ref - β_d * r)
-                let logit = (z_ref as f32) - beta_d * r;
-                let sigmoid_val = 1.0 / (1.0 + (-logit).exp());
-                let l = lambda_d * sigmoid_val;
-                desirable_losses.push(l);
-                l
-            } else {
-                // Undesirable: λ_U * (1 - σ(z_ref - β_u * r))
-                // = λ_U * σ(β_u * r - z_ref)
-                let logit = beta_u * r - (z_ref as f32);
-                let sigmoid_val = 1.0 / (1.0 + (-logit).exp());
-                let l = lambda_u * sigmoid_val;
-                undesirable_losses.push(l);
-                l
-            };
-
-            losses.push(loss);
+        let (mean_loss, scaled_rewards, desirable_loss, undesirable_loss) =
+            Self::compute_kto_loss_arrays(&self.config, &rewards, is_desirable, z_ref)?;
+        if self.config.estimate_z_ref {
+            self.update_z_ref_estimate(&rewards)?;
         }
-
-        // Create loss array
-        let loss_array = Array::from_slice(&losses, &[batch_size as i32]);
-        let mean_loss = loss_array.mean(None)?;
-        mean_loss.eval()?;
-
-        // Compute scaled rewards for logging
-        let beta = Array::from_f32(self.config.beta as f32);
-        let scaled_rewards = rewards.multiply(&beta)?;
 
         Ok(KtoLossOutput {
             loss: mean_loss,
             rewards: scaled_rewards,
             z_ref,
-            desirable_loss: if desirable_losses.is_empty() {
-                0.0
-            } else {
-                desirable_losses.iter().sum::<f32>() / desirable_losses.len() as f32
-            },
-            undesirable_loss: if undesirable_losses.is_empty() {
-                0.0
-            } else {
-                undesirable_losses.iter().sum::<f32>() / undesirable_losses.len() as f32
-            },
+            desirable_loss,
+            undesirable_loss,
         })
     }
 
@@ -531,6 +487,213 @@ impl KtoTrainer {
     /// Increment step counter.
     pub fn increment_step(&mut self) {
         self.step += 1;
+    }
+
+    /// Run offline KTO training over binary-labeled preference data.
+    pub fn train<M, O>(
+        &mut self,
+        policy_model: &mut M,
+        mut reference_model: Option<&mut M>,
+        dataset: &[KtoSample],
+        optimizer: &mut O,
+    ) -> KtoResult<Vec<KtoMetrics>>
+    where
+        M: TrainableModel,
+        O: Optimizer,
+    {
+        if dataset.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if !self.config.reference_free && reference_model.is_none() {
+            return Err(KtoError::Config(
+                "KTO requires a reference model unless reference_free is enabled".into(),
+            ));
+        }
+
+        let batch_size = self.training_config.batch_size.max(1);
+        let num_epochs = self.training_config.num_epochs.max(1);
+        let total_steps = dataset.len().div_ceil(batch_size) * num_epochs;
+        let lr = self.training_config.learning_rate;
+
+        for callback in &mut self.callbacks {
+            callback.on_train_start();
+        }
+
+        let mut history = Vec::with_capacity(total_steps);
+
+        for epoch in 0..num_epochs {
+            for callback in &mut self.callbacks {
+                callback.on_epoch_start(epoch);
+            }
+
+            for batch in dataset.chunks(batch_size) {
+                let step_start = Instant::now();
+                let step_num = self.step + 1;
+                for callback in &mut self.callbacks {
+                    callback.on_step_start(step_num);
+                }
+
+                let (inputs, labels, desirability) = Self::batch_kto_samples(batch)?;
+                let ref_logps = if self.config.reference_free {
+                    Array::from_f32(0.0)
+                } else {
+                    let ref_model = reference_model.as_deref_mut().ok_or_else(|| {
+                        KtoError::Config("Reference model missing".into())
+                    })?;
+                    let ref_logits = ref_model
+                        .forward(&inputs, None)
+                        .map_err(|e| KtoError::Config(format!("Forward failed: {e}")))?;
+                    self.compute_log_probs(&ref_logits, &labels)?
+                };
+                let config = self.config.clone();
+                let z_ref = self.z_ref();
+                let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
+                    let logits = model
+                        .forward(&inputs, None)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    let policy_logps = Self::compute_log_probs_static(&logits, &labels)?;
+                    let rewards = if config.reference_free {
+                        policy_logps
+                    } else {
+                        policy_logps.subtract(&ref_logps)?
+                    };
+                    let (loss, _, _, _) =
+                        Self::compute_kto_loss_arrays(&config, &rewards, &desirability, z_ref)?;
+                    Ok(loss)
+                };
+
+                let (loss, grads) = {
+                    let mut loss_and_grad = nn::value_and_grad(loss_fn);
+                    loss_and_grad(policy_model, ())?
+                };
+                optimizer.update(policy_model, grads)?;
+                loss.eval()?;
+
+                let logits = policy_model
+                    .forward(&inputs, None)
+                    .map_err(|e| KtoError::Config(format!("Forward failed: {e}")))?;
+                let policy_logps = self.compute_log_probs(&logits, &labels)?;
+                let output = self.compute_kto_loss(&policy_logps, &ref_logps, &desirability)?;
+                output.rewards.eval()?;
+                let rewards = output.rewards.as_slice::<f32>().to_vec();
+                let metrics = KtoMetrics::compute(
+                    loss.item::<f32>(),
+                    &rewards,
+                    &desirability,
+                    output.z_ref as f32,
+                    output.desirable_loss,
+                    output.undesirable_loss,
+                );
+
+                self.step += 1;
+                let elapsed = step_start.elapsed().as_secs_f64();
+                let tokens = batch.iter().map(|sample| sample.response_ids.len()).sum::<usize>();
+                let step_metrics = StepMetrics {
+                    step: self.step,
+                    epoch,
+                    total_epochs: num_epochs,
+                    total_steps,
+                    loss: metrics.loss as f64,
+                    lr,
+                    tok_sec: if elapsed > 0.0 {
+                        tokens as f64 / elapsed
+                    } else {
+                        0.0
+                    },
+                    total_ms: elapsed * 1000.0,
+                    tokens,
+                    ..Default::default()
+                };
+                for callback in &mut self.callbacks {
+                    callback.on_step_end_with_metrics(&step_metrics);
+                }
+                history.push(metrics);
+            }
+        }
+
+        let eval = pmetal_core::EvalMetrics {
+            loss: history.last().map(|m| m.loss as f64).unwrap_or(0.0),
+            perplexity: 0.0,
+            accuracy: None,
+            custom: std::collections::HashMap::new(),
+        };
+        for callback in &mut self.callbacks {
+            callback.on_epoch_end(num_epochs.saturating_sub(1), &eval);
+            callback.on_train_end();
+        }
+
+        Ok(history)
+    }
+
+    fn batch_kto_samples(batch: &[KtoSample]) -> Result<(Array, Array, Vec<bool>), Exception> {
+        let inputs: Vec<Vec<u32>> = batch.iter().map(|sample| sample.response_ids.clone()).collect();
+        let labels: Vec<Vec<i64>> = batch.iter().map(|sample| sample.labels.clone()).collect();
+        let desirability = batch.iter().map(|sample| sample.is_desirable).collect();
+        Ok((
+            pad_u32_sequences(&inputs, 0)?,
+            pad_i64_sequences(&labels, -100)?,
+            desirability,
+        ))
+    }
+
+    fn compute_log_probs_static(logits: &Array, labels: &Array) -> Result<Array, Exception> {
+        let seq_len = logits.dim(1);
+        let pred_logits = logits.index((.., ..seq_len - 1, ..));
+        let target_labels = labels.index((.., 1..));
+        let (per_token_logps, _valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
+        per_token_logps.sum_axes(&[1i32], false)
+    }
+
+    fn compute_kto_loss_arrays(
+        config: &KtoConfig,
+        rewards: &Array,
+        is_desirable: &[bool],
+        z_ref: f64,
+    ) -> Result<(Array, Array, f32, f32), Exception> {
+        let batch_size = is_desirable.len();
+        let desirable_mask_values: Vec<f32> = is_desirable
+            .iter()
+            .map(|&value| if value { 1.0 } else { 0.0 })
+            .collect();
+        let desirable_mask = Array::from_slice(&desirable_mask_values, &[batch_size as i32]);
+        let undesirable_mask = Array::from_f32(1.0).subtract(&desirable_mask)?;
+
+        let z_ref_arr = Array::from_f32(z_ref as f32);
+        let desirable_logits =
+            z_ref_arr.subtract(&rewards.multiply(&Array::from_f32(config.effective_beta_desirable() as f32))?)?;
+        let undesirable_logits =
+            rewards.multiply(&Array::from_f32(config.effective_beta_undesirable() as f32))?
+                .subtract(&z_ref_arr)?;
+
+        let desirable_losses = mlx_rs::ops::sigmoid(&desirable_logits)?
+            .multiply(&Array::from_f32(config.desirable_weight as f32))?
+            .multiply(&desirable_mask)?;
+        let undesirable_losses = mlx_rs::ops::sigmoid(&undesirable_logits)?
+            .multiply(&Array::from_f32(config.undesirable_weight as f32))?
+            .multiply(&undesirable_mask)?;
+        let total_losses = desirable_losses.add(&undesirable_losses)?;
+        let mean_loss = total_losses.mean(None)?;
+        mean_loss.eval()?;
+
+        let desirable_count = desirable_mask.sum(None)?;
+        let undesirable_count = undesirable_mask.sum(None)?;
+        let desirable_count_safe =
+            mlx_rs::ops::maximum(&desirable_count, &Array::from_f32(1.0))?;
+        let undesirable_count_safe =
+            mlx_rs::ops::maximum(&undesirable_count, &Array::from_f32(1.0))?;
+        let desirable_loss = desirable_losses
+            .sum(None)?
+            .divide(&desirable_count_safe)?
+            .item::<f32>();
+        let undesirable_loss = undesirable_losses
+            .sum(None)?
+            .divide(&undesirable_count_safe)?
+            .item::<f32>();
+
+        let scaled_rewards = rewards.multiply(&Array::from_f32(config.beta as f32))?;
+        Ok((mean_loss, scaled_rewards, desirable_loss, undesirable_loss))
     }
 }
 

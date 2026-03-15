@@ -11,18 +11,10 @@
     { value: 'sft', label: 'SFT', description: 'Supervised Fine-Tuning on instruction/chat data' },
     { value: 'lora', label: 'LoRA', description: 'Low-Rank Adaptation — parameter-efficient SFT' },
     { value: 'qlora', label: 'QLoRA', description: 'Quantized LoRA for reduced memory usage (4-bit)' },
-    { value: 'dpo', label: 'DPO', description: 'Direct Preference Optimization' },
-    { value: 'simpo', label: 'SimPO', description: 'Simple Preference Optimization with length normalization' },
-    { value: 'orpo', label: 'ORPO', description: 'Odds-Ratio Preference Optimization (no reference model)' },
-    { value: 'kto', label: 'KTO', description: 'Kahneman-Tversky Optimization — binary feedback' },
   ];
 
-  const dpoLossTypes = ['sigmoid', 'hinge', 'ipo'];
   const lrSchedulers = ['cosine', 'linear', 'constant', 'cosine_with_restarts', 'polynomial'];
   const datasetFormats = ['auto', 'alpaca', 'sharegpt', 'hf', 'jsonl'];
-
-  // Preference optimization methods (use paired data, no sequence packing)
-  const preferenceOptMethods = ['dpo', 'simpo', 'orpo', 'kto'];
 
   // Form state
   let selectedModel = $state('');
@@ -58,20 +50,6 @@
   let fusedOptimizer = $state(false);
   let embeddingLr = $state(0.0);
 
-  // Method-specific params
-  // DPO
-  let dpoBeta = $state(0.1);
-  let dpoLossType = $state('sigmoid');
-  let refModel = $state('');
-  // SimPO
-  let simpoBeta = $state(2.5);
-  let simpoGamma = $state(0.5);
-  // ORPO
-  let orpoLambda = $state(0.1);
-  // KTO
-  let ktoDesirableWeight = $state(1.0);
-  let ktoUndesirableWeight = $state(1.0);
-
   // UI state
   let showAdvanced = $state(false);
   let showPmetalOpts = $state(true);
@@ -94,7 +72,6 @@
   let selectedRun = $derived(runs.find(r => r.id === selectedRunId) ?? null);
   // PMetal always uses LoRA; show config for all methods except bare SFT
   let isLoraMethod = $derived(selectedMethod !== 'sft');
-  let isPreferenceMethods = $derived(preferenceOptMethods.includes(selectedMethod));
 
   onMount(() => {
     // Deep-link: pre-select model from query param
@@ -146,17 +123,8 @@
         save_steps: saveSteps,
         logging_steps: loggingSteps,
         lr_scheduler: lrScheduler,
-        sequence_packing: isPreferenceMethods ? null : sequencePacking,
+        sequence_packing: sequencePacking,
         resume_from: resumeFrom || null,
-        // Method-specific
-        dpo_beta: selectedMethod === 'dpo' ? dpoBeta : null,
-        dpo_loss_type: selectedMethod === 'dpo' ? dpoLossType : null,
-        ref_model: (selectedMethod === 'dpo') ? (refModel || null) : null,
-        simpo_beta: selectedMethod === 'simpo' ? simpoBeta : null,
-        simpo_gamma: selectedMethod === 'simpo' ? simpoGamma : null,
-        orpo_lambda: selectedMethod === 'orpo' ? orpoLambda : null,
-        kto_desirable_weight: selectedMethod === 'kto' ? ktoDesirableWeight : null,
-        kto_undesirable_weight: selectedMethod === 'kto' ? ktoUndesirableWeight : null,
       };
 
       const runId = await trainingStore.start(config);
@@ -347,95 +315,6 @@
           </div>
         {/if}
 
-        <!-- Method-specific Parameters -->
-        {#if selectedMethod === 'dpo'}
-          <div class="card">
-            <div class="card-header">
-              <h3 class="font-semibold text-surface-900 dark:text-surface-100">DPO Parameters</h3>
-            </div>
-            <div class="card-body space-y-4">
-              <div class="grid grid-cols-2 gap-4">
-                <div>
-                  <label class="label" for="dpo-beta">Beta</label>
-                  <input id="dpo-beta" type="number" class="input" step="0.01" min="0" bind:value={dpoBeta} />
-                  <p class="text-xs text-surface-500 mt-1">KL penalty coefficient (default 0.1)</p>
-                </div>
-                <div>
-                  <label class="label" for="dpo-loss-type">Loss Type</label>
-                  <select id="dpo-loss-type" class="input" bind:value={dpoLossType}>
-                    {#each dpoLossTypes as lt}
-                      <option value={lt}>{lt}</option>
-                    {/each}
-                  </select>
-                </div>
-              </div>
-              <div>
-                <label class="label" for="ref-model">Reference Model (optional)</label>
-                <select id="ref-model" class="input" bind:value={refModel}>
-                  <option value="">Same as base model (implicit reference)</option>
-                  {#each models as model}
-                    <option value={model.id}>{model.id}</option>
-                  {/each}
-                </select>
-                <p class="text-xs text-surface-500 mt-1">Leave empty to use the base model as implicit reference</p>
-              </div>
-            </div>
-          </div>
-        {:else if selectedMethod === 'simpo'}
-          <div class="card">
-            <div class="card-header">
-              <h3 class="font-semibold text-surface-900 dark:text-surface-100">SimPO Parameters</h3>
-            </div>
-            <div class="card-body">
-              <div class="grid grid-cols-2 gap-4">
-                <div>
-                  <label class="label" for="simpo-beta">Beta</label>
-                  <input id="simpo-beta" type="number" class="input" step="0.1" min="0" bind:value={simpoBeta} />
-                  <p class="text-xs text-surface-500 mt-1">Reward scaling (default 2.5)</p>
-                </div>
-                <div>
-                  <label class="label" for="simpo-gamma">Gamma</label>
-                  <input id="simpo-gamma" type="number" class="input" step="0.05" min="0" bind:value={simpoGamma} />
-                  <p class="text-xs text-surface-500 mt-1">Margin target reward (default 0.5)</p>
-                </div>
-              </div>
-            </div>
-          </div>
-        {:else if selectedMethod === 'orpo'}
-          <div class="card">
-            <div class="card-header">
-              <h3 class="font-semibold text-surface-900 dark:text-surface-100">ORPO Parameters</h3>
-            </div>
-            <div class="card-body">
-              <div>
-                <label class="label" for="orpo-lambda">Lambda</label>
-                <input id="orpo-lambda" type="number" class="input max-w-[200px]" step="0.01" min="0" bind:value={orpoLambda} />
-                <p class="text-xs text-surface-500 mt-1">Odds-ratio loss weight (default 0.1)</p>
-              </div>
-            </div>
-          </div>
-        {:else if selectedMethod === 'kto'}
-          <div class="card">
-            <div class="card-header">
-              <h3 class="font-semibold text-surface-900 dark:text-surface-100">KTO Parameters</h3>
-            </div>
-            <div class="card-body">
-              <div class="grid grid-cols-2 gap-4">
-                <div>
-                  <label class="label" for="kto-desirable">Desirable Weight</label>
-                  <input id="kto-desirable" type="number" class="input" step="0.1" min="0" bind:value={ktoDesirableWeight} />
-                  <p class="text-xs text-surface-500 mt-1">Weight for preferred completions</p>
-                </div>
-                <div>
-                  <label class="label" for="kto-undesirable">Undesirable Weight</label>
-                  <input id="kto-undesirable" type="number" class="input" step="0.1" min="0" bind:value={ktoUndesirableWeight} />
-                  <p class="text-xs text-surface-500 mt-1">Weight for rejected completions</p>
-                </div>
-              </div>
-            </div>
-          </div>
-        {/if}
-
         <!-- Training Hyperparameters -->
         <div class="card">
           <div class="card-header">
@@ -558,15 +437,13 @@
                     <p class="text-xs text-surface-500 mt-0.5">Reduce memory usage</p>
                   </div>
                 </label>
-                {#if !isPreferenceMethods}
-                  <label class="flex items-start gap-3 cursor-pointer">
-                    <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={sequencePacking} />
-                    <div>
-                      <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Sequence Packing</span>
-                      <p class="text-xs text-surface-500 mt-0.5">Pack short sequences</p>
-                    </div>
-                  </label>
-                {/if}
+                <label class="flex items-start gap-3 cursor-pointer">
+                  <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={sequencePacking} />
+                  <div>
+                    <span class="text-sm font-medium text-surface-700 dark:text-surface-300">Sequence Packing</span>
+                    <p class="text-xs text-surface-500 mt-0.5">Pack short sequences</p>
+                  </div>
+                </label>
                 <label class="flex items-start gap-3 cursor-pointer">
                   <input type="checkbox" class="mt-0.5 rounded border-surface-300" bind:checked={flashAttention} />
                   <div>

@@ -87,6 +87,7 @@ pub mod online_dpo;
 pub mod orpo;
 pub mod param_groups;
 pub mod ppo;
+mod preference_batch;
 pub mod reasoning_template;
 pub mod schedule_free;
 pub mod scheduler;

@@ -23,9 +23,15 @@
 use mlx_rs::Array;
 use mlx_rs::Dtype;
 use mlx_rs::error::Exception;
+use mlx_rs::nn;
 use mlx_rs::ops::indexing::IndexOp;
-use pmetal_core::TrainingConfig;
+use mlx_rs::optimizers::Optimizer;
+use pmetal_core::{StepMetrics, TrainingCallback, TrainingConfig};
+use pmetal_lora::TrainableModel;
+use std::time::Instant;
 use tracing;
+
+use crate::preference_batch::{pad_i64_sequences, pad_u32_sequences};
 
 /// Error type for DPO training.
 #[derive(Debug, thiserror::Error)]
@@ -252,6 +258,7 @@ pub struct DpoTrainer {
     pub training_config: TrainingConfig,
     /// Current training step.
     step: usize,
+    callbacks: Vec<Box<dyn TrainingCallback>>,
 }
 
 impl DpoTrainer {
@@ -262,7 +269,13 @@ impl DpoTrainer {
             config,
             training_config,
             step: 0,
+            callbacks: Vec::new(),
         })
+    }
+
+    /// Add a training callback.
+    pub fn add_callback(&mut self, callback: Box<dyn TrainingCallback>) {
+        self.callbacks.push(callback);
     }
 
     /// Compute log probabilities for a sequence.
@@ -562,6 +575,363 @@ impl DpoTrainer {
     /// Increment step counter.
     pub fn increment_step(&mut self) {
         self.step += 1;
+    }
+
+    /// Run offline DPO training over a preference dataset.
+    pub fn train<M, O>(
+        &mut self,
+        policy_model: &mut M,
+        mut reference_model: Option<&mut M>,
+        dataset: &[PreferencePair],
+        optimizer: &mut O,
+    ) -> DpoResult<Vec<DpoMetrics>>
+    where
+        M: TrainableModel,
+        O: Optimizer,
+    {
+        if dataset.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if !self.config.reference_free
+            && !self.config.use_stop_gradient_reference
+            && reference_model.is_none()
+        {
+            return Err(DpoError::Config(
+                "DPO requires a frozen reference model unless reference_free or stop_gradient_reference is enabled".into(),
+            ));
+        }
+
+        let batch_size = self.training_config.batch_size.max(1);
+        let num_epochs = self.training_config.num_epochs.max(1);
+        let total_steps = dataset.len().div_ceil(batch_size) * num_epochs;
+        let lr = self.training_config.learning_rate;
+
+        for callback in &mut self.callbacks {
+            callback.on_train_start();
+        }
+
+        let mut history = Vec::with_capacity(total_steps);
+
+        for epoch in 0..num_epochs {
+            for callback in &mut self.callbacks {
+                callback.on_epoch_start(epoch);
+            }
+
+            for batch in dataset.chunks(batch_size) {
+                let step_start = Instant::now();
+                let step_num = self.step + 1;
+                for callback in &mut self.callbacks {
+                    callback.on_step_start(step_num);
+                }
+
+                let (chosen_inputs, chosen_labels, rejected_inputs, rejected_labels) =
+                    Self::batch_preference_pairs(batch)?;
+
+                let (loss_value, metrics) = if self.config.use_stop_gradient_reference {
+                    let config = self.config.clone();
+                    let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
+                        let chosen_logits = model
+                            .forward(&chosen_inputs, None)
+                            .map_err(|e| Exception::custom(e.to_string()))?;
+                        let rejected_logits = model
+                            .forward(&rejected_inputs, None)
+                            .map_err(|e| Exception::custom(e.to_string()))?;
+
+                        let chosen_policy_logps = Self::compute_log_probs_static(
+                            &chosen_logits,
+                            &chosen_labels,
+                            matches!(config.loss_type, DpoLossType::SimPo),
+                        )?;
+                        let rejected_policy_logps = Self::compute_log_probs_static(
+                            &rejected_logits,
+                            &rejected_labels,
+                            matches!(config.loss_type, DpoLossType::SimPo),
+                        )?;
+                        let chosen_ref_logps = mlx_rs::stop_gradient(&chosen_policy_logps)?;
+                        let rejected_ref_logps = mlx_rs::stop_gradient(&rejected_policy_logps)?;
+                        let (loss, _, _) = Self::compute_dpo_loss_static(
+                            &config,
+                            &chosen_policy_logps,
+                            &rejected_policy_logps,
+                            &chosen_ref_logps,
+                            &rejected_ref_logps,
+                        )?;
+                        Ok(loss)
+                    };
+
+                    let (loss, grads) = {
+                        let mut loss_and_grad = nn::value_and_grad(loss_fn);
+                        loss_and_grad(policy_model, ())?
+                    };
+                    optimizer.update(policy_model, grads)?;
+                    loss.eval()?;
+
+                    let chosen_logits = policy_model
+                        .forward(&chosen_inputs, None)
+                        .map_err(|e| DpoError::Config(format!("Forward failed: {e}")))?;
+                    let rejected_logits = policy_model
+                        .forward(&rejected_inputs, None)
+                        .map_err(|e| DpoError::Config(format!("Forward failed: {e}")))?;
+                    let chosen_policy_logps = Self::compute_log_probs_static(
+                        &chosen_logits,
+                        &chosen_labels,
+                        matches!(self.config.loss_type, DpoLossType::SimPo),
+                    )?;
+                    let rejected_policy_logps = Self::compute_log_probs_static(
+                        &rejected_logits,
+                        &rejected_labels,
+                        matches!(self.config.loss_type, DpoLossType::SimPo),
+                    )?;
+                    let chosen_ref_logps = mlx_rs::stop_gradient(&chosen_policy_logps)?;
+                    let rejected_ref_logps = mlx_rs::stop_gradient(&rejected_policy_logps)?;
+                    let (_loss_arr, chosen_rewards, rejected_rewards) = Self::compute_dpo_loss_static(
+                        &self.config,
+                        &chosen_policy_logps,
+                        &rejected_policy_logps,
+                        &chosen_ref_logps,
+                        &rejected_ref_logps,
+                    )?;
+                    chosen_rewards.eval()?;
+                    rejected_rewards.eval()?;
+                    let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
+                    let rejected_rewards_vec = rejected_rewards.as_slice::<f32>().to_vec();
+                    let metrics =
+                        DpoMetrics::compute(loss.item::<f32>(), &chosen_rewards_vec, &rejected_rewards_vec);
+                    (loss.item::<f32>(), metrics)
+                } else {
+                    let (ref_chosen_logps, ref_rejected_logps) = if self.config.reference_free {
+                        (Array::from_f32(0.0), Array::from_f32(0.0))
+                    } else {
+                        self.precompute_reference_log_probs(
+                            reference_model.as_deref_mut().ok_or_else(|| {
+                                DpoError::Config("Reference model missing".into())
+                            })?,
+                            &chosen_inputs,
+                            &chosen_labels,
+                            &rejected_inputs,
+                            &rejected_labels,
+                        )?
+                    };
+
+                    let config = self.config.clone();
+                    let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
+                        let chosen_logits = model
+                            .forward(&chosen_inputs, None)
+                            .map_err(|e| Exception::custom(e.to_string()))?;
+                        let rejected_logits = model
+                            .forward(&rejected_inputs, None)
+                            .map_err(|e| Exception::custom(e.to_string()))?;
+
+                        let chosen_policy_logps = Self::compute_log_probs_static(
+                            &chosen_logits,
+                            &chosen_labels,
+                            matches!(config.loss_type, DpoLossType::SimPo),
+                        )?;
+                        let rejected_policy_logps = Self::compute_log_probs_static(
+                            &rejected_logits,
+                            &rejected_labels,
+                            matches!(config.loss_type, DpoLossType::SimPo),
+                        )?;
+                        let (loss, _, _) = Self::compute_dpo_loss_static(
+                            &config,
+                            &chosen_policy_logps,
+                            &rejected_policy_logps,
+                            &ref_chosen_logps,
+                            &ref_rejected_logps,
+                        )?;
+                        Ok(loss)
+                    };
+
+                    let (loss, grads) = {
+                        let mut loss_and_grad = nn::value_and_grad(loss_fn);
+                        loss_and_grad(policy_model, ())?
+                    };
+                    optimizer.update(policy_model, grads)?;
+                    loss.eval()?;
+
+                    let chosen_logits = policy_model
+                        .forward(&chosen_inputs, None)
+                        .map_err(|e| DpoError::Config(format!("Forward failed: {e}")))?;
+                    let rejected_logits = policy_model
+                        .forward(&rejected_inputs, None)
+                        .map_err(|e| DpoError::Config(format!("Forward failed: {e}")))?;
+                    let chosen_policy_logps = Self::compute_log_probs_static(
+                        &chosen_logits,
+                        &chosen_labels,
+                        matches!(self.config.loss_type, DpoLossType::SimPo),
+                    )?;
+                    let rejected_policy_logps = Self::compute_log_probs_static(
+                        &rejected_logits,
+                        &rejected_labels,
+                        matches!(self.config.loss_type, DpoLossType::SimPo),
+                    )?;
+                    let (_loss_arr, chosen_rewards, rejected_rewards) = Self::compute_dpo_loss_static(
+                        &self.config,
+                        &chosen_policy_logps,
+                        &rejected_policy_logps,
+                        &ref_chosen_logps,
+                        &ref_rejected_logps,
+                    )?;
+                    chosen_rewards.eval()?;
+                    rejected_rewards.eval()?;
+                    let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
+                    let rejected_rewards_vec = rejected_rewards.as_slice::<f32>().to_vec();
+                    let metrics =
+                        DpoMetrics::compute(loss.item::<f32>(), &chosen_rewards_vec, &rejected_rewards_vec);
+                    (loss.item::<f32>(), metrics)
+                };
+
+                self.step += 1;
+                let elapsed = step_start.elapsed().as_secs_f64();
+                let tokens = batch
+                    .iter()
+                    .map(|pair| pair.chosen_ids.len() + pair.rejected_ids.len())
+                    .sum::<usize>();
+                let step_metrics = StepMetrics {
+                    step: self.step,
+                    epoch,
+                    total_epochs: num_epochs,
+                    total_steps,
+                    loss: loss_value as f64,
+                    lr,
+                    tok_sec: if elapsed > 0.0 {
+                        tokens as f64 / elapsed
+                    } else {
+                        0.0
+                    },
+                    total_ms: elapsed * 1000.0,
+                    tokens,
+                    ..Default::default()
+                };
+                for callback in &mut self.callbacks {
+                    callback.on_step_end_with_metrics(&step_metrics);
+                }
+                history.push(metrics);
+            }
+        }
+
+        let eval = pmetal_core::EvalMetrics {
+            loss: history.last().map(|m| m.loss as f64).unwrap_or(0.0),
+            perplexity: 0.0,
+            accuracy: history.last().map(|m| m.accuracy as f64),
+            custom: std::collections::HashMap::new(),
+        };
+        for callback in &mut self.callbacks {
+            callback.on_epoch_end(num_epochs.saturating_sub(1), &eval);
+            callback.on_train_end();
+        }
+
+        Ok(history)
+    }
+
+    fn batch_preference_pairs(
+        batch: &[PreferencePair],
+    ) -> Result<(Array, Array, Array, Array), Exception> {
+        let chosen_inputs: Vec<Vec<u32>> = batch.iter().map(|pair| pair.chosen_ids.clone()).collect();
+        let chosen_labels: Vec<Vec<i64>> =
+            batch.iter().map(|pair| pair.chosen_labels.clone()).collect();
+        let rejected_inputs: Vec<Vec<u32>> =
+            batch.iter().map(|pair| pair.rejected_ids.clone()).collect();
+        let rejected_labels: Vec<Vec<i64>> =
+            batch.iter().map(|pair| pair.rejected_labels.clone()).collect();
+
+        Ok((
+            pad_u32_sequences(&chosen_inputs, 0)?,
+            pad_i64_sequences(&chosen_labels, -100)?,
+            pad_u32_sequences(&rejected_inputs, 0)?,
+            pad_i64_sequences(&rejected_labels, -100)?,
+        ))
+    }
+
+    fn compute_log_probs_static(
+        logits: &Array,
+        labels: &Array,
+        normalized: bool,
+    ) -> Result<Array, Exception> {
+        let seq_len = logits.dim(1);
+        let pred_logits = logits.index((.., ..seq_len - 1, ..));
+        let target_labels = labels.index((.., 1..));
+        let (per_token_logps, valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
+        let token_sum = per_token_logps.sum_axes(&[1i32], false)?;
+        if !normalized {
+            return Ok(token_sum);
+        }
+
+        let valid_count_raw = valid_mask
+            .as_dtype(Dtype::Float32)?
+            .sum_axes(&[1i32], false)?;
+        let valid_count = mlx_rs::ops::maximum(&valid_count_raw, &Array::from_f32(1.0))?;
+        token_sum.divide(&valid_count)
+    }
+
+    fn compute_dpo_loss_static(
+        config: &DpoConfig,
+        policy_chosen_logps: &Array,
+        policy_rejected_logps: &Array,
+        ref_chosen_logps: &Array,
+        ref_rejected_logps: &Array,
+    ) -> Result<(Array, Array, Array), Exception> {
+        let reference_free = config.reference_free || matches!(config.loss_type, DpoLossType::SimPo);
+        let chosen_rewards = if reference_free {
+            policy_chosen_logps.clone()
+        } else {
+            policy_chosen_logps.subtract(ref_chosen_logps)?
+        };
+        let rejected_rewards = if reference_free {
+            policy_rejected_logps.clone()
+        } else {
+            policy_rejected_logps.subtract(ref_rejected_logps)?
+        };
+
+        let reward_diff = chosen_rewards.subtract(&rejected_rewards)?;
+        let beta = Array::from_f32(config.beta as f32);
+        let logits = if matches!(config.loss_type, DpoLossType::SimPo) {
+            reward_diff
+                .multiply(&beta)?
+                .subtract(&Array::from_f32(config.simpo_gamma as f32))?
+        } else {
+            reward_diff.multiply(&beta)?
+        };
+
+        let loss = match config.loss_type {
+            DpoLossType::Sigmoid | DpoLossType::SimPo => {
+                let mut loss = nn::softplus(&logits.negative()?)?;
+                if config.label_smoothing > 0.0 {
+                    let smooth = Array::from_f32(config.label_smoothing as f32);
+                    let flipped = nn::softplus(&logits)?;
+                    loss = loss
+                        .multiply(&Array::from_f32(1.0 - config.label_smoothing as f32))?
+                        .add(&flipped.multiply(&smooth)?)?;
+                }
+                loss
+            }
+            DpoLossType::Ipo => {
+                let target = Array::from_f32((1.0 / (2.0 * config.beta)) as f32);
+                logits.subtract(&target)?.square()?
+            }
+            DpoLossType::Hinge => {
+                mlx_rs::ops::maximum(
+                    &Array::from_f32(1.0).subtract(&logits)?,
+                    &Array::from_f32(0.0),
+                )?
+            }
+            DpoLossType::Robust => {
+                let sigmoid = nn::softplus(&logits.negative()?)?;
+                let hinge = mlx_rs::ops::maximum(
+                    &Array::from_f32(0.5).subtract(&logits)?,
+                    &Array::from_f32(0.0),
+                )?;
+                sigmoid.add(&hinge.multiply(&Array::from_f32(0.5))?)?
+            }
+        };
+
+        Ok((
+            loss.mean(None)?,
+            chosen_rewards.multiply(&beta)?,
+            rejected_rewards.multiply(&beta)?,
+        ))
     }
 
     /// Pre-compute reference log probabilities for an entire dataset.

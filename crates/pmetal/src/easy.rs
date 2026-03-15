@@ -34,11 +34,12 @@
 
 use std::path::{Path, PathBuf};
 
-use pmetal_core::{LoraConfig, PMetalError, Result, TrainingConfig};
+use pmetal_core::{LoraConfig, PMetalError, Result, TrainingCallback, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
 use pmetal_lora::{DynamicLoraModel, TrainableModel};
-use pmetal_models::{DynamicModel, GenerationConfig, generate_cached_async};
-use pmetal_trainer::{CheckpointManager, TrainingLoop, TrainingLoopConfig};
+use pmetal_mlx::Builder as _;
+use pmetal_models::{DynamicModel, GenerationConfig, generate_cached_async, generate_cached_async_streaming};
+use pmetal_trainer::{CheckpointManager, MetricsJsonCallback, TrainingLoop, TrainingLoopConfig};
 
 /// Map any Display error to `PMetalError::Training`.
 fn training_err(e: impl std::fmt::Display) -> PMetalError {
@@ -96,12 +97,55 @@ pub fn finetune(model: impl Into<String>, dataset: impl Into<String>) -> Finetun
     FinetuneBuilder::new(model.into(), dataset.into())
 }
 
+/// Create a DPO fine-tuning builder.
+pub fn dpo(model: impl Into<String>, dataset: impl Into<String>) -> PreferenceTuneBuilder {
+    PreferenceTuneBuilder::new(
+        model.into(),
+        dataset.into(),
+        PreferenceMethod::Dpo(pmetal_trainer::DpoConfig::default()),
+    )
+}
+
+/// Create a SimPO fine-tuning builder.
+pub fn simpo(model: impl Into<String>, dataset: impl Into<String>) -> PreferenceTuneBuilder {
+    PreferenceTuneBuilder::new(
+        model.into(),
+        dataset.into(),
+        PreferenceMethod::Simpo(pmetal_trainer::SimpoConfig::default()),
+    )
+}
+
+/// Create an ORPO fine-tuning builder.
+pub fn orpo(model: impl Into<String>, dataset: impl Into<String>) -> PreferenceTuneBuilder {
+    PreferenceTuneBuilder::new(
+        model.into(),
+        dataset.into(),
+        PreferenceMethod::Orpo(pmetal_trainer::OrpoConfig::default()),
+    )
+}
+
+/// Create a KTO fine-tuning builder.
+pub fn kto(model: impl Into<String>, dataset: impl Into<String>) -> PreferenceTuneBuilder {
+    PreferenceTuneBuilder::new(
+        model.into(),
+        dataset.into(),
+        PreferenceMethod::Kto(pmetal_trainer::KtoConfig::default()),
+    )
+}
+
 /// Create an inference builder for the given model.
 ///
 /// # Arguments
 /// * `model` - HuggingFace model ID (e.g., `"Qwen/Qwen3-0.6B"`) or local path
 pub fn infer(model: impl Into<String>) -> InferBuilder {
     InferBuilder::new(model.into())
+}
+
+enum PreferenceMethod {
+    Dpo(pmetal_trainer::DpoConfig),
+    Simpo(pmetal_trainer::SimpoConfig),
+    Orpo(pmetal_trainer::OrpoConfig),
+    Kto(pmetal_trainer::KtoConfig),
 }
 
 /// Builder for fine-tuning a model with LoRA.
@@ -119,12 +163,17 @@ pub struct FinetuneBuilder {
     num_epochs: usize,
     max_seq_len: usize,
     output_dir: String,
+    lora_dropout: f32,
+    use_rslora: bool,
+    use_dora: bool,
     flash_attention: bool,
     sequence_packing: bool,
     gradient_checkpointing: bool,
     gradient_checkpointing_layers: usize,
     metal_fused_optimizer: bool,
     embedding_lr: Option<f32>,
+    callbacks: Vec<Box<dyn TrainingCallback>>,
+    metrics_path: Option<PathBuf>,
 }
 
 impl FinetuneBuilder {
@@ -140,12 +189,17 @@ impl FinetuneBuilder {
             num_epochs: 3,
             max_seq_len: 2048,
             output_dir: "./output".to_string(),
+            lora_dropout: 0.0,
+            use_rslora: false,
+            use_dora: false,
             flash_attention: true,
             sequence_packing: true,
             gradient_checkpointing: false,
             gradient_checkpointing_layers: 4,
             metal_fused_optimizer: false,
             embedding_lr: None,
+            callbacks: Vec::new(),
+            metrics_path: None,
         }
     }
 
@@ -186,6 +240,24 @@ impl FinetuneBuilder {
         self
     }
 
+    /// Set LoRA dropout.
+    pub fn lora_dropout(mut self, dropout: f32) -> Self {
+        self.lora_dropout = dropout;
+        self
+    }
+
+    /// Enable rank-stabilized LoRA.
+    pub fn use_rslora(mut self, enabled: bool) -> Self {
+        self.use_rslora = enabled;
+        self
+    }
+
+    /// Enable DoRA adapters.
+    pub fn use_dora(mut self, enabled: bool) -> Self {
+        self.use_dora = enabled;
+        self
+    }
+
     /// Set evaluation dataset path.
     pub fn eval_dataset(mut self, path: impl Into<String>) -> Self {
         self.eval_dataset_path = Some(path.into());
@@ -210,6 +282,12 @@ impl FinetuneBuilder {
         self
     }
 
+    /// Set layers per gradient checkpoint block.
+    pub fn gradient_checkpointing_layers(mut self, layers: usize) -> Self {
+        self.gradient_checkpointing_layers = layers;
+        self
+    }
+
     /// Enable or disable Metal fused optimizer.
     pub fn metal_fused_optimizer(mut self, enabled: bool) -> Self {
         self.metal_fused_optimizer = enabled;
@@ -219,6 +297,18 @@ impl FinetuneBuilder {
     /// Set separate learning rate for embedding layers.
     pub fn embedding_lr(mut self, lr: f32) -> Self {
         self.embedding_lr = Some(lr);
+        self
+    }
+
+    /// Add a training callback.
+    pub fn callback(mut self, callback: Box<dyn TrainingCallback>) -> Self {
+        self.callbacks.push(callback);
+        self
+    }
+
+    /// Write training metrics to JSONL at the given path.
+    pub fn metrics_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.metrics_path = Some(path.into());
         self
     }
 
@@ -262,6 +352,9 @@ impl FinetuneBuilder {
         let lora_config = LoraConfig {
             r: self.lora_r,
             alpha: self.lora_alpha,
+            dropout: self.lora_dropout,
+            use_rslora: self.use_rslora,
+            use_dora: self.use_dora,
             ..Default::default()
         };
 
@@ -312,9 +405,21 @@ impl FinetuneBuilder {
         };
 
         let mut training_loop = TrainingLoop::new(training_loop_config);
+        let use_sequence_packing = self.sequence_packing;
+
+        if let Some(metrics_path) = &self.metrics_path {
+            let callback = MetricsJsonCallback::new(metrics_path)
+                .map_err(training_err)?
+                .with_run_name(self.model_id.replace('/', "-"));
+            training_loop.add_callback(Box::new(callback));
+        }
+
+        for callback in self.callbacks {
+            training_loop.add_callback(callback);
+        }
 
         // Run training (sequence packing by default)
-        let model = if self.sequence_packing {
+        let model = if use_sequence_packing {
             training_loop
                 .run_packed(
                     model,
@@ -346,6 +451,510 @@ impl FinetuneBuilder {
             final_loss: training_loop.current_loss(),
             total_steps: training_loop.current_step(),
             total_tokens: training_loop.total_tokens(),
+            output_dir,
+            lora_weights_path,
+        })
+    }
+}
+
+/// Builder for preference optimization methods such as DPO, SimPO, ORPO, and KTO.
+pub struct PreferenceTuneBuilder {
+    model_id: String,
+    dataset_path: String,
+    reference_model_id: Option<String>,
+    method: PreferenceMethod,
+    lora_r: usize,
+    lora_alpha: f32,
+    lora_dropout: f32,
+    use_rslora: bool,
+    use_dora: bool,
+    learning_rate: f64,
+    batch_size: usize,
+    num_epochs: usize,
+    output_dir: String,
+    gradient_checkpointing: bool,
+    gradient_checkpointing_layers: usize,
+    callbacks: Vec<Box<dyn TrainingCallback>>,
+    metrics_path: Option<PathBuf>,
+}
+
+impl PreferenceTuneBuilder {
+    fn new(model_id: String, dataset_path: String, method: PreferenceMethod) -> Self {
+        Self {
+            model_id,
+            dataset_path,
+            reference_model_id: None,
+            method,
+            lora_r: 16,
+            lora_alpha: 32.0,
+            lora_dropout: 0.0,
+            use_rslora: false,
+            use_dora: false,
+            learning_rate: 5e-6,
+            batch_size: 1,
+            num_epochs: 1,
+            output_dir: "./output".to_string(),
+            gradient_checkpointing: false,
+            gradient_checkpointing_layers: 4,
+            callbacks: Vec::new(),
+            metrics_path: None,
+        }
+    }
+
+    /// Set the reference model to use for DPO/KTO or SimPO+CPO.
+    pub fn reference_model(mut self, model: impl Into<String>) -> Self {
+        self.reference_model_id = Some(model.into());
+        self
+    }
+
+    /// Set LoRA rank and alpha.
+    pub fn lora(mut self, r: usize, alpha: f32) -> Self {
+        self.lora_r = r;
+        self.lora_alpha = alpha;
+        self
+    }
+
+    /// Set LoRA dropout.
+    pub fn lora_dropout(mut self, dropout: f32) -> Self {
+        self.lora_dropout = dropout;
+        self
+    }
+
+    /// Enable rank-stabilized LoRA.
+    pub fn use_rslora(mut self, enabled: bool) -> Self {
+        self.use_rslora = enabled;
+        self
+    }
+
+    /// Enable DoRA adapters.
+    pub fn use_dora(mut self, enabled: bool) -> Self {
+        self.use_dora = enabled;
+        self
+    }
+
+    /// Set learning rate.
+    pub fn learning_rate(mut self, lr: f64) -> Self {
+        self.learning_rate = lr;
+        self
+    }
+
+    /// Set batch size.
+    pub fn batch_size(mut self, n: usize) -> Self {
+        self.batch_size = n;
+        self
+    }
+
+    /// Set number of epochs.
+    pub fn epochs(mut self, n: usize) -> Self {
+        self.num_epochs = n;
+        self
+    }
+
+    /// Set output directory.
+    pub fn output(mut self, path: impl Into<String>) -> Self {
+        self.output_dir = path.into();
+        self
+    }
+
+    /// Enable or disable gradient checkpointing.
+    pub fn gradient_checkpointing(mut self, enabled: bool) -> Self {
+        self.gradient_checkpointing = enabled;
+        self
+    }
+
+    /// Set layers per gradient checkpoint block.
+    pub fn gradient_checkpointing_layers(mut self, layers: usize) -> Self {
+        self.gradient_checkpointing_layers = layers;
+        self
+    }
+
+    /// Add a training callback.
+    pub fn callback(mut self, callback: Box<dyn TrainingCallback>) -> Self {
+        self.callbacks.push(callback);
+        self
+    }
+
+    /// Write training metrics to JSONL at the given path.
+    pub fn metrics_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.metrics_path = Some(path.into());
+        self
+    }
+
+    /// Set DPO beta.
+    pub fn dpo_beta(mut self, beta: f64) -> Self {
+        if let PreferenceMethod::Dpo(config) = &mut self.method {
+            config.beta = beta;
+        }
+        self
+    }
+
+    /// Set DPO loss type.
+    pub fn dpo_loss_type(mut self, loss_type: pmetal_trainer::DpoLossType) -> Self {
+        if let PreferenceMethod::Dpo(config) = &mut self.method {
+            config.loss_type = loss_type;
+        }
+        self
+    }
+
+    /// Enable DPO reference-free mode.
+    pub fn dpo_reference_free(mut self, enabled: bool) -> Self {
+        if let PreferenceMethod::Dpo(config) = &mut self.method {
+            config.reference_free = enabled;
+        }
+        self
+    }
+
+    /// Set SimPO beta.
+    pub fn simpo_beta(mut self, beta: f64) -> Self {
+        if let PreferenceMethod::Simpo(config) = &mut self.method {
+            config.beta = beta;
+        }
+        self
+    }
+
+    /// Set SimPO gamma.
+    pub fn simpo_gamma(mut self, gamma: f64) -> Self {
+        if let PreferenceMethod::Simpo(config) = &mut self.method {
+            config.gamma = gamma;
+        }
+        self
+    }
+
+    /// Enable SimPO CPO regularization.
+    pub fn simpo_cpo(mut self, alpha: f64) -> Self {
+        if let PreferenceMethod::Simpo(config) = &mut self.method {
+            config.cpo_alpha = alpha;
+        }
+        self
+    }
+
+    /// Set ORPO beta.
+    pub fn orpo_beta(mut self, beta: f64) -> Self {
+        if let PreferenceMethod::Orpo(config) = &mut self.method {
+            config.beta = beta;
+        }
+        self
+    }
+
+    /// Set KTO beta.
+    pub fn kto_beta(mut self, beta: f64) -> Self {
+        if let PreferenceMethod::Kto(config) = &mut self.method {
+            config.beta = beta;
+        }
+        self
+    }
+
+    /// Set KTO desirable weight.
+    pub fn kto_desirable_weight(mut self, weight: f64) -> Self {
+        if let PreferenceMethod::Kto(config) = &mut self.method {
+            config.desirable_weight = weight;
+        }
+        self
+    }
+
+    /// Set KTO undesirable weight.
+    pub fn kto_undesirable_weight(mut self, weight: f64) -> Self {
+        if let PreferenceMethod::Kto(config) = &mut self.method {
+            config.undesirable_weight = weight;
+        }
+        self
+    }
+
+    /// Enable KTO reference-free mode.
+    pub fn kto_reference_free(mut self, enabled: bool) -> Self {
+        if let PreferenceMethod::Kto(config) = &mut self.method {
+            config.reference_free = enabled;
+        }
+        self
+    }
+
+    /// Run the preference optimization pipeline.
+    pub async fn run(self) -> Result<FinetuneResult> {
+        let Self {
+            model_id,
+            dataset_path,
+            reference_model_id,
+            method,
+            lora_r,
+            lora_alpha,
+            lora_dropout,
+            use_rslora,
+            use_dora,
+            learning_rate,
+            batch_size,
+            num_epochs,
+            output_dir,
+            gradient_checkpointing,
+            gradient_checkpointing_layers,
+            callbacks,
+            metrics_path,
+        } = self;
+
+        let model_path = resolve_model_path(&model_id).await?;
+        let tokenizer = Tokenizer::from_model_dir(&model_path).map_err(|e| {
+            PMetalError::ModelLoad(format!("Failed to load tokenizer from {model_path:?}: {e}"))
+        })?;
+
+        let lora_config = LoraConfig {
+            r: lora_r,
+            alpha: lora_alpha,
+            dropout: lora_dropout,
+            use_rslora,
+            use_dora,
+            ..Default::default()
+        };
+        let mut model =
+            DynamicLoraModel::from_pretrained(&model_path, lora_config.clone()).map_err(model_err)?;
+        if gradient_checkpointing && model.supports_gradient_checkpointing() {
+            model.enable_gradient_checkpointing(gradient_checkpointing_layers);
+        }
+
+        let output_dir = PathBuf::from(&output_dir);
+        std::fs::create_dir_all(&output_dir).map_err(training_err)?;
+        let metrics_path = metrics_path.unwrap_or_else(|| output_dir.join("metrics.jsonl"));
+        let mut extra_callbacks = Some(callbacks);
+
+        let (final_loss, total_steps, total_tokens) = match method {
+            PreferenceMethod::Dpo(config) => {
+                let dataset = load_dpo_dataset(
+                    &dataset_path,
+                    &tokenizer,
+                    config.max_prompt_length,
+                    config.max_completion_length,
+                    config.truncate_prompt_left,
+                )?;
+                let total_steps = dataset.len().div_ceil(batch_size.max(1)) * num_epochs.max(1);
+                let total_tokens = dataset
+                    .iter()
+                    .map(|pair| pair.chosen_ids.len() + pair.rejected_ids.len())
+                    .sum();
+                let reference_path = reference_model_id
+                    .clone()
+                    .unwrap_or_else(|| model_id.clone());
+                let mut reference_model = if config.reference_free || config.use_stop_gradient_reference {
+                    None
+                } else {
+                    Some(
+                        DynamicLoraModel::from_pretrained(
+                            &resolve_model_path(&reference_path).await?,
+                            LoraConfig { r: 0, ..Default::default() },
+                        )
+                        .map_err(model_err)?,
+                    )
+                };
+                let mut trainer = pmetal_trainer::DpoTrainer::new(
+                    config,
+                    TrainingConfig {
+                        learning_rate,
+                        batch_size,
+                        num_epochs,
+                        output_dir: output_dir.display().to_string(),
+                        ..Default::default()
+                    },
+                )
+                .map_err(training_err)?;
+                let metrics_cb = MetricsJsonCallback::new(&metrics_path)
+                    .map_err(training_err)?
+                    .with_run_name(format!("dpo-{}", model_id.replace('/', "-")));
+                trainer.add_callback(Box::new(metrics_cb));
+                if let Some(callbacks) = extra_callbacks.take() {
+                    for callback in callbacks {
+                        trainer.add_callback(callback);
+                    }
+                }
+                let mut optimizer = mlx_rs::optimizers::AdamWBuilder::new(learning_rate as f32)
+                    .build()
+                    .map_err(training_err)?;
+                let history = trainer
+                    .train(&mut model, reference_model.as_mut(), &dataset, &mut optimizer)
+                    .map_err(training_err)?;
+                (
+                    history.last().map(|m| m.loss as f64).unwrap_or(0.0),
+                    total_steps,
+                    total_tokens,
+                )
+            }
+            PreferenceMethod::Simpo(config) => {
+                let dataset = load_simpo_dataset(
+                    &dataset_path,
+                    &tokenizer,
+                    config.max_prompt_length,
+                    config.max_seq_length.saturating_sub(config.max_prompt_length),
+                )?;
+                let total_steps = dataset.len().div_ceil(batch_size.max(1)) * num_epochs.max(1);
+                let total_tokens = dataset
+                    .iter()
+                    .map(|pair| pair.prompt_ids.len() + pair.chosen_ids.len() + pair.rejected_ids.len())
+                    .sum();
+                let reference_path = reference_model_id
+                    .clone()
+                    .unwrap_or_else(|| model_id.clone());
+                let mut reference_model = if config.cpo_alpha > 0.0 {
+                    Some(
+                        DynamicLoraModel::from_pretrained(
+                            &resolve_model_path(&reference_path).await?,
+                            LoraConfig { r: 0, ..Default::default() },
+                        )
+                        .map_err(model_err)?,
+                    )
+                } else {
+                    None
+                };
+                let mut trainer = pmetal_trainer::SimpoTrainer::new(
+                    config,
+                    TrainingConfig {
+                        learning_rate,
+                        batch_size,
+                        num_epochs,
+                        output_dir: output_dir.display().to_string(),
+                        ..Default::default()
+                    },
+                )
+                .map_err(training_err)?;
+                let metrics_cb = MetricsJsonCallback::new(&metrics_path)
+                    .map_err(training_err)?
+                    .with_run_name(format!("simpo-{}", model_id.replace('/', "-")));
+                trainer.add_callback(Box::new(metrics_cb));
+                if let Some(callbacks) = extra_callbacks.take() {
+                    for callback in callbacks {
+                        trainer.add_callback(callback);
+                    }
+                }
+                let mut optimizer = mlx_rs::optimizers::AdamWBuilder::new(learning_rate as f32)
+                    .build()
+                    .map_err(training_err)?;
+                let history = trainer
+                    .train(&mut model, reference_model.as_mut(), &dataset, &mut optimizer)
+                    .map_err(training_err)?;
+                (
+                    history.last().map(|m| m.loss as f64).unwrap_or(0.0),
+                    total_steps,
+                    total_tokens,
+                )
+            }
+            PreferenceMethod::Orpo(config) => {
+                let dataset = load_dpo_dataset(
+                    &dataset_path,
+                    &tokenizer,
+                    config.max_prompt_length,
+                    config.max_completion_length,
+                    config.truncate_prompt_left,
+                )?;
+                let total_steps = dataset.len().div_ceil(batch_size.max(1)) * num_epochs.max(1);
+                let total_tokens = dataset
+                    .iter()
+                    .map(|pair| pair.chosen_ids.len() + pair.rejected_ids.len())
+                    .sum();
+                let mut trainer = pmetal_trainer::OrpoTrainer::new(
+                    config,
+                    TrainingConfig {
+                        learning_rate,
+                        batch_size,
+                        num_epochs,
+                        output_dir: output_dir.display().to_string(),
+                        ..Default::default()
+                    },
+                )
+                .map_err(training_err)?;
+                let metrics_cb = MetricsJsonCallback::new(&metrics_path)
+                    .map_err(training_err)?
+                    .with_run_name(format!("orpo-{}", model_id.replace('/', "-")));
+                trainer.add_callback(Box::new(metrics_cb));
+                if let Some(callbacks) = extra_callbacks.take() {
+                    for callback in callbacks {
+                        trainer.add_callback(callback);
+                    }
+                }
+                let mut optimizer = mlx_rs::optimizers::AdamWBuilder::new(learning_rate as f32)
+                    .build()
+                    .map_err(training_err)?;
+                let history = trainer
+                    .train(&mut model, &dataset, &mut optimizer)
+                    .map_err(training_err)?;
+                (
+                    history.last().map(|m| m.loss as f64).unwrap_or(0.0),
+                    total_steps,
+                    total_tokens,
+                )
+            }
+            PreferenceMethod::Kto(config) => {
+                let dataset = load_kto_dataset(
+                    &dataset_path,
+                    &tokenizer,
+                    config.max_prompt_length,
+                    config.max_completion_length,
+                    config.truncate_prompt_left,
+                )?;
+                let total_steps = dataset.len().div_ceil(batch_size.max(1)) * num_epochs.max(1);
+                let total_tokens = dataset.iter().map(|sample| sample.response_ids.len()).sum();
+                let reference_path = reference_model_id
+                    .clone()
+                    .unwrap_or_else(|| model_id.clone());
+                let mut reference_model = if config.reference_free {
+                    None
+                } else {
+                    Some(
+                        DynamicLoraModel::from_pretrained(
+                            &resolve_model_path(&reference_path).await?,
+                            LoraConfig { r: 0, ..Default::default() },
+                        )
+                        .map_err(model_err)?,
+                    )
+                };
+                let mut trainer = pmetal_trainer::KtoTrainer::new(
+                    config,
+                    TrainingConfig {
+                        learning_rate,
+                        batch_size,
+                        num_epochs,
+                        output_dir: output_dir.display().to_string(),
+                        ..Default::default()
+                    },
+                )
+                .map_err(training_err)?;
+                let metrics_cb = MetricsJsonCallback::new(&metrics_path)
+                    .map_err(training_err)?
+                    .with_run_name(format!("kto-{}", model_id.replace('/', "-")));
+                trainer.add_callback(Box::new(metrics_cb));
+                if let Some(callbacks) = extra_callbacks.take() {
+                    for callback in callbacks {
+                        trainer.add_callback(callback);
+                    }
+                }
+                let mut optimizer = mlx_rs::optimizers::AdamWBuilder::new(learning_rate as f32)
+                    .build()
+                    .map_err(training_err)?;
+                let history = trainer
+                    .train(&mut model, reference_model.as_mut(), &dataset, &mut optimizer)
+                    .map_err(training_err)?;
+                (
+                    history.last().map(|m| m.loss as f64).unwrap_or(0.0),
+                    total_steps,
+                    total_tokens,
+                )
+            }
+        };
+
+        let lora_weights_path = output_dir.join("lora_weights.safetensors");
+        model
+            .save_lora_weights(&lora_weights_path)
+            .map_err(training_err)?;
+        let adapter_config = serde_json::json!({
+            "r": lora_config.r,
+            "alpha": lora_config.alpha,
+            "target_modules": lora_config.target_modules,
+            "use_rslora": lora_config.use_rslora,
+        });
+        std::fs::write(
+            output_dir.join("adapter_config.json"),
+            serde_json::to_string_pretty(&adapter_config).map_err(training_err)?,
+        )
+        .map_err(training_err)?;
+
+        Ok(FinetuneResult {
+            final_loss,
+            total_steps,
+            total_tokens,
             output_dir,
             lora_weights_path,
         })
@@ -422,6 +1031,12 @@ impl InferBuilder {
     /// Set max tokens to generate.
     pub fn max_tokens(mut self, n: usize) -> Self {
         self.max_tokens = n;
+        self
+    }
+
+    /// Set repetition penalty.
+    pub fn repetition_penalty(mut self, penalty: f32) -> Self {
+        self.repetition_penalty = penalty;
         self
     }
 
@@ -513,6 +1128,76 @@ impl InferBuilder {
         })
     }
 
+    /// Generate text while streaming decoded deltas to the callback.
+    ///
+    /// Return `false` from the callback to stop generation early.
+    pub async fn generate_streaming<F>(self, prompt: &str, mut on_delta: F) -> Result<InferResult>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        // ANE currently uses the non-streaming engine. Emit the final result once.
+        #[cfg(feature = "ane")]
+        if matches!(self.device, Some(pmetal_core::Device::Ane)) {
+            let result = self.generate(prompt).await?;
+            if !result.text.is_empty() {
+                let _ = on_delta(&result.text);
+            }
+            return Ok(result);
+        }
+
+        let model_path = resolve_model_path(&self.model_id).await?;
+        let tokenizer = Tokenizer::from_model_dir(&model_path).map_err(|e| {
+            PMetalError::ModelLoad(format!("Failed to load tokenizer from {model_path:?}: {e}"))
+        })?;
+
+        if let Some(lora_path) = &self.lora_path {
+            return self.generate_with_lora_streaming(&model_path, lora_path, &tokenizer, prompt, &mut on_delta);
+        }
+
+        let mut model = DynamicModel::load(&model_path).map_err(mlx_err)?;
+
+        if self.fp8 {
+            model.quantize_fp8().map_err(mlx_err)?;
+        }
+
+        let input_ids = tokenizer.encode(prompt)?;
+        let gen_config = self.build_gen_config(&tokenizer);
+        let max_seq_len = input_ids.len() + self.max_tokens + 64;
+        let mut cache = model.create_cache(max_seq_len);
+
+        let start = std::time::Instant::now();
+        let mut token_buf: Vec<u32> = Vec::new();
+        let mut streamed_text = String::new();
+
+        let output = generate_cached_async_streaming(
+            |input, cache| model.forward_with_hybrid_cache(input, None, Some(cache), None),
+            &input_ids,
+            gen_config,
+            &mut cache,
+            |token_id| {
+                token_buf.push(token_id);
+                if let Ok(text) = tokenizer.decode(&token_buf) {
+                    if text.len() > streamed_text.len() {
+                        let delta = &text[streamed_text.len()..];
+                        if !delta.is_empty() && !on_delta(delta) {
+                            return false;
+                        }
+                    }
+                    streamed_text = text;
+                }
+                true
+            },
+        )
+        .map_err(mlx_err)?;
+        let elapsed = start.elapsed();
+
+        Ok(InferResult {
+            text: streamed_text,
+            tokens_generated: output.num_generated,
+            tokens_per_sec: output.num_generated as f64 / elapsed.as_secs_f64(),
+        })
+    }
+
     /// Inference with LoRA adapter.
     fn generate_with_lora(
         &self,
@@ -554,6 +1239,67 @@ impl InferBuilder {
 
         Ok(InferResult {
             text,
+            tokens_generated: output.num_generated,
+            tokens_per_sec: output.num_generated as f64 / elapsed.as_secs_f64(),
+        })
+    }
+
+    fn generate_with_lora_streaming<F>(
+        &self,
+        model_path: &Path,
+        lora_path: &str,
+        tokenizer: &Tokenizer,
+        prompt: &str,
+        on_delta: &mut F,
+    ) -> Result<InferResult>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let lora_config = LoraConfig::default();
+        let mut model =
+            DynamicLoraModel::from_pretrained(model_path, lora_config).map_err(model_err)?;
+        model.load_lora_weights(lora_path).map_err(model_err)?;
+
+        let input_ids = tokenizer.encode(prompt)?;
+        let gen_config = self.build_gen_config(tokenizer);
+
+        let max_seq_len = input_ids.len() + self.max_tokens + 64;
+        let mut cache = model.create_cache(max_seq_len).ok_or_else(|| {
+            PMetalError::NotImplemented("Model does not support KV cache".to_string())
+        })?;
+
+        let start = std::time::Instant::now();
+        let mut token_buf: Vec<u32> = Vec::new();
+        let mut streamed_text = String::new();
+
+        let output = generate_cached_async_streaming(
+            |input, cache| {
+                model
+                    .forward_with_cache(input, None, Some(cache))
+                    .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
+            },
+            &input_ids,
+            gen_config,
+            &mut cache,
+            |token_id| {
+                token_buf.push(token_id);
+                if let Ok(text) = tokenizer.decode(&token_buf) {
+                    if text.len() > streamed_text.len() {
+                        let delta = &text[streamed_text.len()..];
+                        if !delta.is_empty() && !on_delta(delta) {
+                            return false;
+                        }
+                    }
+                    streamed_text = text;
+                }
+                true
+            },
+        )
+        .map_err(mlx_err)?;
+        let elapsed = start.elapsed();
+
+        Ok(InferResult {
+            text: streamed_text,
             tokens_generated: output.num_generated,
             tokens_per_sec: output.num_generated as f64 / elapsed.as_secs_f64(),
         })
@@ -754,6 +1500,188 @@ impl InferBuilder {
 
         config
     }
+}
+
+fn read_jsonl_objects(path: &str) -> Result<Vec<serde_json::Value>> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path).map_err(training_err)?;
+    let reader = std::io::BufReader::new(file);
+    let mut rows = Vec::new();
+    for line in reader.lines() {
+        let line = line.map_err(training_err)?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        rows.push(serde_json::from_str(&line).map_err(training_err)?);
+    }
+    Ok(rows)
+}
+
+fn extract_first_string<'a>(
+    value: &'a serde_json::Value,
+    fields: &[&str],
+) -> Option<&'a str> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
+}
+
+fn encode_segment(
+    tokenizer: &Tokenizer,
+    text: &str,
+    max_len: usize,
+    truncate_left: bool,
+    append_eos: bool,
+) -> Result<Vec<u32>> {
+    let mut ids = tokenizer.encode(text)?;
+    if append_eos {
+        if let Some(eos) = tokenizer.eos_token_id() {
+            if ids.last().copied() != Some(eos) {
+                ids.push(eos);
+            }
+        }
+    }
+    if ids.len() > max_len {
+        ids = if truncate_left {
+            ids[ids.len() - max_len..].to_vec()
+        } else {
+            ids[..max_len].to_vec()
+        };
+    }
+    Ok(ids)
+}
+
+fn load_dpo_dataset(
+    path: &str,
+    tokenizer: &Tokenizer,
+    max_prompt_length: usize,
+    max_completion_length: usize,
+    truncate_prompt_left: bool,
+) -> Result<Vec<pmetal_trainer::dpo::PreferencePair>> {
+    let rows = read_jsonl_objects(path)?;
+    let mut pairs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let prompt = extract_first_string(&row, &["prompt", "instruction", "input"])
+            .ok_or_else(|| PMetalError::Training("Preference row missing prompt".into()))?;
+        let chosen = extract_first_string(
+            &row,
+            &["chosen", "accepted", "preferred", "chosen_response", "output_chosen"],
+        )
+        .ok_or_else(|| PMetalError::Training("Preference row missing chosen response".into()))?;
+        let rejected = extract_first_string(
+            &row,
+            &[
+                "rejected",
+                "rejected_response",
+                "dispreferred",
+                "output_rejected",
+            ],
+        )
+        .ok_or_else(|| PMetalError::Training("Preference row missing rejected response".into()))?;
+
+        let prompt_ids = encode_segment(
+            tokenizer,
+            prompt,
+            max_prompt_length,
+            truncate_prompt_left,
+            false,
+        )?;
+        let chosen_ids = encode_segment(tokenizer, chosen, max_completion_length, false, true)?;
+        let rejected_ids = encode_segment(tokenizer, rejected, max_completion_length, false, true)?;
+        pairs.push(pmetal_trainer::dpo::PreferencePair::new(
+            prompt_ids,
+            chosen_ids,
+            rejected_ids,
+        ));
+    }
+    Ok(pairs)
+}
+
+fn load_simpo_dataset(
+    path: &str,
+    tokenizer: &Tokenizer,
+    max_prompt_length: usize,
+    max_completion_length: usize,
+) -> Result<Vec<pmetal_trainer::simpo::PreferencePair>> {
+    let rows = read_jsonl_objects(path)?;
+    let mut pairs = Vec::with_capacity(rows.len());
+    for row in rows {
+        let prompt = extract_first_string(&row, &["prompt", "instruction", "input"])
+            .ok_or_else(|| PMetalError::Training("Preference row missing prompt".into()))?;
+        let chosen = extract_first_string(
+            &row,
+            &["chosen", "accepted", "preferred", "chosen_response", "output_chosen"],
+        )
+        .ok_or_else(|| PMetalError::Training("Preference row missing chosen response".into()))?;
+        let rejected = extract_first_string(
+            &row,
+            &[
+                "rejected",
+                "rejected_response",
+                "dispreferred",
+                "output_rejected",
+            ],
+        )
+        .ok_or_else(|| PMetalError::Training("Preference row missing rejected response".into()))?;
+
+        let prompt_ids = encode_segment(tokenizer, prompt, max_prompt_length, true, false)?;
+        let chosen_ids = encode_segment(tokenizer, chosen, max_completion_length, false, true)?;
+        let rejected_ids = encode_segment(tokenizer, rejected, max_completion_length, false, true)?;
+        pairs.push(pmetal_trainer::simpo::PreferencePair::new(
+            prompt_ids,
+            chosen_ids,
+            rejected_ids,
+        ));
+    }
+    Ok(pairs)
+}
+
+fn load_kto_dataset(
+    path: &str,
+    tokenizer: &Tokenizer,
+    max_prompt_length: usize,
+    max_completion_length: usize,
+    truncate_prompt_left: bool,
+) -> Result<Vec<pmetal_trainer::KtoSample>> {
+    let rows = read_jsonl_objects(path)?;
+    let mut samples = Vec::with_capacity(rows.len());
+    for row in rows {
+        let prompt = extract_first_string(&row, &["prompt", "instruction", "input"])
+            .ok_or_else(|| PMetalError::Training("KTO row missing prompt".into()))?;
+        let response = extract_first_string(&row, &["completion", "response", "output", "answer"])
+            .ok_or_else(|| PMetalError::Training("KTO row missing response".into()))?;
+        let label = row
+            .get("label")
+            .or_else(|| row.get("rating"))
+            .or_else(|| row.get("chosen"))
+            .ok_or_else(|| PMetalError::Training("KTO row missing label".into()))?;
+
+        let is_desirable = match label {
+            serde_json::Value::Bool(value) => *value,
+            serde_json::Value::Number(value) => value.as_i64().unwrap_or_default() > 0,
+            serde_json::Value::String(value) => matches!(
+                value.to_ascii_lowercase().as_str(),
+                "desirable" | "good" | "preferred" | "true" | "yes" | "1"
+            ),
+            _ => false,
+        };
+
+        let prompt_ids = encode_segment(
+            tokenizer,
+            prompt,
+            max_prompt_length,
+            truncate_prompt_left,
+            false,
+        )?;
+        let response_ids = encode_segment(tokenizer, response, max_completion_length, false, true)?;
+        samples.push(pmetal_trainer::KtoSample::new(
+            prompt_ids,
+            response_ids,
+            is_desirable,
+        ));
+    }
+    Ok(samples)
 }
 
 /// Resolve a model ID to a local path, downloading from HuggingFace Hub if necessary.

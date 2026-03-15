@@ -29,8 +29,14 @@
 
 use mlx_rs::Array;
 use mlx_rs::error::Exception;
+use mlx_rs::nn;
 use mlx_rs::ops::indexing::IndexOp;
-use pmetal_core::TrainingConfig;
+use mlx_rs::optimizers::Optimizer;
+use pmetal_core::{StepMetrics, TrainingCallback, TrainingConfig};
+use pmetal_lora::TrainableModel;
+use std::time::Instant;
+
+use crate::preference_batch::{pad_f32_sequences, pad_i64_sequences, pad_u32_sequences};
 
 /// Error type for SimPO training.
 #[derive(Debug, thiserror::Error)]
@@ -211,6 +217,7 @@ pub struct SimpoTrainer {
     pub training_config: TrainingConfig,
     /// Current step.
     step: usize,
+    callbacks: Vec<Box<dyn TrainingCallback>>,
 }
 
 impl SimpoTrainer {
@@ -221,7 +228,13 @@ impl SimpoTrainer {
             config,
             training_config,
             step: 0,
+            callbacks: Vec::new(),
         })
+    }
+
+    /// Add a training callback.
+    pub fn add_callback(&mut self, callback: Box<dyn TrainingCallback>) {
+        self.callbacks.push(callback);
     }
 
     /// Compute per-token log probabilities.
@@ -465,6 +478,273 @@ impl SimpoTrainer {
     /// Increment step.
     pub fn increment_step(&mut self) {
         self.step += 1;
+    }
+
+    /// Run offline SimPO training over a preference dataset.
+    pub fn train<M, O>(
+        &mut self,
+        policy_model: &mut M,
+        mut reference_model: Option<&mut M>,
+        dataset: &[PreferencePair],
+        optimizer: &mut O,
+    ) -> SimpoResult<Vec<SimpoMetrics>>
+    where
+        M: TrainableModel,
+        O: Optimizer,
+    {
+        if dataset.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        if self.config.cpo_alpha > 0.0 && reference_model.is_none() {
+            return Err(SimpoError::Config(
+                "SimPO with CPO regularization requires a reference model".into(),
+            ));
+        }
+
+        let batch_size = self.training_config.batch_size.max(1);
+        let num_epochs = self.training_config.num_epochs.max(1);
+        let total_steps = dataset.len().div_ceil(batch_size) * num_epochs;
+        let lr = self.training_config.learning_rate;
+
+        for callback in &mut self.callbacks {
+            callback.on_train_start();
+        }
+
+        let mut history = Vec::with_capacity(total_steps);
+
+        for epoch in 0..num_epochs {
+            for callback in &mut self.callbacks {
+                callback.on_epoch_start(epoch);
+            }
+
+            for batch in dataset.chunks(batch_size) {
+                let step_start = Instant::now();
+                let step_num = self.step + 1;
+                for callback in &mut self.callbacks {
+                    callback.on_step_start(step_num);
+                }
+
+                let (
+                    chosen_inputs,
+                    chosen_labels,
+                    chosen_mask_full,
+                    rejected_inputs,
+                    rejected_labels,
+                    rejected_mask_full,
+                ) = Self::batch_preference_pairs(batch)?;
+                let chosen_mask = chosen_mask_full.index((.., 1..));
+                let rejected_mask = rejected_mask_full.index((.., 1..));
+                let ref_chosen_logps = if self.config.cpo_alpha > 0.0 {
+                    let ref_model = reference_model.as_deref_mut().ok_or_else(|| {
+                        SimpoError::Config("Reference model missing".into())
+                    })?;
+                    let ref_logits = ref_model
+                        .forward(&chosen_inputs, None)
+                        .map_err(|e| SimpoError::Config(format!("Forward failed: {e}")))?;
+                    Some(self.compute_log_probs(&ref_logits, &chosen_labels, &chosen_mask_full)?)
+                } else {
+                    None
+                };
+
+                let config = self.config.clone();
+                let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
+                    let chosen_logits = model
+                        .forward(&chosen_inputs, None)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    let rejected_logits = model
+                        .forward(&rejected_inputs, None)
+                        .map_err(|e| Exception::custom(e.to_string()))?;
+
+                    let chosen_logps = Self::compute_log_probs_static(
+                        &chosen_logits,
+                        &chosen_labels,
+                        &chosen_mask_full,
+                    )?;
+                    let rejected_logps = Self::compute_log_probs_static(
+                        &rejected_logits,
+                        &rejected_labels,
+                        &rejected_mask_full,
+                    )?;
+                    let (loss, _metrics) = Self::compute_loss_with_cpo_static(
+                        &config,
+                        &chosen_logps,
+                        &rejected_logps,
+                        &chosen_mask,
+                        &rejected_mask,
+                        ref_chosen_logps.as_ref(),
+                    )?;
+                    Ok(loss)
+                };
+
+                let (loss, grads) = {
+                    let mut loss_and_grad = nn::value_and_grad(loss_fn);
+                    loss_and_grad(policy_model, ())?
+                };
+                optimizer.update(policy_model, grads)?;
+                loss.eval()?;
+
+                let chosen_logits = policy_model
+                    .forward(&chosen_inputs, None)
+                    .map_err(|e| SimpoError::Config(format!("Forward failed: {e}")))?;
+                let rejected_logits = policy_model
+                    .forward(&rejected_inputs, None)
+                    .map_err(|e| SimpoError::Config(format!("Forward failed: {e}")))?;
+                let chosen_logps =
+                    self.compute_log_probs(&chosen_logits, &chosen_labels, &chosen_mask_full)?;
+                let rejected_logps =
+                    self.compute_log_probs(&rejected_logits, &rejected_labels, &rejected_mask_full)?;
+                let (_loss_arr, metrics) = self.compute_loss_with_cpo(
+                    &chosen_logps,
+                    &rejected_logps,
+                    &chosen_mask,
+                    &rejected_mask,
+                    ref_chosen_logps.as_ref(),
+                )?;
+
+                self.step += 1;
+                let elapsed = step_start.elapsed().as_secs_f64();
+                let tokens = batch
+                    .iter()
+                    .map(|pair| pair.prompt_ids.len() + pair.chosen_ids.len() + pair.rejected_ids.len())
+                    .sum::<usize>();
+                let step_metrics = StepMetrics {
+                    step: self.step,
+                    epoch,
+                    total_epochs: num_epochs,
+                    total_steps,
+                    loss: metrics.loss as f64,
+                    lr,
+                    tok_sec: if elapsed > 0.0 {
+                        tokens as f64 / elapsed
+                    } else {
+                        0.0
+                    },
+                    total_ms: elapsed * 1000.0,
+                    tokens,
+                    ..Default::default()
+                };
+                for callback in &mut self.callbacks {
+                    callback.on_step_end_with_metrics(&step_metrics);
+                }
+                history.push(metrics);
+            }
+        }
+
+        let eval = pmetal_core::EvalMetrics {
+            loss: history.last().map(|m| m.loss as f64).unwrap_or(0.0),
+            perplexity: 0.0,
+            accuracy: history.last().map(|m| m.accuracy as f64),
+            custom: std::collections::HashMap::new(),
+        };
+        for callback in &mut self.callbacks {
+            callback.on_epoch_end(num_epochs.saturating_sub(1), &eval);
+            callback.on_train_end();
+        }
+
+        Ok(history)
+    }
+
+    fn batch_preference_pairs(
+        batch: &[PreferencePair],
+    ) -> Result<(Array, Array, Array, Array, Array, Array), Exception> {
+        let chosen_inputs: Vec<Vec<u32>> = batch
+            .iter()
+            .map(|pair| {
+                let mut full = pair.prompt_ids.clone();
+                full.extend(pair.chosen_ids.iter().copied());
+                full
+            })
+            .collect();
+        let chosen_labels: Vec<Vec<i64>> = batch
+            .iter()
+            .map(|pair| {
+                let mut labels = vec![-100_i64; pair.prompt_ids.len()];
+                labels.extend(pair.chosen_ids.iter().map(|&id| id as i64));
+                labels
+            })
+            .collect();
+        let chosen_masks: Vec<Vec<f32>> = batch
+            .iter()
+            .map(|pair| {
+                let mut mask = vec![0.0_f32; pair.prompt_ids.len()];
+                mask.extend(std::iter::repeat_n(1.0_f32, pair.chosen_ids.len()));
+                mask
+            })
+            .collect();
+        let rejected_inputs: Vec<Vec<u32>> = batch
+            .iter()
+            .map(|pair| {
+                let mut full = pair.prompt_ids.clone();
+                full.extend(pair.rejected_ids.iter().copied());
+                full
+            })
+            .collect();
+        let rejected_labels: Vec<Vec<i64>> = batch
+            .iter()
+            .map(|pair| {
+                let mut labels = vec![-100_i64; pair.prompt_ids.len()];
+                labels.extend(pair.rejected_ids.iter().map(|&id| id as i64));
+                labels
+            })
+            .collect();
+        let rejected_masks: Vec<Vec<f32>> = batch
+            .iter()
+            .map(|pair| {
+                let mut mask = vec![0.0_f32; pair.prompt_ids.len()];
+                mask.extend(std::iter::repeat_n(1.0_f32, pair.rejected_ids.len()));
+                mask
+            })
+            .collect();
+
+        Ok((
+            pad_u32_sequences(&chosen_inputs, 0)?,
+            pad_i64_sequences(&chosen_labels, -100)?,
+            pad_f32_sequences(&chosen_masks, 0.0)?,
+            pad_u32_sequences(&rejected_inputs, 0)?,
+            pad_i64_sequences(&rejected_labels, -100)?,
+            pad_f32_sequences(&rejected_masks, 0.0)?,
+        ))
+    }
+
+    fn compute_log_probs_static(
+        logits: &Array,
+        labels: &Array,
+        mask_full: &Array,
+    ) -> Result<Array, Exception> {
+        let seq_len = logits.dim(1);
+        let pred_logits = logits.index((.., ..seq_len - 1, ..));
+        let target_labels = labels.index((.., 1..));
+        let target_mask = mask_full.index((.., 1..));
+        let (logps_array, _valid_mask) =
+            crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
+        let target_mask_f32 = target_mask.as_dtype(mlx_rs::Dtype::Float32)?;
+        logps_array.multiply(&target_mask_f32)
+    }
+
+    fn compute_loss_with_cpo_static(
+        config: &SimpoConfig,
+        chosen_logps: &Array,
+        rejected_logps: &Array,
+        chosen_mask: &Array,
+        rejected_mask: &Array,
+        ref_chosen_logps: Option<&Array>,
+    ) -> Result<(Array, SimpoMetrics), Exception> {
+        let trainer = Self {
+            config: config.clone(),
+            training_config: TrainingConfig::default(),
+            step: 0,
+            callbacks: Vec::new(),
+        };
+        trainer
+            .compute_loss_with_cpo(
+                chosen_logps,
+                rejected_logps,
+                chosen_mask,
+                rejected_mask,
+                ref_chosen_logps,
+            )
+            .map_err(|e| Exception::custom(e.to_string()))
     }
 }
 

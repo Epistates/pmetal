@@ -539,6 +539,12 @@ export function onInferenceDone(callback: () => void): Promise<UnlistenFn> {
   });
 }
 
+export function onInferenceError(callback: (message: string) => void): Promise<UnlistenFn> {
+  return listen<{ session_id?: string; error?: string }>('inference-error', (event) => {
+    callback(event.payload?.error ?? 'Inference failed');
+  });
+}
+
 // =============================================================================
 // Merge API
 // =============================================================================

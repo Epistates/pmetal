@@ -357,6 +357,9 @@ pub struct AppState {
     pub active_processes: Arc<RwLock<HashMap<String, tokio::process::Child>>>,
     /// Per-run cancellation flags (run_id → cancelled).
     pub cancel_flags: Arc<RwLock<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// Active inference sessions (session_id → cancelled).
+    pub inference_cancel_flags:
+        Arc<RwLock<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
 impl AppState {
@@ -371,6 +374,7 @@ impl AppState {
             event_tx,
             active_processes: Arc::new(RwLock::new(HashMap::new())),
             cancel_flags: Arc::new(RwLock::new(HashMap::new())),
+            inference_cancel_flags: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
