@@ -280,6 +280,7 @@ impl GrpoRun {
 // Inference
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceStatus {
@@ -288,6 +289,7 @@ pub enum InferenceStatus {
     Stopped,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InferenceSession {
     pub id: String,
@@ -301,6 +303,7 @@ pub struct InferenceSession {
 // Events
 // ---------------------------------------------------------------------------
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum AppEvent {
@@ -362,6 +365,7 @@ pub struct AppState {
         Arc<RwLock<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
 }
 
+#[allow(dead_code)]
 impl AppState {
     pub fn new() -> Self {
         let (event_tx, _) = broadcast::channel(512);

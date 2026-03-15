@@ -33,7 +33,7 @@ pub fn run() {
                 cached_models: state.cached_models.clone(),
             };
 
-            tokio::spawn(async move {
+            tauri::async_runtime::spawn(async move {
                 init_state.load_config().await;
                 init_state.refresh_cached_models().await;
             });
