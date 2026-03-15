@@ -585,13 +585,9 @@ impl ChatTemplate {
                 }
                 "tool" => {
                     // Qwen merges consecutive tool responses into one user turn
-                    let is_first_tool = i == 0
-                        || non_system
-                            .get(i - 1)
-                            .is_none_or(|prev| prev.role != "tool");
-                    let is_last_tool = non_system
-                        .get(i + 1)
-                        .is_none_or(|next| next.role != "tool");
+                    let is_first_tool =
+                        i == 0 || non_system.get(i - 1).is_none_or(|prev| prev.role != "tool");
+                    let is_last_tool = non_system.get(i + 1).is_none_or(|next| next.role != "tool");
 
                     if is_first_tool {
                         text.push_str("<|im_start|>user");
