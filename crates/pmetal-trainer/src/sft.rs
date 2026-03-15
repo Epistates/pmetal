@@ -10,6 +10,7 @@ use mlx_rs::{
     Array,
     builder::Builder,
     error::Exception,
+    ops,
     ops::indexing::IndexOp,
     optimizers::{AdamW, AdamWBuilder},
 };
@@ -142,7 +143,8 @@ impl SftTrainer {
             let masked_loss = loss.multiply(&flat_mask)?;
             let total_loss = masked_loss.sum(None)?;
             let num_tokens = flat_mask.sum(None)?;
-            Ok(total_loss.divide(&num_tokens)?)
+            let safe_num_tokens = ops::maximum(&num_tokens, &Array::from_f32(1.0))?;
+            Ok(total_loss.divide(&safe_num_tokens)?)
         } else {
             Ok(loss.mean(None)?)
         }
@@ -311,38 +313,47 @@ impl SftTrainer {
         }
     }
 
-    /// Train the model (placeholder for full training loop).
+    /// Train the model.
+    ///
+    /// This legacy trainer no longer pretends to implement a full end-to-end
+    /// loop. Use [`crate::TrainingLoop`] for production training.
     pub fn train(&mut self) -> pmetal_core::Result<()> {
-        tracing::info!("Starting SFT training...");
-        tracing::info!("Learning rate: {}", self.config.learning_rate);
-        tracing::info!("Batch size: {}", self.config.batch_size);
-        tracing::info!(
-            "Gradient accumulation steps: {}",
-            self.config.gradient_accumulation_steps
-        );
-        // Full training loop would be implemented here
-        Ok(())
+        Err(pmetal_core::PMetalError::NotImplemented(
+            "SftTrainer::train is a legacy surface. Use pmetal_trainer::TrainingLoop for a complete training loop with optimizer updates, evaluation, and checkpointing.".to_string(),
+        ))
     }
 
     /// Evaluate the model.
+    ///
+    /// Use [`crate::TrainingLoop`] for production evaluation.
     pub fn evaluate(&self) -> pmetal_core::Result<EvalMetrics> {
-        Ok(EvalMetrics::default())
+        Err(pmetal_core::PMetalError::NotImplemented(
+            "SftTrainer::evaluate is not implemented on the legacy trainer surface. Use TrainingLoop evaluation instead.".to_string(),
+        ))
     }
 
     /// Save checkpoint.
+    ///
+    /// Use [`crate::CheckpointManager`] with [`crate::TrainingLoop`] for
+    /// production checkpoint persistence.
     pub fn save_checkpoint<P: AsRef<Path>>(&self, path: P) -> pmetal_core::Result<()> {
         let path = path.as_ref();
-        tracing::info!("Saving checkpoint to {:?}", path);
-        // Save training state, optimizer state, and LoRA weights
-        Ok(())
+        Err(pmetal_core::PMetalError::NotImplemented(format!(
+            "SftTrainer::save_checkpoint does not persist state for {:?}. Use CheckpointManager via TrainingLoop instead.",
+            path
+        )))
     }
 
     /// Load checkpoint.
+    ///
+    /// Use [`crate::CheckpointManager`] with [`crate::TrainingLoop`] for
+    /// production checkpoint restore.
     pub fn load_checkpoint<P: AsRef<Path>>(&mut self, path: P) -> pmetal_core::Result<()> {
         let path = path.as_ref();
-        tracing::info!("Loading checkpoint from {:?}", path);
-        // Load training state, optimizer state, and LoRA weights
-        Ok(())
+        Err(pmetal_core::PMetalError::NotImplemented(format!(
+            "SftTrainer::load_checkpoint does not restore state from {:?}. Use CheckpointManager via TrainingLoop instead.",
+            path
+        )))
     }
 }
 
@@ -370,6 +381,7 @@ pub fn lm_loss(logits: &Array, labels: &Array, ignore_index: i64) -> Result<Arra
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::ops::zeros;
 
     #[test]
     fn test_trainer_creation() {
@@ -451,5 +463,31 @@ mod tests {
         let empty_shape: &[i32] = &[];
         assert_eq!(loss.shape(), empty_shape);
         assert!(loss.item::<f32>() > 0.0);
+    }
+
+    #[test]
+    fn test_compute_loss_with_fully_masked_batch_returns_zero() {
+        let trainer = SftTrainer::new(TrainingConfig::default());
+        let logits = zeros::<f32>(&[1, 3, 8]).unwrap();
+        let labels = zeros::<i32>(&[1, 3]).unwrap();
+        let mask = zeros::<f32>(&[1, 3]).unwrap();
+
+        let loss = trainer.compute_loss(&logits, &labels, Some(&mask)).unwrap();
+        loss.eval().unwrap();
+
+        assert_eq!(loss.item::<f32>(), 0.0);
+    }
+
+    #[test]
+    fn test_legacy_train_surface_fails_explicitly() {
+        let mut trainer = SftTrainer::new(TrainingConfig::default());
+        let err = trainer.train().unwrap_err();
+
+        match err {
+            pmetal_core::PMetalError::NotImplemented(message) => {
+                assert!(message.contains("TrainingLoop"));
+            }
+            other => panic!("expected NotImplemented, got {other:?}"),
+        }
     }
 }
