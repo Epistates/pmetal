@@ -29,6 +29,59 @@ use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, r
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use serde::{Deserialize, Serialize};
 
+fn materialize_linear_weight(
+    weight: &Array,
+    weight_scale: Option<&Array>,
+) -> Result<Array, Exception> {
+    let weight = if weight.dtype() == Dtype::Uint8 {
+        mlx_rs::ops::from_fp8(weight, Dtype::Bfloat16)?
+    } else {
+        weight.clone()
+    };
+
+    if let Some(scale) = weight_scale {
+        weight.multiply(scale)
+    } else {
+        Ok(weight)
+    }
+}
+
+fn linear_forward_with_optional_fp8(
+    x: &Array,
+    weight: &Array,
+    bias: Option<&Array>,
+    weight_scale: Option<&Array>,
+) -> Result<Array, Exception> {
+    let weight = materialize_linear_weight(weight, weight_scale)?;
+    let x = if weight.dtype() == Dtype::Bfloat16 && x.dtype() != Dtype::Bfloat16 {
+        x.as_dtype(Dtype::Bfloat16)?
+    } else {
+        x.clone()
+    };
+
+    let output = x.matmul(&weight.t())?;
+    if let Some(bias) = bias {
+        output.add(bias)
+    } else {
+        Ok(output)
+    }
+}
+
+fn linear_module_forward(linear: &mut nn::Linear, x: &Array) -> Result<Array, Exception> {
+    linear_forward_with_optional_fp8(
+        x,
+        linear.weight.as_ref(),
+        linear.bias.as_ref().as_ref(),
+        None,
+    )
+}
+
+fn quantize_linear_weights_fp8(linear: &mut nn::Linear) -> Result<(), Exception> {
+    let quantized = mlx_rs::ops::to_fp8(linear.weight.as_ref())?;
+    linear.weight = Param::new(quantized);
+    Ok(())
+}
+
 // ============================================================================
 // FP8 Quantized Linear Layer
 // ============================================================================
@@ -65,24 +118,12 @@ impl QuantizedLinear {
     /// Forward pass with FP8 weight dequantization.
     /// NOTE: input_scale is NOT applied - for float inference we only dequantize weights.
     pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        // Dequantize weight if scale is present
-        let weight = if let Some(ref scale) = self.weight_scale {
-            // weight_scale is typically a scalar, broadcast multiply
-            self.weight.as_ref().multiply(scale)?
-        } else {
-            self.weight.as_ref().clone()
-        };
-
-        // Matrix multiply: [B, L, in] @ [out, in].T -> [B, L, out]
-        // NOTE: Do NOT apply input_scale - it's for FP8 dynamic quantization
-        let output = x.matmul(&weight.t())?;
-
-        // Add bias if present
-        if let Some(ref bias) = self.bias {
-            output.add(bias.as_ref())
-        } else {
-            Ok(output)
-        }
+        linear_forward_with_optional_fp8(
+            x,
+            self.weight.as_ref(),
+            self.bias.as_ref().map(Param::as_ref),
+            self.weight_scale.as_ref(),
+        )
     }
 }
 
@@ -513,26 +554,32 @@ impl Expert {
     /// Note: input_scale is NOT applied - it's for dynamic FP8 quantization which we don't use.
     /// We only dequantize weights with weight_scale for float inference.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        // Up projection with weight dequantization
-        // NOTE: Do NOT apply input_scale - that's for FP8 dynamic quantization
-        let up = if let Some(ref scale) = self.up_proj_weight_scale {
-            let weight = self.up_proj.weight.as_ref().multiply(scale)?;
-            x.matmul(&weight.t())?
-        } else {
-            Module::forward(&mut self.up_proj, x)?
-        };
+        let up = linear_forward_with_optional_fp8(
+            x,
+            self.up_proj.weight.as_ref(),
+            self.up_proj.bias.as_ref().as_ref(),
+            self.up_proj_weight_scale.as_ref(),
+        )?;
 
         // ReLU² activation
         let activated = nn::relu(&up)?.square()?;
 
-        // Down projection with weight dequantization
-        // NOTE: Do NOT apply input_scale - that's for FP8 dynamic quantization
-        if let Some(ref scale) = self.down_proj_weight_scale {
-            let weight = self.down_proj.weight.as_ref().multiply(scale)?;
-            activated.matmul(&weight.t())
-        } else {
-            Module::forward(&mut self.down_proj, &activated)
-        }
+        linear_forward_with_optional_fp8(
+            &activated,
+            self.down_proj.weight.as_ref(),
+            self.down_proj.bias.as_ref().as_ref(),
+            self.down_proj_weight_scale.as_ref(),
+        )
+    }
+
+    pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
+        quantize_linear_weights_fp8(&mut self.up_proj)?;
+        quantize_linear_weights_fp8(&mut self.down_proj)?;
+        self.up_proj_weight_scale = None;
+        self.up_proj_input_scale = None;
+        self.down_proj_weight_scale = None;
+        self.down_proj_input_scale = None;
+        Ok(())
     }
 }
 
@@ -597,7 +644,7 @@ impl MoERouter {
     /// - indices: [B*L, top_k] - indices of selected experts
     pub fn forward(&mut self, x: &Array) -> Result<(Array, Array), Exception> {
         // Compute logits: [B*L, num_experts]
-        let logits = Module::forward(&mut self.gate, x)?;
+        let logits = linear_module_forward(&mut self.gate, x)?;
 
         // Apply sigmoid (not softmax) for scoring
         let logits_f32 = logits.as_dtype(Dtype::Float32)?;
@@ -654,6 +701,10 @@ impl MoERouter {
         let weights = scores.multiply(&Array::from_f32(self.routed_scaling_factor))?;
 
         Ok((weights, inds))
+    }
+
+    pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
+        quantize_linear_weights_fp8(&mut self.gate)
     }
 }
 
@@ -799,24 +850,33 @@ impl MoELayer {
         let num_experts = self.experts.len();
 
         // Collect all up_proj weights: [hidden, intermediate] for each expert
-        let up_weights: Vec<&Array> = self
+        let up_weights: Vec<Array> = self
             .experts
             .iter()
-            .map(|e| e.up_proj.weight.as_ref())
-            .collect();
+            .map(|e| {
+                materialize_linear_weight(e.up_proj.weight.as_ref(), e.up_proj_weight_scale.as_ref())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let up_weight_refs: Vec<&Array> = up_weights.iter().collect();
 
         // Stack along new first dimension: [num_experts, intermediate, hidden]
         // Note: Linear weights are stored transposed as [out_features, in_features]
-        let stacked_up = mlx_rs::ops::stack_axis(&up_weights, 0)?;
+        let stacked_up = mlx_rs::ops::stack_axis(&up_weight_refs, 0)?;
 
         // Collect all down_proj weights: [intermediate, hidden] for each expert
-        let down_weights: Vec<&Array> = self
+        let down_weights: Vec<Array> = self
             .experts
             .iter()
-            .map(|e| e.down_proj.weight.as_ref())
-            .collect();
+            .map(|e| {
+                materialize_linear_weight(
+                    e.down_proj.weight.as_ref(),
+                    e.down_proj_weight_scale.as_ref(),
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let down_weight_refs: Vec<&Array> = down_weights.iter().collect();
 
-        let stacked_down = mlx_rs::ops::stack_axis(&down_weights, 0)?;
+        let stacked_down = mlx_rs::ops::stack_axis(&down_weight_refs, 0)?;
 
         tracing::debug!(
             "Stacked MoE weights: up={:?}, down={:?}, num_experts={}",
@@ -826,6 +886,17 @@ impl MoELayer {
         );
 
         Ok((stacked_up, stacked_down))
+    }
+
+    pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
+        self.router.quantize_fp8_weights()?;
+        for expert in &mut self.experts {
+            expert.quantize_fp8_weights()?;
+        }
+        if let Some(shared_expert) = &mut self.shared_expert {
+            shared_expert.quantize_fp8_weights()?;
+        }
+        Ok(())
     }
 
     /// Fast forward using stacked weights and gather_mm.
@@ -1523,18 +1594,12 @@ impl NemotronHMixer {
 
         // Input projection with FP8 weight dequantization
         // NOTE: Do NOT apply input_scale - that's for FP8 dynamic quantization
-        let projected = if let Some(ref ws) = self.in_proj_weight_scale {
-            // Dequantize weight and compute matmul (no input scaling for float inference)
-            let weight = in_proj.weight.as_ref().multiply(ws)?;
-            let out = x.matmul(&weight.t())?;
-            if let Some(bias) = in_proj.bias.as_ref() {
-                out.add(bias)?
-            } else {
-                out
-            }
-        } else {
-            Module::forward(in_proj, x)?
-        };
+        let projected = linear_forward_with_optional_fp8(
+            x,
+            in_proj.weight.as_ref(),
+            in_proj.bias.as_ref().as_ref(),
+            self.in_proj_weight_scale.as_ref(),
+        )?;
 
         // Use split_sections for efficient splitting (optimization #1)
         // Split at: [intermediate_size, intermediate_size + conv_dim]
@@ -1635,18 +1700,12 @@ impl NemotronHMixer {
 
         // Output projection with FP8 weight dequantization
         // NOTE: Do NOT apply input_scale - that's for FP8 dynamic quantization
-        if let Some(ref ws) = self.out_proj_weight_scale {
-            // Dequantize weight and compute matmul (no input scaling for float inference)
-            let weight = out_proj.weight.as_ref().multiply(ws)?;
-            let out = y_normed.matmul(&weight.t())?;
-            if let Some(bias) = out_proj.bias.as_ref() {
-                out.add(bias)
-            } else {
-                Ok(out)
-            }
-        } else {
-            Module::forward(out_proj, &y_normed)
-        }
+        linear_forward_with_optional_fp8(
+            &y_normed,
+            out_proj.weight.as_ref(),
+            out_proj.bias.as_ref().as_ref(),
+            self.out_proj_weight_scale.as_ref(),
+        )
     }
 
     fn forward_attention(
@@ -1665,9 +1724,9 @@ impl NemotronHMixer {
         let seq_len = shape[1];
 
         // Project Q, K, V
-        let q = Module::forward(q_proj, x)?;
-        let k = Module::forward(k_proj, x)?;
-        let v = Module::forward(v_proj, x)?;
+        let q = linear_module_forward(q_proj, x)?;
+        let k = linear_module_forward(k_proj, x)?;
+        let v = linear_module_forward(v_proj, x)?;
 
         // Reshape for multi-head attention [B, L, heads, head_dim]
         let q = q.reshape(&[batch, seq_len, self.num_heads, self.head_dim])?;
@@ -1710,17 +1769,17 @@ impl NemotronHMixer {
         let output = output
             .transpose_axes(&[0, 2, 1, 3])?
             .reshape(&[batch, seq_len, -1])?;
-        Module::forward(o_proj, &output)
+        linear_module_forward(o_proj, &output)
     }
 
     fn forward_mlp(&mut self, x: &Array) -> Result<Array, Exception> {
         let up_proj = self.up_proj.as_mut().unwrap();
         let down_proj = self.down_proj.as_mut().unwrap();
 
-        let up = Module::forward(up_proj, x)?;
+        let up = linear_module_forward(up_proj, x)?;
         // relu2 = relu(x)^2
         let activated = nn::relu(&up)?.square()?;
-        Module::forward(down_proj, &activated)
+        linear_module_forward(down_proj, &activated)
     }
 
     fn forward_moe(&mut self, x: &Array) -> Result<Array, Exception> {
@@ -1748,6 +1807,54 @@ impl NemotronHMixer {
             self.stacked_moe_down = Some(stacked_down);
             tracing::info!("Initialized stacked MoE weights for layer");
         }
+        Ok(())
+    }
+
+    pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
+        match self.block_type {
+            'M' => {
+                if let Some(in_proj) = &mut self.in_proj {
+                    quantize_linear_weights_fp8(in_proj)?;
+                }
+                if let Some(out_proj) = &mut self.out_proj {
+                    quantize_linear_weights_fp8(out_proj)?;
+                }
+                self.in_proj_weight_scale = None;
+                self.in_proj_input_scale = None;
+                self.out_proj_weight_scale = None;
+                self.out_proj_input_scale = None;
+            }
+            '*' => {
+                if let Some(q_proj) = &mut self.q_proj {
+                    quantize_linear_weights_fp8(q_proj)?;
+                }
+                if let Some(k_proj) = &mut self.k_proj {
+                    quantize_linear_weights_fp8(k_proj)?;
+                }
+                if let Some(v_proj) = &mut self.v_proj {
+                    quantize_linear_weights_fp8(v_proj)?;
+                }
+                if let Some(o_proj) = &mut self.o_proj {
+                    quantize_linear_weights_fp8(o_proj)?;
+                }
+            }
+            '-' => {
+                if let Some(up_proj) = &mut self.up_proj {
+                    quantize_linear_weights_fp8(up_proj)?;
+                }
+                if let Some(down_proj) = &mut self.down_proj {
+                    quantize_linear_weights_fp8(down_proj)?;
+                }
+            }
+            'E' => {
+                if let Some(moe_layer) = &mut self.moe_layer {
+                    moe_layer.quantize_fp8_weights()?;
+                }
+                self.init_stacked_moe()?;
+            }
+            _ => {}
+        }
+
         Ok(())
     }
 }
@@ -1839,6 +1946,13 @@ impl NemotronHModel {
         }
         if moe_count > 0 {
             tracing::info!("Initialized stacked weights for {} MoE layers", moe_count);
+        }
+        Ok(())
+    }
+
+    pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
+        for layer in &mut self.layers {
+            layer.mixer.quantize_fp8_weights()?;
         }
         Ok(())
     }
@@ -1959,6 +2073,14 @@ impl NemotronHForCausalLM {
         let params = self.parameters().flatten();
         for (_, param) in params {
             param.eval()?;
+        }
+        Ok(())
+    }
+
+    pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
+        self.backbone.quantize_fp8_weights()?;
+        if let Some(lm_head) = &mut self.lm_head {
+            quantize_linear_weights_fp8(lm_head)?;
         }
         Ok(())
     }
@@ -2287,13 +2409,13 @@ mod tests {
             use_conv_bias: true,
             tie_word_embeddings: true,
             hybrid_override_pattern: Some("M*-E".to_string()),
-            moe_intermediate_size: None,
+            moe_intermediate_size: Some(64),
             moe_shared_expert_intermediate_size: None,
             n_group: None,
-            n_routed_experts: None,
+            n_routed_experts: Some(2),
             n_shared_experts: None,
             topk_group: None,
-            num_experts_per_tok: None,
+            num_experts_per_tok: Some(1),
             norm_topk_prob: None,
             routed_scaling_factor: None,
             rope_theta: 10000.0,
@@ -2311,5 +2433,51 @@ mod tests {
     fn test_config_attention_head_dim() {
         let config = small_config();
         assert_eq!(config.attention_head_dim(), 32);
+    }
+
+    #[test]
+    fn test_quantize_fp8_weights_covers_all_block_types() {
+        let mut model = NemotronHForCausalLM::new(small_config()).unwrap();
+        model.quantize_fp8_weights().unwrap();
+
+        let mamba = &model.backbone.layers[0].mixer;
+        assert_eq!(mamba.in_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
+        assert_eq!(
+            mamba.out_proj.as_ref().unwrap().weight.as_ref().dtype(),
+            Dtype::Uint8
+        );
+
+        let attention = &model.backbone.layers[1].mixer;
+        assert_eq!(attention.q_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
+        assert_eq!(attention.k_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
+        assert_eq!(attention.v_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
+        assert_eq!(attention.o_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
+
+        let mlp = &model.backbone.layers[2].mixer;
+        assert_eq!(mlp.up_proj.as_ref().unwrap().weight.as_ref().dtype(), Dtype::Uint8);
+        assert_eq!(
+            mlp.down_proj.as_ref().unwrap().weight.as_ref().dtype(),
+            Dtype::Uint8
+        );
+
+        let moe = model.backbone.layers[3].mixer.moe_layer.as_ref().unwrap();
+        assert_eq!(moe.router.gate.weight.as_ref().dtype(), Dtype::Uint8);
+        assert_eq!(moe.experts[0].up_proj.weight.as_ref().dtype(), Dtype::Uint8);
+        assert_eq!(moe.experts[0].down_proj.weight.as_ref().dtype(), Dtype::Uint8);
+    }
+
+    #[test]
+    fn test_quantize_fp8_weights_preserves_forward_for_non_mamba_blocks() {
+        let mut config = small_config();
+        config.num_hidden_layers = 3;
+        config.hybrid_override_pattern = Some("*-E".to_string());
+
+        let mut model = NemotronHForCausalLM::new(config).unwrap();
+        model.quantize_fp8_weights().unwrap();
+
+        let input_ids = Array::zeros::<i32>(&[1, 8]).unwrap();
+        let logits = model.forward(&input_ids, None).unwrap();
+        logits.eval().unwrap();
+        assert_eq!(logits.shape(), &[1, 8, 1000]);
     }
 }

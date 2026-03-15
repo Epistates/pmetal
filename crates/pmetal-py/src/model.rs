@@ -27,7 +27,7 @@ impl PyModel {
     ///
     /// Args:
     ///     path_or_id: Local model directory or HuggingFace model ID
-    ///     fp8: Whether to quantize to FP8 for memory savings
+    ///     fp8: Whether to apply runtime FP8 weight quantization (currently Nemotron-H only)
     #[staticmethod]
     #[pyo3(signature = (path_or_id, fp8=false))]
     fn load(py: Python<'_>, path_or_id: &str, fp8: bool) -> PyResult<Self> {

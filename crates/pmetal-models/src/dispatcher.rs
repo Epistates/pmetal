@@ -495,9 +495,15 @@ impl DynamicModel {
     }
 
     pub fn quantize_fp8(&mut self) -> Result<(), Exception> {
-        Err(Exception::custom(
-            "FP8 quantization is not yet implemented. Use a pre-quantized model or mlx-lm's quantize command.",
-        ))
+        match self {
+            Self::NemotronH(model) => model.quantize_fp8_weights(),
+            Self::Flux(_) => Err(Exception::custom(
+                "Flux FP8 quantization is not exposed through DynamicModel. Load the diffusion pipeline via pmetal_models::pipelines::FluxPipeline and quantize its components explicitly.",
+            )),
+            _ => Err(Exception::custom(
+                "Runtime FP8 quantization is currently implemented for NemotronH only. Other architectures require dedicated FP8-aware kernels or pre-quantized checkpoints.",
+            )),
+        }
     }
 
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
