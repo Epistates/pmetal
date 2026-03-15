@@ -3107,7 +3107,7 @@ async fn run_training(
         training: config.training.clone(),
         dataloader: dataloader_config.clone(),
         use_metal_flash_attention,
-        log_every: config.training.logging_steps,
+        log_every: config.training.logging_steps.max(1),
         checkpoint_every: config.training.save_steps.unwrap_or(500),
         eval_every: if eval_dataset.is_some() { 100 } else { 0 },
         use_jit_compilation,
@@ -3674,6 +3674,14 @@ async fn run_inference(
     let is_instruct_model = is_instruction_tuned(&model_path);
     let use_chat = chat || is_instruct_model;
 
+    // Base models don't understand <think> tags — force no_thinking for them
+    let no_thinking = if !is_instruct_model && !no_thinking && use_chat {
+        tracing::info!("Base model detected, disabling thinking mode (use an instruct model for thinking)");
+        true
+    } else {
+        no_thinking
+    };
+
     if is_instruct_model && !chat {
         tracing::info!("Auto-detected instruction-tuned model, enabling chat template");
     }
@@ -3778,6 +3786,27 @@ async fn run_inference(
         // Validates architecture compatibility before attempting compilation.
         #[cfg(feature = "ane")]
         let ane_output: Option<GenerationOutput> = if ane {
+            // Skip ANE for small models (<2B params) — GPU KV-cache is faster for decode.
+            // ANE-hybrid shines on larger models (4B+) where prefill dominates.
+            let param_count_too_small = match std::fs::read_to_string(model_path.join("config.json")) {
+                Ok(config_text) => match serde_json::from_str::<serde_json::Value>(&config_text) {
+                    Ok(config_json) => {
+                        let hidden = config_json.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let layers = config_json.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(0);
+                        let vocab = config_json.get("vocab_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                        // Rough param estimate: 12 * hidden^2 * layers + hidden * vocab
+                        let est_params = 12 * hidden * hidden * layers + hidden * vocab;
+                        est_params < 2_000_000_000 // <2B params
+                    }
+                    Err(_) => false,
+                },
+                Err(_) => false,
+            };
+
+            if param_count_too_small {
+                tracing::info!("Small model (<2B) — using GPU path for faster decode");
+                None
+            } else {
             // Validate architecture before attempting ANE (saves ~7s on incompatible models)
             let ane_compatible = match std::fs::read_to_string(model_path.join("config.json")) {
                 Ok(config_text) => match serde_json::from_str::<serde_json::Value>(&config_text) {
@@ -3815,6 +3844,7 @@ async fn run_inference(
             } else {
                 None
             }
+            } // close else for param_count_too_small
         } else {
             None
         };
