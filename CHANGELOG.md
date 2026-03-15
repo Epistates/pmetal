@@ -5,6 +5,26 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.6] - 2026-03-15
+
+### Fixed
+
+- **Base model thinking mode**: Auto-detect base vs instruct models and disable `<think>` tag prefill for base models. Base models don't understand thinking tags, causing infinite generation without a closing tag
+- **Fused model 5x slower than LoRA**: Skip ANE-hybrid path for models under 2B parameters where GPU KV-cache decode is significantly faster (115 vs 20 tok/s). ANE-hybrid benefits larger models where prefill dominates
+- **DataLoader panics on bad images**: Replace `panic!()` in VLM batch construction with proper `DataLoaderError` enum and `try_next_batch()` method. Image preprocessing failures and missing-image errors now propagate as `Result` instead of crashing
+- **Division by zero with log_every=0**: Clamp `log_every` and `save_every` to minimum 1 across `TrainingLoop`, `LoggingCallback`, `CheckpointCallback`, and CLI
+- **LoRA scaling with rank 0**: `LoraConfig::scaling()` returns 0.0 when rank is 0 instead of dividing by zero
+- **BF16 LoRA weights**: `sanitize_loaded_weights()` converts BF16 tensors to FP16 since MLX doesn't natively support BF16 on Apple Silicon
+- **Qwen3Next silent weight mismatch**: Weight loading now returns errors for unmatched or missing parameters instead of logging a warning and continuing with a partially loaded model
+- **Dataset download only fetched README**: `download_dataset()` now enumerates repo files and downloads actual data files (parquet, json, jsonl, csv, arrow, etc.) with split-aware filtering
+- **Model download silent failures**: `download_model()` tracks per-file failures and reports them instead of silently skipping failed downloads
+
+### Changed
+
+- **DataLoader error handling**: New `DataLoaderError` enum with `Mlx`, `ImagePreprocess`, and `MissingImages` variants. All 7 training loop entry points migrated from `next_batch()` to `try_next_batch()`
+- **AdapterManager validation**: `load()` now validates path existence, checks for adapter artifacts in directories, and rejects unsupported file types
+- **Metal shader build isolation**: Shader compiler cache redirected to build output directory, preventing pollution of user's home directory
+
 ## [0.3.5] - 2026-03-15
 
 ### Added
