@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Compute pipeline state caching.
 //!
 //! This module provides caching for Metal compute pipeline states,

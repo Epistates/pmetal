@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! MoE (Mixture of Experts) Metal kernels.
 //!
 //! This module provides GPU-accelerated operations for Mixture of Experts models:

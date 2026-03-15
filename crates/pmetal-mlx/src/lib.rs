@@ -14,7 +14,6 @@
 //! - Speculative decoding for faster inference
 
 #![warn(missing_docs)]
-#![allow(unsafe_code)]
 #![allow(ambiguous_glob_reexports)]
 #![allow(unused_imports)]
 #![allow(clippy::needless_borrows_for_generic_args)]

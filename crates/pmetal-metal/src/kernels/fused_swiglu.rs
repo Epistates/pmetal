@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Fused SwiGLU + LoRA MLP Metal kernel.
 //!
 //! This kernel combines the full MLP forward pass into a single kernel launch:

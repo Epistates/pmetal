@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Qwen3.5 hybrid CPU GEMV decode engine.
 //!
 //! Implements CPU-only inference for Qwen3.5 hybrid architectures that combine

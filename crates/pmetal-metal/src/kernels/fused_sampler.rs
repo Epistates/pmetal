@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Fused sampling kernel for high-performance token generation.
 //!
 //! This module bypasses mlx-rs for the sampling hot path, executing all

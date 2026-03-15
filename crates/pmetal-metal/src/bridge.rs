@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Bridge for zero-copy interop between MLX arrays and Metal buffers.
 //!
 //! On Apple Silicon, MLX and Metal share unified memory. This module provides

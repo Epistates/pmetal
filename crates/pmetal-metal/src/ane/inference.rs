@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! ANE inference engine for autoregressive generation.
 //!
 //! Provides a hybrid ANE prefill + CPU decode architecture for efficient

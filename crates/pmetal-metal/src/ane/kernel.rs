@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Transformer kernel generators for ANE.
 //!
 //! Generates MIL programs and weight blobs for the 6 kernel types needed

@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! GPU buffer management with type safety.
 //!
 //! This module provides typed GPU buffers that work with Metal's unified memory,

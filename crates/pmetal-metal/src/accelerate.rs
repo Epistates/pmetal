@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Accelerate.framework wrappers for CPU-side vector operations.
 //!
 //! Provides vDSP-accelerated routines used across both the standard training

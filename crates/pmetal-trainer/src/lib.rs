@@ -44,7 +44,6 @@
 // Crate-level lint configuration
 #![allow(missing_docs)]
 #![allow(dead_code)]
-#![allow(unsafe_code)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 #![allow(unused_mut)]

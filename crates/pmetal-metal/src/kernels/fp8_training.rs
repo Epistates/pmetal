@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! FP8 Training Kernels for Apple Silicon.
 //!
 //! This module provides GPU-accelerated FP8 operations for memory-efficient training:

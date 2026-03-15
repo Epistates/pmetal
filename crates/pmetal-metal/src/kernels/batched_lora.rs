@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Batched Multi-Adapter LoRA kernel for efficient multi-adapter serving.
 //!
 //! This module provides Metal kernels for serving multiple LoRA adapters

@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Tuna: The "Tuna" Kernel Auto-Tuner.
 //!
 //! "Tuna" automatically finds the optimal kernel parameters (tile sizes, etc.)

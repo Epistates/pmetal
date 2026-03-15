@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Fused model merging kernels for maximum throughput.
 //!
 //! This module provides Metal kernels for batched model merging operations,

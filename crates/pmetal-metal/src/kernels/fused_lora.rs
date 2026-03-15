@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Fused LoRA kernels for efficient training on Apple Silicon.
 //!
 //! This module provides Metal kernels that fuse LoRA forward and backward passes,

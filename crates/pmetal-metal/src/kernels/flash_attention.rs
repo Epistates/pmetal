@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! FlashAttention implementation for Metal.
 //!
 //! This module provides a memory-efficient attention implementation based on

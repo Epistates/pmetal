@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Fused RMSNorm + LoRA projection Metal kernel.
 //!
 //! This kernel combines RMSNorm with LoRA projection in a single kernel launch:

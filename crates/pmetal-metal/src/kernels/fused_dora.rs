@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Fused DoRA (Weight-Decomposed Low-Rank Adaptation) kernels.
 //!
 //! DoRA decomposes weights as:

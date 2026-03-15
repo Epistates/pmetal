@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Fused Gated Delta Network (GDN) Metal kernel.
 //!
 //! Provides a fused recurrent kernel for GDN decode/short-prefill that replaces

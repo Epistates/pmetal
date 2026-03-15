@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Fused cross-entropy loss kernel.
 //!
 //! This module provides GPU-accelerated cross-entropy loss computation

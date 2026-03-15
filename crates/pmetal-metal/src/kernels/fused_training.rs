@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Fused training kernels for maximum throughput.
 //!
 //! This module provides Metal kernels that eliminate GPU-CPU synchronization

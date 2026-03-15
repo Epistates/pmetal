@@ -6,6 +6,8 @@
 //! MLX uses a caching memory allocator to reduce allocation overhead.
 //! These functions provide visibility into and control over memory usage.
 
+#![allow(unsafe_code)]
+
 use pmetal_core::MemoryStats;
 
 // FFI definitions for getrusage to avoid adding libc dependency

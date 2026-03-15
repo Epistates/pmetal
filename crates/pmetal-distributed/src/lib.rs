@@ -1,4 +1,3 @@
-#![allow(unsafe_code)] // Raw pointer ops needed for zero-copy allreduce
 //! Distributed training backend for PMetal.
 //!
 //! Enables "Home Clusters" by synchronizing gradients across multiple devices

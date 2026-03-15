@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! NEON-accelerated fp16↔fp32 bulk conversion for Apple Silicon.
 //!
 //! On aarch64, uses ARM NEON inline assembly to convert 4 floats at a time

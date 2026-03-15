@@ -26,6 +26,8 @@
 //! let token = sampler.get_token()?;
 //! ```
 
+#![allow(unsafe_code)]
+
 use std::sync::Arc;
 
 use mlx_rs::Array;

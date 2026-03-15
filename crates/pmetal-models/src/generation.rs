@@ -18,6 +18,8 @@
 //! - Dedicated generation stream for parallel execution
 //! - All tensor operations stay on GPU until final token extraction
 
+#![allow(unsafe_code)]
+
 use mlx_rs::{
     Array, Device, Dtype, Stream,
     error::Exception,

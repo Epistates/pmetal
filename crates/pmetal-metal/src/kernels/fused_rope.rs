@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Fused RoPE (Rotary Position Embedding) Metal kernel.
 //!
 //! Provides high-performance rotary position embeddings with:

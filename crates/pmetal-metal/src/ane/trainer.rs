@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Hybrid CPU/ANE training loop.
 //!
 //! Orchestrates ANE forward/backward passes with CPU-side operations:

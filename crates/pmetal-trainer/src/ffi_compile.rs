@@ -35,6 +35,8 @@
 //! let (loss, ntoks) = compiled.step(&input_ids, &labels, learning_rate)?;
 //! ```
 
+#![allow(unsafe_code)]
+
 use std::cell::RefCell;
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};

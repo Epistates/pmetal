@@ -13,6 +13,8 @@
 //! zero-copy bridging to pass MLX array data directly to Metal kernels without
 //! copying, providing significant performance improvements for large tensors.
 
+#![allow(unsafe_code)]
+
 use crate::{HiddenStateLossType, Result};
 use mlx_rs::Array;
 

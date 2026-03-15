@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Metal device and command queue management.
 //!
 //! This module provides thread-safe access to the Metal device and command queue,

@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! IOSurface zero-copy data transfer for ANE.
 //!
 //! IOSurfaces serve as the shared-memory interface between CPU and ANE.

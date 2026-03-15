@@ -29,6 +29,8 @@
 //! kernel.forward(&view)?;
 //! ```
 
+#![allow(unsafe_code)]
+
 use half::f16;
 use mlx_rs::{Array, Dtype};
 use pmetal_metal::{

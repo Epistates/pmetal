@@ -1,5 +1,7 @@
 //! Array extension utilities for MLX.
 
+#![allow(unsafe_code)]
+
 use mlx_rs::error::{Exception, Result};
 use mlx_rs::{Array, Dtype, Stream};
 

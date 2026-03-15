@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Dynamic weight ANE trainer — compile once, train forever.
 //!
 //! Replaces the static trainer that recompiled all kernels every N steps.

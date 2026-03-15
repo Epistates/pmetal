@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Async command buffer scheduling for optimized GPU-CPU synchronization.
 //!
 //! This module provides infrastructure for asynchronous GPU execution that

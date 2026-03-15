@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! ANE private API FFI via dlopen + objc2.
 //!
 //! Wraps the four private ObjC classes from `AppleNeuralEngine.framework`:

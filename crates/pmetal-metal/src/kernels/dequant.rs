@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Metal-accelerated dequantization kernels.
 
 use crate::{context::MetalContext, error::Result};

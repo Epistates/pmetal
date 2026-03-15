@@ -1,3 +1,5 @@
+#![allow(unsafe_code)]
+
 //! Fused knowledge distillation loss kernels.
 //!
 //! GPU-accelerated distillation losses without materializing probability tensors:

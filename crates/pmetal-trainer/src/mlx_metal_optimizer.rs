@@ -38,6 +38,8 @@
 //!
 //! Target: EXCEED mlx-lm (~2980 tok/s) by removing mlx-rs limitations
 
+#![allow(unsafe_code)]
+
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;

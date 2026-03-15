@@ -38,7 +38,6 @@
 // Crate-level lint configuration
 #![allow(missing_docs)]
 #![allow(dead_code)]
-#![allow(unsafe_code)]
 #![allow(unused_imports)]
 #![allow(clippy::too_many_arguments)]
 #![allow(clippy::needless_borrows_for_generic_args)]
