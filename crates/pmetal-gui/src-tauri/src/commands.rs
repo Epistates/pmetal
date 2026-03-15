@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,7 +8,6 @@ use pmetal::easy;
 use pmetal::prelude::TrainingCallback;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
-use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::state::{
     AppConfig, AppEvent, AppState, CachedModel, DistillationRun, DistillationStatus, GrpoRun,
@@ -177,6 +175,7 @@ pub struct FuseResult {
 // ---------------------------------------------------------------------------
 
 /// Full training config matching TS `TrainingConfig`.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct TrainingConfig {
     pub model: String,
@@ -243,6 +242,7 @@ pub struct DistillationConfig {
 }
 
 /// Full GRPO config matching TS `GrpoConfig`.
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub struct GrpoConfig {
     pub model: String,
@@ -2420,7 +2420,7 @@ fn run_quantize_in_process(
 /// Subscribes to the broadcast channel and re-emits events as Tauri events.
 pub fn start_event_forwarder(app_handle: AppHandle, state: &AppState) {
     let mut rx = state.subscribe();
-    tokio::spawn(async move {
+    tauri::async_runtime::spawn(async move {
         loop {
             match rx.recv().await {
                 Ok(event) => {
@@ -2485,376 +2485,6 @@ pub fn start_event_forwarder(app_handle: AppHandle, state: &AppState) {
             }
         }
     });
-}
-
-// ---------------------------------------------------------------------------
-// Internal subprocess monitoring helpers
-// ---------------------------------------------------------------------------
-
-#[allow(clippy::too_many_arguments)]
-async fn spawn_and_monitor_training(
-    mut child: tokio::process::Child,
-    run_id: String,
-    state_arc: Arc<tokio::sync::RwLock<Vec<TrainingRun>>>,
-    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
-    procs_arc: Arc<tokio::sync::RwLock<HashMap<String, tokio::process::Child>>>,
-    cancel_flags: Arc<tokio::sync::RwLock<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
-    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
-    app_handle: AppHandle,
-) {
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => {
-            mark_training_failed(&state_arc, &event_tx, &run_id, "No stdout").await;
-            return;
-        }
-    };
-
-    // Also capture stderr and forward as process-log lines
-    if let Some(stderr) = child.stderr.take() {
-        let ah = app_handle.clone();
-        let rid = run_id.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = ah.emit(
-                    "process-log",
-                    serde_json::json!({ "run_id": rid, "line": line }),
-                );
-            }
-        });
-    }
-
-    {
-        let mut procs = procs_arc.write().await;
-        procs.insert(run_id.clone(), child);
-    }
-
-    let mut lines = BufReader::new(stdout).lines();
-    let start = Utc::now();
-
-    while let Ok(Some(line)) = lines.next_line().await {
-        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-
-        let _ = app_handle.emit(
-            "process-log",
-            serde_json::json!({ "run_id": run_id, "line": line }),
-        );
-
-        if let Ok(metrics) = serde_json::from_str::<serde_json::Value>(&line) {
-            let mut runs = state_arc.write().await;
-            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                apply_metrics_to_training(run, &metrics, start);
-                let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-            }
-        }
-    }
-
-    // Reap process
-    let exit_ok = {
-        let mut procs = procs_arc.write().await;
-        if let Some(mut child) = procs.remove(&run_id) {
-            child.wait().await.map(|s| s.success()).unwrap_or(false)
-        } else {
-            true
-        }
-    };
-
-    // Remove cancellation flag
-    cancel_flags.write().await.remove(&run_id);
-
-    let mut runs = state_arc.write().await;
-    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        if run.status == TrainingStatus::Running {
-            run.status = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                TrainingStatus::Cancelled
-            } else if exit_ok {
-                TrainingStatus::Completed
-            } else {
-                TrainingStatus::Failed
-            };
-            run.ended_at = Some(Utc::now());
-            let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-            let _ = event_tx.send(AppEvent::TrainingStopped { run_id: run_id.clone() });
-        }
-    }
-}
-
-fn apply_metrics_to_training(
-    run: &mut TrainingRun,
-    m: &serde_json::Value,
-    started_at: chrono::DateTime<Utc>,
-) {
-    if let Some(v) = m["step"].as_u64() { run.step = v; }
-    if let Some(v) = m["total_steps"].as_u64() { run.total_steps = v; }
-    if let Some(v) = m["epoch"].as_f64() { run.epoch = v as f32; }
-    if let Some(v) = m["loss"].as_f64() {
-        run.loss = Some(v);
-        if run.best_loss.map_or(true, |b| v < b) {
-            run.best_loss = Some(v);
-        }
-    }
-    if let Some(v) = m["learning_rate"].as_f64() { run.learning_rate = Some(v); }
-    if let Some(v) = m["grad_norm"].as_f64() { run.grad_norm = Some(v); }
-    if let Some(v) = m["tokens_per_second"].as_f64() { run.tokens_per_second = Some(v); }
-    if run.total_steps > 0 && run.step > 0 {
-        let elapsed = (Utc::now() - started_at).num_seconds().max(1) as f64;
-        let remaining = run.total_steps.saturating_sub(run.step) as f64;
-        run.eta_seconds = Some(((elapsed / run.step as f64) * remaining) as u64);
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn spawn_and_monitor_distillation(
-    mut child: tokio::process::Child,
-    run_id: String,
-    state_arc: Arc<tokio::sync::RwLock<Vec<DistillationRun>>>,
-    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
-    procs_arc: Arc<tokio::sync::RwLock<HashMap<String, tokio::process::Child>>>,
-    cancel_flags: Arc<tokio::sync::RwLock<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
-    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
-    app_handle: AppHandle,
-) {
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => {
-            mark_distillation_failed(&state_arc, &event_tx, &run_id, "No stdout").await;
-            return;
-        }
-    };
-
-    if let Some(stderr) = child.stderr.take() {
-        let ah = app_handle.clone();
-        let rid = run_id.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = ah.emit("process-log", serde_json::json!({ "run_id": rid, "line": line }));
-            }
-        });
-    }
-
-    {
-        let mut procs = procs_arc.write().await;
-        procs.insert(run_id.clone(), child);
-    }
-
-    let mut lines = BufReader::new(stdout).lines();
-    let start = Utc::now();
-
-    while let Ok(Some(line)) = lines.next_line().await {
-        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-        let _ = app_handle.emit("process-log", serde_json::json!({ "run_id": run_id, "line": line }));
-
-        if let Ok(m) = serde_json::from_str::<serde_json::Value>(&line) {
-            let mut runs = state_arc.write().await;
-            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                if let Some(v) = m["step"].as_u64() { run.step = v; }
-                if let Some(v) = m["total_steps"].as_u64() { run.total_steps = Some(v); }
-                if let Some(v) = m["epoch"].as_u64() { run.epoch = v; }
-                if let Some(v) = m["loss"].as_f64() {
-                    run.loss = Some(v);
-                    if run.best_loss.map_or(true, |b| v < b) { run.best_loss = Some(v); }
-                }
-                if let Some(v) = m["learning_rate"].as_f64() { run.learning_rate = Some(v); }
-                if let Some(v) = m["tokens_per_second"].as_f64() { run.tokens_per_second = Some(v); }
-                if let (Some(total), step) = (run.total_steps, run.step) {
-                    if step > 0 {
-                        let elapsed = (Utc::now() - start).num_seconds().max(1) as f64;
-                        run.eta_seconds = Some(
-                            ((elapsed / step as f64) * total.saturating_sub(step) as f64) as u64,
-                        );
-                    }
-                }
-                let _ = event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
-            }
-        }
-    }
-
-    let exit_ok = {
-        let mut procs = procs_arc.write().await;
-        if let Some(mut child) = procs.remove(&run_id) {
-            child.wait().await.map(|s| s.success()).unwrap_or(false)
-        } else {
-            true
-        }
-    };
-
-    cancel_flags.write().await.remove(&run_id);
-
-    let mut runs = state_arc.write().await;
-    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        if run.status == DistillationStatus::Training
-            || run.status == DistillationStatus::LoadingModels
-            || run.status == DistillationStatus::GeneratingSignals
-        {
-            run.status = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                DistillationStatus::Cancelled
-            } else if exit_ok {
-                DistillationStatus::Completed
-            } else {
-                DistillationStatus::Failed
-            };
-            run.ended_at = Some(Utc::now());
-            let _ = event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
-            let _ = event_tx.send(AppEvent::DistillationStopped { run_id: run_id.clone() });
-        }
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-async fn spawn_and_monitor_grpo(
-    mut child: tokio::process::Child,
-    run_id: String,
-    state_arc: Arc<tokio::sync::RwLock<Vec<GrpoRun>>>,
-    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
-    procs_arc: Arc<tokio::sync::RwLock<HashMap<String, tokio::process::Child>>>,
-    cancel_flags: Arc<tokio::sync::RwLock<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
-    cancel_flag: Arc<std::sync::atomic::AtomicBool>,
-    app_handle: AppHandle,
-) {
-    let stdout = match child.stdout.take() {
-        Some(s) => s,
-        None => {
-            mark_grpo_failed(&state_arc, &event_tx, &run_id, "No stdout").await;
-            return;
-        }
-    };
-
-    if let Some(stderr) = child.stderr.take() {
-        let ah = app_handle.clone();
-        let rid = run_id.clone();
-        tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                let _ = ah.emit("process-log", serde_json::json!({ "run_id": rid, "line": line }));
-            }
-        });
-    }
-
-    {
-        let mut procs = procs_arc.write().await;
-        procs.insert(run_id.clone(), child);
-    }
-
-    let mut lines = BufReader::new(stdout).lines();
-    let start = Utc::now();
-
-    while let Ok(Some(line)) = lines.next_line().await {
-        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-            break;
-        }
-        let _ = app_handle.emit("process-log", serde_json::json!({ "run_id": run_id, "line": line }));
-
-        if let Ok(m) = serde_json::from_str::<serde_json::Value>(&line) {
-            let mut runs = state_arc.write().await;
-            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                if let Some(v) = m["step"].as_u64() { run.step = v; }
-                if let Some(v) = m["total_steps"].as_u64() { run.total_steps = Some(v); }
-                if let Some(v) = m["loss"].as_f64() {
-                    run.loss = Some(v);
-                    if run.best_loss.map_or(true, |b| v < b) { run.best_loss = Some(v); }
-                }
-                if let Some(v) = m["reward_mean"].as_f64() { run.reward_mean = Some(v); }
-                if let Some(v) = m["reward_std"].as_f64() { run.reward_std = Some(v); }
-                if let Some(v) = m["kl_div"].as_f64() { run.kl_div = Some(v); }
-                if let Some(v) = m["learning_rate"].as_f64() { run.learning_rate = Some(v); }
-                if let Some(v) = m["tokens_per_second"].as_f64() { run.tokens_per_second = Some(v); }
-                if let (Some(total), step) = (run.total_steps, run.step) {
-                    if step > 0 {
-                        let elapsed = (Utc::now() - start).num_seconds().max(1) as f64;
-                        run.eta_seconds = Some(
-                            ((elapsed / step as f64) * total.saturating_sub(step) as f64) as u64,
-                        );
-                    }
-                }
-                let _ = event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
-            }
-        }
-    }
-
-    let exit_ok = {
-        let mut procs = procs_arc.write().await;
-        if let Some(mut child) = procs.remove(&run_id) {
-            child.wait().await.map(|s| s.success()).unwrap_or(false)
-        } else {
-            true
-        }
-    };
-
-    cancel_flags.write().await.remove(&run_id);
-
-    let mut runs = state_arc.write().await;
-    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        if run.status == GrpoStatus::Running {
-            run.status = if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                GrpoStatus::Cancelled
-            } else if exit_ok {
-                GrpoStatus::Completed
-            } else {
-                GrpoStatus::Failed
-            };
-            run.ended_at = Some(Utc::now());
-            let _ = event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
-            let _ = event_tx.send(AppEvent::GrpoStopped { run_id: run_id.clone() });
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Failure markers
-// ---------------------------------------------------------------------------
-
-async fn mark_training_failed(
-    state_arc: &Arc<tokio::sync::RwLock<Vec<TrainingRun>>>,
-    event_tx: &tokio::sync::broadcast::Sender<AppEvent>,
-    run_id: &str,
-    msg: &str,
-) {
-    let mut runs = state_arc.write().await;
-    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        run.status = TrainingStatus::Failed;
-        run.error_message = Some(msg.to_string());
-        run.ended_at = Some(Utc::now());
-        let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-        let _ = event_tx.send(AppEvent::TrainingStopped { run_id: run_id.to_string() });
-    }
-}
-
-async fn mark_distillation_failed(
-    state_arc: &Arc<tokio::sync::RwLock<Vec<DistillationRun>>>,
-    event_tx: &tokio::sync::broadcast::Sender<AppEvent>,
-    run_id: &str,
-    msg: &str,
-) {
-    let mut runs = state_arc.write().await;
-    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        run.status = DistillationStatus::Failed;
-        run.error_message = Some(msg.to_string());
-        run.ended_at = Some(Utc::now());
-        let _ = event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
-        let _ = event_tx.send(AppEvent::DistillationStopped { run_id: run_id.to_string() });
-    }
-}
-
-async fn mark_grpo_failed(
-    state_arc: &Arc<tokio::sync::RwLock<Vec<GrpoRun>>>,
-    event_tx: &tokio::sync::broadcast::Sender<AppEvent>,
-    run_id: &str,
-    msg: &str,
-) {
-    let mut runs = state_arc.write().await;
-    if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-        run.status = GrpoStatus::Failed;
-        run.error_message = Some(msg.to_string());
-        run.ended_at = Some(Utc::now());
-        let _ = event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
-        let _ = event_tx.send(AppEvent::GrpoStopped { run_id: run_id.to_string() });
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2970,59 +2600,48 @@ async fn search_hf_datasets_inner(
 // Utility helpers
 // ---------------------------------------------------------------------------
 
-async fn get_pmetal_version() -> String {
-    pmetal::version::VERSION.to_string()
-}
-
-async fn get_total_memory_bytes() -> u64 {
-    let out = tokio::process::Command::new("sysctl")
-        .args(["-n", "hw.memsize"])
-        .output()
-        .await
-        .ok();
-    out.and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.trim().parse::<u64>().ok())
-        .unwrap_or(16 * 1024 * 1024 * 1024)
-}
-
 fn get_total_memory_bytes_sync() -> u64 {
-    // Synchronous fallback using sysctl directly — just use a constant estimate
-    16 * 1024 * 1024 * 1024
+    let device_info = pmetal::version::device_info();
+    (device_info.memory_total_gb * 1024.0_f64.powi(3)) as u64
 }
 
-/// Attempts to read available (free + inactive) memory via `vm_stat` on macOS.
 async fn get_available_memory_bytes() -> Option<u64> {
-    let out = tokio::process::Command::new("vm_stat")
-        .output()
-        .await
-        .ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
-
-    let page_size: u64 = 16384; // macOS default page size
-
-    let mut free_pages: u64 = 0;
-    let mut inactive_pages: u64 = 0;
-
-    for line in text.lines() {
-        if line.contains("Pages free:") {
-            let val = line.split(':').nth(1)?
-                .trim().trim_end_matches('.').parse::<u64>().ok()?;
-            free_pages = val;
-        } else if line.contains("Pages inactive:") {
-            let val = line.split(':').nth(1)?
-                .trim().trim_end_matches('.').parse::<u64>().ok()?;
-            inactive_pages = val;
-        }
-    }
-
-    Some((free_pages + inactive_pages) * page_size)
+    let device_info = pmetal::version::device_info();
+    Some((device_info.memory_available_gb * 1024.0_f64.powi(3)) as u64)
 }
 
-/// Try to get memory bandwidth via `pmetal memory` output, or return None.
 async fn get_bandwidth_gbps() -> Option<f64> {
     pmetal::metal::MetalContext::global()
         .ok()
         .map(|ctx| ctx.properties().memory_bandwidth_gbps)
+}
+
+fn apply_metrics_to_training(
+    run: &mut TrainingRun,
+    m: &serde_json::Value,
+    started_at: chrono::DateTime<Utc>,
+) {
+    if let Some(v) = m["step"].as_u64() { run.step = v; }
+    if let Some(v) = m["total_steps"].as_u64() { run.total_steps = v; }
+    if let Some(v) = m["epoch"].as_f64() { run.epoch = v as f32; }
+    if let Some(v) = m["loss"].as_f64() {
+        run.loss = Some(v);
+        if run.best_loss.map_or(true, |b| v < b) {
+            run.best_loss = Some(v);
+        }
+    }
+    if let Some(v) = m["learning_rate"].as_f64().or_else(|| m["lr"].as_f64()) {
+        run.learning_rate = Some(v);
+    }
+    if let Some(v) = m["grad_norm"].as_f64() { run.grad_norm = Some(v); }
+    if let Some(v) = m["tokens_per_second"].as_f64().or_else(|| m["tok_sec"].as_f64()) {
+        run.tokens_per_second = Some(v);
+    }
+    if run.total_steps > 0 && run.step > 0 {
+        let elapsed = (Utc::now() - started_at).num_seconds().max(1) as f64;
+        let remaining = run.total_steps.saturating_sub(run.step) as f64;
+        run.eta_seconds = Some(((elapsed / run.step as f64) * remaining) as u64);
+    }
 }
 
 /// Percent-encode a string for use in a URL query parameter value.
