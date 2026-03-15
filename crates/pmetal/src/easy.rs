@@ -38,7 +38,9 @@ use pmetal_core::{LoraConfig, PMetalError, Result, TrainingCallback, TrainingCon
 use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
 use pmetal_lora::{DynamicLoraModel, TrainableModel};
 use pmetal_mlx::Builder as _;
-use pmetal_models::{DynamicModel, GenerationConfig, generate_cached_async, generate_cached_async_streaming};
+use pmetal_models::{
+    DynamicModel, GenerationConfig, generate_cached_async, generate_cached_async_streaming,
+};
 use pmetal_trainer::{CheckpointManager, MetricsJsonCallback, TrainingLoop, TrainingLoopConfig};
 
 /// Map any Display error to `PMetalError::Training`.
@@ -703,8 +705,8 @@ impl PreferenceTuneBuilder {
             use_dora,
             ..Default::default()
         };
-        let mut model =
-            DynamicLoraModel::from_pretrained(&model_path, lora_config.clone()).map_err(model_err)?;
+        let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())
+            .map_err(model_err)?;
         if gradient_checkpointing && model.supports_gradient_checkpointing() {
             model.enable_gradient_checkpointing(gradient_checkpointing_layers);
         }
@@ -731,17 +733,21 @@ impl PreferenceTuneBuilder {
                 let reference_path = reference_model_id
                     .clone()
                     .unwrap_or_else(|| model_id.clone());
-                let mut reference_model = if config.reference_free || config.use_stop_gradient_reference {
-                    None
-                } else {
-                    Some(
-                        DynamicLoraModel::from_pretrained(
-                            &resolve_model_path(&reference_path).await?,
-                            LoraConfig { r: 0, ..Default::default() },
+                let mut reference_model =
+                    if config.reference_free || config.use_stop_gradient_reference {
+                        None
+                    } else {
+                        Some(
+                            DynamicLoraModel::from_pretrained(
+                                &resolve_model_path(&reference_path).await?,
+                                LoraConfig {
+                                    r: 0,
+                                    ..Default::default()
+                                },
+                            )
+                            .map_err(model_err)?,
                         )
-                        .map_err(model_err)?,
-                    )
-                };
+                    };
                 let mut trainer = pmetal_trainer::DpoTrainer::new(
                     config,
                     TrainingConfig {
@@ -766,7 +772,12 @@ impl PreferenceTuneBuilder {
                     .build()
                     .map_err(training_err)?;
                 let history = trainer
-                    .train(&mut model, reference_model.as_mut(), &dataset, &mut optimizer)
+                    .train(
+                        &mut model,
+                        reference_model.as_mut(),
+                        &dataset,
+                        &mut optimizer,
+                    )
                     .map_err(training_err)?;
                 (
                     history.last().map(|m| m.loss as f64).unwrap_or(0.0),
@@ -779,12 +790,16 @@ impl PreferenceTuneBuilder {
                     &dataset_path,
                     &tokenizer,
                     config.max_prompt_length,
-                    config.max_seq_length.saturating_sub(config.max_prompt_length),
+                    config
+                        .max_seq_length
+                        .saturating_sub(config.max_prompt_length),
                 )?;
                 let total_steps = dataset.len().div_ceil(batch_size.max(1)) * num_epochs.max(1);
                 let total_tokens = dataset
                     .iter()
-                    .map(|pair| pair.prompt_ids.len() + pair.chosen_ids.len() + pair.rejected_ids.len())
+                    .map(|pair| {
+                        pair.prompt_ids.len() + pair.chosen_ids.len() + pair.rejected_ids.len()
+                    })
                     .sum();
                 let reference_path = reference_model_id
                     .clone()
@@ -793,7 +808,10 @@ impl PreferenceTuneBuilder {
                     Some(
                         DynamicLoraModel::from_pretrained(
                             &resolve_model_path(&reference_path).await?,
-                            LoraConfig { r: 0, ..Default::default() },
+                            LoraConfig {
+                                r: 0,
+                                ..Default::default()
+                            },
                         )
                         .map_err(model_err)?,
                     )
@@ -824,7 +842,12 @@ impl PreferenceTuneBuilder {
                     .build()
                     .map_err(training_err)?;
                 let history = trainer
-                    .train(&mut model, reference_model.as_mut(), &dataset, &mut optimizer)
+                    .train(
+                        &mut model,
+                        reference_model.as_mut(),
+                        &dataset,
+                        &mut optimizer,
+                    )
                     .map_err(training_err)?;
                 (
                     history.last().map(|m| m.loss as f64).unwrap_or(0.0),
@@ -896,7 +919,10 @@ impl PreferenceTuneBuilder {
                     Some(
                         DynamicLoraModel::from_pretrained(
                             &resolve_model_path(&reference_path).await?,
-                            LoraConfig { r: 0, ..Default::default() },
+                            LoraConfig {
+                                r: 0,
+                                ..Default::default()
+                            },
                         )
                         .map_err(model_err)?,
                     )
@@ -925,7 +951,12 @@ impl PreferenceTuneBuilder {
                     .build()
                     .map_err(training_err)?;
                 let history = trainer
-                    .train(&mut model, reference_model.as_mut(), &dataset, &mut optimizer)
+                    .train(
+                        &mut model,
+                        reference_model.as_mut(),
+                        &dataset,
+                        &mut optimizer,
+                    )
                     .map_err(training_err)?;
                 (
                     history.last().map(|m| m.loss as f64).unwrap_or(0.0),
@@ -1151,7 +1182,13 @@ impl InferBuilder {
         })?;
 
         if let Some(lora_path) = &self.lora_path {
-            return self.generate_with_lora_streaming(&model_path, lora_path, &tokenizer, prompt, &mut on_delta);
+            return self.generate_with_lora_streaming(
+                &model_path,
+                lora_path,
+                &tokenizer,
+                prompt,
+                &mut on_delta,
+            );
         }
 
         let mut model = DynamicModel::load(&model_path).map_err(mlx_err)?;
@@ -1518,10 +1555,7 @@ fn read_jsonl_objects(path: &str) -> Result<Vec<serde_json::Value>> {
     Ok(rows)
 }
 
-fn extract_first_string<'a>(
-    value: &'a serde_json::Value,
-    fields: &[&str],
-) -> Option<&'a str> {
+fn extract_first_string<'a>(value: &'a serde_json::Value, fields: &[&str]) -> Option<&'a str> {
     fields
         .iter()
         .find_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
@@ -1566,7 +1600,13 @@ fn load_dpo_dataset(
             .ok_or_else(|| PMetalError::Training("Preference row missing prompt".into()))?;
         let chosen = extract_first_string(
             &row,
-            &["chosen", "accepted", "preferred", "chosen_response", "output_chosen"],
+            &[
+                "chosen",
+                "accepted",
+                "preferred",
+                "chosen_response",
+                "output_chosen",
+            ],
         )
         .ok_or_else(|| PMetalError::Training("Preference row missing chosen response".into()))?;
         let rejected = extract_first_string(
@@ -1611,7 +1651,13 @@ fn load_simpo_dataset(
             .ok_or_else(|| PMetalError::Training("Preference row missing prompt".into()))?;
         let chosen = extract_first_string(
             &row,
-            &["chosen", "accepted", "preferred", "chosen_response", "output_chosen"],
+            &[
+                "chosen",
+                "accepted",
+                "preferred",
+                "chosen_response",
+                "output_chosen",
+            ],
         )
         .ok_or_else(|| PMetalError::Training("Preference row missing chosen response".into()))?;
         let rejected = extract_first_string(

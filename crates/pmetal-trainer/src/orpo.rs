@@ -16,8 +16,8 @@
 use mlx_rs::error::Exception;
 use mlx_rs::nn;
 use mlx_rs::ops::indexing::IndexOp;
-use mlx_rs::{Array, Dtype};
 use mlx_rs::optimizers::Optimizer;
+use mlx_rs::{Array, Dtype};
 use pmetal_core::{StepMetrics, TrainingCallback, TrainingConfig};
 use pmetal_lora::TrainableModel;
 use std::time::Instant;
@@ -223,9 +223,8 @@ impl OrpoTrainer {
                     Self::batch_preference_pairs(batch)?;
                 let config = self.config.clone();
                 // Capture metric arrays from inside the closure to avoid a second forward pass.
-                let metrics_cell: std::cell::RefCell<
-                    Option<(Array, Array, Array, Array)>,
-                > = std::cell::RefCell::new(None);
+                let metrics_cell: std::cell::RefCell<Option<(Array, Array, Array, Array)>> =
+                    std::cell::RefCell::new(None);
                 let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
                     let chosen_logits = model
                         .forward(&chosen_inputs, None)
@@ -256,8 +255,9 @@ impl OrpoTrainer {
                 optimizer.update(policy_model, grads)?;
                 loss.eval()?;
 
-                let (sft_loss, or_loss, log_odds_chosen, log_odds_rejected) =
-                    metrics_cell.into_inner().expect("loss_fn must have been called");
+                let (sft_loss, or_loss, log_odds_chosen, log_odds_rejected) = metrics_cell
+                    .into_inner()
+                    .expect("loss_fn must have been called");
                 sft_loss.eval()?;
                 or_loss.eval()?;
                 log_odds_chosen.eval()?;
@@ -319,13 +319,18 @@ impl OrpoTrainer {
     fn batch_preference_pairs(
         batch: &[PreferencePair],
     ) -> Result<(Array, Array, Array, Array), Exception> {
-        let chosen_inputs: Vec<Vec<u32>> = batch.iter().map(|pair| pair.chosen_ids.clone()).collect();
-        let chosen_labels: Vec<Vec<i64>> =
-            batch.iter().map(|pair| pair.chosen_labels.clone()).collect();
+        let chosen_inputs: Vec<Vec<u32>> =
+            batch.iter().map(|pair| pair.chosen_ids.clone()).collect();
+        let chosen_labels: Vec<Vec<i64>> = batch
+            .iter()
+            .map(|pair| pair.chosen_labels.clone())
+            .collect();
         let rejected_inputs: Vec<Vec<u32>> =
             batch.iter().map(|pair| pair.rejected_ids.clone()).collect();
-        let rejected_labels: Vec<Vec<i64>> =
-            batch.iter().map(|pair| pair.rejected_labels.clone()).collect();
+        let rejected_labels: Vec<Vec<i64>> = batch
+            .iter()
+            .map(|pair| pair.rejected_labels.clone())
+            .collect();
 
         Ok((
             pad_u32_sequences(&chosen_inputs, 0)?,
@@ -335,7 +340,10 @@ impl OrpoTrainer {
         ))
     }
 
-    fn compute_log_probs_static(logits: &Array, labels: &Array) -> Result<(Array, Array), Exception> {
+    fn compute_log_probs_static(
+        logits: &Array,
+        labels: &Array,
+    ) -> Result<(Array, Array), Exception> {
         let seq_len = logits.dim(1);
         let pred_logits = logits.index((.., ..seq_len - 1, ..));
         let target_labels = labels.index((.., 1..));

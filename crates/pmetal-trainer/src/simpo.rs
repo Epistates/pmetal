@@ -539,9 +539,9 @@ impl SimpoTrainer {
                 let chosen_mask = chosen_mask_full.index((.., 1..));
                 let rejected_mask = rejected_mask_full.index((.., 1..));
                 let ref_chosen_logps = if self.config.cpo_alpha > 0.0 {
-                    let ref_model = reference_model.as_deref_mut().ok_or_else(|| {
-                        SimpoError::Config("Reference model missing".into())
-                    })?;
+                    let ref_model = reference_model
+                        .as_deref_mut()
+                        .ok_or_else(|| SimpoError::Config("Reference model missing".into()))?;
                     let ref_logits = ref_model
                         .forward(&chosen_inputs, None)
                         .map_err(|e| SimpoError::Config(format!("Forward failed: {e}")))?;
@@ -590,8 +590,14 @@ impl SimpoTrainer {
                         &rejected_mask,
                         ref_chosen_logps.as_ref(),
                     )?;
-                    *metrics_cell.borrow_mut() =
-                        Some((simpo_loss, chosen_rewards, rejected_rewards, margin, cpo_loss, sft_loss));
+                    *metrics_cell.borrow_mut() = Some((
+                        simpo_loss,
+                        chosen_rewards,
+                        rejected_rewards,
+                        margin,
+                        cpo_loss,
+                        sft_loss,
+                    ));
                     Ok(total_loss)
                 };
 
@@ -602,8 +608,16 @@ impl SimpoTrainer {
                 optimizer.update(policy_model, grads)?;
                 loss.eval()?;
 
-                let (simpo_loss, chosen_rewards, rejected_rewards, margin, cpo_loss_opt, sft_loss_opt) =
-                    metrics_cell.into_inner().expect("loss_fn must have been called");
+                let (
+                    simpo_loss,
+                    chosen_rewards,
+                    rejected_rewards,
+                    margin,
+                    cpo_loss_opt,
+                    sft_loss_opt,
+                ) = metrics_cell
+                    .into_inner()
+                    .expect("loss_fn must have been called");
                 simpo_loss.eval()?;
                 chosen_rewards.eval()?;
                 rejected_rewards.eval()?;
@@ -650,7 +664,9 @@ impl SimpoTrainer {
                 let elapsed = step_start.elapsed().as_secs_f64();
                 let tokens = batch
                     .iter()
-                    .map(|pair| pair.prompt_ids.len() + pair.chosen_ids.len() + pair.rejected_ids.len())
+                    .map(|pair| {
+                        pair.prompt_ids.len() + pair.chosen_ids.len() + pair.rejected_ids.len()
+                    })
                     .sum::<usize>();
                 let step_metrics = StepMetrics {
                     step: self.step,
@@ -809,7 +825,18 @@ impl SimpoTrainer {
         chosen_mask: &Array,
         rejected_mask: &Array,
         ref_chosen_logps: Option<&Array>,
-    ) -> Result<(Array, Array, Array, Array, Array, Option<Array>, Option<Array>), Exception> {
+    ) -> Result<
+        (
+            Array,
+            Array,
+            Array,
+            Array,
+            Array,
+            Option<Array>,
+            Option<Array>,
+        ),
+        Exception,
+    > {
         // --- Compute length-normalized rewards ---
         let compute_rewards = |logps: &Array, mask: &Array| -> Result<Array, Exception> {
             let masked_logps = logps.multiply(mask)?;
@@ -883,8 +910,7 @@ impl SimpoTrainer {
             if let Some(ref_logps) = ref_chosen_logps {
                 let kl = chosen_logps.subtract(ref_logps)?;
                 let masked_kl = kl.multiply(chosen_mask)?;
-                let mean_kl =
-                    masked_kl.sum(None)?.divide(&chosen_mask.sum(None)?)?;
+                let mean_kl = masked_kl.sum(None)?.divide(&chosen_mask.sum(None)?)?;
                 let alpha = Array::from_f32(config.cpo_alpha as f32);
                 let cpo = mean_kl.multiply(&alpha)?;
                 total_loss = total_loss.add(&cpo)?;
@@ -899,8 +925,7 @@ impl SimpoTrainer {
         // SFT auxiliary loss
         let sft_loss = if config.sft_weight > 0.0 {
             let masked_nll = chosen_logps.negative()?.multiply(chosen_mask)?;
-            let mean_nll =
-                masked_nll.sum(None)?.divide(&chosen_mask.sum(None)?)?;
+            let mean_nll = masked_nll.sum(None)?.divide(&chosen_mask.sum(None)?)?;
             let weight = Array::from_f32(config.sft_weight as f32);
             let sft = mean_nll.multiply(&weight)?;
             total_loss = total_loss.add(&sft)?;
@@ -909,7 +934,15 @@ impl SimpoTrainer {
             None
         };
 
-        Ok((total_loss, simpo_loss, chosen_rewards, rejected_rewards, margin, cpo_loss, sft_loss))
+        Ok((
+            total_loss,
+            simpo_loss,
+            chosen_rewards,
+            rejected_rewards,
+            margin,
+            cpo_loss,
+            sft_loss,
+        ))
     }
 }
 

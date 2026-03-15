@@ -655,13 +655,14 @@ impl DpoTrainer {
                         )?;
                         let chosen_ref_logps = mlx_rs::stop_gradient(&chosen_policy_logps)?;
                         let rejected_ref_logps = mlx_rs::stop_gradient(&rejected_policy_logps)?;
-                        let (loss, chosen_rewards, rejected_rewards) = Self::compute_dpo_loss_static(
-                            &config,
-                            &chosen_policy_logps,
-                            &rejected_policy_logps,
-                            &chosen_ref_logps,
-                            &rejected_ref_logps,
-                        )?;
+                        let (loss, chosen_rewards, rejected_rewards) =
+                            Self::compute_dpo_loss_static(
+                                &config,
+                                &chosen_policy_logps,
+                                &rejected_policy_logps,
+                                &chosen_ref_logps,
+                                &rejected_ref_logps,
+                            )?;
                         *metrics_cell.borrow_mut() = Some((chosen_rewards, rejected_rewards));
                         Ok(loss)
                     };
@@ -680,8 +681,11 @@ impl DpoTrainer {
                     rejected_rewards.eval()?;
                     let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
                     let rejected_rewards_vec = rejected_rewards.as_slice::<f32>().to_vec();
-                    let metrics =
-                        DpoMetrics::compute(loss.item::<f32>(), &chosen_rewards_vec, &rejected_rewards_vec);
+                    let metrics = DpoMetrics::compute(
+                        loss.item::<f32>(),
+                        &chosen_rewards_vec,
+                        &rejected_rewards_vec,
+                    );
                     (loss.item::<f32>(), metrics)
                 } else {
                     let (ref_chosen_logps, ref_rejected_logps) = if self.config.reference_free {
@@ -719,13 +723,14 @@ impl DpoTrainer {
                             &rejected_labels,
                             matches!(config.loss_type, DpoLossType::SimPo),
                         )?;
-                        let (loss, chosen_rewards, rejected_rewards) = Self::compute_dpo_loss_static(
-                            &config,
-                            &chosen_policy_logps,
-                            &rejected_policy_logps,
-                            &ref_chosen_logps,
-                            &ref_rejected_logps,
-                        )?;
+                        let (loss, chosen_rewards, rejected_rewards) =
+                            Self::compute_dpo_loss_static(
+                                &config,
+                                &chosen_policy_logps,
+                                &rejected_policy_logps,
+                                &ref_chosen_logps,
+                                &ref_rejected_logps,
+                            )?;
                         *metrics_cell.borrow_mut() = Some((chosen_rewards, rejected_rewards));
                         Ok(loss)
                     };
@@ -744,8 +749,11 @@ impl DpoTrainer {
                     rejected_rewards.eval()?;
                     let chosen_rewards_vec = chosen_rewards.as_slice::<f32>().to_vec();
                     let rejected_rewards_vec = rejected_rewards.as_slice::<f32>().to_vec();
-                    let metrics =
-                        DpoMetrics::compute(loss.item::<f32>(), &chosen_rewards_vec, &rejected_rewards_vec);
+                    let metrics = DpoMetrics::compute(
+                        loss.item::<f32>(),
+                        &chosen_rewards_vec,
+                        &rejected_rewards_vec,
+                    );
                     (loss.item::<f32>(), metrics)
                 };
 
@@ -798,13 +806,18 @@ impl DpoTrainer {
     fn batch_preference_pairs(
         batch: &[PreferencePair],
     ) -> Result<(Array, Array, Array, Array), Exception> {
-        let chosen_inputs: Vec<Vec<u32>> = batch.iter().map(|pair| pair.chosen_ids.clone()).collect();
-        let chosen_labels: Vec<Vec<i64>> =
-            batch.iter().map(|pair| pair.chosen_labels.clone()).collect();
+        let chosen_inputs: Vec<Vec<u32>> =
+            batch.iter().map(|pair| pair.chosen_ids.clone()).collect();
+        let chosen_labels: Vec<Vec<i64>> = batch
+            .iter()
+            .map(|pair| pair.chosen_labels.clone())
+            .collect();
         let rejected_inputs: Vec<Vec<u32>> =
             batch.iter().map(|pair| pair.rejected_ids.clone()).collect();
-        let rejected_labels: Vec<Vec<i64>> =
-            batch.iter().map(|pair| pair.rejected_labels.clone()).collect();
+        let rejected_labels: Vec<Vec<i64>> = batch
+            .iter()
+            .map(|pair| pair.rejected_labels.clone())
+            .collect();
 
         Ok((
             pad_u32_sequences(&chosen_inputs, 0)?,
@@ -843,7 +856,8 @@ impl DpoTrainer {
         ref_chosen_logps: &Array,
         ref_rejected_logps: &Array,
     ) -> Result<(Array, Array, Array), Exception> {
-        let reference_free = config.reference_free || matches!(config.loss_type, DpoLossType::SimPo);
+        let reference_free =
+            config.reference_free || matches!(config.loss_type, DpoLossType::SimPo);
         let chosen_rewards = if reference_free {
             policy_chosen_logps.clone()
         } else {
@@ -881,12 +895,10 @@ impl DpoTrainer {
                 let target = Array::from_f32((1.0 / (2.0 * config.beta)) as f32);
                 logits.subtract(&target)?.square()?
             }
-            DpoLossType::Hinge => {
-                mlx_rs::ops::maximum(
-                    &Array::from_f32(1.0).subtract(&logits)?,
-                    &Array::from_f32(0.0),
-                )?
-            }
+            DpoLossType::Hinge => mlx_rs::ops::maximum(
+                &Array::from_f32(1.0).subtract(&logits)?,
+                &Array::from_f32(0.0),
+            )?,
             DpoLossType::Robust => {
                 let sigmoid = nn::softplus(&logits.negative()?)?;
                 let hinge = mlx_rs::ops::maximum(

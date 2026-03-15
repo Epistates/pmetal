@@ -12,8 +12,8 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::tui::event::{AppMsg, CommandSpec, JobType};
 use crate::QuantizationMethod;
+use crate::tui::event::{AppMsg, CommandSpec, JobType};
 
 /// A currently running background job.
 #[allow(dead_code)]

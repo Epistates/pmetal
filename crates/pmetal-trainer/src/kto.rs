@@ -541,9 +541,9 @@ impl KtoTrainer {
                 let ref_logps = if self.config.reference_free {
                     Array::from_f32(0.0)
                 } else {
-                    let ref_model = reference_model.as_deref_mut().ok_or_else(|| {
-                        KtoError::Config("Reference model missing".into())
-                    })?;
+                    let ref_model = reference_model
+                        .as_deref_mut()
+                        .ok_or_else(|| KtoError::Config("Reference model missing".into()))?;
                     let ref_logits = ref_model
                         .forward(&inputs, None)
                         .map_err(|e| KtoError::Config(format!("Forward failed: {e}")))?;
@@ -553,9 +553,8 @@ impl KtoTrainer {
                 let z_ref = self.z_ref();
                 // Capture rewards arrays from inside the closure to avoid a second forward pass.
                 // Type: (raw_rewards, scaled_rewards, desirable_losses_arr, undesirable_losses_arr)
-                let metrics_cell: std::cell::RefCell<
-                    Option<(Array, Array, Array, Array)>,
-                > = std::cell::RefCell::new(None);
+                let metrics_cell: std::cell::RefCell<Option<(Array, Array, Array, Array)>> =
+                    std::cell::RefCell::new(None);
                 let loss_fn = |model: &mut M, _: ()| -> Result<Array, Exception> {
                     let logits = model
                         .forward(&inputs, None)
@@ -573,8 +572,12 @@ impl KtoTrainer {
                             &desirability,
                             z_ref,
                         )?;
-                    *metrics_cell.borrow_mut() =
-                        Some((rewards, scaled_rewards, desirable_losses_arr, undesirable_losses_arr));
+                    *metrics_cell.borrow_mut() = Some((
+                        rewards,
+                        scaled_rewards,
+                        desirable_losses_arr,
+                        undesirable_losses_arr,
+                    ));
                     Ok(loss)
                 };
 
@@ -586,7 +589,9 @@ impl KtoTrainer {
                 loss.eval()?;
 
                 let (raw_rewards, scaled_rewards, desirable_losses_arr, undesirable_losses_arr) =
-                    metrics_cell.into_inner().expect("loss_fn must have been called");
+                    metrics_cell
+                        .into_inner()
+                        .expect("loss_fn must have been called");
 
                 // Update z_ref estimate before evaluating arrays
                 if self.config.estimate_z_ref {
@@ -631,7 +636,10 @@ impl KtoTrainer {
 
                 self.step += 1;
                 let elapsed = step_start.elapsed().as_secs_f64();
-                let tokens = batch.iter().map(|sample| sample.response_ids.len()).sum::<usize>();
+                let tokens = batch
+                    .iter()
+                    .map(|sample| sample.response_ids.len())
+                    .sum::<usize>();
                 let step_metrics = StepMetrics {
                     step: self.step,
                     epoch,
@@ -673,7 +681,10 @@ impl KtoTrainer {
     }
 
     fn batch_kto_samples(batch: &[KtoSample]) -> Result<(Array, Array, Vec<bool>), Exception> {
-        let inputs: Vec<Vec<u32>> = batch.iter().map(|sample| sample.response_ids.clone()).collect();
+        let inputs: Vec<Vec<u32>> = batch
+            .iter()
+            .map(|sample| sample.response_ids.clone())
+            .collect();
         let labels: Vec<Vec<i64>> = batch.iter().map(|sample| sample.labels.clone()).collect();
         let desirability = batch.iter().map(|sample| sample.is_desirable).collect();
         Ok((
@@ -707,11 +718,12 @@ impl KtoTrainer {
         let undesirable_mask = Array::from_f32(1.0).subtract(&desirable_mask)?;
 
         let z_ref_arr = Array::from_f32(z_ref as f32);
-        let desirable_logits =
-            z_ref_arr.subtract(&rewards.multiply(&Array::from_f32(config.effective_beta_desirable() as f32))?)?;
-        let undesirable_logits =
-            rewards.multiply(&Array::from_f32(config.effective_beta_undesirable() as f32))?
-                .subtract(&z_ref_arr)?;
+        let desirable_logits = z_ref_arr.subtract(
+            &rewards.multiply(&Array::from_f32(config.effective_beta_desirable() as f32))?,
+        )?;
+        let undesirable_logits = rewards
+            .multiply(&Array::from_f32(config.effective_beta_undesirable() as f32))?
+            .subtract(&z_ref_arr)?;
 
         let desirable_losses = mlx_rs::ops::sigmoid(&desirable_logits)?
             .multiply(&Array::from_f32(config.desirable_weight as f32))?
@@ -725,8 +737,7 @@ impl KtoTrainer {
 
         let desirable_count = desirable_mask.sum(None)?;
         let undesirable_count = undesirable_mask.sum(None)?;
-        let desirable_count_safe =
-            mlx_rs::ops::maximum(&desirable_count, &Array::from_f32(1.0))?;
+        let desirable_count_safe = mlx_rs::ops::maximum(&desirable_count, &Array::from_f32(1.0))?;
         let undesirable_count_safe =
             mlx_rs::ops::maximum(&undesirable_count, &Array::from_f32(1.0))?;
         let desirable_loss = desirable_losses
@@ -765,11 +776,12 @@ impl KtoTrainer {
         let undesirable_mask = Array::from_f32(1.0).subtract(&desirable_mask)?;
 
         let z_ref_arr = Array::from_f32(z_ref as f32);
-        let desirable_logits =
-            z_ref_arr.subtract(&rewards.multiply(&Array::from_f32(config.effective_beta_desirable() as f32))?)?;
-        let undesirable_logits =
-            rewards.multiply(&Array::from_f32(config.effective_beta_undesirable() as f32))?
-                .subtract(&z_ref_arr)?;
+        let desirable_logits = z_ref_arr.subtract(
+            &rewards.multiply(&Array::from_f32(config.effective_beta_desirable() as f32))?,
+        )?;
+        let undesirable_logits = rewards
+            .multiply(&Array::from_f32(config.effective_beta_undesirable() as f32))?
+            .subtract(&z_ref_arr)?;
 
         let desirable_losses = mlx_rs::ops::sigmoid(&desirable_logits)?
             .multiply(&Array::from_f32(config.desirable_weight as f32))?
@@ -781,7 +793,12 @@ impl KtoTrainer {
         let mean_loss = total_losses.mean(None)?;
 
         let scaled_rewards = rewards.multiply(&Array::from_f32(config.beta as f32))?;
-        Ok((mean_loss, scaled_rewards, desirable_losses, undesirable_losses))
+        Ok((
+            mean_loss,
+            scaled_rewards,
+            desirable_losses,
+            undesirable_losses,
+        ))
     }
 }
 
