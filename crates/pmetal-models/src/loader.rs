@@ -845,6 +845,8 @@ pub fn load_qwen3_next_weights(
 
     // Apply sanitized weights to model parameters
     let mut params = model.parameters_mut().flatten();
+    let expected_keys: HashSet<String> = params.keys().map(|key| key.to_string()).collect();
+    let loaded_keys: HashSet<String> = weights.keys().cloned().collect();
     let mut matched = 0usize;
     let mut unmatched = Vec::new();
     for (key, value) in &weights {
@@ -856,15 +858,25 @@ pub fn load_qwen3_next_weights(
         }
     }
     if !unmatched.is_empty() {
-        tracing::warn!(
-            "Qwen3Next weight loading: {}/{} unmatched weights: {:?}",
-            unmatched.len(),
-            matched + unmatched.len(),
+        return Err(LoadError::SafeTensors(format!(
+            "Qwen3Next weight loading found unmatched weights: {:?}",
             &unmatched[..unmatched.len().min(20)]
-        );
-    } else {
-        tracing::info!("Qwen3Next weight loading: all {matched} weights matched successfully");
+        )));
     }
+
+    let missing: Vec<String> = expected_keys
+        .difference(&loaded_keys)
+        .take(20)
+        .cloned()
+        .collect();
+    if !missing.is_empty() {
+        return Err(LoadError::SafeTensors(format!(
+            "Qwen3Next weight loading is missing model parameters: {:?}",
+            missing
+        )));
+    }
+
+    tracing::info!("Qwen3Next weight loading: all {matched} weights matched successfully");
     Ok(())
 }
 

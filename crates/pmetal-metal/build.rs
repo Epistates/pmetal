@@ -43,6 +43,9 @@ fn main() {
 }
 
 fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path) {
+    let cache_root = out_dir.join(".cache");
+    std::fs::create_dir_all(&cache_root).expect("Failed to create shader compiler cache");
+
     let metal_files: Vec<_> = std::fs::read_dir(shaders_dir)
         .expect("Failed to read shaders directory")
         .filter_map(|entry| {
@@ -70,6 +73,8 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path) {
         println!("cargo:rerun-if-changed={}", metal_file.display());
 
         let status = Command::new("xcrun")
+            .env("HOME", out_dir)
+            .env("XDG_CACHE_HOME", &cache_root)
             .args([
                 "-sdk",
                 "macosx",
@@ -104,6 +109,8 @@ fn compile_metal_shaders(shaders_dir: &Path, out_dir: &Path) {
     let metallib_file = out_dir.join("pmetal_kernels.metallib");
 
     let mut cmd = Command::new("xcrun");
+    cmd.env("HOME", out_dir);
+    cmd.env("XDG_CACHE_HOME", &cache_root);
     cmd.args(["-sdk", "macosx", "metallib"]);
 
     for air_file in &air_files {

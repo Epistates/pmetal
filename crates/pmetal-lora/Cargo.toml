@@ -30,6 +30,7 @@ mlx-sys = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
+tempfile = { workspace = true }
 
 [[bench]]
 name = "memory_benchmark"

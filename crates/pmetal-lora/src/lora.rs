@@ -57,7 +57,16 @@ pub enum LoraError {
 pub fn sanitize_loaded_weights(
     weights: HashMap<String, Array>,
 ) -> Result<HashMap<String, Array>, LoraError> {
-    Ok(weights)
+    let mut sanitized = HashMap::with_capacity(weights.len());
+    for (name, weight) in weights {
+        let weight = if weight.dtype() == Dtype::Bfloat16 {
+            weight.as_dtype(Dtype::Float16)?
+        } else {
+            weight
+        };
+        sanitized.insert(name, weight);
+    }
+    Ok(sanitized)
 }
 
 /// LoRA Linear layer that wraps a base Linear layer with low-rank adaptation.

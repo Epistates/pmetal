@@ -72,7 +72,9 @@ pub struct LoggingCallback {
 impl LoggingCallback {
     /// Create a new logging callback.
     pub fn new(log_every: usize) -> Self {
-        Self { log_every }
+        Self {
+            log_every: log_every.max(1),
+        }
     }
 }
 
@@ -110,7 +112,7 @@ impl CheckpointCallback {
     /// is managed by the training loop's `CheckpointManager`.
     pub fn new(save_every: usize, output_dir: &str) -> Self {
         Self {
-            save_every,
+            save_every: save_every.max(1),
             output_dir: output_dir.to_string(),
         }
     }

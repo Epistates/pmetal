@@ -126,6 +126,10 @@ impl LoraConfig {
     /// Compute the LoRA scaling factor.
     #[must_use]
     pub fn scaling(&self) -> f32 {
+        if self.r == 0 {
+            return 0.0;
+        }
+
         if self.use_rslora {
             self.alpha / (self.r as f32).sqrt()
         } else {
@@ -389,6 +393,7 @@ fn default_seed() -> u64 {
 fn default_logging_steps() -> usize {
     10
 }
+
 fn default_output_dir() -> String {
     "./output".into()
 }
@@ -397,4 +402,20 @@ fn default_split() -> String {
 }
 fn default_text_column() -> String {
     "text".into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LoraConfig;
+
+    #[test]
+    fn lora_scaling_is_zero_for_zero_rank() {
+        let config = LoraConfig {
+            r: 0,
+            alpha: 32.0,
+            ..Default::default()
+        };
+
+        assert_eq!(config.scaling(), 0.0);
+    }
 }

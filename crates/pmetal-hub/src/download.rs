@@ -44,6 +44,17 @@ const SKIP_FILES: &[&str] = &[
     "rust_model.ot",
 ];
 
+/// Dataset files worth downloading for local consumption.
+const DATASET_EXTENSIONS: &[&str] = &[
+    ".parquet",
+    ".json",
+    ".jsonl",
+    ".csv",
+    ".tsv",
+    ".txt",
+    ".arrow",
+];
+
 /// Download a model from HuggingFace Hub.
 ///
 /// Lists all files in the repo via `info()` and downloads everything needed:
@@ -92,6 +103,7 @@ pub async fn download_model(
     let mut model_dir: Option<PathBuf> = None;
     let mut downloaded = 0usize;
     let mut skipped = 0usize;
+    let mut failures = Vec::new();
 
     for filename in &all_files {
         // Skip files by extension
@@ -126,7 +138,7 @@ pub async fn download_model(
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to download {}: {}", filename, e);
+                failures.push(format!("{filename}: {e}"));
             }
         }
     }
@@ -138,9 +150,26 @@ pub async fn download_model(
         model_id
     );
 
-    model_dir.ok_or_else(|| {
-        pmetal_core::PMetalError::Hub(format!("No files downloaded for {}", model_id))
-    })
+    if downloaded == 0 {
+        return Err(pmetal_core::PMetalError::Hub(format!(
+            "No files downloaded for {}",
+            model_id
+        )));
+    }
+
+    if !failures.is_empty() {
+        let preview = failures
+            .into_iter()
+            .take(10)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return Err(pmetal_core::PMetalError::Hub(format!(
+            "Download incomplete for {}: {}",
+            model_id, preview
+        )));
+    }
+
+    model_dir.ok_or_else(|| pmetal_core::PMetalError::Hub(format!("No files downloaded for {}", model_id)))
 }
 
 /// Download a specific file from a model repository.
@@ -228,6 +257,13 @@ pub async fn download_safetensors(
         }
     }
 
+    if paths.is_empty() {
+        return Err(pmetal_core::PMetalError::Hub(format!(
+            "No safetensor shards found in index for {}",
+            model_id
+        )));
+    }
+
     Ok(paths)
 }
 
@@ -237,12 +273,13 @@ pub async fn download_safetensors(
 ///
 /// # Arguments
 /// * `dataset_id` - Dataset identifier (e.g., "tatsu-lab/alpaca")
-/// * `_split` - Dataset split (currently unused, reserved for future use)
+/// * `split` - Optional dataset split name; when set, files whose path
+///   contains this substring are also downloaded regardless of extension.
 /// * `revision` - Optional revision/branch
 /// * `token` - Optional authentication token (as SecretString for security)
 pub async fn download_dataset(
     dataset_id: &str,
-    _split: Option<&str>,
+    split: Option<&str>,
     revision: Option<&str>,
     token: Option<&SecretString>,
 ) -> Result<PathBuf> {
@@ -257,14 +294,49 @@ pub async fn download_dataset(
         None => api.repo(Repo::new(dataset_id.to_string(), RepoType::Dataset)),
     };
 
-    // Try to get the README first to determine the dataset path
-    let readme_path = repo
-        .get("README.md")
+    let repo_info = repo
+        .info()
         .await
-        .map_err(|e| pmetal_core::PMetalError::Hub(e.to_string()))?;
+        .map_err(|e| pmetal_core::PMetalError::Hub(format!("Failed to list repo files: {e}")))?;
 
-    // Return the parent directory (dataset cache location)
-    Ok(readme_path
+    let mut downloaded_paths = Vec::new();
+    let mut failures = Vec::new();
+
+    for sibling in &repo_info.siblings {
+        let filename = sibling.rfilename.as_str();
+        if filename.starts_with('.') {
+            continue;
+        }
+
+        let include = filename == "README.md"
+            || DATASET_EXTENSIONS.iter().any(|ext| filename.ends_with(ext))
+            || split.is_some_and(|s| filename.contains(s));
+        if !include {
+            continue;
+        }
+
+        match repo.get(filename).await {
+            Ok(path) => downloaded_paths.push(path),
+            Err(err) => failures.push(format!("{filename}: {err}")),
+        }
+    }
+
+    if downloaded_paths.is_empty() {
+        return Err(pmetal_core::PMetalError::Hub(format!(
+            "No dataset files downloaded for {}",
+            dataset_id
+        )));
+    }
+
+    if !failures.is_empty() {
+        return Err(pmetal_core::PMetalError::Hub(format!(
+            "Dataset download incomplete for {}: {}",
+            dataset_id,
+            failures.into_iter().take(10).collect::<Vec<_>>().join(", ")
+        )));
+    }
+
+    Ok(downloaded_paths[0]
         .parent()
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(".")))
