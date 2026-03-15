@@ -30,6 +30,7 @@ objc2-metal = { workspace = true }
 
 [dev-dependencies]
 serial_test = "3.2"
+tempfile = { workspace = true }
 
 [features]
 default = ["ane"]
