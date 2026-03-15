@@ -243,6 +243,8 @@ jobs:
             exit 0
           fi
 
+          # Use absolute path so cd doesn't break later references
+          APP_PATH="$(cd "$(dirname "$APP_PATH")" && pwd)/$(basename "$APP_PATH")"
           echo "Found app: $APP_PATH"
 
           if codesign -v "$APP_PATH" 2>/dev/null; then
@@ -250,11 +252,11 @@ jobs:
             codesign -vvv --deep --strict "$APP_PATH"
 
             APP_NAME=$(basename "$APP_PATH")
-            cd "$(dirname "$APP_PATH")"
-            ditto -c -k --sequesterRsrc --keepParent "$APP_NAME" "${APP_NAME%.app}-notarize.zip"
+            APP_DIR=$(dirname "$APP_PATH")
+            ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$APP_DIR/${APP_NAME%.app}-notarize.zip"
 
             echo "Submitting for notarization..."
-            xcrun notarytool submit "${APP_NAME%.app}-notarize.zip" \
+            xcrun notarytool submit "$APP_DIR/${APP_NAME%.app}-notarize.zip" \
               --apple-id "${{ secrets.APPLE_ID }}" \
               --password "${{ secrets.APPLE_ID_PASSWORD }}" \
               --team-id "${{ secrets.APPLE_TEAM_ID }}" \
