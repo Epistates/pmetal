@@ -80,3 +80,4 @@ data/
 test-fused-output/
 test-training-output/
 **/node_modules
+**/.svelte-kit
