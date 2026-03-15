@@ -279,7 +279,7 @@ impl AdaptiveLrController {
         Self {
             total_steps: 0,
             grace_period_steps: 30, // Minimum default; recomputed by set_total_steps()
-            warmup_samples: 30, // Need 30 loss samples before spike detection activates
+            warmup_samples: 30,     // Need 30 loss samples before spike detection activates
             loss_ema: 0.0,
             loss_ema_var: 0.0,
             ema_initialized: false,
@@ -326,7 +326,11 @@ impl AdaptiveLrController {
             self.grace_period_steps,
             self.config.warmup_fraction * 100.0,
             total_steps,
-            if self.config.rollback_enabled { "enabled" } else { "disabled" },
+            if self.config.rollback_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            },
             self.config.divergence_window,
             self.config.divergence_slope_threshold,
         );
@@ -1189,7 +1193,10 @@ mod tests {
     #[test]
     fn test_default_rollback_disabled() {
         let config = AdaptiveLrConfig::default();
-        assert!(!config.rollback_enabled, "Rollback should be off by default");
+        assert!(
+            !config.rollback_enabled,
+            "Rollback should be off by default"
+        );
     }
 
     #[test]
@@ -1210,7 +1217,10 @@ mod tests {
             };
             let (_lr, event) = ctrl.step(i, loss, 1e-4);
             assert!(
-                !matches!(event, LrEvent::EarlyStop { .. } | LrEvent::RollbackTriggered { .. }),
+                !matches!(
+                    event,
+                    LrEvent::EarlyStop { .. } | LrEvent::RollbackTriggered { .. }
+                ),
                 "Should NOT trigger rollback/early-stop during grace period at step {i}, got {event:?}"
             );
         }

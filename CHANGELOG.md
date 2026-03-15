@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.3.5] - 2026-03-15
 
+### Added
+
+- **Tool/function calling support**: Chat templates now support tool definitions and tool call formatting for models that natively support function calling:
+  - **Qwen/ChatML**: `<tools>` schema injection, `<tool_call>`/`<tool_response>` tags, consecutive tool message merging
+  - **Llama 3.1+/4**: `Environment: ipython` header, JSON function calls, `ipython` role for tool responses
+  - **Mistral v3+**: `[AVAILABLE_TOOLS]`/`[TOOL_CALLS]`/`[TOOL_RESULTS]` bracketed format
+  - **DeepSeek**: Qwen-style tool tags with DeepSeek's unicode tokens
+  - CLI: `pmetal infer --tools tools.json -p "What's the weather?"` accepts OpenAI-format tool definitions
+- **Tool calling types**: `ToolDefinition`, `ToolCall`, `FunctionCall`, `FunctionDefinition` — OpenAI-compatible structs with serde support for JSON parsing
+- **`Message` tool fields**: `tool_calls: Option<Vec<ToolCall>>` for assistant messages, `tool_call_id: Option<String>` for tool response messages, `Message::tool()` and `Message::assistant_tool_calls()` constructors
+- **`ChatTemplate::apply_with_tools()`**: New method accepting optional `&[ToolDefinition]` — injects tools into system prompts using model-native format
+
 ### Fixed
 
 - **Premature early stop during LoRA training**: The adaptive LR controller was falsely detecting "divergence" from the normal LoRA initialization loss rise (LoRA B starts at zero → first 5-10% of steps naturally increase loss). This triggered rollback cycles that exhausted `max_rollbacks` and killed training at ~5% progress. Fixed with three changes:

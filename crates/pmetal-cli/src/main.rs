@@ -289,6 +289,12 @@ enum Commands {
         #[arg(long)]
         show_thinking: bool,
 
+        /// Path to a JSON file containing tool/function definitions (OpenAI format).
+        /// Tools are injected into the system prompt using the model's native format.
+        /// Example: [{"type":"function","function":{"name":"get_weather","description":"...","parameters":{...}}}]
+        #[arg(long)]
+        tools: Option<String>,
+
         /// Use FP8 quantization for weights (~2x memory reduction).
         /// Quantizes model weights to 8-bit floating point (E4M3 format)
         /// for memory-efficient inference on Apple Silicon.
@@ -1319,12 +1325,27 @@ async fn main() -> anyhow::Result<()> {
             stream,
             minimal,
             show_thinking,
+            tools,
             fp8,
             #[cfg(feature = "ane")]
             no_ane,
             #[cfg(feature = "ane")]
             ane_max_seq_len,
         } => {
+            // Load tool definitions if provided
+            let tool_defs: Option<Vec<pmetal_data::chat_templates::ToolDefinition>> =
+                if let Some(ref tools_path) = tools {
+                    let tools_json = std::fs::read_to_string(tools_path)
+                        .map_err(|e| anyhow::anyhow!("Failed to read tools file: {}", e))?;
+                    let defs: Vec<pmetal_data::chat_templates::ToolDefinition> =
+                        serde_json::from_str(&tools_json)
+                            .map_err(|e| anyhow::anyhow!("Failed to parse tools JSON: {}", e))?;
+                    tracing::info!("Loaded {} tool definitions from {}", defs.len(), tools_path);
+                    Some(defs)
+                } else {
+                    None
+                };
+
             run_inference(
                 &model,
                 lora.as_deref(),
@@ -1347,6 +1368,7 @@ async fn main() -> anyhow::Result<()> {
                 minimal,
                 show_thinking,
                 fp8,
+                tool_defs.as_deref(),
                 #[cfg(feature = "ane")]
                 !no_ane,
                 #[cfg(not(feature = "ane"))]
@@ -3566,6 +3588,7 @@ async fn run_inference(
     minimal: bool,
     show_thinking: bool,
     fp8: bool,
+    tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
     ane: bool,
     ane_max_seq_len: usize,
 ) -> anyhow::Result<()> {
@@ -3669,8 +3692,8 @@ async fn run_inference(
 
     // Apply chat template if needed
     // The template handles thinking mode - model decides when to think unless --no-thinking
-    let (final_prompt, template_type) = if use_chat {
-        apply_chat_template(&tokenizer, prompt, system, &model_path, no_thinking)?
+    let (final_prompt, template_type) = if use_chat || tools.is_some() {
+        apply_chat_template(&tokenizer, prompt, system, &model_path, no_thinking, tools)?
     } else {
         (
             prompt.to_string(),
@@ -4224,14 +4247,40 @@ fn apply_chat_template(
     system_message: Option<&str>,
     model_path: &Path,
     no_thinking: bool,
+    tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
 ) -> anyhow::Result<(String, pmetal_data::chat_templates::ChatTemplateType)> {
-    use pmetal_data::chat_templates::ChatTemplateType;
+    use pmetal_data::chat_templates::{ChatTemplateType, Message};
 
     let detected = pmetal_data::chat_templates::detect_chat_template(
         model_path,
         &model_path.to_string_lossy(),
     );
 
+    // When tools are provided, use the structured template system which handles
+    // tool injection into system prompts in the model-native format
+    if tools.is_some() {
+        let mut messages = Vec::new();
+
+        // Build system message with optional thinking control
+        let sys_content = match (system_message, no_thinking) {
+            (Some(sys), true) => Some(format!("{}\n/no_think", sys)),
+            (Some(sys), false) => Some(sys.to_string()),
+            (None, true) => Some("/no_think".to_string()),
+            (None, false) => None,
+        };
+        if let Some(sys) = sys_content {
+            messages.push(Message::system(sys));
+        }
+
+        messages.push(Message::user(user_message));
+
+        let formatted = detected.apply_with_tools(&messages, tools);
+
+        // The formatted text includes the assistant generation prompt
+        return Ok((formatted.text, detected.template_type));
+    }
+
+    // No tools — use the existing per-template formatting functions
     let formatted = match detected.template_type {
         ChatTemplateType::ChatMl | ChatTemplateType::Qwen => {
             format_chatml(user_message, system_message, no_thinking)
@@ -4808,7 +4857,7 @@ async fn run_inference_with_lora(
 
     // Apply chat template if using chat mode
     let (final_prompt, template_type) = if use_chat {
-        apply_chat_template(tokenizer, prompt, system, model_path, no_thinking)?
+        apply_chat_template(tokenizer, prompt, system, model_path, no_thinking, None)?
     } else {
         (
             prompt.to_string(),
