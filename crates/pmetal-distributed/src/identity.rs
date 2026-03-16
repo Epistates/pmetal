@@ -134,20 +134,34 @@ impl NodeIdentity {
         let secret = ed25519_keypair.secret();
         let secret_bytes = secret.as_ref();
 
-        // Write to file with restrictive permissions
-        let mut file = File::create(path).map_err(|e| {
-            DistributedError::Config(format!("Failed to create keypair file: {}", e))
-        })?;
-
-        // Set file permissions to 600 (owner read/write only) on Unix
+        // Create file atomically with correct permissions from the start.
+        // O_CREAT | O_EXCL (via create_new) prevents TOCTOU: if the file
+        // already exists this errors rather than silently overwriting.
+        // Mode 0o600 means only the owner can read/write — no race window
+        // where the key is world-readable.
         #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let permissions = fs::Permissions::from_mode(0o600);
-            fs::set_permissions(path, permissions).map_err(|e| {
-                DistributedError::Config(format!("Failed to set keypair permissions: {}", e))
-            })?;
-        }
+        let mut file = {
+            use std::os::unix::fs::OpenOptionsExt;
+            std::fs::OpenOptions::new()
+                .mode(0o600)
+                .create_new(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| {
+                    DistributedError::Config(format!("Failed to create keypair file: {}", e))
+                })?
+        };
+
+        #[cfg(not(unix))]
+        let mut file = {
+            std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| {
+                    DistributedError::Config(format!("Failed to create keypair file: {}", e))
+                })?
+        };
 
         file.write_all(secret_bytes)
             .map_err(|e| DistributedError::Config(format!("Failed to write keypair: {}", e)))?;

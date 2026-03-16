@@ -80,6 +80,15 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+/// Reduction operation for `all_reduce`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReduceOp {
+    /// Sum all contributions across nodes.
+    Sum,
+    /// Average all contributions across nodes (sum divided by `world_size`).
+    Mean,
+}
+
 // Core modules
 pub mod auto;
 pub mod cloud_bridge;
@@ -112,6 +121,7 @@ pub use metrics::{DistributedMetrics, MetricsSnapshot, SharedMetrics};
 pub use namespace::NetworkNamespace;
 pub use ring::RingBackend;
 pub use topology::{ClusterTopology, ConnectionProfile, NodeProfile, SharedTopology};
+// ReduceOp is already public via `pub enum ReduceOp` at module level
 
 /// Interface for distributed operations.
 #[async_trait]
@@ -122,11 +132,13 @@ pub trait DistributedBackend: Send + Sync {
     /// Get the total number of nodes.
     fn world_size(&self) -> usize;
 
-    /// Perform an all-reduce operation on a buffer (sum).
+    /// Perform an all-reduce operation on a buffer.
     ///
-    /// The input buffer contains the local gradients.
-    /// On return, it should contain the sum of gradients from all nodes.
-    async fn all_reduce(&self, buffer: &mut [u8]) -> Result<()>;
+    /// The input buffer contains the local gradients encoded as little-endian
+    /// `f32` values.  On return, all nodes hold the same result:
+    /// - `ReduceOp::Sum`  – element-wise sum across all nodes.
+    /// - `ReduceOp::Mean` – element-wise sum divided by `world_size`.
+    async fn all_reduce(&self, buffer: &mut [u8], op: ReduceOp) -> Result<()>;
 
     /// Barrier synchronization.
     async fn barrier(&self) -> Result<()>;
@@ -165,13 +177,13 @@ impl DistributedContext {
         self.backend.world_size()
     }
 
-    /// Perform an all-reduce operation (sum) on the buffer.
+    /// Perform an all-reduce operation on the buffer.
     ///
-    /// After this call, all nodes will have the same values in their buffers,
-    /// which is the element-wise sum of all input buffers.
-    pub async fn all_reduce(&self, buffer: &mut [u8]) -> Result<()> {
+    /// After this call, all nodes will have the same values in their buffers.
+    /// `op` controls whether the result is a sum or mean across nodes.
+    pub async fn all_reduce(&self, buffer: &mut [u8], op: ReduceOp) -> Result<()> {
         let start = std::time::Instant::now();
-        let result = self.backend.all_reduce(buffer).await;
+        let result = self.backend.all_reduce(buffer, op).await;
 
         if let Some(ref metrics) = self.metrics {
             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -224,6 +236,7 @@ impl DistributedContext {
 pub mod prelude {
     pub use crate::DistributedBackend;
     pub use crate::DistributedContext;
+    pub use crate::ReduceOp;
     pub use crate::auto::{AutoDiscoveryBackend, AutoDiscoveryConfig};
     pub use crate::collective::{AllReduceStrategy, CollectiveConfig};
     pub use crate::compression::{CompressionStrategy, GradientCompressor};

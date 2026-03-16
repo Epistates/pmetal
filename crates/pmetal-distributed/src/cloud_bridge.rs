@@ -236,12 +236,36 @@ impl CloudBridge {
 
     // ── Private helpers ───────────────────────────────────────────────────
 
+    /// JSON-escape a metadata string and strip the outer double-quotes so it
+    /// can be embedded as a bare Python string value (between Python `"`s).
+    ///
+    /// `serde_json::to_string` produces a valid JSON string including outer
+    /// quotes and all interior escapes (`\"`, `\\`, `\n`, etc.).  We strip the
+    /// leading and trailing `"` so callers can write `"{escaped}"` in the
+    /// template and get a fully-safe Python string literal.
+    fn json_escape_str(s: &str) -> String {
+        let json = serde_json::to_string(s)
+            .unwrap_or_else(|_| format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"")));
+        // Strip the outer quotes produced by serde_json
+        json[1..json.len() - 1].to_string()
+    }
+
     /// Produce a self-contained, working Python bootstrap script.
     ///
     /// All Rust values are embedded as string/numeric literals — the script
     /// does NOT use Python f-strings for interpolated values, avoiding any
     /// accidental variable-name collision with the surrounding Python scope.
+    /// String metadata fields are JSON-escaped so that arbitrary content
+    /// (quotes, backslashes, Unicode) cannot break the generated Python source.
     fn generate_bootstrap(meta: &CloudTransferMetadata) -> String {
+        // JSON-escape all string fields so they cannot contain unescaped quotes
+        // or backslashes that would break the Python string literal boundaries.
+        let target_cluster = Self::json_escape_str(&meta.target_cluster);
+        let preferred_dtype = Self::json_escape_str(&meta.preferred_dtype);
+        let distributed_strategy = Self::json_escape_str(&meta.distributed_strategy);
+        let pmetal_version = Self::json_escape_str(&meta.pmetal_version);
+        let model_architecture = Self::json_escape_str(&meta.model_architecture);
+
         // Build optional loss strings without pulling in format complexity
         // inside the template.
         let best_loss_repr = match meta.best_loss {
@@ -573,16 +597,21 @@ def main():
 if __name__ == "__main__":
     main()
 "#,
-            pmetal_version = meta.pmetal_version,
-            target_cluster = meta.target_cluster,
-            preferred_dtype = meta.preferred_dtype,
-            distributed_strategy = meta.distributed_strategy,
+            // String fields use the JSON-escaped local variables so that
+            // backslashes, quotes, and other special characters in metadata
+            // values cannot break the generated Python string literals.
+            pmetal_version = pmetal_version,
+            target_cluster = target_cluster,
+            preferred_dtype = preferred_dtype,
+            distributed_strategy = distributed_strategy,
+            model_architecture = model_architecture,
+            // Numeric fields are formatted directly from meta — no escaping
+            // needed as they are not placed inside Python string delimiters.
             global_step = meta.global_step,
             epoch = meta.epoch,
             learning_rate = meta.learning_rate,
             best_loss_repr = best_loss_repr,
             ema_loss_repr = ema_loss_repr,
-            model_architecture = meta.model_architecture,
             hidden_size = meta.hidden_size,
             num_layers = meta.num_layers,
             dataloader_epoch = meta.dataloader_epoch,
