@@ -171,4 +171,33 @@ pub trait TrainableModel: ModuleParameters {
     fn supports_gradient_checkpointing(&self) -> bool {
         false
     }
+
+    /// NEFTune forward: apply uniform embedding noise before the transformer layers.
+    ///
+    /// Implements the NEFTune regularisation from Jain et al. (2023):
+    /// "NEFTune: Noisy Embeddings Improve Instruction Finetuning"
+    ///
+    /// For each training step, uniform noise U(-mag, mag) is added to the embedding
+    /// output, where `mag = alpha / sqrt(seq_len * embed_dim)`.  This is applied
+    /// only during forward passes that contribute to gradient computation (i.e. inside
+    /// `value_and_grad`); it has no effect at inference time.
+    ///
+    /// # Arguments
+    /// * `input_ids`   - Token IDs [batch, seq_len]
+    /// * `mask`        - Optional attention mask
+    /// * `noise_alpha` - NEFTune alpha hyperparameter (recommended: 5.0–15.0)
+    ///
+    /// The default implementation falls back to the regular `forward`, so models that
+    /// do not override this method silently skip the noise injection.  Override it when
+    /// the embedding lookup is directly accessible.
+    fn forward_noised(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        _noise_alpha: f32,
+    ) -> Result<Array, LoraError> {
+        // Default: delegate to forward without noise injection.
+        // Override in concrete model types that expose the embedding layer.
+        self.forward(input_ids, mask)
+    }
 }

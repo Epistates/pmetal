@@ -363,6 +363,10 @@ pub struct GaloreParamState {
     pub m: Option<Array>,
     /// Second moment (variance) in projected space.
     pub v: Option<Array>,
+    /// Adam step counter (independent of SVD update interval).
+    /// Used for bias correction — must track actual optimizer steps, not
+    /// projector iterations which only increment every `update_proj_gap` steps.
+    pub adam_step_count: usize,
 }
 
 impl GaloreParamState {
@@ -372,6 +376,7 @@ impl GaloreParamState {
             projector: GaloreProjector::new(config),
             m: None,
             v: None,
+            adam_step_count: 0,
         }
     }
 
@@ -401,8 +406,11 @@ impl GaloreParamState {
         // Project gradient to low-rank space
         let low_rank_grad = self.projector.project(grad)?;
 
-        // Get or initialize moments in projected space
-        let step = self.projector.iteration() as f32;
+        // Track Adam step count separately from SVD update count.
+        // projector.iteration() counts SVD updates (every update_proj_gap steps),
+        // but bias correction needs the actual Adam step count.
+        self.adam_step_count += 1;
+        let step = self.adam_step_count as f32;
 
         // Initialize moments if needed
         if self.m.is_none() {

@@ -82,6 +82,8 @@ pub struct LoraLinear {
     pub rank: i32,
     /// LoRA scaling factor (alpha / rank).
     pub scale: f32,
+    /// Pre-computed scale as MLX Array (avoids allocation on every forward pass).
+    pub scale_arr: Array,
     /// Whether the layer is merged.
     pub merged: bool,
     /// Whether to use bias.
@@ -156,6 +158,7 @@ impl LoraLinear {
             out_features,
             rank,
             scale,
+            scale_arr: Array::from_f32(scale),
             merged: false,
             use_bias: bias.is_some(),
             training: false,
@@ -231,6 +234,7 @@ impl LoraLinear {
             out_features,
             rank,
             scale,
+            scale_arr: Array::from_f32(scale),
             merged: false,
             use_bias,
             training: false,
@@ -300,7 +304,7 @@ impl LoraLinear {
             // LoRA forward: y_lora = scale * (x_lora @ A.T) @ B.T
             let xa = x_lora.matmul(&self.lora_a.t())?;
             let xab = xa.matmul(&self.lora_b.t())?;
-            let scale_arr = Array::from_f32(self.scale);
+            let scale_arr = &self.scale_arr;
             let y_lora = xab.multiply(&scale_arr)?;
 
             // Combined output
@@ -425,6 +429,48 @@ impl LoraLinear {
     /// Get the LoRA B parameters (for gradient computation).
     pub fn lora_b_params(&self) -> &Array {
         &self.lora_b
+    }
+
+    /// Borrow the LoRA A matrix (mirrors the `LinearAdapter` method API).
+    pub fn lora_a(&self) -> &Array {
+        &self.lora_a
+    }
+
+    /// Borrow the LoRA B matrix (mirrors the `LinearAdapter` method API).
+    pub fn lora_b(&self) -> &Array {
+        &self.lora_b
+    }
+
+    /// Mutably borrow the LoRA A matrix.
+    pub fn lora_a_mut(&mut self) -> &mut Array {
+        &mut self.lora_a
+    }
+
+    /// Mutably borrow the LoRA B matrix.
+    pub fn lora_b_mut(&mut self) -> &mut Array {
+        &mut self.lora_b
+    }
+
+    /// Borrow the frozen base weight matrix.
+    pub fn weight(&self) -> &Array {
+        &self.weight
+    }
+
+    /// Mutably borrow the frozen base weight matrix.
+    pub fn weight_mut(&mut self) -> &mut Array {
+        &mut self.weight
+    }
+
+    /// Extra trainable parameters beyond A and B (none for standard LoRA).
+    ///
+    /// Returns an empty vec. Mirrors the `LinearAdapter::extra_params` API.
+    pub fn extra_params(&self) -> Vec<(&str, &Array)> {
+        vec![]
+    }
+
+    /// Mutably access extra trainable parameters (none for standard LoRA).
+    pub fn extra_params_mut(&mut self) -> Vec<(&str, &mut Array)> {
+        vec![]
     }
 
     /// Set the LoRA A parameters.
@@ -574,6 +620,183 @@ pub fn effective_rank(config: &LoraConfig, module_name: &str) -> usize {
         config.r
     } else {
         0
+    }
+}
+
+/// Unified adapter layer that dispatches to either `LoraLinear` or `DoraLinear`.
+///
+/// Architecture construction code can use `LinearAdapter` in place of `LoraLinear`
+/// directly, choosing the variant based on `LoraConfig::use_dora`.  Both variants
+/// expose the same `forward` API so no further branching is needed at the call sites.
+///
+/// # DoRA
+///
+/// When `use_dora = true`, the layer is backed by [`crate::dora::DoraLinear`] which
+/// decomposes weight updates into magnitude and direction (Liu et al., 2024).
+#[derive(Debug)]
+pub enum LinearAdapter {
+    /// Standard LoRA — efficient, widely supported.
+    Lora(LoraLinear),
+    /// DoRA — weight-decomposed LoRA for improved quality.
+    Dora(crate::dora::DoraLinear),
+}
+
+impl LinearAdapter {
+    /// Create a new adapter layer based on `use_dora`.
+    ///
+    /// When `use_dora` is `false` this is equivalent to `LoraLinear::new`.
+    pub fn new(
+        in_features: i32,
+        out_features: i32,
+        rank: i32,
+        alpha: f32,
+        use_rslora: bool,
+        use_bias: bool,
+        use_dora: bool,
+    ) -> Result<Self, LoraError> {
+        if use_dora {
+            Ok(Self::Dora(crate::dora::DoraLinear::new(
+                in_features,
+                out_features,
+                rank,
+                alpha,
+                use_rslora,
+                use_bias,
+            )?))
+        } else {
+            Ok(Self::Lora(LoraLinear::new(
+                in_features,
+                out_features,
+                rank,
+                alpha,
+                use_rslora,
+                use_bias,
+            )?))
+        }
+    }
+
+    /// Create from `LoraConfig`.
+    pub fn from_lora_config(
+        in_features: i32,
+        out_features: i32,
+        config: &pmetal_core::LoraConfig,
+        use_bias: bool,
+    ) -> Result<Self, LoraError> {
+        let rank = config.r as i32;
+        Self::new(
+            in_features,
+            out_features,
+            rank,
+            config.alpha,
+            config.use_rslora,
+            use_bias,
+            config.use_dora,
+        )
+    }
+
+    /// Forward pass.
+    pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
+        match self {
+            Self::Lora(l) => l.forward(x),
+            Self::Dora(d) => d.forward(x),
+        }
+    }
+
+    /// Set training mode (controls dropout).
+    pub fn set_training(&mut self, training: bool) {
+        match self {
+            Self::Lora(l) => l.training = training,
+            Self::Dora(d) => d.training = training,
+        }
+    }
+
+    /// Number of trainable parameters.
+    pub fn num_trainable_params(&self) -> usize {
+        match self {
+            Self::Lora(l) => l.num_trainable_params(),
+            Self::Dora(d) => d.num_trainable_params(),
+        }
+    }
+
+    /// Whether this adapter uses DoRA.
+    pub fn is_dora(&self) -> bool {
+        matches!(self, Self::Dora(_))
+    }
+
+    /// Borrow the LoRA A matrix.
+    pub fn lora_a(&self) -> &Array {
+        match self {
+            Self::Lora(l) => &l.lora_a,
+            Self::Dora(d) => &d.lora_a,
+        }
+    }
+
+    /// Borrow the LoRA B matrix.
+    pub fn lora_b(&self) -> &Array {
+        match self {
+            Self::Lora(l) => &l.lora_b,
+            Self::Dora(d) => &d.lora_b,
+        }
+    }
+
+    /// Mutably borrow the LoRA A matrix.
+    pub fn lora_a_mut(&mut self) -> &mut Array {
+        match self {
+            Self::Lora(l) => &mut l.lora_a,
+            Self::Dora(d) => &mut d.lora_a,
+        }
+    }
+
+    /// Mutably borrow the LoRA B matrix.
+    pub fn lora_b_mut(&mut self) -> &mut Array {
+        match self {
+            Self::Lora(l) => &mut l.lora_b,
+            Self::Dora(d) => &mut d.lora_b,
+        }
+    }
+
+    /// Additional trainable parameters beyond A and B (DoRA magnitude vector).
+    ///
+    /// Returns an empty iterator for standard LoRA.  For DoRA, yields `("magnitude", magnitude)`.
+    pub fn extra_params(&self) -> Vec<(&str, &Array)> {
+        match self {
+            Self::Lora(_) => vec![],
+            Self::Dora(d) => vec![("magnitude", &d.magnitude)],
+        }
+    }
+
+    /// Mutably access additional trainable parameters (DoRA magnitude).
+    pub fn extra_params_mut(&mut self) -> Vec<(&str, &mut Array)> {
+        match self {
+            Self::Lora(_) => vec![],
+            Self::Dora(d) => vec![("magnitude", &mut d.magnitude)],
+        }
+    }
+
+    /// Borrow the frozen base weight matrix.
+    pub fn weight(&self) -> &Array {
+        match self {
+            Self::Lora(l) => &l.weight,
+            Self::Dora(d) => &d.weight,
+        }
+    }
+
+    /// Mutably borrow the frozen base weight matrix.
+    pub fn weight_mut(&mut self) -> &mut Array {
+        match self {
+            Self::Lora(l) => &mut l.weight,
+            Self::Dora(d) => &mut d.weight,
+        }
+    }
+
+    /// Merge LoRA/DoRA weights into the base weight matrix.
+    ///
+    /// Delegates to the inner [`LoraLinear::merge`] or [`crate::dora::DoraLinear::merge`].
+    pub fn merge(&mut self) -> Result<(), LoraError> {
+        match self {
+            Self::Lora(l) => l.merge(),
+            Self::Dora(d) => d.merge(),
+        }
     }
 }
 
