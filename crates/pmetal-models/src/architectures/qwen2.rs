@@ -701,16 +701,7 @@ impl Qwen2ForCausalLM {
     }
 }
 
-/// Create a causal attention mask.
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    // Create lower triangular mask with 1s for valid positions
-    let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-
-    // Where mask is 0, put -inf; where mask is 1, put 0
-    mlx_rs::ops::r#where(&mask.eq(&zero)?, &neg_inf, &zero)
-}
+use super::utils::create_causal_mask;
 
 /// Create a sliding window causal attention mask.
 fn create_sliding_window_mask(seq_len: i32, window_size: i32) -> Result<Array, Exception> {

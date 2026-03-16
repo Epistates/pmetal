@@ -9,6 +9,7 @@ use mlx_rs::error::Exception;
 use mlx_rs::macros::ModuleParameters;
 use mlx_rs::module::{Module, ModuleParameters};
 use mlx_rs::nested::NestedHashMap;
+use mlx_rs::ops::indexing::IndexOp;
 use mlx_rs::{Array, nn};
 use pmetal_core::ModelConfig;
 use pmetal_mlx::Builder;
@@ -58,6 +59,8 @@ pub struct RGLRU {
     #[param]
     pub output_proj: nn::Linear,
     pub width: i32,
+    /// Persistent recurrent state for decode mode.
+    pub recurrent_state: Option<Array>,
 }
 
 impl RGLRU {
@@ -76,15 +79,55 @@ impl RGLRU {
                 .build()
                 .map_err(|_| Exception::custom("Build error"))?,
             width: config.lru_width,
+            recurrent_state: None,
         })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        // RG-LRU recurrence: h_t = a_t * h_{t-1} + (1 - a_t) * (gate_t * input_t)
+        // where a_t = sigmoid(a_proj(x_t)) is the recurrent decay gate
         let input = self.input_proj.forward(x)?;
-        let _gate = self.gate_proj.forward(x)?;
-        let i = mlx_rs::ops::sigmoid(&input)?;
-        let h = input.multiply(&i)?;
-        self.output_proj.forward(&h)
+        let gate = self.gate_proj.forward(x)?;
+        let gate_activated = mlx_rs::ops::sigmoid(&gate)?;
+
+        // a_t: recurrent decay gate derived from input projection
+        let a_t = mlx_rs::ops::sigmoid(&input)?;
+
+        // Gated input: (1 - a_t) * (gate * input)
+        // Must gate the projected input, NOT the raw embedding x.
+        let one_minus_a = Array::from_f32(1.0).subtract(&a_t)?;
+        let gated_input = gate_activated.multiply(&input)?;
+        let scaled_input = one_minus_a.multiply(&gated_input)?;
+
+        // Apply recurrence
+        let seq_len = x.dim(1);
+        if seq_len == 1 {
+            // Decode path: single step with stored state
+            let h = if let Some(ref state) = self.recurrent_state {
+                a_t.multiply(state)?.add(&scaled_input)?
+            } else {
+                scaled_input
+            };
+            self.recurrent_state = Some(h.clone());
+            self.output_proj.forward(&h)
+        } else {
+            // Prefill path: sequential scan over time dimension
+            let batch = x.dim(0);
+            let mut h = Array::zeros::<f32>(&[batch, 1, self.width as i32])?;
+            let mut outputs = Vec::with_capacity(seq_len as usize);
+
+            for t in 0..seq_len {
+                let a_t_step: Array = a_t.index((.., t..t + 1, ..));
+                let input_step: Array = scaled_input.index((.., t..t + 1, ..));
+                h = a_t_step.multiply(&h)?.add(&input_step)?;
+                outputs.push(h.clone());
+            }
+            self.recurrent_state = Some(h);
+
+            let concatenated =
+                mlx_rs::ops::concatenate_axis(&outputs.iter().collect::<Vec<_>>(), 1)?;
+            self.output_proj.forward(&concatenated)
+        }
     }
 }
 

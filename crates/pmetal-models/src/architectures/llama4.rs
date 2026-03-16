@@ -1062,6 +1062,21 @@ impl Llama4ForCausalLM {
         Module::forward(&mut self.lm_head, &hidden_states)
     }
 
+    /// Forward pass accepting a KV cache parameter for API compatibility.
+    ///
+    /// Llama 4 attention uses iRoPE (interleaved RoPE/NoPE layers) and the
+    /// per-layer cache threading has not been implemented yet. The `_cache`
+    /// argument is accepted but ignored; full KV cache support will be added
+    /// in a future revision.
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        _cache: Option<&mut pmetal_mlx::kv_cache::KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward(input_ids, mask, None)
+    }
+
     /// Aggregate MoD auxiliary losses across all layers after a forward pass.
     ///
     /// Callers should add `config.router_aux_loss_coef * mod_aux_loss()` to the
