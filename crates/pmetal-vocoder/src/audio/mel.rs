@@ -126,7 +126,7 @@ pub fn mel_filterbank(config: &MelConfig) -> Result<Array> {
     // Convert to FFT bin indices
     let bin_points: Vec<f32> = hz_points
         .iter()
-        .map(|&f| (config.n_fft as f32 + 1.0) * f / config.sr as f32)
+        .map(|&f| config.n_fft as f32 * f / config.sr as f32)
         .collect();
 
     // Create filterbank matrix

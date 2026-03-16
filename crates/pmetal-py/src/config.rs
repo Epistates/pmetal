@@ -421,6 +421,8 @@ pub enum PyLrSchedulerType {
     Cosine,
     CosineWithRestarts,
     Polynomial,
+    /// Warmup-Stable-Decay schedule (modern default for LLM training).
+    Wsd,
 }
 
 #[pyclass(from_py_object, name = "OptimizerType", eq)]

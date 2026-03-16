@@ -273,6 +273,8 @@ impl PyTrainer {
                         embedding_lr,
                         eager_evaluation: false,
                         use_metal_fused_optimizer: metal_fused_optimizer,
+                        loraplus_lr_ratio: None,
+                        neftune_noise_alpha: None,
                     };
 
                     let mut training_loop = pmetal_trainer::TrainingLoop::new(loop_config);
