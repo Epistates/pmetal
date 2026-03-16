@@ -1146,6 +1146,7 @@ mod tests {
             adaptive_lr: None,
             adaptive_lr_override: None,
             callbacks: Vec::new(),
+            best_lora_snapshot: None,
         }
     }
 

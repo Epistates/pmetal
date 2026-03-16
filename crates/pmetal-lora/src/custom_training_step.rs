@@ -711,6 +711,7 @@ mod tests {
             target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
             bias: pmetal_core::LoraBias::None,
             init_lora_weights: true,
+            loraplus_lr_ratio: None,
             use_dora: false,
         }
     }

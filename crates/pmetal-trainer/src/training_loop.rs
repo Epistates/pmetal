@@ -3029,6 +3029,7 @@ mod tests {
             bias: pmetal_core::LoraBias::None,
             init_lora_weights: true,
             use_dora: false,
+            loraplus_lr_ratio: None,
         }
     }
 

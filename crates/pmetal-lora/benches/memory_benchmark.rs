@@ -51,6 +51,7 @@ fn create_lora_config() -> LoraConfig {
         ],
         bias: pmetal_core::LoraBias::None,
         init_lora_weights: true,
+        loraplus_lr_ratio: None,
         use_dora: false,
     }
 }
