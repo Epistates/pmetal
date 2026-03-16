@@ -334,7 +334,6 @@ impl TaidDistiller {
 
         // Sum over vocab and seq dimensions to get per-sample KL
         let kl_per_sample = kl_per_token.sum_axis(-1, None)?.sum_axis(-1, None)?;
-        kl_per_sample.eval()?;
 
         // Normalize difficulty to [0, 1] range using a shifted sigmoid so that
         // KL ≈ 0 (easy sample) maps to normalized_diff ≈ 0 → alpha ≈ base_alpha.
@@ -442,15 +441,42 @@ impl TaidDistiller {
         let target_probs =
             self.interpolate_distributions(&teacher_probs, &student_probs, &alpha)?;
 
+        // Compute log of the interpolated target using the log-sum-exp trick to avoid
+        // catastrophic cancellation when computing log(α·P_T + (1-α)·P_S).
+        //
+        // Given log_p = log(α·P_T + (1-α)·P_S) and the temperature-scaled log-softmax
+        // of teacher/student, we have:
+        //   log_target = log_sum_exp([log_teacher + log(α),
+        //                             log_student + log(1-α)])
+        //
+        // This is numerically equivalent but avoids exp→add→log round-trips that
+        // amplify floating-point error near the tails of the distribution.
+        let alpha_expanded = {
+            let a = alpha.reshape(&[alpha.dim(0), 1, 1])?;
+            a
+        };
+        let one_minus_alpha_expanded = Array::from_f32(1.0).subtract(&alpha_expanded)?;
+
+        let log_teacher_scaled = log_softmax(&teacher_scaled, -1)?;
+        // log_student_probs is already computed as `student_log_probs`
+        let log_target = {
+            // a = log_teacher + log(α),  b = log_student + log(1-α)
+            let eps_a = Array::from_f32(1e-10);
+            let log_a_coeff = alpha_expanded.add(&eps_a)?.log()?;
+            let log_b_coeff = one_minus_alpha_expanded.add(&eps_a)?.log()?;
+            let a = log_teacher_scaled.add(&log_a_coeff)?;
+            let b = student_log_probs.add(&log_b_coeff)?;
+            // log_sum_exp(a, b) = max(a,b) + log(exp(a-max)+exp(b-max))
+            let m = mlx_rs::ops::maximum(&a, &b)?;
+            let lse = m.add(&a.subtract(&m)?.exp()?.add(&b.subtract(&m)?.exp()?)?.log()?)?;
+            lse
+        };
+
         // Compute distillation loss
         let distill_loss = match self.config.loss_type {
             TaidLossType::KlDivergence => {
-                // KL(P_I || P_S) = sum(P_I * log(P_I / P_S))
-                let eps = Array::from_f32(1e-10);
-                let target_safe = target_probs.add(&eps)?;
-                let student_safe = student_probs.add(&eps)?;
-                let log_ratio = target_safe.divide(&student_safe)?.log()?;
-                let kl = target_probs.multiply(&log_ratio)?;
+                // KL(P_I || P_S) = sum(P_I * (log_target - log_student))
+                let kl = target_probs.multiply(&log_target.subtract(&student_log_probs)?)?;
                 kl.sum_axis(-1, None)?.mean(None)?
             }
             TaidLossType::CrossEntropy => {
@@ -460,18 +486,22 @@ impl TaidDistiller {
             }
             TaidLossType::JensenShannon => {
                 // JS = 0.5 * KL(P_I || M) + 0.5 * KL(P_S || M)
-                // where M = 0.5 * (P_I + P_S)
-                let eps = Array::from_f32(1e-10);
-                let m = target_probs
-                    .add(&student_probs)?
-                    .multiply(&Array::from_f32(0.5))?;
-                let m_safe = m.add(&eps)?;
+                // where M = 0.5 * (P_I + P_S), computed in log-space via
+                // log_m = log(0.5) + log_sum_exp(log_target, log_student)
+                let log_half = Array::from_f32(0.5_f32.ln());
+                let m_max = mlx_rs::ops::maximum(&log_target, &student_log_probs)?;
+                let log_m = log_half.add(
+                    &m_max.add(
+                        &log_target
+                            .subtract(&m_max)?
+                            .exp()?
+                            .add(&student_log_probs.subtract(&m_max)?.exp()?)?
+                            .log()?,
+                    )?,
+                )?;
 
-                let log_ratio_target = target_probs.add(&eps)?.divide(&m_safe)?.log()?;
-                let kl_target = target_probs.multiply(&log_ratio_target)?;
-
-                let log_ratio_student = student_probs.add(&eps)?.divide(&m_safe)?.log()?;
-                let kl_student = student_probs.multiply(&log_ratio_student)?;
+                let kl_target = target_probs.multiply(&log_target.subtract(&log_m)?)?;
+                let kl_student = student_probs.multiply(&student_log_probs.subtract(&log_m)?)?;
 
                 let js = kl_target
                     .add(&kl_student)?
@@ -479,12 +509,8 @@ impl TaidDistiller {
                 js.sum_axis(-1, None)?.mean(None)?
             }
             TaidLossType::ReverseKl => {
-                // KL(P_S || P_I) = sum(P_S * log(P_S / P_I))
-                let eps = Array::from_f32(1e-10);
-                let target_safe = target_probs.add(&eps)?;
-                let student_safe = student_probs.add(&eps)?;
-                let log_ratio = student_safe.divide(&target_safe)?.log()?;
-                let kl = student_probs.multiply(&log_ratio)?;
+                // KL(P_S || P_I) = sum(P_S * (log_student - log_target))
+                let kl = student_probs.multiply(&student_log_probs.subtract(&log_target)?)?;
                 kl.sum_axis(-1, None)?.mean(None)?
             }
         };
@@ -540,16 +566,15 @@ impl TaidDistiller {
             scaled_distill_loss.clone()
         };
 
-        // Compute mean alpha for logging
-        alpha.eval()?;
+        // Compute mean alpha for logging — kept as Array so callers can fuse
+        // this into their own graph without forcing a GPU-CPU sync here.
         let mean_alpha = alpha.mean(None)?;
-        mean_alpha.eval()?;
 
         Ok(TaidLossOutput {
             total: total_loss,
             distillation: scaled_distill_loss,
             hard_target: hard_loss,
-            mean_alpha: mean_alpha.item::<f32>(),
+            mean_alpha,
             base_alpha: base_alpha as f32,
         })
     }
@@ -569,9 +594,11 @@ pub struct TaidLossOutput {
     pub distillation: Array,
     /// Hard target loss component (if used).
     pub hard_target: Option<Array>,
-    /// Mean alpha used in this batch.
-    pub mean_alpha: f32,
-    /// Base alpha from temporal schedule.
+    /// Mean alpha used in this batch, kept as a lazy `Array` so callers can log
+    /// it without forcing a GPU-CPU sync before the backward pass.
+    /// Call `.item::<f32>()` when you need the scalar value for logging.
+    pub mean_alpha: Array,
+    /// Base alpha from temporal schedule (scalar, cheap to extract).
     pub base_alpha: f32,
 }
 

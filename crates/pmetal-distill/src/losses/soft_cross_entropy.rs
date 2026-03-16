@@ -134,19 +134,26 @@ impl SoftCrossEntropyLoss {
         teacher_flat.eval()?;
         student_flat.eval()?;
 
-        // Get raw data pointers using mlx-rs safe API (zero-copy on Apple Silicon unified memory)
-        // Using as_slice() is safe - it returns a slice backed by the array's data
-        let teacher_slice = teacher_flat.as_slice::<f32>();
-        let student_slice = student_flat.as_slice::<f32>();
-        let teacher_ptr = teacher_slice.as_ptr() as *mut f32;
-        let student_ptr = student_slice.as_ptr() as *mut f32;
+        // SAFETY: mlx_array_data_float32 returns *const f32 in mlx-rs 0.25.7+.
+        // metal_buffer_from_ptr requires *mut T because newBufferWithBytesNoCopy
+        // takes a mutable void pointer (Metal API constraint), but the buffer is
+        // created as a read-only view — we never write through this pointer.
+        // The cast is safe because:
+        //   1. The data is valid unified memory owned by the evaluated MLX arrays.
+        //   2. We only read from the Metal buffer (kernel input).
+        //   3. teacher_flat/student_flat remain alive for the duration of this fn.
+        let teacher_ptr =
+            unsafe { mlx_sys::mlx_array_data_float32(teacher_flat.as_ptr()) as *mut f32 };
+        let student_ptr =
+            unsafe { mlx_sys::mlx_array_data_float32(student_flat.as_ptr()) as *mut f32 };
 
-        // Create zero-copy Metal buffer views from the MLX array pointers
-        // SAFETY:
-        // 1. Pointers are from valid slices (as_slice ensures array is evaluated)
-        // 2. Arrays remain in scope - slices borrow from them
-        // 3. Apple Silicon unified memory allows GPU access to CPU memory
-        // 4. total_elements correctly represents the array size
+        if teacher_ptr.is_null() || student_ptr.is_null() {
+            return Err(crate::DistillError::Metal(
+                "mlx_array_data_float32 returned null — array may not be f32 or not evaluated"
+                    .to_string(),
+            ));
+        }
+
         let teacher_view = unsafe {
             metal_buffer_from_ptr(ctx, teacher_ptr, total_elements)
                 .map_err(|e| crate::DistillError::Metal(format!("Buffer view error: {}", e)))?
@@ -175,36 +182,6 @@ impl SoftCrossEntropyLoss {
         let mean_loss = output.mean_loss();
 
         Ok(Array::from_f32(mean_loss))
-    }
-
-    /// MLX fallback implementation.
-    fn compute_mlx(
-        &self,
-        teacher_logits: &Array,
-        student_logits: &Array,
-        temperature: f32,
-    ) -> Result<Array> {
-        // Scale logits by temperature
-        let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp)?;
-        let student_scaled = student_logits.divide(&temp)?;
-
-        // Teacher soft targets
-        let teacher_probs = softmax(&teacher_scaled, -1)?;
-
-        // Student log probabilities (log_softmax for numerical stability)
-        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
-
-        // Cross-entropy: -sum(p * log(q))
-        let neg_ce = teacher_probs.multiply(&student_log_probs)?;
-
-        // Sum over vocabulary dimension
-        let ce_per_token = neg_ce.sum_axes(&[-1], Some(false))?;
-
-        // Negate and mean over batch and sequence
-        let loss = ce_per_token.neg().mean(None)?;
-
-        Ok(loss)
     }
 }
 

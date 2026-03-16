@@ -188,19 +188,33 @@ impl HiddenStateLoss {
         teacher_flat.eval()?;
         student_flat.eval()?;
 
-        // Get raw data pointers using mlx-rs safe API (zero-copy on Apple Silicon unified memory)
-        // Using as_slice() is safe - it returns a slice backed by the array's data
-        let teacher_slice = teacher_flat.as_slice::<f32>();
-        let student_slice = student_flat.as_slice::<f32>();
-        let teacher_ptr = teacher_slice.as_ptr() as *mut f32;
-        let student_ptr = student_slice.as_ptr() as *mut f32;
-
-        // Create zero-copy Metal buffer views from the MLX array pointers
+        // Get raw data pointers via mlx_sys which returns a legitimate *mut f32
+        // backed by the array's unified-memory allocation.
         // SAFETY:
-        // 1. Pointers are from valid slices (as_slice ensures array is evaluated)
-        // 2. Arrays remain in scope - slices borrow from them
-        // 3. Apple Silicon unified memory allows GPU access to CPU memory
-        // 4. teacher_elements/student_elements correctly represent the array sizes
+        // 1. Arrays have been eval()'d above — data is present in unified memory
+        // 2. Arrays remain in scope for the duration of the Metal buffer views
+        // 3. Apple Silicon unified memory is directly accessible by the GPU
+        // 4. teacher_elements/student_elements correctly bound each allocation
+        // SAFETY: mlx_array_data_float32 returns *const f32 in mlx-rs 0.25.7+.
+        // metal_buffer_from_ptr requires *mut T because newBufferWithBytesNoCopy
+        // takes a mutable void pointer (Metal API constraint), but the buffer is
+        // created as a read-only view — we never write through this pointer.
+        // The cast is safe because:
+        //   1. The data is valid unified memory owned by the evaluated MLX arrays.
+        //   2. We only read from the Metal buffer (kernel input).
+        //   3. teacher_flat/student_flat remain alive for the duration of this fn.
+        let teacher_ptr =
+            unsafe { mlx_sys::mlx_array_data_float32(teacher_flat.as_ptr()) as *mut f32 };
+        let student_ptr =
+            unsafe { mlx_sys::mlx_array_data_float32(student_flat.as_ptr()) as *mut f32 };
+
+        if teacher_ptr.is_null() || student_ptr.is_null() {
+            return Err(crate::DistillError::Metal(
+                "mlx_array_data_float32 returned null — array may not be f32 or not evaluated"
+                    .to_string(),
+            ));
+        }
+
         let teacher_view = unsafe {
             metal_buffer_from_ptr(ctx, teacher_ptr, teacher_elements)
                 .map_err(|e| crate::DistillError::Metal(format!("Buffer view error: {}", e)))?
@@ -288,17 +302,50 @@ pub struct LayerDistillation {
     layer_mapping: Vec<(usize, usize)>,
     /// Loss function for each layer pair.
     loss: HiddenStateLoss,
-    /// Weight for the total hidden state loss.
-    weight: f32,
+    /// Relative per-layer weights (must be the same length as `layer_mapping`).
+    /// These are normalized internally: the final loss is a weighted average over
+    /// in-bounds pairs multiplied by `global_weight`.
+    weights: Vec<f32>,
+    /// Global scalar applied after the weighted average.
+    global_weight: f32,
 }
 
 impl LayerDistillation {
-    /// Create a new layer distillation config.
+    /// Create a new layer distillation config with a uniform weight for all pairs.
+    ///
+    /// The `weight` argument is a global multiplier applied to the mean loss
+    /// across all layer pairs (backwards-compatible with the original API).
     pub fn new(layer_mapping: Vec<(usize, usize)>, loss: HiddenStateLoss, weight: f32) -> Self {
+        let n = layer_mapping.len();
+        Self {
+            weights: vec![1.0; n],
+            layer_mapping,
+            loss,
+            global_weight: weight,
+        }
+    }
+
+    /// Create a layer distillation config with per-layer relative weights.
+    ///
+    /// Each pair's contribution is `weight[i] * loss[i]` divided by the sum of
+    /// the in-bounds weights. The result is further scaled by `global_weight`.
+    /// `weights` must have the same length as `layer_mapping`.
+    pub fn new_with_weights(
+        layer_mapping: Vec<(usize, usize)>,
+        loss: HiddenStateLoss,
+        weights: Vec<f32>,
+        global_weight: f32,
+    ) -> Self {
+        assert_eq!(
+            layer_mapping.len(),
+            weights.len(),
+            "layer_mapping and weights must have the same length"
+        );
         Self {
             layer_mapping,
             loss,
-            weight,
+            weights,
+            global_weight,
         }
     }
 
@@ -333,28 +380,42 @@ impl LayerDistillation {
     }
 
     /// Compute total hidden state loss across all layer pairs.
+    ///
+    /// Each pair is weighted by its corresponding entry in `self.weights`.
+    /// The result is the sum of weighted losses divided by the total weight of
+    /// in-bounds pairs (so out-of-bounds pairs do not dilute the signal).
     pub fn compute(&self, teacher_hiddens: &[Array], student_hiddens: &[Array]) -> Result<Array> {
         if self.layer_mapping.is_empty() {
             return Ok(Array::from_f32(0.0));
         }
 
         let mut total_loss = Array::from_f32(0.0);
-        let mut count = 0;
+        let mut weight_total = 0.0_f32;
 
-        for (teacher_idx, student_idx) in &self.layer_mapping {
+        for ((teacher_idx, student_idx), &w) in self.layer_mapping.iter().zip(self.weights.iter()) {
             if *teacher_idx < teacher_hiddens.len() && *student_idx < student_hiddens.len() {
                 let loss = self.loss.compute(
                     &teacher_hiddens[*teacher_idx],
                     &student_hiddens[*student_idx],
                 )?;
-                total_loss = total_loss.add(&loss)?;
-                count += 1;
+                total_loss = total_loss.add(&loss.multiply(&Array::from_f32(w))?)?;
+                weight_total += w;
+            } else {
+                tracing::warn!(
+                    teacher_idx,
+                    student_idx,
+                    teacher_layers = teacher_hiddens.len(),
+                    student_layers = student_hiddens.len(),
+                    "layer pair ({}, {}) is out of bounds and will be skipped",
+                    teacher_idx,
+                    student_idx,
+                );
             }
         }
 
-        if count > 0 {
-            let avg_loss = total_loss.divide(&Array::from_f32(count as f32))?;
-            Ok(avg_loss.multiply(&Array::from_f32(self.weight))?)
+        if weight_total > 0.0 {
+            let avg = total_loss.divide(&Array::from_f32(weight_total))?;
+            Ok(avg.multiply(&Array::from_f32(self.global_weight))?)
         } else {
             Ok(Array::from_f32(0.0))
         }
@@ -365,9 +426,36 @@ impl LayerDistillation {
         &self.layer_mapping
     }
 
-    /// Get the weight.
-    pub fn weight(&self) -> f32 {
-        self.weight
+    /// Get the per-layer relative weights.
+    pub fn weights(&self) -> &[f32] {
+        &self.weights
+    }
+
+    /// Get the global weight multiplier.
+    pub fn global_weight(&self) -> f32 {
+        self.global_weight
+    }
+}
+
+// SAFETY: `HiddenStateLoss` is constructed once and its `projection` Array (if any)
+// is thereafter immutable. MLX arrays on Apple Silicon use an internal reference-count
+// that is thread-safe; we never mutate the array from multiple threads simultaneously.
+unsafe impl Send for HiddenStateLoss {}
+unsafe impl Sync for HiddenStateLoss {}
+
+impl super::DistillLoss for HiddenStateLoss {
+    fn compute_weighted(
+        &self,
+        teacher: &Array,
+        student: &Array,
+        _temperature: f32,
+        _weights: Option<&Array>,
+    ) -> Result<Array> {
+        self.compute(teacher, student)
+    }
+
+    fn name(&self) -> &'static str {
+        HiddenStateLoss::name(self)
     }
 }
 

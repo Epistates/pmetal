@@ -288,23 +288,41 @@ impl Distiller {
     }
 
     /// Compute distillation loss for a batch.
+    ///
+    /// # Arguments
+    /// * `teacher_logits` - Teacher model logits.
+    /// * `student_logits` - Student model logits.
+    /// * `labels` - Optional ground-truth labels for hard target loss.
+    /// * `weights` - Optional per-token loss weights.
+    /// * `step` - Current training step (used by the progressive schedule).
+    /// * `total_steps` - Total training steps (used by the progressive schedule).
+    ///
+    /// When the distillation method is `Progressive`, `temperature` and `alpha`
+    /// are derived dynamically via `progressive_params(step, total_steps)` instead
+    /// of reading static config values, so the schedule actually takes effect.
     pub fn compute_loss(
         &self,
         teacher_logits: &Array,
         student_logits: &Array,
         labels: Option<&Array>,
         weights: Option<&Array>,
+        step: usize,
+        total_steps: usize,
     ) -> Result<DistillLossOutput> {
+        // Resolve (temperature, alpha): static config or progressive schedule.
+        let (temperature, alpha) = if self.config.method == DistillMethod::Progressive {
+            self.progressive_params(step, total_steps)
+        } else {
+            (self.config.loss.temperature, self.config.loss.alpha)
+        };
+
         // Soft distillation loss
-        let soft_loss = self.loss.compute_weighted(
-            teacher_logits,
-            student_logits,
-            self.config.loss.temperature,
-            weights,
-        )?;
+        let soft_loss =
+            self.loss
+                .compute_weighted(teacher_logits, student_logits, temperature, weights)?;
 
         // Scale by temperature squared (to maintain gradient magnitude)
-        let t_squared = self.config.loss.temperature * self.config.loss.temperature;
+        let t_squared = temperature * temperature;
         let soft_scaled = soft_loss.multiply(&Array::from_f32(t_squared))?;
 
         // Combined with hard labels if provided
@@ -312,7 +330,6 @@ impl Distiller {
             let hard_loss = compute_hard_loss(student_logits, labels)?;
 
             // total = alpha * soft + (1 - alpha) * hard
-            let alpha = self.config.loss.alpha;
             let soft_weighted = soft_scaled.multiply(&Array::from_f32(alpha))?;
             let hard_weighted = hard_loss.multiply(&Array::from_f32(1.0 - alpha))?;
 
@@ -339,8 +356,17 @@ impl Distiller {
         student_hiddens: &[Array],
         labels: Option<&Array>,
         weights: Option<&Array>,
+        step: usize,
+        total_steps: usize,
     ) -> Result<DistillLossOutput> {
-        let mut output = self.compute_loss(teacher_logits, student_logits, labels, weights)?;
+        let mut output = self.compute_loss(
+            teacher_logits,
+            student_logits,
+            labels,
+            weights,
+            step,
+            total_steps,
+        )?;
 
         // Add hidden state loss if configured
         if let Some(_hidden_loss) = &self.hidden_loss {
@@ -480,7 +506,7 @@ mod tests {
         let student = Array::from_slice(&[4.0_f32, 3.0, 2.0, 1.0], &[1, 1, 4]);
 
         let output = distiller
-            .compute_loss(&teacher, &student, None, None)
+            .compute_loss(&teacher, &student, None, None, 0, 1000)
             .unwrap();
 
         // Loss should be positive

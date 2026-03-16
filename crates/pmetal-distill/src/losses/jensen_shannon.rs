@@ -145,19 +145,26 @@ impl JensenShannonLoss {
         teacher_flat.eval()?;
         student_flat.eval()?;
 
-        // Get raw data pointers using mlx-rs safe API (zero-copy on Apple Silicon unified memory)
-        // Using as_slice() is safe - it returns a slice backed by the array's data
-        let teacher_slice = teacher_flat.as_slice::<f32>();
-        let student_slice = student_flat.as_slice::<f32>();
-        let teacher_ptr = teacher_slice.as_ptr() as *mut f32;
-        let student_ptr = student_slice.as_ptr() as *mut f32;
+        // SAFETY: mlx_array_data_float32 returns *const f32 in mlx-rs 0.25.7+.
+        // metal_buffer_from_ptr requires *mut T because newBufferWithBytesNoCopy
+        // takes a mutable void pointer (Metal API constraint), but the buffer is
+        // created as a read-only view — we never write through this pointer.
+        // The cast is safe because:
+        //   1. The data is valid unified memory owned by the evaluated MLX arrays.
+        //   2. We only read from the Metal buffer (kernel input).
+        //   3. teacher_flat/student_flat remain alive for the duration of this fn.
+        let teacher_ptr =
+            unsafe { mlx_sys::mlx_array_data_float32(teacher_flat.as_ptr()) as *mut f32 };
+        let student_ptr =
+            unsafe { mlx_sys::mlx_array_data_float32(student_flat.as_ptr()) as *mut f32 };
 
-        // Create zero-copy Metal buffer views from the MLX array pointers
-        // SAFETY:
-        // 1. Pointers are from valid slices (as_slice ensures array is evaluated)
-        // 2. Arrays remain in scope - slices borrow from them
-        // 3. Apple Silicon unified memory allows GPU access to CPU memory
-        // 4. total_elements correctly represents the array size
+        if teacher_ptr.is_null() || student_ptr.is_null() {
+            return Err(crate::DistillError::Metal(
+                "mlx_array_data_float32 returned null — array may not be f32 or not evaluated"
+                    .to_string(),
+            ));
+        }
+
         let teacher_view = unsafe {
             metal_buffer_from_ptr(ctx, teacher_ptr, total_elements)
                 .map_err(|e| crate::DistillError::Metal(format!("Buffer view error: {}", e)))?
@@ -186,44 +193,6 @@ impl JensenShannonLoss {
         let mean_loss = output.mean_loss();
 
         Ok(Array::from_f32(mean_loss))
-    }
-
-    /// MLX fallback implementation using log-domain computation for numerical stability.
-    fn compute_mlx(
-        &self,
-        teacher_logits: &Array,
-        student_logits: &Array,
-        temperature: f32,
-    ) -> Result<Array> {
-        // Scale logits by temperature
-        let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp)?;
-        let student_scaled = student_logits.divide(&temp)?;
-
-        // Log-softmax for numerical stability
-        let teacher_log_probs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
-        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
-        let teacher_probs = teacher_log_probs.exp()?;
-
-        // log(M) = log(0.5*(P+Q)) via log-sum-exp for stability (avoids 0*-inf = NaN)
-        // log(M) = -ln(2) + log(exp(log_P) + exp(log_Q))
-        let log2 = Array::from_f32(2.0_f32.ln());
-        let log_mixture = log_sum_exp(&teacher_log_probs, &student_log_probs)?.subtract(&log2)?;
-
-        // KL(P || M) = sum(P * (log_P - log_M))
-        let kl_teacher_m = teacher_probs.multiply(&teacher_log_probs.subtract(&log_mixture)?)?;
-
-        // KL(Q || M) = sum(Q * (log_Q - log_M))
-        let student_probs = student_log_probs.exp()?;
-        let kl_student_m = student_probs.multiply(&student_log_probs.subtract(&log_mixture)?)?;
-
-        // JS = 0.5 * (KL(P||M) + KL(Q||M))
-        let half = Array::from_f32(0.5);
-        let js = kl_teacher_m.add(&kl_student_m)?.multiply(&half)?;
-
-        // Sum over vocab, mean over batch and sequence
-        let js_sum = js.sum_axes(&[-1], Some(false))?;
-        Ok(js_sum.mean(None)?)
     }
 }
 

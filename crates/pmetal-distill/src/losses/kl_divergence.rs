@@ -17,7 +17,7 @@
 
 #![allow(unsafe_code)]
 
-use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k, softmax};
+use super::{DistillLoss, SPARSE_TOPK_DEFAULT, align_vocab_with_k};
 use crate::Result;
 use mlx_rs::Array;
 use tracing;
@@ -153,19 +153,26 @@ impl KlDivergenceLoss {
         teacher_flat.eval()?;
         student_flat.eval()?;
 
-        // Get raw data pointers using mlx-rs safe API (zero-copy on Apple Silicon unified memory)
-        // Using as_slice() is safe - it returns a slice backed by the array's data
-        let teacher_slice = teacher_flat.as_slice::<f32>();
-        let student_slice = student_flat.as_slice::<f32>();
-        let teacher_ptr = teacher_slice.as_ptr() as *mut f32;
-        let student_ptr = student_slice.as_ptr() as *mut f32;
+        // SAFETY: mlx_array_data_float32 returns *const f32 in mlx-rs 0.25.7+.
+        // metal_buffer_from_ptr requires *mut T because newBufferWithBytesNoCopy
+        // takes a mutable void pointer (Metal API constraint), but the buffer is
+        // created as a read-only view — we never write through this pointer.
+        // The cast is safe because:
+        //   1. The data is valid unified memory owned by the evaluated MLX arrays.
+        //   2. We only read from the Metal buffer (kernel input).
+        //   3. teacher_flat/student_flat remain alive for the duration of this fn.
+        let teacher_ptr =
+            unsafe { mlx_sys::mlx_array_data_float32(teacher_flat.as_ptr()) as *mut f32 };
+        let student_ptr =
+            unsafe { mlx_sys::mlx_array_data_float32(student_flat.as_ptr()) as *mut f32 };
 
-        // Create zero-copy Metal buffer views from the MLX array pointers
-        // SAFETY:
-        // 1. Pointers are from valid slices (as_slice ensures array is evaluated)
-        // 2. Arrays remain in scope - slices borrow from them
-        // 3. Apple Silicon unified memory allows GPU access to CPU memory
-        // 4. total_elements correctly represents the array size
+        if teacher_ptr.is_null() || student_ptr.is_null() {
+            return Err(crate::DistillError::Metal(
+                "mlx_array_data_float32 returned null — array may not be f32 or not evaluated"
+                    .to_string(),
+            ));
+        }
+
         let teacher_view = unsafe {
             metal_buffer_from_ptr(ctx, teacher_ptr, total_elements)
                 .map_err(|e| crate::DistillError::Metal(format!("Buffer view error: {}", e)))?
@@ -197,53 +204,6 @@ impl KlDivergenceLoss {
         let mean_loss = output.mean_loss();
 
         Ok(Array::from_f32(mean_loss))
-    }
-
-    /// MLX fallback implementation.
-    fn compute_mlx(
-        &self,
-        teacher_logits: &Array,
-        student_logits: &Array,
-        temperature: f32,
-    ) -> Result<Array> {
-        // Scale logits by temperature
-        let temp = Array::from_f32(temperature);
-        let teacher_scaled = teacher_logits.divide(&temp)?;
-        let student_scaled = student_logits.divide(&temp)?;
-
-        // Diagnostics
-        if let Ok(t_max) = teacher_scaled.max(false) {
-            t_max.eval().ok();
-            if t_max.item::<f32>().is_infinite() || t_max.item::<f32>().is_nan() {
-                tracing::warn!(
-                    "KL fallback: teacher_scaled contains Inf/NaN after temperature scaling"
-                );
-            }
-        }
-
-        // Use log-domain computation instead of adding epsilon to probabilities.
-        // Adding epsilon to softmax outputs biases the distribution; log_softmax
-        // avoids this by computing log-probabilities directly and numerically stably.
-        let teacher_log_probs = mlx_rs::nn::log_softmax(&teacher_scaled, -1)?;
-        let student_log_probs = mlx_rs::nn::log_softmax(&student_scaled, -1)?;
-        let teacher_probs = teacher_log_probs.exp()?;
-        let student_probs = student_log_probs.exp()?;
-
-        let kl = if self.reverse {
-            // KL(student || teacher) = sum(student * (log_student - log_teacher))
-            let log_ratio = student_log_probs.subtract(&teacher_log_probs)?;
-            student_probs.multiply(&log_ratio)?
-        } else {
-            // KL(teacher || student) = sum(teacher * (log_teacher - log_student))
-            let log_ratio = teacher_log_probs.subtract(&student_log_probs)?;
-            teacher_probs.multiply(&log_ratio)?
-        };
-
-        // Sum over vocabulary dimension, then mean over batch and sequence
-        let kl_sum = kl.sum_axes(&[-1], Some(false))?;
-        let loss = kl_sum.mean(None)?;
-
-        Ok(loss)
     }
 }
 

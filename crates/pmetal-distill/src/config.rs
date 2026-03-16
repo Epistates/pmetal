@@ -34,7 +34,7 @@ pub struct DistillConfig {
 }
 
 /// Distillation method.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DistillMethod {
     /// Online distillation - teacher runs alongside student.

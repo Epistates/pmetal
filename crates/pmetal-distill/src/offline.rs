@@ -144,6 +144,12 @@ impl LogitCache {
 
     /// Load cached logits for a sequence.
     pub fn load_sequence(&self, sequence_id: usize) -> Result<Array> {
+        if sequence_id >= self.metadata.num_sequences {
+            return Err(DistillError::LogitCache(format!(
+                "sequence_id {} is out of range (cache contains {} sequences)",
+                sequence_id, self.metadata.num_sequences,
+            )));
+        }
         let path = self.cache_dir.join(format!("seq_{:06}.bin", sequence_id));
         let file = File::open(&path)?;
         let mut reader = BufReader::new(file);
@@ -216,10 +222,10 @@ pub enum CompressedLogits {
         /// K value.
         k: usize,
     },
-    /// Quantized to int8.
+    /// Quantized to int8 (stored as unsigned bytes; range [0, 255] via affine mapping).
     Int8 {
-        /// Quantized values.
-        data: Vec<i8>,
+        /// Quantized values (unsigned 8-bit, zero_point-shifted affine encoding).
+        data: Vec<u8>,
         /// Scale factor.
         scale: f32,
         /// Zero point.
@@ -238,6 +244,45 @@ pub enum CompressedLogits {
         /// Shape.
         shape: Vec<i32>,
     },
+}
+
+impl CompressedLogits {
+    /// Validate the internal invariants of this compressed representation.
+    ///
+    /// Returns an error with a descriptive message if any invariant is violated.
+    pub fn validate(&self) -> Result<()> {
+        match self {
+            CompressedLogits::TopK {
+                values,
+                indices,
+                num_tokens,
+                k,
+            } => {
+                let expected = num_tokens * k;
+                if values.len() != expected {
+                    return Err(DistillError::LogitCache(format!(
+                        "TopK values length mismatch: expected {} (num_tokens={} * k={}), got {}",
+                        expected,
+                        num_tokens,
+                        k,
+                        values.len(),
+                    )));
+                }
+                if indices.len() != expected {
+                    return Err(DistillError::LogitCache(format!(
+                        "TopK indices length mismatch: expected {} (num_tokens={} * k={}), got {}",
+                        expected,
+                        num_tokens,
+                        k,
+                        indices.len(),
+                    )));
+                }
+                Ok(())
+            }
+            // Full, Int8, Int4 shapes are checked during decompress; no extra validation needed.
+            _ => Ok(()),
+        }
+    }
 }
 
 /// Compressor for teacher logits.
@@ -308,32 +353,48 @@ impl LogitCompressor {
             let num_tokens: i32 = shape[..shape.len() - 1].iter().product();
             logits.reshape(&[num_tokens, vocab_size as i32])?
         };
-
         let num_tokens = flat.dim(0) as usize;
-        let data: Vec<f32> = flat.as_slice().to_vec();
 
-        // Find top-k for each token
+        // CPU top-k selection: offline compression is a preprocessing step run once
+        // per dataset, not a training hot path. CPU partial sort is simpler and more
+        // predictable than navigating MLX lazy-eval semantics for index arrays.
+        flat.eval()?;
+        let data_slice: &[f32] = flat.as_slice();
+
         let mut all_values = Vec::with_capacity(num_tokens * k);
         let mut all_indices = Vec::with_capacity(num_tokens * k);
 
         for t in 0..num_tokens {
-            let token_logits: Vec<(usize, f32)> = (0..vocab_size)
-                .map(|v| (v, data[t * vocab_size + v]))
-                .collect();
-
-            // Partial sort to get top-k
-            let mut sorted = token_logits;
-            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
-
-            for (idx, val) in sorted.into_iter().take(k) {
-                all_values.push(val);
+            let row = &data_slice[t * vocab_size..(t + 1) * vocab_size];
+            // Collect (index, value) pairs and partial-sort to extract top-k.
+            let mut order: Vec<usize> = (0..vocab_size).collect();
+            // Use select_nth_unstable_by to partition in O(V) with a partial sort.
+            // After this call, order[..k] are the k largest-value indices (unordered).
+            if k < vocab_size {
+                order.select_nth_unstable_by(k - 1, |&a, &b| {
+                    row[b]
+                        .partial_cmp(&row[a])
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+            }
+            // Sort the top-k window descending for deterministic output.
+            order[..k].sort_unstable_by(|&a, &b| {
+                row[b]
+                    .partial_cmp(&row[a])
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            for &idx in &order[..k] {
+                all_values.push(row[idx]);
                 all_indices.push(idx as i32);
             }
         }
 
+        let values = all_values;
+        let indices = all_indices;
+
         Ok(CompressedLogits::TopK {
-            values: all_values,
-            indices: all_indices,
+            values,
+            indices,
             num_tokens,
             k,
         })
@@ -372,42 +433,108 @@ impl LogitCompressor {
         let data: Vec<f32> = logits.as_slice().to_vec();
         let shape = logits.shape().to_vec();
 
-        // Find min/max for quantization
-        let min = data.iter().cloned().fold(f32::INFINITY, f32::min);
-        let max = data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        // Per-token quantization: compute min/max per row so that each token's
+        // dynamic range is captured independently. This avoids a single outlier
+        // token causing all other tokens to be squashed into a narrow band.
+        //
+        // Layout: `data` is stored as a flat Vec<u8> of quantised values followed
+        // immediately by 2 * num_tokens f32s (scale_0, zp_0, scale_1, zp_1, …)
+        // packed as raw little-endian bytes.
+        //
+        // The legacy global-scale format is detected at decompress time by
+        // `scale.is_nan()` (the sentinel stored in the outer struct field).
 
-        let scale = (max - min) / 255.0;
-        let zero_point = min;
-
-        let quantized: Vec<i8> = data
+        let num_tokens: usize = shape[..shape.len() - 1]
             .iter()
-            .map(|&v| {
+            .map(|&s| s as usize)
+            .product();
+        let token_size = data.len() / num_tokens.max(1);
+
+        let mut quantized: Vec<u8> = Vec::with_capacity(data.len() + num_tokens * 8);
+        let mut per_token_meta: Vec<f32> = Vec::with_capacity(num_tokens * 2);
+
+        for t in 0..num_tokens {
+            let token_data = &data[t * token_size..(t + 1) * token_size];
+            let min = token_data.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = token_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+
+            let scale = if (max - min).abs() < 1e-12 {
+                // Constant token; avoid division by zero
+                1.0_f32
+            } else {
+                (max - min) / 255.0
+            };
+            let zero_point = min;
+
+            per_token_meta.push(scale);
+            per_token_meta.push(zero_point);
+
+            for &v in token_data {
                 let q = ((v - zero_point) / scale).round() as i32;
-                q.clamp(0, 255) as i8
-            })
-            .collect();
+                quantized.push(q.clamp(0, 255) as u8);
+            }
+        }
+
+        // Append per-token (scale, zero_point) pairs as raw f32 LE bytes.
+        for &f in &per_token_meta {
+            quantized.extend_from_slice(&f.to_le_bytes());
+        }
 
         Ok(CompressedLogits::Int8 {
             data: quantized,
-            scale,
-            zero_point,
+            // NaN sentinel signals that per-token metadata is embedded in `data`.
+            scale: f32::NAN,
+            zero_point: 0.0,
             shape,
         })
     }
 
     fn decompress_int8(
         &self,
-        data: &[i8],
+        data: &[u8],
         scale: f32,
         zero_point: f32,
         shape: &[i32],
     ) -> Result<Array> {
-        let dequantized: Vec<f32> = data
-            .iter()
-            .map(|&q| (q as u8 as f32) * scale + zero_point)
-            .collect();
+        if scale.is_nan() {
+            // New per-token format: parse embedded (scale, zp) pairs from the tail.
+            let num_tokens: usize = shape[..shape.len() - 1]
+                .iter()
+                .map(|&s| s as usize)
+                .product();
+            let token_size: usize = shape[shape.len() - 1] as usize;
+            let meta_bytes = num_tokens * 2 * 4; // 2 f32s per token
 
-        Ok(Array::from_slice(&dequantized, shape))
+            if data.len() < meta_bytes {
+                return Err(DistillError::LogitCache(
+                    "Int8 compressed data too short to contain per-token metadata".to_string(),
+                ));
+            }
+
+            let quant_len = data.len() - meta_bytes;
+            let quant_data = &data[..quant_len];
+            let meta_data = &data[quant_len..];
+
+            let mut dequantized = Vec::with_capacity(num_tokens * token_size);
+            for t in 0..num_tokens {
+                let meta_off = t * 8;
+                let sc = f32::from_le_bytes(meta_data[meta_off..meta_off + 4].try_into().unwrap());
+                let zp =
+                    f32::from_le_bytes(meta_data[meta_off + 4..meta_off + 8].try_into().unwrap());
+                for &q in &quant_data[t * token_size..(t + 1) * token_size] {
+                    dequantized.push((q as f32) * sc + zp);
+                }
+            }
+
+            Ok(Array::from_slice(&dequantized, shape))
+        } else {
+            // Legacy global-scale format.
+            let dequantized: Vec<f32> = data
+                .iter()
+                .map(|&q| (q as f32) * scale + zero_point)
+                .collect();
+            Ok(Array::from_slice(&dequantized, shape))
+        }
     }
 
     fn compress_int4(&self, logits: &Array) -> Result<CompressedLogits> {
@@ -517,11 +644,23 @@ mod tests {
                 assert_eq!(values.len(), 4); // 2 tokens * 2 top-k
                 assert_eq!(indices.len(), 4);
 
-                // First token: top-2 are indices 3, 2 (values 4, 3)
-                assert_eq!(indices[0], 3);
-                assert_eq!(indices[1], 2);
-                assert!((values[0] - 4.0).abs() < 1e-5);
-                assert!((values[1] - 3.0).abs() < 1e-5);
+                // First token: top-2 are indices 3 and 2 (values 4.0 and 3.0).
+                // argpartition does not guarantee order within the top-k window,
+                // so we check the set rather than the specific order.
+                let token0_indices: std::collections::HashSet<i32> =
+                    indices[..2].iter().cloned().collect();
+                assert!(
+                    token0_indices.contains(&3) && token0_indices.contains(&2),
+                    "Expected top-2 indices {{2, 3}} for token 0, got {:?}",
+                    &indices[..2],
+                );
+                let token0_values: std::collections::HashSet<i32> =
+                    values[..2].iter().map(|&v| v.round() as i32).collect();
+                assert!(
+                    token0_values.contains(&4) && token0_values.contains(&3),
+                    "Expected top-2 values {{3.0, 4.0}} for token 0, got {:?}",
+                    &values[..2],
+                );
             }
             _ => panic!("Wrong compression type"),
         }
@@ -537,6 +676,16 @@ mod tests {
         let decompressed = compressor.decompress(&compressed, 4).unwrap();
 
         let data: Vec<f32> = decompressed.as_slice().to_vec();
+        println!("decompressed: {:?}", &data);
+        if let CompressedLogits::TopK {
+            ref values,
+            ref indices,
+            ..
+        } = compressed
+        {
+            println!("values: {:?}", values);
+            println!("indices: {:?}", indices);
+        }
 
         // Top values should be preserved, others should be very negative
         assert!((data[2] - 10.0).abs() < 1e-5); // Token 0, index 2

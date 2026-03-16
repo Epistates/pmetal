@@ -87,6 +87,35 @@ pub trait DistillLoss: Send + Sync {
         weights: Option<&Array>,
     ) -> Result<Array>;
 
+    /// Compute token-level masked distillation loss.
+    ///
+    /// Tokens where `mask == 0` are excluded from the mean so that padding
+    /// positions and special tokens do not dilute the gradient signal.
+    ///
+    /// The default implementation calls `compute_weighted` with `weights = None`,
+    /// multiplies per-token losses by the mask, then normalises by the number of
+    /// unmasked tokens (floored at 1 to avoid NaN on all-zero masks).
+    ///
+    /// # Arguments
+    /// * `teacher_logits` - Teacher logits `[batch, seq, vocab]`
+    /// * `student_logits` - Student logits `[batch, seq, vocab]`
+    /// * `temperature` - Softmax temperature
+    /// * `mask` - Binary mask `[batch, seq]` where 1 = include, 0 = exclude
+    fn compute_masked(
+        &self,
+        teacher_logits: &Array,
+        student_logits: &Array,
+        temperature: f32,
+        mask: &Array,
+    ) -> Result<Array> {
+        let loss = self.compute_weighted(teacher_logits, student_logits, temperature, None)?;
+        let masked = loss.multiply(mask)?;
+        let sum = masked.sum(false)?;
+        let count = mask.sum(false)?;
+        let safe_count = mlx_rs::ops::maximum(&count, &Array::from_f32(1.0))?;
+        Ok(sum.divide(&safe_count)?)
+    }
+
     /// Get the name of this loss function.
     fn name(&self) -> &'static str;
 }
@@ -236,7 +265,13 @@ pub fn align_vocab_with_k(
         return Ok((teacher_logits.clone(), student_logits.clone(), false));
     }
 
-    let k = top_k.max(1).min(teacher_vocab as i32);
+    // argpartition requires kth < size; cap at teacher_vocab - 1 so we never
+    // request kth == vocab_size (which would be out-of-range).
+    // If top_k >= teacher_vocab the early-exit above already handles the
+    // same-size case; here we just guard against edge cases.
+    let k = top_k
+        .max(1)
+        .min((teacher_vocab as i32).saturating_sub(1).max(1));
 
     tracing::debug!(
         teacher_vocab,
@@ -245,10 +280,11 @@ pub fn align_vocab_with_k(
         "vocab mismatch: using sparse top-k distillation"
     );
 
-    // Argsort descending: negate teacher logits then argsort ascending so the
+    // Argpartition descending: negate teacher logits then argpartition so the
     // first k indices correspond to the k largest teacher logit positions.
+    // O(V) vs O(V log V) for argsort — significant win at vocab size ~150k.
     let neg_teacher = teacher_logits.negative()?;
-    let sorted_indices = mlx_rs::ops::argsort_axis(&neg_teacher, -1)?;
+    let partitioned_indices = mlx_rs::ops::argpartition_axis(&neg_teacher, k as i32, -1)?;
 
     // Slice first k positions along the **last** axis.
     //
@@ -257,7 +293,7 @@ pub fn align_vocab_with_k(
     // Using `(.., ..k)` instead would be wrong for rank > 2 — it would slice
     // the second-to-last dimension rather than the last one.
     use mlx_rs::ops::indexing::{Ellipsis, IndexOp};
-    let top_k_indices = sorted_indices.index((Ellipsis, ..k));
+    let top_k_indices = partitioned_indices.index((Ellipsis, ..k));
 
     // Gather teacher logits at the top-k token positions.
     let teacher_aligned = teacher_logits.take_along_axis(&top_k_indices, -1)?;
@@ -302,9 +338,9 @@ fn gather_at_indices(values: &Array, indices: &Array) -> Result<Array> {
     let n = values.dim(0);
     let v = values.dim(1);
 
-    // Create row indices [0, 1, 2, ..., N-1]
-    let row_indices: Vec<i32> = (0..n).collect();
-    let row_indices_arr = Array::from_slice(&row_indices, &[n]);
+    // Create row indices [0, 1, 2, ..., N-1] via GPU arange — stays in the
+    // MLX compute graph and avoids a CPU Vec<i32> allocation.
+    let row_indices_arr = mlx_rs::ops::arange::<_, i32>(0, n as i32, 1)?;
 
     // Compute flat indices: row * V + col
     let v_arr = Array::from_int(v);
