@@ -107,7 +107,10 @@ impl MlxMetalBridge {
     /// - The array is not f32 dtype
     /// - The array's data pointer is null
     /// - Metal buffer creation fails
-    pub fn view_f32(ctx: &MetalContext, array: &Array) -> MetalResult<MetalBufferView<f32>> {
+    pub fn view_f32<'a>(
+        ctx: &'a MetalContext,
+        array: &'a Array,
+    ) -> MetalResult<MetalBufferView<'a, f32>> {
         // Validate dtype
         if array.dtype() != Dtype::Float32 {
             return Err(MetalError::InvalidConfig(format!(
@@ -134,7 +137,10 @@ impl MlxMetalBridge {
     }
 
     /// Create a zero-copy buffer view from an f16 MLX array.
-    pub fn view_f16(ctx: &MetalContext, array: &Array) -> MetalResult<MetalBufferView<f16>> {
+    pub fn view_f16<'a>(
+        ctx: &'a MetalContext,
+        array: &'a Array,
+    ) -> MetalResult<MetalBufferView<'a, f16>> {
         // Validate dtype
         if array.dtype() != Dtype::Float16 {
             return Err(MetalError::InvalidConfig(format!(

@@ -55,7 +55,7 @@ use objc2_metal::{
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::async_scheduler::GpuCompletionToken;
-use crate::buffer::MetalBuffer;
+use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
 
@@ -643,6 +643,58 @@ impl FusedGradientClipping {
     /// Get number of threadgroups for partial reduction.
     pub fn num_threadgroups(&self) -> usize {
         self.num_threadgroups
+    }
+
+    /// Compute global gradient norm and, if it exceeds `max_norm`, queue a
+    /// scaling kernel into `batch` to clip the gradients in-place.
+    ///
+    /// # Algorithm
+    ///
+    /// Gradient clipping requires comparing the global L2 norm against a
+    /// threshold before deciding whether to scale.  This means we need a
+    /// GPU→CPU round-trip between the partial-reduction pass and the
+    /// conditional scaling pass.  The implementation therefore:
+    ///
+    /// 1. Allocates a CPU-visible shared buffer for partial squared sums
+    ///    (`num_threadgroups` elements).
+    /// 2. Executes the partial norm kernel in its own synchronous
+    ///    `BatchedCommandBuffer` so the values are visible on the CPU.
+    /// 3. Sums the partial results on the CPU to obtain the global L2 norm.
+    /// 4. If `norm > max_norm`, queues `scale_gradients` into the caller's
+    ///    `batch` with the appropriate clipping factor (`max_norm / norm`).
+    ///
+    /// The caller's `batch` is untouched when no clipping is needed, keeping
+    /// the common fast path allocation-free after the first call (assuming the
+    /// caller reuses the `FusedGradientClipping` instance).
+    pub fn queue_norm_and_clip(
+        &self,
+        batch: &mut BatchedCommandBuffer,
+        grads: &MetalBuffer<f32>,
+        max_norm: f32,
+    ) -> Result<()> {
+        // --- Step 1: allocate CPU-visible partial-sums buffer ---------------
+        let n_tg = self.num_threadgroups;
+        let partial_sums = MetalBuffer::<f32>::zeros(&self.ctx, n_tg, BufferUsage::Shared)?;
+
+        // --- Step 2: run partial norm² kernel synchronously -----------------
+        {
+            let mut norm_batch = BatchedCommandBuffer::new(self.ctx.clone())?;
+            self.compute_norm_squared_partial(&mut norm_batch, grads, &partial_sums)?;
+            norm_batch.execute()?;
+        }
+
+        // --- Step 3: reduce partial sums on CPU to get global L2 norm -------
+        let partial_slice = partial_sums.as_slice();
+        let norm_sq: f32 = partial_slice.iter().copied().sum();
+        let norm = norm_sq.sqrt();
+
+        // --- Step 4: queue conditional clipping into the caller's batch -----
+        if norm > max_norm {
+            let scale = max_norm / norm;
+            self.scale_gradients(batch, grads, scale)?;
+        }
+
+        Ok(())
     }
 }
 

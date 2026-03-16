@@ -203,7 +203,14 @@ inline void dual_dot_tg_f16(
 ///
 /// Computes: output = silu(x @ gate_weight.T) * (x @ up_weight.T)
 ///
-/// Each threadgroup handles one token, computing all intermediate_size outputs.
+/// Each threadgroup handles one token.  Within the threadgroup the 256 threads
+/// are arranged as 8 SIMD groups of 32 lanes.  Each SIMD group cooperates on
+/// one output element: the 32 lanes split the hidden dimension into 32 strided
+/// partial sums which are reduced with simd_sum(), so lane 0 holds the final
+/// result and writes it to the output buffer.
+///
+/// This replaces the previous approach where each thread independently computed
+/// a full dot product, wasting 31/32 of the available reduction bandwidth.
 kernel void fused_swiglu_forward(
     device const float* input [[buffer(0)]],          // [batch, hidden_size]
     device const float* gate_weight [[buffer(1)]],    // [intermediate_size, hidden_size]
@@ -212,6 +219,8 @@ kernel void fused_swiglu_forward(
     constant FusedSwiGLUParams& params [[buffer(4)]],
     uint token_idx [[threadgroup_position_in_grid]],
     uint thread_idx [[thread_index_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]],
     threadgroup float* scratch [[threadgroup(0)]]
 ) {
     if (token_idx >= params.batch_size) return;
@@ -219,18 +228,44 @@ kernel void fused_swiglu_forward(
     device const float* x = input + token_idx * params.hidden_size;
     device float* out = output + token_idx * params.intermediate_size;
 
-    // Each thread computes one or more output elements
-    for (uint i = thread_idx; i < params.intermediate_size; i += THREADS_PER_TOKEN) {
-        device const float* gate_row = gate_weight + i * params.hidden_size;
-        device const float* up_row = up_weight + i * params.hidden_size;
+    const uint num_simd_grps = THREADS_PER_TOKEN / SIMD_SIZE;  // 256/32 = 8
+    const uint lane = simd_lane_id;
+    const uint hidden = params.hidden_size;
 
-        // Vectorized dual dot product: gate = x @ gate_weight[i].T, up = x @ up_weight[i].T
-        float gate_val = 0.0f;
-        float up_val = 0.0f;
-        dual_dot_f32(x, gate_row, up_row, params.hidden_size, gate_val, up_val);
+    // Each SIMD group cooperates on one output element; stride over intermediate_size.
+    for (uint i = simd_group_id; i < params.intermediate_size; i += num_simd_grps) {
+        device const float* gate_row = gate_weight + i * hidden;
+        device const float* up_row   = up_weight   + i * hidden;
 
-        // Apply SiLU and multiply: silu(gate) * up
-        out[i] = silu(gate_val) * up_val;
+        // Each lane accumulates a float4-strided partial sum.
+        float4 gate_acc4 = float4(0.0f);
+        float4 up_acc4   = float4(0.0f);
+
+        uint s4 = hidden & ~3u;
+        // Vectorized: each lane starts at lane*4 and strides by SIMD_SIZE*4.
+        for (uint k = lane * 4; k < s4; k += SIMD_SIZE * 4) {
+            float4 x4 = *(device const float4*)(x + k);
+            gate_acc4 += x4 * *(device const float4*)(gate_row + k);
+            up_acc4   += x4 * *(device const float4*)(up_row   + k);
+        }
+        float gate_partial = gate_acc4.x + gate_acc4.y + gate_acc4.z + gate_acc4.w;
+        float up_partial   = up_acc4.x   + up_acc4.y   + up_acc4.z   + up_acc4.w;
+
+        // Scalar tail.
+        for (uint k = s4 + lane; k < hidden; k += SIMD_SIZE) {
+            float xv = x[k];
+            gate_partial += xv * gate_row[k];
+            up_partial   += xv * up_row[k];
+        }
+
+        // SIMD reduction across 32 lanes.
+        float gate_val = simd_sum(gate_partial);
+        float up_val   = simd_sum(up_partial);
+
+        // Only lane 0 holds the fully-reduced result.
+        if (lane == 0) {
+            out[i] = silu(gate_val) * up_val;
+        }
     }
 }
 

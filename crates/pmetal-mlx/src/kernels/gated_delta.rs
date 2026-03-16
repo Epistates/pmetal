@@ -398,7 +398,6 @@ fn gated_delta_chunk_ops(
 
     // Identity matrix for WY factorization (reused across chunks)
     let eye = ops::eye::<f32>(c, None, None)?; // [C, C]
-    let eps = Array::from_f32(1e-6);
     let bh = b * h;
 
     // ========================================================================
@@ -431,9 +430,9 @@ fn gated_delta_chunk_ops(
         let g_c = g.index((.., .., start..end)); // [B, H, C]
         let beta_c = beta.index((.., .., start..end)); // [B, H, C]
 
-        // Decay matrix: clamp g to eps before log to prevent -inf/NaN in f16
-        let g_c = ops::maximum(&g_c, &eps)?;
+        // Decay matrix: clamp log result (not exp-space input) to prevent -inf/NaN in f16
         let log_g_c = g_c.log()?; // [B, H, C]
+        let log_g_c = ops::maximum(&log_g_c, &Array::from_f32(-30.0))?; // Clamp log-space
         let cs = log_g_c.cumsum(-1, None, None)?; // [B, H, C]
         let decay_c = chunk_decay_matrix(&log_g_c)?; // [B, H, C, C]
 

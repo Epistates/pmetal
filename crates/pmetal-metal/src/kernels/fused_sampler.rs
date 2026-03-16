@@ -73,7 +73,7 @@ impl<T: Copy + FromBytes + IntoBytes> AsMetalBuffer for MetalBuffer<T> {
     }
 }
 
-impl<T: Copy + FromBytes + IntoBytes> AsMetalBuffer for MetalBufferView<T> {
+impl<T: Copy + FromBytes + IntoBytes> AsMetalBuffer for MetalBufferView<'_, T> {
     fn metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         MetalBufferView::metal_buffer(self)
     }

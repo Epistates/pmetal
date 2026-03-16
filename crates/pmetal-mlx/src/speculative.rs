@@ -278,6 +278,11 @@ impl SpeculativeDecoder {
     ) -> Result<(Vec<i32>, Option<Array>), Exception> {
         let k = draft_tokens.dim(0) as usize;
 
+        // Greedy path: rejection sampling degenerates at temperature=0; use argmax equality
+        if self.config.temperature == 0.0 {
+            return self.verify_greedy(draft_tokens, draft_logits, target_logits);
+        }
+
         // Apply temperature
         let temp = self.config.temperature.max(1e-6);
         let draft_scaled = draft_logits.divide(Array::from_f32(temp))?;
@@ -361,6 +366,69 @@ impl SpeculativeDecoder {
         }
 
         Ok((accepted_tokens, correction_logits))
+    }
+
+    /// Greedy verification: accept a draft token iff the target model's argmax matches.
+    ///
+    /// This is the exact-correct verification strategy for temperature=0 decoding.
+    /// Rejection sampling with temperature→0 would accept with probability p_t/p_d which
+    /// is numerically unstable; greedy verification is both correct and deterministic.
+    pub fn verify_greedy(
+        &mut self,
+        draft_tokens: &Array,
+        _draft_logits: &Array,
+        target_logits: &Array,
+    ) -> Result<(Vec<i32>, Option<Array>), Exception> {
+        let k = draft_tokens.dim(0) as usize;
+
+        draft_tokens.eval()?;
+        target_logits.eval()?;
+
+        let tokens: Vec<i32> = draft_tokens.as_slice().to_vec();
+        let mut accepted_tokens = Vec::new();
+
+        for i in 0..k {
+            let target_row = target_logits.index(i as i32);
+            let best_idx = argmax(&target_row, None)?;
+            best_idx.eval()?;
+            let best_token = best_idx.item::<u32>() as i32;
+
+            if tokens[i] == best_token {
+                accepted_tokens.push(tokens[i]);
+            } else {
+                // Rejected: return the target argmax token as the correction token,
+                // expressed as log-prob logits (one-hot in log space).
+                let vocab_size = target_logits.dim(1) as usize;
+                let mut one_hot = vec![-1e9f32; vocab_size];
+                one_hot[best_token as usize] = 0.0;
+                let correction = Array::from_slice(&one_hot, &[vocab_size as i32]);
+                // Update stats
+                self.stats.total_draft_tokens += k;
+                self.stats.total_accepted += accepted_tokens.len();
+                self.stats.total_tokens += accepted_tokens.len();
+                self.stats.num_iterations += 1;
+                let acceptance_rate = accepted_tokens.len() as f32 / k as f32;
+                if self.config.adaptive_k {
+                    self.adjust_k(acceptance_rate);
+                }
+                return Ok((accepted_tokens, Some(correction)));
+            }
+        }
+
+        // All tokens accepted
+        self.stats.total_draft_tokens += k;
+        self.stats.total_accepted += accepted_tokens.len();
+        self.stats.total_tokens += accepted_tokens.len();
+        self.stats.num_iterations += 1;
+        let acceptance_rate = if k > 0 {
+            accepted_tokens.len() as f32 / k as f32
+        } else {
+            0.0
+        };
+        if self.config.adaptive_k {
+            self.adjust_k(acceptance_rate);
+        }
+        Ok((accepted_tokens, None))
     }
 
     /// Adjust K based on acceptance rate.

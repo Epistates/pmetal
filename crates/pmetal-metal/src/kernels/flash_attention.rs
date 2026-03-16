@@ -33,6 +33,7 @@ use half::f16;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
 
 use crate::buffer::{BufferUsage, MetalBuffer};
@@ -409,13 +410,43 @@ impl FlashAttention {
         let d_keys = MetalBuffer::zeros(&self.ctx, self.config.kv_size(), BufferUsage::Shared)?;
         let d_values = MetalBuffer::zeros(&self.ctx, self.config.kv_size(), BufferUsage::Shared)?;
 
-        // Execute backward kernels
-        self.execute_backward_dq(
-            queries, keys, values, output, d_output, logsumexp, &d_queries,
+        // Encode both backward kernels into a single command buffer.
+        // dQ and dKV have no data dependencies on each other (they read the same
+        // forward activations and write to disjoint gradient buffers), so they
+        // can share one submission rather than two separate commit+wait cycles.
+        let command_queue = self.ctx.command_queue();
+        let command_buffer = command_queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+
+        self.encode_backward_dq(
+            &command_buffer,
+            queries,
+            keys,
+            values,
+            output,
+            d_output,
+            logsumexp,
+            &d_queries,
         )?;
-        self.execute_backward_dkv(
-            queries, keys, values, output, d_output, logsumexp, &d_keys, &d_values,
+        self.encode_backward_dkv(
+            &command_buffer,
+            queries,
+            keys,
+            values,
+            output,
+            d_output,
+            logsumexp,
+            &d_keys,
+            &d_values,
         )?;
+
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+
+        if let Some(error) = command_buffer.error() {
+            return Err(MetalError::ExecutionFailed(error.to_string()));
+        }
 
         Ok((d_queries, d_keys, d_values))
     }
@@ -559,10 +590,13 @@ impl FlashAttention {
         Ok(())
     }
 
-    /// Execute the backward dQ kernel.
+    /// Encode the backward dQ kernel into an existing command buffer.
+    ///
+    /// Does not commit or wait — the caller is responsible for flushing the buffer.
     #[allow(clippy::too_many_arguments)]
-    fn execute_backward_dq(
+    fn encode_backward_dq(
         &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         queries: &MetalBuffer<f16>,
         keys: &MetalBuffer<f16>,
         values: &MetalBuffer<f16>,
@@ -582,11 +616,6 @@ impl FlashAttention {
                 &constants,
             )?
         };
-
-        let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -626,22 +655,19 @@ impl FlashAttention {
 
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
         encoder.endEncoding();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
-
-        if let Some(error) = command_buffer.error() {
-            return Err(MetalError::ExecutionFailed(error.to_string()));
-        }
 
         Ok(())
     }
 
-    /// Execute the backward dK/dV kernel.
+    /// Encode the backward dK/dV kernel into an existing command buffer.
+    ///
+    /// Does not commit or wait — the caller is responsible for flushing the buffer.
     ///
     /// Note: The `output` buffer is required for exact gradient computation via D_i = rowsum(dO * O)
     #[allow(clippy::too_many_arguments)]
-    fn execute_backward_dkv(
+    fn encode_backward_dkv(
         &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         queries: &MetalBuffer<f16>,
         keys: &MetalBuffer<f16>,
         values: &MetalBuffer<f16>,
@@ -662,11 +688,6 @@ impl FlashAttention {
                 &constants,
             )?
         };
-
-        let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -708,12 +729,6 @@ impl FlashAttention {
 
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
         encoder.endEncoding();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
-
-        if let Some(error) = command_buffer.error() {
-            return Err(MetalError::ExecutionFailed(error.to_string()));
-        }
 
         Ok(())
     }
@@ -1090,8 +1105,8 @@ impl FlashAttentionVarlen {
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 6);
         }
 
-        // Calculate grid size: total query blocks across all sequences
-        let num_q_blocks = self.compute_total_q_blocks();
+        // Calculate exact grid size from cumulative sequence lengths.
+        let num_q_blocks = self.compute_total_q_blocks_exact(cu_seqlens);
         let grid_size = objc2_metal::MTLSize {
             width: num_q_blocks,
             height: self.config.num_heads,
@@ -1116,7 +1131,27 @@ impl FlashAttentionVarlen {
         Ok(())
     }
 
-    /// Compute total number of query blocks across all sequences.
+    /// Compute exact total number of query blocks across all sequences.
+    ///
+    /// Reads `cu_seqlens` from shared memory (CPU-accessible buffer, GPU idle)
+    /// and sums `ceil(seq_len / block_q)` for every sequence.  This is exact
+    /// rather than an average-based estimate, preventing both over- and
+    /// under-dispatch when sequence lengths are highly variable.
+    fn compute_total_q_blocks_exact(&self, cu_seqlens: &MetalBuffer<i32>) -> usize {
+        let seqlens = cu_seqlens.as_slice();
+        let num_seqs = self.config.num_seqs;
+        let mut total = 0usize;
+        for s in 0..num_seqs {
+            let seq_len = (seqlens[s + 1] - seqlens[s]) as usize;
+            total += seq_len.div_ceil(self.block_q);
+        }
+        total
+    }
+
+    /// Compute total number of query blocks across all sequences (legacy estimate).
+    ///
+    /// Kept as a fallback for callers that do not have cu_seqlens available.
+    #[allow(dead_code)]
     fn compute_total_q_blocks(&self) -> usize {
         // Estimate: assuming average sequence length
         let avg_len = self.config.total_tokens / self.config.num_seqs.max(1);

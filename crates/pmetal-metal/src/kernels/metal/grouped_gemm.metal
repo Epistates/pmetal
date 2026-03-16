@@ -12,7 +12,7 @@ using namespace metal;
 // Tile sizes for GEMM
 #define BLOCK_M 64
 #define BLOCK_N 64
-#define BLOCK_K 16
+#define BLOCK_K 32
 
 /// Parameters for grouped GEMM.
 struct GroupedGemmParams {
@@ -26,37 +26,85 @@ struct GroupedGemmParams {
     uint fuse_mul;         // Fuse weight multiplication
 };
 
-/// Standard GEMM for a single tile.
+/// Tiled GEMM for a single output tile using threadgroup staging.
 ///
-/// Computes C[m, n] = A[m, k] @ B[k, n]
-inline void gemm_tile(
-    device const float* A,
-    device const float* B,
-    threadgroup float* C_tile,
+/// Computes C[m, n] = A[m, k] @ B[k, n] using BLOCK_K strips staged through
+/// threadgroup memory to exploit data reuse across threads.
+///
+/// scratch layout (host-allocated):
+///   [0 .. BLOCK_M*BLOCK_K-1]                = A_stage
+///   [BLOCK_M*BLOCK_K .. BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N - 1] = B_stage
+///   [BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N ..]  = C_tile  (BLOCK_M*BLOCK_N)
+inline void gemm_tile_tiled(
+    device const float* A,         // global A: row-major [M_total, K]
+    device const float* B,         // global B: transposed [N_total, K]
+    threadgroup float* scratch,    // staging + accumulator region
     uint m_start, uint m_end,
     uint n_start, uint n_end,
     uint K,
-    uint stride_a, uint stride_b,
     uint tid_x, uint tid_y,
     uint threads_x, uint threads_y
 ) {
     uint m_size = m_end - m_start;
     uint n_size = n_end - n_start;
 
-    // Each thread handles a portion of the tile
-    for (uint m = tid_y; m < min(m_size, (uint)BLOCK_M); m += threads_y) {
-        for (uint n = tid_x; n < min(n_size, (uint)BLOCK_N); n += threads_x) {
-            float acc = 0.0f;
+    // Partition scratch into staging buffers and accumulator.
+    threadgroup float* A_stage = scratch;                              // [BLOCK_M, BLOCK_K]
+    threadgroup float* B_stage = scratch + BLOCK_M * BLOCK_K;         // [BLOCK_K, BLOCK_N]
+    threadgroup float* C_tile  = scratch + BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N; // [BLOCK_M, BLOCK_N]
 
-            // K-dimension reduction
-            for (uint k = 0; k < K; k++) {
-                float a_val = A[(m_start + m) * stride_a + k];
-                float b_val = B[(n_start + n) * stride_b + k];  // B is transposed: [N, K]
-                acc += a_val * b_val;
+    // Zero the accumulator.
+    uint total_threads = threads_x * threads_y;
+    uint linear_tid = tid_y * threads_x + tid_x;
+    for (uint i = linear_tid; i < BLOCK_M * BLOCK_N; i += total_threads) {
+        C_tile[i] = 0.0f;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Loop over K in BLOCK_K-width strips.
+    for (uint k_start = 0; k_start < K; k_start += BLOCK_K) {
+        uint k_end = min(k_start + (uint)BLOCK_K, K);
+        uint k_len = k_end - k_start;
+
+        // Cooperatively load A tile: rows [m_start .. m_end), cols [k_start .. k_end).
+        // Thread (tid_x, tid_y) covers (k, m) → A_stage[m * BLOCK_K + k].
+        for (uint i = linear_tid; i < BLOCK_M * BLOCK_K; i += total_threads) {
+            uint m = i / BLOCK_K;
+            uint k = i % BLOCK_K;
+            if (m < m_size && k < k_len) {
+                A_stage[m * BLOCK_K + k] = A[(m_start + m) * K + (k_start + k)];
+            } else {
+                A_stage[m * BLOCK_K + k] = 0.0f;
             }
-
-            C_tile[m * BLOCK_N + n] = acc;
         }
+
+        // Cooperatively load B tile: rows [n_start .. n_end), cols [k_start .. k_end).
+        // B is transposed [N, K], so B[n, k] = B[n * K + k].
+        // B_stage[k * BLOCK_N + n] so inner loop is contiguous over n.
+        for (uint i = linear_tid; i < BLOCK_K * BLOCK_N; i += total_threads) {
+            uint k = i / BLOCK_N;
+            uint n = i % BLOCK_N;
+            if (k < k_len && n < n_size) {
+                B_stage[k * BLOCK_N + n] = B[(n_start + n) * K + (k_start + k)];
+            } else {
+                B_stage[k * BLOCK_N + n] = 0.0f;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Inner product accumulation from staged tiles.
+        for (uint m = tid_y; m < m_size; m += threads_y) {
+            for (uint n = tid_x; n < n_size; n += threads_x) {
+                float acc = 0.0f;
+                for (uint k = 0; k < k_len; k++) {
+                    acc += A_stage[m * BLOCK_K + k] * B_stage[k * BLOCK_N + n];
+                }
+                C_tile[m * BLOCK_N + n] += acc;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 
@@ -133,49 +181,82 @@ kernel void grouped_gemm_forward(
             // Pointer to this expert's weights: w[expert_idx, :, :]
             device const float* w_expert = w + expert_idx * N * K;
 
-            // Initialize accumulator in shared memory
-            threadgroup float* C_tile = scratch;
+            // scratch layout:
+            //   [0 .. BLOCK_M*BLOCK_K - 1]                       A_stage
+            //   [BLOCK_M*BLOCK_K .. BLOCK_M*BLOCK_K+BLOCK_K*BLOCK_N - 1]  B_stage
+            //   [BLOCK_M*BLOCK_K + BLOCK_K*BLOCK_N ..]           C_tile
 
-            // Zero the tile
-            for (uint i = tid_y * threads_x + tid_x; i < BLOCK_M * BLOCK_N; i += threads_x * threads_y) {
+            // Build a permuted A view: gather input rows so that A[m, k] = x[perm(m), k].
+            // We can't create a true view, so we pass x and handle permutation inside
+            // a wrapper. Instead, build the permuted A tile cooperatively into A_stage
+            // directly during the load step.
+            //
+            // We override the generic helper with an inline tiled loop that respects
+            // permute_x when loading A.
+
+            threadgroup float* A_stage = scratch;
+            threadgroup float* B_stage = scratch + BLOCK_M * BLOCK_K;
+            threadgroup float* C_tile  = scratch + BLOCK_M * BLOCK_K + BLOCK_K * BLOCK_N;
+
+            // Zero C accumulator.
+            uint total_threads = threads_x * threads_y;
+            uint linear_tid = tid_y * threads_x + tid_x;
+            for (uint i = linear_tid; i < BLOCK_M * BLOCK_N; i += total_threads) {
                 C_tile[i] = 0.0f;
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
 
-            // Compute GEMM for this tile
-            // Each thread handles a subset of (m, n) pairs
-            for (uint m = tid_y; m < tile_m_size; m += threads_y) {
-                uint global_m = tile_m_start + m;
+            // Tiled K-loop.
+            for (uint k_start = 0; k_start < K; k_start += BLOCK_K) {
+                uint k_end = min(k_start + (uint)BLOCK_K, K);
+                uint k_len = k_end - k_start;
 
-                // Get input index (with optional permutation)
-                uint input_idx;
-                if (params.permute_x) {
-                    uint sorted_idx = global_m;
-                    uint original_idx = gather_indices[sorted_idx];
-                    input_idx = original_idx / params.topk;  // Map back to original token
-                } else {
-                    input_idx = global_m;
-                }
-
-                device const float* x_row = x + input_idx * K;
-
-                for (uint n = tid_x; n < tile_n_size; n += threads_x) {
-                    uint global_n = tile_n_start + n;
-
-                    // W is [N, K] (transposed)
-                    device const float* w_row = w_expert + global_n * K;
-
-                    // Dot product
-                    float acc = 0.0f;
-                    for (uint k = 0; k < K; k++) {
-                        acc += x_row[k] * w_row[k];
+                // Load A strip (with optional permutation on M).
+                for (uint i = linear_tid; i < BLOCK_M * BLOCK_K; i += total_threads) {
+                    uint m = i / BLOCK_K;
+                    uint k = i % BLOCK_K;
+                    if (m < tile_m_size && k < k_len) {
+                        uint global_m = tile_m_start + m;
+                        uint input_idx;
+                        if (params.permute_x) {
+                            uint original_idx = gather_indices[global_m];
+                            input_idx = original_idx / params.topk;
+                        } else {
+                            input_idx = global_m;
+                        }
+                        A_stage[m * BLOCK_K + k] = x[input_idx * K + (k_start + k)];
+                    } else {
+                        A_stage[m * BLOCK_K + k] = 0.0f;
                     }
-
-                    C_tile[m * BLOCK_N + n] = acc;
                 }
-            }
 
-            threadgroup_barrier(mem_flags::mem_threadgroup);
+                // Load B strip: w_expert[n, k] = w_expert[n * K + k].
+                for (uint i = linear_tid; i < BLOCK_K * BLOCK_N; i += total_threads) {
+                    uint k = i / BLOCK_N;
+                    uint n = i % BLOCK_N;
+                    if (k < k_len && n < tile_n_size) {
+                        uint global_n = tile_n_start + n;
+                        B_stage[k * BLOCK_N + n] = w_expert[global_n * K + (k_start + k)];
+                    } else {
+                        B_stage[k * BLOCK_N + n] = 0.0f;
+                    }
+                }
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+
+                // Accumulate from staged tiles.
+                for (uint m = tid_y; m < tile_m_size; m += threads_y) {
+                    for (uint n = tid_x; n < tile_n_size; n += threads_x) {
+                        float acc = 0.0f;
+                        for (uint k = 0; k < k_len; k++) {
+                            acc += A_stage[m * BLOCK_K + k] * B_stage[k * BLOCK_N + n];
+                        }
+                        C_tile[m * BLOCK_N + n] += acc;
+                    }
+                }
+
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+            }
 
             // Store output with optional permutation and weight multiplication
             for (uint m = tid_y; m < tile_m_size; m += threads_y) {

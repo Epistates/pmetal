@@ -30,6 +30,8 @@ use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
 
 use crate::{
@@ -149,24 +151,21 @@ impl FusedGdn {
         constants
     }
 
-    /// Execute the fused GDN forward recurrence.
+    /// Encode the fused GDN forward recurrence into an existing command buffer.
+    ///
+    /// This method creates a compute encoder, encodes the dispatch, and calls
+    /// `endEncoding` but does **not** commit or wait.  Use this when you want to
+    /// batch multiple GDN steps into one command buffer submission via
+    /// [`GdnBatchEncoder`].
     ///
     /// # Arguments
     ///
-    /// * `q` - Queries, shape `[B, T, Hv, Dk]` (GQA-expanded to Hv heads)
-    /// * `k` - Keys, shape `[B, T, Hv, Dk]` (GQA-expanded to Hv heads)
-    /// * `v` - Values, shape `[B, T, Hv, Dv]`
-    /// * `g` - Gating decay factor in (0,1] from `compute_g()`, shape `[B, T, Hv]`
-    /// * `beta` - Beta gate in (0,1) from `sigmoid()`, shape `[B, T, Hv]`
-    /// * `state` - Recurrent state, shape `[B, Hv, Dv, Dk]`. Modified in-place.
-    /// * `output` - Output buffer, shape `[B, T, Hv, Dv]`. Written by kernel.
-    ///
-    /// # Returns
-    ///
-    /// Ok(()) on success. State is updated in-place, output is written.
+    /// * `command_buffer` - The command buffer to encode into.
+    /// * All other arguments are identical to [`Self::forward`].
     #[allow(clippy::too_many_arguments)]
-    pub fn forward(
+    pub fn encode(
         &self,
+        command_buffer: &ProtocolObject<dyn MTLCommandBuffer>,
         batch_size: u32,
         num_heads: u32,
         seq_len: u32,
@@ -187,11 +186,6 @@ impl FusedGdn {
                 &constants,
             )?
         };
-
-        let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
 
         let encoder = command_buffer
             .computeCommandEncoder()
@@ -238,6 +232,64 @@ impl FusedGdn {
 
         encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
         encoder.endEncoding();
+
+        Ok(())
+    }
+
+    /// Execute the fused GDN forward recurrence (allocates and flushes its own command buffer).
+    ///
+    /// This is a convenience wrapper around [`Self::encode`] that creates a
+    /// command buffer, calls `encode`, commits, and waits for completion.
+    ///
+    /// For workloads where multiple GDN steps are run in sequence, prefer
+    /// [`GdnBatchEncoder`] to amortise command-buffer overhead across steps.
+    ///
+    /// # Arguments
+    ///
+    /// * `q` - Queries, shape `[B, T, Hv, Dk]` (GQA-expanded to Hv heads)
+    /// * `k` - Keys, shape `[B, T, Hv, Dk]` (GQA-expanded to Hv heads)
+    /// * `v` - Values, shape `[B, T, Hv, Dv]`
+    /// * `g` - Gating decay factor in (0,1] from `compute_g()`, shape `[B, T, Hv]`
+    /// * `beta` - Beta gate in (0,1) from `sigmoid()`, shape `[B, T, Hv]`
+    /// * `state` - Recurrent state, shape `[B, Hv, Dv, Dk]`. Modified in-place.
+    /// * `output` - Output buffer, shape `[B, T, Hv, Dv]`. Written by kernel.
+    ///
+    /// # Returns
+    ///
+    /// Ok(()) on success. State is updated in-place, output is written.
+    #[allow(clippy::too_many_arguments)]
+    pub fn forward(
+        &self,
+        batch_size: u32,
+        num_heads: u32,
+        seq_len: u32,
+        q: &MetalBuffer<f32>,
+        k: &MetalBuffer<f32>,
+        v: &MetalBuffer<f32>,
+        g: &MetalBuffer<f32>,
+        beta: &MetalBuffer<f32>,
+        state: &MetalBuffer<f32>,
+        output: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        let command_queue = self.ctx.command_queue();
+        let command_buffer = command_queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+
+        self.encode(
+            &command_buffer,
+            batch_size,
+            num_heads,
+            seq_len,
+            q,
+            k,
+            v,
+            g,
+            beta,
+            state,
+            output,
+        )?;
+
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
 
@@ -256,6 +308,61 @@ impl FusedGdn {
     /// Get the value dimension this kernel was specialized for.
     pub fn value_dim(&self) -> u32 {
         self.config.value_dim
+    }
+}
+
+// =============================================================================
+// GdnBatchEncoder – amortise command-buffer overhead across multiple GDN steps
+// =============================================================================
+
+/// A batch encoder that accumulates multiple GDN kernel encodes into a single
+/// command buffer, reducing driver overhead compared to one buffer per step.
+///
+/// # Usage
+///
+/// ```ignore
+/// let mut batcher = GdnBatchEncoder::new(&ctx)?;
+/// for layer in &layers {
+///     layer.gdn.encode(batcher.command_buffer(), batch, heads, seq, ...)?;
+/// }
+/// batcher.flush()?;  // Commit and wait once for the entire batch.
+/// ```
+pub struct GdnBatchEncoder {
+    #[allow(dead_code)]
+    ctx: Arc<MetalContext>,
+    command_buffer: Retained<ProtocolObject<dyn MTLCommandBuffer>>,
+}
+
+impl GdnBatchEncoder {
+    /// Create a new batch encoder backed by a fresh command buffer.
+    pub fn new(ctx: &Arc<MetalContext>) -> Result<Self> {
+        let command_queue = ctx.command_queue();
+        let command_buffer = command_queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+        Ok(Self {
+            ctx: Arc::clone(ctx),
+            command_buffer,
+        })
+    }
+
+    /// Access the underlying command buffer for encoding additional work.
+    pub fn command_buffer(&self) -> &ProtocolObject<dyn MTLCommandBuffer> {
+        &self.command_buffer
+    }
+
+    /// Commit the command buffer and block until all encoded work completes.
+    ///
+    /// Consumes `self` — create a new [`GdnBatchEncoder`] for subsequent batches.
+    pub fn flush(self) -> Result<()> {
+        self.command_buffer.commit();
+        self.command_buffer.waitUntilCompleted();
+
+        if let Some(error) = self.command_buffer.error() {
+            return Err(MetalError::ExecutionFailed(format!("{}", error)));
+        }
+
+        Ok(())
     }
 }
 

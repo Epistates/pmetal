@@ -294,7 +294,8 @@ impl MoELayer {
         }
 
         // C11: Run each expert only on its assigned tokens
-        let mut final_output = Array::zeros::<f32>(&[batch_seq, hidden_size])?;
+        let input_dtype = hidden_states.dtype();
+        let mut final_output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], input_dtype)?;
 
         for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
             if assignments.is_empty() {
@@ -348,6 +349,84 @@ impl MoELayer {
         };
 
         Ok((output, aux_loss))
+    }
+
+    /// Forward pass with pre-computed routing (bypasses the internal router).
+    ///
+    /// Accepts `expert_indices` [N, k] (Int32) and `expert_weights` [N, k] (Float32) as
+    /// already computed by an external gate (e.g. DeepSeek's sigmoid + e_score_correction_bias
+    /// router).  The internal `MoERouter` is completely skipped — no softmax, no jitter, no
+    /// aux-loss computation.  The dispatch/scatter logic is identical to `forward()`.
+    ///
+    /// # Arguments
+    /// * `hidden_states` - Input tensor [..., hidden_size]
+    /// * `expert_indices` - Pre-selected expert indices [N_flat, k], Int32
+    /// * `expert_weights` - Pre-computed routing weights [N_flat, k], Float32 (should sum to 1 per row)
+    pub fn forward_with_routing(
+        &mut self,
+        hidden_states: &Array,
+        expert_indices: &Array,
+        expert_weights: &Array,
+    ) -> Result<Array, Exception> {
+        let shape = hidden_states.shape();
+        let batch_seq = shape[..shape.len() - 1].iter().product::<i32>();
+        let hidden_size = shape[shape.len() - 1];
+        let hidden_flat = hidden_states.reshape(&[batch_seq, hidden_size])?;
+
+        // Eval routing tensors to CPU for index extraction
+        expert_indices.eval()?;
+        expert_weights.eval()?;
+
+        let n_tokens = batch_seq as usize;
+        let k = self.config.num_experts_per_tok;
+        let ei_data: Vec<i32> = expert_indices.as_slice().to_vec();
+        let ew_data: Vec<f32> = expert_weights.as_slice().to_vec();
+
+        // Build per-expert token lists: (token_idx, routing_weight)
+        let mut expert_assignments: Vec<Vec<(usize, f32)>> =
+            vec![Vec::new(); self.config.num_experts];
+        for token_idx in 0..n_tokens {
+            for slot in 0..k {
+                let flat_idx = token_idx * k + slot;
+                let expert_id = ei_data[flat_idx] as usize;
+                let weight = ew_data[flat_idx];
+                if expert_id < self.config.num_experts {
+                    expert_assignments[expert_id].push((token_idx, weight));
+                }
+            }
+        }
+
+        let input_dtype = hidden_states.dtype();
+        let mut final_output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], input_dtype)?;
+
+        for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
+            if assignments.is_empty() {
+                continue;
+            }
+
+            let token_indices: Vec<i32> = assignments.iter().map(|&(idx, _)| idx as i32).collect();
+            let weights: Vec<f32> = assignments.iter().map(|&(_, w)| w).collect();
+
+            let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
+            let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
+
+            let expert_input = hidden_flat.take_axis(&idx_array, 0)?;
+            let expert_out = self.experts[expert_idx].forward(&expert_input)?;
+            let weighted_out = expert_out.multiply(&weight_array)?;
+
+            let m = token_indices.len() as i32;
+            let updates_3d = weighted_out.reshape(&[m, 1, hidden_size])?;
+            final_output = mlx_rs::ops::indexing::scatter_add_single(
+                &final_output,
+                &idx_array,
+                &updates_3d,
+                0,
+            )?;
+        }
+
+        let mut output_shape = shape.to_vec();
+        output_shape[shape.len() - 1] = hidden_size;
+        final_output.reshape(&output_shape)
     }
 
     /// M7: Compute auxiliary load-balancing loss using Switch Transformer formula.

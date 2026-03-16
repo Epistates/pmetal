@@ -347,9 +347,10 @@ impl GroupedGemmMoE {
         // Step 2: Top-k expert selection
         let (top_weights, top_indices) = self.topk_experts(&routing_probs)?;
 
-        // Normalize weights
+        // Normalize weights with epsilon guard to prevent division by zero
         let weight_sum = top_weights.sum_axis(-1, Some(true))?;
-        let top_weights = top_weights.divide(&weight_sum)?;
+        let safe_sum = mlx_rs::ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
+        let top_weights = top_weights.divide(&safe_sum)?;
 
         // Step 3: Grouped GEMM expert computation
         let expert_output = self.grouped_expert_forward(&x, &top_weights, &top_indices)?;

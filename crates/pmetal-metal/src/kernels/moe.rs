@@ -194,14 +194,14 @@ impl MoeKernel {
         )?;
         let token_counts =
             MetalBuffer::zeros(&self.ctx, self.config.num_experts, BufferUsage::Shared)?;
-        let expert_offsets =
+        let mut expert_offsets =
             MetalBuffer::zeros(&self.ctx, self.config.num_experts + 1, BufferUsage::Shared)?;
         let gather_indices = MetalBuffer::new(&self.ctx, total_tokens, BufferUsage::Shared)?;
         let scatter_indices = MetalBuffer::new(&self.ctx, total_tokens, BufferUsage::Shared)?;
 
         // Execute routing kernels
         self.execute_topk_selection(router_logits, &topk_weights, &topk_ids)?;
-        self.execute_compute_indices(&topk_ids, &token_counts, &expert_offsets)?;
+        self.execute_compute_indices(&topk_ids, &token_counts, &mut expert_offsets)?;
         self.execute_sort_indices(
             &topk_ids,
             &expert_offsets,
@@ -398,7 +398,7 @@ impl MoeKernel {
         &self,
         topk_ids: &MetalBuffer<u32>,
         token_counts: &MetalBuffer<u32>,
-        expert_offsets: &MetalBuffer<u32>,
+        expert_offsets: &mut MetalBuffer<u32>,
     ) -> Result<()> {
         // First pass: compute token counts per expert
         let pipeline_count = {
@@ -459,53 +459,23 @@ impl MoeKernel {
             return Err(MetalError::ExecutionFailed(error.to_string()));
         }
 
-        // Second pass: compute prefix sum
-        let pipeline_prefix = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), "moe_compute_expert_offsets", None)?
-        };
-
-        let command_buffer2 = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-
-        let encoder2 = command_buffer2
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder2.setComputePipelineState(&pipeline_prefix);
-
-        unsafe {
-            encoder2.setBuffer_offset_atIndex(Some(token_counts.metal_buffer()), 0, 0);
-            encoder2.setBuffer_offset_atIndex(Some(expert_offsets.metal_buffer()), 0, 1);
-
-            let num_experts = self.config.num_experts as u32;
-            let num_experts_ptr = NonNull::from(&num_experts).cast();
-            encoder2.setBytes_length_atIndex(
-                num_experts_ptr,
-                std::mem::size_of_val(&num_experts),
-                2,
-            );
-        }
-
-        let grid_size = objc2_metal::MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        };
-        let threadgroup_size = objc2_metal::MTLSize {
-            width: 1,
-            height: 1,
-            depth: 1,
-        };
-
-        encoder2.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder2.endEncoding();
-        command_buffer2.commit();
-        command_buffer2.waitUntilCompleted();
-
-        if let Some(error) = command_buffer2.error() {
-            return Err(MetalError::ExecutionFailed(error.to_string()));
+        // Second pass: CPU prefix sum.
+        //
+        // Dispatching a single-threaded GPU kernel for 512 elements carries
+        // non-trivial command-buffer overhead (~10–20 µs) vs. a trivial loop on
+        // the CPU (~1 µs).  The token_counts and expert_offsets buffers are
+        // StorageModeShared so the CPU can read/write them directly after the
+        // GPU histogram completes (which was already waited on above).
+        {
+            let num_experts = self.config.num_experts;
+            let counts: Vec<u32> = token_counts.as_slice().to_vec();
+            let offsets = expert_offsets.as_mut_slice();
+            let mut sum: u32 = 0;
+            for e in 0..num_experts {
+                offsets[e] = sum;
+                sum = sum.saturating_add(counts[e]);
+            }
+            offsets[num_experts] = sum;
         }
 
         Ok(())
@@ -647,8 +617,13 @@ impl MoeKernel {
             let params_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 7);
 
-            // Threadgroup memory for tile accumulation
-            let scratch_size = block_m * block_n * std::mem::size_of::<f32>();
+            // Threadgroup memory: A_stage + B_stage + C_tile
+            // A_stage: BLOCK_M * BLOCK_K floats
+            // B_stage: BLOCK_K * BLOCK_N floats
+            // C_tile:  BLOCK_M * BLOCK_N floats
+            let block_k = 32usize;
+            let scratch_size = (block_m * block_k + block_k * block_n + block_m * block_n)
+                * std::mem::size_of::<f32>();
             encoder.setThreadgroupMemoryLength_atIndex(scratch_size, 0);
         }
 

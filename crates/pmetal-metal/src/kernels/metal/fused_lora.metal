@@ -291,45 +291,107 @@ kernel void fused_lora_backward_ab(
 
 /// Backward pass for dA gradient.
 ///
-/// Computes dA = scale * x.T @ (dY @ B.T)
-/// This is split for parallelism: first compute dY @ B.T, then x.T @ result
+/// Computes dA[r, k] = scale * sum_b( x[b, k] * (dY[b, :] @ B[:, r]) )
+///
+/// Optimizations:
+/// - B rows (B[0..r-1, rank_idx]) are staged into threadgroup memory once so all
+///   batch iterations read from L1 rather than device memory.
+/// - dY rows are loaded with half4 vectorized loads (4x throughput).
+/// - A SIMD group of 32 lanes cooperates: each lane takes a strided slice of the
+///   out_features reduction, then simd_sum() merges the 32 partial sums.
+/// - Only lane 0 writes the result.
+///
+/// Grid: [ceil(in_features/TILE_K), ceil(rank/TILE_M), 1]
+/// Threadgroup: [SIMD_SIZE, TILE_M, 1]  (one SIMD group per rank row in the tile)
+///
+/// Host must allocate TILE_M * MAX_LORA_RANK * sizeof(float) bytes for scratch.
+/// At TILE_M=4 and MAX_LORA_RANK=256: 4KB, well within the 32KB limit.
 kernel void fused_lora_backward_a(
     device const half* dY [[buffer(0)]],          // [batch, out_features]
     device const half* x [[buffer(1)]],           // [batch, in_features]
     device const half* B [[buffer(2)]],           // [out_features, rank]
     device half* dA [[buffer(3)]],                // [rank, in_features]
     constant FusedLoraParams& params [[buffer(4)]],
+    threadgroup float* scratch [[threadgroup(0)]],  // TILE_M * out_features floats for B staging
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]],
     uint simd_lane_id [[thread_index_in_simdgroup]],
     uint simd_group_id [[simdgroup_index_in_threadgroup]]
 ) {
     // Grid: [ceil(in_features/TILE_K), ceil(rank/TILE_M), 1]
+    const uint in_idx   = tgid.x * TILE_K + tid.x;
+    const uint rank_idx = tgid.y * TILE_M + simd_group_id;
 
-    const uint in_idx = tgid.x * TILE_K + tid.x;
-    const uint rank_idx = tgid.y * TILE_M + tid.y;
+    const uint total_threads = TILE_M * SIMD_SIZE;
+    const uint linear_tid    = simd_group_id * SIMD_SIZE + simd_lane_id;
+
+    // -------------------------------------------------------------------------
+    // Stage B column: B[:, rank_idx] into scratch[simd_group_id * out_features + o]
+    // Each SIMD group stages the B column it will use for the reduction,
+    // using vectorized half4 loads.
+    // Threads with rank_idx out-of-range skip the write but still reach the barrier.
+    // -------------------------------------------------------------------------
+    // scratch layout: [TILE_M][out_features] — float
+    threadgroup float* B_col = scratch + simd_group_id * params.out_features;
+
+    if (rank_idx < params.rank) {
+        uint s4 = params.out_features & ~3u;
+        for (uint o = simd_lane_id * 4; o < s4; o += SIMD_SIZE * 4) {
+            // B[o, rank_idx] = B[o * rank + rank_idx]: strided, can't half4-load directly.
+            // Load 4 consecutive half scalars individually but unrolled.
+            B_col[o + 0] = float(B[(o + 0) * params.rank + rank_idx]);
+            B_col[o + 1] = float(B[(o + 1) * params.rank + rank_idx]);
+            B_col[o + 2] = float(B[(o + 2) * params.rank + rank_idx]);
+            B_col[o + 3] = float(B[(o + 3) * params.rank + rank_idx]);
+        }
+        for (uint o = s4 + simd_lane_id; o < params.out_features; o += SIMD_SIZE) {
+            B_col[o] = float(B[o * params.rank + rank_idx]);
+        }
+    }
+
+    // All threads must reach the barrier — guard the WRITE, not the barrier itself.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 
     if (in_idx >= params.in_features || rank_idx >= params.rank) {
         return;
     }
 
-    // dA[r, k] = scale * sum_b(x[b, k] * sum_o(dY[b, o] * B[o, r]))
+    // -------------------------------------------------------------------------
+    // dA[rank_idx, in_idx] = scale * sum_b( x[b, in_idx] * dot(dY[b], B_col) )
+    // Each lane takes a strided slice of out_features for the dot product.
+    // -------------------------------------------------------------------------
     float acc = 0.0f;
 
     for (uint b = 0; b < params.batch_size; b++) {
-        // Compute dY[b] @ B[:, r] — B is strided (B[o * rank + rank_idx]),
-        // so we can't vectorize contiguously. But dY is contiguous per batch row.
-        float dy_b = 0.0f;
-        for (uint o = 0; o < params.out_features; o++) {
-            dy_b += float(dY[b * params.out_features + o]) * float(B[o * params.rank + rank_idx]);
+        device const half* dY_row = dY + b * params.out_features;
+
+        // Vectorized dot: dY_row * B_col, lane-strided with half4 loads on dY_row.
+        float4 dot_acc4 = float4(0.0f);
+        uint s4 = params.out_features & ~3u;
+        for (uint o = simd_lane_id * 4; o < s4; o += SIMD_SIZE * 4) {
+            float4 dy4 = float4(*(device const half4*)(dY_row + o));
+            float4 b4  = float4(B_col[o], B_col[o+1], B_col[o+2], B_col[o+3]);
+            dot_acc4  += dy4 * b4;
+        }
+        float dy_b = dot_acc4.x + dot_acc4.y + dot_acc4.z + dot_acc4.w;
+        for (uint o = s4 + simd_lane_id; o < params.out_features; o += SIMD_SIZE) {
+            dy_b += float(dY_row[o]) * B_col[o];
         }
 
-        // Then multiply by x[b, k]
-        float x_val = float(x[b * params.in_features + in_idx]);
-        acc += x_val * dy_b;
+        // SIMD reduction: all 32 lanes contribute their partial dot sum.
+        dy_b = simd_sum(dy_b);
+
+        // Only lane 0 has the full dot; multiply by x[b, in_idx] and accumulate.
+        if (simd_lane_id == 0) {
+            float x_val = float(x[b * params.in_features + in_idx]);
+            acc += x_val * dy_b;
+        }
     }
 
-    dA[rank_idx * params.in_features + in_idx] = half(params.scale * acc);
+    // Write result (only lane 0 holds the accumulated value).
+    if (simd_lane_id == 0) {
+        dA[rank_idx * params.in_features + in_idx] = half(params.scale * acc);
+    }
 }
 
 // =============================================================================

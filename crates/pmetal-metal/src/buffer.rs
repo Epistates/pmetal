@@ -326,7 +326,7 @@ impl<T: Copy + FromBytes + IntoBytes> MetalBuffer<T> {
     /// - The buffer has been properly initialized
     #[inline]
     #[allow(clippy::mut_from_ref)] // Metal buffers have interior mutability via unified memory
-    fn as_mut_slice_unchecked(&self) -> &mut [T] {
+    pub(crate) fn as_mut_slice_unchecked(&self) -> &mut [T] {
         // SAFETY:
         // 1. buffer.contents() returns a NonNull pointer to the buffer's memory
         // 2. The memory is valid for self.len elements of type T

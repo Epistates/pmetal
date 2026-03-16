@@ -454,7 +454,7 @@ kernel void fp8_block_gemm(
 
                 // Apply activation scale
                 uint scale_k = global_k / group_k;
-                float a_scale = A_scales[global_m * (K / group_k) + scale_k];
+                float a_scale = A_scales[global_m * ((K + group_k - 1) / group_k) + scale_k];
                 A_tile[local_m * BLOCK_K + local_k] = val * a_scale;
             } else {
                 A_tile[local_m * BLOCK_K + local_k] = 0.0f;
@@ -475,7 +475,7 @@ kernel void fp8_block_gemm(
                 // Apply weight scale
                 uint scale_n = global_n / group_n;
                 uint scale_k = global_k / group_k;
-                float b_scale = B_scales[scale_n * (K / group_k) + scale_k];
+                float b_scale = B_scales[scale_n * ((K + group_k - 1) / group_k) + scale_k];
                 B_tile[local_k * BLOCK_N + local_n] = val * b_scale;
             } else {
                 B_tile[local_k * BLOCK_N + local_n] = 0.0f;

@@ -405,8 +405,13 @@ impl FusedSwiGLU {
             height: 1,
             depth: 1,
         };
+        // Cap at 256 to match THREADS_PER_TOKEN constant in the Metal kernel.
+        // The SIMD-cooperative fused_swiglu_forward kernel hardcodes num_simd_grps = 256/32 = 8;
+        // dispatching 512 threads would create 16 SIMD groups but only 8 are expected,
+        // causing the upper 8 groups to write into unowned output slots.
+        let threads_per_group = self.threads_per_group.min(256);
         let threadgroup_size = objc2_metal::MTLSize {
-            width: self.threads_per_group,
+            width: threads_per_group,
             height: 1,
             depth: 1,
         };
@@ -478,6 +483,8 @@ impl FusedSwiGLU {
             encoder.setThreadgroupMemoryLength_atIndex(scratch_size, 0);
         }
 
+        // Cap at 256 to match THREADS_PER_TOKEN constant in the Metal kernel.
+        let threads_per_group = self.threads_per_group.min(256);
         let (grid_size, threadgroup_size) = if self.config.use_tiled {
             let tile_size = 128;
             let num_tiles = self.config.intermediate_size.div_ceil(tile_size);
@@ -488,7 +495,7 @@ impl FusedSwiGLU {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: self.threads_per_group,
+                    width: threads_per_group,
                     height: 1,
                     depth: 1,
                 },
@@ -501,7 +508,7 @@ impl FusedSwiGLU {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: self.threads_per_group,
+                    width: threads_per_group,
                     height: 1,
                     depth: 1,
                 },
@@ -669,8 +676,11 @@ impl FusedMLP {
             let params_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
 
-            // Threadgroup memory for SwiGLU intermediate
-            let scratch_size = self.config.intermediate_size * std::mem::size_of::<f32>();
+            // Threadgroup memory for SwiGLU intermediate — must be SWIGLU_CHUNK_SIZE,
+            // NOT intermediate_size. The kernel tiles in SWIGLU_CHUNK_SIZE chunks.
+            // intermediate_size can be 14336+ which would exceed 32KB Metal limit.
+            const SWIGLU_CHUNK_SIZE: usize = 2048;
+            let scratch_size = SWIGLU_CHUNK_SIZE * std::mem::size_of::<f32>();
             encoder.setThreadgroupMemoryLength_atIndex(scratch_size, 0);
         }
 
@@ -679,8 +689,10 @@ impl FusedMLP {
             height: 1,
             depth: 1,
         };
+        // Cap at 256 to match THREADS_PER_TOKEN constant in the Metal kernel.
+        let threads_per_group = self.threads_per_group.min(256);
         let threadgroup_size = objc2_metal::MTLSize {
-            width: self.threads_per_group,
+            width: threads_per_group,
             height: 1,
             depth: 1,
         };

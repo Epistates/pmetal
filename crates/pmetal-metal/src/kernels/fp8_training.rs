@@ -236,9 +236,23 @@ impl Fp8TrainingKernel {
             let k_u32 = k as u32;
             let bs_u32 = block_size as u32;
 
-            let params = [m_u32, k_u32, bs_u32];
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
+            // Metal kernel expects individual buffer bindings at indices 3, 4, 5.
+            // Each scalar must be set separately — NOT as a packed array.
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&m_u32).cast(),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&k_u32).cast(),
+                std::mem::size_of::<u32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&bs_u32).cast(),
+                std::mem::size_of::<u32>(),
+                5,
+            );
         }
 
         let grid_size = MTLSize {
@@ -300,9 +314,23 @@ impl Fp8TrainingKernel {
             let k_u32 = k as u32;
             let bs_u32 = block_size as u32;
 
-            let params = [m_u32, k_u32, bs_u32];
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 3);
+            // Metal kernel expects individual buffer bindings at indices 3, 4, 5.
+            // Each scalar must be set separately — NOT as a packed array.
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&m_u32).cast(),
+                std::mem::size_of::<u32>(),
+                3,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&k_u32).cast(),
+                std::mem::size_of::<u32>(),
+                4,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&bs_u32).cast(),
+                std::mem::size_of::<u32>(),
+                5,
+            );
         }
 
         // Use dispatchThreads if available (Metal 2) or standard grid
@@ -387,9 +415,32 @@ impl Fp8TrainingKernel {
             let gn_u32 = self.config.block_size as u32;
             let gk_u32 = self.config.block_size as u32;
 
-            let params = [m_u32, n_u32, k_u32, gn_u32, gk_u32];
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
+            // Metal kernel expects individual buffer bindings at indices 5-9.
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&m_u32).cast(),
+                std::mem::size_of::<u32>(),
+                5,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&n_u32).cast(),
+                std::mem::size_of::<u32>(),
+                6,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&k_u32).cast(),
+                std::mem::size_of::<u32>(),
+                7,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&gn_u32).cast(),
+                std::mem::size_of::<u32>(),
+                8,
+            );
+            encoder.setBytes_length_atIndex(
+                NonNull::from(&gk_u32).cast(),
+                std::mem::size_of::<u32>(),
+                9,
+            );
         }
 
         // Grid setup from kernel:

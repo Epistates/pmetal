@@ -8,6 +8,7 @@
 use half::f16;
 use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLBuffer, MTLDevice, MTLResourceOptions};
+use std::marker::PhantomData;
 use std::ptr::NonNull;
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -43,11 +44,11 @@ use crate::error::{MetalError, Result};
 /// let mlx_ptr = mlx_sys::mlx_array_data_float32(array.as_ptr());
 /// let view = unsafe { metal_buffer_from_ptr(&ctx, mlx_ptr, array.size())? };
 /// ```
-pub unsafe fn metal_buffer_from_ptr<T: Copy + FromBytes + IntoBytes>(
+pub unsafe fn metal_buffer_from_ptr<'src, T: Copy + FromBytes + IntoBytes>(
     ctx: &MetalContext,
     ptr: *mut T,
     len: usize,
-) -> Result<MetalBufferView<T>> {
+) -> Result<MetalBufferView<'src, T>> {
     let size = len * std::mem::size_of::<T>();
 
     let ptr_void =
@@ -82,21 +83,24 @@ pub unsafe fn metal_buffer_from_ptr<T: Copy + FromBytes + IntoBytes>(
     Ok(MetalBufferView {
         buffer,
         len,
-        _phantom: std::marker::PhantomData,
+        _lifetime: PhantomData,
     })
 }
 
 /// A view into existing memory as a Metal buffer.
 ///
 /// Unlike `MetalBuffer`, this does not own its memory - it's a view into
-/// memory owned elsewhere (e.g., an MLX array).
-pub struct MetalBufferView<T: Copy + FromBytes + IntoBytes> {
+/// memory owned elsewhere (e.g., an MLX array).  The `'src` lifetime
+/// parameter ties this view to the source memory so the borrow checker
+/// enforces that the source outlives the view.
+pub struct MetalBufferView<'src, T: Copy + FromBytes + IntoBytes> {
     buffer: objc2::rc::Retained<ProtocolObject<dyn MTLBuffer>>,
     len: usize,
-    _phantom: std::marker::PhantomData<T>,
+    /// Phantom lifetime binding the view to the source allocation.
+    _lifetime: PhantomData<&'src T>,
 }
 
-impl<T: Copy + FromBytes + IntoBytes> AsMetalBuffer for MetalBufferView<T> {
+impl<'src, T: Copy + FromBytes + IntoBytes> AsMetalBuffer for MetalBufferView<'src, T> {
     fn as_metal_buffer(&self) -> &ProtocolObject<dyn MTLBuffer> {
         &self.buffer
     }
@@ -106,7 +110,7 @@ impl<T: Copy + FromBytes + IntoBytes> AsMetalBuffer for MetalBufferView<T> {
     }
 }
 
-impl<T: Copy + FromBytes + IntoBytes> MetalBufferView<T> {
+impl<'src, T: Copy + FromBytes + IntoBytes> MetalBufferView<'src, T> {
     /// Get the number of elements.
     #[inline]
     pub fn len(&self) -> usize {
@@ -142,7 +146,7 @@ impl<T: Copy + FromBytes + IntoBytes> MetalBufferView<T> {
 // 1. The source memory (e.g., MLX array) must remain valid across all threads
 // 2. The source memory must not be modified while any thread holds this view
 // 3. GPU operations using this buffer must be properly synchronized
-unsafe impl<T: Copy + FromBytes + IntoBytes> Send for MetalBufferView<T> {}
+unsafe impl<'src, T: Copy + FromBytes + IntoBytes> Send for MetalBufferView<'src, T> {}
 
 // SAFETY: MetalBufferView can be shared between threads via &reference
 //
@@ -151,13 +155,13 @@ unsafe impl<T: Copy + FromBytes + IntoBytes> Send for MetalBufferView<T> {}
 // 1. MTLBuffer is thread-safe for concurrent reads
 // 2. The view's methods only provide read access to the buffer metadata
 // 3. The underlying memory is immutable from this view's perspective
-unsafe impl<T: Copy + FromBytes + IntoBytes> Sync for MetalBufferView<T> {}
+unsafe impl<'src, T: Copy + FromBytes + IntoBytes> Sync for MetalBufferView<'src, T> {}
 
 /// Type alias for f16 buffer views (common for attention).
-pub type MetalBufferViewF16 = MetalBufferView<f16>;
+pub type MetalBufferViewF16<'src> = MetalBufferView<'src, f16>;
 
 /// Type alias for f32 buffer views.
-pub type MetalBufferViewF32 = MetalBufferView<f32>;
+pub type MetalBufferViewF32<'src> = MetalBufferView<'src, f32>;
 
 #[cfg(test)]
 mod tests {

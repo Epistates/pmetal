@@ -101,10 +101,8 @@ kernel void gdn_fused_recurrent_fwd(
             k_val[ki] = k[qk_base + ki];
         }
 
-        // Load scalar gate and beta.
-        // g layout: [B, T, Hv], beta layout: [B, T, Hv]
-        const uint gb_idx = (batch * T + t) * Hv + head;
-        const float g_val    = g[gb_idx];
+        // Load beta.  Layout: [B, T, Hv]
+        const uint gb_idx    = (batch * T + t) * Hv + head;
         const float beta_val = beta[gb_idx];
 
         // Load v[b, t, h, v_start..v_start+bv]
@@ -116,10 +114,26 @@ kernel void gdn_fused_recurrent_fwd(
         }
 
         // --- Step 1: Decay state ---
-        // h *= g  (g is already in exp-space from compute_g, i.e., the actual decay factor)
-        for (uint ki = 0; ki < K_PER_THREAD; ki++) {
-            for (uint vi = 0; vi < bv; vi++) {
-                h[ki][vi] *= g_val;
+        // g is already in exp-space (the actual decay factor, not log-space).
+        // FC_SCALAR_GATE==1: g layout [B,T,Hv]     — same scalar applied to every k
+        // FC_SCALAR_GATE==0: g layout [B,T,Hv,Dk]  — per-k-dimension gate values
+        if (FC_SCALAR_GATE) {
+            // Scalar gate: one decay value per (batch, time, head).
+            const float g_val = g[gb_idx];
+            for (uint ki = 0; ki < K_PER_THREAD; ki++) {
+                for (uint vi = 0; vi < bv; vi++) {
+                    h[ki][vi] *= g_val;
+                }
+            }
+        } else {
+            // Vector gate: per-k-dimension decay.
+            // g layout: [B, T, Hv, Dk], element (b,t,h,ki) at ((b*T+t)*Hv+h)*Dk+ki
+            const uint g_base = ((batch * T + t) * Hv + head) * Dk + k_base;
+            for (uint ki = 0; ki < K_PER_THREAD; ki++) {
+                const float g_k = g[g_base + ki];
+                for (uint vi = 0; vi < bv; vi++) {
+                    h[ki][vi] *= g_k;
+                }
             }
         }
 

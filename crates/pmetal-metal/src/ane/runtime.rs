@@ -186,6 +186,16 @@ impl AneRuntime {
             if let Some(wd) = weight_dict {
                 for (name, data) in &wd.entries {
                     let rel = name.replace("@model_path/", "");
+                    // Reject path traversal attempts in weight key names.
+                    if rel.contains("..")
+                        || rel.starts_with('/')
+                        || rel.starts_with('\\')
+                        || rel.contains('\0')
+                    {
+                        return Err(MetalError::InvalidConfig(format!(
+                            "Invalid weight key (path traversal attempt): {name:?}"
+                        )));
+                    }
                     let path = format!("{}/{}", tmp_dir_str, rel);
                     let path_ns = NSString::from_str(&path);
                     let ns_data = NSData::with_bytes(data);
