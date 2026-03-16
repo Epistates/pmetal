@@ -122,7 +122,11 @@ fn build_client(token: Option<&SecretString>) -> Result<reqwest::Client> {
         .map_err(|e| pmetal_core::PMetalError::Hub(e.to_string()))
 }
 
-/// Search HuggingFace Hub for text-generation models.
+/// Search HuggingFace Hub for models.
+///
+/// `pipeline_tag` filters results by pipeline type (e.g., `"text-generation"`,
+/// `"text-to-speech"`, `"image-classification"`). Defaults to `"text-generation"`
+/// when `None`.
 ///
 /// Returns results sorted by download count (most popular first).
 pub async fn search_models(
@@ -130,11 +134,29 @@ pub async fn search_models(
     limit: usize,
     token: Option<&SecretString>,
 ) -> Result<Vec<HfSearchResult>> {
+    search_models_with_tag(query, limit, token, None).await
+}
+
+/// Search HuggingFace Hub for models, optionally filtered by pipeline tag.
+///
+/// `pipeline_tag` filters results by pipeline type. Pass `None` to use the
+/// default `"text-generation"` filter, or `Some("text-to-speech")` etc. to
+/// search a different pipeline category.
+///
+/// Returns results sorted by download count (most popular first).
+pub async fn search_models_with_tag(
+    query: &str,
+    limit: usize,
+    token: Option<&SecretString>,
+    pipeline_tag: Option<&str>,
+) -> Result<Vec<HfSearchResult>> {
     let client = build_client(token)?;
 
+    let tag = pipeline_tag.unwrap_or("text-generation");
     let url = format!(
-        "https://huggingface.co/api/models?search={}&filter=text-generation&sort=downloads&direction=-1&limit={}&full=true",
+        "https://huggingface.co/api/models?search={}&filter={}&sort=downloads&direction=-1&limit={}&full=true",
         urlencoding::encode(query),
+        urlencoding::encode(tag),
         limit.min(50)
     );
 

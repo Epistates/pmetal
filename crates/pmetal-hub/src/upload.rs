@@ -324,7 +324,7 @@ async fn preupload_lfs_objects(
     let lfs_body = LfsBatchRequest {
         operation: "upload",
         transfers: vec!["basic", "multipart"],
-        hash_algo: "sha_256",
+        hash_algo: "sha256",
         objects: hashed
             .iter()
             .map(|(c, oid)| LfsObject {

@@ -45,6 +45,23 @@ pub fn pmetal_cache_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from(".cache/pmetal"))
 }
 
+/// Evict a single model from the local HuggingFace hub cache.
+///
+/// Removes the cache directory for `repo_id` (e.g., `"Qwen/Qwen3-0.6B"`).
+/// The directory is resolved as `<cache_dir>/models--<org>--<name>`, matching
+/// the layout used by `huggingface_hub` and the `hf-hub` crate.
+///
+/// Returns `Ok(())` if the directory did not exist (idempotent).
+pub fn evict_model(repo_id: &str) -> Result<()> {
+    // Convert "org/name" → "models--org--name"
+    let dir_name = format!("models--{}", repo_id.replace('/', "--"));
+    let model_cache_dir = cache_dir().join(dir_name);
+    if model_cache_dir.exists() {
+        std::fs::remove_dir_all(&model_cache_dir)?;
+    }
+    Ok(())
+}
+
 /// Clear the model cache.
 pub fn clear_cache() -> Result<()> {
     let cache = cache_dir();
