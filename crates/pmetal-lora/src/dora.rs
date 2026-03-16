@@ -223,8 +223,9 @@ impl DoraLinear {
             let norm_safe = w_col_norm.add(&eps)?;
 
             // Magnitude rescaling: y = y_combined * (m / ||W||_col)
-            // magnitude shape [out, 1] broadcasts over the output dimension
-            let scale_factor = self.magnitude.divide(&norm_safe)?;
+            // magnitude is [out, 1], norm_safe is [out, 1] → divide gives [out, 1],
+            // squeeze to [out] for correct broadcast against y_combined [*, out].
+            let scale_factor = self.magnitude.divide(&norm_safe)?.squeeze_axes(&[-1])?;
             let y = y_combined.multiply(&scale_factor)?;
 
             if let Some(ref bias) = self.bias {
