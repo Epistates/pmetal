@@ -310,8 +310,13 @@ impl DynamicModel {
                 Ok(Self::Qwen3MoE(model))
             }
             ModelArchitecture::Gemma => {
-                let config: GemmaConfig = json5::from_str(&config_content)
+                let mut config: GemmaConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
+                // Set the Gemma3 flag based on model_type to enable the correct
+                // sliding window pattern (every 6th layer global, rest local).
+                if config.model_type == "gemma3" {
+                    config.is_gemma3 = true;
+                }
                 let mut model = GemmaForCausalLM::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
@@ -473,22 +478,29 @@ impl DynamicModel {
             Self::Qwen2(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Qwen3(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Qwen3MoE(m) => m.forward(input_ids, mask, cache),
-            Self::DeepSeek(_)
-            | Self::Cohere(_)
-            | Self::Granite(_)
-            | Self::NemotronH(_)
-            | Self::Qwen3Next(_)
-            | Self::StarCoder2(_)
-            | Self::Llama4(_)
-            | Self::RecurrentGemma(_)
-            | Self::Jamba(_)
-            | Self::Flux(_) => Err(Exception::custom(
-                "Architecture does not support KV caching yet",
-            )),
+            Self::DeepSeek(m) => m.forward(input_ids, mask, cache),
+            Self::Cohere(m) => m.forward_with_cache(input_ids, mask, cache),
+            // Granite forward takes position_ids (not KVCache); cache ignored for now
+            Self::Granite(m) => m.forward(input_ids, mask, None),
+            Self::StarCoder2(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::Llama4(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Gemma(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Mistral(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Phi(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Phi4(m) => m.forward_with_cache(input_ids, mask, cache),
+            // Hybrid recurrent+attention models require both a KV cache and a
+            // Mamba/GDN state cache. Use `forward_with_hybrid_cache` instead.
+            Self::NemotronH(_) | Self::Qwen3Next(_) => Err(Exception::custom(
+                "Hybrid architecture requires both KV and Mamba caches. \
+                 Use DynamicModel::forward_with_hybrid_cache with both \
+                 create_cache() and create_mamba_cache().",
+            )),
+            // Purely recurrent models have no KV cache; use forward() directly.
+            Self::RecurrentGemma(m) => m.forward(input_ids),
+            Self::Jamba(m) => m.forward(input_ids),
+            Self::Flux(_) => Err(Exception::custom(
+                "Flux is not a CausalLM and does not support forward_with_cache.",
+            )),
         }
     }
 

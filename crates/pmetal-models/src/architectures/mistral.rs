@@ -611,13 +611,7 @@ impl CausalLMModel for MistralForCausalLM {
     }
 }
 
-/// Create a causal attention mask.
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-    mlx_rs::ops::r#where(&mask.eq(&zero)?, &neg_inf, &zero)
-}
+use super::utils::create_causal_mask;
 
 #[cfg(test)]
 mod tests {

@@ -72,6 +72,14 @@ pub struct GemmaConfig {
     /// Whether this is a Gemma2 model.
     #[serde(default)]
     pub is_gemma2: bool,
+    /// Whether this is a Gemma3 model.
+    ///
+    /// Gemma3 uses a different sliding window pattern from Gemma2:
+    /// every 6th layer (0-indexed: 5, 11, 17, …) uses global (full causal)
+    /// attention, while all other layers use local sliding-window attention.
+    /// This is set automatically when `model_type == "gemma3"` is detected.
+    #[serde(default)]
+    pub is_gemma3: bool,
     /// RoPE scaling configuration.
     #[serde(default)]
     pub rope_scaling: Option<std::collections::HashMap<String, serde_json::Value>>,
@@ -143,6 +151,7 @@ impl Default for GemmaConfig {
             query_pre_attn_scalar: None,
             sliding_window: None,
             is_gemma2: false,
+            is_gemma3: false,
             rope_scaling: None,
         }
     }
@@ -369,8 +378,15 @@ impl GemmaAttention {
             .traditional(false)
             .build()?;
 
-        // Gemma2: even layers use sliding window, odd layers use full causal
-        let is_local_attention = config.is_gemma2 && (layer_idx % 2 == 0);
+        // Gemma2: even layers use sliding window, odd layers use full causal.
+        // Gemma3: every 6th layer (5, 11, 17, ...) uses global causal attention;
+        //         all other layers use local sliding-window attention.
+        let is_local_attention = if config.is_gemma3 {
+            // Global when (layer_idx + 1) % 6 == 0, i.e. 5, 11, 17, ...
+            !((layer_idx + 1) % 6 == 0)
+        } else {
+            config.is_gemma2 && (layer_idx % 2 == 0)
+        };
 
         Ok(Self {
             n_heads,
@@ -708,7 +724,10 @@ impl GemmaModel {
     pub fn new(config: GemmaConfig) -> Result<Self, Exception> {
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
 
-        let layers = if config.is_gemma2 {
+        // Gemma3 uses Gemma2-style layers (pre/post FFN norms), same as Gemma2.
+        let use_gemma2_layers = config.is_gemma2 || config.is_gemma3;
+
+        let layers = if use_gemma2_layers {
             GemmaLayers {
                 gemma1: None,
                 gemma2: Some(
@@ -901,13 +920,8 @@ impl CausalLMModel for GemmaForCausalLM {
     }
 }
 
-/// Create a causal attention mask.
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-    mlx_rs::ops::r#where(&mask.eq(&zero)?, &neg_inf, &zero)
-}
+/// Re-export the shared causal mask utility.
+use super::utils::create_causal_mask;
 
 #[cfg(test)]
 mod tests {

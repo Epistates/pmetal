@@ -715,8 +715,13 @@ impl DeepSeekMoE {
         })
     }
     pub fn forward(&mut self, x: &Array) -> Result<Array> {
-        let (_expert_indices, _expert_weights) = self.gate.forward(x)?;
-        let (moe_out, _) = self.moe.forward(x)?;
+        // Use the DeepSeek-specific sigmoid gate (with e_score_correction_bias) to compute
+        // routing indices and weights, then dispatch to experts via forward_with_routing,
+        // bypassing MoELayer's internal softmax router entirely.
+        let (expert_indices, expert_weights) = self.gate.forward(x)?;
+        let moe_out = self
+            .moe
+            .forward_with_routing(x, &expert_indices, &expert_weights)?;
         if let Some(ref mut shared) = self.shared_experts {
             moe_out.add(&shared.forward(x)?)
         } else {

@@ -31,6 +31,53 @@ use pmetal_mlx::kv_cache::KVCache;
 use crate::traits::{CausalLMModel, ModelConfig};
 use std::collections::HashMap;
 
+/// Compute SuRoPE precomputed frequencies for Phi-3 128K / Phi-3.5 models.
+///
+/// SuRoPE (Scaled Uniform RoPE) from the Phi-3 128K paper uses per-dimension
+/// scaling factors. The frequencies passed to `mlx_rs::fast::rope` are:
+///   `freqs[i] = factor[i] * base^(2i / rope_dim)`
+/// where `factor` is either `short_factor` or `long_factor`.
+///
+/// In practice mlx-lm always uses `long_factor` and applies a single mscale
+/// attention scalar at the Q/K level. The `mscale` is:
+///   `sqrt(1 + ln(max_pos / orig_max_pos) / ln(orig_max_pos))`
+///
+/// Returns `(freqs, mscale)`.
+fn compute_su_rope_freqs(
+    scaling: &PhiRopeScaling,
+    rope_dim: i32,
+    rope_theta: f32,
+    max_position_embeddings: i32,
+    original_max_position_embeddings: i32,
+) -> Result<(Array, f32), Exception> {
+    let half = (rope_dim / 2) as usize;
+    let long_factor = &scaling.long_factor;
+
+    // Compute INVERSE frequencies: 1 / (factor * base^(2i/rope_dim))
+    // SuRoPE scales the inverse frequencies, NOT the periods.
+    // inv_freq[i] = 1 / (long_factor[i] * theta^(2i/D))
+    let mut freqs = Vec::with_capacity(half);
+    for i in 0..half {
+        let exponent = (2 * i) as f32 / rope_dim as f32;
+        let base_period = rope_theta.powf(exponent); // theta^(2i/D) = period
+        let factor = long_factor.get(i).copied().unwrap_or(1.0);
+        // Inverse frequency scaled by factor
+        freqs.push(1.0 / (factor * base_period));
+    }
+    let freqs_arr = Array::from_slice(&freqs, &[half as i32]);
+
+    // mscale = sqrt(1 + ln(factor) / ln(original_max_pos))
+    // where factor = max_pos / original_max_pos
+    let factor = max_position_embeddings as f32 / original_max_position_embeddings as f32;
+    let mscale = if factor <= 1.0 {
+        1.0_f32
+    } else {
+        (1.0 + factor.ln() / (original_max_position_embeddings as f32).ln()).sqrt()
+    };
+
+    Ok((freqs_arr, mscale))
+}
+
 /// Phi model configuration.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
@@ -275,7 +322,7 @@ impl PhiRMSNorm {
     }
 }
 
-/// Phi attention with partial RoPE.
+/// Phi attention with partial RoPE (and optional SuRoPE for 128K context models).
 #[derive(Debug, ModuleParameters)]
 pub struct PhiAttention {
     #[param]
@@ -286,6 +333,7 @@ pub struct PhiAttention {
     pub v_proj: Linear,
     #[param]
     pub o_proj: Linear,
+    /// Standard RoPE module (used when `su_freqs` is None).
     pub rope: mlx_rs::nn::Rope,
     pub n_heads: i32,
     pub n_kv_heads: i32,
@@ -293,6 +341,11 @@ pub struct PhiAttention {
     pub rope_dim: i32,
     pub scale: f32,
     pub rope_theta: f32,
+    /// SuRoPE precomputed per-dimension frequencies (shape [rope_dim/2]).
+    /// Present only for Phi-3 128K / Phi-3.5 models with `rope_scaling` set.
+    pub su_freqs: Option<Array>,
+    /// Attention mscale applied to Q and K when using SuRoPE.
+    pub su_mscale: f32,
 }
 
 impl PhiAttention {
@@ -332,6 +385,32 @@ impl PhiAttention {
 
         let scale = 1.0 / (head_dim as f32).sqrt();
 
+        // Compute SuRoPE frequencies if rope_scaling is provided (Phi-3 128K / Phi-3.5)
+        let (su_freqs, su_mscale) = if let Some(ref rope_scaling) = config.rope_scaling {
+            if rope_scaling.scaling_type == "su"
+                || rope_scaling.scaling_type == "longrope"
+                || rope_scaling.scaling_type == "linear"
+            {
+                let orig_max = config
+                    .original_max_position_embeddings
+                    .unwrap_or(config.max_position_embeddings);
+                match compute_su_rope_freqs(
+                    rope_scaling,
+                    rope_dim,
+                    rope_theta,
+                    config.max_position_embeddings,
+                    orig_max,
+                ) {
+                    Ok((freqs, mscale)) => (Some(freqs), mscale),
+                    Err(_) => (None, 1.0),
+                }
+            } else {
+                (None, 1.0)
+            }
+        } else {
+            (None, 1.0)
+        };
+
         Self {
             q_proj,
             k_proj,
@@ -344,6 +423,8 @@ impl PhiAttention {
             rope_dim,
             scale,
             rope_theta,
+            su_freqs,
+            su_mscale,
         }
     }
 
@@ -371,18 +452,63 @@ impl PhiAttention {
         let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
         let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
 
-        // Apply partial RoPE
-        let (q_rope, q_pass) = self.split_rotary(&q)?;
-        let (k_rope, k_pass) = self.split_rotary(&k)?;
+        // Apply partial RoPE split first
+        let (q_rope_raw, q_pass) = self.split_rotary(&q)?;
+        let (k_rope_raw, k_pass) = self.split_rotary(&k)?;
 
-        let (q_rope, k_rope) = if let Some((ref cache_ref, _)) = cache {
+        // Apply SuRoPE mscale to the rotary portion only (matching the Python reference:
+        // `x[..., :self.dim] = self._scale * x[..., :self.dim]` before rope call)
+        let (q_rope_raw, k_rope_raw) = if self.su_freqs.is_some() && self.su_mscale != 1.0 {
+            let mscale = Array::from_f32(self.su_mscale);
+            (q_rope_raw.multiply(&mscale)?, k_rope_raw.multiply(&mscale)?)
+        } else {
+            (q_rope_raw, k_rope_raw)
+        };
+
+        let (q_rope, k_rope) = if let Some(ref su_freqs) = self.su_freqs {
+            // SuRoPE path: use precomputed per-dimension frequencies via mlx fast.rope
+            let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+            let qr = mlx_rs::fast::rope(
+                &q_rope_raw,
+                self.rope_dim,
+                false,
+                None,
+                1.0,
+                offset,
+                Some(su_freqs),
+            )?;
+            let kr = mlx_rs::fast::rope(
+                &k_rope_raw,
+                self.rope_dim,
+                false,
+                None,
+                1.0,
+                offset,
+                Some(su_freqs),
+            )?;
+            (qr, kr)
+        } else if let Some((ref cache_ref, _)) = cache {
             let offset = cache_ref.rope_offset();
-            let qr = apply_rope(&q_rope, self.rope_dim, false, self.rope_theta, 1.0, offset)?;
-            let kr = apply_rope(&k_rope, self.rope_dim, false, self.rope_theta, 1.0, offset)?;
+            let qr = apply_rope(
+                &q_rope_raw,
+                self.rope_dim,
+                false,
+                self.rope_theta,
+                1.0,
+                offset,
+            )?;
+            let kr = apply_rope(
+                &k_rope_raw,
+                self.rope_dim,
+                false,
+                self.rope_theta,
+                1.0,
+                offset,
+            )?;
             (qr, kr)
         } else {
-            let qr = self.rope.forward(&q_rope)?;
-            let kr = self.rope.forward(&k_rope)?;
+            let qr = self.rope.forward(&q_rope_raw)?;
+            let kr = self.rope.forward(&k_rope_raw)?;
             (qr, kr)
         };
 
@@ -721,13 +847,8 @@ impl CausalLMModel for PhiForCausalLM {
     }
 }
 
-/// Create a causal attention mask.
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = mlx_rs::ops::tri::<f32>(seq_len, None, None)?;
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-    mlx_rs::ops::r#where(&mask.eq(&zero)?, &neg_inf, &zero)
-}
+/// Re-export the shared causal mask utility.
+use super::utils::create_causal_mask;
 
 #[cfg(test)]
 mod tests {

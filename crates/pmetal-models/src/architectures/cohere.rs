@@ -207,6 +207,7 @@ pub struct CohereAttention {
     pub n_kv_heads: i32,
     pub head_dim: i32,
     pub scale: f32,
+    pub rope_theta: f32,
     pub use_sliding_window: bool,
     pub sliding_window: i32,
 
@@ -250,6 +251,7 @@ impl CohereAttention {
             n_kv_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
+            rope_theta: config.rope_theta,
             use_sliding_window,
             sliding_window: config.sliding_window,
             q_proj,
@@ -272,12 +274,28 @@ impl CohereAttention {
         let k = Module::forward(&mut self.k_proj, x)?;
         let v = Module::forward(&mut self.v_proj, x)?;
 
-        // Reshape for attention
+        // Reshape for attention: [B, seq, n_heads, head_dim]
         let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
         let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
         let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
 
-        // RoPE would be applied here in full implementation
+        // Apply RoPE BEFORE transpose — apply_rope expects [B, seq, heads, dim]
+        let q = pmetal_mlx::kernels::rope::apply_rope(
+            &q,
+            self.head_dim,
+            false,
+            self.rope_theta,
+            1.0,
+            0,
+        )?;
+        let k = pmetal_mlx::kernels::rope::apply_rope(
+            &k,
+            self.head_dim,
+            false,
+            self.rope_theta,
+            1.0,
+            0,
+        )?;
 
         // Transpose for attention: [B, n_heads, seq, head_dim]
         let q = q.transpose_axes(&[0, 2, 1, 3])?;
@@ -437,6 +455,21 @@ impl CohereForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward(input_ids, mask, position_ids)?;
         Module::forward(&mut self.lm_head, &hidden_states)
+    }
+
+    /// Forward pass accepting a KV cache parameter for API compatibility.
+    ///
+    /// The underlying Cohere attention implementation does not yet use the
+    /// KV cache for incremental decoding; the `_cache` argument is accepted
+    /// but ignored. Full cache-accelerated decoding will be added in a future
+    /// revision once per-layer RoPE with offsets is plumbed through.
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        _cache: Option<&mut pmetal_mlx::kv_cache::KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward(input_ids, mask, None)
     }
 }
 

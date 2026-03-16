@@ -1,5 +1,8 @@
 //! Model architecture implementations.
 
+pub mod utils;
+pub use utils::create_causal_mask;
+
 pub mod clip;
 pub mod cohere;
 pub mod deepseek;
