@@ -85,6 +85,34 @@ pub enum Quantization {
     Int8,
     /// 8-bit floating point quantization.
     FP8,
+    // ── GGUF K-quant variants ────────────────────────────────────────────────
+    /// GGUF Q4_0: 4-bit, legacy block format (32 weights, 1 fp16 scale).
+    #[serde(rename = "q4_0")]
+    Q4_0,
+    /// GGUF Q5_0: 5-bit, legacy block format (32 weights, 1 fp16 scale).
+    #[serde(rename = "q5_0")]
+    Q5_0,
+    /// GGUF Q8_0: 8-bit, legacy block format (32 weights, 1 fp16 scale).
+    #[serde(rename = "q8_0")]
+    Q8_0,
+    /// GGUF Q2_K: 2-bit super-block K-quant with 6-bit scales.
+    #[serde(rename = "q2k")]
+    Q2K,
+    /// GGUF Q3_K: 3-bit super-block K-quant with 6-bit scales.
+    #[serde(rename = "q3k")]
+    Q3K,
+    /// GGUF Q4_K_M: 4-bit medium K-quant (mixed 4/6-bit scales).
+    #[serde(rename = "q4km")]
+    Q4KM,
+    /// GGUF Q5_K_M: 5-bit medium K-quant (mixed 5/6-bit scales).
+    #[serde(rename = "q5km")]
+    Q5KM,
+    /// GGUF Q6_K: 6-bit super-block K-quant with 8-bit scales.
+    #[serde(rename = "q6k")]
+    Q6K,
+    /// GGUF Q8_K: 8-bit super-block K-quant (full weights, used for MoE gates).
+    #[serde(rename = "q8k")]
+    Q8K,
 }
 
 /// Memory statistics.
@@ -120,7 +148,7 @@ impl MemoryStats {
     /// Available memory in gigabytes.
     #[must_use]
     pub fn available_gb(&self) -> f64 {
-        (self.total_bytes - self.used_bytes) as f64 / (1024.0 * 1024.0 * 1024.0)
+        self.total_bytes.saturating_sub(self.used_bytes) as f64 / (1024.0 * 1024.0 * 1024.0)
     }
 }
 

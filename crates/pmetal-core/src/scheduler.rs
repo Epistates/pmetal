@@ -27,6 +27,8 @@ pub struct LearningRateScheduler {
     num_restarts: usize,
     /// Fraction of post-warmup steps at stable (peak) LR for WSD (0.0-1.0).
     stable_ratio: f64,
+    /// Exponent for polynomial decay (default 1.0 = linear).
+    polynomial_power: f64,
     /// Current step.
     current_step: usize,
 }
@@ -47,6 +49,7 @@ impl LearningRateScheduler {
             scheduler_type,
             num_restarts: 1,
             stable_ratio: 0.7,
+            polynomial_power: 1.0,
             current_step: 0,
         }
     }
@@ -66,6 +69,12 @@ impl LearningRateScheduler {
     /// Set stable phase ratio for WSD scheduler (default 0.7).
     pub fn with_stable_ratio(mut self, ratio: f64) -> Self {
         self.stable_ratio = ratio.clamp(0.0, 1.0);
+        self
+    }
+
+    /// Set polynomial decay exponent (default 1.0 = linear, 2.0 = quadratic).
+    pub fn with_polynomial_power(mut self, power: f64) -> Self {
+        self.polynomial_power = power.max(0.1); // clamp to positive
         self
     }
 
@@ -100,7 +109,7 @@ impl LearningRateScheduler {
             }
 
             LrSchedulerType::CosineWithRestarts => {
-                let cycle_length = decay_steps / self.num_restarts.max(1);
+                let cycle_length = decay_steps.div_ceil(self.num_restarts.max(1));
                 let cycle_progress = if cycle_length > 0 {
                     (current_decay_step % cycle_length) as f64 / cycle_length as f64
                 } else {
@@ -111,7 +120,7 @@ impl LearningRateScheduler {
             }
 
             LrSchedulerType::Polynomial => {
-                let power = 2.0; // Quadratic decay
+                let power = self.polynomial_power;
                 self.min_lr + (self.base_lr - self.min_lr) * (1.0 - progress).powf(power)
             }
 
@@ -177,6 +186,7 @@ pub struct SchedulerBuilder {
     scheduler_type: LrSchedulerType,
     num_restarts: usize,
     stable_ratio: f64,
+    polynomial_power: f64,
 }
 
 impl Default for SchedulerBuilder {
@@ -197,7 +207,14 @@ impl SchedulerBuilder {
             scheduler_type: LrSchedulerType::Cosine,
             num_restarts: 1,
             stable_ratio: 0.7,
+            polynomial_power: 1.0,
         }
+    }
+
+    /// Set polynomial decay exponent (default 1.0 = linear).
+    pub fn polynomial_power(mut self, power: f64) -> Self {
+        self.polynomial_power = power;
+        self
     }
 
     /// Set base learning rate.
@@ -265,7 +282,8 @@ impl SchedulerBuilder {
         )
         .with_min_lr(self.min_lr)
         .with_num_restarts(self.num_restarts)
-        .with_stable_ratio(self.stable_ratio))
+        .with_stable_ratio(self.stable_ratio)
+        .with_polynomial_power(self.polynomial_power))
     }
 }
 

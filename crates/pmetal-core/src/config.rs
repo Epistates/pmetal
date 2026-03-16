@@ -38,7 +38,9 @@ pub struct ModelConfig {
     pub revision: Option<String>,
 
     /// HuggingFace token for private models.
-    #[serde(default)]
+    /// Skipped during serialization to prevent accidental token leakage into
+    /// config snapshots, logs, or checkpoint metadata.
+    #[serde(default, skip_serializing)]
     pub hf_token: Option<String>,
 }
 
@@ -105,6 +107,16 @@ pub struct LoraConfig {
     /// Initialize LoRA B to zero (recommended).
     #[serde(default = "default_true")]
     pub init_lora_weights: bool,
+
+    /// LoRA+ learning rate ratio for B matrices (Hayou et al., ICML 2024).
+    ///
+    /// When set, LoRA B matrices are trained with `base_lr * loraplus_lr_ratio`
+    /// while LoRA A matrices use `base_lr`.  This breaks the symmetry between A and B,
+    /// letting B learn faster since it starts at zero and directly controls the output.
+    ///
+    /// Recommended value: 16.0 (from the paper).  `None` disables LoRA+ (default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loraplus_lr_ratio: Option<f32>,
 }
 
 impl Default for LoraConfig {
@@ -118,6 +130,7 @@ impl Default for LoraConfig {
             use_dora: false,
             bias: LoraBias::default(),
             init_lora_weights: true,
+            loraplus_lr_ratio: None,
         }
     }
 }
@@ -187,6 +200,23 @@ pub struct TrainingConfig {
     #[serde(default)]
     pub lr_scheduler: LrSchedulerType,
 
+    /// Minimum learning rate floor (absolute). Applied across all decay schedulers.
+    /// Without this, cosine/polynomial decay goes all the way to zero.
+    #[serde(default)]
+    pub min_lr: Option<f64>,
+
+    /// WSD stable phase fraction (0.0-1.0, default 0.7).
+    #[serde(default)]
+    pub wsd_stable_ratio: Option<f64>,
+
+    /// Cosine restart count for CosineWithRestarts scheduler (default 1).
+    #[serde(default)]
+    pub cosine_num_restarts: Option<usize>,
+
+    /// Polynomial decay exponent (default 1.0 = linear, 2.0 = quadratic).
+    #[serde(default)]
+    pub polynomial_power: Option<f64>,
+
     /// Gradient checkpointing strategy.
     #[serde(default)]
     pub gradient_checkpointing: CheckpointStrategy,
@@ -238,6 +268,10 @@ impl Default for TrainingConfig {
             weight_decay: default_weight_decay(),
             max_grad_norm: default_grad_clip(),
             lr_scheduler: LrSchedulerType::default(),
+            min_lr: None,
+            wsd_stable_ratio: None,
+            cosine_num_restarts: None,
+            polynomial_power: None,
             gradient_checkpointing: CheckpointStrategy::default(),
             optimizer: OptimizerType::default(),
             seed: default_seed(),
