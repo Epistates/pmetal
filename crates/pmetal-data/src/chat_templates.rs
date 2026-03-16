@@ -671,10 +671,13 @@ impl ChatTemplate {
             }
         }
 
-        // Additional turns
+        // Additional turns: canonical multi-turn wraps each pair in <s>...</s>.
+        // Format: </s><s>[INST] u2 [/INST] a2 </s><s>[INST] u3 [/INST] ...
         for i in 1..user_messages.len().max(assistant_messages.len()) {
+            // Close previous turn and open a new one
+            text.push_str("</s><s>");
             if i < user_messages.len() {
-                text.push_str(&format!(" [INST] {} [/INST]", user_messages[i].content));
+                text.push_str(&format!("[INST] {} [/INST]", user_messages[i].content));
             }
             if i < assistant_messages.len() {
                 response_start = text.len() + 1;
@@ -981,8 +984,9 @@ impl ChatTemplate {
         let mut response_start = 0;
 
         for (i, msg) in messages.iter().enumerate() {
+            // Canonical Phi-4 format: <|im_start|>role<|im_sep|>content<|im_end|>\n
             let formatted = format!(
-                "<|im_start|>{}<|im_sep|>{}<|im_end|>",
+                "<|im_start|>{}<|im_sep|>{}<|im_end|>\n",
                 msg.role, msg.content
             );
 

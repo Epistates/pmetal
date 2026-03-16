@@ -122,12 +122,20 @@ impl Tokenizer {
     /// 3. Fallback to EOS token
     pub fn pad_token_id(&self) -> Option<u32> {
         self.special.pad.or_else(|| {
-            self.inner
+            let explicit = self
+                .inner
                 .token_to_id("<pad>")
                 .or_else(|| self.inner.token_to_id("[PAD]"))
                 .or_else(|| self.inner.token_to_id("<|pad|>"))
-                .or_else(|| self.inner.token_to_id("<|finetune_right_pad_id|>"))
-                .or_else(|| self.eos_token_id())
+                .or_else(|| self.inner.token_to_id("<|finetune_right_pad_id|>"));
+            if explicit.is_some() {
+                return explicit;
+            }
+            let eos = self.eos_token_id();
+            if eos.is_some() {
+                tracing::warn!("pad_token_id not configured, falling back to eos_token_id");
+            }
+            eos
         })
     }
 

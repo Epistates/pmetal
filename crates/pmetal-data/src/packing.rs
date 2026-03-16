@@ -405,8 +405,18 @@ impl SequencePacker {
         for sample in samples {
             let sample_len = self.get_sample_length(sample);
 
-            // Skip samples that are too short or too long
+            // Skip samples that are too short
             if sample_len < self.config.min_length {
+                continue;
+            }
+
+            // Skip samples that exceed the max pack length (same guard as FFD packer)
+            if sample_len > self.config.max_length {
+                tracing::warn!(
+                    sample_len,
+                    max_length = self.config.max_length,
+                    "Skipping oversized sample in greedy packer"
+                );
                 continue;
             }
 

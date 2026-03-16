@@ -214,6 +214,7 @@ impl TrainingDataset {
         let reader = BufReader::new(file);
         let mut samples = Vec::new();
         let mut detected_format = format;
+        let mut first_content_seen = false;
 
         for (line_num, line_result) in reader.lines().enumerate() {
             let line = line_result.map_err(|e| {
@@ -227,9 +228,13 @@ impl TrainingDataset {
                 continue;
             }
 
-            // Auto-detect format on first line
-            if line_num == 0 && detected_format == DatasetFormat::Auto {
+            // Auto-detect format on the first non-empty line (not necessarily line 0,
+            // which may be blank and cause a false-negative format detection).
+            if !first_content_seen && detected_format == DatasetFormat::Auto {
+                first_content_seen = true;
                 detected_format = Self::detect_format(&line)?;
+            } else {
+                first_content_seen = true;
             }
 
             let sample = Self::parse_line(&line, detected_format, line_num, template)?;

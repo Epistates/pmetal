@@ -48,6 +48,12 @@ impl VocabCompactor {
         }
 
         let compact_vocab = compact_to_full.len();
+        assert!(
+            compact_vocab <= u16::MAX as usize,
+            "compact vocabulary size {compact_vocab} exceeds u16::MAX ({}); \
+             reduce the dataset or split the vocabulary",
+            u16::MAX
+        );
         tracing::info!(
             full_vocab,
             compact_vocab,
@@ -88,7 +94,18 @@ impl VocabCompactor {
     pub fn compact_tokens(&self, tokens: &[u16]) -> Vec<u16> {
         tokens
             .iter()
-            .map(|&t| self.to_compact(t).unwrap_or(0))
+            .map(|&t| {
+                match self.to_compact(t) {
+                    Some(compact_id) => compact_id,
+                    None => {
+                        tracing::warn!(
+                            token_id = t,
+                            "OOV token mapped to compact ID 0; token was not seen during vocabulary construction"
+                        );
+                        0
+                    }
+                }
+            })
             .collect()
     }
 
