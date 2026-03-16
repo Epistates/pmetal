@@ -1814,6 +1814,8 @@ async fn run_qlora_training_in_process(
         embedding_lr: config.embedding_lr.map(|v| v as f32),
         eager_evaluation: true,
         use_metal_fused_optimizer: config.fused_optimizer.unwrap_or(false),
+        loraplus_lr_ratio: None,
+        neftune_noise_alpha: None,
     };
 
     let mut training_loop = pmetal::trainer::TrainingLoop::new(training_loop_config);
@@ -1997,6 +1999,8 @@ async fn run_distillation_in_process(
         embedding_lr: None,
         eager_evaluation: false,
         use_metal_fused_optimizer: true,
+        loraplus_lr_ratio: None,
+        neftune_noise_alpha: None,
     };
 
     let mut trainer = pmetal::trainer::DistillationTrainer::new(distiller, training_loop_config);

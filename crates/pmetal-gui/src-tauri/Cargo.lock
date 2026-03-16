@@ -5455,7 +5455,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "pmetal-core",
  "pmetal-data",
@@ -5478,7 +5478,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-core"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "secrecy",
  "serde",
@@ -5490,7 +5490,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-data"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "arrow",
  "image",
@@ -5507,7 +5507,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distill"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "bitcode",
  "half",
@@ -5529,7 +5529,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distributed"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5555,7 +5555,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gguf"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "byteorder",
  "half",
@@ -5566,7 +5566,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gui"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "chrono",
  "dirs",
@@ -5586,7 +5586,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-hub"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -5606,7 +5606,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-lora"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "half",
  "pmetal-core",
@@ -5623,7 +5623,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-merge"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "half",
  "hf-hub",
@@ -5644,7 +5644,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-metal"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "block2",
  "cc",
@@ -5669,7 +5669,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mhc"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "ndarray",
  "num-traits",
@@ -5689,7 +5689,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mlx"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "half",
  "num-traits",
@@ -5743,7 +5743,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-models"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "json5",
  "objc2",
@@ -5763,7 +5763,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-trainer"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "chrono",
  "indicatif",
@@ -5785,7 +5785,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-vocoder"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "half",
  "hf-hub",
