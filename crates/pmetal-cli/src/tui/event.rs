@@ -107,9 +107,9 @@ impl std::fmt::Display for JobType {
 /// and application messages into a single stream.
 pub struct EventHandler {
     /// Receive events here.
-    rx: mpsc::UnboundedReceiver<Event>,
+    rx: mpsc::Receiver<Event>,
     /// Send app messages on this channel (clone it for background tasks).
-    app_tx: mpsc::UnboundedSender<AppMsg>,
+    app_tx: mpsc::Sender<AppMsg>,
 }
 
 impl EventHandler {
@@ -119,15 +119,18 @@ impl EventHandler {
     /// forwarding them as `Event` variants. Returns the handler (which owns the
     /// receiver) and exposes `app_tx()` for sending `AppMsg` from background jobs.
     pub fn new(tick_rate: std::time::Duration) -> Self {
-        let (event_tx, event_rx) = mpsc::unbounded_channel();
-        let (app_tx, mut app_rx) = mpsc::unbounded_channel::<AppMsg>();
+        // Bounded channels prevent unbounded memory growth when the TUI is slower than
+        // background tasks. Messages exceeding the buffer are dropped with a warning.
+        let (event_tx, event_rx) = mpsc::channel::<Event>(256);
+        let (app_tx, mut app_rx) = mpsc::channel::<AppMsg>(256);
 
         // Forward app messages into the unified event channel
         let fwd_tx = event_tx.clone();
         tokio::spawn(async move {
             while let Some(msg) = app_rx.recv().await {
-                if fwd_tx.send(Event::App(msg)).is_err() {
-                    break;
+                if fwd_tx.try_send(Event::App(msg)).is_err() {
+                    // Channel full or closed — drop the message to avoid blocking
+                    tracing::debug!("Event channel full, dropping AppMsg");
                 }
             }
         });
@@ -141,9 +144,8 @@ impl EventHandler {
             loop {
                 tokio::select! {
                     _ = tick_interval.tick() => {
-                        if ct_tx.send(Event::Tick).is_err() {
-                            break;
-                        }
+                        // Tick events are low-priority; drop silently if channel is full
+                        let _ = ct_tx.try_send(Event::Tick);
                     }
                     maybe_event = event_stream.next() => {
                         match maybe_event {
@@ -161,7 +163,8 @@ impl EventHandler {
                                     _ => None,
                                 };
                                 if let Some(event) = event {
-                                    if ct_tx.send(event).is_err() {
+                                    // Key/mouse events are higher priority — use blocking send
+                                    if ct_tx.send(event).await.is_err() {
                                         break;
                                     }
                                 }
@@ -185,7 +188,7 @@ impl EventHandler {
     }
 
     /// Get a sender for application messages. Clone this for background tasks.
-    pub fn app_tx(&self) -> mpsc::UnboundedSender<AppMsg> {
+    pub fn app_tx(&self) -> mpsc::Sender<AppMsg> {
         self.app_tx.clone()
     }
 }

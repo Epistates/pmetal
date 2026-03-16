@@ -178,11 +178,15 @@ impl App {
             }
         }
 
-        // Restore terminal
+        // Restore terminal.
+        // Each cleanup step must be attempted even if earlier ones fail, so we
+        // suppress errors with `let _ =` rather than propagating them with `?`.
+        // Propagating here would cause partial cleanup (e.g. leaving raw mode
+        // enabled) when, say, DisableMouseCapture fails on a non-mouse terminal.
         let _ = std::panic::take_hook();
-        crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture)?;
-        disable_raw_mode()?;
-        io::stdout().execute(LeaveAlternateScreen)?;
+        let _ = crossterm::execute!(io::stdout(), crossterm::event::DisableMouseCapture);
+        let _ = disable_raw_mode();
+        let _ = io::stdout().execute(LeaveAlternateScreen);
         Ok(())
     }
 
@@ -1698,12 +1702,14 @@ impl App {
         tokio::spawn(async move {
             match pmetal_hub::search_models(&query, 20, None).await {
                 Ok(results) => {
-                    let _ = tx.send(AppMsg::HfSearchResults { results });
+                    let _ = tx.send(AppMsg::HfSearchResults { results }).await;
                 }
                 Err(e) => {
-                    let _ = tx.send(AppMsg::HfSearchError {
-                        message: e.to_string(),
-                    });
+                    let _ = tx
+                        .send(AppMsg::HfSearchError {
+                            message: e.to_string(),
+                        })
+                        .await;
                 }
             }
         });

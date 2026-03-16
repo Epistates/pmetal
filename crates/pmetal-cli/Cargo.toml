@@ -23,6 +23,7 @@ pmetal-hub = { workspace = true }
 pmetal-gguf = { workspace = true }
 pmetal-trainer = { workspace = true }
 pmetal-distill = { workspace = true }
+pmetal-merge = { workspace = true }
 mlx-rs = { workspace = true }
 clap = { workspace = true }
 tokio = { workspace = true }
@@ -49,6 +50,9 @@ ratatui = { version = "0.29", optional = true }
 crossterm = { version = "0.28", features = ["event-stream"], optional = true }
 futures = { version = "0.3", optional = true }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
+libc = "0.2"
+reqwest = { workspace = true }
+sha2 = { workspace = true }
 
 [features]
 default = ["ane", "dashboard"]

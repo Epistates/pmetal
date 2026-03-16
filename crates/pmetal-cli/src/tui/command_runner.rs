@@ -26,13 +26,13 @@ pub struct RunningJob {
 
 /// Manages background pmetal child processes.
 pub struct CommandRunner {
-    app_tx: mpsc::UnboundedSender<AppMsg>,
+    app_tx: mpsc::Sender<AppMsg>,
     jobs: HashMap<String, RunningJob>,
     next_id: u32,
 }
 
 impl CommandRunner {
-    pub fn new(app_tx: mpsc::UnboundedSender<AppMsg>) -> Self {
+    pub fn new(app_tx: mpsc::Sender<AppMsg>) -> Self {
         Self {
             app_tx,
             jobs: HashMap::new(),
@@ -41,7 +41,7 @@ impl CommandRunner {
     }
 
     /// Get a clone of the app message sender (for background tasks).
-    pub fn app_tx(&self) -> mpsc::UnboundedSender<AppMsg> {
+    pub fn app_tx(&self) -> mpsc::Sender<AppMsg> {
         self.app_tx.clone()
     }
 
@@ -57,8 +57,8 @@ impl CommandRunner {
         let job_type = spec.job_type;
         let metrics_file = spec.metrics_file.clone();
 
-        // Notify TUI that job started
-        let _ = tx.send(AppMsg::JobStarted {
+        // Notify TUI that job started (sync context — use try_send, drop on full)
+        let _ = tx.try_send(AppMsg::JobStarted {
             job_id: job_id.clone(),
             job_type: spec.job_type,
         });
@@ -71,11 +71,13 @@ impl CommandRunner {
                 Err(e) => (false, e.to_string()),
             };
 
-            let _ = tx.send(AppMsg::JobFinished {
-                job_id: job_id_clone,
-                success,
-                message,
-            });
+            let _ = tx
+                .send(AppMsg::JobFinished {
+                    job_id: job_id_clone,
+                    success,
+                    message,
+                })
+                .await;
         });
 
         self.jobs.insert(
@@ -147,10 +149,11 @@ impl pmetal_core::TrainingCallback for CancelOnToken {
 }
 
 /// Run a command spec as a child process, streaming output back to the TUI.
+#[allow(unsafe_code)]
 async fn run_command(
     spec: CommandSpec,
     job_id: &str,
-    tx: mpsc::UnboundedSender<AppMsg>,
+    tx: mpsc::Sender<AppMsg>,
     cancel: CancellationToken,
 ) -> Result<(), anyhow::Error> {
     // If this is a training-type job, write a sentinel file
@@ -167,10 +170,12 @@ async fn run_command(
 
     // Log the full command to the job output for debugging
     let cmd_display = format!("pmetal {}", spec.args.join(" "));
-    let _ = tx.send(AppMsg::JobOutput {
-        job_id: job_id.to_string(),
-        line: format!("$ {cmd_display}"),
-    });
+    let _ = tx
+        .send(AppMsg::JobOutput {
+            job_id: job_id.to_string(),
+            line: format!("$ {cmd_display}"),
+        })
+        .await;
 
     // Poll metrics file for training jobs
     if let Some(ref metrics_path) = spec.metrics_file {
@@ -206,6 +211,15 @@ async fn run_command(
 
     cmd.stdout(std::process::Stdio::piped());
     cmd.stderr(std::process::Stdio::piped());
+
+    // Place child in its own process group so cancellation kills the entire
+    // process tree (child + any grandchildren it spawns), not just the direct child.
+    #[cfg(unix)]
+    {
+        #[allow(unused_imports)]
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
 
     let mut child = cmd.spawn()?;
 
@@ -267,18 +281,22 @@ async fn run_command(
                         // Send everything before the footer as content
                         let content = &accum[..footer_pos];
                         if !content.is_empty() {
-                            let _ = tx_out.send(AppMsg::InferenceToken {
-                                token: content.to_string(),
-                            });
+                            let _ = tx_out
+                                .send(AppMsg::InferenceToken {
+                                    token: content.to_string(),
+                                })
+                                .await;
                         }
                         // Parse stats from after "---\n"
                         let after_footer = &accum[footer_pos + "\n---\n".len()..];
                         if let Some(stats_line) = after_footer.lines().next() {
                             let (total_tokens, tok_sec) = parse_inference_stats(stats_line);
-                            let _ = tx_out.send(AppMsg::InferenceDone {
-                                tok_sec,
-                                total_tokens,
-                            });
+                            let _ = tx_out
+                                .send(AppMsg::InferenceDone {
+                                    tok_sec,
+                                    total_tokens,
+                                })
+                                .await;
                             got_stats = true;
                         }
                         break 'stream;
@@ -288,10 +306,12 @@ async fn run_command(
                     if let Some(after) = accum.strip_prefix("---\n") {
                         if let Some(stats_line) = after.lines().next() {
                             let (total_tokens, tok_sec) = parse_inference_stats(stats_line);
-                            let _ = tx_out.send(AppMsg::InferenceDone {
-                                tok_sec,
-                                total_tokens,
-                            });
+                            let _ = tx_out
+                                .send(AppMsg::InferenceDone {
+                                    tok_sec,
+                                    total_tokens,
+                                })
+                                .await;
                             got_stats = true;
                         }
                         break 'stream;
@@ -302,9 +322,11 @@ async fn run_command(
                     if let Some(last_nl) = accum.rfind('\n') {
                         let to_send = &accum[..last_nl];
                         if !to_send.is_empty() {
-                            let _ = tx_out.send(AppMsg::InferenceToken {
-                                token: to_send.to_string(),
-                            });
+                            let _ = tx_out
+                                .send(AppMsg::InferenceToken {
+                                    token: to_send.to_string(),
+                                })
+                                .await;
                         }
                         accum = accum[last_nl + 1..].to_string();
                     }
@@ -312,14 +334,16 @@ async fn run_command(
 
                 // Send any remaining content
                 if !accum.is_empty() && !accum.starts_with("---") {
-                    let _ = tx_out.send(AppMsg::InferenceToken { token: accum });
+                    let _ = tx_out.send(AppMsg::InferenceToken { token: accum }).await;
                 }
 
                 if !got_stats {
-                    let _ = tx_out.send(AppMsg::InferenceDone {
-                        tok_sec: 0.0,
-                        total_tokens: 0,
-                    });
+                    let _ = tx_out
+                        .send(AppMsg::InferenceDone {
+                            tok_sec: 0.0,
+                            total_tokens: 0,
+                        })
+                        .await;
                 }
             } else {
                 // Non-inference: route all output to job log
@@ -330,6 +354,7 @@ async fn run_command(
                             job_id: jid.clone(),
                             line,
                         })
+                        .await
                         .is_err()
                     {
                         break;
@@ -364,7 +389,7 @@ async fn run_command(
                         || line.contains("TRACE")
                         || line.contains("WARN");
                     if !is_tracing {
-                        let _ = tx_err.send(AppMsg::InferenceError { message: line });
+                        let _ = tx_err.send(AppMsg::InferenceError { message: line }).await;
                         continue;
                     }
                 }
@@ -373,6 +398,7 @@ async fn run_command(
                         job_id: jid.clone(),
                         line,
                     })
+                    .await
                     .is_err()
                 {
                     break;
@@ -420,6 +446,17 @@ async fn run_command(
             }
         }
         _ = cancel.cancelled() => {
+            // On Unix, kill the entire process group (child + all grandchildren).
+            // Fall back to killing just the child process on other platforms.
+            #[cfg(unix)]
+            {
+                if let Some(pid) = child.id() {
+                    // SAFETY: kill(2) is async-signal-safe; pid comes from a live child.
+                    unsafe { libc::killpg(pid as i32, libc::SIGTERM); }
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    unsafe { libc::killpg(pid as i32, libc::SIGKILL); }
+                }
+            }
             let _ = child.kill().await;
             cleanup_running_file(&spec).await;
             Err(anyhow::anyhow!("Cancelled by user"))
@@ -500,6 +537,10 @@ async fn run_training_direct(
         false,
         callbacks,
         None,
+        parse_arg(&spec.args, "--warmup-steps", 0usize)?,
+        &optional_arg(&spec.args, "--lr-schedule").unwrap_or_else(|| "cosine".to_string()),
+        parse_arg(&spec.args, "--weight-decay", 0.01f64)?,
+        parse_arg(&spec.args, "--seed", 42u64)?,
         !has_flag(&spec.args, "--no-ane"),
     )
     .await
@@ -532,11 +573,12 @@ async fn run_distillation_direct(
         has_flag(&spec.args, "--rationale"),
         parse_arg(&spec.args, "--rationale-weight", 1.0f32)?,
         parse_arg(&spec.args, "--lora-r", 16usize)?,
-        parse_arg(&spec.args, "--lora-alpha", 32usize)?,
+        parse_arg(&spec.args, "--lora-alpha", 32.0f32)?,
         parse_arg(&spec.args, "--learning-rate", 2e-5f32)?,
         parse_arg(&spec.args, "--batch-size", 1usize)?,
         parse_arg(&spec.args, "--epochs", 1usize)?,
         parse_arg(&spec.args, "--max-seq-len", 1024usize)?,
+        parse_arg(&spec.args, "--seed", 42u64)?,
         spec.metrics_file.as_ref().map(|p| p.display().to_string()),
         false,
         callbacks,
@@ -566,9 +608,10 @@ async fn run_grpo_direct(
         parse_arg(&spec.args, "--learning-rate", 5e-6f64)?,
         parse_arg(&spec.args, "--epochs", 1usize)?,
         parse_arg(&spec.args, "--lora-r", 16usize)?,
-        parse_arg(&spec.args, "--lora-alpha", 32usize)?,
+        parse_arg(&spec.args, "--lora-alpha", 32.0f32)?,
         parse_arg(&spec.args, "--max-seq-len", 512usize)?,
         parse_arg(&spec.args, "--max-completion-length", 512usize)?,
+        parse_arg(&spec.args, "--seed", 42u64)?,
         grpo_type == "dapo" || has_flag(&spec.args, "--dapo"),
         has_flag(&spec.args, "--reasoning-rewards"),
         !has_flag(&spec.args, "--no-flash-attention"),
@@ -633,7 +676,7 @@ fn parse_inference_stats(line: &str) -> (usize, f64) {
 async fn poll_metrics_file(
     path: &std::path::Path,
     job_id: &str,
-    tx: mpsc::UnboundedSender<AppMsg>,
+    tx: mpsc::Sender<AppMsg>,
     cancel: CancellationToken,
 ) {
     let mut last_pos: u64 = 0;
@@ -678,9 +721,11 @@ async fn poll_metrics_file(
                 }
 
                 let mut line = String::new();
+                // Collect metrics lines then send outside the sync read loop
+                let mut metrics_to_send = Vec::new();
                 while reader.read_line(&mut line).unwrap_or(0) > 0 {
                     if let Ok(json) = serde_json::from_str::<serde_json::Value>(&line) {
-                        let _ = tx.send(AppMsg::JobMetrics {
+                        metrics_to_send.push(AppMsg::JobMetrics {
                             job_id: job_id.clone(),
                             step: json["step"].as_u64().unwrap_or(0) as usize,
                             epoch: json["epoch"].as_u64().unwrap_or(0) as usize,
@@ -698,6 +743,9 @@ async fn poll_metrics_file(
                         });
                     }
                     line.clear();
+                }
+                for msg in metrics_to_send {
+                    let _ = tx.try_send(msg);
                 }
                 reader.stream_position().unwrap_or(last_pos)
             }

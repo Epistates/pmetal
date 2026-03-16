@@ -68,11 +68,19 @@ impl JobsTab {
     pub fn scan_jobs(&mut self) {
         self.jobs.clear();
 
-        // Scan common output directories for checkpoints
-        let output_dirs = ["./output", "./output/distilled", "./output/grpo"];
+        // Use absolute paths rooted at ~/.pmetal/output so the jobs tab works
+        // regardless of the current working directory.
+        let base = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".pmetal")
+            .join("output");
+        let output_dirs = [
+            base.join("training"),
+            base.join("distilled"),
+            base.join("grpo"),
+        ];
 
-        for dir_path in &output_dirs {
-            let dir = std::path::Path::new(dir_path);
+        for dir in &output_dirs {
             if !dir.exists() {
                 continue;
             }

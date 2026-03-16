@@ -230,9 +230,12 @@ impl TrainingTab {
         if count == 0 {
             return;
         }
+        let start = self.field_idx;
         self.field_idx = (self.field_idx + 1) % count;
-        // Skip read-only fields that can't be interacted with
-        if matches!(self.fields[self.field_idx].kind, FieldKind::ReadOnly) {
+        // Skip all consecutive read-only fields (guard against all-ReadOnly edge case)
+        while matches!(self.fields[self.field_idx].kind, FieldKind::ReadOnly)
+            && self.field_idx != start
+        {
             self.field_idx = (self.field_idx + 1) % count;
         }
         self.sync_list_selection();
@@ -243,8 +246,12 @@ impl TrainingTab {
         if count == 0 {
             return;
         }
+        let start = self.field_idx;
         self.field_idx = (self.field_idx + count - 1) % count;
-        if matches!(self.fields[self.field_idx].kind, FieldKind::ReadOnly) {
+        // Skip all consecutive read-only fields (guard against all-ReadOnly edge case)
+        while matches!(self.fields[self.field_idx].kind, FieldKind::ReadOnly)
+            && self.field_idx != start
+        {
             self.field_idx = (self.field_idx + count - 1) % count;
         }
         self.sync_list_selection();
@@ -381,6 +388,8 @@ impl TrainingTab {
             self.field_value("Grad Accum Steps"),
         ]);
         args.extend(["--max-grad-norm".into(), self.field_value("Max Grad Norm")]);
+        args.extend(["--warmup-steps".into(), self.field_value("Warmup Steps")]);
+        args.extend(["--weight-decay".into(), self.field_value("Weight Decay")]);
         args.extend(["--lora-r".into(), self.field_value("LoRA Rank")]);
         args.extend(["--lora-alpha".into(), self.field_value("LoRA Alpha")]);
 

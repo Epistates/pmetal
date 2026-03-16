@@ -77,6 +77,86 @@ pub enum QuantizationMethod {
     Int8,
 }
 
+/// GGUF quantization method for the `quantize` subcommand.
+///
+/// Supports all K-quant types available in the pmetal-gguf crate, plus
+/// `dynamic` for importance-matrix-guided mixed-precision quantization.
+/// K-quant size suffixes follow llama.cpp naming conventions:
+///   - `s` = small (lower quality, smaller size)
+///   - `m` = medium (balanced, recommended)
+///   - `l` = large (higher quality, larger size)
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum QuantizeMethod {
+    /// Importance-matrix-guided mixed precision (recommended with --imatrix)
+    #[default]
+    Dynamic,
+    /// 8-bit integer (near-lossless, ~1.06 bpw)
+    Q8_0,
+    /// 6-bit K-quant (high quality, ~0.80 bpw)
+    Q6K,
+    /// 5-bit K-quant medium (good quality/size balance)
+    Q5KM,
+    /// 5-bit K-quant small (slightly smaller than q5-k-m)
+    Q5KS,
+    /// 4-bit K-quant medium (recommended 4-bit, ~0.58 bpw)
+    Q4KM,
+    /// 4-bit K-quant small (smallest 4-bit K-quant)
+    Q4KS,
+    /// 3-bit K-quant medium
+    Q3KM,
+    /// 3-bit K-quant small
+    Q3KS,
+    /// 3-bit K-quant large
+    Q3KL,
+    /// 2-bit K-quant (lowest quality, ~0.37 bpw)
+    Q2K,
+    /// 16-bit float (lossless, 2.0 bpw)
+    F16,
+    /// 32-bit float (lossless reference precision, 4.0 bpw)
+    F32,
+}
+
+impl QuantizeMethod {
+    /// Canonical display name matching llama.cpp naming conventions.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Dynamic => "dynamic",
+            Self::Q8_0 => "q8_0",
+            Self::Q6K => "q6_k",
+            Self::Q5KM => "q5_k_m",
+            Self::Q5KS => "q5_k_s",
+            Self::Q4KM => "q4_k_m",
+            Self::Q4KS => "q4_k_s",
+            Self::Q3KM => "q3_k_m",
+            Self::Q3KS => "q3_k_s",
+            Self::Q3KL => "q3_k_l",
+            Self::Q2K => "q2_k",
+            Self::F16 => "f16",
+            Self::F32 => "f32",
+        }
+    }
+
+    /// Map to the underlying `GgmlType`. Returns `None` for `Dynamic` (uses
+    /// `DynamicQuantizer` instead of a fixed type).
+    pub fn to_ggml_type(self) -> Option<pmetal_gguf::GgmlType> {
+        use pmetal_gguf::GgmlType;
+        match self {
+            Self::Dynamic => None,
+            Self::Q8_0 => Some(GgmlType::Q8_0),
+            Self::Q6K => Some(GgmlType::Q6K),
+            // All Q5K size variants share the same K-quant block structure
+            Self::Q5KM | Self::Q5KS => Some(GgmlType::Q5K),
+            // All Q4K size variants share the same K-quant block structure
+            Self::Q4KM | Self::Q4KS => Some(GgmlType::Q4K),
+            // All Q3K size variants share the same K-quant block structure
+            Self::Q3KM | Self::Q3KS | Self::Q3KL => Some(GgmlType::Q3K),
+            Self::Q2K => Some(GgmlType::Q2K),
+            Self::F16 => Some(GgmlType::F16),
+            Self::F32 => Some(GgmlType::F32),
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "pmetal")]
 #[command(author, version, about = "LLM fine-tuning optimized for Apple Silicon", long_about = None)]
@@ -197,6 +277,22 @@ enum Commands {
         #[arg(long)]
         embedding_lr: Option<f32>,
 
+        /// Number of linear warmup steps before reaching the target learning rate.
+        #[arg(long, default_value = "0")]
+        warmup_steps: usize,
+
+        /// Learning rate schedule (constant, linear, cosine, cosine_with_restarts, polynomial, wsd).
+        #[arg(long, default_value = "cosine")]
+        lr_schedule: String,
+
+        /// AdamW weight decay coefficient.
+        #[arg(long, default_value = "0.01")]
+        weight_decay: f64,
+
+        /// Random seed for dataset shuffling and initialization.
+        #[arg(long, default_value = "42")]
+        seed: u64,
+
         /// Disable ANE (Apple Neural Engine) for training, falling back to GPU/MLX.
         #[cfg(feature = "ane")]
         #[arg(long)]
@@ -276,9 +372,9 @@ enum Commands {
         #[arg(long)]
         compiled: bool,
 
-        /// Use dedicated GPU stream for generation (like mlx_lm's generation_stream)
-        /// (may improve pipelining and reduce scheduling overhead)
-        #[arg(long)]
+        /// Use dedicated GPU stream for generation.
+        /// NOTE: Currently a no-op placeholder; streaming generation is not yet implemented.
+        #[arg(long, hide = true)]
         stream: bool,
 
         /// Use minimal async generation (for performance debugging)
@@ -341,10 +437,18 @@ enum Commands {
         /// Show detailed fit analysis (memory breakdown, training estimates)
         #[arg(long)]
         detailed: bool,
+
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
     },
 
     /// Show memory usage and available capacity
-    Memory,
+    Memory {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 
     /// Benchmark FFI overhead (for performance analysis)
     BenchFfi,
@@ -421,9 +525,9 @@ enum Commands {
         #[arg(long)]
         imatrix: Option<String>,
 
-        /// Quantization method (e.g., q4_k_m, q8_0) or "dynamic"
-        #[arg(long, default_value = "dynamic")]
-        method: String,
+        /// Quantization method
+        #[arg(long, value_enum, default_value = "dynamic")]
+        method: QuantizeMethod,
 
         /// LoRA adapter to fuse before quantizing (optional)
         #[arg(long)]
@@ -478,7 +582,7 @@ enum Commands {
 
         /// LoRA alpha scaling factor
         #[arg(long, default_value = "32")]
-        lora_alpha: usize,
+        lora_alpha: f32,
 
         /// Learning rate
         #[arg(long, default_value = "2e-5")]
@@ -495,6 +599,10 @@ enum Commands {
         /// Maximum sequence length
         #[arg(long, default_value = "1024")]
         max_seq_len: usize,
+
+        /// Random seed for dataset shuffling and initialization.
+        #[arg(long, default_value = "42")]
+        seed: u64,
 
         /// Path to write JSONL metrics log (for TUI dashboard)
         #[arg(long)]
@@ -527,9 +635,29 @@ enum Commands {
         #[arg(long, default_value = "5e-6")]
         learning_rate: f64,
 
+        /// Number of training epochs
+        #[arg(long, default_value = "1")]
+        epochs: usize,
+
+        /// LoRA rank for policy model
+        #[arg(long, default_value = "16")]
+        lora_r: usize,
+
+        /// LoRA alpha scaling factor
+        #[arg(long, default_value = "32")]
+        lora_alpha: f32,
+
         /// Maximum sequence length for generations
         #[arg(long, default_value = "512")]
         max_seq_len: usize,
+
+        /// Maximum completion length per generation
+        #[arg(long, default_value = "512")]
+        max_completion_length: usize,
+
+        /// Random seed for reproducibility
+        #[arg(long, default_value = "42")]
+        seed: u64,
 
         /// Enable DAPO (Distribution-Aware Policy Optimization)
         #[arg(long)]
@@ -567,6 +695,83 @@ enum Commands {
         /// Path to training metrics JSONL file to visualize in the dashboard tab
         #[arg(short, long)]
         metrics_file: Option<String>,
+    },
+
+    /// Show device information (GPU architecture, ANE cores, bandwidth, NAX support)
+    Info {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Merge two or more models using various merge methods (SLERP, TIES, DARE, linear, etc.)
+    Merge {
+        /// First model path or HuggingFace ID
+        #[arg(short = 'a', long)]
+        model_a: String,
+
+        /// Second model path or HuggingFace ID
+        #[arg(short = 'b', long)]
+        model_b: String,
+
+        /// Output directory for merged model
+        #[arg(short, long)]
+        output: String,
+
+        /// Merge method (linear, slerp, ties, dare_ties, dare_linear, task_arithmetic, della, breadcrumbs, model_stock, nearswap, passthrough)
+        #[arg(long, default_value = "slerp")]
+        method: String,
+
+        /// Base model for task-vector methods (TIES, DARE, task_arithmetic)
+        #[arg(long)]
+        base: Option<String>,
+
+        /// Interpolation parameter t for SLERP (0.0=model_a, 1.0=model_b)
+        #[arg(long, default_value = "0.5")]
+        t: f32,
+
+        /// Weight for model_a in linear/ties methods
+        #[arg(long, default_value = "0.5")]
+        weight_a: f32,
+
+        /// Weight for model_b in linear/ties methods
+        #[arg(long, default_value = "0.5")]
+        weight_b: f32,
+
+        /// Density for sparsification (TIES/DARE) — fraction of params to keep
+        #[arg(long, default_value = "0.5")]
+        density: f32,
+
+        /// Output dtype (float32, float16, bfloat16)
+        #[arg(long, default_value = "bfloat16")]
+        dtype: String,
+    },
+
+    /// Evaluate a model's perplexity on a dataset
+    Eval {
+        /// Model ID or path
+        #[arg(short, long)]
+        model: String,
+
+        /// Dataset path (JSONL file)
+        #[arg(short, long)]
+        dataset: String,
+
+        /// LoRA adapter path (optional)
+        #[arg(long)]
+        lora: Option<String>,
+
+        /// Maximum sequence length
+        #[arg(long, default_value = "1024")]
+        max_seq_len: usize,
+
+        /// Number of samples to evaluate (0 = all)
+        #[arg(long, default_value = "0")]
+        num_samples: usize,
+
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -1161,9 +1366,24 @@ fn ensure_metallib() {
     );
 }
 
+/// SHA-256 of the released `mlx.metallib` artifact.
+///
+/// Empty string in dev builds.  Set to the hex digest of the artifact for
+/// official releases so every download is cryptographically verified before
+/// being committed to the cache.
+const METALLIB_SHA256: &str = match option_env!("PMETAL_METALLIB_SHA256") {
+    Some(s) => s,
+    None => "",
+};
+
 /// Download `mlx.metallib` from the matching GitHub release.
 ///
-/// Returns `true` if the download succeeded and the file is in place.
+/// Uses `reqwest` (no subprocess) and verifies the SHA-256 of the downloaded
+/// bytes when `METALLIB_SHA256` is non-empty.  Writes to a temp file first,
+/// then atomically renames into place so a failed download never leaves a
+/// corrupted cache entry.
+///
+/// Returns `true` if the download succeeded and the file is verified.
 fn download_metallib(dest: &std::path::Path) -> bool {
     let version = env!("CARGO_PKG_VERSION");
     let url =
@@ -1178,46 +1398,92 @@ fn download_metallib(dest: &std::path::Path) -> bool {
         let _ = std::fs::create_dir_all(parent);
     }
 
-    // Use a temp file so a partial download doesn't leave a broken metallib
+    // Use a temp file so a partial download never leaves a broken metallib.
     let tmp = dest.with_extension("metallib.tmp");
 
-    let status = std::process::Command::new("curl")
-        .args([
-            "-fSL",           // fail on HTTP errors, show errors, follow redirects
-            "--progress-bar", // compact progress indicator
-            "-o",
-        ])
-        .arg(&tmp)
-        .arg(&url)
-        .status();
-
-    match status {
-        Ok(s) if s.success() => {
-            // Atomic-ish rename into place
-            if std::fs::rename(&tmp, dest).is_ok() {
-                eprintln!(
-                    "\x1b[1;32minfo:\x1b[0m Cached mlx.metallib to {}\n",
-                    dest.display()
-                );
-                true
-            } else {
-                let _ = std::fs::remove_file(&tmp);
-                false
-            }
+    // Build a single-threaded tokio runtime for the blocking download
+    // (this function is called before the main async runtime is started).
+    let rt = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("\x1b[1;33mwarning:\x1b[0m Failed to create download runtime: {e}");
+            return false;
         }
-        _ => {
-            let _ = std::fs::remove_file(&tmp);
+    };
+
+    let bytes: Vec<u8> = match rt.block_on(async {
+        let client = reqwest::Client::builder()
+            .user_agent(concat!("pmetal/", env!("CARGO_PKG_VERSION")))
+            .build()?;
+        let response = client
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        Ok::<_, reqwest::Error>(response.to_vec())
+    }) {
+        Ok(b) => b,
+        Err(e) => {
             eprintln!(
                 "\x1b[1;33mwarning:\x1b[0m Download failed (offline or release v{version} \
-                 not published yet).\n"
+                 not published yet): {e}\n"
             );
-            false
+            return false;
         }
+    };
+
+    // Verify SHA-256 when a reference digest is compiled in.
+    if !METALLIB_SHA256.is_empty() {
+        use sha2::Digest as _;
+        let digest = sha2::Sha256::digest(&bytes);
+        let hex = format!("{digest:x}");
+        if hex != METALLIB_SHA256 {
+            eprintln!(
+                "\x1b[1;31merror:\x1b[0m SHA-256 mismatch for mlx.metallib\n\
+                 expected: {METALLIB_SHA256}\n\
+                 got:      {hex}\n\
+                 The downloaded file has been discarded."
+            );
+            return false;
+        }
+    }
+
+    // Write to temp file, then atomically rename into place.
+    if let Err(e) = std::fs::write(&tmp, &bytes) {
+        eprintln!("\x1b[1;33mwarning:\x1b[0m Failed to write temp metallib: {e}");
+        return false;
+    }
+
+    if std::fs::rename(&tmp, dest).is_ok() {
+        eprintln!(
+            "\x1b[1;32minfo:\x1b[0m Cached mlx.metallib to {}\n",
+            dest.display()
+        );
+        true
+    } else {
+        let _ = std::fs::remove_file(&tmp);
+        false
     }
 }
 
+/// Synchronous entry point.
+///
+/// `ensure_metallib` calls `std::env::set_var` which is unsound when other
+/// threads are running.  By invoking it here — before the `#[tokio::main]`
+/// macro starts the async runtime and its thread pool — we guarantee that
+/// the environment mutation happens in a single-threaded context.
+fn main() -> anyhow::Result<()> {
+    ensure_metallib();
+    tokio_main()
+}
+
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn tokio_main() -> anyhow::Result<()> {
     // Initialize logging
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -1225,8 +1491,6 @@ async fn main() -> anyhow::Result<()> {
                 .add_directive(tracing::Level::INFO.into()),
         )
         .init();
-
-    ensure_metallib();
 
     let cli = Cli::parse();
 
@@ -1258,6 +1522,10 @@ async fn main() -> anyhow::Result<()> {
             gradient_checkpointing_layers,
             log_metrics,
             embedding_lr,
+            warmup_steps,
+            lr_schedule,
+            weight_decay,
+            seed,
             #[cfg(feature = "ane")]
             no_ane,
         } => {
@@ -1298,6 +1566,10 @@ async fn main() -> anyhow::Result<()> {
                 true,
                 Vec::new(),
                 embedding_lr,
+                warmup_steps,
+                &lr_schedule,
+                weight_decay,
+                seed,
                 #[cfg(feature = "ane")]
                 !no_ane,
                 #[cfg(not(feature = "ane"))]
@@ -1394,28 +1666,39 @@ async fn main() -> anyhow::Result<()> {
             limit,
             download,
             detailed,
+            json,
         } => {
-            run_search(&query, limit, download, detailed).await?;
+            run_search(&query, limit, download, detailed, json).await?;
         }
 
-        Commands::Memory => {
+        Commands::Memory { json } => {
             let stats = pmetal_mlx::memory::get_memory_stats();
-            println!("Memory Statistics:");
-            println!("  Total:     {:.2} GB", stats.total_gb());
-            if stats.total_gb() > 0.0 {
-                let used_pct = (stats.used_gb() / stats.total_gb()) * 100.0;
-                let peak_pct = (stats.peak_gb() / stats.total_gb()) * 100.0;
-                println!("  Used:      {:.2} GB ({:.0}%)", stats.used_gb(), used_pct);
-                println!(
-                    "  Available: {:.2} GB ({:.0}%)",
-                    stats.available_gb(),
-                    100.0 - used_pct
-                );
-                println!("  Peak:      {:.2} GB ({:.0}%)", stats.peak_gb(), peak_pct);
+            if json {
+                let obj = serde_json::json!({
+                    "total_gb": stats.total_gb(),
+                    "used_gb": stats.used_gb(),
+                    "available_gb": stats.available_gb(),
+                    "peak_gb": stats.peak_gb(),
+                });
+                println!("{}", serde_json::to_string_pretty(&obj)?);
             } else {
-                println!("  Used:      {:.2} GB", stats.used_gb());
-                println!("  Available: {:.2} GB", stats.available_gb());
-                println!("  Peak:      {:.2} GB", stats.peak_gb());
+                println!("Memory Statistics:");
+                println!("  Total:     {:.2} GB", stats.total_gb());
+                if stats.total_gb() > 0.0 {
+                    let used_pct = (stats.used_gb() / stats.total_gb()) * 100.0;
+                    let peak_pct = (stats.peak_gb() / stats.total_gb()) * 100.0;
+                    println!("  Used:      {:.2} GB ({:.0}%)", stats.used_gb(), used_pct);
+                    println!(
+                        "  Available: {:.2} GB ({:.0}%)",
+                        stats.available_gb(),
+                        100.0 - used_pct
+                    );
+                    println!("  Peak:      {:.2} GB ({:.0}%)", stats.peak_gb(), peak_pct);
+                } else {
+                    println!("  Used:      {:.2} GB", stats.used_gb());
+                    println!("  Available: {:.2} GB", stats.available_gb());
+                    println!("  Peak:      {:.2} GB", stats.peak_gb());
+                }
             }
         }
 
@@ -1466,11 +1749,11 @@ async fn main() -> anyhow::Result<()> {
                 // Fuse LoRA first, then quantize the fused model
                 let fused_dir = format!("{output}.fused_tmp");
                 run_fuse(&model, lora_path, &fused_dir, None, None).await?;
-                run_quantization(&fused_dir, &output, imatrix.as_deref(), &method).await?;
+                run_quantization(&fused_dir, &output, imatrix.as_deref(), method).await?;
                 // Clean up temp dir
                 let _ = std::fs::remove_dir_all(&fused_dir);
             } else {
-                run_quantization(&model, &output, imatrix.as_deref(), &method).await?;
+                run_quantization(&model, &output, imatrix.as_deref(), method).await?;
             }
         }
 
@@ -1491,6 +1774,7 @@ async fn main() -> anyhow::Result<()> {
             batch_size,
             epochs,
             max_seq_len,
+            seed,
             log_metrics,
         } => {
             run_distillation_cli(
@@ -1510,6 +1794,7 @@ async fn main() -> anyhow::Result<()> {
                 batch_size,
                 epochs,
                 max_seq_len,
+                seed,
                 log_metrics,
                 true,
                 Vec::new(),
@@ -1524,7 +1809,12 @@ async fn main() -> anyhow::Result<()> {
             num_generations,
             beta,
             learning_rate,
+            epochs,
+            lora_r,
+            lora_alpha,
             max_seq_len,
+            max_completion_length,
+            seed,
             dapo,
             reasoning_rewards,
             no_flash_attention,
@@ -1537,11 +1827,12 @@ async fn main() -> anyhow::Result<()> {
                 num_generations,
                 beta,
                 learning_rate,
-                1,
-                16,
-                32,
+                epochs,
+                lora_r,
+                lora_alpha,
                 max_seq_len,
-                512,
+                max_completion_length,
+                seed,
                 dapo,
                 reasoning_rewards,
                 !no_flash_attention,
@@ -1566,6 +1857,56 @@ async fn main() -> anyhow::Result<()> {
             let path = metrics_file.map(std::path::PathBuf::from);
             tui::run(path).await?;
         }
+
+        Commands::Info { json } => {
+            run_info(json).await?;
+        }
+
+        Commands::Merge {
+            model_a,
+            model_b,
+            output,
+            method,
+            base,
+            t,
+            weight_a,
+            weight_b,
+            density,
+            dtype,
+        } => {
+            run_merge_command(
+                &model_a,
+                &model_b,
+                &output,
+                &method,
+                base.as_deref(),
+                t,
+                weight_a,
+                weight_b,
+                density,
+                &dtype,
+            )
+            .await?;
+        }
+
+        Commands::Eval {
+            model,
+            dataset,
+            lora,
+            max_seq_len,
+            num_samples,
+            json,
+        } => {
+            run_eval(
+                &model,
+                &dataset,
+                lora.as_deref(),
+                max_seq_len,
+                num_samples,
+                json,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -1577,6 +1918,7 @@ async fn run_search(
     limit: usize,
     download: bool,
     detailed: bool,
+    json_output: bool,
 ) -> anyhow::Result<()> {
     use pmetal_hub::{DeviceSpec, FitLevel, ModelSpec, estimate_fit, search_models};
 
@@ -1601,7 +1943,54 @@ async fn run_search(
     bar.finish_and_clear();
 
     if results.is_empty() {
-        println!("No models found for '{query}'.");
+        if json_output {
+            println!("[]");
+        } else {
+            println!("No models found for '{query}'.");
+        }
+        return Ok(());
+    }
+
+    // JSON output mode: emit structured data and return early
+    if json_output {
+        let json_results: Vec<serde_json::Value> = results
+            .iter()
+            .map(|r| {
+                let fit_info =
+                    if let (Some(dev), Some(params_b)) = (&device_spec, r.estimated_params_b) {
+                        let quant = pmetal_hub::fit::detect_quantization_from_id(&r.model_id);
+                        let model_spec = pmetal_hub::ModelSpec {
+                            params_b,
+                            quantization: quant,
+                            context_length: 4096,
+                            num_kv_heads: None,
+                            head_dim: None,
+                            num_layers: None,
+                            is_moe: r.tags.iter().any(|t| t == "moe"),
+                            num_experts: None,
+                            active_experts: None,
+                        };
+                        let fit = pmetal_hub::estimate_fit(&model_spec, dev);
+                        serde_json::json!({
+                            "total_gb": fit.total_required_gb,
+                            "weights_gb": fit.weights_gb,
+                            "kv_cache_gb": fit.kv_cache_gb,
+                            "fit_level": fit.fit_level.label(),
+                            "estimated_tps": fit.estimated_tps,
+                        })
+                    } else {
+                        serde_json::Value::Null
+                    };
+                serde_json::json!({
+                    "model_id": r.model_id,
+                    "downloads": r.downloads,
+                    "estimated_params_b": r.estimated_params_b,
+                    "tags": r.tags,
+                    "fit": fit_info,
+                })
+            })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&json_results)?);
         return Ok(());
     }
 
@@ -1734,10 +2123,9 @@ async fn run_quantization(
     model_path: &str,
     output_path: &str,
     imatrix_path: Option<&str>,
-    method: &str,
+    method: QuantizeMethod,
 ) -> anyhow::Result<()> {
     use pmetal_gguf::{
-        GgmlType,
         GgufBuilder,
         dynamic::{DynamicQuantizationConfig, DynamicQuantizer},
         imatrix::IMatrix,
@@ -1750,7 +2138,7 @@ async fn run_quantization(
     println!("========================================");
     println!("Model:    {}", model_path);
     println!("Output:   {}", output_path);
-    println!("Method:   {}", method);
+    println!("Method:   {}", method.as_str());
     if let Some(imp) = imatrix_path {
         println!("IMatrix:  {}", imp);
     }
@@ -1766,17 +2154,7 @@ async fn run_quantization(
             PathBuf::from(model_path)
         };
 
-    // 1. Validate quantization method (fail fast before any I/O)
-    const VALID_METHODS: &[&str] = &["dynamic", "q8_0", "q4_k_m"];
-    if !VALID_METHODS.contains(&method) {
-        anyhow::bail!(
-            "Unknown quantization method '{}'. Valid methods: {}",
-            method,
-            VALID_METHODS.join(", ")
-        );
-    }
-
-    // 2. Load IMatrix if provided
+    // 1. Load IMatrix if provided
     let imatrix = if let Some(path) = imatrix_path {
         tracing::info!("Loading IMatrix from {}", path);
         Some(IMatrix::load(Path::new(path))?)
@@ -1784,17 +2162,9 @@ async fn run_quantization(
         None
     };
 
-    // 3. Initialize Dynamic Quantizer
-    let quantizer = if method == "dynamic" {
-        let config = DynamicQuantizationConfig::default();
-        DynamicQuantizer::new(config, imatrix)
-    } else {
-        let base_type = match method {
-            "q8_0" => GgmlType::Q8_0,
-            "q4_k_m" => GgmlType::Q4K,
-            _ => unreachable!("validated above"),
-        };
-
+    // 2. Initialize quantizer — dynamic uses IMatrix-guided mixed precision;
+    //    fixed methods pin every tensor to the same GgmlType.
+    let quantizer = if let Some(base_type) = method.to_ggml_type() {
         let config = DynamicQuantizationConfig {
             base_type,
             high_precision_type: base_type,
@@ -1802,6 +2172,10 @@ async fn run_quantization(
             ..Default::default()
         };
         DynamicQuantizer::new(config, None)
+    } else {
+        // Dynamic: use IMatrix for mixed-precision when provided
+        let config = DynamicQuantizationConfig::default();
+        DynamicQuantizer::new(config, imatrix)
     };
 
     // 4. Load Model Weights
@@ -2125,11 +2499,12 @@ async fn run_distillation_cli(
     rationale: bool,
     rationale_weight: f32,
     lora_r: usize,
-    lora_alpha: usize,
+    lora_alpha: f32,
     learning_rate: f32,
     batch_size: usize,
     epochs: usize,
     max_seq_len: usize,
+    seed: u64,
     log_metrics: Option<String>,
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
@@ -2244,7 +2619,10 @@ async fn run_distillation_cli(
         "online" => DistillMethod::Online,
         "offline" => DistillMethod::Offline,
         "progressive" => DistillMethod::Progressive,
-        _ => DistillMethod::Online,
+        other => anyhow::bail!(
+            "Unknown distillation method '{}'. Valid options: online, offline, progressive",
+            other
+        ),
     };
 
     let loss_type = match loss_type_str.to_lowercase().as_str() {
@@ -2252,7 +2630,10 @@ async fn run_distillation_cli(
         "jensen_shannon" => LossType::JensenShannon,
         "soft_cross_entropy" => LossType::SoftCrossEntropy,
         "mse_loss" => LossType::MseLoss,
-        _ => LossType::KlDivergence,
+        other => anyhow::bail!(
+            "Unknown loss type '{}'. Valid options: kl_divergence, jensen_shannon, soft_cross_entropy, mse_loss",
+            other
+        ),
     };
 
     let validated_distill_output = validate_output_path(output_dir, "distillation output")?;
@@ -2295,7 +2676,7 @@ async fn run_distillation_cli(
             batch_size,
             max_seq_len,
             shuffle: true,
-            seed: 42,
+            seed,
             pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
             drop_last: false,
         },
@@ -2310,6 +2691,8 @@ async fn run_distillation_cli(
         embedding_lr: None,
         eager_evaluation: false,
         use_metal_fused_optimizer: true,
+        loraplus_lr_ratio: None,
+        neftune_noise_alpha: None,
     };
 
     let mut trainer = DistillationTrainer::new(distiller, training_loop_config);
@@ -2355,20 +2738,13 @@ async fn run_distillation_cli(
     std::fs::create_dir_all(&validated_distill_output)?;
     student_model.save_lora_weights(&lora_output)?;
     // Save adapter config so inference knows r/alpha/target_modules without guessing
-    {
-        let adapter_config = serde_json::json!({
-            "r": student_lora_config.r,
-            "alpha": student_lora_config.alpha,
-            "target_modules": student_lora_config.target_modules,
-            "use_rslora": student_lora_config.use_rslora,
-        });
-        let config_path = lora_output
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("adapter_config.json");
-        std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
-        tracing::info!("Saved adapter config to {:?}", config_path);
-    }
+    save_adapter_config(
+        &lora_output,
+        student_lora_config.r,
+        student_lora_config.alpha,
+        &student_lora_config.target_modules,
+        student_lora_config.use_rslora,
+    )?;
 
     if emit_console_output {
         println!("\n========================================");
@@ -2388,6 +2764,33 @@ async fn run_distillation_cli(
     Ok(())
 }
 
+/// Save the LoRA adapter config JSON alongside a safetensors weights file.
+///
+/// Writes `adapter_config.json` into the same directory as `lora_weights_path`,
+/// recording `r`, `alpha`, `target_modules`, and `use_rslora` so inference can
+/// reconstruct the adapter without guessing.
+fn save_adapter_config(
+    lora_weights_path: &std::path::Path,
+    r: usize,
+    alpha: f32,
+    target_modules: &[String],
+    use_rslora: bool,
+) -> anyhow::Result<()> {
+    let adapter_config = serde_json::json!({
+        "r": r,
+        "alpha": alpha,
+        "target_modules": target_modules,
+        "use_rslora": use_rslora,
+    });
+    let config_path = lora_weights_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("adapter_config.json");
+    std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
+    tracing::info!("Saved adapter config to {:?}", config_path);
+    Ok(())
+}
+
 /// Run GRPO (Group Relative Policy Optimization) for reasoning models.
 #[allow(clippy::too_many_arguments)]
 async fn run_grpo_cli(
@@ -2399,9 +2802,10 @@ async fn run_grpo_cli(
     learning_rate: f64,
     epochs: usize,
     lora_r: usize,
-    lora_alpha: usize,
+    lora_alpha: f32,
     max_seq_len: usize,
     max_completion_length: usize,
+    seed: u64,
     dapo: bool,
     reasoning_rewards: bool,
     use_metal_flash_attention: bool,
@@ -2590,7 +2994,7 @@ async fn run_grpo_cli(
             batch_size: 1,
             max_seq_len,
             shuffle: true,
-            seed: 42,
+            seed,
             pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
             drop_last: false,
         },
@@ -2605,6 +3009,8 @@ async fn run_grpo_cli(
         embedding_lr: None,
         eager_evaluation: true, // GRPO generates first, then trains - eager helps memory
         use_metal_fused_optimizer: true,
+        loraplus_lr_ratio: None,
+        neftune_noise_alpha: None,
     };
 
     let mut trainer = GrpoTrainer::new(grpo_config, training_config)?;
@@ -2665,15 +3071,12 @@ async fn run_grpo_cli(
     std::fs::create_dir_all(&output_dir_path)?;
     let final_path = output_dir_path.join("lora_weights.safetensors");
     model.save_lora_weights(&final_path)?;
-    let adapter_config = serde_json::json!({
-        "r": lora_config.r,
-        "alpha": lora_config.alpha,
-        "target_modules": lora_config.target_modules,
-        "use_rslora": lora_config.use_rslora,
-    });
-    std::fs::write(
-        output_dir_path.join("adapter_config.json"),
-        serde_json::to_string_pretty(&adapter_config)?,
+    save_adapter_config(
+        &final_path,
+        lora_config.r,
+        lora_config.alpha,
+        &lora_config.target_modules,
+        lora_config.use_rslora,
     )?;
 
     if emit_console_output {
@@ -2716,6 +3119,10 @@ async fn run_training(
     emit_console_output: bool,
     extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
     embedding_lr: Option<f32>,
+    warmup_steps: usize,
+    lr_schedule: &str,
+    weight_decay: f64,
+    seed: u64,
     ane: bool,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "ane"))]
@@ -2938,6 +3345,23 @@ async fn run_training(
     config.training.gradient_accumulation_steps = gradient_accumulation_steps;
     config.training.max_grad_norm = max_grad_norm;
     config.training.output_dir = output_dir.clone();
+    config.training.warmup_steps = warmup_steps;
+    config.training.weight_decay = weight_decay;
+    config.training.seed = seed;
+    config.training.lr_scheduler = match lr_schedule.to_lowercase().as_str() {
+        "constant" => pmetal_core::LrSchedulerType::Constant,
+        "linear" => pmetal_core::LrSchedulerType::Linear,
+        "cosine" => pmetal_core::LrSchedulerType::Cosine,
+        "cosine_with_restarts" => pmetal_core::LrSchedulerType::CosineWithRestarts,
+        "polynomial" => pmetal_core::LrSchedulerType::Polynomial,
+        "wsd" => pmetal_core::LrSchedulerType::Wsd,
+        other => {
+            anyhow::bail!(
+                "Unknown lr-schedule '{}'. Valid options: constant, linear, cosine, cosine_with_restarts, polynomial, wsd",
+                other
+            );
+        }
+    };
 
     // Download model if needed
     tracing::info!("Loading model: {}", config.model.model_id);
@@ -3175,6 +3599,8 @@ async fn run_training(
         // Essential for models without true gradient checkpointing (e.g., Qwen3.5 hybrid).
         eager_evaluation: true,
         use_metal_fused_optimizer,
+        loraplus_lr_ratio: None,
+        neftune_noise_alpha: None,
     };
 
     // Calculate total steps for progress bar
@@ -3325,20 +3751,13 @@ async fn run_training(
         model.save_lora_weights(&final_path)?;
         tracing::info!("Saved LoRA weights to {:?}", final_path);
         // Save adapter config for inference (r, alpha, target_modules)
-        {
-            let adapter_config = serde_json::json!({
-                "r": config.lora.r,
-                "alpha": config.lora.alpha,
-                "target_modules": config.lora.target_modules,
-                "use_rslora": config.lora.use_rslora,
-            });
-            let config_path = final_path
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .join("adapter_config.json");
-            std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
-            tracing::info!("Saved adapter config to {:?}", config_path);
-        }
+        save_adapter_config(
+            &final_path,
+            config.lora.r,
+            config.lora.alpha,
+            &config.lora.target_modules,
+            config.lora.use_rslora,
+        )?;
 
         // Recover metrics callback from training loop for finalization
         let mut cbs = training_loop.take_callbacks();
@@ -3457,21 +3876,13 @@ async fn run_training(
             let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
             model.save_lora_weights(&final_path)?;
             tracing::info!("Saved LoRA weights to {:?}", final_path);
-            // Save adapter config for inference (r, alpha, target_modules)
-            {
-                let adapter_config = serde_json::json!({
-                    "r": config.lora.r,
-                    "alpha": config.lora.alpha,
-                    "target_modules": config.lora.target_modules,
-                    "use_rslora": config.lora.use_rslora,
-                });
-                let config_path = final_path
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join("adapter_config.json");
-                std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
-                tracing::info!("Saved adapter config to {:?}", config_path);
-            }
+            save_adapter_config(
+                &final_path,
+                config.lora.r,
+                config.lora.alpha,
+                &config.lora.target_modules,
+                config.lora.use_rslora,
+            )?;
         } else if (fused || use_jit_compilation) && config.training.gradient_accumulation_steps == 1
         {
             // Fused training step (combines forward/backward/optimizer)
@@ -3489,21 +3900,13 @@ async fn run_training(
             let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
             model.save_lora_weights(&final_path)?;
             tracing::info!("Saved LoRA weights to {:?}", final_path);
-            // Save adapter config for inference (r, alpha, target_modules)
-            {
-                let adapter_config = serde_json::json!({
-                    "r": config.lora.r,
-                    "alpha": config.lora.alpha,
-                    "target_modules": config.lora.target_modules,
-                    "use_rslora": config.lora.use_rslora,
-                });
-                let config_path = final_path
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join("adapter_config.json");
-                std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
-                tracing::info!("Saved adapter config to {:?}", config_path);
-            }
+            save_adapter_config(
+                &final_path,
+                config.lora.r,
+                config.lora.alpha,
+                &config.lora.target_modules,
+                config.lora.use_rslora,
+            )?;
         } else if use_metal_fused_optimizer {
             // Metal fused optimizer for maximum throughput
             tracing::info!("Using Metal fused optimizer for training");
@@ -3520,21 +3923,13 @@ async fn run_training(
             let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
             model.save_lora_weights(&final_path)?;
             tracing::info!("Saved LoRA weights to {:?}", final_path);
-            // Save adapter config for inference (r, alpha, target_modules)
-            {
-                let adapter_config = serde_json::json!({
-                    "r": config.lora.r,
-                    "alpha": config.lora.alpha,
-                    "target_modules": config.lora.target_modules,
-                    "use_rslora": config.lora.use_rslora,
-                });
-                let config_path = final_path
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join("adapter_config.json");
-                std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
-                tracing::info!("Saved adapter config to {:?}", config_path);
-            }
+            save_adapter_config(
+                &final_path,
+                config.lora.r,
+                config.lora.alpha,
+                &config.lora.target_modules,
+                config.lora.use_rslora,
+            )?;
         } else {
             if (fused || use_jit_compilation) && config.training.gradient_accumulation_steps != 1 {
                 tracing::warn!(
@@ -3554,21 +3949,13 @@ async fn run_training(
             let final_path = PathBuf::from(&output_dir).join("lora_weights.safetensors");
             model.save_lora_weights(&final_path)?;
             tracing::info!("Saved LoRA weights to {:?}", final_path);
-            // Save adapter config for inference (r, alpha, target_modules)
-            {
-                let adapter_config = serde_json::json!({
-                    "r": config.lora.r,
-                    "alpha": config.lora.alpha,
-                    "target_modules": config.lora.target_modules,
-                    "use_rslora": config.lora.use_rslora,
-                });
-                let config_path = final_path
-                    .parent()
-                    .unwrap_or(std::path::Path::new("."))
-                    .join("adapter_config.json");
-                std::fs::write(&config_path, serde_json::to_string_pretty(&adapter_config)?)?;
-                tracing::info!("Saved adapter config to {:?}", config_path);
-            }
+            save_adapter_config(
+                &final_path,
+                config.lora.r,
+                config.lora.alpha,
+                &config.lora.target_modules,
+                config.lora.use_rslora,
+            )?;
         }
 
         // Recover metrics callback from training loop for finalization
@@ -7853,4 +8240,344 @@ fn format_conversations(
     }
 
     output
+}
+
+/// Show device information: GPU architecture, ANE cores, bandwidth, NAX, and unified memory.
+async fn run_info(json_output: bool) -> anyhow::Result<()> {
+    let ctx_result = pmetal_metal::context::MetalContext::global();
+
+    if json_output {
+        let obj = match ctx_result {
+            Ok(ctx) => {
+                let props = ctx.properties();
+                serde_json::json!({
+                    "device_name": props.name,
+                    "gpu_family": format!("{:?}", props.gpu_family),
+                    "architecture_gen": props.architecture_gen,
+                    "has_nax": props.has_nax,
+                    "gpu_cores": props.gpu_core_count,
+                    "ane_cores": props.ane_core_count,
+                    "memory_total_gb": props.recommended_working_set_size as f64 / (1024.0 * 1024.0 * 1024.0),
+                    "memory_bandwidth_gbps": props.memory_bandwidth_gbps,
+                    "has_unified_memory": props.has_unified_memory,
+                    "metal_available": true,
+                })
+            }
+            Err(e) => serde_json::json!({
+                "metal_available": false,
+                "error": e.to_string(),
+            }),
+        };
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else {
+        println!("PMetal Device Information");
+        println!("=========================");
+        match ctx_result {
+            Ok(ctx) => {
+                let props = ctx.properties();
+                let mem_gb = props.recommended_working_set_size as f64 / (1024.0 * 1024.0 * 1024.0);
+                println!("Device:         {}", props.name);
+                println!("GPU Family:     {:?}", props.gpu_family);
+                println!("Architecture:   gen {}", props.architecture_gen);
+                println!("GPU Cores:      {}", props.gpu_core_count);
+                println!("ANE Cores:      {}", props.ane_core_count);
+                println!("Unified Memory: {:.0} GB", mem_gb);
+                println!("Bandwidth:      {:.0} GB/s", props.memory_bandwidth_gbps);
+                println!(
+                    "NAX (Neural):   {}",
+                    if props.has_nax { "yes" } else { "no" }
+                );
+                println!("Metal:          available");
+            }
+            Err(e) => {
+                println!("Metal:          unavailable ({})", e);
+            }
+        }
+        println!("PMetal Version: {}", env!("CARGO_PKG_VERSION"));
+    }
+    Ok(())
+}
+
+/// Merge two models using the pmetal-merge crate.
+#[allow(clippy::too_many_arguments)]
+async fn run_merge_command(
+    model_a: &str,
+    model_b: &str,
+    output: &str,
+    method: &str,
+    base: Option<&str>,
+    t: f32,
+    weight_a: f32,
+    weight_b: f32,
+    density: f32,
+    dtype: &str,
+) -> anyhow::Result<()> {
+    use pmetal_merge::{
+        MergeConfig, MergeMethodConfig, MergeParameters, ModelConfig as MergeModelConfig,
+        TokenizerConfig,
+    };
+
+    println!("PMetal Model Merge");
+    println!("==================");
+    println!("Model A: {model_a}");
+    println!("Model B: {model_b}");
+    println!("Method:  {method}");
+    println!("Output:  {output}");
+    println!();
+
+    // Resolve HuggingFace model IDs to local paths
+    let path_a = if model_a.contains('/') && !std::path::Path::new(model_a).exists() {
+        println!("Downloading model A...");
+        pmetal_hub::download_model(model_a, None, None).await?
+    } else {
+        std::path::PathBuf::from(model_a)
+    };
+
+    let path_b = if model_b.contains('/') && !std::path::Path::new(model_b).exists() {
+        println!("Downloading model B...");
+        pmetal_hub::download_model(model_b, None, None).await?
+    } else {
+        std::path::PathBuf::from(model_b)
+    };
+
+    let base_path = if let Some(base_id) = base {
+        if base_id.contains('/') && !std::path::Path::new(base_id).exists() {
+            println!("Downloading base model...");
+            Some(
+                pmetal_hub::download_model(base_id, None, None)
+                    .await?
+                    .to_string_lossy()
+                    .to_string(),
+            )
+        } else {
+            Some(base_id.to_string())
+        }
+    } else {
+        None
+    };
+
+    let merge_method = match method.to_lowercase().as_str() {
+        "linear" => MergeMethodConfig::Linear,
+        "slerp" => MergeMethodConfig::Slerp,
+        "task_arithmetic" | "task-arithmetic" => MergeMethodConfig::TaskArithmetic,
+        "ties" => MergeMethodConfig::Ties,
+        "dare_ties" | "dare-ties" => MergeMethodConfig::DareTies,
+        "dare_linear" | "dare-linear" => MergeMethodConfig::DareLinear,
+        "della" => MergeMethodConfig::Della,
+        "della_linear" | "della-linear" => MergeMethodConfig::DellaLinear,
+        "breadcrumbs" => MergeMethodConfig::Breadcrumbs,
+        "model_stock" | "model-stock" => MergeMethodConfig::ModelStock,
+        "nearswap" => MergeMethodConfig::Nearswap,
+        "passthrough" => MergeMethodConfig::Passthrough,
+        other => anyhow::bail!(
+            "Unknown merge method '{}'. Valid options: linear, slerp, task_arithmetic, ties, \
+             dare_ties, dare_linear, della, della_linear, breadcrumbs, model_stock, nearswap, passthrough",
+            other
+        ),
+    };
+
+    let config = MergeConfig {
+        merge_method,
+        models: vec![
+            MergeModelConfig {
+                model: path_a.to_string_lossy().to_string(),
+                parameters: MergeParameters {
+                    weight: Some(weight_a),
+                    density: Some(density),
+                    t: Some(t),
+                    ..Default::default()
+                },
+            },
+            MergeModelConfig {
+                model: path_b.to_string_lossy().to_string(),
+                parameters: MergeParameters {
+                    weight: Some(weight_b),
+                    density: Some(density),
+                    t: Some(1.0 - t),
+                    ..Default::default()
+                },
+            },
+        ],
+        base_model: base_path,
+        output_path: Some(std::path::PathBuf::from(output)),
+        dtype: dtype.to_string(),
+        parameters: MergeParameters::default(),
+        tokenizer: Some(TokenizerConfig {
+            source: "first".to_string(),
+        }),
+    };
+
+    println!("Running merge...");
+    let result_path =
+        pmetal_merge::run_merge(&config).map_err(|e| anyhow::anyhow!("Merge failed: {}", e))?;
+
+    println!("\nMerge complete!");
+    println!("Output: {}", result_path.display());
+    println!("\nNext steps:");
+    println!(
+        "  pmetal infer -m {} -p \"Your prompt\"",
+        result_path.display()
+    );
+    Ok(())
+}
+
+/// Evaluate model perplexity on a dataset.
+async fn run_eval(
+    model_id: &str,
+    dataset_path: &str,
+    lora_path: Option<&str>,
+    max_seq_len: usize,
+    num_samples: usize,
+    json_output: bool,
+) -> anyhow::Result<()> {
+    use mlx_rs::ops::indexing::take_along_axis;
+
+    // Resolve model
+    let model_path = if model_id.contains('/') && !std::path::Path::new(model_id).exists() {
+        pmetal_hub::download_model(model_id, None, None).await?
+    } else {
+        std::path::PathBuf::from(model_id)
+    };
+
+    if !json_output {
+        println!("PMetal Eval");
+        println!("===========");
+        println!("Model:   {}", model_id);
+        println!("Dataset: {}", dataset_path);
+        println!("MaxLen:  {}", max_seq_len);
+        if let Some(lp) = lora_path {
+            println!("LoRA:    {}", lp);
+        }
+        println!();
+    }
+
+    // Load tokenizer
+    let tokenizer = Tokenizer::from_model_dir(&model_path)?;
+
+    // Load dataset
+    let chat_template = pmetal_data::chat_templates::detect_chat_template(&model_path, model_id);
+    let dataset = TrainingDataset::from_jsonl_tokenized(
+        dataset_path,
+        &tokenizer,
+        DatasetFormat::Auto,
+        max_seq_len,
+        Some(&chat_template),
+    )?;
+
+    // Load model with optional LoRA
+    let lora_config = LoraConfig {
+        r: 0,
+        ..Default::default()
+    };
+    let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config)?;
+    if let Some(lp) = lora_path {
+        let lora_file = if std::path::Path::new(lp).is_dir() {
+            std::path::PathBuf::from(lp).join("lora_weights.safetensors")
+        } else {
+            std::path::PathBuf::from(lp)
+        };
+        model
+            .load_lora_weights(&lora_file)
+            .map_err(|e| anyhow::anyhow!("Failed to load LoRA weights: {}", e))?;
+    }
+
+    // Evaluate perplexity
+    let samples = dataset.samples();
+    let eval_samples = if num_samples == 0 || num_samples > samples.len() {
+        samples.len()
+    } else {
+        num_samples
+    };
+
+    if !json_output {
+        println!("Evaluating {} samples...", eval_samples);
+    }
+
+    let mut total_nll: f64 = 0.0;
+    let mut total_tokens: usize = 0;
+    let bar = if !json_output {
+        let b = ProgressBar::new(eval_samples as u64);
+        b.set_style(
+            ProgressStyle::default_bar()
+                .template("[{elapsed_precise}] {bar:40} {pos}/{len} ({eta})")?
+                .progress_chars("=> "),
+        );
+        Some(b)
+    } else {
+        None
+    };
+
+    for sample in samples.iter().take(eval_samples) {
+        let tokens: Vec<i32> = sample.input_ids.iter().map(|&t| t as i32).collect();
+        if tokens.len() < 2 {
+            continue;
+        }
+        let n = tokens.len();
+        let input_array = mlx_rs::Array::from_slice(&tokens[..n - 1], &[1, (n - 1) as i32]);
+
+        let logits = model
+            .forward(&input_array, None)
+            .map_err(|e| anyhow::anyhow!("Forward pass failed: {}", e))?;
+
+        // logits: [1, seq-1, vocab]  → [seq-1, vocab]
+        let logits = logits
+            .squeeze_axes(&[0i32])
+            .map_err(|e| anyhow::anyhow!("Squeeze failed: {}", e))?;
+        let log_probs = mlx_rs::nn::log_softmax(&logits, -1)
+            .map_err(|e| anyhow::anyhow!("log_softmax failed: {}", e))?;
+
+        // Gather log-probs for the true tokens using take_along_axis
+        // log_probs: [seq-1, vocab], indices: [seq-1, 1] → gathered: [seq-1, 1]
+        let target_ids: Vec<i32> = sample.input_ids[1..].iter().map(|&t| t as i32).collect();
+        let target_arr = mlx_rs::Array::from_slice(&target_ids, &[(n - 1) as i32, 1]);
+        let gathered = take_along_axis(&log_probs, &target_arr, 1)
+            .map_err(|e| anyhow::anyhow!("take_along_axis failed: {}", e))?;
+
+        let gathered = gathered
+            .as_dtype(mlx_rs::Dtype::Float32)
+            .map_err(|e| anyhow::anyhow!("dtype cast failed: {}", e))?;
+        gathered
+            .eval()
+            .map_err(|e| anyhow::anyhow!("eval failed: {}", e))?;
+        let nll: f32 = gathered.as_slice::<f32>().iter().map(|&v| -v).sum();
+
+        total_nll += nll as f64;
+        total_tokens += n - 1;
+
+        if let Some(ref b) = bar {
+            b.inc(1);
+        }
+    }
+
+    if let Some(b) = bar {
+        b.finish_and_clear();
+    }
+
+    if total_tokens == 0 {
+        anyhow::bail!("No tokens to evaluate — dataset may be empty or all samples too short");
+    }
+
+    let avg_nll = total_nll / total_tokens as f64;
+    let perplexity = avg_nll.exp();
+
+    if json_output {
+        let obj = serde_json::json!({
+            "model": model_id,
+            "dataset": dataset_path,
+            "num_samples": eval_samples,
+            "total_tokens": total_tokens,
+            "avg_nll": avg_nll,
+            "perplexity": perplexity,
+        });
+        println!("{}", serde_json::to_string_pretty(&obj)?);
+    } else {
+        println!("Results");
+        println!("=======");
+        println!("Samples evaluated: {}", eval_samples);
+        println!("Total tokens:      {}", total_tokens);
+        println!("Average NLL:       {:.4}", avg_nll);
+        println!("Perplexity:        {:.2}", perplexity);
+    }
+
+    Ok(())
 }
