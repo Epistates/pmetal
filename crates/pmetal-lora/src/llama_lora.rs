@@ -20,11 +20,13 @@ use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, r
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::llama::LlamaConfig;
 
-use crate::{LoraError, LoraLinear};
+use crate::{LinearAdapter, LoraError, LoraLinear};
 
 /// LoRA-enabled attention layer for Llama.
 ///
-/// Applies LoRA to q_proj, k_proj, v_proj, and o_proj.
+/// Applies LoRA (or DoRA when `use_dora = true`) to q_proj, k_proj, v_proj, and o_proj.
+/// The projection fields use `LinearAdapter` which transparently dispatches to either
+/// `LoraLinear` or `DoraLinear` based on the `LoraConfig`.
 #[derive(Debug)]
 pub struct LlamaLoraAttention {
     /// Number of attention heads.
@@ -36,20 +38,23 @@ pub struct LlamaLoraAttention {
     /// Attention scale factor.
     pub scale: f32,
 
-    /// Query projection with LoRA.
-    pub q_proj: LoraLinear,
-    /// Key projection with LoRA.
-    pub k_proj: LoraLinear,
-    /// Value projection with LoRA.
-    pub v_proj: LoraLinear,
-    /// Output projection with LoRA.
-    pub o_proj: LoraLinear,
+    /// Query projection with LoRA or DoRA adapter.
+    pub q_proj: LinearAdapter,
+    /// Key projection with LoRA or DoRA adapter.
+    pub k_proj: LinearAdapter,
+    /// Value projection with LoRA or DoRA adapter.
+    pub v_proj: LinearAdapter,
+    /// Output projection with LoRA or DoRA adapter.
+    pub o_proj: LinearAdapter,
     /// RoPE layer.
     pub rope: nn::Rope,
 }
 
 impl LlamaLoraAttention {
-    /// Create a new LoRA attention layer.
+    /// Create a new LoRA/DoRA attention layer.
+    ///
+    /// When `lora_config.use_dora` is `true`, all projection layers use `DoraLinear`
+    /// (weight-decomposed LoRA) instead of the standard `LoraLinear`.
     pub fn new(config: &LlamaConfig, lora_config: &LoraConfig) -> Result<Self, LoraError> {
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_kv_heads();
@@ -58,44 +63,49 @@ impl LlamaLoraAttention {
 
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
+        let use_dora = lora_config.use_dora;
         // Per-module ranks respecting target_modules
         let q_rank = crate::effective_rank(lora_config, "q_proj") as i32;
         let k_rank = crate::effective_rank(lora_config, "k_proj") as i32;
         let v_rank = crate::effective_rank(lora_config, "v_proj") as i32;
         let o_rank = crate::effective_rank(lora_config, "o_proj") as i32;
 
-        // Create LoRA linear layers for projections
-        let q_proj = LoraLinear::new(
+        // Create adapter layers — transparently dispatches to LoRA or DoRA
+        let q_proj = LinearAdapter::new(
             config.hidden_size,
             n_heads * head_dim,
             q_rank,
             alpha,
             use_rslora,
             false,
+            use_dora,
         )?;
-        let k_proj = LoraLinear::new(
+        let k_proj = LinearAdapter::new(
             config.hidden_size,
             n_kv_heads * head_dim,
             k_rank,
             alpha,
             use_rslora,
             false,
+            use_dora,
         )?;
-        let v_proj = LoraLinear::new(
+        let v_proj = LinearAdapter::new(
             config.hidden_size,
             n_kv_heads * head_dim,
             v_rank,
             alpha,
             use_rslora,
             false,
+            use_dora,
         )?;
-        let o_proj = LoraLinear::new(
+        let o_proj = LinearAdapter::new(
             n_heads * head_dim,
             config.hidden_size,
             o_rank,
             alpha,
             use_rslora,
             false,
+            use_dora,
         )?;
 
         // Initialize RoPE (unwrap is safe - Infallible error)
@@ -469,6 +479,55 @@ impl LlamaLoraModel {
         self.forward_with_checkpoint(input_ids, mask, None)
     }
 
+    /// NEFTune forward: embed tokens, add uniform noise, then run transformer layers.
+    ///
+    /// Noise magnitude: `mag = alpha / sqrt(seq_len * embed_dim)`
+    pub fn forward_noised(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        noise_alpha: f32,
+        checkpoint_config: Option<&CheckpointConfig>,
+    ) -> Result<Array, LoraError> {
+        // Embed tokens
+        let mut hidden_states = mlx_rs::module::Module::forward(&mut self.embed_tokens, input_ids)?;
+
+        // Compute noise magnitude: alpha / sqrt(seq_len * embed_dim)
+        let seq_len = input_ids.dim(1) as f32;
+        let embed_dim = hidden_states.dim(2) as f32;
+        let mag = noise_alpha / (seq_len * embed_dim).sqrt();
+
+        // Add uniform noise U(-mag, mag) — auto-diffable through the noise
+        let noise = mlx_rs::random::uniform::<_, f32>(-mag, mag, hidden_states.shape(), None)?;
+        hidden_states = hidden_states.add(&noise)?;
+
+        // Create causal mask if not provided
+        let mask = if mask.is_none() {
+            let seq_len_i = input_ids.dim(1);
+            Some(create_causal_mask(seq_len_i)?)
+        } else {
+            mask.cloned()
+        };
+
+        // Pass through transformer layers with optional checkpointing
+        let layers_per_block = checkpoint_config
+            .map(|c| c.layers_per_block)
+            .unwrap_or(usize::MAX);
+        let checkpointing_enabled = checkpoint_config.map(|c| c.enabled).unwrap_or(false);
+
+        for (idx, layer) in self.layers.iter_mut().enumerate() {
+            hidden_states = layer.forward(&hidden_states, mask.as_ref())?;
+            if checkpointing_enabled && (idx + 1) % layers_per_block == 0 {
+                tracing::trace!("NEFTune checkpoint boundary at layer {}", idx + 1);
+            }
+        }
+
+        Ok(mlx_rs::module::Module::forward(
+            &mut self.norm,
+            &hidden_states,
+        )?)
+    }
+
     /// Forward pass with optional gradient checkpointing.
     ///
     /// Gradient checkpointing trades compute for memory by breaking the computation
@@ -664,6 +723,27 @@ impl LlamaLoraForCausalLM {
         }
     }
 
+    /// NEFTune forward: embed tokens, add uniform noise, then run the full model.
+    ///
+    /// See `LlamaLoraModel::forward_noised` for the noise formulation.
+    pub fn forward_noised(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        noise_alpha: f32,
+    ) -> Result<Array, LoraError> {
+        let checkpoint_config = self.checkpoint_config.clone();
+        let hidden_states =
+            self.model
+                .forward_noised(input_ids, mask, noise_alpha, checkpoint_config.as_ref())?;
+
+        if let Some(ref mut lm_head) = self.lm_head {
+            Ok(mlx_rs::module::Module::forward(lm_head, &hidden_states)?)
+        } else {
+            Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
+        }
+    }
+
     /// Forward pass with KV cache for efficient inference.
     ///
     /// KV caching provides O(n) complexity per token instead of O(n²),
@@ -704,74 +784,77 @@ impl LlamaLoraForCausalLM {
         KVCache::new(config)
     }
 
-    /// Get all trainable LoRA parameters as a flat HashMap.
+    /// Get all trainable LoRA (or DoRA) parameters as a flat HashMap.
     ///
-    /// Returns parameters with keys like "layers.0.self_attn.q_proj.lora_a"
+    /// Returns parameters with keys like "layers.0.self_attn.q_proj.lora_a".
+    /// For DoRA layers, also includes "layers.0.self_attn.q_proj.magnitude".
     pub fn lora_parameters(&self) -> HashMap<Rc<str>, Array> {
         let mut params = HashMap::new();
+
+        // Helper macro to insert A, B, and any extra params (magnitude for DoRA)
+        macro_rules! insert_adapter {
+            ($params:expr, $adapter:expr, $key_prefix:expr) => {
+                $params.insert(
+                    Rc::from(format!("{}.lora_a", $key_prefix)),
+                    $adapter.lora_a().clone(),
+                );
+                $params.insert(
+                    Rc::from(format!("{}.lora_b", $key_prefix)),
+                    $adapter.lora_b().clone(),
+                );
+                for (name, arr) in $adapter.extra_params() {
+                    $params.insert(Rc::from(format!("{}.{}", $key_prefix, name)), arr.clone());
+                }
+            };
+        }
 
         for (i, layer) in self.model.layers.iter().enumerate() {
             let prefix = format!("layers.{}", i);
 
-            // Attention LoRA params
-            params.insert(
-                Rc::from(format!("{}.self_attn.q_proj.lora_a", prefix)),
-                layer.self_attn.q_proj.lora_a.clone(),
+            // Attention adapter params (LoRA A + B + optional DoRA magnitude)
+            insert_adapter!(
+                params,
+                layer.self_attn.q_proj,
+                format!("{}.self_attn.q_proj", prefix)
             );
-            params.insert(
-                Rc::from(format!("{}.self_attn.q_proj.lora_b", prefix)),
-                layer.self_attn.q_proj.lora_b.clone(),
+            insert_adapter!(
+                params,
+                layer.self_attn.k_proj,
+                format!("{}.self_attn.k_proj", prefix)
             );
-            params.insert(
-                Rc::from(format!("{}.self_attn.k_proj.lora_a", prefix)),
-                layer.self_attn.k_proj.lora_a.clone(),
+            insert_adapter!(
+                params,
+                layer.self_attn.v_proj,
+                format!("{}.self_attn.v_proj", prefix)
             );
-            params.insert(
-                Rc::from(format!("{}.self_attn.k_proj.lora_b", prefix)),
-                layer.self_attn.k_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.v_proj.lora_a", prefix)),
-                layer.self_attn.v_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.v_proj.lora_b", prefix)),
-                layer.self_attn.v_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.o_proj.lora_a", prefix)),
-                layer.self_attn.o_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.self_attn.o_proj.lora_b", prefix)),
-                layer.self_attn.o_proj.lora_b.clone(),
+            insert_adapter!(
+                params,
+                layer.self_attn.o_proj,
+                format!("{}.self_attn.o_proj", prefix)
             );
 
-            // MLP LoRA params
-            params.insert(
-                Rc::from(format!("{}.mlp.gate_proj.lora_a", prefix)),
-                layer.mlp.gate_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.gate_proj.lora_b", prefix)),
-                layer.mlp.gate_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.up_proj.lora_a", prefix)),
-                layer.mlp.up_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.up_proj.lora_b", prefix)),
-                layer.mlp.up_proj.lora_b.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.down_proj.lora_a", prefix)),
-                layer.mlp.down_proj.lora_a.clone(),
-            );
-            params.insert(
-                Rc::from(format!("{}.mlp.down_proj.lora_b", prefix)),
-                layer.mlp.down_proj.lora_b.clone(),
-            );
+            // MLP LoRA params (use accessor methods — fields are behind LinearAdapter enum)
+            for (proj_name, proj) in [
+                ("gate_proj", &layer.mlp.gate_proj),
+                ("up_proj", &layer.mlp.up_proj),
+                ("down_proj", &layer.mlp.down_proj),
+            ] {
+                let key_prefix = format!("{}.mlp.{}", prefix, proj_name);
+                params.insert(
+                    Rc::from(format!("{}.lora_a", key_prefix)),
+                    proj.lora_a().clone(),
+                );
+                params.insert(
+                    Rc::from(format!("{}.lora_b", key_prefix)),
+                    proj.lora_b().clone(),
+                );
+                for (extra_name, arr) in proj.extra_params() {
+                    params.insert(
+                        Rc::from(format!("{}.{}", key_prefix, extra_name)),
+                        arr.clone(),
+                    );
+                }
+            }
         }
 
         params
@@ -792,75 +875,42 @@ impl LlamaLoraForCausalLM {
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let prefix = format!("layers.{}", i);
 
-            // Helper to apply gradient
-            macro_rules! apply_grad {
-                ($param:expr, $key:expr) => {
-                    if let Some(grad) = gradients.get(&Rc::from($key)) {
-                        let update = grad.multiply(&lr)?;
-                        $param = $param.subtract(&update)?;
-                    }
-                };
+            // Attention adapter params (via accessor methods to support LinearAdapter)
+            for (proj_name, proj) in [
+                ("q_proj", &mut layer.self_attn.q_proj),
+                ("k_proj", &mut layer.self_attn.k_proj),
+                ("v_proj", &mut layer.self_attn.v_proj),
+                ("o_proj", &mut layer.self_attn.o_proj),
+            ] {
+                let a_key = format!("{}.self_attn.{}.lora_a", prefix, proj_name);
+                let b_key = format!("{}.self_attn.{}.lora_b", prefix, proj_name);
+                if let Some(grad) = gradients.get(&Rc::from(a_key)) {
+                    let update = grad.multiply(&lr)?;
+                    *proj.lora_a_mut() = proj.lora_a().subtract(&update)?;
+                }
+                if let Some(grad) = gradients.get(&Rc::from(b_key)) {
+                    let update = grad.multiply(&lr)?;
+                    *proj.lora_b_mut() = proj.lora_b().subtract(&update)?;
+                }
             }
 
-            // Attention LoRA params
-            apply_grad!(
-                layer.self_attn.q_proj.lora_a,
-                format!("{}.self_attn.q_proj.lora_a", prefix)
-            );
-            apply_grad!(
-                layer.self_attn.q_proj.lora_b,
-                format!("{}.self_attn.q_proj.lora_b", prefix)
-            );
-            apply_grad!(
-                layer.self_attn.k_proj.lora_a,
-                format!("{}.self_attn.k_proj.lora_a", prefix)
-            );
-            apply_grad!(
-                layer.self_attn.k_proj.lora_b,
-                format!("{}.self_attn.k_proj.lora_b", prefix)
-            );
-            apply_grad!(
-                layer.self_attn.v_proj.lora_a,
-                format!("{}.self_attn.v_proj.lora_a", prefix)
-            );
-            apply_grad!(
-                layer.self_attn.v_proj.lora_b,
-                format!("{}.self_attn.v_proj.lora_b", prefix)
-            );
-            apply_grad!(
-                layer.self_attn.o_proj.lora_a,
-                format!("{}.self_attn.o_proj.lora_a", prefix)
-            );
-            apply_grad!(
-                layer.self_attn.o_proj.lora_b,
-                format!("{}.self_attn.o_proj.lora_b", prefix)
-            );
-
-            // MLP LoRA params
-            apply_grad!(
-                layer.mlp.gate_proj.lora_a,
-                format!("{}.mlp.gate_proj.lora_a", prefix)
-            );
-            apply_grad!(
-                layer.mlp.gate_proj.lora_b,
-                format!("{}.mlp.gate_proj.lora_b", prefix)
-            );
-            apply_grad!(
-                layer.mlp.up_proj.lora_a,
-                format!("{}.mlp.up_proj.lora_a", prefix)
-            );
-            apply_grad!(
-                layer.mlp.up_proj.lora_b,
-                format!("{}.mlp.up_proj.lora_b", prefix)
-            );
-            apply_grad!(
-                layer.mlp.down_proj.lora_a,
-                format!("{}.mlp.down_proj.lora_a", prefix)
-            );
-            apply_grad!(
-                layer.mlp.down_proj.lora_b,
-                format!("{}.mlp.down_proj.lora_b", prefix)
-            );
+            // MLP LoRA params (use accessor methods — fields are behind LinearAdapter enum)
+            for (proj_name, proj) in [
+                ("gate_proj", &mut layer.mlp.gate_proj),
+                ("up_proj", &mut layer.mlp.up_proj),
+                ("down_proj", &mut layer.mlp.down_proj),
+            ] {
+                let a_key = format!("{}.mlp.{}.lora_a", prefix, proj_name);
+                let b_key = format!("{}.mlp.{}.lora_b", prefix, proj_name);
+                if let Some(grad) = gradients.get(&Rc::from(a_key)) {
+                    let update = grad.multiply(&lr)?;
+                    *proj.lora_a_mut() = proj.lora_a().subtract(&update)?;
+                }
+                if let Some(grad) = gradients.get(&Rc::from(b_key)) {
+                    let update = grad.multiply(&lr)?;
+                    *proj.lora_b_mut() = proj.lora_b().subtract(&update)?;
+                }
+            }
         }
 
         Ok(())
@@ -873,95 +923,72 @@ impl LlamaLoraForCausalLM {
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let prefix = format!("layers.{}", i);
 
-            // Helper to set param
-            macro_rules! set_param {
-                ($param:expr, $key:expr) => {
-                    if let Some(value) = params.get(&Rc::from($key)) {
-                        $param = value.clone();
+            // Attention adapter params (via accessor methods to support LinearAdapter)
+            for (proj_name, proj) in [
+                ("q_proj", &mut layer.self_attn.q_proj),
+                ("k_proj", &mut layer.self_attn.k_proj),
+                ("v_proj", &mut layer.self_attn.v_proj),
+                ("o_proj", &mut layer.self_attn.o_proj),
+            ] {
+                let a_key = format!("{}.self_attn.{}.lora_a", prefix, proj_name);
+                let b_key = format!("{}.self_attn.{}.lora_b", prefix, proj_name);
+                if let Some(value) = params.get(&Rc::from(a_key)) {
+                    *proj.lora_a_mut() = value.clone();
+                }
+                if let Some(value) = params.get(&Rc::from(b_key)) {
+                    *proj.lora_b_mut() = value.clone();
+                }
+                // Restore DoRA magnitude if present
+                for (extra_name, extra_param) in proj.extra_params_mut() {
+                    let key = format!("{}.self_attn.{}.{}", prefix, proj_name, extra_name);
+                    if let Some(value) = params.get(&Rc::from(key)) {
+                        *extra_param = value.clone();
                     }
-                };
+                }
             }
 
-            // Attention LoRA params
-            set_param!(
-                layer.self_attn.q_proj.lora_a,
-                format!("{}.self_attn.q_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.self_attn.q_proj.lora_b,
-                format!("{}.self_attn.q_proj.lora_b", prefix)
-            );
-            set_param!(
-                layer.self_attn.k_proj.lora_a,
-                format!("{}.self_attn.k_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.self_attn.k_proj.lora_b,
-                format!("{}.self_attn.k_proj.lora_b", prefix)
-            );
-            set_param!(
-                layer.self_attn.v_proj.lora_a,
-                format!("{}.self_attn.v_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.self_attn.v_proj.lora_b,
-                format!("{}.self_attn.v_proj.lora_b", prefix)
-            );
-            set_param!(
-                layer.self_attn.o_proj.lora_a,
-                format!("{}.self_attn.o_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.self_attn.o_proj.lora_b,
-                format!("{}.self_attn.o_proj.lora_b", prefix)
-            );
-
-            // MLP LoRA params
-            set_param!(
-                layer.mlp.gate_proj.lora_a,
-                format!("{}.mlp.gate_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.mlp.gate_proj.lora_b,
-                format!("{}.mlp.gate_proj.lora_b", prefix)
-            );
-            set_param!(
-                layer.mlp.up_proj.lora_a,
-                format!("{}.mlp.up_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.mlp.up_proj.lora_b,
-                format!("{}.mlp.up_proj.lora_b", prefix)
-            );
-            set_param!(
-                layer.mlp.down_proj.lora_a,
-                format!("{}.mlp.down_proj.lora_a", prefix)
-            );
-            set_param!(
-                layer.mlp.down_proj.lora_b,
-                format!("{}.mlp.down_proj.lora_b", prefix)
-            );
+            // MLP LoRA params (use accessor methods — fields are behind LinearAdapter enum)
+            for (proj_name, proj) in [
+                ("gate_proj", &mut layer.mlp.gate_proj),
+                ("up_proj", &mut layer.mlp.up_proj),
+                ("down_proj", &mut layer.mlp.down_proj),
+            ] {
+                let a_key = format!("{}.mlp.{}.lora_a", prefix, proj_name);
+                let b_key = format!("{}.mlp.{}.lora_b", prefix, proj_name);
+                if let Some(value) = params.get(&Rc::from(a_key)) {
+                    *proj.lora_a_mut() = value.clone();
+                }
+                if let Some(value) = params.get(&Rc::from(b_key)) {
+                    *proj.lora_b_mut() = value.clone();
+                }
+                for (extra_name, extra_param) in proj.extra_params_mut() {
+                    let key = format!("{}.mlp.{}.{}", prefix, proj_name, extra_name);
+                    if let Some(value) = params.get(&Rc::from(key)) {
+                        *extra_param = value.clone();
+                    }
+                }
+            }
         }
     }
 
     /// Evaluate all LoRA parameters (force computation).
     pub fn eval_lora_params(&self) -> Result<(), LoraError> {
         for layer in &self.model.layers {
-            layer.self_attn.q_proj.lora_a.eval()?;
-            layer.self_attn.q_proj.lora_b.eval()?;
-            layer.self_attn.k_proj.lora_a.eval()?;
-            layer.self_attn.k_proj.lora_b.eval()?;
-            layer.self_attn.v_proj.lora_a.eval()?;
-            layer.self_attn.v_proj.lora_b.eval()?;
-            layer.self_attn.o_proj.lora_a.eval()?;
-            layer.self_attn.o_proj.lora_b.eval()?;
+            layer.self_attn.q_proj.lora_a().eval()?;
+            layer.self_attn.q_proj.lora_b().eval()?;
+            layer.self_attn.k_proj.lora_a().eval()?;
+            layer.self_attn.k_proj.lora_b().eval()?;
+            layer.self_attn.v_proj.lora_a().eval()?;
+            layer.self_attn.v_proj.lora_b().eval()?;
+            layer.self_attn.o_proj.lora_a().eval()?;
+            layer.self_attn.o_proj.lora_b().eval()?;
 
-            layer.mlp.gate_proj.lora_a.eval()?;
-            layer.mlp.gate_proj.lora_b.eval()?;
-            layer.mlp.up_proj.lora_a.eval()?;
-            layer.mlp.up_proj.lora_b.eval()?;
-            layer.mlp.down_proj.lora_a.eval()?;
-            layer.mlp.down_proj.lora_b.eval()?;
+            layer.mlp.gate_proj.lora_a().eval()?;
+            layer.mlp.gate_proj.lora_b().eval()?;
+            layer.mlp.up_proj.lora_a().eval()?;
+            layer.mlp.up_proj.lora_b().eval()?;
+            layer.mlp.down_proj.lora_a().eval()?;
+            layer.mlp.down_proj.lora_b().eval()?;
         }
         Ok(())
     }
@@ -1031,74 +1058,50 @@ impl LlamaLoraForCausalLM {
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let prefix = format!("layers.{}", i);
 
-            // Helper to load param
-            macro_rules! load_param {
-                ($param:expr, $key:expr) => {
-                    if let Some(value) = loaded.get(&Rc::from($key) as &str) {
-                        $param = value.clone();
+            // Attention LoRA params (use accessor methods — LinearAdapter enum)
+            for (proj_name, proj) in [
+                ("q_proj", &mut layer.self_attn.q_proj),
+                ("k_proj", &mut layer.self_attn.k_proj),
+                ("v_proj", &mut layer.self_attn.v_proj),
+                ("o_proj", &mut layer.self_attn.o_proj),
+            ] {
+                let a_key = format!("{}.self_attn.{}.lora_a", prefix, proj_name);
+                let b_key = format!("{}.self_attn.{}.lora_b", prefix, proj_name);
+                if let Some(value) = loaded.get(a_key.as_str()) {
+                    *proj.lora_a_mut() = value.clone();
+                }
+                if let Some(value) = loaded.get(b_key.as_str()) {
+                    *proj.lora_b_mut() = value.clone();
+                }
+                for (extra_name, extra_param) in proj.extra_params_mut() {
+                    let key = format!("{}.self_attn.{}.{}", prefix, proj_name, extra_name);
+                    if let Some(value) = loaded.get(key.as_str()) {
+                        *extra_param = value.clone();
                     }
-                };
+                }
             }
 
-            // Attention LoRA params
-            load_param!(
-                layer.self_attn.q_proj.lora_a,
-                format!("{}.self_attn.q_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.self_attn.q_proj.lora_b,
-                format!("{}.self_attn.q_proj.lora_b", prefix)
-            );
-            load_param!(
-                layer.self_attn.k_proj.lora_a,
-                format!("{}.self_attn.k_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.self_attn.k_proj.lora_b,
-                format!("{}.self_attn.k_proj.lora_b", prefix)
-            );
-            load_param!(
-                layer.self_attn.v_proj.lora_a,
-                format!("{}.self_attn.v_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.self_attn.v_proj.lora_b,
-                format!("{}.self_attn.v_proj.lora_b", prefix)
-            );
-            load_param!(
-                layer.self_attn.o_proj.lora_a,
-                format!("{}.self_attn.o_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.self_attn.o_proj.lora_b,
-                format!("{}.self_attn.o_proj.lora_b", prefix)
-            );
-
-            // MLP LoRA params
-            load_param!(
-                layer.mlp.gate_proj.lora_a,
-                format!("{}.mlp.gate_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.mlp.gate_proj.lora_b,
-                format!("{}.mlp.gate_proj.lora_b", prefix)
-            );
-            load_param!(
-                layer.mlp.up_proj.lora_a,
-                format!("{}.mlp.up_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.mlp.up_proj.lora_b,
-                format!("{}.mlp.up_proj.lora_b", prefix)
-            );
-            load_param!(
-                layer.mlp.down_proj.lora_a,
-                format!("{}.mlp.down_proj.lora_a", prefix)
-            );
-            load_param!(
-                layer.mlp.down_proj.lora_b,
-                format!("{}.mlp.down_proj.lora_b", prefix)
-            );
+            // MLP LoRA params (use accessor methods — LinearAdapter enum)
+            for (proj_name, proj) in [
+                ("gate_proj", &mut layer.mlp.gate_proj),
+                ("up_proj", &mut layer.mlp.up_proj),
+                ("down_proj", &mut layer.mlp.down_proj),
+            ] {
+                let a_key = format!("{}.mlp.{}.lora_a", prefix, proj_name);
+                let b_key = format!("{}.mlp.{}.lora_b", prefix, proj_name);
+                if let Some(value) = loaded.get(a_key.as_str()) {
+                    *proj.lora_a_mut() = value.clone();
+                }
+                if let Some(value) = loaded.get(b_key.as_str()) {
+                    *proj.lora_b_mut() = value.clone();
+                }
+                for (extra_name, extra_param) in proj.extra_params_mut() {
+                    let key = format!("{}.mlp.{}.{}", prefix, proj_name, extra_name);
+                    if let Some(value) = loaded.get(key.as_str()) {
+                        *extra_param = value.clone();
+                    }
+                }
+            }
         }
 
         Ok(())
@@ -1136,29 +1139,29 @@ impl LlamaLoraForCausalLM {
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let prefix = format!("model.layers.{}", i);
 
-            // Self-attention projections (load into LoraLinear.weight)
+            // Self-attention projections (use weight_mut() — LinearAdapter enum)
             if let Some(w) = weights.get(&format!("{}.self_attn.q_proj.weight", prefix)) {
-                layer.self_attn.q_proj.weight = w.clone();
+                *layer.self_attn.q_proj.weight_mut() = w.clone();
             }
             if let Some(w) = weights.get(&format!("{}.self_attn.k_proj.weight", prefix)) {
-                layer.self_attn.k_proj.weight = w.clone();
+                *layer.self_attn.k_proj.weight_mut() = w.clone();
             }
             if let Some(w) = weights.get(&format!("{}.self_attn.v_proj.weight", prefix)) {
-                layer.self_attn.v_proj.weight = w.clone();
+                *layer.self_attn.v_proj.weight_mut() = w.clone();
             }
             if let Some(w) = weights.get(&format!("{}.self_attn.o_proj.weight", prefix)) {
-                layer.self_attn.o_proj.weight = w.clone();
+                *layer.self_attn.o_proj.weight_mut() = w.clone();
             }
 
             // MLP projections
             if let Some(w) = weights.get(&format!("{}.mlp.gate_proj.weight", prefix)) {
-                layer.mlp.gate_proj.weight = w.clone();
+                *layer.mlp.gate_proj.weight_mut() = w.clone();
             }
             if let Some(w) = weights.get(&format!("{}.mlp.up_proj.weight", prefix)) {
-                layer.mlp.up_proj.weight = w.clone();
+                *layer.mlp.up_proj.weight_mut() = w.clone();
             }
             if let Some(w) = weights.get(&format!("{}.mlp.down_proj.weight", prefix)) {
-                layer.mlp.down_proj.weight = w.clone();
+                *layer.mlp.down_proj.weight_mut() = w.clone();
             }
 
             // Layer norms
@@ -1249,30 +1252,30 @@ impl LlamaLoraForCausalLM {
 
         // Eval layers
         for layer in &self.model.layers {
-            // Base weights
-            layer.self_attn.q_proj.weight.eval()?;
-            layer.self_attn.k_proj.weight.eval()?;
-            layer.self_attn.v_proj.weight.eval()?;
-            layer.self_attn.o_proj.weight.eval()?;
-            layer.mlp.gate_proj.weight.eval()?;
-            layer.mlp.up_proj.weight.eval()?;
-            layer.mlp.down_proj.weight.eval()?;
+            // Base weights (use weight() accessor — LinearAdapter enum)
+            layer.self_attn.q_proj.weight().eval()?;
+            layer.self_attn.k_proj.weight().eval()?;
+            layer.self_attn.v_proj.weight().eval()?;
+            layer.self_attn.o_proj.weight().eval()?;
+            layer.mlp.gate_proj.weight().eval()?;
+            layer.mlp.up_proj.weight().eval()?;
+            layer.mlp.down_proj.weight().eval()?;
 
-            // LoRA weights
-            layer.self_attn.q_proj.lora_a.eval()?;
-            layer.self_attn.q_proj.lora_b.eval()?;
-            layer.self_attn.k_proj.lora_a.eval()?;
-            layer.self_attn.k_proj.lora_b.eval()?;
-            layer.self_attn.v_proj.lora_a.eval()?;
-            layer.self_attn.v_proj.lora_b.eval()?;
-            layer.self_attn.o_proj.lora_a.eval()?;
-            layer.self_attn.o_proj.lora_b.eval()?;
-            layer.mlp.gate_proj.lora_a.eval()?;
-            layer.mlp.gate_proj.lora_b.eval()?;
-            layer.mlp.up_proj.lora_a.eval()?;
-            layer.mlp.up_proj.lora_b.eval()?;
-            layer.mlp.down_proj.lora_a.eval()?;
-            layer.mlp.down_proj.lora_b.eval()?;
+            // LoRA weights (use lora_a()/lora_b() accessors — LinearAdapter enum)
+            layer.self_attn.q_proj.lora_a().eval()?;
+            layer.self_attn.q_proj.lora_b().eval()?;
+            layer.self_attn.k_proj.lora_a().eval()?;
+            layer.self_attn.k_proj.lora_b().eval()?;
+            layer.self_attn.v_proj.lora_a().eval()?;
+            layer.self_attn.v_proj.lora_b().eval()?;
+            layer.self_attn.o_proj.lora_a().eval()?;
+            layer.self_attn.o_proj.lora_b().eval()?;
+            layer.mlp.gate_proj.lora_a().eval()?;
+            layer.mlp.gate_proj.lora_b().eval()?;
+            layer.mlp.up_proj.lora_a().eval()?;
+            layer.mlp.up_proj.lora_b().eval()?;
+            layer.mlp.down_proj.lora_a().eval()?;
+            layer.mlp.down_proj.lora_b().eval()?;
 
             // Layer norms
             layer.input_layernorm.weight.value.as_ref().eval()?;
@@ -1316,86 +1319,86 @@ impl ModuleParameters for LlamaLoraForCausalLM {
             let prefix: Rc<str> = Rc::from(format!("layers.{}", i));
             let mut layer_params = HashMap::new();
 
-            // Attention LoRA params
+            // Attention LoRA params (use accessor methods — LinearAdapter enum)
             let mut attn_params = HashMap::new();
             let mut q_params = HashMap::new();
             q_params.insert(
                 Rc::from("lora_a"),
-                NestedValue::Value(&layer.self_attn.q_proj.lora_a),
+                NestedValue::Value(layer.self_attn.q_proj.lora_a()),
             );
             q_params.insert(
                 Rc::from("lora_b"),
-                NestedValue::Value(&layer.self_attn.q_proj.lora_b),
+                NestedValue::Value(layer.self_attn.q_proj.lora_b()),
             );
             attn_params.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
 
             let mut k_params = HashMap::new();
             k_params.insert(
                 Rc::from("lora_a"),
-                NestedValue::Value(&layer.self_attn.k_proj.lora_a),
+                NestedValue::Value(layer.self_attn.k_proj.lora_a()),
             );
             k_params.insert(
                 Rc::from("lora_b"),
-                NestedValue::Value(&layer.self_attn.k_proj.lora_b),
+                NestedValue::Value(layer.self_attn.k_proj.lora_b()),
             );
             attn_params.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
 
             let mut v_params = HashMap::new();
             v_params.insert(
                 Rc::from("lora_a"),
-                NestedValue::Value(&layer.self_attn.v_proj.lora_a),
+                NestedValue::Value(layer.self_attn.v_proj.lora_a()),
             );
             v_params.insert(
                 Rc::from("lora_b"),
-                NestedValue::Value(&layer.self_attn.v_proj.lora_b),
+                NestedValue::Value(layer.self_attn.v_proj.lora_b()),
             );
             attn_params.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
 
             let mut o_params = HashMap::new();
             o_params.insert(
                 Rc::from("lora_a"),
-                NestedValue::Value(&layer.self_attn.o_proj.lora_a),
+                NestedValue::Value(layer.self_attn.o_proj.lora_a()),
             );
             o_params.insert(
                 Rc::from("lora_b"),
-                NestedValue::Value(&layer.self_attn.o_proj.lora_b),
+                NestedValue::Value(layer.self_attn.o_proj.lora_b()),
             );
             attn_params.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
 
             layer_params.insert(Rc::from("self_attn"), NestedValue::Map(attn_params));
 
-            // MLP LoRA params
+            // MLP LoRA params (use accessor methods — LinearAdapter enum)
             let mut mlp_params = HashMap::new();
             let mut gate_params = HashMap::new();
             gate_params.insert(
                 Rc::from("lora_a"),
-                NestedValue::Value(&layer.mlp.gate_proj.lora_a),
+                NestedValue::Value(layer.mlp.gate_proj.lora_a()),
             );
             gate_params.insert(
                 Rc::from("lora_b"),
-                NestedValue::Value(&layer.mlp.gate_proj.lora_b),
+                NestedValue::Value(layer.mlp.gate_proj.lora_b()),
             );
             mlp_params.insert(Rc::from("gate_proj"), NestedValue::Map(gate_params));
 
             let mut up_params = HashMap::new();
             up_params.insert(
                 Rc::from("lora_a"),
-                NestedValue::Value(&layer.mlp.up_proj.lora_a),
+                NestedValue::Value(layer.mlp.up_proj.lora_a()),
             );
             up_params.insert(
                 Rc::from("lora_b"),
-                NestedValue::Value(&layer.mlp.up_proj.lora_b),
+                NestedValue::Value(layer.mlp.up_proj.lora_b()),
             );
             mlp_params.insert(Rc::from("up_proj"), NestedValue::Map(up_params));
 
             let mut down_params = HashMap::new();
             down_params.insert(
                 Rc::from("lora_a"),
-                NestedValue::Value(&layer.mlp.down_proj.lora_a),
+                NestedValue::Value(layer.mlp.down_proj.lora_a()),
             );
             down_params.insert(
                 Rc::from("lora_b"),
-                NestedValue::Value(&layer.mlp.down_proj.lora_b),
+                NestedValue::Value(layer.mlp.down_proj.lora_b()),
             );
             mlp_params.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
 
@@ -1414,88 +1417,73 @@ impl ModuleParameters for LlamaLoraForCausalLM {
             let prefix: Rc<str> = Rc::from(format!("layers.{}", i));
             let mut layer_params = HashMap::new();
 
-            // Attention LoRA params
+            // Attention LoRA params.
+            // To avoid the borrow-checker E0499 (two mut borrows from the same struct),
+            // we build per-adapter param maps using a helper closure that matches the
+            // LinearAdapter enum variant and borrows the two fields simultaneously via
+            // direct struct field projection (disjoint borrows — borrow checker allows it).
             let mut attn_params = HashMap::new();
-            let mut q_params = HashMap::new();
-            q_params.insert(
-                Rc::from("lora_a"),
-                NestedValue::Value(&mut layer.self_attn.q_proj.lora_a),
-            );
-            q_params.insert(
-                Rc::from("lora_b"),
-                NestedValue::Value(&mut layer.self_attn.q_proj.lora_b),
-            );
-            attn_params.insert(Rc::from("q_proj"), NestedValue::Map(q_params));
 
-            let mut k_params = HashMap::new();
-            k_params.insert(
-                Rc::from("lora_a"),
-                NestedValue::Value(&mut layer.self_attn.k_proj.lora_a),
-            );
-            k_params.insert(
-                Rc::from("lora_b"),
-                NestedValue::Value(&mut layer.self_attn.k_proj.lora_b),
-            );
-            attn_params.insert(Rc::from("k_proj"), NestedValue::Map(k_params));
+            fn adapter_params_mut<'a>(
+                adapter: &'a mut LinearAdapter,
+            ) -> HashMap<Rc<str>, NestedValue<Rc<str>, &'a mut Array>> {
+                let mut m: HashMap<Rc<str>, NestedValue<Rc<str>, &'a mut Array>> = HashMap::new();
+                match adapter {
+                    LinearAdapter::Lora(l) => {
+                        m.insert(Rc::from("lora_a"), NestedValue::Value(&mut l.lora_a));
+                        m.insert(Rc::from("lora_b"), NestedValue::Value(&mut l.lora_b));
+                    }
+                    LinearAdapter::Dora(d) => {
+                        m.insert(Rc::from("lora_a"), NestedValue::Value(&mut d.lora_a));
+                        m.insert(Rc::from("lora_b"), NestedValue::Value(&mut d.lora_b));
+                        m.insert(Rc::from("magnitude"), NestedValue::Value(&mut d.magnitude));
+                    }
+                }
+                m
+            }
 
-            let mut v_params = HashMap::new();
-            v_params.insert(
-                Rc::from("lora_a"),
-                NestedValue::Value(&mut layer.self_attn.v_proj.lora_a),
-            );
-            v_params.insert(
-                Rc::from("lora_b"),
-                NestedValue::Value(&mut layer.self_attn.v_proj.lora_b),
-            );
-            attn_params.insert(Rc::from("v_proj"), NestedValue::Map(v_params));
+            fn lora_params_mut<'a>(
+                l: &'a mut LoraLinear,
+            ) -> HashMap<Rc<str>, NestedValue<Rc<str>, &'a mut Array>> {
+                let mut m: HashMap<Rc<str>, NestedValue<Rc<str>, &'a mut Array>> = HashMap::new();
+                m.insert(Rc::from("lora_a"), NestedValue::Value(&mut l.lora_a));
+                m.insert(Rc::from("lora_b"), NestedValue::Value(&mut l.lora_b));
+                m
+            }
 
-            let mut o_params = HashMap::new();
-            o_params.insert(
-                Rc::from("lora_a"),
-                NestedValue::Value(&mut layer.self_attn.o_proj.lora_a),
+            attn_params.insert(
+                Rc::from("q_proj"),
+                NestedValue::Map(adapter_params_mut(&mut layer.self_attn.q_proj)),
             );
-            o_params.insert(
-                Rc::from("lora_b"),
-                NestedValue::Value(&mut layer.self_attn.o_proj.lora_b),
+            attn_params.insert(
+                Rc::from("k_proj"),
+                NestedValue::Map(adapter_params_mut(&mut layer.self_attn.k_proj)),
             );
-            attn_params.insert(Rc::from("o_proj"), NestedValue::Map(o_params));
+            attn_params.insert(
+                Rc::from("v_proj"),
+                NestedValue::Map(adapter_params_mut(&mut layer.self_attn.v_proj)),
+            );
+            attn_params.insert(
+                Rc::from("o_proj"),
+                NestedValue::Map(adapter_params_mut(&mut layer.self_attn.o_proj)),
+            );
 
             layer_params.insert(Rc::from("self_attn"), NestedValue::Map(attn_params));
 
             // MLP LoRA params
             let mut mlp_params = HashMap::new();
-            let mut gate_params = HashMap::new();
-            gate_params.insert(
-                Rc::from("lora_a"),
-                NestedValue::Value(&mut layer.mlp.gate_proj.lora_a),
+            mlp_params.insert(
+                Rc::from("gate_proj"),
+                NestedValue::Map(lora_params_mut(&mut layer.mlp.gate_proj)),
             );
-            gate_params.insert(
-                Rc::from("lora_b"),
-                NestedValue::Value(&mut layer.mlp.gate_proj.lora_b),
+            mlp_params.insert(
+                Rc::from("up_proj"),
+                NestedValue::Map(lora_params_mut(&mut layer.mlp.up_proj)),
             );
-            mlp_params.insert(Rc::from("gate_proj"), NestedValue::Map(gate_params));
-
-            let mut up_params = HashMap::new();
-            up_params.insert(
-                Rc::from("lora_a"),
-                NestedValue::Value(&mut layer.mlp.up_proj.lora_a),
+            mlp_params.insert(
+                Rc::from("down_proj"),
+                NestedValue::Map(lora_params_mut(&mut layer.mlp.down_proj)),
             );
-            up_params.insert(
-                Rc::from("lora_b"),
-                NestedValue::Value(&mut layer.mlp.up_proj.lora_b),
-            );
-            mlp_params.insert(Rc::from("up_proj"), NestedValue::Map(up_params));
-
-            let mut down_params = HashMap::new();
-            down_params.insert(
-                Rc::from("lora_a"),
-                NestedValue::Value(&mut layer.mlp.down_proj.lora_a),
-            );
-            down_params.insert(
-                Rc::from("lora_b"),
-                NestedValue::Value(&mut layer.mlp.down_proj.lora_b),
-            );
-            mlp_params.insert(Rc::from("down_proj"), NestedValue::Map(down_params));
 
             layer_params.insert(Rc::from("mlp"), NestedValue::Map(mlp_params));
 
@@ -1566,6 +1554,15 @@ impl crate::TrainableModel for LlamaLoraForCausalLM {
 
     fn supports_gradient_checkpointing(&self) -> bool {
         true
+    }
+
+    fn forward_noised(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        noise_alpha: f32,
+    ) -> Result<Array, LoraError> {
+        LlamaLoraForCausalLM::forward_noised(self, input_ids, mask, noise_alpha)
     }
 
     fn forward_with_cache(

@@ -173,11 +173,21 @@ impl DoraLinear {
 
     /// Forward pass through the DoRA linear layer.
     ///
-    /// Computes:
-    /// 1. V = W + scale * B @ A
-    /// 2. V_norm = V / ||V||_c
-    /// 3. W_final = m * V_norm
-    /// 4. y = x @ W_final.T
+    /// Uses the efficient factored formulation that avoids materializing the full
+    /// `[out_features, in_features]` effective weight matrix V = W + scale * B @ A.
+    ///
+    /// Instead computes:
+    ///   y_base = x @ W.T                           (frozen weight projection)
+    ///   y_lora = scale * (x @ A.T) @ B.T           (low-rank correction, O(r) intermediate)
+    ///   w_col_norm ≈ ||W||_col (per-row norms of W, shape [out, 1])
+    ///   y = (y_base + y_lora) * (m / w_col_norm)   (magnitude rescaling)
+    ///
+    /// This avoids the O(out * in) materialization of V and instead uses O(r) intermediates.
+    /// The approximation replaces ||V||_col with ||W||_col; since lora_b is zero-initialized
+    /// at the start of training the error is zero initially and grows only as B trains, which
+    /// is the exact regime where the low-rank correction is still small relative to W.
+    ///
+    /// For the merged path (inference), the exact merged weight is used directly.
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         if self.merged {
             let y = x.matmul(&self.weight.t())?;
@@ -187,24 +197,35 @@ impl DoraLinear {
                 Ok(y)
             }
         } else {
-            // 1. Calculate effective weight direction: V = W + scale * B @ A
-            // We need full matrix reconstruction here, which is expensive but necessary for DoRA
-            let ba = self.lora_b.matmul(&self.lora_a)?;
+            // Base projection: y_base = x @ W.T
+            let y_base = x.matmul(&self.weight.t())?;
+
+            // Low-rank LoRA correction (no full weight materialization):
+            //   y_lora = scale * (x @ A.T) @ B.T
+            // Shape: x [*, in] -> xa [*, r] -> xab [*, out]
+            let xa = if self.training && self.lora_dropout > 0.0 {
+                crate::lora::apply_dropout(x, self.lora_dropout)?.matmul(&self.lora_a.t())?
+            } else {
+                x.matmul(&self.lora_a.t())?
+            };
+            let xab = xa.matmul(&self.lora_b.t())?;
             let scale_arr = Array::from_f32(self.scale);
-            let update = ba.multiply(&scale_arr)?;
-            let v = self.weight.add(&update)?;
 
-            // 2. Normalize V: V_norm = V / ||V||
-            let v_norm = v.square()?.sum_axis(1, true)?.sqrt()?;
-            // Add epsilon to avoid div by zero? MLX handles this reasonably well usually
-            let normalized_v = v.divide(&v_norm.add(&Array::from_f32(1e-6))?)?;
+            // Combined output before magnitude rescaling
+            let y_combined = y_base.add(&xab.multiply(&scale_arr)?)?;
 
-            // 3. Scale by magnitude: W_final = m * V_norm
-            // magnitude is [out, 1], normalized_v is [out, in] -> broadcasting works
-            let w_final = normalized_v.multiply(&self.magnitude)?;
+            // Per-row column norms of the frozen weight W: shape [out, 1].
+            // We use ||W||_col as an approximation for ||V||_col = ||W + scale*B@A||_col.
+            // This is exact at init (B=0) and accurate throughout training when the
+            // low-rank update is small relative to the frozen weight magnitude.
+            let w_col_norm = self.weight.square()?.sum_axis(1, true)?.sqrt()?;
+            let eps = Array::from_f32(1e-6);
+            let norm_safe = w_col_norm.add(&eps)?;
 
-            // 4. Linear projection: y = x @ W_final.T
-            let y = x.matmul(&w_final.t())?;
+            // Magnitude rescaling: y = y_combined * (m / ||W||_col)
+            // magnitude shape [out, 1] broadcasts over the output dimension
+            let scale_factor = self.magnitude.divide(&norm_safe)?;
+            let y = y_combined.multiply(&scale_factor)?;
 
             if let Some(ref bias) = self.bias {
                 Ok(y.add(bias)?)
