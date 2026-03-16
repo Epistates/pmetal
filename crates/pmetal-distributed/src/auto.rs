@@ -19,12 +19,12 @@
 //! ctx.all_reduce(&mut gradients).await?;
 //! ```
 
-use crate::DistributedBackend;
 use crate::discovery::{DiscoveryEvent, DiscoveryService};
 use crate::error::DistributedError;
 use crate::identity::NodeIdentity;
 use crate::topology::{NodeProfile, SharedTopology, new_shared_topology};
 use crate::transport::{TcpTransport, TransportReceiver, TransportSender};
+use crate::{DistributedBackend, ReduceOp};
 use anyhow::Result;
 use async_trait::async_trait;
 use libp2p::PeerId;
@@ -32,7 +32,7 @@ use parking_lot::RwLock;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, OnceCell, mpsc};
 use tracing::{debug, error, info, warn};
 use zerocopy::{FromBytes, IntoBytes};
 
@@ -86,8 +86,10 @@ pub struct AutoDiscoveryBackend {
     ring_connections: Mutex<Option<(TransportSender, TransportReceiver)>>,
     /// Event receiver from discovery service.
     event_rx: Mutex<mpsc::Receiver<DiscoveryEvent>>,
-    /// Whether the ring is established.
-    ring_ready: Arc<std::sync::atomic::AtomicBool>,
+    /// Ensures `establish_ring_inner` runs exactly once, even under concurrent
+    /// calls.  Replaces the former `AtomicBool` which had a TOCTOU race:
+    /// two callers could both observe `false` and both attempt to connect.
+    ring_init: OnceCell<()>,
 }
 
 impl AutoDiscoveryBackend {
@@ -129,7 +131,7 @@ impl AutoDiscoveryBackend {
             discovery_state,
             ring_connections: Mutex::new(None),
             event_rx: Mutex::new(event_rx),
-            ring_ready: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            ring_init: OnceCell::new(),
         })
     }
 
@@ -217,9 +219,9 @@ impl AutoDiscoveryBackend {
                 let mut topology = self.topology.write();
                 topology.remove_node(&peer_id);
 
-                // Mark ring as not ready
-                self.ring_ready
-                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                // Note: ring_init is a OnceCell and cannot be reset.  A peer
+                // disconnect means the ring is broken; callers must create a
+                // new AutoDiscoveryBackend to reform the ring.
             }
             DiscoveryEvent::PeerExpired { peer_id } => {
                 debug!("Peer expired: {}", peer_id);
@@ -230,10 +232,10 @@ impl AutoDiscoveryBackend {
         }
     }
 
-    /// Establish the ring topology for all-reduce operations.
+    /// Internal ring setup — performs the actual TCP connection work.
     ///
-    /// This must be called before performing all-reduce operations.
-    pub async fn establish_ring(&self) -> Result<()> {
+    /// Called at most once via `ring_init.get_or_init(...)`.
+    async fn establish_ring_inner(&self) -> Result<()> {
         // Collect all needed data from topology while holding the lock
         let (local_rank, world_size, node_addrs, peer_ids) = {
             let topology = self.topology.read();
@@ -286,16 +288,30 @@ impl AutoDiscoveryBackend {
         let (sender, receiver) = TcpTransport::connect(&config).await?;
 
         *self.ring_connections.lock().await = Some((sender, receiver));
-        self.ring_ready
-            .store(true, std::sync::atomic::Ordering::SeqCst);
 
         info!("Ring established successfully");
         Ok(())
     }
 
-    /// Check if the ring is ready for all-reduce operations.
+    /// Ensure the ring is established, initialising it exactly once.
+    ///
+    /// Uses `tokio::sync::OnceCell::get_or_try_init` so that exactly one
+    /// concurrent caller performs the TCP connection and all others wait.
+    /// If the connection attempt fails the cell remains unset, allowing the
+    /// caller to retry on the next all-reduce.
+    pub async fn establish_ring(&self) -> Result<()> {
+        self.ring_init
+            .get_or_try_init(|| async { self.establish_ring_inner().await })
+            .await?;
+        Ok(())
+    }
+
+    /// Check if the ring has been successfully established.
+    ///
+    /// Returns `true` iff `establish_ring` has completed successfully at least
+    /// once.  This is a cheap non-blocking check suitable for logging.
     pub fn is_ring_ready(&self) -> bool {
-        self.ring_ready.load(std::sync::atomic::Ordering::SeqCst)
+        self.ring_init.initialized()
     }
 }
 
@@ -309,10 +325,9 @@ impl DistributedBackend for AutoDiscoveryBackend {
         self.topology.read().node_count()
     }
 
-    async fn all_reduce(&self, buffer: &mut [u8]) -> Result<()> {
-        if !self.is_ring_ready() {
-            self.establish_ring().await?;
-        }
+    async fn all_reduce(&self, buffer: &mut [u8], op: ReduceOp) -> Result<()> {
+        // establish_ring is idempotent — a no-op after the first successful call.
+        self.establish_ring().await?;
 
         // Validate buffer
         if !buffer.len().is_multiple_of(4) {
@@ -381,8 +396,8 @@ impl DistributedBackend for AutoDiscoveryBackend {
 
         // === ALL-GATHER PHASE ===
         for step in 0..(world_size - 1) {
-            let send_idx = (rank + world_size - step + 1) % world_size;
-            let recv_idx = (rank + world_size - step) % world_size;
+            let send_idx = (rank + world_size - step) % world_size;
+            let recv_idx = (rank + world_size - step - 1) % world_size;
 
             let (send_start, send_end) = get_chunk_range(send_idx);
             let (recv_start, recv_end) = get_chunk_range(recv_idx);
@@ -400,13 +415,19 @@ impl DistributedBackend for AutoDiscoveryBackend {
             floats[recv_start..recv_end].copy_from_slice(recv_floats);
         }
 
+        // Apply mean reduction after the ring has summed all contributions.
+        if op == ReduceOp::Mean {
+            let divisor = world_size as f32;
+            for f in floats.iter_mut() {
+                *f /= divisor;
+            }
+        }
+
         Ok(())
     }
 
     async fn barrier(&self) -> Result<()> {
-        if !self.is_ring_ready() {
-            self.establish_ring().await?;
-        }
+        self.establish_ring().await?;
 
         let world_size = self.world_size();
         if world_size < 2 {

@@ -41,10 +41,35 @@ impl TransportSender {
 
 impl TransportReceiver {
     /// Receive data into buffer (must match expected size).
+    ///
+    /// Enforces a maximum message size of 512 MiB to prevent resource
+    /// exhaustion from malicious or corrupted length prefixes.
+    ///
+    /// Each `read_exact` call is wrapped in a 60-second timeout so that a
+    /// peer crash or network partition does not cause indefinite blocking.
     pub async fn recv(&mut self, buffer: &mut [u8]) -> Result<()> {
+        const MAX_MSG_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
+        const READ_TIMEOUT: Duration = Duration::from_secs(60);
+
+        // Read the 4-byte length prefix with timeout.
         let mut len_buf = [0u8; 4];
-        self.stream.read_exact(&mut len_buf).await?;
+        timeout(READ_TIMEOUT, self.stream.read_exact(&mut len_buf))
+            .await
+            .map_err(|_| {
+                DistributedError::Protocol(
+                    "Timed out waiting for message length prefix (60s) — peer may have crashed"
+                        .to_string(),
+                )
+            })??;
         let len = u32::from_le_bytes(len_buf) as usize;
+
+        if len > MAX_MSG_BYTES {
+            return Err(DistributedError::Protocol(format!(
+                "Message size {} bytes exceeds maximum {} bytes",
+                len, MAX_MSG_BYTES
+            ))
+            .into());
+        }
 
         if len != buffer.len() {
             return Err(DistributedError::Protocol(format!(
@@ -55,7 +80,16 @@ impl TransportReceiver {
             .into());
         }
 
-        self.stream.read_exact(buffer).await?;
+        // Read the payload with timeout.
+        timeout(READ_TIMEOUT, self.stream.read_exact(buffer))
+            .await
+            .map_err(|_| {
+                DistributedError::Protocol(format!(
+                    "Timed out waiting for {} bytes of payload (60s) — peer may have crashed",
+                    buffer.len()
+                ))
+            })??;
+
         Ok(())
     }
 }

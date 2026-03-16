@@ -143,8 +143,13 @@ impl GradientCompressor {
                 self.compress_random(&working_grads, *probability)
             }
             CompressionStrategy::Quantize(qtype) => (self.quantize(&working_grads, *qtype), None),
-            CompressionStrategy::PowerSGD { rank: _ } => {
-                // PowerSGD requires state across iterations, simplified here
+            CompressionStrategy::PowerSGD { rank } => {
+                // PowerSGD is not yet implemented — fall back to uncompressed
+                // with a warning so the caller can see it in logs.
+                tracing::warn!(
+                    rank,
+                    "PowerSGD compression not yet implemented; sending uncompressed gradients"
+                );
                 (CompressedData::Full(working_grads.clone()), None)
             }
         };
@@ -283,7 +288,7 @@ impl GradientCompressor {
                     .iter()
                     .map(|x| x.abs())
                     .fold(0.0f32, |a, b| a.max(b));
-                let scale = max_abs / 127.0;
+                let scale = if max_abs == 0.0 { 1.0 } else { max_abs / 127.0 };
 
                 let data: Vec<i8> = gradients
                     .iter()

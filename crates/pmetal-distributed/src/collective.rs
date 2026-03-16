@@ -271,8 +271,8 @@ pub mod ring {
 
         // === ALL-GATHER PHASE ===
         for step in 0..(world_size - 1) {
-            let send_idx = (rank + world_size - step + 1) % world_size;
-            let recv_idx = (rank + world_size - step) % world_size;
+            let send_idx = (rank + world_size - step) % world_size;
+            let recv_idx = (rank + world_size - step - 1) % world_size;
 
             let (send_start, send_end) = get_chunk_range(send_idx);
             let (recv_start, recv_end) = get_chunk_range(recv_idx);

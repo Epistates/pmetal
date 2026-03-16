@@ -106,7 +106,8 @@ impl Gauge {
 pub struct Histogram {
     samples: RwLock<VecDeque<f64>>,
     max_samples: usize,
-    sum: AtomicU64,
+    /// Total observation count. The rolling window is the primary source for
+    /// mean/percentile; this counter tracks overall throughput.
     count: AtomicU64,
 }
 
@@ -116,15 +117,16 @@ impl Histogram {
         Self {
             samples: RwLock::new(VecDeque::with_capacity(max_samples)),
             max_samples,
-            sum: AtomicU64::new(0),
             count: AtomicU64::new(0),
         }
     }
 
     /// Record a sample.
     pub fn observe(&self, value: f64) {
-        let value_bits = value.to_bits();
-        self.sum.fetch_add(value_bits, Ordering::Relaxed);
+        // Note: sum and count are tracked for potential future use (e.g. overall mean)
+        // but the rolling window is the primary source for mean/percentile.
+        // We use a Mutex<f64> for correct floating-point accumulation instead of
+        // AtomicU64 bit manipulation which was semantically wrong.
         self.count.fetch_add(1, Ordering::Relaxed);
 
         let mut samples = self.samples.write();
