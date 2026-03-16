@@ -150,6 +150,12 @@ impl MergeMethod for SlerpMerge {
             .or(global_params.t)
             .unwrap_or(0.5);
 
+        if !(0.0..=1.0).contains(&t) {
+            return Err(MergeError::InvalidConfig(format!(
+                "SLERP parameter t must be in [0.0, 1.0], got {t}"
+            )));
+        }
+
         Self::slerp(&tensors[0], &tensors[1], t)
     }
 }
