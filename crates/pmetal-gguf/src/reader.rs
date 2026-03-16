@@ -129,6 +129,12 @@ pub enum GgufReadError {
         /// Maximum allowed.
         max: usize,
     },
+    /// Metadata array nesting depth exceeded the safety limit.
+    #[error("Metadata array nesting depth exceeded limit of {max}")]
+    ArrayNestingTooDeep {
+        /// Maximum allowed nesting depth.
+        max: u8,
+    },
     /// Integer overflow in size calculation.
     #[error("Integer overflow in tensor size calculation")]
     IntegerOverflow,
@@ -225,7 +231,7 @@ impl GgufContent {
         for _ in 0..metadata_kv_count {
             let key = read_string(reader, &version)?;
             let value_type_num = reader.read_u32::<LittleEndian>()?;
-            let value = read_value(reader, value_type_num, &version)?;
+            let value = read_value(reader, value_type_num, &version, 0)?;
             metadata.insert(key, value);
         }
 
@@ -414,11 +420,22 @@ fn read_string<R: Read>(reader: &mut R, version: &GgufVersion) -> Result<String,
     String::from_utf8(bytes).map_err(|_| GgufReadError::InvalidUtf8)
 }
 
+/// Maximum nesting depth for GGUF metadata arrays.
+///
+/// Prevents stack overflow from maliciously crafted files with deeply
+/// nested array-of-array structures.
+pub const MAX_ARRAY_DEPTH: u8 = 8;
+
 /// Read a metadata value with size validation.
+///
+/// `depth` tracks the current array nesting depth and must be `0` at the
+/// top level. Returns [`GgufReadError::ArrayNestingTooDeep`] if the depth
+/// exceeds [`MAX_ARRAY_DEPTH`].
 fn read_value<R: Read>(
     reader: &mut R,
     value_type: u32,
     version: &GgufVersion,
+    depth: u8,
 ) -> Result<MetadataValue, GgufReadError> {
     let value = match value_type {
         0 => MetadataValue::Uint8(reader.read_u8()?),
@@ -431,6 +448,13 @@ fn read_value<R: Read>(
         7 => MetadataValue::Bool(reader.read_u8()? != 0),
         8 => MetadataValue::String(read_string(reader, version)?),
         9 => {
+            // Guard against maliciously nested arrays before reading further.
+            if depth >= MAX_ARRAY_DEPTH {
+                return Err(GgufReadError::ArrayNestingTooDeep {
+                    max: MAX_ARRAY_DEPTH,
+                });
+            }
+
             // Array: type + length + elements
             let elem_type = reader.read_u32::<LittleEndian>()?;
             let len = match version {
@@ -457,7 +481,7 @@ fn read_value<R: Read>(
             }
 
             let elements: Vec<MetadataValue> = (0..len)
-                .map(|_| read_value(reader, elem_type, version))
+                .map(|_| read_value(reader, elem_type, version, depth + 1))
                 .collect::<Result<_, _>>()?;
             MetadataValue::Array(elements)
         }

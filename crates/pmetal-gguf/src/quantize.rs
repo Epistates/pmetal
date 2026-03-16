@@ -27,7 +27,13 @@ pub fn quantize(data: &[f32], dtype: GgmlType) -> Result<Vec<u8>> {
                 .collect();
             Ok(bytes)
         }
-        GgmlType::Q8_0 | GgmlType::Q8K => {
+        GgmlType::Q8_0 => {
+            // Q8_0: 32-element blocks with f16 scale + 32 i8 values (34 bytes/block).
+            // Must NOT reuse Q8K which has 256-element blocks with different layout.
+            let blocks = quantize_q8_0(data);
+            Ok(blocks_to_bytes(&blocks))
+        }
+        GgmlType::Q8K => {
             let blocks = quantize_q8k(data);
             Ok(blocks_to_bytes(&blocks))
         }
@@ -56,6 +62,44 @@ pub fn quantize(data: &[f32], dtype: GgmlType) -> Result<Vec<u8>> {
             dtype
         ))),
     }
+}
+
+/// Quantize f32 data to Q8_0 format.
+///
+/// Q8_0: 32-element blocks, each with an f16 scale and 32 i8 quantized values.
+/// Block size: 34 bytes (2 bytes scale + 32 bytes data).
+fn quantize_q8_0(data: &[f32]) -> Vec<u8> {
+    const QK8_0: usize = 32;
+    let n_blocks = data.len().div_ceil(QK8_0);
+    let mut output = Vec::with_capacity(n_blocks * 34);
+
+    for block_idx in 0..n_blocks {
+        let start = block_idx * QK8_0;
+        let end = (start + QK8_0).min(data.len());
+        let block_data = &data[start..end];
+
+        // Find max absolute value for scale
+        let amax = block_data.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
+
+        let scale = amax / 127.0;
+        let iscale = if amax == 0.0 { 0.0 } else { 127.0 / amax };
+
+        // Write f16 scale
+        let scale_f16 = half::f16::from_f32(scale);
+        output.extend_from_slice(&scale_f16.to_le_bytes());
+
+        // Quantize and write i8 values
+        for i in 0..QK8_0 {
+            let val = if i < block_data.len() {
+                nearest_int(block_data[i] * iscale).clamp(-127, 127) as i8
+            } else {
+                0i8 // zero-pad partial last block
+            };
+            output.push(val as u8);
+        }
+    }
+
+    output
 }
 
 /// Convert a slice of any block type to raw bytes.
@@ -118,6 +162,9 @@ pub fn make_qkx1_quants(nmax: i32, ntry: usize, x: &[f32]) -> (f32, f32) {
             }
             sumlx += (value - min) * li as f32;
             suml2 += li * li;
+        }
+        if suml2 == 0 {
+            break; // All quantized values are zero; no further refinement possible
         }
         scale = sumlx / suml2 as f32;
 

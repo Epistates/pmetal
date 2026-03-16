@@ -391,9 +391,22 @@ impl GgufBuilder {
             MetadataValue::Float64(v) => writer.write_f64::<LittleEndian>(*v).map_err(|e| {
                 pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
             })?,
-            MetadataValue::Array(_) => {
-                // Nested arrays - write full value with type
-                self.write_metadata_value(writer, value)?;
+            MetadataValue::Array(inner) => {
+                // Nested arrays — write array header then element data (no per-element type prefix).
+                // The GGUF spec requires array elements to omit individual type codes; the element
+                // type is given once in the outer array header.
+                let elem_type = inner.first().map(|v| v.value_type() as u32).unwrap_or(0); // empty array, type doesn't matter
+                writer.write_u32::<LittleEndian>(elem_type).map_err(|e| {
+                    pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
+                })?;
+                writer
+                    .write_u64::<LittleEndian>(inner.len() as u64)
+                    .map_err(|e| {
+                        pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
+                    })?;
+                for elem in inner {
+                    self.write_metadata_value_data(writer, elem)?;
+                }
             }
         }
         Ok(())
