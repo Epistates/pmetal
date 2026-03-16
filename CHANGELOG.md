@@ -5,6 +5,49 @@ All notable changes to PMetal will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.7] - 2026-03-16
+
+### Added
+
+- **`pmetal merge` CLI command**: Model merging exposed as a first-class CLI command supporting all merge methods (Linear, SLERP, TIES, DARE, DELLA, NearSwap, Model Stock) with `--method`, `--base`, `--t`, `--weight-a`, `--weight-b`, `--density`, and `--dtype` flags
+- **`pmetal eval` CLI command**: Dataset evaluation command — measures loss/perplexity over a validation set with optional LoRA adapter, `--num-samples` cap, and `--json` output
+- **`pmetal info` CLI command**: Prints device and runtime information; `--json` flag emits structured JSON for scripting
+- **`pmetal search --json` output**: Structured JSON output mode for search results including fit estimates, download counts, parameter estimates, and tags — enables scripting and GUI integration
+- **`QuantizeMethod` enum**: Replaces the string `--method` argument for `pmetal quantize` with a typed enum (`dynamic`, `q8_0`, `q4_k_m`, etc.) — invalid methods now fail at argument parsing rather than deep inside the quantizer
+- **GRPO CLI arguments**: `--epochs`, `--lora-r`, `--lora-alpha`, `--max-completion-length`, and `--seed` exposed as CLI arguments, replacing previous hardcoded defaults
+- **`loraplus_lr_ratio` and `neftune_noise_alpha`**: New fields on training loop configurations — enables LoRA+ differential learning rates and NEFTune noise injection directly from config
+- **`trainable_params()` helper**: New utility in `pmetal-lora` for counting total vs. trainable parameter counts, useful for logging and memory estimation
+- **`lora_alpha: f32`**: Distillation CLI and `run_distillation_cli` now accept `lora_alpha` as `f32` instead of `usize` for finer-grained scaling control
+- **`seed` parameter in distillation and GRPO CLI**: Reproducible runs via explicit `--seed` flag in all training entry points
+- **Gemma3 sliding window auto-detection**: `DynamicModel` loader now reads `model_type == "gemma3"` and sets `is_gemma3 = true` on the config, enabling the correct every-6th-layer global attention pattern without manual config overrides
+- **KV cache support for more architectures**: `DynamicModel::forward_with_cache` now routes DeepSeek, Cohere, StarCoder2, and Llama4 to their native caching paths; RecurrentGemma and Jamba now get clear error messages that they require `forward()` directly; hybrid models (NemotronH, Qwen3Next) get a descriptive error directing to `forward_with_hybrid_cache`
+- **Speculative decoding greedy path**: `SpeculativeDecoder::verify_greedy()` — exact-correct verification for temperature=0 decoding using argmax equality; avoids the numerically unstable rejection-sampling limit as temperature→0
+- **Hub cache management** (`pmetal-hub`): New `cache.rs` module with cache inspection, eviction, and size-reporting helpers
+- **Shared model utilities** (`pmetal-models/utils.rs`): Common helpers extracted from per-architecture modules to reduce duplication
+
+### Fixed
+
+- **Scale factor broadcasting in distillation**: `squeeze` applied to the scale factor dimension so it broadcasts correctly across batch and sequence axes — previously caused shape mismatches on non-unit batch sizes
+- **TAID `mean_alpha` forcing GPU sync**: `TaidLossOutput::mean_alpha` changed from `f32` to a lazy `Array` — the `.eval()` call is deferred until callers explicitly call `.item::<f32>()`, removing a forced GPU-CPU sync before the backward pass
+- **SLERP numerical stability**: Added epsilon clamping in the SLERP merge path to prevent NaN when interpolation parameter is at the boundary values (0.0 or 1.0)
+- **Llama LoRA `trainable_params` / gradient application**: Replaced 100+ lines of repeated field accesses with an `insert_adapter!` macro and loop over projection names, fixing DoRA `magnitude` parameter that was silently dropped from gradient maps
+- **GaLore improvements**: Corrected projection matrix update schedule and subspace dimensionality handling
+- **Distillation hidden-state loss**: Refactored alignment computation to correctly handle variable-rank teacher/student hidden state tensors
+- **Jensen-Shannon / KL divergence loss**: Numerical stability improvements — log-sum-exp stabilization applied consistently across all reduction paths
+- **Offline distillation**: Fixed logit cache loading to handle both single-file and sharded cache layouts
+
+### Changed
+
+- **`lm_groups.rs` / LoRA+ optimizer groups**: `build_lora_param_groups` significantly reworked — LoRA+ differential LR ratio (`loraplus_lr_ratio`) applied to `lora_b` parameters, NEFTune noise injection integrated into group construction
+- **GRPO trainer**: `epochs`, `lora_r`, `lora_alpha`, `max_completion_length`, and `seed` plumbed through from CLI args; previously these were hardcoded to `1`, `16`, `32`, `512`, and a fixed seed
+- **Training loop**: `loraplus_lr_ratio` and `neftune_noise_alpha` read from config and forwarded to optimizer group construction
+- **`pmetal-core` config / scheduler / traits**: Config structs gained `loraplus_lr_ratio` and `neftune_noise_alpha` fields; scheduler types and learning rate trait bounds refined; `TrainingCallback` trait extended with blanket impls for boxed callbacks
+- **Data pipeline**: Tokenizer, packing, `vocab_compact`, dataset, and chat template modules updated — minor correctness and efficiency fixes accumulated across the release cycle
+- **GGUF reader / writer / quantize**: Reader handles additional tensor metadata fields; writer improves alignment padding; quantize module uses `QuantizeMethod` enum instead of string matching
+- **Hub search**: `search_models` returns richer result structs used by both the human-readable table and the new `--json` output path; upload path fixes for large model shards
+- **Metal kernels**: GDN, LoRA, grouped GEMM, and fused SwiGLU Metal shaders updated — improved numerical correctness and register pressure
+- **GUI app icons and Tauri config**: Updated icons (32×32, 128×128, 128×128@2x, icns, ico) and `tauri.conf.json` for the 0.3.7 release build; Python vocoder `easy` API additions and mel spectrogram fix
+
 ## [0.3.6] - 2026-03-15
 
 ### Added
