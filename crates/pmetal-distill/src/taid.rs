@@ -451,10 +451,7 @@ impl TaidDistiller {
         //
         // This is numerically equivalent but avoids exp→add→log round-trips that
         // amplify floating-point error near the tails of the distribution.
-        let alpha_expanded = {
-            let a = alpha.reshape(&[alpha.dim(0), 1, 1])?;
-            a
-        };
+        let alpha_expanded = alpha.reshape(&[alpha.dim(0), 1, 1])?;
         let one_minus_alpha_expanded = Array::from_f32(1.0).subtract(&alpha_expanded)?;
 
         let log_teacher_scaled = log_softmax(&teacher_scaled, -1)?;
@@ -468,8 +465,7 @@ impl TaidDistiller {
             let b = student_log_probs.add(&log_b_coeff)?;
             // log_sum_exp(a, b) = max(a,b) + log(exp(a-max)+exp(b-max))
             let m = mlx_rs::ops::maximum(&a, &b)?;
-            let lse = m.add(&a.subtract(&m)?.exp()?.add(&b.subtract(&m)?.exp()?)?.log()?)?;
-            lse
+            m.add(&a.subtract(&m)?.exp()?.add(&b.subtract(&m)?.exp()?)?.log()?)?
         };
 
         // Compute distillation loss

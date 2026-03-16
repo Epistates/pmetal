@@ -383,7 +383,7 @@ impl GemmaAttention {
         //         all other layers use local sliding-window attention.
         let is_local_attention = if config.is_gemma3 {
             // Global when (layer_idx + 1) % 6 == 0, i.e. 5, 11, 17, ...
-            !((layer_idx + 1) % 6 == 0)
+            (layer_idx + 1) % 6 != 0
         } else {
             config.is_gemma2 && (layer_idx % 2 == 0)
         };
