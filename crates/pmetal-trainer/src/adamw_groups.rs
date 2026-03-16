@@ -35,12 +35,15 @@ use crate::ParameterGroupConfig;
 /// Parameter classification for routing to the correct optimizer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ParamClass {
-    /// Regular parameters (LoRA weights, projections) — full weight decay.
+    /// Regular parameters (LoRA A weights, projections) — full weight decay.
     Regular,
     /// Embedding parameters — separate learning rate, full weight decay.
     Embedding,
     /// No-decay parameters (bias, norm, scale) — zero weight decay.
     NoDecay,
+    /// LoRA B matrices — higher learning rate when LoRA+ is enabled (Hayou et al., ICML 2024).
+    /// Falls back to Regular when no loraplus_lr_ratio is configured.
+    LoraB,
 }
 
 /// AdamW optimizer with support for parameter groups.
@@ -49,10 +52,16 @@ enum ParamClass {
 /// pattern matching, allowing separate learning rates and weight decay for
 /// embeddings vs other parameters. Bias, norm, and scale parameters are
 /// automatically routed to a no-decay optimizer (weight_decay=0).
+///
+/// When `loraplus_lr_ratio` is configured (LoRA+, Hayou et al. ICML 2024),
+/// LoRA B matrices use `base_lr * ratio` while A matrices use `base_lr`.
 #[derive(Debug)]
 pub struct AdamWGroups {
-    /// Optimizer for LoRA and other non-embedding parameters.
+    /// Optimizer for LoRA A and other non-embedding parameters.
     lora_optimizer: AdamW,
+    /// Optimizer for LoRA B matrices when LoRA+ is enabled (`base_lr * ratio`).
+    /// When LoRA+ is disabled this is `None` and B matrices use `lora_optimizer`.
+    loraplus_b_optimizer: Option<AdamW>,
     /// Optimizer for embedding parameters (lower learning rate).
     embedding_optimizer: AdamW,
     /// Optimizer for bias/norm/scale parameters (zero weight decay).
@@ -102,6 +111,7 @@ impl AdamWGroups {
 
         Ok(Self {
             lora_optimizer,
+            loraplus_b_optimizer: None,
             embedding_optimizer,
             no_decay_optimizer,
             config,
@@ -109,31 +119,40 @@ impl AdamWGroups {
         })
     }
 
-    /// Classify a parameter by name into Regular, Embedding, or NoDecay.
+    /// Classify a parameter by name into Regular, LoraB, Embedding, or NoDecay.
     ///
-    /// No-decay check takes priority: bias/norm/scale parameters always get
-    /// zero weight decay regardless of whether they also match embedding patterns.
+    /// Priority order:
+    /// 1. NoDecay — bias/norm/scale always get zero weight decay.
+    /// 2. Embedding — embed_tokens, lm_head, etc. get the embedding learning rate.
+    /// 3. LoraB — "lora_b" parameters get the LoRA+ elevated learning rate (if configured).
+    /// 4. Regular — everything else (LoRA A, frozen weights, etc.) gets the base learning rate.
     fn classify_param(&mut self, name: &Rc<str>) -> ParamClass {
         // Check cache first
         if let Some(&class) = self.param_cache.get(name) {
             return class;
         }
 
-        // Classify: no-decay check first, then embedding check
+        let name_lower = name.to_lowercase();
+
         let class = if self.config.is_no_decay(name) {
+            // Bias, norm, and scale parameters — zero weight decay, base LR
             ParamClass::NoDecay
+        } else if self
+            .config
+            .embedding_patterns
+            .iter()
+            .any(|pattern| name_lower.contains(&pattern.to_lowercase()))
+        {
+            // Embedding / LM head parameters — embedding LR
+            ParamClass::Embedding
+        } else if self.loraplus_b_optimizer.is_some()
+            && (name_lower.contains("lora_b") || name_lower.contains("lorab"))
+        {
+            // LoRA B matrices — elevated LR when LoRA+ is configured
+            ParamClass::LoraB
         } else {
-            let name_lower = name.to_lowercase();
-            let is_embedding = self
-                .config
-                .embedding_patterns
-                .iter()
-                .any(|pattern| name_lower.contains(&pattern.to_lowercase()));
-            if is_embedding {
-                ParamClass::Embedding
-            } else {
-                ParamClass::Regular
-            }
+            // Regular parameters (LoRA A, projections, etc.)
+            ParamClass::Regular
         };
 
         self.param_cache.insert(name.clone(), class);
@@ -141,6 +160,8 @@ impl AdamWGroups {
     }
 
     /// Get the learning rates used by this optimizer.
+    ///
+    /// Returns `(base_lr, embedding_lr)`.
     pub fn learning_rates(&self) -> (f32, f32) {
         (
             self.lora_optimizer.lr.item(),
@@ -148,39 +169,45 @@ impl AdamWGroups {
         )
     }
 
-    /// Set the base learning rate, maintaining the embedding/base ratio.
+    /// Set the base learning rate, maintaining all group ratios proportionally.
     ///
     /// This is used by learning rate schedulers to dynamically adjust the
     /// learning rate during training (e.g., warmup, cosine decay).
     ///
-    /// # Arguments
-    ///
-    /// * `base_lr` - New base learning rate for non-embedding parameters
-    ///
-    /// The embedding learning rate is scaled proportionally to maintain the
-    /// original embedding/base ratio. For example, if embedding_lr was 5e-5
-    /// when base_lr was 2e-4 (ratio 0.25), setting base_lr to 1e-4 will set
-    /// embedding_lr to 2.5e-5.
+    /// All group LRs are scaled proportionally to maintain their original ratios
+    /// relative to the base LR:
+    /// - Embedding: `base_lr * (embedding_lr / original_base_lr)`
+    /// - LoRA B (LoRA+): `base_lr * loraplus_ratio`
+    /// - No-decay: `base_lr` (no ratio)
     pub fn set_learning_rate(&mut self, base_lr: f32) {
-        // Calculate the original ratio (embedding_lr / base_lr)
         let current_base: f32 = self.lora_optimizer.lr.item();
         let current_embedding: f32 = self.embedding_optimizer.lr.item();
 
-        // Maintain the ratio if there was a custom embedding LR, otherwise same as base
-        let ratio = if (current_base - current_embedding).abs() < 1e-10 {
-            1.0 // Same LR for both
+        // Maintain the embedding ratio relative to the base LR
+        let emb_ratio = if (current_base - current_embedding).abs() < 1e-10 {
+            1.0
         } else if current_base > 1e-10 {
             current_embedding / current_base
         } else {
-            1.0 // Fallback to same LR
+            1.0
         };
 
-        let new_embedding_lr = base_lr * ratio;
+        let new_embedding_lr = base_lr * emb_ratio;
 
-        // Update all three optimizers
         self.lora_optimizer.lr = array!(base_lr);
         self.embedding_optimizer.lr = array!(new_embedding_lr);
         self.no_decay_optimizer.lr = array!(base_lr);
+
+        // LoRA B optimizer maintains its ratio relative to the base LR
+        if let Some(ref mut b_opt) = self.loraplus_b_optimizer {
+            let current_b: f32 = b_opt.lr.item();
+            let b_ratio = if current_base > 1e-10 {
+                current_b / current_base
+            } else {
+                1.0
+            };
+            b_opt.lr = array!(base_lr * b_ratio);
+        }
     }
 
     /// Get summary of parameter grouping.
@@ -190,10 +217,21 @@ impl AdamWGroups {
         let emb_count = self.embedding_optimizer.state.len();
         let no_decay_count = self.no_decay_optimizer.state.len();
 
-        format!(
-            "AdamWGroups: {} regular params (lr={:.2e}), {} embedding params (lr={:.2e}), {} no-decay params (wd=0)",
-            lora_count, base_lr, emb_count, emb_lr, no_decay_count
-        )
+        if let Some(ref b_opt) = self.loraplus_b_optimizer {
+            let b_lr: f32 = b_opt.lr.item();
+            let b_count = b_opt.state.len();
+            format!(
+                "AdamWGroups(LoRA+): {} A params (lr={:.2e}), {} B params (lr={:.2e}), \
+                 {} embed params (lr={:.2e}), {} no-decay params (wd=0)",
+                lora_count, base_lr, b_count, b_lr, emb_count, emb_lr, no_decay_count
+            )
+        } else {
+            format!(
+                "AdamWGroups: {} regular params (lr={:.2e}), {} embedding params (lr={:.2e}), \
+                 {} no-decay params (wd=0)",
+                lora_count, base_lr, emb_count, emb_lr, no_decay_count
+            )
+        }
     }
 }
 
@@ -234,6 +272,16 @@ impl Optimizer for AdamWGroups {
             ParamClass::Embedding => self
                 .embedding_optimizer
                 .update_single(key, gradient, parameter),
+            ParamClass::LoraB => {
+                // When LoRA+ is active, route B matrices to the elevated-LR optimizer.
+                // If the optimizer is somehow None (shouldn't happen once wired), fall back
+                // to the regular optimizer so training never silently stalls.
+                if let Some(ref mut b_opt) = self.loraplus_b_optimizer {
+                    b_opt.update_single(key, gradient, parameter)
+                } else {
+                    self.lora_optimizer.update_single(key, gradient, parameter)
+                }
+            }
             ParamClass::Regular => self.lora_optimizer.update_single(key, gradient, parameter),
         }
     }
@@ -241,23 +289,45 @@ impl Optimizer for AdamWGroups {
 
 impl Updatable for AdamWGroups {
     fn updatable_states_len(&self) -> usize {
+        let b_len = self
+            .loraplus_b_optimizer
+            .as_ref()
+            .map(|o| o.updatable_states_len())
+            .unwrap_or(0);
         self.lora_optimizer.updatable_states_len()
+            + b_len
             + self.embedding_optimizer.updatable_states_len()
             + self.no_decay_optimizer.updatable_states_len()
     }
 
     fn updatable_states(&self) -> impl IntoIterator<Item = &Array> {
+        let b_states: Box<dyn Iterator<Item = &Array>> =
+            if let Some(ref b_opt) = self.loraplus_b_optimizer {
+                Box::new(b_opt.updatable_states().into_iter())
+            } else {
+                Box::new(std::iter::empty())
+            };
+
         self.lora_optimizer
             .updatable_states()
             .into_iter()
+            .chain(b_states)
             .chain(self.embedding_optimizer.updatable_states())
             .chain(self.no_decay_optimizer.updatable_states())
     }
 
     fn updatable_states_mut(&mut self) -> impl IntoIterator<Item = &mut Array> {
+        let b_states: Box<dyn Iterator<Item = &mut Array>> =
+            if let Some(ref mut b_opt) = self.loraplus_b_optimizer {
+                Box::new(b_opt.updatable_states_mut().into_iter())
+            } else {
+                Box::new(std::iter::empty())
+            };
+
         self.lora_optimizer
             .updatable_states_mut()
             .into_iter()
+            .chain(b_states)
             .chain(self.embedding_optimizer.updatable_states_mut())
             .chain(self.no_decay_optimizer.updatable_states_mut())
     }
@@ -272,6 +342,9 @@ pub struct AdamWGroupsBuilder {
     betas: (f32, f32),
     eps: f32,
     embedding_patterns: Vec<String>,
+    /// LoRA+ B matrix LR ratio (Hayou et al., ICML 2024).
+    /// When `Some(ratio)`, LoRA B matrices use `base_lr * ratio`.
+    loraplus_lr_ratio: Option<f32>,
 }
 
 impl AdamWGroupsBuilder {
@@ -291,6 +364,7 @@ impl AdamWGroupsBuilder {
                 "token_embd".to_string(),
                 "output".to_string(),
             ],
+            loraplus_lr_ratio: None,
         }
     }
 
@@ -326,6 +400,15 @@ impl AdamWGroupsBuilder {
         self
     }
 
+    /// Enable LoRA+ with the given B/A learning rate ratio.
+    ///
+    /// When enabled, LoRA B matrices use `base_lr * ratio` and A matrices use `base_lr`.
+    /// The paper recommends `ratio = 16.0`.
+    pub fn with_loraplus_lr_ratio(mut self, ratio: f32) -> Self {
+        self.loraplus_lr_ratio = Some(ratio);
+        self
+    }
+
     /// Build the optimizer.
     pub fn build(self) -> Result<AdamWGroups> {
         let embedding_lr = self.embedding_lr.unwrap_or(self.base_lr);
@@ -351,6 +434,26 @@ impl AdamWGroupsBuilder {
             .build()
             .map_err(|_| Exception::custom("Failed to build no-decay optimizer"))?;
 
+        // LoRA+ B matrix optimizer: base_lr * ratio
+        let loraplus_b_optimizer = if let Some(ratio) = self.loraplus_lr_ratio {
+            let b_lr = self.base_lr * ratio;
+            let opt = AdamWBuilder::new(b_lr)
+                .betas(self.betas)
+                .eps(self.eps)
+                .weight_decay(self.weight_decay)
+                .build()
+                .map_err(|_| Exception::custom("Failed to build LoRA+ B optimizer"))?;
+            tracing::info!(
+                "LoRA+ enabled: A matrices lr={:.2e}, B matrices lr={:.2e} (ratio={})",
+                self.base_lr,
+                b_lr,
+                ratio
+            );
+            Some(opt)
+        } else {
+            None
+        };
+
         let config = ParameterGroupConfig {
             base_lr: self.base_lr as f64,
             embedding_lr: if self.embedding_lr.is_some() {
@@ -365,6 +468,7 @@ impl AdamWGroupsBuilder {
 
         Ok(AdamWGroups {
             lora_optimizer,
+            loraplus_b_optimizer,
             embedding_optimizer,
             no_decay_optimizer,
             config,

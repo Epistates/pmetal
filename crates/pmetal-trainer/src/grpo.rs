@@ -191,6 +191,11 @@ pub struct GrpoTrainer {
     adaptive_lr_override: Option<f32>,
     /// Training callbacks for metrics/dashboard integration.
     callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>>,
+    /// In-memory snapshot of the best LoRA weights for rollback.
+    ///
+    /// LoRA parameters are typically a few MB so this is cheap to hold in memory.
+    /// Populated whenever `should_snapshot_best()` returns true; consumed on rollback.
+    best_lora_snapshot: Option<std::collections::HashMap<std::rc::Rc<str>, Array>>,
 }
 
 impl GrpoTrainer {
@@ -202,6 +207,7 @@ impl GrpoTrainer {
             adaptive_lr: None,
             adaptive_lr_override: None,
             callbacks: Vec::new(),
+            best_lora_snapshot: None,
         })
     }
 
@@ -229,17 +235,64 @@ impl GrpoTrainer {
         self.training_config.learning_rate as f32
     }
 
+    /// Take a snapshot of the model's LoRA weights as the current best.
+    ///
+    /// Called when the adaptive LR controller indicates the EMA loss has reached a new
+    /// minimum.  The snapshot is held in memory for fast rollback (LoRA params are small).
+    fn snapshot_best_weights<M: pmetal_lora::TrainableModel>(&mut self, model: &M) {
+        let params = model.lora_parameters();
+        tracing::debug!(
+            "GRPO snapshot: saved best LoRA weights at step {} ({} params, ~{:.1} MB)",
+            self.step,
+            params.len(),
+            params.values().map(|a| a.nbytes()).sum::<usize>() as f64 / 1_048_576.0,
+        );
+        self.best_lora_snapshot = Some(params);
+    }
+
+    /// Restore model weights from the best in-memory snapshot.
+    ///
+    /// Returns `true` if weights were successfully restored.
+    fn restore_best_weights<M: pmetal_lora::TrainableModel>(&mut self, model: &mut M) -> bool {
+        if let Some(ref snapshot) = self.best_lora_snapshot {
+            model.set_lora_parameters(snapshot);
+
+            if let Some(ref mut ctrl) = self.adaptive_lr {
+                ctrl.on_rollback_complete();
+            }
+
+            tracing::info!(
+                "GRPO rollback: restored best LoRA weights at step {}",
+                self.step
+            );
+            true
+        } else {
+            tracing::warn!("GRPO rollback requested but no best snapshot available");
+            false
+        }
+    }
+
     /// Feed loss to the adaptive LR controller and update the override.
     ///
-    /// Returns `true` if the controller signals early stop.
-    fn apply_adaptive_lr(&mut self, loss: f64) -> bool {
+    /// Returns an `AdaptiveAction` indicating how the training loop should proceed.
+    fn apply_adaptive_lr_action(&mut self, loss: f64) -> crate::training_loop::AdaptiveAction {
         let scheduled = self.training_config.learning_rate;
         let step = self.step;
         if let Some(ref mut ctrl) = self.adaptive_lr {
             let (adjusted, event) = ctrl.step(step, loss, scheduled);
             self.adaptive_lr_override = Some(adjusted as f32);
 
-            let early_stop = matches!(event, crate::adaptive_lr::LrEvent::EarlyStop { .. });
+            let action = match &event {
+                crate::adaptive_lr::LrEvent::RollbackTriggered { new_lr, .. } => {
+                    // Reduce the adaptive LR override to the rollback-reduced value
+                    self.adaptive_lr_override = Some(*new_lr as f32);
+                    crate::training_loop::AdaptiveAction::Rollback
+                }
+                crate::adaptive_lr::LrEvent::EarlyStop { .. } => {
+                    crate::training_loop::AdaptiveAction::EarlyStop
+                }
+                _ => crate::training_loop::AdaptiveAction::Continue,
+            };
 
             if !matches!(event, crate::adaptive_lr::LrEvent::Scheduled) {
                 for cb in &mut self.callbacks {
@@ -247,7 +300,18 @@ impl GrpoTrainer {
                 }
             }
 
-            early_stop
+            action
+        } else {
+            crate::training_loop::AdaptiveAction::Continue
+        }
+    }
+
+    /// Check if the adaptive LR controller recommends snapshotting the current weights.
+    /// Must call `ctrl.should_snapshot_best(step)` to update `best_ema_step` — without
+    /// this call, `best_ema_step` is never set and snapshots never trigger.
+    fn should_snapshot_best(&mut self) -> bool {
+        if let Some(ref mut ctrl) = self.adaptive_lr {
+            ctrl.should_snapshot_best(self.step)
         } else {
             false
         }
@@ -771,9 +835,33 @@ impl GrpoTrainer {
                 let stats =
                     self.train_step(policy_model, ref_model.as_deref_mut(), &[group], optimizer)?;
 
-                // Feed loss to adaptive LR controller for next step
-                let early_stop = self.apply_adaptive_lr(stats.loss as f64);
-                if early_stop {
+                // Feed loss to adaptive LR controller and handle the resulting action
+                let action = self.apply_adaptive_lr_action(stats.loss as f64);
+
+                // Snapshot best weights when loss reaches a new minimum
+                if action == crate::training_loop::AdaptiveAction::Continue
+                    && self.should_snapshot_best()
+                {
+                    self.snapshot_best_weights(policy_model);
+                }
+
+                // Rollback: restore best weights and reduce LR (already done in controller)
+                if action == crate::training_loop::AdaptiveAction::Rollback {
+                    self.restore_best_weights(policy_model);
+                    let rollback_lr = self
+                        .adaptive_lr_override
+                        .unwrap_or(self.training_config.learning_rate as f32);
+                    set_optimizer_lr(optimizer, rollback_lr);
+                    tracing::info!(
+                        "GRPO rollback at step {}: new lr={:.2e}",
+                        self.step,
+                        rollback_lr
+                    );
+                }
+
+                // Early stop: restore best weights and exit
+                if action == crate::training_loop::AdaptiveAction::EarlyStop {
+                    self.restore_best_weights(policy_model);
                     tracing::info!(
                         "Early stopping GRPO training — adaptive LR exhausted rollbacks."
                     );
