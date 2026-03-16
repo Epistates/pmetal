@@ -81,6 +81,8 @@ impl DistillationTrainer {
         // as a constant input (not the first argument to value_and_grad).
 
         // 2. Define Loss Function for Student
+        // Capture current step for progressive distillation scheduling.
+        let current_step = self.loop_state.step;
         let loss_fn = |student: &mut S,
                        (input_ids, labels, teacher_logits): (&Array, &Array, &Array)|
          -> std::result::Result<Array, Exception> {
@@ -97,9 +99,18 @@ impl DistillationTrainer {
                 None
             };
 
+            // Pass step=current_step and total_steps=0 (conservative default for progressive
+            // scheduling; non-progressive methods ignore these args).
             let output: DistillLossOutput = self
                 .distiller
-                .compute_loss(teacher_logits, &student_logits, labels_opt, None)
+                .compute_loss(
+                    teacher_logits,
+                    &student_logits,
+                    labels_opt,
+                    None,
+                    current_step,
+                    0,
+                )
                 .map_err(|e| Exception::custom(e.to_string()))?;
 
             Ok(output.total)
@@ -355,9 +366,10 @@ impl DistillationTrainer {
                 None
             };
 
+            // step=0, total_steps=1: eval does not use progressive scheduling.
             let output: DistillLossOutput = self
                 .distiller
-                .compute_loss(&teacher_logits, &student_logits, labels_opt, None)
+                .compute_loss(&teacher_logits, &student_logits, labels_opt, None, 0, 1)
                 .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
             total_loss += output.total.item::<f32>() as f64;

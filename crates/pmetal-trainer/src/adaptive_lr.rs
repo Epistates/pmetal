@@ -543,7 +543,12 @@ impl AdaptiveLrController {
 
             // 4c. Plateau detection (permanent reduction)
             if self.plateau_reductions < self.config.plateau_max_reductions {
-                if loss < self.best_loss - self.config.plateau_min_delta {
+                // Scale the minimum-improvement threshold relative to current loss
+                // magnitude so it stays meaningful across different loss regimes
+                // (e.g. 0.1 loss vs 2.0 loss). A fixed absolute delta of 1e-4 is
+                // invisible when loss is 2.0 but very large when loss is 0.05.
+                let relative_min_delta = self.config.plateau_min_delta * self.loss_ema.max(1.0);
+                if loss < self.best_loss - relative_min_delta {
                     self.best_loss = loss;
                     self.plateau_counter = 0;
                 } else {
