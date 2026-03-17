@@ -102,7 +102,7 @@ mod tests {
         result.eval().unwrap();
         let val: f32 = result.item();
         assert!(
-            val >= 0.0 && val <= 1.001,
+            (0.0..=1.001).contains(&val),
             "TVD must be in [0,1], got {val}"
         );
     }

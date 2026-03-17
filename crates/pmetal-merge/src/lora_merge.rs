@@ -1485,7 +1485,7 @@ mod tests {
 
     #[test]
     fn bytes_to_f64_roundtrip_f16() {
-        let vals = vec![1.0_f32, -2.0, 0.5, 3.0];
+        let vals = [1.0_f32, -2.0, 0.5, 3.0];
         let bytes: Vec<u8> = vals
             .iter()
             .flat_map(|&v| f16::from_f32(v).to_le_bytes())

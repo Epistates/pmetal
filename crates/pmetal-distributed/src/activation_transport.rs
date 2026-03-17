@@ -177,7 +177,7 @@ mod tests {
             layer_id: 15,
             shape: vec![1, 512, 4096],
             dtype: DtypeTag::Float16,
-            data: vec![0u8; 1 * 512 * 4096 * 2],
+            data: vec![0u8; 512 * 4096 * 2],
         };
 
         let bytes = msg.serialize();

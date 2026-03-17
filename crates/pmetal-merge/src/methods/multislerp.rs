@@ -292,7 +292,9 @@ mod tests {
         let params = vec![MergeParameters::default()];
         let global = MergeParameters::default();
 
-        let result = ms.merge(&[t.clone()], None, &params, &global).unwrap();
+        let result = ms
+            .merge(std::slice::from_ref(&t), None, &params, &global)
+            .unwrap();
         let r: Vec<f32> = result.as_slice().to_vec();
         let t_vals: Vec<f32> = t.as_slice().to_vec();
         for (rv, tv) in r.iter().zip(t_vals.iter()) {

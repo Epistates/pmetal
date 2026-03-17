@@ -72,9 +72,9 @@ impl RamVectors {
 
         // contrib_counts[p] = number of models with nonzero delta at p
         let mut contrib_counts = vec![0usize; n_params];
-        for m in 0..n_models {
+        for mask in nonzero_mask.iter().take(n_models) {
             for p in 0..n_params {
-                if nonzero_mask[m][p] {
+                if mask[p] {
                     contrib_counts[p] += 1;
                 }
             }
@@ -190,7 +190,7 @@ impl RamMerge {
         // Build merged task vector on CPU
         let mut merged = vec![0.0f32; n_params];
 
-        for p in 0..n_params {
+        for (p, merged_p) in merged.iter_mut().enumerate() {
             let cnt = vecs.contrib_counts[p];
             if cnt == 0 {
                 continue;
@@ -198,9 +198,13 @@ impl RamMerge {
 
             if cnt == 1 {
                 // Unique: exactly one model contributes — keep it with its lambda
-                for m in 0..n_models {
-                    if vecs.nonzero_mask[m][p] {
-                        merged[p] = vecs.tv_flat[m][p] * lambdas[m];
+                for (mask, (tv, &lam)) in vecs
+                    .nonzero_mask
+                    .iter()
+                    .zip(vecs.tv_flat.iter().zip(lambdas.iter()))
+                {
+                    if mask[p] {
+                        *merged_p = tv[p] * lam;
                         break;
                     }
                 }
@@ -208,13 +212,13 @@ impl RamMerge {
                 // Shared: average over all contributing models (no lambda in basic RAM)
                 let mut sum = 0.0f32;
                 let mut contributing = 0usize;
-                for m in 0..n_models {
-                    if vecs.nonzero_mask[m][p] {
-                        sum += vecs.tv_flat[m][p];
+                for (mask, tv) in vecs.nonzero_mask.iter().zip(vecs.tv_flat.iter()) {
+                    if mask[p] {
+                        sum += tv[p];
                         contributing += 1;
                     }
                 }
-                merged[p] = sum / contributing as f32;
+                *merged_p = sum / contributing as f32;
             }
         }
 
