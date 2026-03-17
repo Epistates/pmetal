@@ -345,29 +345,26 @@ fn accept_reject(verify_logits: &Array, draft_tokens: &[u32]) -> Result<Vec<u32>
 
     let mut accepted: Vec<u32> = Vec::with_capacity(n + 1);
 
-    for i in 0..=n {
+    // Verify each draft token against the verifier's argmax at that position.
+    for (i, &draft_tok) in draft_tokens.iter().enumerate() {
         let pos = (verify_start + i) as i32;
         let logit_row = verify_logits.index((0i32, pos, ..));
         logit_row.eval()?;
         let verifier_token = argmax_1d(&logit_row)?;
 
-        if i < n {
-            // Check whether the verifier agrees with the draft token at this pos.
-            if verifier_token == draft_tokens[i] {
-                // Accepted — continue to the next position.
-                // We will emit this token only if the *next* position also verifies
-                // or we run out of positions (emit the bonus token at the end).
-                accepted.push(verifier_token);
-            } else {
-                // Mismatch at position i: take the verifier's correction and stop.
-                accepted.push(verifier_token);
-                return Ok(accepted);
-            }
-        } else {
-            // Last position: bonus token from the verifier after all drafts.
-            accepted.push(verifier_token);
+        accepted.push(verifier_token);
+        if verifier_token != draft_tok {
+            // Mismatch: take the verifier's correction and stop.
+            return Ok(accepted);
         }
     }
+
+    // All draft tokens accepted — emit a bonus token from the verifier's
+    // prediction at the position after the last draft token.
+    let bonus_pos = (verify_start + n) as i32;
+    let bonus_row = verify_logits.index((0i32, bonus_pos, ..));
+    bonus_row.eval()?;
+    accepted.push(argmax_1d(&bonus_row)?);
 
     Ok(accepted)
 }

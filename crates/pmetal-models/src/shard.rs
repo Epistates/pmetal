@@ -141,6 +141,7 @@ pub fn assign_layers_proportional(num_layers: usize, available_ram: &[u64]) -> V
     let world_size = available_ram.len();
     assert!(world_size > 0 && num_layers > 0);
 
+    #[allow(clippy::single_range_in_vec_init)]
     if world_size == 1 {
         return vec![0..num_layers];
     }
