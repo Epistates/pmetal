@@ -2495,8 +2495,14 @@ async fn run_embed_train(
     tracing::info!("Loading dataset from '{}'", dataset_path);
     let dataset = EmbeddingDataset::from_jsonl(dataset_path)
         .map_err(|e| anyhow::anyhow!("Failed to load dataset: {}", e))?;
-    tracing::info!("Loaded {} examples ({:?})", dataset.len(),
-        match &dataset { EmbeddingDataset::Pairs(_) => "pairs", EmbeddingDataset::Triplets(_) => "triplets" });
+    tracing::info!(
+        "Loaded {} examples ({:?})",
+        dataset.len(),
+        match &dataset {
+            EmbeddingDataset::Pairs(_) => "pairs",
+            EmbeddingDataset::Triplets(_) => "triplets",
+        }
+    );
 
     // Build optimizer
     let optimizer = AdamWBuilder::new(learning_rate as f32)
@@ -2506,9 +2512,11 @@ async fn run_embed_train(
     let mut optimizer = optimizer;
 
     // Build trainer config
-    let mut training_cfg = pmetal_core::TrainingConfig::default();
-    training_cfg.batch_size = batch_size;
-    training_cfg.num_epochs = epochs;
+    let training_cfg = pmetal_core::TrainingConfig {
+        batch_size,
+        num_epochs: epochs,
+        ..Default::default()
+    };
 
     let config = EmbeddingTrainerConfig {
         training: training_cfg,
@@ -2548,8 +2556,8 @@ async fn run_embed_train(
 
     // Manual training loop using the encode_and_loss helpers exposed by the trainer
     // until BertForEmbedding implements TrainableModel.
+    use mlx_rs::{module::ModuleParameters, nn, transforms::eval_params};
     use pmetal_models::pooling::{normalize_embeddings, pool};
-    use mlx_rs::{nn, module::ModuleParameters, transforms::eval_params};
     use pmetal_trainer::contrastive_loss;
 
     let actual_batch_size = trainer.config.training.batch_size;
@@ -2571,7 +2579,7 @@ async fn run_embed_train(
                 let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(epoch as u64));
                 indices.shuffle(&mut rng);
 
-                let n_batches = (pairs.len() + actual_batch_size - 1) / actual_batch_size;
+                let n_batches = pairs.len().div_ceil(actual_batch_size);
                 for batch_idx in 0..n_batches {
                     let start = batch_idx * actual_batch_size;
                     let end = (start + actual_batch_size).min(pairs.len());
@@ -2585,12 +2593,20 @@ async fn run_embed_train(
                     let mut actual_max_a = 0usize;
                     let mut actual_max_b = 0usize;
                     for p in &batch {
-                        let a: Vec<i32> = tokenizer.encode(&p.text_a)
+                        let a: Vec<i32> = tokenizer
+                            .encode(&p.text_a)
                             .unwrap_or_default()
-                            .iter().take(max_len).map(|&x| x as i32).collect();
-                        let b: Vec<i32> = tokenizer.encode(&p.text_b)
+                            .iter()
+                            .take(max_len)
+                            .map(|&x| x as i32)
+                            .collect();
+                        let b: Vec<i32> = tokenizer
+                            .encode(&p.text_b)
                             .unwrap_or_default()
-                            .iter().take(max_len).map(|&x| x as i32).collect();
+                            .iter()
+                            .take(max_len)
+                            .map(|&x| x as i32)
+                            .collect();
                         actual_max_a = actual_max_a.max(a.len());
                         actual_max_b = actual_max_b.max(b.len());
                         ids_a_raw.push(a);
@@ -2611,11 +2627,14 @@ async fn run_embed_train(
                             mask_b[i * actual_max_b + j] = 1;
                         }
                     }
-                    let ids_a = mlx_rs::Array::from_slice(&flat_a, &[bs as i32, actual_max_a as i32]);
-                    let m_a   = mlx_rs::Array::from_slice(&mask_a, &[bs as i32, actual_max_a as i32]);
-                    let ids_b = mlx_rs::Array::from_slice(&flat_b, &[bs as i32, actual_max_b as i32]);
-                    let m_b   = mlx_rs::Array::from_slice(&mask_b, &[bs as i32, actual_max_b as i32]);
-                    let labels_data: Vec<f32> = batch.iter().map(|p| p.label.unwrap_or(1.0)).collect();
+                    let ids_a =
+                        mlx_rs::Array::from_slice(&flat_a, &[bs as i32, actual_max_a as i32]);
+                    let m_a = mlx_rs::Array::from_slice(&mask_a, &[bs as i32, actual_max_a as i32]);
+                    let ids_b =
+                        mlx_rs::Array::from_slice(&flat_b, &[bs as i32, actual_max_b as i32]);
+                    let m_b = mlx_rs::Array::from_slice(&mask_b, &[bs as i32, actual_max_b as i32]);
+                    let labels_data: Vec<f32> =
+                        batch.iter().map(|p| p.label.unwrap_or(1.0)).collect();
                     let labels = mlx_rs::Array::from_slice(&labels_data, &[bs as i32]);
 
                     let loss_fn = |m: &mut BertForEmbedding,
@@ -2642,7 +2661,8 @@ async fn run_embed_train(
                     let mut lag = nn::value_and_grad(loss_fn);
                     let (loss, grads) = lag(&mut model, (&ids_a, &m_a, &ids_b, &m_b, &labels))
                         .map_err(|e| anyhow::anyhow!("Forward/backward error: {}", e))?;
-                    optimizer.update(&mut model, grads)
+                    optimizer
+                        .update(&mut model, grads)
                         .map_err(|e| anyhow::anyhow!("Optimizer error: {}", e))?;
                     eval_params(model.trainable_parameters())
                         .map_err(|e| anyhow::anyhow!("Eval error: {}", e))?;
@@ -2650,7 +2670,13 @@ async fn run_embed_train(
                     step += 1;
                     if step % log_every == 0 {
                         let lv: f32 = loss.item();
-                        tracing::info!("step={} loss={:.4} epoch={}/{}", step, lv, epoch + 1, n_epochs);
+                        tracing::info!(
+                            "step={} loss={:.4} epoch={}/{}",
+                            step,
+                            lv,
+                            epoch + 1,
+                            n_epochs
+                        );
                     }
                 }
                 tracing::info!("Epoch {}/{} complete", epoch + 1, n_epochs);
@@ -2664,7 +2690,7 @@ async fn run_embed_train(
                 let mut rng = rand::rngs::StdRng::seed_from_u64(seed.wrapping_add(epoch as u64));
                 indices.shuffle(&mut rng);
 
-                let n_batches = (triplets.len() + actual_batch_size - 1) / actual_batch_size;
+                let n_batches = triplets.len().div_ceil(actual_batch_size);
                 for batch_idx in 0..n_batches {
                     let start = batch_idx * actual_batch_size;
                     let end = (start + actual_batch_size).min(triplets.len());
@@ -2677,8 +2703,13 @@ async fn run_embed_train(
                             let mut raw: Vec<Vec<i32>> = Vec::new();
                             let mut mlen = 0usize;
                             for t in $texts.iter() {
-                                let ids: Vec<i32> = tokenizer.encode(t).unwrap_or_default()
-                                    .iter().take(max_len).map(|&x| x as i32).collect();
+                                let ids: Vec<i32> = tokenizer
+                                    .encode(t)
+                                    .unwrap_or_default()
+                                    .iter()
+                                    .take(max_len)
+                                    .map(|&x| x as i32)
+                                    .collect();
                                 mlen = mlen.max(ids.len());
                                 raw.push(ids);
                             }
@@ -2691,8 +2722,10 @@ async fn run_embed_train(
                                     msk[i * mlen + j] = 1;
                                 }
                             }
-                            let ids_arr = mlx_rs::Array::from_slice(&flat, &[bs2 as i32, mlen as i32]);
-                            let msk_arr = mlx_rs::Array::from_slice(&msk, &[bs2 as i32, mlen as i32]);
+                            let ids_arr =
+                                mlx_rs::Array::from_slice(&flat, &[bs2 as i32, mlen as i32]);
+                            let msk_arr =
+                                mlx_rs::Array::from_slice(&msk, &[bs2 as i32, mlen as i32]);
                             (ids_arr, msk_arr)
                         }};
                     }
@@ -2722,7 +2755,8 @@ async fn run_embed_train(
                     let mut lag = nn::value_and_grad(loss_fn);
                     let (loss, grads) = lag(&mut model, (&ids_a, &m_a, &ids_p, &m_p, &ids_n, &m_n))
                         .map_err(|e| anyhow::anyhow!("Forward/backward error: {}", e))?;
-                    optimizer.update(&mut model, grads)
+                    optimizer
+                        .update(&mut model, grads)
                         .map_err(|e| anyhow::anyhow!("Optimizer error: {}", e))?;
                     eval_params(model.trainable_parameters())
                         .map_err(|e| anyhow::anyhow!("Eval error: {}", e))?;
@@ -2730,7 +2764,13 @@ async fn run_embed_train(
                     step += 1;
                     if step % log_every == 0 {
                         let lv: f32 = loss.item();
-                        tracing::info!("step={} loss={:.4} epoch={}/{}", step, lv, epoch + 1, n_epochs);
+                        tracing::info!(
+                            "step={} loss={:.4} epoch={}/{}",
+                            step,
+                            lv,
+                            epoch + 1,
+                            n_epochs
+                        );
                     }
                 }
                 tracing::info!("Epoch {}/{} complete", epoch + 1, n_epochs);
@@ -2744,18 +2784,27 @@ async fn run_embed_train(
         .map_err(|e| anyhow::anyhow!("Failed to create output dir: {}", e))?;
     let output_path = std::path::Path::new(output_dir).join("model.safetensors");
     use mlx_rs::module::ModuleParametersExt;
-    model.save_safetensors(&output_path)
+    model
+        .save_safetensors(&output_path)
         .map_err(|e| anyhow::anyhow!("Failed to save weights: {}", e))?;
 
     // Copy config.json and tokenizer files so the output is a complete model directory
-    for file in &["config.json", "tokenizer.json", "tokenizer_config.json", "special_tokens_map.json"] {
+    for file in &[
+        "config.json",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "special_tokens_map.json",
+    ] {
         let src = std::path::Path::new(model_path).join(file);
         if src.exists() {
             std::fs::copy(&src, std::path::Path::new(output_dir).join(file)).ok();
         }
     }
 
-    tracing::info!("Embedding training complete. Model saved to '{}'", output_dir);
+    tracing::info!(
+        "Embedding training complete. Model saved to '{}'",
+        output_dir
+    );
     Ok(())
 }
 
@@ -3094,7 +3143,10 @@ async fn run_quantization(
     let calibration_map: CalibrationMap;
 
     if kl_calibrate {
-        println!("Running KL calibration pass over {} tensors...", weights.len());
+        println!(
+            "Running KL calibration pass over {} tensors...",
+            weights.len()
+        );
 
         // Materialise all float tensors.
         let mut tensor_data: Vec<(String, Vec<f32>, Vec<i32>)> = Vec::new();
@@ -3113,9 +3165,9 @@ async fn run_quantization(
             let data_f32: Vec<f32> = match tensor.dtype() {
                 pmetal_mlx::Dtype::Float32 => tensor.as_slice::<f32>().to_vec(),
                 pmetal_mlx::Dtype::Float16 | pmetal_mlx::Dtype::Bfloat16 => {
-                    let t_f32 = tensor
-                        .as_dtype(pmetal_mlx::Dtype::Float32)
-                        .map_err(|e| anyhow::anyhow!("Dtype conversion error for {}: {}", name, e))?;
+                    let t_f32 = tensor.as_dtype(pmetal_mlx::Dtype::Float32).map_err(|e| {
+                        anyhow::anyhow!("Dtype conversion error for {}: {}", name, e)
+                    })?;
                     t_f32
                         .eval()
                         .map_err(|e| anyhow::anyhow!("MLX eval error for {}: {}", name, e))?;
@@ -3717,6 +3769,8 @@ async fn run_distillation_cli(
         loraplus_lr_ratio: None,
         neftune_noise_alpha: None,
         use_cut_cross_entropy: false,
+        #[cfg(feature = "distributed")]
+        distributed: None,
     };
 
     let mut trainer = DistillationTrainer::new(distiller, training_loop_config);
@@ -4039,9 +4093,7 @@ async fn run_grpo_cli(
 
         // Resolve the reward model path — download from HF if it looks like a
         // model ID and doesn't exist locally.
-        let rm_path = if rm_path_str.contains('/')
-            && !std::path::Path::new(rm_path_str).exists()
-        {
+        let rm_path = if rm_path_str.contains('/') && !std::path::Path::new(rm_path_str).exists() {
             pmetal_hub::download_model(rm_path_str, None, None).await?
         } else {
             std::path::PathBuf::from(rm_path_str)
@@ -4058,13 +4110,12 @@ async fn run_grpo_cli(
             ..Default::default()
         };
 
-        let ml_reward =
-            pmetal_trainer::reward_model::MLRewardModel::from_pretrained(
-                &rm_path,
-                rm_tokenizer,
-                rm_config,
-            )
-            .map_err(|e| anyhow::anyhow!("Failed to load ML reward model: {}", e))?;
+        let ml_reward = pmetal_trainer::reward_model::MLRewardModel::from_pretrained(
+            &rm_path,
+            rm_tokenizer,
+            rm_config,
+        )
+        .map_err(|e| anyhow::anyhow!("Failed to load ML reward model: {}", e))?;
 
         rewards = rewards.add(Box::new(ml_reward), reward_model_weight);
 
@@ -4108,6 +4159,8 @@ async fn run_grpo_cli(
         loraplus_lr_ratio: None,
         neftune_noise_alpha: None,
         use_cut_cross_entropy: false,
+        #[cfg(feature = "distributed")]
+        distributed: None,
     };
 
     let mut trainer = GrpoTrainer::new(grpo_config, training_config)?;
@@ -4154,9 +4207,7 @@ async fn run_grpo_cli(
         // Pipelined path: reward scoring runs in a background thread so the GPU
         // training step can overlap with the next sample's reward computation.
         if emit_console_output {
-            println!(
-                "Async rewards enabled — reward scoring will pipeline with GPU training."
-            );
+            println!("Async rewards enabled — reward scoring will pipeline with GPU training.");
         }
         trainer
             .run_async(
@@ -4246,7 +4297,10 @@ async fn run_rlkd_cli(
         println!("Teacher model: {}", teacher_model_id);
         println!("Dataset:       {}", dataset_path);
         println!("Output:        {}", output_dir);
-        println!("Alpha:         {:.2} → {:.2} (anneal={})", distill_alpha, final_alpha, anneal_alpha);
+        println!(
+            "Alpha:         {:.2} → {:.2} (anneal={})",
+            distill_alpha, final_alpha, anneal_alpha
+        );
         println!("Temperature:   {:.1}", distill_temperature);
         println!("Generations:   {}", num_generations);
         println!("Beta:          {}", beta);
@@ -4432,11 +4486,10 @@ async fn run_rlkd_cli(
 
     if let Some(ref metrics_path) = _log_metrics {
         let path = PathBuf::from(output_dir).join(metrics_path);
-        let callback = pmetal_trainer::MetricsJsonCallback::new(&path)?
-            .with_run_name(format!(
-                "rlkd-{}",
-                model_id.split('/').next_back().unwrap_or(model_id)
-            ));
+        let callback = pmetal_trainer::MetricsJsonCallback::new(&path)?.with_run_name(format!(
+            "rlkd-{}",
+            model_id.split('/').next_back().unwrap_or(model_id)
+        ));
         trainer.add_callback(Box::new(callback));
     }
     for callback in extra_callbacks {
@@ -5109,14 +5162,21 @@ async fn run_training(
             }
         }
 
+        // Set up distributed gradient sync if configured (before creating training
+        // loop — the async .await is not Send-compatible with TrainingLoop's Rc fields)
+        #[cfg(feature = "distributed")]
+        let distributed_sync = if let Some(ref dist_cfg) = distributed_config {
+            let ctx = pmetal_trainer::create_distributed_context(dist_cfg).await?;
+            Some(pmetal_trainer::DistributedGradientSync::new(ctx, dist_cfg))
+        } else {
+            None
+        };
+
         // Create training loop
         let mut training_loop = TrainingLoop::new(training_loop_config);
 
-        // Set up distributed gradient sync if configured
         #[cfg(feature = "distributed")]
-        if let Some(ref dist_cfg) = distributed_config {
-            let ctx = pmetal_trainer::create_distributed_context(dist_cfg).await?;
-            let sync = pmetal_trainer::DistributedGradientSync::new(ctx, dist_cfg);
+        if let Some(sync) = distributed_sync {
             training_loop.set_distributed(sync);
         }
 
@@ -5246,14 +5306,21 @@ async fn run_training(
             }
         }
 
+        // Set up distributed gradient sync if configured (before creating training
+        // loop — the async .await is not Send-compatible with TrainingLoop's Rc fields)
+        #[cfg(feature = "distributed")]
+        let distributed_sync = if let Some(ref dist_cfg) = distributed_config {
+            let ctx = pmetal_trainer::create_distributed_context(dist_cfg).await?;
+            Some(pmetal_trainer::DistributedGradientSync::new(ctx, dist_cfg))
+        } else {
+            None
+        };
+
         // Create training loop
         let mut training_loop = TrainingLoop::new(training_loop_config);
 
-        // Set up distributed gradient sync if configured
         #[cfg(feature = "distributed")]
-        if let Some(ref dist_cfg) = distributed_config {
-            let ctx = pmetal_trainer::create_distributed_context(dist_cfg).await?;
-            let sync = pmetal_trainer::DistributedGradientSync::new(ctx, dist_cfg);
+        if let Some(sync) = distributed_sync {
             training_loop.set_distributed(sync);
         }
 
@@ -10032,10 +10099,6 @@ async fn run_serve(
         PathBuf::from(&model_id)
     };
 
-    // Load model config
-    let config_text = std::fs::read_to_string(model_path.join("config.json"))?;
-    let config_json: serde_json::Value = serde_json::from_str(&config_text)?;
-
     // Load tokenizer
     tracing::info!("Loading tokenizer...");
     let tokenizer = tokenizers::Tokenizer::from_file(model_path.join("tokenizer.json"))
@@ -10043,13 +10106,18 @@ async fn run_serve(
 
     // Load model
     tracing::info!("Loading model from {:?}...", model_path);
-    let mut model = DynamicModel::from_config(&config_json, &model_path)?;
+    let model = DynamicModel::load(&model_path)?;
 
     // Apply LoRA adapter if specified
-    if let Some(ref lora) = lora_path {
-        let lora_dir = PathBuf::from(lora);
-        tracing::info!("Applying LoRA adapter from {:?}", lora_dir);
-        model.load_lora_adapter(&lora_dir)?;
+    if let Some(ref _lora) = lora_path {
+        // TODO: DynamicModel does not yet support runtime LoRA application.
+        // For now, merge the adapter into the base model first:
+        //   pmetal merge --base <model> --lora <adapter> --output <merged>
+        anyhow::bail!(
+            "Serving with a LoRA adapter requires pre-merging. \
+             Use `pmetal merge --base <model> --lora <adapter> --output <merged>` \
+             then serve the merged model."
+        );
     }
 
     tracing::info!("Model loaded successfully");

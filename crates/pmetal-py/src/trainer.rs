@@ -277,6 +277,7 @@ impl PyTrainer {
                         loraplus_lr_ratio: None,
                         neftune_noise_alpha: None,
                         use_cut_cross_entropy: false,
+                        ..Default::default()
                     };
 
                     let mut training_loop = pmetal_trainer::TrainingLoop::new(loop_config);
