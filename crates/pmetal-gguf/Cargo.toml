@@ -15,6 +15,7 @@ byteorder = "1.5"
 half = { workspace = true }
 zerocopy = { workspace = true }
 thiserror = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

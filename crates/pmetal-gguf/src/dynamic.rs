@@ -439,8 +439,12 @@ impl DynamicQuantizer {
 
         // Determine the sample window for the quality metric.
         let sample: &[f32] = if kl_config.sample_size > 0 && data.len() > kl_config.sample_size {
-            // Take a prefix of evenly-distributed elements.  A simple prefix is
-            // sufficient because weight magnitude is roughly i.i.d. across rows.
+            // Take a prefix of the weight elements for speed.
+            // WARNING: This assumes weight values are roughly i.i.d. across the flattened
+            // tensor — true for many weight matrices but not guaranteed for structured
+            // weights (e.g. rotary-position biases, depthwise convolution kernels).
+            // If you observe poor calibration quality on such tensors, set
+            // `sample_size = 0` to evaluate the full tensor instead.
             &data[..kl_config.sample_size]
         } else {
             data
@@ -655,6 +659,18 @@ impl DynamicQuantizer {
             if compute_avg_bpw(map) <= target_bpw {
                 break;
             }
+        }
+
+        // Verify the budget was achieved.  When all non-critical tensors are already at
+        // the lowest-quality candidate the loop exits without meeting the target.
+        let final_bpw = compute_avg_bpw(map);
+        if final_bpw > target_bpw {
+            tracing::warn!(
+                "BPW budget not met: target={:.2}, achieved={:.2}. \
+                 All tensors are already at minimum quality.",
+                target_bpw,
+                final_bpw,
+            );
         }
     }
 
