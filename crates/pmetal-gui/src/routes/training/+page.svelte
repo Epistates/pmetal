@@ -1054,6 +1054,31 @@
                 >
                   Stop Training
                 </button>
+              {:else if selectedRun.config_summary}
+                <button
+                  class="btn-primary btn-sm w-full"
+                  onclick={() => {
+                    const r = selectedRun!;
+                    const c = r.config_summary!;
+                    // Load config back into form
+                    selectedModel = r.model;
+                    selectedMethod = r.method;
+                    if (r.dataset) datasetPath = r.dataset;
+                    learningRate = c.learning_rate;
+                    batchSize = c.batch_size;
+                    maxSeqLen = c.max_seq_len;
+                    if (c.lora_rank) { loraRank = c.lora_rank; loraAlpha = c.lora_alpha ?? 32; }
+                    sequencePacking = c.sequence_packing;
+                    flashAttention = c.flash_attention;
+                    jitCompilation = c.jit_compilation;
+                    gradientCheckpointing = c.gradient_checkpointing;
+                    // Clear selection to show the form
+                    selectedRunId = null;
+                  }}
+                  aria-label="Load this run's settings into the form"
+                >
+                  Retry with these settings
+                </button>
               {/if}
             </div>
           </div>
