@@ -407,6 +407,7 @@ impl FinetuneBuilder {
             use_metal_fused_optimizer: self.metal_fused_optimizer,
             loraplus_lr_ratio: None,
             neftune_noise_alpha: None,
+            use_cut_cross_entropy: false,
         };
 
         let mut training_loop = TrainingLoop::new(training_loop_config);

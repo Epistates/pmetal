@@ -4709,6 +4709,7 @@ dependencies = [
  "proptest",
  "tempfile",
  "thiserror 2.0.18",
+ "tracing",
  "zerocopy",
 ]
 
@@ -4955,6 +4956,7 @@ name = "pmetal-trainer"
 version = "0.3.8"
 dependencies = [
  "chrono",
+ "image 0.25.10",
  "indicatif",
  "pmetal-core",
  "pmetal-data",

@@ -7,30 +7,32 @@
 //!
 //! ```toml
 //! [dependencies]
-//! pmetal = "0.1"           # default features: core, gguf, metal, hub, mlx, models, lora, trainer
-//! pmetal = { version = "0.1", features = ["full"] }  # everything
+//! pmetal = "0.3"           # default features: core, gguf, metal, hub, mlx, models, lora, trainer, easy, ane
+//! pmetal = { version = "0.3", features = ["full"] }  # everything
 //! ```
 //!
 //! ## Feature Flags
 //!
-//! | Feature | Crate | Default |
-//! |---------|-------|---------|
-//! | `core` | [`pmetal-core`] | yes |
-//! | `gguf` | [`pmetal-gguf`] | yes |
-//! | `metal` | [`pmetal-metal`] | yes |
-//! | `hub` | [`pmetal-hub`] | yes |
-//! | `mlx` | [`pmetal-mlx`] | yes |
-//! | `models` | [`pmetal-models`] | yes |
-//! | `lora` | [`pmetal-lora`] | yes |
-//! | `trainer` | [`pmetal-trainer`] | yes |
-//! | `data` | [`pmetal-data`] | no |
-//! | `distill` | [`pmetal-distill`] | no |
-//! | `merge` | [`pmetal-merge`] | no |
-//! | `vocoder` | [`pmetal-vocoder`] | no |
-//! | `distributed` | [`pmetal-distributed`] | no |
-//! | `mhc` | [`pmetal-mhc`] | no |
-//! | `easy` | all training/inference crates | yes |
-//! | `full` | all of the above | no |
+//! | Feature | Crate | Default | Notes |
+//! |---------|-------|---------|-------|
+//! | `core` | [`pmetal-core`] | yes | Foundation types, configs, traits |
+//! | `gguf` | [`pmetal-gguf`] | yes | GGUF format support |
+//! | `metal` | [`pmetal-metal`] | yes | Metal GPU kernels |
+//! | `hub` | [`pmetal-hub`] | yes | HuggingFace Hub integration |
+//! | `mlx` | [`pmetal-mlx`] | yes | MLX backend |
+//! | `models` | [`pmetal-models`] | yes | LLM architectures |
+//! | `lora` | [`pmetal-lora`] | yes | LoRA/QLoRA training |
+//! | `trainer` | [`pmetal-trainer`] | yes | Training loops (enables `data` + `distill`) |
+//! | `easy` | (multiple) | yes | High-level builders (enables `trainer` + `hub` + `data`) |
+//! | `ane` | [`pmetal-metal`] | yes | Apple Neural Engine integration |
+//! | `data` | [`pmetal-data`] | yes* | Dataset loading (*enabled transitively via `easy`) |
+//! | `distill` | [`pmetal-distill`] | yes* | Knowledge distillation (*enabled transitively via `trainer`) |
+//! | `lora-metal-fused` | [`pmetal-lora`] | no | ~2x LoRA training speedup via fused Metal kernels |
+//! | `merge` | [`pmetal-merge`] | no | Model merging strategies |
+//! | `vocoder` | [`pmetal-vocoder`] | no | BigVGAN neural vocoder |
+//! | `distributed` | [`pmetal-distributed`] | no | Distributed training |
+//! | `mhc` | [`pmetal-mhc`] | no | Manifold-Constrained Hyper-Connections |
+//! | `full` | (all) | no | All features |
 //!
 //! ## Easy API
 //!

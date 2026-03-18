@@ -581,7 +581,10 @@ impl RlkdTrainer {
 
         let total_loss = total_loss_arr.item::<f32>();
 
-        // Approximate decomposed statistics (no second forward needed)
+        // NOTE: These are proportional approximations, not actual component values.
+        // Actual decomposition would require separate forward passes or returning
+        // both losses from the closure.  For monitoring, the total_loss and alpha
+        // are the authoritative metrics.
         let grpo_component = total_loss * (1.0 - alpha);
         let distill_component = total_loss * alpha;
 
