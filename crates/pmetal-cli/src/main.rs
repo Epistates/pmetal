@@ -4383,7 +4383,11 @@ async fn run_grpo_cli(
     // Wire metrics callback if --log-metrics was provided
     if let Some(ref metrics_path) = _log_metrics {
         use pmetal_trainer::callbacks::MetricsJsonCallback;
-        let path = PathBuf::from(output_dir).join(metrics_path);
+        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
+            PathBuf::from(metrics_path)
+        } else {
+            PathBuf::from(output_dir).join(metrics_path)
+        };
         let callback = MetricsJsonCallback::new(&path)?.with_run_name(format!(
             "grpo-{}",
             model_id.split('/').next_back().unwrap_or(model_id)
@@ -4728,7 +4732,11 @@ async fn run_rlkd_cli(
     let mut trainer = RlkdTrainer::new(rlkd_config)?;
 
     if let Some(ref metrics_path) = _log_metrics {
-        let path = PathBuf::from(output_dir).join(metrics_path);
+        let path = if metrics_path.contains('/') || metrics_path.contains('\\') {
+            PathBuf::from(metrics_path)
+        } else {
+            PathBuf::from(output_dir).join(metrics_path)
+        };
         let callback = pmetal_trainer::MetricsJsonCallback::new(&path)?.with_run_name(format!(
             "rlkd-{}",
             model_id.split('/').next_back().unwrap_or(model_id)

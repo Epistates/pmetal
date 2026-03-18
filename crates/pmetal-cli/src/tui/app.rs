@@ -973,6 +973,7 @@ impl App {
                     self.active_training_job = None;
                     self.active_job_type = None;
                     self.active_training_output_dir = None;
+                    self.dashboard.job_phase = None;
                 }
                 if self.active_inference_job.as_deref() == Some(&job_id) {
                     self.active_inference_job = None;
@@ -1295,7 +1296,11 @@ impl App {
 
         match self.active_tab {
             Tab::Dashboard => {
-                self.dashboard.poll_metrics();
+                // Only poll the file directly when no active job is pushing
+                // metrics via AppMsg::JobMetrics (avoids duplicate samples).
+                if self.active_training_job.is_none() {
+                    self.dashboard.poll_metrics();
+                }
             }
             Tab::Device => {
                 // Refresh memory every 5 ticks (1 second)
