@@ -391,6 +391,7 @@ impl FinetuneBuilder {
             ..Default::default()
         };
 
+        #[allow(clippy::needless_update)] // ..Default covers cfg-gated fields (e.g. distributed)
         let training_loop_config = TrainingLoopConfig {
             training: training_config,
             dataloader: dataloader_config,

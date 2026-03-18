@@ -260,6 +260,7 @@ impl PyTrainer {
                         ..Default::default()
                     };
 
+                    #[allow(clippy::needless_update)]
                     let loop_config = pmetal_trainer::TrainingLoopConfig {
                         training: training_config.clone(),
                         dataloader: dataloader_config,

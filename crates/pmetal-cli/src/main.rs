@@ -3737,6 +3737,7 @@ async fn run_distillation_cli(
     let distiller = Distiller::new(distill_config)?;
 
     // 7. Setup Trainer
+    #[allow(clippy::needless_update)] // ..Default covers cfg-gated fields (distributed)
     let training_loop_config = TrainingLoopConfig {
         training: pmetal_core::TrainingConfig {
             learning_rate: learning_rate as f64,
@@ -4133,6 +4134,7 @@ async fn run_grpo_cli(
         ..Default::default()
     };
 
+    #[allow(clippy::needless_update)] // ..Default covers cfg-gated fields (distributed)
     let _training_loop_config = TrainingLoopConfig {
         training: training_config.clone(),
         dataloader: DataLoaderConfig {
