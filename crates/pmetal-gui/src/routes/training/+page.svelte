@@ -10,6 +10,12 @@
   let datasetColumns = $state<string[]>([]);
   let columnsLoading = $state(false);
   let lastPeekedPath = $state('');
+  let datasetAvgTokens = $state(0);
+  let datasetMaxTokens = $state(0);
+  let datasetSuggestedSeqLen = $state(0);
+  let datasetRowsSampled = $state(0);
+  let datasetFullScan = $state(false);
+  let scanningAll = $state(false);
 
   // Training methods
   const trainingMethods = [
@@ -120,11 +126,16 @@
     lastPeekedPath = path;
     columnsLoading = true;
     peekDatasetColumns(path)
-      .then(cols => {
-        datasetColumns = cols;
+      .then(peek => {
+        datasetColumns = peek.columns;
+        datasetAvgTokens = peek.avg_tokens_estimate;
+        datasetMaxTokens = peek.max_tokens_estimate;
+        datasetSuggestedSeqLen = peek.suggested_seq_len;
+        datasetRowsSampled = peek.rows_sampled;
+        datasetFullScan = false;
         selectedTextColumns = [];
-        columnToAdd = '';
         // Auto-select: prefer 'text', else first column
+        const cols = peek.columns;
         if (cols.length > 0) {
           if (cols.includes('text')) {
             selectedTextColumns = ['text'];
@@ -138,7 +149,7 @@
         }
         textColumn = selectedTextColumns[0] ?? 'text';
       })
-      .catch(() => { datasetColumns = []; lastPeekedPath = ''; })
+      .catch(() => { datasetColumns = []; lastPeekedPath = ''; datasetSuggestedSeqLen = 0; })
       .finally(() => { columnsLoading = false; });
   });
 
@@ -582,31 +593,27 @@
                       {/each}
                     </div>
                   {/if}
-                  <!-- Add column selector -->
-                  <div class="flex gap-2">
+                  <!-- Add column selector (adds on select) -->
+                  {#if datasetColumns.filter(c => !selectedTextColumns.includes(c)).length > 0}
                     <select
                       id="add-column"
-                      class="input text-sm flex-1"
-                      bind:value={columnToAdd}
+                      class="input text-sm"
+                      value=""
+                      onchange={(e) => {
+                        const val = (e.target as HTMLSelectElement).value;
+                        if (val && !selectedTextColumns.includes(val)) {
+                          selectedTextColumns = [...selectedTextColumns, val];
+                          textColumn = selectedTextColumns[0];
+                        }
+                        (e.target as HTMLSelectElement).value = '';
+                      }}
                     >
                       <option value="">Add a column...</option>
                       {#each datasetColumns.filter(c => !selectedTextColumns.includes(c)) as col}
                         <option value={col}>{col}</option>
                       {/each}
                     </select>
-                    <button
-                      type="button"
-                      class="btn-primary btn-sm"
-                      disabled={!columnToAdd}
-                      onclick={() => {
-                        if (columnToAdd && !selectedTextColumns.includes(columnToAdd)) {
-                          selectedTextColumns = [...selectedTextColumns, columnToAdd];
-                          textColumn = selectedTextColumns[0];
-                          columnToAdd = '';
-                        }
-                      }}
-                    >Add</button>
-                  </div>
+                  {/if}
                 </div>
 
                 <div class="grid grid-cols-2 gap-3">
@@ -717,6 +724,45 @@
               <div>
                 <label class="label" for="max-seq-len">Max Seq Length</label>
                 <input id="max-seq-len" type="number" class="input" step="64" bind:value={maxSeqLen} />
+                {#if datasetSuggestedSeqLen > 0}
+                  {#if maxSeqLen < datasetAvgTokens}
+                    <p class="text-xs text-red-500 mt-1">
+                      Most samples will be truncated (avg ~{datasetAvgTokens} tokens, max ~{datasetMaxTokens}). Suggest {datasetSuggestedSeqLen}.
+                    </p>
+                  {:else if maxSeqLen < datasetSuggestedSeqLen && datasetMaxTokens > maxSeqLen}
+                    <p class="text-xs text-amber-500 mt-1">
+                      Some samples may be truncated (max ~{datasetMaxTokens} tokens). Suggest {datasetSuggestedSeqLen}.
+                    </p>
+                  {:else if maxSeqLen > datasetMaxTokens * 2 && datasetMaxTokens > 0}
+                    <p class="text-xs text-blue-500 mt-1">
+                      Seq len is much larger than data (max ~{datasetMaxTokens} tokens). Could reduce to {datasetSuggestedSeqLen}.
+                    </p>
+                  {/if}
+                  <p class="text-xs text-surface-400 mt-0.5">
+                    {#if scanningAll}
+                      Scanning full dataset...
+                    {:else}
+                      Based on first {datasetRowsSampled} rows{#if !datasetFullScan}
+                        — <button
+                          type="button"
+                          class="text-primary-500 hover:text-primary-400 underline"
+                          onclick={async () => {
+                            scanningAll = true;
+                            try {
+                              const peek = await peekDatasetColumns(datasetPath, 0);
+                              datasetAvgTokens = peek.avg_tokens_estimate;
+                              datasetMaxTokens = peek.max_tokens_estimate;
+                              datasetSuggestedSeqLen = peek.suggested_seq_len;
+                              datasetRowsSampled = peek.rows_sampled;
+                              datasetFullScan = true;
+                            } catch { /* ignore */ }
+                            scanningAll = false;
+                          }}
+                        >check all rows</button>
+                      {/if}
+                    {/if}
+                  </p>
+                {/if}
               </div>
               <div>
                 <label class="label" for="lr-scheduler">LR Scheduler</label>

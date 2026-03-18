@@ -690,18 +690,79 @@ pub async fn list_cached_datasets(
 
 /// Peek at the first JSONL record in a file and return the available field names.
 ///
-/// The frontend calls this when the dataset path changes to populate the
-/// column-picker dropdowns for `text_column`, `prompt_column`, and
-/// `response_column`.
+/// Peek at a dataset file: returns column names and rough length statistics
+/// (sampled from the first 100 records) so the frontend can show seq len warnings.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DatasetPeek {
+    pub columns: Vec<String>,
+    /// Estimated average token count (chars / 4 heuristic, sampled from first 100 rows).
+    pub avg_tokens_estimate: usize,
+    /// Estimated max token count in the sample.
+    pub max_tokens_estimate: usize,
+    /// Suggested max_seq_len (next power of two covering the p95 estimate).
+    pub suggested_seq_len: usize,
+    /// Number of rows sampled.
+    pub rows_sampled: usize,
+}
+
 #[tauri::command]
-pub async fn peek_dataset_columns(path: String) -> Result<Vec<String>> {
+pub async fn peek_dataset_columns(path: String, limit: Option<usize>) -> Result<DatasetPeek> {
+    use std::io::{BufRead, BufReader};
+    let sample_limit = limit.unwrap_or(100);
+
     let p = std::path::PathBuf::from(&path);
-    // Resolve directories (handles HF cache layout) before peeking.
     let resolved = pmetal::data::TrainingDataset::resolve_dataset_path_pub(&p)
         .unwrap_or(p);
-    let cols = pmetal::data::peek_columns(&resolved)
+
+    let columns = pmetal::data::peek_columns(&resolved)
         .map_err(|e| AppError(e.to_string()))?;
-    Ok(cols)
+
+    // Sample first 100 rows for length estimates
+    let mut char_lengths: Vec<usize> = Vec::new();
+    if let Ok(file) = std::fs::File::open(&resolved) {
+        let reader = BufReader::new(file);
+        let iter: Box<dyn Iterator<Item = _>> = if sample_limit > 0 {
+            Box::new(reader.lines().take(sample_limit))
+        } else {
+            Box::new(reader.lines()) // scan all
+        };
+        for line in iter {
+            if let Ok(line) = line {
+                let trimmed = line.trim();
+                if trimmed.is_empty() { continue; }
+                // Sum all string-valued fields as a rough content length
+                if let Ok(obj) = serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(trimmed) {
+                    let total_chars: usize = obj.values()
+                        .filter_map(|v| v.as_str())
+                        .map(|s| s.len())
+                        .sum();
+                    char_lengths.push(total_chars);
+                }
+            }
+        }
+    }
+
+    let rows_sampled = char_lengths.len();
+    // Rough estimate: 1 token ≈ 4 characters for English text
+    let token_estimates: Vec<usize> = char_lengths.iter().map(|&c| c / 4).collect();
+    let avg = if token_estimates.is_empty() { 0 } else {
+        token_estimates.iter().sum::<usize>() / token_estimates.len()
+    };
+    let max = token_estimates.iter().copied().max().unwrap_or(0);
+
+    // p95 estimate for suggested seq len
+    let mut sorted = token_estimates;
+    sorted.sort();
+    let p95 = sorted.get((sorted.len() as f64 * 0.95) as usize).copied().unwrap_or(avg);
+    let suggested = if p95 > 0 { p95.next_power_of_two() } else { 2048 };
+
+    Ok(DatasetPeek {
+        columns,
+        avg_tokens_estimate: avg,
+        max_tokens_estimate: max,
+        suggested_seq_len: suggested,
+        rows_sampled,
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -419,8 +419,16 @@ export async function downloadDataset(datasetId: string): Promise<string> {
   return await invoke('download_dataset', { datasetId });
 }
 
-export async function peekDatasetColumns(path: string): Promise<string[]> {
-  return await invoke('peek_dataset_columns', { path });
+export interface DatasetPeek {
+  columns: string[];
+  avg_tokens_estimate: number;
+  max_tokens_estimate: number;
+  suggested_seq_len: number;
+  rows_sampled: number;
+}
+
+export async function peekDatasetColumns(path: string, limit?: number): Promise<DatasetPeek> {
+  return await invoke('peek_dataset_columns', { path, limit: limit ?? null });
 }
 
 // =============================================================================
