@@ -77,6 +77,13 @@ impl MoEConfig {
 /// Router for selecting experts.
 ///
 /// Returns normalized top-k routing weights, top-k expert indices, and raw logits.
+///
+/// Supports auxiliary-loss-free load balancing (DeepSeek-V3 style):
+/// A non-trainable `routing_bias` is added to scores for expert *selection* only
+/// (not for output weighting). After each forward pass, the bias is updated:
+///   `bias[e] += gamma * (target_load - actual_load[e])`
+/// This eliminates the need for the Switch Transformer auxiliary loss while
+/// providing better load distribution.
 #[derive(Debug, ModuleParameters)]
 pub struct MoERouter {
     #[param]
@@ -85,6 +92,13 @@ pub struct MoERouter {
     pub num_experts_per_tok: usize,
     pub jitter: f32,
     pub training: bool,
+    /// Dynamic routing bias for loss-free load balancing (not a trainable parameter).
+    /// Shape: `[num_experts]`. Updated after each forward pass when `use_bias_balancing` is true.
+    pub routing_bias: Option<Vec<f32>>,
+    /// Whether to use bias-based load balancing (DeepSeek-V3 style).
+    pub use_bias_balancing: bool,
+    /// Learning rate for bias updates: `bias[e] += gamma * (target - actual)`.
+    pub bias_gamma: f32,
 }
 
 impl MoERouter {
@@ -99,6 +113,9 @@ impl MoERouter {
             num_experts_per_tok,
             jitter: 0.0,
             training: true,
+            routing_bias: None,
+            use_bias_balancing: false,
+            bias_gamma: 0.001,
         }
     }
 
@@ -106,6 +123,18 @@ impl MoERouter {
         self.jitter = jitter;
         self
     }
+
+    /// Enable auxiliary-loss-free load balancing (DeepSeek-V3 style).
+    ///
+    /// When enabled, a dynamic routing bias is maintained and updated after each
+    /// forward pass. The Switch Transformer auxiliary loss is skipped.
+    pub fn with_bias_balancing(mut self, gamma: f32) -> Self {
+        self.use_bias_balancing = true;
+        self.bias_gamma = gamma;
+        self.routing_bias = Some(vec![0.0; self.num_experts]);
+        self
+    }
+
     pub fn train(&mut self) {
         self.training = true;
     }
@@ -116,6 +145,10 @@ impl MoERouter {
     /// Forward: compute routing weights and expert assignments.
     ///
     /// Returns `(normalized_weights [N, k], top_indices [N, k], router_logits [N, E])`.
+    ///
+    /// When `use_bias_balancing` is enabled, the routing bias is added to softmax scores
+    /// for expert *selection* only. The output weights use the original (unbiased) scores.
+    /// After each forward, the bias is updated to equalize expert load.
     pub fn forward(&mut self, hidden_states: &Array) -> Result<(Array, Array, Array), Exception> {
         let shape = hidden_states.shape();
         let batch_seq = shape[..shape.len() - 1].iter().product::<i32>();
@@ -143,16 +176,77 @@ impl MoERouter {
         };
         let routing_weights = mlx_rs::ops::softmax_axis(&router_logits_f32, -1, None)?;
 
-        // C10: GPU-native top-k using argsort + slice (no CPU round-trip, no NaN panic)
+        // C10: GPU-native top-k
         let k = self.num_experts_per_tok;
-        let (top_weights, top_indices) = gpu_topk(&routing_weights, k)?;
+
+        let top_indices = if self.use_bias_balancing {
+            // DeepSeek-V3 style: add bias for selection, use original scores for weights
+            if let Some(ref bias) = self.routing_bias {
+                let bias_array =
+                    Array::from_slice(bias, &[self.num_experts as i32]);
+                let biased_weights = routing_weights.add(&bias_array)?;
+                let (_, indices) = gpu_topk(&biased_weights, k)?;
+                indices
+            } else {
+                let (_, indices) = gpu_topk(&routing_weights, k)?;
+                indices
+            }
+        } else {
+            let (_, indices) = gpu_topk(&routing_weights, k)?;
+            indices
+        };
+
+        // Gather the *unbiased* routing weights for the selected experts
+        let top_weights = routing_weights.take_along_axis(&top_indices, -1)?;
 
         // Normalize selected weights to sum to 1
         let weight_sum = top_weights.sum_axis(-1, Some(true))?;
         let safe_sum = mlx_rs::ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
         let normalized_weights = top_weights.divide(&safe_sum)?;
 
+        // Update routing bias after forward (DeepSeek-V3 dynamic balancing)
+        if self.use_bias_balancing && self.training {
+            self.update_routing_bias(&top_indices, batch_seq as usize)?;
+        }
+
         Ok((normalized_weights, top_indices, router_logits))
+    }
+
+    /// Update the routing bias to equalize expert load.
+    ///
+    /// `bias[e] += gamma * (target_load - actual_load[e])`
+    /// where target_load = k / num_experts (uniform distribution).
+    fn update_routing_bias(
+        &mut self,
+        selected_experts: &Array,
+        num_tokens: usize,
+    ) -> Result<(), Exception> {
+        let Some(ref mut bias) = self.routing_bias else {
+            return Ok(());
+        };
+
+        selected_experts.eval()?;
+        let indices: Vec<i32> = selected_experts.as_slice().to_vec();
+
+        let target_load =
+            self.num_experts_per_tok as f32 / self.num_experts as f32;
+        let total = (num_tokens * self.num_experts_per_tok) as f32;
+
+        // Count actual load per expert
+        let mut counts = vec![0usize; self.num_experts];
+        for &idx in &indices {
+            if (idx as usize) < self.num_experts {
+                counts[idx as usize] += 1;
+            }
+        }
+
+        // Update bias
+        for (e, count) in counts.iter().enumerate() {
+            let actual_load = *count as f32 / total.max(1.0);
+            bias[e] += self.bias_gamma * (target_load - actual_load);
+        }
+
+        Ok(())
     }
 }
 
@@ -341,8 +435,8 @@ impl MoELayer {
         output_shape[shape.len() - 1] = hidden_size;
         let output = final_output.reshape(&output_shape)?;
 
-        // Compute auxiliary loss if enabled
-        let aux_loss = if self.config.use_aux_loss {
+        // Compute auxiliary loss if enabled (skip when using bias balancing)
+        let aux_loss = if self.config.use_aux_loss && !self.router.use_bias_balancing {
             Some(self.compute_aux_loss(&router_logits, &selected_experts, n_tokens)?)
         } else {
             None
