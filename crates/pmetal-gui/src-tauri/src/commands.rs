@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -1930,6 +1930,27 @@ async fn finalize_grpo_run(
     }
 }
 
+/// Scan a directory (up to 3 levels deep) for .parquet files.
+fn find_parquet_in_dir(dir: &Path) -> Option<PathBuf> {
+    fn scan(dir: &Path, depth: usize) -> Option<PathBuf> {
+        if depth > 3 { return None; }
+        let entries = std::fs::read_dir(dir).ok()?;
+        let mut dirs = Vec::new();
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if p.is_file() && p.extension().is_some_and(|e| e == "parquet") {
+                return Some(p);
+            }
+            if p.is_dir() { dirs.push(p); }
+        }
+        for d in dirs {
+            if let Some(p) = scan(&d, depth + 1) { return Some(p); }
+        }
+        None
+    }
+    scan(dir, 0)
+}
+
 async fn resolve_model_path(model_id: &str) -> Result<PathBuf> {
     if model_id.contains('/') && !PathBuf::from(model_id).exists() {
         pmetal::hub::download_model(model_id, None, None)
@@ -1954,6 +1975,11 @@ async fn resolve_dataset_path(dataset_id: &str) -> Result<PathBuf> {
             if let Ok(path) = pmetal::data::TrainingDataset::resolve_dataset_path_pub(&dir) {
                 return Ok(path);
             }
+            // Scan cached directory for parquet files (no network call)
+            if let Some(pf) = find_parquet_in_dir(&dir) {
+                return Ok(pf);
+            }
+            // Last resort: HF API (slow, network call)
             let parquet_paths = pmetal::hub::download_dataset_parquet(&id, "train", None, None)
                 .await
                 .map_err(|e| AppError(e.to_string()))?;
