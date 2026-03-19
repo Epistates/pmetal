@@ -10,6 +10,7 @@
 //! Reference: `mlx-lm/models/qwen3_next.py` (Apple, 2025).
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use mlx_rs::{
     Array,
@@ -24,12 +25,14 @@ use mlx_rs::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::expert_io::ExpertOffloadContext;
 use crate::traits::ModelConfig;
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use pmetal_mlx::{
     gather_mm,
     kernels::{
         AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+        fused_moe::moe_combine_mlx,
         gated_delta::gated_delta_update,
         rope::{RopeScaling, apply_rope},
     },
@@ -806,6 +809,11 @@ pub struct Qwen3NextSparseMoeBlock {
     pub num_experts: i32,
     pub top_k: i32,
     pub norm_topk_prob: bool,
+    /// Which transformer layer this block belongs to (used for expert file lookup).
+    pub layer_idx: usize,
+    /// If set, routed expert weights are loaded on-demand from SSD instead of
+    /// residing in GPU memory.  `None` means the standard resident path is used.
+    pub offload_ctx: Option<Arc<ExpertOffloadContext>>,
 }
 
 impl Qwen3NextSparseMoeBlock {
@@ -836,10 +844,35 @@ impl Qwen3NextSparseMoeBlock {
             num_experts,
             top_k: config.num_experts_per_tok,
             norm_topk_prob: config.norm_topk_prob,
+            layer_idx: 0,
+            offload_ctx: None,
         })
     }
 
+    /// Attach an offload context and record which layer this block lives in.
+    ///
+    /// After calling this the [`forward`] method will load routed-expert weights
+    /// from SSD rather than from resident GPU arrays.
+    pub fn enable_offloading(&mut self, ctx: Arc<ExpertOffloadContext>, layer_idx: usize) {
+        self.layer_idx = layer_idx;
+        self.offload_ctx = Some(ctx);
+    }
+
+    /// Builder-style alternative to [`enable_offloading`].
+    ///
+    /// Consumes `self` and returns a new instance with offloading configured.
+    /// Useful when constructing layers in an iterator chain.
+    pub fn with_offload(mut self, ctx: Arc<ExpertOffloadContext>, layer_idx: usize) -> Self {
+        self.enable_offloading(ctx, layer_idx);
+        self
+    }
+
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        // Dispatch to offloaded path when an ExpertOffloadContext is present.
+        if self.offload_ctx.is_some() {
+            return self.forward_offloaded(x);
+        }
+
         let shape = x.shape();
         let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
         let hidden = shape[shape.len() - 1];
@@ -907,18 +940,34 @@ impl Qwen3NextSparseMoeBlock {
         )?
         .reshape(&[batch_seq, k, hidden])?;
 
-        // Weight and sum expert outputs
-        let y = down_out
-            .multiply(&top_weights.reshape(&[batch_seq, k, 1])?)?
-            .sum_axis(-2, false)?;
-
-        // Shared expert with gate
+        // Shared expert forward + gate logit
         let shared_y = self.shared_expert.forward(&x_flat)?;
-        let shared_gate = nn::sigmoid(&self.shared_expert_gate.forward(&x_flat)?)?;
-        let shared_y = shared_gate.multiply(&shared_y)?;
+        let shared_gate_logit = self.shared_expert_gate.forward(&x_flat)?;
 
-        let result = y.add(&shared_y)?;
+        // Combine: residual + weighted expert sum + sigmoid-gated shared expert
+        // Pure MLX ops — all async on GPU, no synchronization barriers
+        let result = moe_combine_mlx(
+            &x_flat,
+            &down_out,
+            &top_weights,
+            &shared_y,
+            &shared_gate_logit,
+            k,
+            batch_seq,
+        )?;
         result.reshape(shape)
+    }
+
+    /// Offloaded forward pass: routes to top-k experts whose weights are read
+    /// on-demand from the packed SSD file for this layer.
+    ///
+    /// Returns an explicit error until the full dequant pipeline is wired
+    /// (expert_dequant.rs + FusedMoeExpert integration).
+    fn forward_offloaded(&mut self, _x: &Array) -> Result<Array, Exception> {
+        Err(Exception::custom(
+            "Expert offloading kernel integration not yet complete. \
+             Use --no-offload or wait for the full pipeline."
+        ))
     }
 }
 
