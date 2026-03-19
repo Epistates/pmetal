@@ -1,5 +1,5 @@
 [![Crates.io](https://img.shields.io/crates/v/pmetal.svg)](https://crates.io/crates/pmetal)
-[![Rust](https://img.shields.io/badge/rust-1.85+-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.86+-orange.svg)](https://www.rust-lang.org)
 [![License](https://img.shields.io/badge/license-MIT%2FApache--2.0-blue.svg)](LICENSE)
 [![Platform](https://img.shields.io/badge/platform-macOS-lightgrey.svg)](https://www.apple.com/macos)
 
@@ -111,7 +111,9 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `train` | Fine-tune with LoRA/QLoRA/DoRA (SFT) |
 | `infer` | Interactive inference with chat, tool use, and thinking mode |
 | `distill` | Knowledge distillation (online, offline, progressive) |
-| `grpo` | GRPO/DAPO reasoning training |
+| `grpo` | GRPO/DAPO reasoning training (VLM, speculative, async rewards) |
+| `rlkd` | Reinforcement Learning with Knowledge Distillation |
+| `embed-train` | Sentence-transformer fine-tuning (InfoNCE, Triplet, CoSENT) |
 | `search` | Search HuggingFace Hub with memory fit estimation |
 | `download` | Download a model from HuggingFace Hub |
 | `merge` | Merge two or more models (12 strategies) |
@@ -376,6 +378,9 @@ All training methods support callback-based cancellation (`should_stop()`), metr
 | TAID (Temporally Adaptive) | — | — | — | `TaidDistiller` |
 | ANE Training | `train` (auto) | — | Yes | `AneTrainingLoop` |
 
+| RLKD (RL + Distillation) | `rlkd` | — | — | `RlkdTrainer` |
+| Embedding Training | `embed-train` | — | — | `EmbeddingTrainer` |
+
 Additional methods available via the library only: GSPO (`GspoTrainer`), PPO (`PpoTrainer`), Online DPO (`OnlineDpoTrainer`), Diffusion Training (`DiffusionTrainer`).
 
 ## Key Features
@@ -432,6 +437,8 @@ Auto-detected training data formats:
 - **Simple**: `{"text": "..."}`
 - **Parquet**: Supports both standard text columns and reasoning formats
 
+**Custom columns**: Use `--text-column` for arbitrary field names, `--text-columns col1,col2` to concatenate multiple columns, and `--prompt-column`/`--response-column` for SFT loss masking. All training commands (train, distill, grpo, rlkd) support column flags uniformly.
+
 The `pmetal dataset` subcommand provides utilities for analysis, download from HuggingFace, and format conversion (Parquet, JSON, JSONL, CSV, ShareGPT, Alpaca).
 
 ### Model Operations
@@ -479,7 +486,7 @@ The `pmetal dataset` subcommand provides utilities for analysis, download from H
   | `f16` | Float16 |
   | `f32` | Float32 |
 
-  Supports importance matrix (`--imatrix`) for improved quantization quality.
+  Supports importance matrix (`--imatrix`) for improved quantization quality. KL-calibrated quantization (`--kl-calibrate`) selects per-tensor quantization types via NRMSE + cosine distance, with optional `--target-bpw` for budget-constrained quantization.
 
 - **FP8 Runtime Quantization**: Convert to FP8 (E4M3) at inference time for ~2x memory reduction
 
@@ -519,6 +526,12 @@ Multiple distillation methods and loss functions:
 | `--warmup-steps` | 100 | Learning rate warmup steps |
 | `--weight-decay` | 0.01 | AdamW weight decay coefficient |
 | `--no-sequence-packing` | false | Disable sequence packing |
+| `--cut-cross-entropy` | false | Memory-efficient loss (avoids full logit materialization) |
+| `--text-column` | — | Custom JSONL column name for training text |
+| `--text-columns` | — | Multi-column concat (comma-separated, e.g. `thinking,solution`) |
+| `--prompt-column` | — | Column for prompt (enables SFT loss masking) |
+| `--response-column` | — | Column for response (with prompt masking) |
+| `--column-separator` | `\n\n` | Separator for `--text-columns` |
 | `--config` | — | Path to YAML configuration file |
 
 ### `pmetal infer` Parameters

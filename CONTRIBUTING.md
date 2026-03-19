@@ -10,7 +10,7 @@ By participating in this project, you agree to maintain a respectful and inclusi
 
 ### Prerequisites
 
-- **Rust 1.85+**: Install via [rustup](https://rustup.rs/)
+- **Rust 1.86+**: Install via [rustup](https://rustup.rs/)
 - **macOS**: PMetal targets Apple Silicon exclusively
 - **Xcode Command Line Tools**: `xcode-select --install`
 - **Metal Toolchain**: `xcodebuild -downloadComponent MetalToolchain`
