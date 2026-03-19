@@ -92,10 +92,20 @@ pub fn run() {
             fuse_lora,
             quantize_model,
         ])
-        .on_window_event(|_window, event| {
-            // Force-exit when the main window closes to avoid C++ mutex crashes
-            // from MLX Arrays being dropped on the wrong thread during Tauri cleanup.
-            if let WindowEvent::Destroyed = event {
+        .on_window_event(|window, event| {
+            if let WindowEvent::CloseRequested { .. } = event {
+                // Cancel all active training/distillation/GRPO runs so Metal
+                // command buffers can drain before the process exits.
+                if let Some(state) = window.try_state::<AppState>() {
+                    if let Ok(flags) = state.cancel_flags.try_read() {
+                        for flag in flags.values() {
+                            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+                        }
+                    }
+                }
+                // Brief pause for in-flight GPU work, then force-exit to skip
+                // C++ destructor crashes from MLX's Metal device cleanup.
+                std::thread::sleep(std::time::Duration::from_millis(200));
                 std::process::exit(0);
             }
         })
