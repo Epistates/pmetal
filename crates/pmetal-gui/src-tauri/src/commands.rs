@@ -57,129 +57,69 @@ impl TrainingCallback for CancelOnFlag {
     }
 }
 
-/// Partial metrics update written by the training callback (sync).
-///
-/// The training loop runs on a blocked tokio worker thread, so we can't
-/// acquire `tokio::sync::RwLock` (try_write silently fails, blocking_write
-/// panics). Instead the callback writes to a `std::sync::Mutex<Option<_>>`
-/// and a 250ms poller task syncs updates to the main state + event bus.
-#[derive(Debug, Clone, Default)]
-struct MetricsUpdate {
-    status_message: Option<String>,
-    step: u64,
-    total_steps: u64,
-    total_epochs: u32,
-    epoch: f32,
-    loss: Option<f64>,
-    best_loss: Option<f64>,
-    learning_rate: Option<f64>,
-    tokens_per_second: Option<f64>,
-    grad_norm: Option<f64>,
-    eta_seconds: Option<u64>,
-}
-
-struct GuiMetricsCallback {
-    latest: Arc<std::sync::Mutex<Option<MetricsUpdate>>>,
-    current: MetricsUpdate,
+/// Training metrics callback that streams updates to the frontend via
+/// `tauri::ipc::Channel` — the Tauri-recommended mechanism for streaming
+/// data from backend to frontend. Channel::send() is Send + Sync and
+/// safe to call from any thread, including blocked tokio worker threads.
+struct ChannelMetricsCallback {
+    channel: tauri::ipc::Channel<serde_json::Value>,
     started_at: chrono::DateTime<chrono::Utc>,
+    best_loss: Option<f64>,
 }
 
-impl GuiMetricsCallback {
-    fn push(&self) {
-        if let Ok(mut slot) = self.latest.lock() {
-            *slot = Some(self.current.clone());
-        }
-    }
-}
-
-impl TrainingCallback for GuiMetricsCallback {
+impl TrainingCallback for ChannelMetricsCallback {
     fn on_train_start(&mut self) {
-        self.current.status_message =
-            Some("Training started, waiting for first step...".to_string());
-        self.push();
+        let _ = self.channel.send(serde_json::json!({
+            "event": "train_start",
+            "status_message": "Training started, waiting for first step...",
+        }));
     }
 
     fn on_step_end_with_metrics(&mut self, metrics: &pmetal::core::StepMetrics) {
-        let m = &mut self.current;
-        m.status_message = None;
-        m.step = metrics.step as u64;
-        m.total_steps = metrics.total_steps as u64;
-        m.total_epochs = metrics.total_epochs as u32;
-        m.epoch = metrics.epoch as f32;
-        m.loss = Some(metrics.loss);
-        if m.best_loss.map_or(true, |b| metrics.loss < b) {
-            m.best_loss = Some(metrics.loss);
+        if self.best_loss.map_or(true, |b| metrics.loss < b) {
+            self.best_loss = Some(metrics.loss);
         }
-        m.learning_rate = Some(metrics.lr);
-        m.tokens_per_second = Some(metrics.tok_sec);
-        if let Some(gn) = metrics.grad_norm {
-            m.grad_norm = Some(gn);
-        }
-        if m.total_steps > 0 && m.step > 0 {
-            let elapsed =
-                (chrono::Utc::now() - self.started_at).num_seconds().max(1) as f64;
-            let remaining = m.total_steps.saturating_sub(m.step) as f64;
-            m.eta_seconds = Some(((elapsed / m.step as f64) * remaining) as u64);
-        }
-        self.push();
+        let elapsed = (chrono::Utc::now() - self.started_at).num_seconds().max(1) as f64;
+        let eta = if metrics.total_steps > 0 && metrics.step > 0 {
+            let remaining = metrics.total_steps.saturating_sub(metrics.step) as f64;
+            Some(((elapsed / metrics.step as f64) * remaining) as u64)
+        } else {
+            None
+        };
+        let _ = self.channel.send(serde_json::json!({
+            "event": "step",
+            "step": metrics.step,
+            "total_steps": metrics.total_steps,
+            "total_epochs": metrics.total_epochs,
+            "epoch": metrics.epoch,
+            "loss": metrics.loss,
+            "best_loss": self.best_loss,
+            "lr": metrics.lr,
+            "tok_sec": metrics.tok_sec,
+            "grad_norm": metrics.grad_norm,
+            "eta_seconds": eta,
+        }));
     }
 
     fn on_step_end(&mut self, step: usize, loss: f64) {
-        let m = &mut self.current;
-        m.status_message = None;
-        m.step = step as u64;
-        m.loss = Some(loss);
-        if m.best_loss.map_or(true, |b| loss < b) {
-            m.best_loss = Some(loss);
+        if self.best_loss.map_or(true, |b| loss < b) {
+            self.best_loss = Some(loss);
         }
-        self.push();
+        let _ = self.channel.send(serde_json::json!({
+            "event": "step",
+            "step": step,
+            "loss": loss,
+            "best_loss": self.best_loss,
+        }));
     }
 
-    fn on_epoch_end(&mut self, _epoch: usize, metrics: &pmetal::core::EvalMetrics) {
-        self.current.loss = Some(metrics.loss);
-        self.push();
+    fn on_epoch_end(&mut self, epoch: usize, metrics: &pmetal::core::EvalMetrics) {
+        let _ = self.channel.send(serde_json::json!({
+            "event": "epoch_end",
+            "epoch": epoch,
+            "loss": metrics.loss,
+        }));
     }
-}
-
-/// Spawn a poller that syncs `MetricsUpdate` from the sync Mutex to the
-/// main async state and broadcasts `AppEvent::TrainingUpdate`.
-fn spawn_metrics_poller(
-    sidecar: Arc<std::sync::Mutex<Option<MetricsUpdate>>>,
-    state_arc: Arc<tokio::sync::RwLock<Vec<TrainingRun>>>,
-    event_tx: tokio::sync::broadcast::Sender<AppEvent>,
-    run_id: String,
-    cancel: Arc<std::sync::atomic::AtomicBool>,
-) {
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
-        loop {
-            interval.tick().await;
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                break;
-            }
-            let update = {
-                let mut slot = sidecar.lock().unwrap();
-                slot.take()
-            };
-            if let Some(u) = update {
-                let mut runs = state_arc.write().await;
-                if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                    run.step = u.step;
-                    run.total_steps = u.total_steps;
-                    run.total_epochs = u.total_epochs;
-                    run.epoch = u.epoch;
-                    run.loss = u.loss;
-                    run.best_loss = u.best_loss;
-                    run.learning_rate = u.learning_rate;
-                    run.tokens_per_second = u.tokens_per_second;
-                    run.grad_norm = u.grad_norm;
-                    run.eta_seconds = u.eta_seconds;
-                    run.status_message = u.status_message;
-                    let _ = event_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-                }
-            }
-        }
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -900,6 +840,7 @@ pub async fn start_training(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
     config: TrainingConfig,
+    on_metrics: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
     if !matches!(config.method.as_str(), "sft" | "lora" | "qlora") {
         return Err(AppError(format!(
@@ -1112,25 +1053,14 @@ Selected method '{}' is not library-backed here yet.",
             }
         };
 
-        let metrics_sidecar: Arc<std::sync::Mutex<Option<MetricsUpdate>>> =
-            Arc::new(std::sync::Mutex::new(None));
-
-        spawn_metrics_poller(
-            metrics_sidecar.clone(),
-            state_arc.clone(),
-            event_tx.clone(),
-            run_id_task.clone(),
-            cancel_flag.clone(),
-        );
-
         let callbacks: Vec<Box<dyn pmetal::core::TrainingCallback>> = vec![
             Box::new(CancelOnFlag {
                 cancelled: cancel_flag.clone(),
             }),
-            Box::new(GuiMetricsCallback {
-                latest: metrics_sidecar,
-                current: MetricsUpdate::default(),
+            Box::new(ChannelMetricsCallback {
+                channel: on_metrics,
                 started_at: Utc::now(),
+                best_loss: None,
             }),
         ];
 

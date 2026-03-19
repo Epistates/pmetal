@@ -2,7 +2,7 @@
  * PMetal API - TypeScript wrappers for Tauri commands
  */
 
-import { invoke } from '@tauri-apps/api/core';
+import { invoke, Channel } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
 
 // =============================================================================
@@ -435,8 +435,15 @@ export async function peekDatasetColumns(path: string, limit?: number): Promise<
 // Training API
 // =============================================================================
 
-export async function startTraining(config: TrainingConfig): Promise<string> {
-  return await invoke('start_training', { config });
+export async function startTraining(
+  config: TrainingConfig,
+  onMetrics?: (data: Record<string, unknown>) => void,
+): Promise<string> {
+  const channel = new Channel<Record<string, unknown>>();
+  if (onMetrics) {
+    channel.onmessage = onMetrics;
+  }
+  return await invoke('start_training', { config, onMetrics: channel });
 }
 
 export async function getTrainingStatus(runId: string): Promise<TrainingRun> {

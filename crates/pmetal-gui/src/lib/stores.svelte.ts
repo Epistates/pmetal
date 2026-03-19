@@ -160,7 +160,29 @@ class TrainingStore {
     this.loading = true;
     this.error = null;
     try {
-      const runId = await api.startTraining(config);
+      const runId = await api.startTraining(config, (data) => {
+        // Stream metrics from the backend Channel directly into the run
+        const run = this.runs.find(r => r.id === runId);
+        if (!run) return;
+
+        if (data.event === 'train_start') {
+          run.status_message = data.status_message as string;
+        } else if (data.event === 'step') {
+          run.status_message = null;
+          if (data.step != null) run.step = data.step as number;
+          if (data.total_steps != null) run.total_steps = data.total_steps as number;
+          if (data.total_epochs != null) run.total_epochs = data.total_epochs as number;
+          if (data.epoch != null) run.epoch = data.epoch as number;
+          if (data.loss != null) run.loss = data.loss as number;
+          if (data.best_loss != null) run.best_loss = data.best_loss as number;
+          if (data.lr != null) run.learning_rate = data.lr as number;
+          if (data.tok_sec != null) run.tokens_per_second = data.tok_sec as number;
+          if (data.grad_norm != null) run.grad_norm = data.grad_norm as number;
+          if (data.eta_seconds != null) run.eta_seconds = data.eta_seconds as number;
+        }
+        // Trigger Svelte 5 reactivity
+        this.runs = [...this.runs];
+      });
       this.selectedRunId = runId;
       await this.refresh();
       return runId;
