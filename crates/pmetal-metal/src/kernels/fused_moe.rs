@@ -88,13 +88,26 @@ impl FusedMoeExpertConfig {
                 self.hidden_dim, pf
             )));
         }
+        // Down projection uses intermediate_dim as input — must also be aligned
+        if self.intermediate_dim % pf != 0 {
+            return Err(MetalError::InvalidConfig(format!(
+                "intermediate_dim ({}) must be divisible by pack_factor ({})",
+                self.intermediate_dim, pf
+            )));
+        }
         if self.group_size == 0 || self.hidden_dim % self.group_size != 0 {
             return Err(MetalError::InvalidConfig(format!(
                 "hidden_dim ({}) must be divisible by group_size ({})",
                 self.hidden_dim, self.group_size
             )));
         }
-        // BUG-5: group_size must be >= pack_factor to prevent divide-by-zero
+        if self.intermediate_dim % self.group_size != 0 {
+            return Err(MetalError::InvalidConfig(format!(
+                "intermediate_dim ({}) must be divisible by group_size ({})",
+                self.intermediate_dim, self.group_size
+            )));
+        }
+        // group_size must be >= pack_factor to prevent divide-by-zero
         // in group index calculation (col / (group_size / pack_factor))
         if self.group_size < pf {
             return Err(MetalError::InvalidConfig(format!(
@@ -161,13 +174,10 @@ impl FusedMoeExpert {
         Ok(Self { ctx, config })
     }
 
-    /// Run a single expert's full forward pass: gate+up+SwiGLU then down projection.
+    /// Run a single expert's full forward pass (blocking).
     ///
-    /// # Arguments
-    /// * `input` - Input hidden states `[hidden_dim]`
-    /// * `weights` - Quantized expert weight buffers
-    /// * `output` - Output buffer `[hidden_dim]`
-    /// * `intermediate` - Scratch buffer `[intermediate_dim]` for SwiGLU output
+    /// Convenience wrapper that creates a command buffer, encodes both phases,
+    /// commits, and waits. Use `encode_into` for non-blocking dispatch.
     pub fn forward_single_expert(
         &self,
         input: &MetalBuffer<f32>,
@@ -180,15 +190,54 @@ impl FusedMoeExpert {
             .commandBuffer()
             .ok_or(MetalError::CommandBufferCreation)?;
 
-        // Phase A: fused gate+up+SwiGLU
-        self.encode_gate_up_swiglu(&command_buffer, input, weights, intermediate)?;
-
-        // Phase B: down projection
-        self.encode_down_projection(&command_buffer, intermediate, weights, output)?;
+        self.encode_into(&command_buffer, input, weights, output, intermediate)?;
 
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
 
+        if let Some(error) = command_buffer.error() {
+            return Err(MetalError::ExecutionFailed(error.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Encode both phases into an external command buffer (non-blocking).
+    ///
+    /// The caller manages command buffer lifecycle: create, accumulate multiple
+    /// expert dispatches, commit once, defer wait. This is the pipelined path
+    /// — encode all K experts into one CMD buffer, submit, defer sync to next layer.
+    pub fn encode_into(
+        &self,
+        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+        input: &MetalBuffer<f32>,
+        weights: &ExpertWeightBuffers,
+        output: &MetalBuffer<f32>,
+        intermediate: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        // Phase A: fused gate+up+SwiGLU
+        self.encode_gate_up_swiglu(command_buffer, input, weights, intermediate)?;
+        // Phase B: down projection
+        self.encode_down_projection(command_buffer, intermediate, weights, output)?;
+        Ok(())
+    }
+
+    /// Create a new command buffer from this context's queue.
+    pub fn create_command_buffer(
+        &self,
+    ) -> Result<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>>> {
+        let command_queue = self.ctx.command_queue();
+        command_queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)
+    }
+
+    /// Submit a command buffer and wait for GPU completion.
+    pub fn submit_and_wait(
+        &self,
+        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+    ) -> Result<()> {
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
         if let Some(error) = command_buffer.error() {
             return Err(MetalError::ExecutionFailed(error.to_string()));
         }
@@ -311,6 +360,135 @@ impl FusedMoeExpert {
 
         Ok(())
     }
+
+    /// Encode a single expert forward using an aligned buffer with byte offsets.
+    ///
+    /// Zero-copy path: the `AlignedBuffer` from pread is used directly as the
+    /// Metal buffer, with component offsets from `ExpertRecord` passed via
+    /// `setBuffer:offset:atIndex:`. No intermediate copies or allocations.
+    ///
+    /// Both Phase A (gate+up+SwiGLU) and Phase B (down projection) are encoded
+    /// into the provided command buffer. The caller is responsible for submitting
+    /// and synchronizing the command buffer.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_expert_aligned(
+        &self,
+        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+        input: &MetalBuffer<f32>,
+        expert_buf: &objc2::runtime::ProtocolObject<dyn objc2_metal::MTLBuffer>,
+        gate_w_off: usize,
+        gate_s_off: usize,
+        gate_b_off: usize,
+        up_w_off: usize,
+        up_s_off: usize,
+        up_b_off: usize,
+        down_w_off: usize,
+        down_s_off: usize,
+        down_b_off: usize,
+        output: &MetalBuffer<f32>,
+        intermediate: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        // Phase A: gate+up+SwiGLU
+        {
+            let pipeline = {
+                let mut cache = self.ctx.pipeline_cache_mut();
+                cache.get_or_create_pipeline(self.ctx.device(), "fused_gate_up_swiglu", None)?
+            };
+
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or(MetalError::EncoderCreation)?;
+
+            encoder.setComputePipelineState(&pipeline);
+
+            unsafe {
+                // All 6 weight components point to the same AlignedBuffer at different offsets
+                encoder.setBuffer_offset_atIndex(Some(expert_buf), gate_w_off, 0);
+                encoder.setBuffer_offset_atIndex(Some(expert_buf), gate_s_off, 1);
+                encoder.setBuffer_offset_atIndex(Some(expert_buf), gate_b_off, 2);
+                encoder.setBuffer_offset_atIndex(Some(expert_buf), up_w_off, 3);
+                encoder.setBuffer_offset_atIndex(Some(expert_buf), up_s_off, 4);
+                encoder.setBuffer_offset_atIndex(Some(expert_buf), up_b_off, 5);
+                encoder.setBuffer_offset_atIndex(Some(input.metal_buffer()), 0, 6);
+                encoder.setBuffer_offset_atIndex(Some(intermediate.metal_buffer()), 0, 7);
+
+                let out_dim = self.config.intermediate_dim;
+                let in_dim = self.config.hidden_dim;
+                let group_size = self.config.group_size;
+                let out_dim_ptr = NonNull::from(&out_dim).cast();
+                encoder.setBytes_length_atIndex(out_dim_ptr, 4, 8);
+                let in_dim_ptr = NonNull::from(&in_dim).cast();
+                encoder.setBytes_length_atIndex(in_dim_ptr, 4, 9);
+                let gs_ptr = NonNull::from(&group_size).cast();
+                encoder.setBytes_length_atIndex(gs_ptr, 4, 10);
+            }
+
+            let rows_per_tg: u32 = 8;
+            let grid_size = objc2_metal::MTLSize {
+                width: self.config.intermediate_dim.div_ceil(rows_per_tg) as usize,
+                height: 1,
+                depth: 1,
+            };
+            let threadgroup_size = objc2_metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            };
+
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+            encoder.endEncoding();
+        }
+
+        // Phase B: down projection
+        {
+            let kernel_name = self.config.bits.matvec_kernel_name();
+            let pipeline = {
+                let mut cache = self.ctx.pipeline_cache_mut();
+                cache.get_or_create_pipeline(self.ctx.device(), kernel_name, None)?
+            };
+
+            let encoder = command_buffer
+                .computeCommandEncoder()
+                .ok_or(MetalError::EncoderCreation)?;
+
+            encoder.setComputePipelineState(&pipeline);
+
+            unsafe {
+                encoder.setBuffer_offset_atIndex(Some(expert_buf), down_w_off, 0);
+                encoder.setBuffer_offset_atIndex(Some(expert_buf), down_s_off, 1);
+                encoder.setBuffer_offset_atIndex(Some(expert_buf), down_b_off, 2);
+                encoder.setBuffer_offset_atIndex(Some(intermediate.metal_buffer()), 0, 3);
+                encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), 0, 4);
+
+                let out_dim = self.config.hidden_dim;
+                let in_dim = self.config.intermediate_dim;
+                let group_size = self.config.group_size;
+                let out_dim_ptr = NonNull::from(&out_dim).cast();
+                encoder.setBytes_length_atIndex(out_dim_ptr, 4, 5);
+                let in_dim_ptr = NonNull::from(&in_dim).cast();
+                encoder.setBytes_length_atIndex(in_dim_ptr, 4, 6);
+                let gs_ptr = NonNull::from(&group_size).cast();
+                encoder.setBytes_length_atIndex(gs_ptr, 4, 7);
+            }
+
+            let rows_per_tg: u32 = 8;
+            let grid_size = objc2_metal::MTLSize {
+                width: self.config.hidden_dim.div_ceil(rows_per_tg) as usize,
+                height: 1,
+                depth: 1,
+            };
+            let threadgroup_size = objc2_metal::MTLSize {
+                width: 64,
+                height: 1,
+                depth: 1,
+            };
+
+            encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+            encoder.endEncoding();
+        }
+
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -361,16 +539,22 @@ impl GatherQmmSwigluConfig {
                 self.hidden_dim, pf
             )));
         }
-        if self.intermediate_dim == 0 {
-            return Err(MetalError::InvalidConfig(
-                "intermediate_dim must be positive".into(),
-            ));
+        if self.intermediate_dim == 0 || self.intermediate_dim % pf != 0 {
+            return Err(MetalError::InvalidConfig(format!(
+                "intermediate_dim ({}) must be positive and divisible by pack_factor ({})",
+                self.intermediate_dim, pf
+            )));
         }
-        // group_size must be >= pack_factor (BUG-5)
         if self.group_size < pf {
             return Err(MetalError::InvalidConfig(format!(
                 "group_size ({}) must be >= pack_factor ({}) for {:?}-bit quantization",
                 self.group_size, pf, self.bits
+            )));
+        }
+        if self.hidden_dim % self.group_size != 0 || self.intermediate_dim % self.group_size != 0 {
+            return Err(MetalError::InvalidConfig(format!(
+                "both hidden_dim ({}) and intermediate_dim ({}) must be divisible by group_size ({})",
+                self.hidden_dim, self.intermediate_dim, self.group_size
             )));
         }
         Ok(())
@@ -448,7 +632,9 @@ impl GatherQmmSwiglu {
         fc
     }
 
-    /// Run the full gather+QMM+SwiGLU+down pipeline.
+    /// Run the full gather+QMM+SwiGLU+down pipeline (blocking).
+    ///
+    /// Convenience wrapper. Use `encode_into` for non-blocking dispatch.
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
@@ -460,36 +646,8 @@ impl GatherQmmSwiglu {
         intermediate: &MetalBuffer<f32>,
         output: &MetalBuffer<f32>,
     ) -> Result<()> {
-        let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-
-        let fc = Self::function_constants(&self.config);
-
-        // Phase 1: gather + gate+up+SwiGLU
-        self.encode_gate_up_swiglu(
-            &command_buffer,
-            num_tokens,
-            topk,
-            input,
-            expert_ids,
-            weights,
-            intermediate,
-            &fc,
-        )?;
-
-        // Phase 2: gather + down projection
-        self.encode_down(
-            &command_buffer,
-            num_tokens,
-            topk,
-            intermediate,
-            expert_ids,
-            weights,
-            output,
-            &fc,
-        )?;
+        let command_buffer = self.create_command_buffer()?;
+        self.encode_into(&command_buffer, num_tokens, topk, input, expert_ids, weights, intermediate, output)?;
 
         command_buffer.commit();
         command_buffer.waitUntilCompleted();
@@ -498,6 +656,45 @@ impl GatherQmmSwiglu {
             return Err(MetalError::ExecutionFailed(error.to_string()));
         }
         Ok(())
+    }
+
+    /// Encode both phases into an external command buffer (non-blocking).
+    ///
+    /// The caller manages command buffer lifecycle. Encode multiple expert
+    /// dispatches + combine into one CMD buffer, submit once, defer wait.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_into(
+        &self,
+        command_buffer: &objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>,
+        num_tokens: u32,
+        topk: u32,
+        input: &MetalBuffer<f32>,
+        expert_ids: &MetalBuffer<u32>,
+        weights: &StackedExpertWeights,
+        intermediate: &MetalBuffer<f32>,
+        output: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        let fc = Self::function_constants(&self.config);
+
+        self.encode_gate_up_swiglu(
+            command_buffer, num_tokens, topk, input, expert_ids, weights, intermediate, &fc,
+        )?;
+
+        self.encode_down(
+            command_buffer, num_tokens, topk, intermediate, expert_ids, weights, output, &fc,
+        )?;
+
+        Ok(())
+    }
+
+    /// Create a new command buffer from this context's queue.
+    pub fn create_command_buffer(
+        &self,
+    ) -> Result<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn MTLCommandBuffer>>> {
+        let command_queue = self.ctx.command_queue();
+        command_queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)
     }
 
     #[allow(clippy::too_many_arguments)]

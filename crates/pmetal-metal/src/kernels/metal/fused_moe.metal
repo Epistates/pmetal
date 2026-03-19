@@ -9,14 +9,14 @@
 /// 4. `gather_qmm_swiglu` — Fused gather + quantized matmul + SwiGLU for resident mode
 /// 5. `gather_dequant_matvec` — Down projection for resident mode
 ///
-/// Quantization format (MLX affine, group_size via params/FC):
-///   - Weights stored as uint32, each holding pack_factor values
-///   - Per-group scale and bias in bfloat16
+/// Key techniques:
 ///   - qdot: pre-scale activations to eliminate per-nibble shifts
-///   - result = scale * qdot_accum + bias * x_sum  (factored outer FMA)
+///   - Thread-local x caching: load x once per column, reuse across all RESULTS_PER_SG rows
+///   - Factored bias: result = scale * qdot_accum + bias * x_sum  (single outer FMA)
+///   - Register-only: no threadgroup shared memory (no overflow, no barriers)
 ///
 /// Thread model: 2 simdgroups × 32 threads = 64 threads per threadgroup
-/// Each simdgroup computes RESULTS_PER_SG output rows (register-only, no shared memory)
+/// Each simdgroup computes RESULTS_PER_SG output rows
 
 #include <metal_stdlib>
 using namespace metal;
@@ -33,7 +33,6 @@ inline float bf16_to_f32(uint16_t bf16) {
 // Threadgroup geometry
 // ============================================================================
 
-// 4 output rows per simdgroup, 2 simdgroups per threadgroup
 #define RESULTS_PER_SG 4
 #define NUM_SIMDGROUPS  2
 #define ROWS_PER_TG    (RESULTS_PER_SG * NUM_SIMDGROUPS)  // 8
@@ -47,72 +46,104 @@ constant uint FC_GROUP_SIZE     [[function_constant(0)]];
 constant uint FC_BITS           [[function_constant(1)]]; // 2 or 4
 
 // ============================================================================
-// 4-bit qdot helper: pre-scaled dot product for one uint32 (8 nibbles)
+// 4-bit qdot: pre-scaled dot product from thread-local x registers
 // ============================================================================
 //
-// Computes sum_i[ q_i * x_i ] where q_i is the i-th 4-bit value in `packed`.
-// Instead of shifting, we pre-scale x values and use mask-only extraction:
-//   (packed & 0x00F0) * (x[1] / 16) == ((packed >> 4) & 0xF) * x[1]
-//
-// Returns (qdot_accum, x_sum) where:
-//   qdot_accum = sum_i[ q_i * x_i ]  (via pre-scaled activations)
-//   x_sum = sum_i[ x_i ]             (for factored bias: bias * x_sum)
+// Takes x already loaded into thread-local registers (not device memory).
+// Computes sum_i[ q_i * x_i ] via mask-only extraction with pre-scaled x.
+// Returns (qdot_accum, x_sum).
 
-inline float2 qdot4(device const float* x_ptr, uint32_t packed) {
-    float x0 = x_ptr[0], x1 = x_ptr[1], x2 = x_ptr[2], x3 = x_ptr[3];
-    float x4 = x_ptr[4], x5 = x_ptr[5], x6 = x_ptr[6], x7 = x_ptr[7];
-
-    // Pre-scale: divide by shift factor to eliminate >> from inner product
-    // uint16 low half: nibbles at bit positions 0, 4, 8, 12
-    // uint16 high half: nibbles at bit positions 0, 4, 8, 12 (after >>16)
+inline float2 qdot4_local(thread const float* xl, uint32_t packed) {
     uint16_t lo = uint16_t(packed);
     uint16_t hi = uint16_t(packed >> 16);
 
-    float accum = float(lo & 0x000fu) * x0
-                + float(lo & 0x00f0u) * (x1 * (1.0f / 16))
-                + float(lo & 0x0f00u) * (x2 * (1.0f / 256))
-                + float(lo & 0xf000u) * (x3 * (1.0f / 4096))
-                + float(hi & 0x000fu) * x4
-                + float(hi & 0x00f0u) * (x5 * (1.0f / 16))
-                + float(hi & 0x0f00u) * (x6 * (1.0f / 256))
-                + float(hi & 0xf000u) * (x7 * (1.0f / 4096));
+    float accum = float(lo & 0x000fu) * xl[0]
+                + float(lo & 0x00f0u) * xl[1]
+                + float(lo & 0x0f00u) * xl[2]
+                + float(lo & 0xf000u) * xl[3]
+                + float(hi & 0x000fu) * xl[4]
+                + float(hi & 0x00f0u) * xl[5]
+                + float(hi & 0x0f00u) * xl[6]
+                + float(hi & 0xf000u) * xl[7];
 
-    float x_sum = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7;
-
-    return float2(accum, x_sum);
+    return float2(accum, xl[8]); // xl[8] = pre-computed x_sum
 }
 
 // ============================================================================
-// 2-bit qdot helper: pre-scaled dot product for one uint32 (16 crumbs)
+// 2-bit qdot: pre-scaled dot product from thread-local x registers
 // ============================================================================
 
-inline float2 qdot2(device const float* x_ptr, uint32_t packed) {
+inline float2 qdot2_local(thread const float* xl, uint32_t packed) {
     uint16_t lo = uint16_t(packed);
     uint16_t hi = uint16_t(packed >> 16);
 
-    // 2-bit: 8 values per uint16 at bit positions 0,2,4,6,8,10,12,14
-    // Pre-scale factors: 1, 1/4, 1/16, 1/64, 1/256, 1/1024, 1/4096, 1/16384
-    float accum = float(lo & 0x0003u) * x_ptr[0]
-                + float(lo & 0x000cu) * (x_ptr[1]  * (1.0f / 4))
-                + float(lo & 0x0030u) * (x_ptr[2]  * (1.0f / 16))
-                + float(lo & 0x00c0u) * (x_ptr[3]  * (1.0f / 64))
-                + float(lo & 0x0300u) * (x_ptr[4]  * (1.0f / 256))
-                + float(lo & 0x0c00u) * (x_ptr[5]  * (1.0f / 1024))
-                + float(lo & 0x3000u) * (x_ptr[6]  * (1.0f / 4096))
-                + float(lo & 0xc000u) * (x_ptr[7]  * (1.0f / 16384))
-                + float(hi & 0x0003u) * x_ptr[8]
-                + float(hi & 0x000cu) * (x_ptr[9]  * (1.0f / 4))
-                + float(hi & 0x0030u) * (x_ptr[10] * (1.0f / 16))
-                + float(hi & 0x00c0u) * (x_ptr[11] * (1.0f / 64))
-                + float(hi & 0x0300u) * (x_ptr[12] * (1.0f / 256))
-                + float(hi & 0x0c00u) * (x_ptr[13] * (1.0f / 1024))
-                + float(hi & 0x3000u) * (x_ptr[14] * (1.0f / 4096))
-                + float(hi & 0xc000u) * (x_ptr[15] * (1.0f / 16384));
+    float accum = float(lo & 0x0003u) * xl[0]
+                + float(lo & 0x000cu) * xl[1]
+                + float(lo & 0x0030u) * xl[2]
+                + float(lo & 0x00c0u) * xl[3]
+                + float(lo & 0x0300u) * xl[4]
+                + float(lo & 0x0c00u) * xl[5]
+                + float(lo & 0x3000u) * xl[6]
+                + float(lo & 0xc000u) * xl[7]
+                + float(hi & 0x0003u) * xl[8]
+                + float(hi & 0x000cu) * xl[9]
+                + float(hi & 0x0030u) * xl[10]
+                + float(hi & 0x00c0u) * xl[11]
+                + float(hi & 0x0300u) * xl[12]
+                + float(hi & 0x0c00u) * xl[13]
+                + float(hi & 0x3000u) * xl[14]
+                + float(hi & 0xc000u) * xl[15];
 
-    float x_sum = 0.0f;
-    for (int i = 0; i < 16; i++) x_sum += x_ptr[i];
+    return float2(accum, xl[16]); // xl[16] = pre-computed x_sum
+}
 
-    return float2(accum, x_sum);
+// ============================================================================
+// x-vector loaders: device → thread-local with pre-scaling
+// ============================================================================
+//
+// Load x from device memory ONCE per column iteration, pre-scale for qdot,
+// and compute x_sum. The results are stored in thread-local registers and
+// reused across all RESULTS_PER_SG rows — eliminating redundant device reads.
+
+// 4-bit: loads 8 floats, pre-scales, stores 9 values (8 pre-scaled + x_sum)
+inline void load_x4(device const float* x_ptr, thread float* xl) {
+    float x0 = x_ptr[0], x1 = x_ptr[1], x2 = x_ptr[2], x3 = x_ptr[3];
+    float x4 = x_ptr[4], x5 = x_ptr[5], x6 = x_ptr[6], x7 = x_ptr[7];
+
+    xl[0] = x0;                       // nibble 0: no pre-scale
+    xl[1] = x1 * (1.0f / 16);         // nibble 1: /16
+    xl[2] = x2 * (1.0f / 256);        // nibble 2: /256
+    xl[3] = x3 * (1.0f / 4096);       // nibble 3: /4096
+    xl[4] = x4;                        // nibble 4: no pre-scale (hi word)
+    xl[5] = x5 * (1.0f / 16);         // nibble 5: /16
+    xl[6] = x6 * (1.0f / 256);        // nibble 6: /256
+    xl[7] = x7 * (1.0f / 4096);       // nibble 7: /4096
+    xl[8] = x0 + x1 + x2 + x3 + x4 + x5 + x6 + x7; // x_sum for bias factoring
+}
+
+// 2-bit: loads 16 floats, pre-scales, stores 17 values (16 pre-scaled + x_sum)
+inline void load_x2(device const float* x_ptr, thread float* xl) {
+    float x0  = x_ptr[0],  x1  = x_ptr[1],  x2  = x_ptr[2],  x3  = x_ptr[3];
+    float x4  = x_ptr[4],  x5  = x_ptr[5],  x6  = x_ptr[6],  x7  = x_ptr[7];
+    float x8  = x_ptr[8],  x9  = x_ptr[9],  x10 = x_ptr[10], x11 = x_ptr[11];
+    float x12 = x_ptr[12], x13 = x_ptr[13], x14 = x_ptr[14], x15 = x_ptr[15];
+
+    // Pre-scale for 2-bit: shift factors 1, 4, 16, 64, 256, 1024, 4096, 16384
+    xl[0]  = x0;                         xl[1]  = x1  * (1.0f / 4);
+    xl[2]  = x2  * (1.0f / 16);          xl[3]  = x3  * (1.0f / 64);
+    xl[4]  = x4  * (1.0f / 256);         xl[5]  = x5  * (1.0f / 1024);
+    xl[6]  = x6  * (1.0f / 4096);        xl[7]  = x7  * (1.0f / 16384);
+    xl[8]  = x8;                          xl[9]  = x9  * (1.0f / 4);
+    xl[10] = x10 * (1.0f / 16);          xl[11] = x11 * (1.0f / 64);
+    xl[12] = x12 * (1.0f / 256);         xl[13] = x13 * (1.0f / 1024);
+    xl[14] = x14 * (1.0f / 4096);        xl[15] = x15 * (1.0f / 16384);
+
+    // Balanced tree reduction for x_sum (better than sequential chain)
+    float s0 = (x0 + x1) + (x2 + x3);
+    float s1 = (x4 + x5) + (x6 + x7);
+    float s2 = (x8 + x9) + (x10 + x11);
+    float s3 = (x12 + x13) + (x14 + x15);
+    xl[16] = (s0 + s1) + (s2 + s3);
 }
 
 
@@ -120,24 +151,18 @@ inline float2 qdot2(device const float* x_ptr, uint32_t packed) {
 // Kernel 1: Fused Gate+Up+SwiGLU (single expert, quantized 4-bit)
 // ============================================================================
 //
-// For a single quantized expert: reads input x ONCE per column, computes:
-//   gate_out = gate_W @ x   (dequant 4-bit via qdot)
-//   up_out   = up_W @ x     (dequant 4-bit via qdot)
-//   output   = silu(gate_out) * up_out
-//
-// Each simdgroup computes RESULTS_PER_SG=4 output rows.
-// 64 threads = 2 simdgroups = 8 output rows per threadgroup.
-// Thread-private registers only — no threadgroup shared memory.
+// x loaded once per column into thread-local registers, reused across
+// RESULTS_PER_SG gate rows + RESULTS_PER_SG up rows = 8 qdot calls per col.
 
 kernel void fused_gate_up_swiglu(
-    device const uint32_t* gate_W      [[buffer(0)]],   // [out_dim, in_dim/8] packed
-    device const uint16_t* gate_scales [[buffer(1)]],   // [out_dim, num_groups] bf16
-    device const uint16_t* gate_biases [[buffer(2)]],   // [out_dim, num_groups] bf16
-    device const uint32_t* up_W        [[buffer(3)]],   // [out_dim, in_dim/8] packed
-    device const uint16_t* up_scales   [[buffer(4)]],   // [out_dim, num_groups] bf16
-    device const uint16_t* up_biases   [[buffer(5)]],   // [out_dim, num_groups] bf16
-    device const float*    x           [[buffer(6)]],   // [in_dim]
-    device float*          out         [[buffer(7)]],   // [out_dim]
+    device const uint32_t* gate_W      [[buffer(0)]],
+    device const uint16_t* gate_scales [[buffer(1)]],
+    device const uint16_t* gate_biases [[buffer(2)]],
+    device const uint32_t* up_W        [[buffer(3)]],
+    device const uint16_t* up_scales   [[buffer(4)]],
+    device const uint16_t* up_biases   [[buffer(5)]],
+    device const float*    x           [[buffer(6)]],
+    device float*          out         [[buffer(7)]],
     constant uint&         out_dim     [[buffer(8)]],
     constant uint&         in_dim      [[buffer(9)]],
     constant uint&         group_size  [[buffer(10)]],
@@ -150,16 +175,18 @@ kernel void fused_gate_up_swiglu(
 
     uint packed_cols = in_dim / 8;
     uint num_groups = in_dim / group_size;
-    uint pf_gs = group_size / 8; // packed columns per quantization group
+    uint pf_gs = group_size / 8;
 
     float ga[RESULTS_PER_SG] = {0, 0, 0, 0};
     float ua[RESULTS_PER_SG] = {0, 0, 0, 0};
 
     for (uint col = simd_lane; col < packed_cols; col += 32) {
-        device const float* x_ptr = x + col * 8;
+        // Load x ONCE into thread-local registers — reused across all 8 qdot calls
+        thread float xl[9]; // 8 pre-scaled + x_sum
+        load_x4(x + col * 8, xl);
+
         uint g = col / pf_gs;
 
-        // Compute qdot for each row (amortizes x load across RESULTS_PER_SG rows)
         for (uint r = 0; r < RESULTS_PER_SG; r++) {
             uint row = row_base + r;
             if (row >= out_dim) break;
@@ -167,21 +194,16 @@ kernel void fused_gate_up_swiglu(
             uint w_idx = row * packed_cols + col;
             uint sb_idx = row * num_groups + g;
 
-            // Gate qdot
-            float2 gqd = qdot4(x_ptr, gate_W[w_idx]);
-            float gsc = bf16_to_f32(gate_scales[sb_idx]);
-            float gbi = bf16_to_f32(gate_biases[sb_idx]);
-            ga[r] += gsc * gqd.x + gbi * gqd.y;
+            float2 gqd = qdot4_local(xl, gate_W[w_idx]);
+            ga[r] += bf16_to_f32(gate_scales[sb_idx]) * gqd.x
+                   + bf16_to_f32(gate_biases[sb_idx]) * gqd.y;
 
-            // Up qdot
-            float2 uqd = qdot4(x_ptr, up_W[w_idx]);
-            float usc = bf16_to_f32(up_scales[sb_idx]);
-            float ubi = bf16_to_f32(up_biases[sb_idx]);
-            ua[r] += usc * uqd.x + ubi * uqd.y;
+            float2 uqd = qdot4_local(xl, up_W[w_idx]);
+            ua[r] += bf16_to_f32(up_scales[sb_idx]) * uqd.x
+                   + bf16_to_f32(up_biases[sb_idx]) * uqd.y;
         }
     }
 
-    // SIMD reduction + SwiGLU write
     for (uint r = 0; r < RESULTS_PER_SG; r++) {
         uint row = row_base + r;
         if (row >= out_dim) break;
@@ -197,17 +219,13 @@ kernel void fused_gate_up_swiglu(
 // ============================================================================
 // Kernel 2: Optimized 4-bit dequant matrix-vector multiply (qdot)
 // ============================================================================
-//
-// For down projection (or any single matvec with quantized weights).
-// Each simdgroup computes RESULTS_PER_SG=4 output rows via qdot.
-// Thread-private registers only — no threadgroup shared memory.
 
 kernel void dequant_matvec_4bit(
-    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/8]
-    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
-    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
-    device const float*    x          [[buffer(3)]],  // [in_dim]
-    device float*          out        [[buffer(4)]],  // [out_dim]
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
     constant uint&         out_dim    [[buffer(5)]],
     constant uint&         in_dim     [[buffer(6)]],
     constant uint&         group_size [[buffer(7)]],
@@ -225,17 +243,18 @@ kernel void dequant_matvec_4bit(
     float acc[RESULTS_PER_SG] = {0, 0, 0, 0};
 
     for (uint col = simd_lane; col < packed_cols; col += 32) {
-        device const float* x_ptr = x + col * 8;
+        thread float xl[9];
+        load_x4(x + col * 8, xl);
+
         uint g = col / pf_gs;
 
         for (uint r = 0; r < RESULTS_PER_SG; r++) {
             uint row = row_base + r;
             if (row >= out_dim) break;
 
-            float2 qd = qdot4(x_ptr, W_packed[row * packed_cols + col]);
-            float scale = bf16_to_f32(scales[row * num_groups + g]);
-            float bias  = bf16_to_f32(biases[row * num_groups + g]);
-            acc[r] += scale * qd.x + bias * qd.y;
+            float2 qd = qdot4_local(xl, W_packed[row * packed_cols + col]);
+            acc[r] += bf16_to_f32(scales[row * num_groups + g]) * qd.x
+                    + bf16_to_f32(biases[row * num_groups + g]) * qd.y;
         }
     }
 
@@ -253,16 +272,13 @@ kernel void dequant_matvec_4bit(
 // ============================================================================
 // Kernel 3: 2-bit dequant matrix-vector multiply (qdot)
 // ============================================================================
-//
-// Same structure as 4-bit but packs 16 x 2-bit values per uint32.
-// ~44% smaller expert files for proportionally faster SSD streaming.
 
 kernel void dequant_matvec_2bit(
-    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/16]
-    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
-    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
-    device const float*    x          [[buffer(3)]],  // [in_dim]
-    device float*          out        [[buffer(4)]],  // [out_dim]
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
     constant uint&         out_dim    [[buffer(5)]],
     constant uint&         in_dim     [[buffer(6)]],
     constant uint&         group_size [[buffer(7)]],
@@ -273,24 +289,25 @@ kernel void dequant_matvec_2bit(
     uint row_base = tgid * ROWS_PER_TG + simd_group * RESULTS_PER_SG;
     if (row_base >= out_dim) return;
 
-    uint packed_cols = in_dim / 16;  // 16 values per uint32 for 2-bit
+    uint packed_cols = in_dim / 16;
     uint num_groups = in_dim / group_size;
     uint pf_gs = group_size / 16;
 
     float acc[RESULTS_PER_SG] = {0, 0, 0, 0};
 
     for (uint col = simd_lane; col < packed_cols; col += 32) {
-        device const float* x_ptr = x + col * 16;
+        thread float xl[17]; // 16 pre-scaled + x_sum
+        load_x2(x + col * 16, xl);
+
         uint g = col / pf_gs;
 
         for (uint r = 0; r < RESULTS_PER_SG; r++) {
             uint row = row_base + r;
             if (row >= out_dim) break;
 
-            float2 qd = qdot2(x_ptr, W_packed[row * packed_cols + col]);
-            float scale = bf16_to_f32(scales[row * num_groups + g]);
-            float bias  = bf16_to_f32(biases[row * num_groups + g]);
-            acc[r] += scale * qd.x + bias * qd.y;
+            float2 qd = qdot2_local(xl, W_packed[row * packed_cols + col]);
+            acc[r] += bf16_to_f32(scales[row * num_groups + g]) * qd.x
+                    + bf16_to_f32(biases[row * num_groups + g]) * qd.y;
         }
     }
 
@@ -308,34 +325,24 @@ kernel void dequant_matvec_2bit(
 // ============================================================================
 // Kernel 4: Gather + Quantized MatMul + SwiGLU (resident mode, qdot)
 // ============================================================================
-//
-// For resident inference where all expert weights fit in GPU memory.
-// Replaces the 3x gather_mm + silu + multiply pattern.
-//
-// Uses FC_BITS function constant for PSO specialization (no runtime branch).
-// Each simdgroup computes RESULTS_PER_SG output rows for one token-expert pair.
-// Thread-private registers — no threadgroup shared memory.
-//
-// Grid: ceil(intermediate / ROWS_PER_TG) * N * K
-// Where N = number of tokens, K = top-k experts per token.
 
 struct GatherQmmSwigluParams {
-    uint hidden_dim;            // Input dimension (D)
-    uint intermediate_dim;      // Output dimension per gate/up (I)
-    uint num_tokens;            // N
-    uint topk;                  // K
+    uint hidden_dim;
+    uint intermediate_dim;
+    uint num_tokens;
+    uint topk;
 };
 
 kernel void gather_qmm_swiglu(
-    device const uint32_t* gate_weights  [[buffer(0)]],  // [E, I, D/pack_factor]
-    device const uint16_t* gate_scales   [[buffer(1)]],  // [E, I, D/group_size]
-    device const uint16_t* gate_biases   [[buffer(2)]],  // [E, I, D/group_size]
-    device const uint32_t* up_weights    [[buffer(3)]],  // [E, I, D/pack_factor]
-    device const uint16_t* up_scales     [[buffer(4)]],  // [E, I, D/group_size]
-    device const uint16_t* up_biases     [[buffer(5)]],  // [E, I, D/group_size]
-    device const float*    input         [[buffer(6)]],  // [N, D]
-    device const uint*     expert_ids    [[buffer(7)]],  // [N, K]
-    device float*          output        [[buffer(8)]],  // [N, K, I]
+    device const uint32_t* gate_weights  [[buffer(0)]],
+    device const uint16_t* gate_scales   [[buffer(1)]],
+    device const uint16_t* gate_biases   [[buffer(2)]],
+    device const uint32_t* up_weights    [[buffer(3)]],
+    device const uint16_t* up_scales     [[buffer(4)]],
+    device const uint16_t* up_biases     [[buffer(5)]],
+    device const float*    input         [[buffer(6)]],
+    device const uint*     expert_ids    [[buffer(7)]],
+    device float*          output        [[buffer(8)]],
     constant GatherQmmSwigluParams& params [[buffer(9)]],
     uint tgid       [[threadgroup_position_in_grid]],
     uint simd_lane  [[thread_index_in_simdgroup]],
@@ -345,27 +352,23 @@ kernel void gather_qmm_swiglu(
     uint I = params.intermediate_dim;
     uint K = params.topk;
 
-    // Determine which (token, expert_slot, output_row_tile) this threadgroup handles
     uint tiles_per_token_expert = (I + ROWS_PER_TG - 1) / ROWS_PER_TG;
     uint token_expert_idx = tgid / tiles_per_token_expert;
     uint tile_idx = tgid % tiles_per_token_expert;
 
-    uint n = token_expert_idx / K;  // token index
-    uint k = token_expert_idx % K;  // expert slot
+    uint n = token_expert_idx / K;
+    uint k = token_expert_idx % K;
     uint row_base = tile_idx * ROWS_PER_TG + simd_group * RESULTS_PER_SG;
 
     if (n >= params.num_tokens || row_base >= I) return;
 
-    // Look up which expert this token-slot maps to
     uint expert_id = expert_ids[n * K + k];
 
-    // Compute layout constants using function constants
     uint pack_factor = (FC_BITS == 2) ? 16 : 8;
     uint packed_cols = D / pack_factor;
     uint num_groups = D / FC_GROUP_SIZE;
     uint pf_gs = FC_GROUP_SIZE / pack_factor;
 
-    // Per-expert weight base offsets
     uint expert_weight_offset = expert_id * I * packed_cols;
     uint expert_scale_offset = expert_id * I * num_groups;
 
@@ -374,42 +377,52 @@ kernel void gather_qmm_swiglu(
     float ga[RESULTS_PER_SG] = {0, 0, 0, 0};
     float ua[RESULTS_PER_SG] = {0, 0, 0, 0};
 
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        device const float* x_ptr = x_in + col * pack_factor;
-        uint g = col / pf_gs;
+    if (FC_BITS == 4) {
+        for (uint col = simd_lane; col < packed_cols; col += 32) {
+            thread float xl[9];
+            load_x4(x_in + col * 8, xl);
+            uint g = col / pf_gs;
 
-        for (uint r = 0; r < RESULTS_PER_SG; r++) {
-            uint row = row_base + r;
-            if (row >= I) break;
+            for (uint r = 0; r < RESULTS_PER_SG; r++) {
+                uint row = row_base + r;
+                if (row >= I) break;
 
-            uint w_idx = expert_weight_offset + row * packed_cols + col;
-            uint sb_idx = expert_scale_offset + row * num_groups + g;
+                uint w_idx = expert_weight_offset + row * packed_cols + col;
+                uint sb_idx = expert_scale_offset + row * num_groups + g;
 
-            if (FC_BITS == 4) {
-                // Gate qdot (4-bit)
-                float2 gqd = qdot4(x_ptr, gate_weights[w_idx]);
+                float2 gqd = qdot4_local(xl, gate_weights[w_idx]);
                 ga[r] += bf16_to_f32(gate_scales[sb_idx]) * gqd.x
                        + bf16_to_f32(gate_biases[sb_idx]) * gqd.y;
 
-                // Up qdot (4-bit)
-                float2 uqd = qdot4(x_ptr, up_weights[w_idx]);
+                float2 uqd = qdot4_local(xl, up_weights[w_idx]);
                 ua[r] += bf16_to_f32(up_scales[sb_idx]) * uqd.x
                        + bf16_to_f32(up_biases[sb_idx]) * uqd.y;
-            } else {
-                // Gate qdot (2-bit)
-                float2 gqd = qdot2(x_ptr, gate_weights[w_idx]);
+            }
+        }
+    } else {
+        for (uint col = simd_lane; col < packed_cols; col += 32) {
+            thread float xl[17];
+            load_x2(x_in + col * pack_factor, xl);
+            uint g = col / pf_gs;
+
+            for (uint r = 0; r < RESULTS_PER_SG; r++) {
+                uint row = row_base + r;
+                if (row >= I) break;
+
+                uint w_idx = expert_weight_offset + row * packed_cols + col;
+                uint sb_idx = expert_scale_offset + row * num_groups + g;
+
+                float2 gqd = qdot2_local(xl, gate_weights[w_idx]);
                 ga[r] += bf16_to_f32(gate_scales[sb_idx]) * gqd.x
                        + bf16_to_f32(gate_biases[sb_idx]) * gqd.y;
 
-                // Up qdot (2-bit)
-                float2 uqd = qdot2(x_ptr, up_weights[w_idx]);
+                float2 uqd = qdot2_local(xl, up_weights[w_idx]);
                 ua[r] += bf16_to_f32(up_scales[sb_idx]) * uqd.x
                        + bf16_to_f32(up_biases[sb_idx]) * uqd.y;
             }
         }
     }
 
-    // SIMD reduction + SwiGLU write
     for (uint r = 0; r < RESULTS_PER_SG; r++) {
         uint row = row_base + r;
         if (row >= I) break;
@@ -425,32 +438,28 @@ kernel void gather_qmm_swiglu(
 // ============================================================================
 // Kernel 5: Gather + Dequant MatVec (down projection for resident mode, qdot)
 // ============================================================================
-//
-// Phase 2 of gather_qmm_swiglu: applies down projection per expert.
-// Uses FC_BITS function constant for PSO specialization.
-// Thread-private registers — no threadgroup shared memory.
 
 struct GatherDequantMatvecParams {
-    uint in_dim;       // Intermediate dimension (I) — input to down proj
-    uint out_dim;      // Hidden dimension (D) — output of down proj
-    uint num_tokens;   // N
-    uint topk;         // K
+    uint in_dim;
+    uint out_dim;
+    uint num_tokens;
+    uint topk;
 };
 
 kernel void gather_dequant_matvec(
-    device const uint32_t* down_weights [[buffer(0)]],  // [E, D, I/pack_factor]
-    device const uint16_t* down_scales  [[buffer(1)]],  // [E, D, I/group_size]
-    device const uint16_t* down_biases  [[buffer(2)]],  // [E, D, I/group_size]
-    device const float*    input        [[buffer(3)]],  // [N, K, I] — SwiGLU output
-    device const uint*     expert_ids   [[buffer(4)]],  // [N, K]
-    device float*          output       [[buffer(5)]],  // [N, K, D]
+    device const uint32_t* down_weights [[buffer(0)]],
+    device const uint16_t* down_scales  [[buffer(1)]],
+    device const uint16_t* down_biases  [[buffer(2)]],
+    device const float*    input        [[buffer(3)]],
+    device const uint*     expert_ids   [[buffer(4)]],
+    device float*          output       [[buffer(5)]],
     constant GatherDequantMatvecParams& params [[buffer(6)]],
     uint tgid       [[threadgroup_position_in_grid]],
     uint simd_lane  [[thread_index_in_simdgroup]],
     uint simd_group [[simdgroup_index_in_threadgroup]]
 ) {
-    uint I = params.in_dim;   // intermediate
-    uint D = params.out_dim;  // hidden
+    uint I = params.in_dim;
+    uint D = params.out_dim;
     uint K = params.topk;
 
     uint tiles_per_token_expert = (D + ROWS_PER_TG - 1) / ROWS_PER_TG;
@@ -477,23 +486,38 @@ kernel void gather_dequant_matvec(
 
     float acc[RESULTS_PER_SG] = {0, 0, 0, 0};
 
-    for (uint col = simd_lane; col < packed_cols; col += 32) {
-        device const float* x_ptr = x_in + col * pack_factor;
-        uint g = col / pf_gs;
+    if (FC_BITS == 4) {
+        for (uint col = simd_lane; col < packed_cols; col += 32) {
+            thread float xl[9];
+            load_x4(x_in + col * 8, xl);
+            uint g = col / pf_gs;
 
-        for (uint r = 0; r < RESULTS_PER_SG; r++) {
-            uint row = row_base + r;
-            if (row >= D) break;
+            for (uint r = 0; r < RESULTS_PER_SG; r++) {
+                uint row = row_base + r;
+                if (row >= D) break;
 
-            uint w_idx = expert_weight_offset + row * packed_cols + col;
-            uint sb_idx = expert_scale_offset + row * num_groups + g;
+                uint w_idx = expert_weight_offset + row * packed_cols + col;
+                uint sb_idx = expert_scale_offset + row * num_groups + g;
 
-            if (FC_BITS == 4) {
-                float2 qd = qdot4(x_ptr, down_weights[w_idx]);
+                float2 qd = qdot4_local(xl, down_weights[w_idx]);
                 acc[r] += bf16_to_f32(down_scales[sb_idx]) * qd.x
                         + bf16_to_f32(down_biases[sb_idx]) * qd.y;
-            } else {
-                float2 qd = qdot2(x_ptr, down_weights[w_idx]);
+            }
+        }
+    } else {
+        for (uint col = simd_lane; col < packed_cols; col += 32) {
+            thread float xl[17];
+            load_x2(x_in + col * pack_factor, xl);
+            uint g = col / pf_gs;
+
+            for (uint r = 0; r < RESULTS_PER_SG; r++) {
+                uint row = row_base + r;
+                if (row >= D) break;
+
+                uint w_idx = expert_weight_offset + row * packed_cols + col;
+                uint sb_idx = expert_scale_offset + row * num_groups + g;
+
+                float2 qd = qdot2_local(xl, down_weights[w_idx]);
                 acc[r] += bf16_to_f32(down_scales[sb_idx]) * qd.x
                         + bf16_to_f32(down_biases[sb_idx]) * qd.y;
             }
