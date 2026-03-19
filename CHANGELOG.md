@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Training orchestrator** (`pmetal-trainer::orchestrator`): Single `run_training()` entry point replaces four separate training pipeline implementations (CLI ~1000 lines, GUI ~190 lines, easy API ~200 lines, TUI bridge ~70 lines). All consumers now share one canonical pipeline with: ANE training with GPU fallback, QLoRA and standard LoRA, all dispatch modes (packed, compiled, metal-fused, standard), adaptive LR, checkpointing, metrics callbacks, and phase status reporting. Net -1300 lines of duplicated pipeline code
+- **`TrainingJobConfig` struct**: Replaces 38 positional parameters with a typed config struct. Includes `DispatchConfig` (optimization flags), `QLoraOrchConfig` (quantization), `TrainingPhase` enum (status reporting), and `PhaseCallback` trait (GUI/TUI status wiring)
+- **ANE large-vocab support** (`VocabMap::from_token_ids`, `VocabMap::remap_u32`): ANE training now correctly handles models with vocab > 65536 (e.g. Qwen3 @ 151936). Token IDs are processed as u32 through VocabMap compaction before converting to the u16 format required by ANE IOSurface operations. Previously, u32→u16 casting silently truncated IDs above 65535, corrupting embeddings and gradients
+- **ANE first-class metrics**: ANE training path now wires `MetricsJsonCallback` with per-step metrics (loss, tok/s, ANE timing breakdowns), config JSON, and user-provided callbacks (cancel support). Previously ANE produced no metrics output, making GUI/TUI appear stuck during ANE training
+
+### Fixed
+
+- **GUI metrics not updating during training**: Metrics file watcher now detects file truncation (from ANE→GPU fallback) and resets read position. Previously `last_pos` exceeded the new file length after truncation, causing the watcher to skip all new data indefinitely
+- **GUI output path relative to process cwd**: Training output now resolves to `~/pmetal-output/` instead of relative to the GUI's working directory (`crates/pmetal-gui/src-tauri/`). Absolute paths from the frontend are preserved as-is
+- **GPU metrics callback truncates ANE metrics**: GPU `MetricsJsonCallback` creation moved to after ANE attempt completes, so ANE metrics aren't wiped on fallback
+- **GUI drops warmup/lr_schedule/save_steps/logging_steps**: All four fields from the GUI training config DTO are now properly mapped to `TrainingConfig` instead of falling through to defaults
+- **Phase status not visible in GUI**: Added `tokio::task::yield_now()` after each phase emit in pre-MLX orchestrator phases and ANE path, allowing the tokio runtime to deliver status events between blocking operations
+- **TUI missing `embedding_lr` and `lr_schedule` parsing**: Direct training path now parses `--embedding-lr` and `--lr-schedule` args that were previously ignored
+- **Easy API drops `embedding_lr`**: `FinetuneBuilder` now maps `embedding_lr` into `TrainingConfig.embedding_learning_rate`
+
 - **GUI live training dashboard**: Full-screen live view replaces the config form when training is active. Includes real-time loss curve (SVG), metric cards (loss, best loss, tok/s, LR, grad norm, progress %), run details panel with hyperparameters, and progress bar. Config form returns when training stops
 - **GUI cached dataset dropdown**: Dataset selector uses a `<select>` dropdown (matching the model selector style) with cached HuggingFace datasets, plus a text input for custom paths or HF dataset IDs
 - **GUI dataset column picker**: When a dataset is selected, columns are auto-detected and shown in dropdowns for text, prompt (loss masking), and format selection. Falls back to manual text input when columns can't be detected
