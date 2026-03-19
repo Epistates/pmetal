@@ -1239,16 +1239,10 @@ async fn attempt_ane_training(
         }
     }
 
-    // Wire user-provided callbacks ONLY here — after all fallible setup.
-    // If ANE training fails after this point and we fall back to GPU,
-    // the callbacks are consumed and won't be available for the GPU path.
-    // This is acceptable because once we reach here, ANE kernel compilation
-    // succeeded and training failure is rare.
-    if let Some(callbacks) = extra_callbacks.take() {
-        for callback in callbacks {
-            training_loop.add_callback(callback);
-        }
-    }
+    // Do NOT wire user-provided callbacks (cancel, GUI metrics) into the ANE
+    // training loop. ANE failure is common (hardware rejection) and consuming
+    // the callbacks here would leave the GPU fallback path without them.
+    // The ANE loop still gets the MetricsJsonCallback for JSONL logging.
 
     // -----------------------------------------------------------------------
     // Train
