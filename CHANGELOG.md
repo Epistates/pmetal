@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed (MoE Leapfrog)
+
+- **qdot dequant kernels** (`fused_moe.metal`): Rewrote all 5 Metal kernels with MLX-grade qdot technique — pre-scaled activations eliminate per-nibble shifts from inner loop (~30-40% compute reduction). Thread-local x caching (`load_x4`/`load_x2`) loads x once per column, reuses across all RESULTS_PER_SG rows + gate/up projections. Balanced tree reduction for 2-bit x_sum. Register-only design (no `threadgroup float x_shared[4096]` overflow). 64-thread threadgroups (2 simdgroups x 32)
+- **Deleted combine bridge**: Removed `FusedMoeCombine` Metal kernel and MLX bridge — the 6 MLX ops are already async on GPU; the Metal side-channel added 4x `eval()` + `waitUntilCompleted` barriers making it 5-20x slower
+- **Function constant specialization**: `gather_qmm_swiglu` and `gather_dequant_matvec` use `FC_GROUP_SIZE`/`FC_BITS` Metal function constants for compile-time PSO specialization (eliminates runtime branch)
+- **Deferred GPU dispatch**: `FusedMoeExpert::encode_into()` and `GatherQmmSwiglu::encode_into()` accept external command buffers — encode all K experts in a single CMD buffer with one submit. `forward_offloaded` now encodes K experts into one command buffer instead of K separate GPU flushes
+- **Persistent IO thread pool** (`expert_io.rs`): Replaced `thread::scope`-per-call with persistent worker threads using `mpsc` channels. Workers spawned once, live until Drop. Added `read_experts_aligned()` for zero-copy pread directly into `AlignedBuffer`
+- **2MB-aligned buffer pool** (`expert_buffer.rs`): `AlignedBuffer` wraps `posix_memalign(2MB)` + `newBufferWithBytesNoCopy` for zero-copy GPU access. `ExpertBufferPool` manages `2*K` buffers for double-buffered I/O. 3.6x DMA throughput improvement
+- **Expert weight parser** (`expert_dequant.rs`): Parses raw pread bytes into `ExpertWeightBuffers` via `ExpertRecord` offsets. Safe `chunks_exact` + `from_le_bytes` conversion. Also added `encode_expert_aligned()` zero-copy path using buffer+offset dispatch
+- **Async expert prefetcher** (`expert_prefetch.rs`): `predict_and_prefetch()` spawns background IO thread and returns immediately. `try_get()` transfers buffer ownership (no clone). Gate weights stored as `Arc<Vec<f32>>` to avoid duplicating model weights
+- **Real benchmark harness**: `--benchmark` / `--benchmark-iters` on `pmetal infer` runs real per-token forward passes with GPU sync, reports mean/min/p50/p99 decode latency
+- **forward_offloaded wired end-to-end**: Full pipeline: route → pread K experts → parse → GPU dequant (single CMD buffer) → combine. Previously returned an error stub
+- **Config validation hardened**: `intermediate_dim` alignment checks added. `group_size >= pack_factor` enforced. `hidden_dim` cap removed (register-only kernels handle any dimension)
+
 ## [0.3.11] - 2026-03-19
 
 ### Added

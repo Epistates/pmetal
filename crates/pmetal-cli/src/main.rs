@@ -5389,31 +5389,62 @@ async fn run_inference(
 
     // ── Benchmark mode ────────────────────────────────────────────────────────
     if benchmark {
-        println!("\n=== Benchmark Mode ===");
-        println!(
-            "[prefill] {} tokens in {:.1} ms",
-            output.num_generated.min(1), // At least 1 token was the "prefill"
-            elapsed.as_secs_f64() * 1000.0 / output.num_generated.max(1) as f64
-        );
+        use std::time::Instant;
 
-        // Per-token decode timing: generate single tokens N times
-        // We already did one full generation above. Now measure decode latency
-        // by timing the average per-token cost from the initial generation.
-        let avg_ms = elapsed.as_secs_f64() * 1000.0 / output.num_generated.max(1) as f64;
-        let best_tps = tokens_per_sec;
+        println!("\n=== Benchmark Mode ({} decode iterations) ===", benchmark_iters);
 
-        println!("[decode benchmark - {} iterations from initial generation]", benchmark_iters.max(1));
-        for i in 0..benchmark_iters {
-            let iter_ms = avg_ms * (1.0 + (i as f64 * 0.001)); // Slight variance for realism
-            let iter_tps = 1000.0 / iter_ms;
-            println!(
-                "  [{i}] {:.1} ms ({:.2} tok/s)",
-                iter_ms, iter_tps
-            );
+        // Initial generation gives us TTFT (time to first token) and overall throughput.
+        // Now measure per-token decode latency by running independent single-token
+        // forward passes through the primed KV cache.
+        let last_token_id = output.token_ids.last().copied().unwrap_or(1);
+
+        let mut decode_times_ms: Vec<f64> = Vec::with_capacity(benchmark_iters);
+
+        // Warm-up: one forward pass to prime caches/pipelines
+        {
+            let input = mlx_rs::Array::from_slice(&[last_token_id as i32], &[1, 1]);
+            if let Ok(ref logits_w) = model.forward_with_hybrid_cache(
+                &input, None, Some(&mut cache), mamba_cache.as_mut(),
+            ) {
+                let _ = logits_w.eval();
+            }
         }
 
-        println!("[average] {:.1} ms ({:.2} tok/s)", avg_ms, tokens_per_sec);
-        println!("[best]    {:.1} ms ({:.2} tok/s)", avg_ms * 0.98, best_tps * 1.02);
+        // Timed decode iterations: each is a real single-token forward pass
+        for i in 0..benchmark_iters {
+            let input = mlx_rs::Array::from_slice(&[last_token_id as i32], &[1, 1]);
+
+            let t0 = Instant::now();
+            let logits = model.forward_with_hybrid_cache(
+                &input, None, Some(&mut cache), mamba_cache.as_mut(),
+            );
+            // Synchronize GPU to ensure timing includes all GPU work
+            if let Ok(ref l) = logits { let _ = l.eval(); }
+            let dt = t0.elapsed();
+
+            let ms = dt.as_secs_f64() * 1000.0;
+            let tps = 1000.0 / ms;
+            decode_times_ms.push(ms);
+
+            let status = if logits.is_ok() { "ok" } else { "err" };
+            println!("  [{i}] {ms:.1} ms ({tps:.2} tok/s)  [{status}]");
+        }
+
+        if !decode_times_ms.is_empty() {
+            // Statistics
+            let mut sorted = decode_times_ms.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let n = sorted.len();
+            let mean = sorted.iter().sum::<f64>() / n as f64;
+            let min = sorted[0];
+            let p50 = sorted[n / 2];
+            let p99 = sorted[(n * 99 / 100).min(n - 1)];
+
+            println!("[mean]    {mean:.1} ms ({:.2} tok/s)", 1000.0 / mean);
+            println!("[min]     {min:.1} ms ({:.2} tok/s)", 1000.0 / min);
+            println!("[p50]     {p50:.1} ms ({:.2} tok/s)", 1000.0 / p50);
+            println!("[p99]     {p99:.1} ms ({:.2} tok/s)", 1000.0 / p99);
+        }
 
         // Memory stats
         let mem_stats = pmetal_mlx::memory::get_memory_stats();
