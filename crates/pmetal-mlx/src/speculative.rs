@@ -652,9 +652,11 @@ mod tests {
         let mut decoder = SpeculativeDecoder::new(config);
 
         // Low acceptance scenario: target prefers different tokens
-        let draft_tokens = vec![1, 2, 3];
-        let draft_probs = vec![0.9, 0.9, 0.9]; // Draft is confident
-        let target_probs = vec![0.1, 0.1, 0.1]; // Target disagrees
+        // Use many tokens with near-zero acceptance probability so flaky passes
+        // are astronomically unlikely (accept_prob = 0.01/0.99 ≈ 0.01 per token)
+        let draft_tokens = vec![1, 2, 3, 4, 5, 6, 7, 8];
+        let draft_probs = vec![0.99; 8]; // Draft is very confident
+        let target_probs = vec![0.01; 8]; // Target strongly disagrees
 
         let result = decoder
             .verify(&draft_tokens, &draft_probs, &target_probs)
