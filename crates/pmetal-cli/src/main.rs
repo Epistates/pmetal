@@ -19,12 +19,10 @@ use pmetal_data::{
     DataLoaderConfig, DatasetColumnConfig, DatasetFormat, Tokenizer, TrainingDataset,
 };
 use pmetal_lora::{DynamicLoraModel, LlamaLoraForCausalLM, TrainableModel};
+use pmetal_models::DynamicModel;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::ollama::{ModelfileBuilder, templates as ollama_templates};
-use pmetal_models::DynamicModel;
-use pmetal_trainer::{
-    GrpoConfig, GrpoTrainer, RlkdConfig, RlkdTrainer, TrainingLoopConfig,
-};
+use pmetal_trainer::{GrpoConfig, GrpoTrainer, RlkdConfig, RlkdTrainer, TrainingLoopConfig};
 
 /// Re-export FullTrainingConfig from orchestrator for YAML config generation.
 use pmetal_trainer::orchestrator::FullTrainingConfig;
@@ -4038,7 +4036,13 @@ fn save_adapter_config(
     target_modules: &[String],
     use_rslora: bool,
 ) -> anyhow::Result<()> {
-    pmetal_trainer::orchestrator::save_adapter_config(lora_weights_path, r, alpha, target_modules, use_rslora)
+    pmetal_trainer::orchestrator::save_adapter_config(
+        lora_weights_path,
+        r,
+        alpha,
+        target_modules,
+        use_rslora,
+    )
 }
 
 /// Run GRPO (Group Relative Policy Optimization) for reasoning models.

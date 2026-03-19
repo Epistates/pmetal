@@ -448,13 +448,9 @@ impl FinetuneBuilder {
             emit_console_output: false,
         };
 
-        let result = orchestrator::run_training(
-            job_config,
-            phase_cb.as_deref(),
-            self.callbacks,
-        )
-        .await
-        .map_err(training_err)?;
+        let result = orchestrator::run_training(job_config, phase_cb.as_deref(), self.callbacks)
+            .await
+            .map_err(training_err)?;
 
         Ok(FinetuneResult {
             final_loss: result.final_loss,

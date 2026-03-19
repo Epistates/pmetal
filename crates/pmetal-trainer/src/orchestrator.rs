@@ -11,9 +11,7 @@
 
 use std::path::{Component, Path, PathBuf};
 
-use pmetal_core::{
-    DatasetConfig, LoraConfig, ModelConfig, TrainingCallback, TrainingConfig,
-};
+use pmetal_core::{DatasetConfig, LoraConfig, ModelConfig, TrainingCallback, TrainingConfig};
 use pmetal_data::{
     DataLoaderConfig, DatasetColumnConfig, DatasetFormat, DatasetSource, Tokenizer,
     TrainingDataset, resolve_dataset_source,
@@ -238,9 +236,7 @@ pub async fn run_training(
         anyhow::bail!("A model is required. Specify --model <model_id> or set model_id in config.");
     }
     if config.dataset.is_empty() {
-        anyhow::bail!(
-            "A dataset is required. Specify --dataset <path> or set dataset in config."
-        );
+        anyhow::bail!("A dataset is required. Specify --dataset <path> or set dataset in config.");
     }
 
     let use_qlora = config
@@ -460,19 +456,21 @@ pub async fn run_training(
         } else if metrics_path.contains('/') || metrics_path.contains('\\') {
             // Relative path with directories — resolve against output_dir
             PathBuf::from(&output_dir).join(
-                p.file_name().unwrap_or(std::ffi::OsStr::new("metrics.jsonl")),
+                p.file_name()
+                    .unwrap_or(std::ffi::OsStr::new("metrics.jsonl")),
             )
         } else {
             PathBuf::from(&output_dir).join(metrics_path)
         }
     });
     let has_metrics_cb = metrics_path_resolved.is_some();
-    let mut metrics_callback: Option<Box<dyn TrainingCallback>> =
-        if let Some(ref path) = metrics_path_resolved {
-            // Create the metrics callback NOW (after ANE attempt).
-            // This truncates the file — safe because ANE either succeeded
-            // (and we returned early) or failed (and its partial metrics are stale).
-            let mut callback = MetricsJsonCallback::new(path)?
+    let mut metrics_callback: Option<Box<dyn TrainingCallback>> = if let Some(ref path) =
+        metrics_path_resolved
+    {
+        // Create the metrics callback NOW (after ANE attempt).
+        // This truncates the file — safe because ANE either succeeded
+        // (and we returned early) or failed (and its partial metrics are stale).
+        let mut callback = MetricsJsonCallback::new(path)?
                 .with_run_name(format!(
                     "{}-{}",
                     full_config.model.model_id.replace('/', "-"),
@@ -489,11 +487,11 @@ pub async fn run_training(
                     "gradient_checkpointing": config.dispatch.gradient_checkpointing,
                     "quantization": format!("{:?}", config.qlora.as_ref().map(|q| q.scheme).unwrap_or_default()),
                 }));
-            callback.on_train_start();
-            Some(Box::new(callback) as Box<dyn TrainingCallback>)
-        } else {
-            None
-        };
+        callback.on_train_start();
+        Some(Box::new(callback) as Box<dyn TrainingCallback>)
+    } else {
+        None
+    };
 
     // -----------------------------------------------------------------------
     // Phase 8: Set up training infrastructure
@@ -526,7 +524,10 @@ pub async fn run_training(
         use_sequence_packing: config.dispatch.sequence_packing,
         gradient_checkpointing: config.dispatch.gradient_checkpointing,
         gradient_checkpointing_layers: config.dispatch.gradient_checkpointing_layers,
-        embedding_lr: full_config.training.embedding_learning_rate.map(|v| v as f32),
+        embedding_lr: full_config
+            .training
+            .embedding_learning_rate
+            .map(|v| v as f32),
         eager_evaluation: true,
         use_metal_fused_optimizer: config.dispatch.metal_fused_optimizer,
         loraplus_lr_ratio: None,
@@ -1230,8 +1231,10 @@ async fn attempt_ane_training(
         let metrics_path = if p.is_absolute() {
             p
         } else {
-            PathBuf::from(output_dir)
-                .join(p.file_name().unwrap_or(std::ffi::OsStr::new("metrics.jsonl")))
+            PathBuf::from(output_dir).join(
+                p.file_name()
+                    .unwrap_or(std::ffi::OsStr::new("metrics.jsonl")),
+            )
         };
         if let Ok(cb) = crate::MetricsJsonCallback::new(&metrics_path) {
             let cb = cb
@@ -1314,14 +1317,17 @@ fn load_dataset(
         } else {
             // Try well-known column names, then fall back to converting
             // parquet → temporary JSONL for chat-format datasets (e.g. "messages" column).
-            let result = TrainingDataset::from_parquet_tokenized(
-                path, tokenizer, "text", max_seq_len, None,
-            );
+            let result =
+                TrainingDataset::from_parquet_tokenized(path, tokenizer, "text", max_seq_len, None);
             if let Ok(ds) = result {
                 return Ok(ds);
             }
             let result = TrainingDataset::from_parquet_tokenized(
-                path, tokenizer, "content", max_seq_len, None,
+                path,
+                tokenizer,
+                "content",
+                max_seq_len,
+                None,
             );
             if let Ok(ds) = result {
                 return Ok(ds);
@@ -1329,14 +1335,17 @@ fn load_dataset(
             // Parquet with chat format (e.g. "messages" column): convert to
             // temporary JSONL and use the full-featured JSONL pipeline which
             // handles OpenAI/ShareGPT/Alpaca formats with chat templates.
-            tracing::info!("Parquet has no text/content column — converting to JSONL for chat format detection");
+            tracing::info!(
+                "Parquet has no text/content column — converting to JSONL for chat format detection"
+            );
             let tmp_dir = std::env::temp_dir().join("pmetal-parquet-convert");
             std::fs::create_dir_all(&tmp_dir)?;
             let tmp_jsonl = tmp_dir.join("converted.jsonl");
             {
                 use std::io::Write;
                 let file = std::fs::File::open(path)?;
-                let builder = parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
+                let builder =
+                    parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder::try_new(file)?;
                 let reader = builder.build()?;
                 let mut out = std::io::BufWriter::new(std::fs::File::create(&tmp_jsonl)?);
                 let mut buf = Vec::new();
