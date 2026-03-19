@@ -242,6 +242,12 @@ enum Commands {
         #[arg(long)]
         embedding_lr: Option<f32>,
 
+        /// Loss scaling factor for ANE training (default: 1.0).
+        /// Multiplies gradients during backward to prevent fp32 underflow
+        /// at >350M params. Automatically unscaled before optimizer step.
+        #[arg(long, default_value = "1.0")]
+        loss_scale: f32,
+
         /// Number of linear warmup steps before reaching the target learning rate.
         #[arg(long, default_value = "0")]
         warmup_steps: usize,
@@ -1933,6 +1939,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             gradient_checkpointing_layers,
             log_metrics,
             embedding_lr,
+            loss_scale,
             warmup_steps,
             lr_schedule,
             weight_decay,
@@ -2055,6 +2062,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                     ane: !no_ane,
                     #[cfg(not(feature = "ane"))]
                     ane: false,
+                    loss_scale,
                     #[cfg(feature = "distributed")]
                     distributed,
                 },
@@ -4953,7 +4961,7 @@ async fn run_inference(
     }
 
     // Load sampling defaults from model's generation_config.json
-    let defaults = load_sampling_defaults(&model_path, use_chat && !no_thinking);
+    let defaults = pmetal_data::inference_config::load_sampling_defaults(&model_path, use_chat && !no_thinking);
 
     // Apply CLI overrides over model defaults
     let temperature = temperature.unwrap_or(defaults.temperature);
@@ -4980,7 +4988,7 @@ async fn run_inference(
     tracing::info!("Tokenized {} tokens", input_ids.len());
 
     // Configure stop tokens — unified collection from all sources
-    let stop_tokens = collect_all_stop_tokens(
+    let stop_tokens = pmetal_data::inference_config::collect_all_stop_tokens(
         &model_path,
         &tokenizer,
         if use_chat { Some(template_type) } else { None },
@@ -5342,178 +5350,7 @@ async fn run_inference(
 /// Many models (like Qwen3) have multiple EOS tokens that should all stop generation.
 #[allow(dead_code)]
 fn get_eos_tokens(model_path: &Path, tokenizer: &Tokenizer) -> Vec<u32> {
-    collect_all_stop_tokens(model_path, tokenizer, None)
-}
-
-/// Collect all stop tokens from every available source.
-///
-/// Merges tokens from:
-/// 1. `generation_config.json` — the model's declared `eos_token_id` (single or array)
-/// 2. Chat template EOS — the template-specific end token (e.g. `<|im_end|>` for ChatML)
-/// 3. Tokenizer's `eos_token_id` — resolved from special_tokens_map / heuristics
-/// 4. Well-known special tokens — if they exist in the vocabulary as single tokens,
-///    they're likely EOS candidates (e.g. `<|im_end|>`, `<|eot_id|>`, `<|endoftext|>`)
-///
-/// Returns a deduplicated list. This ensures fine-tuned models stop correctly
-/// regardless of whether they produce the base model's EOS or the chat EOS.
-fn collect_all_stop_tokens(
-    model_path: &Path,
-    tokenizer: &Tokenizer,
-    template_type: Option<pmetal_data::chat_templates::ChatTemplateType>,
-) -> Vec<u32> {
-    let mut tokens = Vec::new();
-
-    // 1. generation_config.json
-    let config_path = model_path.join("generation_config.json");
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(eos) = config.get("eos_token_id") {
-                    if let Some(arr) = eos.as_array() {
-                        for v in arr {
-                            if let Some(id) = v.as_u64() {
-                                tokens.push(id as u32);
-                            }
-                        }
-                    } else if let Some(id) = eos.as_u64() {
-                        tokens.push(id as u32);
-                    }
-                }
-            }
-        }
-    }
-
-    // 2. Chat template EOS (if template type is known)
-    if let Some(tt) = template_type {
-        let eos_str = tt.eos_token();
-        if let Ok(encoded) = tokenizer.encode(eos_str) {
-            if encoded.len() == 1 {
-                tokens.push(encoded[0]);
-            }
-        }
-    }
-
-    // 3. Tokenizer's resolved eos_token_id
-    if let Some(eos) = tokenizer.eos_token_id() {
-        tokens.push(eos);
-    }
-
-    // 4. Well-known special tokens — probe the vocabulary for common EOS tokens.
-    //    Only add tokens that encode to exactly 1 token (i.e. they're real special tokens,
-    //    not subword sequences).
-    let candidates = [
-        "<|im_end|>",
-        "<|eot_id|>",
-        "<|eot|>",
-        "<|endoftext|>",
-        "<|end_of_text|>",
-        "<end_of_turn>",
-        "<|end|>",
-        "<|return|>",
-        "<|END_OF_TURN_TOKEN|>",
-        "<｜end▁of▁sentence｜>",
-        "</s>",
-    ];
-    for candidate in &candidates {
-        if let Ok(encoded) = tokenizer.encode(candidate) {
-            if encoded.len() == 1 {
-                tokens.push(encoded[0]);
-            }
-        }
-    }
-
-    // Deduplicate
-    tokens.sort_unstable();
-    tokens.dedup();
-
-    // Final fallback
-    if tokens.is_empty() {
-        tokens.push(2);
-    }
-
-    tracing::debug!("Collected stop tokens: {:?}", tokens);
-    tokens
-}
-
-/// Sampling hyperparameter defaults loaded from model config.
-struct SamplingDefaults {
-    temperature: f32,
-    top_k: usize,
-    top_p: f32,
-    min_p: f32,
-    repetition_penalty: f32,
-    frequency_penalty: f32,
-    presence_penalty: f32,
-}
-
-impl Default for SamplingDefaults {
-    fn default() -> Self {
-        // Qwen3 recommended defaults for non-thinking mode
-        Self {
-            temperature: 0.7,
-            top_k: 20,
-            top_p: 0.8,
-            min_p: 0.0,
-            repetition_penalty: 1.0,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
-        }
-    }
-}
-
-/// Load sampling defaults from model's generation_config.json.
-///
-/// Uses Qwen3 recommended values as fallback:
-/// - Thinking mode: temp=0.6, top_p=0.95, top_k=20, min_p=0
-/// - Non-thinking mode: temp=0.7, top_p=0.8, top_k=20, min_p=0
-fn load_sampling_defaults(model_path: &Path, thinking_mode: bool) -> SamplingDefaults {
-    // Start with mode-appropriate defaults
-    let mut defaults = if thinking_mode {
-        SamplingDefaults {
-            temperature: 0.6,
-            top_k: 20,
-            top_p: 0.95,
-            min_p: 0.0,
-            repetition_penalty: 1.0,
-            frequency_penalty: 0.0,
-            presence_penalty: 0.0,
-        }
-    } else {
-        SamplingDefaults::default()
-    };
-
-    // Try to load from generation_config.json
-    let config_path = model_path.join("generation_config.json");
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                // Load each parameter if present
-                if let Some(v) = config.get("temperature").and_then(|v| v.as_f64()) {
-                    defaults.temperature = v as f32;
-                }
-                if let Some(v) = config.get("top_k").and_then(|v| v.as_u64()) {
-                    defaults.top_k = v as usize;
-                }
-                if let Some(v) = config.get("top_p").and_then(|v| v.as_f64()) {
-                    defaults.top_p = v as f32;
-                }
-                if let Some(v) = config.get("min_p").and_then(|v| v.as_f64()) {
-                    defaults.min_p = v as f32;
-                }
-                if let Some(v) = config.get("repetition_penalty").and_then(|v| v.as_f64()) {
-                    defaults.repetition_penalty = v as f32;
-                }
-                if let Some(v) = config.get("frequency_penalty").and_then(|v| v.as_f64()) {
-                    defaults.frequency_penalty = v as f32;
-                }
-                if let Some(v) = config.get("presence_penalty").and_then(|v| v.as_f64()) {
-                    defaults.presence_penalty = v as f32;
-                }
-            }
-        }
-    }
-
-    defaults
+    pmetal_data::inference_config::collect_all_stop_tokens(model_path, tokenizer, None)
 }
 
 /// Check if a model is instruction-tuned based on its configuration.
@@ -6154,7 +5991,7 @@ async fn run_inference_with_lora(
     }
 
     // Load sampling defaults from model's generation_config.json
-    let defaults = load_sampling_defaults(model_path, use_chat && !no_thinking);
+    let defaults = pmetal_data::inference_config::load_sampling_defaults(model_path, use_chat && !no_thinking);
 
     // Apply CLI overrides over model defaults
     let temperature = temperature.unwrap_or(defaults.temperature);
@@ -6180,7 +6017,7 @@ async fn run_inference_with_lora(
     tracing::info!("Tokenized {} tokens", input_ids.len());
 
     // Configure stop tokens — unified collection from all sources
-    let stop_tokens = collect_all_stop_tokens(
+    let stop_tokens = pmetal_data::inference_config::collect_all_stop_tokens(
         model_path,
         tokenizer,
         if use_chat { Some(template_type) } else { None },
