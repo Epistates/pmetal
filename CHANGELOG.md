@@ -7,23 +7,44 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.11] - 2026-03-19
+
 ### Added
 
+- **`pmetal-data::inference_config` module**: `load_sampling_defaults()` and `collect_all_stop_tokens()` extracted from the CLI and easy API into a shared module consumed by the CLI, GUI Tauri backend, and Python bindings. Eliminates duplicated stop-token and sampling-default logic across three call sites
+- **`pmetal-hub::resolve` module**: `resolve_model_path()` exposed as a public re-export, shared by the trainer orchestrator, Python bindings, and Tauri commands without duplicating the download-or-local-path logic
+- **`pmetal-trainer::preference_data` module**: Preference dataset handling for DPO/RLKD training workflows; `resolve_dataset_path()` made public and re-exported from `lib.rs`
+- **GUI streaming inference via Tauri commands**: `run_inference_streaming()` helper uses `pmetal-data` / `pmetal-hub` / `pmetal-models` directly (replaces former `easy::infer()` builder call), enabling real token-by-token streaming with full stop-token and sampling-config support
+- **CLI `--loss-scale` flag**: Multiplies gradients during backward for ANE training at >350M params to prevent fp32 underflow; automatically unscaled before the optimizer step. Default `1.0` (no change to existing behaviour)
+- **`inference.rs` example**: Low-level inference example using `pmetal-models` / `pmetal-hub` / `pmetal-data` directly, without the easy builder API
+- **Comprehensive documentation site** (`docs/`): Getting-started, installation, hardware, models, training, CLI reference (21 commands), configuration, SDK, Python, and contributing guides
 - **Metal GPU backward kernels** (`dw_gemm.metal`, `dw_gemm.rs`): Tiled fp32 SGEMM kernel replaces per-layer cblas CPU worker thread for weight gradient GEMMs in ANE training. All 7 per-layer dW GEMMs are encoded into a single `BatchedCommandBuffer` for one GPU-CPU sync per step. `LayerGradients` fields migrated from `Vec<f32>` to `MetalBuffer<f32>` (shared unified memory, zero-copy CPU/GPU access). Projected 5.5x backward pass speedup at 579M params
 - **GUI adapter discovery** (`list_trained_adapters`): Scans `~/pmetal-output/` for trained LoRA adapters. Reads `adapter_config.json` + `training_info.json` for rank, alpha, base model, and dataset metadata. Displays descriptive names like "Qwen3-0.6B-Base + alpaca-cleaned r=16"
 - **GUI adapter dropdowns**: Fuse modal and inference page replace manual path entry with adapter select dropdowns. "Custom path..." fallback for arbitrary paths. Fuse modal auto-fills base model when adapter has known metadata
 - **GUI inference chat UX**: Copy button on all messages (hover reveal with checkmark feedback), regenerate button on assistant responses (re-runs same prompt with current config)
 - **GUI auto-named training output**: Default output directory is now `~/pmetal-output/{model}-{method}-{YYYYMMDD-HHMM}` instead of generic `output`. Training writes `training_info.json` with base model, dataset, and method metadata
 - **GUI chat template support**: Inference applies model-specific chat templates (ChatML, Llama3, Gemma, Nemotron, etc.) via `detect_chat_template()`. System message passed through template formatting instead of raw concatenation
-- **GUI streaming inference**: GPU (Metal) path used for inference instead of ANE, enabling real token-by-token streaming
 - **`save_adapter_config_with_base()`**: Adapter config now includes `base_model` field for adapter discovery
+
+### Removed
+
+- **`pmetal::easy` module** (breaking for direct users): The high-level `easy::finetune()` / `easy::infer()` builder API is removed from the `pmetal` umbrella crate. Callers should use `pmetal_trainer::orchestrator::run_training()` for training and the `pmetal-models` / `pmetal-hub` / `pmetal-data` crates directly for inference. The `easy` feature flag is removed from `Cargo.toml`; the `data` feature is added to the default set
+- **`inference_easy.rs` and `finetune_easy.rs` examples**: Removed alongside the easy API. Replaced by `inference.rs` and `finetune_manual.rs`
 
 ### Fixed
 
+- **CLI inference helper duplication**: `load_sampling_defaults` and `collect_all_stop_tokens` were defined inline in `main.rs` (~170 loc); now delegated to `pmetal_data::inference_config`. No logic change
+- **Trainer `resolve_model_path` Hub routing**: Previously had a feature-flag branch that fell through to a local-path fallback even when the Hub feature was enabled; now unconditionally delegates to `pmetal_hub::resolve_model_path()`
 - **ANE inference adapter loading**: `load_lora_adapter()` now accepts both `"alpha"` and `"lora_alpha"` keys in adapter_config.json, and checks for both `lora_weights.safetensors` (pmetal) and `adapter_model.safetensors` (HF/PEFT)
 - **GUI inference chat template encoding**: Uses `encode_with_special_tokens()` for chat-template-formatted prompts so special tokens (`<|im_start|>`, `<|im_end|>`) are properly tokenized instead of split into subwords. Fixes models like Nemotron generating one token then stopping
 - **Qwen3.5 multimodal weight loading**: `load_qwen3_next_weights()` skips `model.visual.*` and other non-text weights instead of erroring, allowing text-only inference from multimodal model checkpoints
-- **NemotronH hybrid inference**: `easy.rs` streaming path now creates and passes Mamba cache for hybrid models (NemotronH). Previously passed `None`, causing recurrent layers to produce garbage after the first token
+- **NemotronH hybrid inference**: Streaming path now creates and passes Mamba cache for hybrid models (NemotronH). Previously passed `None`, causing recurrent layers to produce garbage after the first token
+
+### Changed
+
+- **`crates/pmetal-gui/build/` gitignored**: Build artifact directory removed from git tracking. The bare `build` gitignore rule scoped to `crates/pmetal-gui/build/` to avoid ignoring unintended directories
+- **Minimum Rust version bumped to 1.86**: Updated README badge, CONTRIBUTING prerequisites, and related documentation
+- **CLI commands table in README**: Documents `rlkd` and `embed-train` commands added in 0.3.9; updates `grpo` description to mention VLM, speculative, and async-rewards modes
 
 ## [0.3.10] - 2026-03-18
 
