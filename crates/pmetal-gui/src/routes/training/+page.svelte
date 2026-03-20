@@ -1126,15 +1126,6 @@
       </div>
       <form onsubmit={handleFuse} class="card-body space-y-4">
         <div>
-          <label class="label" for="fuse-base">Base Model</label>
-          <select id="fuse-base" class="input" bind:value={fuseBaseModel}>
-            <option value="">Select base model...</option>
-            {#each models as model}
-              <option value={model.id}>{model.id}</option>
-            {/each}
-          </select>
-        </div>
-        <div>
           <label class="label" for="fuse-lora">LoRA Adapter</label>
           {#if trainedAdapters.length > 0 && !fuseCustomPath}
             <select id="fuse-lora" class="input" bind:value={fuseLoraPath} onchange={(e) => {
@@ -1164,6 +1155,10 @@
           {/if}
         </div>
         <div>
+          <label class="label" for="fuse-base">Base Model</label>
+          <input id="fuse-base" type="text" class="input bg-surface-100 dark:bg-surface-700 cursor-not-allowed" value={fuseBaseModel || '(auto-detected from adapter)'} readonly />
+        </div>
+        <div>
           <label class="label" for="fuse-output">Output Directory</label>
           <input id="fuse-output" type="text" class="input" placeholder="/path/to/fused-model" bind:value={fuseOutputDir} />
         </div>
@@ -1174,15 +1169,20 @@
           <div class="p-3 rounded-lg bg-green-50 dark:bg-green-900/20 text-green-700 dark:text-green-300 text-sm" role="status">{fuseSuccess}</div>
         {/if}
         <div class="flex gap-3">
-          <button type="submit" class="btn-primary flex-1" disabled={isFusing || !fuseBaseModel || !fuseLoraPath}>
-            {#if isFusing}
-              <div class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" aria-hidden="true"></div>
-              Fusing...
-            {:else}
-              Fuse
-            {/if}
-          </button>
-          <button type="button" class="btn-secondary" onclick={() => (showFuseModal = false)}>Cancel</button>
+          {#if fuseSuccess}
+            <button type="submit" class="btn-primary flex-1" disabled={isFusing || !fuseBaseModel || !fuseLoraPath}>Fuse Another</button>
+            <button type="button" class="btn-secondary" onclick={() => (showFuseModal = false)}>Done</button>
+          {:else}
+            <button type="submit" class="btn-primary flex-1" disabled={isFusing || !fuseBaseModel || !fuseLoraPath}>
+              {#if isFusing}
+                <div class="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" aria-hidden="true"></div>
+                Fusing...
+              {:else}
+                Fuse
+              {/if}
+            </button>
+            <button type="button" class="btn-secondary" onclick={() => (showFuseModal = false)}>Cancel</button>
+          {/if}
         </div>
       </form>
     </div>

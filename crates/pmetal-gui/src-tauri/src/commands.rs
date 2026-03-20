@@ -1522,9 +1522,20 @@ async fn run_inference_streaming(
                         .as_f64()
                         .or_else(|| cfg["lora_alpha"].as_f64())
                         .unwrap_or(32.0) as f32;
+                    let target_modules: Vec<String> = cfg["target_modules"]
+                        .as_array()
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    let use_rslora = cfg["use_rslora"].as_bool().unwrap_or(false);
                     LoraConfig {
                         r,
                         alpha,
+                        target_modules,
+                        use_rslora,
                         ..LoraConfig::default()
                     }
                 } else {
@@ -1539,6 +1550,12 @@ async fn run_inference_streaming(
         model
             .load_lora_weights(lora_path)
             .map_err(|e| e.to_string())?;
+        model
+            .merge_lora()
+            .map_err(|e| format!("Failed to merge LoRA: {e}"))?;
+        model
+            .eval_all()
+            .map_err(|e| format!("Failed to eval merged model: {e}"))?;
 
         let mut cache = model
             .create_cache(max_seq_len)
@@ -1762,7 +1779,10 @@ pub async fn fuse_lora(
     lora_path: String,
     output_dir: String,
 ) -> Result<FuseResult> {
-    let base_model_task = base_model.clone();
+    // Resolve remote model IDs (e.g. "unsloth/Qwen3-0.6B-Base") before the
+    // blocking fuse step, since `run_fuse_in_process` cannot be async.
+    let resolved_base = resolve_model_path(&base_model).await?;
+    let base_model_task = resolved_base.to_string_lossy().into_owned();
     let lora_path_task = lora_path.clone();
     let output_dir_task = output_dir.clone();
 
@@ -2727,13 +2747,9 @@ fn run_fuse_in_process(
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
 
-    let model_dir: PathBuf = if model_path.contains('/') && !PathBuf::from(model_path).exists() {
-        return Err(AppError(
-            "Fuse with remote base models is not supported in the GUI yet.".to_string(),
-        ));
-    } else {
-        PathBuf::from(model_path)
-    };
+    // The caller (`fuse_lora`) has already resolved remote model IDs to local
+    // cache paths, so model_path is always a local directory at this point.
+    let model_dir: PathBuf = PathBuf::from(model_path);
 
     let lora_file = if Path::new(lora_path).is_dir() {
         let f = Path::new(lora_path).join("lora_weights.safetensors");
@@ -2806,12 +2822,20 @@ fn run_fuse_in_process(
             continue;
         };
 
+        let base_dtype = base_weight.dtype();
         let delta = ops::matmul(lora_b, lora_a)
             .map_err(|e| AppError(e.to_string()))?;
         let scaled_delta = ops::multiply(&delta, pmetal::mlx::Array::from_f32(scale))
             .map_err(|e| AppError(e.to_string()))?;
         let fused = ops::add(base_weight, &scaled_delta)
             .map_err(|e| AppError(e.to_string()))?;
+        // Cast back to base dtype (LoRA is f32, base is typically bf16/f16 —
+        // without this cast the fused model is 2x larger than necessary)
+        let fused = if fused.dtype() != base_dtype {
+            fused.as_dtype(base_dtype).map_err(|e| AppError(e.to_string()))?
+        } else {
+            fused
+        };
         base_weights.insert(base_key, fused);
     }
 
@@ -2833,8 +2857,25 @@ fn run_fuse_in_process(
     }
 
     let output_file = output_dir.join("model.safetensors");
-    pmetal::mlx::Array::save_safetensors(&base_weights, None, &output_file)
+    let metadata = std::collections::HashMap::from([("format".to_string(), "mlx".to_string())]);
+    pmetal::mlx::Array::save_safetensors(&base_weights, Some(&metadata), &output_file)
         .map_err(|e| AppError(e.to_string()))?;
+
+    // Generate model.safetensors.index.json (required by LM Studio and other tools)
+    let mut weight_map = serde_json::Map::new();
+    let mut total_size: u64 = 0;
+    for (key, arr) in &base_weights {
+        weight_map.insert(key.clone(), serde_json::Value::String("model.safetensors".to_string()));
+        total_size += arr.nbytes() as u64;
+    }
+    let index = serde_json::json!({
+        "metadata": { "total_size": total_size },
+        "weight_map": weight_map,
+    });
+    std::fs::write(
+        output_dir.join("model.safetensors.index.json"),
+        serde_json::to_string_pretty(&index).map_err(|e| AppError(e.to_string()))?,
+    )?;
     Ok(())
 }
 

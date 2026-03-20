@@ -272,7 +272,14 @@
         <label for="inf-lora" class="sr-only">LoRA adapter</label>
         {#if trainedAdapters.length > 0 && !loraCustomPath}
           <select id="inf-lora" class="input text-sm" bind:value={loraPath} onchange={(e) => {
-            if ((e.target as HTMLSelectElement).value === '__custom__') { loraCustomPath = true; loraPath = ''; }
+            const selectedValue = (e.target as HTMLSelectElement).value;
+            if (selectedValue === '__custom__') { loraCustomPath = true; loraPath = ''; return; }
+            // Auto-select matching base model when a LoRA adapter is chosen
+            const adapter = trainedAdapters.find(a => a.path === selectedValue);
+            if (adapter?.base_model) {
+              const match = models.find(m => m.id === adapter.base_model || m.id.endsWith('/' + adapter.base_model));
+              if (match) selectedModel = match.id;
+            }
           }}>
             <option value="">No adapter (base model)</option>
             {#each trainedAdapters as adapter}
