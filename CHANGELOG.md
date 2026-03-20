@@ -29,6 +29,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Reasoning dataset training producing no `<think>` tags**: When GUI/CLI set custom text columns (`thinking`, `solution`) with prompt column `problem`, the Custom format path bypassed the Reasoning format's `<think>`/`</think>` tag injection. Auto-detection now routes reasoning-pattern columns to the Reasoning format. Also fixed prompt-column loss masking when prompt isn't in text columns (prompt is now prepended to training text)
+- **Adaptive LR controller too aggressive**: Divergence detection was firing on normal training noise, crushing LR from 2e-4 to 1e-7 within 10% of training. SOTA-aligned overhaul:
+  - Divergence confirmation: requires 2 consecutive positive-slope windows before triggering (was: single window)
+  - Divergence cooldown: 80 steps after reduction before re-checking (was: immediate re-check after 40-step window refill)
+  - Max divergence reductions: capped at 4 (was: unlimited cascading)
+  - ZClip-style spike exclusion from EMA: detected spikes no longer inflate the EMA threshold
+  - Gentler reduction factor: 0.7 per reduction (was: 0.5)
+  - Increased grace period: 15% of training steps (was: 10%)
 - **GUI LoRA inference producing garbage** (`_framework` token repeated): GUI was not reading `target_modules` from adapter_config.json (all modules got rank=16 instead of only attention) and was not merging LoRA weights before inference. Now reads `target_modules`/`use_rslora`, calls `merge_lora()` + `eval_all()` matching the working CLI path
 - **GUI fuse with cached models failing**: "Fuse with remote base models is not supported" error removed — now calls `resolve_model_path()` to download/resolve, matching CLI behavior
 - **Fused model not recognized by LM Studio**: Three fixes:
@@ -46,12 +54,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **GUI fuse modal UX**: "Cancel" becomes "Done" after successful fuse with "Fuse Another" option. Base model field is read-only, auto-detected from LoRA adapter's `adapter_config.json`
 - **GUI inference auto-select**: Selecting a LoRA adapter in inference automatically selects the matching base model (mirrors training page behavior)
 - **Deleted MoE combine bridge**: Removed `FusedMoeCombine` Metal kernel — the 6 MLX ops are already async on GPU; the Metal side-channel added sync barriers making it 5-20x slower
-- **Fused MoE Metal kernels** (`fused_moe.metal`, `fused_moe.rs`): High-performance fused MoE implementation that handles expert selection, dequantization, and computation in a single pass
-- **Expert Management infrastructure** (`expert_io.rs`, `expert_prefetch.rs`, `expert_layout.rs`): Asynchronous expert prefetching and zero-copy loading from unified memory
-- **DeepSeek-V3 style routing** (`MoERouter`): Auxiliary-loss-free load balancing via dynamic routing bias
-- **`pmetal pack-experts` CLI command**: Preprocessing raw expert weights into optimized layouts for fused MoE kernels
-- **`pmetal-data::inference_config` module**: `load_sampling_defaults()` and `collect_all_stop_tokens()` shared across CLI, GUI, and Python bindings
-- **`pmetal-hub::resolve` module**: `resolve_model_path()` shared by trainer, Python bindings, and Tauri commands
 - **GUI streaming inference**: Token-by-token streaming with full stop-token and sampling-config support
 - **CLI `--loss-scale` flag**: Gradient scaling for ANE training at >350M params
 - **Comprehensive documentation site** (`docs/`): Getting-started, installation, hardware, models, training, CLI reference (21 commands), configuration, SDK, Python, and contributing guides
@@ -64,27 +66,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Removed
 
 - **`pmetal::easy` module** (breaking): Removed in favor of direct `pmetal-models` / `pmetal-hub` / `pmetal-data` usage
-
-### Fixed
-
-- **GUI LoRA inference producing garbage**: GUI was not reading `target_modules` from adapter_config.json and was not merging LoRA weights before inference. Now reads `target_modules`/`use_rslora`, calls `merge_lora()` + `eval_all()`
-- **GUI fuse with cached models failing**: "Fuse with remote base models is not supported" error removed — now calls `resolve_model_path()`
-- **Fused model not recognized by LM Studio**: Safetensors metadata `format: mlx`, generates `model.safetensors.index.json`, preserves base dtype (bf16/f16) instead of upcasting to f32
-- **Serve security**: Default bind `127.0.0.1`, sanitized error responses, 2MB body limit, removed `unsafe impl Sync`
-- **Serve extra forward pass**: Decode loop no longer runs wasted forward pass after final token
-- **Serve SSE error handling**: `[DONE]` no longer emitted after errors
-- **Serve UTF-8 streaming**: Token buffering prevents garbled multi-byte characters
-- **CLI inference helper duplication**: Delegated to `pmetal_data::inference_config`
-- **ANE inference adapter loading**: Accepts both `"alpha"` and `"lora_alpha"` keys, checks both `lora_weights.safetensors` and `adapter_model.safetensors`
-- **GUI chat template encoding**: `encode_with_special_tokens()` for proper special token handling
-- **Qwen3.5 multimodal weight loading**: Skips non-text weights instead of erroring
-- **NemotronH hybrid inference**: Creates and passes Mamba cache for hybrid models
-
-### Changed
-
-- **`crates/pmetal-gui/build/` gitignored**: Build artifact directory removed from git tracking. The bare `build` gitignore rule scoped to `crates/pmetal-gui/build/` to avoid ignoring unintended directories
-- **Minimum Rust version bumped to 1.86**: Updated README badge, CONTRIBUTING prerequisites, and related documentation
-- **CLI commands table in README**: Documents `rlkd` and `embed-train` commands added in 0.3.9; updates `grpo` description to mention VLM, speculative, and async-rewards modes
 
 ## [0.3.10] - 2026-03-18
 
