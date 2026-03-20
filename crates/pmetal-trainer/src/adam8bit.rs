@@ -4,6 +4,12 @@
 //! which stores optimizer states (first and second moments) in 8-bit precision
 //! with block-wise dynamic quantization.
 //!
+//! # Status: Not yet integrated
+//!
+//! Adam8bit is implemented with dynamic block-wise scaling and stochastic
+//! rounding, providing ~2x memory savings over fp32 Adam, but is not yet
+//! wired into the CLI optimizer selection.
+//!
 //! # Memory Savings
 //!
 //! Traditional Adam stores:

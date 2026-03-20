@@ -38,6 +38,12 @@
 //! let config = NEFTuneConfig::default(); // alpha=5
 //! let noisy_embeds = apply_neftune(&embeds, &config)?;
 //! ```
+//!
+//! # Status: Not yet integrated
+//!
+//! `apply_neftune()` is fully implemented and tested, but is not yet called from any
+//! LoRA or SFT training forward pass. Next step: wire into the embedding layer of each
+//! training architecture, guarded by a `NEFTuneConfig::enabled` flag in the trainer config.
 
 use mlx_rs::{Array, error::Exception};
 

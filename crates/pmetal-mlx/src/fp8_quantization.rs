@@ -21,6 +21,13 @@
 //! // Run inference (uses native FP8 operations)
 //! let output = fp8_linear.forward(&input)?;
 //! ```
+//!
+//! # Status: Not yet integrated
+//!
+//! FP8 formats (E4M3/E5M2) are fully implemented with dynamic scaling and tests pass,
+//! but `Fp8Linear` is not yet wired into the model quantization pipelines or training
+//! loops. Next step: hook into the weight-loading path and expose an `--fp8` flag in
+//! the training/inference CLI.
 
 use mlx_rs::Array;
 use mlx_rs::error::Exception;

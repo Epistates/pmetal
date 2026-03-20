@@ -23,6 +23,13 @@
 //! - Works best when draft model has high acceptance rate (>70%)
 //! - Memory overhead: need to load both models
 //! - Most effective for greedy/low-temperature sampling
+//!
+//! # Status: Not yet integrated (end-to-end pipeline)
+//!
+//! `SpeculativeDecoder` is integrated into `pmetal-models/src/speculative.rs`, but the
+//! end-to-end pipeline (draft model + target model loaded together) is not yet exposed
+//! via CLI. Greedy and sampling verification modes are fully implemented. Next step:
+//! add a `pmetal infer --speculative <draft-model>` subcommand that wires both models.
 
 use mlx_rs::{
     Array,

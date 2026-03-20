@@ -145,7 +145,7 @@ impl BigVGAN {
             }
         }
 
-        // Load upsample weights (TODO: implement fully)
+        // Load upsample weights (weight_g normalization not yet applied)
         for (i, upsample) in self.upsamples.iter_mut().enumerate() {
             let prefix = format!("ups.{}", i);
             if let Ok(weight_v) = tensors.tensor(&format!("{}.weight_v", prefix)) {

@@ -265,9 +265,8 @@ fn downsample_1d(x: &Array, ratio: i32, filter: &Array) -> Result<Array> {
     // Expand filter for group conv: [1, 1, taps] -> [channels, 1, taps]
     let _filter_exp = mlx_rs::ops::broadcast_to(filter, &[channels, 1, filter.dim(2)])?;
 
-    // Apply filter (would need conv1d with groups)
-    // For now, simplified: just downsample without explicit filtering
-    // TODO: Implement proper grouped conv1d
+    // Simplified: downsample without group conv1d filtering.
+    // Full implementation needs conv1d with groups support in mlx-rs.
 
     // Take every ratio-th sample
     let indices: Vec<i32> = (0..length).step_by(ratio as usize).collect();

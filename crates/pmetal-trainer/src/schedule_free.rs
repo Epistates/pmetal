@@ -5,6 +5,12 @@
 //! standard momentum update with a specific interpolation between the current point
 //! and a "conservative" estimate.
 //!
+//! # Status: Not yet integrated
+//!
+//! `ScheduleFreeOptimizer` is implemented and tested but not yet exposed via
+//! CLI. It eliminates the need for learning rate schedulers by averaging
+//! iterate sequences, requiring only a constant LR to be set.
+//!
 //! # Key Benefits
 //!
 //! - No learning rate schedule tuning required (just set a constant LR)

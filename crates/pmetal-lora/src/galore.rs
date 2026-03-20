@@ -5,6 +5,11 @@
 //! The optimizer states are maintained only for the projected (low-rank) gradients,
 //! significantly reducing memory usage.
 //!
+//! # Status: Not yet integrated
+//!
+//! GaLore is implemented and tested (SVD and random projection types) but is
+//! not yet wired into the CLI or any training loop.
+//!
 //! # Algorithm
 //!
 //! 1. Compute gradient G ∈ ℝ^(m×n)

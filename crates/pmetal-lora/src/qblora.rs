@@ -4,6 +4,12 @@
 //! overly complex adapter inputs/outputs lead to underfitting. It simplifies
 //! the adapter's inputs and outputs while increasing the adapter's rank.
 //!
+//! # Status: Not yet integrated
+//!
+//! QB-LoRA is implemented and tested but not yet exposed via CLI. It addresses
+//! QLoRA underfitting by balancing quantization error through input/output
+//! projection simplification paired with higher adapter rank.
+//!
 //! # The Imbalance Problem
 //!
 //! In standard QLoRA:

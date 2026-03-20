@@ -22,7 +22,7 @@ pub fn run() {
         .setup(|app| {
             #[cfg(desktop)]
             {
-                // TODO: re-enable once signing key is configured in CI
+                // Auto-updater disabled — requires signing key in CI.
                 // app.handle()
                 //     .plugin(tauri_plugin_updater::Builder::new().build())?;
                 app.handle()

@@ -14,6 +14,13 @@
 //! - Basic checkpointing: ~60% memory reduction
 //! - Smart checkpointing: ~70-80% memory reduction
 //! - With offloading: Up to 90% reduction (slower)
+//!
+//! # Status: Not yet integrated
+//!
+//! `SmartCheckpointContext` and `LongContextManager` are fully implemented with smart
+//! scheduling and disk checkpointing, but are not yet wired into the training loop's
+//! forward/backward pass. Next step: integrate alongside the existing gradient checkpoint
+//! path and expose via a `--smart-checkpoint` flag in the training CLI.
 
 use mlx_rs::{Array, error::Exception};
 use std::collections::HashMap;

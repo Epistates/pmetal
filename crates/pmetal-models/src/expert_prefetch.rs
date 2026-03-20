@@ -19,6 +19,13 @@
 //!            hit  → take prefetched buffers (zero-copy, ownership transfer)
 //!            miss → synchronous pread fallback
 //! ```
+//!
+//! # Status: Not yet integrated
+//!
+//! `ExpertPrefetcher` needs to be wired into the MoE inference loop alongside
+//! `ExpertOffloadContext`. Background pread prefetching is fully implemented,
+//! but the prediction→consumption pipeline is not yet hooked into any
+//! architecture's forward pass.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
