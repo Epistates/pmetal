@@ -26,10 +26,8 @@ use pmetal_models::architectures::{
 };
 
 use crate::{
-    LoraError, QLoraConfig, TrainableModel,
-    gemma_qlora::GemmaQloraForCausalLM,
-    llama_qlora::LlamaQloraForCausalLM,
-    mistral_qlora::MistralQloraForCausalLM,
+    LoraError, QLoraConfig, TrainableModel, gemma_qlora::GemmaQloraForCausalLM,
+    llama_qlora::LlamaQloraForCausalLM, mistral_qlora::MistralQloraForCausalLM,
     qwen3_qlora::Qwen3QloraForCausalLM,
 };
 
@@ -70,8 +68,9 @@ impl DynamicQloraModel {
     ) -> Result<Self, LoraError> {
         let model_dir = model_dir.as_ref();
 
-        let arch = ModelArchitecture::detect(model_dir)
-            .map_err(|e| LoraError::InvalidState(format!("Failed to detect model architecture: {}", e)))?;
+        let arch = ModelArchitecture::detect(model_dir).map_err(|e| {
+            LoraError::InvalidState(format!("Failed to detect model architecture: {}", e))
+        })?;
 
         let config_path = model_dir.join("config.json");
         let config_content = std::fs::read_to_string(&config_path)
@@ -79,26 +78,30 @@ impl DynamicQloraModel {
 
         match arch {
             ModelArchitecture::Llama | ModelArchitecture::Llama4 => {
-                let cfg: LlamaConfig = serde_json::from_str(&config_content)
-                    .map_err(|e| LoraError::InvalidState(format!("Failed to parse Llama config: {}", e)))?;
+                let cfg: LlamaConfig = serde_json::from_str(&config_content).map_err(|e| {
+                    LoraError::InvalidState(format!("Failed to parse Llama config: {}", e))
+                })?;
                 let model = LlamaQloraForCausalLM::with_qlora_config(cfg, qlora_config)?;
                 Ok(Self::Llama(model))
             }
             ModelArchitecture::Mistral | ModelArchitecture::Granite => {
-                let cfg: MistralConfig = serde_json::from_str(&config_content)
-                    .map_err(|e| LoraError::InvalidState(format!("Failed to parse Mistral config: {}", e)))?;
+                let cfg: MistralConfig = serde_json::from_str(&config_content).map_err(|e| {
+                    LoraError::InvalidState(format!("Failed to parse Mistral config: {}", e))
+                })?;
                 let model = MistralQloraForCausalLM::with_qlora_config(cfg, qlora_config)?;
                 Ok(Self::Mistral(model))
             }
             ModelArchitecture::Qwen3 | ModelArchitecture::Qwen2 => {
-                let cfg: Qwen3Config = serde_json::from_str(&config_content)
-                    .map_err(|e| LoraError::InvalidState(format!("Failed to parse Qwen3 config: {}", e)))?;
+                let cfg: Qwen3Config = serde_json::from_str(&config_content).map_err(|e| {
+                    LoraError::InvalidState(format!("Failed to parse Qwen3 config: {}", e))
+                })?;
                 let model = Qwen3QloraForCausalLM::with_qlora_config(cfg, qlora_config)?;
                 Ok(Self::Qwen3(model))
             }
             ModelArchitecture::Gemma | ModelArchitecture::RecurrentGemma => {
-                let cfg: GemmaConfig = serde_json::from_str(&config_content)
-                    .map_err(|e| LoraError::InvalidState(format!("Failed to parse Gemma config: {}", e)))?;
+                let cfg: GemmaConfig = serde_json::from_str(&config_content).map_err(|e| {
+                    LoraError::InvalidState(format!("Failed to parse Gemma config: {}", e))
+                })?;
                 let model = GemmaQloraForCausalLM::with_qlora_config(cfg, qlora_config)?;
                 Ok(Self::Gemma(model))
             }

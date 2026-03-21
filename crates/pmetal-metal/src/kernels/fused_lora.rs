@@ -571,7 +571,7 @@ impl FusedLora {
             let pipeline = {
                 let mut cache = self.ctx.pipeline_cache_mut();
                 let mut constants = std::collections::HashMap::new();
-                constants.insert(0, 32_u32);       // TILE_M (unused by backward_ab)
+                constants.insert(0, 32_u32); // TILE_M (unused by backward_ab)
                 constants.insert(1, TILE_N as u32); // TILE_N
                 constants.insert(2, TILE_K as u32); // TILE_K
                 cache.get_or_create_specialized_pipeline(
@@ -673,8 +673,8 @@ impl FusedLora {
                 let mut cache = self.ctx.pipeline_cache_mut();
                 let mut constants = std::collections::HashMap::new();
                 constants.insert(0, TILE_M_BWD_A as u32); // TILE_M
-                constants.insert(1, 32_u32);               // TILE_N (unused by backward_a)
-                constants.insert(2, TILE_K as u32);        // TILE_K
+                constants.insert(1, 32_u32); // TILE_N (unused by backward_a)
+                constants.insert(2, TILE_K as u32); // TILE_K
                 cache.get_or_create_specialized_pipeline(
                     self.ctx.device(),
                     function_name,
@@ -746,9 +746,9 @@ impl FusedLora {
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
             let mut constants = std::collections::HashMap::new();
-            constants.insert(0, TILE_M as u32);  // function_constant(0): TILE_M
-            constants.insert(1, 32_u32);         // function_constant(1): TILE_N (unused but required)
-            constants.insert(2, TILE_K as u32);  // function_constant(2): TILE_K
+            constants.insert(0, TILE_M as u32); // function_constant(0): TILE_M
+            constants.insert(1, 32_u32); // function_constant(1): TILE_N (unused but required)
+            constants.insert(2, TILE_K as u32); // function_constant(2): TILE_K
             cache.get_or_create_specialized_pipeline(
                 self.ctx.device(),
                 function_name,
