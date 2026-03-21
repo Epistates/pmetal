@@ -19,7 +19,8 @@ use pmetal_data::{
 use pmetal_lora::{DynamicLoraModel, DynamicQloraModel, QLoraConfig, TrainableModel};
 use pmetal_mlx::quantization::QuantScheme;
 use pmetal_models::WeightFormat;
-use pmetal_models::architectures::llama::LlamaConfig;
+// LlamaConfig import removed — config.json is now parsed as generic serde_json::Value
+// to support all architectures (QLoRA uses DynamicQloraModel for arch-specific parsing).
 
 use crate::{
     AdaptiveLrConfig, CheckpointManager, MetricsJsonCallback, TrainingLoop, TrainingLoopConfig,
@@ -235,6 +236,11 @@ pub async fn run_training(
     phase_cb: Option<&dyn PhaseCallback>,
     callbacks: Vec<Box<dyn TrainingCallback>>,
 ) -> anyhow::Result<TrainingResult> {
+    // Log MLX's default memory configuration for diagnostics.
+    // We do NOT override MLX's defaults — it auto-configures based on
+    // the Metal device's recommendedMaxWorkingSetSize.
+    pmetal_mlx::memory::log_memory_stats();
+
     // Validate required fields
     if config.model_id.is_empty() {
         anyhow::bail!("A model is required. Specify --model <model_id> or set model_id in config.");
@@ -281,8 +287,10 @@ pub async fn run_training(
     // -----------------------------------------------------------------------
     // Phase 3: Load model config
     // -----------------------------------------------------------------------
+    // Parse config.json as a generic JSON value for architecture-agnostic field extraction.
+    // Previous versions parsed as LlamaConfig which crashed for non-Llama models.
     let model_config_path = model_path.join("config.json");
-    let llama_config: Option<LlamaConfig> = if model_config_path.exists() {
+    let model_config_json: Option<serde_json::Value> = if model_config_path.exists() {
         let content = std::fs::read_to_string(&model_config_path)?;
         Some(serde_json::from_str(&content)?)
     } else {
@@ -297,8 +305,12 @@ pub async fn run_training(
 
     // Auto-detect max_seq_len if requested (0)
     if full_config.training.max_seq_len == 0 {
-        if let Some(ref cfg) = llama_config {
-            let model_max = cfg.max_position_embeddings as usize;
+        if let Some(ref cfg) = model_config_json {
+            // Try common field names across architectures
+            let model_max = cfg
+                .get("max_position_embeddings")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(8192) as usize;
             full_config.training.max_seq_len = model_max.min(8192);
             tracing::info!(
                 "Auto-detected max_seq_len: {} (model supports {}, capped at 8192)",
@@ -314,13 +326,17 @@ pub async fn run_training(
         }
     }
 
-    if let Some(ref cfg) = llama_config {
-        tracing::info!(
-            "Model: {} hidden, {} layers, {} heads",
-            cfg.hidden_size,
-            cfg.num_hidden_layers,
-            cfg.num_attention_heads
-        );
+    if let Some(ref cfg) = model_config_json {
+        let hidden = cfg.get("hidden_size").and_then(|v| v.as_i64()).unwrap_or(0);
+        let layers = cfg
+            .get("num_hidden_layers")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        let heads = cfg
+            .get("num_attention_heads")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+        tracing::info!("Model: {} hidden, {} layers, {} heads", hidden, layers, heads);
     } else {
         tracing::info!("Model config will be extracted from GGUF metadata");
     }
@@ -409,42 +425,21 @@ pub async fn run_training(
     };
 
     // -----------------------------------------------------------------------
-    // Phase 7: ANE training attempt (if enabled)
-    // Uses the already-tokenized dataset — no duplicate resolution/loading.
+    // Phase 7: ANE training (skipped for LoRA/QLoRA)
+    //
+    // ANE has its own weight format and training kernels — incompatible with
+    // LoRA/QLoRA adapters. The orchestrator always uses LoRA or QLoRA, so we
+    // skip the ANE attempt to avoid loading full model weights into memory
+    // (which would be discarded on failure, doubling peak memory usage).
     // -----------------------------------------------------------------------
-    #[cfg(not(feature = "ane"))]
     if config.dispatch.ane {
-        anyhow::bail!("ANE training requires the 'ane' feature: cargo build --features ane");
+        tracing::debug!(
+            "ANE dispatch requested but skipped: orchestrator uses LoRA/QLoRA \
+             which requires GPU-based adapter training"
+        );
     }
 
     let mut extra_callbacks = Some(callbacks);
-
-    #[cfg(feature = "ane")]
-    if config.dispatch.ane {
-        let ane_result = attempt_ane_training(
-            &config,
-            &full_config,
-            &model_path,
-            &output_dir,
-            phase_cb,
-            &mut extra_callbacks,
-            &train_dataset,
-        )
-        .await;
-
-        match ane_result {
-            Ok(result) => {
-                emit_phase(phase_cb, TrainingPhase::Complete);
-                return Ok(result);
-            }
-            Err(e) => {
-                let msg = format!("{}", e);
-                tracing::warn!("ANE training failed ({}), falling back to GPU", msg);
-                emit_phase(phase_cb, TrainingPhase::AneFallback(msg));
-                tokio::task::yield_now().await;
-            }
-        }
-    }
 
     // -----------------------------------------------------------------------
     // Phase 7: Resolve metrics path (absolute, using canonicalized output_dir)
@@ -549,37 +544,69 @@ pub async fn run_training(
     // NOTE: After this point, MLX types (Rc-based) will be created.
     // No more yields — the future becomes !Send.
 
-    let (final_loss, final_step, total_tokens) = if use_qlora {
-        run_qlora_path(
-            &config,
-            &full_config,
-            &model_path,
-            training_loop_config,
-            train_dataset,
-            eval_dataset,
-            &checkpoint_manager,
-            &mut metrics_callback,
-            &mut extra_callbacks,
-            &output_dir,
-            phase_cb,
-            has_metrics_cb,
-        )?
-    } else {
-        run_lora_path(
-            &config,
-            &full_config,
-            &model_path,
-            training_loop_config,
-            train_dataset,
-            eval_dataset,
-            &checkpoint_manager,
-            &mut metrics_callback,
-            &mut extra_callbacks,
-            &output_dir,
-            phase_cb,
-            has_metrics_cb,
-        )?
+    // Catch panics from MLX/Metal so all frontends (CLI, TUI, GUI) get a
+    // proper error instead of a silent process crash.
+    let training_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if use_qlora {
+            run_qlora_path(
+                &config,
+                &full_config,
+                &model_path,
+                training_loop_config,
+                train_dataset,
+                eval_dataset,
+                &checkpoint_manager,
+                &mut metrics_callback,
+                &mut extra_callbacks,
+                &output_dir,
+                phase_cb,
+                has_metrics_cb,
+            )
+        } else {
+            run_lora_path(
+                &config,
+                &full_config,
+                &model_path,
+                training_loop_config,
+                train_dataset,
+                eval_dataset,
+                &checkpoint_manager,
+                &mut metrics_callback,
+                &mut extra_callbacks,
+                &output_dir,
+                phase_cb,
+                has_metrics_cb,
+            )
+        }
+    }));
+
+    // Drop the training result's captured state (model, optimizer, etc.)
+    // BEFORE clearing the cache. The catch_unwind closure captures references
+    // to the model — those Arrays must be dropped first so their Metal buffers
+    // move from "active" to "cache", then clear_cache() returns them to the OS.
+    let training_outcome = match training_result {
+        Ok(result) => result,
+        Err(panic_payload) => {
+            let msg = if let Some(s) = panic_payload.downcast_ref::<&str>() {
+                format!("Training crashed: {s}")
+            } else if let Some(s) = panic_payload.downcast_ref::<String>() {
+                format!("Training crashed: {s}")
+            } else {
+                "Training crashed (internal panic)".to_string()
+            };
+            // Model + optimizer already dropped (catch_unwind closure ended).
+            pmetal_mlx::memory::clear_cache();
+            pmetal_mlx::memory::log_memory_stats();
+            anyhow::bail!(msg);
+        }
     };
+
+    // For success/error paths, clear cache after extracting the result
+    // (model dropped when catch_unwind closure returned).
+    pmetal_mlx::memory::clear_cache();
+    pmetal_mlx::memory::log_memory_stats();
+
+    let (final_loss, final_step, total_tokens) = training_outcome?;
 
     // -----------------------------------------------------------------------
     // Phase 10: Finalize
@@ -704,6 +731,7 @@ fn run_qlora_path(
         "Trainable parameters: {}",
         format_param_count(model.num_trainable_params())
     );
+    pmetal_mlx::memory::log_memory_stats();
 
     if config.dispatch.gradient_checkpointing {
         if model.supports_gradient_checkpointing() {
@@ -757,6 +785,7 @@ fn run_qlora_path(
     }
 
     tracing::info!("Starting QLoRA training...");
+    pmetal_mlx::memory::log_memory_stats();
     emit_phase(phase_cb, TrainingPhase::Training);
 
     for cb in &mut training_loop.callbacks {
@@ -767,6 +796,7 @@ fn run_qlora_path(
         tracing::warn!("Fused training is not yet supported for QLoRA, using standard training");
     }
 
+    tracing::info!("Entering training_loop.run() for QLoRA...");
     training_loop.run(
         &mut model,
         train_dataset,
@@ -847,6 +877,7 @@ fn run_lora_path(
         "Trainable parameters: {}",
         format_param_count(model.num_trainable_params())
     );
+    pmetal_mlx::memory::log_memory_stats();
 
     if config.dispatch.gradient_checkpointing {
         if model.supports_gradient_checkpointing() {
@@ -1013,6 +1044,7 @@ fn run_lora_path(
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "ane")]
+#[allow(dead_code)] // Will be called when full fine-tuning (non-LoRA) path is added
 async fn attempt_ane_training(
     config: &TrainingJobConfig,
     full_config: &FullTrainingConfig,
