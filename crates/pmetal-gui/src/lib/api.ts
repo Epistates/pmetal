@@ -240,11 +240,21 @@ export interface InferenceConfig {
   lora_path: string | null;
   prompt: string;
   system_message: string | null;
-  temperature: number;
+  temperature: number | null;
   top_k: number | null;
   top_p: number | null;
-  max_tokens: number;
+  min_p: number | null;
+  max_tokens: number | null;
   repetition_penalty: number | null;
+  frequency_penalty: number | null;
+  presence_penalty: number | null;
+  seed: number | null;
+  /** Quantize weights to FP8 E4M3 for ~2x memory savings. */
+  fp8: boolean | null;
+  /** Disable thinking mode for models that support it. */
+  no_thinking: boolean | null;
+  /** Path to packed expert weights directory for SSD-offloaded MoE inference. */
+  experts_dir: string | null;
 }
 
 export interface HubSearchResult {

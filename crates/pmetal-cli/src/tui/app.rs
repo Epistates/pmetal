@@ -1686,6 +1686,9 @@ impl App {
         if self.inference.top_p < 1.0 {
             args.extend(["--top-p".to_string(), self.inference.top_p.to_string()]);
         }
+        if let Some(ref experts_dir) = self.inference.experts_dir {
+            args.extend(["--experts-dir".to_string(), experts_dir.clone()]);
+        }
 
         let spec = CommandSpec {
             job_type: JobType::Infer,

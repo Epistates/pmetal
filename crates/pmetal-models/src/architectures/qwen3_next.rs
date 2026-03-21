@@ -10,6 +10,7 @@
 //! Reference: `mlx-lm/models/qwen3_next.py` (Apple, 2025).
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 
 use mlx_rs::{
@@ -26,6 +27,7 @@ use mlx_rs::{
 use serde::{Deserialize, Serialize};
 
 use crate::expert_io::ExpertOffloadContext;
+use crate::expert_prefetch::ExpertPrefetcher;
 use crate::traits::ModelConfig;
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use pmetal_mlx::{
@@ -815,6 +817,8 @@ pub struct Qwen3NextSparseMoeBlock {
     /// If set, routed expert weights are loaded on-demand from SSD instead of
     /// residing in GPU memory.  `None` means the standard resident path is used.
     pub offload_ctx: Option<Arc<ExpertOffloadContext>>,
+    /// If set, pre-gated prediction engine that prefetches experts in the background.
+    pub prefetcher: Option<Arc<ExpertPrefetcher>>,
 }
 
 impl Qwen3NextSparseMoeBlock {
@@ -847,6 +851,7 @@ impl Qwen3NextSparseMoeBlock {
             norm_topk_prob: config.norm_topk_prob,
             layer_idx: 0,
             offload_ctx: None,
+            prefetcher: None,
         })
     }
 
@@ -1016,9 +1021,49 @@ impl Qwen3NextSparseMoeBlock {
 
         #[cfg(unix)]
         {
-            let expert_bufs = ctx
-                .read_experts(layer_idx, &expert_indices)
-                .map_err(|e| Exception::custom(format!("expert pread layer {layer_idx}: {e}")))?;
+            // ---- Prefetch-aware expert loading ----
+            // Check prefetcher for hits, only pread the misses.
+            let io_start = std::time::Instant::now();
+
+            let prefetched: Vec<Option<Vec<u8>>> = self
+                .prefetcher
+                .as_ref()
+                .map(|p| p.try_get(layer_idx, &expert_indices))
+                .unwrap_or_else(|| vec![None; expert_indices.len()]);
+
+            let miss_ids: Vec<usize> = prefetched
+                .iter()
+                .enumerate()
+                .filter(|(_, buf)| buf.is_none())
+                .map(|(i, _)| expert_indices[i])
+                .collect();
+
+            let miss_bufs = if !miss_ids.is_empty() {
+                ctx.read_experts(layer_idx, &miss_ids)
+                    .map_err(|e| Exception::custom(format!("expert pread layer {layer_idx}: {e}")))?
+            } else {
+                vec![]
+            };
+
+            // Merge hits + misses in original order
+            let mut expert_bufs: Vec<Vec<u8>> = Vec::with_capacity(expert_indices.len());
+            let mut miss_iter = miss_bufs.into_iter();
+            let prefetch_hits = prefetched.iter().filter(|b| b.is_some()).count();
+            for hit in prefetched {
+                expert_bufs.push(match hit {
+                    Some(buf) => buf,
+                    None => miss_iter.next().unwrap(),
+                });
+            }
+
+            let io_us = io_start.elapsed().as_micros();
+            tracing::trace!(
+                layer = layer_idx,
+                io_ms = io_us as f64 / 1000.0,
+                hits = prefetch_hits,
+                misses = miss_ids.len(),
+                "offloaded MoE I/O"
+            );
 
             // ---- Parse + forward each expert via Metal dequant kernels ----
             let metal_ctx = pmetal_metal::context::MetalContext::global()
@@ -1297,6 +1342,12 @@ pub struct Qwen3NextModel {
     #[param]
     pub norm: nn::RmsNorm,
     pub full_attention_interval: i32,
+    /// Shared expert offload context (set via `enable_expert_offloading`).
+    pub offload_ctx: Option<Arc<ExpertOffloadContext>>,
+    /// Pre-gated expert prediction engine (set via `enable_expert_offloading`).
+    pub prefetcher: Option<Arc<ExpertPrefetcher>>,
+    /// Pre-computed indices of MoE layers for fast next-MoE lookup during prefetch.
+    pub moe_layer_indices: Vec<usize>,
 }
 
 impl Qwen3NextModel {
@@ -1309,11 +1360,21 @@ impl Qwen3NextModel {
             .eps(config.rms_norm_eps)
             .build()?;
 
+        let moe_layer_indices: Vec<usize> = layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| matches!(l.mlp, Qwen3NextFeedForward::MoE(_)))
+            .map(|(i, _)| i)
+            .collect();
+
         Ok(Self {
             embed_tokens,
             layers,
             norm,
             full_attention_interval: config.full_attention_interval,
+            offload_ctx: None,
+            prefetcher: None,
+            moe_layer_indices,
         })
     }
 
@@ -1354,6 +1415,20 @@ impl Qwen3NextModel {
 
             let layer_mask = if layer.is_linear { ssm_mask } else { fa_mask };
             hidden = layer.forward(&hidden, layer_mask, kv, mamba)?;
+
+            // Predict + prefetch experts for the next MoE layer (non-blocking).
+            // Uses current layer's output hidden states to predict which experts
+            // the next MoE layer will route to, then dispatches background pread.
+            if let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx) {
+                let search = self.moe_layer_indices.partition_point(|&i| i <= layer_idx);
+                if search < self.moe_layer_indices.len() {
+                    prefetcher.predict_and_prefetch(
+                        self.moe_layer_indices[search],
+                        &hidden,
+                        ctx,
+                    );
+                }
+            }
         }
 
         self.norm.forward(&hidden)
@@ -1420,6 +1495,83 @@ impl Qwen3NextForCausalLM {
 
     pub fn config(&self) -> &Qwen3NextConfig {
         &self.config
+    }
+
+    /// Enable SSD-offloaded MoE inference with expert prefetching.
+    ///
+    /// 1. Opens packed expert files from `experts_dir`
+    /// 2. Extracts gate weights to build the prefetch predictor
+    /// 3. Wires offload context and prefetcher into each MoE layer
+    /// 4. Zeros stacked expert weight arrays to reclaim GPU memory
+    pub fn enable_expert_offloading(&mut self, experts_dir: &Path) -> Result<(), Exception> {
+        let ctx = Arc::new(
+            ExpertOffloadContext::new(experts_dir)
+                .map_err(|e| Exception::custom(format!("expert offload init: {e}")))?,
+        );
+
+        // Extract gate weights from each MoE layer for the prefetcher
+        let mut gate_weights: HashMap<usize, Arc<Vec<f32>>> = HashMap::new();
+        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
+            if let Qwen3NextFeedForward::MoE(ref mut block) = layer.mlp {
+                // Enable offloading on the block (sets offload_ctx + layer_idx)
+                block.enable_offloading(ctx.clone(), layer_idx);
+
+                // Extract gate weight matrix for prefetch prediction
+                let w = block.gate.weight.as_ref().as_type::<f32>()?;
+                w.eval()?;
+                let data: Vec<f32> = w.as_slice().to_vec();
+                gate_weights.insert(layer_idx, Arc::new(data));
+            }
+        }
+
+        let num_moe_layers = gate_weights.len();
+        if num_moe_layers == 0 {
+            return Err(Exception::custom("no MoE layers found to offload"));
+        }
+
+        // Build prefetcher
+        let prefetcher = Arc::new(ExpertPrefetcher::new(
+            gate_weights,
+            self.config.num_experts as usize,
+            self.config.hidden_size as usize,
+            self.config.num_experts_per_tok as usize,
+        ));
+
+        // Wire prefetcher into each MoE block
+        for layer in self.model.layers.iter_mut() {
+            if let Qwen3NextFeedForward::MoE(ref mut block) = layer.mlp {
+                block.prefetcher = Some(prefetcher.clone());
+            }
+        }
+
+        // Store on model for use in forward_with_cache
+        self.model.offload_ctx = Some(ctx.clone());
+        self.model.prefetcher = Some(prefetcher);
+
+        // Zero stacked expert weight arrays to reclaim GPU memory.
+        // The offloaded path loads weights from SSD — these are no longer needed.
+        for layer in self.model.layers.iter_mut() {
+            if let Qwen3NextFeedForward::MoE(ref mut block) = layer.mlp {
+                if block.offload_ctx.is_some() {
+                    *block.switch_mlp_gate_proj = Array::zeros::<f32>(&[1])?;
+                    *block.switch_mlp_up_proj = Array::zeros::<f32>(&[1])?;
+                    *block.switch_mlp_down_proj = Array::zeros::<f32>(&[1])?;
+                }
+            }
+        }
+
+        tracing::info!(
+            moe_layers = num_moe_layers,
+            expert_size_mb = ctx.layout.expert_size as f64 / 1e6,
+            "Expert offloading enabled with prefetching"
+        );
+
+        Ok(())
+    }
+
+    /// Get prefetch hit/miss statistics (if offloading is enabled).
+    pub fn prefetch_stats(&self) -> Option<crate::expert_prefetch::PrefetchStats> {
+        self.model.prefetcher.as_ref().map(|p| p.stats())
     }
 }
 

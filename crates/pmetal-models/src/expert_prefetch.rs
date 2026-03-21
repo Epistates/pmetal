@@ -40,6 +40,7 @@ use crate::expert_io::ExpertOffloadContext;
 ///
 /// Maintains gate weight matrices for each MoE layer and a cache of
 /// prefetched expert buffers. Thread-safe for concurrent predict/consume.
+#[derive(Debug)]
 pub struct ExpertPrefetcher {
     /// Gate weight matrices for each MoE layer, indexed by layer_idx.
     /// Shape: `[num_experts, hidden_dim]` (flattened row-major).
@@ -58,6 +59,7 @@ pub struct ExpertPrefetcher {
 }
 
 /// Cached prefetch result for a layer.
+#[derive(Debug)]
 struct PrefetchResult {
     /// Expert indices that were predicted and prefetched.
     predicted_indices: Vec<usize>,

@@ -38,6 +38,7 @@
   let topP = $state(0.9);
   let maxTokens = $state(1024);
   let repetitionPenalty = $state(1.1);
+  let expertsDir = $state('');
   let showParams = $state(false);
   let defaultsSource = $state(''); // which model the current defaults came from
 
@@ -187,8 +188,15 @@
         temperature,
         top_k: topK,
         top_p: topP,
+        min_p: null,
         max_tokens: maxTokens,
         repetition_penalty: repetitionPenalty,
+        frequency_penalty: null,
+        presence_penalty: null,
+        seed: null,
+        fp8: null,
+        no_thinking: null,
+        experts_dir: expertsDir || null,
       });
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -356,6 +364,10 @@
         <div>
           <label class="label" for="inf-rep">Rep. Penalty</label>
           <input id="inf-rep" type="number" class="input text-sm" step="0.05" min="1" bind:value={repetitionPenalty} />
+        </div>
+        <div class="col-span-2">
+          <label class="label" for="inf-experts">Experts Dir</label>
+          <input id="inf-experts" type="text" class="input text-sm" placeholder="Path to packed experts (optional)" bind:value={expertsDir} />
         </div>
       </div>
     {/if}

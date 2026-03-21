@@ -4852,6 +4852,7 @@ dependencies = [
  "indicatif",
  "libc",
  "parquet",
+ "pmetal",
  "pmetal-core",
  "pmetal-data",
  "pmetal-distill",

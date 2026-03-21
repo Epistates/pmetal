@@ -63,6 +63,12 @@
 
 pub mod version;
 
+/// Unified inference pipeline shared by CLI, GUI, and serve.
+///
+/// Requires features: `hub`, `data`, `models`, `lora`.
+#[cfg(all(feature = "hub", feature = "data", feature = "models", feature = "lora"))]
+pub mod inference_runner;
+
 // NOTE: `core` below shadows the Rust built-in `core` crate within this file.
 // Any code added here that needs `core::fmt`, `core::mem`, etc. must use `::core::`.
 #[cfg(feature = "core")]

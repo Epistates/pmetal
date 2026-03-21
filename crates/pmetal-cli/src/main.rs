@@ -417,6 +417,12 @@ enum Commands {
         #[arg(long)]
         fp8: bool,
 
+        /// Path to packed expert weights directory for SSD-offloaded MoE inference.
+        /// Created with `pmetal pack-experts`. Enables expert prefetching for
+        /// models that don't fit in memory (e.g., Qwen3.5-397B on 48GB).
+        #[arg(long)]
+        experts_dir: Option<String>,
+
         /// Disable ANE (Apple Neural Engine) for inference, falling back to GPU/Metal.
         #[cfg(feature = "ane")]
         #[arg(long)]
@@ -1027,6 +1033,11 @@ enum Commands {
         /// Maximum sequence length for KV cache
         #[arg(long, default_value = "4096")]
         max_seq_len: usize,
+
+        /// Path to packed expert weights directory for SSD-offloaded MoE inference.
+        /// Created with `pmetal pack-experts`.
+        #[arg(long)]
+        experts_dir: Option<String>,
     },
 
     /// Dataset utilities for preparing and analyzing training data
@@ -2116,8 +2127,9 @@ async fn tokio_main() -> anyhow::Result<()> {
             port,
             host,
             max_seq_len,
+            experts_dir,
         } => {
-            commands::serve::run_serve(model, lora, port, host, max_seq_len).await?;
+            commands::serve::run_serve(model, lora, port, host, max_seq_len, experts_dir).await?;
         }
 
         Commands::Infer {
@@ -2143,6 +2155,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             show_thinking,
             tools,
             fp8,
+            experts_dir,
             #[cfg(feature = "ane")]
             no_ane,
             #[cfg(feature = "ane")]
@@ -2207,6 +2220,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 kv_v_bits,
                 kv_group_size,
                 no_kv_quant,
+                experts_dir.as_deref(),
             )
             .await?;
         }

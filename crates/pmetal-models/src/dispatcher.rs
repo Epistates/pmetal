@@ -877,6 +877,27 @@ impl DynamicModel {
             Self::Bert(m) => ModuleParametersExt::eval(m),
         }
     }
+
+    /// Enable SSD-offloaded MoE inference with expert prefetching.
+    ///
+    /// Only supported for architectures with MoE (currently Qwen3Next).
+    /// The `experts_dir` should contain packed expert files from `pmetal pack-experts`.
+    pub fn enable_expert_offloading(&mut self, experts_dir: &Path) -> Result<(), Exception> {
+        match self {
+            Self::Qwen3Next(m) => m.enable_expert_offloading(experts_dir),
+            _ => Err(Exception::custom(
+                "expert offloading is only supported for qwen3_next architecture",
+            )),
+        }
+    }
+
+    /// Get prefetch hit/miss statistics (if expert offloading is enabled).
+    pub fn prefetch_stats(&self) -> Option<crate::expert_prefetch::PrefetchStats> {
+        match self {
+            Self::Qwen3Next(m) => m.prefetch_stats(),
+            _ => None,
+        }
+    }
 }
 
 impl ModuleParameters for DynamicModel {

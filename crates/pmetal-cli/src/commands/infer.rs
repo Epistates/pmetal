@@ -4,13 +4,9 @@ use pmetal_data::Tokenizer;
 
 /// Run inference with a model.
 ///
-/// Supports any architecture via DynamicModel, with optional LoRA support
-/// for Llama models. Uses KV-cached generation for fast inference.
-///
-/// Implements SOTA sampling: temperature, top-k, top-p, min-p, repetition penalty,
-/// frequency penalty, and presence penalty.
-///
-/// With `--fp8`, weights are quantized to FP8 E4M3 format for ~2x memory savings.
+/// Uses the shared `InferenceRunner` for model loading, tokenization, chat
+/// template, sampling config, and cache creation. CLI-specific features
+/// (ANE, metal sampler, compiled, benchmark) use the runner's prepared state.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_inference(
     model_id: &str,
@@ -44,6 +40,7 @@ pub(crate) async fn run_inference(
     kv_v_bits: Option<u8>,
     kv_group_size: usize,
     no_kv_quant: bool,
+    experts_dir: Option<&str>,
 ) -> anyhow::Result<()> {
     #[cfg(not(feature = "ane"))]
     if ane {
@@ -51,18 +48,13 @@ pub(crate) async fn run_inference(
     }
     #[cfg(target_os = "macos")]
     use pmetal_models::generate_cached_metal;
-    use pmetal_models::{
-        DynamicModel, GenerationConfig, GenerationOutput, generate_cached_compiled,
-        generate_minimal_async,
-    };
+    use pmetal_models::{GenerationOutput, generate_cached_compiled, generate_minimal_async};
 
     tracing::info!(model = %model_id, "Loading model for inference");
 
     // Download model if needed (HuggingFace repo ID contains '/')
     let model_path = if model_id.contains('/') && !PathBuf::from(model_id).exists() {
         tracing::info!("Model not found locally, downloading from HuggingFace Hub...");
-
-        // Download all repo files (configs, tokenizer, weights, etc.)
         let path = pmetal_hub::download_model(model_id, None, None).await?;
         tracing::info!("Model downloaded successfully to {:?}", path);
         path
@@ -70,139 +62,47 @@ pub(crate) async fn run_inference(
         PathBuf::from(model_id)
     };
 
-    // Load tokenizer (with config-aware special token resolution)
-    let tokenizer_path = model_path.join("tokenizer.json");
-    let tokenizer = if tokenizer_path.exists() {
-        Tokenizer::from_model_dir(&model_path)?
-    } else {
-        anyhow::bail!(
-            "Tokenizer not found at {:?}. GGUF models don't bundle a tokenizer — \
-             download the source model first with: pmetal download {}",
-            tokenizer_path,
-            model_id
-        );
+    // ── Prepare inference via shared runner ──────────────────────────────
+    use pmetal_lib::inference_runner::{InferenceRunner, InferenceRunnerConfig};
+
+    let runner_config = InferenceRunnerConfig {
+        model_path: model_path.clone(),
+        lora_path: lora_path.map(|s| s.to_string()),
+        experts_dir: experts_dir.map(|s| s.to_string()),
+        fp8,
+        prompt: prompt.to_string(),
+        system_message: system.map(|s| s.to_string()),
+        chat,
+        no_thinking,
+        tools: tools.map(|t| t.to_vec()),
+        temperature,
+        top_k,
+        top_p,
+        min_p,
+        max_tokens,
+        repetition_penalty,
+        frequency_penalty,
+        presence_penalty,
+        seed,
+        kv_quant,
+        kv_k_bits,
+        kv_v_bits,
+        kv_group_size,
+        no_kv_quant,
     };
 
-    // Check if LoRA is requested
-    if let Some(lora) = lora_path {
-        return run_inference_with_lora(
-            &model_path,
-            lora,
-            &tokenizer,
-            prompt,
-            max_tokens,
-            temperature,
-            top_k,
-            top_p,
-            min_p,
-            repetition_penalty,
-            frequency_penalty,
-            presence_penalty,
-            seed,
-            chat,
-            system,
-            no_thinking,
-            show_thinking,
-        )
-        .await;
-    }
-
-    // Use DynamicModel for architecture-agnostic inference
-    tracing::info!("Loading model with auto-detected architecture...");
-    let mut model = DynamicModel::load(&model_path)?;
-
-    tracing::info!(
-        "Model loaded successfully (architecture: {})",
-        model.architecture()
-    );
-
-    // Apply FP8 quantization if requested
-    if fp8 {
-        tracing::info!("Quantizing model weights to FP8 E4M3 format...");
-        model.quantize_fp8()?;
-        tracing::info!("FP8 quantization complete (~2x memory reduction)")
-    }
-
-    // Auto-detect if chat mode should be enabled for instruction-tuned models
-    let is_instruct_model = is_instruction_tuned(&model_path);
-    let use_chat = chat || is_instruct_model;
-
-    // Base models don't understand <think> tags — force no_thinking for them
-    let no_thinking = if !is_instruct_model && !no_thinking && use_chat {
-        tracing::info!(
-            "Base model detected, disabling thinking mode (use an instruct model for thinking)"
-        );
-        true
-    } else {
-        no_thinking
-    };
-
-    if is_instruct_model && !chat {
-        tracing::info!("Auto-detected instruction-tuned model, enabling chat template");
-    }
-
-    // Load sampling defaults from model's generation_config.json
-    let defaults = pmetal_data::inference_config::load_sampling_defaults(
-        &model_path,
-        use_chat && !no_thinking,
-    );
-
-    // Apply CLI overrides over model defaults
-    let temperature = temperature.unwrap_or(defaults.temperature);
-    let top_k = top_k.unwrap_or(defaults.top_k);
-    let top_p = top_p.unwrap_or(defaults.top_p);
-    let min_p = min_p.unwrap_or(defaults.min_p);
-    let repetition_penalty = repetition_penalty.unwrap_or(defaults.repetition_penalty);
-    let frequency_penalty = frequency_penalty.unwrap_or(defaults.frequency_penalty);
-    let presence_penalty = presence_penalty.unwrap_or(defaults.presence_penalty);
-
-    // Apply chat template if needed
-    // The template handles thinking mode - model decides when to think unless --no-thinking
-    let (final_prompt, template_type) = if use_chat || tools.is_some() {
-        apply_chat_template(&tokenizer, prompt, system, &model_path, no_thinking, tools)?
-    } else {
-        (
-            prompt.to_string(),
-            pmetal_data::chat_templates::ChatTemplateType::ChatMl,
-        )
-    };
-
-    // Tokenize prompt
-    let input_ids = tokenizer.encode(&final_prompt)?;
-    tracing::info!("Tokenized {} tokens", input_ids.len());
-
-    // Configure stop tokens — unified collection from all sources
-    let stop_tokens = pmetal_data::inference_config::collect_all_stop_tokens(
-        &model_path,
-        &tokenizer,
-        if use_chat { Some(template_type) } else { None },
-    );
-
-    // Configure generation with user-specified parameters
-    let gen_config = if temperature == 0.0 {
-        GenerationConfig::greedy(max_tokens).with_stop_tokens(stop_tokens)
-    } else {
-        let mut config = GenerationConfig::sampling(max_tokens, temperature)
-            .with_top_k(top_k)
-            .with_top_p(top_p)
-            .with_min_p(min_p)
-            .with_repetition_penalty(repetition_penalty)
-            .with_frequency_penalty(frequency_penalty)
-            .with_presence_penalty(presence_penalty)
-            .with_stop_tokens(stop_tokens);
-
-        if let Some(s) = seed {
-            config = config.with_seed(s);
-        }
-
-        config
-    };
+    let mut runner = InferenceRunner::prepare(runner_config)?;
+    let use_chat = runner.is_chat();
+    let gen_config = runner.state.gen_config();
 
     // Print configuration
     println!("\n========================================");
     println!("  PMetal Inference");
     println!("========================================");
     println!("Model:       {}", model_id);
+    if lora_path.is_some() {
+        println!("LoRA:        {}", lora_path.unwrap());
+    }
     println!("Temperature: {}", gen_config.temperature);
     println!("Top-k:       {}", gen_config.top_k);
     println!("Top-p:       {}", gen_config.top_p);
@@ -217,94 +117,34 @@ pub(crate) async fn run_inference(
     if use_chat && no_thinking {
         println!("Thinking:    disabled");
     }
-    // KV cache mode is printed after cache creation below
     println!("========================================\n");
 
     println!("Prompt: {}\n", prompt);
     println!("Generating...\n");
 
-    // Create KV cache for efficient generation
-    // Cache size = prompt_len + max_tokens + buffer
-    let max_seq_len = input_ids.len() + max_tokens + 64;
-    let cache_mode = if no_kv_quant || kv_quant == 0 {
-        pmetal_mlx::kv_cache::CacheMode::Standard
-    } else if let (Some(k_bits), Some(v_bits)) = (kv_k_bits, kv_v_bits) {
-        pmetal_mlx::kv_cache::CacheMode::AsymmetricQuantized {
-            key_bits: k_bits,
-            value_bits: v_bits,
-            group_size: kv_group_size,
-        }
-    } else if kv_k_bits.is_some() || kv_v_bits.is_some() {
-        let k = kv_k_bits.unwrap_or(kv_quant);
-        let v = kv_v_bits.unwrap_or(kv_quant);
-        if k == v {
-            pmetal_mlx::kv_cache::CacheMode::Quantized {
-                bits: k,
-                group_size: kv_group_size,
-            }
-        } else {
-            pmetal_mlx::kv_cache::CacheMode::AsymmetricQuantized {
-                key_bits: k,
-                value_bits: v,
-                group_size: kv_group_size,
-            }
-        }
-    } else {
-        pmetal_mlx::kv_cache::CacheMode::Quantized {
-            bits: kv_quant,
-            group_size: kv_group_size,
-        }
-    };
-    tracing::info!("KV cache: {}", cache_mode.describe());
-    // Warn about potential quality degradation at very long contexts with quantized KV
-    if max_seq_len > 32768 && !no_kv_quant && kv_quant > 0 {
-        tracing::warn!(
-            "KV cache q{} at {} tokens: community reports quality degradation at >32k context. \
-             Use --no-kv-quant if you see issues.",
-            kv_quant,
-            max_seq_len
-        );
-    }
-    let mut cache = model.create_cache_with_mode(max_seq_len, cache_mode);
-    tracing::debug!("Created KV cache for {} tokens", max_seq_len);
+    // Extract refs for generation dispatch (split borrow)
+    let input_ids = runner.state.input_ids().to_vec();
+    let gen_config = runner.state.gen_config().clone();
 
-    // Create Mamba cache for hybrid models (NemotronH)
-    let mut mamba_cache = model.create_mamba_cache();
-    if mamba_cache.is_some() {
-        tracing::debug!("Created Mamba cache for hybrid model");
-    }
-
+    // ── Generation dispatch ────────────────────────────────────────────────
     let start = std::time::Instant::now();
     let mut already_streamed = false;
 
     #[cfg(target_os = "macos")]
     let output = {
         // ANE branch: separate engine with its own weight loading and KV cache
-        // Validates architecture compatibility before attempting compilation.
         #[cfg(feature = "ane")]
         let ane_output: Option<GenerationOutput> = if ane {
-            // Skip ANE for small models (<2B params) — GPU KV-cache is faster for decode.
-            // ANE-hybrid shines on larger models (4B+) where prefill dominates.
             let param_count_too_small =
                 match std::fs::read_to_string(model_path.join("config.json")) {
                     Ok(config_text) => {
                         match serde_json::from_str::<serde_json::Value>(&config_text) {
                             Ok(config_json) => {
-                                let hidden = config_json
-                                    .get("hidden_size")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let layers = config_json
-                                    .get("num_hidden_layers")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                let vocab = config_json
-                                    .get("vocab_size")
-                                    .and_then(|v| v.as_u64())
-                                    .unwrap_or(0);
-                                // Rough param estimate: 12 * hidden^2 * layers + hidden * vocab
+                                let hidden = config_json.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let layers = config_json.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let vocab = config_json.get("vocab_size").and_then(|v| v.as_u64()).unwrap_or(0);
                                 let est_params = 12 * hidden * hidden * layers + hidden * vocab;
-                                est_params < 2_000_000_000 // <2B params
+                                est_params < 2_000_000_000
                             }
                             Err(_) => false,
                         }
@@ -316,7 +156,6 @@ pub(crate) async fn run_inference(
                 tracing::info!("Small model (<2B) — using GPU path for faster decode");
                 None
             } else {
-                // Validate architecture before attempting ANE (saves ~7s on incompatible models)
                 let ane_compatible = match std::fs::read_to_string(model_path.join("config.json")) {
                     Ok(config_text) => {
                         match serde_json::from_str::<serde_json::Value>(&config_text) {
@@ -330,21 +169,16 @@ pub(crate) async fn run_inference(
                                     }
                                 }
                             }
-                            Err(_) => true, // Can't parse config, let ANE try anyway
+                            Err(_) => true,
                         }
                     }
-                    Err(_) => true, // No config.json, let ANE try anyway
+                    Err(_) => true,
                 };
 
                 if ane_compatible {
-                    tracing::info!(
-                        "Attempting ANE-hybrid inference engine (Prefill: ANE, Decode: CPU/vDSP)"
-                    );
+                    tracing::info!("Attempting ANE-hybrid inference engine");
                     match pmetal_models::generate_cached_ane(
-                        &model_path,
-                        &input_ids,
-                        &gen_config,
-                        ane_max_seq_len,
+                        &model_path, &input_ids, &gen_config, ane_max_seq_len,
                     ) {
                         Ok(output) => Some(output),
                         Err(e) => {
@@ -355,14 +189,13 @@ pub(crate) async fn run_inference(
                 } else {
                     None
                 }
-            } // close else for param_count_too_small
+            }
         } else {
             None
         };
         #[cfg(not(feature = "ane"))]
         let ane_output: Option<GenerationOutput> = None;
 
-        // CPU hybrid engine: try for Qwen3.5 non-MoE when ANE is not compatible
         #[cfg(feature = "ane")]
         let cpu_hybrid_output: Option<GenerationOutput> = if ane_output.is_none() && ane {
             match std::fs::read_to_string(model_path.join("config.json")) {
@@ -371,20 +204,13 @@ pub(crate) async fn run_inference(
                         use pmetal_models::is_hybrid_cpu_compatible;
                         match is_hybrid_cpu_compatible(&config_json) {
                             Ok(()) => {
-                                tracing::info!(
-                                    "Attempting CPU GEMV hybrid engine (Qwen3.5 decode: CPU/vDSP)"
-                                );
+                                tracing::info!("Attempting CPU GEMV hybrid engine");
                                 match pmetal_models::generate_cached_hybrid_cpu(
-                                    &model_path,
-                                    &input_ids,
-                                    &gen_config,
+                                    &model_path, &input_ids, &gen_config,
                                 ) {
                                     Ok(output) => Some(output),
                                     Err(e) => {
-                                        tracing::warn!(
-                                            "CPU hybrid engine failed ({}), falling back to GPU",
-                                            e
-                                        );
+                                        tracing::warn!("CPU hybrid engine failed ({}), falling back to GPU", e);
                                         None
                                     }
                                 }
@@ -408,121 +234,70 @@ pub(crate) async fn run_inference(
             output
         } else if minimal {
             tracing::info!("Using minimal async generation (debugging)");
-            generate_minimal_async(
-                |input, cache| {
-                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-                },
-                &input_ids,
-                gen_config,
-                &mut cache,
-            )?
+            runner.state.run_with(|fwd, cache| {
+                generate_minimal_async(fwd, &input_ids, gen_config, cache)
+            })?
         } else if metal_sampler {
             tracing::info!("Using fused Metal sampling kernel");
-            generate_cached_metal(
-                |input, cache| {
-                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-                },
-                &input_ids,
-                gen_config,
-                &mut cache,
-            )?
+            runner.state.run_with(|fwd, cache| {
+                generate_cached_metal(fwd, &input_ids, gen_config, cache)
+            })?
         } else if compiled {
-            tracing::info!("Using JIT-compiled sampling (mlx_lm style)");
-            generate_cached_compiled(
-                |input, cache| {
-                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-                },
-                &input_ids,
-                gen_config,
-                &mut cache,
-            )?
+            tracing::info!("Using JIT-compiled sampling");
+            runner.state.run_with(|fwd, cache| {
+                generate_cached_compiled(fwd, &input_ids, gen_config, cache)
+            })?
         } else {
-            // Default: streaming async generation — tokens printed as they're produced
             already_streamed = true;
-            use pmetal_models::generate_cached_async_streaming;
-            use std::io::Write;
-
+            let tokenizer = &runner.tokenizer;
             let mut token_buf: Vec<u32> = Vec::new();
             let mut streamed_text = String::new();
-            let tokenizer_ref = &tokenizer;
-
-            generate_cached_async_streaming(
-                |input, cache| {
-                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-                },
-                &input_ids,
-                gen_config,
-                &mut cache,
-                |token_id| {
-                    token_buf.push(token_id);
-                    if let Ok(text) = tokenizer_ref.decode(&token_buf) {
-                        if text.len() > streamed_text.len() {
-                            let delta = &text[streamed_text.len()..];
-                            let _ = std::io::stdout().write_all(delta.as_bytes());
-                            let _ = std::io::stdout().flush();
-                        }
-                        streamed_text = text;
+            runner.state.generate_streaming(|token_id| {
+                use std::io::Write;
+                token_buf.push(token_id);
+                if let Ok(text) = tokenizer.decode(&token_buf) {
+                    if text.len() > streamed_text.len() {
+                        let delta = &text[streamed_text.len()..];
+                        let _ = std::io::stdout().write_all(delta.as_bytes());
+                        let _ = std::io::stdout().flush();
                     }
-                    true
-                },
-            )?
+                    streamed_text = text;
+                }
+                true
+            })?
         }
     };
 
     #[cfg(not(target_os = "macos"))]
     let output = {
-        let _ = metal_sampler; // Suppress unused warning
+        let _ = metal_sampler;
         let _ = ane;
         if minimal {
-            tracing::info!("Using minimal async generation (debugging)");
-            generate_minimal_async(
-                |input, cache| {
-                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-                },
-                &input_ids,
-                gen_config,
-                &mut cache,
-            )?
+            runner.state.run_with(|fwd, cache| {
+                generate_minimal_async(fwd, &input_ids, gen_config, cache)
+            })?
         } else if compiled {
-            tracing::info!("Using JIT-compiled sampling (mlx_lm style)");
-            generate_cached_compiled(
-                |input, cache| {
-                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-                },
-                &input_ids,
-                gen_config,
-                &mut cache,
-            )?
+            runner.state.run_with(|fwd, cache| {
+                generate_cached_compiled(fwd, &input_ids, gen_config, cache)
+            })?
         } else {
-            // Default: streaming async generation
             already_streamed = true;
-            use pmetal_models::generate_cached_async_streaming;
-            use std::io::Write;
-
+            let tokenizer = &runner.tokenizer;
             let mut token_buf: Vec<u32> = Vec::new();
             let mut streamed_text = String::new();
-            let tokenizer_ref = &tokenizer;
-
-            generate_cached_async_streaming(
-                |input, cache| {
-                    model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-                },
-                &input_ids,
-                gen_config,
-                &mut cache,
-                |token_id| {
-                    token_buf.push(token_id);
-                    if let Ok(text) = tokenizer_ref.decode(&token_buf) {
-                        if text.len() > streamed_text.len() {
-                            let delta = &text[streamed_text.len()..];
-                            let _ = std::io::stdout().write_all(delta.as_bytes());
-                            let _ = std::io::stdout().flush();
-                        }
-                        streamed_text = text;
+            runner.state.generate_streaming(|token_id| {
+                use std::io::Write;
+                token_buf.push(token_id);
+                if let Ok(text) = tokenizer.decode(&token_buf) {
+                    if text.len() > streamed_text.len() {
+                        let delta = &text[streamed_text.len()..];
+                        let _ = std::io::stdout().write_all(delta.as_bytes());
+                        let _ = std::io::stdout().flush();
                     }
-                    true
-                },
-            )?
+                    streamed_text = text;
+                }
+                true
+            })?
         }
     };
     let elapsed = start.elapsed();
@@ -530,7 +305,7 @@ pub(crate) async fn run_inference(
     // For non-streaming paths, decode and print the generated text now
     if !already_streamed {
         let generated_tokens = &output.token_ids[input_ids.len()..];
-        let raw_text = tokenizer.decode(generated_tokens)?;
+        let raw_text = runner.tokenizer.decode(generated_tokens)?;
         let text = if use_chat && !no_thinking {
             format!("<think>{}", raw_text)
         } else {
@@ -549,7 +324,7 @@ pub(crate) async fn run_inference(
             println!("{}", text);
         }
     } else {
-        println!(); // finish the streamed line
+        println!();
     }
 
     println!("---");
@@ -566,6 +341,18 @@ pub(crate) async fn run_inference(
         println!("Stopped by: max length");
     }
 
+    // Print expert prefetch stats if offloading was active
+    if let Some(model) = runner.state.dynamic_model() {
+        if let Some(stats) = model.prefetch_stats() {
+            eprintln!(
+                "Expert prefetch: {:.1}% hit rate ({} hits / {} total)",
+                stats.hit_rate() * 100.0,
+                stats.hits,
+                stats.total,
+            );
+        }
+    }
+
     // ── Benchmark mode ────────────────────────────────────────────────────────
     if benchmark {
         use std::time::Instant;
@@ -575,52 +362,35 @@ pub(crate) async fn run_inference(
             benchmark_iters
         );
 
-        // Initial generation gives us TTFT (time to first token) and overall throughput.
-        // Now measure per-token decode latency by running independent single-token
-        // forward passes through the primed KV cache.
         let last_token_id = output.token_ids.last().copied().unwrap_or(1);
-
         let mut decode_times_ms: Vec<f64> = Vec::with_capacity(benchmark_iters);
 
-        // Warm-up: one forward pass to prime caches/pipelines
-        {
-            let input = mlx_rs::Array::from_slice(&[last_token_id as i32], &[1, 1]);
-            if let Ok(ref logits_w) = model.forward_with_hybrid_cache(
-                &input,
-                None,
-                Some(&mut cache),
-                mamba_cache.as_mut(),
-            ) {
-                let _ = logits_w.eval();
+        // Warm-up + timed decode via run_with to avoid borrow conflicts
+        runner.state.run_with(|fwd, cache| {
+            // Warm-up
+            {
+                let input = mlx_rs::Array::from_slice(&[last_token_id as i32], &[1, 1]);
+                if let Ok(ref logits_w) = fwd(&input, cache) {
+                    let _ = logits_w.eval();
+                }
             }
-        }
 
-        // Timed decode iterations: each is a real single-token forward pass
-        for i in 0..benchmark_iters {
-            let input = mlx_rs::Array::from_slice(&[last_token_id as i32], &[1, 1]);
-
-            let t0 = Instant::now();
-            let logits = model.forward_with_hybrid_cache(
-                &input,
-                None,
-                Some(&mut cache),
-                mamba_cache.as_mut(),
-            );
-            // Force evaluation to get accurate GPU timing
-            if let Ok(ref l) = logits {
-                let _ = l.eval();
+            for i in 0..benchmark_iters {
+                let input = mlx_rs::Array::from_slice(&[last_token_id as i32], &[1, 1]);
+                let t0 = Instant::now();
+                let logits = fwd(&input, cache);
+                if let Ok(ref l) = logits {
+                    let _ = l.eval();
+                }
+                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                let tps = 1000.0 / ms;
+                decode_times_ms.push(ms);
+                let status = if logits.is_ok() { "ok" } else { "err" };
+                println!("  [{i}] {ms:.1} ms ({tps:.2} tok/s)  [{status}]");
             }
-            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-            let tps = 1000.0 / ms;
-
-            decode_times_ms.push(ms);
-
-            let status = if logits.is_ok() { "ok" } else { "err" };
-            println!("  [{i}] {ms:.1} ms ({tps:.2} tok/s)  [{status}]");
-        }
+        });
 
         if !decode_times_ms.is_empty() {
-            // Statistics
             let mut sorted = decode_times_ms.clone();
             sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let n = sorted.len();
@@ -628,14 +398,12 @@ pub(crate) async fn run_inference(
             let min = sorted[0];
             let p50 = sorted[n / 2];
             let p99 = sorted[(n * 99 / 100).min(n - 1)];
-
             println!("[mean]    {mean:.1} ms ({:.2} tok/s)", 1000.0 / mean);
             println!("[min]     {min:.1} ms ({:.2} tok/s)", 1000.0 / min);
             println!("[p50]     {p50:.1} ms ({:.2} tok/s)", 1000.0 / p50);
             println!("[p99]     {p99:.1} ms ({:.2} tok/s)", 1000.0 / p99);
         }
 
-        // Memory stats
         let mem_stats = pmetal_mlx::memory::get_memory_stats();
         println!("[memory]  {:.1} GB resident", mem_stats.used_gb());
         println!("[peak]    {:.1} GB peak", mem_stats.peak_gb());
@@ -644,20 +412,13 @@ pub(crate) async fn run_inference(
     Ok(())
 }
 
-/// Get EOS token IDs from model's generation_config.json.
-///
-/// Many models (like Qwen3) have multiple EOS tokens that should all stop generation.
-#[allow(dead_code)]
-pub(crate) fn get_eos_tokens(model_path: &Path, tokenizer: &Tokenizer) -> Vec<u32> {
-    pmetal_data::inference_config::collect_all_stop_tokens(model_path, tokenizer, None)
-}
+// NOTE: get_eos_tokens, is_instruction_tuned, apply_chat_template, and 15
+// per-template format_* functions have been removed. Their logic is now in
+// InferenceRunner::prepare() via the generic ChatTemplate::apply path.
 
-/// Check if a model is instruction-tuned based on its configuration.
-///
-/// Looks for indicators like:
-/// - chat_template in tokenizer_config.json
-/// - "instruct", "chat", "it" in model name
-/// - Known instruction-tuned model architectures
+// NOTE: is_instruction_tuned moved to inference_runner.rs
+
+#[allow(dead_code)]
 pub(crate) fn is_instruction_tuned(model_path: &Path) -> bool {
     // Primary: check for chat_template in tokenizer_config.json (authoritative)
     let config_path = model_path.join("tokenizer_config.json");
@@ -1164,240 +925,5 @@ pub(crate) fn extract_thinking_content(text: &str) -> Option<String> {
     None
 }
 
-/// Run inference with LoRA adapter (supports all architectures via DynamicLoraModel).
-///
-/// Mirrors the main inference path: auto-detects chat mode, applies chat template,
-/// configures stop tokens (including chat EOS), and respects all sampling parameters.
-#[allow(clippy::too_many_arguments)]
-pub(crate) async fn run_inference_with_lora(
-    model_path: &Path,
-    lora_path: &str,
-    tokenizer: &Tokenizer,
-    prompt: &str,
-    max_tokens: usize,
-    temperature: Option<f32>,
-    top_k: Option<usize>,
-    top_p: Option<f32>,
-    min_p: Option<f32>,
-    repetition_penalty: Option<f32>,
-    frequency_penalty: Option<f32>,
-    presence_penalty: Option<f32>,
-    seed: Option<u64>,
-    chat: bool,
-    system: Option<&str>,
-    no_thinking: bool,
-    show_thinking: bool,
-) -> anyhow::Result<()> {
-    use pmetal_core::LoraConfig;
-    use pmetal_lora::{DynamicLoraModel, TrainableModel};
-    use pmetal_models::{GenerationConfig, generate_cached_async_streaming};
-
-    // Try to load adapter config from the LoRA weights directory
-    let lora_path_buf = std::path::Path::new(lora_path);
-    let lora_dir = lora_path_buf.parent().unwrap_or(std::path::Path::new("."));
-    let adapter_config_path = lora_dir.join("adapter_config.json");
-
-    let lora_config = if adapter_config_path.exists() {
-        let config_str = std::fs::read_to_string(&adapter_config_path)?;
-        let config_json: serde_json::Value = serde_json::from_str(&config_str)?;
-
-        let r = config_json["r"].as_u64().unwrap_or(16) as usize;
-        let alpha = config_json["alpha"].as_f64().unwrap_or(32.0) as f32;
-        let target_modules: Vec<String> = config_json["target_modules"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default();
-        let use_rslora = config_json["use_rslora"].as_bool().unwrap_or(false);
-
-        tracing::info!(
-            "Loaded adapter config: r={}, alpha={}, use_rslora={}, targets={:?}",
-            r,
-            alpha,
-            use_rslora,
-            target_modules
-        );
-        LoraConfig {
-            r,
-            alpha,
-            target_modules,
-            use_rslora,
-            ..Default::default()
-        }
-    } else {
-        tracing::warn!(
-            "No adapter_config.json found at {:?}, using defaults (r=16, alpha=32.0, all modules)",
-            adapter_config_path
-        );
-        LoraConfig {
-            r: 16,
-            alpha: 32.0,
-            target_modules: vec![],
-            ..Default::default()
-        }
-    };
-
-    // Use DynamicLoraModel for automatic architecture detection
-    tracing::info!("Loading model with auto-detected architecture...");
-    let mut model = DynamicLoraModel::from_pretrained(model_path, lora_config)?;
-    tracing::info!("Detected architecture: {}", model.architecture_name());
-
-    // Load LoRA adapter weights
-    tracing::info!("Loading LoRA adapter from {:?}...", lora_path);
-    model.load_lora_weights(lora_path)?;
-
-    // Merge LoRA into base weights for inference (W_merged = W + scale * B @ A).
-    // This matches mlx-lm's approach where adapters are applied to the base model,
-    // producing correct inference without needing separate LoRA forward computation.
-    tracing::info!("Merging LoRA weights into base model for inference...");
-    model
-        .merge_lora()
-        .map_err(|e| anyhow::anyhow!("Failed to merge LoRA weights: {}", e))?;
-
-    // Force evaluation of all parameters
-    model
-        .eval_all()
-        .map_err(|e| anyhow::anyhow!("Failed to eval LoRA model: {}", e))?;
-
-    tracing::info!("Model loaded successfully (LoRA merged)");
-
-    // Auto-detect chat mode
-    let is_instruct = is_instruction_tuned(model_path);
-    let use_chat = chat || is_instruct;
-
-    if is_instruct && !chat {
-        tracing::info!("Auto-detected instruction-tuned model, enabling chat template");
-    }
-
-    // Load sampling defaults
-    let defaults =
-        pmetal_data::inference_config::load_sampling_defaults(model_path, use_chat && !no_thinking);
-
-    let temperature = temperature.unwrap_or(defaults.temperature);
-    let top_k = top_k.unwrap_or(defaults.top_k);
-    let top_p = top_p.unwrap_or(defaults.top_p);
-    let min_p = min_p.unwrap_or(defaults.min_p);
-    let repetition_penalty = repetition_penalty.unwrap_or(defaults.repetition_penalty);
-    let frequency_penalty = frequency_penalty.unwrap_or(defaults.frequency_penalty);
-    let presence_penalty = presence_penalty.unwrap_or(defaults.presence_penalty);
-
-    // Apply chat template
-    let (final_prompt, template_type) = if use_chat {
-        apply_chat_template(tokenizer, prompt, system, model_path, no_thinking, None)?
-    } else {
-        (
-            prompt.to_string(),
-            pmetal_data::chat_templates::ChatTemplateType::ChatMl,
-        )
-    };
-
-    // Tokenize
-    let input_ids = tokenizer.encode(&final_prompt)?;
-    tracing::info!("Tokenized {} tokens", input_ids.len());
-
-    // Configure stop tokens
-    let stop_tokens = pmetal_data::inference_config::collect_all_stop_tokens(
-        model_path,
-        tokenizer,
-        if use_chat { Some(template_type) } else { None },
-    );
-
-    // Configure generation
-    let gen_config = if temperature == 0.0 {
-        GenerationConfig::greedy(max_tokens).with_stop_tokens(stop_tokens)
-    } else {
-        let mut config = GenerationConfig::sampling(max_tokens, temperature)
-            .with_top_k(top_k)
-            .with_top_p(top_p)
-            .with_min_p(min_p)
-            .with_repetition_penalty(repetition_penalty)
-            .with_frequency_penalty(frequency_penalty)
-            .with_presence_penalty(presence_penalty)
-            .with_stop_tokens(stop_tokens);
-        if let Some(s) = seed {
-            config = config.with_seed(s);
-        }
-        config
-    };
-
-    println!("\n========================================");
-    println!("  PMetal Inference (LoRA)");
-    println!("========================================");
-    println!("Model:       {:?}", model_path);
-    println!("LoRA:        {}", lora_path);
-    println!("Temperature: {}", gen_config.temperature);
-    println!("Max tokens:  {}", max_tokens);
-    println!("========================================\n");
-
-    println!("Prompt: {}\n", prompt);
-    println!("Generating...\n");
-
-    // Create KV/Mamba caches
-    let cache_size = input_ids.len() + max_tokens + 64;
-    let mut cache = model
-        .create_cache(cache_size)
-        .ok_or_else(|| anyhow::anyhow!("Model does not support KV cache"))?;
-    let mut mamba_cache = model.create_mamba_cache();
-
-    let start = std::time::Instant::now();
-    let mut token_buf: Vec<u32> = Vec::new();
-    let mut streamed_text = String::new();
-    let tokenizer_ref = tokenizer;
-
-    let output = generate_cached_async_streaming(
-        |input, cache| {
-            model
-                .forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-                .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
-        },
-        &input_ids,
-        gen_config,
-        &mut cache,
-        |token_id| {
-            use std::io::Write;
-            token_buf.push(token_id);
-            if let Ok(text) = tokenizer_ref.decode(&token_buf) {
-                if text.len() > streamed_text.len() {
-                    let delta = &text[streamed_text.len()..];
-                    let _ = std::io::stdout().write_all(delta.as_bytes());
-                    let _ = std::io::stdout().flush();
-                }
-                streamed_text = text;
-            }
-            true
-        },
-    )?;
-
-    let elapsed = start.elapsed();
-    println!(); // finish streamed line
-
-    // Post-process: extract thinking and clean up EOS tokens
-    if use_chat && show_thinking {
-        if let Some(thinking) = extract_thinking_content(&streamed_text) {
-            if !thinking.is_empty() {
-                println!("\n--- Thinking ---");
-                println!("{}", thinking.trim());
-                println!("--- End Thinking ---\n");
-            }
-        }
-    }
-
-    let tokens_per_sec = output.num_generated as f64 / elapsed.as_secs_f64();
-    println!("\n---");
-    println!(
-        "Generated {} tokens in {:.2}s ({:.1} tok/s)",
-        output.num_generated,
-        elapsed.as_secs_f64(),
-        tokens_per_sec
-    );
-    if output.stopped_by_token {
-        println!("Stopped by: EOS token");
-    } else {
-        println!("Stopped by: max length");
-    }
-
-    Ok(())
-}
+// NOTE: run_inference_with_lora has been removed — LoRA loading is now handled
+// by InferenceRunner::prepare() via the lora_path config field.

@@ -363,6 +363,9 @@ pub struct GrpoConfig {
 }
 
 /// Inference config matching TS `InferenceConfig`.
+///
+/// All sampling fields are `Option` — `None` means "use model's
+/// `generation_config.json` default" (same behavior as CLI).
 #[derive(Debug, Deserialize)]
 pub struct InferenceConfig {
     pub model: String,
@@ -372,8 +375,18 @@ pub struct InferenceConfig {
     pub temperature: Option<f32>,
     pub top_k: Option<u32>,
     pub top_p: Option<f32>,
+    pub min_p: Option<f32>,
     pub max_tokens: Option<u32>,
     pub repetition_penalty: Option<f32>,
+    pub frequency_penalty: Option<f32>,
+    pub presence_penalty: Option<f32>,
+    pub seed: Option<u64>,
+    /// Quantize weights to FP8 E4M3 for ~2x memory savings.
+    pub fp8: Option<bool>,
+    /// Disable thinking mode for models that support it.
+    pub no_thinking: Option<bool>,
+    /// Path to packed expert weights directory for SSD-offloaded MoE inference.
+    pub experts_dir: Option<String>,
 }
 
 /// Merge config matching TS `MergeConfig`.
@@ -1473,189 +1486,70 @@ pub async fn stop_grpo(state: State<'_, AppState>, run_id: String) -> Result<()>
 
 /// Run streaming inference — mirrors the logic from the former `easy::infer().generate_streaming()`.
 ///
-/// Kept as a standalone async fn (not an inline async block) to match the
-/// memory layout and lifetime behaviour of the v0.3.10 `InferBuilder` method.
+/// Run inference using the shared InferenceRunner pipeline.
+///
+/// This ensures the GUI gets identical behavior to `pmetal infer`:
+/// same chat template handling, sampling defaults, stop tokens,
+/// LoRA loading, FP8, expert offloading, KV cache quantization, etc.
 async fn run_inference_streaming(
     config: &InferenceConfig,
     cancel_flag: &std::sync::atomic::AtomicBool,
     app_handle: &AppHandle,
 ) -> std::result::Result<(), String> {
-    use pmetal::core::LoraConfig;
-    use pmetal::data::chat_templates::{Message, detect_chat_template};
-    use pmetal::data::Tokenizer;
     use pmetal::hub::resolve_model_path;
-    use pmetal::lora::{DynamicLoraModel, TrainableModel as _};
-    use pmetal::models::{DynamicModel, GenerationConfig, generate_cached_async_streaming};
+    use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig};
 
-    // 1. Resolve model path (downloads from HF if needed)
     let model_path = resolve_model_path(&config.model)
         .await
         .map_err(|e| e.to_string())?;
 
-    // 2. Load tokenizer
-    let tokenizer = Tokenizer::from_model_dir(&model_path)
-        .map_err(|e| format!("Failed to load tokenizer: {e}"))?;
-
-    // 3. Apply chat template
-    let template = detect_chat_template(&model_path, &config.model);
-    let mut msgs = Vec::new();
-    if let Some(ref sys) = config.system_message {
-        if !sys.is_empty() {
-            msgs.push(Message::system(sys));
-        }
-    }
-    msgs.push(Message::user(&config.prompt));
-    let formatted = template.apply(&msgs).text;
-
-    // 4. Encode (special-token-aware for chat template tokens)
-    let input_ids = tokenizer
-        .encode_with_special_tokens(&formatted)
-        .map_err(|e| e.to_string())?;
-
-    // 5. Generation config — use model defaults as fallback, user overrides take precedence
-    let defaults = pmetal::data::inference_config::load_sampling_defaults(&model_path, false);
-    let max_tokens = config.max_tokens.unwrap_or(1024) as usize;
-    let temp = config.temperature.unwrap_or(defaults.temperature);
-    let mut gen_config = if temp < 1e-6 {
-        GenerationConfig::greedy(max_tokens)
-    } else {
-        GenerationConfig::sampling(max_tokens, temp)
-            .with_top_k(config.top_k.unwrap_or(defaults.top_k as u32) as usize)
-            .with_top_p(config.top_p.unwrap_or(defaults.top_p))
-            .with_min_p(defaults.min_p)
-            .with_repetition_penalty(config.repetition_penalty.unwrap_or(defaults.repetition_penalty))
+    let runner_config = InferenceRunnerConfig {
+        model_path,
+        lora_path: config.lora_path.clone(),
+        experts_dir: config.experts_dir.clone(),
+        fp8: config.fp8.unwrap_or(false),
+        prompt: config.prompt.clone(),
+        system_message: config.system_message.clone(),
+        chat: true, // GUI always uses chat mode
+        no_thinking: config.no_thinking.unwrap_or(false),
+        tools: None,
+        temperature: config.temperature,
+        top_k: config.top_k.map(|k| k as usize),
+        top_p: config.top_p,
+        min_p: config.min_p,
+        max_tokens: config.max_tokens.unwrap_or(1024) as usize,
+        repetition_penalty: config.repetition_penalty,
+        frequency_penalty: config.frequency_penalty,
+        presence_penalty: config.presence_penalty,
+        seed: config.seed,
+        ..InferenceRunnerConfig::default()
     };
 
-    // Collect ALL stop tokens (generation_config.json array, chat template EOS,
-    // tokenizer EOS, well-known special tokens) — critical for multi-EOS models like Qwen3
-    let stop_tokens = pmetal::data::inference_config::collect_all_stop_tokens(
-        &model_path,
-        &tokenizer,
-        Some(template.template_type),
-    );
-    gen_config = gen_config.with_stop_tokens(stop_tokens);
+    let mut runner = InferenceRunner::prepare(runner_config).map_err(|e| e.to_string())?;
 
-    let max_seq_len = input_ids.len() + max_tokens + 64;
+    let mut token_buf: Vec<u32> = Vec::new();
+    let mut streamed_text = String::new();
 
-    // 6. Branch: LoRA or standard inference
-    if let Some(ref lora_path) = config.lora_path {
-        // --- LoRA inference ---
-        let lora_dir = std::path::Path::new(lora_path.as_str());
-        let adapter_dir = if lora_dir.is_dir() {
-            lora_dir
-        } else {
-            lora_dir.parent().unwrap_or(lora_dir)
-        };
-        let lora_config =
-            if let Ok(cfg_str) = std::fs::read_to_string(adapter_dir.join("adapter_config.json")) {
-                if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
-                    let r = cfg["r"].as_u64().unwrap_or(16) as usize;
-                    let alpha = cfg["alpha"]
-                        .as_f64()
-                        .or_else(|| cfg["lora_alpha"].as_f64())
-                        .unwrap_or(32.0) as f32;
-                    let target_modules: Vec<String> = cfg["target_modules"]
-                        .as_array()
-                        .map(|arr| {
-                            arr.iter()
-                                .filter_map(|v| v.as_str().map(String::from))
-                                .collect()
-                        })
-                        .unwrap_or_default();
-                    let use_rslora = cfg["use_rslora"].as_bool().unwrap_or(false);
-                    LoraConfig {
-                        r,
-                        alpha,
-                        target_modules,
-                        use_rslora,
-                        ..LoraConfig::default()
-                    }
-                } else {
-                    LoraConfig::default()
-                }
-            } else {
-                LoraConfig::default()
-            };
-
-        let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config)
-            .map_err(|e| e.to_string())?;
-        model
-            .load_lora_weights(lora_path)
-            .map_err(|e| e.to_string())?;
-        model
-            .merge_lora()
-            .map_err(|e| format!("Failed to merge LoRA: {e}"))?;
-        model
-            .eval_all()
-            .map_err(|e| format!("Failed to eval merged model: {e}"))?;
-
-        let mut cache = model
-            .create_cache(max_seq_len)
-            .ok_or_else(|| "Model does not support KV cache".to_string())?;
-        let mut token_buf: Vec<u32> = Vec::new();
-        let mut streamed_text = String::new();
-
-        let _ = generate_cached_async_streaming(
-            |input, cache| {
-                model
-                    .forward_with_cache(input, None, Some(cache))
-                    .map_err(|e| mlx_rs::error::Exception::custom(e.to_string()))
-            },
-            &input_ids,
-            gen_config,
-            &mut cache,
-            |token_id| {
-                token_buf.push(token_id);
-                if let Ok(text) = tokenizer.decode(&token_buf) {
-                    if text.len() > streamed_text.len() {
-                        let delta = &text[streamed_text.len()..];
-                        if !delta.is_empty() {
-                            if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                                return false;
-                            }
-                            let _ = app_handle.emit("inference-token", delta);
+    // Split borrow: &runner.tokenizer captured by closure, runner.gen borrows the rest.
+    let tokenizer = &runner.tokenizer;
+    runner.state
+        .generate_streaming(|token_id| {
+            token_buf.push(token_id);
+            if let Ok(text) = tokenizer.decode(&token_buf) {
+                if text.len() > streamed_text.len() {
+                    let delta = &text[streamed_text.len()..];
+                    if !delta.is_empty() {
+                        if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
+                            return false;
                         }
+                        let _ = app_handle.emit("inference-token", delta);
                     }
-                    streamed_text = text;
                 }
-                true
-            },
-        )
+                streamed_text = text;
+            }
+            true
+        })
         .map_err(|e| e.to_string())?;
-    } else {
-        // --- Standard inference (supports hybrid models with mamba cache) ---
-        let mut model = DynamicModel::load(&model_path).map_err(|e| e.to_string())?;
-        let mut cache = model.create_cache(max_seq_len);
-        let mut mamba_cache = model.create_mamba_cache();
-        let mut token_buf: Vec<u32> = Vec::new();
-        let mut streamed_text = String::new();
-
-        let _ = generate_cached_async_streaming(
-            |input, cache| {
-                model.forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
-            },
-            &input_ids,
-            gen_config,
-            &mut cache,
-            |token_id| {
-                token_buf.push(token_id);
-                if let Ok(text) = tokenizer.decode(&token_buf) {
-                    if text.len() > streamed_text.len() {
-                        let delta = &text[streamed_text.len()..];
-                        if !delta.is_empty() {
-                            if cancel_flag.load(std::sync::atomic::Ordering::SeqCst) {
-                                return false;
-                            }
-                            let _ = app_handle.emit("inference-token", delta);
-                        }
-                    }
-                    streamed_text = text;
-                }
-                true
-            },
-        )
-        .map_err(|e| e.to_string())?;
-    }
 
     Ok(())
 }

@@ -70,6 +70,8 @@ pub struct InferenceTab {
     pub selected_message: Option<usize>,
     /// Whether the sidebar is visible.
     pub sidebar_visible: bool,
+    /// Path to packed expert weights directory for SSD-offloaded MoE inference.
+    pub experts_dir: Option<String>,
 }
 
 // Keep backwards-compat public fields as computed properties
@@ -100,6 +102,7 @@ impl InferenceTab {
             message_scroll: 0,
             selected_message: None,
             sidebar_visible: true,
+            experts_dir: None,
         }
     }
 
