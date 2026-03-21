@@ -405,16 +405,16 @@ fn gated_delta_chunk_ops(
     //          (I+A) matrices for batched tri_inv.
     // ========================================================================
     struct ChunkPrecomp {
-        q_c: Array,            // [B, H, C, Dk]
-        k_c: Array,            // [B, H, C, Dk]
-        #[allow(dead_code)]    // Precomputed for chunk attention (used in tri_inv path)
-        k_c_t: Array,          // [B, H, Dk, C]
-        beta_v: Array,         // [B, H, C, Dv]
+        q_c: Array, // [B, H, C, Dk]
+        k_c: Array, // [B, H, C, Dk]
+        #[allow(dead_code)] // Precomputed for chunk attention (used in tri_inv path)
+        k_c_t: Array, // [B, H, Dk, C]
+        beta_v: Array, // [B, H, C, Dv]
         beta_gamma_row: Array, // [B, H, 1, C]
-        gamma_init: Array,     // [B, H, C]
-        gamma_total: Array,    // [B, H]
-        gamma_last: Array,     // [B, H, C]
-        qk_decay: Array,       // [B, H, C, C]
+        gamma_init: Array, // [B, H, C]
+        gamma_total: Array, // [B, H]
+        gamma_last: Array, // [B, H, C]
+        qk_decay: Array, // [B, H, C, C]
     }
 
     let mut chunks: Vec<ChunkPrecomp> = Vec::with_capacity(n_chunks as usize);
