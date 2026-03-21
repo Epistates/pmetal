@@ -865,11 +865,12 @@ async fn is_model_dir(dir: &PathBuf) -> bool {
     if dir.join("adapter_config.json").exists() {
         return true;
     }
-    // Has any .safetensors files?
+    // Has any .safetensors or .gguf files?
     if let Ok(mut rd) = tokio::fs::read_dir(dir).await {
         while let Ok(Some(entry)) = rd.next_entry().await {
             let name = entry.file_name();
-            if name.to_string_lossy().ends_with(".safetensors") {
+            let name_str = name.to_string_lossy();
+            if name_str.ends_with(".safetensors") || name_str.ends_with(".gguf") {
                 return true;
             }
         }

@@ -3203,19 +3203,36 @@ async fn dir_size_simple(path: &PathBuf) -> u64 {
     total
 }
 
-/// Read `config.json` from the first snapshot directory found under a HF hub model repo.
+/// Read `config.json` from a model path.
+///
+/// Checks (in order):
+/// 1. Direct `config.json` at path root (custom dirs, GGUF models with config)
+/// 2. HF hub cache layout: `snapshots/{hash}/config.json`
 async fn read_model_config_json(repo_path: &str) -> Option<serde_json::Value> {
-    let snapshots = PathBuf::from(repo_path).join("snapshots");
-    let mut rd = tokio::fs::read_dir(&snapshots).await.ok()?;
+    let base = PathBuf::from(repo_path);
 
-    // Take the first (usually only) snapshot hash directory
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        if entry.file_type().await.ok()?.is_dir() {
-            let config_path = entry.path().join("config.json");
-            if let Ok(data) = tokio::fs::read_to_string(&config_path).await {
-                return serde_json::from_str(&data).ok();
+    // 1. Check root config.json (custom dirs, non-HF layouts)
+    let root_config = base.join("config.json");
+    if let Ok(data) = tokio::fs::read_to_string(&root_config).await {
+        if let Ok(cfg) = serde_json::from_str(&data) {
+            return Some(cfg);
+        }
+    }
+
+    // 2. Check HF hub cache layout: snapshots/{hash}/config.json
+    let snapshots = base.join("snapshots");
+    if let Ok(mut rd) = tokio::fs::read_dir(&snapshots).await {
+        while let Ok(Some(entry)) = rd.next_entry().await {
+            if entry.file_type().await.ok().is_some_and(|ft| ft.is_dir()) {
+                let config_path = entry.path().join("config.json");
+                if let Ok(data) = tokio::fs::read_to_string(&config_path).await {
+                    if let Ok(cfg) = serde_json::from_str(&data) {
+                        return Some(cfg);
+                    }
+                }
             }
         }
     }
+
     None
 }

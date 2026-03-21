@@ -679,6 +679,19 @@ fn is_model_dir(path: &std::path::Path) -> bool {
         || path.join("model.safetensors").exists()
         || path.join("model.safetensors.index.json").exists()
         || path.join("lora_weights.safetensors").exists()
+        || has_gguf_files(path)
+}
+
+/// Check if a directory contains any .gguf files.
+fn has_gguf_files(path: &std::path::Path) -> bool {
+    std::fs::read_dir(path)
+        .ok()
+        .map(|entries| {
+            entries
+                .flatten()
+                .any(|e| e.path().extension().is_some_and(|ext| ext == "gguf"))
+        })
+        .unwrap_or(false)
 }
 
 /// Check if a directory looks like a trained/fine-tuned output directory.
@@ -797,12 +810,23 @@ fn detect_weight_format(path: &std::path::Path) -> Option<String> {
     } else if path.join("pytorch_model.bin").exists() {
         Some("PyTorch".to_string())
     } else {
-        let has_shards = std::fs::read_dir(path)
-            .ok()?
-            .flatten()
-            .any(|e| e.file_name().to_string_lossy().ends_with(".safetensors"));
+        let mut has_shards = false;
+        let mut has_gguf = false;
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let name_str = name.to_string_lossy();
+                if name_str.ends_with(".safetensors") {
+                    has_shards = true;
+                } else if name_str.ends_with(".gguf") {
+                    has_gguf = true;
+                }
+            }
+        }
         if has_shards {
             Some("SafeTensors (sharded)".to_string())
+        } else if has_gguf {
+            Some("GGUF".to_string())
         } else {
             None
         }
