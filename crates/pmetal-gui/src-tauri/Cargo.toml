@@ -1,6 +1,6 @@
 [package]
 name = "pmetal-gui"
-version = "0.3.11"
+version = "0.3.12"
 description = "PMetal - Apple Silicon ML Training Suite"
 edition = "2021"
 
@@ -26,6 +26,7 @@ serde_json = "1"
 
 # Async
 tokio = { version = "1", features = ["full"] }
+futures = "0.3"
 
 # Time
 chrono = { version = "0.4", features = ["serde"] }
@@ -41,7 +42,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 dirs = "6"
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 pmetal = { path = "../../pmetal", features = ["full"] }
-mlx-rs = { version = "0.25.7", package = "pmetal-mlx-rs", features = ["safetensors"] }
+# TODO: migrate direct mlx-rs usage to pmetal re-exports, then remove this dep
+mlx-rs = { version = "0.25.8", package = "pmetal-mlx-rs", features = ["safetensors"] }
 
 # Optimize all dependencies in dev builds — training/tokenization is CPU-bound
 # and ~10x slower without optimizations. The GUI's own code stays at opt-level 1

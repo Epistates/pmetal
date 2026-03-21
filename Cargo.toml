@@ -23,7 +23,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.11"
+version = "0.3.12"
 edition = "2024"
 rust-version = "1.86"
 license = "MIT OR Apache-2.0"
@@ -33,25 +33,25 @@ categories = ["science", "algorithms"]
 
 [workspace.dependencies]
 # Internal crates
-pmetal-core = { path = "crates/pmetal-core", version = "0.3.11", default-features = false }
-pmetal-metal = { path = "crates/pmetal-metal", version = "0.3.11", default-features = false }
-pmetal-mlx = { path = "crates/pmetal-mlx", version = "0.3.11" }
-pmetal-models = { path = "crates/pmetal-models", version = "0.3.11" }
-pmetal-lora = { path = "crates/pmetal-lora", version = "0.3.11" }
-pmetal-data = { path = "crates/pmetal-data", version = "0.3.11" }
-pmetal-trainer = { path = "crates/pmetal-trainer", version = "0.3.11" }
-pmetal-hub = { path = "crates/pmetal-hub", version = "0.3.11" }
-pmetal-gguf = { path = "crates/pmetal-gguf", version = "0.3.11" }
-pmetal-cli = { path = "crates/pmetal-cli", version = "0.3.11" }
-pmetal-vocoder = { path = "crates/pmetal-vocoder", version = "0.3.11" }
-pmetal-merge = { path = "crates/pmetal-merge", version = "0.3.11" }
-pmetal-distill = { path = "crates/pmetal-distill", version = "0.3.11" }
-pmetal-mhc = { path = "crates/pmetal-mhc", version = "0.3.11" }
-pmetal-distributed = { path = "crates/pmetal-distributed", version = "0.3.11" }
-pmetal-serve = { path = "crates/pmetal-serve", version = "0.3.11" }
+pmetal-core = { path = "crates/pmetal-core", version = "0.3.12", default-features = false }
+pmetal-metal = { path = "crates/pmetal-metal", version = "0.3.12", default-features = false }
+pmetal-mlx = { path = "crates/pmetal-mlx", version = "0.3.12" }
+pmetal-models = { path = "crates/pmetal-models", version = "0.3.12" }
+pmetal-lora = { path = "crates/pmetal-lora", version = "0.3.12" }
+pmetal-data = { path = "crates/pmetal-data", version = "0.3.12" }
+pmetal-trainer = { path = "crates/pmetal-trainer", version = "0.3.12" }
+pmetal-hub = { path = "crates/pmetal-hub", version = "0.3.12" }
+pmetal-gguf = { path = "crates/pmetal-gguf", version = "0.3.12" }
+pmetal-cli = { path = "crates/pmetal-cli", version = "0.3.12" }
+pmetal-vocoder = { path = "crates/pmetal-vocoder", version = "0.3.12" }
+pmetal-merge = { path = "crates/pmetal-merge", version = "0.3.12" }
+pmetal-distill = { path = "crates/pmetal-distill", version = "0.3.12" }
+pmetal-mhc = { path = "crates/pmetal-mhc", version = "0.3.12" }
+pmetal-distributed = { path = "crates/pmetal-distributed", version = "0.3.12" }
+pmetal-serve = { path = "crates/pmetal-serve", version = "0.3.12" }
 
 # MLX bindings - pmetal-maintained fork (unblocks crates.io publishing)
-mlx-rs = { version = "0.25.7", package = "pmetal-mlx-rs", features = ["safetensors"] }
+mlx-rs = { version = "0.25.8", package = "pmetal-mlx-rs", features = ["safetensors"] }
 mlx-sys = { version = "=0.2.4", package = "pmetal-mlx-sys" }
 
 # Async runtime
@@ -164,4 +164,5 @@ opt-level = 0
 # Benchmarks: release perf with debug symbols for Instruments profiling
 [profile.bench]
 debug = 1
+
 

@@ -5455,7 +5455,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "pmetal-core",
  "pmetal-data",
@@ -5478,7 +5478,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-core"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "secrecy",
  "serde",
@@ -5490,7 +5490,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-data"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "arrow",
  "image",
@@ -5508,7 +5508,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distill"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "bitcode",
  "half",
@@ -5530,7 +5530,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-distributed"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -5556,7 +5556,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gguf"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "byteorder",
  "half",
@@ -5568,10 +5568,11 @@ dependencies = [
 
 [[package]]
 name = "pmetal-gui"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "chrono",
  "dirs",
+ "futures",
  "pmetal",
  "pmetal-mlx-rs",
  "reqwest 0.13.2",
@@ -5589,7 +5590,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-hub"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "base64 0.22.1",
  "dirs",
@@ -5609,7 +5610,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-lora"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "half",
  "pmetal-core",
@@ -5626,7 +5627,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-merge"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "half",
  "hf-hub",
@@ -5649,7 +5650,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-metal"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "block2",
  "cc",
@@ -5674,7 +5675,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mhc"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "ndarray",
  "num-traits",
@@ -5694,7 +5695,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mlx"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "half",
  "num-traits",
@@ -5711,9 +5712,9 @@ dependencies = [
 
 [[package]]
 name = "pmetal-mlx-rs"
-version = "0.25.7"
+version = "0.25.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cbfec183f3115a5a4542475671a4fb23fb2e5d8e4b668da0a15ac122098deca1"
+checksum = "a05ebac612098d1324f0027bc7934e9794475c6642ab5bc923025fb4b74ca5f5"
 dependencies = [
  "bytemuck",
  "dyn-clone",
@@ -5748,7 +5749,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-models"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "json5",
  "objc2",
@@ -5768,7 +5769,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-trainer"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "anyhow",
  "arrow",
@@ -5798,7 +5799,7 @@ dependencies = [
 
 [[package]]
 name = "pmetal-vocoder"
-version = "0.3.11"
+version = "0.3.12"
 dependencies = [
  "half",
  "hf-hub",
