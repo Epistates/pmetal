@@ -20,28 +20,15 @@ permissions:
   contents: write
 
 jobs:
-  test:
-    name: Test
-    runs-on: macos-latest
-    permissions:
-      contents: read
-
-    steps:
-      - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      - name: Check
-        run: cargo check --workspace --exclude pmetal-py
-      - name: Test
-        run: cargo test --workspace --exclude pmetal-py --profile ci -- --test-threads=1
-
   # ============================================================
   # CLI Binary (aarch64-apple-darwin)
   # ============================================================
+  # NOTE: Tests are NOT duplicated here. The CI workflow already runs
+  # lint + test on every push to main. Tags are only created after CI
+  # passes, so re-running tests would waste ~15 minutes of CI time.
   build-cli:
     name: Build CLI (aarch64-apple-darwin)
     runs-on: macos-latest
-    needs: test
     permissions:
       contents: read
 
@@ -171,7 +158,6 @@ jobs:
   build-gui:
     name: Build GUI (macOS aarch64)
     runs-on: macos-latest
-    needs: test
     permissions:
       contents: read
 
