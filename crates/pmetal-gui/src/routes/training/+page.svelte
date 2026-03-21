@@ -37,8 +37,8 @@
   let columnToAdd = $state('');
   let epochs = $state(3);
   let learningRate = $state(0.0002);
-  let batchSize = $state(4);
-  let gradAccumSteps = $state(4);
+  let batchSize = $state(1);
+  let gradAccumSteps = $state(1);
   let loraRank = $state(16);
   let loraAlpha = $state(32);
   let loraDropout = $state(0.0);
@@ -57,7 +57,7 @@
 
   // PMetal optimizations
   let jitCompilation = $state(false);
-  let gradientCheckpointing = $state(false);
+  let gradientCheckpointing = $state(true);
   let sequencePacking = $state(true);
   let flashAttention = $state(true);
   let fusedOptimizer = $state(false);

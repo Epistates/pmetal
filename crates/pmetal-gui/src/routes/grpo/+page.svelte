@@ -8,7 +8,7 @@
   let datasetPath = $state('');
   let epochs = $state(1);
   let learningRate = $state(0.00001);
-  let batchSize = $state(4);
+  let batchSize = $state(1);
   let groupSize = $state(8);
   let beta = $state(0.04);
   let loraRank = $state(16);

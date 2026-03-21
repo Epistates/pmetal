@@ -20,7 +20,7 @@
   let alpha = $state(0.5);
   let epochs = $state(3);
   let learningRate = $state(0.0001);
-  let batchSize = $state(4);
+  let batchSize = $state(1);
   let loraRank = $state(16);
   let loraAlpha = $state(32);
   let maxSeqLen = $state(2048);
