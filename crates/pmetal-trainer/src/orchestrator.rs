@@ -818,9 +818,11 @@ fn run_qlora_path(
     }
 
     {
-        let adaptive_config = AdaptiveLrConfig::default();
+        let adaptive_config = AdaptiveLrConfig::for_lora();
         let control_file = PathBuf::from(output_dir).join(".lr_control.json");
         training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
+        training_loop
+            .set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
     }
 
     if config.resume {
@@ -829,6 +831,17 @@ fn run_qlora_path(
             model.set_lora_parameters(&lora_params);
             training_loop.set_step(metadata.step);
             training_loop.set_epoch(metadata.epoch);
+            // Restore persisted best-loss snapshot so rollback works after resume.
+            if let Some(snapshot) =
+                crate::checkpoint::load_best_snapshot(checkpoint_manager.checkpoint_dir())
+            {
+                training_loop.best_lora_snapshot = Some(snapshot);
+                // Notify adaptive LR controller that a snapshot is available for rollback.
+                if let Some(ref mut ctrl) = training_loop.adaptive_lr {
+                    ctrl.set_has_snapshot(metadata.running_loss, metadata.step);
+                }
+                tracing::info!("Restored best snapshot from disk for rollback-on-resume");
+            }
         } else {
             tracing::info!("No checkpoint found, starting fresh");
         }
@@ -964,9 +977,11 @@ fn run_lora_path(
     }
 
     {
-        let adaptive_config = AdaptiveLrConfig::default();
+        let adaptive_config = AdaptiveLrConfig::for_lora();
         let control_file = PathBuf::from(output_dir).join(".lr_control.json");
         training_loop.enable_adaptive_lr_with_control(adaptive_config, control_file);
+        training_loop
+            .set_snapshot_persist_dir(checkpoint_manager.checkpoint_dir().to_path_buf());
     }
 
     if config.resume {
@@ -975,6 +990,17 @@ fn run_lora_path(
             model.set_lora_parameters(&lora_params);
             training_loop.set_step(metadata.step);
             training_loop.set_epoch(metadata.epoch);
+            // Restore persisted best-loss snapshot so rollback works after resume.
+            if let Some(snapshot) =
+                crate::checkpoint::load_best_snapshot(checkpoint_manager.checkpoint_dir())
+            {
+                training_loop.best_lora_snapshot = Some(snapshot);
+                // Notify adaptive LR controller that a snapshot is available for rollback.
+                if let Some(ref mut ctrl) = training_loop.adaptive_lr {
+                    ctrl.set_has_snapshot(metadata.running_loss, metadata.step);
+                }
+                tracing::info!("Restored best snapshot from disk for rollback-on-resume");
+            }
         } else {
             tracing::info!("No checkpoint found, starting fresh");
         }

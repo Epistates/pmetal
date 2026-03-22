@@ -167,9 +167,9 @@ pub struct AdaptiveLrConfig {
     /// When true, divergence triggers weight restoration from the best in-memory
     /// snapshot instead of just reducing LR.
     ///
-    /// **Off by default.** Rollback is counterproductive for typical LoRA fine-tuning
-    /// where early loss increases are expected (LoRA B initializes at zero). Enable
-    /// this for long pre-training runs or when you know the loss landscape is stable.
+    /// **On by default.** The grace period (`warmup_fraction`) prevents rollback
+    /// from firing while LoRA B matrices are still initializing from zero.
+    /// Disable for short experimental runs where rollback overhead is undesirable.
     pub rollback_enabled: bool,
 
     /// Maximum number of rollback attempts before early stopping.
@@ -183,7 +183,7 @@ pub struct AdaptiveLrConfig {
     /// `set_warmup_steps()` is called with the LR scheduler's warmup duration,
     /// the grace period is extended to cover the full warmup + settling buffer.
     ///
-    /// Default: 0.25 (25% of total steps). Set to 0.0 to disable.
+    /// Default: 0.30 (30% of total steps). Set to 0.0 to disable.
     pub warmup_fraction: f64,
 
     /// Maximum relative loss increase allowed during the warmup grace period before
@@ -220,10 +220,10 @@ impl Default for AdaptiveLrConfig {
             max_divergence_reductions: 4,
             min_lr: 1e-7,
             control_poll_interval: 10,
-            rollback_enabled: false,
+            rollback_enabled: true,
             max_rollbacks: 5,
             rollback_lr_factor: 0.5,
-            warmup_fraction: 0.25,
+            warmup_fraction: 0.30,
             warmup_max_loss_increase: f64::MAX, // Disabled by default — loss rise during warmup is expected
             max_warmup_caps: 3,
         }
@@ -231,6 +231,22 @@ impl Default for AdaptiveLrConfig {
 }
 
 impl AdaptiveLrConfig {
+    /// Config tuned for LoRA fine-tuning.
+    ///
+    /// Enables rollback with a conservative budget (3 attempts) and a slightly
+    /// tighter LR reduction on each rollback. The 30% warmup fraction ensures
+    /// rollback does not trigger during LoRA B-matrix initialization (which
+    /// starts at zero and produces high early loss by design).
+    pub fn for_lora() -> Self {
+        Self {
+            rollback_enabled: true,
+            warmup_fraction: 0.30,
+            max_rollbacks: 3,
+            rollback_lr_factor: 0.5,
+            ..Self::default()
+        }
+    }
+
     /// Config tuned for knowledge distillation (more conservative).
     pub fn for_distillation() -> Self {
         Self {
@@ -831,6 +847,22 @@ impl AdaptiveLrController {
             self.best_ema_step,
             self.best_ema_loss,
             self.lr_multiplier,
+        );
+    }
+
+    /// Notify the controller that a best-loss snapshot has been loaded
+    /// from a persisted checkpoint (e.g., on training resume).
+    ///
+    /// Without this call, the controller would not trigger rollbacks until
+    /// a new best EMA loss is observed and `should_snapshot_best` returns true.
+    pub fn set_has_snapshot(&mut self, best_loss: f64, best_step: usize) {
+        self.has_best_snapshot = true;
+        self.best_ema_loss = best_loss;
+        self.best_ema_step = best_step;
+        tracing::debug!(
+            best_loss,
+            best_step,
+            "Loaded persisted best snapshot into adaptive LR controller"
         );
     }
 

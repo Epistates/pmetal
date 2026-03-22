@@ -130,7 +130,7 @@ pub struct TrainingLoopConfig {
     /// Lower = more memory savings but slower. Recommended: 4 for most models.
     pub gradient_checkpointing_layers: usize,
     /// Separate learning rate for embedding parameters.
-    /// Unsloth recommends 5e-5 for embeddings vs 2e-4 for LoRA params.
+    /// Recommended default is 5e-5 for embeddings vs 2e-4 for LoRA params.
     /// None means use the same learning rate as other parameters.
     pub embedding_lr: Option<f32>,
     /// Enable eager evaluation after each training step.
@@ -288,6 +288,9 @@ pub struct TrainingLoop {
     /// In-memory snapshot of the best LoRA weights for rollback.
     /// LoRA params are typically a few MB, so this is cheap to hold in memory.
     pub(crate) best_lora_snapshot: Option<std::collections::HashMap<std::rc::Rc<str>, Array>>,
+    /// When set, each in-memory snapshot is also persisted to this directory
+    /// as `best_snapshot.safetensors` so it survives process interruptions.
+    pub(crate) snapshot_persist_dir: Option<std::path::PathBuf>,
     /// Distributed gradient synchronization bridge.
     /// When present, gradients are all-reduced across nodes after each accumulation cycle.
     #[cfg(feature = "distributed")]
@@ -330,6 +333,7 @@ impl TrainingLoop {
             adaptive_lr: None,
             adaptive_lr_override: None,
             best_lora_snapshot: None,
+            snapshot_persist_dir: None,
             #[cfg(feature = "distributed")]
             distributed: None,
         }
@@ -352,6 +356,15 @@ impl TrainingLoop {
         self.config.dataloader.rank = sync.rank();
         self.config.dataloader.world_size = sync.world_size();
         self.distributed = Some(sync);
+    }
+
+    /// Set the directory where best-loss snapshots are persisted to disk.
+    ///
+    /// When set, every call to `snapshot_best_weights` also writes
+    /// `best_snapshot.safetensors` to this directory so the snapshot survives
+    /// process interruptions and is available on resume.
+    pub fn set_snapshot_persist_dir(&mut self, dir: std::path::PathBuf) {
+        self.snapshot_persist_dir = Some(dir);
     }
 
     /// Enable adaptive LR with control file for TUI communication.
@@ -453,6 +466,8 @@ impl TrainingLoop {
     ///
     /// Called when the adaptive LR controller indicates loss has improved.
     /// The snapshot is held in memory for fast rollback (LoRA params are small).
+    /// When `snapshot_persist_dir` is configured, the snapshot is also written to
+    /// disk as `best_snapshot.safetensors` for durability across restarts.
     pub fn snapshot_best_weights<M: TrainableModel>(&mut self, model: &M) {
         let params = model.lora_parameters();
         tracing::debug!(
@@ -461,6 +476,14 @@ impl TrainingLoop {
             params.len(),
             params.values().map(|a| a.nbytes()).sum::<usize>() as f64 / 1_048_576.0,
         );
+
+        // Persist to disk if a snapshot directory is configured.
+        if let Some(ref dir) = self.snapshot_persist_dir {
+            if let Err(e) = crate::checkpoint::save_best_snapshot(dir, &params) {
+                tracing::warn!("Failed to persist best snapshot to disk: {e}");
+            }
+        }
+
         self.best_lora_snapshot = Some(params);
     }
 
@@ -496,6 +519,44 @@ impl TrainingLoop {
             ctrl.best_ema_step() == self.step
         } else {
             false
+        }
+    }
+
+    /// Unified post-step logic: adaptive LR + snapshot + rollback handling.
+    ///
+    /// Consolidates the pattern duplicated across all training loop variants:
+    ///   1. Feed loss to adaptive LR controller
+    ///   2. Snapshot best weights if loss improved
+    ///   3. Restore from snapshot on rollback
+    ///   4. Signal early stop when max rollbacks exhausted
+    ///
+    /// Returns `AdaptiveAction` indicating what the caller should do next.
+    pub fn post_step_adaptive<M: TrainableModel>(
+        &mut self,
+        loss: f64,
+        model: &mut M,
+    ) -> AdaptiveAction {
+        let action = self.apply_adaptive_lr(loss);
+        match action {
+            AdaptiveAction::Continue => {
+                if self.should_snapshot_best() {
+                    self.snapshot_best_weights(model);
+                }
+                AdaptiveAction::Continue
+            }
+            AdaptiveAction::Rollback => {
+                tracing::warn!(step = self.step, "Divergence detected — rolling back to best snapshot");
+                if self.restore_best_weights(model) {
+                    AdaptiveAction::Rollback
+                } else {
+                    // No snapshot available — treat as continue
+                    AdaptiveAction::Continue
+                }
+            }
+            AdaptiveAction::EarlyStop => {
+                tracing::warn!(step = self.step, "Max rollbacks exhausted — early stopping");
+                AdaptiveAction::EarlyStop
+            }
         }
     }
 
@@ -1275,12 +1336,12 @@ impl Drop for TrainingLoop {
 }
 
 // =============================================================================
-// Custom Autograd Training (Unsloth-style memory optimization)
+// Custom Autograd Training (memory-efficient LoRA optimization)
 // =============================================================================
 //
 // This module provides custom autograd training that bypasses MLX autodiff
-// for LoRA layers, achieving ~50% memory reduction. This is the technique
-// used by unsloth to enable training of larger models on limited memory.
+// for LoRA layers, achieving ~50% memory reduction by avoiding materialization
+// of full intermediate activations, enabling training of larger models on limited memory.
 //
 // NOTE: This is an advanced feature that requires model-specific integration.
 // The standard training loop (run_compiled, run_packed) uses MLX autodiff

@@ -14,6 +14,84 @@ use serde::{Deserialize, Serialize};
 
 use crate::{Result, SftError};
 
+// ---------------------------------------------------------------------------
+// Best-snapshot persistence (for rollback-on-resume)
+// ---------------------------------------------------------------------------
+
+/// Persist the best in-memory LoRA snapshot to disk as a safetensors file.
+///
+/// Writes `best_snapshot.safetensors` inside `checkpoint_dir`. Intended to be
+/// called whenever the training loop takes a new in-memory best snapshot so
+/// that the weights are recoverable if the process is interrupted and resumed.
+///
+/// The file is written atomically via a `.tmp` rename to avoid leaving a
+/// partially-written snapshot that could corrupt a resume.
+pub fn save_best_snapshot(
+    checkpoint_dir: &Path,
+    weights: &HashMap<Rc<str>, Array>,
+) -> Result<()> {
+    fs::create_dir_all(checkpoint_dir).map_err(|e| {
+        SftError::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to create checkpoint directory: {e}"),
+        ))
+    })?;
+
+    let tmp_path = checkpoint_dir.join("best_snapshot.safetensors.tmp");
+    let final_path = checkpoint_dir.join("best_snapshot.safetensors");
+
+    Array::save_safetensors(
+        weights.iter().map(|(k, v)| (k.as_ref(), v)),
+        None,
+        &tmp_path,
+    )
+    .map_err(|e| {
+        SftError::Io(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to write best snapshot: {e}"),
+        ))
+    })?;
+
+    fs::rename(&tmp_path, &final_path).map_err(|e| {
+        SftError::Io(std::io::Error::new(
+            e.kind(),
+            format!("Failed to rename best snapshot: {e}"),
+        ))
+    })?;
+
+    tracing::debug!("Persisted best snapshot to {:?}", final_path);
+    Ok(())
+}
+
+/// Load the persisted best LoRA snapshot from `checkpoint_dir`, if present.
+///
+/// Returns `None` if `best_snapshot.safetensors` does not exist.
+/// Errors in the file I/O are logged as warnings and `None` is returned so
+/// that a missing or corrupt snapshot degrades gracefully to a fresh start.
+pub fn load_best_snapshot(checkpoint_dir: &Path) -> Option<HashMap<Rc<str>, Array>> {
+    let path = checkpoint_dir.join("best_snapshot.safetensors");
+    if !path.exists() {
+        return None;
+    }
+
+    match Array::load_safetensors(&path) {
+        Ok(params) => {
+            let weights: HashMap<Rc<str>, Array> =
+                params.into_iter().map(|(k, v)| (Rc::from(k), v)).collect();
+            tracing::info!(
+                "Loaded best snapshot from {:?} ({} params)",
+                path,
+                weights.len()
+            );
+            Some(weights)
+        }
+        Err(e) => {
+            tracing::warn!("Failed to load best snapshot from {:?}: {e}", path);
+            None
+        }
+    }
+}
+
 /// Training state metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CheckpointMetadata {
