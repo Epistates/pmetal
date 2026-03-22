@@ -7,8 +7,12 @@ PMetal is a complete machine learning platform for Apple Silicon — from low-le
 ## Prerequisites
 
 - **macOS** on Apple Silicon (M1 or later)
-- **Rust 1.86+** (for building from source or using the SDK)
 - **Xcode Command Line Tools**: `xcode-select --install`
+
+For building from source, also install:
+- **Rust 1.86+** via [rustup](https://rustup.rs/)
+- **Metal Toolchain**: `xcodebuild -downloadComponent MetalToolchain`
+- **CMake**: `brew install cmake`
 
 ## Quick Install
 

@@ -9,10 +9,34 @@ Install PMetal from prebuilt binaries, crates.io, or build from source.
 
 For building from source:
 - **Rust 1.86+**: Install via [rustup](https://rustup.rs/)
-- **Metal Toolchain**: `xcodebuild -downloadComponent MetalToolchain`
+- **Metal Toolchain**: Required for compiling Metal GPU shaders
+- **CMake**: Required for building MLX native dependencies
 
 For GUI development:
 - **bun**: `brew install oven-sh/bun/bun`
+
+### Installing Build Dependencies
+
+```bash
+# 1. Install Xcode Command Line Tools
+xcode-select --install
+
+# 2. Accept the Xcode license (if Xcode is installed)
+sudo xcodebuild -license accept
+
+# 3. Install the Metal shader compiler toolchain
+xcodebuild -downloadComponent MetalToolchain
+
+# 4. Install CMake (required for MLX native build)
+brew install cmake
+
+# 5. Restart your terminal after installation
+```
+
+> **Note:** If you installed Xcode but `metal` is not found, try:
+> `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`
+>
+> After installing Xcode and Metal, a **restart** may be required.
 
 ## Prebuilt Binaries
 

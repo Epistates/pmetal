@@ -12,11 +12,17 @@ Thank you for your interest in contributing to PMetal!
 - **macOS**: PMetal targets Apple Silicon exclusively
 - **Xcode Command Line Tools**: `xcode-select --install`
 - **Metal Toolchain**: `xcodebuild -downloadComponent MetalToolchain`
+- **CMake**: `brew install cmake` (required for MLX native build)
 - **bun** (optional, for GUI): `brew install oven-sh/bun/bun`
 
 ### Development Setup
 
 ```bash
+# Install all build dependencies
+xcode-select --install
+xcodebuild -downloadComponent MetalToolchain
+brew install cmake
+
 git clone https://github.com/epistates/pmetal.git
 cd pmetal
 
