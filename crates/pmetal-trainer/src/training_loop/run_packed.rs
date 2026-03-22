@@ -83,6 +83,14 @@ impl TrainingLoop {
         let computed_total_steps = max_steps.unwrap_or(num_epochs * stats.num_batches);
         if let Some(ref mut ctrl) = self.adaptive_lr {
             ctrl.set_total_steps(computed_total_steps);
+            // Extend grace period to cover the full LR warmup so the adaptive
+            // controller doesn't intervene while the LR is still ramping.
+            let warmup_steps = if let Some(ratio) = self.config.training.warmup_ratio {
+                (computed_total_steps as f64 * ratio) as usize
+            } else {
+                self.config.training.warmup_steps
+            };
+            ctrl.set_warmup_steps(warmup_steps);
         }
 
         // Create state tuple for training
@@ -201,12 +209,18 @@ impl TrainingLoop {
                     // optimizer states together to prevent graph growth
                     eval_training_state(&accumulated_losses, &state)?;
 
-                    // Extract values and compute running loss via EMA
-                    // Track adaptive action across all accumulated losses
+                    // Extract values and compute running loss via EMA.
+                    // Track adaptive action across all accumulated losses.
+                    // Each accumulated loss was computed at a specific training step.
+                    // Retroactively set self.step so the adaptive LR controller and
+                    // scheduler see the correct per-step context (not the batch-end step).
+                    let saved_step = self.step;
+                    let batch_size = accumulated_losses.len();
                     let mut adaptive_action = AdaptiveAction::Continue;
-                    for loss in accumulated_losses.iter() {
+                    for (i, loss) in accumulated_losses.iter().enumerate() {
                         let loss_val = loss.item::<f32>();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
+                        self.step = saved_step - batch_size + i;
                         let action = self.apply_adaptive_lr(loss_val as f64);
                         match action {
                             AdaptiveAction::EarlyStop => {
@@ -221,6 +235,7 @@ impl TrainingLoop {
                             _ => {}
                         }
                     }
+                    self.step = saved_step;
                     accumulated_losses.clear();
 
                     // Snapshot best weights when adaptive controller detects improvement

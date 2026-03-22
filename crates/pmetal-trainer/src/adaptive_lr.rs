@@ -60,6 +60,11 @@ pub enum LrEvent {
     ManualOverride { lr: f64 },
     /// LR restored after temporary spike reduction.
     SpikeRecovered,
+    /// Loss increased too much during warmup — LR ceiling reduced.
+    WarmupCapped {
+        loss_increase_pct: f64,
+        new_multiplier: f64,
+    },
 }
 
 impl std::fmt::Display for LrEvent {
@@ -85,6 +90,13 @@ impl std::fmt::Display for LrEvent {
             } => write!(f, "early_stop(n={rollback_count}, best={best_loss:.4})"),
             LrEvent::ManualOverride { lr } => write!(f, "manual(lr={lr:.2e})"),
             LrEvent::SpikeRecovered => write!(f, "recovered"),
+            LrEvent::WarmupCapped {
+                loss_increase_pct,
+                new_multiplier,
+            } => write!(
+                f,
+                "warmup_cap(+{loss_increase_pct:.1}%, mult={new_multiplier:.3})"
+            ),
         }
     }
 }
@@ -166,13 +178,26 @@ pub struct AdaptiveLrConfig {
     /// LR multiplier applied on each rollback (cumulative with existing reductions).
     pub rollback_lr_factor: f64,
 
-    /// Fraction of total training steps to skip before activating any adaptive logic
-    /// (spike, plateau, divergence detection). During this grace period, only manual
-    /// overrides are processed. This prevents false triggers from the normal
-    /// early-training loss rise in LoRA fine-tuning.
+    /// Fraction of total training steps to skip before activating full adaptive logic
+    /// (spike, plateau, divergence detection). This is a fallback — when
+    /// `set_warmup_steps()` is called with the LR scheduler's warmup duration,
+    /// the grace period is extended to cover the full warmup + settling buffer.
     ///
-    /// Default: 0.1 (10% of total steps). Set to 0.0 to disable.
+    /// Default: 0.25 (25% of total steps). Set to 0.0 to disable.
     pub warmup_fraction: f64,
+
+    /// Maximum relative loss increase allowed during the warmup grace period before
+    /// reducing the LR ceiling. Compares a recent 5-step average to the initial loss.
+    ///
+    /// Default: f64::MAX (disabled). Loss increasing during LR warmup is expected.
+    /// Set to 0.03-0.05 to enable early detection for pre-training runs.
+    pub warmup_max_loss_increase: f64,
+
+    /// Maximum number of warmup LR cap events. After this many, warmup monitoring
+    /// stops and defers to post-warmup divergence detection.
+    ///
+    /// Default: 3.
+    pub max_warmup_caps: usize,
 }
 
 impl Default for AdaptiveLrConfig {
@@ -189,7 +214,7 @@ impl Default for AdaptiveLrConfig {
             plateau_max_reductions: 5,
             divergence_window: 40,
             divergence_factor: 0.7,
-            divergence_slope_threshold: 0.05,
+            divergence_slope_threshold: 0.005,
             divergence_confirmation: 2,
             divergence_cooldown_steps: 80, // 2x window
             max_divergence_reductions: 4,
@@ -198,7 +223,9 @@ impl Default for AdaptiveLrConfig {
             rollback_enabled: false,
             max_rollbacks: 5,
             rollback_lr_factor: 0.5,
-            warmup_fraction: 0.15,
+            warmup_fraction: 0.25,
+            warmup_max_loss_increase: f64::MAX, // Disabled by default — loss rise during warmup is expected
+            max_warmup_caps: 3,
         }
     }
 }
@@ -212,11 +239,12 @@ impl AdaptiveLrConfig {
             plateau_patience: 50, // React faster than SFT
             plateau_factor: 0.5,
             divergence_window: 30,
-            divergence_slope_threshold: 0.03, // More sensitive to divergence than SFT
+            divergence_slope_threshold: 0.003, // More sensitive to divergence than SFT
             divergence_confirmation: 2,
             divergence_cooldown_steps: 60,
             max_divergence_reductions: 4,
-            warmup_fraction: 0.05, // Shorter grace period (distillation has stable early loss)
+            warmup_fraction: 0.15, // Shorter grace period (distillation has stable early loss)
+            warmup_max_loss_increase: f64::MAX, // Disabled — let scheduler run without interference
             ..Self::default()
         }
     }
@@ -287,6 +315,13 @@ pub struct AdaptiveLrController {
     /// Number of rollbacks performed so far.
     rollback_count: usize,
 
+    // --- Warmup monitoring ---
+    /// Initial loss captured from the first training step, used as reference
+    /// for warmup divergence detection.
+    warmup_reference_loss: f64,
+    /// Number of warmup LR cap events fired so far.
+    warmup_caps: usize,
+
     // --- Manual override ---
     manual_lr: Option<f64>,
     control_file: Option<PathBuf>,
@@ -324,6 +359,8 @@ impl AdaptiveLrController {
             best_ema_step: 0,
             has_best_snapshot: false,
             rollback_count: 0,
+            warmup_reference_loss: 0.0,
+            warmup_caps: 0,
             manual_lr: None,
             control_file: None,
             last_control_poll: 0,
@@ -351,11 +388,14 @@ impl AdaptiveLrController {
         }
         tracing::info!(
             "Adaptive LR: grace period = {} steps ({:.0}% of {} total). \
-             Rollback: {}. Divergence: window={}, threshold={:.3}, \
+             Warmup monitor: max_increase={:.0}%, max_caps={}. \
+             Rollback: {}. Divergence: window={}, threshold={:.4}, \
              confirm={}, cooldown={}, max_reductions={}.",
             self.grace_period_steps,
             self.config.warmup_fraction * 100.0,
             total_steps,
+            self.config.warmup_max_loss_increase * 100.0,
+            self.config.max_warmup_caps,
             if self.config.rollback_enabled {
                 "enabled"
             } else {
@@ -367,6 +407,30 @@ impl AdaptiveLrController {
             self.config.divergence_cooldown_steps,
             self.config.max_divergence_reductions,
         );
+    }
+
+    /// Set the LR scheduler's warmup step count.
+    ///
+    /// Extends the grace period to cover the entire LR warmup plus a settling
+    /// buffer (10% of warmup or 10 steps, whichever is larger). Loss increasing
+    /// during LR warmup is expected behavior — the adaptive controller should
+    /// not intervene until the LR has stabilized.
+    ///
+    /// Call after `set_total_steps()`. The final grace period is the maximum of
+    /// the fraction-based value and the warmup-based value.
+    pub fn set_warmup_steps(&mut self, warmup_steps: usize) {
+        let buffer = (warmup_steps / 10).max(10);
+        let warmup_based = warmup_steps + buffer;
+        if warmup_based > self.grace_period_steps {
+            self.grace_period_steps = warmup_based;
+            tracing::info!(
+                "Adaptive LR: grace period extended to {} steps \
+                 (LR warmup={}, buffer={}).",
+                self.grace_period_steps,
+                warmup_steps,
+                buffer,
+            );
+        }
     }
 
     /// Set the control file path for TUI → training communication.
@@ -435,10 +499,58 @@ impl AdaptiveLrController {
             self.divergence_cooldown_remaining -= 1;
         }
 
-        // 3a. Grace period: skip all adaptive logic during early training.
-        // This prevents false triggers from the normal LoRA initialization
-        // loss increase (LoRA B starts at zero → first steps increase loss).
+        // 3a. Grace period: skip full adaptive logic (spike/plateau/divergence)
+        // but run warmup monitoring to catch runaway loss during LR ramp.
         if step < self.grace_period_steps {
+            // Capture initial loss reference from the first training step.
+            if self.warmup_reference_loss == 0.0 && loss.is_finite() {
+                self.warmup_reference_loss = loss;
+            }
+
+            // Warmup divergence monitoring: compare recent loss average to
+            // the initial loss. If loss has increased beyond the threshold,
+            // reduce the LR multiplier to cap the effective peak LR.
+            if self.warmup_reference_loss > 0.0
+                && self.loss_window.len() >= 10
+                && self.warmup_caps < self.config.max_warmup_caps
+            {
+                let n_recent = 5.min(self.loss_window.len());
+                let recent_avg: f64 =
+                    self.loss_window.iter().rev().take(n_recent).sum::<f64>() / n_recent as f64;
+                let relative_increase = (recent_avg - self.warmup_reference_loss)
+                    / self.warmup_reference_loss.abs().max(1e-8);
+
+                if relative_increase > self.config.warmup_max_loss_increase {
+                    self.warmup_caps += 1;
+                    let old_mult = self.lr_multiplier;
+                    self.lr_multiplier *= self.config.divergence_factor;
+
+                    tracing::warn!(
+                        "Warmup divergence: loss +{:.1}% from initial ({:.4} → {:.4}). \
+                         Reducing LR ceiling: multiplier {old_mult:.3} → {:.3} (cap {}/{}).",
+                        relative_increase * 100.0,
+                        self.warmup_reference_loss,
+                        recent_avg,
+                        self.lr_multiplier,
+                        self.warmup_caps,
+                        self.config.max_warmup_caps,
+                    );
+
+                    // Reset reference so next cap needs another threshold-sized increase.
+                    self.warmup_reference_loss = recent_avg;
+                    // Clear window so monitoring pauses until 10 new samples arrive.
+                    self.loss_window.clear();
+
+                    let base_lr = scheduled_lr * self.lr_multiplier;
+                    let event = LrEvent::WarmupCapped {
+                        loss_increase_pct: relative_increase * 100.0,
+                        new_multiplier: self.lr_multiplier,
+                    };
+                    self.last_event = event.clone();
+                    return (base_lr.max(self.config.min_lr), event);
+                }
+            }
+
             let base_lr = scheduled_lr * self.lr_multiplier;
             return (base_lr.max(self.config.min_lr), LrEvent::Scheduled);
         }
@@ -678,7 +790,8 @@ impl AdaptiveLrController {
     /// Get summary statistics.
     pub fn stats_summary(&self) -> String {
         format!(
-            "spikes={}, plateaus={}, divergences={}, rollbacks={}, multiplier={:.3}",
+            "warmup_caps={}, spikes={}, plateaus={}, divergences={}, rollbacks={}, multiplier={:.3}",
+            self.warmup_caps,
             self.total_spikes,
             self.total_plateau_reductions,
             self.total_divergence_reductions,
@@ -921,25 +1034,103 @@ mod tests {
     }
 
     #[test]
-    fn test_grace_period_blocks_detection() {
+    fn test_grace_period_blocks_spike_detection() {
         let config = AdaptiveLrConfig {
             warmup_fraction: 0.1,
             spike_threshold: 2.0,
+            warmup_max_loss_increase: 10.0, // Disable warmup monitoring for this test
             ..Default::default()
         };
         let mut ctrl = AdaptiveLrController::new(config);
         ctrl.set_total_steps(1000); // grace = 100 steps
 
-        // Feed wildly increasing losses during grace period — should NOT trigger
+        // Feed flat losses with a large spike — spike detection should NOT fire
         for i in 0..99 {
-            let loss = 5.0 + (i as f64) * 2.0;
+            let loss = if i == 50 { 100.0 } else { 5.0 };
             let (lr, event) = ctrl.step(i, loss, 1e-4);
             assert!(
                 matches!(event, LrEvent::Scheduled),
-                "No detection should fire during grace period, got {event:?} at step {i}"
+                "Spike detection should not fire during grace period, got {event:?} at step {i}"
             );
             assert!((lr - 1e-4).abs() < 1e-10);
         }
+    }
+
+    #[test]
+    fn test_warmup_monitoring_detects_divergence() {
+        let config = AdaptiveLrConfig {
+            warmup_fraction: 0.1,
+            warmup_max_loss_increase: 0.05, // 5% threshold
+            max_warmup_caps: 3,
+            ..Default::default()
+        };
+        let mut ctrl = AdaptiveLrController::new(config);
+        ctrl.set_total_steps(1000); // grace = 100 steps
+
+        // Feed steadily increasing losses (1% per step) — warmup monitoring should fire
+        let mut warmup_capped = false;
+        for i in 0..50 {
+            let loss = 1.0 + (i as f64) * 0.01;
+            let (_lr, event) = ctrl.step(i, loss, 1e-4);
+            if matches!(event, LrEvent::WarmupCapped { .. }) {
+                warmup_capped = true;
+                break;
+            }
+        }
+        assert!(
+            warmup_capped,
+            "Warmup monitoring should have detected divergence"
+        );
+        assert!(
+            ctrl.lr_multiplier < 1.0,
+            "LR multiplier should have been reduced"
+        );
+    }
+
+    #[test]
+    fn test_warmup_monitoring_no_false_trigger() {
+        let config = AdaptiveLrConfig {
+            warmup_fraction: 0.1,
+            warmup_max_loss_increase: 0.05,
+            ..Default::default()
+        };
+        let mut ctrl = AdaptiveLrController::new(config);
+        ctrl.set_total_steps(1000);
+
+        // Feed stable losses with minor noise — should NOT trigger
+        for i in 0..99 {
+            let loss = 5.0 + (i as f64 % 5.0) * 0.01; // Oscillates 5.00–5.04
+            let (_lr, event) = ctrl.step(i, loss, 1e-4);
+            assert!(
+                !matches!(event, LrEvent::WarmupCapped { .. }),
+                "Warmup monitoring should not trigger on stable loss, got {event:?} at step {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_warmup_caps_respect_max_limit() {
+        let config = AdaptiveLrConfig {
+            warmup_fraction: 0.5,
+            warmup_max_loss_increase: 0.02, // Very sensitive (2%)
+            max_warmup_caps: 2,
+            ..Default::default()
+        };
+        let mut ctrl = AdaptiveLrController::new(config);
+        ctrl.set_total_steps(1000); // grace = 500 steps
+
+        let mut cap_count = 0;
+        for i in 0..300 {
+            let loss = 1.0 + (i as f64) * 0.005; // Steady increase
+            let (_lr, event) = ctrl.step(i, loss, 1e-4);
+            if matches!(event, LrEvent::WarmupCapped { .. }) {
+                cap_count += 1;
+            }
+        }
+        assert_eq!(
+            cap_count, 2,
+            "Should have capped exactly max_warmup_caps times"
+        );
     }
 
     #[test]
@@ -1321,5 +1512,43 @@ mod tests {
                 "Should NOT trigger rollback/early-stop during grace period at step {i}, got {event:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_set_warmup_steps_extends_grace_period() {
+        let config = AdaptiveLrConfig {
+            warmup_fraction: 0.1,
+            ..Default::default()
+        };
+        let mut ctrl = AdaptiveLrController::new(config);
+        ctrl.set_total_steps(1000); // fraction-based grace = 100
+
+        // LR warmup of 200 steps → grace should extend to 200 + 20 = 220
+        ctrl.set_warmup_steps(200);
+        assert_eq!(ctrl.grace_period_steps, 220);
+
+        // Losses increasing during the extended grace period should NOT trigger
+        for i in 0..219 {
+            let loss = 5.0 + (i as f64) * 0.1; // Strong upward trend
+            let (_lr, event) = ctrl.step(i, loss, 1e-4);
+            assert!(
+                matches!(event, LrEvent::Scheduled),
+                "No detection should fire during extended grace period, got {event:?} at step {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_set_warmup_steps_does_not_shrink_grace() {
+        let config = AdaptiveLrConfig {
+            warmup_fraction: 0.5, // 50% of 1000 = 500 steps
+            ..Default::default()
+        };
+        let mut ctrl = AdaptiveLrController::new(config);
+        ctrl.set_total_steps(1000); // fraction-based grace = 500
+
+        // Short warmup (50 steps + buffer=10 = 60) should NOT shrink grace below 500
+        ctrl.set_warmup_steps(50);
+        assert_eq!(ctrl.grace_period_steps, 500);
     }
 }

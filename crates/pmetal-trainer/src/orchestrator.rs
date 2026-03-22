@@ -485,9 +485,7 @@ pub async fn run_training(
                 }
             }
             Err(reason) => {
-                tracing::info!(
-                    "Model not ANE-compatible ({reason}), using GPU training"
-                );
+                tracing::info!("Model not ANE-compatible ({reason}), using GPU training");
                 emit_phase(phase_cb, TrainingPhase::AneFallback(reason));
             }
         }
