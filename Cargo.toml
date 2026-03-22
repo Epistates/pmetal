@@ -18,12 +18,11 @@ members = [
     "crates/pmetal-mhc",
     "crates/pmetal-serve",
     "crates/pmetal",
-    "crates/pmetal-cli",
     "crates/pmetal-py",
 ]
 
 [workspace.package]
-version = "0.3.12"
+version = "0.3.13"
 edition = "2024"
 rust-version = "1.86"
 license = "MIT OR Apache-2.0"
@@ -42,7 +41,6 @@ pmetal-data = { path = "crates/pmetal-data", version = "0.3.12" }
 pmetal-trainer = { path = "crates/pmetal-trainer", version = "0.3.12" }
 pmetal-hub = { path = "crates/pmetal-hub", version = "0.3.12" }
 pmetal-gguf = { path = "crates/pmetal-gguf", version = "0.3.12" }
-pmetal-cli = { path = "crates/pmetal-cli", version = "0.3.12" }
 pmetal-vocoder = { path = "crates/pmetal-vocoder", version = "0.3.12" }
 pmetal-merge = { path = "crates/pmetal-merge", version = "0.3.12" }
 pmetal-distill = { path = "crates/pmetal-distill", version = "0.3.12" }

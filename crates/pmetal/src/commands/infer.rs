@@ -63,7 +63,7 @@ pub(crate) async fn run_inference(
     };
 
     // ── Prepare inference via shared runner ──────────────────────────────
-    use pmetal_lib::inference_runner::{InferenceRunner, InferenceRunnerConfig};
+    use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig};
 
     let runner_config = InferenceRunnerConfig {
         model_path: model_path.clone(),
@@ -140,9 +140,18 @@ pub(crate) async fn run_inference(
                     Ok(config_text) => {
                         match serde_json::from_str::<serde_json::Value>(&config_text) {
                             Ok(config_json) => {
-                                let hidden = config_json.get("hidden_size").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let layers = config_json.get("num_hidden_layers").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let vocab = config_json.get("vocab_size").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let hidden = config_json
+                                    .get("hidden_size")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let layers = config_json
+                                    .get("num_hidden_layers")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
+                                let vocab = config_json
+                                    .get("vocab_size")
+                                    .and_then(|v| v.as_u64())
+                                    .unwrap_or(0);
                                 let est_params = 12 * hidden * hidden * layers + hidden * vocab;
                                 est_params < 2_000_000_000
                             }
@@ -178,7 +187,10 @@ pub(crate) async fn run_inference(
                 if ane_compatible {
                     tracing::info!("Attempting ANE-hybrid inference engine");
                     match pmetal_models::generate_cached_ane(
-                        &model_path, &input_ids, &gen_config, ane_max_seq_len,
+                        &model_path,
+                        &input_ids,
+                        &gen_config,
+                        ane_max_seq_len,
                     ) {
                         Ok(output) => Some(output),
                         Err(e) => {
@@ -206,11 +218,16 @@ pub(crate) async fn run_inference(
                             Ok(()) => {
                                 tracing::info!("Attempting CPU GEMV hybrid engine");
                                 match pmetal_models::generate_cached_hybrid_cpu(
-                                    &model_path, &input_ids, &gen_config,
+                                    &model_path,
+                                    &input_ids,
+                                    &gen_config,
                                 ) {
                                     Ok(output) => Some(output),
                                     Err(e) => {
-                                        tracing::warn!("CPU hybrid engine failed ({}), falling back to GPU", e);
+                                        tracing::warn!(
+                                            "CPU hybrid engine failed ({}), falling back to GPU",
+                                            e
+                                        );
                                         None
                                     }
                                 }
@@ -234,14 +251,14 @@ pub(crate) async fn run_inference(
             output
         } else if minimal {
             tracing::info!("Using minimal async generation (debugging)");
-            runner.state.run_with(|fwd, cache| {
-                generate_minimal_async(fwd, &input_ids, gen_config, cache)
-            })?
+            runner
+                .state
+                .run_with(|fwd, cache| generate_minimal_async(fwd, &input_ids, gen_config, cache))?
         } else if metal_sampler {
             tracing::info!("Using fused Metal sampling kernel");
-            runner.state.run_with(|fwd, cache| {
-                generate_cached_metal(fwd, &input_ids, gen_config, cache)
-            })?
+            runner
+                .state
+                .run_with(|fwd, cache| generate_cached_metal(fwd, &input_ids, gen_config, cache))?
         } else if compiled {
             tracing::info!("Using JIT-compiled sampling");
             runner.state.run_with(|fwd, cache| {
@@ -273,9 +290,9 @@ pub(crate) async fn run_inference(
         let _ = metal_sampler;
         let _ = ane;
         if minimal {
-            runner.state.run_with(|fwd, cache| {
-                generate_minimal_async(fwd, &input_ids, gen_config, cache)
-            })?
+            runner
+                .state
+                .run_with(|fwd, cache| generate_minimal_async(fwd, &input_ids, gen_config, cache))?
         } else if compiled {
             runner.state.run_with(|fwd, cache| {
                 generate_cached_compiled(fwd, &input_ids, gen_config, cache)

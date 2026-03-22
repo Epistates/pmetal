@@ -4,6 +4,8 @@
 #![allow(clippy::derivable_impls)]
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::needless_borrows_for_generic_args)]
+#![allow(clippy::unnecessary_unwrap)]
+#![allow(dead_code)] // Chat template formatters — pending migration to pmetal-data
 
 mod commands;
 mod dashboard;
@@ -1796,7 +1798,7 @@ fn ensure_metallib() {
         "\n\x1b[1;33mwarning:\x1b[0m mlx.metallib not found — Metal GPU acceleration will fail.\n\n\
          Searched:\n{locations}\n\n\
          To fix this, do ONE of the following:\n\
-         \x1b[1m  1. Rebuild from source:\x1b[0m  cargo install pmetal-cli  (auto-caches metallib)\n\
+         \x1b[1m  1. Rebuild from source:\x1b[0m  cargo install pmetal  (auto-caches metallib)\n\
          \x1b[1m  2. Download manually:\x1b[0m\n\
              curl -fSL -o ~/.cache/pmetal/lib/mlx.metallib \\\n\
                https://github.com/epistates/pmetal/releases/download/v{version}/mlx.metallib\n\

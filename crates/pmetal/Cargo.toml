@@ -9,15 +9,20 @@ repository.workspace = true
 keywords.workspace = true
 categories.workspace = true
 
+[[bin]]
+name = "pmetal"
+path = "src/main.rs"
+required-features = ["cli"]
+
 [features]
-default = ["core", "gguf", "metal", "hub", "mlx", "models", "lora", "data", "trainer", "ane"]
+default = ["cli", "dashboard", "ane"]
 
 # Foundation crates (no mlx-rs dependency)
 core = ["dep:pmetal-core"]
 gguf = ["dep:pmetal-gguf", "core"]
 metal = ["dep:pmetal-metal", "core"]
 hub = ["dep:pmetal-hub", "core"]
-distributed = ["dep:pmetal-distributed"]
+distributed = ["dep:pmetal-distributed", "pmetal-trainer?/distributed"]
 mhc = ["dep:pmetal-mhc", "core", "metal"]
 
 # MLX-dependent crates
@@ -33,16 +38,34 @@ merge = ["dep:pmetal-merge", "core", "mlx"]
 vocoder = ["dep:pmetal-vocoder", "core", "mlx"]
 
 # ANE: Apple Neural Engine direct programming
-ane = ["metal", "pmetal-metal/ane", "pmetal-core/ane"]
+ane = ["metal", "pmetal-metal/ane", "pmetal-core/ane", "pmetal-trainer?/ane", "pmetal-models?/ane"]
 
-# Everything
+# Everything (sub-crate deps only, no CLI-only deps)
 full = [
     "core", "gguf", "metal", "hub", "distributed", "mhc",
     "mlx", "models", "lora", "data", "trainer",
     "distill", "merge", "vocoder", "ane",
 ]
 
+# CLI: adds the pmetal binary + all CLI-specific dependencies
+cli = [
+    "full",
+    "dep:clap", "dep:tokio", "dep:tracing-subscriber",
+    "dep:serde", "dep:serde_yaml", "dep:indicatif", "dep:anyhow",
+    "dep:safetensors", "dep:dirs", "dep:chrono",
+    "dep:parquet", "dep:arrow-array", "dep:arrow-json",
+    "dep:rand", "dep:regex", "dep:tempfile", "dep:tokenizers",
+    "dep:walkdir", "dep:flate2", "dep:libc", "dep:reqwest", "dep:sha2",
+]
+
+# Dashboard: TUI (adds ratatui/crossterm on top of cli)
+dashboard = ["cli", "dep:ratatui", "dep:crossterm", "dep:futures", "dep:tokio-util"]
+
+# Serve: HTTP inference server
+serve = ["cli", "dep:pmetal-serve"]
+
 [dependencies]
+# Sub-crates (all optional — activated by feature flags above)
 pmetal-core = { workspace = true, optional = true }
 pmetal-gguf = { workspace = true, optional = true }
 pmetal-metal = { workspace = true, optional = true }
@@ -57,13 +80,48 @@ pmetal-trainer = { workspace = true, optional = true }
 pmetal-distill = { workspace = true, optional = true }
 pmetal-merge = { workspace = true, optional = true }
 pmetal-vocoder = { workspace = true, optional = true }
+pmetal-serve = { workspace = true, optional = true }
 mlx-rs = { workspace = true, optional = true }
+
+# Always-on (SDK facade needs these)
 serde_json = { workspace = true }
 tracing = { workspace = true }
 
+# CLI dependencies (optional, behind "cli" feature)
+clap = { workspace = true, optional = true }
+tokio = { workspace = true, optional = true }
+tracing-subscriber = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_yaml = { workspace = true, optional = true }
+indicatif = { workspace = true, optional = true }
+anyhow = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
+dirs = { workspace = true, optional = true }
+chrono = { version = "0.4", optional = true }
+parquet = { workspace = true, features = ["arrow"], optional = true }
+arrow-array = { workspace = true, optional = true }
+arrow-json = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+regex = { version = "1", optional = true }
+tempfile = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+walkdir = { workspace = true, optional = true }
+flate2 = { version = "1", optional = true }
+libc = { version = "0.2", optional = true }
+reqwest = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+# Dashboard dependencies (optional, behind "dashboard" feature)
+ratatui = { version = "0.30", optional = true }
+crossterm = { version = "0.29", features = ["event-stream"], optional = true }
+futures = { version = "0.3", optional = true }
+tokio-util = { version = "0.7", features = ["rt"], optional = true }
+
+[build-dependencies]
+flate2 = "1"
+
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
-tokio = { workspace = true }
 
 [[example]]
 name = "device_info"

@@ -7,13 +7,13 @@
 use std::path::{Path, PathBuf};
 
 use mlx_rs::error::Exception;
-use pmetal_data::chat_templates::{ChatTemplateType, Message, ToolDefinition};
 use pmetal_data::Tokenizer;
+use pmetal_data::chat_templates::{ChatTemplateType, Message, ToolDefinition};
 use pmetal_lora::{DynamicLoraModel, TrainableModel as _};
+use pmetal_mlx::kv_cache::{CacheMode, KVCache, MambaCache};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::GenerationConfig;
 use pmetal_models::{GenerationOutput, generate_cached_async_streaming};
-use pmetal_mlx::kv_cache::{CacheMode, KVCache, MambaCache};
 
 /// Configuration for preparing an inference run.
 ///
@@ -174,14 +174,20 @@ impl InferenceRunner {
         let top_k = config.top_k.unwrap_or(defaults.top_k);
         let top_p = config.top_p.unwrap_or(defaults.top_p);
         let min_p = config.min_p.unwrap_or(defaults.min_p);
-        let repetition_penalty = config.repetition_penalty.unwrap_or(defaults.repetition_penalty);
-        let frequency_penalty = config.frequency_penalty.unwrap_or(defaults.frequency_penalty);
+        let repetition_penalty = config
+            .repetition_penalty
+            .unwrap_or(defaults.repetition_penalty);
+        let frequency_penalty = config
+            .frequency_penalty
+            .unwrap_or(defaults.frequency_penalty);
         let presence_penalty = config.presence_penalty.unwrap_or(defaults.presence_penalty);
 
         // 4. Apply chat template + tokenize
         let (input_ids, template_type) = if use_chat {
-            let detected =
-                pmetal_data::chat_templates::detect_chat_template(model_path, &model_path.to_string_lossy());
+            let detected = pmetal_data::chat_templates::detect_chat_template(
+                model_path,
+                &model_path.to_string_lossy(),
+            );
 
             let formatted = if config.tools.is_some() {
                 // Tool-calling path: structured template with tool injection
@@ -375,16 +381,17 @@ impl InferenceGenState {
             ..
         } = *self;
 
-        let mut fwd = |input: &mlx_rs::Array, kv: &mut KVCache| -> Result<mlx_rs::Array, Exception> {
-            match model {
-                LoadedModel::Standard(m) => {
-                    m.forward_with_hybrid_cache(input, None, Some(kv), mamba_cache.as_mut())
+        let mut fwd =
+            |input: &mlx_rs::Array, kv: &mut KVCache| -> Result<mlx_rs::Array, Exception> {
+                match model {
+                    LoadedModel::Standard(m) => {
+                        m.forward_with_hybrid_cache(input, None, Some(kv), mamba_cache.as_mut())
+                    }
+                    LoadedModel::Lora(m) => m
+                        .forward_with_hybrid_cache(input, None, Some(kv), mamba_cache.as_mut())
+                        .map_err(|e| Exception::custom(e.to_string())),
                 }
-                LoadedModel::Lora(m) => m
-                    .forward_with_hybrid_cache(input, None, Some(kv), mamba_cache.as_mut())
-                    .map_err(|e| Exception::custom(e.to_string())),
-            }
-        };
+            };
 
         f(&mut fwd, cache)
     }
@@ -492,7 +499,11 @@ fn load_model_with_lora(
             pmetal_core::LoraConfig::default()
         };
 
-    tracing::info!(r = lora_config.r, alpha = lora_config.alpha, "Loading LoRA adapter");
+    tracing::info!(
+        r = lora_config.r,
+        alpha = lora_config.alpha,
+        "Loading LoRA adapter"
+    );
 
     let mut model = DynamicLoraModel::from_pretrained(model_path, lora_config)
         .map_err(|e| Exception::custom(format!("LoRA load: {e}")))?;
@@ -567,14 +578,7 @@ fn is_instruction_tuned(model_path: &Path) -> bool {
 
     // Common instruction-tuning suffixes
     let instruct_markers = [
-        "instruct",
-        "chat",
-        "it",
-        "-sft",
-        "-rlhf",
-        "-dpo",
-        "-grpo",
-        "-rl",
+        "instruct", "chat", "it", "-sft", "-rlhf", "-dpo", "-grpo", "-rl",
     ];
 
     instruct_markers.iter().any(|m| name.contains(m))
