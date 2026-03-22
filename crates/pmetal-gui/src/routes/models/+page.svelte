@@ -287,8 +287,9 @@
                     {#if model.model_type}
                       <span class="badge-neutral text-xs">{model.model_type}</span>
                     {/if}
-                    {@const badge = getSourceBadge(model.source)}
-                    <span class="{badge.class} text-xs">{badge.label}</span>
+                    {#if true}{@const badge = getSourceBadge(model.source)}
+                      <span class="{badge.class} text-xs">{badge.label}</span>
+                    {/if}
                   </div>
                 </div>
                 {#if fitData[model.id]}

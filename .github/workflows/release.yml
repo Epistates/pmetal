@@ -45,7 +45,7 @@ jobs:
           shared-key: cli-aarch64-apple-darwin
 
       - name: Build CLI
-        run: cargo build --release --target aarch64-apple-darwin -p pmetal-cli
+        run: cargo build --release --target aarch64-apple-darwin -p pmetal
 
       - name: Stage metallib
         run: |
