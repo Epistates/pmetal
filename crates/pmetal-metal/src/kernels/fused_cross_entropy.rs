@@ -27,6 +27,7 @@
 //!
 //! This is the single biggest memory optimization in LLM training.
 
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -37,6 +38,8 @@ use crate::{
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
     error::{MetalError, Result},
+    pipeline::FunctionConstant,
+    tuna::CrossEntropyTunedConfig,
 };
 
 /// Configuration for fused cross-entropy loss.
@@ -564,6 +567,8 @@ impl std::fmt::Debug for FusedCrossEntropy {
 //   - With fusion: peak memory is only [chunk_size=4096] → 8MB
 // =============================================================================
 
+const DEFAULT_FUSED_LINEAR_CROSS_ENTROPY_CHUNK_SIZE: usize = 4096;
+
 /// Configuration for fused linear + cross-entropy loss.
 ///
 /// Memory-efficient chunked vocabulary loss: computes loss directly from
@@ -614,7 +619,7 @@ impl FusedLinearCrossEntropyConfig {
             num_tokens,
             hidden_size,
             vocab_size,
-            chunk_size: 4096, // Default chunk size
+            chunk_size: DEFAULT_FUSED_LINEAR_CROSS_ENTROPY_CHUNK_SIZE,
             label_smoothing: 0.0,
             ignore_index: -100,
             use_fp16: false,
@@ -695,17 +700,49 @@ pub struct FusedLinearCrossEntropy {
 
     /// Configuration.
     config: FusedLinearCrossEntropyConfig,
+
+    /// Tuned kernel configuration for this device/problem shape.
+    tuned: CrossEntropyTunedConfig,
+
+    /// Effective threads per token used for the fused chunked vocabulary sweep.
+    threads_per_token: usize,
+
+    /// Effective vocabulary chunk size.
+    chunk_size: usize,
 }
 
 impl FusedLinearCrossEntropy {
     /// Create a new fused linear + cross-entropy kernel.
     pub fn new(ctx: Arc<MetalContext>, config: FusedLinearCrossEntropyConfig) -> Result<Self> {
-        Ok(Self { ctx, config })
+        let tuned = resolve_fused_linear_ce_tuned_config(&ctx, &config)?;
+        Self::new_with_tuned_config(ctx, config, tuned)
+    }
+
+    /// Create a new fused linear + cross-entropy kernel with an explicit tuned config.
+    pub fn new_with_tuned_config(
+        ctx: Arc<MetalContext>,
+        config: FusedLinearCrossEntropyConfig,
+        tuned: CrossEntropyTunedConfig,
+    ) -> Result<Self> {
+        let chunk_size = resolve_fused_linear_ce_chunk_size(&config, tuned.chunk_size);
+        Ok(Self {
+            ctx,
+            config,
+            tuned,
+            threads_per_token: tuned.threadgroup_size as usize,
+            chunk_size,
+        })
     }
 
     /// Get the configuration.
     pub fn config(&self) -> &FusedLinearCrossEntropyConfig {
         &self.config
+    }
+
+    fn function_constants(&self) -> HashMap<u64, FunctionConstant> {
+        let mut constants = HashMap::new();
+        constants.insert(0, FunctionConstant::UInt(self.tuned.threadgroup_size));
+        constants
     }
 
     /// Compute forward pass directly from hidden states.
@@ -817,12 +854,13 @@ impl FusedLinearCrossEntropy {
         losses: &MetalBuffer<f32>,
         logsumexp: &MetalBuffer<f32>,
     ) -> Result<()> {
+        let constants = self.function_constants();
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(
+            cache.get_or_create_specialized_pipeline_typed(
                 self.ctx.device(),
                 "fused_linear_cross_entropy_forward",
-                None,
+                &constants,
             )?
         };
 
@@ -849,9 +887,8 @@ impl FusedLinearCrossEntropy {
             let params_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
 
-            // Threadgroup memory for reduction scratch space
-            // 4 SIMD groups * 2 floats (max, sum) = 8 floats = 32 bytes
-            let scratch_size = 8 * std::mem::size_of::<f32>();
+            let scratch_size =
+                fused_linear_ce_scratch_floats(self.threads_per_token) * std::mem::size_of::<f32>();
             encoder.setThreadgroupMemoryLength_atIndex(scratch_size, 0);
         }
 
@@ -863,7 +900,7 @@ impl FusedLinearCrossEntropy {
         };
 
         let threadgroup_size = objc2_metal::MTLSize {
-            width: 128, // CE_THREADS_PER_TOKEN
+            width: self.threads_per_token,
             height: 1,
             depth: 1,
         };
@@ -889,12 +926,13 @@ impl FusedLinearCrossEntropy {
         losses: &MetalBuffer<f32>,
         logsumexp: &MetalBuffer<f32>,
     ) -> Result<()> {
+        let constants = self.function_constants();
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(
+            cache.get_or_create_specialized_pipeline_typed(
                 self.ctx.device(),
                 "fused_linear_cross_entropy_forward_f16",
-                None,
+                &constants,
             )?
         };
 
@@ -920,7 +958,8 @@ impl FusedLinearCrossEntropy {
             let params_ptr = NonNull::from(&params).cast();
             encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
 
-            let scratch_size = 8 * std::mem::size_of::<f32>();
+            let scratch_size =
+                fused_linear_ce_scratch_floats(self.threads_per_token) * std::mem::size_of::<f32>();
             encoder.setThreadgroupMemoryLength_atIndex(scratch_size, 0);
         }
 
@@ -931,7 +970,7 @@ impl FusedLinearCrossEntropy {
         };
 
         let threadgroup_size = objc2_metal::MTLSize {
-            width: 128,
+            width: self.threads_per_token,
             height: 1,
             depth: 1,
         };
@@ -954,7 +993,7 @@ impl FusedLinearCrossEntropy {
             num_tokens: self.config.num_tokens as u32,
             hidden_size: self.config.hidden_size as u32,
             vocab_size: self.config.vocab_size as u32,
-            chunk_size: self.config.chunk_size as u32,
+            chunk_size: self.chunk_size as u32,
             ignore_index: self.config.ignore_index,
             label_smoothing: self.config.label_smoothing,
         }
@@ -971,6 +1010,41 @@ struct FusedLinearCEParams {
     chunk_size: u32,
     ignore_index: i32,
     label_smoothing: f32,
+}
+
+fn resolve_fused_linear_ce_tuned_config(
+    ctx: &Arc<MetalContext>,
+    config: &FusedLinearCrossEntropyConfig,
+) -> Result<CrossEntropyTunedConfig> {
+    let tuned = ctx.tuner().tune_fused_linear_cross_entropy(ctx, config)?;
+    Ok(CrossEntropyTunedConfig {
+        threadgroup_size: sanitize_fused_linear_ce_threads(
+            ctx,
+            tuned.threadgroup_size,
+        ),
+        chunk_size: tuned.chunk_size.max(1),
+    })
+}
+
+fn sanitize_fused_linear_ce_threads(ctx: &MetalContext, threads_per_token: u32) -> u32 {
+    let max_threads = (ctx.properties().max_threads_per_threadgroup as u32).max(32);
+    threads_per_token.clamp(32, max_threads).div_ceil(32) * 32
+}
+
+fn resolve_fused_linear_ce_chunk_size(
+    config: &FusedLinearCrossEntropyConfig,
+    tuned_chunk_size: u32,
+) -> usize {
+    let preferred = if config.chunk_size == DEFAULT_FUSED_LINEAR_CROSS_ENTROPY_CHUNK_SIZE {
+        tuned_chunk_size as usize
+    } else {
+        config.chunk_size
+    };
+    preferred.max(1).min(config.vocab_size.max(1))
+}
+
+fn fused_linear_ce_scratch_floats(threads_per_token: usize) -> usize {
+    4 * threads_per_token.div_ceil(32)
 }
 
 impl std::fmt::Debug for FusedLinearCrossEntropy {
@@ -1025,6 +1099,41 @@ mod tests {
         let ctx = Arc::new(MetalContext::new().unwrap());
         let config = FusedCrossEntropyConfig::new(8, 100);
         let _ce = FusedCrossEntropy::new(ctx, config).unwrap();
+    }
+
+    #[test]
+    fn test_fused_linear_ce_scratch_floats() {
+        assert_eq!(fused_linear_ce_scratch_floats(128), 16);
+        assert_eq!(fused_linear_ce_scratch_floats(256), 32);
+        assert_eq!(fused_linear_ce_scratch_floats(512), 64);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fused_linear_cross_entropy_constructor_uses_tuned_config() {
+        let ctx = Arc::new(MetalContext::new().expect("Metal required"));
+
+        let auto_config = FusedLinearCrossEntropyConfig::new(64, 512, 200_000).with_fp16();
+        let explicit_config = FusedLinearCrossEntropyConfig::new(64, 512, 200_000)
+            .with_fp16()
+            .with_chunk_size(1024);
+
+        let tuned = ctx
+            .tuner()
+            .tune_fused_linear_cross_entropy(&ctx, &auto_config)
+            .expect("tune_fused_linear_cross_entropy");
+
+        let auto_kernel =
+            FusedLinearCrossEntropy::new(ctx.clone(), auto_config).expect("auto kernel");
+        let explicit_kernel =
+            FusedLinearCrossEntropy::new(ctx.clone(), explicit_config).expect("explicit kernel");
+
+        assert_eq!(
+            auto_kernel.threads_per_token as u32,
+            sanitize_fused_linear_ce_threads(&ctx, tuned.threadgroup_size)
+        );
+        assert_eq!(auto_kernel.chunk_size, tuned.chunk_size as usize);
+        assert_eq!(explicit_kernel.chunk_size, 1024);
     }
 
     #[test]

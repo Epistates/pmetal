@@ -476,8 +476,9 @@ kernel void fused_cross_entropy_forward_f16(
 //
 // =============================================================================
 
-#define CE_CHUNK_SIZE 4096
-#define CE_THREADS_PER_TOKEN 128  // Threads per token for parallel matmul
+constant uint FC_CE_THREADS_PER_TOKEN [[function_constant(0)]];
+
+#define CE_THREADS_PER_TOKEN FC_CE_THREADS_PER_TOKEN
 
 /// Parameters for fused linear cross-entropy
 struct FusedLinearCEParams {
@@ -544,11 +545,9 @@ kernel void fused_linear_cross_entropy_forward(
     float target_logit = -INFINITY;  // Sentinel: only the thread owning target sets this
     float local_logit_sum = 0.0f;    // Accumulate sum of logits for label smoothing
 
-    // Scratch layout (num_simd_groups = CE_THREADS_PER_TOKEN / SIMD_SIZE = 4):
-    //   [0..7]   logsumexp reduction: scratch[g*2] = max, scratch[g*2+1] = sum
-    //   [8..11]  target_logit per simd group (for cross-group broadcast)
-    //   [12..15] logit_sum per simd group (for label smoothing reduction)
     const uint num_simd_groups = CE_THREADS_PER_TOKEN / SIMD_SIZE;
+    const uint target_offset = 2 * num_simd_groups;
+    const uint logit_sum_offset = 3 * num_simd_groups;
 
     // Process vocabulary in chunks
     for (uint chunk_start = 0; chunk_start < params.vocab_size; chunk_start += params.chunk_size) {
@@ -649,7 +648,7 @@ kernel void fused_linear_cross_entropy_forward(
     {
         float simd_target = simd_max(target_logit);
         if (lane_id == 0) {
-            scratch[8 + simd_group_id] = simd_target;
+            scratch[target_offset + simd_group_id] = simd_target;
         }
     }
 
@@ -659,7 +658,7 @@ kernel void fused_linear_cross_entropy_forward(
     {
         float simd_lsum = simd_sum(local_logit_sum);
         if (lane_id == 0) {
-            scratch[12 + simd_group_id] = simd_lsum;
+            scratch[logit_sum_offset + simd_group_id] = simd_lsum;
         }
     }
 
@@ -670,7 +669,7 @@ kernel void fused_linear_cross_entropy_forward(
         // Collect target_logit from all simd groups
         float global_target_logit = -INFINITY;
         for (uint g = 0; g < num_simd_groups; g++) {
-            float v = scratch[8 + g];
+            float v = scratch[target_offset + g];
             if (v > global_target_logit) global_target_logit = v;
         }
 
@@ -682,7 +681,7 @@ kernel void fused_linear_cross_entropy_forward(
         if (params.label_smoothing > 0.0f) {
             float global_logit_sum = 0.0f;
             for (uint g = 0; g < num_simd_groups; g++) {
-                global_logit_sum += scratch[12 + g];
+                global_logit_sum += scratch[logit_sum_offset + g];
             }
             float mean_logit = global_logit_sum / (float)params.vocab_size;
             float smooth_loss = lse - mean_logit;
@@ -732,11 +731,9 @@ kernel void fused_linear_cross_entropy_forward_f16(
     float target_logit = -INFINITY;  // Sentinel: only the thread owning target sets this
     float local_logit_sum = 0.0f;    // Accumulate sum of logits for label smoothing
 
-    // Scratch layout (num_simd_groups = CE_THREADS_PER_TOKEN / SIMD_SIZE = 4):
-    //   [0..7]   logsumexp reduction: scratch[g*2] = max, scratch[g*2+1] = sum
-    //   [8..11]  target_logit per simd group (for cross-group broadcast)
-    //   [12..15] logit_sum per simd group (for label smoothing reduction)
     const uint num_simd_groups = CE_THREADS_PER_TOKEN / SIMD_SIZE;
+    const uint target_offset = 2 * num_simd_groups;
+    const uint logit_sum_offset = 3 * num_simd_groups;
 
     for (uint chunk_start = 0; chunk_start < params.vocab_size; chunk_start += params.chunk_size) {
         uint chunk_end = min(chunk_start + params.chunk_size, params.vocab_size);
@@ -829,7 +826,7 @@ kernel void fused_linear_cross_entropy_forward_f16(
     {
         float simd_target = simd_max(target_logit);
         if (lane_id == 0) {
-            scratch[8 + simd_group_id] = simd_target;
+            scratch[target_offset + simd_group_id] = simd_target;
         }
     }
 
@@ -839,7 +836,7 @@ kernel void fused_linear_cross_entropy_forward_f16(
     {
         float simd_lsum = simd_sum(local_logit_sum);
         if (lane_id == 0) {
-            scratch[12 + simd_group_id] = simd_lsum;
+            scratch[logit_sum_offset + simd_group_id] = simd_lsum;
         }
     }
 
@@ -850,7 +847,7 @@ kernel void fused_linear_cross_entropy_forward_f16(
         // Collect target_logit from all simd groups
         float global_target_logit = -INFINITY;
         for (uint g = 0; g < num_simd_groups; g++) {
-            float v = scratch[8 + g];
+            float v = scratch[target_offset + g];
             if (v > global_target_logit) global_target_logit = v;
         }
 
@@ -862,7 +859,7 @@ kernel void fused_linear_cross_entropy_forward_f16(
         if (params.label_smoothing > 0.0f) {
             float global_logit_sum = 0.0f;
             for (uint g = 0; g < num_simd_groups; g++) {
-                global_logit_sum += scratch[12 + g];
+                global_logit_sum += scratch[logit_sum_offset + g];
             }
             float mean_logit = global_logit_sum / (float)params.vocab_size;
             float smooth_loss = lse - mean_logit;

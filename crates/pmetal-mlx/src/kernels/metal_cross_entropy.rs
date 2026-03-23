@@ -16,17 +16,19 @@
 //!
 //! Two implementations are available:
 //! 1. **Metal kernel** (`use_metal=true`): Uses custom Metal GPU kernels (fastest)
-//! 2. **MLX fallback** (`use_metal=false`): Uses pure MLX chunked computation (robust)
+//! 2. **MLX CutCrossEntropy**: Uses pure MLX chunked computation (robust)
 //!
-//! By default, the MLX implementation is used as it's more stable. Set `use_metal=true`
-//! to use the experimental Metal kernel for additional speedup.
+//! By default, PMetal benchmarks the MLX and Metal implementations for
+//! benchmarkable shapes, validates the Metal result against the MLX reference,
+//! and persists the winner per device/shape. Set `use_metal=true` to force the
+//! Metal kernel, or disable `auto_select_backend` to force the MLX path.
 //!
 //! # Usage
 //!
 //! ```rust,ignore
 //! use pmetal_mlx::kernels::metal_cross_entropy::fused_linear_cross_entropy_loss;
 //!
-//! // Compute loss directly from hidden states (uses MLX fallback)
+//! // Compute loss directly from hidden states (auto-selects and caches backend)
 //! let loss = fused_linear_cross_entropy_loss(
 //!     &hidden_states,  // [batch * seq, hidden_dim]
 //!     &lm_head_weight, // [vocab_size, hidden_dim]
@@ -37,20 +39,128 @@
 
 use half::f16;
 use mlx_rs::{Array, Dtype};
-use std::sync::Arc;
+use serde::{Deserialize, Serialize};
+use std::{
+    sync::{Arc, OnceLock},
+    time::Instant,
+};
 use tracing::{debug, warn};
 
 use pmetal_metal::{
     FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig,
     buffer::{BufferUsage, MetalBuffer},
-    context::MetalContext,
+    context::{DeviceProperties, DeviceTier, MetalContext},
 };
 
 use super::cut_cross_entropy::{CutCrossEntropy, CutCrossEntropyConfig};
+use super::persistent_cache::PersistentChoiceCache;
 use crate::error::MlxError;
 
 /// Result type for metal cross-entropy operations.
 pub type Result<T> = std::result::Result<T, MlxError>;
+
+const DEFAULT_METAL_CROSS_ENTROPY_CHUNK_SIZE: usize = 4096;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+enum CrossEntropyBackendChoice {
+    MlxCut,
+    MetalFused,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CrossEntropyDispatchKey {
+    device_name: String,
+    device_tier: &'static str,
+    dtype: &'static str,
+    num_tokens: i32,
+    hidden_size: i32,
+    vocab_size: i32,
+    chunk_size: usize,
+    ignore_index: i32,
+    label_smoothing_bits: u32,
+    use_fp16: bool,
+}
+
+static CROSS_ENTROPY_BACKEND_CACHE: OnceLock<PersistentChoiceCache<CrossEntropyBackendChoice>> =
+    OnceLock::new();
+
+fn cross_entropy_backend_cache() -> &'static PersistentChoiceCache<CrossEntropyBackendChoice> {
+    CROSS_ENTROPY_BACKEND_CACHE
+        .get_or_init(|| PersistentChoiceCache::new("cross_entropy_backends.json"))
+}
+
+fn device_tier_key(tier: DeviceTier) -> &'static str {
+    match tier {
+        DeviceTier::Base => "base",
+        DeviceTier::Pro => "pro",
+        DeviceTier::Max => "max",
+        DeviceTier::Ultra => "ultra",
+    }
+}
+
+fn dtype_key(dtype: Dtype) -> Option<&'static str> {
+    match dtype {
+        Dtype::Float16 => Some("f16"),
+        Dtype::Float32 => Some("f32"),
+        _ => None,
+    }
+}
+
+impl CrossEntropyDispatchKey {
+    fn new(
+        props: &DeviceProperties,
+        dtype: Dtype,
+        num_tokens: i32,
+        hidden_size: i32,
+        vocab_size: i32,
+        chunk_size: usize,
+        config: &MetalCrossEntropyConfig,
+    ) -> Option<Self> {
+        Some(Self {
+            device_name: props.name.clone(),
+            device_tier: device_tier_key(props.device_tier),
+            dtype: dtype_key(dtype)?,
+            num_tokens,
+            hidden_size,
+            vocab_size,
+            chunk_size,
+            ignore_index: config.ignore_index,
+            label_smoothing_bits: config.label_smoothing.to_bits(),
+            use_fp16: config.use_fp16,
+        })
+    }
+
+    fn cache_key(&self) -> String {
+        format!(
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            self.device_name,
+            self.device_tier,
+            self.dtype,
+            self.num_tokens,
+            self.hidden_size,
+            self.vocab_size,
+            self.chunk_size,
+            self.ignore_index,
+            self.label_smoothing_bits,
+            self.use_fp16
+        )
+    }
+}
+
+fn cached_cross_entropy_backend(
+    key: &CrossEntropyDispatchKey,
+) -> Option<CrossEntropyBackendChoice> {
+    cross_entropy_backend_cache().get(&key.cache_key())
+}
+
+fn cache_cross_entropy_backend(key: CrossEntropyDispatchKey, backend: CrossEntropyBackendChoice) {
+    cross_entropy_backend_cache().insert(key.cache_key(), backend);
+}
+
+#[cfg(test)]
+fn clear_cached_cross_entropy_backends() {
+    cross_entropy_backend_cache().clear();
+}
 
 /// Configuration for memory-efficient fused cross-entropy.
 #[derive(Debug, Clone)]
@@ -68,19 +178,26 @@ pub struct MetalCrossEntropyConfig {
     /// Use fp16 kernels for mixed precision (Metal only).
     pub use_fp16: bool,
 
-    /// Use experimental Metal kernel (false = use MLX fallback).
-    /// The MLX fallback provides the same memory savings but may be slower.
+    /// Automatically benchmark and persist the preferred backend.
+    ///
+    /// When enabled, PMetal compares the MLX chunked path against the Metal
+    /// fused kernel for benchmarkable shapes, validates the Metal result
+    /// against the MLX reference, and caches the winner per device/shape.
+    pub auto_select_backend: bool,
+
+    /// Force the experimental Metal kernel instead of auto-selection or MLX.
     pub use_metal: bool,
 }
 
 impl Default for MetalCrossEntropyConfig {
     fn default() -> Self {
         Self {
-            chunk_size: 4096,
+            chunk_size: DEFAULT_METAL_CROSS_ENTROPY_CHUNK_SIZE,
             ignore_index: -100,
             label_smoothing: 0.0,
             use_fp16: true,
-            use_metal: false, // Default to MLX fallback for stability
+            auto_select_backend: true,
+            use_metal: false, // Default to auto-selection for stability + speed
         }
     }
 }
@@ -115,13 +232,49 @@ impl MetalCrossEntropyConfig {
         self
     }
 
-    /// Use experimental Metal kernel (vs MLX fallback).
+    /// Enable or disable automatic backend benchmarking and cache selection.
+    pub fn with_auto_backend(mut self, auto_select_backend: bool) -> Self {
+        self.auto_select_backend = auto_select_backend;
+        self
+    }
+
+    /// Force the experimental Metal kernel.
     ///
-    /// The Metal kernel is faster but experimental.
-    /// The MLX fallback provides the same memory savings and is more stable.
+    /// The default path is automatic backend selection with persistent caching.
     pub fn with_metal(mut self, use_metal: bool) -> Self {
         self.use_metal = use_metal;
         self
+    }
+}
+
+fn resolve_chunk_size(
+    ctx: &MetalCrossEntropyContext,
+    num_tokens: usize,
+    hidden_size: usize,
+    vocab_size: usize,
+    use_fp16: bool,
+    requested_chunk_size: usize,
+) -> usize {
+    if requested_chunk_size != DEFAULT_METAL_CROSS_ENTROPY_CHUNK_SIZE {
+        return requested_chunk_size.max(1).min(vocab_size.max(1));
+    }
+
+    let tuning_config = if use_fp16 {
+        FusedLinearCrossEntropyConfig::new(num_tokens, hidden_size, vocab_size).with_fp16()
+    } else {
+        FusedLinearCrossEntropyConfig::new(num_tokens, hidden_size, vocab_size)
+    };
+
+    match ctx
+        .metal_context()
+        .tuner()
+        .tune_fused_linear_cross_entropy(ctx.metal_context(), &tuning_config)
+    {
+        Ok(tuned) => (tuned.chunk_size as usize).max(1).min(vocab_size.max(1)),
+        Err(error) => {
+            debug!("Cross-entropy tuning unavailable, using default chunk size: {error}");
+            requested_chunk_size.max(1).min(vocab_size.max(1))
+        }
     }
 }
 
@@ -222,8 +375,8 @@ fn array_to_metal_buffer_f16(ctx: &MetalContext, array: &Array) -> Result<MetalB
 ///
 /// # Implementation
 ///
-/// Uses MLX CutCrossEntropy by default (stable), or experimental Metal kernel
-/// if `config.use_metal = true`.
+/// Uses automatic MLX-vs-Metal backend selection by default, or the forced
+/// Metal path if `config.use_metal = true`.
 pub fn metal_fused_linear_cross_entropy(
     ctx: &MetalCrossEntropyContext,
     hidden_states: &Array,
@@ -234,10 +387,182 @@ pub fn metal_fused_linear_cross_entropy(
     if config.use_metal {
         // Use experimental Metal kernel
         metal_kernel_cross_entropy(ctx, hidden_states, lm_head_weight, targets, config)
+    } else if config.auto_select_backend {
+        auto_selected_cross_entropy(ctx, hidden_states, lm_head_weight, targets, config)
     } else {
         // Use stable MLX CutCrossEntropy fallback
-        mlx_cut_cross_entropy(hidden_states, lm_head_weight, targets, config)
+        mlx_cut_cross_entropy(ctx, hidden_states, lm_head_weight, targets, config)
     }
+}
+
+fn benchmarkable_cross_entropy_dispatch_key(
+    ctx: &MetalCrossEntropyContext,
+    hidden_states: &Array,
+    lm_head_weight: &Array,
+    config: &MetalCrossEntropyConfig,
+) -> Option<CrossEntropyDispatchKey> {
+    let hidden_shape = hidden_states.shape();
+    let weight_shape = lm_head_weight.shape();
+    if hidden_shape.len() != 2 || weight_shape.len() != 2 {
+        return None;
+    }
+
+    if hidden_shape[1] != weight_shape[1] {
+        return None;
+    }
+
+    let hidden_dtype = hidden_states.dtype();
+    if hidden_dtype != lm_head_weight.dtype() {
+        return None;
+    }
+
+    CrossEntropyDispatchKey::new(
+        ctx.metal_context().properties(),
+        hidden_dtype,
+        hidden_shape[0],
+        hidden_shape[1],
+        weight_shape[0],
+        resolve_chunk_size(
+            ctx,
+            hidden_shape[0] as usize,
+            hidden_shape[1] as usize,
+            weight_shape[0] as usize,
+            config.use_fp16,
+            config.chunk_size,
+        ),
+        config,
+    )
+}
+
+fn auto_selected_cross_entropy(
+    ctx: &MetalCrossEntropyContext,
+    hidden_states: &Array,
+    lm_head_weight: &Array,
+    targets: &Array,
+    config: &MetalCrossEntropyConfig,
+) -> Result<MetalCrossEntropyOutput> {
+    let Some(dispatch_key) =
+        benchmarkable_cross_entropy_dispatch_key(ctx, hidden_states, lm_head_weight, config)
+    else {
+        return mlx_cut_cross_entropy(ctx, hidden_states, lm_head_weight, targets, config);
+    };
+
+    if let Some(backend) = cached_cross_entropy_backend(&dispatch_key) {
+        return execute_cross_entropy_backend(
+            backend,
+            ctx,
+            hidden_states,
+            lm_head_weight,
+            targets,
+            config,
+        )
+        .or_else(|error| {
+            debug!(
+                "Cached {:?} cross-entropy backend failed, falling back to MLX: {error}",
+                backend
+            );
+            cache_cross_entropy_backend(dispatch_key.clone(), CrossEntropyBackendChoice::MlxCut);
+            mlx_cut_cross_entropy(ctx, hidden_states, lm_head_weight, targets, config)
+        });
+    }
+
+    let (backend, output) =
+        benchmark_cross_entropy_backends(ctx, hidden_states, lm_head_weight, targets, config)?;
+    cache_cross_entropy_backend(dispatch_key, backend);
+    Ok(output)
+}
+
+fn execute_cross_entropy_backend(
+    backend: CrossEntropyBackendChoice,
+    ctx: &MetalCrossEntropyContext,
+    hidden_states: &Array,
+    lm_head_weight: &Array,
+    targets: &Array,
+    config: &MetalCrossEntropyConfig,
+) -> Result<MetalCrossEntropyOutput> {
+    match backend {
+        CrossEntropyBackendChoice::MlxCut => {
+            mlx_cut_cross_entropy(ctx, hidden_states, lm_head_weight, targets, config)
+        }
+        CrossEntropyBackendChoice::MetalFused => run_metal_kernel_cross_entropy_strict(
+            ctx,
+            hidden_states,
+            lm_head_weight,
+            targets,
+            config,
+        ),
+    }
+}
+
+fn benchmark_cross_entropy_backends(
+    ctx: &MetalCrossEntropyContext,
+    hidden_states: &Array,
+    lm_head_weight: &Array,
+    targets: &Array,
+    config: &MetalCrossEntropyConfig,
+) -> Result<(CrossEntropyBackendChoice, MetalCrossEntropyOutput)> {
+    let mlx_start = Instant::now();
+    let mlx_output = mlx_cut_cross_entropy(ctx, hidden_states, lm_head_weight, targets, config)?;
+    mlx_output.loss.eval()?;
+    let mlx_loss = mlx_output.loss.item::<f32>();
+    let mlx_elapsed = mlx_start.elapsed();
+
+    let metal_start = Instant::now();
+    let metal_output = match run_metal_kernel_cross_entropy_strict(
+        ctx,
+        hidden_states,
+        lm_head_weight,
+        targets,
+        config,
+    ) {
+        Ok(output) => {
+            output.loss.eval()?;
+            Some(output)
+        }
+        Err(error) => {
+            debug!("Metal cross-entropy benchmark failed, using MLX CutCrossEntropy: {error}");
+            None
+        }
+    };
+    let metal_elapsed = metal_start.elapsed();
+
+    if let Some(metal_output) = metal_output {
+        let metal_loss = metal_output.loss.item::<f32>();
+        if losses_match(mlx_loss, metal_loss, config.use_fp16)
+            && metal_output.n_valid == mlx_output.n_valid
+            && metal_elapsed < mlx_elapsed
+        {
+            debug!(
+                "Selected Metal fused cross-entropy ({:?} vs {:?})",
+                metal_elapsed, mlx_elapsed
+            );
+            return Ok((CrossEntropyBackendChoice::MetalFused, metal_output));
+        }
+
+        if metal_output.n_valid != mlx_output.n_valid {
+            debug!(
+                "Rejecting Metal fused cross-entropy due to n_valid mismatch (metal={}, mlx={})",
+                metal_output.n_valid, mlx_output.n_valid
+            );
+        } else if !losses_match(mlx_loss, metal_loss, config.use_fp16) {
+            debug!(
+                "Rejecting Metal fused cross-entropy due to loss mismatch (metal={metal_loss:.6}, mlx={mlx_loss:.6})"
+            );
+        }
+    }
+
+    debug!(
+        "Selected MLX CutCrossEntropy ({:?} vs {:?})",
+        mlx_elapsed, metal_elapsed
+    );
+    Ok((CrossEntropyBackendChoice::MlxCut, mlx_output))
+}
+
+fn losses_match(reference: f32, candidate: f32, use_fp16: bool) -> bool {
+    let abs_diff = (reference - candidate).abs();
+    let abs_tol = if use_fp16 { 2e-2 } else { 5e-3 };
+    let rel_tol = if use_fp16 { 5e-3 } else { 1e-3 };
+    abs_diff <= abs_tol || abs_diff <= rel_tol * reference.abs().max(candidate.abs()).max(1.0)
 }
 
 /// MLX-based CutCrossEntropy implementation (stable fallback).
@@ -245,6 +570,7 @@ pub fn metal_fused_linear_cross_entropy(
 /// Provides the same memory savings as the Metal kernel but uses
 /// pure MLX operations for computation.
 fn mlx_cut_cross_entropy(
+    ctx: &MetalCrossEntropyContext,
     hidden_states: &Array,
     lm_head_weight: &Array,
     targets: &Array,
@@ -252,9 +578,20 @@ fn mlx_cut_cross_entropy(
 ) -> Result<MetalCrossEntropyOutput> {
     debug!("Using MLX CutCrossEntropy (memory-efficient, stable)");
 
+    let hidden_shape = hidden_states.shape();
+    let weight_shape = lm_head_weight.shape();
+    let chunk_size = resolve_chunk_size(
+        ctx,
+        hidden_shape[0] as usize,
+        hidden_shape[1] as usize,
+        weight_shape[0] as usize,
+        config.use_fp16,
+        config.chunk_size,
+    );
+
     // Create CutCrossEntropy config
     let cce_config = CutCrossEntropyConfig::new()
-        .with_vocab_chunk_size(config.chunk_size)
+        .with_vocab_chunk_size(chunk_size)
         .with_ignore_index(config.ignore_index)
         .with_label_smoothing(config.label_smoothing);
 
@@ -281,6 +618,23 @@ fn metal_kernel_cross_entropy(
 ) -> Result<MetalCrossEntropyOutput> {
     debug!("Using experimental Metal FusedLinearCrossEntropy kernel");
 
+    match run_metal_kernel_cross_entropy_strict(ctx, hidden_states, lm_head_weight, targets, config)
+    {
+        Ok(output) => Ok(output),
+        Err(error) => {
+            warn!("Metal fused cross-entropy failed, falling back to MLX: {error}");
+            mlx_cut_cross_entropy(ctx, hidden_states, lm_head_weight, targets, config)
+        }
+    }
+}
+
+fn run_metal_kernel_cross_entropy_strict(
+    ctx: &MetalCrossEntropyContext,
+    hidden_states: &Array,
+    lm_head_weight: &Array,
+    targets: &Array,
+    config: &MetalCrossEntropyConfig,
+) -> Result<MetalCrossEntropyOutput> {
     let metal_ctx = ctx.metal_context();
 
     // Get dimensions
@@ -300,10 +654,23 @@ fn metal_kernel_cross_entropy(
     }
 
     // Create Metal kernel config
+    let effective_chunk_size = resolve_chunk_size(
+        ctx,
+        num_tokens,
+        hidden_size,
+        vocab_size,
+        config.use_fp16,
+        config.chunk_size,
+    );
     let metal_config = FusedLinearCrossEntropyConfig::new(num_tokens, hidden_size, vocab_size)
-        .with_chunk_size(config.chunk_size)
+        .with_chunk_size(effective_chunk_size)
         .with_ignore_index(config.ignore_index)
         .with_label_smoothing(config.label_smoothing);
+    let metal_config = if config.use_fp16 {
+        metal_config.with_fp16()
+    } else {
+        metal_config
+    };
 
     // Create kernel
     let kernel = FusedLinearCrossEntropy::new(metal_ctx.clone(), metal_config)
@@ -350,7 +717,9 @@ fn metal_kernel_cross_entropy(
             "Metal kernel returned non-finite loss ({}), falling back to MLX",
             mean_loss
         );
-        return mlx_cut_cross_entropy(hidden_states, lm_head_weight, targets, config);
+        return Err(MlxError::Metal(format!(
+            "Metal kernel returned non-finite loss ({mean_loss})"
+        )));
     }
 
     Ok(MetalCrossEntropyOutput {
@@ -430,7 +799,8 @@ mod tests {
         assert_eq!(config.chunk_size, 8192);
         assert_eq!(config.ignore_index, -1);
         assert_eq!(config.label_smoothing, 0.1);
-        assert!(!config.use_metal); // Default is MLX fallback
+        assert!(config.auto_select_backend);
+        assert!(!config.use_metal); // Default is auto-selection, not forced Metal
     }
 
     #[test]
@@ -492,6 +862,64 @@ mod tests {
         assert_eq!(output.n_valid, 2);
         output.loss.eval().unwrap();
         assert!(output.loss.item::<f32>().is_finite());
+    }
+
+    #[test]
+    fn test_cross_entropy_dispatch_key_roundtrip() {
+        clear_cached_cross_entropy_backends();
+
+        let key = CrossEntropyDispatchKey {
+            device_name: "Apple M4 Max".to_string(),
+            device_tier: "max",
+            dtype: "f16",
+            num_tokens: 128,
+            hidden_size: 4096,
+            vocab_size: 32000,
+            chunk_size: 4096,
+            ignore_index: -100,
+            label_smoothing_bits: 0.0f32.to_bits(),
+            use_fp16: true,
+        };
+
+        assert_eq!(cached_cross_entropy_backend(&key), None);
+        cache_cross_entropy_backend(key.clone(), CrossEntropyBackendChoice::MetalFused);
+        assert_eq!(
+            cached_cross_entropy_backend(&key),
+            Some(CrossEntropyBackendChoice::MetalFused)
+        );
+
+        clear_cached_cross_entropy_backends();
+    }
+
+    #[test]
+    fn test_auto_backend_fused_linear_cross_entropy_basic() {
+        clear_cached_cross_entropy_backends();
+
+        let n_tokens = 4;
+        let hidden_dim = 8;
+        let vocab_size = 16;
+
+        let hidden_data: Vec<f32> = (0..n_tokens * hidden_dim)
+            .map(|i| ((i * 7 + 3) % 10) as f32 / 10.0)
+            .collect();
+        let hidden = Array::from_slice(&hidden_data, &[n_tokens as i32, hidden_dim as i32]);
+
+        let weight_data: Vec<f32> = (0..vocab_size * hidden_dim)
+            .map(|i| ((i * 11 + 5) % 10) as f32 / 10.0 - 0.5)
+            .collect();
+        let weight = Array::from_slice(&weight_data, &[vocab_size as i32, hidden_dim as i32]);
+
+        let targets = Array::from_slice(&[0i32, 5, 10, 15], &[4]);
+        let ctx = MetalCrossEntropyContext::new().unwrap();
+        let config = MetalCrossEntropyConfig::new().with_ignore_index(-100);
+
+        let output =
+            metal_fused_linear_cross_entropy(&ctx, &hidden, &weight, &targets, &config).unwrap();
+        output.loss.eval().unwrap();
+
+        let loss_value = output.loss.item::<f32>();
+        assert!(loss_value.is_finite());
+        assert!(loss_value >= 0.0);
     }
 
     #[test]

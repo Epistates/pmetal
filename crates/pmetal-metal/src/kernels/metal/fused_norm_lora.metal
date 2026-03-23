@@ -20,7 +20,9 @@ using namespace metal;
 
 // SIMD group size for M-series (Apple Silicon)
 #define SIMD_SIZE 32
-#define THREADS_PER_TOKEN 128
+constant uint FC_THREADS_PER_TOKEN [[function_constant(0)]];
+
+#define THREADS_PER_TOKEN FC_THREADS_PER_TOKEN
 
 /// Parameters for fused RMSNorm + LoRA
 struct FusedNormLoraParams {

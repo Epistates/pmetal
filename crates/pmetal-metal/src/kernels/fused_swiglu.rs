@@ -26,6 +26,7 @@
 //! The `fused_mlp_lora_forward` kernel fuses the ENTIRE MLP (gate/up/down)
 //! into a single kernel, fusing all three MLP projections in one pass.
 
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -35,6 +36,8 @@ use crate::{
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
     error::{MetalError, Result},
+    pipeline::FunctionConstant,
+    tuna::SwiGLUTunedConfig,
 };
 
 /// Configuration for fused SwiGLU kernel.
@@ -172,39 +175,45 @@ pub struct FusedMLPOutput {
 pub struct FusedSwiGLU {
     ctx: Arc<MetalContext>,
     config: FusedSwiGLUConfig,
-    /// Device-optimized threadgroup size.
+    /// Tuned kernel specialization for this device/problem shape.
+    tuned: SwiGLUTunedConfig,
+    /// Effective threadgroup size used for dispatch.
     threads_per_group: usize,
 }
 
 impl FusedSwiGLU {
     /// Create a new fused SwiGLU kernel.
     pub fn new(ctx: Arc<MetalContext>, config: FusedSwiGLUConfig) -> Result<Self> {
-        // Select threadgroup size based on device tier for M4 optimization
-        let threads_per_group = Self::select_threadgroup_size(&ctx);
+        let tuned = resolve_swiglu_tuned_config(&ctx, &config)?;
+        Self::new_with_tuned_config(ctx, config, tuned)
+    }
+
+    /// Create a new fused SwiGLU kernel with an explicit tuned specialization.
+    pub(crate) fn new_with_tuned_config(
+        ctx: Arc<MetalContext>,
+        config: FusedSwiGLUConfig,
+        tuned: SwiGLUTunedConfig,
+    ) -> Result<Self> {
+        let tuned = normalize_swiglu_tuned_config(&ctx, tuned);
+        let threads_per_group = tuned.threads_per_token as usize;
         Ok(Self {
             ctx,
             config,
+            tuned,
             threads_per_group,
         })
-    }
-
-    /// Select optimal threadgroup size based on device tier.
-    ///
-    /// M4 Max/Ultra benefit from larger threadgroups due to increased
-    /// shader core count and memory bandwidth.
-    fn select_threadgroup_size(ctx: &MetalContext) -> usize {
-        use crate::context::DeviceTier;
-
-        match ctx.properties().device_tier {
-            DeviceTier::Ultra | DeviceTier::Max => 512, // Higher parallelism
-            DeviceTier::Pro => 256,                     // Balanced
-            DeviceTier::Base => 256,                    // Default
-        }
     }
 
     /// Get the configuration.
     pub fn config(&self) -> &FusedSwiGLUConfig {
         &self.config
+    }
+
+    fn function_constants(&self) -> HashMap<u64, FunctionConstant> {
+        let mut constants = HashMap::new();
+        constants.insert(0, FunctionConstant::UInt(self.tuned.threads_per_token));
+        constants.insert(1, FunctionConstant::UInt(self.tuned.chunk_size));
+        constants
     }
 
     /// Forward pass without LoRA.
@@ -373,9 +382,14 @@ impl FusedSwiGLU {
             "fused_swiglu_forward"
         };
 
+        let constants = self.function_constants();
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), kernel_name, None)?
+            cache.get_or_create_specialized_pipeline_typed(
+                self.ctx.device(),
+                kernel_name,
+                &constants,
+            )?
         };
 
         let command_queue = self.ctx.command_queue();
@@ -405,13 +419,8 @@ impl FusedSwiGLU {
             height: 1,
             depth: 1,
         };
-        // Cap at 256 to match THREADS_PER_TOKEN constant in the Metal kernel.
-        // The SIMD-cooperative fused_swiglu_forward kernel hardcodes num_simd_grps = 256/32 = 8;
-        // dispatching 512 threads would create 16 SIMD groups but only 8 are expected,
-        // causing the upper 8 groups to write into unowned output slots.
-        let threads_per_group = self.threads_per_group.min(256);
         let threadgroup_size = objc2_metal::MTLSize {
-            width: threads_per_group,
+            width: self.threads_per_group,
             height: 1,
             depth: 1,
         };
@@ -448,9 +457,14 @@ impl FusedSwiGLU {
             "fused_swiglu_lora_forward"
         };
 
+        let constants = self.function_constants();
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), kernel_name, None)?
+            cache.get_or_create_specialized_pipeline_typed(
+                self.ctx.device(),
+                kernel_name,
+                &constants,
+            )?
         };
 
         let command_queue = self.ctx.command_queue();
@@ -483,10 +497,8 @@ impl FusedSwiGLU {
             encoder.setThreadgroupMemoryLength_atIndex(scratch_size, 0);
         }
 
-        // Cap at 256 to match THREADS_PER_TOKEN constant in the Metal kernel.
-        let threads_per_group = self.threads_per_group.min(256);
         let (grid_size, threadgroup_size) = if self.config.use_tiled {
-            let tile_size = 128;
+            let tile_size = self.tuned.chunk_size as usize;
             let num_tiles = self.config.intermediate_size.div_ceil(tile_size);
             (
                 objc2_metal::MTLSize {
@@ -495,7 +507,7 @@ impl FusedSwiGLU {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: threads_per_group,
+                    width: self.threads_per_group,
                     height: 1,
                     depth: 1,
                 },
@@ -508,7 +520,7 @@ impl FusedSwiGLU {
                     depth: 1,
                 },
                 objc2_metal::MTLSize {
-                    width: threads_per_group,
+                    width: self.threads_per_group,
                     height: 1,
                     depth: 1,
                 },
@@ -550,31 +562,40 @@ impl FusedSwiGLU {
 pub struct FusedMLP {
     ctx: Arc<MetalContext>,
     config: FusedSwiGLUConfig,
-    /// Device-optimized threadgroup size.
+    /// Tuned kernel specialization for this device/problem shape.
+    tuned: SwiGLUTunedConfig,
+    /// Effective threadgroup size used for dispatch.
     threads_per_group: usize,
 }
 
 impl FusedMLP {
     /// Create a new fused MLP kernel.
     pub fn new(ctx: Arc<MetalContext>, config: FusedSwiGLUConfig) -> Result<Self> {
-        // Select threadgroup size based on device tier for M4 optimization
-        let threads_per_group = Self::select_threadgroup_size(&ctx);
+        let tuned = resolve_swiglu_tuned_config(&ctx, &config)?;
+        Self::new_with_tuned_config(ctx, config, tuned)
+    }
+
+    /// Create a new fused MLP kernel with an explicit tuned specialization.
+    pub(crate) fn new_with_tuned_config(
+        ctx: Arc<MetalContext>,
+        config: FusedSwiGLUConfig,
+        tuned: SwiGLUTunedConfig,
+    ) -> Result<Self> {
+        let tuned = normalize_swiglu_tuned_config(&ctx, tuned);
+        let threads_per_group = tuned.threads_per_token as usize;
         Ok(Self {
             ctx,
             config,
+            tuned,
             threads_per_group,
         })
     }
 
-    /// Select optimal threadgroup size based on device tier.
-    fn select_threadgroup_size(ctx: &MetalContext) -> usize {
-        use crate::context::DeviceTier;
-
-        match ctx.properties().device_tier {
-            DeviceTier::Ultra | DeviceTier::Max => 512,
-            DeviceTier::Pro => 256,
-            DeviceTier::Base => 256,
-        }
+    fn function_constants(&self) -> HashMap<u64, FunctionConstant> {
+        let mut constants = HashMap::new();
+        constants.insert(0, FunctionConstant::UInt(self.tuned.threads_per_token));
+        constants.insert(1, FunctionConstant::UInt(self.tuned.chunk_size));
+        constants
     }
 
     /// Get the configuration.
@@ -643,9 +664,14 @@ impl FusedMLP {
     ) -> Result<()> {
         let kernel_name = "fused_mlp_forward";
 
+        let constants = self.function_constants();
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), kernel_name, None)?
+            cache.get_or_create_specialized_pipeline_typed(
+                self.ctx.device(),
+                kernel_name,
+                &constants,
+            )?
         };
 
         let command_queue = self.ctx.command_queue();
@@ -679,8 +705,7 @@ impl FusedMLP {
             // Threadgroup memory for SwiGLU intermediate — must be SWIGLU_CHUNK_SIZE,
             // NOT intermediate_size. The kernel tiles in SWIGLU_CHUNK_SIZE chunks.
             // intermediate_size can be 14336+ which would exceed 32KB Metal limit.
-            const SWIGLU_CHUNK_SIZE: usize = 2048;
-            let scratch_size = SWIGLU_CHUNK_SIZE * std::mem::size_of::<f32>();
+            let scratch_size = self.tuned.chunk_size as usize * std::mem::size_of::<f32>();
             encoder.setThreadgroupMemoryLength_atIndex(scratch_size, 0);
         }
 
@@ -689,10 +714,8 @@ impl FusedMLP {
             height: 1,
             depth: 1,
         };
-        // Cap at 256 to match THREADS_PER_TOKEN constant in the Metal kernel.
-        let threads_per_group = self.threads_per_group.min(256);
         let threadgroup_size = objc2_metal::MTLSize {
-            width: threads_per_group,
+            width: self.threads_per_group,
             height: 1,
             depth: 1,
         };
@@ -719,6 +742,31 @@ struct FusedSwiGLUParams {
     intermediate_size: u32,
     lora_rank: u32,
     lora_scale: f32,
+}
+
+fn resolve_swiglu_tuned_config(
+    ctx: &Arc<MetalContext>,
+    config: &FusedSwiGLUConfig,
+) -> Result<SwiGLUTunedConfig> {
+    let tuned = ctx
+        .tuner()
+        .tune_swiglu(ctx, config.batch_size, config.hidden_size, config.intermediate_size)?;
+    Ok(normalize_swiglu_tuned_config(ctx, tuned))
+}
+
+fn sanitize_threads_per_token(ctx: &MetalContext, threads_per_token: u32) -> u32 {
+    let max_threads = (ctx.properties().max_threads_per_threadgroup as u32).max(32);
+    threads_per_token.clamp(32, max_threads).div_ceil(32) * 32
+}
+
+fn normalize_swiglu_tuned_config(
+    ctx: &MetalContext,
+    tuned: SwiGLUTunedConfig,
+) -> SwiGLUTunedConfig {
+    SwiGLUTunedConfig {
+        threads_per_token: sanitize_threads_per_token(ctx, tuned.threads_per_token),
+        chunk_size: tuned.chunk_size.max(1),
+    }
 }
 
 impl std::fmt::Debug for FusedSwiGLU {
@@ -761,5 +809,56 @@ mod tests {
         assert_eq!(config.lora_rank, 16);
         assert!((config.lora_scale - 2.0).abs() < 1e-6); // 32 / 16 = 2
         assert!(config.has_lora());
+    }
+
+    #[test]
+    fn test_sanitize_threads_per_token_rounds_to_simd_multiple() {
+        let max_threads_per_threadgroup = 320;
+        assert_eq!(
+            sanitize_threads_per_token_from_max(17, max_threads_per_threadgroup),
+            32
+        );
+        assert_eq!(
+            sanitize_threads_per_token_from_max(257, max_threads_per_threadgroup),
+            288
+        );
+        assert_eq!(
+            sanitize_threads_per_token_from_max(512, max_threads_per_threadgroup),
+            320
+        );
+    }
+
+    fn sanitize_threads_per_token_from_max(
+        threads_per_token: u32,
+        max_threads_per_threadgroup: u64,
+    ) -> u32 {
+        threads_per_token
+            .clamp(32, (max_threads_per_threadgroup as u32).max(32))
+            .div_ceil(32)
+            * 32
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fused_swiglu_constructor_uses_tuned_specialization() {
+        let ctx = Arc::new(MetalContext::new().expect("Metal required"));
+        let config = FusedSwiGLUConfig::with_lora(4, 512, 8192, 8, 16.0);
+        let tuned = ctx
+            .tuner()
+            .tune_swiglu(&ctx, config.batch_size, config.hidden_size, config.intermediate_size)
+            .expect("tune_swiglu");
+        let kernel = FusedSwiGLU::new(ctx.clone(), config.clone()).expect("kernel");
+        let mlp = FusedMLP::new(ctx.clone(), config).expect("mlp");
+
+        assert_eq!(kernel.tuned.chunk_size, tuned.chunk_size);
+        assert_eq!(mlp.tuned.chunk_size, tuned.chunk_size);
+        assert_eq!(
+            kernel.threads_per_group as u32,
+            sanitize_threads_per_token(&ctx, tuned.threads_per_token)
+        );
+        assert_eq!(
+            mlp.threads_per_group as u32,
+            sanitize_threads_per_token(&ctx, tuned.threads_per_token)
+        );
     }
 }

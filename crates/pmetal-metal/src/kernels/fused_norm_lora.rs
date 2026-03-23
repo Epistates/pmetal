@@ -20,6 +20,7 @@
 //!
 //! This is a novel optimization: no existing framework fuses normalization with LoRA.
 
+use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -29,6 +30,8 @@ use crate::{
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
     error::{MetalError, Result},
+    pipeline::FunctionConstant,
+    tuna::NormLoraTunedConfig,
 };
 
 /// Configuration for fused RMSNorm + LoRA kernel.
@@ -134,39 +137,48 @@ pub struct FusedNormLoraOutput {
 pub struct FusedNormLora {
     ctx: Arc<MetalContext>,
     config: FusedNormLoraConfig,
-    /// Device-optimized threadgroup size.
+    /// Tuned kernel specialization for this device/problem shape.
+    tuned: NormLoraTunedConfig,
+    /// Effective threadgroup size.
     threads_per_token: usize,
+    /// Effective tiled-path choice after tuning.
+    use_tiled: bool,
 }
 
 impl FusedNormLora {
     /// Create a new fused norm + LoRA kernel.
     pub fn new(ctx: Arc<MetalContext>, config: FusedNormLoraConfig) -> Result<Self> {
-        // Select threadgroup size based on device tier for M4 optimization
-        let threads_per_token = Self::select_threadgroup_size(&ctx);
+        let tuned = resolve_norm_lora_tuned_config(&ctx, &config)?;
+        Self::new_with_tuned_config(ctx, config, tuned)
+    }
+
+    /// Create a new fused norm + LoRA kernel with an explicit tuned specialization.
+    pub(crate) fn new_with_tuned_config(
+        ctx: Arc<MetalContext>,
+        config: FusedNormLoraConfig,
+        tuned: NormLoraTunedConfig,
+    ) -> Result<Self> {
+        let tuned = normalize_norm_lora_tuned_config(&ctx, tuned);
+        let threads_per_token = tuned.threads_per_token as usize;
+        let use_tiled = config.use_tiled && tuned.use_tiled;
         Ok(Self {
             ctx,
             config,
+            tuned,
             threads_per_token,
+            use_tiled,
         })
-    }
-
-    /// Select optimal threadgroup size based on device tier.
-    ///
-    /// M4 Max/Ultra benefit from larger threadgroups due to increased
-    /// shader core count and memory bandwidth.
-    fn select_threadgroup_size(ctx: &MetalContext) -> usize {
-        use crate::context::DeviceTier;
-
-        match ctx.properties().device_tier {
-            DeviceTier::Ultra | DeviceTier::Max => 256, // Higher parallelism for RMSNorm reduction
-            DeviceTier::Pro => 128,                     // Balanced
-            DeviceTier::Base => 128,                    // Default (THREADS_PER_TOKEN in shader)
-        }
     }
 
     /// Get the configuration.
     pub fn config(&self) -> &FusedNormLoraConfig {
         &self.config
+    }
+
+    fn function_constants(&self) -> HashMap<u64, FunctionConstant> {
+        let mut constants = HashMap::new();
+        constants.insert(0, FunctionConstant::UInt(self.tuned.threads_per_token));
+        constants
     }
 
     /// Forward pass.
@@ -249,15 +261,20 @@ impl FusedNormLora {
         lora_b: &MetalBuffer<f32>,
         output: &MetalBuffer<f32>,
     ) -> Result<()> {
-        let kernel_name = if self.config.use_tiled {
+        let kernel_name = if self.use_tiled {
             "fused_norm_lora_forward_tiled"
         } else {
             "fused_norm_lora_forward"
         };
 
+        let constants = self.function_constants();
         let pipeline = {
             let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(self.ctx.device(), kernel_name, None)?
+            cache.get_or_create_specialized_pipeline_typed(
+                self.ctx.device(),
+                kernel_name,
+                &constants,
+            )?
         };
 
         let command_queue = self.ctx.command_queue();
@@ -290,7 +307,7 @@ impl FusedNormLora {
             // reduction scratch: num_simd_groups = THREADS_PER_TOKEN / SIMD_SIZE = 128 / 32 = 4
             // floats appended after norm_x and x_a.
             let num_simd_groups = self.threads_per_token.div_ceil(32);
-            let scratch_floats = if self.config.use_tiled {
+            let scratch_floats = if self.use_tiled {
                 self.config.hidden_size + self.config.lora_rank
             } else {
                 self.config.hidden_size + self.config.lora_rank + num_simd_groups
@@ -299,7 +316,7 @@ impl FusedNormLora {
             encoder.setThreadgroupMemoryLength_atIndex(scratch_size, 0);
         }
 
-        let (grid_size, threadgroup_size) = if self.config.use_tiled {
+        let (grid_size, threadgroup_size) = if self.use_tiled {
             // Tiled version: one threadgroup per token
             (
                 objc2_metal::MTLSize {
@@ -365,6 +382,35 @@ struct FusedNormLoraParams {
     lora_scale: f32,
 }
 
+fn resolve_norm_lora_tuned_config(
+    ctx: &Arc<MetalContext>,
+    config: &FusedNormLoraConfig,
+) -> Result<NormLoraTunedConfig> {
+    let tuned = ctx.tuner().tune_norm_lora(
+        ctx,
+        config.batch_size,
+        config.hidden_size,
+        config.out_features,
+        config.lora_rank,
+    )?;
+    Ok(normalize_norm_lora_tuned_config(ctx, tuned))
+}
+
+fn sanitize_norm_lora_threads_per_token(ctx: &MetalContext, threads_per_token: u32) -> u32 {
+    let max_threads = (ctx.properties().max_threads_per_threadgroup as u32).max(32);
+    threads_per_token.clamp(32, max_threads).div_ceil(32) * 32
+}
+
+fn normalize_norm_lora_tuned_config(
+    ctx: &MetalContext,
+    tuned: NormLoraTunedConfig,
+) -> NormLoraTunedConfig {
+    NormLoraTunedConfig {
+        threads_per_token: sanitize_norm_lora_threads_per_token(ctx, tuned.threads_per_token),
+        use_tiled: tuned.use_tiled,
+    }
+}
+
 impl std::fmt::Debug for FusedNormLora {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FusedNormLora")
@@ -387,5 +433,48 @@ mod tests {
         assert_eq!(config.lora_rank, 8);
         assert!((config.lora_scale - 2.0).abs() < 1e-6); // 16 / 8 = 2
         assert!(config.use_tiled);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fused_norm_lora_constructor_uses_tuned_specialization() {
+        let ctx = Arc::new(MetalContext::new().expect("Metal required"));
+        let small = FusedNormLoraConfig::new(2, 512, 128, 8, 16.0);
+        let large = FusedNormLoraConfig::new(2, 512, 1024, 8, 16.0);
+
+        let tuned_small = ctx
+            .tuner()
+            .tune_norm_lora(
+                &ctx,
+                small.batch_size,
+                small.hidden_size,
+                small.out_features,
+                small.lora_rank,
+            )
+            .expect("tune_norm_lora small");
+        let tuned_large = ctx
+            .tuner()
+            .tune_norm_lora(
+                &ctx,
+                large.batch_size,
+                large.hidden_size,
+                large.out_features,
+                large.lora_rank,
+            )
+            .expect("tune_norm_lora large");
+
+        let kernel_small = FusedNormLora::new(ctx.clone(), small).expect("kernel small");
+        let kernel_large = FusedNormLora::new(ctx.clone(), large).expect("kernel large");
+
+        assert_eq!(
+            kernel_small.threads_per_token as u32,
+            sanitize_norm_lora_threads_per_token(&ctx, tuned_small.threads_per_token)
+        );
+        assert_eq!(
+            kernel_large.threads_per_token as u32,
+            sanitize_norm_lora_threads_per_token(&ctx, tuned_large.threads_per_token)
+        );
+        assert_eq!(kernel_small.use_tiled, tuned_small.use_tiled);
+        assert_eq!(kernel_large.use_tiled, tuned_large.use_tiled);
     }
 }

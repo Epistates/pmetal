@@ -39,6 +39,7 @@ use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLCompu
 use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::MetalContext;
 use crate::error::{MetalError, Result};
+use crate::tuna::FlashAttentionTunedConfig;
 
 /// Configuration for FlashAttention.
 #[derive(Debug, Clone)]
@@ -255,58 +256,48 @@ impl FlashAttention {
     pub fn new(ctx: Arc<MetalContext>, config: FlashAttentionConfig) -> Result<Self> {
         config.validate()?;
 
-        // Determine block sizes based on head dimension AND device tier
-        // M4 Max/Ultra can use larger blocks due to higher memory bandwidth
-        let device_tier = ctx.properties().device_tier;
-        let (block_q, block_k) = Self::select_block_sizes(config.head_dim, device_tier);
+        let tuned = ctx.tuner().tune_flash_attention(&ctx, &config)?;
+        Self::new_with_tuned_blocks(ctx, config, tuned)
+    }
+
+    pub(crate) fn new_with_tuned_blocks(
+        ctx: Arc<MetalContext>,
+        config: FlashAttentionConfig,
+        tuned: FlashAttentionTunedConfig,
+    ) -> Result<Self> {
+        config.validate()?;
+        Self::validate_block_sizes(config.head_dim, tuned)?;
 
         Ok(Self {
             ctx,
             config,
-            block_q,
-            block_k,
+            block_q: tuned.block_q as usize,
+            block_k: tuned.block_k as usize,
         })
     }
 
-    /// Select optimal block sizes based on head dimension and device tier.
-    ///
-    /// Higher-tier devices (M4 Max/Ultra) benefit from larger tile sizes
-    /// due to increased memory bandwidth and shader core count.
-    fn select_block_sizes(
+    fn validate_block_sizes(
         head_dim: usize,
-        device_tier: crate::context::DeviceTier,
-    ) -> (usize, usize) {
-        use crate::context::DeviceTier;
+        tuned: FlashAttentionTunedConfig,
+    ) -> Result<()> {
+        let supported = match head_dim {
+            64 => matches!(
+                (tuned.block_q, tuned.block_k),
+                (64, 64) | (64, 32) | (32, 32)
+            ),
+            80 | 96 => matches!((tuned.block_q, tuned.block_k), (64, 32) | (32, 32)),
+            128 => matches!((tuned.block_q, tuned.block_k), (64, 32) | (32, 32)),
+            256 => matches!((tuned.block_q, tuned.block_k), (32, 16) | (16, 16)),
+            _ => false,
+        };
 
-        match (head_dim, device_tier) {
-            // D=64: Can use larger blocks on high-end devices
-            (64, DeviceTier::Ultra | DeviceTier::Max) => (64, 64),
-            (64, DeviceTier::Pro) => (64, 64),
-            (64, DeviceTier::Base) => (64, 32),
-
-            // D=80: Awkward dimension, use asymmetric blocks
-            (80, DeviceTier::Ultra | DeviceTier::Max) => (64, 32),
-            (80, DeviceTier::Pro) => (64, 32),
-            (80, DeviceTier::Base) => (32, 32),
-
-            // D=96: Similar to D=80
-            (96, DeviceTier::Ultra | DeviceTier::Max) => (64, 32),
-            (96, DeviceTier::Pro) => (64, 32),
-            (96, DeviceTier::Base) => (32, 32),
-
-            // D=128: Most common, optimize carefully
-            (128, DeviceTier::Ultra | DeviceTier::Max) => (64, 32),
-            (128, DeviceTier::Pro) => (32, 32),
-            (128, DeviceTier::Base) => (32, 32),
-
-            // D=256: Large head dim needs smaller blocks
-            (256, DeviceTier::Ultra | DeviceTier::Max) => (32, 16),
-            (256, DeviceTier::Pro) => (16, 16),
-            (256, DeviceTier::Base) => (16, 16),
-
-            // Default fallback
-            (_, DeviceTier::Ultra | DeviceTier::Max) => (32, 32),
-            (_, _) => (32, 32),
+        if supported {
+            Ok(())
+        } else {
+            Err(MetalError::InvalidConfig(format!(
+                "unsupported FlashAttention block config {}x{} for head_dim={}",
+                tuned.block_q, tuned.block_k, head_dim
+            )))
         }
     }
 
@@ -1269,5 +1260,63 @@ mod tests {
         };
         assert!(!mha_config.is_gqa());
         assert_eq!(mha_config.gqa_ratio(), 1);
+    }
+
+    #[test]
+    fn valid_flash_attention_block_configs_are_accepted() {
+        assert!(
+            FlashAttention::validate_block_sizes(
+                64,
+                FlashAttentionTunedConfig {
+                    block_q: 64,
+                    block_k: 32,
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            FlashAttention::validate_block_sizes(
+                128,
+                FlashAttentionTunedConfig {
+                    block_q: 32,
+                    block_k: 32,
+                },
+            )
+            .is_ok()
+        );
+        assert!(
+            FlashAttention::validate_block_sizes(
+                256,
+                FlashAttentionTunedConfig {
+                    block_q: 32,
+                    block_k: 16,
+                },
+            )
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn invalid_flash_attention_block_configs_are_rejected() {
+        assert!(
+            FlashAttention::validate_block_sizes(
+                128,
+                FlashAttentionTunedConfig {
+                    block_q: 64,
+                    block_k: 64,
+                },
+            )
+            .is_err()
+        );
+        assert!(
+            FlashAttention::validate_block_sizes(
+                256,
+                FlashAttentionTunedConfig {
+                    block_q: 64,
+                    block_k: 32,
+                },
+            )
+            .is_err()
+        );
     }
 }

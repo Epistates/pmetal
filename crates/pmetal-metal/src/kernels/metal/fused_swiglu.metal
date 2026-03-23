@@ -22,14 +22,11 @@ using namespace metal;
 
 // SIMD group size for Apple Silicon
 #define SIMD_SIZE 32
-#define THREADS_PER_TOKEN 256
+constant uint FC_THREADS_PER_TOKEN [[function_constant(0)]];
+constant uint FC_SWIGLU_CHUNK_SIZE [[function_constant(1)]];
 
-// Tile the intermediate computation to stay within 32KB threadgroup memory limit.
-// 2048 floats * 4 bytes = 8KB per chunk; two chunks (gate/up) = 16KB, well within 32KB.
-// Host must allocate threadgroup memory of SWIGLU_CHUNK_SIZE * sizeof(float) bytes
-// for scratch in the non-lora variants, and (2 * lora_rank + SWIGLU_CHUNK_SIZE) * sizeof(float)
-// bytes for the lora variants.
-#define SWIGLU_CHUNK_SIZE 2048
+#define THREADS_PER_TOKEN FC_THREADS_PER_TOKEN
+#define SWIGLU_CHUNK_SIZE FC_SWIGLU_CHUNK_SIZE
 
 /// Parameters for fused SwiGLU kernel
 struct FusedSwiGLUParams {
@@ -507,7 +504,7 @@ kernel void fused_swiglu_lora_forward_tiled(
 ) {
     const uint token_idx = tgid.x;
     const uint tile_idx = tgid.y;
-    const uint tile_size = 128;
+    const uint tile_size = SWIGLU_CHUNK_SIZE;
     const uint tile_start = tile_idx * tile_size;
 
     if (token_idx >= params.batch_size) return;

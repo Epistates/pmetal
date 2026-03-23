@@ -49,6 +49,12 @@ use serde::{Deserialize, Serialize};
 use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::{DeviceTier, MetalContext};
 use crate::error::{MetalError, Result};
+use crate::kernels::flash_attention::{FlashAttention, FlashAttentionConfig};
+use crate::kernels::fused_cross_entropy::{
+    FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig,
+};
+use crate::kernels::fused_norm_lora::{FusedNormLora, FusedNormLoraConfig};
+use crate::kernels::fused_swiglu::{FusedMLP, FusedSwiGLUConfig};
 use crate::kernels::mpp_gemm::{MppGemm, MppGemmConfig, MppGemmKernelVariant};
 use tracing::{debug, info, warn};
 
@@ -141,6 +147,29 @@ impl Default for CrossEntropyTunedConfig {
     }
 }
 
+/// Configuration for tuned FlashAttention block sizes.
+///
+/// Standard Metal FlashAttention specializes query/key tile sizes at pipeline
+/// creation time. These choices are safe to benchmark on first use and persist
+/// per device/problem shape, rather than relying only on static tier tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FlashAttentionTunedConfig {
+    /// Number of query rows processed per block.
+    pub block_q: u32,
+    /// Number of key/value rows processed per block.
+    pub block_k: u32,
+}
+
+impl Default for FlashAttentionTunedConfig {
+    fn default() -> Self {
+        Self {
+            block_q: 32,
+            block_k: 32,
+        }
+    }
+}
+
 /// Configuration for tuned Norm+LoRA fused kernels.
 ///
 /// Fusing layer-norm with the LoRA projection saves a round-trip through
@@ -218,6 +247,55 @@ impl MppGemmTuneRequest {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct FlashAttentionTuneRequest {
+    batch_size: usize,
+    num_heads: usize,
+    num_kv_heads: usize,
+    query_seq_len: usize,
+    kv_seq_len: usize,
+    head_dim: usize,
+    is_causal: bool,
+    has_sliding_window: bool,
+    has_softcap: bool,
+    is_training: bool,
+}
+
+impl FlashAttentionTuneRequest {
+    fn from_config(config: &FlashAttentionConfig) -> Self {
+        Self {
+            batch_size: config.batch_size,
+            num_heads: config.num_heads,
+            num_kv_heads: config.num_kv_heads,
+            query_seq_len: config.query_seq_len,
+            kv_seq_len: config.kv_seq_len,
+            head_dim: config.head_dim,
+            is_causal: config.is_causal,
+            has_sliding_window: config.sliding_window.is_some(),
+            has_softcap: config.softcap.is_some(),
+            is_training: config.is_training,
+        }
+    }
+
+    fn cache_key(self, device_name: &str, device_tier: DeviceTier) -> String {
+        format!(
+            "flash_attention:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}:{}",
+            device_name,
+            device_tier_key(device_tier),
+            self.batch_size,
+            self.num_heads,
+            self.num_kv_heads,
+            self.query_seq_len,
+            self.kv_seq_len,
+            self.head_dim,
+            if self.is_causal { "causal" } else { "free" },
+            if self.has_sliding_window { "window" } else { "full" },
+            if self.has_softcap { "softcap" } else { "plain" },
+            if self.is_training { "train" } else { "infer" }
+        )
+    }
+}
+
 fn device_tier_key(tier: DeviceTier) -> &'static str {
     match tier {
         DeviceTier::Base => "base",
@@ -225,6 +303,48 @@ fn device_tier_key(tier: DeviceTier) -> &'static str {
         DeviceTier::Max => "max",
         DeviceTier::Ultra => "ultra",
     }
+}
+
+fn sanitize_threads_per_token_candidate(
+    threads_per_token: u32,
+    max_threads_per_threadgroup: u32,
+) -> u32 {
+    threads_per_token
+        .clamp(32, max_threads_per_threadgroup.max(32))
+        .div_ceil(32)
+        * 32
+}
+
+fn dedupe_swiglu_configs(configs: Vec<SwiGLUTunedConfig>) -> Vec<SwiGLUTunedConfig> {
+    let mut unique = Vec::with_capacity(configs.len());
+    for config in configs {
+        if !unique.contains(&config) {
+            unique.push(config);
+        }
+    }
+    unique
+}
+
+fn dedupe_norm_lora_configs(configs: Vec<NormLoraTunedConfig>) -> Vec<NormLoraTunedConfig> {
+    let mut unique = Vec::with_capacity(configs.len());
+    for config in configs {
+        if !unique.contains(&config) {
+            unique.push(config);
+        }
+    }
+    unique
+}
+
+fn dedupe_cross_entropy_configs(
+    configs: Vec<CrossEntropyTunedConfig>,
+) -> Vec<CrossEntropyTunedConfig> {
+    let mut unique = Vec::with_capacity(configs.len());
+    for config in configs {
+        if !unique.contains(&config) {
+            unique.push(config);
+        }
+    }
+    unique
 }
 
 // ============================================================================
@@ -284,8 +404,12 @@ pub struct Tuner {
     swiglu_cache: Mutex<HashMap<String, SwiGLUTunedConfig>>,
 
     /// Cache of best configurations for cross-entropy kernels.
-    /// Key: "cross_entropy:num_tokens:vocab_size"
+    /// Keys cover both generic logits CE and fused-linear CE shapes.
     cross_entropy_cache: Mutex<HashMap<String, CrossEntropyTunedConfig>>,
+
+    /// Cache of best configurations for FlashAttention block sizes.
+    /// Key: "flash_attention:device_name:device_tier:..."
+    flash_attention_cache: Mutex<HashMap<String, FlashAttentionTunedConfig>>,
 
     /// Cache of best configurations for Norm+LoRA fused kernels.
     /// Key: "norm_lora:batch:hidden:out_features:rank"
@@ -314,6 +438,7 @@ impl Tuner {
             merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
+            flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
             cache_dir: None,
@@ -332,6 +457,7 @@ impl Tuner {
             merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
+            flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
             cache_dir: cache_dir.clone(),
@@ -364,6 +490,10 @@ impl Tuner {
         load_disk_cache_file::<CrossEntropyTunedConfig>(
             &dir.join("cross_entropy.json"),
             &self.cross_entropy_cache,
+        );
+        load_disk_cache_file::<FlashAttentionTunedConfig>(
+            &dir.join("flash_attention.json"),
+            &self.flash_attention_cache,
         );
         load_disk_cache_file::<NormLoraTunedConfig>(
             &dir.join("norm_lora.json"),
@@ -413,6 +543,15 @@ impl Tuner {
         };
         let path = dir.join("cross_entropy.json");
         self.flush_cache_file(&path, &self.cross_entropy_cache, key, config);
+    }
+
+    /// Persist the full flash_attention in-memory cache to `flash_attention.json`.
+    fn save_flash_attention_to_disk(&self, key: &str, config: &FlashAttentionTunedConfig) {
+        let Some(dir) = self.ensure_cache_dir() else {
+            return;
+        };
+        let path = dir.join("flash_attention.json");
+        self.flush_cache_file(&path, &self.flash_attention_cache, key, config);
     }
 
     /// Persist the full norm-lora in-memory cache to `norm_lora.json`.
@@ -515,6 +654,253 @@ impl Tuner {
                 tracing::error!("Failed to acquire merge_cache lock: {}", e);
             }
         }
+    }
+
+    // =========================================================================
+    // FlashAttention Block Tuning (benchmarked)
+    // =========================================================================
+
+    /// Tune standard Metal FlashAttention block sizes for the given problem.
+    pub fn tune_flash_attention(
+        &self,
+        context: &Arc<MetalContext>,
+        config: &FlashAttentionConfig,
+    ) -> Result<FlashAttentionTunedConfig> {
+        config.validate()?;
+
+        let request = FlashAttentionTuneRequest::from_config(config);
+        let props = context.properties();
+        let key = request.cache_key(&props.name, props.device_tier);
+
+        {
+            let cache = self
+                .flash_attention_cache
+                .lock()
+                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
+            if let Some(&tuned) = cache.get(&key) {
+                return Ok(tuned);
+            }
+        }
+
+        let candidates = self.candidate_flash_attention_configs(request.head_dim, props.device_tier);
+        let mut best_config = self.heuristic_flash_attention_config(request.head_dim, props.device_tier);
+        let mut best_time = f64::INFINITY;
+
+        info!(
+            "Tuning FlashAttention blocks for [B={}, H={}, KVH={}, Q={}, KV={}, D={}, mode={}]...",
+            request.batch_size,
+            request.num_heads,
+            request.num_kv_heads,
+            request.query_seq_len,
+            request.kv_seq_len,
+            request.head_dim,
+            if request.is_training { "train" } else { "infer" }
+        );
+
+        for candidate in candidates {
+            match self.benchmark_flash_attention(context, config, candidate) {
+                Ok(elapsed) => {
+                    debug!(
+                        "FlashAttention config {:?} took {:.3} ms",
+                        candidate,
+                        elapsed * 1000.0
+                    );
+                    if elapsed < best_time {
+                        best_time = elapsed;
+                        best_config = candidate;
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        "FlashAttention config {:?} failed benchmarking: {}",
+                        candidate,
+                        error
+                    );
+                }
+            }
+        }
+
+        if best_time.is_finite() {
+            info!(
+                "Selected FlashAttention block config {:?} ({:.3} ms)",
+                best_config,
+                best_time * 1000.0
+            );
+        } else {
+            debug!(
+                "Falling back to heuristic FlashAttention block config {:?}",
+                best_config
+            );
+        }
+
+        {
+            let mut cache = self
+                .flash_attention_cache
+                .lock()
+                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
+            cache.insert(key.clone(), best_config);
+        }
+        self.save_flash_attention_to_disk(&key, &best_config);
+
+        Ok(best_config)
+    }
+
+    fn heuristic_flash_attention_config(
+        &self,
+        head_dim: usize,
+        tier: DeviceTier,
+    ) -> FlashAttentionTunedConfig {
+        match (head_dim, tier) {
+            (64, DeviceTier::Base) => FlashAttentionTunedConfig {
+                block_q: 64,
+                block_k: 32,
+            },
+            (64, _) => FlashAttentionTunedConfig {
+                block_q: 64,
+                block_k: 64,
+            },
+            (80 | 96, DeviceTier::Base) => FlashAttentionTunedConfig {
+                block_q: 32,
+                block_k: 32,
+            },
+            (80 | 96, _) => FlashAttentionTunedConfig {
+                block_q: 64,
+                block_k: 32,
+            },
+            (128, DeviceTier::Max | DeviceTier::Ultra) => FlashAttentionTunedConfig {
+                block_q: 64,
+                block_k: 32,
+            },
+            (128, _) => FlashAttentionTunedConfig {
+                block_q: 32,
+                block_k: 32,
+            },
+            (256, DeviceTier::Max | DeviceTier::Ultra) => FlashAttentionTunedConfig {
+                block_q: 32,
+                block_k: 16,
+            },
+            (256, _) => FlashAttentionTunedConfig {
+                block_q: 16,
+                block_k: 16,
+            },
+            _ => FlashAttentionTunedConfig::default(),
+        }
+    }
+
+    fn candidate_flash_attention_configs(
+        &self,
+        head_dim: usize,
+        tier: DeviceTier,
+    ) -> Vec<FlashAttentionTunedConfig> {
+        let heuristic = self.heuristic_flash_attention_config(head_dim, tier);
+        let mut candidates = vec![heuristic];
+
+        let fallback = match head_dim {
+            64 => vec![
+                FlashAttentionTunedConfig {
+                    block_q: 64,
+                    block_k: 64,
+                },
+                FlashAttentionTunedConfig {
+                    block_q: 64,
+                    block_k: 32,
+                },
+                FlashAttentionTunedConfig {
+                    block_q: 32,
+                    block_k: 32,
+                },
+            ],
+            80 | 96 => vec![
+                FlashAttentionTunedConfig {
+                    block_q: 64,
+                    block_k: 32,
+                },
+                FlashAttentionTunedConfig {
+                    block_q: 32,
+                    block_k: 32,
+                },
+            ],
+            128 => vec![
+                FlashAttentionTunedConfig {
+                    block_q: 64,
+                    block_k: 32,
+                },
+                FlashAttentionTunedConfig {
+                    block_q: 32,
+                    block_k: 32,
+                },
+            ],
+            256 => vec![
+                FlashAttentionTunedConfig {
+                    block_q: 32,
+                    block_k: 16,
+                },
+                FlashAttentionTunedConfig {
+                    block_q: 16,
+                    block_k: 16,
+                },
+            ],
+            _ => vec![FlashAttentionTunedConfig::default()],
+        };
+
+        for candidate in fallback {
+            if !candidates.contains(&candidate) {
+                candidates.push(candidate);
+            }
+        }
+
+        candidates
+    }
+
+    fn benchmark_flash_attention(
+        &self,
+        context: &Arc<MetalContext>,
+        config: &FlashAttentionConfig,
+        candidate: FlashAttentionTunedConfig,
+    ) -> Result<f64> {
+        let heuristic =
+            self.heuristic_flash_attention_config(config.head_dim, context.properties().device_tier);
+        let total_bytes = config
+            .query_size()
+            .checked_mul(2)
+            .and_then(|x| x.checked_add(config.kv_size().checked_mul(2)?))
+            .and_then(|x| x.checked_add(config.kv_size().checked_mul(2)?))
+            .and_then(|x| x.checked_add(config.output_size().checked_mul(2)?))
+            .and_then(|x| {
+                x.checked_add(if config.is_training {
+                    config.logsumexp_size().checked_mul(4)?
+                } else {
+                    0
+                })
+            })
+            .ok_or_else(|| {
+                MetalError::InvalidConfig(
+                    "FlashAttention benchmark size overflow".to_string(),
+                )
+            })?;
+        if total_bytes > 256 * 1024 * 1024 {
+            return Ok(if candidate == heuristic { 1.0 } else { 10.0 });
+        }
+
+        let queries = MetalBuffer::<f16>::zeros(context, config.query_size(), BufferUsage::Shared)?;
+        let keys = MetalBuffer::<f16>::zeros(context, config.kv_size(), BufferUsage::Shared)?;
+        let values = MetalBuffer::<f16>::zeros(context, config.kv_size(), BufferUsage::Shared)?;
+
+        let flash = FlashAttention::new_with_tuned_blocks(
+            Arc::clone(context),
+            config.clone(),
+            candidate,
+        )?;
+
+        flash.forward(&queries, &keys, &values)?;
+
+        let iterations = 3;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            flash.forward(&queries, &keys, &values)?;
+        }
+
+        Ok(start.elapsed().as_secs_f64() / iterations as f64)
     }
 
     // =========================================================================
@@ -762,7 +1148,6 @@ impl Tuner {
             return Ok(if heuristic == candidate { 1.0 } else { 10.0 });
         }
 
-        let start = Instant::now();
         let iterations = 3;
 
         if request.use_fp16 {
@@ -791,9 +1176,11 @@ impl Tuner {
             config.auto_tune_variant = false;
             let gemm = MppGemm::new(Arc::clone(context), config);
             gemm.execute(&a, &b, &d)?;
+            let start = Instant::now();
             for _ in 0..iterations {
                 gemm.execute(&a, &b, &d)?;
             }
+            Ok(start.elapsed().as_secs_f64() / iterations as f64)
         } else {
             let a = MetalBuffer::<f32>::zeros(
                 context,
@@ -820,12 +1207,12 @@ impl Tuner {
             config.auto_tune_variant = false;
             let gemm = MppGemm::new(Arc::clone(context), config);
             gemm.execute(&a, &b, &d)?;
+            let start = Instant::now();
             for _ in 0..iterations {
                 gemm.execute(&a, &b, &d)?;
             }
+            Ok(start.elapsed().as_secs_f64() / iterations as f64)
         }
-
-        Ok(start.elapsed().as_secs_f64() / iterations as f64)
     }
 
     // =========================================================================
@@ -1565,16 +1952,10 @@ impl Tuner {
     }
 
     // =========================================================================
-    // SwiGLU Kernel Tuning (heuristic)
+    // SwiGLU Kernel Tuning (benchmarked)
     // =========================================================================
 
     /// Tune the SwiGLU activation kernel for the given problem size.
-    ///
-    /// SwiGLU is memory-bandwidth-bound on Apple Silicon, so the optimal config
-    /// is dominated by device memory bandwidth tier rather than by runtime
-    /// benchmarking. A heuristic based on the device tier and problem size is
-    /// therefore preferred over full benchmarking, which would require setting
-    /// up the full weight buffers and is cost-prohibitive at startup.
     ///
     /// # Arguments
     /// * `context` - Metal context
@@ -1583,17 +1964,23 @@ impl Tuner {
     /// * `intermediate_size` - MLP intermediate dimension (typically 8/3 * hidden_size)
     ///
     /// # Returns
-    /// Heuristically-selected optimal configuration for SwiGLU on this hardware.
+    /// Benchmarked optimal configuration for SwiGLU on this hardware, with
+    /// heuristic fallback for oversized problems.
     pub fn tune_swiglu(
         &self,
-        context: &MetalContext,
+        context: &Arc<MetalContext>,
         batch_size: usize,
         hidden_size: usize,
         intermediate_size: usize,
     ) -> Result<SwiGLUTunedConfig> {
+        let props = context.properties();
         let key = format!(
-            "swiglu:{}:{}:{}",
-            batch_size, hidden_size, intermediate_size
+            "swiglu:{}:{}:{}:{}:{}",
+            props.name,
+            device_tier_key(props.device_tier),
+            batch_size,
+            hidden_size,
+            intermediate_size
         );
 
         // Check in-memory cache (populated from disk on startup)
@@ -1612,13 +1999,57 @@ impl Tuner {
             batch_size, hidden_size, intermediate_size
         );
 
-        let config = self.select_swiglu_config(context, batch_size, intermediate_size);
+        let heuristic = self.heuristic_swiglu_config(
+            props.device_tier,
+            intermediate_size,
+            props.max_threads_per_threadgroup as u32,
+        );
+        let candidates = self.candidate_swiglu_configs(
+            props.device_tier,
+            intermediate_size,
+            props.max_threads_per_threadgroup as u32,
+        );
+        let config = FusedSwiGLUConfig::new(batch_size, hidden_size, intermediate_size);
+        let mut best_config = heuristic;
+        let mut best_time = f64::INFINITY;
 
         info!(
-            "Selected SwiGLU config: {:?} (heuristic, device tier: {:?})",
-            config,
-            context.properties().device_tier
+            "Tuning SwiGLU config for [B={}, H={}, I={}]...",
+            batch_size, hidden_size, intermediate_size
         );
+
+        for candidate in candidates {
+            match self.benchmark_swiglu(context, &config, candidate) {
+                Ok(elapsed) => {
+                    debug!(
+                        "SwiGLU config {:?} took {:.3} ms",
+                        candidate,
+                        elapsed * 1000.0
+                    );
+                    if elapsed < best_time {
+                        best_time = elapsed;
+                        best_config = candidate;
+                    }
+                }
+                Err(error) => {
+                    debug!("SwiGLU config {:?} failed benchmarking: {}", candidate, error);
+                }
+            }
+        }
+
+        if best_time.is_finite() {
+            info!(
+                "Selected SwiGLU config: {:?} ({:.3} ms)",
+                best_config,
+                best_time * 1000.0
+            );
+        } else {
+            debug!(
+                "Falling back to heuristic SwiGLU config {:?} for device tier {:?}",
+                best_config,
+                props.device_tier
+            );
+        }
 
         // Update in-memory cache
         {
@@ -1626,58 +2057,153 @@ impl Tuner {
                 .swiglu_cache
                 .lock()
                 .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
-            cache.insert(key.clone(), config);
+            cache.insert(key.clone(), best_config);
         }
 
         // Write-through to disk
-        self.save_swiglu_to_disk(&key, &config);
+        self.save_swiglu_to_disk(&key, &best_config);
 
-        Ok(config)
+        Ok(best_config)
     }
 
     /// Select the best SwiGLU config using device-tier heuristics.
-    ///
-    /// Decision rationale:
-    /// - `threads_per_token`: Apple Silicon SIMD width is 32. We scale up by
-    ///   bandwidth tier so high-bandwidth devices can saturate more compute lanes
-    ///   per token without stalling on memory.
-    /// - `chunk_size`: Larger chunks improve arithmetic intensity but require
-    ///   more threadgroup memory. High-end devices have larger L2 caches.
-    fn select_swiglu_config(
+    fn heuristic_swiglu_config(
         &self,
-        context: &MetalContext,
-        _batch_size: usize,
+        device_tier: DeviceTier,
         intermediate_size: usize,
+        max_threads_per_threadgroup: u32,
     ) -> SwiGLUTunedConfig {
-        use crate::context::DeviceTier;
-
-        let props = context.properties();
-
         // For very small intermediate sizes, a smaller chunk avoids over-committing
         // threadgroup memory on any device tier.
         let small_intermediate = intermediate_size < 2048;
 
-        match props.device_tier {
-            DeviceTier::Ultra | DeviceTier::Max => {
-                // High-bandwidth: prefer wider threadgroups and larger chunks for
-                // better arithmetic intensity, unless intermediate_size is tiny.
-                SwiGLUTunedConfig {
-                    threads_per_token: 512,
-                    chunk_size: if small_intermediate { 2048 } else { 4096 },
-                }
-            }
-            DeviceTier::Pro => SwiGLUTunedConfig {
-                threads_per_token: 256,
-                chunk_size: if small_intermediate { 2048 } else { 4096 },
-            },
+        let threads_per_token = match device_tier {
+            DeviceTier::Ultra | DeviceTier::Max => 512,
+            DeviceTier::Pro => 256,
             DeviceTier::Base => {
-                // Base chips: moderate thread count for better occupancy.
-                SwiGLUTunedConfig {
-                    threads_per_token: if small_intermediate { 128 } else { 256 },
-                    chunk_size: if small_intermediate { 1024 } else { 2048 },
+                if small_intermediate {
+                    128
+                } else {
+                    256
                 }
             }
+        };
+
+        SwiGLUTunedConfig {
+            threads_per_token: sanitize_threads_per_token_candidate(
+                threads_per_token,
+                max_threads_per_threadgroup,
+            ),
+            chunk_size: match device_tier {
+                DeviceTier::Ultra | DeviceTier::Max => {
+                    if small_intermediate { 2048 } else { 4096 }
+                }
+                DeviceTier::Pro => {
+                    if small_intermediate { 2048 } else { 4096 }
+                }
+                DeviceTier::Base => {
+                    if small_intermediate { 1024 } else { 2048 }
+                }
+            },
         }
+    }
+
+    fn candidate_swiglu_configs(
+        &self,
+        device_tier: DeviceTier,
+        intermediate_size: usize,
+        max_threads_per_threadgroup: u32,
+    ) -> Vec<SwiGLUTunedConfig> {
+        let heuristic =
+            self.heuristic_swiglu_config(device_tier, intermediate_size, max_threads_per_threadgroup);
+        let mut candidates = vec![heuristic];
+
+        let thread_candidates: &[u32] = match device_tier {
+            DeviceTier::Base => &[128, 256],
+            DeviceTier::Pro => &[128, 256, 512],
+            DeviceTier::Max | DeviceTier::Ultra => &[256, 512, 1024],
+        };
+        for &threads in thread_candidates {
+            candidates.push(SwiGLUTunedConfig {
+                threads_per_token: sanitize_threads_per_token_candidate(
+                    threads,
+                    max_threads_per_threadgroup,
+                ),
+                chunk_size: heuristic.chunk_size,
+            });
+        }
+
+        let chunk_candidates: &[u32] = if intermediate_size < 2048 {
+            &[1024, 2048]
+        } else {
+            &[1024, 2048, 4096]
+        };
+        for &chunk_size in chunk_candidates {
+            candidates.push(SwiGLUTunedConfig {
+                threads_per_token: heuristic.threads_per_token,
+                chunk_size,
+            });
+        }
+
+        dedupe_swiglu_configs(candidates)
+    }
+
+    fn benchmark_swiglu(
+        &self,
+        context: &Arc<MetalContext>,
+        config: &FusedSwiGLUConfig,
+        candidate: SwiGLUTunedConfig,
+    ) -> Result<f64> {
+        let heuristic = self.heuristic_swiglu_config(
+            context.properties().device_tier,
+            config.intermediate_size,
+            context.properties().max_threads_per_threadgroup as u32,
+        );
+        let total_bytes = config
+            .batch_size
+            .checked_mul(config.hidden_size)
+            .and_then(|x| x.checked_add(config.intermediate_size.checked_mul(config.hidden_size)?))
+            .and_then(|x| x.checked_add(config.intermediate_size.checked_mul(config.hidden_size)?))
+            .and_then(|x| x.checked_add(config.hidden_size.checked_mul(config.intermediate_size)?))
+            .and_then(|x| x.checked_add(config.batch_size.checked_mul(config.hidden_size)?))
+            .and_then(|x| x.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| MetalError::InvalidConfig("SwiGLU benchmark size overflow".to_string()))?;
+        if total_bytes > 256 * 1024 * 1024 {
+            return Ok(if candidate == heuristic { 1.0 } else { 10.0 });
+        }
+
+        let input = MetalBuffer::<f32>::zeros(
+            context,
+            config.batch_size * config.hidden_size,
+            BufferUsage::Shared,
+        )?;
+        let gate_weight = MetalBuffer::<f32>::zeros(
+            context,
+            config.intermediate_size * config.hidden_size,
+            BufferUsage::Shared,
+        )?;
+        let up_weight = MetalBuffer::<f32>::zeros(
+            context,
+            config.intermediate_size * config.hidden_size,
+            BufferUsage::Shared,
+        )?;
+        let down_weight = MetalBuffer::<f32>::zeros(
+            context,
+            config.hidden_size * config.intermediate_size,
+            BufferUsage::Shared,
+        )?;
+
+        let kernel =
+            FusedMLP::new_with_tuned_config(Arc::clone(context), config.clone(), candidate)?;
+        kernel.forward(&input, &gate_weight, &up_weight, &down_weight)?;
+
+        let iterations = 3;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            kernel.forward(&input, &gate_weight, &up_weight, &down_weight)?;
+        }
+
+        Ok(start.elapsed().as_secs_f64() / iterations as f64)
     }
 
     // =========================================================================
@@ -1791,8 +2317,310 @@ impl Tuner {
         }
     }
 
+    /// Tune the fused linear cross-entropy kernel for the given problem shape.
+    ///
+    /// This benchmarks the real hidden-state kernel instead of relying only on
+    /// vocabulary heuristics, so the selected configuration reflects hidden
+    /// width, dtype, and device tier on M1-M4 as well as Apple10/M5.
+    pub fn tune_fused_linear_cross_entropy(
+        &self,
+        context: &Arc<MetalContext>,
+        config: &FusedLinearCrossEntropyConfig,
+    ) -> Result<CrossEntropyTunedConfig> {
+        let props = context.properties();
+        let key = format!(
+            "fused_linear_ce:{}:{}:{}:{}:{}:{}",
+            props.name,
+            device_tier_key(props.device_tier),
+            if config.use_fp16 { "f16" } else { "f32" },
+            config.num_tokens,
+            config.hidden_size,
+            config.vocab_size
+        );
+
+        {
+            let cache = self
+                .cross_entropy_cache
+                .lock()
+                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
+            if let Some(&cached) = cache.get(&key) {
+                return Ok(cached);
+            }
+        }
+
+        debug!(
+            "Selecting fused linear CE config for [T={}, H={}, V={}, dtype={}]",
+            config.num_tokens,
+            config.hidden_size,
+            config.vocab_size,
+            if config.use_fp16 { "f16" } else { "f32" }
+        );
+
+        let heuristic = self.heuristic_fused_linear_cross_entropy_config(
+            props.device_tier,
+            config.hidden_size,
+            config.vocab_size,
+            props.max_threads_per_threadgroup as u32,
+        );
+        let candidates = self.candidate_fused_linear_cross_entropy_configs(
+            props.device_tier,
+            config.hidden_size,
+            config.vocab_size,
+            props.max_threads_per_threadgroup as u32,
+        );
+        let mut best_config = heuristic;
+        let mut best_time = f64::INFINITY;
+
+        info!(
+            "Tuning fused linear CE config for [T={}, H={}, V={}, dtype={}]...",
+            config.num_tokens,
+            config.hidden_size,
+            config.vocab_size,
+            if config.use_fp16 { "f16" } else { "f32" }
+        );
+
+        for candidate in candidates {
+            match self.benchmark_fused_linear_cross_entropy(context, config, candidate) {
+                Ok(elapsed) => {
+                    debug!(
+                        "Fused linear CE config {:?} took {:.3} ms",
+                        candidate,
+                        elapsed * 1000.0
+                    );
+                    if elapsed < best_time {
+                        best_time = elapsed;
+                        best_config = candidate;
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        "Fused linear CE config {:?} failed benchmarking: {}",
+                        candidate,
+                        error
+                    );
+                }
+            }
+        }
+
+        if best_time.is_finite() {
+            info!(
+                "Selected fused linear CE config: {:?} ({:.3} ms)",
+                best_config,
+                best_time * 1000.0
+            );
+        } else {
+            debug!(
+                "Falling back to heuristic fused linear CE config {:?} for [H={}, V={}] on {:?}",
+                best_config,
+                config.hidden_size,
+                config.vocab_size,
+                props.device_tier
+            );
+        }
+
+        {
+            let mut cache = self
+                .cross_entropy_cache
+                .lock()
+                .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
+            cache.insert(key.clone(), best_config);
+        }
+
+        self.save_cross_entropy_to_disk(&key, &best_config);
+
+        Ok(best_config)
+    }
+
+    fn heuristic_fused_linear_cross_entropy_config(
+        &self,
+        device_tier: DeviceTier,
+        hidden_size: usize,
+        vocab_size: usize,
+        max_threads_per_threadgroup: u32,
+    ) -> CrossEntropyTunedConfig {
+        let threadgroup_size = match device_tier {
+            DeviceTier::Base => {
+                if vocab_size < 32_768 {
+                    128
+                } else if vocab_size < 131_072 {
+                    256
+                } else {
+                    512
+                }
+            }
+            DeviceTier::Pro | DeviceTier::Max | DeviceTier::Ultra => {
+                if vocab_size < 32_768 {
+                    256
+                } else if vocab_size < 131_072 {
+                    512
+                } else {
+                    1024
+                }
+            }
+        };
+
+        let chunk_size = match device_tier {
+            DeviceTier::Base => {
+                if hidden_size >= 4096 { 1024 } else { 2048 }
+            }
+            DeviceTier::Pro => {
+                if hidden_size >= 8192 { 2048 } else { 4096 }
+            }
+            DeviceTier::Max | DeviceTier::Ultra => {
+                if hidden_size >= 8192 { 4096 } else { 8192 }
+            }
+        };
+
+        CrossEntropyTunedConfig {
+            threadgroup_size: sanitize_threads_per_token_candidate(
+                threadgroup_size,
+                max_threads_per_threadgroup,
+            ),
+            chunk_size: chunk_size.min(vocab_size.max(1) as u32),
+        }
+    }
+
+    fn candidate_fused_linear_cross_entropy_configs(
+        &self,
+        device_tier: DeviceTier,
+        hidden_size: usize,
+        vocab_size: usize,
+        max_threads_per_threadgroup: u32,
+    ) -> Vec<CrossEntropyTunedConfig> {
+        let heuristic = self.heuristic_fused_linear_cross_entropy_config(
+            device_tier,
+            hidden_size,
+            vocab_size,
+            max_threads_per_threadgroup,
+        );
+        let mut configs = vec![heuristic];
+
+        let thread_candidates: &[u32] = match device_tier {
+            DeviceTier::Base => &[128, 256, 512],
+            DeviceTier::Pro => &[128, 256, 512, 1024],
+            DeviceTier::Max | DeviceTier::Ultra => &[256, 512, 1024],
+        };
+        for &threadgroup_size in thread_candidates {
+            configs.push(CrossEntropyTunedConfig {
+                threadgroup_size: sanitize_threads_per_token_candidate(
+                    threadgroup_size,
+                    max_threads_per_threadgroup,
+                ),
+                chunk_size: heuristic.chunk_size,
+            });
+        }
+
+        let chunk_candidates: &[u32] = &[1024, 2048, 4096, 8192];
+        for &chunk_size in chunk_candidates {
+            configs.push(CrossEntropyTunedConfig {
+                threadgroup_size: heuristic.threadgroup_size,
+                chunk_size: chunk_size.min(vocab_size.max(1) as u32),
+            });
+        }
+
+        dedupe_cross_entropy_configs(configs)
+    }
+
+    fn benchmark_fused_linear_cross_entropy(
+        &self,
+        context: &Arc<MetalContext>,
+        config: &FusedLinearCrossEntropyConfig,
+        candidate: CrossEntropyTunedConfig,
+    ) -> Result<f64> {
+        let heuristic = self.heuristic_fused_linear_cross_entropy_config(
+            context.properties().device_tier,
+            config.hidden_size,
+            config.vocab_size,
+            context.properties().max_threads_per_threadgroup as u32,
+        );
+
+        let dtype_size = if config.use_fp16 {
+            std::mem::size_of::<f16>()
+        } else {
+            std::mem::size_of::<f32>()
+        };
+        let total_bytes = config
+            .num_tokens
+            .checked_mul(config.hidden_size)
+            .and_then(|x| x.checked_add(config.vocab_size.checked_mul(config.hidden_size)?))
+            .and_then(|x| x.checked_mul(dtype_size))
+            .and_then(|x| {
+                x.checked_add(config.num_tokens.checked_mul(std::mem::size_of::<i32>())?)
+            })
+            .and_then(|x| {
+                x.checked_add(
+                    config
+                        .num_tokens
+                        .checked_mul(2 * std::mem::size_of::<f32>())?,
+                )
+            })
+            .ok_or_else(|| {
+                MetalError::InvalidConfig("Fused linear CE benchmark size overflow".to_string())
+            })?;
+        let benchmark_budget = match context.properties().device_tier {
+            DeviceTier::Base => 256 * 1024 * 1024,
+            DeviceTier::Pro => 384 * 1024 * 1024,
+            DeviceTier::Max | DeviceTier::Ultra => 512 * 1024 * 1024,
+        };
+        if total_bytes > benchmark_budget {
+            return Ok(if candidate == heuristic { 1.0 } else { 10.0 });
+        }
+
+        let kernel = FusedLinearCrossEntropy::new_with_tuned_config(
+            Arc::clone(context),
+            config.clone(),
+            candidate,
+        )?;
+        let targets = MetalBuffer::<i32>::zeros(context, config.num_tokens, BufferUsage::Shared)?;
+
+        if config.use_fp16 {
+            let hidden_states = MetalBuffer::<f16>::zeros(
+                context,
+                config.num_tokens * config.hidden_size,
+                BufferUsage::Shared,
+            )?;
+            let lm_head_weight = MetalBuffer::<f16>::zeros(
+                context,
+                config.vocab_size * config.hidden_size,
+                BufferUsage::Shared,
+            )?;
+
+            kernel.forward_f16(&hidden_states, &lm_head_weight, &targets)?;
+
+            let iterations = 3;
+            let start = Instant::now();
+            for _ in 0..iterations {
+                let output = kernel.forward_f16(&hidden_states, &lm_head_weight, &targets)?;
+                std::hint::black_box(output);
+            }
+            return Ok(start.elapsed().as_secs_f64() / iterations as f64);
+        }
+
+        let hidden_states = MetalBuffer::<f32>::zeros(
+            context,
+            config.num_tokens * config.hidden_size,
+            BufferUsage::Shared,
+        )?;
+        let lm_head_weight = MetalBuffer::<f32>::zeros(
+            context,
+            config.vocab_size * config.hidden_size,
+            BufferUsage::Shared,
+        )?;
+
+        kernel.forward(&hidden_states, &lm_head_weight, &targets)?;
+
+        let iterations = 3;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            let output = kernel.forward(&hidden_states, &lm_head_weight, &targets)?;
+            std::hint::black_box(output);
+        }
+
+        Ok(start.elapsed().as_secs_f64() / iterations as f64)
+    }
+
     // =========================================================================
-    // Norm+LoRA Fused Kernel Tuning (heuristic)
+    // Norm+LoRA Fused Kernel Tuning (benchmarked)
     // =========================================================================
 
     /// Tune the fused Layer-Norm + LoRA projection kernel.
@@ -1810,18 +2638,25 @@ impl Tuner {
     /// * `rank` - LoRA rank
     ///
     /// # Returns
-    /// Heuristically-selected optimal configuration for Norm+LoRA on this hardware.
+    /// Benchmarked optimal configuration for Norm+LoRA on this hardware, with
+    /// heuristic fallback for oversized problems.
     pub fn tune_norm_lora(
         &self,
-        context: &MetalContext,
+        context: &Arc<MetalContext>,
         batch_size: usize,
         hidden_size: usize,
         out_features: usize,
         rank: usize,
     ) -> Result<NormLoraTunedConfig> {
+        let props = context.properties();
         let key = format!(
-            "norm_lora:{}:{}:{}:{}",
-            batch_size, hidden_size, out_features, rank
+            "norm_lora:{}:{}:{}:{}:{}:{}",
+            props.name,
+            device_tier_key(props.device_tier),
+            batch_size,
+            hidden_size,
+            out_features,
+            rank
         );
 
         // Check in-memory cache
@@ -1840,14 +2675,62 @@ impl Tuner {
             batch_size, hidden_size, out_features, rank
         );
 
-        let config = self.select_norm_lora_config(context, out_features);
+        let heuristic = self.heuristic_norm_lora_config(
+            props.device_tier,
+            out_features,
+            props.max_threads_per_threadgroup as u32,
+        );
+        let candidates = self.candidate_norm_lora_configs(
+            props.device_tier,
+            out_features,
+            props.max_threads_per_threadgroup as u32,
+        );
+        let config = FusedNormLoraConfig::new(batch_size, hidden_size, out_features, rank, 16.0);
+        let mut best_config = heuristic;
+        let mut best_time = f64::INFINITY;
 
         info!(
-            "Selected Norm+LoRA config: {:?} (heuristic, out_features={}, device tier: {:?})",
-            config,
-            out_features,
-            context.properties().device_tier
+            "Tuning Norm+LoRA config for [B={}, H={}, O={}, R={}]...",
+            batch_size, hidden_size, out_features, rank
         );
+
+        for candidate in candidates {
+            match self.benchmark_norm_lora(context, &config, candidate) {
+                Ok(elapsed) => {
+                    debug!(
+                        "Norm+LoRA config {:?} took {:.3} ms",
+                        candidate,
+                        elapsed * 1000.0
+                    );
+                    if elapsed < best_time {
+                        best_time = elapsed;
+                        best_config = candidate;
+                    }
+                }
+                Err(error) => {
+                    debug!(
+                        "Norm+LoRA config {:?} failed benchmarking: {}",
+                        candidate,
+                        error
+                    );
+                }
+            }
+        }
+
+        if best_time.is_finite() {
+            info!(
+                "Selected Norm+LoRA config: {:?} ({:.3} ms)",
+                best_config,
+                best_time * 1000.0
+            );
+        } else {
+            debug!(
+                "Falling back to heuristic Norm+LoRA config {:?} for out_features={} on {:?}",
+                best_config,
+                out_features,
+                props.device_tier
+            );
+        }
 
         // Update in-memory cache
         {
@@ -1855,45 +2738,137 @@ impl Tuner {
                 .norm_lora_cache
                 .lock()
                 .map_err(|e| MetalError::Internal(format!("Mutex poisoned: {}", e)))?;
-            cache.insert(key.clone(), config);
+            cache.insert(key.clone(), best_config);
         }
 
         // Write-through to disk
-        self.save_norm_lora_to_disk(&key, &config);
+        self.save_norm_lora_to_disk(&key, &best_config);
 
-        Ok(config)
+        Ok(best_config)
     }
 
     /// Select the best Norm+LoRA config using heuristics.
-    ///
-    /// Decision rationale:
-    /// - `use_tiled`: Tiling shared memory pays off when `out_features > 256`.
-    ///   Below that threshold the overhead of loading data into threadgroup
-    ///   memory exceeds the bandwidth savings.
-    /// - `threads_per_token`: Scales with device tier. The norm reduction over
-    ///   `hidden_size` is the bottleneck; more threads reduce the serial portion.
-    fn select_norm_lora_config(
+    fn heuristic_norm_lora_config(
         &self,
-        context: &MetalContext,
+        device_tier: DeviceTier,
         out_features: usize,
+        max_threads_per_threadgroup: u32,
     ) -> NormLoraTunedConfig {
-        use crate::context::DeviceTier;
-
-        let props = context.properties();
-
         // Tiled path is profitable when out_features is wide enough.
         let use_tiled = out_features > 256;
 
-        let threads_per_token = match props.device_tier {
+        let threads_per_token = match device_tier {
             DeviceTier::Ultra | DeviceTier::Max => 512,
             DeviceTier::Pro => 256,
             DeviceTier::Base => 128,
         };
 
         NormLoraTunedConfig {
-            threads_per_token,
+            threads_per_token: sanitize_threads_per_token_candidate(
+                threads_per_token,
+                max_threads_per_threadgroup,
+            ),
             use_tiled,
         }
+    }
+
+    fn candidate_norm_lora_configs(
+        &self,
+        device_tier: DeviceTier,
+        out_features: usize,
+        max_threads_per_threadgroup: u32,
+    ) -> Vec<NormLoraTunedConfig> {
+        let heuristic =
+            self.heuristic_norm_lora_config(device_tier, out_features, max_threads_per_threadgroup);
+        let mut configs = vec![heuristic];
+
+        let thread_candidates: &[u32] = match device_tier {
+            DeviceTier::Base => &[128, 256],
+            DeviceTier::Pro => &[128, 256, 512],
+            DeviceTier::Max | DeviceTier::Ultra => &[256, 512, 1024],
+        };
+        for &threads in thread_candidates {
+            configs.push(NormLoraTunedConfig {
+                threads_per_token: sanitize_threads_per_token_candidate(
+                    threads,
+                    max_threads_per_threadgroup,
+                ),
+                use_tiled: heuristic.use_tiled,
+            });
+        }
+
+        configs.push(NormLoraTunedConfig {
+            threads_per_token: heuristic.threads_per_token,
+            use_tiled: false,
+        });
+        configs.push(NormLoraTunedConfig {
+            threads_per_token: heuristic.threads_per_token,
+            use_tiled: true,
+        });
+
+        dedupe_norm_lora_configs(configs)
+    }
+
+    fn benchmark_norm_lora(
+        &self,
+        context: &Arc<MetalContext>,
+        config: &FusedNormLoraConfig,
+        candidate: NormLoraTunedConfig,
+    ) -> Result<f64> {
+        let heuristic = self.heuristic_norm_lora_config(
+            context.properties().device_tier,
+            config.out_features,
+            context.properties().max_threads_per_threadgroup as u32,
+        );
+        let total_bytes = config
+            .batch_size
+            .checked_mul(config.hidden_size)
+            .and_then(|x| x.checked_add(config.hidden_size))
+            .and_then(|x| x.checked_add(config.out_features.checked_mul(config.hidden_size)?))
+            .and_then(|x| x.checked_add(config.lora_rank.checked_mul(config.hidden_size)?))
+            .and_then(|x| x.checked_add(config.out_features.checked_mul(config.lora_rank)?))
+            .and_then(|x| x.checked_add(config.batch_size.checked_mul(config.out_features)?))
+            .and_then(|x| x.checked_mul(std::mem::size_of::<f32>()))
+            .ok_or_else(|| {
+                MetalError::InvalidConfig("Norm+LoRA benchmark size overflow".to_string())
+            })?;
+        if total_bytes > 256 * 1024 * 1024 {
+            return Ok(if candidate == heuristic { 1.0 } else { 10.0 });
+        }
+
+        let input = MetalBuffer::<f32>::zeros(
+            context,
+            config.batch_size * config.hidden_size,
+            BufferUsage::Shared,
+        )?;
+        let gamma = MetalBuffer::<f32>::zeros(context, config.hidden_size, BufferUsage::Shared)?;
+        let weight = MetalBuffer::<f32>::zeros(
+            context,
+            config.out_features * config.hidden_size,
+            BufferUsage::Shared,
+        )?;
+        let lora_a = MetalBuffer::<f32>::zeros(
+            context,
+            config.lora_rank * config.hidden_size,
+            BufferUsage::Shared,
+        )?;
+        let lora_b = MetalBuffer::<f32>::zeros(
+            context,
+            config.out_features * config.lora_rank,
+            BufferUsage::Shared,
+        )?;
+
+        let kernel =
+            FusedNormLora::new_with_tuned_config(Arc::clone(context), config.clone(), candidate)?;
+        kernel.forward(&input, &gamma, &weight, &lora_a, &lora_b)?;
+
+        let iterations = 3;
+        let start = Instant::now();
+        for _ in 0..iterations {
+            kernel.forward(&input, &gamma, &weight, &lora_a, &lora_b)?;
+        }
+
+        Ok(start.elapsed().as_secs_f64() / iterations as f64)
     }
 }
 
@@ -1904,6 +2879,7 @@ impl Tuner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     // -------------------------------------------------------------------------
     // Struct defaults
@@ -1953,6 +2929,13 @@ mod tests {
         assert!(c.use_morton);
     }
 
+    #[test]
+    fn flash_attention_tuned_config_default() {
+        let c = FlashAttentionTunedConfig::default();
+        assert_eq!(c.block_q, 32);
+        assert_eq!(c.block_k, 32);
+    }
+
     // -------------------------------------------------------------------------
     // Serde round-trips
     // -------------------------------------------------------------------------
@@ -1988,6 +2971,17 @@ mod tests {
         };
         let json = serde_json::to_string(&config).unwrap();
         let decoded: CrossEntropyTunedConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(config, decoded);
+    }
+
+    #[test]
+    fn flash_attention_tuned_config_serde_roundtrip() {
+        let config = FlashAttentionTunedConfig {
+            block_q: 64,
+            block_k: 32,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let decoded: FlashAttentionTunedConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, decoded);
     }
 
@@ -2073,6 +3067,7 @@ mod tests {
             merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
+            flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
             cache_dir: Some(cache_path.clone()),
@@ -2117,6 +3112,7 @@ mod tests {
             merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
+            flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
             cache_dir: Some(cache_path),
@@ -2137,6 +3133,7 @@ mod tests {
             merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
+            flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
             cache_dir: Some(cache_path.clone()),
@@ -2177,6 +3174,7 @@ mod tests {
             merge_cache: Mutex::new(HashMap::new()),
             swiglu_cache: Mutex::new(HashMap::new()),
             cross_entropy_cache: Mutex::new(HashMap::new()),
+            flash_attention_cache: Mutex::new(HashMap::new()),
             norm_lora_cache: Mutex::new(HashMap::new()),
             mpp_gemm_cache: Mutex::new(HashMap::new()),
             cache_dir: Some(cache_path),
@@ -2185,6 +3183,143 @@ mod tests {
 
         let guard = tuner.mpp_gemm_cache.lock().unwrap();
         assert_eq!(guard.get(key), Some(&config));
+    }
+
+    #[test]
+    fn flash_attention_disk_cache_write_read_roundtrip() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
+
+        let tuner = Tuner {
+            cache: Mutex::new(HashMap::new()),
+            merge_cache: Mutex::new(HashMap::new()),
+            swiglu_cache: Mutex::new(HashMap::new()),
+            cross_entropy_cache: Mutex::new(HashMap::new()),
+            flash_attention_cache: Mutex::new(HashMap::new()),
+            norm_lora_cache: Mutex::new(HashMap::new()),
+            mpp_gemm_cache: Mutex::new(HashMap::new()),
+            cache_dir: Some(cache_path.clone()),
+        };
+
+        let key = "flash_attention:Apple M4 Max:max:1:32:8:1:2048:128:causal:full:plain:infer";
+        let config = FlashAttentionTunedConfig {
+            block_q: 64,
+            block_k: 32,
+        };
+        tuner.save_flash_attention_to_disk(key, &config);
+
+        let json_path = cache_path.join("flash_attention.json");
+        assert!(
+            json_path.exists(),
+            "flash_attention.json should have been created"
+        );
+
+        let contents = fs::read_to_string(&json_path).unwrap();
+        let map: HashMap<String, FlashAttentionTunedConfig> =
+            serde_json::from_str(&contents).unwrap();
+        assert_eq!(map.get(key), Some(&config));
+    }
+
+    #[test]
+    fn flash_attention_disk_cache_load_populates_in_memory() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
+        fs::create_dir_all(&cache_path).unwrap();
+
+        let key = "flash_attention:Apple M5 Pro:pro:1:32:8:64:2048:128:causal:full:plain:infer";
+        let config = FlashAttentionTunedConfig {
+            block_q: 32,
+            block_k: 32,
+        };
+        let map: HashMap<&str, FlashAttentionTunedConfig> = [(key, config)].into_iter().collect();
+        let json = serde_json::to_string_pretty(&map).unwrap();
+        fs::write(cache_path.join("flash_attention.json"), &json).unwrap();
+
+        let mut tuner = Tuner {
+            cache: Mutex::new(HashMap::new()),
+            merge_cache: Mutex::new(HashMap::new()),
+            swiglu_cache: Mutex::new(HashMap::new()),
+            cross_entropy_cache: Mutex::new(HashMap::new()),
+            flash_attention_cache: Mutex::new(HashMap::new()),
+            norm_lora_cache: Mutex::new(HashMap::new()),
+            mpp_gemm_cache: Mutex::new(HashMap::new()),
+            cache_dir: Some(cache_path),
+        };
+        tuner.load_disk_cache();
+
+        let guard = tuner.flash_attention_cache.lock().unwrap();
+        assert_eq!(guard.get(key), Some(&config));
+    }
+
+    #[test]
+    fn flash_attention_heuristic_tracks_head_dim_and_tier() {
+        let tuner = Tuner::new();
+        assert_eq!(
+            tuner.heuristic_flash_attention_config(64, DeviceTier::Base),
+            FlashAttentionTunedConfig {
+                block_q: 64,
+                block_k: 32,
+            }
+        );
+        assert_eq!(
+            tuner.heuristic_flash_attention_config(128, DeviceTier::Pro),
+            FlashAttentionTunedConfig {
+                block_q: 32,
+                block_k: 32,
+            }
+        );
+        assert_eq!(
+            tuner.heuristic_flash_attention_config(128, DeviceTier::Ultra),
+            FlashAttentionTunedConfig {
+                block_q: 64,
+                block_k: 32,
+            }
+        );
+        assert_eq!(
+            tuner.heuristic_flash_attention_config(256, DeviceTier::Max),
+            FlashAttentionTunedConfig {
+                block_q: 32,
+                block_k: 16,
+            }
+        );
+    }
+
+    #[test]
+    fn flash_attention_candidates_cover_supported_configs_without_duplicates() {
+        let tuner = Tuner::new();
+        let candidates = tuner.candidate_flash_attention_configs(128, DeviceTier::Max);
+        assert_eq!(
+            candidates,
+            vec![
+                FlashAttentionTunedConfig {
+                    block_q: 64,
+                    block_k: 32,
+                },
+                FlashAttentionTunedConfig {
+                    block_q: 32,
+                    block_k: 32,
+                },
+            ]
+        );
+
+        let candidates = tuner.candidate_flash_attention_configs(64, DeviceTier::Base);
+        assert_eq!(
+            candidates,
+            vec![
+                FlashAttentionTunedConfig {
+                    block_q: 64,
+                    block_k: 32,
+                },
+                FlashAttentionTunedConfig {
+                    block_q: 64,
+                    block_k: 64,
+                },
+                FlashAttentionTunedConfig {
+                    block_q: 32,
+                    block_k: 32,
+                },
+            ]
+        );
     }
 
     #[test]
@@ -2331,42 +3466,55 @@ mod tests {
     }
 
     // -------------------------------------------------------------------------
-    // Heuristic selection sanity checks (no Metal device needed)
+    // Standard-Metal tuning sanity checks
     // -------------------------------------------------------------------------
 
-    // The heuristic methods need a `MetalContext`, which requires a real GPU.
-    // We test the pure-logic paths below by constructing synthetic properties
-    // and calling the internal selection helpers via a wrapper that exposes them
-    // for test use only. Because the selection functions are private we exercise
-    // them through the public tuning API (which requires a Metal device).
-    //
-    // The tests below instead verify the public surface: tune_* methods with a
-    // real context are exercised in the metal integration tests. Here we check
-    // that the heuristic functions produce sensible values by directly matching
-    // expected output against known device tier inputs using the integration
-    // with the global Metal context (only run when Metal is available).
-
-    /// Verify use_tiled=true when out_features > 256.
     #[test]
-    #[cfg(target_os = "macos")]
-    fn norm_lora_use_tiled_threshold() {
-        let ctx = MetalContext::new().expect("Metal required");
+    fn norm_lora_heuristic_tracks_out_features_and_tier() {
         let tuner = Tuner::new();
-
-        // out_features = 128 -> use_tiled should be false
-        let c_small = tuner
-            .tune_norm_lora(&ctx, 1, 512, 128, 8)
-            .expect("tune_norm_lora small");
-        assert!(
-            !c_small.use_tiled,
-            "Small out_features should not use tiled"
+        assert_eq!(
+            tuner.heuristic_norm_lora_config(DeviceTier::Base, 128, 1024),
+            NormLoraTunedConfig {
+                threads_per_token: 128,
+                use_tiled: false,
+            }
         );
+        assert_eq!(
+            tuner.heuristic_norm_lora_config(DeviceTier::Pro, 512, 1024),
+            NormLoraTunedConfig {
+                threads_per_token: 256,
+                use_tiled: true,
+            }
+        );
+        assert_eq!(
+            tuner.heuristic_norm_lora_config(DeviceTier::Max, 1024, 1024),
+            NormLoraTunedConfig {
+                threads_per_token: 512,
+                use_tiled: true,
+            }
+        );
+    }
 
-        // out_features = 512 -> use_tiled should be true
-        let c_large = tuner
-            .tune_norm_lora(&ctx, 1, 512, 512, 8)
-            .expect("tune_norm_lora large");
-        assert!(c_large.use_tiled, "Large out_features should use tiled");
+    #[test]
+    fn norm_lora_candidates_cover_thread_and_tiled_options() {
+        let tuner = Tuner::new();
+        let candidates = tuner.candidate_norm_lora_configs(DeviceTier::Pro, 512, 1024);
+        assert!(candidates.contains(&NormLoraTunedConfig {
+            threads_per_token: 256,
+            use_tiled: true,
+        }));
+        assert!(candidates.contains(&NormLoraTunedConfig {
+            threads_per_token: 256,
+            use_tiled: false,
+        }));
+        assert!(candidates.contains(&NormLoraTunedConfig {
+            threads_per_token: 128,
+            use_tiled: true,
+        }));
+        assert!(candidates.contains(&NormLoraTunedConfig {
+            threads_per_token: 512,
+            use_tiled: true,
+        }));
     }
 
     /// Verify threadgroup_size scales with vocab_size.
@@ -2389,22 +3537,119 @@ mod tests {
         );
     }
 
-    /// Verify SwiGLU chunk_size is smaller for small intermediate_size.
     #[test]
-    #[cfg(target_os = "macos")]
-    fn swiglu_chunk_size_adapts_to_size() {
-        let ctx = MetalContext::new().expect("Metal required");
+    fn fused_linear_cross_entropy_heuristic_tracks_tier_and_shape() {
         let tuner = Tuner::new();
-
-        // intermediate_size = 512 -> small path
-        let c_small = tuner.tune_swiglu(&ctx, 1, 512, 512).expect("swiglu small");
-        // intermediate_size = 8192 -> large path
-        let c_large = tuner.tune_swiglu(&ctx, 1, 512, 8192).expect("swiglu large");
-
-        assert!(
-            c_large.chunk_size >= c_small.chunk_size,
-            "Larger intermediate_size should have >= chunk_size"
+        assert_eq!(
+            tuner.heuristic_fused_linear_cross_entropy_config(DeviceTier::Base, 2048, 16_384, 1024),
+            CrossEntropyTunedConfig {
+                threadgroup_size: 128,
+                chunk_size: 2048,
+            }
         );
+        assert_eq!(
+            tuner.heuristic_fused_linear_cross_entropy_config(
+                DeviceTier::Base,
+                4096,
+                200_000,
+                1024,
+            ),
+            CrossEntropyTunedConfig {
+                threadgroup_size: 512,
+                chunk_size: 1024,
+            }
+        );
+        assert_eq!(
+            tuner.heuristic_fused_linear_cross_entropy_config(
+                DeviceTier::Max,
+                2048,
+                200_000,
+                1024,
+            ),
+            CrossEntropyTunedConfig {
+                threadgroup_size: 1024,
+                chunk_size: 8192,
+            }
+        );
+    }
+
+    #[test]
+    fn fused_linear_cross_entropy_candidates_cover_thread_and_chunk_options() {
+        let tuner = Tuner::new();
+        let candidates = tuner.candidate_fused_linear_cross_entropy_configs(
+            DeviceTier::Pro,
+            4096,
+            200_000,
+            1024,
+        );
+        assert!(candidates.contains(&CrossEntropyTunedConfig {
+            threadgroup_size: 512,
+            chunk_size: 4096,
+        }));
+        assert!(candidates.contains(&CrossEntropyTunedConfig {
+            threadgroup_size: 128,
+            chunk_size: 4096,
+        }));
+        assert!(candidates.contains(&CrossEntropyTunedConfig {
+            threadgroup_size: 1024,
+            chunk_size: 4096,
+        }));
+        assert!(candidates.contains(&CrossEntropyTunedConfig {
+            threadgroup_size: 1024,
+            chunk_size: 1024,
+        }));
+        assert!(candidates.contains(&CrossEntropyTunedConfig {
+            threadgroup_size: 1024,
+            chunk_size: 8192,
+        }));
+    }
+
+    #[test]
+    fn swiglu_heuristic_tracks_size_and_tier() {
+        let tuner = Tuner::new();
+        assert_eq!(
+            tuner.heuristic_swiglu_config(DeviceTier::Base, 512, 1024),
+            SwiGLUTunedConfig {
+                threads_per_token: 128,
+                chunk_size: 1024,
+            }
+        );
+        assert_eq!(
+            tuner.heuristic_swiglu_config(DeviceTier::Base, 8192, 1024),
+            SwiGLUTunedConfig {
+                threads_per_token: 256,
+                chunk_size: 2048,
+            }
+        );
+        assert_eq!(
+            tuner.heuristic_swiglu_config(DeviceTier::Max, 8192, 1024),
+            SwiGLUTunedConfig {
+                threads_per_token: 512,
+                chunk_size: 4096,
+            }
+        );
+    }
+
+    #[test]
+    fn swiglu_candidates_cover_thread_and_chunk_options() {
+        let tuner = Tuner::new();
+        let candidates = tuner.candidate_swiglu_configs(DeviceTier::Pro, 8192, 1024);
+        assert!(candidates.contains(&SwiGLUTunedConfig {
+            threads_per_token: 256,
+            chunk_size: 4096,
+        }));
+        assert!(candidates.contains(&SwiGLUTunedConfig {
+            threads_per_token: 128,
+            chunk_size: 4096,
+        }));
+        assert!(candidates.contains(&SwiGLUTunedConfig {
+            threads_per_token: 512,
+            chunk_size: 4096,
+        }));
+        assert!(candidates.contains(&SwiGLUTunedConfig {
+            threads_per_token: 256,
+            chunk_size: 2048,
+        }));
     }
 
     /// Verify in-memory caching avoids re-computation (second call returns
@@ -2412,11 +3657,69 @@ mod tests {
     #[test]
     #[cfg(target_os = "macos")]
     fn swiglu_cache_hit_on_second_call() {
-        let ctx = MetalContext::new().expect("Metal required");
+        let ctx = Arc::new(MetalContext::new().expect("Metal required"));
         let tuner = Tuner::new();
 
         let first = tuner.tune_swiglu(&ctx, 4, 2048, 8192).unwrap();
         let second = tuner.tune_swiglu(&ctx, 4, 2048, 8192).unwrap();
         assert_eq!(first, second);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn norm_lora_cache_hit_on_second_call() {
+        let ctx = Arc::new(MetalContext::new().expect("Metal required"));
+        let tuner = Tuner::new();
+
+        let first = tuner.tune_norm_lora(&ctx, 4, 2048, 2048, 16).unwrap();
+        let second = tuner.tune_norm_lora(&ctx, 4, 2048, 2048, 16).unwrap();
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fused_linear_cross_entropy_cache_hit_on_second_call() {
+        let ctx = Arc::new(MetalContext::new().expect("Metal required"));
+        let tuner = Tuner::new();
+        let config = FusedLinearCrossEntropyConfig::new(64, 512, 8_192).with_fp16();
+
+        let first = tuner
+            .tune_fused_linear_cross_entropy(&ctx, &config)
+            .expect("first fused linear CE tune");
+        let second = tuner
+            .tune_fused_linear_cross_entropy(&ctx, &config)
+            .expect("second fused linear CE tune");
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn fused_linear_cross_entropy_tuning_keys_include_dtype_and_hidden_size() {
+        let ctx = Arc::new(MetalContext::new().expect("Metal required"));
+        let tuner = Tuner::new();
+        let fp16 = FusedLinearCrossEntropyConfig::new(32, 512, 8_192).with_fp16();
+        let fp32 = FusedLinearCrossEntropyConfig::new(32, 512, 8_192);
+        let wider = FusedLinearCrossEntropyConfig::new(32, 1024, 8_192).with_fp16();
+
+        tuner
+            .tune_fused_linear_cross_entropy(&ctx, &fp16)
+            .expect("fp16 tune");
+        tuner
+            .tune_fused_linear_cross_entropy(&ctx, &fp32)
+            .expect("fp32 tune");
+        tuner
+            .tune_fused_linear_cross_entropy(&ctx, &wider)
+            .expect("wider tune");
+
+        let cache = tuner.cross_entropy_cache.lock().expect("cross_entropy cache");
+        let fused_entries = cache
+            .keys()
+            .filter(|key| key.starts_with("fused_linear_ce:"))
+            .count();
+        assert!(
+            fused_entries >= 3,
+            "expected distinct fused linear CE entries for dtype/shape, found {fused_entries}"
+        );
     }
 }
