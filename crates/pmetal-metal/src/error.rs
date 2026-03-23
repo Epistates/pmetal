@@ -95,6 +95,10 @@ pub enum MetalError {
     #[cfg(feature = "ane")]
     AneEvalFailed(String),
 
+    /// ANE chaining request preparation failed.
+    #[cfg(feature = "ane")]
+    AneChainingFailed(String),
+
     /// IOSurface creation failed.
     #[cfg(feature = "ane")]
     IoSurfaceCreation {
@@ -197,6 +201,10 @@ impl fmt::Display for MetalError {
             #[cfg(feature = "ane")]
             MetalError::AneEvalFailed(msg) => {
                 write!(f, "ANE evaluation failed: {}", msg)
+            }
+            #[cfg(feature = "ane")]
+            MetalError::AneChainingFailed(msg) => {
+                write!(f, "ANE chaining failed: {}", msg)
             }
             #[cfg(feature = "ane")]
             MetalError::IoSurfaceCreation { size, reason } => {

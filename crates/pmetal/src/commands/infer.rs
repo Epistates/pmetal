@@ -33,6 +33,7 @@ pub(crate) async fn run_inference(
     tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
     ane: bool,
     ane_max_seq_len: usize,
+    ane_real_time: bool,
     benchmark: bool,
     benchmark_iters: usize,
     kv_quant: u8,
@@ -124,7 +125,8 @@ pub(crate) async fn run_inference(
 
     // Extract refs for generation dispatch (split borrow)
     let input_ids = runner.state.input_ids().to_vec();
-    let gen_config = runner.state.gen_config().clone();
+    let mut gen_config = runner.state.gen_config().clone();
+    gen_config.ane_real_time = ane_real_time;
 
     // ── Generation dispatch ────────────────────────────────────────────────
     let start = std::time::Instant::now();

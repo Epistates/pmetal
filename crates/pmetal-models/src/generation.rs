@@ -112,6 +112,7 @@ fn with_cached_ane_engine<R>(
             config.top_k,
             config.max_tokens,
             config.eos_token_id,
+            config.real_time_eval,
         );
         f(engine)
     })
@@ -399,6 +400,8 @@ pub struct GenerationConfig {
     pub seed: Option<u64>,
     /// Whether to use greedy decoding (ignores temperature, top_k, top_p, min_p).
     pub do_sample: bool,
+    /// Use the experimental ANE real-time evaluation path when ANE generation is selected.
+    pub ane_real_time: bool,
 }
 
 impl Default for GenerationConfig {
@@ -415,6 +418,7 @@ impl Default for GenerationConfig {
             stop_tokens: vec![],
             seed: None,
             do_sample: true,
+            ane_real_time: false,
         }
     }
 }
@@ -463,6 +467,7 @@ impl GenerationConfig {
             stop_tokens: vec![],
             seed: None,
             do_sample: true,
+            ane_real_time: false,
         }
     }
 
@@ -482,6 +487,7 @@ impl GenerationConfig {
             stop_tokens: vec![],
             seed: None,
             do_sample: true,
+            ane_real_time: false,
         }
     }
 
@@ -501,6 +507,7 @@ impl GenerationConfig {
             stop_tokens: vec![],
             seed: None,
             do_sample: true,
+            ane_real_time: false,
         }
     }
 
@@ -518,6 +525,7 @@ impl GenerationConfig {
             stop_tokens: vec![],
             seed: None,
             do_sample: true,
+            ane_real_time: false,
         }
     }
 
@@ -649,6 +657,12 @@ impl GenerationConfig {
     /// Set random seed.
     pub fn with_seed(mut self, seed: u64) -> Self {
         self.seed = Some(seed);
+        self
+    }
+
+    /// Enable or disable the experimental ANE real-time evaluation path.
+    pub fn with_ane_real_time(mut self, enabled: bool) -> Self {
+        self.ane_real_time = enabled;
         self
     }
 
@@ -2330,9 +2344,21 @@ fn build_ane_inference_config(
     pmetal_metal::ane::inference::AneInferenceConfig,
     pmetal_metal::error::MetalError,
 > {
-    use pmetal_metal::ane::inference::AneInferenceConfig;
-
     let config_json = load_model_config_json(model_path)?;
+    build_ane_inference_config_from_json(&config_json, input_ids, gen_config, ane_max_seq_len)
+}
+
+#[cfg(feature = "ane")]
+fn build_ane_inference_config_from_json(
+    config_json: &serde_json::Value,
+    input_ids: &[u32],
+    gen_config: &GenerationConfig,
+    ane_max_seq_len: usize,
+) -> std::result::Result<
+    pmetal_metal::ane::inference::AneInferenceConfig,
+    pmetal_metal::error::MetalError,
+> {
+    use pmetal_metal::ane::inference::AneInferenceConfig;
 
     let get_usize = |key: &str| -> std::result::Result<usize, pmetal_metal::error::MetalError> {
         config_json
@@ -2384,6 +2410,7 @@ fn build_ane_inference_config(
         temperature: gen_config.temperature,
         top_k: gen_config.top_k,
         max_tokens: gen_config.max_new_tokens,
+        real_time_eval: gen_config.ane_real_time,
         eos_token_id: gen_config.stop_tokens.first().copied(),
         rope_theta,
         rms_norm_eps,
@@ -2645,6 +2672,7 @@ mod tests {
         assert_eq!(config.frequency_penalty, 0.0);
         assert_eq!(config.presence_penalty, 0.0);
         assert!(config.do_sample);
+        assert!(!config.ane_real_time);
     }
 
     #[test]
@@ -2862,5 +2890,25 @@ mod tests {
             "num_local_experts": 0
         });
         assert!(is_ane_inference_compatible(&hybrid).is_err());
+    }
+
+    #[cfg(feature = "ane")]
+    #[test]
+    fn test_build_ane_inference_config_propagates_real_time_flag() {
+        let config_json = serde_json::json!({
+            "hidden_size": 1024,
+            "intermediate_size": 4096,
+            "num_attention_heads": 16,
+            "num_hidden_layers": 24,
+            "vocab_size": 32000
+        });
+        let gen_config = GenerationConfig::greedy(32).with_ane_real_time(true);
+        let ane_config =
+            build_ane_inference_config_from_json(&config_json, &[1, 2, 3], &gen_config, 512)
+                .unwrap();
+
+        assert!(ane_config.real_time_eval);
+        assert_eq!(ane_config.max_ane_seq_len, 512);
+        assert_eq!(ane_config.max_seq_len, 3 + 32 + 64);
     }
 }

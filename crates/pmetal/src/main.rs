@@ -438,6 +438,11 @@ enum Commands {
         #[arg(long, default_value = "1024")]
         ane_max_seq_len: usize,
 
+        /// Use the experimental ANE real-time evaluation path when ANE inference is selected.
+        #[cfg(feature = "ane")]
+        #[arg(long)]
+        ane_real_time: bool,
+
         /// Run benchmark mode: measure prefill + decode performance.
         /// Outputs per-token timing, tok/s, and memory metrics.
         #[arg(long)]
@@ -530,6 +535,21 @@ enum Commands {
         /// Sequence length
         #[arg(short, long, default_value = "512")]
         seq_len: usize,
+    },
+
+    /// Run a structured kernel benchmark corpus for this device tier
+    BenchCorpus {
+        /// Use a shorter run with fewer iterations and smaller tier-scaled shapes
+        #[arg(long)]
+        quick: bool,
+
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Optional output path for the JSON report
+        #[arg(short, long)]
+        output: Option<String>,
     },
 
     /// Generate a sample configuration file
@@ -1052,6 +1072,11 @@ enum Commands {
         #[cfg(feature = "ane")]
         #[arg(long, default_value = "1024")]
         ane_max_seq_len: usize,
+
+        /// Use the experimental ANE real-time evaluation path when ANE serving is selected.
+        #[cfg(feature = "ane")]
+        #[arg(long)]
+        ane_real_time: bool,
     },
 
     /// Dataset utilities for preparing and analyzing training data
@@ -2215,6 +2240,8 @@ async fn tokio_main() -> anyhow::Result<()> {
             no_ane,
             #[cfg(feature = "ane")]
             ane_max_seq_len,
+            #[cfg(feature = "ane")]
+            ane_real_time,
         } => {
             #[cfg(feature = "ane")]
             let ane_enabled = !no_ane;
@@ -2225,6 +2252,10 @@ async fn tokio_main() -> anyhow::Result<()> {
             let serve_ane_max_seq_len = ane_max_seq_len;
             #[cfg(not(feature = "ane"))]
             let serve_ane_max_seq_len = 1024;
+            #[cfg(feature = "ane")]
+            let serve_ane_real_time = ane_real_time;
+            #[cfg(not(feature = "ane"))]
+            let serve_ane_real_time = false;
 
             commands::serve::run_serve(
                 model,
@@ -2235,6 +2266,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 experts_dir,
                 ane_enabled,
                 serve_ane_max_seq_len,
+                serve_ane_real_time,
             )
             .await?;
         }
@@ -2267,6 +2299,8 @@ async fn tokio_main() -> anyhow::Result<()> {
             no_ane,
             #[cfg(feature = "ane")]
             ane_max_seq_len,
+            #[cfg(feature = "ane")]
+            ane_real_time,
             benchmark,
             benchmark_iters,
             kv_quant,
@@ -2320,6 +2354,10 @@ async fn tokio_main() -> anyhow::Result<()> {
                 ane_max_seq_len,
                 #[cfg(not(feature = "ane"))]
                 1024,
+                #[cfg(feature = "ane")]
+                ane_real_time,
+                #[cfg(not(feature = "ane"))]
+                false,
                 benchmark,
                 benchmark_iters,
                 kv_quant,
@@ -2394,6 +2432,22 @@ async fn tokio_main() -> anyhow::Result<()> {
             seq_len,
         } => {
             commands::bench::run_benchmark(&model, batch_size, seq_len).await?;
+        }
+
+        Commands::BenchCorpus {
+            quick,
+            json,
+            output,
+        } => {
+            let validated_output = output
+                .as_deref()
+                .map(|path| validate_output_path(path, "benchmark corpus output"))
+                .transpose()?;
+            commands::bench::run_kernel_benchmark_corpus(
+                quick,
+                validated_output.as_deref(),
+                json,
+            )?;
         }
 
         Commands::Init { output } => {

@@ -80,6 +80,65 @@ struct BackendState {
     preferred: PreferredGenerationBackend,
 }
 
+fn build_generation_config_from_parts(
+    stop_token_ids: &[u32],
+    max_seq_len: usize,
+    ane_real_time: bool,
+    params: &SamplingParams,
+) -> GenerationConfig {
+    let temperature = params.temperature;
+    let do_sample = temperature > 0.0;
+
+    let max_tokens = params.max_tokens.min(max_seq_len);
+
+    let mut stop_tokens = stop_token_ids.to_vec();
+    stop_tokens.extend_from_slice(&params.extra_stop_token_ids);
+    stop_tokens.sort_unstable();
+    stop_tokens.dedup();
+
+    let mut config = if do_sample {
+        GenerationConfig {
+            max_new_tokens: max_tokens,
+            temperature,
+            do_sample: true,
+            stop_tokens,
+            seed: params.seed,
+            ane_real_time,
+            ..GenerationConfig::default()
+        }
+    } else {
+        GenerationConfig::greedy(max_tokens)
+            .with_stop_tokens(stop_tokens)
+            .with_ane_real_time(ane_real_time)
+    };
+
+    if let Some(top_k) = params.top_k {
+        config = config.with_top_k(top_k);
+    }
+    if let Some(top_p) = params.top_p {
+        config = config.with_top_p(top_p);
+    }
+    if let Some(min_p) = params.min_p {
+        config = config.with_min_p(min_p);
+    }
+    if let Some(rp) = params.repetition_penalty {
+        config = config.with_repetition_penalty(rp);
+    }
+    if let Some(fp) = params.frequency_penalty {
+        config = config.with_frequency_penalty(fp);
+    }
+    if let Some(pp) = params.presence_penalty {
+        config = config.with_presence_penalty(pp);
+    }
+    if !do_sample {
+        if let Some(seed) = params.seed {
+            config = config.with_seed(seed);
+        }
+    }
+
+    config
+}
+
 fn estimate_parameter_count(config_json: &serde_json::Value) -> Option<u64> {
     let hidden = config_json.get("hidden_size")?.as_u64()?;
     let layers = config_json.get("num_hidden_layers")?.as_u64()?;
@@ -137,6 +196,8 @@ pub struct InferenceEngine {
     max_seq_len: usize,
     /// Fixed ANE bucket cap for accelerated backends.
     ane_max_seq_len: usize,
+    /// Enable the experimental ANE real-time evaluation path for ANE requests.
+    ane_real_time: bool,
     /// Preferred generation backend; falls back to GPU permanently on failure.
     backend: Arc<Mutex<BackendState>>,
     /// Stop token IDs collected from all available sources.
@@ -173,6 +234,7 @@ impl InferenceEngine {
             max_seq_len,
             true,
             1024,
+            false,
         )
     }
 
@@ -185,6 +247,7 @@ impl InferenceEngine {
         max_seq_len: usize,
         ane_enabled: bool,
         ane_max_seq_len: usize,
+        ane_real_time: bool,
     ) -> ServeResult<Self> {
         let chat_template = detect_chat_template(model_path, &model_id);
 
@@ -228,6 +291,7 @@ impl InferenceEngine {
             backend = ?preferred_backend,
             ane_enabled,
             ane_max_seq_len,
+            ane_real_time,
             "Selected serving generation backend"
         );
 
@@ -241,6 +305,7 @@ impl InferenceEngine {
             model_path: model_path.to_path_buf(),
             max_seq_len,
             ane_max_seq_len,
+            ane_real_time,
             backend: Arc::new(Mutex::new(BackendState {
                 preferred: preferred_backend,
             })),
@@ -350,60 +415,12 @@ impl InferenceEngine {
     /// All stop tokens (engine-level + per-request) are merged into the config.
     /// `max_tokens` is silently clamped to `max_seq_len` (matches OpenAI behaviour).
     pub fn build_generation_config(&self, params: &SamplingParams) -> GenerationConfig {
-        let temperature = params.temperature;
-        let do_sample = temperature > 0.0;
-
-        // Clamp max_tokens silently — matching OpenAI API behaviour.
-        let max_tokens = params.max_tokens.min(self.max_seq_len);
-
-        // Merge engine-level stop tokens with any per-request stop tokens.
-        let mut stop_tokens = self.stop_token_ids.clone();
-        stop_tokens.extend_from_slice(&params.extra_stop_token_ids);
-        stop_tokens.sort_unstable();
-        stop_tokens.dedup();
-
-        let mut config = if do_sample {
-            // Start from the default sampling config, then apply per-request overrides.
-            GenerationConfig {
-                max_new_tokens: max_tokens,
-                temperature,
-                do_sample: true,
-                stop_tokens,
-                seed: params.seed,
-                ..GenerationConfig::default()
-            }
-        } else {
-            GenerationConfig::greedy(max_tokens).with_stop_tokens(stop_tokens)
-        };
-
-        // Apply optional overrides — only set fields the caller specified.
-        if let Some(top_k) = params.top_k {
-            config = config.with_top_k(top_k);
-        }
-        if let Some(top_p) = params.top_p {
-            config = config.with_top_p(top_p);
-        }
-        if let Some(min_p) = params.min_p {
-            config = config.with_min_p(min_p);
-        }
-        if let Some(rp) = params.repetition_penalty {
-            config = config.with_repetition_penalty(rp);
-        }
-        if let Some(fp) = params.frequency_penalty {
-            config = config.with_frequency_penalty(fp);
-        }
-        if let Some(pp) = params.presence_penalty {
-            config = config.with_presence_penalty(pp);
-        }
-        // For greedy mode the seed is not set in the config initializer above,
-        // so apply it here (it won't affect sampling but may affect MLX RNG state).
-        if !do_sample {
-            if let Some(seed) = params.seed {
-                config = config.with_seed(seed);
-            }
-        }
-
-        config
+        build_generation_config_from_parts(
+            &self.stop_token_ids,
+            self.max_seq_len,
+            self.ane_real_time,
+            params,
+        )
     }
 
     fn backend_or_gpu(backend: &Arc<Mutex<BackendState>>) -> PreferredGenerationBackend {
@@ -973,5 +990,29 @@ mod tests {
             select_accelerated_backend(&config, false),
             PreferredGenerationBackend::Gpu
         );
+    }
+
+    #[test]
+    fn test_build_generation_config_propagates_ane_real_time() {
+        let params = SamplingParams {
+            max_tokens: 64,
+            temperature: 0.8,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: Some(7),
+            extra_stop_token_ids: vec![99],
+        };
+
+        let config = build_generation_config_from_parts(&[1, 2], 32, true, &params);
+
+        assert_eq!(config.max_new_tokens, 32);
+        assert!(config.do_sample);
+        assert!(config.ane_real_time);
+        assert_eq!(config.seed, Some(7));
+        assert_eq!(config.stop_tokens, vec![1, 2, 99]);
     }
 }

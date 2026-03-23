@@ -4824,6 +4824,7 @@ dependencies = [
  "dirs",
  "flate2",
  "futures",
+ "half",
  "indicatif",
  "libc",
  "parquet",

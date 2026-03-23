@@ -18,7 +18,10 @@
 //! - LoRA adapter fusion (merge before ANE kernel compilation)
 //! - Legacy full-recomputation path preserved for backward compatibility
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use rand::RngExt;
 
@@ -78,6 +81,8 @@ pub struct AneInferenceConfig {
     pub top_k: usize,
     /// Maximum tokens to generate.
     pub max_tokens: usize,
+    /// Use the experimental ANE real-time evaluation path when available.
+    pub real_time_eval: bool,
     /// EOS token ID for early stopping.
     pub eos_token_id: Option<u32>,
     /// RoPE base frequency (Qwen3 default: 1_000_000.0).
@@ -113,6 +118,7 @@ impl Default for AneInferenceConfig {
             temperature: 0.0,
             top_k: 0,
             max_tokens: 128,
+            real_time_eval: false,
             eos_token_id: None,
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
@@ -225,6 +231,9 @@ pub struct AneInferenceEngine {
     io_pool: Option<IoSurfacePool>,
     /// Set to true after `compile_kernels()` is called.
     compiled: bool,
+    /// Permanently disables real-time dispatch for this engine after the
+    /// first failure until the request mode changes.
+    real_time_disabled: AtomicBool,
 }
 
 impl AneInferenceEngine {
@@ -331,6 +340,7 @@ impl AneInferenceEngine {
             budget,
             io_pool: None,
             compiled: false,
+            real_time_disabled: AtomicBool::new(false),
         })
     }
 
@@ -346,11 +356,42 @@ impl AneInferenceEngine {
         top_k: usize,
         max_tokens: usize,
         eos_token_id: Option<u32>,
+        real_time_eval: bool,
     ) {
+        let previous_real_time = self.config.real_time_eval;
         self.config.temperature = temperature;
         self.config.top_k = top_k;
         self.config.max_tokens = max_tokens;
         self.config.eos_token_id = eos_token_id;
+        self.config.real_time_eval = real_time_eval;
+        if previous_real_time != real_time_eval {
+            self.real_time_disabled.store(false, Ordering::Relaxed);
+        }
+    }
+
+    fn evaluate_ane_model(
+        &self,
+        model: &AneModel,
+        inputs: &[*mut std::ffi::c_void],
+        outputs: &[*mut std::ffi::c_void],
+    ) -> Result<()> {
+        if self.config.real_time_eval
+            && !self.real_time_disabled.load(Ordering::Relaxed)
+            && model.real_time_available()
+        {
+            match model.evaluate_real_time(inputs, outputs) {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    tracing::warn!(
+                        error = %err,
+                        "ANE real-time evaluation failed; falling back to standard ANE dispatch"
+                    );
+                    self.real_time_disabled.store(true, Ordering::Relaxed);
+                }
+            }
+        }
+
+        model.evaluate(inputs, outputs)
     }
 
     /// Get the compilation budget tracker.
@@ -619,8 +660,11 @@ impl AneInferenceEngine {
             // CPU RMSNorm in f32 (avoids fp16 overflow on ANE)
             accelerate::rmsnorm(&mut xn_buf, &x, &lw.rms_att, d, s, eps);
             io_pool.input.write_f32_as_fp16(&xn_buf, d, s);
-            lk.fwd_attn_kv
-                .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_attn.as_ptr()])?;
+            self.evaluate_ane_model(
+                &lk.fwd_attn_kv,
+                &[io_pool.input.as_ptr()],
+                &[io_pool.output_attn.as_ptr()],
+            )?;
             io_pool.output_attn.read_fp16_as_f32(&mut o_out, 0, d, s);
 
             // Residual: x2 = x + o_out
@@ -630,7 +674,11 @@ impl AneInferenceEngine {
             if let Some(ref ffn_kernel) = lk.fwd_ffn {
                 accelerate::rmsnorm(&mut xn_buf, &x2, &lw.rms_ffn, d, s, eps);
                 io_pool.input.write_f32_as_fp16(&xn_buf, d, s);
-                ffn_kernel.evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_ffn.as_ptr()])?;
+                self.evaluate_ane_model(
+                    ffn_kernel,
+                    &[io_pool.input.as_ptr()],
+                    &[io_pool.output_ffn.as_ptr()],
+                )?;
                 io_pool.output_ffn.read_fp16_as_f32(&mut ffn_out, 0, d, s);
             } else {
                 self.cpu_ffn_forward(layer_idx, &x2, &mut ffn_out);
@@ -893,8 +941,11 @@ impl AneInferenceEngine {
             accelerate::rmsnorm(&mut xn_buf, &x, &lw.rms_att, d, s, eps);
             io_pool.input.write_f32_as_fp16(&xn_buf, d, s);
 
-            lk.fwd_attn_kv
-                .evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_attn.as_ptr()])?;
+            self.evaluate_ane_model(
+                &lk.fwd_attn_kv,
+                &[io_pool.input.as_ptr()],
+                &[io_pool.output_attn.as_ptr()],
+            )?;
 
             // Read oo (channels 0..D)
             io_pool.output_attn.read_fp16_as_f32(&mut o_out, 0, d, s);
@@ -927,7 +978,11 @@ impl AneInferenceEngine {
                 // CPU RMSNorm for FFN input (same fp16 overflow avoidance)
                 accelerate::rmsnorm(&mut xn_buf, &x2, &lw.rms_ffn, d, s, eps);
                 io_pool.input.write_f32_as_fp16(&xn_buf, d, s);
-                ffn_kernel.evaluate(&[io_pool.input.as_ptr()], &[io_pool.output_ffn.as_ptr()])?;
+                self.evaluate_ane_model(
+                    ffn_kernel,
+                    &[io_pool.input.as_ptr()],
+                    &[io_pool.output_ffn.as_ptr()],
+                )?;
                 io_pool.output_ffn.read_fp16_as_f32(&mut ffn_out, 0, d, s);
             } else {
                 self.cpu_ffn_forward(layer_idx, &x2, &mut ffn_out);
@@ -1702,6 +1757,7 @@ mod tests {
             temperature: 0.0,
             top_k: 0,
             max_tokens: 32,
+            real_time_eval: false,
             eos_token_id: None,
             rope_theta: 1_000_000.0,
             rms_norm_eps: 1e-6,
@@ -1733,11 +1789,12 @@ mod tests {
         let config = small_config();
         let mut engine = AneInferenceEngine::new(config, 0).unwrap();
 
-        engine.set_generation_params(0.8, 32, 128, Some(42));
+        engine.set_generation_params(0.8, 32, 128, Some(42), true);
 
         assert_eq!(engine.config().temperature, 0.8);
         assert_eq!(engine.config().top_k, 32);
         assert_eq!(engine.config().max_tokens, 128);
+        assert!(engine.config().real_time_eval);
         assert_eq!(engine.config().eos_token_id, Some(42));
     }
 

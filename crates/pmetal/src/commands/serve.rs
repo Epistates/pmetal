@@ -11,6 +11,7 @@ pub(crate) async fn run_serve(
     experts_dir: Option<String>,
     ane_enabled: bool,
     ane_max_seq_len: usize,
+    ane_real_time: bool,
 ) -> anyhow::Result<()> {
     use pmetal_models::dispatcher::DynamicModel;
     use pmetal_serve::{InferenceEngine, ServeConfig};
@@ -61,6 +62,7 @@ pub(crate) async fn run_serve(
         max_seq_len,
         ane_enabled,
         ane_max_seq_len,
+        ane_real_time,
     )?;
 
     // Start server

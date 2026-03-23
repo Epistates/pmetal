@@ -86,6 +86,7 @@ mlx-rs = { workspace = true, optional = true }
 # Always-on (SDK facade needs these)
 serde_json = { workspace = true }
 tracing = { workspace = true }
+half = { workspace = true }
 
 # CLI dependencies (optional, behind "cli" feature)
 clap = { workspace = true, optional = true }

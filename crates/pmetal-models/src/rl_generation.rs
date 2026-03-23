@@ -217,6 +217,7 @@ impl BatchedRlConfig {
             stop_tokens: self.stop_tokens.clone(),
             seed: self.seed,
             do_sample: true,
+            ane_real_time: false,
         }
     }
 }

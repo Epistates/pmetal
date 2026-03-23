@@ -30,6 +30,16 @@ Benchmark FFI overhead between Rust and Metal/MLX.
 pmetal bench-ffi
 ```
 
+### bench-corpus
+
+Run the structured kernel benchmark corpus for the current Apple Silicon tier and emit a JSON artifact. This corpus covers standard-Metal hot paths on M1-M4 and adds MPP GEMM coverage on Apple10/M5 when NAX is available.
+
+```bash
+pmetal bench-corpus --quick --output .strategy/bench_corpus.json
+```
+
+Use `--json` to print the report to stdout, or omit `--quick` for the standard corpus run.
+
 ## See Also
 
 - [Hardware Support](/hardware/apple-silicon/) — Hardware capabilities
