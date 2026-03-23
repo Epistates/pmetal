@@ -1,0 +1,44 @@
+[package]
+name = "pmetal-mcp"
+description = "MCP server exposing PMetal ML toolkit"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+
+[[bin]]
+name = "pmetal-mcp"
+path = "src/main.rs"
+
+[dependencies]
+# Internal crates — lightweight, library-callable operations
+pmetal-core = { workspace = true }
+pmetal-metal = { workspace = true }
+pmetal-hub = { workspace = true }
+
+# MCP server framework
+turbomcp = { version = "3.0.7", features = ["stdio"] }
+
+# Async runtime
+tokio = { workspace = true }
+
+# Serialization
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# HTTP client (for chat tool → serve interaction)
+reqwest = { workspace = true }
+
+# Job management
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1", features = ["v4"] }
+
+[lints]
+workspace = true
