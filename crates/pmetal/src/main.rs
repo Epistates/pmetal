@@ -112,6 +112,29 @@ impl QuantizeMethod {
     }
 }
 
+/// Inference-context selection for `bench-workload`.
+#[derive(Debug, Clone, Copy, Default, ValueEnum)]
+pub enum WorkloadInferenceContext {
+    /// Automatically choose between prompt-only and longer text-prefix continuation context
+    #[default]
+    Auto,
+    /// Use the prompt portion only
+    Prompt,
+    /// Use a prefix of the full formatted sample text
+    TextPrefix,
+}
+
+/// Named workload presets for `bench-workload`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkloadBenchmarkPreset {
+    /// Dense Qwen3 regression workload on the cached reasoning dataset
+    #[value(name = "dense-qwen3")]
+    DenseQwen3,
+    /// Hybrid Qwen3Next regression workload with a conservative training cap
+    #[value(name = "hybrid-qwen3next")]
+    HybridQwen3Next,
+}
+
 #[derive(Parser)]
 #[command(name = "pmetal")]
 #[command(author, version, about = "LLM fine-tuning optimized for Apple Silicon", long_about = None)]
@@ -458,9 +481,10 @@ enum Commands {
         #[arg(long, default_value = "5")]
         benchmark_iters: usize,
 
-        /// KV cache quantization bits (8=q8_0, 4=q4_0, 0=fp16). Default: 8 (free lunch).
-        #[arg(long, default_value = "8")]
-        kv_quant: u8,
+        /// KV cache quantization bits (8=q8_0, 4=q4_0, 0=fp16).
+        /// Omit to auto-select the fastest mode that still fits the device budget.
+        #[arg(long)]
+        kv_quant: Option<u8>,
 
         /// KV cache key bits (overrides --kv-quant for keys only, for asymmetric K/V).
         #[arg(long)]
@@ -548,6 +572,61 @@ enum Commands {
         /// Use a shorter run with fewer iterations and smaller tier-scaled shapes
         #[arg(long)]
         quick: bool,
+
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+
+        /// Optional output path for the JSON report
+        #[arg(short, long)]
+        output: Option<String>,
+    },
+
+    /// Benchmark a real cached workload for inference and short LoRA training
+    BenchWorkload {
+        /// Named preset that overrides the model/dataset/shape knobs below
+        #[arg(long, value_enum)]
+        preset: Option<WorkloadBenchmarkPreset>,
+
+        /// Model ID or local path
+        #[arg(long, default_value = "Qwen/Qwen3-0.6B")]
+        model: String,
+
+        /// Dataset ID or local path
+        #[arg(long, default_value = "TeichAI/gemini-3-pro-preview-high-reasoning-250x")]
+        dataset: String,
+
+        /// Number of prompt samples to benchmark for inference
+        #[arg(long, default_value = "8")]
+        prompt_samples: usize,
+
+        /// Maximum prompt tokens per inference sample (0 = auto-select from sampled prompts, capped for a quick run)
+        #[arg(long, default_value = "0")]
+        max_prompt_tokens: usize,
+
+        /// Inference context source for workload benchmarking
+        #[arg(long, value_enum, default_value = "auto")]
+        inference_context: WorkloadInferenceContext,
+
+        /// Number of decode steps per prompt sample
+        #[arg(long, default_value = "32")]
+        decode_steps: usize,
+
+        /// Number of raw samples to include in the sampled training subset
+        #[arg(long, default_value = "8")]
+        train_samples: usize,
+
+        /// Number of LoRA training steps to run
+        #[arg(long, default_value = "4")]
+        train_steps: usize,
+
+        /// Training batch size
+        #[arg(long, default_value = "1")]
+        batch_size: usize,
+
+        /// Maximum sequence length for the short training run (0 = auto-select from sampled data, capped for a quick run)
+        #[arg(long, default_value = "0")]
+        max_seq_len: usize,
 
         /// Output results as JSON
         #[arg(long)]
@@ -2465,6 +2544,51 @@ async fn tokio_main() -> anyhow::Result<()> {
                 validated_output.as_deref(),
                 json,
             )?;
+        }
+
+        Commands::BenchWorkload {
+            preset,
+            model,
+            dataset,
+            prompt_samples,
+            max_prompt_tokens,
+            inference_context,
+            decode_steps,
+            train_samples,
+            train_steps,
+            batch_size,
+            max_seq_len,
+            json,
+            output,
+        } => {
+            let validated_output = output
+                .as_deref()
+                .map(|path| validate_output_path(path, "workload benchmark output"))
+                .transpose()?;
+            if let Some(preset) = preset {
+                commands::bench::run_workload_benchmark_preset(
+                    preset,
+                    validated_output.as_deref(),
+                    json,
+                )
+                .await?;
+            } else {
+                commands::bench::run_workload_benchmark(
+                    &model,
+                    &dataset,
+                    prompt_samples,
+                    max_prompt_tokens,
+                    inference_context,
+                    decode_steps,
+                    train_samples,
+                    train_steps,
+                    batch_size,
+                    max_seq_len,
+                    validated_output.as_deref(),
+                    json,
+                )
+                .await?;
+            }
         }
 
         Commands::Init { output } => {

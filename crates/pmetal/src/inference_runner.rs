@@ -4,14 +4,19 @@
 //! tokenization, chat template, sampling config, cache creation) so that all
 //! consumers get identical behavior from a single code path.
 
-use std::path::{Path, PathBuf};
+use std::{
+    collections::HashSet,
+    ffi::OsStr,
+    path::{Path, PathBuf},
+};
 
+use mlx_rs::Dtype;
 use mlx_rs::error::Exception;
 use mlx_rs::module::ModuleParameters as _;
 use pmetal_data::Tokenizer;
 use pmetal_data::chat_templates::{ChatTemplateType, Message, ToolDefinition};
 use pmetal_lora::{DynamicLoraModel, TrainableModel as _};
-use pmetal_mlx::kv_cache::{CacheMode, KVCache, MambaCache};
+use pmetal_mlx::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::GenerationConfig;
 use pmetal_models::{GenerationOutput, generate_cached_async_streaming};
@@ -56,8 +61,11 @@ pub struct InferenceRunnerConfig {
     pub seed: Option<u64>,
 
     // ── KV Cache ─────────────────────────────────────────────────────────
-    /// Quantization bits for KV cache (8=q8_0, 4=q4_0, 0=fp16). Default: 8.
-    pub kv_quant: u8,
+    /// Quantization bits for KV cache (8=q8_0, 4=q4_0, 0=fp16).
+    ///
+    /// `None` means auto-select based on the model size, context window, and
+    /// the device working-set budget.
+    pub kv_quant: Option<u8>,
     /// Override key bits (for asymmetric K/V quantization).
     pub kv_k_bits: Option<u8>,
     /// Override value bits (for asymmetric K/V quantization).
@@ -89,7 +97,7 @@ impl Default for InferenceRunnerConfig {
             frequency_penalty: None,
             presence_penalty: None,
             seed: None,
-            kv_quant: 8,
+            kv_quant: None,
             kv_k_bits: None,
             kv_v_bits: None,
             kv_group_size: 64,
@@ -242,6 +250,7 @@ impl InferenceRunner {
             &tokenizer,
             template_type,
         );
+        tracing::info!(count = stop_tokens.len(), "Stop tokens collected");
 
         // 6. Build GenerationConfig
         let gen_config = if temperature < 1e-6 {
@@ -263,22 +272,14 @@ impl InferenceRunner {
 
         // 7. Load model (standard or LoRA-merged)
         let max_seq_len = input_ids.len() + config.max_tokens + 64;
-        // kv_quant may be promoted to Q8 by auto-detect below (standard path only)
-        let mut kv_quant = config.kv_quant;
 
         let (model, cache, mamba_cache) = if let Some(ref lora_path) = config.lora_path {
-            let cache_mode = resolve_cache_mode(
-                kv_quant,
-                config.kv_k_bits,
-                config.kv_v_bits,
-                config.kv_group_size,
-                config.no_kv_quant,
-            );
-            tracing::info!(mode = %cache_mode.describe(), tokens = max_seq_len, "KV cache");
-            let (lora_model, cache, mamba_cache) =
-                load_model_with_lora(model_path, lora_path, max_seq_len)?;
+            let (lora_model, cache, mamba_cache, cache_selection) =
+                load_model_with_lora(model_path, lora_path, max_seq_len, &config)?;
+            log_cache_selection(&cache_selection, max_seq_len);
             (LoadedModel::Lora(lora_model), cache, mamba_cache)
         } else {
+            tracing::info!("Loading dynamic model");
             let mut m = DynamicModel::load(model_path)?;
             tracing::info!(arch = %m.architecture(), "Model loaded");
 
@@ -293,37 +294,24 @@ impl InferenceRunner {
                 m.enable_expert_offloading(Path::new(experts_dir))?;
             }
 
-            // Auto-enable KV quantization for memory-constrained setups
-            if kv_quant == 0 && !config.no_kv_quant {
-                if let Ok(ctx) = pmetal_metal::context::MetalContext::global() {
-                    let props = ctx.properties();
-                    let available_gb =
-                        props.recommended_working_set_size as f64 / (1024.0 * 1024.0 * 1024.0);
-                    let param_count = m.num_parameters();
-                    let bytes_per_param = if config.fp8 { 1.05 } else { 2.0 };
-                    let estimated_weight_gb =
-                        param_count as f64 * bytes_per_param / (1024.0 * 1024.0 * 1024.0);
-                    if estimated_weight_gb > available_gb * 0.7 {
-                        tracing::info!(
-                            estimated_weight_gb = format!("{:.1}", estimated_weight_gb),
-                            available_gb = format!("{:.1}", available_gb),
-                            "Auto-enabling KV cache quantization (Q8) for memory-constrained setup"
-                        );
-                        kv_quant = 8;
-                    }
-                }
-            }
-
-            let cache_mode = resolve_cache_mode(
-                kv_quant,
-                config.kv_k_bits,
-                config.kv_v_bits,
-                config.kv_group_size,
-                config.no_kv_quant,
+            let base_cache_config = m.create_cache(max_seq_len).config().clone();
+            tracing::info!(tokens = max_seq_len, "Base KV cache created");
+            let cache_selection = select_cache_mode_for_model(
+                &base_cache_config,
+                model_path,
+                m.num_parameters(),
+                CacheModeRequest {
+                    kv_quant: config.kv_quant,
+                    kv_k_bits: config.kv_k_bits,
+                    kv_v_bits: config.kv_v_bits,
+                    kv_group_size: config.kv_group_size,
+                    no_kv_quant: config.no_kv_quant,
+                    fp8: config.fp8,
+                },
             );
-            tracing::info!(mode = %cache_mode.describe(), tokens = max_seq_len, "KV cache");
+            log_cache_selection(&cache_selection, max_seq_len);
 
-            let cache = m.create_cache_with_mode(max_seq_len, cache_mode);
+            let cache = build_cache_from_base_config(&base_cache_config, cache_selection.mode);
             let mamba_cache = m.create_mamba_cache();
             (LoadedModel::Standard(m), cache, mamba_cache)
         };
@@ -492,7 +480,8 @@ fn load_model_with_lora(
     model_path: &Path,
     lora_path: &str,
     max_seq_len: usize,
-) -> Result<(DynamicLoraModel, KVCache, Option<MambaCache>), Exception> {
+    config: &InferenceRunnerConfig,
+) -> Result<(DynamicLoraModel, KVCache, Option<MambaCache>, CacheModeSelection), Exception> {
     let lora_path_buf = Path::new(lora_path);
     let adapter_dir = if lora_path_buf.is_dir() {
         lora_path_buf
@@ -552,25 +541,40 @@ fn load_model_with_lora(
 
     tracing::info!("LoRA merged into base model");
 
-    let cache = model
+    let base_cache = model
         .create_cache(max_seq_len)
         .ok_or_else(|| Exception::custom("model does not support KV cache"))?;
+    let cache_selection = select_cache_mode_for_model(
+        base_cache.config(),
+        model_path,
+        model.num_parameters(),
+        CacheModeRequest {
+            kv_quant: config.kv_quant,
+            kv_k_bits: config.kv_k_bits,
+            kv_v_bits: config.kv_v_bits,
+            kv_group_size: config.kv_group_size,
+            no_kv_quant: config.no_kv_quant,
+            fp8: config.fp8,
+        },
+    );
+    let cache = build_cache_from_base_config(base_cache.config(), cache_selection.mode);
     let mamba_cache = model.create_mamba_cache();
 
-    Ok((model, cache, mamba_cache))
+    Ok((model, cache, mamba_cache, cache_selection))
 }
 
 /// Resolve KV cache quantization mode from CLI/GUI parameters.
 fn resolve_cache_mode(
-    kv_quant: u8,
+    kv_quant: Option<u8>,
     kv_k_bits: Option<u8>,
     kv_v_bits: Option<u8>,
     kv_group_size: usize,
     no_kv_quant: bool,
 ) -> CacheMode {
-    if no_kv_quant || kv_quant == 0 {
+    if no_kv_quant || kv_quant == Some(0) {
         return CacheMode::Standard;
     }
+    let kv_quant = kv_quant.unwrap_or(8);
     match (kv_k_bits, kv_v_bits) {
         (Some(k), Some(v)) => CacheMode::AsymmetricQuantized {
             key_bits: k,
@@ -601,6 +605,283 @@ fn resolve_cache_mode(
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CacheModeSource {
+    ForcedFp16,
+    Explicit,
+    AutoFp16,
+    AutoQ8,
+}
+
+impl CacheModeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ForcedFp16 => "forced-fp16",
+            Self::Explicit => "explicit",
+            Self::AutoFp16 => "auto-fp16",
+            Self::AutoQ8 => "auto-q8",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheModeSelection {
+    pub mode: CacheMode,
+    pub source: CacheModeSource,
+    pub estimated_weight_bytes: u64,
+    pub estimated_fp16_kv_bytes: u64,
+    pub working_set_bytes: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CacheModeRequest {
+    pub kv_quant: Option<u8>,
+    pub kv_k_bits: Option<u8>,
+    pub kv_v_bits: Option<u8>,
+    pub kv_group_size: usize,
+    pub no_kv_quant: bool,
+    pub fp8: bool,
+}
+
+pub fn select_cache_mode_for_model(
+    base_cache_config: &KVCacheConfig,
+    model_path: &Path,
+    param_count: usize,
+    request: CacheModeRequest,
+) -> CacheModeSelection {
+    let working_set_bytes = pmetal_metal::context::MetalContext::global()
+        .ok()
+        .map(|ctx| ctx.properties().recommended_working_set_size);
+    let estimated_weight_bytes = estimate_weight_bytes(model_path, param_count, request.fp8);
+
+    select_cache_mode_with_working_set(
+        base_cache_config,
+        estimated_weight_bytes,
+        request,
+        working_set_bytes,
+    )
+}
+
+fn select_cache_mode_with_working_set(
+    base_cache_config: &KVCacheConfig,
+    estimated_weight_bytes: u64,
+    request: CacheModeRequest,
+    working_set_bytes: Option<u64>,
+) -> CacheModeSelection {
+    let estimated_fp16_kv_bytes = estimate_fp16_kv_cache_bytes(base_cache_config);
+
+    if request.no_kv_quant || request.kv_quant == Some(0) {
+        return CacheModeSelection {
+            mode: CacheMode::Standard,
+            source: CacheModeSource::ForcedFp16,
+            estimated_weight_bytes,
+            estimated_fp16_kv_bytes,
+            working_set_bytes,
+        };
+    }
+
+    if request.kv_quant.is_some() || request.kv_k_bits.is_some() || request.kv_v_bits.is_some() {
+        return CacheModeSelection {
+            mode: resolve_cache_mode(
+                request.kv_quant,
+                request.kv_k_bits,
+                request.kv_v_bits,
+                request.kv_group_size,
+                false,
+            ),
+            source: CacheModeSource::Explicit,
+            estimated_weight_bytes,
+            estimated_fp16_kv_bytes,
+            working_set_bytes,
+        };
+    }
+
+    let estimated_total_fp16 = estimated_weight_bytes.saturating_add(estimated_fp16_kv_bytes);
+    let prefer_q8 = working_set_bytes.is_some_and(|working_set| {
+        working_set > 0 && estimated_total_fp16 > ((working_set as f64) * 0.70) as u64
+    });
+
+    CacheModeSelection {
+        mode: if prefer_q8 {
+            CacheMode::Quantized {
+                bits: 8,
+                group_size: request.kv_group_size,
+            }
+        } else {
+            CacheMode::Standard
+        },
+        source: if prefer_q8 {
+            CacheModeSource::AutoQ8
+        } else {
+            CacheModeSource::AutoFp16
+        },
+        estimated_weight_bytes,
+        estimated_fp16_kv_bytes,
+        working_set_bytes,
+    }
+}
+
+fn estimate_weight_bytes(model_path: &Path, param_count: usize, fp8: bool) -> u64 {
+    let param_estimate = estimate_weight_bytes_from_param_count(param_count, fp8);
+    estimate_local_model_weight_bytes(model_path, fp8)
+        .map(|bytes| bytes.max(param_estimate))
+        .unwrap_or(param_estimate)
+}
+
+fn estimate_weight_bytes_from_param_count(param_count: usize, fp8: bool) -> u64 {
+    let bytes_per_param = if fp8 { 1.05 } else { 2.0 };
+    (param_count as f64 * bytes_per_param) as u64
+}
+
+fn estimate_local_model_weight_bytes(model_path: &Path, fp8: bool) -> Option<u64> {
+    let on_disk_bytes = sum_model_weight_file_bytes(model_path)?;
+    Some(if fp8 {
+        ((on_disk_bytes as f64) * (1.05 / 2.0)).ceil() as u64
+    } else {
+        on_disk_bytes
+    })
+}
+
+fn sum_model_weight_file_bytes(model_path: &Path) -> Option<u64> {
+    let mut total = 0u64;
+    let mut visited_dirs = HashSet::new();
+    let mut counted_files = HashSet::new();
+    accumulate_model_weight_file_bytes(
+        model_path,
+        &mut visited_dirs,
+        &mut counted_files,
+        &mut total,
+    );
+    (total > 0).then_some(total)
+}
+
+fn accumulate_model_weight_file_bytes(
+    path: &Path,
+    visited_dirs: &mut HashSet<PathBuf>,
+    counted_files: &mut HashSet<PathBuf>,
+    total: &mut u64,
+) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+
+    if metadata.is_dir() {
+        let canonical = path
+            .canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf());
+        if !visited_dirs.insert(canonical) {
+            return;
+        }
+
+        let Ok(entries) = std::fs::read_dir(path) else {
+            return;
+        };
+
+        for entry in entries.flatten() {
+            accumulate_model_weight_file_bytes(&entry.path(), visited_dirs, counted_files, total);
+        }
+        return;
+    }
+
+    if !metadata.is_file() || !is_supported_model_weight_file(path) {
+        return;
+    }
+
+    let canonical = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf());
+    if counted_files.insert(canonical) {
+        *total = total.saturating_add(metadata.len());
+    }
+}
+
+fn is_supported_model_weight_file(path: &Path) -> bool {
+    let extension = path
+        .extension()
+        .and_then(OsStr::to_str)
+        .map(|ext| ext.to_ascii_lowercase());
+    let file_name = path
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(|name| name.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    match extension.as_deref() {
+        Some("safetensors") | Some("gguf") => true,
+        Some("bin") | Some("pt") | Some("pth") => {
+            file_name.contains("model")
+                || file_name.contains("pytorch")
+                || file_name.contains("consolidated")
+        }
+        _ => false,
+    }
+}
+
+fn estimate_fp16_kv_cache_bytes(base_cache_config: &KVCacheConfig) -> u64 {
+    base_cache_config
+        .clone()
+        .with_dtype(Dtype::Float16)
+        .with_mode(CacheMode::Standard)
+        .memory_footprint() as u64
+}
+
+fn log_cache_selection(selection: &CacheModeSelection, max_seq_len: usize) {
+    let estimated_weight_gb = selection.estimated_weight_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let estimated_fp16_kv_gb =
+        selection.estimated_fp16_kv_bytes as f64 / (1024.0 * 1024.0 * 1024.0);
+    let working_set_gb = selection
+        .working_set_bytes
+        .map(|bytes| bytes as f64 / (1024.0 * 1024.0 * 1024.0));
+
+    tracing::info!(
+        mode = %selection.mode.describe(),
+        source = selection.source.as_str(),
+        tokens = max_seq_len,
+        estimated_weight_gb = format!("{estimated_weight_gb:.2}"),
+        estimated_fp16_kv_gb = format!("{estimated_fp16_kv_gb:.2}"),
+        working_set_gb = working_set_gb.map(|value| format!("{value:.2}")),
+        "KV cache"
+    );
+}
+
+fn build_cache_from_base_config(base_cache_config: &KVCacheConfig, mode: CacheMode) -> KVCache {
+    let safe_mode = sanitize_cache_mode(base_cache_config, mode);
+    KVCache::new(base_cache_config.clone().with_mode(safe_mode))
+}
+
+fn sanitize_cache_mode(base_cache_config: &KVCacheConfig, mode: CacheMode) -> CacheMode {
+    let head_dim = base_cache_config.head_dim;
+    match mode {
+        CacheMode::Quantized { bits, group_size } if head_dim > 0 && head_dim % group_size != 0 => {
+            CacheMode::Quantized {
+                bits,
+                group_size: find_compatible_group_size(head_dim, group_size),
+            }
+        }
+        CacheMode::AsymmetricQuantized {
+            key_bits,
+            value_bits,
+            group_size,
+        } if head_dim > 0 && head_dim % group_size != 0 => CacheMode::AsymmetricQuantized {
+            key_bits,
+            value_bits,
+            group_size: find_compatible_group_size(head_dim, group_size),
+        },
+        other => other,
+    }
+}
+
+fn find_compatible_group_size(head_dim: usize, preferred: usize) -> usize {
+    if preferred > 0 && head_dim % preferred == 0 {
+        return preferred;
+    }
+    for candidate in [128, 64, 32, 16, 8, 4, 2, 1] {
+        if head_dim % candidate == 0 {
+            return candidate;
+        }
+    }
+    1
+}
 /// Check if a model directory looks like an instruction-tuned model.
 fn is_instruction_tuned(model_path: &Path) -> bool {
     let name = model_path
@@ -615,4 +896,143 @@ fn is_instruction_tuned(model_path: &Path) -> bool {
     ];
 
     instruct_markers.iter().any(|m| name.contains(m))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::tempdir;
+
+    fn qwen3_cache_config(max_seq_len: usize) -> KVCacheConfig {
+        KVCacheConfig::new(28, max_seq_len, 8, 128)
+    }
+
+    #[test]
+    fn auto_cache_mode_prefers_fp16_when_model_fits_comfortably() {
+        let selection = select_cache_mode_with_working_set(
+            &qwen3_cache_config(256),
+            estimate_weight_bytes_from_param_count(620_000_000, false),
+            CacheModeRequest {
+                kv_quant: None,
+                kv_k_bits: None,
+                kv_v_bits: None,
+                kv_group_size: 64,
+                no_kv_quant: false,
+                fp8: false,
+            },
+            Some(48 * 1024 * 1024 * 1024),
+        );
+
+        assert_eq!(selection.mode, CacheMode::Standard);
+        assert_eq!(selection.source, CacheModeSource::AutoFp16);
+    }
+
+    #[test]
+    fn auto_cache_mode_promotes_to_q8_when_budget_is_tight() {
+        let selection = select_cache_mode_with_working_set(
+            &qwen3_cache_config(4096),
+            estimate_weight_bytes_from_param_count(7_000_000_000, false),
+            CacheModeRequest {
+                kv_quant: None,
+                kv_k_bits: None,
+                kv_v_bits: None,
+                kv_group_size: 64,
+                no_kv_quant: false,
+                fp8: false,
+            },
+            Some(12 * 1024 * 1024 * 1024),
+        );
+
+        assert_eq!(
+            selection.mode,
+            CacheMode::Quantized {
+                bits: 8,
+                group_size: 64
+            }
+        );
+        assert_eq!(selection.source, CacheModeSource::AutoQ8);
+    }
+
+    #[test]
+    fn explicit_cache_mode_overrides_auto_selection() {
+        let selection = select_cache_mode_with_working_set(
+            &qwen3_cache_config(4096),
+            estimate_weight_bytes_from_param_count(620_000_000, false),
+            CacheModeRequest {
+                kv_quant: Some(4),
+                kv_k_bits: None,
+                kv_v_bits: None,
+                kv_group_size: 64,
+                no_kv_quant: false,
+                fp8: false,
+            },
+            Some(12 * 1024 * 1024 * 1024),
+        );
+
+        assert_eq!(
+            selection.mode,
+            CacheMode::Quantized {
+                bits: 4,
+                group_size: 64
+            }
+        );
+        assert_eq!(selection.source, CacheModeSource::Explicit);
+    }
+
+    #[test]
+    fn no_kv_quant_forces_fp16_even_when_budget_is_tight() {
+        let selection = select_cache_mode_with_working_set(
+            &qwen3_cache_config(4096),
+            estimate_weight_bytes_from_param_count(7_000_000_000, false),
+            CacheModeRequest {
+                kv_quant: None,
+                kv_k_bits: None,
+                kv_v_bits: None,
+                kv_group_size: 64,
+                no_kv_quant: true,
+                fp8: false,
+            },
+            Some(12 * 1024 * 1024 * 1024),
+        );
+
+        assert_eq!(selection.mode, CacheMode::Standard);
+        assert_eq!(selection.source, CacheModeSource::ForcedFp16);
+    }
+
+    #[test]
+    fn estimate_weight_bytes_prefers_real_model_files_when_param_count_is_missing() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), vec![0u8; 4096]).unwrap();
+        std::fs::write(dir.path().join("tokenizer.json"), vec![0u8; 8192]).unwrap();
+
+        assert_eq!(estimate_weight_bytes(dir.path(), 0, false), 4096);
+    }
+
+    #[test]
+    fn estimate_weight_bytes_scales_disk_estimate_for_fp8() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), vec![0u8; 4000]).unwrap();
+
+        assert_eq!(estimate_weight_bytes(dir.path(), 0, true), 2100);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn estimate_weight_bytes_dedupes_symlinked_hf_snapshot_files() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempdir().unwrap();
+        let blobs = dir.path().join("blobs");
+        let snapshot = dir.path().join("snapshots").join("1234");
+        std::fs::create_dir_all(&blobs).unwrap();
+        std::fs::create_dir_all(&snapshot).unwrap();
+
+        let blob = blobs.join("weights");
+        std::fs::write(&blob, vec![0u8; 3072]).unwrap();
+        symlink(&blob, snapshot.join("model-00001-of-00002.safetensors")).unwrap();
+        symlink(&blob, snapshot.join("model-duplicate.safetensors")).unwrap();
+        std::fs::write(snapshot.join("config.json"), b"{}").unwrap();
+
+        assert_eq!(estimate_weight_bytes(&snapshot, 0, false), 3072);
+    }
 }

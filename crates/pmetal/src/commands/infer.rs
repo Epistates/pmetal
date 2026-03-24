@@ -36,7 +36,7 @@ pub(crate) async fn run_inference(
     ane_real_time: bool,
     benchmark: bool,
     benchmark_iters: usize,
-    kv_quant: u8,
+    kv_quant: Option<u8>,
     kv_k_bits: Option<u8>,
     kv_v_bits: Option<u8>,
     kv_group_size: usize,
