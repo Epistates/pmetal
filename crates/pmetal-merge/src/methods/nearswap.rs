@@ -43,8 +43,7 @@
 //!
 //! # References
 //!
-//! Nearswap is an informal community method; the core idea appears in discussions
-//! around MergeKit and related tooling circa 2024. It is conceptually related to
+//! Nearswap is an informal community method. It is conceptually related to
 //! "model stock" selection but operates per-element rather than per-layer.
 
 use super::MergeMethod;

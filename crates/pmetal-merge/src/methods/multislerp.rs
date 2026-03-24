@@ -373,8 +373,7 @@ mod tests {
     fn test_multislerp_three_models_symmetric_cancellation() {
         // Three unit vectors at 0°, 120°, 240° with equal weights sum to zero
         // (antipodal cancellation).  The method should return an error in this case
-        // since it cannot determine a meaningful mean direction — this matches the
-        // mergekit reference implementation's behavior.
+        // since it cannot determine a meaningful mean direction.
         let ms = MultiSlerpMerge::new();
         let cos0 = 1.0_f32;
         let sin0 = 0.0_f32;

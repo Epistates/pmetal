@@ -239,7 +239,6 @@ pub enum MergeMethodConfig {
     /// Reinforced Agent Merging Plus with tensor-local adaptive rescaling.
     RamPlus,
 
-
     /// Multi-model SLERP via barycentric tangent-space interpolation.
     MultiSlerp,
 

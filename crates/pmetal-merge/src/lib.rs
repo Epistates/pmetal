@@ -1,6 +1,6 @@
 //! Model Merging Toolkit for PMetal
 //!
-//! This crate provides comprehensive model merging capabilities inspired by MergeKit,
+//! This crate provides comprehensive model merging capabilities
 //! optimized for Apple Silicon and memory-efficient operation.
 //!
 //! # Supported Merge Methods
@@ -71,6 +71,7 @@ pub use sparsify::*;
 
 /// Re-export merge methods for convenience
 pub use methods::{
+    BreadcrumbsMerge, DareMerge, DellaMerge, LinearMerge, MergeMethod,
     ModelStockMerge, MultiSlerpMerge, NearswapMerge, PassthroughMerge, RamMerge, SlerpMerge,
     SouperMerge, TaskArithmeticMerge, TiesMerge,
 };

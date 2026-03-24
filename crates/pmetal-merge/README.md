@@ -1,6 +1,6 @@
 # pmetal-merge
 
-Model merging toolkit inspired by MergeKit.
+Model merging toolkit for Apple Silicon.
 
 ## Overview
 
