@@ -6,7 +6,7 @@
 //!
 //! ## Key design decisions
 //! - Router logits are cast to float32 before softmax for numerical stability.
-//! - Top-k uses GPU-native argsort + slice (no CPU round-trip).
+//! - Top-k uses GPU-native argpartition + slice (no CPU round-trip).
 //! - Per-expert dispatch: only assigned tokens are fed to each expert.
 //! - Aux loss follows the Switch Transformer formula: `N * sum(f_i * P_i)`.
 
@@ -248,20 +248,15 @@ impl MoERouter {
     }
 }
 
-/// GPU-native top-k selection using argsort + slice.
+/// GPU-native top-k selection using argpartition + slice.
 ///
 /// Returns the top-k values and indices from `probs` along the last axis.
 /// This avoids the CPU round-trip and NaN panic of the previous `custom_topk`.
-/// Indices are returned as Int32 (argsort returns Uint32, which is cast).
+/// Indices are returned as Int32.
 fn gpu_topk(probs: &Array, k: usize) -> Result<(Array, Array), Exception> {
-    // Negate for descending sort, then argsort on GPU
-    let neg_probs = probs.negative()?;
-    let sorted_indices = mlx_rs::ops::argsort_axis(&neg_probs, -1)?;
-
-    // Slice first k (the largest values)
-    let top_indices = sorted_indices.index((.., ..k as i32));
-
-    // Cast to Int32 for downstream as_slice compatibility (argsort returns Uint32)
+    let neg_k = -(k as i32);
+    let partitioned_indices = mlx_rs::ops::argpartition_axis(probs, neg_k, -1)?;
+    let top_indices = partitioned_indices.index((.., neg_k..));
     let top_indices = top_indices.as_type::<i32>()?;
 
     // Gather top-k values
@@ -691,6 +686,63 @@ mod tests {
                 "token {} received duplicate expert assignment: {}/{}",
                 token, a, b
             );
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    #[serial]
+    fn test_gpu_topk_matches_full_sort_reference() -> Result<(), Exception> {
+        let probs = Array::from_slice(
+            &[
+                0.10f32, 0.60, 0.20, 0.40, 0.30, 0.55, 0.15, 0.45, 0.35, 0.25,
+            ],
+            &[2, 5],
+        );
+
+        let (values, indices) = gpu_topk(&probs, 2)?;
+        values.eval()?;
+        indices.eval()?;
+
+        let value_data: Vec<f32> = values.as_slice::<f32>().to_vec();
+        let index_data: Vec<i32> = indices.as_slice::<i32>().to_vec();
+        let probs_data: Vec<f32> = probs.as_slice::<f32>().to_vec();
+
+        for row in 0..2 {
+            let mut expected: Vec<(i32, f32)> = probs_data[row * 5..(row + 1) * 5]
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(idx, value)| (idx as i32, value))
+                .collect();
+            expected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            expected.truncate(2);
+            expected.sort_by_key(|&(idx, _)| idx);
+
+            let mut actual = vec![
+                (index_data[row * 2], value_data[row * 2]),
+                (index_data[row * 2 + 1], value_data[row * 2 + 1]),
+            ];
+            actual.sort_by_key(|&(idx, _)| idx);
+
+            assert_eq!(
+                actual.len(),
+                expected.len(),
+                "row {row} returned the wrong number of top-k entries"
+            );
+            for (actual_pair, expected_pair) in actual.iter().zip(expected.iter()) {
+                assert_eq!(
+                    actual_pair.0, expected_pair.0,
+                    "row {row} selected the wrong expert ids"
+                );
+                assert!(
+                    (actual_pair.1 - expected_pair.1).abs() < 1e-6,
+                    "row {row} selected the wrong top-k values: {:?} vs {:?}",
+                    actual,
+                    expected
+                );
+            }
         }
 
         Ok(())

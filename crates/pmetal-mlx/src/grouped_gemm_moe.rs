@@ -376,35 +376,12 @@ impl GroupedGemmMoE {
         Ok((output, aux_loss))
     }
 
-    /// Top-k expert selection.
+    /// Top-k expert selection on GPU.
     fn topk_experts(&self, probs: &Array) -> Result<(Array, Array), Exception> {
-        probs.eval()?;
-        let shape = probs.shape();
-        let batch = shape[0] as usize;
-        let n_experts = shape[1] as usize;
-        let k = self.config.num_experts_per_tok;
-
-        let probs_data: Vec<f32> = probs.as_slice().to_vec();
-
-        let mut top_values = Vec::with_capacity(batch * k);
-        let mut top_indices = Vec::with_capacity(batch * k);
-
-        for b in 0..batch {
-            let row = &probs_data[b * n_experts..(b + 1) * n_experts];
-
-            // Get indices sorted by value (descending)
-            let mut indexed: Vec<(usize, f32)> = row.iter().cloned().enumerate().collect();
-            indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-
-            for i in 0..k {
-                top_values.push(indexed[i].1);
-                top_indices.push(indexed[i].0 as i32);
-            }
-        }
-
-        let values = Array::from_slice(&top_values, &[batch as i32, k as i32]);
-        let indices = Array::from_slice(&top_indices, &[batch as i32, k as i32]);
-
+        let neg_k = -(self.config.num_experts_per_tok as i32);
+        let partitioned_indices = mlx_rs::ops::argpartition_axis(probs, neg_k, -1)?;
+        let indices = partitioned_indices.try_index((.., neg_k..))?.as_type::<i32>()?;
+        let values = probs.take_along_axis(&indices, -1)?;
         Ok((values, indices))
     }
 
@@ -690,9 +667,28 @@ mod tests {
         assert_eq!(values.shape(), &[2, 2]);
         assert_eq!(indices.shape(), &[2, 2]);
 
-        // Check first row: top 2 are indices 1 (0.4) and 3 (0.3)
+        let value_data: Vec<f32> = values.as_slice::<f32>().to_vec();
         let idx_data: Vec<i32> = indices.as_slice().to_vec();
-        assert_eq!(idx_data[0], 1); // 0.4 is highest
-        assert_eq!(idx_data[1], 3); // 0.3 is second
+
+        let probs_data: Vec<f32> = probs.as_slice::<f32>().to_vec();
+        for row in 0..2 {
+            let mut expected: Vec<(i32, f32)> = probs_data[row * 4..(row + 1) * 4]
+                .iter()
+                .cloned()
+                .enumerate()
+                .map(|(idx, value)| (idx as i32, value))
+                .collect();
+            expected.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            expected.truncate(2);
+            expected.sort_by_key(|&(idx, _)| idx);
+
+            let mut actual = vec![
+                (idx_data[row * 2], value_data[row * 2]),
+                (idx_data[row * 2 + 1], value_data[row * 2 + 1]),
+            ];
+            actual.sort_by_key(|&(idx, _)| idx);
+
+            assert_eq!(actual, expected, "row {row} returned the wrong top-k set");
+        }
     }
 }

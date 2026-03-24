@@ -485,6 +485,438 @@ kernel void mpp_flash_attention_fwd_d64(
 }
 
 // =============================================================================
+// FlashAttention Forward with Block GEMM (D=80, causal via padded D=96 tiles)
+// =============================================================================
+//
+// Uses an internal D=96 tile so the MPP 32x32 matmul contract stays identical to
+// the existing D=96 kernel. Q/K/V loads zero-pad columns 80..95, and writeback
+// only stores the first 80 output elements per row.
+
+kernel void mpp_flash_attention_fwd_d80_causal(
+    device half* Q [[buffer(0)]],
+    device half* K [[buffer(1)]],
+    device half* V [[buffer(2)]],
+    device half* O [[buffer(3)]],
+    device float* L [[buffer(4)]],
+    constant FlashAttentionParams& params [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]
+) {
+    const uint Bq = 32;
+    const uint Bk = 32;
+    const uint D_EXT = 80;
+    const uint D_PAD = 96;
+    const uint ROWS_PER_GROUP = 8;
+
+    const uint batch_idx = tgid.z;
+    const uint head_idx = tgid.y;
+    const uint q_block_idx = tgid.x;
+    const uint kv_head_idx = head_idx / params.gqa_ratio;
+    const uint q_start = q_block_idx * Bq;
+
+    const uint q_batch_stride = params.num_heads * params.query_seq_len * D_EXT;
+    const uint q_head_stride = params.query_seq_len * D_EXT;
+    const uint kv_batch_stride = params.num_kv_heads * params.kv_seq_len * D_EXT;
+    const uint kv_head_stride = params.kv_seq_len * D_EXT;
+
+    device half* Q_head = Q + batch_idx * q_batch_stride + head_idx * q_head_stride;
+    device half* K_head = K + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
+    device half* V_head = V + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
+    device half* O_head = O + batch_idx * q_batch_stride + head_idx * q_head_stride;
+    device float* L_head = L + batch_idx * params.num_heads * params.query_seq_len
+                             + head_idx * params.query_seq_len;
+
+    threadgroup half Q_tile[Bq * D_PAD];
+    threadgroup half K_tile[Bk * D_PAD];
+    threadgroup half V_tile[Bk * D_PAD];
+    threadgroup float S_tile[Bq * Bk];
+    threadgroup half P_half[Bq * Bk];
+
+    const uint group_row_start = simd_group_id * ROWS_PER_GROUP;
+    const uint linear_tid = tid.y * SIMD_SIZE + tid.x;
+
+    float m_i[ROWS_PER_GROUP];
+    float l_i[ROWS_PER_GROUP];
+    float o_local[ROWS_PER_GROUP][3];
+
+    #pragma unroll
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        m_i[r] = -INFINITY;
+        l_i[r] = 0.0f;
+        o_local[r][0] = o_local[r][1] = o_local[r][2] = 0.0f;
+    }
+
+    for (uint i = linear_tid; i < Bq * D_PAD; i += 128) {
+        uint q_row = i / D_PAD;
+        uint q_col = i % D_PAD;
+        uint global_q_row = q_start + q_row;
+        Q_tile[i] = (global_q_row < params.query_seq_len && q_col < D_EXT)
+                   ? Q_head[global_q_row * D_EXT + q_col] : half(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint kv_end = min(q_start + Bq, params.kv_seq_len);
+    uint num_kv_blocks = (kv_end + Bk - 1) / Bk;
+
+    constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 32, static_cast<int>(dynamic_extent), false, true, false
+    );
+    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroups<4>> qk_op;
+
+    constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 32, static_cast<int>(dynamic_extent), false, false, false
+    );
+    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroups<4>> pv_op;
+
+    for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+        uint k_start = kv_block * Bk;
+        uint k_end_actual = min(k_start + Bk, params.kv_seq_len);
+
+        for (uint i = linear_tid; i < Bk * D_PAD; i += 128) {
+            uint row = i / D_PAD;
+            uint col = i % D_PAD;
+            uint global_row = k_start + row;
+            K_tile[i] = (global_row < k_end_actual && col < D_EXT)
+                      ? K_head[global_row * D_EXT + col] : half(0.0f);
+            V_tile[i] = (global_row < k_end_actual && col < D_EXT)
+                      ? V_head[global_row * D_EXT + col] : half(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto tQ = tensor((threadgroup half*)Q_tile,
+                         dextents<int, 2>{(int)D_PAD, (int)Bq},
+                         array<int, 2>{1, (int)D_PAD});
+        auto tK = tensor((threadgroup half*)K_tile,
+                         dextents<int, 2>{(int)D_PAD, (int)Bk},
+                         array<int, 2>{1, (int)D_PAD});
+        auto tS = tensor((threadgroup float*)S_tile,
+                         dextents<int, 2>{(int)Bk, (int)Bq},
+                         array<int, 2>{1, (int)Bk});
+        qk_op.run(tQ, tK, tS);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+            uint my_row = group_row_start + r;
+            uint global_q_pos = q_start + my_row;
+            if (my_row >= Bq || global_q_pos >= params.query_seq_len) {
+                for (uint k = simd_lane_id; k < Bk; k += SIMD_SIZE) {
+                    P_half[my_row * Bk + k] = half(0.0f);
+                }
+                continue;
+            }
+
+            float row_max = -INFINITY;
+            for (uint k = simd_lane_id; k < Bk; k += SIMD_SIZE) {
+                uint global_k_pos = k_start + k;
+                float s = S_tile[my_row * Bk + k] * params.scale;
+
+                if (global_k_pos > global_q_pos || global_k_pos >= k_end_actual) {
+                    s = -INFINITY;
+                }
+                if (params.sliding_window > 0 && global_q_pos > global_k_pos + params.sliding_window) {
+                    s = -INFINITY;
+                }
+                if (params.softcap > 0.0f && s > -INFINITY) {
+                    s = params.softcap * tanh(s / params.softcap);
+                }
+                S_tile[my_row * Bk + k] = s;
+                row_max = max(row_max, s);
+            }
+            row_max = simd_max_f32(row_max);
+
+            float m_new = max(m_i[r], row_max);
+            float correction = metal::exp(m_i[r] - m_new);
+
+            float row_sum = 0.0f;
+            for (uint k = simd_lane_id; k < Bk; k += SIMD_SIZE) {
+                float s = S_tile[my_row * Bk + k];
+                float p = (s > -INFINITY) ? metal::exp(s - m_new) : 0.0f;
+                P_half[my_row * Bk + k] = half(p);
+                row_sum += p;
+            }
+            row_sum = simd_sum_f32(row_sum);
+
+            l_i[r] = correction * l_i[r] + row_sum;
+
+            #pragma unroll
+            for (uint dd = 0; dd < 3; dd++) {
+                o_local[r][dd] *= correction;
+            }
+
+            m_i[r] = m_new;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup half* O_partial = (threadgroup half*)K_tile;
+
+        auto tP = tensor((threadgroup half*)P_half,
+                         dextents<int, 2>{(int)Bk, (int)Bq},
+                         array<int, 2>{1, (int)Bk});
+        auto tV_full = tensor((threadgroup half*)V_tile,
+                              dextents<int, 2>{(int)D_PAD, (int)Bk},
+                              array<int, 2>{1, (int)D_PAD});
+        auto tO_full = tensor(O_partial,
+                              dextents<int, 2>{(int)D_PAD, (int)Bq},
+                              array<int, 2>{1, (int)D_PAD});
+
+        #pragma unroll
+        for (uint d_start = 0; d_start < D_PAD; d_start += 32) {
+            auto tV_chunk = tV_full.slice((int)d_start, 0);
+            auto tO_chunk = tO_full.slice((int)d_start, 0);
+            pv_op.run(tP, tV_chunk, tO_chunk);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+            uint my_row = group_row_start + r;
+            if (my_row >= Bq) continue;
+
+            #pragma unroll
+            for (uint dd = 0; dd < 3; dd++) {
+                uint d = simd_lane_id * 3 + dd;
+                o_local[r][dd] += float(O_partial[my_row * D_PAD + d]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
+        uint global_q_idx = q_start + my_row;
+        if (my_row >= Bq || global_q_idx >= params.query_seq_len) continue;
+
+        float inv_l = (l_i[r] > 0.0f) ? 1.0f / l_i[r] : 0.0f;
+
+        #pragma unroll
+        for (uint dd = 0; dd < 3; dd++) {
+            uint d = simd_lane_id * 3 + dd;
+            if (d < D_EXT) {
+                O_head[global_q_idx * D_EXT + d] = half(o_local[r][dd] * inv_l);
+            }
+        }
+
+        if (simd_lane_id == 0) {
+            L_head[global_q_idx] = m_i[r] + log(max(l_i[r], 1e-10f));
+        }
+    }
+}
+
+// =============================================================================
+// FlashAttention Forward (D=80, non-causal via padded D=96 tiles)
+// =============================================================================
+
+kernel void mpp_flash_attention_fwd_d80(
+    device half* Q [[buffer(0)]],
+    device half* K [[buffer(1)]],
+    device half* V [[buffer(2)]],
+    device half* O [[buffer(3)]],
+    device float* L [[buffer(4)]],
+    constant FlashAttentionParams& params [[buffer(5)]],
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint3 tid [[thread_position_in_threadgroup]],
+    uint simd_lane_id [[thread_index_in_simdgroup]],
+    uint simd_group_id [[simdgroup_index_in_threadgroup]]
+) {
+    const uint Bq = 32;
+    const uint Bk = 32;
+    const uint D_EXT = 80;
+    const uint D_PAD = 96;
+    const uint ROWS_PER_GROUP = 8;
+
+    const uint batch_idx = tgid.z;
+    const uint head_idx = tgid.y;
+    const uint q_block_idx = tgid.x;
+    const uint kv_head_idx = head_idx / params.gqa_ratio;
+    const uint q_start = q_block_idx * Bq;
+
+    const uint q_batch_stride = params.num_heads * params.query_seq_len * D_EXT;
+    const uint q_head_stride = params.query_seq_len * D_EXT;
+    const uint kv_batch_stride = params.num_kv_heads * params.kv_seq_len * D_EXT;
+    const uint kv_head_stride = params.kv_seq_len * D_EXT;
+
+    device half* Q_head = Q + batch_idx * q_batch_stride + head_idx * q_head_stride;
+    device half* K_head = K + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
+    device half* V_head = V + batch_idx * kv_batch_stride + kv_head_idx * kv_head_stride;
+    device half* O_head = O + batch_idx * q_batch_stride + head_idx * q_head_stride;
+    device float* L_head = L + batch_idx * params.num_heads * params.query_seq_len
+                             + head_idx * params.query_seq_len;
+
+    threadgroup half Q_tile[Bq * D_PAD];
+    threadgroup half K_tile[Bk * D_PAD];
+    threadgroup half V_tile[Bk * D_PAD];
+    threadgroup float S_tile[Bq * Bk];
+    threadgroup half P_half[Bq * Bk];
+
+    const uint group_row_start = simd_group_id * ROWS_PER_GROUP;
+    const uint linear_tid = tid.y * SIMD_SIZE + tid.x;
+
+    float m_i[ROWS_PER_GROUP];
+    float l_i[ROWS_PER_GROUP];
+    float o_local[ROWS_PER_GROUP][3];
+
+    #pragma unroll
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        m_i[r] = -INFINITY;
+        l_i[r] = 0.0f;
+        o_local[r][0] = o_local[r][1] = o_local[r][2] = 0.0f;
+    }
+
+    for (uint i = linear_tid; i < Bq * D_PAD; i += 128) {
+        uint q_row = i / D_PAD;
+        uint q_col = i % D_PAD;
+        uint global_q_row = q_start + q_row;
+        Q_tile[i] = (global_q_row < params.query_seq_len && q_col < D_EXT)
+                   ? Q_head[global_q_row * D_EXT + q_col] : half(0.0f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint num_kv_blocks = (params.kv_seq_len + Bk - 1) / Bk;
+
+    constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 32, static_cast<int>(dynamic_extent), false, true, false
+    );
+    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroups<4>> qk_op;
+
+    constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
+        32, 32, static_cast<int>(dynamic_extent), false, false, false
+    );
+    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroups<4>> pv_op;
+
+    for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
+        uint k_start = kv_block * Bk;
+        uint k_end_actual = min(k_start + Bk, params.kv_seq_len);
+
+        for (uint i = linear_tid; i < Bk * D_PAD; i += 128) {
+            uint row = i / D_PAD;
+            uint col = i % D_PAD;
+            uint global_row = k_start + row;
+            K_tile[i] = (global_row < k_end_actual && col < D_EXT)
+                      ? K_head[global_row * D_EXT + col] : half(0.0f);
+            V_tile[i] = (global_row < k_end_actual && col < D_EXT)
+                      ? V_head[global_row * D_EXT + col] : half(0.0f);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        auto tQ = tensor((threadgroup half*)Q_tile,
+                         dextents<int, 2>{(int)D_PAD, (int)Bq},
+                         array<int, 2>{1, (int)D_PAD});
+        auto tK = tensor((threadgroup half*)K_tile,
+                         dextents<int, 2>{(int)D_PAD, (int)Bk},
+                         array<int, 2>{1, (int)D_PAD});
+        auto tS = tensor((threadgroup float*)S_tile,
+                         dextents<int, 2>{(int)Bk, (int)Bq},
+                         array<int, 2>{1, (int)Bk});
+        qk_op.run(tQ, tK, tS);
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+            uint my_row = group_row_start + r;
+            uint global_q_pos = q_start + my_row;
+            if (my_row >= Bq || global_q_pos >= params.query_seq_len) {
+                for (uint k = simd_lane_id; k < Bk; k += SIMD_SIZE) {
+                    P_half[my_row * Bk + k] = half(0.0f);
+                }
+                continue;
+            }
+
+            float row_max = -INFINITY;
+            for (uint k = simd_lane_id; k < Bk; k += SIMD_SIZE) {
+                uint global_k_pos = k_start + k;
+                float s = S_tile[my_row * Bk + k] * params.scale;
+                if (global_k_pos >= k_end_actual) s = -INFINITY;
+                if (params.sliding_window > 0 && global_q_pos > global_k_pos + params.sliding_window) s = -INFINITY;
+                if (params.softcap > 0.0f && s > -INFINITY) s = params.softcap * tanh(s / params.softcap);
+                S_tile[my_row * Bk + k] = s;
+                row_max = max(row_max, s);
+            }
+            row_max = simd_max_f32(row_max);
+
+            float m_new = max(m_i[r], row_max);
+            float correction = metal::exp(m_i[r] - m_new);
+
+            float row_sum = 0.0f;
+            for (uint k = simd_lane_id; k < Bk; k += SIMD_SIZE) {
+                float s = S_tile[my_row * Bk + k];
+                float p = (s > -INFINITY) ? metal::exp(s - m_new) : 0.0f;
+                P_half[my_row * Bk + k] = half(p);
+                row_sum += p;
+            }
+            row_sum = simd_sum_f32(row_sum);
+
+            l_i[r] = correction * l_i[r] + row_sum;
+
+            #pragma unroll
+            for (uint dd = 0; dd < 3; dd++) {
+                o_local[r][dd] *= correction;
+            }
+
+            m_i[r] = m_new;
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        threadgroup half* O_partial = (threadgroup half*)K_tile;
+
+        auto tP = tensor((threadgroup half*)P_half,
+                         dextents<int, 2>{(int)Bk, (int)Bq},
+                         array<int, 2>{1, (int)Bk});
+        auto tV_full = tensor((threadgroup half*)V_tile,
+                              dextents<int, 2>{(int)D_PAD, (int)Bk},
+                              array<int, 2>{1, (int)D_PAD});
+        auto tO_full = tensor(O_partial,
+                              dextents<int, 2>{(int)D_PAD, (int)Bq},
+                              array<int, 2>{1, (int)D_PAD});
+
+        #pragma unroll
+        for (uint d_start = 0; d_start < D_PAD; d_start += 32) {
+            auto tV_chunk = tV_full.slice((int)d_start, 0);
+            auto tO_chunk = tO_full.slice((int)d_start, 0);
+            pv_op.run(tP, tV_chunk, tO_chunk);
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+            uint my_row = group_row_start + r;
+            if (my_row >= Bq) continue;
+
+            #pragma unroll
+            for (uint dd = 0; dd < 3; dd++) {
+                uint d = simd_lane_id * 3 + dd;
+                o_local[r][dd] += float(O_partial[my_row * D_PAD + d]);
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    for (uint r = 0; r < ROWS_PER_GROUP; r++) {
+        uint my_row = group_row_start + r;
+        uint global_q_idx = q_start + my_row;
+        if (my_row >= Bq || global_q_idx >= params.query_seq_len) continue;
+
+        float inv_l = (l_i[r] > 0.0f) ? 1.0f / l_i[r] : 0.0f;
+        #pragma unroll
+        for (uint dd = 0; dd < 3; dd++) {
+            uint d = simd_lane_id * 3 + dd;
+            if (d < D_EXT) {
+                O_head[global_q_idx * D_EXT + d] = half(o_local[r][dd] * inv_l);
+            }
+        }
+        if (simd_lane_id == 0) {
+            L_head[global_q_idx] = m_i[r] + log(max(l_i[r], 1e-10f));
+        }
+    }
+}
+
+// =============================================================================
 // FlashAttention Forward with Block GEMM (D=96, causal)
 // =============================================================================
 //

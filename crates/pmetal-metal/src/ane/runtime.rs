@@ -1207,12 +1207,34 @@ unsafe fn ns_array_from_numbers(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ane::{iosurface::IoSurface, mil::MilProgram};
+    use crate::ane::{
+        iosurface::IoSurface,
+        kernel::{self, TransformerKernelConfig},
+        mil::MilProgram,
+    };
     use std::os::unix::process::ExitStatusExt;
     use std::process::Command;
+    use std::time::Instant;
 
     const CHAINING_SMOKE_CHILD_ENV: &str = "PMETAL_ANE_CHAINING_SMOKE_CHILD";
     const CHAINING_SMOKE_TEST_NAME: &str = "ane::runtime::tests::test_prepare_loopback_chain_smoke";
+
+    fn median_f64(values: &mut [f64]) -> f64 {
+        values.sort_by(|lhs, rhs| lhs.partial_cmp(rhs).unwrap());
+        let mid = values.len() / 2;
+        if values.len() % 2 == 0 {
+            (values[mid - 1] + values[mid]) * 0.5
+        } else {
+            values[mid]
+        }
+    }
+
+    fn max_abs_diff(lhs: &[f32], rhs: &[f32]) -> f32 {
+        lhs.iter()
+            .zip(rhs.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0, f32::max)
+    }
 
     #[test]
     fn test_ane_runtime_global() {
@@ -1336,6 +1358,130 @@ mod tests {
                 "standard={standard}, realtime={realtime}"
             );
         }
+    }
+
+    #[test]
+    #[ignore = "requires ANE hardware and private AppleNeuralEngine.framework"]
+    fn test_real_time_eval_sdpa_latency_probe() {
+        let rt = match AneRuntime::global() {
+            Ok(rt) => rt,
+            Err(MetalError::AneNotAvailable) => return,
+            Err(e) => panic!("Unexpected error: {e}"),
+        };
+        if !rt.real_time_available() {
+            return;
+        }
+
+        let cfg = TransformerKernelConfig {
+            dim: 64,
+            hidden_dim: 128,
+            n_heads: 4,
+            n_kv_heads: 4,
+            head_dim: 16,
+            seq_len: 16,
+            rope_theta: 10_000.0,
+            rms_norm_eps: 1e-5,
+        };
+        let rms_att = vec![1.0f32; cfg.dim];
+        let wq = (0..cfg.q_dim() * cfg.dim)
+            .map(|idx| ((idx % 19) as f32 - 9.0) * 0.01)
+            .collect::<Vec<_>>();
+        let wk = (0..cfg.kv_dim() * cfg.dim)
+            .map(|idx| ((idx % 17) as f32 - 8.0) * 0.01)
+            .collect::<Vec<_>>();
+        let wv = (0..cfg.kv_dim() * cfg.dim)
+            .map(|idx| ((idx % 13) as f32 - 6.0) * 0.01)
+            .collect::<Vec<_>>();
+        let wo = (0..cfg.dim * cfg.q_dim())
+            .map(|idx| ((idx % 23) as f32 - 11.0) * 0.01)
+            .collect::<Vec<_>>();
+        let sdpa = kernel::gen_sdpa_fwd_taps(&cfg, &rms_att, &wq, &wk, &wv, &wo);
+
+        let model = match rt.compile(sdpa.mil_text.as_bytes(), Some(&sdpa.weights)) {
+            Ok(model) => model,
+            Err(MetalError::AneCompileFailed(_)) | Err(MetalError::AneLoadFailed(_)) => return,
+            Err(e) => panic!("Unexpected error: {e}"),
+        };
+        if !model.real_time_available() {
+            return;
+        }
+
+        let input = IoSurface::for_tensor(cfg.dim, cfg.seq_len).unwrap();
+        let output_channels = cfg.sdpa_fwd_output_ch();
+        let output_std = IoSurface::for_tensor(output_channels, cfg.seq_len).unwrap();
+        let output_rt = IoSurface::for_tensor(output_channels, cfg.seq_len).unwrap();
+        let input_values = (0..cfg.dim * cfg.seq_len)
+            .map(|idx| ((idx % 29) as f32 - 14.0) * 0.03125)
+            .collect::<Vec<_>>();
+        input.write_f32_as_fp16(&input_values, cfg.dim, cfg.seq_len);
+
+        if let Err(err) = model.evaluate(&[input.as_ptr()], &[output_std.as_ptr()]) {
+            eprintln!("Skipping SDPA standard-vs-real-time probe: {err}");
+            return;
+        }
+        if let Err(err) = model.evaluate_real_time(&[input.as_ptr()], &[output_rt.as_ptr()]) {
+            eprintln!("Skipping SDPA real-time probe: {err}");
+            return;
+        }
+
+        let mut std_values = vec![0.0f32; output_channels * cfg.seq_len];
+        let mut rt_values = vec![0.0f32; output_channels * cfg.seq_len];
+        output_std.read_fp16_as_f32(&mut std_values, 0, output_channels, cfg.seq_len);
+        output_rt.read_fp16_as_f32(&mut rt_values, 0, output_channels, cfg.seq_len);
+
+        let max_diff = max_abs_diff(&std_values, &rt_values);
+        assert!(max_diff < 5e-2, "SDPA RT output drifted: max_diff={max_diff}");
+
+        let iterations = 7;
+        let mut standard_wall_ms = Vec::with_capacity(iterations);
+        let mut standard_hw_ms = Vec::with_capacity(iterations);
+        let mut realtime_wall_ms = Vec::with_capacity(iterations);
+        let mut realtime_hw_ms = Vec::with_capacity(iterations);
+
+        for _ in 0..iterations {
+            let start = Instant::now();
+            let stats = match model.evaluate_with_stats(&[input.as_ptr()], &[output_std.as_ptr()]) {
+                Ok(stats) => stats,
+                Err(err) => {
+                    eprintln!("Skipping SDPA latency probe during standard eval: {err}");
+                    return;
+                }
+            };
+            standard_wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            standard_hw_ms.push(stats.hw_execution_time_ns as f64 / 1_000_000.0);
+        }
+
+        for _ in 0..iterations {
+            let start = Instant::now();
+            let stats =
+                match model.evaluate_real_time_with_stats(&[input.as_ptr()], &[output_rt.as_ptr()])
+                {
+                    Ok(stats) => stats,
+                    Err(err) => {
+                        eprintln!("Skipping SDPA latency probe during real-time eval: {err}");
+                        return;
+                    }
+                };
+            realtime_wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);
+            realtime_hw_ms.push(stats.hw_execution_time_ns as f64 / 1_000_000.0);
+        }
+
+        let standard_wall_median = median_f64(&mut standard_wall_ms);
+        let standard_hw_median = median_f64(&mut standard_hw_ms);
+        let realtime_wall_median = median_f64(&mut realtime_wall_ms);
+        let realtime_hw_median = median_f64(&mut realtime_hw_ms);
+
+        eprintln!(
+            "ANE RT SDPA probe seq_len={} dim={} heads={} head_dim={}: standard median wall {:.3} ms / hw {:.3} ms, real-time median wall {:.3} ms / hw {:.3} ms",
+            cfg.seq_len,
+            cfg.dim,
+            cfg.n_heads,
+            cfg.head_dim,
+            standard_wall_median,
+            standard_hw_median,
+            realtime_wall_median,
+            realtime_hw_median
+        );
     }
 
     #[test]

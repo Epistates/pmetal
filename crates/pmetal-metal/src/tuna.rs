@@ -47,7 +47,7 @@ use objc2_metal::{
 use serde::{Deserialize, Serialize};
 
 use crate::buffer::{BufferUsage, MetalBuffer};
-use crate::context::{DeviceTier, MetalContext};
+use crate::context::{DeviceProperties, DeviceTier, MetalContext};
 use crate::error::{MetalError, Result};
 use crate::kernels::flash_attention::{FlashAttention, FlashAttentionConfig};
 use crate::kernels::fused_cross_entropy::{
@@ -385,6 +385,51 @@ where
     }
 }
 
+fn cache_device_tier_label(tier: DeviceTier) -> &'static str {
+    match tier {
+        DeviceTier::Base => "base",
+        DeviceTier::Pro => "pro",
+        DeviceTier::Max => "max",
+        DeviceTier::Ultra => "ultra",
+    }
+}
+
+fn device_cache_identity(props: &DeviceProperties) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        props.name,
+        cache_device_tier_label(props.device_tier),
+        props.architecture_gen,
+        props.gpu_core_count
+    )
+}
+
+fn lora_forward_cache_key(
+    props: &DeviceProperties,
+    batch_size: usize,
+    in_features: usize,
+    out_features: usize,
+    rank: usize,
+) -> String {
+    format!(
+        "fused_lora_forward:{}:{}:{}:{}:{}",
+        device_cache_identity(props),
+        batch_size,
+        in_features,
+        out_features,
+        rank
+    )
+}
+
+fn merge_cache_key(props: &DeviceProperties, num_elements: usize, num_models: usize) -> String {
+    format!(
+        "merge:{}:{}:{}",
+        device_cache_identity(props),
+        num_elements,
+        num_models
+    )
+}
+
 // ============================================================================
 // Tuner
 // ============================================================================
@@ -396,7 +441,7 @@ pub struct Tuner {
     cache: Mutex<HashMap<String, TunedConfig>>,
 
     /// Cache of best configurations for merge ops.
-    /// Key: "merge_kernel:num_elements:num_models"
+    /// Key: "merge:device_name:device_tier:architecture_gen:gpu_core_count:num_elements:num_models"
     merge_cache: Mutex<HashMap<String, MergeTunedConfig>>,
 
     /// Cache of best configurations for SwiGLU kernels.
@@ -412,7 +457,7 @@ pub struct Tuner {
     flash_attention_cache: Mutex<HashMap<String, FlashAttentionTunedConfig>>,
 
     /// Cache of best configurations for Norm+LoRA fused kernels.
-    /// Key: "norm_lora:batch:hidden:out_features:rank"
+    /// Key: "norm_lora:device_name:device_tier:batch:hidden:out_features:rank"
     norm_lora_cache: Mutex<HashMap<String, NormLoraTunedConfig>>,
 
     /// Cache of best configurations for MPP GEMM dispatch.
@@ -486,6 +531,7 @@ impl Tuner {
         };
 
         load_disk_cache_file::<TunedConfig>(&dir.join("lora_forward.json"), &self.cache);
+        load_disk_cache_file::<MergeTunedConfig>(&dir.join("merge.json"), &self.merge_cache);
         load_disk_cache_file::<SwiGLUTunedConfig>(&dir.join("swiglu.json"), &self.swiglu_cache);
         load_disk_cache_file::<CrossEntropyTunedConfig>(
             &dir.join("cross_entropy.json"),
@@ -534,6 +580,15 @@ impl Tuner {
         };
         let path = dir.join("swiglu.json");
         self.flush_cache_file(&path, &self.swiglu_cache, key, config);
+    }
+
+    /// Persist the full merge in-memory cache to `merge.json`.
+    fn save_merge_to_disk(&self, key: &str, config: &MergeTunedConfig) {
+        let Some(dir) = self.ensure_cache_dir() else {
+            return;
+        };
+        let path = dir.join("merge.json");
+        self.flush_cache_file(&path, &self.merge_cache, key, config);
     }
 
     /// Persist the full cross-entropy in-memory cache to `cross_entropy.json`.
@@ -1228,9 +1283,12 @@ impl Tuner {
         out_features: usize,
         rank: usize,
     ) -> Result<TunedConfig> {
-        let key = format!(
-            "fused_lora_forward:{}:{}:{}:{}",
-            batch_size, in_features, out_features, rank
+        let key = lora_forward_cache_key(
+            context.properties(),
+            batch_size,
+            in_features,
+            out_features,
+            rank,
         );
 
         // 1. Check in-memory cache (also populated from disk on startup)
@@ -1654,7 +1712,7 @@ impl Tuner {
         num_elements: usize,
         num_models: usize,
     ) -> Result<MergeTunedConfig> {
-        let key = format!("merge:{}:{}", num_elements, num_models);
+        let key = merge_cache_key(context.properties(), num_elements, num_models);
 
         // Check cache
         if let Some(config) = self.get_merge_config(&key) {
@@ -1696,7 +1754,8 @@ impl Tuner {
         );
 
         // Cache result
-        self.set_merge_config(key, best_config);
+        self.set_merge_config(key.clone(), best_config);
+        self.save_merge_to_disk(&key, &best_config);
 
         Ok(best_config)
     }
@@ -2879,7 +2938,41 @@ impl Tuner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::{AppleGPUFamily, MemoryBandwidthSource};
     use std::sync::Arc;
+
+    fn test_device_properties(
+        name: &str,
+        device_tier: DeviceTier,
+        architecture_gen: u32,
+        gpu_core_count: u32,
+    ) -> DeviceProperties {
+        DeviceProperties {
+            name: name.to_string(),
+            max_threads_per_threadgroup: 1024,
+            max_threadgroup_memory_length: 32 * 1024,
+            has_unified_memory: true,
+            recommended_working_set_size: 32 * 1024 * 1024 * 1024,
+            max_buffer_length: 1 << 30,
+            gpu_family: AppleGPUFamily::Apple9,
+            device_tier,
+            has_dynamic_caching: true,
+            has_hardware_ray_tracing: true,
+            has_mesh_shaders: true,
+            has_nax: architecture_gen >= 17,
+            architecture_gen,
+            memory_bandwidth_gbps: 100.0,
+            memory_bandwidth_source: MemoryBandwidthSource::SpecTableFallback,
+            gpu_core_count,
+            ane_core_count: 16,
+            is_ultra_fusion: matches!(device_tier, DeviceTier::Ultra),
+            die_count: if matches!(device_tier, DeviceTier::Ultra) {
+                2
+            } else {
+                1
+            },
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Struct defaults
@@ -3040,7 +3133,7 @@ mod tests {
     #[test]
     fn merge_cache_get_set() {
         let tuner = Tuner::new();
-        let key = "merge:1024:3".to_string();
+        let key = "merge:Apple M4:base:16:10:1024:3".to_string();
         assert!(tuner.get_merge_config(&key).is_none());
 
         let cfg = MergeTunedConfig {
@@ -3050,6 +3143,32 @@ mod tests {
         };
         tuner.set_merge_config(key.clone(), cfg);
         assert_eq!(tuner.get_merge_config(&key), Some(cfg));
+    }
+
+    #[test]
+    fn lora_forward_cache_key_includes_device_identity() {
+        let base = test_device_properties("Apple M4", DeviceTier::Base, 16, 10);
+        let max = test_device_properties("Apple M4 Max", DeviceTier::Max, 16, 40);
+
+        let base_key = lora_forward_cache_key(&base, 64, 1024, 1024, 16);
+        let max_key = lora_forward_cache_key(&max, 64, 1024, 1024, 16);
+
+        assert_ne!(base_key, max_key);
+        assert!(base_key.contains("Apple M4:base:16:10"));
+        assert!(max_key.contains("Apple M4 Max:max:16:40"));
+    }
+
+    #[test]
+    fn merge_cache_key_includes_device_identity() {
+        let pro = test_device_properties("Apple M3 Pro", DeviceTier::Pro, 15, 18);
+        let ultra = test_device_properties("Apple M4 Ultra", DeviceTier::Ultra, 16, 80);
+
+        let pro_key = merge_cache_key(&pro, 1_048_576, 6);
+        let ultra_key = merge_cache_key(&ultra, 1_048_576, 6);
+
+        assert_ne!(pro_key, ultra_key);
+        assert!(pro_key.contains("Apple M3 Pro:pro:15:18"));
+        assert!(ultra_key.contains("Apple M4 Ultra:ultra:16:80"));
     }
 
     // -------------------------------------------------------------------------
@@ -3152,6 +3271,70 @@ mod tests {
         let contents = fs::read_to_string(&json_path).unwrap();
         let map: HashMap<String, MppGemmTunedConfig> = serde_json::from_str(&contents).unwrap();
         assert_eq!(map.get(key), Some(&config));
+    }
+
+    #[test]
+    fn merge_disk_cache_write_read_roundtrip() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
+
+        let tuner = Tuner {
+            cache: Mutex::new(HashMap::new()),
+            merge_cache: Mutex::new(HashMap::new()),
+            swiglu_cache: Mutex::new(HashMap::new()),
+            cross_entropy_cache: Mutex::new(HashMap::new()),
+            flash_attention_cache: Mutex::new(HashMap::new()),
+            norm_lora_cache: Mutex::new(HashMap::new()),
+            mpp_gemm_cache: Mutex::new(HashMap::new()),
+            cache_dir: Some(cache_path.clone()),
+        };
+
+        let key = "merge:Apple M4 Max:max:16:40:1048576:8";
+        let config = MergeTunedConfig {
+            threads_per_group: 512,
+            elements_per_thread: 8,
+            use_simd: true,
+        };
+        tuner.save_merge_to_disk(key, &config);
+
+        let json_path = cache_path.join("merge.json");
+        assert!(json_path.exists(), "merge.json should have been created");
+
+        let contents = fs::read_to_string(&json_path).unwrap();
+        let map: HashMap<String, MergeTunedConfig> = serde_json::from_str(&contents).unwrap();
+        assert_eq!(map.get(key), Some(&config));
+    }
+
+    #[test]
+    fn merge_disk_cache_load_populates_in_memory() {
+        let tmp_dir = tempfile::tempdir().expect("tempdir");
+        let cache_path = tmp_dir.path().join("pmetal").join("tuna");
+        fs::create_dir_all(&cache_path).unwrap();
+
+        let key = "merge:Apple M5 Pro:pro:17:28:2097152:6";
+        let config = MergeTunedConfig {
+            threads_per_group: 256,
+            elements_per_thread: 8,
+            use_simd: true,
+        };
+        let map: HashMap<&str, MergeTunedConfig> = [(key, config)].into_iter().collect();
+        let json = serde_json::to_string_pretty(&map).unwrap();
+        fs::write(cache_path.join("merge.json"), &json).unwrap();
+
+        let mut tuner = Tuner {
+            cache: Mutex::new(HashMap::new()),
+            merge_cache: Mutex::new(HashMap::new()),
+            swiglu_cache: Mutex::new(HashMap::new()),
+            cross_entropy_cache: Mutex::new(HashMap::new()),
+            flash_attention_cache: Mutex::new(HashMap::new()),
+            norm_lora_cache: Mutex::new(HashMap::new()),
+            mpp_gemm_cache: Mutex::new(HashMap::new()),
+            cache_dir: Some(cache_path),
+        };
+        tuner.load_disk_cache();
+
+        let guard = tuner.merge_cache.lock().unwrap();
+        assert_eq!(guard.get(key), Some(&config));
     }
 
     #[test]

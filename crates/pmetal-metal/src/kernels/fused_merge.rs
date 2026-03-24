@@ -154,7 +154,7 @@ impl FusedMergeMetal {
     pub fn new(ctx: Arc<MetalContext>) -> Self {
         Self {
             ctx,
-            tuner: Tuner::new(),
+            tuner: Tuner::with_persistent_cache(),
             tuned_config: None,
         }
     }

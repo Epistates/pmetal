@@ -59,6 +59,7 @@ struct AttentionDispatchKey {
     kv_seq_len: i32,
     head_dim: i32,
     mask_type: AttentionMaskType,
+    softcap_bits: Option<u32>,
 }
 
 static ATTENTION_BACKEND_CACHE: OnceLock<PersistentChoiceCache<AttentionBackendChoice>> =
@@ -92,7 +93,7 @@ impl AttentionDispatchKey {
         dtype: Dtype,
         q_shape: &[i32],
         k_shape: &[i32],
-        mask_type: AttentionMaskType,
+        config: &FusedAttentionConfig,
     ) -> Option<Self> {
         Some(Self {
             device_name: props.name.clone(),
@@ -104,13 +105,14 @@ impl AttentionDispatchKey {
             query_seq_len: q_shape[2],
             kv_seq_len: k_shape[2],
             head_dim: q_shape[3],
-            mask_type,
+            mask_type: config.mask_type,
+            softcap_bits: config.logit_softcapping.map(f32::to_bits),
         })
     }
 
     fn cache_key(&self) -> String {
         format!(
-            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}",
+            "{}:{}:{}:{}:{}:{}:{}:{}:{}:{:?}:{:?}",
             self.device_name,
             self.device_tier,
             self.dtype,
@@ -120,7 +122,8 @@ impl AttentionDispatchKey {
             self.query_seq_len,
             self.kv_seq_len,
             self.head_dim,
-            self.mask_type
+            self.mask_type,
+            self.softcap_bits
         )
     }
 }
@@ -279,7 +282,7 @@ fn try_selected_attention_backend(
                     backend
                 );
                 cache_attention_backend(dispatch_key.clone(), AttentionBackendChoice::MlxFast);
-                fast_fused_sdpa(queries, keys, values, config, None).map(Some)
+                reference_attention_output(queries, keys, values, config).map(Some)
             });
     }
 
@@ -297,7 +300,7 @@ fn benchmarkable_attention_dispatch_key(
     custom_mask: Option<&Array>,
     props: &DeviceProperties,
 ) -> Option<AttentionDispatchKey> {
-    if custom_mask.is_some() || config.logit_softcapping.is_some() {
+    if custom_mask.is_some() {
         return None;
     }
 
@@ -307,7 +310,7 @@ fn benchmarkable_attention_dispatch_key(
 
     let q_shape = queries.shape();
     let k_shape = keys.shape();
-    AttentionDispatchKey::new(props, queries.dtype(), q_shape, k_shape, config.mask_type)
+    AttentionDispatchKey::new(props, queries.dtype(), q_shape, k_shape, config)
 }
 
 fn execute_attention_backend(
@@ -319,7 +322,9 @@ fn execute_attention_backend(
     metal_ctx: &std::sync::Arc<MetalContext>,
 ) -> Result<Array, Exception> {
     match backend {
-        AttentionBackendChoice::MlxFast => fast_fused_sdpa(queries, keys, values, config, None),
+        AttentionBackendChoice::MlxFast => {
+            reference_attention_output(queries, keys, values, config)
+        }
         AttentionBackendChoice::MetalFlash => {
             run_metal_flash_attention(queries, keys, values, config, metal_ctx)
         }
@@ -336,15 +341,14 @@ fn benchmark_attention_backends(
     config: &FusedAttentionConfig,
     metal_ctx: &std::sync::Arc<MetalContext>,
 ) -> Result<(AttentionBackendChoice, Array), Exception> {
-    let mlx_start = Instant::now();
-    let mlx_output = fast_fused_sdpa(queries, keys, values, config, None)?;
-    mlx_output.eval()?;
-    let mlx_elapsed = mlx_start.elapsed();
-    let reference_output = mlx_output.clone();
+    let reference_start = Instant::now();
+    let reference_output = reference_attention_output(queries, keys, values, config)?;
+    reference_output.eval()?;
+    let reference_elapsed = reference_start.elapsed();
 
     let mut best_backend = AttentionBackendChoice::MlxFast;
-    let mut best_elapsed = mlx_elapsed;
-    let mut best_output = mlx_output;
+    let mut best_elapsed = reference_elapsed;
+    let mut best_output = reference_output.clone();
 
     if let Some((elapsed, output)) = benchmark_attention_candidate(
         AttentionBackendChoice::MetalFlash,
@@ -421,6 +425,19 @@ fn benchmark_attention_candidate(
     }
 
     Ok(Some((elapsed, output)))
+}
+
+fn reference_attention_output(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    config: &FusedAttentionConfig,
+) -> Result<Array, Exception> {
+    if let Some(cap) = config.logit_softcapping {
+        manual_sdpa_with_softcapping(queries, keys, values, config, None, cap)
+    } else {
+        fast_fused_sdpa(queries, keys, values, config, None)
+    }
 }
 
 fn fast_fused_sdpa(
@@ -536,7 +553,7 @@ fn mpp_flash_attention_supported(
 ) -> bool {
     props.has_nax()
         && flash_attention_supported(queries, keys, values, custom_mask)
-        && matches!(queries.shape()[3], 64 | 96 | 128)
+        && matches!(queries.shape()[3], 64 | 80 | 96 | 128)
 }
 
 fn max_abs_diff(lhs: &Array, rhs: &Array) -> Result<f32, Exception> {
@@ -1258,6 +1275,7 @@ mod tests {
             kv_seq_len: 16,
             head_dim: 64,
             mask_type: AttentionMaskType::Causal,
+            softcap_bits: None,
         };
 
         assert_eq!(cached_attention_backend(&key), None);
@@ -1271,17 +1289,45 @@ mod tests {
     }
 
     #[test]
-    fn test_benchmarkable_attention_dispatch_key_rejects_softcapping() {
+    fn test_benchmarkable_attention_dispatch_key_accepts_softcapping_and_tracks_cap() {
         let props = test_device_properties();
         let queries = random_tensor(&[1, 4, 8, 64]);
         let keys = random_tensor(&[1, 4, 8, 64]);
         let values = random_tensor(&[1, 4, 8, 64]);
         let config = FusedAttentionConfig::new(4, 4, 64).with_logit_softcapping(30.0);
+        let other_config = FusedAttentionConfig::new(4, 4, 64).with_logit_softcapping(50.0);
 
-        assert!(
+        let key =
             benchmarkable_attention_dispatch_key(&queries, &keys, &values, &config, None, &props)
-                .is_none()
-        );
+                .expect("softcapped inference shapes should remain benchmarkable");
+        let other_key = benchmarkable_attention_dispatch_key(
+            &queries,
+            &keys,
+            &values,
+            &other_config,
+            None,
+            &props,
+        )
+        .expect("softcapped inference shapes should remain benchmarkable");
+
+        assert_eq!(key.softcap_bits, Some(30.0f32.to_bits()));
+        assert_eq!(other_key.softcap_bits, Some(50.0f32.to_bits()));
+        assert_ne!(key.cache_key(), other_key.cache_key());
+    }
+
+    #[test]
+    fn test_reference_attention_output_matches_manual_softcapping() {
+        let queries = random_tensor(&[1, 4, 8, 64]);
+        let keys = random_tensor(&[1, 4, 8, 64]);
+        let values = random_tensor(&[1, 4, 8, 64]);
+        let config = FusedAttentionConfig::new(4, 4, 64).with_logit_softcapping(30.0);
+
+        let reference = reference_attention_output(&queries, &keys, &values, &config).unwrap();
+        let manual =
+            manual_sdpa_with_softcapping(&queries, &keys, &values, &config, None, 30.0).unwrap();
+
+        let max_diff = max_abs_diff(&reference, &manual).unwrap();
+        assert!(max_diff <= 1e-3, "softcap reference drifted: {max_diff}");
     }
 
     #[test]
@@ -1326,10 +1372,21 @@ mod tests {
         let queries_d80 = random_tensor(&[1, 4, 8, 80]);
         let keys_d80 = random_tensor(&[1, 4, 8, 80]);
         let values_d80 = random_tensor(&[1, 4, 8, 80]);
-        assert!(!mpp_flash_attention_supported(
+        assert!(mpp_flash_attention_supported(
             &queries_d80,
             &keys_d80,
             &values_d80,
+            None,
+            &props
+        ));
+
+        let queries_d72 = random_tensor(&[1, 4, 8, 72]);
+        let keys_d72 = random_tensor(&[1, 4, 8, 72]);
+        let values_d72 = random_tensor(&[1, 4, 8, 72]);
+        assert!(!mpp_flash_attention_supported(
+            &queries_d72,
+            &keys_d72,
+            &values_d72,
             None,
             &props
         ));
