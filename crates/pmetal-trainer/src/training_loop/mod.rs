@@ -272,6 +272,8 @@ pub struct TrainingLoop {
     pub(crate) tokens_since_log: usize,
     /// Time of last log (for throughput calculation).
     pub(crate) last_log_time: Option<std::time::Instant>,
+    /// Step number at the last log boundary.
+    pub(crate) last_log_step: Option<usize>,
     /// Accumulated loss across micro-batches for gradient accumulation.
     pub(crate) accumulated_loss: f64,
     /// Number of micro-batches accumulated (for averaging).
@@ -330,6 +332,7 @@ impl TrainingLoop {
             metal_fa_available,
             tokens_since_log: 0,
             last_log_time: None,
+            last_log_step: None,
             accumulated_loss: 0.0,
             loss_accumulation_count: 0,
             pending_checkpoint: None,
@@ -346,6 +349,112 @@ impl TrainingLoop {
     /// Add a training callback for metrics logging or dashboard integration.
     pub fn add_callback(&mut self, callback: Box<dyn pmetal_core::TrainingCallback>) {
         self.callbacks.push(callback);
+    }
+
+    /// Apply direct training-loop gradient checkpointing configuration.
+    ///
+    /// The orchestrator already configures checkpointing on loaded models, but
+    /// callers that use `TrainingLoop` directly rely on the loop entry points to
+    /// keep dispatch modes consistent.
+    pub(crate) fn apply_gradient_checkpointing<M>(&self, model: &mut M, mode: &str)
+    where
+        M: TrainableModel,
+    {
+        if !self.config.gradient_checkpointing {
+            return;
+        }
+
+        if !model.supports_gradient_checkpointing() {
+            if mode.is_empty() {
+                tracing::warn!(
+                    "Gradient checkpointing requested but not supported by this model; \
+                     continuing without it."
+                );
+            } else {
+                tracing::warn!(
+                    "{}: gradient checkpointing requested but not supported by this model; \
+                     continuing without it.",
+                    mode
+                );
+            }
+            return;
+        }
+
+        let layers = self.config.gradient_checkpointing_layers.max(1);
+        model.enable_gradient_checkpointing(layers);
+
+        if mode.is_empty() {
+            tracing::info!(
+                "Gradient checkpointing enabled: {} layers per checkpoint block",
+                layers
+            );
+        } else {
+            tracing::info!(
+                "{}: gradient checkpointing enabled (every {} layers)",
+                mode,
+                layers
+            );
+        }
+    }
+
+    /// Run the standard loop while retaining ownership of the model.
+    pub(crate) fn run_standard_owned<M>(
+        &mut self,
+        mut model: M,
+        train_dataset: TrainingDataset,
+        eval_dataset: Option<TrainingDataset>,
+        checkpoint_manager: Option<&CheckpointManager>,
+    ) -> Result<M>
+    where
+        M: TrainableModel,
+    {
+        self.run(
+            &mut model,
+            train_dataset,
+            eval_dataset,
+            checkpoint_manager,
+        )?;
+        Ok(model)
+    }
+
+    /// Start a new logging interval from the current training step.
+    pub(crate) fn reset_log_interval(&mut self) {
+        self.last_log_time = Some(std::time::Instant::now());
+        self.last_log_step = Some(self.step);
+        self.tokens_since_log = 0;
+    }
+
+    /// Consume the current logging interval and return averaged throughput metrics.
+    pub(crate) fn take_log_interval_metrics(
+        &mut self,
+        now: std::time::Instant,
+    ) -> LogIntervalMetrics {
+        let total_ms = self
+            .last_log_time
+            .map(|last| now.duration_since(last).as_secs_f64() * 1000.0)
+            .unwrap_or(0.0);
+        let tokens = self.tokens_since_log;
+        let steps = self
+            .last_log_step
+            .map(|last| self.step.saturating_sub(last))
+            .unwrap_or(1)
+            .max(1);
+        let tok_sec = if total_ms > 0.0 {
+            tokens as f64 / (total_ms / 1000.0)
+        } else {
+            0.0
+        };
+
+        self.last_log_time = Some(now);
+        self.last_log_step = Some(self.step);
+        self.tokens_since_log = 0;
+
+        LogIntervalMetrics {
+            steps,
+            tokens,
+            total_ms,
+            tok_sec,
+        }
     }
 
     /// Enable adaptive LR control with the given config.
@@ -1326,6 +1435,14 @@ impl TrainingLoop {
         self.pending_checkpoint = Some(handle);
         Ok(())
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct LogIntervalMetrics {
+    pub(crate) steps: usize,
+    pub(crate) tokens: usize,
+    pub(crate) total_ms: f64,
+    pub(crate) tok_sec: f64,
 }
 
 impl Drop for TrainingLoop {

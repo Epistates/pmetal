@@ -47,14 +47,7 @@ impl TrainingLoop {
         let num_epochs = self.config.training.num_epochs;
 
         // Apply gradient checkpointing if configured (matches run() behavior)
-        if self.config.gradient_checkpointing {
-            let layers = self.config.gradient_checkpointing_layers.max(1);
-            model.enable_gradient_checkpointing(layers);
-            tracing::info!(
-                "Metal-fused: gradient checkpointing enabled (every {} layers)",
-                layers
-            );
-        }
+        self.apply_gradient_checkpointing(model, "Metal-fused");
 
         tracing::info!(
             "Starting Metal-fused training: {} trainable params, batch_size={}, grad_accum={}",

@@ -1,7 +1,10 @@
 use super::*;
-use pmetal_core::LoraConfig;
+use pmetal_core::{LoraConfig, StepMetrics, TrainingCallback, TrainingConfig};
+use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
 use pmetal_lora::LlamaLoraForCausalLM;
 use pmetal_models::architectures::llama::LlamaConfig;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 fn small_config() -> LlamaConfig {
     LlamaConfig {
@@ -38,6 +41,50 @@ fn small_lora_config() -> LoraConfig {
     }
 }
 
+fn create_dummy_dataset(num_samples: usize, seq_len: usize) -> TrainingDataset {
+    let samples: Vec<Sample> = (0..num_samples)
+        .map(|i| {
+            let input_ids: Vec<u32> = (0..seq_len).map(|j| ((i + j) % 256) as u32).collect();
+            Sample::new(input_ids)
+        })
+        .collect();
+    TrainingDataset::from_samples(samples)
+}
+
+fn single_sequence_packed_batch(tokens: &[i32], labels: &[i64]) -> PackedTrainingBatch {
+    let len = tokens.len() as i32;
+    let position_ids: Vec<i32> = (0..len).collect();
+    PackedTrainingBatch {
+        input_ids: Array::from_slice(tokens, &[len]),
+        position_ids: Array::from_slice(&position_ids, &[len]),
+        cu_seqlens: Array::from_slice(&[0_i32, len], &[2]),
+        labels: Array::from_slice(labels, &[len]),
+        total_tokens: tokens.len(),
+        num_sequences: 1,
+        max_seqlen: tokens.len(),
+    }
+}
+
+#[derive(Clone, Default)]
+struct MetricsCapture {
+    steps: Arc<Mutex<Vec<StepMetrics>>>,
+}
+
+impl MetricsCapture {
+    fn snapshot(&self) -> Vec<StepMetrics> {
+        self.steps.lock().expect("metrics capture lock").clone()
+    }
+}
+
+impl TrainingCallback for MetricsCapture {
+    fn on_step_end_with_metrics(&mut self, metrics: &StepMetrics) {
+        self.steps
+            .lock()
+            .expect("metrics capture lock")
+            .push(metrics.clone());
+    }
+}
+
 #[test]
 fn test_training_loop_creation() {
     let config = TrainingLoopConfig::default();
@@ -71,6 +118,69 @@ fn test_learning_rate_warmup() {
     training_loop.step = 100;
     let lr100 = training_loop.get_learning_rate();
     assert!((lr100 - 1e-4).abs() < 1e-8);
+}
+
+#[test]
+fn test_take_log_interval_metrics_uses_actual_logged_steps() {
+    let mut config = TrainingLoopConfig::default();
+    config.log_every = 10;
+    let mut training_loop = TrainingLoop::new(config);
+
+    training_loop.step = 1;
+    training_loop.reset_log_interval();
+    training_loop.last_log_time = Some(Instant::now() - Duration::from_millis(25));
+    training_loop.tokens_since_log = 450;
+    training_loop.step = 10;
+
+    let metrics = training_loop.take_log_interval_metrics(Instant::now());
+
+    assert_eq!(metrics.steps, 9);
+    assert_eq!(metrics.tokens, 450);
+    assert!(metrics.total_ms > 0.0);
+    assert!(metrics.tok_sec > 0.0);
+    assert_eq!(training_loop.tokens_since_log, 0);
+    assert_eq!(training_loop.last_log_step, Some(10));
+}
+
+#[test]
+fn test_run_packed_falls_back_to_standard_when_no_sequences_are_combined() {
+    let config = TrainingLoopConfig {
+        training: TrainingConfig {
+            learning_rate: 1e-4,
+            batch_size: 1,
+            gradient_accumulation_steps: 1,
+            num_epochs: 1,
+            max_steps: Some(1),
+            max_grad_norm: 1.0,
+            ..Default::default()
+        },
+        dataloader: DataLoaderConfig {
+            batch_size: 1,
+            max_seq_len: 8,
+            shuffle: false,
+            pad_token_id: 0,
+            ..Default::default()
+        },
+        use_metal_flash_attention: false,
+        log_every: 1,
+        checkpoint_every: 0,
+        eval_every: 0,
+        use_jit_compilation: false,
+        use_cut_cross_entropy: false,
+        ..Default::default()
+    };
+
+    let mut training_loop = TrainingLoop::new(config);
+    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let dataset = create_dummy_dataset(3, 8);
+
+    let _model = training_loop.run_packed(model, dataset, None, None).unwrap();
+
+    assert_eq!(
+        training_loop.current_step(),
+        1,
+        "single-sequence packed batches should fall back to the standard loop"
+    );
 }
 
 #[test]
@@ -194,6 +304,153 @@ fn test_jit_training_step_multiple_steps() {
     );
 
     println!("Training step losses: {:?}", losses);
+}
+
+#[test]
+fn test_run_packed_direct_api_applies_gradient_checkpointing() {
+    let config = TrainingLoopConfig {
+        training: TrainingConfig {
+            learning_rate: 1e-4,
+            batch_size: 1,
+            gradient_accumulation_steps: 1,
+            num_epochs: 1,
+            max_steps: Some(1),
+            max_grad_norm: 1.0,
+            ..Default::default()
+        },
+        dataloader: DataLoaderConfig {
+            batch_size: 1,
+            max_seq_len: 8,
+            shuffle: false,
+            pad_token_id: 0,
+            ..Default::default()
+        },
+        use_metal_flash_attention: false,
+        log_every: 1,
+        checkpoint_every: 0,
+        eval_every: 0,
+        gradient_checkpointing: true,
+        gradient_checkpointing_layers: 3,
+        use_jit_compilation: false,
+        use_cut_cross_entropy: false,
+        ..Default::default()
+    };
+
+    let mut training_loop = TrainingLoop::new(config);
+    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let dataset = create_dummy_dataset(4, 2);
+
+    let model = training_loop.run_packed(model, dataset, None, None).unwrap();
+
+    let checkpoint_config = model
+        .checkpoint_config
+        .expect("packed direct API should enable gradient checkpointing");
+    assert!(checkpoint_config.enabled);
+    assert_eq!(checkpoint_config.layers_per_block, 3);
+}
+
+#[test]
+fn test_run_compiled_direct_api_applies_gradient_checkpointing() {
+    let config = TrainingLoopConfig {
+        training: TrainingConfig {
+            learning_rate: 1e-4,
+            batch_size: 1,
+            gradient_accumulation_steps: 1,
+            num_epochs: 1,
+            max_steps: Some(1),
+            max_grad_norm: 1.0,
+            ..Default::default()
+        },
+        dataloader: DataLoaderConfig {
+            batch_size: 1,
+            max_seq_len: 16,
+            shuffle: false,
+            pad_token_id: 0,
+            ..Default::default()
+        },
+        use_metal_flash_attention: false,
+        log_every: 1,
+        checkpoint_every: 0,
+        eval_every: 0,
+        gradient_checkpointing: true,
+        gradient_checkpointing_layers: 3,
+        use_jit_compilation: false,
+        use_cut_cross_entropy: false,
+        ..Default::default()
+    };
+
+    let mut training_loop = TrainingLoop::new(config);
+    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let dataset = create_dummy_dataset(2, 8);
+
+    let model = training_loop.run_compiled(model, dataset, None, None).unwrap();
+
+    let checkpoint_config = model
+        .checkpoint_config
+        .expect("compiled direct API should enable gradient checkpointing");
+    assert!(checkpoint_config.enabled);
+    assert_eq!(checkpoint_config.layers_per_block, 3);
+}
+
+#[test]
+fn test_single_sequence_packed_step_matches_standard_step() {
+    use mlx_rs::{optimizers::AdamW, random};
+
+    let tokens = [1_i32, 2, 3, 4, 5, 6];
+    let labels = [2_i64, 3, 4, 5, 6, 7];
+
+    random::seed(1337).unwrap();
+    let model_standard = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    random::seed(1337).unwrap();
+    let model_packed = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+
+    let optimizer_standard = AdamW::new(0.0);
+    let optimizer_packed = AdamW::new(0.0);
+
+    let mut standard_state = (model_standard, optimizer_standard);
+    let mut packed_state = (model_packed, optimizer_packed);
+
+    let input_ids = Array::from_slice(&tokens, &[1, tokens.len() as i32]);
+    let label_ids = Array::from_slice(&labels, &[1, labels.len() as i32]);
+    let packed_batch = single_sequence_packed_batch(&tokens, &labels);
+
+    let standard_loss = jit_training_step(&mut standard_state, (&input_ids, &label_ids)).unwrap();
+    standard_loss.eval().unwrap();
+    let packed_loss = jit_training_step_packed(&mut packed_state, &packed_batch, 0.0).unwrap();
+    packed_loss.eval().unwrap();
+
+    let standard_val = standard_loss.item::<f32>();
+    let packed_val = packed_loss.item::<f32>();
+    assert!(
+        (standard_val - packed_val).abs() < 1e-4,
+        "single-sequence packed step should match standard step: standard={standard_val}, packed={packed_val}"
+    );
+}
+
+#[test]
+fn test_single_sequence_packed_cce_step_is_finite() {
+    use mlx_rs::{optimizers::AdamW, random};
+
+    let tokens = [1_i32, 2, 3, 4, 5, 6];
+    let labels = [2_i64, 3, 4, 5, 6, 7];
+
+    random::seed(7331).unwrap();
+    let model_packed = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+
+    let optimizer_packed = AdamW::new(0.0);
+
+    let mut packed_state = (model_packed, optimizer_packed);
+
+    let packed_batch = single_sequence_packed_batch(&tokens, &labels);
+
+    let packed_loss = jit_training_step_packed_cce(&mut packed_state, &packed_batch, 0.0).unwrap();
+    packed_loss.eval().unwrap();
+
+    let packed_val = packed_loss.item::<f32>();
+    assert!(
+        packed_val.is_finite() && packed_val > 0.0,
+        "single-sequence packed CCE step should produce a finite positive loss, got {packed_val}"
+    );
 }
 
 #[test]
@@ -381,6 +638,51 @@ fn test_gpu_gradient_clipping() {
         "Second grad should be ~0.8, got {}",
         values[1]
     );
+}
+
+#[test]
+fn test_run_packed_callbacks_report_non_zero_interval_metrics() {
+    let config = TrainingLoopConfig {
+        training: TrainingConfig {
+            learning_rate: 1e-4,
+            batch_size: 1,
+            gradient_accumulation_steps: 1,
+            num_epochs: 1,
+            max_steps: Some(3),
+            max_grad_norm: 1.0,
+            ..Default::default()
+        },
+        dataloader: DataLoaderConfig {
+            batch_size: 1,
+            max_seq_len: 32,
+            shuffle: false,
+            pad_token_id: 0,
+            ..Default::default()
+        },
+        use_metal_flash_attention: false,
+        log_every: 1,
+        checkpoint_every: 0,
+        eval_every: 0,
+        use_jit_compilation: false,
+        use_cut_cross_entropy: false,
+        ..Default::default()
+    };
+
+    let mut training_loop = TrainingLoop::new(config);
+    let capture = MetricsCapture::default();
+    let snapshot = capture.clone();
+    training_loop.add_callback(Box::new(capture));
+
+    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let dataset = create_dummy_dataset(6, 24);
+
+    let _model = training_loop.run_packed(model, dataset, None, None).unwrap();
+
+    let metrics = snapshot.snapshot();
+    assert!(!metrics.is_empty());
+    assert!(metrics.iter().all(|metric| metric.tokens > 0));
+    assert!(metrics.iter().all(|metric| metric.total_ms > 0.0));
+    assert!(metrics.iter().all(|metric| metric.tok_sec > 0.0));
 }
 
 #[test]

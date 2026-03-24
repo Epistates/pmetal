@@ -78,7 +78,7 @@ macro_rules! dispatch_lora_architecture {
 ///
 /// - Llama (2, 3, 3.1, 3.2, 3.3) — gradient checkpointing supported
 /// - Qwen2 (2, 2.5) — uses Qwen3 LoRA implementation internally
-/// - Qwen3 — gradient checkpointing supported
+/// - Qwen3 — dense attention + RoPE reset support
 /// - Qwen3Next (3.5) — hybrid architecture with nested `text_config` handling
 /// - Gemma (2, 3) — GeGLU activation, special RMSNorm
 /// - Mistral (7B, Mixtral 8x7B) — sliding window attention support
@@ -93,14 +93,14 @@ macro_rules! dispatch_lora_architecture {
 /// |---------|-------|---------|-------|-------|-----|-----------|
 /// | LoRA Training | Yes | Yes | Yes | Yes | Yes | Yes |
 /// | QLoRA | Yes | Yes | Yes | Yes | — | — |
-/// | Gradient Checkpointing | Yes | Yes | Yes | Yes | Yes | Yes |
+/// | Gradient Checkpointing | Yes | Yes | No | Yes | Yes | No |
 /// | Packed Sequences | Yes | Yes | Yes | Yes | Yes | Yes |
 pub enum DynamicLoraModel {
     /// Llama family with LoRA adapters (supports gradient checkpointing).
     Llama(LlamaLoraForCausalLM),
     /// Mistral family with LoRA adapters (supports gradient checkpointing and SWA).
     Mistral(MistralLoraForCausalLM),
-    /// Qwen3 family with LoRA adapters (supports gradient checkpointing).
+    /// Qwen3 family with LoRA adapters.
     Qwen3(Qwen3LoraForCausalLM),
     /// Gemma family with LoRA adapters (supports GeGLU and special RMSNorm).
     Gemma(GemmaLoraForCausalLM),
@@ -508,14 +508,7 @@ impl TrainableModel for DynamicLoraModel {
     }
 
     fn supports_gradient_checkpointing(&self) -> bool {
-        match self {
-            Self::Llama(_) => true,
-            Self::Mistral(_) => true,
-            Self::Qwen3(_) => true,
-            Self::Gemma(_) => true,
-            Self::Phi(_) => true,
-            Self::Qwen3Next(_) => true,
-        }
+        dispatch_lora_uniform!(self, supports_gradient_checkpointing)
     }
 
     fn forward_with_cache(
@@ -648,6 +641,7 @@ pub enum DynamicLoraError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_models::architectures::{qwen3::Qwen3Config, qwen3_next::Qwen3NextConfig};
 
     #[test]
     fn test_architecture_dispatch() {
@@ -668,5 +662,67 @@ mod tests {
             ModelArchitecture::from_model_type("qwen2"),
             Some(ModelArchitecture::Qwen2)
         );
+    }
+
+    #[test]
+    fn test_gradient_checkpointing_support_delegates_to_inner_model() {
+        let lora_config = LoraConfig {
+            r: 4,
+            alpha: 8.0,
+            dropout: 0.0,
+            use_rslora: false,
+            ..Default::default()
+        };
+
+        let qwen3 = DynamicLoraModel::Qwen3(
+            Qwen3LoraForCausalLM::new(
+                Qwen3Config {
+                    vocab_size: 128,
+                    hidden_size: 64,
+                    intermediate_size: 128,
+                    num_hidden_layers: 2,
+                    num_attention_heads: 4,
+                    num_key_value_heads: Some(2),
+                    head_dim: 16,
+                    max_position_embeddings: 128,
+                    ..Default::default()
+                },
+                lora_config.clone(),
+            )
+            .unwrap(),
+        );
+        assert!(!qwen3.supports_gradient_checkpointing());
+
+        let qwen3_next = DynamicLoraModel::Qwen3Next(
+            Qwen3NextLoraForCausalLM::new(
+                Qwen3NextConfig {
+                    hidden_size: 32,
+                    intermediate_size: 64,
+                    num_hidden_layers: 4,
+                    num_attention_heads: 2,
+                    num_key_value_heads: Some(1),
+                    head_dim: Some(16),
+                    vocab_size: 100,
+                    linear_num_value_heads: 2,
+                    linear_num_key_heads: 1,
+                    linear_key_head_dim: 16,
+                    linear_value_head_dim: 16,
+                    linear_conv_kernel_dim: 4,
+                    full_attention_interval: 4,
+                    num_experts: 0,
+                    num_experts_per_tok: 0,
+                    decoder_sparse_step: 1,
+                    moe_intermediate_size: 16,
+                    shared_expert_intermediate_size: 32,
+                    mlp_only_layers: vec![],
+                    norm_topk_prob: false,
+                    tie_word_embeddings: true,
+                    ..Default::default()
+                },
+                lora_config,
+            )
+            .unwrap(),
+        );
+        assert!(!qwen3_next.supports_gradient_checkpointing());
     }
 }

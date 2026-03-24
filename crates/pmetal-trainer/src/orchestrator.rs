@@ -730,7 +730,7 @@ fn run_qlora_path(
     config: &TrainingJobConfig,
     full_config: &FullTrainingConfig,
     model_path: &Path,
-    training_loop_config: TrainingLoopConfig,
+    mut training_loop_config: TrainingLoopConfig,
     train_dataset: TrainingDataset,
     eval_dataset: Option<TrainingDataset>,
     checkpoint_manager: &CheckpointManager,
@@ -800,6 +800,9 @@ fn run_qlora_path(
                 model.arch_name()
             );
         }
+        // The model has already handled the capability check above. Do not let
+        // the TrainingLoop re-apply or re-log this setting.
+        training_loop_config.gradient_checkpointing = false;
     }
 
     #[cfg(feature = "distributed")]
@@ -909,7 +912,7 @@ fn run_lora_path(
     config: &TrainingJobConfig,
     full_config: &FullTrainingConfig,
     model_path: &Path,
-    training_loop_config: TrainingLoopConfig,
+    mut training_loop_config: TrainingLoopConfig,
     train_dataset: TrainingDataset,
     eval_dataset: Option<TrainingDataset>,
     checkpoint_manager: &CheckpointManager,
@@ -961,6 +964,9 @@ fn run_lora_path(
                 model.architecture_name()
             );
         }
+        // The model has already handled the capability check above. Do not let
+        // the TrainingLoop re-apply or re-log this setting.
+        training_loop_config.gradient_checkpointing = false;
     }
 
     #[cfg(feature = "distributed")]

@@ -50,18 +50,10 @@ impl TrainingLoop {
         // Apply gradient checkpointing when requested.
         // This must be done before the training loop so that all forward passes
         // use checkpointed activations.
-        if self.config.gradient_checkpointing {
-            let layers = self.config.gradient_checkpointing_layers;
-            model.enable_gradient_checkpointing(layers);
-            tracing::info!(
-                "Gradient checkpointing enabled: {} layers per checkpoint block",
-                layers
-            );
-        }
+        self.apply_gradient_checkpointing(model, "");
 
         // Initialize timing for throughput measurement
-        self.last_log_time = Some(std::time::Instant::now());
-        self.tokens_since_log = 0;
+        self.reset_log_interval();
 
         let mut best_eval_loss = f64::MAX;
 
@@ -175,28 +167,14 @@ impl TrainingLoop {
                 if self.step % self.config.log_every == 0 || self.step == 1 {
                     // Calculate throughput over the entire logging interval
                     let now = std::time::Instant::now();
-                    let tokens_per_sec = match self.last_log_time {
-                        Some(last) => {
-                            let elapsed_secs = now.duration_since(last).as_secs_f64();
-                            if elapsed_secs > 0.0 {
-                                self.tokens_since_log as f64 / elapsed_secs
-                            } else {
-                                0.0
-                            }
-                        }
-                        None => 0.0,
-                    };
-
-                    // Reset interval tracking
-                    self.last_log_time = Some(now);
-                    self.tokens_since_log = 0;
+                    let interval = self.take_log_interval_metrics(now);
 
                     tracing::info!(
                         "Step {}: loss={:.4}, lr={:.2e}, tokens/s={:.0}{}",
                         stats.step,
                         self.running_loss,
                         stats.learning_rate,
-                        tokens_per_sec,
+                        interval.tok_sec,
                         stats
                             .grad_norm
                             .map(|n| format!(", grad_norm={:.2}", n))
@@ -212,9 +190,9 @@ impl TrainingLoop {
                             total_steps: computed_total_steps,
                             loss: self.running_loss,
                             lr: stats.learning_rate as f64,
-                            tok_sec: tokens_per_sec,
-                            total_ms: now.elapsed().as_secs_f64() * 1000.0,
-                            tokens: stats.tokens,
+                            tok_sec: interval.tok_sec,
+                            total_ms: interval.total_ms / interval.steps as f64,
+                            tokens: interval.tokens,
                             grad_norm: stats.grad_norm.map(|n| n as f64),
                             ..Default::default()
                         };

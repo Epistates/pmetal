@@ -52,6 +52,9 @@ impl TrainingLoop {
             return self.run_jit_compiled(model, train_dataset, _eval_dataset, checkpoint_manager);
         }
 
+        let mut model = model;
+        self.apply_gradient_checkpointing(&mut model, "Compiled");
+
         // Initialize optimizer with optional embedding learning rate
         let base_lr = self.config.training.learning_rate as f32;
         let weight_decay = self.config.training.weight_decay as f32;
@@ -180,8 +183,7 @@ impl TrainingLoop {
         tracing::info!("Fused mode enabled - using deferred evaluation for optimized throughput");
 
         // Initialize timing for throughput measurement
-        self.last_log_time = Some(std::time::Instant::now());
-        self.tokens_since_log = warmup_tokens;
+        self.reset_log_interval();
 
         // =========================================================================
         // PHASE 3: MAIN LOOP - Deferred Evaluation Pattern for 2x throughput
@@ -377,26 +379,14 @@ impl TrainingLoop {
 
                     // Calculate throughput
                     let now = std::time::Instant::now();
-                    let tokens_per_sec = match self.last_log_time {
-                        Some(last) => {
-                            let elapsed_secs = now.duration_since(last).as_secs_f64();
-                            if elapsed_secs > 0.0 {
-                                self.tokens_since_log as f64 / elapsed_secs
-                            } else {
-                                0.0
-                            }
-                        }
-                        None => 0.0,
-                    };
-                    self.last_log_time = Some(now);
-                    self.tokens_since_log = 0;
+                    let interval = self.take_log_interval_metrics(now);
 
                     tracing::info!(
                         "Step {}: loss={:.4}, lr={:.2e}, tokens/s={:.0}",
                         self.step,
                         self.running_loss,
                         self.get_learning_rate(),
-                        tokens_per_sec,
+                        interval.tok_sec,
                     );
 
                     // Dispatch to callbacks
@@ -408,15 +398,9 @@ impl TrainingLoop {
                             total_steps: computed_total_steps,
                             loss: self.running_loss,
                             lr: self.get_learning_rate() as f64,
-                            tok_sec: tokens_per_sec,
-                            total_ms: self
-                                .last_log_time
-                                .map(|t| {
-                                    let interval = self.config.log_every as f64;
-                                    t.elapsed().as_secs_f64() * 1000.0 / interval
-                                })
-                                .unwrap_or(0.0),
-                            tokens: self.tokens_since_log,
+                            tok_sec: interval.tok_sec,
+                            total_ms: interval.total_ms / interval.steps as f64,
+                            tokens: interval.tokens,
                             ..Default::default()
                         };
                         for cb in &mut self.callbacks {
@@ -512,6 +496,9 @@ impl TrainingLoop {
                 "JIT compilation requires gradient_accumulation_steps=1",
             )));
         }
+
+        let mut model = model;
+        self.apply_gradient_checkpointing(&mut model, "JIT-compiled");
 
         // Initialize optimizer
         let base_lr = self.config.training.learning_rate as f32;
@@ -627,8 +614,7 @@ impl TrainingLoop {
             compile_with_state(jit_training_step::<M, crate::AdamWGroups>, None);
 
         // Initialize timing for throughput measurement
-        self.last_log_time = Some(std::time::Instant::now());
-        self.tokens_since_log = warmup_tokens;
+        self.reset_log_interval();
 
         // =========================================================================
         // PHASE 3: MAIN LOOP with JIT-compiled training
@@ -717,17 +703,7 @@ impl TrainingLoop {
 
                     // Calculate throughput
                     let now = std::time::Instant::now();
-                    let tokens_per_sec = match self.last_log_time {
-                        Some(last) => {
-                            let elapsed_secs = now.duration_since(last).as_secs_f64();
-                            if elapsed_secs > 0.0 {
-                                self.tokens_since_log as f64 / elapsed_secs
-                            } else {
-                                0.0
-                            }
-                        }
-                        None => 0.0,
-                    };
+                    let interval = self.take_log_interval_metrics(now);
 
                     // Use canonical scheduler (includes warmup) for LR logging.
                     let lr = self.get_learning_rate() as f64;
@@ -737,7 +713,7 @@ impl TrainingLoop {
                         self.step,
                         self.running_loss,
                         lr,
-                        tokens_per_sec
+                        interval.tok_sec
                     );
 
                     // Dispatch to callbacks
@@ -749,13 +725,9 @@ impl TrainingLoop {
                             total_steps: computed_total_steps,
                             loss: self.running_loss,
                             lr,
-                            tok_sec: tokens_per_sec,
-                            total_ms: now
-                                .duration_since(self.last_log_time.unwrap_or(now))
-                                .as_secs_f64()
-                                * 1000.0
-                                / self.config.log_every as f64,
-                            tokens: self.tokens_since_log,
+                            tok_sec: interval.tok_sec,
+                            total_ms: interval.total_ms / interval.steps as f64,
+                            tokens: interval.tokens,
                             ..Default::default()
                         };
                         for cb in &mut self.callbacks {
@@ -766,9 +738,6 @@ impl TrainingLoop {
                             return Err(SftError::Cancelled);
                         }
                     }
-
-                    self.last_log_time = Some(now);
-                    self.tokens_since_log = 0;
                 }
 
                 // Check max steps

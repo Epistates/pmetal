@@ -98,26 +98,29 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
     let input_ids_2d = packed_batch.input_ids.reshape(&[1, total_tokens])?;
     let labels_2d = packed_batch.labels.reshape(&[1, total_tokens])?;
 
-    // Get position IDs - these reset for each packed sequence
-    // Critical for correct RoPE embeddings in packed sequences
+    // Keep explicit position IDs so packed-sequence models can still reset RoPE
+    // at sequence boundaries when needed.
     let position_ids = packed_batch.position_ids.clone();
-
-    // Get the block-diagonal attention mask [total_tokens, total_tokens]
-    // and reshape to [1, 1, total_tokens, total_tokens] for attention
-    let attn_mask = packed_batch.attention_mask()?;
-    let attn_mask_4d = attn_mask.reshape(&[1, 1, total_tokens, total_tokens])?;
+    let attn_mask_4d = if packed_batch.num_sequences > 1 {
+        // Only materialize the expensive block-diagonal mask when this batch
+        // actually contains multiple packed sequences. Single-sequence batches
+        // can use the model's native causal path.
+        Some(packed_batch.attention_mask()?.reshape(&[1, 1, total_tokens, total_tokens])?)
+    } else {
+        None
+    };
 
     // Construct CrossEntropy once per step rather than inside the closure.
     let ce = CrossEntropy::new().map_err(|e| Exception::custom(e.to_string()))?;
 
     // Define loss function that will be used by value_and_grad
     // Use IDENTICAL loss computation as regular training for consistency
-    let loss_fn = |model: &mut M,
-                   (input_ids, labels, mask, pos_ids): (&Array, &Array, &Array, &Array)|
+    let loss_fn = |model: &mut M, (input_ids, labels): (&Array, &Array)|
      -> std::result::Result<Array, Exception> {
-        // Use forward_with_positions for correct RoPE with packed sequences
+        // Preserve explicit position IDs while allowing single-sequence packed
+        // batches to stay on the model's native causal-attention fast path.
         let logits = model
-            .forward_with_positions(input_ids, Some(mask), pos_ids)
+            .forward_with_positions(input_ids, attn_mask_4d.as_ref(), &position_ids)
             .map_err(|e| Exception::custom(e.to_string()))?;
 
         // For packed sequences, labels already have boundary tokens masked as -100
@@ -151,12 +154,9 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
         masked_loss.sum(None)?.divide(&safe_count)
     };
 
-    // Compute loss and gradients - pass position_ids as 4th argument
+    // Compute loss and gradients.
     let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-    let (loss, mut grads) = loss_and_grad_fn(
-        model,
-        (&input_ids_2d, &labels_2d, &attn_mask_4d, &position_ids),
-    )?;
+    let (loss, mut grads) = loss_and_grad_fn(model, (&input_ids_2d, &labels_2d))?;
 
     // Apply gradient clipping if max_grad_norm > 0
     if max_grad_norm > 0.0 {
@@ -294,8 +294,11 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
     let input_ids_2d = packed_batch.input_ids.reshape(&[1, total_tokens])?;
     let labels_2d = packed_batch.labels.reshape(&[1, total_tokens])?;
     let position_ids = packed_batch.position_ids.clone();
-    let attn_mask = packed_batch.attention_mask()?;
-    let attn_mask_4d = attn_mask.reshape(&[1, 1, total_tokens, total_tokens])?;
+    let attn_mask_4d = if packed_batch.num_sequences > 1 {
+        Some(packed_batch.attention_mask()?.reshape(&[1, 1, total_tokens, total_tokens])?)
+    } else {
+        None
+    };
 
     // Fetch the LM head weight once — serves as capability probe and provides
     // the cached weight to capture into the closure (avoids a second call inside
@@ -305,10 +308,10 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
 
     if has_cce_support {
         let cached_weight = lm_weight_cached.expect("checked above");
-        let loss_fn = |model: &mut M,
-                       (input_ids, labels, mask, pos_ids): (&Array, &Array, &Array, &Array)|
+        let loss_fn = |model: &mut M, (input_ids, labels): (&Array, &Array)|
          -> std::result::Result<Array, Exception> {
-            let hidden_opt = model.forward_hidden_with_positions(input_ids, Some(mask), pos_ids);
+            let hidden_opt =
+                model.forward_hidden_with_positions(input_ids, attn_mask_4d.as_ref(), &position_ids);
 
             match hidden_opt {
                 Some(Ok(hidden_states)) => {
@@ -322,7 +325,7 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
                 _ => {
                     // Fall back to standard cross-entropy
                     let logits = model
-                        .forward_with_positions(input_ids, Some(mask), pos_ids)
+                        .forward_with_positions(input_ids, attn_mask_4d.as_ref(), &position_ids)
                         .map_err(|e| Exception::custom(e.to_string()))?;
                     let seq_len = logits.dim(1);
                     let vocab_size = logits.dim(2);
@@ -348,10 +351,7 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
         };
 
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
-        let (loss, mut grads) = loss_and_grad_fn(
-            model,
-            (&input_ids_2d, &labels_2d, &attn_mask_4d, &position_ids),
-        )?;
+        let (loss, mut grads) = loss_and_grad_fn(model, (&input_ids_2d, &labels_2d))?;
 
         // Gradient clipping (same as jit_training_step_packed)
         if max_grad_norm > 0.0 {

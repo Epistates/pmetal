@@ -2219,7 +2219,7 @@ impl crate::TrainableModel for Qwen3NextLoraForCausalLM {
     }
 
     fn supports_gradient_checkpointing(&self) -> bool {
-        true
+        false
     }
 
     fn supports_kv_cache(&self) -> bool {
@@ -2396,5 +2396,14 @@ mod tests {
             restored_params.len(),
             "Parameter count should be preserved"
         );
+    }
+
+    #[test]
+    fn test_qwen3_next_reports_no_gradient_checkpointing_support() {
+        let config = tiny_config();
+        let lora_config = tiny_lora_config();
+        let model = Qwen3NextLoraForCausalLM::new(config, lora_config).unwrap();
+
+        assert!(!crate::TrainableModel::supports_gradient_checkpointing(&model));
     }
 }

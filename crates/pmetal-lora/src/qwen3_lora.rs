@@ -259,37 +259,20 @@ impl Qwen3LoraAttention {
             differentiable_attention(self.layer_id, &queries, &keys, &values, &fa_config)
                 .map_err(|e| LoraError::Mlx(Exception::custom(e.to_string())))?
         } else {
-            // Standard MLX attention path (inference or non-Metal training)
-            // Expand KV heads for GQA if needed
-            let keys = if self.n_kv_heads < self.n_heads {
-                let repeats = self.n_heads / self.n_kv_heads;
-                expand_kv_heads(&keys, repeats)?
+            // Short-sequence training path: use fused SDPA instead of materializing
+            // score tensors and expanded KV heads. This matches the base Qwen3 stack.
+            let mask_type = if mask.is_some() {
+                AttentionMaskType::None
             } else {
-                keys
+                AttentionMaskType::Causal
             };
-            let values = if self.n_kv_heads < self.n_heads {
-                let repeats = self.n_heads / self.n_kv_heads;
-                expand_kv_heads(&values, repeats)?
-            } else {
-                values
-            };
+            let attn_config =
+                FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+                    .with_scale(self.scale)
+                    .with_mask_type(mask_type);
 
-            // Scaled dot-product attention (O(n²) memory)
-            let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?;
-            let scores = scores.multiply(Array::from_f32(self.scale))?;
-
-            // Apply mask if provided
-            let scores = if let Some(m) = mask {
-                scores.add(m)?
-            } else {
-                scores
-            };
-
-            // Softmax
-            let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
-
-            // Attention output
-            weights.matmul(&values)?
+            fused_sdpa(&queries, &keys, &values, &attn_config, mask)
+                .map_err(LoraError::Mlx)?
         };
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
@@ -384,19 +367,6 @@ impl Qwen3LoraAttention {
             + self.v_proj.num_trainable_params()
             + self.o_proj.num_trainable_params()
     }
-}
-
-/// Expand KV heads for grouped query attention.
-fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
-    let shape = x.shape();
-    let batch = shape[0];
-    let n_kv_heads = shape[1];
-    let seq_len = shape[2];
-    let head_dim = shape[3];
-
-    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = mlx_rs::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
-    x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
 }
 
 /// LoRA-enabled MLP layer for Qwen3.
@@ -1477,7 +1447,7 @@ impl crate::TrainableModel for Qwen3LoraForCausalLM {
     }
 
     fn supports_gradient_checkpointing(&self) -> bool {
-        true
+        false
     }
 
     fn forward_with_cache(
@@ -1537,6 +1507,7 @@ fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mlx_rs::{Dtype, random};
 
     fn small_config() -> Qwen3Config {
         Qwen3Config {
@@ -1573,6 +1544,96 @@ mod tests {
         }
     }
 
+    fn expand_kv_heads_reference(x: &Array, repeats: i32) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let batch = shape[0];
+        let n_kv_heads = shape[1];
+        let seq_len = shape[2];
+        let head_dim = shape[3];
+
+        let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
+        let x = mlx_rs::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
+        x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
+    }
+
+    fn reference_attention_output(
+        attn: &mut Qwen3LoraAttention,
+        x: &Array,
+        mask: Option<&Array>,
+        position_ids: Option<&Array>,
+    ) -> Result<Array, LoraError> {
+        let shape = x.shape();
+        let batch = shape[0];
+        let seq_len = shape[1];
+
+        let queries = attn.q_proj.forward(x)?;
+        let keys = attn.k_proj.forward(x)?;
+        let values = attn.v_proj.forward(x)?;
+
+        let queries = queries.reshape(&[batch, seq_len, attn.n_heads, attn.head_dim])?;
+        let keys = keys.reshape(&[batch, seq_len, attn.n_kv_heads, attn.head_dim])?;
+        let values = values.reshape(&[batch, seq_len, attn.n_kv_heads, attn.head_dim])?;
+
+        let queries = mlx_rs::module::Module::forward(&mut attn.q_norm, &queries)?;
+        let keys = mlx_rs::module::Module::forward(&mut attn.k_norm, &keys)?;
+
+        let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
+        let keys = keys.transpose_axes(&[0, 2, 1, 3])?;
+        let values = values.transpose_axes(&[0, 2, 1, 3])?;
+
+        let (queries, keys) = if let Some(pos_ids) = position_ids {
+            use pmetal_mlx::kernels::rope::apply_rope_with_positions;
+            let q = apply_rope_with_positions(
+                &queries,
+                pos_ids,
+                attn.head_dim,
+                false,
+                attn.rope.base,
+                1.0,
+            )?;
+            let k = apply_rope_with_positions(
+                &keys,
+                pos_ids,
+                attn.head_dim,
+                false,
+                attn.rope.base,
+                1.0,
+            )?;
+            (q, k)
+        } else {
+            let q = mlx_rs::module::Module::forward(&mut attn.rope, &queries)?;
+            let k = mlx_rs::module::Module::forward(&mut attn.rope, &keys)?;
+            (q, k)
+        };
+
+        let keys = if attn.n_kv_heads < attn.n_heads {
+            expand_kv_heads_reference(&keys, attn.n_heads / attn.n_kv_heads)?
+        } else {
+            keys
+        };
+        let values = if attn.n_kv_heads < attn.n_heads {
+            expand_kv_heads_reference(&values, attn.n_heads / attn.n_kv_heads)?
+        } else {
+            values
+        };
+
+        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2])?)?;
+        let scores = scores.multiply(Array::from_f32(attn.scale))?;
+        let scores = if let Some(mask) = mask {
+            scores.add(mask)?
+        } else {
+            let causal_mask = create_causal_mask(seq_len)?.as_dtype(Dtype::Float32)?;
+            scores.add(&causal_mask)?
+        };
+        let weights = mlx_rs::ops::softmax_axis(&scores, -1, None)?;
+        let output = weights.matmul(&values)?;
+
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])?
+            .reshape(&[batch, seq_len, -1])?;
+        attn.o_proj.forward(&output).map_err(LoraError::from)
+    }
+
     #[test]
     fn test_qwen3_lora_attention() {
         let config = small_config();
@@ -1583,6 +1644,86 @@ mod tests {
         let output = attn.forward(&x, None, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
+    }
+
+    #[test]
+    fn test_qwen3_lora_attention_matches_manual_causal_reference() {
+        let config = small_config();
+        let lora_config = small_lora_config();
+        random::seed(11).unwrap();
+        let mut fused_attn = Qwen3LoraAttention::new(&config, &lora_config).unwrap();
+        random::seed(11).unwrap();
+        let mut ref_attn = Qwen3LoraAttention::new(&config, &lora_config).unwrap();
+
+        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+
+        let fused = fused_attn.forward(&x, None, None).unwrap();
+        fused.eval().unwrap();
+        let reference = reference_attention_output(&mut ref_attn, &x, None, None).unwrap();
+        reference.eval().unwrap();
+
+        let delta = fused
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(delta < 1e-4, "causal attention mismatch, max delta={delta}");
+    }
+
+    #[test]
+    fn test_qwen3_lora_attention_matches_manual_packed_reference() {
+        let config = small_config();
+        let lora_config = small_lora_config();
+        random::seed(17).unwrap();
+        let mut fused_attn = Qwen3LoraAttention::new(&config, &lora_config).unwrap();
+        random::seed(17).unwrap();
+        let mut ref_attn = Qwen3LoraAttention::new(&config, &lora_config).unwrap();
+
+        let x = mlx_rs::random::normal::<f32>(&[1, 4, 64], None, None, None).unwrap();
+        let position_ids = Array::from_slice(&[0_i32, 1, 0, 1], &[4]);
+        let packed_mask = Array::from_slice(
+            &[
+                0.0_f32,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                0.0_f32,
+                0.0_f32,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                0.0_f32,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                f32::NEG_INFINITY,
+                0.0_f32,
+                0.0_f32,
+            ],
+            &[1, 1, 4, 4],
+        );
+
+        let fused = fused_attn
+            .forward(&x, Some(&packed_mask), Some(&position_ids))
+            .unwrap();
+        fused.eval().unwrap();
+        let reference =
+            reference_attention_output(&mut ref_attn, &x, Some(&packed_mask), Some(&position_ids))
+                .unwrap();
+        reference.eval().unwrap();
+
+        let delta = fused
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(delta < 1e-4, "packed attention mismatch, max delta={delta}");
     }
 
     #[test]
@@ -1598,6 +1739,41 @@ mod tests {
     }
 
     #[test]
+    fn test_qwen3_hidden_states_single_sequence_match_explicit_causal_mask() {
+        let config = small_config();
+        let lora_config = small_lora_config();
+        let mut model = Qwen3LoraForCausalLM::new(config, lora_config).unwrap();
+
+        let input_ids = mlx_rs::Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let position_ids = mlx_rs::Array::from_slice(&[0_i32, 1, 2, 3], &[4]);
+        let causal_mask = create_causal_mask(4).unwrap();
+
+        let hidden_without_mask = model
+            .forward_hidden_states(&input_ids, None, Some(&position_ids))
+            .unwrap();
+        hidden_without_mask.eval().unwrap();
+
+        let hidden_with_mask = model
+            .forward_hidden_states(&input_ids, Some(&causal_mask), Some(&position_ids))
+            .unwrap();
+        hidden_with_mask.eval().unwrap();
+
+        let delta = hidden_without_mask
+            .subtract(&hidden_with_mask)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+
+        assert!(
+            delta < 1e-5,
+            "single-sequence hidden states should match with and without an explicit causal mask, max delta={delta}"
+        );
+    }
+
+    #[test]
     fn test_lora_param_count() {
         let config = small_config();
         let lora_config = small_lora_config();
@@ -1607,5 +1783,14 @@ mod tests {
 
         let params = model.lora_parameters();
         assert!(!params.is_empty());
+    }
+
+    #[test]
+    fn test_qwen3_lora_reports_no_gradient_checkpointing_support() {
+        let config = small_config();
+        let lora_config = small_lora_config();
+        let model = Qwen3LoraForCausalLM::new(config, lora_config).unwrap();
+
+        assert!(!crate::TrainableModel::supports_gradient_checkpointing(&model));
     }
 }
