@@ -13,7 +13,7 @@ PMetal automatically selects kernel parameters based on your device tier and GPU
 | Max | 64×64×32 | 128×64×32 |
 | Ultra | 64×64×32 | 128×64×32 |
 
-These tier tables apply to the standard Metal GEMM/LoRA kernels. On Apple10/M5 hardware, the Metal 4 / MPP dispatcher now auto-tunes and persists among `32×32` / `1`-simdgroup, `64×32` / `2`-simdgroup, `32×64` / `2`-simdgroup, and `64×64` / `4`-simdgroup variants, plus Morton-vs-linear tile walk order. Aligned M/N tiles use static full-tile extents. Apple7-9 continue to use the standard Metal kernels. For 4-bit affine quantized linear inference, Apple10/M5 also benchmarks and persists MLX `quantized_matmul` versus the MPP path per device and problem shape. Standard Metal FlashAttention now benchmarks and persists among the known-valid per-head-dimension block pairs instead of relying only on the tier table below. For supported `head_dim = 64`, `96`, and `128` inference attention shapes, Apple10/M5 also benchmarks and persists MLX fast SDPA vs Metal FlashAttention vs MPP FlashAttention, rejecting MPP candidates that diverge numerically from the MLX reference.
+These tier tables apply to the standard Metal GEMM/LoRA kernels. On Apple10/M5 hardware, the Metal 4 / MPP dispatcher now auto-tunes and persists among `32×32` / `1`-simdgroup, `64×32` / `2`-simdgroup, `32×64` / `2`-simdgroup, and `64×64` / `4`-simdgroup variants, plus Morton-vs-linear tile walk order. Aligned M/N tiles use static full-tile extents. Apple7-9 continue to use the standard Metal kernels. For 4-bit affine quantized linear inference, Apple10/M5 also benchmarks and persists MLX `quantized_matmul` versus the MPP path per device and problem shape. Standard Metal FlashAttention now benchmarks and persists among the known-valid per-head-dimension block pairs instead of relying only on the tier table below. For supported no-custom-mask `head_dim = 64`, `80`, `96`, and `128` inference attention shapes, including softcapped configs, Apple10/M5 also benchmarks and persists MLX fast SDPA vs Metal FlashAttention vs MPP FlashAttention, rejecting MPP candidates that diverge numerically from the MLX reference.
 
 ## FlashAttention Block Sizes
 
@@ -63,6 +63,19 @@ Tuna now benchmarks and persists fused linear cross-entropy threadgroup size and
 | Ultra | 256 / 512 / 1024 | 4096 or 8192 |
 
 `CE_THREADS_PER_TOKEN` still scales with vocabulary size and clamps to the hardware maximum. Base-tier devices seed at `128 / 256 / 512` across `< 32k`, `32k..128k`, and `> 128k` vocabularies, while Pro / Max / Ultra seed at `256 / 512 / 1024`. Wider hidden states start from a smaller chunk-size seed before benchmarking.
+
+### Fused Merge
+
+Tuna now benchmarks and persists `threads_per_group` and `elements_per_thread` for the standard-Metal fused-merge elementwise kernels. This path stays first-class on Apple7-Apple9 and is also reused on Apple10 for non-MPP merge workloads.
+
+| Tier | Threads / Group | Elements / Thread |
+|------|-----------------|-------------------|
+| Base | 128 or 256 | 2, 4, or 8 |
+| Pro | 128, 256, or 512 | 4 or 8 |
+| Max | 256 or 512 | 4 or 8 |
+| Ultra | 256 or 512 | 4 or 8 |
+
+The candidate ordering is tier-aware, but the final result is benchmarked per device and problem shape and stored in `merge.json`. Persistent merge and LoRA-forward cache keys now include device identity so results are safe to reuse across different Apple Silicon tiers and bins.
 
 ## Batch Size Multiplier
 

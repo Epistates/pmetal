@@ -178,7 +178,7 @@ MLX upstream has NAX-optimized kernels for M5. Integration path:
 - [x] Benchmark and persist MLX vs MPP backend choice for 4-bit affine quantized linear inference on Apple10/M5
 - [x] Tier-aware MPP dispatcher tuning across `32×32`, `64×32`, `32×64`, and `64×64` MPP tile variants on Apple10/M5
 - [ ] Upstream mlx-rs NAX kernel passthrough (requires mlx-rs update to MLX with NAX)
-- [x] Benchmark and persist Apple10/M5 MPP FlashAttention vs Metal FlashAttention vs MLX fast SDPA for supported `head_dim = 64`, `96`, and `128` inference shapes
+- [x] Benchmark and persist Apple10/M5 MPP FlashAttention vs Metal FlashAttention vs MLX fast SDPA for supported no-custom-mask `head_dim = 64`, `80`, `96`, and `128` inference shapes, including softcapped configs
 
 ### P1 — ANE chaining API
 
@@ -197,13 +197,15 @@ MLX upstream has NAX-optimized kernels for M5. Integration path:
 - [x] Runtime probe + `AneModel::evaluate_real_time*` wrapper
 - [x] Experimental `--ane-real-time` opt-in for `infer` / `serve`
 - [x] Automatic fallback to standard ANE dispatch if the private RT path fails
-- [ ] Compare RT vs standard eval latency distribution (the ignored hardware test on the local M4 Max still hit `ANEProgramProcessRequestDirect() ... Program Inference error` for the tiny synthetic MIL kernel on 2026-03-23)
+- [ ] Compare RT vs standard eval latency distribution (PMetal now has both a tiny-kernel check and a generated SDPA forward latency probe, but on the local M4 Max both ignored tests still hit `ANEProgramProcessRequestDirect() ... Program Inference error` on 2026-03-23)
 - [ ] Promote beyond experimental only after measured latency wins and stable correctness
 
 ### P3 — UltraFusion-aware distributed
 
 Current distributed crate (`pmetal-distributed`) is multi-machine over TCP/mDNS. UltraFusion's 32 TB/s interconnect bandwidth could enable:
 
+- [x] Add a local UltraFusion planner plus same-process in-memory stage transport for dual-die pipeline execution scaffolding
+- [ ] Validate measurable gain for local UltraFusion pipeline execution on real Ultra hardware
 - [ ] Intra-machine model parallelism across dies (pipeline or tensor parallel)
 - [ ] Die-affine buffer placement for large models that exceed single-die cache
 - [ ] Hybrid: UltraFusion tensor parallel + network data parallel across machines
@@ -218,8 +220,11 @@ Replace hardcoded tier-based parameters with runtime optimization:
 - [x] Benchmark and persist standard Metal FlashAttention block-size selection for supported head dimensions
 - [x] Wire broader standard-Metal fused kernels through persisted Tuna specialization (`fused_swiglu`, `fused_mlp`, `fused_norm_lora`, fused linear cross-entropy)
 - [x] Benchmark and persist standard-Metal `fused_swiglu`, `fused_mlp`, and `fused_norm_lora` kernel specialization choices
-- [x] Add a structured `pmetal bench-corpus` kernel benchmark command for comparable per-tier measurements on M1-M4 and M5
-- [ ] Auto-benchmark broader kernel configs on first run and cache optimal parameters
+- [x] Benchmark and persist standard-Metal `fused_merge` specialization choices, with device-safe cache keys and `merge.json` disk persistence
+- [x] Add a structured `pmetal bench-corpus` kernel benchmark command for comparable per-tier measurements on M1-M4 and M5, including initial MoE/model-family cases
+- [x] Add a real `pmetal bench-workload` command for fast end-to-end Qwen3/dataset regression runs on local Apple Silicon, and record the selected inference KV cache mode in the report
+- [x] Auto-select fp16 vs q8 KV cache for inference based on model/context fit instead of hardcoding q8 as the default on Apple7-Apple9
+- [ ] Expand first-run autotuning only where checked-in corpus data still shows meaningful upside beyond the now-covered hot paths
 - [x] Measure and persist approximate GPU unified-memory bandwidth via copy benchmark, with spec-table fallback when probing is unavailable
 - [x] Record local M4 Max benchmark-corpus reports in `.strategy/bench_corpus_m4_max_2026_03_23.json` and `.strategy/bench_corpus_m4_max_quick_2026_03_23.json`
 - [ ] Run `pmetal bench-corpus` on representative M1/M2/M3/M4/M5 hardware and check in the reports that justify default choices

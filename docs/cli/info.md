@@ -22,6 +22,7 @@ Shows:
 - **Memory bandwidth** (GB/s, with measured-vs-fallback source)
 - **Metal features** (dynamic caching, mesh shaders)
 - **UltraFusion topology** (Ultra chips)
+- **UltraFusion local executor scaffold** (Ultra chips): per-die slices, local stage count, and heuristic interconnect bandwidth
 
 ## See Also
 

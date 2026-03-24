@@ -46,9 +46,13 @@ PMetal detects at startup:
 
 Use `pmetal info` to display all detected hardware properties.
 
-Use `pmetal bench-corpus` to collect a comparable kernel report for the current machine. That corpus exercises standard-Metal hot paths on M1-M4 and adds MPP GEMM coverage on Apple10/M5 when NAX is available.
+On UltraFusion machines, `pmetal info` now also reports the local same-process executor scaffold: per-die resource slices, the in-memory stage count, and the heuristic 32 TB/s interconnect used by PMetal's local UltraFusion planner.
 
-Across Apple7-10 GPUs, PMetal now benchmarks, persists, and reuses standard-Metal Tuna specializations for `fused_swiglu`, `fused_mlp`, `fused_norm_lora`, and fused linear cross-entropy. M1-M4 remain first-class paths rather than “fallback” hardware.
+Use `pmetal bench-corpus` to collect a comparable kernel report for the current machine. That corpus exercises standard-Metal hot paths on M1-M4, includes fused-merge plus initial MoE/model-family coverage across Apple7-Apple10, and adds MPP GEMM coverage on Apple10/M5 when NAX is available.
+
+Use `pmetal bench-workload` when you want a fast end-to-end regression loop instead of only kernel microbenchmarks. The default workload uses the cached `Qwen/Qwen3-0.6B` model plus `TeichAI/gemini-3-pro-preview-high-reasoning-250x`, and the inference report now records the KV cache mode chosen on the current machine.
+
+Across Apple7-10 GPUs, PMetal now benchmarks, persists, and reuses standard-Metal Tuna specializations for `fused_swiglu`, `fused_mlp`, `fused_norm_lora`, fused linear cross-entropy, and fused merge. Shared MLX MoE routers now use GPU-native `argpartition` selection instead of heavier full sorts or CPU top-k paths. M1-M4 remain first-class paths rather than “fallback” hardware. PMetal also now auto-selects the inference KV cache mode: on Apple7-Apple9 it prefers fp16 KV cache when the model plus context comfortably fit the device budget and only promotes to q8 when memory pressure justifies it.
 
 ## M5-Specific: NAX
 
@@ -58,7 +62,7 @@ M5 (Apple10, arch gen 17) introduces Neural Accelerator units within GPU cores f
 - Quantized inference (FP4/FP8)
 - Scaled dot-product attention
 
-Accessed via Metal 4.0 (`-std=metal4.0`) kernels. NAX availability is checked via `DeviceProperties::has_nax()`. PMetal currently ships the Metal 4 dispatcher, NAX-capable hardware detection, persisted Apple10/M5 MPP dispatch tuning across `32×32`, `64×32`, `32×64`, and `64×64` threadgroup variants, and persisted runtime selection between MLX fast SDPA, Metal FlashAttention, and MPP FlashAttention for supported `head_dim = 64`, `96`, and `128` inference shapes. Upstream `mlx-rs` NAX passthrough is still in progress.
+Accessed via Metal 4.0 (`-std=metal4.0`) kernels. NAX availability is checked via `DeviceProperties::has_nax()`. PMetal currently ships the Metal 4 dispatcher, NAX-capable hardware detection, persisted Apple10/M5 MPP dispatch tuning across `32×32`, `64×32`, `32×64`, and `64×64` threadgroup variants, and persisted runtime selection between MLX fast SDPA, Metal FlashAttention, and MPP FlashAttention for supported no-custom-mask `head_dim = 64`, `80`, `96`, and `128` inference shapes, including softcapped configs. Upstream `mlx-rs` NAX passthrough is still in progress.
 
 ## ANE (Apple Neural Engine)
 
@@ -69,7 +73,7 @@ PMetal's ANE pipeline:
 - **Power-of-2 bucketing**: Optimal kernel compilation for sequence lengths
 - **CPU RMSNorm**: f32 computation on CPU to avoid fp16 ANE overflow
 - **IOSurface Zero-Copy**: Shared memory surfaces for CPU-ANE transfer
-- **Experimental RT Eval**: `infer` / `serve` support `--ane-real-time`, but PMetal still falls back to standard ANE if the private real-time path rejects the request on the current OS/framework
+- **Experimental RT Eval**: `infer` / `serve` support `--ane-real-time`, but PMetal still falls back to standard ANE if the private real-time path rejects the request on the current OS/framework; on the local M4 Max, both the tiny-kernel check and the generated SDPA forward probe still hit `ANEProgramProcessRequestDirect() ... Program Inference error` on 2026-03-23
 - **M1–M5 Compatibility**: Per-matrix blobs for M1, single-blob for M3+
 
 ## See Also
