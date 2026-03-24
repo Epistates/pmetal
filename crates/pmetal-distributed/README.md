@@ -4,7 +4,7 @@ Distributed training backend for home clusters on Apple Silicon.
 
 ## Overview
 
-This crate provides peer-to-peer distributed training infrastructure designed for small Apple Silicon clusters (2-8 nodes). It features zero-configuration mDNS discovery, ring all-reduce gradient synchronization, and pluggable compression strategies for bandwidth-efficient training.
+This crate provides peer-to-peer distributed training infrastructure designed for small Apple Silicon clusters (2-8 nodes). It features zero-configuration mDNS discovery, ring all-reduce gradient synchronization, pluggable compression strategies for bandwidth-efficient training, and a local UltraFusion execution planner that can wire same-process stage links over in-memory channels instead of TCP.
 
 ## Architecture
 
@@ -39,6 +39,7 @@ This crate provides peer-to-peer distributed training infrastructure designed fo
 
 - **Zero-Configuration Discovery**: Automatic peer detection via mDNS/Bonjour on local networks
 - **Ring All-Reduce**: Bandwidth-optimal gradient synchronization with scatter-reduce and all-gather phases
+- **Local UltraFusion Planner**: Per-die stage planning plus same-process in-memory transport scaffolding for Ultra Macs
 - **Persistent Identity**: Ed25519 keypairs stored at `~/.pmetal/node_keypair`
 - **Topology Awareness**: Graph-based cluster representation with node capability and connection profiling
 - **Master Election**: Seniority-based distributed leader election with PeerId tiebreaking

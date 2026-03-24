@@ -10,6 +10,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::tcp::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::mpsc;
 use tokio::time::timeout;
 use tracing::{debug, info, warn};
 
@@ -21,20 +22,40 @@ const INITIAL_BACKOFF_MS: u64 = 100;
 
 /// Sender half of the transport.
 pub struct TransportSender {
-    stream: OwnedWriteHalf,
+    inner: TransportSenderInner,
 }
 
 /// Receiver half of the transport.
 pub struct TransportReceiver {
-    stream: OwnedReadHalf,
+    inner: TransportReceiverInner,
+}
+
+enum TransportSenderInner {
+    Tcp(OwnedWriteHalf),
+    Memory(mpsc::Sender<Vec<u8>>),
+}
+
+enum TransportReceiverInner {
+    Tcp(OwnedReadHalf),
+    Memory(mpsc::Receiver<Vec<u8>>),
 }
 
 impl TransportSender {
     /// Send data with length prefix.
     pub async fn send(&mut self, data: &[u8]) -> Result<()> {
-        let len = (data.len() as u32).to_le_bytes();
-        self.stream.write_all(&len).await?;
-        self.stream.write_all(data).await?;
+        match &mut self.inner {
+            TransportSenderInner::Tcp(stream) => {
+                let len = (data.len() as u32).to_le_bytes();
+                stream.write_all(&len).await?;
+                stream.write_all(data).await?;
+            }
+            TransportSenderInner::Memory(sender) => {
+                sender
+                    .send(data.to_vec())
+                    .await
+                    .map_err(|e| DistributedError::Protocol(format!("in-memory send failed: {e}")))?;
+            }
+        }
         Ok(())
     }
 }
@@ -51,44 +72,79 @@ impl TransportReceiver {
         const MAX_MSG_BYTES: usize = 512 * 1024 * 1024; // 512 MiB
         const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-        // Read the 4-byte length prefix with timeout.
-        let mut len_buf = [0u8; 4];
-        timeout(READ_TIMEOUT, self.stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| {
-                DistributedError::Protocol(
-                    "Timed out waiting for message length prefix (60s) — peer may have crashed"
-                        .to_string(),
-                )
-            })??;
-        let len = u32::from_le_bytes(len_buf) as usize;
+        match &mut self.inner {
+            TransportReceiverInner::Tcp(stream) => {
+                // Read the 4-byte length prefix with timeout.
+                let mut len_buf = [0u8; 4];
+                timeout(READ_TIMEOUT, stream.read_exact(&mut len_buf))
+                    .await
+                    .map_err(|_| {
+                        DistributedError::Protocol(
+                            "Timed out waiting for message length prefix (60s) — peer may have crashed"
+                                .to_string(),
+                        )
+                    })??;
+                let len = u32::from_le_bytes(len_buf) as usize;
 
-        if len > MAX_MSG_BYTES {
-            return Err(DistributedError::Protocol(format!(
-                "Message size {} bytes exceeds maximum {} bytes",
-                len, MAX_MSG_BYTES
-            ))
-            .into());
+                if len > MAX_MSG_BYTES {
+                    return Err(DistributedError::Protocol(format!(
+                        "Message size {} bytes exceeds maximum {} bytes",
+                        len, MAX_MSG_BYTES
+                    ))
+                    .into());
+                }
+
+                if len != buffer.len() {
+                    return Err(DistributedError::Protocol(format!(
+                        "Expected {} bytes, got {}",
+                        buffer.len(),
+                        len
+                    ))
+                    .into());
+                }
+
+                timeout(READ_TIMEOUT, stream.read_exact(buffer))
+                    .await
+                    .map_err(|_| {
+                        DistributedError::Protocol(format!(
+                            "Timed out waiting for {} bytes of payload (60s) — peer may have crashed",
+                            buffer.len()
+                        ))
+                    })??;
+            }
+            TransportReceiverInner::Memory(receiver) => {
+                let data = timeout(READ_TIMEOUT, receiver.recv())
+                    .await
+                    .map_err(|_| {
+                        DistributedError::Protocol(
+                            "Timed out waiting for in-memory payload (60s)".to_string(),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        DistributedError::Protocol("in-memory channel closed".to_string())
+                    })?;
+
+                if data.len() > MAX_MSG_BYTES {
+                    return Err(DistributedError::Protocol(format!(
+                        "Message size {} bytes exceeds maximum {} bytes",
+                        data.len(),
+                        MAX_MSG_BYTES
+                    ))
+                    .into());
+                }
+
+                if data.len() != buffer.len() {
+                    return Err(DistributedError::Protocol(format!(
+                        "Expected {} bytes, got {}",
+                        buffer.len(),
+                        data.len()
+                    ))
+                    .into());
+                }
+
+                buffer.copy_from_slice(&data);
+            }
         }
-
-        if len != buffer.len() {
-            return Err(DistributedError::Protocol(format!(
-                "Expected {} bytes, got {}",
-                buffer.len(),
-                len
-            ))
-            .into());
-        }
-
-        // Read the payload with timeout.
-        timeout(READ_TIMEOUT, self.stream.read_exact(buffer))
-            .await
-            .map_err(|_| {
-                DistributedError::Protocol(format!(
-                    "Timed out waiting for {} bytes of payload (60s) — peer may have crashed",
-                    buffer.len()
-                ))
-            })??;
 
         Ok(())
     }
@@ -102,36 +158,103 @@ impl TransportReceiver {
         const MAX_MSG_BYTES: usize = 512 * 1024 * 1024;
         const READ_TIMEOUT: Duration = Duration::from_secs(60);
 
-        let mut len_buf = [0u8; 4];
-        timeout(READ_TIMEOUT, self.stream.read_exact(&mut len_buf))
-            .await
-            .map_err(|_| {
-                DistributedError::Protocol(
-                    "Timed out waiting for message length prefix (60s)".to_string(),
-                )
-            })??;
-        let len = u32::from_le_bytes(len_buf) as usize;
+        match &mut self.inner {
+            TransportReceiverInner::Tcp(stream) => {
+                let mut len_buf = [0u8; 4];
+                timeout(READ_TIMEOUT, stream.read_exact(&mut len_buf))
+                    .await
+                    .map_err(|_| {
+                        DistributedError::Protocol(
+                            "Timed out waiting for message length prefix (60s)".to_string(),
+                        )
+                    })??;
+                let len = u32::from_le_bytes(len_buf) as usize;
 
-        if len > MAX_MSG_BYTES {
-            return Err(DistributedError::Protocol(format!(
-                "Message size {} bytes exceeds maximum {} bytes",
-                len, MAX_MSG_BYTES
-            ))
-            .into());
+                if len > MAX_MSG_BYTES {
+                    return Err(DistributedError::Protocol(format!(
+                        "Message size {} bytes exceeds maximum {} bytes",
+                        len, MAX_MSG_BYTES
+                    ))
+                    .into());
+                }
+
+                let mut buf = vec![0u8; len];
+                timeout(READ_TIMEOUT, stream.read_exact(&mut buf))
+                    .await
+                    .map_err(|_| {
+                        DistributedError::Protocol(format!(
+                            "Timed out waiting for {} bytes of payload (60s)",
+                            len
+                        ))
+                    })??;
+
+                Ok(buf)
+            }
+            TransportReceiverInner::Memory(receiver) => {
+                let data = timeout(READ_TIMEOUT, receiver.recv())
+                    .await
+                    .map_err(|_| {
+                        DistributedError::Protocol(
+                            "Timed out waiting for in-memory payload (60s)".to_string(),
+                        )
+                    })?
+                    .ok_or_else(|| {
+                        DistributedError::Protocol("in-memory channel closed".to_string())
+                    })?;
+
+                if data.len() > MAX_MSG_BYTES {
+                    return Err(DistributedError::Protocol(format!(
+                        "Message size {} bytes exceeds maximum {} bytes",
+                        data.len(),
+                        MAX_MSG_BYTES
+                    ))
+                    .into());
+                }
+
+                Ok(data)
+            }
         }
-
-        let mut buf = vec![0u8; len];
-        timeout(READ_TIMEOUT, self.stream.read_exact(&mut buf))
-            .await
-            .map_err(|_| {
-                DistributedError::Protocol(format!(
-                    "Timed out waiting for {} bytes of payload (60s)",
-                    len
-                ))
-            })??;
-
-        Ok(buf)
     }
+}
+
+impl TransportSender {
+    fn from_tcp(stream: OwnedWriteHalf) -> Self {
+        Self {
+            inner: TransportSenderInner::Tcp(stream),
+        }
+    }
+
+    fn from_memory(sender: mpsc::Sender<Vec<u8>>) -> Self {
+        Self {
+            inner: TransportSenderInner::Memory(sender),
+        }
+    }
+}
+
+impl TransportReceiver {
+    fn from_tcp(stream: OwnedReadHalf) -> Self {
+        Self {
+            inner: TransportReceiverInner::Tcp(stream),
+        }
+    }
+
+    fn from_memory(receiver: mpsc::Receiver<Vec<u8>>) -> Self {
+        Self {
+            inner: TransportReceiverInner::Memory(receiver),
+        }
+    }
+}
+
+/// Create a unidirectional in-memory transport channel.
+///
+/// This is used for local same-process pipeline stages, such as UltraFusion
+/// multi-die execution planning, where TCP framing would add unnecessary cost.
+pub fn in_memory_channel(capacity: usize) -> (TransportSender, TransportReceiver) {
+    let (tx, rx) = mpsc::channel(capacity.max(1));
+    (
+        TransportSender::from_memory(tx),
+        TransportReceiver::from_memory(rx),
+    )
 }
 
 /// TCP transport for ring communication.
@@ -230,17 +353,42 @@ impl TcpTransport {
         let (read_prev, _) = prev_peer.into_split();
 
         Ok((
-            TransportSender { stream: write_next },
-            TransportReceiver { stream: read_prev },
+            TransportSender::from_tcp(write_next),
+            TransportReceiver::from_tcp(read_prev),
         ))
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[tokio::test]
-    async fn test_transport_sender_receiver() {
-        // This would require setting up actual TCP connections
-        // For unit testing, we'd use mock streams
+    async fn in_memory_transport_roundtrip() {
+        let (mut sender, mut receiver) = in_memory_channel(4);
+        sender.send(b"hello").await.expect("send");
+
+        let mut buf = [0u8; 5];
+        receiver.recv(&mut buf).await.expect("recv");
+        assert_eq!(&buf, b"hello");
+    }
+
+    #[tokio::test]
+    async fn in_memory_transport_recv_vec_roundtrip() {
+        let (mut sender, mut receiver) = in_memory_channel(4);
+        sender.send(b"payload").await.expect("send");
+
+        let data = receiver.recv_vec().await.expect("recv_vec");
+        assert_eq!(data, b"payload");
+    }
+
+    #[tokio::test]
+    async fn in_memory_transport_len_mismatch_errors() {
+        let (mut sender, mut receiver) = in_memory_channel(4);
+        sender.send(b"toolong").await.expect("send");
+
+        let mut buf = [0u8; 3];
+        let err = receiver.recv(&mut buf).await.expect_err("length mismatch");
+        assert!(err.to_string().contains("Expected 3 bytes, got 7"));
     }
 }

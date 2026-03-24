@@ -114,6 +114,7 @@ pub mod activation_transport;
 pub mod layer_assignment;
 pub mod pipeline;
 pub mod solver;
+pub mod ultrafusion;
 
 // Re-exports for convenience
 pub use activation_codec::ActivationCodec;
@@ -134,6 +135,10 @@ pub use pipeline::{
 };
 pub use ring::RingBackend;
 pub use topology::{ClusterTopology, ConnectionProfile, NodeProfile, SharedTopology};
+pub use ultrafusion::{
+    DEFAULT_LOCAL_CHANNEL_CAPACITY, DEFAULT_ULTRAFUSION_INTERCONNECT_BYTES_PER_SEC,
+    UltraFusionDieProfile, UltraFusionExecutionConfig, UltraFusionPlan, UltraFusionStagePlan,
+};
 // ReduceOp is already public via `pub enum ReduceOp` at module level
 
 /// Interface for distributed operations.
@@ -262,4 +267,7 @@ pub mod prelude {
     pub use crate::namespace::NetworkNamespace;
     pub use crate::ring::RingBackend;
     pub use crate::topology::{ClusterTopology, NodeProfile};
+    pub use crate::ultrafusion::{
+        UltraFusionDieProfile, UltraFusionExecutionConfig, UltraFusionPlan, UltraFusionStagePlan,
+    };
 }
