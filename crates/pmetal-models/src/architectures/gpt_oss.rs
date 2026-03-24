@@ -33,7 +33,6 @@ use mlx_rs::{
 };
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
-use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};
 
 /// Attention layer type for GPT-OSS.
@@ -513,26 +512,91 @@ impl GptOssMLP {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
 
-        // SwiGLU with clamping: clamp(silu(gate) * up, -limit, limit)
-        let activated = nn::silu(&gate)?.multiply(&up)?;
-        // Clamp using min/max operations
-        let limit = Array::from_f32(self.swiglu_limit);
-        let neg_limit = Array::from_f32(-self.swiglu_limit);
-        let clamped = mlx_rs::ops::minimum(&activated, &limit)?;
-        let clamped = mlx_rs::ops::maximum(&clamped, &neg_limit)?;
+        let clamped = clamp_swiglu_hidden(&gate, &up, self.swiglu_limit)?;
 
         self.down_proj.forward(&clamped)
     }
 }
 
-/// GPT-OSS MoE block with sigmoid routing.
-#[derive(Debug)]
-pub struct GptOssMoE {
-    /// MoE layer from pmetal-mlx.
-    moe_layer: MoELayer,
-    /// SwiGLU limit for clamping.
-    #[allow(dead_code)] // Kept for future clamping pass; currently handled inside MoELayer
+fn clamp_swiglu_hidden(gate: &Array, up: &Array, limit: f32) -> Result<Array, Exception> {
+    let activated = nn::silu(gate)?.multiply(up)?;
+    let limit = Array::from_f32(limit);
+    let neg_limit = Array::from_f32(-limit.item::<f32>());
+    let clamped = mlx_rs::ops::minimum(&activated, &limit)?;
+    mlx_rs::ops::maximum(&clamped, &neg_limit)
+}
+
+/// GPT-OSS expert MLP with bias and SwiGLU clamping.
+#[derive(Debug, ModuleParameters)]
+pub struct GptOssMoEExpert {
+    /// SwiGLU limit (clamp value).
     swiglu_limit: f32,
+    /// Gate projection.
+    #[param]
+    pub gate_proj: nn::Linear,
+    /// Up projection.
+    #[param]
+    pub up_proj: nn::Linear,
+    /// Down projection.
+    #[param]
+    pub down_proj: nn::Linear,
+}
+
+impl GptOssMoEExpert {
+    /// Create a new expert.
+    pub fn new(hidden_size: i32, intermediate_size: i32, swiglu_limit: f32) -> Result<Self, Exception> {
+        Ok(Self {
+            swiglu_limit,
+            gate_proj: nn::LinearBuilder::new(hidden_size, intermediate_size)
+                .bias(true)
+                .build()?,
+            up_proj: nn::LinearBuilder::new(hidden_size, intermediate_size)
+                .bias(true)
+                .build()?,
+            down_proj: nn::LinearBuilder::new(intermediate_size, hidden_size)
+                .bias(true)
+                .build()?,
+        })
+    }
+
+    /// Forward pass through a single expert.
+    pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        let gate = self.gate_proj.forward(x)?;
+        let up = self.up_proj.forward(x)?;
+        let clamped = clamp_swiglu_hidden(&gate, &up, self.swiglu_limit)?;
+        self.down_proj.forward(&clamped)
+    }
+}
+
+/// GPT-OSS MoE block with sigmoid routing.
+#[derive(Debug, ModuleParameters)]
+pub struct GptOssMoE {
+    /// Top-k experts per token.
+    top_k: usize,
+    /// Router auxiliary loss coefficient.
+    router_aux_loss_coef: f32,
+    /// Gate projection (routes to experts).
+    #[param]
+    gate: nn::Linear,
+    /// Expert MLPs.
+    #[param]
+    experts: Vec<GptOssMoEExpert>,
+    /// SwiGLU limit for clamping.
+    swiglu_limit: f32,
+    /// Stacked gate projection weights `[num_experts, hidden, intermediate]`.
+    stacked_gate_proj: Option<Array>,
+    /// Stacked up projection weights `[num_experts, hidden, intermediate]`.
+    stacked_up_proj: Option<Array>,
+    /// Stacked down projection weights `[num_experts, intermediate, hidden]`.
+    stacked_down_proj: Option<Array>,
+    /// Stacked gate bias `[num_experts, intermediate]`.
+    stacked_gate_bias: Option<Array>,
+    /// Stacked up bias `[num_experts, intermediate]`.
+    stacked_up_bias: Option<Array>,
+    /// Stacked down bias `[num_experts, hidden]`.
+    stacked_down_bias: Option<Array>,
+    /// Signature of the current expert weight/bias handles.
+    stacked_signature: Option<Vec<usize>>,
 }
 
 impl GptOssMoE {
@@ -543,24 +607,295 @@ impl GptOssMoE {
         num_experts: i32,
         experts_per_token: i32,
         swiglu_limit: f32,
+        router_aux_loss_coef: f32,
     ) -> Result<Self, Exception> {
-        // GPT-OSS uses sigmoid routing (already default in MoE expert)
-        let config = MoEConfig::new(hidden_size, intermediate_size, num_experts as usize)
-            .with_num_experts_per_tok(experts_per_token as usize)
-            .with_aux_loss(true, 0.9);
-
-        let moe_layer = MoELayer::new(config);
+        let gate = nn::LinearBuilder::new(hidden_size, num_experts)
+            .bias(false)
+            .build()?;
+        let experts = (0..num_experts as usize)
+            .map(|_| GptOssMoEExpert::new(hidden_size, intermediate_size, swiglu_limit))
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
-            moe_layer,
+            top_k: experts_per_token as usize,
+            router_aux_loss_coef,
+            gate,
+            experts,
             swiglu_limit,
+            stacked_gate_proj: None,
+            stacked_up_proj: None,
+            stacked_down_proj: None,
+            stacked_gate_bias: None,
+            stacked_up_bias: None,
+            stacked_down_bias: None,
+            stacked_signature: None,
         })
+    }
+
+    fn current_signature(&self) -> Vec<usize> {
+        let mut signature = Vec::with_capacity(self.experts.len() * 6);
+        for expert in &self.experts {
+            signature.push(expert.gate_proj.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(
+                expert
+                    .gate_proj
+                    .bias
+                    .as_ref()
+                    .as_ref()
+                    .map(|bias| bias.as_ptr().ctx as usize)
+                    .unwrap_or(0),
+            );
+            signature.push(expert.up_proj.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(
+                expert
+                    .up_proj
+                    .bias
+                    .as_ref()
+                    .as_ref()
+                    .map(|bias| bias.as_ptr().ctx as usize)
+                    .unwrap_or(0),
+            );
+            signature.push(expert.down_proj.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(
+                expert
+                    .down_proj
+                    .bias
+                    .as_ref()
+                    .as_ref()
+                    .map(|bias| bias.as_ptr().ctx as usize)
+                    .unwrap_or(0),
+            );
+        }
+        signature
+    }
+
+    fn stack_expert_weights(&self) -> Result<(Array, Array, Array, Array, Array, Array), Exception> {
+        let gate_weights: Vec<Array> = self
+            .experts
+            .iter()
+            .map(|expert| expert.gate_proj.weight.as_ref().t())
+            .collect();
+        let up_weights: Vec<Array> = self
+            .experts
+            .iter()
+            .map(|expert| expert.up_proj.weight.as_ref().t())
+            .collect();
+        let down_weights: Vec<Array> = self
+            .experts
+            .iter()
+            .map(|expert| expert.down_proj.weight.as_ref().t())
+            .collect();
+        let gate_biases: Vec<Array> = self
+            .experts
+            .iter()
+            .map(|expert| {
+                expert
+                    .gate_proj
+                    .bias
+                    .as_ref()
+                    .clone()
+                    .unwrap_or_else(|| Array::zeros::<f32>(&[expert.gate_proj.weight.as_ref().dim(0)]).unwrap())
+            })
+            .collect();
+        let up_biases: Vec<Array> = self
+            .experts
+            .iter()
+            .map(|expert| {
+                expert
+                    .up_proj
+                    .bias
+                    .as_ref()
+                    .clone()
+                    .unwrap_or_else(|| Array::zeros::<f32>(&[expert.up_proj.weight.as_ref().dim(0)]).unwrap())
+            })
+            .collect();
+        let down_biases: Vec<Array> = self
+            .experts
+            .iter()
+            .map(|expert| {
+                expert
+                    .down_proj
+                    .bias
+                    .as_ref()
+                    .clone()
+                    .unwrap_or_else(|| Array::zeros::<f32>(&[expert.down_proj.weight.as_ref().dim(0)]).unwrap())
+            })
+            .collect();
+
+        let gate_weight_refs: Vec<&Array> = gate_weights.iter().collect();
+        let up_weight_refs: Vec<&Array> = up_weights.iter().collect();
+        let down_weight_refs: Vec<&Array> = down_weights.iter().collect();
+        let gate_bias_refs: Vec<&Array> = gate_biases.iter().collect();
+        let up_bias_refs: Vec<&Array> = up_biases.iter().collect();
+        let down_bias_refs: Vec<&Array> = down_biases.iter().collect();
+
+        Ok((
+            mlx_rs::ops::stack_axis(&gate_weight_refs, 0)?,
+            mlx_rs::ops::stack_axis(&up_weight_refs, 0)?,
+            mlx_rs::ops::stack_axis(&down_weight_refs, 0)?,
+            mlx_rs::ops::stack_axis(&gate_bias_refs, 0)?,
+            mlx_rs::ops::stack_axis(&up_bias_refs, 0)?,
+            mlx_rs::ops::stack_axis(&down_bias_refs, 0)?,
+        ))
+    }
+
+    fn ensure_stacked(&mut self) -> Result<(), Exception> {
+        let signature = self.current_signature();
+        let needs_refresh = self.stacked_gate_proj.is_none()
+            || self.stacked_up_proj.is_none()
+            || self.stacked_down_proj.is_none()
+            || self.stacked_gate_bias.is_none()
+            || self.stacked_up_bias.is_none()
+            || self.stacked_down_bias.is_none()
+            || self.stacked_signature.as_ref() != Some(&signature);
+
+        if needs_refresh {
+            let (
+                stacked_gate_proj,
+                stacked_up_proj,
+                stacked_down_proj,
+                stacked_gate_bias,
+                stacked_up_bias,
+                stacked_down_bias,
+            ) = self.stack_expert_weights()?;
+            stacked_gate_proj.eval()?;
+            stacked_up_proj.eval()?;
+            stacked_down_proj.eval()?;
+            stacked_gate_bias.eval()?;
+            stacked_up_bias.eval()?;
+            stacked_down_bias.eval()?;
+            self.stacked_gate_proj = Some(stacked_gate_proj);
+            self.stacked_up_proj = Some(stacked_up_proj);
+            self.stacked_down_proj = Some(stacked_down_proj);
+            self.stacked_gate_bias = Some(stacked_gate_bias);
+            self.stacked_up_bias = Some(stacked_up_bias);
+            self.stacked_down_bias = Some(stacked_down_bias);
+            self.stacked_signature = Some(signature);
+        }
+
+        Ok(())
+    }
+
+    /// Eagerly build or refresh the stacked expert cache.
+    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
+        self.ensure_stacked()
+    }
+
+    /// Whether the stacked expert cache is populated.
+    pub fn has_stacked_moe(&self) -> bool {
+        self.stacked_gate_proj.is_some()
+            && self.stacked_up_proj.is_some()
+            && self.stacked_down_proj.is_some()
+            && self.stacked_gate_bias.is_some()
+            && self.stacked_up_bias.is_some()
+            && self.stacked_down_bias.is_some()
+    }
+
+    fn route_topk(&mut self, hidden_flat: &Array) -> Result<(i32, i32, Array, Array), Exception> {
+        let batch_seq = hidden_flat.dim(0);
+        let hidden_size = hidden_flat.dim(1);
+
+        let gate_logits = self.gate.forward(hidden_flat)?;
+        let scores = mlx_rs::ops::sigmoid(&gate_logits)?;
+        let neg_k = -(self.top_k as i32);
+        let part_indices = mlx_rs::ops::argpartition_axis(&scores, neg_k, -1)?;
+        let top_indices = part_indices.index((.., neg_k..)).as_type::<i32>()?;
+        let top_weights = scores.take_along_axis(&top_indices, -1)?;
+        let weight_sum = top_weights.sum_axis(-1, Some(true))?;
+        let safe_sum = mlx_rs::ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
+        let normalized_weights = top_weights.divide(&safe_sum)?;
+
+        Ok((batch_seq, hidden_size, top_indices, normalized_weights))
+    }
+
+    fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array, Exception> {
+        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)])?;
+        let result = mlx_rs::ops::matmul(&x_expanded, w)?;
+        result.squeeze_axes(&[1])
+    }
+
+    #[cfg(test)]
+    fn forward_reference(&mut self, x: &Array) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
+        let hidden_size = shape[shape.len() - 1];
+        let hidden_flat = x.reshape(&[batch_seq, hidden_size])?;
+        let (_batch_seq, _hidden_size, top_indices, normalized_weights) = self.route_topk(&hidden_flat)?;
+
+        top_indices.eval()?;
+        normalized_weights.eval()?;
+        let expert_indices: Vec<i32> = top_indices.as_slice().to_vec();
+        let expert_weights: Vec<f32> = normalized_weights.as_slice().to_vec();
+        let mut assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.experts.len()];
+        for token_idx in 0..batch_seq as usize {
+            for slot in 0..self.top_k {
+                let flat_idx = token_idx * self.top_k + slot;
+                let expert_id = expert_indices[flat_idx] as usize;
+                let weight = expert_weights[flat_idx];
+                if expert_id < self.experts.len() {
+                    assignments[expert_id].push((token_idx, weight));
+                }
+            }
+        }
+
+        let mut output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
+        for (expert_idx, expert_assignments) in assignments.iter().enumerate() {
+            if expert_assignments.is_empty() {
+                continue;
+            }
+            let token_indices: Vec<i32> =
+                expert_assignments.iter().map(|&(idx, _)| idx as i32).collect();
+            let weights: Vec<f32> = expert_assignments.iter().map(|&(_, weight)| weight).collect();
+
+            let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
+            let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
+            let expert_input = hidden_flat.take_axis(&idx_array, 0)?;
+            let expert_out = self.experts[expert_idx].forward(&expert_input)?;
+            let weighted = expert_out.multiply(&weight_array)?;
+            let updates = weighted.reshape(&[token_indices.len() as i32, 1, hidden_size])?;
+            output = mlx_rs::ops::indexing::scatter_add_single(&output, &idx_array, &updates, 0)?;
+        }
+
+        let mut output_shape = shape.to_vec();
+        output_shape[shape.len() - 1] = hidden_size;
+        output.reshape(&output_shape)
+    }
+
+    fn forward_stacked(&mut self, x: &Array) -> Result<Array, Exception> {
+        self.ensure_stacked()?;
+
+        let shape = x.shape();
+        let hidden_flat = x.reshape(&[shape[..shape.len() - 1].iter().product(), shape[shape.len() - 1]])?;
+        let (batch_seq, hidden_size, top_indices, normalized_weights) = self.route_topk(&hidden_flat)?;
+        let top_k = self.top_k as i32;
+        let mut output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
+
+        for slot in 0..top_k {
+            let slot_experts = top_indices.index((.., slot));
+            let slot_weights = normalized_weights.index((.., slot..slot + 1));
+            let gate_weights = self.stacked_gate_proj.as_ref().unwrap().take_axis(&slot_experts, 0)?;
+            let up_weights = self.stacked_up_proj.as_ref().unwrap().take_axis(&slot_experts, 0)?;
+            let down_weights = self.stacked_down_proj.as_ref().unwrap().take_axis(&slot_experts, 0)?;
+            let gate_bias = self.stacked_gate_bias.as_ref().unwrap().take_axis(&slot_experts, 0)?;
+            let up_bias = self.stacked_up_bias.as_ref().unwrap().take_axis(&slot_experts, 0)?;
+            let down_bias = self.stacked_down_bias.as_ref().unwrap().take_axis(&slot_experts, 0)?;
+
+            let gate_out = self.batched_matmul(&hidden_flat, &gate_weights)?.add(&gate_bias)?;
+            let up_out = self.batched_matmul(&hidden_flat, &up_weights)?.add(&up_bias)?;
+            let clamped = clamp_swiglu_hidden(&gate_out, &up_out, self.swiglu_limit)?;
+            let slot_out = self.batched_matmul(&clamped, &down_weights)?.add(&down_bias)?;
+            output = output.add(&slot_out.multiply(&slot_weights)?)?;
+        }
+
+        let mut output_shape = shape.to_vec();
+        output_shape[shape.len() - 1] = hidden_size;
+        output.reshape(&output_shape)
     }
 
     /// Forward pass through MoE.
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let (output, _aux_loss) = self.moe_layer.forward(x)?;
-        Ok(output)
+        let _ = self.router_aux_loss_coef;
+        self.forward_stacked(x)
     }
 }
 
@@ -571,6 +906,7 @@ pub struct GptOssDecoderLayer {
     #[param]
     pub self_attn: GptOssAttention,
     /// MoE or dense MLP.
+    #[param]
     mlp: GptOssMoE,
     /// Input layer norm.
     #[param]
@@ -591,6 +927,7 @@ impl GptOssDecoderLayer {
             config.num_local_experts,
             config.num_experts_per_tok(),
             config.swiglu_limit,
+            config.router_aux_loss_coef,
         )?;
 
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
@@ -626,6 +963,11 @@ impl GptOssDecoderLayer {
         let hidden = self.post_attention_layernorm.forward(&hidden)?;
         let hidden = self.mlp.forward(&hidden)?;
         residual.add(&hidden)
+    }
+
+    /// Eagerly build the stacked expert cache for this layer's MoE block.
+    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
+        self.mlp.init_stacked_moe()
     }
 }
 
@@ -691,6 +1033,14 @@ impl GptOssModel {
         self.norm.forward(&hidden)
     }
 
+    /// Eagerly build stacked expert caches for all decoder layers.
+    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
+        for layer in &mut self.layers {
+            layer.init_stacked_moe()?;
+        }
+        Ok(())
+    }
+
     /// Get the configuration.
     pub fn config(&self) -> &GptOssConfig {
         &self.config
@@ -729,6 +1079,11 @@ impl GptOssForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward(input_ids, mask, cache)?;
         self.lm_head.forward(&hidden)
+    }
+
+    /// Eagerly build stacked expert caches for all MoE layers.
+    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
+        self.model.init_stacked_moe()
     }
 
     /// Get the configuration.
@@ -1228,6 +1583,7 @@ impl GptOssForCausalLM {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
 
     #[test]
     fn test_config_defaults() {
@@ -1254,6 +1610,144 @@ mod tests {
         let config = GptOssConfig::gpt_oss_120b();
         assert_eq!(config.num_hidden_layers, 36);
         assert_eq!(config.num_local_experts, 128);
+    }
+
+    fn tiny_gpt_oss_config() -> GptOssConfig {
+        GptOssConfig {
+            hidden_size: 32,
+            intermediate_size: 48,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 1,
+            head_dim: 8,
+            vocab_size: 64,
+            num_local_experts: 4,
+            experts_per_token: 2,
+            num_experts_per_tok: Some(2),
+            sliding_window: 16,
+            ..GptOssConfig::default()
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_gpt_oss_moe_forward_shape() {
+        let config = tiny_gpt_oss_config();
+        let mut moe = GptOssMoE::new(
+            config.hidden_size,
+            config.intermediate_size,
+            config.num_local_experts,
+            config.num_experts_per_tok(),
+            config.swiglu_limit,
+            config.router_aux_loss_coef,
+        )
+        .unwrap();
+        let x = Array::zeros::<f32>(&[2, 5, config.hidden_size]).unwrap();
+        let out = moe.forward(&x).unwrap();
+        assert_eq!(out.shape(), &[2, 5, config.hidden_size]);
+        assert!(moe.has_stacked_moe());
+    }
+
+    #[test]
+    #[serial]
+    fn test_gpt_oss_moe_stacked_matches_reference() {
+        let config = tiny_gpt_oss_config();
+        let mut moe = GptOssMoE::new(
+            config.hidden_size,
+            config.intermediate_size,
+            config.num_local_experts,
+            config.num_experts_per_tok(),
+            config.swiglu_limit,
+            config.router_aux_loss_coef,
+        )
+        .unwrap();
+        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
+            .unwrap();
+
+        let reference = moe.forward_reference(&x).unwrap();
+        let fast = moe.forward(&x).unwrap();
+        reference.eval().unwrap();
+        fast.eval().unwrap();
+
+        let max_diff = fast
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        max_diff.eval().unwrap();
+        assert!(
+            max_diff.item::<f32>() < 1e-4,
+            "gpt-oss stacked MoE drifted from reference"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_gpt_oss_moe_cache_refreshes_after_weight_change() {
+        let config = tiny_gpt_oss_config();
+        let mut moe = GptOssMoE::new(
+            config.hidden_size,
+            config.intermediate_size,
+            config.num_local_experts,
+            config.num_experts_per_tok(),
+            config.swiglu_limit,
+            config.router_aux_loss_coef,
+        )
+        .unwrap();
+        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
+            .unwrap();
+
+        let _ = moe.forward(&x).unwrap();
+        moe.experts[0].gate_proj.weight = mlx_rs::module::Param::new(
+            Array::zeros::<f32>(&[config.intermediate_size, config.hidden_size]).unwrap(),
+        );
+
+        let reference = moe.forward_reference(&x).unwrap();
+        let fast = moe.forward(&x).unwrap();
+        reference.eval().unwrap();
+        fast.eval().unwrap();
+
+        let max_diff = fast
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        max_diff.eval().unwrap();
+        assert!(
+            max_diff.item::<f32>() < 1e-4,
+            "gpt-oss stacked cache failed to refresh after weight change"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_gpt_oss_full_model_init_stacked_moe_preserves_forward() {
+        let config = tiny_gpt_oss_config();
+        let mut model = GptOssForCausalLM::new(config.clone()).unwrap();
+        let input_ids = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
+
+        let reference = model.forward(&input_ids, None, None).unwrap();
+        model.init_stacked_moe().unwrap();
+        let fast = model.forward(&input_ids, None, None).unwrap();
+        reference.eval().unwrap();
+        fast.eval().unwrap();
+
+        let max_diff = fast
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        max_diff.eval().unwrap();
+        assert!(
+            max_diff.item::<f32>() < 1e-4,
+            "gpt-oss full model drifted after stacked init"
+        );
     }
 
     // LoRA Tests

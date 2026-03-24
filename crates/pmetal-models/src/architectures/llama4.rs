@@ -474,33 +474,51 @@ impl Llama4MoE {
         // Shared expert output (always applied to all tokens)
         let shared_out = self.shared_expert.forward(&flat_x)?;
 
-        // Accumulator for routed expert outputs, summed over all top_k slots.
-        let mut combined_out = ops::zeros::<f32>(&[total_tokens, hidden_size])?;
+        // Eval routing tensors to CPU for index extraction.
+        // The routing tensors are small relative to expert MLP compute, and
+        // per-expert dispatch avoids running every expert over every token.
+        let expert_indices = expert_indices.as_type::<i32>()?;
+        expert_indices.eval()?;
+        expert_weights.eval()?;
 
-        // For each top_k slot, dispatch to the corresponding expert and weight.
-        // This is the naive O(num_experts * top_k) masked-dispatch loop.
-        // In production this would use grouped GEMM per-slot.
-        let top_k = self.config.num_experts_per_tok;
-        for slot in 0..top_k {
-            // slot_indices: [total_tokens]  — which expert each token chose in this slot
-            let slot_indices = expert_indices
-                .index((.., slot..slot + 1))
-                .squeeze_axes(&[-1])?;
-            // slot_weights: [total_tokens, 1]  — normalized weight for this slot
-            let slot_weights = expert_weights.index((.., slot..slot + 1));
+        let top_k = self.config.num_experts_per_tok as usize;
+        let n_tokens = total_tokens as usize;
+        let expert_ids: Vec<i32> = expert_indices.as_slice().to_vec();
+        let routing_weights: Vec<f32> = expert_weights.as_slice().to_vec();
 
-            let mut slot_out = ops::zeros::<f32>(&[total_tokens, hidden_size])?;
-            for (expert_idx, expert) in self.experts.iter_mut().enumerate() {
-                let expert_id = Array::from_int(expert_idx as i32);
-                let mask = slot_indices.eq(&expert_id)?;
-                let mask_f32 = mask.as_dtype(mlx_rs::Dtype::Float32)?;
-                let exp_output = expert.forward(&flat_x)?;
-                let masked = exp_output.multiply(&mask_f32.reshape(&[total_tokens, 1])?)?;
-                slot_out = slot_out.add(&masked)?;
+        let mut expert_assignments: Vec<Vec<(usize, f32)>> =
+            vec![Vec::new(); self.experts.len()];
+        for token_idx in 0..n_tokens {
+            for slot in 0..top_k {
+                let flat_idx = token_idx * top_k + slot;
+                let expert_id = expert_ids[flat_idx] as usize;
+                let weight = routing_weights[flat_idx];
+                if expert_id < self.experts.len() {
+                    expert_assignments[expert_id].push((token_idx, weight));
+                }
+            }
+        }
+
+        let input_dtype = flat_x.dtype();
+        let mut combined_out = ops::zeros_dtype(&[total_tokens, hidden_size], input_dtype)?;
+        for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
+            if assignments.is_empty() {
+                continue;
             }
 
-            let weighted = slot_out.multiply(&slot_weights)?;
-            combined_out = combined_out.add(&weighted)?;
+            let token_indices: Vec<i32> = assignments.iter().map(|&(idx, _)| idx as i32).collect();
+            let weights: Vec<f32> = assignments.iter().map(|&(_, weight)| weight).collect();
+
+            let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
+            let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
+
+            let expert_input = flat_x.take_axis(&idx_array, 0)?;
+            let expert_out = self.experts[expert_idx].forward(&expert_input)?;
+            let weighted_out = expert_out.multiply(&weight_array)?;
+
+            let updates = weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size])?;
+            combined_out =
+                mlx_rs::ops::indexing::scatter_add_single(&combined_out, &idx_array, &updates, 0)?;
         }
 
         // Add shared expert contribution and reshape to original shape
@@ -1156,6 +1174,96 @@ mod tests {
         out.eval().unwrap();
 
         assert_eq!(out.shape(), &[1, 10, 64]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_llama4_moe_matches_naive_reference() {
+        let mut config = Llama4TextConfig::default();
+        config.hidden_size = 32;
+        config.intermediate_size = 64;
+        config.intermediate_size_mlp = 64;
+        config.num_local_experts = 4;
+        config.num_experts_per_tok = 2;
+
+        let mut moe = Llama4MoE::new(&config).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[2, 5, config.hidden_size], None, None, None)
+            .unwrap();
+
+        let shape = x.shape().to_vec();
+        let hidden_size = *shape.last().unwrap();
+        let total_tokens = shape.iter().take(shape.len() - 1).product::<i32>();
+        let flat_x = x.reshape(&[total_tokens, hidden_size]).unwrap();
+
+        let (expert_indices, expert_weights, _router_logits) = moe.router.forward(&flat_x).unwrap();
+        let shared_out = moe.shared_expert.forward(&flat_x).unwrap();
+
+        let mut reference = ops::zeros_dtype(&[total_tokens, hidden_size], flat_x.dtype()).unwrap();
+        let top_k = config.num_experts_per_tok;
+        for slot in 0..top_k {
+            let slot_indices = expert_indices
+                .index((.., slot..slot + 1))
+                .squeeze_axes(&[-1])
+                .unwrap();
+            let slot_weights = expert_weights.index((.., slot..slot + 1));
+
+            let mut slot_out = ops::zeros_dtype(&[total_tokens, hidden_size], flat_x.dtype()).unwrap();
+            for (expert_idx, expert) in moe.experts.iter_mut().enumerate() {
+                let expert_id = Array::from_int(expert_idx as i32);
+                let mask = slot_indices.eq(&expert_id).unwrap();
+                let mask_f32 = mask.as_dtype(mlx_rs::Dtype::Float32).unwrap();
+                let exp_output = expert.forward(&flat_x).unwrap();
+                let masked = exp_output
+                    .multiply(&mask_f32.reshape(&[total_tokens, 1]).unwrap())
+                    .unwrap();
+                slot_out = slot_out.add(&masked).unwrap();
+            }
+
+            let weighted = slot_out.multiply(&slot_weights).unwrap();
+            reference = reference.add(&weighted).unwrap();
+        }
+
+        let reference = shared_out.add(&reference).unwrap().reshape(&shape).unwrap();
+        let output = moe.forward(&x).unwrap();
+
+        output.eval().unwrap();
+        reference.eval().unwrap();
+        let diff = output
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        diff.eval().unwrap();
+        let max_diff = diff.item::<f32>();
+        assert!(max_diff < 1e-4, "llama4 moe drifted from naive path: {max_diff}");
+        assert_eq!(output.shape(), &[2, 5, config.hidden_size]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_llama4_moe_accepts_float16_inputs() {
+        let mut config = Llama4TextConfig::default();
+        config.hidden_size = 16;
+        config.intermediate_size = 32;
+        config.intermediate_size_mlp = 32;
+        config.num_local_experts = 2;
+        config.num_experts_per_tok = 1;
+
+        let mut moe = Llama4MoE::new(&config).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[1, 4, config.hidden_size], None, None, None)
+            .unwrap()
+            .as_dtype(mlx_rs::Dtype::Float16)
+            .unwrap();
+
+        let output = moe.forward(&x).unwrap();
+        output.eval().unwrap();
+
+        assert_eq!(output.shape(), &[1, 4, config.hidden_size]);
+        for value in output.as_slice::<f32>().to_vec() {
+            assert!(value.is_finite(), "non-finite Llama4 MoE output");
+        }
     }
 
     #[test]

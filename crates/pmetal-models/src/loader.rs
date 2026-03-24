@@ -57,6 +57,27 @@ impl From<mlx_rs::error::Exception> for LoadError {
     }
 }
 
+const PARAM_EVAL_BATCH_SIZE: usize = 128;
+
+fn assign_loaded_weights<M: ModuleParameters>(model: &mut M, loaded: HashMap<String, Array>) {
+    let mut params = model.parameters_mut().flatten();
+    for (key, value) in loaded {
+        if let Some(param) = params.get_mut(&*key) {
+            **param = value;
+        }
+    }
+}
+
+fn eval_loaded_parameters<M: ModuleParameters>(model: &M) -> Result<(), LoadError> {
+    let params = model.parameters().flatten();
+    let arrays: Vec<&Array> = params.values().copied().collect();
+    for chunk in arrays.chunks(PARAM_EVAL_BATCH_SIZE) {
+        mlx_rs::transforms::eval(chunk.iter().copied())
+            .map_err(|e| LoadError::Mlx(e.to_string()))?;
+    }
+    Ok(())
+}
+
 pub fn load_clip_weights(
     model: &mut CLIPTextModel,
     weights: &HashMap<String, Array>,
@@ -796,16 +817,17 @@ fn find_hf_repo_root(path: &Path) -> Option<std::path::PathBuf> {
 }
 
 /// Load generic weights using safetensors.
-pub fn load_generic_weights<M: ModuleParametersExt>(
+pub fn load_generic_weights<M: ModuleParameters>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
 ) -> Result<(), LoadError> {
     let model_dir = model_dir.as_ref();
     let single_file = model_dir.join("model.safetensors");
     if single_file.exists() {
-        model
-            .load_safetensors(&single_file)
+        let loaded = Array::load_safetensors(&single_file)
             .map_err(|e| LoadError::SafeTensors(e.to_string()))?;
+        assign_loaded_weights(model, loaded);
+        eval_loaded_parameters(model)?;
         return Ok(());
     }
     let index_path = model_dir.join("model.safetensors.index.json");
@@ -820,10 +842,11 @@ pub fn load_generic_weights<M: ModuleParametersExt>(
     let shard_files: HashSet<&String> = index.weight_map.values().collect();
     for shard_file in shard_files {
         let shard_path = validate_shard_path(model_dir, shard_file)?;
-        model
-            .load_safetensors(&shard_path)
+        let loaded = Array::load_safetensors(&shard_path)
             .map_err(|e| LoadError::SafeTensors(e.to_string()))?;
+        assign_loaded_weights(model, loaded);
     }
+    eval_loaded_parameters(model)?;
     Ok(())
 }
 

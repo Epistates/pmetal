@@ -12,7 +12,7 @@ use crate::traits::{CausalLMModel, ModelConfig};
 use mlx_rs::{
     Array,
     error::Exception,
-    module::{Module, ModuleParameters, ModuleParametersExt},
+    module::{Module, ModuleParameters},
 };
 use pmetal_mlx::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
 use std::path::Path;
@@ -30,6 +30,19 @@ fn find_compatible_group_size(head_dim: usize, preferred: usize) -> usize {
         }
     }
     1 // Fallback: per-element quantization (always works)
+}
+
+const PARAM_EVAL_BATCH_SIZE: usize = 128;
+
+fn eval_module_parameters_batched(module: &impl ModuleParameters) -> Result<(), Exception> {
+    let params = module.parameters().flatten();
+    let arrays: Vec<&Array> = params.values().copied().collect();
+
+    for chunk in arrays.chunks(PARAM_EVAL_BATCH_SIZE) {
+        mlx_rs::transforms::eval(chunk.iter().copied())?;
+    }
+
+    Ok(())
 }
 
 /// Model architecture types supported by PMetal.
@@ -368,7 +381,7 @@ impl DynamicModel {
                 let mut model = LlamaForCausalLM::new(config)?;
                 crate::loader::load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Llama(model))
             }
             ModelArchitecture::Llama4 => {
@@ -377,7 +390,7 @@ impl DynamicModel {
                 let mut model = Llama4ForCausalLM::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Llama4(model))
             }
             ModelArchitecture::Qwen2 => {
@@ -386,16 +399,16 @@ impl DynamicModel {
                 let mut model = Qwen2ForCausalLM::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Qwen2(model))
             }
             ModelArchitecture::Qwen3 => {
                 let config: Qwen3Config = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = Qwen3ForCausalLM::new(config)?;
+                let mut model = Qwen3ForCausalLM::new_for_loading(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Qwen3(model))
             }
             ModelArchitecture::Qwen3MoE => {
@@ -404,7 +417,7 @@ impl DynamicModel {
                 let mut model = Qwen3MoE::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Qwen3MoE(model))
             }
             ModelArchitecture::Gemma => {
@@ -420,7 +433,7 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 crate::loader::load_gemma_weights(&mut model, &weights)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Gemma(model))
             }
             ModelArchitecture::Mistral => {
@@ -429,7 +442,7 @@ impl DynamicModel {
                 let mut model = MistralForCausalLM::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Mistral(model))
             }
             ModelArchitecture::Phi => {
@@ -438,7 +451,7 @@ impl DynamicModel {
                 let mut model = PhiForCausalLM::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Phi(model))
             }
             ModelArchitecture::Phi4 => {
@@ -447,7 +460,7 @@ impl DynamicModel {
                 let mut model = PhiForCausalLM::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Phi4(model))
             }
             ModelArchitecture::DeepSeek => {
@@ -456,7 +469,7 @@ impl DynamicModel {
                 let mut model = DeepSeek::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::DeepSeek(model))
             }
             ModelArchitecture::Cohere => {
@@ -465,7 +478,7 @@ impl DynamicModel {
                 let mut model = CohereForCausalLM::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Cohere(model))
             }
             ModelArchitecture::Granite => {
@@ -474,7 +487,7 @@ impl DynamicModel {
                 let mut model = GraniteForCausalLM::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Granite(model))
             }
             ModelArchitecture::NemotronH => {
@@ -483,7 +496,7 @@ impl DynamicModel {
                 let mut model = NemotronHForCausalLM::new(config)?;
                 crate::loader::load_nemotron_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::NemotronH(model))
             }
             ModelArchitecture::Qwen3Next => {
@@ -504,7 +517,7 @@ impl DynamicModel {
                 let mut model = Qwen3NextForCausalLM::new(config.clone())?;
                 load_qwen3_next_weights(&mut model, model_dir, &config)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Qwen3Next(model))
             }
             ModelArchitecture::StarCoder2 => {
@@ -513,7 +526,7 @@ impl DynamicModel {
                 let mut model = StarCoder2Model::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::StarCoder2(model))
             }
             ModelArchitecture::RecurrentGemma => {
@@ -522,7 +535,7 @@ impl DynamicModel {
                 let mut model = RecurrentGemmaModel::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::RecurrentGemma(model))
             }
             ModelArchitecture::Jamba => {
@@ -531,7 +544,7 @@ impl DynamicModel {
                 let mut model = JambaModel::new(config)?;
                 load_generic_weights(&mut model, model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Jamba(model))
             }
             ModelArchitecture::FalconH1 => {
@@ -542,7 +555,7 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 load_falcon_h1_weights(&mut model, &weights)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::FalconH1(model))
             }
             ModelArchitecture::Flux => Err(Exception::custom(
@@ -559,7 +572,7 @@ impl DynamicModel {
                     load_weights(model_dir).map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 load_bert_weights(&mut model, &weights)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                ModuleParametersExt::eval(&model)?;
+                eval_module_parameters_batched(&model)?;
                 Ok(Self::Bert(model))
             }
         }
@@ -880,28 +893,27 @@ impl DynamicModel {
     }
 
     pub fn eval(&self) -> Result<(), Exception> {
-        // Use explicit UFCS to resolve ambiguity with CausalLMModel::eval on some variants.
         match self {
-            Self::Llama(m) => ModuleParametersExt::eval(m),
-            Self::Llama4(m) => ModuleParametersExt::eval(m),
-            Self::Qwen2(m) => ModuleParametersExt::eval(m),
-            Self::Qwen3(m) => ModuleParametersExt::eval(m),
-            Self::Qwen3MoE(m) => ModuleParametersExt::eval(m),
-            Self::Gemma(m) => ModuleParametersExt::eval(m),
-            Self::Mistral(m) => ModuleParametersExt::eval(m),
-            Self::Phi(m) => ModuleParametersExt::eval(m),
-            Self::Phi4(m) => ModuleParametersExt::eval(m),
-            Self::DeepSeek(m) => ModuleParametersExt::eval(m),
-            Self::Cohere(m) => ModuleParametersExt::eval(m),
-            Self::Granite(m) => ModuleParametersExt::eval(m),
-            Self::NemotronH(m) => ModuleParametersExt::eval(m),
-            Self::Qwen3Next(m) => ModuleParametersExt::eval(m),
-            Self::StarCoder2(m) => ModuleParametersExt::eval(m),
-            Self::RecurrentGemma(m) => ModuleParametersExt::eval(m),
-            Self::Jamba(m) => ModuleParametersExt::eval(m),
-            Self::FalconH1(m) => ModuleParametersExt::eval(m),
-            Self::Flux(m) => ModuleParametersExt::eval(m),
-            Self::Bert(m) => ModuleParametersExt::eval(m),
+            Self::Llama(m) => eval_module_parameters_batched(m),
+            Self::Llama4(m) => eval_module_parameters_batched(m),
+            Self::Qwen2(m) => eval_module_parameters_batched(m),
+            Self::Qwen3(m) => eval_module_parameters_batched(m),
+            Self::Qwen3MoE(m) => eval_module_parameters_batched(m),
+            Self::Gemma(m) => eval_module_parameters_batched(m),
+            Self::Mistral(m) => eval_module_parameters_batched(m),
+            Self::Phi(m) => eval_module_parameters_batched(m),
+            Self::Phi4(m) => eval_module_parameters_batched(m),
+            Self::DeepSeek(m) => eval_module_parameters_batched(m),
+            Self::Cohere(m) => eval_module_parameters_batched(m),
+            Self::Granite(m) => eval_module_parameters_batched(m),
+            Self::NemotronH(m) => eval_module_parameters_batched(m),
+            Self::Qwen3Next(m) => eval_module_parameters_batched(m),
+            Self::StarCoder2(m) => eval_module_parameters_batched(m),
+            Self::RecurrentGemma(m) => eval_module_parameters_batched(m),
+            Self::Jamba(m) => eval_module_parameters_batched(m),
+            Self::FalconH1(m) => eval_module_parameters_batched(m),
+            Self::Flux(m) => eval_module_parameters_batched(m),
+            Self::Bert(m) => eval_module_parameters_batched(m),
         }
     }
 

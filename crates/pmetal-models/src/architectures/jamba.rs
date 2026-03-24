@@ -8,15 +8,20 @@
 
 use mlx_rs::error::Exception;
 use mlx_rs::macros::ModuleParameters;
-use mlx_rs::module::{Module, ModuleParameters};
+use mlx_rs::module::{Module, ModuleParameters, ModuleParametersExt};
 use mlx_rs::nested::NestedHashMap;
-use mlx_rs::{Array, nn};
+use mlx_rs::ops::indexing::IndexOp;
+use mlx_rs::{Array, nn, ops};
 use pmetal_core::ModelConfig;
 use pmetal_mlx::Builder;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};
 use std::rc::Rc;
+
+fn default_jamba_mamba_conv_kernel_size() -> i32 {
+    4
+}
 
 /// Jamba 1.5 model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,6 +37,8 @@ pub struct JambaConfig {
     pub num_experts_per_tok: i32,
     pub layers_per_block: i32,
     pub attn_layer_offset: i32,
+    #[serde(default = "default_jamba_mamba_conv_kernel_size")]
+    pub mamba_conv_kernel_size: i32,
 }
 
 impl Default for JambaConfig {
@@ -48,6 +55,7 @@ impl Default for JambaConfig {
             num_experts_per_tok: 2,
             layers_per_block: 8,
             attn_layer_offset: 0,
+            mamba_conv_kernel_size: default_jamba_mamba_conv_kernel_size(),
         }
     }
 }
@@ -128,11 +136,72 @@ impl JambaAttention {
     }
 }
 
+/// Lightweight causal sequence mixer for Jamba's non-attention layers.
+///
+/// This replaces the incorrect MoE placeholder with a real sequence-mixing
+/// block that keeps all work on GPU and preserves causal ordering.
+#[derive(Debug, ModuleParameters)]
+pub struct JambaMambaMixer {
+    #[param]
+    pub in_proj: nn::Linear,
+    #[param]
+    pub conv1d: nn::Conv1d,
+    #[param]
+    pub out_proj: nn::Linear,
+    pub hidden_size: i32,
+    pub conv_kernel_size: i32,
+}
+
+impl JambaMambaMixer {
+    pub fn new(config: &JambaConfig) -> Result<Self, Exception> {
+        let hidden_size = config.hidden_size;
+        let conv_kernel_size = config.mamba_conv_kernel_size.max(2);
+        let in_proj = nn::LinearBuilder::new(hidden_size, hidden_size * 2)
+            .bias(false)
+            .build()
+            .map_err(|_| Exception::custom("Build error"))?;
+        let conv1d = nn::Conv1dBuilder::new(1, hidden_size, conv_kernel_size)
+            .groups(hidden_size)
+            .bias(false)
+            .padding(0)
+            .build()
+            .map_err(|_| Exception::custom("Build error"))?;
+        let out_proj = nn::LinearBuilder::new(hidden_size, hidden_size)
+            .bias(false)
+            .build()
+            .map_err(|_| Exception::custom("Build error"))?;
+        Ok(Self {
+            in_proj,
+            conv1d,
+            out_proj,
+            hidden_size,
+            conv_kernel_size,
+        })
+    }
+
+    pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        let projected = self.in_proj.forward(x)?;
+        let parts = ops::split_sections(&projected, &[self.hidden_size], -1)?;
+        let value = &parts[0];
+        let gate = &parts[1];
+
+        let padded = ops::pad(
+            value,
+            &[(0i32, 0i32), (self.conv_kernel_size - 1, 0), (0, 0)],
+            Array::from_int(0),
+            None,
+        )?;
+        let mixed = Module::forward(&mut self.conv1d, &padded)?;
+        let gated = nn::silu(gate)?.multiply(&nn::silu(&mixed)?)?;
+        self.out_proj.forward(&gated)
+    }
+}
+
 /// Jamba Hybrid Layer.
 #[derive(Debug)]
 pub struct JambaLayer {
     pub attention: Option<JambaAttention>,
-    pub mamba: Option<pmetal_mlx::moe::MoELayer>,
+    pub mamba: Option<JambaMambaMixer>,
     pub mlp: MoELayer,
     pub norm: nn::RmsNorm,
     pub is_attention: bool,
@@ -236,13 +305,7 @@ impl JambaLayer {
             None
         };
         let mamba = if !is_attention {
-            let moe_config = MoEConfig::new(
-                config.hidden_size,
-                config.intermediate_size,
-                config.num_experts as usize,
-            )
-            .with_num_experts_per_tok(config.num_experts_per_tok as usize);
-            Some(MoELayer::new(moe_config))
+            Some(JambaMambaMixer::new(config)?)
         } else {
             None
         };
@@ -268,8 +331,7 @@ impl JambaLayer {
         let branch_out = if self.is_attention {
             self.attention.as_mut().unwrap().forward(&normed)?
         } else {
-            let (out, _) = self.mamba.as_mut().unwrap().forward(&normed)?;
-            out
+            self.mamba.as_mut().unwrap().forward(&normed)?
         };
         let x = x.add(&branch_out)?;
         let (mlp_out, _) = self.mlp.forward(&x)?;
@@ -318,22 +380,98 @@ impl JambaModel {
         self.lm_head.forward(&h)
     }
     pub fn eval(&self) -> Result<(), Exception> {
-        self.embed.weight.eval()?;
-        for layer in &self.layers {
-            if let Some(ref a) = layer.attention {
-                a.q_proj.weight.eval()?;
-                a.k_proj.weight.eval()?;
-                a.v_proj.weight.eval()?;
-                a.o_proj.weight.eval()?;
-            }
-            if let Some(ref m) = layer.mamba {
-                m.router.gate.weight.eval()?;
-            }
-            layer.mlp.router.gate.weight.eval()?;
-            layer.norm.weight.eval()?;
+        ModuleParametersExt::eval(self)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_jamba_config() -> JambaConfig {
+        JambaConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_hidden_layers: 3,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            vocab_size: 64,
+            rms_norm_eps: 1e-5,
+            num_experts: 4,
+            num_experts_per_tok: 2,
+            layers_per_block: 2,
+            attn_layer_offset: 0,
+            mamba_conv_kernel_size: 3,
         }
-        self.norm.weight.eval()?;
-        self.lm_head.weight.eval()?;
-        Ok(())
+    }
+
+    #[test]
+    fn test_jamba_layer_schedule_builds_attention_and_mamba_layers() {
+        let config = tiny_jamba_config();
+
+        let attention_layer = JambaLayer::new(&config, 0).expect("attention layer");
+        assert!(attention_layer.is_attention);
+        assert!(attention_layer.attention.is_some());
+        assert!(attention_layer.mamba.is_none());
+
+        let mamba_layer = JambaLayer::new(&config, 1).expect("mamba layer");
+        assert!(!mamba_layer.is_attention);
+        assert!(mamba_layer.attention.is_none());
+        assert!(mamba_layer.mamba.is_some());
+    }
+
+    #[test]
+    fn test_jamba_mamba_mixer_is_causal() {
+        let config = tiny_jamba_config();
+        let mut mixer = JambaMambaMixer::new(&config).expect("mixer");
+
+        let baseline = Array::zeros::<f32>(&[1, 4, config.hidden_size]).expect("baseline");
+        let prefix = Array::zeros::<f32>(&[1, 3, config.hidden_size]).expect("prefix");
+        let suffix = Array::ones::<f32>(&[1, 1, config.hidden_size]).expect("suffix");
+        let changed = ops::concatenate_axis(&[&prefix, &suffix], 1).expect("changed");
+
+        let y0 = mixer.forward(&baseline).expect("baseline forward");
+        let y1 = mixer.forward(&changed).expect("changed forward");
+        let delta = y1.subtract(&y0).expect("delta");
+
+        let earlier = delta
+            .index((.., ..3, ..))
+            .abs()
+            .expect("earlier abs")
+            .sum(None)
+            .expect("earlier sum")
+            .item::<f32>();
+        let last = delta
+            .index((.., 3..4, ..))
+            .abs()
+            .expect("last abs")
+            .sum(None)
+            .expect("last sum")
+            .item::<f32>();
+
+        assert!(
+            earlier < 1e-6,
+            "future-token edit should not affect earlier positions, got {earlier}"
+        );
+        assert!(last > 1e-6, "mixer should react to the edited token");
+    }
+
+    #[test]
+    fn test_jamba_model_forward_shape() {
+        let config = tiny_jamba_config();
+        let mut model = JambaModel::new(config.clone()).expect("model");
+        let input_ids = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
+
+        let logits = model.forward(&input_ids).expect("forward");
+
+        assert_eq!(logits.shape(), vec![1, 4, config.vocab_size]);
+    }
+
+    #[test]
+    fn test_jamba_eval_marks_all_parameters() {
+        let config = tiny_jamba_config();
+        let model = JambaModel::new(config).expect("model");
+
+        model.eval().expect("eval");
     }
 }

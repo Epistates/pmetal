@@ -596,12 +596,17 @@ impl DeepSeekMoEGate {
         })
     }
     pub fn forward(&mut self, x: &Array) -> Result<(Array, Array)> {
-        let gates = self.weight.forward(x)?;
+        let shape = x.shape();
+        let hidden_size = *shape.last().unwrap_or(&0);
+        let token_count: i32 = shape[..shape.len().saturating_sub(1)].iter().product();
+        let hidden_flat = x.reshape(&[token_count, hidden_size])?;
+        let gates = self.weight.forward(&hidden_flat)?;
         let scores = mlx_rs::ops::sigmoid(&gates.as_dtype(mlx_rs::Dtype::Float32)?)?;
         let scores_with_bias = scores.add(&self.e_score_correction_bias)?;
         let neg_k = -self.top_k;
-        let inds =
-            mlx_rs::ops::argpartition_axis(&scores_with_bias, neg_k, -1)?.index((.., .., neg_k..));
+        let inds = mlx_rs::ops::argpartition_axis(&scores_with_bias, neg_k, -1)?
+            .index((.., neg_k..))
+            .as_type::<i32>()?;
         let top_scores = scores.take_along_axis(&inds, -1)?;
         let final_scores = if self.norm_topk_prob && self.top_k > 1 {
             top_scores.divide(&top_scores.sum_axis(-1, true)?)?
@@ -621,6 +626,10 @@ pub struct DeepSeekMoE {
     pub gate: DeepSeekMoEGate,
     pub moe: MoELayer,
     pub shared_experts: Option<DeepSeekMLP>,
+    pub stacked_gate_proj: Option<Array>,
+    pub stacked_up_proj: Option<Array>,
+    pub stacked_down_proj: Option<Array>,
+    pub stacked_weight_signature: Option<Vec<usize>>,
 }
 impl ModuleParameters for DeepSeekMoE {
     fn parameters(&self) -> NestedHashMap<Rc<str>, &Array> {
@@ -712,12 +721,93 @@ impl DeepSeekMoE {
             gate: DeepSeekMoEGate::new(config)?,
             moe: MoELayer::new(moe_config),
             shared_experts,
+            stacked_gate_proj: None,
+            stacked_up_proj: None,
+            stacked_down_proj: None,
+            stacked_weight_signature: None,
         })
     }
-    pub fn forward(&mut self, x: &Array) -> Result<Array> {
-        // Use the DeepSeek-specific sigmoid gate (with e_score_correction_bias) to compute
-        // routing indices and weights, then dispatch to experts via forward_with_routing,
-        // bypassing MoELayer's internal softmax router entirely.
+
+    fn current_stacked_weight_signature(&self) -> Vec<usize> {
+        let mut signature = Vec::with_capacity(self.moe.experts.len() * 3);
+        for expert in &self.moe.experts {
+            signature.push(expert.w1.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(expert.w3.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(expert.w2.weight.as_ref().as_ptr().ctx as usize);
+        }
+        signature
+    }
+
+    fn stack_expert_weights(&self) -> Result<(Array, Array, Array)> {
+        let gate_weights: Vec<Array> = self
+            .moe
+            .experts
+            .iter()
+            .map(|expert| expert.w1.weight.as_ref().t())
+            .collect();
+        let up_weights: Vec<Array> = self
+            .moe
+            .experts
+            .iter()
+            .map(|expert| expert.w3.weight.as_ref().t())
+            .collect();
+        let down_weights: Vec<Array> = self
+            .moe
+            .experts
+            .iter()
+            .map(|expert| expert.w2.weight.as_ref().t())
+            .collect();
+        let gate_weight_refs: Vec<&Array> = gate_weights.iter().collect();
+        let up_weight_refs: Vec<&Array> = up_weights.iter().collect();
+        let down_weight_refs: Vec<&Array> = down_weights.iter().collect();
+
+        Ok((
+            mlx_rs::ops::stack_axis(&gate_weight_refs, 0)?,
+            mlx_rs::ops::stack_axis(&up_weight_refs, 0)?,
+            mlx_rs::ops::stack_axis(&down_weight_refs, 0)?,
+        ))
+    }
+
+    fn ensure_stacked_moe(&mut self) -> Result<()> {
+        let signature = self.current_stacked_weight_signature();
+        let needs_refresh = self.stacked_gate_proj.is_none()
+            || self.stacked_up_proj.is_none()
+            || self.stacked_down_proj.is_none()
+            || self.stacked_weight_signature.as_ref() != Some(&signature);
+
+        if needs_refresh {
+            let (stacked_gate_proj, stacked_up_proj, stacked_down_proj) =
+                self.stack_expert_weights()?;
+            stacked_gate_proj.eval()?;
+            stacked_up_proj.eval()?;
+            stacked_down_proj.eval()?;
+            self.stacked_gate_proj = Some(stacked_gate_proj);
+            self.stacked_up_proj = Some(stacked_up_proj);
+            self.stacked_down_proj = Some(stacked_down_proj);
+            self.stacked_weight_signature = Some(signature);
+        }
+
+        Ok(())
+    }
+
+    pub fn init_stacked_moe(&mut self) -> Result<()> {
+        self.ensure_stacked_moe()
+    }
+
+    pub fn has_stacked_moe(&self) -> bool {
+        self.stacked_gate_proj.is_some()
+            && self.stacked_up_proj.is_some()
+            && self.stacked_down_proj.is_some()
+    }
+
+    fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array> {
+        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)])?;
+        let result = mlx_rs::ops::matmul(&x_expanded, w)?;
+        result.squeeze_axes(&[1])
+    }
+
+    #[cfg(test)]
+    fn forward_reference(&mut self, x: &Array) -> Result<Array> {
         let (expert_indices, expert_weights) = self.gate.forward(x)?;
         let moe_out = self
             .moe
@@ -727,6 +817,63 @@ impl DeepSeekMoE {
         } else {
             Ok(moe_out)
         }
+    }
+
+    fn forward_stacked(&mut self, x: &Array) -> Result<Array> {
+        self.ensure_stacked_moe()?;
+
+        let shape = x.shape();
+        let hidden_flat = x.reshape(&[
+            shape[..shape.len() - 1].iter().product(),
+            shape[shape.len() - 1],
+        ])?;
+        let batch_seq = hidden_flat.dim(0);
+        let hidden_size = hidden_flat.dim(1);
+        let (expert_indices, expert_weights) = self.gate.forward(&hidden_flat)?;
+        let top_k = self.gate.top_k;
+        let mut output =
+            mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
+
+        for slot in 0..top_k {
+            let slot_experts = expert_indices.index((.., slot));
+            let slot_weights = expert_weights.index((.., slot..slot + 1));
+
+            let gate_weights = self
+                .stacked_gate_proj
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
+            let up_weights = self
+                .stacked_up_proj
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
+            let down_weights = self
+                .stacked_down_proj
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
+
+            let gate_out = self.batched_matmul(&hidden_flat, &gate_weights)?;
+            let up_out = self.batched_matmul(&hidden_flat, &up_weights)?;
+            let activated = nn::silu(&gate_out)?.multiply(&up_out)?;
+            let slot_out = self.batched_matmul(&activated, &down_weights)?;
+            output = output.add(&slot_out.multiply(&slot_weights)?)?;
+        }
+
+        let mut output_shape = shape.to_vec();
+        output_shape[shape.len() - 1] = hidden_size;
+        let moe_out = output.reshape(&output_shape)?;
+
+        if let Some(ref mut shared) = self.shared_experts {
+            moe_out.add(&shared.forward(x)?)
+        } else {
+            Ok(moe_out)
+        }
+    }
+
+    pub fn forward(&mut self, x: &Array) -> Result<Array> {
+        self.forward_stacked(x)
     }
 }
 
@@ -792,6 +939,13 @@ impl DeepSeekMLPType {
             DeepSeekMLPType::MoE(moe) => moe.forward(x),
         }
     }
+
+    pub fn init_stacked_moe(&mut self) -> Result<()> {
+        match self {
+            Self::Dense(_) => Ok(()),
+            Self::MoE(moe) => moe.init_stacked_moe(),
+        }
+    }
 }
 
 #[derive(Debug, ModuleParameters)]
@@ -850,6 +1004,10 @@ impl DeepSeekDecoderLayer {
                 .forward(&self.post_attention_layernorm.forward(&h)?)?,
         )
     }
+
+    pub fn init_stacked_moe(&mut self) -> Result<()> {
+        self.mlp.init_stacked_moe()
+    }
 }
 
 #[derive(Debug, ModuleParameters)]
@@ -904,6 +1062,13 @@ impl DeepSeekModel {
         }
         let out = self.norm.forward(&h)?;
         Ok((out, all_hidden))
+    }
+
+    pub fn init_stacked_moe(&mut self) -> Result<()> {
+        for layer in &mut self.layers {
+            layer.init_stacked_moe()?;
+        }
+        Ok(())
     }
 }
 
@@ -1021,5 +1186,127 @@ impl DeepSeek {
             self.config.num_attention_heads as usize,
             self.config.q_head_dim() as usize,
         ))
+    }
+
+    pub fn init_stacked_moe(&mut self) -> Result<()> {
+        self.model.init_stacked_moe()?;
+        for module in &mut self.mtp_modules {
+            module.layer.init_stacked_moe()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mlx_rs::module::Param;
+    use serial_test::serial;
+
+    fn tiny_deepseek_moe_config() -> DeepSeekConfig {
+        DeepSeekConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            moe_intermediate_size: 24,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: Some(4),
+            n_shared_experts: Some(1),
+            n_routed_experts: Some(4),
+            num_experts_per_tok: 2,
+            moe_layer_freq: 1,
+            first_k_dense_replace: 0,
+            ..DeepSeekConfig::default()
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_deepseek_moe_stacked_matches_reference() {
+        let config = tiny_deepseek_moe_config();
+        let mut moe = DeepSeekMoE::new(&config).unwrap();
+        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
+            .unwrap();
+
+        let reference = moe.forward_reference(&x).unwrap();
+        let fast = moe.forward(&x).unwrap();
+        reference.eval().unwrap();
+        fast.eval().unwrap();
+
+        assert!(moe.has_stacked_moe());
+
+        let max_diff = fast
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        max_diff.eval().unwrap();
+        assert!(
+            max_diff.item::<f32>() < 1e-4,
+            "deepseek stacked MoE drifted from reference"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_deepseek_moe_cache_refreshes_after_weight_change() {
+        let config = tiny_deepseek_moe_config();
+        let mut moe = DeepSeekMoE::new(&config).unwrap();
+        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
+            .unwrap();
+
+        let _ = moe.forward(&x).unwrap();
+        assert!(moe.has_stacked_moe());
+
+        moe.moe.experts[0].w1.weight = Param::new(
+            Array::zeros::<f32>(&[config.moe_intermediate_size, config.hidden_size]).unwrap(),
+        );
+
+        let reference = moe.forward_reference(&x).unwrap();
+        let fast = moe.forward(&x).unwrap();
+        reference.eval().unwrap();
+        fast.eval().unwrap();
+
+        let max_diff = fast
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        max_diff.eval().unwrap();
+        assert!(
+            max_diff.item::<f32>() < 1e-4,
+            "deepseek stacked cache failed to refresh after weight change"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_deepseek_full_model_init_stacked_moe_preserves_forward() {
+        let config = tiny_deepseek_moe_config();
+        let mut model = DeepSeek::new(config).unwrap();
+        let input_ids = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
+
+        let reference = model.forward(&input_ids, None, None).unwrap();
+        model.init_stacked_moe().unwrap();
+        let fast = model.forward(&input_ids, None, None).unwrap();
+        reference.eval().unwrap();
+        fast.eval().unwrap();
+
+        let max_diff = fast
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        max_diff.eval().unwrap();
+        assert!(
+            max_diff.item::<f32>() < 1e-4,
+            "deepseek full model drifted after stacked init"
+        );
     }
 }

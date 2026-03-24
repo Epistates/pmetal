@@ -15,7 +15,7 @@ use mlx_rs::{
     builder::Builder,
     error::Exception,
     macros::ModuleParameters,
-    module::{Module, ModuleParametersExt},
+    module::{Module, ModuleParametersExt, Param},
     nn,
 };
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,38 @@ use pmetal_mlx::kernels::{
     rope::{RopeScaling, apply_rope},
 };
 use pmetal_mlx::kv_cache::KVCache;
+
+fn zero_linear(out_dims: i32, in_dims: i32, bias: bool) -> Result<nn::Linear, Exception> {
+    Ok(nn::Linear {
+        weight: Param::new(Array::zeros::<f32>(&[out_dims, in_dims])?),
+        bias: Param::new(if bias {
+            Some(Array::zeros::<f32>(&[out_dims])?)
+        } else {
+            None
+        }),
+    })
+}
+
+fn zero_embedding(embedding_count: i32, dimensions: i32) -> Result<nn::Embedding, Exception> {
+    Ok(nn::Embedding {
+        weight: Param::new(Array::zeros::<f32>(&[embedding_count, dimensions])?),
+    })
+}
+
+fn placeholder_linear(bias: bool) -> Result<nn::Linear, Exception> {
+    zero_linear(1, 1, bias)
+}
+
+fn placeholder_embedding() -> Result<nn::Embedding, Exception> {
+    zero_embedding(1, 1)
+}
+
+fn placeholder_rms_norm(eps: f32) -> Result<nn::RmsNorm, Exception> {
+    Ok(nn::RmsNorm {
+        weight: Param::new(Array::ones::<f32>(&[1])?),
+        eps,
+    })
+}
 
 /// Qwen3 model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -220,6 +252,23 @@ impl Qwen3MLP {
             down_proj,
         })
     }
+
+    #[cfg(test)]
+    pub(crate) fn new_zeroed(config: &Qwen3Config) -> Result<Self, Exception> {
+        Ok(Self {
+            gate_proj: zero_linear(config.intermediate_size, config.hidden_size, false)?,
+            up_proj: zero_linear(config.intermediate_size, config.hidden_size, false)?,
+            down_proj: zero_linear(config.hidden_size, config.intermediate_size, false)?,
+        })
+    }
+
+    pub(crate) fn new_for_loading() -> Result<Self, Exception> {
+        Ok(Self {
+            gate_proj: placeholder_linear(false)?,
+            up_proj: placeholder_linear(false)?,
+            down_proj: placeholder_linear(false)?,
+        })
+    }
 }
 
 impl Module<Array> for Qwen3MLP {
@@ -310,6 +359,77 @@ impl Qwen3Attention {
             o_proj,
             q_norm,
             k_norm,
+            n_heads: config.num_attention_heads,
+            n_kv_heads,
+            head_dim,
+            scale: (head_dim as f32).powf(-0.5),
+            rope_theta: config.rope_theta,
+            rope_scale,
+            effective_base,
+            use_sliding_window,
+            sliding_window: config.sliding_window,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_zeroed(
+        config: &Qwen3Config,
+        use_sliding_window: bool,
+    ) -> Result<Self, Exception> {
+        let head_dim = config.get_head_dim();
+        let n_kv_heads = config.num_kv_heads();
+        let rope_scaling = config
+            .rope_scaling
+            .as_ref()
+            .map(RopeScaling::from_config_map)
+            .unwrap_or(RopeScaling::None);
+        let rope_scale = rope_scaling.scale();
+        let effective_base = rope_scaling.effective_base(config.rope_theta, head_dim);
+
+        Ok(Self {
+            q_proj: zero_linear(config.num_attention_heads * head_dim, config.hidden_size, false)?,
+            k_proj: zero_linear(n_kv_heads * head_dim, config.hidden_size, false)?,
+            v_proj: zero_linear(n_kv_heads * head_dim, config.hidden_size, false)?,
+            o_proj: zero_linear(config.hidden_size, config.num_attention_heads * head_dim, false)?,
+            q_norm: nn::RmsNormBuilder::new(head_dim)
+                .eps(config.rms_norm_eps)
+                .build()?,
+            k_norm: nn::RmsNormBuilder::new(head_dim)
+                .eps(config.rms_norm_eps)
+                .build()?,
+            n_heads: config.num_attention_heads,
+            n_kv_heads,
+            head_dim,
+            scale: (head_dim as f32).powf(-0.5),
+            rope_theta: config.rope_theta,
+            rope_scale,
+            effective_base,
+            use_sliding_window,
+            sliding_window: config.sliding_window,
+        })
+    }
+
+    pub(crate) fn new_for_loading(
+        config: &Qwen3Config,
+        use_sliding_window: bool,
+    ) -> Result<Self, Exception> {
+        let head_dim = config.get_head_dim();
+        let n_kv_heads = config.num_kv_heads();
+        let rope_scaling = config
+            .rope_scaling
+            .as_ref()
+            .map(RopeScaling::from_config_map)
+            .unwrap_or(RopeScaling::None);
+        let rope_scale = rope_scaling.scale();
+        let effective_base = rope_scaling.effective_base(config.rope_theta, head_dim);
+
+        Ok(Self {
+            q_proj: placeholder_linear(false)?,
+            k_proj: placeholder_linear(false)?,
+            v_proj: placeholder_linear(false)?,
+            o_proj: placeholder_linear(false)?,
+            q_norm: placeholder_rms_norm(config.rms_norm_eps)?,
+            k_norm: placeholder_rms_norm(config.rms_norm_eps)?,
             n_heads: config.num_attention_heads,
             n_kv_heads,
             head_dim,
@@ -432,6 +552,45 @@ impl Qwen3Layer {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_zeroed(
+        config: &Qwen3Config,
+        use_sliding_window: bool,
+    ) -> Result<Self, Exception> {
+        let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
+            .eps(config.rms_norm_eps)
+            .build()?;
+        let self_attn = Qwen3Attention::new_zeroed(config, use_sliding_window)?;
+        let post_attention_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
+            .eps(config.rms_norm_eps)
+            .build()?;
+        let mlp = Qwen3MLP::new_zeroed(config)?;
+
+        Ok(Self {
+            input_layernorm,
+            self_attn,
+            post_attention_layernorm,
+            mlp,
+        })
+    }
+
+    pub(crate) fn new_for_loading(
+        config: &Qwen3Config,
+        use_sliding_window: bool,
+    ) -> Result<Self, Exception> {
+        let input_layernorm = placeholder_rms_norm(config.rms_norm_eps)?;
+        let self_attn = Qwen3Attention::new_for_loading(config, use_sliding_window)?;
+        let post_attention_layernorm = placeholder_rms_norm(config.rms_norm_eps)?;
+        let mlp = Qwen3MLP::new_for_loading()?;
+
+        Ok(Self {
+            input_layernorm,
+            self_attn,
+            post_attention_layernorm,
+            mlp,
+        })
+    }
+
     pub fn forward(
         &mut self,
         x: &Array,
@@ -479,6 +638,43 @@ impl Qwen3Model {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn new_zeroed(config: &Qwen3Config) -> Result<Self, Exception> {
+        let embed_tokens = zero_embedding(config.vocab_size, config.hidden_size)?;
+        let layers = (0..config.num_hidden_layers as usize)
+            .map(|i| {
+                let use_sliding = config.use_sliding_window_at(i);
+                Qwen3Layer::new_zeroed(config, use_sliding)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let norm = nn::RmsNormBuilder::new(config.hidden_size)
+            .eps(config.rms_norm_eps)
+            .build()?;
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+        })
+    }
+
+    pub(crate) fn new_for_loading(config: &Qwen3Config) -> Result<Self, Exception> {
+        let embed_tokens = placeholder_embedding()?;
+        let layers = (0..config.num_hidden_layers as usize)
+            .map(|i| {
+                let use_sliding = config.use_sliding_window_at(i);
+                Qwen3Layer::new_for_loading(config, use_sliding)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let norm = placeholder_rms_norm(config.rms_norm_eps)?;
+
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+        })
+    }
+
     pub fn forward(
         &mut self,
         input_ids: &Array,
@@ -516,6 +712,35 @@ impl Qwen3ForCausalLM {
                     .bias(false)
                     .build()?,
             )
+        };
+        Ok(Self {
+            model,
+            lm_head,
+            config,
+        })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_zeroed(config: Qwen3Config) -> Result<Self, Exception> {
+        let model = Qwen3Model::new_zeroed(&config)?;
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(zero_linear(config.vocab_size, config.hidden_size, false)?)
+        };
+        Ok(Self {
+            model,
+            lm_head,
+            config,
+        })
+    }
+
+    pub(crate) fn new_for_loading(config: Qwen3Config) -> Result<Self, Exception> {
+        let model = Qwen3Model::new_for_loading(&config)?;
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(placeholder_linear(false)?)
         };
         Ok(Self {
             model,
@@ -751,6 +976,19 @@ mod tests {
         let config = tiny_config();
         let vocab_size = config.vocab_size;
         let mut model = Qwen3ForCausalLM::new(config).unwrap();
+
+        let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+        let logits = model.forward(&input_ids, None).unwrap();
+
+        assert_eq!(logits.shape(), &[1, 4, vocab_size]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_qwen3_zeroed_causal_lm_forward_shape() {
+        let config = tiny_config();
+        let vocab_size = config.vocab_size;
+        let mut model = Qwen3ForCausalLM::new_zeroed(config).unwrap();
 
         let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();

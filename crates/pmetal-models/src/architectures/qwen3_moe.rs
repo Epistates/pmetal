@@ -384,9 +384,8 @@ impl Qwen3MoEDenseMLP {
 
 /// MoE block with softmax routing for Qwen3-MoE.
 ///
-/// C6: Fixed to perform proper per-expert token dispatch instead of
-/// ignoring routing results. Uses the same GPU-native top-k and
-/// per-expert gather/scatter pattern as [`MoELayer`].
+/// Uses cached stacked expert weights plus GPU batched gathers/matmuls for the main inference path.
+/// The cache is rebuilt automatically when the underlying expert weight handles change.
 #[derive(Debug, ModuleParameters)]
 pub struct Qwen3MoEBlock {
     /// Number of experts.
@@ -401,6 +400,14 @@ pub struct Qwen3MoEBlock {
     /// Expert MLPs.
     #[param]
     pub experts: Vec<pmetal_mlx::moe::Expert>,
+    /// Stacked gate projection weights `[num_experts, hidden, intermediate]`.
+    pub stacked_gate_proj: Option<Array>,
+    /// Stacked up projection weights `[num_experts, hidden, intermediate]`.
+    pub stacked_up_proj: Option<Array>,
+    /// Stacked down projection weights `[num_experts, intermediate, hidden]`.
+    pub stacked_down_proj: Option<Array>,
+    /// Signature of the currently stacked expert weight handles.
+    pub stacked_weight_signature: Option<Vec<usize>>,
 }
 
 impl Qwen3MoEBlock {
@@ -423,22 +430,92 @@ impl Qwen3MoEBlock {
             norm_topk_prob: config.norm_topk_prob,
             gate,
             experts,
+            stacked_gate_proj: None,
+            stacked_up_proj: None,
+            stacked_down_proj: None,
+            stacked_weight_signature: None,
         })
     }
 
-    /// Forward pass with proper routing.
-    ///
-    /// 1. Compute routing logits and softmax probabilities
-    /// 2. GPU-native top-k selection (argsort + slice)
-    /// 3. Per-expert token dispatch: gather assigned tokens, run expert, scatter back
-    pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let shape = x.shape();
-        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
-        let hidden_size = shape[shape.len() - 1];
-        let hidden_flat = x.reshape(&[batch_seq, hidden_size])?;
+    fn current_stacked_weight_signature(&self) -> Vec<usize> {
+        let mut signature = Vec::with_capacity(self.experts.len() * 3);
+        for expert in &self.experts {
+            signature.push(expert.w1.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(expert.w3.weight.as_ref().as_ptr().ctx as usize);
+            signature.push(expert.w2.weight.as_ref().as_ptr().ctx as usize);
+        }
+        signature
+    }
 
-        // Compute routing scores (cast to f32 for stability)
-        let gate_logits = self.gate.forward(&hidden_flat)?;
+    fn stack_expert_weights(&self) -> Result<(Array, Array, Array), Exception> {
+        let gate_weights: Vec<Array> = self
+            .experts
+            .iter()
+            .map(|expert| expert.w1.weight.as_ref().t())
+            .collect();
+        let up_weights: Vec<Array> = self
+            .experts
+            .iter()
+            .map(|expert| expert.w3.weight.as_ref().t())
+            .collect();
+        let down_weights: Vec<Array> = self
+            .experts
+            .iter()
+            .map(|expert| expert.w2.weight.as_ref().t())
+            .collect();
+        let gate_weight_refs: Vec<&Array> = gate_weights.iter().collect();
+        let up_weight_refs: Vec<&Array> = up_weights.iter().collect();
+        let down_weight_refs: Vec<&Array> = down_weights.iter().collect();
+
+        Ok((
+            mlx_rs::ops::stack_axis(&gate_weight_refs, 0)?,
+            mlx_rs::ops::stack_axis(&up_weight_refs, 0)?,
+            mlx_rs::ops::stack_axis(&down_weight_refs, 0)?,
+        ))
+    }
+
+    fn ensure_stacked_moe(&mut self) -> Result<(), Exception> {
+        let signature = self.current_stacked_weight_signature();
+        let needs_refresh = self.stacked_gate_proj.is_none()
+            || self.stacked_up_proj.is_none()
+            || self.stacked_down_proj.is_none()
+            || self.stacked_weight_signature.as_ref() != Some(&signature);
+
+        if needs_refresh {
+            let (stacked_gate_proj, stacked_up_proj, stacked_down_proj) =
+                self.stack_expert_weights()?;
+            stacked_gate_proj.eval()?;
+            stacked_up_proj.eval()?;
+            stacked_down_proj.eval()?;
+            self.stacked_gate_proj = Some(stacked_gate_proj);
+            self.stacked_up_proj = Some(stacked_up_proj);
+            self.stacked_down_proj = Some(stacked_down_proj);
+            self.stacked_weight_signature = Some(signature);
+        }
+
+        Ok(())
+    }
+
+    /// Eagerly build or refresh the stacked expert-weight cache.
+    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
+        self.ensure_stacked_moe()
+    }
+
+    /// Whether the stacked expert-weight cache is currently populated.
+    pub fn has_stacked_moe(&self) -> bool {
+        self.stacked_gate_proj.is_some()
+            && self.stacked_up_proj.is_some()
+            && self.stacked_down_proj.is_some()
+    }
+
+    fn route_topk(
+        &mut self,
+        hidden_flat: &Array,
+    ) -> Result<(i32, i32, Array, Array), Exception> {
+        let batch_seq = hidden_flat.dim(0);
+        let hidden_size = hidden_flat.dim(1);
+
+        let gate_logits = self.gate.forward(hidden_flat)?;
         let gate_logits_f32 = if gate_logits.dtype() != mlx_rs::Dtype::Float32 {
             gate_logits.as_type::<f32>()?
         } else {
@@ -446,13 +523,12 @@ impl Qwen3MoEBlock {
         };
         let routing_probs = mlx_rs::ops::softmax_axis(&gate_logits_f32, -1, None)?;
 
-        // GPU-native top-k
-        let neg_probs = routing_probs.negative()?;
-        let sorted_indices = mlx_rs::ops::argsort_axis(&neg_probs, -1)?;
-        let top_indices = sorted_indices.index((.., ..self.top_k as i32));
+        let top_k = self.top_k as i32;
+        let neg_k = -top_k;
+        let part_indices = mlx_rs::ops::argpartition_axis(&routing_probs, neg_k, -1)?;
+        let top_indices = part_indices.index((.., neg_k..)).as_type::<i32>()?;
         let top_weights = routing_probs.take_along_axis(&top_indices, -1)?;
 
-        // Normalize top-k weights
         let normalized_weights = if self.norm_topk_prob {
             let weight_sum = top_weights.sum_axis(-1, Some(true))?;
             let safe_sum = mlx_rs::ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
@@ -461,9 +537,18 @@ impl Qwen3MoEBlock {
             top_weights
         };
 
-        // Eval for CPU-side index extraction (small tensor)
-        // argsort returns Uint32; cast to Int32 for as_slice compatibility
-        let top_indices = top_indices.as_type::<i32>()?;
+        Ok((batch_seq, hidden_size, top_indices, normalized_weights))
+    }
+
+    #[cfg(test)]
+    fn forward_per_expert(&mut self, x: &Array) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
+        let hidden_size = shape[shape.len() - 1];
+        let hidden_flat = x.reshape(&[batch_seq, hidden_size])?;
+        let (_batch_seq, _hidden_size, top_indices, normalized_weights) =
+            self.route_topk(&hidden_flat)?;
+
         top_indices.eval()?;
         normalized_weights.eval()?;
 
@@ -471,7 +556,6 @@ impl Qwen3MoEBlock {
         let expert_indices: Vec<i32> = top_indices.as_slice().to_vec();
         let expert_weights: Vec<f32> = normalized_weights.as_slice().to_vec();
 
-        // Build per-expert token assignments
         let mut expert_assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.num_experts];
         for token_idx in 0..n_tokens {
             for slot in 0..self.top_k {
@@ -484,8 +568,7 @@ impl Qwen3MoEBlock {
             }
         }
 
-        // Per-expert dispatch
-        let mut final_output = Array::zeros::<f32>(&[batch_seq, hidden_size])?;
+        let mut final_output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
         for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
             if assignments.is_empty() {
                 continue;
@@ -496,17 +579,10 @@ impl Qwen3MoEBlock {
 
             let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
             let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
-
             let expert_input = hidden_flat.take_axis(&idx_array, 0)?;
             let expert_out = self.experts[expert_idx].forward(&expert_input)?;
             let weighted_out = expert_out.multiply(&weight_array)?;
-
-            // Scatter-add weighted expert output back to the correct token positions.
-            // MLX scatter constraint: ndim(updates) == ndim(a) + ndim(indices)
-            //   ndim(a)=2, ndim(indices)=1 => ndim(updates) must be 3
-            // Reshape [M, hidden] -> [M, 1, hidden] so the constraint holds.
-            let m = token_indices.len() as i32;
-            let updates_3d = weighted_out.reshape(&[m, 1, hidden_size])?;
+            let updates_3d = weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size])?;
             final_output = mlx_rs::ops::indexing::scatter_add_single(
                 &final_output,
                 &idx_array,
@@ -518,6 +594,57 @@ impl Qwen3MoEBlock {
         let mut output_shape = shape.to_vec();
         output_shape[shape.len() - 1] = hidden_size;
         final_output.reshape(&output_shape)
+    }
+
+    fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array, Exception> {
+        let x_expanded = x.reshape(&[x.dim(0), 1, x.dim(1)])?;
+        let result = mlx_rs::ops::matmul(&x_expanded, w)?;
+        result.squeeze_axes(&[1])
+    }
+
+    fn forward_stacked(&mut self, x: &Array) -> Result<Array, Exception> {
+        self.ensure_stacked_moe()?;
+
+        let shape = x.shape();
+        let hidden_flat = x.reshape(&[shape[..shape.len() - 1].iter().product(), shape[shape.len() - 1]])?;
+        let (batch_seq, hidden_size, top_indices, normalized_weights) = self.route_topk(&hidden_flat)?;
+        let top_k = self.top_k as i32;
+        let mut output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
+        for slot in 0..top_k {
+            let slot_experts = top_indices.index((.., slot));
+            let slot_weights = normalized_weights.index((.., slot..slot + 1));
+
+            let gate_weights = self
+                .stacked_gate_proj
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
+            let up_weights = self
+                .stacked_up_proj
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
+            let down_weights = self
+                .stacked_down_proj
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
+
+            let gate_out = self.batched_matmul(&hidden_flat, &gate_weights)?;
+            let up_out = self.batched_matmul(&hidden_flat, &up_weights)?;
+            let activated = nn::silu(&gate_out)?.multiply(&up_out)?;
+            let slot_out = self.batched_matmul(&activated, &down_weights)?;
+            output = output.add(&slot_out.multiply(&slot_weights)?)?;
+        }
+
+        let mut output_shape = shape.to_vec();
+        output_shape[shape.len() - 1] = hidden_size;
+        output.reshape(&output_shape)
+    }
+
+    /// Forward pass using the stacked batched-gather path.
+    pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        self.forward_stacked(x)
     }
 }
 
@@ -600,6 +727,14 @@ impl Qwen3MoEFeedForward {
             Self::MoE(moe) => moe.forward(x),
         }
     }
+
+    /// Eagerly build stacked expert caches for MoE variants.
+    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
+        match self {
+            Self::Dense(_) => Ok(()),
+            Self::MoE(moe) => moe.init_stacked_moe(),
+        }
+    }
 }
 
 /// Qwen3-MoE decoder layer.
@@ -669,6 +804,11 @@ impl Qwen3MoEDecoderLayer {
         let ffn_out = self.ffn.forward(&normed)?;
         h.add(&ffn_out)
     }
+
+    /// Eagerly build stacked expert caches for this layer's MoE path.
+    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
+        self.ffn.init_stacked_moe()
+    }
 }
 
 /// Qwen3-MoE base model (without LM head).
@@ -733,6 +873,14 @@ impl Qwen3MoEModel {
 
         self.norm.forward(&h)
     }
+
+    /// Eagerly build stacked expert caches for all MoE layers.
+    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
+        for layer in &mut self.layers {
+            layer.init_stacked_moe()?;
+        }
+        Ok(())
+    }
 }
 
 /// Full Qwen3-MoE model with LM head.
@@ -791,6 +939,11 @@ impl Qwen3MoE {
             let embed_weight = self.model.embed_tokens.weight.value.as_ref();
             hidden_states.matmul(&embed_weight.t())
         }
+    }
+
+    /// Eagerly build stacked expert caches for all Qwen3-MoE layers.
+    pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
+        self.model.init_stacked_moe()
     }
 }
 
@@ -955,12 +1108,102 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_moe_block_stacked_matches_per_expert_path() {
+        let config = tiny_moe_config();
+        let mut block = Qwen3MoEBlock::new(&config).unwrap();
+        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[2, 5, config.hidden_size], None)
+            .unwrap();
+
+        let reference = block.forward_per_expert(&x).unwrap();
+        let fast = block.forward(&x).unwrap();
+        reference.eval().unwrap();
+        fast.eval().unwrap();
+
+        assert!(block.has_stacked_moe());
+
+        let max_diff = fast
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        max_diff.eval().unwrap();
+        assert!(
+            max_diff.item::<f32>() < 1e-4,
+            "stacked qwen3-moe path drifted from per-expert reference"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_moe_block_stacked_cache_refreshes_after_weight_change() {
+        let config = tiny_moe_config();
+        let mut block = Qwen3MoEBlock::new(&config).unwrap();
+        let x = mlx_rs::random::uniform::<_, f32>(-1.0, 1.0, &[1, 4, config.hidden_size], None)
+            .unwrap();
+
+        let _ = block.forward(&x).unwrap();
+        assert!(block.has_stacked_moe());
+
+        block.experts[0].w1.weight = Param::new(
+            Array::zeros::<f32>(&[config.get_moe_intermediate_size(), config.hidden_size]).unwrap(),
+        );
+
+        let reference = block.forward_per_expert(&x).unwrap();
+        let fast = block.forward(&x).unwrap();
+        reference.eval().unwrap();
+        fast.eval().unwrap();
+
+        let max_diff = fast
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        max_diff.eval().unwrap();
+        assert!(
+            max_diff.item::<f32>() < 1e-4,
+            "stacked cache failed to refresh after expert weight change"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn test_full_model_forward_shape() {
         let config = tiny_moe_config();
         let mut model = Qwen3MoE::new(config.clone()).unwrap();
         let input_ids = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
         let out = model.forward(&input_ids, None, None).unwrap();
         assert_eq!(out.shape(), &[1, 4, config.vocab_size]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_full_model_init_stacked_moe_preserves_forward() {
+        let config = tiny_moe_config();
+        let mut model = Qwen3MoE::new(config.clone()).unwrap();
+        let input_ids = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
+
+        let reference = model.forward(&input_ids, None, None).unwrap();
+        model.init_stacked_moe().unwrap();
+        let fast = model.forward(&input_ids, None, None).unwrap();
+        reference.eval().unwrap();
+        fast.eval().unwrap();
+
+        let max_diff = fast
+            .subtract(&reference)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap();
+        max_diff.eval().unwrap();
+        assert!(
+            max_diff.item::<f32>() < 1e-4,
+            "qwen3-moe full model drifted after stacked init"
+        );
     }
 
     #[test]
