@@ -31,6 +31,14 @@ pub enum PackedBits {
 }
 
 impl PackedBits {
+    /// Bit width of each packed value.
+    pub fn bit_width(self) -> u32 {
+        match self {
+            Self::Four => 4,
+            Self::Two => 2,
+        }
+    }
+
     /// Values packed per uint32.
     pub fn pack_factor(self) -> usize {
         match self {

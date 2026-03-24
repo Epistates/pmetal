@@ -57,6 +57,17 @@ struct IoResult {
     data: std::io::Result<Vec<u8>>,
 }
 
+struct BytesIoTask {
+    work: IoWork,
+    file: Arc<File>,
+    result_tx: mpsc::Sender<IoResult>,
+}
+
+#[cfg(unix)]
+enum IoTask {
+    Bytes(BytesIoTask),
+}
+
 /// Persistent thread pool for parallel pread() operations.
 ///
 /// Workers are spawned once at construction and live until `Drop`.
@@ -65,9 +76,7 @@ struct IoResult {
 /// which allows concurrent positional reads without seeking or locking.
 pub struct ExpertIoPool {
     workers: Vec<JoinHandle<()>>,
-    task_tx: mpsc::Sender<(IoWork, Arc<File>)>,
-    /// Wrapped in Mutex to make ExpertIoPool Sync (required for Arc<ExpertOffloadContext>).
-    result_rx: Mutex<mpsc::Receiver<IoResult>>,
+    task_tx: mpsc::Sender<IoTask>,
     shutdown: Arc<AtomicBool>,
 }
 
@@ -79,8 +88,7 @@ impl ExpertIoPool {
 
     /// Create with a specific number of threads.
     pub fn with_threads(num_threads: usize) -> Self {
-        let (task_tx, task_rx) = mpsc::channel::<(IoWork, Arc<File>)>();
-        let (result_tx, result_rx) = mpsc::channel::<IoResult>();
+        let (task_tx, task_rx) = mpsc::channel::<IoTask>();
         let shutdown = Arc::new(AtomicBool::new(false));
 
         // Wrap task_rx in an Arc<Mutex<>> so multiple workers can share it
@@ -89,7 +97,6 @@ impl ExpertIoPool {
         let mut workers = Vec::with_capacity(num_threads);
         for _ in 0..num_threads {
             let task_rx = task_rx.clone();
-            let result_tx = result_tx.clone();
             let shutdown = shutdown.clone();
 
             let handle = std::thread::Builder::new()
@@ -103,10 +110,11 @@ impl ExpertIoPool {
                         };
 
                         match task {
-                            Ok((work, file)) => {
-                                let data = Self::do_pread(&file, work.offset, work.size);
-                                let _ = result_tx.send(IoResult {
-                                    result_idx: work.result_idx,
+                            Ok(IoTask::Bytes(task)) => {
+                                let data =
+                                    Self::do_pread(&task.file, task.work.offset, task.work.size);
+                                let _ = task.result_tx.send(IoResult {
+                                    result_idx: task.work.result_idx,
                                     data,
                                 });
                             }
@@ -122,7 +130,6 @@ impl ExpertIoPool {
         Self {
             workers,
             task_tx,
-            result_rx: Mutex::new(result_rx),
             shutdown,
         }
     }
@@ -167,21 +174,28 @@ impl ExpertIoPool {
         }
 
         // Dispatch all tasks
+        let (result_tx, result_rx) = mpsc::channel::<IoResult>();
         for (i, &offset) in offsets.iter().enumerate() {
             let work = IoWork {
                 offset,
                 size,
                 result_idx: i,
             };
-            self.task_tx.send((work, file.clone())).map_err(|_| {
+            self.task_tx.send(IoTask::Bytes(BytesIoTask {
+                work,
+                file: file.clone(),
+                result_tx: result_tx.clone(),
+            }))
+            .map_err(|_| {
                 std::io::Error::new(std::io::ErrorKind::BrokenPipe, "IO pool shut down")
             })?;
         }
+        drop(result_tx);
 
         // Collect all results
         let mut results: Vec<Option<Vec<u8>>> = (0..n).map(|_| None).collect();
         for _ in 0..n {
-            let result = self.result_rx.lock().unwrap().recv().map_err(|_| {
+            let result = result_rx.recv().map_err(|_| {
                 std::io::Error::new(
                     std::io::ErrorKind::BrokenPipe,
                     "IO pool result channel closed",
@@ -337,7 +351,6 @@ impl ExpertOffloadContext {
 
         self.io_pool.parallel_read(file, &offsets, expert_size)
     }
-
     /// Read experts directly into pre-allocated AlignedBuffers (zero-copy path).
     ///
     /// Each `AlignedBuffer` is filled via `pread()` directly into GPU-visible
@@ -374,26 +387,26 @@ impl ExpertOffloadContext {
         }
 
         let expert_size = self.file_manager.expert_size();
+        let offsets: Vec<u64> = expert_indices
+            .iter()
+            .map(|&idx| self.file_manager.expert_offset(idx))
+            .collect();
         let fd = file.as_raw_fd();
-
-        // Use scoped threads for direct pread into aligned buffers
-        // (can't send &mut AlignedBuffer through channels, but scoped threads work)
         let errors: Mutex<Vec<(usize, std::io::Error)>> = Mutex::new(Vec::new());
 
         std::thread::scope(|s| {
-            let chunk_size = buffers.len().div_ceil(4); // 4 IO threads
+            let chunk_size = buffers.len().div_ceil(4);
             for (chunk_idx, (buf_chunk, idx_chunk)) in buffers
                 .chunks_mut(chunk_size)
-                .zip(expert_indices.chunks(chunk_size))
+                .zip(offsets.chunks(chunk_size))
                 .enumerate()
             {
                 let errors = &errors;
                 s.spawn(move || {
-                    for (i, (buf, &eidx)) in buf_chunk.iter_mut().zip(idx_chunk.iter()).enumerate()
+                    for (i, (buf, &offset)) in buf_chunk.iter_mut().zip(idx_chunk.iter()).enumerate()
                     {
-                        let offset = eidx as u64 * expert_size as u64;
                         if let Err(e) = buf
-                            .pread(fd, offset)
+                            .pread_range(fd, offset, 0, expert_size)
                             .map_err(|e| std::io::Error::other(e.to_string()))
                         {
                             let global_idx = chunk_idx * chunk_size + i;
@@ -467,5 +480,38 @@ mod tests {
         let file = Arc::new(tempfile::tempfile().unwrap());
         let results = pool.parallel_read(&file, &[], 0).unwrap();
         assert!(results.is_empty());
+    }
+
+    #[test]
+    fn test_io_pool_parallel_read_is_safe_for_concurrent_callers() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("test.bin");
+
+        let mut file = File::create(&path).unwrap();
+        file.write_all(&[1u8; 256]).unwrap();
+        file.write_all(&[2u8; 256]).unwrap();
+        drop(file);
+
+        let file = Arc::new(File::open(&path).unwrap());
+        let pool = Arc::new(ExpertIoPool::with_threads(2));
+
+        let file_a = file.clone();
+        let pool_a = pool.clone();
+        let t1 = std::thread::spawn(move || pool_a.parallel_read(&file_a, &[0, 256], 256).unwrap());
+
+        let file_b = file.clone();
+        let pool_b = pool.clone();
+        let t2 =
+            std::thread::spawn(move || pool_b.parallel_read(&file_b, &[256, 0], 256).unwrap());
+
+        let r1 = t1.join().unwrap();
+        let r2 = t2.join().unwrap();
+
+        assert_eq!(r1.len(), 2);
+        assert_eq!(r2.len(), 2);
+        assert_eq!(r1[0][0], 1);
+        assert_eq!(r1[1][0], 2);
+        assert_eq!(r2[0][0], 2);
+        assert_eq!(r2[1][0], 1);
     }
 }
