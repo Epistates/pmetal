@@ -1,28 +1,30 @@
-use anyhow::Context;
 use crate::{WorkloadBenchmarkPreset, WorkloadInferenceContext};
+use anyhow::Context;
 use half::f16;
 use mlx_rs::module::ModuleParameters as _;
 use pmetal::inference_runner::{CacheModeRequest, select_cache_mode_for_model};
-use pmetal_core::{DatasetConfig, LoraConfig, ModelConfig, StepMetrics, TrainingCallback, TrainingConfig};
+use pmetal_core::{
+    DatasetConfig, LoraConfig, ModelConfig, StepMetrics, TrainingCallback, TrainingConfig,
+};
 use pmetal_data::{DatasetColumnConfig, DatasetFormat, TextSample, Tokenizer, TrainingDataset};
 use pmetal_lora::LlamaLoraForCausalLM;
 use pmetal_metal::context::{DeviceTier, MemoryBandwidthSource};
 use pmetal_metal::kernels::BatchedCommandBuffer;
 use pmetal_metal::kernels::mpp_gemm::{MppGemm, MppGemmConfig};
 use pmetal_metal::tuna::MppGemmTuneRequest;
-use pmetal_mlx::kv_cache::CacheMode;
 use pmetal_metal::{
     BufferUsage, FlashAttention, FlashAttentionConfig, FusedLinearCrossEntropy,
     FusedLinearCrossEntropyConfig, FusedLora, FusedLoraConfig, FusedMLP, FusedMergeMetal,
     FusedNormLora, FusedNormLoraConfig, FusedSwiGLUConfig, MetalBuffer, MetalContext,
     build_merge_config, build_tensor_info,
 };
+use pmetal_mlx::kv_cache::CacheMode;
 use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE};
 use pmetal_models::architectures::jamba::{JambaConfig, JambaLayer};
-use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::architectures::llama4::{Llama4MoE, Llama4TextConfig};
 use pmetal_models::architectures::qwen3_moe::{Qwen3MoEBlock, Qwen3MoEConfig};
+use pmetal_models::dispatcher::DynamicModel;
 use pmetal_trainer::orchestrator::{FullTrainingConfig, run_training};
 use pmetal_trainer::{DispatchConfig, TrainingJobConfig};
 use serde::Serialize;
@@ -503,8 +505,12 @@ pub(crate) fn run_kernel_benchmark_corpus(
 
     let report_json = serde_json::to_string_pretty(&report)?;
     if let Some(output_path) = output {
-        std::fs::write(output_path, &report_json)
-            .with_context(|| format!("failed to write benchmark corpus to {}", output_path.display()))?;
+        std::fs::write(output_path, &report_json).with_context(|| {
+            format!(
+                "failed to write benchmark corpus to {}",
+                output_path.display()
+            )
+        })?;
     }
 
     if json {
@@ -590,8 +596,7 @@ async fn run_workload_benchmark_internal(
     let device = workload_benchmark_device()?;
     let model_path = resolve_workload_model_path(model_id).await?;
     let dataset_path = pmetal_trainer::resolve_dataset_path(dataset_id).await?;
-    let chat_template =
-        pmetal_data::chat_templates::detect_chat_template(&model_path, model_id);
+    let chat_template = pmetal_data::chat_templates::detect_chat_template(&model_path, model_id);
     let text_samples = load_workload_text_samples(&dataset_path, &chat_template)?;
 
     let selected_inference_samples: Vec<TextSample> = text_samples
@@ -607,14 +612,13 @@ async fn run_workload_benchmark_internal(
         .cloned()
         .collect();
 
-    let inference_prompt_len =
-        resolve_workload_inference_prompt_len(
-            &model_path,
-            &selected_inference_samples,
-            max_prompt_tokens,
-            inference_context,
-            decode_steps,
-        );
+    let inference_prompt_len = resolve_workload_inference_prompt_len(
+        &model_path,
+        &selected_inference_samples,
+        max_prompt_tokens,
+        inference_context,
+        decode_steps,
+    );
     let inference = benchmark_real_inference(
         &model_path,
         &selected_inference_samples,
@@ -704,8 +708,12 @@ async fn run_workload_benchmark_internal(
 
     let report_json = serde_json::to_string_pretty(&report)?;
     if let Some(output_path) = output {
-        std::fs::write(output_path, &report_json)
-            .with_context(|| format!("failed to write workload benchmark to {}", output_path.display()))?;
+        std::fs::write(output_path, &report_json).with_context(|| {
+            format!(
+                "failed to write workload benchmark to {}",
+                output_path.display()
+            )
+        })?;
     }
 
     if json {
@@ -838,7 +846,9 @@ fn benchmark_real_inference(
 
     let tokenizer = Tokenizer::from_model_dir(model_path)?;
     let mut model = DynamicModel::load(model_path)?;
-    let cache_max_seq_len = max_prompt_tokens.saturating_add(decode_steps).saturating_add(8);
+    let cache_max_seq_len = max_prompt_tokens
+        .saturating_add(decode_steps)
+        .saturating_add(8);
     let base_cache_config = model.create_cache(cache_max_seq_len).config().clone();
     let cache_selection = select_cache_mode_for_model(
         &base_cache_config,
@@ -856,8 +866,12 @@ fn benchmark_real_inference(
     let cache_mode = cache_selection.mode;
 
     // Warm up model load / kernels on the first prompt so the timed run is steadier.
-    let warmup_ids =
-        encode_benchmark_prompt(&tokenizer, &samples[0], max_prompt_tokens, inference_context)?;
+    let warmup_ids = encode_benchmark_prompt(
+        &tokenizer,
+        &samples[0],
+        max_prompt_tokens,
+        inference_context,
+    )?;
     if !warmup_ids.is_empty() {
         let _ = run_prefill_decode_pass(&mut model, &warmup_ids, decode_steps, cache_mode)?;
     }
@@ -892,31 +906,33 @@ fn benchmark_real_inference(
     let decode_ms = duration_to_ms(total_decode);
     let decode_tokens = measured_samples * decode_steps;
 
-    Ok(WorkloadBenchmarkSection::Completed(InferenceWorkloadMetrics {
-        prompt_samples: measured_samples,
-        prompt_tokens: total_prompt_tokens,
-        max_prompt_tokens,
-        decode_steps,
-        cache_mode: cache_mode.describe(),
-        cache_mode_source: cache_selection.source.as_str().to_string(),
-        total_prefill_ms: prefill_ms,
-        prefill_tok_per_sec: if prefill_ms > 0.0 {
-            total_prompt_tokens as f64 / (prefill_ms / 1000.0)
-        } else {
-            0.0
+    Ok(WorkloadBenchmarkSection::Completed(
+        InferenceWorkloadMetrics {
+            prompt_samples: measured_samples,
+            prompt_tokens: total_prompt_tokens,
+            max_prompt_tokens,
+            decode_steps,
+            cache_mode: cache_mode.describe(),
+            cache_mode_source: cache_selection.source.as_str().to_string(),
+            total_prefill_ms: prefill_ms,
+            prefill_tok_per_sec: if prefill_ms > 0.0 {
+                total_prompt_tokens as f64 / (prefill_ms / 1000.0)
+            } else {
+                0.0
+            },
+            total_decode_ms: decode_ms,
+            decode_tok_per_sec: if decode_tokens > 0 && decode_ms > 0.0 {
+                decode_tokens as f64 / (decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_ms_per_token: if decode_tokens > 0 {
+                decode_ms / decode_tokens as f64
+            } else {
+                0.0
+            },
         },
-        total_decode_ms: decode_ms,
-        decode_tok_per_sec: if decode_tokens > 0 && decode_ms > 0.0 {
-            decode_tokens as f64 / (decode_ms / 1000.0)
-        } else {
-            0.0
-        },
-        decode_ms_per_token: if decode_tokens > 0 {
-            decode_ms / decode_tokens as f64
-        } else {
-            0.0
-        },
-    }))
+    ))
 }
 
 fn encode_benchmark_prompt(
@@ -925,9 +941,8 @@ fn encode_benchmark_prompt(
     max_prompt_tokens: usize,
     inference_context: ResolvedWorkloadInferenceContext,
 ) -> anyhow::Result<Vec<u32>> {
-    let mut ids = tokenizer.encode_with_special_tokens(
-        benchmark_inference_text(sample, inference_context),
-    )?;
+    let mut ids = tokenizer
+        .encode_with_special_tokens(benchmark_inference_text(sample, inference_context))?;
     if max_prompt_tokens > 0 && ids.len() > max_prompt_tokens {
         ids.truncate(max_prompt_tokens);
     }
@@ -945,17 +960,18 @@ fn run_prefill_decode_pass(
 
     let prompt_tokens: Vec<i32> = prompt_ids.iter().map(|&id| id as i32).collect();
     let prompt = Array::from_slice(&prompt_tokens, &[1, prompt_tokens.len() as i32]);
-    let mut cache =
-        model.create_cache_with_mode(prompt_ids.len().saturating_add(decode_steps).saturating_add(8), cache_mode);
+    let mut cache = model.create_cache_with_mode(
+        prompt_ids
+            .len()
+            .saturating_add(decode_steps)
+            .saturating_add(8),
+        cache_mode,
+    );
     let mut mamba_cache = model.create_mamba_cache();
 
     let prefill_start = Instant::now();
-    let logits = model.forward_with_hybrid_cache(
-        &prompt,
-        None,
-        Some(&mut cache),
-        mamba_cache.as_mut(),
-    )?;
+    let logits =
+        model.forward_with_hybrid_cache(&prompt, None, Some(&mut cache), mamba_cache.as_mut())?;
     logits.eval()?;
     let prefill_elapsed = prefill_start.elapsed();
 
@@ -1157,7 +1173,9 @@ fn empty_prompt_len_selection(requested_max_prompt_tokens: usize) -> WorkloadPro
     }
 }
 
-fn empty_training_seq_len_selection(requested_max_seq_len: usize) -> WorkloadTrainingSeqLenSelection {
+fn empty_training_seq_len_selection(
+    requested_max_seq_len: usize,
+) -> WorkloadTrainingSeqLenSelection {
     WorkloadTrainingSeqLenSelection {
         requested_max_seq_len,
         effective_max_seq_len: requested_max_seq_len,
@@ -1275,8 +1293,7 @@ fn resolve_requested_workload_inference_context(
                     ResolvedWorkloadInferenceContext::TextPrefix,
                     format!(
                         "auto-short-prompt-p95-{}-lt-{}",
-                        prompt_p95_tokens,
-                        AUTO_BENCH_WORKLOAD_MIN_PROMPT_TOKENS
+                        prompt_p95_tokens, AUTO_BENCH_WORKLOAD_MIN_PROMPT_TOKENS
                     ),
                 )
             }
@@ -1301,8 +1318,7 @@ fn resolve_workload_training_seq_len(
     requested_max_seq_len: usize,
 ) -> anyhow::Result<WorkloadTrainingSeqLenSelection> {
     let tokenizer = Tokenizer::from_model_dir(model_path)?;
-    let chat_template =
-        pmetal_data::chat_templates::detect_chat_template(model_path, model_id);
+    let chat_template = pmetal_data::chat_templates::detect_chat_template(model_path, model_id);
 
     let auto_cap = workload_auto_training_seq_len_cap(model_path);
     let effective_max_seq_len = if requested_max_seq_len > 0 {
@@ -1339,7 +1355,10 @@ fn resolve_workload_training_seq_len(
     })
 }
 
-fn summarize_prompt_lengths(lengths: &[usize], max_prompt_tokens: usize) -> WorkloadPromptLenSelection {
+fn summarize_prompt_lengths(
+    lengths: &[usize],
+    max_prompt_tokens: usize,
+) -> WorkloadPromptLenSelection {
     if lengths.is_empty() {
         return empty_prompt_len_selection(max_prompt_tokens);
     }
@@ -1479,15 +1498,23 @@ fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Opt
             );
             println!(
                 "  Prompt len: {} ({}, sample p95 {}, {:.1}% truncated)",
-                report.workload.inference_prompt_len.effective_max_prompt_tokens,
-                report.workload.inference_prompt_len.max_prompt_tokens_source,
-                report.workload.inference_prompt_len.sample_p95_prompt_tokens,
+                report
+                    .workload
+                    .inference_prompt_len
+                    .effective_max_prompt_tokens,
+                report
+                    .workload
+                    .inference_prompt_len
+                    .max_prompt_tokens_source,
+                report
+                    .workload
+                    .inference_prompt_len
+                    .sample_p95_prompt_tokens,
                 report.workload.inference_prompt_len.sample_truncated_pct
             );
             println!(
                 "  KV cache: {} ({})",
-                metrics.cache_mode,
-                metrics.cache_mode_source
+                metrics.cache_mode, metrics.cache_mode_source
             );
             println!(
                 "  Prefill: {:.0} tok/s over {} prompt tokens ({} samples, {:.2} ms total)",
@@ -1498,9 +1525,7 @@ fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Opt
             );
             println!(
                 "  Decode:  {:.0} tok/s ({:.2} ms/token over {} steps/sample)",
-                metrics.decode_tok_per_sec,
-                metrics.decode_ms_per_token,
-                metrics.decode_steps
+                metrics.decode_tok_per_sec, metrics.decode_ms_per_token, metrics.decode_steps
             );
         }
         WorkloadBenchmarkSection::Skipped { reason } => {
@@ -1525,14 +1550,11 @@ fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Opt
             );
             println!(
                 "  Median step: {:.2} ms, median throughput: {:.0} tok/s",
-                metrics.median_step_ms,
-                metrics.median_tok_sec
+                metrics.median_step_ms, metrics.median_tok_sec
             );
             println!(
                 "  Final loss: {:.4} across {} steps / {} tokens",
-                metrics.final_loss,
-                metrics.total_steps,
-                metrics.total_tokens
+                metrics.final_loss, metrics.total_steps, metrics.total_tokens
             );
         }
         WorkloadBenchmarkSection::Skipped { reason } => {
@@ -1632,10 +1654,12 @@ fn run_kernel_benchmark_case(
         }
         KernelBenchmarkCase::FusedMlp(case) => {
             let parameters = fused_mlp_parameters(*case);
-            let tuning = match ctx
-                .tuner()
-                .tune_swiglu(ctx, case.batch_size, case.hidden_size, case.intermediate_size)
-            {
+            let tuning = match ctx.tuner().tune_swiglu(
+                ctx,
+                case.batch_size,
+                case.hidden_size,
+                case.intermediate_size,
+            ) {
                 Ok(tuned) => btree_map([
                     ("threads_per_token", tuned.threads_per_token.to_string()),
                     ("chunk_size", tuned.chunk_size.to_string()),
@@ -1650,8 +1674,7 @@ fn run_kernel_benchmark_case(
                 let input = alloc_f32_buffer(ctx, case.batch_size * case.hidden_size)?;
                 let gate_weight = alloc_f32_buffer(ctx, case.intermediate_size * case.hidden_size)?;
                 let up_weight = alloc_f32_buffer(ctx, case.intermediate_size * case.hidden_size)?;
-                let down_weight =
-                    alloc_f32_buffer(ctx, case.hidden_size * case.intermediate_size)?;
+                let down_weight = alloc_f32_buffer(ctx, case.hidden_size * case.intermediate_size)?;
 
                 benchmark_operation(warmup_iterations, benchmark_iterations, || {
                     let output = kernel.forward(&input, &gate_weight, &up_weight, &down_weight)?;
@@ -1677,8 +1700,13 @@ fn run_kernel_benchmark_case(
                 ]),
                 Err(error) => btree_map([("selection_error", error.to_string())]),
             };
-            let config =
-                FusedNormLoraConfig::new(case.batch_size, case.hidden_size, case.out_features, case.rank, 16.0);
+            let config = FusedNormLoraConfig::new(
+                case.batch_size,
+                case.hidden_size,
+                case.out_features,
+                case.rank,
+                16.0,
+            );
 
             let outcome = (|| -> anyhow::Result<KernelBenchmarkOutcome> {
                 let kernel = FusedNormLora::new(ctx.clone(), config)?;
@@ -1705,10 +1733,7 @@ fn run_kernel_benchmark_case(
                 case.vocab_size,
             )
             .with_fp16();
-            let tuning = match ctx
-                .tuner()
-                .tune_fused_linear_cross_entropy(ctx, &config)
-            {
+            let tuning = match ctx.tuner().tune_fused_linear_cross_entropy(ctx, &config) {
                 Ok(tuned) => btree_map([
                     ("threadgroup_size", tuned.threadgroup_size.to_string()),
                     ("chunk_size", tuned.chunk_size.to_string()),
@@ -1723,8 +1748,7 @@ fn run_kernel_benchmark_case(
                 let targets = alloc_i32_targets(ctx, case.num_tokens, case.vocab_size)?;
 
                 benchmark_operation(warmup_iterations, benchmark_iterations, || {
-                    let output =
-                        kernel.forward_f16(&hidden_states, &lm_head_weight, &targets)?;
+                    let output = kernel.forward_f16(&hidden_states, &lm_head_weight, &targets)?;
                     std::hint::black_box(output);
                     Ok(())
                 })
@@ -1801,7 +1825,11 @@ fn run_kernel_benchmark_case(
 
             let outcome = (|| -> anyhow::Result<KernelBenchmarkOutcome> {
                 let input = mlx_rs::random::normal::<f32>(
-                    &[case.batch_size as i32, case.seq_len as i32, case.hidden_size as i32],
+                    &[
+                        case.batch_size as i32,
+                        case.seq_len as i32,
+                        case.hidden_size as i32,
+                    ],
                     None,
                     None,
                     None,
@@ -1887,7 +1915,11 @@ fn run_kernel_benchmark_case(
 
             let outcome = (|| -> anyhow::Result<KernelBenchmarkOutcome> {
                 let input = mlx_rs::random::normal::<f32>(
-                    &[case.batch_size as i32, case.seq_len as i32, case.hidden_size as i32],
+                    &[
+                        case.batch_size as i32,
+                        case.seq_len as i32,
+                        case.hidden_size as i32,
+                    ],
                     None,
                     None,
                     None,
@@ -2358,9 +2390,7 @@ fn alloc_i32_targets(
     len: usize,
     vocab_size: usize,
 ) -> anyhow::Result<MetalBuffer<i32>> {
-    let data: Vec<i32> = (0..len)
-        .map(|i| (i % vocab_size.max(1)) as i32)
-        .collect();
+    let data: Vec<i32> = (0..len).map(|i| (i % vocab_size.max(1)) as i32).collect();
     Ok(MetalBuffer::from_slice(ctx, &data, BufferUsage::Shared)?)
 }
 
@@ -2530,10 +2560,7 @@ fn print_kernel_benchmark_report(report: &KernelBenchmarkReport, output: Option<
                 );
             }
             KernelBenchmarkOutcome::Failed { error } => {
-                println!(
-                    "{:<30} {:<24} failed ({})",
-                    case.name, case.category, error
-                );
+                println!("{:<30} {:<24} failed ({})", case.name, case.category, error);
             }
         }
     }
@@ -3073,6 +3100,10 @@ mod tests {
 
         assert_eq!(report["mode"], "quick");
         assert!(report["summary"]["completed"].as_u64().unwrap_or(0) > 0);
-        assert!(report["cases"].as_array().is_some_and(|cases| !cases.is_empty()));
+        assert!(
+            report["cases"]
+                .as_array()
+                .is_some_and(|cases| !cases.is_empty())
+        );
     }
 }

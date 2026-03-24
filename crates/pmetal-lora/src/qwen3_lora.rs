@@ -271,8 +271,7 @@ impl Qwen3LoraAttention {
                     .with_scale(self.scale)
                     .with_mask_type(mask_type);
 
-            fused_sdpa(&queries, &keys, &values, &attn_config, mask)
-                .map_err(LoraError::Mlx)?
+            fused_sdpa(&queries, &keys, &values, &attn_config, mask).map_err(LoraError::Mlx)?
         };
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
@@ -1791,6 +1790,8 @@ mod tests {
         let lora_config = small_lora_config();
         let model = Qwen3LoraForCausalLM::new(config, lora_config).unwrap();
 
-        assert!(!crate::TrainableModel::supports_gradient_checkpointing(&model));
+        assert!(!crate::TrainableModel::supports_gradient_checkpointing(
+            &model
+        ));
     }
 }

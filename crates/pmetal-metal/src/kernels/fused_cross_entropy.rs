@@ -1018,10 +1018,7 @@ fn resolve_fused_linear_ce_tuned_config(
 ) -> Result<CrossEntropyTunedConfig> {
     let tuned = ctx.tuner().tune_fused_linear_cross_entropy(ctx, config)?;
     Ok(CrossEntropyTunedConfig {
-        threadgroup_size: sanitize_fused_linear_ce_threads(
-            ctx,
-            tuned.threadgroup_size,
-        ),
+        threadgroup_size: sanitize_fused_linear_ce_threads(ctx, tuned.threadgroup_size),
         chunk_size: tuned.chunk_size.max(1),
     })
 }

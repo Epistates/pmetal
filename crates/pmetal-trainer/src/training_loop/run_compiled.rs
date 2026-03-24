@@ -678,8 +678,7 @@ impl TrainingLoop {
                     if action == AdaptiveAction::Rollback {
                         self.restore_best_weights(&mut state.0);
                     }
-                    if action == AdaptiveAction::EarlyStop
-                        || action == AdaptiveAction::GracefulStop
+                    if action == AdaptiveAction::EarlyStop || action == AdaptiveAction::GracefulStop
                     {
                         if action == AdaptiveAction::EarlyStop {
                             self.restore_best_weights(&mut state.0);

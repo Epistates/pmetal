@@ -1522,6 +1522,8 @@ mod tests {
         let qlora_config = small_qlora_config();
         let model = Qwen3QloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
 
-        assert!(!crate::TrainableModel::supports_gradient_checkpointing(&model));
+        assert!(!crate::TrainableModel::supports_gradient_checkpointing(
+            &model
+        ));
     }
 }

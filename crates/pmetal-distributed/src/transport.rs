@@ -50,10 +50,9 @@ impl TransportSender {
                 stream.write_all(data).await?;
             }
             TransportSenderInner::Memory(sender) => {
-                sender
-                    .send(data.to_vec())
-                    .await
-                    .map_err(|e| DistributedError::Protocol(format!("in-memory send failed: {e}")))?;
+                sender.send(data.to_vec()).await.map_err(|e| {
+                    DistributedError::Protocol(format!("in-memory send failed: {e}"))
+                })?;
             }
         }
         Ok(())

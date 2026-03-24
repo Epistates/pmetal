@@ -831,8 +831,7 @@ impl DeepSeekMoE {
         let hidden_size = hidden_flat.dim(1);
         let (expert_indices, expert_weights) = self.gate.forward(&hidden_flat)?;
         let top_k = self.gate.top_k;
-        let mut output =
-            mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
+        let mut output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
 
         for slot in 0..top_k {
             let slot_experts = expert_indices.index((.., slot));

@@ -68,9 +68,10 @@ pub async fn run_pmetal_blocking(args: &[&str]) -> McpResult<String> {
         } else {
             stderr.into_owned()
         };
-        return Err(McpError::internal(
-            format!("pmetal exited with {}: {msg}", output.status),
-        ));
+        return Err(McpError::internal(format!(
+            "pmetal exited with {}: {msg}",
+            output.status
+        )));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
@@ -78,9 +79,8 @@ pub async fn run_pmetal_blocking(args: &[&str]) -> McpResult<String> {
 
 /// Build device info JSON by calling MetalContext directly.
 pub fn build_device_info_json() -> McpResult<serde_json::Value> {
-    let ctx = pmetal_metal::context::MetalContext::global().map_err(|e| {
-        McpError::internal(format!("Metal not available: {e}"))
-    })?;
+    let ctx = pmetal_metal::context::MetalContext::global()
+        .map_err(|e| McpError::internal(format!("Metal not available: {e}")))?;
 
     let props = ctx.properties();
     let system_memory = get_system_memory();
@@ -105,9 +105,8 @@ pub fn build_device_info_json() -> McpResult<serde_json::Value> {
 
 /// Build a DeviceSpec for fit estimation.
 pub fn build_device_spec() -> McpResult<pmetal_hub::DeviceSpec> {
-    let ctx = pmetal_metal::context::MetalContext::global().map_err(|e| {
-        McpError::internal(format!("Metal not available: {e}"))
-    })?;
+    let ctx = pmetal_metal::context::MetalContext::global()
+        .map_err(|e| McpError::internal(format!("Metal not available: {e}")))?;
     let props = ctx.properties();
 
     const BYTES_PER_GB: f64 = 1024.0 * 1024.0 * 1024.0;
@@ -141,7 +140,10 @@ pub fn hf_cache_dir() -> std::path::PathBuf {
     if let Ok(cache) = std::env::var("HUGGINGFACE_HUB_CACHE") {
         return cache.into();
     }
-    dirs_fallback().join(".cache").join("huggingface").join("hub")
+    dirs_fallback()
+        .join(".cache")
+        .join("huggingface")
+        .join("hub")
 }
 
 fn dirs_fallback() -> std::path::PathBuf {

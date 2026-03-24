@@ -2404,6 +2404,8 @@ mod tests {
         let lora_config = tiny_lora_config();
         let model = Qwen3NextLoraForCausalLM::new(config, lora_config).unwrap();
 
-        assert!(!crate::TrainableModel::supports_gradient_checkpointing(&model));
+        assert!(!crate::TrainableModel::supports_gradient_checkpointing(
+            &model
+        ));
     }
 }

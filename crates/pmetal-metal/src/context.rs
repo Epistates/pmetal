@@ -398,10 +398,7 @@ fn load_memory_bandwidth_cache(path: &Path) -> Option<HashMap<String, MemoryBand
     serde_json::from_str(&contents).ok()
 }
 
-fn load_cached_memory_bandwidth(
-    path: &Path,
-    cache_key: &str,
-) -> Option<MemoryBandwidthCacheEntry> {
+fn load_cached_memory_bandwidth(path: &Path, cache_key: &str) -> Option<MemoryBandwidthCacheEntry> {
     let cache = load_memory_bandwidth_cache(path)?;
     let entry = cache.get(cache_key)?.clone();
     if measured_bandwidth_is_plausible(entry.bandwidth_gbps) {
@@ -411,11 +408,7 @@ fn load_cached_memory_bandwidth(
     }
 }
 
-fn store_cached_memory_bandwidth(
-    path: &Path,
-    cache_key: &str,
-    entry: &MemoryBandwidthCacheEntry,
-) {
+fn store_cached_memory_bandwidth(path: &Path, cache_key: &str, entry: &MemoryBandwidthCacheEntry) {
     let Some(parent) = path.parent() else {
         return;
     };
@@ -538,19 +531,20 @@ fn measure_gpu_copy_bandwidth_gbps(
 
     let pipeline = pipeline_cache.get_or_create_pipeline(device, "bandwidth_probe_f32", None)?;
 
-    let options = MTLResourceOptions::StorageModePrivate | MTLResourceOptions::HazardTrackingModeTracked;
-    let src = device.newBufferWithLength_options(copy_bytes, options).ok_or_else(|| {
-        MetalError::BufferCreation {
+    let options =
+        MTLResourceOptions::StorageModePrivate | MTLResourceOptions::HazardTrackingModeTracked;
+    let src = device
+        .newBufferWithLength_options(copy_bytes, options)
+        .ok_or_else(|| MetalError::BufferCreation {
             size: copy_bytes,
             reason: "bandwidth probe src".to_string(),
-        }
-    })?;
-    let dst = device.newBufferWithLength_options(copy_bytes, options).ok_or_else(|| {
-        MetalError::BufferCreation {
+        })?;
+    let dst = device
+        .newBufferWithLength_options(copy_bytes, options)
+        .ok_or_else(|| MetalError::BufferCreation {
             size: copy_bytes,
             reason: "bandwidth probe dst".to_string(),
-        }
-    })?;
+        })?;
 
     let max_threads = pipeline.maxTotalThreadsPerThreadgroup();
     let threads_per_threadgroup = max_threads.clamp(32, 256).div_ceil(32) * 32;

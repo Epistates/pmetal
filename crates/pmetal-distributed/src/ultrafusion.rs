@@ -160,7 +160,11 @@ impl UltraFusionExecutionConfig {
             )));
         }
 
-        let available_ram: Vec<u64> = self.dies.iter().map(|die| die.available_ram_bytes).collect();
+        let available_ram: Vec<u64> = self
+            .dies
+            .iter()
+            .map(|die| die.available_ram_bytes)
+            .collect();
         let bandwidths = vec![self.interconnect_bandwidth_bytes_per_sec; self.dies.len()];
         let ranges = if bandwidths.windows(2).all(|pair| pair[0] == pair[1]) {
             assign_layers_proportional(num_layers, &available_ram)
@@ -305,12 +309,8 @@ mod tests {
 
     #[test]
     fn uniform_hardware_splits_resources_evenly() {
-        let config = UltraFusionExecutionConfig::from_uniform_hardware(
-            128 * 1024 * 1024 * 1024,
-            80,
-            32,
-            2,
-        );
+        let config =
+            UltraFusionExecutionConfig::from_uniform_hardware(128 * 1024 * 1024 * 1024, 80, 32, 2);
 
         assert_eq!(config.dies.len(), 2);
         assert_eq!(config.dies[0].available_ram_bytes, 64 * 1024 * 1024 * 1024);
@@ -323,29 +323,26 @@ mod tests {
 
     #[test]
     fn validation_rejects_single_die_configs() {
-        let config = UltraFusionExecutionConfig::from_uniform_hardware(
-            64 * 1024 * 1024 * 1024,
-            40,
-            16,
-            1,
-        );
-        let err = config.validate().expect_err("single-die config should fail");
+        let config =
+            UltraFusionExecutionConfig::from_uniform_hardware(64 * 1024 * 1024 * 1024, 40, 16, 1);
+        let err = config
+            .validate()
+            .expect_err("single-die config should fail");
         assert!(err.to_string().contains("at least 2 die slices"));
     }
 
     #[test]
     fn plan_inference_generates_contiguous_stage_ranges() {
-        let config = UltraFusionExecutionConfig::from_uniform_hardware(
-            128 * 1024 * 1024 * 1024,
-            80,
-            32,
-            2,
-        );
+        let config =
+            UltraFusionExecutionConfig::from_uniform_hardware(128 * 1024 * 1024 * 1024, 80, 32, 2);
         let plan = config.plan_inference(80).expect("plan");
 
         assert_eq!(plan.stages.len(), 2);
         assert_eq!(plan.stages[0].layer_range.start, 0);
-        assert_eq!(plan.stages[0].layer_range.end, plan.stages[1].layer_range.start);
+        assert_eq!(
+            plan.stages[0].layer_range.end,
+            plan.stages[1].layer_range.start
+        );
         assert_eq!(plan.stages[1].layer_range.end, 80);
         assert!(plan.estimated_latency_ms > 0.0);
     }
@@ -379,12 +376,8 @@ mod tests {
 
     #[tokio::test]
     async fn build_stage_runtimes_wires_local_pipeline_channels() {
-        let config = UltraFusionExecutionConfig::from_uniform_hardware(
-            128 * 1024 * 1024 * 1024,
-            80,
-            32,
-            2,
-        );
+        let config =
+            UltraFusionExecutionConfig::from_uniform_hardware(128 * 1024 * 1024 * 1024, 80, 32, 2);
         let plan = config.plan_inference(8).expect("plan");
         let mut runtimes = config.build_stage_runtimes(&plan).expect("runtimes");
         assert_eq!(runtimes.len(), 2);

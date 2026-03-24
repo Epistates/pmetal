@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::process::Stdio;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -108,9 +108,9 @@ impl JobManager {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let mut child = cmd.spawn().map_err(|e| {
-            McpError::internal(format!("failed to spawn pmetal {subcommand}: {e}"))
-        })?;
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| McpError::internal(format!("failed to spawn pmetal {subcommand}: {e}")))?;
 
         let child_pid = child.id();
 
@@ -241,13 +241,14 @@ impl JobManager {
 
     /// Stop a running job by sending SIGTERM, then SIGKILL after 5 seconds.
     pub async fn stop(&self, job_id: &str) -> McpResult<()> {
-        let job = self.jobs.get(job_id).ok_or_else(|| {
-            McpError::invalid_params(format!("job not found: {job_id}"))
-        })?;
+        let job = self
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| McpError::invalid_params(format!("job not found: {job_id}")))?;
 
-        let pid = job.child_pid.ok_or_else(|| {
-            McpError::internal("job has no PID (already exited?)")
-        })?;
+        let pid = job
+            .child_pid
+            .ok_or_else(|| McpError::internal("job has no PID (already exited?)"))?;
 
         {
             let mut status = job.status.write().await;
@@ -284,9 +285,10 @@ impl JobManager {
     /// Looks for `--output` followed by a path in the stored args.
     /// Falls back to the subcommand's CLI default output directory.
     pub fn get_output_dir(&self, job_id: &str) -> McpResult<String> {
-        let job = self.jobs.get(job_id).ok_or_else(|| {
-            McpError::invalid_params(format!("job not found: {job_id}"))
-        })?;
+        let job = self
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| McpError::invalid_params(format!("job not found: {job_id}")))?;
 
         // Search for --output in args
         let args = &job.args;
@@ -314,9 +316,10 @@ impl JobManager {
 
     /// Get a summary of a specific job.
     pub async fn get_summary(&self, job_id: &str) -> McpResult<JobSummary> {
-        let job = self.jobs.get(job_id).ok_or_else(|| {
-            McpError::invalid_params(format!("job not found: {job_id}"))
-        })?;
+        let job = self
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| McpError::invalid_params(format!("job not found: {job_id}")))?;
 
         let status = job.status.read().await.clone();
         let finished = *job.finished_at.read().await;
@@ -371,9 +374,10 @@ impl JobManager {
 
     /// Get recent log lines from a job.
     pub async fn get_logs(&self, job_id: &str, tail: usize) -> McpResult<(Vec<String>, usize)> {
-        let job = self.jobs.get(job_id).ok_or_else(|| {
-            McpError::invalid_params(format!("job not found: {job_id}"))
-        })?;
+        let job = self
+            .jobs
+            .get(job_id)
+            .ok_or_else(|| McpError::invalid_params(format!("job not found: {job_id}")))?;
 
         let stdout = job.stdout_lines.read().await;
         let stderr = job.stderr_lines.read().await;
@@ -445,10 +449,16 @@ mod tests {
     #[test]
     fn default_output_dirs_match_cli_defaults() {
         assert_eq!(default_output_dir_for_command("train"), "./output");
-        assert_eq!(default_output_dir_for_command("distill"), "./output/distilled");
+        assert_eq!(
+            default_output_dir_for_command("distill"),
+            "./output/distilled"
+        );
         assert_eq!(default_output_dir_for_command("grpo"), "./output/grpo");
         assert_eq!(default_output_dir_for_command("rlkd"), "./output/rlkd");
-        assert_eq!(default_output_dir_for_command("embed-train"), "./output-embed");
+        assert_eq!(
+            default_output_dir_for_command("embed-train"),
+            "./output-embed"
+        );
     }
 
     #[test]

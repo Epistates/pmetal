@@ -387,10 +387,18 @@ impl Qwen3Attention {
         let effective_base = rope_scaling.effective_base(config.rope_theta, head_dim);
 
         Ok(Self {
-            q_proj: zero_linear(config.num_attention_heads * head_dim, config.hidden_size, false)?,
+            q_proj: zero_linear(
+                config.num_attention_heads * head_dim,
+                config.hidden_size,
+                false,
+            )?,
             k_proj: zero_linear(n_kv_heads * head_dim, config.hidden_size, false)?,
             v_proj: zero_linear(n_kv_heads * head_dim, config.hidden_size, false)?,
-            o_proj: zero_linear(config.hidden_size, config.num_attention_heads * head_dim, false)?,
+            o_proj: zero_linear(
+                config.hidden_size,
+                config.num_attention_heads * head_dim,
+                false,
+            )?,
             q_norm: nn::RmsNormBuilder::new(head_dim)
                 .eps(config.rms_norm_eps)
                 .build()?,

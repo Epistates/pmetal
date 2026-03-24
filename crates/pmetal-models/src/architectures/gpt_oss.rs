@@ -544,7 +544,11 @@ pub struct GptOssMoEExpert {
 
 impl GptOssMoEExpert {
     /// Create a new expert.
-    pub fn new(hidden_size: i32, intermediate_size: i32, swiglu_limit: f32) -> Result<Self, Exception> {
+    pub fn new(
+        hidden_size: i32,
+        intermediate_size: i32,
+        swiglu_limit: f32,
+    ) -> Result<Self, Exception> {
         Ok(Self {
             swiglu_limit,
             gate_proj: nn::LinearBuilder::new(hidden_size, intermediate_size)
@@ -669,7 +673,9 @@ impl GptOssMoE {
         signature
     }
 
-    fn stack_expert_weights(&self) -> Result<(Array, Array, Array, Array, Array, Array), Exception> {
+    fn stack_expert_weights(
+        &self,
+    ) -> Result<(Array, Array, Array, Array, Array, Array), Exception> {
         let gate_weights: Vec<Array> = self
             .experts
             .iter()
@@ -689,36 +695,27 @@ impl GptOssMoE {
             .experts
             .iter()
             .map(|expert| {
-                expert
-                    .gate_proj
-                    .bias
-                    .as_ref()
-                    .clone()
-                    .unwrap_or_else(|| Array::zeros::<f32>(&[expert.gate_proj.weight.as_ref().dim(0)]).unwrap())
+                expert.gate_proj.bias.as_ref().clone().unwrap_or_else(|| {
+                    Array::zeros::<f32>(&[expert.gate_proj.weight.as_ref().dim(0)]).unwrap()
+                })
             })
             .collect();
         let up_biases: Vec<Array> = self
             .experts
             .iter()
             .map(|expert| {
-                expert
-                    .up_proj
-                    .bias
-                    .as_ref()
-                    .clone()
-                    .unwrap_or_else(|| Array::zeros::<f32>(&[expert.up_proj.weight.as_ref().dim(0)]).unwrap())
+                expert.up_proj.bias.as_ref().clone().unwrap_or_else(|| {
+                    Array::zeros::<f32>(&[expert.up_proj.weight.as_ref().dim(0)]).unwrap()
+                })
             })
             .collect();
         let down_biases: Vec<Array> = self
             .experts
             .iter()
             .map(|expert| {
-                expert
-                    .down_proj
-                    .bias
-                    .as_ref()
-                    .clone()
-                    .unwrap_or_else(|| Array::zeros::<f32>(&[expert.down_proj.weight.as_ref().dim(0)]).unwrap())
+                expert.down_proj.bias.as_ref().clone().unwrap_or_else(|| {
+                    Array::zeros::<f32>(&[expert.down_proj.weight.as_ref().dim(0)]).unwrap()
+                })
             })
             .collect();
 
@@ -820,7 +817,8 @@ impl GptOssMoE {
         let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
         let hidden_size = shape[shape.len() - 1];
         let hidden_flat = x.reshape(&[batch_seq, hidden_size])?;
-        let (_batch_seq, _hidden_size, top_indices, normalized_weights) = self.route_topk(&hidden_flat)?;
+        let (_batch_seq, _hidden_size, top_indices, normalized_weights) =
+            self.route_topk(&hidden_flat)?;
 
         top_indices.eval()?;
         normalized_weights.eval()?;
@@ -843,9 +841,14 @@ impl GptOssMoE {
             if expert_assignments.is_empty() {
                 continue;
             }
-            let token_indices: Vec<i32> =
-                expert_assignments.iter().map(|&(idx, _)| idx as i32).collect();
-            let weights: Vec<f32> = expert_assignments.iter().map(|&(_, weight)| weight).collect();
+            let token_indices: Vec<i32> = expert_assignments
+                .iter()
+                .map(|&(idx, _)| idx as i32)
+                .collect();
+            let weights: Vec<f32> = expert_assignments
+                .iter()
+                .map(|&(_, weight)| weight)
+                .collect();
 
             let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
             let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
@@ -865,25 +868,59 @@ impl GptOssMoE {
         self.ensure_stacked()?;
 
         let shape = x.shape();
-        let hidden_flat = x.reshape(&[shape[..shape.len() - 1].iter().product(), shape[shape.len() - 1]])?;
-        let (batch_seq, hidden_size, top_indices, normalized_weights) = self.route_topk(&hidden_flat)?;
+        let hidden_flat = x.reshape(&[
+            shape[..shape.len() - 1].iter().product(),
+            shape[shape.len() - 1],
+        ])?;
+        let (batch_seq, hidden_size, top_indices, normalized_weights) =
+            self.route_topk(&hidden_flat)?;
         let top_k = self.top_k as i32;
         let mut output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
 
         for slot in 0..top_k {
             let slot_experts = top_indices.index((.., slot));
             let slot_weights = normalized_weights.index((.., slot..slot + 1));
-            let gate_weights = self.stacked_gate_proj.as_ref().unwrap().take_axis(&slot_experts, 0)?;
-            let up_weights = self.stacked_up_proj.as_ref().unwrap().take_axis(&slot_experts, 0)?;
-            let down_weights = self.stacked_down_proj.as_ref().unwrap().take_axis(&slot_experts, 0)?;
-            let gate_bias = self.stacked_gate_bias.as_ref().unwrap().take_axis(&slot_experts, 0)?;
-            let up_bias = self.stacked_up_bias.as_ref().unwrap().take_axis(&slot_experts, 0)?;
-            let down_bias = self.stacked_down_bias.as_ref().unwrap().take_axis(&slot_experts, 0)?;
+            let gate_weights = self
+                .stacked_gate_proj
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
+            let up_weights = self
+                .stacked_up_proj
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
+            let down_weights = self
+                .stacked_down_proj
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
+            let gate_bias = self
+                .stacked_gate_bias
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
+            let up_bias = self
+                .stacked_up_bias
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
+            let down_bias = self
+                .stacked_down_bias
+                .as_ref()
+                .unwrap()
+                .take_axis(&slot_experts, 0)?;
 
-            let gate_out = self.batched_matmul(&hidden_flat, &gate_weights)?.add(&gate_bias)?;
-            let up_out = self.batched_matmul(&hidden_flat, &up_weights)?.add(&up_bias)?;
+            let gate_out = self
+                .batched_matmul(&hidden_flat, &gate_weights)?
+                .add(&gate_bias)?;
+            let up_out = self
+                .batched_matmul(&hidden_flat, &up_weights)?
+                .add(&up_bias)?;
             let clamped = clamp_swiglu_hidden(&gate_out, &up_out, self.swiglu_limit)?;
-            let slot_out = self.batched_matmul(&clamped, &down_weights)?.add(&down_bias)?;
+            let slot_out = self
+                .batched_matmul(&clamped, &down_weights)?
+                .add(&down_bias)?;
             output = output.add(&slot_out.multiply(&slot_weights)?)?;
         }
 

@@ -174,7 +174,9 @@ fn test_run_packed_falls_back_to_standard_when_no_sequences_are_combined() {
     let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
     let dataset = create_dummy_dataset(3, 8);
 
-    let _model = training_loop.run_packed(model, dataset, None, None).unwrap();
+    let _model = training_loop
+        .run_packed(model, dataset, None, None)
+        .unwrap();
 
     assert_eq!(
         training_loop.current_step(),
@@ -340,7 +342,9 @@ fn test_run_packed_direct_api_applies_gradient_checkpointing() {
     let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
     let dataset = create_dummy_dataset(4, 2);
 
-    let model = training_loop.run_packed(model, dataset, None, None).unwrap();
+    let model = training_loop
+        .run_packed(model, dataset, None, None)
+        .unwrap();
 
     let checkpoint_config = model
         .checkpoint_config
@@ -383,7 +387,9 @@ fn test_run_compiled_direct_api_applies_gradient_checkpointing() {
     let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
     let dataset = create_dummy_dataset(2, 8);
 
-    let model = training_loop.run_compiled(model, dataset, None, None).unwrap();
+    let model = training_loop
+        .run_compiled(model, dataset, None, None)
+        .unwrap();
 
     let checkpoint_config = model
         .checkpoint_config
@@ -676,7 +682,9 @@ fn test_run_packed_callbacks_report_non_zero_interval_metrics() {
     let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
     let dataset = create_dummy_dataset(6, 24);
 
-    let _model = training_loop.run_packed(model, dataset, None, None).unwrap();
+    let _model = training_loop
+        .run_packed(model, dataset, None, None)
+        .unwrap();
 
     let metrics = snapshot.snapshot();
     assert!(!metrics.is_empty());

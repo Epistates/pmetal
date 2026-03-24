@@ -71,7 +71,7 @@ pub use sparsify::*;
 
 /// Re-export merge methods for convenience
 pub use methods::{
-    BreadcrumbsMerge, DareMerge, DellaMerge, LinearMerge, MergeMethod,
-    ModelStockMerge, MultiSlerpMerge, NearswapMerge, PassthroughMerge, RamMerge, SlerpMerge,
-    SouperMerge, TaskArithmeticMerge, TiesMerge,
+    BreadcrumbsMerge, DareMerge, DellaMerge, LinearMerge, MergeMethod, ModelStockMerge,
+    MultiSlerpMerge, NearswapMerge, PassthroughMerge, RamMerge, SlerpMerge, SouperMerge,
+    TaskArithmeticMerge, TiesMerge,
 };

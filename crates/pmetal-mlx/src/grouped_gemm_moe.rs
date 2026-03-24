@@ -380,7 +380,9 @@ impl GroupedGemmMoE {
     fn topk_experts(&self, probs: &Array) -> Result<(Array, Array), Exception> {
         let neg_k = -(self.config.num_experts_per_tok as i32);
         let partitioned_indices = mlx_rs::ops::argpartition_axis(probs, neg_k, -1)?;
-        let indices = partitioned_indices.try_index((.., neg_k..))?.as_type::<i32>()?;
+        let indices = partitioned_indices
+            .try_index((.., neg_k..))?
+            .as_type::<i32>()?;
         let values = probs.take_along_axis(&indices, -1)?;
         Ok((values, indices))
     }

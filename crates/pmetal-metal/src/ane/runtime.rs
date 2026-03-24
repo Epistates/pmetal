@@ -1430,7 +1430,10 @@ mod tests {
         output_rt.read_fp16_as_f32(&mut rt_values, 0, output_channels, cfg.seq_len);
 
         let max_diff = max_abs_diff(&std_values, &rt_values);
-        assert!(max_diff < 5e-2, "SDPA RT output drifted: max_diff={max_diff}");
+        assert!(
+            max_diff < 5e-2,
+            "SDPA RT output drifted: max_diff={max_diff}"
+        );
 
         let iterations = 7;
         let mut standard_wall_ms = Vec::with_capacity(iterations);
@@ -1453,15 +1456,15 @@ mod tests {
 
         for _ in 0..iterations {
             let start = Instant::now();
-            let stats =
-                match model.evaluate_real_time_with_stats(&[input.as_ptr()], &[output_rt.as_ptr()])
-                {
-                    Ok(stats) => stats,
-                    Err(err) => {
-                        eprintln!("Skipping SDPA latency probe during real-time eval: {err}");
-                        return;
-                    }
-                };
+            let stats = match model
+                .evaluate_real_time_with_stats(&[input.as_ptr()], &[output_rt.as_ptr()])
+            {
+                Ok(stats) => stats,
+                Err(err) => {
+                    eprintln!("Skipping SDPA latency probe during real-time eval: {err}");
+                    return;
+                }
+            };
             realtime_wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);
             realtime_hw_ms.push(stats.hw_execution_time_ns as f64 / 1_000_000.0);
         }

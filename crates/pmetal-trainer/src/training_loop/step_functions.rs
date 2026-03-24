@@ -105,7 +105,11 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
         // Only materialize the expensive block-diagonal mask when this batch
         // actually contains multiple packed sequences. Single-sequence batches
         // can use the model's native causal path.
-        Some(packed_batch.attention_mask()?.reshape(&[1, 1, total_tokens, total_tokens])?)
+        Some(
+            packed_batch
+                .attention_mask()?
+                .reshape(&[1, 1, total_tokens, total_tokens])?,
+        )
     } else {
         None
     };
@@ -115,7 +119,8 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
 
     // Define loss function that will be used by value_and_grad
     // Use IDENTICAL loss computation as regular training for consistency
-    let loss_fn = |model: &mut M, (input_ids, labels): (&Array, &Array)|
+    let loss_fn = |model: &mut M,
+                   (input_ids, labels): (&Array, &Array)|
      -> std::result::Result<Array, Exception> {
         // Preserve explicit position IDs while allowing single-sequence packed
         // batches to stay on the model's native causal-attention fast path.
@@ -295,7 +300,11 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
     let labels_2d = packed_batch.labels.reshape(&[1, total_tokens])?;
     let position_ids = packed_batch.position_ids.clone();
     let attn_mask_4d = if packed_batch.num_sequences > 1 {
-        Some(packed_batch.attention_mask()?.reshape(&[1, 1, total_tokens, total_tokens])?)
+        Some(
+            packed_batch
+                .attention_mask()?
+                .reshape(&[1, 1, total_tokens, total_tokens])?,
+        )
     } else {
         None
     };
@@ -308,10 +317,14 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
 
     if has_cce_support {
         let cached_weight = lm_weight_cached.expect("checked above");
-        let loss_fn = |model: &mut M, (input_ids, labels): (&Array, &Array)|
+        let loss_fn = |model: &mut M,
+                       (input_ids, labels): (&Array, &Array)|
          -> std::result::Result<Array, Exception> {
-            let hidden_opt =
-                model.forward_hidden_with_positions(input_ids, attn_mask_4d.as_ref(), &position_ids);
+            let hidden_opt = model.forward_hidden_with_positions(
+                input_ids,
+                attn_mask_4d.as_ref(),
+                &position_ids,
+            );
 
             match hidden_opt {
                 Some(Ok(hidden_states)) => {

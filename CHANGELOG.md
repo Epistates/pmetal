@@ -28,9 +28,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`--no-adaptive-lr` flag**: Disables automatic spike/plateau/divergence detection while keeping the control file protocol active. Enables fully LLM-driven learning rate control — the agent observes loss via `job_status` and manually adjusts LR via `job_set_lr`/`job_reduce_lr`
 
+- **UltraFusion execution planner** (`pmetal-distributed`): Per-die stage planner for M-series Ultra Macs with in-memory channel transport backend for same-process links, avoiding TCP overhead on UltraFusion interconnect
+
+- **MPP FlashAttention for head_dim 64/96**: Metal 4 MPP flash attention kernel now supports head_dim 64, 96, and 128 with stride-2/stride-3 SIMD lane packing and causal/non-causal variants
+
+- **Tuna persistent disk cache**: The auto-tuner now persists benchmark results to disk, avoiding re-tuning on restart. Expanded search covers FlashAttention, FusedCrossEntropy, FusedNormLora, and FusedSwiGLU via function constants
+
+- **MoE GPU top-k selection**: Expert top-k selection moved from CPU sort to GPU `argpartition_axis`, eliminating a sync point in the MoE forward path
+
+- **`bench-workload` CLI command**: Benchmark a real cached workload for inference and short LoRA training with named presets (`--preset dense-qwen3`, `--preset hybrid-qwen3next`)
+
+- **KV cache quantization auto-select**: `--kv-quant` is now optional — omitting it auto-selects the fastest quantization mode that fits the device memory budget
+
+- **UltraFusion info display**: `pmetal info` shows UltraFusion topology, die count, and local executor plan on Ultra Macs
+
+- **Qwen3 LoRA RoPE reset**: Qwen3 LoRA and QLoRA gain dense attention and RoPE reset support
+
+- **ANE real-time evaluation**: Experimental `_ANEClient` real-time dispatch with automatic fallback to standard evaluation on failure. Propagated via `--ane-real-time` CLI flag
+
+- **`bench-corpus` CLI command**: Structured kernel benchmarking with device-tier-aware test cases, JSON reporting, and `--quick`/`--output` flags
+
+- **GPU memory bandwidth probing**: Real GPU copy benchmark replaces static spec-table lookup, with disk-cached results and spec-table fallback
+
+- **Persistent runtime kernel backend selection**: Benchmark-and-persist infrastructure races MLX vs MPP backends on Apple10/M5, validates numerical agreement, and caches the winner to disk for 4-bit quantized linear, fused attention, and LoRA matmul
+
+- **MPP kernel tile variants**: Metal 4 GEMM supports parameterized tile variants (32x32, 64x32, 32x64, 64x64) with Tuna auto-tuner selection per device and problem shape
+
+- **Serve ANE/CPU-hybrid engine caching**: Serve engine auto-selects optimal backend (ANE, CPU-hybrid, GPU) at startup with permanent downgrade on failure. Compiled engines cached across requests
+
+- **Rollback enabled by default for LoRA**: Best-loss checkpoint rollback now defaults to on with extended warmup grace period. Persistent snapshot to disk via atomic write. `for_lora()` factory for recommended defaults
+
+- **Extended StepMetrics**: `gpu_fwd_bwd_ms`, `optimizer_ms`, `io_staging_ms`, `overhead_ms` fields for fine-grained training profiling
+
+- **Zero-copy MoE expert dispatch**: `ExpertBufferPool` with `read_experts_aligned` + `encode_expert_aligned` for pread-to-Metal expert weight dispatch. Auto-enable KV-Q8 when memory-constrained
+
+- **ANE dual-die support**: On UltraFusion chips, compile variant-B kernel set with distinct MIL hashes and alternate per step for dual-die thermal distribution. Auto-recompile on throughput degradation (>15% or >25K dispatches)
+
+- **Batched parameter eval**: Model dispatcher evaluates parameters in batches of 128 tensors per sync instead of all-at-once, reducing peak memory during model loading
+
+- **Architecture enhancements**: DeepSeek V3/V3.2, GPT-OSS, Jamba, Llama 4, Qwen3, and Qwen3-MoE model improvements and weight sanitization refinements
+
+- **Third-party attribution**: Complete THIRD_PARTY_NOTICES with entries for mlx-lm, llama.cpp/GGML, Candle, and Burn
+
 ### Changed
 
 - **ANE is now opt-in**: The `--no-ane` flag has been replaced with `--ane` across CLI, TUI, orchestrator, and MCP. ANE training is experimental and limited to small models, so it defaults to off. The orchestrator's `DispatchConfig` now sets `ane: false` by default
+- **Gradient checkpointing support corrected**: Qwen3 and Qwen3Next no longer claim gradient checkpointing support (was incorrectly advertised)
+- **Training loop refactored**: Gradient checkpointing helper extracted, step logging tracks step numbers correctly, training loop tests expanded
+
+### Removed
+
+- **Merge methods**: Removed merge methods with incompatible licenses. Cleaned up related references across documentation and configuration
+
+### Fixed
+
+- **MetalSampler use-after-free**: Retained source logits array until GPU completion in serve engine
+- **Fused merge Tuna cache**: Now uses persistent disk cache instead of ephemeral per-session tuning
 
 ## [0.3.13] - 2026-03-22
 

@@ -408,12 +408,7 @@ impl TrainingLoop {
     where
         M: TrainableModel,
     {
-        self.run(
-            &mut model,
-            train_dataset,
-            eval_dataset,
-            checkpoint_manager,
-        )?;
+        self.run(&mut model, train_dataset, eval_dataset, checkpoint_manager)?;
         Ok(model)
     }
 

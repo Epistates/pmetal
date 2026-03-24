@@ -593,7 +593,10 @@ enum Commands {
         model: String,
 
         /// Dataset ID or local path
-        #[arg(long, default_value = "TeichAI/gemini-3-pro-preview-high-reasoning-250x")]
+        #[arg(
+            long,
+            default_value = "TeichAI/gemini-3-pro-preview-high-reasoning-250x"
+        )]
         dataset: String,
 
         /// Number of prompt samples to benchmark for inference
@@ -2321,7 +2324,9 @@ async fn tokio_main() -> anyhow::Result<()> {
 
         #[cfg(feature = "mcp")]
         Commands::Mcp => {
-            pmetal_mcp::run_stdio().await.map_err(|e| anyhow::anyhow!("{e}"))?;
+            pmetal_mcp::run_stdio()
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
 
         #[cfg(feature = "serve")]
@@ -2539,11 +2544,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 .as_deref()
                 .map(|path| validate_output_path(path, "benchmark corpus output"))
                 .transpose()?;
-            commands::bench::run_kernel_benchmark_corpus(
-                quick,
-                validated_output.as_deref(),
-                json,
-            )?;
+            commands::bench::run_kernel_benchmark_corpus(quick, validated_output.as_deref(), json)?;
         }
 
         Commands::BenchWorkload {

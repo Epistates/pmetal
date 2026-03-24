@@ -481,7 +481,15 @@ fn load_model_with_lora(
     lora_path: &str,
     max_seq_len: usize,
     config: &InferenceRunnerConfig,
-) -> Result<(DynamicLoraModel, KVCache, Option<MambaCache>, CacheModeSelection), Exception> {
+) -> Result<
+    (
+        DynamicLoraModel,
+        KVCache,
+        Option<MambaCache>,
+        CacheModeSelection,
+    ),
+    Exception,
+> {
     let lora_path_buf = Path::new(lora_path);
     let adapter_dir = if lora_path_buf.is_dir() {
         lora_path_buf
@@ -766,9 +774,7 @@ fn accumulate_model_weight_file_bytes(
     };
 
     if metadata.is_dir() {
-        let canonical = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf());
+        let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if !visited_dirs.insert(canonical) {
             return;
         }
@@ -787,9 +793,7 @@ fn accumulate_model_weight_file_bytes(
         return;
     }
 
-    let canonical = path
-        .canonicalize()
-        .unwrap_or_else(|_| path.to_path_buf());
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     if counted_files.insert(canonical) {
         *total = total.saturating_add(metadata.len());
     }

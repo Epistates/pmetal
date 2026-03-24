@@ -50,9 +50,7 @@ use crate::buffer::{BufferUsage, MetalBuffer};
 use crate::context::{DeviceProperties, DeviceTier, MetalContext};
 use crate::error::{MetalError, Result};
 use crate::kernels::flash_attention::{FlashAttention, FlashAttentionConfig};
-use crate::kernels::fused_cross_entropy::{
-    FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig,
-};
+use crate::kernels::fused_cross_entropy::{FusedLinearCrossEntropy, FusedLinearCrossEntropyConfig};
 use crate::kernels::fused_norm_lora::{FusedNormLora, FusedNormLoraConfig};
 use crate::kernels::fused_swiglu::{FusedMLP, FusedSwiGLUConfig};
 use crate::kernels::mpp_gemm::{MppGemm, MppGemmConfig, MppGemmKernelVariant};
@@ -289,7 +287,11 @@ impl FlashAttentionTuneRequest {
             self.kv_seq_len,
             self.head_dim,
             if self.is_causal { "causal" } else { "free" },
-            if self.has_sliding_window { "window" } else { "full" },
+            if self.has_sliding_window {
+                "window"
+            } else {
+                "full"
+            },
             if self.has_softcap { "softcap" } else { "plain" },
             if self.is_training { "train" } else { "infer" }
         )
@@ -737,8 +739,10 @@ impl Tuner {
             }
         }
 
-        let candidates = self.candidate_flash_attention_configs(request.head_dim, props.device_tier);
-        let mut best_config = self.heuristic_flash_attention_config(request.head_dim, props.device_tier);
+        let candidates =
+            self.candidate_flash_attention_configs(request.head_dim, props.device_tier);
+        let mut best_config =
+            self.heuristic_flash_attention_config(request.head_dim, props.device_tier);
         let mut best_time = f64::INFINITY;
 
         info!(
@@ -749,7 +753,11 @@ impl Tuner {
             request.query_seq_len,
             request.kv_seq_len,
             request.head_dim,
-            if request.is_training { "train" } else { "infer" }
+            if request.is_training {
+                "train"
+            } else {
+                "infer"
+            }
         );
 
         for candidate in candidates {
@@ -768,8 +776,7 @@ impl Tuner {
                 Err(error) => {
                     debug!(
                         "FlashAttention config {:?} failed benchmarking: {}",
-                        candidate,
-                        error
+                        candidate, error
                     );
                 }
             }
@@ -913,8 +920,8 @@ impl Tuner {
         config: &FlashAttentionConfig,
         candidate: FlashAttentionTunedConfig,
     ) -> Result<f64> {
-        let heuristic =
-            self.heuristic_flash_attention_config(config.head_dim, context.properties().device_tier);
+        let heuristic = self
+            .heuristic_flash_attention_config(config.head_dim, context.properties().device_tier);
         let total_bytes = config
             .query_size()
             .checked_mul(2)
@@ -929,9 +936,7 @@ impl Tuner {
                 })
             })
             .ok_or_else(|| {
-                MetalError::InvalidConfig(
-                    "FlashAttention benchmark size overflow".to_string(),
-                )
+                MetalError::InvalidConfig("FlashAttention benchmark size overflow".to_string())
             })?;
         if total_bytes > 256 * 1024 * 1024 {
             return Ok(if candidate == heuristic { 1.0 } else { 10.0 });
@@ -941,11 +946,8 @@ impl Tuner {
         let keys = MetalBuffer::<f16>::zeros(context, config.kv_size(), BufferUsage::Shared)?;
         let values = MetalBuffer::<f16>::zeros(context, config.kv_size(), BufferUsage::Shared)?;
 
-        let flash = FlashAttention::new_with_tuned_blocks(
-            Arc::clone(context),
-            config.clone(),
-            candidate,
-        )?;
+        let flash =
+            FlashAttention::new_with_tuned_blocks(Arc::clone(context), config.clone(), candidate)?;
 
         flash.forward(&queries, &keys, &values)?;
 
@@ -2091,7 +2093,10 @@ impl Tuner {
                     }
                 }
                 Err(error) => {
-                    debug!("SwiGLU config {:?} failed benchmarking: {}", candidate, error);
+                    debug!(
+                        "SwiGLU config {:?} failed benchmarking: {}",
+                        candidate, error
+                    );
                 }
             }
         }
@@ -2105,8 +2110,7 @@ impl Tuner {
         } else {
             debug!(
                 "Falling back to heuristic SwiGLU config {:?} for device tier {:?}",
-                best_config,
-                props.device_tier
+                best_config, props.device_tier
             );
         }
 
@@ -2155,13 +2159,25 @@ impl Tuner {
             ),
             chunk_size: match device_tier {
                 DeviceTier::Ultra | DeviceTier::Max => {
-                    if small_intermediate { 2048 } else { 4096 }
+                    if small_intermediate {
+                        2048
+                    } else {
+                        4096
+                    }
                 }
                 DeviceTier::Pro => {
-                    if small_intermediate { 2048 } else { 4096 }
+                    if small_intermediate {
+                        2048
+                    } else {
+                        4096
+                    }
                 }
                 DeviceTier::Base => {
-                    if small_intermediate { 1024 } else { 2048 }
+                    if small_intermediate {
+                        1024
+                    } else {
+                        2048
+                    }
                 }
             },
         }
@@ -2173,8 +2189,11 @@ impl Tuner {
         intermediate_size: usize,
         max_threads_per_threadgroup: u32,
     ) -> Vec<SwiGLUTunedConfig> {
-        let heuristic =
-            self.heuristic_swiglu_config(device_tier, intermediate_size, max_threads_per_threadgroup);
+        let heuristic = self.heuristic_swiglu_config(
+            device_tier,
+            intermediate_size,
+            max_threads_per_threadgroup,
+        );
         let mut candidates = vec![heuristic];
 
         let thread_candidates: &[u32] = match device_tier {
@@ -2226,7 +2245,9 @@ impl Tuner {
             .and_then(|x| x.checked_add(config.hidden_size.checked_mul(config.intermediate_size)?))
             .and_then(|x| x.checked_add(config.batch_size.checked_mul(config.hidden_size)?))
             .and_then(|x| x.checked_mul(std::mem::size_of::<f32>()))
-            .ok_or_else(|| MetalError::InvalidConfig("SwiGLU benchmark size overflow".to_string()))?;
+            .ok_or_else(|| {
+                MetalError::InvalidConfig("SwiGLU benchmark size overflow".to_string())
+            })?;
         if total_bytes > 256 * 1024 * 1024 {
             return Ok(if candidate == heuristic { 1.0 } else { 10.0 });
         }
@@ -2454,8 +2475,7 @@ impl Tuner {
                 Err(error) => {
                     debug!(
                         "Fused linear CE config {:?} failed benchmarking: {}",
-                        candidate,
-                        error
+                        candidate, error
                     );
                 }
             }
@@ -2470,10 +2490,7 @@ impl Tuner {
         } else {
             debug!(
                 "Falling back to heuristic fused linear CE config {:?} for [H={}, V={}] on {:?}",
-                best_config,
-                config.hidden_size,
-                config.vocab_size,
-                props.device_tier
+                best_config, config.hidden_size, config.vocab_size, props.device_tier
             );
         }
 
@@ -2520,13 +2537,25 @@ impl Tuner {
 
         let chunk_size = match device_tier {
             DeviceTier::Base => {
-                if hidden_size >= 4096 { 1024 } else { 2048 }
+                if hidden_size >= 4096 {
+                    1024
+                } else {
+                    2048
+                }
             }
             DeviceTier::Pro => {
-                if hidden_size >= 8192 { 2048 } else { 4096 }
+                if hidden_size >= 8192 {
+                    2048
+                } else {
+                    4096
+                }
             }
             DeviceTier::Max | DeviceTier::Ultra => {
-                if hidden_size >= 8192 { 4096 } else { 8192 }
+                if hidden_size >= 8192 {
+                    4096
+                } else {
+                    8192
+                }
             }
         };
 
@@ -2603,9 +2632,7 @@ impl Tuner {
             .checked_mul(config.hidden_size)
             .and_then(|x| x.checked_add(config.vocab_size.checked_mul(config.hidden_size)?))
             .and_then(|x| x.checked_mul(dtype_size))
-            .and_then(|x| {
-                x.checked_add(config.num_tokens.checked_mul(std::mem::size_of::<i32>())?)
-            })
+            .and_then(|x| x.checked_add(config.num_tokens.checked_mul(std::mem::size_of::<i32>())?))
             .and_then(|x| {
                 x.checked_add(
                     config
@@ -2769,8 +2796,7 @@ impl Tuner {
                 Err(error) => {
                     debug!(
                         "Norm+LoRA config {:?} failed benchmarking: {}",
-                        candidate,
-                        error
+                        candidate, error
                     );
                 }
             }
@@ -2785,9 +2811,7 @@ impl Tuner {
         } else {
             debug!(
                 "Falling back to heuristic Norm+LoRA config {:?} for out_features={} on {:?}",
-                best_config,
-                out_features,
-                props.device_tier
+                best_config, out_features, props.device_tier
             );
         }
 
@@ -3743,12 +3767,8 @@ mod tests {
             }
         );
         assert_eq!(
-            tuner.heuristic_fused_linear_cross_entropy_config(
-                DeviceTier::Max,
-                2048,
-                200_000,
-                1024,
-            ),
+            tuner
+                .heuristic_fused_linear_cross_entropy_config(DeviceTier::Max, 2048, 200_000, 1024,),
             CrossEntropyTunedConfig {
                 threadgroup_size: 1024,
                 chunk_size: 8192,
@@ -3895,7 +3915,10 @@ mod tests {
             .tune_fused_linear_cross_entropy(&ctx, &wider)
             .expect("wider tune");
 
-        let cache = tuner.cross_entropy_cache.lock().expect("cross_entropy cache");
+        let cache = tuner
+            .cross_entropy_cache
+            .lock()
+            .expect("cross_entropy cache");
         let fused_entries = cache
             .keys()
             .filter(|key| key.starts_with("fused_linear_ce:"))

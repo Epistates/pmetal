@@ -91,8 +91,7 @@ fn build_info_lines(
         ),
         format!(
             "Bandwidth:      {:.0} GB/s ({:?})",
-            props.memory_bandwidth_gbps,
-            props.memory_bandwidth_source
+            props.memory_bandwidth_gbps, props.memory_bandwidth_source
         ),
         format!(
             "NAX (Neural):   {}",
@@ -133,12 +132,14 @@ fn build_ultrafusion_executor_config(
     }
 
     let total_available_ram = system_memory.unwrap_or(props.recommended_working_set_size);
-    Some(pmetal_distributed::UltraFusionExecutionConfig::from_uniform_hardware(
-        total_available_ram,
-        props.gpu_core_count,
-        props.ane_core_count,
-        props.die_count as usize,
-    ))
+    Some(
+        pmetal_distributed::UltraFusionExecutionConfig::from_uniform_hardware(
+            total_available_ram,
+            props.gpu_core_count,
+            props.ane_core_count,
+            props.die_count as usize,
+        ),
+    )
 }
 
 #[cfg(feature = "distributed")]
@@ -273,7 +274,8 @@ mod tests {
         assert!(lines.iter().any(|line| line == "System Memory:  64 GB"));
         assert!(lines.iter().any(|line| line == "Recommended WS: 48 GB"));
         assert!(
-            lines.iter()
+            lines
+                .iter()
                 .any(|line| line == "Bandwidth:      273 GB/s (SpecTableFallback)")
         );
     }
@@ -307,15 +309,18 @@ mod tests {
         let lines = build_info_lines(&props, Some(256 * 1024 * 1024 * 1024));
 
         assert!(
-            lines.iter()
+            lines
+                .iter()
                 .any(|line| line == "UltraFusion:    yes (2 dies)")
         );
         assert!(
-            lines.iter()
+            lines
+                .iter()
                 .any(|line| line == "Local Exec:     2-stage in-memory pipeline available")
         );
         assert!(
-            lines.iter()
+            lines
+                .iter()
                 .any(|line| line == "Per-Die Slice:  128 GB / 40 GPU / 16 ANE")
         );
     }

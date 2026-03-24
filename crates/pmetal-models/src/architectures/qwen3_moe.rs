@@ -508,10 +508,7 @@ impl Qwen3MoEBlock {
             && self.stacked_down_proj.is_some()
     }
 
-    fn route_topk(
-        &mut self,
-        hidden_flat: &Array,
-    ) -> Result<(i32, i32, Array, Array), Exception> {
+    fn route_topk(&mut self, hidden_flat: &Array) -> Result<(i32, i32, Array, Array), Exception> {
         let batch_seq = hidden_flat.dim(0);
         let hidden_size = hidden_flat.dim(1);
 
@@ -568,7 +565,8 @@ impl Qwen3MoEBlock {
             }
         }
 
-        let mut final_output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
+        let mut final_output =
+            mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
         for (expert_idx, assignments) in expert_assignments.iter().enumerate() {
             if assignments.is_empty() {
                 continue;
@@ -606,8 +604,12 @@ impl Qwen3MoEBlock {
         self.ensure_stacked_moe()?;
 
         let shape = x.shape();
-        let hidden_flat = x.reshape(&[shape[..shape.len() - 1].iter().product(), shape[shape.len() - 1]])?;
-        let (batch_seq, hidden_size, top_indices, normalized_weights) = self.route_topk(&hidden_flat)?;
+        let hidden_flat = x.reshape(&[
+            shape[..shape.len() - 1].iter().product(),
+            shape[shape.len() - 1],
+        ])?;
+        let (batch_seq, hidden_size, top_indices, normalized_weights) =
+            self.route_topk(&hidden_flat)?;
         let top_k = self.top_k as i32;
         let mut output = mlx_rs::ops::zeros_dtype(&[batch_seq, hidden_size], hidden_flat.dtype())?;
         for slot in 0..top_k {

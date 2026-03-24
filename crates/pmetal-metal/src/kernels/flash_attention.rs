@@ -276,10 +276,7 @@ impl FlashAttention {
         })
     }
 
-    fn validate_block_sizes(
-        head_dim: usize,
-        tuned: FlashAttentionTunedConfig,
-    ) -> Result<()> {
+    fn validate_block_sizes(head_dim: usize, tuned: FlashAttentionTunedConfig) -> Result<()> {
         let supported = match head_dim {
             64 => matches!(
                 (tuned.block_q, tuned.block_k),

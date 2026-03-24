@@ -371,19 +371,28 @@ mod tests {
 
         let mut d64 = test_config();
         d64.head_dim = 64;
-        assert_eq!(kernel_name(&d64).unwrap(), "mpp_flash_attention_fwd_d64_causal");
+        assert_eq!(
+            kernel_name(&d64).unwrap(),
+            "mpp_flash_attention_fwd_d64_causal"
+        );
         d64.is_causal = false;
         assert_eq!(kernel_name(&d64).unwrap(), "mpp_flash_attention_fwd_d64");
 
         let mut d80 = test_config();
         d80.head_dim = 80;
-        assert_eq!(kernel_name(&d80).unwrap(), "mpp_flash_attention_fwd_d80_causal");
+        assert_eq!(
+            kernel_name(&d80).unwrap(),
+            "mpp_flash_attention_fwd_d80_causal"
+        );
         d80.is_causal = false;
         assert_eq!(kernel_name(&d80).unwrap(), "mpp_flash_attention_fwd_d80");
 
         let mut d96 = test_config();
         d96.head_dim = 96;
-        assert_eq!(kernel_name(&d96).unwrap(), "mpp_flash_attention_fwd_d96_causal");
+        assert_eq!(
+            kernel_name(&d96).unwrap(),
+            "mpp_flash_attention_fwd_d96_causal"
+        );
         d96.is_causal = false;
         assert_eq!(kernel_name(&d96).unwrap(), "mpp_flash_attention_fwd_d96");
     }

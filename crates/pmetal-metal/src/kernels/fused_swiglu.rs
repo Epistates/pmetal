@@ -748,9 +748,12 @@ fn resolve_swiglu_tuned_config(
     ctx: &Arc<MetalContext>,
     config: &FusedSwiGLUConfig,
 ) -> Result<SwiGLUTunedConfig> {
-    let tuned = ctx
-        .tuner()
-        .tune_swiglu(ctx, config.batch_size, config.hidden_size, config.intermediate_size)?;
+    let tuned = ctx.tuner().tune_swiglu(
+        ctx,
+        config.batch_size,
+        config.hidden_size,
+        config.intermediate_size,
+    )?;
     Ok(normalize_swiglu_tuned_config(ctx, tuned))
 }
 
@@ -845,7 +848,12 @@ mod tests {
         let config = FusedSwiGLUConfig::with_lora(4, 512, 8192, 8, 16.0);
         let tuned = ctx
             .tuner()
-            .tune_swiglu(&ctx, config.batch_size, config.hidden_size, config.intermediate_size)
+            .tune_swiglu(
+                &ctx,
+                config.batch_size,
+                config.hidden_size,
+                config.intermediate_size,
+            )
             .expect("tune_swiglu");
         let kernel = FusedSwiGLU::new(ctx.clone(), config.clone()).expect("kernel");
         let mlp = FusedMLP::new(ctx.clone(), config).expect("mlp");

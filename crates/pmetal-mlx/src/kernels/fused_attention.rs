@@ -945,7 +945,8 @@ mod tests {
             has_nax: true,
             architecture_gen: 17,
             memory_bandwidth_gbps: 546.0,
-            memory_bandwidth_source: pmetal_metal::context::MemoryBandwidthSource::SpecTableFallback,
+            memory_bandwidth_source:
+                pmetal_metal::context::MemoryBandwidthSource::SpecTableFallback,
             gpu_core_count: 40,
             ane_core_count: 16,
             is_ultra_fusion: false,

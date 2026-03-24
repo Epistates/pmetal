@@ -486,8 +486,7 @@ impl Llama4MoE {
         let expert_ids: Vec<i32> = expert_indices.as_slice().to_vec();
         let routing_weights: Vec<f32> = expert_weights.as_slice().to_vec();
 
-        let mut expert_assignments: Vec<Vec<(usize, f32)>> =
-            vec![Vec::new(); self.experts.len()];
+        let mut expert_assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); self.experts.len()];
         for token_idx in 0..n_tokens {
             for slot in 0..top_k {
                 let flat_idx = token_idx * top_k + slot;
@@ -1187,8 +1186,8 @@ mod tests {
         config.num_experts_per_tok = 2;
 
         let mut moe = Llama4MoE::new(&config).unwrap();
-        let x = mlx_rs::random::normal::<f32>(&[2, 5, config.hidden_size], None, None, None)
-            .unwrap();
+        let x =
+            mlx_rs::random::normal::<f32>(&[2, 5, config.hidden_size], None, None, None).unwrap();
 
         let shape = x.shape().to_vec();
         let hidden_size = *shape.last().unwrap();
@@ -1207,7 +1206,8 @@ mod tests {
                 .unwrap();
             let slot_weights = expert_weights.index((.., slot..slot + 1));
 
-            let mut slot_out = ops::zeros_dtype(&[total_tokens, hidden_size], flat_x.dtype()).unwrap();
+            let mut slot_out =
+                ops::zeros_dtype(&[total_tokens, hidden_size], flat_x.dtype()).unwrap();
             for (expert_idx, expert) in moe.experts.iter_mut().enumerate() {
                 let expert_id = Array::from_int(expert_idx as i32);
                 let mask = slot_indices.eq(&expert_id).unwrap();
@@ -1237,7 +1237,10 @@ mod tests {
             .unwrap();
         diff.eval().unwrap();
         let max_diff = diff.item::<f32>();
-        assert!(max_diff < 1e-4, "llama4 moe drifted from naive path: {max_diff}");
+        assert!(
+            max_diff < 1e-4,
+            "llama4 moe drifted from naive path: {max_diff}"
+        );
         assert_eq!(output.shape(), &[2, 5, config.hidden_size]);
     }
 

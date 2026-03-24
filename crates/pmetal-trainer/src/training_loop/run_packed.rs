@@ -84,12 +84,7 @@ impl TrainingLoop {
                 "Sequence packing produced only single-sequence batches; \
                  falling back to the standard training loop"
             );
-            return self.run_standard_owned(
-                model,
-                train_dataset,
-                eval_dataset,
-                checkpoint_manager,
-            );
+            return self.run_standard_owned(model, train_dataset, eval_dataset, checkpoint_manager);
         }
 
         let mut model = model;
@@ -285,7 +280,9 @@ impl TrainingLoop {
                             );
                             self.restore_best_weights(&mut state.0);
                         } else {
-                            tracing::info!("Graceful stop requested. Saving checkpoint and exiting.");
+                            tracing::info!(
+                                "Graceful stop requested. Saving checkpoint and exiting."
+                            );
                         }
                         // Save the best checkpoint before exiting
                         if let Some(manager) = checkpoint_manager {
