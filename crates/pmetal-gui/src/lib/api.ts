@@ -242,6 +242,7 @@ export interface InferenceConfig {
   model: string;
   lora_path: string | null;
   prompt: string;
+  messages: InferenceMessage[] | null;
   system_message: string | null;
   temperature: number | null;
   top_k: number | null;
@@ -258,6 +259,11 @@ export interface InferenceConfig {
   no_thinking: boolean | null;
   /** Path to packed expert weights directory for SSD-offloaded MoE inference. */
   experts_dir: string | null;
+}
+
+export interface InferenceMessage {
+  role: 'user' | 'assistant';
+  content: string;
 }
 
 export interface HubSearchResult {

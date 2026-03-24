@@ -103,24 +103,6 @@
     return { thinking: null, reply: text };
   }
 
-  /**
-   * Build a formatted conversation prompt from the full message history.
-   * We send the accumulated conversation so the model has context.
-   */
-  function buildConversationPrompt(history: ChatMessage[], newUserMessage: string): string {
-    const lines: string[] = [];
-    for (const msg of history) {
-      if (msg.role === 'user') {
-        lines.push(`User: ${msg.content}`);
-      } else if (msg.role === 'assistant' && msg.content) {
-        lines.push(`Assistant: ${msg.content}`);
-      }
-    }
-    lines.push(`User: ${newUserMessage}`);
-    lines.push('Assistant:');
-    return lines.join('\n');
-  }
-
   async function handleSend() {
     if (!userInput.trim() || isGenerating) return;
     if (!selectedModel) { error = 'Please select a model first'; return; }
@@ -177,13 +159,13 @@
         isGenerating = false;
       });
 
-      // Build full conversation prompt for context
-      const conversationPrompt = buildConversationPrompt(historySnapshot, prompt);
-
       await startInference({
         model: selectedModel,
         lora_path: loraPath || null,
-        prompt: conversationPrompt,
+        prompt,
+        messages: historySnapshot
+          .filter((m) => m.role === 'user' || m.role === 'assistant')
+          .map((m) => ({ role: m.role, content: m.content })),
         system_message: systemMessage || null,
         temperature,
         top_k: topK,

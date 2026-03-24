@@ -366,11 +366,18 @@ pub struct GrpoConfig {
 ///
 /// All sampling fields are `Option` — `None` means "use model's
 /// `generation_config.json` default" (same behavior as CLI).
+#[derive(Debug, Deserialize, Clone)]
+pub struct InferenceMessage {
+    pub role: String,
+    pub content: String,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct InferenceConfig {
     pub model: String,
     pub lora_path: Option<String>,
     pub prompt: String,
+    pub messages: Option<Vec<InferenceMessage>>,
     pub system_message: Option<String>,
     pub temperature: Option<f32>,
     pub top_k: Option<u32>,
@@ -1563,6 +1570,17 @@ async fn run_inference_streaming(
         experts_dir: config.experts_dir.clone(),
         fp8: config.fp8.unwrap_or(false),
         prompt: config.prompt.clone(),
+        chat_messages: config.messages.as_ref().map(|messages| {
+            messages
+                .iter()
+                .map(|message| match message.role.as_str() {
+                    "assistant" => pmetal::data::chat_templates::Message::assistant(
+                        message.content.clone(),
+                    ),
+                    _ => pmetal::data::chat_templates::Message::user(message.content.clone()),
+                })
+                .collect()
+        }),
         system_message: config.system_message.clone(),
         chat: true, // GUI always uses chat mode
         no_thinking: config.no_thinking.unwrap_or(false),
