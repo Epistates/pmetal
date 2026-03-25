@@ -997,6 +997,13 @@ impl DynamicModel {
             _ => None,
         }
     }
+
+    /// Reset prefetch hit/miss statistics (if expert offloading is enabled).
+    pub fn reset_prefetch_stats(&self) {
+        if let Self::Qwen3Next(m) = self {
+            m.reset_prefetch_stats();
+        }
+    }
 }
 
 impl ModuleParameters for DynamicModel {

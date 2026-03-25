@@ -817,6 +817,7 @@ pub struct Qwen3NextGatedDeltaNet {
 
 impl Qwen3NextGatedDeltaNet {
     const COMBINED_INPUT_PROJ_MAX_HIDDEN: i32 = 2048;
+    const DECODE_FLATTEN_MAX_HIDDEN: i32 = 2048;
 
     pub fn new(config: &Qwen3NextConfig) -> Result<Self, Exception> {
         let hidden_size = config.hidden_size;
@@ -925,19 +926,68 @@ impl Qwen3NextGatedDeltaNet {
         let b = shape[0];
         let s = shape[1];
         let combined_weight = self.ensure_combined_input_proj_weight()?;
-        let projected = ops::matmul(inputs, &combined_weight.t())?;
+        let projected = if s == 1 {
+            let flat = inputs.reshape(&[b, self.hidden_size])?;
+            ops::matmul(&flat, &combined_weight.t())?
+        } else {
+            ops::matmul(inputs, &combined_weight.t())?
+        };
 
         let qkv_end = self.conv_dim;
         let z_end = qkv_end + self.value_dim;
         let b_end = z_end + self.num_v_heads;
 
-        let qkv = projected.index((.., .., ..qkv_end));
-        let z = projected
-            .index((.., .., qkv_end..z_end))
-            .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?;
-        let b_val = projected.index((.., .., z_end..b_end));
-        let a = projected.index((.., .., b_end..));
+        let qkv = if s == 1 {
+            projected.index((.., ..qkv_end)).reshape(&[b, s, self.conv_dim])?
+        } else {
+            projected.index((.., .., ..qkv_end))
+        };
+        let z = if s == 1 {
+            projected
+                .index((.., qkv_end..z_end))
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+        } else {
+            projected
+                .index((.., .., qkv_end..z_end))
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+        };
+        let b_val = if s == 1 {
+            projected.index((.., z_end..b_end)).reshape(&[b, s, self.num_v_heads])?
+        } else {
+            projected.index((.., .., z_end..b_end))
+        };
+        let a = if s == 1 {
+            projected
+                .index((.., b_end..))
+                .reshape(&[b, s, self.num_v_heads])?
+        } else {
+            projected.index((.., .., b_end..))
+        };
         Ok((qkv, z, b_val, a))
+    }
+
+    fn decode_linear_projection(
+        inputs: &Array,
+        weight: &Array,
+        output_dim: i32,
+    ) -> Result<Array, Exception> {
+        let batch = inputs.dim(0);
+        let hidden = inputs.dim(2);
+        let flat = inputs.reshape(&[batch, hidden])?;
+        let projected = ops::matmul(&flat, &weight.t())?;
+        projected.reshape(&[batch, 1, output_dim])
+    }
+
+    fn decode_out_projection(&self, out: &Array, batch: i32) -> Result<Array, Exception> {
+        let flat = out.reshape(&[batch, self.value_dim])?;
+        let projected = ops::matmul(&flat, &self.out_proj.weight.as_ref().t())?;
+        projected.reshape(&[batch, 1, self.hidden_size])
+    }
+
+    fn should_use_flattened_decode_proj(&self, inputs: &Array, mask: Option<&Array>) -> bool {
+        mask.is_none()
+            && inputs.dim(1) == 1
+            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
     }
 
     fn should_use_combined_input_proj(&self, inputs: &Array, mask: Option<&Array>) -> bool {
@@ -1065,7 +1115,14 @@ impl Qwen3NextGatedDeltaNet {
 
         // Apply gated norm and output projection
         let out = self.norm.forward(&out, Some(z))?;
-        self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])?)
+        if mask.is_none()
+            && seq_len == 1
+            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
+        {
+            self.decode_out_projection(&out, batch)
+        } else {
+            self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])?)
+        }
     }
 
     fn finish_forward_from_conv_out_profiled(
@@ -1128,7 +1185,14 @@ impl Qwen3NextGatedDeltaNet {
 
         let out_proj_start = Instant::now();
         let out = self.norm.forward(&out, Some(z))?;
-        let projected = self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])?)?;
+        let projected = if mask.is_none()
+            && seq_len == 1
+            && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN
+        {
+            self.decode_out_projection(&out, batch)?
+        } else {
+            self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])?)?
+        };
         projected.eval()?;
         layer_profile.push_section("gdn_out_proj", out_proj_start);
         Ok(projected)
@@ -1143,15 +1207,32 @@ impl Qwen3NextGatedDeltaNet {
         let shape = inputs.shape();
         let b = shape[0];
         let s = shape[1];
+        let decode_linear = self.should_use_flattened_decode_proj(inputs, mask);
 
         // 4 separate projections matching HF weight format (qwen3_5.py:136-139)
-        let qkv = self.in_proj_qkv.forward(inputs)?;
-        let z =
+        let qkv = if decode_linear {
+            Self::decode_linear_projection(inputs, self.in_proj_qkv.weight.as_ref(), self.conv_dim)?
+        } else {
+            self.in_proj_qkv.forward(inputs)?
+        };
+        let z = if decode_linear {
+            Self::decode_linear_projection(inputs, self.in_proj_z.weight.as_ref(), self.value_dim)?
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+        } else {
             self.in_proj_z
                 .forward(inputs)?
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?;
-        let b_val = self.in_proj_b.forward(inputs)?;
-        let a = self.in_proj_a.forward(inputs)?;
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+        };
+        let b_val = if decode_linear {
+            Self::decode_linear_projection(inputs, self.in_proj_b.weight.as_ref(), self.num_v_heads)?
+        } else {
+            self.in_proj_b.forward(inputs)?
+        };
+        let a = if decode_linear {
+            Self::decode_linear_projection(inputs, self.in_proj_a.weight.as_ref(), self.num_v_heads)?
+        } else {
+            self.in_proj_a.forward(inputs)?
+        };
         let qkv = if let Some(mask) = mask {
             let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1])?;
             ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))?
@@ -1200,27 +1281,44 @@ impl Qwen3NextGatedDeltaNet {
         let shape = inputs.shape();
         let b = shape[0];
         let s = shape[1];
+        let decode_linear = self.should_use_flattened_decode_proj(inputs, mask);
 
         let qkv_start = Instant::now();
-        let qkv = self.in_proj_qkv.forward(inputs)?;
+        let qkv = if decode_linear {
+            Self::decode_linear_projection(inputs, self.in_proj_qkv.weight.as_ref(), self.conv_dim)?
+        } else {
+            self.in_proj_qkv.forward(inputs)?
+        };
         qkv.eval()?;
         layer_profile.push_section("gdn_input_qkv", qkv_start);
 
         let z_start = Instant::now();
-        let z =
+        let z = if decode_linear {
+            Self::decode_linear_projection(inputs, self.in_proj_z.weight.as_ref(), self.value_dim)?
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+        } else {
             self.in_proj_z
                 .forward(inputs)?
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?;
+                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?
+        };
         z.eval()?;
         layer_profile.push_section("gdn_input_z", z_start);
 
         let b_start = Instant::now();
-        let b_val = self.in_proj_b.forward(inputs)?;
+        let b_val = if decode_linear {
+            Self::decode_linear_projection(inputs, self.in_proj_b.weight.as_ref(), self.num_v_heads)?
+        } else {
+            self.in_proj_b.forward(inputs)?
+        };
         b_val.eval()?;
         layer_profile.push_section("gdn_input_b", b_start);
 
         let a_start = Instant::now();
-        let a = self.in_proj_a.forward(inputs)?;
+        let a = if decode_linear {
+            Self::decode_linear_projection(inputs, self.in_proj_a.weight.as_ref(), self.num_v_heads)?
+        } else {
+            self.in_proj_a.forward(inputs)?
+        };
         a.eval()?;
         layer_profile.push_section("gdn_input_a", a_start);
 
@@ -1311,19 +1409,38 @@ pub struct Qwen3NextSparseMoeBlock {
     pub expert_out_bufs: Vec<pmetal_metal::buffer::MetalBuffer<f32>>,
     /// Reusable intermediate scratch buffer for expert forward.
     pub expert_intermediate: Option<pmetal_metal::buffer::MetalBuffer<f32>>,
+    /// Token window size used by prompt-time exact-routing expert reuse.
+    pub prefill_expert_window_tokens: usize,
+    /// Cached concatenated [gate; up; shared_gate] projection weights for the shared expert path.
+    pub shared_combined_in_proj_weight: Option<Array>,
+    /// Weight pointer signature used to invalidate the shared projection cache.
+    pub shared_combined_in_proj_signature: Option<Vec<usize>>,
 }
 
 impl Qwen3NextSparseMoeBlock {
-    const PREFILL_EXPERT_WINDOW_TOKENS: usize = 8;
+    const DEFAULT_PREFILL_EXPERT_WINDOW_TOKENS: usize = 8;
+    const PREFILL_EXPERT_WINDOW_TOKENS_ENV_VAR: &str = "PMETAL_PREFILL_EXPERT_WINDOW_TOKENS";
 
-    fn required_pool_buffers(top_k: usize) -> usize {
+    fn sanitize_prefill_expert_window_tokens(value: usize) -> usize {
+        value.clamp(1, 32)
+    }
+
+    fn configured_prefill_expert_window_tokens() -> usize {
+        std::env::var(Self::PREFILL_EXPERT_WINDOW_TOKENS_ENV_VAR)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .map(Self::sanitize_prefill_expert_window_tokens)
+            .unwrap_or(Self::DEFAULT_PREFILL_EXPERT_WINDOW_TOKENS)
+    }
+
+    fn required_pool_buffers(top_k: usize, prefill_window_tokens: usize) -> usize {
         top_k
-            .max(Self::PREFILL_EXPERT_WINDOW_TOKENS.saturating_mul(top_k))
+            .max(prefill_window_tokens.saturating_mul(top_k))
             .max(1)
     }
 
-    fn required_output_buffers(top_k: usize) -> usize {
-        Self::PREFILL_EXPERT_WINDOW_TOKENS
+    fn required_output_buffers(top_k: usize, prefill_window_tokens: usize) -> usize {
+        prefill_window_tokens
             .saturating_mul(top_k)
             .max(top_k)
             .max(1)
@@ -1365,6 +1482,7 @@ impl Qwen3NextSparseMoeBlock {
 
         let shared_expert = Qwen3NextMLP::new(dim, config.shared_expert_intermediate_size)?;
         let shared_expert_gate = nn::LinearBuilder::new(dim, 1).bias(false).build()?;
+        let prefill_expert_window_tokens = Self::configured_prefill_expert_window_tokens();
 
         Ok(Self {
             gate,
@@ -1384,7 +1502,67 @@ impl Qwen3NextSparseMoeBlock {
             fused_expert: None,
             expert_out_bufs: Vec::new(),
             expert_intermediate: None,
+            prefill_expert_window_tokens,
+            shared_combined_in_proj_weight: None,
+            shared_combined_in_proj_signature: None,
         })
+    }
+
+    fn current_shared_input_proj_signature(&self) -> Vec<usize> {
+        vec![
+            self.shared_expert.gate_proj.weight.as_ref().as_ptr().ctx as usize,
+            self.shared_expert.up_proj.weight.as_ref().as_ptr().ctx as usize,
+            self.shared_expert_gate.weight.as_ref().as_ptr().ctx as usize,
+        ]
+    }
+
+    fn ensure_shared_combined_input_proj_weight(&mut self) -> Result<Array, Exception> {
+        let signature = self.current_shared_input_proj_signature();
+        let needs_refresh = self.shared_combined_in_proj_weight.is_none()
+            || self.shared_combined_in_proj_signature.as_ref() != Some(&signature);
+
+        if needs_refresh {
+            let weights = [
+                self.shared_expert.gate_proj.weight.as_ref().clone(),
+                self.shared_expert.up_proj.weight.as_ref().clone(),
+                self.shared_expert_gate.weight.as_ref().clone(),
+            ];
+            let weight_refs: Vec<&Array> = weights.iter().collect();
+            let combined = ops::concatenate_axis(&weight_refs, 0)?;
+            combined.eval()?;
+            self.shared_combined_in_proj_weight = Some(combined);
+            self.shared_combined_in_proj_signature = Some(signature);
+        }
+
+        Ok(self.shared_combined_in_proj_weight.as_ref().unwrap().clone())
+    }
+
+    fn forward_shared_expert_and_gate(
+        &mut self,
+        x: &Array,
+    ) -> Result<(Array, Array), Exception> {
+        let shape = x.shape();
+        let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
+        let hidden = shape[shape.len() - 1];
+        let x_flat = if shape.len() == 2 {
+            x.clone()
+        } else {
+            x.reshape(&[batch_seq, hidden])?
+        };
+
+        let combined_weight = self.ensure_shared_combined_input_proj_weight()?;
+        let projected = ops::matmul(&x_flat, &combined_weight.t())?;
+        let intermediate = self.shared_expert.gate_proj.weight.as_ref().dim(0);
+
+        let gate = projected.index((.., ..intermediate));
+        let up = projected.index((.., intermediate..intermediate * 2));
+        let shared_gate_logit = projected
+            .index((.., intermediate * 2..))
+            .reshape(&[batch_seq, 1])?;
+        let hidden = nn::silu(&gate)?.multiply(&up)?;
+        let shared_y = ops::matmul(&hidden, &self.shared_expert.down_proj.weight.as_ref().t())?;
+
+        Ok((shared_y, shared_gate_logit))
     }
 
     /// Attach an offload context and record which layer this block lives in.
@@ -1398,7 +1576,8 @@ impl Qwen3NextSparseMoeBlock {
         if let Ok(metal_ctx) = pmetal_metal::context::MetalContext::global() {
             let expert_size = ctx.layout.expert_size;
             let decode_streams = self.top_k as usize;
-            let total_pool_buffers = Self::required_pool_buffers(decode_streams);
+            let total_pool_buffers =
+                Self::required_pool_buffers(decode_streams, self.prefill_expert_window_tokens);
             let k = total_pool_buffers.div_ceil(2);
 
             // Buffer pool: enough 2 MB-aligned buffers for both T=1 decode
@@ -1435,7 +1614,8 @@ impl Qwen3NextSparseMoeBlock {
             }
 
             // Reusable per-expert output buffers
-            let output_buffer_count = Self::required_output_buffers(decode_streams);
+            let output_buffer_count =
+                Self::required_output_buffers(decode_streams, self.prefill_expert_window_tokens);
             let mut out_bufs = Vec::with_capacity(output_buffer_count);
             for _ in 0..output_buffer_count {
                 if let Ok(buf) = pmetal_metal::buffer::MetalBuffer::<f32>::new(
@@ -1551,8 +1731,7 @@ impl Qwen3NextSparseMoeBlock {
         .reshape(&[batch_seq, k, hidden])?;
 
         // Shared expert forward + gate logit
-        let shared_y = self.shared_expert.forward(&x_flat)?;
-        let shared_gate_logit = self.shared_expert_gate.forward(&x_flat)?;
+        let (shared_y, shared_gate_logit) = self.forward_shared_expert_and_gate(&x_flat)?;
 
         // Combine: residual + weighted expert sum + sigmoid-gated shared expert
         // Pure MLX ops — all async on GPU, no synchronization barriers
@@ -1661,34 +1840,28 @@ impl Qwen3NextSparseMoeBlock {
             let metal_ctx = pmetal_metal::context::MetalContext::global()
                 .map_err(|e| Exception::custom(e.to_string()))?;
             let record = &ctx.layout.record;
+            let prefill_window_tokens = self.prefill_expert_window_tokens;
 
             let mut window_outputs = Vec::with_capacity(
-                batch_seq as usize / Self::PREFILL_EXPERT_WINDOW_TOKENS + 1,
+                batch_seq as usize / prefill_window_tokens + 1,
             );
 
-            for window_start in (0..batch_seq as usize).step_by(Self::PREFILL_EXPERT_WINDOW_TOKENS)
+            for window_start in (0..batch_seq as usize).step_by(prefill_window_tokens)
             {
                 let window_end =
-                    (window_start + Self::PREFILL_EXPERT_WINDOW_TOKENS).min(batch_seq as usize);
+                    (window_start + prefill_window_tokens).min(batch_seq as usize);
                 let window_len = (window_end - window_start) as i32;
                 let window_input = x_flat
                     .index((window_start as i32..window_end as i32, ..))
                     .reshape(&[window_len, hidden])?;
 
+                let route_start = Instant::now();
                 let (window_top_weights, window_expert_indices, k) =
                     self.route_experts(&window_input)?;
+                if let Some(profile) = layer_profile.as_deref_mut() {
+                    profile.push_section("moe_prefill_route", route_start);
+                }
                 let k_usize = k as usize;
-
-                let shared_y = self.shared_expert.forward(&window_input)?;
-                let shared_gate_logit = self.shared_expert_gate.forward(&window_input)?;
-                shared_y.eval()?;
-                shared_gate_logit.eval()?;
-                let fused_expert = self.fused_expert.as_ref().ok_or_else(|| {
-                    Exception::custom("forward_offloaded: fused_expert not initialized")
-                })?;
-                let intermediate = self.expert_intermediate.as_ref().ok_or_else(|| {
-                    Exception::custom("forward_offloaded: expert_intermediate not initialized")
-                })?;
 
                 let (unique_experts, unique_index_map) =
                     Self::ordered_unique_experts(&window_expert_indices);
@@ -1706,15 +1879,25 @@ impl Qwen3NextSparseMoeBlock {
                         .buffer_pool
                         .as_ref()
                         .is_some_and(|pool| pool.total_buffers() >= unique_experts.len());
+                let mut aligned_release_bufs: Option<
+                    Vec<pmetal_metal::expert_buffer::AlignedBuffer>,
+                > = None;
                 let mut window_down_tokens = Vec::with_capacity(window_len as usize);
 
-                if use_aligned {
+                let cmd_buf = if use_aligned {
+                    let fused_expert = self.fused_expert.as_ref().ok_or_else(|| {
+                        Exception::custom("forward_offloaded: fused_expert not initialized")
+                    })?;
+                    let intermediate = self.expert_intermediate.as_ref().ok_or_else(|| {
+                        Exception::custom("forward_offloaded: expert_intermediate not initialized")
+                    })?;
                     let pool = self.buffer_pool.as_ref().unwrap();
                     let mut unique_bufs: Vec<pmetal_metal::expert_buffer::AlignedBuffer> =
                         (0..unique_experts.len())
                             .map(|_| pool.acquire_blocking())
                             .collect();
 
+                    let io_start = Instant::now();
                     let aligned_load = if miss_plan.len() == unique_experts.len() {
                         ctx.read_experts_aligned(layer_idx, &unique_experts, &mut unique_bufs)
                             .map_err(|e| {
@@ -1747,7 +1930,11 @@ impl Qwen3NextSparseMoeBlock {
                         }
                         return Err(error);
                     }
+                    if let Some(profile) = layer_profile.as_deref_mut() {
+                        profile.push_section("moe_prefill_io", io_start);
+                    }
 
+                    let encode_submit_start = Instant::now();
                     let cmd_buf = fused_expert
                         .create_command_buffer()
                         .map_err(|e| Exception::custom(e.to_string()))?;
@@ -1793,27 +1980,21 @@ impl Qwen3NextSparseMoeBlock {
                     fused_expert
                         .submit(&cmd_buf)
                         .map_err(|e| Exception::custom(e.to_string()))?;
-                    fused_expert
-                        .wait_for_completion(&cmd_buf)
-                        .map_err(|e| Exception::custom(e.to_string()))?;
-
-                    for token_offset in 0..window_len as usize {
-                        let mut expert_arrays: Vec<Array> = Vec::with_capacity(k_usize);
-                        for slot in 0..k_usize {
-                            let output_slot = token_offset * k_usize + slot;
-                            let slice = self.expert_out_bufs[output_slot].as_slice();
-                            expert_arrays.push(Array::from_slice(slice, &[1, hidden]));
-                        }
-                        let down_out = ops::stack_axis(&expert_arrays, 1)?.reshape(&[k, hidden])?;
-                        window_down_tokens.push(down_out);
+                    if let Some(profile) = layer_profile.as_deref_mut() {
+                        profile.push_section("moe_prefill_expert_encode_submit", encode_submit_start);
                     }
-
-                    for buf in unique_bufs {
-                        pool.release(buf);
-                    }
+                    aligned_release_bufs = Some(unique_bufs);
+                    cmd_buf
                 } else {
+                    let fused_expert = self.fused_expert.as_ref().ok_or_else(|| {
+                        Exception::custom("forward_offloaded: fused_expert not initialized")
+                    })?;
+                    let intermediate = self.expert_intermediate.as_ref().ok_or_else(|| {
+                        Exception::custom("forward_offloaded: expert_intermediate not initialized")
+                    })?;
                     let miss_ids: Vec<usize> =
                         miss_plan.iter().map(|(_, expert_idx)| *expert_idx).collect();
+                    let io_start = Instant::now();
                     let miss_bufs = if !miss_ids.is_empty() {
                         ctx.read_experts(layer_idx, &miss_ids).map_err(|e| {
                             Exception::custom(format!("expert pread layer {layer_idx}: {e}"))
@@ -1831,7 +2012,11 @@ impl Qwen3NextSparseMoeBlock {
                             None => miss_iter.next().unwrap(),
                         });
                     }
+                    if let Some(profile) = layer_profile.as_deref_mut() {
+                        profile.push_section("moe_prefill_io", io_start);
+                    }
 
+                    let encode_submit_start = Instant::now();
                     let cmd_buf = fused_expert
                         .create_command_buffer()
                         .map_err(|e| Exception::custom(e.to_string()))?;
@@ -1874,22 +2059,55 @@ impl Qwen3NextSparseMoeBlock {
                     fused_expert
                         .submit(&cmd_buf)
                         .map_err(|e| Exception::custom(e.to_string()))?;
-                    fused_expert
-                        .wait_for_completion(&cmd_buf)
-                        .map_err(|e| Exception::custom(e.to_string()))?;
+                    if let Some(profile) = layer_profile.as_deref_mut() {
+                        profile.push_section("moe_prefill_expert_encode_submit", encode_submit_start);
+                    }
+                    cmd_buf
+                };
 
-                    for token_offset in 0..window_len as usize {
-                        let mut expert_arrays: Vec<Array> = Vec::with_capacity(k_usize);
-                        for slot in 0..k_usize {
-                            let output_slot = token_offset * k_usize + slot;
-                            let slice = self.expert_out_bufs[output_slot].as_slice();
-                            expert_arrays.push(Array::from_slice(slice, &[1, hidden]));
-                        }
-                        let down_out = ops::stack_axis(&expert_arrays, 1)?.reshape(&[k, hidden])?;
-                        window_down_tokens.push(down_out);
+                let shared_start = Instant::now();
+                let (shared_y, shared_gate_logit) =
+                    self.forward_shared_expert_and_gate(&window_input)?;
+                shared_y.eval()?;
+                shared_gate_logit.eval()?;
+                if let Some(profile) = layer_profile.as_deref_mut() {
+                    profile.push_section("moe_prefill_shared", shared_start);
+                }
+
+                let wait_start = Instant::now();
+                let fused_expert = self.fused_expert.as_ref().ok_or_else(|| {
+                    Exception::custom("forward_offloaded: fused_expert not initialized")
+                })?;
+                fused_expert
+                    .wait_for_completion(&cmd_buf)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                if let Some(profile) = layer_profile.as_deref_mut() {
+                    profile.push_section("moe_prefill_expert_wait", wait_start);
+                }
+
+                if let Some(unique_bufs) = aligned_release_bufs {
+                    let pool = self.buffer_pool.as_ref().unwrap();
+                    for buf in unique_bufs {
+                        pool.release(buf);
                     }
                 }
 
+                let output_wrap_start = Instant::now();
+                for token_offset in 0..window_len as usize {
+                    let mut expert_arrays: Vec<Array> = Vec::with_capacity(k_usize);
+                    for slot in 0..k_usize {
+                        let output_slot = token_offset * k_usize + slot;
+                        let slice = self.expert_out_bufs[output_slot].as_slice();
+                        expert_arrays.push(Array::from_slice(slice, &[1, hidden]));
+                    }
+                    let down_out = ops::stack_axis(&expert_arrays, 1)?.reshape(&[k, hidden])?;
+                    window_down_tokens.push(down_out);
+                }
+                if let Some(profile) = layer_profile.as_deref_mut() {
+                    profile.push_section("moe_prefill_output_wrap", output_wrap_start);
+                }
+
+                let combine_start = Instant::now();
                 let down_refs: Vec<&Array> = window_down_tokens.iter().collect();
                 let window_down_out =
                     ops::stack_axis(&down_refs, 0)?.reshape(&[window_len, k, hidden])?;
@@ -1903,6 +2121,9 @@ impl Qwen3NextSparseMoeBlock {
                     window_len,
                 )?
                 .reshape(&[window_len, hidden])?;
+                if let Some(profile) = layer_profile.as_deref_mut() {
+                    profile.push_section("moe_prefill_combine", combine_start);
+                }
                 window_outputs.push(window_output);
             }
             let window_refs: Vec<&Array> = window_outputs.iter().collect();
@@ -1951,13 +2172,6 @@ impl Qwen3NextSparseMoeBlock {
             let prefetch_hits = prefetched.iter().filter(|b| b.is_some()).count();
 
             // ---- Dispatch: zero-copy aligned path or legacy copy path ----
-            let fused_expert = self.fused_expert.as_ref().ok_or_else(|| {
-                Exception::custom("forward_offloaded: fused_expert not initialized")
-            })?;
-            let intermediate = self.expert_intermediate.as_ref().ok_or_else(|| {
-                Exception::custom("forward_offloaded: expert_intermediate not initialized")
-            })?;
-
             let metal_ctx = pmetal_metal::context::MetalContext::global()
                 .map_err(|e| Exception::custom(e.to_string()))?;
             let record = &ctx.layout.record;
@@ -1974,6 +2188,12 @@ impl Qwen3NextSparseMoeBlock {
             let mut aligned_release_bufs: Option<Vec<pmetal_metal::expert_buffer::AlignedBuffer>> =
                 None;
             let cmd_buf = if use_aligned {
+                let fused_expert = self.fused_expert.as_ref().ok_or_else(|| {
+                    Exception::custom("forward_offloaded: fused_expert not initialized")
+                })?;
+                let intermediate = self.expert_intermediate.as_ref().ok_or_else(|| {
+                    Exception::custom("forward_offloaded: expert_intermediate not initialized")
+                })?;
                 // ---- ALIGNED FAST PATH ----
                 // Prefetched hits are copied into aligned Metal-shared buffers,
                 // and misses are read directly into aligned buffers. This keeps
@@ -2080,6 +2300,12 @@ impl Qwen3NextSparseMoeBlock {
                 aligned_release_bufs = Some(aligned_bufs);
                 cmd_buf
             } else {
+                let fused_expert = self.fused_expert.as_ref().ok_or_else(|| {
+                    Exception::custom("forward_offloaded: fused_expert not initialized")
+                })?;
+                let intermediate = self.expert_intermediate.as_ref().ok_or_else(|| {
+                    Exception::custom("forward_offloaded: expert_intermediate not initialized")
+                })?;
                 // ---- LEGACY COPY PATH ----
                 // Used when the aligned buffer pool is unavailable.
                 let cmd_buf = fused_expert
@@ -2142,8 +2368,7 @@ impl Qwen3NextSparseMoeBlock {
                 cmd_buf
             };
             let shared_start = Instant::now();
-            let shared_y = self.shared_expert.forward(&x_flat)?;
-            let shared_gate_logit = self.shared_expert_gate.forward(&x_flat)?;
+            let (shared_y, shared_gate_logit) = self.forward_shared_expert_and_gate(&x_flat)?;
             shared_y.eval()?;
             shared_gate_logit.eval()?;
             if let Some(profile) = layer_profile.as_deref_mut() {
@@ -2151,6 +2376,9 @@ impl Qwen3NextSparseMoeBlock {
             }
 
             let wait_start = Instant::now();
+            let fused_expert = self.fused_expert.as_ref().ok_or_else(|| {
+                Exception::custom("forward_offloaded: fused_expert not initialized")
+            })?;
             fused_expert
                 .wait_for_completion(&cmd_buf)
                 .map_err(|e| Exception::custom(e.to_string()))?;
@@ -2590,7 +2818,11 @@ impl Qwen3NextModel {
             }
         }
 
-        self.norm.forward(&hidden)
+        let hidden = self.norm.forward(&hidden)?;
+        if prefill_like && let Some(prefetcher) = &self.prefetcher {
+            prefetcher.reset_pending();
+        }
+        Ok(hidden)
     }
 
     pub fn forward_with_cache_profiled(
@@ -2655,6 +2887,9 @@ impl Qwen3NextModel {
         let hidden = self.norm.forward(&hidden)?;
         hidden.eval()?;
         profile.final_norm_us = final_norm_start.elapsed().as_micros() as u64;
+        if prefill_like && let Some(prefetcher) = &self.prefetcher {
+            prefetcher.reset_pending();
+        }
         profile.total_us = model_start.elapsed().as_micros() as u64;
         Ok((hidden, profile))
     }
@@ -2838,6 +3073,13 @@ impl Qwen3NextForCausalLM {
     /// Get prefetch hit/miss statistics (if offloading is enabled).
     pub fn prefetch_stats(&self) -> Option<crate::expert_prefetch::PrefetchStats> {
         self.model.prefetcher.as_ref().map(|p| p.stats())
+    }
+
+    /// Reset prefetch hit/miss statistics.
+    pub fn reset_prefetch_stats(&self) {
+        if let Some(prefetcher) = self.model.prefetcher.as_ref() {
+            prefetcher.reset_stats();
+        }
     }
 }
 
@@ -3195,16 +3437,25 @@ mod tests {
 
     #[test]
     fn test_sparse_moe_required_pool_buffers_covers_prefill_window() {
-        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(0), 1);
-        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(4), 32);
-        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(8), 64);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(0, 8), 1);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(4, 8), 32);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(8, 8), 64);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_pool_buffers(4, 16), 64);
     }
 
     #[test]
     fn test_sparse_moe_required_output_buffers_covers_prefill_window() {
-        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(0), 1);
-        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(4), 32);
-        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(8), 64);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(0, 8), 1);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(4, 8), 32);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(8, 8), 64);
+        assert_eq!(Qwen3NextSparseMoeBlock::required_output_buffers(4, 16), 64);
+    }
+
+    #[test]
+    fn test_prefill_expert_window_tokens_is_sanitized() {
+        assert_eq!(Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(0), 1);
+        assert_eq!(Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(8), 8);
+        assert_eq!(Qwen3NextSparseMoeBlock::sanitize_prefill_expert_window_tokens(64), 32);
     }
 
     #[test]
@@ -3329,6 +3580,221 @@ mod tests {
         large_config.hidden_size = 4096;
         let large_gdn = Qwen3NextGatedDeltaNet::new(&large_config).unwrap();
         assert!(!large_gdn.should_use_combined_input_proj(&decode, None));
+    }
+
+    #[test]
+    fn test_sparse_moe_shared_forward_matches_separate_paths() {
+        let config = tiny_config();
+        let mut moe = Qwen3NextSparseMoeBlock::new(&config).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[5, config.hidden_size], None, None, None).unwrap();
+
+        let shared_ref = moe.shared_expert.forward(&x).unwrap();
+        let gate_ref = moe.shared_expert_gate.forward(&x).unwrap();
+        let (shared_y, shared_gate_logit) = moe.forward_shared_expert_and_gate(&x).unwrap();
+
+        shared_ref.eval().unwrap();
+        gate_ref.eval().unwrap();
+        shared_y.eval().unwrap();
+        shared_gate_logit.eval().unwrap();
+
+        let max_shared_diff = shared_y
+            .subtract(&shared_ref)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        let max_gate_diff = shared_gate_logit
+            .subtract(&gate_ref)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+
+        assert!(
+            max_shared_diff < 1e-5,
+            "combined shared expert diverged: {max_shared_diff}"
+        );
+        assert!(
+            max_gate_diff < 1e-5,
+            "combined shared gate diverged: {max_gate_diff}"
+        );
+    }
+
+    #[test]
+    fn test_sparse_moe_shared_combined_projection_refreshes_after_weight_replacement() {
+        let config = tiny_config();
+        let mut moe = Qwen3NextSparseMoeBlock::new(&config).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[3, config.hidden_size], None, None, None).unwrap();
+
+        let _ = moe.forward_shared_expert_and_gate(&x).unwrap();
+        let initial_signature = moe.shared_combined_in_proj_signature.clone().unwrap();
+
+        let replacement = Array::ones::<f32>(&[1, config.hidden_size]).unwrap();
+        moe.shared_expert_gate.weight = Param::new(replacement);
+
+        let gate_ref = moe.shared_expert_gate.forward(&x).unwrap();
+        let (_, shared_gate_logit) = moe.forward_shared_expert_and_gate(&x).unwrap();
+
+        gate_ref.eval().unwrap();
+        shared_gate_logit.eval().unwrap();
+
+        let max_gate_diff = shared_gate_logit
+            .subtract(&gate_ref)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+
+        assert!(
+            max_gate_diff < 1e-5,
+            "refreshed shared gate diverged: {max_gate_diff}"
+        );
+        assert_ne!(
+            moe.shared_combined_in_proj_signature.as_ref().unwrap(),
+            &initial_signature
+        );
+    }
+
+    #[test]
+    fn test_gdn_decode_linear_projection_matches_linear_forward() {
+        let mut config = tiny_config();
+        config.hidden_size = 4096;
+        let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
+        let x = mlx_rs::random::normal::<f32>(&[1, 1, 4096], None, None, None).unwrap();
+
+        let qkv_ref = gdn.in_proj_qkv.forward(&x).unwrap();
+        let z_ref = gdn.in_proj_z.forward(&x).unwrap();
+        let b_ref = gdn.in_proj_b.forward(&x).unwrap();
+        let a_ref = gdn.in_proj_a.forward(&x).unwrap();
+
+        let qkv = Qwen3NextGatedDeltaNet::decode_linear_projection(
+            &x,
+            gdn.in_proj_qkv.weight.as_ref(),
+            gdn.conv_dim,
+        )
+        .unwrap();
+        let z = Qwen3NextGatedDeltaNet::decode_linear_projection(
+            &x,
+            gdn.in_proj_z.weight.as_ref(),
+            gdn.value_dim,
+        )
+        .unwrap();
+        let b_val = Qwen3NextGatedDeltaNet::decode_linear_projection(
+            &x,
+            gdn.in_proj_b.weight.as_ref(),
+            gdn.num_v_heads,
+        )
+        .unwrap();
+        let a = Qwen3NextGatedDeltaNet::decode_linear_projection(
+            &x,
+            gdn.in_proj_a.weight.as_ref(),
+            gdn.num_v_heads,
+        )
+        .unwrap();
+
+        qkv.eval().unwrap();
+        z.eval().unwrap();
+        b_val.eval().unwrap();
+        a.eval().unwrap();
+        qkv_ref.eval().unwrap();
+        z_ref.eval().unwrap();
+        b_ref.eval().unwrap();
+        a_ref.eval().unwrap();
+
+        assert!(
+            qkv.subtract(&qkv_ref)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>()
+                < 1e-5
+        );
+        assert!(
+            z.subtract(&z_ref)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>()
+                < 1e-5
+        );
+        assert!(
+            b_val
+                .subtract(&b_ref)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>()
+                < 1e-5
+        );
+        assert!(
+            a.subtract(&a_ref)
+                .unwrap()
+                .abs()
+                .unwrap()
+                .max(None)
+                .unwrap()
+                .item::<f32>()
+                < 1e-5
+        );
+    }
+
+    #[test]
+    fn test_gdn_decode_flatten_fastpath_is_gated_by_hidden_size_and_decode_shape() {
+        let mut small_config = tiny_config();
+        small_config.hidden_size = 2048;
+        let small_gdn = Qwen3NextGatedDeltaNet::new(&small_config).unwrap();
+        let decode = mlx_rs::random::normal::<f32>(&[1, 1, 2048], None, None, None).unwrap();
+        let prefill = mlx_rs::random::normal::<f32>(&[1, 2, 2048], None, None, None).unwrap();
+        assert!(small_gdn.should_use_flattened_decode_proj(&decode, None));
+        assert!(!small_gdn.should_use_flattened_decode_proj(&prefill, None));
+
+        let mut large_config = tiny_config();
+        large_config.hidden_size = 4096;
+        let large_gdn = Qwen3NextGatedDeltaNet::new(&large_config).unwrap();
+        let large_decode = mlx_rs::random::normal::<f32>(&[1, 1, 4096], None, None, None).unwrap();
+        assert!(!large_gdn.should_use_flattened_decode_proj(&large_decode, None));
+    }
+
+    #[test]
+    fn test_gdn_decode_out_projection_matches_linear_forward() {
+        let config = tiny_config();
+        let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
+        let out = mlx_rs::random::normal::<f32>(
+            &[1, 1, gdn.num_v_heads, gdn.head_v_dim],
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let reference = gdn
+            .out_proj
+            .forward(&out.reshape(&[1, 1, gdn.value_dim]).unwrap())
+            .unwrap();
+        let projected = gdn.decode_out_projection(&out, 1).unwrap();
+
+        reference.eval().unwrap();
+        projected.eval().unwrap();
+        let max_diff = reference
+            .subtract(&projected)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .max(None)
+            .unwrap()
+            .item::<f32>();
+        assert!(max_diff < 1e-5, "decode out projection diverged: {max_diff}");
     }
 
     #[test]
