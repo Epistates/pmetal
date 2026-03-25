@@ -78,7 +78,13 @@ pmetal infer \
 
 `--profile-layers` is currently implemented for standard `Qwen 3.5 / qwen3_next` inference. It runs one real prefill pass and one real cached decode pass using the shared inference runner, forcing MLX evaluation at each measured section so the report reflects actual wall time instead of only op scheduling overhead.
 
-Use `--profile-output <PATH>` to capture the full JSON report. The CLI summary prints the slowest layers and their main sections, which is useful for deciding whether the next decode optimization should target GDN input projection, GDN recurrence, full-attention preparation, or the LM head.
+Use `--profile-output <PATH>` to capture the full JSON report. The CLI summary now prints:
+- total layer time vs non-layer overhead
+- aggregated time by layer kind (`linear_attention` vs `full_attention`)
+- top section buckets within each kind
+- the slowest individual layers and their main sections
+
+That makes long-prompt hybrid profiles much easier to read when you are deciding whether the next prompt-heavy optimization should target GDN prefill, full-attention preparation/SDPA, sparse MoE combine, or decode-only paths.
 
 ## Chat Mode
 

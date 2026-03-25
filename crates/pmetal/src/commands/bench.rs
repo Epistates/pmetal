@@ -19,6 +19,7 @@ use pmetal_metal::{
     FusedNormLora, FusedNormLoraConfig, FusedSwiGLUConfig, MetalBuffer, MetalContext,
     build_merge_config, build_tensor_info,
 };
+use pmetal_mlx::kernels::gated_delta_update_with_chunk_size_override;
 use pmetal_mlx::kv_cache::CacheMode;
 use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE};
 use pmetal_models::architectures::jamba::{JambaConfig, JambaLayer};
@@ -157,6 +158,8 @@ struct WorkloadBenchmarkConfig {
     max_prompt_tokens: usize,
     inference_prompt_len: WorkloadPromptLenSelection,
     decode_steps: usize,
+    inference_warmup_passes: usize,
+    inference_session_repeats: usize,
     inference_repeats: usize,
     train_samples: usize,
     train_steps: usize,
@@ -175,8 +178,10 @@ enum WorkloadBenchmarkSection<T> {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct InferenceWorkloadMetrics {
+    session_runs: usize,
     prompt_samples: usize,
     measurement_passes: usize,
+    warmup_passes: usize,
     prompt_tokens: usize,
     max_prompt_tokens: usize,
     decode_steps: usize,
@@ -196,6 +201,15 @@ struct InferenceWorkloadMetrics {
     median_decode_tok_per_sec: f64,
     mean_decode_ms_per_token: f64,
     median_decode_ms_per_token: f64,
+    mean_session_prefill_tok_per_sec: f64,
+    median_session_prefill_tok_per_sec: f64,
+    mean_session_decode_tok_per_sec: f64,
+    median_session_decode_tok_per_sec: f64,
+    mean_session_decode_ms_per_token: f64,
+    median_session_decode_ms_per_token: f64,
+    session_prefill_tok_per_sec: Vec<f64>,
+    session_decode_tok_per_sec: Vec<f64>,
+    session_decode_ms_per_token: Vec<f64>,
     prefetch_hits: Option<usize>,
     prefetch_misses: Option<usize>,
     prefetch_total: Option<usize>,
@@ -396,9 +410,27 @@ struct GdnLinearProjectionBenchmarkSetup {
     reference_output_data: Vec<f32>,
 }
 
+struct GdnPrefillBenchmarkSetup {
+    model_path: PathBuf,
+    layer_idx: usize,
+    batch_size: usize,
+    seq_len: usize,
+    input_dim: usize,
+    output_dim: usize,
+    q: Array,
+    k: Array,
+    v: Array,
+    a: Array,
+    b: Array,
+    a_log: Array,
+    dt_bias: Array,
+    reference_output_data: Vec<f32>,
+}
+
 enum GdnBenchmarkSetup {
     InputProj(GdnInputProjectionBenchmarkSetup),
     OutProj(GdnLinearProjectionBenchmarkSetup),
+    Prefill(GdnPrefillBenchmarkSetup),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1098,13 +1130,69 @@ pub(crate) async fn run_gdn_decode_benchmark(
                 ],
             }
         }
+        GdnBenchmarkSetup::Prefill(setup) => GdnDecodeBenchmarkReport {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            generated_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis(),
+            device,
+            stage: "prefill".to_string(),
+            model_id: model_id.to_string(),
+            resolved_model_path: setup.model_path.display().to_string(),
+            layer_idx: setup.layer_idx,
+            batch_size,
+            seq_len,
+            input_dim: setup.input_dim,
+            output_dim: setup.output_dim,
+            warmup_iterations,
+            benchmark_iterations,
+            reference_backend: "mlx_sequential".to_string(),
+            backends: vec![
+                run_gdn_prefill_backend(
+                    &setup,
+                    "mlx_sequential",
+                    Some(0),
+                    warmup_iterations,
+                    benchmark_iterations,
+                )?,
+                run_gdn_prefill_backend(
+                    &setup,
+                    "mlx_chunk_32",
+                    Some(32),
+                    warmup_iterations,
+                    benchmark_iterations,
+                )?,
+                run_gdn_prefill_backend(
+                    &setup,
+                    "mlx_chunk_64",
+                    Some(64),
+                    warmup_iterations,
+                    benchmark_iterations,
+                )?,
+                run_gdn_prefill_backend(
+                    &setup,
+                    "mlx_chunk_128",
+                    Some(128),
+                    warmup_iterations,
+                    benchmark_iterations,
+                )?,
+                run_gdn_prefill_backend(
+                    &setup,
+                    "mlx_chunk_256",
+                    Some(256),
+                    warmup_iterations,
+                    benchmark_iterations,
+                )?,
+            ],
+        },
     };
 
     let report_json = serde_json::to_string_pretty(&report)?;
     if let Some(output_path) = output {
         std::fs::write(output_path, &report_json).with_context(|| {
             format!(
-                "failed to write GDN decode benchmark to {}",
+                "failed to write GDN benchmark to {}",
                 output_path.display()
             )
         })?;
@@ -1119,6 +1207,73 @@ pub(crate) async fn run_gdn_decode_benchmark(
     Ok(())
 }
 
+fn run_gdn_prefill_backend(
+    setup: &GdnPrefillBenchmarkSetup,
+    name: &str,
+    chunk_size_override: Option<i32>,
+    warmup_iterations: usize,
+    benchmark_iterations: usize,
+) -> anyhow::Result<GdnDecodeBackendResult> {
+    if let Some(chunk_size) = chunk_size_override
+        && chunk_size > 0
+        && setup.seq_len <= chunk_size as usize
+    {
+        return Ok(GdnDecodeBackendResult {
+            name: name.to_string(),
+            max_abs_diff_vs_reference: None,
+            outcome: KernelBenchmarkOutcome::Skipped {
+                reason: format!(
+                    "seq_len={} does not exceed forced chunk size {}; chunk path would not engage",
+                    setup.seq_len, chunk_size
+                ),
+            },
+        });
+    }
+
+    let outcome = benchmark_operation(warmup_iterations, benchmark_iterations, || {
+        let (y, state): (Array, Array) = gated_delta_update_with_chunk_size_override(
+            &setup.q,
+            &setup.k,
+            &setup.v,
+            &setup.a,
+            &setup.b,
+            &setup.a_log,
+            &setup.dt_bias,
+            None,
+            None,
+            false,
+            chunk_size_override,
+        )?;
+        y.eval()?;
+        state.eval()?;
+        Ok(())
+    })?;
+
+    let (output, _): (Array, Array) = gated_delta_update_with_chunk_size_override(
+        &setup.q,
+        &setup.k,
+        &setup.v,
+        &setup.a,
+        &setup.b,
+        &setup.a_log,
+        &setup.dt_bias,
+        None,
+        None,
+        false,
+        chunk_size_override,
+    )?;
+    output.eval()?;
+
+    Ok(GdnDecodeBackendResult {
+        name: name.to_string(),
+        max_abs_diff_vs_reference: Some(max_abs_diff(
+            &setup.reference_output_data,
+            output.as_slice::<f32>(),
+        )),
+        outcome,
+    })
+}
+
 pub(crate) async fn run_workload_benchmark(
     model_id: &str,
     dataset_id: &str,
@@ -1127,6 +1282,8 @@ pub(crate) async fn run_workload_benchmark(
     max_prompt_tokens: usize,
     inference_context: WorkloadInferenceContext,
     decode_steps: usize,
+    inference_warmup_passes: usize,
+    inference_session_repeats: usize,
     inference_repeats: usize,
     train_samples: usize,
     train_steps: usize,
@@ -1144,6 +1301,8 @@ pub(crate) async fn run_workload_benchmark(
         max_prompt_tokens,
         inference_context,
         decode_steps,
+        inference_warmup_passes,
+        inference_session_repeats,
         inference_repeats,
         train_samples,
         train_steps,
@@ -1157,6 +1316,8 @@ pub(crate) async fn run_workload_benchmark(
 
 pub(crate) async fn run_workload_benchmark_preset(
     preset: WorkloadBenchmarkPreset,
+    inference_warmup_passes: usize,
+    inference_session_repeats: usize,
     experts_dir: Option<&str>,
     output: Option<&Path>,
     json: bool,
@@ -1171,6 +1332,8 @@ pub(crate) async fn run_workload_benchmark_preset(
         config.max_prompt_tokens,
         config.inference_context,
         config.decode_steps,
+        inference_warmup_passes,
+        inference_session_repeats,
         config.inference_repeats,
         config.train_samples,
         config.train_steps,
@@ -1191,6 +1354,8 @@ async fn run_workload_benchmark_internal(
     max_prompt_tokens: usize,
     inference_context: WorkloadInferenceContext,
     decode_steps: usize,
+    inference_warmup_passes: usize,
+    inference_session_repeats: usize,
     inference_repeats: usize,
     train_samples: usize,
     train_steps: usize,
@@ -1241,6 +1406,8 @@ async fn run_workload_benchmark_internal(
             })
             .unwrap_or(ResolvedWorkloadInferenceContext::Prompt),
         decode_steps,
+        inference_warmup_passes,
+        inference_session_repeats,
         inference_repeats,
     );
     let training = benchmark_real_training(
@@ -1303,6 +1470,8 @@ async fn run_workload_benchmark_internal(
             max_prompt_tokens: inference_prompt_len.effective_max_prompt_tokens,
             inference_prompt_len,
             decode_steps,
+            inference_warmup_passes,
+            inference_session_repeats,
             inference_repeats,
             train_samples,
             train_steps,
@@ -1368,7 +1537,7 @@ fn build_gdn_decode_benchmark_setup(
     )?;
     let DynamicModel::Qwen3Next(model) = model else {
         anyhow::bail!(
-            "GDN decode benchmark only supports qwen3_next / qwen3_5 model families"
+            "GDN benchmark only supports qwen3_next / qwen3_5 model families"
         );
     };
 
@@ -1484,6 +1653,97 @@ fn build_gdn_decode_benchmark_setup(
                 weight,
                 weight_t,
                 weight_data,
+                reference_output_data: reference_output.as_slice::<f32>().to_vec(),
+            }))
+        }
+        GdnBenchmarkStage::Prefill => {
+            let input_dim = gdn.key_dim as usize;
+            let output_dim = gdn.value_dim as usize;
+            let q_data: Vec<f32> =
+                (0..batch_size * seq_len * gdn.num_k_heads as usize * gdn.head_k_dim as usize)
+                    .map(deterministic_value)
+                    .collect();
+            let k_data: Vec<f32> =
+                (0..batch_size * seq_len * gdn.num_k_heads as usize * gdn.head_k_dim as usize)
+                    .map(|i| deterministic_value(i + 17))
+                    .collect();
+            let v_data: Vec<f32> =
+                (0..batch_size * seq_len * gdn.num_v_heads as usize * gdn.head_v_dim as usize)
+                    .map(|i| deterministic_value(i + 29))
+                    .collect();
+            let a_data: Vec<f32> = (0..batch_size * seq_len * gdn.num_v_heads as usize)
+                .map(|i| deterministic_value(i + 43))
+                .collect();
+            let b_data: Vec<f32> = (0..batch_size * seq_len * gdn.num_v_heads as usize)
+                .map(|i| deterministic_value(i + 61))
+                .collect();
+
+            let q_raw: Array = Array::from_slice(
+                &q_data,
+                &[
+                    batch_size as i32,
+                    seq_len as i32,
+                    gdn.num_k_heads,
+                    gdn.head_k_dim,
+                ],
+            );
+            let k_raw: Array = Array::from_slice(
+                &k_data,
+                &[
+                    batch_size as i32,
+                    seq_len as i32,
+                    gdn.num_k_heads,
+                    gdn.head_k_dim,
+                ],
+            );
+            let v: Array = Array::from_slice(
+                &v_data,
+                &[
+                    batch_size as i32,
+                    seq_len as i32,
+                    gdn.num_v_heads,
+                    gdn.head_v_dim,
+                ],
+            );
+            let a: Array = Array::from_slice(
+                &a_data,
+                &[batch_size as i32, seq_len as i32, gdn.num_v_heads],
+            );
+            let b: Array = Array::from_slice(
+                &b_data,
+                &[batch_size as i32, seq_len as i32, gdn.num_v_heads],
+            );
+            let q = l2norm_last_dim(&q_raw, 1e-6)?
+                .multiply(&Array::from_f32((gdn.head_k_dim as f32).sqrt().recip()))?;
+            let k = l2norm_last_dim(&k_raw, 1e-6)?;
+            let a_log = gdn.a_log.as_ref().as_type::<f32>()?;
+            let dt_bias = gdn.dt_bias.as_ref().as_type::<f32>()?;
+            q.eval()?;
+            k.eval()?;
+            v.eval()?;
+            a.eval()?;
+            b.eval()?;
+            a_log.eval()?;
+            dt_bias.eval()?;
+            let (reference_output, _): (Array, Array) = gated_delta_update_with_chunk_size_override(
+                &q, &k, &v, &a, &b, &a_log, &dt_bias, None, None, false, Some(0),
+            )?;
+            reference_output.eval()?;
+
+            Ok(GdnBenchmarkSetup::Prefill(GdnPrefillBenchmarkSetup {
+                model_path: model_path.to_path_buf(),
+                layer_idx,
+                batch_size,
+                seq_len,
+                input_dim,
+                output_dim,
+                q,
+                k,
+                v,
+                a,
+                b,
+                a_log,
+                dt_bias,
                 reference_output_data: reference_output.as_slice::<f32>().to_vec(),
             }))
         }
@@ -1671,6 +1931,15 @@ fn mlx_qkv_z_combined_split_projection_rhs_transposed(
     let b_val = mlx_linear_projection_rhs_transposed(input, b_weight_t)?;
     let a = mlx_linear_projection_rhs_transposed(input, a_weight_t)?;
     Ok((qkv, z, b_val, a))
+}
+
+fn l2norm_last_dim(x: &Array, eps: f32) -> anyhow::Result<Array> {
+    let norm = x
+        .square()?
+        .sum_axis(-1, true)?
+        .add(&Array::from_f32(eps))?
+        .sqrt()?;
+    Ok(x.divide(&norm)?)
 }
 
 fn accelerate_combined_projection(
@@ -1866,6 +2135,28 @@ fn benchmark_inference_text(
     }
 }
 
+struct InferenceSessionMetrics {
+    prompt_samples: usize,
+    measurement_passes: usize,
+    warmup_passes: usize,
+    prompt_tokens: usize,
+    max_prompt_tokens: usize,
+    decode_steps: usize,
+    inference_repeats: usize,
+    cache_mode: String,
+    cache_mode_source: String,
+    first_generated_token_id: Option<u32>,
+    first_generated_token_text: Option<String>,
+    total_prefill_ms: f64,
+    total_decode_ms: f64,
+    prefill_tok_sec_samples: Vec<f64>,
+    decode_tok_sec_samples: Vec<f64>,
+    decode_ms_per_token_samples: Vec<f64>,
+    prefetch_hits: Option<usize>,
+    prefetch_misses: Option<usize>,
+    prefetch_total: Option<usize>,
+}
+
 fn benchmark_real_inference(
     model_path: &Path,
     experts_dir: Option<&str>,
@@ -1873,6 +2164,8 @@ fn benchmark_real_inference(
     max_prompt_tokens: usize,
     inference_context: ResolvedWorkloadInferenceContext,
     decode_steps: usize,
+    inference_warmup_passes: usize,
+    inference_session_repeats: usize,
     inference_repeats: usize,
 ) -> anyhow::Result<WorkloadBenchmarkSection<InferenceWorkloadMetrics>> {
     if samples.is_empty() {
@@ -1881,6 +2174,176 @@ fn benchmark_real_inference(
         });
     }
 
+    let session_runs = inference_session_repeats.max(1);
+    let mut sessions = Vec::with_capacity(session_runs);
+    for _ in 0..session_runs {
+        sessions.push(benchmark_real_inference_session(
+            model_path,
+            experts_dir,
+            samples,
+            max_prompt_tokens,
+            inference_context,
+            decode_steps,
+            inference_warmup_passes,
+            inference_repeats,
+        )?);
+    }
+
+    let prompt_samples = sessions[0].prompt_samples;
+    let max_prompt_tokens = sessions[0].max_prompt_tokens;
+    let decode_steps = sessions[0].decode_steps;
+    let inference_repeats = sessions[0].inference_repeats;
+    let cache_mode = sessions[0].cache_mode.clone();
+    let cache_mode_source = sessions[0].cache_mode_source.clone();
+    let first_generated_token_id = sessions[0].first_generated_token_id;
+    let first_generated_token_text = sessions[0].first_generated_token_text.clone();
+
+    let mut total_prompt_tokens = 0usize;
+    let mut measurement_passes = 0usize;
+    let mut warmup_passes = 0usize;
+    let mut total_prefill_ms = 0.0;
+    let mut total_decode_ms = 0.0;
+    let mut prefill_tok_sec_samples = Vec::new();
+    let mut decode_tok_sec_samples = Vec::new();
+    let mut decode_ms_per_token_samples = Vec::new();
+    let mut session_prefill_tok_per_sec = Vec::with_capacity(session_runs);
+    let mut session_decode_tok_per_sec = Vec::with_capacity(session_runs);
+    let mut session_decode_ms_per_token = Vec::with_capacity(session_runs);
+    let mut prefetch_hits = 0usize;
+    let mut prefetch_misses = 0usize;
+    let mut prefetch_total = 0usize;
+    let mut saw_prefetch_stats = true;
+
+    for session in sessions {
+        total_prompt_tokens += session.prompt_tokens;
+        measurement_passes += session.measurement_passes;
+        warmup_passes += session.warmup_passes;
+        total_prefill_ms += session.total_prefill_ms;
+        total_decode_ms += session.total_decode_ms;
+        prefill_tok_sec_samples.extend(session.prefill_tok_sec_samples.iter().copied());
+        decode_tok_sec_samples.extend(session.decode_tok_sec_samples.iter().copied());
+        decode_ms_per_token_samples.extend(session.decode_ms_per_token_samples.iter().copied());
+
+        let session_decode_tokens = session.measurement_passes * session.decode_steps;
+        let session_prefill_rate = if session.total_prefill_ms > 0.0 {
+            session.prompt_tokens as f64 / (session.total_prefill_ms / 1000.0)
+        } else {
+            0.0
+        };
+        let session_decode_rate = if session_decode_tokens > 0 && session.total_decode_ms > 0.0 {
+            session_decode_tokens as f64 / (session.total_decode_ms / 1000.0)
+        } else {
+            0.0
+        };
+        let session_decode_ms = if session_decode_tokens > 0 {
+            session.total_decode_ms / session_decode_tokens as f64
+        } else {
+            0.0
+        };
+        session_prefill_tok_per_sec.push(session_prefill_rate);
+        session_decode_tok_per_sec.push(session_decode_rate);
+        session_decode_ms_per_token.push(session_decode_ms);
+
+        match (
+            session.prefetch_hits,
+            session.prefetch_misses,
+            session.prefetch_total,
+        ) {
+            (Some(hits), Some(misses), Some(total)) => {
+                prefetch_hits += hits;
+                prefetch_misses += misses;
+                prefetch_total += total;
+            }
+            _ => saw_prefetch_stats = false,
+        }
+    }
+
+    if prompt_samples == 0 || total_prompt_tokens == 0 {
+        return Ok(WorkloadBenchmarkSection::Skipped {
+            reason: "all selected prompt samples tokenized to empty inputs".to_string(),
+        });
+    }
+
+    let decode_tokens = measurement_passes * decode_steps;
+    let mean_prefill_tok_per_sec = mean(&prefill_tok_sec_samples);
+    let mean_decode_tok_per_sec = mean(&decode_tok_sec_samples);
+    let mean_decode_ms_per_token = mean(&decode_ms_per_token_samples);
+    let median_prefill_tok_per_sec = median(&mut prefill_tok_sec_samples);
+    let median_decode_tok_per_sec = median(&mut decode_tok_sec_samples);
+    let median_decode_ms_per_token = median(&mut decode_ms_per_token_samples);
+    let mean_session_prefill_tok_per_sec = mean(&session_prefill_tok_per_sec);
+    let mean_session_decode_tok_per_sec = mean(&session_decode_tok_per_sec);
+    let mean_session_decode_ms_per_token = mean(&session_decode_ms_per_token);
+    let median_session_prefill_tok_per_sec = median(&mut session_prefill_tok_per_sec);
+    let median_session_decode_tok_per_sec = median(&mut session_decode_tok_per_sec);
+    let median_session_decode_ms_per_token = median(&mut session_decode_ms_per_token);
+
+    Ok(WorkloadBenchmarkSection::Completed(InferenceWorkloadMetrics {
+        session_runs,
+        prompt_samples,
+        measurement_passes,
+        warmup_passes,
+        prompt_tokens: total_prompt_tokens,
+        max_prompt_tokens,
+        decode_steps,
+        inference_repeats,
+        cache_mode,
+        cache_mode_source,
+        first_generated_token_id,
+        first_generated_token_text,
+        total_prefill_ms,
+        prefill_tok_per_sec: if total_prefill_ms > 0.0 {
+            total_prompt_tokens as f64 / (total_prefill_ms / 1000.0)
+        } else {
+            0.0
+        },
+        mean_prefill_tok_per_sec,
+        median_prefill_tok_per_sec,
+        total_decode_ms,
+        decode_tok_per_sec: if decode_tokens > 0 && total_decode_ms > 0.0 {
+            decode_tokens as f64 / (total_decode_ms / 1000.0)
+        } else {
+            0.0
+        },
+        decode_ms_per_token: if decode_tokens > 0 {
+            total_decode_ms / decode_tokens as f64
+        } else {
+            0.0
+        },
+        mean_decode_tok_per_sec,
+        median_decode_tok_per_sec,
+        mean_decode_ms_per_token,
+        median_decode_ms_per_token,
+        mean_session_prefill_tok_per_sec,
+        median_session_prefill_tok_per_sec,
+        mean_session_decode_tok_per_sec,
+        median_session_decode_tok_per_sec,
+        mean_session_decode_ms_per_token,
+        median_session_decode_ms_per_token,
+        session_prefill_tok_per_sec,
+        session_decode_tok_per_sec,
+        session_decode_ms_per_token,
+        prefetch_hits: saw_prefetch_stats.then_some(prefetch_hits),
+        prefetch_misses: saw_prefetch_stats.then_some(prefetch_misses),
+        prefetch_total: saw_prefetch_stats.then_some(prefetch_total),
+        prefetch_hit_rate: if saw_prefetch_stats && prefetch_total > 0 {
+            Some(prefetch_hits as f64 / prefetch_total as f64)
+        } else {
+            None
+        },
+    }))
+}
+
+fn benchmark_real_inference_session(
+    model_path: &Path,
+    experts_dir: Option<&str>,
+    samples: &[TextSample],
+    max_prompt_tokens: usize,
+    inference_context: ResolvedWorkloadInferenceContext,
+    decode_steps: usize,
+    inference_warmup_passes: usize,
+    inference_repeats: usize,
+) -> anyhow::Result<InferenceSessionMetrics> {
     let tokenizer = Tokenizer::from_model_dir(model_path)?;
     let mut model = DynamicModel::load_with_options(
         model_path,
@@ -1908,22 +2371,24 @@ fn benchmark_real_inference(
             kv_k_bits: None,
             kv_v_bits: None,
             kv_group_size: 64,
+            kv_turboquant: false,
             no_kv_quant: false,
             fp8: false,
         },
     );
     let cache_mode = cache_selection.mode;
 
-    // Warm up model load / kernels on the first prompt so the timed run is steadier.
-    let warmup_ids = encode_benchmark_prompt(
-        &tokenizer,
-        &samples[0],
-        max_prompt_tokens,
-        inference_context,
-    )?;
-    if !warmup_ids.is_empty() {
-        let _ = run_prefill_decode_pass(&mut model, &warmup_ids, decode_steps, cache_mode)?;
+    for sample in samples {
+        let warmup_ids =
+            encode_benchmark_prompt(&tokenizer, sample, max_prompt_tokens, inference_context)?;
+        if warmup_ids.is_empty() {
+            continue;
+        }
+        for _ in 0..inference_warmup_passes {
+            let _ = run_prefill_decode_pass(&mut model, &warmup_ids, decode_steps, cache_mode)?;
+        }
     }
+    model.reset_prefetch_stats();
 
     let inference_repeats = inference_repeats.max(1);
     let mut total_prompt_tokens = 0usize;
@@ -1931,6 +2396,7 @@ fn benchmark_real_inference(
     let mut total_decode = Duration::default();
     let mut measured_samples = 0usize;
     let mut measurement_passes = 0usize;
+    let mut warmup_passes = 0usize;
     let mut first_generated_token_id = None;
     let mut first_generated_token_text = None;
     let mut prefill_tok_sec = Vec::new();
@@ -1945,6 +2411,7 @@ fn benchmark_real_inference(
         }
 
         measured_samples += 1;
+        warmup_passes += inference_warmup_passes;
         for _ in 0..inference_repeats {
             let pass = run_prefill_decode_pass(&mut model, &prompt_ids, decode_steps, cache_mode)?;
             let prompt_tokens = prompt_ids.len();
@@ -1972,63 +2439,32 @@ fn benchmark_real_inference(
     }
 
     if measured_samples == 0 || total_prompt_tokens == 0 {
-        return Ok(WorkloadBenchmarkSection::Skipped {
-            reason: "all selected prompt samples tokenized to empty inputs".to_string(),
-        });
+        anyhow::bail!("all selected prompt samples tokenized to empty inputs");
     }
 
-    let prefill_ms = duration_to_ms(total_prefill);
-    let decode_ms = duration_to_ms(total_decode);
-    let decode_tokens = measurement_passes * decode_steps;
-    let mean_prefill_tok_per_sec = mean(&prefill_tok_sec);
-    let mean_decode_tok_per_sec = mean(&decode_tok_sec);
-    let mean_decode_ms_per_token = mean(&decode_ms_per_token);
-    let median_prefill_tok_per_sec = median(&mut prefill_tok_sec);
-    let median_decode_tok_per_sec = median(&mut decode_tok_sec);
-    let median_decode_ms_per_token = median(&mut decode_ms_per_token);
     let prefetch_stats = model.prefetch_stats();
 
-    Ok(WorkloadBenchmarkSection::Completed(
-        InferenceWorkloadMetrics {
-            prompt_samples: measured_samples,
-            measurement_passes,
-            prompt_tokens: total_prompt_tokens,
-            max_prompt_tokens,
-            decode_steps,
-            inference_repeats,
-            cache_mode: cache_mode.describe(),
-            cache_mode_source: cache_selection.source.as_str().to_string(),
-            first_generated_token_id,
-            first_generated_token_text,
-            total_prefill_ms: prefill_ms,
-            prefill_tok_per_sec: if prefill_ms > 0.0 {
-                total_prompt_tokens as f64 / (prefill_ms / 1000.0)
-            } else {
-                0.0
-            },
-            mean_prefill_tok_per_sec,
-            median_prefill_tok_per_sec,
-            total_decode_ms: decode_ms,
-            decode_tok_per_sec: if decode_tokens > 0 && decode_ms > 0.0 {
-                decode_tokens as f64 / (decode_ms / 1000.0)
-            } else {
-                0.0
-            },
-            decode_ms_per_token: if decode_tokens > 0 {
-                decode_ms / decode_tokens as f64
-            } else {
-                0.0
-            },
-            mean_decode_tok_per_sec,
-            median_decode_tok_per_sec,
-            mean_decode_ms_per_token,
-            median_decode_ms_per_token,
-            prefetch_hits: prefetch_stats.as_ref().map(|stats| stats.hits),
-            prefetch_misses: prefetch_stats.as_ref().map(|stats| stats.misses),
-            prefetch_total: prefetch_stats.as_ref().map(|stats| stats.total),
-            prefetch_hit_rate: prefetch_stats.as_ref().map(|stats| stats.hit_rate()),
-        },
-    ))
+    Ok(InferenceSessionMetrics {
+        prompt_samples: measured_samples,
+        measurement_passes,
+        warmup_passes,
+        prompt_tokens: total_prompt_tokens,
+        max_prompt_tokens,
+        decode_steps,
+        inference_repeats,
+        cache_mode: cache_mode.describe(),
+        cache_mode_source: cache_selection.source.as_str().to_string(),
+        first_generated_token_id,
+        first_generated_token_text,
+        total_prefill_ms: duration_to_ms(total_prefill),
+        total_decode_ms: duration_to_ms(total_decode),
+        prefill_tok_sec_samples: prefill_tok_sec,
+        decode_tok_sec_samples: decode_tok_sec,
+        decode_ms_per_token_samples: decode_ms_per_token,
+        prefetch_hits: prefetch_stats.as_ref().map(|stats| stats.hits),
+        prefetch_misses: prefetch_stats.as_ref().map(|stats| stats.misses),
+        prefetch_total: prefetch_stats.as_ref().map(|stats| stats.total),
+    })
 }
 
 struct PrefillDecodePassResult {
@@ -2606,6 +3042,7 @@ fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Opt
     match &report.inference {
         WorkloadBenchmarkSection::Completed(metrics) => {
             println!("Inference");
+            println!("  Sessions: {}", metrics.session_runs);
             println!(
                 "  Context: {} ({})",
                 report.workload.inference_prompt_len.context_source,
@@ -2651,6 +3088,11 @@ fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Opt
                 metrics.total_prefill_ms
             );
             println!(
+                "  Warmup: {} untimed pass(es) per sample ({} total)",
+                report.workload.inference_warmup_passes,
+                metrics.warmup_passes
+            );
+            println!(
                 "  Decode:  {:.0} tok/s aggregate, {:.0} tok/s median ({:.2} ms/token aggregate, {:.2} ms/token median over {} steps/sample x {} repeats)",
                 metrics.decode_tok_per_sec,
                 metrics.median_decode_tok_per_sec,
@@ -2659,6 +3101,14 @@ fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Opt
                 metrics.decode_steps,
                 metrics.inference_repeats
             );
+            if metrics.session_runs > 1 {
+                println!(
+                    "  Session medians: prefill {:.0} tok/s, decode {:.0} tok/s ({:.2} ms/token)",
+                    metrics.median_session_prefill_tok_per_sec,
+                    metrics.median_session_decode_tok_per_sec,
+                    metrics.median_session_decode_ms_per_token
+                );
+            }
         }
         WorkloadBenchmarkSection::Skipped { reason } => {
             println!("Inference");
@@ -2706,7 +3156,7 @@ fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Opt
 }
 
 fn print_gdn_decode_benchmark_report(report: &GdnDecodeBenchmarkReport, output: Option<&Path>) {
-    println!("GDN Decode Benchmark");
+    println!("GDN Benchmark");
     println!("  Device:  {}", report.device.name);
     println!("  Stage:   {}", report.stage);
     println!("  Model:   {}", report.model_id);
@@ -4121,6 +4571,8 @@ mod tests {
                     sample_truncated_pct: 12.5,
                 },
                 decode_steps: 32,
+                inference_warmup_passes: 2,
+                inference_session_repeats: 3,
                 inference_repeats: 3,
                 train_samples: 8,
                 train_steps: 4,
@@ -4137,8 +4589,10 @@ mod tests {
                 },
             },
             inference: WorkloadBenchmarkSection::Completed(InferenceWorkloadMetrics {
+                session_runs: 3,
                 prompt_samples: 8,
                 measurement_passes: 24,
+                warmup_passes: 16,
                 prompt_tokens: 12288,
                 max_prompt_tokens: 768,
                 decode_steps: 32,
@@ -4158,6 +4612,15 @@ mod tests {
                 median_decode_tok_per_sec: 3210.0,
                 mean_decode_ms_per_token: 2.52,
                 median_decode_ms_per_token: 2.49,
+                mean_session_prefill_tok_per_sec: 40800.0,
+                median_session_prefill_tok_per_sec: 40900.0,
+                mean_session_decode_tok_per_sec: 3185.0,
+                median_session_decode_tok_per_sec: 3205.0,
+                mean_session_decode_ms_per_token: 2.53,
+                median_session_decode_ms_per_token: 2.50,
+                session_prefill_tok_per_sec: vec![40600.0, 40900.0, 40940.0],
+                session_decode_tok_per_sec: vec![3170.0, 3205.0, 3180.0],
+                session_decode_ms_per_token: vec![2.52, 2.50, 2.57],
                 prefetch_hits: None,
                 prefetch_misses: None,
                 prefetch_total: None,
@@ -4187,6 +4650,8 @@ mod tests {
         assert!(json.contains("\"inference_prompt_len\""));
         assert!(json.contains("\"training_seq_len\""));
         assert!(json.contains("\"first_generated_token_id\": 8160"));
+        assert!(json.contains("\"session_runs\": 3"));
+        assert!(json.contains("\"inference_session_repeats\": 3"));
         assert!(json.contains("\"effective_max_seq_len\": 1792"));
         assert!(json.contains("\"effective_max_prompt_tokens\": 768"));
     }

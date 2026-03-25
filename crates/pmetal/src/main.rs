@@ -127,13 +127,16 @@ pub enum WorkloadInferenceContext {
 /// GDN projection stage for `bench-gdn`.
 #[derive(Debug, Clone, Copy, Default, ValueEnum)]
 pub enum GdnBenchmarkStage {
-    /// Benchmark the four decode input projections (`qkv`, `z`, `b`, `a`)
+    /// Benchmark the four GDN input projections (`qkv`, `z`, `b`, `a`)
     #[default]
     #[value(name = "input-proj")]
     InputProj,
-    /// Benchmark the decode output projection after recurrent update + norm
+    /// Benchmark the GDN output projection after recurrent update + norm
     #[value(name = "out-proj")]
     OutProj,
+    /// Benchmark the recurrent GDN prefill update across fixed chunk sizes
+    #[value(name = "prefill")]
+    Prefill,
 }
 
 /// Named workload presets for `bench-workload`.
@@ -525,6 +528,10 @@ enum Commands {
         #[arg(long, default_value = "64")]
         kv_group_size: usize,
 
+        /// Use TurboQuant for KV cache compression.
+        #[arg(long)]
+        kv_turboquant: bool,
+
         /// Disable KV cache quantization (use fp16 KV cache).
         #[arg(long)]
         no_kv_quant: bool,
@@ -646,6 +653,14 @@ enum Commands {
         #[arg(long, default_value = "32")]
         decode_steps: usize,
 
+        /// Number of untimed warmup passes to run per sampled inference prompt before measurement
+        #[arg(long, default_value = "2")]
+        inference_warmup_passes: usize,
+
+        /// Number of independent warmed inference sessions to run and aggregate
+        #[arg(long, default_value = "1")]
+        inference_session_repeats: usize,
+
         /// Number of timed inference passes per prompt sample
         #[arg(long, default_value = "1")]
         inference_repeats: usize,
@@ -675,7 +690,7 @@ enum Commands {
         output: Option<String>,
     },
 
-    /// Benchmark Qwen3.5 GDN decode backends on the actual model layer shapes
+    /// Benchmark Qwen3.5 GDN backends on the actual model layer shapes
     BenchGdn {
         /// Qwen3.5/Qwen3Next model ID or local path
         #[arg(long, default_value = "unsloth/Qwen3.5-0.8B")]
@@ -689,11 +704,11 @@ enum Commands {
         #[arg(long)]
         layer: Option<usize>,
 
-        /// Batch size for the synthetic decode input
+        /// Batch size for the synthetic benchmark input
         #[arg(long, default_value = "1")]
         batch_size: usize,
 
-        /// Sequence length for the synthetic input (1 = decode shape)
+        /// Sequence length for the synthetic input (use a longer value for prefill benchmarking)
         #[arg(long, default_value = "1")]
         seq_len: usize,
 
@@ -2484,6 +2499,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             kv_k_bits,
             kv_v_bits,
             kv_group_size,
+            kv_turboquant,
             no_kv_quant,
         } => {
             // Load tool definitions if provided
@@ -2548,6 +2564,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 kv_k_bits,
                 kv_v_bits,
                 kv_group_size,
+                kv_turboquant,
                 no_kv_quant,
                 experts_dir.as_deref(),
             )
@@ -2639,6 +2656,8 @@ async fn tokio_main() -> anyhow::Result<()> {
             max_prompt_tokens,
             inference_context,
             decode_steps,
+            inference_warmup_passes,
+            inference_session_repeats,
             inference_repeats,
             train_samples,
             train_steps,
@@ -2654,6 +2673,8 @@ async fn tokio_main() -> anyhow::Result<()> {
             if let Some(preset) = preset {
                 commands::bench::run_workload_benchmark_preset(
                     preset,
+                    inference_warmup_passes,
+                    inference_session_repeats,
                     experts_dir.as_deref(),
                     validated_output.as_deref(),
                     json,
@@ -2668,6 +2689,8 @@ async fn tokio_main() -> anyhow::Result<()> {
                     max_prompt_tokens,
                     inference_context,
                     decode_steps,
+                    inference_warmup_passes,
+                    inference_session_repeats,
                     inference_repeats,
                     train_samples,
                     train_steps,
