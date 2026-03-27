@@ -406,6 +406,8 @@ pub struct InferenceConfig {
     pub no_kv_quant: Option<bool>,
     /// Use TurboQuant KV cache instead of MLX affine quantization.
     pub kv_turboquant: Option<bool>,
+    /// Mixed-bit TurboQuant preset (`q2_5` or `q3_5`).
+    pub kv_turboquant_preset: Option<String>,
 }
 
 /// Merge config matching TS `MergeConfig`.
@@ -1579,7 +1581,16 @@ async fn run_inference_streaming(
     app_handle: &AppHandle,
 ) -> std::result::Result<serde_json::Value, String> {
     use pmetal::hub::resolve_model_path;
-    use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig};
+    use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig, TurboQuantPreset};
+
+    let kv_turboquant_preset = match config.kv_turboquant_preset.as_deref() {
+        Some("q2_5") => Some(TurboQuantPreset::Q2_5),
+        Some("q3_5") => Some(TurboQuantPreset::Q3_5),
+        Some(other) => {
+            return Err(format!("unsupported TurboQuant preset: {other}"));
+        }
+        None => None,
+    };
 
     let model_path = resolve_model_path(&config.model)
         .await
@@ -1620,6 +1631,7 @@ async fn run_inference_streaming(
         kv_v_bits: config.kv_v_bits,
         kv_group_size: config.kv_group_size.unwrap_or(64),
         kv_turboquant: config.kv_turboquant.unwrap_or(false),
+        kv_turboquant_preset,
         no_kv_quant: config.no_kv_quant.unwrap_or(false),
     };
 

@@ -9,10 +9,14 @@ pub(crate) async fn run_serve(
     host: String,
     max_seq_len: usize,
     experts_dir: Option<String>,
+    kv_turboquant: bool,
+    kv_turboquant_preset: Option<String>,
     ane_enabled: bool,
     ane_max_seq_len: usize,
     ane_real_time: bool,
 ) -> anyhow::Result<()> {
+    use pmetal_mlx::CacheMode;
+    use pmetal_mlx::kv_cache::turboquant::TurboQuantConfig;
     use pmetal_models::dispatcher::DynamicModel;
     use pmetal_serve::{InferenceEngine, ServeConfig};
 
@@ -62,8 +66,31 @@ pub(crate) async fn run_serve(
 
     tracing::info!("Model loaded successfully");
 
+    // Resolve KV cache mode override
+    let cache_mode_override = if kv_turboquant || kv_turboquant_preset.is_some() {
+        let config = match kv_turboquant_preset.as_deref() {
+            Some("q2_5") => {
+                tracing::info!("TurboQuant KV cache: q2.5 preset (2.5 bits, ~6.4x compression)");
+                TurboQuantConfig::preset_q2_5(128) // head_dim refined by dispatcher sanitization
+            }
+            Some("q3_5") => {
+                tracing::info!(
+                    "TurboQuant KV cache: q3.5 preset (3.5 bits, ~4.6x compression, near-lossless)"
+                );
+                TurboQuantConfig::preset_q3_5(128)
+            }
+            _ => {
+                tracing::info!("TurboQuant KV cache: uniform 4-bit keys, 4-bit values");
+                TurboQuantConfig::uniform(4, 4)
+            }
+        };
+        Some(CacheMode::TurboQuant { config })
+    } else {
+        None
+    };
+
     // Create inference engine
-    let engine = InferenceEngine::new_with_backend(
+    let engine = InferenceEngine::new_with_options(
         model,
         tokenizer,
         model_id.clone(),
@@ -72,6 +99,7 @@ pub(crate) async fn run_serve(
         ane_enabled,
         ane_max_seq_len,
         ane_real_time,
+        cache_mode_override,
     )?;
 
     // Start server

@@ -1,8 +1,8 @@
 use crate::{GdnBenchmarkStage, WorkloadBenchmarkPreset, WorkloadInferenceContext};
 use anyhow::Context;
 use half::f16;
-use mlx_rs::{Array, ops, ops::indexing::IndexOp};
 use mlx_rs::module::ModuleParameters as _;
+use mlx_rs::{Array, ops, ops::indexing::IndexOp};
 use pmetal::inference_runner::{CacheModeRequest, select_cache_mode_for_model};
 use pmetal_core::{
     DatasetConfig, LoraConfig, ModelConfig, StepMetrics, TrainingCallback, TrainingConfig,
@@ -25,8 +25,8 @@ use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE};
 use pmetal_models::architectures::jamba::{JambaConfig, JambaLayer};
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::architectures::llama4::{Llama4MoE, Llama4TextConfig};
-use pmetal_models::architectures::qwen3_next::Qwen3NextGatedDeltaNet;
 use pmetal_models::architectures::qwen3_moe::{Qwen3MoEBlock, Qwen3MoEConfig};
+use pmetal_models::architectures::qwen3_next::Qwen3NextGatedDeltaNet;
 use pmetal_models::dispatcher::{DynamicModel, DynamicModelLoadOptions};
 use pmetal_trainer::orchestrator::{FullTrainingConfig, run_training};
 use pmetal_trainer::{DispatchConfig, TrainingJobConfig};
@@ -751,8 +751,10 @@ pub(crate) async fn run_gdn_decode_benchmark(
                 warmup_iterations,
                 benchmark_iterations,
                 || -> anyhow::Result<()> {
-                    let projected =
-                        mlx_linear_projection_rhs_transposed(&setup.input, &setup.combined_weight_t)?;
+                    let projected = mlx_linear_projection_rhs_transposed(
+                        &setup.input,
+                        &setup.combined_weight_t,
+                    )?;
                     projected.eval()?;
                     Ok(())
                 },
@@ -904,16 +906,19 @@ pub(crate) async fn run_gdn_decode_benchmark(
                 setup.num_v_heads,
                 setup.head_v_dim,
             )?;
-            let qkv_z_combined_output = ops::concatenate_axis(&[
-                &qkv_qz,
-                &z_qz.reshape(&[
-                    setup.batch_size as i32,
-                    setup.seq_len as i32,
-                    setup.value_dim as i32,
-                ])?,
-                &b_qz,
-                &a_qz,
-            ], -1)?;
+            let qkv_z_combined_output = ops::concatenate_axis(
+                &[
+                    &qkv_qz,
+                    &z_qz.reshape(&[
+                        setup.batch_size as i32,
+                        setup.seq_len as i32,
+                        setup.value_dim as i32,
+                    ])?,
+                    &b_qz,
+                    &a_qz,
+                ],
+                -1,
+            )?;
             qkv_z_combined_output.eval()?;
             let qkv_z_combined_output_data = qkv_z_combined_output.as_slice::<f32>().to_vec();
             let accelerate_output = accelerate_combined_projection(
@@ -1191,10 +1196,7 @@ pub(crate) async fn run_gdn_decode_benchmark(
     let report_json = serde_json::to_string_pretty(&report)?;
     if let Some(output_path) = output {
         std::fs::write(output_path, &report_json).with_context(|| {
-            format!(
-                "failed to write GDN benchmark to {}",
-                output_path.display()
-            )
+            format!("failed to write GDN benchmark to {}", output_path.display())
         })?;
     }
 
@@ -1536,9 +1538,7 @@ fn build_gdn_decode_benchmark_setup(
         },
     )?;
     let DynamicModel::Qwen3Next(model) = model else {
-        anyhow::bail!(
-            "GDN benchmark only supports qwen3_next / qwen3_5 model families"
-        );
+        anyhow::bail!("GDN benchmark only supports qwen3_next / qwen3_5 model families");
     };
 
     let layer_idx = resolve_qwen3_next_gdn_layer_index(&model, layer)?;
@@ -1641,20 +1641,22 @@ fn build_gdn_decode_benchmark_setup(
             let reference_output = mlx_linear_projection(&input, &weight)?;
             reference_output.eval()?;
 
-            Ok(GdnBenchmarkSetup::OutProj(GdnLinearProjectionBenchmarkSetup {
-                model_path: model_path.to_path_buf(),
-                layer_idx,
-                batch_size,
-                seq_len,
-                input_dim,
-                output_dim,
-                input,
-                input_data,
-                weight,
-                weight_t,
-                weight_data,
-                reference_output_data: reference_output.as_slice::<f32>().to_vec(),
-            }))
+            Ok(GdnBenchmarkSetup::OutProj(
+                GdnLinearProjectionBenchmarkSetup {
+                    model_path: model_path.to_path_buf(),
+                    layer_idx,
+                    batch_size,
+                    seq_len,
+                    input_dim,
+                    output_dim,
+                    input,
+                    input_data,
+                    weight,
+                    weight_t,
+                    weight_data,
+                    reference_output_data: reference_output.as_slice::<f32>().to_vec(),
+                },
+            ))
         }
         GdnBenchmarkStage::Prefill => {
             let input_dim = gdn.key_dim as usize;
@@ -1725,9 +1727,20 @@ fn build_gdn_decode_benchmark_setup(
             b.eval()?;
             a_log.eval()?;
             dt_bias.eval()?;
-            let (reference_output, _): (Array, Array) = gated_delta_update_with_chunk_size_override(
-                &q, &k, &v, &a, &b, &a_log, &dt_bias, None, None, false, Some(0),
-            )?;
+            let (reference_output, _): (Array, Array) =
+                gated_delta_update_with_chunk_size_override(
+                    &q,
+                    &k,
+                    &v,
+                    &a,
+                    &b,
+                    &a_log,
+                    &dt_bias,
+                    None,
+                    None,
+                    false,
+                    Some(0),
+                )?;
             reference_output.eval()?;
 
             Ok(GdnBenchmarkSetup::Prefill(GdnPrefillBenchmarkSetup {
@@ -1775,9 +1788,7 @@ fn resolve_qwen3_next_gdn_layer_index(
         .context("model does not contain any GDN linear-attention layers")
 }
 
-fn build_combined_input_projection_weight(
-    gdn: &Qwen3NextGatedDeltaNet,
-) -> anyhow::Result<Array> {
+fn build_combined_input_projection_weight(gdn: &Qwen3NextGatedDeltaNet) -> anyhow::Result<Array> {
     let weights = [
         gdn.in_proj_qkv.weight.as_ref().as_type::<f32>()?,
         gdn.in_proj_z.weight.as_ref().as_type::<f32>()?,
@@ -1788,9 +1799,7 @@ fn build_combined_input_projection_weight(
     Ok(ops::concatenate_axis(&refs, 0)?)
 }
 
-fn build_qkv_z_combined_projection_weight(
-    gdn: &Qwen3NextGatedDeltaNet,
-) -> anyhow::Result<Array> {
+fn build_qkv_z_combined_projection_weight(gdn: &Qwen3NextGatedDeltaNet) -> anyhow::Result<Array> {
     let weights = [
         gdn.in_proj_qkv.weight.as_ref().as_type::<f32>()?,
         gdn.in_proj_z.weight.as_ref().as_type::<f32>()?,
@@ -2278,60 +2287,62 @@ fn benchmark_real_inference(
     let median_session_decode_tok_per_sec = median(&mut session_decode_tok_per_sec);
     let median_session_decode_ms_per_token = median(&mut session_decode_ms_per_token);
 
-    Ok(WorkloadBenchmarkSection::Completed(InferenceWorkloadMetrics {
-        session_runs,
-        prompt_samples,
-        measurement_passes,
-        warmup_passes,
-        prompt_tokens: total_prompt_tokens,
-        max_prompt_tokens,
-        decode_steps,
-        inference_repeats,
-        cache_mode,
-        cache_mode_source,
-        first_generated_token_id,
-        first_generated_token_text,
-        total_prefill_ms,
-        prefill_tok_per_sec: if total_prefill_ms > 0.0 {
-            total_prompt_tokens as f64 / (total_prefill_ms / 1000.0)
-        } else {
-            0.0
+    Ok(WorkloadBenchmarkSection::Completed(
+        InferenceWorkloadMetrics {
+            session_runs,
+            prompt_samples,
+            measurement_passes,
+            warmup_passes,
+            prompt_tokens: total_prompt_tokens,
+            max_prompt_tokens,
+            decode_steps,
+            inference_repeats,
+            cache_mode,
+            cache_mode_source,
+            first_generated_token_id,
+            first_generated_token_text,
+            total_prefill_ms,
+            prefill_tok_per_sec: if total_prefill_ms > 0.0 {
+                total_prompt_tokens as f64 / (total_prefill_ms / 1000.0)
+            } else {
+                0.0
+            },
+            mean_prefill_tok_per_sec,
+            median_prefill_tok_per_sec,
+            total_decode_ms,
+            decode_tok_per_sec: if decode_tokens > 0 && total_decode_ms > 0.0 {
+                decode_tokens as f64 / (total_decode_ms / 1000.0)
+            } else {
+                0.0
+            },
+            decode_ms_per_token: if decode_tokens > 0 {
+                total_decode_ms / decode_tokens as f64
+            } else {
+                0.0
+            },
+            mean_decode_tok_per_sec,
+            median_decode_tok_per_sec,
+            mean_decode_ms_per_token,
+            median_decode_ms_per_token,
+            mean_session_prefill_tok_per_sec,
+            median_session_prefill_tok_per_sec,
+            mean_session_decode_tok_per_sec,
+            median_session_decode_tok_per_sec,
+            mean_session_decode_ms_per_token,
+            median_session_decode_ms_per_token,
+            session_prefill_tok_per_sec,
+            session_decode_tok_per_sec,
+            session_decode_ms_per_token,
+            prefetch_hits: saw_prefetch_stats.then_some(prefetch_hits),
+            prefetch_misses: saw_prefetch_stats.then_some(prefetch_misses),
+            prefetch_total: saw_prefetch_stats.then_some(prefetch_total),
+            prefetch_hit_rate: if saw_prefetch_stats && prefetch_total > 0 {
+                Some(prefetch_hits as f64 / prefetch_total as f64)
+            } else {
+                None
+            },
         },
-        mean_prefill_tok_per_sec,
-        median_prefill_tok_per_sec,
-        total_decode_ms,
-        decode_tok_per_sec: if decode_tokens > 0 && total_decode_ms > 0.0 {
-            decode_tokens as f64 / (total_decode_ms / 1000.0)
-        } else {
-            0.0
-        },
-        decode_ms_per_token: if decode_tokens > 0 {
-            total_decode_ms / decode_tokens as f64
-        } else {
-            0.0
-        },
-        mean_decode_tok_per_sec,
-        median_decode_tok_per_sec,
-        mean_decode_ms_per_token,
-        median_decode_ms_per_token,
-        mean_session_prefill_tok_per_sec,
-        median_session_prefill_tok_per_sec,
-        mean_session_decode_tok_per_sec,
-        median_session_decode_tok_per_sec,
-        mean_session_decode_ms_per_token,
-        median_session_decode_ms_per_token,
-        session_prefill_tok_per_sec,
-        session_decode_tok_per_sec,
-        session_decode_ms_per_token,
-        prefetch_hits: saw_prefetch_stats.then_some(prefetch_hits),
-        prefetch_misses: saw_prefetch_stats.then_some(prefetch_misses),
-        prefetch_total: saw_prefetch_stats.then_some(prefetch_total),
-        prefetch_hit_rate: if saw_prefetch_stats && prefetch_total > 0 {
-            Some(prefetch_hits as f64 / prefetch_total as f64)
-        } else {
-            None
-        },
-    }))
+    ))
 }
 
 fn benchmark_real_inference_session(
@@ -2372,6 +2383,7 @@ fn benchmark_real_inference_session(
             kv_v_bits: None,
             kv_group_size: 64,
             kv_turboquant: false,
+            kv_turboquant_preset: None,
             no_kv_quant: false,
             fp8: false,
         },
@@ -3089,8 +3101,7 @@ fn print_workload_benchmark_report(report: &WorkloadBenchmarkReport, output: Opt
             );
             println!(
                 "  Warmup: {} untimed pass(es) per sample ({} total)",
-                report.workload.inference_warmup_passes,
-                metrics.warmup_passes
+                report.workload.inference_warmup_passes, metrics.warmup_passes
             );
             println!(
                 "  Decode:  {:.0} tok/s aggregate, {:.0} tok/s median ({:.2} ms/token aggregate, {:.2} ms/token median over {} steps/sample x {} repeats)",
@@ -4718,10 +4729,8 @@ mod tests {
             &input_data,
             &[batch_size as i32, seq_len as i32, hidden_size as i32],
         );
-        let weight = Array::from_slice(
-            &weight_data,
-            &[total_output_dim as i32, hidden_size as i32],
-        );
+        let weight =
+            Array::from_slice(&weight_data, &[total_output_dim as i32, hidden_size as i32]);
 
         let reference = mlx_linear_projection(&input, &weight).expect("mlx projection");
         reference.eval().expect("eval");
@@ -4757,10 +4766,8 @@ mod tests {
             &input_data,
             &[batch_size as i32, seq_len as i32, hidden_size as i32],
         );
-        let combined_weight = Array::from_slice(
-            &weight_data,
-            &[total_output_dim as i32, hidden_size as i32],
-        );
+        let combined_weight =
+            Array::from_slice(&weight_data, &[total_output_dim as i32, hidden_size as i32]);
 
         let reference = mlx_linear_projection(&input, &combined_weight).expect("mlx projection");
         reference.eval().expect("eval");
@@ -4814,17 +4821,17 @@ mod tests {
             &qkv_z_weight_data,
             &[(conv_dim + value_dim) as i32, hidden_size as i32],
         );
-        let b_weight = Array::from_slice(
-            &b_weight_data,
-            &[num_v_heads as i32, hidden_size as i32],
-        );
-        let a_weight = Array::from_slice(
-            &a_weight_data,
-            &[num_v_heads as i32, hidden_size as i32],
-        );
+        let b_weight = Array::from_slice(&b_weight_data, &[num_v_heads as i32, hidden_size as i32]);
+        let a_weight = Array::from_slice(&a_weight_data, &[num_v_heads as i32, hidden_size as i32]);
 
-        let reference = mlx_split_projection(&input, &qkv_z_weight.index((..conv_dim as i32, ..)), &qkv_z_weight.index((conv_dim as i32.., ..)), &b_weight, &a_weight)
-            .expect("mlx split");
+        let reference = mlx_split_projection(
+            &input,
+            &qkv_z_weight.index((..conv_dim as i32, ..)),
+            &qkv_z_weight.index((conv_dim as i32.., ..)),
+            &b_weight,
+            &a_weight,
+        )
+        .expect("mlx split");
         reference.eval().expect("eval");
         let (qkv, z, b_val, a) = mlx_qkv_z_combined_split_projection(
             &input,
@@ -4846,7 +4853,10 @@ mod tests {
         stitched.eval().expect("eval");
 
         assert!(max_abs_diff(reference.as_slice::<f32>(), stitched.as_slice::<f32>()) < 1e-4);
-        assert_eq!(stitched.shape(), &[batch_size as i32, seq_len as i32, total_output_dim as i32]);
+        assert_eq!(
+            stitched.shape(),
+            &[batch_size as i32, seq_len as i32, total_output_dim as i32]
+        );
     }
 
     #[test]
@@ -4879,12 +4889,9 @@ mod tests {
         );
         let qkv_weight =
             Array::from_slice(&qkv_weight_data, &[conv_dim as i32, hidden_size as i32]);
-        let z_weight =
-            Array::from_slice(&z_weight_data, &[value_dim as i32, hidden_size as i32]);
-        let b_weight =
-            Array::from_slice(&b_weight_data, &[num_v_heads as i32, hidden_size as i32]);
-        let a_weight =
-            Array::from_slice(&a_weight_data, &[num_v_heads as i32, hidden_size as i32]);
+        let z_weight = Array::from_slice(&z_weight_data, &[value_dim as i32, hidden_size as i32]);
+        let b_weight = Array::from_slice(&b_weight_data, &[num_v_heads as i32, hidden_size as i32]);
+        let a_weight = Array::from_slice(&a_weight_data, &[num_v_heads as i32, hidden_size as i32]);
 
         let reference = mlx_split_projection(&input, &qkv_weight, &z_weight, &b_weight, &a_weight)
             .expect("mlx split");
@@ -4926,10 +4933,8 @@ mod tests {
             &input_data,
             &[batch_size as i32, seq_len as i32, hidden_size as i32],
         );
-        let combined_weight = Array::from_slice(
-            &weight_data,
-            &[total_output_dim as i32, hidden_size as i32],
-        );
+        let combined_weight =
+            Array::from_slice(&weight_data, &[total_output_dim as i32, hidden_size as i32]);
 
         let reference = mlx_linear_projection(&input, &combined_weight).expect("mlx projection");
         reference.eval().expect("eval");
@@ -4982,10 +4987,8 @@ mod tests {
             &qkv_z_weight_data,
             &[(conv_dim + value_dim) as i32, hidden_size as i32],
         );
-        let b_weight =
-            Array::from_slice(&b_weight_data, &[num_v_heads as i32, hidden_size as i32]);
-        let a_weight =
-            Array::from_slice(&a_weight_data, &[num_v_heads as i32, hidden_size as i32]);
+        let b_weight = Array::from_slice(&b_weight_data, &[num_v_heads as i32, hidden_size as i32]);
+        let a_weight = Array::from_slice(&a_weight_data, &[num_v_heads as i32, hidden_size as i32]);
 
         let reference = mlx_split_projection(
             &input,
@@ -5034,10 +5037,7 @@ mod tests {
             &input_data,
             &[batch_size as i32, seq_len as i32, input_dim as i32],
         );
-        let weight = Array::from_slice(
-            &weight_data,
-            &[output_dim as i32, input_dim as i32],
-        );
+        let weight = Array::from_slice(&weight_data, &[output_dim as i32, input_dim as i32]);
 
         let reference = mlx_linear_projection(&input, &weight).expect("mlx projection");
         reference.eval().expect("eval");
@@ -5068,10 +5068,8 @@ mod tests {
             &input_data,
             &[batch_size as i32, seq_len as i32, hidden_size as i32],
         );
-        let weight = Array::from_slice(
-            &weight_data,
-            &[total_output_dim as i32, hidden_size as i32],
-        );
+        let weight =
+            Array::from_slice(&weight_data, &[total_output_dim as i32, hidden_size as i32]);
 
         let reference = mlx_linear_projection(&input, &weight).expect("mlx projection");
         reference.eval().expect("eval");
@@ -5113,10 +5111,7 @@ mod tests {
             &input_data,
             &[batch_size as i32, seq_len as i32, input_dim as i32],
         );
-        let weight = Array::from_slice(
-            &weight_data,
-            &[output_dim as i32, input_dim as i32],
-        );
+        let weight = Array::from_slice(&weight_data, &[output_dim as i32, input_dim as i32]);
 
         let reference = mlx_linear_projection(&input, &weight).expect("mlx projection");
         reference.eval().expect("eval");

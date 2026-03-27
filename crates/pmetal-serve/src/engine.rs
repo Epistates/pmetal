@@ -83,6 +83,7 @@ enum PreferredGenerationBackend {
 enum ServeCacheModeSource {
     AutoFp16,
     AutoQ8,
+    Explicit,
 }
 
 impl ServeCacheModeSource {
@@ -90,6 +91,7 @@ impl ServeCacheModeSource {
         match self {
             Self::AutoFp16 => "auto-fp16",
             Self::AutoQ8 => "auto-q8",
+            Self::Explicit => "explicit",
         }
     }
 }
@@ -391,6 +393,8 @@ pub struct InferenceEngine {
     stop_token_ids: Vec<u32>,
     /// Model creation timestamp.
     created_at: i64,
+    /// Explicit cache mode override (bypasses auto-selection when set).
+    cache_mode_override: Option<CacheMode>,
 }
 
 /// Model + cache state that must be accessed sequentially.
@@ -409,10 +413,24 @@ impl InferenceEngine {
         model: &DynamicModel,
         model_path: &Path,
         max_seq_len: usize,
+        cache_mode_override: Option<CacheMode>,
     ) -> (KVCache, Option<MambaCache>) {
         let base_cache = model.create_cache(max_seq_len);
-        let selection =
-            select_serve_cache_mode(model_path, model.num_parameters(), base_cache.config());
+        let selection = if let Some(mode) = cache_mode_override {
+            let estimated_weight_bytes = estimate_serve_weight_bytes(
+                model_path,
+                estimate_weight_bytes_from_param_count(model.num_parameters()),
+            );
+            ServeCacheModeSelection {
+                mode,
+                source: ServeCacheModeSource::Explicit,
+                estimated_weight_bytes,
+                estimated_fp16_kv_bytes: estimate_fp16_kv_cache_bytes(base_cache.config()),
+                working_set_bytes: None,
+            }
+        } else {
+            select_serve_cache_mode(model_path, model.num_parameters(), base_cache.config())
+        };
         log_serve_cache_selection(&selection, max_seq_len);
         let cache = model.create_cache_with_mode(max_seq_len, selection.mode);
         let mamba_cache = model.create_mamba_cache();
@@ -449,6 +467,31 @@ impl InferenceEngine {
         ane_enabled: bool,
         ane_max_seq_len: usize,
         ane_real_time: bool,
+    ) -> ServeResult<Self> {
+        Self::new_with_options(
+            model,
+            tokenizer,
+            model_id,
+            model_path,
+            max_seq_len,
+            ane_enabled,
+            ane_max_seq_len,
+            ane_real_time,
+            None,
+        )
+    }
+
+    /// Create a new inference engine with explicit backend and cache mode controls.
+    pub fn new_with_options(
+        model: DynamicModel,
+        tokenizer: pmetal_data::Tokenizer,
+        model_id: String,
+        model_path: &std::path::Path,
+        max_seq_len: usize,
+        ane_enabled: bool,
+        ane_max_seq_len: usize,
+        ane_real_time: bool,
+        cache_mode_override: Option<CacheMode>,
     ) -> ServeResult<Self> {
         let chat_template = detect_chat_template(model_path, &model_id);
 
@@ -512,6 +555,7 @@ impl InferenceEngine {
             })),
             stop_token_ids,
             created_at,
+            cache_mode_override,
         })
     }
 
@@ -847,6 +891,7 @@ impl InferenceEngine {
         let max_seq_len = self.max_seq_len;
         let ane_max_seq_len = self.ane_max_seq_len;
         let backend = Arc::clone(&self.backend);
+        let cache_mode_override = self.cache_mode_override;
 
         // Generation is synchronous/blocking; run it on a dedicated blocking
         // thread so we don't stall the async executor.
@@ -869,7 +914,7 @@ impl InferenceEngine {
             let mut state = model_arc.lock().map_err(|_| ServeError::Busy)?;
             let model = &mut state.model;
             let (mut cache, mut mamba_cache) =
-                Self::create_request_caches(model, &model_path, max_seq_len);
+                Self::create_request_caches(model, &model_path, max_seq_len, cache_mode_override);
 
             // Build input array [1, seq_len] for prefill.
             let i32_ids: Vec<i32> = input_ids.iter().map(|&t| t as i32).collect();
@@ -985,6 +1030,7 @@ impl InferenceEngine {
         let max_seq_len = self.max_seq_len;
         let ane_max_seq_len = self.ane_max_seq_len;
         let backend = Arc::clone(&self.backend);
+        let cache_mode_override = self.cache_mode_override;
 
         // Spawn generation on a dedicated blocking thread.
         tokio::task::spawn_blocking(move || {
@@ -1024,7 +1070,7 @@ impl InferenceEngine {
             let mut state = state_guard;
             let model = &mut state.model;
             let (mut cache, mut mamba_cache) =
-                Self::create_request_caches(model, &model_path, max_seq_len);
+                Self::create_request_caches(model, &model_path, max_seq_len, cache_mode_override);
 
             // Build prefill input array.
             let i32_ids: Vec<i32> = input_ids.iter().map(|&t| t as i32).collect();
@@ -1302,8 +1348,12 @@ mod tests {
     fn create_request_caches_allocates_mamba_cache_for_hybrid_models() {
         let model =
             DynamicModel::NemotronH(NemotronHForCausalLM::new(tiny_nemotron_h_config()).unwrap());
-        let (cache, mamba_cache) =
-            InferenceEngine::create_request_caches(&model, std::env::temp_dir().as_path(), 64);
+        let (cache, mamba_cache) = InferenceEngine::create_request_caches(
+            &model,
+            std::env::temp_dir().as_path(),
+            64,
+            None,
+        );
 
         assert_eq!(cache.config().max_seq_len, 64);
         assert!(mamba_cache.is_some());

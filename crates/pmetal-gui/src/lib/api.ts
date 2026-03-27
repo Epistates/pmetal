@@ -271,6 +271,8 @@ export interface InferenceConfig {
   no_kv_quant: boolean | null;
   /** Use TurboQuant KV cache instead of MLX affine quantization. */
   kv_turboquant: boolean | null;
+  /** Mixed-bit TurboQuant preset. */
+  kv_turboquant_preset: 'q2_5' | 'q3_5' | null;
 }
 
 export interface InferenceMessage {

@@ -46,7 +46,7 @@
   let fp8 = $state(false);
   let noThinking = $state(false);
   let expertsDir = $state('');
-  let kvQuant = $state<string>('auto'); // 'auto' | '0' | '4' | '8'
+  let kvQuant = $state<string>('auto'); // 'auto' | '0' | '4' | '8' | 'tq4' | 'tq8' | 'tq2_5' | 'tq3_5'
   let showParams = $state(false);
   let defaultsSource = $state(''); // which model the current defaults came from
 
@@ -187,12 +187,25 @@
         fp8: fp8 || null,
         no_thinking: noThinking || null,
         experts_dir: expertsDir || null,
-        kv_quant: kvQuant.startsWith('tq') ? parseInt(kvQuant.slice(2)) : kvQuant === 'auto' ? null : parseInt(kvQuant),
+        kv_quant:
+          kvQuant === 'tq4'
+            ? 4
+            : kvQuant === 'tq8'
+              ? 8
+              : kvQuant === 'auto'
+                ? null
+                : parseInt(kvQuant),
         kv_k_bits: null,
         kv_v_bits: null,
         kv_group_size: null,
         no_kv_quant: kvQuant === '0' ? true : null,
-        kv_turboquant: kvQuant.startsWith('tq') ? true : null,
+        kv_turboquant: kvQuant === 'tq4' || kvQuant === 'tq8' ? true : null,
+        kv_turboquant_preset:
+          kvQuant === 'tq2_5'
+            ? 'q2_5'
+            : kvQuant === 'tq3_5'
+              ? 'q3_5'
+              : null,
       });
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
@@ -391,6 +404,8 @@
               <option value="4">Q4</option>
               <option value="tq4">TurboQ4</option>
               <option value="tq8">TurboQ8</option>
+              <option value="tq2_5">TurboQ2.5</option>
+              <option value="tq3_5">TurboQ3.5</option>
             </select>
           </div>
         </div>

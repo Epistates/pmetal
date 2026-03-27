@@ -156,6 +156,23 @@ pub enum WorkloadBenchmarkPreset {
     MoeNemotronH,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum TurboQuantPresetArg {
+    #[value(name = "q2_5")]
+    Q2_5,
+    #[value(name = "q3_5")]
+    Q3_5,
+}
+
+impl From<TurboQuantPresetArg> for pmetal::inference_runner::TurboQuantPreset {
+    fn from(value: TurboQuantPresetArg) -> Self {
+        match value {
+            TurboQuantPresetArg::Q2_5 => Self::Q2_5,
+            TurboQuantPresetArg::Q3_5 => Self::Q3_5,
+        }
+    }
+}
+
 #[derive(Parser)]
 #[command(name = "pmetal")]
 #[command(author, version, about = "LLM fine-tuning optimized for Apple Silicon", long_about = None)]
@@ -531,6 +548,11 @@ enum Commands {
         /// Use TurboQuant for KV cache compression.
         #[arg(long)]
         kv_turboquant: bool,
+
+        /// Mixed-bit TurboQuant preset (`q2_5` or `q3_5`).
+        /// When set, this enables outlier-aware TurboQuant without needing `--kv-turboquant`.
+        #[arg(long, value_enum)]
+        kv_turboquant_preset: Option<TurboQuantPresetArg>,
 
         /// Disable KV cache quantization (use fp16 KV cache).
         #[arg(long)]
@@ -1241,6 +1263,15 @@ enum Commands {
         /// Created with `pmetal pack-experts`.
         #[arg(long)]
         experts_dir: Option<String>,
+
+        /// Enable TurboQuant KV cache compression (provably near-optimal, data-oblivious).
+        /// Reduces KV cache memory 4-6x with near-zero quality loss.
+        #[arg(long)]
+        kv_turboquant: bool,
+
+        /// TurboQuant quality preset: q2_5 (2.5 bits, 6.4x compression) or q3_5 (3.5 bits, 4.6x compression, lossless).
+        #[arg(long, value_parser = ["q2_5", "q3_5"])]
+        kv_turboquant_preset: Option<String>,
 
         /// Enable ANE (Apple Neural Engine) for serving (experimental).
         #[cfg(feature = "ane")]
@@ -2426,6 +2457,8 @@ async fn tokio_main() -> anyhow::Result<()> {
             host,
             max_seq_len,
             experts_dir,
+            kv_turboquant,
+            kv_turboquant_preset,
             #[cfg(feature = "ane")]
             ane,
             #[cfg(feature = "ane")]
@@ -2454,6 +2487,8 @@ async fn tokio_main() -> anyhow::Result<()> {
                 host,
                 max_seq_len,
                 experts_dir,
+                kv_turboquant,
+                kv_turboquant_preset,
                 ane_enabled,
                 serve_ane_max_seq_len,
                 serve_ane_real_time,
@@ -2500,6 +2535,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             kv_v_bits,
             kv_group_size,
             kv_turboquant,
+            kv_turboquant_preset,
             no_kv_quant,
         } => {
             // Load tool definitions if provided
@@ -2565,6 +2601,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 kv_v_bits,
                 kv_group_size,
                 kv_turboquant,
+                kv_turboquant_preset.map(Into::into),
                 no_kv_quant,
                 experts_dir.as_deref(),
             )
