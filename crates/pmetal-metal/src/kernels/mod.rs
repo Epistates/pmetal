@@ -24,6 +24,7 @@ pub mod mpp_bench;
 pub mod mpp_flash_attention;
 pub mod mpp_gemm;
 pub mod mpp_quantized;
+pub mod turboquant;
 
 // Re-export main types
 pub use batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
@@ -71,3 +72,4 @@ pub use mpp_flash_attention::{
     MppFlashAttention, MppFlashAttentionConfig, MppFlashAttentionOutput,
 };
 pub use mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig};
+pub use turboquant::TurboQuantTransform;
