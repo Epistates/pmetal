@@ -83,3 +83,5 @@ test-training-output/
 **/.svelte-kit
 crates/pmetal-gui/build/
 .mcp.json
+
+*.gputrace

@@ -3,3 +3,6 @@
 # MLX's internal device/memory state is not thread-safe for parallel test execution.
 # Full suite (650+ tests) runs in ~1s serial, so no performance impact.
 RUST_TEST_THREADS = "1"
+# MLX requires macOS 14+ for Metal. Pin deployment target so the linker
+# matches the object files compiled by CMake inside mlx-sys.
+MACOSX_DEPLOYMENT_TARGET = "14.0"
