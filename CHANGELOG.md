@@ -7,6 +7,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-03-25
+
+### Added
+
+- **TurboQuant KV cache quantization**: Provably near-optimal KV cache compression based on random rotation + Lloyd-Max scalar quantization + QJL residual for unbiased inner products (arXiv:2504.19874). Achieves 4-6x KV cache compression with near-zero quality loss. Available via `--kv-turboquant` or presets `--kv-turboquant-preset q3_5` (near-lossless) / `q2_5` (6.4x compression)
+  - Separate key/value runtimes with independent bit widths and outlier-aware mixed-precision
+  - Direct attention path for single-token decode avoids full cache dequantization
+  - Data-oblivious (no calibration data required) — quantizes KV entries online as generated
+  - Precomputed codebooks via Lloyd-Max algorithm for Beta distribution (deterministic from seed)
+  - Metal kernel backend with CPU fallback
+
+- **Asymmetric K/V head dimensions**: KV cache, TurboQuant, and fused attention now support models where key and value projections have different widths (e.g. DeepSeek MLA with `qk_head_dim != v_head_dim`)
+  - `KVCacheConfig::with_value_head_dim()` for asymmetric buffer allocation
+  - `FusedAttentionConfig::with_value_head_dim()` for correct output shape routing
+  - Metal flash attention gracefully falls back to MLX SDPA for asymmetric dims
+  - Output tensors correctly use value dimension, not key dimension
+
+- **DeepSeek TurboQuant integration**: DeepSeek architecture creates asymmetric caches matching its MLA head dimensions and uses `try_turboquant_attention()` for direct compressed-cache attention during decode
+
+- **`pmetal serve --kv-turboquant`**: TurboQuant KV cache is now available in the serving engine. `--kv-turboquant-preset q3_5` enables near-lossless 4.6x KV compression for production serving. Cache mode override propagated through both streaming and non-streaming generation paths
+
+- **Qwen3.5 MoE dispatch improvements**: Expert prefetch reset per generation, configurable GDN chunk size, chunked prefill, and generation helpers
+
+- **`pmetal-distributed` crate**: Feature-gated tensor, expert, context, zero, and pipeline parallelism modules
+
+- **GUI inference parity**: Full inference feature parity with CLI in the Tauri GUI, including TurboQuant flag
+
+- **Benchmark enhancements**: Warmup passes, session repeats, GDN prefill stage profiling, TurboQuant flag for bench commands, fused gate/up expert packing with auto-detected tensor layout
+
+### Changed
+
+- Fused attention config carries optional `value_head_dim` for architectures with asymmetric K/V projections; Metal backends reject asymmetric dims and fall through to MLX SDPA
+- Serve engine accepts explicit `cache_mode_override` via `InferenceEngine::new_with_options()`, bypassing auto-selection when TurboQuant or other explicit modes are requested
+- Dispatcher sanitizes TurboQuant configs per-dimension, clamping outlier counts and falling back to uniform for degenerate head dims
+- All architecture attention forwards auto-detect asymmetric value dims from tensor shapes
+
 ## [0.4.0] - 2026-03-23
 
 ### Added
