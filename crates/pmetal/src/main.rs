@@ -9,6 +9,8 @@
 
 mod commands;
 mod dashboard;
+#[cfg(any(feature = "models", feature = "native-only"))]
+pub mod native_inference;
 mod pack_experts;
 #[cfg(feature = "dashboard")]
 mod tui;
