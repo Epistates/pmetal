@@ -1451,8 +1451,8 @@ pub fn generate(
     // Clear prefill residue from the Metal buffer cache.
     bridge::clear_cache();
     bridge::reset_peak_memory();
-    // Enable MLX global compile — fuses element-wise ops across entire eval graph
-    bridge::enable_compile();
+    // NOTE: enable_compile() was tested and shown to HURT performance
+    // (adds tracing overhead without meaningful fusion). Keep disabled.
     // Create a dedicated GPU stream for generation (matches Python's generation_stream).
     bridge::new_generation_stream();
     bridge::set_generation_stream();

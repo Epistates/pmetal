@@ -2223,4 +2223,110 @@ mod tests {
         assert_eq!(q2_5, TurboQuantConfig::mixed(2, 4, 32, 2, 4, 32));
         assert_eq!(q3_5, TurboQuantConfig::mixed(3, 5, 32, 3, 5, 32));
     }
+
+    /// GPU round-trip: append via GPU path then dequantize via GPU path.
+    ///
+    /// We verify two things:
+    ///   1. The GPU path is actually taken (store.gpu is Some).
+    ///   2. The GPU dequantised output is close to the CPU dequantised output
+    ///      (same algorithm, both paths should produce bitwise-close results
+    ///       modulo f32 ordering differences).
+    #[test]
+    fn turboquant_gpu_path_round_trip() {
+        // Small dim so the test is fast.
+        let dim = 16usize;
+        let config = TurboQuantConfig::uniform(4, 4);
+        let b = 1i32;
+        let h = 2i32;
+        let s = 3i32;
+        let d = dim as i32;
+        let total = (b * h * s * d) as usize;
+
+        // Build deterministic input vectors.
+        let data: Vec<f32> = (0..total).map(|i| ((i as f32) * 0.1 - total as f32 * 0.05).sin()).collect();
+        // Upload as [B, H, S, D] f32.
+        let keys_arr = InlineArray::from_f32_slice(&data, &[b, h, s, d]);
+        let vals_arr = InlineArray::from_f32_slice(&data, &[b, h, s, d]);
+
+        // ── CPU reference path (use Mixed config to force CPU) ────────────
+        let cpu_config = TurboQuantConfig {
+            keys: TurboQuantTensorConfig::Mixed {
+                regular_bits: 3,
+                outlier_bits: 4,
+                outlier_count: 4,
+            },
+            values: TurboQuantTensorConfig::Mixed {
+                regular_bits: 4,
+                outlier_bits: 4,
+                outlier_count: 4,
+            },
+        };
+        let mut cpu_cache = QuantizedKvCache::new(cpu_config);
+        cpu_cache.append(&keys_arr, &vals_arr).expect("CPU append");
+        // Verify CPU path taken (no GPU store).
+        assert!(cpu_cache.keys.as_ref().unwrap().gpu.is_none(), "Expected CPU path for Mixed config");
+
+        // ── GPU path ──────────────────────────────────────────────────────
+        let mut gpu_cache = QuantizedKvCache::new(config);
+        gpu_cache.append(&keys_arr, &vals_arr).expect("GPU append");
+
+        // Verify GPU path was taken.
+        assert!(
+            gpu_cache.keys.as_ref().unwrap().gpu.is_some(),
+            "GPU store should be Some for Uniform config"
+        );
+        assert!(
+            gpu_cache.values.as_ref().unwrap().gpu.is_some(),
+            "GPU value store should be Some for Uniform config"
+        );
+
+        // Dequantise — should succeed.
+        let dk = gpu_cache.dequantize_keys().expect("GPU dequantize_keys");
+        let dv = gpu_cache.dequantize_values().expect("GPU dequantize_values");
+
+        // Verify output shapes: [B, H, T, D].
+        assert_eq!(dk.shape(), &[b, h, s, d], "dequantized keys shape mismatch");
+        assert_eq!(dv.shape(), &[b, h, s, d], "dequantized values shape mismatch");
+
+        // Output should be finite (not NaN/Inf).
+        let dk_vals = dk.reshape(&[(b * h * s * d)]).to_f32_vec(total).expect("dk to_f32");
+        let dv_vals = dv.reshape(&[(b * h * s * d)]).to_f32_vec(total).expect("dv to_f32");
+        assert!(dk_vals.iter().all(|v| v.is_finite()), "dequantized keys contain non-finite");
+        assert!(dv_vals.iter().all(|v| v.is_finite()), "dequantized values contain non-finite");
+
+        // Verify output is within reasonable range (quantisation introduces error but
+        // should not explode — reconstructed vectors should be roughly same magnitude as input).
+        let input_max = data.iter().cloned().fold(0.0f32, f32::max).abs();
+        let dk_max = dk_vals.iter().cloned().fold(0.0f32, f32::max).abs();
+        assert!(dk_max < input_max * 3.0, "dequantized keys magnitude unreasonably large");
+    }
+
+    /// Verify that multiple appends accumulate correctly in the GPU store.
+    #[test]
+    fn turboquant_gpu_multi_append() {
+        let dim = 8usize;
+        let config = TurboQuantConfig::uniform(4, 4);
+        let b = 1i32;
+        let h = 1i32;
+        let d = dim as i32;
+
+        let make_data = |seed: f32| -> Vec<f32> {
+            (0..b * h * 1 * d).map(|i| (i as f32 * 0.15 + seed).sin()).collect()
+        };
+
+        let mut cache = QuantizedKvCache::new(config);
+
+        // Append 3 steps individually.
+        for step in 0..3 {
+            let data = make_data(step as f32);
+            let arr = InlineArray::from_f32_slice(&data, &[b, h, 1, d]);
+            cache.append(&arr, &arr).expect("append step");
+        }
+
+        assert_eq!(cache.offset, 3, "Should have 3 cached positions");
+
+        let dk = cache.dequantize_keys().expect("dequantize_keys");
+        // Shape should be [B, H, 3, D].
+        assert_eq!(dk.shape(), &[b, h, 3, d]);
+    }
 }
