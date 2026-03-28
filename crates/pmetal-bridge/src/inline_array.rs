@@ -275,8 +275,12 @@ unsafe extern "C" {
 
     // ── Sampling ──
     fn mlx_inline_argmax(dst: *mut RawBuf, a: *const RawBuf, axis: i32);
+    fn mlx_inline_argmin(dst: *mut RawBuf, a: *const RawBuf, axis: i32);
     fn mlx_inline_logsumexp(dst: *mut RawBuf, a: *const RawBuf, axis: i32, keepdims: bool);
     fn mlx_inline_categorical(dst: *mut RawBuf, logits: *const RawBuf);
+
+    // ── Element-wise math ──
+    fn mlx_inline_abs(dst: *mut RawBuf, a: *const RawBuf);
 
     // ── Embedding / KV cache ──
     fn mlx_inline_take_axis(dst: *mut RawBuf, a: *const RawBuf, indices: *const RawBuf, axis: i32);
@@ -1165,6 +1169,19 @@ impl InlineArray {
     pub fn argmax(&self, axis: i32) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe { mlx_inline_argmax(dst.as_mut_ptr(), &self.raw, axis); Self { raw: dst.assume_init() } }
+    }
+
+    #[inline]
+    pub fn argmin(&self, axis: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe { mlx_inline_argmin(dst.as_mut_ptr(), &self.raw, axis); Self { raw: dst.assume_init() } }
+    }
+
+    /// Element-wise absolute value.
+    #[inline]
+    pub fn abs_val(&self) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe { mlx_inline_abs(dst.as_mut_ptr(), &self.raw); Self { raw: dst.assume_init() } }
     }
 
     #[inline]

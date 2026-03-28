@@ -836,6 +836,14 @@ void mlx_inline_argmax(mlx_inline_array* dst, const mlx_inline_array* a, int axi
     new (dst->buf) array(mlx::core::argmax(as_arr(a), axis));
 }
 
+void mlx_inline_argmin(mlx_inline_array* dst, const mlx_inline_array* a, int axis) {
+    new (dst->buf) array(mlx::core::argmin(as_arr(a), axis));
+}
+
+void mlx_inline_abs(mlx_inline_array* dst, const mlx_inline_array* a) {
+    new (dst->buf) array(mlx::core::abs(as_arr(a)));
+}
+
 void mlx_inline_logsumexp(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
     new (dst->buf) array(mlx::core::logsumexp(as_arr(a), axis, keepdims));
 }

@@ -246,6 +246,9 @@ pub struct TurboQuantCore {
     qjl_arr: Option<InlineArray>,
     /// InlineArray view of the inverse QJL projection matrix.
     inverse_qjl_arr: Option<InlineArray>,
+    /// GPU-side codebook arrays: `codebook_arrs[b]` is a 1-D f32 InlineArray
+    /// holding 2^b centroids for b-bit quantisation.  Indexed as codebooks.
+    codebook_arrs: Vec<Option<InlineArray>>,
 }
 
 impl TurboQuantCore {
@@ -269,6 +272,20 @@ impl TurboQuantCore {
         let qjl_arr = matrix_to_inline_array(&qjl_projection, dim);
         let inverse_qjl_arr = matrix_to_inline_array(&inverse_qjl_projection, dim);
 
+        // GPU-side codebooks: each is a tiny 1-D f32 array (16 elements for 4-bit).
+        let codebook_arrs: Vec<Option<InlineArray>> = codebooks
+            .iter()
+            .map(|cb| {
+                if cb.is_empty() {
+                    None
+                } else {
+                    let mut arr = InlineArray::from_f32_slice(cb, &[cb.len() as i32]);
+                    arr.eval();
+                    Some(arr)
+                }
+            })
+            .collect();
+
         Self {
             dim,
             rotation,
@@ -280,11 +297,49 @@ impl TurboQuantCore {
             inverse_rotation_arr,
             qjl_arr,
             inverse_qjl_arr,
+            codebook_arrs,
         }
     }
 
     fn codebook(&self, bits: u8) -> &[f32] {
         &self.codebooks[usize::from(bits)]
+    }
+
+    fn codebook_arr(&self, bits: u8) -> Option<&InlineArray> {
+        self.codebook_arrs.get(usize::from(bits))?.as_ref()
+    }
+
+    /// GPU-native nearest-centroid quantisation.
+    ///
+    /// `rotated`: [N, D] f32 InlineArray of already-rotated (and normalised) vectors.
+    /// Returns a uint32 InlineArray of shape [N, D] holding the codebook index per coordinate.
+    ///
+    /// Algorithm: expand rotated → [N, D, 1], subtract codebook [C] → [N, D, C],
+    /// take squared diff, argmin along axis=-1 → [N, D].
+    fn gpu_quantize_mse(&self, rotated: &InlineArray, bits: u8) -> Option<InlineArray> {
+        let cb_arr = self.codebook_arr(bits)?;
+        // rotated: [..., D]  →  expanded: [..., D, 1]
+        let expanded = rotated.expand_dims(-1);
+        // broadcast subtract: [..., D, C]
+        let diffs = expanded.subtract(cb_arr);
+        // squared distances (cheaper than abs for MSE nearest-centroid)
+        let sq = diffs.multiply(&diffs);
+        // argmin over codebook dimension → [..., D] uint32
+        Some(sq.argmin(-1))
+    }
+
+    /// GPU-native codebook reconstruction.
+    ///
+    /// `indices`: [..., D] uint32.  Returns [..., D] f32 of gathered centroid values.
+    fn gpu_reconstruct_mse(&self, indices: &InlineArray, bits: u8) -> Option<InlineArray> {
+        let cb_arr = self.codebook_arr(bits)?;
+        // take(codebook [C], indices [..., D], axis=0) → [..., D] f32
+        // Flatten indices to 1-D, gather, reshape back.
+        let orig_shape = indices.shape().to_vec();
+        let n: i32 = orig_shape.iter().product();
+        let flat = indices.reshape(&[n]);
+        let gathered = cb_arr.take_axis(&flat, 0);
+        Some(gathered.reshape(&orig_shape))
     }
 
     /// Rotate input rows: output = input · Π^T  (each row left-multiplied by Π).
@@ -556,10 +611,56 @@ fn unpack_all(bits: &PackedBits) -> Vec<u16> {
 // Per-layer quantised storage
 // ═══════════════════════════════════════════════════════════════════════════
 
+/// GPU-resident quantised key data for the Uniform (non-outlier) path.
+///
+/// All tensors live entirely on the GPU — no CPU round-trips during normal
+/// operation.  Shape convention (accumulated over T steps):
+///   indices:         [B, H, T, D]  uint32  — codebook index per coordinate
+///   norms:           [B, H, T, 1]  f32     — L2 norm before unit-sphere normalise
+///   qjl_signs:       [B, H, T, D]  f32     — ±1 sign of QJL projection
+///   residual_norms:  [B, H, T, 1]  f32     — L2 norm of MSE residual
+#[derive(Debug, Clone)]
+struct GpuKeyStore {
+    indices: InlineArray,
+    norms: InlineArray,
+    qjl_signs: InlineArray,
+    residual_norms: InlineArray,
+}
+
+impl GpuKeyStore {
+    /// Concatenate a new step's GPU arrays along the T (axis 2) dimension.
+    fn append(&mut self, new: GpuKeyStore) {
+        self.indices        = self.indices.kv_cache_append(&new.indices, 2);
+        self.norms          = self.norms.kv_cache_append(&new.norms, 2);
+        self.qjl_signs      = self.qjl_signs.kv_cache_append(&new.qjl_signs, 2);
+        self.residual_norms = self.residual_norms.kv_cache_append(&new.residual_norms, 2);
+    }
+}
+
+/// GPU-resident quantised value data for the Uniform path.
+///
+///   indices:  [B, H, T, D]  uint32
+///   norms:    [B, H, T, 1]  f32
+#[derive(Debug, Clone)]
+struct GpuValueStore {
+    indices: InlineArray,
+    norms: InlineArray,
+}
+
+impl GpuValueStore {
+    fn append(&mut self, new: GpuValueStore) {
+        self.indices = self.indices.kv_cache_append(&new.indices, 2);
+        self.norms   = self.norms.kv_cache_append(&new.norms, 2);
+    }
+}
+
 /// Quantised key store for one attention layer.
 #[derive(Debug, Clone)]
 pub struct QuantizedKeyStore {
-    // Regular (non-outlier) sub-vector data.
+    // GPU-native store (Uniform path only).  When Some, dequantize uses GPU ops.
+    gpu: Option<GpuKeyStore>,
+
+    // CPU fallback: regular (non-outlier) sub-vector data.
     pub regular_indices: PackedBits,
     pub regular_qjl_signs: PackedBits,
     pub regular_norms: Vec<f32>,
@@ -587,6 +688,7 @@ impl QuantizedKeyStore {
         };
 
         Self {
+            gpu: None,
             regular_indices: PackedBits::new(regular_bits),
             regular_qjl_signs: PackedBits::new(1),
             regular_norms: Vec::new(),
@@ -673,6 +775,9 @@ impl QuantizedKeyStore {
 /// Quantised value store for one attention layer.
 #[derive(Debug, Clone)]
 pub struct QuantizedValueStore {
+    // GPU-native store (Uniform path only).
+    gpu: Option<GpuValueStore>,
+
     pub regular_indices: PackedBits,
     pub regular_norms: Vec<f32>,
 
@@ -693,6 +798,7 @@ impl QuantizedValueStore {
         };
 
         Self {
+            gpu: None,
             regular_indices: PackedBits::new(regular_bits),
             regular_norms: Vec::new(),
             outlier_mask: outlier_bits.map(|_| PackedBits::new(1)),
@@ -823,7 +929,14 @@ impl QuantizedKvCache {
     /// Append new keys and values.
     ///
     /// `keys` and `values` must have shape `[B, H, S, D]` as f32 or bf16.
-    /// The tensors are immediately evaluated (GPU → CPU) and quantised.
+    ///
+    /// For the Uniform quantisation config the entire pipeline runs on-GPU:
+    /// normalise → rotate → argmin codebook → QJL projection → sign.
+    /// No GPU→CPU transfer happens.  Results are stored as `InlineArray`s and
+    /// concatenated along the T axis on subsequent calls.
+    ///
+    /// For the Mixed (outlier-aware) config the CPU path is used (outlier mask
+    /// selection requires a per-row top-k sort that is not trivially vectorisable).
     ///
     /// Returns an error string on shape mismatch.
     pub fn append(
@@ -834,27 +947,51 @@ impl QuantizedKvCache {
         let layout = self.ensure_layout(keys, values)?;
         let seq_len = keys.dim(2) as usize;
 
-        let key_rows = inline_array_to_bshd_rows(keys)?;
-        let value_rows = inline_array_to_bshd_rows(values)?;
-
         let config = self.config;
         let state = self.state.get_or_insert_with(|| {
             Arc::new(TurboQuantState::new(layout.key_dim, layout.value_dim, config))
         });
+        let state = Arc::clone(state);
+
+        // Cast to f32 once — needed for both GPU and CPU paths.
+        let keys_f32 = keys.as_dtype(10 /* float32 */);
+        let values_f32 = values.as_dtype(10 /* float32 */);
+
+        let ks = self.keys.get_or_insert_with(|| QuantizedKeyStore::new(config.keys));
+        let vs = self.values.get_or_insert_with(|| QuantizedValueStore::new(config.values));
+
+        // ── GPU path (Uniform only) ───────────────────────────────────────
+        let gpu_keys_ok = matches!(config.keys, TurboQuantTensorConfig::Uniform { .. });
+        let gpu_vals_ok = matches!(config.values, TurboQuantTensorConfig::Uniform { .. });
+
+        if gpu_keys_ok && gpu_vals_ok {
+            if let Some((new_ks_gpu, new_vs_gpu)) =
+                gpu_quantize_kv(&state, &keys_f32, &values_f32, config)
+            {
+                // Accumulate into the running GPU stores.
+                match ks.gpu.as_mut() {
+                    None => ks.gpu = Some(new_ks_gpu),
+                    Some(g) => g.append(new_ks_gpu),
+                }
+                match vs.gpu.as_mut() {
+                    None => vs.gpu = Some(new_vs_gpu),
+                    Some(g) => g.append(new_vs_gpu),
+                }
+                self.offset += seq_len;
+                return Ok(());
+            }
+            // GPU path failed — fall through to CPU.
+        }
+
+        // ── CPU fallback path ─────────────────────────────────────────────
+        let key_rows = inline_array_to_bshd_rows(&keys_f32)?;
+        let value_rows = inline_array_to_bshd_rows(&values_f32)?;
 
         let rows_per_seq = layout.batch * layout.heads;
         debug_assert_eq!(key_rows.len(), rows_per_seq * seq_len * layout.key_dim);
 
-        // Encode all (batch × head × seq) rows in one shot.
         let encoded_keys = encode_key_rows(&state.keys, layout.key_dim, &key_rows);
         let encoded_values = encode_value_rows(&state.values, layout.value_dim, &value_rows);
-
-        let ks = self.keys.get_or_insert_with(|| {
-            QuantizedKeyStore::new(config.keys)
-        });
-        let vs = self.values.get_or_insert_with(|| {
-            QuantizedValueStore::new(config.values)
-        });
 
         ks.extend(
             &encoded_keys.regular,
@@ -873,13 +1010,24 @@ impl QuantizedKvCache {
 
     /// Dequantise and return all cached keys as an `InlineArray` of shape
     /// `[B, H, T, D]` (f32).
+    ///
+    /// Uses the GPU path when keys were quantised on-GPU; otherwise falls back
+    /// to the CPU decode path.
     pub fn dequantize_keys(&self) -> Option<InlineArray> {
         let ks = self.keys.as_ref()?;
         let layout = self.layout?;
         let state = self.state.as_ref()?;
 
+        // GPU path: all data lives in InlineArrays — single GPU graph eval.
+        if let Some(ref g) = ks.gpu {
+            let TurboQuantTensorConfig::Uniform { bits } = self.config.keys else {
+                unreachable!("GPU store only exists for Uniform config")
+            };
+            return gpu_dequantize_keys(g, &state.keys, bits);
+        }
+
+        // CPU fallback.
         let rows = decode_key_rows(&state.keys, layout.key_dim, ks);
-        // rows: [B*H*T, key_dim] in (batch, head, seq) order → reshape to [B, H, T, D]
         Some(f32_rows_to_bhsd_array(
             &rows,
             layout.batch,
@@ -896,6 +1044,15 @@ impl QuantizedKvCache {
         let layout = self.layout?;
         let state = self.state.as_ref()?;
 
+        // GPU path.
+        if let Some(ref g) = vs.gpu {
+            let TurboQuantTensorConfig::Uniform { bits } = self.config.values else {
+                unreachable!("GPU store only exists for Uniform config")
+            };
+            return gpu_dequantize_values(g, &state.values, bits);
+        }
+
+        // CPU fallback.
         let rows = decode_value_rows(&state.values, layout.value_dim, vs);
         Some(f32_rows_to_bhsd_array(
             &rows,
@@ -963,6 +1120,171 @@ pub fn new_cache_with_state(
     state: Arc<TurboQuantState>,
 ) -> QuantizedKvCache {
     QuantizedKvCache::with_state(config, state)
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GPU-native quantise / dequantise
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Quantise keys and values entirely on GPU.
+///
+/// Returns `None` if the GPU path is unavailable (e.g. missing codebook arr).
+/// On success returns `(GpuKeyStore, GpuValueStore)` — both shapes `[B, H, S, *]`.
+///
+/// Algorithm:
+///   1. Normalise onto unit sphere; keep per-vector L2 norm.
+///   2. Rotate: x_norm @ rotation.T  → rotated   [B, H, S, D]
+///   3. Nearest-centroid: argmin over squared diffs to codebook [C] → indices [B, H, S, D]
+///   4. (Keys) Reconstruct MSE approx, compute residual, project via J, take sign.
+fn gpu_quantize_kv(
+    state: &TurboQuantState,
+    keys: &InlineArray,   // [B, H, S, Dk]  f32
+    values: &InlineArray, // [B, H, S, Dv]  f32
+    config: TurboQuantConfig,
+) -> Option<(GpuKeyStore, GpuValueStore)> {
+    let TurboQuantTensorConfig::Uniform { bits: key_bits } = config.keys else {
+        return None;
+    };
+    let TurboQuantTensorConfig::Uniform { bits: val_bits } = config.values else {
+        return None;
+    };
+    let key_mse_bits = key_bits.saturating_sub(1);
+
+    let k_core = match &state.keys {
+        TensorRuntime::Uniform { core, .. } => core,
+        TensorRuntime::Mixed { .. } => return None,
+    };
+    let v_core = match &state.values {
+        TensorRuntime::Uniform { core, .. } => core,
+        TensorRuntime::Mixed { .. } => return None,
+    };
+
+    // ── Keys ─────────────────────────────────────────────────────────────
+    // 1. L2 norm along D axis, keepdims → [B, H, S, 1]
+    let key_norms = keys.norm_l2(-1, true);
+    // 2. Normalise: x / max(norm, eps)
+    let eps = InlineArray::from_f32(ZERO_EPSILON);
+    let safe_norms_k = key_norms.maximum(&eps);
+    let k_norm = keys.divide(&safe_norms_k);
+
+    // 3. Rotate: k_norm @ rotation.T  (CPU: matmul_rows(rotation, dim, input) = input @ rotation.T)
+    //    rotation.T == inverse_rotation, so we matmul with inverse_rotation_arr.
+    let k_rot = match &k_core.inverse_rotation_arr {
+        Some(rot_t) => k_norm.matmul(rot_t),
+        None => return None,
+    };
+
+    // 4. GPU nearest-centroid → [B, H, S, D] uint32
+    let k_indices = k_core.gpu_quantize_mse(&k_rot, key_mse_bits)?;
+
+    // 5. Reconstruct MSE approximation in the rotated space.
+    let k_mse_recon_rot = k_core.gpu_reconstruct_mse(&k_indices, key_mse_bits)?;
+
+    // 6. Residual norms: rotation-invariant, so compute directly in rotated space.
+    //    residual_rot = k_rot - k_mse_recon_rot  →  norm_l2  [B, H, S, 1]
+    let k_residual_rot = k_rot.subtract(&k_mse_recon_rot);
+    let k_residual_norms = k_residual_rot.norm_l2(-1, true);
+
+    // 7. QJL: project the residual in the **unrotated** space.
+    //    residual_unrot = k_mse_recon_rot @ rotation_arr  (inverse-rotate the rotated reconstruction)
+    //    then: residual_unrot = k_norm - inv_rotate(k_mse_recon_rot)
+    //    QJL: residual_unrot @ inverse_qjl_arr  (= residual @ qjl.T)
+    let rot = k_core.rotation_arr.as_ref()?;
+    let k_mse_recon_unrot = k_mse_recon_rot.matmul(rot);
+    let k_residual_unrot = k_norm.subtract(&k_mse_recon_unrot);
+    let k_qjl_proj = match &k_core.inverse_qjl_arr {
+        Some(inv_j) => k_residual_unrot.matmul(inv_j),
+        None => return None,
+    };
+    let k_qjl_signs = k_qjl_proj.sign();
+
+    // ── Values ────────────────────────────────────────────────────────────
+    let val_norms = values.norm_l2(-1, true);
+    let safe_norms_v = val_norms.maximum(&eps);
+    let v_norm = values.divide(&safe_norms_v);
+
+    // v_norm @ rotation.T = v_norm @ inverse_rotation_arr
+    let v_rot = match &v_core.inverse_rotation_arr {
+        Some(rot_t) => v_norm.matmul(rot_t),
+        None => return None,
+    };
+    let v_indices = v_core.gpu_quantize_mse(&v_rot, val_bits)?;
+
+    Some((
+        GpuKeyStore {
+            indices: k_indices,
+            norms: key_norms,
+            qjl_signs: k_qjl_signs,
+            residual_norms: k_residual_norms,
+        },
+        GpuValueStore {
+            indices: v_indices,
+            norms: val_norms,
+        },
+    ))
+}
+
+/// Dequantise GPU-stored keys back to `[B, H, T, Dk]` f32.
+///
+/// Formula (per coordinate):
+///   k̃ = (codebook[idx] + (√(π/2)/D) · (J^T · sign) · residual_norm) · norm  [inv-rotated]
+fn gpu_dequantize_keys(
+    store: &GpuKeyStore,
+    runtime: &TensorRuntime,
+    key_bits: u8,
+) -> Option<InlineArray> {
+    let key_mse_bits = key_bits.saturating_sub(1);
+    let core = match runtime {
+        TensorRuntime::Uniform { core, .. } => core,
+        TensorRuntime::Mixed { .. } => return None,
+    };
+
+    // 1. Reconstruct MSE centroids in the rotated domain: take(codebook, indices) → [B,H,T,D].
+    let mse_recon_rot = core.gpu_reconstruct_mse(&store.indices, key_mse_bits)?;
+
+    // 2. Inverse-rotate back to input space.
+    //    CPU: inverse_rotate_rows = matmul_rows(inverse_rotation, dim, input) = input @ inverse_rotation.T = input @ rotation.
+    //    So GPU: recon_rot @ rotation_arr.
+    let rot = core.rotation_arr.as_ref()?;
+    let mse_base = mse_recon_rot.matmul(rot);
+
+    // 3. QJL correction.
+    //    CPU: inverse_project_rows(signs) = matmul_rows(inverse_qjl, dim, signs) = signs @ inverse_qjl.T = signs @ qjl.
+    //    So GPU: qjl_signs @ qjl_arr.
+    let qjl = core.qjl_arr.as_ref()?;
+    let qjl_correction = store.qjl_signs.matmul(qjl);
+    let dim = core.dim as f32;
+    let qjl_scale_factor = InlineArray::from_f32((std::f32::consts::PI / 2.0).sqrt() / dim);
+    // residual_norms: [B,H,T,1] keepdims — broadcast along D.
+    let scale = store.residual_norms.multiply(&qjl_scale_factor);
+    let correction = qjl_correction.multiply(&scale);
+
+    // 4. Base + QJL correction, rescale by original L2 norm.
+    // norms: [B,H,T,1] keepdims — broadcast along D.
+    let combined = mse_base.add(&correction);
+    Some(combined.multiply(&store.norms))
+}
+
+/// Dequantise GPU-stored values back to `[B, H, T, Dv]` f32.
+fn gpu_dequantize_values(
+    store: &GpuValueStore,
+    runtime: &TensorRuntime,
+    val_bits: u8,
+) -> Option<InlineArray> {
+    let core = match runtime {
+        TensorRuntime::Uniform { core, .. } => core,
+        TensorRuntime::Mixed { .. } => return None,
+    };
+
+    // 1. Reconstruct MSE centroids in rotated space.
+    let mse_recon_rot = core.gpu_reconstruct_mse(&store.indices, val_bits)?;
+
+    // 2. Inverse-rotate: recon_rot @ rotation_arr (same derivation as keys).
+    let rot = core.rotation_arr.as_ref()?;
+    let mse_base = mse_recon_rot.matmul(rot);
+
+    // 3. Rescale by stored L2 norms [B,H,T,1].
+    Some(mse_base.multiply(&store.norms))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════

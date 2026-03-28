@@ -214,9 +214,13 @@ int mlx_inline_gdn_update(
 
 // ── Sampling ops ──
 void mlx_inline_argmax(mlx_inline_array* dst, const mlx_inline_array* a, int axis);
+void mlx_inline_argmin(mlx_inline_array* dst, const mlx_inline_array* a, int axis);
 void mlx_inline_logsumexp(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims);
 void mlx_inline_categorical(mlx_inline_array* dst, const mlx_inline_array* logits);
 void mlx_inline_negative(mlx_inline_array* dst, const mlx_inline_array* a);
+
+// ── Element-wise math ──
+void mlx_inline_abs(mlx_inline_array* dst, const mlx_inline_array* a);
 
 // ── Fused compiled ops (match Python's @mx.compile) ──
 // Each fuses multiple element-wise ops into a single Compiled dispatch node.
