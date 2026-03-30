@@ -192,8 +192,8 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<GptOssConfig, String> 
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
     // Some checkpoints nest config under "text_config"
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("failed to parse config.json: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
     let config_str = if json.get("text_config").is_some() {
         serde_json::to_string(&json["text_config"]).map_err(|e| e.to_string())?
     } else {
@@ -215,13 +215,13 @@ struct LayerWeights {
     post_ln_eps: f32,
 
     // Attention projections (pre-transposed [in, out] for direct matmul)
-    attn_q_w: InlineArray,   // [hidden, n_heads * head_dim]
+    attn_q_w: InlineArray,         // [hidden, n_heads * head_dim]
     attn_q_b: Option<InlineArray>, // [n_heads * head_dim]
-    attn_k_w: InlineArray,   // [hidden, n_kv_heads * head_dim]
+    attn_k_w: InlineArray,         // [hidden, n_kv_heads * head_dim]
     attn_k_b: Option<InlineArray>, // [n_kv_heads * head_dim]
-    attn_v_w: InlineArray,   // [hidden, n_kv_heads * head_dim]
+    attn_v_w: InlineArray,         // [hidden, n_kv_heads * head_dim]
     attn_v_b: Option<InlineArray>, // [n_kv_heads * head_dim]
-    attn_o_w: InlineArray,   // [n_heads * head_dim, hidden]
+    attn_o_w: InlineArray,         // [n_heads * head_dim, hidden]
     attn_o_b: Option<InlineArray>, // [hidden]
 
     // Attention dims
@@ -239,12 +239,12 @@ struct LayerWeights {
     // Stacked expert weights — shape [num_experts, hidden_size, intermediate_size]
     // pre-transposed to [num_experts, intermediate_size, hidden_size] for batched gather_mm
     // but actually stored as [num_experts, hidden, intermediate] with matmul handling transpose
-    moe_gate_w: InlineArray,  // [num_experts, hidden, intermediate]
-    moe_gate_b: InlineArray,  // [num_experts, intermediate]
-    moe_up_w: InlineArray,    // [num_experts, hidden, intermediate]
-    moe_up_b: InlineArray,    // [num_experts, intermediate]
-    moe_down_w: InlineArray,  // [num_experts, intermediate, hidden]
-    moe_down_b: InlineArray,  // [num_experts, hidden]
+    moe_gate_w: InlineArray, // [num_experts, hidden, intermediate]
+    moe_gate_b: InlineArray, // [num_experts, intermediate]
+    moe_up_w: InlineArray,   // [num_experts, hidden, intermediate]
+    moe_up_b: InlineArray,   // [num_experts, intermediate]
+    moe_down_w: InlineArray, // [num_experts, intermediate, hidden]
+    moe_down_b: InlineArray, // [num_experts, hidden]
 
     moe_num_experts: i32,
     moe_top_k: i32,
@@ -292,11 +292,11 @@ impl std::fmt::Debug for NativeWeights {
 ///   - Full attention: unbounded growth (256-token chunk reallocation strategy)
 ///   - Sliding attention: rotating window of `sliding_window` tokens
 pub struct KvLayerCache {
-    pub keys: Option<InlineArray>,   // [B, H, MAX_T, D] (or [B, H, window, D] for sliding)
+    pub keys: Option<InlineArray>, // [B, H, MAX_T, D] (or [B, H, window, D] for sliding)
     pub values: Option<InlineArray>, // [B, H, MAX_T, D]
-    pub offset: i32,                 // total tokens written
+    pub offset: i32,               // total tokens written
     pub is_sliding: bool,
-    pub window: i32,                 // sliding window size (ignored when is_sliding=false)
+    pub window: i32, // sliding window size (ignored when is_sliding=false)
 }
 
 /// Full model cache — one KV entry per layer.
@@ -313,8 +313,28 @@ impl NativeCache {
     pub fn eval_and_detach_states(&mut self) {
         let mut to_eval: Vec<&mut InlineArray> = Vec::new();
         for c in &mut self.kv_caches {
-            if let Some(ref mut k) = c.keys   { to_eval.push(k); }
-            if let Some(ref mut v) = c.values { to_eval.push(v); }
+            if let Some(k) = c.keys.take() {
+                let trimmed = if c.offset > 0 && c.offset < k.dim(2) {
+                    k.slice(&[0, 0, 0, 0], &[k.dim(0), k.dim(1), c.offset, k.dim(3)])
+                } else {
+                    k
+                };
+                c.keys = Some(trimmed);
+            }
+            if let Some(v) = c.values.take() {
+                let trimmed = if c.offset > 0 && c.offset < v.dim(2) {
+                    v.slice(&[0, 0, 0, 0], &[v.dim(0), v.dim(1), c.offset, v.dim(3)])
+                } else {
+                    v
+                };
+                c.values = Some(trimmed);
+            }
+            if let Some(ref mut k) = c.keys {
+                to_eval.push(k);
+            }
+            if let Some(ref mut v) = c.values {
+                to_eval.push(v);
+            }
         }
         bridge::eval_and_detach_many(&mut to_eval);
     }
@@ -374,7 +394,7 @@ pub fn load_model(
 ) -> Result<NativeWeights, String> {
     // ── Step 1: Shard discovery ─────────────────────────────────────────────
     let single_path = model_dir.join("model.safetensors");
-    let index_path  = model_dir.join("model.safetensors.index.json");
+    let index_path = model_dir.join("model.safetensors.index.json");
 
     let shard_paths: Vec<std::path::PathBuf> = if single_path.exists() {
         vec![single_path]
@@ -387,7 +407,7 @@ pub fn load_model(
             .get("weight_map")
             .and_then(|v| v.as_object())
             .ok_or_else(|| "index JSON missing weight_map".to_string())?;
-        let mut seen  = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
         let mut paths = Vec::new();
         for shard_file in weight_map.values() {
             let name = shard_file
@@ -409,8 +429,7 @@ pub fn load_model(
     };
 
     // ── Step 2: Load all tensors from all shards ────────────────────────────
-    let mut raw: std::collections::HashMap<String, InlineArray> =
-        std::collections::HashMap::new();
+    let mut raw: std::collections::HashMap<String, InlineArray> = std::collections::HashMap::new();
 
     for shard_path in &shard_paths {
         let path_str = shard_path
@@ -472,16 +491,16 @@ pub fn load_model(
 
                     // Produce two keys by replacing gate_up_proj with gate_proj / up_proj
                     let gate_key = base_key.replace("gate_up_proj", "gate_proj");
-                    let up_key   = base_key.replace("gate_up_proj", "up_proj");
+                    let up_key = base_key.replace("gate_up_proj", "up_proj");
 
                     new_entries.push((gate_key, gate_arr));
-                    new_entries.push((up_key,   up_arr));
+                    new_entries.push((up_key, up_arr));
                 }
             } else if k.contains("gate_up_proj_bias") {
                 if let Some(v) = raw.remove(k) {
                     let (gate_b, up_b) = split_gate_up_bias(&v);
                     new_entries.push((k.replace("gate_up_proj_bias", "gate_proj.bias"), gate_b));
-                    new_entries.push((k.replace("gate_up_proj_bias", "up_proj.bias"),   up_b));
+                    new_entries.push((k.replace("gate_up_proj_bias", "up_proj.bias"), up_b));
                 }
             } else if k.contains("down_proj") && !k.contains("bias") {
                 if let Some(v) = raw.remove(k) {
@@ -515,24 +534,16 @@ pub fn load_model(
     // ── Step 4: Build per-layer weight structs ──────────────────────────────
 
     let get = |key: &str| -> Result<InlineArray, String> {
-        raw.get(key)
-            .cloned()
-            .ok_or_else(|| {
-                let parts: Vec<&str> = key.rsplitn(2, '.').collect();
-                let suffix = parts[0];
-                let close: Vec<&String> = raw
-                    .keys()
-                    .filter(|k| k.ends_with(suffix))
-                    .take(5)
-                    .collect();
-                format!("missing weight key: {key} (close matches: {close:?})")
-            })
+        raw.get(key).cloned().ok_or_else(|| {
+            let parts: Vec<&str> = key.rsplitn(2, '.').collect();
+            let suffix = parts[0];
+            let close: Vec<&String> = raw.keys().filter(|k| k.ends_with(suffix)).take(5).collect();
+            format!("missing weight key: {key} (close matches: {close:?})")
+        })
     };
-    let get_opt = |key: &str| -> Option<InlineArray> {
-        raw.get(key).cloned()
-    };
+    let get_opt = |key: &str| -> Option<InlineArray> { raw.get(key).cloned() };
 
-    let embed_w      = get("model.embed_tokens.weight")?;
+    let embed_w = get("model.embed_tokens.weight")?;
     let final_norm_w = get("model.norm.weight")?;
     let final_norm_eps = config.rms_norm_eps;
     let lm_head_w = if config.tie_word_embeddings {
@@ -544,27 +555,27 @@ pub fn load_model(
 
     let model_dtype = embed_w.dtype_raw();
 
-    let n_heads    = config.num_attention_heads;
+    let n_heads = config.num_attention_heads;
     let n_kv_heads = config.num_key_value_heads;
-    let head_dim   = config.head_dim;
+    let head_dim = config.head_dim;
     let attn_scale = 1.0_f32 / (head_dim as f32).sqrt();
-    let rope_base  = config.rope_theta;
-    let n_experts  = config.num_local_experts;
-    let top_k      = config.experts_per_tok();
-    let use_bias   = config.attention_bias;
+    let rope_base = config.rope_theta;
+    let n_experts = config.num_local_experts;
+    let top_k = config.experts_per_tok();
+    let use_bias = config.attention_bias;
 
     let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
 
     for li in 0..config.num_hidden_layers as usize {
-        let p         = format!("model.layers.{li}");
-        let sa        = format!("{p}.self_attn");
-        let mlp       = format!("{p}.mlp");
+        let p = format!("model.layers.{li}");
+        let sa = format!("{p}.self_attn");
+        let mlp = format!("{p}.mlp");
         let layer_type = config.layer_type(li);
         let is_sliding = layer_type == AttentionLayerType::SlidingAttention;
 
         // Layer norms
         let input_ln_w = get(&format!("{p}.input_layernorm.weight"))?;
-        let post_ln_w  = get(&format!("{p}.post_attention_layernorm.weight"))?;
+        let post_ln_w = get(&format!("{p}.post_attention_layernorm.weight"))?;
 
         // Attention projections — stored as [out, in], pre-transpose to [in, out]
         let attn_q_w = get(&format!("{sa}.q_proj.weight"))?.t();
@@ -573,10 +584,26 @@ pub fn load_model(
         let attn_o_w = get(&format!("{sa}.o_proj.weight"))?.t();
 
         // Optional attention biases
-        let attn_q_b = if use_bias { get_opt(&format!("{sa}.q_proj.bias")) } else { None };
-        let attn_k_b = if use_bias { get_opt(&format!("{sa}.k_proj.bias")) } else { None };
-        let attn_v_b = if use_bias { get_opt(&format!("{sa}.v_proj.bias")) } else { None };
-        let attn_o_b = if use_bias { get_opt(&format!("{sa}.o_proj.bias")) } else { None };
+        let attn_q_b = if use_bias {
+            get_opt(&format!("{sa}.q_proj.bias"))
+        } else {
+            None
+        };
+        let attn_k_b = if use_bias {
+            get_opt(&format!("{sa}.k_proj.bias"))
+        } else {
+            None
+        };
+        let attn_v_b = if use_bias {
+            get_opt(&format!("{sa}.v_proj.bias"))
+        } else {
+            None
+        };
+        let attn_o_b = if use_bias {
+            get_opt(&format!("{sa}.o_proj.bias"))
+        } else {
+            None
+        };
 
         // MoE router — stored as [num_experts, hidden]; pre-transpose to [hidden, num_experts]
         let moe_router_w = get(&format!("{mlp}.router.weight"))?.t();
@@ -591,14 +618,14 @@ pub fn load_model(
         // InlineArray.t() on 3-D does a full transpose of the last two dims — this
         // matches what we want: [num_experts, in, out] after transposing.
         let moe_gate_w = get(&format!("{mlp}.experts.gate_proj.weight"))?.t();
-        let moe_up_w   = get(&format!("{mlp}.experts.up_proj.weight"))?.t();
+        let moe_up_w = get(&format!("{mlp}.experts.up_proj.weight"))?.t();
         // down_proj: [num_experts, hidden, intermediate] — transpose to [num_experts, intermediate, hidden]
         // to match gather_mm(clamped, down_w) → clamped: [T, inter], down_w: [inter, hidden]
         let moe_down_w = get(&format!("{mlp}.experts.down_proj.weight"))?.t();
 
         // Expert biases — [num_experts, out_features]; accessed by index during routing
         let moe_gate_b = get(&format!("{mlp}.experts.gate_proj.bias"))?;
-        let moe_up_b   = get(&format!("{mlp}.experts.up_proj.bias"))?;
+        let moe_up_b = get(&format!("{mlp}.experts.up_proj.bias"))?;
         let moe_down_b = get(&format!("{mlp}.experts.down_proj.bias"))?;
 
         layers.push(LayerWeights {
@@ -648,39 +675,38 @@ pub fn load_model(
     }
 
     // ── Step 5: copy_fresh — force all weights into fresh Metal buffers ─────
-    let zero      = InlineArray::from_f32(0.0).as_dtype(model_dtype);
+    let zero = InlineArray::from_f32(0.0).as_dtype(model_dtype);
     let copy_fresh = |w: &InlineArray| -> InlineArray {
         let mut fresh = w.add(&zero);
         fresh.eval();
         fresh.detach();
         fresh
     };
-    let copy_fresh_opt = |w: Option<InlineArray>| -> Option<InlineArray> {
-        w.map(|w| copy_fresh(&w))
-    };
+    let copy_fresh_opt =
+        |w: Option<InlineArray>| -> Option<InlineArray> { w.map(|w| copy_fresh(&w)) };
 
-    let embed_w      = copy_fresh(&embed_w);
+    let embed_w = copy_fresh(&embed_w);
     let final_norm_w = copy_fresh(&final_norm_w);
-    let lm_head_w    = lm_head_w.map(|w| copy_fresh(&w));
+    let lm_head_w = lm_head_w.map(|w| copy_fresh(&w));
 
     for lw in &mut layers {
-        lw.input_ln_w    = copy_fresh(&lw.input_ln_w);
-        lw.post_ln_w     = copy_fresh(&lw.post_ln_w);
-        lw.attn_q_w      = copy_fresh(&lw.attn_q_w);
-        lw.attn_k_w      = copy_fresh(&lw.attn_k_w);
-        lw.attn_v_w      = copy_fresh(&lw.attn_v_w);
-        lw.attn_o_w      = copy_fresh(&lw.attn_o_w);
-        lw.attn_q_b      = copy_fresh_opt(lw.attn_q_b.take());
-        lw.attn_k_b      = copy_fresh_opt(lw.attn_k_b.take());
-        lw.attn_v_b      = copy_fresh_opt(lw.attn_v_b.take());
-        lw.attn_o_b      = copy_fresh_opt(lw.attn_o_b.take());
-        lw.moe_router_w  = copy_fresh(&lw.moe_router_w);
-        lw.moe_gate_w    = copy_fresh(&lw.moe_gate_w);
-        lw.moe_gate_b    = copy_fresh(&lw.moe_gate_b);
-        lw.moe_up_w      = copy_fresh(&lw.moe_up_w);
-        lw.moe_up_b      = copy_fresh(&lw.moe_up_b);
-        lw.moe_down_w    = copy_fresh(&lw.moe_down_w);
-        lw.moe_down_b    = copy_fresh(&lw.moe_down_b);
+        lw.input_ln_w = copy_fresh(&lw.input_ln_w);
+        lw.post_ln_w = copy_fresh(&lw.post_ln_w);
+        lw.attn_q_w = copy_fresh(&lw.attn_q_w);
+        lw.attn_k_w = copy_fresh(&lw.attn_k_w);
+        lw.attn_v_w = copy_fresh(&lw.attn_v_w);
+        lw.attn_o_w = copy_fresh(&lw.attn_o_w);
+        lw.attn_q_b = copy_fresh_opt(lw.attn_q_b.take());
+        lw.attn_k_b = copy_fresh_opt(lw.attn_k_b.take());
+        lw.attn_v_b = copy_fresh_opt(lw.attn_v_b.take());
+        lw.attn_o_b = copy_fresh_opt(lw.attn_o_b.take());
+        lw.moe_router_w = copy_fresh(&lw.moe_router_w);
+        lw.moe_gate_w = copy_fresh(&lw.moe_gate_w);
+        lw.moe_gate_b = copy_fresh(&lw.moe_gate_b);
+        lw.moe_up_w = copy_fresh(&lw.moe_up_w);
+        lw.moe_up_b = copy_fresh(&lw.moe_up_b);
+        lw.moe_down_w = copy_fresh(&lw.moe_down_w);
+        lw.moe_down_b = copy_fresh(&lw.moe_down_b);
     }
 
     eprintln!("[GPT-OSS] load_model: all weights force-copied into fresh Metal buffers");
@@ -748,9 +774,9 @@ fn split_gate_up(v: &InlineArray, suffix: &str) -> (InlineArray, InlineArray) {
     // Build start/stop index arrays for slice on split_dim.
     // All other dims are taken in full: start=0, stop=dim(i).
     let start_gate = vec![0i32; ndim as usize];
-    let mut stop_gate  = (0..ndim).map(|i| v.dim(i)).collect::<Vec<_>>();
-    let mut start_up   = vec![0i32; ndim as usize];
-    let stop_up    = stop_gate.clone();
+    let mut stop_gate = (0..ndim).map(|i| v.dim(i)).collect::<Vec<_>>();
+    let mut start_up = vec![0i32; ndim as usize];
+    let stop_up = stop_gate.clone();
 
     // gate: [0..half] along split_dim
     stop_gate[split_dim as usize] = half;
@@ -761,20 +787,20 @@ fn split_gate_up(v: &InlineArray, suffix: &str) -> (InlineArray, InlineArray) {
         // For scales the fused axis may be the last dim — use the same logic
         // but fall back to a split on axis -1 when ndim == 1.
         let axis = if ndim == 1 { 0i32 } else { split_dim };
-        let sg     = vec![0i32; ndim as usize];
+        let sg = vec![0i32; ndim as usize];
         let mut eg = (0..ndim).map(|i| v.dim(i)).collect::<Vec<_>>();
         let mut su = sg.clone();
-        let eu     = eg.clone();
+        let eu = eg.clone();
         let half_s = eg[axis as usize] / 2;
         eg[axis as usize] = half_s;
         su[axis as usize] = half_s;
         let gate = v.slice(&sg, &eg);
-        let up   = v.slice(&su, &eu);
+        let up = v.slice(&su, &eu);
         return (gate, up);
     }
 
     let gate = v.slice(&start_gate, &stop_gate);
-    let up   = v.slice(&start_up,  &stop_up);
+    let up = v.slice(&start_up, &stop_up);
     (gate, up)
 }
 
@@ -783,21 +809,21 @@ fn split_gate_up(v: &InlineArray, suffix: &str) -> (InlineArray, InlineArray) {
 /// Shape `[num_experts, out*2]` → gate `[num_experts, out]`, up `[num_experts, out]`.
 /// Shape `[out*2]` → gate `[out]`, up `[out]`.
 fn split_gate_up_bias(v: &InlineArray) -> (InlineArray, InlineArray) {
-    let ndim   = v.ndim();
-    let last   = (ndim - 1) as i32;
-    let total  = v.dim(last);
-    let half   = total / 2;
+    let ndim = v.ndim();
+    let last = (ndim - 1) as i32;
+    let total = v.dim(last);
+    let half = total / 2;
 
-    let sg     = vec![0i32; ndim as usize];
+    let sg = vec![0i32; ndim as usize];
     let mut eg = (0..ndim).map(|i| v.dim(i)).collect::<Vec<_>>();
     let mut su = sg.clone();
-    let eu     = eg.clone();
+    let eu = eg.clone();
 
     eg[last as usize] = half;
     su[last as usize] = half;
 
     let gate = v.slice(&sg, &eg);
-    let up   = v.slice(&su, &eu);
+    let up = v.slice(&su, &eu);
     (gate, up)
 }
 
@@ -821,8 +847,8 @@ pub fn forward_step(
     token_ids: &InlineArray, // [B, T]
     cache: &mut NativeCache,
 ) -> InlineArray {
-    let b     = token_ids.dim(0);
-    let s     = token_ids.dim(1);
+    let b = token_ids.dim(0);
+    let s = token_ids.dim(1);
     let dtype = weights.model_dtype;
 
     // Embedding lookup: [B, T, hidden]
@@ -833,7 +859,15 @@ pub fn forward_step(
         let normed = hidden.rms_norm(Some(&lw.input_ln_w), lw.input_ln_eps);
 
         // Attention
-        let attn_out = attn_forward(lw, &normed, b, s, &mut cache.kv_caches[li], cache.rope_offset, dtype);
+        let attn_out = attn_forward(
+            lw,
+            &normed,
+            b,
+            s,
+            &mut cache.kv_caches[li],
+            cache.rope_offset,
+            dtype,
+        );
 
         // Residual
         let h = hidden.add(&attn_out);
@@ -873,10 +907,10 @@ fn attn_forward(
     rope_offset: i32,
     dtype: i32,
 ) -> InlineArray {
-    let n_heads    = lw.attn_n_heads;
+    let n_heads = lw.attn_n_heads;
     let n_kv_heads = lw.attn_n_kv_heads;
-    let head_dim   = lw.attn_head_dim;
-    let scale      = lw.attn_scale;
+    let head_dim = lw.attn_head_dim;
+    let scale = lw.attn_scale;
 
     // Q, K, V projections — [B, S, n_heads*head_dim]
     let mut q = normed.matmul(&lw.attn_q_w);
@@ -884,23 +918,35 @@ fn attn_forward(
     let mut v = normed.matmul(&lw.attn_v_w);
 
     // Add attention biases if present
-    if let Some(ref qb) = lw.attn_q_b { q = q.add(qb); }
-    if let Some(ref kb) = lw.attn_k_b { k = k.add(kb); }
-    if let Some(ref vb) = lw.attn_v_b { v = v.add(vb); }
+    if let Some(ref qb) = lw.attn_q_b {
+        q = q.add(qb);
+    }
+    if let Some(ref kb) = lw.attn_k_b {
+        k = k.add(kb);
+    }
+    if let Some(ref vb) = lw.attn_v_b {
+        v = v.add(vb);
+    }
 
     // Reshape to [B, S, H, D] then transpose to [B, H, S, D]
-    let q = q.reshape(&[b, s, n_heads,    head_dim]).transpose_axes(&[0, 2, 1, 3]);
-    let k = k.reshape(&[b, s, n_kv_heads, head_dim]).transpose_axes(&[0, 2, 1, 3]);
-    let v = v.reshape(&[b, s, n_kv_heads, head_dim]).transpose_axes(&[0, 2, 1, 3]);
+    let q = q
+        .reshape(&[b, s, n_heads, head_dim])
+        .transpose_axes(&[0, 2, 1, 3]);
+    let k = k
+        .reshape(&[b, s, n_kv_heads, head_dim])
+        .transpose_axes(&[0, 2, 1, 3]);
+    let v = v
+        .reshape(&[b, s, n_kv_heads, head_dim])
+        .transpose_axes(&[0, 2, 1, 3]);
 
     // Full RoPE (head_dim = 64, no partial rotation)
     let q = q.rope(head_dim, false, lw.attn_rope_base, 1.0, rope_offset);
     let k = k.rope(head_dim, false, lw.attn_rope_base, 1.0, rope_offset);
 
     // KV cache update
-    let prev    = cache.offset;
+    let prev = cache.offset;
     let num_new = k.dim(2); // S
-    let next    = prev + num_new;
+    let next = prev + num_new;
 
     if lw.attn_is_sliding {
         // Rotating / sliding window cache: only keep `window` most recent tokens.
@@ -910,25 +956,31 @@ fn attn_forward(
         let window = lw.attn_sliding_window;
 
         if cache.keys.is_none() {
-            cache.keys   = Some(InlineArray::zeros(&[b, n_kv_heads, window, head_dim], dtype));
-            cache.values = Some(InlineArray::zeros(&[b, n_kv_heads, window, head_dim], dtype));
+            cache.keys = Some(InlineArray::zeros(
+                &[b, n_kv_heads, window, head_dim],
+                dtype,
+            ));
+            cache.values = Some(InlineArray::zeros(
+                &[b, n_kv_heads, window, head_dim],
+                dtype,
+            ));
         }
 
         if next <= window {
             // Simple write: fits in window without rotation
             let start = [0, 0, prev, 0];
-            let stop  = [b, n_kv_heads, next, head_dim];
+            let stop = [b, n_kv_heads, next, head_dim];
             let k_buf = cache.keys.take().unwrap();
             let v_buf = cache.values.take().unwrap();
-            cache.keys   = Some(k_buf.slice_set(&k, &start, &stop));
+            cache.keys = Some(k_buf.slice_set(&k, &start, &stop));
             cache.values = Some(v_buf.slice_set(&v, &start, &stop));
         } else {
             // Rotate: drop oldest tokens to make room for `num_new`.
             // shift = how many positions to rotate left
-            let shift  = (next - window).min(window);
+            let shift = (next - window).min(window);
             let remain = window - shift; // tokens kept from previous
-            let k_buf  = cache.keys.take().unwrap();
-            let v_buf  = cache.values.take().unwrap();
+            let k_buf = cache.keys.take().unwrap();
+            let v_buf = cache.values.take().unwrap();
 
             // Copy the tail [shift..window] → [0..remain]
             let k_old = k_buf.slice(&[0, 0, shift, 0], &[b, n_kv_heads, window, head_dim]);
@@ -938,45 +990,70 @@ fn attn_forward(
             let new_v_buf = InlineArray::zeros(&[b, n_kv_heads, window, head_dim], dtype);
 
             // Write old tail to front
-            let k_rotated = new_k_buf.slice_set(&k_old, &[0, 0, 0, 0], &[b, n_kv_heads, remain, head_dim]);
-            let v_rotated = new_v_buf.slice_set(&v_old, &[0, 0, 0, 0], &[b, n_kv_heads, remain, head_dim]);
+            let k_rotated =
+                new_k_buf.slice_set(&k_old, &[0, 0, 0, 0], &[b, n_kv_heads, remain, head_dim]);
+            let v_rotated =
+                new_v_buf.slice_set(&v_old, &[0, 0, 0, 0], &[b, n_kv_heads, remain, head_dim]);
 
             // Append new tokens after old tail
             let write_start = remain.min(window - num_new);
-            let write_end   = (write_start + num_new).min(window);
-            let actual_new  = write_end - write_start;
+            let write_end = (write_start + num_new).min(window);
+            let actual_new = write_end - write_start;
 
-            let k_slice = k.slice(&[0, 0, num_new - actual_new, 0], &[b, n_kv_heads, num_new, head_dim]);
-            let v_slice = v.slice(&[0, 0, num_new - actual_new, 0], &[b, n_kv_heads, num_new, head_dim]);
+            let k_slice = k.slice(
+                &[0, 0, num_new - actual_new, 0],
+                &[b, n_kv_heads, num_new, head_dim],
+            );
+            let v_slice = v.slice(
+                &[0, 0, num_new - actual_new, 0],
+                &[b, n_kv_heads, num_new, head_dim],
+            );
 
-            let k_final = k_rotated.slice_set(&k_slice, &[0, 0, write_start, 0], &[b, n_kv_heads, write_end, head_dim]);
-            let v_final = v_rotated.slice_set(&v_slice, &[0, 0, write_start, 0], &[b, n_kv_heads, write_end, head_dim]);
+            let k_final = k_rotated.slice_set(
+                &k_slice,
+                &[0, 0, write_start, 0],
+                &[b, n_kv_heads, write_end, head_dim],
+            );
+            let v_final = v_rotated.slice_set(
+                &v_slice,
+                &[0, 0, write_start, 0],
+                &[b, n_kv_heads, write_end, head_dim],
+            );
 
-            cache.keys   = Some(k_final);
+            cache.keys = Some(k_final);
             cache.values = Some(v_final);
         }
         cache.offset = next;
 
         // For SDPA we use the full window buffer (up to `min(next, window)` valid tokens)
         let valid = next.min(window);
-        let valid_keys   = cache.keys.as_ref().unwrap().slice(
-            &[0, 0, 0, 0], &[b, n_kv_heads, valid, head_dim],
-        );
-        let valid_values = cache.values.as_ref().unwrap().slice(
-            &[0, 0, 0, 0], &[b, n_kv_heads, valid, head_dim],
-        );
-        let output = q.sdpa(&valid_keys, &valid_values, scale, "causal");
-        let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[b, s, n_heads * head_dim]);
+        let valid_keys = cache
+            .keys
+            .as_ref()
+            .unwrap()
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, valid, head_dim]);
+        let valid_values = cache
+            .values
+            .as_ref()
+            .unwrap()
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, valid, head_dim]);
+        let output =
+            crate::decode::sdpa_causal_like_mlx(&q, &valid_keys, &valid_values, scale, s);
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[b, s, n_heads * head_dim]);
 
         // Output projection + bias
         let mut proj = output.matmul(&lw.attn_o_w);
-        if let Some(ref ob) = lw.attn_o_b { proj = proj.add(ob); }
+        if let Some(ref ob) = lw.attn_o_b {
+            proj = proj.add(ob);
+        }
         proj
     } else {
         // Full attention: growing pre-allocated buffer (256-token chunk strategy)
         if cache.keys.is_none() {
             let alloc = 256i32;
-            cache.keys   = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
+            cache.keys = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
             cache.values = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
         } else {
             let allocated = cache.keys.as_ref().unwrap().dim(2);
@@ -985,33 +1062,42 @@ fn attn_forward(
                 let old_v = cache.values.take().unwrap();
                 let ext_k = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
                 let ext_v = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
-                cache.keys   = Some(old_k.kv_cache_append(&ext_k, 2));
+                cache.keys = Some(old_k.kv_cache_append(&ext_k, 2));
                 cache.values = Some(old_v.kv_cache_append(&ext_v, 2));
             }
         }
 
         // In-place update: cache[..., prev:next, :] = new_kv
         let start = [0, 0, prev, 0];
-        let stop  = [b, n_kv_heads, next, head_dim];
+        let stop = [b, n_kv_heads, next, head_dim];
         let k_buf = cache.keys.take().unwrap();
         let v_buf = cache.values.take().unwrap();
-        cache.keys   = Some(k_buf.slice_set(&k, &start, &stop));
+        cache.keys = Some(k_buf.slice_set(&k, &start, &stop));
         cache.values = Some(v_buf.slice_set(&v, &start, &stop));
         cache.offset = next;
 
         // SDPA on the valid portion
-        let valid_keys   = cache.keys.as_ref().unwrap().slice(
-            &[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim],
-        );
-        let valid_values = cache.values.as_ref().unwrap().slice(
-            &[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim],
-        );
-        let output = q.sdpa(&valid_keys, &valid_values, scale, "causal");
-        let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[b, s, n_heads * head_dim]);
+        let valid_keys = cache
+            .keys
+            .as_ref()
+            .unwrap()
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+        let valid_values = cache
+            .values
+            .as_ref()
+            .unwrap()
+            .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+        let output =
+            crate::decode::sdpa_causal_like_mlx(&q, &valid_keys, &valid_values, scale, s);
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[b, s, n_heads * head_dim]);
 
         // Output projection + bias
         let mut proj = output.matmul(&lw.attn_o_w);
-        if let Some(ref ob) = lw.attn_o_b { proj = proj.add(ob); }
+        if let Some(ref ob) = lw.attn_o_b {
+            proj = proj.add(ob);
+        }
         proj
     }
 }
@@ -1038,7 +1124,7 @@ fn attn_forward(
 fn moe_forward(lw: &LayerWeights, normed: &InlineArray, b: i32, s: i32) -> InlineArray {
     // Flatten to [B*T, hidden]
     let hidden_size = normed.dim(2);
-    let bt          = b * s;
+    let bt = b * s;
     let hidden_flat = normed.reshape(&[bt, hidden_size]);
 
     // Router logits: [B*T, num_experts]
@@ -1048,24 +1134,29 @@ fn moe_forward(lw: &LayerWeights, normed: &InlineArray, b: i32, s: i32) -> Inlin
     let scores = router_logits.sigmoid();
 
     // Top-k: argpartition at kth = -top_k gives top-k indices in the last k slots
-    let neg_k          = -lw.moe_top_k;
-    let partitioned    = scores.argpartition(neg_k, -1);          // [B*T, num_experts]
-    let top_k_indices  = partitioned.slice(&[0, lw.moe_num_experts - lw.moe_top_k], &[bt, lw.moe_num_experts]);
+    let neg_k = -lw.moe_top_k;
+    let partitioned = scores.argpartition(neg_k, -1); // [B*T, num_experts]
+    let top_k_indices = partitioned.slice(
+        &[0, lw.moe_num_experts - lw.moe_top_k],
+        &[bt, lw.moe_num_experts],
+    );
     // Re-cast to int32 for gather ops (argpartition returns int32 already, but ensure)
-    let top_k_scores   = scores.take_along_axis(&top_k_indices, -1); // [B*T, top_k]
+    let top_k_scores = scores.take_along_axis(&top_k_indices, -1); // [B*T, top_k]
 
     // Normalize: weights = scores / max(sum, 1e-8)
-    let sum_scores   = top_k_scores.sum_axis(-1, true);           // [B*T, 1]
-    let eps          = InlineArray::from_f32(1e-8).as_dtype(sum_scores.dtype_raw());
-    let safe_sum     = sum_scores.maximum(&eps);
-    let expert_weights = top_k_scores.divide(&safe_sum);          // [B*T, top_k]
+    let sum_scores = top_k_scores.sum_axis(-1, true); // [B*T, 1]
+    let eps = InlineArray::from_f32(1e-8).as_dtype(sum_scores.dtype_raw());
+    let safe_sum = sum_scores.maximum(&eps);
+    let expert_weights = top_k_scores.divide(&safe_sum); // [B*T, top_k]
 
     // Accumulate expert outputs
     let mut output = InlineArray::zeros(&[bt, hidden_size], hidden_flat.dtype_raw());
 
     for slot in 0..lw.moe_top_k {
         // Expert indices for this slot: [B*T]
-        let slot_experts = top_k_indices.slice(&[0, slot], &[bt, slot + 1]).reshape(&[bt]);
+        let slot_experts = top_k_indices
+            .slice(&[0, slot], &[bt, slot + 1])
+            .reshape(&[bt]);
         // Expert weights for this slot: [B*T, 1]
         let slot_weights = expert_weights.slice(&[0, slot], &[bt, slot + 1]);
 
@@ -1073,23 +1164,26 @@ fn moe_forward(lw: &LayerWeights, normed: &InlineArray, b: i32, s: i32) -> Inlin
         // stacked shape: [num_experts, hidden, intermediate] (gate/up) or [num_experts, intermediate, hidden] (down)
         // take_axis(slot_experts, 0) → [B*T, hidden, intermediate]
         let gate_w = lw.moe_gate_w.take_axis(&slot_experts, 0); // [B*T, hidden, inter]
-        let up_w   = lw.moe_up_w  .take_axis(&slot_experts, 0); // [B*T, hidden, inter]
+        let up_w = lw.moe_up_w.take_axis(&slot_experts, 0); // [B*T, hidden, inter]
         let down_w = lw.moe_down_w.take_axis(&slot_experts, 0); // [B*T, inter, hidden]
         let gate_b = lw.moe_gate_b.take_axis(&slot_experts, 0); // [B*T, inter]
-        let up_b   = lw.moe_up_b  .take_axis(&slot_experts, 0); // [B*T, inter]
+        let up_b = lw.moe_up_b.take_axis(&slot_experts, 0); // [B*T, inter]
         let down_b = lw.moe_down_b.take_axis(&slot_experts, 0); // [B*T, hidden]
 
         // Batched matmul: [B*T, 1, hidden] @ [B*T, hidden, inter] → [B*T, 1, inter] → [B*T, inter]
-        let h_exp  = hidden_flat.reshape(&[bt, 1, hidden_size]);
+        let h_exp = hidden_flat.reshape(&[bt, 1, hidden_size]);
         let gate_out = h_exp.matmul(&gate_w).reshape(&[bt, -1]).add(&gate_b);
-        let up_out   = h_exp.matmul(&up_w  ).reshape(&[bt, -1]).add(&up_b);
+        let up_out = h_exp.matmul(&up_w).reshape(&[bt, -1]).add(&up_b);
 
         // GPT-OSS SwiGLU activation with clamping
         let act = gpt_oss_swiglu(&gate_out, &up_out, lw.swiglu_alpha, lw.swiglu_limit);
 
         // Down projection: [B*T, 1, inter] @ [B*T, inter, hidden] → [B*T, hidden]
-        let act_exp  = act.reshape(&[bt, 1, -1]);
-        let slot_out = act_exp.matmul(&down_w).reshape(&[bt, hidden_size]).add(&down_b);
+        let act_exp = act.reshape(&[bt, 1, -1]);
+        let slot_out = act_exp
+            .matmul(&down_w)
+            .reshape(&[bt, hidden_size])
+            .add(&down_b);
 
         // Weighted accumulation
         output = output.add(&slot_out.multiply(&slot_weights));
@@ -1117,25 +1211,30 @@ fn moe_forward(lw: &LayerWeights, normed: &InlineArray, b: i32, s: i32) -> Inlin
 /// `InlineArray` exposes `maximum` but not `minimum`.  Upper-clamp is
 /// implemented as `−maximum(−x, −limit)` (de Morgan's min/max identity).
 #[inline]
-fn gpt_oss_swiglu(x_linear: &InlineArray, x_glu: &InlineArray, alpha: f32, limit: f32) -> InlineArray {
+fn gpt_oss_swiglu(
+    x_linear: &InlineArray,
+    x_glu: &InlineArray,
+    alpha: f32,
+    limit: f32,
+) -> InlineArray {
     let neg_limit_arr = InlineArray::from_f32(-limit).as_dtype(x_glu.dtype_raw());
-    let alpha_arr     = InlineArray::from_f32(alpha).as_dtype(x_glu.dtype_raw());
-    let one_arr       = InlineArray::from_f32(1.0).as_dtype(x_linear.dtype_raw());
+    let alpha_arr = InlineArray::from_f32(alpha).as_dtype(x_glu.dtype_raw());
+    let one_arr = InlineArray::from_f32(1.0).as_dtype(x_linear.dtype_raw());
 
     // clip(x_glu, a_max=limit) = -maximum(-x_glu, -limit)
-    let x_glu_clamped  = x_glu.negative().maximum(&neg_limit_arr).negative();
+    let x_glu_clamped = x_glu.negative().maximum(&neg_limit_arr).negative();
     // clip(x_linear, a_min=-limit, a_max=limit):
     //   lower: maximum(x_linear, -limit)
     //   upper: -maximum(-result, -limit)
-    let x_lin_lo       = x_linear.maximum(&neg_limit_arr);
-    let x_lin_clamped  = x_lin_lo.negative().maximum(&neg_limit_arr).negative();
+    let x_lin_lo = x_linear.maximum(&neg_limit_arr);
+    let x_lin_clamped = x_lin_lo.negative().maximum(&neg_limit_arr).negative();
 
     // sigmoid(alpha * x_glu)
     let glu_scaled = x_glu_clamped.multiply(&alpha_arr);
-    let sig        = glu_scaled.sigmoid();
+    let sig = glu_scaled.sigmoid();
 
     // out_glu = x_glu * sigmoid(alpha * x_glu)
-    let out_glu    = x_glu_clamped.multiply(&sig);
+    let out_glu = x_glu_clamped.multiply(&sig);
 
     // (x_linear + 1)
     let lin_biased = x_lin_clamped.add(&one_arr);
@@ -1152,15 +1251,7 @@ fn gpt_oss_swiglu(x_linear: &InlineArray, x_glu: &InlineArray, alpha: f32, limit
 ///
 /// `temperature <= 0.0` → greedy argmax; otherwise categorical sampling.
 pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
-    if temperature <= 0.0 {
-        logits_2d.argmax(-1)
-    } else {
-        let inv_temp = InlineArray::from_f32(1.0 / temperature);
-        let lse      = logits_2d.logsumexp(-1, true);
-        let log_prob = logits_2d.subtract(&lse);
-        let scaled   = log_prob.multiply(&inv_temp);
-        scaled.categorical()
-    }
+    crate::decode::sample_token(logits_2d, temperature)
 }
 
 // ============================================================================
@@ -1184,31 +1275,17 @@ pub fn generate(
 ) -> Vec<u32> {
     let mut tokens = Vec::with_capacity(max_tokens);
 
-    // Flush prefill residue from the Metal buffer cache.
-    bridge::clear_cache();
-    bridge::reset_peak_memory();
-    // Enable MLX global compile — fuses element-wise ops across the eval graph.
-    bridge::enable_compile();
-    // Dedicated GPU stream for generation — prevents interference with default stream.
-    bridge::new_generation_stream();
-    bridge::set_generation_stream();
-    // Wire model weights into GPU memory — prevents paging during decode.
-    bridge::set_wired_limit_max();
-    eprintln!(
-        "[GPT-OSS] generate: dtype={} active={:.0}MB",
-        weights.model_dtype,
-        bridge::get_active_memory() as f64 / 1e6,
-    );
+    crate::decode::begin_generation_session("GPT-OSS", weights.model_dtype);
 
     // Evaluate and detach all prefill cache states before decode.
     cache.eval_and_detach_states();
     bridge::clear_cache();
 
     // First decode step
-    let input_token  = InlineArray::from_i32(first_token as i32).reshape(&[1, 1]);
-    let logits       = forward_step(weights, &input_token, cache);
+    let input_token = InlineArray::from_i32(first_token as i32).reshape(&[1, 1]);
+    let logits = forward_step(weights, &input_token, cache);
     // Squeeze sequence dim: [B, 1, vocab] → [B, vocab]
-    let logits_2d    = logits.squeeze(1);
+    let logits_2d = logits.squeeze(1);
     let mut current_y = sample_token(&logits_2d, temperature);
     // Start async GPU eval concurrently with CPU.
     current_y.async_eval_ref();
@@ -1216,6 +1293,19 @@ pub fn generate(
     let mut step_times: Vec<f64> = Vec::new();
 
     for step in 0..max_tokens {
+        let next_y = if step + 1 < max_tokens {
+            let t_step = std::time::Instant::now();
+            let next_input = current_y.reshape(&[1, 1]);
+            let next_logits = forward_step(weights, &next_input, cache);
+            let next_logits_2d = next_logits.squeeze(1);
+            let next_y = sample_token(&next_logits_2d, temperature);
+            next_y.async_eval_ref();
+            step_times.push(t_step.elapsed().as_secs_f64() * 1000.0);
+            Some(next_y)
+        } else {
+            None
+        };
+
         if step == 0 {
             current_y.eval();
         }
@@ -1225,18 +1315,10 @@ pub fn generate(
         if !on_token(token_val) {
             break;
         }
-        if step + 1 >= max_tokens {
+        let Some(next_y) = next_y else {
             break;
-        }
-
-        let t_step       = std::time::Instant::now();
-        let next_input   = InlineArray::from_i32(token_val as i32).reshape(&[1, 1]);
-        let next_logits  = forward_step(weights, &next_input, cache);
-        let next_logits_2d = next_logits.squeeze(1);
-        current_y        = sample_token(&next_logits_2d, temperature);
-        current_y.eval();
-
-        step_times.push(t_step.elapsed().as_secs_f64() * 1000.0);
+        };
+        current_y = next_y;
 
         // Periodically flush the buffer cache to prevent memory accumulation.
         if step % 256 == 255 {
@@ -1247,8 +1329,8 @@ pub fn generate(
     if step_times.len() > 20 {
         step_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let skip = 10;
-        let avg  = step_times[skip..].iter().sum::<f64>() / (step_times.len() - skip) as f64;
-        let p50  = step_times[step_times.len() / 2];
+        let avg = step_times[skip..].iter().sum::<f64>() / (step_times.len() - skip) as f64;
+        let p50 = step_times[step_times.len() / 2];
         eprintln!(
             "[GPT-OSS] per-step: avg={avg:.2}ms p50={p50:.2}ms = {:.0} tok/s",
             1000.0 / avg,

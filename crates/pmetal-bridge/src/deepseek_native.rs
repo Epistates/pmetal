@@ -141,10 +141,7 @@ impl DeepSeekConfig {
                 .and_then(|v| v.as_f64())
                 .unwrap_or(0.0);
             if mscale_all_dim > 0.0 {
-                let factor = rs
-                    .get("factor")
-                    .and_then(|v| v.as_f64())
-                    .unwrap_or(1.0);
+                let factor = rs.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0);
                 if factor > 1.0 {
                     let s = 0.1 * mscale_all_dim * factor.ln() + 1.0;
                     return base * (s * s) as f32;
@@ -176,8 +173,8 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<DeepSeekConfig, String
     let path = model_dir.join("config.json");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let cfg: DeepSeekConfig = serde_json::from_str(&text)
-        .map_err(|e| format!("failed to parse config.json: {e}"))?;
+    let cfg: DeepSeekConfig =
+        serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
     Ok(cfg)
 }
 
@@ -226,14 +223,14 @@ struct LayerWeights {
     //   q_b_proj: [q_lora_rank, n_heads * q_head_dim]
     // or direct path:
     //   q_proj: [hidden, n_heads * q_head_dim]
-    q_a_w: Option<InlineArray>,    // pre-transposed [hidden, q_lora_rank]
+    q_a_w: Option<InlineArray>, // pre-transposed [hidden, q_lora_rank]
     q_a_norm_w: Option<InlineArray>, // [q_lora_rank] for rms_norm
-    q_b_w: Option<InlineArray>,    // pre-transposed [q_lora_rank, n_heads*q_head_dim]
-    q_w: Option<InlineArray>,      // pre-transposed [hidden, n_heads*q_head_dim] (direct)
+    q_b_w: Option<InlineArray>, // pre-transposed [q_lora_rank, n_heads*q_head_dim]
+    q_w: Option<InlineArray>,   // pre-transposed [hidden, n_heads*q_head_dim] (direct)
 
     // KV compression: kv_a_proj_with_mqa projects x → [kv_lora_rank + qk_rope_head_dim]
-    kv_a_proj_w: InlineArray,      // pre-transposed [hidden, kv_lora_rank + qk_rope_head_dim]
-    kv_a_norm_w: InlineArray,      // [kv_lora_rank] for rms_norm
+    kv_a_proj_w: InlineArray, // pre-transposed [hidden, kv_lora_rank + qk_rope_head_dim]
+    kv_a_norm_w: InlineArray, // [kv_lora_rank] for rms_norm
 
     // embed_q: [n_heads, qk_nope_head_dim, kv_lora_rank] — W_uk^T
     //   Decode (L=1): q_nope @ embed_q_w^T = q_nope @ [n_heads, lora, nope]^T = q_nope @ [n_heads, nope, lora]
@@ -241,14 +238,14 @@ struct LayerWeights {
     //   embed_q.weight in Python: [n_heads, qk_nope_head_dim, kv_lora_rank]
     //   In decode: q_nope [B,H,1,nope] @ embed_q_w.swapaxes(-1,-2) [H,lora,nope]^T → [B,H,1,lora]
     //   So embed_q_w stored as [H, nope_dim, lora_rank] for direct bmm (no extra transpose)
-    embed_q_w: InlineArray,        // [n_heads, qk_nope_head_dim, kv_lora_rank]
+    embed_q_w: InlineArray, // [n_heads, qk_nope_head_dim, kv_lora_rank]
 
     // unembed_out: [n_heads, kv_lora_rank, v_head_dim] — W_uv
     //   Decode: output [B,H,1,lora] @ unembed_out_w [H,lora,v_dim] → [B,H,1,v_dim]
-    unembed_out_w: InlineArray,    // [n_heads, kv_lora_rank, v_head_dim]
+    unembed_out_w: InlineArray, // [n_heads, kv_lora_rank, v_head_dim]
 
     // Output projection: [n_heads * v_head_dim, hidden] pre-transposed to [n_heads*v_dim, hidden]
-    o_proj_w: InlineArray,         // pre-transposed [n_heads*v_head_dim, hidden]
+    o_proj_w: InlineArray, // pre-transposed [n_heads*v_head_dim, hidden]
 
     // Attention scalars
     n_heads: i32,
@@ -349,6 +346,22 @@ impl NativeCache {
     pub fn eval_and_detach_states(&mut self) {
         let mut to_eval: Vec<&mut InlineArray> = Vec::new();
         for c in &mut self.mla_caches {
+            if let Some(kv) = c.kv_latent.take() {
+                let trimmed = if c.offset > 0 && c.offset < kv.dim(2) {
+                    kv.slice(&[0, 0, 0, 0], &[kv.dim(0), kv.dim(1), c.offset, kv.dim(3)])
+                } else {
+                    kv
+                };
+                c.kv_latent = Some(trimmed);
+            }
+            if let Some(kp) = c.k_pe.take() {
+                let trimmed = if c.offset > 0 && c.offset < kp.dim(2) {
+                    kp.slice(&[0, 0, 0, 0], &[kp.dim(0), kp.dim(1), c.offset, kp.dim(3)])
+                } else {
+                    kp
+                };
+                c.k_pe = Some(trimmed);
+            }
             if let Some(ref mut kv) = c.kv_latent {
                 to_eval.push(kv);
             }
@@ -408,9 +421,7 @@ pub fn load_model(
                 .ok_or_else(|| "shard filename is not a string".to_string())?;
             if seen.insert(name.to_string()) {
                 if name.contains("..") || name.starts_with('/') {
-                    return Err(format!(
-                        "shard filename contains path traversal: {name}"
-                    ));
+                    return Err(format!("shard filename contains path traversal: {name}"));
                 }
                 paths.push(model_dir.join(name));
             }
@@ -424,8 +435,7 @@ pub fn load_model(
     };
 
     // ── Step 2: Load all tensors ───────────────────────────────────────────
-    let mut raw: std::collections::HashMap<String, InlineArray> =
-        std::collections::HashMap::new();
+    let mut raw: std::collections::HashMap<String, InlineArray> = std::collections::HashMap::new();
 
     for shard_path in &shard_paths {
         let path_str = shard_path
@@ -446,10 +456,7 @@ pub fn load_model(
 
     // 3a. Drop MTP layers (model.layers.61 is the auxiliary MTP module in V3).
     // Also drop rotary_emb.inv_freq (precomputed, not needed — we compute on the fly).
-    raw.retain(|k, _| {
-        !k.contains("rotary_emb.inv_freq")
-            && !k.starts_with("model.layers.61")
-    });
+    raw.retain(|k, _| !k.contains("rotary_emb.inv_freq") && !k.starts_with("model.layers.61"));
 
     // Drop lm_head when tied.
     if config.tie_word_embeddings {
@@ -513,7 +520,11 @@ pub fn load_model(
             // Check whether per-expert keys exist (unsanitized checkpoint).
             let first_expert_key = format!("{p}.mlp.experts.0.gate_proj.weight");
             if raw.contains_key(&first_expert_key) {
-                for (n, m) in [("gate_proj", "gate_proj"), ("down_proj", "down_proj"), ("up_proj", "up_proj")] {
+                for (n, m) in [
+                    ("gate_proj", "gate_proj"),
+                    ("down_proj", "down_proj"),
+                    ("up_proj", "up_proj"),
+                ] {
                     let to_join: Option<Vec<InlineArray>> = (0..n_experts)
                         .map(|e| raw.remove(&format!("{p}.mlp.experts.{e}.{m}.weight")))
                         .collect();
@@ -568,7 +579,7 @@ pub fn load_model(
             // split at qk_nope_head_dim along axis 1
             let mut parts = v.split(&[config.qk_nope_head_dim], 1);
             let v_nope = parts.remove(0); // [H, nope, lora]
-            let v_v = parts.remove(0);    // [H, v_dim, lora]
+            let v_v = parts.remove(0); // [H, v_dim, lora]
 
             // embed_q.weight = wk = v_nope.swapaxes(-1,-2) → [H, lora, nope]
             let wk = v_nope.transpose_axes(&[0, 2, 1]);
@@ -582,18 +593,12 @@ pub fn load_model(
 
     // ── Step 4: Build per-layer weight structs ──────────────────────────────
     let get = |key: &str| -> Result<InlineArray, String> {
-        raw.get(key)
-            .cloned()
-            .ok_or_else(|| {
-                let parts: Vec<&str> = key.rsplitn(2, '.').collect();
-                let suffix = parts[0];
-                let close: Vec<&String> = raw
-                    .keys()
-                    .filter(|k| k.ends_with(suffix))
-                    .take(5)
-                    .collect();
-                format!("missing weight key: {key} (close matches: {close:?})")
-            })
+        raw.get(key).cloned().ok_or_else(|| {
+            let parts: Vec<&str> = key.rsplitn(2, '.').collect();
+            let suffix = parts[0];
+            let close: Vec<&String> = raw.keys().filter(|k| k.ends_with(suffix)).take(5).collect();
+            format!("missing weight key: {key} (close matches: {close:?})")
+        })
     };
 
     let embed_w = get("model.embed_tokens.weight")?;
@@ -650,7 +655,9 @@ pub fn load_model(
             let moe_prefix = format!("{p}.mlp");
             let n_re = config.n_routed_experts.unwrap_or(0);
             let n_shared = config.n_shared_experts.unwrap_or(0);
-            let moe_inter = config.moe_intermediate_size.unwrap_or(config.intermediate_size);
+            let moe_inter = config
+                .moe_intermediate_size
+                .unwrap_or(config.intermediate_size);
 
             // Stacked expert weights: [n_experts, intermediate, hidden] stored pre-transposed.
             // In safetensors the stacked weights are [n_experts, intermediate, hidden] for
@@ -755,31 +762,55 @@ pub fn load_model(
     for lw in &mut layers {
         lw.input_ln_w = copy_fresh(&lw.input_ln_w);
         lw.post_ln_w = copy_fresh(&lw.post_ln_w);
-        if let Some(ref w) = lw.q_a_w      { lw.q_a_w      = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.q_a_norm_w { lw.q_a_norm_w = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.q_b_w      { lw.q_b_w      = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.q_w        { lw.q_w        = Some(copy_fresh(w)); }
+        if let Some(ref w) = lw.q_a_w {
+            lw.q_a_w = Some(copy_fresh(w));
+        }
+        if let Some(ref w) = lw.q_a_norm_w {
+            lw.q_a_norm_w = Some(copy_fresh(w));
+        }
+        if let Some(ref w) = lw.q_b_w {
+            lw.q_b_w = Some(copy_fresh(w));
+        }
+        if let Some(ref w) = lw.q_w {
+            lw.q_w = Some(copy_fresh(w));
+        }
         lw.kv_a_proj_w = copy_fresh(&lw.kv_a_proj_w);
         lw.kv_a_norm_w = copy_fresh(&lw.kv_a_norm_w);
-        lw.embed_q_w   = copy_fresh(&lw.embed_q_w);
+        lw.embed_q_w = copy_fresh(&lw.embed_q_w);
         lw.unembed_out_w = copy_fresh(&lw.unembed_out_w);
-        lw.o_proj_w    = copy_fresh(&lw.o_proj_w);
-        if let Some(ref w) = lw.mlp_gate_w { lw.mlp_gate_w = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.mlp_up_w   { lw.mlp_up_w   = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.mlp_down_w { lw.mlp_down_w = Some(copy_fresh(w)); }
+        lw.o_proj_w = copy_fresh(&lw.o_proj_w);
+        if let Some(ref w) = lw.mlp_gate_w {
+            lw.mlp_gate_w = Some(copy_fresh(w));
+        }
+        if let Some(ref w) = lw.mlp_up_w {
+            lw.mlp_up_w = Some(copy_fresh(w));
+        }
+        if let Some(ref w) = lw.mlp_down_w {
+            lw.mlp_down_w = Some(copy_fresh(w));
+        }
         if let Some(ref mut moe) = lw.moe {
             moe.gate_w = copy_fresh(&moe.gate_w);
             moe.up_w = copy_fresh(&moe.up_w);
             moe.down_w = copy_fresh(&moe.down_w);
             moe.gate_weight = copy_fresh(&moe.gate_weight);
             moe.e_score_correction_bias = copy_fresh(&moe.e_score_correction_bias);
-            if let Some(ref w) = moe.shared_gate_w { moe.shared_gate_w = Some(copy_fresh(w)); }
-            if let Some(ref w) = moe.shared_up_w   { moe.shared_up_w   = Some(copy_fresh(w)); }
-            if let Some(ref w) = moe.shared_down_w { moe.shared_down_w = Some(copy_fresh(w)); }
+            if let Some(ref w) = moe.shared_gate_w {
+                moe.shared_gate_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = moe.shared_up_w {
+                moe.shared_up_w = Some(copy_fresh(w));
+            }
+            if let Some(ref w) = moe.shared_down_w {
+                moe.shared_down_w = Some(copy_fresh(w));
+            }
         }
     }
 
-    eprintln!("[DEEPSEEK] load_model: {} layers, dtype={}", layers.len(), model_dtype);
+    eprintln!(
+        "[DEEPSEEK] load_model: {} layers, dtype={}",
+        layers.len(),
+        model_dtype
+    );
 
     Ok(NativeWeights {
         embed_w,
@@ -908,14 +939,7 @@ pub fn forward_step(
         let normed = hidden.rms_norm(Some(&lw.input_ln_w), lw.norm_eps);
 
         // MLA Attention
-        let attn_out = mla_forward(
-            lw,
-            &normed,
-            b,
-            s,
-            cache_slot,
-            cache.rope_offset,
-        );
+        let attn_out = mla_forward(lw, &normed, b, s, cache_slot, cache.rope_offset);
 
         // Residual
         let h = hidden.add(&attn_out);
@@ -971,13 +995,13 @@ fn mla_forward(
     cache: &mut MlaLayerCache,
     rope_offset: i32,
 ) -> InlineArray {
-    let n_heads      = lw.n_heads;
-    let q_head_dim   = lw.q_head_dim;
-    let nope_dim     = lw.qk_nope_head_dim;
-    let rope_dim     = lw.qk_rope_head_dim;
-    let v_dim        = lw.v_head_dim;
-    let lora_rank    = lw.kv_lora_rank;
-    let scale        = lw.scale;
+    let n_heads = lw.n_heads;
+    let q_head_dim = lw.q_head_dim;
+    let nope_dim = lw.qk_nope_head_dim;
+    let rope_dim = lw.qk_rope_head_dim;
+    let v_dim = lw.v_head_dim;
+    let lora_rank = lw.kv_lora_rank;
+    let scale = lw.scale;
 
     // ── Q projection ─────────────────────────────────────────────────────
     // Low-rank: x → q_a_proj → rms_norm → q_b_proj → [B, S, H, q_head_dim]
@@ -995,7 +1019,7 @@ fn mla_forward(
         .transpose_axes(&[0, 2, 1, 3]);
     // Split q into [q_nope, q_pe] along last axis at nope_dim.
     let mut q_parts = q.split(&[nope_dim], -1);
-    let q_pe   = q_parts.pop().unwrap(); // [B, H, S, rope_dim]
+    let q_pe = q_parts.pop().unwrap(); // [B, H, S, rope_dim]
     let q_nope = q_parts.pop().unwrap(); // [B, H, S, nope_dim]
 
     // ── KV compression ───────────────────────────────────────────────────
@@ -1003,8 +1027,8 @@ fn mla_forward(
     let compressed_kv = x.matmul(&lw.kv_a_proj_w);
     // Split: [compressed_kv (lora_rank), k_pe_raw (rope_dim)]
     let mut kv_parts = compressed_kv.split(&[lora_rank], -1);
-    let k_pe_raw     = kv_parts.pop().unwrap(); // [B, S, rope_dim]
-    let compressed   = kv_parts.pop().unwrap(); // [B, S, lora_rank]
+    let k_pe_raw = kv_parts.pop().unwrap(); // [B, S, rope_dim]
+    let compressed = kv_parts.pop().unwrap(); // [B, S, lora_rank]
 
     // RMS-norm the latent.
     let kv_latent_tok = compressed.rms_norm(Some(&lw.kv_a_norm_w), 1e-6);
@@ -1018,8 +1042,20 @@ fn mla_forward(
     // Apply RoPE to q_pe [B, H, S, rope_dim] and k_pe [B, 1, S, rope_dim].
     // DeepSeek V3 uses traditional=true RoPE (the default in initialize_rope with
     // traditional=True in the Python code).
-    let q_pe = q_pe.rope(rope_dim, /*traditional=*/true, lw.rope_base, lw.rope_scale, rope_offset);
-    let k_pe = k_pe_raw_4d.rope(rope_dim, /*traditional=*/true, lw.rope_base, lw.rope_scale, rope_offset);
+    let q_pe = q_pe.rope(
+        rope_dim,
+        /*traditional=*/ true,
+        lw.rope_base,
+        lw.rope_scale,
+        rope_offset,
+    );
+    let k_pe = k_pe_raw_4d.rope(
+        rope_dim,
+        /*traditional=*/ true,
+        lw.rope_base,
+        lw.rope_scale,
+        rope_offset,
+    );
 
     // Expand kv_latent: [B, S, lora] → [B, 1, S, lora] (Python: expand_dims(axis=1))
     let kv_latent_4d = kv_latent_tok.expand_dims(1); // [B, 1, S, lora_rank]
@@ -1032,7 +1068,7 @@ fn mla_forward(
     if cache.kv_latent.is_none() {
         let alloc = 256i32;
         cache.kv_latent = Some(InlineArray::zeros(&[b, 1, alloc, lora_rank], 11));
-        cache.k_pe      = Some(InlineArray::zeros(&[b, 1, alloc, rope_dim], 11));
+        cache.k_pe = Some(InlineArray::zeros(&[b, 1, alloc, rope_dim], 11));
     } else {
         let allocated = cache.kv_latent.as_ref().unwrap().dim(2);
         if next > allocated {
@@ -1041,27 +1077,33 @@ fn mla_forward(
             let ext_kv = InlineArray::zeros(&[b, 1, 256, lora_rank], 11);
             let ext_kp = InlineArray::zeros(&[b, 1, 256, rope_dim], 11);
             cache.kv_latent = Some(old_kv.kv_cache_append(&ext_kv, 2));
-            cache.k_pe      = Some(old_kp.kv_cache_append(&ext_kp, 2));
+            cache.k_pe = Some(old_kp.kv_cache_append(&ext_kp, 2));
         }
     }
 
     let start_kv = [0i32, 0, prev, 0];
-    let stop_kv  = [b,    1, next, lora_rank];
+    let stop_kv = [b, 1, next, lora_rank];
     let start_kp = [0i32, 0, prev, 0];
-    let stop_kp  = [b,    1, next, rope_dim];
+    let stop_kp = [b, 1, next, rope_dim];
 
     let kv_buf = cache.kv_latent.take().unwrap();
     let kp_buf = cache.k_pe.take().unwrap();
 
     cache.kv_latent = Some(kv_buf.slice_set(&kv_latent_4d, &start_kv, &stop_kv));
-    cache.k_pe      = Some(kp_buf.slice_set(&k_pe,         &start_kp, &stop_kp));
-    cache.offset    = next;
+    cache.k_pe = Some(kp_buf.slice_set(&k_pe, &start_kp, &stop_kp));
+    cache.offset = next;
 
     // Valid portions of the cache.
-    let all_kv_latent = cache.kv_latent.as_ref().unwrap()
+    let all_kv_latent = cache
+        .kv_latent
+        .as_ref()
+        .unwrap()
         .slice(&[0, 0, 0, 0], &[b, 1, next, lora_rank]); // [B, 1, T_total, lora]
-    let all_k_pe = cache.k_pe.as_ref().unwrap()
-        .slice(&[0, 0, 0, 0], &[b, 1, next, rope_dim]);   // [B, 1, T_total, rope_dim]
+    let all_k_pe = cache
+        .k_pe
+        .as_ref()
+        .unwrap()
+        .slice(&[0, 0, 0, 0], &[b, 1, next, rope_dim]); // [B, 1, T_total, rope_dim]
 
     // ── PE attention scores ───────────────────────────────────────────────
     // pe_scores = (q_pe * scale) @ k_pe.swapaxes(-1,-2)
@@ -1069,7 +1111,7 @@ fn mla_forward(
     // k_pe:    [B, 1, T, rope_dim]  (broadcast over H)
     // Swap last two axes of k_pe: [B, 1, T, rope_dim] → [B, 1, rope_dim, T]
     let k_pe_t = all_k_pe.transpose_axes(&[0, 1, 3, 2]); // [B, 1, rope_dim, T]
-    let scale_arr = InlineArray::from_f32(scale);
+    let scale_arr = crate::decode::scalar_f32_like(scale, &q_pe);
     let q_pe_scaled = q_pe.multiply(&scale_arr);
     // [B, H, S, rope_dim] @ [B, 1, rope_dim, T] → [B, H, S, T]  (H broadcasts 1→H)
     let pe_scores = q_pe_scaled.matmul(&k_pe_t); // [B, H, S, T]
@@ -1111,12 +1153,8 @@ fn mla_forward(
         // SDPA: q_nope_latent [B, H, 1, lora_rank] vs k,v [B, 1, T, lora_rank]
         // The K head (1) broadcasts to H. pe_scores [B, H, 1, T] is the additive bias.
         // Use sdpa_with_mask where mask = pe_scores (additive, not boolean).
-        let out_latent = q_nope_latent.sdpa_with_mask(
-            &all_kv_latent,
-            &all_kv_latent,
-            scale,
-            Some(&pe_scores),
-        ); // [B, H, 1, lora_rank]
+        let out_latent =
+            q_nope_latent.sdpa_with_mask(&all_kv_latent, &all_kv_latent, scale, Some(&pe_scores)); // [B, H, 1, lora_rank]
 
         // Project through unembed_out:
         // unembed_out_w: [H, v_dim, lora_rank]
@@ -1163,8 +1201,8 @@ fn mla_forward(
 
 fn dense_mlp_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
     let gate = x.matmul(lw.mlp_gate_w.as_ref().unwrap());
-    let up   = x.matmul(lw.mlp_up_w.as_ref().unwrap());
-    let act  = InlineArray::fused_swiglu(&gate, &up);
+    let up = x.matmul(lw.mlp_up_w.as_ref().unwrap());
+    let act = InlineArray::fused_swiglu(&gate, &up);
     act.matmul(lw.mlp_down_w.as_ref().unwrap())
 }
 
@@ -1231,7 +1269,7 @@ fn moe_forward(lw: &LayerWeights, x: &InlineArray, b: i32, s: i32) -> InlineArra
     // We call gather_mm(x_2d, w, None, inds_for_gather, false) to select top-k expert rows.
 
     let gate_out = x_2d.gather_mm(&moe.gate_w, None, Some(&inds), false); // [T, k, inter]
-    let up_out   = x_2d.gather_mm(&moe.up_w,   None, Some(&inds), false); // [T, k, inter]
+    let up_out = x_2d.gather_mm(&moe.up_w, None, Some(&inds), false); // [T, k, inter]
     let activated = InlineArray::fused_swiglu(&gate_out, &up_out); // [T, k, inter]
 
     // down_proj: [T, k, inter] @ down_w[experts] → [T, k, hidden]
@@ -1243,15 +1281,13 @@ fn moe_forward(lw: &LayerWeights, x: &InlineArray, b: i32, s: i32) -> InlineArra
     let mut y = weighted.sum_axis(-2, false); // [T, hidden]
 
     // ── Shared expert ─────────────────────────────────────────────────────
-    if let (Some(sg), Some(su), Some(sd)) = (
-        &moe.shared_gate_w,
-        &moe.shared_up_w,
-        &moe.shared_down_w,
-    ) {
+    if let (Some(sg), Some(su), Some(sd)) =
+        (&moe.shared_gate_w, &moe.shared_up_w, &moe.shared_down_w)
+    {
         let sh_gate = x_2d.matmul(sg);
-        let sh_up   = x_2d.matmul(su);
-        let sh_act  = InlineArray::fused_swiglu(&sh_gate, &sh_up);
-        let sh_out  = sh_act.matmul(sd);
+        let sh_up = x_2d.matmul(su);
+        let sh_act = InlineArray::fused_swiglu(&sh_gate, &sh_up);
+        let sh_out = sh_act.matmul(sd);
         y = y.add(&sh_out);
     }
 
@@ -1274,11 +1310,11 @@ fn moe_forward(lw: &LayerWeights, x: &InlineArray, b: i32, s: i32) -> InlineArra
 /// applies group masking for load balance).
 fn group_topk(
     biased_scores: &InlineArray, // [T, n_experts] — for routing decision
-    orig_scores:   &InlineArray, // [T, n_experts] — for weight computation
-    n_experts:     i32,
-    n_group:       i32,
-    topk_group:    i32,
-    top_k:         i32,
+    orig_scores: &InlineArray,   // [T, n_experts] — for weight computation
+    n_experts: i32,
+    n_group: i32,
+    topk_group: i32,
+    top_k: i32,
     routed_scaling_factor: f32,
     norm_topk_prob: bool,
 ) -> (InlineArray, InlineArray) {
@@ -1300,7 +1336,14 @@ fn group_topk(
 
         // Build zero mask over groups: [T, n_group, 1] → zero out those groups.
         // We use a simple approach: set masked groups to -inf before per-group argpartition.
-        let masked = apply_group_mask(&s_grouped, &mask_inds, t, n_group, experts_per_group, k_mask);
+        let masked = apply_group_mask(
+            &s_grouped,
+            &mask_inds,
+            t,
+            n_group,
+            experts_per_group,
+            k_mask,
+        );
 
         // Flatten masked scores back to [T, n_experts]
         masked.reshape(&[t, n_experts])
@@ -1326,7 +1369,8 @@ fn group_topk(
         let scale_arr = InlineArray::from_f32(routed_scaling_factor).as_dtype(normed.dtype_raw());
         normed.multiply(&scale_arr)
     } else {
-        let scale_arr = InlineArray::from_f32(routed_scaling_factor).as_dtype(sel_scores.dtype_raw());
+        let scale_arr =
+            InlineArray::from_f32(routed_scaling_factor).as_dtype(sel_scores.dtype_raw());
         sel_scores.multiply(&scale_arr)
     };
 
@@ -1350,11 +1394,8 @@ fn top2_sum_per_group(s_grouped: &InlineArray, _n_group: i32, _epg: i32) -> Inli
     }
     // argpartition(-s, kth=1, axis=-1): first 2 elements have the top-2.
     let neg = s_grouped.negative();
-    let part = neg.argpartition(1, -1);   // [T, n_group, epg]
-    let top2_inds = part.slice(
-        &[0, 0, 0],
-        &[s_grouped.dim(0), s_grouped.dim(1), 2],
-    ); // [T, n_group, 2]
+    let part = neg.argpartition(1, -1); // [T, n_group, epg]
+    let top2_inds = part.slice(&[0, 0, 0], &[s_grouped.dim(0), s_grouped.dim(1), 2]); // [T, n_group, 2]
     let top2_vals = s_grouped.take_along_axis(&top2_inds, -1); // [T, n_group, 2]
     top2_vals.sum_axis(-1, true) // [T, n_group, 1]
 }
@@ -1399,15 +1440,7 @@ fn apply_group_mask(
 ///
 /// `temperature <= 0.0` → greedy argmax. Otherwise categorical sampling.
 pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
-    if temperature <= 0.0 {
-        logits_2d.argmax(-1)
-    } else {
-        let inv_temp = InlineArray::from_f32(1.0 / temperature);
-        let lse = logits_2d.logsumexp(-1, true);
-        let log_probs = logits_2d.subtract(&lse);
-        let scaled = log_probs.multiply(&inv_temp);
-        scaled.categorical()
-    }
+    crate::decode::sample_token(logits_2d, temperature)
 }
 
 // ============================================================================
@@ -1431,18 +1464,7 @@ pub fn generate(
 ) -> Vec<u32> {
     let mut tokens = Vec::with_capacity(max_tokens);
 
-    bridge::clear_cache();
-    bridge::reset_peak_memory();
-    bridge::enable_compile();
-    bridge::new_generation_stream();
-    bridge::set_generation_stream();
-    bridge::set_wired_limit_max();
-
-    eprintln!(
-        "[DEEPSEEK] generate: dtype={} active={:.0}MB",
-        weights.model_dtype,
-        bridge::get_active_memory() as f64 / 1e6,
-    );
+    crate::decode::begin_generation_session("DEEPSEEK", weights.model_dtype);
 
     // Evaluate and detach prefill cache states.
     cache.eval_and_detach_states();
@@ -1458,6 +1480,19 @@ pub fn generate(
     let mut step_times: Vec<f64> = Vec::new();
 
     for step in 0..max_tokens {
+        let next_y = if step + 1 < max_tokens {
+            let t_step = std::time::Instant::now();
+            let next_input = current_y.reshape(&[1, 1]);
+            let next_logits = forward_step(weights, &next_input, cache);
+            let next_2d = next_logits.squeeze(1);
+            let next_y = sample_token(&next_2d, temperature);
+            next_y.async_eval_ref();
+            step_times.push(t_step.elapsed().as_secs_f64() * 1000.0);
+            Some(next_y)
+        } else {
+            None
+        };
+
         if step == 0 {
             current_y.eval();
         }
@@ -1467,18 +1502,10 @@ pub fn generate(
         if !on_token(token_val) {
             break;
         }
-        if step + 1 >= max_tokens {
+        let Some(next_y) = next_y else {
             break;
-        }
-
-        let t_step = std::time::Instant::now();
-        let next_input  = InlineArray::from_i32(token_val as i32).reshape(&[1, 1]);
-        let next_logits = forward_step(weights, &next_input, cache);
-        let next_2d     = next_logits.squeeze(1);
-        current_y = sample_token(&next_2d, temperature);
-        current_y.eval();
-
-        step_times.push(t_step.elapsed().as_secs_f64() * 1000.0);
+        };
+        current_y = next_y;
 
         if step % 256 == 255 {
             bridge::clear_cache();

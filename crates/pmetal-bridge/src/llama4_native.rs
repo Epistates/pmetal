@@ -166,8 +166,7 @@ impl Llama4Config {
     /// Head dimension.
     pub fn head_dim(&self) -> i32 {
         let t = self.text();
-        t.head_dim
-            .unwrap_or(t.hidden_size / t.num_attention_heads)
+        t.head_dim.unwrap_or(t.hidden_size / t.num_attention_heads)
     }
 
     /// Number of KV heads.
@@ -185,8 +184,8 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Llama4Config, String> 
     let path = model_dir.join("config.json");
     let text = std::fs::read_to_string(&path)
         .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    let json: serde_json::Value = serde_json::from_str(&text)
-        .map_err(|e| format!("failed to parse config.json: {e}"))?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
 
     // If the outer config has `text_config`, try deserializing that inner object
     // as the canonical text config and wrap it.  Otherwise deserialize the
@@ -199,7 +198,11 @@ pub fn load_config(model_dir: &std::path::Path) -> Result<Llama4Config, String> 
         // Flat layout: embed a synthetic `model_type` field if absent, then
         // deserialize the whole object as both outer + inner config.
         let mut obj = json.clone();
-        if !obj.as_object().map(|o| o.contains_key("model_type")).unwrap_or(false) {
+        if !obj
+            .as_object()
+            .map(|o| o.contains_key("model_type"))
+            .unwrap_or(false)
+        {
             obj["model_type"] = serde_json::Value::String("llama4".to_string());
         }
         let config_str = serde_json::to_string(&obj).map_err(|e| e.to_string())?;
@@ -285,8 +288,8 @@ struct LayerWeights {
 
 /// All model weights as InlineArrays. Zero dependency on mlx-rs.
 pub struct NativeWeights {
-    pub embed_w: InlineArray,        // [vocab, hidden]
-    pub final_norm_w: InlineArray,   // [hidden]
+    pub embed_w: InlineArray,      // [vocab, hidden]
+    pub final_norm_w: InlineArray, // [hidden]
     pub final_norm_eps: f32,
     /// `None` when `tie_word_embeddings = true`.
     pub lm_head_w: Option<InlineArray>, // [hidden, vocab] (pre-transposed)
@@ -340,8 +343,28 @@ impl NativeCache {
     pub fn eval_and_detach_states(&mut self) {
         let mut to_eval: Vec<&mut InlineArray> = Vec::new();
         for c in &mut self.kv_caches {
-            if let Some(ref mut k) = c.keys   { to_eval.push(k); }
-            if let Some(ref mut v) = c.values { to_eval.push(v); }
+            if let Some(k) = c.keys.take() {
+                let trimmed = if c.offset > 0 && c.offset < k.dim(2) {
+                    k.slice(&[0, 0, 0, 0], &[k.dim(0), k.dim(1), c.offset, k.dim(3)])
+                } else {
+                    k
+                };
+                c.keys = Some(trimmed);
+            }
+            if let Some(v) = c.values.take() {
+                let trimmed = if c.offset > 0 && c.offset < v.dim(2) {
+                    v.slice(&[0, 0, 0, 0], &[v.dim(0), v.dim(1), c.offset, v.dim(3)])
+                } else {
+                    v
+                };
+                c.values = Some(trimmed);
+            }
+            if let Some(ref mut k) = c.keys {
+                to_eval.push(k);
+            }
+            if let Some(ref mut v) = c.values {
+                to_eval.push(v);
+            }
         }
         bridge::eval_and_detach_many(&mut to_eval);
     }
@@ -397,7 +420,7 @@ pub fn load_model(
 
     // ── Step 1: Shard discovery ─────────────────────────────────────────────
     let single_path = model_dir.join("model.safetensors");
-    let index_path  = model_dir.join("model.safetensors.index.json");
+    let index_path = model_dir.join("model.safetensors.index.json");
 
     let shard_paths: Vec<std::path::PathBuf> = if single_path.exists() {
         vec![single_path]
@@ -410,7 +433,7 @@ pub fn load_model(
             .get("weight_map")
             .and_then(|v| v.as_object())
             .ok_or_else(|| "index JSON missing weight_map".to_string())?;
-        let mut seen  = std::collections::HashSet::new();
+        let mut seen = std::collections::HashSet::new();
         let mut paths = Vec::new();
         for shard_file in weight_map.values() {
             let name = shard_file
@@ -432,8 +455,7 @@ pub fn load_model(
     };
 
     // ── Step 2: Load all tensors from all shards ────────────────────────────
-    let mut raw: std::collections::HashMap<String, InlineArray> =
-        std::collections::HashMap::new();
+    let mut raw: std::collections::HashMap<String, InlineArray> = std::collections::HashMap::new();
 
     for shard_path in &shard_paths {
         let path_str = shard_path
@@ -577,7 +599,7 @@ pub fn load_model(
             let expert_hidden = tc.intermediate_size;
             // split along last axis at position expert_hidden
             let mut parts = gate_up.split(&[expert_hidden], -1);
-            let up   = parts.pop().unwrap(); // [E, in_dim, expert_hidden]
+            let up = parts.pop().unwrap(); // [E, in_dim, expert_hidden]
             let gate = parts.pop().unwrap(); // [E, in_dim, expert_hidden]
             raw.insert(format!("{prefix}.gate_proj.weight"), gate);
             raw.insert(format!("{prefix}.up_proj.weight"), up);
@@ -602,34 +624,28 @@ pub fn load_model(
         raw.get(key).cloned().ok_or_else(|| {
             let parts: Vec<&str> = key.rsplitn(2, '.').collect();
             let suffix = parts[0];
-            let close: Vec<&String> = raw
-                .keys()
-                .filter(|k| k.ends_with(suffix))
-                .take(5)
-                .collect();
+            let close: Vec<&String> = raw.keys().filter(|k| k.ends_with(suffix)).take(5).collect();
             format!("missing weight key: {key} (close matches: {close:?})")
         })
     };
 
-    let try_get = |key: &str| -> Option<InlineArray> {
-        raw.get(key).cloned()
-    };
+    let try_get = |key: &str| -> Option<InlineArray> { raw.get(key).cloned() };
 
-    let embed_w     = get("model.embed_tokens.weight")?;
+    let embed_w = get("model.embed_tokens.weight")?;
     let final_norm_w = get("model.norm.weight")?;
-    let lm_head_w   = if tc.tie_word_embeddings {
+    let lm_head_w = if tc.tie_word_embeddings {
         None
     } else {
         // Stored as [vocab, hidden] — transpose to [hidden, vocab] for matmul.
         Some(get("lm_head.weight")?.t())
     };
 
-    let n_heads    = tc.num_attention_heads;
+    let n_heads = tc.num_attention_heads;
     let n_kv_heads = config.num_kv_heads();
-    let head_dim   = config.head_dim();
+    let head_dim = config.head_dim();
     let attn_scale = (head_dim as f32).powi(-1).sqrt(); // 1/sqrt(head_dim)
     // rope_theta from config — Llama 4 uses 500_000 by default.
-    let rope_base  = tc.rope_theta as f32;
+    let rope_base = tc.rope_theta as f32;
     // rope_scale: for Llama 4 iRoPE with rope_scaling.type=="llama3", factor is the
     // high-frequency scale. For simplicity in the native path we use scale=1.0
     // (standard RoPE, no long-context extension) because chunked attention limits
@@ -640,12 +656,12 @@ pub fn load_model(
     let mut layers = Vec::with_capacity(tc.num_hidden_layers as usize);
 
     for li in 0..tc.num_hidden_layers as usize {
-        let p        = format!("model.layers.{li}");
+        let p = format!("model.layers.{li}");
         let use_rope = config.use_rope(li);
-        let is_moe   = config.is_moe_layer(li);
+        let is_moe = config.is_moe_layer(li);
 
         let input_ln_w = get(&format!("{p}.input_layernorm.weight"))?;
-        let post_ln_w  = get(&format!("{p}.post_attention_layernorm.weight"))?;
+        let post_ln_w = get(&format!("{p}.post_attention_layernorm.weight"))?;
 
         // Attention projections — stored as [out, in], transpose to [in, out].
         let sa = format!("{p}.self_attn");
@@ -673,7 +689,7 @@ pub fn load_model(
             // up_proj:   [E, in_dim, expert_hidden]
             // down_proj: [E, expert_hidden, in_dim]
             let gate_w = get(&format!("{exp}.gate_proj.weight"))?;
-            let up_w   = get(&format!("{exp}.up_proj.weight"))?;
+            let up_w = get(&format!("{exp}.up_proj.weight"))?;
             let down_w = get(&format!("{exp}.down_proj.weight"))?;
 
             // Router: [num_experts, in_dim] → pre-transpose to [in_dim, num_experts]
@@ -682,16 +698,16 @@ pub fn load_model(
             // Shared expert — stored as standard [out, in], transposed to [in, out]
             let sh = format!("{ff}.shared_expert");
             let sh_gate_w = get(&format!("{sh}.gate_proj.weight"))?.t();
-            let sh_up_w   = get(&format!("{sh}.up_proj.weight"))?.t();
+            let sh_up_w = get(&format!("{sh}.up_proj.weight"))?.t();
             let sh_down_w = get(&format!("{sh}.down_proj.weight"))?.t();
 
             let moe_weights = MoeWeights {
                 experts_gate_w: gate_w,
-                experts_up_w:   up_w,
+                experts_up_w: up_w,
                 experts_down_w: down_w,
                 router_w,
                 shared_gate_w: sh_gate_w,
-                shared_up_w:   sh_up_w,
+                shared_up_w: sh_up_w,
                 shared_down_w: sh_down_w,
             };
             (None, None, None, Some(moe_weights))
@@ -699,7 +715,7 @@ pub fn load_model(
             // Dense MLP — uses intermediate_size_mlp
             let ff = format!("{p}.feed_forward");
             let gate_w = get(&format!("{ff}.gate_proj.weight"))?.t();
-            let up_w   = get(&format!("{ff}.up_proj.weight"))?.t();
+            let up_w = get(&format!("{ff}.up_proj.weight"))?.t();
             let down_w = get(&format!("{ff}.down_proj.weight"))?.t();
             (Some(gate_w), Some(up_w), Some(down_w), None)
         };
@@ -744,37 +760,55 @@ pub fn load_model(
         fresh
     };
 
-    let embed_w      = copy_fresh(&embed_w);
+    let embed_w = copy_fresh(&embed_w);
     let final_norm_w = copy_fresh(&final_norm_w);
-    let lm_head_w    = lm_head_w.map(|w| copy_fresh(&w));
+    let lm_head_w = lm_head_w.map(|w| copy_fresh(&w));
 
     for lw in &mut layers {
         lw.input_ln_w = copy_fresh(&lw.input_ln_w);
-        lw.post_ln_w  = copy_fresh(&lw.post_ln_w);
-        lw.attn_q_w   = copy_fresh(&lw.attn_q_w);
-        lw.attn_k_w   = copy_fresh(&lw.attn_k_w);
-        lw.attn_v_w   = copy_fresh(&lw.attn_v_w);
-        lw.attn_o_w   = copy_fresh(&lw.attn_o_w);
-        if let Some(ref b) = lw.attn_q_b { lw.attn_q_b = Some(copy_fresh(b)); }
-        if let Some(ref b) = lw.attn_k_b { lw.attn_k_b = Some(copy_fresh(b)); }
-        if let Some(ref b) = lw.attn_v_b { lw.attn_v_b = Some(copy_fresh(b)); }
-        if let Some(ref b) = lw.attn_o_b { lw.attn_o_b = Some(copy_fresh(b)); }
-        if let Some(ref w) = lw.mlp_gate_w { lw.mlp_gate_w = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.mlp_up_w   { lw.mlp_up_w   = Some(copy_fresh(w)); }
-        if let Some(ref w) = lw.mlp_down_w { lw.mlp_down_w = Some(copy_fresh(w)); }
+        lw.post_ln_w = copy_fresh(&lw.post_ln_w);
+        lw.attn_q_w = copy_fresh(&lw.attn_q_w);
+        lw.attn_k_w = copy_fresh(&lw.attn_k_w);
+        lw.attn_v_w = copy_fresh(&lw.attn_v_w);
+        lw.attn_o_w = copy_fresh(&lw.attn_o_w);
+        if let Some(ref b) = lw.attn_q_b {
+            lw.attn_q_b = Some(copy_fresh(b));
+        }
+        if let Some(ref b) = lw.attn_k_b {
+            lw.attn_k_b = Some(copy_fresh(b));
+        }
+        if let Some(ref b) = lw.attn_v_b {
+            lw.attn_v_b = Some(copy_fresh(b));
+        }
+        if let Some(ref b) = lw.attn_o_b {
+            lw.attn_o_b = Some(copy_fresh(b));
+        }
+        if let Some(ref w) = lw.mlp_gate_w {
+            lw.mlp_gate_w = Some(copy_fresh(w));
+        }
+        if let Some(ref w) = lw.mlp_up_w {
+            lw.mlp_up_w = Some(copy_fresh(w));
+        }
+        if let Some(ref w) = lw.mlp_down_w {
+            lw.mlp_down_w = Some(copy_fresh(w));
+        }
         if let Some(ref mut moe) = lw.moe {
             moe.experts_gate_w = copy_fresh(&moe.experts_gate_w);
-            moe.experts_up_w   = copy_fresh(&moe.experts_up_w);
+            moe.experts_up_w = copy_fresh(&moe.experts_up_w);
             moe.experts_down_w = copy_fresh(&moe.experts_down_w);
-            moe.router_w       = copy_fresh(&moe.router_w);
-            moe.shared_gate_w  = copy_fresh(&moe.shared_gate_w);
-            moe.shared_up_w    = copy_fresh(&moe.shared_up_w);
-            moe.shared_down_w  = copy_fresh(&moe.shared_down_w);
+            moe.router_w = copy_fresh(&moe.router_w);
+            moe.shared_gate_w = copy_fresh(&moe.shared_gate_w);
+            moe.shared_up_w = copy_fresh(&moe.shared_up_w);
+            moe.shared_down_w = copy_fresh(&moe.shared_down_w);
         }
     }
 
-    eprintln!("[LLAMA4_NATIVE] load_model: {} layers, dtype={}, chunk_size={}",
-              layers.len(), detected_dtype, tc.attention_chunk_size);
+    eprintln!(
+        "[LLAMA4_NATIVE] load_model: {} layers, dtype={}, chunk_size={}",
+        layers.len(),
+        detected_dtype,
+        tc.attention_chunk_size
+    );
 
     Ok(NativeWeights {
         embed_w,
@@ -822,8 +856,8 @@ pub fn forward_step(
     // the current query are attended to.
     let chunk_size = weights.attention_chunk_size;
     // offset = number of tokens already in the cache (all layers share same sequence position).
-    let offset     = cache.rope_offset;
-    let end        = offset + s;
+    let offset = cache.rope_offset;
+    let end = offset + s;
     // We build the chunk mask eagerly only for prefill (T > 1). For decode (T=1)
     // we skip the mask and use pure causal (the single query token attends to all
     // positions in its chunk, which degenerates to a simple causal window).
@@ -927,10 +961,13 @@ fn build_chunk_mask(offset: i32, s: i32, end: i32, chunk_size: i32) -> InlineArr
 fn make_additive_mask(bool_mask: &InlineArray, dtype: i32) -> InlineArray {
     // large negative value in the model dtype
     let neg_inf = InlineArray::from_f32(-1e9).as_dtype(dtype);
-    let zero    = InlineArray::from_f32(0.0).as_dtype(dtype);
+    let zero = InlineArray::from_f32(0.0).as_dtype(dtype);
     // where(bool_mask != 0, 0.0, -1e9)
     // bool_mask contains 0 or 1 as int32; `where_cond` treats nonzero as true.
-    bool_mask.as_dtype(0).where_cond(&zero, &neg_inf).as_dtype(dtype)
+    bool_mask
+        .as_dtype(0)
+        .where_cond(&zero, &neg_inf)
+        .as_dtype(dtype)
 }
 
 // ============================================================================
@@ -946,28 +983,37 @@ fn attn_forward(
     rope_offset: i32,
     chunk_mask: Option<&InlineArray>, // prefill only — [s, offset+s]
 ) -> InlineArray {
-    let n_heads    = lw.n_heads;
+    let n_heads = lw.n_heads;
     let n_kv_heads = lw.n_kv_heads;
-    let head_dim   = lw.head_dim;
-    let scale      = lw.attn_scale;
+    let head_dim = lw.head_dim;
+    let scale = lw.attn_scale;
 
     // Q, K, V projections
     let mut queries = normed.matmul(&lw.attn_q_w);
-    let mut keys    = normed.matmul(&lw.attn_k_w);
-    let mut values  = normed.matmul(&lw.attn_v_w);
+    let mut keys = normed.matmul(&lw.attn_k_w);
+    let mut values = normed.matmul(&lw.attn_v_w);
 
     // Optional biases
-    if let Some(ref qb) = lw.attn_q_b { queries = queries.add(qb); }
-    if let Some(ref kb) = lw.attn_k_b { keys    = keys.add(kb);    }
-    if let Some(ref vb) = lw.attn_v_b { values  = values.add(vb);  }
+    if let Some(ref qb) = lw.attn_q_b {
+        queries = queries.add(qb);
+    }
+    if let Some(ref kb) = lw.attn_k_b {
+        keys = keys.add(kb);
+    }
+    if let Some(ref vb) = lw.attn_v_b {
+        values = values.add(vb);
+    }
 
     // Reshape to [B, S, H, D] then transpose to [B, H, S, D]
-    let queries = queries.reshape(&[b, s, n_heads, head_dim])
-                         .transpose_axes(&[0, 2, 1, 3]);
-    let keys    = keys.reshape(&[b, s, n_kv_heads, head_dim])
-                      .transpose_axes(&[0, 2, 1, 3]);
-    let values  = values.reshape(&[b, s, n_kv_heads, head_dim])
-                        .transpose_axes(&[0, 2, 1, 3]);
+    let queries = queries
+        .reshape(&[b, s, n_heads, head_dim])
+        .transpose_axes(&[0, 2, 1, 3]);
+    let keys = keys
+        .reshape(&[b, s, n_kv_heads, head_dim])
+        .transpose_axes(&[0, 2, 1, 3]);
+    let values = values
+        .reshape(&[b, s, n_kv_heads, head_dim])
+        .transpose_axes(&[0, 2, 1, 3]);
 
     // iRoPE: only RoPE layers apply positional encoding
     let (queries, keys) = if lw.use_rope {
@@ -1011,42 +1057,48 @@ fn attn_forward(
     };
 
     // KV cache update
-    let prev     = cache.offset;
-    let num_new  = keys.dim(2); // T for prefill, 1 for decode
-    let next     = prev + num_new;
+    let prev = cache.offset;
+    let num_new = keys.dim(2); // T for prefill, 1 for decode
+    let next = prev + num_new;
 
     if cache.keys.is_none() {
         let alloc = 256i32;
         let dtype = keys.dtype_raw();
-        cache.keys   = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
+        cache.keys = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
         cache.values = Some(InlineArray::zeros(&[b, n_kv_heads, alloc, head_dim], dtype));
     } else {
         // Grow if needed
         let allocated = cache.keys.as_ref().unwrap().dim(2);
         if next > allocated {
-            let dtype  = cache.keys.as_ref().unwrap().dtype_raw();
-            let old_k  = cache.keys.take().unwrap();
-            let old_v  = cache.values.take().unwrap();
-            let ext_k  = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
-            let ext_v  = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
-            cache.keys   = Some(old_k.kv_cache_append(&ext_k, 2));
+            let dtype = cache.keys.as_ref().unwrap().dtype_raw();
+            let old_k = cache.keys.take().unwrap();
+            let old_v = cache.values.take().unwrap();
+            let ext_k = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
+            let ext_v = InlineArray::zeros(&[b, n_kv_heads, 256, head_dim], dtype);
+            cache.keys = Some(old_k.kv_cache_append(&ext_k, 2));
             cache.values = Some(old_v.kv_cache_append(&ext_v, 2));
         }
     }
 
     let start_coord = [0, 0, prev, 0];
-    let stop_coord  = [b, n_kv_heads, next, head_dim];
+    let stop_coord = [b, n_kv_heads, next, head_dim];
     let k_buf = cache.keys.take().unwrap();
     let v_buf = cache.values.take().unwrap();
-    cache.keys   = Some(k_buf.slice_set(&keys,   &start_coord, &stop_coord));
+    cache.keys = Some(k_buf.slice_set(&keys, &start_coord, &stop_coord));
     cache.values = Some(v_buf.slice_set(&values, &start_coord, &stop_coord));
     cache.offset = next;
 
     // Valid portion of KV cache
-    let valid_keys   = cache.keys.as_ref().unwrap()
-                           .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
-    let valid_values = cache.values.as_ref().unwrap()
-                           .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+    let valid_keys = cache
+        .keys
+        .as_ref()
+        .unwrap()
+        .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
+    let valid_values = cache
+        .values
+        .as_ref()
+        .unwrap()
+        .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
 
     // SDPA
     let output = if lw.use_rope {
@@ -1060,19 +1112,16 @@ fn attn_forward(
         if let Some(ref mask_int) = chunk_mask {
             // Build [s, next] additive mask and reshape to [1, 1, s, next] for SDPA.
             let dtype = queries.dtype_raw();
-            let mask_full = make_additive_mask(
-                &mask_int.slice(&[0, 0], &[s, next]),
-                dtype,
-            );
+            let mask_full = make_additive_mask(&mask_int.slice(&[0, 0], &[s, next]), dtype);
             let mask_4d = mask_full.reshape(&[1, 1, s, next]);
             queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(&mask_4d))
         } else {
             // Decode: causal (only 1 query token, always valid)
-            queries.sdpa(&valid_keys, &valid_values, scale, "causal")
+            crate::decode::sdpa_causal_like_mlx(&queries, &valid_keys, &valid_values, scale, s)
         }
     } else {
         // Global (NoPE) layer: full causal attention, no chunk constraint.
-        queries.sdpa(&valid_keys, &valid_values, scale, "causal")
+        crate::decode::sdpa_causal_like_mlx(&queries, &valid_keys, &valid_values, scale, s)
     };
 
     // Reshape [B, H, S, D] → [B, S, H*D]
@@ -1130,7 +1179,9 @@ fn apply_temperature_tuning(
         // We create the scale array from individual f32 scalars and concatenate.
         // For S=1 (decode) this is trivial.
         if s == 1 {
-            InlineArray::from_f32(scales[0]).as_dtype(dtype).reshape(&[1, 1, 1, 1])
+            InlineArray::from_f32(scales[0])
+                .as_dtype(dtype)
+                .reshape(&[1, 1, 1, 1])
         } else {
             // Build as i32 array trick won't work for f32. Instead: create each
             // element, concatenate along axis 0, then reshape.
@@ -1153,8 +1204,8 @@ fn apply_temperature_tuning(
 
 fn dense_mlp_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
     let gate = x.matmul(lw.mlp_gate_w.as_ref().unwrap());
-    let up   = x.matmul(lw.mlp_up_w.as_ref().unwrap());
-    let act  = InlineArray::fused_swiglu(&gate, &up);
+    let up = x.matmul(lw.mlp_up_w.as_ref().unwrap());
+    let act = InlineArray::fused_swiglu(&gate, &up);
     act.matmul(lw.mlp_down_w.as_ref().unwrap())
 }
 
@@ -1182,47 +1233,47 @@ fn dense_mlp_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
 /// We reshape inputs to `[B*T, 1, hidden]` for gather_mm and `rhs_indices=[B*T, 1]`.
 fn moe_forward(moe: &MoeWeights, x: &InlineArray, b: i32, s: i32) -> InlineArray {
     let hidden_size = x.dim(2);
-    let dtype       = x.dtype_raw();
+    let dtype = x.dtype_raw();
 
     // Router: [B, T, hidden] × [hidden, num_experts] → [B, T, num_experts]
     let logits = x.matmul(&moe.router_w);
 
     // Top-1 selection: argpartition(-logits, kth=0)  places the top-1 index
     // at position 0. Flatten to [B*T, num_experts], slice first column → [B*T, 1].
-    let bt          = b * s;
+    let bt = b * s;
     let num_experts = logits.dim(2);
-    let neg_logits  = logits.negative();
-    let partition   = neg_logits.argpartition(0, -1);
-    let part_flat   = partition.reshape(&[bt, num_experts]);
+    let neg_logits = logits.negative();
+    let partition = neg_logits.argpartition(0, -1);
+    let part_flat = partition.reshape(&[bt, num_experts]);
     let indices_flat = part_flat.slice(&[0, 0], &[bt, 1]); // [bt, 1] top-1 expert index
-    let indices      = indices_flat.reshape(&[b, s, 1]);   // [B, T, 1]
+    let indices = indices_flat.reshape(&[b, s, 1]); // [B, T, 1]
 
     // Gather scores for the top-1 expert, apply sigmoid in f32 for numerical stability.
-    let scores_raw = logits.take_along_axis(&indices, -1);          // [B, T, 1]
+    let scores_raw = logits.take_along_axis(&indices, -1); // [B, T, 1]
     let scores_sig = scores_raw.as_dtype(0).sigmoid().as_dtype(dtype); // [B, T, 1]
 
     // Scale the routed input.
-    let x_scaled = x.multiply(&scores_sig);                          // [B, T, hidden]
+    let x_scaled = x.multiply(&scores_sig); // [B, T, hidden]
 
     // Reshape for gather_mm: [bt, 1, hidden]. rhs_indices: [bt, 1] as uint32.
-    let x_g     = x_scaled.reshape(&[bt, 1, hidden_size]);
+    let x_g = x_scaled.reshape(&[bt, 1, hidden_size]);
     let rhs_idx = indices_flat.as_dtype(5); // dtype 5 = uint32 in MLX
 
     // Gate and up projections via gather_mm → [bt, 1, expert_h]
     let gate_out = x_g.gather_mm(&moe.experts_gate_w, None, Some(&rhs_idx), false);
-    let up_out   = x_g.gather_mm(&moe.experts_up_w,   None, Some(&rhs_idx), false);
+    let up_out = x_g.gather_mm(&moe.experts_up_w, None, Some(&rhs_idx), false);
 
     // SwiGLU activation
     let activated = InlineArray::fused_swiglu(&gate_out, &up_out);
 
     // Down projection → [bt, 1, hidden]
-    let down_out   = activated.gather_mm(&moe.experts_down_w, None, Some(&rhs_idx), false);
+    let down_out = activated.gather_mm(&moe.experts_down_w, None, Some(&rhs_idx), false);
     let routed_out = down_out.reshape(&[b, s, hidden_size]);
 
     // Shared expert: standard dense SwiGLU MLP
-    let sh_gate    = x.matmul(&moe.shared_gate_w);
-    let sh_up      = x.matmul(&moe.shared_up_w);
-    let sh_act     = InlineArray::fused_swiglu(&sh_gate, &sh_up);
+    let sh_gate = x.matmul(&moe.shared_gate_w);
+    let sh_up = x.matmul(&moe.shared_up_w);
+    let sh_act = InlineArray::fused_swiglu(&sh_gate, &sh_up);
     let shared_out = sh_act.matmul(&moe.shared_down_w);
 
     routed_out.add(&shared_out)
@@ -1236,15 +1287,7 @@ fn moe_forward(moe: &MoeWeights, x: &InlineArray, b: i32, s: i32) -> InlineArray
 ///
 /// `temperature <= 0.0` → greedy argmax. Otherwise categorical sampling.
 pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
-    if temperature <= 0.0 {
-        logits_2d.argmax(-1)
-    } else {
-        let inv_temp  = InlineArray::from_f32(1.0 / temperature);
-        let lse       = logits_2d.logsumexp(-1, true);
-        let log_probs = logits_2d.subtract(&lse);
-        let scaled    = log_probs.multiply(&inv_temp);
-        scaled.categorical()
-    }
+    crate::decode::sample_token(logits_2d, temperature)
 }
 
 // ============================================================================
@@ -1268,21 +1311,7 @@ pub fn generate(
 ) -> Vec<u32> {
     let mut tokens = Vec::with_capacity(max_tokens);
 
-    // Flush prefill residue from the Metal buffer cache.
-    bridge::clear_cache();
-    bridge::reset_peak_memory();
-    // Enable MLX global compile — fuses element-wise ops across the eval graph.
-    bridge::enable_compile();
-    // Create a dedicated GPU stream (matches Python's generation_stream).
-    bridge::new_generation_stream();
-    bridge::set_generation_stream();
-    // Wire model weights into GPU memory — prevents paging during decode.
-    bridge::set_wired_limit_max();
-    eprintln!(
-        "[LLAMA4_NATIVE] generate: dtype={} active={:.0}MB",
-        weights.model_dtype,
-        bridge::get_active_memory() as f64 / 1e6,
-    );
+    crate::decode::begin_generation_session("LLAMA4_NATIVE", weights.model_dtype);
 
     // Eval and detach all prefill cache states before decode.
     cache.eval_and_detach_states();
@@ -1290,15 +1319,28 @@ pub fn generate(
 
     // First decode step
     let input_token = InlineArray::from_i32(first_token as i32).reshape(&[1, 1]);
-    let logits      = forward_step(weights, &input_token, cache);
+    let logits = forward_step(weights, &input_token, cache);
     // Squeeze sequence dim: [B, 1, vocab] → [B, vocab]
-    let logits_2d   = logits.squeeze(1);
+    let logits_2d = logits.squeeze(1);
     let mut current_y = sample_token(&logits_2d, temperature);
     current_y.async_eval_ref();
 
     let mut step_times: Vec<f64> = Vec::new();
 
     for step in 0..max_tokens {
+        let next_y = if step + 1 < max_tokens {
+            let t_step = std::time::Instant::now();
+            let next_input = current_y.reshape(&[1, 1]);
+            let next_logits = forward_step(weights, &next_input, cache);
+            let next_2d = next_logits.squeeze(1);
+            let next_y = sample_token(&next_2d, temperature);
+            next_y.async_eval_ref();
+            step_times.push(t_step.elapsed().as_secs_f64() * 1000.0);
+            Some(next_y)
+        } else {
+            None
+        };
+
         if step == 0 {
             current_y.eval();
         }
@@ -1308,18 +1350,10 @@ pub fn generate(
         if !on_token(token_val) {
             break;
         }
-        if step + 1 >= max_tokens {
+        let Some(next_y) = next_y else {
             break;
-        }
-
-        let t_step     = std::time::Instant::now();
-        let next_input = InlineArray::from_i32(token_val as i32).reshape(&[1, 1]);
-        let next_logits = forward_step(weights, &next_input, cache);
-        let next_2d     = next_logits.squeeze(1);
-        current_y = sample_token(&next_2d, temperature);
-        current_y.eval();
-
-        step_times.push(t_step.elapsed().as_secs_f64() * 1000.0);
+        };
+        current_y = next_y;
 
         // Periodically flush buffer cache to prevent memory accumulation.
         if step % 256 == 255 {
@@ -1330,8 +1364,8 @@ pub fn generate(
     if step_times.len() > 20 {
         step_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let skip = 10;
-        let avg  = step_times[skip..].iter().sum::<f64>() / (step_times.len() - skip) as f64;
-        let p50  = step_times[step_times.len() / 2];
+        let avg = step_times[skip..].iter().sum::<f64>() / (step_times.len() - skip) as f64;
+        let p50 = step_times[step_times.len() / 2];
         eprintln!(
             "[LLAMA4_NATIVE] per-step: avg={avg:.2}ms p50={p50:.2}ms = {:.0} tok/s",
             1000.0 / avg
