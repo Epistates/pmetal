@@ -12,7 +12,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::{Array, Exception, nn, Param, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue};
+use pmetal_bridge::compat::{
+    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param, nn,
+};
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
@@ -132,18 +134,18 @@ impl Qwen3QLoraAttention {
         let values = self.v_proj.forward(x)?;
 
         // Reshape for multi-head attention: [B, L, heads, head_dim]
-        let queries = queries.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        let keys = keys.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
-        let values = values.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        let queries = queries.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        let keys = keys.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let values = values.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Qwen3-specific: Apply Q/K normalization before RoPE
         let queries = pmetal_bridge::compat::Module::forward(&mut self.q_norm, &queries)?;
         let keys = pmetal_bridge::compat::Module::forward(&mut self.k_norm, &keys)?;
 
         // Transpose for attention: [B, heads, L, head_dim]
-        let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-        let keys = keys.transpose_axes(&[0, 2, 1, 3])?;
-        let values = values.transpose_axes(&[0, 2, 1, 3])?;
+        let queries = queries.transpose_axes(&[0, 2, 1, 3]);
+        let keys = keys.transpose_axes(&[0, 2, 1, 3]);
+        let values = values.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE - use position_ids if provided (for packed sequences)
         let (queries, keys) = if let Some(pos_ids) = position_ids {
@@ -187,8 +189,8 @@ impl Qwen3QLoraAttention {
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         // Output projection
         self.o_proj.forward(&output).map_err(LoraError::from)
@@ -268,9 +270,9 @@ impl Qwen3QloraMLP {
     /// Forward pass (SwiGLU activation).
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::silu(gate)?;
+        let gate = nn::silu(&gate);
         let up = self.up_proj.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         self.down_proj.forward(&hidden)
     }
 
@@ -341,10 +343,11 @@ impl Qwen3QloraDecoderLayer {
         // Pre-norm + attention + residual
         let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward(&normed, mask, position_ids)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-norm + MLP + residual
-        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed =
+            pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
         Ok(h.add(&mlp_out))
     }
@@ -423,7 +426,8 @@ impl Qwen3QloraModel {
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
         // Get embeddings
-        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states =
+            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Create causal mask if not provided
         let mask = if mask.is_none() {
@@ -564,10 +568,13 @@ impl Qwen3QloraForCausalLM {
 
         // Get logits from LM head or shared embeddings
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(
+                lm_head,
+                &hidden_states,
+            )?)
         } else {
             // Tie weights: use embedding weight transposed
-            Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
+            Ok(self.model.embed_tokens.as_linear(&hidden_states))
         }
     }
 
@@ -759,7 +766,8 @@ impl Qwen3QloraForCausalLM {
         // Single-file model
         let single_file = model_dir.join("model.safetensors");
         if single_file.exists() {
-            let weights = crate::sanitize_loaded_weights(Array::load_safetensors(&single_file)?)?;
+            let weights =
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&single_file)?)?;
             return self.load_and_quantize_weights(&weights);
         }
 
@@ -788,7 +796,7 @@ impl Qwen3QloraForCausalLM {
         for shard_file in shard_files {
             let shard_path = model_dir.join(shard_file);
             let shard_weights =
-                crate::sanitize_loaded_weights(Array::load_safetensors(&shard_path)?)?;
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&shard_path)?)?;
             all_weights.extend(shard_weights);
         }
 
@@ -808,8 +816,7 @@ impl Qwen3QloraForCausalLM {
     /// Save LoRA weights to safetensors.
     pub fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
         let params = self.lora_parameters();
-        Array::save_safetensors(params, None, path)?;
-        Ok(())
+        crate::save_safetensors_map(path, &params)
     }
 
     /// Load LoRA weights from safetensors.
@@ -823,14 +830,14 @@ impl Qwen3QloraForCausalLM {
         } else {
             path.to_path_buf()
         };
-        let loaded = Array::load_safetensors(&file_path)?;
+        let loaded = crate::load_safetensors_map(&file_path)?;
 
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let prefix = format!("layers.{}", i);
 
             macro_rules! load_param {
                 ($param:expr, $key:expr) => {
-                    if let Some(value) = loaded.get(&Rc::from($key) as &str) {
+                    if let Some(value) = loaded.get(&$key) {
                         $param = value.clone();
                     }
                 };
@@ -1253,16 +1260,23 @@ impl crate::TrainableModel for Qwen3QloraForCausalLM {
 
 /// Create a causal attention mask.
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
+    let mask =
+        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
-    pmetal_bridge::compat::ops::where_fn(&mask.eq(&zero), &neg_inf, &zero)
+    let equal_zero = mask.equal(&zero);
+    Ok(pmetal_bridge::compat::ops::where_fn(
+        &equal_zero,
+        &neg_inf,
+        &zero,
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::Dtype; use pmetal_bridge::compat::random;
+    use pmetal_bridge::compat::Dtype;
+    use pmetal_bridge::compat::random;
 
     fn small_config() -> Qwen3Config {
         Qwen3Config {
@@ -1300,9 +1314,12 @@ mod tests {
         let seq_len = shape[2];
         let head_dim = shape[3];
 
-        let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-        let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
-        x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
+        let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim]);
+        let x = pmetal_bridge::compat::ops::broadcast_to(
+            &x,
+            &[batch, n_kv_heads, repeats, seq_len, head_dim],
+        );
+        Ok(x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim]))
     }
 
     fn reference_attention_output(
@@ -1319,16 +1336,16 @@ mod tests {
         let keys = attn.k_proj.forward(x)?;
         let values = attn.v_proj.forward(x)?;
 
-        let queries = queries.reshape(&[batch, seq_len, attn.n_heads, attn.head_dim])?;
-        let keys = keys.reshape(&[batch, seq_len, attn.n_kv_heads, attn.head_dim])?;
-        let values = values.reshape(&[batch, seq_len, attn.n_kv_heads, attn.head_dim])?;
+        let queries = queries.reshape(&[batch, seq_len, attn.n_heads, attn.head_dim]);
+        let keys = keys.reshape(&[batch, seq_len, attn.n_kv_heads, attn.head_dim]);
+        let values = values.reshape(&[batch, seq_len, attn.n_kv_heads, attn.head_dim]);
 
         let queries = pmetal_bridge::compat::Module::forward(&mut attn.q_norm, &queries)?;
         let keys = pmetal_bridge::compat::Module::forward(&mut attn.k_norm, &keys)?;
 
-        let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-        let keys = keys.transpose_axes(&[0, 2, 1, 3])?;
-        let values = values.transpose_axes(&[0, 2, 1, 3])?;
+        let queries = queries.transpose_axes(&[0, 2, 1, 3]);
+        let keys = keys.transpose_axes(&[0, 2, 1, 3]);
+        let values = values.transpose_axes(&[0, 2, 1, 3]);
 
         let (queries, keys) = if let Some(pos_ids) = position_ids {
             use pmetal_mlx::kernels::rope::apply_rope_with_positions;
@@ -1366,19 +1383,19 @@ mod tests {
             values
         };
 
-        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
-        let scores = scores.multiply(Array::from_f32(attn.scale))?;
+        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]));
+        let scores = scores.multiply(&Array::from_f32(attn.scale));
         let scores = if let Some(mask) = mask {
             scores.add(mask)
         } else {
-            let causal_mask = create_causal_mask(seq_len)?.as_dtype(Dtype::Float32)?;
+            let causal_mask = create_causal_mask(seq_len)?.as_dtype(Dtype::Float32.as_i32());
             scores.add(&causal_mask)
         };
-        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
-        let output = weights.matmul(&values)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1);
+        let output = weights.matmul(&values);
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
         attn.o_proj.forward(&output).map_err(LoraError::from)
     }
 
@@ -1388,7 +1405,10 @@ mod tests {
         let qlora_config = small_qlora_config();
         let mut attn = Qwen3QLoraAttention::new(&config, &qlora_config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = attn.forward(&x, None, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1398,12 +1418,15 @@ mod tests {
     fn test_qwen3_qlora_attention_matches_manual_causal_reference() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        random::seed(23).unwrap();
+        random::seed(23);
         let mut fused_attn = Qwen3QLoraAttention::new(&config, &qlora_config).unwrap();
-        random::seed(23).unwrap();
+        random::seed(23);
         let mut ref_attn = Qwen3QLoraAttention::new(&config, &qlora_config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let fused = fused_attn.forward(&x, None, None).unwrap();
         fused.eval().unwrap();
@@ -1425,12 +1448,15 @@ mod tests {
     fn test_qwen3_qlora_attention_matches_manual_packed_reference() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        random::seed(29).unwrap();
+        random::seed(29);
         let mut fused_attn = Qwen3QLoraAttention::new(&config, &qlora_config).unwrap();
-        random::seed(29).unwrap();
+        random::seed(29);
         let mut ref_attn = Qwen3QLoraAttention::new(&config, &qlora_config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let position_ids = Array::from_slice(&[0_i32, 1, 0, 1], &[4]);
         let packed_mask = Array::from_slice(
             &[

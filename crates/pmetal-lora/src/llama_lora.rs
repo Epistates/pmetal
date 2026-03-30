@@ -6,8 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use pmetal_bridge::compat::{
-    Array, Exception, nn,
-    ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
+    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, nn,
 };
 
 use pmetal_core::LoraConfig;
@@ -146,13 +145,13 @@ impl LlamaLoraAttention {
         // Reshape for multi-head attention: [B, L, heads, head_dim]
         let queries = queries
             .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?; // [B, heads, L, head_dim]
+            .transpose_axes(&[0, 2, 1, 3]); // [B, heads, L, head_dim]
         let keys = keys
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
         let values = values
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE
         let queries = pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?;
@@ -173,8 +172,8 @@ impl LlamaLoraAttention {
         };
 
         // Scaled dot-product attention
-        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
-        let scores = scores.multiply(Array::from_f32(self.scale))?;
+        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]));
+        let scores = scores.multiply(&Array::from_f32(self.scale));
 
         // Apply mask if provided
         let scores = if let Some(m) = mask {
@@ -184,15 +183,15 @@ impl LlamaLoraAttention {
         };
 
         // Softmax
-        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1);
 
         // Attention output
-        let output = weights.matmul(&values)?;
+        let output = weights.matmul(&values);
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         // Output projection
         self.o_proj.forward(&output).map_err(LoraError::from)
@@ -219,13 +218,13 @@ impl LlamaLoraAttention {
 
         let queries = queries
             .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
         let keys = keys
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
         let values = values
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE with explicit position IDs so packed sequences get correct positions.
         let rope_dims = self.rope.dimensions;
@@ -262,8 +261,8 @@ impl LlamaLoraAttention {
             values
         };
 
-        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
-        let scores = scores.multiply(Array::from_f32(self.scale))?;
+        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]));
+        let scores = scores.multiply(&Array::from_f32(self.scale));
 
         let scores = if let Some(m) = mask {
             scores.add(m)
@@ -271,12 +270,12 @@ impl LlamaLoraAttention {
             scores
         };
 
-        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
-        let output = weights.matmul(&values)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1);
+        let output = weights.matmul(&values);
 
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         self.o_proj.forward(&output).map_err(LoraError::from)
     }
@@ -308,13 +307,13 @@ impl LlamaLoraAttention {
         // Reshape for multi-head attention: [B, L, heads, head_dim]
         let queries = queries
             .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?; // [B, heads, L, head_dim]
+            .transpose_axes(&[0, 2, 1, 3]); // [B, heads, L, head_dim]
         let keys = keys
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
         let values = values
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
 
         // Get RoPE offset and apply RoPE
         let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
@@ -347,8 +346,8 @@ impl LlamaLoraAttention {
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         // Output projection
         self.o_proj.forward(&output).map_err(LoraError::from)
@@ -371,9 +370,12 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     let seq_len = shape[2];
     let head_dim = shape[3];
 
-    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
-    x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
+    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim]);
+    let x = pmetal_bridge::compat::ops::broadcast_to(
+        &x,
+        &[batch, n_kv_heads, repeats, seq_len, head_dim],
+    );
+    Ok(x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim]))
 }
 
 /// LoRA-enabled MLP layer for Llama.
@@ -431,9 +433,9 @@ impl LlamaLoraMLP {
     /// Forward pass (SwiGLU activation).
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::silu(gate)?;
+        let gate = nn::silu(&gate);
         let up = self.up_proj.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         self.down_proj.forward(&hidden)
     }
 
@@ -486,10 +488,11 @@ impl LlamaLoraDecoderLayer {
         // Pre-norm + attention + residual
         let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward(&normed, mask)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-norm + MLP + residual
-        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed =
+            pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
         Ok(h.add(&mlp_out))
     }
@@ -509,10 +512,11 @@ impl LlamaLoraDecoderLayer {
         // Pre-norm + attention + residual
         let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-norm + MLP + residual
-        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed =
+            pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
         Ok(h.add(&mlp_out))
     }
@@ -528,9 +532,10 @@ impl LlamaLoraDecoderLayer {
         let attn_out = self
             .self_attn
             .forward_with_positions(&normed, mask, position_ids)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
-        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed =
+            pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
         Ok(h.add(&mlp_out))
     }
@@ -595,7 +600,8 @@ impl LlamaLoraModel {
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
         // Embed tokens
-        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states =
+            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Compute noise magnitude: alpha / sqrt(seq_len * embed_dim)
         let seq_len = input_ids.dim(1) as f32;
@@ -603,8 +609,13 @@ impl LlamaLoraModel {
         let mag = noise_alpha / (seq_len * embed_dim).sqrt();
 
         // Add uniform noise U(-mag, mag) — auto-diffable through the noise
-        let noise = pmetal_bridge::compat::random::uniform_range(-mag, mag, hidden_states.shape(), pmetal_bridge::compat::Dtype::Float32);
-        hidden_states = hidden_states.add(&noise)?;
+        let noise = pmetal_bridge::compat::random::uniform_range(
+            -mag,
+            mag,
+            hidden_states.shape(),
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        hidden_states = hidden_states.add(&noise);
 
         // Create causal mask if not provided
         let mask = if mask.is_none() {
@@ -656,7 +667,8 @@ impl LlamaLoraModel {
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
         // Get embeddings
-        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states =
+            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Create causal mask if not provided
         let mask = if mask.is_none() {
@@ -704,7 +716,8 @@ impl LlamaLoraModel {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, LoraError> {
         // Get embeddings
-        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states =
+            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Don't create explicit causal mask - fused SDPA handles it internally
         // with proper dtype handling. Only pass through user-provided masks.
@@ -741,7 +754,8 @@ impl LlamaLoraModel {
         mask: Option<&Array>,
         position_ids: &Array,
     ) -> Result<Array, LoraError> {
-        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states =
+            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // The caller provides a pre-built block-diagonal attention mask for packed sequences;
         // do not auto-generate a causal mask here.
@@ -885,10 +899,13 @@ impl LlamaLoraForCausalLM {
 
         // Get logits from LM head or shared embeddings
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(
+                lm_head,
+                &hidden_states,
+            )?)
         } else {
             // Tie weights: use embedding weight transposed
-            Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
+            Ok(self.model.embed_tokens.as_linear(&hidden_states))
         }
     }
 
@@ -947,9 +964,12 @@ impl LlamaLoraForCausalLM {
                 .forward_noised(input_ids, mask, noise_alpha, checkpoint_config.as_ref())?;
 
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(
+                lm_head,
+                &hidden_states,
+            )?)
         } else {
-            Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
+            Ok(self.model.embed_tokens.as_linear(&hidden_states))
         }
     }
 
@@ -972,10 +992,13 @@ impl LlamaLoraForCausalLM {
 
         // Get logits from LM head or shared embeddings
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(
+                lm_head,
+                &hidden_states,
+            )?)
         } else {
             // Tie weights: use embedding weight transposed
-            Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
+            Ok(self.model.embed_tokens.as_linear(&hidden_states))
         }
     }
 
@@ -1026,12 +1049,12 @@ impl LlamaLoraForCausalLM {
                 let a_key = format!("{}.self_attn.{}.lora_a", prefix, proj_name);
                 let b_key = format!("{}.self_attn.{}.lora_b", prefix, proj_name);
                 if let Some(grad) = gradients.get(&Rc::from(a_key)) {
-                    let update = grad.multiply(&lr)?;
-                    *proj.lora_a_mut() = proj.lora_a().subtract(&update)?;
+                    let update = grad.multiply(&lr);
+                    *proj.lora_a_mut() = proj.lora_a().subtract(&update);
                 }
                 if let Some(grad) = gradients.get(&Rc::from(b_key)) {
-                    let update = grad.multiply(&lr)?;
-                    *proj.lora_b_mut() = proj.lora_b().subtract(&update)?;
+                    let update = grad.multiply(&lr);
+                    *proj.lora_b_mut() = proj.lora_b().subtract(&update);
                 }
             }
 
@@ -1044,12 +1067,12 @@ impl LlamaLoraForCausalLM {
                 let a_key = format!("{}.mlp.{}.lora_a", prefix, proj_name);
                 let b_key = format!("{}.mlp.{}.lora_b", prefix, proj_name);
                 if let Some(grad) = gradients.get(&Rc::from(a_key)) {
-                    let update = grad.multiply(&lr)?;
-                    *proj.lora_a_mut() = proj.lora_a().subtract(&update)?;
+                    let update = grad.multiply(&lr);
+                    *proj.lora_a_mut() = proj.lora_a().subtract(&update);
                 }
                 if let Some(grad) = gradients.get(&Rc::from(b_key)) {
-                    let update = grad.multiply(&lr)?;
-                    *proj.lora_b_mut() = proj.lora_b().subtract(&update)?;
+                    let update = grad.multiply(&lr);
+                    *proj.lora_b_mut() = proj.lora_b().subtract(&update);
                 }
             }
         }
@@ -1065,23 +1088,23 @@ impl LlamaLoraForCausalLM {
     }
 
     /// Evaluate all LoRA parameters (force computation).
-    pub fn eval_lora_params(&self) -> Result<(), LoraError> {
-        for layer in &self.model.layers {
-            layer.self_attn.q_proj.lora_a().eval()?;
-            layer.self_attn.q_proj.lora_b().eval()?;
-            layer.self_attn.k_proj.lora_a().eval()?;
-            layer.self_attn.k_proj.lora_b().eval()?;
-            layer.self_attn.v_proj.lora_a().eval()?;
-            layer.self_attn.v_proj.lora_b().eval()?;
-            layer.self_attn.o_proj.lora_a().eval()?;
-            layer.self_attn.o_proj.lora_b().eval()?;
+    pub fn eval_lora_params(&mut self) -> Result<(), LoraError> {
+        for layer in &mut self.model.layers {
+            layer.self_attn.q_proj.lora_a_mut().eval();
+            layer.self_attn.q_proj.lora_b_mut().eval();
+            layer.self_attn.k_proj.lora_a_mut().eval();
+            layer.self_attn.k_proj.lora_b_mut().eval();
+            layer.self_attn.v_proj.lora_a_mut().eval();
+            layer.self_attn.v_proj.lora_b_mut().eval();
+            layer.self_attn.o_proj.lora_a_mut().eval();
+            layer.self_attn.o_proj.lora_b_mut().eval();
 
-            layer.mlp.gate_proj.lora_a().eval()?;
-            layer.mlp.gate_proj.lora_b().eval()?;
-            layer.mlp.up_proj.lora_a().eval()?;
-            layer.mlp.up_proj.lora_b().eval()?;
-            layer.mlp.down_proj.lora_a().eval()?;
-            layer.mlp.down_proj.lora_b().eval()?;
+            layer.mlp.gate_proj.lora_a_mut().eval();
+            layer.mlp.gate_proj.lora_b_mut().eval();
+            layer.mlp.up_proj.lora_a_mut().eval();
+            layer.mlp.up_proj.lora_b_mut().eval();
+            layer.mlp.down_proj.lora_a_mut().eval();
+            layer.mlp.down_proj.lora_b_mut().eval();
         }
         Ok(())
     }
@@ -1238,7 +1261,8 @@ impl LlamaLoraForCausalLM {
         // Check for single file model
         let single_file = model_dir.join("model.safetensors");
         if single_file.exists() {
-            let weights = crate::sanitize_loaded_weights(Array::load_safetensors(&single_file)?)?;
+            let weights =
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&single_file)?)?;
             return self.load_base_weights(&weights);
         }
 
@@ -1269,7 +1293,7 @@ impl LlamaLoraForCausalLM {
         for shard_file in shard_files {
             let shard_path = model_dir.join(shard_file);
             let shard_weights =
-                crate::sanitize_loaded_weights(Array::load_safetensors(&shard_path)?)?;
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&shard_path)?)?;
             all_weights.extend(shard_weights);
         }
 
@@ -1280,53 +1304,48 @@ impl LlamaLoraForCausalLM {
     ///
     /// This evaluates both base weights and LoRA weights to ensure
     /// they are materialized on the device.
-    pub fn eval_all(&self) -> Result<(), LoraError> {
+    pub fn eval_all(&mut self) -> Result<(), LoraError> {
         // Eval embeddings
-        self.model.embed_tokens.weight.value.as_ref().eval()?;
+        self.model.embed_tokens.weight.value.eval();
 
         // Eval layers
-        for layer in &self.model.layers {
+        for layer in &mut self.model.layers {
             // Base weights (use weight() accessor — LinearAdapter enum)
-            layer.self_attn.q_proj.weight().eval()?;
-            layer.self_attn.k_proj.weight().eval()?;
-            layer.self_attn.v_proj.weight().eval()?;
-            layer.self_attn.o_proj.weight().eval()?;
-            layer.mlp.gate_proj.weight().eval()?;
-            layer.mlp.up_proj.weight().eval()?;
-            layer.mlp.down_proj.weight().eval()?;
+            layer.self_attn.q_proj.weight_mut().eval();
+            layer.self_attn.k_proj.weight_mut().eval();
+            layer.self_attn.v_proj.weight_mut().eval();
+            layer.self_attn.o_proj.weight_mut().eval();
+            layer.mlp.gate_proj.weight_mut().eval();
+            layer.mlp.up_proj.weight_mut().eval();
+            layer.mlp.down_proj.weight_mut().eval();
 
             // LoRA weights (use lora_a()/lora_b() accessors — LinearAdapter enum)
-            layer.self_attn.q_proj.lora_a().eval()?;
-            layer.self_attn.q_proj.lora_b().eval()?;
-            layer.self_attn.k_proj.lora_a().eval()?;
-            layer.self_attn.k_proj.lora_b().eval()?;
-            layer.self_attn.v_proj.lora_a().eval()?;
-            layer.self_attn.v_proj.lora_b().eval()?;
-            layer.self_attn.o_proj.lora_a().eval()?;
-            layer.self_attn.o_proj.lora_b().eval()?;
-            layer.mlp.gate_proj.lora_a().eval()?;
-            layer.mlp.gate_proj.lora_b().eval()?;
-            layer.mlp.up_proj.lora_a().eval()?;
-            layer.mlp.up_proj.lora_b().eval()?;
-            layer.mlp.down_proj.lora_a().eval()?;
-            layer.mlp.down_proj.lora_b().eval()?;
+            layer.self_attn.q_proj.lora_a_mut().eval();
+            layer.self_attn.q_proj.lora_b_mut().eval();
+            layer.self_attn.k_proj.lora_a_mut().eval();
+            layer.self_attn.k_proj.lora_b_mut().eval();
+            layer.self_attn.v_proj.lora_a_mut().eval();
+            layer.self_attn.v_proj.lora_b_mut().eval();
+            layer.self_attn.o_proj.lora_a_mut().eval();
+            layer.self_attn.o_proj.lora_b_mut().eval();
+            layer.mlp.gate_proj.lora_a_mut().eval();
+            layer.mlp.gate_proj.lora_b_mut().eval();
+            layer.mlp.up_proj.lora_a_mut().eval();
+            layer.mlp.up_proj.lora_b_mut().eval();
+            layer.mlp.down_proj.lora_a_mut().eval();
+            layer.mlp.down_proj.lora_b_mut().eval();
 
             // Layer norms
-            layer.input_layernorm.weight.value.as_ref().eval()?;
-            layer
-                .post_attention_layernorm
-                .weight
-                .value
-                .as_ref()
-                .eval()?;
+            layer.input_layernorm.weight.value.eval();
+            layer.post_attention_layernorm.weight.value.eval();
         }
 
         // Final norm
-        self.model.norm.weight.value.as_ref().eval()?;
+        self.model.norm.weight.value.eval();
 
         // LM head if present
-        if let Some(ref lm_head) = self.lm_head {
-            lm_head.weight.value.as_ref().eval()?;
+        if let Some(ref mut lm_head) = self.lm_head {
+            lm_head.weight.value.eval();
         }
 
         Ok(())
@@ -1460,8 +1479,8 @@ impl ModuleParameters for LlamaLoraForCausalLM {
 
             fn adapter_params_mut<'a>(
                 adapter: &'a mut LinearAdapter,
-            ) -> HashMap<Rc<str>, NestedValue<Rc<str>, &'a mut Array>> {
-                let mut m: HashMap<Rc<str>, NestedValue<Rc<str>, &'a mut Array>> = HashMap::new();
+            ) -> HashMap<Rc<str>, NestedValue<&'a mut Array>> {
+                let mut m: HashMap<Rc<str>, NestedValue<&'a mut Array>> = HashMap::new();
                 match adapter {
                     LinearAdapter::Lora(l) => {
                         m.insert(Rc::from("lora_a"), NestedValue::Value(&mut l.lora_a));
@@ -1478,8 +1497,8 @@ impl ModuleParameters for LlamaLoraForCausalLM {
 
             fn lora_params_mut<'a>(
                 l: &'a mut LoraLinear,
-            ) -> HashMap<Rc<str>, NestedValue<Rc<str>, &'a mut Array>> {
-                let mut m: HashMap<Rc<str>, NestedValue<Rc<str>, &'a mut Array>> = HashMap::new();
+            ) -> HashMap<Rc<str>, NestedValue<&'a mut Array>> {
+                let mut m: HashMap<Rc<str>, NestedValue<&'a mut Array>> = HashMap::new();
                 m.insert(Rc::from("lora_a"), NestedValue::Value(&mut l.lora_a));
                 m.insert(Rc::from("lora_b"), NestedValue::Value(&mut l.lora_b));
                 m
@@ -1557,10 +1576,15 @@ crate::impl_trainable_model!(LlamaLoraForCausalLM);
 
 /// Create a causal attention mask.
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = pmetal_bridge::compat::ops::tri::<f32>(seq_len, None, None)?;
+    let mask =
+        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
-    pmetal_bridge::compat::ops::where_fn(&mask.eq(&zero), &neg_inf, &zero)
+    Ok(pmetal_bridge::compat::ops::where_fn(
+        &mask.equal(&zero),
+        &neg_inf,
+        &zero,
+    ))
 }
 
 #[cfg(test)]
@@ -1608,7 +1632,10 @@ mod tests {
         let lora_config = small_lora_config();
         let mut attn = LlamaLoraAttention::new(&config, &lora_config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);

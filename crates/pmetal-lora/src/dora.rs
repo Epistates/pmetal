@@ -73,10 +73,18 @@ impl DoraLinear {
 
         // Initialize LoRA A with Kaiming uniform
         let bound = (3.0_f32 / in_features as f32).sqrt();
-        let lora_a = pmetal_bridge::compat::random::uniform_range(-bound, bound, &[rank, in_features], pmetal_bridge::compat::Dtype::Float32);
+        let lora_a = pmetal_bridge::compat::random::uniform_range(
+            -bound,
+            bound,
+            &[rank, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Initialize LoRA B with zeros
-        let lora_b = pmetal_bridge::compat::ops::zeros(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32);
+        let lora_b = pmetal_bridge::compat::ops::zeros(
+            &[out_features, rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Initialize magnitude with column norms of base weight
         // weight is [out, in], so we want norms along dim 1 to get [out, 1]
@@ -121,17 +129,32 @@ impl DoraLinear {
 
         // Initialize base weight with Kaiming uniform
         let bound = (3.0_f32 / in_features as f32).sqrt();
-        let weight =
-            pmetal_bridge::compat::random::uniform_range(-bound, bound, &[out_features, in_features], pmetal_bridge::compat::Dtype::Float32);
+        let weight = pmetal_bridge::compat::random::uniform_range(
+            -bound,
+            bound,
+            &[out_features, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let bias = if use_bias {
-            Some(pmetal_bridge::compat::ops::zeros(&[out_features], pmetal_bridge::compat::Dtype::Float32))
+            Some(pmetal_bridge::compat::ops::zeros(
+                &[out_features],
+                pmetal_bridge::compat::Dtype::Float32,
+            ))
         } else {
             None
         };
 
-        let lora_a = pmetal_bridge::compat::random::uniform_range(-bound, bound, &[rank, in_features], pmetal_bridge::compat::Dtype::Float32);
-        let lora_b = pmetal_bridge::compat::ops::zeros(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32);
+        let lora_a = pmetal_bridge::compat::random::uniform_range(
+            -bound,
+            bound,
+            &[rank, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let lora_b = pmetal_bridge::compat::ops::zeros(
+            &[out_features, rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Initialize magnitude from weight norms
         let magnitude = weight.square().sum_axis(1, true).sqrt();
@@ -342,7 +365,10 @@ mod tests {
     #[test]
     fn test_dora_forward_pass() {
         let mut dora = DoraLinear::new(32, 64, 4, 8.0, false, false).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 32], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, 32],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let output = dora.forward(&x).unwrap();
         assert_eq!(output.shape(), &[2, 4, 64]);
@@ -401,7 +427,8 @@ mod tests {
         // When lora_b is zero (as initialised), the merged weight should produce
         // the same output as the unmerged forward pass.
         let mut dora = DoraLinear::new(16, 32, 4, 8.0, false, false).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[1, 16], pmetal_bridge::compat::Dtype::Float32);
+        let x =
+            pmetal_bridge::compat::random::normal(&[1, 16], pmetal_bridge::compat::Dtype::Float32);
 
         let unmerged_out = dora.forward(&x).unwrap();
         dora.merge().unwrap();

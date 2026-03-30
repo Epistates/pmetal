@@ -133,7 +133,7 @@ pub fn lora_forward_with_grad(
     // LoRA contribution: (x @ A^T) @ B^T
     // [..., rank] @ [rank, out_features] = [..., out_features]
     let lora_out = x_a.matmul(&lora_b.t());
-    let scaled_lora = lora_out.multiply(Array::from_f32(scale));
+    let scaled_lora = lora_out.multiply(&Array::from_f32(scale));
 
     // Base output: x @ W^T
     let base_out = x.matmul(&weight.t());
@@ -168,10 +168,7 @@ pub fn lora_forward_with_grad(
 /// # Returns
 ///
 /// LoRA gradients (dA, dB, and optionally dX)
-pub fn lora_backward(
-    d_output: &Array,
-    saved: &LoraForwardSaved,
-) -> Result<LoraGrads, Exception> {
+pub fn lora_backward(d_output: &Array, saved: &LoraForwardSaved) -> Result<LoraGrads, Exception> {
     let scale = saved.scale;
     let shape = saved.x.shape();
     let ndim = shape.len();
@@ -212,7 +209,7 @@ pub fn lora_backward(
     let d_lora_b = x_a_flat
         .t()
         .matmul(&d_output_flat)
-        .multiply(Array::from_f32(scale))
+        .multiply(&Array::from_f32(scale))
         .t();
 
     // dY @ B: [N, out_features] @ [out_features, rank] = [N, rank]
@@ -224,7 +221,7 @@ pub fn lora_backward(
     let d_lora_a = x_flat
         .t()
         .matmul(&dy_b_flat)
-        .multiply(Array::from_f32(scale))
+        .multiply(&Array::from_f32(scale))
         .t();
 
     // Optionally compute input gradient for chain rule
@@ -236,7 +233,7 @@ pub fn lora_backward(
         // (dY @ B) @ A: [N, rank] @ [rank, in_features] = [N, in_features]
         let dx_lora_flat = dy_b_flat
             .matmul(&saved.lora_a)
-            .multiply(Array::from_f32(scale));
+            .multiply(&Array::from_f32(scale));
 
         let dx_flat = dx_base_flat.add(&dx_lora_flat);
 
@@ -344,7 +341,7 @@ pub fn fused_mlp_forward(
     let gate_lora = x
         .matmul(&gate_lora_a.t())
         .matmul(&gate_lora_b.t())
-        .multiply(Array::from_f32(gate_scale));
+        .multiply(&Array::from_f32(gate_scale));
     let gate_pre_silu = gate_base.add(&gate_lora);
 
     // SiLU activation
@@ -355,7 +352,7 @@ pub fn fused_mlp_forward(
     let up_lora = x
         .matmul(&up_lora_a.t())
         .matmul(&up_lora_b.t())
-        .multiply(Array::from_f32(up_scale));
+        .multiply(&Array::from_f32(up_scale));
     let up_out = up_base.add(&up_lora);
 
     // Element-wise multiply (SwiGLU)
@@ -366,7 +363,7 @@ pub fn fused_mlp_forward(
     let down_lora = mlp_hidden
         .matmul(&down_lora_a.t())
         .matmul(&down_lora_b.t())
-        .multiply(Array::from_f32(down_scale));
+        .multiply(&Array::from_f32(down_scale));
     let output = down_base.add(&down_lora);
 
     let saved = MlpForwardSaved {
@@ -489,7 +486,7 @@ pub fn fused_mlp_backward(
     let d_h_a_down = d_output_flat.matmul(&saved.down_lora_b); // [batch, rank]
     let d_mlp_hidden_lora = d_h_a_down
         .matmul(&saved.down_lora_a)
-        .multiply(Array::from_f32(saved.down_scale));
+        .multiply(&Array::from_f32(saved.down_scale));
     let d_mlp_hidden = d_mlp_hidden.add(&d_mlp_hidden_lora);
 
     // Down LoRA gradients:
@@ -500,12 +497,12 @@ pub fn fused_mlp_backward(
     let down_d_lora_b = d_output_flat
         .t()
         .matmul(&h_a_down)
-        .multiply(Array::from_f32(saved.down_scale));
+        .multiply(&Array::from_f32(saved.down_scale));
 
     let down_d_lora_a = d_h_a_down
         .t()
         .matmul(&mlp_hidden_flat)
-        .multiply(Array::from_f32(saved.down_scale));
+        .multiply(&Array::from_f32(saved.down_scale));
 
     // ============================================
     // 2. SWIGLU BACKWARD
@@ -536,13 +533,13 @@ pub fn fused_mlp_backward(
     let up_d_lora_b = d_up_out
         .t()
         .matmul(&x_a_up)
-        .multiply(Array::from_f32(saved.up_scale));
+        .multiply(&Array::from_f32(saved.up_scale));
 
     let d_x_a_up = d_up_out.matmul(&saved.up_lora_b); // [batch, rank]
     let up_d_lora_a = d_x_a_up
         .t()
         .matmul(&x_flat)
-        .multiply(Array::from_f32(saved.up_scale));
+        .multiply(&Array::from_f32(saved.up_scale));
 
     // ============================================
     // 4. GATE PROJECTION BACKWARD
@@ -556,13 +553,13 @@ pub fn fused_mlp_backward(
     let gate_d_lora_b = d_gate_pre_silu
         .t()
         .matmul(&x_a_gate)
-        .multiply(Array::from_f32(saved.gate_scale));
+        .multiply(&Array::from_f32(saved.gate_scale));
 
     let d_x_a_gate = d_gate_pre_silu.matmul(&saved.gate_lora_b); // [batch, rank]
     let gate_d_lora_a = d_x_a_gate
         .t()
         .matmul(&x_flat)
-        .multiply(Array::from_f32(saved.gate_scale));
+        .multiply(&Array::from_f32(saved.gate_scale));
 
     // ============================================
     // 5. INPUT GRADIENT (ACCUMULATE BOTH PATHS)
@@ -579,7 +576,7 @@ pub fn fused_mlp_backward(
         &d_up_out
             .matmul(&saved.up_lora_b)
             .matmul(&saved.up_lora_a)
-            .multiply(Array::from_f32(saved.up_scale)),
+            .multiply(&Array::from_f32(saved.up_scale)),
     );
 
     // Gate path base
@@ -590,7 +587,7 @@ pub fn fused_mlp_backward(
         &d_gate_pre_silu
             .matmul(&saved.gate_lora_b)
             .matmul(&saved.gate_lora_a)
-            .multiply(Array::from_f32(saved.gate_scale)),
+            .multiply(&Array::from_f32(saved.gate_scale)),
     );
 
     // Reshape back if needed
@@ -633,10 +630,7 @@ impl AccumulatedLoraGrads {
     }
 
     /// Merge with another accumulator (for gradient accumulation).
-    pub fn accumulate(
-        &mut self,
-        other: &AccumulatedLoraGrads,
-    ) -> Result<(), Exception> {
+    pub fn accumulate(&mut self, other: &AccumulatedLoraGrads) -> Result<(), Exception> {
         for (name, grad) in &other.grads {
             if let Some(existing) = self.grads.get_mut(name) {
                 *existing = existing.add(grad);
@@ -650,7 +644,7 @@ impl AccumulatedLoraGrads {
     /// Scale all gradients (for gradient accumulation averaging).
     pub fn scale(&mut self, factor: f32) -> Result<(), Exception> {
         for grad in self.grads.values_mut() {
-            *grad = grad.multiply(Array::from_f32(factor));
+            *grad = grad.multiply(&Array::from_f32(factor));
         }
         Ok(())
     }
@@ -723,12 +717,22 @@ mod tests {
         let scale = 2.0;
 
         // Create test tensors
-        let x = pmetal_bridge::compat::random::normal(&[batch, in_features], pmetal_bridge::compat::Dtype::Float32);
-        let weight =
-            pmetal_bridge::compat::random::normal(&[out_features, in_features], pmetal_bridge::compat::Dtype::Float32);
-        let lora_a = pmetal_bridge::compat::random::normal(&[rank, in_features], pmetal_bridge::compat::Dtype::Float32);
-        let lora_b =
-            pmetal_bridge::compat::random::normal(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[batch, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let weight = pmetal_bridge::compat::random::normal(
+            &[out_features, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let lora_a = pmetal_bridge::compat::random::normal(
+            &[rank, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let lora_b = pmetal_bridge::compat::random::normal(
+            &[out_features, rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Forward
         let ctx = LoraGradContext::new();
@@ -740,8 +744,10 @@ mod tests {
         assert_eq!(saved.x_a.shape(), &[batch, rank]);
 
         // Backward
-        let d_output =
-            pmetal_bridge::compat::random::normal(&[batch, out_features], pmetal_bridge::compat::Dtype::Float32);
+        let d_output = pmetal_bridge::compat::random::normal(
+            &[batch, out_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let grads = lora_backward(&d_output, &saved).unwrap();
 
         assert_eq!(grads.d_lora_a.shape(), &[rank, in_features]);
@@ -758,12 +764,22 @@ mod tests {
         let rank = 8;
         let scale = 2.0;
 
-        let x = pmetal_bridge::compat::random::normal(&[batch, in_features], pmetal_bridge::compat::Dtype::Float32);
-        let weight =
-            pmetal_bridge::compat::random::normal(&[out_features, in_features], pmetal_bridge::compat::Dtype::Float32);
-        let lora_a = pmetal_bridge::compat::random::normal(&[rank, in_features], pmetal_bridge::compat::Dtype::Float32);
-        let lora_b =
-            pmetal_bridge::compat::random::normal(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[batch, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let weight = pmetal_bridge::compat::random::normal(
+            &[out_features, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let lora_a = pmetal_bridge::compat::random::normal(
+            &[rank, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let lora_b = pmetal_bridge::compat::random::normal(
+            &[out_features, rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Forward without input grad
         let ctx = LoraGradContext::new().without_input_grad();
@@ -771,8 +787,10 @@ mod tests {
             lora_forward_with_grad(&x, &weight, &lora_a, &lora_b, scale, &ctx).unwrap();
 
         // Backward
-        let d_output =
-            pmetal_bridge::compat::random::normal(&[batch, out_features], pmetal_bridge::compat::Dtype::Float32);
+        let d_output = pmetal_bridge::compat::random::normal(
+            &[batch, out_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let grads = lora_backward(&d_output, &saved).unwrap();
 
         assert!(grads.d_x.is_none());
@@ -785,14 +803,26 @@ mod tests {
         let out_features = 1024;
 
         let grads1 = LoraGrads {
-            d_lora_a: pmetal_bridge::compat::ops::ones(&[rank, in_features], pmetal_bridge::compat::Dtype::Float32),
-            d_lora_b: pmetal_bridge::compat::ops::ones(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32),
+            d_lora_a: pmetal_bridge::compat::ops::ones(
+                &[rank, in_features],
+                pmetal_bridge::compat::Dtype::Float32,
+            ),
+            d_lora_b: pmetal_bridge::compat::ops::ones(
+                &[out_features, rank],
+                pmetal_bridge::compat::Dtype::Float32,
+            ),
             d_x: None,
         };
 
         let grads2 = LoraGrads {
-            d_lora_a: pmetal_bridge::compat::ops::ones(&[rank, in_features], pmetal_bridge::compat::Dtype::Float32),
-            d_lora_b: pmetal_bridge::compat::ops::ones(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32),
+            d_lora_a: pmetal_bridge::compat::ops::ones(
+                &[rank, in_features],
+                pmetal_bridge::compat::Dtype::Float32,
+            ),
+            d_lora_b: pmetal_bridge::compat::ops::ones(
+                &[out_features, rank],
+                pmetal_bridge::compat::Dtype::Float32,
+            ),
             d_x: None,
         };
 
@@ -815,28 +845,52 @@ mod tests {
         let scale = 2.0;
 
         // Create test tensors for MLP projections
-        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden_size], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[batch, seq_len, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Gate projection: hidden -> intermediate
-        let gate_weight = pmetal_bridge::compat::random::normal(&[intermediate_size, hidden_size], pmetal_bridge::compat::Dtype::Float32);
-        let gate_lora_a =
-            pmetal_bridge::compat::random::normal(&[rank, hidden_size], pmetal_bridge::compat::Dtype::Float32);
-        let gate_lora_b =
-            pmetal_bridge::compat::random::normal(&[intermediate_size, rank], pmetal_bridge::compat::Dtype::Float32);
+        let gate_weight = pmetal_bridge::compat::random::normal(
+            &[intermediate_size, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let gate_lora_a = pmetal_bridge::compat::random::normal(
+            &[rank, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let gate_lora_b = pmetal_bridge::compat::random::normal(
+            &[intermediate_size, rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Up projection: hidden -> intermediate
-        let up_weight = pmetal_bridge::compat::random::normal(&[intermediate_size, hidden_size], pmetal_bridge::compat::Dtype::Float32);
-        let up_lora_a =
-            pmetal_bridge::compat::random::normal(&[rank, hidden_size], pmetal_bridge::compat::Dtype::Float32);
-        let up_lora_b =
-            pmetal_bridge::compat::random::normal(&[intermediate_size, rank], pmetal_bridge::compat::Dtype::Float32);
+        let up_weight = pmetal_bridge::compat::random::normal(
+            &[intermediate_size, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let up_lora_a = pmetal_bridge::compat::random::normal(
+            &[rank, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let up_lora_b = pmetal_bridge::compat::random::normal(
+            &[intermediate_size, rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Down projection: intermediate -> hidden
-        let down_weight = pmetal_bridge::compat::random::normal(&[hidden_size, intermediate_size], pmetal_bridge::compat::Dtype::Float32);
-        let down_lora_a =
-            pmetal_bridge::compat::random::normal(&[rank, intermediate_size], pmetal_bridge::compat::Dtype::Float32);
-        let down_lora_b =
-            pmetal_bridge::compat::random::normal(&[hidden_size, rank], pmetal_bridge::compat::Dtype::Float32);
+        let down_weight = pmetal_bridge::compat::random::normal(
+            &[hidden_size, intermediate_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let down_lora_a = pmetal_bridge::compat::random::normal(
+            &[rank, intermediate_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let down_lora_b = pmetal_bridge::compat::random::normal(
+            &[hidden_size, rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Forward pass
         let (output, saved) = fused_mlp_forward(
@@ -876,8 +930,10 @@ mod tests {
         );
 
         // Backward pass
-        let d_output =
-            pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden_size], pmetal_bridge::compat::Dtype::Float32);
+        let d_output = pmetal_bridge::compat::random::normal(
+            &[batch, seq_len, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let grads = fused_mlp_backward(&d_output, &saved).unwrap();
 
         // Verify gradient shapes
@@ -899,25 +955,49 @@ mod tests {
         let rank = 4;
         let scale = 1.0;
 
-        let x = pmetal_bridge::compat::random::normal(&[batch, hidden_size], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[batch, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
-        let gate_weight = pmetal_bridge::compat::random::normal(&[intermediate_size, hidden_size], pmetal_bridge::compat::Dtype::Float32);
-        let gate_lora_a =
-            pmetal_bridge::compat::random::normal(&[rank, hidden_size], pmetal_bridge::compat::Dtype::Float32);
-        let gate_lora_b =
-            pmetal_bridge::compat::random::normal(&[intermediate_size, rank], pmetal_bridge::compat::Dtype::Float32);
+        let gate_weight = pmetal_bridge::compat::random::normal(
+            &[intermediate_size, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let gate_lora_a = pmetal_bridge::compat::random::normal(
+            &[rank, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let gate_lora_b = pmetal_bridge::compat::random::normal(
+            &[intermediate_size, rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
-        let up_weight = pmetal_bridge::compat::random::normal(&[intermediate_size, hidden_size], pmetal_bridge::compat::Dtype::Float32);
-        let up_lora_a =
-            pmetal_bridge::compat::random::normal(&[rank, hidden_size], pmetal_bridge::compat::Dtype::Float32);
-        let up_lora_b =
-            pmetal_bridge::compat::random::normal(&[intermediate_size, rank], pmetal_bridge::compat::Dtype::Float32);
+        let up_weight = pmetal_bridge::compat::random::normal(
+            &[intermediate_size, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let up_lora_a = pmetal_bridge::compat::random::normal(
+            &[rank, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let up_lora_b = pmetal_bridge::compat::random::normal(
+            &[intermediate_size, rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
-        let down_weight = pmetal_bridge::compat::random::normal(&[hidden_size, intermediate_size], pmetal_bridge::compat::Dtype::Float32);
-        let down_lora_a =
-            pmetal_bridge::compat::random::normal(&[rank, intermediate_size], pmetal_bridge::compat::Dtype::Float32);
-        let down_lora_b =
-            pmetal_bridge::compat::random::normal(&[hidden_size, rank], pmetal_bridge::compat::Dtype::Float32);
+        let down_weight = pmetal_bridge::compat::random::normal(
+            &[hidden_size, intermediate_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let down_lora_a = pmetal_bridge::compat::random::normal(
+            &[rank, intermediate_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let down_lora_b = pmetal_bridge::compat::random::normal(
+            &[hidden_size, rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let (output, saved) = fused_mlp_forward(
             &x,
@@ -938,8 +1018,10 @@ mod tests {
 
         assert_eq!(output.shape(), &[batch, hidden_size]);
 
-        let d_output =
-            pmetal_bridge::compat::random::normal(&[batch, hidden_size], pmetal_bridge::compat::Dtype::Float32);
+        let d_output = pmetal_bridge::compat::random::normal(
+            &[batch, hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let grads = fused_mlp_backward(&d_output, &saved).unwrap();
 
         // 2D case should have 2D input gradient

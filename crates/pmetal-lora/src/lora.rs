@@ -10,6 +10,8 @@
 //! - `scale = alpha / rank` (or `alpha / sqrt(rank)` for RSLoRA)
 
 use std::collections::HashMap;
+use std::hash::Hash;
+use std::path::Path;
 
 use pmetal_bridge::compat::{Array, Dtype, Exception, nn};
 
@@ -158,6 +160,48 @@ pub fn sanitize_loaded_weights(
     Ok(sanitized)
 }
 
+/// Load a full safetensors shard into a map of tensor name to array.
+pub fn load_safetensors_map(path: impl AsRef<Path>) -> Result<HashMap<String, Array>, LoraError> {
+    let path = path.as_ref();
+    let path_str = path.to_str().ok_or_else(|| {
+        LoraError::Mlx(Exception::custom(format!(
+            "non-UTF-8 safetensors path: {}",
+            path.display()
+        )))
+    })?;
+    let entries =
+        pmetal_bridge::inline_array::load_safetensors_shard(path_str).ok_or_else(|| {
+            LoraError::Mlx(Exception::custom(format!(
+                "failed to load safetensors shard: {}",
+                path.display()
+            )))
+        })?;
+    Ok(entries.into_iter().collect())
+}
+
+/// Save a named array map to a safetensors file.
+pub fn save_safetensors_map<K>(
+    path: impl AsRef<Path>,
+    params: &HashMap<K, Array>,
+) -> Result<(), LoraError>
+where
+    K: AsRef<str> + Eq + Hash,
+{
+    let path = path.as_ref();
+    let path_str = path.to_str().ok_or_else(|| {
+        LoraError::Mlx(Exception::custom(format!(
+            "non-UTF-8 safetensors path: {}",
+            path.display()
+        )))
+    })?;
+    let entries: Vec<(&str, &Array)> = params
+        .iter()
+        .map(|(key, value)| (key.as_ref(), value))
+        .collect();
+    Array::save_safetensors(path_str, &entries);
+    Ok(())
+}
+
 /// LoRA Linear layer that wraps a base Linear layer with low-rank adaptation.
 ///
 /// Implements: `y = x @ W.T + scale * (x @ A.T) @ B.T`
@@ -227,7 +271,12 @@ impl LoraLinear {
             } else {
                 (3.0_f32 / in_features as f32).sqrt()
             };
-            pmetal_bridge::compat::random::uniform_range(-bound, bound, &[rank, in_features], Dtype::Float32)
+            pmetal_bridge::compat::random::uniform_range(
+                -bound,
+                bound,
+                &[rank, in_features],
+                Dtype::Float32,
+            )
         } else {
             pmetal_bridge::compat::ops::zeros(&[1, in_features], Dtype::Float32) // Dummy small array
         };
@@ -281,12 +330,19 @@ impl LoraLinear {
 
         // Initialize base weight with Kaiming uniform
         let bound = (3.0_f32 / in_features as f32).sqrt();
-        let weight =
-            pmetal_bridge::compat::random::uniform_range(-bound, bound, &[out_features, in_features], Dtype::Float32);
+        let weight = pmetal_bridge::compat::random::uniform_range(
+            -bound,
+            bound,
+            &[out_features, in_features],
+            Dtype::Float32,
+        );
 
         // Initialize bias if needed
         let bias = if use_bias {
-            Some(pmetal_bridge::compat::ops::zeros(&[out_features], Dtype::Float32))
+            Some(pmetal_bridge::compat::ops::zeros(
+                &[out_features],
+                Dtype::Float32,
+            ))
         } else {
             None
         };
@@ -373,7 +429,7 @@ impl LoraLinear {
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         if self.merged || self.rank == 0 {
             // Use base weight directly if merged or rank=0 (frozen)
-            let y = x.matmul(&self.weight.t())?;
+            let y = x.matmul(&self.weight.t());
             if let Some(ref bias) = self.bias {
                 Ok(y.add(bias))
             } else {
@@ -381,7 +437,7 @@ impl LoraLinear {
             }
         } else {
             // Standard forward: y_base = x @ W.T
-            let y_base = x.matmul(&self.weight.t())?;
+            let y_base = x.matmul(&self.weight.t());
 
             // Apply dropout to LoRA input when training
             let x_lora = if self.training && self.lora_dropout > 0.0 {
@@ -391,13 +447,13 @@ impl LoraLinear {
             };
 
             // LoRA forward: y_lora = scale * (x_lora @ A.T) @ B.T
-            let xa = x_lora.matmul(&self.lora_a.t())?;
-            let xab = xa.matmul(&self.lora_b.t())?;
+            let xa = x_lora.matmul(&self.lora_a.t());
+            let xab = xa.matmul(&self.lora_b.t());
             let scale_arr = &self.scale_arr;
-            let y_lora = xab.multiply(&scale_arr)?;
+            let y_lora = xab.multiply(&scale_arr);
 
             // Combined output
-            let y = y_base.add(&y_lora)?;
+            let y = y_base.add(&y_lora);
 
             // Add bias if present
             if let Some(ref bias) = self.bias {
@@ -479,8 +535,8 @@ impl LoraLinear {
         learning_rate: f32,
     ) -> Result<(), LoraError> {
         let lr = Array::from_f32(learning_rate);
-        self.lora_a = self.lora_a.subtract(&grads.d_lora_a.multiply(&lr))?;
-        self.lora_b = self.lora_b.subtract(&grads.d_lora_b.multiply(&lr))?;
+        self.lora_a = self.lora_a.subtract(&grads.d_lora_a.multiply(&lr));
+        self.lora_b = self.lora_b.subtract(&grads.d_lora_b.multiply(&lr));
         Ok(())
     }
 
@@ -496,10 +552,10 @@ impl LoraLinear {
         }
 
         // W_merged = W + scale * B @ A
-        let ba = self.lora_b.matmul(&self.lora_a)?;
+        let ba = self.lora_b.matmul(&self.lora_a);
         let scale_arr = Array::from_f32(self.scale);
-        let delta = ba.multiply(&scale_arr)?;
-        let merged_weight = self.weight.add(&delta)?;
+        let delta = ba.multiply(&scale_arr);
+        let merged_weight = self.weight.add(&delta);
 
         self.weight = merged_weight;
         self.merged = true;
@@ -682,13 +738,13 @@ pub fn fused_lora_forward(
     scale: f32,
 ) -> Result<Array, LoraError> {
     // Base forward: y_base = x @ W.T
-    let y_base = x.matmul(&weight.t())?;
+    let y_base = x.matmul(&weight.t());
 
     // LoRA forward: y_lora = scale * (x @ A.T) @ B.T
-    let xa = x.matmul(&lora_a.t())?;
-    let xab = xa.matmul(&lora_b.t())?;
+    let xa = x.matmul(&lora_a.t());
+    let xab = xa.matmul(&lora_b.t());
     let scale_arr = Array::from_f32(scale);
-    let y_lora = xab.multiply(&scale_arr)?;
+    let y_lora = xab.multiply(&scale_arr);
 
     // Combined output
     Ok(y_base.add(&y_lora))
@@ -908,7 +964,10 @@ mod tests {
     fn test_lora_linear_forward() {
         let mut lora = LoraLinear::new(32, 64, 4, 8.0, false, false).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 32], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, 32],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = lora.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[2, 4, 64]);
@@ -918,7 +977,10 @@ mod tests {
     fn test_lora_linear_with_bias() {
         let mut lora = LoraLinear::new(32, 64, 4, 8.0, false, true).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 32], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, 32],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = lora.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[2, 4, 64]);
@@ -930,7 +992,10 @@ mod tests {
         // With B initialized to zeros, LoRA should have minimal effect initially
         let mut lora = LoraLinear::new(32, 64, 8, 16.0, false, false).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 32],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = lora.forward(&x).unwrap();
 
         // Check base forward without LoRA
@@ -951,9 +1016,13 @@ mod tests {
         let mut lora = LoraLinear::new(32, 64, 4, 8.0, false, false).unwrap();
 
         // Initialize B to non-zero for merge to have effect
-        lora.lora_b = pmetal_bridge::compat::random::normal(&[64, 4], pmetal_bridge::compat::Dtype::Float32);
+        lora.lora_b =
+            pmetal_bridge::compat::random::normal(&[64, 4], pmetal_bridge::compat::Dtype::Float32);
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 32], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 32],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Get output before merge
         let output_before = lora.forward(&x).unwrap();
@@ -1008,11 +1077,22 @@ mod tests {
         let scale = 2.0;
 
         // Create random weights
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, in_features], pmetal_bridge::compat::Dtype::Float32);
-        let weight =
-            pmetal_bridge::compat::random::normal(&[out_features, in_features], pmetal_bridge::compat::Dtype::Float32);
-        let lora_a = pmetal_bridge::compat::random::normal(&[rank, in_features], pmetal_bridge::compat::Dtype::Float32);
-        let lora_b = pmetal_bridge::compat::ops::zeros(&[out_features, rank], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let weight = pmetal_bridge::compat::random::normal(
+            &[out_features, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let lora_a = pmetal_bridge::compat::random::normal(
+            &[rank, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let lora_b = pmetal_bridge::compat::ops::zeros(
+            &[out_features, rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let output = fused_lora_forward(&x, &weight, &lora_a, &lora_b, scale).unwrap();
 

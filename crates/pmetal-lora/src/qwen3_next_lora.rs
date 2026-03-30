@@ -18,11 +18,11 @@ use std::rc::Rc;
 use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use pmetal_bridge::compat::{
-    Array, Exception, nn, Param,
-    ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
-};
 use pmetal_bridge::compat::ops;
+use pmetal_bridge::compat::{
+    Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param,
+    nn,
+};
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gather_mm;
@@ -189,28 +189,28 @@ impl Qwen3NextLoraAttention {
         // Project Q (with gate in second half) and K, V
         let q_proj_out = self.q_proj.forward(x)?;
         // [B, L, n_heads, head_dim * 2] — split along last dim
-        let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2])?;
-        let queries = q_gate.index((.., .., .., ..self.head_dim));
+        let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2]);
+        let queries = pmetal_bridge::compat::ops::slice_last_to(&q_gate, self.head_dim);
         // gate: [B, L, n_heads * head_dim] — used after attention output
-        let gate = q_gate.index((.., .., .., self.head_dim..)).reshape(&[
+        let gate = pmetal_bridge::compat::ops::slice_last_from(&q_gate, self.head_dim).reshape(&[
             b,
             l,
             self.n_heads * self.head_dim,
-        ])?;
+        ]);
 
         let keys = self.k_proj.forward(x)?;
         let values = self.v_proj.forward(x)?;
 
         // Apply Q/K per-head normalization
         let queries = Module::forward(&mut self.q_norm, &queries)?;
-        let keys_reshaped = keys.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+        let keys_reshaped = keys.reshape(&[b, l, self.n_kv_heads, self.head_dim]);
         let keys_normed = Module::forward(&mut self.k_norm, &keys_reshaped)?;
-        let values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+        let values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim]);
 
         // Transpose to [B, heads, L, head_dim]
-        let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-        let keys = keys_normed.transpose_axes(&[0, 2, 1, 3])?;
-        let values = values.transpose_axes(&[0, 2, 1, 3])?;
+        let queries = queries.transpose_axes(&[0, 2, 1, 3]);
+        let keys = keys_normed.transpose_axes(&[0, 2, 1, 3]);
+        let values = values.transpose_axes(&[0, 2, 1, 3]);
 
         // Partial RoPE — only apply to first `rope_dims` dimensions
         let queries = apply_rope(
@@ -259,25 +259,25 @@ impl Qwen3NextLoraAttention {
                 (keys, values)
             };
 
-            let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
-            let scores = scores.multiply(Array::from_f32(self.scale))?;
+            let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]));
+            let scores = scores.multiply(&Array::from_f32(self.scale));
             let scores = if let Some(m) = mask {
                 scores.add(m)
             } else {
                 scores
             };
-            let weights = ops::softmax_axis(&scores, -1, None)?;
+            let weights = ops::softmax_axis(&scores, -1);
             weights.matmul(&values)
         };
 
         // [B, heads, L, head_dim] -> [B, L, n_heads * head_dim]
         let output =
             output
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[b, l, self.n_heads * self.head_dim])?;
+                .transpose_axes(&[0, 2, 1, 3])
+                .reshape(&[b, l, self.n_heads * self.head_dim]);
 
         // Gated output: o_proj(output * sigmoid(gate))
-        let gated = output.multiply(&nn::sigmoid(&gate))?;
+        let gated = output.multiply(&nn::sigmoid(&gate));
         self.o_proj.forward(&gated)
     }
 
@@ -293,25 +293,25 @@ impl Qwen3NextLoraAttention {
         let l = shape[1];
 
         let q_proj_out = self.q_proj.forward(x)?;
-        let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2])?;
-        let queries = q_gate.index((.., .., .., ..self.head_dim));
-        let gate = q_gate.index((.., .., .., self.head_dim..)).reshape(&[
+        let q_gate = q_proj_out.reshape(&[b, l, self.n_heads, self.head_dim * 2]);
+        let queries = pmetal_bridge::compat::ops::slice_last_to(&q_gate, self.head_dim);
+        let gate = pmetal_bridge::compat::ops::slice_last_from(&q_gate, self.head_dim).reshape(&[
             b,
             l,
             self.n_heads * self.head_dim,
-        ])?;
+        ]);
 
         let keys = self.k_proj.forward(x)?;
         let values = self.v_proj.forward(x)?;
 
         let queries = Module::forward(&mut self.q_norm, &queries)?;
-        let keys_reshaped = keys.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+        let keys_reshaped = keys.reshape(&[b, l, self.n_kv_heads, self.head_dim]);
         let keys_normed = Module::forward(&mut self.k_norm, &keys_reshaped)?;
-        let values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim])?;
+        let values = values.reshape(&[b, l, self.n_kv_heads, self.head_dim]);
 
-        let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-        let keys = keys_normed.transpose_axes(&[0, 2, 1, 3])?;
-        let values = values.transpose_axes(&[0, 2, 1, 3])?;
+        let queries = queries.transpose_axes(&[0, 2, 1, 3]);
+        let keys = keys_normed.transpose_axes(&[0, 2, 1, 3]);
+        let values = values.transpose_axes(&[0, 2, 1, 3]);
 
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
         let queries = apply_rope(
@@ -348,10 +348,10 @@ impl Qwen3NextLoraAttention {
 
         let output =
             output
-                .transpose_axes(&[0, 2, 1, 3])?
-                .reshape(&[b, l, self.n_heads * self.head_dim])?;
+                .transpose_axes(&[0, 2, 1, 3])
+                .reshape(&[b, l, self.n_heads * self.head_dim]);
 
-        let gated = output.multiply(&nn::sigmoid(&gate))?;
+        let gated = output.multiply(&nn::sigmoid(&gate));
         self.o_proj.forward(&gated)
     }
 
@@ -438,10 +438,18 @@ impl Qwen3NextLoraGDN {
             .map_err(LoraError::Mlx)?;
 
         // Frozen SSM parameters
-        let dt_bias = Param::new(pmetal_bridge::compat::ops::ones(&[num_v_heads], pmetal_bridge::compat::Dtype::Float32));
+        let dt_bias = Param::new(pmetal_bridge::compat::ops::ones(
+            &[num_v_heads],
+            pmetal_bridge::compat::Dtype::Float32,
+        ));
         let a_log = Param::new(
-            pmetal_bridge::compat::random::uniform_range(0.0, 16.0, &[num_v_heads], pmetal_bridge::compat::Dtype::Float32)
-                .log(),
+            pmetal_bridge::compat::random::uniform_range(
+                0.0,
+                16.0,
+                &[num_v_heads],
+                pmetal_bridge::compat::Dtype::Float32,
+            )
+            .log(),
         );
 
         // Frozen norm
@@ -514,10 +522,10 @@ impl Qwen3NextLoraGDN {
 
         // 4 separate projections matching HF weight format (qwen3_5.py:136-139)
         let qkv = self.in_proj_qkv.forward(inputs)?;
-        let z =
-            self.in_proj_z
-                .forward(inputs)?
-                .reshape(&[b, s, self.num_v_heads, self.head_v_dim])?;
+        let z = self
+            .in_proj_z
+            .forward(inputs)?
+            .reshape(&[b, s, self.num_v_heads, self.head_v_dim]);
         let b_val = Module::forward(&mut self.in_proj_b, inputs)?;
         let a = Module::forward(&mut self.in_proj_a, inputs)?;
 
@@ -528,64 +536,61 @@ impl Qwen3NextLoraGDN {
             None
         };
         let conv_state = conv_state.unwrap_or_else(|| {
-            pmetal_bridge::compat::ops::zeros(&[b, self.conv_kernel_size - 1, self.conv_dim], pmetal_bridge::compat::Dtype::Float32)
+            pmetal_bridge::compat::ops::zeros(
+                &[b, self.conv_kernel_size - 1, self.conv_dim],
+                pmetal_bridge::compat::Dtype::Float32,
+            )
         });
 
         // Mask QKV BEFORE conv (Python line 149-150)
         let qkv = if let Some(msk) = mask {
-            let mask_expanded = msk.reshape(&[msk.dim(0), msk.dim(1), 1])?;
-            ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))?
+            let mask_expanded = msk.reshape(&[msk.dim(0), msk.dim(1), 1]);
+            ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))
         } else {
             qkv
         };
 
         // Prepend conv state and run depthwise conv1d + silu
-        let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1)?;
+        let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1);
 
         // Update conv state in cache
         if let Some(c) = cache.as_deref_mut() {
             let keep = self.conv_kernel_size - 1;
             let total_len = conv_input.dim(1);
-            c.conv_state = Some(conv_input.index((.., (total_len - keep).., ..)));
+            c.conv_state = Some(pmetal_bridge::compat::ops::slice_axis_from(
+                &conv_input,
+                1,
+                total_len - keep,
+            ));
         }
 
-        let conv_out = nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)?;
+        let conv_out = nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?);
 
         // Split conv output — simple positional split on last dim (Python line 156-163)
-        let q_conv = conv_out.index((.., .., ..self.key_dim));
-        let k_conv = conv_out.index((.., .., self.key_dim..self.key_dim * 2));
-        let v_conv = conv_out.index((.., .., self.key_dim * 2..));
+        let q_conv = pmetal_bridge::compat::ops::slice_last_to(&conv_out, self.key_dim);
+        let k_conv =
+            pmetal_bridge::compat::ops::slice_axis(&conv_out, -1, self.key_dim, self.key_dim * 2);
+        let v_conv = pmetal_bridge::compat::ops::slice_last_from(&conv_out, self.key_dim * 2);
 
         // Trim to last S timesteps (conv prepended state adds padding)
         let out_len = q_conv.dim(1);
-        let q_conv = q_conv.index((.., (out_len - s).., ..)).reshape(&[
-            b,
-            s,
-            self.num_k_heads,
-            self.head_k_dim,
-        ])?;
-        let k_conv = k_conv.index((.., (out_len - s).., ..)).reshape(&[
-            b,
-            s,
-            self.num_k_heads,
-            self.head_k_dim,
-        ])?;
-        let v_conv = v_conv.index((.., (out_len - s).., ..)).reshape(&[
-            b,
-            s,
-            self.num_v_heads,
-            self.head_v_dim,
-        ])?;
+        let q_conv = pmetal_bridge::compat::ops::slice_axis_from(&q_conv, 1, out_len - s)
+            .reshape(&[b, s, self.num_k_heads, self.head_k_dim]);
+        let k_conv = pmetal_bridge::compat::ops::slice_axis_from(&k_conv, 1, out_len - s)
+            .reshape(&[b, s, self.num_k_heads, self.head_k_dim]);
+        let v_conv = pmetal_bridge::compat::ops::slice_axis_from(&v_conv, 1, out_len - s)
+            .reshape(&[b, s, self.num_v_heads, self.head_v_dim]);
 
         // Q/K RMS normalization with scaling (frozen, using identity weight)
         let inv_scale = (self.head_k_dim as f32).powf(-0.5);
-        let ones_weight = pmetal_bridge::compat::ops::ones(&[self.head_k_dim], pmetal_bridge::compat::Dtype::Float32);
-        let q_normed =
-            pmetal_bridge::compat::fast::rms_norm(&q_conv, &ones_weight, 1e-6)
-                .multiply(&Array::from_f32(inv_scale * inv_scale));
-        let k_normed =
-            pmetal_bridge::compat::fast::rms_norm(&k_conv, &ones_weight, 1e-6)
-                .multiply(&Array::from_f32(inv_scale));
+        let ones_weight = pmetal_bridge::compat::ops::ones(
+            &[self.head_k_dim],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let q_normed = pmetal_bridge::compat::fast::rms_norm(&q_conv, &ones_weight, 1e-6)
+            .multiply(&Array::from_f32(inv_scale * inv_scale));
+        let k_normed = pmetal_bridge::compat::fast::rms_norm(&k_conv, &ones_weight, 1e-6)
+            .multiply(&Array::from_f32(inv_scale));
 
         // Get SSM state from cache
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
@@ -657,9 +662,9 @@ impl Qwen3NextLoraMLP {
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::silu(gate)?;
+        let gate = nn::silu(&gate);
         let up = self.up_proj.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         self.down_proj.forward(&hidden)
     }
 
@@ -698,9 +703,9 @@ impl Qwen3NextLoraSharedExpert {
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::silu(gate)?;
+        let gate = nn::silu(&gate);
         let up = self.up_proj.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         self.down_proj.forward(&hidden)
     }
 
@@ -746,12 +751,18 @@ impl Qwen3NextLoraSparseMoE {
             .map_err(LoraError::Mlx)?;
 
         // Stacked expert weights — frozen
-        let gate_proj =
-            pmetal_bridge::compat::ops::zeros(&[num_experts, intermediate_size, dim], pmetal_bridge::compat::Dtype::Float32);
-        let up_proj =
-            pmetal_bridge::compat::ops::zeros(&[num_experts, intermediate_size, dim], pmetal_bridge::compat::Dtype::Float32);
-        let down_proj =
-            pmetal_bridge::compat::ops::zeros(&[num_experts, dim, intermediate_size], pmetal_bridge::compat::Dtype::Float32);
+        let gate_proj = pmetal_bridge::compat::ops::zeros(
+            &[num_experts, intermediate_size, dim],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let up_proj = pmetal_bridge::compat::ops::zeros(
+            &[num_experts, intermediate_size, dim],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let down_proj = pmetal_bridge::compat::ops::zeros(
+            &[num_experts, dim, intermediate_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let shared_expert_gate = nn::LinearBuilder::new(dim, 1)
             .bias(false)
@@ -777,35 +788,34 @@ impl Qwen3NextLoraSparseMoE {
         let shape = x.shape();
         let batch_seq: i32 = shape[..shape.len() - 1].iter().product();
         let hidden = shape[shape.len() - 1];
-        let x_flat = x.reshape(&[batch_seq, hidden])?;
+        let x_flat = x.reshape(&[batch_seq, hidden]);
 
         // Routing
         let gate_logits = Module::forward(&mut self.gate, &x_flat)?;
         let gates = ops::softmax_axis(
             &if gate_logits.dtype() != pmetal_bridge::compat::Dtype::Float32 {
-                gate_logits.as_type::<f32>()?
+                gate_logits.as_type::<f32>()
             } else {
                 gate_logits
             },
             -1,
-            None,
-        )?;
+        );
 
         let k = self.top_k;
-        let neg_gates = gates.negative()?;
-        let sorted_indices = ops::argsort_axis(&neg_gates, -1)?;
-        let top_indices = sorted_indices.index((.., ..k));
-        let top_weights = gates.take_along_axis(&top_indices, -1)?;
+        let neg_gates = gates.negative();
+        let sorted_indices = ops::argsort_axis(&neg_gates, -1);
+        let top_indices = pmetal_bridge::compat::ops::slice_last_to(&sorted_indices, k);
+        let top_weights = gates.take_along_axis(&top_indices, -1);
 
         let top_weights = if self.norm_topk_prob {
-            let weight_sum = top_weights.sum_axis(-1, Some(true))?;
-            let safe_sum = ops::maximum(&weight_sum, &Array::from_f32(1e-8))?;
+            let weight_sum = top_weights.sum_axis(-1, true);
+            let safe_sum = ops::maximum(&weight_sum, &Array::from_f32(1e-8));
             top_weights.divide(&safe_sum)
         } else {
             top_weights
         };
 
-        let top_indices_i32 = top_indices.as_type::<i32>()?;
+        let top_indices_i32 = top_indices.as_type::<i32>();
 
         // SwitchGLU with frozen expert weights
         let gate_out = gather_mm(
@@ -823,7 +833,7 @@ impl Qwen3NextLoraSparseMoE {
             false,
         )?;
 
-        let activated = nn::silu(&gate_out)?.multiply(&up_out)?;
+        let activated = nn::silu(&gate_out).multiply(&up_out);
 
         let down_out = gather_mm(
             &activated.reshape(&[batch_seq * k, -1]),
@@ -832,19 +842,19 @@ impl Qwen3NextLoraSparseMoE {
             Some(&top_indices_i32.reshape(&[batch_seq * k, 1])),
             false,
         )?
-        .reshape(&[batch_seq, k, hidden])?;
+        .reshape(&[batch_seq, k, hidden]);
 
         let y = down_out
-            .multiply(&top_weights.reshape(&[batch_seq, k, 1]))?
-            .sum_axis(-2, false)?;
+            .multiply(&top_weights.reshape(&[batch_seq, k, 1]))
+            .sum_axis(-2, false);
 
         // LoRA'd shared expert with sigmoid gate
         let shared_y = self.shared_expert.forward(&x_flat)?;
-        let shared_gate = nn::sigmoid(&Module::forward(&mut self.shared_expert_gate, &x_flat)?)?;
-        let shared_y = shared_gate.multiply(&shared_y)?;
+        let shared_gate = nn::sigmoid(&Module::forward(&mut self.shared_expert_gate, &x_flat)?);
+        let shared_y = shared_gate.multiply(&shared_y);
 
-        let result = y.add(&shared_y)?;
-        result.reshape(shape).map_err(LoraError::Mlx)
+        let result = y.add(&shared_y);
+        Ok(result.reshape(shape))
     }
 
     pub fn num_trainable_params(&self) -> usize {
@@ -967,10 +977,10 @@ impl Qwen3NextLoraDecoderLayer {
                 .expect("self_attn must be Some for attention layers")
                 .forward(&normed, mask)?
         };
-        let h = x.add(&r)?;
+        let h = x.add(&r);
 
         let mlp_in = Module::forward(&mut self.post_attention_layernorm, &h)?;
-        Ok(h.add(&self.mlp.forward(&mlp_in))?)
+        Ok(h.add(&self.mlp.forward(&mlp_in)?))
     }
 
     /// Cache-aware forward for inference.
@@ -994,10 +1004,10 @@ impl Qwen3NextLoraDecoderLayer {
                 .expect("self_attn must be Some for attention layers")
                 .forward_with_cache(&normed, mask, kv_cache)?
         };
-        let h = x.add(&r)?;
+        let h = x.add(&r);
 
         let mlp_in = Module::forward(&mut self.post_attention_layernorm, &h)?;
-        Ok(h.add(&self.mlp.forward(&mlp_in))?)
+        Ok(h.add(&self.mlp.forward(&mlp_in)?))
     }
 
     pub fn num_trainable_params(&self) -> usize {
@@ -1228,7 +1238,7 @@ impl Qwen3NextLoraForCausalLM {
         if let Some(ref mut lm_head) = self.lm_head {
             Ok(Module::forward(lm_head, h)?)
         } else {
-            Ok(self.model.embed_tokens.as_linear(h)?)
+            Ok(self.model.embed_tokens.as_linear(h))
         }
     }
 
@@ -1480,8 +1490,7 @@ impl Qwen3NextLoraForCausalLM {
     /// Save LoRA adapters to a safetensors file.
     pub fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
         let params = self.lora_parameters();
-        Array::save_safetensors(params, None, path)?;
-        Ok(())
+        crate::save_safetensors_map(path, &params)
     }
 
     /// Load LoRA adapters from a safetensors file or directory.
@@ -1495,7 +1504,7 @@ impl Qwen3NextLoraForCausalLM {
         } else {
             path.to_path_buf()
         };
-        let loaded = Array::load_safetensors(&file_path)?;
+        let loaded = crate::load_safetensors_map(&file_path)?;
         let params: HashMap<Rc<str>, Array> = loaded
             .into_iter()
             .map(|(k, v)| (Rc::from(k.as_str()), v))
@@ -1664,7 +1673,7 @@ impl Qwen3NextLoraForCausalLM {
         let single_file = model_dir.join("model.safetensors");
         if single_file.exists() {
             let mut weights =
-                crate::sanitize_loaded_weights(Array::load_safetensors(&single_file)?)?;
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&single_file)?)?;
             sanitize_weights(
                 &mut weights,
                 &self.model.config,
@@ -1699,7 +1708,7 @@ impl Qwen3NextLoraForCausalLM {
         for shard_file in shard_files {
             let shard_path = model_dir.join(shard_file);
             let shard_weights =
-                crate::sanitize_loaded_weights(Array::load_safetensors(&shard_path)?)?;
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&shard_path)?)?;
             all_weights.extend(shard_weights);
         }
 
@@ -1713,91 +1722,86 @@ impl Qwen3NextLoraForCausalLM {
     }
 
     /// Force evaluation of all parameters (materialise lazy tensors).
-    pub fn eval_all(&self) -> Result<(), LoraError> {
-        self.model.embed_tokens.weight.value.as_ref().eval()?;
+    pub fn eval_all(&mut self) -> Result<(), LoraError> {
+        self.model.embed_tokens.weight.value.eval();
 
-        for layer in &self.model.layers {
-            layer.input_layernorm.weight.value.as_ref().eval()?;
-            layer
-                .post_attention_layernorm
-                .weight
-                .value
-                .as_ref()
-                .eval()?;
+        for layer in &mut self.model.layers {
+            layer.input_layernorm.weight.value.eval();
+            layer.post_attention_layernorm.weight.value.eval();
 
-            if let Some(ref attn) = layer.self_attn {
-                attn.q_proj.weight.eval()?;
-                attn.k_proj.weight.eval()?;
-                attn.v_proj.weight.eval()?;
-                attn.o_proj.weight.eval()?;
-                attn.q_norm.weight.value.as_ref().eval()?;
-                attn.k_norm.weight.value.as_ref().eval()?;
+            if let Some(ref mut attn) = layer.self_attn {
+                attn.q_proj.weight.eval();
+                attn.k_proj.weight.eval();
+                attn.v_proj.weight.eval();
+                attn.o_proj.weight.eval();
+                attn.q_norm.weight.value.eval();
+                attn.k_norm.weight.value.eval();
                 // LoRA adapters
-                attn.q_proj.lora_a.eval()?;
-                attn.q_proj.lora_b.eval()?;
-                attn.k_proj.lora_a.eval()?;
-                attn.k_proj.lora_b.eval()?;
-                attn.v_proj.lora_a.eval()?;
-                attn.v_proj.lora_b.eval()?;
-                attn.o_proj.lora_a.eval()?;
-                attn.o_proj.lora_b.eval()?;
+                attn.q_proj.lora_a.eval();
+                attn.q_proj.lora_b.eval();
+                attn.k_proj.lora_a.eval();
+                attn.k_proj.lora_b.eval();
+                attn.v_proj.lora_a.eval();
+                attn.v_proj.lora_b.eval();
+                attn.o_proj.lora_a.eval();
+                attn.o_proj.lora_b.eval();
             }
-            if let Some(ref gdn) = layer.linear_attn {
-                gdn.in_proj_qkv.weight.eval()?;
-                gdn.in_proj_z.weight.eval()?;
-                gdn.out_proj.weight.eval()?;
+            if let Some(ref mut gdn) = layer.linear_attn {
+                gdn.in_proj_qkv.weight.eval();
+                gdn.in_proj_z.weight.eval();
+                gdn.out_proj.weight.eval();
                 // LoRA adapters
-                gdn.in_proj_qkv.lora_a.eval()?;
-                gdn.in_proj_qkv.lora_b.eval()?;
-                gdn.in_proj_z.lora_a.eval()?;
-                gdn.in_proj_z.lora_b.eval()?;
-                gdn.out_proj.lora_a.eval()?;
-                gdn.out_proj.lora_b.eval()?;
+                gdn.in_proj_qkv.lora_a.eval();
+                gdn.in_proj_qkv.lora_b.eval();
+                gdn.in_proj_z.lora_a.eval();
+                gdn.in_proj_z.lora_b.eval();
+                gdn.out_proj.lora_a.eval();
+                gdn.out_proj.lora_b.eval();
                 // Frozen components
-                gdn.in_proj_b.weight.value.as_ref().eval()?;
-                gdn.in_proj_a.weight.value.as_ref().eval()?;
-                gdn.conv1d.weight.value.as_ref().eval()?;
-                gdn.dt_bias.value.as_ref().eval()?;
-                gdn.a_log.value.as_ref().eval()?;
-                gdn.norm.weight.value.as_ref().eval()?;
+                gdn.in_proj_b.weight.value.eval();
+                gdn.in_proj_a.weight.value.eval();
+                gdn.conv1d.weight.value.eval();
+                gdn.dt_bias.value.eval();
+                gdn.a_log.value.eval();
+                gdn.norm.weight.value.eval();
             }
 
-            match &layer.mlp {
+            match &mut layer.mlp {
                 Qwen3NextLoraFeedForward::Dense(mlp) => {
-                    mlp.gate_proj.weight.eval()?;
-                    mlp.up_proj.weight.eval()?;
-                    mlp.down_proj.weight.eval()?;
-                    mlp.gate_proj.lora_a.eval()?;
-                    mlp.gate_proj.lora_b.eval()?;
-                    mlp.up_proj.lora_a.eval()?;
-                    mlp.up_proj.lora_b.eval()?;
-                    mlp.down_proj.lora_a.eval()?;
-                    mlp.down_proj.lora_b.eval()?;
+                    mlp.gate_proj.weight.eval();
+                    mlp.up_proj.weight.eval();
+                    mlp.down_proj.weight.eval();
+                    mlp.gate_proj.lora_a.eval();
+                    mlp.gate_proj.lora_b.eval();
+                    mlp.up_proj.lora_a.eval();
+                    mlp.up_proj.lora_b.eval();
+                    mlp.down_proj.lora_a.eval();
+                    mlp.down_proj.lora_b.eval();
                 }
                 Qwen3NextLoraFeedForward::MoE(moe) => {
-                    moe.gate.weight.value.as_ref().eval()?;
-                    moe.switch_mlp_gate_proj.value.as_ref().eval()?;
-                    moe.switch_mlp_up_proj.value.as_ref().eval()?;
-                    moe.switch_mlp_down_proj.value.as_ref().eval()?;
-                    moe.shared_expert_gate.weight.value.as_ref().eval()?;
-                    let se = &moe.shared_expert;
-                    se.gate_proj.weight.eval()?;
-                    se.up_proj.weight.eval()?;
-                    se.down_proj.weight.eval()?;
-                    se.gate_proj.lora_a.eval()?;
-                    se.gate_proj.lora_b.eval()?;
-                    se.up_proj.lora_a.eval()?;
-                    se.up_proj.lora_b.eval()?;
-                    se.down_proj.lora_a.eval()?;
-                    se.down_proj.lora_b.eval()?;
+                    moe.gate.weight.value.eval();
+                    moe.switch_mlp_gate_proj.value.eval();
+                    moe.switch_mlp_up_proj.value.eval();
+                    moe.switch_mlp_down_proj.value.eval();
+                    moe.shared_expert_gate.weight.value.eval();
+                    let se = &mut moe.shared_expert;
+                    se.gate_proj.weight.eval();
+                    se.up_proj.weight.eval();
+                    se.down_proj.weight.eval();
+                    se.gate_proj.lora_a.eval();
+                    se.gate_proj.lora_b.eval();
+                    se.up_proj.lora_a.eval();
+                    se.up_proj.lora_b.eval();
+                    se.down_proj.lora_a.eval();
+                    se.down_proj.lora_b.eval();
                 }
             }
         }
 
-        self.model.norm.weight.value.as_ref().eval()?;
+        self.model.norm.weight.value.eval();
 
-        if let Some(ref lm_head) = self.lm_head {
-            lm_head.weight.value.as_ref().eval()?;
+        if let Some(ref mut lm_head) = self.lm_head {
+            lm_head.weight.value.eval();
         }
 
         Ok(())
@@ -2262,8 +2266,8 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, LoraError> {
     let seq_len = shape[2];
     let head_dim = shape[3];
 
-    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
+    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim]);
+    let x = ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim]);
     Ok(x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim]))
 }
 

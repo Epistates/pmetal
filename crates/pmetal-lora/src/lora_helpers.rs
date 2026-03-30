@@ -209,8 +209,7 @@ pub fn save_lora_weights_impl(
     path: impl AsRef<std::path::Path>,
 ) -> Result<(), LoraError> {
     let params = collect_lora_parameters(stack);
-    Array::save_safetensors(params, None, path)?;
-    Ok(())
+    crate::save_safetensors_map(path, &params)
 }
 
 /// Load LoRA weights into a stack from a safetensors file or directory.
@@ -226,7 +225,7 @@ pub fn load_lora_weights_impl(
     } else {
         path.to_path_buf()
     };
-    let loaded = Array::load_safetensors(&file_path)?;
+    let loaded = crate::load_safetensors_map(&file_path)?;
     // Convert the string-keyed map to Rc<str>-keyed for set_lora_parameters
     let params: HashMap<Rc<str>, Array> = loaded
         .into_iter()
@@ -286,9 +285,7 @@ macro_rules! impl_trainable_model {
                 <$type>::num_trainable_params(self)
             }
 
-            fn lora_parameters(
-                &self,
-            ) -> std::collections::HashMap<std::rc::Rc<str>, Array> {
+            fn lora_parameters(&self) -> std::collections::HashMap<std::rc::Rc<str>, Array> {
                 <$type>::lora_parameters(self)
             }
 

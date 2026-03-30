@@ -16,11 +16,11 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use pmetal_bridge::compat::fast;
 use pmetal_bridge::compat::{
-    Array, Exception, nn, Param,
-    ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
+    Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param,
+    nn,
 };
-use pmetal_bridge::compat as fast;
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
@@ -53,7 +53,10 @@ pub struct GemmaRmsNorm {
 impl GemmaRmsNorm {
     /// Create a new GemmaRmsNorm layer.
     pub fn new(hidden_size: i32, eps: f32) -> Result<Self, Exception> {
-        let weight = pmetal_bridge::compat::ops::zeros(&[hidden_size], pmetal_bridge::compat::Dtype::Float32);
+        let weight = pmetal_bridge::compat::ops::zeros(
+            &[hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         Ok(Self {
             weight: Param::new(weight),
             weight_plus_one: None,
@@ -208,13 +211,13 @@ impl GemmaLoraAttention {
 
         let queries = queries
             .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
         let keys = keys
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
         let values = values
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE
         let queries = Module::forward(&mut self.rope, &queries)?;
@@ -235,15 +238,15 @@ impl GemmaLoraAttention {
         };
 
         // Scaled dot-product attention
-        let mut scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
-        scores = scores.multiply(Array::from_f32(self.scale))?;
+        let mut scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]));
+        scores = scores.multiply(&Array::from_f32(self.scale));
 
         // Apply logit softcapping (Gemma2)
         if let Some(cap) = self.logit_softcapping {
             let cap_val = Array::from_f32(cap);
-            scores = scores.divide(&cap_val)?;
-            scores = pmetal_bridge::compat::ops::tanh(&scores)?;
-            scores = scores.multiply(&cap_val)?;
+            scores = scores.divide(&cap_val);
+            scores = pmetal_bridge::compat::ops::tanh(&scores);
+            scores = scores.multiply(&cap_val);
         }
 
         let scores = if let Some(m) = mask {
@@ -252,12 +255,12 @@ impl GemmaLoraAttention {
             scores
         };
 
-        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
-        let output = weights.matmul(&values)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1);
+        let output = weights.matmul(&values);
 
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         self.o_proj.forward(&output).map_err(LoraError::from)
     }
@@ -287,14 +290,14 @@ impl GemmaLoraAttention {
         let values = self.v_proj.forward(x)?;
 
         // Reshape for multi-head attention: [B, L, heads, head_dim]
-        let queries = queries.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        let keys = keys.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
-        let values = values.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        let queries = queries.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        let keys = keys.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let values = values.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Transpose for attention: [B, heads, L, head_dim]
-        let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-        let keys = keys.transpose_axes(&[0, 2, 1, 3])?;
-        let values = values.transpose_axes(&[0, 2, 1, 3])?;
+        let queries = queries.transpose_axes(&[0, 2, 1, 3]);
+        let keys = keys.transpose_axes(&[0, 2, 1, 3]);
+        let values = values.transpose_axes(&[0, 2, 1, 3]);
 
         // Get RoPE offset and apply RoPE
         let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
@@ -333,8 +336,8 @@ impl GemmaLoraAttention {
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         // Output projection
         self.o_proj.forward(&output).map_err(LoraError::from)
@@ -356,9 +359,12 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     let seq_len = shape[2];
     let head_dim = shape[3];
 
-    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
-    x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
+    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim]);
+    let x = pmetal_bridge::compat::ops::broadcast_to(
+        &x,
+        &[batch, n_kv_heads, repeats, seq_len, head_dim],
+    );
+    Ok(x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim]))
 }
 
 /// LoRA-enabled MLP layer for Gemma (GeGLU).
@@ -420,9 +426,9 @@ impl GemmaLoraMLP {
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         let gate = self.gate_proj.forward(x)?;
         // Use the optimized compiled GELU approximation (equivalent to tanh approximation)
-        let gate = nn::gelu_approximate(&gate)?;
+        let gate = nn::gelu_approximate(&gate);
         let up = self.up_proj.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         self.down_proj.forward(&hidden)
     }
 
@@ -468,7 +474,7 @@ impl GemmaLoraDecoderLayer {
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self.self_attn.forward(&normed, mask)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         let normed = self.post_attention_layernorm.forward(&h)?;
         let mlp_out = self.mlp.forward(&normed)?;
@@ -490,7 +496,7 @@ impl GemmaLoraDecoderLayer {
         // Pre-norm + attention + residual
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-norm + MLP + residual
         let normed = self.post_attention_layernorm.forward(&h)?;
@@ -550,7 +556,7 @@ impl Gemma2LoraDecoderLayer {
         let attn_out = self.self_attn.forward(&normed, mask)?;
         // Post-attention norm before residual (Gemma2 specific)
         let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-feedforward norm + MLP
         let normed = self.pre_feedforward_layernorm.forward(&h)?;
@@ -577,7 +583,7 @@ impl Gemma2LoraDecoderLayer {
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
         // Post-attention norm before residual (Gemma2 specific)
         let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-feedforward norm + MLP
         let normed = self.pre_feedforward_layernorm.forward(&h)?;
@@ -690,7 +696,7 @@ impl GemmaLoraModel {
         // Get embeddings and scale
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
         let scale = Array::from_f32(self.embedding_scale);
-        hidden_states = hidden_states.multiply(&scale)?;
+        hidden_states = hidden_states.multiply(&scale);
 
         let mask = if mask.is_none() {
             let seq_len = input_ids.dim(1);
@@ -747,7 +753,7 @@ impl GemmaLoraModel {
         // Get embeddings and scale
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
         let scale = Array::from_f32(self.embedding_scale);
-        hidden_states = hidden_states.multiply(&scale)?;
+        hidden_states = hidden_states.multiply(&scale);
 
         // Don't create explicit causal mask - fused SDPA handles it internally
         // with proper dtype handling. Only pass through user-provided masks.
@@ -932,7 +938,7 @@ impl GemmaLoraForCausalLM {
             self.model
                 .forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
         // Gemma always ties embeddings
-        Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
+        Ok(self.model.embed_tokens.as_linear(&hidden_states))
     }
 
     /// Forward pass returning hidden states before lm_head, for Cut Cross-Entropy.
@@ -994,7 +1000,7 @@ impl GemmaLoraForCausalLM {
     ) -> Result<Array, LoraError> {
         let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
         // Gemma always ties embeddings
-        Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
+        Ok(self.model.embed_tokens.as_linear(&hidden_states))
     }
 
     /// Create a KV cache for this model.
@@ -1174,7 +1180,8 @@ impl GemmaLoraForCausalLM {
 
         let single_file = model_dir.join("model.safetensors");
         if single_file.exists() {
-            let weights = crate::sanitize_loaded_weights(Array::load_safetensors(&single_file)?)?;
+            let weights =
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&single_file)?)?;
             return self.load_base_weights(&weights);
         }
 
@@ -1202,7 +1209,7 @@ impl GemmaLoraForCausalLM {
         for shard_file in shard_files {
             let shard_path = model_dir.join(shard_file);
             let shard_weights =
-                crate::sanitize_loaded_weights(Array::load_safetensors(&shard_path)?)?;
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&shard_path)?)?;
             all_weights.extend(shard_weights);
         }
 
@@ -1210,43 +1217,38 @@ impl GemmaLoraForCausalLM {
     }
 
     /// Evaluate all model parameters.
-    pub fn eval_all(&self) -> Result<(), LoraError> {
-        self.model.embed_tokens.weight.value.as_ref().eval()?;
+    pub fn eval_all(&mut self) -> Result<(), LoraError> {
+        self.model.embed_tokens.weight.value.eval();
 
         macro_rules! eval_layer {
             ($layer:expr) => {
-                $layer.self_attn.q_proj.weight.eval()?;
-                $layer.self_attn.k_proj.weight.eval()?;
-                $layer.self_attn.v_proj.weight.eval()?;
-                $layer.self_attn.o_proj.weight.eval()?;
-                $layer.mlp.gate_proj.weight.eval()?;
-                $layer.mlp.up_proj.weight.eval()?;
-                $layer.mlp.down_proj.weight.eval()?;
-                $layer.self_attn.q_proj.lora_a.eval()?;
-                $layer.self_attn.q_proj.lora_b.eval()?;
-                $layer.self_attn.k_proj.lora_a.eval()?;
-                $layer.self_attn.k_proj.lora_b.eval()?;
-                $layer.self_attn.v_proj.lora_a.eval()?;
-                $layer.self_attn.v_proj.lora_b.eval()?;
-                $layer.self_attn.o_proj.lora_a.eval()?;
-                $layer.self_attn.o_proj.lora_b.eval()?;
-                $layer.mlp.gate_proj.lora_a.eval()?;
-                $layer.mlp.gate_proj.lora_b.eval()?;
-                $layer.mlp.up_proj.lora_a.eval()?;
-                $layer.mlp.up_proj.lora_b.eval()?;
-                $layer.mlp.down_proj.lora_a.eval()?;
-                $layer.mlp.down_proj.lora_b.eval()?;
-                $layer.input_layernorm.weight.value.as_ref().eval()?;
-                $layer
-                    .post_attention_layernorm
-                    .weight
-                    .value
-                    .as_ref()
-                    .eval()?;
+                $layer.self_attn.q_proj.weight.eval();
+                $layer.self_attn.k_proj.weight.eval();
+                $layer.self_attn.v_proj.weight.eval();
+                $layer.self_attn.o_proj.weight.eval();
+                $layer.mlp.gate_proj.weight.eval();
+                $layer.mlp.up_proj.weight.eval();
+                $layer.mlp.down_proj.weight.eval();
+                $layer.self_attn.q_proj.lora_a.eval();
+                $layer.self_attn.q_proj.lora_b.eval();
+                $layer.self_attn.k_proj.lora_a.eval();
+                $layer.self_attn.k_proj.lora_b.eval();
+                $layer.self_attn.v_proj.lora_a.eval();
+                $layer.self_attn.v_proj.lora_b.eval();
+                $layer.self_attn.o_proj.lora_a.eval();
+                $layer.self_attn.o_proj.lora_b.eval();
+                $layer.mlp.gate_proj.lora_a.eval();
+                $layer.mlp.gate_proj.lora_b.eval();
+                $layer.mlp.up_proj.lora_a.eval();
+                $layer.mlp.up_proj.lora_b.eval();
+                $layer.mlp.down_proj.lora_a.eval();
+                $layer.mlp.down_proj.lora_b.eval();
+                $layer.input_layernorm.weight.value.eval();
+                $layer.post_attention_layernorm.weight.value.eval();
             };
         }
 
-        match &self.model.layers {
+        match &mut self.model.layers {
             GemmaLoraLayers::Gemma1(layers) => {
                 for layer in layers {
                     eval_layer!(layer);
@@ -1255,23 +1257,13 @@ impl GemmaLoraForCausalLM {
             GemmaLoraLayers::Gemma2(layers) => {
                 for layer in layers {
                     eval_layer!(layer);
-                    layer
-                        .pre_feedforward_layernorm
-                        .weight
-                        .value
-                        .as_ref()
-                        .eval()?;
-                    layer
-                        .post_feedforward_layernorm
-                        .weight
-                        .value
-                        .as_ref()
-                        .eval()?;
+                    layer.pre_feedforward_layernorm.weight.value.eval();
+                    layer.post_feedforward_layernorm.weight.value.eval();
                 }
             }
         }
 
-        self.model.norm.weight.value.as_ref().eval()?;
+        self.model.norm.weight.value.eval();
         Ok(())
     }
 }
@@ -1521,10 +1513,15 @@ impl ModuleParameters for GemmaLoraForCausalLM {
 crate::impl_trainable_model!(GemmaLoraForCausalLM);
 
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = pmetal_bridge::compat::ops::tri::<f32>(seq_len, None, None)?;
+    let mask =
+        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
-    pmetal_bridge::compat::ops::where_fn(&mask.eq(&zero), &neg_inf, &zero)
+    Ok(pmetal_bridge::compat::ops::where_fn(
+        &mask.equal(&zero),
+        &neg_inf,
+        &zero,
+    ))
 }
 
 #[cfg(test)]
@@ -1572,7 +1569,10 @@ mod tests {
         let lora_config = small_lora_config();
         let mut attn = GemmaLoraAttention::new(&config, &lora_config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
@@ -1647,7 +1647,10 @@ mod tests {
         let layer = Gemma2LoraDecoderLayer::new(&config, &lora_config).unwrap();
 
         // Verify Gemma2 has extra normalization layers
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Check pre-feedforward norm works
         let normed = layer.pre_feedforward_layernorm.forward(&x).unwrap();
@@ -1680,6 +1683,6 @@ mod tests {
 
         // Test ModuleParameters implementation
         let params = model.parameters();
-        assert!(!params.entries.is_empty());
+        assert!(!params.is_empty());
     }
 }

@@ -13,6 +13,8 @@ categories.workspace = true
 default = []
 # Enable fused Metal kernels for accelerated training on Apple Silicon
 metal-fused = ["pmetal-metal"]
+# Bridge-port of the legacy custom-training benchmark path is still in progress.
+custom-training = []
 
 [dependencies]
 pmetal-core = { workspace = true }
@@ -34,6 +36,7 @@ tempfile = { workspace = true }
 [[bench]]
 name = "memory_benchmark"
 harness = false
+required-features = ["custom-training"]
 
 [lints]
 workspace = true

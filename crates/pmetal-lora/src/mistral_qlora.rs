@@ -9,7 +9,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::{Array, Exception, nn, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue};
+use pmetal_bridge::compat::{
+    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, nn,
+};
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
@@ -76,7 +78,7 @@ impl MistralQLoraAttention {
             .base(config.rope_theta)
             .traditional(false)
             .build()
-            ;
+            .map_err(LoraError::Mlx)?;
 
         Ok(Self {
             n_heads,
@@ -118,7 +120,7 @@ impl MistralQLoraAttention {
             .base(config.rope_theta)
             .traditional(false)
             .build()
-            ;
+            .map_err(LoraError::Mlx)?;
 
         Ok(Self {
             n_heads,
@@ -148,13 +150,13 @@ impl MistralQLoraAttention {
         // Reshape for multi-head attention: [B, L, heads, head_dim]
         let queries = queries
             .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?; // [B, heads, L, head_dim]
+            .transpose_axes(&[0, 2, 1, 3]); // [B, heads, L, head_dim]
         let keys = keys
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
         let values = values
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
-            .transpose_axes(&[0, 2, 1, 3])?;
+            .transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE
         let queries = pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?;
@@ -175,8 +177,8 @@ impl MistralQLoraAttention {
         };
 
         // Scaled dot-product attention
-        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]))?;
-        let scores = scores.multiply(Array::from_f32(self.scale))?;
+        let scores = queries.matmul(&keys.transpose_axes(&[0, 1, 3, 2]));
+        let scores = scores.multiply(&Array::from_f32(self.scale));
 
         // Apply mask if provided
         let scores = if let Some(m) = mask {
@@ -186,15 +188,15 @@ impl MistralQLoraAttention {
         };
 
         // Softmax
-        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1);
 
         // Attention output
-        let output = weights.matmul(&values)?;
+        let output = weights.matmul(&values);
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         // Output projection
         self.o_proj.forward(&output).map_err(LoraError::from)
@@ -231,9 +233,12 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     let seq_len = shape[2];
     let head_dim = shape[3];
 
-    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
-    x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
+    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim]);
+    let x = pmetal_bridge::compat::ops::broadcast_to(
+        &x,
+        &[batch, n_kv_heads, repeats, seq_len, head_dim],
+    );
+    Ok(x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim]))
 }
 
 /// QLoRA-enabled MLP layer for Mistral (SwiGLU).
@@ -305,9 +310,9 @@ impl MistralQloraMLP {
     /// Forward pass (SwiGLU activation).
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         let gate = self.gate_proj.forward(x)?;
-        let gate = nn::silu(gate)?;
+        let gate = nn::silu(&gate);
         let up = self.up_proj.forward(x)?;
-        let hidden = gate.multiply(&up)?;
+        let hidden = gate.multiply(&up);
         self.down_proj.forward(&hidden)
     }
 
@@ -354,11 +359,11 @@ impl MistralQloraDecoderLayer {
         let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
             .build()
-            ;
+            .map_err(LoraError::Mlx)?;
         let post_attention_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
             .build()
-            ;
+            .map_err(LoraError::Mlx)?;
 
         Ok(Self {
             self_attn,
@@ -373,10 +378,11 @@ impl MistralQloraDecoderLayer {
         // Pre-norm + attention + residual
         let normed = pmetal_bridge::compat::Module::forward(&mut self.input_layernorm, x)?;
         let attn_out = self.self_attn.forward(&normed, mask)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-norm + MLP + residual
-        let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
+        let normed =
+            pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
         Ok(h.add(&mlp_out))
     }
@@ -425,7 +431,7 @@ impl MistralQloraModel {
         let norm = nn::RmsNormBuilder::new(config.hidden_size)
             .eps(config.rms_norm_eps)
             .build()
-            ;
+            .map_err(LoraError::Mlx)?;
 
         Ok(Self {
             config,
@@ -439,7 +445,8 @@ impl MistralQloraModel {
     /// Forward pass.
     pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         // Get embeddings
-        let mut hidden_states = pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states =
+            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Create causal mask if not provided
         let mask = if mask.is_none() {
@@ -516,7 +523,7 @@ impl MistralQloraForCausalLM {
             let head = nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
                 .bias(false)
                 .build()
-                ;
+                .map_err(LoraError::Mlx)?;
             Some(head)
         } else {
             None
@@ -535,10 +542,13 @@ impl MistralQloraForCausalLM {
 
         // Get logits from LM head or shared embeddings
         if let Some(ref mut lm_head) = self.lm_head {
-            Ok(pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)?)
+            Ok(pmetal_bridge::compat::Module::forward(
+                lm_head,
+                &hidden_states,
+            )?)
         } else {
             // Tie weights: use embedding weight transposed
-            Ok(self.model.embed_tokens.as_linear(&hidden_states)?)
+            Ok(self.model.embed_tokens.as_linear(&hidden_states))
         }
     }
 
@@ -689,23 +699,23 @@ impl MistralQloraForCausalLM {
     }
 
     /// Evaluate all LoRA parameters.
-    pub fn eval_lora_params(&self) -> Result<(), LoraError> {
-        for layer in &self.model.layers {
-            layer.self_attn.q_proj.lora_a.eval()?;
-            layer.self_attn.q_proj.lora_b.eval()?;
-            layer.self_attn.k_proj.lora_a.eval()?;
-            layer.self_attn.k_proj.lora_b.eval()?;
-            layer.self_attn.v_proj.lora_a.eval()?;
-            layer.self_attn.v_proj.lora_b.eval()?;
-            layer.self_attn.o_proj.lora_a.eval()?;
-            layer.self_attn.o_proj.lora_b.eval()?;
+    pub fn eval_lora_params(&mut self) -> Result<(), LoraError> {
+        for layer in &mut self.model.layers {
+            layer.self_attn.q_proj.lora_a.eval();
+            layer.self_attn.q_proj.lora_b.eval();
+            layer.self_attn.k_proj.lora_a.eval();
+            layer.self_attn.k_proj.lora_b.eval();
+            layer.self_attn.v_proj.lora_a.eval();
+            layer.self_attn.v_proj.lora_b.eval();
+            layer.self_attn.o_proj.lora_a.eval();
+            layer.self_attn.o_proj.lora_b.eval();
 
-            layer.mlp.gate_proj.lora_a.eval()?;
-            layer.mlp.gate_proj.lora_b.eval()?;
-            layer.mlp.up_proj.lora_a.eval()?;
-            layer.mlp.up_proj.lora_b.eval()?;
-            layer.mlp.down_proj.lora_a.eval()?;
-            layer.mlp.down_proj.lora_b.eval()?;
+            layer.mlp.gate_proj.lora_a.eval();
+            layer.mlp.gate_proj.lora_b.eval();
+            layer.mlp.up_proj.lora_a.eval();
+            layer.mlp.up_proj.lora_b.eval();
+            layer.mlp.down_proj.lora_a.eval();
+            layer.mlp.down_proj.lora_b.eval();
         }
         Ok(())
     }
@@ -770,8 +780,7 @@ impl MistralQloraForCausalLM {
     /// Save LoRA weights to safetensors.
     pub fn save_lora_weights(&self, path: impl AsRef<std::path::Path>) -> Result<(), LoraError> {
         let params = self.lora_parameters();
-        Array::save_safetensors(params, None, path)?;
-        Ok(())
+        crate::save_safetensors_map(path, &params)
     }
 
     /// Load LoRA weights from safetensors.
@@ -788,14 +797,14 @@ impl MistralQloraForCausalLM {
         } else {
             path.to_path_buf()
         };
-        let loaded = Array::load_safetensors(&file_path)?;
+        let loaded = crate::load_safetensors_map(&file_path)?;
 
         for (i, layer) in self.model.layers.iter_mut().enumerate() {
             let prefix = format!("model.layers.{}", i);
 
             macro_rules! load_param {
                 ($param:expr, $key:expr) => {
-                    if let Some(value) = loaded.get(&Rc::from($key) as &str) {
+                    if let Some(value) = loaded.get(&$key) {
                         $param = value.clone();
                     }
                 };
@@ -958,7 +967,8 @@ impl MistralQloraForCausalLM {
         // Check for single file model
         let single_file = model_dir.join("model.safetensors");
         if single_file.exists() {
-            let weights = crate::sanitize_loaded_weights(Array::load_safetensors(&single_file)?)?;
+            let weights =
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&single_file)?)?;
             return self.load_and_quantize_weights(&weights);
         }
 
@@ -989,7 +999,7 @@ impl MistralQloraForCausalLM {
         for shard_file in shard_files {
             let shard_path = model_dir.join(shard_file);
             let shard_weights =
-                crate::sanitize_loaded_weights(Array::load_safetensors(&shard_path)?)?;
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&shard_path)?)?;
             all_weights.extend(shard_weights);
         }
 
@@ -999,17 +1009,24 @@ impl MistralQloraForCausalLM {
 
 /// Create a causal attention mask with optional sliding window.
 fn create_causal_mask(seq_len: i32, sliding_window: Option<i32>) -> Result<Array, Exception> {
-    let mask = pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
+    let mask =
+        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
-    let mut causal_mask = pmetal_bridge::compat::ops::where_fn(&mask.eq(&zero), &neg_inf, &zero)?;
+    let mut causal_mask = pmetal_bridge::compat::ops::where_fn(&mask.equal(&zero), &neg_inf, &zero);
 
     // Apply sliding window if specified
     if let Some(window) = sliding_window {
         // Create lower triangular mask with window offset
-        let window_mask = pmetal_bridge::compat::ops::tri(seq_len, seq_len, -window, pmetal_bridge::compat::Dtype::Float32);
+        let window_mask = pmetal_bridge::compat::ops::tri(
+            seq_len,
+            seq_len,
+            -window,
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let one = Array::from_f32(1.0);
-        causal_mask = pmetal_bridge::compat::ops::where_fn(&window_mask.eq(&one), &neg_inf, &causal_mask)?;
+        causal_mask =
+            pmetal_bridge::compat::ops::where_fn(&window_mask.equal(&one), &neg_inf, &causal_mask);
     }
 
     Ok(causal_mask)
@@ -1315,10 +1332,13 @@ mod tests {
     fn test_mistral_qlora_attention() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let mut attn = MistralQLoraAttention::new(&config, &qlora_config);
+        let mut attn = MistralQLoraAttention::new(&config, &qlora_config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
-        let output = attn.forward(&x, None);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
     }
@@ -1327,10 +1347,11 @@ mod tests {
     fn test_mistral_qlora_model_forward() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let mut model = MistralQloraForCausalLM::with_qlora_config(config, qlora_config);
+        let mut model =
+            MistralQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
 
         let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
-        let logits = model.forward(&input_ids, None);
+        let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 256]);
     }
@@ -1339,7 +1360,7 @@ mod tests {
     fn test_mistral_qlora_param_count() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let model = MistralQloraForCausalLM::with_qlora_config(config, qlora_config);
+        let model = MistralQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
 
         // Should have trainable params
         assert!(model.num_trainable_params() > 0);
@@ -1353,7 +1374,7 @@ mod tests {
     fn test_mistral_qlora_memory_savings() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let model = MistralQloraForCausalLM::with_qlora_config(config, qlora_config);
+        let model = MistralQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
 
         let savings = model.memory_savings();
         // QLoRA should provide significant memory savings (< 0.35 of full precision)
@@ -1370,14 +1391,15 @@ mod tests {
         assert_eq!(config.sliding_window, Some(64));
 
         let qlora_config = small_qlora_config();
-        let mut model = MistralQloraForCausalLM::with_qlora_config(config, qlora_config);
+        let mut model =
+            MistralQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
 
         // Verify sliding window is passed through
         assert_eq!(model.model.layers[0].self_attn.sliding_window, Some(64));
 
         // Forward pass should work with sliding window
         let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4, 5, 6, 7, 8]).reshape(&[1, 8]);
-        let logits = model.forward(&input_ids, None);
+        let logits = model.forward(&input_ids, None).unwrap();
         assert_eq!(logits.shape(), &[1, 8, 256]);
     }
 
@@ -1385,7 +1407,8 @@ mod tests {
     fn test_mistral_qlora_set_parameters() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let mut model = MistralQloraForCausalLM::with_qlora_config(config, qlora_config);
+        let mut model =
+            MistralQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
 
         // Get initial parameters
         let params = model.lora_parameters();
@@ -1393,7 +1416,8 @@ mod tests {
         // Modify a parameter
         let mut new_params = params.clone();
         if let Some(key) = new_params.keys().next().cloned() {
-            let new_val = pmetal_bridge::compat::ops::ones(&[4, 64], pmetal_bridge::compat::Dtype::Float32);
+            let new_val =
+                pmetal_bridge::compat::ops::ones(&[4, 64], pmetal_bridge::compat::Dtype::Float32);
             new_params.insert(key.clone(), new_val);
         }
 

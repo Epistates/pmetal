@@ -41,15 +41,9 @@
 mod adapter;
 pub mod arch_config;
 pub mod autograd;
-pub mod custom_autograd_trainer;
-pub mod custom_backward;
-pub mod custom_training;
-pub mod custom_training_step;
 mod dora;
 mod dynamic;
 mod dynamic_qlora;
-pub mod fused_training;
-pub mod galore;
 pub mod gemma_lora;
 pub mod gemma_qlora;
 pub mod llama_lora;
@@ -60,7 +54,6 @@ pub mod mistral_lora;
 pub mod mistral_qlora;
 mod patcher;
 pub mod phi_lora;
-mod qblora;
 mod qlora;
 pub mod qwen3_lora;
 pub mod qwen3_next_lora;
@@ -73,25 +66,9 @@ pub use autograd::{
     AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads, MlpForwardSaved,
     MlpLoraGrads, fused_mlp_backward, fused_mlp_forward, lora_backward, lora_forward_with_grad,
 };
-pub use custom_autograd_trainer::{
-    CustomAutogradTrainer, LayerForwardState, LayerGradients, ModelForwardState, mlp_backward,
-};
-pub use custom_backward::{
-    AttentionSaved, DecoderLayerGrads, DecoderLayerSaved, RmsNormSaved, RopeSaved, SiluSaved,
-    attention_backward, attention_forward_with_grad, rmsnorm_backward, rmsnorm_forward_with_grad,
-    rope_backward, rope_forward_with_grad, silu_backward, silu_forward_with_grad,
-};
-pub use custom_training::{
-    CustomLoraTrainer, LayerSavedState, LoraGradAccumulator, ModelSavedState,
-};
-pub use custom_training_step::{Qwen3CustomTrainer, Qwen3LayerSaved, Qwen3ModelSaved};
 pub use dora::*;
 pub use dynamic::*;
 pub use dynamic_qlora::DynamicQloraModel;
-pub use fused_training::*;
-pub use galore::{
-    GaloreConfig, GaloreParamState, GaloreProjectionState, GaloreProjectionType, GaloreProjector,
-};
 pub use gemma_lora::*;
 pub use gemma_qlora::*;
 pub use llama_lora::*;
@@ -105,7 +82,6 @@ pub use mistral_lora::*;
 pub use mistral_qlora::*;
 pub use patcher::*;
 pub use phi_lora::*;
-pub use qblora::*;
 pub use qlora::*;
 pub use qwen3_lora::*;
 pub use qwen3_next_lora::*;

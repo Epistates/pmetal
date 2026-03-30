@@ -15,11 +15,11 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use pmetal_bridge::compat::fast;
 use pmetal_bridge::compat::{
-    Array, Exception, nn, Param,
-    ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
+    Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param,
+    nn,
 };
-use pmetal_bridge::compat as fast;
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
@@ -48,7 +48,10 @@ pub struct PhiLoraRmsNorm {
 impl PhiLoraRmsNorm {
     /// Create a new RMS LayerNorm.
     pub fn new(hidden_size: i32, eps: f32) -> Self {
-        let weight = Param::new(Array::ones::<f32>(&[hidden_size]).unwrap());
+        let weight = Param::new(pmetal_bridge::compat::ops::ones(
+            &[hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        ));
         Self { weight, eps }
     }
 
@@ -131,7 +134,7 @@ impl PhiLoraAttention {
             false,
         )?;
 
-        let rope = RopeBuilder::new(rope_dim)
+        let rope = nn::RopeBuilder::new(rope_dim)
             .traditional(false)
             .base(config.rope_theta)
             .scale(1.0)
@@ -163,9 +166,9 @@ impl PhiLoraAttention {
         let v = self.v_proj.forward(x)?;
 
         // Reshape to [batch, seq, n_heads, head_dim]
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Apply partial RoPE
         let (q_rope, q_pass) = self.split_rotary(&q)?;
@@ -175,13 +178,13 @@ impl PhiLoraAttention {
         let k_rope = Module::forward(&mut self.rope, &k_rope)?;
 
         // Concatenate RoPE and pass-through parts
-        let q = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
-        let k = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
+        let q = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
+        let k = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1);
 
         // Transpose for attention: [batch, n_heads, seq, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3])?;
-        let k = k.transpose_axes(&[0, 2, 1, 3])?;
-        let v = v.transpose_axes(&[0, 2, 1, 3])?;
+        let q = q.transpose_axes(&[0, 2, 1, 3]);
+        let k = k.transpose_axes(&[0, 2, 1, 3]);
+        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Expand KV heads for GQA
         let k = if self.n_kv_heads < self.n_heads {
@@ -198,8 +201,8 @@ impl PhiLoraAttention {
         };
 
         // Scaled dot-product attention
-        let scores = q.matmul(&k.transpose_axes(&[0, 1, 3, 2]))?;
-        let scores = scores.multiply(Array::from_f32(self.scale))?;
+        let scores = q.matmul(&k.transpose_axes(&[0, 1, 3, 2]));
+        let scores = scores.multiply(&Array::from_f32(self.scale));
 
         let scores = if let Some(m) = mask {
             scores.add(m)
@@ -207,12 +210,12 @@ impl PhiLoraAttention {
             scores
         };
 
-        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1, None)?;
-        let output = weights.matmul(&v)?;
+        let weights = pmetal_bridge::compat::ops::softmax_axis(&scores, -1);
+        let output = weights.matmul(&v);
 
         // Transpose back and project
-        let output = output.transpose_axes(&[0, 2, 1, 3])?;
-        let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim])?;
+        let output = output.transpose_axes(&[0, 2, 1, 3]);
+        let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
 
         self.o_proj.forward(&output).map_err(LoraError::from)
     }
@@ -242,14 +245,14 @@ impl PhiLoraAttention {
         let values = self.v_proj.forward(x)?;
 
         // Reshape for multi-head attention: [B, L, heads, head_dim]
-        let queries = queries.reshape(&[batch, seq_len, self.n_heads, self.head_dim])?;
-        let keys = keys.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
-        let values = values.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])?;
+        let queries = queries.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
+        let keys = keys.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        let values = values.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Transpose for attention: [B, heads, L, head_dim]
-        let queries = queries.transpose_axes(&[0, 2, 1, 3])?;
-        let keys = keys.transpose_axes(&[0, 2, 1, 3])?;
-        let values = values.transpose_axes(&[0, 2, 1, 3])?;
+        let queries = queries.transpose_axes(&[0, 2, 1, 3]);
+        let keys = keys.transpose_axes(&[0, 2, 1, 3]);
+        let values = values.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply partial RoPE with cache offset
         let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
@@ -258,12 +261,12 @@ impl PhiLoraAttention {
             // Apply partial RoPE to query
             let (q_rope, q_pass) = self.split_rotary_transposed(&queries)?;
             let q_rope = apply_rope(&q_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
-            let queries = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
+            let queries = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
 
             // Apply partial RoPE to key
             let (k_rope, k_pass) = self.split_rotary_transposed(&keys)?;
             let k_rope = apply_rope(&k_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
-            let keys = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
+            let keys = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1);
 
             (queries, keys, values)
         } else {
@@ -274,8 +277,8 @@ impl PhiLoraAttention {
             let q_rope = Module::forward(&mut self.rope, &q_rope)?;
             let k_rope = Module::forward(&mut self.rope, &k_rope)?;
 
-            let queries = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1)?;
-            let keys = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1)?;
+            let queries = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
+            let keys = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1);
 
             (queries, keys, values)
         };
@@ -299,8 +302,8 @@ impl PhiLoraAttention {
 
         // Reshape back: [B, heads, L, head_dim] -> [B, L, hidden]
         let output = output
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[batch, seq_len, -1])?;
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
 
         // Output projection
         self.o_proj.forward(&output).map_err(LoraError::from)
@@ -308,16 +311,16 @@ impl PhiLoraAttention {
 
     /// Split tensor into RoPE and pass-through parts.
     fn split_rotary(&self, x: &Array) -> Result<(Array, Array), Exception> {
-        let rope_part = x.index((.., .., .., ..self.rope_dim));
-        let pass_part = x.index((.., .., .., self.rope_dim..));
+        let rope_part = pmetal_bridge::compat::ops::slice_last_to(x, self.rope_dim);
+        let pass_part = pmetal_bridge::compat::ops::slice_last_from(x, self.rope_dim);
         Ok((rope_part, pass_part))
     }
 
     /// Split tensor into RoPE and pass-through parts (for transposed layout).
     /// Input: [B, heads, seq, head_dim]
     fn split_rotary_transposed(&self, x: &Array) -> Result<(Array, Array), Exception> {
-        let rope_part = x.index((.., .., .., ..self.rope_dim));
-        let pass_part = x.index((.., .., .., self.rope_dim..));
+        let rope_part = pmetal_bridge::compat::ops::slice_last_to(x, self.rope_dim);
+        let pass_part = pmetal_bridge::compat::ops::slice_last_from(x, self.rope_dim);
         Ok((rope_part, pass_part))
     }
 
@@ -337,9 +340,12 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, Exception> {
     let seq_len = shape[2];
     let head_dim = shape[3];
 
-    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim])?;
-    let x = pmetal_bridge::compat::ops::broadcast_to(&x, &[batch, n_kv_heads, repeats, seq_len, head_dim])?;
-    x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim])
+    let x = x.reshape(&[batch, n_kv_heads, 1, seq_len, head_dim]);
+    let x = pmetal_bridge::compat::ops::broadcast_to(
+        &x,
+        &[batch, n_kv_heads, repeats, seq_len, head_dim],
+    );
+    Ok(x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim]))
 }
 
 /// LoRA-enabled MLP layer for Phi with fused gate_up.
@@ -406,13 +412,15 @@ impl PhiLoraMLP {
         let activated = match self.activation {
             PhiActivation::SwiGLU => {
                 // Split into gate and up projections
-                let gate = hidden.index((.., .., ..self.intermediate_size));
-                let up = hidden.index((.., .., self.intermediate_size..));
+                let gate =
+                    pmetal_bridge::compat::ops::slice_last_to(&hidden, self.intermediate_size);
+                let up =
+                    pmetal_bridge::compat::ops::slice_last_from(&hidden, self.intermediate_size);
                 // SwiGLU: silu(gate) * up - use compiled silu kernel
-                let gate_activated = nn::silu(&gate)?;
+                let gate_activated = nn::silu(&gate);
                 gate_activated.multiply(&up)
             }
-            PhiActivation::GeluApprox | PhiActivation::GeluExact => nn::gelu(&hidden)?,
+            PhiActivation::GeluApprox | PhiActivation::GeluExact => nn::gelu(&hidden),
         };
 
         self.down_proj.forward(&activated)
@@ -459,7 +467,7 @@ impl PhiLoraDecoderLayer {
         let residual = x.clone();
         let hidden = self.input_layernorm.forward(x)?;
         let hidden = self.self_attn.forward(&hidden, mask)?;
-        let hidden = residual.add(&hidden)?;
+        let hidden = residual.add(&hidden);
 
         let residual = hidden.clone();
         let hidden = self.post_attention_layernorm.forward(&hidden)?;
@@ -482,7 +490,7 @@ impl PhiLoraDecoderLayer {
         // Pre-norm + attention + residual
         let normed = self.input_layernorm.forward(x)?;
         let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
-        let h = x.add(&attn_out)?;
+        let h = x.add(&attn_out);
 
         // Pre-norm + MLP + residual
         let normed = self.post_attention_layernorm.forward(&h)?;
@@ -921,7 +929,8 @@ impl PhiLoraForCausalLM {
 
         let single_file = model_dir.join("model.safetensors");
         if single_file.exists() {
-            let weights = crate::sanitize_loaded_weights(Array::load_safetensors(&single_file)?)?;
+            let weights =
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&single_file)?)?;
             return self.load_base_weights(&weights);
         }
 
@@ -949,7 +958,7 @@ impl PhiLoraForCausalLM {
         for shard_file in shard_files {
             let shard_path = model_dir.join(shard_file);
             let shard_weights =
-                crate::sanitize_loaded_weights(Array::load_safetensors(&shard_path)?)?;
+                crate::sanitize_loaded_weights(crate::load_safetensors_map(&shard_path)?)?;
             all_weights.extend(shard_weights);
         }
 
@@ -957,41 +966,36 @@ impl PhiLoraForCausalLM {
     }
 
     /// Evaluate all model parameters.
-    pub fn eval_all(&self) -> Result<(), LoraError> {
-        self.model.embed_tokens.weight.value.as_ref().eval()?;
+    pub fn eval_all(&mut self) -> Result<(), LoraError> {
+        self.model.embed_tokens.weight.value.eval();
 
-        for layer in &self.model.layers {
-            layer.self_attn.q_proj.weight.eval()?;
-            layer.self_attn.k_proj.weight.eval()?;
-            layer.self_attn.v_proj.weight.eval()?;
-            layer.self_attn.o_proj.weight.eval()?;
-            layer.mlp.gate_up_proj.weight.eval()?;
-            layer.mlp.down_proj.weight.eval()?;
+        for layer in &mut self.model.layers {
+            layer.self_attn.q_proj.weight.eval();
+            layer.self_attn.k_proj.weight.eval();
+            layer.self_attn.v_proj.weight.eval();
+            layer.self_attn.o_proj.weight.eval();
+            layer.mlp.gate_up_proj.weight.eval();
+            layer.mlp.down_proj.weight.eval();
 
-            layer.self_attn.q_proj.lora_a.eval()?;
-            layer.self_attn.q_proj.lora_b.eval()?;
-            layer.self_attn.k_proj.lora_a.eval()?;
-            layer.self_attn.k_proj.lora_b.eval()?;
-            layer.self_attn.v_proj.lora_a.eval()?;
-            layer.self_attn.v_proj.lora_b.eval()?;
-            layer.self_attn.o_proj.lora_a.eval()?;
-            layer.self_attn.o_proj.lora_b.eval()?;
-            layer.mlp.gate_up_proj.lora_a.eval()?;
-            layer.mlp.gate_up_proj.lora_b.eval()?;
-            layer.mlp.down_proj.lora_a.eval()?;
-            layer.mlp.down_proj.lora_b.eval()?;
+            layer.self_attn.q_proj.lora_a.eval();
+            layer.self_attn.q_proj.lora_b.eval();
+            layer.self_attn.k_proj.lora_a.eval();
+            layer.self_attn.k_proj.lora_b.eval();
+            layer.self_attn.v_proj.lora_a.eval();
+            layer.self_attn.v_proj.lora_b.eval();
+            layer.self_attn.o_proj.lora_a.eval();
+            layer.self_attn.o_proj.lora_b.eval();
+            layer.mlp.gate_up_proj.lora_a.eval();
+            layer.mlp.gate_up_proj.lora_b.eval();
+            layer.mlp.down_proj.lora_a.eval();
+            layer.mlp.down_proj.lora_b.eval();
 
-            layer.input_layernorm.weight.value.as_ref().eval()?;
-            layer
-                .post_attention_layernorm
-                .weight
-                .value
-                .as_ref()
-                .eval()?;
+            layer.input_layernorm.weight.value.eval();
+            layer.post_attention_layernorm.weight.value.eval();
         }
 
-        self.model.norm.weight.value.as_ref().eval()?;
-        self.lm_head.weight.value.as_ref().eval()?;
+        self.model.norm.weight.value.eval();
+        self.lm_head.weight.value.eval();
         Ok(())
     }
 }
@@ -1187,10 +1191,15 @@ impl ModuleParameters for PhiLoraForCausalLM {
 crate::impl_trainable_model!(PhiLoraForCausalLM);
 
 fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = pmetal_bridge::compat::ops::tri::<f32>(seq_len, None, None)?;
+    let mask =
+        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
     let neg_inf = Array::from_f32(f32::NEG_INFINITY);
     let zero = Array::from_f32(0.0);
-    pmetal_bridge::compat::ops::where_fn(&mask.eq(&zero), &neg_inf, &zero)
+    Ok(pmetal_bridge::compat::ops::where_fn(
+        &mask.equal(&zero),
+        &neg_inf,
+        &zero,
+    ))
 }
 
 #[cfg(test)]
@@ -1245,7 +1254,10 @@ mod tests {
         let lora_config = small_lora_config();
         let mut attn = PhiLoraAttention::new(&config, &lora_config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
