@@ -27,7 +27,7 @@
 //! - "Proximal Policy Optimization Algorithms" (Schulman et al., 2017)
 //! - Standard RLHF implementations
 
-use pmetal_bridge::compat::{Array, Exception, ops, nn, ops::indexing::IndexOp};
+use pmetal_bridge::compat::{Array, Exception, indexing::IndexOp, nn, ops};
 type Result<T> = std::result::Result<T, Exception>;
 use pmetal_core::TrainingConfig;
 
@@ -371,8 +371,8 @@ impl PpoTrainer {
         logits: Option<&Array>,
     ) -> PpoResult<(Array, Array, Option<Array>, Option<Array>, Array)> {
         // Compute probability ratio: r = exp(new_logp - old_logp)
-        let log_ratio = new_log_probs.subtract(old_log_probs)?;
-        let ratio = log_ratio.exp()?;
+        let log_ratio = new_log_probs.subtract(old_log_probs);
+        let ratio = log_ratio.exp();
 
         // Clipped objective
         let eps = Array::from_f32(self.config.clip_eps as f32);
@@ -725,7 +725,7 @@ mod tests {
         let advantages = Array::from_slice(&[1.0f32, -0.5, 0.8, -0.3], &[2, 2]);
         let mask = Array::from_slice(&[1.0f32, 1.0, 1.0, 1.0], &[2, 2]);
 
-        let (loss, policy_loss, _, _, kl) = trainer
+        let (mut loss, mut policy_loss, _, _, mut kl) = trainer
             .compute_ppo_loss(
                 &new_logps,
                 &old_logps,
@@ -738,12 +738,12 @@ mod tests {
             )
             .unwrap();
 
-        loss.eval().unwrap();
-        policy_loss.eval().unwrap();
-        kl.eval().unwrap();
+        loss.eval();
+        policy_loss.eval();
+        kl.eval();
 
-        assert!(loss\.item_f32().is_finite());
-        assert!(kl\.item_f32() >= 0.0);
+        assert!(loss.item_f32().is_finite());
+        assert!(kl.item_f32() >= 0.0);
     }
 
     #[test]

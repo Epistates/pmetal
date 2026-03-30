@@ -20,7 +20,9 @@
 //! - `pi_ref` is the reference model (frozen)
 //! - `beta` is the temperature parameter
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, nn, ops, ops::indexing::IndexOp, optimizers::Optimizer};
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, indexing::IndexOp, nn, ops, optimizers::Optimizer,
+};
 use pmetal_core::{StepMetrics, TrainingCallback, TrainingConfig};
 use pmetal_lora::TrainableModel;
 use std::time::Instant;
@@ -333,7 +335,7 @@ impl DpoTrainer {
         let valid_count_raw = valid_mask
             .as_dtype(Dtype::Float32.as_i32())
             .sum_axes(&[1i32], false);
-        let valid_count = ops::maximum(&valid_count_raw, &Array::from_f32(1.0))?;
+        let valid_count = ops::maximum(&valid_count_raw, &Array::from_f32(1.0));
 
         Ok(token_sum.divide(&valid_count))
     }
@@ -523,9 +525,7 @@ impl DpoTrainer {
             let s = Array::from_f32(self.config.label_smoothing as f32);
             let one_minus_s = Array::from_f32((1.0 - self.config.label_smoothing) as f32);
 
-            let loss = pos_loss
-                .multiply(&one_minus_s)
-                .add(&neg_loss.multiply(&s));
+            let loss = pos_loss.multiply(&one_minus_s).add(&neg_loss.multiply(&s));
             Ok(loss)
         } else {
             // Simple: -log_sigmoid(logits) = softplus(-logits)
@@ -662,14 +662,14 @@ impl DpoTrainer {
                         Ok(loss)
                     };
 
-                    let (loss, grads) = {
+                    let (mut loss, grads) = {
                         let mut loss_and_grad = nn::value_and_grad(loss_fn);
                         loss_and_grad(policy_model, ())?
                     };
                     optimizer.update(policy_model, grads)?;
                     loss.eval();
 
-                    let (chosen_rewards, rejected_rewards) = metrics_cell
+                    let (mut chosen_rewards, mut rejected_rewards) = metrics_cell
                         .into_inner()
                         .expect("loss_fn must have been called");
                     chosen_rewards.eval();
@@ -730,14 +730,14 @@ impl DpoTrainer {
                         Ok(loss)
                     };
 
-                    let (loss, grads) = {
+                    let (mut loss, grads) = {
                         let mut loss_and_grad = nn::value_and_grad(loss_fn);
                         loss_and_grad(policy_model, ())?
                     };
                     optimizer.update(policy_model, grads)?;
                     loss.eval();
 
-                    let (chosen_rewards, rejected_rewards) = metrics_cell
+                    let (mut chosen_rewards, mut rejected_rewards) = metrics_cell
                         .into_inner()
                         .expect("loss_fn must have been called");
                     chosen_rewards.eval();
@@ -840,8 +840,8 @@ impl DpoTrainer {
         let valid_count_raw = valid_mask
             .as_dtype(Dtype::Float32.as_i32())
             .sum_axes(&[1i32], false);
-        let valid_count = ops::maximum(&valid_count_raw, &Array::from_f32(1.0))?;
-        token_sum.divide(&valid_count)
+        let valid_count = ops::maximum(&valid_count_raw, &Array::from_f32(1.0));
+        Ok(token_sum.divide(&valid_count))
     }
 
     fn compute_dpo_loss_static(
@@ -869,7 +869,7 @@ impl DpoTrainer {
         let logits = if matches!(config.loss_type, DpoLossType::SimPo) {
             reward_diff
                 .multiply(&beta)
-                .subtract(&Array::from_f32(config.simpo_gamma as f32))?
+                .subtract(&Array::from_f32(config.simpo_gamma as f32))
         } else {
             reward_diff.multiply(&beta)
         };
@@ -994,8 +994,10 @@ impl DpoTrainer {
         let ref_rejected_logps = self.compute_log_probs(&rejected_logits, rejected_labels)?;
 
         // Evaluate and return (forces computation, allows caching)
-        ref_chosen_logps.eval().map_err(|e| DpoError::Mlx(e))?;
-        ref_rejected_logps.eval().map_err(|e| DpoError::Mlx(e))?;
+        let mut ref_chosen_logps = ref_chosen_logps;
+        let mut ref_rejected_logps = ref_rejected_logps;
+        ref_chosen_logps.eval();
+        ref_rejected_logps.eval();
 
         Ok((ref_chosen_logps, ref_rejected_logps))
     }
@@ -1044,15 +1046,10 @@ impl DpoTrainer {
 
             if batch_chosen_inputs.len() >= batch_size {
                 // Stack into batch arrays (stack along axis 0)
-                let chosen_inputs_refs: Vec<&Array> = batch_chosen_inputs.iter().collect();
-                let chosen_labels_refs: Vec<&Array> = batch_chosen_labels.iter().collect();
-                let rejected_inputs_refs: Vec<&Array> = batch_rejected_inputs.iter().collect();
-                let rejected_labels_refs: Vec<&Array> = batch_rejected_labels.iter().collect();
-
-                let chosen_inputs = ops::stack(&chosen_inputs_refs);
-                let chosen_labels = ops::stack(&chosen_labels_refs);
-                let rejected_inputs = ops::stack(&rejected_inputs_refs);
-                let rejected_labels = ops::stack(&rejected_labels_refs);
+                let chosen_inputs = ops::stack_axis(&batch_chosen_inputs, 0);
+                let chosen_labels = ops::stack_axis(&batch_chosen_labels, 0);
+                let rejected_inputs = ops::stack_axis(&batch_rejected_inputs, 0);
+                let rejected_labels = ops::stack_axis(&batch_rejected_labels, 0);
 
                 // Compute log probs for batch
                 let (chosen_logps, rejected_logps) = self.precompute_reference_log_probs(
@@ -1076,15 +1073,10 @@ impl DpoTrainer {
 
         // Process remaining samples
         if !batch_chosen_inputs.is_empty() {
-            let chosen_inputs_refs: Vec<&Array> = batch_chosen_inputs.iter().collect();
-            let chosen_labels_refs: Vec<&Array> = batch_chosen_labels.iter().collect();
-            let rejected_inputs_refs: Vec<&Array> = batch_rejected_inputs.iter().collect();
-            let rejected_labels_refs: Vec<&Array> = batch_rejected_labels.iter().collect();
-
-            let chosen_inputs = ops::stack(&chosen_inputs_refs);
-            let chosen_labels = ops::stack(&chosen_labels_refs);
-            let rejected_inputs = ops::stack(&rejected_inputs_refs);
-            let rejected_labels = ops::stack(&rejected_labels_refs);
+            let chosen_inputs = ops::stack_axis(&batch_chosen_inputs, 0);
+            let chosen_labels = ops::stack_axis(&batch_chosen_labels, 0);
+            let rejected_inputs = ops::stack_axis(&batch_rejected_inputs, 0);
+            let rejected_labels = ops::stack_axis(&batch_rejected_labels, 0);
 
             let (chosen_logps, rejected_logps) = self.precompute_reference_log_probs(
                 model,

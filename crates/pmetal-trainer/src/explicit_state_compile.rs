@@ -76,9 +76,9 @@ use std::rc::Rc;
 
 use pmetal_bridge::compat::{
     Array, Dtype, Exception,
-    module::{FlattenedModuleParam, ModuleParameters},
+    indexing::IndexOp,
+    module::{FlattenedModuleParam, ModuleParameters, ModuleParametersExt},
     nn, ops,
-    ops::indexing::IndexOp,
     optimizers::{Optimizer, Updatable},
     transforms,
 };
@@ -515,12 +515,12 @@ pub struct ExplicitStateTrainer<M, O> {
 impl<M, O> ExplicitStateTrainer<M, O>
 where
     M: TrainableModel + ModuleParameters,
-    O: Optimizer,
+    O: Optimizer + Updatable,
 {
     /// Create a new trainer.
     pub fn new(model: M, optimizer: O, config: ExplicitStateConfig) -> Result<Self> {
         // Get sorted parameter keys for deterministic ordering
-        let params = model.trainable_parameters().flatten();
+        let params = model.flatten_params();
         let mut param_keys: Vec<_> = params.keys().cloned().collect();
         param_keys.sort();
 
@@ -569,7 +569,7 @@ where
         // Compute loss and gradients
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
 
-        let (loss, grads) = if self.metal_fa_available {
+        let (mut loss, grads) = if self.metal_fa_available {
             pmetal_mlx::kernels::with_training_mode(|| {
                 loss_and_grad_fn(&mut self.model, (input_ids, labels))
                     .map_err(|e| pmetal_mlx::error::MlxError::from(e))
@@ -631,7 +631,7 @@ where
         // Compute loss and gradients
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
 
-        let (loss, grads) = if self.metal_fa_available {
+        let (mut loss, grads) = if self.metal_fa_available {
             pmetal_mlx::kernels::with_training_mode(|| {
                 loss_and_grad_fn(&mut self.model, (input_ids, labels))
                     .map_err(|e| pmetal_mlx::error::MlxError::from(e))
@@ -658,13 +658,8 @@ where
             loss.eval();
 
             // Eval model params (flatten returns HashMap<Rc<str>, &Array>)
-            let param_refs: Vec<&Array> = self
-                .model
-                .trainable_parameters()
-                .flatten()
-                .values()
-                .copied() // &Array -> Array reference
-                .collect();
+            let params = self.model.flatten_params();
+            let param_refs: Vec<&Array> = params.values().collect();
             if !param_refs.is_empty() {
                 transforms::eval(param_refs).map_err(crate::SftError::Mlx)?;
             }
@@ -746,27 +741,9 @@ fn generate_unique_id<T: 'static>() -> usize {
 ///
 /// Shifts logits and labels for next-token prediction and handles ignore_index=-100.
 fn compute_causal_lm_loss(logits: &Array, labels: &Array) -> std::result::Result<Array, Exception> {
-    let seq_len = logits.dim(1);
-    let vocab_size = logits.dim(2);
-
-    // Shift: logits[:-1] predicts labels[1:]
-    let shift_logits = logits.index((.., ..seq_len - 1, ..));
-    let shift_labels = labels.index((.., 1..));
-
-    let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
-    let flat_labels = shift_labels.reshape(&[-1]);
-
-    // Use optimized cross-entropy kernel with ignore_index=-100
-    let per_token_loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
-
-    // Compute mean loss over non-ignored tokens
-    let ignore_mask = flat_labels.ne(&Array::from_int(-100_i32));
-    let ignore_mask_f32 = ignore_mask.as_dtype(Dtype::Float32.as_i32());
-    let masked_loss = per_token_loss.multiply(&ignore_mask_f32);
-    let valid_count = ignore_mask_f32.sum(None);
-    let valid_count_safe = ops::maximum(&valid_count, &Array::from_f32(1.0));
-
-    Ok(masked_loss.sum(None).divide(&valid_count_safe))
+    Ok(pmetal_bridge::training::causal_lm_loss(
+        logits, labels, -100,
+    ))
 }
 
 /// GPU-based gradient clipping by global norm.
@@ -843,7 +820,9 @@ where
     F: Fn(&Array) -> std::result::Result<Array, Exception> + Copy + 'static,
 {
     // No-op shim: bridge executes pre-compiled Metal ops; JIT compile is a no-op.
-    fn compile_noop<F>(f: F, _shapeless: bool) -> F { f }
+    fn compile_noop<F>(f: F, _shapeless: bool) -> F {
+        f
+    }
     let mut compiled = compile_noop(forward_fn, shapeless);
     move |input| compiled(input)
 }
@@ -935,7 +914,7 @@ mod tests {
         let func = |inputs: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
             let arg = &inputs[0];
             let state = &inputs[1];
-            let sum = arg.sum(None)?;
+            let sum = arg.sum(None);
             Ok(vec![sum, state.clone()])
         };
 
@@ -959,8 +938,8 @@ mod tests {
         let func = |inputs: &[Array]| -> std::result::Result<Vec<Array>, Exception> {
             let arg = &inputs[0];
             let state = &inputs[1];
-            let new_state = state.add(arg)?;
-            let output = new_state.sum(None)?;
+            let new_state = state.add(arg);
+            let output = new_state.sum(None);
             Ok(vec![output, new_state])
         };
 
@@ -995,7 +974,7 @@ mod tests {
         let seq_len = 4;
         let vocab_size = 10;
 
-        use pmetal_bridge::compat::{random, Dtype as D};
+        use pmetal_bridge::compat::{Dtype as D, random};
         let logits = random::normal(&[batch, seq_len, vocab_size], D::Float32);
         let labels = random::randint(0, vocab_size, &[batch, seq_len], D::Int32);
 

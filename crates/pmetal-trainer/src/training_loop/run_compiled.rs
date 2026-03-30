@@ -125,7 +125,7 @@ impl TrainingLoop {
         );
 
         // Run ONE uncompiled training step
-        let warmup_loss = if self.config.use_cut_cross_entropy {
+        let mut warmup_loss = if self.config.use_cut_cross_entropy {
             jit_training_step_cce(
                 &mut state,
                 (&warmup_batch.input_ids, &warmup_batch.labels),
@@ -242,7 +242,7 @@ impl TrainingLoop {
                 // Execute fused training step (forward + backward + optimizer update)
                 // DEFERRED EVAL: Loss remains a lazy Array, no GPU-CPU sync here
                 // MLX's lazy evaluation automatically fuses operations when not evaluated
-                let loss = if self.config.use_cut_cross_entropy {
+                let mut loss = if self.config.use_cut_cross_entropy {
                     jit_training_step_cce(
                         &mut state,
                         (&batch.input_ids, &batch.labels),
@@ -274,7 +274,7 @@ impl TrainingLoop {
                     && self.step % self.config.log_every != 0
                 {
                     // Already evaluated above, just process the losses
-                    for loss in &accumulated_losses {
+                    for loss in &mut accumulated_losses {
                         let loss_val = loss.item_f32();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         let action = self.apply_adaptive_lr(loss_val as f64);
@@ -322,7 +322,7 @@ impl TrainingLoop {
 
                     // Now extract values and compute running loss
                     let mut adaptive_action = AdaptiveAction::Continue;
-                    for loss in &accumulated_losses {
+                    for loss in &mut accumulated_losses {
                         let loss_val = loss.item_f32();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         let action = self.apply_adaptive_lr(loss_val as f64);
@@ -418,7 +418,7 @@ impl TrainingLoop {
                     // Eval any pending losses before checkpointing
                     if !accumulated_losses.is_empty() {
                         eval_training_state(&accumulated_losses, &state)?;
-                        for loss in &accumulated_losses {
+                        for loss in &mut accumulated_losses {
                             let loss_val = loss.item_f32();
                             self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         }
@@ -437,7 +437,7 @@ impl TrainingLoop {
                         // Eval any remaining losses before returning
                         if !accumulated_losses.is_empty() {
                             eval_training_state(&accumulated_losses, &state)?;
-                            for loss in &accumulated_losses {
+                            for loss in &mut accumulated_losses {
                                 let loss_val = loss.item_f32();
                                 self.running_loss =
                                     0.99 * self.running_loss + 0.01 * loss_val as f64;
@@ -454,7 +454,7 @@ impl TrainingLoop {
         // Eval any remaining accumulated losses at end of training
         if !accumulated_losses.is_empty() {
             eval_training_state(&accumulated_losses, &state)?;
-            for loss in &accumulated_losses {
+            for loss in &mut accumulated_losses {
                 let loss_val = loss.item_f32();
                 self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
             }
@@ -563,7 +563,7 @@ impl TrainingLoop {
         );
 
         // Run ONE uncompiled training step for warmup
-        let warmup_loss = if self.config.use_cut_cross_entropy {
+        let mut warmup_loss = if self.config.use_cut_cross_entropy {
             jit_training_step_cce(
                 &mut state,
                 (&warmup_batch.input_ids, &warmup_batch.labels),
@@ -649,7 +649,7 @@ impl TrainingLoop {
                 // Execute JIT-compiled training step.
                 // When CCE is enabled, bypass compile_with_state (which requires a plain fn pointer)
                 // and use the CCE step directly — compile_with_state cannot capture neftune_alpha.
-                let loss = if self.config.use_cut_cross_entropy {
+                let mut loss = if self.config.use_cut_cross_entropy {
                     jit_training_step_cce(
                         &mut state,
                         (&batch.input_ids, &batch.labels),

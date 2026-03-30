@@ -44,10 +44,10 @@ use std::rc::Rc;
 
 use pmetal_bridge::compat::{
     Array, Exception,
+    indexing::IndexOp,
     losses::CrossEntropy,
-    module::{FlattenedModuleParam, ModuleParameters, update_parameters},
+    module::{FlattenedModuleParam, ModuleParameters, ModuleParametersExt, update_parameters},
     nn,
-    ops::indexing::IndexOp,
     optimizers::Optimizer,
     optimizers::Updatable,
 };
@@ -91,7 +91,7 @@ pub struct CompiledTrainStep<M, O> {
 impl<M, O> CompiledTrainStep<M, O>
 where
     M: ModuleParameters,
-    O: Optimizer,
+    O: Optimizer + Updatable,
 {
     /// Create a new compiled training step.
     ///
@@ -103,7 +103,7 @@ where
     /// Panics if optimizer state is not initialized (run warmup step first).
     pub fn new(model: M, optimizer: O) -> Result<Self> {
         // Get parameter keys in deterministic order
-        let params = model.trainable_parameters().flatten();
+        let params = model.flatten_params();
         let mut param_keys: Vec<Rc<str>> = params.keys().cloned().collect();
         param_keys.sort();
 
@@ -167,13 +167,7 @@ where
 
     #[allow(dead_code)] // JIT infrastructure, not yet wired end-to-end
     fn extract_model_params(&self) -> Vec<Array> {
-        let params: FlattenedModuleParam = self
-            .model
-            .trainable_parameters()
-            .flatten()
-            .into_iter()
-            .map(|(k, v)| (k, v.clone()))
-            .collect();
+        let params: FlattenedModuleParam = self.model.flatten_params();
         self.param_keys
             .iter()
             .map(|k| params.get(k).cloned().expect("param key must exist"))
@@ -216,42 +210,32 @@ pub fn stateless_loss_and_grad(
 
     // Define loss function for autodiff
     let loss_fn = |params: HashMap<Rc<str>, Array>,
-                   (input_ids, labels): (&Array, &Array)|
+                   (input_ids_local, labels_local): (Array, Array)|
      -> std::result::Result<Vec<Array>, Exception> {
         let params: FlattenedModuleParam = params;
-        let logits = forward_fn(&params, input_ids)?;
+        let logits = forward_fn(&params, &input_ids_local)?;
 
-        // Compute cross-entropy loss with shifted labels
         let seq_len = logits.dim(1);
         let vocab_size = logits.dim(2);
-
         let shift_logits = logits.index((.., ..seq_len - 1, ..));
-        let shift_labels = labels.index((.., 1..));
-
+        let shift_labels = labels_local.index((.., 1..));
         let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
         let flat_labels = shift_labels.reshape(&[-1]);
-
-        // Cross-entropy with ignore_index=-100
-        let ce = CrossEntropy::new()?;
-        let per_token_loss = ce.apply(&flat_logits, &flat_labels)?;
-
+        let per_token_loss = CrossEntropy::new()?.apply(&flat_logits, &flat_labels)?;
         let labels_dtype = flat_labels.dtype_raw();
         let ignore_idx = Array::from_int(-100).as_dtype(labels_dtype);
         let valid_mask = flat_labels.ne(&ignore_idx);
         use pmetal_bridge::compat::{Dtype, ops};
         let valid_mask_f32 = valid_mask.as_dtype(Dtype::Float32.as_i32());
-
         let masked_loss = per_token_loss.multiply(&valid_mask_f32);
         let n_valid = valid_mask_f32.sum(None);
         let n_valid_safe = ops::maximum(&n_valid, &Array::from_f32(1.0));
-
-        let loss = masked_loss.sum(None).divide(&n_valid_safe);
-        Ok(vec![loss])
+        Ok(vec![masked_loss.sum(None).divide(&n_valid_safe)])
     };
 
     // Compute value and gradient
     let mut vg = keyed_value_and_grad(loss_fn);
-    let (values, grads_map) = vg(params, (input_ids, labels))?;
+    let (values, grads_map) = vg(params, (input_ids.clone(), labels.clone()))?;
 
     // Extract gradients in same order as params
     let grads: Vec<Array> = param_keys

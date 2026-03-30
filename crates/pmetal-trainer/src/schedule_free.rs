@@ -58,7 +58,8 @@
 //! - [The Road Less Scheduled](https://arxiv.org/abs/2405.15682)
 //! - [Facebook Research Implementation](https://github.com/facebookresearch/schedule_free)
 
-use pmetal_bridge::compat::{Array, array, Exception, ops};
+use pmetal_bridge::array;
+use pmetal_bridge::compat::{Array, Exception, ops};
 
 /// Error type for Schedule-Free optimizer.
 #[derive(Debug, thiserror::Error)]
@@ -341,32 +342,32 @@ impl ScheduleFreeOptimizer {
 
             // 1. Update variance estimate (v)
             // v_{t} = β₂ * v_{t-1} + (1 - β₂) * grad²
-            let grad_sq = grad.square()?;
+            let grad_sq = grad.square();
             state.v = state
                 .v
-                .multiply(&beta2)?
-                .add(&grad_sq.multiply(&one_minus_beta2)?)?;
+                .multiply(&beta2)
+                .add(&grad_sq.multiply(&one_minus_beta2));
 
             // 2. Compute adaptive step size denominator
             // denom = √v + ε
-            let denom = state.v.sqrt()?.add(&eps)?;
+            let denom = state.v.sqrt().add(&eps);
 
             // 3. Update conservative estimate (z)
             // z_{t+1} = z_{t} - lr * grad / denom - lr * wd * z_{t}
-            let grad_term = grad.divide(&denom)?;
+            let grad_term = grad.divide(&denom);
             let update = if self.config.weight_decay > 0.0 {
-                let decay_term = state.z.multiply(&wd)?;
-                grad_term.add(&decay_term)?
+                let decay_term = state.z.multiply(&wd);
+                grad_term.add(&decay_term)
             } else {
                 grad_term
             };
-            state.z = state.z.subtract(&update.multiply(&lr)?)?;
+            state.z = state.z.subtract(&update.multiply(&lr));
 
             // 4. Update evaluation point (y) for next step
             // y_{t+1} = (1 - c_k) * z_{t+1} + c_k * y_{t}
-            let z_part = state.z.multiply(&one_minus_ck)?;
-            let y_part = param.multiply(&ck_arr)?;
-            *param = z_part.add(&y_part)?;
+            let z_part = state.z.multiply(&one_minus_ck);
+            let y_part = param.multiply(&ck_arr);
+            *param = z_part.add(&y_part);
         }
 
         Ok(())
@@ -411,9 +412,9 @@ impl ScheduleFreeOptimizer {
             // Save the current iterate y so train_mode can restore it.
             state.y_saved = Some(param.clone());
             // Compute evaluation point: y = (1 - 1/c_k) * z + (1/c_k) * x
-            let z_part = state.z.multiply(&w_z)?;
-            let x_part = param.multiply(&w_x)?;
-            *param = z_part.add(&x_part)?;
+            let z_part = state.z.multiply(&w_z);
+            let x_part = param.multiply(&w_x);
+            *param = z_part.add(&x_part);
         }
 
         Ok(())

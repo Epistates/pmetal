@@ -102,14 +102,16 @@ fn test_forward_process_gpu() {
 fn test_diffusion_loss_gpu() {
     // Test GPU-native diffusion loss
     // Create dummy logits: [batch=1, seq_len=4, vocab_size=8]
-    let logits = pmetal_bridge::compat::random::normal(&[1, 4, 8], pmetal_bridge::compat::Dtype::Float32);
+    let logits =
+        pmetal_bridge::compat::random::normal(&[1, 4, 8], pmetal_bridge::compat::Dtype::Float32);
 
     // Create targets: [batch=1, seq_len=4]
     let targets = Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4], &[1, 4]);
 
     // Create mask: [batch=1, seq_len=4] - first two positions masked
     // Bridge doesn't have from_bool_slice, use from_i32 cast to bool
-    let mask = Array::from_i32_slice_shaped(&[1_i32, 1, 0, 0], &[1, 4]).as_dtype(pmetal_bridge::compat::Dtype::Bool.as_i32());
+    let mask = Array::from_i32_slice_shaped(&[1_i32, 1, 0, 0], &[1, 4])
+        .as_dtype(pmetal_bridge::compat::Dtype::Bool.as_i32());
 
     let t = 0.5;
     let use_elbo = true;
@@ -347,9 +349,11 @@ fn test_noise_schedules() {
 #[serial]
 fn test_elbo_weighting() {
     // Test that ELBO weighting increases loss at low noise levels
-    let logits = pmetal_bridge::compat::random::normal(&[1, 4, 8], pmetal_bridge::compat::Dtype::Float32);
+    let logits =
+        pmetal_bridge::compat::random::normal(&[1, 4, 8], pmetal_bridge::compat::Dtype::Float32);
     let targets = Array::from_i32_slice_shaped(&[1_i32, 2, 3, 4], &[1, 4]);
-    let mask = Array::from_i32_slice_shaped(&[1_i32, 1, 1, 1], &[1, 4]).as_dtype(pmetal_bridge::compat::Dtype::Bool.as_i32());
+    let mask = Array::from_i32_slice_shaped(&[1_i32, 1, 1, 1], &[1, 4])
+        .as_dtype(pmetal_bridge::compat::Dtype::Bool.as_i32());
 
     // Loss at t=0.5 without ELBO
     let loss_no_elbo =

@@ -12,7 +12,7 @@
 //!
 //! This is the technique used by DeepSeek V3/R1.
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops, nn};
+use pmetal_bridge::compat::{Array, Dtype, Exception, nn, ops};
 
 /// Selective log softmax: compute log probabilities only at target indices.
 ///
@@ -233,10 +233,7 @@ mod tests {
         // Naive reference: -sum(softmax(x) * log_softmax(x), axis=-1)
         let log_probs = nn::log_softmax(&logits, -1);
         let probs = log_probs.exp();
-        let naive_ent = probs
-            .multiply(&log_probs)
-            .sum_axis(-1, false)
-            .negative();
+        let naive_ent = probs.multiply(&log_probs).sum_axis(-1, false).negative();
         naive_ent.eval();
 
         let ent_vals: &[f32] = ent.as_slice();
@@ -390,8 +387,7 @@ mod tests {
     fn test_selective_int64_labels() {
         // Labels as Int64 (common when loaded from datasets)
         let logits = Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], &[1, 2, 3]);
-        let labels_i64 = Array::from_slice(&[2i32, -100], &[1, 2])
-            .as_dtype(Dtype::Int64 as i32);
+        let labels_i64 = Array::from_slice(&[2i32, -100], &[1, 2]).as_dtype(Dtype::Int64 as i32);
 
         let (log_probs, mask) = selective_log_softmax(&logits, &labels_i64).unwrap();
         log_probs.eval();

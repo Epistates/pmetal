@@ -12,9 +12,9 @@
 
 use pmetal_bridge::compat::{
     Array, Exception,
+    indexing::IndexOp,
     module::{Module, ModuleParameters},
     nn, ops,
-    ops::indexing::IndexOp,
     optimizers::Optimizer,
 };
 use pmetal_core::TrainingConfig;
@@ -789,7 +789,7 @@ impl GrpoTrainer {
         let old_logits = policy_model
             .forward_with_images(&input_ids, None, pixel_values.as_ref())
             .map_err(|e| Exception::custom(e.to_string()))?;
-        let (old_per_token_logps, completion_mask) =
+        let (mut old_per_token_logps, mut completion_mask) =
             self.compute_per_token_logps(&old_logits, &labels, temperature)?;
         // Eval to materialize — these must NOT be part of the grad graph
         old_per_token_logps.eval();
@@ -801,7 +801,7 @@ impl GrpoTrainer {
         let ref_per_token_logps = if self.config.beta > 0.0 {
             if let Some(ref mut ref_m) = ref_model {
                 let ref_logits = ref_m.forward(input_ids.clone())?;
-                let (ref_logps, _) =
+                let (mut ref_logps, _) =
                     self.compute_per_token_logps(&ref_logits, &labels, temperature)?;
                 ref_logps.eval();
                 Some(ref_logps)
@@ -865,6 +865,7 @@ impl GrpoTrainer {
         optimizer.update(policy_model, grads)?;
 
         // Extract loss from the forward pass (already computed, no redundant re-forward)
+        let mut total_loss_arr = total_loss_arr;
         let total_loss = total_loss_arr.item_f32();
 
         // Compute KL/policy_loss stats from the values already available in the loss
@@ -878,8 +879,7 @@ impl GrpoTrainer {
                 .subtract(&Array::from_f32(1.0))
                 .subtract(&kl_log_ratio);
             let masked_kl = per_token_kl.multiply(&completion_mask);
-            let safe_count =
-                ops::maximum(&completion_mask.sum(None), &Array::from_f32(1.0));
+            let safe_count = ops::maximum(&completion_mask.sum(None), &Array::from_f32(1.0));
             masked_kl.sum(None).divide(&safe_count).item_f32()
         } else {
             0.0

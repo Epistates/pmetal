@@ -22,9 +22,9 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use pmetal_bridge::array;
 use pmetal_bridge::compat::{
-    Array, array,
-    Exception,
+    Array, Exception,
     optimizers::{AdamW, AdamWBuilder, Optimizer, State, Updatable},
 };
 type Result<T> = std::result::Result<T, Exception>;

@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use pmetal_bridge::compat::Array;
+use pmetal_bridge::inline_array;
 use serde::{Deserialize, Serialize};
 
 use crate::{Result, SftError};
@@ -37,17 +38,9 @@ pub fn save_best_snapshot(checkpoint_dir: &Path, weights: &HashMap<Rc<str>, Arra
     let tmp_path = checkpoint_dir.join("best_snapshot.safetensors.tmp");
     let final_path = checkpoint_dir.join("best_snapshot.safetensors");
 
-    Array::save_safetensors(
-        weights.iter().map(|(k, v)| (k.as_ref(), v)),
-        None,
-        &tmp_path,
-    )
-    .map_err(|e| {
-        SftError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to write best snapshot: {e}"),
-        ))
-    })?;
+    let tmp_path_str = path_as_str(&tmp_path)?;
+    let entries: Vec<(&str, &Array)> = weights.iter().map(|(k, v)| (k.as_ref(), v)).collect();
+    Array::save_safetensors(tmp_path_str, &entries);
 
     fs::rename(&tmp_path, &final_path).map_err(|e| {
         SftError::Io(std::io::Error::new(
@@ -71,8 +64,8 @@ pub fn load_best_snapshot(checkpoint_dir: &Path) -> Option<HashMap<Rc<str>, Arra
         return None;
     }
 
-    match Array::load_safetensors(&path) {
-        Ok(params) => {
+    match inline_array::load_safetensors_shard(path_as_str(&path).ok()?) {
+        Some(params) => {
             let weights: HashMap<Rc<str>, Array> =
                 params.into_iter().map(|(k, v)| (Rc::from(k), v)).collect();
             tracing::info!(
@@ -82,8 +75,8 @@ pub fn load_best_snapshot(checkpoint_dir: &Path) -> Option<HashMap<Rc<str>, Arra
             );
             Some(weights)
         }
-        Err(e) => {
-            tracing::warn!("Failed to load best snapshot from {:?}: {e}", path);
+        None => {
+            tracing::warn!("Failed to load best snapshot from {:?}", path);
             None
         }
     }
@@ -180,12 +173,8 @@ fn write_checkpoint_to_dir<'a>(
     })?;
 
     let weights_path = dir.join("lora_weights.safetensors");
-    Array::save_safetensors(params, None, &weights_path).map_err(|e| {
-        SftError::Io(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to save weights: {e}"),
-        ))
-    })?;
+    let entries: Vec<(&str, &Array)> = params.into_iter().collect();
+    Array::save_safetensors(path_as_str(&weights_path)?, &entries);
 
     let metadata_path = dir.join("metadata.json");
     let mut file = File::create(&metadata_path).map_err(|e| {
@@ -365,12 +354,13 @@ impl CheckpointManager {
 
         // Load weights
         let weights_path = checkpoint_path.join("lora_weights.safetensors");
-        let params = Array::load_safetensors(&weights_path).map_err(|e| {
-            SftError::Io(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("Failed to load weights: {}", e),
-            ))
-        })?;
+        let params =
+            inline_array::load_safetensors_shard(path_as_str(&weights_path)?).ok_or_else(|| {
+                SftError::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to load weights from {}", weights_path.display()),
+                ))
+            })?;
 
         // Convert HashMap<String, Array> to HashMap<Rc<str>, Array>
         let params: HashMap<Rc<str>, Array> =
@@ -550,6 +540,15 @@ impl CheckpointManager {
 
         Ok(step_dir)
     }
+}
+
+fn path_as_str(path: &Path) -> Result<&str> {
+    path.to_str().ok_or_else(|| {
+        SftError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Non-UTF8 path: {}", path.display()),
+        ))
+    })
 }
 
 #[cfg(test)]

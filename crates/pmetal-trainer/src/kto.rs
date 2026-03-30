@@ -46,7 +46,7 @@
 //! let undesirable = KtoSample::undesirable(prompt_ids, response_ids);
 //! ```
 
-use pmetal_bridge::compat::{Array, Exception, nn, ops, ops::indexing::IndexOp, optimizers::Optimizer};
+use pmetal_bridge::compat::{Array, Exception, indexing::IndexOp, nn, ops, optimizers::Optimizer};
 use pmetal_core::{StepMetrics, TrainingCallback, TrainingConfig};
 use pmetal_lora::TrainableModel;
 use std::time::Instant;
@@ -453,7 +453,7 @@ impl KtoTrainer {
         let batch_size = rewards.dim(0) as usize;
 
         // Compute mean KL divergence (reward) for this batch
-        let mean_reward = rewards.mean(None);
+        let mut mean_reward = rewards.mean(None);
         mean_reward.eval();
         let batch_mean = mean_reward.item_f32() as f64;
 
@@ -577,17 +577,21 @@ impl KtoTrainer {
                     Ok(loss)
                 };
 
-                let (loss, grads) = {
+                let (mut loss, grads) = {
                     let mut loss_and_grad = nn::value_and_grad(loss_fn);
                     loss_and_grad(policy_model, ())?
                 };
                 optimizer.update(policy_model, grads)?;
                 loss.eval();
 
-                let (raw_rewards, scaled_rewards, desirable_losses_arr, undesirable_losses_arr) =
-                    metrics_cell
-                        .into_inner()
-                        .expect("loss_fn must have been called");
+                let (
+                    raw_rewards,
+                    mut scaled_rewards,
+                    mut desirable_losses_arr,
+                    mut undesirable_losses_arr,
+                ) = metrics_cell
+                    .into_inner()
+                    .expect("loss_fn must have been called");
 
                 // Update z_ref estimate before evaluating arrays
                 if self.config.estimate_z_ref {
@@ -607,8 +611,7 @@ impl KtoTrainer {
                 let undesirable_mask = Array::from_f32(1.0).subtract(&desirable_mask);
                 let desirable_count = desirable_mask.sum(None);
                 let undesirable_count = undesirable_mask.sum(None);
-                let desirable_count_safe =
-                    ops::maximum(&desirable_count, &Array::from_f32(1.0));
+                let desirable_count_safe = ops::maximum(&desirable_count, &Array::from_f32(1.0));
                 let undesirable_count_safe =
                     ops::maximum(&undesirable_count, &Array::from_f32(1.0));
                 let desirable_loss = desirable_losses_arr
@@ -696,7 +699,7 @@ impl KtoTrainer {
         let target_labels = labels.index((.., 1..));
         let (per_token_logps, _valid_mask) =
             crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
-        per_token_logps.sum_axes(&[1i32], false)
+        Ok(per_token_logps.sum_axes(&[1i32], false))
     }
 
     fn compute_kto_loss_arrays(
@@ -715,27 +718,26 @@ impl KtoTrainer {
 
         let z_ref_arr = Array::from_f32(z_ref as f32);
         let desirable_logits = z_ref_arr.subtract(
-            &rewards.multiply(&Array::from_f32(config.effective_beta_desirable() as f32))?,
-        )?;
+            &rewards.multiply(&Array::from_f32(config.effective_beta_desirable() as f32)),
+        );
         let undesirable_logits = rewards
-            .multiply(&Array::from_f32(config.effective_beta_undesirable() as f32))?
+            .multiply(&Array::from_f32(config.effective_beta_undesirable() as f32))
             .subtract(&z_ref_arr);
 
         let desirable_losses = nn::sigmoid(&desirable_logits)
-            .multiply(&Array::from_f32(config.desirable_weight as f32))?
+            .multiply(&Array::from_f32(config.desirable_weight as f32))
             .multiply(&desirable_mask);
         let undesirable_losses = nn::sigmoid(&undesirable_logits)
-            .multiply(&Array::from_f32(config.undesirable_weight as f32))?
+            .multiply(&Array::from_f32(config.undesirable_weight as f32))
             .multiply(&undesirable_mask);
         let total_losses = desirable_losses.add(&undesirable_losses);
-        let mean_loss = total_losses.mean(None);
+        let mut mean_loss = total_losses.mean(None);
         mean_loss.eval();
 
         let desirable_count = desirable_mask.sum(None);
         let undesirable_count = undesirable_mask.sum(None);
         let desirable_count_safe = ops::maximum(&desirable_count, &Array::from_f32(1.0));
-        let undesirable_count_safe =
-            ops::maximum(&undesirable_count, &Array::from_f32(1.0));
+        let undesirable_count_safe = ops::maximum(&undesirable_count, &Array::from_f32(1.0));
         let desirable_loss = desirable_losses
             .sum(None)
             .divide(&desirable_count_safe)
@@ -745,7 +747,7 @@ impl KtoTrainer {
             .divide(&undesirable_count_safe)
             .item_f32();
 
-        let scaled_rewards = rewards.multiply(&Array::from_f32(config.beta as f32))?;
+        let scaled_rewards = rewards.multiply(&Array::from_f32(config.beta as f32));
         Ok((mean_loss, scaled_rewards, desirable_loss, undesirable_loss))
     }
 
@@ -773,22 +775,22 @@ impl KtoTrainer {
 
         let z_ref_arr = Array::from_f32(z_ref as f32);
         let desirable_logits = z_ref_arr.subtract(
-            &rewards.multiply(&Array::from_f32(config.effective_beta_desirable() as f32))?,
-        )?;
+            &rewards.multiply(&Array::from_f32(config.effective_beta_desirable() as f32)),
+        );
         let undesirable_logits = rewards
-            .multiply(&Array::from_f32(config.effective_beta_undesirable() as f32))?
+            .multiply(&Array::from_f32(config.effective_beta_undesirable() as f32))
             .subtract(&z_ref_arr);
 
         let desirable_losses = nn::sigmoid(&desirable_logits)
-            .multiply(&Array::from_f32(config.desirable_weight as f32))?
+            .multiply(&Array::from_f32(config.desirable_weight as f32))
             .multiply(&desirable_mask);
         let undesirable_losses = nn::sigmoid(&undesirable_logits)
-            .multiply(&Array::from_f32(config.undesirable_weight as f32))?
+            .multiply(&Array::from_f32(config.undesirable_weight as f32))
             .multiply(&undesirable_mask);
         let total_losses = desirable_losses.add(&undesirable_losses);
         let mean_loss = total_losses.mean(None);
 
-        let scaled_rewards = rewards.multiply(&Array::from_f32(config.beta as f32))?;
+        let scaled_rewards = rewards.multiply(&Array::from_f32(config.beta as f32));
         Ok((
             mean_loss,
             scaled_rewards,

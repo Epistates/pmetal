@@ -351,18 +351,21 @@ impl TrainingLoop {
                 }
                 pmetal_bridge::compat::transforms::eval(to_eval);
 
+                let mut loss = loss;
                 let loss_val = loss.item_f32();
-                let norm = lazy_norm.map(|n| n.item_f32());
+                let norm = lazy_norm.map(|mut n| n.item_f32());
 
                 (loss_val, norm, clip_elapsed, opt_elapsed)
             } else {
                 // No gradients accumulated - just eval loss
-                loss.eval()?;
+                let mut loss = loss;
+                loss.eval();
                 (loss.item::<f32>(), None, 0, 0)
             }
         } else {
             // Gradient accumulation not complete - just eval loss
-            loss.eval()?;
+            let mut loss = loss;
+            loss.eval();
             (loss.item::<f32>(), None, 0, 0)
         };
 

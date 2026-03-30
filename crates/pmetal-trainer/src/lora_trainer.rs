@@ -6,8 +6,8 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use pmetal_bridge::compat::{
-    Array, Exception, module::ModuleParameters, nn, ops::indexing::IndexOp,
-    optimizers::Optimizer, eval_params,
+    Array, Exception, eval_params, indexing::IndexOp, module::ModuleParameters, nn,
+    optimizers::Optimizer,
 };
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_lora::LlamaLoraForCausalLM;
@@ -124,8 +124,8 @@ impl LoraTrainer {
         gradients: &HashMap<Rc<str>, Array>,
     ) -> Result<TrainStepStats> {
         // Compute loss first
-        let loss = self.compute_loss(input_ids, labels)?;
-        loss.eval()?;
+        let mut loss = self.compute_loss(input_ids, labels)?;
+        loss.eval();
         let loss_val = loss.item_f32();
 
         // Get learning rate
@@ -184,19 +184,21 @@ impl LoraTrainer {
             let shift_logits = logits.index((.., ..seq_len - 1, ..));
             let shift_labels = lbls.index((.., 1..));
 
-            let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-            let flat_labels = shift_labels.reshape(&[-1])?;
-
-            let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
-            loss.mean(None)
+            let masked_labels = lbls.clone();
+            let _ = vocab_size;
+            Ok(pmetal_bridge::training::causal_lm_loss(
+                &logits,
+                &masked_labels,
+                -100,
+            ))
         };
 
         // Create value_and_grad function
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
 
         // Compute loss and gradients
-        let (loss, gradients) = loss_and_grad_fn(&mut self.model, (input_ids, labels))?;
-        loss.eval()?;
+        let (mut loss, gradients) = loss_and_grad_fn(&mut self.model, (input_ids, labels))?;
+        loss.eval();
         let loss_val = loss.item_f32();
 
         // Update parameters with optimizer
@@ -372,13 +374,10 @@ pub fn compute_lm_loss(logits: &Array, labels: &Array) -> Result<Array> {
     let shift_labels = labels.index((.., 1..));
 
     // Reshape for cross entropy: [batch * seq_len, vocab_size] and [batch * seq_len]
-    let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-    let flat_labels = shift_labels.reshape(&[-1])?;
-
-    // Compute cross entropy loss with ignore_index=-100
-    let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
-
-    Ok(loss.mean(None)?)
+    let _ = vocab_size;
+    Ok(pmetal_bridge::training::causal_lm_loss(
+        logits, labels, -100,
+    ))
 }
 
 /// Create a simple training loop for testing.
@@ -409,8 +408,8 @@ where
 
     for (step, (input_ids, labels)) in data.enumerate() {
         // Compute loss (no gradient update in this simple version)
-        let loss = trainer.compute_loss(&input_ids, &labels)?;
-        loss.eval()?;
+        let mut loss = trainer.compute_loss(&input_ids, &labels)?;
+        loss.eval();
         let loss_val = loss.item_f32() as f64;
 
         trainer.running_loss = if step == 0 {

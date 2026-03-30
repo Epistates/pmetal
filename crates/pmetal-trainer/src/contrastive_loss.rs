@@ -9,7 +9,7 @@
 //! All losses operate on L2-normalised embeddings `[batch, dim]`.
 //! Normalisation should be applied by the caller (use `pool::normalize_embeddings`).
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, module::Module, ops, ops::indexing::IndexOp};
+use pmetal_bridge::compat::{Array, Dtype, Exception, indexing::IndexOp, module::Module, ops};
 
 // ---------------------------------------------------------------------------
 // Public loss functions
@@ -31,8 +31,8 @@ pub fn info_nce_loss(
     let batch_size = anchors.dim(0);
 
     // Similarity matrix [batch, batch]
-    let sim = anchors.matmul(&positives.transpose_axes(&[1, 0])?)?;
-    let sim_scaled = sim.divide(&Array::from_f32(temperature))?;
+    let sim = anchors.matmul(&positives.transpose_axes(&[1, 0]));
+    let sim_scaled = sim.divide(&Array::from_f32(temperature));
 
     // Diagonal labels: [0, 1, 2, ..., batch-1]
     let labels: Vec<i32> = (0..batch_size).collect();
@@ -40,7 +40,7 @@ pub fn info_nce_loss(
 
     let ce = pmetal_bridge::compat::losses::CrossEntropy::new()?;
     let loss = ce.apply(&sim_scaled, &labels_arr)?;
-    loss.mean(None)
+    Ok(loss.mean(None))
 }
 
 /// Triplet margin loss using cosine distance.
@@ -58,10 +58,10 @@ pub fn triplet_loss(
     let neg_sim = pairwise_cosine_similarity(anchors, negatives)?;
 
     // loss = max(0, margin - pos_sim + neg_sim)
-    let diff = Array::from_f32(margin).subtract(&pos_sim)?.add(&neg_sim)?;
+    let diff = Array::from_f32(margin).subtract(&pos_sim).add(&neg_sim);
     let zero = Array::from_f32(0.0);
     let loss = ops::maximum(&diff, &zero);
-    loss.mean(None)
+    Ok(loss.mean(None))
 }
 
 /// CoSENT (Cosine Sentence Embedding Training) loss.
@@ -83,21 +83,21 @@ pub fn cosent_loss(
 ) -> Result<Array, Exception> {
     // Full similarity matrix [batch, batch]
     let sim = cosine_similarity_matrix(embeddings_a, embeddings_b)?;
-    let sim_scaled = sim.divide(&Array::from_f32(temperature))?;
+    let sim_scaled = sim.divide(&Array::from_f32(temperature));
 
     // Cast labels to float for masking arithmetic
-    let labels_f = labels.as_dtype(Dtype::Float32)?;
+    let labels_f = labels.as_dtype(Dtype::Float32.as_i32());
     // labels_f is [batch]; broadcast to [batch, batch] via outer product
     let pos_mask = labels_f
-        .reshape(&[-1, 1])?
-        .multiply(&labels_f.reshape(&[1, -1])?)?;
-    let neg_mask = Array::from_f32(1.0).subtract(&pos_mask)?;
+        .reshape(&[-1, 1])
+        .multiply(&labels_f.reshape(&[1, -1]));
+    let neg_mask = Array::from_f32(1.0).subtract(&pos_mask);
 
     // Guard: CoSENT requires at least one positive pair; if all labels are 0 the
     // pos_logits matrix is entirely -1e9 and logsumexp(-1e9) - logsumexp(actual)
     // overflows to +inf.  Return zero loss instead.
-    let pos_count = pos_mask.sum(None)?;
-    pos_count.eval()?;
+    let mut pos_count = pos_mask.sum(None);
+    pos_count.eval();
     if pos_count.item::<f32>() < 0.5 {
         return Ok(Array::from_f32(0.0));
     }
@@ -105,32 +105,32 @@ pub fn cosent_loss(
     // Mask out diagonal (self-similarity is always pos=1, which is trivial)
     let batch = embeddings_a.dim(0);
     let diag_mask = diagonal_zeros(batch)?;
-    let pos_mask = pos_mask.multiply(&diag_mask)?;
-    let neg_mask = neg_mask.multiply(&diag_mask)?;
+    let pos_mask = pos_mask.multiply(&diag_mask);
+    let neg_mask = neg_mask.multiply(&diag_mask);
 
     // Replace zeros with very negative values before logsumexp
     let neg_large = Array::from_f32(-1e9_f32);
 
     let pos_logits = sim_scaled.add(
         &Array::from_f32(1.0)
-            .subtract(&pos_mask)?
-            .multiply(&neg_large)?,
-    )?;
+            .subtract(&pos_mask)
+            .multiply(&neg_large),
+    );
     let neg_logits = sim_scaled.add(
         &Array::from_f32(1.0)
-            .subtract(&neg_mask)?
-            .multiply(&neg_large)?,
-    )?;
+            .subtract(&neg_mask)
+            .multiply(&neg_large),
+    );
 
     // LogSumExp over last axis for each row
-    let pos_lse = pos_logits.logsumexp_axis(-1, false)?; // [batch]
-    let neg_lse = neg_logits.logsumexp_axis(-1, false)?; // [batch]
+    let pos_lse = pos_logits.logsumexp_axis(-1, false); // [batch]
+    let neg_lse = neg_logits.logsumexp_axis(-1, false); // [batch]
 
     // Softplus: log(1 + exp(neg_lse - pos_lse))
-    let diff = neg_lse.subtract(&pos_lse)?;
+    let diff = neg_lse.subtract(&pos_lse);
     // softplus(x) = log(1 + exp(x)) — use log1p for numerical stability
     let loss = ops::log1p(&diff.exp());
-    loss.mean(None)
+    Ok(loss.mean(None))
 }
 
 /// Multiple Negatives Ranking Loss (MNRL).
@@ -156,9 +156,9 @@ pub fn cosine_similarity_loss(
     labels: &Array,
 ) -> Result<Array, Exception> {
     let sim = pairwise_cosine_similarity(embeddings_a, embeddings_b)?;
-    let labels_f = labels.as_dtype(Dtype::Float32)?;
-    let diff = sim.subtract(&labels_f)?;
-    diff.square()?.mean(None)
+    let labels_f = labels.as_dtype(Dtype::Float32.as_i32());
+    let diff = sim.subtract(&labels_f);
+    Ok(diff.square().mean(None))
 }
 
 // ---------------------------------------------------------------------------
@@ -169,23 +169,23 @@ pub fn cosine_similarity_loss(
 ///
 /// Returns `[batch]` of similarity values in `[-1, 1]`.
 pub(crate) fn pairwise_cosine_similarity(a: &Array, b: &Array) -> Result<Array, Exception> {
-    let dot = a.multiply(b)?.sum_axes(&[-1], false)?; // [batch]
-    let norm_a = a.square()?.sum_axes(&[-1], false)?.sqrt()?; // [batch]
-    let norm_b = b.square()?.sum_axes(&[-1], false)?.sqrt()?; // [batch]
-    let norms = norm_a.multiply(&norm_b)?;
+    let dot = a.multiply(b).sum_axes(&[-1], false); // [batch]
+    let norm_a = a.square().sum_axes(&[-1], false).sqrt(); // [batch]
+    let norm_b = b.square().sum_axes(&[-1], false).sqrt(); // [batch]
+    let norms = norm_a.multiply(&norm_b);
     let norms = ops::maximum(&norms, &Array::from_f32(1e-8));
-    dot.divide(&norms)
+    Ok(dot.divide(&norms))
 }
 
 /// Full pairwise cosine similarity matrix between two sets of embeddings.
 ///
 /// Returns `[batch_a, batch_b]` matrix.
 pub(crate) fn cosine_similarity_matrix(a: &Array, b: &Array) -> Result<Array, Exception> {
-    let norm_a = a.square()?.sum_axes(&[-1], true)?.sqrt()?;
-    let norm_b = b.square()?.sum_axes(&[-1], true)?.sqrt()?;
+    let norm_a = a.square().sum_axes(&[-1], true).sqrt();
+    let norm_b = b.square().sum_axes(&[-1], true).sqrt();
     let a_normed = a.divide(&ops::maximum(&norm_a, &Array::from_f32(1e-8)));
     let b_normed = b.divide(&ops::maximum(&norm_b, &Array::from_f32(1e-8)));
-    a_normed.matmul(&b_normed.transpose_axes(&[1, 0])?)
+    Ok(a_normed.matmul(&b_normed.transpose_axes(&[1, 0])))
 }
 
 /// Return a `[n, n]` float32 matrix that is 0.0 on the diagonal and 1.0 elsewhere.
@@ -232,7 +232,7 @@ mod tests {
         let a = Array::from_slice(&[1.0f32, 0.0, 0.0, 1.0, 0.0, 0.0], &[2, 3]);
         let sim = pairwise_cosine_similarity(&a, &a).unwrap();
         sim.eval().unwrap();
-        let flat = sim.flatten(None, None).unwrap();
+        let flat = sim.flatten(0, -1);
         let v0: f32 = flat.index(0).item();
         let v1: f32 = flat.index(1).item();
         assert!((v0 - 1.0).abs() < 1e-5);

@@ -7,10 +7,9 @@
 //! - Checkpoint saving
 
 use pmetal_bridge::compat::{
-    Array,
-    Exception,
+    Array, Exception,
+    indexing::IndexOp,
     ops,
-    ops::indexing::IndexOp,
     optimizers::{AdamW, AdamWBuilder},
 };
 use pmetal_core::{EvalMetrics, TrainingConfig};
@@ -123,32 +122,22 @@ impl SftTrainer {
         labels: &Array,
         attention_mask: Option<&Array>,
     ) -> Result<Array> {
-        // Shift logits and labels for causal LM
-        let seq_len = logits.dim(1);
-        let vocab_size = logits.dim(2);
-
-        // Shift: logits[:-1] predicts labels[1:]
-        let shift_logits = logits.index((.., ..seq_len - 1, ..));
-        let shift_labels = labels.index((.., 1..));
-
-        // Reshape for cross entropy: [batch * seq_len, vocab_size] and [batch * seq_len]
-        let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-        let flat_labels = shift_labels.reshape(&[-1])?;
-
-        // Compute cross entropy loss with ignore_index=-100
-        let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
-
-        // Apply attention mask if provided
         if let Some(mask) = attention_mask {
-            let shift_mask = mask.index((.., 1..));
-            let flat_mask = shift_mask.reshape(&[-1])?;
-            let masked_loss = loss.multiply(&flat_mask)?;
-            let total_loss = masked_loss.sum(None)?;
-            let num_tokens = flat_mask.sum(None)?;
-            let safe_num_tokens = ops::maximum(&num_tokens, &Array::from_f32(1.0))?;
-            Ok(total_loss.divide(&safe_num_tokens)?)
+            let mask_dtype = mask.dtype_raw();
+            let zero = Array::from_int(0).as_dtype(mask_dtype);
+            let cond = mask.ne(&zero);
+            let ignore = Array::from_int(-100).as_dtype(labels.dtype_raw());
+            let ignore_full = ops::broadcast_to(&ignore, &labels.shape());
+            let masked_labels = ops::where_fn(&cond, labels, &ignore_full);
+            Ok(pmetal_bridge::training::causal_lm_loss(
+                logits,
+                &masked_labels,
+                -100,
+            ))
         } else {
-            Ok(loss.mean(None)?)
+            Ok(pmetal_bridge::training::causal_lm_loss(
+                logits, labels, -100,
+            ))
         }
     }
 
@@ -183,7 +172,8 @@ impl SftTrainer {
         let logits = forward_fn(&lora_refs, input_ids, pixel_values)?;
         let loss = self.compute_loss(&logits, labels, None)?;
 
-        loss.eval()?;
+        let mut loss = loss;
+        loss.eval();
         let loss_value = loss.item_f32() as f64;
 
         self.state.step += 1;
@@ -201,9 +191,10 @@ impl SftTrainer {
         // Compute global gradient norm
         let mut total_norm_sq = 0.0;
         for grad in grads.iter() {
-            grad.eval()?;
-            let norm_sq = grad.multiply(grad)?.sum(None)?;
-            norm_sq.eval()?;
+            let mut grad_eval = grad.clone();
+            grad_eval.eval();
+            let mut norm_sq = grad.multiply(grad).sum(None);
+            norm_sq.eval();
             total_norm_sq += norm_sq.item_f32() as f64;
         }
         let total_norm = total_norm_sq.sqrt();
@@ -213,7 +204,7 @@ impl SftTrainer {
             let scale = self.config.max_grad_norm / total_norm;
             for grad in grads.iter_mut() {
                 let scale_arr = Array::from_f32(scale as f32);
-                *grad = grad.multiply(&scale_arr)?;
+                *grad = grad.multiply(&scale_arr);
             }
         }
 
@@ -264,14 +255,14 @@ impl SftTrainer {
             let d_logits = logits.index((.., ..seq_len - shift as i32, ..));
             let d_labels = labels.index((.., shift as i32..));
 
-            let flat_logits = d_logits.reshape(&[-1, vocab_size])?;
-            let flat_labels = d_labels.reshape(&[-1])?;
+            let flat_logits = d_logits.reshape(&[-1, vocab_size]);
+            let flat_labels = d_labels.reshape(&[-1]);
 
             let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
-            let mean_loss = loss.mean(None)?;
+            let mean_loss = loss.mean(None);
 
-            let weighted_loss = mean_loss.multiply(&Array::from_f32(weight))?;
-            total_loss = total_loss.add(&weighted_loss)?;
+            let weighted_loss = mean_loss.multiply(&Array::from_f32(weight));
+            total_loss = total_loss.add(&weighted_loss);
         }
 
         Ok(total_loss)
@@ -371,19 +362,19 @@ pub fn lm_loss(logits: &Array, labels: &Array, ignore_index: i64) -> Result<Arra
     let shift_labels = labels.index((.., 1..));
 
     // Reshape for cross entropy
-    let flat_logits = shift_logits.reshape(&[-1, vocab_size])?;
-    let flat_labels = shift_labels.reshape(&[-1])?;
+    let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
+    let flat_labels = shift_labels.reshape(&[-1]);
 
     // Compute cross entropy loss
     let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(ignore_index), 0.0)?;
 
-    Ok(loss.mean(None)?)
+    Ok(loss.mean(None))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_bridge::compat::{random, ops::zeros};
+    use pmetal_bridge::compat::{ops::zeros, random};
 
     #[test]
     fn test_trainer_creation() {

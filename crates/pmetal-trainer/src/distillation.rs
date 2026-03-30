@@ -120,7 +120,7 @@ impl DistillationTrainer {
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
 
         // Use Metal FlashAttention if available
-        let (loss, grads) = if self.loop_state.metal_fa_available {
+        let (mut loss, grads) = if self.loop_state.metal_fa_available {
             let result = with_training_mode(|| {
                 loss_and_grad_fn(student, (&batch.input_ids, &batch.labels, &teacher_logits))
                     .map_err(|e| pmetal_mlx::error::MlxError::from(e))
@@ -367,7 +367,7 @@ impl DistillationTrainer {
             };
 
             // step=0, total_steps=1: eval does not use progressive scheduling.
-            let output: DistillLossOutput = self
+            let mut output: DistillLossOutput = self
                 .distiller
                 .compute_loss(&teacher_logits, &student_logits, labels_opt, None, 0, 1)
                 .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;

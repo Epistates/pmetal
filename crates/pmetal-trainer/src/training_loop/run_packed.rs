@@ -133,7 +133,7 @@ impl TrainingLoop {
 
         // Execute warmup step - this initializes optimizer momentum/velocity buffers
         let max_grad_norm = self.config.training.max_grad_norm as f32;
-        let warmup_loss = if self.config.use_cut_cross_entropy {
+        let mut warmup_loss = if self.config.use_cut_cross_entropy {
             jit_training_step_packed_cce(&mut state, &warmup_batch, max_grad_norm)?
         } else {
             jit_training_step_packed(&mut state, &warmup_batch, max_grad_norm)?
@@ -193,7 +193,7 @@ impl TrainingLoop {
                 state.1.set_learning_rate(scheduled_lr);
 
                 // Execute packed training step (forward + backward + optimizer update)
-                let loss = if self.config.use_cut_cross_entropy {
+                let mut loss = if self.config.use_cut_cross_entropy {
                     jit_training_step_packed_cce(&mut state, &packed_batch, max_grad_norm)?
                 } else {
                     jit_training_step_packed(&mut state, &packed_batch, max_grad_norm)?
@@ -227,7 +227,7 @@ impl TrainingLoop {
                     let saved_step = self.step;
                     let batch_size = accumulated_losses.len();
                     let mut adaptive_action = AdaptiveAction::Continue;
-                    for (i, loss) in accumulated_losses.iter().enumerate() {
+                    for (i, loss) in accumulated_losses.iter_mut().enumerate() {
                         let loss_val = loss.item_f32();
                         self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         self.step = saved_step - batch_size + i;
@@ -344,7 +344,7 @@ impl TrainingLoop {
                     // Eval any pending losses before checkpointing
                     if !accumulated_losses.is_empty() {
                         eval_training_state(&accumulated_losses, &state)?;
-                        for loss in &accumulated_losses {
+                        for loss in &mut accumulated_losses {
                             let loss_val = loss.item_f32();
                             self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
                         }
@@ -373,7 +373,7 @@ impl TrainingLoop {
         // Eval any remaining accumulated losses at end of training
         if !accumulated_losses.is_empty() {
             eval_training_state(&accumulated_losses, &state)?;
-            for loss in &accumulated_losses {
+            for loss in &mut accumulated_losses {
                 let loss_val = loss.item_f32();
                 self.running_loss = 0.99 * self.running_loss + 0.01 * loss_val as f64;
             }

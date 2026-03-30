@@ -119,8 +119,9 @@ impl DistributedGradientSync {
         for (name, _shape, count) in &self.param_layout {
             if let Some(arr) = grads.get(name) {
                 // Evaluate the gradient array to materialized f32 values
-                arr.eval();
-                let arr_f32 = arr.as_dtype(Dtype::Float32.as_i32());
+                let mut arr_eval = arr.clone();
+                arr_eval.eval();
+                let mut arr_f32 = arr_eval.as_dtype(Dtype::Float32.as_i32());
                 arr_f32.eval();
 
                 // Copy data from MLX Array into our flat buffer
@@ -259,27 +260,19 @@ pub async fn create_distributed_context(
 
         let backend = pmetal_distributed::AutoDiscoveryBackend::with_config(auto_config)
             .await
-            .map_err(|e| {
-                SftError::Mlx(Exception::custom(format!(
-                    "auto-discovery failed: {e}"
-                )))
-            })?;
+            .map_err(|e| SftError::Mlx(Exception::custom(format!("auto-discovery failed: {e}"))))?;
 
         tracing::info!("Waiting for peers via mDNS auto-discovery...");
         let peer_count = backend
             .wait_for_peers(1, std::time::Duration::from_secs(60))
             .await
             .map_err(|e| {
-                SftError::Mlx(Exception::custom(format!(
-                    "peer discovery timeout: {e}"
-                )))
+                SftError::Mlx(Exception::custom(format!("peer discovery timeout: {e}")))
             })?;
         tracing::info!("Found {} peers, establishing ring...", peer_count);
 
         backend.establish_ring().await.map_err(|e| {
-            SftError::Mlx(Exception::custom(format!(
-                "ring establishment failed: {e}"
-            )))
+            SftError::Mlx(Exception::custom(format!("ring establishment failed: {e}")))
         })?;
 
         Ok(Arc::new(DistributedContext::with_metrics(
@@ -309,11 +302,7 @@ pub async fn create_distributed_context(
         let dist_config = pmetal_distributed::DistributedConfig::new(nodes, rank);
         let backend = pmetal_distributed::RingBackend::new(dist_config)
             .await
-            .map_err(|e| {
-                SftError::Mlx(Exception::custom(format!(
-                    "ring backend failed: {e}"
-                )))
-            })?;
+            .map_err(|e| SftError::Mlx(Exception::custom(format!("ring backend failed: {e}"))))?;
 
         Ok(Arc::new(DistributedContext::with_metrics(
             Box::new(backend),

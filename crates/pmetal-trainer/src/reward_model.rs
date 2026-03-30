@@ -34,7 +34,8 @@
 //! ).unwrap();
 //! ```
 
-use pmetal_bridge::compat::{Array, ops, ops::indexing::IndexOp};
+use pmetal_bridge::compat::{Array, indexing::IndexOp, ops};
+use pmetal_bridge::inline_array;
 use pmetal_data::Tokenizer;
 use std::path::Path;
 use std::sync::Mutex;
@@ -268,8 +269,14 @@ impl MLRewardModel {
             .collect();
 
         for sf_path in &sf_paths {
-            match Array::load_safetensors(sf_path) {
-                Ok(tensors) => {
+            let sf_path_str = match sf_path.to_str() {
+                Some(s) => s,
+                None => continue,
+            };
+            match inline_array::load_safetensors_shard(sf_path_str) {
+                Some(tensors) => {
+                    let tensors: std::collections::HashMap<String, Array> =
+                        tensors.into_iter().collect();
                     // ArmoRM / Skywork: "score.weight"
                     // Some models wrap under "model.score.weight"
                     let weight = tensors
@@ -286,8 +293,8 @@ impl MLRewardModel {
                         return (weight, bias);
                     }
                 }
-                Err(e) => {
-                    tracing::warn!("Failed to probe score head in {}: {}", sf_path.display(), e);
+                None => {
+                    tracing::warn!("Failed to probe score head in {}", sf_path.display());
                 }
             }
         }
@@ -371,24 +378,17 @@ impl MLRewardModel {
                 // score.weight shape from HF: [out_features=1, in_features=hidden_dim].
                 // Transpose to [hidden_dim, 1] for matmul [1, hidden_dim] × [hidden_dim, 1].
                 let w = self.score_weight.as_ref().unwrap();
-                let w_t = w.transpose_axes(&[1, 0]).map_err(|e| {
-                    GrpoError::Reward(format!("Score head transpose failed: {}", e))
-                })?;
+                let w_t = w.transpose_axes(&[1, 0]);
                 // [1, vocab_size] × [vocab_size, 1] → [1, 1]
-                let score = ops::matmul(&last_token_vec, &w_t)
-                    .map_err(|e| GrpoError::Reward(format!("Score head matmul failed: {}", e)))?;
+                let mut score = ops::matmul(&last_token_vec, &w_t);
 
-                let score = if let Some(b) = &self.score_bias {
-                    score
-                        .add(b)
-                        .map_err(|e| GrpoError::Reward(format!("Score bias add failed: {}", e)))?
+                let mut score = if let Some(b) = &self.score_bias {
+                    score.add(b)
                 } else {
                     score
                 };
 
-                score
-                    .eval()
-                    .map_err(|e| GrpoError::Reward(format!("Score eval failed: {}", e)))?;
+                score.eval();
                 score.item::<f32>() as f64
             }
 
@@ -397,11 +397,8 @@ impl MLRewardModel {
                 // logits as a heuristic scalar reward.
                 // Shape: [1, vocab_size] → scalar
                 let last_token_logits = logits.index((.., -1i32, ..));
-                let mean = last_token_logits
-                    .mean(None)
-                    .map_err(|e| GrpoError::Reward(format!("Mean logits failed: {}", e)))?;
-                mean.eval()
-                    .map_err(|e| GrpoError::Reward(format!("Mean eval failed: {}", e)))?;
+                let mut mean = last_token_logits.mean(None);
+                mean.eval();
                 mean.item::<f32>() as f64
             }
         };

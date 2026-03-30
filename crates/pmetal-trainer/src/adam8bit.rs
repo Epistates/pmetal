@@ -45,7 +45,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops::indexing::IndexOp};
+use pmetal_bridge::compat::{Array, Dtype, Exception, indexing::IndexOp};
 type Result<T> = std::result::Result<T, Exception>;
 
 /// Error type for 8-bit Adam operations.
@@ -368,9 +368,6 @@ impl Adam8bit {
             "apply_update called with step=0; call update_single() or update() instead"
         );
 
-        gradient.eval();
-        parameter.eval();
-
         // Validate dtypes — quantization assumes Float32
         if gradient.dtype_raw() != Dtype::Float32.as_i32() {
             return Err(Exception::custom(format!(
@@ -397,8 +394,8 @@ impl Adam8bit {
         }
 
         // Flatten arrays for vectorized operations
-        let flat_grad = gradient.flatten(None, None)?;
-        let flat_param = parameter.flatten(None, None)?;
+        let flat_grad = gradient.flatten(0, -1);
+        let flat_param = parameter.flatten(0, -1);
 
         // Bias correction terms (step is already >= 1 by the time we get here).
         // Clamp to i32::MAX to prevent truncation on very long runs (>2.1B steps).
@@ -429,7 +426,7 @@ impl Adam8bit {
         // Vectorized moment updates: m = beta1 * m + (1 - beta1) * g
         let beta1_arr = Array::from_f32(self.config.beta1);
         let one_minus_beta1 = Array::from_f32(1.0 - self.config.beta1);
-        let m_new = m_array
+        let mut m_new = m_array
             .multiply(&beta1_arr)
             .add(&flat_grad.multiply(&one_minus_beta1));
 
@@ -437,7 +434,7 @@ impl Adam8bit {
         let beta2_arr = Array::from_f32(self.config.beta2);
         let one_minus_beta2 = Array::from_f32(1.0 - self.config.beta2);
         let grad_sq = flat_grad.multiply(&flat_grad);
-        let v_new = v_array
+        let mut v_new = v_array
             .multiply(&beta2_arr)
             .add(&grad_sq.multiply(&one_minus_beta2));
 
@@ -455,7 +452,7 @@ impl Adam8bit {
         let update = m_hat.divide(&denom).multiply(&lr_arr);
 
         // Apply weight decay (AdamW-style) and update parameter
-        let param_new = if self.config.weight_decay > 0.0 {
+        let mut param_new = if self.config.weight_decay > 0.0 {
             let wd_factor = Array::from_f32(1.0 - self.config.lr * self.config.weight_decay);
             flat_param.multiply(&wd_factor).subtract(&update)
         } else {
@@ -489,7 +486,7 @@ impl Adam8bit {
         );
 
         // Update parameter
-        *parameter = param_new.reshape(&shape)?;
+        *parameter = param_new.reshape(&shape);
 
         Ok(())
     }
@@ -500,8 +497,7 @@ impl Adam8bit {
     /// Debug-asserts that the array is Float32. In release builds, a dtype
     /// mismatch would produce garbage data.
     fn array_to_vec(&self, arr: &Array) -> Result<Vec<f32>> {
-        arr.eval();
-        let flat = arr.flatten(None, None);
+        let mut flat = arr.flatten(0, -1);
         flat.eval();
         debug_assert_eq!(
             flat.dtype_raw(),

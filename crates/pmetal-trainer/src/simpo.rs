@@ -27,7 +27,9 @@
 //! - "SimPO: Simple Preference Optimization with a Reference-Free Reward"
 //!   (Meng et al., 2024)
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, nn, ops, ops::indexing::IndexOp, optimizers::Optimizer};
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, indexing::IndexOp, nn, ops, optimizers::Optimizer,
+};
 use pmetal_core::{StepMetrics, TrainingCallback, TrainingConfig};
 use pmetal_lora::TrainableModel;
 use std::time::Instant;
@@ -265,11 +267,11 @@ impl SimpoTrainer {
     /// Compute sequence-level reward (length-normalized or summed).
     pub fn compute_rewards(&self, per_token_logps: &Array, mask: &Array) -> SimpoResult<Array> {
         let masked_logps = per_token_logps.multiply(mask);
-        let sum_logps = masked_logps.sum_axis(-1, None)?;
+        let sum_logps = masked_logps.sum_axis(-1, false);
 
         if self.config.length_norm {
             // Length-normalized: avg log prob
-            let lengths = mask.sum_axis(-1, None)?;
+            let lengths = mask.sum_axis(-1, false);
             let eps = Array::from_f32(1e-8);
             let lengths_safe = lengths.add(&eps);
             Ok(sum_logps.divide(&lengths_safe))
@@ -319,7 +321,7 @@ impl SimpoTrainer {
             SimpoLossType::Ipo => {
                 // (margin - 1)^2
                 let one = Array::from_f32(1.0);
-                margin.subtract(&one).square()?
+                margin.subtract(&one).square()
             }
         };
 
@@ -340,12 +342,12 @@ impl SimpoTrainer {
                 }
                 SimpoLossType::Ipo => {
                     let one = Array::from_f32(1.0);
-                    flipped_margin.subtract(&one).square()?
+                    flipped_margin.subtract(&one).square()
                 }
             };
 
             loss.multiply(&one_minus_smooth)
-                .add(&flipped_loss.multiply(&smooth))?
+                .add(&flipped_loss.multiply(&smooth))
         } else {
             loss
         };
@@ -379,7 +381,7 @@ impl SimpoTrainer {
                 // Minimizing this encourages policy to stay close to reference
                 let kl = chosen_logps.subtract(ref_logps);
                 let masked_kl = kl.multiply(chosen_mask);
-                let mean_kl = masked_kl.sum(None).divide(&chosen_mask.sum(None))?;
+                let mean_kl = masked_kl.sum(None).divide(&chosen_mask.sum(None));
                 let alpha = Array::from_f32(self.config.cpo_alpha as f32);
                 let cpo = mean_kl.multiply(&alpha);
                 total_loss = total_loss.add(&cpo);
@@ -395,7 +397,7 @@ impl SimpoTrainer {
         let sft_loss = if self.config.sft_weight > 0.0 {
             // Negative log likelihood on chosen
             let masked_nll = chosen_logps.negative().multiply(chosen_mask);
-            let mean_nll = masked_nll.sum(None).divide(&chosen_mask.sum(None))?;
+            let mean_nll = masked_nll.sum(None).divide(&chosen_mask.sum(None));
             let weight = Array::from_f32(self.config.sft_weight as f32);
             let sft = mean_nll.multiply(&weight);
             total_loss = total_loss.add(&sft);
@@ -406,6 +408,10 @@ impl SimpoTrainer {
 
         // Evaluate for metrics
         total_loss.eval();
+        let mut simpo_loss = simpo_loss;
+        let mut chosen_rewards = chosen_rewards;
+        let mut rejected_rewards = rejected_rewards;
+        let mut margin = margin;
         simpo_loss.eval();
         chosen_rewards.eval();
         rejected_rewards.eval();
@@ -415,55 +421,38 @@ impl SimpoTrainer {
             loss: total_loss.item_f32(),
             simpo_loss: simpo_loss.item_f32(),
             cpo_loss: cpo_loss
-                .map(|l| {
-                    l.eval().ok();
+                .map(|mut l| {
+                    l.eval();
                     l.item_f32()
                 })
                 .unwrap_or(0.0),
             sft_loss: sft_loss
-                .map(|l| {
-                    l.eval().ok();
+                .map(|mut l| {
+                    l.eval();
                     l.item_f32()
                 })
                 .unwrap_or(0.0),
-            chosen_reward: chosen_rewards
-                .mean(None)
-                .ok()
-                .map(|m| {
-                    m.eval().ok();
-                    m.item_f32()
-                })
-                .unwrap_or(0.0),
-            rejected_reward: rejected_rewards
-                .mean(None)
-                .ok()
-                .map(|m| {
-                    m.eval().ok();
-                    m.item_f32()
-                })
-                .unwrap_or(0.0),
-            margin: margin
-                .mean(None)
-                .ok()
-                .map(|m| {
-                    m.eval().ok();
-                    m.item_f32()
-                })
-                .unwrap_or(0.0),
-            accuracy: (margin
-                .gt(&Array::from_f32(0.0))
-                .ok()
-                .map(|m| {
-                    m.as_dtype(Dtype::Float32.as_i32())
-                        .ok()
-                        .and_then(|m| m.mean(None).ok())
-                        .map(|m| {
-                            m.eval().ok();
-                            m.item_f32()
-                        })
-                        .unwrap_or(0.0)
-                })
-                .unwrap_or(0.0)),
+            chosen_reward: {
+                let mut mean = chosen_rewards.mean(None);
+                mean.eval();
+                mean.item_f32()
+            },
+            rejected_reward: {
+                let mut mean = rejected_rewards.mean(None);
+                mean.eval();
+                mean.item_f32()
+            },
+            margin: {
+                let mut mean = margin.mean(None);
+                mean.eval();
+                mean.item_f32()
+            },
+            accuracy: {
+                let correct = margin.gt(&Array::from_f32(0.0));
+                let mut mean = correct.as_dtype(Dtype::Float32.as_i32()).mean(None);
+                mean.eval();
+                mean.item_f32()
+            },
         };
 
         Ok((total_loss, metrics))
@@ -597,7 +586,7 @@ impl SimpoTrainer {
                     Ok(total_loss)
                 };
 
-                let (loss, grads) = {
+                let (mut loss, grads) = {
                     let mut loss_and_grad = nn::value_and_grad(loss_fn);
                     loss_and_grad(policy_model, ())?
                 };
@@ -605,10 +594,10 @@ impl SimpoTrainer {
                 loss.eval();
 
                 let (
-                    simpo_loss,
-                    chosen_rewards,
-                    rejected_rewards,
-                    margin,
+                    mut simpo_loss,
+                    mut chosen_rewards,
+                    mut rejected_rewards,
+                    mut margin,
                     cpo_loss_opt,
                     sft_loss_opt,
                 ) = metrics_cell
@@ -619,26 +608,28 @@ impl SimpoTrainer {
                 rejected_rewards.eval();
                 margin.eval();
 
-                let chosen_reward_mean = chosen_rewards.mean(None);
-                let rejected_reward_mean = rejected_rewards.mean(None);
-                let margin_mean = margin.mean(None);
+                let mut chosen_reward_mean = chosen_rewards.mean(None);
+                let mut rejected_reward_mean = rejected_rewards.mean(None);
+                let mut margin_mean = margin.mean(None);
                 chosen_reward_mean.eval();
                 rejected_reward_mean.eval();
                 margin_mean.eval();
 
-                let accuracy = margin
-                    .gt(&Array::from_f32(0.0))?
+                let mut accuracy = margin
+                    .gt(&Array::from_f32(0.0))
                     .as_dtype(Dtype::Float32.as_i32())
                     .mean(None);
                 accuracy.eval();
 
                 let cpo_loss_val = if let Some(cpo) = cpo_loss_opt {
+                    let mut cpo = cpo;
                     cpo.eval();
                     cpo.item_f32()
                 } else {
                     0.0
                 };
                 let sft_loss_val = if let Some(sft) = sft_loss_opt {
+                    let mut sft = sft;
                     sft.eval();
                     sft.item_f32()
                 } else {
@@ -778,7 +769,7 @@ impl SimpoTrainer {
         let (logps_array, _valid_mask) =
             crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
         let target_mask_f32 = target_mask.as_dtype(Dtype::Float32.as_i32());
-        logps_array.multiply(&target_mask_f32)
+        Ok(logps_array.multiply(&target_mask_f32))
     }
 
     #[allow(dead_code)] // Convenience wrapper for testing without a full trainer instance
@@ -837,12 +828,12 @@ impl SimpoTrainer {
         // --- Compute length-normalized rewards ---
         let compute_rewards = |logps: &Array, mask: &Array| -> Result<Array, Exception> {
             let masked_logps = logps.multiply(mask);
-            let sum_logps = masked_logps.sum_axis(-1, None)?;
+            let sum_logps = masked_logps.sum_axis(-1, false);
             if config.length_norm {
-                let lengths = mask.sum_axis(-1, None)?;
+                let lengths = mask.sum_axis(-1, false);
                 let eps = Array::from_f32(1e-8);
                 let lengths_safe = lengths.add(&eps);
-                sum_logps.divide(&lengths_safe)
+                Ok(sum_logps.divide(&lengths_safe))
             } else {
                 Ok(sum_logps)
             }
@@ -871,7 +862,7 @@ impl SimpoTrainer {
             }
             SimpoLossType::Ipo => {
                 let one = Array::from_f32(1.0);
-                margin.subtract(&one).square()?
+                margin.subtract(&one).square()
             }
         };
 
@@ -890,11 +881,11 @@ impl SimpoTrainer {
                 }
                 SimpoLossType::Ipo => {
                     let one = Array::from_f32(1.0);
-                    flipped_margin.subtract(&one).square()?
+                    flipped_margin.subtract(&one).square()
                 }
             };
             loss.multiply(&one_minus_smooth)
-                .add(&flipped_loss.multiply(&smooth))?
+                .add(&flipped_loss.multiply(&smooth))
         } else {
             loss
         };
@@ -907,7 +898,7 @@ impl SimpoTrainer {
             if let Some(ref_logps) = ref_chosen_logps {
                 let kl = chosen_logps.subtract(ref_logps);
                 let masked_kl = kl.multiply(chosen_mask);
-                let mean_kl = masked_kl.sum(None).divide(&chosen_mask.sum(None))?;
+                let mean_kl = masked_kl.sum(None).divide(&chosen_mask.sum(None));
                 let alpha = Array::from_f32(config.cpo_alpha as f32);
                 let cpo = mean_kl.multiply(&alpha);
                 total_loss = total_loss.add(&cpo);
@@ -922,7 +913,7 @@ impl SimpoTrainer {
         // SFT auxiliary loss
         let sft_loss = if config.sft_weight > 0.0 {
             let masked_nll = chosen_logps.negative().multiply(chosen_mask);
-            let mean_nll = masked_nll.sum(None).divide(&chosen_mask.sum(None))?;
+            let mean_nll = masked_nll.sum(None).divide(&chosen_mask.sum(None));
             let weight = Array::from_f32(config.sft_weight as f32);
             let sft = mean_nll.multiply(&weight);
             total_loss = total_loss.add(&sft);

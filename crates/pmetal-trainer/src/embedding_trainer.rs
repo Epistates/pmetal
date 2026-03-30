@@ -30,7 +30,7 @@
 use std::collections::HashMap;
 
 use pmetal_bridge::compat::{
-    Array, Exception, module::ModuleParameters, nn, optimizers::Optimizer, eval_params,
+    Array, Exception, eval_params, module::ModuleParameters, nn, optimizers::Optimizer,
 };
 use pmetal_core::{EvalMetrics, TrainingCallback, TrainingConfig};
 use pmetal_data::{EmbeddingDataset, EmbeddingPair, EmbeddingTriplet, Tokenizer};
@@ -317,7 +317,7 @@ impl EmbeddingTrainer {
                 };
 
                 let mut loss_and_grad = nn::value_and_grad(loss_fn);
-                let (loss, grads) =
+                let (mut loss, grads) =
                     loss_and_grad(model, (&ids_a, &mask_a, &ids_b, &mask_b, &labels))
                         .map_err(EmbeddingTrainerError::Mlx)?;
 
@@ -432,7 +432,7 @@ impl EmbeddingTrainer {
                 };
 
                 let mut loss_and_grad = nn::value_and_grad(loss_fn);
-                let (loss, grads) =
+                let (mut loss, grads) =
                     loss_and_grad(model, (&ids_a, &mask_a, &ids_p, &mask_p, &ids_n, &mask_n))
                         .map_err(EmbeddingTrainerError::Mlx)?;
 

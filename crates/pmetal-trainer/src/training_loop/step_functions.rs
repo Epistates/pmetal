@@ -1,6 +1,9 @@
 use pmetal_bridge::compat::{
-    Array, Dtype, Exception, losses::CrossEntropy, nn, ops, ops::indexing::IndexOp,
-    optimizers::{Optimizer, Updatable}, transforms,
+    Array, Exception,
+    module::{ModuleParameters, ModuleParametersExt},
+    nn, ops,
+    optimizers::{Optimizer, Updatable},
+    transforms,
 };
 use pmetal_data::PackedTrainingBatch;
 use pmetal_lora::TrainableModel;
@@ -27,10 +30,6 @@ pub(crate) fn jit_training_step_inner<M: TrainableModel, O: Optimizer>(
 ) -> std::result::Result<Array, Exception> {
     let (model, optimizer) = state;
 
-    // Construct CrossEntropy once per step rather than inside the closure so
-    // that repeated calls (e.g. gradient-accumulation steps) don't re-allocate.
-    let ce = CrossEntropy::new();
-
     // Define loss function that will be used by value_and_grad
     let loss_fn = |model: &mut M,
                    (input_ids, labels): (&Array, &Array)|
@@ -45,31 +44,9 @@ pub(crate) fn jit_training_step_inner<M: TrainableModel, O: Optimizer>(
                 .map_err(|e| Exception::custom(e.to_string()))?
         };
 
-        // Compute cross-entropy loss with shifted labels for causal LM
-        let seq_len = logits.dim(1);
-        let vocab_size = logits.dim(2);
-
-        // Shift: logits[:-1] predicts labels[1:]
-        let shift_logits = logits.index((.., ..seq_len - 1, ..));
-        let shift_labels = labels.index((.., 1..));
-
-        let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
-        let flat_labels = shift_labels.reshape(&[-1]);
-
-        // Use CrossEntropy directly - it handles the logsumexp internally
-        // Note: We need to handle ignore_index=-100 separately
-        let per_token_loss = ce.apply(&flat_logits, &flat_labels);
-
-        // Mask out ignored tokens (label == -100) and compute mean
-        // Cast ignore value to match labels dtype (may be i32 or i64)
-        let ignore_val = Array::from_int(-100_i32).as_dtype(flat_labels.dtype_raw());
-        let ignore_mask = flat_labels.ne(&ignore_val);
-        let ignore_mask_f32 = ignore_mask.as_dtype(Dtype::Float32.as_i32());
-        let masked_loss = per_token_loss.multiply(&ignore_mask_f32);
-        let valid_count = ignore_mask_f32.sum(None);
-        // Guard against division by zero when all tokens are masked (-100)
-        let safe_count = ops::maximum(&valid_count, &Array::from_f32(1.0));
-        Ok(masked_loss.sum(None).divide(&safe_count))
+        Ok(pmetal_bridge::training::causal_lm_loss(
+            &logits, labels, -100,
+        ))
     };
 
     // Compute loss and gradients
@@ -114,9 +91,6 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
         None
     };
 
-    // Construct CrossEntropy once per step rather than inside the closure.
-    let ce = CrossEntropy::new();
-
     // Define loss function that will be used by value_and_grad
     // Use IDENTICAL loss computation as regular training for consistency
     let loss_fn = |model: &mut M,
@@ -128,31 +102,9 @@ pub(crate) fn jit_training_step_packed<M: TrainableModel, O: Optimizer>(
             .forward_with_positions(input_ids, attn_mask_4d.as_ref(), &position_ids)
             .map_err(|e| Exception::custom(e.to_string()))?;
 
-        // For packed sequences, labels already have boundary tokens masked as -100
-        // We still need to shift for causal LM prediction
-        let seq_len = logits.dim(1);
-        let vocab_size = logits.dim(2);
-
-        // Shift: logits[:-1] predicts labels[1:]
-        let shift_logits = logits.index((.., ..seq_len - 1, ..));
-        let shift_labels = labels.index((.., 1..));
-
-        let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
-        let flat_labels = shift_labels.reshape(&[-1]);
-
-        // Use CrossEntropy directly - SAME as regular training
-        let per_token_loss = ce.apply(&flat_logits, &flat_labels);
-
-        // Mask out ignored tokens (label == -100) and compute mean
-        // Match ignore_index dtype to labels dtype to avoid silent type promotion issues
-        let ignore_idx = Array::from_int(-100).as_dtype(flat_labels.dtype_raw());
-        let ignore_mask = flat_labels.ne(&ignore_idx);
-        let ignore_mask_f32 = ignore_mask.as_dtype(Dtype::Float32.as_i32());
-        let masked_loss = per_token_loss.multiply(&ignore_mask_f32);
-        let valid_count = ignore_mask_f32.sum(None);
-        // Guard against division by zero when all tokens are masked (-100)
-        let safe_count = ops::maximum(&valid_count, &Array::from_f32(1.0));
-        Ok(masked_loss.sum(None).divide(&safe_count))
+        Ok(pmetal_bridge::training::causal_lm_loss(
+            &logits, labels, -100,
+        ))
     };
 
     // Compute loss and gradients.
@@ -250,21 +202,9 @@ pub(crate) fn jit_training_step_cce<M: TrainableModel, O: Optimizer>(
                     let logits = model
                         .forward(input_ids, None)
                         .map_err(|e| Exception::custom(e.to_string()))?;
-                    let seq_len = logits.dim(1);
-                    let vocab_size = logits.dim(2);
-                    let shift_logits = logits.index((.., ..seq_len - 1, ..));
-                    let shift_labels = labels.index((.., 1..));
-                    let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
-                    let flat_labels = shift_labels.reshape(&[-1]);
-                    let ce = CrossEntropy::new();
-                    let per_token_loss = ce.apply(&flat_logits, &flat_labels);
-                    let ignore_val = Array::from_int(-100_i32).as_dtype(flat_labels.dtype_raw());
-                    let ignore_mask = flat_labels.ne(&ignore_val);
-                    let ignore_mask_f32 = ignore_mask.as_dtype(Dtype::Float32.as_i32());
-                    let masked_loss = per_token_loss.multiply(&ignore_mask_f32);
-                    let valid_count = ignore_mask_f32.sum(None);
-                    let safe_count = ops::maximum(&valid_count, &Array::from_f32(1.0));
-                    Ok(masked_loss.sum(None).divide(&safe_count))
+                    Ok(pmetal_bridge::training::causal_lm_loss(
+                        &logits, labels, -100,
+                    ))
                 }
             }
         };
@@ -336,25 +276,9 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
                     let logits = model
                         .forward_with_positions(input_ids, attn_mask_4d.as_ref(), &position_ids)
                         .map_err(|e| Exception::custom(e.to_string()))?;
-                    let seq_len = logits.dim(1);
-                    let vocab_size = logits.dim(2);
-                    let shift_logits = logits.index((.., ..seq_len - 1, ..));
-                    let shift_labels = labels.index((.., 1..));
-                    let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
-                    let flat_labels = shift_labels.reshape(&[-1]);
-                    let ce = CrossEntropy::new();
-                    let per_token_loss = ce.apply(&flat_logits, &flat_labels);
-                    let ignore_idx = if flat_labels.dtype_raw() == Dtype::Int64.as_i32() {
-                        Array::from_i64_slice(&[-100_i64], &[1])
-                    } else {
-                        Array::from_i32_slice(&[-100_i32], &[1])
-                    };
-                    let ignore_mask = flat_labels.ne(&ignore_idx);
-                    let ignore_mask_f32 = ignore_mask.as_dtype(Dtype::Float32.as_i32());
-                    let masked_loss = per_token_loss.multiply(&ignore_mask_f32);
-                    let valid_count = ignore_mask_f32.sum(None);
-                    let safe_count = ops::maximum(&valid_count, &Array::from_f32(1.0));
-                    Ok(masked_loss.sum(None).divide(&safe_count))
+                    Ok(pmetal_bridge::training::causal_lm_loss(
+                        &logits, labels, -100,
+                    ))
                 }
             }
         };
@@ -392,14 +316,15 @@ pub(crate) fn jit_training_step_packed_cce<M: TrainableModel, O: Optimizer>(
 /// unbounded in deferred-eval mode. Evaluating only the losses (as prior
 /// code did) leaves params and optimizer states (momentum, velocity) as
 /// lazy nodes, causing Metal resource exhaustion on long runs.
-pub(crate) fn eval_training_state<M: Updatable, O: Updatable>(
+pub(crate) fn eval_training_state<M: ModuleParameters, O: Updatable>(
     accumulated_losses: &[Array],
     state: &(M, O),
 ) -> std::result::Result<(), Exception> {
     let mut all_arrays: Vec<&Array> = accumulated_losses.iter().collect();
 
-    // Model parameters (flattened via Updatable blanket impl over ModuleParameters)
-    all_arrays.extend(state.0.updatable_states().into_iter());
+    // Keep flattened parameter clones alive while we evaluate the full state.
+    let model_params = state.0.flatten_params();
+    all_arrays.extend(model_params.values());
 
     // Optimizer states (momentum, velocity buffers)
     all_arrays.extend(state.1.updatable_states().into_iter());

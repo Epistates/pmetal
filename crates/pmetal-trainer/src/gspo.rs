@@ -497,31 +497,31 @@ impl GspoTrainer {
         mask: &Array,
     ) -> GspoResult<(Array, Array)> {
         // Per-token KL divergence
-        let log_ratio = per_token_policy_logps.subtract(per_token_ref_logps)?;
-        let ratio = log_ratio.exp()?;
+        let log_ratio = per_token_policy_logps.subtract(per_token_ref_logps);
+        let ratio = log_ratio.exp();
         let one = Array::from_f32(1.0);
-        let per_token_kl = ratio.subtract(&one)?.subtract(&log_ratio)?;
+        let per_token_kl = ratio.subtract(&one).subtract(&log_ratio);
 
         // Count total valid tokens across entire batch (for equal weighting)
-        let total_tokens = mask.sum(None)?;
+        let total_tokens = mask.sum(None);
 
         // Compute per-token loss with advantage
         // Key insight: we DON'T normalize per sequence, we treat all tokens equally
-        let adv_expanded = advantages.reshape(&[advantages.dim(0), 1])?;
-        let per_token_loss = per_token_policy_logps.negative()?.multiply(&adv_expanded)?;
+        let adv_expanded = advantages.reshape(&[advantages.dim(0), 1]);
+        let per_token_loss = per_token_policy_logps.negative().multiply(&adv_expanded);
 
         // Apply mask and compute mean over ALL tokens (equal weighting)
-        let masked_loss = per_token_loss.multiply(mask)?;
-        let mean_loss = masked_loss.sum(None)?.divide(&total_tokens)?;
+        let masked_loss = per_token_loss.multiply(mask);
+        let mean_loss = masked_loss.sum(None).divide(&total_tokens);
 
         // KL loss (also equal-weighted over all tokens)
-        let masked_kl = per_token_kl.multiply(mask)?;
-        let mean_kl = masked_kl.sum(None)?.divide(&total_tokens)?;
+        let masked_kl = per_token_kl.multiply(mask);
+        let mean_kl = masked_kl.sum(None).divide(&total_tokens);
 
         // Total loss with KL penalty
         let total_loss = if self.config.beta > 0.0 {
             let beta = Array::from_f32(self.config.beta as f32);
-            mean_loss.add(&mean_kl.multiply(&beta)?)?
+            mean_loss.add(&mean_kl.multiply(&beta))
         } else {
             mean_loss
         };
@@ -549,33 +549,33 @@ impl GspoTrainer {
         let pos_weights = Array::from_slice(&positions, &[1, seq_len]);
 
         // Apply positional weights to mask
-        let weighted_mask = mask.multiply(&pos_weights)?;
+        let weighted_mask = mask.multiply(&pos_weights);
 
         // Per-token KL
-        let log_ratio = per_token_policy_logps.subtract(per_token_ref_logps)?;
-        let ratio = log_ratio.exp()?;
+        let log_ratio = per_token_policy_logps.subtract(per_token_ref_logps);
+        let ratio = log_ratio.exp();
         let one = Array::from_f32(1.0);
-        let per_token_kl = ratio.subtract(&one)?.subtract(&log_ratio)?;
+        let per_token_kl = ratio.subtract(&one).subtract(&log_ratio);
 
         // Total weight for normalization
-        let total_weight = weighted_mask.sum(None)?;
+        let total_weight = weighted_mask.sum(None);
 
         // Per-token loss with advantage
-        let adv_expanded = advantages.reshape(&[advantages.dim(0), 1])?;
-        let per_token_loss = per_token_policy_logps.negative()?.multiply(&adv_expanded)?;
+        let adv_expanded = advantages.reshape(&[advantages.dim(0), 1]);
+        let per_token_loss = per_token_policy_logps.negative().multiply(&adv_expanded);
 
         // Apply weighted mask
-        let weighted_loss = per_token_loss.multiply(&weighted_mask)?;
-        let mean_loss = weighted_loss.sum(None)?.divide(&total_weight)?;
+        let weighted_loss = per_token_loss.multiply(&weighted_mask);
+        let mean_loss = weighted_loss.sum(None).divide(&total_weight);
 
         // Weighted KL
-        let weighted_kl = per_token_kl.multiply(&weighted_mask)?;
-        let mean_kl = weighted_kl.sum(None)?.divide(&total_weight)?;
+        let weighted_kl = per_token_kl.multiply(&weighted_mask);
+        let mean_kl = weighted_kl.sum(None).divide(&total_weight);
 
         // Total loss
         let total_loss = if self.config.beta > 0.0 {
             let beta = Array::from_f32(self.config.beta as f32);
-            mean_loss.add(&mean_kl.multiply(&beta)?)?
+            mean_loss.add(&mean_kl.multiply(&beta))
         } else {
             mean_loss
         };
@@ -592,27 +592,27 @@ impl GspoTrainer {
         mask: &Array,
     ) -> GspoResult<(Array, Array)> {
         // Sum log probs per sequence
-        let masked_policy = per_token_policy_logps.multiply(mask)?;
-        let seq_policy_logps = masked_policy.sum_axis(-1, None)?;
+        let masked_policy = per_token_policy_logps.multiply(mask);
+        let seq_policy_logps = masked_policy.sum_axis(-1, false);
 
-        let masked_ref = per_token_ref_logps.multiply(mask)?;
-        let seq_ref_logps = masked_ref.sum_axis(-1, None)?;
+        let masked_ref = per_token_ref_logps.multiply(mask);
+        let seq_ref_logps = masked_ref.sum_axis(-1, false);
 
         // Sequence-level KL
-        let log_ratio = seq_policy_logps.subtract(&seq_ref_logps)?;
-        let ratio = log_ratio.exp()?;
+        let log_ratio = seq_policy_logps.subtract(&seq_ref_logps);
+        let ratio = log_ratio.exp();
         let one = Array::from_f32(1.0);
-        let seq_kl = ratio.subtract(&one)?.subtract(&log_ratio)?;
-        let mean_kl = seq_kl.mean(None)?;
+        let seq_kl = ratio.subtract(&one).subtract(&log_ratio);
+        let mean_kl = seq_kl.mean(None);
 
         // Sequence-level loss
-        let seq_loss = seq_policy_logps.negative()?.multiply(advantages)?;
-        let mean_loss = seq_loss.mean(None)?;
+        let seq_loss = seq_policy_logps.negative().multiply(advantages);
+        let mean_loss = seq_loss.mean(None);
 
         // Total loss
         let total_loss = if self.config.beta > 0.0 {
             let beta = Array::from_f32(self.config.beta as f32);
-            mean_loss.add(&mean_kl.multiply(&beta)?)?
+            mean_loss.add(&mean_kl.multiply(&beta))
         } else {
             mean_loss
         };

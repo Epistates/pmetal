@@ -13,7 +13,9 @@
 //! log_odds = log(probs / (1 - probs))
 //! ```
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, nn, ops, ops::indexing::IndexOp, optimizers::Optimizer};
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, indexing::IndexOp, nn, ops, optimizers::Optimizer,
+};
 use pmetal_core::{StepMetrics, TrainingCallback, TrainingConfig};
 use pmetal_lora::TrainableModel;
 use std::time::Instant;
@@ -244,26 +246,31 @@ impl OrpoTrainer {
                     Ok(loss)
                 };
 
-                let (loss, grads) = {
+                let (mut loss, grads) = {
                     let mut loss_and_grad = nn::value_and_grad(loss_fn);
                     loss_and_grad(policy_model, ())?
                 };
                 optimizer.update(policy_model, grads)?;
                 loss.eval();
 
-                let (sft_loss, or_loss, log_odds_chosen, log_odds_rejected) = metrics_cell
-                    .into_inner()
-                    .expect("loss_fn must have been called");
+                let (mut sft_loss, mut or_loss, mut log_odds_chosen, mut log_odds_rejected) =
+                    metrics_cell
+                        .into_inner()
+                        .expect("loss_fn must have been called");
                 sft_loss.eval();
                 or_loss.eval();
                 log_odds_chosen.eval();
                 log_odds_rejected.eval();
+                let mut chosen_log_odds = log_odds_chosen.mean(None);
+                let mut rejected_log_odds = log_odds_rejected.mean(None);
+                chosen_log_odds.eval();
+                rejected_log_odds.eval();
                 let metrics = OrpoMetrics {
                     loss: loss.item_f32(),
                     sft_loss: sft_loss.item_f32(),
                     or_loss: or_loss.item_f32(),
-                    chosen_log_odds: log_odds_chosen.mean(None).item_f32(),
-                    rejected_log_odds: log_odds_rejected.mean(None).item_f32(),
+                    chosen_log_odds: chosen_log_odds.item_f32(),
+                    rejected_log_odds: rejected_log_odds.item_f32(),
                 };
 
                 self.step += 1;

@@ -475,8 +475,8 @@ impl DapoTrainer {
         mask: &Array,
     ) -> DapoResult<(Array, f32)> {
         // Importance ratio: exp(policy_logps - old_policy_logps)
-        let log_ratio = policy_logps.subtract(old_policy_logps)?;
-        let ratio = log_ratio.exp()?;
+        let log_ratio = policy_logps.subtract(old_policy_logps);
+        let ratio = log_ratio.exp();
 
         // Clip-Higher: only clip upper bound
         // clipped_ratio = min(ratio, 1 + eps_high)
@@ -485,31 +485,27 @@ impl DapoTrainer {
         let eps_low = self.config.clip_eps_low;
 
         let ratio_clipped_high = ops::minimum(&ratio, &Array::from_f32(eps_high as f32));
-        let ratio_clipped =
-            ops::maximum(&ratio_clipped_high, &Array::from_f32(eps_low as f32));
+        let ratio_clipped = ops::maximum(&ratio_clipped_high, &Array::from_f32(eps_low as f32));
 
         // Compute clip fraction for logging
         let is_clipped = ratio
-            .gt(&Array::from_f32(eps_high as f32))?
+            .gt(&Array::from_f32(eps_high as f32))
             .as_dtype(Dtype::Float32 as i32);
-        let clip_fraction = is_clipped
-            .multiply(mask)?
-            .sum(None)?
-            .divide(&mask.sum(None)?)?;
-        clip_fraction.eval()?;
+        let mut clip_fraction = is_clipped.multiply(mask).sum(None).divide(&mask.sum(None));
+        clip_fraction.eval();
         let clip_frac = clip_fraction.item_f32();
 
         // Expand advantages for broadcasting: [batch] -> [batch, 1]
-        let adv_expanded = advantages.reshape(&[advantages.dim(0), 1])?;
+        let adv_expanded = advantages.reshape(&[advantages.dim(0), 1]);
 
         // Token-level loss: -clipped_ratio * advantage
-        let token_loss = ratio_clipped.multiply(&adv_expanded)?.negative()?;
+        let token_loss = ratio_clipped.multiply(&adv_expanded).negative();
 
         // Masked mean over all tokens, guarded against division by zero
-        let masked_loss = token_loss.multiply(mask)?;
-        let total_tokens = mask.sum(None)?;
+        let masked_loss = token_loss.multiply(mask);
+        let total_tokens = mask.sum(None);
         let safe_count = ops::maximum(&total_tokens, &Array::from_f32(1.0));
-        let mean_loss = masked_loss.sum(None)?.divide(&safe_count)?;
+        let mean_loss = masked_loss.sum(None).divide(&safe_count);
 
         Ok((mean_loss, clip_frac))
     }
@@ -522,27 +518,26 @@ impl DapoTrainer {
         advantages: &Array,       // [batch]
     ) -> DapoResult<(Array, f32)> {
         // Importance ratio
-        let log_ratio = policy_logps.subtract(old_policy_logps)?;
-        let ratio = log_ratio.exp()?;
+        let log_ratio = policy_logps.subtract(old_policy_logps);
+        let ratio = log_ratio.exp();
 
         // Clip-Higher
         let eps_high = 1.0 + self.config.clip_eps_high;
         let eps_low = self.config.clip_eps_low;
 
         let ratio_clipped_high = ops::minimum(&ratio, &Array::from_f32(eps_high as f32));
-        let ratio_clipped =
-            ops::maximum(&ratio_clipped_high, &Array::from_f32(eps_low as f32));
+        let ratio_clipped = ops::maximum(&ratio_clipped_high, &Array::from_f32(eps_low as f32));
 
         // Clip fraction
-        let is_clipped = ratio.gt(&Array::from_f32(eps_high as f32))?;
-        let clip_count = is_clipped.as_dtype(Dtype::Float32 as i32).sum(None)?;
+        let is_clipped = ratio.gt(&Array::from_f32(eps_high as f32));
+        let clip_count = is_clipped.as_dtype(Dtype::Float32 as i32).sum(None);
         let total_count = Array::from_int(policy_logps.dim(0));
-        let clip_fraction = clip_count.divide(&total_count)?;
-        clip_fraction.eval()?;
+        let mut clip_fraction = clip_count.divide(&total_count);
+        clip_fraction.eval();
         let clip_frac = clip_fraction.item_f32();
 
         // Sequence-level loss
-        let loss = ratio_clipped.multiply(advantages)?.negative()?.mean(None)?;
+        let loss = ratio_clipped.multiply(advantages).negative().mean(None);
 
         Ok((loss, clip_frac))
     }
@@ -555,17 +550,17 @@ impl DapoTrainer {
         mask: Option<&Array>,
     ) -> DapoResult<Array> {
         // KL approximation: (ratio - 1) - log_ratio
-        let log_ratio = policy_logps.subtract(ref_logps)?;
-        let ratio = log_ratio.exp()?;
+        let log_ratio = policy_logps.subtract(ref_logps);
+        let ratio = log_ratio.exp();
         let one = Array::from_f32(1.0);
-        let kl = ratio.subtract(&one)?.subtract(&log_ratio)?;
+        let kl = ratio.subtract(&one).subtract(&log_ratio);
 
         if let Some(m) = mask {
-            let masked_kl = kl.multiply(m)?;
-            let total = m.sum(None)?;
-            Ok(masked_kl.sum(None)?.divide(&total)?)
+            let masked_kl = kl.multiply(m);
+            let total = m.sum(None);
+            Ok(masked_kl.sum(None).divide(&total))
         } else {
-            Ok(kl.mean(None)?)
+            Ok(kl.mean(None))
         }
     }
 
@@ -576,11 +571,11 @@ impl DapoTrainer {
         let entropy = crate::logprob_utils::efficient_entropy(logits)?;
 
         if let Some(m) = mask {
-            let masked_entropy = entropy.multiply(m)?;
-            let total = m.sum(None)?;
-            Ok(masked_entropy.sum(None)?.divide(&total)?)
+            let masked_entropy = entropy.multiply(m);
+            let total = m.sum(None);
+            Ok(masked_entropy.sum(None).divide(&total))
         } else {
-            Ok(entropy.mean(None)?)
+            Ok(entropy.mean(None))
         }
     }
 

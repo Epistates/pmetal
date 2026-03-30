@@ -216,14 +216,17 @@ pub fn forward_process(
     mask_token_id: i64,
     rng: &mut StdRng,
 ) -> std::result::Result<(Array, Vec<bool>), Exception> {
-    x_0.eval();
     let shape = x_0.shape();
     let total_elements = shape.iter().product::<i32>() as usize;
 
     // Get original tokens as slice
-    let x_0_i32 = x_0.as_dtype(Dtype::Int32);
-    x_0_i32.eval();
-    let original: Vec<i32> = x_0_i32.as_slice().to_vec();
+    let mut x_0_f32 = x_0.as_dtype(Dtype::Float32.as_i32());
+    x_0_f32.eval();
+    let original: Vec<i32> = x_0_f32
+        .as_slice::<f32>()
+        .iter()
+        .map(|&v| v as i32)
+        .collect();
 
     // Generate mask: each position independently masked with probability t
     let mut masked_tokens = Vec::with_capacity(total_elements);
@@ -307,13 +310,17 @@ pub fn diffusion_loss(
     let selected_logits = flat_logits.take_along_axis(&gather_indices, -1); // [N, 1]
     let lse = flat_logits.logsumexp(-1, true); // [N, 1]
     let log_probs_at_target = selected_logits.subtract(&lse); // [N, 1]
-    let log_probs_at_target = log_probs_at_target.squeeze(-1i32); // [N]
+    let mut log_probs_at_target = log_probs_at_target.squeeze(-1i32); // [N]
     log_probs_at_target.eval();
 
     // Get targets for masking logic
-    let flat_targets_i64 = flat_targets.as_dtype(Dtype::Int64.as_i32());
-    flat_targets_i64.eval();
-    let target_vec: Vec<i64> = flat_targets_i64.as_slice().to_vec();
+    let mut flat_targets_f32 = flat_targets.as_dtype(Dtype::Float32.as_i32());
+    flat_targets_f32.eval();
+    let target_vec: Vec<i64> = flat_targets_f32
+        .as_slice::<f32>()
+        .iter()
+        .map(|&v| v as i64)
+        .collect();
 
     let lp_data: &[f32] = log_probs_at_target.as_slice();
 
@@ -416,8 +423,7 @@ impl DiffusionTrainingLoop {
 
         let mut total_norm_sq = 0.0_f32;
         for (_, grad) in grads.iter() {
-            grad.eval();
-            let norm_sq = grad.multiply(grad).sum(None);
+            let mut norm_sq = grad.multiply(grad).sum(None);
             norm_sq.eval();
             total_norm_sq += norm_sq.item_f32();
         }
@@ -443,7 +449,7 @@ impl DiffusionTrainingLoop {
                 let scaled: FlattenedModuleParam = new_grads
                     .into_iter()
                     .map(|(k, v)| {
-                        let scaled = v.multiply(&Array::from_f32(scale)).unwrap();
+                        let scaled = v.multiply(&Array::from_f32(scale));
                         (k, scaled)
                     })
                     .collect();
@@ -500,7 +506,7 @@ impl DiffusionTrainingLoop {
         // 2. Apply GPU-native forward masking process
         // Use step as seed for reproducibility while staying on GPU
         let seed = self.step as u64 + self.config.seed * 1000;
-        let (x_t, mask) =
+        let (mut x_t, mut mask) =
             forward_process_gpu(&batch.input_ids, t, self.config.mask_token_id, Some(seed))?;
 
         // IMPORTANT: Eval x_t and mask before any further operations to avoid
@@ -509,8 +515,8 @@ impl DiffusionTrainingLoop {
         mask.eval();
 
         // Compute mask ratio on GPU and read single scalar
-        let mask_f32 = mask.as_dtype(Dtype::Float32);
-        let mask_sum = mask_f32.sum(None);
+        let mask_f32 = mask.as_dtype(Dtype::Float32.as_i32());
+        let mut mask_sum = mask_f32.sum(None);
         mask_sum.eval();
         let mask_ratio = mask_sum.item_f32() / batch_tokens as f32;
 
@@ -518,7 +524,7 @@ impl DiffusionTrainingLoop {
         // targets = where(mask, original_tokens, -100)
         let ignore_tokens = ops::full(batch.input_ids.shape(), -100.0_f32, Dtype::Int32);
         let original_i32 = batch.input_ids.as_dtype(Dtype::Int32.as_i32());
-        let targets = ops::r#where(&mask, &original_i32, &ignore_tokens);
+        let mut targets = ops::r#where(&mask, &original_i32, &ignore_tokens);
 
         // Sync all inputs before loss computation
         targets.eval();
@@ -544,7 +550,7 @@ impl DiffusionTrainingLoop {
         let mut loss_and_grad_fn = nn::value_and_grad(loss_fn);
 
         // 5. Compute loss and gradients
-        let (loss, grads) = loss_and_grad_fn(model, (&x_t, &targets))?;
+        let (mut loss, grads) = loss_and_grad_fn(model, (&x_t, &targets))?;
 
         loss.eval();
         let mut loss_val = loss.item_f32();
@@ -734,8 +740,8 @@ impl DiffusionTrainingLoop {
                 .forward(&x_t, None)
                 .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
-            let targets = batch.input_ids.as_dtype(Dtype::Int64);
-            let loss = diffusion_loss(&logits, &targets, &mask_flags, eval_t, false, -100)?;
+            let targets = batch.input_ids.as_dtype(Dtype::Int64.as_i32());
+            let mut loss = diffusion_loss(&logits, &targets, &mask_flags, eval_t, false, -100)?;
             loss.eval();
             total_loss += loss.item_f32() as f64;
             num_batches += 1;
@@ -843,14 +849,17 @@ impl DiffusionSampler {
     where
         M: TrainableModel,
     {
-        prompt.eval();
         let prompt_len = prompt.dim(1) as usize;
         let total_len = prompt_len + max_new_tokens;
 
         // Get prompt tokens
-        let prompt_i32 = prompt.as_dtype(Dtype::Int32);
-        prompt_i32.eval();
-        let prompt_vec: Vec<i32> = prompt_i32.as_slice().to_vec();
+        let mut prompt_f32 = prompt.as_dtype(Dtype::Float32.as_i32());
+        prompt_f32.eval();
+        let prompt_vec: Vec<i32> = prompt_f32
+            .as_slice::<f32>()
+            .iter()
+            .map(|&v| v as i32)
+            .collect();
 
         // Initialize: prompt + masks
         let mut tokens: Vec<i32> = prompt_vec.clone();
@@ -876,11 +885,11 @@ impl DiffusionSampler {
             // Apply temperature scaling before softmax — affects confidence
             // magnitudes which drive the remasking strategy.
             let scaled_logits = if (self.temperature - 1.0).abs() > 1e-6 {
-                logits.multiply(&Array::from_f32(1.0 / self.temperature))?
+                logits.multiply(&Array::from_f32(1.0 / self.temperature))
             } else {
                 logits
             };
-            let probs = ops::softmax_axis(&scaled_logits, -1);
+            let mut probs = ops::softmax_axis(&scaled_logits, -1);
             probs.eval();
 
             let probs_data: Vec<f32> = probs.as_slice().to_vec();

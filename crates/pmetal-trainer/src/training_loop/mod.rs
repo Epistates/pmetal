@@ -59,19 +59,19 @@
 //! when mlx-rs improves its compile_with_state implementation.
 
 use pmetal_bridge::compat::{
-    Array, Exception,
+    Array, Dtype, Exception,
+    indexing::{IndexOp, argmax_axis},
     losses::CrossEntropy,
     module::{FlattenedModuleParam, ModuleParameters},
-    nn,
-    ops,
-    ops::indexing::{IndexOp, argmax_axis},
+    nn, ops,
     optimizers::{AdamW, AdamWBuilder, Optimizer, Updatable},
     transforms,
-    Dtype,
 };
 // Local no-op compile shim (bridge doesn't need JIT compilation)
 // Accepts Option<bool> to match the mlx-rs call site: compile_with_state(f, None)
-fn compile_with_state<F: FnMut(S, I) -> O, S, I, O>(f: F, _shapeless: Option<bool>) -> F { f }
+fn compile_with_state<F: FnMut(S, I) -> O, S, I, O>(f: F, _shapeless: Option<bool>) -> F {
+    f
+}
 use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
 use pmetal_data::{
     DataLoader, DataLoaderConfig, PackedDataLoader, PackedTrainingBatch, PackerConfig,
@@ -675,28 +675,9 @@ impl TrainingLoop {
 
     /// Compute loss for a batch.
     fn compute_loss(logits: &Array, labels: &Array) -> Result<Array> {
-        let seq_len = logits.dim(1);
-        let vocab_size = logits.dim(2);
-
-        // Shift: logits[:-1] predicts labels[1:]
-        let shift_logits = logits.index((.., ..seq_len - 1, ..));
-        let shift_labels = labels.index((.., 1..));
-
-        // Reshape for cross entropy
-        let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
-        let flat_labels = shift_labels.reshape(&[-1]);
-
-        // Compute cross entropy loss with ignore_index=-100
-        let loss = cross_entropy_loss(&flat_logits, &flat_labels, Some(-100_i64), 0.0)?;
-
-        // Compute masked mean: only average over non-ignored (-100) tokens.
-        // loss.mean(None) would incorrectly divide by all positions including
-        // ignored ones, producing an underestimated loss.
-        let mask = flat_labels.ne(&Array::from_int(-100).as_dtype(flat_labels.dtype_raw()));
-        let valid_count_raw = mask.as_dtype(Dtype::Float32.as_i32()).sum(None);
-        let valid_count = ops::maximum(&valid_count_raw, &Array::from_f32(1.0));
-        let masked_loss = loss.multiply(&mask.as_dtype(loss.dtype_raw()));
-        Ok(masked_loss.sum(None).divide(&valid_count))
+        Ok(pmetal_bridge::training::causal_lm_loss(
+            logits, labels, -100,
+        ))
     }
 
     /// Clip gradients by global norm (GPU-based, no sync required).
@@ -809,7 +790,7 @@ impl TrainingLoop {
                 let scale_arr = Array::from_f32(scale);
                 let mut scaled: FlattenedModuleParam = FlattenedModuleParam::new();
                 for (k, v) in new_grads {
-                    let scaled_grad = v.multiply(&scale_arr)?;
+                    let scaled_grad = v.multiply(&scale_arr);
                     scaled.insert(k, scaled_grad);
                 }
                 self.accumulated_grads = Some(scaled);
@@ -820,10 +801,10 @@ impl TrainingLoop {
                 let scale_arr = Array::from_f32(scale);
                 for (key, new_grad) in new_grads {
                     if let Some(existing) = acc.get_mut(&key) {
-                        let scaled = new_grad.multiply(&scale_arr)?;
-                        *existing = existing.add(&scaled)?;
+                        let scaled = new_grad.multiply(&scale_arr);
+                        *existing = existing.add(&scaled);
                     } else {
-                        let scaled = new_grad.multiply(&scale_arr)?;
+                        let scaled = new_grad.multiply(&scale_arr);
                         acc.insert(key, scaled);
                     }
                 }
@@ -868,7 +849,7 @@ impl TrainingLoop {
     ) -> Result<StepStats>
     where
         M: TrainableModel,
-        O: Optimizer,
+        O: Optimizer + Updatable,
     {
         let start_time = std::time::Instant::now();
 
@@ -903,7 +884,8 @@ impl TrainingLoop {
         if self.step <= 1 {
             tracing::debug!(step = self.step, "train_step: evaluating loss...");
         }
-        loss.eval()?;
+        let mut loss = loss;
+        loss.eval();
         let micro_batch_loss = loss.item::<f32>();
         if self.step <= 3 {
             let active = pmetal_mlx::memory::get_active_memory();
@@ -950,12 +932,12 @@ impl TrainingLoop {
                     // model. Evaluating all 600M+ params of a frozen model every step
                     // is wasteful and can spike memory via unnecessary GPU->CPU sync.
                     // This matches mlx-lm's approach: mx.eval(state, losses, ...).
-                    pmetal_bridge::compat::eval_params(model.trainable_parameters());
+                    let _ = pmetal_bridge::compat::eval_params(model.trainable_parameters());
                     // Optimizer state (momentum/variance for Adam)
                     let opt_states: Vec<&Array> =
                         optimizer.updatable_states().into_iter().collect();
                     if !opt_states.is_empty() {
-                        transforms::eval(opt_states);
+                        let _ = transforms::eval(opt_states);
                     }
                 }
                 // NOTE: Do NOT clear the buffer cache here. MLX's cache holds
@@ -974,7 +956,8 @@ impl TrainingLoop {
                 // Always compute grad_norm when clipping is enabled (tests expect this).
                 // The lazy Array is evaluated here — syncs GPU->CPU.
                 if let Some(norm_arr) = lazy_norm {
-                    norm_arr.eval()?;
+                    let mut norm_arr = norm_arr;
+                    norm_arr.eval();
                     Some(norm_arr.item::<f32>())
                 } else {
                     None
@@ -1055,7 +1038,7 @@ impl TrainingLoop {
                         let seq_len = hidden_states.dim(1);
                         let shift_hidden = hidden_states.index((.., ..seq_len - 1, ..));
                         let shift_labels = labels.index((.., 1..));
-                        let flat_labels = shift_labels.reshape(&[-1])?;
+                        let flat_labels = shift_labels.reshape(&[-1]);
                         compute_cce_loss(&shift_hidden, &cached_weight, &flat_labels)
                     }
                     _ => {
@@ -1176,8 +1159,8 @@ impl TrainingLoop {
                 .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
             // Compute loss
-            let loss = Self::compute_loss(&logits, &batch.labels)?;
-            loss.eval()?;
+            let mut loss = Self::compute_loss(&logits, &batch.labels)?;
+            loss.eval();
             total_loss += loss.item::<f32>() as f64;
 
             // Compute token-level accuracy
@@ -1233,19 +1216,19 @@ impl TrainingLoop {
 
         // Get predictions (argmax over vocab dimension)
         let flat_logits = shift_logits.reshape(&[-1, vocab_size]);
-        let predictions = argmax_axis(&flat_logits, -1, None);
+        let mut predictions = argmax_axis(&flat_logits, -1, false);
         predictions.eval();
 
-        let flat_labels = shift_labels.reshape(&[-1]);
+        let mut flat_labels = shift_labels.reshape(&[-1]);
         flat_labels.eval();
 
         // Create mask for valid tokens (label != -100)
         let ignore_index = Array::from_int(-100);
-        let valid_mask = flat_labels.ne(&ignore_index);
+        let mut valid_mask = flat_labels.ne(&ignore_index);
         valid_mask.eval();
 
         // Count valid tokens
-        let total_valid = valid_mask.sum(None);
+        let mut total_valid = valid_mask.sum(None);
         total_valid.eval();
         let total_tokens = total_valid.item_f32() as u64;
 
@@ -1256,12 +1239,12 @@ impl TrainingLoop {
         // Compare predictions with labels where valid
         // predictions is i32, labels is i64, need to cast
         let predictions_i64 = predictions.as_dtype(Dtype::Int64.as_i32());
-        let correct = predictions_i64.eq(&flat_labels);
+        let mut correct = predictions_i64.eq(&flat_labels);
         correct.eval();
 
         // Mask out invalid tokens and sum
         let valid_correct = correct.multiply(&valid_mask);
-        let correct_sum = valid_correct.sum(None);
+        let mut correct_sum = valid_correct.sum(None);
         correct_sum.eval();
         let correct_count = correct_sum.item_f32() as u64;
 

@@ -34,7 +34,9 @@
 //! - The distillation loss uses the SAME student logits computed inside the closure,
 //!   so both objectives share one forward pass per step.
 
-use pmetal_bridge::compat::{Array, Exception, nn, ops, ops::indexing::IndexOp, optimizers::Optimizer, eval_params};
+use pmetal_bridge::compat::{
+    Array, Exception, eval_params, indexing::IndexOp, nn, ops, optimizers::Optimizer,
+};
 use pmetal_core::{EvalMetrics, TrainingConfig};
 use pmetal_lora::TrainableModel;
 use std::time::Instant;
@@ -374,28 +376,27 @@ impl RlkdTrainer {
         let student_shifted = student_logits.index((.., ..seq - 1, ..));
 
         // Scale by temperature
-        let teacher_scaled = teacher_shifted.divide(&t)?;
-        let student_scaled = student_shifted.divide(&t)?;
+        let teacher_scaled = teacher_shifted.divide(&t);
+        let student_scaled = student_shifted.divide(&t);
 
         // log-softmax for numerical stability
         let teacher_log_probs = nn::log_softmax(&teacher_scaled, -1);
         let student_log_probs = nn::log_softmax(&student_scaled, -1);
-        let teacher_probs = teacher_log_probs.exp()?;
+        let teacher_probs = teacher_log_probs.exp();
 
         // Forward KL: sum_v [ p_t * (log p_t - log p_s) ]
-        let kl_per_vocab =
-            teacher_probs.multiply(&teacher_log_probs.subtract(&student_log_probs)?)?;
+        let kl_per_vocab = teacher_probs.multiply(&teacher_log_probs.subtract(&student_log_probs));
         // Sum over vocab dimension → [batch, seq-1]
-        let kl_per_token = kl_per_vocab.sum_axes(&[-1], Some(false))?;
+        let kl_per_token = kl_per_vocab.sum_axes(&[-1], false);
 
         // Apply completion mask and take mean over valid tokens
-        let masked_kl = kl_per_token.multiply(completion_mask)?;
-        let total_tokens = completion_mask.sum(None)?;
+        let masked_kl = kl_per_token.multiply(completion_mask);
+        let total_tokens = completion_mask.sum(None);
         let safe_tokens = ops::maximum(&total_tokens, &Array::from_f32(1.0));
-        let mean_kl = masked_kl.sum(None)?.divide(&safe_tokens)?;
+        let mean_kl = masked_kl.sum(None).divide(&safe_tokens);
 
         // Scale by T^2 to preserve gradient magnitude
-        mean_kl.multiply(&t_sq)
+        Ok(mean_kl.multiply(&t_sq))
     }
 
     // -----------------------------------------------------------------------
@@ -480,19 +481,19 @@ impl RlkdTrainer {
         let old_logits = policy
             .forward(&input_ids, None)
             .map_err(|e| GrpoError::Mlx(Exception::custom(e.to_string())))?;
-        let (old_per_token_logps, completion_mask) =
-            self.grpo_trainer
-                .compute_per_token_logps(&old_logits, &labels, temperature)?;
-        old_per_token_logps.eval()?;
-        completion_mask.eval()?;
+        let (mut old_per_token_logps, mut completion_mask) = self
+            .grpo_trainer
+            .compute_per_token_logps(&old_logits, &labels, temperature)?;
+        old_per_token_logps.eval();
+        completion_mask.eval();
 
         // --- 3. Compute teacher logits (frozen, outside gradient tape) ---
         // We materialize these before entering value_and_grad so they become
         // constants in the backward pass — no teacher gradients are computed.
-        let teacher_logits = teacher
+        let mut teacher_logits = teacher
             .forward_teacher(&input_ids)
             .map_err(|e| GrpoError::Mlx(e))?;
-        teacher_logits.eval()?;
+        teacher_logits.eval();
 
         let distill_temp = self.config.distill_temperature;
 
@@ -545,8 +546,8 @@ impl RlkdTrainer {
             let alpha_arr = Array::from_f32(alpha);
             let one_minus_alpha = Array::from_f32(1.0 - alpha);
             let total = one_minus_alpha
-                .multiply(&grpo_loss)?
-                .add(&alpha_arr.multiply(&distill_loss)?)?;
+                .multiply(&grpo_loss)
+                .add(&alpha_arr.multiply(&distill_loss));
 
             Ok(total)
         };
@@ -569,6 +570,7 @@ impl RlkdTrainer {
         optimizer.update(policy, grads)?;
         eval_params(policy.parameters())?;
 
+        let mut total_loss_arr = total_loss_arr;
         let total_loss = total_loss_arr.item::<f32>();
 
         // NOTE: These are proportional approximations, not actual component values.

@@ -54,11 +54,16 @@ fn create_dummy_dataset(num_samples: usize, seq_len: usize) -> TrainingDataset {
 fn single_sequence_packed_batch(tokens: &[i32], labels: &[i64]) -> PackedTrainingBatch {
     let len = tokens.len() as i32;
     let position_ids: Vec<i32> = (0..len).collect();
+    let cu_seqlens_raw = vec![0_i32, len];
     PackedTrainingBatch {
         input_ids: Array::from_i32_slice_shaped(tokens, &[len]),
         position_ids: Array::from_i32_slice_shaped(&position_ids, &[len]),
-        cu_seqlens: Array::from_i32_slice_shaped(&[0_i32, len], &[2]),
-        labels: Array::from_i32_slice_shaped(&labels.iter().map(|&x| x as i32).collect::<Vec<_>>(), &[len]),
+        cu_seqlens: Array::from_i32_slice_shaped(&cu_seqlens_raw, &[2]),
+        cu_seqlens_raw,
+        labels: Array::from_i32_slice_shaped(
+            &labels.iter().map(|&x| x as i32).collect::<Vec<_>>(),
+            &[len],
+        ),
         total_tokens: tokens.len(),
         num_sequences: 1,
         max_seqlen: tokens.len(),
@@ -241,7 +246,7 @@ fn test_jit_training_step() {
     use pmetal_bridge::compat::optimizers::AdamW;
 
     let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
-    let optimizer = AdamW::new(1e-4);
+    let optimizer = AdamW::new(1e-4, 0.0);
 
     let mut state = (model, optimizer);
 
@@ -269,7 +274,7 @@ fn test_jit_training_step_multiple_steps() {
     use pmetal_bridge::compat::optimizers::AdamW;
 
     let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
-    let optimizer = AdamW::new(1e-4);
+    let optimizer = AdamW::new(1e-4, 0.0);
 
     let mut state = (model, optimizer);
 
@@ -410,14 +415,17 @@ fn test_single_sequence_packed_step_matches_standard_step() {
     random::seed(1337);
     let model_packed = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
 
-    let optimizer_standard = AdamW::new(0.0);
-    let optimizer_packed = AdamW::new(0.0);
+    let optimizer_standard = AdamW::new(0.0, 0.0);
+    let optimizer_packed = AdamW::new(0.0, 0.0);
 
     let mut standard_state = (model_standard, optimizer_standard);
     let mut packed_state = (model_packed, optimizer_packed);
 
     let input_ids = Array::from_i32_slice_shaped(&tokens, &[1, tokens.len() as i32]);
-    let label_ids = Array::from_i32_slice_shaped(&labels.iter().map(|&x| x as i32).collect::<Vec<_>>(), &[1, labels.len() as i32]);
+    let label_ids = Array::from_i32_slice_shaped(
+        &labels.iter().map(|&x| x as i32).collect::<Vec<_>>(),
+        &[1, labels.len() as i32],
+    );
     let packed_batch = single_sequence_packed_batch(&tokens, &labels);
 
     let standard_loss = jit_training_step(&mut standard_state, (&input_ids, &label_ids)).unwrap();
@@ -443,7 +451,7 @@ fn test_single_sequence_packed_cce_step_is_finite() {
     random::seed(7331);
     let model_packed = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
 
-    let optimizer_packed = AdamW::new(0.0);
+    let optimizer_packed = AdamW::new(0.0, 0.0);
 
     let mut packed_state = (model_packed, optimizer_packed);
 
@@ -467,7 +475,7 @@ fn test_jit_training_step_with_warmup() {
     use pmetal_bridge::compat::optimizers::Updatable;
 
     let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
-    let optimizer = AdamW::new(1e-4);
+    let optimizer = AdamW::new(1e-4, 0.0);
 
     let mut state = (model, optimizer);
 

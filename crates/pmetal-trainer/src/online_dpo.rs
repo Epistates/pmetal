@@ -15,7 +15,9 @@
 
 use std::sync::Arc;
 
-use pmetal_bridge::compat::{Array, Dtype, Exception, nn, ops, ops::indexing::IndexOp, optimizers::Optimizer, random};
+use pmetal_bridge::compat::{
+    Array, Dtype, Exception, indexing::IndexOp, nn, ops, optimizers::Optimizer, random,
+};
 use pmetal_core::TrainingConfig;
 use pmetal_lora::TrainableModel;
 use tracing::{debug, info};
@@ -194,7 +196,7 @@ impl OnlineDpoTrainer {
             crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
         // Sum over sequence dimension -> [B] (masked positions are already 0)
-        per_token_logps.sum_axes(&[1i32], false)
+        Ok(per_token_logps.sum_axes(&[1i32], false))
     }
 
     /// Compute DPO loss for a batch of pairs.
@@ -212,37 +214,37 @@ impl OnlineDpoTrainer {
         let chosen_rewards = if reference_free {
             policy_chosen_logps.clone()
         } else {
-            policy_chosen_logps.subtract(ref_chosen_logps)?
+            policy_chosen_logps.subtract(ref_chosen_logps)
         };
 
         let rejected_rewards = if reference_free {
             policy_rejected_logps.clone()
         } else {
-            policy_rejected_logps.subtract(ref_rejected_logps)?
+            policy_rejected_logps.subtract(ref_rejected_logps)
         };
 
         // Compute logits
-        let reward_diff = chosen_rewards.subtract(&rejected_rewards)?;
+        let reward_diff = chosen_rewards.subtract(&rejected_rewards);
         let beta = Array::from_f32(self.config.dpo_config.beta as f32);
-        let mut logits = reward_diff.multiply(&beta)?;
+        let mut logits = reward_diff.multiply(&beta);
 
         // SimPO margin
         if is_simpo {
             let gamma = Array::from_f32(self.config.dpo_config.simpo_gamma as f32);
-            logits = logits.subtract(&gamma)?;
+            logits = logits.subtract(&gamma);
         }
 
         // Sigmoid loss: -log(sigmoid(logits)) = softplus(-logits)
-        let neg_logits = logits.negative()?;
-        let loss = nn::softplus(&neg_logits)?;
+        let neg_logits = logits.negative();
+        let loss = nn::softplus(&neg_logits);
 
         // Mean loss
-        let loss = loss.mean(None)?;
+        let loss = loss.mean(None);
 
         Ok((
             loss,
-            chosen_rewards.multiply(&beta)?,
-            rejected_rewards.multiply(&beta)?,
+            chosen_rewards.multiply(&beta),
+            rejected_rewards.multiply(&beta),
         ))
     }
 
@@ -285,7 +287,7 @@ impl OnlineDpoTrainer {
 
                     // Sample from categorical distribution (proper stochastic sampling)
                     // categorical() takes logits directly (applies softmax internally)
-                    let next_token = scaled.categorical();
+                    let mut next_token = scaled.categorical();
                     next_token.eval();
                     let token_id = next_token.clone().item_u32();
 
@@ -340,8 +342,8 @@ impl OnlineDpoTrainer {
                     &[1, completion.len() as i32],
                 );
 
-                let score = self.reward_func.score(&prompt_array, &completion_array)?;
-                score.eval()?;
+                let mut score = self.reward_func.score(&prompt_array, &completion_array)?;
+                score.eval();
                 scored.push((idx, score.item_f32()));
             }
 
@@ -450,9 +452,9 @@ impl OnlineDpoTrainer {
 
         // Compute loss and gradients
         let mut value_and_grad = nn::value_and_grad(loss_fn);
-        let (loss, grads) = value_and_grad(policy_model, ())?;
+        let (mut loss, grads) = value_and_grad(policy_model, ())?;
 
-        loss.eval()?;
+        loss.eval();
         let loss_val = loss.item_f32();
 
         // Update
@@ -475,7 +477,7 @@ impl OnlineDpoTrainer {
             crate::logprob_utils::selective_log_softmax(&pred_logits, &target_labels)?;
 
         // Sum over sequence dimension -> [B] (masked positions are already 0)
-        per_token_logps.sum_axes(&[1i32], false)
+        Ok(per_token_logps.sum_axes(&[1i32], false))
     }
 
     /// Static version of compute_dpo_loss for use in closures.
@@ -492,32 +494,32 @@ impl OnlineDpoTrainer {
         let chosen_rewards = if reference_free {
             policy_chosen_logps.clone()
         } else {
-            policy_chosen_logps.subtract(ref_chosen_logps)?
+            policy_chosen_logps.subtract(ref_chosen_logps)
         };
 
         let rejected_rewards = if reference_free {
             policy_rejected_logps.clone()
         } else {
-            policy_rejected_logps.subtract(ref_rejected_logps)?
+            policy_rejected_logps.subtract(ref_rejected_logps)
         };
 
-        let reward_diff = chosen_rewards.subtract(&rejected_rewards)?;
+        let reward_diff = chosen_rewards.subtract(&rejected_rewards);
         let beta = Array::from_f32(config.beta as f32);
-        let mut logits = reward_diff.multiply(&beta)?;
+        let mut logits = reward_diff.multiply(&beta);
 
         if is_simpo {
             let gamma = Array::from_f32(config.simpo_gamma as f32);
-            logits = logits.subtract(&gamma)?;
+            logits = logits.subtract(&gamma);
         }
 
-        let neg_logits = logits.negative()?;
-        let loss = nn::softplus(&neg_logits)?;
-        let loss = loss.mean(None)?;
+        let neg_logits = logits.negative();
+        let loss = nn::softplus(&neg_logits);
+        let loss = loss.mean(None);
 
         Ok((
             loss,
-            chosen_rewards.multiply(&beta)?,
-            rejected_rewards.multiply(&beta)?,
+            chosen_rewards.multiply(&beta),
+            rejected_rewards.multiply(&beta),
         ))
     }
 
