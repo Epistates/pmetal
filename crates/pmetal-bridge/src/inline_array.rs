@@ -446,6 +446,7 @@ unsafe extern "C" {
         cache_seq_capacity: u32,
         q_heads: u32,
         kv_heads: u32,
+        attn_scale_bits: u32,
     ) -> i32;
 
     fn mlx_inline_turboquant_mixed_score(
@@ -475,6 +476,7 @@ unsafe extern "C" {
         cache_seq_capacity: u32,
         q_heads: u32,
         kv_heads: u32,
+        attn_scale_bits: u32,
     ) -> i32;
 
     fn mlx_inline_turboquant_pack_sign_bits(
@@ -2269,6 +2271,7 @@ impl InlineArray {
         cache_seq_capacity: u32,
         q_heads: u32,
         kv_heads: u32,
+        attn_scale: f32,
     ) -> Option<Self> {
         let mut out = MaybeUninit::<RawBuf>::uninit();
         let rc = unsafe {
@@ -2289,6 +2292,7 @@ impl InlineArray {
                 cache_seq_capacity,
                 q_heads,
                 kv_heads,
+                attn_scale.to_bits(),
             )
         };
         if rc == 0 {
@@ -2328,6 +2332,7 @@ impl InlineArray {
         cache_seq_capacity: u32,
         q_heads: u32,
         kv_heads: u32,
+        attn_scale: f32,
     ) -> Option<Self> {
         let mut out = MaybeUninit::<RawBuf>::uninit();
         let rc = unsafe {
@@ -2358,6 +2363,7 @@ impl InlineArray {
                 cache_seq_capacity,
                 q_heads,
                 kv_heads,
+                attn_scale.to_bits(),
             )
         };
         if rc == 0 {

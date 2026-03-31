@@ -282,7 +282,7 @@ impl TurboQuantCore {
                 if cb.is_empty() {
                     None
                 } else {
-                    let mut arr = InlineArray::from_f32_slice(cb, &[cb.len() as i32]);
+                    let arr = InlineArray::from_f32_slice(cb, &[cb.len() as i32]);
                     arr.eval();
                     Some(arr)
                 }
@@ -661,6 +661,10 @@ fn unpack_all(bits: &PackedBits) -> Vec<u16> {
     (0..bits.len()).map(|i| bits.get(i)).collect()
 }
 
+fn packed_qjl_words(dim: usize) -> usize {
+    dim.div_ceil(32)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Per-layer quantised storage
 // ═══════════════════════════════════════════════════════════════════════════
@@ -669,10 +673,10 @@ fn unpack_all(bits: &PackedBits) -> Vec<u16> {
 ///
 /// All tensors live entirely on the GPU — no CPU round-trips during normal
 /// operation.  Shape convention (accumulated over T steps):
-///   indices:         [B, H, T, D]  uint32  — codebook index per coordinate
+///   indices:         [B, H, T, D]  uint8   — codebook index per coordinate
 ///   norms:           [B, H, T, 1]  f32     — L2 norm before unit-sphere normalise
-///   qjl_signs:       [B, H, T, D]  f32     — ±1 sign of QJL projection
-///   residual_norms:  [B, H, T, 1]  f32     — L2 norm of MSE residual
+///   qjl_signs:       [B, H, T, ceil(D/32)]  uint32 packed sign words
+///   residual_norms:  [B, H, T, 1]  f32     — unscaled residual L2 norm
 #[derive(Debug, Clone)]
 struct GpuKeyStore {
     indices: InlineArray,
@@ -689,11 +693,18 @@ impl GpuKeyStore {
         self.qjl_signs = self.qjl_signs.kv_cache_append(&new.qjl_signs, 2);
         self.residual_norms = self.residual_norms.kv_cache_append(&new.residual_norms, 2);
     }
+
+    fn collect_for_detach<'a>(&'a mut self, out: &mut Vec<&'a mut InlineArray>) {
+        out.push(&mut self.indices);
+        out.push(&mut self.norms);
+        out.push(&mut self.qjl_signs);
+        out.push(&mut self.residual_norms);
+    }
 }
 
 /// GPU-resident quantised value data for the Uniform path.
 ///
-///   indices:  [B, H, T, D]  uint32
+///   indices:  [B, H, T, D]  uint8
 ///   norms:    [B, H, T, 1]  f32
 #[derive(Debug, Clone)]
 struct GpuValueStore {
@@ -705,6 +716,11 @@ impl GpuValueStore {
     fn append(&mut self, new: GpuValueStore) {
         self.indices = self.indices.kv_cache_append(&new.indices, 2);
         self.norms = self.norms.kv_cache_append(&new.norms, 2);
+    }
+
+    fn collect_for_detach<'a>(&'a mut self, out: &mut Vec<&'a mut InlineArray>) {
+        out.push(&mut self.indices);
+        out.push(&mut self.norms);
     }
 }
 
@@ -1094,6 +1110,194 @@ impl QuantizedKvCache {
         ))
     }
 
+    /// Evaluate and detach GPU-resident cache arrays to keep graph chains short.
+    pub fn eval_and_detach_gpu_state(&mut self) {
+        let mut to_eval = Vec::new();
+        if let Some(keys) = &mut self.keys {
+            if let Some(gpu) = &mut keys.gpu {
+                gpu.collect_for_detach(&mut to_eval);
+            }
+        }
+        if let Some(values) = &mut self.values {
+            if let Some(gpu) = &mut values.gpu {
+                gpu.collect_for_detach(&mut to_eval);
+            }
+        }
+        if !to_eval.is_empty() {
+            crate::inline_array::eval_and_detach_many(&mut to_eval);
+        }
+    }
+
+    /// Append a single-token KV chunk and compute attention output.
+    ///
+    /// This restores the bridge cache API expected by native Qwen decode.
+    /// The current implementation is correctness-first: it dequantizes the
+    /// cache and runs standard SDPA over the valid prefix.
+    pub fn append_and_compute_attention(
+        &mut self,
+        queries: &InlineArray,
+        keys: &InlineArray,
+        values: &InlineArray,
+        scale: f32,
+    ) -> Result<InlineArray, String> {
+        if queries.ndim() != 4
+            || keys.ndim() != 4
+            || values.ndim() != 4
+            || queries.dim(2) != 1
+            || keys.dim(2) != 1
+            || values.dim(2) != 1
+        {
+            return Err(
+                "TurboQuant direct attention requires [B, H, 1, D] single-token decode inputs"
+                    .to_string(),
+            );
+        }
+
+        let layout = self.ensure_layout(keys, values)?;
+        self.append(keys, values)?;
+        let query_dtype = queries.dtype_raw();
+        let queries_f32 = if query_dtype == 10 {
+            queries.clone()
+        } else {
+            queries.as_dtype(10)
+        };
+
+        if let Some(output) = self.try_gpu_uniform_attention(&queries_f32, layout, scale) {
+            return Ok(if query_dtype == 10 {
+                output
+            } else {
+                output.as_dtype(query_dtype)
+            });
+        }
+
+        let full_keys = self
+            .dequantize_keys()
+            .ok_or_else(|| "TurboQuant failed to dequantize keys".to_string())?;
+        let full_values = self
+            .dequantize_values()
+            .ok_or_else(|| "TurboQuant failed to dequantize values".to_string())?;
+
+        let q_heads = queries.dim(1) as usize;
+        let kv_heads = layout.heads;
+        let (keys_for_attn, values_for_attn) = if q_heads == kv_heads {
+            (full_keys, full_values)
+        } else {
+            let groups = q_heads / kv_heads;
+            if groups * kv_heads != q_heads {
+                return Err(format!(
+                    "TurboQuant GQA mismatch: query heads {q_heads} not divisible by kv heads {kv_heads}"
+                ));
+            }
+            (
+                full_keys.repeat(groups as i32, 1),
+                full_values.repeat(groups as i32, 1),
+            )
+        };
+
+        let queries_f32 = queries.as_dtype(10);
+        let output = crate::decode::sdpa_causal_like_mlx(
+            &queries_f32,
+            &keys_for_attn,
+            &values_for_attn,
+            scale,
+            queries.dim(2),
+        );
+        Ok(if queries.dtype_raw() == 10 {
+            output
+        } else {
+            output.as_dtype(queries.dtype_raw())
+        })
+    }
+
+    fn try_gpu_uniform_attention(
+        &self,
+        queries_f32: &InlineArray,
+        layout: CacheLayout,
+        scale: f32,
+    ) -> Option<InlineArray> {
+        let ks = self.keys.as_ref()?.gpu.as_ref()?;
+        let vs = self.values.as_ref()?.gpu.as_ref()?;
+        let state = self.state.as_ref()?;
+
+        let (key_core, key_bits) = match &state.keys {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            TensorRuntime::Uniform { .. } | TensorRuntime::Mixed { .. } => return None,
+        };
+        let (value_core, value_bits) = match &state.values {
+            TensorRuntime::Uniform {
+                config: TurboQuantTensorConfig::Uniform { bits },
+                core,
+            } => (core, *bits),
+            TensorRuntime::Uniform { .. } | TensorRuntime::Mixed { .. } => return None,
+        };
+
+        let key_codebook = key_core.codebook_arr(key_bits.saturating_sub(1))?;
+        let value_codebook = value_core.codebook_arr(value_bits)?;
+        let key_rot = key_core.inverse_rotation_arr.as_ref()?;
+        let key_proj = key_core.inverse_qjl_arr.as_ref()?;
+        let value_inv_rot = value_core.rotation_arr.as_ref()?;
+
+        let batch = queries_f32.dim(0);
+        let q_heads = queries_f32.dim(1);
+        let key_dim = queries_f32.dim(3);
+        let value_dim = layout.value_dim as i32;
+        let q_rows = batch * q_heads;
+        let n_seq = self.offset as i32;
+        let cache_seq_capacity = ks.indices.dim(2);
+        if q_rows <= 0 || n_seq <= 0 || cache_seq_capacity < n_seq {
+            return None;
+        }
+
+        let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
+        let query_rot = query_rows.matmul(key_rot);
+        let query_proj = query_rows.matmul(key_proj);
+
+        let kv_rows = (layout.batch * layout.heads) as i32;
+        let key_norms = ks.norms.reshape(&[kv_rows, cache_seq_capacity]);
+        let key_residual_norms = ks.residual_norms.reshape(&[kv_rows, cache_seq_capacity]);
+        let qjl_words = ks.qjl_signs.dim(3);
+
+        let scores = InlineArray::turboquant_score(
+            &query_rot,
+            &query_proj,
+            &ks.indices,
+            &ks.qjl_signs,
+            &key_norms,
+            &key_residual_norms,
+            key_codebook,
+            key_dim as u32,
+            qjl_words as u32,
+            key_codebook.dim(0) as u32,
+            q_rows as u32,
+            n_seq as u32,
+            cache_seq_capacity as u32,
+            q_heads as u32,
+            layout.heads as u32,
+            scale,
+        )?;
+        let weights = scores.softmax(-1);
+
+        let value_norms = vs.norms.reshape(&[kv_rows, cache_seq_capacity]);
+        let decoded_rot = InlineArray::turboquant_weighted_decode(
+            &weights,
+            &vs.indices,
+            &value_norms,
+            value_codebook,
+            value_dim as u32,
+            value_codebook.dim(0) as u32,
+            q_rows as u32,
+            n_seq as u32,
+            vs.indices.dim(2) as u32,
+            q_heads as u32,
+            layout.heads as u32,
+        )?;
+        let output_rows = decoded_rot.matmul(value_inv_rot);
+        Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]))
+    }
+
     fn ensure_layout(
         &mut self,
         keys: &InlineArray,
@@ -1240,7 +1444,28 @@ fn gpu_quantize_kv(
         Some(inv_j) => k_residual_unrot.matmul(inv_j),
         None => return None,
     };
-    let k_qjl_signs = k_qjl_proj.sign();
+    let qjl_shape = k_qjl_proj.shape();
+    let qjl_ndim = qjl_shape.len();
+    let qjl_rows: i32 = qjl_shape[..qjl_ndim - 1].iter().product();
+    let packed_dim = packed_qjl_words(k_core.dim) as i32;
+    let k_qjl_proj_2d = if qjl_ndim == 2 {
+        k_qjl_proj.clone()
+    } else {
+        k_qjl_proj.reshape(&[qjl_rows, k_core.dim as i32])
+    };
+    let k_qjl_signs = InlineArray::turboquant_pack_sign_bits(
+        &k_qjl_proj_2d,
+        k_core.dim as u32,
+        packed_dim as u32,
+        qjl_rows as u32,
+    )?;
+    let k_qjl_signs = if qjl_ndim == 2 {
+        k_qjl_signs
+    } else {
+        let mut packed_shape: Vec<i32> = qjl_shape[..qjl_ndim - 1].to_vec();
+        packed_shape.push(packed_dim);
+        k_qjl_signs.reshape(&packed_shape)
+    };
 
     // ── Values ────────────────────────────────────────────────────────────
     let val_norms = values.norm_l2(-1, true);
@@ -1294,9 +1519,32 @@ fn gpu_dequantize_keys(
 
     // 3. QJL correction.
     //    CPU: inverse_project_rows(signs) = matmul_rows(inverse_qjl, dim, signs) = signs @ inverse_qjl.T = signs @ qjl.
-    //    So GPU: qjl_signs @ qjl_arr.
+    //    The GPU store keeps packed uint32 sign words, so unpack to {-1,+1}
+    //    before the matmul with qjl_arr.
     let qjl = core.qjl_arr.as_ref()?;
-    let qjl_correction = store.qjl_signs.matmul(qjl);
+    let packed_shape = store.qjl_signs.shape();
+    let packed_ndim = packed_shape.len();
+    let packed_rows: i32 = packed_shape[..packed_ndim - 1].iter().product();
+    let packed_words = packed_shape[packed_ndim - 1];
+    let packed_signs = if packed_ndim == 2 {
+        store.qjl_signs.clone()
+    } else {
+        store.qjl_signs.reshape(&[packed_rows, packed_words])
+    };
+    let unpacked_qjl_2d = InlineArray::turboquant_unpack_sign_bits(
+        &packed_signs,
+        core.dim as u32,
+        packed_words as u32,
+        packed_rows as u32,
+    )?;
+    let unpacked_qjl = if packed_ndim == 2 {
+        unpacked_qjl_2d
+    } else {
+        let mut unpacked_shape: Vec<i32> = packed_shape[..packed_ndim - 1].to_vec();
+        unpacked_shape.push(core.dim as i32);
+        unpacked_qjl_2d.reshape(&unpacked_shape)
+    };
+    let qjl_correction = unpacked_qjl.matmul(qjl);
     let dim = core.dim as f32;
     let qjl_scale_factor = InlineArray::from_f32((std::f32::consts::PI / 2.0).sqrt() / dim);
     // residual_norms: [B,H,T,1] keepdims — broadcast along D.
@@ -2096,7 +2344,7 @@ fn matrix_to_inline_array(matrix: &[f32], dim: usize) -> Option<InlineArray> {
     if matrix.is_empty() || dim == 0 {
         return None;
     }
-    let mut arr = InlineArray::from_f32_slice(matrix, &[dim as i32, dim as i32]);
+    let arr = InlineArray::from_f32_slice(matrix, &[dim as i32, dim as i32]);
     arr.eval();
     Some(arr)
 }
@@ -2360,6 +2608,78 @@ mod tests {
         assert!(
             dk_max < input_max * 3.0,
             "dequantized keys magnitude unreasonably large"
+        );
+    }
+
+    #[test]
+    fn gpu_packed_qjl_sign_words_round_trip_encodes_zero_as_positive_bit() {
+        let projected = InlineArray::from_f32_slice(&[-2.0f32, 0.0, 3.0, -0.5], &[1, 4]);
+        let packed = InlineArray::turboquant_pack_sign_bits(&projected, 4, 1, 1)
+            .expect("pack sign bits");
+        let mut unpacked =
+            InlineArray::turboquant_unpack_sign_bits(&packed, 4, 1, 1).expect("unpack sign bits");
+        let values = unpacked.to_f32_vec(4).expect("unpacked to_f32");
+        assert_eq!(values, vec![-1.0, 1.0, 1.0, -1.0]);
+    }
+
+    #[test]
+    fn turboquant_direct_attention_matches_dequantized_sdpa_uniform() {
+        let dim = 16usize;
+        let config = TurboQuantConfig::uniform(8, 8);
+        let b = 1i32;
+        let h = 2i32;
+        let prefill = 3i32;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let step_keys = InlineArray::from_f32_slice(&make_data(step_len, 1.9), &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+        assert!(seed_cache.keys.as_ref().and_then(|k| k.gpu.as_ref()).is_some());
+        assert!(seed_cache.values.as_ref().and_then(|v| v.gpu.as_ref()).is_some());
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache.append(&step_keys, &step_values).expect("reference append");
+        let full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let mut reference =
+            crate::decode::sdpa_causal_like_mlx(&queries, &full_keys, &full_values, scale, 1);
+
+        let direct_vals = direct.to_f32_vec((b * h * d) as usize).expect("direct to_f32");
+        let reference_vals = reference
+            .to_f32_vec((b * h * d) as usize)
+            .expect("reference to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < 1e-4,
+            "direct attention diverged from dequantized sdpa: max_abs_diff={max_abs_diff}"
         );
     }
 

@@ -568,7 +568,8 @@ int mlx_inline_turboquant_score(
     uint32_t                n_seq,
     uint32_t                cache_seq_capacity,
     uint32_t                q_heads,
-    uint32_t                kv_heads);
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
 
 // Fused mixed TurboQuant key scoring.
 // regular/outlier query tensors: [N, D_reg]/[N, D_out] f32
@@ -602,7 +603,8 @@ int mlx_inline_turboquant_mixed_score(
     uint32_t                n_seq,
     uint32_t                cache_seq_capacity,
     uint32_t                q_heads,
-    uint32_t                kv_heads);
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
 
 // Pack sign(projected >= 0) along the last dimension into uint32 words.
 // projected: [N, D] f32

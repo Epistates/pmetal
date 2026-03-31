@@ -876,9 +876,10 @@ static const char* TURBOQUANT_SCORE_SOURCE = R"(
     float residual = residual_norms[kv_scalar_idx];
     float score = mse;
     if (residual > 0.0f) {
-        score += qjl * residual;
+        score += qjl * residual * (1.2533141373155003f / float(dim));
     }
-    output[scalar_idx] = norms[kv_scalar_idx] * score;
+    float attn_scale = as_type<float>((uint)attn_scale_bits);
+    output[scalar_idx] = norms[kv_scalar_idx] * score * attn_scale;
 )";
 
 // MIXED_SCORE: combine regular and outlier TurboQuant key contributions in one
@@ -928,18 +929,19 @@ static const char* TURBOQUANT_MIXED_SCORE_SOURCE = R"(
     float regular_score = regular_mse;
     float regular_residual = regular_residual_norms[kv_scalar_idx];
     if (regular_residual > 0.0f) {
-        regular_score += regular_qjl * regular_residual;
+        regular_score += regular_qjl * regular_residual * (1.2533141373155003f / float(regular_dim));
     }
     regular_score *= regular_norms[kv_scalar_idx];
 
     float outlier_score = outlier_mse;
     float outlier_residual = outlier_residual_norms[kv_scalar_idx];
     if (outlier_residual > 0.0f) {
-        outlier_score += outlier_qjl * outlier_residual;
+        outlier_score += outlier_qjl * outlier_residual * (1.2533141373155003f / float(outlier_dim));
     }
     outlier_score *= outlier_norms[kv_scalar_idx];
 
-    output[scalar_idx] = regular_score + outlier_score;
+    float attn_scale = as_type<float>((uint)attn_scale_bits);
+    output[scalar_idx] = (regular_score + outlier_score) * attn_scale;
 )";
 
 static const char* TURBOQUANT_PACK_SIGN_BITS_SOURCE = R"(
@@ -1285,7 +1287,8 @@ int mlx_inline_turboquant_score(
     uint32_t                n_seq,
     uint32_t                cache_seq_capacity,
     uint32_t                q_heads,
-    uint32_t                kv_heads)
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits)
 {
     using namespace mlx::core;
 
@@ -1309,7 +1312,8 @@ int mlx_inline_turboquant_score(
              {"n_seq",       (int)n_seq},
              {"cache_seq_capacity", (int)cache_seq_capacity},
              {"q_heads",     (int)q_heads},
-             {"kv_heads",    (int)kv_heads}},
+             {"kv_heads",    (int)kv_heads},
+             {"attn_scale_bits",  (int)attn_scale_bits}},
             std::nullopt, false, {}
         );
         new (out_scores->buf) array(outputs[0]);
@@ -1345,7 +1349,8 @@ int mlx_inline_turboquant_mixed_score(
     uint32_t                n_seq,
     uint32_t                cache_seq_capacity,
     uint32_t                q_heads,
-    uint32_t                kv_heads)
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits)
 {
     using namespace mlx::core;
 
@@ -1385,7 +1390,8 @@ int mlx_inline_turboquant_mixed_score(
              {"n_seq",       (int)n_seq},
              {"cache_seq_capacity", (int)cache_seq_capacity},
              {"q_heads",     (int)q_heads},
-             {"kv_heads",    (int)kv_heads}},
+             {"kv_heads",    (int)kv_heads},
+             {"attn_scale_bits",  (int)attn_scale_bits}},
             std::nullopt, false, {}
         );
         new (out_scores->buf) array(outputs[0]);
