@@ -73,6 +73,9 @@ pub mod inference_runner;
 #[cfg(any(feature = "models", feature = "native-only"))]
 pub mod native_inference;
 
+/// Shared parsing of assistant responses, including `<think>` handling.
+pub mod response_parser;
+
 // NOTE: `core` below shadows the Rust built-in `core` crate within this file.
 // Any code added here that needs `core::fmt`, `core::mem`, etc. must use `::core::`.
 #[cfg(feature = "core")]

@@ -2210,6 +2210,8 @@ fn download_metallib(dest: &std::path::Path) -> bool {
 /// the environment mutation happens in a single-threaded context.
 fn main() -> anyhow::Result<()> {
     ensure_metallib();
+    #[cfg(feature = "metal")]
+    let _ = pmetal_metal::context::MetalContext::device_available();
     tokio_main()
 }
 

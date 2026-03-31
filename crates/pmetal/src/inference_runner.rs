@@ -218,13 +218,14 @@ impl InferenceRunner {
             .frequency_penalty
             .unwrap_or(defaults.frequency_penalty);
         let presence_penalty = config.presence_penalty.unwrap_or(defaults.presence_penalty);
-        let native_qwen_candidate = config.lora_path.is_none()
-            && !config.fp8
-            && matches!(
-                crate::native_inference::detect_arch(model_path),
-                Some(crate::native_inference::NativeArch::Qwen3)
-                    | Some(crate::native_inference::NativeArch::Qwen3_5)
-            );
+        let native_bridge_info =
+            if config.lora_path.is_none() && !config.fp8 && config.experts_dir.is_none() {
+                crate::native_inference::load_native_bridge_info(model_path)
+                    .map_err(Exception::custom)?
+            } else {
+                None
+            };
+        let native_bridge_candidate = native_bridge_info.is_some();
 
         // 4. Prime the Metal runtime before MLX model construction. The stable
         // benchmark path always initializes Metal first, and doing the same here
@@ -232,7 +233,7 @@ impl InferenceRunner {
         // loading competing Metal pipeline state that degrades MLX performance.
         #[cfg(feature = "metal")]
         {
-            if !native_qwen_candidate {
+            if !native_bridge_candidate {
                 if let Err(err) = pmetal_metal::context::MetalContext::global() {
                     tracing::warn!("Metal context prewarm failed: {err}");
                 }
@@ -243,9 +244,8 @@ impl InferenceRunner {
         // the interactive inference path follows the same load ordering as the
         // stable benchmark flow. LoRA still tokenizes first because its loader
         // needs the final max_seq_len up front.
-        let mut preloaded_model = if native_qwen_candidate {
-            // Skip dynamic model loading for Qwen bridge-native inference.
-            tracing::info!("Qwen bridge-native path detected — skipping shared model load");
+        let mut preloaded_model = if native_bridge_candidate {
+            tracing::info!("Bridge-native path detected — skipping shared model load");
             None
         } else if config.lora_path.is_none() {
             Some(load_standard_model_for_inference(model_path, &config)?)
@@ -275,8 +275,22 @@ impl InferenceRunner {
                 .map_err(|e| Exception::custom(e.to_string()))?;
             (ids, Some(detected.template_type))
         } else {
+            let prompt_text = if config.chat_messages.is_some()
+                || config
+                    .system_message
+                    .as_deref()
+                    .is_some_and(|system| !system.trim().is_empty())
+            {
+                build_plain_conversation_prompt(
+                    config.chat_messages.as_ref(),
+                    config.system_message.as_deref(),
+                    &config.prompt,
+                )
+            } else {
+                config.prompt.clone()
+            };
             let ids = tokenizer
-                .encode(&config.prompt)
+                .encode(&prompt_text)
                 .map_err(|e| Exception::custom(e.to_string()))?;
             (ids, None)
         };
@@ -313,31 +327,32 @@ impl InferenceRunner {
         let max_seq_len = input_ids.len() + config.max_tokens + 64;
 
         let cache_request = cache_mode_request_from_config(&config);
-        let (model, cache, mamba_cache, native_turboquant) = if native_qwen_candidate {
-            // Native Qwen path: parse the shared bridge config directly.
-            let qwen_config = pmetal_bridge::qwen3_native::load_config(model_path)
-                .map_err(|e| Exception::custom(format!("Qwen config parse: {e}")))?;
-            let n_layers = qwen_config.num_hidden_layers as usize;
-            let n_kv = qwen_config.get_num_kv_heads() as usize;
-            let hd = qwen_config.get_head_dim() as usize;
-            let base_cache_config = KVCacheConfig::new(n_layers, max_seq_len, n_kv, hd);
-            let cache_selection =
-                select_cache_mode_for_model(&base_cache_config, model_path, 0, cache_request);
+        let (model, cache, mamba_cache, native_turboquant) = if let Some(native_info) =
+            native_bridge_info
+        {
+            let base_cache_config = native_bridge_base_cache_config(native_info, max_seq_len);
+            let cache_selection = select_cache_mode_with_working_set(
+                &base_cache_config,
+                estimate_weight_bytes(model_path, 0, cache_request.fp8),
+                cache_request,
+                None,
+            );
 
-            if native_cache_mode_supported(cache_selection.mode) {
+            if native_cache_mode_supported(native_info, cache_selection.mode) {
                 log_cache_selection(&cache_selection, max_seq_len);
-                let cache = build_cache_from_base_config(&base_cache_config, cache_selection.mode);
-                let mamba_cache = Some(MambaCache::new(n_layers));
+                let cache = build_native_placeholder_cache(&base_cache_config);
+                let mamba_cache = Some(MambaCache::new(native_info.num_layers));
                 (
                     LoadedModel::NativeOnly,
                     cache,
                     mamba_cache,
-                    turboquant_config_from_mode(cache_selection.mode),
+                    turboquant_config_from_mode(native_info, cache_selection.mode),
                 )
             } else {
                 tracing::info!(
                     mode = %cache_selection.mode.describe(),
-                    "Native Qwen3.5 path does not support the selected cache mode; using shared model path"
+                    arch = native_info.arch.label(),
+                    "Bridge-native path does not support the selected cache mode; using shared model path"
                 );
                 let m = match preloaded_model.take() {
                     Some(model) => model,
@@ -459,18 +474,20 @@ impl InferenceGenState {
     ///
     /// Split from `InferenceRunner` so callers can hold `&runner.tokenizer`
     /// while calling `runner.gen.generate_streaming(...)`.
-    pub fn generate_streaming<F>(&mut self, mut on_token: F) -> Result<GenerationOutput, Exception>
+    pub fn generate_streaming<F>(&mut self, on_token: F) -> Result<GenerationOutput, Exception>
     where
         F: FnMut(u32) -> bool,
     {
         if matches!(self.model, LoadedModel::NativeOnly) {
+            let stop_tokens = self.gen_config.stop_tokens.clone();
+            let mut on_token = on_token;
             let output = crate::native_inference::run_native_inference(
                 &self.model_path,
                 &self.input_ids,
                 self.gen_config.max_new_tokens,
                 self.gen_config.temperature,
                 self.native_turboquant,
-                on_token,
+                |token| forward_native_token(&stop_tokens, &mut on_token, token),
             )
             .map_err(Exception::custom)?;
 
@@ -512,7 +529,7 @@ impl InferenceGenState {
             }
             LoadedModel::NativeOnly => {
                 // native path returns before reaching this fallback code
-                unreachable!("NativeOnly model should have returned before the mlx-rs fallback")
+                unreachable!("NativeOnly model should have returned before the shared fallback")
             }
         }
     }
@@ -643,6 +660,16 @@ impl InferenceGenState {
     }
 }
 
+fn forward_native_token<F>(stop_tokens: &[u32], on_token: &mut F, token: u32) -> bool
+where
+    F: FnMut(u32) -> bool,
+{
+    if stop_tokens.contains(&token) {
+        return false;
+    }
+    on_token(token)
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 fn cache_mode_request_from_config(config: &InferenceRunnerConfig) -> CacheModeRequest {
@@ -701,11 +728,39 @@ fn load_standard_model_for_inference(
     Ok(model)
 }
 
-fn native_cache_mode_supported(mode: CacheMode) -> bool {
-    matches!(mode, CacheMode::Standard | CacheMode::TurboQuant { .. })
+fn native_bridge_base_cache_config(
+    info: crate::native_inference::NativeBridgeInfo,
+    max_seq_len: usize,
+) -> KVCacheConfig {
+    KVCacheConfig::new(
+        info.num_layers,
+        max_seq_len,
+        info.num_kv_heads,
+        info.head_dim,
+    )
+    .with_value_head_dim(info.value_head_dim)
+    .with_dtype(Dtype::Float16)
 }
 
-fn turboquant_config_from_mode(mode: CacheMode) -> Option<BridgeTurboQuantConfig> {
+fn native_cache_mode_supported(
+    info: crate::native_inference::NativeBridgeInfo,
+    mode: CacheMode,
+) -> bool {
+    match mode {
+        CacheMode::Standard => true,
+        CacheMode::TurboQuant { .. } => info.supports_turboquant,
+        _ => false,
+    }
+}
+
+fn turboquant_config_from_mode(
+    info: crate::native_inference::NativeBridgeInfo,
+    mode: CacheMode,
+) -> Option<BridgeTurboQuantConfig> {
+    if !info.supports_turboquant {
+        return None;
+    }
+
     match mode {
         CacheMode::TurboQuant { config } => Some(BridgeTurboQuantConfig {
             keys: bridge_turboquant_tensor_config(config.keys),
@@ -1164,6 +1219,13 @@ fn build_cache_from_base_config(base_cache_config: &KVCacheConfig, mode: CacheMo
     let safe_mode = sanitize_cache_mode_for_config(base_cache_config, mode);
     KVCache::new(base_cache_config.clone().with_mode(safe_mode))
 }
+
+fn build_native_placeholder_cache(base_cache_config: &KVCacheConfig) -> KVCache {
+    // Bridge-native inference owns its own KV/TurboQuant cache implementation.
+    // Keep the runner's structural cache in the simplest mode so the native
+    // path does not instantiate the shared pmetal-mlx TurboQuant stack.
+    KVCache::new(base_cache_config.clone().with_mode(CacheMode::Standard))
+}
 /// Check if a model directory looks instruction-tuned and should default to chat.
 ///
 /// Primary signal is `tokenizer_config.json` containing a `chat_template`,
@@ -1217,13 +1279,101 @@ fn build_chat_messages(
     messages
 }
 
+fn build_plain_conversation_prompt(
+    history: Option<&Vec<Message>>,
+    system_message: Option<&str>,
+    prompt: &str,
+) -> String {
+    let messages = build_chat_messages(history, system_message, prompt);
+    let mut lines = Vec::with_capacity(messages.len() + 1);
+
+    for message in messages {
+        match message.role.as_str() {
+            "system" => lines.push(format!("System: {}", message.content)),
+            "user" => lines.push(format!("User: {}", message.content)),
+            "assistant" => lines.push(format!("Assistant: {}", message.content)),
+            _ => {}
+        }
+    }
+
+    if !matches!(lines.last(), Some(last) if last.starts_with("Assistant:")) {
+        lines.push("Assistant:".to_string());
+    }
+
+    lines.join("\n\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native_inference::{NativeArch, NativeBridgeInfo};
     use tempfile::tempdir;
 
     fn qwen3_cache_config(max_seq_len: usize) -> KVCacheConfig {
         KVCacheConfig::new(28, max_seq_len, 8, 128)
+    }
+
+    #[test]
+    fn native_bridge_base_cache_config_preserves_asymmetric_value_dim() {
+        let info = NativeBridgeInfo {
+            arch: NativeArch::DeepSeek,
+            num_layers: 61,
+            num_kv_heads: 128,
+            head_dim: 192,
+            value_head_dim: 128,
+            supports_turboquant: false,
+        };
+        let config = native_bridge_base_cache_config(info, 4096);
+        assert_eq!(config.num_layers, 61);
+        assert_eq!(config.num_kv_heads, 128);
+        assert_eq!(config.head_dim, 192);
+        assert_eq!(config.value_head_dim, 128);
+        assert_eq!(config.dtype, Dtype::Float16);
+    }
+
+    #[test]
+    fn native_placeholder_cache_stays_standard_even_for_turboquant_mode() {
+        let base = qwen3_cache_config(4096).with_mode(CacheMode::TurboQuant {
+            config: TurboQuantConfig::uniform(8, 8),
+        });
+        let cache = build_native_placeholder_cache(&base);
+        assert_eq!(cache.config().mode, CacheMode::Standard);
+        assert_eq!(cache.config().head_dim, 128);
+        assert_eq!(cache.config().value_head_dim, 128);
+    }
+
+    #[test]
+    fn native_cache_mode_support_respects_turboquant_capability() {
+        let qwen = NativeBridgeInfo {
+            arch: NativeArch::Qwen3_5,
+            num_layers: 28,
+            num_kv_heads: 2,
+            head_dim: 128,
+            value_head_dim: 128,
+            supports_turboquant: true,
+        };
+        let llama4 = NativeBridgeInfo {
+            arch: NativeArch::Llama4,
+            num_layers: 48,
+            num_kv_heads: 8,
+            head_dim: 128,
+            value_head_dim: 128,
+            supports_turboquant: false,
+        };
+
+        assert!(native_cache_mode_supported(qwen, CacheMode::Standard));
+        assert!(native_cache_mode_supported(
+            qwen,
+            CacheMode::TurboQuant {
+                config: TurboQuantConfig::uniform(8, 8),
+            }
+        ));
+        assert!(!native_cache_mode_supported(
+            llama4,
+            CacheMode::TurboQuant {
+                config: TurboQuantConfig::uniform(8, 8),
+            }
+        ));
     }
 
     #[test]
@@ -1463,6 +1613,35 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].content, "write fizzbuzz");
+    }
+
+    #[test]
+    fn build_plain_conversation_prompt_preserves_history_for_base_models() {
+        let history = vec![Message::user("hello"), Message::assistant("hi there")];
+
+        let prompt = build_plain_conversation_prompt(
+            Some(&history),
+            Some("You are a helpful assistant."),
+            "what is the capital of france?",
+        );
+
+        assert_eq!(
+            prompt,
+            "System: You are a helpful assistant.\n\nUser: hello\n\nAssistant: hi there\n\nUser: what is the capital of france?\n\nAssistant:"
+        );
+    }
+
+    #[test]
+    fn forward_native_token_stops_before_callback_on_stop_token() {
+        let mut seen = Vec::new();
+        let mut callback = |token| {
+            seen.push(token);
+            true
+        };
+
+        assert!(forward_native_token(&[7, 9], &mut callback, 3));
+        assert!(!forward_native_token(&[7, 9], &mut callback, 7));
+        assert_eq!(seen, vec![3]);
     }
 
     #[test]
