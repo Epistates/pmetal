@@ -1447,6 +1447,108 @@ pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
 // Generation loop
 // ============================================================================
 
+/// Run prompt prefill and return the first sampled token.
+pub fn prefill_first_token(
+    weights: &NativeWeights,
+    cache: &mut NativeCache,
+    input_ids: &[u32],
+    temperature: f32,
+) -> u32 {
+    crate::decode::prefill_first_token(weights, cache, input_ids, temperature, forward_step)
+}
+
+fn prepare_generation_cache(cache: &mut NativeCache) {
+    cache.eval_and_detach_states();
+    bridge::clear_cache();
+}
+
+fn prime_generation_impl(
+    weights: &NativeWeights,
+    cache: &mut NativeCache,
+    first_token: u32,
+    temperature: f32,
+    reset_peak_memory: bool,
+    log_session: bool,
+) -> InlineArray {
+    crate::decode::prime_generation(
+        "DEEPSEEK",
+        weights.model_dtype,
+        weights,
+        cache,
+        first_token,
+        temperature,
+        reset_peak_memory,
+        log_session,
+        prepare_generation_cache,
+        forward_step,
+    )
+}
+
+fn generate_from_primed_sample_impl(
+    weights: &NativeWeights,
+    cache: &mut NativeCache,
+    current_y: InlineArray,
+    max_tokens: usize,
+    temperature: f32,
+    log_stats: bool,
+    mut on_token: impl FnMut(u32) -> bool,
+) -> Vec<u32> {
+    crate::decode::generate_from_primed_sample(
+        "DEEPSEEK",
+        weights,
+        cache,
+        current_y,
+        max_tokens,
+        temperature,
+        log_stats,
+        |token| on_token(token),
+        forward_step,
+    )
+}
+
+/// Run one MLX-LM-style benchmark trial on the canonical DeepSeek native path.
+pub fn benchmark_mlx_lm_trial(
+    weights: &NativeWeights,
+    prompt_ids: &[u32],
+    generation_tokens: usize,
+) -> crate::decode::BenchmarkTrial {
+    crate::inline_array::reset_peak_memory();
+    let mut cache = NativeCache::new_empty(weights.layers.len());
+
+    let prompt_tic = std::time::Instant::now();
+    let first_tok = prefill_first_token(weights, &mut cache, prompt_ids, 0.0);
+    let current_y = prime_generation_impl(weights, &mut cache, first_tok, 0.0, false, false);
+    let prompt_secs = prompt_tic.elapsed().as_secs_f64();
+
+    let generation_secs = if generation_tokens > 1 {
+        let generation_tic = std::time::Instant::now();
+        let generated_tail = generate_from_primed_sample_impl(
+            weights,
+            &mut cache,
+            current_y,
+            generation_tokens - 1,
+            0.0,
+            false,
+            |_| true,
+        );
+        debug_assert_eq!(generated_tail.len(), generation_tokens - 1);
+        generation_tic.elapsed().as_secs_f64()
+    } else {
+        crate::inline_array::synchronize();
+        f64::MIN_POSITIVE
+    };
+
+    let trial = crate::decode::BenchmarkTrial {
+        prompt_secs,
+        generation_secs,
+        peak_memory_bytes: crate::inline_array::get_peak_memory(),
+    };
+
+    crate::inline_array::synchronize();
+    crate::inline_array::clear_cache();
+    trial
+}
+
 /// Run the full generation loop with async GPU pipelining.
 ///
 /// `first_token` is the last token of the prompt (prefill already committed
@@ -1462,67 +1564,14 @@ pub fn generate(
     temperature: f32,
     mut on_token: impl FnMut(u32) -> bool,
 ) -> Vec<u32> {
-    let mut tokens = Vec::with_capacity(max_tokens);
-
-    crate::decode::begin_generation_session("DEEPSEEK", weights.model_dtype);
-
-    // Evaluate and detach prefill cache states.
-    cache.eval_and_detach_states();
-    bridge::clear_cache();
-
-    // First decode step.
-    let input_token = InlineArray::from_i32(first_token as i32).reshape(&[1, 1]);
-    let logits = forward_step(weights, &input_token, cache);
-    let logits_2d = logits.squeeze(1);
-    let mut current_y = sample_token(&logits_2d, temperature);
-    current_y.async_eval_ref();
-
-    let mut step_times: Vec<f64> = Vec::new();
-
-    for step in 0..max_tokens {
-        let next_y = if step + 1 < max_tokens {
-            let t_step = std::time::Instant::now();
-            let next_input = current_y.reshape(&[1, 1]);
-            let next_logits = forward_step(weights, &next_input, cache);
-            let next_2d = next_logits.squeeze(1);
-            let next_y = sample_token(&next_2d, temperature);
-            next_y.async_eval_ref();
-            step_times.push(t_step.elapsed().as_secs_f64() * 1000.0);
-            Some(next_y)
-        } else {
-            None
-        };
-
-        if step == 0 {
-            current_y.eval();
-        }
-        let token_val = current_y.item_u32();
-
-        tokens.push(token_val);
-        if !on_token(token_val) {
-            break;
-        }
-        let Some(next_y) = next_y else {
-            break;
-        };
-        current_y = next_y;
-
-        if step % 256 == 255 {
-            bridge::clear_cache();
-        }
-    }
-
-    if step_times.len() > 20 {
-        step_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let skip = 10;
-        let avg = step_times[skip..].iter().sum::<f64>() / (step_times.len() - skip) as f64;
-        let p50 = step_times[step_times.len() / 2];
-        eprintln!(
-            "[DEEPSEEK] per-step: avg={avg:.2}ms p50={p50:.2}ms = {:.0} tok/s",
-            1000.0 / avg
-        );
-    }
-
-    bridge::synchronize();
-    tokens
+    let current_y = prime_generation_impl(weights, cache, first_token, temperature, true, true);
+    generate_from_primed_sample_impl(
+        weights,
+        cache,
+        current_y,
+        max_tokens,
+        temperature,
+        true,
+        |token| on_token(token),
+    )
 }

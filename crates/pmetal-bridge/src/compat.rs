@@ -382,7 +382,7 @@ pub trait ModuleParameters {
 /// evaluated.  The caller's originals are unaffected.
 pub fn eval<'a>(arrays: impl IntoIterator<Item = &'a Array>) -> Result<(), Exception> {
     for a in arrays {
-        let mut c = a.clone();
+        let c = a.clone();
         c.eval();
     }
     Ok(())
@@ -393,7 +393,7 @@ pub fn eval_params(params: ModuleParamRef<'_>) -> Result<(), Exception> {
     fn walk(node: &NestedValue<&Array>) {
         match node {
             NestedValue::Value(a) => {
-                let mut c = (*a).clone();
+                let c = (*a).clone();
                 c.eval();
             }
             NestedValue::Map(m) => {
@@ -994,7 +994,7 @@ pub mod ops {
 
     /// Returns `true` (scalar bool) if any element is NaN.
     pub fn item_bool(a: &Array) -> bool {
-        let mut a_clone = a.clone();
+        let a_clone = a.clone();
         a_clone.eval();
         // Cast to f32 and check if value > 0.5
         let f = a_clone.as_dtype(Dtype::Float32.as_i32()).item_f32();
@@ -1748,7 +1748,7 @@ pub mod indexing {
     }
 
     fn select_axis_idx(a: &Array, axis: usize, idx: i32) -> Array {
-        let ndim = a.ndim();
+        let _ndim = a.ndim();
         let axis_i32 = axis as i32;
         let dim = a.dim(axis_i32);
         let normalized = if idx < 0 { dim + idx } else { idx };
@@ -1819,6 +1819,19 @@ pub mod indexing {
                 self,
                 ((idx.0.start as i32)..(idx.0.end as i32), ..),
             )
+        }
+    }
+
+    impl IndexOp<(RangeFrom<i32>, RangeFull)> for Array {
+        fn index(&self, idx: (RangeFrom<i32>, RangeFull)) -> Self {
+            let axis = normalize_axis(0, self.ndim() as usize);
+            slice_axis_from(self, axis, idx.0.start)
+        }
+    }
+
+    impl IndexOp<(RangeFrom<usize>, RangeFull)> for Array {
+        fn index(&self, idx: (RangeFrom<usize>, RangeFull)) -> Self {
+            IndexOp::<(RangeFrom<i32>, RangeFull)>::index(self, ((idx.0.start as i32).., ..))
         }
     }
 
@@ -2641,8 +2654,7 @@ macro_rules! impl_module_params {
 /// They implement `pmetal_bridge::compat::ModuleParameters` directly.
 pub mod layers {
     use super::{
-        Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue, Param,
-        Parameter, ops, random,
+        Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, Param, ops, random,
     };
     use std::collections::HashMap;
     use std::rc::Rc;
