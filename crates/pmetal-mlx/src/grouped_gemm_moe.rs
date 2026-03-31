@@ -378,9 +378,9 @@ impl GroupedGemmMoE {
         weights: &Array,
         expert_indices: &Array,
     ) -> Result<Array, Exception> {
-        let mut ei_owned = expert_indices.clone();
+        let ei_owned = expert_indices.clone();
         ei_owned.eval();
-        let mut wt_owned = weights.clone();
+        let wt_owned = weights.clone();
         wt_owned.eval();
 
         let n_tokens = x.dim(0) as usize;
@@ -476,7 +476,7 @@ impl GroupedGemmMoE {
         let n_tokens = routing_probs.dim(0) as f32;
 
         // Compute fraction of tokens routed to each expert
-        let mut ei_owned = expert_indices.clone();
+        let ei_owned = expert_indices.clone();
         ei_owned.eval();
         let indices_flat = ei_owned.flatten(0, -1);
 

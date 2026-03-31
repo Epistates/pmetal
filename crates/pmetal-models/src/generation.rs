@@ -62,8 +62,8 @@ fn build_ane_engine(
     pmetal_metal::error::MetalError,
 > {
     let mut engine = pmetal_metal::ane::inference::AneInferenceEngine::new(config, prompt_len)?;
-    engine.load_weights_safetensors(model_path);
-    engine.compile_kernels();
+    engine.load_weights_safetensors(model_path)?;
+    engine.compile_kernels()?;
     Ok(engine)
 }
 
@@ -126,7 +126,7 @@ fn build_hybrid_cpu_engine(
     pmetal_metal::error::MetalError,
 > {
     let mut engine = pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine::new(config)?;
-    engine.load_weights_safetensors(model_path);
+    engine.load_weights_safetensors(model_path)?;
     Ok(engine)
 }
 
@@ -327,7 +327,7 @@ where
     for start in (0..input_ids.len()).step_by(step_size) {
         let end = (start + step_size).min(input_ids.len());
         let chunk_input = token_input_array(&input_ids[start..end]);
-        let mut logits = forward(&chunk_input)?;
+        let logits = forward(&chunk_input)?;
         if end < input_ids.len() {
             logits.eval();
             pmetal_mlx::memory::clear_cache();
@@ -1068,7 +1068,7 @@ impl Sampler {
 /// Greedy sampling - returns the token with highest probability.
 /// Note: item() internally calls eval(), so no explicit eval() needed.
 fn greedy_sample(logits: &Array) -> Result<u32, Exception> {
-    let mut token_id = argmax(logits);
+    let token_id = argmax(logits);
     Ok(token_id.item::<u32>())
 }
 
@@ -1380,7 +1380,7 @@ fn gpu_categorical_sample(log_probs: &Array, temperature: f32) -> Result<u32, Ex
     };
 
     // Sample using GPU-native categorical (axis=-1 by default)
-    let mut sampled = categorical(&scaled, -1);
+    let sampled = categorical(&scaled, -1);
 
     // Extract the scalar token ID (item() calls eval() internally)
     Ok(sampled.item::<u32>())
@@ -1432,7 +1432,7 @@ where
         );
 
         // Get logits from model
-        let mut logits = forward_fn(&input)?;
+        let logits = forward_fn(&input)?;
         logits.eval();
 
         // Extract logits for the last position [vocab_size]
@@ -1501,10 +1501,9 @@ where
     let prompt_len = input_ids.len();
 
     // Prefill: process long prompts in chunks to bound peak allocator pressure.
-    let mut logits =
-        run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-            forward_fn(chunk_input, cache)
-        })?;
+    let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+        forward_fn(chunk_input, cache)
+    })?;
     logits.eval();
 
     // Get logits for the last position and sample first new token
@@ -1533,7 +1532,7 @@ where
         let token_input = Array::from_slice(&[next_token as i32], &[1, 1]);
 
         // Forward with cache - only processes the new token
-        let mut logits = forward_fn(&token_input, cache)?;
+        let logits = forward_fn(&token_input, cache)?;
         logits.eval();
 
         // Get logits for the (only) position
@@ -1640,7 +1639,7 @@ where
     };
 
     let (mut current_y, mut current_logprobs) = {
-        let mut logits =
+        let logits =
             run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
                 let _stream_ctx = StreamContext::new(&generation_stream);
                 forward_fn(chunk_input, cache)
@@ -1760,7 +1759,7 @@ where
     };
 
     let (mut current_y, mut current_logprobs) = {
-        let mut logits =
+        let logits =
             run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
                 let _stream_ctx = StreamContext::new(&generation_stream);
                 forward_fn(chunk_input, cache)
@@ -1902,11 +1901,10 @@ where
     let mut token_counts: HashMap<u32, usize> = HashMap::new();
 
     // Get vocab size from the final prefill chunk output.
-    let mut logits =
-        run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
-            let _stream_ctx = StreamContext::new(&generation_stream);
-            forward_fn(chunk_input, cache)
-        })?;
+    let logits = run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
+        let _stream_ctx = StreamContext::new(&generation_stream);
+        forward_fn(chunk_input, cache)
+    })?;
     let vocab_size = logits.dim(-1) as usize;
 
     // Create Metal sampler with optional seed for reproducibility
@@ -1958,7 +1956,7 @@ where
 
     // Sample first token
     let current_logits = extract_logits(&logits)?;
-    let mut penalized_logits = if use_repetition || use_freq_presence {
+    let penalized_logits = if use_repetition || use_freq_presence {
         apply_penalties(&current_logits, &[], &token_counts, &config)?
     } else {
         current_logits
@@ -2022,7 +2020,7 @@ where
 
         // Apply penalties to logits before sampling
         let generated = &all_tokens[prompt_len..]; // Only tokens we generated
-        let mut penalized_logits = if use_repetition || use_freq_presence {
+        let penalized_logits = if use_repetition || use_freq_presence {
             apply_penalties(&next_logits, generated, &token_counts, &config)?
         } else {
             next_logits
@@ -2079,7 +2077,7 @@ where
         // Stream context ONLY around forward pass (like Python's `with mx.stream(generation_stream):`)
         let _stream_ctx = StreamContext::new(&generation_stream);
         let out = forward_fn(input, cache)?;
-        let mut logits = select_axis(&out, -1, 1);
+        let logits = select_axis(&out, -1, 1);
         Ok(argmax_axis(&logits, -1))
     };
 
@@ -2215,7 +2213,7 @@ where
     let sampler = Sampler::new(config.clone());
 
     let mut current_y = {
-        let mut logits =
+        let logits =
             run_cached_prefill_chunks(input_ids, config.prefill_step_size, |chunk_input| {
                 let _stream_ctx = StreamContext::new(&generation_stream);
                 forward_fn(chunk_input, cache)

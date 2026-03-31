@@ -298,9 +298,9 @@ impl SpeculativeDecoder {
         // Evaluate for CPU access
         let mut dt_eval = draft_tokens.clone();
         dt_eval.eval();
-        let mut dp_eval = draft_probs.clone();
+        let dp_eval = draft_probs.clone();
         dp_eval.eval();
-        let mut tp_eval = target_probs.clone();
+        let tp_eval = target_probs.clone();
         tp_eval.eval();
         let draft_probs = &dp_eval;
         let target_probs = &tp_eval;
@@ -320,10 +320,10 @@ impl SpeculativeDecoder {
             let token = tokens[i];
 
             // Get probability of this token under both models
-            let mut p_draft = draft_probs
+            let p_draft = draft_probs
                 .slice(&[i as i32, token], &[i as i32 + 1, token + 1])
                 .reshape(&[]);
-            let mut p_target = target_probs
+            let p_target = target_probs
                 .slice(&[i as i32, token], &[i as i32 + 1, token + 1])
                 .reshape(&[]);
             p_draft.eval();
@@ -405,7 +405,7 @@ impl SpeculativeDecoder {
 
         let mut dt_eval = draft_tokens.clone();
         dt_eval.eval();
-        let mut tl_eval = target_logits.clone();
+        let tl_eval = target_logits.clone();
         tl_eval.eval();
         let target_logits = &tl_eval;
 
@@ -422,7 +422,7 @@ impl SpeculativeDecoder {
             let target_row = target_logits
                 .slice(&[i as i32, 0], &[i as i32 + 1, target_logits.dim(1)])
                 .squeeze(0);
-            let mut best_idx = target_row.argmax(-1);
+            let best_idx = target_row.argmax(-1);
             best_idx.eval();
             let best_token = best_idx.item::<u32>() as i32;
 
@@ -481,12 +481,12 @@ impl SpeculativeDecoder {
 
     /// Sample from a probability distribution.
     pub fn sample(&self, logits: &Array) -> Result<i32, Exception> {
-        let mut logits_owned = logits.clone();
+        let logits_owned = logits.clone();
         logits_owned.eval();
 
         if self.config.temperature == 0.0 {
             // Greedy
-            let mut max_idx = logits_owned.argmax(-1);
+            let max_idx = logits_owned.argmax(-1);
             max_idx.eval();
             Ok(max_idx.item::<u32>() as i32)
         } else {

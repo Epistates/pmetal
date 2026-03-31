@@ -609,7 +609,10 @@ mod tests {
     #[serial]
     fn test_granite_mlp() {
         let mlp = GraniteMLP::new(64, 256).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[1, 10, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 10, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let mut mlp = mlp;
         let out = mlp.forward(&x).unwrap();

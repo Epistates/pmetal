@@ -2544,8 +2544,7 @@ fn run_prefill_decode_pass(
     pmetal_bridge::compat::transforms::eval([&logits])?;
     let prefill_elapsed = prefill_start.elapsed();
 
-    let mut first_generated_token =
-        pmetal_bridge::compat::ops::argmax(&logits.index((.., -1, ..)), -1);
+    let first_generated_token = pmetal_bridge::compat::ops::argmax(&logits.index((.., -1, ..)), -1);
     let first_generated_token_id = first_generated_token.item::<u32>();
     let mut next_token = first_generated_token_id as i32;
     let decode_start = Instant::now();
@@ -2557,7 +2556,7 @@ fn run_prefill_decode_pass(
             Some(&mut cache),
             mamba_cache.as_mut(),
         )?;
-        let mut next_token_array =
+        let next_token_array =
             pmetal_bridge::compat::ops::argmax(&decode_logits.index((.., -1, ..)), -1);
         next_token = next_token_array.item::<u32>() as i32;
     }

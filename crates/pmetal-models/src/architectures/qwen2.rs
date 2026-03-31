@@ -788,7 +788,10 @@ mod tests {
         let config = small_config();
         let mut attn = Qwen2Attention::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 128], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 128],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = attn.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 128]);
@@ -800,7 +803,10 @@ mod tests {
         let config = small_config();
         let mut mlp = Qwen2MLP::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 128], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 128],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = mlp.forward(&x).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 128]);
@@ -812,7 +818,10 @@ mod tests {
         let config = small_config();
         let mut layer = Qwen2DecoderLayer::new(&config).unwrap();
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 4, 128], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 128],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = layer.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 128]);

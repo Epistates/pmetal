@@ -365,7 +365,7 @@ fn benchmark_attention_backends(
 ) -> Result<(AttentionBackendChoice, Array), Exception> {
     let reference_start = Instant::now();
     let reference_output = reference_attention_output(queries, keys, values, config)?;
-    let mut ref_eval = reference_output.clone();
+    let ref_eval = reference_output.clone();
     ref_eval.eval();
     let reference_elapsed = reference_start.elapsed();
 
@@ -428,7 +428,7 @@ fn benchmark_attention_candidate(
     let output = match execute_attention_backend(backend, queries, keys, values, config, metal_ctx)
     {
         Ok(output) => {
-            let mut out_eval = output.clone();
+            let out_eval = output.clone();
             out_eval.eval();
             output
         }
@@ -584,7 +584,7 @@ fn max_abs_diff(lhs: &Array, rhs: &Array) -> Result<f32, Exception> {
     };
 
     let diff = lhs.subtract(&rhs).abs_val().max(None);
-    let mut diff_owned = diff.clone();
+    let diff_owned = diff.clone();
     diff_owned.eval();
     Ok(diff_owned.item_f32())
 }

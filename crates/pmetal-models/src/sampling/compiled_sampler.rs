@@ -435,7 +435,7 @@ impl CompiledSampler {
         let log_probs = self.apply_filters_fused(&log_probs)?;
 
         // Get next random key - advances state for different samples each call
-        let rng_key = self.state.next_key();
+        let _rng_key = self.state.next_key();
 
         // Scale by inverse temperature and sample
         let scaled = log_probs.multiply(&self.inv_temp);
@@ -498,7 +498,7 @@ impl CompiledSampler {
     /// completes and returns the token as a u32.
     #[inline]
     pub fn sample_token(&mut self, logits: &Array) -> Result<u32, Exception> {
-        let mut token_array = self.sample(logits)?;
+        let token_array = self.sample(logits)?;
         Ok(token_array.item::<u32>())
     }
 

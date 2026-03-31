@@ -16,14 +16,14 @@ use pmetal_mlx::Array;
 /// Python-facing code that then wraps the result in numpy.
 pub fn mlx_to_f32_vec(array: &Array) -> Result<Vec<f32>, String> {
     // Force evaluation of lazy array
-    let mut array = array.clone();
+    let array = array.clone();
     array.eval();
 
     match array.dtype() {
         pmetal_mlx::Dtype::Float32 => Ok(array.as_slice::<f32>().to_vec()),
         _ => {
             // Convert to f32 first
-            let mut f32_array = array.as_dtype(pmetal_mlx::Dtype::Float32.as_i32());
+            let f32_array = array.as_dtype(pmetal_mlx::Dtype::Float32.as_i32());
             f32_array.eval();
             Ok(f32_array.as_slice::<f32>().to_vec())
         }

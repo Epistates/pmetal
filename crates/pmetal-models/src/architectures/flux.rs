@@ -817,13 +817,19 @@ mod tests {
 
         let batch = 1;
         let seq_len = 16 * 16; // 128x128 image patchified with 2x2 patches
-        let hidden_states =
-            pmetal_bridge::compat::random::normal(&[batch, seq_len as i32, 64], pmetal_bridge::compat::Dtype::Float32);
+        let hidden_states = pmetal_bridge::compat::random::normal(
+            &[batch, seq_len as i32, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let timestep = Array::from_slice(&[1.0f32], &[1]);
-        let prompt_emb =
-            pmetal_bridge::compat::random::normal(&[batch, 512, 4096], pmetal_bridge::compat::Dtype::Float32);
-        let pooled_prompt_emb =
-            pmetal_bridge::compat::random::normal(&[batch, 768], pmetal_bridge::compat::Dtype::Float32);
+        let prompt_emb = pmetal_bridge::compat::random::normal(
+            &[batch, 512, 4096],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let pooled_prompt_emb = pmetal_bridge::compat::random::normal(
+            &[batch, 768],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let text_ids = pmetal_bridge::compat::ops::zeros(&[batch, 512, 3], Dtype::Float32).unwrap();
         let image_ids =
             pmetal_bridge::compat::ops::zeros(&[batch, seq_len as i32, 3], Dtype::Float32).unwrap();

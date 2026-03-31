@@ -363,7 +363,7 @@ impl SequencePacker {
         packed_batch: &PackedBatch,
         original_count: usize,
     ) -> Result<Vec<Array>, Exception> {
-        let mut loss_owned = packed_loss.clone();
+        let loss_owned = packed_loss.clone();
         loss_owned.eval();
 
         let losses = vec![None; original_count];

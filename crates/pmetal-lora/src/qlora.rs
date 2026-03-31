@@ -176,7 +176,7 @@ impl QLoraLinear {
 
         // Cast weight to Float32 if needed (handles BFloat16, Float16, etc.)
         // This is necessary because models like Qwen3 use BFloat16 weights
-        let mut weight_f32 = if weight.dtype() != pmetal_bridge::compat::Dtype::Float32 {
+        let weight_f32 = if weight.dtype() != pmetal_bridge::compat::Dtype::Float32 {
             weight.as_type::<f32>()
         } else {
             weight.clone()

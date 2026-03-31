@@ -874,7 +874,10 @@ mod tests {
     #[serial]
     fn test_phi_rms_norm() {
         let mut norm = PhiRMSNorm::new(64, 1e-5);
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let out = norm.forward(&x).unwrap();
         out.eval().unwrap();
@@ -896,7 +899,10 @@ mod tests {
         };
 
         let mut attn = PhiAttention::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let out = attn.forward(&x, None).unwrap();
         out.eval().unwrap();
@@ -915,7 +921,10 @@ mod tests {
         };
 
         let mut mlp = PhiMLP::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let out = mlp.forward(&x).unwrap();
         out.eval().unwrap();
@@ -936,7 +945,10 @@ mod tests {
         };
 
         let mut layer = PhiDecoderLayer::new(&config).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let out = layer.forward(&x, None).unwrap();
         out.eval().unwrap();

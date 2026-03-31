@@ -479,7 +479,7 @@ impl Qwen3MoEBlock {
             || self.stacked_weight_signature.as_ref() != Some(&signature);
 
         if needs_refresh {
-            let (mut stacked_gate_proj, mut stacked_up_proj, mut stacked_down_proj) =
+            let (stacked_gate_proj, stacked_up_proj, stacked_down_proj) =
                 self.stack_expert_weights()?;
             stacked_gate_proj.eval();
             stacked_up_proj.eval();
@@ -1162,10 +1162,8 @@ mod tests {
         let _ = block.forward(&x).unwrap();
         assert!(block.has_stacked_moe());
 
-        block.experts[0].w1.weight = Array::zeros_f32(&[
-            config.get_moe_intermediate_size(),
-            config.hidden_size,
-        ]);
+        block.experts[0].w1.weight =
+            Array::zeros_f32(&[config.get_moe_intermediate_size(), config.hidden_size]);
 
         let reference = block.forward_per_expert(&x).unwrap();
         let fast = block.forward(&x).unwrap();

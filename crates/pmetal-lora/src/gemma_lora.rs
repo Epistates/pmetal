@@ -85,7 +85,7 @@ impl GemmaRmsNorm {
     /// to avoid recomputing weight+1 on every forward pass.
     pub fn update_weight_cache(&mut self) -> Result<(), Exception> {
         let weight_with_offset = self.weight.as_ref().add(&Array::from_f32(1.0));
-        let mut w = weight_with_offset.clone();
+        let w = weight_with_offset.clone();
         w.eval();
         self.weight_plus_one = Some(weight_with_offset);
         Ok(())

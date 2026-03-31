@@ -242,7 +242,7 @@ impl MetalSampler {
         }
 
         // Ensure array is evaluated before getting data pointer
-        let mut logits_owned = logits.clone();
+        let logits_owned = logits.clone();
         logits_owned.eval();
 
         // Check dtype - must be f32

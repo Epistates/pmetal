@@ -430,7 +430,7 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
                 let mut model = Self::Qwen3MoE(model);
-                model.init_post_load_fast_paths();
+                model.init_post_load_fast_paths()?;
                 Ok(model)
             }
             ModelArchitecture::Gemma => {
@@ -484,7 +484,7 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
                 let mut model = Self::DeepSeek(model);
-                model.init_post_load_fast_paths();
+                model.init_post_load_fast_paths()?;
                 Ok(model)
             }
             ModelArchitecture::Cohere => {
@@ -513,7 +513,7 @@ impl DynamicModel {
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
                 let mut model = Self::NemotronH(model);
-                model.init_post_load_fast_paths();
+                model.init_post_load_fast_paths()?;
                 Ok(model)
             }
             ModelArchitecture::Qwen3Next => {

@@ -503,7 +503,7 @@ fn benchmark_cross_entropy_backends(
 ) -> Result<(CrossEntropyBackendChoice, MetalCrossEntropyOutput)> {
     let mlx_start = Instant::now();
     let mlx_output = mlx_cut_cross_entropy(ctx, hidden_states, lm_head_weight, targets, config)?;
-    let mut mlx_loss_eval = mlx_output.loss.clone();
+    let mlx_loss_eval = mlx_output.loss.clone();
     mlx_loss_eval.eval();
     let mlx_loss = mlx_loss_eval.item_f32();
     let mlx_elapsed = mlx_start.elapsed();
@@ -517,7 +517,7 @@ fn benchmark_cross_entropy_backends(
         config,
     ) {
         Ok(output) => {
-            let mut loss_eval = output.loss.clone();
+            let loss_eval = output.loss.clone();
             loss_eval.eval();
             Some(output)
         }
@@ -529,7 +529,7 @@ fn benchmark_cross_entropy_backends(
     let metal_elapsed = metal_start.elapsed();
 
     if let Some(metal_output) = metal_output {
-        let mut metal_loss_eval = metal_output.loss.clone();
+        let metal_loss_eval = metal_output.loss.clone();
         metal_loss_eval.eval();
         let metal_loss = metal_loss_eval.item_f32();
         if losses_match(mlx_loss, metal_loss, config.use_fp16)

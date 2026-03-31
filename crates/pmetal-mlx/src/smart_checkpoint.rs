@@ -247,7 +247,7 @@ impl ActivationStore {
         let file_path = format!("{}/{}.bin", path, key.replace('/', "_"));
 
         // Evaluate before serializing.
-        let mut owned = activation.clone();
+        let owned = activation.clone();
         owned.eval();
 
         // Serialize as raw f32 bytes.
@@ -410,7 +410,7 @@ impl SmartCheckpointContext {
 
         match policy {
             CheckpointPolicy::OffloadDisk if self.config.allow_disk_offload => {
-                self.store.store_disk(&key, activation);
+                self.store.store_disk(&key, activation)?;
             }
             _ => {
                 // Store in memory (including CPU offload for now)
@@ -453,7 +453,7 @@ impl SmartCheckpointContext {
         let is_boundary = (self.current_layer + 1) % self.config.max_layers_per_block == 0;
 
         if is_boundary && self.config.eval_at_boundaries {
-            let mut owned = output.clone();
+            let owned = output.clone();
             owned.eval();
         }
 
@@ -706,7 +706,7 @@ impl LongContextManager {
     pub fn new(config: LongContextConfig, context_length: usize) -> Result<Self, Exception> {
         // Create checkpoint directory
         std::fs::create_dir_all(&config.checkpoint_dir)
-            .map_err(|e| Exception::custom(format!("Failed to create checkpoint dir: {}", e)));
+            .map_err(|e| Exception::custom(format!("Failed to create checkpoint dir: {}", e)))?;
 
         let total_segments = config.num_segments(context_length);
 
@@ -741,7 +741,7 @@ impl LongContextManager {
         let mut total_bytes = 0usize;
         let mut evaled: Vec<(String, Array)> = Vec::new();
         for (k, array) in activations.iter() {
-            let mut owned = array.clone();
+            let owned = array.clone();
             owned.eval();
             total_bytes += owned.size() * 4; // f32 bytes
             evaled.push((k.clone(), owned));

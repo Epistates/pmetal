@@ -469,9 +469,9 @@ impl Llama4MoE {
         // Eval routing tensors to CPU for index extraction.
         // The routing tensors are small relative to expert MLP compute, and
         // per-expert dispatch avoids running every expert over every token.
-        let mut expert_indices = expert_indices.as_type::<i32>();
+        let expert_indices = expert_indices.as_type::<i32>();
         expert_indices.eval();
-        let mut expert_weights = expert_weights;
+        let expert_weights = expert_weights;
         expert_weights.eval();
 
         let top_k = self.config.num_experts_per_tok as usize;
@@ -1154,7 +1154,10 @@ mod tests {
     #[serial]
     fn test_llama4_expert() {
         let expert = Llama4Expert::new(64, 256).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[1, 10, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 10, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let mut expert = expert;
         let out = expert.forward(&x).unwrap();
@@ -1174,8 +1177,10 @@ mod tests {
         config.num_experts_per_tok = 2;
 
         let mut moe = Llama4MoE::new(&config).unwrap();
-        let x =
-            pmetal_bridge::compat::random::normal(&[2, 5, config.hidden_size], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 5, config.hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let shape = x.shape().to_vec();
         let hidden_size = *shape.last().unwrap();
@@ -1245,10 +1250,12 @@ mod tests {
         config.num_experts_per_tok = 1;
 
         let mut moe = Llama4MoE::new(&config).unwrap();
-        let x =
-            pmetal_bridge::compat::random::normal(&[1, 4, config.hidden_size], pmetal_bridge::compat::Dtype::Float32)
-                .as_dtype(pmetal_bridge::compat::Dtype::Float16.as_i32())
-                .unwrap();
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, config.hidden_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        )
+        .as_dtype(pmetal_bridge::compat::Dtype::Float16.as_i32())
+        .unwrap();
 
         let output = moe.forward(&x).unwrap();
         output.eval().unwrap();
@@ -1319,7 +1326,10 @@ mod tests {
         let capacity = 0.5_f32; // k = 4
 
         let mut router = Llama4ModRouter::new(hidden).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[batch, seq_len, hidden],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let (selected_indices, router_logits, top_k_mask) = router.route(&x, capacity).unwrap();
         selected_indices.eval().unwrap();
@@ -1346,7 +1356,10 @@ mod tests {
         let capacity = 0.3_f32; // k = floor(0.3 * 10) = 3
 
         let mut router = Llama4ModRouter::new(hidden).unwrap();
-        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[batch, seq_len, hidden],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let (_indices, _logits, top_k_mask) = router.route(&x, capacity).unwrap();
         top_k_mask.eval().unwrap();
@@ -1389,7 +1402,10 @@ mod tests {
         let seq_len = 8i32;
         let hidden = config.hidden_size;
 
-        let x = pmetal_bridge::compat::random::normal(&[batch, seq_len, hidden], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[batch, seq_len, hidden],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let out = layer.forward(&x, None, None).unwrap();
         out.eval().unwrap();
 
@@ -1425,7 +1441,10 @@ mod tests {
             "No MoD router when MoD is disabled"
         );
 
-        let x = pmetal_bridge::compat::random::normal(&[1, 6, 32], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 6, 32],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let out = layer.forward(&x, None, None).unwrap();
         out.eval().unwrap();
         assert_eq!(out.shape(), &[1, 6, 32]);

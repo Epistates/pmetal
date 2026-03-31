@@ -91,7 +91,7 @@ pub fn checkpoint_boundary(arrays: &[&Array], config: &CheckpointConfig) -> Resu
         // Evaluate arrays to materialize them
         // This breaks the computation graph, allowing earlier parts to be freed
         for arr in arrays {
-            let mut owned = (*arr).clone();
+            let owned = (*arr).clone();
             owned.eval();
         }
     }
@@ -125,7 +125,7 @@ pub fn checkpointed_forward<F>(
 where
     F: FnMut(&Array) -> Result<Array, Exception>,
 {
-    let mut output = layer_fn(input)?;
+    let output = layer_fn(input)?;
 
     // Check if this is a checkpoint boundary
     if config.enabled && (layer_idx + 1) % config.layers_per_block == 0 && config.eval_at_boundaries
@@ -223,7 +223,7 @@ impl CheckpointContext {
     /// Apply checkpointing to output tensor if at boundary.
     pub fn maybe_checkpoint(&self, output: &Array) -> Result<(), Exception> {
         if self.is_checkpoint_boundary() && self.checkpoint_config.eval_at_boundaries {
-            let mut owned = output.clone();
+            let owned = output.clone();
             owned.eval();
         }
         Ok(())

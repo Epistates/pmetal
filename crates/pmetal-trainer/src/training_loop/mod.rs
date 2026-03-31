@@ -820,7 +820,7 @@ impl TrainingLoop {
         if let Some(ref acc) = self.accumulated_grads {
             let grad_arrays: Vec<&Array> = acc.values().collect();
             if !grad_arrays.is_empty() {
-                transforms::eval(grad_arrays);
+                transforms::eval(grad_arrays)?;
             }
         }
         Ok(())
@@ -1381,7 +1381,7 @@ impl TrainingLoop {
         {
             let arrays: Vec<&Array> = lora_params.values().collect();
             if !arrays.is_empty() {
-                transforms::eval(arrays);
+                transforms::eval(arrays)?;
             }
         }
 

@@ -65,6 +65,7 @@ pub use speculative::*;
 // Re-export bridge types for convenience
 pub use pmetal_bridge::compat::builder::Builder;
 pub use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param};
+/// Crate-level result type alias using [`Exception`] as the error.
 pub type Result<T> = std::result::Result<T, Exception>;
 
 /// Prelude module for convenient imports.

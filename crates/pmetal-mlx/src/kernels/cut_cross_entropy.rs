@@ -143,7 +143,7 @@ pub struct CutCrossEntropyOutput {
 impl CutCrossEntropyOutput {
     /// Get the loss value.
     pub fn loss_value(&self) -> Result<f32, Exception> {
-        let mut loss_eval = self.loss.clone();
+        let loss_eval = self.loss.clone();
         loss_eval.eval();
         Ok(loss_eval.item_f32())
     }
@@ -370,7 +370,7 @@ impl CutCrossEntropy {
 
         // Count valid tokens
         let n_valid_arr = valid_mask_f32.sum_all();
-        let mut n_valid_eval = n_valid_arr.clone();
+        let n_valid_eval = n_valid_arr.clone();
         n_valid_eval.eval();
         let n_valid = n_valid_eval.item_f32() as usize;
 

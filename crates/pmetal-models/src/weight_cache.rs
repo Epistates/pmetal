@@ -156,7 +156,7 @@ impl WeightCache {
         } else {
             // Cache miss — load and possibly evict
             self.stats.misses += 1;
-            self.load_layer(layer_idx);
+            self.load_layer(layer_idx)?;
         }
 
         Ok(self.resident.get(&layer_idx).unwrap())
@@ -179,7 +179,7 @@ impl WeightCache {
             "Prefetch layer {}: not resident, loading synchronously (async not yet implemented)",
             layer_idx
         );
-        self.load_layer(layer_idx);
+        self.load_layer(layer_idx)?;
         Ok(())
     }
 

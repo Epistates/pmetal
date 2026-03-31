@@ -521,7 +521,7 @@ impl GptOssMLP {
 
 fn clamp_swiglu_hidden(gate: &Array, up: &Array, limit: f32) -> Result<Array, Exception> {
     let activated = nn::silu(&gate).multiply(up);
-    let mut limit = Array::from_f32(limit);
+    let limit = Array::from_f32(limit);
     let neg_limit = Array::from_f32(-limit.item::<f32>());
     let clamped = pmetal_bridge::compat::ops::minimum(&activated, &limit);
     Ok(pmetal_bridge::compat::ops::maximum(&clamped, &neg_limit))
@@ -748,12 +748,12 @@ impl GptOssMoE {
 
         if needs_refresh {
             let (
-                mut stacked_gate_proj,
-                mut stacked_up_proj,
-                mut stacked_down_proj,
-                mut stacked_gate_bias,
-                mut stacked_up_bias,
-                mut stacked_down_bias,
+                stacked_gate_proj,
+                stacked_up_proj,
+                stacked_down_proj,
+                stacked_gate_bias,
+                stacked_up_bias,
+                stacked_down_bias,
             ) = self.stack_expert_weights()?;
             stacked_gate_proj.eval();
             stacked_up_proj.eval();
@@ -1420,10 +1420,10 @@ impl GptOssLoraAttention {
 
     /// Merge all LoRA weights.
     pub fn merge(&mut self) -> Result<(), Exception> {
-        self.q_proj.merge();
-        self.k_proj.merge();
-        self.v_proj.merge();
-        self.o_proj.merge();
+        self.q_proj.merge()?;
+        self.k_proj.merge()?;
+        self.v_proj.merge()?;
+        self.o_proj.merge()?;
         Ok(())
     }
 }
@@ -1557,7 +1557,7 @@ impl GptOssLoraModel {
     /// Merge all LoRA weights.
     pub fn merge(&mut self) -> Result<(), Exception> {
         for layer in &mut self.layers {
-            layer.merge();
+            layer.merge()?;
         }
         Ok(())
     }
@@ -1828,10 +1828,7 @@ mod tests {
 
     #[test]
     fn test_lora_linear_creation() {
-        let linear = nn::LinearBuilder::new(256, 512)
-            .bias(true)
-            .build()
-            .unwrap();
+        let linear = nn::LinearBuilder::new(256, 512).bias(true).build().unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 8, 16.0).unwrap();
 
@@ -1843,10 +1840,7 @@ mod tests {
 
     #[test]
     fn test_lora_linear_forward_shape() {
-        let linear = nn::LinearBuilder::new(64, 128)
-            .bias(false)
-            .build()
-            .unwrap();
+        let linear = nn::LinearBuilder::new(64, 128).bias(false).build().unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
         let x = Array::zeros_f32(&[2, 8, 64]);
@@ -1857,10 +1851,7 @@ mod tests {
 
     #[test]
     fn test_lora_linear_merge() {
-        let linear = nn::LinearBuilder::new(32, 64)
-            .bias(false)
-            .build()
-            .unwrap();
+        let linear = nn::LinearBuilder::new(32, 64).bias(false).build().unwrap();
 
         let mut lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
         assert!(lora_linear.lora_active);
@@ -1876,10 +1867,7 @@ mod tests {
 
     #[test]
     fn test_lora_trainable_params() {
-        let linear = nn::LinearBuilder::new(32, 64)
-            .bias(false)
-            .build()
-            .unwrap();
+        let linear = nn::LinearBuilder::new(32, 64).bias(false).build().unwrap();
 
         let lora_linear = LoraLinear::from_linear(&linear, 4, 8.0).unwrap();
         let params = lora_linear.trainable_parameters();

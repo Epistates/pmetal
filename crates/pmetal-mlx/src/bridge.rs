@@ -105,7 +105,7 @@ impl MlxMetalBridge {
         }
 
         // Ensure array is evaluated before accessing data pointer
-        let mut evaled = array.clone();
+        let evaled = array.clone();
         evaled.eval();
 
         // Get pointer to array data
@@ -134,7 +134,7 @@ impl MlxMetalBridge {
             )));
         }
 
-        let mut evaled = array.clone();
+        let evaled = array.clone();
         evaled.eval();
 
         let ptr = evaled.data_ptr() as *mut f16;
@@ -159,7 +159,7 @@ impl MlxMetalBridge {
             )));
         }
 
-        let mut evaled = array.clone();
+        let evaled = array.clone();
         evaled.eval();
 
         let ptr = evaled.data_ptr() as *mut u32;
@@ -177,7 +177,7 @@ impl MlxMetalBridge {
     /// This method is safer than zero-copy as it owns its data, but slower
     /// due to the copy operation. Auto-converts non-f32 arrays.
     pub fn copy_as_f32(ctx: &MetalContext, array: &Array) -> MetalResult<MetalBuffer<f32>> {
-        let mut converted = if array.dtype() != Dtype::Float32 {
+        let converted = if array.dtype() != Dtype::Float32 {
             array.as_dtype(Dtype::Float32.as_i32())
         } else {
             array.clone()
@@ -191,7 +191,7 @@ impl MlxMetalBridge {
 
     /// Copy MLX array data to a new f16 Metal buffer, converting dtype if needed.
     pub fn copy_as_f16(ctx: &MetalContext, array: &Array) -> MetalResult<MetalBuffer<f16>> {
-        let mut converted = if array.dtype() != Dtype::Float16 {
+        let converted = if array.dtype() != Dtype::Float16 {
             array.as_dtype(Dtype::Float16.as_i32())
         } else {
             array.clone()

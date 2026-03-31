@@ -568,8 +568,8 @@ impl Expert {
     }
 
     pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
-        quantize_linear_weights_fp8(&mut self.up_proj);
-        quantize_linear_weights_fp8(&mut self.down_proj);
+        quantize_linear_weights_fp8(&mut self.up_proj)?;
+        quantize_linear_weights_fp8(&mut self.down_proj)?;
         self.up_proj_weight_scale = None;
         self.up_proj_input_scale = None;
         self.down_proj_weight_scale = None;
@@ -783,7 +783,7 @@ impl MoELayer {
         let x_flat = x.reshape(&[num_tokens, hidden_size]);
 
         // Get routing weights and indices: weights [B*L, top_k], indices [B*L, top_k]
-        let (weights, mut indices) = self.router.forward(&x_flat)?;
+        let (weights, indices) = self.router.forward(&x_flat)?;
 
         // Initialize output with zeros
         let mut output = pmetal_bridge::compat::ops::zeros_like(&x_flat);
@@ -889,12 +889,12 @@ impl MoELayer {
     }
 
     pub fn quantize_fp8_weights(&mut self) -> Result<(), Exception> {
-        self.router.quantize_fp8_weights();
+        self.router.quantize_fp8_weights()?;
         for expert in &mut self.experts {
-            expert.quantize_fp8_weights();
+            expert.quantize_fp8_weights()?;
         }
         if let Some(shared_expert) = &mut self.shared_expert {
-            shared_expert.quantize_fp8_weights();
+            shared_expert.quantize_fp8_weights()?;
         }
         Ok(())
     }
@@ -1809,7 +1809,7 @@ impl NemotronHMixer {
     /// Call this after model loading to enable fast MoE inference.
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
         if let Some(ref moe_layer) = self.moe_layer {
-            let (mut stacked_up, mut stacked_down) = moe_layer.stack_expert_weights()?;
+            let (stacked_up, stacked_down) = moe_layer.stack_expert_weights()?;
             // Evaluate the stacked weights once
             stacked_up.eval();
             stacked_down.eval();
@@ -1824,10 +1824,10 @@ impl NemotronHMixer {
         match self.block_type {
             'M' => {
                 if let Some(in_proj) = &mut self.in_proj {
-                    quantize_linear_weights_fp8(in_proj);
+                    quantize_linear_weights_fp8(in_proj)?;
                 }
                 if let Some(out_proj) = &mut self.out_proj {
-                    quantize_linear_weights_fp8(out_proj);
+                    quantize_linear_weights_fp8(out_proj)?;
                 }
                 self.in_proj_weight_scale = None;
                 self.in_proj_input_scale = None;
@@ -1836,31 +1836,31 @@ impl NemotronHMixer {
             }
             '*' => {
                 if let Some(q_proj) = &mut self.q_proj {
-                    quantize_linear_weights_fp8(q_proj);
+                    quantize_linear_weights_fp8(q_proj)?;
                 }
                 if let Some(k_proj) = &mut self.k_proj {
-                    quantize_linear_weights_fp8(k_proj);
+                    quantize_linear_weights_fp8(k_proj)?;
                 }
                 if let Some(v_proj) = &mut self.v_proj {
-                    quantize_linear_weights_fp8(v_proj);
+                    quantize_linear_weights_fp8(v_proj)?;
                 }
                 if let Some(o_proj) = &mut self.o_proj {
-                    quantize_linear_weights_fp8(o_proj);
+                    quantize_linear_weights_fp8(o_proj)?;
                 }
             }
             '-' => {
                 if let Some(up_proj) = &mut self.up_proj {
-                    quantize_linear_weights_fp8(up_proj);
+                    quantize_linear_weights_fp8(up_proj)?;
                 }
                 if let Some(down_proj) = &mut self.down_proj {
-                    quantize_linear_weights_fp8(down_proj);
+                    quantize_linear_weights_fp8(down_proj)?;
                 }
             }
             'E' => {
                 if let Some(moe_layer) = &mut self.moe_layer {
-                    moe_layer.quantize_fp8_weights();
+                    moe_layer.quantize_fp8_weights()?;
                 }
-                self.init_stacked_moe();
+                self.init_stacked_moe()?;
             }
             _ => {}
         }
@@ -1946,7 +1946,7 @@ impl NemotronHModel {
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
         let mut moe_count = 0;
         for layer in &mut self.layers {
-            layer.mixer.init_stacked_moe();
+            layer.mixer.init_stacked_moe()?;
             if layer.mixer.moe_layer.is_some() {
                 moe_count += 1;
             }
@@ -2125,19 +2125,19 @@ pub fn load_nemotron_weights(
         match block_type {
             'M' => {
                 // Mamba layer
-                load_mamba_weights(&mut layer.mixer, weights, &prefix);
+                load_mamba_weights(&mut layer.mixer, weights, &prefix)?;
             }
             '*' => {
                 // Attention layer
-                load_attention_weights(&mut layer.mixer, weights, &prefix);
+                load_attention_weights(&mut layer.mixer, weights, &prefix)?;
             }
             '-' => {
                 // MLP layer
-                load_mlp_weights(&mut layer.mixer, weights, &prefix);
+                load_mlp_weights(&mut layer.mixer, weights, &prefix)?;
             }
             'E' => {
                 // MoE layer
-                load_moe_weights(&mut layer.mixer, weights, &prefix);
+                load_moe_weights(&mut layer.mixer, weights, &prefix)?;
             }
             _ => {}
         }

@@ -514,7 +514,12 @@ mod tests {
         let mut projector = GaloreProjector::new(config);
 
         // Create a gradient where m >= n (10 x 8)
-        let grad = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
+        let grad = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[10, 8],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let low_rank = projector.project(&grad).unwrap();
 
@@ -534,7 +539,12 @@ mod tests {
         let mut projector = GaloreProjector::new(config);
 
         // Create a gradient where m < n (8 x 10)
-        let grad = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[8, 10], pmetal_bridge::compat::Dtype::Float32);
+        let grad = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[8, 10],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let low_rank = projector.project(&grad).unwrap();
 
@@ -553,7 +563,12 @@ mod tests {
         let config = GaloreConfig::with_rank(4).projection_type(GaloreProjectionType::Right);
         let mut projector = GaloreProjector::new(config);
 
-        let grad = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[8, 10], pmetal_bridge::compat::Dtype::Float32);
+        let grad = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[8, 10],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let low_rank = projector.project(&grad).unwrap();
 
@@ -567,10 +582,30 @@ mod tests {
         let config = GaloreConfig::with_rank(4).update_gap(3);
         let mut projector = GaloreProjector::new(config);
 
-        let grad1 = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
-        let grad2 = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
-        let grad3 = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
-        let grad4 = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
+        let grad1 = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[10, 8],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let grad2 = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[10, 8],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let grad3 = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[10, 8],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let grad4 = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[10, 8],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // First projection - initializes projector
         projector.project(&grad1).unwrap();
@@ -610,7 +645,12 @@ mod tests {
         let config = GaloreConfig::with_rank(4);
         let mut projector = GaloreProjector::new(config);
 
-        let grad = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
+        let grad = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[10, 8],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let state = projector.project_with_state(&grad).unwrap();
 
@@ -639,8 +679,18 @@ mod tests {
         let mut state = GaloreParamState::new(config);
 
         // Create parameter and gradient
-        let param = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
-        let grad = pmetal_bridge::compat::random::uniform_range(-0.1, 0.1, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
+        let param = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[10, 8],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let grad = pmetal_bridge::compat::random::uniform_range(
+            -0.1,
+            0.1,
+            &[10, 8],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Take a step
         let new_param = state
@@ -670,11 +720,21 @@ mod tests {
         let config = GaloreConfig::with_rank(4).update_gap(5);
         let mut state = GaloreParamState::new(config);
 
-        let mut param = pmetal_bridge::compat::random::uniform_range(-1.0, 1.0, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
+        let mut param = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[10, 8],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Take multiple steps
         for _ in 0..10 {
-            let grad = pmetal_bridge::compat::random::uniform_range(-0.1, 0.1, &[10, 8], pmetal_bridge::compat::Dtype::Float32);
+            let grad = pmetal_bridge::compat::random::uniform_range(
+                -0.1,
+                0.1,
+                &[10, 8],
+                pmetal_bridge::compat::Dtype::Float32,
+            );
 
             param = state
                 .adam_step(

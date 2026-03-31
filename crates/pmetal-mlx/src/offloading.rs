@@ -183,7 +183,7 @@ impl OffloadedEmbedding {
                 fs::create_dir_all(dir).map_err(|e| Exception::custom(e.to_string()))?;
 
                 let path = dir.join(format!("embedding_{}.bin", uuid_simple()));
-                save_array_to_disk(&array, &path);
+                save_array_to_disk(&array, &path)?;
                 embedding.disk_path = Some(path);
             }
         }
@@ -758,7 +758,7 @@ impl FrozenParameterManager {
 
             if should_offload {
                 // Evaluate and store
-                let mut arr_owned = array.clone();
+                let arr_owned = array.clone();
                 arr_owned.eval();
 
                 self.frozen_params.insert(
@@ -1010,7 +1010,7 @@ mod tests {
         let activation = random::normal(&[2, 10, 64], Dtype::Float32);
         offloader.store("layer_0", activation.clone()).unwrap();
 
-        let mut loaded = offloader.load("layer_0").unwrap();
+        let loaded = offloader.load("layer_0").unwrap();
         loaded.eval();
 
         assert_eq!(loaded.shape(), activation.shape());
@@ -1023,7 +1023,7 @@ mod tests {
             OffloadedEmbedding::from_array(weights.clone(), OffloadTarget::Cpu, None).unwrap();
 
         let indices = Array::from_slice(&[0i32, 5, 10], &[3]);
-        let mut result = embedding.lookup(&indices).unwrap();
+        let result = embedding.lookup(&indices).unwrap();
         result.eval();
 
         assert_eq!(result.shape(), &[3, 64]);

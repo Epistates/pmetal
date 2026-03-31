@@ -349,7 +349,7 @@ impl TrainingLoop {
                 if let Some(ref norm) = lazy_norm {
                     to_eval.push(norm);
                 }
-                pmetal_bridge::compat::transforms::eval(to_eval);
+                let _ = pmetal_bridge::compat::transforms::eval(to_eval);
 
                 let mut loss = loss;
                 let loss_val = loss.item_f32();

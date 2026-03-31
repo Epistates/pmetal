@@ -303,15 +303,15 @@ pub fn load_vae_weights(
         weights: &HashMap<String, Array>,
         prefix: &str,
     ) -> Result<(), LoadError> {
-        load_group_norm_weight(&mut block.norm1, weights, &format!("{prefix}.norm1"));
-        load_conv2d_weight(&mut block.conv1, weights, &format!("{prefix}.conv1"));
-        load_group_norm_weight(&mut block.norm2, weights, &format!("{prefix}.norm2"));
-        load_conv2d_weight(&mut block.conv2, weights, &format!("{prefix}.conv2"));
+        load_group_norm_weight(&mut block.norm1, weights, &format!("{prefix}.norm1"))?;
+        load_conv2d_weight(&mut block.conv1, weights, &format!("{prefix}.conv1"))?;
+        load_group_norm_weight(&mut block.norm2, weights, &format!("{prefix}.norm2"))?;
+        load_conv2d_weight(&mut block.conv2, weights, &format!("{prefix}.conv2"))?;
         if let Some(ref mut shortcut) = block.conv_shortcut {
             // Only load if the weights exist (skip silently if they don't)
             let key = format!("{prefix}.conv_shortcut.weight");
             if weights.contains_key(&key) {
-                load_conv2d_weight(shortcut, weights, &format!("{prefix}.conv_shortcut"));
+                load_conv2d_weight(shortcut, weights, &format!("{prefix}.conv_shortcut"))?;
             }
         }
         Ok(())
@@ -323,202 +323,202 @@ pub fn load_vae_weights(
         weights: &HashMap<String, Array>,
         prefix: &str,
     ) -> Result<(), LoadError> {
-        load_group_norm_weight(&mut attn.norm, weights, &format!("{prefix}.group_norm"));
-        load_conv2d_weight(&mut attn.q, weights, &format!("{prefix}.to_q"));
-        load_conv2d_weight(&mut attn.k, weights, &format!("{prefix}.to_k"));
-        load_conv2d_weight(&mut attn.v, weights, &format!("{prefix}.to_v"));
-        load_conv2d_weight(&mut attn.proj_out, weights, &format!("{prefix}.to_out.0"));
+        load_group_norm_weight(&mut attn.norm, weights, &format!("{prefix}.group_norm"))?;
+        load_conv2d_weight(&mut attn.q, weights, &format!("{prefix}.to_q"))?;
+        load_conv2d_weight(&mut attn.k, weights, &format!("{prefix}.to_k"))?;
+        load_conv2d_weight(&mut attn.v, weights, &format!("{prefix}.to_v"))?;
+        load_conv2d_weight(&mut attn.proj_out, weights, &format!("{prefix}.to_out.0"))?;
         Ok(())
     }
 
     // Encoder weights
     if let Some(ref mut encoder) = model.encoder {
-        load_conv2d_weight(&mut encoder.conv_in, weights, "encoder.conv_in");
+        load_conv2d_weight(&mut encoder.conv_in, weights, "encoder.conv_in")?;
 
         // Down blocks: block 0 has no downsampler, blocks 1-3 have downsamplers
         load_resnet_block(
             &mut encoder.down_1_0,
             weights,
             "encoder.down_blocks.0.resnets.0",
-        );
+        )?;
         load_resnet_block(
             &mut encoder.down_1_1,
             weights,
             "encoder.down_blocks.0.resnets.1",
-        );
+        )?;
 
         load_resnet_block(
             &mut encoder.down_2_0,
             weights,
             "encoder.down_blocks.1.resnets.0",
-        );
+        )?;
         load_resnet_block(
             &mut encoder.down_2_1,
             weights,
             "encoder.down_blocks.1.resnets.1",
-        );
+        )?;
         load_conv2d_weight(
             &mut encoder.down_2_sampler.conv,
             weights,
             "encoder.down_blocks.1.downsamplers.0.conv",
-        );
+        )?;
 
         load_resnet_block(
             &mut encoder.down_3_0,
             weights,
             "encoder.down_blocks.2.resnets.0",
-        );
+        )?;
         load_resnet_block(
             &mut encoder.down_3_1,
             weights,
             "encoder.down_blocks.2.resnets.1",
-        );
+        )?;
         load_conv2d_weight(
             &mut encoder.down_3_sampler.conv,
             weights,
             "encoder.down_blocks.2.downsamplers.0.conv",
-        );
+        )?;
 
         load_resnet_block(
             &mut encoder.down_4_0,
             weights,
             "encoder.down_blocks.3.resnets.0",
-        );
+        )?;
         load_resnet_block(
             &mut encoder.down_4_1,
             weights,
             "encoder.down_blocks.3.resnets.1",
-        );
+        )?;
         load_conv2d_weight(
             &mut encoder.down_4_sampler.conv,
             weights,
             "encoder.down_blocks.3.downsamplers.0.conv",
-        );
+        )?;
 
         // Mid block
         load_resnet_block(
             &mut encoder.mid_block_1,
             weights,
             "encoder.mid_block.resnets.0",
-        );
+        )?;
         load_attn_block(
             &mut encoder.mid_attn,
             weights,
             "encoder.mid_block.attentions.0",
-        );
+        )?;
         load_resnet_block(
             &mut encoder.mid_block_2,
             weights,
             "encoder.mid_block.resnets.1",
-        );
+        )?;
 
-        load_group_norm_weight(&mut encoder.norm_out, weights, "encoder.conv_norm_out");
-        load_conv2d_weight(&mut encoder.conv_out, weights, "encoder.conv_out");
+        load_group_norm_weight(&mut encoder.norm_out, weights, "encoder.conv_norm_out")?;
+        load_conv2d_weight(&mut encoder.conv_out, weights, "encoder.conv_out")?;
     }
 
     // Decoder weights
     let decoder = &mut model.decoder;
-    load_conv2d_weight(&mut decoder.conv_in, weights, "decoder.conv_in");
+    load_conv2d_weight(&mut decoder.conv_in, weights, "decoder.conv_in")?;
 
     // Mid block
     load_resnet_block(
         &mut decoder.mid_block_1,
         weights,
         "decoder.mid_block.resnets.0",
-    );
+    )?;
     load_attn_block(
         &mut decoder.mid_attn,
         weights,
         "decoder.mid_block.attentions.0",
-    );
+    )?;
     load_resnet_block(
         &mut decoder.mid_block_2,
         weights,
         "decoder.mid_block.resnets.1",
-    );
+    )?;
 
     // Up blocks: blocks 0-2 have upsamplers, block 3 does not
     load_resnet_block(
         &mut decoder.up_1_0,
         weights,
         "decoder.up_blocks.0.resnets.0",
-    );
+    )?;
     load_resnet_block(
         &mut decoder.up_1_1,
         weights,
         "decoder.up_blocks.0.resnets.1",
-    );
+    )?;
     load_resnet_block(
         &mut decoder.up_1_2,
         weights,
         "decoder.up_blocks.0.resnets.2",
-    );
+    )?;
     load_conv2d_weight(
         &mut decoder.up_1_sampler.conv,
         weights,
         "decoder.up_blocks.0.upsamplers.0.conv",
-    );
+    )?;
 
     load_resnet_block(
         &mut decoder.up_2_0,
         weights,
         "decoder.up_blocks.1.resnets.0",
-    );
+    )?;
     load_resnet_block(
         &mut decoder.up_2_1,
         weights,
         "decoder.up_blocks.1.resnets.1",
-    );
+    )?;
     load_resnet_block(
         &mut decoder.up_2_2,
         weights,
         "decoder.up_blocks.1.resnets.2",
-    );
+    )?;
     load_conv2d_weight(
         &mut decoder.up_2_sampler.conv,
         weights,
         "decoder.up_blocks.1.upsamplers.0.conv",
-    );
+    )?;
 
     load_resnet_block(
         &mut decoder.up_3_0,
         weights,
         "decoder.up_blocks.2.resnets.0",
-    );
+    )?;
     load_resnet_block(
         &mut decoder.up_3_1,
         weights,
         "decoder.up_blocks.2.resnets.1",
-    );
+    )?;
     load_resnet_block(
         &mut decoder.up_3_2,
         weights,
         "decoder.up_blocks.2.resnets.2",
-    );
+    )?;
     load_conv2d_weight(
         &mut decoder.up_3_sampler.conv,
         weights,
         "decoder.up_blocks.2.upsamplers.0.conv",
-    );
+    )?;
 
     load_resnet_block(
         &mut decoder.up_4_0,
         weights,
         "decoder.up_blocks.3.resnets.0",
-    );
+    )?;
     load_resnet_block(
         &mut decoder.up_4_1,
         weights,
         "decoder.up_blocks.3.resnets.1",
-    );
+    )?;
     load_resnet_block(
         &mut decoder.up_4_2,
         weights,
         "decoder.up_blocks.3.resnets.2",
-    );
+    )?;
 
-    load_group_norm_weight(&mut decoder.norm_out, weights, "decoder.conv_norm_out");
-    load_conv2d_weight(&mut decoder.conv_out, weights, "decoder.conv_out");
+    load_group_norm_weight(&mut decoder.norm_out, weights, "decoder.conv_norm_out")?;
+    load_conv2d_weight(&mut decoder.conv_out, weights, "decoder.conv_out")?;
 
     Ok(())
 }
@@ -906,7 +906,7 @@ pub fn load_generic_weights<M: ModuleParameters + ModuleParametersExt>(
     if single_file.exists() {
         let loaded = load_shard(&single_file)?;
         assign_loaded_weights(model, loaded);
-        eval_loaded_parameters(model);
+        eval_loaded_parameters(model)?;
         return Ok(());
     }
     let index_path = model_dir.join("model.safetensors.index.json");

@@ -3,13 +3,13 @@ use std::path::{Path, PathBuf};
 use pmetal_mlx::{Array, Dtype};
 
 fn tensor_to_f32_vec(name: &str, tensor: &Array) -> anyhow::Result<Option<Vec<f32>>> {
-    let mut materialized = tensor.clone();
+    let materialized = tensor.clone();
     materialized.eval();
 
     match materialized.dtype() {
         Dtype::Float32 => Ok(Some(materialized.as_slice::<f32>().to_vec())),
         Dtype::Float16 | Dtype::Bfloat16 => {
-            let mut float32 = materialized.as_dtype(Dtype::Float32.as_i32());
+            let float32 = materialized.as_dtype(Dtype::Float32.as_i32());
             float32.eval();
             Ok(Some(float32.as_slice::<f32>().to_vec()))
         }

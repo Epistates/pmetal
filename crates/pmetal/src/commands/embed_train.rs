@@ -270,7 +270,7 @@ pub(crate) async fn run_embed_train(
                     };
 
                     let mut lag = nn::value_and_grad(loss_fn);
-                    let (mut loss, grads) = lag(&mut model, (&ids_a, &m_a, &ids_b, &m_b, &labels))
+                    let (loss, grads) = lag(&mut model, (&ids_a, &m_a, &ids_b, &m_b, &labels))
                         .map_err(|e| anyhow::anyhow!("Forward/backward error: {}", e))?;
                     optimizer
                         .update(&mut model, grads)
@@ -390,9 +390,8 @@ pub(crate) async fn run_embed_train(
                     };
 
                     let mut lag = nn::value_and_grad(loss_fn);
-                    let (mut loss, grads) =
-                        lag(&mut model, (&ids_a, &m_a, &ids_p, &m_p, &ids_n, &m_n))
-                            .map_err(|e| anyhow::anyhow!("Forward/backward error: {}", e))?;
+                    let (loss, grads) = lag(&mut model, (&ids_a, &m_a, &ids_p, &m_p, &ids_n, &m_n))
+                        .map_err(|e| anyhow::anyhow!("Forward/backward error: {}", e))?;
                     optimizer
                         .update(&mut model, grads)
                         .map_err(|e| anyhow::anyhow!("Optimizer error: {}", e))?;

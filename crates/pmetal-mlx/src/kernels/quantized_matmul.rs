@@ -187,7 +187,7 @@ fn max_abs_diff(lhs: &Array, rhs: &Array) -> Result<f32, Exception> {
     };
 
     let diff = lhs.subtract(&rhs).abs_val().max(None);
-    let mut diff_owned = diff.clone();
+    let diff_owned = diff.clone();
     diff_owned.eval();
     Ok(diff_owned.item::<f32>())
 }
@@ -280,13 +280,13 @@ fn benchmark_quantized_linear_backends(
 ) -> Result<(QuantizedLinearBackend, Array), Exception> {
     let mlx_start = Instant::now();
     let mlx_output = run_mlx_quantized_rhs_transposed(x, w_q, scales, biases, problem.group_size)?;
-    let mut mlx_evaled = mlx_output.clone();
+    let mlx_evaled = mlx_output.clone();
     mlx_evaled.eval();
     let mlx_elapsed = mlx_start.elapsed();
 
     let mpp_start = Instant::now();
     let mpp_output = match run_mpp_quantized_rhs_transposed(x, w_q, scales, biases, ctx, problem) {
-        Ok(mut output) => {
+        Ok(output) => {
             output.eval();
             Some(output)
         }

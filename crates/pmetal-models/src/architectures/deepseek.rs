@@ -800,7 +800,7 @@ impl DeepSeekMoE {
             || self.stacked_weight_signature.as_ref() != Some(&signature);
 
         if needs_refresh {
-            let (mut stacked_gate_proj, mut stacked_up_proj, mut stacked_down_proj) =
+            let (stacked_gate_proj, stacked_up_proj, stacked_down_proj) =
                 self.stack_expert_weights()?;
             stacked_gate_proj.eval();
             stacked_up_proj.eval();
@@ -1285,10 +1285,8 @@ mod tests {
         let _ = moe.forward(&x).unwrap();
         assert!(moe.has_stacked_moe());
 
-        moe.moe.experts[0].w1.weight = Array::zeros_f32(&[
-            config.moe_intermediate_size,
-            config.hidden_size,
-        ]);
+        moe.moe.experts[0].w1.weight =
+            Array::zeros_f32(&[config.moe_intermediate_size, config.hidden_size]);
 
         let reference = moe.forward_reference(&x).unwrap();
         let fast = moe.forward(&x).unwrap();

@@ -380,6 +380,8 @@ pub mod raw_ffi {
 
     /// No-op stub replacing `mlx_sys::mlx_closure`.
     pub struct RawClosure {
+        #[allow(dead_code)]
+        // Placeholder field for future real JIT closure; stub always uses f: None
         f: Option<Box<dyn Fn(&[Array]) -> std::result::Result<Vec<Array>, Exception>>>,
     }
 

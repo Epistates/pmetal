@@ -223,7 +223,7 @@ impl<M: ShardableModel> SpeculativeDecoder<M> {
             self.verify_cache.reset();
             return Err(e);
         }
-        let mut verify_logits = verify_logits.unwrap();
+        let verify_logits = verify_logits.unwrap();
         // verify_logits: [1, seq_len_verify, vocab_size]
         verify_logits.eval();
 
@@ -271,7 +271,7 @@ impl<M: ShardableModel> SpeculativeDecoder<M> {
         // Take only the last token position: hidden[..., -1:, ...]
         let last_hidden = last_token_hidden(&hidden)?;
         let norm_last = self.model.normalize(&last_hidden)?;
-        let mut draft_logits = self.model.lm_head(&norm_last)?;
+        let draft_logits = self.model.lm_head(&norm_last)?;
 
         // Sample first draft token.
         draft_logits.eval();
@@ -287,7 +287,7 @@ impl<M: ShardableModel> SpeculativeDecoder<M> {
                 .apply_layer_range(0..split, &h, mask, &mut draft_cache)?;
             let h_last = last_token_hidden(&h)?;
             let h_norm = self.model.normalize(&h_last)?;
-            let mut logits = self.model.lm_head(&h_norm)?;
+            let logits = self.model.lm_head(&h_norm)?;
             logits.eval();
             draft_tokens.push(argmax_last(&logits)?);
         }
@@ -348,7 +348,7 @@ fn accept_reject(verify_logits: &Array, draft_tokens: &[u32]) -> Result<Vec<u32>
     // Verify each draft token against the verifier's argmax at that position.
     for (i, &draft_tok) in draft_tokens.iter().enumerate() {
         let pos = (verify_start + i) as i32;
-        let mut logit_row = pmetal_bridge::compat::ops::slice_axis(verify_logits, 1, pos, pos + 1)
+        let logit_row = pmetal_bridge::compat::ops::slice_axis(verify_logits, 1, pos, pos + 1)
             .squeeze_axes(&[0, 1]);
         logit_row.eval();
         let verifier_token = argmax_1d(&logit_row)?;
@@ -363,7 +363,7 @@ fn accept_reject(verify_logits: &Array, draft_tokens: &[u32]) -> Result<Vec<u32>
     // All draft tokens accepted — emit a bonus token from the verifier's
     // prediction at the position after the last draft token.
     let bonus_pos = (verify_start + n) as i32;
-    let mut bonus_row =
+    let bonus_row =
         pmetal_bridge::compat::ops::slice_axis(verify_logits, 1, bonus_pos, bonus_pos + 1)
             .squeeze_axes(&[0, 1]);
     bonus_row.eval();
@@ -417,7 +417,7 @@ fn argmax_last(logits: &Array) -> Result<u32, Exception> {
 /// Greedy argmax for a 1-D logits vector `[vocab_size]`.
 fn argmax_1d(row: &Array) -> Result<u32, Exception> {
     use pmetal_bridge::compat::indexing::argmax;
-    let mut idx = argmax(row);
+    let idx = argmax(row);
     idx.eval();
     Ok(idx.item::<u32>())
 }

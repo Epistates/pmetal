@@ -52,16 +52,16 @@ impl FlowMatchScheduler {
     /// Perform a single denoising step.
     pub fn step(&self, model_output: &Array, timestep: &Array, sample: &Array) -> Result<Array> {
         let diff = self.timesteps.subtract(timestep).abs();
-        let mut timestep_id_arr = argmin_axis(&diff, 0);
+        let timestep_id_arr = argmin_axis(&diff, 0);
         let timestep_id = timestep_id_arr.item::<u32>() as i32;
 
-        let mut sigma_arr = ops::select_axis(&self.sigmas, timestep_id, 0);
+        let sigma_arr = ops::select_axis(&self.sigmas, timestep_id, 0);
         let sigma = sigma_arr.item::<f32>();
 
         let sigma_next = if (timestep_id as usize) + 1 >= self.sigmas.dim(0) as usize {
             0.0
         } else {
-            let mut sigma_next_arr = ops::select_axis(&self.sigmas, timestep_id + 1, 0);
+            let sigma_next_arr = ops::select_axis(&self.sigmas, timestep_id + 1, 0);
             sigma_next_arr.item::<f32>()
         };
 
@@ -74,10 +74,10 @@ impl FlowMatchScheduler {
     /// Add noise to a sample.
     pub fn add_noise(&self, original: &Array, noise: &Array, timestep: &Array) -> Result<Array> {
         let diff = self.timesteps.subtract(timestep).abs();
-        let mut timestep_id_arr = argmin_axis(&diff, 0);
+        let timestep_id_arr = argmin_axis(&diff, 0);
         let timestep_id = timestep_id_arr.item::<u32>() as i32;
 
-        let mut sigma_arr = ops::select_axis(&self.sigmas, timestep_id, 0);
+        let sigma_arr = ops::select_axis(&self.sigmas, timestep_id, 0);
         let sigma = sigma_arr.item::<f32>();
         let sigma_arr = Array::from_f32(sigma);
         let one_minus_sigma = Array::from_f32(1.0 - sigma);

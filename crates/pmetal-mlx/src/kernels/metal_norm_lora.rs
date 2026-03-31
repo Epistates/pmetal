@@ -37,8 +37,8 @@
 
 use pmetal_bridge::compat::{Array, Dtype, ops, random};
 
-/// Result type for fused norm+LoRA operations.
 use pmetal_bridge::compat::Exception;
+/// Result type for fused norm+LoRA operations.
 pub type Result<T> = std::result::Result<T, Exception>;
 
 /// Configuration for fused RMSNorm + LoRA.
@@ -309,7 +309,7 @@ mod tests {
 
         // Check normalization: mean(x^2) should be close to 1
         let normalized_squared = normalized.square();
-        let mut mean = normalized_squared.mean_all();
+        let mean = normalized_squared.mean_all();
         mean.eval();
         let mean_val: f32 = mean.item_f32();
         assert!(
@@ -426,9 +426,8 @@ mod tests {
         )
         .with_eps(eps);
 
-        let mut fused_output =
-            fused_norm_lora_forward(&x, &gamma, &weight, &lora_a, &lora_b, &config)
-                .unwrap_or_else(|e| panic!("{e}"));
+        let fused_output = fused_norm_lora_forward(&x, &gamma, &weight, &lora_a, &lora_b, &config)
+            .unwrap_or_else(|e| panic!("{e}"));
 
         // Separate operations version
         let normalized = apply_rms_norm(&x, &gamma, eps);
@@ -436,7 +435,7 @@ mod tests {
         let lora_out = normalized.matmul(&lora_a.t()).matmul(&lora_b.t());
         let scale = lora_alpha / lora_rank as f32;
         let scaled_lora = lora_out.multiply(&Array::from_f32(scale));
-        let mut separate_output = base.add(&scaled_lora);
+        let separate_output = base.add(&scaled_lora);
 
         // Compare outputs
         fused_output.eval();

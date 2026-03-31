@@ -115,7 +115,7 @@ pub(crate) async fn run_eval(
             pmetal_bridge::compat::Array::from_slice(&target_ids, &[(n - 1) as i32, 1]);
         let gathered = take_along_axis(&log_probs, &target_arr, 1);
 
-        let mut gathered = gathered.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        let gathered = gathered.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
         gathered.eval();
         let nll: f32 = gathered.as_slice::<f32>().iter().map(|&v| -v).sum();
 

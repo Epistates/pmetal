@@ -379,14 +379,14 @@ fn benchmark_projection_backends(
 ) -> Result<(ProjectionBackend, Array), Exception> {
     let mlx_start = Instant::now();
     let mlx_output = run_mlx_rhs_transposed(x, weight)?;
-    let mut mlx_out_eval = mlx_output.clone();
+    let mlx_out_eval = mlx_output.clone();
     mlx_out_eval.eval();
     let mlx_elapsed = mlx_start.elapsed();
 
     let mpp_start = Instant::now();
     let mpp_output = match run_mpp_rhs_transposed(x, weight, ctx, problem) {
         Ok(output) => {
-            let mut out_eval = output.clone();
+            let out_eval = output.clone();
             out_eval.eval();
             Some(output)
         }

@@ -817,8 +817,10 @@ mod tests {
         let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
 
         // Image: [batch=1, channels=3, h=28, w=28] (NCHW)
-        let pixels =
-            pmetal_bridge::compat::random::normal(&[1, 3, 28, 28], pmetal_bridge::compat::Dtype::Float32);
+        let pixels = pmetal_bridge::compat::random::normal(
+            &[1, 3, 28, 28],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Forward
         let logits = model.forward(&input_ids, Some(&pixels)).unwrap();

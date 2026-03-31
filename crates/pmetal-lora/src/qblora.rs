@@ -273,10 +273,18 @@ impl QBLoraLinear {
         let (input_proj, lora_a_in_dim) = if let Some(proj_dim) = config.input_proj_dim {
             let bound = (3.0_f32 / in_features as f32).sqrt();
             let proj = if config.learnable_projections {
-                pmetal_bridge::compat::random::uniform_range(-bound, bound, &[in_features, proj_dim as i32], pmetal_bridge::compat::Dtype::Float32)
+                pmetal_bridge::compat::random::uniform_range(
+                    -bound,
+                    bound,
+                    &[in_features, proj_dim as i32],
+                    pmetal_bridge::compat::Dtype::Float32,
+                )
             } else {
                 // Random orthogonal-ish projection (fixed)
-                let proj = pmetal_bridge::compat::random::normal(&[in_features, proj_dim as i32], pmetal_bridge::compat::Dtype::Float32);
+                let proj = pmetal_bridge::compat::random::normal(
+                    &[in_features, proj_dim as i32],
+                    pmetal_bridge::compat::Dtype::Float32,
+                );
                 // Normalize columns for stability
                 let norm = proj.square().sum_axis(0, true).sqrt();
                 proj.divide(&norm)
@@ -290,9 +298,17 @@ impl QBLoraLinear {
         let (output_proj, lora_b_out_dim) = if let Some(proj_dim) = config.output_proj_dim {
             let bound = (3.0_f32 / proj_dim as f32).sqrt();
             let proj = if config.learnable_projections {
-                pmetal_bridge::compat::random::uniform_range(-bound, bound, &[proj_dim as i32, out_features], pmetal_bridge::compat::Dtype::Float32)
+                pmetal_bridge::compat::random::uniform_range(
+                    -bound,
+                    bound,
+                    &[proj_dim as i32, out_features],
+                    pmetal_bridge::compat::Dtype::Float32,
+                )
             } else {
-                let proj = pmetal_bridge::compat::random::normal(&[proj_dim as i32, out_features], pmetal_bridge::compat::Dtype::Float32);
+                let proj = pmetal_bridge::compat::random::normal(
+                    &[proj_dim as i32, out_features],
+                    pmetal_bridge::compat::Dtype::Float32,
+                );
                 let norm = proj.square().sum_axis(1, true).sqrt();
                 proj.divide(&norm)
             };
@@ -303,10 +319,18 @@ impl QBLoraLinear {
 
         // Initialize LoRA A with Kaiming uniform
         let bound = (3.0_f32 / lora_a_in_dim as f32).sqrt();
-        let lora_a = pmetal_bridge::compat::random::uniform_range(-bound, bound, &[effective_rank, lora_a_in_dim], pmetal_bridge::compat::Dtype::Float32);
+        let lora_a = pmetal_bridge::compat::random::uniform_range(
+            -bound,
+            bound,
+            &[effective_rank, lora_a_in_dim],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         // Initialize LoRA B with zeros
-        let lora_b = pmetal_bridge::compat::ops::zeros(&[lora_b_out_dim, effective_rank], pmetal_bridge::compat::Dtype::Float32);
+        let lora_b = pmetal_bridge::compat::ops::zeros(
+            &[lora_b_out_dim, effective_rank],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         Ok(Self {
             in_features,
@@ -336,11 +360,18 @@ impl QBLoraLinear {
         use_bias: bool,
     ) -> Result<Self, LoraError> {
         let bound = (3.0_f32 / in_features as f32).sqrt();
-        let weight =
-            pmetal_bridge::compat::random::uniform_range(-bound, bound, &[out_features, in_features], pmetal_bridge::compat::Dtype::Float32);
+        let weight = pmetal_bridge::compat::random::uniform_range(
+            -bound,
+            bound,
+            &[out_features, in_features],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
 
         let bias = if use_bias {
-            Some(pmetal_bridge::compat::ops::zeros(&[out_features], pmetal_bridge::compat::Dtype::Float32))
+            Some(pmetal_bridge::compat::ops::zeros(
+                &[out_features],
+                pmetal_bridge::compat::Dtype::Float32,
+            ))
         } else {
             None
         };
@@ -538,7 +569,10 @@ mod tests {
         let config = default_config();
         let qblora = QBLoraLinear::new(32, 64, &config, false);
 
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 32], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, 32],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = qblora.forward(&x);
 
         assert_eq!(output.shape(), &[2, 4, 64]);
@@ -552,7 +586,10 @@ mod tests {
         assert!(qblora.has_input_proj());
         assert!(!qblora.has_output_proj());
 
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = qblora.forward(&x);
 
         assert_eq!(output.shape(), &[2, 4, 128]);
@@ -566,7 +603,10 @@ mod tests {
         assert!(!qblora.has_input_proj());
         assert!(qblora.has_output_proj());
 
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = qblora.forward(&x);
 
         assert_eq!(output.shape(), &[2, 4, 128]);
@@ -580,7 +620,10 @@ mod tests {
         assert!(qblora.has_input_proj());
         assert!(qblora.has_output_proj());
 
-        let x = pmetal_bridge::compat::random::normal(&[2, 4, 64], pmetal_bridge::compat::Dtype::Float32);
+        let x = pmetal_bridge::compat::random::normal(
+            &[2, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
         let output = qblora.forward(&x);
 
         assert_eq!(output.shape(), &[2, 4, 128]);

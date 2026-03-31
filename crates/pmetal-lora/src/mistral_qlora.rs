@@ -1347,8 +1347,7 @@ mod tests {
     fn test_mistral_qlora_model_forward() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let mut model =
-            MistralQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
+        let mut model = MistralQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
 
         let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model.forward(&input_ids, None).unwrap();
@@ -1391,8 +1390,7 @@ mod tests {
         assert_eq!(config.sliding_window, Some(64));
 
         let qlora_config = small_qlora_config();
-        let mut model =
-            MistralQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
+        let mut model = MistralQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
 
         // Verify sliding window is passed through
         assert_eq!(model.model.layers[0].self_attn.sliding_window, Some(64));
@@ -1407,8 +1405,7 @@ mod tests {
     fn test_mistral_qlora_set_parameters() {
         let config = small_config();
         let qlora_config = small_qlora_config();
-        let mut model =
-            MistralQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
+        let mut model = MistralQloraForCausalLM::with_qlora_config(config, qlora_config).unwrap();
 
         // Get initial parameters
         let params = model.lora_parameters();

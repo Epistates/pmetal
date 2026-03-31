@@ -934,7 +934,7 @@ pub fn compare_weights(native: &InlineModelWeights, from_model: &InlineModelWeig
         // Flatten to 1-D and take index [0].
         let flat = arr.reshape(&[-1]);
         let idx = InlineArray::from_i32(0).reshape(&[1]);
-        let mut elem = flat.take_axis(&idx, 0);
+        let elem = flat.take_axis(&idx, 0);
         elem.eval();
         elem.item_f32()
     }
@@ -1113,7 +1113,7 @@ pub fn inline_decode_step_pure(
     let mut gdn_slot = 0usize;
     let mut attn_slot = 0usize;
 
-    for (layer_idx, lw) in weights.layers.iter().enumerate() {
+    for (_layer_idx, lw) in weights.layers.iter().enumerate() {
         // Input LayerNorm
         let normed = hidden.rms_norm(Some(&lw.input_ln_w), lw.input_ln_eps);
 
@@ -1610,6 +1610,7 @@ fn inline_gdn_forward(
 // Attention layer forward (InlineArray)
 // ============================================================================
 
+#[allow(dead_code)] // Infrastructure for inline (zero-alloc) attention forward path; not yet wired into dispatch
 fn inline_attn_forward(
     lw: &InlineLayerWeights,
     normed: &InlineArray,

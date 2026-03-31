@@ -984,7 +984,7 @@ impl MlxMetalOptimizer {
             }
             to_eval.push(self.flat_m.as_ref().unwrap());
             to_eval.push(self.flat_v.as_ref().unwrap());
-            transforms::eval(to_eval);
+            transforms::eval(to_eval)?;
         }
 
         Ok(())
@@ -1133,7 +1133,7 @@ impl MlxMetalOptimizer {
 
         // Single eval call for all arrays
         // Pass Vec directly since Vec<&Array> implements IntoIterator<Item = &Array>
-        transforms::eval(arrays_to_eval);
+        transforms::eval(arrays_to_eval)?;
 
         Ok(())
     }

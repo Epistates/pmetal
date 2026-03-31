@@ -361,7 +361,7 @@ impl ModelfileBuilder {
     /// Build and write to a file.
     pub fn write_to_file(&self, path: impl AsRef<Path>) -> Result<(), ModelfileError> {
         let content = self.build()?;
-        std::fs::write(path, content);
+        std::fs::write(path, content)?;
         Ok(())
     }
 }
