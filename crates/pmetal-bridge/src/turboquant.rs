@@ -36,6 +36,7 @@ use std::time::Instant;
 
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
+use crate::compat::Dtype;
 use crate::InlineArray;
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -261,6 +262,8 @@ pub struct TurboQuantCore {
     codebooks: Vec<Vec<f32>>,
     /// InlineArray view of the rotation matrix for GPU-accelerated matmul.
     rotation_arr: Option<InlineArray>,
+    /// Bfloat16 view of the rotation matrix for bf16 output reconstruction.
+    rotation_arr_bf16: Option<InlineArray>,
     /// InlineArray view of the inverse rotation matrix.
     inverse_rotation_arr: Option<InlineArray>,
     /// InlineArray view of the QJL projection matrix.
@@ -289,6 +292,11 @@ impl TurboQuantCore {
         // Build InlineArray GPU matrices.  On failure we fall back to CPU
         // matmul transparently — the Option<InlineArray> is None in that case.
         let rotation_arr = matrix_to_inline_array(&rotation, dim);
+        let rotation_arr_bf16 = rotation_arr.as_ref().map(|arr| {
+            let cast = arr.as_dtype(Dtype::Bfloat16.as_i32());
+            cast.eval();
+            cast
+        });
         let inverse_rotation_arr = matrix_to_inline_array(&inverse_rotation, dim);
         let qjl_arr = matrix_to_inline_array(&qjl_projection, dim);
         let inverse_qjl_arr = matrix_to_inline_array(&inverse_qjl_projection, dim);
@@ -315,6 +323,7 @@ impl TurboQuantCore {
             inverse_qjl_projection,
             codebooks,
             rotation_arr,
+            rotation_arr_bf16,
             inverse_rotation_arr,
             qjl_arr,
             inverse_qjl_arr,
@@ -1214,8 +1223,10 @@ impl QuantizedKvCache {
             queries.as_dtype(10)
         };
 
-        if let Some(output) = self.try_gpu_uniform_attention(&queries_f32, layout, scale) {
-            return Ok(if query_dtype == 10 {
+        if let Some(output) =
+            self.try_gpu_uniform_attention(&queries_f32, layout, scale, query_dtype)
+        {
+            return Ok(if query_dtype == 10 || output.dtype_raw() == query_dtype {
                 output
             } else {
                 output.as_dtype(query_dtype)
@@ -1510,6 +1521,7 @@ impl QuantizedKvCache {
         queries_f32: &InlineArray,
         layout: CacheLayout,
         scale: f32,
+        output_dtype: i32,
     ) -> Option<InlineArray> {
         let ks = self.keys.as_ref()?.gpu.as_ref()?;
         let vs = self.values.as_ref()?.gpu.as_ref()?;
@@ -1606,8 +1618,14 @@ impl QuantizedKvCache {
                         } else {
                             0
                         };
-                        let value_inv_rot = value_core.rotation_arr.as_ref()?;
-                        let output_rows = decoded_rot.matmul(value_inv_rot);
+                        let output_rows = if output_dtype == Dtype::Bfloat16.as_i32() {
+                            let decoded_rot_bf16 = decoded_rot.as_dtype(output_dtype);
+                            let value_inv_rot_bf16 = value_core.rotation_arr_bf16.as_ref()?;
+                            decoded_rot_bf16.matmul(value_inv_rot_bf16)
+                        } else {
+                            let value_inv_rot = value_core.rotation_arr.as_ref()?;
+                            decoded_rot.matmul(value_inv_rot)
+                        };
                         let inverse_rotate_us = if trace_timing {
                             eval_stage_micros(&output_rows)
                         } else {
@@ -1653,8 +1671,14 @@ impl QuantizedKvCache {
                     } else {
                         0
                     };
-                    let value_inv_rot = value_core.rotation_arr.as_ref()?;
-                    let output_rows = decoded_rot.matmul(value_inv_rot);
+                    let output_rows = if output_dtype == Dtype::Bfloat16.as_i32() {
+                        let decoded_rot_bf16 = decoded_rot.as_dtype(output_dtype);
+                        let value_inv_rot_bf16 = value_core.rotation_arr_bf16.as_ref()?;
+                        decoded_rot_bf16.matmul(value_inv_rot_bf16)
+                    } else {
+                        let value_inv_rot = value_core.rotation_arr.as_ref()?;
+                        decoded_rot.matmul(value_inv_rot)
+                    };
                     let inverse_rotate_us = if trace_timing {
                         eval_stage_micros(&output_rows)
                     } else {
@@ -1713,8 +1737,14 @@ impl QuantizedKvCache {
         } else {
             0
         };
-        let value_inv_rot = value_core.rotation_arr.as_ref()?;
-        let output_rows = decoded_rot.matmul(value_inv_rot);
+        let output_rows = if output_dtype == Dtype::Bfloat16.as_i32() {
+            let decoded_rot_bf16 = decoded_rot.as_dtype(output_dtype);
+            let value_inv_rot_bf16 = value_core.rotation_arr_bf16.as_ref()?;
+            decoded_rot_bf16.matmul(value_inv_rot_bf16)
+        } else {
+            let value_inv_rot = value_core.rotation_arr.as_ref()?;
+            decoded_rot.matmul(value_inv_rot)
+        };
         let inverse_rotate_us = if trace_timing {
             eval_stage_micros(&output_rows)
         } else {
