@@ -56,6 +56,10 @@ fn turboquant_trace_enabled() -> bool {
     std::env::var_os("PMETAL_TRACE_TURBOQUANT").is_some()
 }
 
+fn turboquant_wht_enabled() -> bool {
+    std::env::var_os("PMETAL_TQ_USE_WHT").is_some()
+}
+
 fn trace_turboquant_bridge(message: &str) {
     if turboquant_trace_enabled() {
         eprintln!("[TURBOQUANT TRACE][BRIDGE] {message}");
@@ -257,6 +261,14 @@ pub struct TurboQuantCore {
     qjl_projection: Vec<f32>,
     /// Row-major [dim × dim] transpose of qjl_projection.
     inverse_qjl_projection: Vec<f32>,
+    /// Optional signed-FWHT rotation signs for power-of-two dims.
+    wht_left_signs: Option<Vec<f32>>,
+    /// Optional signed-FWHT rotation signs for power-of-two dims.
+    wht_right_signs: Option<Vec<f32>>,
+    /// Optional signed-FWHT QJL signs for power-of-two dims.
+    qjl_wht_left_signs: Option<Vec<f32>>,
+    /// Optional signed-FWHT QJL signs for power-of-two dims.
+    qjl_wht_right_signs: Option<Vec<f32>>,
     /// `codebooks[b]` holds the 2^b sorted centroids for `b`-bit quantisation.
     /// Index 0 is unused (0-bit is a degenerate case).
     codebooks: Vec<Vec<f32>>,
@@ -270,6 +282,14 @@ pub struct TurboQuantCore {
     qjl_arr: Option<InlineArray>,
     /// InlineArray view of the inverse QJL projection matrix.
     inverse_qjl_arr: Option<InlineArray>,
+    /// GPU-side signed-FWHT rotation signs for D=256 experiments.
+    wht_left_signs_arr: Option<InlineArray>,
+    /// GPU-side signed-FWHT rotation signs for D=256 experiments.
+    wht_right_signs_arr: Option<InlineArray>,
+    /// GPU-side signed-FWHT QJL signs for D=256 experiments.
+    qjl_wht_left_signs_arr: Option<InlineArray>,
+    /// GPU-side signed-FWHT QJL signs for D=256 experiments.
+    qjl_wht_right_signs_arr: Option<InlineArray>,
     /// GPU-side codebook arrays: `codebook_arrs[b]` is a 1-D f32 InlineArray
     /// holding 2^b centroids for b-bit quantisation.  Indexed as codebooks.
     codebook_arrs: Vec<Option<InlineArray>>,
@@ -283,6 +303,22 @@ impl TurboQuantCore {
         let inverse_rotation = transpose_square_matrix(&rotation, dim);
         let qjl_projection = generate_random_projection(dim, &mut rng);
         let inverse_qjl_projection = transpose_square_matrix(&qjl_projection, dim);
+        let (
+            wht_left_signs,
+            wht_right_signs,
+            qjl_wht_left_signs,
+            qjl_wht_right_signs,
+        ) = if dim.is_power_of_two() {
+            let mut wht_rng = StdRng::seed_from_u64(TURBOQUANT_SEED ^ 0x5748_5400 ^ dim as u64);
+            (
+                Some(generate_rademacher_signs(dim, &mut wht_rng)),
+                Some(generate_rademacher_signs(dim, &mut wht_rng)),
+                Some(generate_rademacher_signs(dim, &mut wht_rng)),
+                Some(generate_rademacher_signs(dim, &mut wht_rng)),
+            )
+        } else {
+            (None, None, None, None)
+        };
 
         let mut codebooks = vec![Vec::new(); usize::from(max_mse_bits) + 1];
         for bits in 1..=max_mse_bits {
@@ -300,6 +336,21 @@ impl TurboQuantCore {
         let inverse_rotation_arr = matrix_to_inline_array(&inverse_rotation, dim);
         let qjl_arr = matrix_to_inline_array(&qjl_projection, dim);
         let inverse_qjl_arr = matrix_to_inline_array(&inverse_qjl_projection, dim);
+        let signs_to_inline_array = |signs: &Option<Vec<f32>>| {
+            if dim == 256 {
+                signs.as_ref().map(|values| {
+                    let arr = InlineArray::from_f32_slice(values, &[dim as i32]);
+                    arr.eval();
+                    arr
+                })
+            } else {
+                None
+            }
+        };
+        let wht_left_signs_arr = signs_to_inline_array(&wht_left_signs);
+        let wht_right_signs_arr = signs_to_inline_array(&wht_right_signs);
+        let qjl_wht_left_signs_arr = signs_to_inline_array(&qjl_wht_left_signs);
+        let qjl_wht_right_signs_arr = signs_to_inline_array(&qjl_wht_right_signs);
 
         // GPU-side codebooks: each is a tiny 1-D f32 array (16 elements for 4-bit).
         let codebook_arrs: Vec<Option<InlineArray>> = codebooks
@@ -321,12 +372,20 @@ impl TurboQuantCore {
             inverse_rotation,
             qjl_projection,
             inverse_qjl_projection,
+            wht_left_signs,
+            wht_right_signs,
+            qjl_wht_left_signs,
+            qjl_wht_right_signs,
             codebooks,
             rotation_arr,
             rotation_arr_bf16,
             inverse_rotation_arr,
             qjl_arr,
             inverse_qjl_arr,
+            wht_left_signs_arr,
+            wht_right_signs_arr,
+            qjl_wht_left_signs_arr,
+            qjl_wht_right_signs_arr,
             codebook_arrs,
         }
     }
@@ -429,21 +488,61 @@ impl TurboQuantCore {
 
     /// Rotate input rows: output = input · Π^T  (each row left-multiplied by Π).
     fn rotate_rows(&self, input: &[f32]) -> Vec<f32> {
+        if turboquant_wht_enabled() && self.dim == 256 {
+            if let (Some(pre), Some(post)) = (&self.wht_right_signs, &self.wht_left_signs) {
+                let mut output = input.to_vec();
+                for row in output.chunks_mut(self.dim) {
+                    signed_fwht_forward(row, pre, post);
+                }
+                return output;
+            }
+        }
         self.apply_transform(input, &self.rotation, &self.rotation_arr)
     }
 
     /// Inverse-rotate: output = input · Π.
     fn inverse_rotate_rows(&self, input: &[f32]) -> Vec<f32> {
+        if turboquant_wht_enabled() && self.dim == 256 {
+            if let (Some(pre), Some(post)) = (&self.wht_left_signs, &self.wht_right_signs) {
+                let mut output = input.to_vec();
+                for row in output.chunks_mut(self.dim) {
+                    signed_fwht_forward(row, pre, post);
+                }
+                return output;
+            }
+        }
         self.apply_transform(input, &self.inverse_rotation, &self.inverse_rotation_arr)
     }
 
     /// Project via Gaussian matrix J for QJL.
     fn project_rows(&self, input: &[f32]) -> Vec<f32> {
+        if turboquant_wht_enabled() && self.dim == 256 {
+            if let (Some(pre), Some(post)) =
+                (&self.qjl_wht_right_signs, &self.qjl_wht_left_signs)
+            {
+                let mut output = input.to_vec();
+                for row in output.chunks_mut(self.dim) {
+                    signed_fwht_forward(row, pre, post);
+                }
+                return output;
+            }
+        }
         self.apply_transform(input, &self.qjl_projection, &self.qjl_arr)
     }
 
     /// Inverse-project via J^T.
     fn inverse_project_rows(&self, input: &[f32]) -> Vec<f32> {
+        if turboquant_wht_enabled() && self.dim == 256 {
+            if let (Some(pre), Some(post)) =
+                (&self.qjl_wht_left_signs, &self.qjl_wht_right_signs)
+            {
+                let mut output = input.to_vec();
+                for row in output.chunks_mut(self.dim) {
+                    signed_fwht_forward(row, pre, post);
+                }
+                return output;
+            }
+        }
         self.apply_transform(input, &self.inverse_qjl_projection, &self.inverse_qjl_arr)
     }
 
@@ -468,6 +567,171 @@ impl TurboQuantCore {
 
         // CPU fallback — avoids GPU round-trip for tiny inputs.
         matmul_rows(matrix_cpu, self.dim, input)
+    }
+    /// Experimental signed-FWHT rotation path for power-of-two dims.
+    fn rotate_rows_wht(&self, input_rows: &InlineArray) -> Option<InlineArray> {
+        self.apply_signed_fwht_rows(
+            input_rows,
+            self.wht_right_signs.as_ref()?,
+            self.wht_left_signs.as_ref()?,
+            &self.wht_left_signs_arr,
+            &self.wht_right_signs_arr,
+        )
+    }
+
+    /// Experimental inverse signed-FWHT rotation path for power-of-two dims.
+    fn inverse_rotate_rows_wht(&self, input_rows: &InlineArray) -> Option<InlineArray> {
+        self.apply_signed_fwht_rows(
+            input_rows,
+            self.wht_left_signs.as_ref()?,
+            self.wht_right_signs.as_ref()?,
+            &self.wht_right_signs_arr,
+            &self.wht_left_signs_arr,
+        )
+    }
+
+    /// Experimental signed-FWHT QJL projection path for power-of-two dims.
+    #[allow(dead_code)]
+    fn project_rows_wht(&self, input_rows: &InlineArray) -> Option<InlineArray> {
+        self.apply_signed_fwht_rows(
+            input_rows,
+            self.qjl_wht_right_signs.as_ref()?,
+            self.qjl_wht_left_signs.as_ref()?,
+            &self.qjl_wht_left_signs_arr,
+            &self.qjl_wht_right_signs_arr,
+        )
+    }
+
+    /// Experimental inverse signed-FWHT QJL projection path for power-of-two dims.
+    fn inverse_project_rows_wht(&self, input_rows: &InlineArray) -> Option<InlineArray> {
+        self.apply_signed_fwht_rows(
+            input_rows,
+            self.qjl_wht_left_signs.as_ref()?,
+            self.qjl_wht_right_signs.as_ref()?,
+            &self.qjl_wht_right_signs_arr,
+            &self.qjl_wht_left_signs_arr,
+        )
+    }
+
+    fn apply_signed_fwht_rows(
+        &self,
+        input_rows: &InlineArray,
+        pre_signs_cpu: &[f32],
+        post_signs_cpu: &[f32],
+        post_signs_gpu: &Option<InlineArray>,
+        pre_signs_gpu: &Option<InlineArray>,
+    ) -> Option<InlineArray> {
+        if !self.dim.is_power_of_two() || input_rows.ndim() != 2 || input_rows.dim(1) != self.dim as i32 {
+            return None;
+        }
+        let n_rows = input_rows.dim(0) as usize;
+
+        if self.dim == 256 {
+            if let (Some(post_gpu), Some(pre_gpu)) = (post_signs_gpu.as_ref(), pre_signs_gpu.as_ref()) {
+                if let Some(out) = InlineArray::turboquant_signed_fwht_256_rows(
+                    input_rows,
+                    post_gpu,
+                    pre_gpu,
+                    n_rows as u32,
+                ) {
+                    return Some(out);
+                }
+            }
+        }
+
+        let mut output = inline_array_to_f32_vec(input_rows, n_rows * self.dim)?;
+        for row in output.chunks_mut(self.dim) {
+            signed_fwht_forward(row, post_signs_cpu, pre_signs_cpu);
+        }
+        Some(InlineArray::from_f32_slice(
+            &output,
+            &[n_rows as i32, self.dim as i32],
+        ))
+    }
+
+    fn apply_array_transform_rows(
+        &self,
+        input: &InlineArray,
+        matrix_gpu: &Option<InlineArray>,
+        wht_impl: impl FnOnce(&Self, &InlineArray) -> Option<InlineArray>,
+    ) -> Option<InlineArray> {
+        let shape = input.shape();
+        if shape.is_empty() || *shape.last()? != self.dim as i32 {
+            return None;
+        }
+        let ndim = shape.len();
+        let n_rows: i32 = if ndim == 1 {
+            1
+        } else {
+            shape[..ndim - 1].iter().product()
+        };
+        let input_rows = if ndim == 2 {
+            input.clone()
+        } else {
+            input.reshape(&[n_rows, self.dim as i32])
+        };
+        let output_rows = if turboquant_wht_enabled() && self.dim == 256 {
+            let input_rows_f32 = if input_rows.dtype_raw() == Dtype::Float32.as_i32() {
+                input_rows
+            } else {
+                input_rows.as_dtype(Dtype::Float32.as_i32())
+            };
+            wht_impl(self, &input_rows_f32)?
+        } else {
+            let matrix = matrix_gpu.as_ref()?;
+            input_rows.matmul(matrix)
+        };
+        if ndim == 2 {
+            Some(output_rows)
+        } else {
+            Some(output_rows.reshape(&shape))
+        }
+    }
+
+    fn rotate_array(&self, input: &InlineArray) -> Option<InlineArray> {
+        self.apply_array_transform_rows(input, &self.inverse_rotation_arr, |core, rows| {
+            core.rotate_rows_wht(rows)
+        })
+    }
+
+    fn inverse_rotate_array(&self, input: &InlineArray) -> Option<InlineArray> {
+        self.apply_array_transform_rows(input, &self.rotation_arr, |core, rows| {
+            core.inverse_rotate_rows_wht(rows)
+        })
+    }
+
+    fn project_array(&self, input: &InlineArray) -> Option<InlineArray> {
+        self.apply_array_transform_rows(input, &self.inverse_qjl_arr, |core, rows| {
+            core.project_rows_wht(rows)
+        })
+    }
+
+    fn inverse_project_array(&self, input: &InlineArray) -> Option<InlineArray> {
+        self.apply_array_transform_rows(input, &self.qjl_arr, |core, rows| {
+            core.inverse_project_rows_wht(rows)
+        })
+    }
+
+    fn inverse_rotate_output_array(
+        &self,
+        input: &InlineArray,
+        output_dtype: i32,
+    ) -> Option<InlineArray> {
+        if turboquant_wht_enabled() && self.dim == 256 {
+            let output = self.inverse_rotate_array(input)?;
+            if output_dtype == Dtype::Bfloat16.as_i32() {
+                Some(output.as_dtype(output_dtype))
+            } else {
+                Some(output)
+            }
+        } else if output_dtype == Dtype::Bfloat16.as_i32() {
+            let input_bf16 = input.as_dtype(output_dtype);
+            let rotation_bf16 = self.rotation_arr_bf16.as_ref()?;
+            Some(input_bf16.matmul(rotation_bf16))
+        } else {
+            let rotation = self.rotation_arr.as_ref()?;
+            Some(input.matmul(rotation))
+        }
     }
 }
 
@@ -1525,6 +1789,46 @@ impl QuantizedKvCache {
         Some((query_rows.matmul(key_rot), query_rows.matmul(key_proj)))
     }
 
+    #[doc(hidden)]
+    pub fn bench_gpu_uniform_query_transforms_wht(
+        &self,
+        queries_f32: &InlineArray,
+    ) -> Option<(InlineArray, InlineArray)> {
+        let state = self.state.as_ref()?;
+        let key_core = match &state.keys {
+            TensorRuntime::Uniform { core, .. } => core,
+            _ => return None,
+        };
+        let batch = queries_f32.dim(0);
+        let q_heads = queries_f32.dim(1);
+        let key_dim = queries_f32.dim(3);
+        if key_dim != 256 {
+            return None;
+        }
+        let q_rows = batch * q_heads;
+        let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
+        Some((
+            key_core.rotate_rows_wht(&query_rows)?,
+            key_core.project_rows_wht(&query_rows)?,
+        ))
+    }
+
+    #[doc(hidden)]
+    pub fn bench_gpu_uniform_output_inverse_rotate_wht(
+        &self,
+        decoded_rot: &InlineArray,
+    ) -> Option<InlineArray> {
+        let state = self.state.as_ref()?;
+        let value_core = match &state.values {
+            TensorRuntime::Uniform { core, .. } => core,
+            _ => return None,
+        };
+        let dim = decoded_rot.dim(1);
+        if dim != 256 {
+            return None;
+        }
+        value_core.inverse_rotate_rows_wht(decoded_rot)
+    }
     fn try_gpu_uniform_attention_q8_d256_precomputed(
         &self,
         query_rot: &InlineArray,
@@ -1784,8 +2088,6 @@ impl QuantizedKvCache {
         };
 
         let key_codebook = key_core.codebook_arr(key_bits.saturating_sub(1))?;
-        let key_rot = key_core.inverse_rotation_arr.as_ref()?;
-        let key_proj = key_core.inverse_qjl_arr.as_ref()?;
 
         let batch = queries_f32.dim(0);
         let q_heads = queries_f32.dim(1);
@@ -1805,13 +2107,13 @@ impl QuantizedKvCache {
             0
         };
         let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
-        let query_rot = query_rows.matmul(key_rot);
+        let query_rot = key_core.rotate_array(&query_rows)?;
         let rotate_us = if trace_timing {
             eval_stage_micros(&query_rot)
         } else {
             0
         };
-        let query_proj = query_rows.matmul(key_proj);
+        let query_proj = key_core.project_array(&query_rows)?;
         let project_us = if trace_timing {
             eval_stage_micros(&query_proj)
         } else {
@@ -1832,14 +2134,7 @@ impl QuantizedKvCache {
             } else {
                 0
             };
-            let output_rows = if output_dtype == Dtype::Bfloat16.as_i32() {
-                let decoded_rot_bf16 = decoded_rot.as_dtype(output_dtype);
-                let value_inv_rot_bf16 = value_core.rotation_arr_bf16.as_ref()?;
-                decoded_rot_bf16.matmul(value_inv_rot_bf16)
-            } else {
-                let value_inv_rot = value_core.rotation_arr.as_ref()?;
-                decoded_rot.matmul(value_inv_rot)
-            };
+            let output_rows = value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
             let inverse_rotate_us = if trace_timing {
                 eval_stage_micros(&output_rows)
             } else {
@@ -1897,14 +2192,8 @@ impl QuantizedKvCache {
                         } else {
                             0
                         };
-                        let output_rows = if output_dtype == Dtype::Bfloat16.as_i32() {
-                            let decoded_rot_bf16 = decoded_rot.as_dtype(output_dtype);
-                            let value_inv_rot_bf16 = value_core.rotation_arr_bf16.as_ref()?;
-                            decoded_rot_bf16.matmul(value_inv_rot_bf16)
-                        } else {
-                            let value_inv_rot = value_core.rotation_arr.as_ref()?;
-                            decoded_rot.matmul(value_inv_rot)
-                        };
+                        let output_rows =
+                            value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
                         let inverse_rotate_us = if trace_timing {
                             eval_stage_micros(&output_rows)
                         } else {
@@ -1951,14 +2240,8 @@ impl QuantizedKvCache {
                     } else {
                         0
                     };
-                    let output_rows = if output_dtype == Dtype::Bfloat16.as_i32() {
-                        let decoded_rot_bf16 = decoded_rot.as_dtype(output_dtype);
-                        let value_inv_rot_bf16 = value_core.rotation_arr_bf16.as_ref()?;
-                        decoded_rot_bf16.matmul(value_inv_rot_bf16)
-                    } else {
-                        let value_inv_rot = value_core.rotation_arr.as_ref()?;
-                        decoded_rot.matmul(value_inv_rot)
-                    };
+                    let output_rows =
+                        value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
                     let inverse_rotate_us = if trace_timing {
                         eval_stage_micros(&output_rows)
                     } else {
@@ -2017,14 +2300,7 @@ impl QuantizedKvCache {
         } else {
             0
         };
-        let output_rows = if output_dtype == Dtype::Bfloat16.as_i32() {
-            let decoded_rot_bf16 = decoded_rot.as_dtype(output_dtype);
-            let value_inv_rot_bf16 = value_core.rotation_arr_bf16.as_ref()?;
-            decoded_rot_bf16.matmul(value_inv_rot_bf16)
-        } else {
-            let value_inv_rot = value_core.rotation_arr.as_ref()?;
-            decoded_rot.matmul(value_inv_rot)
-        };
+        let output_rows = value_core.inverse_rotate_output_array(&decoded_rot, output_dtype)?;
         let inverse_rotate_us = if trace_timing {
             eval_stage_micros(&output_rows)
         } else {
@@ -2166,10 +2442,7 @@ fn gpu_quantize_kv(
 
     // 3. Rotate: k_norm @ rotation.T  (CPU: matmul_rows(rotation, dim, input) = input @ rotation.T)
     //    rotation.T == inverse_rotation, so we matmul with inverse_rotation_arr.
-    let k_rot = match &k_core.inverse_rotation_arr {
-        Some(rot_t) => k_norm.matmul(rot_t),
-        None => return None,
-    };
+    let k_rot = k_core.rotate_array(&k_norm)?;
 
     // 4. GPU nearest-centroid → [B, H, S, D] uint32
     let k_indices = k_core.gpu_quantize_mse(&k_rot, key_mse_bits)?;
@@ -2186,13 +2459,9 @@ fn gpu_quantize_kv(
     //    residual_unrot = k_mse_recon_rot @ rotation_arr  (inverse-rotate the rotated reconstruction)
     //    then: residual_unrot = k_norm - inv_rotate(k_mse_recon_rot)
     //    QJL: residual_unrot @ inverse_qjl_arr  (= residual @ qjl.T)
-    let rot = k_core.rotation_arr.as_ref()?;
-    let k_mse_recon_unrot = k_mse_recon_rot.matmul(rot);
+    let k_mse_recon_unrot = k_core.inverse_rotate_array(&k_mse_recon_rot)?;
     let k_residual_unrot = k_norm.subtract(&k_mse_recon_unrot);
-    let k_qjl_proj = match &k_core.inverse_qjl_arr {
-        Some(inv_j) => k_residual_unrot.matmul(inv_j),
-        None => return None,
-    };
+    let k_qjl_proj = k_core.project_array(&k_residual_unrot)?;
     let qjl_shape = k_qjl_proj.shape();
     let qjl_ndim = qjl_shape.len();
     let qjl_rows: i32 = qjl_shape[..qjl_ndim - 1].iter().product();
@@ -2270,10 +2539,7 @@ fn gpu_quantize_kv(
     let v_norm = values.divide(&safe_norms_v);
 
     // v_norm @ rotation.T = v_norm @ inverse_rotation_arr
-    let v_rot = match &v_core.inverse_rotation_arr {
-        Some(rot_t) => v_norm.matmul(rot_t),
-        None => return None,
-    };
+    let v_rot = v_core.rotate_array(&v_norm)?;
     let v_indices = v_core.gpu_quantize_mse(&v_rot, val_bits)?;
     let v_indices_t = (!use_q8_seq_shadow).then(|| v_indices.transpose_axes(&[0, 1, 3, 2]));
     let d256_rot_values_seq = if use_q8_seq_shadow {
@@ -2361,14 +2627,12 @@ fn gpu_dequantize_keys(
     // 2. Inverse-rotate back to input space.
     //    CPU: inverse_rotate_rows = matmul_rows(inverse_rotation, dim, input) = input @ inverse_rotation.T = input @ rotation.
     //    So GPU: recon_rot @ rotation_arr.
-    let rot = core.rotation_arr.as_ref()?;
-    let mse_base = mse_recon_rot.matmul(rot);
+    let mse_base = core.inverse_rotate_array(&mse_recon_rot)?;
 
     // 3. QJL correction.
     //    CPU: inverse_project_rows(signs) = matmul_rows(inverse_qjl, dim, signs) = signs @ inverse_qjl.T = signs @ qjl.
     //    The GPU store keeps packed uint32 sign words, so unpack to {-1,+1}
     //    before the matmul with qjl_arr.
-    let qjl = core.qjl_arr.as_ref()?;
     let packed_shape = store.qjl_signs.shape();
     let packed_ndim = packed_shape.len();
     let packed_rows: i32 = packed_shape[..packed_ndim - 1].iter().product();
@@ -2391,7 +2655,7 @@ fn gpu_dequantize_keys(
         unpacked_shape.push(core.dim as i32);
         unpacked_qjl_2d.reshape(&unpacked_shape)
     };
-    let qjl_correction = unpacked_qjl.matmul(qjl);
+    let qjl_correction = core.inverse_project_array(&unpacked_qjl)?;
     let dim = core.dim as f32;
     let qjl_scale_factor = InlineArray::from_f32((std::f32::consts::PI / 2.0).sqrt() / dim);
     // residual_norms: [B,H,T,1] keepdims — broadcast along D.
@@ -2425,12 +2689,24 @@ fn gpu_dequantize_values(
         TensorRuntime::Mixed { .. } => return None,
     };
 
+    if turboquant_wht_enabled() && core.dim == 256 {
+        let shape = store.indices.shape();
+        let total = shape.iter().product::<i32>() as usize;
+        let rows = shape[..shape.len() - 1].iter().product::<i32>() as usize;
+        let indices: Vec<u16> = inline_array_to_f32_vec(&store.indices, total)?
+            .into_iter()
+            .map(|v| v as u16)
+            .collect();
+        let norms = inline_array_to_f32_vec(&store.norms, rows)?;
+        let reconstructed = decode_value_component_rows_raw(core, &indices, &norms, val_bits);
+        return Some(InlineArray::from_f32_slice(&reconstructed, &shape));
+    }
+
     // 1. Reconstruct MSE centroids in rotated space.
     let mse_recon_rot = core.gpu_reconstruct_mse(&store.indices, val_bits)?;
 
     // 2. Inverse-rotate: recon_rot @ rotation_arr (same derivation as keys).
-    let rot = core.rotation_arr.as_ref()?;
-    let mse_base = mse_recon_rot.matmul(rot);
+    let mse_base = core.inverse_rotate_array(&mse_recon_rot)?;
 
     // 3. Rescale by stored L2 norms [B,H,T,1].
     Some(mse_base.multiply(&store.norms))
@@ -3160,6 +3436,58 @@ fn transpose_square_matrix(matrix: &[f32], dim: usize) -> Vec<f32> {
         }
     }
     t
+}
+
+fn generate_rademacher_signs(dim: usize, rng: &mut StdRng) -> Vec<f32> {
+    (0..dim)
+        .map(|_| if rng.random::<bool>() { 1.0 } else { -1.0 })
+        .collect()
+}
+
+fn fwht_in_place(values: &mut [f32]) {
+    let len = values.len();
+    debug_assert!(len.is_power_of_two());
+    let mut h = 1usize;
+    while h < len {
+        let step = h << 1;
+        let mut i = 0usize;
+        while i < len {
+            for j in i..i + h {
+                let a = values[j];
+                let b = values[j + h];
+                values[j] = a + b;
+                values[j + h] = a - b;
+            }
+            i += step;
+        }
+        h = step;
+    }
+}
+
+fn signed_fwht_forward(values: &mut [f32], left_signs: &[f32], right_signs: &[f32]) {
+    debug_assert_eq!(values.len(), left_signs.len());
+    debug_assert_eq!(values.len(), right_signs.len());
+    for (v, &s) in values.iter_mut().zip(right_signs.iter()) {
+        *v *= s;
+    }
+    fwht_in_place(values);
+    let scale = 1.0f32 / (values.len() as f32).sqrt();
+    for (v, &left) in values.iter_mut().zip(left_signs.iter()) {
+        *v *= left * scale;
+    }
+}
+
+fn signed_fwht_inverse(values: &mut [f32], left_signs: &[f32], right_signs: &[f32]) {
+    debug_assert_eq!(values.len(), left_signs.len());
+    debug_assert_eq!(values.len(), right_signs.len());
+    let scale = 1.0f32 / (values.len() as f32).sqrt();
+    for (v, &left) in values.iter_mut().zip(left_signs.iter()) {
+        *v *= left * scale;
+    }
+    fwht_in_place(values);
+    for (v, &right) in values.iter_mut().zip(right_signs.iter()) {
+        *v *= right;
+    }
 }
 
 /// CPU fallback: row-major [dim × dim] matrix applied to a batch of row vectors.

@@ -2994,6 +2994,31 @@ int mlx_inline_turboquant_unpack_sign_bits(
     }
 }
 
+int mlx_inline_turboquant_signed_fwht_256_rows(
+    mlx_inline_array*       out,
+    const mlx_inline_array* input,
+    const mlx_inline_array* left_signs,
+    const mlx_inline_array* right_signs,
+    uint32_t                n_rows)
+{
+    using namespace mlx::core;
+
+    if (n_rows == 0) return 1;
+
+    try {
+        constexpr float kScale = 0.0625f;
+        auto input_f32 = mlx::core::astype(as_arr(input), float32);
+        auto input_contig = mlx::core::contiguous(input_f32);
+        auto signed_input = mlx::core::multiply(input_contig, as_arr(left_signs));
+        auto signed_input_contig = mlx::core::contiguous(signed_input);
+        auto transformed = mlx::core::hadamard_transform(signed_input_contig, kScale);
+        auto output_arr = mlx::core::multiply(transformed, as_arr(right_signs));
+        new (out->buf) array(output_arr);
+        return 0;
+    } catch (...) {
+        return 1;
+    }
+}
 int mlx_inline_turboquant_attention_q8_d256_2pass(
     mlx_inline_array*       out,
     const mlx_inline_array* query_rot,

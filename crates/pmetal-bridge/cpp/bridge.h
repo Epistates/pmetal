@@ -685,6 +685,17 @@ int mlx_inline_turboquant_unpack_sign_bits(
     uint32_t                packed_dim,
     uint32_t                n_rows);
 
+// input:       [N, 256] f32
+// left_signs:  [256] f32
+// right_signs: [256] f32
+// out:         [N, 256] f32
+int mlx_inline_turboquant_signed_fwht_256_rows(
+    mlx_inline_array*       out,
+    const mlx_inline_array* input,
+    const mlx_inline_array* left_signs,
+    const mlx_inline_array* right_signs,
+    uint32_t                n_rows);
+
 // Fused TurboQuant value aggregation in the rotated domain.
 // weights:  [N, S] f32
 // indices:  [N, D, S_cap] uint8

@@ -543,6 +543,14 @@ unsafe extern "C" {
         n_rows: u32,
     ) -> i32;
 
+    fn mlx_inline_turboquant_signed_fwht_256_rows(
+        out: *mut RawBuf,
+        input: *const RawBuf,
+        left_signs: *const RawBuf,
+        right_signs: *const RawBuf,
+        n_rows: u32,
+    ) -> i32;
+
     fn mlx_inline_turboquant_weighted_decode(
         out: *mut RawBuf,
         weights: *const RawBuf,
@@ -2730,6 +2738,38 @@ impl InlineArray {
                 &packed.raw,
                 dim,
                 packed_dim,
+                n_rows,
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Signed, normalized FWHT-256 transform applied row-wise:
+    /// `out[row] = left_signs * FWHT(right_signs * input[row]) / sqrt(256)`.
+    ///
+    /// - `input`: `[N, 256]` f32
+    /// - `left_signs`: `[256]` f32
+    /// - `right_signs`: `[256]` f32
+    /// - Returns `[N, 256]` f32 on success.
+    pub fn turboquant_signed_fwht_256_rows(
+        input: &Self,
+        left_signs: &Self,
+        right_signs: &Self,
+        n_rows: u32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_signed_fwht_256_rows(
+                out.as_mut_ptr(),
+                &input.raw,
+                &left_signs.raw,
+                &right_signs.raw,
                 n_rows,
             )
         };
