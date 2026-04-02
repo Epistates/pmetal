@@ -1371,8 +1371,10 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KEYS_2PASS_1_SOURCE = R"(
 
     for (uint seq = block; seq < n_seq; seq += blocks) {
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
-        float key_norm = key_norms[scalar_idx];
-        float residual_scale = key_residual_norms[scalar_idx] * kQjlConst;
+        uint scale_base = scalar_idx * 4u;
+        float key_norm = slot_scales[scale_base + 0u];
+        float residual_scale = slot_scales[scale_base + 1u] * kQjlConst;
+        float value_norm = slot_scales[scale_base + 2u];
         uint key_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
         uint value_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
 
@@ -1419,7 +1421,7 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KEYS_2PASS_1_SOURCE = R"(
         max_score = new_max;
         sum_exp_score = sum_exp_score * factor + exp_score;
 
-        float value_scale = exp_score * value_norms[scalar_idx];
+        float value_scale = exp_score * value_norm;
         acc0 = acc0 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 0u]];
         acc1 = acc1 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 1u]];
         acc2 = acc2 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 2u]];
@@ -2117,11 +2119,9 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_attention_q8_d256_p
             "query_rot",
             "query_proj",
             "key_bytes",
-            "key_norms",
-            "key_residual_norms",
+            "slot_scales",
             "key_codebook",
             "value_indices",
-            "value_norms",
             "value_codebook",
         },
         {"partials", "sums", "maxs"},
@@ -2699,11 +2699,9 @@ int mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(
     const mlx_inline_array* query_rot,
     const mlx_inline_array* query_proj,
     const mlx_inline_array* key_bytes,
-    const mlx_inline_array* key_norms,
-    const mlx_inline_array* key_residual_norms,
+    const mlx_inline_array* slot_scales,
     const mlx_inline_array* key_codebook,
     const mlx_inline_array* value_indices,
-    const mlx_inline_array* value_norms,
     const mlx_inline_array* value_codebook,
     uint32_t                n_rows,
     uint32_t                n_seq,
@@ -2724,11 +2722,9 @@ int mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(
         const array& query_rot_arr = as_arr(query_rot);
         const array& query_proj_arr = as_arr(query_proj);
         const array& key_bytes_arr = as_arr(key_bytes);
-        const array& key_norms_arr = as_arr(key_norms);
-        const array& key_residual_norms_arr = as_arr(key_residual_norms);
+        const array& slot_scales_arr = as_arr(slot_scales);
         const array& key_codebook_arr = as_arr(key_codebook);
         const array& value_indices_arr = as_arr(value_indices);
-        const array& value_norms_arr = as_arr(value_norms);
         const array& value_codebook_arr = as_arr(value_codebook);
 
         if (query_rot_arr.shape(-1) != dim || query_proj_arr.shape(-1) != dim) return 1;
@@ -2740,11 +2736,9 @@ int mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(
                 query_rot_arr,
                 query_proj_arr,
                 key_bytes_arr,
-                key_norms_arr,
-                key_residual_norms_arr,
+                slot_scales_arr,
                 key_codebook_arr,
                 value_indices_arr,
-                value_norms_arr,
                 value_codebook_arr,
             },
             {{(int)n_rows, (int)blocks, (int)dim}, {(int)n_rows, (int)blocks}, {(int)n_rows, (int)blocks}},
