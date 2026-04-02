@@ -1388,7 +1388,7 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KEYS_2PASS_1_SOURCE = R"(
 
     for (uint seq = block; seq < n_seq; seq += blocks) {
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
-        uint scale_base = scalar_idx * 4u;
+        uint scale_base = scalar_idx * 3u;
         float key_norm = slot_scales[scale_base + 0u];
         float residual_scale = slot_scales[scale_base + 1u] * kQjlConst;
         float value_norm = slot_scales[scale_base + 2u];
@@ -1527,7 +1527,7 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KV_2PASS_1_SOURCE = R"(
 
     for (uint seq = block; seq < n_seq; seq += blocks) {
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
-        uint scale_base = scalar_idx * 4u;
+        uint scale_base = scalar_idx * 3u;
         float key_norm = slot_scales[scale_base + 0u];
         float residual_scale = slot_scales[scale_base + 1u] * kQjlConst;
         float value_norm = slot_scales[scale_base + 2u];

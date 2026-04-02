@@ -705,11 +705,11 @@ fn packed_qjl_words(dim: usize) -> usize {
 ///   q8_keybytes_t:   [B, H, D, T]  uint8   — q8-only packed index/sign view
 ///   q8_keybytes_seq: [B, H, T, D]  uint8   — q8 seq-major key shadow
 ///   q8_kvbytes_seq:  [B, H, T, D]  uint16  — D256 q8 seq-major packed {key,value}
-///   q8_slot_scales_seq: [B, H, T, 4]  f32  — [key_norm, residual_norm, value_norm, pad]
-///   norms:           [B, H, T, 1]  f32     — L2 norm before unit-sphere normalise
+///   q8_slot_scales_seq: [B, H, T, 3]  f32  — [key_norm, residual_norm, value_norm]
+///   norms:           [B, H, T, 1]  f32     — optional L2 norm before unit-sphere normalise
 ///   qjl_signs:       [B, H, T, ceil(D/32)]  uint32 packed sign words
 ///   qjl_signs_t:     [B, H, ceil(D/32), T]  uint32 transposed sign-word view
-///   residual_norms:  [B, H, T, 1]  f32     — unscaled residual L2 norm
+///   residual_norms:  [B, H, T, 1]  f32     — optional unscaled residual L2 norm
 #[derive(Debug, Clone)]
 struct GpuKeyStore {
     indices: InlineArray,
@@ -718,10 +718,10 @@ struct GpuKeyStore {
     q8_keybytes_seq: Option<InlineArray>,
     q8_kvbytes_seq: Option<InlineArray>,
     q8_slot_scales_seq: Option<InlineArray>,
-    norms: InlineArray,
+    norms: Option<InlineArray>,
     qjl_signs: InlineArray,
     qjl_signs_t: Option<InlineArray>,
-    residual_norms: InlineArray,
+    residual_norms: Option<InlineArray>,
 }
 
 impl GpuKeyStore {
@@ -755,13 +755,19 @@ impl GpuKeyStore {
                 (Some(current), None) => Some(current),
                 (None, None) => None,
             };
-        self.norms = self.norms.kv_cache_append(&new.norms, 2);
+        self.norms = match (self.norms.take(), new.norms) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+            _ => None,
+        };
         self.qjl_signs = self.qjl_signs.kv_cache_append(&new.qjl_signs, 2);
         self.qjl_signs_t = match (self.qjl_signs_t.take(), new.qjl_signs_t) {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
             _ => None,
         };
-        self.residual_norms = self.residual_norms.kv_cache_append(&new.residual_norms, 2);
+        self.residual_norms = match (self.residual_norms.take(), new.residual_norms) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+            _ => None,
+        };
     }
 
     fn cache_seq_capacity(&self) -> i32 {
@@ -792,6 +798,26 @@ impl GpuKeyStore {
             .unwrap_or_else(|| self.qjl_signs.dim(3))
     }
 
+    fn slot_scale_component_array(&self, component: i32) -> Option<InlineArray> {
+        let slot_scales = self.q8_slot_scales_seq.as_ref()?;
+        Some(slot_scales.slice(
+            &[0, 0, 0, component],
+            &[slot_scales.dim(0), slot_scales.dim(1), slot_scales.dim(2), component + 1],
+        ))
+    }
+
+    fn key_norms_array(&self) -> Option<InlineArray> {
+        self.norms
+            .clone()
+            .or_else(|| self.slot_scale_component_array(0))
+    }
+
+    fn residual_norms_array(&self) -> Option<InlineArray> {
+        self.residual_norms
+            .clone()
+            .or_else(|| self.slot_scale_component_array(1))
+    }
+
     fn collect_for_detach<'a>(&'a mut self, out: &mut Vec<&'a mut InlineArray>) {
         out.push(&mut self.indices);
         if let Some(indices_t) = self.indices_t.as_mut() {
@@ -809,12 +835,16 @@ impl GpuKeyStore {
         if let Some(q8_slot_scales_seq) = self.q8_slot_scales_seq.as_mut() {
             out.push(q8_slot_scales_seq);
         }
-        out.push(&mut self.norms);
+        if let Some(norms) = self.norms.as_mut() {
+            out.push(norms);
+        }
         out.push(&mut self.qjl_signs);
         if let Some(qjl_signs_t) = self.qjl_signs_t.as_mut() {
             out.push(qjl_signs_t);
         }
-        out.push(&mut self.residual_norms);
+        if let Some(residual_norms) = self.residual_norms.as_mut() {
+            out.push(residual_norms);
+        }
     }
 }
 
@@ -1395,8 +1425,10 @@ impl QuantizedKvCache {
         }
 
         let kv_rows = (layout.batch * layout.heads) as i32;
-        let key_norms = ks.norms.reshape(&[kv_rows, cache_seq_capacity]);
-        let key_residual_norms = ks.residual_norms.reshape(&[kv_rows, cache_seq_capacity]);
+        let key_norms = ks.key_norms_array()?.reshape(&[kv_rows, cache_seq_capacity]);
+        let key_residual_norms = ks
+            .residual_norms_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
         let qjl_words = ks.qjl_words();
 
         match mode {
@@ -1537,7 +1569,7 @@ impl QuantizedKvCache {
                 query_rot,
                 query_proj,
                 &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
+                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
                 key_core.codebook_arr(key_bits.saturating_sub(1))?,
                 value_core.codebook_arr(value_bits)?,
                 q_rows as u32,
@@ -1554,7 +1586,7 @@ impl QuantizedKvCache {
                 query_rot,
                 query_proj,
                 &key_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
+                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
                 key_core.codebook_arr(key_bits.saturating_sub(1))?,
                 &vs.indices.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
                 value_core.codebook_arr(value_bits)?,
@@ -1571,8 +1603,9 @@ impl QuantizedKvCache {
                 query_proj,
                 &ks.indices_t_array().reshape(&[kv_rows, key_dim, cache_seq_capacity]),
                 &ks.qjl_signs_t_array().reshape(&[kv_rows, qjl_words, cache_seq_capacity]),
-                &ks.norms.reshape(&[kv_rows, cache_seq_capacity]),
-                &ks.residual_norms.reshape(&[kv_rows, cache_seq_capacity]),
+                &ks.key_norms_array()?.reshape(&[kv_rows, cache_seq_capacity]),
+                &ks.residual_norms_array()?
+                    .reshape(&[kv_rows, cache_seq_capacity]),
                 key_core.codebook_arr(key_bits.saturating_sub(1))?,
                 &vs.indices_t_array().reshape(&[kv_rows, value_dim, cache_seq_capacity]),
                 &vs.norms.reshape(&[kv_rows, cache_seq_capacity]),
@@ -1611,8 +1644,10 @@ impl QuantizedKvCache {
         let n_seq = self.offset as i32;
         let cache_seq_capacity = ks.cache_seq_capacity();
         let qjl_words = ks.qjl_words();
-        let key_norms = ks.norms.reshape(&[kv_rows, cache_seq_capacity]);
-        let key_residual_norms = ks.residual_norms.reshape(&[kv_rows, cache_seq_capacity]);
+        let key_norms = ks.key_norms_array()?.reshape(&[kv_rows, cache_seq_capacity]);
+        let key_residual_norms = ks
+            .residual_norms_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
         if key_bits == 8
             && key_dim == 256
             && qjl_words == 8
@@ -1756,8 +1791,10 @@ impl QuantizedKvCache {
         };
 
         let kv_rows = (layout.batch * layout.heads) as i32;
-        let key_norms = ks.norms.reshape(&[kv_rows, cache_seq_capacity]);
-        let key_residual_norms = ks.residual_norms.reshape(&[kv_rows, cache_seq_capacity]);
+        let key_norms = ks.key_norms_array()?.reshape(&[kv_rows, cache_seq_capacity]);
+        let key_residual_norms = ks
+            .residual_norms_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
         let qjl_words = ks.qjl_words();
         if let Some(decoded_rot) =
             self.try_gpu_uniform_attention_q8_d256_precomputed(&query_rot, &query_proj, q_heads, scale)
@@ -2242,13 +2279,8 @@ fn gpu_quantize_kv(
         None
     };
     let q8_slot_scales_seq = if use_q8_seq_shadow {
-        let slot_pad = InlineArray::zeros(
-            &[values.dim(0), values.dim(1), values.dim(2), 1],
-            val_norms.dtype_raw(),
-        );
         let key_scales = key_norms.concatenate_2(&k_residual_norms, 3);
-        let value_scales = val_norms.concatenate_2(&slot_pad, 3);
-        Some(key_scales.concatenate_2(&value_scales, 3))
+        Some(key_scales.concatenate_2(&val_norms, 3))
     } else {
         None
     };
@@ -2261,10 +2293,10 @@ fn gpu_quantize_kv(
             q8_keybytes_seq,
             q8_kvbytes_seq,
             q8_slot_scales_seq,
-            norms: key_norms,
+            norms: (!use_q8_seq_shadow).then_some(key_norms),
             qjl_signs: k_qjl_signs,
             qjl_signs_t: k_qjl_signs_t,
-            residual_norms: k_residual_norms,
+            residual_norms: (!use_q8_seq_shadow).then_some(k_residual_norms),
         },
         GpuValueStore {
             indices: v_indices,
@@ -2329,13 +2361,14 @@ fn gpu_dequantize_keys(
     let dim = core.dim as f32;
     let qjl_scale_factor = InlineArray::from_f32((std::f32::consts::PI / 2.0).sqrt() / dim);
     // residual_norms: [B,H,T,1] keepdims — broadcast along D.
-    let scale = store.residual_norms.multiply(&qjl_scale_factor);
+    let residual_norms = store.residual_norms_array()?;
+    let scale = residual_norms.multiply(&qjl_scale_factor);
     let correction = qjl_correction.multiply(&scale);
 
     // 4. Base + QJL correction, rescale by original L2 norm.
     // norms: [B,H,T,1] keepdims — broadcast along D.
     let combined = mse_base.add(&correction);
-    Some(combined.multiply(&store.norms))
+    Some(combined.multiply(&store.key_norms_array()?))
 }
 
 /// Dequantise GPU-stored values back to `[B, H, T, Dv]` f32.
@@ -3635,6 +3668,14 @@ mod tests {
         assert!(
             gpu.qjl_signs_t.is_none(),
             "d256 q8 path should not keep transposed qjl sign words"
+        );
+        assert!(
+            gpu.norms.is_none(),
+            "d256 q8 path should source key norms from slot scales"
+        );
+        assert!(
+            gpu.residual_norms.is_none(),
+            "d256 q8 path should source residual norms from slot scales"
         );
         let gpu_values = seed_cache
             .values
