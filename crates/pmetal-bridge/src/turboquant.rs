@@ -858,6 +858,7 @@ struct GpuValueStore {
     indices: InlineArray,
     indices_t: Option<InlineArray>,
     norms: InlineArray,
+    d256_rot_values_seq: Option<InlineArray>,
 }
 
 impl GpuValueStore {
@@ -868,6 +869,13 @@ impl GpuValueStore {
             _ => None,
         };
         self.norms = self.norms.kv_cache_append(&new.norms, 2);
+        self.d256_rot_values_seq =
+            match (self.d256_rot_values_seq.take(), new.d256_rot_values_seq) {
+                (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+                (None, Some(next)) => Some(next),
+                (Some(current), None) => Some(current),
+                (None, None) => None,
+            };
     }
 
     fn indices_t_array(&self) -> InlineArray {
@@ -882,6 +890,9 @@ impl GpuValueStore {
             out.push(indices_t);
         }
         out.push(&mut self.norms);
+        if let Some(d256_rot_values_seq) = self.d256_rot_values_seq.as_mut() {
+            out.push(d256_rot_values_seq);
+        }
     }
 }
 
@@ -1565,20 +1576,37 @@ impl QuantizedKvCache {
         if let (Some(kv_bytes), Some(slot_scales)) =
             (ks.q8_kvbytes_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
         {
-            InlineArray::turboquant_attention_q8_d256_packed_kv_2pass(
-                query_rot,
-                query_proj,
-                &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
-                key_core.codebook_arr(key_bits.saturating_sub(1))?,
-                value_core.codebook_arr(value_bits)?,
-                q_rows as u32,
-                n_seq as u32,
-                cache_seq_capacity as u32,
-                q_heads as u32,
-                layout.heads as u32,
-                scale,
-            )
+            if let Some(value_rot_dense) = vs.d256_rot_values_seq.as_ref() {
+                InlineArray::turboquant_attention_q8_d256_packed_kv_dense_values_2pass(
+                    query_rot,
+                    query_proj,
+                    &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                    &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                    key_core.codebook_arr(key_bits.saturating_sub(1))?,
+                    &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
+                    q_rows as u32,
+                    n_seq as u32,
+                    cache_seq_capacity as u32,
+                    q_heads as u32,
+                    layout.heads as u32,
+                    scale,
+                )
+            } else {
+                InlineArray::turboquant_attention_q8_d256_packed_kv_2pass(
+                    query_rot,
+                    query_proj,
+                    &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
+                    &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                    key_core.codebook_arr(key_bits.saturating_sub(1))?,
+                    value_core.codebook_arr(value_bits)?,
+                    q_rows as u32,
+                    n_seq as u32,
+                    cache_seq_capacity as u32,
+                    q_heads as u32,
+                    layout.heads as u32,
+                    scale,
+                )
+            }
         } else if let (Some(key_bytes), Some(slot_scales)) =
             (ks.q8_keybytes_seq.as_ref(), ks.q8_slot_scales_seq.as_ref())
         {
@@ -2248,6 +2276,11 @@ fn gpu_quantize_kv(
     };
     let v_indices = v_core.gpu_quantize_mse(&v_rot, val_bits)?;
     let v_indices_t = (!use_q8_seq_shadow).then(|| v_indices.transpose_axes(&[0, 1, 3, 2]));
+    let d256_rot_values_seq = if use_q8_seq_shadow {
+        Some(v_rot.multiply(&val_norms).as_dtype(Dtype::Bfloat16.as_i32()))
+    } else {
+        None
+    };
     let q8_kvbytes_seq = if use_q8_seq_shadow {
         q8_pack_inputs
             .as_ref()
@@ -2302,6 +2335,7 @@ fn gpu_quantize_kv(
             indices: v_indices,
             indices_t: v_indices_t,
             norms: val_norms,
+            d256_rot_values_seq,
         },
     ))
 }
@@ -2377,6 +2411,15 @@ fn gpu_dequantize_values(
     runtime: &TensorRuntime,
     val_bits: u8,
 ) -> Option<InlineArray> {
+    if let Some(d256_rot_values_seq) = store.d256_rot_values_seq.as_ref() {
+        let core = match runtime {
+            TensorRuntime::Uniform { core, .. } => core,
+            TensorRuntime::Mixed { .. } => return None,
+        };
+        let rot = core.rotation_arr.as_ref()?;
+        return Some(d256_rot_values_seq.as_dtype(Dtype::Float32.as_i32()).matmul(rot));
+    }
+
     let core = match runtime {
         TensorRuntime::Uniform { core, .. } => core,
         TensorRuntime::Mixed { .. } => return None,
