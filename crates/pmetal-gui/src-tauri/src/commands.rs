@@ -1748,16 +1748,26 @@ async fn run_inference_streaming(
     // captures only prefill + first-token latency.  decode_ms = total - ttft covers decode only.
     let ttft_ms = first_token_time.map(|t| t.duration_since(start).as_secs_f64() * 1000.0);
     let decode_ms = ttft_ms.map(|ttft| total_ms - ttft);
-    // Token 1 is the prefill output (counted in TTFT); tokens 2..N are decode steps.
-    let tok_per_sec = if let Some(dm) = decode_ms {
-        if dm > 0.0 && generated_tokens > 1 {
-            Some((generated_tokens - 1) as f64 / (dm / 1000.0))
+
+    // For native paths, prefer the bridge's own decode metrics (measured inside the decode loop,
+    // skipping the first 10 steps and excluding stop-token overhead) over wall-clock estimation.
+    // Fall back to wall-clock calculation for non-native paths.
+    let (tok_per_sec, avg_step_ms, p50_step_ms) =
+        if let Some(m) = runner.state.last_decode_metrics {
+            (Some(m.tok_per_sec), Some(m.avg_step_ms), Some(m.p50_step_ms))
         } else {
-            None
-        }
-    } else {
-        None
-    };
+            // Token 1 is the prefill output (counted in TTFT); tokens 2..N are decode steps.
+            let tps = if let Some(dm) = decode_ms {
+                if dm > 0.0 && generated_tokens > 1 {
+                    Some((generated_tokens - 1) as f64 / (dm / 1000.0))
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+            (tps, None, None)
+        };
 
     let parsed_response = pmetal::response_parser::parse_assistant_response(&streamed_text);
 
@@ -1767,6 +1777,8 @@ async fn run_inference_streaming(
         "total_ms": total_ms,
         "ttft_ms": ttft_ms,
         "tok_per_sec": tok_per_sec,
+        "avg_step_ms": avg_step_ms,
+        "p50_step_ms": p50_step_ms,
         "response_text": parsed_response.response,
         "thinking": parsed_response.thinking,
         "truncated_thinking": parsed_response.truncated_thinking,

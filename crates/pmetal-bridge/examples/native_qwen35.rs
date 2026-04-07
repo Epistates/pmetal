@@ -112,7 +112,7 @@ fn main() {
 
     let t0 = std::time::Instant::now();
     eprintln!("Using canonical bridge decode path");
-    let tokens = pmetal_bridge::qwen3_native::generate_canonical(
+    let (tokens, metrics) = pmetal_bridge::qwen3_native::generate_canonical(
         &weights,
         &mut cache,
         &config,
@@ -129,4 +129,10 @@ fn main() {
         elapsed,
         tokens.len() as f64 / elapsed
     );
+    if let Some(m) = metrics {
+        eprintln!(
+            "Decode (bridge): {:.0} tok/s (avg={:.2}ms p50={:.2}ms over {} steps)",
+            m.tok_per_sec, m.avg_step_ms, m.p50_step_ms, m.measured_steps,
+        );
+    }
 }

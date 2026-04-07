@@ -28,6 +28,19 @@ pub struct BenchmarkTrial {
     pub peak_memory_bytes: usize,
 }
 
+/// Per-token decode performance metrics returned from generation loops.
+#[derive(Debug, Clone, Copy)]
+pub struct DecodeMetrics {
+    /// Tokens per second (excludes warmup steps).
+    pub tok_per_sec: f64,
+    /// Average milliseconds per decode step.
+    pub avg_step_ms: f64,
+    /// Median (p50) milliseconds per decode step.
+    pub p50_step_ms: f64,
+    /// Number of decode steps measured (excluding warmup).
+    pub measured_steps: usize,
+}
+
 /// Convert token ids to the native `[1, T]` int32 prompt input expected by
 /// bridge-backed forward passes.
 pub fn prompt_tokens_to_input(input_ids: &[u32]) -> InlineArray {
@@ -575,7 +588,7 @@ pub fn generate_from_primed_sample<Weights, Cache>(
     log_stats: bool,
     mut on_token: impl FnMut(u32) -> bool,
     mut forward_step: impl FnMut(&Weights, &InlineArray, &mut Cache) -> InlineArray,
-) -> Vec<u32> {
+) -> (Vec<u32>, Option<DecodeMetrics>) {
     let mut tokens = Vec::with_capacity(max_tokens);
     let mut step_times: Vec<f64> = Vec::new();
 
@@ -613,14 +626,21 @@ pub fn generate_from_primed_sample<Weights, Cache>(
         }
     }
 
-    if log_stats && step_times.len() > 20 {
+    let metrics = if log_stats && step_times.len() > 20 {
         step_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
         let skip = 10;
-        let avg = step_times[skip..].iter().sum::<f64>() / (step_times.len() - skip) as f64;
+        let measured = &step_times[skip..];
+        let avg = measured.iter().sum::<f64>() / measured.len() as f64;
         let p50 = step_times[step_times.len() / 2];
-        let tps = 1000.0 / avg;
-        eprintln!("Decode: {tps:.0} tok/s (avg={avg:.2}ms p50={p50:.2}ms)");
-    }
+        Some(DecodeMetrics {
+            tok_per_sec: 1000.0 / avg,
+            avg_step_ms: avg,
+            p50_step_ms: p50,
+            measured_steps: measured.len(),
+        })
+    } else {
+        None
+    };
 
     crate::inline_array::synchronize();
     // Restore the default stream before returning. InlineArray Drops happen
@@ -628,7 +648,7 @@ pub fn generate_from_primed_sample<Weights, Cache>(
     // the main stream, not the generation stream, to avoid SIGSEGV from
     // Metal teardown racing with stream cleanup.
     crate::inline_array::reset_default_stream();
-    tokens
+    (tokens, metrics)
 }
 
 #[cfg(test)]

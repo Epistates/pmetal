@@ -275,6 +275,9 @@ pub struct NativeGenerationOutput {
     pub stopped_by_token: bool,
     /// True when generation stopped because `max_tokens` was exhausted.
     pub stopped_by_length: bool,
+    /// Decode throughput metrics from the bridge generate loop.
+    /// `None` when fewer than 20 decode steps were measured.
+    pub decode_metrics: Option<pmetal_bridge::decode::DecodeMetrics>,
 }
 
 #[derive(Debug, Clone)]
@@ -376,7 +379,9 @@ fn finish_with_bridge_generate(
     first_tok: u32,
     max_tokens: usize,
     on_token: &mut dyn FnMut(u32) -> bool,
-    generate_tail: impl FnOnce(&mut dyn FnMut(u32) -> bool) -> Vec<u32>,
+    generate_tail: impl FnOnce(
+        &mut dyn FnMut(u32) -> bool,
+    ) -> (Vec<u32>, Option<pmetal_bridge::decode::DecodeMetrics>),
 ) -> NativeGenerationOutput {
     let prompt_len = prompt.len();
     let mut all_tokens = prompt.to_vec();
@@ -388,11 +393,12 @@ fn finish_with_bridge_generate(
             num_generated: 1,
             stopped_by_token: true,
             stopped_by_length: false,
+            decode_metrics: None,
         };
     }
 
     let remaining = max_tokens.saturating_sub(1);
-    let generated_tail = generate_tail(on_token);
+    let (generated_tail, decode_metrics) = generate_tail(on_token);
     let stopped_by_token = generated_tail.len() < remaining;
     all_tokens.extend(generated_tail);
     let num_generated = all_tokens.len() - prompt_len;
@@ -402,6 +408,7 @@ fn finish_with_bridge_generate(
         num_generated,
         stopped_by_token,
         stopped_by_length: !stopped_by_token && num_generated >= max_tokens,
+        decode_metrics,
     }
 }
 
@@ -424,7 +431,7 @@ fn run_bridge_inference<Config, Weights, Cache>(
         usize,
         f32,
         &mut dyn FnMut(u32) -> bool,
-    ) -> Vec<u32>,
+    ) -> (Vec<u32>, Option<pmetal_bridge::decode::DecodeMetrics>),
 ) -> Result<NativeGenerationOutput, String> {
     let config = load_config(model_path)?;
     tracing::debug!("{}", describe_config(&config));

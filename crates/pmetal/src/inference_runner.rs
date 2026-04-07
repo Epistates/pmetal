@@ -183,6 +183,9 @@ pub struct InferenceGenState {
     /// Model directory path — used for native InlineArray weight loading
     /// (bypasses mlx-rs to avoid dual-MLX-instance 6x slowdown).
     model_path: PathBuf,
+    /// Decode throughput metrics from the last native generation run.
+    /// `None` on non-native paths or when fewer than 20 steps were measured.
+    pub last_decode_metrics: Option<pmetal_bridge::decode::DecodeMetrics>,
 }
 
 impl InferenceRunner {
@@ -474,6 +477,7 @@ impl InferenceRunner {
                 native_turboquant,
                 native_quant_config,
                 model_path: config.model_path.clone(),
+                last_decode_metrics: None,
             },
             chat_template_type: template_type,
             is_chat: use_chat,
@@ -548,6 +552,7 @@ impl InferenceGenState {
             )
             .map_err(Exception::custom)?;
 
+            self.last_decode_metrics = output.decode_metrics;
             return Ok(GenerationOutput {
                 token_ids: output.token_ids,
                 num_generated: output.num_generated,

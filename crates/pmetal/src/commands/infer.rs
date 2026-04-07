@@ -679,6 +679,12 @@ pub(crate) async fn run_inference(
     } else {
         println!("Stopped by: max length");
     }
+    if let Some(m) = runner.state.last_decode_metrics {
+        println!(
+            "Decode: {:.0} tok/s (avg={:.2}ms p50={:.2}ms over {} steps)",
+            m.tok_per_sec, m.avg_step_ms, m.p50_step_ms, m.measured_steps,
+        );
+    }
 
     // Print expert prefetch stats if offloading was active
     if let Some(model) = runner.state.dynamic_model() {

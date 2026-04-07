@@ -1436,7 +1436,7 @@ fn generate_from_primed_sample_impl(
     temperature: f32,
     log_stats: bool,
     mut on_token: impl FnMut(u32) -> bool,
-) -> Vec<u32> {
+) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     crate::decode::generate_from_primed_sample(
         "GPT-OSS",
         weights,
@@ -1466,7 +1466,7 @@ pub fn benchmark_mlx_lm_trial(
 
     let generation_secs = if generation_tokens > 1 {
         let generation_tic = std::time::Instant::now();
-        let generated_tail = generate_from_primed_sample_impl(
+        let (generated_tail, _) = generate_from_primed_sample_impl(
             weights,
             &mut cache,
             current_y,
@@ -1507,7 +1507,7 @@ pub fn generate(
     max_tokens: usize,
     temperature: f32,
     mut on_token: impl FnMut(u32) -> bool,
-) -> Vec<u32> {
+) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     let current_y = prime_generation_impl(weights, cache, first_token, temperature, true, true);
     generate_from_primed_sample_impl(
         weights,

@@ -3652,7 +3652,7 @@ fn generate_from_primed_sample_impl(
     temperature: f32,
     log_stats: bool,
     mut on_token: impl FnMut(u32) -> bool,
-) -> Vec<u32> {
+) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     crate::decode::generate_from_primed_sample(
         "NATIVE",
         weights,
@@ -3717,7 +3717,7 @@ pub fn generate_from_primed_sample(
     max_tokens: usize,
     temperature: f32,
     on_token: impl FnMut(u32) -> bool,
-) -> Vec<u32> {
+) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     generate_from_primed_sample_impl(
         weights,
         cache,
@@ -3799,6 +3799,7 @@ pub fn generate_from_primed_sample_silent(
         false,
         on_token,
     )
+    .0
 }
 
 pub fn generate(
@@ -3808,7 +3809,7 @@ pub fn generate(
     max_tokens: usize,
     temperature: f32,
     on_token: impl FnMut(u32) -> bool,
-) -> Vec<u32> {
+) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     let current_y = prime_generation_impl(
         weights,
         cache,
@@ -3850,7 +3851,7 @@ pub fn generate_canonical(
     temperature: f32,
     turboquant: Option<crate::turboquant::TurboQuantConfig>,
     on_token: impl FnMut(u32) -> bool,
-) -> Vec<u32> {
+) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     match canonical_decode_backend(config, turboquant) {
         QwenDecodeBackend::RustBridge => generate(
             weights,
@@ -3884,7 +3885,7 @@ pub fn generate_preserve_peak(
     max_tokens: usize,
     temperature: f32,
     on_token: impl FnMut(u32) -> bool,
-) -> Vec<u32> {
+) -> (Vec<u32>, Option<crate::decode::DecodeMetrics>) {
     let current_y = prime_generation_impl(
         weights,
         cache,
@@ -4018,7 +4019,8 @@ fn generate_cpp(
             max_tokens,
             temperature,
             on_token,
-        );
+        )
+        .0;
     }
 
     let (session, current_y) =
