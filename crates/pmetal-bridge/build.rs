@@ -307,5 +307,9 @@ fn build_and_link() {
 }
 
 fn main() {
+    // Ensure Cargo re-runs build.rs when C++ sources change.
+    // Without this, edits to bridge.cpp/bridge.h produce stale binaries.
+    println!("cargo:rerun-if-changed=cpp/bridge.cpp");
+    println!("cargo:rerun-if-changed=cpp/bridge.h");
     build_and_link();
 }
