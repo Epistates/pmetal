@@ -67,6 +67,7 @@ pub mod ane;
 pub mod async_scheduler;
 pub mod backend;
 pub mod bridge;
+pub mod metal3_backend;
 pub mod buffer;
 pub mod context;
 pub mod error;
