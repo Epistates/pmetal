@@ -1,9 +1,9 @@
 //! Metal 4 / MPP kernel backend.
 //!
 //! [`Metal4Backend`] implements [`KernelBackend`] by delegating every operation
-//! to the [`Metal3Backend`] fallback. Tasks 7–9 will wire in the allocator pool,
-//! residency manager, and Metal 4 command buffer. Tasks 11–18 will replace
-//! individual fallback calls with MPP kernel dispatch.
+//! to the [`Metal3Backend`] fallback. Tasks 11–18 will replace individual
+//! fallback calls with MPP kernel dispatch using the allocator pool and
+//! residency manager stored in this struct.
 
 use std::sync::Arc;
 
@@ -29,6 +29,7 @@ use crate::{
         moe::{MoeConfig, MoeRouting},
     },
     metal3_backend::Metal3Backend,
+    metal4::{allocator_pool::CommandAllocatorPool, residency::ResidencyManager},
 };
 
 // ============================================================================
@@ -37,18 +38,24 @@ use crate::{
 
 /// Metal 4 / MPP kernel backend for Apple M5+ (Apple10, NAX cores).
 ///
-/// Currently a thin delegation layer over [`Metal3Backend`]. As Tasks 7–18
-/// land, individual methods will be replaced with MPP-accelerated
-/// implementations using the allocator pool, residency sets, and NAX kernels.
+/// Holds the [`CommandAllocatorPool`] and [`ResidencyManager`] needed for MPP
+/// kernel dispatch. Currently delegates all operations to [`Metal3Backend`];
+/// Tasks 11–18 will replace individual fallback calls with MPP-accelerated
+/// implementations using these resources.
 ///
 /// # Runtime activation
 ///
 /// [`Metal4Backend`] is constructed only when `has_nax()` returns `true`
-/// (M5+ hardware). On M4 and earlier it is never instantiated; `KernelDispatch`
-/// holds `metal4: None` and routes everything to Metal 3.
+/// (M5+ hardware) and the Metal 4 library is present in the pipeline cache.
+/// On M4 and earlier it is never instantiated; `KernelDispatch` holds
+/// `metal4: None` and routes everything to Metal 3.
 pub struct Metal4Backend {
     ctx: Arc<MetalContext>,
     caps: BackendCaps,
+    /// Triple-buffered command allocator pool — ready for MPP kernel encoding.
+    pub(crate) pool: Arc<CommandAllocatorPool>,
+    /// Residency set manager — tracks buffers that must be GPU-visible.
+    pub(crate) residency: Arc<ResidencyManager>,
     /// Metal 3 fallback — receives every call until MPP kernels replace them.
     fallback: Metal3Backend,
 }
@@ -56,14 +63,26 @@ pub struct Metal4Backend {
 impl Metal4Backend {
     /// Construct a new Metal 4 backend from the shared context.
     ///
-    /// Initialises the Metal 3 fallback so that all 16 trait methods have a
-    /// working implementation immediately. The fallback is replaced
+    /// Creates a triple-buffered [`CommandAllocatorPool`] and a
+    /// [`ResidencyManager`] backed by the device. The Metal 3 fallback is
+    /// initialised so all 16 trait methods work immediately; they are replaced
     /// method-by-method in Tasks 11–18.
+    ///
+    /// # Note on `attach_to_queue`
+    ///
+    /// `ResidencyManager::attach_to_queue` requires an `MTL4CommandQueue`
+    /// reference, which `MetalContext` does not yet expose. Attachment will be
+    /// performed by the first MPP kernel dispatch in Task 11, when a typed
+    /// Metal 4 queue is available.
     pub fn new(ctx: Arc<MetalContext>) -> Result<Self> {
+        let pool = CommandAllocatorPool::new(ctx.device(), 3)?;
+        let residency = ResidencyManager::new(ctx.device())?;
         let fallback = Metal3Backend::new(ctx.clone());
         Ok(Self {
             caps: BackendCaps::metal4(),
             ctx,
+            pool,
+            residency,
             fallback,
         })
     }
@@ -71,6 +90,16 @@ impl Metal4Backend {
     /// Return a reference to the shared Metal context.
     pub fn ctx(&self) -> &Arc<MetalContext> {
         &self.ctx
+    }
+
+    /// Return a reference to the command allocator pool.
+    pub fn pool(&self) -> &Arc<CommandAllocatorPool> {
+        &self.pool
+    }
+
+    /// Return a reference to the residency manager.
+    pub fn residency(&self) -> &Arc<ResidencyManager> {
+        &self.residency
     }
 }
 

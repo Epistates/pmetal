@@ -17,20 +17,14 @@
 //!
 //! - **`metal3()`**: Explicit Metal 3 accessor for callers that need to bypass
 //!   routing (e.g., fallback paths inside the Metal 4 backend itself).
-//!
-//! # Metal 4 placeholder
-//!
-//! The `metal4` field is `Option<()>` under `#[cfg(has_metal4)]` and will be
-//! replaced with `Option<Metal4Backend>` in Task 10 once the Metal 4 backend
-//! is implemented. The routing methods already contain the correct conditional
-//! structure so Task 10 only needs to change the type and fill in the `Some`
-//! branch.
 
 use std::sync::Arc;
 
 use crate::backend::KernelBackend;
 use crate::context::MetalContext;
 use crate::metal3_backend::Metal3Backend;
+#[cfg(has_metal4)]
+use crate::metal4::Metal4Backend;
 
 // ============================================================================
 // KernelDispatch
@@ -46,26 +40,46 @@ use crate::metal3_backend::Metal3Backend;
 /// and share freely — `KernelDispatch` is `Send + Sync` because both backends are.
 pub struct KernelDispatch {
     metal3: Metal3Backend,
-    /// Placeholder for the Metal 4 backend (Task 10).
+    /// Metal 4 backend — present only on M5+ hardware with the Metal 4 SDK.
     ///
-    /// `Option<()>` will become `Option<Metal4Backend>` when Task 10 lands.
     /// Gated by `#[cfg(has_metal4)]` so the field does not exist at all on
-    /// non-Metal-4 builds, keeping the struct layout identical to today.
+    /// non-Metal-4 builds, keeping the struct layout identical to Metal 3 builds.
     #[cfg(has_metal4)]
-    metal4: Option<()>,
+    metal4: Option<Metal4Backend>,
 }
 
 impl KernelDispatch {
     /// Create a new dispatch router backed by the given Metal context.
     ///
-    /// Both the Metal 3 backend (and the Metal 4 placeholder when compiled in)
-    /// are initialised from the shared `ctx`.
+    /// On Metal 4 builds, attempts to construct a [`Metal4Backend`] when the
+    /// device has NAX cores and the Metal 4 library is loaded. Falls back to
+    /// Metal 3-only routing if initialisation fails (missing SDK, non-M5
+    /// hardware, or library load error).
     pub fn new(ctx: Arc<MetalContext>) -> Self {
         let metal3 = Metal3Backend::new(ctx.clone());
+
+        #[cfg(has_metal4)]
+        let metal4 = if ctx.properties().has_nax
+            && ctx.pipeline_cache().metal4_library().is_some()
+        {
+            match Metal4Backend::new(ctx.clone()) {
+                Ok(m4) => {
+                    tracing::info!("Metal 4 / MPP backend initialized");
+                    Some(m4)
+                }
+                Err(e) => {
+                    tracing::warn!("Metal 4 init failed, using Metal 3: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
         Self {
             metal3,
             #[cfg(has_metal4)]
-            metal4: None, // Metal4Backend not implemented yet — Task 10
+            metal4,
         }
     }
 
@@ -82,17 +96,15 @@ impl KernelDispatch {
     /// - Decode / matvec (M = 1) — MPP tile constraints waste threads.
     /// - K not divisible by 32 — NAX alignment requirement.
     /// - All non-Metal-4 builds.
-    pub fn backend_for_gemm(&self, _m: usize, _n: usize, _k: usize) -> &dyn KernelBackend {
-        // Task 10 will replace this with:
-        //
-        // #[cfg(has_metal4)]
-        // if let Some(ref m4) = self.metal4 {
-        //     if m4.should_handle_gemm(_m, _n, _k) {
-        //         return m4;
-        //     }
-        // }
-        //
-        // For now, always return Metal 3.
+    pub fn backend_for_gemm(&self, m: usize, n: usize, k: usize) -> &dyn KernelBackend {
+        #[cfg(has_metal4)]
+        if let Some(ref m4) = self.metal4 {
+            if m4.should_handle_gemm(m, n, k) {
+                return m4;
+            }
+        }
+        // Suppress unused-variable warnings on Metal 3 builds.
+        let _ = (m, n, k);
         &self.metal3
     }
 
@@ -103,12 +115,10 @@ impl KernelDispatch {
     /// training losses only on Metal 3) should call the backend directly via
     /// [`metal3`][KernelDispatch::metal3].
     pub fn preferred_backend(&self) -> &dyn KernelBackend {
-        // Task 10 will add:
-        //
-        // #[cfg(has_metal4)]
-        // if let Some(ref m4) = self.metal4 {
-        //     return m4;
-        // }
+        #[cfg(has_metal4)]
+        if let Some(ref m4) = self.metal4 {
+            return m4;
+        }
         &self.metal3
     }
 
