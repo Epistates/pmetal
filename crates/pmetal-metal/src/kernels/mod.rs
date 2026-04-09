@@ -36,6 +36,16 @@ pub mod mpp_dw_gemm;
 pub mod mpp_grouped_gemm;
 #[cfg(has_metal4)]
 pub mod mpp_fused_lora;
+#[cfg(has_metal4)]
+pub mod mpp_fused_training;
+#[cfg(has_metal4)]
+pub mod mpp_fused_cross_entropy;
+#[cfg(has_metal4)]
+pub mod mpp_fused_rope;
+#[cfg(has_metal4)]
+pub mod mpp_fused_moe;
+#[cfg(has_metal4)]
+pub mod mpp_fused_distill;
 
 // Re-export main types
 pub use batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
