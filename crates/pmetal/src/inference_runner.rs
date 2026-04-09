@@ -314,6 +314,22 @@ impl InferenceRunner {
 
         tracing::info!(tokens = input_ids.len(), "Prompt tokenized");
 
+        // 6b. Apply thinking-model repetition penalty default.
+        //
+        // Qwen3.5 thinking mode is prone to infinite repetition loops on small
+        // models. When the user didn't explicitly set a repetition penalty and
+        // the model uses the Qwen chat template (which enables thinking mode),
+        // default to 1.1 instead of 1.0 to discourage repetition loops.
+        let repetition_penalty = if config.repetition_penalty.is_none()
+            && matches!(template_type, Some(ChatTemplateType::Qwen))
+            && !no_thinking
+        {
+            tracing::info!("Thinking model detected, using default repetition_penalty=1.1");
+            1.1_f32
+        } else {
+            repetition_penalty
+        };
+
         // 7. Collect stop tokens from all sources
         let stop_tokens = pmetal_data::inference_config::collect_all_stop_tokens(
             model_path,
