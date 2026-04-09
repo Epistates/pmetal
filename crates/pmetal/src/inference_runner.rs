@@ -201,6 +201,13 @@ pub struct InferenceGenState {
     detect_repetition: bool,
 }
 
+impl InferenceGenState {
+    /// True when using the native bridge path (model loads inside generate).
+    pub fn is_native_only(&self) -> bool {
+        matches!(self.model, LoadedModel::NativeOnly)
+    }
+}
+
 impl InferenceRunner {
     /// Prepare everything for generation.
     ///

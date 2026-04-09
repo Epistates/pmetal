@@ -314,9 +314,9 @@ pub(crate) async fn run_inference(
     if ane {
         anyhow::bail!("ANE inference requires the 'ane' feature: cargo build --features ane");
     }
-    #[cfg(target_os = "macos")]
-    use pmetal_models::generate_cached_metal;
-    use pmetal_models::{GenerationOutput, generate_cached_compiled, generate_minimal_async};
+    use pmetal_models::{
+        GenerationOutput, generate_cached_compiled, generate_cached_metal, generate_minimal_async,
+    };
 
     tracing::info!(model = %model_id, "Loading model for inference");
 
@@ -445,7 +445,11 @@ pub(crate) async fn run_inference(
     }
     println!("========================================");
     println!();
-    println!("Generating...");
+    if runner.state.is_native_only() {
+        println!("Loading model...");
+    } else {
+        println!("Generating...");
+    }
 
     // Extract refs for generation dispatch (split borrow)
     let input_ids = runner.state.input_ids().to_vec();
@@ -456,7 +460,6 @@ pub(crate) async fn run_inference(
     let start = std::time::Instant::now();
     let mut already_streamed = false;
 
-    #[cfg(target_os = "macos")]
     let output = {
         // ANE branch: separate engine with its own weight loading and KV cache
         #[cfg(feature = "ane")]
@@ -587,48 +590,6 @@ pub(crate) async fn run_inference(
                 .run_with(|fwd, cache| generate_cached_metal(fwd, &input_ids, gen_config, cache))?
         } else if compiled {
             tracing::info!("Using JIT-compiled sampling");
-            runner.state.run_with(|fwd, cache| {
-                generate_cached_compiled(fwd, &input_ids, gen_config, cache)
-            })?
-        } else {
-            already_streamed = true;
-            let tokenizer = &runner.tokenizer;
-            let mut token_buf: Vec<u32> = Vec::new();
-            let mut streamed_text = String::new();
-            runner.state.generate_streaming(|token_id| {
-                use std::io::Write;
-                token_buf.push(token_id);
-                if let Ok(text) = tokenizer.decode(&token_buf) {
-                    if text.len() > streamed_text.len() {
-                        // Tokenizer may retroactively change multi-byte chars
-                        // (e.g. replacement char → full emoji), so the old byte
-                        // offset can land mid-character in the new string.
-                        let idx = streamed_text.len();
-                        let start = (idx..=text.len())
-                            .find(|&i| text.is_char_boundary(i))
-                            .unwrap_or(text.len());
-                        if start < text.len() {
-                            let delta = &text[start..];
-                            let _ = std::io::stdout().write_all(delta.as_bytes());
-                            let _ = std::io::stdout().flush();
-                        }
-                    }
-                    streamed_text = text;
-                }
-                true
-            })?
-        }
-    };
-
-    #[cfg(not(target_os = "macos"))]
-    let output = {
-        let _ = metal_sampler;
-        let _ = ane;
-        if minimal {
-            runner
-                .state
-                .run_with(|fwd, cache| generate_minimal_async(fwd, &input_ids, gen_config, cache))?
-        } else if compiled {
             runner.state.run_with(|fwd, cache| {
                 generate_cached_compiled(fwd, &input_ids, gen_config, cache)
             })?

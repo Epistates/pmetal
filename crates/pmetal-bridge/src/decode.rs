@@ -101,52 +101,51 @@ impl SamplingParams {
     }
 }
 
-/// Apply repetition, frequency, and presence penalties to logits.
+/// Reusable buffer for penalty application.
 ///
-/// - repetition_penalty: multiplicative (>1.0 penalizes, 1.0 = disabled)
-/// - frequency_penalty: logit -= frequency_penalty * count
-/// - presence_penalty: logit -= presence_penalty * (count > 0)
-fn apply_penalties(
-    logits_2d: &InlineArray,
-    token_counts: &HashMap<u32, usize>,
-    params: &SamplingParams,
-) -> InlineArray {
-    if token_counts.is_empty() || !params.has_penalties() {
-        return logits_2d.clone();
+/// Pre-allocates a vocab-sized vec once and tracks dirty indices so each step
+/// only zeros the positions that were previously set, instead of re-allocating
+/// and zeroing the entire ~1 MB buffer every decode step.
+struct PenaltyBuffer {
+    vec: Vec<f32>,
+    dirty: Vec<usize>,
+}
+
+impl PenaltyBuffer {
+    fn new(vocab_size: usize) -> Self {
+        Self {
+            vec: vec![0.0f32; vocab_size],
+            dirty: Vec::with_capacity(256),
+        }
     }
 
-    let vocab_size = logits_2d.dim(-1) as usize;
+    /// Apply penalties and return penalized logits. Reuses the internal buffer.
+    fn apply(
+        &mut self,
+        logits_2d: &InlineArray,
+        token_counts: &HashMap<u32, usize>,
+        params: &SamplingParams,
+    ) -> InlineArray {
+        // Clear only previously-dirty positions (O(unique_tokens) not O(vocab))
+        for &idx in &self.dirty {
+            self.vec[idx] = 0.0;
+        }
+        self.dirty.clear();
 
-    // Build a combined penalty vector on CPU, apply in one GPU op.
-    // For typical generation (~100-1000 unique tokens), this is cheaper than
-    // scatter/gather on the full vocab.
-    let mut penalty_vec = vec![0.0f32; vocab_size];
-
-    for (&token, &count) in token_counts {
-        let idx = token as usize;
-        if idx >= vocab_size {
-            continue;
+        let vocab_size = self.vec.len();
+        for (&token, &count) in token_counts {
+            let idx = token as usize;
+            if idx >= vocab_size {
+                continue;
+            }
+            // Frequency + presence (subtractive): logit -= freq*count + pres*(count>0)
+            self.vec[idx] = params.frequency_penalty * count as f32 + params.presence_penalty;
+            self.dirty.push(idx);
         }
 
-        // Frequency + presence (subtractive): logit -= freq*count + pres*(count>0)
-        penalty_vec[idx] += params.frequency_penalty * count as f32 + params.presence_penalty;
-
-        // Repetition penalty (multiplicative, sign-aware):
-        // For positive logits: logit /= penalty. For negative: logit *= penalty.
-        // We fold this into the subtractive vector as an additive correction:
-        //   logit_new = logit - penalty_vec[idx]
-        //   where penalty_vec includes the repetition effect
-        // But repetition penalty is multiplicative — we can't cleanly fold it.
-        // Instead, for simplicity and correctness at this model scale, we
-        // approximate: logit -= (rep_penalty - 1.0) * abs(logit_at_token).
-        // This is equivalent for the common case (rep_penalty ~1.0-1.3).
-        //
-        // For the native bridge path, presence_penalty is the primary mechanism
-        // (per Qwen model card). Repetition penalty is secondary.
+        let pen_arr = InlineArray::from_slice(&self.vec, &[1, vocab_size as i32]);
+        logits_2d.subtract(&pen_arr)
     }
-
-    let pen_arr = InlineArray::from_slice(&penalty_vec, &[1, vocab_size as i32]);
-    logits_2d.subtract(&pen_arr)
 }
 
 /// Shared temperature sampling helper for bridge-backed decode paths.
@@ -733,7 +732,14 @@ pub fn generate_from_primed_sample_with_params<Weights, Cache>(
 ) -> (Vec<u32>, Option<DecodeMetrics>) {
     let mut tokens = Vec::with_capacity(max_tokens);
     let mut step_times: Vec<f64> = Vec::new();
-    let mut token_counts: HashMap<u32, usize> = HashMap::new();
+    let use_penalties = params.has_penalties();
+    let mut token_counts: HashMap<u32, usize> = if use_penalties {
+        HashMap::new()
+    } else {
+        HashMap::with_capacity(0)
+    };
+    // Lazily initialised on first step that needs it (once vocab_size is known).
+    let mut penalty_buf: Option<PenaltyBuffer> = None;
 
     for step in 0..max_tokens {
         let next_y = if step + 1 < max_tokens {
@@ -742,14 +748,17 @@ pub fn generate_from_primed_sample_with_params<Weights, Cache>(
             let next_logits = forward_step(weights, &next_input, cache);
             let next_logits_2d = next_logits.squeeze(1);
 
-            // Apply penalties before sampling
-            let penalized = if params.has_penalties() {
-                apply_penalties(&next_logits_2d, &token_counts, &params)
+            // Apply penalties before sampling (zero-cost when disabled or no
+            // tokens seen yet; reuses pre-allocated buffer otherwise).
+            let next_y = if use_penalties && !token_counts.is_empty() {
+                let buf = penalty_buf
+                    .get_or_insert_with(|| PenaltyBuffer::new(next_logits_2d.dim(-1) as usize));
+                let penalized = buf.apply(&next_logits_2d, &token_counts, &params);
+                sample_token(&penalized, params.temperature)
             } else {
-                next_logits_2d.clone()
+                sample_token(&next_logits_2d, params.temperature)
             };
 
-            let next_y = sample_token(&penalized, params.temperature);
             trace_decode_graph(tag, step, &next_logits_2d, &next_y);
             next_y.async_eval_ref();
             step_times.push(t_step.elapsed().as_secs_f64() * 1000.0);
@@ -764,7 +773,7 @@ pub fn generate_from_primed_sample_with_params<Weights, Cache>(
         let token_val = current_y.item_u32();
 
         tokens.push(token_val);
-        if params.has_penalties() {
+        if use_penalties {
             *token_counts.entry(token_val).or_insert(0) += 1;
         }
         if !on_token(token_val) {
@@ -780,18 +789,31 @@ pub fn generate_from_primed_sample_with_params<Weights, Cache>(
         }
     }
 
-    let metrics = if log_stats && step_times.len() > 20 {
+    let metrics = if log_stats && !step_times.is_empty() {
         step_times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        let skip = 10;
+        // Skip warmup steps: 10 for long runs, proportionally fewer for short ones.
+        let skip = step_times.len().min(10);
         let measured = &step_times[skip..];
-        let avg = measured.iter().sum::<f64>() / measured.len() as f64;
-        let p50 = step_times[step_times.len() / 2];
-        Some(DecodeMetrics {
-            tok_per_sec: 1000.0 / avg,
-            avg_step_ms: avg,
-            p50_step_ms: p50,
-            measured_steps: measured.len(),
-        })
+        if measured.is_empty() {
+            // Fewer steps than the skip window — use all of them.
+            let avg = step_times.iter().sum::<f64>() / step_times.len() as f64;
+            let p50 = step_times[step_times.len() / 2];
+            Some(DecodeMetrics {
+                tok_per_sec: 1000.0 / avg,
+                avg_step_ms: avg,
+                p50_step_ms: p50,
+                measured_steps: step_times.len(),
+            })
+        } else {
+            let avg = measured.iter().sum::<f64>() / measured.len() as f64;
+            let p50 = step_times[step_times.len() / 2];
+            Some(DecodeMetrics {
+                tok_per_sec: 1000.0 / avg,
+                avg_step_ms: avg,
+                p50_step_ms: p50,
+                measured_steps: measured.len(),
+            })
+        }
     } else {
         None
     };

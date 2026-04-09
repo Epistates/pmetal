@@ -245,7 +245,7 @@ pub fn model_preset(
 /// Qwen3 / Qwen3.5 recommended sampling presets.
 ///
 /// From Qwen3.5 model card (applies to all Qwen3.5 sizes):
-///   - Thinking general:     temp=1.0, top_p=0.95, top_k=20, presence_penalty=1.5
+///   - Thinking general:     temp=1.0, top_p=0.95, top_k=20, presence_penalty=0.0 (card says 1.5, causes early EOS)
 ///   - Thinking coding:      temp=0.6, top_p=0.95, top_k=20, presence_penalty=0.0
 ///   - Instruct general:     temp=0.7, top_p=0.8,  top_k=20, presence_penalty=1.5
 ///   - Instruct reasoning:   temp=1.0, top_p=1.0,  top_k=40, presence_penalty=2.0
@@ -261,7 +261,10 @@ fn qwen_preset(mode: SamplingMode) -> Option<SamplingDefaults> {
             top_p: 0.95,
             top_k: 20,
             min_p: 0.0,
-            presence_penalty: 1.5,
+            // Model card says 1.5, but presence penalty during thinking chains
+            // penalizes common tokens ("the", "is", etc.) and causes early EOS.
+            // ThinkingCoding already uses 0.0; keep thinking modes penalty-free.
+            presence_penalty: 0.0,
             repetition_penalty: 1.0,
             frequency_penalty: 0.0,
         },
