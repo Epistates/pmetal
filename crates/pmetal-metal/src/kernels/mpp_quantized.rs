@@ -6,18 +6,18 @@
 //! `metal4/mpp_quantized.metal`. The currently wired format is 4-bit affine
 //! quantization with fp16 activations and fp16 output.
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::AsMetalBuffer,
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 /// Configuration for MPP quantized GEMM.
@@ -303,22 +303,6 @@ impl MppQuantizedGemm {
 
         let geometry = dispatch_geometry(&self.config);
         let kernel_name = kernel_name(&self.config)?;
-        let constants: HashMap<u64, crate::pipeline::FunctionConstant> = HashMap::new();
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(self.ctx.device(), kernel_name, &constants)?
-        };
-
-        let command_buffer = self
-            .ctx
-            .command_queue()
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
 
         let params = QuantGemmParams {
             m: self.config.m as u32,
@@ -330,59 +314,60 @@ impl MppQuantizedGemm {
             num_tiles_n: geometry.num_tiles_n as u32,
         };
 
-        unsafe {
-            match self.config.bits {
-                4 => {
-                    encoder.setBuffer_offset_atIndex(Some(x.as_metal_buffer()), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(weights.as_metal_buffer()), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(scales.as_metal_buffer()), 0, 2);
-                    encoder.setBuffer_offset_atIndex(
-                        Some(
-                            biases
-                                .ok_or_else(|| {
-                                    MetalError::InvalidConfig(
-                                        "MPP 4-bit quantized GEMM requires biases".to_string(),
-                                    )
-                                })?
-                                .as_metal_buffer(),
-                        ),
-                        0,
-                        3,
-                    );
-                    encoder.setBuffer_offset_atIndex(Some(output.as_metal_buffer()), 0, 4);
+        let grid = objc2_metal::MTLSize {
+            width: geometry.num_tiles_n,
+            height: geometry.num_tiles_m,
+            depth: 1,
+        };
+        let tg_size = objc2_metal::MTLSize {
+            width: geometry.threads_per_threadgroup,
+            height: 1,
+            depth: 1,
+        };
 
+        // Resolve the biases buffer reference before entering the closure so
+        // that the fallible `?` stays outside the infallible bind_buffers closure.
+        let bias_buf = match self.config.bits {
+            4 => Some(
+                biases
+                    .ok_or_else(|| {
+                        MetalError::InvalidConfig(
+                            "MPP 4-bit quantized GEMM requires biases".to_string(),
+                        )
+                    })?
+                    .as_metal_buffer(),
+            ),
+            _ => None,
+        };
+
+        let x_buf = x.as_metal_buffer();
+        let w_buf = weights.as_metal_buffer();
+        let s_buf = scales.as_metal_buffer();
+        let out_buf = output.as_metal_buffer();
+        let bits = self.config.bits;
+
+        encode_mpp_kernel(&self.ctx, kernel_name, grid, tg_size, |encoder| unsafe {
+            match bits {
+                4 => {
+                    encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(w_buf), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(s_buf), 0, 2);
+                    encoder.setBuffer_offset_atIndex(bias_buf, 0, 3);
+                    encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 4);
                     let params_ptr = NonNull::from(&params).cast();
                     encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
                 }
                 8 => {
-                    encoder.setBuffer_offset_atIndex(Some(x.as_metal_buffer()), 0, 0);
-                    encoder.setBuffer_offset_atIndex(Some(weights.as_metal_buffer()), 0, 1);
-                    encoder.setBuffer_offset_atIndex(Some(scales.as_metal_buffer()), 0, 2);
-                    encoder.setBuffer_offset_atIndex(Some(output.as_metal_buffer()), 0, 3);
-
+                    encoder.setBuffer_offset_atIndex(Some(x_buf), 0, 0);
+                    encoder.setBuffer_offset_atIndex(Some(w_buf), 0, 1);
+                    encoder.setBuffer_offset_atIndex(Some(s_buf), 0, 2);
+                    encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 3);
                     let params_ptr = NonNull::from(&params).cast();
                     encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 4);
                 }
                 _ => unreachable!("validate_config rejects unsupported bit-widths"),
             }
-        }
-
-        let threadgroup_size = objc2_metal::MTLSize {
-            width: geometry.threads_per_threadgroup,
-            height: 1,
-            depth: 1,
-        };
-        let grid_size = objc2_metal::MTLSize {
-            width: geometry.num_tiles_n,
-            height: geometry.num_tiles_m,
-            depth: 1,
-        };
-
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
-
-        Ok(command_buffer)
+        })
     }
 }
 

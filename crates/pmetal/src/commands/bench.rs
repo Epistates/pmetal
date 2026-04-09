@@ -2658,6 +2658,7 @@ async fn benchmark_real_training(
             dispatch: DispatchConfig {
                 flash_attention: true,
                 sequence_packing: true,
+                pack_max_seq_len: None,
                 jit_compilation: true,
                 fused: true,
                 metal_fused_optimizer: true,

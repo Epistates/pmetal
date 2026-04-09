@@ -23,6 +23,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 use tracing::{debug, info};
 
+use crate::dispatch::KernelDispatch;
 use crate::error::{MetalError, Result};
 use crate::pipeline::PipelineCache;
 use crate::tuna::Tuner;
@@ -60,6 +61,15 @@ pub struct MetalContext {
 
     /// Device properties.
     properties: DeviceProperties,
+
+    /// Kernel dispatch router (Metal 3 / Metal 4).
+    ///
+    /// Initialised lazily after `Arc<MetalContext>` is available — use
+    /// [`MetalContext::dispatch()`] to access it.  The `OnceLock` is
+    /// populated by [`MetalContext::global()`] immediately after wrapping
+    /// `self` in `Arc`, so for all practical call sites `dispatch()` never
+    /// blocks on initialisation.
+    dispatch: OnceLock<KernelDispatch>,
 }
 
 /// Apple GPU family classification.
@@ -692,10 +702,19 @@ impl MetalContext {
     pub fn global() -> Result<Arc<MetalContext>> {
         GLOBAL_CONTEXT
             .get_or_init(|| {
-                MetalContext::new().map(Arc::new).map_err(|e| {
-                    tracing::error!("Failed to initialize Metal context: {}", e);
-                    e
-                })
+                MetalContext::new()
+                    .map(|ctx| {
+                        let arc = Arc::new(ctx);
+                        // Eagerly populate the KernelDispatch now that Arc is available.
+                        // The `set` call only fails if the OnceLock is already populated,
+                        // which cannot happen for a freshly constructed context.
+                        let _ = arc.dispatch.set(KernelDispatch::new(arc.clone()));
+                        arc
+                    })
+                    .map_err(|e| {
+                        tracing::error!("Failed to initialize Metal context: {}", e);
+                        e
+                    })
             })
             .clone()
     }
@@ -831,6 +850,7 @@ impl MetalContext {
             pipeline_cache,
             tuner,
             properties,
+            dispatch: OnceLock::new(),
         })
     }
 
@@ -868,6 +888,39 @@ impl MetalContext {
     #[inline]
     pub fn pipeline_cache_mut(&self) -> parking_lot::RwLockWriteGuard<'_, PipelineCache> {
         self.pipeline_cache.write()
+    }
+
+    /// Get the kernel dispatch router.
+    ///
+    /// For contexts obtained via [`MetalContext::global()`] this is always
+    /// pre-populated.  For contexts created via [`MetalContext::new()`] and
+    /// then wrapped in `Arc` manually, call [`MetalContext::init_dispatch`]
+    /// once before the first call to this method.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`init_dispatch`][MetalContext::init_dispatch] was never called
+    /// on a context that was constructed via `new()` rather than `global()`.
+    #[inline]
+    pub fn dispatch(&self) -> &KernelDispatch {
+        self.dispatch
+            .get()
+            .expect("KernelDispatch not initialised — call init_dispatch(arc) after Arc::new()")
+    }
+
+    /// Initialise the [`KernelDispatch`] for contexts not obtained via
+    /// [`MetalContext::global()`].
+    ///
+    /// Call this once immediately after `Arc::new(MetalContext::new()?)`:
+    ///
+    /// ```ignore
+    /// let ctx = Arc::new(MetalContext::new()?);
+    /// ctx.init_dispatch(ctx.clone());
+    /// ```
+    ///
+    /// Calling this more than once is a no-op (the first write wins).
+    pub fn init_dispatch(&self, arc: Arc<MetalContext>) {
+        let _ = self.dispatch.set(KernelDispatch::new(arc));
     }
 
     /// Check if this device supports the Neural Engine.

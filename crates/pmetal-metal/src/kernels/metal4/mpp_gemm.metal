@@ -53,13 +53,15 @@ struct MppGemmParams {
 };
 
 // =============================================================================
-// MPP GEMM helper variants. These expose a small set of threadgroup tile
-// shapes based on the guide's recommended 32x32 simdgroup tile starting point:
-//   1 simdgroup  -> 32x32
-//   2 simdgroups -> 64x32 or 32x64
-//   4 simdgroups -> 64x64
+// MPP GEMM helper variants.
 //
-// Rust selects and auto-tunes among these Apple10/M5-only entry points.
+// MPP Guide Section 2.3.1: "single simdgroup execution always resulted in
+// significant performance drop" applies to naive multi-group configurations.
+// All kernel entry points below use execution_simdgroup (single simdgroup).
+// The function name suffix (sg1/sg2/sg4) encodes the *output tile size* chosen
+// by the Rust auto-tuner, NOT the number of simdgroups.  A sg4_64x64 kernel
+// still runs as one simdgroup over a 64x64 tile — the larger tile increases
+// arithmetic intensity without the coordination overhead of multiple simdgroups.
 
 inline uint2 decode_output_tile(uint linear, constant MppGemmParams& params) {
     uint2 tile;
@@ -76,7 +78,10 @@ inline uint2 decode_output_tile(uint linear, constant MppGemmParams& params) {
     return tile;
 }
 
-template <typename T, int SM, int SN, int NUM_GROUPS>
+// MPP Guide: single simdgroup always outperforms multi-simdgroup configurations.
+// NUM_GROUPS template parameter is retained only for source-level compatibility
+// with instantiations below, but every instantiation passes NUM_GROUPS=1.
+template <typename T, int SM, int SN, int NUM_GROUPS = 1>
 inline void mpp_gemm_nn_impl(
     device T* A,
     device T* B,
@@ -84,6 +89,8 @@ inline void mpp_gemm_nn_impl(
     constant MppGemmParams& params,
     uint3 tgid
 ) {
+    static_assert(NUM_GROUPS == 1, "MPP Guide: single simdgroup required");
+
     const int M = (int)params.M;
     const int N = (int)params.N;
     const int K = (int)params.K;
@@ -110,7 +117,7 @@ inline void mpp_gemm_nn_impl(
         true,
         false
     );
-    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<NUM_GROUPS>> op;
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
 
     const bool is_full_tile =
         (FC_M_ALIGNED && FC_N_ALIGNED) || (tile_m + SM <= M && tile_n + SN <= N);
@@ -127,7 +134,7 @@ inline void mpp_gemm_nn_impl(
     }
 }
 
-template <int SM, int SN, int NUM_GROUPS>
+template <int SM, int SN, int NUM_GROUPS = 1>
 inline void mpp_gemm_accumulate_f16_impl(
     device half* A,
     device half* B,
@@ -136,6 +143,7 @@ inline void mpp_gemm_accumulate_f16_impl(
     constant MppGemmParams& params,
     uint3 tgid
 ) {
+    static_assert(NUM_GROUPS == 1, "MPP Guide: single simdgroup required");
     const int M = (int)params.M;
     const int N = (int)params.N;
     const int K = (int)params.K;
@@ -164,7 +172,7 @@ inline void mpp_gemm_accumulate_f16_impl(
         false,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate
     );
-    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<NUM_GROUPS>> op;
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
 
     const bool is_full_tile =
         (FC_M_ALIGNED && FC_N_ALIGNED) || (tile_m + SM <= M && tile_n + SN <= N);
@@ -257,6 +265,10 @@ inline void mpp_gemm_accumulate_f16_impl(
     }
 }
 
+// All kernels use single simdgroup (execution_simdgroup).
+// The sg1/sg2/sg4 name suffixes reflect tile sizes chosen by the Rust
+// auto-tuner, not simdgroup counts.
+
 kernel void mpp_gemm_nn_f16_sg1_32x32(
     device half* A [[buffer(0)]],
     device half* B [[buffer(1)]],
@@ -274,7 +286,7 @@ kernel void mpp_gemm_nn_f16_sg2_64x32(
     constant MppGemmParams& params [[buffer(3)]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
-    mpp_gemm_nn_impl<half, 64, 32, 2>(A, B, D, params, tgid);
+    mpp_gemm_nn_impl<half, 64, 32, 1>(A, B, D, params, tgid);
 }
 
 kernel void mpp_gemm_nn_f16_sg2_32x64(
@@ -284,7 +296,7 @@ kernel void mpp_gemm_nn_f16_sg2_32x64(
     constant MppGemmParams& params [[buffer(3)]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
-    mpp_gemm_nn_impl<half, 32, 64, 2>(A, B, D, params, tgid);
+    mpp_gemm_nn_impl<half, 32, 64, 1>(A, B, D, params, tgid);
 }
 
 kernel void mpp_gemm_nn_f16_sg4_64x64(
@@ -294,7 +306,7 @@ kernel void mpp_gemm_nn_f16_sg4_64x64(
     constant MppGemmParams& params [[buffer(3)]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
-    mpp_gemm_nn_impl<half, 64, 64, 4>(A, B, D, params, tgid);
+    mpp_gemm_nn_impl<half, 64, 64, 1>(A, B, D, params, tgid);
 }
 
 kernel void mpp_gemm_nn_f32_sg1_32x32(
@@ -314,7 +326,7 @@ kernel void mpp_gemm_nn_f32_sg2_64x32(
     constant MppGemmParams& params [[buffer(3)]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
-    mpp_gemm_nn_impl<float, 64, 32, 2>(A, B, D, params, tgid);
+    mpp_gemm_nn_impl<float, 64, 32, 1>(A, B, D, params, tgid);
 }
 
 kernel void mpp_gemm_nn_f32_sg2_32x64(
@@ -324,7 +336,7 @@ kernel void mpp_gemm_nn_f32_sg2_32x64(
     constant MppGemmParams& params [[buffer(3)]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
-    mpp_gemm_nn_impl<float, 32, 64, 2>(A, B, D, params, tgid);
+    mpp_gemm_nn_impl<float, 32, 64, 1>(A, B, D, params, tgid);
 }
 
 kernel void mpp_gemm_nn_f32_sg4_64x64(
@@ -334,7 +346,7 @@ kernel void mpp_gemm_nn_f32_sg4_64x64(
     constant MppGemmParams& params [[buffer(3)]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
-    mpp_gemm_nn_impl<float, 64, 64, 4>(A, B, D, params, tgid);
+    mpp_gemm_nn_impl<float, 64, 64, 1>(A, B, D, params, tgid);
 }
 
 kernel void mpp_gemm_accumulate_f16_sg1_32x32(
@@ -356,7 +368,7 @@ kernel void mpp_gemm_accumulate_f16_sg2_64x32(
     constant MppGemmParams& params [[buffer(4)]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
-    mpp_gemm_accumulate_f16_impl<64, 32, 2>(A, B, C, D, params, tgid);
+    mpp_gemm_accumulate_f16_impl<64, 32, 1>(A, B, C, D, params, tgid);
 }
 
 kernel void mpp_gemm_accumulate_f16_sg2_32x64(
@@ -367,7 +379,7 @@ kernel void mpp_gemm_accumulate_f16_sg2_32x64(
     constant MppGemmParams& params [[buffer(4)]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
-    mpp_gemm_accumulate_f16_impl<32, 64, 2>(A, B, C, D, params, tgid);
+    mpp_gemm_accumulate_f16_impl<32, 64, 1>(A, B, C, D, params, tgid);
 }
 
 kernel void mpp_gemm_accumulate_f16_sg4_64x64(
@@ -378,5 +390,5 @@ kernel void mpp_gemm_accumulate_f16_sg4_64x64(
     constant MppGemmParams& params [[buffer(4)]],
     uint3 tgid [[threadgroup_position_in_grid]]
 ) {
-    mpp_gemm_accumulate_f16_impl<64, 64, 4>(A, B, C, D, params, tgid);
+    mpp_gemm_accumulate_f16_impl<64, 64, 1>(A, B, C, D, params, tgid);
 }

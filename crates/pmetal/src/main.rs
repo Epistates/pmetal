@@ -274,6 +274,15 @@ enum Commands {
         #[arg(long)]
         no_sequence_packing: bool,
 
+        /// Override the maximum sequence length for packing.
+        ///
+        /// Default: auto-detect from dataset p99 of sample lengths, rounded up to the
+        /// next power of two and capped at --max-seq-len.  Use this flag to pin the
+        /// packing bucket to a specific length (e.g. 512) when the adaptive heuristic
+        /// overshoots due to outlier samples.
+        #[arg(long)]
+        pack_max_seq_len: Option<usize>,
+
         /// Disable JIT compilation (enabled by default for up to 50% throughput improvement)
         #[arg(long)]
         no_jit_compilation: bool,
@@ -2384,6 +2393,7 @@ async fn tokio_main() -> anyhow::Result<()> {
             no_fused,
             no_metal_fused_optimizer,
             no_sequence_packing,
+            pack_max_seq_len,
             no_jit_compilation,
             no_gradient_checkpointing,
             gradient_checkpointing_layers,
@@ -2503,6 +2513,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 dispatch: orchestrator::DispatchConfig {
                     flash_attention: !no_flash_attention,
                     sequence_packing: !no_sequence_packing,
+                    pack_max_seq_len,
                     jit_compilation: !no_jit_compilation,
                     fused: !no_fused,
                     metal_fused_optimizer: !no_metal_fused_optimizer,

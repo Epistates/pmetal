@@ -53,6 +53,13 @@ kernel void mpp_dw_gemm_accum(
     const int N = (int)params.N;
     const int K = (int)params.K;
 
+    // MPP Guide: K must be a multiple of 32 for NAX hardware GEMM.
+    // If K is not aligned, NAX silently produces wrong results.
+    // The Rust caller is responsible for padding; we guard defensively here.
+    // An unaligned K falls back to a no-op (output unchanged) to surface
+    // the misconfiguration without producing corrupted results.
+    if ((K & 31) != 0) return;
+
     // 2D grid (no Morton needed for dw_gemm since it's dispatched per-layer
     // in a batched command buffer — cache behavior is different from global GEMM)
     const int tile_m = (int)(tgid.y * 64);
@@ -81,7 +88,7 @@ kernel void mpp_dw_gemm_accum(
             false, true, false
         );
 
-        mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+        mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
 
         auto sliceA = tA.slice(0, tile_m);
         auto sliceB = tB.slice(0, tile_n);
@@ -98,7 +105,7 @@ kernel void mpp_dw_gemm_accum(
             mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate
         );
 
-        mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+        mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
 
         auto sliceA = tA.slice(0, tile_m);
         auto sliceB = tB.slice(0, tile_n);

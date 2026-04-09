@@ -66,6 +66,10 @@ kernel void mpp_grouped_gemm_forward_f16(
     uint N = params.intermediate;
     uint E = params.num_experts;
 
+    // MPP Guide: K must be a multiple of 32 for NAX.
+    // Misaligned K silently corrupts results on NAX hardware.
+    if ((K & 31u) != 0u) return;
+
     uint num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
 
     // Find which expert this tile belongs to
@@ -129,7 +133,7 @@ kernel void mpp_grouped_gemm_forward_f16(
                 false   // relaxed_precision
             );
 
-            mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+            mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
 
             // Slice to this tile
             // Handle permutation: if permute_x, the input rows at expert_offsets
@@ -163,6 +167,9 @@ kernel void mpp_grouped_gemm_forward_f32(
     uint K = params.hidden_size;
     uint N = params.intermediate;
     uint E = params.num_experts;
+
+    // MPP Guide: K must be a multiple of 32 for NAX.
+    if ((K & 31u) != 0u) return;
 
     uint num_n_tiles = (N + BLOCK_N - 1) / BLOCK_N;
 
@@ -206,7 +213,7 @@ kernel void mpp_grouped_gemm_forward_f32(
                 false, true, false
             );
 
-            mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+            mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
 
             auto sliceX = tX.slice(0, (int)tile_m_start);
             auto sliceW = tW.slice(0, (int)tile_n_start);

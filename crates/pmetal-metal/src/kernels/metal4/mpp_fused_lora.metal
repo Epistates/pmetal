@@ -81,7 +81,7 @@ kernel void mpp_fused_lora_forward_f16(
         static_cast<int>(dynamic_extent),
         false, true, false
     );
-    mpp::tensor_ops::matmul2d<base_desc, execution_simdgroups<4>> base_op;
+    mpp::tensor_ops::matmul2d<base_desc, execution_simdgroup> base_op;
 
     auto sliceX = tX.slice(0, tile_b);
     auto sliceW = tW.slice(0, tile_o);
@@ -189,7 +189,7 @@ kernel void mpp_lora_forward_inference_f16(
     constexpr auto base_desc = mpp::tensor_ops::matmul2d_descriptor(
         64, 64, static_cast<int>(dynamic_extent), false, true, false
     );
-    mpp::tensor_ops::matmul2d<base_desc, execution_simdgroups<4>> base_op;
+    mpp::tensor_ops::matmul2d<base_desc, execution_simdgroup> base_op;
 
     auto sX = tX.slice(0, tile_b);
     auto sW = tW.slice(0, tile_o);

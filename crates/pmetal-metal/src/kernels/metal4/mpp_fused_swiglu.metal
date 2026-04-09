@@ -13,6 +13,16 @@
 //   2. up   = x @ up_weight^T
 //   3. output = silu(gate) * up
 //
+// MPP Guide Section 2.3.4 (Postfix Fusion): The GEMM output stays in
+// cooperative tensor registers.  Both gate and up projections are computed
+// with their results held in register arrays (rGate, rUp) simultaneously.
+// SwiGLU is then applied element-wise in register space before the single
+// store to device memory — no threadgroup memory staging required.
+//
+// MPP Guide Section 2.3.1: Single simdgroup (execution_simdgroup) is used
+// throughout. Multi-simdgroup configurations always resulted in a significant
+// performance drop in Apple's benchmarks.
+//
 // For LoRA: adds scale * (x @ A^T) @ B^T to each projection.
 
 #include <metal_stdlib>
@@ -33,17 +43,15 @@ inline float silu(float x) {
 }
 
 // =============================================================================
-// MPP Fused SwiGLU Forward (no LoRA)
+// MPP Fused SwiGLU Forward (fp16)
 // =============================================================================
 //
-// Strategy: Compute gate and up projections using matmul2d, then fuse
-// SwiGLU activation. Each threadgroup handles a tile of the output.
+// Both GEMMs are computed with their results held in cooperative tensor
+// register arrays simultaneously. SwiGLU activation is applied in register
+// space, then a single store writes the fused result to device memory.
 //
-// For batch_size=1 (decode), this is memory-bound — matmul2d still helps
-// because it avoids the overhead of per-element SIMD reduction loops.
-//
-// For batch_size>1 (prefill/training), this is compute-bound and matmul2d
-// provides significant speedup via hardware MMA units.
+// No threadgroup memory staging for GEMM outputs — Apple Silicon cache
+// hierarchy handles data reuse for the input tile automatically.
 
 kernel void mpp_fused_swiglu_forward_f16(
     device half* input [[buffer(0)]],
@@ -61,77 +69,63 @@ kernel void mpp_fused_swiglu_forward_f16(
     const int I = (int)params.intermediate_size;
 
     // Grid: [num_intermediate_tiles, num_batch_tiles, 1]
-    // Each threadgroup computes a 64×64 tile of the output
-    // But for SwiGLU we need BOTH gate and up for the same output positions,
-    // so each threadgroup computes gate[B_tile, I_tile] and up[B_tile, I_tile]
-    // then fuses silu(gate) * up.
-
-    const int BM = 64;  // batch tile
-    const int BN = 64;  // intermediate tile
+    const int BM = 32;  // batch tile — 32x32 is the recommended single-simdgroup tile
+    const int BN = 32;  // intermediate tile
 
     const int tile_b = (int)(tgid.y * BM);
     const int tile_i = (int)(tgid.x * BN);
     if (tile_b >= B || tile_i >= I) return;
 
     // Create tensors
-    // input: [B, H] row-major
+    // input:       [B, H] row-major → tensor with K=H, M=B columns-first
     auto tX = tensor(input, dextents<int, 2>{H, B}, array<int, 2>{1, H});
 
-    // gate_weight: [I, H] row-major → need transpose
+    // gate_weight: [I, H] row-major → transposed via descriptor
     auto tGW = tensor(gate_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
-    auto tUW = tensor(up_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
+    auto tUW = tensor(up_weight,   dextents<int, 2>{H, I}, array<int, 2>{1, H});
 
-    // Threadgroup memory for gate and up results
-    // We need both to compute silu(gate) * up
-    threadgroup float gate_tile[BM * BN]; // 16KB
-    threadgroup float up_tile[BM * BN];   // 16KB
-    // Total: 32KB (at threadgroup limit)
+    // Output tensor: [I, B] columns-first
+    auto tOut = tensor(output, dextents<int, 2>{I, B}, array<int, 2>{1, I});
 
-    auto tGate = tensor((threadgroup float*)gate_tile,
-                        dextents<int, 2>{BN, BM},
-                        array<int, 2>{1, BN});
-    auto tUp = tensor((threadgroup float*)up_tile,
-                      dextents<int, 2>{BN, BM},
-                      array<int, 2>{1, BN});
-
-    // Slice to this tile
-    auto sliceX = tX.slice(0, tile_b);
+    // Slices to this tile
+    auto sliceX  = tX.slice(0, tile_b);
     auto sliceGW = tGW.slice(0, tile_i);
     auto sliceUW = tUW.slice(0, tile_i);
-    auto sliceGate = tGate.slice(0, 0);
-    auto sliceUp = tUp.slice(0, 0);
 
-    // Gate projection: gate_tile = X @ gate_W^T
+    // MPP single-simdgroup matmul descriptor: 32x32 tile, K dynamic, A@B^T
     constexpr auto proj_desc = mpp::tensor_ops::matmul2d_descriptor(
-        64, 64,
+        BM, BN,
         static_cast<int>(dynamic_extent),
-        false, true, false
+        false,  // A not transposed
+        true,   // B transposed (weight is [I, H], we want X @ W^T)
+        false   // relaxed_precision
     );
-    mpp::tensor_ops::matmul2d<proj_desc, execution_simdgroups<4>> proj_op;
 
-    proj_op.run(sliceX, sliceGW, sliceGate);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Gate GEMM — result lives in register array rGate
+    mpp::tensor_ops::matmul2d<proj_desc, execution_simdgroup> gate_op;
+    auto rGate = gate_op.template get_destination_cooperative_tensor<
+        decltype(sliceX), decltype(sliceGW), float>();
+    gate_op.run(sliceX, sliceGW, rGate);
 
-    // Up projection: up_tile = X @ up_W^T
-    proj_op.run(sliceX, sliceUW, sliceUp);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Up GEMM — result lives in register array rUp
+    mpp::tensor_ops::matmul2d<proj_desc, execution_simdgroup> up_op;
+    auto rUp = up_op.template get_destination_cooperative_tensor<
+        decltype(sliceX), decltype(sliceUW), float>();
+    up_op.run(sliceX, sliceUW, rUp);
 
-    // Fuse SwiGLU: output = silu(gate) * up
-    // Each thread handles a subset of the tile
-    uint total_threads = 128; // 4 simdgroups × 32 lanes
-    uint linear_tid = simd_group_id * 32 + simd_lane_id;
-    uint tile_b_size = min((uint)BM, params.batch_size - (uint)tile_b);
-    uint tile_i_size = min((uint)BN, params.intermediate_size - (uint)tile_i);
+    // Postfix fusion: apply silu(gate) * up in register space.
+    // rOut will carry the fused result to device memory via a single store.
+    mpp::tensor_ops::matmul2d<proj_desc, execution_simdgroup> out_op;
+    auto rOut = out_op.template get_destination_cooperative_tensor<
+        decltype(sliceX), decltype(sliceGW), half>();
 
-    for (uint idx = linear_tid; idx < tile_b_size * tile_i_size; idx += total_threads) {
-        uint m = idx / tile_i_size;
-        uint n = idx % tile_i_size;
-        float g = gate_tile[m * BN + n];
-        float u = up_tile[m * BN + n];
-        uint global_b = (uint)tile_b + m;
-        uint global_i = (uint)tile_i + n;
-        output[global_b * params.intermediate_size + global_i] = half(silu(g) * u);
+    for (int i = 0; i < rGate.get_capacity(); i++) {
+        rOut[i] = half(silu(rGate[i]) * rUp[i]);
     }
+
+    // Single store from registers to device memory — no staging required
+    auto sliceOut = tOut.slice(tile_i, tile_b);
+    rOut.store(sliceOut);
 }
 
 // =============================================================================
@@ -153,57 +147,48 @@ kernel void mpp_fused_swiglu_forward_f32(
     const int H = (int)params.hidden_size;
     const int I = (int)params.intermediate_size;
 
-    const int BM = 64;
-    const int BN = 64;
+    const int BM = 32;
+    const int BN = 32;
     const int tile_b = (int)(tgid.y * BM);
     const int tile_i = (int)(tgid.x * BN);
     if (tile_b >= B || tile_i >= I) return;
 
-    auto tX = tensor(input, dextents<int, 2>{H, B}, array<int, 2>{1, H});
-    auto tGW = tensor(gate_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
-    auto tUW = tensor(up_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
+    auto tX   = tensor(input,       dextents<int, 2>{H, B}, array<int, 2>{1, H});
+    auto tGW  = tensor(gate_weight, dextents<int, 2>{H, I}, array<int, 2>{1, H});
+    auto tUW  = tensor(up_weight,   dextents<int, 2>{H, I}, array<int, 2>{1, H});
+    auto tOut = tensor(output,      dextents<int, 2>{I, B}, array<int, 2>{1, I});
 
-    threadgroup float gate_tile[BM * BN];
-    threadgroup float up_tile[BM * BN];
-
-    auto tGate = tensor((threadgroup float*)gate_tile,
-                        dextents<int, 2>{BN, BM},
-                        array<int, 2>{1, BN});
-    auto tUp = tensor((threadgroup float*)up_tile,
-                      dextents<int, 2>{BN, BM},
-                      array<int, 2>{1, BN});
-
-    auto sliceX = tX.slice(0, tile_b);
+    auto sliceX  = tX.slice(0, tile_b);
     auto sliceGW = tGW.slice(0, tile_i);
     auto sliceUW = tUW.slice(0, tile_i);
 
     constexpr auto proj_desc = mpp::tensor_ops::matmul2d_descriptor(
-        64, 64,
+        BM, BN,
         static_cast<int>(dynamic_extent),
         false, true, false
     );
-    mpp::tensor_ops::matmul2d<proj_desc, execution_simdgroups<4>> proj_op;
 
-    auto sliceGate = tGate.slice(0, 0);
-    auto sliceUp = tUp.slice(0, 0);
+    // Gate GEMM in registers
+    mpp::tensor_ops::matmul2d<proj_desc, execution_simdgroup> gate_op;
+    auto rGate = gate_op.template get_destination_cooperative_tensor<
+        decltype(sliceX), decltype(sliceGW), float>();
+    gate_op.run(sliceX, sliceGW, rGate);
 
-    proj_op.run(sliceX, sliceGW, sliceGate);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Up GEMM in registers
+    mpp::tensor_ops::matmul2d<proj_desc, execution_simdgroup> up_op;
+    auto rUp = up_op.template get_destination_cooperative_tensor<
+        decltype(sliceX), decltype(sliceUW), float>();
+    up_op.run(sliceX, sliceUW, rUp);
 
-    proj_op.run(sliceX, sliceUW, sliceUp);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
+    // Postfix fusion in register space — no threadgroup staging
+    mpp::tensor_ops::matmul2d<proj_desc, execution_simdgroup> out_op;
+    auto rOut = out_op.template get_destination_cooperative_tensor<
+        decltype(sliceX), decltype(sliceGW), float>();
 
-    uint linear_tid = simd_group_id * 32 + simd_lane_id;
-    uint tile_b_size = min((uint)BM, params.batch_size - (uint)tile_b);
-    uint tile_i_size = min((uint)BN, params.intermediate_size - (uint)tile_i);
-
-    for (uint idx = linear_tid; idx < tile_b_size * tile_i_size; idx += 128) {
-        uint m = idx / tile_i_size;
-        uint n = idx % tile_i_size;
-        float g = gate_tile[m * BN + n];
-        float u = up_tile[m * BN + n];
-        uint global_b = (uint)tile_b + m;
-        uint global_i = (uint)tile_i + n;
-        output[global_b * params.intermediate_size + global_i] = silu(g) * u;
+    for (int i = 0; i < rGate.get_capacity(); i++) {
+        rOut[i] = silu(rGate[i]) * rUp[i];
     }
+
+    auto sliceOut = tOut.slice(tile_i, tile_b);
+    rOut.store(sliceOut);
 }

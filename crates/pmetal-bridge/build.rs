@@ -240,7 +240,7 @@ fn build_and_link() {
         .opt_level(3);
 
     #[cfg(target_os = "macos")]
-    build.flag(&format!("-mmacosx-version-min={deploy_target}"));
+    build.flag(format!("-mmacosx-version-min={deploy_target}"));
 
     build.compile("pmetal_bridge");
     println!("cargo:rustc-link-lib=static=pmetal_bridge");

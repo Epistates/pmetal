@@ -148,12 +148,12 @@ kernel void mpp_flash_attention_fwd_d64_causal(
     constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, true, false
     );
-    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroups<4>> qk_op;
+    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroup> qk_op;
 
     constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, false, false
     );
-    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroups<4>> pv_op;
+    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroup> pv_op;
 
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         uint k_start = kv_block * Bk;
@@ -359,12 +359,12 @@ kernel void mpp_flash_attention_fwd_d64(
     constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, true, false
     );
-    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroups<4>> qk_op;
+    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroup> qk_op;
 
     constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, false, false
     );
-    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroups<4>> pv_op;
+    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroup> pv_op;
 
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         uint k_start = kv_block * Bk;
@@ -563,12 +563,12 @@ kernel void mpp_flash_attention_fwd_d80_causal(
     constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, true, false
     );
-    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroups<4>> qk_op;
+    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroup> qk_op;
 
     constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, false, false
     );
-    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroups<4>> pv_op;
+    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroup> pv_op;
 
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         uint k_start = kv_block * Bk;
@@ -781,12 +781,12 @@ kernel void mpp_flash_attention_fwd_d80(
     constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, true, false
     );
-    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroups<4>> qk_op;
+    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroup> qk_op;
 
     constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, false, false
     );
-    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroups<4>> pv_op;
+    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroup> pv_op;
 
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         uint k_start = kv_block * Bk;
@@ -1000,12 +1000,12 @@ kernel void mpp_flash_attention_fwd_d96_causal(
     constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, true, false
     );
-    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroups<4>> qk_op;
+    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroup> qk_op;
 
     constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, false, false
     );
-    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroups<4>> pv_op;
+    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroup> pv_op;
 
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         uint k_start = kv_block * Bk;
@@ -1213,12 +1213,12 @@ kernel void mpp_flash_attention_fwd_d96(
     constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, true, false
     );
-    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroups<4>> qk_op;
+    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroup> qk_op;
 
     constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, false, false
     );
-    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroups<4>> pv_op;
+    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroup> pv_op;
 
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         uint k_start = kv_block * Bk;
@@ -1427,13 +1427,13 @@ kernel void mpp_flash_attention_fwd_d128_causal(
     constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, true, false
     );
-    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroups<4>> qk_op;
+    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroup> qk_op;
 
     // PV: O_chunk[32,32] = P[32,32] @ V_chunk[32,32] — no transpose
     constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, false, false
     );
-    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroups<4>> pv_op;
+    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroup> pv_op;
 
     // Main loop over KV blocks
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
@@ -1672,12 +1672,12 @@ kernel void mpp_flash_attention_fwd_d128(
     constexpr auto qk_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, true, false
     );
-    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroups<4>> qk_op;
+    mpp::tensor_ops::matmul2d<qk_desc, execution_simdgroup> qk_op;
 
     constexpr auto pv_desc = mpp::tensor_ops::matmul2d_descriptor(
         32, 32, static_cast<int>(dynamic_extent), false, false, false
     );
-    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroups<4>> pv_op;
+    mpp::tensor_ops::matmul2d<pv_desc, execution_simdgroup> pv_op;
 
     for (uint kv_block = 0; kv_block < num_kv_blocks; kv_block++) {
         uint k_start = kv_block * Bk;

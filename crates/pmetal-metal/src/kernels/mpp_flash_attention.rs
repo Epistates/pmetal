@@ -6,18 +6,18 @@
 //! `metal4/mpp_flash_attention.metal`. The current shader contract supports
 //! fp16 attention with `head_dim = 64`, `80`, `96`, or `128` for causal and non-causal inference.
 
-use std::collections::HashMap;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
 use half::f16;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2_metal::{MTLCommandBuffer, MTLComputeCommandEncoder};
 
 use crate::{
     buffer::{BufferUsage, MetalBuffer},
     context::MetalContext,
     error::{MetalError, Result},
+    kernels::mpp_dispatch::encode_mpp_kernel,
 };
 
 /// Configuration for MPP FlashAttention.
@@ -236,24 +236,6 @@ impl MppFlashAttention {
         }
 
         let function_name = kernel_name(&self.config)?;
-        let pipeline = {
-            let mut cache = self.ctx.pipeline_cache_mut();
-            cache.get_or_create_metal4_pipeline(
-                self.ctx.device(),
-                function_name,
-                &HashMap::new(),
-            )?
-        };
-
-        let command_queue = self.ctx.command_queue();
-        let command_buffer = command_queue
-            .commandBuffer()
-            .ok_or(MetalError::CommandBufferCreation)?;
-        let encoder = command_buffer
-            .computeCommandEncoder()
-            .ok_or(MetalError::EncoderCreation)?;
-
-        encoder.setComputePipelineState(&pipeline);
 
         let params = FlashAttentionParams {
             batch_size: self.config.batch_size as u32,
@@ -271,33 +253,28 @@ impl MppFlashAttention {
             softcap: self.config.softcap.unwrap_or(0.0),
         };
 
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(queries.metal_buffer()), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(keys.metal_buffer()), 0, 1);
-            encoder.setBuffer_offset_atIndex(Some(values.metal_buffer()), 0, 2);
-            encoder.setBuffer_offset_atIndex(Some(output.metal_buffer()), 0, 3);
-            encoder.setBuffer_offset_atIndex(Some(logsumexp.metal_buffer()), 0, 4);
-
-            let params_ptr = NonNull::from(&params).cast();
-            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
-        }
-
-        let grid_size = objc2_metal::MTLSize {
+        let grid = objc2_metal::MTLSize {
             width: self.config.query_seq_len.div_ceil(32),
             height: self.config.num_heads,
             depth: self.config.batch_size,
         };
-        let threadgroup_size = objc2_metal::MTLSize {
-            width: 32,
-            height: 4,
-            depth: 1,
-        };
+        let tg_size = objc2_metal::MTLSize { width: 32, height: 4, depth: 1 };
 
-        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
-        encoder.endEncoding();
-        command_buffer.commit();
+        let q_buf = queries.metal_buffer();
+        let k_buf = keys.metal_buffer();
+        let v_buf = values.metal_buffer();
+        let out_buf = output.metal_buffer();
+        let lse_buf = logsumexp.metal_buffer();
 
-        Ok(command_buffer)
+        encode_mpp_kernel(&self.ctx, function_name, grid, tg_size, |encoder| unsafe {
+            encoder.setBuffer_offset_atIndex(Some(q_buf), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(k_buf), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(v_buf), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(out_buf), 0, 3);
+            encoder.setBuffer_offset_atIndex(Some(lse_buf), 0, 4);
+            let params_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 5);
+        })
     }
 }
 

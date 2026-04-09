@@ -592,6 +592,7 @@ async fn run_training_direct(
         dispatch: orchestrator::DispatchConfig {
             flash_attention: !has_flag(&spec.args, "--no-flash-attention"),
             sequence_packing: !has_flag(&spec.args, "--no-sequence-packing"),
+            pack_max_seq_len: parse_opt_arg(&spec.args, "--pack-max-seq-len"),
             jit_compilation: !has_flag(&spec.args, "--no-jit-compilation"),
             fused: true,
             metal_fused_optimizer: !has_flag(&spec.args, "--no-metal-fused-optimizer"),
@@ -725,6 +726,14 @@ fn required_arg(args: &[String], flag: &str) -> Result<String, anyhow::Error> {
 
 fn has_flag(args: &[String], flag: &str) -> bool {
     args.iter().any(|arg| arg == flag)
+}
+
+/// Parse an optional typed argument — returns `None` when the flag is absent.
+fn parse_opt_arg<T>(args: &[String], flag: &str) -> Option<T>
+where
+    T: std::str::FromStr,
+{
+    optional_arg(args, flag).and_then(|v| v.parse::<T>().ok())
 }
 
 fn parse_arg<T>(args: &[String], flag: &str, default: T) -> Result<T, anyhow::Error>

@@ -76,7 +76,7 @@ kernel void mpp_qmm_4bit_f16(
         false, true, false,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate
     );
-    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
 
     auto sliceX = tX.slice(0, tile_m);
     auto sliceY = tY.slice(tile_n, tile_m);
@@ -196,7 +196,7 @@ kernel void mpp_qmm_8bit_f16(
         false, true, false,
         mpp::tensor_ops::matmul2d_descriptor::mode::multiply_accumulate
     );
-    mpp::tensor_ops::matmul2d<desc, execution_simdgroups<4>> op;
+    mpp::tensor_ops::matmul2d<desc, execution_simdgroup> op;
 
     auto sliceX = tX.slice(0, tile_m);
     auto sliceY = tY.slice(tile_n, tile_m);

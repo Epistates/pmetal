@@ -157,7 +157,7 @@ impl TurboQuantTransform {
         }
 
         let threadgroup_width =
-            choose_threadgroup_width(pipeline.maxTotalThreadsPerThreadgroup() as usize, self.dim);
+            choose_threadgroup_width(pipeline.maxTotalThreadsPerThreadgroup(), self.dim);
         let grid_size = MTLSize {
             width: num_rows,
             height: 1,

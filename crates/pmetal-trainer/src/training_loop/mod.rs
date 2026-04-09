@@ -75,7 +75,7 @@ fn compile_with_state<F: FnMut(S, I) -> O, S, I, O>(f: F, _shapeless: Option<boo
 use pmetal_core::{EvalMetrics, LrSchedulerType, TrainingConfig};
 use pmetal_data::{
     DataLoader, DataLoaderConfig, PackedDataLoader, PackedTrainingBatch, PackerConfig,
-    TrainingBatch, TrainingDataset,
+    TrainingBatch, TrainingDataset, compute_pack_seq_len,
 };
 use pmetal_lora::TrainableModel;
 use pmetal_mlx::kernels::cross_entropy::cross_entropy_loss;
@@ -188,6 +188,17 @@ pub struct TrainingLoopConfig {
     /// Falls back to standard cross-entropy silently when the model does not support it.
     pub use_cut_cross_entropy: bool,
 
+    /// Override the maximum sequence length used for sequence packing.
+    ///
+    /// When `None` (default), `run_packed` auto-computes the packing length from
+    /// the p99 of sample lengths in the training dataset, rounded up to the next
+    /// power of two and capped at `dataloader.max_seq_len`.
+    ///
+    /// When `Some(n)`, the explicit value `n` is used directly, bypassing the
+    /// adaptive computation.  Useful for reproducibility or when the dataset p99
+    /// heuristic overshoots (e.g., a single outlier sample inflates the bucket).
+    pub pack_max_seq_len: Option<usize>,
+
     /// Distributed training configuration.
     /// When set, gradients are synchronized across multiple nodes after each
     /// accumulation cycle, enabling data-parallel training over a home cluster.
@@ -214,6 +225,7 @@ impl Default for TrainingLoopConfig {
             neftune_noise_alpha: None,
             loraplus_lr_ratio: None,
             use_cut_cross_entropy: false,
+            pack_max_seq_len: None,
             #[cfg(feature = "distributed")]
             distributed: None,
         }

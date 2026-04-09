@@ -21,10 +21,32 @@ pub mod fused_swiglu;
 pub mod fused_training;
 pub mod moe;
 pub mod mpp_bench;
+pub mod mpp_dispatch;
 pub mod mpp_flash_attention;
 pub mod mpp_gemm;
 pub mod mpp_quantized;
 pub mod turboquant;
+
+#[cfg(has_metal4)]
+pub mod mpp_fused_swiglu;
+#[cfg(has_metal4)]
+pub mod mpp_fused_norm_lora;
+#[cfg(has_metal4)]
+pub mod mpp_dw_gemm;
+#[cfg(has_metal4)]
+pub mod mpp_grouped_gemm;
+#[cfg(has_metal4)]
+pub mod mpp_fused_lora;
+#[cfg(has_metal4)]
+pub mod mpp_fused_training;
+#[cfg(has_metal4)]
+pub mod mpp_fused_cross_entropy;
+#[cfg(has_metal4)]
+pub mod mpp_fused_rope;
+#[cfg(has_metal4)]
+pub mod mpp_fused_moe;
+#[cfg(has_metal4)]
+pub mod mpp_fused_distill;
 
 // Re-export main types
 pub use batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};

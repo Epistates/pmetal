@@ -65,7 +65,12 @@ pub mod accelerate;
 #[cfg(feature = "ane")]
 pub mod ane;
 pub mod async_scheduler;
+pub mod backend;
 pub mod bridge;
+pub mod dispatch;
+#[cfg(has_metal4)]
+pub mod metal4;
+pub mod metal3_backend;
 pub mod buffer;
 pub mod context;
 pub mod error;
@@ -78,6 +83,7 @@ pub mod tuna;
 pub use bridge::{MetalBufferView, MetalBufferViewF16, MetalBufferViewF32, metal_buffer_from_ptr};
 pub use buffer::{BufferUsage, MetalBuffer};
 pub use context::MetalContext;
+pub use dispatch::KernelDispatch;
 pub use error::{MetalError, Result};
 pub use kernels::batched_lora::{BatchedLora, BatchedLoraAdapters, BatchedLoraConfig};
 pub use kernels::flash_attention::{

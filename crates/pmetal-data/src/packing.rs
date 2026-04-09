@@ -803,6 +803,43 @@ impl Iterator for PackedDataLoader {
     }
 }
 
+// =============================================================================
+// Adaptive packing sequence length
+// =============================================================================
+
+/// Compute an adaptive packing sequence length from dataset statistics.
+///
+/// Uses the p99 of actual sequence lengths, rounded up to the next power of 2,
+/// capped at `model_max_seq_len`. This avoids the O(n²) attention cost that
+/// arises when `max_seq_len` auto-detects to the model's architectural maximum
+/// (e.g., 8192) for datasets whose sequences are much shorter (e.g., 50–400
+/// tokens).
+///
+/// # Example
+///
+/// For a dataset with 50–400 token sequences and a model max of 8192:
+/// - p99 ≈ 390
+/// - next_power_of_two(390) = 512
+/// - min(512, 8192) = **512** ← used for packing instead of 8192
+///
+/// This reduces attention cost by (8192/512)² ≈ 256×.
+pub fn compute_pack_seq_len(sequence_lengths: &[usize], model_max_seq_len: usize) -> usize {
+    if sequence_lengths.is_empty() {
+        return model_max_seq_len;
+    }
+    let mut sorted = sequence_lengths.to_vec();
+    sorted.sort_unstable();
+    // p99 index: ceiling of 99% of the sorted length, clamped to a valid index.
+    let p99_idx = ((sorted.len() as f64) * 0.99).ceil() as usize;
+    let p99 = sorted[p99_idx.saturating_sub(1).min(sorted.len() - 1)];
+    let adaptive = p99.next_power_of_two().min(model_max_seq_len);
+    tracing::info!(
+        "Adaptive pack seq_len: p99={p99}, next_pow2={pow2}, model_max={model_max_seq_len}, using={adaptive}",
+        pow2 = p99.next_power_of_two(),
+    );
+    adaptive
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1087,5 +1124,47 @@ mod tests {
 
         let total_tokens: usize = batches.iter().map(|b| b.total_tokens()).sum();
         assert_eq!(total_tokens, 5); // Only [2,3] and [5,6,7]
+    }
+
+    #[test]
+    fn test_compute_pack_seq_len_empty() {
+        // Empty slice: fall back to model max unchanged.
+        assert_eq!(compute_pack_seq_len(&[], 8192), 8192);
+    }
+
+    #[test]
+    fn test_compute_pack_seq_len_short_dataset() {
+        // Dataset with 50–400 token sequences, model max 8192.
+        // p99 of 100 values in 50..=400 range → rounds to next power of 2, well below 8192.
+        let lengths: Vec<usize> = (0..100).map(|i| 50 + i * 3).collect(); // 50, 53, ..., 347
+        let result = compute_pack_seq_len(&lengths, 8192);
+        // p99 ≈ 347, next_power_of_two(347) = 512
+        assert_eq!(result, 512);
+        assert!(result < 8192, "Should be far below model max");
+    }
+
+    #[test]
+    fn test_compute_pack_seq_len_capped_at_model_max() {
+        // Sequences longer than model max → result capped at model max.
+        let lengths: Vec<usize> = vec![1000, 2000, 3000, 4000];
+        let result = compute_pack_seq_len(&lengths, 2048);
+        // p99 ≈ 4000, next_power_of_two = 4096, but capped at 2048
+        assert_eq!(result, 2048);
+    }
+
+    #[test]
+    fn test_compute_pack_seq_len_single_sequence() {
+        let lengths = vec![300usize];
+        let result = compute_pack_seq_len(&lengths, 8192);
+        // next_power_of_two(300) = 512
+        assert_eq!(result, 512);
+    }
+
+    #[test]
+    fn test_compute_pack_seq_len_exact_power_of_two() {
+        // If p99 is already a power of 2, result should be that power.
+        let lengths: Vec<usize> = vec![512; 100];
+        let result = compute_pack_seq_len(&lengths, 8192);
+        assert_eq!(result, 512);
     }
 }

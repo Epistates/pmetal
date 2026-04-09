@@ -63,6 +63,12 @@ impl Default for QLoraOrchConfig {
 pub struct DispatchConfig {
     pub flash_attention: bool,
     pub sequence_packing: bool,
+    /// Explicit override for the packing sequence length.
+    ///
+    /// When `None` (default), `run_packed` auto-computes the packing length from
+    /// the p99 of sample lengths, rounded up to the next power of two.
+    /// When `Some(n)`, `n` is used directly, bypassing the adaptive heuristic.
+    pub pack_max_seq_len: Option<usize>,
     pub jit_compilation: bool,
     pub fused: bool,
     pub metal_fused_optimizer: bool,
@@ -85,6 +91,7 @@ impl Default for DispatchConfig {
         Self {
             flash_attention: true,
             sequence_packing: true,
+            pack_max_seq_len: None,
             jit_compilation: true,
             fused: true,
             metal_fused_optimizer: true,
@@ -575,6 +582,7 @@ pub async fn run_training(
         },
         use_jit_compilation: config.dispatch.jit_compilation,
         use_sequence_packing: config.dispatch.sequence_packing,
+        pack_max_seq_len: config.dispatch.pack_max_seq_len,
         gradient_checkpointing: config.dispatch.gradient_checkpointing,
         gradient_checkpointing_layers: config.dispatch.gradient_checkpointing_layers,
         embedding_lr: full_config

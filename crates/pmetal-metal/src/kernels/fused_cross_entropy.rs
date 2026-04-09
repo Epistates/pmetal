@@ -32,10 +32,11 @@ use std::ptr::NonNull;
 use std::sync::Arc;
 
 use half::f16;
-use objc2_metal::{MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
+use objc2::runtime::ProtocolObject;
+use objc2_metal::{MTLBuffer, MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder};
 
 use crate::{
-    buffer::{BufferUsage, MetalBuffer},
+    buffer::{AsMetalBuffer, BufferUsage, MetalBuffer},
     context::MetalContext,
     error::{MetalError, Result},
     pipeline::FunctionConstant,
@@ -228,6 +229,51 @@ impl FusedCrossEntropy {
         Ok(FusedCrossEntropyOutput { losses, logsumexp })
     }
 
+    /// Compute forward pass accepting a type-erased logits buffer.
+    ///
+    /// Called by [`Metal3Backend`] which receives `&dyn buffer::AsMetalBuffer`
+    /// from the [`KernelBackend`] trait and cannot cast it to a concrete
+    /// `MetalBuffer<f32/f16>`. This method allocates outputs and dispatches
+    /// the appropriate kernel variant based on `config.use_fp16`.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that `logits` actually contains data of the type
+    /// implied by `config.use_fp16` (f32 when false, f16 when true). Passing
+    /// mismatched data produces numerically incorrect results without panicking,
+    /// since Metal treats all buffers as raw bytes.
+    pub(crate) fn forward_dyn(
+        &self,
+        logits: &dyn AsMetalBuffer,
+        targets: &MetalBuffer<i32>,
+    ) -> Result<FusedCrossEntropyOutput> {
+        let expected_logits = self.config.num_tokens * self.config.vocab_size;
+        if logits.len() != expected_logits {
+            return Err(MetalError::DimensionMismatch {
+                param: "logits",
+                expected: expected_logits,
+                actual: logits.len(),
+            });
+        }
+        if targets.len() != self.config.num_tokens {
+            return Err(MetalError::DimensionMismatch {
+                param: "targets",
+                expected: self.config.num_tokens,
+                actual: targets.len(),
+            });
+        }
+
+        let losses = MetalBuffer::new(&self.ctx, self.config.num_tokens, BufferUsage::Shared)?;
+        let logsumexp = MetalBuffer::new(&self.ctx, self.config.num_tokens, BufferUsage::Shared)?;
+
+        // Dispatch the Metal kernel directly via the raw MTLBuffer pointer.
+        // We call execute_forward_raw so we are not constrained by the concrete
+        // typed wrappers on execute_forward / execute_forward_f16.
+        self.execute_forward_raw(logits.as_metal_buffer(), targets, &losses, &logsumexp)?;
+
+        Ok(FusedCrossEntropyOutput { losses, logsumexp })
+    }
+
     /// Compute backward pass (in-place gradient).
     ///
     /// # Arguments
@@ -258,7 +304,13 @@ impl FusedCrossEntropy {
     }
 
     /// Execute forward kernel.
-    fn execute_forward(
+    ///
+    /// Exposed as `pub(crate)` so that [`Metal3Backend`] can call it directly
+    /// with a raw `MetalBuffer<f32>` obtained by materialising a
+    /// `&dyn AsMetalBuffer` reference, without needing to go through the
+    /// higher-level `forward()` wrapper (which re-validates sizes we've
+    /// already validated at the trait boundary).
+    pub(crate) fn execute_forward(
         &self,
         logits: &MetalBuffer<f32>,
         targets: &MetalBuffer<i32>,
@@ -290,6 +342,77 @@ impl FusedCrossEntropy {
         // SAFETY: Metal compute encoder operations are safe when buffers are valid
         unsafe {
             encoder.setBuffer_offset_atIndex(Some(logits.metal_buffer()), 0, 0);
+            encoder.setBuffer_offset_atIndex(Some(targets.metal_buffer()), 0, 1);
+            encoder.setBuffer_offset_atIndex(Some(losses.metal_buffer()), 0, 2);
+            encoder.setBuffer_offset_atIndex(Some(logsumexp.metal_buffer()), 0, 3);
+
+            let params = self.create_params();
+            let params_ptr = NonNull::from(&params).cast();
+            encoder.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 4);
+        }
+
+        let grid_size = objc2_metal::MTLSize {
+            width: self.config.num_tokens,
+            height: 1,
+            depth: 1,
+        };
+
+        let threadgroup_size = objc2_metal::MTLSize {
+            width: 32,
+            height: 1,
+            depth: 1,
+        };
+
+        encoder.dispatchThreadgroups_threadsPerThreadgroup(grid_size, threadgroup_size);
+        encoder.endEncoding();
+        command_buffer.commit();
+        command_buffer.waitUntilCompleted();
+
+        if let Some(error) = command_buffer.error() {
+            return Err(MetalError::ExecutionFailed(error.to_string()));
+        }
+
+        Ok(())
+    }
+
+    /// Execute forward kernel with a raw (type-erased) logits buffer.
+    ///
+    /// Used by [`forward_dyn`] when the caller holds `&dyn buffer::AsMetalBuffer`
+    /// and cannot provide the concrete `MetalBuffer<f32/f16>` that the typed
+    /// variants require. The pipeline selected is the same one `execute_forward`
+    /// uses; the kernel itself does not care about the Rust element type —
+    /// the caller is responsible for dtype correctness.
+    fn execute_forward_raw(
+        &self,
+        logits: &ProtocolObject<dyn MTLBuffer>,
+        targets: &MetalBuffer<i32>,
+        losses: &MetalBuffer<f32>,
+        logsumexp: &MetalBuffer<f32>,
+    ) -> Result<()> {
+        let function_name = if self.config.use_simd {
+            "fused_cross_entropy_forward_simd"
+        } else {
+            "fused_cross_entropy_forward"
+        };
+
+        let pipeline = {
+            let mut cache = self.ctx.pipeline_cache_mut();
+            cache.get_or_create_pipeline(self.ctx.device(), function_name, None)?
+        };
+
+        let command_queue = self.ctx.command_queue();
+        let command_buffer = command_queue
+            .commandBuffer()
+            .ok_or(MetalError::CommandBufferCreation)?;
+
+        let encoder = command_buffer
+            .computeCommandEncoder()
+            .ok_or(MetalError::EncoderCreation)?;
+
+        encoder.setComputePipelineState(&pipeline);
+
+        unsafe {
+            encoder.setBuffer_offset_atIndex(Some(logits), 0, 0);
             encoder.setBuffer_offset_atIndex(Some(targets.metal_buffer()), 0, 1);
             encoder.setBuffer_offset_atIndex(Some(losses.metal_buffer()), 0, 2);
             encoder.setBuffer_offset_atIndex(Some(logsumexp.metal_buffer()), 0, 3);

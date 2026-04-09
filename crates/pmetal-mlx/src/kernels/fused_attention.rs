@@ -16,7 +16,7 @@ use std::{sync::OnceLock, time::Instant};
 use crate::ArrayDtypeExt;
 use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
 use pmetal_metal::{
-    FlashAttention, FlashAttentionConfig as MetalFlashAttentionConfig, MetalContext,
+    FlashAttention, FlashAttentionConfig as MetalFlashAttentionConfig, KernelDispatch, MetalContext,
     MppFlashAttention, MppFlashAttentionConfig,
     context::{DeviceProperties, DeviceTier},
 };
@@ -389,7 +389,7 @@ fn benchmark_attention_backends(
         }
     }
 
-    if mpp_flash_attention_supported(queries, keys, values, None, metal_ctx.properties()) {
+    if mpp_flash_attention_supported(queries, keys, values, None, metal_ctx.dispatch()) {
         if let Some((elapsed, output)) = benchmark_attention_candidate(
             AttentionBackendChoice::MppFlash,
             queries,
@@ -559,16 +559,33 @@ fn flash_attention_supported(
     matches!(q_shape[3] as usize, 64 | 80 | 96 | 128 | 256)
 }
 
+/// Shape-only eligibility check for MPP flash attention (no hardware check).
+///
+/// Separated from [`mpp_flash_attention_supported`] so that unit tests can
+/// exercise shape logic without needing a live [`KernelDispatch`].
+fn mpp_flash_attention_shape_ok(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    custom_mask: Option<&Array>,
+) -> bool {
+    flash_attention_supported(queries, keys, values, custom_mask)
+        && matches!(queries.shape()[3], 64 | 80 | 96 | 128)
+}
+
+/// Full eligibility check for MPP flash attention: hardware capability + shape.
+///
+/// Uses [`KernelDispatch::preferred_backend`] to determine whether the Metal 4
+/// backend is available on this device, rather than calling `has_nax()` directly.
 fn mpp_flash_attention_supported(
     queries: &Array,
     keys: &Array,
     values: &Array,
     custom_mask: Option<&Array>,
-    props: &DeviceProperties,
+    dispatch: &KernelDispatch,
 ) -> bool {
-    props.has_nax()
-        && flash_attention_supported(queries, keys, values, custom_mask)
-        && matches!(queries.shape()[3], 64 | 80 | 96 | 128)
+    dispatch.preferred_backend().caps().has_mpp_flash_attention
+        && mpp_flash_attention_shape_ok(queries, keys, values, custom_mask)
 }
 
 fn max_abs_diff(lhs: &Array, rhs: &Array) -> Result<f32, Exception> {
@@ -660,7 +677,7 @@ fn run_mpp_flash_attention(
     config: &FusedAttentionConfig,
     metal_ctx: &std::sync::Arc<MetalContext>,
 ) -> Result<Array, Exception> {
-    if !mpp_flash_attention_supported(queries, keys, values, None, metal_ctx.properties()) {
+    if !mpp_flash_attention_supported(queries, keys, values, None, metal_ctx.dispatch()) {
         return Err(Exception::custom(
             "MPP FlashAttention unsupported for current device or shape".to_string(),
         ));
@@ -1408,64 +1425,55 @@ mod tests {
     }
 
     #[test]
-    fn test_mpp_flash_attention_support_requires_apple10_and_supported_head_dim() {
-        let props = test_device_properties();
+    fn test_mpp_flash_attention_shape_ok_accepted_and_rejected_head_dims() {
+        // Hardware capability gating (has_nax / preferred_backend) is exercised
+        // by integration tests that run on a live MetalContext.  Unit tests here
+        // verify only the shape predicate via `mpp_flash_attention_shape_ok`.
+
         let queries = random_tensor(&[1, 4, 8, 128]);
         let keys = random_tensor(&[1, 4, 8, 128]);
         let values = random_tensor(&[1, 4, 8, 128]);
-
-        assert!(mpp_flash_attention_supported(
-            &queries, &keys, &values, None, &props
-        ));
-
-        let mut no_nax = props.clone();
-        no_nax.has_nax = false;
-        assert!(!mpp_flash_attention_supported(
-            &queries, &keys, &values, None, &no_nax
-        ));
+        assert!(mpp_flash_attention_shape_ok(&queries, &keys, &values, None));
 
         let queries_d64 = random_tensor(&[1, 4, 8, 64]);
         let keys_d64 = random_tensor(&[1, 4, 8, 64]);
         let values_d64 = random_tensor(&[1, 4, 8, 64]);
-        assert!(mpp_flash_attention_supported(
+        assert!(mpp_flash_attention_shape_ok(
             &queries_d64,
             &keys_d64,
             &values_d64,
-            None,
-            &props
+            None
         ));
 
         let queries_d96 = random_tensor(&[1, 4, 8, 96]);
         let keys_d96 = random_tensor(&[1, 4, 8, 96]);
         let values_d96 = random_tensor(&[1, 4, 8, 96]);
-        assert!(mpp_flash_attention_supported(
+        assert!(mpp_flash_attention_shape_ok(
             &queries_d96,
             &keys_d96,
             &values_d96,
-            None,
-            &props
+            None
         ));
 
         let queries_d80 = random_tensor(&[1, 4, 8, 80]);
         let keys_d80 = random_tensor(&[1, 4, 8, 80]);
         let values_d80 = random_tensor(&[1, 4, 8, 80]);
-        assert!(mpp_flash_attention_supported(
+        assert!(mpp_flash_attention_shape_ok(
             &queries_d80,
             &keys_d80,
             &values_d80,
-            None,
-            &props
+            None
         ));
 
+        // head_dim=72 is not in the allowed set; must be rejected.
         let queries_d72 = random_tensor(&[1, 4, 8, 72]);
         let keys_d72 = random_tensor(&[1, 4, 8, 72]);
         let values_d72 = random_tensor(&[1, 4, 8, 72]);
-        assert!(!mpp_flash_attention_supported(
+        assert!(!mpp_flash_attention_shape_ok(
             &queries_d72,
             &keys_d72,
             &values_d72,
-            None,
-            &props
+            None
         ));
     }
 

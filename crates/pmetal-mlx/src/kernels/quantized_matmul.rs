@@ -8,7 +8,7 @@ use std::{sync::OnceLock, time::Instant};
 use crate::ArrayDtypeExt;
 use pmetal_bridge::compat::{Array, Dtype, Exception};
 use pmetal_metal::{
-    BufferUsage, MetalBuffer, MetalContext, MppQuantizedGemm, MppQuantizedGemmConfig,
+    BufferUsage, KernelDispatch, MetalBuffer, MetalContext, MppQuantizedGemm, MppQuantizedGemmConfig,
     context::{DeviceProperties, DeviceTier},
 };
 use serde::{Deserialize, Serialize};
@@ -151,11 +151,21 @@ fn quantized_rhs_transposed_problem(
     })
 }
 
+/// Decide whether to try the MPP quantized-GEMM path for this problem.
+///
+/// Uses [`KernelDispatch::preferred_backend`] for the hardware-capability check
+/// instead of calling `has_nax()` directly, so the routing decision is owned by
+/// [`KernelDispatch`] rather than scattered call sites.
 fn should_consider_mpp_quantized_linear(
+    dispatch: &KernelDispatch,
     props: &DeviceProperties,
     problem: &QuantizedLinearProblem,
 ) -> bool {
-    if !props.has_nax() || problem.m == 0 || problem.n < 64 || problem.k < 64 {
+    if !dispatch.preferred_backend().caps().has_quantized_gemm
+        || problem.m == 0
+        || problem.n < 64
+        || problem.k < 64
+    {
         return false;
     }
 
@@ -358,7 +368,7 @@ pub fn quantized_linear_rhs_transposed_best_effort(
         }
     };
 
-    if !should_consider_mpp_quantized_linear(ctx.properties(), &problem) {
+    if !should_consider_mpp_quantized_linear(ctx.dispatch(), ctx.properties(), &problem) {
         return run_mlx_quantized_rhs_transposed(x, w_q, scales, biases, group_size);
     }
 

@@ -49,17 +49,34 @@ impl TrainingLoop {
 
         tracing::info!("Starting packed training with sequence packing enabled");
 
-        // Create PackedDataLoader from dataset samples
-        // CRITICAL: Set max_seq_length to truncate long sequences instead of skipping them!
-        let max_seq_len = self.config.dataloader.max_seq_len;
-        let packer_config = PackerConfig::with_max_length(max_seq_len)
-            .with_max_seq_length(max_seq_len) // Truncate sequences to max_seq_len
-            .mask_boundaries(true);
-
         // Get samples from dataset - need to access the samples directly
         let samples: Vec<_> = (0..train_dataset.len())
             .filter_map(|i| train_dataset.get(i).cloned())
             .collect();
+
+        // Create PackedDataLoader from dataset samples
+        // CRITICAL: Set max_seq_length to truncate long sequences instead of skipping them!
+        //
+        // Use adaptive packing sequence length: p99 of actual sample lengths rounded
+        // up to the next power of 2, capped at the configured max. This avoids the
+        // O(n²) attention cost when max_seq_len auto-detects to the model architectural
+        // maximum (e.g. 8192) for datasets with short sequences (e.g. 50–400 tokens).
+        //
+        // If the caller provided an explicit override via `--pack-max-seq-len`, use
+        // that value directly instead of the adaptive computation.
+        let max_seq_len = if let Some(explicit) = self.config.pack_max_seq_len {
+            tracing::info!(
+                "Using explicit pack_max_seq_len={} (overrides adaptive p99 heuristic)",
+                explicit
+            );
+            explicit
+        } else {
+            let sample_lengths: Vec<usize> = samples.iter().map(|s| s.input_ids.len()).collect();
+            compute_pack_seq_len(&sample_lengths, self.config.dataloader.max_seq_len)
+        };
+        let packer_config = PackerConfig::with_max_length(max_seq_len)
+            .with_max_seq_length(max_seq_len) // Truncate sequences to adaptive max
+            .mask_boundaries(true);
 
         let mut packed_dataloader = PackedDataLoader::new(
             &samples,
