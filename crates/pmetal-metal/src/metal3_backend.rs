@@ -375,6 +375,24 @@ impl KernelBackend for Metal3Backend {
         )
     }
 
+    /// Standalone AdamW step: creates a temporary [`BatchedCommandBuffer`],
+    /// queues the update, and executes it synchronously.
+    ///
+    /// This satisfies the [`KernelBackend::fused_adamw_step_standalone`] contract
+    /// for callers (e.g. [`Metal4Backend`] dispatch glue) that need a
+    /// self-contained call without an externally owned batch.
+    ///
+    /// [`Metal4Backend`]: crate::metal4::backend::Metal4Backend
+    fn fused_adamw_step_standalone(
+        &self,
+        _ctx: &Arc<MetalContext>,
+        desc: &AdamWDescriptor<'_>,
+    ) -> Result<()> {
+        let mut batch = BatchedCommandBuffer::new(self.ctx.clone())?;
+        self.fused_adamw_step(&mut batch, desc)?;
+        batch.execute()
+    }
+
     /// Fused cross-entropy via [`FusedCrossEntropy::forward_dyn`].
     ///
     /// The trait provides `logits: &dyn AsMetalBuffer` to support both f32

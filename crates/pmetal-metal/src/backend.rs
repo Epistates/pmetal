@@ -140,12 +140,15 @@ impl BackendCaps {
     /// Handles large GEMM shapes with NAX acceleration. Routes decode (M=1)
     /// and unaligned K back to Metal 3.
     ///
-    /// # Wired MPP operations (Task 18)
+    /// # Wired MPP operations
     ///
     /// The following flags are `true` because the corresponding trait methods
     /// in [`Metal4Backend`] now dispatch through MPP kernel structs:
     ///
-    /// - `has_swiglu`: `MppFusedSwiGLU` (no-LoRA path; LoRA falls back to Metal 3)
+    /// - `has_gemm`: `MppGemm` (large prefill / training shapes)
+    /// - `has_quantized_gemm`: `MppQuantizedGemm` via `fused_adamw_step_standalone`
+    /// - `has_swiglu`: `MppFusedSwiGLU` (base and LoRA paths both use MPP kernels)
+    /// - `has_adamw`: `MppFusedAdamW` via `fused_adamw_step_standalone`
     /// - `has_cross_entropy`: `MppFusedCrossEntropy`
     /// - `has_rope`: `MppFusedRoPE`
     /// - `has_distill`: `MppFusedDistill`
@@ -154,24 +157,24 @@ impl BackendCaps {
     /// - `has_dw_gemm`: `MppDwGemm`
     ///
     /// The following remain `false` because their MPP APIs are structurally
-    /// incompatible with the trait's parameter model (see `backend.rs` doc):
+    /// incompatible with the trait's parameter model:
     ///
-    /// - `has_adamw`: `BatchedCommandBuffer` vs MPP's own-command-buffer model
     /// - `has_moe`: quantized u32 weights vs MPP's dense fp16 weights
     /// - `has_grouped_gemm`: GPU-side prefix-sum buffer, no CPU read
     pub const fn metal4() -> Self {
         Self {
             name: "Metal4",
             has_gemm: true,
-            // Quantized GEMM path (mpp_quantized.rs) is wired in Task 12.
-            // Leaving false while Metal3Backend's quantized_gemm() may panic.
-            has_quantized_gemm: false,
-            has_flash_attention: false,
+            // Wired: MppQuantizedGemm dispatched directly from quantized_gemm().
+            has_quantized_gemm: true,
+            // Wired: MPP forward (MppFlashAttention) and backward (MppFlashAttentionBackward).
+            // D=128 causal backward uses native MPP kernels; other dims fall back to Metal 3.
+            has_flash_attention: true,
             has_mpp_flash_attention: true,
-            // Wired: MppFusedSwiGLU (no-LoRA path only; LoRA falls back).
+            // Wired: MppFusedSwiGLU (LoRA path now uses MPP variant).
             has_swiglu: true,
-            // Fallback: BatchedCommandBuffer vs MPP own-command-buffer model.
-            has_adamw: false,
+            // Wired: MppFusedAdamW via fused_adamw_step_standalone().
+            has_adamw: true,
             // Wired: MppFusedCrossEntropy.
             has_cross_entropy: true,
             // Wired: MppFusedRoPE.
@@ -559,6 +562,35 @@ pub trait KernelBackend: Send + Sync {
         batch: &mut BatchedCommandBuffer,
         desc: &AdamWDescriptor<'_>,
     ) -> Result<()>;
+
+    /// Execute a fused AdamW optimizer step, creating its own command buffer.
+    ///
+    /// Unlike [`fused_adamw_step`], this method does not require an existing
+    /// [`BatchedCommandBuffer`]. It creates a temporary command buffer internally,
+    /// executes the step synchronously, and waits for completion before returning.
+    ///
+    /// # When to use
+    ///
+    /// Use this method from backends (like [`Metal4Backend`]) that cannot encode
+    /// into a shared [`BatchedCommandBuffer`] because their MPP dispatch model
+    /// owns its own command buffer per call.
+    ///
+    /// Metal 3 callers should prefer [`fused_adamw_step`] for batching efficiency.
+    ///
+    /// [`fused_adamw_step`]: KernelBackend::fused_adamw_step
+    /// [`Metal4Backend`]: crate::metal4::backend::Metal4Backend
+    fn fused_adamw_step_standalone(
+        &self,
+        ctx: &Arc<MetalContext>,
+        desc: &AdamWDescriptor<'_>,
+    ) -> Result<()> {
+        // Default: fall through to error — backends that support this override it.
+        let _ = ctx;
+        let _ = desc;
+        Err(crate::error::MetalError::ExecutionFailed(
+            "fused_adamw_step_standalone not implemented for this backend".into(),
+        ))
+    }
 
     /// Fused cross-entropy loss forward pass.
     ///

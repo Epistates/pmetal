@@ -2,9 +2,9 @@
 
 //! Metal 4 / MPP FlashAttention dispatch.
 //!
-//! This is an Apple10/M5-only forward-path wrapper over
-//! `metal4/mpp_flash_attention.metal`. The current shader contract supports
-//! fp16 attention with `head_dim = 64`, `80`, `96`, or `128` for causal and non-causal inference.
+//! This is an Apple10/M5-only wrapper over `metal4/mpp_flash_attention.metal`.
+//! It covers both the forward pass and the backward pass (dQ and dKV kernels).
+//! Supported `head_dim` values: `64`, `80`, `96`, and `128` (causal and non-causal).
 
 use std::ptr::NonNull;
 use std::sync::Arc;
@@ -282,6 +282,175 @@ impl MppFlashAttention {
     }
 }
 
+// =============================================================================
+// Backward pass
+// =============================================================================
+
+/// Output from MPP FlashAttention backward pass.
+#[derive(Debug)]
+pub struct MppFlashAttentionBwdOutput {
+    /// Gradient w.r.t. queries: `[batch, num_heads, query_seq_len, head_dim]` fp16.
+    pub d_queries: MetalBuffer<f16>,
+    /// Gradient w.r.t. keys: `[batch, num_kv_heads, kv_seq_len, head_dim]` fp16.
+    pub d_keys: MetalBuffer<f16>,
+    /// Gradient w.r.t. values: `[batch, num_kv_heads, kv_seq_len, head_dim]` fp16.
+    pub d_values: MetalBuffer<f16>,
+}
+
+/// Select the backward kernel names for dQ and dKV given a config.
+///
+/// Currently only D=128 causal is fully implemented via MPP kernels.
+/// Returns `None` for configurations that should fall back to Metal 3.
+fn bwd_kernel_names(config: &MppFlashAttentionConfig) -> Option<(&'static str, &'static str)> {
+    match (config.head_dim, config.is_causal) {
+        (128, true) => Some((
+            "mpp_flash_attention_bwd_dq_d128_causal",
+            "mpp_flash_attention_bwd_dkv_d128_causal",
+        )),
+        _ => None,
+    }
+}
+
+/// Metal 4 / MPP FlashAttention backward dispatcher.
+///
+/// Dispatches `mpp_flash_attention_bwd_dq_d128_causal` and
+/// `mpp_flash_attention_bwd_dkv_d128_causal` from
+/// `metal4/mpp_flash_attention.metal`.
+///
+/// Falls back gracefully (returns `None`) for head dimensions other than 128
+/// or non-causal configurations, allowing the caller to route those to Metal 3.
+pub struct MppFlashAttentionBackward {
+    ctx: Arc<MetalContext>,
+    config: MppFlashAttentionConfig,
+}
+
+impl MppFlashAttentionBackward {
+    /// Create a new backward dispatcher.
+    pub fn new(ctx: Arc<MetalContext>, config: MppFlashAttentionConfig) -> Result<Self> {
+        validate_config(&config)?;
+        Ok(Self { ctx, config })
+    }
+
+    /// Whether this device and config can execute the MPP backward kernels.
+    pub fn is_available(&self) -> bool {
+        self.ctx.properties().has_nax()
+            && self.ctx.pipeline_cache().metal4_library().is_some()
+            && bwd_kernel_names(&self.config).is_some()
+    }
+
+    /// Run both dQ and dKV backward kernels synchronously.
+    ///
+    /// Returns `Ok(Some(output))` when the MPP path ran, or `Ok(None)` when
+    /// the config is unsupported and the caller should fall back to Metal 3.
+    pub fn backward(
+        &self,
+        queries: &MetalBuffer<f16>,
+        keys: &MetalBuffer<f16>,
+        values: &MetalBuffer<f16>,
+        output: &MetalBuffer<f16>,
+        d_output: &MetalBuffer<f16>,
+        logsumexp: &MetalBuffer<f32>,
+    ) -> Result<Option<MppFlashAttentionBwdOutput>> {
+        if !self.ctx.properties().has_nax()
+            || self.ctx.pipeline_cache().metal4_library().is_none()
+        {
+            return Ok(None);
+        }
+        let Some((dq_name, dkv_name)) = bwd_kernel_names(&self.config) else {
+            return Ok(None);
+        };
+
+        validate_input_sizes(&self.config, queries, keys, values)?;
+
+        let q_size  = self.config.batch_size * self.config.num_heads    * self.config.query_seq_len * self.config.head_dim;
+        let kv_size = self.config.batch_size * self.config.num_kv_heads * self.config.kv_seq_len   * self.config.head_dim;
+
+        let d_queries = MetalBuffer::<f16>::zeros(&self.ctx, q_size,  BufferUsage::Shared)?;
+        let d_keys    = MetalBuffer::<f16>::zeros(&self.ctx, kv_size, BufferUsage::Shared)?;
+        let d_values  = MetalBuffer::<f16>::zeros(&self.ctx, kv_size, BufferUsage::Shared)?;
+
+        let params = FlashAttentionParams {
+            batch_size:     self.config.batch_size     as u32,
+            num_heads:      self.config.num_heads      as u32,
+            num_kv_heads:   self.config.num_kv_heads   as u32,
+            query_seq_len:  self.config.query_seq_len  as u32,
+            kv_seq_len:     self.config.kv_seq_len     as u32,
+            head_dim:       self.config.head_dim       as u32,
+            scale:          self.config.scaling_factor(),
+            block_q:        32,
+            block_k:        32,
+            gqa_ratio:      self.config.gqa_ratio()    as u32,
+            is_causal:      self.config.is_causal      as u32,
+            sliding_window: self.config.sliding_window.unwrap_or(0) as u32,
+            softcap:        self.config.softcap.unwrap_or(0.0),
+        };
+
+        // --- dQ kernel: grid = [num_q_blocks, num_heads, batch_size] --------
+        let dq_grid = objc2_metal::MTLSize {
+            width:  self.config.query_seq_len.div_ceil(32),
+            height: self.config.num_heads,
+            depth:  self.config.batch_size,
+        };
+        let tg_size = objc2_metal::MTLSize { width: 32, height: 4, depth: 1 };
+
+        let q_buf   = queries.metal_buffer();
+        let k_buf   = keys.metal_buffer();
+        let v_buf   = values.metal_buffer();
+        let o_buf   = output.metal_buffer();
+        let do_buf  = d_output.metal_buffer();
+        let lse_buf = logsumexp.metal_buffer();
+        let dq_buf  = d_queries.metal_buffer();
+        let dk_buf  = d_keys.metal_buffer();
+        let dv_buf  = d_values.metal_buffer();
+
+        let cmd_dq = encode_mpp_kernel(&self.ctx, dq_name, dq_grid, tg_size, |enc| unsafe {
+            enc.setBuffer_offset_atIndex(Some(q_buf),   0, 0);
+            enc.setBuffer_offset_atIndex(Some(k_buf),   0, 1);
+            enc.setBuffer_offset_atIndex(Some(v_buf),   0, 2);
+            enc.setBuffer_offset_atIndex(Some(o_buf),   0, 3);
+            enc.setBuffer_offset_atIndex(Some(do_buf),  0, 4);
+            enc.setBuffer_offset_atIndex(Some(lse_buf), 0, 5);
+            enc.setBuffer_offset_atIndex(Some(dq_buf),  0, 6);
+            let params_ptr = NonNull::from(&params).cast();
+            enc.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 7);
+        })?;
+        cmd_dq.waitUntilCompleted();
+        if let Some(err) = cmd_dq.error() {
+            return Err(MetalError::ExecutionFailed(format!("dQ kernel: {err}")));
+        }
+
+        // --- dKV kernel: grid = [num_kv_blocks, num_kv_heads, batch_size] ---
+        let dkv_grid = objc2_metal::MTLSize {
+            width:  self.config.kv_seq_len.div_ceil(32),
+            height: self.config.num_kv_heads,
+            depth:  self.config.batch_size,
+        };
+
+        let cmd_dkv = encode_mpp_kernel(&self.ctx, dkv_name, dkv_grid, tg_size, |enc| unsafe {
+            enc.setBuffer_offset_atIndex(Some(q_buf),   0, 0);
+            enc.setBuffer_offset_atIndex(Some(k_buf),   0, 1);
+            enc.setBuffer_offset_atIndex(Some(v_buf),   0, 2);
+            enc.setBuffer_offset_atIndex(Some(o_buf),   0, 3);
+            enc.setBuffer_offset_atIndex(Some(do_buf),  0, 4);
+            enc.setBuffer_offset_atIndex(Some(lse_buf), 0, 5);
+            enc.setBuffer_offset_atIndex(Some(dk_buf),  0, 6);
+            enc.setBuffer_offset_atIndex(Some(dv_buf),  0, 7);
+            let params_ptr = NonNull::from(&params).cast();
+            enc.setBytes_length_atIndex(params_ptr, std::mem::size_of_val(&params), 8);
+        })?;
+        cmd_dkv.waitUntilCompleted();
+        if let Some(err) = cmd_dkv.error() {
+            return Err(MetalError::ExecutionFailed(format!("dKV kernel: {err}")));
+        }
+
+        Ok(Some(MppFlashAttentionBwdOutput {
+            d_queries,
+            d_keys,
+            d_values,
+        }))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +567,33 @@ mod tests {
         d80.head_dim = 80;
         assert_eq!(d80.output_size(), 8 * 32 * 80);
         assert_eq!(d80.logsumexp_size(), 8 * 32);
+    }
+
+    // --- Backward dispatch tests ---
+
+    #[test]
+    fn mpp_flash_attention_bwd_kernel_names_d128_causal() {
+        let config = test_config(); // head_dim=128, is_causal=true
+        let names = bwd_kernel_names(&config);
+        assert!(names.is_some());
+        let (dq, dkv) = names.unwrap();
+        assert_eq!(dq, "mpp_flash_attention_bwd_dq_d128_causal");
+        assert_eq!(dkv, "mpp_flash_attention_bwd_dkv_d128_causal");
+    }
+
+    #[test]
+    fn mpp_flash_attention_bwd_kernel_names_none_for_non_causal() {
+        let mut config = test_config();
+        config.is_causal = false;
+        // Non-causal D=128 does not have an MPP backward kernel yet.
+        assert!(bwd_kernel_names(&config).is_none());
+    }
+
+    #[test]
+    fn mpp_flash_attention_bwd_kernel_names_none_for_d64() {
+        let mut config = test_config();
+        config.head_dim = 64;
+        // D=64 backward not yet wired.
+        assert!(bwd_kernel_names(&config).is_none());
     }
 }

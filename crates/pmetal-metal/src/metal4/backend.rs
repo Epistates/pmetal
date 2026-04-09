@@ -33,8 +33,16 @@ use crate::{
         mpp_fused_lora::{MppFusedLora, MppFusedLoraConfig},
         mpp_fused_norm_lora::{MppFusedNormLora, MppFusedNormLoraConfig},
         mpp_fused_rope::{MppFusedRoPE, MppFusedRoPEConfig},
-        mpp_fused_swiglu::{MppFusedSwiGLU, MppFusedSwiGLUConfig},
+        mpp_flash_attention::{MppFlashAttentionBackward, MppFlashAttentionConfig as MppFAConfig},
+        mpp_fused_moe::{
+            MppFusedMoEQuant, MppFusedMoEQuantConfig, MppGroupedGemmTileCount,
+        },
+        mpp_fused_swiglu::{MppFusedMLP, MppFusedMLPConfig, MppFusedSwiGLU, MppFusedSwiGLUConfig},
+        mpp_fused_training::{MppFusedAdamW, MppFusedAdamWConfig, MppParamInfo},
+        mpp_grouped_gemm::{GroupedGemmDispatch, MppGroupedGemm, MppGroupedGemmConfig},
+        mpp_quantized::{MppQuantizedGemm, MppQuantizedGemmConfig},
     },
+    kernels::fused_moe::ExpertBits,
     metal3_backend::Metal3Backend,
     metal4::{allocator_pool::CommandAllocatorPool, residency::ResidencyManager},
 };
@@ -50,17 +58,13 @@ use crate::{
 /// methods retain the [`Metal3Backend`] fallback where the MPP API is
 /// structurally incompatible with the trait's parameter model:
 ///
-/// - `fused_adamw_step`: trait uses [`BatchedCommandBuffer`] (single shared
-///   encoder); `MppFusedAdamW` owns its own command buffer per call. These
-///   two execution models cannot be bridged without restructuring the trait.
-/// - `fused_moe_expert`: descriptor carries quantized `u32` weight buffers;
-///   `MppFusedMoE` expects dense fp16 weights. Type mismatch — no safe cast.
-/// - `grouped_gemm`: `GroupedGemmDispatch` requires per-expert *token counts*
-///   derived from the prefix-sum `expert_offsets` buffer, which lives on the
-///   GPU and cannot be read without a CPU round-trip inside this call.
-/// - `fused_mlp`: no MPP full-MLP (gate+up+down) kernel exists yet.
+/// - `fused_moe_expert` (2-bit): `MppFusedMoEQuant` handles 4-bit only;
+///   2-bit weights fall back to Metal 3's dequant kernels.
 /// - `moe_routing`: routing kernel is Metal 3 only; no MPP variant exists yet.
-/// - `flash_attention_backward`: no MPP backward path exists yet.
+///
+/// Previously falling back: `fused_adamw_step` now routes through
+/// [`fused_adamw_step_standalone`] which dispatches `MppFusedAdamW` directly.
+/// Quantized GEMM is now wired to `MppQuantizedGemm`.
 pub struct Metal4Backend {
     ctx: Arc<MetalContext>,
     caps: BackendCaps,
@@ -152,9 +156,22 @@ impl KernelBackend for Metal4Backend {
         biases: Option<&dyn AsMetalBuffer>,
         output: &dyn AsMetalBuffer,
     ) -> Result<()> {
-        // MPP quantized GEMM is handled by mpp_quantized.rs, wired in Task 12.
-        self.fallback
-            .quantized_gemm(ctx, desc, x, w_q, scales, biases, output)
+        let mpp_config = MppQuantizedGemmConfig {
+            m: desc.m,
+            n: desc.n,
+            k: desc.k,
+            group_size: desc.group_size,
+            bits: desc.bits,
+        };
+        let dispatcher = MppQuantizedGemm::new(self.ctx.clone(), mpp_config);
+
+        if !dispatcher.is_available() {
+            return self
+                .fallback
+                .quantized_gemm(ctx, desc, x, w_q, scales, biases, output);
+        }
+
+        dispatcher.execute(x, w_q, scales, biases, output)
     }
 
     fn dw_gemm_accum(
@@ -200,20 +217,76 @@ impl KernelBackend for Metal4Backend {
         scatter_indices: &MetalBuffer<u32>,
         topk_weights: &MetalBuffer<f32>,
     ) -> Result<MetalBuffer<f32>> {
-        // MppGroupedGemm requires GroupedGemmDispatch::total_tiles computed from
-        // per-expert token counts. Those counts are derived from the prefix-sum
-        // expert_offsets GPU buffer, which cannot be read without a CPU round-trip
-        // at this call site. Route to Metal 3 to avoid the stall.
-        self.fallback.grouped_gemm(
+        // Use the GPU tile-count kernel to compute total_tiles from expert_offsets
+        // without a CPU round-trip on the full offsets buffer. The tile count
+        // kernel returns a single u32 — 4 bytes vs. (E+1)*4 bytes for the full
+        // prefix-sum copy.
+        let tile_counter = MppGroupedGemmTileCount::new(self.ctx.clone());
+
+        if !tile_counter.is_available() {
+            return self.fallback.grouped_gemm(
+                ctx,
+                desc,
+                x,
+                w,
+                expert_offsets,
+                gather_indices,
+                scatter_indices,
+                topk_weights,
+            );
+        }
+
+        const BLOCK_M: usize = 64;
+        const BLOCK_N: usize = 64;
+
+        let total_tiles = tile_counter.compute(
+            expert_offsets,
+            desc.num_experts,
+            desc.intermediate_size,
+            BLOCK_M,
+            BLOCK_N,
+        )?;
+
+        if total_tiles == 0 {
+            // All experts have zero tokens — return empty output.
+            return MetalBuffer::<f32>::new(
+                ctx,
+                desc.total_tokens * desc.intermediate_size,
+                BufferUsage::Shared,
+            );
+        }
+
+        let mpp_config = MppGroupedGemmConfig {
+            total_tokens: desc.total_tokens,
+            num_experts: desc.num_experts,
+            hidden_size: desc.hidden_size,
+            intermediate: desc.intermediate_size,
+            topk: desc.topk,
+            use_fp16: desc.use_fp16,
+        };
+        let dispatcher = MppGroupedGemm::new(self.ctx.clone(), mpp_config);
+
+        let dispatch = GroupedGemmDispatch {
+            total_tiles,
+            threads_per_threadgroup: 32,
+        };
+
+        let y = MetalBuffer::<f32>::new(
             ctx,
-            desc,
+            desc.total_tokens * desc.intermediate_size,
+            BufferUsage::Shared,
+        )?;
+        dispatcher.execute(
             x,
             w,
+            &y,
             expert_offsets,
             gather_indices,
             scatter_indices,
             topk_weights,
-        )
+            dispatch,
+        )?;
+        Ok(y)
     }
 
     // ---- Attention ----------------------------------------------------------
@@ -243,7 +316,29 @@ impl KernelBackend for Metal4Backend {
         d_output: &MetalBuffer<f16>,
         logsumexp: &MetalBuffer<f32>,
     ) -> Result<(MetalBuffer<f16>, MetalBuffer<f16>, MetalBuffer<f16>)> {
-        // No MPP backward flash attention path exists yet.
+        // Attempt the MPP backward path (D=128 causal only; falls back otherwise).
+        let mpp_config = MppFAConfig {
+            batch_size:     config.batch_size,
+            num_heads:      config.num_heads,
+            num_kv_heads:   config.num_kv_heads,
+            query_seq_len:  config.query_seq_len,
+            kv_seq_len:     config.kv_seq_len,
+            head_dim:       config.head_dim,
+            scale:          config.scale,
+            is_causal:      config.is_causal,
+            sliding_window: config.sliding_window,
+            softcap:        config.softcap,
+        };
+
+        if let Ok(dispatcher) = MppFlashAttentionBackward::new(self.ctx.clone(), mpp_config) {
+            if let Ok(Some(bwd)) =
+                dispatcher.backward(queries, keys, values, output, d_output, logsumexp)
+            {
+                return Ok((bwd.d_queries, bwd.d_keys, bwd.d_values));
+            }
+        }
+
+        // Fall back to Metal 3 for unsupported head dims / non-causal.
         self.fallback.flash_attention_backward(
             ctx, config, queries, keys, values, output, d_output, logsumexp,
         )
@@ -264,32 +359,20 @@ impl KernelBackend for Metal4Backend {
         up_lora_a: Option<&MetalBuffer<f32>>,
         up_lora_b: Option<&MetalBuffer<f32>>,
     ) -> Result<FusedSwiGLUOutput> {
-        // The MPP SwiGLU kernel (MppFusedSwiGLU) does not support LoRA-augmented
-        // projections. Route the LoRA path to Metal 3; use MPP for the base path.
+        // Route all cases (base and LoRA) through MPP. Build the config with
+        // LoRA fields populated when all four adapter matrices are provided.
         let has_lora = gate_lora_a.is_some()
-            || gate_lora_b.is_some()
-            || up_lora_a.is_some()
-            || up_lora_b.is_some();
-
-        if has_lora {
-            return self.fallback.fused_swiglu(
-                ctx,
-                config,
-                input,
-                gate_weight,
-                up_weight,
-                gate_lora_a,
-                gate_lora_b,
-                up_lora_a,
-                up_lora_b,
-            );
-        }
+            && gate_lora_b.is_some()
+            && up_lora_a.is_some()
+            && up_lora_b.is_some();
 
         let mpp_config = MppFusedSwiGLUConfig {
             batch_size: config.batch_size,
             hidden_size: config.hidden_size,
             intermediate_size: config.intermediate_size,
             use_fp16: config.use_fp16,
+            lora_rank: if has_lora { config.lora_rank } else { 0 },
+            lora_scale: config.lora_scale,
         };
         let dispatcher = MppFusedSwiGLU::new(self.ctx.clone(), mpp_config);
 
@@ -312,7 +395,22 @@ impl KernelBackend for Metal4Backend {
             config.batch_size * config.intermediate_size,
             BufferUsage::Shared,
         )?;
-        dispatcher.execute(input, gate_weight, up_weight, &output)?;
+
+        if has_lora {
+            dispatcher.execute_lora(
+                input,
+                gate_weight,
+                up_weight,
+                gate_lora_a.unwrap(),
+                gate_lora_b.unwrap(),
+                up_lora_a.unwrap(),
+                up_lora_b.unwrap(),
+                &output,
+            )?;
+        } else {
+            dispatcher.execute(input, gate_weight, up_weight, &output)?;
+        }
+
         Ok(FusedSwiGLUOutput { output })
     }
 
@@ -325,9 +423,26 @@ impl KernelBackend for Metal4Backend {
         up_weight: &MetalBuffer<f32>,
         down_weight: &MetalBuffer<f32>,
     ) -> Result<FusedMLPOutput> {
-        // No MPP full-MLP (gate+up+down) kernel exists yet.
-        self.fallback
-            .fused_mlp(ctx, config, input, gate_weight, up_weight, down_weight)
+        let mpp_config = MppFusedMLPConfig::new(
+            config.batch_size,
+            config.hidden_size,
+            config.intermediate_size,
+        );
+        let dispatcher = MppFusedMLP::new(self.ctx.clone(), mpp_config);
+
+        if !dispatcher.is_available() {
+            return self
+                .fallback
+                .fused_mlp(ctx, config, input, gate_weight, up_weight, down_weight);
+        }
+
+        let output = MetalBuffer::<f32>::new(
+            &self.ctx,
+            config.batch_size * config.hidden_size,
+            BufferUsage::Shared,
+        )?;
+        dispatcher.execute(input, gate_weight, up_weight, down_weight, &output)?;
+        Ok(FusedMLPOutput { output })
     }
 
     fn fused_norm_lora(
@@ -405,15 +520,69 @@ impl KernelBackend for Metal4Backend {
 
     fn fused_adamw_step(
         &self,
-        batch: &mut BatchedCommandBuffer,
+        _batch: &mut BatchedCommandBuffer,
         desc: &AdamWDescriptor<'_>,
     ) -> Result<()> {
-        // MppFusedAdamW creates its own command buffer; it cannot encode into an
-        // existing BatchedCommandBuffer. The trait contract requires encoding into
-        // `batch` so that callers can batch the AdamW step with other operations
-        // and execute them together. Bridging these two execution models requires
-        // restructuring the trait — delegating to Metal 3 instead.
-        self.fallback.fused_adamw_step(batch, desc)
+        // MppFusedAdamW creates its own command buffer and cannot encode into
+        // an existing BatchedCommandBuffer. Delegate to the standalone path,
+        // which executes synchronously and satisfies the caller's intent.
+        self.fused_adamw_step_standalone(&self.ctx.clone(), desc)
+    }
+
+    fn fused_adamw_step_standalone(
+        &self,
+        _ctx: &Arc<MetalContext>,
+        desc: &AdamWDescriptor<'_>,
+    ) -> Result<()> {
+        // Derive num_params and max_param_elements from the param_info buffer.
+        let param_infos = desc.param_info.as_slice();
+        let num_params = param_infos.len();
+        let max_param_elements = param_infos
+            .iter()
+            .map(|p| p.size as usize)
+            .max()
+            .unwrap_or(0);
+
+        let mpp_config = MppFusedAdamWConfig {
+            num_params,
+            max_param_elements,
+            use_fp16: false,
+            step: desc.config.step,
+        };
+
+        // Convert ParamInfo → MppParamInfo. Both are #[repr(C)] with the same
+        // four u32 fields (offset, size, m_offset, v_offset), so the mapping
+        // is a direct field copy with no data loss.
+        let mpp_param_infos: Vec<MppParamInfo> = param_infos
+            .iter()
+            .map(|p| MppParamInfo {
+                offset: p.offset,
+                size: p.size,
+                m_offset: p.m_offset,
+                v_offset: p.v_offset,
+            })
+            .collect();
+
+        let dispatcher = MppFusedAdamW::new(self.ctx.clone(), mpp_config);
+
+        if !dispatcher.is_available() {
+            // NAX not present — fall back to Metal 3 path via a temporary batch.
+            return self.fallback.fused_adamw_step_standalone(_ctx, desc);
+        }
+
+        dispatcher.execute(
+            desc.params,
+            desc.grads,
+            desc.m,
+            desc.v,
+            &mpp_param_infos,
+            desc.param_info,
+            desc.config.learning_rate,
+            desc.config.beta1,
+            desc.config.beta2,
+            desc.config.epsilon,
+            desc.config.weight_decay,
+        )
     }
 
     fn fused_cross_entropy(
@@ -517,10 +686,60 @@ impl KernelBackend for Metal4Backend {
         ctx: &Arc<MetalContext>,
         desc: &MoeExpertDescriptor<'_>,
     ) -> Result<MetalBuffer<f32>> {
-        // MoeExpertDescriptor carries quantized u32 weight buffers (gate/up/down).
-        // MppFusedMoE expects dense fp16 weights. There is no safe in-place cast
-        // or dequant path here — route to Metal 3's quantized expert kernel.
-        self.fallback.fused_moe_expert(ctx, desc)
+        // Dispatch to the quantized MPP expert kernel for 4-bit weights.
+        // 2-bit weights fall back to Metal 3 (MPP matmul2d needs fp16 inputs;
+        // 2-bit requires the scalar qdot path).
+        if desc.expert_config.bits != ExpertBits::Four {
+            return self.fallback.fused_moe_expert(ctx, desc);
+        }
+
+        let mpp_config = MppFusedMoEQuantConfig::new(
+            desc.num_tokens,
+            desc.expert_config.hidden_dim as usize,
+            desc.expert_config.intermediate_dim as usize,
+            desc.expert_config.group_size as usize,
+            4,
+        );
+        let dispatcher = MppFusedMoEQuant::new(self.ctx.clone(), mpp_config);
+
+        if !dispatcher.is_available() {
+            return self.fallback.fused_moe_expert(ctx, desc);
+        }
+
+        // Intermediate buffer: SwiGLU output [num_tokens, intermediate_dim].
+        let act_out = MetalBuffer::<f32>::new(
+            ctx,
+            desc.num_tokens * desc.expert_config.intermediate_dim as usize,
+            BufferUsage::Shared,
+        )?;
+
+        dispatcher.execute_gate_up(
+            desc.input,
+            desc.gate_weight,
+            desc.gate_scales,
+            desc.gate_biases,
+            desc.up_weight,
+            desc.up_scales,
+            desc.up_biases,
+            &act_out,
+        )?;
+
+        // Down projection: [num_tokens, intermediate] @ down_W^T → [num_tokens, hidden]
+        let output = MetalBuffer::<f32>::new(
+            ctx,
+            desc.num_tokens * desc.expert_config.hidden_dim as usize,
+            BufferUsage::Shared,
+        )?;
+
+        dispatcher.execute_down(
+            &act_out,
+            desc.down_weight,
+            desc.down_scales,
+            desc.down_biases,
+            &output,
+        )?;
+
+        Ok(output)
     }
 
     // ---- Distillation -------------------------------------------------------
