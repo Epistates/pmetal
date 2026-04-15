@@ -30,6 +30,10 @@ objc2-metal = { workspace = true }
 [dev-dependencies]
 serial_test = "3.2"
 tempfile = { workspace = true }
+# Pull in pmetal-mlx's `test-utils` feature so integration tests can reach
+# the shared parity helpers (`test_utils::*`). The feature is empty in
+# production builds, so there's no runtime impact.
+pmetal-mlx = { workspace = true, features = ["test-utils"] }
 
 [features]
 default = ["ane"]

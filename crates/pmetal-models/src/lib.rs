@@ -48,6 +48,9 @@
 #![allow(ambiguous_glob_reexports)]
 
 pub mod architectures;
+pub mod ddtree;
+pub mod dflash_decoder;
+pub mod dflash_native_target;
 pub mod dispatcher;
 pub mod expert_dequant;
 pub mod expert_io;

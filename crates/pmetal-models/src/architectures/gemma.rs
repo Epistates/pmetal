@@ -766,7 +766,21 @@ impl GemmaModel {
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, cache, None)
+    }
+
+    /// Forward pass with optional hidden-state capture for DFlash
+    /// speculative decoding. Identical to [`forward_with_cache`] when
+    /// `capture` is `None`. Applies the Gemma embedding scale before the
+    /// layer loop and mirrors the gemma1/gemma2 branching.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         // Get embeddings and scale
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
@@ -783,16 +797,28 @@ impl GemmaModel {
             mask
         };
 
-        // Pass through transformer layers
+        // Pass through transformer layers — gemma1 and gemma2 keep their
+        // layer vecs in separate Option slots, so we mirror the branching
+        // here.
         if let Some(ref mut layers) = self.layers.gemma1 {
             for (idx, layer) in layers.iter_mut().enumerate() {
                 let c = cache.as_deref_mut().map(|c| (c, idx));
                 hidden_states = layer.forward_with_cache(&hidden_states, mask, c)?;
+                if let Some(buf) = capture.as_deref_mut()
+                    && buf.wants_hidden_for(idx)
+                {
+                    buf.record_hidden(idx, hidden_states.clone());
+                }
             }
         } else if let Some(ref mut layers) = self.layers.gemma2 {
             for (idx, layer) in layers.iter_mut().enumerate() {
                 let c = cache.as_deref_mut().map(|c| (c, idx));
                 hidden_states = layer.forward_with_cache(&hidden_states, mask, c)?;
+                if let Some(buf) = capture.as_deref_mut()
+                    && buf.wants_hidden_for(idx)
+                {
+                    buf.record_hidden(idx, hidden_states.clone());
+                }
             }
         }
 
@@ -831,6 +857,21 @@ impl GemmaForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
         // Gemma always ties embeddings
+        Ok(self.model.embed_tokens.as_linear(&hidden_states))
+    }
+
+    /// Forward pass that records hidden states into a DFlash capture
+    /// buffer at every tapped layer index.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<Array, Exception> {
+        let hidden_states =
+            self.model
+                .forward_with_capture(input_ids, mask, cache, Some(capture))?;
         Ok(self.model.embed_tokens.as_linear(&hidden_states))
     }
 

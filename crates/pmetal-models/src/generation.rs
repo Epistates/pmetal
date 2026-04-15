@@ -686,7 +686,7 @@ impl GenerationConfig {
 }
 
 /// Output from text generation.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct GenerationOutput {
     /// Generated token IDs (including prompt).
     pub token_ids: Vec<u32>,
@@ -696,6 +696,12 @@ pub struct GenerationOutput {
     pub stopped_by_token: bool,
     /// Whether generation stopped due to max length.
     pub stopped_by_length: bool,
+    /// Per-step decode timing, populated by `generate_cached_async_streaming`.
+    /// The native path on `inference_runner` also produces the same struct
+    /// via `pmetal_bridge::decode::DecodeMetrics`, which is what the CLI
+    /// summary print ingests — keeping the shape identical keeps the stats
+    /// display DRY across both paths.
+    pub decode_metrics: Option<pmetal_bridge::decode::DecodeMetrics>,
 }
 
 /// Sampler for token generation.
@@ -1451,6 +1457,7 @@ where
                 num_generated,
                 stopped_by_token: true,
                 stopped_by_length: false,
+                decode_metrics: None,
             });
         }
 
@@ -1463,6 +1470,7 @@ where
         num_generated,
         stopped_by_token: false,
         stopped_by_length: true,
+        decode_metrics: None,
     })
 }
 
@@ -1521,6 +1529,7 @@ where
             num_generated,
             stopped_by_token: true,
             stopped_by_length: false,
+            decode_metrics: None,
         });
     }
 
@@ -1550,6 +1559,7 @@ where
                 num_generated,
                 stopped_by_token: true,
                 stopped_by_length: false,
+                decode_metrics: None,
             });
         }
 
@@ -1562,6 +1572,7 @@ where
         num_generated,
         stopped_by_token: false,
         stopped_by_length: true,
+        decode_metrics: None,
     })
 }
 
@@ -1700,6 +1711,7 @@ where
                 num_generated,
                 stopped_by_token: true,
                 stopped_by_length: false,
+                decode_metrics: None,
             });
         }
 
@@ -1728,6 +1740,7 @@ where
         num_generated,
         stopped_by_token: false,
         stopped_by_length: true,
+        decode_metrics: None,
     })
 }
 
@@ -1753,6 +1766,11 @@ where
     let sampler = Sampler::new(config.clone());
     let prompt_len = input_ids.len();
 
+    // Per-step decode latencies in nanoseconds. The first step (n=0) is
+    // dropped as warmup — it includes prefill fallout that skews the
+    // tokens-per-second number. See `build_decode_metrics` below.
+    let mut step_ns: Vec<u128> = Vec::with_capacity(config.max_new_tokens);
+
     let extract_logits = |logits: &Array| -> Array {
         let last_idx = logits.dim(1) - 1;
         select_axis(logits, last_idx, 1)
@@ -1772,6 +1790,7 @@ where
     let mut n = 0;
 
     loop {
+        let step_start = std::time::Instant::now();
         let next_pair = if n + 1 < config.max_new_tokens {
             let (y, lp) = {
                 let _stream_ctx = StreamContext::new(&generation_stream);
@@ -1782,10 +1801,6 @@ where
                 let next_logits = select_axis(&next_output, 0, 1);
                 sampler.sample_array(&next_logits)?
             };
-            if n > 0 && n <= 3 {
-                let nodes = pmetal_bridge::inline_array::graph_node_count(&y);
-                eprintln!("[gen {n}] graph nodes: {nodes}");
-            }
             async_eval([&y, &lp]);
             Some((y, lp))
         } else {
@@ -1801,6 +1816,10 @@ where
         }
 
         let token = current_y.item::<u32>();
+        // End of this decode step (we've materialised the token). Record
+        // the timing before the callback fires so stream-print latency
+        // doesn't contaminate the metric.
+        step_ns.push(step_start.elapsed().as_nanos());
 
         if sampler.is_stop_token(token) {
             let num_generated = all_tokens.len() - prompt_len;
@@ -1809,6 +1828,7 @@ where
                 num_generated,
                 stopped_by_token: true,
                 stopped_by_length: false,
+                decode_metrics: build_decode_metrics(&step_ns),
             });
         }
 
@@ -1822,6 +1842,7 @@ where
                 num_generated,
                 stopped_by_token: false,
                 stopped_by_length: false,
+                decode_metrics: build_decode_metrics(&step_ns),
             });
         }
 
@@ -1845,6 +1866,39 @@ where
         num_generated,
         stopped_by_token: false,
         stopped_by_length: true,
+        decode_metrics: build_decode_metrics(&step_ns),
+    })
+}
+
+/// Compute a [`DecodeMetrics`] summary from raw per-step latencies (ns).
+///
+/// Drops the first step as warmup (it covers prefill fall-out / JIT caches)
+/// and returns `None` if fewer than 2 usable samples are available. The
+/// shape is identical to `pmetal_bridge::decode::DecodeMetrics` so the CLI
+/// summary print path works for both the native and dynamic-model routes.
+fn build_decode_metrics(step_ns: &[u128]) -> Option<pmetal_bridge::decode::DecodeMetrics> {
+    // n=0 is warmup (includes prefill fall-out / JIT caches).
+    let body = step_ns.get(1..)?;
+    if body.is_empty() {
+        return None;
+    }
+    let measured_steps = body.len();
+    let total_ns: u128 = body.iter().sum();
+    let avg_step_ms = (total_ns as f64 / measured_steps as f64) / 1_000_000.0;
+    let mut sorted: Vec<u128> = body.to_vec();
+    sorted.sort_unstable();
+    let p50_ns = sorted[measured_steps / 2];
+    let p50_step_ms = (p50_ns as f64) / 1_000_000.0;
+    let tok_per_sec = if total_ns > 0 {
+        measured_steps as f64 / (total_ns as f64 / 1_000_000_000.0)
+    } else {
+        0.0
+    };
+    Some(pmetal_bridge::decode::DecodeMetrics {
+        tok_per_sec,
+        avg_step_ms,
+        p50_step_ms,
+        measured_steps,
     })
 }
 
@@ -1995,6 +2049,7 @@ where
                 num_generated,
                 stopped_by_token: true,
                 stopped_by_length: false,
+                decode_metrics: None,
             });
         }
 
@@ -2050,6 +2105,7 @@ where
         num_generated,
         stopped_by_token: false,
         stopped_by_length: true,
+        decode_metrics: None,
     })
 }
 
@@ -2133,6 +2189,7 @@ where
                 num_generated,
                 stopped_by_token: true,
                 stopped_by_length: false,
+                decode_metrics: None,
             });
         }
 
@@ -2156,6 +2213,7 @@ where
         num_generated,
         stopped_by_token: false,
         stopped_by_length: true,
+        decode_metrics: None,
     })
 }
 
@@ -2264,6 +2322,7 @@ where
                 num_generated,
                 stopped_by_token: true,
                 stopped_by_length: false,
+                decode_metrics: None,
             });
         }
 
@@ -2288,6 +2347,7 @@ where
         num_generated,
         stopped_by_token: false,
         stopped_by_length: true,
+        decode_metrics: None,
     })
 }
 
@@ -2332,6 +2392,7 @@ fn build_cached_generation_output(
         stopped_by_length: !cancelled
             && !stopped_by_token
             && num_generated >= gen_config.max_new_tokens,
+        decode_metrics: None,
     }
 }
 

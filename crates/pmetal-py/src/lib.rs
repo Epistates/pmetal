@@ -9,6 +9,7 @@ use pyo3::prelude::*;
 mod array_bridge;
 mod callbacks;
 mod config;
+mod dflash;
 mod easy;
 pub(crate) mod error;
 pub(crate) mod hub;
@@ -43,6 +44,9 @@ fn pmetal(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Model
     m.add_class::<model::PyModel>()?;
+
+    // DFlash speculative decoder
+    m.add_class::<dflash::PyDFlashGenerator>()?;
 
     // Tokenizer
     m.add_class::<tokenizer::PyTokenizer>()?;

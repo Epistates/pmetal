@@ -1,6 +1,7 @@
 #[cfg(feature = "trainer")]
 pub(crate) mod bench;
 pub(crate) mod dataset;
+pub(crate) mod dflash;
 #[cfg(feature = "trainer")]
 pub(crate) mod distill;
 #[cfg(feature = "trainer")]

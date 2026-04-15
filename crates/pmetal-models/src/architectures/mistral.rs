@@ -455,7 +455,20 @@ impl MistralModel {
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, cache, None)
+    }
+
+    /// Forward pass with optional hidden-state capture for DFlash
+    /// speculative decoding. When `capture` is `None` this is the same
+    /// path as [`forward_with_cache`].
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         // Get embeddings
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
@@ -474,6 +487,11 @@ impl MistralModel {
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             let c = cache.as_deref_mut().map(|c| (c, idx));
             hidden_states = layer.forward_with_cache(&hidden_states, mask, c)?;
+            if let Some(buf) = capture.as_deref_mut()
+                && buf.wants_hidden_for(idx)
+            {
+                buf.record_hidden(idx, hidden_states.clone());
+            }
         }
 
         // Final norm
@@ -528,6 +546,25 @@ impl MistralForCausalLM {
             Module::forward(lm_head, &hidden_states)
         } else {
             // Tie weights: use embedding weight transposed
+            Ok(self.model.embed_tokens.as_linear(&hidden_states))
+        }
+    }
+
+    /// Forward pass that records hidden states for DFlash speculative
+    /// decoding at every layer index in `capture.requested_hidden_layers`.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<Array, Exception> {
+        let hidden_states =
+            self.model
+                .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+        if let Some(ref mut lm_head) = self.lm_head {
+            Module::forward(lm_head, &hidden_states)
+        } else {
             Ok(self.model.embed_tokens.as_linear(&hidden_states))
         }
     }

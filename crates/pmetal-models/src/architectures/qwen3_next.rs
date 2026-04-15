@@ -1433,6 +1433,88 @@ impl Qwen3NextGatedDeltaNet {
         )
     }
 
+    /// Same math as [`finish_forward_from_conv_out`] but writes
+    /// `(keys, values, g, beta, conv_input)` into the supplied
+    /// `SpecCapture` before running the recurrence, so a speculative
+    /// rollback can replay the state over the accepted prefix.
+    ///
+    /// `conv_input_qkv` is the pre-conv projection (the `qkv` local in
+    /// `forward_general_with_capture`) — that is the tensor
+    /// `MambaCacheEntry::rewind` needs to reconstruct the rolled-back
+    /// conv state.
+    #[allow(clippy::too_many_arguments)]
+    fn finish_forward_from_conv_out_capturing(
+        &mut self,
+        conv_out: &Array,
+        batch: i32,
+        seq_len: i32,
+        z: &Array,
+        a: &Array,
+        b_val: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut MambaCacheEntry>,
+        capture: Option<(usize, &mut pmetal_mlx::speculative::SpecCapture)>,
+        conv_input_qkv: &Array,
+        conv_kernel_size: usize,
+    ) -> Result<Array, Exception> {
+        // Split / reshape / Q-K norm exactly like the non-capturing variant.
+        let splits = ops::split_sections(conv_out, &[self.key_dim, self.key_dim * 2], -1);
+        let (q_conv, k_conv, v_conv) = (&splits[0], &splits[1], &splits[2]);
+        let q_conv = q_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim]);
+        let k_conv = k_conv.reshape(&[batch, seq_len, self.num_k_heads, self.head_k_dim]);
+        let v_conv = v_conv.reshape(&[batch, seq_len, self.num_v_heads, self.head_v_dim]);
+        let q_normed = pmetal_bridge::compat::fast::rms_norm(&q_conv, &self.q_norm_weight, 1e-6);
+        let k_normed = pmetal_bridge::compat::fast::rms_norm(&k_conv, &self.k_norm_weight, 1e-6);
+
+        // Compute g and beta OUTSIDE gated_delta_update so we can stash
+        // them in the capture — the internal implementation derives them
+        // from (a, b_val, a_log, dt_bias) on every call.
+        let beta = b_val.sigmoid();
+        let g = pmetal_mlx::kernels::compute_g(self.a_log.as_ref(), a, &self.dt_bias.as_ref())?;
+
+        // Record the rollback inputs before advancing the state.
+        if let Some((layer_idx, buf)) = capture {
+            let rec = pmetal_mlx::kv_cache::GdnVerifyInputs {
+                keys: k_normed.clone(),
+                values: v_conv.clone(),
+                g: g.clone(),
+                beta: beta.clone(),
+                conv_input: conv_input_qkv.clone(),
+                conv_kernel_size,
+            };
+            buf.record_gdn(layer_idx, rec);
+        }
+
+        let ssm_state_arr;
+        let ssm_state_ref: Option<&Array> = match cache.as_ref().and_then(|c| c.ssm_state.as_ref())
+        {
+            Some(s) => Some(s),
+            None => {
+                ssm_state_arr = pmetal_bridge::compat::ops::zeros_dtype(
+                    &[batch, self.num_v_heads, self.head_v_dim, self.head_k_dim],
+                    conv_out.dtype(),
+                );
+                Some(&ssm_state_arr)
+            }
+        };
+        let state_ref = ssm_state_ref.expect("ssm state ref initialized above");
+
+        // Use the inference dispatch with the pre-computed g/beta so the
+        // capture and the recurrence share the exact same tensors.
+        let (out, new_state) = pmetal_mlx::kernels::gated_delta_inference_dispatch(
+            &q_normed, &k_normed, &v_conv, &g, &beta, state_ref, mask,
+        )?;
+        if let Some(cache) = cache {
+            cache.ssm_state = Some(new_state);
+        }
+        let out = self.norm.forward(&out, Some(z))?;
+        if mask.is_none() && seq_len == 1 && self.hidden_size <= Self::DECODE_FLATTEN_MAX_HIDDEN {
+            self.decode_out_projection(&out, batch)
+        } else {
+            Ok(self.out_proj.forward(&out.reshape(&[batch, seq_len, -1])))
+        }
+    }
+
     fn finish_forward_from_conv_out(
         &mut self,
         conv_out: &Array,
@@ -1643,6 +1725,91 @@ impl Qwen3NextGatedDeltaNet {
             return self.forward_cached_decode(inputs, cache);
         }
         self.forward_general(inputs, mask, cache)
+    }
+
+    /// GDN forward that ALSO records the per-token inputs the GDN
+    /// recurrence saw, so a speculative-decoding rollback can replay the
+    /// state over a partially-accepted prefix.
+    ///
+    /// Always routes through the general (ops + Metal kernel) path — the
+    /// compiled decode fast-path (T=1) is not used during verify, which
+    /// by construction runs with `T = block_size >= 2`.
+    pub fn forward_with_capture(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut MambaCacheEntry>,
+        layer_idx: usize,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<Array, Exception> {
+        self.forward_general_with_capture(inputs, mask, cache, Some((layer_idx, capture)))
+    }
+
+    /// Internal helper: same math as `forward_general` but with an optional
+    /// capture slot. When `capture` is `None` this is a line-for-line copy
+    /// of `forward_general`; when it is `Some`, the per-token
+    /// `(keys, values, g, beta, conv_input)` tensors are stored into the
+    /// capture buffer immediately before `gated_delta_update` runs.
+    fn forward_general_with_capture(
+        &mut self,
+        inputs: &Array,
+        mask: Option<&Array>,
+        mut cache: Option<&mut MambaCacheEntry>,
+        capture: Option<(usize, &mut pmetal_mlx::speculative::SpecCapture)>,
+    ) -> Result<Array, Exception> {
+        if capture.is_none() {
+            return self.forward_general(inputs, mask, cache);
+        }
+        let shape = inputs.shape();
+        let b = shape[0];
+        let s = shape[1];
+
+        // Projection phase — same as `forward_general`, minus the
+        // decode_linear fast-paths (capture only runs with T > 1).
+        let qkv = self.in_proj_qkv.forward(inputs);
+        let z = self
+            .in_proj_z
+            .forward(inputs)
+            .reshape(&[b, s, self.num_v_heads, self.head_v_dim]);
+        let b_val = self.in_proj_b.forward(inputs);
+        let a = self.in_proj_a.forward(inputs);
+        let qkv = if let Some(mask) = mask {
+            let mask_expanded = mask.reshape(&[mask.dim(0), mask.dim(1), 1]);
+            ops::r#where(&mask_expanded, &qkv, &Array::from_f32(0.0))
+        } else {
+            qkv
+        };
+
+        // `qkv_for_capture` is the pre-conv projection the caller will
+        // need to rebuild conv_state on rollback.
+        let qkv_for_capture = qkv.clone();
+        let conv_kernel_size = self.conv_kernel_size as usize;
+
+        let conv_out = if let Some(cache_entry) = cache.as_deref_mut() {
+            let conv_input = cache_entry.update_conv_state(&qkv, self.conv_kernel_size)?;
+            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
+        } else {
+            let conv_state = pmetal_bridge::compat::ops::zeros_dtype(
+                &[b, self.conv_kernel_size - 1, self.conv_dim],
+                qkv.dtype(),
+            );
+            let conv_input = ops::concatenate_axis(&[&conv_state, &qkv], 1);
+            nn::silu(&Module::forward(&mut self.conv1d, &conv_input)?)
+        };
+
+        self.finish_forward_from_conv_out_capturing(
+            &conv_out,
+            b,
+            s,
+            &z,
+            &a,
+            &b_val,
+            mask,
+            cache,
+            capture,
+            &qkv_for_capture,
+            conv_kernel_size,
+        )
     }
 
     pub fn forward_profiled(
@@ -3004,6 +3171,38 @@ impl Qwen3NextDecoderLayer {
         Ok(h.add(&mlp_out))
     }
 
+    /// Speculative-verify forward: records GDN verify inputs into
+    /// `capture` for every linear-attention layer. Full-attention layers
+    /// (every 4th, see `Qwen3NextConfig::is_linear_layer`) run the plain
+    /// [`forward`] path — their KV cache rollback is just `KVCache::rollback`
+    /// and needs no extra per-token state.
+    pub fn forward_with_capture(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<(&mut KVCache, usize)>,
+        mamba_cache: Option<&mut MambaCacheEntry>,
+        layer_idx: usize,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<Array, Exception> {
+        let normed = self.input_layernorm.forward(x);
+        let r = if self.is_linear {
+            self.linear_attn
+                .as_mut()
+                .expect("linear_attn must be Some for linear layers")
+                .forward_with_capture(&normed, mask, mamba_cache, layer_idx, capture)?
+        } else {
+            self.self_attn
+                .as_mut()
+                .expect("self_attn must be Some for attention layers")
+                .forward(&normed, mask, kv_cache)?
+        };
+        let h = x.add(&r);
+        let mlp_in = self.post_attention_layernorm.forward(&h);
+        let mlp_out = self.mlp.forward(&mlp_in)?;
+        Ok(h.add(&mlp_out))
+    }
+
     pub fn forward_profiled(
         &mut self,
         x: &Array,
@@ -3111,8 +3310,34 @@ impl Qwen3NextModel {
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_cache_and_capture(input_ids, mask, kv_cache, mamba_cache, None)
+    }
+
+    /// Forward pass with optional hidden-state capture for speculative
+    /// decoding.
+    ///
+    /// Behaves identically to [`forward_with_cache`] when `capture` is
+    /// `None`. When a capture buffer is supplied, the post-layer hidden
+    /// state is cloned into `capture.hidden_states` for every layer index in
+    /// `capture.requested_hidden_layers`, without otherwise perturbing the
+    /// loop.
+    ///
+    /// GDN verify-input capture is intentionally *not* populated here. The
+    /// hybrid-attention rollback path needs the linear-layer `k,v,g,β` and
+    /// `conv_input` captured from inside the mixer; wiring that would touch
+    /// the compiled-decode hot path. Hidden-state capture alone is enough
+    /// for the Qwen3 DFlash path, and the Qwen3.5 path will add GDN
+    /// capture as a follow-up that plumbs through the mixer.
+    pub fn forward_with_cache_and_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
         mut kv_cache: Option<&mut KVCache>,
         mut mamba_cache: Option<&mut MambaCache>,
+        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         let mut hidden = Module::forward(&mut self.embed_tokens, input_ids)?;
 
@@ -3154,7 +3379,28 @@ impl Qwen3NextModel {
             };
 
             let layer_mask = if layer.is_linear { ssm_mask } else { fa_mask };
-            hidden = layer.forward(&hidden, layer_mask, kv, mamba)?;
+
+            // When a capture buffer is supplied we route the GDN layers
+            // through `forward_with_capture` so their per-token verify
+            // inputs end up in `capture.gdn_inputs`. Full-attention
+            // layers do not need the capture and just reuse `forward`.
+            hidden = if let Some(buf) = capture.as_deref_mut() {
+                if layer.is_linear {
+                    layer.forward_with_capture(
+                        &hidden, layer_mask, kv, mamba, layer_idx, buf,
+                    )?
+                } else {
+                    layer.forward(&hidden, layer_mask, kv, mamba)?
+                }
+            } else {
+                layer.forward(&hidden, layer_mask, kv, mamba)?
+            };
+
+            if let Some(buf) = capture.as_deref_mut()
+                && buf.wants_hidden_for(layer_idx)
+            {
+                buf.record_hidden(layer_idx, hidden.clone());
+            }
 
             if !prefill_like
                 && let (Some(prefetcher), Some(ctx)) = (&self.prefetcher, &self.offload_ctx)
@@ -3378,6 +3624,32 @@ impl Qwen3NextForCausalLM {
         let h = self
             .model
             .forward_with_cache(input_ids, mask, kv_cache, mamba_cache)?;
+        self.lm_head_forward(&h)
+    }
+
+    /// Forward pass that returns logits AND pre-lm-head hidden states for
+    /// the tapped layers — the target side of a DFlash speculative verify
+    /// step for the hybrid-attention Qwen3.5 stack.
+    ///
+    /// This path intentionally bypasses the InlineArray decode closure used
+    /// by [`forward_with_cache`] for `T = 1`: verify always runs with
+    /// `T > 1` (multiple draft tokens), so the standard mlx-rs path is the
+    /// correct target.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<Array, Exception> {
+        let h = self.model.forward_with_cache_and_capture(
+            input_ids,
+            mask,
+            kv_cache,
+            mamba_cache,
+            Some(capture),
+        )?;
         self.lm_head_forward(&h)
     }
 

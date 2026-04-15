@@ -1055,17 +1055,39 @@ impl GptOssModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, cache, None)
+    }
+
+    /// Forward pass with optional hidden-state capture for DFlash
+    /// speculative decoding.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+    ) -> Result<Array, Exception> {
         let mut hidden = self.embed_tokens.forward(input_ids);
 
         match cache {
             Some(cache) => {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                     hidden = layer.forward(&hidden, mask, Some((cache, layer_idx)))?;
+                    if let Some(buf) = capture.as_deref_mut()
+                        && buf.wants_hidden_for(layer_idx)
+                    {
+                        buf.record_hidden(layer_idx, hidden.clone());
+                    }
                 }
             }
             None => {
-                for layer in self.layers.iter_mut() {
+                for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                     hidden = layer.forward(&hidden, mask, None)?;
+                    if let Some(buf) = capture.as_deref_mut()
+                        && buf.wants_hidden_for(layer_idx)
+                    {
+                        buf.record_hidden(layer_idx, hidden.clone());
+                    }
                 }
             }
         }
@@ -1117,6 +1139,21 @@ impl GptOssForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward(input_ids, mask, cache)?;
+        Ok(self.lm_head.forward(&hidden))
+    }
+
+    /// Forward pass that records hidden states into a DFlash capture
+    /// buffer at every tapped layer index.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<Array, Exception> {
+        let hidden =
+            self.model
+                .forward_with_capture(input_ids, mask, cache, Some(capture))?;
         Ok(self.lm_head.forward(&hidden))
     }
 

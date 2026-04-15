@@ -22,6 +22,7 @@ pub mod training;
 pub mod turboquant;
 
 pub mod deepseek_native;
+pub mod gemma4_native;
 pub mod gpt_oss_native;
 pub mod llama4_native;
 pub mod qwen3_native;

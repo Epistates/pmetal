@@ -701,6 +701,39 @@ impl Qwen3Model {
         }
         Ok(self.norm.forward(&h))
     }
+
+    /// Forward pass with optional hidden-state capture for speculative
+    /// decoding.
+    ///
+    /// Runs the same inner loop as [`forward`] but, for each layer index
+    /// requested by `capture`, clones the post-layer hidden state into
+    /// `capture.hidden_states`. The `capture.gdn_inputs` map is never
+    /// populated here because Qwen3 has no linear-attention layers.
+    ///
+    /// Passing `capture = None` reproduces [`forward`] exactly — this
+    /// method intentionally does not duplicate the hot path.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        mut cache: Option<&mut KVCache>,
+        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+    ) -> Result<Array, Exception> {
+        if capture.is_none() {
+            return self.forward(input_ids, mask, cache);
+        }
+        let mut h = self.embed_tokens.forward(input_ids);
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let layer_cache = cache.as_mut().map(|c| (&mut **c, i));
+            h = layer.forward(&h, mask, layer_cache)?;
+            if let Some(buf) = capture.as_deref_mut()
+                && buf.wants_hidden_for(i)
+            {
+                buf.record_hidden(i, h.clone());
+            }
+        }
+        Ok(self.norm.forward(&h))
+    }
 }
 
 /// Qwen3 for Causal LM.
@@ -783,6 +816,26 @@ impl Qwen3ForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let h = self.model.forward(input_ids, mask, cache)?;
+        self.lm_head_forward(&h)
+    }
+
+    /// Forward pass that returns logits AND pre-lm-head hidden states for a
+    /// set of tapped layers — the target side of a DFlash-style speculative
+    /// verify step.
+    ///
+    /// `capture` is populated with hidden states at every layer index in
+    /// `capture.requested_hidden_layers`. The returned logits are the same
+    /// shape (`[B, T, V]`) as [`forward_with_cache`].
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<Array, Exception> {
+        let h = self
+            .model
+            .forward_with_capture(input_ids, mask, cache, Some(capture))?;
         self.lm_head_forward(&h)
     }
 }
@@ -1028,6 +1081,65 @@ mod tests {
         let logits = model.forward(&input_ids, None).unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, vocab_size]);
+    }
+
+    #[test]
+    #[serial]
+    fn test_qwen3_forward_with_capture_matches_baseline() {
+        // `forward_with_capture` must be bit-identical to `forward_with_cache`
+        // on the logit path, and must populate the requested layer indices.
+        let config = tiny_config();
+        let hidden_size = config.hidden_size;
+        let num_layers = config.num_hidden_layers as usize;
+        let vocab_size = config.vocab_size;
+
+        let mut model_baseline = Qwen3ForCausalLM::new_zeroed(config.clone()).unwrap();
+        let mut model_capture = Qwen3ForCausalLM::new_zeroed(config).unwrap();
+
+        let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
+
+        let baseline_logits = model_baseline
+            .forward_with_cache(&input_ids, None, None)
+            .unwrap();
+
+        // Request hidden states for layer 0 and the final layer
+        let mut capture = pmetal_mlx::speculative::SpecCapture::with_layers(vec![0, num_layers - 1]);
+        let captured_logits = model_capture
+            .forward_with_capture(&input_ids, None, None, &mut capture)
+            .unwrap();
+
+        assert_eq!(baseline_logits.shape(), &[1, 4, vocab_size]);
+        assert_eq!(captured_logits.shape(), &[1, 4, vocab_size]);
+
+        let mut base_eval = baseline_logits.clone();
+        let mut cap_eval = captured_logits.clone();
+        base_eval.eval();
+        cap_eval.eval();
+        let base_vec = base_eval
+            .to_f32_vec(base_eval.size())
+            .expect("baseline logits to vec");
+        let cap_vec = cap_eval
+            .to_f32_vec(cap_eval.size())
+            .expect("capture logits to vec");
+        let max_diff = base_vec
+            .iter()
+            .zip(cap_vec.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-5,
+            "capture path must be bit-identical to baseline, got max_diff={max_diff}"
+        );
+
+        // Both tapped layers should be present with shape [B, T, hidden].
+        assert_eq!(capture.hidden_states.len(), 2);
+        for idx in [0usize, num_layers - 1] {
+            let h = capture
+                .hidden_states
+                .get(&idx)
+                .unwrap_or_else(|| panic!("layer {idx} not captured"));
+            assert_eq!(h.shape(), &[1, 4, hidden_size as i32]);
+        }
     }
 
     // --- tie_word_embeddings ---

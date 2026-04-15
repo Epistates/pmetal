@@ -85,6 +85,12 @@ reqwest = { version = "0.13", features = ["json", "multipart", "stream", "rustls
 sha2 = "0.10"
 base64 = "0.22"
 
+# Jinja template engine for executing upstream chat_template strings from
+# tokenizer_config.json. `minijinja-contrib` adds the `now`/`strftime_now`
+# helpers that Llama 3 chat templates use for dynamic date injection.
+minijinja = { version = "2", features = ["loader", "builtins", "macros"] }
+minijinja-contrib = { version = "2", features = ["datetime", "pycompat"] }
+
 # Serialization (binary)
 bitcode = { version = "0.6", features = ["serde"] }
 

@@ -62,6 +62,14 @@ void mlx_inline_rms_norm(mlx_inline_array* dst, const mlx_inline_array* x,
     const mlx_inline_array* weight, float eps);
 void mlx_inline_rope(mlx_inline_array* dst, const mlx_inline_array* x,
     int dims, bool traditional, float base, float scale, int offset);
+void mlx_inline_rope_with_freqs(mlx_inline_array* dst, const mlx_inline_array* x,
+    int dims, bool traditional, float scale, int offset,
+    const mlx_inline_array* freqs);
+// Per-position RoPE: applies an array of int32 offsets (one per token).
+// Used by DDTree-style tree verify where each tree node has its own depth.
+void mlx_inline_rope_with_pos_ids(mlx_inline_array* dst, const mlx_inline_array* x,
+    int dims, bool traditional, float base, float scale,
+    const mlx_inline_array* offset_arr);
 void mlx_inline_sdpa(mlx_inline_array* dst,
     const mlx_inline_array* q, const mlx_inline_array* k,
     const mlx_inline_array* v, float scale, const char* mask_mode);
@@ -234,6 +242,14 @@ void mlx_inline_abs(mlx_inline_array* dst, const mlx_inline_array* a);
 void mlx_inline_fused_swiglu(mlx_inline_array* dst,
     const mlx_inline_array* gate, const mlx_inline_array* up);
 
+// fused_geglu_tanh: tanh-approx GELU gating used by Gemma 2/3/4 MLP.
+//   0.5 * g * (1 + tanh(sqrt(2/pi) * (g + 0.044715 * g^3))) * u
+// Scalars are astype'd to gate.dtype() inside the compiled lambda, so
+// bf16 inputs stay bf16 (fixes an f32 promotion that doubled MLP
+// bandwidth on the Gemma 4 hot path). Shapeless compile.
+void mlx_inline_fused_geglu_tanh(mlx_inline_array* dst,
+    const mlx_inline_array* gate, const mlx_inline_array* up);
+
 // fused_silu: x * sigmoid(x) → 1 dispatch instead of 2 (sigmoid+mul)
 void mlx_inline_fused_silu(mlx_inline_array* dst, const mlx_inline_array* x);
 
@@ -283,6 +299,61 @@ void mlx_inline_compiled_attn_layer_fixed(
     float k_norm_eps,
     bool gated);
 
+// Fixed-shape compiled Gemma 4 decoder layer halves. Each side is a
+// `make_compiled_fixed` lambda keyed by the layer's per-shape signature
+// (batch, seq_len, cache_len, n_heads, n_kv, head_dim, k_eq_v, sliding).
+//
+// The attention block fuses input_layernorm + q/k/v projections (with
+// the optional `attention_k_eq_v` collapse) + q_norm/k_norm/v_norm-no-scale
+// + transpose + RoPE (custom freqs OR full base) + KV cache write +
+// SDPA + o_proj + post_attention_layernorm into a single Compiled graph.
+//
+// The MLP block fuses pre_feedforward_layernorm + gate/up projections +
+// tanh-approx GELU (matching mlx-lm `nn.gelu_approx`) + multiply +
+// down_proj + post_feedforward_layernorm.
+//
+// Residual adds and the per-layer scalar multiply are intentionally
+// kept on the Rust side — they're 3 trivial element-wise ops and the
+// FFI surface stays narrow that way.
+void mlx_inline_compiled_gemma4_attn_block(
+    mlx_inline_array* dst_out,
+    mlx_inline_array* dst_cache_keys,
+    mlx_inline_array* dst_cache_vals,
+    const mlx_inline_array* x,
+    const mlx_inline_array* in_norm_w,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* k_w,
+    const mlx_inline_array* v_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_norm_w,
+    const mlx_inline_array* k_norm_w,
+    const mlx_inline_array* post_norm_w,
+    const mlx_inline_array* rope_freqs,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int kv_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float in_norm_eps,
+    float qk_norm_eps,
+    float post_norm_eps,
+    int sliding_window,
+    bool use_k_eq_v,
+    float rope_base,
+    int rope_dims);
+
+void mlx_inline_compiled_gemma4_mlp_block(
+    mlx_inline_array* dst_out,
+    const mlx_inline_array* x,
+    const mlx_inline_array* pre_norm_w,
+    const mlx_inline_array* gate_w,
+    const mlx_inline_array* up_w,
+    const mlx_inline_array* down_w,
+    const mlx_inline_array* post_norm_w,
+    float pre_norm_eps,
+    float post_norm_eps);
+
 // Fixed-shape compiled dense MoE decode block (shapeless=false).
 // Replays the routed-expert + shared-expert graph for T=1 decode.
 void mlx_inline_compiled_moe_layer_fixed(
@@ -327,6 +398,20 @@ void mlx_inline_gdn_metal_step(
     mlx_inline_array* dst_y,
     mlx_inline_array* dst_state,
     const mlx_inline_array* q,
+    const mlx_inline_array* k,
+    const mlx_inline_array* v,
+    const mlx_inline_array* g,
+    const mlx_inline_array* beta,
+    const mlx_inline_array* state_in,
+    int T);
+
+// GDN state-only advance for speculative-decoding rollback replay.
+// Same shapes as `mlx_inline_gdn_metal_step` but WITHOUT the `q` / `y`
+// channels: the caller only needs the post-replay state. Saves roughly
+// half the per-step work versus dispatching the full step kernel and
+// discarding `y`.
+void mlx_inline_gdn_metal_state_update(
+    mlx_inline_array* dst_state,
     const mlx_inline_array* k,
     const mlx_inline_array* v,
     const mlx_inline_array* g,

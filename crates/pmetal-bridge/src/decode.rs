@@ -75,9 +75,24 @@ pub fn scalar_f32_like(value: f32, like: &InlineArray) -> InlineArray {
 }
 
 /// Sampling parameters for the bridge decode loop.
+///
+/// Includes the full mlx-lm-style filter pipeline: temperature, top-k,
+/// top-p (nucleus), and min-p, plus repetition / frequency / presence
+/// penalties. Defaults are no-ops for every filter so callers that only
+/// care about temperature can use [`SamplingParams::new`] and ignore the
+/// rest.
 #[derive(Clone, Debug)]
 pub struct SamplingParams {
     pub temperature: f32,
+    /// Top-K filter. `0` disables. Keeps only the top `k` highest-logit
+    /// tokens before sampling.
+    pub top_k: usize,
+    /// Top-P (nucleus) filter. `1.0` disables. Keeps the smallest set of
+    /// tokens whose cumulative probability exceeds `1 - p`.
+    pub top_p: f32,
+    /// Min-P filter. `0.0` disables. Drops tokens with probability less
+    /// than `min_p * top_token_probability`.
+    pub min_p: f32,
     pub repetition_penalty: f32,
     pub frequency_penalty: f32,
     pub presence_penalty: f32,
@@ -87,6 +102,9 @@ impl SamplingParams {
     pub fn new(temperature: f32) -> Self {
         Self {
             temperature,
+            top_k: 0,
+            top_p: 1.0,
+            min_p: 0.0,
             repetition_penalty: 1.0,
             frequency_penalty: 0.0,
             presence_penalty: 0.0,
@@ -99,6 +117,87 @@ impl SamplingParams {
             || self.frequency_penalty != 0.0
             || self.presence_penalty != 0.0
     }
+
+    /// Whether any logit filter (top-k, top-p, min-p) is active.
+    pub fn has_filters(&self) -> bool {
+        self.top_k > 0 || (self.top_p < 1.0 && self.top_p > 0.0) || self.min_p > 0.0
+    }
+}
+
+/// Apply the top-k filter: mask all logits except the `k` highest to
+/// negative infinity. Uses `argpartition_axis` (O(n)) instead of a full
+/// sort. Mirrors `pmetal-models::sampling::compiled_sampler::apply_top_k_2d`,
+/// kept here so the bridge can do native-path filtered sampling without
+/// taking a dependency on `pmetal-models`.
+fn apply_top_k(logits_2d: &InlineArray, k: usize, neg_inf: &InlineArray) -> InlineArray {
+    use crate::compat::ops::{argpartition_axis, put_along_axis, slice_last_from};
+    let vocab = logits_2d.dim(-1) as usize;
+    let k = k.min(vocab).max(1);
+    // argpartition on -logits → first k indices are the top-k positions.
+    // We want the indices of the *bottom* (vocab - k) positions to mask
+    // out, which is everything past index k-1 along the partitioned axis.
+    let neg = logits_2d.negative();
+    let part = argpartition_axis(&neg, (k - 1) as i32, -1);
+    let mask_idx = slice_last_from(&part, k as i32);
+    put_along_axis(logits_2d, &mask_idx, neg_inf, -1)
+}
+
+/// Apply the top-p (nucleus) filter: keep the smallest set of tokens
+/// whose cumulative probability exceeds `p`. Mirrors
+/// `compiled_sampler::apply_top_p_2d`.
+fn apply_top_p(logits_2d: &InlineArray, p: f32, neg_inf: &InlineArray) -> InlineArray {
+    use crate::compat::ops::{
+        argsort_axis, cumsum, exp, put_along_axis, take_along_axis, which, zeros_like,
+    };
+    let vocab = logits_2d.dim(-1) as usize;
+    let probs = exp(logits_2d);
+    let sorted_indices = argsort_axis(logits_2d, -1);
+    let sorted_probs = take_along_axis(&probs, &sorted_indices, -1);
+    let cumulative = cumsum(&sorted_probs, -1);
+    // Restore original ordering of the cumulative probabilities.
+    let vocab_range = InlineArray::from_i32_slice_shaped(
+        &(0..vocab as i32).collect::<Vec<_>>(),
+        &[1, vocab as i32],
+    );
+    let inverse_indices = put_along_axis(
+        &zeros_like(&sorted_indices),
+        &sorted_indices,
+        &vocab_range,
+        -1,
+    );
+    let cumulative = take_along_axis(&cumulative, &inverse_indices, -1);
+    let threshold = scalar_f32_like(1.0 - p, logits_2d);
+    let keep = cumulative.greater(&threshold);
+    which(&keep, logits_2d, neg_inf)
+}
+
+/// Apply the min-p filter: drop tokens whose probability is less than
+/// `min_p * top_token_probability`. Mirrors
+/// `compiled_sampler::apply_min_p_2d`.
+fn apply_min_p(logits_2d: &InlineArray, min_p: f32, neg_inf: &InlineArray) -> InlineArray {
+    use crate::compat::ops::{
+        argsort_axis, put_along_axis, slice_axis, take_along_axis, which, zeros_like,
+    };
+    let vocab = logits_2d.dim(-1) as usize;
+    let neg = logits_2d.negative();
+    let sorted_indices = argsort_axis(&neg, -1);
+    let sorted_logits = take_along_axis(logits_2d, &sorted_indices, -1);
+    let top_logits = slice_axis(&sorted_logits, -1, 0, 1);
+    let log_min_p = scalar_f32_like(min_p.ln(), logits_2d);
+    let scaled = top_logits.add(&log_min_p);
+    let drop_mask = sorted_logits.less(&scaled);
+    let selected = which(&drop_mask, neg_inf, &sorted_logits);
+    let vocab_range = InlineArray::from_i32_slice_shaped(
+        &(0..vocab as i32).collect::<Vec<_>>(),
+        &[1, vocab as i32],
+    );
+    let inverse_indices = put_along_axis(
+        &zeros_like(&sorted_indices),
+        &sorted_indices,
+        &vocab_range,
+        -1,
+    );
+    take_along_axis(&selected, &inverse_indices, -1)
 }
 
 /// Reusable buffer for penalty application.
@@ -162,6 +261,51 @@ pub fn sample_token(logits_2d: &InlineArray, temperature: f32) -> InlineArray {
         let scaled = log_probs.multiply(&inv_temp);
         scaled.categorical()
     }
+}
+
+/// Sample a token from `[B, vocab]` logits using the full filter
+/// pipeline in `params`: temperature → top-k → top-p → min-p →
+/// categorical. At `temperature == 0` the call collapses to argmax and
+/// every filter is a no-op. Otherwise the filter chain matches mlx-lm's
+/// per-step sampling pipeline. Use [`sample_token`] when only
+/// temperature matters.
+///
+/// IMPORTANT: penalty (`repetition_penalty` / `frequency_penalty` /
+/// `presence_penalty`) handling lives in [`PenaltyBuffer::apply`] which
+/// must run BEFORE this call — penalties operate on raw logits, not
+/// log-probs, and depend on per-token counts the sampler does not track.
+pub fn sample_token_with_params(
+    logits_2d: &InlineArray,
+    params: &SamplingParams,
+) -> InlineArray {
+    if params.temperature <= 0.0 {
+        return logits_2d.argmax(-1);
+    }
+    let log_probs = {
+        let inv_temp = scalar_f32_like(1.0 / params.temperature, logits_2d);
+        let lse = logits_2d.logsumexp(-1, true);
+        let scaled = logits_2d.subtract(&lse).multiply(&inv_temp);
+        scaled
+    };
+    if !params.has_filters() {
+        return log_probs.categorical();
+    }
+    // Pre-construct the negative-infinity sentinel once per call. Filters
+    // splat it into masked positions; sample_token is called per step so
+    // the alloc is small but unavoidable. mlx-lm caches it on a sampler
+    // struct — same opportunity exists if/when we factor out a Sampler.
+    let neg_inf = scalar_f32_like(f32::NEG_INFINITY, &log_probs);
+    let mut filtered = log_probs;
+    if params.top_k > 0 {
+        filtered = apply_top_k(&filtered, params.top_k, &neg_inf);
+    }
+    if params.top_p < 1.0 && params.top_p > 0.0 {
+        filtered = apply_top_p(&filtered, params.top_p, &neg_inf);
+    }
+    if params.min_p > 0.0 && params.min_p < 1.0 {
+        filtered = apply_min_p(&filtered, params.min_p, &neg_inf);
+    }
+    filtered.categorical()
 }
 
 /// Sample a single token id from `[B, vocab]` logits.
@@ -750,11 +894,24 @@ pub fn generate_from_primed_sample_with_params<Weights, Cache>(
 
             // Apply penalties before sampling (zero-cost when disabled or no
             // tokens seen yet; reuses pre-allocated buffer otherwise).
+            // Route through the full filter pipeline only when any
+            // filter is actually active — params.has_filters() is
+            // false on the common greedy / temperature-only path so
+            // we use the leaner sample_token and skip the
+            // scalar_f32_like neg-inf construction inside
+            // sample_token_with_params.
+            let needs_filters = params.has_filters();
             let next_y = if use_penalties && !token_counts.is_empty() {
                 let buf = penalty_buf
                     .get_or_insert_with(|| PenaltyBuffer::new(next_logits_2d.dim(-1) as usize));
                 let penalized = buf.apply(&next_logits_2d, &token_counts, &params);
-                sample_token(&penalized, params.temperature)
+                if needs_filters {
+                    sample_token_with_params(&penalized, &params)
+                } else {
+                    sample_token(&penalized, params.temperature)
+                }
+            } else if needs_filters {
+                sample_token_with_params(&next_logits_2d, &params)
             } else {
                 sample_token(&next_logits_2d, params.temperature)
             };

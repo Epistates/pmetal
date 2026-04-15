@@ -205,6 +205,84 @@ impl KVCache {
         &self.config
     }
 
+    /// Take the layer's KV buffers and current offset for a fused
+    /// compiled update step (used by `compiled_*_attn_block` callers).
+    /// The buffer is grown to fit the next `prev_offset + new_seq_len`
+    /// tokens before being handed out, so the compiled call can write
+    /// `new_seq_len` rows at `prev_offset` via `put_along_axis`.
+    ///
+    /// The caller is responsible for invoking
+    /// [`KVCache::commit_compiled_layer_buffers`] with the *new* keys
+    /// and values returned by the compiled function — otherwise the
+    /// layer cache is left in an inconsistent state.
+    pub fn take_compiled_layer_buffers(
+        &mut self,
+        layer_idx: usize,
+        new_seq_len: usize,
+        n_kv_heads: i32,
+        key_head_dim: i32,
+        value_head_dim: i32,
+        dtype: Dtype,
+    ) -> Result<(Array, Array, usize), Exception> {
+        if layer_idx >= self.config.num_layers {
+            return Err(Exception::custom(format!(
+                "Layer index {} out of range (num_layers={})",
+                layer_idx, self.config.num_layers
+            )));
+        }
+        if self.quantized_layers.is_some() || self.turboquant_layers.is_some() {
+            return Err(Exception::custom(
+                "compiled cache buffer access is unsupported for quantized caches",
+            ));
+        }
+        let cache = &mut self.layer_caches[layer_idx];
+        let prev_offset = cache.offset;
+        let needed = prev_offset + new_seq_len;
+        let needs_grow = match cache.keys.as_ref() {
+            None => true,
+            Some(k) => (k.dim(2) as usize) < needed,
+        };
+        if needs_grow {
+            // Pre-allocate in chunks of CACHE_STEP_SIZE.
+            let n_steps = needed.div_ceil(CACHE_STEP_SIZE);
+            let new_alloc_len = n_steps * CACHE_STEP_SIZE;
+            let batch = 1; // current callers all use batch=1
+            let k_shape = [batch, n_kv_heads, new_alloc_len as i32, key_head_dim];
+            let v_shape = [batch, n_kv_heads, new_alloc_len as i32, value_head_dim];
+            let new_k = ops::zeros(&k_shape, dtype);
+            let new_v = ops::zeros(&v_shape, dtype);
+            if let (Some(existing_k), Some(existing_v)) = (&cache.keys, &cache.values) {
+                cache.keys = Some(ops::concatenate_axis(&[existing_k, &new_k], 2));
+                cache.values = Some(ops::concatenate_axis(&[existing_v, &new_v], 2));
+            } else {
+                cache.keys = Some(new_k);
+                cache.values = Some(new_v);
+            }
+        }
+        let keys = cache.keys.take().unwrap();
+        let values = cache.values.take().unwrap();
+        Ok((keys, values, prev_offset))
+    }
+
+    /// Commit the new KV buffers returned by a compiled fused step back
+    /// to the layer cache. `new_offset` is the post-update offset
+    /// (typically `prev_offset + new_seq_len`).
+    pub fn commit_compiled_layer_buffers(
+        &mut self,
+        layer_idx: usize,
+        new_keys: Array,
+        new_values: Array,
+        new_offset: usize,
+    ) {
+        let cache = &mut self.layer_caches[layer_idx];
+        cache.keys = Some(new_keys);
+        cache.values = Some(new_values);
+        cache.offset = new_offset;
+        if layer_idx == 0 {
+            self.total_tokens = new_offset;
+        }
+    }
+
     /// Get the current cached sequence length.
     pub fn seq_len(&self) -> usize {
         if let Some(ref q_layers) = self.quantized_layers {
@@ -288,40 +366,39 @@ impl KVCache {
         self.total_tokens = 0;
     }
 
-    /// Roll back (discard) the last `n` tokens from every layer in the cache.
+    /// Roll back (discard) the last `n` tokens from every layer in the cache
+    /// and return the count actually removed (clamped to the current length).
     ///
-    /// This is used after speculative decoding when some draft tokens are
-    /// rejected: the verify model has already appended the full draft sequence
-    /// to its KV cache, but only the accepted prefix should be retained.
+    /// This is the speculative-decoding primitive: after a verify step that
+    /// accepted only some of the drafted tokens, call `rollback(rejected)` to
+    /// reclaim the trailing positions. The return value is the same contract
+    /// as MLX-LM / dflash-mlx `trim()` — callers can assert it matches the
+    /// expected discard count.
     ///
-    /// The operation simply decrements each layer's `offset` by `n` and
-    /// adjusts `total_tokens`.  The underlying buffer data beyond the new
-    /// offset is left in place (overwritten on the next `update_and_fetch`
-    /// call) — this is safe because `update_and_fetch` always writes before
-    /// reading the new positions.
-    ///
-    /// # Panics
-    ///
-    /// Panics (in debug) if `n > seq_len()`.  In release builds the offset is
-    /// clamped to 0 to avoid underflow.
-    pub fn rollback(&mut self, n: usize) {
-        if n == 0 {
-            return;
+    /// For the standard path this is an O(1) offset decrement; the buffer is
+    /// left in place and the orphaned region is overwritten on the next
+    /// `update_and_fetch`. Quantized / TurboQuant variants physically reclaim
+    /// storage via sliced re-assignment.
+    pub fn rollback(&mut self, n: usize) -> usize {
+        let trimmed = n.min(self.seq_len());
+        if trimmed == 0 {
+            return 0;
         }
         if let Some(ref mut q_layers) = self.quantized_layers {
             for cache in q_layers {
-                cache.rollback(n);
+                cache.rollback(trimmed);
             }
         } else if let Some(ref mut tq_layers) = self.turboquant_layers {
             for cache in tq_layers {
-                cache.rollback(n);
+                cache.rollback(trimmed);
             }
         } else {
             for cache in &mut self.layer_caches {
-                cache.offset = cache.offset.saturating_sub(n);
+                cache.offset = cache.offset.saturating_sub(trimmed);
             }
         }
-        self.total_tokens = self.total_tokens.saturating_sub(n);
+        self.total_tokens = self.total_tokens.saturating_sub(trimmed);
+        trimmed
     }
 
     /// Update the cache with new keys and values for a layer.

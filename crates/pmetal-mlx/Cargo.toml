@@ -27,5 +27,12 @@ rand = { workspace = true }
 serial_test = "3"
 tempfile = { workspace = true }
 
+[features]
+# Enables `pmetal_mlx::test_utils` for cross-crate parity tests. Empty
+# (no extra deps) — production builds never see it. Integration tests in
+# downstream crates that need shared parity helpers add this feature in
+# their own `[dev-dependencies]`.
+test-utils = []
+
 [lints]
 workspace = true

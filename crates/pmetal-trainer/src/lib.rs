@@ -74,6 +74,7 @@ pub mod checkpoint;
 pub mod checkpointing;
 pub mod contrastive_loss;
 pub mod dapo;
+pub mod dflash_training;
 #[cfg(feature = "experimental-trainers")]
 pub mod diffusion;
 pub mod distillation;

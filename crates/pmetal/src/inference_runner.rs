@@ -600,8 +600,17 @@ impl InferenceGenState {
 
         if matches!(self.model, LoadedModel::NativeOnly) {
             let stop_tokens = self.gen_config.stop_tokens.clone();
+            // Wire the full filter pipeline through to the bridge.
+            // Previously top_k / top_p / min_p were silently dropped on
+            // the native path: users passing `--top-k 20 --top-p 0.95`
+            // got pure temperature sampling because SamplingParams
+            // didn't carry those fields. Now the bridge applies the
+            // same filter chain mlx-lm does.
             let sampling_params = pmetal_bridge::decode::SamplingParams {
                 temperature: self.gen_config.temperature,
+                top_k: self.gen_config.top_k,
+                top_p: self.gen_config.top_p,
+                min_p: self.gen_config.min_p,
                 repetition_penalty: self.gen_config.repetition_penalty,
                 frequency_penalty: self.gen_config.frequency_penalty,
                 presence_penalty: self.gen_config.presence_penalty,
@@ -623,10 +632,11 @@ impl InferenceGenState {
                 num_generated: output.num_generated,
                 stopped_by_token: output.stopped_by_token,
                 stopped_by_length: output.stopped_by_length,
+                decode_metrics: output.decode_metrics,
             });
         }
 
-        match self.model {
+        let output = match self.model {
             LoadedModel::Standard(ref mut model) => {
                 let mamba = &mut self.mamba_cache;
                 generate_cached_async_streaming(
@@ -658,7 +668,12 @@ impl InferenceGenState {
                 // native path returns before reaching this fallback code
                 unreachable!("NativeOnly model should have returned before the shared fallback")
             }
-        }
+        }?;
+        // Forward the streaming generator's per-step decode metrics into
+        // the runner state so the CLI summary print ingests them the same
+        // way it does for the bridge-native path.
+        self.last_decode_metrics = output.decode_metrics;
+        Ok(output)
     }
 
     /// Run a generation function with properly split borrows.

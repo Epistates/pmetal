@@ -57,6 +57,8 @@ pub enum ModelArchitecture {
     RecurrentGemma,
     Jamba,
     FalconH1,
+    GptOss,
+    Gemma4,
     Flux,
     /// BERT / RoBERTa / DistilBERT encoder-only model.
     Bert,
@@ -83,6 +85,8 @@ impl std::fmt::Display for ModelArchitecture {
             Self::RecurrentGemma => write!(f, "RecurrentGemma"),
             Self::Jamba => write!(f, "Jamba"),
             Self::FalconH1 => write!(f, "Falcon H1"),
+            Self::GptOss => write!(f, "GPT-OSS"),
+            Self::Gemma4 => write!(f, "Gemma 4"),
             Self::Flux => write!(f, "Flux"),
             Self::Bert => write!(f, "BERT"),
         }
@@ -96,11 +100,17 @@ impl ModelArchitecture {
             "llama4" => Some(Self::Llama4),
             "llama" | "llama3" => Some(Self::Llama),
             "qwen3_moe" => Some(Self::Qwen3MoE),
+            "gpt_oss" | "gptoss" | "gpt-oss" => Some(Self::GptOss),
             "qwen3_next" | "qwen3_5" | "qwen3.5" | "qwen3_5_text" | "qwen3_5_moe"
             | "qwen3_5_moe_text" => Some(Self::Qwen3Next),
             "qwen3" => Some(Self::Qwen3),
             "qwen2" | "qwen2_5" => Some(Self::Qwen2),
             "gemma" | "gemma2" | "gemma3" => Some(Self::Gemma),
+            // Gemma 4 has its own architecture module (separate attention
+            // variants per layer type, k_eq_v for full-attention, layer
+            // scalar, final logit softcapping). Multimodal wrappers nest
+            // the text backbone under `text_config`; the loader unwraps.
+            "gemma4" | "gemma4_text" => Some(Self::Gemma4),
             "mistral" | "mixtral" => Some(Self::Mistral),
             "phi4" => Some(Self::Phi4),
             "phi" | "phi3" => Some(Self::Phi),
@@ -170,6 +180,15 @@ impl ModelArchitecture {
             }
             if lower.contains("granite") {
                 return Some(Self::Granite);
+            }
+            if lower.contains("gptoss")
+                || lower.contains("gpt_oss")
+                || lower.contains("gpt-oss")
+            {
+                return Some(Self::GptOss);
+            }
+            if lower.contains("gemma4") {
+                return Some(Self::Gemma4);
             }
             if lower.contains("nemotronhforcausallm") || lower.contains("nemotron_h") {
                 return Some(Self::NemotronH);
@@ -252,6 +271,8 @@ macro_rules! dispatch_uniform {
             Self::RecurrentGemma(m) => m.$method($($arg),*),
             Self::Jamba(m) => m.$method($($arg),*),
             Self::FalconH1(m) => m.$method($($arg),*),
+            Self::GptOss(m) => m.$method($($arg),*),
+            Self::Gemma4(m) => m.$method($($arg),*),
             Self::Flux(m) => m.$method($($arg),*),
             Self::Bert(m) => m.$method($($arg),*),
         }
@@ -280,6 +301,8 @@ macro_rules! dispatch_architecture {
             Self::RecurrentGemma(_) => ModelArchitecture::RecurrentGemma,
             Self::Jamba(_) => ModelArchitecture::Jamba,
             Self::FalconH1(_) => ModelArchitecture::FalconH1,
+            Self::GptOss(_) => ModelArchitecture::GptOss,
+            Self::Gemma4(_) => ModelArchitecture::Gemma4,
             Self::Flux(_) => ModelArchitecture::Flux,
             Self::Bert(_) => ModelArchitecture::Bert,
         }
@@ -306,6 +329,8 @@ pub enum DynamicModel {
     RecurrentGemma(RecurrentGemmaModel),
     Jamba(JambaModel),
     FalconH1(FalconH1ForCausalLM),
+    GptOss(GptOssForCausalLM),
+    Gemma4(Gemma4ForCausalLM),
     Flux(FluxDiT),
     Bert(BertForEmbedding),
 }
@@ -331,6 +356,8 @@ impl std::fmt::Debug for DynamicModel {
             Self::RecurrentGemma(_) => write!(f, "DynamicModel::RecurrentGemma"),
             Self::Jamba(_) => write!(f, "DynamicModel::Jamba"),
             Self::FalconH1(_) => write!(f, "DynamicModel::FalconH1"),
+            Self::GptOss(_) => write!(f, "DynamicModel::GptOss"),
+            Self::Gemma4(_) => write!(f, "DynamicModel::Gemma4"),
             Self::Flux(_) => write!(f, "DynamicModel::Flux"),
             Self::Bert(_) => write!(f, "DynamicModel::Bert"),
         }
@@ -343,6 +370,7 @@ impl DynamicModel {
             Self::Qwen3MoE(model) => model.init_stacked_moe(),
             Self::DeepSeek(model) => model.init_stacked_moe(),
             Self::NemotronH(model) => model.init_stacked_moe(),
+            Self::GptOss(model) => model.init_stacked_moe(),
             _ => Ok(()),
         }
     }
@@ -434,17 +462,69 @@ impl DynamicModel {
                 Ok(model)
             }
             ModelArchitecture::Gemma => {
-                let mut config: GemmaConfig = json5::from_str(&config_content)
+                // Gemma 4 multimodal configs nest the text-tower fields
+                // under `text_config` (same pattern as Qwen 3.5 VLM). Unwrap
+                // if present and the top-level has no `hidden_size`.
+                let config_json: serde_json::Value = serde_json::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
-                // Set the Gemma3 flag based on model_type to enable the correct
-                // sliding window pattern (every 6th layer global, rest local).
-                if config.model_type == "gemma3" {
+                let effective = if config_json.get("text_config").is_some()
+                    && config_json.get("hidden_size").is_none()
+                {
+                    serde_json::to_string(&config_json["text_config"])
+                        .map_err(|e| Exception::custom(e.to_string()))?
+                } else {
+                    config_content.clone()
+                };
+                let mut config: GemmaConfig = json5::from_str(&effective)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                // Set the Gemma3 flag based on model_type to enable the
+                // correct sliding window pattern (every 6th layer global,
+                // rest local). Gemma 4 inherits the same interleave.
+                if config.model_type == "gemma3"
+                    || config.model_type == "gemma4"
+                    || config.model_type == "gemma4_text"
+                    || config.model_type == "gemma3_text"
+                {
                     config.is_gemma3 = true;
                 }
                 let mut model = GemmaForCausalLM::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                crate::loader::load_gemma_weights(&mut model, &weights)
+                // Gemma 4 stores the language-tower weights under
+                // `model.language_model.…` (multimodal wrapper). Strip the
+                // infix so the existing loader's `model.…` keys match.
+                // Also drop vision / audio tower weights — pmetal only
+                // runs the language stack today.
+                let needs_lm_strip = weights
+                    .keys()
+                    .any(|k| k.starts_with("model.language_model."));
+                let weights_effective = if needs_lm_strip {
+                    let mut remapped: std::collections::HashMap<String, Array> =
+                        std::collections::HashMap::with_capacity(weights.len());
+                    for (key, value) in &weights {
+                        if let Some(rest) = key.strip_prefix("model.language_model.") {
+                            remapped.insert(format!("model.{rest}"), value.clone());
+                        } else if key.starts_with("model.embed_vision.")
+                            || key.starts_with("model.vision_tower.")
+                            || key.starts_with("model.audio_tower.")
+                            || key.starts_with("model.multi_modal_projector.")
+                        {
+                            // Skip non-language towers.
+                        } else if key == "lm_head.weight" {
+                            // Gemma ties, but some checkpoints carry an
+                            // explicit head. Keep it under its own key; the
+                            // loader will ignore it because Gemma uses
+                            // tied embeddings.
+                            remapped.insert(key.clone(), value.clone());
+                        } else {
+                            remapped.insert(key.clone(), value.clone());
+                        }
+                    }
+                    remapped
+                } else {
+                    weights
+                };
+                crate::loader::load_gemma_weights(&mut model, &weights_effective)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Gemma(model))
@@ -594,6 +674,51 @@ impl DynamicModel {
             ModelArchitecture::Flux => Err(Exception::custom(
                 "Flux models are diffusion pipelines, not causal language models. Load them via pmetal_models::pipelines::FluxPipeline instead of DynamicModel::load.",
             )),
+            ModelArchitecture::GptOss => {
+                let config: GptOssConfig = json5::from_str(&config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model = GptOssForCausalLM::new(config)?;
+                load_generic_weights(&mut model, model_dir)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                eval_module_parameters_batched(&model)?;
+                let mut model = Self::GptOss(model);
+                model.init_post_load_fast_paths()?;
+                Ok(model)
+            }
+            ModelArchitecture::Gemma4 => {
+                // Gemma 4 configs nest the text tower under `text_config`
+                // (multimodal wrapper). Unwrap if the top level has no
+                // `hidden_size`.
+                let config_json: serde_json::Value = serde_json::from_str(&config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let effective = if config_json.get("text_config").is_some()
+                    && config_json.get("hidden_size").is_none()
+                {
+                    serde_json::to_string(&config_json["text_config"])
+                        .map_err(|e| Exception::custom(e.to_string()))?
+                } else {
+                    config_content.clone()
+                };
+                let config: crate::architectures::gemma4::Gemma4Config =
+                    json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model =
+                    crate::architectures::gemma4::Gemma4ForCausalLM::new(config)?;
+                let weights = crate::loader::load_weights(model_dir)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                let report =
+                    crate::architectures::gemma4::load_gemma4_weights(&mut model, &weights)
+                        .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                if !report.skipped.is_empty() {
+                    tracing::info!(
+                        "Gemma 4 weight load: {} loaded, {} skipped (first: {:?})",
+                        report.loaded,
+                        report.skipped.len(),
+                        report.skipped.first()
+                    );
+                }
+                eval_module_parameters_batched(&model)?;
+                Ok(Self::Gemma4(model))
+            }
             ModelArchitecture::Bert => {
                 let config: BertConfig = serde_json::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
@@ -631,6 +756,8 @@ impl DynamicModel {
             Self::RecurrentGemma(m) => m.forward(input_ids),
             Self::Jamba(m) => m.forward(input_ids),
             Self::FalconH1(m) => m.forward(input_ids, mask),
+            Self::GptOss(m) => m.forward(input_ids, mask, None),
+            Self::Gemma4(m) => m.forward(input_ids, mask),
             Self::Flux(_) => Err(Exception::custom(
                 "Flux is not a CausalLM and does not support standard forward(input_ids, mask)",
             )),
@@ -661,6 +788,8 @@ impl DynamicModel {
             Self::Mistral(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Phi(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Phi4(m) => m.forward_with_cache(input_ids, mask, cache),
+            Self::GptOss(m) => m.forward(input_ids, mask, cache),
+            Self::Gemma4(m) => m.forward_with_cache(input_ids, mask, cache),
             // Hybrid recurrent+attention models require both a KV cache and a
             // Mamba/GDN state cache. Use `forward_with_hybrid_cache` instead.
             Self::NemotronH(_) | Self::Qwen3Next(_) | Self::FalconH1(_) => Err(Exception::custom(
@@ -714,6 +843,8 @@ impl DynamicModel {
             Self::RecurrentGemma(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Jamba(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::FalconH1(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::GptOss(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Gemma4(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Bert(m) => crate::fp8_utils::quantize_model_linears(m),
         }
     }
@@ -792,6 +923,18 @@ impl DynamicModel {
                 max_seq_len,
                 m.config().num_kv_heads() as usize,
                 m.config().head_dim() as usize,
+            )),
+            Self::GptOss(m) => KVCache::new(KVCacheConfig::new(
+                m.config().num_hidden_layers as usize,
+                max_seq_len,
+                m.config().num_key_value_heads as usize,
+                m.config().head_dim as usize,
+            )),
+            Self::Gemma4(m) => KVCache::new(KVCacheConfig::new(
+                m.config.num_hidden_layers as usize,
+                max_seq_len,
+                m.config.num_key_value_heads as usize,
+                m.config.head_dim as usize,
             )),
             Self::Flux(_) => KVCache::new(KVCacheConfig::new(0, 0, 0, 0)),
             // BERT is encoder-only with no autoregressive KV cache.
@@ -879,6 +1022,8 @@ impl DynamicModel {
             Self::RecurrentGemma(m) => m.config.vocab_size,
             Self::Jamba(m) => m.config.vocab_size,
             Self::FalconH1(m) => m.config().vocab_size(),
+            Self::GptOss(m) => m.config().vocab_size,
+            Self::Gemma4(m) => m.config.vocab_size,
             Self::Flux(_) => 0,
             Self::Bert(m) => m.config().vocab_size as i32,
         }
@@ -904,6 +1049,8 @@ impl DynamicModel {
             Self::RecurrentGemma(m) => m.config.hidden_size,
             Self::Jamba(m) => m.config.hidden_size,
             Self::FalconH1(m) => m.config().hidden_size(),
+            Self::GptOss(m) => m.config().hidden_size,
+            Self::Gemma4(m) => m.config.hidden_size,
             Self::Flux(m) => m.pos_embedder.dim as i32,
             Self::Bert(m) => m.config().hidden_size as i32,
         }
@@ -929,6 +1076,8 @@ impl DynamicModel {
             Self::RecurrentGemma(m) => eval_module_parameters_batched(m),
             Self::Jamba(m) => eval_module_parameters_batched(m),
             Self::FalconH1(m) => eval_module_parameters_batched(m),
+            Self::GptOss(m) => eval_module_parameters_batched(m),
+            Self::Gemma4(m) => eval_module_parameters_batched(m),
             Self::Flux(m) => eval_module_parameters_batched(m),
             Self::Bert(m) => eval_module_parameters_batched(m),
         }

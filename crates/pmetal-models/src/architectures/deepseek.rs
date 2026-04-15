@@ -1070,14 +1070,32 @@ impl DeepSeekModel {
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array> {
+        self.forward_with_capture(input_ids, mask, cache, None)
+    }
+
+    /// Forward pass with optional hidden-state capture for DFlash
+    /// speculative decoding.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array> {
         let mut h = self.embed_tokens.forward(input_ids);
         for (i, layer) in self.layers.iter_mut().enumerate() {
             h = layer.forward(&h, mask, cache.as_mut().map(|c| (&mut **c, i)))?;
+            if let Some(buf) = capture.as_deref_mut()
+                && buf.wants_hidden_for(i)
+            {
+                buf.record_hidden(i, h.clone());
+            }
         }
         Ok(self.norm.forward(&h))
     }
+
     pub fn forward_with_hidden(
         &mut self,
         input_ids: &Array,
@@ -1201,6 +1219,22 @@ impl DeepSeek {
             .lm_head
             .forward(&self.model.forward(input_ids, mask, cache)?))
     }
+
+    /// Forward pass that records hidden states into a DFlash capture
+    /// buffer for every requested layer index.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<Array> {
+        let hidden = self
+            .model
+            .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+        Ok(self.lm_head.forward(&hidden))
+    }
+
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
         KVCache::new(
             pmetal_mlx::kv_cache::KVCacheConfig::new(

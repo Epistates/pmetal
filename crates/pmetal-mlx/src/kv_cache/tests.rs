@@ -2,6 +2,7 @@
 
 use super::*;
 use crate::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
+use crate::test_utils::{max_abs_diff, to_f32_vec_eval};
 use pmetal_bridge::compat::{Array, Dtype, ops};
 
 fn seq_tensor(start: f32, len: usize) -> Array {
@@ -18,23 +19,6 @@ fn patterned_tensor(batch: usize, heads: usize, seq: usize, dim: usize, phase: f
         })
         .collect();
     Array::from_f32_slice(&data, &[batch as i32, heads as i32, seq as i32, dim as i32])
-}
-
-fn to_f32_vec_eval(arr: &Array) -> Vec<f32> {
-    let mut evaled = arr.clone();
-    evaled.eval();
-    let n = evaled.size();
-    evaled.to_f32_vec(n).unwrap_or_default()
-}
-
-fn max_abs_diff(lhs: &Array, rhs: &Array) -> f32 {
-    let lhs_v = to_f32_vec_eval(lhs);
-    let rhs_v = to_f32_vec_eval(rhs);
-    lhs_v
-        .iter()
-        .zip(rhs_v.iter())
-        .map(|(l, r)| (l - r).abs())
-        .fold(0.0f32, f32::max)
 }
 
 fn manual_attention_output(queries: &Array, keys: &Array, values: &Array, scale: f32) -> Array {
@@ -206,6 +190,61 @@ fn test_kv_cache_reset() {
     assert!(cache.is_empty());
     assert_eq!(cache.seq_len(), 0);
     assert_eq!(cache.total_tokens(), 0);
+}
+
+#[test]
+fn test_kv_cache_speculative_rollback_preserves_accepted_prefix() {
+    // Speculative-decoding scenario:
+    //   1. prefill 4 tokens     (offset 4)
+    //   2. verify appends 5 draft tokens → offset 9
+    //   3. only 2 of the 5 are accepted → trim 3 → offset 6
+    //   4. append 1 correction/bonus token → offset 7
+    // After the final append we must observe a contiguous [prefill || accepted || bonus]
+    // with the rejected tokens completely overwritten (matching dflash-mlx's
+    // `target.rewind_kv_caches` semantics).
+    let config = KVCacheConfig::new(1, 64, 1, 1);
+    let mut cache = KVCache::new(config);
+
+    let prefill = seq_tensor(0.0, 4); // [0,1,2,3]
+    let draft = seq_tensor(10.0, 5); // [10,11,12,13,14] (values the draft tried)
+    let accepted_bonus = seq_tensor(100.0, 1); // [100] the corrective token
+
+    cache.update_and_fetch(0, &prefill, &prefill).unwrap();
+    cache.update_and_fetch(0, &draft, &draft).unwrap();
+    assert_eq!(cache.seq_len(), 9);
+    assert_eq!(cache.total_tokens(), 9);
+
+    // 2 accepted out of 5 → rewind 3
+    let trimmed = cache.rollback(3);
+    assert_eq!(trimmed, 3);
+    assert_eq!(cache.seq_len(), 6);
+    assert_eq!(cache.total_tokens(), 6);
+
+    cache
+        .update_and_fetch(0, &accepted_bonus, &accepted_bonus)
+        .unwrap();
+    assert_eq!(cache.seq_len(), 7);
+
+    let (cached_k, _) = cache.get(0).unwrap();
+    let flat = to_f32_vec_eval(&cached_k);
+    assert_eq!(
+        flat,
+        vec![0.0, 1.0, 2.0, 3.0, 10.0, 11.0, 100.0],
+        "rollback must preserve accepted prefix and overwrite rejected tail"
+    );
+}
+
+#[test]
+fn test_kv_cache_rollback_clamps_to_seq_len() {
+    let config = KVCacheConfig::new(1, 100, 1, 1);
+    let mut cache = KVCache::new(config);
+    let tokens = seq_tensor(0.0, 3);
+    cache.update_and_fetch(0, &tokens, &tokens).unwrap();
+
+    // Asking to trim more than we have clamps to available.
+    let trimmed = cache.rollback(99);
+    assert_eq!(trimmed, 3);
+    assert_eq!(cache.seq_len(), 0);
 }
 
 #[test]
@@ -1345,4 +1384,170 @@ fn test_kv_cache_lazy_reset_deallocates() {
     assert!(cache.is_empty());
     // Verify buffers are deallocated by checking get returns None
     assert!(cache.get(0).is_none());
+}
+
+// =========================================================================
+// MambaCache / GDN rollback tests
+// =========================================================================
+
+fn gdn_random_inputs(
+    batch: usize,
+    t: usize,
+    hv: usize,
+    dk: usize,
+    dv: usize,
+    seed_phase: f32,
+) -> (Array, Array, Array, Array) {
+    // GDN input layout is [B, T, H, D]. `patterned_tensor(a, b, c, d)`
+    // already returns [a, b, c, d], so we pass the axes in the target order
+    // and skip the transpose.
+    let k = patterned_tensor(batch, t, hv, dk, seed_phase);
+    let v = patterned_tensor(batch, t, hv, dv, seed_phase + 0.31);
+    // g ∈ (0,1) so the state doesn't explode; use small patterned values
+    let g_len = batch * t * hv;
+    let g_data: Vec<f32> = (0..g_len)
+        .map(|i| 0.5 + 0.3 * ((i as f32 * 0.17 + seed_phase).sin()))
+        .collect();
+    let g = Array::from_f32_slice(&g_data, &[batch as i32, t as i32, hv as i32]);
+    // beta ∈ (0,1)
+    let beta_data: Vec<f32> = (0..g_len)
+        .map(|i| 0.5 + 0.25 * ((i as f32 * 0.09 + seed_phase).cos()))
+        .collect();
+    let beta = Array::from_f32_slice(&beta_data, &[batch as i32, t as i32, hv as i32]);
+    (k, v, g, beta)
+}
+
+#[test]
+fn test_mamba_snapshot_and_restore_roundtrip() {
+    let mut cache = MambaCache::new(2);
+
+    // Seed layer 0 with some fake state + conv_state
+    {
+        let entry = cache.get_mut(0).unwrap();
+        entry.ssm_state = Some(patterned_tensor(1, 2, 8, 16, 0.5));
+        entry.conv_state = Some(patterned_tensor(1, 3, 1, 32, 0.9).reshape(&[1, 3, 32]));
+    }
+
+    let snapshots = cache.snapshot();
+
+    // Mutate the cache after taking the snapshot
+    {
+        let entry = cache.get_mut(0).unwrap();
+        entry.ssm_state = Some(patterned_tensor(1, 2, 8, 16, 7.0));
+    }
+
+    // Restoring every layer verbatim brings the cache back to the snapshot
+    let no_inputs: Vec<Option<GdnVerifyInputs>> = vec![None, None];
+    cache
+        .rewind_from_snapshots(&snapshots, &no_inputs, 0)
+        .unwrap();
+
+    let after = cache.get(0).unwrap();
+    let before = snapshots[0].ssm_state.as_ref().unwrap();
+    assert!(
+        max_abs_diff(after.ssm_state.as_ref().unwrap(), before) < 1e-6,
+        "restore must be a bitwise roundtrip"
+    );
+}
+
+#[test]
+fn test_gdn_rollback_matches_never_went_there() {
+    // Speculative rollback invariant:
+    //   advance(S0, inputs[..M])  ==  rewind(snapshot=S0, inputs[..K], accepted=M)
+    //
+    // Where `inputs[..K]` is the full verify batch and `inputs[..M]` is the
+    // accepted prefix. The left-hand side is the "ground truth" — what we'd
+    // compute if we had known up-front to only advance through M tokens.
+    let batch = 1;
+    let t_verify = 5;
+    let accepted = 2;
+    let hv = 2;
+    let dk = 32;
+    let dv = 16;
+
+    let initial_state = patterned_tensor(batch, hv, dv, dk, 0.25);
+    let (k_full, v_full, g_full, beta_full) = gdn_random_inputs(batch, t_verify, hv, dk, dv, 1.0);
+
+    // Ground truth: advance through only the accepted prefix
+    let slice_time = |arr: &Array, n: i32| -> Array {
+        let shape = arr.shape();
+        let rank = shape.len();
+        let start = vec![0i32; rank];
+        let mut stop: Vec<i32> = shape.to_vec();
+        stop[1] = n;
+        arr.slice(&start, &stop)
+    };
+    let k_trunc = slice_time(&k_full, accepted as i32);
+    let v_trunc = slice_time(&v_full, accepted as i32);
+    let g_trunc = slice_time(&g_full, accepted as i32);
+    let beta_trunc = slice_time(&beta_full, accepted as i32);
+    let expected_state = crate::kernels::gated_delta_state_advance(
+        &initial_state,
+        &k_trunc,
+        &v_trunc,
+        &g_trunc,
+        &beta_trunc,
+    )
+    .unwrap();
+
+    // Rollback path: advance through the full verify batch, then rewind
+    let mut entry = MambaCacheEntry::default();
+    entry.ssm_state = Some(initial_state.clone());
+    let snapshot = entry.snapshot();
+
+    // Simulate verify advancing through all K tokens
+    let post_verify = crate::kernels::gated_delta_state_advance(
+        &initial_state, &k_full, &v_full, &g_full, &beta_full,
+    )
+    .unwrap();
+    entry.ssm_state = Some(post_verify);
+
+    let conv_input = ops::zeros(&[batch as i32, t_verify as i32, 4], Dtype::Float32);
+    let verify_inputs = GdnVerifyInputs {
+        keys: k_full,
+        values: v_full,
+        g: g_full,
+        beta: beta_full,
+        conv_input,
+        conv_kernel_size: 1, // no conv rewind path (we're testing SSM only)
+    };
+
+    entry.rewind(&snapshot, Some(&verify_inputs), accepted).unwrap();
+
+    let rolled_back = entry.ssm_state.as_ref().unwrap();
+    let diff = max_abs_diff(rolled_back, &expected_state);
+    assert!(
+        diff < 1e-4,
+        "rewound GDN state must equal never-went-there state, got max_diff={diff}"
+    );
+}
+
+#[test]
+fn test_gdn_rollback_zero_accepted_equals_snapshot() {
+    // If zero tokens are accepted, rewind must restore the exact snapshot —
+    // no replay through the verify inputs.
+    let mut entry = MambaCacheEntry::default();
+    let state = patterned_tensor(1, 2, 4, 8, 3.14);
+    entry.ssm_state = Some(state.clone());
+    let snapshot = entry.snapshot();
+
+    // Advance state through some verify work
+    let (k, v, g, beta) = gdn_random_inputs(1, 3, 2, 8, 4, 5.0);
+    let post = crate::kernels::gated_delta_state_advance(&state, &k, &v, &g, &beta).unwrap();
+    entry.ssm_state = Some(post);
+
+    let conv_input = ops::zeros(&[1, 3, 2], Dtype::Float32);
+    let inputs = GdnVerifyInputs {
+        keys: k,
+        values: v,
+        g,
+        beta,
+        conv_input,
+        conv_kernel_size: 1,
+    };
+
+    entry.rewind(&snapshot, Some(&inputs), 0).unwrap();
+
+    let diff = max_abs_diff(entry.ssm_state.as_ref().unwrap(), &state);
+    assert!(diff < 1e-6, "zero-accepted rewind must be verbatim snapshot");
 }

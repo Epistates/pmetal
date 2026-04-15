@@ -520,6 +520,23 @@ pub mod fast {
         x.rope(dims, traditional, base, scale, offset)
     }
 
+    /// Rotary position embedding with an explicit inverse-frequency
+    /// array. Use this when the template rotates only a subset of the
+    /// head dimensions but the rotation pairing still uses the full
+    /// head_dim — for example mlx-lm's `ProportionalRoPE` (Gemma 4).
+    /// The `freqs` array has shape `[head_dim / 2]` where non-rotated
+    /// slots are filled with `f32::INFINITY` so mlx skips them.
+    pub fn rope_with_freqs(
+        x: &Array,
+        dims: i32,
+        traditional: bool,
+        scale: f32,
+        offset: i32,
+        freqs: &Array,
+    ) -> Array {
+        x.rope_with_freqs(dims, traditional, scale, offset, freqs)
+    }
+
     /// Scaled dot-product attention with string mask mode (`"none"`, `"causal"`, …).
     pub fn scaled_dot_product_attention(
         q: &Array,

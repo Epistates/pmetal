@@ -290,6 +290,11 @@ pub struct TurboQuantCore {
     qjl_arr: Option<InlineArray>,
     /// InlineArray view of the inverse QJL projection matrix.
     inverse_qjl_arr: Option<InlineArray>,
+    /// Horizontally-stacked `[inverse_rotation | inverse_qjl]` of shape
+    /// `[dim, 2*dim]`. Lets the hot-path attention kernel do one fused
+    /// matmul for (query_rot, query_proj) instead of two separate
+    /// dispatches — saves one dispatch per layer per decode step.
+    stacked_inv_rot_qjl_arr: Option<InlineArray>,
     /// GPU-side signed-FWHT rotation signs for D=256 experiments.
     wht_left_signs_arr: Option<InlineArray>,
     /// GPU-side signed-FWHT rotation signs for D=256 experiments.
@@ -340,6 +345,19 @@ impl TurboQuantCore {
         let inverse_rotation_arr = matrix_to_inline_array(&inverse_rotation, dim);
         let qjl_arr = matrix_to_inline_array(&qjl_projection, dim);
         let inverse_qjl_arr = matrix_to_inline_array(&inverse_qjl_projection, dim);
+        // Precompute the horizontally-stacked [inv_rot | inv_qjl]
+        // matrix so the decode-time hot path can do a single matmul
+        // instead of two. Shape: [dim, 2*dim]. Built only when both
+        // component arrays built successfully; caller falls back to
+        // separate dispatches otherwise.
+        let stacked_inv_rot_qjl_arr =
+            if let (Some(rot), Some(qjl)) = (&inverse_rotation_arr, &inverse_qjl_arr) {
+                let stacked = crate::compat::ops::concatenate_axis(&[rot, qjl], -1);
+                stacked.eval();
+                Some(stacked)
+            } else {
+                None
+            };
         let signs_to_inline_array = |signs: &Option<Vec<f32>>| {
             if dim == 256 {
                 signs.as_ref().map(|values| {
@@ -386,6 +404,7 @@ impl TurboQuantCore {
             inverse_rotation_arr,
             qjl_arr,
             inverse_qjl_arr,
+            stacked_inv_rot_qjl_arr,
             wht_left_signs_arr,
             wht_right_signs_arr,
             qjl_wht_left_signs_arr,
@@ -697,6 +716,40 @@ impl TurboQuantCore {
         self.apply_array_transform_rows(input, &self.inverse_rotation_arr, |core, rows| {
             core.rotate_rows_wht(rows)
         })
+    }
+
+    /// Fused rotate + project: computes `input @ [inv_rotation | inv_qjl]`
+    /// as a single [N, 2*dim] matmul and splits the result back into
+    /// `(query_rot, query_proj)` of shape [N, dim] each. Saves one op
+    /// dispatch per decode step compared to calling `rotate_array` and
+    /// `project_array` separately. Returns `None` if the stacked matrix
+    /// wasn't built at construction (falls back to separate paths in
+    /// the caller), or if the FWHT fast path is enabled (that path
+    /// stays unchanged).
+    fn rotate_and_project_array(
+        &self,
+        input: &InlineArray,
+    ) -> Option<(InlineArray, InlineArray)> {
+        if turboquant_wht_enabled() && self.dim == 256 {
+            return None;
+        }
+        let stacked = self.stacked_inv_rot_qjl_arr.as_ref()?;
+        let shape = input.shape();
+        let ndim = shape.len();
+        if ndim == 0 {
+            return None;
+        }
+        let last_dim = shape[ndim - 1];
+        if last_dim as usize != self.dim {
+            return None;
+        }
+        let n: i32 = shape[..ndim - 1].iter().product();
+        let input_2d = input.reshape(&[n, last_dim]);
+        let fused = input_2d.matmul(stacked); // [n, 2*dim]
+        let dim_i32 = self.dim as i32;
+        let rot = fused.slice(&[0, 0], &[n, dim_i32]);
+        let proj = fused.slice(&[0, dim_i32], &[n, 2 * dim_i32]);
+        Some((rot, proj))
     }
 
     fn inverse_rotate_array(&self, input: &InlineArray) -> Option<InlineArray> {
@@ -2451,12 +2504,6 @@ impl QuantizedKvCache {
             0
         };
         let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
-        let query_rot = key_core.rotate_array(&query_rows)?;
-        let rotate_us = if trace_timing {
-            eval_stage_micros(&query_rot)
-        } else {
-            0
-        };
         let can_try_q8_fullbyte = turboquant_q8_fullbyte_enabled()
             && key_bits == 8
             && value_bits == 8
@@ -2466,14 +2513,33 @@ impl QuantizedKvCache {
             && ks.q8_fullbyte_seq.is_some()
             && ks.q8_slot_scales_seq.is_some()
             && vs.d256_rot_values_seq.is_some();
-        let mut query_proj: Option<InlineArray> = None;
         let mut project_us = 0;
-        if !can_try_q8_fullbyte {
-            let projected = key_core.project_array(&query_rows)?;
-            if trace_timing {
-                project_us = eval_stage_micros(&projected);
+        // Fused rotate+project: saves one dispatch per layer by doing
+        // `input @ [inv_rot | inv_qjl]` as a single [N, 2*dim] matmul
+        // instead of two separate [N, dim] matmuls. Only applied when
+        // both outputs are needed (i.e., the q8 fullbyte fast path is
+        // not taken). Falls back to sequential calls if the stacked
+        // matrix wasn't built.
+        let (query_rot, mut query_proj) = if !can_try_q8_fullbyte {
+            if let Some((rot, proj)) = key_core.rotate_and_project_array(&query_rows) {
+                (rot, Some(proj))
+            } else {
+                let rot = key_core.rotate_array(&query_rows)?;
+                let proj = key_core.project_array(&query_rows)?;
+                (rot, Some(proj))
             }
-            query_proj = Some(projected);
+        } else {
+            (key_core.rotate_array(&query_rows)?, None)
+        };
+        let rotate_us = if trace_timing {
+            eval_stage_micros(&query_rot)
+        } else {
+            0
+        };
+        if let Some(proj) = query_proj.as_ref() {
+            if trace_timing {
+                project_us = eval_stage_micros(proj);
+            }
         }
 
         let kv_rows = (layout.batch * layout.heads) as i32;

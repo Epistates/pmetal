@@ -34,6 +34,9 @@ pub enum NativeArch {
     DeepSeek,
     /// GPT-OSS (`model_type = "gpt_oss"`).
     GptOss,
+    /// Gemma 4 (`model_type = "gemma4"` / `"gemma4_text"`). Text-only 26B/31B
+    /// path — no MoE, no KV sharing, no per-layer-input gating.
+    Gemma4,
 }
 
 impl NativeArch {
@@ -48,6 +51,7 @@ impl NativeArch {
             Self::Llama4 => "Llama4",
             Self::DeepSeek => "DeepSeek",
             Self::GptOss => "GPT-OSS",
+            Self::Gemma4 => "Gemma4",
         }
     }
 }
@@ -88,6 +92,7 @@ pub fn detect_arch(model_path: &Path) -> Option<NativeArch> {
         "llama4" | "llama4_text" => Some(NativeArch::Llama4),
         "deepseek_v3" => Some(NativeArch::DeepSeek),
         "gpt_oss" => Some(NativeArch::GptOss),
+        "gemma4" | "gemma4_text" => Some(NativeArch::Gemma4),
         _ => None,
     }
 }
@@ -139,6 +144,24 @@ pub fn load_native_bridge_info(model_path: &Path) -> Result<Option<NativeBridgeI
                 num_kv_heads: config.num_key_value_heads as usize,
                 head_dim: config.head_dim as usize,
                 value_head_dim: config.head_dim as usize,
+                supports_turboquant: false,
+            }
+        }
+        NativeArch::Gemma4 => {
+            let config = pmetal_bridge::gemma4_native::load_config(model_path)?;
+            // Use the full-attention KV-head count since it's the smaller of
+            // the two per-layer-type dimensions — callers only use this to
+            // estimate KV-cache memory budgets.
+            let n_kv_full = config
+                .num_global_key_value_heads
+                .unwrap_or(config.num_key_value_heads);
+            let head_dim_full = config.global_head_dim.unwrap_or(config.head_dim);
+            NativeBridgeInfo {
+                arch,
+                num_layers: config.num_hidden_layers as usize,
+                num_kv_heads: n_kv_full.max(config.num_key_value_heads) as usize,
+                head_dim: head_dim_full.max(config.head_dim) as usize,
+                value_head_dim: head_dim_full.max(config.head_dim) as usize,
                 supports_turboquant: false,
             }
         }
@@ -372,6 +395,13 @@ pub fn run_native_inference_ext(
             quant_config,
             &mut on_token,
         ),
+        NativeArch::Gemma4 => run_gemma4(
+            model_path,
+            input_ids,
+            max_tokens,
+            params,
+            &mut on_token,
+        ),
     }
 }
 
@@ -595,6 +625,44 @@ fn build_qwen3_cache_with_quant(
     cache
 }
 
+// ============================================================================
+// Gemma 4
+// ============================================================================
+
+fn run_gemma4(
+    model_path: &Path,
+    input_ids: &[u32],
+    max_tokens: usize,
+    params: pmetal_bridge::decode::SamplingParams,
+    on_token: &mut dyn FnMut(u32) -> bool,
+) -> Result<NativeGenerationOutput, String> {
+    use pmetal_bridge::gemma4_native;
+
+    run_bridge_inference(
+        model_path,
+        input_ids,
+        max_tokens,
+        params,
+        on_token,
+        gemma4_native::load_config,
+        |config| {
+            format!(
+                "Gemma4: {} layers, hidden={}, head_dim={}, global_head_dim={:?}",
+                config.num_hidden_layers,
+                config.hidden_size,
+                config.head_dim,
+                config.global_head_dim
+            )
+        },
+        |path, config| gemma4_native::load_model(path, config),
+        |weights, config| gemma4_native::build_cache(weights, config),
+        gemma4_native::prefill_first_token,
+        |weights, config, cache, first_tok, remaining, params, on_token| {
+            gemma4_native::generate(weights, config, cache, first_tok, remaining, params, on_token)
+        },
+    )
+}
+
 /// Benchmark full prompt + generation throughput using the same workload shape
 /// as `mlx_lm.benchmark`: fixed prompt token ids, one warmup, EOS disabled, and
 /// repeated generations from a fresh cache.
@@ -667,6 +735,9 @@ pub fn benchmark_native_mlx_lm(
                 run_benchmark_trials(prompt_ids.len(), generation_tokens, num_trials, || {
                     gpt_oss_native::benchmark_mlx_lm_trial(&weights, prompt_ids, generation_tokens)
                 })
+            }
+            NativeArch::Gemma4 => {
+                return Err("Gemma 4 native benchmark mode is not implemented yet".to_string());
             }
         }
     };

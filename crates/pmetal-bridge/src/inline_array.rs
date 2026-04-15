@@ -62,6 +62,24 @@ unsafe extern "C" {
         scale: f32,
         off: i32,
     );
+    fn mlx_inline_rope_with_freqs(
+        dst: *mut RawBuf,
+        x: *const RawBuf,
+        dims: i32,
+        trad: bool,
+        scale: f32,
+        off: i32,
+        freqs: *const RawBuf,
+    );
+    fn mlx_inline_rope_with_pos_ids(
+        dst: *mut RawBuf,
+        x: *const RawBuf,
+        dims: i32,
+        trad: bool,
+        base: f32,
+        scale: f32,
+        offset_arr: *const RawBuf,
+    );
     fn mlx_inline_sdpa(
         dst: *mut RawBuf,
         q: *const RawBuf,
@@ -265,6 +283,47 @@ unsafe extern "C" {
         norm_topk_prob: bool,
     );
 
+    fn mlx_inline_compiled_gemma4_attn_block(
+        dst_out: *mut RawBuf,
+        dst_cache_keys: *mut RawBuf,
+        dst_cache_vals: *mut RawBuf,
+        x: *const RawBuf,
+        in_norm_w: *const RawBuf,
+        q_w: *const RawBuf,
+        k_w: *const RawBuf,
+        v_w: *const RawBuf,
+        o_w: *const RawBuf,
+        q_norm_w: *const RawBuf,
+        k_norm_w: *const RawBuf,
+        post_norm_w: *const RawBuf,
+        rope_freqs: *const RawBuf,
+        cache_keys_in: *const RawBuf,
+        cache_vals_in: *const RawBuf,
+        kv_offset: i32,
+        n_heads: i32,
+        n_kv: i32,
+        head_dim: i32,
+        in_norm_eps: f32,
+        qk_norm_eps: f32,
+        post_norm_eps: f32,
+        sliding_window: i32,
+        use_k_eq_v: bool,
+        rope_base: f32,
+        rope_dims: i32,
+    );
+
+    fn mlx_inline_compiled_gemma4_mlp_block(
+        dst_out: *mut RawBuf,
+        x: *const RawBuf,
+        pre_norm_w: *const RawBuf,
+        gate_w: *const RawBuf,
+        up_w: *const RawBuf,
+        down_w: *const RawBuf,
+        post_norm_w: *const RawBuf,
+        pre_norm_eps: f32,
+        post_norm_eps: f32,
+    );
+
     // Arange — non-broadcast tensor creation
     fn mlx_inline_arange(dst: *mut RawBuf, n: i32, dtype: i32);
     fn mlx_inline_load_safetensors_key(
@@ -393,6 +452,22 @@ unsafe extern "C" {
         dst_y: *mut RawBuf,
         dst_state: *mut RawBuf,
         q: *const RawBuf,
+        k: *const RawBuf,
+        v: *const RawBuf,
+        g: *const RawBuf,
+        beta: *const RawBuf,
+        state_in: *const RawBuf,
+        t: i32,
+    );
+
+    // ── GDN state-only advance for speculative-decoding rollback replay ──
+    //
+    // Same contract as `mlx_inline_gdn_metal_step` minus the `q`/`y` channels:
+    // advances the recurrent state through `t` tokens without computing the
+    // attention output. Roughly 2× faster per step than dispatching the
+    // full step kernel and discarding its output.
+    fn mlx_inline_gdn_metal_state_update(
+        dst_state: *mut RawBuf,
         k: *const RawBuf,
         v: *const RawBuf,
         g: *const RawBuf,
@@ -932,6 +1007,7 @@ unsafe extern "C" {
 
     // ── Fused compiled ops (match Python's @mx.compile) ──
     fn mlx_inline_fused_swiglu(dst: *mut RawBuf, gate: *const RawBuf, up: *const RawBuf);
+    fn mlx_inline_fused_geglu_tanh(dst: *mut RawBuf, gate: *const RawBuf, up: *const RawBuf);
     fn mlx_inline_fused_silu(dst: *mut RawBuf, x: *const RawBuf);
     fn mlx_inline_fused_compute_g(
         dst: *mut RawBuf,
@@ -1791,6 +1867,66 @@ impl InlineArray {
         }
     }
 
+    /// RoPE with an explicit inverse-frequency array. Pass the full
+    /// `head_dim` as `dims` and an `[rotated_dims / 2]`-sized `freqs`
+    /// array; non-rotated dimensions can be padded with `f32::INFINITY`
+    /// so `mx.fast.rope` skips them. This mirrors mlx-lm's
+    /// `ProportionalRoPE` — used by Gemma 4 full-attention layers.
+    pub fn rope_with_freqs(
+        &self,
+        dims: i32,
+        traditional: bool,
+        scale: f32,
+        offset: i32,
+        freqs: &Self,
+    ) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_rope_with_freqs(
+                dst.as_mut_ptr(),
+                &self.raw,
+                dims,
+                traditional,
+                scale,
+                offset,
+                &freqs.raw,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
+    /// Per-position RoPE: applies an array of int32 offsets (one per
+    /// token) instead of a single scalar offset. Required for tree
+    /// verify where each tree node has its own depth, not a
+    /// contiguous position sequence. `offset_arr` must be a 1-D int32
+    /// InlineArray of length `seq_len`.
+    pub fn rope_with_pos_ids(
+        &self,
+        dims: i32,
+        traditional: bool,
+        base: f32,
+        scale: f32,
+        offset_arr: &Self,
+    ) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_rope_with_pos_ids(
+                dst.as_mut_ptr(),
+                &self.raw,
+                dims,
+                traditional,
+                base,
+                scale,
+                &offset_arr.raw,
+            );
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
     pub fn sdpa(&self, k: &Self, v: &Self, scale: f32, mask_mode: &str) -> Self {
         let c = std::ffi::CString::new(mask_mode).unwrap();
         let mut dst = MaybeUninit::<RawBuf>::uninit();
@@ -2164,6 +2300,127 @@ impl InlineArray {
         }
     }
 
+    /// Fixed-shape compiled Gemma 4 attention block. Fuses
+    /// input_layernorm → q/k/v projections (with optional
+    /// `attention_k_eq_v` collapse) → q_norm / k_norm / v_norm-no-scale
+    /// → transpose → RoPE (custom freqs OR full base) → KV cache write
+    /// → SDPA → o_proj → post_attention_layernorm into a single
+    /// mlx::compile graph. Weights are expected in `[in, out]` form
+    /// (pre-transposed by the caller at load time).
+    #[allow(clippy::too_many_arguments)]
+    pub fn compiled_gemma4_attn_block(
+        x: &Self,
+        in_norm_w: &Self,
+        q_w: &Self,
+        k_w: &Self,
+        v_w: Option<&Self>,
+        o_w: &Self,
+        q_norm_w: &Self,
+        k_norm_w: &Self,
+        post_norm_w: &Self,
+        rope_freqs: Option<&Self>,
+        cache_keys_in: &Self,
+        cache_vals_in: &Self,
+        kv_offset: i32,
+        n_heads: i32,
+        n_kv: i32,
+        head_dim: i32,
+        in_norm_eps: f32,
+        qk_norm_eps: f32,
+        post_norm_eps: f32,
+        sliding_window: i32,
+        rope_base: f32,
+        rope_dims: i32,
+    ) -> (Self, Self, Self) {
+        let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
+        let mut ck_out = std::mem::MaybeUninit::<RawBuf>::uninit();
+        let mut cv_out = std::mem::MaybeUninit::<RawBuf>::uninit();
+        let use_k_eq_v = v_w.is_none();
+        let v_ptr: *const RawBuf = match v_w {
+            Some(v) => &v.raw,
+            None => &q_w.raw,
+        };
+        let freqs_ptr: *const RawBuf = match rope_freqs {
+            Some(f) => &f.raw,
+            None => std::ptr::null(),
+        };
+        unsafe {
+            mlx_inline_compiled_gemma4_attn_block(
+                out.as_mut_ptr(),
+                ck_out.as_mut_ptr(),
+                cv_out.as_mut_ptr(),
+                &x.raw,
+                &in_norm_w.raw,
+                &q_w.raw,
+                &k_w.raw,
+                v_ptr,
+                &o_w.raw,
+                &q_norm_w.raw,
+                &k_norm_w.raw,
+                &post_norm_w.raw,
+                freqs_ptr,
+                &cache_keys_in.raw,
+                &cache_vals_in.raw,
+                kv_offset,
+                n_heads,
+                n_kv,
+                head_dim,
+                in_norm_eps,
+                qk_norm_eps,
+                post_norm_eps,
+                sliding_window,
+                use_k_eq_v,
+                rope_base,
+                rope_dims,
+            );
+            (
+                Self {
+                    raw: out.assume_init(),
+                },
+                Self {
+                    raw: ck_out.assume_init(),
+                },
+                Self {
+                    raw: cv_out.assume_init(),
+                },
+            )
+        }
+    }
+
+    /// Fixed-shape compiled Gemma 4 MLP block. Fuses
+    /// `pre_feedforward_layernorm` + gate/up projections + tanh-approx GELU
+    /// + element-wise multiply + down_proj + `post_feedforward_layernorm`
+    /// into a single mlx::compile graph.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compiled_gemma4_mlp_block(
+        x: &Self,
+        pre_norm_w: &Self,
+        gate_w: &Self,
+        up_w: &Self,
+        down_w: &Self,
+        post_norm_w: &Self,
+        pre_norm_eps: f32,
+        post_norm_eps: f32,
+    ) -> Self {
+        let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_compiled_gemma4_mlp_block(
+                out.as_mut_ptr(),
+                &x.raw,
+                &pre_norm_w.raw,
+                &gate_w.raw,
+                &up_w.raw,
+                &down_w.raw,
+                &post_norm_w.raw,
+                pre_norm_eps,
+                post_norm_eps,
+            );
+            Self {
+                raw: out.assume_init(),
+            }
+        }
+    }
+
     /// Load a single array from a safetensors file by key name.
     /// Uses pmetal-bridge's MLX instance (not mlx-rs) — critical for avoiding
     /// dual-allocator interference.
@@ -2448,6 +2705,39 @@ impl InlineArray {
                     raw: dst_state.assume_init(),
                 },
             )
+        }
+    }
+
+    /// GDN state-only advance for speculative-decoding rollback replay.
+    ///
+    /// Same contract as [`gdn_metal_step`] but skips the query / output
+    /// projection — only the post-replay state is returned. Used when the
+    /// caller has accepted a prefix of a drafted block and wants to
+    /// reconstruct the recurrent state at the accepted position without
+    /// paying for the output computation.
+    #[inline]
+    pub fn gdn_metal_state_update(
+        k: &Self,
+        v: &Self,
+        g: &Self,
+        beta: &Self,
+        state: &Self,
+        t: i32,
+    ) -> Self {
+        let mut dst_state = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_gdn_metal_state_update(
+                dst_state.as_mut_ptr(),
+                &k.raw,
+                &v.raw,
+                &g.raw,
+                &beta.raw,
+                &state.raw,
+                t,
+            );
+            Self {
+                raw: dst_state.assume_init(),
+            }
         }
     }
 
@@ -3668,6 +3958,21 @@ impl InlineArray {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         unsafe {
             mlx_inline_fused_swiglu(dst.as_mut_ptr(), &gate.raw, &up.raw);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
+    /// Fused tanh-approx GEGLU matching mlx-lm's `nn.gelu_approx(gate) * up`.
+    /// All scalar constants are cast to `gate.dtype()` inside the compiled
+    /// lambda, so bf16 inputs stay bf16 — avoiding the silent f32 promotion
+    /// that otherwise doubled MLP bandwidth on the Gemma 4 hot path.
+    #[inline]
+    pub fn fused_geglu_tanh(gate: &Self, up: &Self) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_fused_geglu_tanh(dst.as_mut_ptr(), &gate.raw, &up.raw);
             Self {
                 raw: dst.assume_init(),
             }

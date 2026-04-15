@@ -853,17 +853,39 @@ impl Qwen3MoEModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, cache, None)
+    }
+
+    /// Forward pass with optional hidden-state capture for DFlash
+    /// speculative decoding.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+    ) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(input_ids);
 
         match cache {
             Some(cache) => {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                     h = layer.forward(&h, mask, Some((cache, layer_idx)))?;
+                    if let Some(buf) = capture.as_deref_mut()
+                        && buf.wants_hidden_for(layer_idx)
+                    {
+                        buf.record_hidden(layer_idx, h.clone());
+                    }
                 }
             }
             None => {
-                for layer in self.layers.iter_mut() {
+                for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                     h = layer.forward(&h, mask, None)?;
+                    if let Some(buf) = capture.as_deref_mut()
+                        && buf.wants_hidden_for(layer_idx)
+                    {
+                        buf.record_hidden(layer_idx, h.clone());
+                    }
                 }
             }
         }
@@ -932,6 +954,26 @@ impl Qwen3MoE {
         } else {
             // Tied embeddings: use embed_tokens weight as linear projection
             // embed_tokens.weight is [vocab, hidden], so logits = hidden @ weight.T
+            let embed_weight = self.model.embed_tokens.weight.value.as_ref();
+            Ok(hidden_states.matmul(&embed_weight.t()))
+        }
+    }
+
+    /// Forward pass that records hidden states into a DFlash capture
+    /// buffer at every tapped layer index.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<Array, Exception> {
+        let hidden_states =
+            self.model
+                .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+        if let Some(ref mut head) = self.lm_head {
+            Ok(head.forward(&hidden_states))
+        } else {
             let embed_weight = self.model.embed_tokens.weight.value.as_ref();
             Ok(hidden_states.matmul(&embed_weight.t()))
         }

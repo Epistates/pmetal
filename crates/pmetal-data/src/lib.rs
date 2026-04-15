@@ -16,7 +16,9 @@ pub mod dataloader;
 pub mod dataset;
 pub mod image_processing;
 pub mod inference_config;
+pub mod jinja_chat;
 pub mod packing;
+pub mod stream_format;
 pub mod tokenizer;
 pub mod vocab_compact;
 

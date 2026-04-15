@@ -755,6 +755,50 @@ pub fn gated_delta_inference_dispatch(
     gated_delta_ops(q, k, v, g, beta, Some(state), mask)
 }
 
+/// Replay the GDN recurrence forward from a saved `initial_state`, returning
+/// only the final state (no output `y`).
+///
+/// This is the speculative-decoding rollback primitive for hybrid models such
+/// as Qwen3.5: after a verify pass appends `T_verify` tokens but only `M < T`
+/// are accepted, call this with the pre-verify state snapshot and the
+/// accepted-prefix slices of `k`, `v`, `g`, `beta` to reconstruct the GDN
+/// state at exactly the accepted position. Matches dflash-mlx's
+/// `advance_gated_delta_states` helper but reuses the existing Metal kernel +
+/// ops path instead of shipping a second kernel.
+///
+/// # Shapes
+/// * `initial_state`: `[B, Hv, Dv, Dk]`
+/// * `k`: `[B, T, Hk, Dk]` (GQA-expanded internally)
+/// * `v`: `[B, T, Hv, Dv]`
+/// * `g`: `[B, T, Hv]`
+/// * `beta`: `[B, T, Hv]`
+///
+/// If `T == 0` the input state is returned unchanged.
+pub fn gated_delta_state_advance(
+    initial_state: &Array,
+    k: &Array,
+    v: &Array,
+    g: &Array,
+    beta: &Array,
+) -> Result<Array, Exception> {
+    let t = k.dim(1);
+    if t == 0 {
+        return Ok(initial_state.clone());
+    }
+    // Fast path: the dedicated state-only Metal kernel (no `q`, no `y`).
+    // Preconditions mirror `try_gdn_metal_kernel`: scalar gating, Dk % 32 == 0,
+    // Dk <= 256. These match every Qwen3.5 GDN layer today.
+    let dk = k.dim(3) as usize;
+    if g.ndim() == 3 && dk > 0 && dk % 32 == 0 && dk <= 256 {
+        return Ok(Array::gdn_metal_state_update(k, v, g, beta, initial_state, t));
+    }
+    // Fallback: reuse the full ops-based recurrence and discard `y`. This
+    // keeps GQA-expansion, vector gating, and the non-power-of-2 Dk edge
+    // cases working without a second code path.
+    let (_y, new_state) = gated_delta_ops(k, k, v, g, beta, Some(initial_state), None)?;
+    Ok(new_state)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn gated_delta_dispatch(
     q: &Array,

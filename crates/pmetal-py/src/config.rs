@@ -478,6 +478,8 @@ pub enum PyModelArchitecture {
     RecurrentGemma,
     Jamba,
     FalconH1,
+    GptOss,
+    Gemma4,
     Bert,
     Flux,
 }
@@ -503,6 +505,8 @@ impl From<pmetal_models::ModelArchitecture> for PyModelArchitecture {
             pmetal_models::ModelArchitecture::RecurrentGemma => Self::RecurrentGemma,
             pmetal_models::ModelArchitecture::Jamba => Self::Jamba,
             pmetal_models::ModelArchitecture::FalconH1 => Self::FalconH1,
+            pmetal_models::ModelArchitecture::GptOss => Self::GptOss,
+            pmetal_models::ModelArchitecture::Gemma4 => Self::Gemma4,
             pmetal_models::ModelArchitecture::Bert => Self::Bert,
             pmetal_models::ModelArchitecture::Flux => Self::Flux,
         }

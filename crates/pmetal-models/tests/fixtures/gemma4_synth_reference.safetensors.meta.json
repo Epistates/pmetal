@@ -1,0 +1,23 @@
+{
+  "captured_keys": [
+    "argmax_tokens",
+    "final_hidden",
+    "input_ids",
+    "layer_0_hidden",
+    "layer_1_hidden",
+    "logits",
+    "post_embed"
+  ],
+  "hidden_size": 128,
+  "manual_walk_vs_canonical_max_abs_diff": 0.0,
+  "model_id": "synthetic",
+  "num_hidden_layers": 2,
+  "rng_seed": 42,
+  "seq_len": 12,
+  "synthetic": true,
+  "tap_layers": [
+    0,
+    1
+  ],
+  "vocab_size": 512
+}

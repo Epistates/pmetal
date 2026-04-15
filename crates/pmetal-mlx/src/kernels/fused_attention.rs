@@ -84,6 +84,24 @@ fn dtype_key(dtype: Dtype) -> Option<&'static str> {
     }
 }
 
+/// Bucket a sequence length so that adjacent decode steps share a cache
+/// entry. Without this, every decode step grows the KV cache by 1 and
+/// forces a fresh backend benchmark — that's a 5-10x slowdown per step
+/// compared to the steady-state cached backend. Bucketing to the next
+/// power of two means we re-benchmark only when the cache passes a
+/// power-of-two boundary, which doubles the amortisation window each
+/// time.
+fn bucket_seq_len(seq_len: i32) -> i32 {
+    if seq_len <= 1 {
+        return 1;
+    }
+    let mut bucket = 1i32;
+    while bucket < seq_len {
+        bucket <<= 1;
+    }
+    bucket
+}
+
 impl AttentionDispatchKey {
     fn new(
         props: &DeviceProperties,
@@ -99,8 +117,8 @@ impl AttentionDispatchKey {
             batch: q_shape[0],
             num_heads: q_shape[1],
             num_kv_heads: k_shape[1],
-            query_seq_len: q_shape[2],
-            kv_seq_len: k_shape[2],
+            query_seq_len: bucket_seq_len(q_shape[2]),
+            kv_seq_len: bucket_seq_len(k_shape[2]),
             head_dim: q_shape[3],
             value_head_dim: config.effective_value_head_dim(),
             mask_type: config.mask_type,

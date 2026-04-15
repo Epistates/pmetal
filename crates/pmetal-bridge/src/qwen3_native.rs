@@ -2279,6 +2279,304 @@ pub fn forward_step(
     }
 }
 
+/// Variant of [`forward_step`] that tees post-layer hidden states at the
+/// indices listed in `tap_layers` into `captured`, in ascending-layer order.
+///
+/// The extra per-layer check is just a `contains` on a tiny vec and a
+/// refcount bump (`InlineArray` is a thin handle around an `mx::array`), so
+/// this path is within a few percent of the non-capture `forward_step`. It
+/// is intentionally a separate entry point rather than a generic hook so the
+/// hot path stays unbranched for non-DFlash callers.
+///
+/// `captured` is populated in the SAME ORDER as `tap_layers`. Callers that
+/// want the concatenated target-hidden tensor for a DFlash draft should
+/// concatenate along the last axis after this returns:
+///
+/// ```ignore
+/// let refs: Vec<&InlineArray> = captured.iter().collect();
+/// let target_hidden = ops::concatenate_axis(&refs, -1);
+/// ```
+pub fn forward_step_with_capture(
+    weights: &NativeWeights,
+    token_ids: &InlineArray,
+    cache: &mut NativeCache,
+    tap_layers: &[usize],
+    captured: &mut Vec<InlineArray>,
+) -> InlineArray {
+    captured.clear();
+    let b = token_ids.dim(0);
+    let s = token_ids.dim(1);
+    let dtype = weights.model_dtype;
+
+    let mut hidden =
+        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
+            let qcfg = weights.quantization_config.as_ref();
+            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
+            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
+            let w_rows = weights.embed_w.take_axis(token_ids, 0);
+            let s_rows = scales.take_axis(token_ids, 0);
+            let b_rows = biases.take_axis(token_ids, 0);
+            w_rows.dequantize(&s_rows, &b_rows, gs, bits)
+        } else {
+            weights.embed_w.take_axis(token_ids, 0)
+        };
+
+    let mut gdn_slot = 0usize;
+    let mut attn_slot = 0usize;
+
+    for (layer_idx, lw) in weights.layers.iter().enumerate() {
+        let normed = hidden.rms_norm(Some(&lw.input_ln_w), lw.input_ln_eps);
+        let r = if lw.is_linear {
+            let result = gdn_forward(lw, &normed, b, s, &mut cache.gdn_caches[gdn_slot], dtype);
+            gdn_slot += 1;
+            result
+        } else {
+            let result = attn_forward(
+                lw,
+                &normed,
+                b,
+                s,
+                &mut cache.kv_caches[attn_slot],
+                cache.rope_offset,
+                dtype,
+                weights.qjl_matrix.as_ref(),
+            );
+            attn_slot += 1;
+            result
+        };
+        let h = hidden.add(&r);
+        let mlp_in = h.rms_norm(Some(&lw.post_ln_w), lw.post_ln_eps);
+        let mlp_out = if lw.is_moe_layer {
+            moe_forward(lw, &mlp_in)
+        } else {
+            dense_mlp_forward(lw, &mlp_in)
+        };
+        hidden = h.add(&mlp_out);
+
+        // Tap hidden state POST-residual, matching mlx-lm's
+        // `hidden_states = layer(...)` + `if idx in target_layer_ids:
+        // selected_hidden_states.append(hidden_states)` pattern in
+        // `dflash_mlx/adapters.py`.
+        if tap_layers.contains(&layer_idx) {
+            captured.push(hidden.clone());
+        }
+    }
+
+    cache.rope_offset += s;
+
+    let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
+    if weights.tie_word_embeddings {
+        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
+            let qcfg = weights.quantization_config.as_ref();
+            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
+            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
+            hidden.quantized_matmul(&weights.embed_w, scales, Some(biases), true, gs, bits)
+        } else {
+            hidden.matmul(&weights.embed_w.t())
+        }
+    } else {
+        weights.lm_head_w.as_ref().unwrap().matmul_from(&hidden)
+    }
+}
+
+/// Tree-verify variant of [`forward_step_with_capture`]. Each token
+/// carries its own position id (from the DDTree tree compile) and the
+/// target's attention is gated by a custom additive mask encoding the
+/// tree visibility. All tapped layers are captured, same as the
+/// linear variant, so the DFlash draft can condition its next round
+/// on the accepted path's hidden states.
+///
+/// Only the plain-bf16 KV cache path is wired today. TurboQuant /
+/// quant-config modes silently fall back to their existing causal
+/// paths — the tree context is ignored for those (and the caller gets
+/// a warning via the normal `cache.turboquant.is_some()` routing).
+pub fn forward_step_tree_verify(
+    weights: &NativeWeights,
+    token_ids: &InlineArray,
+    cache: &mut NativeCache,
+    position_ids: &InlineArray,
+    attention_mask: &InlineArray,
+    tap_layers: &[usize],
+    captured: &mut Vec<InlineArray>,
+) -> InlineArray {
+    captured.clear();
+    let b = token_ids.dim(0);
+    let s = token_ids.dim(1);
+    let dtype = weights.model_dtype;
+    // Compile_tree builds `position_ids` as [1, S] for consistency
+    // with `token_ids`. Squeeze the batch axis to 1D — MLX's rope
+    // array-offset API expects offset shape `[batch]` where batch is
+    // the rope kernel's batch dim. After our [1,H,T,D]→[T,H,1,D]
+    // transpose trick, the rope batch dim has T elements.
+    let pos_ids_1d = if position_ids.ndim() == 2 && position_ids.dim(0) == 1 {
+        position_ids.reshape(&[position_ids.dim(1)])
+    } else {
+        position_ids.clone()
+    };
+    let tree_ctx = TreeVerifyInputs {
+        pos_ids: &pos_ids_1d,
+        attention_mask,
+    };
+
+    let mut hidden =
+        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
+            let qcfg = weights.quantization_config.as_ref();
+            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
+            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
+            let w_rows = weights.embed_w.take_axis(token_ids, 0);
+            let s_rows = scales.take_axis(token_ids, 0);
+            let b_rows = biases.take_axis(token_ids, 0);
+            w_rows.dequantize(&s_rows, &b_rows, gs, bits)
+        } else {
+            weights.embed_w.take_axis(token_ids, 0)
+        };
+
+    let mut gdn_slot = 0usize;
+    let mut attn_slot = 0usize;
+
+    for (layer_idx, lw) in weights.layers.iter().enumerate() {
+        let normed = hidden.rms_norm(Some(&lw.input_ln_w), lw.input_ln_eps);
+        let r = if lw.is_linear {
+            // Linear-attn layers in Qwen3.5 do not yet support tree
+            // verify; they process the sequence recurrently with no
+            // meaningful "mask" analogue. Fall back to scalar offset.
+            let result = gdn_forward(lw, &normed, b, s, &mut cache.gdn_caches[gdn_slot], dtype);
+            gdn_slot += 1;
+            result
+        } else {
+            let result = attn_forward_with_tree_ctx(
+                lw,
+                &normed,
+                b,
+                s,
+                &mut cache.kv_caches[attn_slot],
+                cache.rope_offset,
+                dtype,
+                weights.qjl_matrix.as_ref(),
+                Some(tree_ctx),
+            );
+            attn_slot += 1;
+            result
+        };
+        let h = hidden.add(&r);
+        let mlp_in = h.rms_norm(Some(&lw.post_ln_w), lw.post_ln_eps);
+        let mlp_out = if lw.is_moe_layer {
+            moe_forward(lw, &mlp_in)
+        } else {
+            dense_mlp_forward(lw, &mlp_in)
+        };
+        hidden = h.add(&mlp_out);
+
+        if tap_layers.contains(&layer_idx) {
+            captured.push(hidden.clone());
+        }
+    }
+
+    // Advance the global rope offset by the full tree length so that
+    // `rollback_cache` (which subtracts from BOTH `rope_offset` and
+    // each `kv.offset`) leaves the cache in a consistent state when
+    // the caller wants to discard the tree write entirely (the
+    // tree-pick + linear-commit path). Compact_tree_cache, used by
+    // the tree-only commit path, also still works because it
+    // unconditionally OVERWRITES `cache.rope_offset` to
+    // `past_length + accepted_count`.
+    cache.rope_offset += s;
+
+    let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
+    if weights.tie_word_embeddings {
+        if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
+            let qcfg = weights.quantization_config.as_ref();
+            let gs = qcfg.map(|q| q.group_size).unwrap_or(64);
+            let bits = qcfg.map(|q| q.bits).unwrap_or(4);
+            hidden.quantized_matmul(&weights.embed_w, scales, Some(biases), true, gs, bits)
+        } else {
+            hidden.matmul(&weights.embed_w.t())
+        }
+    } else {
+        weights.lm_head_w.as_ref().unwrap().matmul_from(&hidden)
+    }
+}
+
+/// Compact the target KV cache after a tree-verify round: the verify
+/// forward wrote `tree_length` (full tree) keys/values into the cache
+/// starting at `past_length`; this function gathers the accepted
+/// indices (relative to the tree's local index space 0..tree_length)
+/// and rewrites them contiguously at the start of the appended
+/// window. Advances `cache.offset` by `accepted_indices.len()` on
+/// each layer and sets `cache.rope_offset` accordingly.
+///
+/// Matches DDTree's `compact_dynamic_cache` but operates on the
+/// native `KvLayerCache` buffers directly: we use `take_axis` for the
+/// row gather and `slice_set` to write the compacted rows back.
+pub fn compact_tree_cache(
+    cache: &mut NativeCache,
+    past_length: i32,
+    tree_length: i32,
+    accepted_indices: &[usize],
+) {
+    if accepted_indices.is_empty() {
+        return;
+    }
+    let keep_len = accepted_indices.len() as i32;
+    let kept_indices: Vec<i32> = accepted_indices
+        .iter()
+        .map(|&i| past_length + i as i32)
+        .collect();
+    let idx_arr = InlineArray::from_i32_slice(&kept_indices);
+
+    for kv in cache.kv_caches.iter_mut() {
+        let Some(k_buf) = kv.keys.take() else { continue };
+        let Some(v_buf) = kv.values.take() else { continue };
+        let shape = k_buf.shape().to_vec();
+        let n_kv = shape[1];
+        let head_dim = shape[3];
+
+        // Gather the accepted rows from along the seq axis using
+        // `take_axis(axis=2)`. Result is [B, Hkv, keep_len, D].
+        let kept_k = k_buf.take_axis(&idx_arr, 2);
+        let kept_v = v_buf.take_axis(&idx_arr, 2);
+
+        // Write the gathered rows back starting at `past_length` via
+        // `slice_set`. This leaves any rows past `past_length +
+        // keep_len` in the buffer untouched — the rejected
+        // verify-block keys/values. They'll get overwritten by the
+        // next round's writes since `offset` is now lower.
+        let start = [0, 0, past_length, 0];
+        let stop = [1, n_kv, past_length + keep_len, head_dim];
+        let new_k = k_buf.slice_set(&kept_k, &start, &stop);
+        let new_v = v_buf.slice_set(&kept_v, &start, &stop);
+
+        kv.keys = Some(new_k);
+        kv.values = Some(new_v);
+        kv.offset = past_length + keep_len;
+    }
+    cache.rope_offset = past_length + keep_len;
+    // `tree_length` is the total number of positions the verify forward
+    // wrote beyond `past_length`. `accepted_indices.len()` is how many
+    // we committed. The unused slots (tree_length - keep_len) stay
+    // allocated but are now beyond `offset` — effectively garbage
+    // that the next write will clobber.
+    let _ = tree_length;
+}
+
+/// Rollback the target KV state by `n` positions. Mirrors
+/// [`pmetal_mlx::kv_cache::KVCache::rollback`] but operates on the native
+/// cache — decrements `rope_offset` on the cache and on each KV layer,
+/// leaving the underlying buffer intact. Subsequent writes refill the
+/// rejected slots.
+///
+/// Caller is responsible for ensuring the cache is in a quiescent state
+/// (no pending ops referencing the rolled-back slots).
+pub fn rollback_cache(cache: &mut NativeCache, n: i32) {
+    if n <= 0 {
+        return;
+    }
+    cache.rope_offset = cache.rope_offset.saturating_sub(n);
+    for kv in cache.kv_caches.iter_mut() {
+        kv.offset = kv.offset.saturating_sub(n);
+    }
+}
+
 // ============================================================================
 // Dense MLP forward
 // ============================================================================
@@ -2290,6 +2588,7 @@ fn dense_mlp_forward(lw: &LayerWeights, mlp_in: &InlineArray) -> InlineArray {
     let activated = InlineArray::fused_swiglu(&gate, &up);
     lw.mlp_down_w.as_ref().unwrap().matmul_from(&activated)
 }
+
 
 // ============================================================================
 // MoE forward
@@ -2598,6 +2897,64 @@ fn gdn_forward(
 // ============================================================================
 
 #[allow(clippy::too_many_arguments)]
+/// Optional inputs for tree-verify attention: per-token absolute
+/// position ids and a custom additive attention mask.
+///
+/// Routes the per-token RoPE through MLX's fused `fast::rope` (the
+/// SAME kernel linear DFlash uses) via a reshape trick: the input
+/// `[B, H, T, D]` tensor is transposed to `[T, H, 1, D]` so the
+/// `T`-token sequence becomes the rope's batch axis. MLX's array-
+/// offset overload accepts one offset per batch element, so passing
+/// `pos_ids` of shape `[T]` rotates each token at its own absolute
+/// position with the EXACT same numerics linear DFlash gets. No
+/// hand-rolled cos/sin → no bf16 ULP drift compounding across
+/// 100+ decode rounds.
+#[derive(Clone, Copy)]
+pub(crate) struct TreeVerifyInputs<'a> {
+    /// `[T]` int32 — per-token absolute positions (round offset +
+    /// tree depth). Used as the array-offset for MLX rope.
+    pub pos_ids: &'a InlineArray,
+    /// `[1, 1, seq_len, past_length + seq_len]` additive mask in the
+    /// current dtype. `0` at visible positions, `-inf` elsewhere.
+    pub attention_mask: &'a InlineArray,
+}
+
+/// Apply per-token RoPE to a `[1, H, T, D]` tensor by routing through
+/// MLX's fused `fast::rope` array-offset overload.
+///
+/// The trick: MLX's `rope(x, array offset)` accepts one offset per
+/// BATCH element. We transpose `[1, H, T, D]` → `[T, H, 1, D]` so the
+/// `T`-token sequence becomes the rope's batch axis with one token
+/// per batch slot. The `pos_ids` array (shape `[T]`) then provides
+/// the per-token absolute positions. After the rope call, transpose
+/// back to `[1, H, T, D]`.
+///
+/// This guarantees numerical equivalence with linear DFlash's RoPE
+/// path because both use the SAME MLX kernel — no hand-rolled
+/// cos/sin, no separate ops with intermediate fp32 stores. Each
+/// position rotation is computed in fused fp32 registers exactly as
+/// MLX does for sequential positions.
+///
+/// `rotated_dims` must equal the head's rotary width (== head_dim
+/// for Qwen3 full RoPE).
+fn apply_per_position_rope(
+    x: &InlineArray,
+    pos_ids: &InlineArray,
+    rotated_dims: i32,
+    base: f32,
+    scale: f32,
+) -> InlineArray {
+    // x shape: [B=1, H, T, D]. Transpose to [T, H, 1, D] so the rope
+    // batch axis carries one token per row. The fast::rope kernel
+    // sees a "batch" of T elements, each with H heads × 1 token × D
+    // dim, and applies offset[batch_idx] + 0 = pos_ids[batch_idx] to
+    // each one. Bit-exact with the linear path because both go
+    // through the SAME MLX kernel.
+    let xt = x.transpose_axes(&[2, 1, 0, 3]);
+    let rotated = xt.rope_with_pos_ids(rotated_dims, false, base, scale, pos_ids);
+    rotated.transpose_axes(&[2, 1, 0, 3])
+}
+
 fn attn_forward(
     lw: &LayerWeights,
     normed: &InlineArray,
@@ -2607,6 +2964,20 @@ fn attn_forward(
     rope_offset: i32,
     dtype: i32,
     qjl_matrix: Option<&InlineArray>,
+) -> InlineArray {
+    attn_forward_with_tree_ctx(lw, normed, b, s, cache, rope_offset, dtype, qjl_matrix, None)
+}
+
+fn attn_forward_with_tree_ctx(
+    lw: &LayerWeights,
+    normed: &InlineArray,
+    b: i32,
+    s: i32,
+    cache: &mut KvLayerCache,
+    rope_offset: i32,
+    dtype: i32,
+    qjl_matrix: Option<&InlineArray>,
+    tree_ctx: Option<TreeVerifyInputs>,
 ) -> InlineArray {
     let n_heads = lw.attn_n_heads;
     let n_kv_heads = lw.attn_n_kv_heads;
@@ -2711,21 +3082,48 @@ fn attn_forward(
     let keys = keys.transpose_axes(&[0, 2, 1, 3]);
     let values = values.transpose_axes(&[0, 2, 1, 3]);
 
-    // RoPE (full for Qwen3, partial for Qwen3.5)
-    let queries = queries.rope(
-        lw.attn_rope_dims,
-        false,
-        lw.attn_rope_base,
-        lw.attn_rope_scale,
-        rope_offset,
-    );
-    let keys = keys.rope(
-        lw.attn_rope_dims,
-        false,
-        lw.attn_rope_base,
-        lw.attn_rope_scale,
-        rope_offset,
-    );
+    // RoPE: default path uses `fast::rope` with a scalar offset.
+    // Tree-verify mode threads each token's absolute position
+    // through MLX's array-offset overload via the [1,H,T,D]→[T,H,1,D]
+    // transpose trick. Both paths use the SAME MLX kernel — no
+    // hand-rolled rope, no bf16 ULP drift between the two modes, so
+    // tree DFlash output stays bit-exact with linear DFlash
+    // (and therefore with greedy decode at temperature=0).
+    let (queries, keys) = if let Some(ctx) = tree_ctx {
+        (
+            apply_per_position_rope(
+                &queries,
+                ctx.pos_ids,
+                lw.attn_rope_dims,
+                lw.attn_rope_base,
+                lw.attn_rope_scale,
+            ),
+            apply_per_position_rope(
+                &keys,
+                ctx.pos_ids,
+                lw.attn_rope_dims,
+                lw.attn_rope_base,
+                lw.attn_rope_scale,
+            ),
+        )
+    } else {
+        (
+            queries.rope(
+                lw.attn_rope_dims,
+                false,
+                lw.attn_rope_base,
+                lw.attn_rope_scale,
+                rope_offset,
+            ),
+            keys.rope(
+                lw.attn_rope_dims,
+                false,
+                lw.attn_rope_base,
+                lw.attn_rope_scale,
+                rope_offset,
+            ),
+        )
+    };
 
     // KV cache update + SDPA
     let output = if let Some(ref mut tq_cache) = cache.turboquant {
@@ -3301,7 +3699,13 @@ fn attn_forward(
             .as_ref()
             .unwrap()
             .slice(&[0, 0, 0, 0], &[b, n_kv_heads, next, head_dim]);
-        crate::decode::sdpa_causal_like_mlx(&queries, &valid_keys, &valid_values, scale, s)
+        if let Some(ctx) = tree_ctx {
+            // Tree verify: use the caller-supplied additive mask that
+            // encodes tree visibility instead of "causal" semantics.
+            queries.sdpa_with_mask(&valid_keys, &valid_values, scale, Some(ctx.attention_mask))
+        } else {
+            crate::decode::sdpa_causal_like_mlx(&queries, &valid_keys, &valid_values, scale, s)
+        }
     };
 
     // Output projection

@@ -46,6 +46,9 @@ pub mod sequence_packing;
 pub mod smart_checkpoint;
 pub mod speculative;
 
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
+
 mod array_ext;
 
 pub use array_ext::*;

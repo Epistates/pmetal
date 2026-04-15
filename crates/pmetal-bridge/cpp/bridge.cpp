@@ -164,7 +164,22 @@ void mlx_inline_rope(mlx_inline_array* dst, const mlx_inline_array* x,
                       int dims, bool traditional, float base, float scale, int offset) {
     try {
         new (dst->buf) array(mlx::core::fast::rope(
-            as_arr(x), dims, traditional, base, scale, offset));
+            as_arr(x), dims, traditional, std::optional<float>(base), scale, offset));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+}
+
+// RoPE with an explicit inverse-frequency array. Used by templates like
+// Gemma 4's ProportionalRoPE where only a subset of the head dim rotates,
+// but the rotation pairing still uses the full head dim — passing freqs
+// with `inf` in the non-rotated slots tells mlx to skip those
+// dimensions without any slicing on the caller side.
+void mlx_inline_rope_with_freqs(mlx_inline_array* dst, const mlx_inline_array* x,
+                                 int dims, bool traditional, float scale, int offset,
+                                 const mlx_inline_array* freqs) {
+    try {
+        new (dst->buf) array(mlx::core::fast::rope(
+            as_arr(x), dims, traditional, std::nullopt, scale, offset,
+            std::optional<array>(as_arr(freqs))));
     } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
 
@@ -177,6 +192,23 @@ void mlx_inline_sdpa(mlx_inline_array* dst,
             as_arr(q), as_arr(k), as_arr(v), scale, mode));
     } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
 }
+
+// Per-position RoPE: applies an array of int offsets (one per token) to x.
+// Used by DDTree-style tree verify where each tree node has its own depth
+// rather than a single sequential offset. `offset_arr` must be a 1-D int32
+// InlineArray of length `seq_len` (the `q_len` dim of x).
+void mlx_inline_rope_with_pos_ids(mlx_inline_array* dst,
+                                    const mlx_inline_array* x,
+                                    int dims, bool traditional, float base, float scale,
+                                    const mlx_inline_array* offset_arr) {
+    try {
+        new (dst->buf) array(mlx::core::fast::rope(
+            as_arr(x), dims, traditional, std::optional<float>(base), scale,
+            as_arr(offset_arr)));
+    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+}
+
+// `mlx_inline_sdpa_with_mask` is defined in bridge_inference.cpp.
 
 // Split (writes N+1 arrays into pre-allocated output slots)
 void mlx_inline_split(const mlx_inline_array* input, const int* indices, int num_indices,

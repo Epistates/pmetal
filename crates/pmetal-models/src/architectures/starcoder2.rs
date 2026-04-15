@@ -167,11 +167,27 @@ impl StarCoder2Model {
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
+        cache: Option<&mut pmetal_mlx::kv_cache::KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, cache, None)
+    }
+
+    /// Forward pass with optional DFlash hidden-state capture.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
         mut cache: Option<&mut pmetal_mlx::kv_cache::KVCache>,
+        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         let mut x = self.embed_tokens.forward(input_ids);
         for (i, layer) in self.layers.iter_mut().enumerate() {
             x = layer.forward(&x, mask, cache.as_mut().map(|c| (&mut **c, i)))?;
+            if let Some(buf) = capture.as_deref_mut()
+                && buf.wants_hidden_for(i)
+            {
+                buf.record_hidden(i, x.clone());
+            }
         }
         x = self.norm.forward(&x);
         Ok(self.lm_head.forward(&x))

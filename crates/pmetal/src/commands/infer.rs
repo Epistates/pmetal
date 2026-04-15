@@ -596,27 +596,17 @@ pub(crate) async fn run_inference(
         } else {
             already_streamed = true;
             let tokenizer = &runner.tokenizer;
-            let mut token_buf: Vec<u32> = Vec::new();
-            let mut streamed_text = String::new();
+            let show_thinking = use_chat && !hide_thinking && !no_thinking;
+            let mut formatter = pmetal_data::stream_format::StreamFormatter::new(
+                tokenizer,
+                show_thinking,
+            );
             runner.state.generate_streaming(|token_id| {
                 use std::io::Write;
-                token_buf.push(token_id);
-                if let Ok(text) = tokenizer.decode(&token_buf) {
-                    if text.len() > streamed_text.len() {
-                        // Tokenizer may retroactively change multi-byte chars
-                        // (e.g. replacement char → full emoji), so the old byte
-                        // offset can land mid-character in the new string.
-                        let idx = streamed_text.len();
-                        let start = (idx..=text.len())
-                            .find(|&i| text.is_char_boundary(i))
-                            .unwrap_or(text.len());
-                        if start < text.len() {
-                            let delta = &text[start..];
-                            let _ = std::io::stdout().write_all(delta.as_bytes());
-                            let _ = std::io::stdout().flush();
-                        }
-                    }
-                    streamed_text = text;
+                let delta = formatter.push_token(tokenizer, token_id);
+                if !delta.is_empty() {
+                    let _ = std::io::stdout().write_all(delta.as_bytes());
+                    let _ = std::io::stdout().flush();
                 }
                 true
             })?

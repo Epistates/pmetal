@@ -83,6 +83,7 @@ pub fn collect_all_stop_tokens(
         "<|endoftext|>",
         "<|end_of_text|>",
         "<end_of_turn>",
+        "<turn|>", // Gemma 4 — distinct from Gemma 2/3's <end_of_turn>.
         "<|end|>",
         "<|return|>",
         "<|END_OF_TURN_TOKEN|>",
@@ -311,6 +312,51 @@ pub fn resolve_auto_mode(mode: SamplingMode, thinking: bool) -> SamplingMode {
     }
 }
 
+/// Read `generation_config.json` into a [`SamplingDefaults`], starting from
+/// the global fallback and overriding each field that the file explicitly
+/// provides. Missing fields leave the global default in place. This is the
+/// raw stage-2 of the loading pipeline (step 1+2 in [`load_sampling_defaults`])
+/// and is exposed so the chat-template audit can verify that HF's declared
+/// values are actually picked up, independent of any mode preset that might
+/// override them later.
+pub fn load_sampling_from_generation_config(model_path: &Path) -> SamplingDefaults {
+    let mut defaults = SamplingDefaults::default();
+    let config_path = model_path.join("generation_config.json");
+    if !config_path.exists() {
+        return defaults;
+    }
+    let content = match std::fs::read_to_string(&config_path) {
+        Ok(c) => c,
+        Err(_) => return defaults,
+    };
+    let config: serde_json::Value = match serde_json::from_str(&content) {
+        Ok(c) => c,
+        Err(_) => return defaults,
+    };
+    if let Some(v) = config.get("temperature").and_then(|v| v.as_f64()) {
+        defaults.temperature = v as f32;
+    }
+    if let Some(v) = config.get("top_k").and_then(|v| v.as_u64()) {
+        defaults.top_k = v as usize;
+    }
+    if let Some(v) = config.get("top_p").and_then(|v| v.as_f64()) {
+        defaults.top_p = v as f32;
+    }
+    if let Some(v) = config.get("min_p").and_then(|v| v.as_f64()) {
+        defaults.min_p = v as f32;
+    }
+    if let Some(v) = config.get("repetition_penalty").and_then(|v| v.as_f64()) {
+        defaults.repetition_penalty = v as f32;
+    }
+    if let Some(v) = config.get("frequency_penalty").and_then(|v| v.as_f64()) {
+        defaults.frequency_penalty = v as f32;
+    }
+    if let Some(v) = config.get("presence_penalty").and_then(|v| v.as_f64()) {
+        defaults.presence_penalty = v as f32;
+    }
+    defaults
+}
+
 /// Load sampling defaults with the full resolution chain:
 ///
 /// 1. Start with global fallback (`SamplingDefaults::default()`)
@@ -324,40 +370,12 @@ pub fn load_sampling_defaults(
     mode: SamplingMode,
     thinking: bool,
 ) -> SamplingDefaults {
-    // 1. Global fallback
-    let mut defaults = SamplingDefaults::default();
+    // Steps 1 + 2: baseline + generation_config.json.
+    let mut defaults = load_sampling_from_generation_config(model_path);
 
-    // 2. generation_config.json (model's declared defaults)
-    let config_path = model_path.join("generation_config.json");
-    if config_path.exists() {
-        if let Ok(content) = std::fs::read_to_string(&config_path) {
-            if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
-                if let Some(v) = config.get("temperature").and_then(|v| v.as_f64()) {
-                    defaults.temperature = v as f32;
-                }
-                if let Some(v) = config.get("top_k").and_then(|v| v.as_u64()) {
-                    defaults.top_k = v as usize;
-                }
-                if let Some(v) = config.get("top_p").and_then(|v| v.as_f64()) {
-                    defaults.top_p = v as f32;
-                }
-                if let Some(v) = config.get("min_p").and_then(|v| v.as_f64()) {
-                    defaults.min_p = v as f32;
-                }
-                if let Some(v) = config.get("repetition_penalty").and_then(|v| v.as_f64()) {
-                    defaults.repetition_penalty = v as f32;
-                }
-                if let Some(v) = config.get("frequency_penalty").and_then(|v| v.as_f64()) {
-                    defaults.frequency_penalty = v as f32;
-                }
-                if let Some(v) = config.get("presence_penalty").and_then(|v| v.as_f64()) {
-                    defaults.presence_penalty = v as f32;
-                }
-            }
-        }
-    }
-
-    // 3. Mode preset (overrides generation_config.json for mode-specific params)
+    // Step 3: model-card preset (overrides generation_config values for
+    // mode-specific params like presence_penalty that the JSON usually
+    // lacks).
     let resolved_mode = resolve_auto_mode(mode, thinking);
     if let Some(preset) = model_preset(template, resolved_mode) {
         tracing::info!(

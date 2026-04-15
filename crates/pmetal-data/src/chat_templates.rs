@@ -257,6 +257,11 @@ pub enum ChatTemplateType {
     Mistral,
     /// Gemma format: <start_of_turn>role\ncontent<end_of_turn>
     Gemma,
+    /// Gemma 4 format: `<|turn>role\ncontent<turn|>\n`, role=`model` for the
+    /// assistant turn, with an optional `<|think|>` system block for the
+    /// built-in reasoning channel. Distinct from Gemma 2/3 — the tokens are
+    /// different (`<|turn>`/`<turn|>` vs `<start_of_turn>`/`<end_of_turn>`).
+    Gemma4,
     /// Phi-3 format: <|user|>content<|end|><|assistant|>content<|end|>
     Phi3,
     /// Phi-4 format: <|im_start|>role<|im_sep|>content<|im_end|>
@@ -291,6 +296,7 @@ impl ChatTemplateType {
             Self::Llama3 => "<|eot_id|>",
             Self::Mistral => "</s>",
             Self::Gemma => "<end_of_turn>",
+            Self::Gemma4 => "<turn|>",
             Self::Phi3 => "<|end|>",
             Self::Alpaca => "</s>",
             Self::Vicuna => "</s>",
@@ -355,6 +361,13 @@ pub struct ChatTemplate {
     pub add_bos: bool,
     /// Whether to add EOS at the end.
     pub add_eos: bool,
+    /// Raw Jinja template source from `tokenizer_config.json::chat_template`.
+    /// When present, [`ChatTemplate::apply_inference`] renders this directly
+    /// via `minijinja`, which is bit-exact with HuggingFace's
+    /// `AutoTokenizer.apply_chat_template`. Falls back to the hardcoded
+    /// `format_*` functions when this is `None` (base models without a
+    /// chat_template) or when Jinja rendering fails at runtime.
+    pub jinja_source: Option<String>,
 }
 
 impl ChatTemplate {
@@ -374,6 +387,7 @@ impl ChatTemplate {
                     | ChatTemplateType::Cohere
             ),
             add_eos: true,
+            jinja_source: None,
         }
     }
 
@@ -402,6 +416,13 @@ impl ChatTemplate {
     /// Create a Gemma template.
     pub fn gemma() -> Self {
         Self::new(ChatTemplateType::Gemma)
+    }
+
+    /// Create a Gemma 4 template (distinct from Gemma 2/3 — uses `<|turn>`
+    /// and `<turn|>` with an asymmetric pipe on each side and role `model`
+    /// for the assistant turn).
+    pub fn gemma4() -> Self {
+        Self::new(ChatTemplateType::Gemma4)
     }
 
     /// Create a Phi-3 template.
@@ -498,6 +519,7 @@ impl ChatTemplate {
             // Templates without native tool support — inject tools into system prompt via ChatML style
             ChatTemplateType::Llama2 => self.format_llama2(messages),
             ChatTemplateType::Gemma => self.format_gemma(messages),
+            ChatTemplateType::Gemma4 => self.format_gemma4(messages),
             ChatTemplateType::Phi3 => self.format_phi3(messages),
             ChatTemplateType::Phi4 => self.format_phi4(messages),
             ChatTemplateType::Alpaca => self.format_alpaca(messages),
@@ -511,18 +533,106 @@ impl ChatTemplate {
 
     /// Format an inference prompt with any template-specific generation prefill.
     ///
-    /// Most templates can reuse the standard formatter, but Qwen 3 / 3.5 expects
-    /// the assistant generation prompt to include a `<think>` prefill rather than
-    /// relying on a `/no_think` system directive.
+    /// When a Jinja `chat_template` is attached (from
+    /// `tokenizer_config.json`), this method renders it via `minijinja` —
+    /// bit-exact with HuggingFace's `AutoTokenizer.apply_chat_template`.
+    /// Falls back to the hardcoded `format_*` functions only when the
+    /// Jinja source is missing or rendering fails.
     pub fn apply_inference(
         &self,
         messages: &[Message],
         no_thinking: bool,
         tools: Option<&[ToolDefinition]>,
     ) -> FormattedChat {
+        // 1. Prefer the upstream Jinja template when present. This is the
+        //    only path that gets model-specific default system messages
+        //    (Qwen2.5, SmolLM2), dynamic date injection (Llama 3), and
+        //    multi-channel GPT-OSS preambles correct.
+        if let Some(rendered) = self.render_jinja(messages, no_thinking, tools) {
+            return FormattedChat {
+                text: rendered,
+                response_start: 0, // training masks set this separately
+                template_type: self.template_type,
+            };
+        }
+        // 2. Hardcoded fallback for base models without a chat_template.
         match self.template_type {
             ChatTemplateType::Qwen => self.format_qwen_inference(messages, tools, no_thinking),
             _ => self.apply_with_tools(messages, tools),
+        }
+    }
+
+    /// Try to render the template via the upstream Jinja source. Returns
+    /// `None` when no Jinja source is attached, or when rendering fails —
+    /// callers should fall back to the hardcoded formatter in that case.
+    fn render_jinja(
+        &self,
+        messages: &[Message],
+        no_thinking: bool,
+        tools: Option<&[ToolDefinition]>,
+    ) -> Option<String> {
+        let src = self.jinja_source.as_deref()?;
+
+        // Map pmetal's internal Message into the shape HF Jinja templates
+        // expect. We carry tool_calls / tool_call_id through verbatim.
+        let jinja_messages: Vec<crate::jinja_chat::JinjaMessage> = messages
+            .iter()
+            .map(|m| crate::jinja_chat::JinjaMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+                tool_calls: m.tool_calls.as_ref().map(|calls| {
+                    calls
+                        .iter()
+                        .map(|c| {
+                            serde_json::json!({
+                                "id": c.id,
+                                "type": "function",
+                                "function": {
+                                    "name": c.function.name,
+                                    "arguments": c.function.arguments,
+                                },
+                            })
+                        })
+                        .collect()
+                }),
+                tool_call_id: m.tool_call_id.clone(),
+            })
+            .collect();
+
+        // Serialize tools into the exact shape HF expects: a list of
+        // `{ "type": "function", "function": { ... } }` objects.
+        let tools_json: Option<Vec<serde_json::Value>> = tools.map(|tool_defs| {
+            tool_defs
+                .iter()
+                .map(|td| {
+                    serde_json::json!({
+                        "type": td.tool_type,
+                        "function": {
+                            "name": td.function.name,
+                            "description": td.function.description,
+                            "parameters": td.function.parameters,
+                        },
+                    })
+                })
+                .collect()
+        });
+
+        let options = crate::jinja_chat::JinjaRenderOptions {
+            add_generation_prompt: true,
+            enable_thinking: Some(!no_thinking),
+            tools: tools_json,
+            bos_token: self.bos_token.clone(),
+            eos_token: Some(self.eos_token.clone()),
+        };
+
+        match crate::jinja_chat::render_chat_template(src, &jinja_messages, &options) {
+            Ok(text) => Some(text),
+            Err(e) => {
+                tracing::warn!(
+                    "Jinja chat template render failed, falling back to hardcoded formatter: {e}"
+                );
+                None
+            }
         }
     }
 
@@ -974,6 +1084,61 @@ impl ChatTemplate {
             if last.role == "user" || last.role == "human" {
                 text.push_str("<start_of_turn>model\n");
                 response_start = text.len();
+            }
+        }
+
+        FormattedChat {
+            text,
+            response_start,
+            template_type: self.template_type,
+        }
+    }
+
+    /// Format using Gemma 4's `<|turn>...<turn|>` wrappers.
+    ///
+    /// The role for the assistant turn is `model`. For the default
+    /// (non-thinking) generation prompt we append `<|channel>thought\n
+    /// <channel|>` right after the `<|turn>model\n` header — this matches
+    /// the upstream Jinja template's `enable_thinking=False` default, which
+    /// pre-opens *and* immediately closes an empty thought channel so the
+    /// model can write its answer directly into the `model` turn. Omitting
+    /// this suffix causes the model to emit pathological `---` loops,
+    /// because Gemma 4 was trained to always emit something in the thought
+    /// channel before the final answer.
+    ///
+    /// System messages are honoured via an explicit `<|turn>system` block
+    /// (unlike Gemma 2/3 which folded system into user). Reasoning mode
+    /// (`<|think|>` system-block prefix) is not yet exposed and is a
+    /// follow-up — gate it on a future `enable_thinking` flag.
+    fn format_gemma4(&self, messages: &[Message]) -> FormattedChat {
+        let mut text = String::new();
+        let mut response_start = 0;
+
+        for (i, msg) in messages.iter().enumerate() {
+            let role = match msg.role.as_str() {
+                "user" | "human" => "user",
+                "assistant" | "gpt" | "model" => "model",
+                "system" | "developer" => "system",
+                other => other,
+            };
+
+            let formatted = format!("<|turn>{}\n{}<turn|>\n", role, msg.content);
+
+            if (msg.role == "assistant" || msg.role == "model") && i == messages.len() - 1 {
+                let header = format!("<|turn>{}\n", role);
+                response_start = text.len() + header.len();
+            }
+
+            text.push_str(&formatted);
+        }
+
+        // Generation prompt when the last message is user/system: start a
+        // new model turn AND pre-close the thought channel (see doc above).
+        if let Some(last) = messages.last() {
+            if last.role == "user" || last.role == "human" || last.role == "system" {
+                text.push_str("<|turn>model\n");
+                response_start = text.len();
+                text.push_str("<|channel>thought\n<channel|>");
             }
         }
 
@@ -1521,26 +1686,52 @@ pub fn detect_chat_template(model_path: &std::path::Path, model_name: &str) -> C
     if let Ok(content) = std::fs::read_to_string(&config_path) {
         if let Ok(json) = serde_json::from_str::<serde_json::Value>(&content) {
             if let Some(jinja) = extract_jinja_template(&json) {
-                if let Some(mut template) = detect_template_from_jinja(&jinja) {
-                    // Refine: if the Jinja matched generic ChatML but the checkpoint
-                    // is actually Qwen, upgrade to the Qwen variant so inference can
-                    // use the tokenizer's expected `<think>` generation prefill.
-                    if template.template_type == ChatTemplateType::ChatMl {
-                        let is_qwen = json
-                            .get("model_type")
-                            .and_then(|v| v.as_str())
-                            .is_some_and(|t| t.to_lowercase().contains("qwen"))
-                            || model_name.to_lowercase().contains("qwen");
-                        if is_qwen {
-                            template = ChatTemplate::qwen();
-                        }
+                // Detect the template family (for the eos_token lookup and
+                // fallback path), but we'll also attach the raw Jinja so
+                // `apply_inference` can execute the upstream template
+                // verbatim and get a bit-exact match.
+                let detected_family = detect_template_from_jinja(&jinja)
+                    // When the detector can't classify the Jinja family,
+                    // fall back to a ChatML skeleton so eos/bos defaults
+                    // are sensible. The attached Jinja source is what
+                    // actually drives rendering.
+                    .unwrap_or_else(|| ChatTemplate::chatml());
+                let mut template = detected_family;
+
+                // Refine: ChatML-looking Qwen checkpoints get the Qwen
+                // variant so the hardcoded fallback (for base models)
+                // uses the right defaults. The Jinja source still wins
+                // for the rendering path.
+                if template.template_type == ChatTemplateType::ChatMl {
+                    let is_qwen = json
+                        .get("model_type")
+                        .and_then(|v| v.as_str())
+                        .is_some_and(|t| t.to_lowercase().contains("qwen"))
+                        || model_name.to_lowercase().contains("qwen");
+                    if is_qwen {
+                        template = ChatTemplate::qwen();
                     }
-                    tracing::info!(
-                        "Chat template: {:?} (from tokenizer_config.json)",
-                        template.template_type
-                    );
-                    return template;
                 }
+
+                // Pull bos / eos token strings from the tokenizer config
+                // so the Jinja renderer can substitute `{{ bos_token }}`
+                // and `{{ eos_token }}` exactly like HF does.
+                if let Some(bos) = extract_token_string_field(&json, "bos_token") {
+                    template.bos_token = Some(bos);
+                }
+                if let Some(eos) = extract_token_string_field(&json, "eos_token") {
+                    template.eos_token = eos;
+                }
+
+                // Attach the raw Jinja source — this is what `apply_inference`
+                // executes first, falling back to `format_*` on failure.
+                template.jinja_source = Some(jinja);
+
+                tracing::info!(
+                    "Chat template: {:?} (from tokenizer_config.json, jinja attached)",
+                    template.template_type
+                );
+                return template;
             }
         }
     }
@@ -1548,10 +1739,28 @@ pub fn detect_chat_template(model_path: &std::path::Path, model_name: &str) -> C
     // 2. Fall back to model-name heuristics
     let template = detect_template_from_model(model_name);
     tracing::info!(
-        "Chat template: {:?} (from model name)",
+        "Chat template: {:?} (from model name, no jinja)",
         template.template_type
     );
     template
+}
+
+/// Extract the string form of a special token field (`bos_token`,
+/// `eos_token`, …) from a parsed `tokenizer_config.json`. Handles both
+/// the plain-string shape (`"bos_token": "<s>"`) and the object shape
+/// (`"bos_token": {"content": "<s>", ...}`). Returns `None` for null /
+/// missing / unrecognised shapes.
+fn extract_token_string_field(json: &serde_json::Value, key: &str) -> Option<String> {
+    let field = json.get(key)?;
+    if let Some(s) = field.as_str() {
+        return Some(s.to_string());
+    }
+    if let Some(obj) = field.as_object() {
+        if let Some(content) = obj.get("content").and_then(|v| v.as_str()) {
+            return Some(content.to_string());
+        }
+    }
+    None
 }
 
 /// Extract the Jinja template string from the `chat_template` field in tokenizer_config.json.
@@ -1619,7 +1828,13 @@ fn detect_template_from_jinja(jinja: &str) -> Option<ChatTemplate> {
     if jinja.contains("<<SYS>>") {
         return Some(ChatTemplate::llama2());
     }
-    // Gemma: <start_of_turn>
+    // Gemma 4: <|turn> / <turn|> (asymmetric pipes, role=model). Must be
+    // checked before the Gemma 2/3 `<start_of_turn>` match because Gemma 4's
+    // template does NOT contain `<start_of_turn>`.
+    if jinja.contains("<|turn>") && jinja.contains("<turn|>") {
+        return Some(ChatTemplate::gemma4());
+    }
+    // Gemma 2/3: <start_of_turn>
     if jinja.contains("<start_of_turn>") {
         return Some(ChatTemplate::gemma());
     }
@@ -1627,8 +1842,14 @@ fn detect_template_from_jinja(jinja: &str) -> Option<ChatTemplate> {
     if jinja.contains("[INST]") {
         return Some(ChatTemplate::mistral());
     }
-    // Phi-3: <|user|> + <|end|>
-    if jinja.contains("<|user|>") && jinja.contains("<|end|>") {
+    // Phi-3: `<|user|>` + `<|end|>`. We also accept the concatenation
+    // variant `'<|' + message['role'] + '|>'` that Phi-4-mini uses — it
+    // still renders Phi-3-style markers at runtime, and the `<|end|>` +
+    // `<|assistant|>` literals are present in the jinja source.
+    if (jinja.contains("<|user|>") || jinja.contains("'<|' + message['role']"))
+        && jinja.contains("<|end|>")
+        && jinja.contains("<|assistant|>")
+    {
         return Some(ChatTemplate::phi3());
     }
     // GPT-OSS Harmony: <|start|> + <|message|>
@@ -1676,6 +1897,13 @@ pub fn detect_template_from_model(model_name: &str) -> ChatTemplate {
         ChatTemplate::llama3()
     } else if name_lower.contains("mistral") || name_lower.contains("mixtral") {
         ChatTemplate::mistral()
+    } else if name_lower.contains("gemma-4")
+        || name_lower.contains("gemma_4")
+        || name_lower.contains("gemma4")
+    {
+        // Gemma 4 must come before the generic "gemma" match: its chat
+        // template uses `<|turn>` / `<turn|>`, NOT the Gemma 2/3 markers.
+        ChatTemplate::gemma4()
     } else if name_lower.contains("gemma") {
         ChatTemplate::gemma()
     } else if name_lower.contains("phi-4") || name_lower.contains("phi4") {

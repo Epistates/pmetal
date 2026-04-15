@@ -705,7 +705,20 @@ impl PhiModel {
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, cache, None)
+    }
+
+    /// Forward pass with optional hidden-state capture for DFlash
+    /// speculative decoding. Identical to [`forward_with_cache`] when
+    /// `capture` is `None`.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         let mut hidden = self.embed_tokens.forward(input_ids);
 
@@ -722,6 +735,11 @@ impl PhiModel {
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             let c = cache.as_deref_mut().map(|c| (c, idx));
             hidden = layer.forward_with_cache(&hidden, mask, c)?;
+            if let Some(buf) = capture.as_deref_mut()
+                && buf.wants_hidden_for(idx)
+            {
+                buf.record_hidden(idx, hidden.clone());
+            }
         }
 
         self.norm.forward(&hidden)
@@ -759,6 +777,21 @@ impl PhiForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward_with_cache(input_ids, mask, cache)?;
+        Ok(self.lm_head.forward(&hidden))
+    }
+
+    /// Forward pass that records hidden states into a DFlash capture
+    /// buffer at every requested layer index.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<Array, Exception> {
+        let hidden =
+            self.model
+                .forward_with_capture(input_ids, mask, cache, Some(capture))?;
         Ok(self.lm_head.forward(&hidden))
     }
 

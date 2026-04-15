@@ -17,12 +17,41 @@ pub fn sigmoid(a: &Array) -> Array {
 pub fn relu(a: &Array) -> Array {
     a.relu()
 }
+/// GELU "fast approximation" using `x * sigmoid(1.702 * x)`. This is
+/// the same formula used by mlx-rs's `nn::gelu_fast_approx` and by the
+/// `mlx_inline_gelu` kernel in `bridge_training.cpp`. This is NOT the
+/// tanh approximation (`mx.fast.rms_norm(x, None, eps)` style) — for
+/// that see `gelu_tanh_approximate` below.
 pub fn gelu(a: &Array) -> Array {
     a.gelu()
 }
-/// GeLU with tanh approximation — matches `mlx_rs::nn::gelu_approximate`.
+/// Alias of [`gelu`] kept for source compatibility with mlx-rs's
+/// `nn::gelu_approximate`, which was also the sigmoid fast-approx (and
+/// not the tanh approximation, despite the name). Prefer calling
+/// [`gelu_tanh_approximate`] when you need the tanh variant — see the
+/// Gemma 4 parity investigation for the drift this discrepancy caused.
 pub fn gelu_approximate(a: &Array) -> Array {
     a.gelu()
+}
+/// GELU tanh approximation matching mlx-lm's `nn.gelu_approx`:
+///
+/// ```text
+///     0.5 * x * (1 + tanh(sqrt(2/π) * (x + 0.044715 * x^3)))
+/// ```
+///
+/// Implemented in pure ops since there's no dedicated bridge kernel.
+pub fn gelu_tanh_approximate(a: &Array) -> Array {
+    use super::ops;
+    let k = Array::from_f32(0.797_884_56); // sqrt(2/pi)
+    let c = Array::from_f32(0.044_715);
+    let half = Array::from_f32(0.5);
+    let one = Array::from_f32(1.0);
+    let x2 = a.multiply(a);
+    let x3 = x2.multiply(a);
+    let inner = a.add(&c.multiply(&x3));
+    let scaled = k.multiply(&inner);
+    let t = ops::tanh(&scaled);
+    half.multiply(a).multiply(&one.add(&t))
 }
 pub fn silu(a: &Array) -> Array {
     a.silu()

@@ -39,7 +39,7 @@ pub enum QuantizationMethod {
 ///
 /// Supports all K-quant types available in the pmetal-gguf crate, plus
 /// `dynamic` for importance-matrix-guided mixed-precision quantization.
-/// K-quant size suffixes follow llama.cpp naming conventions:
+/// K-quant size suffixes follow the GGUF K-quant naming convention:
 ///   - `s` = small (lower quality, smaller size)
 ///   - `m` = medium (balanced, recommended)
 ///   - `l` = large (higher quality, larger size)
@@ -75,7 +75,7 @@ pub enum QuantizeMethod {
 }
 
 impl QuantizeMethod {
-    /// Canonical display name matching llama.cpp naming conventions.
+    /// Canonical display name matching the GGUF K-quant naming convention.
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Dynamic => "dynamic",
@@ -633,6 +633,61 @@ enum Commands {
         /// Output results as JSON
         #[arg(long)]
         json: bool,
+    },
+
+    /// Block-diffusion speculative decoding (DFlash).
+    ///
+    /// Runs a Qwen3 target alongside a DFlash draft to emit multiple tokens
+    /// per forward pass with bit-identical output to greedy baseline.
+    Dflash {
+        /// Target Qwen3 model (HF id or local path).
+        #[arg(long)]
+        target: String,
+
+        /// DFlash draft model (HF id or local path, e.g. `z-lab/Qwen3-4B-DFlash-b16`).
+        #[arg(long)]
+        draft: String,
+
+        /// Input prompt.
+        #[arg(short, long)]
+        prompt: String,
+
+        /// Maximum tokens to generate after the prompt.
+        #[arg(long, default_value = "128")]
+        max_new_tokens: usize,
+
+        /// Sampling temperature (0 = greedy, bit-identical to baseline).
+        #[arg(long, default_value = "0.0")]
+        temperature: f32,
+
+        /// Override the draft block size (defaults to the draft checkpoint's `block_size`).
+        #[arg(long)]
+        speculative_tokens: Option<usize>,
+
+        /// Quantize the draft's Linear weights to FP8 (E4M3) on load.
+        /// Halves draft memory with minimal acceptance-rate impact vs BF16.
+        #[arg(long)]
+        draft_fp8: bool,
+
+        /// Emit a JSON report of tokens + metrics instead of plain text.
+        #[arg(long)]
+        json: bool,
+
+        /// Skip the model's chat template and tokenize the prompt verbatim.
+        /// By default pmetal dflash mirrors upstream dflash-mlx and applies
+        /// the target's chat template (with `enable_thinking=false`) — the
+        /// draft was trained against chat-templated target hidden states,
+        /// so running raw inputs collapses acceptance to near zero.
+        #[arg(long)]
+        no_chat: bool,
+
+        /// Tree-verify budget — when set to `N > 0`, the decoder
+        /// builds a budget-N candidate tree per round (inspired by
+        /// DDTree) and lets the target walk the tree via posterior
+        /// argmax. Typical values: 16-64. Set to 0 to force linear
+        /// DFlash (the default).
+        #[arg(long, default_value = "0")]
+        tree_budget: usize,
     },
 
     /// Show memory usage and available capacity
@@ -2759,6 +2814,33 @@ async fn tokio_main() -> anyhow::Result<()> {
             json,
         } => {
             commands::search::run_search(&query, limit, download, detailed, json).await?;
+        }
+
+        Commands::Dflash {
+            target,
+            draft,
+            prompt,
+            max_new_tokens,
+            temperature,
+            speculative_tokens,
+            draft_fp8,
+            json,
+            no_chat,
+            tree_budget,
+        } => {
+            commands::dflash::run_dflash(
+                &target,
+                &draft,
+                &prompt,
+                max_new_tokens,
+                temperature,
+                speculative_tokens,
+                draft_fp8,
+                json,
+                no_chat,
+                tree_budget,
+            )
+            .await?;
         }
 
         Commands::Memory { json } => {

@@ -19,6 +19,11 @@ tracing = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 tokenizers = { workspace = true }
+minijinja = { workspace = true }
+minijinja-contrib = { workspace = true }
+# `time` is already pulled in transitively by minijinja-contrib; depending
+# on it directly lets us format "now" for the Llama 3 `strftime_now` shim.
+time = { version = "0.3", features = ["formatting", "macros"] }
 rand = { workspace = true }
 rayon = "1"
 image = "0.25"

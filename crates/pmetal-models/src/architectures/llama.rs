@@ -539,11 +539,24 @@ impl LlamaModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, cache, None)
+    }
+
+    /// Forward pass with optional hidden-state capture for DFlash
+    /// speculative decoding. `capture = None` is identical to
+    /// [`forward_with_cache`]; otherwise the post-layer hidden state is
+    /// cloned into `capture` for every layer index the caller requested.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
+    ) -> Result<Array, Exception> {
         // Get embeddings
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
 
         // Create causal mask if not provided and not using cache
-        // When using cache for decode step (seq_len=1), we don't need a mask
         let mask_owned;
         let mask = if mask.is_none() && cache.is_none() {
             let seq_len = input_ids.dim(1);
@@ -559,11 +572,21 @@ impl LlamaModel {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                     hidden_states =
                         layer.forward_with_cache(&hidden_states, mask, Some((cache, layer_idx)))?;
+                    if let Some(buf) = capture.as_deref_mut()
+                        && buf.wants_hidden_for(layer_idx)
+                    {
+                        buf.record_hidden(layer_idx, hidden_states.clone());
+                    }
                 }
             }
             None => {
-                for layer in &mut self.layers {
+                for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                     hidden_states = layer.forward(&hidden_states, mask)?;
+                    if let Some(buf) = capture.as_deref_mut()
+                        && buf.wants_hidden_for(layer_idx)
+                    {
+                        buf.record_hidden(layer_idx, hidden_states.clone());
+                    }
                 }
             }
         }
@@ -635,6 +658,25 @@ impl LlamaForCausalLM {
             Module::forward(lm_head, &hidden_states)
         } else {
             // Tie weights: use embedding weight transposed
+            Ok(self.model.embed_tokens.as_linear(&hidden_states))
+        }
+    }
+
+    /// Forward pass that records hidden states into a DFlash speculative
+    /// capture buffer at every tapped layer index.
+    pub fn forward_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<Array, Exception> {
+        let hidden_states =
+            self.model
+                .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+        if let Some(ref mut lm_head) = self.lm_head {
+            Module::forward(lm_head, &hidden_states)
+        } else {
             Ok(self.model.embed_tokens.as_linear(&hidden_states))
         }
     }

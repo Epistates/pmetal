@@ -28,6 +28,10 @@ adapters/
 *.bin
 *.gguf
 !crates/*/src/**/*.rs
+# Parity test fixtures — small checked-in reference tensors used by the
+# numerical parity integration tests (e.g. gemma4_parity).
+!crates/pmetal-models/tests/fixtures/**/*.safetensors
+!crates/pmetal-models/tests/fixtures/**/*.meta.json
 
 # Environment
 .env

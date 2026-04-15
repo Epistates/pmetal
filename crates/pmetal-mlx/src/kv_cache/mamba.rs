@@ -3,6 +3,7 @@
 use pmetal_bridge::compat::{Array, Exception, ops};
 
 use crate::array_ext::ArrayDtypeExt;
+use crate::kernels::gated_delta_state_advance;
 
 /// Cache for Mamba-2 SSM state during autoregressive generation.
 ///
@@ -30,6 +31,44 @@ pub struct MambaCacheEntry {
     pub ssm_state: Option<Array>,
 }
 
+/// Snapshot of a single Mamba/GDN layer's state, captured before a
+/// speculative verify step.
+///
+/// `MambaSnapshot` is an immutable, cheap clone of the two state arrays; MLX
+/// arrays are ref-counted so cloning here does not copy data, but any future
+/// in-place update on the live cache leaves the snapshot unchanged.
+#[derive(Debug, Clone, Default)]
+pub struct MambaSnapshot {
+    /// Conv state as of the snapshot, shape `[B, kernel-1, conv_dim]`.
+    pub conv_state: Option<Array>,
+    /// SSM state as of the snapshot, shape `[B, Hv, Dv, Dk]`.
+    pub ssm_state: Option<Array>,
+}
+
+/// Per-token inputs captured during a speculative verify step so that a
+/// rollback can replay the GDN recurrence from a snapshot over only the
+/// accepted prefix.
+///
+/// All arrays should cover exactly the `T_verify` tokens that the verify
+/// pass appended; a rollback with `accepted < T_verify` slices them to
+/// `accepted` along axis 1.
+#[derive(Debug, Clone)]
+pub struct GdnVerifyInputs {
+    /// Keys used by the verify pass, shape `[B, T_verify, Hk, Dk]`.
+    pub keys: Array,
+    /// Values used by the verify pass, shape `[B, T_verify, Hv, Dv]`.
+    pub values: Array,
+    /// Gating decay, shape `[B, T_verify, Hv]` (scalar gating).
+    pub g: Array,
+    /// Beta gate, shape `[B, T_verify, Hv]`.
+    pub beta: Array,
+    /// Conv1d input for this verify step (pre-conv), shape
+    /// `[B, T_verify, conv_dim]`. Used to reconstruct `conv_state` on rollback.
+    pub conv_input: Array,
+    /// Conv1d kernel size (needed to size the rolled-back conv state).
+    pub conv_kernel_size: usize,
+}
+
 impl MambaCache {
     /// Create a new Mamba cache with the specified number of layers.
     pub fn new(num_layers: usize) -> Self {
@@ -37,6 +76,11 @@ impl MambaCache {
             .map(|_| MambaCacheEntry::default())
             .collect();
         Self { layers }
+    }
+
+    /// Number of layers tracked by this cache.
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
     }
 
     /// Get a mutable reference to a layer's cache entry.
@@ -62,6 +106,54 @@ impl MambaCache {
         self.layers
             .iter()
             .all(|e| e.conv_state.is_none() && e.ssm_state.is_none())
+    }
+
+    /// Snapshot every layer's current state for a speculative verify step.
+    ///
+    /// Returns a parallel `Vec<MambaSnapshot>` that can later be replayed via
+    /// [`MambaCache::rewind_from_snapshots`]. This is `O(num_layers)` and
+    /// performs no data copies — MLX arrays are ref-counted.
+    pub fn snapshot(&self) -> Vec<MambaSnapshot> {
+        self.layers.iter().map(|entry| entry.snapshot()).collect()
+    }
+
+    /// Rewind every layer to the state implied by the accepted prefix of
+    /// the verify inputs.
+    ///
+    /// `snapshots` must have been produced by [`MambaCache::snapshot`] on
+    /// this cache prior to the verify pass. `per_layer_inputs[i]` is the
+    /// verify inputs captured during the verify forward for layer `i`; it
+    /// may be `None` for layers that are not GDN (pure attention layers).
+    /// `accepted_tokens` is how many of the drafted tokens were accepted.
+    ///
+    /// When `accepted_tokens == 0` every GDN layer is restored exactly to its
+    /// snapshot. Otherwise each layer's GDN state is replayed forward from
+    /// its snapshot through the first `accepted_tokens` entries of its
+    /// verify inputs.
+    pub fn rewind_from_snapshots(
+        &mut self,
+        snapshots: &[MambaSnapshot],
+        per_layer_inputs: &[Option<GdnVerifyInputs>],
+        accepted_tokens: usize,
+    ) -> Result<(), Exception> {
+        if snapshots.len() != self.layers.len() {
+            return Err(Exception::custom(format!(
+                "snapshot count {} does not match cache layer count {}",
+                snapshots.len(),
+                self.layers.len()
+            )));
+        }
+        if per_layer_inputs.len() != self.layers.len() {
+            return Err(Exception::custom(format!(
+                "verify input count {} does not match cache layer count {}",
+                per_layer_inputs.len(),
+                self.layers.len()
+            )));
+        }
+        for (idx, entry) in self.layers.iter_mut().enumerate() {
+            entry.rewind(&snapshots[idx], per_layer_inputs[idx].as_ref(), accepted_tokens)?;
+        }
+        Ok(())
     }
 }
 
@@ -123,4 +215,118 @@ impl MambaCacheEntry {
     pub fn set_ssm_state(&mut self, state: Array) {
         self.ssm_state = Some(state);
     }
+
+    /// Clone this entry's current state into an immutable snapshot.
+    ///
+    /// See [`MambaSnapshot`] — this is the single-layer form of
+    /// [`MambaCache::snapshot`].
+    pub fn snapshot(&self) -> MambaSnapshot {
+        MambaSnapshot {
+            conv_state: self.conv_state.clone(),
+            ssm_state: self.ssm_state.clone(),
+        }
+    }
+
+    /// Restore this entry exactly to the given snapshot (no replay).
+    pub fn restore(&mut self, snapshot: &MambaSnapshot) {
+        self.conv_state = snapshot.conv_state.clone();
+        self.ssm_state = snapshot.ssm_state.clone();
+    }
+
+    /// Rewind this GDN layer to the state after `accepted_tokens` of the
+    /// captured verify inputs, using the pre-verify snapshot as the base.
+    ///
+    /// * If `verify_inputs` is `None` the layer is restored verbatim —
+    ///   appropriate for pure-attention layers that never contributed GDN
+    ///   state during verify.
+    /// * If `accepted_tokens == 0` the layer is restored verbatim even when
+    ///   verify inputs are supplied — no replay is needed.
+    /// * Otherwise the SSM state is replayed forward from
+    ///   `snapshot.ssm_state` through the first `accepted_tokens` entries of
+    ///   `verify_inputs.{keys,values,g,beta}`, and the conv state is rebuilt
+    ///   by taking the last `kernel_size - 1` positions of
+    ///   `[snapshot.conv_state || verify_inputs.conv_input[..accepted]]`.
+    pub fn rewind(
+        &mut self,
+        snapshot: &MambaSnapshot,
+        verify_inputs: Option<&GdnVerifyInputs>,
+        accepted_tokens: usize,
+    ) -> Result<(), Exception> {
+        let Some(inputs) = verify_inputs else {
+            self.restore(snapshot);
+            return Ok(());
+        };
+        if accepted_tokens == 0 {
+            self.restore(snapshot);
+            return Ok(());
+        }
+
+        let verify_len = inputs.keys.dim(1) as usize;
+        let t = accepted_tokens.min(verify_len);
+
+        // ── SSM state replay ─────────────────────────────────────────────
+        let initial_ssm = snapshot.ssm_state.clone().ok_or_else(|| {
+            Exception::custom(
+                "MambaCacheEntry::rewind: snapshot.ssm_state is None; \
+                 cannot replay GDN without an initial state",
+            )
+        })?;
+        let k_slice = slice_leading_time(&inputs.keys, t as i32);
+        let v_slice = slice_leading_time(&inputs.values, t as i32);
+        let g_slice = slice_leading_time(&inputs.g, t as i32);
+        let beta_slice = slice_leading_time(&inputs.beta, t as i32);
+        self.ssm_state = Some(gated_delta_state_advance(
+            &initial_ssm,
+            &k_slice,
+            &v_slice,
+            &g_slice,
+            &beta_slice,
+        )?);
+
+        // ── Conv state rewind ────────────────────────────────────────────
+        // The live conv_state after verify is the last (kernel-1) rows of
+        //   [initial_conv_state || inputs.conv_input].
+        // After accepting only the first `t` tokens, the rewound conv_state
+        // should be the last (kernel-1) rows of
+        //   [initial_conv_state || inputs.conv_input[:, :t]].
+        if inputs.conv_kernel_size >= 1 {
+            let keep = inputs.conv_kernel_size.saturating_sub(1);
+            let conv_input_prefix = slice_leading_time(&inputs.conv_input, t as i32);
+            let initial_conv = snapshot
+                .conv_state
+                .clone()
+                .unwrap_or_else(|| zero_conv_state(&inputs.conv_input, keep));
+            let extended = ops::concatenate_axis(&[&initial_conv, &conv_input_prefix], 1);
+            let b = extended.dim(0);
+            let ext_len = extended.dim(1);
+            let cd = extended.dim(2);
+            let keep_i32 = keep.min(ext_len as usize) as i32;
+            let start = (ext_len - keep_i32).max(0);
+            self.conv_state = Some(extended.slice(&[0, start, 0], &[b, ext_len, cd]));
+        } else {
+            self.conv_state = snapshot.conv_state.clone();
+        }
+
+        Ok(())
+    }
+}
+
+/// Slice a per-token tensor along axis 1 (time) to the first `t` entries.
+fn slice_leading_time(arr: &Array, t: i32) -> Array {
+    let rank = arr.shape().len();
+    let mut start = vec![0i32; rank];
+    let _ = &mut start; // keep zero-initialized
+    let mut stop: Vec<i32> = arr.shape().to_vec();
+    if rank >= 2 {
+        stop[1] = t;
+    }
+    arr.slice(&start, &stop)
+}
+
+/// Construct a zero-initialized conv state matching the dtype/batch/channels
+/// of `conv_input` when no prior state existed.
+fn zero_conv_state(conv_input: &Array, keep: usize) -> Array {
+    let b = conv_input.dim(0);
+    let cd = conv_input.dim(2);
+    ops::zeros(&[b, keep as i32, cd], conv_input.dtype())
 }
