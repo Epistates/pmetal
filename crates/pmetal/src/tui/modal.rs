@@ -13,6 +13,7 @@ use ratatui::widgets::{
     StatefulWidget, Table, TableState, Widget, Wrap,
 };
 
+use crate::tui::tabs::Tab;
 use crate::tui::theme::THEME;
 
 /// Actions that a modal can produce when dismissed.
@@ -72,6 +73,8 @@ pub enum Modal {
         entries: Vec<HfSearchEntry>,
         table_state: TableState,
     },
+    /// Contextual help overlay showing global + per-tab keybindings.
+    Help { tab: Tab },
 }
 
 /// An entry in the HF search results modal.
@@ -141,6 +144,10 @@ impl Modal {
             datasets,
             list_state: state,
         }
+    }
+
+    pub fn help(tab: Tab) -> Self {
+        Modal::Help { tab }
     }
 
     pub fn error(title: impl Into<String>, message: impl Into<String>) -> Self {
@@ -379,6 +386,14 @@ impl Modal {
                 }
                 _ => None,
             },
+
+            Modal::Help { .. } => match key.code {
+                KeyCode::Esc
+                | KeyCode::Enter
+                | KeyCode::Char('q')
+                | KeyCode::Char('?') => Some(ModalAction::None),
+                _ => None,
+            },
         }
     }
 
@@ -423,6 +438,7 @@ impl Modal {
                 entries,
                 table_state,
             } => render_hf_search(popup_area, buf, entries, table_state),
+            Modal::Help { tab } => render_help(popup_area, buf, *tab),
         }
     }
 
@@ -432,6 +448,7 @@ impl Modal {
             Modal::TextInput { .. } => 60,
             Modal::ModelPicker { .. } | Modal::DatasetPicker { .. } => 70,
             Modal::HfSearch { .. } => 85,
+            Modal::Help { .. } => 65,
         }
     }
 
@@ -442,6 +459,7 @@ impl Modal {
             Modal::Error { .. } | Modal::Progress { .. } => 25,
             Modal::ModelPicker { .. } | Modal::DatasetPicker { .. } => 60,
             Modal::HfSearch { .. } => 70,
+            Modal::Help { .. } => 75,
         }
     }
 }
@@ -798,6 +816,132 @@ fn filtered_models<'a>(models: &'a [PickerEntry], search: &str) -> Vec<&'a Picke
             .iter()
             .filter(|m| m.id.to_lowercase().contains(&q))
             .collect()
+    }
+}
+
+/// Render the contextual help overlay — shows global keybindings
+/// alongside the bindings specific to `tab`.
+fn render_help(area: Rect, buf: &mut Buffer, tab: Tab) {
+    let block = Block::default()
+        .title(format!(" Help — {tab} "))
+        .title_style(THEME.block_title_focused)
+        .borders(Borders::ALL)
+        .border_style(THEME.block_focused);
+    let inner = block.inner(area);
+    block.render(area, buf);
+
+    let [global_area, tab_area, footer_area] = Layout::vertical([
+        Constraint::Length(12),
+        Constraint::Min(0),
+        Constraint::Length(2),
+    ])
+    .areas(inner);
+
+    // ── Global bindings (same on every tab) ────────────────────────────
+    let global_lines = [
+        ("?", "Toggle this help overlay"),
+        ("Tab / Shift+Tab", "Switch tabs forward / backward"),
+        ("Alt+1..9", "Jump directly to tab 1..9"),
+        ("Ctrl+1..9", "Jump directly to tab 1..9 (alternative)"),
+        ("q / Ctrl+C", "Quit the TUI"),
+        ("F2", "Toggle mouse capture (text select/copy)"),
+        ("Esc", "Close modal / cancel edit"),
+    ];
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(Line::from(Span::styled(" Global", THEME.kv_key)));
+    for (key, desc) in &global_lines {
+        lines.push(Line::from(vec![
+            Span::styled(format!("  {key:<18}"), THEME.footer_key),
+            Span::styled(*desc, THEME.text),
+        ]));
+    }
+    Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .render(global_area, buf);
+
+    // ── Tab-specific bindings ──────────────────────────────────────────
+    let tab_bindings: &[(&str, &str)] = tab_help(tab);
+    let mut tab_lines: Vec<Line> = Vec::new();
+    tab_lines.push(Line::from(Span::styled(
+        format!(" {tab} tab"),
+        THEME.kv_key,
+    )));
+    if tab_bindings.is_empty() {
+        tab_lines.push(Line::from(Span::styled(
+            "  (no tab-specific bindings)",
+            THEME.text_muted,
+        )));
+    } else {
+        for (key, desc) in tab_bindings {
+            tab_lines.push(Line::from(vec![
+                Span::styled(format!("  {key:<18}"), THEME.footer_key),
+                Span::styled(*desc, THEME.text),
+            ]));
+        }
+    }
+    Paragraph::new(tab_lines)
+        .wrap(Wrap { trim: false })
+        .render(tab_area, buf);
+
+    Paragraph::new(Line::from(Span::styled(
+        " Press ? or Esc to close",
+        THEME.text_muted,
+    )))
+    .render(footer_area, buf);
+}
+
+/// Return the help text for a specific tab. Each row is `(key, description)`.
+fn tab_help(tab: Tab) -> &'static [(&'static str, &'static str)] {
+    match tab {
+        Tab::Dashboard => &[
+            ("p", "Pause / resume metric updates"),
+            ("r", "Reset metric buffers"),
+        ],
+        Tab::Device => &[],
+        Tab::Models => &[
+            ("j / k", "Navigate rows"),
+            ("/", "Filter model list"),
+            ("R", "Rescan model directories"),
+            ("d", "Download a model by HF id"),
+            ("a", "Add a custom model directory"),
+            ("S", "Search HuggingFace Hub"),
+            ("t", "Train with the selected model"),
+            ("s", "Distill with the selected model as student"),
+            ("i", "Infer with the selected model"),
+            ("f", "Fuse a LoRA adapter into its base"),
+        ],
+        Tab::Datasets => &[
+            ("j / k", "Navigate rows"),
+            ("c", "Convert to pmetal JSONL"),
+            ("a", "Add a custom dataset directory"),
+            ("R", "Rescan dataset directories"),
+        ],
+        Tab::Training | Tab::Distillation | Tab::Grpo => &[
+            ("j / k", "Navigate fields"),
+            ("Enter", "Edit / cycle / pick"),
+            ("S", "Start the job"),
+            ("x", "Stop the running job"),
+            ("L", "Override learning rate during training"),
+        ],
+        Tab::Inference => &[
+            ("Enter", "Send the prompt"),
+            ("Ctrl+P", "Pick a model"),
+            ("Ctrl+S", "Focus the settings sidebar"),
+            ("Ctrl+H", "Show / hide the settings sidebar"),
+            ("F2", "Enter browse mode to yank text"),
+            ("Esc", "Stop generation"),
+        ],
+        Tab::Jobs => &[
+            ("j / k", "Navigate jobs"),
+            ("J / K", "Scroll the selected job log"),
+            ("R", "Rescan job output directories"),
+        ],
+        Tab::Serve | Tab::Quantize | Tab::Merge | Tab::Bench | Tab::Eval => &[
+            ("j / k", "Navigate fields"),
+            ("Enter", "Edit / cycle / pick"),
+            ("S", "Start the job"),
+            ("x", "Cancel the running job"),
+        ],
     }
 }
 

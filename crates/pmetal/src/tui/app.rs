@@ -283,12 +283,22 @@ impl App {
                 }
                 return;
             }
-            // Number keys for direct tab access
-            KeyCode::Char(c @ '1'..='9') if key.modifiers.contains(KeyModifiers::ALT) => {
+            // Number keys for direct tab access (Alt+1..9 and Ctrl+1..9
+            // are both accepted so the shortcut works in terminals that
+            // intercept one of the modifiers).
+            KeyCode::Char(c @ '1'..='9')
+                if key.modifiers.contains(KeyModifiers::ALT)
+                    || key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
                 let idx = (c as u8 - b'1') as usize;
                 if let Some(&tab) = Tab::ALL.get(idx) {
                     self.active_tab = tab;
                 }
+                return;
+            }
+            // Contextual help overlay — shows global + tab-specific bindings.
+            KeyCode::Char('?') => {
+                self.modal_stack.push(Modal::help(self.active_tab));
                 return;
             }
             _ => {}
@@ -1733,6 +1743,24 @@ impl App {
 
     // --- Action helpers ---
 
+    /// Count currently running background jobs across every tab that
+    /// owns one. Used by the footer to render a right-aligned
+    /// "N running" badge.
+    fn active_job_count(&self) -> usize {
+        [
+            self.active_training_job.is_some(),
+            self.active_inference_job.is_some(),
+            self.active_serve_job.is_some(),
+            self.active_quantize_job.is_some(),
+            self.active_bench_job.is_some(),
+            self.active_eval_job.is_some(),
+            self.active_merge_job.is_some(),
+        ]
+        .iter()
+        .filter(|x| **x)
+        .count()
+    }
+
     fn model_picker_entries(&self) -> Vec<PickerEntry> {
         self.models
             .models
@@ -2500,9 +2528,10 @@ impl App {
             Tab::Merge => (&mut self.merge).render(content_area, buf),
         }
 
-        // Footer with keybindings
+        // Footer with keybindings and active-job count.
         Footer {
             tab: self.active_tab,
+            active_jobs: self.active_job_count(),
         }
         .render(footer_area, buf);
 

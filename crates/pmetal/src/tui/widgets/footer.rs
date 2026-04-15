@@ -11,6 +11,10 @@ use crate::tui::theme::THEME;
 /// Footer widget showing context-sensitive keybindings.
 pub struct Footer {
     pub tab: Tab,
+    /// Number of background jobs currently running (training, serve,
+    /// quantize, …). Surfaces a compact "N running" badge on the right
+    /// edge so the user never loses track of active work.
+    pub active_jobs: usize,
 }
 
 impl Widget for Footer {
@@ -19,6 +23,8 @@ impl Widget for Footer {
 
         let mut spans = vec![
             Span::raw(" "),
+            Span::styled("?", THEME.footer_key),
+            Span::styled(" help  ", THEME.footer_desc),
             Span::styled("Tab", THEME.footer_key),
             Span::styled(" switch  ", THEME.footer_desc),
         ];
@@ -181,6 +187,16 @@ impl Widget for Footer {
             Span::styled("F2", THEME.footer_key),
             Span::styled(" mouse/select", THEME.footer_desc),
         ]);
+
+        // Right-aligned "N running" badge when any background job is
+        // active. Gives the operator an always-on indicator so they
+        // never lose track of in-flight work.
+        if self.active_jobs > 0 {
+            spans.push(Span::styled(
+                format!("   ● {} running ", self.active_jobs),
+                THEME.status_running,
+            ));
+        }
 
         Line::from(spans).render(area, buf);
     }
