@@ -401,6 +401,98 @@ enum Commands {
         compression_strategy: Option<String>,
     },
 
+    /// Pretrain a model from scratch (full-parameter, no LoRA)
+    #[cfg(feature = "trainer")]
+    Pretrain {
+        /// Model architecture (e.g. gpt-oss)
+        #[arg(short, long)]
+        arch: String,
+
+        /// Glob pattern or comma-separated list of tokenized shard files (.bin)
+        #[arg(short, long, value_delimiter = ',')]
+        shards: Vec<String>,
+
+        /// Target sequence length for packed training batches
+        #[arg(long, default_value = "2048")]
+        seq_len: usize,
+
+        /// Batch size
+        #[arg(long, default_value = "4")]
+        batch_size: usize,
+
+        /// Number of training steps
+        #[arg(long, default_value = "10000")]
+        steps: usize,
+
+        /// Peak learning rate
+        #[arg(long, default_value = "3e-4")]
+        learning_rate: f32,
+
+        /// Minimum learning rate (cosine floor)
+        #[arg(long, default_value = "1e-5")]
+        min_lr: f32,
+
+        /// Linear warmup steps
+        #[arg(long, default_value = "1000")]
+        warmup_steps: usize,
+
+        /// LR schedule (constant, linear, cosine)
+        #[arg(long, default_value = "cosine")]
+        lr_schedule: String,
+
+        /// AdamW weight decay
+        #[arg(long, default_value = "0.1")]
+        weight_decay: f32,
+
+        /// Max gradient norm for clipping (0 to disable)
+        #[arg(long, default_value = "1.0")]
+        max_grad_norm: f32,
+
+        /// EOS token ID (inserted between documents in packed sequences)
+        #[arg(long, default_value = "0")]
+        eos_token_id: u32,
+
+        /// Output / checkpoint directory
+        #[arg(short, long, default_value = "./pretrain-output")]
+        output: String,
+
+        /// Save checkpoint every N steps (0 to disable)
+        #[arg(long, default_value = "1000")]
+        checkpoint_every: usize,
+
+        /// Resume from checkpoint directory
+        #[arg(long)]
+        resume: Option<String>,
+
+        /// Model config JSON file (overrides arch defaults)
+        #[arg(long)]
+        model_config: Option<String>,
+
+        /// MoE router z-loss coefficient (0 to disable)
+        #[arg(long, default_value = "0.0")]
+        z_loss: f32,
+
+        /// Gradient accumulation steps (effective batch = batch_size * this)
+        #[arg(long, default_value = "1")]
+        gradient_accumulation_steps: usize,
+
+        /// Log step/loss/LR every N steps (0 to disable)
+        #[arg(long, default_value = "10")]
+        log_every: usize,
+
+        /// Evaluate on held-out data every N steps (0 to disable)
+        #[arg(long, default_value = "0")]
+        eval_every: usize,
+
+        /// Number of batches per eval round
+        #[arg(long, default_value = "10")]
+        eval_batches: usize,
+
+        /// Random seed
+        #[arg(long, default_value = "42")]
+        seed: u64,
+    },
+
     /// Run inference with a model
     Infer {
         /// Model ID or path
@@ -1464,6 +1556,25 @@ enum Commands {
     Dataset {
         #[command(subcommand)]
         action: DatasetAction,
+    },
+
+    /// Tokenize a text corpus into binary shards for pretraining
+    Tokenize {
+        /// Input JSONL file
+        #[arg(short, long)]
+        input: String,
+        /// Output directory for shard files
+        #[arg(short, long)]
+        output: String,
+        /// Tokenizer model ID or path (HuggingFace format)
+        #[arg(short, long)]
+        tokenizer: String,
+        /// JSONL column containing text (default: "text")
+        #[arg(long, default_value = "text")]
+        text_column: String,
+        /// Maximum documents per shard (default: 10000)
+        #[arg(long, default_value = "10000")]
+        docs_per_shard: usize,
     },
 
     /// Real-time training dashboard (loss curves, ANE utilization, timing)
@@ -3309,6 +3420,23 @@ async fn tokio_main() -> anyhow::Result<()> {
             commands::dataset::run_dataset_command(action).await?;
         }
 
+        Commands::Tokenize {
+            input,
+            output,
+            tokenizer,
+            text_column,
+            docs_per_shard,
+        } => {
+            commands::tokenize::run_tokenize(
+                &input,
+                &output,
+                &tokenizer,
+                &text_column,
+                docs_per_shard,
+            )
+            .await?;
+        }
+
         Commands::Dashboard { metrics_file } => {
             let path = metrics_file.map(std::path::PathBuf::from);
             dashboard::run_dashboard(path)?;
@@ -3408,6 +3536,145 @@ async fn tokio_main() -> anyhow::Result<()> {
                 seed,
             )
             .await?;
+        }
+
+        #[cfg(feature = "trainer")]
+        Commands::Pretrain {
+            arch,
+            shards,
+            seq_len,
+            batch_size,
+            steps,
+            learning_rate,
+            min_lr,
+            warmup_steps,
+            lr_schedule,
+            weight_decay,
+            max_grad_norm,
+            eos_token_id,
+            output,
+            checkpoint_every,
+            resume,
+            model_config: _model_config,
+            z_loss,
+            gradient_accumulation_steps,
+            log_every,
+            eval_every,
+            eval_batches,
+            seed,
+        } => {
+            use pmetal_bridge::compat::random;
+            use pmetal_data::streaming::{StreamConfig, StreamingShardReader};
+            use pmetal_trainer::pretrain::{self, PretrainConfig};
+
+            random::seed(seed);
+            let _output_dir = validate_output_path(&output, "pretrain output")?;
+
+            // Collect shard paths (each CLI value is a literal path)
+            let shard_paths: Vec<std::path::PathBuf> =
+                shards.iter().map(std::path::PathBuf::from).collect();
+            anyhow::ensure!(!shard_paths.is_empty(), "no shard files specified");
+            println!(
+                "Pretraining on {} shards, {} steps",
+                shard_paths.len(),
+                steps
+            );
+
+            // Parse LR schedule
+            let lr_sched = match lr_schedule.to_lowercase().as_str() {
+                "constant" => pmetal_core::LrSchedulerType::Constant,
+                "linear" => pmetal_core::LrSchedulerType::Linear,
+                "cosine" => pmetal_core::LrSchedulerType::Cosine,
+                other => anyhow::bail!("unknown lr-schedule: {other}"),
+            };
+
+            // Build model via factory (supports llama, qwen2, qwen3, gemma, mistral, phi, gpt-oss)
+            use pmetal_bridge::compat::module::ModuleParameters;
+            let config_path = _model_config.as_deref().map(std::path::Path::new);
+            let mut model = pretrain::create_model(&arch, config_path)?;
+            let n_layers = pretrain::n_layers(&model);
+            println!(
+                "Architecture: {arch}, layers: {n_layers}, params: {}",
+                model.num_parameters()
+            );
+
+            let config = PretrainConfig {
+                num_steps: steps,
+                learning_rate,
+                min_lr,
+                warmup_steps,
+                lr_schedule: lr_sched,
+                weight_decay,
+                betas: (0.9, 0.95),
+                eps: 1e-8,
+                max_grad_norm: if max_grad_norm > 0.0 {
+                    Some(max_grad_norm)
+                } else {
+                    None
+                },
+                ignore_index: None,
+                z_loss_coef: if z_loss > 0.0 { Some(z_loss) } else { None },
+                n_layers,
+                apply_init: resume.is_none(),
+                checkpoint_every: if checkpoint_every > 0 {
+                    Some(checkpoint_every)
+                } else {
+                    None
+                },
+                checkpoint_dir: Some(std::path::PathBuf::from(&output)),
+                gradient_accumulation_steps,
+                log_every,
+                eval_every,
+                eval_batches,
+            };
+
+            // Resume from checkpoint if requested
+            if let Some(ref ckpt_dir) = resume {
+                let mut opt = pmetal_bridge::compat::optimizers::AdamWBuilder::new(learning_rate)
+                    .weight_decay(weight_decay)
+                    .build()?;
+                let meta = pretrain::load_checkpoint(
+                    std::path::Path::new(ckpt_dir),
+                    &mut model,
+                    &mut opt,
+                )?;
+                println!("Resumed from step {}, loss {:.4}", meta.step, meta.loss);
+            }
+
+            // Streaming data pipeline
+            let stream_config = StreamConfig {
+                shard_paths,
+                seq_len,
+                batch_size,
+                eos_token_id,
+                resume_from: None,
+            };
+            let reader = StreamingShardReader::new(stream_config)?;
+
+            // Convert streaming batches to MLX arrays
+            let batch_iter = reader.map(move |(batch, _pos)| {
+                let flat: Vec<i32> = batch
+                    .iter()
+                    .flat_map(|seq| seq.iter().map(|&t| t as i32))
+                    .collect();
+                pmetal_bridge::InlineArray::from_i32_slice_shaped(
+                    &flat,
+                    &[batch.len() as i32, seq_len as i32],
+                )
+            });
+
+            // Run
+            let losses = pretrain::run_pretrain(&mut model, &config, batch_iter)?;
+
+            // Print summary
+            if !losses.is_empty() {
+                let last = losses.last().unwrap();
+                println!(
+                    "Pretraining complete: {} steps, final loss {:.4}",
+                    losses.len(),
+                    last,
+                );
+            }
         }
     }
 

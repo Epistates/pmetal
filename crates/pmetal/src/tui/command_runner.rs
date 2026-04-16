@@ -162,7 +162,7 @@ async fn run_command(
     if let Some(ref output_dir) = spec.output_dir {
         if matches!(
             spec.job_type,
-            JobType::Train | JobType::Distill | JobType::Grpo
+            JobType::Train | JobType::Distill | JobType::Grpo | JobType::Pretrain
         ) {
             let running_file = output_dir.join(".running");
             let _ = tokio::fs::create_dir_all(output_dir).await;
@@ -193,7 +193,7 @@ async fn run_command(
     // Emit phase status for training-type jobs so the dashboard shows setup progress.
     if matches!(
         spec.job_type,
-        JobType::Train | JobType::Distill | JobType::Grpo
+        JobType::Train | JobType::Distill | JobType::Grpo | JobType::Pretrain
     ) {
         let _ = tx
             .send(AppMsg::JobPhase {
@@ -218,7 +218,7 @@ async fn run_command(
     if let Some(ref metrics_path) = spec.metrics_file {
         if matches!(
             spec.job_type,
-            JobType::Train | JobType::Distill | JobType::Grpo
+            JobType::Train | JobType::Distill | JobType::Grpo | JobType::Pretrain
         ) {
             cmd.args(["--log-metrics", &metrics_path.display().to_string()]);
         }

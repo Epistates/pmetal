@@ -11,6 +11,7 @@ mod inference;
 mod jobs;
 mod merge;
 mod models;
+mod pretrain;
 mod quantize;
 mod serve;
 mod training;
@@ -26,6 +27,7 @@ pub use inference::{InferenceFocus, InferenceTab};
 pub use jobs::JobsTab;
 pub use merge::MergeTab;
 pub use models::{ModelSource, ModelsTab, write_training_info};
+pub use pretrain::PretrainTab;
 pub use quantize::QuantizeTab;
 pub use serve::ServeTab;
 pub use training::{TrainingStatus, TrainingTab};
@@ -44,6 +46,7 @@ pub enum Tab {
     Models,
     Datasets,
     Training,
+    Pretrain,
     Distillation,
     Grpo,
     Inference,
@@ -62,6 +65,7 @@ impl Tab {
         Tab::Models,
         Tab::Datasets,
         Tab::Training,
+        Tab::Pretrain,
         Tab::Distillation,
         Tab::Grpo,
         Tab::Dashboard,
@@ -82,6 +86,7 @@ impl Tab {
             Tab::Models => "~",
             Tab::Datasets => "&",
             Tab::Training => ">",
+            Tab::Pretrain => "]",
             Tab::Distillation => "^",
             Tab::Grpo => "!",
             Tab::Inference => "$",
@@ -117,6 +122,7 @@ impl std::fmt::Display for Tab {
             Tab::Models => write!(f, "Models"),
             Tab::Datasets => write!(f, "Datasets"),
             Tab::Training => write!(f, "Training"),
+            Tab::Pretrain => write!(f, "Pretrain"),
             Tab::Distillation => write!(f, "Distill"),
             Tab::Grpo => write!(f, "GRPO"),
             Tab::Inference => write!(f, "Inference"),

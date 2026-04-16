@@ -42,6 +42,7 @@ pub struct App {
     pub training: TrainingTab,
     pub inference: InferenceTab,
     pub jobs: JobsTab,
+    pub pretrain: PretrainTab,
     pub distillation: DistillationTab,
     pub grpo: GrpoTab,
     pub serve: ServeTab,
@@ -91,6 +92,9 @@ pub struct App {
     /// Currently active merge job ID (if any). One-shot.
     active_merge_job: Option<String>,
 
+    /// Currently active pretrain job ID (if any).
+    active_pretrain_job: Option<String>,
+
     /// Header area for mouse hit-testing.
     header_area: ratatui::layout::Rect,
 }
@@ -129,6 +133,7 @@ enum PendingModalTarget {
     MergeModelB,
     MergeBaseModel,
     MergeStart,
+    PretrainStart,
     DownloadModel,
     HfSearch,
     AddModelDir,
@@ -152,6 +157,7 @@ impl App {
             training: TrainingTab::new(),
             inference: InferenceTab::new(),
             jobs: JobsTab::new(),
+            pretrain: PretrainTab::new(),
             distillation: DistillationTab::new(),
             grpo: GrpoTab::new(),
             serve: ServeTab::new(),
@@ -172,6 +178,7 @@ impl App {
             active_bench_job: None,
             active_eval_job: None,
             active_merge_job: None,
+            active_pretrain_job: None,
             header_area: ratatui::layout::Rect::default(),
         }
     }
@@ -495,6 +502,7 @@ impl App {
                 _ => {}
             },
             Tab::Training => self.handle_training_key(key),
+            Tab::Pretrain => self.handle_pretrain_key(key),
             Tab::Inference => self.handle_inference_key(key),
             Tab::Jobs => self.handle_jobs_key(key),
             Tab::Distillation => self.handle_distillation_key(key),
@@ -730,6 +738,45 @@ impl App {
             }
             KeyCode::Char('S') => {
                 self.start_distillation_prompt();
+            }
+            KeyCode::Char('L') => {
+                self.open_lr_override_modal();
+            }
+            _ => {}
+        }
+    }
+
+    // --- Pretrain tab key handler ---
+    fn handle_pretrain_key(&mut self, key: crossterm::event::KeyEvent) {
+        if self.pretrain.is_editing() {
+            match key.code {
+                KeyCode::Enter => {
+                    self.pretrain.confirm_edit();
+                }
+                KeyCode::Esc => {
+                    self.pretrain.cancel_edit();
+                }
+                _ => {
+                    self.pretrain.handle_edit_key(key);
+                }
+            }
+            return;
+        }
+
+        match key.code {
+            KeyCode::Down | KeyCode::Char('j') => self.pretrain.next_param(),
+            KeyCode::Up | KeyCode::Char('k') => self.pretrain.prev_param(),
+            KeyCode::Enter => {
+                if let Some(action) = self.pretrain.handle_enter() {
+                    match action {
+                        FormAction::OpenModelPicker { .. } => {}
+                        FormAction::OpenDatasetPicker { .. } => {}
+                        FormAction::StartEdit => {}
+                    }
+                }
+            }
+            KeyCode::Char('S') => {
+                self.start_pretrain_prompt();
             }
             KeyCode::Char('L') => {
                 self.open_lr_override_modal();
@@ -1077,6 +1124,7 @@ impl App {
                     Tab::Models => self.models.prev_row(),
                     Tab::Datasets => self.datasets.prev_row(),
                     Tab::Training => self.training.prev_param(),
+                    Tab::Pretrain => self.pretrain.prev_param(),
                     Tab::Jobs => self.jobs.prev_row(),
                     Tab::Distillation => self.distillation.prev_param(),
                     Tab::Grpo => self.grpo.prev_param(),
@@ -1092,6 +1140,7 @@ impl App {
                 Tab::Models => self.models.next_row(),
                 Tab::Datasets => self.datasets.next_row(),
                 Tab::Training => self.training.next_param(),
+                Tab::Pretrain => self.pretrain.next_param(),
                 Tab::Jobs => self.jobs.next_row(),
                 Tab::Distillation => self.distillation.next_param(),
                 Tab::Grpo => self.grpo.next_param(),
@@ -1134,6 +1183,16 @@ impl App {
                         total_steps: 0,
                         loss: 0.0,
                     };
+                }
+                JobType::Pretrain => {
+                    self.pretrain.status = TrainingStatus::Running {
+                        step: 0,
+                        epoch: 0,
+                        total_epochs: 0,
+                        total_steps: 0,
+                        loss: 0.0,
+                    };
+                    self.dashboard.job_phase = Some("Starting pretrain job...".to_string());
                 }
                 _ => {}
             },
@@ -1181,6 +1240,7 @@ impl App {
                 match self.active_job_type {
                     Some(JobType::Distill) => self.distillation.status = running,
                     Some(JobType::Grpo) => self.grpo.status = running,
+                    Some(JobType::Pretrain) => self.pretrain.status = running,
                     _ => self.training.set_status_running(
                         step,
                         epoch,
@@ -1274,6 +1334,12 @@ impl App {
                                     total_steps: steps,
                                 };
                             }
+                            JobType::Pretrain => {
+                                self.pretrain.status = TrainingStatus::Completed {
+                                    final_loss: loss,
+                                    total_steps: steps,
+                                };
+                            }
                             _ => {
                                 self.training.set_status_completed(loss, steps);
                             }
@@ -1289,6 +1355,7 @@ impl App {
                         let job_label = match job_type {
                             JobType::Distill => "Distillation",
                             JobType::Grpo => "GRPO Training",
+                            JobType::Pretrain => "Pretraining",
                             _ => "Training",
                         };
                         // Offer to test inference with the trained model
@@ -1309,6 +1376,9 @@ impl App {
                             }
                             JobType::Grpo => {
                                 self.grpo.status = TrainingStatus::Failed(message.clone());
+                            }
+                            JobType::Pretrain => {
+                                self.pretrain.status = TrainingStatus::Failed(message.clone());
                             }
                             _ => {
                                 self.training.set_status_failed(&message);
@@ -1365,6 +1435,9 @@ impl App {
                     } else {
                         self.merge.mark_failed(&message);
                     }
+                }
+                if self.active_pretrain_job.as_deref() == Some(&job_id) {
+                    self.active_pretrain_job = None;
                 }
                 // Pop progress modal if one is showing (for convert/download jobs)
                 if matches!(self.modal_stack.last(), Some(Modal::Progress { .. })) {
@@ -1529,6 +1602,9 @@ impl App {
                     }
                     Some(PendingModalTarget::MergeStart) => {
                         self.start_merge();
+                    }
+                    Some(PendingModalTarget::PretrainStart) => {
+                        self.start_pretrain();
                     }
                     Some(PendingModalTarget::FuseStart) => {
                         self.start_fuse();
@@ -1754,6 +1830,7 @@ impl App {
             self.active_bench_job.is_some(),
             self.active_eval_job.is_some(),
             self.active_merge_job.is_some(),
+            self.active_pretrain_job.is_some(),
         ]
         .iter()
         .filter(|x| **x)
@@ -1942,6 +2019,44 @@ impl App {
             let job_id = runner.spawn(spec);
             self.active_training_job = Some(job_id);
             self.active_job_type = Some(JobType::Grpo);
+            self.active_training_output_dir = Some(output_dir);
+            self.dashboard.set_metrics_path(Some(metrics_file));
+            self.active_tab = Tab::Dashboard;
+        }
+    }
+
+    fn start_pretrain_prompt(&mut self) {
+        let summary = self.pretrain.config_summary();
+        if let Err(msg) = self.pretrain.validate_config() {
+            self.modal_stack.push(Modal::error("Invalid Config", msg));
+            return;
+        }
+        self.pending_modal_context = Some(PendingModalTarget::PretrainStart);
+        self.modal_stack
+            .push(Modal::confirm("Start Pretraining?", summary));
+    }
+
+    fn start_pretrain(&mut self) {
+        let args = self.pretrain.build_cli_args();
+        let output_dir = self.pretrain.output_dir();
+        let metrics_file = output_dir.join("metrics.jsonl");
+
+        // Truncate old metrics so dashboard starts fresh
+        let _ = std::fs::create_dir_all(&output_dir);
+        let _ = std::fs::write(&metrics_file, "");
+
+        let spec = CommandSpec {
+            job_type: JobType::Pretrain,
+            args,
+            metrics_file: Some(metrics_file.clone()),
+            output_dir: Some(output_dir.clone()),
+        };
+
+        if let Some(runner) = &mut self.runner {
+            let job_id = runner.spawn(spec);
+            self.active_pretrain_job = Some(job_id.clone());
+            self.active_training_job = Some(job_id);
+            self.active_job_type = Some(JobType::Pretrain);
             self.active_training_output_dir = Some(output_dir);
             self.dashboard.set_metrics_path(Some(metrics_file));
             self.active_tab = Tab::Dashboard;
@@ -2479,7 +2594,7 @@ impl App {
         let dash_throughput;
         let needs_metrics = matches!(
             self.active_tab,
-            Tab::Training | Tab::Distillation | Tab::Grpo
+            Tab::Training | Tab::Pretrain | Tab::Distillation | Tab::Grpo
         );
         if needs_metrics {
             dash_samples = self.dashboard.samples.clone();
@@ -2503,6 +2618,14 @@ impl App {
                     &dash_throughput,
                 );
             }
+            Tab::Pretrain => {
+                self.pretrain.render_with_metrics(
+                    content_area,
+                    buf,
+                    &dash_samples,
+                    &dash_throughput,
+                );
+            }
             Tab::Inference => (&mut self.inference).render(content_area, buf),
             Tab::Jobs => (&mut self.jobs).render(content_area, buf),
             Tab::Distillation => {
@@ -2517,11 +2640,11 @@ impl App {
                 self.grpo
                     .render_with_metrics(content_area, buf, &dash_samples, &dash_throughput);
             }
-            Tab::Serve => (&mut self.serve).render(content_area, buf),
-            Tab::Quantize => (&mut self.quantize).render(content_area, buf),
-            Tab::Bench => (&mut self.bench).render(content_area, buf),
-            Tab::Eval => (&mut self.eval).render(content_area, buf),
-            Tab::Merge => (&mut self.merge).render(content_area, buf),
+            Tab::Serve => self.serve.render(content_area, buf),
+            Tab::Quantize => self.quantize.render(content_area, buf),
+            Tab::Bench => self.bench.render(content_area, buf),
+            Tab::Eval => self.eval.render(content_area, buf),
+            Tab::Merge => self.merge.render(content_area, buf),
         }
 
         // Footer with keybindings and active-job count.

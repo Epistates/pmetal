@@ -104,6 +104,8 @@ pub enum JobType {
     Eval,
     /// One-shot model-merge job (`pmetal merge`).
     Merge,
+    /// Full-parameter pretraining job (`pmetal pretrain`).
+    Pretrain,
 }
 
 impl std::fmt::Display for JobType {
@@ -120,6 +122,7 @@ impl std::fmt::Display for JobType {
             JobType::Bench => write!(f, "Bench"),
             JobType::Eval => write!(f, "Eval"),
             JobType::Merge => write!(f, "Merge"),
+            JobType::Pretrain => write!(f, "Pretrain"),
         }
     }
 }
