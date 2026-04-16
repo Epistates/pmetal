@@ -23,6 +23,7 @@ pub(crate) mod rlkd;
 pub(crate) mod search;
 #[cfg(feature = "serve")]
 pub(crate) mod serve;
+pub(crate) mod tokenize;
 
 use pmetal_data::DatasetColumnConfig;
 
