@@ -359,7 +359,7 @@ pub fn model_spec_from_config(
         .or(num_attention_heads);
     let head_dim = config["head_dim"].as_u64().or_else(|| {
         let nh = num_attention_heads?;
-        if nh > 0 { Some(hidden / nh) } else { None }
+        hidden.checked_div(nh)
     });
 
     // MoE detection
