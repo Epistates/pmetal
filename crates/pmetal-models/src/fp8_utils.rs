@@ -42,14 +42,8 @@ pub fn quantize_model_linears<M: ModuleParameters>(model: &mut M) -> Result<(), 
     // We need owned quantized arrays, then write them back through parameters_mut.
     let keys_to_quantize: Vec<std::rc::Rc<str>> = {
         let flat = model.flatten_params();
-        flat.into_iter()
-            .filter_map(|(k, _)| {
-                if k.ends_with(".weight") || k.as_ref() == "weight" {
-                    Some(k)
-                } else {
-                    None
-                }
-            })
+        flat.into_keys()
+            .filter(|k| k.ends_with(".weight") || k.as_ref() == "weight")
             .collect()
     };
 

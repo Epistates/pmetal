@@ -159,7 +159,7 @@ impl DFlashTarget for NativeQwen3Target {
                 }
             }
         }
-        for (idx, h) in tap_layers.iter().zip(captured.into_iter()) {
+        for (idx, h) in tap_layers.iter().zip(captured) {
             capture.record_hidden(*idx, h);
         }
         Ok(logits)
@@ -249,7 +249,7 @@ impl DFlashTarget for NativeQwen3Target {
                 tap_layers
             )));
         }
-        for (idx, h) in tap_layers.iter().zip(captured.into_iter()) {
+        for (idx, h) in tap_layers.iter().zip(captured) {
             capture.record_hidden(*idx, h);
         }
         Ok(logits)
