@@ -99,6 +99,7 @@ pub mod param_groups;
 #[cfg(feature = "experimental-trainers")]
 pub mod ppo;
 mod preference_batch;
+pub mod pretrain;
 pub mod reasoning_template;
 pub mod reward_model;
 pub mod rlkd;
