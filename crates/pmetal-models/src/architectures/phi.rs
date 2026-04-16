@@ -15,6 +15,9 @@
 //! - `phi-3-medium-4k-instruct` (14B, 4K context)
 //! - `phi-3.5-mini-instruct` (3.8B, 128K context)
 //! - `phi-4` (14B, 16K context)
+use crate::decoder_layer::{
+    AttentionModule, DecoderLayer, MlpModule, NormModule, std_pre_norm_forward,
+};
 use pmetal_bridge::compat::nn::{Embedding, Linear, RmsNorm, RopeBuilder};
 use pmetal_bridge::compat::{
     Array, Exception, ModuleParameters, ModuleParametersExt, Param, fast, nn, ops, random,
@@ -315,6 +318,12 @@ impl PhiRMSNorm {
         let eps = Array::from_f32(self.eps);
         let x_normed = x.divide(&variance.add(&eps).sqrt());
         Ok(x_normed.multiply(&self.weight))
+    }
+}
+
+impl NormModule for PhiRMSNorm {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        PhiRMSNorm::forward(self, x)
     }
 }
 
@@ -621,6 +630,12 @@ impl PhiMLP {
     }
 }
 
+impl MlpModule for PhiMLP {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        PhiMLP::forward(self, x)
+    }
+}
+
 /// Phi decoder layer.
 #[derive(Debug)]
 pub struct PhiDecoderLayer {
@@ -648,23 +663,46 @@ impl PhiDecoderLayer {
     }
 
     /// Forward pass with optional KV cache.
+    ///
+    /// Delegates to the shared pre-norm skeleton —
+    /// see `crate::decoder_layer::std_pre_norm_forward`.
     pub fn forward_with_cache(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
-        // Pre-norm attention
-        let residual = x.clone();
-        let hidden = self.input_layernorm.forward(x)?;
-        let hidden = self.self_attn.forward_with_cache(&hidden, mask, cache)?;
-        let hidden = residual.add(&hidden);
+        std_pre_norm_forward(
+            &mut self.input_layernorm,
+            &mut self.self_attn,
+            &mut self.post_attention_layernorm,
+            &mut self.mlp,
+            x,
+            mask,
+            cache,
+        )
+    }
+}
 
-        // Pre-norm MLP
-        let residual = hidden.clone();
-        let hidden = self.post_attention_layernorm.forward(&hidden)?;
-        let hidden = self.mlp.forward(&hidden)?;
-        Ok(residual.add(&hidden))
+impl AttentionModule for PhiAttention {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        PhiAttention::forward_with_cache(self, x, mask, cache)
+    }
+}
+
+impl DecoderLayer for PhiDecoderLayer {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        PhiDecoderLayer::forward_with_cache(self, x, mask, cache)
     }
 }
 

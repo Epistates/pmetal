@@ -35,12 +35,9 @@ chrono = "0.4"
 futures = "0.3"
 tokio-stream = "0.1"
 
-[lints.rust]
-unsafe_code = "allow"
-
-[lints.clippy]
-all = { level = "warn", priority = -1 }
-must_use_candidate = "allow"
-missing_errors_doc = "allow"
-missing_panics_doc = "allow"
-module_name_repetitions = "allow"
+# Inherit workspace lints (including `unsafe_code = "deny"`); the single
+# `unsafe impl Send for ModelState` in engine.rs is annotated with
+# `#[allow(unsafe_code)]` + a SAFETY comment, which overrides the deny at
+# the item level.
+[lints]
+workspace = true

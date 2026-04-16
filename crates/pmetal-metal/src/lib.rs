@@ -105,8 +105,7 @@ pub use kernels::fused_merge::{
     build_tensor_info,
 };
 pub use kernels::fused_moe::{
-    ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig, GatherQmmSwiglu,
-    GatherQmmSwigluConfig, StackedExpertWeights,
+    ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig,
 };
 pub use kernels::fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use kernels::fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};

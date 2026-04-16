@@ -168,6 +168,18 @@ deps:
 audit:
     cargo audit
 
+# ─── Benchmarks ─────────────────────────────────────────────────────
+
+# Run all pmetal-metal benchmarks (ANE kernels + kernel dispatch)
+bench-metal:
+    cargo bench -p pmetal-metal
+
+# Run the Metal kernel-dispatch benchmark only. Establishes a baseline
+# for the `dispatch_simple_kernel` helper; re-run after shader/dispatch
+# changes to catch regressions.
+bench-metal-dispatch:
+    cargo bench -p pmetal-metal --bench kernel_dispatch
+
 # ─── Fuzzing ────────────────────────────────────────────────────────
 
 # Run GGUF fuzz tests (CI: fuzz job, 5 min)

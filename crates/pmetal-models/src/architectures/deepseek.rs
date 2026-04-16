@@ -8,6 +8,7 @@
 //! - Multi-token prediction lookahead modules
 
 // ModuleParameters derive via impl_module_params!
+use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use pmetal_bridge::compat::indexing::IndexOp;
 use pmetal_bridge::compat::{
     Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
@@ -624,27 +625,22 @@ impl DeepSeekMoEGate {
         let token_count: i32 = shape[..shape.len().saturating_sub(1)].iter().product();
         let hidden_flat = x.reshape(&[token_count, hidden_size]);
         let gates = self.weight.forward(&hidden_flat);
+
+        // DeepSeek routes on sigmoid scores (not softmax). The cast keeps
+        // the reduction in f32 for numerical stability on bf16 models.
         let scores = pmetal_bridge::compat::ops::sigmoid(
             &gates.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32()),
         );
-        let scores_with_bias = scores.add(&self.e_score_correction_bias);
-        let neg_k = -self.top_k;
-        let inds = pmetal_bridge::compat::ops::slice_axis_from(
-            &pmetal_bridge::compat::ops::argpartition_axis(&scores_with_bias, neg_k, -1),
-            -1,
-            neg_k,
+
+        // Shared top-k + noaux_tc bias-corrected selection —
+        // see `crate::moe_routing::noaux_tc_topk`.
+        crate::moe_routing::noaux_tc_topk(
+            &scores,
+            &self.e_score_correction_bias,
+            self.top_k,
+            self.norm_topk_prob,
+            self.routed_scaling_factor,
         )
-        .as_type::<i32>();
-        let top_scores = scores.take_along_axis(&inds, -1);
-        let final_scores = if self.norm_topk_prob && self.top_k > 1 {
-            top_scores.divide(&top_scores.sum_axis(-1, true))
-        } else {
-            top_scores
-        };
-        Ok((
-            inds,
-            final_scores.multiply(&Array::from_f32(self.routed_scaling_factor)),
-        ))
     }
 }
 
@@ -1020,20 +1016,47 @@ impl DeepSeekDecoderLayer {
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array> {
-        let h = x.add(
-            &self
-                .self_attn
-                .forward(&self.input_layernorm.forward(x), mask, cache)?,
-        );
-        Ok(h.add(
-            &self
-                .mlp
-                .forward(&self.post_attention_layernorm.forward(&h))?,
-        ))
+        std_pre_norm_forward(
+            &mut self.input_layernorm,
+            &mut self.self_attn,
+            &mut self.post_attention_layernorm,
+            &mut self.mlp,
+            x,
+            mask,
+            cache,
+        )
     }
 
     pub fn init_stacked_moe(&mut self) -> Result<()> {
         self.mlp.init_stacked_moe()
+    }
+}
+
+impl AttentionModule for DeepSeekAttention {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        DeepSeekAttention::forward(self, x, mask, cache)
+    }
+}
+
+impl MlpModule for DeepSeekMLPType {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        DeepSeekMLPType::forward(self, x)
+    }
+}
+
+impl DecoderLayer for DeepSeekDecoderLayer {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        DeepSeekDecoderLayer::forward(self, x, mask, cache)
     }
 }
 

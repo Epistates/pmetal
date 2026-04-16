@@ -3,6 +3,12 @@
 //! This module provides Rust bindings for the Metal compute shaders that accelerate
 //! mHC operations on Apple Silicon.
 
+// This module is the Metal FFI boundary for mHC — `unsafe` is required for
+// `new_with_length: options:`, `from_bytes_no_copy: length: …`, `std::slice::from_raw_parts`,
+// and the `Send`/`Sync` impls on `MhcMetalContext`. Each unsafe block carries
+// its own SAFETY comment.
+#![allow(unsafe_code)]
+
 use super::{KernelStats, MHC_METAL_SHADERS, MhcKernelConfig};
 use crate::params::MhcMappings;
 use crate::sinkhorn::SinkhornConfig;

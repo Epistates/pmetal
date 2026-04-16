@@ -14,6 +14,8 @@ use pmetal_mlx::kernels::{
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
+use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
+
 /// Llama model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LlamaConfig {
@@ -413,6 +415,12 @@ impl LlamaMLP {
     }
 }
 
+impl MlpModule for LlamaMLP {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        LlamaMLP::forward(self, x)
+    }
+}
+
 /// Llama transformer block.
 #[derive(Debug)]
 pub struct LlamaDecoderLayer {
@@ -459,21 +467,49 @@ impl LlamaDecoderLayer {
     }
 
     /// Forward pass with optional KV cache.
+    ///
+    /// Delegates to the shared pre-norm skeleton in
+    /// [`crate::decoder_layer::std_pre_norm_forward`] — the 6-line
+    /// `norm → attn → +residual → norm → mlp → +residual` pattern is
+    /// defined once and reused across every dense-transformer arch
+    /// that matches the standard shape.
     pub fn forward_with_cache(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
-        // Pre-norm + attention + residual
-        let normed = Module::forward(&mut self.input_layernorm, x)?;
-        let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
-        let h = x.add(&attn_out);
+        std_pre_norm_forward(
+            &mut self.input_layernorm,
+            &mut self.self_attn,
+            &mut self.post_attention_layernorm,
+            &mut self.mlp,
+            x,
+            mask,
+            cache,
+        )
+    }
+}
 
-        // Pre-norm + MLP + residual
-        let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out))
+impl AttentionModule for LlamaAttention {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        LlamaAttention::forward_with_cache(self, x, mask, cache)
+    }
+}
+
+impl DecoderLayer for LlamaDecoderLayer {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        LlamaDecoderLayer::forward_with_cache(self, x, mask, cache)
     }
 }
 
@@ -852,6 +888,30 @@ mod tests {
         let output = layer.forward(&x, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 64]);
+    }
+
+    /// Canary: `LlamaDecoderLayer` must work through the shared
+    /// [`crate::decoder_layer::DecoderLayer`] trait — not just via its
+    /// inherent `forward_with_cache`. Dispatching through `dyn DecoderLayer`
+    /// proves the trait impl is live and the trait object is object-safe
+    /// (which is what generation code relies on).
+    #[test]
+    #[serial]
+    fn test_llama_decoder_layer_dispatches_via_trait() {
+        use crate::decoder_layer::DecoderLayer;
+
+        let config = small_config();
+        let mut layer = LlamaDecoderLayer::new(&config, 0).unwrap();
+
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let via_trait = {
+            let dyn_layer: &mut dyn DecoderLayer = &mut layer;
+            dyn_layer.forward(&x, None).unwrap()
+        };
+        assert_eq!(via_trait.shape(), &[1, 4, 64]);
     }
 
     #[test]

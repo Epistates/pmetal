@@ -11,6 +11,15 @@
 pub mod inline_array;
 pub use inline_array::InlineArray;
 
+pub mod error;
+pub use error::{BridgeError, BridgeResult, check_last_error, clear_last_error};
+
+pub mod compile;
+pub use compile::CompiledFn;
+
+pub mod scalar;
+pub mod try_ops;
+
 pub mod compat;
 pub mod decode;
 

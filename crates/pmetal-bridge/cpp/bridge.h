@@ -1264,6 +1264,85 @@ void mlx_inline_layer_norm(mlx_inline_array* dst, const mlx_inline_array* x, con
 void mlx_inline_addmm(mlx_inline_array* dst, const mlx_inline_array* c, const mlx_inline_array* a, const mlx_inline_array* b);
 void mlx_inline_conv2d(mlx_inline_array* dst, const mlx_inline_array* input, const mlx_inline_array* weight, int stride_h, int stride_w, int pad_h, int pad_w, int dil_h, int dil_w, int groups);
 
+// ---------------------------------------------------------------------------
+// Generic mlx::core::compile() wrapper
+// ---------------------------------------------------------------------------
+//
+// mlx::core::compile traces a callable into a single fused graph on first
+// invocation and replays the trace on subsequent calls — the memory-tracked
+// perf memory calls this out as the dominant remaining lever for inference
+// throughput (~7× over the uncompiled path on Qwen3.5).
+//
+// The pmetal bridge already uses compile() *internally* for specific fused
+// ops (see `make_compiled` in `bridge_compiled.cpp`). The API below exposes
+// it generically: a Rust closure is wrapped, compiled once, and handed back
+// as an opaque handle that Rust can call repeatedly.
+
+// Callback invoked by MLX when the compiled closure is called. Converts
+// input mlx::core::array values into `mlx_inline_array` buffers, then
+// calls `forward_fn` with them. The Rust side writes output arrays into
+// `outputs` (caller-allocated with space for `n_outputs_max` slots) and
+// sets `*n_outputs_written` to the actual count.
+typedef void (*mlx_rust_compile_forward_fn)(
+    const mlx_inline_array* const* inputs,
+    int n_inputs,
+    mlx_inline_array* outputs,
+    int* n_outputs_written,
+    void* ctx
+);
+
+// Create a compiled closure. `n_outputs_max` bounds the output vector the
+// Rust trampoline can produce. `shapeless=true` allows re-use across
+// different input shapes; `false` retraces on shape changes.
+//
+// Returns NULL on failure (check pmetal_bridge_last_error_*).
+void* mlx_inline_compile_make(
+    mlx_rust_compile_forward_fn forward_fn,
+    void* ctx,
+    int n_outputs_max,
+    bool shapeless
+);
+
+// Invoke a compiled closure. `inputs` is a flat array of N input handles;
+// on success `outputs[0..*n_outputs_written-1]` hold the result arrays
+// (caller must have allocated at least `n_outputs_max` slots).
+//
+// Returns 0 on success, -1 on any failure (check pmetal_bridge_last_error_*).
+int mlx_inline_compile_call(
+    void* compiled_handle,
+    const mlx_inline_array* const* inputs,
+    int n_inputs,
+    mlx_inline_array* outputs,
+    int n_outputs_max,
+    int* n_outputs_written
+);
+
+// Destroy a compiled closure handle. Safe to call with NULL. Rust's
+// `CompiledFn` Drop impl calls this before dropping its own closure Box.
+void mlx_inline_compile_free(void* compiled_handle);
+
+// ---------------------------------------------------------------------------
+// Error reporting
+// ---------------------------------------------------------------------------
+//
+// Every `mlx_inline_*` entry point that can throw a C++ exception writes
+// its failure into a thread-local error slot before returning. Rust callers
+// can read the slot via these three functions and must copy the message
+// string before issuing another bridge call on the same thread.
+
+// Returns 0 on no error, 1 on a caught std::exception, 2 on an unknown
+// (non-std) C++ exception. Thread-local.
+int32_t pmetal_bridge_last_error_code(void);
+
+// Returns a NUL-terminated message describing the most recent failure on
+// this thread. Pointer is valid until the next bridge call on the same
+// thread. Always returns a non-NULL pointer (empty string when no error).
+const char* pmetal_bridge_last_error_message(void);
+
+// Manually clears the thread-local error slot. Normally unnecessary —
+// every successful bridge op clears it automatically.
+void pmetal_bridge_clear_error(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -18,6 +18,9 @@ use pmetal_mlx::kernels::{
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
+use crate::decoder_layer::{
+    AttentionModule, DecoderLayer, MlpModule, NormModule, std_pre_norm_forward,
+};
 use crate::traits::{CausalLMModel, ModelConfig};
 use std::collections::HashMap;
 
@@ -267,6 +270,14 @@ impl GemmaRmsNorm {
         let one = Array::from_f32(1.0);
         let scale = self.weight.as_ref().add(&one);
         Ok(normed.multiply(&scale))
+    }
+}
+
+impl NormModule for GemmaRmsNorm {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        // Underlying forward takes `&self`; the NormModule trait is `&mut`
+        // to match nn::RmsNorm's training-mode API. Coerce down.
+        GemmaRmsNorm::forward(&*self, x)
     }
 }
 
@@ -573,6 +584,12 @@ impl GemmaMLP {
     }
 }
 
+impl MlpModule for GemmaMLP {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        GemmaMLP::forward(self, x)
+    }
+}
+
 /// Gemma decoder layer.
 #[derive(Debug)]
 pub struct GemmaDecoderLayer {
@@ -611,21 +628,47 @@ impl GemmaDecoderLayer {
     }
 
     /// Forward pass with optional KV cache.
+    ///
+    /// Delegates to the shared pre-norm skeleton —
+    /// see `crate::decoder_layer::std_pre_norm_forward`. Plugs in with
+    /// the Gemma-specific norm via `NormModule for GemmaRmsNorm`.
     pub fn forward_with_cache(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
-        // Pre-norm + attention + residual
-        let normed = self.input_layernorm.forward(x)?;
-        let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
-        let h = x.add(&attn_out);
+        std_pre_norm_forward(
+            &mut self.input_layernorm,
+            &mut self.self_attn,
+            &mut self.post_attention_layernorm,
+            &mut self.mlp,
+            x,
+            mask,
+            cache,
+        )
+    }
+}
 
-        // Pre-norm + MLP + residual
-        let normed = self.post_attention_layernorm.forward(&h)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out))
+impl AttentionModule for GemmaAttention {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        GemmaAttention::forward_with_cache(self, x, mask, cache)
+    }
+}
+
+impl DecoderLayer for GemmaDecoderLayer {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        GemmaDecoderLayer::forward_with_cache(self, x, mask, cache)
     }
 }
 
@@ -676,6 +719,13 @@ impl Gemma2DecoderLayer {
     }
 
     /// Forward pass with optional KV cache.
+    ///
+    /// Gemma2 uses the 4-norm peri-norm pattern (pre-attn, post-attn,
+    /// pre-ffn, post-ffn), which doesn't fit
+    /// `crate::decoder_layer::std_pre_norm_forward`'s two-norm skeleton.
+    /// The hand-rolled body stays; the `DecoderLayer` trait impl is what
+    /// lets generation code dispatch uniformly alongside the
+    /// std-skeleton archs.
     pub fn forward_with_cache(
         &mut self,
         x: &Array,
@@ -693,6 +743,17 @@ impl Gemma2DecoderLayer {
         let mlp_out = self.mlp.forward(&normed)?;
         let mlp_out = self.post_feedforward_layernorm.forward(&mlp_out)?;
         Ok(h.add(&mlp_out))
+    }
+}
+
+impl DecoderLayer for Gemma2DecoderLayer {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        Gemma2DecoderLayer::forward_with_cache(self, x, mask, cache)
     }
 }
 

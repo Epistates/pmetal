@@ -7,6 +7,7 @@
 //! - No RoPE scaling support
 //! - Optional sliding window attention (usually disabled)
 
+use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::traits::ModelConfig;
 use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, nn, ops, random};
 use pmetal_bridge::impl_module_params;
@@ -488,6 +489,12 @@ impl Qwen2MLP {
     }
 }
 
+impl MlpModule for Qwen2MLP {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        Qwen2MLP::forward(self, x)
+    }
+}
+
 /// Qwen2 transformer block.
 #[derive(Debug)]
 pub struct Qwen2DecoderLayer {
@@ -530,21 +537,46 @@ impl Qwen2DecoderLayer {
     }
 
     /// Forward pass with optional KV cache.
+    ///
+    /// Delegates to the shared pre-norm skeleton —
+    /// see `crate::decoder_layer::std_pre_norm_forward`.
     pub fn forward_with_cache(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
-        // Pre-norm + attention + residual
-        let normed = Module::forward(&mut self.input_layernorm, x)?;
-        let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
-        let h = x.add(&attn_out);
+        std_pre_norm_forward(
+            &mut self.input_layernorm,
+            &mut self.self_attn,
+            &mut self.post_attention_layernorm,
+            &mut self.mlp,
+            x,
+            mask,
+            cache,
+        )
+    }
+}
 
-        // Pre-norm + MLP + residual
-        let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out))
+impl AttentionModule for Qwen2Attention {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        Qwen2Attention::forward_with_cache(self, x, mask, cache)
+    }
+}
+
+impl DecoderLayer for Qwen2DecoderLayer {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        Qwen2DecoderLayer::forward_with_cache(self, x, mask, cache)
     }
 }
 

@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::traits::ModelConfig;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
@@ -276,6 +277,14 @@ impl Module<Array> for Qwen3MLP {
     }
 
     fn training_mode(&mut self, _mode: bool) {}
+}
+
+impl MlpModule for Qwen3MLP {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        // Qwen3MLP's native Module<Array> forward takes x by value; clone
+        // is cheap because MLX arrays are reference-counted internally.
+        <Qwen3MLP as Module<Array>>::forward(self, x.clone())
+    }
 }
 
 /// Qwen3 Attention with Q/K RMSNorm before RoPE.
@@ -605,19 +614,56 @@ impl Qwen3Layer {
         })
     }
 
+    /// Forward pass without cache (inference convenience wrapper).
+    pub fn forward_no_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward(x, mask, None)
+    }
+
+    /// Forward pass with optional KV cache.
+    ///
+    /// Delegates to the shared pre-norm skeleton —
+    /// see `crate::decoder_layer::std_pre_norm_forward`.
     pub fn forward(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
-        let h = x.add(
-            &self
-                .self_attn
-                .forward(&self.input_layernorm.forward(x), mask, cache)?,
-        );
-        let mlp_in = self.post_attention_layernorm.forward(&h);
-        Ok(h.add(&self.mlp.forward(mlp_in)?))
+        std_pre_norm_forward(
+            &mut self.input_layernorm,
+            &mut self.self_attn,
+            &mut self.post_attention_layernorm,
+            &mut self.mlp,
+            x,
+            mask,
+            cache,
+        )
+    }
+}
+
+impl AttentionModule for Qwen3Attention {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        Qwen3Attention::forward(self, x, mask, cache)
+    }
+}
+
+impl DecoderLayer for Qwen3Layer {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        Qwen3Layer::forward(self, x, mask, cache)
     }
 }
 
@@ -1022,7 +1068,7 @@ mod tests {
             &[1, 4, 32],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let output = mlp.forward(x).unwrap();
+        let output = Module::forward(&mut mlp, x).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 32]);
     }

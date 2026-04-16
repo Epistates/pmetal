@@ -34,7 +34,7 @@ extern "C" {
 
 void mlx_inline_fused_swiglu(mlx_inline_array* dst,
     const mlx_inline_array* gate, const mlx_inline_array* up) {
-    try {
+    BRIDGE_TRY_DST("fused_swiglu", dst, {
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& g = inputs[0];
@@ -43,7 +43,7 @@ void mlx_inline_fused_swiglu(mlx_inline_array* dst,
             });
         auto result = (*compiled)({as_arr(gate), as_arr(up)});
         new (dst->buf) array(result[0]);
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    });
 }
 
 // Tanh-approximation GELU gating matching mlx-lm's `nn.gelu_approx(gate) * up`.
@@ -53,7 +53,7 @@ void mlx_inline_fused_swiglu(mlx_inline_array* dst,
 // MLP result). Shapeless compile — one trace reused across all layers.
 void mlx_inline_fused_geglu_tanh(mlx_inline_array* dst,
     const mlx_inline_array* gate, const mlx_inline_array* up) {
-    try {
+    BRIDGE_TRY_DST("fused_geglu_tanh", dst, {
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& g = inputs[0];
@@ -71,11 +71,11 @@ void mlx_inline_fused_geglu_tanh(mlx_inline_array* dst,
             });
         auto result = (*compiled)({as_arr(gate), as_arr(up)});
         new (dst->buf) array(result[0]);
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    });
 }
 
 void mlx_inline_fused_silu(mlx_inline_array* dst, const mlx_inline_array* x) {
-    try {
+    BRIDGE_TRY_DST("fused_silu", dst, {
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& x = inputs[0];
@@ -83,12 +83,12 @@ void mlx_inline_fused_silu(mlx_inline_array* dst, const mlx_inline_array* x) {
             });
         auto result = (*compiled)({as_arr(x)});
         new (dst->buf) array(result[0]);
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    });
 }
 
 void mlx_inline_fused_compute_g(mlx_inline_array* dst,
     const mlx_inline_array* a_log, const mlx_inline_array* a, const mlx_inline_array* dt_bias) {
-    try {
+    BRIDGE_TRY_DST("fused_compute_g", dst, {
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto decay = exp(astype(inputs[0], float32));
@@ -97,12 +97,12 @@ void mlx_inline_fused_compute_g(mlx_inline_array* dst,
             });
         auto result = (*compiled)({as_arr(a_log), as_arr(a), as_arr(dt_bias)});
         new (dst->buf) array(result[0]);
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    });
 }
 
 void mlx_inline_fused_precise_swiglu(mlx_inline_array* dst,
     const mlx_inline_array* x, const mlx_inline_array* gate) {
-    try {
+    BRIDGE_TRY_DST("fused_precise_swiglu", dst, {
         static auto* compiled = make_compiled(
             [](const std::vector<array>& inputs) -> std::vector<array> {
                 auto& x = inputs[0];
@@ -113,7 +113,7 @@ void mlx_inline_fused_precise_swiglu(mlx_inline_array* dst,
             });
         auto result = (*compiled)({as_arr(x), as_arr(gate)});
         new (dst->buf) array(result[0]);
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    });
 }
 
 // Compiled entire GDN layer forward.
@@ -217,8 +217,14 @@ void mlx_inline_compiled_gdn_layer(
         new (dst_out->buf) array(result[0]);
         new (dst_conv_state->buf) array(result[1]);
         new (dst_ssm_state->buf) array(result[2]);
+        pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
-        fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what());
+        pmetal_bridge_set_last_error("compiled_gdn_layer", e.what());
+        new (dst_out->buf) array(0.0f);
+        new (dst_conv_state->buf) array(0.0f);
+        new (dst_ssm_state->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("compiled_gdn_layer", "unknown C++ exception");
         new (dst_out->buf) array(0.0f);
         new (dst_conv_state->buf) array(0.0f);
         new (dst_ssm_state->buf) array(0.0f);
@@ -305,8 +311,14 @@ void mlx_inline_compiled_gdn_layer_fixed(
         new (dst_out->buf) array(result[0]);
         new (dst_conv_state->buf) array(result[1]);
         new (dst_ssm_state->buf) array(result[2]);
+        pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
-        fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what());
+        pmetal_bridge_set_last_error("compiled_gdn_layer_fixed", e.what());
+        new (dst_out->buf) array(0.0f);
+        new (dst_conv_state->buf) array(0.0f);
+        new (dst_ssm_state->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("compiled_gdn_layer_fixed", "unknown C++ exception");
         new (dst_out->buf) array(0.0f);
         new (dst_conv_state->buf) array(0.0f);
         new (dst_ssm_state->buf) array(0.0f);
@@ -476,8 +488,14 @@ void mlx_inline_compiled_attn_layer_fixed(
         new (dst_out->buf) array(result[0]);
         new (dst_cache_keys->buf) array(result[1]);
         new (dst_cache_vals->buf) array(result[2]);
+        pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
-        fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what());
+        pmetal_bridge_set_last_error("compiled_attn_layer_fixed", e.what());
+        new (dst_out->buf) array(0.0f);
+        new (dst_cache_keys->buf) array(0.0f);
+        new (dst_cache_vals->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("compiled_attn_layer_fixed", "unknown C++ exception");
         new (dst_out->buf) array(0.0f);
         new (dst_cache_keys->buf) array(0.0f);
         new (dst_cache_vals->buf) array(0.0f);
@@ -611,7 +629,14 @@ void mlx_inline_compiled_moe_layer_fixed(
             as_arr(shared_expert_gate_w),
         });
         new (dst_out->buf) array(result[0]);
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst_out->buf) array(0.0f); }
+        pmetal_bridge_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("compiled_moe_layer_fixed", e.what());
+        new (dst_out->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("compiled_moe_layer_fixed", "unknown C++ exception");
+        new (dst_out->buf) array(0.0f);
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -885,8 +910,14 @@ void mlx_inline_compiled_gemma4_attn_block(
         new (dst_out->buf) array(result[0]);
         new (dst_cache_keys->buf) array(result[1]);
         new (dst_cache_vals->buf) array(result[2]);
+        pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
-        fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what());
+        pmetal_bridge_set_last_error("compiled_gemma4_attn_block", e.what());
+        new (dst_out->buf) array(0.0f);
+        new (dst_cache_keys->buf) array(0.0f);
+        new (dst_cache_vals->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("compiled_gemma4_attn_block", "unknown C++ exception");
         new (dst_out->buf) array(0.0f);
         new (dst_cache_keys->buf) array(0.0f);
         new (dst_cache_vals->buf) array(0.0f);
@@ -996,9 +1027,173 @@ void mlx_inline_compiled_gemma4_mlp_block(
             as_arr(post_norm_w),
         });
         new (dst_out->buf) array(result[0]);
+        pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
-        fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what());
+        pmetal_bridge_set_last_error("compiled_gemma4_mlp_block", e.what());
         new (dst_out->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("compiled_gemma4_mlp_block", "unknown C++ exception");
+        new (dst_out->buf) array(0.0f);
+    }
+}
+
+} // extern "C"
+
+// ============================================================================
+// Generic mlx::core::compile() wrapper — see bridge.h for the ABI docs.
+// ============================================================================
+//
+// Each `BridgeCompiledHandle` owns one compiled closure; the `CompileCtx`
+// member holds the Rust callback + ctx + max output count, and the
+// lambda captured by `mlx::core::compile()` dereferences through a
+// stable pointer into that member. Because the handle is heap-allocated
+// and never moved, the captured pointer stays valid for the life of the
+// handle.
+
+struct CompileCtx {
+    mlx_rust_compile_forward_fn fn;
+    void* ctx;
+    int n_outputs_max;
+};
+
+struct BridgeCompiledHandle {
+    CompiledFn fn;
+    CompileCtx cctx;
+};
+
+// Trampoline: MLX gives us a std::vector<array>; we wrap each as an
+// inline buffer, hand control to Rust, then collect the Rust-populated
+// outputs back into a std::vector<array>.
+//
+// The `mlx_inline_init_copy` on each input is the same pattern used by
+// `value_and_grad`'s trampoline; it gives Rust a borrowed InlineArray
+// whose placement-new'd underlying array is destroyed on the way out.
+static std::vector<array> rust_compile_trampoline(
+    const std::vector<array>& inputs,
+    const CompileCtx* cctx
+) {
+    // Wrap inputs as mlx_inline_array buffers.
+    std::vector<mlx_inline_array> input_bufs(inputs.size());
+    std::vector<const mlx_inline_array*> input_ptrs(inputs.size());
+    for (size_t i = 0; i < inputs.size(); ++i) {
+        new (input_bufs[i].buf) array(inputs[i]);
+        input_ptrs[i] = &input_bufs[i];
+    }
+
+    // Allocate output buffers — Rust writes into these and updates n_out.
+    std::vector<mlx_inline_array> output_bufs(cctx->n_outputs_max);
+    for (int i = 0; i < cctx->n_outputs_max; ++i) {
+        mlx_inline_init_empty(&output_bufs[i]);
+    }
+
+    int n_out = 0;
+    cctx->fn(
+        input_ptrs.data(),
+        static_cast<int>(inputs.size()),
+        output_bufs.data(),
+        &n_out,
+        cctx->ctx
+    );
+
+    // Collect results before destroying the output buffers.
+    std::vector<array> results;
+    results.reserve(static_cast<size_t>(std::max(0, n_out)));
+    int n_to_collect = std::max(0, std::min(n_out, cctx->n_outputs_max));
+    for (int i = 0; i < n_to_collect; ++i) {
+        results.push_back(as_arr(&output_bufs[i]));
+    }
+
+    // Destroy all output buffers (including any Rust didn't fill — those
+    // still hold the default placement-new from mlx_inline_init_empty).
+    for (int i = 0; i < cctx->n_outputs_max; ++i) {
+        as_arr(&output_bufs[i]).~array();
+    }
+    // Destroy input wrappers.
+    for (auto& b : input_bufs) {
+        as_arr(&b).~array();
+    }
+
+    return results;
+}
+
+extern "C" {
+
+void* mlx_inline_compile_make(
+    mlx_rust_compile_forward_fn fn,
+    void* ctx,
+    int n_outputs_max,
+    bool shapeless
+) {
+    if (n_outputs_max <= 0) {
+        pmetal_bridge_set_last_error("compile_make", "n_outputs_max must be > 0");
+        return nullptr;
+    }
+    try {
+        auto* handle = new BridgeCompiledHandle;
+        handle->cctx = CompileCtx{fn, ctx, n_outputs_max};
+        // Capture a pointer to the handle's own cctx member; it stays
+        // alive for as long as the handle (heap-allocated, never moved).
+        CompileCtx* cctx_ptr = &handle->cctx;
+        auto lambda = [cctx_ptr](const std::vector<array>& inputs) -> std::vector<array> {
+            return rust_compile_trampoline(inputs, cctx_ptr);
+        };
+        handle->fn = mlx::core::compile(std::move(lambda), shapeless);
+        pmetal_bridge_clear_error_internal();
+        return handle;
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("compile_make", e.what());
+        return nullptr;
+    } catch (...) {
+        pmetal_bridge_set_last_error("compile_make", "unknown C++ exception");
+        return nullptr;
+    }
+}
+
+int mlx_inline_compile_call(
+    void* compiled_handle,
+    const mlx_inline_array* const* inputs,
+    int n_inputs,
+    mlx_inline_array* outputs,
+    int n_outputs_max,
+    int* n_outputs_written
+) {
+    if (!compiled_handle) {
+        pmetal_bridge_set_last_error("compile_call", "null handle");
+        if (n_outputs_written) *n_outputs_written = 0;
+        return -1;
+    }
+    try {
+        auto* h = static_cast<BridgeCompiledHandle*>(compiled_handle);
+
+        std::vector<array> input_arrs;
+        input_arrs.reserve(static_cast<size_t>(std::max(0, n_inputs)));
+        for (int i = 0; i < n_inputs; ++i) {
+            input_arrs.push_back(as_arr(inputs[i]));
+        }
+
+        auto results = h->fn(input_arrs);
+
+        int n = std::min(static_cast<int>(results.size()), n_outputs_max);
+        for (int i = 0; i < n; ++i) {
+            new (outputs[i].buf) array(std::move(results[i]));
+        }
+        if (n_outputs_written) *n_outputs_written = n;
+        pmetal_bridge_clear_error_internal();
+        return 0;
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("compile_call", e.what());
+        if (n_outputs_written) *n_outputs_written = 0;
+        return -1;
+    } catch (...) {
+        pmetal_bridge_set_last_error("compile_call", "unknown C++ exception");
+        if (n_outputs_written) *n_outputs_written = 0;
+        return -1;
+    }
+}
+
+void mlx_inline_compile_free(void* compiled_handle) {
+    if (compiled_handle) {
+        delete static_cast<BridgeCompiledHandle*>(compiled_handle);
     }
 }
 

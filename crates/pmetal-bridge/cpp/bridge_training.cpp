@@ -9,18 +9,21 @@ extern "C" {
 // ── Training ops: random ─────────────────────────────────────────────────────
 
 void mlx_inline_random_normal(mlx_inline_array* dst, const int* shape, int ndim, int dtype) {
-    new (dst->buf) array(mlx::core::random::normal(
-        {shape, shape + ndim}, dtype_from_int(dtype)));
+    BRIDGE_TRY_DST("random_normal", dst,
+        new (dst->buf) array(mlx::core::random::normal(
+        {shape, shape + ndim}, dtype_from_int(dtype))));
 }
 
 void mlx_inline_random_uniform(mlx_inline_array* dst, const int* shape, int ndim, int dtype) {
-    new (dst->buf) array(mlx::core::random::uniform(
-        {shape, shape + ndim}, dtype_from_int(dtype)));
+    BRIDGE_TRY_DST("random_uniform", dst,
+        new (dst->buf) array(mlx::core::random::uniform(
+        {shape, shape + ndim}, dtype_from_int(dtype))));
 }
 
 void mlx_inline_random_bernoulli(mlx_inline_array* dst, const mlx_inline_array* p, const int* shape, int ndim) {
-    new (dst->buf) array(mlx::core::random::bernoulli(
-        as_arr(p), {shape, shape + ndim}));
+    BRIDGE_TRY_DST("random_bernoulli", dst,
+        new (dst->buf) array(mlx::core::random::bernoulli(
+        as_arr(p), {shape, shape + ndim})));
 }
 
 void mlx_inline_random_seed(uint64_t seed) {
@@ -28,38 +31,46 @@ void mlx_inline_random_seed(uint64_t seed) {
 }
 
 void mlx_inline_random_randint(mlx_inline_array* dst, int low, int high, const int* shape, int ndim, int dtype) {
-    new (dst->buf) array(mlx::core::random::randint(
-        low, high, {shape, shape + ndim}, dtype_from_int(dtype)));
+    BRIDGE_TRY_DST("random_randint", dst,
+        new (dst->buf) array(mlx::core::random::randint(
+        low, high, {shape, shape + ndim}, dtype_from_int(dtype))));
 }
 
 // ── Training ops: math ───────────────────────────────────────────────────────
 
 void mlx_inline_mean_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
-    new (dst->buf) array(mlx::core::mean(as_arr(a), axis, keepdims));
+    BRIDGE_TRY_DST("mean_axis", dst,
+        new (dst->buf) array(mlx::core::mean(as_arr(a), axis, keepdims)));
 }
 
 void mlx_inline_mean_all(mlx_inline_array* dst, const mlx_inline_array* a) {
-    new (dst->buf) array(mlx::core::mean(as_arr(a)));
+    BRIDGE_TRY_DST("mean_all", dst,
+        new (dst->buf) array(mlx::core::mean(as_arr(a))));
 }
 
 void mlx_inline_var_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
-    new (dst->buf) array(mlx::core::var(as_arr(a), axis, keepdims));
+    BRIDGE_TRY_DST("var_axis", dst,
+        new (dst->buf) array(mlx::core::var(as_arr(a), axis, keepdims)));
 }
 
 void mlx_inline_pow(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::power(as_arr(a), as_arr(b)));
+    BRIDGE_TRY_DST("pow", dst,
+        new (dst->buf) array(mlx::core::power(as_arr(a), as_arr(b))));
 }
 
 void mlx_inline_reciprocal(mlx_inline_array* dst, const mlx_inline_array* a) {
-    new (dst->buf) array(mlx::core::reciprocal(as_arr(a)));
+    BRIDGE_TRY_DST("reciprocal", dst,
+        new (dst->buf) array(mlx::core::reciprocal(as_arr(a))));
 }
 
 void mlx_inline_sin(mlx_inline_array* dst, const mlx_inline_array* a) {
-    new (dst->buf) array(mlx::core::sin(as_arr(a)));
+    BRIDGE_TRY_DST("sin", dst,
+        new (dst->buf) array(mlx::core::sin(as_arr(a))));
 }
 
 void mlx_inline_cos(mlx_inline_array* dst, const mlx_inline_array* a) {
-    new (dst->buf) array(mlx::core::cos(as_arr(a)));
+    BRIDGE_TRY_DST("cos", dst,
+        new (dst->buf) array(mlx::core::cos(as_arr(a))));
 }
 
 void mlx_inline_clip(mlx_inline_array* dst, const mlx_inline_array* a,
@@ -78,134 +89,131 @@ void mlx_inline_log_softmax(mlx_inline_array* dst, const mlx_inline_array* a, in
 
 void mlx_inline_cross_entropy(mlx_inline_array* dst, const mlx_inline_array* logits,
                                const mlx_inline_array* targets, int axis) {
-    try {
+    BRIDGE_TRY_DST("cross_entropy", dst, {
         // cross_entropy = -sum(targets * log_softmax(logits), axis=axis)
-        const auto& l = as_arr(logits);
-        auto lse      = mlx::core::logsumexp(l, axis, true);
-        auto log_probs = mlx::core::subtract(l, lse);
-        new (dst->buf) array(mlx::core::negative(
-            mlx::core::sum(mlx::core::multiply(as_arr(targets), log_probs), axis, false)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                const auto& l = as_arr(logits);
+                auto lse      = mlx::core::logsumexp(l, axis, true);
+                auto log_probs = mlx::core::subtract(l, lse);
+                new (dst->buf) array(mlx::core::negative(
+                    mlx::core::sum(mlx::core::multiply(as_arr(targets), log_probs), axis, false)));
+    });
 }
 
 void mlx_inline_square(mlx_inline_array* dst, const mlx_inline_array* a) {
-    try {
-        new (dst->buf) array(mlx::core::square(as_arr(a)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("square", dst,
+        new (dst->buf) array(mlx::core::square(as_arr(a))));
 }
 
 // ── Training ops: creation ───────────────────────────────────────────────────
 
 void mlx_inline_full(mlx_inline_array* dst, const int* shape, int ndim, float val, int dtype) {
-    try {
+    BRIDGE_TRY_DST("full", dst, {
         new (dst->buf) array(mlx::core::full(
-            {shape, shape + ndim}, val, dtype_from_int(dtype)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                    {shape, shape + ndim}, val, dtype_from_int(dtype)));
+    });
 }
 
 void mlx_inline_eye(mlx_inline_array* dst, int n, int dtype) {
-    try {
+    BRIDGE_TRY_DST("eye", dst, {
         // eye(n, m=n, k=0, dtype)
-        new (dst->buf) array(mlx::core::eye(n, n, 0, dtype_from_int(dtype)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                new (dst->buf) array(mlx::core::eye(n, n, 0, dtype_from_int(dtype)));
+    });
 }
 
 void mlx_inline_tri(mlx_inline_array* dst, int n, int m, int k, int dtype) {
-    try {
-        new (dst->buf) array(mlx::core::tri(n, m, k, dtype_from_int(dtype)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("tri", dst,
+        new (dst->buf) array(mlx::core::tri(n, m, k, dtype_from_int(dtype))));
 }
 
 // ── Training ops: shape ──────────────────────────────────────────────────────
 
 void mlx_inline_broadcast_to(mlx_inline_array* dst, const mlx_inline_array* a,
                               const int* shape, int ndim) {
-    try {
+    BRIDGE_TRY_DST("broadcast_to", dst, {
         new (dst->buf) array(mlx::core::broadcast_to(
-            as_arr(a), {shape, shape + ndim}));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                    as_arr(a), {shape, shape + ndim}));
+    });
 }
 
 void mlx_inline_flatten(mlx_inline_array* dst, const mlx_inline_array* a,
                         int start_axis, int end_axis) {
-    try {
-        new (dst->buf) array(mlx::core::flatten(as_arr(a), start_axis, end_axis));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("flatten", dst,
+        new (dst->buf) array(mlx::core::flatten(as_arr(a), start_axis, end_axis)));
 }
 
 // ── Training ops: sort/reduction ─────────────────────────────────────────────
 
 void mlx_inline_argsort(mlx_inline_array* dst, const mlx_inline_array* a, int axis) {
-    try {
-        new (dst->buf) array(mlx::core::argsort(as_arr(a), axis));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("argsort", dst,
+        new (dst->buf) array(mlx::core::argsort(as_arr(a), axis)));
 }
 
 void mlx_inline_sum_all(mlx_inline_array* dst, const mlx_inline_array* a) {
-    try {
-        new (dst->buf) array(mlx::core::sum(as_arr(a)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("sum_all", dst,
+        new (dst->buf) array(mlx::core::sum(as_arr(a))));
 }
 
 void mlx_inline_max_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
-    try {
-        new (dst->buf) array(mlx::core::max(as_arr(a), axis, keepdims));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("max_axis", dst,
+        new (dst->buf) array(mlx::core::max(as_arr(a), axis, keepdims)));
 }
 
 void mlx_inline_min_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims) {
-    try {
-        new (dst->buf) array(mlx::core::min(as_arr(a), axis, keepdims));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("min_axis", dst,
+        new (dst->buf) array(mlx::core::min(as_arr(a), axis, keepdims)));
 }
 
 void mlx_inline_minimum(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    try {
-        new (dst->buf) array(mlx::core::minimum(as_arr(a), as_arr(b)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("minimum", dst,
+        new (dst->buf) array(mlx::core::minimum(as_arr(a), as_arr(b))));
 }
 
 // ── Training ops: activation ─────────────────────────────────────────────────
 
 void mlx_inline_relu(mlx_inline_array* dst, const mlx_inline_array* a) {
-    try {
-        new (dst->buf) array(mlx::core::maximum(as_arr(a), array(0.0f)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("relu", dst,
+        new (dst->buf) array(mlx::core::maximum(as_arr(a), array(0.0f))));
 }
 
 void mlx_inline_gelu(mlx_inline_array* dst, const mlx_inline_array* a) {
-    try {
+    BRIDGE_TRY_DST("gelu", dst, {
         // GELU fast approx: x * sigmoid(1.702 * x)
-        const auto& x = as_arr(a);
-        new (dst->buf) array(mlx::core::multiply(
-            x, mlx::core::sigmoid(mlx::core::multiply(array(1.702f), x))));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                const auto& x = as_arr(a);
+                new (dst->buf) array(mlx::core::multiply(
+                    x, mlx::core::sigmoid(mlx::core::multiply(array(1.702f), x))));
+    });
 }
 
 // ── Training ops: comparison ─────────────────────────────────────────────────
 
 void mlx_inline_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::equal(as_arr(a), as_arr(b)));
+    BRIDGE_TRY_DST("equal", dst,
+        new (dst->buf) array(mlx::core::equal(as_arr(a), as_arr(b))));
 }
 
 void mlx_inline_not_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::not_equal(as_arr(a), as_arr(b)));
+    BRIDGE_TRY_DST("not_equal", dst,
+        new (dst->buf) array(mlx::core::not_equal(as_arr(a), as_arr(b))));
 }
 
 void mlx_inline_greater(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::greater(as_arr(a), as_arr(b)));
+    BRIDGE_TRY_DST("greater", dst,
+        new (dst->buf) array(mlx::core::greater(as_arr(a), as_arr(b))));
 }
 
 void mlx_inline_less(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::less(as_arr(a), as_arr(b)));
+    BRIDGE_TRY_DST("less", dst,
+        new (dst->buf) array(mlx::core::less(as_arr(a), as_arr(b))));
 }
 
 void mlx_inline_greater_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::greater_equal(as_arr(a), as_arr(b)));
+    BRIDGE_TRY_DST("greater_equal", dst,
+        new (dst->buf) array(mlx::core::greater_equal(as_arr(a), as_arr(b))));
 }
 
 void mlx_inline_less_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {
-    new (dst->buf) array(mlx::core::less_equal(as_arr(a), as_arr(b)));
+    BRIDGE_TRY_DST("less_equal", dst,
+        new (dst->buf) array(mlx::core::less_equal(as_arr(a), as_arr(b))));
 }
 
 // ── Training ops: serialization ──────────────────────────────────────────────
@@ -235,14 +243,16 @@ void mlx_inline_quantize(mlx_inline_array* dst_w, mlx_inline_array* dst_scales,
 
 void mlx_inline_sum_axes(mlx_inline_array* dst, const mlx_inline_array* a,
                           const int* axes, int num_axes, bool keepdims) {
-    new (dst->buf) array(mlx::core::sum(
-        as_arr(a), {axes, axes + num_axes}, keepdims));
+    BRIDGE_TRY_DST("sum_axes", dst,
+        new (dst->buf) array(mlx::core::sum(
+        as_arr(a), {axes, axes + num_axes}, keepdims)));
 }
 
 void mlx_inline_mean_axes(mlx_inline_array* dst, const mlx_inline_array* a,
                            const int* axes, int num_axes, bool keepdims) {
-    new (dst->buf) array(mlx::core::mean(
-        as_arr(a), {axes, axes + num_axes}, keepdims));
+    BRIDGE_TRY_DST("mean_axes", dst,
+        new (dst->buf) array(mlx::core::mean(
+        as_arr(a), {axes, axes + num_axes}, keepdims)));
 }
 
 // ── Training ops: misc ───────────────────────────────────────────────────────
@@ -268,7 +278,8 @@ uintptr_t mlx_inline_array_id(const mlx_inline_array* a) {
 }
 
 void mlx_inline_stop_gradient(mlx_inline_array* dst, const mlx_inline_array* a) {
-    new (dst->buf) array(mlx::core::stop_gradient(as_arr(a)));
+    BRIDGE_TRY_DST("stop_gradient", dst,
+        new (dst->buf) array(mlx::core::stop_gradient(as_arr(a))));
 }
 
 void mlx_inline_tri_inv(mlx_inline_array* dst, const mlx_inline_array* a, bool upper, bool use_cpu) {
@@ -371,9 +382,16 @@ void mlx_inline_value_and_grad(
         for (int i = 0; i < n_params; i++) {
             new (grads_out[i]->buf) array(grads[i]);
         }
+        pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
-        fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what());
+        pmetal_bridge_set_last_error("value_and_grad", e.what());
         // Return scalar NaN loss and zero gradients so the training loop can detect failure.
+        new (loss_out->buf) array(std::numeric_limits<float>::quiet_NaN());
+        for (int i = 0; i < n_params; i++) {
+            new (grads_out[i]->buf) array(0.0f);
+        }
+    } catch (...) {
+        pmetal_bridge_set_last_error("value_and_grad", "unknown C++ exception");
         new (loss_out->buf) array(std::numeric_limits<float>::quiet_NaN());
         for (int i = 0; i < n_params; i++) {
             new (grads_out[i]->buf) array(0.0f);
@@ -384,102 +402,100 @@ void mlx_inline_value_and_grad(
 // ── FFT ops ──────────────────────────────────────────────────────────────────
 
 void mlx_inline_rfft(mlx_inline_array* dst, const mlx_inline_array* a, int n_fft, int axis) {
-    try {
+    BRIDGE_TRY_DST("rfft", dst, {
         const auto& x = as_arr(a);
-        if (n_fft < 0) {
-            new (dst->buf) array(mlx::core::fft::rfft(x, axis));
-        } else {
-            new (dst->buf) array(mlx::core::fft::rfft(x, n_fft, axis));
-        }
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                if (n_fft < 0) {
+                    new (dst->buf) array(mlx::core::fft::rfft(x, axis));
+                } else {
+                    new (dst->buf) array(mlx::core::fft::rfft(x, n_fft, axis));
+                };
+    });
 }
 
 void mlx_inline_irfft(mlx_inline_array* dst, const mlx_inline_array* a, int n_fft, int axis) {
-    try {
+    BRIDGE_TRY_DST("irfft", dst, {
         const auto& x = as_arr(a);
-        if (n_fft < 0) {
-            new (dst->buf) array(mlx::core::fft::irfft(x, axis));
-        } else {
-            new (dst->buf) array(mlx::core::fft::irfft(x, n_fft, axis));
-        }
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                if (n_fft < 0) {
+                    new (dst->buf) array(mlx::core::fft::irfft(x, axis));
+                } else {
+                    new (dst->buf) array(mlx::core::fft::irfft(x, n_fft, axis));
+                };
+    });
 }
 
 // ── leaky_relu ────────────────────────────────────────────────────────────────
 
 void mlx_inline_leaky_relu(mlx_inline_array* dst, const mlx_inline_array* a, float neg_slope) {
-    try {
+    BRIDGE_TRY_DST("leaky_relu", dst, {
         const auto& x = as_arr(a);
-        new (dst->buf) array(mlx::core::maximum(
-            mlx::core::multiply(x, array(neg_slope)),
-            x));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                new (dst->buf) array(mlx::core::maximum(
+                    mlx::core::multiply(x, array(neg_slope)),
+                    x));
+    });
 }
 
 // ── squeeze all size-1 axes ────────────────────────────────────────────────────
 
 void mlx_inline_squeeze_all(mlx_inline_array* dst, const mlx_inline_array* a) {
-    try {
+    BRIDGE_TRY_DST("squeeze_all", dst, {
         const auto& x = as_arr(a);
-        std::vector<int> axes;
-        for (int i = 0; i < (int)x.ndim(); ++i) {
-            if (x.shape(i) == 1) axes.push_back(i);
-        }
-        if (axes.empty()) {
-            new (dst->buf) array(x);
-        } else {
-            new (dst->buf) array(mlx::core::squeeze(x, axes));
-        }
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                std::vector<int> axes;
+                for (int i = 0; i < (int)x.ndim(); ++i) {
+                    if (x.shape(i) == 1) axes.push_back(i);
+                }
+                if (axes.empty()) {
+                    new (dst->buf) array(x);
+                } else {
+                    new (dst->buf) array(mlx::core::squeeze(x, axes));
+                };
+    });
 }
 
 // ── pad ───────────────────────────────────────────────────────────────────────
 
 void mlx_inline_pad(mlx_inline_array* dst, const mlx_inline_array* a,
                     const int* pad_widths, int ndim, float fill_value) {
-    try {
+    BRIDGE_TRY_DST("pad", dst, {
         const auto& x = as_arr(a);
-        std::vector<std::pair<int,int>> pw(ndim);
-        for (int i = 0; i < ndim; ++i) {
-            pw[i] = { pad_widths[2*i], pad_widths[2*i+1] };
-        }
-        new (dst->buf) array(mlx::core::pad(x, pw, array(fill_value)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                std::vector<std::pair<int,int>> pw(ndim);
+                for (int i = 0; i < ndim; ++i) {
+                    pw[i] = { pad_widths[2*i], pad_widths[2*i+1] };
+                }
+                new (dst->buf) array(mlx::core::pad(x, pw, array(fill_value)));
+    });
 }
 
 // ── Missing ops for pmetal-models migration ───────────────────────────────────
 
 void mlx_inline_rsqrt(mlx_inline_array* dst, const mlx_inline_array* a) {
-    try {
-        new (dst->buf) array(mlx::core::rsqrt(as_arr(a)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("rsqrt", dst,
+        new (dst->buf) array(mlx::core::rsqrt(as_arr(a))));
 }
 
 void mlx_inline_zeros_like(mlx_inline_array* dst, const mlx_inline_array* a) {
-    try {
-        new (dst->buf) array(mlx::core::zeros_like(as_arr(a)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("zeros_like", dst,
+        new (dst->buf) array(mlx::core::zeros_like(as_arr(a))));
 }
 
 void mlx_inline_ones_like(mlx_inline_array* dst, const mlx_inline_array* a) {
-    try {
-        new (dst->buf) array(mlx::core::ones_like(as_arr(a)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("ones_like", dst,
+        new (dst->buf) array(mlx::core::ones_like(as_arr(a))));
 }
 
 void mlx_inline_tile(mlx_inline_array* dst, const mlx_inline_array* a, const int* reps, int ndim) {
-    try {
+    BRIDGE_TRY_DST("tile", dst, {
         std::vector<int> r(reps, reps + ndim);
-        new (dst->buf) array(mlx::core::tile(as_arr(a), r));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                new (dst->buf) array(mlx::core::tile(as_arr(a), r));
+    });
 }
 
 void mlx_inline_linspace(mlx_inline_array* dst, float start, float stop, int n, int dtype) {
-    try {
-        new (dst->buf) array(mlx::core::linspace(start, stop, n, dtype_from_int(dtype)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("linspace", dst,
+        new (dst->buf) array(mlx::core::linspace(start, stop, n, dtype_from_int(dtype))));
 }
 
+// Multi-output (writes up to `sections` slots into dst_arr). Uses a manual
+// try/catch because BRIDGE_TRY_DST targets a single dst buffer.
 void mlx_inline_split_sections(mlx_inline_array* dst_arr, const mlx_inline_array* a,
                                 int sections, int axis, int* out_count) {
     try {
@@ -488,58 +504,61 @@ void mlx_inline_split_sections(mlx_inline_array* dst_arr, const mlx_inline_array
         for (int i = 0; i < (int)parts.size(); i++) {
             new (dst_arr[i].buf) array(parts[i]);
         }
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); *out_count = 0; }
+        pmetal_bridge_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("split_sections", e.what());
+        *out_count = 0;
+    } catch (...) {
+        pmetal_bridge_set_last_error("split_sections", "unknown C++ exception");
+        *out_count = 0;
+    }
 }
 
 void mlx_inline_scatter_add(mlx_inline_array* dst, const mlx_inline_array* a,
                              const mlx_inline_array* indices, const mlx_inline_array* updates,
                              int axis) {
-    try {
-        new (dst->buf) array(mlx::core::scatter_add(as_arr(a), as_arr(indices), as_arr(updates), axis));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("scatter_add", dst,
+        new (dst->buf) array(mlx::core::scatter_add(as_arr(a), as_arr(indices), as_arr(updates), axis)));
 }
 
 void mlx_inline_topk(mlx_inline_array* dst, const mlx_inline_array* a, int k, int axis) {
-    try {
-        new (dst->buf) array(mlx::core::topk(as_arr(a), k, axis));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("topk", dst,
+        new (dst->buf) array(mlx::core::topk(as_arr(a), k, axis)));
 }
 
 void mlx_inline_put_along_axis(mlx_inline_array* dst, const mlx_inline_array* a,
                                 const mlx_inline_array* indices, const mlx_inline_array* values,
                                 int axis) {
-    try {
-        new (dst->buf) array(mlx::core::put_along_axis(as_arr(a), as_arr(indices), as_arr(values), axis));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("put_along_axis", dst,
+        new (dst->buf) array(mlx::core::put_along_axis(as_arr(a), as_arr(indices), as_arr(values), axis)));
 }
 
 void mlx_inline_layer_norm(mlx_inline_array* dst, const mlx_inline_array* x,
                             const mlx_inline_array* weight, const mlx_inline_array* bias,
                             float eps) {
-    try {
+    BRIDGE_TRY_DST("layer_norm", dst, {
         auto w_opt = weight ? std::optional<array>(as_arr(weight)) : std::nullopt;
-        auto b_opt = bias   ? std::optional<array>(as_arr(bias))   : std::nullopt;
-        new (dst->buf) array(mlx::core::fast::layer_norm(as_arr(x), w_opt, b_opt, eps));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                auto b_opt = bias   ? std::optional<array>(as_arr(bias))   : std::nullopt;
+                new (dst->buf) array(mlx::core::fast::layer_norm(as_arr(x), w_opt, b_opt, eps));
+    });
 }
 
 void mlx_inline_addmm(mlx_inline_array* dst, const mlx_inline_array* c,
                        const mlx_inline_array* a, const mlx_inline_array* b) {
-    try {
-        new (dst->buf) array(mlx::core::addmm(as_arr(c), as_arr(a), as_arr(b)));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+    BRIDGE_TRY_DST("addmm", dst,
+        new (dst->buf) array(mlx::core::addmm(as_arr(c), as_arr(a), as_arr(b))));
 }
 
 void mlx_inline_conv2d(mlx_inline_array* dst, const mlx_inline_array* input,
                        const mlx_inline_array* weight,
                        int stride_h, int stride_w, int pad_h, int pad_w,
                        int dil_h, int dil_w, int groups) {
-    try {
+    BRIDGE_TRY_DST("conv2d", dst, {
         new (dst->buf) array(mlx::core::conv2d(
-            as_arr(input), as_arr(weight),
-            {stride_h, stride_w}, {pad_h, pad_w},
-            {dil_h, dil_w}, groups));
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); new (dst->buf) array(0.0f); }
+                    as_arr(input), as_arr(weight),
+                    {stride_h, stride_w}, {pad_h, pad_w},
+                    {dil_h, dil_w}, groups));
+    });
 }
 
 // ── Gradient checkpointing ───────────────────────────────────────────────────
@@ -641,8 +660,12 @@ void mlx_inline_checkpoint(
             new (dst_outputs[i].buf) array(std::move(results[i]));
         }
         *n_outputs_written = n;
+        pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
-        fprintf(stderr, "[C++ EXCEPTION mlx_inline_checkpoint] %s\n", e.what());
+        pmetal_bridge_set_last_error("checkpoint", e.what());
+        *n_outputs_written = 0;
+    } catch (...) {
+        pmetal_bridge_set_last_error("checkpoint", "unknown C++ exception");
         *n_outputs_written = 0;
     }
 }

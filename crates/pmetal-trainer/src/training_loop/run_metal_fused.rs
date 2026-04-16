@@ -130,41 +130,15 @@ impl TrainingLoop {
                     stats.loss = synced;
                 }
 
-                // Feed loss to adaptive LR controller for next step
-                let action = self.apply_adaptive_lr(stats.loss as f64);
-
-                if action == AdaptiveAction::Continue && self.should_snapshot_best() {
-                    self.snapshot_best_weights(model);
-                }
-                if action == AdaptiveAction::Rollback {
-                    self.restore_best_weights(model);
-                }
-                if action == AdaptiveAction::EarlyStop || action == AdaptiveAction::GracefulStop {
-                    if action == AdaptiveAction::EarlyStop {
-                        self.restore_best_weights(model);
-                    }
-                    #[cfg(feature = "distributed")]
-                    let should_ckpt = self.distributed.as_ref().is_none_or(|d| d.is_master());
-                    #[cfg(not(feature = "distributed"))]
-                    let should_ckpt = true;
-                    if should_ckpt {
-                        if let Some(manager) = checkpoint_manager {
-                            self.save_checkpoint(model, manager, true, Some(self.running_loss))?;
-                        }
-                    }
+                // Adaptive LR + snapshot/rollback/checkpoint-on-stop.
+                // See `TrainingLoop::post_step_adaptive_with_checkpoint` in mod.rs
+                // for the shared handling of every AdaptiveAction variant.
+                if self.post_step_adaptive_with_checkpoint(
+                    stats.loss as f64,
+                    model,
+                    checkpoint_manager,
+                )? {
                     return Ok(());
-                }
-                // Handle external checkpoint save request
-                if action == AdaptiveAction::SaveCheckpoint {
-                    #[cfg(feature = "distributed")]
-                    let should_ckpt = self.distributed.as_ref().is_none_or(|d| d.is_master());
-                    #[cfg(not(feature = "distributed"))]
-                    let should_ckpt = true;
-                    if should_ckpt {
-                        if let Some(manager) = checkpoint_manager {
-                            self.save_checkpoint(model, manager, false, Some(self.running_loss))?;
-                        }
-                    }
                 }
 
                 // Logging + callback dispatch
@@ -223,45 +197,16 @@ impl TrainingLoop {
                     }
                 }
 
-                // Evaluation
-                if self.config.eval_every > 0 && self.step % self.config.eval_every == 0 {
-                    if let Some(eval_ds) = eval_dataset.as_ref() {
-                        let metrics = self.evaluate(model, eval_ds)?;
-                        let acc_str = metrics
-                            .accuracy
-                            .map(|a| format!(", accuracy={:.2}%", a * 100.0))
-                            .unwrap_or_default();
-                        tracing::info!("Eval: loss={:.4}{}", metrics.loss, acc_str);
+                // Scheduled evaluation + best-checkpoint-on-improvement.
+                best_eval_loss = self.maybe_evaluate(
+                    model,
+                    eval_dataset.as_ref(),
+                    checkpoint_manager,
+                    best_eval_loss,
+                )?;
 
-                        if metrics.loss < best_eval_loss {
-                            best_eval_loss = metrics.loss;
-                            #[cfg(feature = "distributed")]
-                            let should_ckpt =
-                                self.distributed.as_ref().is_none_or(|d| d.is_master());
-                            #[cfg(not(feature = "distributed"))]
-                            let should_ckpt = true;
-                            if should_ckpt {
-                                if let Some(manager) = checkpoint_manager {
-                                    self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Regular checkpointing (rank-0 only in distributed mode)
-                if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
-                {
-                    #[cfg(feature = "distributed")]
-                    let should_ckpt = self.distributed.as_ref().is_none_or(|d| d.is_master());
-                    #[cfg(not(feature = "distributed"))]
-                    let should_ckpt = true;
-                    if should_ckpt {
-                        if let Some(manager) = checkpoint_manager {
-                            self.save_checkpoint(model, manager, false, None)?;
-                        }
-                    }
-                }
+                // Scheduled regular checkpointing (rank-0 only in distributed mode).
+                self.maybe_save_regular_checkpoint(model, checkpoint_manager)?;
 
                 // Check max steps
                 if let Some(max) = max_steps {

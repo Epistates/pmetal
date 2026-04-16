@@ -796,16 +796,16 @@ impl GptOssMoE {
         let batch_seq = hidden_flat.dim(0);
         let hidden_size = hidden_flat.dim(1);
 
+        // GPT-OSS uses sigmoid (not softmax) on router logits; weights are
+        // always renormalised to sum to 1.
         let gate_logits = self.gate.forward(hidden_flat);
         let scores = pmetal_bridge::compat::ops::sigmoid(&gate_logits);
-        let neg_k = -(self.top_k as i32);
-        let part_indices = pmetal_bridge::compat::ops::argpartition_axis(&scores, neg_k, -1);
-        let top_indices =
-            pmetal_bridge::compat::ops::slice_axis_from(&part_indices, -1, neg_k).as_type::<i32>();
-        let top_weights = scores.take_along_axis(&top_indices, -1);
-        let weight_sum = top_weights.sum_axis(-1, true);
-        let safe_sum = pmetal_bridge::compat::ops::maximum(&weight_sum, &Array::from_f32(1e-8));
-        let normalized_weights = top_weights.divide(&safe_sum);
+
+        let (top_indices, normalized_weights) = crate::moe_routing::topk_normalize(
+            &scores,
+            self.top_k as i32,
+            /* norm_topk_prob */ true,
+        )?;
 
         Ok((batch_seq, hidden_size, top_indices, normalized_weights))
     }

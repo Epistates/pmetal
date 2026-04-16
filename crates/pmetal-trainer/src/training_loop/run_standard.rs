@@ -127,39 +127,15 @@ impl TrainingLoop {
                     // agree on the value fed to the adaptive LR controller.
                 }
 
-                // Feed loss to adaptive LR controller for next step
-                let action = self.apply_adaptive_lr(stats.loss as f64);
-
-                // Snapshot best weights when loss improves
-                if action == AdaptiveAction::Continue && self.should_snapshot_best() {
-                    self.snapshot_best_weights(model);
-                }
-                // Handle rollback
-                if action == AdaptiveAction::Rollback {
-                    self.restore_best_weights(model);
-                }
-                // Handle early stop
-                if action == AdaptiveAction::EarlyStop || action == AdaptiveAction::GracefulStop {
-                    if action == AdaptiveAction::EarlyStop {
-                        self.restore_best_weights(model);
-                    }
-                    // Rank-0 only: save checkpoint
-                    #[cfg(feature = "distributed")]
-                    let should_checkpoint = self.distributed.as_ref().is_none_or(|d| d.is_master());
-                    #[cfg(not(feature = "distributed"))]
-                    let should_checkpoint = true;
-                    if should_checkpoint {
-                        if let Some(manager) = checkpoint_manager {
-                            self.save_checkpoint(model, manager, true, Some(self.running_loss))?;
-                        }
-                    }
+                // Adaptive LR + snapshot/rollback/checkpoint-on-stop.
+                // See `TrainingLoop::post_step_adaptive_with_checkpoint` in mod.rs
+                // for the shared handling of every AdaptiveAction variant.
+                if self.post_step_adaptive_with_checkpoint(
+                    stats.loss as f64,
+                    model,
+                    checkpoint_manager,
+                )? {
                     return Ok(());
-                }
-                // Handle external checkpoint save request
-                if action == AdaptiveAction::SaveCheckpoint {
-                    if let Some(manager) = checkpoint_manager {
-                        self.save_checkpoint(model, manager, false, Some(self.running_loss))?;
-                    }
                 }
 
                 // Logging — always log step 1 for immediate GUI feedback,
@@ -206,55 +182,16 @@ impl TrainingLoop {
                     }
                 }
 
-                // Evaluation
-                if self.config.eval_every > 0 && self.step % self.config.eval_every == 0 {
-                    if let Some(eval_ds) = eval_dataset.as_ref() {
-                        let metrics = self.evaluate(model, eval_ds)?;
+                // Scheduled evaluation + best-checkpoint-on-improvement.
+                best_eval_loss = self.maybe_evaluate(
+                    model,
+                    eval_dataset.as_ref(),
+                    checkpoint_manager,
+                    best_eval_loss,
+                )?;
 
-                        // Log comprehensive metrics
-                        let acc_str = metrics
-                            .accuracy
-                            .map(|a| format!(", acc={:.2}%", a))
-                            .unwrap_or_default();
-                        tracing::info!(
-                            "Step {}: eval_loss={:.4}, ppl={:.2}{}",
-                            self.step,
-                            metrics.loss,
-                            metrics.perplexity,
-                            acc_str
-                        );
-
-                        if metrics.loss < best_eval_loss {
-                            best_eval_loss = metrics.loss;
-
-                            // Rank-0 only: save best checkpoint
-                            #[cfg(feature = "distributed")]
-                            let should_ckpt =
-                                self.distributed.as_ref().is_none_or(|d| d.is_master());
-                            #[cfg(not(feature = "distributed"))]
-                            let should_ckpt = true;
-                            if should_ckpt {
-                                if let Some(manager) = checkpoint_manager {
-                                    self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
-                                }
-                            }
-                        }
-                    }
-                }
-
-                // Regular checkpointing (rank-0 only in distributed mode)
-                if self.config.checkpoint_every > 0 && self.step % self.config.checkpoint_every == 0
-                {
-                    #[cfg(feature = "distributed")]
-                    let should_ckpt = self.distributed.as_ref().is_none_or(|d| d.is_master());
-                    #[cfg(not(feature = "distributed"))]
-                    let should_ckpt = true;
-                    if should_ckpt {
-                        if let Some(manager) = checkpoint_manager {
-                            self.save_checkpoint(model, manager, false, None)?;
-                        }
-                    }
-                }
+                // Scheduled regular checkpointing (rank-0 only in distributed mode).
+                self.maybe_save_regular_checkpoint(model, checkpoint_manager)?;
 
                 // Check max steps
                 if let Some(max) = max_steps {

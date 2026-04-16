@@ -306,6 +306,50 @@ macro_rules! dispatch_architecture {
     };
 }
 
+/// Shared body for the common architecture load path:
+///
+/// 1. Parse config JSON into the architecture's config type.
+/// 2. Construct the model via the provided constructor expression.
+/// 3. Run the HuggingFace-style generic weight loader.
+/// 4. Batched-eval every `ModuleParameters` so weights materialise on GPU.
+/// 5. Wrap in the given `DynamicModel` variant and return.
+///
+/// Used for architectures that don't need config unwrapping, custom weight
+/// remapping, or post-load fast-path initialisation. Replaces ~13 hand-rolled
+/// copy-paste match arms in `DynamicModel::load_with_options`.
+///
+/// `$new` accepts any callable returning `Result<Model, Exception>` — most
+/// architectures pass `TypeName::new`; Qwen3 passes `Qwen3ForCausalLM::new_for_loading`.
+macro_rules! simple_load {
+    ($config_ty:ty, $new:expr, $content:expr, $model_dir:expr, $variant:ident) => {{
+        let config: $config_ty =
+            json5::from_str($content).map_err(|e| Exception::custom(e.to_string()))?;
+        let mut model = ($new)(config)?;
+        load_generic_weights(&mut model, $model_dir)
+            .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+        eval_module_parameters_batched(&model)?;
+        Ok(Self::$variant(model))
+    }};
+}
+
+/// Same as `simple_load!` but additionally calls `init_post_load_fast_paths()`
+/// on the wrapped `DynamicModel` before returning — required for MoE
+/// architectures (Qwen3MoE, DeepSeek, NemotronH, GptOss) that materialise
+/// stacked expert weights after the base load.
+macro_rules! simple_load_moe {
+    ($config_ty:ty, $new:expr, $content:expr, $model_dir:expr, $variant:ident) => {{
+        let config: $config_ty =
+            json5::from_str($content).map_err(|e| Exception::custom(e.to_string()))?;
+        let mut model = ($new)(config)?;
+        load_generic_weights(&mut model, $model_dir)
+            .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+        eval_module_parameters_batched(&model)?;
+        let mut model = Self::$variant(model);
+        model.init_post_load_fast_paths()?;
+        Ok(model)
+    }};
+}
+
 /// A model whose architecture is dispatched at runtime.
 pub enum DynamicModel {
     Llama(LlamaForCausalLM),
@@ -411,53 +455,41 @@ impl DynamicModel {
             })?;
 
         match arch {
-            ModelArchitecture::Llama => {
-                let config: LlamaConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = LlamaForCausalLM::new(config)?;
-                crate::loader::load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::Llama(model))
-            }
-            ModelArchitecture::Llama4 => {
-                let config: Llama4TextConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = Llama4ForCausalLM::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::Llama4(model))
-            }
-            ModelArchitecture::Qwen2 => {
-                let config: Qwen2Config = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = Qwen2ForCausalLM::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::Qwen2(model))
-            }
-            ModelArchitecture::Qwen3 => {
-                let config: Qwen3Config = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = Qwen3ForCausalLM::new_for_loading(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::Qwen3(model))
-            }
-            ModelArchitecture::Qwen3MoE => {
-                let config: Qwen3MoEConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = Qwen3MoE::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                let mut model = Self::Qwen3MoE(model);
-                model.init_post_load_fast_paths()?;
-                Ok(model)
-            }
+            ModelArchitecture::Llama => simple_load!(
+                LlamaConfig,
+                LlamaForCausalLM::new,
+                &config_content,
+                model_dir,
+                Llama
+            ),
+            ModelArchitecture::Llama4 => simple_load!(
+                Llama4TextConfig,
+                Llama4ForCausalLM::new,
+                &config_content,
+                model_dir,
+                Llama4
+            ),
+            ModelArchitecture::Qwen2 => simple_load!(
+                Qwen2Config,
+                Qwen2ForCausalLM::new,
+                &config_content,
+                model_dir,
+                Qwen2
+            ),
+            ModelArchitecture::Qwen3 => simple_load!(
+                Qwen3Config,
+                Qwen3ForCausalLM::new_for_loading,
+                &config_content,
+                model_dir,
+                Qwen3
+            ),
+            ModelArchitecture::Qwen3MoE => simple_load_moe!(
+                Qwen3MoEConfig,
+                Qwen3MoE::new,
+                &config_content,
+                model_dir,
+                Qwen3MoE
+            ),
             ModelArchitecture::Gemma => {
                 // Gemma 4 multimodal configs nest the text-tower fields
                 // under `text_config` (same pattern as Qwen 3.5 VLM). Unwrap
@@ -526,62 +558,51 @@ impl DynamicModel {
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Gemma(model))
             }
-            ModelArchitecture::Mistral => {
-                let config: MistralConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = MistralForCausalLM::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::Mistral(model))
-            }
-            ModelArchitecture::Phi => {
-                let config: PhiConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = PhiForCausalLM::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::Phi(model))
-            }
-            ModelArchitecture::Phi4 => {
-                let config: PhiConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = PhiForCausalLM::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::Phi4(model))
-            }
-            ModelArchitecture::DeepSeek => {
-                let config: DeepSeekConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = DeepSeek::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                let mut model = Self::DeepSeek(model);
-                model.init_post_load_fast_paths()?;
-                Ok(model)
-            }
-            ModelArchitecture::Cohere => {
-                let config: CohereConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = CohereForCausalLM::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::Cohere(model))
-            }
-            ModelArchitecture::Granite => {
-                let config: GraniteConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = GraniteForCausalLM::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::Granite(model))
-            }
+            ModelArchitecture::Mistral => simple_load!(
+                MistralConfig,
+                MistralForCausalLM::new,
+                &config_content,
+                model_dir,
+                Mistral
+            ),
+            ModelArchitecture::Phi => simple_load!(
+                PhiConfig,
+                PhiForCausalLM::new,
+                &config_content,
+                model_dir,
+                Phi
+            ),
+            ModelArchitecture::Phi4 => simple_load!(
+                PhiConfig,
+                PhiForCausalLM::new,
+                &config_content,
+                model_dir,
+                Phi4
+            ),
+            ModelArchitecture::DeepSeek => simple_load_moe!(
+                DeepSeekConfig,
+                DeepSeek::new,
+                &config_content,
+                model_dir,
+                DeepSeek
+            ),
+            ModelArchitecture::Cohere => simple_load!(
+                CohereConfig,
+                CohereForCausalLM::new,
+                &config_content,
+                model_dir,
+                Cohere
+            ),
+            ModelArchitecture::Granite => simple_load!(
+                GraniteConfig,
+                GraniteForCausalLM::new,
+                &config_content,
+                model_dir,
+                Granite
+            ),
+            // NemotronH uses a bespoke weight loader (load_nemotron_weights) so we
+            // can't route through simple_load_moe!, but the init_post_load_fast_paths
+            // step still applies after weights are materialised.
             ModelArchitecture::NemotronH => {
                 let config: NemotronHConfig = json5::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
@@ -630,33 +651,27 @@ impl DynamicModel {
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Qwen3Next(model))
             }
-            ModelArchitecture::StarCoder2 => {
-                let config: StarCoder2Config = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = StarCoder2Model::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::StarCoder2(model))
-            }
-            ModelArchitecture::RecurrentGemma => {
-                let config: RecurrentGemmaConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = RecurrentGemmaModel::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::RecurrentGemma(model))
-            }
-            ModelArchitecture::Jamba => {
-                let config: JambaConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = JambaModel::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                Ok(Self::Jamba(model))
-            }
+            ModelArchitecture::StarCoder2 => simple_load!(
+                StarCoder2Config,
+                StarCoder2Model::new,
+                &config_content,
+                model_dir,
+                StarCoder2
+            ),
+            ModelArchitecture::RecurrentGemma => simple_load!(
+                RecurrentGemmaConfig,
+                RecurrentGemmaModel::new,
+                &config_content,
+                model_dir,
+                RecurrentGemma
+            ),
+            ModelArchitecture::Jamba => simple_load!(
+                JambaConfig,
+                JambaModel::new,
+                &config_content,
+                model_dir,
+                Jamba
+            ),
             ModelArchitecture::FalconH1 => {
                 let config: FalconH1Config = serde_json::from_str(&config_content)
                     .map_err(|e| Exception::custom(e.to_string()))?;
@@ -671,17 +686,13 @@ impl DynamicModel {
             ModelArchitecture::Flux => Err(Exception::custom(
                 "Flux models are diffusion pipelines, not causal language models. Load them via pmetal_models::pipelines::FluxPipeline instead of DynamicModel::load.",
             )),
-            ModelArchitecture::GptOss => {
-                let config: GptOssConfig = json5::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let mut model = GptOssForCausalLM::new(config)?;
-                load_generic_weights(&mut model, model_dir)
-                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                eval_module_parameters_batched(&model)?;
-                let mut model = Self::GptOss(model);
-                model.init_post_load_fast_paths()?;
-                Ok(model)
-            }
+            ModelArchitecture::GptOss => simple_load_moe!(
+                GptOssConfig,
+                GptOssForCausalLM::new,
+                &config_content,
+                model_dir,
+                GptOss
+            ),
             ModelArchitecture::Gemma4 => {
                 // Gemma 4 configs nest the text tower under `text_config`
                 // (multimodal wrapper). Unwrap if the top level has no

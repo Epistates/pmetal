@@ -1,13 +1,20 @@
 #![allow(unsafe_code)]
 
 //! Metal-accelerated dequantization kernels.
+//!
+//! Thin wrappers around [`dispatch_linear_kernel`] — each entry point just
+//! names the Metal function to bind and forwards the input / output
+//! buffers. Any failure to allocate a command buffer or encoder now
+//! propagates as [`MetalError`] instead of panicking via `None.unwrap()`.
 
-use crate::{context::MetalContext, error::Result};
+use crate::context::MetalContext;
+use crate::error::Result;
+use crate::kernels::dispatch::dispatch_linear_kernel;
+use objc2::rc::Retained;
 use objc2::runtime::ProtocolObject;
-use objc2_metal::{
-    MTLCommandBuffer, MTLCommandEncoder, MTLCommandQueue, MTLComputeCommandEncoder,
-    MTLComputePipelineState, MTLSize,
-};
+use objc2_metal::MTLBuffer;
+
+type MetalBufferRef = Retained<ProtocolObject<dyn MTLBuffer>>;
 
 /// Dequantization backend using Metal kernels.
 pub struct DequantKernels;
@@ -22,81 +29,31 @@ impl DequantKernels {
     pub fn dequantize_q4_0(
         &self,
         ctx: &MetalContext,
-        input_buffer: &objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-        output_buffer: &objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+        input_buffer: &MetalBufferRef,
+        output_buffer: &MetalBufferRef,
         n_elements: usize,
     ) -> Result<()> {
-        let pipeline = {
-            let mut cache = ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(ctx.device(), "dequantize_q4_0", None)?
-        };
-
-        let command_buffer = ctx.command_queue().commandBuffer().unwrap();
-        let encoder = command_buffer.computeCommandEncoder().unwrap();
-
-        encoder.setComputePipelineState(&pipeline);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input_buffer), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output_buffer), 0, 1);
-        }
-
-        let grid_size = MTLSize {
-            width: n_elements,
-            height: 1,
-            depth: 1,
-        };
-        let thread_group_size = MTLSize {
-            width: pipeline.maxTotalThreadsPerThreadgroup().min(n_elements),
-            height: 1,
-            depth: 1,
-        };
-
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, thread_group_size);
-        encoder.endEncoding();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
-
-        Ok(())
+        dispatch_linear_kernel(
+            ctx,
+            "dequantize_q4_0",
+            &[input_buffer, output_buffer],
+            n_elements,
+        )
     }
 
     /// Dequantize IQ4_XS data to a float buffer.
     pub fn dequantize_iq4_xs(
         &self,
         ctx: &MetalContext,
-        input_buffer: &objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
-        output_buffer: &objc2::rc::Retained<ProtocolObject<dyn objc2_metal::MTLBuffer>>,
+        input_buffer: &MetalBufferRef,
+        output_buffer: &MetalBufferRef,
         n_elements: usize,
     ) -> Result<()> {
-        let pipeline = {
-            let mut cache = ctx.pipeline_cache_mut();
-            cache.get_or_create_pipeline(ctx.device(), "dequantize_iq4_xs", None)?
-        };
-
-        let command_buffer = ctx.command_queue().commandBuffer().unwrap();
-        let encoder = command_buffer.computeCommandEncoder().unwrap();
-
-        encoder.setComputePipelineState(&pipeline);
-        unsafe {
-            encoder.setBuffer_offset_atIndex(Some(input_buffer), 0, 0);
-            encoder.setBuffer_offset_atIndex(Some(output_buffer), 0, 1);
-        }
-
-        let grid_size = MTLSize {
-            width: n_elements,
-            height: 1,
-            depth: 1,
-        };
-        let thread_group_size = MTLSize {
-            width: pipeline.maxTotalThreadsPerThreadgroup().min(n_elements),
-            height: 1,
-            depth: 1,
-        };
-
-        encoder.dispatchThreads_threadsPerThreadgroup(grid_size, thread_group_size);
-        encoder.endEncoding();
-        command_buffer.commit();
-        command_buffer.waitUntilCompleted();
-
-        Ok(())
+        dispatch_linear_kernel(
+            ctx,
+            "dequantize_iq4_xs",
+            &[input_buffer, output_buffer],
+            n_elements,
+        )
     }
 }

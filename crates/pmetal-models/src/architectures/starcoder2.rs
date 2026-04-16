@@ -8,6 +8,7 @@
 //! - Optimized for Fill-in-the-Middle (FIM) training
 
 use crate::architectures::llama::{LlamaAttention, LlamaConfig};
+use crate::decoder_layer::{DecoderLayer, MlpModule, std_pre_norm_forward};
 // ModuleParameters derive via impl_module_params!
 use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, nn};
 use pmetal_bridge::impl_module_params;
@@ -81,6 +82,12 @@ impl StarCoder2MLP {
     }
 }
 
+impl MlpModule for StarCoder2MLP {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        StarCoder2MLP::forward(self, x)
+    }
+}
+
 /// StarCoder2 Layer block.
 #[derive(Debug)]
 pub struct StarCoder2Layer {
@@ -114,22 +121,41 @@ impl StarCoder2Layer {
         })
     }
 
-    pub fn forward(
+    /// Forward pass without cache (inference convenience wrapper).
+    pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
+        self.forward_with_cache(x, mask, None)
+    }
+
+    /// Forward pass with optional KV cache.
+    ///
+    /// Delegates to the shared pre-norm skeleton —
+    /// see `crate::decoder_layer::std_pre_norm_forward`.
+    pub fn forward_with_cache(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
-        mut cache: Option<(&mut pmetal_mlx::kv_cache::KVCache, usize)>,
+        cache: Option<(&mut pmetal_mlx::kv_cache::KVCache, usize)>,
     ) -> Result<Array, Exception> {
-        let h = self.input_layernorm.forward(x);
-        let attn_out = self.attention.forward_with_cache(
-            &h,
+        std_pre_norm_forward(
+            &mut self.input_layernorm,
+            &mut self.attention,
+            &mut self.post_attention_layernorm,
+            &mut self.mlp,
+            x,
             mask,
-            cache.as_mut().map(|(c, i)| (&mut **c, *i)),
-        )?;
-        let x = x.add(&attn_out);
-        let h = self.post_attention_layernorm.forward(&x);
-        let mlp_out = self.mlp.forward(&h)?;
-        Ok(x.add(&mlp_out))
+            cache,
+        )
+    }
+}
+
+impl DecoderLayer for StarCoder2Layer {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut pmetal_mlx::kv_cache::KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        StarCoder2Layer::forward_with_cache(self, x, mask, cache)
     }
 }
 
@@ -182,7 +208,7 @@ impl StarCoder2Model {
     ) -> Result<Array, Exception> {
         let mut x = self.embed_tokens.forward(input_ids);
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            x = layer.forward(&x, mask, cache.as_mut().map(|c| (&mut **c, i)))?;
+            x = layer.forward_with_cache(&x, mask, cache.as_mut().map(|c| (&mut **c, i)))?;
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(i)
             {

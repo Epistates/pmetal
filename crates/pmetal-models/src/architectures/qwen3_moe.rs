@@ -19,6 +19,8 @@ use pmetal_mlx::kv_cache::KVCache;
 // MoE block uses pmetal_mlx::moe::Expert directly for individual expert MLPs
 use serde::{Deserialize, Serialize};
 
+use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
+
 /// Qwen3-MoE model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Qwen3MoEConfig {
@@ -511,6 +513,7 @@ impl Qwen3MoEBlock {
         let batch_seq = hidden_flat.dim(0);
         let hidden_size = hidden_flat.dim(1);
 
+        // Softmax over expert logits, with an f32 cast for numerical stability.
         let gate_logits = self.gate.forward(hidden_flat);
         let gate_logits_f32 = if gate_logits.dtype() != pmetal_bridge::compat::Dtype::Float32 {
             gate_logits.as_type::<f32>()
@@ -519,20 +522,13 @@ impl Qwen3MoEBlock {
         };
         let routing_probs = pmetal_bridge::compat::ops::softmax_axis(&gate_logits_f32, -1);
 
-        let top_k = self.top_k as i32;
-        let neg_k = -top_k;
-        let part_indices = pmetal_bridge::compat::ops::argpartition_axis(&routing_probs, neg_k, -1);
-        let top_indices =
-            pmetal_bridge::compat::ops::slice_last_from(&part_indices, neg_k).as_type::<i32>();
-        let top_weights = routing_probs.take_along_axis(&top_indices, -1);
-
-        let normalized_weights = if self.norm_topk_prob {
-            let weight_sum = top_weights.sum_axis(-1, true);
-            let safe_sum = pmetal_bridge::compat::ops::maximum(&weight_sum, &Array::from_f32(1e-8));
-            top_weights.divide(&safe_sum)
-        } else {
-            top_weights
-        };
+        // Shared top-k selection + optional renormalisation — see
+        // `crate::moe_routing::topk_normalize`.
+        let (top_indices, normalized_weights) = crate::moe_routing::topk_normalize(
+            &routing_probs,
+            self.top_k as i32,
+            self.norm_topk_prob,
+        )?;
 
         Ok((batch_seq, hidden_size, top_indices, normalized_weights))
     }
@@ -791,26 +787,59 @@ impl Qwen3MoEDecoderLayer {
     }
 
     /// Forward pass through decoder layer.
+    ///
+    /// Delegates to `crate::decoder_layer::std_pre_norm_forward` — the
+    /// standard pre-norm skeleton, with `self_attn: Qwen3MoEAttention` and
+    /// `ffn: Qwen3MoEFeedForward` plugging into the `AttentionModule` /
+    /// `MlpModule` traits.
     pub fn forward(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
-        // Self-attention with residual
-        let normed = self.input_layernorm.forward(x);
-        let attn_out = self.self_attn.forward(&normed, mask, cache)?;
-        let h = x.add(&attn_out);
-
-        // FFN with residual
-        let normed = self.post_attention_layernorm.forward(&h);
-        let ffn_out = self.ffn.forward(&normed)?;
-        Ok(h.add(&ffn_out))
+        std_pre_norm_forward(
+            &mut self.input_layernorm,
+            &mut self.self_attn,
+            &mut self.post_attention_layernorm,
+            &mut self.ffn,
+            x,
+            mask,
+            cache,
+        )
     }
 
     /// Eagerly build stacked expert caches for this layer's MoE path.
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
         self.ffn.init_stacked_moe()
+    }
+}
+
+impl AttentionModule for Qwen3MoEAttention {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        Qwen3MoEAttention::forward(self, x, mask, cache)
+    }
+}
+
+impl MlpModule for Qwen3MoEFeedForward {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        Qwen3MoEFeedForward::forward(self, x)
+    }
+}
+
+impl DecoderLayer for Qwen3MoEDecoderLayer {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        Qwen3MoEDecoderLayer::forward(self, x, mask, cache)
     }
 }
 

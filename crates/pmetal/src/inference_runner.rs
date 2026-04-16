@@ -1361,8 +1361,11 @@ fn estimate_weight_bytes(model_path: &Path, param_count: usize, fp8: bool) -> u6
 }
 
 fn estimate_weight_bytes_from_param_count(param_count: usize, fp8: bool) -> u64 {
-    let bytes_per_param = if fp8 { 1.05 } else { 2.0 };
-    (param_count as f64 * bytes_per_param) as u64
+    // Single source of truth for the fp8/fp16 weight byte rates —
+    // see pmetal_core::constants::bytes_per_param.
+    let quant = if fp8 { "fp8" } else { "fp16" };
+    let bpp = pmetal_core::constants::bytes_per_param(quant);
+    (param_count as f64 * bpp) as u64
 }
 
 fn estimate_local_model_weight_bytes(model_path: &Path, fp8: bool) -> Option<u64> {

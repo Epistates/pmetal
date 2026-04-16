@@ -99,21 +99,11 @@ pub struct ModelSpec {
 }
 
 /// Bytes per parameter for a given quantization format, tuned for Apple Silicon / MLX.
-pub fn bytes_per_param(quantization: &str) -> f64 {
-    match quantization.to_lowercase().as_str() {
-        "fp32" | "f32" | "float32" => 4.0,
-        "fp16" | "f16" | "bf16" | "bfloat16" | "float16" | "" => 2.0,
-        "fp8" | "f8" | "e4m3" | "e5m2" => 1.05,
-        "q8_0" | "int8" | "8bit" | "mlx-8bit" | "w8a16" => 1.05,
-        "q6_k" => 0.80,
-        "q5_k_m" | "q5_k_s" | "q5_0" | "q5_1" => 0.68,
-        "q4_k_m" | "q4_k_s" | "q4_0" | "q4_1" | "4bit" | "mlx-4bit" | "nf4" | "awq" | "gptq"
-        | "w4a16" => 0.58,
-        "q3_k_m" | "q3_k_s" | "q3_k_l" => 0.48,
-        "q2_k" | "q2_k_s" | "2bit" => 0.37,
-        _ => 2.0, // default to fp16
-    }
-}
+///
+/// Thin re-export of [`pmetal_core::constants::bytes_per_param`]; kept here
+/// so downstream callers that `use pmetal_hub::fit::bytes_per_param` don't
+/// have to change paths.
+pub use pmetal_core::constants::bytes_per_param;
 
 /// Estimate inference and training fit for a model on a device.
 pub fn estimate_fit(model: &ModelSpec, device: &DeviceSpec) -> FitEstimate {
@@ -130,12 +120,7 @@ pub fn estimate_fit(model: &ModelSpec, device: &DeviceSpec) -> FitEstimate {
     //   kv_cache = 0.000008 * params_b * context_length
     //
     // KV cache bytes per element: quantized modes reduce memory 2-8x.
-    let kv_bytes_per_element: f64 = match model.kv_cache_bits {
-        Some(8) => 1.1,  // q8: ~50% reduction + scale/bias overhead
-        Some(4) => 0.6,  // q4: ~75% reduction + scale/bias overhead
-        Some(2) => 0.35, // q2: ~87% reduction + scale/bias overhead
-        _ => 2.0,        // fp16 (default)
-    };
+    let kv_bytes_per_element = pmetal_core::constants::kv_bytes_per_element(model.kv_cache_bits);
     let kv_cache_gb = match (model.num_layers, model.num_kv_heads, model.head_dim) {
         (Some(layers), Some(kv_heads), Some(hd)) => {
             // 2 for K and V, bytes per element determined by quantization mode
@@ -494,34 +479,11 @@ fn detect_quantization(config: &serde_json::Value) -> String {
 }
 
 /// Detect quantization from a model ID string (heuristic).
-pub fn detect_quantization_from_id(model_id: &str) -> String {
-    let lower = model_id.to_lowercase();
-    if lower.contains("q2_k") {
-        "Q2_K".to_string()
-    } else if lower.contains("q3_k") {
-        "Q3_K_M".to_string()
-    } else if lower.contains("q4_k") || lower.contains("q4_0") {
-        "Q4_K_M".to_string()
-    } else if lower.contains("q5_k") {
-        "Q5_K_M".to_string()
-    } else if lower.contains("q6_k") {
-        "Q6_K".to_string()
-    } else if lower.contains("q8_0") || lower.contains("int8") || lower.contains("8bit") {
-        "Q8_0".to_string()
-    } else if lower.contains("fp8") || lower.contains("f8") {
-        "fp8".to_string()
-    } else if lower.contains("4bit") || lower.contains("mlx-4bit") || lower.contains("w4a16") {
-        "mlx-4bit".to_string()
-    } else if lower.contains("gptq") {
-        "gptq".to_string()
-    } else if lower.contains("awq") {
-        "awq".to_string()
-    } else if lower.contains("gguf") {
-        "Q4_K_M".to_string() // GGUF default assumption
-    } else {
-        "fp16".to_string()
-    }
-}
+///
+/// Thin re-export of [`pmetal_core::constants::detect_quantization_from_id`];
+/// kept here so downstream callers that `use pmetal_hub::fit::detect_quantization_from_id`
+/// (search + TUI + MCP + CLI) don't have to change paths.
+pub use pmetal_core::constants::detect_quantization_from_id;
 
 /// Format a parameter count for display.
 pub fn format_params(params_b: f64) -> String {

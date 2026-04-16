@@ -14,6 +14,8 @@ use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, r
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
+use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
+
 use crate::traits::{CausalLMModel, ModelConfig};
 
 /// Mistral model configuration.
@@ -350,6 +352,12 @@ impl MistralMLP {
     }
 }
 
+impl MlpModule for MistralMLP {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        MistralMLP::forward(self, x)
+    }
+}
+
 /// Mistral transformer block.
 #[derive(Debug)]
 pub struct MistralDecoderLayer {
@@ -392,21 +400,46 @@ impl MistralDecoderLayer {
     }
 
     /// Forward pass with optional KV cache.
+    ///
+    /// Delegates to the shared pre-norm skeleton —
+    /// see `crate::decoder_layer::std_pre_norm_forward`.
     pub fn forward_with_cache(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
-        // Pre-norm + attention + residual
-        let normed = Module::forward(&mut self.input_layernorm, x)?;
-        let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
-        let h = x.add(&attn_out);
+        std_pre_norm_forward(
+            &mut self.input_layernorm,
+            &mut self.self_attn,
+            &mut self.post_attention_layernorm,
+            &mut self.mlp,
+            x,
+            mask,
+            cache,
+        )
+    }
+}
 
-        // Pre-norm + MLP + residual
-        let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
-        let mlp_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&mlp_out))
+impl AttentionModule for MistralAttention {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        MistralAttention::forward_with_cache(self, x, mask, cache)
+    }
+}
+
+impl DecoderLayer for MistralDecoderLayer {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        MistralDecoderLayer::forward_with_cache(self, x, mask, cache)
     }
 }
 

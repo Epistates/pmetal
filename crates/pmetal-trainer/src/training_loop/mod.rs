@@ -686,6 +686,123 @@ impl TrainingLoop {
         }
     }
 
+    /// Whether this rank should perform checkpoint writes.
+    ///
+    /// Non-distributed builds always write; distributed builds only write
+    /// on the master rank. Shared across every training loop variant so
+    /// the `cfg(feature = "distributed")` guard lives in one place.
+    #[inline]
+    pub fn is_checkpoint_master(&self) -> bool {
+        #[cfg(feature = "distributed")]
+        {
+            self.distributed.as_ref().is_none_or(|d| d.is_master())
+        }
+        #[cfg(not(feature = "distributed"))]
+        {
+            true
+        }
+    }
+
+    /// Composes [`post_step_adaptive`] with the checkpoint-on-stop behavior
+    /// that every training loop variant previously duplicated.
+    ///
+    /// Returns `Ok(true)` when the caller should `return Ok(())` from the
+    /// training loop — i.e. the adaptive LR controller signaled `EarlyStop`
+    /// or `GracefulStop`, and a final "best" checkpoint (if a manager was
+    /// provided) has been written. Returns `Ok(false)` for Continue,
+    /// Rollback, or SaveCheckpoint — Continue and Rollback do nothing
+    /// extra; SaveCheckpoint writes a regular checkpoint first.
+    ///
+    /// [`post_step_adaptive`]: Self::post_step_adaptive
+    pub fn post_step_adaptive_with_checkpoint<M: TrainableModel>(
+        &mut self,
+        loss: f64,
+        model: &mut M,
+        checkpoint_manager: Option<&CheckpointManager>,
+    ) -> Result<bool> {
+        match self.post_step_adaptive(loss, model) {
+            AdaptiveAction::EarlyStop | AdaptiveAction::GracefulStop => {
+                if self.is_checkpoint_master() {
+                    if let Some(manager) = checkpoint_manager {
+                        self.save_checkpoint(model, manager, true, Some(self.running_loss))?;
+                    }
+                }
+                Ok(true)
+            }
+            AdaptiveAction::SaveCheckpoint => {
+                if self.is_checkpoint_master() {
+                    if let Some(manager) = checkpoint_manager {
+                        self.save_checkpoint(model, manager, false, Some(self.running_loss))?;
+                    }
+                }
+                Ok(false)
+            }
+            AdaptiveAction::Continue | AdaptiveAction::Rollback => Ok(false),
+        }
+    }
+
+    /// Run evaluation at the current step if the schedule calls for it and
+    /// write a "best" checkpoint on improvement. Returns the (possibly
+    /// updated) best-eval-loss bookkeeping value.
+    ///
+    /// Used by every training loop variant that supports mid-training
+    /// evaluation. No-op when `eval_every == 0`, the step isn't on the
+    /// schedule, or no eval dataset was provided.
+    pub fn maybe_evaluate<M: TrainableModel>(
+        &mut self,
+        model: &mut M,
+        eval_dataset: Option<&TrainingDataset>,
+        checkpoint_manager: Option<&CheckpointManager>,
+        best_eval_loss: f64,
+    ) -> Result<f64> {
+        if self.config.eval_every == 0 || self.step % self.config.eval_every != 0 {
+            return Ok(best_eval_loss);
+        }
+        let Some(eval_ds) = eval_dataset else {
+            return Ok(best_eval_loss);
+        };
+        let metrics = self.evaluate(model, eval_ds)?;
+        let acc_str = metrics
+            .accuracy
+            .map(|a| format!(", acc={a:.2}%"))
+            .unwrap_or_default();
+        tracing::info!(
+            "Step {}: eval_loss={:.4}, ppl={:.2}{}",
+            self.step,
+            metrics.loss,
+            metrics.perplexity,
+            acc_str
+        );
+        if metrics.loss < best_eval_loss {
+            if self.is_checkpoint_master() {
+                if let Some(manager) = checkpoint_manager {
+                    self.save_checkpoint(model, manager, true, Some(metrics.loss))?;
+                }
+            }
+            Ok(metrics.loss)
+        } else {
+            Ok(best_eval_loss)
+        }
+    }
+
+    /// Save a regular (non-best) checkpoint if the schedule calls for it
+    /// and this rank is the checkpoint master.
+    pub fn maybe_save_regular_checkpoint<M: TrainableModel>(
+        &mut self,
+        model: &mut M,
+        checkpoint_manager: Option<&CheckpointManager>,
+    ) -> Result<()> {
+        if self.config.checkpoint_every > 0
+            && self.step % self.config.checkpoint_every == 0
+            && self.is_checkpoint_master()
+        {
+            if let Some(manager) = checkpoint_manager {
+                self.save_checkpoint(model, manager, false, None)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Compute loss for a batch.
     fn compute_loss(logits: &Array, labels: &Array) -> Result<Array> {
         Ok(pmetal_bridge::training::causal_lm_loss(

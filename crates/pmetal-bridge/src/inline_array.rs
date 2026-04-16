@@ -1482,7 +1482,7 @@ pub fn random_seed(seed: u64) {
 
 /// Stack-allocated MLX array. Zero heap allocation per op.
 pub struct InlineArray {
-    raw: RawBuf,
+    pub(crate) raw: RawBuf,
 }
 
 #[derive(Clone, Copy, Debug, Default)]

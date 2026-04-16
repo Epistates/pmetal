@@ -29,3 +29,12 @@ rand = "0.9"
 [build-dependencies]
 cc = "1"
 cmake = "0.1"
+
+# This crate is the C++ FFI boundary to MLX and must use `unsafe` pervasively
+# (`inline_array` wraps mlx::core::array via extern "C" calls; ~280 unsafe blocks).
+# We declare an explicit `[lints.rust]` section so the `unsafe_code = "allow"`
+# exemption is documented rather than relying on the implicit bypass that
+# occurs when a crate omits `workspace = true`. The workspace-level
+# `unsafe_code = "deny"` still applies to every other crate.
+[lints.rust]
+unsafe_code = "allow"

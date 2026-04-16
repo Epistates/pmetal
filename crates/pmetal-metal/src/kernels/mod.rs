@@ -4,8 +4,10 @@
 //! with a focus on transformer attention mechanisms, high-performance sampling,
 //! and efficient training operations.
 
+pub mod batch_encoder;
 pub mod batched_lora;
 pub mod dequant;
+pub mod dispatch;
 pub mod dw_gemm;
 pub mod flash_attention;
 pub mod fp8_training;
@@ -75,10 +77,7 @@ pub use fused_lora::{FusedLora, FusedLoraConfig, FusedLoraOutput};
 pub use fused_merge::{
     FusedMergeMetal, MergeConfig, TensorInfo, build_merge_config, build_tensor_info,
 };
-pub use fused_moe::{
-    ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig, GatherQmmSwiglu,
-    GatherQmmSwigluConfig, StackedExpertWeights,
-};
+pub use fused_moe::{ExpertBits, ExpertWeightBuffers, FusedMoeExpert, FusedMoeExpertConfig};
 pub use fused_norm_lora::{FusedNormLora, FusedNormLoraConfig, FusedNormLoraOutput};
 pub use fused_rope::{FusedRoPE, FusedRoPEConfig, RoPECache};
 pub use fused_sampler::{FusedSampler, FusedSamplerConfig, SamplingParams};

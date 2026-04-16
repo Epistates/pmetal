@@ -60,3 +60,8 @@ default = ["metal"]
 metal = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-metal", "pmetal-metal"]
 # Enable CUDA backend for NVIDIA GPUs (future)
 cuda = []
+
+# Inherit workspace lints (`unsafe_code = "deny"` among others).
+# The Metal FFI module opts back in via `#![allow(unsafe_code)]` locally.
+[lints]
+workspace = true

@@ -49,6 +49,7 @@
 
 pub mod architectures;
 pub mod ddtree;
+pub mod decoder_layer;
 pub mod dflash_decoder;
 pub mod dflash_native_target;
 pub mod dispatcher;
@@ -60,6 +61,7 @@ pub mod fp8_utils;
 pub mod generation;
 pub mod loader;
 pub mod moe;
+pub mod moe_routing;
 pub mod ollama;
 pub mod pipelines;
 pub mod pooling;

@@ -2367,9 +2367,7 @@ int mlx_inline_turboquant_encode(
         );
         new (out_indices->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_encode", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_encode", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_decode(
@@ -2403,9 +2401,7 @@ int mlx_inline_turboquant_decode(
         );
         new (out->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_decode", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_decode", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_score(
@@ -2455,9 +2451,7 @@ int mlx_inline_turboquant_score(
         );
         new (out_scores->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_score", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_score", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_score_q8_d256(
@@ -2517,9 +2511,7 @@ int mlx_inline_turboquant_score_q8_d256(
         );
         new (out_scores->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_score_q8_d256", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_score_q8_d256", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_mixed_score(
@@ -2595,9 +2587,7 @@ int mlx_inline_turboquant_mixed_score(
         );
         new (out_scores->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_mixed_score", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_mixed_score", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_pack_sign_bits(
@@ -2626,9 +2616,7 @@ int mlx_inline_turboquant_pack_sign_bits(
         );
         new (out->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_pack_sign_bits", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_pack_sign_bits", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_pack_q8_keybytes(
@@ -2660,9 +2648,7 @@ int mlx_inline_turboquant_pack_q8_keybytes(
         );
         new (out->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_pack_q8_keybytes", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_pack_q8_keybytes", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_pack_q8_keybytes_seq(
@@ -2694,9 +2680,7 @@ int mlx_inline_turboquant_pack_q8_keybytes_seq(
         );
         new (out->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_pack_q8_keybytes_seq", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_pack_q8_keybytes_seq", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_pack_q8_kvbytes_seq(
@@ -2729,9 +2713,7 @@ int mlx_inline_turboquant_pack_q8_kvbytes_seq(
         );
         new (out->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_pack_q8_kvbytes_seq", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_pack_q8_kvbytes_seq", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_unpack_sign_bits(
@@ -2760,9 +2742,7 @@ int mlx_inline_turboquant_unpack_sign_bits(
         );
         new (out->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_unpack_sign_bits", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_unpack_sign_bits", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_signed_fwht_256_rows(
@@ -2786,9 +2766,7 @@ int mlx_inline_turboquant_signed_fwht_256_rows(
         auto output_arr = mlx::core::multiply(transformed, as_arr(right_signs));
         new (out->buf) array(output_arr);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_signed_fwht_256_rows", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_signed_fwht_256_rows", "unknown C++ exception"); return 1; }
 }
 int mlx_inline_turboquant_attention_q8_d256_2pass(
     mlx_inline_array*       out,
@@ -2878,9 +2856,7 @@ int mlx_inline_turboquant_attention_q8_d256_2pass(
 
         new (out->buf) array(pass2_outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_2pass", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_2pass", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(
@@ -2962,9 +2938,7 @@ int mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(
 
         new (out->buf) array(pass2_outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_packed_keys_2pass", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_packed_keys_2pass", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d256_packed_keys_dense_values_2pass(
@@ -3043,9 +3017,7 @@ int mlx_inline_turboquant_attention_q8_d256_packed_keys_dense_values_2pass(
 
         new (out->buf) array(pass2_outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_packed_keys_dense_values_2pass", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_packed_keys_dense_values_2pass", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
@@ -3121,9 +3093,7 @@ int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
 
         new (out->buf) array(pass2_outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_fullbyte_dense_values_2pass", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_fullbyte_dense_values_2pass", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state(
@@ -3183,9 +3153,7 @@ int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state(
         new (out_sums->buf) array(pass1_outputs[1]);
         new (out_maxs->buf) array(pass1_outputs[2]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1(
@@ -3247,9 +3215,7 @@ int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1(
 
         new (out->buf) array(pass1_outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d256_pass2_merge(
@@ -3286,9 +3252,7 @@ int mlx_inline_turboquant_attention_q8_d256_pass2_merge(
         );
         new (out->buf) array(pass2_outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_pass2_merge", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_pass2_merge", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsoftmax(
@@ -3358,9 +3322,7 @@ int mlx_inline_turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsof
 
         new (out->buf) array(pass2_outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsoftmax", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsoftmax", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_score_q8_d256_fullbyte(
@@ -3411,9 +3373,7 @@ int mlx_inline_turboquant_score_q8_d256_fullbyte(
         );
         new (out_scores->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_score_q8_d256_fullbyte", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_score_q8_d256_fullbyte", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_weighted_sum_d256_dense_values(
@@ -3458,9 +3418,7 @@ int mlx_inline_turboquant_weighted_sum_d256_dense_values(
         );
         new (out->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_weighted_sum_d256_dense_values", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_weighted_sum_d256_dense_values", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d256_packed_kv_2pass(
@@ -3539,9 +3497,7 @@ int mlx_inline_turboquant_attention_q8_d256_packed_kv_2pass(
 
         new (out->buf) array(pass2_outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_packed_kv_2pass", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_packed_kv_2pass", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d256_packed_kv_dense_values_2pass(
@@ -3620,9 +3576,7 @@ int mlx_inline_turboquant_attention_q8_d256_packed_kv_dense_values_2pass(
 
         new (out->buf) array(pass2_outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_packed_kv_dense_values_2pass", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_packed_kv_dense_values_2pass", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d128_packed_keys_2pass(
@@ -3710,9 +3664,7 @@ int mlx_inline_turboquant_attention_q8_d128_packed_keys_2pass(
 
         new (out->buf) array(pass2_outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d128_packed_keys_2pass", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d128_packed_keys_2pass", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_weighted_decode(
@@ -3757,9 +3709,7 @@ int mlx_inline_turboquant_weighted_decode(
         );
         new (out->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_weighted_decode", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_weighted_decode", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d128_2pass(
@@ -3850,9 +3800,7 @@ int mlx_inline_turboquant_attention_q8_d128_2pass(
 
         new (out->buf) array(pass2_outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d128_2pass", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d128_2pass", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_gather_last_dim(
@@ -3882,9 +3830,7 @@ int mlx_inline_turboquant_gather_last_dim(
         );
         new (out->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_gather_last_dim", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_gather_last_dim", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_scatter_last_dim(
@@ -3923,9 +3869,7 @@ int mlx_inline_turboquant_scatter_last_dim(
         );
         new (out->buf) array(outputs[0]);
         return 0;
-    } catch (...) {
-        return 1;
-    }
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_scatter_last_dim", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_scatter_last_dim", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_gdn_update(
@@ -4025,8 +3969,15 @@ int mlx_inline_gdn_update(
         auto y = (T == 1) ? reshape(ys[0], {B, 1, Hv, Dv}) : stack(ys, 1);
         new (dst_y->buf) array(y);
         new (dst_state->buf) array(state);
+        pmetal_bridge_clear_error_internal();
         return 0;
-    } catch (const std::exception& e) { fprintf(stderr, "[C++ EXCEPTION] %s\n", e.what()); return -1; }
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("gdn_update", e.what());
+        return -1;
+    } catch (...) {
+        pmetal_bridge_set_last_error("gdn_update", "unknown C++ exception");
+        return -1;
+    }
 }
 
 
