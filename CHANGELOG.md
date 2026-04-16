@@ -11,6 +11,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`pmetal-bridge` crate**: Zero-allocation MLX C++ bridge replacing mlx-rs as the core runtime. Native inference at 201 tok/s (Qwen3.5 0.8B), 4-bit quantized inference (28 tok/s on 27B), compiled attention, KV cache trimming, and full training ops (autograd, optimizer, random, math, reduction, comparison) — all without mlx-rs overhead
+
+- **Full-parameter pretraining**: End-to-end `pmetal pretrain` pipeline for training models from scratch
+  - Model factory supporting llama, qwen, gemma, mistral, phi, and gpt-oss architectures
+  - Gradient accumulation, cosine/linear/constant LR scheduling, gradient clipping
+  - Full model + optimizer checkpoint save/restore for resumable runs
+  - Memory-mapped streaming shard reader (`StreamingShardReader`) with zero-copy I/O via memmap2
+  - `pmetal tokenize` command for converting JSONL corpora to binary shards
+  - Pretrain tab in TUI and GUI with real-time loss/throughput/ETA monitoring
+
+- **Gradient checkpointing**: `checkpoint_apply()` wraps forward functions via `mlx::core::checkpoint()` to recompute activations during backward, reducing peak training memory from O(layers) to O(1)
+
+- **Optimizer checkpoint/resume**: `AdamW` gains `step_count()`, `set_lr()`, and `restore_state()` for saving and restoring optimizer state across training runs
+
+- **Gemma 4 architecture**: Full Gemma 4 model support with sliding-window attention and per-layer KV head configuration
+
+- **DFlash speculative decoding**: Native Rust port of the dflash-mlx speculative decoding pipeline for accelerated generation
+
+- **Jinja chat templates**: Real upstream jinja rendering via minijinja with 16 parity-audited template types (ChatML, Llama2/3/4, Mistral, Gemma/Gemma4, Phi3/4, Qwen, DeepSeek, Cohere, Alpaca, Vicuna, Zephyr, GptOss)
+
 - **TurboQuant KV cache quantization**: Provably near-optimal KV cache compression based on random rotation + Lloyd-Max scalar quantization + QJL residual for unbiased inner products (arXiv:2504.19874). Achieves 4-6x KV cache compression with near-zero quality loss. Available via `--kv-turboquant` or presets `--kv-turboquant-preset q3_5` (near-lossless) / `q2_5` (6.4x compression)
   - Separate key/value runtimes with independent bit widths and outlier-aware mixed-precision
   - Direct attention path for single-token decode avoids full cache dequantization
@@ -19,74 +39,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Metal kernel backend with CPU fallback
 
 - **Asymmetric K/V head dimensions**: KV cache, TurboQuant, and fused attention now support models where key and value projections have different widths (e.g. DeepSeek MLA with `qk_head_dim != v_head_dim`)
-  - `KVCacheConfig::with_value_head_dim()` for asymmetric buffer allocation
-  - `FusedAttentionConfig::with_value_head_dim()` for correct output shape routing
-  - Metal flash attention gracefully falls back to MLX SDPA for asymmetric dims
-  - Output tensors correctly use value dimension, not key dimension
 
-- **DeepSeek TurboQuant integration**: DeepSeek architecture creates asymmetric caches matching its MLA head dimensions and uses `try_turboquant_attention()` for direct compressed-cache attention during decode
-
-- **`pmetal serve --kv-turboquant`**: TurboQuant KV cache is now available in the serving engine. `--kv-turboquant-preset q3_5` enables near-lossless 4.6x KV compression for production serving. Cache mode override propagated through both streaming and non-streaming generation paths
+- **`pmetal serve --kv-turboquant`**: TurboQuant KV cache in the serving engine with `--kv-turboquant-preset q3_5` for near-lossless 4.6x KV compression in production
 
 - **Qwen3.5 MoE dispatch improvements**: Expert prefetch reset per generation, configurable GDN chunk size, chunked prefill, and generation helpers
 
 - **`pmetal-distributed` crate**: Feature-gated tensor, expert, context, zero, and pipeline parallelism modules
 
-- **GUI inference parity**: Full inference feature parity with CLI in the Tauri GUI, including TurboQuant flag
+- **TUI overhaul**: Expanded to 14 tabs with full CLI parity, `?`-key help overlay, Ctrl+1..9 tab jump, active-job footer badge, and shared `FormTabState` primitive for consistent form-based config across tabs
+
+- **GUI parity**: Serve, Bench, Eval, Jobs, and Pretrain pages in the Tauri GUI, matching TUI functionality with real-time event-driven updates
 
 - **Benchmark enhancements**: Warmup passes, session repeats, GDN prefill stage profiling, TurboQuant flag for bench commands, fused gate/up expert packing with auto-detected tensor layout
 
 - **Metal 4 / MPP kernel backend** (Epistates/pmetal#14): Trait-based kernel dispatch with `Metal3Backend` and `Metal4Backend` for M5+ (Apple10/NAX) GPUs
   - `KernelBackend` trait with 16 methods covering GEMM, attention, fused linear, training, MoE, distillation
   - `KernelDispatch` router on `MetalContext` — selects Metal 4 for large GEMMs (M>1, K%32==0) on M5, Metal 3 for everything else
-  - `Metal4CommandBuffer` with correct begin/end lifecycle state machine and safe Drop (fixes SIGSEGV crash class from Metal 3 command buffer patterns on Metal 4 hardware)
-  - `CommandAllocatorPool` with GPU-completion-tracked allocator reuse (prevents premature reset crashes)
-  - `ResidencyManager` wrapping mandatory Metal 4 `MTLResidencySet` for GPU resource visibility
+  - `Metal4CommandBuffer` with correct begin/end lifecycle, `CommandAllocatorPool`, `ResidencyManager`
   - Compile-time `#[cfg(has_metal4)]` gating + runtime `has_nax` check — zero overhead on M1-M4
 
-- **13 MPP-optimized Metal 4 shaders**: All following Apple MPP best practices (single simdgroup execution, Morton-order threadgroup walk, K-dimension alignment to 32, accumulation-loop barriers at BK=128, static tensor extents)
-  - 8 existing shaders optimized: `mpp_gemm`, `mpp_flash_attention`, `mpp_quantized`, `mpp_fused_swiglu` (rewritten with register-space cooperative tensor fusion), `mpp_fused_norm_lora`, `mpp_dw_gemm`, `mpp_grouped_gemm`, `mpp_fused_lora`
-  - 5 new shaders: `mpp_fused_training` (AdamW), `mpp_fused_cross_entropy` (log-softmax + NLL), `mpp_fused_rope` (4 variants with postfix fusion), `mpp_fused_moe` (gate+up SwiGLU fusion + down projection), `mpp_fused_distill` (KL/reverse-KL/JS/soft-CE)
-  - Shared `encode_mpp_kernel()` dispatch helper eliminates boilerplate across 15 dispatch sites
+- **15 MPP-optimized Metal 4 shaders**: All following Apple MPP best practices (single simdgroup execution, Morton-order threadgroup walk, K-dimension alignment to 32, accumulation-loop barriers at BK=128)
+  - 8 existing shaders optimized: `mpp_gemm`, `mpp_flash_attention`, `mpp_quantized`, `mpp_fused_swiglu`, `mpp_fused_norm_lora`, `mpp_dw_gemm`, `mpp_grouped_gemm`, `mpp_fused_lora`
+  - 5 new shaders: `mpp_fused_training` (AdamW), `mpp_fused_cross_entropy`, `mpp_fused_rope`, `mpp_fused_moe`, `mpp_fused_distill`
+  - 2 additional: `mpp_fused_mlp` (gate+up+down combined), quantized MoE expert variants
 
-- **Adaptive sequence packing**: `compute_pack_seq_len()` uses p99 of actual dataset sequence lengths (rounded to next power of 2, capped at model max) instead of blindly using `max_position_embeddings`. Fixes O(n^2) attention cost when packing short sequences (50-400 tokens) into 8192-token batches — up to 256x reduction in wasted compute
-  - `--pack-max-seq-len` CLI flag for explicit override
+- **Adaptive sequence packing**: `compute_pack_seq_len()` uses p99 of actual dataset sequence lengths instead of `max_position_embeddings` — up to 256x reduction in wasted compute for short-sequence datasets. `--pack-max-seq-len` for explicit override
 
-- **`--mode` sampling presets**: Per-model-family recommended sampling parameters sourced from model card READMEs
-  - Qwen3/3.5 modes: `thinking-general` (temp=1.0, pp=1.5), `thinking-coding` (temp=0.6, pp=0.0), `instruct-general` (temp=0.7, pp=1.5), `instruct-reasoning` (temp=1.0, pp=2.0)
-  - `--mode auto` (default) selects based on `--no-thinking` flag
-  - Resolution order: CLI explicit > mode preset > generation_config.json > global fallback
+- **`--mode` sampling presets**: Per-model-family recommended sampling parameters (Qwen3/3.5 thinking/instruct modes). `--mode auto` selects based on `--no-thinking` flag
 
-- **`--detect-repetition`**: Opt-in n-gram repetition loop detection (8-token pattern x 4 repeats). Force-stops generation when infinite loops are detected
+- **`--detect-repetition`**: Opt-in n-gram repetition loop detection (8-token pattern x 4 repeats), force-stops infinite loops
 
-- **Chip name in decode stats**: Inference output now shows the Apple Silicon chip (e.g., `[M4 Max]`) in the decode performance line
+- **Chip name in decode stats**: Inference output now shows the Apple Silicon chip (e.g., `[M4 Max]`)
 
 ### Changed
 
+- **mlx-rs removed**: All crates migrated from mlx-rs to the `pmetal-bridge` compat API. Entire model, training, serving, and GUI stacks now use the zero-allocation C++ bridge
 - Thinking trace shown by default for thinking models; use `--hide-thinking` to suppress
-- Migrated scattered `has_nax()` checks in `pmetal-mlx` to use `MetalContext::dispatch()` for centralized backend routing
-- `load_sampling_defaults()` now accepts `ChatTemplateType` and `SamplingMode` for preset-aware parameter resolution
-
-- Fused attention config carries optional `value_head_dim` for architectures with asymmetric K/V projections; Metal backends reject asymmetric dims and fall through to MLX SDPA
-- Serve engine accepts explicit `cache_mode_override` via `InferenceEngine::new_with_options()`, bypassing auto-selection when TurboQuant or other explicit modes are requested
-- Dispatcher sanitizes TurboQuant configs per-dimension, clamping outlier counts and falling back to uniform for degenerate head dims
-- All architecture attention forwards auto-detect asymmetric value dims from tensor shapes
-- Split `compat.rs` (3620 lines) into 7-file `compat/` module directory for maintainability
+- Migrated scattered `has_nax()` checks to `MetalContext::dispatch()` for centralized backend routing
+- Split `compat.rs` (3620 lines) into 7-file `compat/` module directory
 - Split `bridge.cpp` (6749 lines) into 6 C++ source files with shared `bridge_internal.h`
+- `Array::id()` replaces `data_ptr()` for weight change detection — safe with lazy evaluation
 
 ### Fixed
 
-- **AdamW bias correction**: step counter was advancing per-parameter instead of per-step, corrupting momentum/velocity estimates
+- **AdamW bias correction**: step counter was advancing per-parameter instead of per-step
 - **Gradient clipping** in compiled training path now uses `_clipped` step variants
-- **FFI exception safety**: ~33 C++ bridge functions wrapped in try/catch to prevent unwinding across the FFI boundary
+- **FFI exception safety**: ~33 C++ bridge functions wrapped in try/catch
 - **LoRA inference segfault**: put_along_axis crash during generation
 - **UTF-8 char boundary panics** in inference/GUI output stream handling
-- Zero clippy warnings across entire workspace (`cargo clippy --workspace --all-targets --all-features -- -D warnings`)
+- **Distributed ring reduce**: all-gather chunk indexing used wrong offset, corrupting gradient aggregation
+- **select_axis parameter order**: standardized (data, index, axis) across all call sites
+- **Lazy array segfaults**: diffusion sampler now evals sigmas/timesteps before slice access
+- **Sampling penalties**: correctly wired through native bridge decode path
+- Zero clippy warnings across entire workspace
 - Stale `pmetal-mlx-sys` metallib path in release workflow (renamed to `pmetal-bridge`)
 
 ### Removed
 
+- **mlx-rs dependency**: Fully replaced by `pmetal-bridge` — removes ~15K lines of Rust FFI bindings
 - 1065 lines of dead code: `qwen3_train.rs`, unused LoRA functions in `qwen3_native.rs`
+- 5 superseded LoRA training modules
 
 ## [0.4.0] - 2026-03-23
 
