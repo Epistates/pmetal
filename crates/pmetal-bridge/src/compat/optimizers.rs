@@ -71,6 +71,36 @@ impl AdamW {
     pub fn advance_step(&mut self) {
         self.inner.advance_step();
     }
+
+    /// Current optimizer step count.
+    pub fn step_count(&self) -> u64 {
+        self.inner.step_count()
+    }
+
+    /// Update the base learning rate (for LR scheduling).
+    pub fn set_lr(&mut self, lr: f32) {
+        self.inner.set_lr(lr);
+        self.lr = Array::from_f32(lr);
+    }
+
+    /// Restore optimizer state from a checkpoint.
+    ///
+    /// Sets the step counter and populates both the public `state` map and
+    /// the inner per-parameter `AdamState` entries so that the next
+    /// `update()` call picks up where training left off.
+    pub fn restore_state(&mut self, step_count: u64, state: State<(Array, Array)>) {
+        self.inner.set_step_count(step_count);
+        for (key, (m, v)) in &state {
+            self.inner.states.insert(
+                key.to_string(),
+                crate::optimizer::AdamState {
+                    m: m.clone(),
+                    v: v.clone(),
+                },
+            );
+        }
+        self.state = state;
+    }
 }
 
 impl Optimizer for AdamW {

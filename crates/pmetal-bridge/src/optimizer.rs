@@ -161,6 +161,11 @@ impl AdamW {
         self.step_count_inner
     }
 
+    /// Set the step counter (used when restoring from checkpoint).
+    pub fn set_step_count(&mut self, count: u64) {
+        self.step_count_inner = count;
+    }
+
     /// Remove optimizer state for parameters that are no longer present in
     /// the model (e.g. after a LoRA rank change). Only needed in advanced
     /// setups; safe to call at any time.
