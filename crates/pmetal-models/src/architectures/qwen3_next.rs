@@ -1464,7 +1464,7 @@ impl Qwen3NextGatedDeltaNet {
         // them in the capture — the internal implementation derives them
         // from (a, b_val, a_log, dt_bias) on every call.
         let beta = b_val.sigmoid();
-        let g = pmetal_mlx::kernels::compute_g(self.a_log.as_ref(), a, &self.dt_bias.as_ref())?;
+        let g = pmetal_mlx::kernels::compute_g(self.a_log.as_ref(), a, self.dt_bias.as_ref())?;
 
         // Record the rollback inputs before advancing the state.
         if let Some((layer_idx, buf)) = capture {

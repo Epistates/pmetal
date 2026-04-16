@@ -2958,6 +2958,7 @@ fn apply_per_position_rope(
     rotated.transpose_axes(&[2, 1, 0, 3])
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attn_forward(
     lw: &LayerWeights,
     normed: &InlineArray,
@@ -2981,6 +2982,7 @@ fn attn_forward(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn attn_forward_with_tree_ctx(
     lw: &LayerWeights,
     normed: &InlineArray,

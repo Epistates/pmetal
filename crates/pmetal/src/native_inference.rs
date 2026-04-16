@@ -648,8 +648,8 @@ fn run_gemma4(
                 config.global_head_dim
             )
         },
-        |path, config| gemma4_native::load_model(path, config),
-        |weights, config| gemma4_native::build_cache(weights, config),
+        gemma4_native::load_model,
+        gemma4_native::build_cache,
         gemma4_native::prefill_first_token,
         |weights, config, cache, first_tok, remaining, params, on_token| {
             gemma4_native::generate(

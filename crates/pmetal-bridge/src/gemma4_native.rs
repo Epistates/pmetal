@@ -144,14 +144,12 @@ impl Gemma4Config {
     }
 
     pub fn layer_num_kv_heads(&self, layer_idx: usize) -> i32 {
-        if self.is_full_attention(layer_idx)
-            && self.attention_k_eq_v
-            && self.num_global_key_value_heads.is_some()
-        {
-            self.num_global_key_value_heads.unwrap()
-        } else {
-            self.num_key_value_heads
+        if self.is_full_attention(layer_idx) && self.attention_k_eq_v {
+            if let Some(h) = self.num_global_key_value_heads {
+                return h;
+            }
         }
+        self.num_key_value_heads
     }
 
     pub fn layer_uses_k_eq_v(&self, layer_idx: usize) -> bool {

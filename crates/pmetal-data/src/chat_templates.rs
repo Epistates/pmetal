@@ -1695,7 +1695,7 @@ pub fn detect_chat_template(model_path: &std::path::Path, model_name: &str) -> C
                     // fall back to a ChatML skeleton so eos/bos defaults
                     // are sensible. The attached Jinja source is what
                     // actually drives rendering.
-                    .unwrap_or_else(|| ChatTemplate::chatml());
+                    .unwrap_or_else(ChatTemplate::chatml);
                 let mut template = detected_family;
 
                 // Refine: ChatML-looking Qwen checkpoints get the Qwen

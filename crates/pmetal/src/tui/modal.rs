@@ -915,7 +915,7 @@ fn tab_help(tab: Tab) -> &'static [(&'static str, &'static str)] {
             ("a", "Add a custom dataset directory"),
             ("R", "Rescan dataset directories"),
         ],
-        Tab::Training | Tab::Distillation | Tab::Grpo => &[
+        Tab::Training | Tab::Pretrain | Tab::Distillation | Tab::Grpo => &[
             ("j / k", "Navigate fields"),
             ("Enter", "Edit / cycle / pick"),
             ("S", "Start the job"),

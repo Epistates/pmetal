@@ -69,7 +69,7 @@ impl Widget for Footer {
                     Span::styled(" refresh  ", THEME.footer_desc),
                 ]);
             }
-            Tab::Training | Tab::Distillation | Tab::Grpo => {
+            Tab::Training | Tab::Pretrain | Tab::Distillation | Tab::Grpo => {
                 spans.extend([
                     Span::styled("jk", THEME.footer_key),
                     Span::styled(" navigate  ", THEME.footer_desc),

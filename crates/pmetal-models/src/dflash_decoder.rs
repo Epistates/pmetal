@@ -170,18 +170,13 @@ pub trait DFlashTarget {
 /// `target_hidden` tensor alongside the draft hidden states) is not
 /// plumbed yet; requesting `Ane` returns an explicit error so callers can
 /// feature-detect rather than silently fall back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DraftBackend {
     /// Run the draft on the GPU via mlx-rs (the default today).
+    #[default]
     Gpu,
     /// Run the draft on the Apple Neural Engine — not yet implemented.
     Ane,
-}
-
-impl Default for DraftBackend {
-    fn default() -> Self {
-        DraftBackend::Gpu
-    }
 }
 
 /// Runtime configuration for [`DFlashDecoder::generate`].
@@ -901,20 +896,15 @@ use crate::architectures::qwen3::Qwen3ForCausalLM;
 /// alone drops acceptance rates. `Fp8` keeps ±240 range which covers every
 /// Linear layer in the upstream Qwen3-DFlash checkpoints and shaves ~50%
 /// off draft memory vs BF16 with minimal acceptance-rate regression.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum DFlashDraftQuant {
     /// Keep weights at their loaded dtype (typically BF16).
+    #[default]
     None,
     /// Quantize every `.weight` tensor to FP8 (E4M3) in-place via
     /// [`crate::fp8_utils::quantize_model_linears`]. Leaves biases and
     /// normalisation scales alone.
     Fp8,
-}
-
-impl Default for DFlashDraftQuant {
-    fn default() -> Self {
-        DFlashDraftQuant::None
-    }
 }
 
 /// Load a DFlash draft model from a local directory.

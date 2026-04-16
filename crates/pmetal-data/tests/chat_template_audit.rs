@@ -361,8 +361,8 @@ fn chat_template_audit() {
     let reports: Vec<ModelReport> = entries.iter().map(|d| run_audit_on(d)).collect();
 
     println!(
-        "\n{:50} | {:10} | {:18} | {:10} | {}",
-        "model", "template", "ids", "stops", "sampling"
+        "\n{:50} | {:10} | {:18} | {:10} | sampling",
+        "model", "template", "ids", "stops"
     );
     println!("{}", "-".repeat(110));
     for r in &reports {

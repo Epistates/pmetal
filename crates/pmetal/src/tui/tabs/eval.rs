@@ -306,9 +306,7 @@ fn parse_sample_progress(line: &str) -> Option<(usize, usize)> {
     for (i, ch) in line.char_indices() {
         if ch.is_ascii_digit() {
             let tail = &line[i..];
-            let end = tail
-                .find(|c: char| c == ' ' || c == ',')
-                .unwrap_or(tail.len());
+            let end = tail.find([' ', ',']).unwrap_or(tail.len());
             let slice = &tail[..end];
             if let Some((a, b)) = slice.split_once('/') {
                 if let (Ok(done), Ok(total)) = (a.parse::<usize>(), b.parse::<usize>()) {
@@ -329,7 +327,7 @@ fn parse_metric(line: &str, key: &str) -> Option<f64> {
     let lower = line.to_lowercase();
     let idx = lower.find(key)?;
     let tail = &line[idx + key.len()..];
-    let tail = tail.trim_start_matches(|c: char| c == ' ' || c == '=' || c == ':');
+    let tail = tail.trim_start_matches([' ', '=', ':']);
     let end = tail
         .find(|c: char| !(c.is_ascii_digit() || c == '.' || c == '-' || c == '+' || c == 'e'))
         .unwrap_or(tail.len());

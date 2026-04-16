@@ -256,9 +256,8 @@ pub fn build_tree(draft_logits: &Array, budget: usize) -> TreeBuildResult {
     visibility[0][0] = true;
     for i in 1..total {
         let parent = parents[i] as usize;
-        for j in 0..i {
-            visibility[i][j] = visibility[parent][j];
-        }
+        let (head, tail) = visibility.split_at_mut(i);
+        tail[0][..i].copy_from_slice(&head[parent][..i]);
         visibility[i][i] = true;
     }
 
@@ -435,9 +434,9 @@ mod tests {
         // node_1's parent is node_0 (index 1).
         assert_eq!(tree.parents, vec![-1, 0, 1]);
         // Visibility: node 2 sees root (0) and node 1.
-        assert_eq!(tree.visibility[2][0], true);
-        assert_eq!(tree.visibility[2][1], true);
-        assert_eq!(tree.visibility[2][2], true);
+        assert!(tree.visibility[2][0]);
+        assert!(tree.visibility[2][1]);
+        assert!(tree.visibility[2][2]);
     }
 
     #[test]

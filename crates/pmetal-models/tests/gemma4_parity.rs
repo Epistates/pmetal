@@ -187,9 +187,10 @@ fn compare_checkpoint_owned(
         .find(|(n, _)| n == name)
         .map(|(_, t)| *t)
         .unwrap_or(Tolerance::new(5e-2, 5e-2));
-    if name.starts_with("layer_") && name.ends_with("_hidden") {
-        ParityReport::compute_with_per_position(name, rust, reference, tol)
-    } else if name == "logits" || name == "final_hidden" {
+    let wants_per_position = (name.starts_with("layer_") && name.ends_with("_hidden"))
+        || name == "logits"
+        || name == "final_hidden";
+    if wants_per_position {
         ParityReport::compute_with_per_position(name, rust, reference, tol)
     } else {
         ParityReport::compute(name, rust, reference, tol)
@@ -240,37 +241,38 @@ fn gemma4_synthetic_parity() {
         .clone();
 
     let tol = synthetic_tolerances();
-    let mut reports = Vec::new();
-    reports.push(compare_checkpoint(
-        "post_embed",
-        &post_embed_rust,
-        ref_tensor(&ref_shard, "post_embed"),
-        &tol,
-    ));
-    reports.push(compare_checkpoint(
-        "layer_0_hidden",
-        &layer0_rust,
-        ref_tensor(&ref_shard, "layer_0_hidden"),
-        &tol,
-    ));
-    reports.push(compare_checkpoint(
-        "layer_1_hidden",
-        &layer1_rust,
-        ref_tensor(&ref_shard, "layer_1_hidden"),
-        &tol,
-    ));
-    reports.push(compare_checkpoint(
-        "final_hidden",
-        &final_hidden_rust,
-        ref_tensor(&ref_shard, "final_hidden"),
-        &tol,
-    ));
-    reports.push(compare_checkpoint(
-        "logits",
-        &logits_rust,
-        ref_tensor(&ref_shard, "logits"),
-        &tol,
-    ));
+    let reports = vec![
+        compare_checkpoint(
+            "post_embed",
+            &post_embed_rust,
+            ref_tensor(&ref_shard, "post_embed"),
+            &tol,
+        ),
+        compare_checkpoint(
+            "layer_0_hidden",
+            &layer0_rust,
+            ref_tensor(&ref_shard, "layer_0_hidden"),
+            &tol,
+        ),
+        compare_checkpoint(
+            "layer_1_hidden",
+            &layer1_rust,
+            ref_tensor(&ref_shard, "layer_1_hidden"),
+            &tol,
+        ),
+        compare_checkpoint(
+            "final_hidden",
+            &final_hidden_rust,
+            ref_tensor(&ref_shard, "final_hidden"),
+            &tol,
+        ),
+        compare_checkpoint(
+            "logits",
+            &logits_rust,
+            ref_tensor(&ref_shard, "logits"),
+            &tol,
+        ),
+    ];
 
     println!("\n== Gemma 4 synthetic parity report ==");
     print_report_table(&reports);

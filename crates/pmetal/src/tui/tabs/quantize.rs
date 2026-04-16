@@ -464,9 +464,7 @@ fn parse_tensor_progress(line: &str) -> Option<(usize, usize)> {
     for (i, ch) in line.char_indices() {
         if ch.is_ascii_digit() {
             let tail = &line[i..];
-            let end = tail
-                .find(|c: char| c == ' ' || c == ',')
-                .unwrap_or(tail.len());
+            let end = tail.find([' ', ',']).unwrap_or(tail.len());
             let slice = &tail[..end];
             if let Some((a, b)) = slice.split_once('/') {
                 if let (Ok(done), Ok(total)) = (a.parse::<usize>(), b.parse::<usize>()) {

@@ -281,8 +281,7 @@ pub fn sample_token_with_params(logits_2d: &InlineArray, params: &SamplingParams
     let log_probs = {
         let inv_temp = scalar_f32_like(1.0 / params.temperature, logits_2d);
         let lse = logits_2d.logsumexp(-1, true);
-        let scaled = logits_2d.subtract(&lse).multiply(&inv_temp);
-        scaled
+        logits_2d.subtract(&lse).multiply(&inv_temp)
     };
     if !params.has_filters() {
         return log_probs.categorical();

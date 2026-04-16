@@ -582,14 +582,17 @@ mod tests {
 
     #[test]
     fn test_compiled_sampler_reproducibility() {
-        // Same seed should produce same sequence
-        let mut sampler1 = CompiledSampler::with_seed(0.7, 0, 1.0, 0.0, 42).unwrap();
-        let mut sampler2 = CompiledSampler::with_seed(0.7, 0, 1.0, 0.0, 42).unwrap();
-
+        // Same seed should produce same token. The bridge uses a global RNG,
+        // so we must reset the seed immediately before each sample — creating
+        // two samplers up-front would leave the global state advanced.
         let logits = Array::from_slice(&[0.0f32; 100], &[100]);
 
+        let mut sampler1 = CompiledSampler::with_seed(0.7, 0, 1.0, 0.0, 42).unwrap();
         let token1 = sampler1.sample_token(&logits).unwrap();
+
+        let mut sampler2 = CompiledSampler::with_seed(0.7, 0, 1.0, 0.0, 42).unwrap();
         let token2 = sampler2.sample_token(&logits).unwrap();
+
         assert_eq!(token1, token2);
     }
 
@@ -618,12 +621,12 @@ mod tests {
     fn test_sampler_state_updatable() {
         let state = SamplerState::new().unwrap();
 
-        // Should have exactly 1 updatable state (the random key)
-        assert_eq!(state.updatable_states_len(), 1);
+        // Bridge uses a global seed rather than an explicit random key Array,
+        // so there are no updatable state tensors to track.
+        assert_eq!(state.updatable_states_len(), 0);
 
-        // Should be able to iterate states
         let states: Vec<_> = state.updatable_states().into_iter().collect();
-        assert_eq!(states.len(), 1);
+        assert_eq!(states.len(), 0);
     }
 
     #[test]
