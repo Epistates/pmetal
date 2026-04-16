@@ -150,7 +150,7 @@ impl SequencePacker {
             .enumerate()
             .map(|(i, (ids, _))| (i, ids.dim(0)))
             .collect();
-        indexed_lengths.sort_by(|a, b| b.1.cmp(&a.1));
+        indexed_lengths.sort_by_key(|b| std::cmp::Reverse(b.1));
 
         // First-fit-decreasing bin packing
         let mut bins: Vec<Vec<usize>> = Vec::new();
