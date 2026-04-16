@@ -1240,8 +1240,10 @@ impl TrainingLoop {
         let mut valid_mask = flat_labels.ne(&ignore_index);
         valid_mask.eval();
 
-        // Count valid tokens
-        let mut total_valid = valid_mask.sum(None);
+        // Count valid tokens (cast bool→f32 before sum — bridge item_f32
+        // doesn't handle bool dtype correctly)
+        let valid_mask_f32 = valid_mask.as_type::<f32>();
+        let mut total_valid = valid_mask_f32.sum(None);
         total_valid.eval();
         let total_tokens = total_valid.item_f32() as u64;
 
@@ -1249,14 +1251,9 @@ impl TrainingLoop {
             return Ok((0, 0));
         }
 
-        // Compare predictions with labels where valid
-        // predictions is i32, labels is i64, need to cast
-        let predictions_i64 = predictions.as_dtype(Dtype::Int64.as_i32());
-        let mut correct = predictions_i64.eq(&flat_labels);
-        correct.eval();
-
-        // Mask out invalid tokens and sum
-        let valid_correct = correct.multiply(&valid_mask);
+        // Compare predictions with labels (both i32 from the bridge dataloader)
+        let correct = predictions.eq(&flat_labels).as_type::<f32>();
+        let valid_correct = correct.multiply(&valid_mask_f32);
         let mut correct_sum = valid_correct.sum(None);
         correct_sum.eval();
         let correct_count = correct_sum.item_f32() as u64;

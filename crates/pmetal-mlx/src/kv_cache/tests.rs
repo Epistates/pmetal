@@ -1533,7 +1533,7 @@ fn test_gdn_rollback_zero_accepted_equals_snapshot() {
     // If zero tokens are accepted, rewind must restore the exact snapshot —
     // no replay through the verify inputs.
     let mut entry = MambaCacheEntry::default();
-    let state = patterned_tensor(1, 2, 4, 8, 3.14);
+    let state = patterned_tensor(1, 2, 4, 8, 3.25);
     entry.ssm_state = Some(state.clone());
     let snapshot = entry.snapshot();
 

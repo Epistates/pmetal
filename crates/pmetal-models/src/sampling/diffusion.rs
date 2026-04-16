@@ -42,6 +42,11 @@ impl FlowMatchScheduler {
 
         let timesteps = sigmas.multiply(&Array::from_f32(num_train_timesteps));
 
+        // Materialise so downstream as_slice/item calls don't segfault on
+        // lazy arrays (data_ptr requires evaluated buffers).
+        sigmas.eval();
+        timesteps.eval();
+
         Ok(Self {
             sigmas,
             timesteps,

@@ -42,7 +42,7 @@ pub fn gelu_approximate(a: &Array) -> Array {
 /// Implemented in pure ops since there's no dedicated bridge kernel.
 pub fn gelu_tanh_approximate(a: &Array) -> Array {
     use super::ops;
-    let k = Array::from_f32(0.797_884_56); // sqrt(2/pi)
+    let k = Array::from_f32(0.797_884_6); // sqrt(2/pi)
     let c = Array::from_f32(0.044_715);
     let half = Array::from_f32(0.5);
     let one = Array::from_f32(1.0);
