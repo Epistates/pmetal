@@ -1279,13 +1279,12 @@ impl ChatTemplate {
 
         for msg in messages {
             match msg.role.as_str() {
-                "system" => {
+                "system"
                     // Already handled or override
-                    if text.is_empty() {
+                    if text.is_empty() => {
                         text.push_str(&msg.content);
                         text.push_str("\n\n");
                     }
-                }
                 "user" => {
                     text.push_str("USER: ");
                     text.push_str(&msg.content);

@@ -456,7 +456,7 @@ impl SequencePacker {
             .collect();
 
         // Sort by length descending (largest first)
-        indexed_samples.sort_by(|a, b| b.1.input_ids.len().cmp(&a.1.input_ids.len()));
+        indexed_samples.sort_by_key(|b| std::cmp::Reverse(b.1.input_ids.len()));
 
         // Pack using first-fit decreasing
         let mut bins: Vec<PackingBin> = Vec::new();
