@@ -95,6 +95,7 @@ pub mod mlx_metal_optimizer;
 pub mod online_dpo;
 #[cfg(feature = "experimental-trainers")]
 pub mod orpo;
+pub mod paired_preference;
 pub mod param_groups;
 #[cfg(feature = "experimental-trainers")]
 pub mod ppo;

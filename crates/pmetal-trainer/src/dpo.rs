@@ -767,6 +767,25 @@ impl DpoTrainer {
         }
     }
 
+    /// Public surface over the DPO loss math so [`crate::paired_preference::DpoLoss`]
+    /// can delegate without duplicating the formula. Behaviour is identical to
+    /// the trainer's internal `compute_dpo_loss_static`.
+    pub fn compute_dpo_loss_for(
+        config: &DpoConfig,
+        policy_chosen_logps: &Array,
+        policy_rejected_logps: &Array,
+        ref_chosen_logps: &Array,
+        ref_rejected_logps: &Array,
+    ) -> Result<(Array, Array, Array), Exception> {
+        Self::compute_dpo_loss_static(
+            config,
+            policy_chosen_logps,
+            policy_rejected_logps,
+            ref_chosen_logps,
+            ref_rejected_logps,
+        )
+    }
+
     fn compute_dpo_loss_static(
         config: &DpoConfig,
         policy_chosen_logps: &Array,
