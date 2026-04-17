@@ -1,5 +1,6 @@
 //! Server setup and configuration.
 
+use crate::anthropic;
 use crate::engine::InferenceEngine;
 use crate::routes::{self, AppState, ServingMetrics};
 use axum::Router;
@@ -48,6 +49,7 @@ pub fn build_router(engine: InferenceEngine) -> Router {
             axum::routing::post(routes::chat_completions),
         )
         .route("/v1/completions", axum::routing::post(routes::completions))
+        .route("/v1/messages", axum::routing::post(anthropic::messages))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
         // Reject request bodies larger than 2 MiB to prevent memory exhaustion.
