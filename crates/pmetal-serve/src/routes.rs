@@ -305,13 +305,9 @@ pub async fn completions(
     let created = Utc::now().timestamp();
 
     // /v1/completions: logprobs is a numeric field (number of top
-    // alternatives). Streaming logprobs are out of scope here — the
-    // streaming SSE payload shape stays unchanged.
-    let logprobs_top_n = if !req.stream.unwrap_or(false) {
-        req.logprobs.map(|n| n as usize)
-    } else {
-        None
-    };
+    // alternatives). Honoured on both the streaming and non-streaming
+    // paths — streaming deltas emit per-token 4-parallel-array chunks.
+    let logprobs_top_n = req.logprobs.map(|n| n as usize);
 
     let params = SamplingParams {
         max_tokens: req.max_tokens,
@@ -333,8 +329,16 @@ pub async fn completions(
         let tokenizer = state.engine.tokenizer_arc();
         let metrics_handle = Arc::clone(&state);
 
-        let sse_stream =
-            completion_sse_stream(rx, tokenizer, request_id, model_id, created, metrics_handle);
+        let logprobs_enabled = logprobs_top_n.is_some();
+        let sse_stream = completion_sse_stream(
+            rx,
+            tokenizer,
+            request_id,
+            model_id,
+            created,
+            metrics_handle,
+            logprobs_enabled,
+        );
 
         return Ok(Sse::new(sse_stream)
             .keep_alive(axum::response::sse::KeepAlive::default())
@@ -617,8 +621,11 @@ fn chat_sse_stream(
 
 /// Convert an mpsc token stream into an SSE event stream for text completions.
 ///
-/// Uses the same UTF-8 boundary buffering as `chat_sse_stream`. [DONE] is only
-/// emitted on successful completion — not after errors.
+/// Uses the same UTF-8 boundary buffering as `chat_sse_stream`. When
+/// `logprobs_enabled` is true, each delta carries a per-chunk
+/// `CompletionLogprobs` payload with 4-parallel-array shape aligned to
+/// the substring boundaries of the current delta. [DONE] is only emitted
+/// on successful completion — not after errors.
 fn completion_sse_stream(
     rx: tokio::sync::mpsc::Receiver<TokenEvent>,
     tokenizer: Arc<pmetal_data::Tokenizer>,
@@ -626,37 +633,57 @@ fn completion_sse_stream(
     model_id: String,
     created: i64,
     state: Arc<AppState>,
+    logprobs_enabled: bool,
 ) -> impl futures::Stream<Item = Result<Event, Infallible>> + Send + 'static {
     let token_stream = ReceiverStream::new(rx);
 
     // BPE boundaries can split multi-byte codepoints across tokens — see
-    // crate::sse::IncrementalDecoder for the buffering rationale. Streaming
-    // logprobs aren't exposed on /v1/completions yet, so the aux type is `()`.
-    let mut decoder: IncrementalDecoder<()> = IncrementalDecoder::new(tokenizer);
+    // crate::sse::IncrementalDecoder for the buffering rationale. When
+    // logprobs are off, aux is always `None`; `push_with_aux` still drives
+    // the decoder but drained aux is ignored.
+    let mut decoder: IncrementalDecoder<Option<crate::engine::TokenLogprobEntry>> =
+        IncrementalDecoder::new(Arc::clone(&tokenizer));
+    // Running byte offset into the concatenated streamed text — aligns
+    // `text_offset` across delta boundaries per OpenAI's shape.
+    let mut running_offset: usize = 0;
+    let tokenizer_for_aux = Arc::clone(&tokenizer);
 
     token_stream.flat_map(move |event| {
         let mut events: Vec<Result<Event, Infallible>> = Vec::new();
 
         match event {
-            TokenEvent::Token { id: token_id, logprob: _ } => {
-                let new_text = decoder.push(token_id);
+            TokenEvent::Token { id: token_id, logprob } => {
+                let (new_text, drained_aux) = decoder.push_with_aux(token_id, logprob);
                 if !new_text.is_empty() {
+                    let logprobs_payload = if logprobs_enabled {
+                        Some(build_completion_logprobs(
+                            &tokenizer_for_aux,
+                            drained_aux,
+                            &mut running_offset,
+                        ))
+                    } else {
+                        None
+                    };
+                    let mut choice = json!({
+                        "index": 0,
+                        "text": new_text,
+                        "finish_reason": null,
+                    });
+                    if let Some(lp) = logprobs_payload {
+                        choice["logprobs"] = serde_json::to_value(lp).unwrap_or(json!(null));
+                    }
                     let chunk = json!({
                         "id": request_id,
                         "object": "text_completion",
                         "created": created,
                         "model": model_id,
-                        "choices": [{
-                            "index": 0,
-                            "text": new_text,
-                            "finish_reason": null,
-                        }]
+                        "choices": [choice],
                     });
                     events.push(Ok(Event::default().data(chunk.to_string())));
                 }
             }
             TokenEvent::Done(finish_reason, metrics) => {
-                let remaining = decoder.flush();
+                let (remaining, _drained_aux) = decoder.flush_aux();
                 if !remaining.is_empty() {
                     let flush = json!({
                         "id": request_id,
@@ -700,6 +727,46 @@ fn completion_sse_stream(
 
         stream::iter(events)
     })
+}
+
+/// Build a per-delta `CompletionLogprobs` payload from drained aux.
+///
+/// `running_offset` is the caller-owned byte cursor into the concatenated
+/// streamed text — it advances by each drained token's decoded length so
+/// `text_offset` entries align across chunk boundaries per OpenAI's shape.
+/// When aux contains no logprob entries (e.g. an accelerated path that
+/// can't produce them) the returned payload has empty arrays rather than
+/// being `None` — callers opt in via `logprobs_enabled` upstream.
+fn build_completion_logprobs(
+    tokenizer: &Arc<pmetal_data::Tokenizer>,
+    aux: Vec<Option<crate::engine::TokenLogprobEntry>>,
+    running_offset: &mut usize,
+) -> CompletionLogprobs {
+    let entries: Vec<crate::engine::TokenLogprobEntry> = aux.into_iter().flatten().collect();
+    let n = entries.len();
+    let mut tokens = Vec::with_capacity(n);
+    let mut token_logprobs = Vec::with_capacity(n);
+    let mut top_logprobs = Vec::with_capacity(n);
+    let mut text_offset = Vec::with_capacity(n);
+    for entry in entries {
+        let tok_str = tokenizer.decode(&[entry.token]).unwrap_or_default();
+        let mut top = std::collections::HashMap::with_capacity(entry.top_logprobs.len());
+        for (alt_id, lp) in entry.top_logprobs {
+            let alt_str = tokenizer.decode(&[alt_id]).unwrap_or_default();
+            top.insert(alt_str, lp);
+        }
+        text_offset.push(*running_offset);
+        *running_offset += tok_str.len();
+        tokens.push(tok_str);
+        token_logprobs.push(entry.logprob);
+        top_logprobs.push(top);
+    }
+    CompletionLogprobs {
+        tokens,
+        token_logprobs,
+        top_logprobs,
+        text_offset,
+    }
 }
 
 /// `POST /v1/embeddings` — OpenAI-compatible sentence embeddings.
