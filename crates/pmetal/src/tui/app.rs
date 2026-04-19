@@ -1802,11 +1802,9 @@ impl App {
             Tab::Dashboard if self.active_training_job.is_none() => {
                 self.dashboard.poll_metrics();
             }
-            Tab::Device => {
-                // Refresh memory every 5 ticks (1 second)
-                if self.tick_count % 5 == 0 {
-                    self.device.refresh_memory();
-                }
+            // Refresh memory every 5 ticks (1 second)
+            Tab::Device if self.tick_count % 5 == 0 => {
+                self.device.refresh_memory();
             }
             _ => {}
         }

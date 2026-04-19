@@ -160,16 +160,14 @@ impl FormField {
                     }
                 }
             }
-            KeyCode::Backspace => {
-                if self.cursor > 0 {
-                    let prev = self.edit_buffer[..self.cursor]
-                        .chars()
-                        .last()
-                        .map(|c| c.len_utf8())
-                        .unwrap_or(0);
-                    self.cursor -= prev;
-                    self.edit_buffer.remove(self.cursor);
-                }
+            KeyCode::Backspace if self.cursor > 0 => {
+                let prev = self.edit_buffer[..self.cursor]
+                    .chars()
+                    .last()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(0);
+                self.cursor -= prev;
+                self.edit_buffer.remove(self.cursor);
             }
             KeyCode::Left if self.cursor > 0 => {
                 let prev = self.edit_buffer[..self.cursor]
