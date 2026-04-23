@@ -98,6 +98,12 @@ void mlx_inline_compiled_attn_layer_fixed(
 // Residual adds and the per-layer scalar multiply are intentionally
 // kept on the Rust side — they're 3 trivial element-wise ops and the
 // FFI surface stays narrow that way.
+//
+// Small-model-specific helpers:
+//   * `mlx_inline_compiled_gemma4_shared_attn_decode`
+//       Decode-only q-only attention for KV-shared layers.
+//   * `mlx_inline_compiled_gemma4_per_layer_input_block`
+//       Decode-time per-layer-input gating/projection block.
 void mlx_inline_compiled_gemma4_attn_block(
     mlx_inline_array* dst_out,
     mlx_inline_array* dst_cache_keys,
@@ -126,6 +132,29 @@ void mlx_inline_compiled_gemma4_attn_block(
     float rope_base,
     int rope_dims);
 
+void mlx_inline_compiled_gemma4_shared_attn_decode(
+    mlx_inline_array* dst_out,
+    const mlx_inline_array* x,
+    const mlx_inline_array* in_norm_w,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_norm_w,
+    const mlx_inline_array* post_norm_w,
+    const mlx_inline_array* rope_freqs,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int valid_kv_len,
+    int rope_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float in_norm_eps,
+    float q_norm_eps,
+    float post_norm_eps,
+    int sliding_window,
+    float rope_base,
+    int rope_dims);
+
 void mlx_inline_compiled_gemma4_mlp_block(
     mlx_inline_array* dst_out,
     const mlx_inline_array* x,
@@ -135,6 +164,15 @@ void mlx_inline_compiled_gemma4_mlp_block(
     const mlx_inline_array* down_w,
     const mlx_inline_array* post_norm_w,
     float pre_norm_eps,
+    float post_norm_eps);
+
+void mlx_inline_compiled_gemma4_per_layer_input_block(
+    mlx_inline_array* dst_out,
+    const mlx_inline_array* x,
+    const mlx_inline_array* layer_input,
+    const mlx_inline_array* gate_w,
+    const mlx_inline_array* projection_w,
+    const mlx_inline_array* post_norm_w,
     float post_norm_eps);
 
 // Fixed-shape compiled dense MoE decode block (shapeless=false).

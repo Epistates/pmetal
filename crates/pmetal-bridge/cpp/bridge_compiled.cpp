@@ -809,6 +809,179 @@ void mlx_inline_compiled_gemma4_attn_block(
     }
 }
 
+void mlx_inline_compiled_gemma4_shared_attn_decode(
+    mlx_inline_array* dst_out,
+    const mlx_inline_array* x,
+    const mlx_inline_array* in_norm_w,
+    const mlx_inline_array* q_w,
+    const mlx_inline_array* o_w,
+    const mlx_inline_array* q_norm_w,
+    const mlx_inline_array* post_norm_w,
+    const mlx_inline_array* rope_freqs,
+    const mlx_inline_array* cache_keys_in,
+    const mlx_inline_array* cache_vals_in,
+    int valid_kv_len,
+    int rope_offset,
+    int n_heads,
+    int n_kv,
+    int head_dim,
+    float in_norm_eps,
+    float q_norm_eps,
+    float post_norm_eps,
+    int sliding_window,
+    float rope_base,
+    int rope_dims
+) {
+    struct Entry {
+        int batch;
+        int seq_len;
+        int cache_len;
+        int n_heads;
+        int n_kv;
+        int head_dim;
+        int has_freqs;
+        int sliding_window;
+        int dtype;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        int batch = as_arr(x).shape(0);
+        int seq_len = as_arr(x).shape(1);
+        int cache_len = as_arr(cache_keys_in).shape(2);
+        int dtype = static_cast<int>(as_arr(x).dtype().val());
+        int has_freqs = (rope_freqs != nullptr) ? 1 : 0;
+
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.batch == batch
+                && entry.seq_len == seq_len
+                && entry.cache_len == cache_len
+                && entry.n_heads == n_heads
+                && entry.n_kv == n_kv
+                && entry.head_dim == head_dim
+                && entry.has_freqs == has_freqs
+                && entry.sliding_window == sliding_window
+                && entry.dtype == dtype) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            int NH = n_heads;
+            int NKV = n_kv;
+            int HD = head_dim;
+            int RD = rope_dims;
+            int L = cache_len;
+            int SW = sliding_window;
+            bool HAS_FREQS = has_freqs == 1;
+            float INE = in_norm_eps;
+            float QNE = q_norm_eps;
+            float PNE = post_norm_eps;
+            float RBASE = rope_base;
+
+            entries->push_back(Entry{
+                batch,
+                seq_len,
+                cache_len,
+                n_heads,
+                n_kv,
+                head_dim,
+                has_freqs,
+                sliding_window,
+                dtype,
+                *make_compiled_fixed(
+                    [NH, NKV, HD, RD, L, SW, HAS_FREQS, INE, QNE, PNE, RBASE]
+                    (const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+
+                        std::size_t idx = 0;
+                        const array& x = ins[idx++];
+                        const array& in_norm_w = ins[idx++];
+                        const array& q_w = ins[idx++];
+                        const array& o_w = ins[idx++];
+                        const array& q_norm_w = ins[idx++];
+                        const array& post_norm_w = ins[idx++];
+                        const array& rope_freqs_arr = ins[idx++];
+                        const array& cache_keys = ins[idx++];
+                        const array& cache_vals = ins[idx++];
+                        const array& valid_kv_len_arr = ins[idx++];
+                        const array& rope_offset_arr = ins[idx++];
+
+                        int B = x.shape(0);
+                        int S = x.shape(1);
+
+                        auto normed = fast::rms_norm(x, in_norm_w, INE);
+                        auto q_proj = matmul(normed, q_w);
+                        auto q = reshape(q_proj, {B, S, NH, HD});
+                        q = fast::rms_norm(q, q_norm_w, QNE);
+                        q = transpose(q, {0, 2, 1, 3});
+
+                        if (HAS_FREQS) {
+                            q = fast::rope(q, HD, false, std::nullopt, 1.0f,
+                                           rope_offset_arr,
+                                           std::optional<array>(rope_freqs_arr));
+                        } else {
+                            q = fast::rope(q, RD, false,
+                                           std::optional<float>(RBASE), 1.0f,
+                                           rope_offset_arr);
+                        }
+
+                        auto positions = reshape(arange(L, int32), {1, 1, 1, L});
+                        auto valid_mask = less(
+                            positions, reshape(valid_kv_len_arr, {1, 1, 1, 1}));
+                        if (SW > 0) {
+                            auto window_start = subtract(valid_kv_len_arr, array(SW));
+                            auto in_window = greater_equal(
+                                positions,
+                                reshape(window_start, {1, 1, 1, 1}));
+                            valid_mask = logical_and(valid_mask, in_window);
+                        }
+
+                        auto output = fast::scaled_dot_product_attention(
+                            q, cache_keys, cache_vals, 1.0f, "", valid_mask);
+                        output = transpose(output, {0, 2, 1, 3});
+                        output = reshape(output, {B, S, NH * HD});
+
+                        auto attn_out = matmul(output, o_w);
+                        auto post = fast::rms_norm(attn_out, post_norm_w, PNE);
+                        return {post};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        static array dummy_freqs(0.0f);
+        const array& freqs_input = (rope_freqs != nullptr)
+            ? as_arr(rope_freqs)
+            : dummy_freqs;
+
+        auto result = (*compiled)({
+            as_arr(x),
+            as_arr(in_norm_w),
+            as_arr(q_w),
+            as_arr(o_w),
+            as_arr(q_norm_w),
+            as_arr(post_norm_w),
+            freqs_input,
+            as_arr(cache_keys_in),
+            as_arr(cache_vals_in),
+            array(valid_kv_len),
+            array(rope_offset),
+        });
+        new (dst_out->buf) array(result[0]);
+        pmetal_bridge_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("compiled_gemma4_shared_attn_decode", e.what());
+        new (dst_out->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("compiled_gemma4_shared_attn_decode", "unknown C++ exception");
+        new (dst_out->buf) array(0.0f);
+    }
+}
+
 void mlx_inline_compiled_gemma4_mlp_block(
     mlx_inline_array* dst_out,
     const mlx_inline_array* x,
@@ -918,6 +1091,100 @@ void mlx_inline_compiled_gemma4_mlp_block(
         new (dst_out->buf) array(0.0f);
     } catch (...) {
         pmetal_bridge_set_last_error("compiled_gemma4_mlp_block", "unknown C++ exception");
+        new (dst_out->buf) array(0.0f);
+    }
+}
+
+void mlx_inline_compiled_gemma4_per_layer_input_block(
+    mlx_inline_array* dst_out,
+    const mlx_inline_array* x,
+    const mlx_inline_array* layer_input,
+    const mlx_inline_array* gate_w,
+    const mlx_inline_array* projection_w,
+    const mlx_inline_array* post_norm_w,
+    float post_norm_eps
+) {
+    struct Entry {
+        int batch;
+        int seq_len;
+        int hidden;
+        int per_layer_hidden;
+        int dtype;
+        CompiledFn compiled;
+    };
+    static auto* entries = new std::vector<Entry>();
+
+    try {
+        int batch = as_arr(x).shape(0);
+        int seq_len = as_arr(x).shape(1);
+        int hidden = as_arr(x).shape(2);
+        int per_layer_hidden = as_arr(layer_input).shape(2);
+        int dtype = static_cast<int>(as_arr(x).dtype().val());
+
+        CompiledFn* compiled = nullptr;
+        for (auto& entry : *entries) {
+            if (entry.batch == batch
+                && entry.seq_len == seq_len
+                && entry.hidden == hidden
+                && entry.per_layer_hidden == per_layer_hidden
+                && entry.dtype == dtype) {
+                compiled = &entry.compiled;
+                break;
+            }
+        }
+
+        if (compiled == nullptr) {
+            float POST = post_norm_eps;
+            entries->push_back(Entry{
+                batch,
+                seq_len,
+                hidden,
+                per_layer_hidden,
+                dtype,
+                *make_compiled_fixed(
+                    [POST](const std::vector<array>& ins) -> std::vector<array> {
+                        using namespace mlx::core;
+                        const array& x = ins[0];
+                        const array& layer_input = ins[1];
+                        const array& gate_w = ins[2];
+                        const array& projection_w = ins[3];
+                        const array& post_norm_w = ins[4];
+
+                        auto gate = matmul(x, gate_w);
+
+                        auto dt = gate.dtype();
+                        auto half = astype(array(0.5f), dt);
+                        auto one = astype(array(1.0f), dt);
+                        auto sqrt2_pi = astype(array(0.7978845608f), dt);
+                        auto coef = astype(array(0.044715f), dt);
+                        auto gate3 = multiply(multiply(gate, gate), gate);
+                        auto inner = add(gate, multiply(coef, gate3));
+                        auto t = tanh(multiply(sqrt2_pi, inner));
+                        auto gelu_g = multiply(half, multiply(gate, add(one, t)));
+
+                        auto mixed = multiply(gelu_g, layer_input);
+                        auto projected = matmul(mixed, projection_w);
+                        auto post = fast::rms_norm(projected, post_norm_w, POST);
+                        return {add(x, post)};
+                    })
+            });
+            compiled = &entries->back().compiled;
+        }
+
+        auto result = (*compiled)({
+            as_arr(x),
+            as_arr(layer_input),
+            as_arr(gate_w),
+            as_arr(projection_w),
+            as_arr(post_norm_w),
+        });
+        new (dst_out->buf) array(result[0]);
+        pmetal_bridge_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("compiled_gemma4_per_layer_input_block", e.what());
+        new (dst_out->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("compiled_gemma4_per_layer_input_block", "unknown C++ exception");
         new (dst_out->buf) array(0.0f);
     }
 }

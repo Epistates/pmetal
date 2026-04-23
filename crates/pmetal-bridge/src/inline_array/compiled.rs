@@ -282,6 +282,70 @@ impl InlineArray {
         }
     }
 
+    /// Decode-only q-only attention path for Gemma 4 KV-shared layers.
+    ///
+    /// Reuses an already-populated source cache and applies the same
+    /// input-layernorm → q_proj → q_norm → RoPE → SDPA → o_proj →
+    /// post_attention_layernorm sequence as the full Gemma 4 block, but
+    /// without projecting / appending fresh K/V.
+    #[allow(clippy::too_many_arguments)]
+    pub fn compiled_gemma4_shared_attn_decode(
+        x: &Self,
+        in_norm_w: &Self,
+        q_w: &Self,
+        o_w: &Self,
+        q_norm_w: &Self,
+        post_norm_w: &Self,
+        rope_freqs: Option<&Self>,
+        cache_keys_in: &Self,
+        cache_vals_in: &Self,
+        valid_kv_len: i32,
+        rope_offset: i32,
+        n_heads: i32,
+        n_kv: i32,
+        head_dim: i32,
+        in_norm_eps: f32,
+        q_norm_eps: f32,
+        post_norm_eps: f32,
+        sliding_window: i32,
+        rope_base: f32,
+        rope_dims: i32,
+    ) -> Self {
+        let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
+        let freqs_ptr: *const RawBuf = match rope_freqs {
+            Some(f) => &f.raw,
+            None => std::ptr::null(),
+        };
+        unsafe {
+            mlx_inline_compiled_gemma4_shared_attn_decode(
+                out.as_mut_ptr(),
+                &x.raw,
+                &in_norm_w.raw,
+                &q_w.raw,
+                &o_w.raw,
+                &q_norm_w.raw,
+                &post_norm_w.raw,
+                freqs_ptr,
+                &cache_keys_in.raw,
+                &cache_vals_in.raw,
+                valid_kv_len,
+                rope_offset,
+                n_heads,
+                n_kv,
+                head_dim,
+                in_norm_eps,
+                q_norm_eps,
+                post_norm_eps,
+                sliding_window,
+                rope_base,
+                rope_dims,
+            );
+            Self {
+                raw: out.assume_init(),
+            }
+        }
+    }
+
     /// Fixed-shape compiled Gemma 4 MLP block.
     ///
     /// Fuses `pre_feedforward_layernorm` + gate/up projections + tanh-approx
@@ -312,6 +376,33 @@ impl InlineArray {
                 &down_w.raw,
                 &post_norm_w.raw,
                 pre_norm_eps,
+                post_norm_eps,
+            );
+            Self {
+                raw: out.assume_init(),
+            }
+        }
+    }
+
+    /// Decode-time compiled per-layer-input gating / projection block used by
+    /// Gemma 4 E2B/E4B.
+    pub fn compiled_gemma4_per_layer_input_block(
+        x: &Self,
+        layer_input: &Self,
+        gate_w: &Self,
+        projection_w: &Self,
+        post_norm_w: &Self,
+        post_norm_eps: f32,
+    ) -> Self {
+        let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_compiled_gemma4_per_layer_input_block(
+                out.as_mut_ptr(),
+                &x.raw,
+                &layer_input.raw,
+                &gate_w.raw,
+                &projection_w.raw,
+                &post_norm_w.raw,
                 post_norm_eps,
             );
             Self {

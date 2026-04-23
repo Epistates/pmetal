@@ -34,8 +34,9 @@ pub enum NativeArch {
     DeepSeek,
     /// GPT-OSS (`model_type = "gpt_oss"`).
     GptOss,
-    /// Gemma 4 (`model_type = "gemma4"` / `"gemma4_text"`). Text-only 26B/31B
-    /// path — no MoE, no KV sharing, no per-layer-input gating.
+    /// Gemma 4 (`model_type = "gemma4"` / `"gemma4_text"`). Text-only dense
+    /// path, including E2B/E4B per-layer-input gating and KV sharing. MoE /
+    /// multimodal towers remain unsupported here.
     Gemma4,
 }
 

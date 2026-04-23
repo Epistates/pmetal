@@ -301,6 +301,30 @@ unsafe extern "C" {
         rope_dims: i32,
     );
 
+    pub(super) fn mlx_inline_compiled_gemma4_shared_attn_decode(
+        dst_out: *mut RawBuf,
+        x: *const RawBuf,
+        in_norm_w: *const RawBuf,
+        q_w: *const RawBuf,
+        o_w: *const RawBuf,
+        q_norm_w: *const RawBuf,
+        post_norm_w: *const RawBuf,
+        rope_freqs: *const RawBuf,
+        cache_keys_in: *const RawBuf,
+        cache_vals_in: *const RawBuf,
+        valid_kv_len: i32,
+        rope_offset: i32,
+        n_heads: i32,
+        n_kv: i32,
+        head_dim: i32,
+        in_norm_eps: f32,
+        q_norm_eps: f32,
+        post_norm_eps: f32,
+        sliding_window: i32,
+        rope_base: f32,
+        rope_dims: i32,
+    );
+
     pub(super) fn mlx_inline_compiled_gemma4_mlp_block(
         dst_out: *mut RawBuf,
         x: *const RawBuf,
@@ -310,6 +334,16 @@ unsafe extern "C" {
         down_w: *const RawBuf,
         post_norm_w: *const RawBuf,
         pre_norm_eps: f32,
+        post_norm_eps: f32,
+    );
+
+    pub(super) fn mlx_inline_compiled_gemma4_per_layer_input_block(
+        dst_out: *mut RawBuf,
+        x: *const RawBuf,
+        layer_input: *const RawBuf,
+        gate_w: *const RawBuf,
+        projection_w: *const RawBuf,
+        post_norm_w: *const RawBuf,
         post_norm_eps: f32,
     );
 
