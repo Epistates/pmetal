@@ -22,6 +22,7 @@ pub enum PretrainModel {
     Qwen3MoE(architectures::Qwen3MoE),
     Qwen3Next(Box<architectures::Qwen3NextForCausalLM>),
     Gemma(architectures::GemmaForCausalLM),
+    Gemma4(Box<architectures::Gemma4ForCausalLM>),
     Mistral(architectures::MistralForCausalLM),
     Phi(architectures::PhiForCausalLM),
 }
@@ -37,6 +38,7 @@ macro_rules! dispatch {
             PretrainModel::Qwen3MoE(m) => m.$method($($arg),*),
             PretrainModel::Qwen3Next(m) => m.$method($($arg),*),
             PretrainModel::Gemma(m) => m.$method($($arg),*),
+            PretrainModel::Gemma4(m) => m.$method($($arg),*),
             PretrainModel::Mistral(m) => m.$method($($arg),*),
             PretrainModel::Phi(m) => m.$method($($arg),*),
         }
@@ -77,6 +79,7 @@ pub fn n_layers(model: &PretrainModel) -> usize {
         PretrainModel::Qwen3MoE(m) => m.config.num_hidden_layers as usize,
         PretrainModel::Qwen3Next(m) => m.config.num_hidden_layers as usize,
         PretrainModel::Gemma(m) => m.config().num_hidden_layers as usize,
+        PretrainModel::Gemma4(m) => m.config.num_hidden_layers as usize,
         PretrainModel::Mistral(m) => m.config().num_hidden_layers as usize,
         PretrainModel::Phi(m) => m.config().num_hidden_layers as usize,
     }
@@ -151,6 +154,22 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
                 config,
             )?))
         }
+        "gemma4" | "gemma4_text" => {
+            let json = json.as_ref().ok_or_else(|| {
+                Exception::custom("gemma4 pretrain requires --model-config with a Gemma 4 config")
+            })?;
+            let effective =
+                if json.get("text_config").is_some() && json.get("hidden_size").is_none() {
+                    json["text_config"].clone()
+                } else {
+                    json.clone()
+                };
+            let config: architectures::Gemma4Config = serde_json::from_value(effective)
+                .map_err(|e| Exception::custom(format!("gemma4 config: {e}")))?;
+            Ok(PretrainModel::Gemma4(Box::new(
+                architectures::Gemma4ForCausalLM::new(config)?,
+            )))
+        }
         "mistral" | "mixtral" => {
             let config: architectures::MistralConfig = match &json {
                 Some(v) => serde_json::from_value(v.clone())
@@ -172,11 +191,20 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
             )?))
         }
         "qwen3.5" | "qwen3_5" | "qwen3_next" | "qwen3-next" | "qwen35" => {
-            let config: architectures::Qwen3NextConfig = match &json {
-                Some(v) => serde_json::from_value(v.clone())
-                    .map_err(|e| Exception::custom(format!("qwen3.5 config: {e}")))?,
+            let mut config: architectures::Qwen3NextConfig = match &json {
+                Some(v) => {
+                    let effective =
+                        if v.get("text_config").is_some() && v.get("hidden_size").is_none() {
+                            v["text_config"].clone()
+                        } else {
+                            v.clone()
+                        };
+                    serde_json::from_value(effective)
+                        .map_err(|e| Exception::custom(format!("qwen3.5 config: {e}")))?
+                }
                 None => architectures::Qwen3NextConfig::default(),
             };
+            config.apply_rope_parameters();
             Ok(PretrainModel::Qwen3Next(Box::new(
                 architectures::Qwen3NextForCausalLM::new(config)?,
             )))
@@ -193,7 +221,7 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
         }
         other => Err(Exception::custom(format!(
             "unsupported pretrain architecture: {other}\n\
-             supported: llama, qwen2, qwen3, qwen3.5, qwen3_moe, gemma, mistral, phi, gpt-oss"
+             supported: llama, qwen2, qwen3, qwen3.5, qwen3_moe, gemma, gemma4, mistral, phi, gpt-oss"
         ))),
     }
 }

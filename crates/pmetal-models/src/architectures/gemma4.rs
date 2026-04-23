@@ -29,10 +29,8 @@
 //!   approximation (matching mlx-lm `nn.gelu_approx`), NOT pmetal's
 //!   `nn::gelu_approximate` which maps to the sigmoid fast-approx variant.
 //!
-//! NOT supported (skipped for the 31B path):
+//! NOT supported:
 //! * MoE block (`enable_moe_block`)
-//! * Per-layer input gating (`hidden_size_per_layer_input`)
-//! * KV sharing (`num_kv_shared_layers`)
 //! * Double-wide MLP (`use_double_wide_mlp`)
 //! * Vision / audio towers
 //!
@@ -321,6 +319,10 @@ pub struct Gemma4Config {
     #[serde(default)]
     pub hidden_size_per_layer_input: Option<i32>,
     #[serde(default)]
+    pub vocab_size_per_layer_input: Option<i32>,
+    #[serde(default)]
+    pub hidden_activation: Option<String>,
+    #[serde(default)]
     pub num_kv_shared_layers: Option<i32>,
     #[serde(default)]
     pub use_double_wide_mlp: Option<bool>,
@@ -381,17 +383,46 @@ impl Gemma4Config {
         defaults
     }
 
-    pub fn pruned_unsupported_blocks(&self) -> Result<(), Exception> {
-        if self.hidden_size_per_layer_input.unwrap_or(0) != 0 {
-            return Err(Exception::custom(
-                "Gemma 4 per-layer input gating (hidden_size_per_layer_input != 0) \
-                 is not ported yet — only the 26B/31B path is supported.",
-            ));
+    pub fn uses_per_layer_inputs(&self) -> bool {
+        self.hidden_size_per_layer_input.unwrap_or(0) > 0
+    }
+
+    pub fn per_layer_input_dim(&self) -> i32 {
+        self.hidden_size_per_layer_input.unwrap_or(0)
+    }
+
+    pub fn per_layer_input_vocab_size(&self) -> i32 {
+        self.vocab_size_per_layer_input.unwrap_or(self.vocab_size)
+    }
+
+    pub fn num_kv_shared_layers(&self) -> usize {
+        self.num_kv_shared_layers.unwrap_or(0).max(0) as usize
+    }
+
+    pub fn first_kv_shared_layer_idx(&self) -> usize {
+        let total = self.num_hidden_layers.max(0) as usize;
+        total.saturating_sub(self.num_kv_shared_layers())
+    }
+
+    pub fn kv_shared_source_layer(&self, layer_idx: usize) -> Option<usize> {
+        let first_shared = self.first_kv_shared_layer_idx();
+        if layer_idx < first_shared || first_shared == 0 {
+            return None;
         }
-        if self.num_kv_shared_layers.unwrap_or(0) != 0 {
-            return Err(Exception::custom(
-                "Gemma 4 KV sharing (num_kv_shared_layers != 0) is not ported yet.",
-            ));
+        let is_full = self.is_full_attention(layer_idx);
+        (0..first_shared)
+            .rev()
+            .find(|&src| self.is_full_attention(src) == is_full)
+    }
+
+    pub fn pruned_unsupported_blocks(&self) -> Result<(), Exception> {
+        if let Some(ref act) = self.hidden_activation
+            && self.uses_per_layer_inputs()
+            && !matches!(act.as_str(), "gelu" | "gelu_pytorch_tanh" | "gelu_tanh")
+        {
+            return Err(Exception::custom(format!(
+                "Gemma 4 unsupported per-layer-input activation {act:?}"
+            )));
         }
         if self.enable_moe_block.unwrap_or(false) {
             return Err(Exception::custom("Gemma 4 MoE block is not ported yet."));
@@ -437,6 +468,120 @@ impl Gemma4RmsNorm {
 /// avoids the tiny rounding drift that the ones path introduces.
 fn rms_norm_noscale(x: &Array, eps: f32) -> Array {
     pmetal_bridge::compat::fast::rms_norm_opt(x, None, eps)
+}
+
+fn layer_per_input(per_layer_inputs: &Array, layer_idx: usize) -> Array {
+    let b = per_layer_inputs.dim(0);
+    let s = per_layer_inputs.dim(1);
+    let d = per_layer_inputs.dim(3);
+    per_layer_inputs
+        .slice(
+            &[0, 0, layer_idx as i32, 0],
+            &[b, s, layer_idx as i32 + 1, d],
+        )
+        .squeeze(2)
+}
+
+// ----------------------------------------------------------------------------
+// Per-layer inputs
+// ----------------------------------------------------------------------------
+
+#[derive(Debug)]
+pub struct Gemma4PerLayerInputs {
+    pub embed_tokens: nn::Embedding,
+    pub model_projection: nn::Linear,
+    pub projection_norm: Gemma4RmsNorm,
+    pub embed_scale: f32,
+    pub projection_scale: f32,
+    pub input_scale: f32,
+    pub num_layers: i32,
+    pub per_layer_dim: i32,
+    pub vocab_size: i32,
+}
+impl_module_params!(Gemma4PerLayerInputs; embed_tokens, model_projection, projection_norm);
+
+impl Gemma4PerLayerInputs {
+    pub fn new(config: &Gemma4Config) -> Result<Self, Exception> {
+        let per_layer_dim = config.per_layer_input_dim();
+        let total_ple_dim = config.num_hidden_layers * per_layer_dim;
+        Ok(Self {
+            embed_tokens: nn::Embedding::new(config.per_layer_input_vocab_size(), total_ple_dim)?,
+            model_projection: nn::LinearBuilder::new(config.hidden_size, total_ple_dim)
+                .bias(false)
+                .build()?,
+            projection_norm: Gemma4RmsNorm::new(per_layer_dim, config.rms_norm_eps),
+            embed_scale: (per_layer_dim as f32).sqrt(),
+            projection_scale: (config.hidden_size as f32).powf(-0.5),
+            input_scale: 2.0f32.powf(-0.5),
+            num_layers: config.num_hidden_layers,
+            per_layer_dim,
+            vocab_size: config.per_layer_input_vocab_size(),
+        })
+    }
+
+    pub fn compute(&self, input_ids: &Array, inputs_embeds: &Array) -> Array {
+        let ge_zero = ops::greater_equal(input_ids, &Array::from_i32(0));
+        let lt_vocab = ops::less(input_ids, &Array::from_i32(self.vocab_size));
+        let mask = ops::logical_and(&ge_zero, &lt_vocab);
+        let safe_input_ids = mask.where_cond(input_ids, &ops::zeros_like(input_ids));
+
+        let per_layer_embeds = self
+            .embed_tokens
+            .forward(&safe_input_ids)
+            .multiply(&Array::from_f32(self.embed_scale))
+            .reshape(&[
+                input_ids.dim(0),
+                input_ids.dim(1),
+                self.num_layers,
+                self.per_layer_dim,
+            ]);
+        let projection = self
+            .model_projection
+            .forward(inputs_embeds)
+            .multiply(&Array::from_f32(self.projection_scale))
+            .reshape(&[
+                input_ids.dim(0),
+                input_ids.dim(1),
+                self.num_layers,
+                self.per_layer_dim,
+            ]);
+        let projection = self.projection_norm.forward(&projection);
+        projection
+            .add(&per_layer_embeds)
+            .multiply(&Array::from_f32(self.input_scale))
+    }
+}
+
+#[derive(Debug)]
+pub struct Gemma4PerLayerInputBlock {
+    pub gate_proj: nn::Linear,
+    pub projection: nn::Linear,
+    pub post_norm: Gemma4RmsNorm,
+}
+impl_module_params!(Gemma4PerLayerInputBlock; gate_proj, projection, post_norm);
+
+impl Gemma4PerLayerInputBlock {
+    pub fn new(config: &Gemma4Config) -> Result<Self, Exception> {
+        let per_layer_dim = config.per_layer_input_dim();
+        Ok(Self {
+            gate_proj: nn::LinearBuilder::new(config.hidden_size, per_layer_dim)
+                .bias(false)
+                .build()?,
+            projection: nn::LinearBuilder::new(per_layer_dim, config.hidden_size)
+                .bias(false)
+                .build()?,
+            post_norm: Gemma4RmsNorm::new(config.hidden_size, config.rms_norm_eps),
+        })
+    }
+
+    pub fn forward(&mut self, hidden: &Array, layer_input: &Array) -> Result<Array, Exception> {
+        let residual = hidden.clone();
+        let gate = self.gate_proj.forward(hidden);
+        let activated = nn::gelu_tanh_approximate(&gate);
+        let projected = self.projection.forward(&activated.multiply(layer_input));
+        let projected = self.post_norm.forward(&projected);
+        Ok(residual.add(&projected))
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -571,17 +716,73 @@ impl Gemma4Attention {
         })
     }
 
-    pub fn forward(
-        &mut self,
-        x: &Array,
+    fn attention_mask_type(
+        &self,
+        query_len: i32,
+        key_len: i32,
         mask: Option<&Array>,
-        mut cache: Option<(&mut KVCache, usize)>,
+    ) -> AttentionMaskType {
+        if mask.is_some() {
+            AttentionMaskType::None
+        } else if let Some(w) = self.sliding_window {
+            if query_len == 1 && key_len <= w {
+                AttentionMaskType::None
+            } else {
+                AttentionMaskType::SlidingWindow(w)
+            }
+        } else if query_len == 1 {
+            AttentionMaskType::None
+        } else {
+            AttentionMaskType::Causal
+        }
+    }
+
+    fn attend(
+        &mut self,
+        q: &Array,
+        k: &Array,
+        v: &Array,
+        mask: Option<&Array>,
     ) -> Result<Array, Exception> {
+        let query_len = q.dim(2);
+        let key_len = k.dim(2);
+        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+            .with_scale(1.0)
+            .with_mask_type(self.attention_mask_type(query_len, key_len, mask));
+        let output = fused_sdpa(q, k, v, &attn_config, mask)?;
+        let b = q.dim(0);
+        let output = output.transpose_axes(&[0, 2, 1, 3]).reshape(&[
+            b,
+            query_len,
+            self.n_heads * self.head_dim,
+        ]);
+        Ok(self.o_proj.forward(&output))
+    }
+
+    fn project_queries(&mut self, x: &Array, offset: i32) -> Result<Array, Exception> {
+        let shape = x.shape();
+        let b = shape[0];
+        let l = shape[1];
+        let q = self
+            .q_proj
+            .forward(x)
+            .reshape(&[b, l, self.n_heads, self.head_dim]);
+        let q = self.q_norm.forward(&q).transpose_axes(&[0, 2, 1, 3]);
+        apply_gemma4_partial_rope(
+            &q,
+            self.head_dim,
+            self.rope_partial_dims,
+            self.rope_base,
+            offset,
+            self.rope_partial_freqs.as_ref(),
+        )
+    }
+
+    fn project_qkv(&mut self, x: &Array, offset: i32) -> Result<(Array, Array, Array), Exception> {
         let shape = x.shape();
         let b = shape[0];
         let l = shape[1];
 
-        // Projections
         let q = self
             .q_proj
             .forward(x)
@@ -590,10 +791,6 @@ impl Gemma4Attention {
             .k_proj
             .forward(x)
             .reshape(&[b, l, self.n_kv_heads, self.head_dim]);
-
-        // v comes from k_proj (pre-norm) when k_eq_v; otherwise from v_proj.
-        // Bind through `as_ref` so we call the inherent `Linear::forward`
-        // (&self → Array), not the trait method (&mut self → Result).
         let v_raw = match self.v_proj.as_ref() {
             Some(v_proj) => v_proj
                 .forward(x)
@@ -601,19 +798,10 @@ impl Gemma4Attention {
             None => k.clone(),
         };
 
-        // Normalise: q_norm, k_norm are learnable RMSNorm; v is RMSNorm without scale.
-        let q = self.q_norm.forward(&q);
-        let k = self.k_norm.forward(&k);
-        let v = rms_norm_noscale(&v_raw, self.rms_norm_eps);
+        let q = self.q_norm.forward(&q).transpose_axes(&[0, 2, 1, 3]);
+        let k = self.k_norm.forward(&k).transpose_axes(&[0, 2, 1, 3]);
+        let v = rms_norm_noscale(&v_raw, self.rms_norm_eps).transpose_axes(&[0, 2, 1, 3]);
 
-        // Transpose to [B, H, L, D] for SDPA.
-        let q = q.transpose_axes(&[0, 2, 1, 3]);
-        let k = k.transpose_axes(&[0, 2, 1, 3]);
-        let v = v.transpose_axes(&[0, 2, 1, 3]);
-
-        // Partial / full RoPE via Gemma 4's ProportionalRoPE math (see
-        // `apply_gemma4_partial_rope` for the freq derivation).
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
         let partial_freqs = self.rope_partial_freqs.as_ref();
         let q = apply_gemma4_partial_rope(
             &q,
@@ -631,6 +819,17 @@ impl Gemma4Attention {
             offset,
             partial_freqs,
         )?;
+        Ok((q, k, v))
+    }
+
+    pub fn forward(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        mut cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let (q, k, v) = self.project_qkv(x, offset)?;
 
         // Update KV cache.
         let (k, v) = if let Some((cache_ref, layer_idx)) = cache.as_mut() {
@@ -639,40 +838,30 @@ impl Gemma4Attention {
             (k, v)
         };
 
-        // SDPA with scale=1.0 (Gemma 4 bakes the scale into the weights).
-        // For decode (`query_len == 1`) where the entire KV cache fits
-        // inside the sliding window, we can skip mask construction
-        // entirely — mlx's fast SDPA handles "no mask" as the cheapest
-        // path. mlx-lm relies on the same observation in
-        // `create_attention_mask` (returns `None` for `N == 1`).
-        let query_len = q.dim(2);
-        let key_len = k.dim(2);
-        let mask_type = if mask.is_some() {
-            AttentionMaskType::None
-        } else if let Some(w) = self.sliding_window {
-            if query_len == 1 && key_len <= w {
-                AttentionMaskType::None
-            } else {
-                AttentionMaskType::SlidingWindow(w)
-            }
-        } else if query_len == 1 {
-            // Decode against an attention cache: the single query is by
-            // construction at the last position, so causal masking is a
-            // no-op. Skip the mask build to match mlx-lm's fast path.
-            AttentionMaskType::None
-        } else {
-            AttentionMaskType::Causal
-        };
-        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
-            .with_scale(1.0)
-            .with_mask_type(mask_type);
-        let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
+        self.attend(&q, &k, &v, mask)
+    }
 
-        let output =
-            output
-                .transpose_axes(&[0, 2, 1, 3])
-                .reshape(&[b, l, self.n_heads * self.head_dim]);
-        Ok(self.o_proj.forward(&output))
+    pub fn forward_collect_kv(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        offset: i32,
+    ) -> Result<(Array, Array, Array), Exception> {
+        let (q, k, v) = self.project_qkv(x, offset)?;
+        let output = self.attend(&q, &k, &v, mask)?;
+        Ok((output, k, v))
+    }
+
+    pub fn forward_with_shared_kv(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        source_keys: &Array,
+        source_values: &Array,
+        offset: i32,
+    ) -> Result<Array, Exception> {
+        let q = self.project_queries(x, offset)?;
+        self.attend(&q, source_keys, source_values, mask)
     }
 }
 
@@ -688,10 +877,12 @@ pub struct Gemma4DecoderLayer {
     pub pre_feedforward_layernorm: Gemma4RmsNorm,
     pub mlp: Gemma4Mlp,
     pub post_feedforward_layernorm: Gemma4RmsNorm,
+    pub per_layer_input_block: Option<Gemma4PerLayerInputBlock>,
     /// Per-layer scalar multiplier. The reference stores it as a 1-element
     /// tensor initialised to 1.0; applied as `h = h * layer_scalar` at the
     /// end of the layer forward.
     pub layer_scalar: Param<Array>,
+    pub kv_shared_source_layer: Option<usize>,
 }
 impl_module_params!(
     Gemma4DecoderLayer;
@@ -701,6 +892,7 @@ impl_module_params!(
     pre_feedforward_layernorm,
     mlp,
     post_feedforward_layernorm,
+    per_layer_input_block,
     layer_scalar
 );
 
@@ -713,8 +905,38 @@ impl Gemma4DecoderLayer {
             pre_feedforward_layernorm: Gemma4RmsNorm::new(config.hidden_size, config.rms_norm_eps),
             mlp: Gemma4Mlp::new(config)?,
             post_feedforward_layernorm: Gemma4RmsNorm::new(config.hidden_size, config.rms_norm_eps),
+            per_layer_input_block: if config.uses_per_layer_inputs() {
+                Some(Gemma4PerLayerInputBlock::new(config)?)
+            } else {
+                None
+            },
             layer_scalar: Param::new(Array::ones_f32(&[1])),
+            kv_shared_source_layer: config.kv_shared_source_layer(layer_idx),
         })
+    }
+
+    fn finish_forward(
+        &mut self,
+        residual_in: &Array,
+        attn_out: &Array,
+        layer_input: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let h = self.post_attention_layernorm.forward(attn_out);
+        let h = residual_in.add(&h);
+
+        let residual = h.clone();
+        let h = self.pre_feedforward_layernorm.forward(&h);
+        let h = self.mlp.forward(&h)?;
+        let h = self.post_feedforward_layernorm.forward(&h);
+        let mut h = residual.add(&h);
+
+        if let Some(layer_input) = layer_input
+            && let Some(ref mut block) = self.per_layer_input_block
+        {
+            h = block.forward(&h, layer_input)?;
+        }
+
+        Ok(h.multiply(self.layer_scalar.as_ref()))
     }
 
     pub fn forward(
@@ -722,6 +944,7 @@ impl Gemma4DecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        layer_input: Option<&Array>,
     ) -> Result<Array, Exception> {
         // Dynamic-path decoder (used by training, parity tests, and
         // generation when the native bridge isn't available). The fused
@@ -732,16 +955,38 @@ impl Gemma4DecoderLayer {
         let residual = x.clone();
         let h = self.input_layernorm.forward(x);
         let h = self.self_attn.forward(&h, mask, cache)?;
-        let h = self.post_attention_layernorm.forward(&h);
-        let h = residual.add(&h);
+        self.finish_forward(&residual, &h, layer_input)
+    }
 
-        let residual = h.clone();
-        let h = self.pre_feedforward_layernorm.forward(&h);
-        let h = self.mlp.forward(&h)?;
-        let h = self.post_feedforward_layernorm.forward(&h);
-        let h = residual.add(&h);
+    pub fn forward_collect_kv(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        offset: i32,
+        layer_input: Option<&Array>,
+    ) -> Result<(Array, Array, Array), Exception> {
+        let residual = x.clone();
+        let h = self.input_layernorm.forward(x);
+        let (attn_out, keys, values) = self.self_attn.forward_collect_kv(&h, mask, offset)?;
+        let hidden = self.finish_forward(&residual, &attn_out, layer_input)?;
+        Ok((hidden, keys, values))
+    }
 
-        Ok(h.multiply(self.layer_scalar.as_ref()))
+    pub fn forward_with_shared_kv(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        source_keys: &Array,
+        source_values: &Array,
+        offset: i32,
+        layer_input: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let residual = x.clone();
+        let h = self.input_layernorm.forward(x);
+        let attn_out =
+            self.self_attn
+                .forward_with_shared_kv(&h, mask, source_keys, source_values, offset)?;
+        self.finish_forward(&residual, &attn_out, layer_input)
     }
 }
 
@@ -752,17 +997,23 @@ impl Gemma4DecoderLayer {
 #[derive(Debug)]
 pub struct Gemma4Model {
     pub embed_tokens: nn::Embedding,
+    pub per_layer_inputs: Option<Gemma4PerLayerInputs>,
     pub layers: Vec<Gemma4DecoderLayer>,
     pub norm: Gemma4RmsNorm,
     pub config: Gemma4Config,
     pub embed_scale: f32,
 }
-impl_module_params!(Gemma4Model; embed_tokens, layers, norm);
+impl_module_params!(Gemma4Model; embed_tokens, per_layer_inputs, layers, norm);
 
 impl Gemma4Model {
     pub fn new(config: Gemma4Config) -> Result<Self, Exception> {
         config.pruned_unsupported_blocks()?;
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
+        let per_layer_inputs = if config.uses_per_layer_inputs() {
+            Some(Gemma4PerLayerInputs::new(&config)?)
+        } else {
+            None
+        };
         let layers = (0..config.num_hidden_layers as usize)
             .map(|i| Gemma4DecoderLayer::new(&config, i))
             .collect::<Result<Vec<_>, _>>()?;
@@ -770,6 +1021,7 @@ impl Gemma4Model {
         let embed_scale = (config.hidden_size as f32).sqrt();
         Ok(Self {
             embed_tokens,
+            per_layer_inputs,
             layers,
             norm,
             config,
@@ -796,14 +1048,69 @@ impl Gemma4Model {
         let mut h = self.embed_tokens.forward(input_ids);
         let scale = Array::from_f32(self.embed_scale);
         h = h.multiply(&scale);
+        let per_layer_inputs = self
+            .per_layer_inputs
+            .as_ref()
+            .map(|inputs| inputs.compute(input_ids, &h));
+        let mut local_shared_kv = if cache.is_none() && self.config.num_kv_shared_layers() > 0 {
+            Some((0..self.layers.len()).map(|_| None).collect::<Vec<_>>())
+        } else {
+            None
+        };
         if let Some(buf) = capture.as_deref_mut()
             && buf.wants_embedding()
         {
             buf.record_embedding(h.clone());
         }
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            let c = cache.as_deref_mut().map(|c| (c, i));
-            h = layer.forward(&h, mask, c)?;
+            let layer_input = per_layer_inputs
+                .as_ref()
+                .map(|inputs| layer_per_input(inputs, i));
+            let layer_input_ref = layer_input.as_ref();
+            if let Some(shared_source) = layer.kv_shared_source_layer {
+                let rope_offset = cache.as_ref().map(|c| c.rope_offset()).unwrap_or(0);
+                if let Some(cache_ref) = cache.as_ref() {
+                    let (source_keys, source_values) = cache_ref.get(shared_source).ok_or_else(|| {
+                        Exception::custom(format!(
+                            "Gemma 4 shared-KV layer {i} missing source layer {shared_source} cache"
+                        ))
+                    })?;
+                    h = layer.forward_with_shared_kv(
+                        &h,
+                        mask,
+                        &source_keys,
+                        &source_values,
+                        rope_offset,
+                        layer_input_ref,
+                    )?;
+                } else {
+                    let (source_keys, source_values) = local_shared_kv
+                        .as_ref()
+                        .and_then(|entries| entries.get(shared_source))
+                        .and_then(|entry| entry.as_ref())
+                        .ok_or_else(|| {
+                            Exception::custom(format!(
+                                "Gemma 4 shared-KV layer {i} missing source layer {shared_source} activations"
+                            ))
+                        })?;
+                    h = layer.forward_with_shared_kv(
+                        &h,
+                        mask,
+                        source_keys,
+                        source_values,
+                        rope_offset,
+                        layer_input_ref,
+                    )?;
+                }
+            } else if let Some(ref mut shared_kv) = local_shared_kv {
+                let (next_h, keys, values) =
+                    layer.forward_collect_kv(&h, mask, 0, layer_input_ref)?;
+                shared_kv[i] = Some((keys, values));
+                h = next_h;
+            } else {
+                let c = cache.as_deref_mut().map(|c| (c, i));
+                h = layer.forward(&h, mask, c, layer_input_ref)?;
+            }
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(i)
             {
@@ -920,6 +1227,28 @@ pub fn load_gemma4_weights(
         model.model.norm.weight = Param::new(w.clone());
         report.loaded += 1;
     }
+    if let Some(ref mut per_layer_inputs) = model.model.per_layer_inputs {
+        if let Some(w) = weights.get("model.embed_tokens_per_layer.weight") {
+            per_layer_inputs.embed_tokens.weight = Param::new(w.clone());
+            report.loaded += 1;
+        } else {
+            report
+                .skipped
+                .push("model.embed_tokens_per_layer.weight".to_string());
+        }
+        load_linear(
+            &mut per_layer_inputs.model_projection,
+            &weights,
+            "model.per_layer_model_projection",
+            &mut report,
+        );
+        load_norm(
+            &mut per_layer_inputs.projection_norm.weight,
+            &weights,
+            "model.per_layer_projection_norm.weight",
+            &mut report,
+        );
+    }
 
     for (layer_idx, layer) in model.model.layers.iter_mut().enumerate() {
         let prefix = format!("model.layers.{layer_idx}");
@@ -963,6 +1292,26 @@ pub fn load_gemma4_weights(
             &format!("{prefix}.self_attn.k_norm.weight"),
             &mut report,
         );
+        if let Some(ref mut block) = layer.per_layer_input_block {
+            load_linear(
+                &mut block.gate_proj,
+                &weights,
+                &format!("{prefix}.per_layer_input_gate"),
+                &mut report,
+            );
+            load_linear(
+                &mut block.projection,
+                &weights,
+                &format!("{prefix}.per_layer_projection"),
+                &mut report,
+            );
+            load_norm(
+                &mut block.post_norm.weight,
+                &weights,
+                &format!("{prefix}.post_per_layer_input_norm.weight"),
+                &mut report,
+            );
+        }
 
         load_linear(
             &mut layer.self_attn.q_proj,

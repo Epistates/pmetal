@@ -132,6 +132,15 @@ impl CausalLm for architectures::Qwen3NextForCausalLM {
     }
 }
 
+impl CausalLm for architectures::Gemma4ForCausalLM {
+    fn forward_logits(&mut self, input_ids: &Array) -> Result<Array, Exception> {
+        self.forward(input_ids, None)
+    }
+    fn vocab_size(&self) -> i32 {
+        self.config.vocab_size
+    }
+}
+
 // Qwen3 MoE has 3-arg forward like GptOss (input_ids, mask, cache)
 impl CausalLm for architectures::Qwen3MoE {
     fn forward_logits(&mut self, input_ids: &Array) -> Result<Array, Exception> {

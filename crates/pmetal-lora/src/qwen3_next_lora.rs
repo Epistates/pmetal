@@ -2233,11 +2233,16 @@ impl crate::TrainableModel for Qwen3NextLoraForCausalLM {
     }
 
     fn supports_kv_cache(&self) -> bool {
-        true
+        // Qwen3Next is hybrid (GDN + attention). Training-side `TrainableModel`
+        // only exposes `KVCache`; GDN layers additionally require `MambaCache`,
+        // which is not threadable through this trait. Callers that need the
+        // hybrid cache must use `Qwen3NextLoraForCausalLM::forward_with_cache`
+        // directly.
+        false
     }
 
-    fn create_cache(&self, max_seq_len: usize) -> Option<KVCache> {
-        Some(Qwen3NextLoraForCausalLM::create_cache(self, max_seq_len))
+    fn create_cache(&self, _max_seq_len: usize) -> Option<KVCache> {
+        None
     }
 
     fn forward_hidden(

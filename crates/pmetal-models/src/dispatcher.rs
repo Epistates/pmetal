@@ -97,7 +97,7 @@ impl ModelArchitecture {
     pub fn from_model_type(model_type: &str) -> Option<Self> {
         let lower = model_type.to_lowercase();
         match lower.as_str() {
-            "llama4" => Some(Self::Llama4),
+            "llama4" | "llama4_text" => Some(Self::Llama4),
             "llama" | "llama3" => Some(Self::Llama),
             "qwen3_moe" => Some(Self::Qwen3MoE),
             "gpt_oss" | "gptoss" | "gpt-oss" => Some(Self::GptOss),
@@ -156,6 +156,9 @@ impl ModelArchitecture {
             if lower.contains("qwen2") || lower.contains("qwen") {
                 return Some(Self::Qwen2);
             }
+            if lower.contains("gemma4") {
+                return Some(Self::Gemma4);
+            }
             if lower.contains("gemma") {
                 if lower.contains("recurrent") {
                     return Some(Self::RecurrentGemma);
@@ -183,9 +186,6 @@ impl ModelArchitecture {
             }
             if lower.contains("gptoss") || lower.contains("gpt_oss") || lower.contains("gpt-oss") {
                 return Some(Self::GptOss);
-            }
-            if lower.contains("gemma4") {
-                return Some(Self::Gemma4);
             }
             if lower.contains("nemotronhforcausallm") || lower.contains("nemotron_h") {
                 return Some(Self::NemotronH);
@@ -462,13 +462,35 @@ impl DynamicModel {
                 model_dir,
                 Llama
             ),
-            ModelArchitecture::Llama4 => simple_load!(
-                Llama4TextConfig,
-                Llama4ForCausalLM::new,
-                &config_content,
-                model_dir,
-                Llama4
-            ),
+            ModelArchitecture::Llama4 => {
+                let config_json: serde_json::Value = serde_json::from_str(&config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let effective = if config_json.get("text_config").is_some()
+                    && config_json.get("hidden_size").is_none()
+                {
+                    serde_json::to_string(&config_json["text_config"])
+                        .map_err(|e| Exception::custom(e.to_string()))?
+                } else {
+                    config_content.clone()
+                };
+                let config: Llama4TextConfig =
+                    json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model = Llama4ForCausalLM::new(config)?;
+                let weights = crate::loader::load_weights(model_dir)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                let mut params = model.flatten_params_mut();
+                for (key, value) in weights {
+                    let remapped = key
+                        .strip_prefix("model.language_model.")
+                        .map(|rest| format!("model.{rest}"))
+                        .unwrap_or(key);
+                    if let Some(param) = params.get_mut(&remapped) {
+                        **param = value;
+                    }
+                }
+                eval_module_parameters_batched(&model)?;
+                Ok(Self::Llama4(model))
+            }
             ModelArchitecture::Qwen2 => simple_load!(
                 Qwen2Config,
                 Qwen2ForCausalLM::new,
@@ -1371,11 +1393,28 @@ mod tests {
     }
 
     #[test]
+    fn llama4_text_model_type_detects_as_llama4() {
+        assert_eq!(
+            ModelArchitecture::from_model_type("llama4_text"),
+            Some(ModelArchitecture::Llama4)
+        );
+    }
+
+    #[test]
     fn qwen35_moe_architecture_string_detects_as_qwen3_next() {
         let architectures = vec!["Qwen3_5_MoeForConditionalGeneration".to_string()];
         assert_eq!(
             ModelArchitecture::from_architectures(&architectures),
             Some(ModelArchitecture::Qwen3Next)
+        );
+    }
+
+    #[test]
+    fn gemma4_architecture_string_detects_as_gemma4_not_gemma3() {
+        let architectures = vec!["Gemma4ForConditionalGeneration".to_string()];
+        assert_eq!(
+            ModelArchitecture::from_architectures(&architectures),
+            Some(ModelArchitecture::Gemma4)
         );
     }
 

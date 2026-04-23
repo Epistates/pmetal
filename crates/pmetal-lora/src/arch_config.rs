@@ -67,7 +67,9 @@ use pmetal_models::ModelConfig;
 use pmetal_models::architectures::llama::LlamaConfig;
 use pmetal_models::architectures::mistral::MistralConfig;
 use pmetal_models::architectures::qwen3::Qwen3Config;
+use pmetal_models::architectures::qwen3_moe::Qwen3MoEConfig;
 use pmetal_models::architectures::qwen3_next::Qwen3NextConfig;
+use pmetal_models::architectures::{gemma4::Gemma4Config, gpt_oss::GptOssConfig};
 
 impl LoraArchitectureConfig for LlamaConfig {
     fn hidden_size(&self) -> i32 {
@@ -238,6 +240,148 @@ impl LoraArchitectureConfig for Qwen3NextConfig {
 
     fn rms_norm_eps(&self) -> f32 {
         self.rms_norm_eps
+    }
+
+    fn num_hidden_layers(&self) -> i32 {
+        self.num_hidden_layers
+    }
+
+    fn vocab_size(&self) -> i32 {
+        self.vocab_size
+    }
+
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+}
+
+impl LoraArchitectureConfig for Qwen3MoEConfig {
+    fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+
+    fn num_attention_heads(&self) -> i32 {
+        self.num_attention_heads
+    }
+
+    fn num_kv_heads(&self) -> i32 {
+        self.num_kv_heads()
+    }
+
+    fn head_dim(&self) -> i32 {
+        self.head_dim
+    }
+
+    fn intermediate_size(&self) -> i32 {
+        self.intermediate_size
+    }
+
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta
+    }
+
+    fn rms_norm_eps(&self) -> f32 {
+        self.rms_norm_eps
+    }
+
+    fn num_hidden_layers(&self) -> i32 {
+        self.num_hidden_layers
+    }
+
+    fn vocab_size(&self) -> i32 {
+        self.vocab_size
+    }
+
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+}
+
+impl LoraArchitectureConfig for Gemma4Config {
+    fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+
+    fn num_attention_heads(&self) -> i32 {
+        self.num_attention_heads
+    }
+
+    fn num_kv_heads(&self) -> i32 {
+        self.num_key_value_heads
+    }
+
+    fn head_dim(&self) -> i32 {
+        self.head_dim
+    }
+
+    fn intermediate_size(&self) -> i32 {
+        self.intermediate_size
+    }
+
+    fn rope_theta(&self) -> f32 {
+        self.layer_rope(0).0
+    }
+
+    fn sliding_window(&self) -> Option<i32> {
+        Some(self.sliding_window)
+    }
+
+    fn rms_norm_eps(&self) -> f32 {
+        self.rms_norm_eps
+    }
+
+    fn hidden_act(&self) -> &str {
+        self.hidden_activation.as_deref().unwrap_or("gelu_tanh")
+    }
+
+    fn num_hidden_layers(&self) -> i32 {
+        self.num_hidden_layers
+    }
+
+    fn vocab_size(&self) -> i32 {
+        self.vocab_size
+    }
+
+    fn tie_word_embeddings(&self) -> bool {
+        self.tie_word_embeddings
+    }
+}
+
+impl LoraArchitectureConfig for GptOssConfig {
+    fn hidden_size(&self) -> i32 {
+        self.hidden_size
+    }
+
+    fn num_attention_heads(&self) -> i32 {
+        self.num_attention_heads
+    }
+
+    fn num_kv_heads(&self) -> i32 {
+        self.num_key_value_heads
+    }
+
+    fn head_dim(&self) -> i32 {
+        self.head_dim
+    }
+
+    fn intermediate_size(&self) -> i32 {
+        self.intermediate_size
+    }
+
+    fn rope_theta(&self) -> f32 {
+        self.rope_theta
+    }
+
+    fn sliding_window(&self) -> Option<i32> {
+        Some(self.sliding_window)
+    }
+
+    fn rms_norm_eps(&self) -> f32 {
+        self.rms_norm_eps
+    }
+
+    fn hidden_act(&self) -> &str {
+        &self.hidden_act
     }
 
     fn num_hidden_layers(&self) -> i32 {

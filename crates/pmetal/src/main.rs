@@ -3617,7 +3617,7 @@ async fn tokio_main() -> anyhow::Result<()> {
                 other => anyhow::bail!("unknown lr-schedule: {other}"),
             };
 
-            // Build model via factory (supports llama, qwen2, qwen3, gemma, mistral, phi, gpt-oss)
+            // Build model via factory (supports llama, qwen2, qwen3, gemma, gemma4, mistral, phi, gpt-oss)
             use pmetal_bridge::compat::module::ModuleParameters;
             let config_path = _model_config.as_deref().map(std::path::Path::new);
             let mut model = pretrain::create_model(&arch, config_path)?;

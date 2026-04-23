@@ -1260,17 +1260,17 @@ impl InferenceEngine {
                 };
             }
 
-            if stop_sequences.is_empty() {
-                if Self::try_accelerated_streaming_blocking(
+            if stop_sequences.is_empty()
+                && Self::try_accelerated_streaming_blocking(
                     &backend,
                     &model_path,
                     &input_ids,
                     &gen_config,
                     ane_max_seq_len,
                     &tx,
-                ) {
-                    return;
-                }
+                )
+            {
+                return;
             }
 
             let max_tokens = gen_config.max_new_tokens;

@@ -1284,21 +1284,21 @@ impl LoraLinear {
 pub struct GptOssLoraAttention {
     /// Layer index.
     #[allow(dead_code)] // Retained for debugging and future layer-aware LoRA scheduling
-    layer_idx: usize,
+    pub layer_idx: usize,
     /// Number of attention heads.
-    n_heads: i32,
+    pub n_heads: i32,
     /// Number of KV heads.
-    n_kv_heads: i32,
+    pub n_kv_heads: i32,
     /// Head dimension.
-    head_dim: i32,
+    pub head_dim: i32,
     /// Attention scale.
-    scale: f32,
+    pub scale: f32,
     /// RoPE theta.
-    rope_theta: f32,
+    pub rope_theta: f32,
     /// Sliding window size.
-    sliding_window: i32,
+    pub sliding_window: i32,
     /// Attention type.
-    attention_type: AttentionType,
+    pub attention_type: AttentionType,
     /// Query projection with LoRA.
     pub q_proj: LoraLinear,
     /// Key projection with LoRA.
@@ -1475,7 +1475,7 @@ pub struct GptOssLoraDecoderLayer {
     /// Self-attention with LoRA.
     pub self_attn: GptOssLoraAttention,
     /// MoE (no LoRA - too many experts).
-    mlp: GptOssMoE,
+    pub mlp: GptOssMoE,
     /// Input layer norm.
     pub input_layernorm: nn::RmsNorm,
     /// Post-attention layer norm.

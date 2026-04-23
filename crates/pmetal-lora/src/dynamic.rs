@@ -32,9 +32,11 @@ use pmetal_models::{
 };
 
 use crate::{
-    LoraError, TrainableModel, gemma_lora::GemmaLoraForCausalLM, llama_lora::LlamaLoraForCausalLM,
-    mistral_lora::MistralLoraForCausalLM, phi_lora::PhiLoraForCausalLM,
-    qwen3_lora::Qwen3LoraForCausalLM, qwen3_next_lora::Qwen3NextLoraForCausalLM,
+    LoraError, TrainableModel, gemma_lora::GemmaLoraForCausalLM,
+    gemma4_lora::Gemma4LoraForCausalLM, gpt_oss_lora::GptOssLoraForCausalLM,
+    llama_lora::LlamaLoraForCausalLM, mistral_lora::MistralLoraForCausalLM,
+    phi_lora::PhiLoraForCausalLM, qwen3_lora::Qwen3LoraForCausalLM,
+    qwen3_moe_lora::Qwen3MoELoraForCausalLM, qwen3_next_lora::Qwen3NextLoraForCausalLM,
 };
 
 /// Dispatch a method call uniformly across all `DynamicLoraModel` variants.
@@ -50,6 +52,9 @@ macro_rules! dispatch_lora_uniform {
             Self::Gemma(m) => m.$method($($arg),*),
             Self::Phi(m) => m.$method($($arg),*),
             Self::Qwen3Next(m) => m.$method($($arg),*),
+            Self::Qwen3MoE(m) => m.$method($($arg),*),
+            Self::Gemma4(m) => m.$method($($arg),*),
+            Self::GptOss(m) => m.$method($($arg),*),
         }
     };
 }
@@ -64,6 +69,9 @@ macro_rules! dispatch_lora_architecture {
             Self::Gemma(_) => ModelArchitecture::Gemma,
             Self::Phi(_) => ModelArchitecture::Phi,
             Self::Qwen3Next(_) => ModelArchitecture::Qwen3Next,
+            Self::Qwen3MoE(_) => ModelArchitecture::Qwen3MoE,
+            Self::Gemma4(_) => ModelArchitecture::Gemma4,
+            Self::GptOss(_) => ModelArchitecture::GptOss,
         }
     };
 }
@@ -95,6 +103,12 @@ macro_rules! dispatch_lora_architecture {
 /// | QLoRA | Yes | Yes | Yes | Yes | — | — |
 /// | Gradient Checkpointing | Yes | Yes | No | Yes | Yes | No |
 /// | Packed Sequences | Yes | Yes | Yes | Yes | Yes | Yes |
+// The Gemma4 variant (per-layer embeddings + KV-sharing bookkeeping) is
+// ~1.6 KB vs ~960 B for the next-largest variant. This enum is constructed
+// once per training run and dispatched through references, not copied, so the
+// size delta is not on any hot path — boxing would just churn the ~20-method
+// TrainableModel dispatch sites.
+#[allow(clippy::large_enum_variant)]
 pub enum DynamicLoraModel {
     /// Llama family with LoRA adapters (supports gradient checkpointing).
     Llama(LlamaLoraForCausalLM),
@@ -108,6 +122,12 @@ pub enum DynamicLoraModel {
     Phi(PhiLoraForCausalLM),
     /// Qwen3.5 (qwen3_next) hybrid family with LoRA adapters.
     Qwen3Next(Qwen3NextLoraForCausalLM),
+    /// Qwen3-MoE family with attention + router/dense-MLP adapters.
+    Qwen3MoE(Qwen3MoELoraForCausalLM),
+    /// Gemma4 family with PLE-aware adapters.
+    Gemma4(Gemma4LoraForCausalLM),
+    /// GPT-OSS family with attention adapters.
+    GptOss(GptOssLoraForCausalLM),
 }
 
 impl std::fmt::Debug for DynamicLoraModel {
@@ -119,6 +139,9 @@ impl std::fmt::Debug for DynamicLoraModel {
             Self::Gemma(_) => write!(f, "DynamicLoraModel::Gemma"),
             Self::Phi(_) => write!(f, "DynamicLoraModel::Phi"),
             Self::Qwen3Next(_) => write!(f, "DynamicLoraModel::Qwen3Next"),
+            Self::Qwen3MoE(_) => write!(f, "DynamicLoraModel::Qwen3MoE"),
+            Self::Gemma4(_) => write!(f, "DynamicLoraModel::Gemma4"),
+            Self::GptOss(_) => write!(f, "DynamicLoraModel::GptOss"),
         }
     }
 }
@@ -247,6 +270,47 @@ impl DynamicLoraModel {
 
                 tracing::info!("Loaded Qwen3.5 (qwen3_next) LoRA model");
                 Ok(DynamicLoraModel::Qwen3Next(model))
+            }
+            ModelArchitecture::Qwen3MoE => {
+                let qwen_config: pmetal_models::architectures::qwen3_moe::Qwen3MoEConfig =
+                    serde_json::from_str(&config_content)?;
+
+                let mut model = Qwen3MoELoraForCausalLM::new(qwen_config, lora_config)?;
+                model.load_base_weights_from_dir(model_dir)?;
+                model.eval_all()?;
+
+                tracing::info!("Loaded Qwen3-MoE LoRA model");
+                Ok(DynamicLoraModel::Qwen3MoE(model))
+            }
+            ModelArchitecture::Gemma4 => {
+                let config_json: serde_json::Value = serde_json::from_str(&config_content)?;
+                let effective = if config_json.get("text_config").is_some()
+                    && config_json.get("hidden_size").is_none()
+                {
+                    serde_json::to_string(&config_json["text_config"])?
+                } else {
+                    config_content.clone()
+                };
+                let gemma4_config: pmetal_models::architectures::gemma4::Gemma4Config =
+                    serde_json::from_str(&effective)?;
+
+                let mut model = Gemma4LoraForCausalLM::new(gemma4_config, lora_config)?;
+                model.load_base_weights_from_dir(model_dir)?;
+                model.eval_all()?;
+
+                tracing::info!("Loaded Gemma4 LoRA model");
+                Ok(DynamicLoraModel::Gemma4(model))
+            }
+            ModelArchitecture::GptOss => {
+                let gpt_oss_config: pmetal_models::architectures::gpt_oss::GptOssConfig =
+                    serde_json::from_str(&config_content)?;
+
+                let mut model = GptOssLoraForCausalLM::new(gpt_oss_config, lora_config)?;
+                model.load_base_weights_from_dir(model_dir)?;
+                model.eval_all()?;
+
+                tracing::info!("Loaded GPT-OSS LoRA model");
+                Ok(DynamicLoraModel::GptOss(model))
             }
             // Other architectures not yet supported for LoRA training
             arch => Err(DynamicLoraError::NotImplemented(arch)),
@@ -401,6 +465,9 @@ impl DynamicLoraModel {
             Self::Gemma(_) => "Gemma",
             Self::Phi(_) => "Phi",
             Self::Qwen3Next(_) => "Qwen3Next",
+            Self::Qwen3MoE(_) => "Qwen3MoE",
+            Self::Gemma4(_) => "Gemma4",
+            Self::GptOss(_) => "GptOss",
         }
     }
 
@@ -459,6 +526,28 @@ impl TrainableModel for DynamicLoraModel {
             Self::Gemma(m) => TrainableModel::forward(m, input_ids, mask),
             Self::Phi(m) => TrainableModel::forward(m, input_ids, mask),
             Self::Qwen3Next(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Qwen3MoE(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Gemma4(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::GptOss(m) => TrainableModel::forward(m, input_ids, mask),
+        }
+    }
+
+    fn forward_noised(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        noise_alpha: f32,
+    ) -> Result<Array, LoraError> {
+        match self {
+            Self::Llama(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::Mistral(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::Qwen3(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::Gemma(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::Phi(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::Qwen3Next(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::Qwen3MoE(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::Gemma4(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
+            Self::GptOss(m) => TrainableModel::forward_noised(m, input_ids, mask, noise_alpha),
         }
     }
 
@@ -476,6 +565,9 @@ impl TrainableModel for DynamicLoraModel {
             Self::Gemma(m) => TrainableModel::forward(m, input_ids, mask),
             Self::Phi(m) => TrainableModel::forward(m, input_ids, mask),
             Self::Qwen3Next(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Qwen3MoE(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::Gemma4(m) => TrainableModel::forward(m, input_ids, mask),
+            Self::GptOss(m) => TrainableModel::forward(m, input_ids, mask),
         }
     }
 
@@ -524,6 +616,9 @@ impl TrainableModel for DynamicLoraModel {
             Self::Gemma(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
             Self::Phi(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
             Self::Qwen3Next(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Qwen3MoE(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::Gemma4(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
+            Self::GptOss(m) => TrainableModel::forward_with_cache(m, input_ids, mask, cache),
         }
     }
 
@@ -535,6 +630,9 @@ impl TrainableModel for DynamicLoraModel {
             Self::Gemma(m) => TrainableModel::create_cache(m, max_seq_len),
             Self::Phi(m) => TrainableModel::create_cache(m, max_seq_len),
             Self::Qwen3Next(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::Qwen3MoE(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::Gemma4(m) => TrainableModel::create_cache(m, max_seq_len),
+            Self::GptOss(m) => TrainableModel::create_cache(m, max_seq_len),
         }
     }
 
@@ -546,6 +644,9 @@ impl TrainableModel for DynamicLoraModel {
             Self::Gemma(_) => true,
             Self::Phi(_) => true,
             Self::Qwen3Next(_) => true,
+            Self::Qwen3MoE(_) => true,
+            Self::Gemma4(_) => true,
+            Self::GptOss(_) => true,
         }
     }
 
@@ -641,7 +742,9 @@ pub enum DynamicLoraError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_models::architectures::{qwen3::Qwen3Config, qwen3_next::Qwen3NextConfig};
+    use pmetal_models::architectures::{
+        llama::LlamaConfig, qwen3::Qwen3Config, qwen3_next::Qwen3NextConfig,
+    };
 
     #[test]
     fn test_architecture_dispatch() {
@@ -661,6 +764,22 @@ mod tests {
         assert_eq!(
             ModelArchitecture::from_model_type("qwen2"),
             Some(ModelArchitecture::Qwen2)
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("qwen3_next"),
+            Some(ModelArchitecture::Qwen3Next)
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("qwen3_moe"),
+            Some(ModelArchitecture::Qwen3MoE)
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("gemma4_text"),
+            Some(ModelArchitecture::Gemma4)
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("gpt_oss"),
+            Some(ModelArchitecture::GptOss)
         );
     }
 
@@ -724,5 +843,43 @@ mod tests {
             .unwrap(),
         );
         assert!(!qwen3_next.supports_gradient_checkpointing());
+    }
+
+    #[test]
+    fn test_forward_noised_delegates_to_inner_model() {
+        let lora_config = LoraConfig {
+            r: 4,
+            alpha: 8.0,
+            dropout: 0.0,
+            use_rslora: false,
+            ..Default::default()
+        };
+        let mut model = DynamicLoraModel::Llama(
+            LlamaLoraForCausalLM::new(
+                LlamaConfig {
+                    vocab_size: 128,
+                    hidden_size: 32,
+                    intermediate_size: 64,
+                    num_hidden_layers: 2,
+                    num_attention_heads: 4,
+                    num_key_value_heads: Some(2),
+                    head_dim: Some(8),
+                    max_position_embeddings: 64,
+                    ..Default::default()
+                },
+                lora_config,
+            )
+            .unwrap(),
+        );
+
+        let input_ids = Array::from_i32_slice_shaped(&[1, 2, 3, 4], &[1, 4]);
+        let clean = model.forward(&input_ids, None).unwrap();
+        let noised = TrainableModel::forward_noised(&mut model, &input_ids, None, 10.0).unwrap();
+        let diff = clean.subtract(&noised);
+        let sq_sum = diff.multiply(&diff).sum(None).item_f32();
+        assert!(
+            sq_sum > 0.0,
+            "dynamic LoRA wrapper should delegate NEFTune instead of falling back to plain forward"
+        );
     }
 }

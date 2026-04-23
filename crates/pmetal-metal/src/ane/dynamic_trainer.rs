@@ -236,6 +236,8 @@ impl DynamicAneTrainerConfig {
             "nemotron_h",     // Mamba hybrid
             "recurrentgemma", // RG-LRU hybrid
             "jamba",          // Mamba hybrid
+            "gemma4",         // extra per-layer norms / KV-sharing / PLI blocks
+            "gemma4_text",
         ];
         if INCOMPATIBLE.contains(&model_type) {
             return Err(format!(
@@ -3070,6 +3072,18 @@ mod tests {
             "hidden_size": 768,
         });
         assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_err());
+    }
+
+    #[test]
+    fn test_ane_incompatible_gemma4() {
+        let config = serde_json::json!({
+            "model_type": "gemma4_text",
+            "hidden_size": 768,
+            "num_attention_heads": 12,
+        });
+        let result = DynamicAneTrainerConfig::is_ane_compatible(&config);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("hybrid/recurrent"));
     }
 
     #[test]
