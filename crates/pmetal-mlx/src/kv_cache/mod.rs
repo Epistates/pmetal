@@ -38,6 +38,7 @@
 //! }
 //! ```
 
+mod fused_batch;
 mod mamba;
 mod paged;
 mod quantized;
@@ -47,6 +48,7 @@ mod standard;
 mod tests;
 mod turboquant;
 
+pub use fused_batch::*;
 pub use mamba::*;
 pub use paged::*;
 pub use quantized::*;

@@ -948,13 +948,19 @@ impl GptOssMoE {
     }
 }
 
+impl crate::decoder_layer::MlpModule for GptOssMoE {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        GptOssMoE::forward(self, x)
+    }
+}
+
 /// GPT-OSS decoder layer.
 #[derive(Debug)]
 pub struct GptOssDecoderLayer {
     /// Self-attention.
     pub self_attn: GptOssAttention,
     /// MoE or dense MLP.
-    mlp: GptOssMoE,
+    pub mlp: GptOssMoE,
     /// Input layer norm.
     pub input_layernorm: nn::RmsNorm,
     /// Post-attention layer norm.
@@ -1174,6 +1180,67 @@ impl GptOssForCausalLM {
     /// Get the vocabulary size.
     pub fn vocab_size(&self) -> i32 {
         self.model.config.vocab_size
+    }
+
+    /// Fused batched decode forward for continuous-batching.
+    ///
+    /// GPT-OSS interleaves sliding-window and full-attention layers
+    /// (default: even layers slide with `config.sliding_window`, odd
+    /// layers full-attend). Attention bias is carried by the Q/K/V/O
+    /// projections themselves, so no helper changes are needed beyond
+    /// the per-layer sliding-window overlay. The stacked MoE block
+    /// handles `[N_active, 1, H]` natively via its 2-D flatten path.
+    pub fn forward_batched_impl(
+        &mut self,
+        input_ids: &Array,
+        active_indices: &[usize],
+        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+    ) -> Result<Array, Exception> {
+        use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
+
+        let cfg = &self.model.config;
+        let base_cfg = BatchedGqaAttnCfg::new(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.rope_theta,
+            1.0,
+        );
+        let window = cfg.sliding_window;
+        // Snapshot per-layer attention types so we don't borrow `self` twice
+        // during the mutable iteration over `self.model.layers`.
+        let attn_types: Vec<AttentionType> = (0..self.model.layers.len())
+            .map(|i| cfg.attention_type_at(i))
+            .collect();
+        let mut hidden = pmetal_bridge::compat::Module::forward(
+            &mut self.model.embed_tokens,
+            input_ids,
+        )?;
+        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
+            let attn_cfg = match attn_types[layer_idx] {
+                AttentionType::SlidingAttention => base_cfg.with_sliding_window(window),
+                AttentionType::FullAttention => base_cfg,
+            };
+            hidden = batched_prenorm_layer(
+                &hidden,
+                &mut layer.input_layernorm,
+                &mut layer.self_attn.q_proj,
+                &mut layer.self_attn.k_proj,
+                &mut layer.self_attn.v_proj,
+                &mut layer.self_attn.o_proj,
+                None,
+                None,
+                &mut layer.post_attention_layernorm,
+                &mut layer.mlp,
+                &attn_cfg,
+                cache,
+                active_indices,
+                layer_idx,
+            )?;
+        }
+        let hidden =
+            pmetal_bridge::compat::Module::forward(&mut self.model.norm, &hidden)?;
+        pmetal_bridge::compat::Module::forward(&mut self.lm_head, &hidden)
     }
 }
 

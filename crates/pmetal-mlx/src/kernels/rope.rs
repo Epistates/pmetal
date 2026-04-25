@@ -393,6 +393,121 @@ pub fn apply_rope_with_positions(
     }
 }
 
+/// Apply RoPE with per-batch-row position IDs.
+///
+/// Sibling of [`apply_rope_with_positions`] for the fused continuous-batching
+/// decode path. Each batch row carries its own absolute offsets, so the
+/// computed cos/sin are broadcast as `[batch, 1, seq_len, half_dims]` rather
+/// than `[1, 1, seq_len, half_dims]`.
+///
+/// # Arguments
+/// * `x` - Input tensor of shape `[batch, heads, seq_len, head_dim]`
+/// * `position_ids` - Position indices of shape `[batch, seq_len]` (int32)
+/// * `dims` - Number of dimensions to apply RoPE to
+/// * `traditional` - If true, use traditional (interleaved) RoPE
+/// * `base` - Base frequency for the embeddings
+/// * `scale` - Scale factor for positions
+pub fn apply_rope_with_per_batch_positions(
+    x: &Array,
+    position_ids: &Array,
+    dims: i32,
+    traditional: bool,
+    base: f32,
+    scale: f32,
+) -> Result<Array, Exception> {
+    let shape = x.shape();
+    if shape.len() != 4 {
+        return Err(Exception::custom(format!(
+            "apply_rope_with_per_batch_positions: expected rank-4 input, got {shape:?}"
+        )));
+    }
+    let batch = shape[0];
+    let head_dim = shape[3];
+    let half_dims = dims / 2;
+
+    let pos_shape = position_ids.shape();
+    if pos_shape.len() != 2 || pos_shape[0] != batch {
+        return Err(Exception::custom(format!(
+            "apply_rope_with_per_batch_positions: position_ids must be [batch={batch}, seq_len], got {pos_shape:?}"
+        )));
+    }
+
+    // inv_freq[i] = base ^ (-2i / dims)
+    let indices = ops::arange_range(0, half_dims);
+    let neg_two_over_dims = Array::from_f32(-2.0 / dims as f32);
+    let exponents = indices.multiply(&neg_two_over_dims);
+    let base_arr = Array::from_f32(base);
+    let inv_freq = base_arr.pow(&exponents); // [half_dims]
+
+    // scaled positions: [batch, seq_len]
+    let pos_float = position_ids.as_dtype(Dtype::Float32.as_i32());
+    let scale_arr = Array::from_f32(scale);
+    let scaled_pos = pos_float.multiply(&scale_arr);
+
+    // angles: [batch, seq_len, half_dims]
+    let pos_expanded = scaled_pos.expand_dims(-1); // [batch, seq_len, 1]
+    let inv_freq_expanded = inv_freq.reshape(&[1, 1, half_dims]); // [1, 1, half_dims]
+    let angles = pos_expanded.multiply(&inv_freq_expanded);
+
+    let cos_theta = angles.cos();
+    let sin_theta = angles.sin();
+
+    // Reshape to [batch, 1, seq_len, half_dims] for broadcasting with
+    // x shaped [batch, heads, seq_len, head_dim].
+    let cos_theta = cos_theta.reshape(&[batch, 1, -1, half_dims]);
+    let sin_theta = sin_theta.reshape(&[batch, 1, -1, half_dims]);
+
+    if traditional {
+        let x_rope = if dims < head_dim {
+            x.split(&[dims], -1).remove(0)
+        } else {
+            x.clone()
+        };
+        let rope_shape = x_rope.shape();
+        let batch_r = rope_shape[0];
+        let heads = rope_shape[1];
+        let seq_len = rope_shape[2];
+        let x_pairs = x_rope.reshape(&[batch_r, heads, seq_len, half_dims, 2]);
+        let x_even = x_pairs
+            .slice(&[0, 0, 0, 0, 0], &[batch_r, heads, seq_len, half_dims, 1])
+            .squeeze(-1);
+        let x_odd = x_pairs
+            .slice(&[0, 0, 0, 0, 1], &[batch_r, heads, seq_len, half_dims, 2])
+            .squeeze(-1);
+
+        let r_even = x_even
+            .multiply(&cos_theta)
+            .subtract(&x_odd.multiply(&sin_theta));
+        let r_odd = x_even.multiply(&sin_theta).add(&x_odd.multiply(&cos_theta));
+
+        let stacked = ops::stack_axis(vec![r_even, r_odd].as_slice(), -1);
+        let x_rotated = stacked.reshape(&[batch_r, heads, seq_len, dims]);
+
+        if dims < head_dim {
+            let parts = x.split(&[dims], -1);
+            Ok(ops::concatenate_axis(&[&x_rotated, &parts[1]], -1))
+        } else {
+            Ok(x_rotated)
+        }
+    } else {
+        let parts = if dims == head_dim {
+            x.split(&[half_dims], -1)
+        } else {
+            x.split(&[half_dims, dims], -1)
+        };
+        let x1 = &parts[0];
+        let x2 = &parts[1];
+        let rx1 = x1.multiply(&cos_theta).subtract(&x2.multiply(&sin_theta));
+        let rx2 = x1.multiply(&sin_theta).add(&x2.multiply(&cos_theta));
+        let x_rotated = ops::concatenate_axis(&[&rx1, &rx2], -1);
+        if dims < head_dim && parts.len() > 2 {
+            Ok(ops::concatenate_axis(&[&x_rotated, &parts[2]], -1))
+        } else {
+            Ok(x_rotated)
+        }
+    }
+}
+
 /// Apply RoPE with extended context scaling.
 ///
 /// # Arguments

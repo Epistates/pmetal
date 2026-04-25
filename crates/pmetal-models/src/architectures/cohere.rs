@@ -10,12 +10,18 @@
 //! - **Command R+**: 104B parameters
 //! - **Command A**: 111B parameters (2025)
 use pmetal_bridge::compat::{
-    Array, Exception, Module, ModuleParameters, ModuleParametersExt, nn, ops, random,
+    Array, Exception, Module, ModuleParameters, ModuleParametersExt, nn, random,
 };
 use pmetal_bridge::impl_module_params;
 
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope,
+};
+use pmetal_mlx::kv_cache::KVCache;
+
 use serde::{Deserialize, Serialize};
 
+use crate::decoder_layer::{AttentionModule, MlpModule, NormModule};
 use crate::traits::ModelConfig;
 
 /// Cohere model configuration.
@@ -257,6 +263,25 @@ impl CohereAttention {
         mask: Option<&Array>,
         _position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
+        self.forward_with_cache(x, mask, None)
+    }
+
+    /// Forward pass with optional KV cache.
+    ///
+    /// Mirrors the Llama-style serial cached path: project → reshape →
+    /// **transpose first** → `apply_rope` with axis -2 = seq → cache write
+    /// → fused SDPA. The previous implementation applied RoPE before the
+    /// transpose on `[B, S, H, D]`, which silently misrotated heads as
+    /// positions for `offset > 0` (same axis bug fixed in Phi). Sliding
+    /// window per-layer masking is not yet plumbed; configs with
+    /// `use_sliding_window = true` AND non-global layers must build a
+    /// custom mask externally and pass it via `mask`.
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
         let batch = x.shape()[0];
         let seq_len = x.shape()[1];
 
@@ -264,54 +289,59 @@ impl CohereAttention {
         let k = Module::forward(&mut self.k_proj, x)?;
         let v = Module::forward(&mut self.v_proj, x)?;
 
-        // Reshape for attention: [B, seq, n_heads, head_dim]
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        // Reshape + transpose to [B, heads, seq, head_dim] BEFORE RoPE so
+        // axis -2 is correctly the seq axis.
+        let q = q
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let k = k
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let v = v
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply RoPE BEFORE transpose — apply_rope expects [B, seq, heads, dim]
-        let q = pmetal_mlx::kernels::rope::apply_rope(
-            &q,
-            self.head_dim,
-            false,
-            self.rope_theta,
-            1.0,
-            0,
-        )?;
-        let k = pmetal_mlx::kernels::rope::apply_rope(
-            &k,
-            self.head_dim,
-            false,
-            self.rope_theta,
-            1.0,
-            0,
-        )?;
+        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, offset)?;
+        let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, offset)?;
 
-        // Transpose for attention: [B, n_heads, seq, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3]);
-        let k = k.transpose_axes(&[0, 2, 1, 3]);
-        let v = v.transpose_axes(&[0, 2, 1, 3]);
+        let (k, v) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &k, &v)?
+        } else {
+            (k, v)
+        };
 
-        // Attention scores
-        let k_t = k.transpose_axes(&[0, 1, 3, 2]);
-        let mut scores = q.matmul(&k_t);
-        scores = scores.multiply(&Array::from_f32(self.scale));
+        let attn_config =
+            FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+                .with_scale(self.scale)
+                .with_mask_type(if mask.is_some() {
+                    AttentionMaskType::None
+                } else {
+                    AttentionMaskType::Causal
+                });
+        let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 
-        // Apply mask (includes sliding window mask for non-global layers)
-        if let Some(m) = mask {
-            scores = scores.add(m);
-        }
-
-        // For sliding window, we could apply additional masking here
-        // In production, this would use a sparse attention pattern
-
-        let probs = ops::softmax_axis(&scores, -1);
-        let output = probs.matmul(&v);
-
-        // Reshape and project
-        let output = output.transpose_axes(&[0, 2, 1, 3]);
-        let output = output.reshape(&[batch, seq_len, -1]);
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
         Module::forward(&mut self.o_proj, &output)
+    }
+}
+
+impl AttentionModule for CohereAttention {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        CohereAttention::forward_with_cache(self, x, mask, cache)
+    }
+}
+
+impl MlpModule for CohereMLP {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        CohereMLP::forward(self, x)
     }
 }
 
@@ -350,12 +380,23 @@ impl CohereDecoderLayer {
         mask: Option<&Array>,
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
-        // Pre-norm with parallel attention and FFN
-        let normed = Module::forward(&mut self.input_layernorm, x)?;
-        let attn_out = self.self_attn.forward(&normed, mask, position_ids)?;
-        let ffn_out = self.mlp.forward(&normed)?;
+        let _ = position_ids;
+        self.forward_with_cache(x, mask, None)
+    }
 
-        // Residual: x + attn + ffn
+    /// Cohere parallel decoder block with optional KV cache.
+    ///
+    /// Layout: `x + attn(norm(x)) + ffn(norm(x))` — both branches consume
+    /// the *same* normed input. There is no `post_attention_layernorm`.
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        let normed = Module::forward(&mut self.input_layernorm, x)?;
+        let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
+        let ffn_out = self.mlp.forward(&normed)?;
         Ok(x.add(&attn_out).add(&ffn_out))
     }
 }
@@ -397,10 +438,21 @@ impl CohereModel {
         mask: Option<&Array>,
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
+        let _ = position_ids;
+        self.forward_with_cache(input_ids, mask, None)
+    }
+
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        mut cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
 
-        for layer in &mut self.layers {
-            hidden_states = layer.forward(&hidden_states, mask, position_ids)?;
+        for (idx, layer) in self.layers.iter_mut().enumerate() {
+            let c = cache.as_deref_mut().map(|c| (c, idx));
+            hidden_states = layer.forward_with_cache(&hidden_states, mask, c)?;
         }
 
         Module::forward(&mut self.norm, &hidden_states)
@@ -442,19 +494,75 @@ impl CohereForCausalLM {
         Module::forward(&mut self.lm_head, &hidden_states)
     }
 
-    /// Forward pass accepting a KV cache parameter for API compatibility.
-    ///
-    /// The underlying Cohere attention implementation does not yet use the
-    /// KV cache for incremental decoding; the `_cache` argument is accepted
-    /// but ignored. Full cache-accelerated decoding will be added in a future
-    /// revision once per-layer RoPE with offsets is plumbed through.
+    /// Forward pass with optional KV cache for incremental decoding.
     pub fn forward_with_cache(
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
-        _cache: Option<&mut pmetal_mlx::kv_cache::KVCache>,
+        cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        self.forward(input_ids, mask, None)
+        let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
+        Module::forward(&mut self.lm_head, &hidden_states)
+    }
+
+    /// Create a fresh KV cache sized for this model.
+    pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
+        use pmetal_mlx::kv_cache::KVCacheConfig;
+        KVCache::new(KVCacheConfig::new(
+            self.config.num_hidden_layers as usize,
+            max_seq_len,
+            self.config.num_key_value_heads as usize,
+            self.config.head_dim as usize,
+        ))
+    }
+
+    /// Fused batched-decode forward.
+    ///
+    /// Cohere's parallel decoder block — `x + attn(norm(x)) + ffn(norm(x))` —
+    /// has no `post_attention_layernorm`, so it can't reuse
+    /// `batched_prenorm_layer`. Routes through
+    /// [`crate::common::batched_parallel_block`] instead.
+    ///
+    /// Sliding-window Cohere configs (`use_sliding_window = true` with
+    /// non-global layers) take the serial fallback — gated by
+    /// [`crate::dispatcher::DynamicModel::supports_fused_batched`].
+    pub fn forward_batched_impl(
+        &mut self,
+        input_ids: &Array,
+        active_indices: &[usize],
+        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+    ) -> Result<Array, Exception> {
+        use crate::common::{BatchedGqaAttnCfg, batched_parallel_block};
+
+        let cfg = &self.config;
+        let attn_cfg = BatchedGqaAttnCfg::new(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.rope_theta,
+            1.0,
+        );
+
+        let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?;
+        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
+            hidden = batched_parallel_block(
+                &hidden,
+                &mut layer.input_layernorm,
+                &mut layer.self_attn.q_proj,
+                &mut layer.self_attn.k_proj,
+                &mut layer.self_attn.v_proj,
+                &mut layer.self_attn.o_proj,
+                None,
+                None,
+                &mut layer.mlp,
+                &attn_cfg,
+                cache,
+                active_indices,
+                layer_idx,
+            )?;
+        }
+        let hidden = Module::forward(&mut self.model.norm, &hidden)?;
+        Module::forward(&mut self.lm_head, &hidden)
     }
 }
 

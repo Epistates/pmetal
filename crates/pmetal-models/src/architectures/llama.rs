@@ -717,6 +717,55 @@ impl LlamaForCausalLM {
         }
     }
 
+    /// Fused batched decode forward.
+    ///
+    /// Runs one `[N_active, 1]` forward across every active slot,
+    /// reusing the shared [`FusedBatchKVCache`] for all layers. Shape
+    /// contract matches [`crate::dispatcher::DynamicModel::forward_batched`].
+    pub fn forward_batched_impl(
+        &mut self,
+        input_ids: &Array,
+        active_indices: &[usize],
+        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+    ) -> Result<Array, Exception> {
+        use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
+
+        let cfg = &self.model.config;
+        let head_dim = cfg.get_head_dim();
+        let attn_cfg = BatchedGqaAttnCfg::new(
+            cfg.num_attention_heads,
+            cfg.num_kv_heads(),
+            head_dim,
+            self.model.layers[0].self_attn.effective_base,
+            self.model.layers[0].self_attn.rope_scale,
+        );
+        let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?;
+        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
+            hidden = batched_prenorm_layer(
+                &hidden,
+                &mut layer.input_layernorm,
+                &mut layer.self_attn.q_proj,
+                &mut layer.self_attn.k_proj,
+                &mut layer.self_attn.v_proj,
+                &mut layer.self_attn.o_proj,
+                None,
+                None,
+                &mut layer.post_attention_layernorm,
+                &mut layer.mlp,
+                &attn_cfg,
+                cache,
+                active_indices,
+                layer_idx,
+            )?;
+        }
+        let hidden = Module::forward(&mut self.model.norm, &hidden)?;
+        if let Some(ref mut lm_head) = self.lm_head {
+            Module::forward(lm_head, &hidden)
+        } else {
+            Ok(self.model.embed_tokens.as_linear(&hidden))
+        }
+    }
+
     /// Create a KV cache for this model.
     ///
     /// # Arguments

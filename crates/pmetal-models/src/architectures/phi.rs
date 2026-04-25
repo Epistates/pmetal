@@ -445,17 +445,27 @@ impl PhiAttention {
         let k = self.k_proj.forward(x);
         let v = self.v_proj.forward(x);
 
-        // Reshape to [batch, seq, n_heads, head_dim]
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        // Reshape to [batch, seq, n_heads, head_dim] then transpose to
+        // [batch, n_heads, seq, head_dim] BEFORE applying RoPE. MLX's
+        // `fast::rope` treats axis -2 as the seq axis, so the transpose
+        // must happen first; otherwise partial-RoPE on `[B, S, H, rope_dim]`
+        // misreads the heads dim as seq for offset > 0 (silent off-by-head).
+        let q = q
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let k = k
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let v_transposed = v
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply partial RoPE split first
+        // Partial RoPE split on the last axis (head_dim → rope_dim + pass).
         let (q_rope_raw, q_pass) = self.split_rotary(&q);
-        let (k_rope_raw, k_pass) = self.split_rotary(&k); // infallible
+        let (k_rope_raw, k_pass) = self.split_rotary(&k);
 
-        // Apply SuRoPE mscale to the rotary portion only (matching the Python reference:
-        // `x[..., :self.dim] = self._scale * x[..., :self.dim]` before rope call)
+        // Apply SuRoPE mscale to the rotary portion only (matches the Python
+        // reference: `x[..., :self.dim] = self._scale * x[..., :self.dim]`).
         let (q_rope_raw, k_rope_raw) = if self.su_freqs.is_some() && self.su_mscale != 1.0 {
             let mscale = Array::from_f32(self.su_mscale);
             (q_rope_raw.multiply(&mscale), k_rope_raw.multiply(&mscale))
@@ -463,59 +473,32 @@ impl PhiAttention {
             (q_rope_raw, k_rope_raw)
         };
 
-        let (q_rope, k_rope) = if let Some(ref _su_freqs) = self.su_freqs {
-            // SuRoPE path: use standard rope with rope_theta (su_freqs baked into theta via scaling)
-            let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-            let qr = apply_rope(
-                &q_rope_raw,
-                self.rope_dim,
-                false,
-                self.rope_theta,
-                self.su_mscale,
-                offset,
-            )?;
-            let kr = apply_rope(
-                &k_rope_raw,
-                self.rope_dim,
-                false,
-                self.rope_theta,
-                self.su_mscale,
-                offset,
-            )?;
-            (qr, kr)
-        } else if let Some((ref cache_ref, _)) = cache {
-            let offset = cache_ref.rope_offset();
-            let qr = apply_rope(
-                &q_rope_raw,
-                self.rope_dim,
-                false,
-                self.rope_theta,
-                1.0,
-                offset,
-            )?;
-            let kr = apply_rope(
-                &k_rope_raw,
-                self.rope_dim,
-                false,
-                self.rope_theta,
-                1.0,
-                offset,
-            )?;
-            (qr, kr)
+        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let rope_scale = if self.su_freqs.is_some() {
+            self.su_mscale
         } else {
-            let qr = self.rope.forward(&q_rope_raw, 0);
-            let kr = self.rope.forward(&k_rope_raw, 0);
-            (qr, kr)
+            1.0
         };
+        let q_rope = apply_rope(
+            &q_rope_raw,
+            self.rope_dim,
+            false,
+            self.rope_theta,
+            rope_scale,
+            offset,
+        )?;
+        let k_rope = apply_rope(
+            &k_rope_raw,
+            self.rope_dim,
+            false,
+            self.rope_theta,
+            rope_scale,
+            offset,
+        )?;
 
-        // Concatenate RoPE and pass-through parts
+        // Concatenate RoPE and pass-through parts back into the head_dim axis.
         let q = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
-        let k = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1);
-
-        // Transpose for attention: [batch, n_heads, seq, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3]);
-        let k_transposed = k.transpose_axes(&[0, 2, 1, 3]);
-        let v_transposed = v.transpose_axes(&[0, 2, 1, 3]);
+        let k_transposed = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1);
 
         // Use fused attention
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
@@ -848,6 +831,62 @@ impl PhiForCausalLM {
     /// Get configuration.
     pub fn config(&self) -> &PhiConfig {
         &self.model.config
+    }
+
+    /// Fused batched-decode forward.
+    ///
+    /// Runs one `[N_active, 1]` forward across every active slot against a
+    /// shared [`pmetal_mlx::kv_cache::FusedBatchKVCache`]. Phi uses partial
+    /// RoPE (`partial_rotary_factor < 1.0`); routed through
+    /// [`crate::common::BatchedGqaAttnCfg::with_rope_dims`].
+    ///
+    /// SuRoPE configs (`rope_scaling = Some(...)`) take the serial fallback —
+    /// the fused config carries a single `rope_base`, not a per-dim freq
+    /// array. Gated by [`crate::dispatcher::DynamicModel::supports_fused_batched`].
+    pub fn forward_batched_impl(
+        &mut self,
+        input_ids: &Array,
+        active_indices: &[usize],
+        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+    ) -> Result<Array, Exception> {
+        use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
+        use pmetal_bridge::compat::Module;
+
+        let cfg = &self.model.config;
+        let attn_cfg = BatchedGqaAttnCfg::new(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim(),
+            cfg.rope_theta,
+            1.0,
+        )
+        .with_rope_dims(cfg.rope_dim());
+
+        let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?;
+        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
+            hidden = batched_prenorm_layer(
+                &hidden,
+                &mut layer.input_layernorm,
+                &mut layer.self_attn.q_proj,
+                &mut layer.self_attn.k_proj,
+                &mut layer.self_attn.v_proj,
+                &mut layer.self_attn.o_proj,
+                None,
+                None,
+                &mut layer.post_attention_layernorm,
+                &mut layer.mlp,
+                &attn_cfg,
+                cache,
+                active_indices,
+                layer_idx,
+            )?;
+        }
+        let hidden = self.model.norm.forward(&hidden)?;
+        if cfg.tie_word_embeddings {
+            Ok(self.model.embed_tokens.as_linear(&hidden))
+        } else {
+            Ok(Module::forward(&mut self.lm_head, &hidden)?)
+        }
     }
 }
 

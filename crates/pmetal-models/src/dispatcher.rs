@@ -14,7 +14,7 @@ use pmetal_bridge::compat::{
     ModuleParametersExt, nn, transforms,
 };
 use pmetal_mlx::kv_cache::{
-    CacheMode, KVCache, KVCacheConfig, MambaCache, sanitize_cache_mode_for_config,
+    CacheMode, FusedBatchKVCache, KVCache, KVCacheConfig, MambaCache, sanitize_cache_mode_for_config,
 };
 use std::path::Path;
 
@@ -786,8 +786,7 @@ impl DynamicModel {
             Self::Qwen3MoE(m) => m.forward(input_ids, mask, cache),
             Self::DeepSeek(m) => m.forward(input_ids, mask, cache),
             Self::Cohere(m) => m.forward_with_cache(input_ids, mask, cache),
-            // Granite forward takes position_ids (not KVCache); cache ignored for now
-            Self::Granite(m) => m.forward(input_ids, mask, None),
+            Self::Granite(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Llama4(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Gemma(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::Mistral(m) => m.forward_with_cache(input_ids, mask, cache),
@@ -885,12 +884,7 @@ impl DynamicModel {
                 m.config.num_key_value_heads as usize,
                 (m.config.hidden_size / m.config.num_attention_heads) as usize,
             )),
-            Self::Granite(m) => KVCache::new(KVCacheConfig::new(
-                m.config.num_hidden_layers as usize,
-                max_seq_len,
-                m.config.num_key_value_heads as usize,
-                (m.config.hidden_size / m.config.num_attention_heads) as usize,
-            )),
+            Self::Granite(m) => m.create_cache(max_seq_len),
             Self::NemotronH(m) => KVCache::new(KVCacheConfig::new(
                 m.config().num_hidden_layers() as usize,
                 max_seq_len,
@@ -963,6 +957,96 @@ impl DynamicModel {
             Self::NemotronH(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
             Self::Qwen3Next(m) => m.forward_with_cache(input_ids, mask, kv_cache, mamba_cache),
             _ => self.forward_with_cache(input_ids, mask, kv_cache),
+        }
+    }
+
+    /// Whether this architecture has a fused `[N, 1]` batched-decode
+    /// implementation. Continuous batching falls back to the per-slot
+    /// serial path when this is `false`. Hybrid attn+recurrent archs
+    /// (Mamba/GDN) and bespoke attention variants (MLA, MoD) stay on
+    /// the fallback until dedicated fused designs land.
+    ///
+    /// Per-arch gates reject configs the fused path can't currently
+    /// handle (sliding-window attention, softcapping variants that
+    /// haven't been plumbed through, etc.). When adding a new arch,
+    /// default to `false` and expose `true` only after a parity test.
+    pub fn supports_fused_batched(&self) -> bool {
+        match self {
+            Self::Llama(_) => true,
+            Self::Mistral(m) => m.config().sliding_window.is_none(),
+            Self::Qwen2(m) => !m.config().use_sliding_window,
+            Self::Qwen3(m) => !m.config.use_sliding_window,
+            // Qwen3-MoE reuses the GQA attention block (with qk-norm); the
+            // token-level MoE router already flattens `[N, 1, H]` cleanly
+            // via `forward_stacked`.
+            Self::Qwen3MoE(_) => true,
+            // GPT-OSS: per-layer sliding-window attention is handled by the
+            // `BatchedGqaAttnCfg::with_sliding_window` overlay inside the
+            // arch's `forward_batched_impl`; attention biases ride on the
+            // standard `nn::Linear` projections.
+            Self::GptOss(_) => true,
+            // Gemma1 uses `batched_prenorm_layer`. Gemma2/3 use the
+            // 4-norm peri-norm helper plus optional per-layer sliding
+            // window and attention logit softcap.
+            Self::Gemma(_) => true,
+            // Phi/Phi4: partial RoPE handled by `BatchedGqaAttnCfg::with_rope_dims`.
+            // SuRoPE configs (`rope_scaling = Some(...)`) take the serial fallback
+            // because the fused cfg carries a single scalar `rope_base`, not a
+            // per-dim freq array. Sliding-window Phi configs likewise stay on
+            // serial until the per-layer overlay is wired into the arch loop.
+            Self::Phi(m) | Self::Phi4(m) => {
+                let c = m.config();
+                c.rope_scaling.is_none() && c.sliding_window.is_none()
+            }
+            // Cohere: parallel decoder block via `batched_parallel_block`.
+            // Sliding-window-with-non-global-layers configs need a per-layer
+            // sliding overlay; defer those to a follow-up.
+            Self::Cohere(m) => !m.config.use_sliding_window,
+            // Granite: pure-attention configs route through
+            // `batched_prenorm_layer`. Hybrid (Mamba2 + Attention) configs
+            // stay on serial until the simplified Mamba2 stub is replaced
+            // with a real stateful implementation.
+            Self::Granite(m) => !m.config.is_hybrid,
+            _ => false,
+        }
+    }
+
+    /// Fused batched-decode forward: runs one `[N_active, 1, V]` forward
+    /// per tick against a shared [`FusedBatchKVCache`].
+    ///
+    /// # Arguments
+    /// * `input_ids` — `[N_active, 1]` int32 token ids, one per active slot.
+    /// * `active_indices` — batch rows in the fused cache corresponding to
+    ///   each row of `input_ids`, in the same order.
+    /// * `cache` — fused per-layer KV store shared across all slots.
+    ///
+    /// Returns logits of shape `[N_active, 1, vocab_size]`.
+    ///
+    /// Architectures that opt in must override via a dedicated match arm
+    /// populated by the Tier-1 / Tier-2 rollouts. The default path returns
+    /// a typed error so callers gate on [`Self::supports_fused_batched`].
+    pub fn forward_batched(
+        &mut self,
+        input_ids: &Array,
+        active_indices: &[usize],
+        cache: &mut FusedBatchKVCache,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Llama(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            Self::Mistral(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            Self::Qwen2(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            Self::Qwen3(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            Self::Qwen3MoE(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            Self::GptOss(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            Self::Gemma(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            Self::Phi(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            Self::Phi4(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            Self::Cohere(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            Self::Granite(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            other => Err(Exception::custom(format!(
+                "forward_batched not implemented for {:?} — check supports_fused_batched first",
+                other.architecture()
+            ))),
         }
     }
 

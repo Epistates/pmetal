@@ -952,6 +952,129 @@ impl GemmaForCausalLM {
     pub fn config(&self) -> &GemmaConfig {
         &self.model.config
     }
+
+    /// Fused batched decode forward.
+    ///
+    /// Gemma1 only — Gemma2/3's 4-norm peri-norm pattern (with
+    /// pre/post FFN norms and attn logit softcap on different code
+    /// paths) doesn't fit the standard `batched_prenorm_layer` skeleton
+    /// and stays on the serial path. The dispatcher gate
+    /// (`supports_fused_batched`) enforces this by rejecting
+    /// `is_gemma2 || is_gemma3 || sliding_window || logit_softcap`.
+    ///
+    /// The Gemma embedding scale (`hidden^0.5`) is applied identically
+    /// to the serial path so logits come out in matching numerical
+    /// space; tied embeddings are projected via `embed_tokens.as_linear`.
+    pub fn forward_batched_impl(
+        &mut self,
+        input_ids: &Array,
+        active_indices: &[usize],
+        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+    ) -> Result<Array, Exception> {
+        use crate::common::{
+            BatchedGqaAttnCfg, batched_perinorm_layer, batched_prenorm_layer,
+        };
+
+        let cfg = &self.model.config;
+        let head_dim = cfg.get_head_dim();
+
+        let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?;
+        let scale = Array::from_f32(cfg.embedding_scale());
+        hidden = hidden.multiply(&scale);
+
+        if let Some(layers) = self.model.layers.gemma1.as_mut() {
+            // Gemma1: standard pre-norm, no softcap, no per-layer sliding.
+            let (rope_base, rope_scale) = (
+                layers[0].self_attn.effective_base,
+                layers[0].self_attn.rope_scale,
+            );
+            let attn_cfg = BatchedGqaAttnCfg::new(
+                cfg.num_attention_heads,
+                cfg.num_kv_heads(),
+                head_dim,
+                rope_base,
+                rope_scale,
+            )
+            .with_scale(cfg.attention_scale());
+
+            for (layer_idx, layer) in layers.iter_mut().enumerate() {
+                hidden = batched_prenorm_layer(
+                    &hidden,
+                    &mut layer.input_layernorm,
+                    &mut layer.self_attn.q_proj,
+                    &mut layer.self_attn.k_proj,
+                    &mut layer.self_attn.v_proj,
+                    &mut layer.self_attn.o_proj,
+                    None,
+                    None,
+                    &mut layer.post_attention_layernorm,
+                    &mut layer.mlp,
+                    &attn_cfg,
+                    cache,
+                    active_indices,
+                    layer_idx,
+                )?;
+            }
+        } else if let Some(layers) = self.model.layers.gemma2.as_mut() {
+            // Gemma2 / Gemma3: 4-norm peri-norm, optional softcap, per-layer
+            // sliding-window override (Gemma2 even layers; Gemma3 layers
+            // where (idx+1) % 6 != 0).
+            let (rope_base, rope_scale) = (
+                layers[0].self_attn.effective_base,
+                layers[0].self_attn.rope_scale,
+            );
+            let mut base_cfg = BatchedGqaAttnCfg::new(
+                cfg.num_attention_heads,
+                cfg.num_kv_heads(),
+                head_dim,
+                rope_base,
+                rope_scale,
+            )
+            .with_scale(cfg.attention_scale());
+            if let Some(cap) = cfg.attn_logit_softcapping {
+                base_cfg = base_cfg.with_logit_softcap(cap);
+            }
+            let sliding = cfg.sliding_window;
+
+            // Pre-collect per-layer sliding flags so the layer-iter loop
+            // below can borrow each layer mutably without re-borrowing
+            // the model's shared config.
+            let local_flags: Vec<bool> = (0..layers.len())
+                .map(|i| layers[i].self_attn.is_local_attention)
+                .collect();
+
+            for (layer_idx, layer) in layers.iter_mut().enumerate() {
+                let attn_cfg = match (local_flags[layer_idx], sliding) {
+                    (true, Some(window)) => base_cfg.with_sliding_window(window),
+                    _ => base_cfg,
+                };
+                hidden = batched_perinorm_layer(
+                    &hidden,
+                    &mut layer.input_layernorm,
+                    &mut layer.self_attn.q_proj,
+                    &mut layer.self_attn.k_proj,
+                    &mut layer.self_attn.v_proj,
+                    &mut layer.self_attn.o_proj,
+                    None,
+                    None,
+                    &mut layer.post_attention_layernorm,
+                    &mut layer.pre_feedforward_layernorm,
+                    &mut layer.post_feedforward_layernorm,
+                    &mut layer.mlp,
+                    &attn_cfg,
+                    cache,
+                    active_indices,
+                    layer_idx,
+                )?;
+            }
+        } else {
+            return Err(Exception::custom(
+                "forward_batched_impl: GemmaLayers had neither gemma1 nor gemma2 populated",
+            ));
+        }
+        let hidden = self.model.norm.forward(&hidden)?;
+        Ok(self.model.embed_tokens.as_linear(&hidden))
+    }
 }
 
 // Trait implementations

@@ -12,12 +12,18 @@
 //! - RMSNorm
 //! - Shared input/output embeddings
 use pmetal_bridge::compat::{
-    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, ops, random,
+    Array, Dtype, Exception, Module, ModuleParameters, ModuleParametersExt, Param, nn, random,
 };
 use pmetal_bridge::impl_module_params;
 
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope,
+};
+use pmetal_mlx::kv_cache::KVCache;
+
 use serde::{Deserialize, Serialize};
 
+use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::traits::ModelConfig;
 
 /// Layer type for Granite Hybrid models.
@@ -269,6 +275,7 @@ pub struct GraniteAttention {
     pub n_kv_heads: i32,
     pub head_dim: i32,
     pub scale: f32,
+    pub rope_theta: f32,
 
     pub q_proj: nn::Linear,
     pub k_proj: nn::Linear,
@@ -302,6 +309,7 @@ impl GraniteAttention {
             n_kv_heads,
             head_dim,
             scale: (head_dim as f32).sqrt().recip(),
+            rope_theta: config.rope_theta,
             q_proj,
             k_proj,
             v_proj,
@@ -315,6 +323,22 @@ impl GraniteAttention {
         mask: Option<&Array>,
         _position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
+        self.forward_with_cache(x, mask, None)
+    }
+
+    /// Forward pass with optional KV cache.
+    ///
+    /// Mirrors the Llama-style serial cached path: project → reshape →
+    /// **transpose first** → `apply_rope` with axis -2 = seq → cache write
+    /// → fused SDPA. The previous implementation had a `// RoPE would be
+    /// applied here` placeholder and a hand-rolled softmax(QK^T)V — both
+    /// are now replaced by the standard GQA pipeline.
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
         let batch = x.shape()[0];
         let seq_len = x.shape()[1];
 
@@ -322,33 +346,58 @@ impl GraniteAttention {
         let k = Module::forward(&mut self.k_proj, x)?;
         let v = Module::forward(&mut self.v_proj, x)?;
 
-        // Reshape for attention
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        // Reshape + transpose to [B, heads, seq, head_dim] BEFORE RoPE so
+        // axis -2 is correctly the seq axis.
+        let q = q
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let k = k
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let v = v
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
 
-        // RoPE would be applied here
+        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, offset)?;
+        let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, offset)?;
 
-        // Transpose for attention
-        let q = q.transpose_axes(&[0, 2, 1, 3]);
-        let k = k.transpose_axes(&[0, 2, 1, 3]);
-        let v = v.transpose_axes(&[0, 2, 1, 3]);
+        let (k, v) = if let Some((cache, layer_idx)) = cache {
+            cache.update_and_fetch(layer_idx, &k, &v)?
+        } else {
+            (k, v)
+        };
 
-        // Attention scores
-        let k_t = k.transpose_axes(&[0, 1, 3, 2]);
-        let mut scores = q.matmul(&k_t);
-        scores = scores.multiply(&Array::from_f32(self.scale));
+        let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
+            .with_scale(self.scale)
+            .with_mask_type(if mask.is_some() {
+                AttentionMaskType::None
+            } else {
+                AttentionMaskType::Causal
+            });
+        let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
 
-        if let Some(m) = mask {
-            scores = scores.add(m);
-        }
-
-        let probs = ops::softmax_axis(&scores, -1);
-        let output = probs.matmul(&v);
-
-        let output = output.transpose_axes(&[0, 2, 1, 3]);
-        let output = output.reshape(&[batch, seq_len, -1]);
+        let output = output
+            .transpose_axes(&[0, 2, 1, 3])
+            .reshape(&[batch, seq_len, -1]);
         Module::forward(&mut self.o_proj, &output)
+    }
+}
+
+impl AttentionModule for GraniteAttention {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        GraniteAttention::forward_with_cache(self, x, mask, cache)
+    }
+}
+
+impl MlpModule for GraniteMLP {
+    fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
+        GraniteMLP::forward(self, x)
     }
 }
 
@@ -465,27 +514,52 @@ impl GraniteDecoderLayer {
         mask: Option<&Array>,
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
-        // Pre-norm
-        let normed = Module::forward(&mut self.input_layernorm, x)?;
+        let _ = position_ids;
+        self.forward_with_cache(x, mask, None)
+    }
 
-        // Mixer (attention or mamba)
-        let mixer_out = match self.layer_type {
-            GraniteLayerType::Attention => {
-                self.attention
-                    .as_mut()
-                    .unwrap()
-                    .forward(&normed, mask, position_ids)
+    /// Forward pass with optional KV cache.
+    ///
+    /// Attention layers use the standard pre-norm skeleton with cache
+    /// plumbing. Mamba2 layers ignore the cache (the simplified Mamba2
+    /// stub does not yet maintain state — fused decode is gated to
+    /// pure-attention configs via `dispatcher::supports_fused_batched`).
+    pub fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        match self.layer_type {
+            GraniteLayerType::Attention => std_pre_norm_forward(
+                &mut self.input_layernorm,
+                self.attention.as_mut().unwrap(),
+                &mut self.post_attention_layernorm,
+                &mut self.mlp,
+                x,
+                mask,
+                cache,
+            ),
+            GraniteLayerType::Mamba2 => {
+                let normed = Module::forward(&mut self.input_layernorm, x)?;
+                let mixer_out = self.mamba.as_mut().unwrap().forward(&normed)?;
+                let h = x.add(&mixer_out);
+                let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
+                let ffn_out = self.mlp.forward(&normed)?;
+                Ok(h.add(&ffn_out))
             }
-            GraniteLayerType::Mamba2 => self.mamba.as_mut().unwrap().forward(&normed),
-        }?;
+        }
+    }
+}
 
-        let h = x.add(&mixer_out);
-
-        // FFN
-        let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
-        let ffn_out = self.mlp.forward(&normed)?;
-
-        Ok(h.add(&ffn_out))
+impl DecoderLayer for GraniteDecoderLayer {
+    fn forward_with_cache(
+        &mut self,
+        x: &Array,
+        mask: Option<&Array>,
+        cache: Option<(&mut KVCache, usize)>,
+    ) -> Result<Array, Exception> {
+        GraniteDecoderLayer::forward_with_cache(self, x, mask, cache)
     }
 }
 
@@ -526,10 +600,21 @@ impl GraniteModel {
         mask: Option<&Array>,
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
+        let _ = position_ids;
+        self.forward_with_cache(input_ids, mask, None)
+    }
+
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        mut cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
 
-        for layer in &mut self.layers {
-            hidden_states = layer.forward(&hidden_states, mask, position_ids)?;
+        for (idx, layer) in self.layers.iter_mut().enumerate() {
+            let c = cache.as_deref_mut().map(|c| (c, idx));
+            hidden_states = layer.forward_with_cache(&hidden_states, mask, c)?;
         }
 
         Module::forward(&mut self.norm, &hidden_states)
@@ -575,16 +660,94 @@ impl GraniteForCausalLM {
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward(input_ids, mask, position_ids)?;
+        self.project_logits(&hidden_states)
+    }
 
+    /// Forward pass with optional KV cache for incremental decoding.
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
+        self.project_logits(&hidden_states)
+    }
+
+    fn project_logits(&mut self, hidden_states: &Array) -> Result<Array, Exception> {
         if let Some(ref mut lm_head) = self.lm_head {
-            Module::forward(lm_head, &hidden_states)
+            Module::forward(lm_head, hidden_states)
         } else {
-            // Tied embeddings: use embedding weights as lm_head
-            // logits = hidden @ embed.weight.T
+            // Tied embeddings: logits = hidden @ embed.weight.T
             let embed_weight = self.model.embed_tokens.weight.as_ref();
             let embed_t = embed_weight.t();
             Ok(hidden_states.matmul(&embed_t))
         }
+    }
+
+    /// Create a fresh KV cache sized for this model.
+    pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
+        use pmetal_mlx::kv_cache::KVCacheConfig;
+        KVCache::new(KVCacheConfig::new(
+            self.config.num_hidden_layers as usize,
+            max_seq_len,
+            self.config.num_key_value_heads as usize,
+            self.config.head_dim as usize,
+        ))
+    }
+
+    /// Fused batched-decode forward.
+    ///
+    /// Pure-attention Granite (`is_hybrid = false`) routes through the
+    /// shared `batched_prenorm_layer` skeleton. Hybrid configs (Mamba2 +
+    /// Attention) are gated off by
+    /// [`crate::dispatcher::DynamicModel::supports_fused_batched`] until
+    /// the simplified Mamba2 stub is replaced with a real stateful
+    /// implementation.
+    pub fn forward_batched_impl(
+        &mut self,
+        input_ids: &Array,
+        active_indices: &[usize],
+        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+    ) -> Result<Array, Exception> {
+        use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
+
+        let cfg = &self.config;
+        let attn_cfg = BatchedGqaAttnCfg::new(
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            cfg.head_dim,
+            cfg.rope_theta,
+            1.0,
+        );
+
+        let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?;
+        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
+            let attn = layer.attention.as_mut().ok_or_else(|| {
+                Exception::custom(
+                    "forward_batched_impl invoked on hybrid Granite — \
+                     supports_fused_batched should have gated this off",
+                )
+            })?;
+            hidden = batched_prenorm_layer(
+                &hidden,
+                &mut layer.input_layernorm,
+                &mut attn.q_proj,
+                &mut attn.k_proj,
+                &mut attn.v_proj,
+                &mut attn.o_proj,
+                None,
+                None,
+                &mut layer.post_attention_layernorm,
+                &mut layer.mlp,
+                &attn_cfg,
+                cache,
+                active_indices,
+                layer_idx,
+            )?;
+        }
+        let hidden = Module::forward(&mut self.model.norm, &hidden)?;
+        self.project_logits(&hidden)
     }
 }
 

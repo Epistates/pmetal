@@ -232,17 +232,23 @@ fn get_max_recommended_wired_limit() -> usize {
 ///
 /// This matches Python's `wired_limit` context manager that sets
 /// the memory limit based on the Metal device's recommended working set size.
-struct WiredLimitGuard {
+pub struct WiredLimitGuard {
     previous_limit: usize,
 }
 
 impl WiredLimitGuard {
     /// Create a new wired limit guard, setting the limit to the device's
     /// max recommended working set size.
-    fn new() -> Self {
+    pub fn new() -> Self {
         let max_limit = get_max_recommended_wired_limit();
         let previous_limit = set_wired_limit(max_limit);
         WiredLimitGuard { previous_limit }
+    }
+}
+
+impl Default for WiredLimitGuard {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -257,13 +263,13 @@ impl Drop for WiredLimitGuard {
 ///
 /// In the bridge, we use the built-in new_generation_stream / set_generation_stream
 /// bridge functions which set the underlying C++ stream correctly.
-struct StreamContext {
+pub struct StreamContext {
     _marker: std::marker::PhantomData<()>,
 }
 
 impl StreamContext {
     /// Create a new stream context, activating the generation stream.
-    fn new(_stream: &Stream) -> Self {
+    pub fn new(_stream: &Stream) -> Self {
         pmetal_bridge::inline_array::set_generation_stream();
         StreamContext {
             _marker: std::marker::PhantomData,
@@ -280,7 +286,7 @@ impl Drop for StreamContext {
 
 /// Create a new generation stream (no-op in bridge — streams are managed internally).
 #[inline]
-fn create_generation_stream() -> Stream {
+pub fn create_generation_stream() -> Stream {
     pmetal_bridge::inline_array::new_generation_stream();
     Stream
 }
@@ -295,13 +301,19 @@ fn token_input_array(tokens: &[u32]) -> Array {
 
 /// Clear both compiled graph state and the general MLX allocation cache.
 #[inline]
-fn clear_generation_caches() {
+pub fn clear_generation_caches() {
     pmetal_bridge::compat::transforms::compile::clear_cache();
     pmetal_mlx::memory::clear_cache();
 }
 
 /// Run cached prompt prefill, optionally chunking long prompts to bound peak memory.
-fn run_cached_prefill_chunks<F>(
+///
+/// Used by the async-pipelined generators (and by `pmetal-serve`) to keep
+/// prefill latency bounded on long prompts: each chunk is `eval`ed and the
+/// MLX allocation cache is cleared between chunks so peak memory matches a
+/// single-chunk forward. The final chunk's logits are returned lazily (no
+/// `eval`) so the caller can fold them into the async decode pipeline.
+pub fn run_cached_prefill_chunks<F>(
     input_ids: &[u32],
     prefill_step_size: usize,
     mut forward: F,
@@ -909,8 +921,43 @@ impl Sampler {
         Ok((token, log_probs))
     }
 
+    /// Penalty-aware variant of [`sample_array`](Self::sample_array).
+    ///
+    /// Applies repetition, frequency, and presence penalties on the raw
+    /// logits before sampling. `generated_tokens` is the full prompt + output
+    /// history (same input shape as [`sample`](Self::sample)).
+    ///
+    /// Does NOT call `update_counts` — the caller is expected to invoke
+    /// [`update_counts`](Self::update_counts) after extracting the token id
+    /// via `.item()` so the async pipeline is preserved.
+    pub fn sample_array_with_penalties(
+        &self,
+        logits: &Array,
+        generated_tokens: &[u32],
+    ) -> Result<(Array, Array), Exception> {
+        let mut penalised = ensure_f32(logits)?;
+        if self.config.repetition_penalty != 1.0 && !generated_tokens.is_empty() {
+            penalised = apply_repetition_penalty(
+                &penalised,
+                generated_tokens,
+                self.config.repetition_penalty,
+            )?;
+        }
+        if (self.config.frequency_penalty != 0.0 || self.config.presence_penalty != 0.0)
+            && !self.token_counts.is_empty()
+        {
+            penalised = apply_frequency_presence_penalty(
+                &penalised,
+                &self.token_counts,
+                self.config.frequency_penalty,
+                self.config.presence_penalty,
+            )?;
+        }
+        self.sample_array(&penalised)
+    }
+
     /// Update token frequency counts for frequency penalty.
-    fn update_counts(&mut self, token: u32) {
+    pub fn update_counts(&mut self, token: u32) {
         *self.token_counts.entry(token).or_insert(0) += 1;
     }
 
@@ -1180,7 +1227,11 @@ pub fn token_logprobs(
 /// For negative logits: multiply by penalty (reduces probability)
 ///
 /// All operations stay on GPU - no CPU round-trip.
-fn apply_repetition_penalty(
+/// GPU-native repetition penalty (mlx_lm compatible).
+///
+/// `logits` can be 1-D `[vocab]` or 2-D `[1, vocab]`. Returns an array of the
+/// same shape with the penalty applied in-place on the GPU (no host sync).
+pub fn apply_repetition_penalty(
     logits: &Array,
     generated_tokens: &[u32],
     penalty: f32,
@@ -1399,7 +1450,7 @@ fn min_p_filter(logits: &Array, min_p: f32) -> Result<Array, Exception> {
 /// Presence penalty: logit -= presence_penalty (if token appeared at all)
 ///
 /// Uses scatter operations to stay on GPU.
-fn apply_frequency_presence_penalty(
+pub fn apply_frequency_presence_penalty(
     logits: &Array,
     token_counts: &HashMap<u32, usize>,
     frequency_penalty: f32,

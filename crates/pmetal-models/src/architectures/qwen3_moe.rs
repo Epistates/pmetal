@@ -1016,6 +1016,59 @@ impl Qwen3MoE {
     pub fn init_stacked_moe(&mut self) -> Result<(), Exception> {
         self.model.init_stacked_moe()
     }
+
+    /// Fused batched decode forward.
+    ///
+    /// Mirrors [`crate::architectures::llama::LlamaForCausalLM::forward_batched_impl`]
+    /// but routes each layer's FFN through the existing
+    /// [`Qwen3MoEFeedForward`] (dense or MoE). The MoE block's token-level
+    /// router already handles the `[N_active, 1, H]` tensor natively —
+    /// `forward_stacked` flattens to `[N_active, hidden]` and back.
+    pub fn forward_batched_impl(
+        &mut self,
+        input_ids: &Array,
+        active_indices: &[usize],
+        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
+    ) -> Result<Array, Exception> {
+        use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
+
+        let cfg = &self.config;
+        let head_dim = cfg.head_dim;
+        let attn_cfg = BatchedGqaAttnCfg::new(
+            cfg.num_attention_heads,
+            cfg.num_kv_heads(),
+            head_dim,
+            self.model.layers[0].self_attn.effective_base,
+            self.model.layers[0].self_attn.rope_scale,
+        );
+        let mut hidden =
+            pmetal_bridge::compat::Module::forward(&mut self.model.embed_tokens, input_ids)?;
+        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
+            hidden = batched_prenorm_layer(
+                &hidden,
+                &mut layer.input_layernorm,
+                &mut layer.self_attn.q_proj,
+                &mut layer.self_attn.k_proj,
+                &mut layer.self_attn.v_proj,
+                &mut layer.self_attn.o_proj,
+                Some(&mut layer.self_attn.q_norm),
+                Some(&mut layer.self_attn.k_norm),
+                &mut layer.post_attention_layernorm,
+                &mut layer.ffn,
+                &attn_cfg,
+                cache,
+                active_indices,
+                layer_idx,
+            )?;
+        }
+        let hidden = pmetal_bridge::compat::Module::forward(&mut self.model.norm, &hidden)?;
+        if let Some(ref mut head) = self.lm_head {
+            pmetal_bridge::compat::Module::forward(head, &hidden)
+        } else {
+            let embed_weight = self.model.embed_tokens.weight.value.as_ref();
+            Ok(hidden.matmul(&embed_weight.t()))
+        }
+    }
 }
 
 #[cfg(test)]
