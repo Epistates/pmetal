@@ -445,9 +445,17 @@ pub fn put_along_axis(a: &Array, indices: &Array, updates: &Array, axis: i32) ->
     a.put_along_axis_op(indices, updates, axis)
 }
 
-/// `async_eval` — in the bridge, evaluation is always synchronous; this is a no-op.
+/// `async_eval` — schedule GPU evaluation of each array on the active stream
+/// without blocking the caller. Used by the decode pipeline to launch the
+/// forward for token N+1 before the host extracts token N.
+///
+/// Mirrors `mx.async_eval(...)` in Python MLX. Unlike the synchronous
+/// `eval`, this does not wait for GPU completion — callers rely on a
+/// downstream `.item()` / `.as_slice()` to drive the host sync.
 pub fn async_eval<'a>(arrays: impl IntoIterator<Item = &'a Array>) {
-    let _ = arrays;
+    for arr in arrays {
+        arr.async_eval_ref();
+    }
 }
 
 /// `logsumexp_axis` — alias for `logsumexp(a, axis, false)`.
