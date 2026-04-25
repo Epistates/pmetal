@@ -118,6 +118,11 @@ pub mod health;
 pub mod metrics;
 pub mod namespace;
 
+// Canonical expert-ID ↔ rank mapping (pure Rust, no MLX dependency).
+// Shared by tensor_parallel weight sharding, expert_parallel placement,
+// and ZeRO MoE partitioning to enforce a single invariant.
+pub mod expert_shard;
+
 // Pipeline inference modules
 pub mod activation_codec;
 pub mod activation_transport;

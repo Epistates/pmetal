@@ -1,5 +1,6 @@
 //! Core sharding abstractions for tensor parallelism.
 
+use crate::expert_shard::expert_range;
 use pmetal_bridge::compat::{Array, Exception};
 use std::collections::HashMap;
 
@@ -158,12 +159,20 @@ pub fn shard_weight(
                 ));
             }
 
-            // Expert dimension is always axis 0: [num_experts, ...]
-            let experts_per_rank = total_experts / world_size;
-            let start = (rank * experts_per_rank) as i32;
-            let len = experts_per_rank as i32;
-
-            narrow(weight, 0, start, len)
+            // Expert dimension is always axis 0: [num_experts, ...].
+            //
+            // Use the canonical `expert_range` helper so this shard
+            // matches `ExpertPlacement::uniform` exactly. A divergence here
+            // would route tokens to ranks whose weight shards don't
+            // contain the addressed experts — see `crate::expert_shard`.
+            let (start, len) = expert_range(*total_experts, rank, world_size);
+            if len == 0 {
+                return Err(Exception::custom(format!(
+                    "shard_weight: rank {rank} has no experts for total_experts={total_experts}, \
+                     world_size={world_size} (world_size must be <= total_experts)"
+                )));
+            }
+            narrow(weight, 0, start as i32, len as i32)
         }
     }
 }
@@ -265,6 +274,52 @@ mod tests {
         .unwrap();
 
         assert_eq!(shard.shape(), &[2, 3, 4]);
+    }
+
+    #[test]
+    fn shard_weight_expert_sharded_non_divisible_covers_all() {
+        // 10 experts across 3 ranks — previously the tail expert 9 went
+        // unowned because of `total/world` truncation. Now every expert
+        // must appear in exactly one shard.
+        // Use expert dim (axis 0) = 10, per-expert trailing dim = 2 so
+        // we can trivially check which experts ended up in each shard.
+        let data: Vec<f32> = (0..20).map(|i| i as f32).collect();
+        // Shape [10, 2]: expert e has values [2e, 2e+1].
+        let w = Array::from_f32_slice(&data, &[10, 2]);
+
+        let total_experts = 10usize;
+        let world_size = 3usize;
+
+        let mut covered = vec![false; total_experts];
+        for rank in 0..world_size {
+            let shard = shard_weight(
+                &w,
+                &ShardingDirective::ExpertSharded { total_experts },
+                rank,
+                world_size,
+            )
+            .unwrap();
+
+            // Cross-reference against the canonical placement: the
+            // experts in this shard must be exactly what `expert_range`
+            // says rank owns.
+            let (start, count) = crate::expert_shard::expert_range(
+                total_experts,
+                rank,
+                world_size,
+            );
+            assert_eq!(shard.shape(), &[count as i32, 2]);
+            for (e, slot) in covered
+                .iter_mut()
+                .enumerate()
+                .skip(start)
+                .take(count)
+            {
+                assert!(!*slot, "expert {e} covered twice");
+                *slot = true;
+            }
+        }
+        assert!(covered.iter().all(|c| *c), "some experts went unowned");
     }
 
     #[test]

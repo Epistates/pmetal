@@ -35,6 +35,9 @@ pub mod plan;
 pub mod sharded_linear;
 pub mod sharding;
 
-pub use plan::{build_plan, plan_attention, plan_ffn, plan_gdn, plan_moe};
+pub use plan::{
+    build_plan, plan_attention, plan_deepseek_moe, plan_ffn, plan_gdn, plan_gpt_oss_moe,
+    plan_llama4_moe, plan_mla, plan_qwen_moe,
+};
 pub use sharded_linear::{all_to_sharded_forward, sharded_to_all_forward};
 pub use sharding::{ShardingDirective, ShardingPlan, shard_weight};
