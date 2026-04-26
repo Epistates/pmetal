@@ -67,18 +67,9 @@
     isStarting = true;
     try {
       await benchStore.start({
-        mode,
         model: selectedModel,
-        preset: mode === 'workload' ? preset : null,
-        inference_context: mode === 'workload' ? inferenceContext : null,
-        prompt_samples: mode === 'workload' ? promptSamples : null,
-        max_prompt_tokens: mode === 'workload' ? maxPromptTokens : null,
-        decode_steps: mode === 'workload' ? decodeSteps : null,
-        inference_warmup: mode === 'workload' ? inferenceWarmup : null,
-        inference_repeats: mode === 'workload' ? inferenceRepeats : null,
-        batch_size: mode === 'basic' ? batchSize : null,
-        seq_len: mode === 'basic' ? seqLen : null,
-        json_output: jsonOutput.trim() || null,
+        batch_size: batchSize,
+        seq_len: seqLen,
       });
     } catch (e) {
       formError = e instanceof Error ? e.message : String(e);

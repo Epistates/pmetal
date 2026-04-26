@@ -65,17 +65,28 @@
 
     isStarting = true;
     try {
-      await serveStore.start({
+      const spec: import('$lib/api').ServeSpec = {
         model: selectedModel,
         host,
         port,
         max_seq_len: maxSeqLen,
         fp8,
-        kv_cache: kvCache,
+        kv_quant:
+          kvCache === 'q8' ? 8 :
+          kvCache === 'q4' ? 4 :
+          kvCache === 'fp16' ? 0 :
+          undefined,
+        no_kv_quant: kvCache === 'fp16' ? true : undefined,
+        kv_turboquant: kvCache === 'tq8' || kvCache === 'tq4' ? true : undefined,
+        kv_turboquant_preset:
+          kvCache === 'tq2_5' ? 'q2_5' :
+          kvCache === 'tq3_5' ? 'q3_5' :
+          undefined,
         kv_group_size: kvGroupSize,
-        lora: loraAdapter.trim() || null,
-        experts_dir: expertsDir.trim() || null,
-      });
+        lora: loraAdapter.trim() || undefined,
+        experts_dir: expertsDir.trim() || undefined,
+      };
+      await serveStore.start(spec);
       formSuccess = `Server starting on ${bindUrlPreview()}`;
     } catch (e) {
       formError = e instanceof Error ? e.message : String(e);

@@ -1,6 +1,6 @@
 <script lang="ts">
   import { modelsStore, grpoStore } from '$lib/stores.svelte';
-  import type { GrpoConfig, GrpoRun } from '$lib/api';
+  import type { GrpoSpec, GrpoRun } from '$lib/api';
   import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
 
   // Form state
@@ -39,23 +39,21 @@
 
     isSubmitting = true;
     try {
-      const config: GrpoConfig = {
+      const spec: GrpoSpec = {
         model: selectedModel,
-        dataset: datasetPath || null,
+        dataset: datasetPath,
         epochs,
         learning_rate: learningRate,
-        batch_size: batchSize,
-        group_size: groupSize,
+        num_generations: groupSize,
         beta,
-        lora_rank: loraRank,
+        lora_r: loraRank,
         lora_alpha: loraAlpha,
         max_seq_len: maxSeqLen,
-        output_dir: outputDir || null,
-        use_reasoning_rewards: useReasoningRewards,
-        text_column: null,
+        output_dir: outputDir || undefined,
+        reasoning_rewards: useReasoningRewards,
       };
 
-      const runId = await grpoStore.start(config);
+      const runId = await grpoStore.start(spec);
       formSuccess = `GRPO training started (run ID: ${runId})`;
       selectedRunId = runId;
     } catch (e) {

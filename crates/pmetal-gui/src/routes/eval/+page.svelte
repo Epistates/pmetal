@@ -44,10 +44,10 @@
       await evalStore.start({
         model: selectedModel,
         dataset: dataset.trim(),
-        lora: lora.trim() || null,
+        lora: lora.trim() || undefined,
         max_seq_len: maxSeqLen,
         num_samples: numSamples,
-        json_output: jsonReport,
+        json: jsonReport,
       });
     } catch (e) {
       formError = e instanceof Error ? e.message : String(e);

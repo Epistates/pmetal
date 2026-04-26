@@ -182,7 +182,7 @@ class TrainingStore {
     }
   }
 
-  async start(config: api.TrainingConfig) {
+  async start(config: api.TrainSpec) {
     this.loading = true;
     this.error = null;
     try {
@@ -273,7 +273,7 @@ class ServeStore {
     }
   }
 
-  async start(config: api.ServeConfigDto) {
+  async start(config: api.ServeSpec) {
     this.loading = true;
     this.error = null;
     try {
@@ -340,7 +340,7 @@ class BenchStore {
     }
   }
 
-  async start(config: api.BenchConfigDto) {
+  async start(config: api.BenchSpec) {
     this.loading = true;
     this.error = null;
     try {
@@ -402,7 +402,7 @@ class EvalStore {
     }
   }
 
-  async start(config: api.EvalConfigDto) {
+  async start(config: api.EvalSpec) {
     this.loading = true;
     this.error = null;
     try {
@@ -464,7 +464,7 @@ class PretrainStore {
     }
   }
 
-  async start(config: api.PretrainConfigDto) {
+  async start(config: api.PretrainSpec) {
     this.loading = true;
     this.error = null;
     try {
@@ -530,7 +530,7 @@ class GrpoStore {
     }
   }
 
-  async start(config: api.GrpoConfig) {
+  async start(config: api.GrpoSpec) {
     this.loading = true;
     this.error = null;
     try {
@@ -607,7 +607,7 @@ class DistillationStore {
     }
   }
 
-  async start(config: api.DistillationConfig) {
+  async start(config: api.DistillSpec) {
     this.loading = true;
     this.error = null;
     try {

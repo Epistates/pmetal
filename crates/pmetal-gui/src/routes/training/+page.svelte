@@ -2,7 +2,7 @@
   import { onMount } from 'svelte';
   import { page } from '$app/stores';
   import { modelsStore, trainingStore } from '$lib/stores.svelte';
-  import type { TrainingConfig, TrainingRun, CachedDatasetInfo, TrainedAdapter } from '$lib/api';
+  import type { TrainSpec, TrainingRun, CachedDatasetInfo, TrainedAdapter } from '$lib/api';
   import { fuseLora, listCachedDatasets, listTrainedAdapters, peekDatasetColumns, getModelDefaults } from '$lib/api';
   import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
 
@@ -237,46 +237,40 @@
 
     isSubmitting = true;
     try {
-      const config: TrainingConfig = {
+      const spec: TrainSpec = {
         model: selectedModel,
-        dataset: datasetPath || null,
-        method: selectedMethod,
+        dataset: datasetPath,
+        output_dir: outputDir || undefined,
         epochs,
         learning_rate: learningRate,
         batch_size: batchSize,
-        lora_rank: isLoraMethod ? loraRank : null,
-        lora_alpha: isLoraMethod ? loraAlpha : null,
-        lora_dropout: isLoraMethod ? loraDropout : null,
-        use_rslora: isLoraMethod ? useRslora : null,
-        use_dora: isLoraMethod ? useDora : null,
-        output_dir: outputDir || null,
-        load_in_4bit: selectedMethod === 'qlora' ? loadIn4bit : null,
+        lora_r: isLoraMethod ? loraRank : undefined,
+        lora_alpha: isLoraMethod ? loraAlpha : undefined,
+        quantization: selectedMethod === 'qlora' ? 'nf4' : undefined,
         gradient_accumulation_steps: gradAccumSteps,
         max_seq_len: maxSeqLen,
-        text_column: selectedTextColumns.length > 1
-          ? selectedTextColumns.join('+')
-          : selectedTextColumns.length === 1
-            ? selectedTextColumns[0]
-            : textColumn || null,
-        dataset_format: datasetFormat,
-        embedding_lr: embeddingLr > 0 ? embeddingLr : null,
-        jit_compilation: jitCompilation,
-        gradient_checkpointing: gradientCheckpointing,
-        flash_attention: flashAttention,
-        fused_optimizer: fusedOptimizer,
+        text_columns: selectedTextColumns.length > 1
+          ? selectedTextColumns.join(',')
+          : undefined,
+        text_column: selectedTextColumns.length === 1
+          ? selectedTextColumns[0]
+          : selectedTextColumns.length === 0 ? textColumn || undefined : undefined,
+        embedding_lr: embeddingLr > 0 ? embeddingLr : undefined,
+        no_jit_compilation: !jitCompilation,
+        no_gradient_checkpointing: !gradientCheckpointing,
+        no_flash_attention: !flashAttention,
+        no_metal_fused_optimizer: !fusedOptimizer,
         warmup_steps: warmupSteps,
         weight_decay: weightDecay,
         max_grad_norm: maxGradNorm,
-        save_steps: saveSteps,
-        logging_steps: loggingSteps,
-        lr_scheduler: lrScheduler,
-        sequence_packing: sequencePacking,
-        resume_from: resumeFrom || null,
-        prompt_column: null,
-        response_column: null,
+        lr_schedule: lrScheduler,
+        no_sequence_packing: !sequencePacking,
+        ane: selectedMethod === 'ane',
+        config_path: resumeFrom || undefined,
+        resume: !!resumeFrom,
       };
 
-      const runId = await trainingStore.start(config);
+      const runId = await trainingStore.start(spec);
       formSuccess = `Training started (run ID: ${runId})`;
       selectedRunId = runId;
     } catch (e) {

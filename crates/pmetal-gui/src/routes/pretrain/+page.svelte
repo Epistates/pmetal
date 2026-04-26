@@ -64,11 +64,11 @@
     try {
       const runId = await pretrainStore.start({
         arch,
-        model_config: modelConfig.trim() || null,
-        shard_paths: shardPaths.trim() || null,
+        model_config: modelConfig.trim() || undefined,
+        shards: shardPaths.trim() || undefined,
         seq_len: seqLen,
         batch_size: batchSize,
-        grad_accum: gradAccum,
+        gradient_accumulation_steps: gradAccum,
         steps,
         learning_rate: learningRate,
         min_lr: minLr,
@@ -79,7 +79,7 @@
         z_loss: zLoss,
         eos_token_id: eosTokenId,
         checkpoint_every: checkpointEvery,
-        output_dir: outputDir.trim() || null,
+        output_dir: outputDir.trim() || undefined,
         seed,
       });
       formSuccess = `Pretraining started (run ID: ${runId})`;

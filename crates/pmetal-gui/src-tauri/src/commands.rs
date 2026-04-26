@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use futures::FutureExt;
-use pmetal::prelude::TrainingCallback;
+use pmetal::prelude::{JobFields, TrainingCallback};
 use pmetal_bridge::compat::ops;
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
@@ -279,101 +279,8 @@ pub struct ModelDefaults {
 // Request DTOs — match api.ts invoke calls
 // ---------------------------------------------------------------------------
 
-/// Full training config matching TS `TrainingConfig`.
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub struct TrainingConfig {
-    pub model: String,
-    pub dataset: Option<String>,
-    pub method: String,
-    pub epochs: Option<u32>,
-    pub learning_rate: Option<f64>,
-    pub batch_size: Option<u32>,
-    pub lora_rank: Option<u32>,
-    pub lora_alpha: Option<u32>,
-    pub lora_dropout: Option<f64>,
-    pub use_rslora: Option<bool>,
-    pub use_dora: Option<bool>,
-    pub output_dir: Option<String>,
-    pub load_in_4bit: Option<bool>,
-    pub gradient_accumulation_steps: Option<u32>,
-    pub max_seq_len: Option<u32>,
-    pub text_column: Option<String>,
-    pub dataset_format: Option<String>,
-    pub embedding_lr: Option<f64>,
-    pub jit_compilation: Option<bool>,
-    pub gradient_checkpointing: Option<bool>,
-    pub gradient_checkpointing_layers: Option<u32>,
-    pub flash_attention: Option<bool>,
-    pub fused_optimizer: Option<bool>,
-    pub warmup_steps: Option<u32>,
-    pub weight_decay: Option<f64>,
-    pub max_grad_norm: Option<f64>,
-    pub save_steps: Option<u32>,
-    pub logging_steps: Option<u32>,
-    pub lr_scheduler: Option<String>,
-    pub sequence_packing: Option<bool>,
-    pub resume_from: Option<String>,
-    pub prompt_column: Option<String>,
-    pub response_column: Option<String>,
-    // DPO-specific
-    pub dpo_beta: Option<f64>,
-    pub dpo_loss_type: Option<String>,
-    pub ref_model: Option<String>,
-    // SimPO-specific
-    pub simpo_beta: Option<f64>,
-    pub simpo_gamma: Option<f64>,
-    // ORPO-specific
-    pub orpo_lambda: Option<f64>,
-    // KTO-specific
-    pub kto_desirable_weight: Option<f64>,
-    pub kto_undesirable_weight: Option<f64>,
-}
-
-/// Full distillation config matching TS `DistillationConfig`.
-#[derive(Debug, Deserialize)]
-pub struct DistillationConfig {
-    pub student_model: String,
-    pub teacher_model: String,
-    pub dataset: Option<String>,
-    pub loss_type: Option<String>,
-    pub temperature: Option<f32>,
-    pub alpha: Option<f32>,
-    pub epochs: Option<u32>,
-    pub learning_rate: Option<f64>,
-    pub batch_size: Option<u32>,
-    pub lora_rank: Option<u32>,
-    pub lora_alpha: Option<u32>,
-    pub max_seq_len: Option<u32>,
-    pub output_dir: Option<String>,
-    pub text_column: Option<String>,
-}
-
-/// Full GRPO config matching TS `GrpoConfig`.
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub struct GrpoConfig {
-    pub model: String,
-    pub dataset: Option<String>,
-    pub epochs: Option<u32>,
-    pub learning_rate: Option<f64>,
-    pub batch_size: Option<u32>,
-    pub group_size: Option<u32>,
-    pub beta: Option<f64>,
-    pub lora_rank: Option<u32>,
-    pub lora_alpha: Option<u32>,
-    pub max_seq_len: Option<u32>,
-    pub output_dir: Option<String>,
-    pub use_reasoning_rewards: Option<bool>,
-    pub text_column: Option<String>,
-    /// KV cache quantization bits for rollout generation (2, 4, or 8).
-    pub kv_cache_bits: Option<u8>,
-}
-
-/// Inference config matching TS `InferenceConfig`.
-///
-/// All sampling fields are `Option` — `None` means "use model's
-/// `generation_config.json` default" (same behavior as CLI).
+/// GUI-only chat message — not part of InferSpec; passed alongside the spec
+/// so `start_inference` can forward prior conversation history to the runner.
 #[derive(Debug, Deserialize, Clone)]
 pub struct InferenceMessage {
     pub role: String,
@@ -399,62 +306,10 @@ fn chat_message_from_inference_message(
     }
 }
 
-#[derive(Debug, Deserialize)]
-pub struct InferenceConfig {
-    pub model: String,
-    pub lora_path: Option<String>,
-    pub prompt: String,
-    pub messages: Option<Vec<InferenceMessage>>,
-    pub system_message: Option<String>,
-    pub temperature: Option<f32>,
-    pub top_k: Option<u32>,
-    pub top_p: Option<f32>,
-    pub min_p: Option<f32>,
-    pub max_tokens: Option<u32>,
-    pub repetition_penalty: Option<f32>,
-    pub frequency_penalty: Option<f32>,
-    pub presence_penalty: Option<f32>,
-    pub seed: Option<u64>,
-    /// Quantize weights to FP8 E4M3 for ~2x memory savings.
-    pub fp8: Option<bool>,
-    /// Disable thinking mode for models that support it.
-    pub no_thinking: Option<bool>,
-    /// Path to packed expert weights directory for SSD-offloaded MoE inference.
-    pub experts_dir: Option<String>,
-    /// KV cache quantization bits (8=q8_0, 4=q4_0, 0=fp16). None = auto.
-    pub kv_quant: Option<u8>,
-    /// Override key bits for asymmetric K/V quantization.
-    pub kv_k_bits: Option<u8>,
-    /// Override value bits for asymmetric K/V quantization.
-    pub kv_v_bits: Option<u8>,
-    /// KV cache quantization group size.
-    pub kv_group_size: Option<usize>,
-    /// Disable KV cache quantization entirely (force fp16).
-    pub no_kv_quant: Option<bool>,
-    /// Use TurboQuant KV cache instead of MLX affine quantization.
-    pub kv_turboquant: Option<bool>,
-    /// Mixed-bit TurboQuant preset (`q2_5` or `q3_5`).
-    pub kv_turboquant_preset: Option<String>,
-    /// TurboQuant v2 affine mixed-bit preset ("q2_5" or "q3_5").
-    pub kv_quant_preset: Option<String>,
-    /// Enable QJL residual correction for Q2-Q3 uniform KV cache.
-    pub kv_qjl: Option<bool>,
-}
-
-/// Merge config matching TS `MergeConfig`.
-#[derive(Debug, Deserialize)]
-pub struct MergeConfig {
-    pub base_model: String,
-    pub models: Vec<MergeModelEntry>,
-    pub strategy: String,
-    pub output: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct MergeModelEntry {
-    pub model: String,
-    pub weight: f64,
-}
+// All other hand-rolled request DTOs (TrainingConfig, DistillationConfig,
+// GrpoConfig, InferenceConfig, ServeConfigDto, BenchConfigDto, EvalConfigDto,
+// PretrainConfigDto, MergeConfig, MergeModelEntry) have been removed.
+// Commands now accept pmetal::core::jobs::*Spec types directly.
 
 // ---------------------------------------------------------------------------
 // System commands
@@ -1123,97 +978,82 @@ pub async fn peek_dataset_columns(path: String, limit: Option<usize>) -> Result<
 pub async fn start_training(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
-    config: TrainingConfig,
+    mut spec: pmetal::core::jobs::TrainSpec,
     on_metrics: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
-    if !matches!(config.method.as_str(), "sft" | "lora" | "qlora" | "ane") {
-        return Err(AppError(format!(
-            "Unsupported training method '{}'. Expected: ane, lora, qlora, or sft.",
-            config.method
-        )));
-    }
+    spec.normalize()
+        .map_err(|errs| AppError(errs[0].message.clone()))?;
 
-    // resume_from, if set, is validated below: the directory must exist and
-    // contain at least one checkpoint file so we surface the error before
-    // creating a run record. The actual resume logic is in the orchestrator
-    // (TrainingJobConfig::resume = true).
-    if let Some(ref resume_dir) = config.resume_from {
-        let rd = PathBuf::from(resume_dir);
-        if !rd.exists() || !rd.is_dir() {
-            return Err(AppError(format!(
-                "resume_from path '{resume_dir}' does not exist or is not a directory."
-            )));
-        }
-    }
+    // Determine training method from quantization field and ane flag for
+    // display purposes (the actual dispatch is inside the orchestrator).
+    let method = if spec.ane {
+        "ane"
+    } else if spec.quantization.as_deref().is_some_and(|q| q != "none") {
+        "qlora"
+    } else {
+        "lora"
+    };
 
     // -----------------------------------------------------------------------
     // Pre-flight validation: resolve dataset before creating the run so that
     // HF download errors surface immediately rather than silently after spawn.
     // -----------------------------------------------------------------------
-    let dataset_id = config
-        .dataset
-        .clone()
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError("A dataset is required for training".to_string()))?;
-
-    // Resolve HF dataset IDs to a local path (downloads if necessary).
-    // This runs synchronously relative to the caller so errors are returned
-    // to the frontend before any run record is created.
+    let dataset_id = spec.dataset.clone();
     let resolved_dataset = resolve_dataset_path(&dataset_id)
         .await
         .map_err(|e| AppError(format!("Dataset not found: {e}")))?;
 
-    let total_epochs = config.epochs.unwrap_or(3);
-    // Resolve output_dir to an absolute path under the user's home directory
-    // so it doesn't depend on the GUI process's working directory.
-    //
-    // Default naming: "{model_short}-{method}-{YYYYMMDD-HHMM}" so trained
-    // adapters are easily identifiable in the fuse/inference dropdowns.
+    let total_epochs = spec.epochs as u32;
+
+    // Resolve output_dir to an absolute path under ~/pmetal-output/ when the
+    // spec carries a relative or placeholder path, so the GUI process working
+    // directory doesn't affect the result.
     let output_dir = {
-        let raw = config.output_dir.as_deref().unwrap_or("");
+        let raw = &spec.output_dir;
         let p = PathBuf::from(raw);
         let base = dirs::home_dir()
             .map(|h| h.join("pmetal-output"))
             .unwrap_or_else(|| PathBuf::from("./pmetal-output"));
         let _ = std::fs::create_dir_all(&base);
 
-        if !raw.is_empty() && p.is_absolute() {
+        if p.is_absolute() {
             p.to_string_lossy().to_string()
-        } else if !raw.is_empty() && raw != "./output" {
-            // User provided a custom relative name — use it under ~/pmetal-output/
+        } else if raw != "./output" && !raw.is_empty() {
+            // User supplied a custom relative name — anchor it under ~/pmetal-output/.
             base.join(p.file_name().unwrap_or(std::ffi::OsStr::new("output")))
                 .to_string_lossy()
                 .to_string()
         } else {
-            // Auto-generate a descriptive name: "Qwen3-0.6B-lora-20260318-2145"
-            let model_short = config.model.rsplit('/').next().unwrap_or(&config.model);
-            let method = &config.method;
+            // Auto-generate: "Qwen3-0.6B-lora-20260318-2145"
+            let model_short = spec.model.rsplit('/').next().unwrap_or(&spec.model);
             let ts = chrono::Local::now().format("%Y%m%d-%H%M");
             base.join(format!("{model_short}-{method}-{ts}"))
                 .to_string_lossy()
                 .to_string()
         }
     };
-    let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
+    // Propagate the resolved path back so the orchestrator and metadata use it.
+    spec.output_dir = output_dir.clone();
 
+    let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Build a config summary for display in the UI.
     let config_summary = TrainingConfigSummary {
-        learning_rate: config.learning_rate.unwrap_or(1e-4),
-        batch_size: config.batch_size.unwrap_or(1) as usize,
-        max_seq_len: config.max_seq_len.unwrap_or(2048) as usize,
-        lora_rank: config.lora_rank.map(|r| r as usize),
-        lora_alpha: config.lora_alpha.map(|a| a as f32),
-        sequence_packing: config.sequence_packing.unwrap_or(true),
-        flash_attention: config.flash_attention.unwrap_or(true),
-        jit_compilation: config.jit_compilation.unwrap_or(true),
-        gradient_checkpointing: config.gradient_checkpointing.unwrap_or(true),
+        learning_rate: spec.learning_rate,
+        batch_size: spec.batch_size,
+        max_seq_len: spec.max_seq_len,
+        lora_rank: Some(spec.lora_r),
+        lora_alpha: Some(spec.lora_alpha),
+        sequence_packing: !spec.no_sequence_packing,
+        flash_attention: !spec.no_flash_attention,
+        jit_compilation: !spec.no_jit_compilation,
+        gradient_checkpointing: !spec.no_gradient_checkpointing,
     };
 
     let mut run = TrainingRun::new(
-        &config.model,
-        &config.method,
+        &spec.model,
+        method,
         Some(&dataset_id),
         Some(&output_dir),
         total_epochs,
@@ -1223,8 +1063,6 @@ pub async fn start_training(
     run.config_summary = Some(config_summary);
     let run_id = run.id.clone();
 
-    // Register cancellation flag before creating the run so the flag is always
-    // present when the run record is visible to the frontend.
     state
         .cancel_flags
         .write()
@@ -1243,9 +1081,9 @@ pub async fn start_training(
     let _ = std::fs::create_dir_all(&output_dir);
     {
         let info = serde_json::json!({
-            "base_model": config.model,
+            "base_model": spec.model,
             "dataset": dataset_id,
-            "method": config.method,
+            "method": method,
             "created": chrono::Local::now().to_rfc3339(),
         });
         let _ = std::fs::write(
@@ -1267,10 +1105,16 @@ pub async fn start_training(
             }
         }
 
-        // Build orchestrator config from GUI DTO
-        let qlora = if config.method == "qlora" || config.load_in_4bit == Some(true) {
+        // Build orchestrator config from TrainSpec.
+        let qlora = if spec.quantization.as_deref().is_some_and(|q| q == "nf4") {
             Some(pmetal::trainer::QLoraOrchConfig {
                 scheme: pmetal::trainer::QuantizationScheme::Nf4,
+                block_size: 64,
+                double_quant: false,
+            })
+        } else if spec.quantization.as_deref().is_some_and(|q| q == "fp4") {
+            Some(pmetal::trainer::QLoraOrchConfig {
+                scheme: pmetal::trainer::QuantizationScheme::Fp4,
                 block_size: 64,
                 double_quant: false,
             })
@@ -1278,20 +1122,14 @@ pub async fn start_training(
             None
         };
 
-        // Build column config from GUI
         let columns = {
-            let mut text_column = None;
-            let mut text_columns = None;
-            let prompt_column = config.prompt_column.clone();
-            let response_column = config.response_column.clone();
-            if let Some(ref tc) = config.text_column {
-                if tc.contains('+') {
-                    text_columns = Some(tc.split('+').map(str::to_string).collect::<Vec<_>>());
-                    text_column = text_columns.as_ref().and_then(|c| c.first().cloned());
-                } else {
-                    text_column = Some(tc.clone());
-                }
-            }
+            let text_column = spec.text_column.clone();
+            let text_columns = spec.text_columns.as_ref().map(|s| {
+                s.split(',').map(str::to_string).collect::<Vec<_>>()
+            });
+            let prompt_column = spec.prompt_column.clone();
+            let response_column = spec.response_column.clone();
+            let column_separator = spec.column_separator.clone();
             if text_column.is_some()
                 || text_columns.is_some()
                 || prompt_column.is_some()
@@ -1300,7 +1138,7 @@ pub async fn start_training(
                 Some(pmetal::data::DatasetColumnConfig {
                     text_column,
                     text_columns,
-                    column_separator: Some("\n\n".to_string()),
+                    column_separator: column_separator.or(Some("\n\n".to_string())),
                     prompt_column,
                     response_column,
                 })
@@ -1309,70 +1147,62 @@ pub async fn start_training(
             }
         };
 
+        let lr_scheduler = match spec.lr_schedule.as_str() {
+            "constant" => pmetal::core::LrSchedulerType::Constant,
+            "linear" => pmetal::core::LrSchedulerType::Linear,
+            "cosine_with_restarts" => pmetal::core::LrSchedulerType::CosineWithRestarts,
+            "polynomial" => pmetal::core::LrSchedulerType::Polynomial,
+            "wsd" => pmetal::core::LrSchedulerType::Wsd,
+            _ => pmetal::core::LrSchedulerType::Cosine,
+        };
+
         let job_config = pmetal::trainer::TrainingJobConfig {
-            model_id: config.model.clone(),
+            model_id: spec.model.clone(),
             dataset: resolved_dataset.to_string_lossy().into_owned(),
-            eval_dataset: None,
+            eval_dataset: spec.eval_dataset.clone(),
             output_dir: output_dir.clone(),
             lora: pmetal::core::LoraConfig {
-                r: config.lora_rank.unwrap_or(16) as usize,
-                alpha: config.lora_alpha.unwrap_or(32) as f32,
-                dropout: config.lora_dropout.unwrap_or(0.0) as f32,
-                use_rslora: config.use_rslora.unwrap_or(false),
-                use_dora: config.use_dora.unwrap_or(false),
+                r: spec.lora_r,
+                alpha: spec.lora_alpha,
                 ..Default::default()
             },
             qlora,
             training: pmetal::core::TrainingConfig {
-                learning_rate: config.learning_rate.unwrap_or(1e-4),
-                batch_size: config.batch_size.unwrap_or(1) as usize,
-                num_epochs: config.epochs.unwrap_or(3) as usize,
-                max_seq_len: config.max_seq_len.unwrap_or(2048) as usize,
-                gradient_accumulation_steps: config.gradient_accumulation_steps.unwrap_or(4)
-                    as usize,
-                weight_decay: config.weight_decay.unwrap_or(0.01),
-                max_grad_norm: config.max_grad_norm.unwrap_or(1.0),
-                warmup_steps: config.warmup_steps.unwrap_or(100) as usize,
-                logging_steps: config.logging_steps.unwrap_or(10) as usize,
-                save_steps: config.save_steps.map(|v| v as usize),
-                lr_scheduler: match config.lr_scheduler.as_deref() {
-                    Some("constant") => pmetal::core::LrSchedulerType::Constant,
-                    Some("linear") => pmetal::core::LrSchedulerType::Linear,
-                    Some("cosine_with_restarts") => {
-                        pmetal::core::LrSchedulerType::CosineWithRestarts
-                    }
-                    Some("polynomial") => pmetal::core::LrSchedulerType::Polynomial,
-                    Some("wsd") => pmetal::core::LrSchedulerType::Wsd,
-                    _ => pmetal::core::LrSchedulerType::Cosine,
-                },
+                learning_rate: spec.learning_rate,
+                batch_size: spec.batch_size,
+                num_epochs: spec.epochs,
+                max_seq_len: spec.max_seq_len,
+                gradient_accumulation_steps: spec.gradient_accumulation_steps,
+                weight_decay: spec.weight_decay,
+                max_grad_norm: spec.max_grad_norm,
+                warmup_steps: spec.warmup_steps,
+                logging_steps: 10,
+                save_steps: None,
+                lr_scheduler,
                 output_dir: output_dir.clone(),
-                embedding_learning_rate: config.embedding_lr,
+                embedding_learning_rate: spec.embedding_lr,
                 ..Default::default()
             },
             columns,
             dispatch: pmetal::trainer::DispatchConfig {
-                flash_attention: config.flash_attention.unwrap_or(true),
-                sequence_packing: config.sequence_packing.unwrap_or(true),
-                pack_max_seq_len: None,
-                jit_compilation: config.jit_compilation.unwrap_or(true),
+                flash_attention: !spec.no_flash_attention,
+                sequence_packing: !spec.no_sequence_packing,
+                pack_max_seq_len: spec.pack_max_seq_len,
+                jit_compilation: !spec.no_jit_compilation,
                 fused: true,
-                metal_fused_optimizer: config.fused_optimizer.unwrap_or(true),
-                gradient_checkpointing: config.gradient_checkpointing.unwrap_or(true),
-                gradient_checkpointing_layers: config.gradient_checkpointing_layers.unwrap_or(4)
-                    as usize,
-                cut_cross_entropy: false,
-                ane: config.method == "ane",
-                no_adaptive_lr: false,
-                loss_scale: 1.0,
+                metal_fused_optimizer: !spec.no_metal_fused_optimizer,
+                gradient_checkpointing: !spec.no_gradient_checkpointing,
+                gradient_checkpointing_layers: spec.gradient_checkpointing_layers,
+                cut_cross_entropy: spec.cut_cross_entropy,
+                ane: spec.ane,
+                no_adaptive_lr: spec.no_adaptive_lr,
+                loss_scale: spec.loss_scale,
                 distributed: None,
             },
-            // config_path points to an existing output directory to resume
-            // from. The orchestrator's CheckpointManager will load the latest
-            // checkpoint from that directory when resume=true.
-            config_path: config.resume_from.clone(),
+            config_path: spec.config_path.clone(),
             log_metrics: Some(metrics_path.display().to_string()),
-            resume: config.resume_from.is_some(),
-            seed: 42,
+            resume: spec.resume,
+            seed: spec.seed,
             emit_console_output: false,
         };
 
@@ -1428,7 +1258,6 @@ pub async fn start_training(
         .await;
 
         // Release MLX Metal buffer cache after training ends (success, error, or cancel).
-        // Without this, freed buffers stay in MLX's cache indefinitely.
         pmetal::mlx::memory::clear_cache();
         tracing::info!("Training cleanup: MLX cache cleared");
 
@@ -1465,25 +1294,24 @@ pub async fn stop_training(state: State<'_, AppState>, run_id: String) -> Result
 pub async fn start_distillation(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
-    config: DistillationConfig,
+    mut spec: pmetal::core::jobs::DistillSpec,
     on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
-    let temperature = config.temperature.unwrap_or(2.0) as f64;
-    let loss_type = config.loss_type.clone().unwrap_or_else(|| "kl".to_string());
-    let total_epochs = config.epochs.unwrap_or(3) as u64;
-    let output_dir = config
-        .output_dir
-        .as_deref()
-        .unwrap_or("./output")
-        .to_string();
+    spec.normalize()
+        .map_err(|errs| AppError(errs[0].message.clone()))?;
+
+    let temperature = spec.temperature as f64;
+    let loss_type = spec.loss_type.clone();
+    let total_epochs = spec.epochs as u64;
+    let output_dir = spec.output_dir.clone();
     let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
 
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut run = DistillationRun::new(
-        &config.student_model,
-        &config.teacher_model,
-        config.dataset.as_deref(),
+        &spec.student,
+        &spec.teacher,
+        Some(spec.dataset.as_str()),
         &loss_type,
         temperature,
         total_epochs,
@@ -1534,7 +1362,7 @@ pub async fn start_distillation(
         });
 
         let result = std::panic::AssertUnwindSafe(run_distillation_in_process(
-            &config,
+            &spec,
             &metrics_path,
             cancel_flag.clone(),
         ))
@@ -1598,23 +1426,22 @@ pub async fn stop_distillation(state: State<'_, AppState>, run_id: String) -> Re
 pub async fn start_grpo(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
-    config: GrpoConfig,
+    mut spec: pmetal::core::jobs::GrpoSpec,
     on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
-    let group_size = config.group_size.unwrap_or(8);
-    let beta = config.beta.unwrap_or(0.04);
-    let output_dir = config
-        .output_dir
-        .as_deref()
-        .unwrap_or("./output")
-        .to_string();
+    spec.normalize()
+        .map_err(|errs| AppError(errs[0].message.clone()))?;
+
+    let group_size = spec.num_generations as u32;
+    let beta = spec.beta;
+    let output_dir = spec.output_dir.clone();
     let metrics_path = PathBuf::from(&output_dir).join("metrics.jsonl");
 
     let cancel_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     let mut run = GrpoRun::new(
-        &config.model,
-        config.dataset.as_deref(),
+        &spec.model,
+        Some(spec.dataset.as_str()),
         group_size,
         beta,
         Some(&output_dir),
@@ -1661,7 +1488,7 @@ pub async fn start_grpo(
         });
 
         let result = std::panic::AssertUnwindSafe(run_grpo_in_process(
-            &config,
+            &spec,
             &metrics_path,
             cancel_flag.clone(),
         ))
@@ -1726,20 +1553,6 @@ pub async fn stop_grpo(state: State<'_, AppState>, run_id: String) -> Result<()>
 // either surface produces the same running server.
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct ServeConfigDto {
-    pub model: String,
-    pub host: Option<String>,
-    pub port: Option<u16>,
-    pub max_seq_len: Option<usize>,
-    pub fp8: Option<bool>,
-    /// One of: `auto | fp16 | q8 | q4 | tq8 | tq4 | tq2_5 | tq3_5`.
-    pub kv_cache: Option<String>,
-    pub kv_group_size: Option<usize>,
-    pub lora: Option<String>,
-    pub experts_dir: Option<String>,
-}
-
 #[tauri::command]
 pub async fn list_serve_instances(state: State<'_, AppState>) -> Result<Vec<ServeInstance>> {
     Ok(state.list_serve_instances().await)
@@ -1755,17 +1568,31 @@ pub async fn stop_serve(state: State<'_, AppState>, instance_id: String) -> Resu
 pub async fn start_serve(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
-    config: ServeConfigDto,
+    mut spec: pmetal::core::jobs::ServeSpec,
 ) -> Result<String> {
-    let host = config.host.clone().unwrap_or_else(|| "0.0.0.0".to_string());
-    let port = config.port.unwrap_or(8080);
-    let max_seq_len = config.max_seq_len.unwrap_or(4096);
-    let fp8 = config.fp8.unwrap_or(false);
-    let kv_cache = config
-        .kv_cache
-        .clone()
-        .unwrap_or_else(|| "auto".to_string());
-    let kv_group_size = config.kv_group_size.unwrap_or(64);
+    spec.normalize()
+        .map_err(|errs| AppError(errs[0].message.clone()))?;
+
+    let host = spec.host.clone();
+    let port = spec.port;
+    let max_seq_len = spec.max_seq_len;
+    let fp8 = spec.fp8;
+    // Derive a display kv_cache string from spec fields (for ServeInstance display).
+    let kv_cache_display = if spec.kv_turboquant {
+        if let Some(ref preset) = spec.kv_turboquant_preset {
+            format!("tq_{preset}")
+        } else if let Some(bits) = spec.kv_quant {
+            format!("tq{bits}")
+        } else {
+            "turboquant".into()
+        }
+    } else if spec.no_kv_quant {
+        "fp16".into()
+    } else if let Some(bits) = spec.kv_quant {
+        format!("q{bits}")
+    } else {
+        "auto".into()
+    };
 
     // Refuse to start if something is already bound to the same port, so
     // the operator sees a clean error instead of a mysterious crash loop
@@ -1781,52 +1608,14 @@ pub async fn start_serve(
         }
     }
 
-    let instance = ServeInstance::new(&config.model, &host, port, max_seq_len, fp8, &kv_cache);
+    let instance = ServeInstance::new(&spec.model, &host, port, max_seq_len, fp8, &kv_cache_display);
     let instance_id = instance.id.clone();
     state.create_serve_instance(instance).await;
 
-    // Build the `pmetal serve` argv. Mirrors the TUI's Serve tab
-    // `build_cli_args` so the two surfaces stay in lockstep.
+    // Build the `pmetal serve` argv via ServeSpec::to_argv().
+    let argv = spec.to_argv();
     let mut args: Vec<String> = vec!["serve".into()];
-    args.extend(["--model".into(), config.model.clone()]);
-    if let Some(ref lora) = config.lora {
-        if !lora.is_empty() {
-            args.extend(["--lora".into(), lora.clone()]);
-        }
-    }
-    if let Some(ref experts) = config.experts_dir {
-        if !experts.is_empty() {
-            args.extend(["--experts-dir".into(), experts.clone()]);
-        }
-    }
-    args.extend(["--host".into(), host.clone()]);
-    args.extend(["--port".into(), port.to_string()]);
-    args.extend(["--max-seq-len".into(), max_seq_len.to_string()]);
-    args.extend(["--kv-group-size".into(), kv_group_size.to_string()]);
-    if fp8 {
-        args.push("--fp8".into());
-    }
-    match kv_cache.as_str() {
-        "auto" => {}
-        "fp16" => args.push("--no-kv-quant".into()),
-        "q8" => args.extend(["--kv-quant".into(), "8".into()]),
-        "q4" => args.extend(["--kv-quant".into(), "4".into()]),
-        "tq8" => {
-            args.push("--kv-turboquant".into());
-            args.extend(["--kv-quant".into(), "8".into()]);
-        }
-        "tq4" => {
-            args.push("--kv-turboquant".into());
-            args.extend(["--kv-quant".into(), "4".into()]);
-        }
-        "tq2_5" => args.extend(["--kv-turboquant-preset".into(), "q2_5".into()]),
-        "tq3_5" => args.extend(["--kv-turboquant-preset".into(), "q3_5".into()]),
-        other => {
-            return Err(AppError(format!(
-                "Unknown kv_cache preset '{other}' (expected auto/fp16/q8/q4/tq8/tq4/tq2_5/tq3_5)"
-            )));
-        }
-    }
+    args.extend(argv);
 
     let binary = pmetal_binary();
     let mut cmd = tokio::process::Command::new(&binary);
@@ -1971,23 +1760,6 @@ fn spawn_serve_exit_watcher(
 // Bench — one-shot benchmark subprocess, trial rows parsed into BenchRun
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct BenchConfigDto {
-    /// `workload` or `basic`.
-    pub mode: Option<String>,
-    pub model: String,
-    pub preset: Option<String>,
-    pub prompt_samples: Option<usize>,
-    pub max_prompt_tokens: Option<usize>,
-    pub decode_steps: Option<usize>,
-    pub inference_warmup: Option<usize>,
-    pub inference_repeats: Option<usize>,
-    pub inference_context: Option<String>,
-    pub batch_size: Option<usize>,
-    pub seq_len: Option<usize>,
-    pub json_output: Option<String>,
-}
-
 #[tauri::command]
 pub async fn list_bench_runs(state: State<'_, AppState>) -> Result<Vec<BenchRun>> {
     Ok(state.list_bench_runs().await)
@@ -2003,75 +1775,19 @@ pub async fn stop_bench(state: State<'_, AppState>, run_id: String) -> Result<()
 pub async fn start_bench(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
-    config: BenchConfigDto,
+    mut spec: pmetal::core::jobs::BenchSpec,
     on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
-    let mode = config
-        .mode
-        .clone()
-        .unwrap_or_else(|| "workload".to_string());
-    if !matches!(mode.as_str(), "workload" | "basic") {
-        return Err(AppError(format!(
-            "Unknown bench mode '{mode}' (expected workload or basic)"
-        )));
-    }
+    spec.normalize()
+        .map_err(|errs| AppError(errs[0].message.clone()))?;
 
-    let run = BenchRun::new(&mode, &config.model, config.preset.as_deref());
+    let run = BenchRun::new("basic", &spec.model, None);
     let run_id = run.id.clone();
     state.create_bench_run(run).await;
 
-    // Build the subprocess argv. Mirrors the TUI Bench tab exactly so the
-    // same config run from either surface produces identical measurements.
-    let mut args: Vec<String> = Vec::new();
-    if mode == "workload" {
-        args.push("bench-workload".into());
-        args.extend(["--model".into(), config.model.clone()]);
-        if let Some(ref preset) = config.preset {
-            if preset != "custom" {
-                args.extend(["--preset".into(), preset.clone()]);
-            }
-        }
-        if let Some(ref ctx) = config.inference_context {
-            args.extend(["--inference-context".into(), ctx.clone()]);
-        }
-        args.extend([
-            "--prompt-samples".into(),
-            config.prompt_samples.unwrap_or(8).to_string(),
-        ]);
-        args.extend([
-            "--max-prompt-tokens".into(),
-            config.max_prompt_tokens.unwrap_or(0).to_string(),
-        ]);
-        args.extend([
-            "--decode-steps".into(),
-            config.decode_steps.unwrap_or(32).to_string(),
-        ]);
-        args.extend([
-            "--inference-warmup-passes".into(),
-            config.inference_warmup.unwrap_or(2).to_string(),
-        ]);
-        args.extend([
-            "--inference-repeats".into(),
-            config.inference_repeats.unwrap_or(1).to_string(),
-        ]);
-    } else {
-        args.push("bench".into());
-        args.extend(["--model".into(), config.model.clone()]);
-        args.extend([
-            "--batch-size".into(),
-            config.batch_size.unwrap_or(1).to_string(),
-        ]);
-        args.extend([
-            "--seq-len".into(),
-            config.seq_len.unwrap_or(512).to_string(),
-        ]);
-    }
-    if let Some(ref out) = config.json_output {
-        if !out.is_empty() {
-            args.push("--json".into());
-            args.extend(["--output".into(), out.clone()]);
-        }
-    }
+    // BenchSpec maps to `pmetal bench` (the basic path).
+    let mut args: Vec<String> = vec!["bench".into()];
+    args.extend(spec.to_argv());
 
     spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Bench, on_event).await?;
     Ok(run_id)
@@ -2080,16 +1796,6 @@ pub async fn start_bench(
 // ---------------------------------------------------------------------------
 // Eval — one-shot evaluation subprocess, metrics parsed into EvalRun
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct EvalConfigDto {
-    pub model: String,
-    pub dataset: String,
-    pub lora: Option<String>,
-    pub max_seq_len: Option<usize>,
-    pub num_samples: Option<usize>,
-    pub json_output: Option<bool>,
-}
 
 #[tauri::command]
 pub async fn list_eval_runs(state: State<'_, AppState>) -> Result<Vec<EvalRun>> {
@@ -2106,39 +1812,18 @@ pub async fn stop_eval(state: State<'_, AppState>, run_id: String) -> Result<()>
 pub async fn start_eval(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
-    config: EvalConfigDto,
+    mut spec: pmetal::core::jobs::EvalSpec,
     on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
-    if config.model.is_empty() {
-        return Err(AppError("Model is required".into()));
-    }
-    if config.dataset.is_empty() {
-        return Err(AppError("Dataset is required".into()));
-    }
+    spec.normalize()
+        .map_err(|errs| AppError(errs[0].message.clone()))?;
 
-    let run = EvalRun::new(&config.model, &config.dataset);
+    let run = EvalRun::new(&spec.model, &spec.dataset);
     let run_id = run.id.clone();
     state.create_eval_run(run).await;
 
     let mut args: Vec<String> = vec!["eval".into()];
-    args.extend(["--model".into(), config.model.clone()]);
-    args.extend(["--dataset".into(), config.dataset.clone()]);
-    args.extend([
-        "--max-seq-len".into(),
-        config.max_seq_len.unwrap_or(1024).to_string(),
-    ]);
-    args.extend([
-        "--num-samples".into(),
-        config.num_samples.unwrap_or(0).to_string(),
-    ]);
-    if let Some(ref lora) = config.lora {
-        if !lora.is_empty() {
-            args.extend(["--lora".into(), lora.clone()]);
-        }
-    }
-    if config.json_output.unwrap_or(false) {
-        args.push("--json".into());
-    }
+    args.extend(spec.to_argv());
 
     spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Eval, on_event).await?;
     Ok(run_id)
@@ -2415,113 +2100,22 @@ fn spawn_job_exit_watcher(
 // Pretrain commands
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize)]
-pub struct PretrainConfigDto {
-    pub arch: String,
-    pub model_config: Option<String>,
-    pub shard_paths: Option<String>,
-    pub seq_len: Option<usize>,
-    pub batch_size: Option<usize>,
-    pub grad_accum: Option<usize>,
-    pub steps: Option<usize>,
-    pub learning_rate: Option<f64>,
-    pub min_lr: Option<f64>,
-    pub warmup_steps: Option<usize>,
-    pub lr_schedule: Option<String>,
-    pub weight_decay: Option<f64>,
-    pub max_grad_norm: Option<f64>,
-    pub z_loss: Option<f64>,
-    pub eos_token_id: Option<usize>,
-    pub checkpoint_every: Option<usize>,
-    pub output_dir: Option<String>,
-    pub seed: Option<usize>,
-}
-
 #[tauri::command]
 pub async fn start_pretrain(
     state: State<'_, AppState>,
     _app_handle: AppHandle,
-    config: PretrainConfigDto,
+    mut spec: pmetal::core::jobs::PretrainSpec,
     on_event: tauri::ipc::Channel<serde_json::Value>,
 ) -> Result<String> {
-    if config.arch.is_empty() {
-        return Err(AppError("Architecture is required".into()));
-    }
+    spec.normalize()
+        .map_err(|errs| AppError(errs[0].message.clone()))?;
 
-    let output_dir = config
-        .output_dir
-        .as_deref()
-        .unwrap_or("./pretrain-output")
-        .to_string();
-
-    let run = PretrainRun::new(&config.arch, &output_dir);
+    let run = PretrainRun::new(&spec.arch, &spec.output_dir);
     let run_id = run.id.clone();
     state.create_pretrain_run(run).await;
 
     let mut args: Vec<String> = vec!["pretrain".into()];
-    args.extend(["--arch".into(), config.arch.clone()]);
-    if let Some(ref p) = config.model_config {
-        if !p.is_empty() {
-            args.extend(["--model-config".into(), p.clone()]);
-        }
-    }
-    if let Some(ref p) = config.shard_paths {
-        if !p.is_empty() {
-            args.extend(["--shards".into(), p.clone()]);
-        }
-    }
-    args.extend([
-        "--seq-len".into(),
-        config.seq_len.unwrap_or(2048).to_string(),
-    ]);
-    args.extend([
-        "--batch-size".into(),
-        config.batch_size.unwrap_or(4).to_string(),
-    ]);
-    args.extend([
-        "--grad-accum".into(),
-        config.grad_accum.unwrap_or(1).to_string(),
-    ]);
-    args.extend(["--steps".into(), config.steps.unwrap_or(10000).to_string()]);
-    args.extend([
-        "--learning-rate".into(),
-        config.learning_rate.unwrap_or(3e-4).to_string(),
-    ]);
-    args.extend(["--min-lr".into(), config.min_lr.unwrap_or(1e-5).to_string()]);
-    args.extend([
-        "--warmup-steps".into(),
-        config.warmup_steps.unwrap_or(1000).to_string(),
-    ]);
-    args.extend([
-        "--lr-schedule".into(),
-        config
-            .lr_schedule
-            .as_deref()
-            .unwrap_or("cosine")
-            .to_string(),
-    ]);
-    args.extend([
-        "--weight-decay".into(),
-        config.weight_decay.unwrap_or(0.1).to_string(),
-    ]);
-    args.extend([
-        "--max-grad-norm".into(),
-        config.max_grad_norm.unwrap_or(1.0).to_string(),
-    ]);
-    let z_loss = config.z_loss.unwrap_or(0.0);
-    if z_loss > 0.0 {
-        args.extend(["--z-loss".into(), z_loss.to_string()]);
-    }
-    let eos = config.eos_token_id.unwrap_or(0);
-    if eos > 0 {
-        args.extend(["--eos-token-id".into(), eos.to_string()]);
-    }
-    args.extend([
-        "--checkpoint-every".into(),
-        config.checkpoint_every.unwrap_or(1000).to_string(),
-    ]);
-    args.extend(["--output-dir".into(), output_dir]);
-    args.extend(["--seed".into(), config.seed.unwrap_or(42).to_string()]);
+    args.extend(spec.to_argv());
 
     spawn_job_subprocess(&state, run_id.clone(), args, JobKind::Pretrain, on_event).await?;
     Ok(run_id)
@@ -2566,21 +2160,21 @@ fn pmetal_binary() -> PathBuf {
 // Inference helpers
 // ---------------------------------------------------------------------------
 
-/// Run streaming inference — mirrors the logic from the former `easy::infer().generate_streaming()`.
+/// Run streaming inference — mirrors the logic from `pmetal infer`.
 ///
-/// Run inference using the shared InferenceRunner pipeline.
-///
-/// This ensures the GUI gets identical behavior to `pmetal infer`:
-/// same chat template handling, sampling defaults, stop tokens,
-/// LoRA loading, FP8, expert offloading, KV cache quantization, etc.
+/// Accepts an `InferSpec` for all model/sampling configuration plus an
+/// optional GUI-only `messages` list for chat history (not part of InferSpec
+/// because InferSpec maps to the CLI which cannot represent multi-turn history
+/// as a structured argument).
 async fn run_inference_streaming(
-    config: &InferenceConfig,
+    spec: &pmetal::core::jobs::InferSpec,
+    messages: Option<&[InferenceMessage]>,
     cancel_flag: &std::sync::atomic::AtomicBool,
     app_handle: &AppHandle,
 ) -> std::result::Result<serde_json::Value, String> {
     use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig, TurboQuantPreset};
 
-    let kv_turboquant_preset = match config.kv_turboquant_preset.as_deref() {
+    let kv_turboquant_preset = match spec.kv_turboquant_preset.as_deref() {
         Some("q2_5") => Some(TurboQuantPreset::Q2_5),
         Some("q3_5") => Some(TurboQuantPreset::Q3_5),
         Some(other) => {
@@ -2589,16 +2183,13 @@ async fn run_inference_streaming(
         None => None,
     };
 
-    let model_path = resolve_model_path(&config.model)
+    let model_path = resolve_model_path(&spec.model)
         .await
         .map_err(|e| e.to_string())?;
 
-    let chat_messages = config
-        .messages
-        .as_ref()
-        .map(|messages| {
-            messages
-                .iter()
+    let chat_messages = messages
+        .map(|msgs| {
+            msgs.iter()
                 .map(chat_message_from_inference_message)
                 .collect::<std::result::Result<Vec<_>, _>>()
         })
@@ -2606,33 +2197,33 @@ async fn run_inference_streaming(
 
     let runner_config = InferenceRunnerConfig {
         model_path,
-        lora_path: config.lora_path.clone(),
-        experts_dir: config.experts_dir.clone(),
-        fp8: config.fp8.unwrap_or(false),
-        prompt: config.prompt.clone(),
+        lora_path: spec.lora.clone(),
+        experts_dir: spec.experts_dir.clone(),
+        fp8: spec.fp8,
+        prompt: spec.prompt.clone(),
         chat_messages,
-        system_message: config.system_message.clone(),
+        system_message: spec.system.clone(),
         chat: false, // let the shared runner auto-detect chat-capable models
-        no_thinking: config.no_thinking.unwrap_or(false),
+        no_thinking: spec.no_thinking,
         tools: None,
-        temperature: config.temperature,
-        top_k: config.top_k.map(|k| k as usize),
-        top_p: config.top_p,
-        min_p: config.min_p,
-        max_tokens: config.max_tokens.unwrap_or(1024) as usize,
-        repetition_penalty: config.repetition_penalty,
-        frequency_penalty: config.frequency_penalty,
-        presence_penalty: config.presence_penalty,
-        seed: config.seed,
-        kv_quant: config.kv_quant,
-        kv_k_bits: config.kv_k_bits,
-        kv_v_bits: config.kv_v_bits,
-        kv_group_size: config.kv_group_size.unwrap_or(64),
-        kv_turboquant: config.kv_turboquant.unwrap_or(false),
+        temperature: spec.temperature,
+        top_k: spec.top_k,
+        top_p: spec.top_p,
+        min_p: spec.min_p,
+        max_tokens: spec.max_tokens,
+        repetition_penalty: spec.repetition_penalty,
+        frequency_penalty: spec.frequency_penalty,
+        presence_penalty: spec.presence_penalty,
+        seed: spec.seed,
+        kv_quant: spec.kv_quant,
+        kv_k_bits: spec.kv_k_bits,
+        kv_v_bits: spec.kv_v_bits,
+        kv_group_size: spec.kv_group_size,
+        kv_turboquant: spec.kv_turboquant,
         kv_turboquant_preset,
-        kv_quant_preset: config.kv_quant_preset.clone(),
-        no_kv_quant: config.no_kv_quant.unwrap_or(false),
-        kv_qjl: config.kv_qjl.unwrap_or(false),
+        kv_quant_preset: spec.kv_quant_preset.clone(),
+        no_kv_quant: spec.no_kv_quant,
+        kv_qjl: spec.kv_qjl,
         mode: pmetal::data::inference_config::SamplingMode::Auto,
         detect_repetition: false,
     };
@@ -2729,7 +2320,9 @@ async fn run_inference_streaming(
 pub async fn start_inference(
     state: State<'_, AppState>,
     app_handle: AppHandle,
-    config: InferenceConfig,
+    spec: pmetal::core::jobs::InferSpec,
+    // GUI-only chat history — not part of InferSpec; None for single-turn requests.
+    messages: Option<Vec<InferenceMessage>>,
 ) -> Result<()> {
     let session_id = uuid::Uuid::new_v4().to_string();
     let session_id_task = session_id.clone();
@@ -2742,7 +2335,13 @@ pub async fn start_inference(
         .insert(session_id.clone(), cancel_flag.clone());
 
     tokio::spawn(async move {
-        let result = run_inference_streaming(&config, &cancel_flag, &app_handle).await;
+        let result = run_inference_streaming(
+            &spec,
+            messages.as_deref(),
+            &cancel_flag,
+            &app_handle,
+        )
+        .await;
 
         match result {
             Ok(metrics) => {
@@ -2814,33 +2413,47 @@ pub async fn get_merge_strategies() -> Result<Vec<MergeStrategy>> {
 }
 
 #[tauri::command]
-pub async fn merge_models(_app_handle: AppHandle, config: MergeConfig) -> Result<String> {
-    let merge_method = match config.strategy.as_str() {
+pub async fn merge_models(
+    _app_handle: AppHandle,
+    mut spec: pmetal::core::jobs::MergeSpec,
+) -> Result<String> {
+    spec.normalize()
+        .map_err(|errs| AppError(errs[0].message.clone()))?;
+
+    let merge_method = match spec.method.as_str() {
         "linear" => pmetal::merge::MergeMethodConfig::Linear,
         "slerp" => pmetal::merge::MergeMethodConfig::Slerp,
         "ties" => pmetal::merge::MergeMethodConfig::Ties,
-        "dare" => pmetal::merge::MergeMethodConfig::DareTies,
+        "dare_ties" | "dare" => pmetal::merge::MergeMethodConfig::DareTies,
         "model_stock" => pmetal::merge::MergeMethodConfig::ModelStock,
-        other => return Err(AppError(format!("Unsupported merge strategy: {other}"))),
+        other => return Err(AppError(format!("Unsupported merge method: {other}"))),
     };
 
     let merge_config = pmetal::merge::MergeConfig {
         merge_method,
-        base_model: Some(config.base_model.clone()),
-        models: config
-            .models
-            .into_iter()
-            .map(|model| pmetal::merge::ModelConfig {
-                model: model.model,
+        base_model: spec.base.clone(),
+        models: vec![
+            pmetal::merge::ModelConfig {
+                model: spec.model_a.clone(),
                 parameters: pmetal::merge::MergeParameters {
-                    weight: Some(pmetal::merge::ParameterSetting::Scalar(model.weight as f32)),
+                    weight: Some(pmetal::merge::ParameterSetting::Scalar(spec.weight_a)),
+                    density: Some(pmetal::merge::ParameterSetting::Scalar(spec.density)),
                     ..Default::default()
                 },
-            })
-            .collect(),
-        output_path: Some(PathBuf::from(&config.output)),
+            },
+            pmetal::merge::ModelConfig {
+                model: spec.model_b.clone(),
+                parameters: pmetal::merge::MergeParameters {
+                    weight: Some(pmetal::merge::ParameterSetting::Scalar(spec.weight_b)),
+                    density: Some(pmetal::merge::ParameterSetting::Scalar(spec.density)),
+                    ..Default::default()
+                },
+            },
+        ],
+        output_path: Some(PathBuf::from(&spec.output)),
         parameters: pmetal::merge::MergeParameters {
             normalize: Some(true),
+            t: Some(pmetal::merge::ParameterSetting::Scalar(spec.t)),
             ..Default::default()
         },
         ..Default::default()
@@ -3374,41 +2987,48 @@ async fn resolve_dataset_path(dataset_id: &str) -> Result<PathBuf> {
 }
 
 async fn run_distillation_in_process(
-    config: &DistillationConfig,
+    spec: &pmetal::core::jobs::DistillSpec,
     metrics_path: &PathBuf,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     use pmetal::lora::TrainableModel;
 
-    let teacher_path = resolve_model_path(&config.teacher_model).await?;
-    let student_path = resolve_model_path(&config.student_model).await?;
-    let dataset_id = config
-        .dataset
-        .as_deref()
-        .ok_or_else(|| AppError("Dataset is required for distillation".to_string()))?;
-    let dataset_path = resolve_dataset_path(dataset_id).await?;
+    let teacher_path = resolve_model_path(&spec.teacher).await?;
+    let student_path = resolve_model_path(&spec.student).await?;
+    let dataset_path = resolve_dataset_path(&spec.dataset).await?;
 
     let tokenizer = pmetal::data::Tokenizer::from_model_dir(&student_path)
         .map_err(|e| AppError(e.to_string()))?;
     let chat_template =
-        pmetal::data::chat_templates::detect_chat_template(&student_path, &config.student_model);
+        pmetal::data::chat_templates::detect_chat_template(&student_path, &spec.student);
 
-    let max_seq_len = config.max_seq_len.unwrap_or(1024) as usize;
+    let max_seq_len = spec.max_seq_len;
 
-    // Build column config from the `+`-separated multi-column string the GUI sends.
-    let col_cfg = config.text_column.as_deref().map(|tc| {
-        if tc.contains('+') {
-            pmetal::data::DatasetColumnConfig {
-                text_columns: Some(tc.split('+').map(str::to_string).collect()),
-                ..Default::default()
-            }
+    // Build column config from the spec fields.
+    let col_cfg = {
+        let text_column = spec.text_column.clone();
+        let text_columns = spec.text_columns.as_ref().map(|s| {
+            s.split(',').map(str::to_string).collect::<Vec<_>>()
+        });
+        let prompt_column = spec.prompt_column.clone();
+        let response_column = spec.response_column.clone();
+        let column_separator = spec.column_separator.clone();
+        if text_column.is_some()
+            || text_columns.is_some()
+            || prompt_column.is_some()
+            || response_column.is_some()
+        {
+            Some(pmetal::data::DatasetColumnConfig {
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
+            })
         } else {
-            pmetal::data::DatasetColumnConfig {
-                text_column: Some(tc.to_string()),
-                ..Default::default()
-            }
+            None
         }
-    });
+    };
 
     let train_dataset = if dataset_path.extension().is_some_and(|ext| ext == "parquet") {
         pmetal::data::TrainingDataset::from_parquet_tokenized(
@@ -3449,21 +3069,15 @@ async fn run_distillation_in_process(
             .map_err(|e| AppError(e.to_string()))?;
 
     let student_lora_config = pmetal::core::LoraConfig {
-        r: config.lora_rank.unwrap_or(16) as usize,
-        alpha: config.lora_alpha.unwrap_or(32) as f32,
+        r: spec.lora_r,
+        alpha: spec.lora_alpha,
         ..Default::default()
     };
     let mut student_model =
         pmetal::lora::DynamicLoraModel::from_pretrained(&student_path, student_lora_config.clone())
             .map_err(|e| AppError(e.to_string()))?;
 
-    let loss_type = match config
-        .loss_type
-        .clone()
-        .unwrap_or_else(|| "kl_divergence".to_string())
-        .to_lowercase()
-        .as_str()
-    {
+    let loss_type = match spec.loss_type.to_lowercase().as_str() {
         "kl" | "kl_divergence" => pmetal::distill::LossType::KlDivergence,
         "js" | "jensen_shannon" => pmetal::distill::LossType::JensenShannon,
         "soft_cross_entropy" => pmetal::distill::LossType::SoftCrossEntropy,
@@ -3476,21 +3090,21 @@ async fn run_distillation_in_process(
     };
 
     let distill_config = pmetal::distill::DistillConfig {
-        teacher: config.teacher_model.clone(),
-        student: config.student_model.clone(),
+        teacher: spec.teacher.clone(),
+        student: spec.student.clone(),
         method: pmetal::distill::DistillMethod::Online,
         loss: pmetal::distill::LossConfig {
             loss_type,
-            temperature: config.temperature.unwrap_or(2.0),
-            alpha: config.alpha.unwrap_or(0.5),
+            temperature: spec.temperature,
+            alpha: spec.alpha,
             ..Default::default()
         },
         offline: None,
-        output_path: config.output_dir.as_ref().map(PathBuf::from),
+        output_path: Some(PathBuf::from(&spec.output_dir)),
         training: pmetal::distill::TrainingConfig {
-            batch_size: config.batch_size.unwrap_or(1) as usize,
-            learning_rate: config.learning_rate.unwrap_or(2e-5) as f32,
-            epochs: config.epochs.unwrap_or(3) as usize,
+            batch_size: spec.batch_size,
+            learning_rate: spec.learning_rate,
+            epochs: spec.epochs,
             max_seq_len,
             ..Default::default()
         },
@@ -3501,21 +3115,18 @@ async fn run_distillation_in_process(
 
     let training_loop_config = pmetal::trainer::TrainingLoopConfig {
         training: pmetal::core::TrainingConfig {
-            learning_rate: config.learning_rate.unwrap_or(2e-5),
-            batch_size: config.batch_size.unwrap_or(1) as usize,
-            num_epochs: config.epochs.unwrap_or(3) as usize,
+            learning_rate: spec.learning_rate as f64,
+            batch_size: spec.batch_size,
+            num_epochs: spec.epochs,
             max_seq_len,
-            output_dir: config
-                .output_dir
-                .clone()
-                .unwrap_or_else(|| "./output".to_string()),
+            output_dir: spec.output_dir.clone(),
             ..Default::default()
         },
         dataloader: pmetal::data::DataLoaderConfig {
-            batch_size: config.batch_size.unwrap_or(1) as usize,
+            batch_size: spec.batch_size,
             max_seq_len,
             shuffle: true,
-            seed: 42,
+            seed: spec.seed,
             pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
             drop_last: false,
             ..Default::default()
@@ -3538,20 +3149,14 @@ async fn run_distillation_in_process(
 
     let mut trainer = pmetal::trainer::DistillationTrainer::new(distiller, training_loop_config);
     let adaptive_config = pmetal::trainer::AdaptiveLrConfig::for_distillation();
-    let control_file = PathBuf::from(
-        config
-            .output_dir
-            .clone()
-            .unwrap_or_else(|| "./output".to_string()),
-    )
-    .join(".lr_control.json");
+    let control_file = PathBuf::from(&spec.output_dir).join(".lr_control.json");
     trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
 
     let callback = pmetal::trainer::MetricsJsonCallback::new(metrics_path)
         .map_err(|e| AppError(e.to_string()))?
         .with_run_name(format!(
             "distill-{}",
-            config.student_model.replace('/', "-")
+            spec.student.replace('/', "-")
         ));
     trainer.add_callback(Box::new(callback));
     trainer.add_callback(Box::new(CancelOnFlag {
@@ -3568,12 +3173,7 @@ async fn run_distillation_in_process(
         )
         .map_err(|e| AppError(e.to_string()))?;
 
-    let output_dir = PathBuf::from(
-        config
-            .output_dir
-            .clone()
-            .unwrap_or_else(|| "./output".to_string()),
-    );
+    let output_dir = PathBuf::from(&spec.output_dir);
     std::fs::create_dir_all(&output_dir).map_err(|e| AppError(e.to_string()))?;
     let lora_output = output_dir.join("lora_weights.safetensors");
     student_model
@@ -3584,7 +3184,7 @@ async fn run_distillation_in_process(
         "alpha": student_lora_config.alpha,
         "target_modules": student_lora_config.target_modules,
         "use_rslora": student_lora_config.use_rslora,
-        "base_model": config.student_model,
+        "base_model": spec.student,
     });
     std::fs::write(
         output_dir.join("adapter_config.json"),
@@ -3596,39 +3196,46 @@ async fn run_distillation_in_process(
 }
 
 async fn run_grpo_in_process(
-    config: &GrpoConfig,
+    spec: &pmetal::core::jobs::GrpoSpec,
     metrics_path: &PathBuf,
     cancel_flag: Arc<std::sync::atomic::AtomicBool>,
 ) -> Result<()> {
     use pmetal::lora::TrainableModel;
 
-    let model_path = resolve_model_path(&config.model).await?;
-    let dataset_id = config
-        .dataset
-        .as_deref()
-        .ok_or_else(|| AppError("Dataset is required for GRPO".to_string()))?;
-    let dataset_path = resolve_dataset_path(dataset_id).await?;
+    let model_path = resolve_model_path(&spec.model).await?;
+    let dataset_path = resolve_dataset_path(&spec.dataset).await?;
     let tokenizer = pmetal::data::Tokenizer::from_model_dir(&model_path)
         .map_err(|e| AppError(e.to_string()))?;
     let chat_template =
-        pmetal::data::chat_templates::detect_chat_template(&model_path, &config.model);
+        pmetal::data::chat_templates::detect_chat_template(&model_path, &spec.model);
 
-    let max_seq_len = config.max_seq_len.unwrap_or(512) as usize;
+    let max_seq_len = spec.max_seq_len;
 
-    // Build column config from the `+`-separated multi-column string the GUI sends.
-    let col_cfg = config.text_column.as_deref().map(|tc| {
-        if tc.contains('+') {
-            pmetal::data::DatasetColumnConfig {
-                text_columns: Some(tc.split('+').map(str::to_string).collect()),
-                ..Default::default()
-            }
+    // Build column config from spec fields.
+    let col_cfg = {
+        let text_column = spec.text_column.clone();
+        let text_columns = spec.text_columns.as_ref().map(|s| {
+            s.split(',').map(str::to_string).collect::<Vec<_>>()
+        });
+        let prompt_column = spec.prompt_column.clone();
+        let response_column = spec.response_column.clone();
+        let column_separator = spec.column_separator.clone();
+        if text_column.is_some()
+            || text_columns.is_some()
+            || prompt_column.is_some()
+            || response_column.is_some()
+        {
+            Some(pmetal::data::DatasetColumnConfig {
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
+            })
         } else {
-            pmetal::data::DatasetColumnConfig {
-                text_column: Some(tc.to_string()),
-                ..Default::default()
-            }
+            None
         }
-    });
+    };
 
     let dataset = if dataset_path.extension().is_some_and(|ext| ext == "parquet") {
         pmetal::data::TrainingDataset::from_parquet_tokenized(
@@ -3661,42 +3268,39 @@ async fn run_grpo_in_process(
     };
 
     let lora_config = pmetal::core::LoraConfig {
-        r: config.lora_rank.unwrap_or(16) as usize,
-        alpha: config.lora_alpha.unwrap_or(32) as f32,
+        r: spec.lora_r,
+        alpha: spec.lora_alpha,
         ..Default::default()
     };
     let mut model =
         pmetal::lora::DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())
             .map_err(|e| AppError(e.to_string()))?;
 
-    let mut grpo_config = pmetal::trainer::GrpoConfig::new(config.group_size.unwrap_or(8) as usize)
-        .with_beta(config.beta.unwrap_or(0.04));
+    let mut grpo_config = pmetal::trainer::GrpoConfig::new(spec.num_generations)
+        .with_beta(spec.beta);
     grpo_config.max_prompt_length = max_seq_len;
-    grpo_config.max_completion_length = 512;
-    grpo_config.kv_cache_bits = config.kv_cache_bits;
+    grpo_config.max_completion_length = spec.max_completion_length;
+    grpo_config.kv_cache_bits = spec.grpo_kv_bits;
 
     let mut rewards = pmetal::trainer::CombinedReward::new();
-    if config.use_reasoning_rewards.unwrap_or(false) {
+    if spec.reasoning_rewards {
         rewards = rewards.add(
             Box::new(pmetal::trainer::XmlFormatReward::default_reasoning()),
             1.0,
         );
     } else {
         return Err(AppError(
-            "GRPO requires a reward function. Enable 'Use Reasoning Rewards' or use the CLI \
+            "GRPO requires a reward function. Enable 'Reasoning Rewards' or use the CLI \
              with a custom reward configuration."
                 .to_string(),
         ));
     }
 
-    let output_dir = config
-        .output_dir
-        .clone()
-        .unwrap_or_else(|| "./output".to_string());
+    let output_dir = spec.output_dir.clone();
     let training_config = pmetal::core::TrainingConfig {
-        learning_rate: config.learning_rate.unwrap_or(5e-6),
+        learning_rate: spec.learning_rate,
         batch_size: 1,
-        num_epochs: config.epochs.unwrap_or(1) as usize,
+        num_epochs: spec.epochs,
         max_seq_len,
         output_dir: output_dir.clone(),
         ..Default::default()
@@ -3706,7 +3310,7 @@ async fn run_grpo_in_process(
         .map_err(|e| AppError(e.to_string()))?;
     let callback = pmetal::trainer::MetricsJsonCallback::new(metrics_path)
         .map_err(|e| AppError(e.to_string()))?
-        .with_run_name(format!("grpo-{}", config.model.replace('/', "-")));
+        .with_run_name(format!("grpo-{}", spec.model.replace('/', "-")));
     trainer.add_callback(Box::new(callback));
     trainer.add_callback(Box::new(CancelOnFlag {
         cancelled: cancel_flag,
@@ -3717,7 +3321,7 @@ async fn run_grpo_in_process(
     trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
 
     let mut optimizer = pmetal_bridge::compat::optimizers::AdamWBuilder::new(
-        config.learning_rate.unwrap_or(5e-6) as f32,
+        spec.learning_rate as f32,
     )
     .build()
     .map_err(|e| AppError(e.to_string()))?;
@@ -3749,7 +3353,7 @@ async fn run_grpo_in_process(
         "alpha": lora_config.alpha,
         "target_modules": lora_config.target_modules,
         "use_rslora": lora_config.use_rslora,
-        "base_model": config.model,
+        "base_model": spec.model,
     });
     std::fs::write(
         output_dir.join("adapter_config.json"),

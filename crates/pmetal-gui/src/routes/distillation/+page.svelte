@@ -1,6 +1,6 @@
 <script lang="ts">
   import { modelsStore, distillationStore } from '$lib/stores.svelte';
-  import type { DistillationConfig, DistillationRun } from '$lib/api';
+  import type { DistillSpec, DistillationRun } from '$lib/api';
   import { formatEta, runProgress, getStatusBadgeClass } from '$lib/utils';
 
   const lossTypes = [
@@ -48,24 +48,23 @@
 
     isSubmitting = true;
     try {
-      const config: DistillationConfig = {
-        student_model: studentModel,
-        teacher_model: teacherModel,
-        dataset: datasetPath || null,
+      const spec: DistillSpec = {
+        student: studentModel,
+        teacher: teacherModel,
+        dataset: datasetPath,
         loss_type: selectedLossType,
         temperature,
         alpha,
         epochs,
         learning_rate: learningRate,
         batch_size: batchSize,
-        lora_rank: loraRank,
+        lora_r: loraRank,
         lora_alpha: loraAlpha,
         max_seq_len: maxSeqLen,
-        output_dir: outputDir || null,
-        text_column: null,
+        output_dir: outputDir || undefined,
       };
 
-      const runId = await distillationStore.start(config);
+      const runId = await distillationStore.start(spec);
       formSuccess = `Distillation started (run ID: ${runId})`;
       selectedRunId = runId;
     } catch (e) {

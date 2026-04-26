@@ -211,46 +211,45 @@
         inferenceStatus = 'idle';
       });
 
-      await startInference({
-        model: selectedModel,
-        lora_path: loraPath || null,
-        prompt,
-        messages: historySnapshot
+      await startInference(
+        {
+          model: selectedModel,
+          lora: loraPath || undefined,
+          prompt,
+          system: systemMessage || undefined,
+          temperature,
+          top_k: topK,
+          top_p: topP,
+          min_p: minP,
+          max_tokens: normalizeMaxTokensValue(maxTokens),
+          repetition_penalty: repetitionPenalty,
+          frequency_penalty: frequencyPenalty,
+          presence_penalty: presencePenalty,
+          seed,
+          fp8: fp8 || undefined,
+          no_thinking: noThinking || undefined,
+          experts_dir: expertsDir || undefined,
+          kv_quant:
+            kvQuant === 'tq4'
+              ? 4
+              : kvQuant === 'tq8'
+                ? 8
+                : kvQuant === 'auto'
+                  ? undefined
+                  : parseInt(kvQuant),
+          no_kv_quant: kvQuant === '0' ? true : undefined,
+          kv_turboquant: kvQuant === 'tq4' || kvQuant === 'tq8' ? true : undefined,
+          kv_turboquant_preset:
+            kvQuant === 'tq2_5'
+              ? 'q2_5'
+              : kvQuant === 'tq3_5'
+                ? 'q3_5'
+                : undefined,
+        },
+        historySnapshot
           .filter((m) => m.role === 'user' || m.role === 'assistant')
           .map((m) => ({ role: m.role, content: m.content })),
-        system_message: systemMessage || null,
-        temperature,
-        top_k: topK,
-        top_p: topP,
-        min_p: minP,
-        max_tokens: normalizeMaxTokensValue(maxTokens),
-        repetition_penalty: repetitionPenalty,
-        frequency_penalty: frequencyPenalty,
-        presence_penalty: presencePenalty,
-        seed,
-        fp8: fp8 || null,
-        no_thinking: noThinking || null,
-        experts_dir: expertsDir || null,
-        kv_quant:
-          kvQuant === 'tq4'
-            ? 4
-            : kvQuant === 'tq8'
-              ? 8
-              : kvQuant === 'auto'
-                ? null
-                : parseInt(kvQuant),
-        kv_k_bits: null,
-        kv_v_bits: null,
-        kv_group_size: null,
-        no_kv_quant: kvQuant === '0' ? true : null,
-        kv_turboquant: kvQuant === 'tq4' || kvQuant === 'tq8' ? true : null,
-        kv_turboquant_preset:
-          kvQuant === 'tq2_5'
-            ? 'q2_5'
-            : kvQuant === 'tq3_5'
-              ? 'q3_5'
-              : null,
-      });
+      );
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
       // Remove the streaming placeholder on error

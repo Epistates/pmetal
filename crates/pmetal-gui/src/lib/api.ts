@@ -107,51 +107,43 @@ export interface TrainingConfigSummary {
   gradient_checkpointing: boolean;
 }
 
-export interface TrainingConfig {
+export interface TrainSpec {
   model: string;
-  dataset: string | null;
-  method: string;
-  epochs: number;
-  learning_rate: number;
-  batch_size: number;
-  lora_rank: number | null;
-  lora_alpha: number | null;
-  lora_dropout: number | null;
-  use_rslora: boolean | null;
-  use_dora: boolean | null;
-  output_dir: string | null;
-  load_in_4bit: boolean | null;
-  gradient_accumulation_steps: number | null;
-  max_seq_len: number | null;
-  text_column: string | null;
-  dataset_format: string | null;
-  embedding_lr: number | null;
-  jit_compilation: boolean | null;
-  gradient_checkpointing: boolean | null;
-  flash_attention: boolean | null;
-  fused_optimizer: boolean | null;
-  warmup_steps: number | null;
-  weight_decay: number | null;
-  max_grad_norm: number | null;
-  save_steps: number | null;
-  logging_steps: number | null;
-  lr_scheduler: string | null;
-  sequence_packing: boolean | null;
-  resume_from: string | null;
-  prompt_column: string | null;
-  response_column: string | null;
-  // DPO
-  dpo_beta?: number | null;
-  dpo_loss_type?: string | null;
-  ref_model?: string | null;
-  // SimPO
-  simpo_beta?: number | null;
-  simpo_gamma?: number | null;
-  // ORPO
-  orpo_lambda?: number | null;
-  // KTO
-  kto_desirable_weight?: number | null;
-  kto_undesirable_weight?: number | null;
+  dataset: string;
+  eval_dataset?: string | null;
+  output_dir?: string;
+  learning_rate?: number;
+  embedding_lr?: number | null;
+  batch_size?: number;
+  epochs?: number;
+  max_seq_len?: number;
+  gradient_accumulation_steps?: number;
+  no_gradient_checkpointing?: boolean;
+  gradient_checkpointing_layers?: number;
+  max_grad_norm?: number;
+  warmup_steps?: number;
+  weight_decay?: number;
+  lr_schedule?: string;
+  seed?: number;
+  loss_scale?: number;
+  lora_r?: number;
+  lora_alpha?: number;
+  quantization?: string | null;
+  text_column?: string | null;
+  text_columns?: string | null;
+  column_separator?: string | null;
+  prompt_column?: string | null;
+  response_column?: string | null;
+  no_flash_attention?: boolean;
+  no_sequence_packing?: boolean;
+  no_jit_compilation?: boolean;
+  no_metal_fused_optimizer?: boolean;
+  cut_cross_entropy?: boolean;
+  no_adaptive_lr?: boolean;
+  ane?: boolean;
+  pack_max_seq_len?: number | null;
+  config_path?: string | null;
+  resume?: boolean;
 }
 
 export interface GrpoRun {
@@ -174,20 +166,38 @@ export interface GrpoRun {
   error_message: string | null;
 }
 
-export interface GrpoConfig {
+export interface GrpoSpec {
   model: string;
-  dataset: string | null;
-  epochs: number;
-  learning_rate: number;
-  batch_size: number;
-  group_size: number;
-  beta: number;
-  lora_rank: number | null;
-  lora_alpha: number | null;
-  max_seq_len: number | null;
-  output_dir: string | null;
-  use_reasoning_rewards: boolean | null;
-  text_column: string | null;
+  dataset: string;
+  output_dir?: string;
+  num_generations?: number;
+  beta?: number;
+  learning_rate?: number;
+  epochs?: number;
+  lora_r?: number;
+  lora_alpha?: number;
+  max_seq_len?: number;
+  max_completion_length?: number;
+  seed?: number;
+  dapo?: boolean;
+  reasoning_rewards?: boolean;
+  no_flash_attention?: boolean;
+  vlm?: boolean;
+  max_image_size?: number;
+  reward_model?: string | null;
+  reward_model_max_length?: number;
+  reward_model_weight?: number;
+  reward_model_template?: string | null;
+  speculative?: boolean;
+  speculative_draft_tokens?: number;
+  async_rewards?: boolean;
+  text_column?: string | null;
+  text_columns?: string | null;
+  column_separator?: string | null;
+  prompt_column?: string | null;
+  response_column?: string | null;
+  grpo_kv_bits?: number | null;
+  log_metrics?: string | null;
 }
 
 export type DistillationStatus =
@@ -221,58 +231,61 @@ export interface DistillationRun {
   error_message: string | null;
 }
 
-export interface DistillationConfig {
-  student_model: string;
-  teacher_model: string;
-  dataset: string | null;
-  loss_type: string;
-  temperature: number;
-  alpha: number;
-  epochs: number;
-  learning_rate: number;
-  batch_size: number;
-  lora_rank: number | null;
-  lora_alpha: number | null;
-  max_seq_len: number | null;
-  output_dir: string | null;
-  text_column: string | null;
+export interface DistillSpec {
+  teacher: string;
+  student: string;
+  dataset: string;
+  output_dir?: string;
+  method?: string;
+  offline?: boolean;
+  offline_cache?: string | null;
+  offline_generate?: boolean;
+  offline_compression?: string;
+  offline_top_k?: number;
+  loss_type?: string;
+  temperature?: number;
+  alpha?: number;
+  rationale?: boolean;
+  rationale_weight?: number;
+  lora_r?: number;
+  lora_alpha?: number;
+  learning_rate?: number;
+  batch_size?: number;
+  epochs?: number;
+  max_seq_len?: number;
+  seed?: number;
+  text_column?: string | null;
+  text_columns?: string | null;
+  column_separator?: string | null;
+  prompt_column?: string | null;
+  response_column?: string | null;
+  log_metrics?: string | null;
 }
 
-export interface InferenceConfig {
+export interface InferSpec {
   model: string;
-  lora_path: string | null;
-  prompt: string;
-  messages: InferenceMessage[] | null;
-  system_message: string | null;
-  temperature: number | null;
-  top_k: number | null;
-  top_p: number | null;
-  min_p: number | null;
-  max_tokens: number | null;
-  repetition_penalty: number | null;
-  frequency_penalty: number | null;
-  presence_penalty: number | null;
-  seed: number | null;
-  /** Quantize weights to FP8 E4M3 for ~2x memory savings. */
-  fp8: boolean | null;
-  /** Disable thinking mode for models that support it. */
-  no_thinking: boolean | null;
-  /** Path to packed expert weights directory for SSD-offloaded MoE inference. */
-  experts_dir: string | null;
-  /** KV cache quantization bits (8=q8_0, 4=q4_0, 0=fp16). null = auto. */
-  kv_quant: number | null;
-  /** Override key bits for asymmetric K/V quantization. */
-  kv_k_bits: number | null;
-  /** Override value bits for asymmetric K/V quantization. */
-  kv_v_bits: number | null;
-  /** KV cache quantization group size. */
-  kv_group_size: number | null;
-  /** Disable KV cache quantization entirely (force fp16). */
-  no_kv_quant: boolean | null;
-  /** Use TurboQuant KV cache instead of MLX affine quantization. */
-  kv_turboquant: boolean | null;
-  /** Mixed-bit TurboQuant preset. */
-  kv_turboquant_preset: 'q2_5' | 'q3_5' | null;
+  lora?: string | null;
+  prompt?: string;
+  max_tokens?: number;
+  temperature?: number | null;
+  top_k?: number | null;
+  top_p?: number | null;
+  min_p?: number | null;
+  repetition_penalty?: number | null;
+  frequency_penalty?: number | null;
+  presence_penalty?: number | null;
+  seed?: number | null;
+  system?: string | null;
+  no_thinking?: boolean;
+  fp8?: boolean;
+  experts_dir?: string | null;
+  kv_quant?: number | null;
+  kv_k_bits?: number | null;
+  kv_v_bits?: number | null;
+  kv_group_size?: number;
+  no_kv_quant?: boolean;
+  kv_turboquant?: boolean;
+  kv_turboquant_preset?: 'q2_5' | 'q3_5' | null;
 }
 
 export interface InferenceMessage {
@@ -309,16 +322,17 @@ export interface CachedDatasetInfo {
   size_formatted: string;
 }
 
-export interface MergeConfig {
-  base_model: string;
-  models: MergeModelEntry[];
-  strategy: string;
+export interface MergeSpec {
+  model_a: string;
+  model_b: string;
   output: string;
-}
-
-export interface MergeModelEntry {
-  model: string;
-  weight: number;
+  method?: string;
+  base?: string | null;
+  t?: number;
+  weight_a?: number;
+  weight_b?: number;
+  density?: number;
+  dtype?: string;
 }
 
 export interface MergeStrategy {
@@ -502,14 +516,14 @@ export async function peekDatasetColumns(path: string, limit?: number): Promise<
 // =============================================================================
 
 export async function startTraining(
-  config: TrainingConfig,
+  spec: TrainSpec,
   onMetrics?: (data: Record<string, unknown>) => void,
 ): Promise<string> {
   const channel = new Channel<Record<string, unknown>>();
   if (onMetrics) {
     channel.onmessage = onMetrics;
   }
-  return await invoke('start_training', { config, onMetrics: channel });
+  return await invoke('start_training', { spec, onMetrics: channel });
 }
 
 export async function getTrainingStatus(runId: string): Promise<TrainingRun> {
@@ -566,20 +580,29 @@ export interface ServeInstance {
   log_tail: string[];
 }
 
-export interface ServeConfigDto {
+export interface ServeSpec {
   model: string;
-  host?: string | null;
-  port?: number | null;
-  max_seq_len?: number | null;
-  fp8?: boolean | null;
-  kv_cache?: string | null;
-  kv_group_size?: number | null;
-  lora?: string | null;
+  host?: string;
+  port?: number;
+  max_seq_len?: number;
   experts_dir?: string | null;
+  lora?: string | null;
+  fp8?: boolean;
+  kv_quant?: number | null;
+  no_kv_quant?: boolean;
+  kv_group_size?: number;
+  kv_turboquant?: boolean;
+  kv_turboquant_preset?: string | null;
+  ane?: boolean;
+  ane_max_seq_len?: number;
+  ane_real_time?: boolean;
+  continuous_batch?: boolean;
+  cb_max_slots?: number;
+  cb_max_queue_depth?: number;
 }
 
-export async function startServe(config: ServeConfigDto): Promise<string> {
-  return await invoke('start_serve', { config });
+export async function startServe(spec: ServeSpec): Promise<string> {
+  return await invoke('start_serve', { spec });
 }
 
 export async function stopServe(instanceId: string): Promise<void> {
@@ -638,28 +661,19 @@ export interface BenchRun {
   log_tail: string[];
 }
 
-export interface BenchConfigDto {
-  mode?: string;
+export interface BenchSpec {
   model: string;
-  preset?: string | null;
-  prompt_samples?: number | null;
-  max_prompt_tokens?: number | null;
-  decode_steps?: number | null;
-  inference_warmup?: number | null;
-  inference_repeats?: number | null;
-  inference_context?: string | null;
-  batch_size?: number | null;
-  seq_len?: number | null;
-  json_output?: string | null;
+  batch_size?: number;
+  seq_len?: number;
 }
 
 export async function startBench(
-  config: BenchConfigDto,
+  spec: BenchSpec,
   onEvent?: (e: Record<string, unknown>) => void,
 ): Promise<string> {
   const channel = new Channel<Record<string, unknown>>();
   if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_bench', { config, onEvent: channel });
+  return await invoke('start_bench', { spec, onEvent: channel });
 }
 
 export async function stopBench(runId: string): Promise<void> {
@@ -712,22 +726,22 @@ export interface EvalRun {
   log_tail: string[];
 }
 
-export interface EvalConfigDto {
+export interface EvalSpec {
   model: string;
   dataset: string;
   lora?: string | null;
-  max_seq_len?: number | null;
-  num_samples?: number | null;
-  json_output?: boolean | null;
+  max_seq_len?: number;
+  num_samples?: number;
+  json?: boolean;
 }
 
 export async function startEval(
-  config: EvalConfigDto,
+  spec: EvalSpec,
   onEvent?: (e: Record<string, unknown>) => void,
 ): Promise<string> {
   const channel = new Channel<Record<string, unknown>>();
   if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_eval', { config, onEvent: channel });
+  return await invoke('start_eval', { spec, onEvent: channel });
 }
 
 export async function stopEval(runId: string): Promise<void> {
@@ -761,12 +775,12 @@ export function onEvalStopped(callback: (runId: string) => void): Promise<Unlist
 // =============================================================================
 
 export async function startGrpo(
-  config: GrpoConfig,
+  spec: GrpoSpec,
   onEvent?: (e: Record<string, unknown>) => void,
 ): Promise<string> {
   const channel = new Channel<Record<string, unknown>>();
   if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_grpo', { config, onEvent: channel });
+  return await invoke('start_grpo', { spec, onEvent: channel });
 }
 
 export async function getGrpoStatus(runId: string): Promise<GrpoRun> {
@@ -804,12 +818,12 @@ export function onGrpoUpdate(callback: (run: GrpoRun) => void): Promise<Unlisten
 // =============================================================================
 
 export async function startDistillation(
-  config: DistillationConfig,
+  spec: DistillSpec,
   onEvent?: (e: Record<string, unknown>) => void,
 ): Promise<string> {
   const channel = new Channel<Record<string, unknown>>();
   if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_distillation', { config, onEvent: channel });
+  return await invoke('start_distillation', { spec, onEvent: channel });
 }
 
 export async function getDistillationStatus(runId: string): Promise<DistillationRun> {
@@ -846,8 +860,8 @@ export function onDistillationUpdate(callback: (run: DistillationRun) => void): 
 // Inference API
 // =============================================================================
 
-export async function startInference(config: InferenceConfig): Promise<void> {
-  return await invoke('start_inference', { config });
+export async function startInference(spec: InferSpec, messages?: InferenceMessage[] | null): Promise<void> {
+  return await invoke('start_inference', { spec, messages: messages ?? null });
 }
 
 export async function stopInference(): Promise<void> {
@@ -887,8 +901,8 @@ export function onInferenceError(callback: (message: string) => void): Promise<U
 // Merge API
 // =============================================================================
 
-export async function mergeModels(config: MergeConfig): Promise<string> {
-  return await invoke('merge_models', { config });
+export async function mergeModels(spec: MergeSpec): Promise<string> {
+  return await invoke('merge_models', { spec });
 }
 
 export async function getMergeStrategies(): Promise<MergeStrategy[]> {
@@ -965,34 +979,38 @@ export interface PretrainRun {
   log_tail: string[];
 }
 
-export interface PretrainConfigDto {
+export interface PretrainSpec {
   arch: string;
+  shards?: string | null;
+  seq_len?: number;
+  batch_size?: number;
+  steps?: number;
+  learning_rate?: number;
+  min_lr?: number;
+  warmup_steps?: number;
+  lr_schedule?: string;
+  weight_decay?: number;
+  max_grad_norm?: number;
+  eos_token_id?: number;
+  output_dir?: string;
+  checkpoint_every?: number;
+  resume?: string | null;
   model_config?: string | null;
-  shard_paths?: string | null;
-  seq_len?: number | null;
-  batch_size?: number | null;
-  grad_accum?: number | null;
-  steps?: number | null;
-  learning_rate?: number | null;
-  min_lr?: number | null;
-  warmup_steps?: number | null;
-  lr_schedule?: string | null;
-  weight_decay?: number | null;
-  max_grad_norm?: number | null;
-  z_loss?: number | null;
-  eos_token_id?: number | null;
-  checkpoint_every?: number | null;
-  output_dir?: string | null;
-  seed?: number | null;
+  z_loss?: number;
+  gradient_accumulation_steps?: number;
+  log_every?: number;
+  eval_every?: number;
+  eval_batches?: number;
+  seed?: number;
 }
 
 export async function startPretrain(
-  config: PretrainConfigDto,
+  spec: PretrainSpec,
   onEvent?: (e: Record<string, unknown>) => void,
 ): Promise<string> {
   const channel = new Channel<Record<string, unknown>>();
   if (onEvent) channel.onmessage = onEvent;
-  return await invoke('start_pretrain', { config, onEvent: channel });
+  return await invoke('start_pretrain', { spec, onEvent: channel });
 }
 
 export async function listPretrainRuns(): Promise<PretrainRun[]> {

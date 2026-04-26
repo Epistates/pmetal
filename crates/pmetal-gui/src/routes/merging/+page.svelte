@@ -2,23 +2,28 @@
   import { onMount } from 'svelte';
   import { modelsStore } from '$lib/stores.svelte';
   import { getMergeStrategies, mergeModels } from '$lib/api';
-  import type { MergeStrategy, MergeModelEntry, MergeConfig } from '$lib/api';
+  import type { MergeStrategy, MergeSpec } from '$lib/api';
 
   let models = $derived(modelsStore.models);
   let strategies = $state<MergeStrategy[]>([]);
   let loadingStrategies = $state(true);
 
   // Form state
+  let modelA = $state('');
+  let modelB = $state('');
   let baseModel = $state('');
-  let selectedStrategy = $state('');
+  let selectedStrategy = $state('slerp');
   let outputPath = $state('');
-  let modelEntries = $state<MergeModelEntry[]>([{ model: '', weight: 1.0 }]);
+  let weightA = $state(0.5);
+  let weightB = $state(0.5);
+  let slerpT = $state(0.5);
+  let density = $state(0.5);
+  let dtype = $state('bfloat16');
   let isSubmitting = $state(false);
   let formError = $state<string | null>(null);
   let mergeSuccess = $state<string | null>(null);
 
   let currentStrategy = $derived(strategies.find(s => s.name === selectedStrategy));
-  let canAddMore = $derived(modelEntries.length < 5);
 
   onMount(async () => {
     try {
@@ -33,59 +38,37 @@
     }
   });
 
-  function addModelEntry() {
-    if (canAddMore) {
-      modelEntries = [...modelEntries, { model: '', weight: 1.0 }];
-    }
-  }
-
-  function removeModelEntry(index: number) {
-    if (modelEntries.length > 1) {
-      modelEntries = modelEntries.filter((_, i) => i !== index);
-    }
-  }
-
-  function updateModelEntry(index: number, field: 'model' | 'weight', value: string | number) {
-    modelEntries = modelEntries.map((entry, i) =>
-      i === index ? { ...entry, [field]: value } : entry
-    );
-  }
-
   async function handleSubmit(e: Event) {
     e.preventDefault();
     formError = null;
     mergeSuccess = null;
 
-    if (!baseModel) { formError = 'Please select a base model'; return; }
+    if (!modelA) { formError = 'Please select Model A'; return; }
+    if (!modelB) { formError = 'Please select Model B'; return; }
+    if (modelA === modelB) { formError = 'Model A and Model B must be different'; return; }
     if (!selectedStrategy) { formError = 'Please select a merge strategy'; return; }
-    const validEntries = modelEntries.filter(e => e.model);
-    if (validEntries.length === 0) { formError = 'Please add at least one model to merge'; return; }
     if (!outputPath) { formError = 'Please specify an output path'; return; }
 
     isSubmitting = true;
     try {
-      const config: MergeConfig = {
-        base_model: baseModel,
-        models: validEntries,
-        strategy: selectedStrategy,
+      const spec: MergeSpec = {
+        model_a: modelA,
+        model_b: modelB,
         output: outputPath,
+        method: selectedStrategy,
+        base: baseModel || undefined,
+        t: slerpT,
+        weight_a: weightA,
+        weight_b: weightB,
+        density,
+        dtype,
       };
-      const result = await mergeModels(config);
+      const result = await mergeModels(spec);
       mergeSuccess = `Merge completed! Output saved to: ${result}`;
     } catch (e) {
       formError = e instanceof Error ? e.message : String(e);
     } finally {
       isSubmitting = false;
-    }
-  }
-
-  function normalizeWeights() {
-    const total = modelEntries.reduce((sum, e) => sum + e.weight, 0);
-    if (total > 0) {
-      modelEntries = modelEntries.map(e => ({
-        ...e,
-        weight: Math.round((e.weight / total) * 10000) / 10000,
-      }));
     }
   }
 </script>
@@ -133,95 +116,76 @@
           </div>
         </div>
 
-        <!-- Base Model -->
-        <div class="card">
-          <div class="card-header">
-            <h3 class="font-semibold text-surface-900 dark:text-surface-100">Base Model</h3>
-          </div>
-          <div class="card-body">
-            <select class="input" bind:value={baseModel}>
-              <option value="">Select base model...</option>
-              {#each models as model}
-                <option value={model.id}>{model.id} ({model.size_formatted})</option>
-              {/each}
-            </select>
-            <p class="text-xs text-surface-500 mt-1">The base architecture. Other models are merged relative to this one.</p>
-          </div>
-        </div>
-
         <!-- Models to merge -->
         <div class="card">
-          <div class="card-header flex items-center justify-between">
-            <h3 class="font-semibold text-surface-900 dark:text-surface-100">Models to Merge</h3>
-            <div class="flex gap-2">
-              {#if currentStrategy?.supports_weights}
-                <button type="button" class="btn-ghost btn-sm" onclick={normalizeWeights} title="Normalize weights to sum to 1.0">
-                  Normalize
-                </button>
-              {/if}
-              <button
-                type="button"
-                class="btn-secondary btn-sm"
-                onclick={addModelEntry}
-                disabled={!canAddMore}
-              >
-                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
-                </svg>
-                Add Model
-              </button>
-            </div>
+          <div class="card-header">
+            <h3 class="font-semibold text-surface-900 dark:text-surface-100">Models</h3>
           </div>
-          <div class="card-body space-y-3">
-            {#each modelEntries as entry, index}
-              <div class="flex items-center gap-3">
-                <div class="flex-1">
-                  <select
-                    class="input"
-                    value={entry.model}
-                    onchange={(e) => updateModelEntry(index, 'model', (e.target as HTMLSelectElement).value)}
-                  >
-                    <option value="">Select model {index + 1}...</option>
-                    {#each models as model}
-                      <option value={model.id}>{model.id}</option>
-                    {/each}
-                  </select>
-                </div>
-
-                {#if currentStrategy?.supports_weights}
-                  <div class="w-28 flex-shrink-0">
-                    <input
-                      type="number"
-                      class="input text-sm"
-                      placeholder="Weight"
-                      step="0.05"
-                      min="0"
-                      max="1"
-                      value={entry.weight}
-                      oninput={(e) => updateModelEntry(index, 'weight', parseFloat((e.target as HTMLInputElement).value) || 0)}
-                    />
-                  </div>
-                {/if}
-
-                <button
-                  type="button"
-                  class="btn-ghost btn-sm text-red-500 hover:text-red-700 flex-shrink-0"
-                  onclick={() => removeModelEntry(index)}
-                  disabled={modelEntries.length === 1}
-                  title="Remove"
-                >
-                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
-                  </svg>
-                </button>
+          <div class="card-body space-y-4">
+            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+              <div>
+                <label class="label" for="merge-model-a">Model A</label>
+                <select id="merge-model-a" class="input" bind:value={modelA}>
+                  <option value="">Select Model A...</option>
+                  {#each models as model}
+                    <option value={model.id}>{model.id} ({model.size_formatted})</option>
+                  {/each}
+                </select>
               </div>
-            {/each}
+              <div>
+                <label class="label" for="merge-model-b">Model B</label>
+                <select id="merge-model-b" class="input" bind:value={modelB}>
+                  <option value="">Select Model B...</option>
+                  {#each models as model}
+                    <option value={model.id}>{model.id} ({model.size_formatted})</option>
+                  {/each}
+                </select>
+              </div>
+            </div>
+
+            <div>
+              <label class="label" for="merge-base">Base Model <span class="text-surface-400">(optional, for TIES/DARE)</span></label>
+              <select id="merge-base" class="input" bind:value={baseModel}>
+                <option value="">None</option>
+                {#each models as model}
+                  <option value={model.id}>{model.id} ({model.size_formatted})</option>
+                {/each}
+              </select>
+            </div>
 
             {#if currentStrategy?.supports_weights}
-              <div class="pt-2 text-xs text-surface-500">
-                Total weight: {modelEntries.reduce((s, e) => s + e.weight, 0).toFixed(2)}
+              <div class="grid grid-cols-2 gap-4">
+                <div>
+                  <label class="label" for="merge-weight-a">Weight A</label>
+                  <input id="merge-weight-a" type="number" class="input" step="0.05" min="0" max="10" bind:value={weightA} />
+                </div>
+                <div>
+                  <label class="label" for="merge-weight-b">Weight B</label>
+                  <input id="merge-weight-b" type="number" class="input" step="0.05" min="0" max="10" bind:value={weightB} />
+                </div>
               </div>
             {/if}
+
+            <div class="grid grid-cols-3 gap-4">
+              <div>
+                <label class="label" for="merge-t">SLERP t</label>
+                <input id="merge-t" type="number" class="input" step="0.05" min="0" max="1" bind:value={slerpT} />
+                <p class="text-xs text-surface-400 mt-0.5">0=Model A, 1=Model B</p>
+              </div>
+              <div>
+                <label class="label" for="merge-density">Density</label>
+                <input id="merge-density" type="number" class="input" step="0.05" min="0" max="1" bind:value={density} />
+                <p class="text-xs text-surface-400 mt-0.5">For DARE/TIES pruning</p>
+              </div>
+              <div>
+                <label class="label" for="merge-dtype">Output Dtype</label>
+                <select id="merge-dtype" class="input" bind:value={dtype}>
+                  <option value="bfloat16">bfloat16</option>
+                  <option value="float16">float16</option>
+                  <option value="float32">float32</option>
+                </select>
+              </div>
+            </div>
           </div>
         </div>
 
