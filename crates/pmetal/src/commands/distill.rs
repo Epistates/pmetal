@@ -1,5 +1,13 @@
 use pmetal_data::{DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
 
+// Phase 4 follow-up: the `parse_method` / `parse_loss_type` /
+// `parse_compression_method` / `resolve_offline_config` helpers below duplicate
+// the enum options that are now declared (and descriptor-validated) in
+// `pmetal_core::jobs::DistillSpec`. The Phase 5 CLI adoption sweep should
+// replace `run_distillation_cli`'s flat parameter list with a single
+// `DistillSpec` argument, call `spec.normalize()` at the call site, and remove
+// these matchers in favour of the already-validated typed enums.
+
 #[derive(Debug, Clone, Default)]
 pub(crate) struct OfflineCliOptions {
     pub enabled: bool,
@@ -166,7 +174,6 @@ fn validate_cache_for_generation(
     }
     Ok(())
 }
-
 /// Run knowledge distillation.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_distillation_cli(

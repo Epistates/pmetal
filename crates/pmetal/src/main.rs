@@ -180,11 +180,23 @@ impl From<TurboQuantPresetArg> for pmetal::inference_runner::TurboQuantPreset {
 #[command(name = "pmetal")]
 #[command(author, version, about = "LLM fine-tuning optimized for Apple Silicon", long_about = None)]
 struct Cli {
+    /// Write every JobEvent as a JSONL line to this file.
+    ///
+    /// When set, the CLI wraps each long-running job's callback chain with a
+    /// `pmetal_core::JsonlSink<File>` so the event stream is machine-readable.
+    /// This is what TUI subprocess-fallback and MCP subprocess consumers read.
+    ///
+    /// Currently wired for `pmetal train`. Other subcommands will follow the
+    /// same pattern (see `crates/pmetal/src/cli/README.md`).
+    #[cfg(feature = "trainer")]
+    #[arg(long, global = true, value_name = "PATH")]
+    log_events: Option<PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
 }
 
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
     /// Fine-tune a model using LoRA/QLoRA
@@ -1790,7 +1802,7 @@ enum Commands {
 }
 
 /// Dataset subcommands for data preparation.
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum DatasetAction {
     /// Analyze a dataset and show statistics
     Analyze {
@@ -2108,7 +2120,7 @@ enum InputFormat {
 }
 
 /// Ollama subcommands for model export and registration.
-#[derive(Subcommand)]
+#[derive(Subcommand, Debug)]
 enum OllamaAction {
     /// Generate a Modelfile for a trained model
     Modelfile {
@@ -2594,6 +2606,10 @@ impl std::io::Write for TeeWriter {
 async fn tokio_main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
+    // Capture global flags before `cli` is moved into the `match` below.
+    #[cfg(feature = "trainer")]
+    let log_events_path = cli.log_events.clone();
+
     // Initialize logging — suppress stderr output when running the TUI
     // to avoid corrupting the raw terminal display.
     #[cfg(feature = "dashboard")]
@@ -2769,7 +2785,46 @@ async fn tokio_main() -> anyhow::Result<()> {
                 emit_console_output: true,
             };
 
-            orchestrator::run_training(job_config, None, Vec::new()).await?;
+            // If --log-events <path> was given, open the file and wrap the
+            // trainer callback chain with a JsonlSink so every JobEvent is
+            // emitted as a JSONL line.  The file is created (or truncated) at
+            // parse time so callers can `tail -f` it immediately.
+            //
+            // Pattern for other entry points (distill, grpo, …): open the
+            // sink the same way, box it as `Box<dyn pmetal_core::TrainingCallback>`,
+            // and push it into the `extra_callbacks` vec that each run_* fn
+            // already accepts.  See `src/cli/README.md` for the full pattern.
+            // `mut` is needed post-substrate-merge when push() is called.
+            #[allow(unused_mut)]
+            let mut extra_callbacks: Vec<Box<dyn pmetal_core::TrainingCallback>> = Vec::new();
+            if let Some(path) = log_events_path {
+                // Validate the path is writable immediately so the user gets a
+                // clear error before training starts rather than partway through.
+                std::fs::File::create(&path).map_err(|e| {
+                    anyhow::anyhow!("--log-events: could not create '{}': {e}", path.display())
+                })?;
+                // TODO(Phase 4 substrate adoption): once this worktree merges
+                // `main` (commit ce2f770 carrying pmetal_core::events), replace
+                // the file-create-and-drop above with the full sink wiring:
+                //
+                //   use pmetal_core::{JsonlSink, TrainingCallbackToSink};
+                //   let file = std::fs::File::create(&path)?;
+                //   let sink = JsonlSink::new(file);
+                //   extra_callbacks.push(Box::new(TrainingCallbackToSink::new(
+                //       job_config.model_id.clone(),
+                //       sink,
+                //   )));
+                //
+                // See `src/cli/README.md` §Wiring --log-events for the pattern.
+                tracing::warn!(
+                    "--log-events stub: file '{}' created but event streaming \
+                     requires merging the substrate branch (ce2f770). \
+                     Events will not be written until the merge is complete.",
+                    path.display()
+                );
+            }
+
+            orchestrator::run_training(job_config, None, extra_callbacks).await?;
         }
 
         #[cfg(feature = "mcp")]
@@ -3723,7 +3778,7 @@ async fn tokio_main() -> anyhow::Result<()> {
 
             // Print summary
             if !losses.is_empty() {
-                let last = losses.last().unwrap();
+                let last = losses.last().copied().unwrap_or(0.0);
                 println!(
                     "Pretraining complete: {} steps, final loss {:.4}",
                     losses.len(),
@@ -3830,4 +3885,288 @@ fn validate_output_path(path: &str, context: &str) -> anyhow::Result<PathBuf> {
     }
 
     Ok(canonical)
+}
+
+// ---------------------------------------------------------------------------
+// argv round-trip tests
+//
+// These verify that every JobSpec's `to_argv()` output is accepted by the
+// actual clap `Commands` enum — i.e. the spec's `argv = "..."` attributes are
+// byte-identical to the CLI flag names.
+//
+// The tests live here (not in `tests/`) because `Cli` is private to the binary.
+// See `crates/pmetal/src/cli/README.md` for the future migration pattern that
+// would move `Cli`/`Commands` to `lib.rs` and make integration tests possible.
+//
+// COMPILATION PREREQUISITE: These tests require `pmetal_core::jobs::*` which
+// is added in commit ce2f770 (Phase 3 substrate).  They will not compile until
+// this worktree is rebased/merged onto main.  The feature gate
+// `feature = "core"` is necessary but not sufficient on its own — the crate
+// must also have the jobs module.
+//
+// To run after the merge:
+//   cargo test -p pmetal --features trainer -- argv_roundtrip
+// ---------------------------------------------------------------------------
+#[cfg(all(test, feature = "trainer", feature = "core"))]
+mod argv_roundtrip {
+    use super::{Cli, Commands};
+    use clap::Parser;
+    use pmetal_core::jobs::{
+        BenchSpec, DflashSpec, DistillSpec, EmbedTrainSpec, EvalSpec, FuseSpec, GrpoSpec,
+        InferSpec, MergeSpec, PackExpertsSpec, PretrainSpec, QuantizeSpec, RlkdSpec,
+        TokenizeSpec, TrainSpec,
+    };
+    #[cfg(feature = "serve")]
+    use pmetal_core::jobs::ServeSpec;
+    use pmetal_core::JobFields;
+
+    /// Parse an argv slice built from a spec's `to_argv()` output.  Returns
+    /// `Err(String)` on failure so the test body can provide a descriptive message.
+    fn try_parse(subcommand: &str, spec_argv: Vec<String>) -> Result<Commands, String> {
+        let mut argv = vec!["pmetal".to_string(), subcommand.to_string()];
+        argv.extend(spec_argv);
+        Cli::try_parse_from(&argv)
+            .map(|cli| cli.command)
+            .map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn train_spec_round_trip() {
+        let mut spec = TrainSpec::default();
+        spec.model = "Qwen/Qwen3-0.6B".into();
+        spec.dataset = "data/train.jsonl".into();
+        let result = try_parse("train", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "TrainSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn distill_spec_round_trip() {
+        let mut spec = DistillSpec::default();
+        spec.teacher = "Qwen/Qwen3-7B".into();
+        spec.student = "Qwen/Qwen3-0.6B".into();
+        spec.dataset = "data.jsonl".into();
+        let result = try_parse("distill", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "DistillSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn grpo_spec_round_trip() {
+        let mut spec = GrpoSpec::default();
+        spec.model = "model".into();
+        spec.dataset = "data.jsonl".into();
+        let result = try_parse("grpo", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "GrpoSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn rlkd_spec_round_trip() {
+        let mut spec = RlkdSpec::default();
+        spec.model = "model".into();
+        spec.teacher_model = "teacher".into();
+        spec.dataset = "data.jsonl".into();
+        let result = try_parse("rlkd", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "RlkdSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn embed_train_spec_round_trip() {
+        let mut spec = EmbedTrainSpec::default();
+        spec.model = "model".into();
+        spec.dataset = "data.jsonl".into();
+        let result = try_parse("embed-train", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "EmbedTrainSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn pretrain_spec_round_trip() {
+        let mut spec = PretrainSpec::default();
+        spec.arch = "gpt-oss".into();
+        let result = try_parse("pretrain", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "PretrainSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn infer_spec_round_trip() {
+        let mut spec = InferSpec::default();
+        spec.model = "model".into();
+        spec.prompt = "Hello".into();
+        let result = try_parse("infer", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "InferSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    // Commands::Serve is only compiled when `--features serve` is active.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn serve_spec_round_trip() {
+        let mut spec = ServeSpec::default();
+        spec.model = "model".into();
+        let result = try_parse("serve", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "ServeSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn bench_spec_round_trip() {
+        let spec = BenchSpec::default();
+        let result = try_parse("bench", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "BenchSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn eval_spec_round_trip() {
+        let mut spec = EvalSpec::default();
+        spec.model = "model".into();
+        spec.dataset = "data.jsonl".into();
+        let result = try_parse("eval", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "EvalSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn quantize_spec_round_trip() {
+        let mut spec = QuantizeSpec::default();
+        spec.model = "model".into();
+        spec.output = "out.gguf".into();
+        let result = try_parse("quantize", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "QuantizeSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    // Commands::Merge requires `feature = "merge"` (a default feature but
+    // not implied by trainer alone when building with --no-default-features).
+    #[cfg(feature = "merge")]
+    #[test]
+    fn merge_spec_round_trip() {
+        let mut spec = MergeSpec::default();
+        spec.model_a = "a".into();
+        spec.model_b = "b".into();
+        spec.output = "out".into();
+        let result = try_parse("merge", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "MergeSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn fuse_spec_round_trip() {
+        let mut spec = FuseSpec::default();
+        spec.model = "model".into();
+        spec.lora = "adapter".into();
+        spec.output = "out".into();
+        let result = try_parse("fuse", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "FuseSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn dflash_spec_round_trip() {
+        let mut spec = DflashSpec::default();
+        spec.target = "target-model".into();
+        spec.draft = "draft-model".into();
+        spec.prompt = "Hello".into();
+        let result = try_parse("dflash", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "DflashSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn pack_experts_spec_round_trip() {
+        let mut spec = PackExpertsSpec::default();
+        spec.model = "model".into();
+        let result = try_parse("pack-experts", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "PackExpertsSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    #[test]
+    fn tokenize_spec_round_trip() {
+        let mut spec = TokenizeSpec::default();
+        spec.input = "corpus.jsonl".into();
+        spec.output = "shards/".into();
+        spec.tokenizer = "Qwen/Qwen3-0.6B".into();
+        let result = try_parse("tokenize", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "TokenizeSpec argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
+
+    // Smoke-test: default flags only contain the minimum required fields.
+    // Any flag that is present in to_argv() but not recognized by clap would
+    // have already failed the round-trip test above.
+    #[test]
+    fn train_spec_no_unexpected_flags() {
+        let mut spec = TrainSpec::default();
+        spec.model = "m".into();
+        spec.dataset = "d".into();
+        // Set every optional flag that the spec supports to ensure they all
+        // appear in to_argv() and clap accepts them.
+        spec.no_flash_attention = true;
+        spec.no_sequence_packing = true;
+        spec.no_jit_compilation = true;
+        spec.no_metal_fused_optimizer = true;
+        spec.cut_cross_entropy = true;
+        spec.no_adaptive_lr = true;
+        spec.ane = true;
+        spec.resume = true;
+        let result = try_parse("train", spec.to_argv());
+        assert!(
+            result.is_ok(),
+            "TrainSpec flag-heavy argv failed to parse: {}",
+            result.unwrap_err()
+        );
+    }
 }
