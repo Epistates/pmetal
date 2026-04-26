@@ -195,6 +195,135 @@ impl InlineArray {
         check_last_error()?;
         Ok(out)
     }
+
+    /// Checked sparse cross-entropy (integer-class targets).
+    pub fn try_cross_entropy_sparse(&self, indices: &Self, axis: i32) -> BridgeResult<Self> {
+        let out = self.cross_entropy_sparse(indices, axis);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked log-softmax along `axis`.
+    pub fn try_log_softmax(&self, axis: i32) -> BridgeResult<Self> {
+        let out = self.log_softmax(axis);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked clip — bounds may be `None` for one-sided clipping.
+    pub fn try_clip(&self, lo: Option<&Self>, hi: Option<&Self>) -> BridgeResult<Self> {
+        let out = self.clip(lo, hi);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked layer norm.
+    pub fn try_layer_norm(
+        &self,
+        weight: Option<&Self>,
+        bias: Option<&Self>,
+        eps: f32,
+    ) -> BridgeResult<Self> {
+        let out = self.layer_norm(weight, bias, eps);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked constant-pad. `pad_widths_flat` must have length `2 * ndim`.
+    pub fn try_pad_constant(
+        &self,
+        pad_widths_flat: &[i32],
+        fill_value: f32,
+    ) -> BridgeResult<Self> {
+        let out = self.pad_constant(pad_widths_flat, fill_value);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked leaky-ReLU activation.
+    pub fn try_leaky_relu(&self, neg_slope: f32) -> BridgeResult<Self> {
+        let out = self.leaky_relu(neg_slope);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked addmm (`c + a @ b`).
+    pub fn try_addmm(c: &Self, a: &Self, b: &Self) -> BridgeResult<Self> {
+        let out = Self::addmm(c, a, b);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked 1-D convolution.
+    pub fn try_conv1d(
+        &self,
+        weight: &Self,
+        stride: i32,
+        padding: i32,
+        dilation: i32,
+        groups: i32,
+    ) -> BridgeResult<Self> {
+        let out = self.conv1d(weight, stride, padding, dilation, groups);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked 2-D convolution (NHWC, MLX standard).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_conv2d(
+        &self,
+        weight: &Self,
+        stride_h: i32,
+        stride_w: i32,
+        pad_h: i32,
+        pad_w: i32,
+        dil_h: i32,
+        dil_w: i32,
+        groups: i32,
+    ) -> BridgeResult<Self> {
+        let out = self.conv2d(weight, stride_h, stride_w, pad_h, pad_w, dil_h, dil_w, groups);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked tri-inverse (lower or upper triangular). `use_cpu=true` forces
+    /// CPU dispatch (matching mlx-lm's WY-factorization usage).
+    pub fn try_tri_inv(&self, upper: bool, use_cpu: bool) -> BridgeResult<Self> {
+        let out = self.tri_inv(upper, use_cpu);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked SVD — returns `(U, S, Vt)`.
+    pub fn try_svd(&self) -> BridgeResult<(Self, Self, Self)> {
+        let out = self.svd();
+        check_last_error()?;
+        Ok(out)
+    }
+
+    // ── Shape ops ───────────────────────────────────────────────────────
+
+    /// Checked single-axis squeeze. Out-of-range axis surfaces as
+    /// `BridgeError::CxxException`.
+    pub fn try_squeeze(&self, axis: i32) -> BridgeResult<Self> {
+        let out = self.squeeze(axis);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked single-axis expand_dims.
+    pub fn try_expand_dims(&self, axis: i32) -> BridgeResult<Self> {
+        let out = self.expand_dims(axis);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked transpose. Permutation must contain each axis index exactly once.
+    pub fn try_transpose_axes(&self, axes: &[i32]) -> BridgeResult<Self> {
+        let out = self.transpose_axes(axes);
+        check_last_error()?;
+        Ok(out)
+    }
 }
 
 #[cfg(test)]

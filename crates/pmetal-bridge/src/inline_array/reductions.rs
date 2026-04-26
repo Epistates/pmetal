@@ -187,29 +187,41 @@ impl InlineArray {
     }
 
     // ── Scalar reductions (mlx-rs compat) ───────────────────────────────
+    //
+    // The optional `axis` argument is now honored to match mlx-rs semantics:
+    //   * `Some(ax)`: reduce along that axis (no keepdims).
+    //   * `None`:     global reduction (flatten then reduce).
 
-    /// Reduce to the global maximum (returns scalar array).
-    pub fn max(&self, _axis: Option<i32>) -> Self {
-        // The vocoder code uses `.max(None)` for global max.
-        // We reduce all axes by flattening first.
-        let flat = self.flatten(0, -1);
-        flat.max_axis(0, false)
+    /// Reduce to the maximum (along `axis` if provided, else global scalar).
+    pub fn max(&self, axis: Option<i32>) -> Self {
+        match axis {
+            Some(ax) => self.max_axis(ax, false),
+            None => self.flatten(0, -1).max_axis(0, false),
+        }
     }
 
-    /// Reduce to the global minimum (returns scalar array).
-    pub fn min(&self, _axis: Option<i32>) -> Self {
-        let flat = self.flatten(0, -1);
-        flat.min_axis(0, false)
+    /// Reduce to the minimum (along `axis` if provided, else global scalar).
+    pub fn min(&self, axis: Option<i32>) -> Self {
+        match axis {
+            Some(ax) => self.min_axis(ax, false),
+            None => self.flatten(0, -1).min_axis(0, false),
+        }
     }
 
-    /// Reduce to the global sum (returns scalar array).
-    pub fn sum(&self, _axis: Option<i32>) -> Self {
-        self.sum_all()
+    /// Reduce to a sum (along `axis` if provided, else global scalar).
+    pub fn sum(&self, axis: Option<i32>) -> Self {
+        match axis {
+            Some(ax) => self.sum_axes(&[ax], false),
+            None => self.sum_all(),
+        }
     }
 
-    /// Reduce to the global mean (returns scalar array).
-    pub fn mean(&self, _axis: Option<i32>) -> Self {
-        self.mean_all()
+    /// Reduce to a mean (along `axis` if provided, else global scalar).
+    pub fn mean(&self, axis: Option<i32>) -> Self {
+        match axis {
+            Some(ax) => self.mean_axis(ax, false),
+            None => self.mean_all(),
+        }
     }
 
     /// mlx-rs compat alias.

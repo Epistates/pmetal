@@ -66,25 +66,29 @@ impl InlineArray {
     }
 
     // ── Item extraction ──────────────────────────────────────────────────
+    //
+    // The C++ FFI signatures take `mlx_inline_array*` for ABI uniformity but
+    // both ops only mutate through MLX's internal interior-mutability: eval
+    // materializes the backing graph and item<T> reads the resulting scalar.
+    // Cloning self before the call would only bump the underlying refcount
+    // without changing observable behavior, so we route the read through a
+    // const→mut pointer cast (matches `eval()` above).
 
     pub fn item_f32(&self) -> f32 {
-        let mut owned = self.clone();
-        owned.eval();
-        unsafe { mlx_inline_item_f32(&mut owned.raw) }
+        self.eval();
+        unsafe { mlx_inline_item_f32(std::ptr::from_ref(&self.raw).cast_mut()) }
     }
     pub fn item_u32(&self) -> u32 {
-        let mut owned = self.clone();
-        owned.eval();
-        unsafe { mlx_inline_item_u32(&mut owned.raw) }
+        self.eval();
+        unsafe { mlx_inline_item_u32(std::ptr::from_ref(&self.raw).cast_mut()) }
     }
 
     // ── Item extraction (generic) ────────────────────────────────────────
 
     /// Extract the scalar value from a 0-d array. Evaluates lazily if needed.
-    /// `T` must be `f32` or `u32` (the only types exported by the bridge).
+    /// `T` must be `f32`, `u32`, or `i32` (the bridge-exported scalar types).
     pub fn item<T: BridgeScalar>(&self) -> T {
-        let mut owned = self.clone();
-        owned.eval();
-        T::extract(&mut owned)
+        self.eval();
+        T::extract(self)
     }
 }

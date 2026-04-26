@@ -118,13 +118,19 @@ impl InlineArray {
     }
 
     /// Squeeze all size-1 dimensions (multi-axis compat alias).
+    ///
+    /// Process axes in descending order so each squeeze leaves the remaining
+    /// axis indices valid. Avoids an initial `self.clone()` by performing the
+    /// first squeeze directly against `self`.
     #[inline]
     pub fn squeeze_axes(&self, axes: &[i32]) -> Self {
-        let mut result = self.clone();
-        // Process axes in descending order to maintain correct indices
+        if axes.is_empty() {
+            return self.clone();
+        }
         let mut sorted = axes.to_vec();
         sorted.sort_unstable_by(|a, b| b.cmp(a));
-        for &ax in &sorted {
+        let mut result = self.squeeze(sorted[0]);
+        for &ax in &sorted[1..] {
             result = result.squeeze(ax);
         }
         result
@@ -143,14 +149,19 @@ impl InlineArray {
 
     /// Multi-axis expand_dims — insert a new size-1 axis at each position.
     ///
-    /// Compatible with mlx-rs `expand_dims_axes(&[ax1, ax2, ...])`.
+    /// Compatible with mlx-rs `expand_dims_axes(&[ax1, ax2, ...])`. Insert in
+    /// ascending order so each prior insertion remains at its requested axis.
+    /// Avoids an initial `self.clone()` by performing the first insertion
+    /// directly against `self`.
     #[inline]
     pub fn expand_dims_axes(&self, axes: &[i32]) -> Self {
-        let mut result = self.clone();
-        // Insert axes in ascending order (each insertion shifts subsequent axes)
+        if axes.is_empty() {
+            return self.clone();
+        }
         let mut sorted = axes.to_vec();
         sorted.sort_unstable();
-        for &ax in &sorted {
+        let mut result = self.expand_dims(sorted[0]);
+        for &ax in &sorted[1..] {
             result = result.expand_dims(ax);
         }
         result

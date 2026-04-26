@@ -109,10 +109,12 @@ impl ArrayElement for usize {
 
 /// Sealed trait for extracting a scalar value from an [`InlineArray`].
 ///
-/// Only `f32` and `u32` are supported — they are the types the bridge FFI
-/// exposes via `mlx_inline_item_f32` / `mlx_inline_item_u32`.
+/// Only `f32`, `u32`, and `i32` are supported — they are the types the bridge
+/// FFI exposes via `mlx_inline_item_f32` / `mlx_inline_item_u32`. The trait
+/// reads through `&InlineArray` because the underlying readback is logically
+/// const (eval is interior-mutable on the MLX side).
 pub trait BridgeScalar: private::Sealed {
-    fn extract(arr: &mut InlineArray) -> Self;
+    fn extract(arr: &InlineArray) -> Self;
 }
 
 mod private {
@@ -123,19 +125,19 @@ mod private {
 }
 
 impl BridgeScalar for f32 {
-    fn extract(arr: &mut InlineArray) -> f32 {
+    fn extract(arr: &InlineArray) -> f32 {
         arr.item_f32()
     }
 }
 
 impl BridgeScalar for u32 {
-    fn extract(arr: &mut InlineArray) -> u32 {
+    fn extract(arr: &InlineArray) -> u32 {
         arr.item_u32()
     }
 }
 
 impl BridgeScalar for i32 {
-    fn extract(arr: &mut InlineArray) -> i32 {
+    fn extract(arr: &InlineArray) -> i32 {
         arr.item_u32() as i32
     }
 }
