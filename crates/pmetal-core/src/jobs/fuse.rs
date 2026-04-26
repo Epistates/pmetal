@@ -4,7 +4,7 @@ use crate::{FieldError, JobFields};
 use pmetal_core_derive::JobSpec;
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize, JobSpec)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JobSpec)]
 #[spec(kind = "Fuse", subcommand = "fuse")]
 #[serde(rename_all = "snake_case")]
 pub struct FuseSpec {
@@ -35,20 +35,6 @@ pub struct FuseSpec {
     #[job(label = "Low-Memory", group = "Method", argv = "--low-memory", flag, default_bool = false)]
     #[serde(default)]
     pub low_memory: bool,
-}
-
-impl Default for FuseSpec {
-    fn default() -> Self {
-        Self {
-            model: String::new(),
-            lora: String::new(),
-            output: String::new(),
-            alpha: None,
-            rank: None,
-            accurate: false,
-            low_memory: false,
-        }
-    }
 }
 
 impl FuseSpec {

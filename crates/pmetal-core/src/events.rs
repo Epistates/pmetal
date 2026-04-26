@@ -411,10 +411,11 @@ impl JobEvent {
 ///
 /// Drive transitions via [`JobStatus::apply_event`] so every surface advances
 /// state the same way. Replaces all per-tab `*Status` enums.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum JobStatus<R = ()> {
     /// Job has not started.
+    #[default]
     Idle,
     /// Job is starting up; carries the current [`Phase`].
     Starting {
@@ -440,12 +441,6 @@ pub enum JobStatus<R = ()> {
     },
     /// Job was cancelled.
     Cancelled,
-}
-
-impl<R> Default for JobStatus<R> {
-    fn default() -> Self {
-        Self::Idle
-    }
 }
 
 impl<R> JobStatus<R> {

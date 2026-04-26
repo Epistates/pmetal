@@ -105,7 +105,7 @@ impl DefaultValue {
 fn format_float(f: f64) -> String {
     // Print scientific for tiny / huge magnitudes, decimal otherwise.
     let abs = f.abs();
-    if abs != 0.0 && (abs < 1e-3 || abs >= 1e6) {
+    if abs != 0.0 && !(1e-3..1e6).contains(&abs) {
         format!("{f:e}")
     } else {
         format!("{f}")
