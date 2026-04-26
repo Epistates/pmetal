@@ -43,7 +43,7 @@
 //! use pmetal::data::{Tokenizer, chat_templates::{detect_chat_template, Message}};
 //! use pmetal::models::{DynamicModel, GenerationConfig, generate_cached_async};
 //!
-//! let model_path = resolve_model_path("Qwen/Qwen3-0.6B").await?;
+//! let model_path = resolve_model_path("Qwen/Qwen3-0.6B", None, None).await?;
 //! let tokenizer = Tokenizer::from_model_dir(&model_path)?;
 //! let template = detect_chat_template(&model_path, "Qwen/Qwen3-0.6B");
 //! let formatted = template.apply(&[Message::user("What is 2+2?")]).text;

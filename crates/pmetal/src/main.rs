@@ -7,6 +7,7 @@
 #![allow(clippy::unnecessary_unwrap)]
 #![allow(dead_code)] // Chat template formatters — pending migration to pmetal-data
 
+pub mod cli;
 mod commands;
 mod dashboard;
 #[cfg(any(feature = "models", feature = "native-only"))]
@@ -201,529 +202,15 @@ struct Cli {
 enum Commands {
     /// Fine-tune a model using LoRA/QLoRA
     #[cfg(feature = "trainer")]
-    Train {
-        /// Path to training configuration file (YAML)
-        #[arg(short, long)]
-        config: Option<String>,
-
-        /// Model ID (HuggingFace or local path)
-        #[arg(short, long)]
-        model: Option<String>,
-
-        /// Dataset path (JSONL file)
-        #[arg(short, long)]
-        dataset: Option<String>,
-
-        /// Evaluation dataset path (optional JSONL file)
-        #[arg(long)]
-        eval_dataset: Option<String>,
-
-        /// Output directory
-        #[arg(short, long, default_value = "./output")]
-        output: String,
-
-        /// LoRA rank
-        #[arg(long, default_value = "16")]
-        lora_r: usize,
-
-        /// LoRA alpha (scaling factor). Recommended: 2x rank.
-        #[arg(long, default_value = "32")]
-        lora_alpha: f32,
-
-        /// Learning rate. Recommended: 2e-4 for most tasks.
-        #[arg(long, default_value = "2e-4")]
-        learning_rate: f64,
-
-        /// Batch size
-        #[arg(long, default_value = "1")]
-        batch_size: usize,
-
-        /// Number of epochs
-        #[arg(long, default_value = "1")]
-        epochs: usize,
-
-        /// Maximum sequence length (0 to auto-detect from model config)
-        #[arg(long, default_value = "0")]
-        max_seq_len: usize,
-
-        /// Gradient accumulation steps
-        #[arg(long, default_value = "4")]
-        gradient_accumulation_steps: usize,
-
-        /// Disable Metal FlashAttention (enabled by default for O(n) memory)
-        #[arg(long)]
-        no_flash_attention: bool,
-
-        /// Maximum gradient norm for clipping (0 to disable)
-        #[arg(long, default_value = "1.0")]
-        max_grad_norm: f64,
-
-        /// Resume from checkpoint
-        #[arg(long)]
-        resume: bool,
-
-        /// Quantization method for QLoRA (none, nf4, fp4, int8)
-        #[arg(long, value_enum, default_value = "none")]
-        quantization: QuantizationMethod,
-
-        /// Block size for quantization (default: 64)
-        #[arg(long, default_value = "64")]
-        quant_block_size: usize,
-
-        /// Enable double quantization for absmax values
-        #[arg(long)]
-        double_quant: bool,
-
-        /// Disable fused training step (enabled by default when gradient_accumulation_steps=1)
-        #[arg(long)]
-        no_fused: bool,
-
-        /// Disable Metal fused optimizer (enabled by default for ~40% throughput improvement)
-        #[arg(long)]
-        no_metal_fused_optimizer: bool,
-
-        /// Disable sequence packing (enabled by default for 2-5x throughput)
-        #[arg(long)]
-        no_sequence_packing: bool,
-
-        /// Override the maximum sequence length for packing.
-        ///
-        /// Default: auto-detect from dataset p99 of sample lengths, rounded up to the
-        /// next power of two and capped at --max-seq-len.  Use this flag to pin the
-        /// packing bucket to a specific length (e.g. 512) when the adaptive heuristic
-        /// overshoots due to outlier samples.
-        #[arg(long)]
-        pack_max_seq_len: Option<usize>,
-
-        /// Disable the experimental compiled-training dispatch.
-        ///
-        /// The current Rust bridge falls back to fused eager execution when
-        /// compile-with-state is unavailable.
-        #[arg(long)]
-        no_jit_compilation: bool,
-
-        /// Disable gradient checkpointing (enabled by default for memory efficiency)
-        #[arg(long)]
-        no_gradient_checkpointing: bool,
-
-        /// Number of layers per checkpoint block (default: 4).
-        /// Lower = more memory savings but slower.
-        #[arg(long, default_value = "4")]
-        gradient_checkpointing_layers: usize,
-
-        /// Path to log training metrics as JSONL (Wandb-compatible).
-        /// Metrics can be imported to Wandb: `wandb sync path/to/metrics.jsonl`
-        #[arg(long)]
-        log_metrics: Option<String>,
-
-        /// Separate learning rate for embedding layers.
-        /// Recommended: 5e-5 for embeddings vs 2e-4 for LoRA params.
-        /// Improves training stability for large vocabulary models.
-        #[arg(long)]
-        embedding_lr: Option<f32>,
-
-        /// Loss scaling factor for ANE training (default: 1.0).
-        /// Multiplies gradients during backward to prevent fp32 underflow
-        /// at >350M params. Automatically unscaled before optimizer step.
-        #[arg(long, default_value = "1.0")]
-        loss_scale: f32,
-
-        /// Number of linear warmup steps before reaching the target learning rate.
-        #[arg(long, default_value = "0")]
-        warmup_steps: usize,
-
-        /// Learning rate schedule (constant, linear, cosine, cosine_with_restarts, polynomial, wsd).
-        #[arg(long, default_value = "cosine")]
-        lr_schedule: String,
-
-        /// AdamW weight decay coefficient.
-        #[arg(long, default_value = "0.01")]
-        weight_decay: f64,
-
-        /// Random seed for dataset shuffling and initialization.
-        #[arg(long, default_value = "42")]
-        seed: u64,
-
-        /// Use Cut Cross-Entropy for memory-efficient loss computation.
-        ///
-        /// Avoids materializing the full [batch, seq, vocab] logits tensor, saving
-        /// up to 37x peak memory for large-vocabulary models (e.g. Qwen3 with 150K tokens).
-        #[arg(long)]
-        cut_cross_entropy: bool,
-
-        /// Disable automatic adaptive LR (spike/plateau/divergence detection).
-        /// Control file polling stays active for manual LR control via MCP/TUI.
-        /// Use this when you want an external agent (LLM) to fully control the learning rate.
-        #[arg(long)]
-        no_adaptive_lr: bool,
-
-        /// Custom JSONL column containing the training text.
-        ///
-        /// When set to anything other than "text", bypasses format auto-detection
-        /// and reads training data from the named field. Use with --prompt-column
-        /// and --response-column for SFT loss masking.
-        #[arg(long)]
-        text_column: Option<String>,
-
-        /// Multiple JSONL columns to concatenate as the training text.
-        ///
-        /// Comma-separated column names, e.g. `--text-columns thinking,solution`.
-        /// Takes precedence over --text-column. Columns are joined with the
-        /// separator specified by --column-separator (default: two newlines).
-        #[arg(long, value_delimiter = ',')]
-        text_columns: Option<Vec<String>>,
-
-        /// Separator inserted between columns when using --text-columns.
-        /// Default: "\n\n" (two newlines).
-        #[arg(long, default_value = "\n\n")]
-        column_separator: String,
-
-        /// Custom JSONL column containing the prompt portion (loss-masked).
-        ///
-        /// Tokens from this field receive label -100 and do not contribute to the
-        /// loss. Combine with --response-column to concatenate prompt+response.
-        #[arg(long)]
-        prompt_column: Option<String>,
-
-        /// Custom JSONL column containing the response portion.
-        ///
-        /// When provided together with --prompt-column, the full training sequence
-        /// is prompt || response with prompt tokens masked from the loss.
-        #[arg(long)]
-        response_column: Option<String>,
-
-        /// Enable ANE (Apple Neural Engine) for training (experimental).
-        #[cfg(feature = "ane")]
-        #[arg(long)]
-        ane: bool,
-
-        /// Distributed training: comma-separated peer addresses (ip:port).
-        /// All nodes in the cluster must specify the same peer list.
-        /// Set PMETAL_RANK=N env var to specify this node's rank (0-indexed).
-        #[cfg(feature = "distributed")]
-        #[arg(long, value_delimiter = ',')]
-        distributed_peers: Option<Vec<String>>,
-
-        /// Distributed training: enable automatic mDNS peer discovery.
-        /// Finds other pmetal nodes on the local network automatically.
-        #[cfg(feature = "distributed")]
-        #[arg(long)]
-        distributed_auto: bool,
-
-        /// Gradient compression strategy for distributed training (none, topk, fp16, random).
-        #[cfg(feature = "distributed")]
-        #[arg(long, default_value = "none")]
-        compression_strategy: Option<String>,
-    },
+    Train(crate::cli::train::TrainArgs),
 
     /// Pretrain a model from scratch (full-parameter, no LoRA)
     #[cfg(feature = "trainer")]
-    Pretrain {
-        /// Model architecture (e.g. gpt-oss)
-        #[arg(short, long)]
-        arch: String,
-
-        /// Glob pattern or comma-separated list of tokenized shard files (.bin)
-        #[arg(short, long, value_delimiter = ',')]
-        shards: Vec<String>,
-
-        /// Target sequence length for packed training batches
-        #[arg(long, default_value = "2048")]
-        seq_len: usize,
-
-        /// Batch size
-        #[arg(long, default_value = "4")]
-        batch_size: usize,
-
-        /// Number of training steps
-        #[arg(long, default_value = "10000")]
-        steps: usize,
-
-        /// Peak learning rate
-        #[arg(long, default_value = "3e-4")]
-        learning_rate: f32,
-
-        /// Minimum learning rate (cosine floor)
-        #[arg(long, default_value = "1e-5")]
-        min_lr: f32,
-
-        /// Linear warmup steps
-        #[arg(long, default_value = "1000")]
-        warmup_steps: usize,
-
-        /// LR schedule (constant, linear, cosine)
-        #[arg(long, default_value = "cosine")]
-        lr_schedule: String,
-
-        /// AdamW weight decay
-        #[arg(long, default_value = "0.1")]
-        weight_decay: f32,
-
-        /// Max gradient norm for clipping (0 to disable)
-        #[arg(long, default_value = "1.0")]
-        max_grad_norm: f32,
-
-        /// EOS token ID (inserted between documents in packed sequences)
-        #[arg(long, default_value = "0")]
-        eos_token_id: u32,
-
-        /// Output / checkpoint directory
-        #[arg(short, long, default_value = "./pretrain-output")]
-        output: String,
-
-        /// Save checkpoint every N steps (0 to disable)
-        #[arg(long, default_value = "1000")]
-        checkpoint_every: usize,
-
-        /// Resume from checkpoint directory
-        #[arg(long)]
-        resume: Option<String>,
-
-        /// Model config JSON file (overrides arch defaults)
-        #[arg(long)]
-        model_config: Option<String>,
-
-        /// MoE router z-loss coefficient (0 to disable)
-        #[arg(long, default_value = "0.0")]
-        z_loss: f32,
-
-        /// Gradient accumulation steps (effective batch = batch_size * this)
-        #[arg(long, default_value = "1")]
-        gradient_accumulation_steps: usize,
-
-        /// Log step/loss/LR every N steps (0 to disable)
-        #[arg(long, default_value = "10")]
-        log_every: usize,
-
-        /// Evaluate on held-out data every N steps (0 to disable)
-        #[arg(long, default_value = "0")]
-        eval_every: usize,
-
-        /// Number of batches per eval round
-        #[arg(long, default_value = "10")]
-        eval_batches: usize,
-
-        /// Random seed
-        #[arg(long, default_value = "42")]
-        seed: u64,
-    },
+    Pretrain(crate::cli::pretrain::PretrainArgs),
 
     /// Run inference with a model
-    Infer {
-        /// Model ID or path
-        #[arg(short, long)]
-        model: String,
+    Infer(crate::cli::infer::InferArgs),
 
-        /// LoRA adapter path (optional)
-        #[arg(long)]
-        lora: Option<String>,
-
-        /// Input prompt
-        #[arg(short, long)]
-        prompt: String,
-
-        /// Maximum tokens to generate
-        #[arg(long, default_value = "256")]
-        max_tokens: usize,
-
-        /// Temperature for sampling (0 = greedy). Defaults to model's generation_config.json
-        #[arg(long)]
-        temperature: Option<f32>,
-
-        /// Top-k sampling (0 = disabled). Defaults to model's generation_config.json
-        #[arg(long)]
-        top_k: Option<usize>,
-
-        /// Top-p nucleus sampling (0.0-1.0). Defaults to model's generation_config.json
-        #[arg(long)]
-        top_p: Option<f32>,
-
-        /// Min-p dynamic sampling (0.0 = disabled). Defaults to model's generation_config.json
-        #[arg(long)]
-        min_p: Option<f32>,
-
-        /// Repetition penalty applied to prompt + output (1.0 = disabled, 1.0-1.2 typical)
-        #[arg(long)]
-        repetition_penalty: Option<f32>,
-
-        /// Frequency penalty proportional to token count (0.0 = disabled, 0.0-2.0 typical)
-        #[arg(long)]
-        frequency_penalty: Option<f32>,
-
-        /// Presence penalty for any appeared token (0.0 = disabled, Qwen3 recommends 0-2)
-        #[arg(long)]
-        presence_penalty: Option<f32>,
-
-        /// Random seed for reproducible generation
-        #[arg(long)]
-        seed: Option<u64>,
-
-        /// Apply chat template (auto-detected from tokenizer)
-        #[arg(long)]
-        chat: bool,
-
-        /// System message for chat mode
-        #[arg(long)]
-        system: Option<String>,
-
-        /// Disable thinking mode for models that support it (e.g., Qwen3)
-        /// By default, the model decides when to use thinking based on query complexity
-        #[arg(long)]
-        no_thinking: bool,
-
-        /// Sampling mode preset with model-card recommended parameters.
-        /// Available modes: auto, thinking-general (thinking), thinking-coding (coding),
-        /// instruct-general (instruct), instruct-reasoning (reasoning).
-        /// "auto" selects based on --no-thinking flag. CLI sampling params override mode defaults.
-        #[arg(long, default_value = "auto")]
-        mode: pmetal_data::inference_config::SamplingMode,
-
-        /// Execution backend: auto | standard | compiled | metal-sampler | ane | minimal | dflash.
-        /// `auto` picks the best path for the current device + model (default). Explicit
-        /// variants pin a backend. `dflash` also requires `--draft-model`.
-        /// Takes precedence over the legacy `--compiled` / `--metal-sampler` / `--minimal`
-        /// / `--ane` flags when set to anything other than `auto`.
-        #[arg(long, default_value = "auto")]
-        backend: pmetal_data::inference_config::InferenceBackend,
-
-        /// Draft model for speculative decoding (HF id or local path).
-        /// Required when `--backend dflash`; ignored otherwise.
-        #[arg(long)]
-        draft_model: Option<String>,
-
-        /// Use fused Metal sampling kernel for better battery performance
-        /// (bypasses mlx-rs sampling, uses single GPU kernel launch).
-        /// Legacy alias — prefer `--backend metal-sampler`.
-        #[arg(long)]
-        metal_sampler: bool,
-
-        /// Use JIT-compiled sampling for better performance
-        /// (matches mlx_lm's @mx.compile approach for kernel fusion).
-        /// Legacy alias — prefer `--backend compiled`.
-        #[arg(long)]
-        compiled: bool,
-
-        /// Use dedicated GPU stream for generation.
-        /// NOTE: Currently a no-op placeholder; streaming generation is not yet implemented.
-        #[arg(long, hide = true)]
-        stream: bool,
-
-        /// Use minimal async generation (for performance debugging)
-        #[arg(long)]
-        minimal: bool,
-
-        /// Hide thinking trace from output (shown by default for thinking models)
-        #[arg(long)]
-        hide_thinking: bool,
-
-        /// Path to a JSON file containing tool/function definitions (OpenAI format).
-        /// Tools are injected into the system prompt using the model's native format.
-        /// Example: [{"type":"function","function":{"name":"get_weather","description":"...","parameters":{...}}}]
-        #[arg(long)]
-        tools: Option<String>,
-
-        /// Use FP8 quantization for weights (~2x memory reduction).
-        /// Quantizes model weights to 8-bit floating point (E4M3 format)
-        /// for memory-efficient inference on Apple Silicon.
-        #[arg(long)]
-        fp8: bool,
-
-        /// Path to packed expert weights directory for SSD-offloaded MoE inference.
-        /// Created with `pmetal pack-experts`. Enables expert prefetching for
-        /// models that don't fit in memory (e.g., Qwen3.5-397B on 48GB).
-        #[arg(long)]
-        experts_dir: Option<String>,
-
-        /// Enable ANE (Apple Neural Engine) for inference (experimental).
-        #[cfg(feature = "ane")]
-        #[arg(long)]
-        ane: bool,
-
-        /// Maximum ANE kernel sequence length (power-of-2 bucket cap).
-        /// ANE kernels are compiled for a fixed spatial dimension — larger values
-        /// allow longer prompts to be processed on ANE but may fail to compile
-        /// for models with many attention heads. Default: 1024.
-        #[cfg(feature = "ane")]
-        #[arg(long, default_value = "1024")]
-        ane_max_seq_len: usize,
-
-        /// Use the experimental ANE real-time evaluation path when ANE inference is selected.
-        #[cfg(feature = "ane")]
-        #[arg(long)]
-        ane_real_time: bool,
-
-        /// Run an MLX-LM-compatible benchmark with random prompt ids, one warmup,
-        /// EOS disabled, and fixed generation length.
-        #[arg(long)]
-        benchmark: bool,
-
-        /// Number of measured trials for benchmarking (default: 5)
-        #[arg(long, default_value = "5")]
-        benchmark_iters: usize,
-
-        /// Synthetic prompt length for --benchmark.
-        #[arg(long)]
-        benchmark_prompt_tokens: Option<usize>,
-
-        /// Run an opt-in per-layer forward profile for supported hybrid models.
-        /// Currently implemented for Qwen 3.5 / qwen3_next standard inference.
-        #[arg(long)]
-        profile_layers: bool,
-
-        /// Write the layer profile report as pretty JSON.
-        #[arg(long)]
-        profile_output: Option<String>,
-
-        /// KV cache quantization bits (8=q8_0, 4=q4_0, 0=fp16).
-        /// Omit to auto-select the fastest mode that still fits the device budget.
-        #[arg(long)]
-        kv_quant: Option<u8>,
-
-        /// KV cache key bits (overrides --kv-quant for keys only, for asymmetric K/V).
-        #[arg(long)]
-        kv_k_bits: Option<u8>,
-
-        /// KV cache value bits (overrides --kv-quant for values only, for asymmetric K/V).
-        #[arg(long)]
-        kv_v_bits: Option<u8>,
-
-        /// KV cache quantization group size.
-        #[arg(long, default_value = "64")]
-        kv_group_size: usize,
-
-        /// Use TurboQuant for KV cache compression.
-        #[arg(long)]
-        kv_turboquant: bool,
-
-        /// Mixed-bit TurboQuant preset (`q2_5` or `q3_5`).
-        /// When set, this enables outlier-aware TurboQuant without needing `--kv-turboquant`.
-        #[arg(long, value_enum)]
-        kv_turboquant_preset: Option<TurboQuantPresetArg>,
-
-        /// TurboQuant v2 mixed-bit affine preset: "q2_5" (2.5-bit) or "q3_5" (3.5-bit).
-        /// Enables outlier channel detection + split-bit quantized KV cache (native path only).
-        #[arg(long, value_parser = ["q2_5", "q3_5"])]
-        kv_quant_preset: Option<String>,
-
-        /// Disable KV cache quantization (use fp16 KV cache).
-        #[arg(long)]
-        no_kv_quant: bool,
-
-        /// Enable QJL residual correction for Q2-Q3 key quantization.
-        ///
-        /// Stores 1-bit sign vectors on quantization residuals and applies an
-        /// additive correction to attention scores, making key inner products
-        /// unbiased. Only active for --kv-quant 2 or 3 (uniform, non-mixed-bit).
-        /// Adds ~2-5% latency overhead from one extra D×D matmul per decode step.
-        #[arg(long)]
-        kv_qjl: bool,
-
-        /// Enable n-gram repetition loop detection.
-        /// Force-stops generation when the same 8-token pattern repeats 4 times.
-        /// Useful for small models prone to infinite loops in thinking mode.
-        #[arg(long)]
-        detect_repetition: bool,
-    },
 
     /// Download a model from HuggingFace
     Download {
@@ -761,56 +248,7 @@ enum Commands {
     ///
     /// Runs a Qwen3 target alongside a DFlash draft to emit multiple tokens
     /// per forward pass with bit-identical output to greedy baseline.
-    Dflash {
-        /// Target Qwen3 model (HF id or local path).
-        #[arg(long)]
-        target: String,
-
-        /// DFlash draft model (HF id or local path, e.g. `z-lab/Qwen3-4B-DFlash-b16`).
-        #[arg(long)]
-        draft: String,
-
-        /// Input prompt.
-        #[arg(short, long)]
-        prompt: String,
-
-        /// Maximum tokens to generate after the prompt.
-        #[arg(long, default_value = "128")]
-        max_new_tokens: usize,
-
-        /// Sampling temperature (0 = greedy, bit-identical to baseline).
-        #[arg(long, default_value = "0.0")]
-        temperature: f32,
-
-        /// Override the draft block size (defaults to the draft checkpoint's `block_size`).
-        #[arg(long)]
-        speculative_tokens: Option<usize>,
-
-        /// Quantize the draft's Linear weights to FP8 (E4M3) on load.
-        /// Halves draft memory with minimal acceptance-rate impact vs BF16.
-        #[arg(long)]
-        draft_fp8: bool,
-
-        /// Emit a JSON report of tokens + metrics instead of plain text.
-        #[arg(long)]
-        json: bool,
-
-        /// Skip the model's chat template and tokenize the prompt verbatim.
-        /// By default pmetal dflash mirrors upstream dflash-mlx and applies
-        /// the target's chat template (with `enable_thinking=false`) — the
-        /// draft was trained against chat-templated target hidden states,
-        /// so running raw inputs collapses acceptance to near zero.
-        #[arg(long)]
-        no_chat: bool,
-
-        /// Tree-verify budget — when set to `N > 0`, the decoder
-        /// builds a budget-N candidate tree per round (inspired by
-        /// DDTree) and lets the target walk the tree via posterior
-        /// argmax. Typical values: 16-64. Set to 0 to force linear
-        /// DFlash (the default).
-        #[arg(long, default_value = "0")]
-        tree_budget: usize,
-    },
+    Dflash(crate::cli::dflash::DflashArgs),
 
     /// Show memory usage and available capacity
     Memory {
@@ -833,19 +271,7 @@ enum Commands {
 
     /// Benchmark training performance
     #[cfg(feature = "trainer")]
-    Bench {
-        /// Model to benchmark
-        #[arg(short, long, default_value = "meta-llama/Llama-3.2-1B")]
-        model: String,
-
-        /// Batch size
-        #[arg(short, long, default_value = "1")]
-        batch_size: usize,
-
-        /// Sequence length
-        #[arg(short, long, default_value = "512")]
-        seq_len: usize,
-    },
+    Bench(crate::cli::bench::BenchArgs),
 
     /// Run a structured kernel benchmark corpus for this device tier
     #[cfg(feature = "trainer")]
@@ -987,19 +413,7 @@ enum Commands {
     },
 
     /// Pack expert weights for SSD-offloaded MoE inference
-    PackExperts {
-        /// Model directory (containing config.json and safetensors)
-        #[arg(short, long)]
-        model: String,
-
-        /// Output directory for packed expert files
-        #[arg(short, long, default_value = "./packed_experts")]
-        output: String,
-
-        /// Quantization bit width (4 or 2)
-        #[arg(short, long)]
-        bits: Option<u8>,
-    },
+    PackExperts(crate::cli::pack_experts::PackExpertsArgs),
 
     /// Export trained model for Ollama
     Ollama {
@@ -1009,95 +423,10 @@ enum Commands {
 
     /// Fuse LoRA adapter weights into a base model and save as a complete model
     #[cfg(feature = "lora")]
-    Fuse {
-        /// Base model ID or path
-        #[arg(short, long)]
-        model: String,
-
-        /// LoRA adapter path (directory containing lora_weights.safetensors, or the file itself)
-        #[arg(short, long)]
-        lora: String,
-
-        /// Output directory for the fused model
-        #[arg(short, long)]
-        output: String,
-
-        /// LoRA scaling alpha (default: auto-detect from adapter)
-        #[arg(long)]
-        alpha: Option<f32>,
-
-        /// LoRA rank (default: auto-detect from adapter)
-        #[arg(long)]
-        rank: Option<usize>,
-
-        /// Use f64-accurate LoRA merge (reads adapter_config.json, performs B@A in f64,
-        /// writes merged weights in the original storage dtype).
-        /// More numerically accurate than the default f32 path.
-        #[arg(long, default_value_t = false)]
-        accurate: bool,
-
-        /// Use tiled low-memory mode with the --accurate path.
-        /// Limits peak f64 allocation to tile_size rows of B at a time.
-        /// Only has effect when --accurate is also set.
-        #[arg(long, default_value_t = false)]
-        low_memory: bool,
-    },
+    Fuse(crate::cli::fuse::FuseArgs),
 
     /// Quantize a model to GGUF format (supports Dynamic 2.0 and KL-calibrated)
-    Quantize {
-        /// Source model path (Safetensors/HF)
-        #[arg(short, long)]
-        model: String,
-
-        /// Output GGUF file path
-        #[arg(short, long)]
-        output: String,
-
-        /// Path to Importance Matrix (imatrix.dat) for dynamic quantization
-        #[arg(long)]
-        imatrix: Option<String>,
-
-        /// Quantization method
-        #[arg(long, value_enum, default_value = "dynamic")]
-        method: QuantizeMethod,
-
-        /// LoRA adapter to fuse before quantizing (optional)
-        #[arg(long)]
-        lora: Option<String>,
-
-        /// Use KL-divergence calibration for per-tensor quantization type selection.
-        /// Tests multiple quantization types per tensor and picks the one minimizing
-        /// quality loss while meeting the threshold and optional BPW budget.
-        #[arg(long)]
-        kl_calibrate: bool,
-
-        /// Target average bits per weight for KL calibration (e.g. 4.5).
-        /// When set, the calibrator will downgrade low-impact tensors until the
-        /// budget is satisfied.
-        #[arg(long)]
-        target_bpw: Option<f32>,
-
-        /// Quality-loss threshold for KL calibration (default: 0.01).
-        /// Lower values preserve more quality; higher values allow more compression.
-        #[arg(long, default_value = "0.01")]
-        kl_threshold: f64,
-
-        /// Output format: "gguf" (default) or "mlx" (MLX safetensors with per-tensor bit
-        /// allocation).  When "mlx" is selected the --output argument is treated as an
-        /// output directory path rather than a file.
-        #[arg(long, default_value = "gguf")]
-        format: String,
-
-        /// Default bit-width for MLX-format quantization (3, 4, 5, 6, or 8).
-        /// Only used when --format mlx is set.
-        #[arg(long, default_value_t = 4)]
-        bits: i32,
-
-        /// Group size for MLX-format quantization.
-        /// Only used when --format mlx is set.
-        #[arg(long, default_value_t = 64)]
-        group_size: i32,
-    },
+    Quantize(crate::cli::quantize::QuantizeArgs),
 
     /// Knowledge Distillation from teacher to student
     #[cfg(feature = "trainer")]
@@ -2620,55 +1949,56 @@ async fn tokio_main() -> anyhow::Result<()> {
 
     match cli.command {
         #[cfg(feature = "trainer")]
-        Commands::Train {
-            config,
-            model,
-            dataset,
-            eval_dataset,
-            output,
-            lora_r,
-            lora_alpha,
-            learning_rate,
-            batch_size,
-            epochs,
-            max_seq_len,
-            gradient_accumulation_steps,
-            no_flash_attention,
-            max_grad_norm,
-            resume,
-            quantization,
-            quant_block_size,
-            double_quant,
-            no_fused,
-            no_metal_fused_optimizer,
-            no_sequence_packing,
-            pack_max_seq_len,
-            no_jit_compilation,
-            no_gradient_checkpointing,
-            gradient_checkpointing_layers,
-            log_metrics,
-            embedding_lr,
-            loss_scale,
-            warmup_steps,
-            lr_schedule,
-            weight_decay,
-            seed,
-            cut_cross_entropy,
-            no_adaptive_lr,
-            text_column,
-            text_columns,
-            column_separator,
-            prompt_column,
-            response_column,
-            #[cfg(feature = "ane")]
-            ane,
-            #[cfg(feature = "distributed")]
-            distributed_peers,
-            #[cfg(feature = "distributed")]
-            distributed_auto,
-            #[cfg(feature = "distributed")]
-            compression_strategy,
-        } => {
+        Commands::Train(args) => {
+            let crate::cli::train::TrainArgs {
+                config,
+                model,
+                dataset,
+                eval_dataset,
+                output,
+                lora_r,
+                lora_alpha,
+                learning_rate,
+                batch_size,
+                epochs,
+                max_seq_len,
+                gradient_accumulation_steps,
+                no_flash_attention,
+                max_grad_norm,
+                resume,
+                quantization,
+                quant_block_size,
+                double_quant,
+                no_fused,
+                no_metal_fused_optimizer,
+                no_sequence_packing,
+                pack_max_seq_len,
+                no_jit_compilation,
+                no_gradient_checkpointing,
+                gradient_checkpointing_layers,
+                log_metrics,
+                embedding_lr,
+                loss_scale,
+                warmup_steps,
+                lr_schedule,
+                weight_decay,
+                seed,
+                cut_cross_entropy,
+                no_adaptive_lr,
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
+                #[cfg(feature = "ane")]
+                ane,
+                #[cfg(feature = "distributed")]
+                distributed_peers,
+                #[cfg(feature = "distributed")]
+                distributed_auto,
+                #[cfg(feature = "distributed")]
+                compression_strategy,
+            } = args;
             use pmetal_trainer::orchestrator;
 
             // Parse LR schedule
@@ -2893,55 +2223,56 @@ async fn tokio_main() -> anyhow::Result<()> {
             .await?;
         }
 
-        Commands::Infer {
-            model,
-            lora,
-            prompt,
-            max_tokens,
-            temperature,
-            top_k,
-            top_p,
-            min_p,
-            repetition_penalty,
-            frequency_penalty,
-            presence_penalty,
-            seed,
-            chat,
-            system,
-            no_thinking,
-            mode,
-            backend,
-            draft_model,
-            metal_sampler,
-            compiled,
-            stream,
-            minimal,
-            hide_thinking,
-            tools,
-            fp8,
-            experts_dir,
-            #[cfg(feature = "ane")]
-            ane,
-            #[cfg(feature = "ane")]
-            ane_max_seq_len,
-            #[cfg(feature = "ane")]
-            ane_real_time,
-            benchmark,
-            benchmark_iters,
-            benchmark_prompt_tokens,
-            profile_layers,
-            profile_output,
-            kv_quant,
-            kv_k_bits,
-            kv_v_bits,
-            kv_group_size,
-            kv_turboquant,
-            kv_turboquant_preset,
-            kv_quant_preset,
-            no_kv_quant,
-            kv_qjl,
-            detect_repetition,
-        } => {
+        Commands::Infer(args) => {
+            let crate::cli::infer::InferArgs {
+                model,
+                lora,
+                prompt,
+                max_tokens,
+                temperature,
+                top_k,
+                top_p,
+                min_p,
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+                seed,
+                chat,
+                system,
+                no_thinking,
+                mode,
+                backend,
+                draft_model,
+                metal_sampler,
+                compiled,
+                stream,
+                minimal,
+                hide_thinking,
+                tools,
+                fp8,
+                experts_dir,
+                #[cfg(feature = "ane")]
+                ane,
+                #[cfg(feature = "ane")]
+                ane_max_seq_len,
+                #[cfg(feature = "ane")]
+                ane_real_time,
+                benchmark,
+                benchmark_iters,
+                benchmark_prompt_tokens,
+                profile_layers,
+                profile_output,
+                kv_quant,
+                kv_k_bits,
+                kv_v_bits,
+                kv_group_size,
+                kv_turboquant,
+                kv_turboquant_preset,
+                kv_quant_preset,
+                no_kv_quant,
+                kv_qjl,
+                detect_repetition,
+            } = args;
             // Load tool definitions if provided
             let tool_defs: Option<Vec<pmetal_data::chat_templates::ToolDefinition>> =
                 if let Some(ref tools_path) = tools {
@@ -3025,11 +2356,12 @@ async fn tokio_main() -> anyhow::Result<()> {
             println!("Model downloaded to: {}", path.display());
         }
 
-        Commands::PackExperts {
-            model,
-            output,
-            bits,
-        } => {
+        Commands::PackExperts(args) => {
+            let crate::cli::pack_experts::PackExpertsArgs {
+                model,
+                output,
+                bits,
+            } = args;
             pack_experts::pack_experts(Path::new(&model), Path::new(&output), bits)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
         }
@@ -3044,18 +2376,19 @@ async fn tokio_main() -> anyhow::Result<()> {
             commands::search::run_search(&query, limit, download, detailed, json).await?;
         }
 
-        Commands::Dflash {
-            target,
-            draft,
-            prompt,
-            max_new_tokens,
-            temperature,
-            speculative_tokens,
-            draft_fp8,
-            json,
-            no_chat,
-            tree_budget,
-        } => {
+        Commands::Dflash(args) => {
+            let crate::cli::dflash::DflashArgs {
+                target,
+                draft,
+                prompt,
+                max_new_tokens,
+                temperature,
+                speculative_tokens,
+                draft_fp8,
+                json,
+                no_chat,
+                tree_budget,
+            } = args;
             commands::dflash::run_dflash(
                 &target,
                 &draft,
@@ -3103,11 +2436,12 @@ async fn tokio_main() -> anyhow::Result<()> {
         }
 
         #[cfg(feature = "trainer")]
-        Commands::Bench {
-            model,
-            batch_size,
-            seq_len,
-        } => {
+        Commands::Bench(args) => {
+            let crate::cli::bench::BenchArgs {
+                model,
+                batch_size,
+                seq_len,
+            } = args;
             commands::bench::run_benchmark(&model, batch_size, seq_len).await?;
         }
 
@@ -3233,15 +2567,16 @@ async fn tokio_main() -> anyhow::Result<()> {
         }
 
         #[cfg(feature = "lora")]
-        Commands::Fuse {
-            model,
-            lora,
-            output,
-            alpha,
-            rank,
-            accurate,
-            low_memory,
-        } => {
+        Commands::Fuse(args) => {
+            let crate::cli::fuse::FuseArgs {
+                model,
+                lora,
+                output,
+                alpha,
+                rank,
+                accurate,
+                low_memory,
+            } = args;
             if accurate {
                 commands::fuse::run_fuse_accurate(&model, &lora, &output, low_memory).await?;
             } else {
@@ -3249,19 +2584,20 @@ async fn tokio_main() -> anyhow::Result<()> {
             }
         }
 
-        Commands::Quantize {
-            model,
-            output,
-            imatrix,
-            method,
-            lora,
-            kl_calibrate,
-            target_bpw,
-            kl_threshold,
-            format,
-            bits,
-            group_size,
-        } => {
+        Commands::Quantize(args) => {
+            let crate::cli::quantize::QuantizeArgs {
+                model,
+                output,
+                imatrix,
+                method,
+                lora,
+                kl_calibrate,
+                target_bpw,
+                kl_threshold,
+                format,
+                bits,
+                group_size,
+            } = args;
             if format == "mlx" {
                 // MLX safetensors path — no LoRA fusion support in this path yet.
                 if lora.is_some() {
@@ -3649,30 +2985,31 @@ async fn tokio_main() -> anyhow::Result<()> {
         }
 
         #[cfg(feature = "trainer")]
-        Commands::Pretrain {
-            arch,
-            shards,
-            seq_len,
-            batch_size,
-            steps,
-            learning_rate,
-            min_lr,
-            warmup_steps,
-            lr_schedule,
-            weight_decay,
-            max_grad_norm,
-            eos_token_id,
-            output,
-            checkpoint_every,
-            resume,
-            model_config: _model_config,
-            z_loss,
-            gradient_accumulation_steps,
-            log_every,
-            eval_every,
-            eval_batches,
-            seed,
-        } => {
+        Commands::Pretrain(args) => {
+            let crate::cli::pretrain::PretrainArgs {
+                arch,
+                shards,
+                seq_len,
+                batch_size,
+                steps,
+                learning_rate,
+                min_lr,
+                warmup_steps,
+                lr_schedule,
+                weight_decay,
+                max_grad_norm,
+                eos_token_id,
+                output,
+                checkpoint_every,
+                resume,
+                model_config: _model_config,
+                z_loss,
+                gradient_accumulation_steps,
+                log_every,
+                eval_every,
+                eval_batches,
+                seed,
+            } = args;
             use pmetal_bridge::compat::random;
             use pmetal_data::streaming::{StreamConfig, StreamingShardReader};
             use pmetal_trainer::pretrain::{self, PretrainConfig};
