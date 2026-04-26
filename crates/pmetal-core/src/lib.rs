@@ -15,6 +15,7 @@
 mod config;
 pub mod constants;
 mod error;
+pub mod events;
 pub mod scheduler;
 mod secrets;
 mod traits;
@@ -22,6 +23,11 @@ mod types;
 
 pub use config::*;
 pub use error::*;
+pub use events::{
+    BenchTrialMetrics, BroadcastSink, CompletionSummary, JobEvent, JobEventSink, JobKind,
+    JobStatus, JsonlSink, LogLevel, MetricPayload, NullSink, ParseError, Phase, Progress,
+    ServeRequestMetrics, TrainingCallbackToSink, parse_event, write_event,
+};
 pub use scheduler::{LearningRateScheduler, SchedulerBuilder};
 pub use secrets::SecretString;
 pub use traits::*;
@@ -31,6 +37,7 @@ pub use types::*;
 pub mod prelude {
     pub use crate::config::*;
     pub use crate::error::{PMetalError, Result};
+    pub use crate::events::{JobEvent, JobEventSink, JobKind, JobStatus, MetricPayload, Phase};
     pub use crate::scheduler::{LearningRateScheduler, SchedulerBuilder};
     pub use crate::secrets::SecretString;
     pub use crate::traits::*;
