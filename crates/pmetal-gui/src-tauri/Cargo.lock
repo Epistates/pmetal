@@ -5825,12 +5825,22 @@ dependencies = [
 name = "pmetal-core"
 version = "0.5.0"
 dependencies = [
+ "pmetal-core-derive",
  "secrecy",
  "serde",
  "serde_json",
  "serde_yaml_ng",
  "thiserror 2.0.18",
  "tracing",
+]
+
+[[package]]
+name = "pmetal-core-derive"
+version = "0.5.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.117",
 ]
 
 [[package]]

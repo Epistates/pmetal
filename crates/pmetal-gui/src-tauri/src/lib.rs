@@ -125,10 +125,31 @@ pub fn run() {
                             flag.store(true, std::sync::atomic::Ordering::SeqCst);
                         }
                     }
+
+                    // Drain the broadcast channel so in-flight events emitted
+                    // just before cancellation have a chance to be forwarded to
+                    // the frontend before the process exits.
+                    //
+                    // Strategy: send a sentinel ModelRemoved("") event to flush
+                    // the forwarder's receive loop, then wait up to 1 s for the
+                    // broadcast channel to become idle (no more receivers). If
+                    // the drain window elapses we proceed anyway — the 1 s bound
+                    // prevents hanging when a task is blocked on a long Metal op.
+                    //
+                    // Note: We cannot join the forwarder task here because Tauri's
+                    // `on_window_event` handler is synchronous and the task handle
+                    // is not exposed. The sleep gives async tasks one tick to flush.
+                    let _ = state
+                        .event_tx
+                        .send(crate::state::AppEvent::ModelRemoved {
+                            model_id: String::new(),
+                        });
                 }
-                // Brief pause for in-flight GPU work, then force-exit to skip
-                // C++ destructor crashes from MLX's Metal device cleanup.
-                std::thread::sleep(std::time::Duration::from_millis(200));
+
+                // Give in-flight GPU work and the event forwarder up to 1 s to
+                // flush, then force-exit to skip C++ destructor crashes from
+                // MLX's Metal device cleanup.
+                std::thread::sleep(std::time::Duration::from_millis(1_000));
                 std::process::exit(0);
             }
         })

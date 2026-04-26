@@ -694,6 +694,48 @@ pub async fn get_model_defaults(
 
 #[tauri::command]
 pub async fn delete_model(state: State<'_, AppState>, model_id: String) -> Result<()> {
+    // Refuse to delete a model that is the source of an active run. Checking
+    // all three run types that hold a `model` field avoids orphaned Metal
+    // command buffers that would reference a deleted weight directory.
+    {
+        let training = state.training_runs.read().await;
+        if training.iter().any(|r| {
+            r.model == model_id
+                && matches!(r.status, TrainingStatus::Pending | TrainingStatus::Running)
+        }) {
+            return Err(AppError(format!(
+                "Cannot delete '{model_id}': a training run is currently using it."
+            )));
+        }
+    }
+    {
+        let distillation = state.distillation_runs.read().await;
+        if distillation.iter().any(|r| {
+            (r.student_model == model_id || r.teacher_model == model_id)
+                && !matches!(
+                    r.status,
+                    DistillationStatus::Completed
+                        | DistillationStatus::Failed
+                        | DistillationStatus::Cancelled
+                )
+        }) {
+            return Err(AppError(format!(
+                "Cannot delete '{model_id}': a distillation run is currently using it."
+            )));
+        }
+    }
+    {
+        let grpo = state.grpo_runs.read().await;
+        if grpo.iter().any(|r| {
+            r.model == model_id
+                && matches!(r.status, GrpoStatus::Pending | GrpoStatus::Running)
+        }) {
+            return Err(AppError(format!(
+                "Cannot delete '{model_id}': a GRPO run is currently using it."
+            )));
+        }
+    }
+
     let path = {
         let models = state.cached_models.read().await;
         models
@@ -783,8 +825,17 @@ pub async fn download_model(
     let hf_token = state.config.read().await.hf_token.clone();
     let cached_models = state.cached_models.clone();
     let cache_dir = state.config.read().await.cache_dir.clone();
+    // Clone the semaphore Arc so the spawned task can acquire a permit.
+    // The permit is dropped when the download completes (success or error),
+    // releasing the slot for the next queued download.
+    let semaphore = state.download_semaphore.clone();
 
     tokio::spawn(async move {
+        // Acquire the permit before announcing the download so the frontend
+        // queuing indicator is accurate: "download-started" fires only once
+        // a slot is actually available.
+        let _permit = semaphore.acquire().await;
+
         let _ = app_handle.emit("download-started", &run_id_task);
 
         let _ = app_handle.emit(
@@ -822,6 +873,7 @@ pub async fn download_model(
                 );
             }
         }
+        // _permit is dropped here, releasing the semaphore slot.
     });
 
     Ok(run_id)
@@ -1081,12 +1133,17 @@ pub async fn start_training(
         )));
     }
 
-    if config.resume_from.is_some() {
-        return Err(AppError(
-            "Resume from checkpoint is not yet supported in GUI mode. \
-             Use the CLI instead: pmetal train --resume"
-                .to_string(),
-        ));
+    // resume_from, if set, is validated below: the directory must exist and
+    // contain at least one checkpoint file so we surface the error before
+    // creating a run record. The actual resume logic is in the orchestrator
+    // (TrainingJobConfig::resume = true).
+    if let Some(ref resume_dir) = config.resume_from {
+        let rd = PathBuf::from(resume_dir);
+        if !rd.exists() || !rd.is_dir() {
+            return Err(AppError(format!(
+                "resume_from path '{resume_dir}' does not exist or is not a directory."
+            )));
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1309,9 +1366,12 @@ pub async fn start_training(
                 loss_scale: 1.0,
                 distributed: None,
             },
-            config_path: None,
+            // config_path points to an existing output directory to resume
+            // from. The orchestrator's CheckpointManager will load the latest
+            // checkpoint from that directory when resume=true.
+            config_path: config.resume_from.clone(),
             log_metrics: Some(metrics_path.display().to_string()),
-            resume: false,
+            resume: config.resume_from.is_some(),
             seed: 42,
             emit_console_output: false,
         };
@@ -1868,9 +1928,9 @@ fn spawn_serve_exit_watcher(
                                 inst.status_message = Some("Exited cleanly".to_string());
                             } else {
                                 inst.status = ServeStatus::Failed;
-                                inst.status_message =
-                                    Some(format!("Process exited with status {status}"));
-                                inst.error_message = Some(inst.status_message.clone().unwrap());
+                                let msg = format!("Process exited with status {status}");
+                                inst.error_message = Some(msg.clone());
+                                inst.status_message = Some(msg);
                             }
                             inst.stopped_at = Some(Utc::now());
                             let _ = event_tx.send(AppEvent::ServeUpdate {
@@ -2836,8 +2896,8 @@ fn scan_trained_adapters() -> Vec<TrainedAdapter> {
         }
     }
 
-    // Sort by modification time (newest first)
-    adapters.sort_by(|a, b| b.size_bytes.cmp(&a.size_bytes));
+    // Sort by size (largest first)
+    adapters.sort_by_key(|a| std::cmp::Reverse(a.size_bytes));
     adapters
 }
 

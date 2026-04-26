@@ -779,6 +779,9 @@ pub struct AppState {
     pub cancel_flags: Arc<RwLock<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
     /// Active inference sessions (session_id → cancelled).
     pub inference_cancel_flags: Arc<RwLock<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>>,
+    /// Limits concurrent HF model downloads to 3 to avoid saturating the
+    /// network connection and exhausting disk write bandwidth.
+    pub download_semaphore: Arc<tokio::sync::Semaphore>,
 }
 
 #[allow(dead_code)]
@@ -799,6 +802,7 @@ impl AppState {
             active_processes: Arc::new(RwLock::new(HashMap::new())),
             cancel_flags: Arc::new(RwLock::new(HashMap::new())),
             inference_cancel_flags: Arc::new(RwLock::new(HashMap::new())),
+            download_semaphore: Arc::new(tokio::sync::Semaphore::new(3)),
         }
     }
 
