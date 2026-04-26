@@ -430,297 +430,11 @@ enum Commands {
 
     /// Knowledge Distillation from teacher to student
     #[cfg(feature = "trainer")]
-    Distill {
-        /// Teacher model ID or path
-        #[arg(short, long)]
-        teacher: String,
-
-        /// Student model ID or path
-        #[arg(short, long)]
-        student: String,
-
-        /// Dataset path (JSONL file)
-        #[arg(short, long)]
-        dataset: String,
-
-        /// Output directory for distilled student
-        #[arg(short, long, default_value = "./output/distilled")]
-        output: String,
-
-        /// Distillation method (online, offline, progressive)
-        #[arg(long, default_value = "online")]
-        method: String,
-
-        /// Shortcut for `--method offline`.
-        #[arg(long)]
-        offline: bool,
-
-        /// Directory used to store or load cached teacher logits for offline distillation.
-        #[arg(long)]
-        offline_cache: Option<String>,
-
-        /// Force generation of missing teacher logits for offline distillation.
-        #[arg(long)]
-        offline_generate: bool,
-
-        /// Compression used for newly created offline logit caches.
-        #[arg(long, default_value = "top_k")]
-        offline_compression: String,
-
-        /// Top-k width for newly created offline logit caches.
-        #[arg(long, default_value_t = 128)]
-        offline_top_k: usize,
-
-        /// Loss type (kl_divergence, jensen_shannon, soft_cross_entropy, mse_loss)
-        #[arg(long, default_value = "kl_divergence")]
-        loss_type: String,
-
-        /// Softmax temperature
-        #[arg(long, default_value = "2.0")]
-        temperature: f32,
-
-        /// Alpha for blending hard/soft targets (0.0 to 1.0)
-        #[arg(long, default_value = "0.5")]
-        alpha: f32,
-
-        /// Use reasoning-aware (rationale) distillation
-        #[arg(long)]
-        rationale: bool,
-
-        /// Weight for reasoning tokens (if rationale is enabled)
-        #[arg(long, default_value = "1.0")]
-        rationale_weight: f32,
-
-        /// LoRA rank for student
-        #[arg(long, default_value = "16")]
-        lora_r: usize,
-
-        /// LoRA alpha scaling factor
-        #[arg(long, default_value = "32")]
-        lora_alpha: f32,
-
-        /// Learning rate
-        #[arg(long, default_value = "2e-5")]
-        learning_rate: f32,
-
-        /// Batch size
-        #[arg(long, default_value = "1")]
-        batch_size: usize,
-
-        /// Number of epochs
-        #[arg(long, default_value = "1")]
-        epochs: usize,
-
-        /// Maximum sequence length
-        #[arg(long, default_value = "1024")]
-        max_seq_len: usize,
-
-        /// Random seed for dataset shuffling and initialization.
-        #[arg(long, default_value = "42")]
-        seed: u64,
-
-        /// Custom text column name in the dataset JSONL.
-        #[arg(long)]
-        text_column: Option<String>,
-
-        /// Comma-separated list of columns to concatenate as the text field.
-        #[arg(long, value_delimiter = ',')]
-        text_columns: Option<Vec<String>>,
-
-        /// Separator used when joining multiple text columns.
-        #[arg(long, default_value = "\n\n")]
-        column_separator: String,
-
-        /// Column name for the prompt portion (enables SFT label masking).
-        #[arg(long)]
-        prompt_column: Option<String>,
-
-        /// Column name for the response portion (enables SFT label masking).
-        #[arg(long)]
-        response_column: Option<String>,
-
-        /// Path to write JSONL metrics log (for TUI dashboard)
-        #[arg(long)]
-        log_metrics: Option<String>,
-    },
+    Distill(crate::cli::distill::DistillArgs),
 
     /// Group Relative Policy Optimization (GRPO) for reasoning models
     #[cfg(feature = "trainer")]
-    Grpo {
-        /// Model ID or path
-        #[arg(short, long)]
-        model: String,
-
-        /// Dataset path (JSONL with prompts)
-        #[arg(short, long)]
-        dataset: String,
-
-        /// Output directory
-        #[arg(short, long, default_value = "./output/grpo")]
-        output: String,
-
-        /// Number of generations per prompt (group size)
-        #[arg(long, default_value = "8")]
-        num_generations: usize,
-
-        /// KL penalty coefficient (beta)
-        #[arg(long, default_value = "0.001")]
-        beta: f64,
-
-        /// Learning rate
-        #[arg(long, default_value = "5e-6")]
-        learning_rate: f64,
-
-        /// Number of training epochs
-        #[arg(long, default_value = "1")]
-        epochs: usize,
-
-        /// LoRA rank for policy model
-        #[arg(long, default_value = "16")]
-        lora_r: usize,
-
-        /// LoRA alpha scaling factor
-        #[arg(long, default_value = "32")]
-        lora_alpha: f32,
-
-        /// Maximum sequence length for generations
-        #[arg(long, default_value = "512")]
-        max_seq_len: usize,
-
-        /// Maximum completion length per generation
-        #[arg(long, default_value = "512")]
-        max_completion_length: usize,
-
-        /// Random seed for reproducibility
-        #[arg(long, default_value = "42")]
-        seed: u64,
-
-        /// Enable DAPO (Distribution-Aware Policy Optimization)
-        #[arg(long)]
-        dapo: bool,
-
-        /// Use reasoning-aware rewards (e.g., length, formatting)
-        #[arg(long)]
-        reasoning_rewards: bool,
-
-        /// Disable Metal FlashAttention
-        #[arg(long)]
-        no_flash_attention: bool,
-
-        /// Enable VLM (Vision-Language Model) mode for GRPO with image inputs.
-        ///
-        /// When set, images are loaded from each dataset sample's `images` field,
-        /// passed to reward functions, and used in forward passes via
-        /// `forward_with_images`.  Requires a multimodal dataset (JSONL with
-        /// `"images": ["/path/to/img.jpg", ...]` per sample).
-        #[arg(long)]
-        vlm: bool,
-
-        /// Maximum image size (pixels per side) for VLM preprocessing.
-        ///
-        /// Images are resized to fit within a square of this size while maintaining
-        /// aspect ratio.  336 matches CLIP ViT-L/14; 448 and 560 are common for
-        /// larger vision encoders.
-        #[arg(long, default_value = "336")]
-        max_image_size: usize,
-
-        /// Path to a pretrained ML reward model for scoring completions.
-        ///
-        /// When set, the model is loaded at training start and used alongside any
-        /// heuristic reward functions.  Accepts a local model directory or a
-        /// HuggingFace model ID (e.g. "RLHFlow/ArmoRM-Llama3-8B-v0.1").
-        ///
-        /// The reward model runs inference-only — it is not fine-tuned.
-        #[arg(long)]
-        reward_model: Option<String>,
-
-        /// Maximum input sequence length for the ML reward model (tokens).
-        ///
-        /// Inputs longer than this are truncated from the right.
-        #[arg(long, default_value = "2048")]
-        reward_model_max_length: usize,
-
-        /// Weight for the ML reward model in the combined reward.
-        ///
-        /// The final reward is a weighted sum of all reward functions.  Set to
-        /// a value less than 1.0 to blend the ML reward with heuristic rewards.
-        #[arg(long, default_value = "1.0")]
-        reward_model_weight: f64,
-
-        /// Chat template for the reward model (optional).
-        ///
-        /// Use `{prompt}` and `{completion}` as placeholders, e.g.:
-        /// `"Human: {prompt}\nAssistant: {completion}"`
-        ///
-        /// When omitted, prompt and completion are concatenated directly.
-        #[arg(long)]
-        reward_model_template: Option<String>,
-
-        /// Enable speculative decoding for faster rollout generation.
-        ///
-        /// Uses a draft/verify approach: generate `--speculative-draft-tokens` cheap
-        /// draft tokens, then verify them all in a single batched forward pass.
-        /// Expected speedup: 2–4x over standard autoregressive generation.
-        ///
-        /// Automatically disabled for models that do not support KV caching.
-        #[arg(long)]
-        speculative: bool,
-
-        /// Number of draft tokens per speculative decode step (default: 3).
-        ///
-        /// Higher values yield more throughput at high acceptance rates but increase
-        /// overhead when the draft distribution diverges from the full model.
-        /// Typical range: 2–5.  Ignored unless `--speculative` is set.
-        #[arg(long, default_value = "3")]
-        speculative_draft_tokens: usize,
-
-        /// Enable pipelined (asynchronous) reward scoring.
-        ///
-        /// When set, reward scoring for step N runs in a background thread
-        /// concurrently with GPU training for step N+1.  This is most effective
-        /// when using an ML reward model (`--reward-model`) whose inference is
-        /// CPU- or ANE-bound while the policy model trains on the GPU.
-        ///
-        /// For pure heuristic rewards (format, accuracy), the scoring is
-        /// so fast that pipelining provides negligible benefit.
-        #[arg(long)]
-        async_rewards: bool,
-
-        /// Custom text column name in the dataset JSONL.
-        #[arg(long)]
-        text_column: Option<String>,
-
-        /// Comma-separated list of columns to concatenate as the text field.
-        #[arg(long, value_delimiter = ',')]
-        text_columns: Option<Vec<String>>,
-
-        /// Separator used when joining multiple text columns.
-        #[arg(long, default_value = "\n\n")]
-        column_separator: String,
-
-        /// Column name for the prompt portion (enables SFT label masking).
-        #[arg(long)]
-        prompt_column: Option<String>,
-
-        /// Column name for the response portion (enables SFT label masking).
-        #[arg(long)]
-        response_column: Option<String>,
-
-        /// KV cache quantization bits for GRPO rollout generation (2, 4, or 8).
-        ///
-        /// When set, the KV cache used during completion generation is stored at the
-        /// requested bit width instead of fp16.  This reduces peak memory during rollout
-        /// by 2–8× depending on the bit width, enabling longer completions or larger
-        /// generation group sizes on memory-constrained hardware.
-        ///
-        /// Valid values: 2, 4, 8.  Omit to use the default fp16 cache.
-        #[arg(long)]
-        grpo_kv_bits: Option<u8>,
-
-        /// Path to write JSONL metrics log (for TUI dashboard)
-        #[arg(long)]
-        log_metrics: Option<String>,
-    },
+    Grpo(crate::cli::grpo::GrpoArgs),
 
     /// RLKD: Reinforcement Learning with Knowledge Distillation.
     ///
@@ -729,116 +443,7 @@ enum Commands {
     ///
     /// Loss formula: L = (1 - alpha) * L_grpo + alpha * L_distill
     #[cfg(feature = "trainer")]
-    Rlkd {
-        /// Policy (student) model ID or local path.
-        #[arg(short, long)]
-        model: String,
-
-        /// Teacher model ID or local path (frozen, provides soft targets).
-        #[arg(long)]
-        teacher_model: String,
-
-        /// Dataset path (JSONL with prompts).
-        #[arg(short, long)]
-        dataset: String,
-
-        /// Output directory for LoRA adapter weights.
-        #[arg(short, long, default_value = "./output/rlkd")]
-        output: String,
-
-        /// Distillation blend factor: 0.0 = pure RL, 1.0 = pure distillation.
-        ///
-        /// When `--anneal-alpha` is set this is the starting value; the factor
-        /// is linearly annealed toward `--final-alpha` over training.
-        #[arg(long, default_value = "0.3")]
-        distill_alpha: f32,
-
-        /// Final alpha value when annealing (default: 0.05 = mostly RL by end).
-        #[arg(long, default_value = "0.05")]
-        final_alpha: f32,
-
-        /// Linearly anneal alpha from `--distill-alpha` toward `--final-alpha`.
-        ///
-        /// This shifts training from distillation-guided early on to RL-driven
-        /// at the end, which typically improves final task performance.
-        #[arg(long)]
-        anneal_alpha: bool,
-
-        /// Temperature for distillation soft targets (default: 2.0).
-        ///
-        /// Higher temperatures soften the teacher distribution, transferring
-        /// more information about non-dominant token probabilities.
-        #[arg(long, default_value = "2.0")]
-        distill_temperature: f32,
-
-        /// Number of completions to generate per prompt (GRPO group size).
-        #[arg(long, default_value = "8")]
-        num_generations: usize,
-
-        /// KL penalty coefficient (beta) for GRPO reference model regularization.
-        #[arg(long, default_value = "0.001")]
-        beta: f64,
-
-        /// Learning rate.
-        #[arg(long, default_value = "5e-6")]
-        learning_rate: f64,
-
-        /// Number of training epochs.
-        #[arg(long, default_value = "1")]
-        epochs: usize,
-
-        /// LoRA rank for the policy model.
-        #[arg(long, default_value = "16")]
-        lora_r: usize,
-
-        /// LoRA alpha scaling factor.
-        #[arg(long, default_value = "32")]
-        lora_alpha: f32,
-
-        /// Maximum sequence length (prompt + completion).
-        #[arg(long, default_value = "512")]
-        max_seq_len: usize,
-
-        /// Maximum completion length per generation.
-        #[arg(long, default_value = "512")]
-        max_completion_length: usize,
-
-        /// Random seed for reproducibility.
-        #[arg(long, default_value = "42")]
-        seed: u64,
-
-        /// Use reasoning-aware rewards (format + length signals).
-        #[arg(long)]
-        reasoning_rewards: bool,
-
-        /// Disable Metal FlashAttention.
-        #[arg(long)]
-        no_flash_attention: bool,
-
-        /// Custom text column name in the dataset JSONL.
-        #[arg(long)]
-        text_column: Option<String>,
-
-        /// Comma-separated list of columns to concatenate as the text field.
-        #[arg(long, value_delimiter = ',')]
-        text_columns: Option<Vec<String>>,
-
-        /// Separator used when joining multiple text columns.
-        #[arg(long, default_value = "\n\n")]
-        column_separator: String,
-
-        /// Column name for the prompt portion (enables SFT label masking).
-        #[arg(long)]
-        prompt_column: Option<String>,
-
-        /// Column name for the response portion (enables SFT label masking).
-        #[arg(long)]
-        response_column: Option<String>,
-
-        /// Path to write JSONL metrics log (for TUI dashboard).
-        #[arg(long)]
-        log_metrics: Option<String>,
-    },
+    Rlkd(crate::cli::rlkd::RlkdArgs),
 
     /// Start MCP server for Claude Desktop integration
     #[cfg(feature = "mcp")]
@@ -846,91 +451,7 @@ enum Commands {
 
     /// Start an OpenAI-compatible inference server
     #[cfg(feature = "serve")]
-    Serve {
-        /// Model ID or path
-        #[arg(short, long)]
-        model: String,
-
-        /// Port to listen on
-        #[arg(short, long, default_value = "8080")]
-        port: u16,
-
-        /// Host to bind to
-        #[arg(long, default_value = "127.0.0.1")]
-        host: String,
-
-        /// Maximum sequence length for KV cache
-        #[arg(long, default_value = "4096")]
-        max_seq_len: usize,
-
-        /// Path to packed expert weights directory for SSD-offloaded MoE inference.
-        /// Created with `pmetal pack-experts`.
-        #[arg(long)]
-        experts_dir: Option<String>,
-
-        /// Quantize weights to FP8 E4M3 at load time (~2x memory savings).
-        #[arg(long)]
-        fp8: bool,
-
-        /// KV cache quantization bits: 8 = q8_0, 4 = q4_0, 0 = fp16.
-        /// Omit for auto-selection based on model size and device memory budget.
-        #[arg(long)]
-        kv_quant: Option<u8>,
-
-        /// Disable KV cache quantization (use fp16 KV cache).
-        #[arg(long)]
-        no_kv_quant: bool,
-
-        /// Quantization group size for KV cache.
-        #[arg(long, default_value = "64")]
-        kv_group_size: usize,
-
-        /// Enable TurboQuant KV cache compression (provably near-optimal, data-oblivious).
-        /// Reduces KV cache memory 4-6x with near-zero quality loss.
-        #[arg(long)]
-        kv_turboquant: bool,
-
-        /// TurboQuant quality preset: q2_5 (2.5 bits, 6.4x compression) or q3_5 (3.5 bits, 4.6x compression, lossless).
-        #[arg(long, value_parser = ["q2_5", "q3_5"])]
-        kv_turboquant_preset: Option<String>,
-
-        /// Enable ANE (Apple Neural Engine) for serving (experimental).
-        #[cfg(feature = "ane")]
-        #[arg(long)]
-        ane: bool,
-
-        /// Maximum ANE kernel sequence length (power-of-2 bucket cap).
-        /// Higher values allow longer prompts on ANE but may fail to compile on
-        /// wider models. Default: 1024.
-        #[cfg(feature = "ane")]
-        #[arg(long, default_value = "1024")]
-        ane_max_seq_len: usize,
-
-        /// Use the experimental ANE real-time evaluation path when ANE serving is selected.
-        #[cfg(feature = "ane")]
-        #[arg(long)]
-        ane_real_time: bool,
-
-        /// Enable continuous batching: multiple in-flight requests share
-        /// batched decode steps. Requests that use stop_sequences,
-        /// logprobs, or non-neutral repetition/frequency/presence
-        /// penalties automatically fall back to single-request mode.
-        #[arg(long)]
-        continuous_batch: bool,
-
-        /// Maximum concurrent slots when --continuous-batch is set.
-        /// KV cache memory scales linearly with this; pick conservatively
-        /// on models that already sit close to the memory ceiling at
-        /// batch 1.
-        #[arg(long, default_value = "8")]
-        cb_max_slots: usize,
-
-        /// Maximum pending-queue depth when --continuous-batch is set.
-        /// Requests beyond this are rejected with a 5xx rather than
-        /// silently queued forever.
-        #[arg(long, default_value = "256")]
-        cb_max_queue_depth: usize,
-    },
+    Serve(crate::cli::serve::ServeArgs),
 
     /// Dataset utilities for preparing and analyzing training data
     Dataset {
@@ -939,23 +460,7 @@ enum Commands {
     },
 
     /// Tokenize a text corpus into binary shards for pretraining
-    Tokenize {
-        /// Input JSONL file
-        #[arg(short, long)]
-        input: String,
-        /// Output directory for shard files
-        #[arg(short, long)]
-        output: String,
-        /// Tokenizer model ID or path (HuggingFace format)
-        #[arg(short, long)]
-        tokenizer: String,
-        /// JSONL column containing text (default: "text")
-        #[arg(long, default_value = "text")]
-        text_column: String,
-        /// Maximum documents per shard (default: 10000)
-        #[arg(long, default_value = "10000")]
-        docs_per_shard: usize,
-    },
+    Tokenize(crate::cli::tokenize::TokenizeArgs),
 
     /// Real-time training dashboard (loss curves, ANE utilization, timing)
     Dashboard {
@@ -981,75 +486,11 @@ enum Commands {
 
     /// Merge two or more models using various merge methods (SLERP, TIES, DARE, linear, etc.)
     #[cfg(feature = "merge")]
-    Merge {
-        /// First model path or HuggingFace ID
-        #[arg(short = 'a', long)]
-        model_a: String,
-
-        /// Second model path or HuggingFace ID
-        #[arg(short = 'b', long)]
-        model_b: String,
-
-        /// Output directory for merged model
-        #[arg(short, long)]
-        output: String,
-
-        /// Merge method (linear, slerp, ties, dare_ties, dare_linear, task_arithmetic, della, breadcrumbs, model_stock, nearswap, passthrough)
-        #[arg(long, default_value = "slerp")]
-        method: String,
-
-        /// Base model for task-vector methods (TIES, DARE, task_arithmetic)
-        #[arg(long)]
-        base: Option<String>,
-
-        /// Interpolation parameter t for SLERP (0.0=model_a, 1.0=model_b)
-        #[arg(long, default_value = "0.5")]
-        t: f32,
-
-        /// Weight for model_a in linear/ties methods
-        #[arg(long, default_value = "0.5")]
-        weight_a: f32,
-
-        /// Weight for model_b in linear/ties methods
-        #[arg(long, default_value = "0.5")]
-        weight_b: f32,
-
-        /// Density for sparsification (TIES/DARE) — fraction of params to keep
-        #[arg(long, default_value = "0.5")]
-        density: f32,
-
-        /// Output dtype (float32, float16, bfloat16)
-        #[arg(long, default_value = "bfloat16")]
-        dtype: String,
-    },
+    Merge(crate::cli::merge::MergeArgs),
 
     /// Evaluate a model's perplexity on a dataset
     #[cfg(feature = "lora")]
-    Eval {
-        /// Model ID or path
-        #[arg(short, long)]
-        model: String,
-
-        /// Dataset path (JSONL file)
-        #[arg(short, long)]
-        dataset: String,
-
-        /// LoRA adapter path (optional)
-        #[arg(long)]
-        lora: Option<String>,
-
-        /// Maximum sequence length
-        #[arg(long, default_value = "1024")]
-        max_seq_len: usize,
-
-        /// Number of samples to evaluate (0 = all)
-        #[arg(long, default_value = "0")]
-        num_samples: usize,
-
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
+    Eval(crate::cli::eval::EvalArgs),
 
     /// Train a sentence embedding model (BERT / encoder-only) with contrastive losses.
     ///
@@ -1065,69 +506,7 @@ enum Commands {
     ///   {"anchor": "...", "positive": "...", "negative": "..."}
     #[command(name = "embed-train")]
     #[cfg(feature = "trainer")]
-    EmbedTrain {
-        /// Path to the BERT / encoder model directory.
-        #[arg(short, long)]
-        model: String,
-
-        /// Path to the training dataset (JSONL pairs or triplets).
-        #[arg(short, long)]
-        dataset: String,
-
-        /// Output directory for trained model weights.
-        #[arg(short, long, default_value = "./output-embed")]
-        output: String,
-
-        /// Contrastive loss function.
-        /// Options: info_nce (default), mnrl, triplet, cosent, cosine_similarity
-        #[arg(long, default_value = "info_nce")]
-        loss: String,
-
-        /// Pooling strategy for sentence embeddings.
-        /// Options: mean (default), cls, max, last_token, weighted_mean
-        #[arg(long, default_value = "mean")]
-        pooling: String,
-
-        /// Temperature for InfoNCE / CoSENT losses.
-        #[arg(long, default_value = "0.05")]
-        temperature: f32,
-
-        /// Margin for triplet loss.
-        #[arg(long, default_value = "0.3")]
-        margin: f32,
-
-        /// Learning rate.
-        #[arg(long, default_value = "2e-5")]
-        learning_rate: f64,
-
-        /// Training batch size.
-        #[arg(long, default_value = "32")]
-        batch_size: usize,
-
-        /// Number of training epochs.
-        #[arg(long, default_value = "3")]
-        epochs: usize,
-
-        /// Maximum input sequence length.
-        #[arg(long, default_value = "512")]
-        max_seq_len: usize,
-
-        /// AdamW weight decay.
-        #[arg(long, default_value = "0.01")]
-        weight_decay: f64,
-
-        /// Disable L2 normalisation of embeddings before loss.
-        #[arg(long)]
-        no_normalize: bool,
-
-        /// Log training progress every N steps.
-        #[arg(long, default_value = "10")]
-        log_every: usize,
-
-        /// Random seed for dataset shuffling.
-        #[arg(long, default_value = "42")]
-        seed: u64,
-    },
+    EmbedTrain(crate::cli::embed_train::EmbedTrainArgs),
 }
 
 /// Dataset subcommands for data preparation.
@@ -2165,28 +1544,29 @@ async fn tokio_main() -> anyhow::Result<()> {
         }
 
         #[cfg(feature = "serve")]
-        Commands::Serve {
-            model,
-            port,
-            host,
-            max_seq_len,
-            experts_dir,
-            fp8,
-            kv_quant,
-            no_kv_quant,
-            kv_group_size,
-            kv_turboquant,
-            kv_turboquant_preset,
-            #[cfg(feature = "ane")]
-            ane,
-            #[cfg(feature = "ane")]
-            ane_max_seq_len,
-            #[cfg(feature = "ane")]
-            ane_real_time,
-            continuous_batch,
-            cb_max_slots,
-            cb_max_queue_depth,
-        } => {
+        Commands::Serve(args) => {
+            let crate::cli::serve::ServeArgs {
+                model,
+                port,
+                host,
+                max_seq_len,
+                experts_dir,
+                fp8,
+                kv_quant,
+                no_kv_quant,
+                kv_group_size,
+                kv_turboquant,
+                kv_turboquant_preset,
+                #[cfg(feature = "ane")]
+                ane,
+                #[cfg(feature = "ane")]
+                ane_max_seq_len,
+                #[cfg(feature = "ane")]
+                ane_real_time,
+                continuous_batch,
+                cb_max_slots,
+                cb_max_queue_depth,
+            } = args;
             #[cfg(feature = "ane")]
             let ane_enabled = ane;
             #[cfg(not(feature = "ane"))]
@@ -2663,36 +2043,37 @@ async fn tokio_main() -> anyhow::Result<()> {
         }
 
         #[cfg(feature = "trainer")]
-        Commands::Distill {
-            teacher,
-            student,
-            dataset,
-            output,
-            method,
-            offline,
-            offline_cache,
-            offline_generate,
-            offline_compression,
-            offline_top_k,
-            loss_type,
-            temperature,
-            alpha,
-            rationale,
-            rationale_weight,
-            lora_r,
-            lora_alpha,
-            learning_rate,
-            batch_size,
-            epochs,
-            max_seq_len,
-            seed,
-            text_column,
-            text_columns,
-            column_separator,
-            prompt_column,
-            response_column,
-            log_metrics,
-        } => {
+        Commands::Distill(args) => {
+            let crate::cli::distill::DistillArgs {
+                teacher,
+                student,
+                dataset,
+                output,
+                method,
+                offline,
+                offline_cache,
+                offline_generate,
+                offline_compression,
+                offline_top_k,
+                loss_type,
+                temperature,
+                alpha,
+                rationale,
+                rationale_weight,
+                lora_r,
+                lora_alpha,
+                learning_rate,
+                batch_size,
+                epochs,
+                max_seq_len,
+                seed,
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
+                log_metrics,
+            } = args;
             commands::distill::run_distillation_cli(
                 &teacher,
                 &student,
@@ -2731,39 +2112,40 @@ async fn tokio_main() -> anyhow::Result<()> {
         }
 
         #[cfg(feature = "trainer")]
-        Commands::Grpo {
-            model,
-            dataset,
-            output,
-            num_generations,
-            beta,
-            learning_rate,
-            epochs,
-            lora_r,
-            lora_alpha,
-            max_seq_len,
-            max_completion_length,
-            seed,
-            dapo,
-            reasoning_rewards,
-            no_flash_attention,
-            vlm,
-            max_image_size,
-            reward_model,
-            reward_model_max_length,
-            reward_model_weight,
-            reward_model_template,
-            async_rewards,
-            speculative,
-            speculative_draft_tokens,
-            grpo_kv_bits,
-            text_column,
-            text_columns,
-            column_separator,
-            prompt_column,
-            response_column,
-            log_metrics,
-        } => {
+        Commands::Grpo(args) => {
+            let crate::cli::grpo::GrpoArgs {
+                model,
+                dataset,
+                output,
+                num_generations,
+                beta,
+                learning_rate,
+                epochs,
+                lora_r,
+                lora_alpha,
+                max_seq_len,
+                max_completion_length,
+                seed,
+                dapo,
+                reasoning_rewards,
+                no_flash_attention,
+                vlm,
+                max_image_size,
+                reward_model,
+                reward_model_max_length,
+                reward_model_weight,
+                reward_model_template,
+                async_rewards,
+                speculative,
+                speculative_draft_tokens,
+                grpo_kv_bits,
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
+                log_metrics,
+            } = args;
             commands::grpo::run_grpo_cli(
                 &model,
                 &dataset,
@@ -2803,33 +2185,34 @@ async fn tokio_main() -> anyhow::Result<()> {
         }
 
         #[cfg(feature = "trainer")]
-        Commands::Rlkd {
-            model,
-            teacher_model,
-            dataset,
-            output,
-            distill_alpha,
-            final_alpha,
-            anneal_alpha,
-            distill_temperature,
-            num_generations,
-            beta,
-            learning_rate,
-            epochs,
-            lora_r,
-            lora_alpha,
-            max_seq_len,
-            max_completion_length,
-            seed,
-            reasoning_rewards,
-            no_flash_attention,
-            text_column,
-            text_columns,
-            column_separator,
-            prompt_column,
-            response_column,
-            log_metrics,
-        } => {
+        Commands::Rlkd(args) => {
+            let crate::cli::rlkd::RlkdArgs {
+                model,
+                teacher_model,
+                dataset,
+                output,
+                distill_alpha,
+                final_alpha,
+                anneal_alpha,
+                distill_temperature,
+                num_generations,
+                beta,
+                learning_rate,
+                epochs,
+                lora_r,
+                lora_alpha,
+                max_seq_len,
+                max_completion_length,
+                seed,
+                reasoning_rewards,
+                no_flash_attention,
+                text_column,
+                text_columns,
+                column_separator,
+                prompt_column,
+                response_column,
+                log_metrics,
+            } = args;
             commands::rlkd::run_rlkd_cli(
                 &model,
                 &teacher_model,
@@ -2866,13 +2249,14 @@ async fn tokio_main() -> anyhow::Result<()> {
             commands::dataset::run_dataset_command(action).await?;
         }
 
-        Commands::Tokenize {
-            input,
-            output,
-            tokenizer,
-            text_column,
-            docs_per_shard,
-        } => {
+        Commands::Tokenize(args) => {
+            let crate::cli::tokenize::TokenizeArgs {
+                input,
+                output,
+                tokenizer,
+                text_column,
+                docs_per_shard,
+            } = args;
             commands::tokenize::run_tokenize(
                 &input,
                 &output,
@@ -2899,18 +2283,19 @@ async fn tokio_main() -> anyhow::Result<()> {
         }
 
         #[cfg(feature = "merge")]
-        Commands::Merge {
-            model_a,
-            model_b,
-            output,
-            method,
-            base,
-            t,
-            weight_a,
-            weight_b,
-            density,
-            dtype,
-        } => {
+        Commands::Merge(args) => {
+            let crate::cli::merge::MergeArgs {
+                model_a,
+                model_b,
+                output,
+                method,
+                base,
+                t,
+                weight_a,
+                weight_b,
+                density,
+                dtype,
+            } = args;
             commands::merge::run_merge_command(
                 &model_a,
                 &model_b,
@@ -2927,14 +2312,15 @@ async fn tokio_main() -> anyhow::Result<()> {
         }
 
         #[cfg(feature = "lora")]
-        Commands::Eval {
-            model,
-            dataset,
-            lora,
-            max_seq_len,
-            num_samples,
-            json,
-        } => {
+        Commands::Eval(args) => {
+            let crate::cli::eval::EvalArgs {
+                model,
+                dataset,
+                lora,
+                max_seq_len,
+                num_samples,
+                json,
+            } = args;
             commands::eval::run_eval(
                 &model,
                 &dataset,
@@ -2947,23 +2333,24 @@ async fn tokio_main() -> anyhow::Result<()> {
         }
 
         #[cfg(feature = "trainer")]
-        Commands::EmbedTrain {
-            model,
-            dataset,
-            output,
-            loss,
-            pooling,
-            temperature,
-            margin,
-            learning_rate,
-            batch_size,
-            epochs,
-            max_seq_len,
-            weight_decay,
-            no_normalize,
-            log_every,
-            seed,
-        } => {
+        Commands::EmbedTrain(args) => {
+            let crate::cli::embed_train::EmbedTrainArgs {
+                model,
+                dataset,
+                output,
+                loss,
+                pooling,
+                temperature,
+                margin,
+                learning_rate,
+                batch_size,
+                epochs,
+                max_seq_len,
+                weight_decay,
+                no_normalize,
+                log_every,
+                seed,
+            } = args;
             commands::embed_train::run_embed_train(
                 &model,
                 &dataset,
