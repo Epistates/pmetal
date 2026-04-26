@@ -9,10 +9,20 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // Each TurboQuant Metal kernel uses the pattern below to lazily register itself
 // the first time the getter is called. We intentionally keep this as direct
-// boilerplate rather than a macro because the C preprocessor cannot pass
-// brace-enclosed initializer lists for the input/output name vectors without
-// awkward parenthesisation tricks that obscure more than they save (~5 lines
-// per kernel × ~20 kernels). If you add a new kernel, copy this template:
+// boilerplate rather than a macro for two reasons:
+//
+//   1. The C preprocessor cannot pass brace-enclosed initializer lists for the
+//      input/output name vectors as macro arguments without awkward
+//      parenthesisation tricks. (`__VA_ARGS__` works around this, but the
+//      macro form is no longer obviously readable at the call site.)
+//
+//   2. Even with the brace-list issue solved, each getter is only ~12 LOC and
+//      the most error-prone part is the input/output name-vector binding to
+//      the kernel-source identifiers. A macro hides exactly that — wrong
+//      ordering or a typo silently produces the wrong tensor binding instead
+//      of a compile-time error you can spot in 10 seconds.
+//
+// If you add a new kernel, copy this template:
 //
 //   static const char* MY_KERNEL_SOURCE = R"(...)";
 //

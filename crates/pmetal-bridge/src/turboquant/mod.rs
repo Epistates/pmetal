@@ -4133,14 +4133,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn turboquant_attention_q8_d256_fullbyte_dense_values_matches_manual_reference() {
+    /// Drives the d256 fullbyte+dense-values direct attention path against a
+    /// from-scratch CPU reference at the given sequence length. Pulled out of
+    /// the original single-shape test so the seq-sweep variant below can hit
+    /// 1024/2048/4096 without copy-pasting 80 LOC of fixture setup.
+    fn run_d256_fullbyte_dense_values_parity_at(seq: i32) {
         let batch = 1i32;
         let q_heads = 4i32;
         let kv_heads = 2i32;
         let groups = q_heads / kv_heads;
         let dim = 256i32;
-        let seq = 1024i32;
         let kv_rows = batch * kv_heads;
         let q_rows = batch * q_heads;
         let scale = 1.0f32 / (dim as f32).sqrt();
@@ -4225,8 +4227,27 @@ mod tests {
             .fold(0.0f32, f32::max);
         assert!(
             max_abs_diff < 1e-4,
-            "d256 fullbyte direct attention diverged from manual reference: max_abs_diff={max_abs_diff}"
+            "d256 fullbyte direct attention diverged from manual reference at seq={seq}: max_abs_diff={max_abs_diff}"
         );
+    }
+
+    #[test]
+    fn turboquant_attention_q8_d256_fullbyte_dense_values_matches_manual_reference() {
+        run_d256_fullbyte_dense_values_parity_at(1024);
+    }
+
+    /// Denser parity sweep over n_seq for the d256 fullbyte+dense-values path.
+    ///
+    /// The single-shape test above pins correctness at the n_seq=1024 dispatch
+    /// boundary. This sweep extends coverage to 2048 and 4096 so any future
+    /// touch-ups to the shared d256 pass-2 merge kernel (e.g. when the
+    /// mixed-precision fused attention kernel from Phase 3 reuses it) catch
+    /// regressions across the long-context envelope, not just at the threshold.
+    #[test]
+    fn turboquant_attention_q8_d256_fullbyte_dense_values_parity_seq_sweep() {
+        for seq in [1024, 2048, 4096] {
+            run_d256_fullbyte_dense_values_parity_at(seq);
+        }
     }
 
     #[test]

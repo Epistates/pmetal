@@ -3,19 +3,40 @@
 // the D=128 pass-2 merge kernel.
 //
 // ─────────────────────────────────────────────────────────────────────────
-// Templating note (audit 2026-04-25)
+// Templating note (audit revisit 2026-04-26)
 // ─────────────────────────────────────────────────────────────────────────
-// This file (~520 LOC) and bridge_turboquant_attn_d256.cpp (~1930 LOC) share
-// the same kernel structure modulo three constants:
-//   * kDim         (head_dim — 128 vs 256)
-//   * kVec         (per-lane element count — 4 vs 8)
-//   * codebook size (128 vs 256 entries)
-// A future refactor could extract a common kernel template parameterised on
-// `kDim` and emit both as specialisations. Deferred until: (1) parity tests
-// for both head dims share a single fixture, (2) attention-correctness
-// regression coverage is in place for every existing variant. Until then,
-// keeping these as separate maintainable units beats sharing a fragile macro
-// that we'd have to debug across two sets of numerics.
+// The April 2026 audit considered consolidating this file and
+// bridge_turboquant_attn_d256.cpp behind a `MAKE_TQ_ATTN_KERNEL(NAME, DIM,
+// VEC, ...)` macro that would emit kernel sources with constants substituted.
+// After deeper exploration the conclusion is "do not pursue":
+//
+//   1. Pass-1 unroll counts genuinely differ (4 vs 8 accumulators per lane).
+//      A constants-only macro can't change this; consolidation would need
+//      either a token-pasting unroll macro (`ACC_LANE(0); ACC_LANE(1); …`)
+//      or a Metal `for` loop. Both have downsides — the former obscures
+//      the code; the latter risks a perf regression we'd need to re-tune.
+//
+//   2. Pass-2 merge reductions diverge on purpose. d128 uses `simd_sum`;
+//      d256 uses an explicit `for (uint g = 0; g < kSimds; ++g) sum += …`
+//      because the larger d256 footprint benefits from the loop form. This
+//      is a perf-tuning choice baked into the kernel body, not a constant.
+//
+//   3. d256 has four kernels with NO d128 equivalent: packed_keys_dense_values,
+//      fullbyte_dense_values, fullbyte_localsoftmax, packed_kv_dense_values.
+//      The fullbyte family is q8-MSE-only with no QJL residual term — the
+//      score-side math is structurally distinct, not a constant swap.
+//
+//   4. MLX upstream solves this with `template <typename T, int D, int V>`
+//      at the .metal source level (see mlx/backend/metal/kernels/sdpa_vector.h)
+//      plus Metal function constants for runtime branches. The public
+//      `mlx::core::fast::metal_kernel` API we use here does NOT expose
+//      function constants, and exposing them would mean linking against
+//      MLX internals — out of scope for a duplication cleanup.
+//
+// Net: keeping d128 and d256 as separate maintainable units is the right
+// call. The actual large-file problem is the 1930-LOC d256 file's growth
+// across five variant families; that's tracked as a navigability concern
+// (split by family) rather than a templating one.
 
 #include "bridge_turboquant_internal.h"
 
