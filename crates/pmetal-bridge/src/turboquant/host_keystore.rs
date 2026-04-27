@@ -24,7 +24,14 @@ pub struct QuantizedKeyStore {
     // consumes it without going through dequantize is still future work.
     pub(super) gpu_mixed: Option<GpuMixedKeyStore>,
 
-    // CPU fallback: regular (non-outlier) sub-vector data.
+    // CPU fallback: regular (non-outlier) sub-vector data. For Variant F
+    // (NoQjl) `regular_qjl_signs` is filled with zeros and
+    // `regular_residual_norms` is all-zero — the decode path's
+    // `residual_norms.any(> ZERO_EPSILON)` short-circuit then folds the
+    // QJL term to 0. The Option-typed parallel for these CPU buffers
+    // would save ~1 bit per coord (vs the 32× larger GPU `qjl_signs`
+    // savings already realized in the GPU stores) and isn't worth the
+    // diff churn through every CPU consumer.
     pub regular_indices: PackedBits,
     pub regular_qjl_signs: PackedBits,
     pub regular_norms: Vec<f32>,

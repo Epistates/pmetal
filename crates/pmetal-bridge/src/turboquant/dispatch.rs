@@ -136,92 +136,108 @@ pub(super) fn gpu_quantize_kv(
     //    residual_unrot = k_mse_recon_rot @ rotation_arr  (inverse-rotate the rotated reconstruction)
     //    then: residual_unrot = k_norm - inv_rotate(k_mse_recon_rot)
     //    QJL: residual_unrot @ inverse_qjl_arr  (= residual @ qjl.T)
-    let k_mse_recon_unrot = k_core.inverse_rotate_array(&k_mse_recon_rot)?;
-    let k_residual_unrot = k_norm.subtract(&k_mse_recon_unrot);
-    let k_qjl_proj = k_core.project_array(&k_residual_unrot)?;
-    let qjl_shape = k_qjl_proj.shape();
-    let qjl_ndim = qjl_shape.len();
-    let qjl_rows: i32 = qjl_shape[..qjl_ndim - 1].iter().product();
+    //
+    // Variant F (NoQjl): skip the projection + sign-bit packing entirely.
+    // qjl_signs / qjl_signs_t / q8_keybytes* stay None — the cache's score
+    // path for NoQjl goes through dequantize+SDPA (which is qjl-aware via
+    // residual_norms) so the GPU score kernels never read them.
     let packed_dim = packed_qjl_words(k_core.dim) as i32;
-    let k_qjl_proj_2d = if qjl_ndim == 2 {
-        k_qjl_proj.clone()
-    } else {
-        k_qjl_proj.reshape(&[qjl_rows, k_core.dim as i32])
-    };
-    let k_qjl_signs = InlineArray::turboquant_pack_sign_bits(
-        &k_qjl_proj_2d,
-        k_core.dim as u32,
-        packed_dim as u32,
-        qjl_rows as u32,
-    )?;
-    let k_qjl_signs = if qjl_ndim == 2 {
-        k_qjl_signs
-    } else {
-        let mut packed_shape: Vec<i32> = qjl_shape[..qjl_ndim - 1].to_vec();
-        packed_shape.push(packed_dim);
-        k_qjl_signs.reshape(&packed_shape)
-    };
     let use_q8_seq_shadow = key_bits == 8 && k_core.dim == 256 && v_core.dim == 256;
     let k_indices_t = (!use_q8_seq_shadow).then(|| k_indices.transpose_axes(&[0, 1, 3, 2]));
-    let k_qjl_signs_t = (!use_q8_seq_shadow).then(|| k_qjl_signs.transpose_axes(&[0, 1, 3, 2]));
-    let q8_pack_inputs = if key_bits == 8 {
-        let kv_rows = (keys.dim(0) * keys.dim(1)) as u32;
-        let seq = keys.dim(2) as u32;
-        let indices_t_3d = if let Some(indices_t) = k_indices_t.as_ref() {
-            indices_t.reshape(&[kv_rows as i32, k_core.dim as i32, seq as i32])
-        } else {
-            k_indices.transpose_axes(&[0, 1, 3, 2]).reshape(&[
-                kv_rows as i32,
-                k_core.dim as i32,
-                seq as i32,
-            ])
-        };
-        let qjl_signs_t_3d = if let Some(qjl_signs_t) = k_qjl_signs_t.as_ref() {
-            qjl_signs_t.reshape(&[kv_rows as i32, packed_dim, seq as i32])
-        } else {
-            k_qjl_signs.transpose_axes(&[0, 1, 3, 2]).reshape(&[
-                kv_rows as i32,
-                packed_dim,
-                seq as i32,
-            ])
-        };
-        Some((kv_rows, seq, indices_t_3d, qjl_signs_t_3d))
+
+    let (k_qjl_signs, k_qjl_signs_t, q8_keybytes_t, q8_keybytes_seq) = if no_qjl {
+        (None, None, None, None)
     } else {
-        None
-    };
-    let q8_keybytes_t = if use_q8_seq_shadow {
-        None
-    } else if let Some((kv_rows, seq, indices_t_3d, qjl_signs_t_3d)) = q8_pack_inputs.as_ref() {
-        InlineArray::turboquant_pack_q8_keybytes(
-            indices_t_3d,
-            qjl_signs_t_3d,
+        let k_mse_recon_unrot = k_core.inverse_rotate_array(&k_mse_recon_rot)?;
+        let k_residual_unrot = k_norm.subtract(&k_mse_recon_unrot);
+        let k_qjl_proj = k_core.project_array(&k_residual_unrot)?;
+        let qjl_shape = k_qjl_proj.shape();
+        let qjl_ndim = qjl_shape.len();
+        let qjl_rows: i32 = qjl_shape[..qjl_ndim - 1].iter().product();
+        let k_qjl_proj_2d = if qjl_ndim == 2 {
+            k_qjl_proj.clone()
+        } else {
+            k_qjl_proj.reshape(&[qjl_rows, k_core.dim as i32])
+        };
+        let k_qjl_signs = InlineArray::turboquant_pack_sign_bits(
+            &k_qjl_proj_2d,
             k_core.dim as u32,
             packed_dim as u32,
-            *kv_rows,
-            *seq,
-        )
-        .map(|packed| packed.reshape(&[keys.dim(0), keys.dim(1), k_core.dim as i32, keys.dim(2)]))
-    } else {
-        None
-    };
-    let q8_keybytes_seq = if use_q8_seq_shadow {
-        q8_pack_inputs
-            .as_ref()
-            .and_then(|(kv_rows, seq, indices_t_3d, qjl_signs_t_3d)| {
-                InlineArray::turboquant_pack_q8_keybytes_seq(
-                    indices_t_3d,
-                    qjl_signs_t_3d,
-                    k_core.dim as u32,
-                    packed_dim as u32,
-                    *kv_rows,
-                    *seq,
-                )
-                .map(|packed| {
-                    packed.reshape(&[keys.dim(0), keys.dim(1), keys.dim(2), k_core.dim as i32])
-                })
+            qjl_rows as u32,
+        )?;
+        let k_qjl_signs = if qjl_ndim == 2 {
+            k_qjl_signs
+        } else {
+            let mut packed_shape: Vec<i32> = qjl_shape[..qjl_ndim - 1].to_vec();
+            packed_shape.push(packed_dim);
+            k_qjl_signs.reshape(&packed_shape)
+        };
+        let k_qjl_signs_t =
+            (!use_q8_seq_shadow).then(|| k_qjl_signs.transpose_axes(&[0, 1, 3, 2]));
+        let q8_pack_inputs = if key_bits == 8 {
+            let kv_rows = (keys.dim(0) * keys.dim(1)) as u32;
+            let seq = keys.dim(2) as u32;
+            let indices_t_3d = if let Some(indices_t) = k_indices_t.as_ref() {
+                indices_t.reshape(&[kv_rows as i32, k_core.dim as i32, seq as i32])
+            } else {
+                k_indices.transpose_axes(&[0, 1, 3, 2]).reshape(&[
+                    kv_rows as i32,
+                    k_core.dim as i32,
+                    seq as i32,
+                ])
+            };
+            let qjl_signs_t_3d = if let Some(qjl_signs_t) = k_qjl_signs_t.as_ref() {
+                qjl_signs_t.reshape(&[kv_rows as i32, packed_dim, seq as i32])
+            } else {
+                k_qjl_signs.transpose_axes(&[0, 1, 3, 2]).reshape(&[
+                    kv_rows as i32,
+                    packed_dim,
+                    seq as i32,
+                ])
+            };
+            Some((kv_rows, seq, indices_t_3d, qjl_signs_t_3d))
+        } else {
+            None
+        };
+        let q8_keybytes_t = if use_q8_seq_shadow {
+            None
+        } else if let Some((kv_rows, seq, indices_t_3d, qjl_signs_t_3d)) = q8_pack_inputs.as_ref()
+        {
+            InlineArray::turboquant_pack_q8_keybytes(
+                indices_t_3d,
+                qjl_signs_t_3d,
+                k_core.dim as u32,
+                packed_dim as u32,
+                *kv_rows,
+                *seq,
+            )
+            .map(|packed| {
+                packed.reshape(&[keys.dim(0), keys.dim(1), k_core.dim as i32, keys.dim(2)])
             })
-    } else {
-        None
+        } else {
+            None
+        };
+        let q8_keybytes_seq = if use_q8_seq_shadow {
+            q8_pack_inputs
+                .as_ref()
+                .and_then(|(kv_rows, seq, indices_t_3d, qjl_signs_t_3d)| {
+                    InlineArray::turboquant_pack_q8_keybytes_seq(
+                        indices_t_3d,
+                        qjl_signs_t_3d,
+                        k_core.dim as u32,
+                        packed_dim as u32,
+                        *kv_rows,
+                        *seq,
+                    )
+                    .map(|packed| {
+                        packed
+                            .reshape(&[keys.dim(0), keys.dim(1), keys.dim(2), k_core.dim as i32])
+                    })
+                })
+        } else {
+            None
+        };
+        (Some(k_qjl_signs), k_qjl_signs_t, q8_keybytes_t, q8_keybytes_seq)
     };
     let q8_fullbyte_seq = if use_q8_seq_shadow && turboquant_q8_fullbyte_enabled() {
         k_core
@@ -303,8 +319,14 @@ pub(super) fn gpu_encode_key_subvector(
     rows: &InlineArray, // [B, H, S, sub_dim] f32
     core: &TurboQuantCore,
     key_bits: u8,
+    qjl_mode: super::TurboQuantQjlMode,
 ) -> Option<MixedKeySubvectorEncoding> {
-    let mse_bits = key_bits.saturating_sub(1);
+    let no_qjl = matches!(qjl_mode, super::TurboQuantQjlMode::NoQjl);
+    let mse_bits = if no_qjl {
+        key_bits
+    } else {
+        key_bits.saturating_sub(1)
+    };
     let eps = InlineArray::from_f32(ZERO_EPSILON);
 
     let norms = rows.norm_l2(-1, true);
@@ -343,47 +365,54 @@ pub(super) fn gpu_encode_key_subvector(
     let residual_norms = residual_norms_raw
         .maximum(&zero_bound)
         .minimum(&upper_bound);
-    // QJL ablation: see the `gpu_quantize_kv` site for rationale.
-    let residual_norms = if super::should_zero_qjl() {
+    // QJL ablation OR Variant F (NoQjl): zero residual_norms so the score /
+    // dequantize paths skip the J^T·sign correction.
+    let residual_norms = if super::should_zero_qjl() || no_qjl {
         residual_norms.multiply(&zero_bound)
     } else {
         residual_norms
     };
 
-    let recon_unrot = core.inverse_rotate_array(&recon_rot)?;
-    let residual_unrot = normalized.subtract(&recon_unrot);
-    let qjl_proj = core.project_array(&residual_unrot)?;
-    let qjl_shape = qjl_proj.shape();
-    let qjl_ndim = qjl_shape.len();
-    let qjl_rows: i32 = qjl_shape[..qjl_ndim - 1].iter().product();
-    let packed_dim = packed_qjl_words(core.dim) as i32;
-    let qjl_proj_2d = if qjl_ndim == 2 {
-        qjl_proj.clone()
+    // Variant F (NoQjl) skips QJL projection + sign packing entirely.
+    let (qjl_signs, qjl_signs_t) = if no_qjl {
+        (None, None)
     } else {
-        qjl_proj.reshape(&[qjl_rows, core.dim as i32])
-    };
-    let qjl_signs = InlineArray::turboquant_pack_sign_bits(
-        &qjl_proj_2d,
-        core.dim as u32,
-        packed_dim as u32,
-        qjl_rows as u32,
-    )?;
-    let qjl_signs = if qjl_ndim == 2 {
-        qjl_signs
-    } else {
-        let mut packed_shape: Vec<i32> = qjl_shape[..qjl_ndim - 1].to_vec();
-        packed_shape.push(packed_dim);
-        qjl_signs.reshape(&packed_shape)
+        let recon_unrot = core.inverse_rotate_array(&recon_rot)?;
+        let residual_unrot = normalized.subtract(&recon_unrot);
+        let qjl_proj = core.project_array(&residual_unrot)?;
+        let qjl_shape = qjl_proj.shape();
+        let qjl_ndim = qjl_shape.len();
+        let qjl_rows: i32 = qjl_shape[..qjl_ndim - 1].iter().product();
+        let packed_dim = packed_qjl_words(core.dim) as i32;
+        let qjl_proj_2d = if qjl_ndim == 2 {
+            qjl_proj.clone()
+        } else {
+            qjl_proj.reshape(&[qjl_rows, core.dim as i32])
+        };
+        let qjl_signs = InlineArray::turboquant_pack_sign_bits(
+            &qjl_proj_2d,
+            core.dim as u32,
+            packed_dim as u32,
+            qjl_rows as u32,
+        )?;
+        let qjl_signs = if qjl_ndim == 2 {
+            qjl_signs
+        } else {
+            let mut packed_shape: Vec<i32> = qjl_shape[..qjl_ndim - 1].to_vec();
+            packed_shape.push(packed_dim);
+            qjl_signs.reshape(&packed_shape)
+        };
+        let qjl_signs_t = qjl_signs.transpose_axes(&[0, 1, 3, 2]);
+        (Some(qjl_signs), Some(qjl_signs_t))
     };
 
     let indices_t = indices.transpose_axes(&[0, 1, 3, 2]);
-    let qjl_signs_t = qjl_signs.transpose_axes(&[0, 1, 3, 2]);
 
     Some(MixedKeySubvectorEncoding {
         indices,
         indices_t: Some(indices_t),
         qjl_signs,
-        qjl_signs_t: Some(qjl_signs_t),
+        qjl_signs_t,
         norms,
         residual_norms,
         slot_scale,
@@ -393,9 +422,12 @@ pub(super) fn gpu_encode_key_subvector(
 pub(super) struct MixedKeySubvectorEncoding {
     pub(super) indices: InlineArray,
     pub(super) indices_t: Option<InlineArray>,
-    pub(super) qjl_signs: InlineArray,
+    /// `None` for Variant F (NoQjl); the GPU sub-vector store skips the
+    /// QJL pack along with the projection itself.
+    pub(super) qjl_signs: Option<InlineArray>,
     pub(super) qjl_signs_t: Option<InlineArray>,
     pub(super) norms: InlineArray,
+    /// Always zero for Variant F (`NoQjl`) — no residual to track.
     pub(super) residual_norms: InlineArray,
     pub(super) slot_scale: InlineArray,
 }
@@ -526,8 +558,8 @@ pub(super) fn gpu_quantize_kv_mixed(
     let k_reg_rows = keys.take_along_axis(&k_reg_src, -1);
     let k_out_rows = keys.take_along_axis(&k_out_src, -1);
 
-    let k_reg_enc = gpu_encode_key_subvector(&k_reg_rows, k_reg_core, kr_bits)?;
-    let k_out_enc = gpu_encode_key_subvector(&k_out_rows, k_out_core, ko_bits)?;
+    let k_reg_enc = gpu_encode_key_subvector(&k_reg_rows, k_reg_core, kr_bits, config.qjl)?;
+    let k_out_enc = gpu_encode_key_subvector(&k_out_rows, k_out_core, ko_bits, config.qjl)?;
 
     // Cast scatter tables to u8 for storage (D_total ≤ 256 fits comfortably).
     let k_reg_src_u8 = k_reg_src.as_dtype(Dtype::Uint8.as_i32());
@@ -643,6 +675,11 @@ pub(super) fn try_gpu_mixed_score(
     if q_heads <= 0 || kv_heads <= 0 || (q_heads % kv_heads) != 0 {
         return None;
     }
+    // Variant F (NoQjl) for Mixed configs goes through the dequantize fallback.
+    // The mixed_score kernel still requires QJL inputs; a no_qjl mixed kernel
+    // is Phase C′ follow-up.
+    let reg_qjl = kstore.regular_qjl_signs.as_ref()?;
+    let out_qjl = kstore.outlier_qjl_signs.as_ref()?;
 
     let reg_codebook = reg_core.codebook_arr(regular_bits.saturating_sub(1))?;
     let out_codebook = out_core.codebook_arr(outlier_bits.saturating_sub(1))?;
@@ -691,14 +728,14 @@ pub(super) fn try_gpu_mixed_score(
     let out_residual_flat = kstore.outlier_residual_norms.reshape(&[kv_rows, t]);
     let out_slot_scale_flat = kstore.outlier_slot_scale.reshape(&[kv_rows, t]);
 
-    let reg_qjl_words = kstore.regular_qjl_signs.dim(3);
-    let out_qjl_words = kstore.outlier_qjl_signs.dim(3);
+    let reg_qjl_words = reg_qjl.dim(3);
+    let out_qjl_words = out_qjl.dim(3);
 
     InlineArray::turboquant_mixed_score(
         &q_reg_rot,
         &q_reg_proj,
         &kstore.regular_indices,
-        &kstore.regular_qjl_signs,
+        reg_qjl,
         &reg_norms_flat,
         &reg_residual_flat,
         &reg_slot_scale_flat,
@@ -706,7 +743,7 @@ pub(super) fn try_gpu_mixed_score(
         &q_out_rot,
         &q_out_proj,
         &kstore.outlier_indices,
-        &kstore.outlier_qjl_signs,
+        out_qjl,
         &out_norms_flat,
         &out_residual_flat,
         &out_slot_scale_flat,
@@ -766,39 +803,46 @@ pub(super) fn gpu_dequantize_keys(
     //    CPU: inverse_project_rows(signs) = matmul_rows(inverse_qjl, dim, signs) = signs @ inverse_qjl.T = signs @ qjl.
     //    The GPU store keeps packed uint32 sign words, so unpack to {-1,+1}
     //    before the matmul with qjl_arr.
-    let packed_shape = store.qjl_signs.shape();
-    let packed_ndim = packed_shape.len();
-    let packed_rows: i32 = packed_shape[..packed_ndim - 1].iter().product();
-    let packed_words = packed_shape[packed_ndim - 1];
-    let packed_signs = if packed_ndim == 2 {
-        store.qjl_signs.clone()
+    //
+    // Variant F (NoQjl): qjl_signs is None — skip the correction entirely.
+    // Equivalent to Variant E with all-zero residual_norms.
+    let combined = if let Some(qjl_signs_arr) = store.qjl_signs.as_ref() {
+        let packed_shape = qjl_signs_arr.shape();
+        let packed_ndim = packed_shape.len();
+        let packed_rows: i32 = packed_shape[..packed_ndim - 1].iter().product();
+        let packed_words = packed_shape[packed_ndim - 1];
+        let packed_signs = if packed_ndim == 2 {
+            qjl_signs_arr.clone()
+        } else {
+            qjl_signs_arr.reshape(&[packed_rows, packed_words])
+        };
+        let unpacked_qjl_2d = InlineArray::turboquant_unpack_sign_bits(
+            &packed_signs,
+            core.dim as u32,
+            packed_words as u32,
+            packed_rows as u32,
+        )?;
+        let unpacked_qjl = if packed_ndim == 2 {
+            unpacked_qjl_2d
+        } else {
+            let mut unpacked_shape: Vec<i32> = packed_shape[..packed_ndim - 1].to_vec();
+            unpacked_shape.push(core.dim as i32);
+            unpacked_qjl_2d.reshape(&unpacked_shape)
+        };
+        let qjl_correction = core.inverse_project_array(&unpacked_qjl)?;
+        let dim = core.dim as f32;
+        let qjl_scale_factor = InlineArray::from_f32((std::f32::consts::PI / 2.0).sqrt() / dim);
+        // residual_norms: [B,H,T,1] keepdims — broadcast along D.
+        let residual_norms = store.residual_norms_array()?;
+        let scale = residual_norms.multiply(&qjl_scale_factor);
+        let correction = qjl_correction.multiply(&scale);
+        mse_base.add(&correction)
     } else {
-        store.qjl_signs.reshape(&[packed_rows, packed_words])
+        mse_base
     };
-    let unpacked_qjl_2d = InlineArray::turboquant_unpack_sign_bits(
-        &packed_signs,
-        core.dim as u32,
-        packed_words as u32,
-        packed_rows as u32,
-    )?;
-    let unpacked_qjl = if packed_ndim == 2 {
-        unpacked_qjl_2d
-    } else {
-        let mut unpacked_shape: Vec<i32> = packed_shape[..packed_ndim - 1].to_vec();
-        unpacked_shape.push(core.dim as i32);
-        unpacked_qjl_2d.reshape(&unpacked_shape)
-    };
-    let qjl_correction = core.inverse_project_array(&unpacked_qjl)?;
-    let dim = core.dim as f32;
-    let qjl_scale_factor = InlineArray::from_f32((std::f32::consts::PI / 2.0).sqrt() / dim);
-    // residual_norms: [B,H,T,1] keepdims — broadcast along D.
-    let residual_norms = store.residual_norms_array()?;
-    let scale = residual_norms.multiply(&qjl_scale_factor);
-    let correction = qjl_correction.multiply(&scale);
 
-    // 4. Base + QJL correction, rescale by original L2 norm.
+    // 4. Rescale by original L2 norm.
     // norms: [B,H,T,1] keepdims — broadcast along D.
-    let combined = mse_base.add(&correction);
     Some(combined.multiply(&store.key_norms_array()?))
 }
 
@@ -852,15 +896,19 @@ pub(super) fn gpu_dequantize_values(
 /// parameterised by an arbitrary `TurboQuantCore` and stored arrays.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn gpu_dequantize_key_subvector(
-    indices_u8: &InlineArray,        // [B, H, T, D_sub] u8
-    qjl_signs: &InlineArray,         // [B, H, T, ceil(D_sub/32)] u32
-    norms: &InlineArray,             // [B, H, T, 1] f32
-    residual_norms: &InlineArray,    // [B, H, T, 1] f32
-    slot_scale: &InlineArray,        // [B, H, T, 1] f32
+    indices_u8: &InlineArray,           // [B, H, T, D_sub] u8
+    qjl_signs: Option<&InlineArray>,    // [B, H, T, ceil(D_sub/32)] u32, or None for Variant F
+    norms: &InlineArray,                // [B, H, T, 1] f32
+    residual_norms: &InlineArray,       // [B, H, T, 1] f32 (zero for Variant F)
+    slot_scale: &InlineArray,           // [B, H, T, 1] f32
     core: &TurboQuantCore,
     key_bits: u8,
+    qjl_mode: super::TurboQuantQjlMode,
 ) -> Option<InlineArray> {
-    let mse_bits = key_bits.saturating_sub(1);
+    let mse_bits = match qjl_mode {
+        super::TurboQuantQjlMode::Standard => key_bits.saturating_sub(1),
+        super::TurboQuantQjlMode::NoQjl => key_bits,
+    };
 
     // Phase 3a: indices stored as u32; cast no-op when already u32.
     let indices_u32 = indices_u8.as_dtype(Dtype::Uint32.as_i32());
@@ -869,34 +917,39 @@ pub(super) fn gpu_dequantize_key_subvector(
     let mse_recon_rot = mse_recon_rot_unit.multiply(slot_scale);
     let mse_base = core.inverse_rotate_array(&mse_recon_rot)?;
 
-    let packed_shape = qjl_signs.shape();
-    let packed_ndim = packed_shape.len();
-    let packed_rows: i32 = packed_shape[..packed_ndim - 1].iter().product();
-    let packed_words = packed_shape[packed_ndim - 1];
-    let packed_signs = if packed_ndim == 2 {
-        qjl_signs.clone()
+    // Variant F (NoQjl): qjl_signs is None — skip the correction entirely.
+    let combined = if let Some(qjl_signs) = qjl_signs {
+        let packed_shape = qjl_signs.shape();
+        let packed_ndim = packed_shape.len();
+        let packed_rows: i32 = packed_shape[..packed_ndim - 1].iter().product();
+        let packed_words = packed_shape[packed_ndim - 1];
+        let packed_signs = if packed_ndim == 2 {
+            qjl_signs.clone()
+        } else {
+            qjl_signs.reshape(&[packed_rows, packed_words])
+        };
+        let unpacked_2d = InlineArray::turboquant_unpack_sign_bits(
+            &packed_signs,
+            core.dim as u32,
+            packed_words as u32,
+            packed_rows as u32,
+        )?;
+        let unpacked = if packed_ndim == 2 {
+            unpacked_2d
+        } else {
+            let mut shape: Vec<i32> = packed_shape[..packed_ndim - 1].to_vec();
+            shape.push(core.dim as i32);
+            unpacked_2d.reshape(&shape)
+        };
+        let qjl_correction = core.inverse_project_array(&unpacked)?;
+        let dim_f = core.dim as f32;
+        let qjl_scale_factor = InlineArray::from_f32((std::f32::consts::PI / 2.0).sqrt() / dim_f);
+        let scale = residual_norms.multiply(&qjl_scale_factor);
+        let correction = qjl_correction.multiply(&scale);
+        mse_base.add(&correction)
     } else {
-        qjl_signs.reshape(&[packed_rows, packed_words])
+        mse_base
     };
-    let unpacked_2d = InlineArray::turboquant_unpack_sign_bits(
-        &packed_signs,
-        core.dim as u32,
-        packed_words as u32,
-        packed_rows as u32,
-    )?;
-    let unpacked = if packed_ndim == 2 {
-        unpacked_2d
-    } else {
-        let mut shape: Vec<i32> = packed_shape[..packed_ndim - 1].to_vec();
-        shape.push(core.dim as i32);
-        unpacked_2d.reshape(&shape)
-    };
-    let qjl_correction = core.inverse_project_array(&unpacked)?;
-    let dim_f = core.dim as f32;
-    let qjl_scale_factor = InlineArray::from_f32((std::f32::consts::PI / 2.0).sqrt() / dim_f);
-    let scale = residual_norms.multiply(&qjl_scale_factor);
-    let correction = qjl_correction.multiply(&scale);
-    let combined = mse_base.add(&correction);
     Some(combined.multiply(norms))
 }
 
@@ -940,21 +993,23 @@ pub(super) fn gpu_dequantize_keys_mixed(
 
     let regular_recon = gpu_dequantize_key_subvector(
         &store.regular_indices,
-        &store.regular_qjl_signs,
+        store.regular_qjl_signs.as_ref(),
         &store.regular_norms,
         &store.regular_residual_norms,
         &store.regular_slot_scale,
         reg_core,
         regular_bits,
+        config.qjl,
     )?;
     let outlier_recon = gpu_dequantize_key_subvector(
         &store.outlier_indices,
-        &store.outlier_qjl_signs,
+        store.outlier_qjl_signs.as_ref(),
         &store.outlier_norms,
         &store.outlier_residual_norms,
         &store.outlier_slot_scale,
         out_core,
         outlier_bits,
+        config.qjl,
     )?;
 
     let b = store.regular_indices.dim(0);

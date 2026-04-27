@@ -626,6 +626,52 @@ mod kvcache {
     }
 
     #[test]
+    fn turboquant_no_qjl_skips_gpu_qjl_allocations() {
+        // Variant F's whole point: qjl_signs / qjl_signs_t / residual_norms
+        // should not be allocated on the GPU side. Pin this so we don't
+        // regress to "Variant F via fallback that still allocates QJL".
+        let dim = 16usize;
+        let heads = 2i32;
+        let prefill = 3i32;
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl);
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let make_data = |seed: f32| -> Vec<f32> {
+            (0..prefill_len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin())
+                .collect()
+        };
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(0.7), &[b, h, prefill, d]);
+
+        let mut cache = QuantizedKvCache::new(config);
+        cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let gpu = cache
+            .keys
+            .as_ref()
+            .and_then(|k| k.gpu.as_ref())
+            .expect("uniform NoQjl should produce a GpuKeyStore");
+        assert!(
+            gpu.qjl_signs.is_none(),
+            "NoQjl must NOT allocate qjl_signs on the GPU side"
+        );
+        assert!(
+            gpu.qjl_signs_t.is_none(),
+            "NoQjl must NOT allocate qjl_signs_t on the GPU side"
+        );
+    }
+
+    #[test]
     fn turboquant_no_qjl_direct_attention_matches_dequantized_sdpa() {
         // Variant F (NoQjl) end-to-end: append → direct attention through the
         // dequantize-and-SDPA fallback path (try_gpu_uniform_attention is
@@ -1716,15 +1762,22 @@ mod kvcache {
         let recon_uni = dec_uni.to_f32_vec(total).expect("dec uni to_f32");
 
         // Mixed sub-vector path on the SAME core
-        let enc_mix = gpu_encode_key_subvector(&rows, core, 3).expect("mix encode");
+        let enc_mix = gpu_encode_key_subvector(
+            &rows,
+            core,
+            3,
+            super::config::TurboQuantQjlMode::Standard,
+        )
+        .expect("mix encode");
         let mut dec_mix = gpu_dequantize_key_subvector(
             &enc_mix.indices,
-            &enc_mix.qjl_signs,
+            enc_mix.qjl_signs.as_ref(),
             &enc_mix.norms,
             &enc_mix.residual_norms,
             &enc_mix.slot_scale,
             core,
             3,
+            super::config::TurboQuantQjlMode::Standard,
         )
         .expect("mix decode");
         let recon_mix = dec_mix.to_f32_vec(total).expect("dec mix to_f32");

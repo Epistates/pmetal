@@ -25,7 +25,10 @@ use crate::InlineArray;
 ///   q8_slot_scales_seq: [B, H, T, 4]  f32  — [key_norm, residual_norm, value_norm, key_slot_scale]
 ///   norms:           [B, H, T, 1]  f32     — optional L2 norm before unit-sphere normalise
 ///   qjl_signs:       [B, H, T, ceil(D/32)]  uint32 packed sign words
+///                                            (None when qjl_mode = NoQjl —
+///                                             Variant F has no residual to project)
 ///   qjl_signs_t:     [B, H, ceil(D/32), T]  uint32 transposed sign-word view
+///                                            (None when qjl_signs is None)
 ///   residual_norms:  [B, H, T, 1]  f32     — optional unscaled residual L2 norm
 ///   key_slot_scale:  [B, H, T, 1]  f32     — per-row codebook scaling factor
 ///                                           (max(|rotated|) / centroid_max).
@@ -41,7 +44,7 @@ pub(super) struct GpuKeyStore {
     pub(super) q8_kvbytes_seq: Option<InlineArray>,
     pub(super) q8_slot_scales_seq: Option<InlineArray>,
     pub(super) norms: Option<InlineArray>,
-    pub(super) qjl_signs: InlineArray,
+    pub(super) qjl_signs: Option<InlineArray>,
     pub(super) qjl_signs_t: Option<InlineArray>,
     pub(super) residual_norms: Option<InlineArray>,
     pub(super) key_slot_scale: Option<InlineArray>,
@@ -87,7 +90,12 @@ impl GpuKeyStore {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
             _ => None,
         };
-        self.qjl_signs = self.qjl_signs.kv_cache_append(&new.qjl_signs, 2);
+        self.qjl_signs = match (self.qjl_signs.take(), new.qjl_signs) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+            (None, None) => None,
+            // Mismatched (qjl mode changed mid-flight) is a logic bug.
+            _ => panic!("GpuKeyStore.qjl_signs Option-state mismatch on append"),
+        };
         self.qjl_signs_t = match (self.qjl_signs_t.take(), new.qjl_signs_t) {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
             _ => None,
@@ -117,17 +125,21 @@ impl GpuKeyStore {
             .unwrap_or_else(|| self.indices.transpose_axes(&[0, 1, 3, 2]))
     }
 
-    pub(super) fn qjl_signs_t_array(&self) -> InlineArray {
+    /// Returns the score-friendly transposed QJL sign view, or `None` when
+    /// the cache was built with `qjl_mode = NoQjl` (no residual to project).
+    pub(super) fn qjl_signs_t_array(&self) -> Option<InlineArray> {
         self.qjl_signs_t
             .clone()
-            .unwrap_or_else(|| self.qjl_signs.transpose_axes(&[0, 1, 3, 2]))
+            .or_else(|| self.qjl_signs.as_ref().map(|s| s.transpose_axes(&[0, 1, 3, 2])))
     }
 
+    /// Number of packed sign words, or `0` when `qjl_signs` is absent.
     pub(super) fn qjl_words(&self) -> i32 {
         self.qjl_signs_t
             .as_ref()
             .map(|arr| arr.dim(2))
-            .unwrap_or_else(|| self.qjl_signs.dim(3))
+            .or_else(|| self.qjl_signs.as_ref().map(|arr| arr.dim(3)))
+            .unwrap_or(0)
     }
 
     pub(super) fn slot_scale_component_array(&self, component: i32) -> Option<InlineArray> {
@@ -188,7 +200,9 @@ impl GpuKeyStore {
         if let Some(norms) = self.norms.as_mut() {
             out.push(norms);
         }
-        out.push(&mut self.qjl_signs);
+        if let Some(qjl_signs) = self.qjl_signs.as_mut() {
+            out.push(qjl_signs);
+        }
         if let Some(qjl_signs_t) = self.qjl_signs_t.as_mut() {
             out.push(qjl_signs_t);
         }
@@ -292,7 +306,7 @@ impl GpuValueStore {
 pub(super) struct GpuMixedKeyStore {
     pub(super) regular_indices: InlineArray,
     pub(super) regular_indices_t: Option<InlineArray>,
-    pub(super) regular_qjl_signs: InlineArray,
+    pub(super) regular_qjl_signs: Option<InlineArray>,
     pub(super) regular_qjl_signs_t: Option<InlineArray>,
     pub(super) regular_norms: InlineArray,
     pub(super) regular_residual_norms: InlineArray,
@@ -300,7 +314,7 @@ pub(super) struct GpuMixedKeyStore {
     pub(super) regular_src_dim: InlineArray,
     pub(super) outlier_indices: InlineArray,
     pub(super) outlier_indices_t: Option<InlineArray>,
-    pub(super) outlier_qjl_signs: InlineArray,
+    pub(super) outlier_qjl_signs: Option<InlineArray>,
     pub(super) outlier_qjl_signs_t: Option<InlineArray>,
     pub(super) outlier_norms: InlineArray,
     pub(super) outlier_residual_norms: InlineArray,
@@ -315,9 +329,11 @@ impl GpuMixedKeyStore {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
             _ => None,
         };
-        self.regular_qjl_signs = self
-            .regular_qjl_signs
-            .kv_cache_append(&new.regular_qjl_signs, 2);
+        self.regular_qjl_signs = match (self.regular_qjl_signs.take(), new.regular_qjl_signs) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+            (None, None) => None,
+            _ => panic!("GpuMixedKeyStore.regular_qjl_signs Option-state mismatch on append"),
+        };
         self.regular_qjl_signs_t = match (self.regular_qjl_signs_t.take(), new.regular_qjl_signs_t)
         {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
@@ -336,9 +352,11 @@ impl GpuMixedKeyStore {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
             _ => None,
         };
-        self.outlier_qjl_signs = self
-            .outlier_qjl_signs
-            .kv_cache_append(&new.outlier_qjl_signs, 2);
+        self.outlier_qjl_signs = match (self.outlier_qjl_signs.take(), new.outlier_qjl_signs) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+            (None, None) => None,
+            _ => panic!("GpuMixedKeyStore.outlier_qjl_signs Option-state mismatch on append"),
+        };
         self.outlier_qjl_signs_t = match (self.outlier_qjl_signs_t.take(), new.outlier_qjl_signs_t)
         {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 3)),
@@ -359,7 +377,9 @@ impl GpuMixedKeyStore {
         if let Some(indices_t) = self.regular_indices_t.as_mut() {
             out.push(indices_t);
         }
-        out.push(&mut self.regular_qjl_signs);
+        if let Some(qjl_signs) = self.regular_qjl_signs.as_mut() {
+            out.push(qjl_signs);
+        }
         if let Some(signs_t) = self.regular_qjl_signs_t.as_mut() {
             out.push(signs_t);
         }
@@ -371,7 +391,9 @@ impl GpuMixedKeyStore {
         if let Some(indices_t) = self.outlier_indices_t.as_mut() {
             out.push(indices_t);
         }
-        out.push(&mut self.outlier_qjl_signs);
+        if let Some(qjl_signs) = self.outlier_qjl_signs.as_mut() {
+            out.push(qjl_signs);
+        }
         if let Some(signs_t) = self.outlier_qjl_signs_t.as_mut() {
             out.push(signs_t);
         }

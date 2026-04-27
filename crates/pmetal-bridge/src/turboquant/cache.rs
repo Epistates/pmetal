@@ -943,9 +943,9 @@ impl QuantizedKvCache {
                 let key_indices =
                     ks.indices_t_array()
                         .reshape(&[kv_rows, key_dim, cache_seq_capacity]);
-                let key_qjl_signs =
-                    ks.qjl_signs_t_array()
-                        .reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
+                let key_qjl_signs = ks
+                    .qjl_signs_t_array()?
+                    .reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
                 let value_indices =
                     vs.indices_t_array()?
                         .reshape(&[kv_rows, value_dim, cache_seq_capacity]);
@@ -1329,7 +1329,7 @@ impl QuantizedKvCache {
                     query_proj,
                     &ks.indices_t_array()
                         .reshape(&[kv_rows, key_dim, cache_seq_capacity]),
-                    &ks.qjl_signs_t_array()
+                    &ks.qjl_signs_t_array()?
                         .reshape(&[kv_rows, qjl_words, cache_seq_capacity]),
                     &ks.key_norms_array()?
                         .reshape(&[kv_rows, cache_seq_capacity]),
@@ -1397,7 +1397,7 @@ impl QuantizedKvCache {
                 query_rot,
                 query_proj,
                 &ks.indices_t_array(),
-                &ks.qjl_signs_t_array(),
+                &ks.qjl_signs_t_array()?,
                 &key_norms,
                 &key_residual_norms,
                 &key_slot_scale,
@@ -1416,7 +1416,7 @@ impl QuantizedKvCache {
             query_rot,
             query_proj,
             &ks.indices_t_array(),
-            &ks.qjl_signs_t_array(),
+            &ks.qjl_signs_t_array()?,
             &key_norms,
             &key_residual_norms,
             &key_slot_scale,
@@ -1840,9 +1840,9 @@ impl QuantizedKvCache {
                     }
                 }
             } else if qjl_words == 4 {
-                let key_qjl_signs =
-                    ks.qjl_signs_t_array()
-                        .reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
+                let key_qjl_signs = ks
+                    .qjl_signs_t_array()?
+                    .reshape(&[kv_rows, qjl_words, cache_seq_capacity]);
                 if let Some(decoded_rot) = InlineArray::turboquant_attention_q8_d128_2pass(
                     &query_rot,
                     query_proj,
