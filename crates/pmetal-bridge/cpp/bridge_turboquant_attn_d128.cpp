@@ -622,6 +622,17 @@ int mlx_inline_turboquant_attention_q8_d128_2pass(
         const array& value_codebook_arr = as_arr(value_codebook);
 
         if (query_rot_arr.shape(-1) != dim || query_proj_arr.shape(-1) != dim) return 1;
+        // NOTE: this check is `!= 256` even though the Standard dispatch
+        // passes a 128-entry codebook (key_bits.saturating_sub(1) = 7 → 128
+        // centroids). As a result this kernel ALWAYS returns 1 in production
+        // and `try_gpu_uniform_attention` falls through to the dequantize+SDPA
+        // path. This was discovered 2026-04-27 while wiring the no_qjl variant.
+        // Relaxing the check to `!= 128` activates the kernel but exposes a
+        // latent ~O(1) parity bug in the d128 inner-loop math (mirrored in
+        // the new no_qjl kernel — same bug). The d128 kernel family is
+        // therefore dormant pending a focused parity-debug session. Do NOT
+        // relax this check without first fixing the underlying parity bug,
+        // or the long-context d128 tests will break.
         if (key_codebook_arr.shape(0) != 256 || value_codebook_arr.shape(0) != 256) return 1;
 
         auto& pass1 = get_turboquant_attention_q8_d128_2pass_1_kernel();
