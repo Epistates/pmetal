@@ -110,6 +110,7 @@ fn test_sanitize_cache_mode_clamps_turboquant_outliers_per_tensor_dim() {
                 keys: TurboQuantTensorConfig::mixed(2, 4, 99),
                 values: TurboQuantTensorConfig::mixed(3, 5, 99),
                 recent_window: Some(DEFAULT_RECENT_WINDOW),
+                qjl: Default::default(),
             },
         },
     );
@@ -121,6 +122,7 @@ fn test_sanitize_cache_mode_clamps_turboquant_outliers_per_tensor_dim() {
                 keys: TurboQuantTensorConfig::mixed(2, 4, 7),
                 values: TurboQuantTensorConfig::mixed(3, 5, 3),
                 recent_window: Some(DEFAULT_RECENT_WINDOW),
+                qjl: Default::default(),
             }
         }
     );

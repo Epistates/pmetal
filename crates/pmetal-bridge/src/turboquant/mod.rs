@@ -134,7 +134,9 @@ pub(super) fn eval_stage_micros(array: &InlineArray) -> u128 {
 }
 
 mod config;
-pub use config::{DEFAULT_RECENT_WINDOW, TurboQuantConfig, TurboQuantTensorConfig};
+pub use config::{
+    DEFAULT_RECENT_WINDOW, TurboQuantConfig, TurboQuantQjlMode, TurboQuantTensorConfig,
+};
 
 mod core;
 pub use core::TurboQuantCore;

@@ -108,6 +108,33 @@ impl TurboQuantTensorConfig {
     }
 }
 
+/// QJL residual mode — orthogonal to Uniform/Mixed.
+///
+/// Variant E (`Standard`): `key_bits - 1` go to the codebook, 1 bit per
+/// dim is the QJL sign of the residual. Decode adds a √(π/2)/D scaled
+/// J^T·sign correction term to the codebook reconstruction. This is the
+/// historical TurboQuant default.
+///
+/// Variant F (`NoQjl`): all `key_bits` go to the codebook; QJL is dropped
+/// entirely. The encoded cache uses ~12.5% less memory at 4b (no
+/// `qjl_signs` or `residual_norms` allocations) and the codebook gets a
+/// full extra bit of resolution. Per the audit (2026-04-27) the QJL
+/// residual contributes ≈0 to attention scores on rotated, normalized
+/// keys; the reference `quant.cpp` ablation reproduced this.
+///
+/// Real-model PPL ablation (Phase A → Phase C decision gate) is required
+/// before flipping the default. Until then, `NoQjl` ships opt-in via
+/// `TurboQuantConfig::with_qjl_mode(NoQjl)` or `TurboQuantConfig::no_qjl_*`
+/// presets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurboQuantQjlMode {
+    /// Variant E: codebook at `key_bits - 1`, 1 bit per dim QJL residual.
+    #[default]
+    Standard,
+    /// Variant F: codebook at full `key_bits`, no QJL residual.
+    NoQjl,
+}
+
 /// Default size of the recent-token fp16 window. See pmetal-mlx for the
 /// rationale; bridge keeps the same constant so cross-crate config plumbing
 /// agrees.
@@ -130,6 +157,10 @@ pub struct TurboQuantConfig {
     /// uncompressed; older history goes through TurboQuant. `None` disables
     /// the hot path (compress every token immediately).
     pub recent_window: Option<usize>,
+    /// QJL residual mode. `Standard` (Variant E) is the historical default;
+    /// `NoQjl` (Variant F) drops the QJL term and reclaims its bit for the
+    /// codebook. See [`TurboQuantQjlMode`] for the trade-offs.
+    pub qjl: TurboQuantQjlMode,
 }
 
 impl TurboQuantConfig {
@@ -139,6 +170,7 @@ impl TurboQuantConfig {
             keys: TurboQuantTensorConfig::uniform(key_bits),
             values: TurboQuantTensorConfig::uniform(value_bits),
             recent_window: Some(DEFAULT_RECENT_WINDOW),
+            qjl: TurboQuantQjlMode::Standard,
         }
     }
 
@@ -163,6 +195,7 @@ impl TurboQuantConfig {
                 value_outlier_count,
             ),
             recent_window: Some(DEFAULT_RECENT_WINDOW),
+            qjl: TurboQuantQjlMode::Standard,
         }
     }
 
@@ -171,6 +204,19 @@ impl TurboQuantConfig {
     pub const fn with_recent_window(mut self, window: Option<usize>) -> Self {
         self.recent_window = window;
         self
+    }
+
+    /// Override the QJL residual mode. See [`TurboQuantQjlMode`] for the
+    /// quality / memory trade-off.
+    pub const fn with_qjl_mode(mut self, qjl: TurboQuantQjlMode) -> Self {
+        self.qjl = qjl;
+        self
+    }
+
+    /// Variant F preset: 4-bit codebook with QJL dropped. Use this for
+    /// real-model PPL ablation runs against the Standard 4-bit baseline.
+    pub const fn no_qjl_4b() -> Self {
+        Self::uniform(4, 4).with_qjl_mode(TurboQuantQjlMode::NoQjl)
     }
 
     /// Outlier-aware 2.5-bit preset (25% outliers at 4 bits, rest at 2 bits).

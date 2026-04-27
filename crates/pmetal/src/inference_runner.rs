@@ -11,7 +11,7 @@ use std::{
 };
 
 use pmetal_bridge::turboquant::{
-    TurboQuantConfig as BridgeTurboQuantConfig,
+    TurboQuantConfig as BridgeTurboQuantConfig, TurboQuantQjlMode as BridgeTurboQuantQjlMode,
     TurboQuantTensorConfig as BridgeTurboQuantTensorConfig,
 };
 use pmetal_data::Tokenizer;
@@ -1032,8 +1032,18 @@ fn turboquant_config_from_mode(
             keys: bridge_turboquant_tensor_config(config.keys),
             values: bridge_turboquant_tensor_config(config.values),
             recent_window: config.recent_window,
+            qjl: bridge_turboquant_qjl_mode(config.qjl),
         }),
         _ => None,
+    }
+}
+
+fn bridge_turboquant_qjl_mode(
+    qjl: pmetal_mlx::kv_cache::TurboQuantQjlMode,
+) -> BridgeTurboQuantQjlMode {
+    match qjl {
+        pmetal_mlx::kv_cache::TurboQuantQjlMode::Standard => BridgeTurboQuantQjlMode::Standard,
+        pmetal_mlx::kv_cache::TurboQuantQjlMode::NoQjl => BridgeTurboQuantQjlMode::NoQjl,
     }
 }
 
@@ -1267,6 +1277,7 @@ impl TurboQuantPreset {
             keys: key_config,
             values: value_config,
             recent_window: Some(pmetal_mlx::kv_cache::DEFAULT_RECENT_WINDOW),
+            qjl: Default::default(),
         }
     }
 }
@@ -1821,6 +1832,7 @@ mod tests {
             keys: TurboQuantConfig::preset_q2_5(256).keys,
             values: TurboQuantConfig::preset_q2_5(128).values,
             recent_window: Some(pmetal_mlx::kv_cache::DEFAULT_RECENT_WINDOW),
+            qjl: Default::default(),
         };
         assert_eq!(mode, CacheMode::TurboQuant { config: expected });
     }

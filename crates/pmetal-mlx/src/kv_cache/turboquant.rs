@@ -152,6 +152,18 @@ pub const DEFAULT_RECENT_WINDOW: usize = 8192;
 /// matches the typical prefill chunk so most evictions happen in one shot.
 const HOT_EVICTION_CHUNK: usize = 1024;
 
+/// QJL residual mode — mirror of `pmetal_bridge::TurboQuantQjlMode`.
+/// `Standard` uses 1 bit per dim for QJL signs; `NoQjl` drops QJL and
+/// reclaims that bit for the codebook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurboQuantQjlMode {
+    /// Variant E: 1 bit per dim QJL residual + codebook at `key_bits - 1`.
+    #[default]
+    Standard,
+    /// Variant F: codebook at full `key_bits`, no QJL residual stored.
+    NoQjl,
+}
+
 /// Full TurboQuant K/V cache configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurboQuantConfig {
@@ -164,6 +176,8 @@ pub struct TurboQuantConfig {
     /// disables the hot path (compress everything immediately, the original
     /// behavior — useful for memory-constrained eval and parity tests).
     pub recent_window: Option<usize>,
+    /// QJL residual mode. See [`TurboQuantQjlMode`].
+    pub qjl: TurboQuantQjlMode,
 }
 
 impl TurboQuantConfig {
@@ -173,6 +187,7 @@ impl TurboQuantConfig {
             keys: TurboQuantTensorConfig::uniform(key_bits),
             values: TurboQuantTensorConfig::uniform(value_bits),
             recent_window: Some(DEFAULT_RECENT_WINDOW),
+            qjl: TurboQuantQjlMode::Standard,
         }
     }
 
@@ -197,6 +212,7 @@ impl TurboQuantConfig {
                 value_outlier_count,
             ),
             recent_window: Some(DEFAULT_RECENT_WINDOW),
+            qjl: TurboQuantQjlMode::Standard,
         }
     }
 
@@ -205,6 +221,17 @@ impl TurboQuantConfig {
     pub const fn with_recent_window(mut self, window: Option<usize>) -> Self {
         self.recent_window = window;
         self
+    }
+
+    /// Override the QJL residual mode.
+    pub const fn with_qjl_mode(mut self, qjl: TurboQuantQjlMode) -> Self {
+        self.qjl = qjl;
+        self
+    }
+
+    /// Variant F preset: 4-bit codebook with QJL dropped.
+    pub const fn no_qjl_4b() -> Self {
+        Self::uniform(4, 4).with_qjl_mode(TurboQuantQjlMode::NoQjl)
     }
 
     /// Outlier-aware 2.5-bit preset.

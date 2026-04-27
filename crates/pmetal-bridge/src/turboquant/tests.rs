@@ -485,6 +485,7 @@ mod kvcache {
         // Disable the hot window so the test exercises the cold-only legacy
         // path it was originally written against.
         let cpu_config = TurboQuantConfig {
+            qjl: super::config::TurboQuantQjlMode::Standard,
             keys: TurboQuantTensorConfig::Mixed {
                 regular_bits: 3,
                 outlier_bits: 4,
