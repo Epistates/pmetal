@@ -89,6 +89,14 @@ pub(super) fn gpu_quantize_kv(
     let k_residual_norms = k_residual_norms_raw
         .maximum(&zero_bound)
         .minimum(&upper_bound);
+    // QJL ablation: when the tq-ablation feature is enabled and the runtime
+    // flag is set, zero the residual norms so the score kernel's residual
+    // term collapses to 0 — measurement-only short-circuit, no kernel change.
+    let k_residual_norms = if super::should_zero_qjl() {
+        k_residual_norms.multiply(&zero_bound)
+    } else {
+        k_residual_norms
+    };
 
     // 7. QJL: project the residual in the **unrotated** space.
     //    residual_unrot = k_mse_recon_rot @ rotation_arr  (inverse-rotate the rotated reconstruction)
@@ -280,6 +288,12 @@ pub(super) fn gpu_encode_key_subvector(
     let residual_norms = residual_norms_raw
         .maximum(&zero_bound)
         .minimum(&upper_bound);
+    // QJL ablation: see the `gpu_quantize_kv` site for rationale.
+    let residual_norms = if super::should_zero_qjl() {
+        residual_norms.multiply(&zero_bound)
+    } else {
+        residual_norms
+    };
 
     let recon_unrot = core.inverse_rotate_array(&recon_rot)?;
     let residual_unrot = normalized.subtract(&recon_unrot);

@@ -160,6 +160,25 @@ mod dispatch;
 mod cache;
 pub use cache::{QuantizedKvCache, UniformAttentionBenchMode};
 
+#[cfg(feature = "tq-ablation")]
+pub mod ablation;
+
+/// Returns true when the active build should zero the QJL residual at encode
+/// time (used by the ablation bench). Always `false` in production builds —
+/// gated on the `tq-ablation` feature so release shipments carry no
+/// measurement surface.
+#[inline]
+pub(super) fn should_zero_qjl() -> bool {
+    #[cfg(feature = "tq-ablation")]
+    {
+        ablation::qjl_disabled()
+    }
+    #[cfg(not(feature = "tq-ablation"))]
+    {
+        false
+    }
+}
+
 #[cfg(test)]
 mod tests;
 

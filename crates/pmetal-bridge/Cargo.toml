@@ -14,6 +14,13 @@ links = "pmetal_bridge"
 default = ["accelerate", "metal"]
 accelerate = []
 metal = []
+# Compile in measurement-only TurboQuant ablation hooks. With this feature
+# enabled, [`turboquant::ablation::set_qjl_disabled`] short-circuits the QJL
+# residual to zero at encode time so attention scores fall back to pure
+# Beta-codebook reconstruction. Used by the QJL ablation bench to A/B
+# perplexity with vs without the residual stage. Off by default — release
+# builds carry no ablation surface.
+tq-ablation = []
 
 [dependencies]
 half = { workspace = true }
@@ -29,6 +36,10 @@ rand = "0.9"
 [build-dependencies]
 cc = "1"
 cmake = "0.1"
+
+[[bench]]
+name = "turboquant_qjl_ablation"
+harness = false
 
 # This crate is the C++ FFI boundary to MLX and must use `unsafe` pervasively
 # (`inline_array` wraps mlx::core::array via extern "C" calls; ~280 unsafe blocks).

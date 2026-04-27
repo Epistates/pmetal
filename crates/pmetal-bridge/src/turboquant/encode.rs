@@ -205,6 +205,15 @@ pub(super) fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key
         }
     }
 
+    // QJL ablation: zero residual norms when the tq-ablation knob is on.
+    // The decode path's QJL correction block is gated on
+    // `residual_norms.iter().any(|rn| rn > ZERO_EPSILON)`, so all-zero
+    // residual_norms make the entire QJL stage a no-op without touching
+    // the decoder.
+    if super::should_zero_qjl() {
+        residual_norms.fill(0.0);
+    }
+
     EncodedKeyRows {
         mse_indices,
         qjl_signs,
