@@ -29,6 +29,9 @@ pub struct QuantizedKeyStore {
     pub regular_qjl_signs: PackedBits,
     pub regular_norms: Vec<f32>,
     pub regular_residual_norms: Vec<f32>,
+    /// Per-row codebook scaling factor (`max(|rotated|) / centroid_max`).
+    /// Reconstruction: `recon = norm * inverse_rotate(codebook[idx] * slot_scale + qjl_correction)`.
+    pub regular_slot_scale: Vec<f32>,
 
     // Outlier sub-vector data (None when config is Uniform).
     pub outlier_mask: Option<PackedBits>,
@@ -36,6 +39,7 @@ pub struct QuantizedKeyStore {
     pub outlier_qjl_signs: Option<PackedBits>,
     pub outlier_norms: Option<Vec<f32>>,
     pub outlier_residual_norms: Option<Vec<f32>>,
+    pub outlier_slot_scale: Option<Vec<f32>>,
 }
 
 impl QuantizedKeyStore {
@@ -58,11 +62,13 @@ impl QuantizedKeyStore {
             regular_qjl_signs: PackedBits::new(1),
             regular_norms: Vec::new(),
             regular_residual_norms: Vec::new(),
+            regular_slot_scale: Vec::new(),
             outlier_mask: outlier_bits.map(|_| PackedBits::new(1)),
             outlier_indices: outlier_bits.map(PackedBits::new),
             outlier_qjl_signs: outlier_bits.map(|_| PackedBits::new(1)),
             outlier_norms: outlier_bits.map(|_| Vec::new()),
             outlier_residual_norms: outlier_bits.map(|_| Vec::new()),
+            outlier_slot_scale: outlier_bits.map(|_| Vec::new()),
         }
     }
 
@@ -77,6 +83,8 @@ impl QuantizedKeyStore {
         self.regular_norms.extend_from_slice(&encoded.norms);
         self.regular_residual_norms
             .extend_from_slice(&encoded.residual_norms);
+        self.regular_slot_scale
+            .extend_from_slice(&encoded.slot_scale);
 
         if let Some(mask) = outlier_mask {
             self.outlier_mask
@@ -101,6 +109,10 @@ impl QuantizedKeyStore {
                 .as_mut()
                 .expect("TurboQuant key outlier residual_norms missing")
                 .extend_from_slice(&outlier.residual_norms);
+            self.outlier_slot_scale
+                .as_mut()
+                .expect("TurboQuant key outlier slot_scale missing")
+                .extend_from_slice(&outlier.slot_scale);
         }
     }
 
@@ -110,12 +122,17 @@ impl QuantizedKeyStore {
             + self.regular_qjl_signs.byte_len()
             + self.regular_norms.len() * 4
             + self.regular_residual_norms.len() * 4
+            + self.regular_slot_scale.len() * 4
             + self.outlier_mask.as_ref().map_or(0, |p| p.byte_len())
             + self.outlier_indices.as_ref().map_or(0, |p| p.byte_len())
             + self.outlier_qjl_signs.as_ref().map_or(0, |p| p.byte_len())
             + self.outlier_norms.as_ref().map_or(0, |v| v.len() * 4)
             + self
                 .outlier_residual_norms
+                .as_ref()
+                .map_or(0, |v| v.len() * 4)
+            + self
+                .outlier_slot_scale
                 .as_ref()
                 .map_or(0, |v| v.len() * 4)
     }

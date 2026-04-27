@@ -925,6 +925,9 @@ impl QuantizedKvCache {
         let key_residual_norms = ks
             .residual_norms_array()?
             .reshape(&[kv_rows, cache_seq_capacity]);
+        let key_slot_scale = ks
+            .key_slot_scale_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
         let qjl_words = ks.qjl_words();
 
         match mode {
@@ -953,6 +956,7 @@ impl QuantizedKvCache {
                     &key_qjl_signs,
                     &key_norms,
                     &key_residual_norms,
+                    &key_slot_scale,
                     key_core.codebook_arr(key_bits.saturating_sub(1))?,
                     &value_indices,
                     &vs.norms_array()?.reshape(&[kv_rows, cache_seq_capacity]),
@@ -989,7 +993,7 @@ impl QuantizedKvCache {
                     InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_pass1(
                         query_rot,
                         &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
                         key_core.codebook_arr(key_bits)?,
                         &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
                         q_rows as u32,
@@ -1041,7 +1045,7 @@ impl QuantizedKvCache {
                     let scores = InlineArray::turboquant_score_q8_d256_fullbyte(
                         query_rot,
                         &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
                         key_core.codebook_arr(key_bits)?,
                         q_rows as u32,
                         n_seq as u32,
@@ -1081,7 +1085,7 @@ impl QuantizedKvCache {
                     InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_localsoftmax(
                         query_rot,
                         &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
                         key_core.codebook_arr(key_bits)?,
                         &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
                         q_rows as u32,
@@ -1230,7 +1234,7 @@ impl QuantizedKvCache {
             InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
                 query_rot,
                 &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
                 key_core.codebook_arr(key_bits)?,
                 &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
                 q_rows as u32,
@@ -1255,7 +1259,7 @@ impl QuantizedKvCache {
                     query_rot,
                     query_proj,
                     &key_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                    &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                    &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
                     key_core.codebook_arr(key_bits.saturating_sub(1))?,
                     &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
                     q_rows as u32,
@@ -1273,7 +1277,7 @@ impl QuantizedKvCache {
                         query_rot,
                         query_proj,
                         &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
                         key_core.codebook_arr(key_bits.saturating_sub(1))?,
                         &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
                         q_rows as u32,
@@ -1288,7 +1292,7 @@ impl QuantizedKvCache {
                         query_rot,
                         query_proj,
                         &kv_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
                         key_core.codebook_arr(key_bits.saturating_sub(1))?,
                         value_core.codebook_arr(value_bits)?,
                         q_rows as u32,
@@ -1306,7 +1310,7 @@ impl QuantizedKvCache {
                     query_rot,
                     query_proj,
                     &key_bytes.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                    &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                    &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
                     key_core.codebook_arr(key_bits.saturating_sub(1))?,
                     &vs.indices
                         .as_ref()?
@@ -1330,6 +1334,8 @@ impl QuantizedKvCache {
                     &ks.key_norms_array()?
                         .reshape(&[kv_rows, cache_seq_capacity]),
                     &ks.residual_norms_array()?
+                        .reshape(&[kv_rows, cache_seq_capacity]),
+                    &ks.key_slot_scale_array()?
                         .reshape(&[kv_rows, cache_seq_capacity]),
                     key_core.codebook_arr(key_bits.saturating_sub(1))?,
                     &vs.indices_t_array()?
@@ -1377,6 +1383,9 @@ impl QuantizedKvCache {
         let key_residual_norms = ks
             .residual_norms_array()?
             .reshape(&[kv_rows, cache_seq_capacity]);
+        let key_slot_scale = ks
+            .key_slot_scale_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
         if key_bits == 8
             && key_dim == 256
             && qjl_words == 8
@@ -1391,6 +1400,7 @@ impl QuantizedKvCache {
                 &ks.qjl_signs_t_array(),
                 &key_norms,
                 &key_residual_norms,
+                &key_slot_scale,
                 key_core.codebook_arr(key_bits.saturating_sub(1))?,
                 q_rows as u32,
                 n_seq as u32,
@@ -1409,6 +1419,7 @@ impl QuantizedKvCache {
             &ks.qjl_signs_t_array(),
             &key_norms,
             &key_residual_norms,
+            &key_slot_scale,
             key_core.codebook_arr(key_bits.saturating_sub(1))?,
             key_dim as u32,
             qjl_words as u32,
@@ -1459,7 +1470,7 @@ impl QuantizedKvCache {
             InlineArray::turboquant_score_q8_d256_fullbyte(
                 query_rot,
                 &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
                 key_core.codebook_arr(key_bits)?,
                 q_rows as u32,
                 n_seq as u32,
@@ -1515,7 +1526,7 @@ impl QuantizedKvCache {
             InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_state(
                 query_rot,
                 &key_indices.reshape(&[kv_rows, cache_seq_capacity, key_dim]),
-                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 3]),
+                &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
                 key_core.codebook_arr(key_bits)?,
                 &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
                 q_rows as u32,
@@ -1683,6 +1694,9 @@ impl QuantizedKvCache {
         let key_residual_norms = ks
             .residual_norms_array()?
             .reshape(&[kv_rows, cache_seq_capacity]);
+        let key_slot_scale = ks
+            .key_slot_scale_array()?
+            .reshape(&[kv_rows, cache_seq_capacity]);
         let qjl_words = ks.qjl_words();
         if can_try_q8_fullbyte {
             if let Some(decoded_rot) =
@@ -1774,6 +1788,7 @@ impl QuantizedKvCache {
                             &key_bytes,
                             &key_norms,
                             &key_residual_norms,
+                            &key_slot_scale,
                             key_codebook,
                             &value_indices,
                             &value_norms,
@@ -1824,6 +1839,7 @@ impl QuantizedKvCache {
                     &key_qjl_signs,
                     &key_norms,
                     &key_residual_norms,
+                    &key_slot_scale,
                     key_codebook,
                     &value_indices,
                     &value_norms,

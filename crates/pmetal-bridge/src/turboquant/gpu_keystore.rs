@@ -22,11 +22,15 @@ use crate::InlineArray;
 ///   q8_keybytes_seq: [B, H, T, D]  uint8   — q8 seq-major key shadow
 ///   q8_fullbyte_seq: [B, H, T, D]  uint8   — q8 seq-major pure-256-centroid key shadow
 ///   q8_kvbytes_seq:  [B, H, T, D]  uint16  — D256 q8 seq-major packed {key,value}
-///   q8_slot_scales_seq: [B, H, T, 3]  f32  — [key_norm, residual_norm, value_norm]
+///   q8_slot_scales_seq: [B, H, T, 4]  f32  — [key_norm, residual_norm, value_norm, key_slot_scale]
 ///   norms:           [B, H, T, 1]  f32     — optional L2 norm before unit-sphere normalise
 ///   qjl_signs:       [B, H, T, ceil(D/32)]  uint32 packed sign words
 ///   qjl_signs_t:     [B, H, ceil(D/32), T]  uint32 transposed sign-word view
 ///   residual_norms:  [B, H, T, 1]  f32     — optional unscaled residual L2 norm
+///   key_slot_scale:  [B, H, T, 1]  f32     — per-row codebook scaling factor
+///                                           (max(|rotated|) / centroid_max).
+///                                           Populated only when q8_slot_scales_seq is None;
+///                                           otherwise read from component 3 of the pack.
 #[derive(Debug, Clone)]
 pub(super) struct GpuKeyStore {
     pub(super) indices: InlineArray,
@@ -40,6 +44,7 @@ pub(super) struct GpuKeyStore {
     pub(super) qjl_signs: InlineArray,
     pub(super) qjl_signs_t: Option<InlineArray>,
     pub(super) residual_norms: Option<InlineArray>,
+    pub(super) key_slot_scale: Option<InlineArray>,
 }
 
 impl GpuKeyStore {
@@ -88,6 +93,10 @@ impl GpuKeyStore {
             _ => None,
         };
         self.residual_norms = match (self.residual_norms.take(), new.residual_norms) {
+            (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
+            _ => None,
+        };
+        self.key_slot_scale = match (self.key_slot_scale.take(), new.key_slot_scale) {
             (Some(current), Some(next)) => Some(current.kv_cache_append(&next, 2)),
             _ => None,
         };
@@ -146,6 +155,16 @@ impl GpuKeyStore {
             .or_else(|| self.slot_scale_component_array(1))
     }
 
+    /// Per-row codebook scaling factor (`max(|rotated|) / centroid_max`).
+    ///
+    /// Stored in `key_slot_scale` for the standard (non-q8-shadow) path; for
+    /// the q8 seq-shadow path it lives at component 3 of `q8_slot_scales_seq`.
+    pub(super) fn key_slot_scale_array(&self) -> Option<InlineArray> {
+        self.key_slot_scale
+            .clone()
+            .or_else(|| self.slot_scale_component_array(3))
+    }
+
     pub(super) fn collect_for_detach<'a>(&'a mut self, out: &mut Vec<&'a mut InlineArray>) {
         out.push(&mut self.indices);
         if let Some(indices_t) = self.indices_t.as_mut() {
@@ -175,6 +194,9 @@ impl GpuKeyStore {
         }
         if let Some(residual_norms) = self.residual_norms.as_mut() {
             out.push(residual_norms);
+        }
+        if let Some(key_slot_scale) = self.key_slot_scale.as_mut() {
+            out.push(key_slot_scale);
         }
     }
 }
@@ -274,6 +296,7 @@ pub(super) struct GpuMixedKeyStore {
     pub(super) regular_qjl_signs_t: Option<InlineArray>,
     pub(super) regular_norms: InlineArray,
     pub(super) regular_residual_norms: InlineArray,
+    pub(super) regular_slot_scale: InlineArray,
     pub(super) regular_src_dim: InlineArray,
     pub(super) outlier_indices: InlineArray,
     pub(super) outlier_indices_t: Option<InlineArray>,
@@ -281,6 +304,7 @@ pub(super) struct GpuMixedKeyStore {
     pub(super) outlier_qjl_signs_t: Option<InlineArray>,
     pub(super) outlier_norms: InlineArray,
     pub(super) outlier_residual_norms: InlineArray,
+    pub(super) outlier_slot_scale: InlineArray,
     pub(super) outlier_src_dim: InlineArray,
 }
 
@@ -303,6 +327,9 @@ impl GpuMixedKeyStore {
         self.regular_residual_norms = self
             .regular_residual_norms
             .kv_cache_append(&new.regular_residual_norms, 2);
+        self.regular_slot_scale = self
+            .regular_slot_scale
+            .kv_cache_append(&new.regular_slot_scale, 2);
         self.regular_src_dim = self.regular_src_dim.kv_cache_append(&new.regular_src_dim, 2);
         self.outlier_indices = self.outlier_indices.kv_cache_append(&new.outlier_indices, 2);
         self.outlier_indices_t = match (self.outlier_indices_t.take(), new.outlier_indices_t) {
@@ -321,6 +348,9 @@ impl GpuMixedKeyStore {
         self.outlier_residual_norms = self
             .outlier_residual_norms
             .kv_cache_append(&new.outlier_residual_norms, 2);
+        self.outlier_slot_scale = self
+            .outlier_slot_scale
+            .kv_cache_append(&new.outlier_slot_scale, 2);
         self.outlier_src_dim = self.outlier_src_dim.kv_cache_append(&new.outlier_src_dim, 2);
     }
 
@@ -335,6 +365,7 @@ impl GpuMixedKeyStore {
         }
         out.push(&mut self.regular_norms);
         out.push(&mut self.regular_residual_norms);
+        out.push(&mut self.regular_slot_scale);
         out.push(&mut self.regular_src_dim);
         out.push(&mut self.outlier_indices);
         if let Some(indices_t) = self.outlier_indices_t.as_mut() {
@@ -346,6 +377,7 @@ impl GpuMixedKeyStore {
         }
         out.push(&mut self.outlier_norms);
         out.push(&mut self.outlier_residual_norms);
+        out.push(&mut self.outlier_slot_scale);
         out.push(&mut self.outlier_src_dim);
     }
 }

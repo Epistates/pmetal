@@ -89,6 +89,7 @@ static const char* TURBOQUANT_ATTENTION_Q8_D128_2PASS_1_SOURCE = R"(
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
         float key_norm = key_norms[scalar_idx];
         float residual_scale = key_residual_norms[scalar_idx] * kQjlConst;
+        float slot_scale = key_slot_scale[scalar_idx];
         uint key_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
         uint value_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
         uint sign_word = key_qjl_signs[(kv_row * kQjlWords + (lane >> 3u)) * cache_seq_capacity + seq];
@@ -103,6 +104,12 @@ static const char* TURBOQUANT_ATTENTION_Q8_D128_2PASS_1_SOURCE = R"(
         score_part += qrot1 * shared_k_codebook[(uint)key_indices[key_base + 1u * cache_seq_capacity]];
         score_part += qrot2 * shared_k_codebook[(uint)key_indices[key_base + 2u * cache_seq_capacity]];
         score_part += qrot3 * shared_k_codebook[(uint)key_indices[key_base + 3u * cache_seq_capacity]];
+        // Codebook indices were quantised against rotated values divided by
+        // slot_scale; recover the original-magnitude codebook contribution by
+        // re-scaling the codebook accumulator. The QJL residual term added
+        // below is already in correct units (residual_norms is the full L2 of
+        // the rescaled-codebook residual), so it must NOT be multiplied.
+        score_part *= slot_scale;
         score_part += residual_scale * qproj0 * sign0;
         score_part += residual_scale * qproj1 * sign1;
         score_part += residual_scale * qproj2 * sign2;
@@ -186,6 +193,7 @@ static const char* TURBOQUANT_ATTENTION_Q8_D128_PACKED_KEYS_2PASS_1_SOURCE = R"(
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
         float key_norm = key_norms[scalar_idx];
         float residual_scale = key_residual_norms[scalar_idx] * kQjlConst;
+        float slot_scale = key_slot_scale[scalar_idx];
         uint key_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
         uint value_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
 
@@ -204,6 +212,8 @@ static const char* TURBOQUANT_ATTENTION_Q8_D128_PACKED_KEYS_2PASS_1_SOURCE = R"(
         score_part += qrot1 * shared_k_codebook[(uint)(key_byte1 & 0x7fu)];
         score_part += qrot2 * shared_k_codebook[(uint)(key_byte2 & 0x7fu)];
         score_part += qrot3 * shared_k_codebook[(uint)(key_byte3 & 0x7fu)];
+        // See d128_2pass_1 source: rescale the codebook accumulator only.
+        score_part *= slot_scale;
         score_part += residual_scale * qproj0 * sign0;
         score_part += residual_scale * qproj1 * sign1;
         score_part += residual_scale * qproj2 * sign2;
@@ -319,6 +329,7 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_attention_q8_d128_2
             "key_qjl_signs",
             "key_norms",
             "key_residual_norms",
+            "key_slot_scale",
             "key_codebook",
             "value_indices",
             "value_norms",
@@ -355,6 +366,7 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_attention_q8_d128_p
             "key_bytes",
             "key_norms",
             "key_residual_norms",
+            "key_slot_scale",
             "key_codebook",
             "value_indices",
             "value_norms",
@@ -378,6 +390,7 @@ int mlx_inline_turboquant_attention_q8_d128_packed_keys_2pass(
     const mlx_inline_array* key_bytes,
     const mlx_inline_array* key_norms,
     const mlx_inline_array* key_residual_norms,
+    const mlx_inline_array* key_slot_scale,
     const mlx_inline_array* key_codebook,
     const mlx_inline_array* value_indices,
     const mlx_inline_array* value_norms,
@@ -403,6 +416,7 @@ int mlx_inline_turboquant_attention_q8_d128_packed_keys_2pass(
         const array& key_bytes_arr = as_arr(key_bytes);
         const array& key_norms_arr = as_arr(key_norms);
         const array& key_residual_norms_arr = as_arr(key_residual_norms);
+        const array& key_slot_scale_arr = as_arr(key_slot_scale);
         const array& key_codebook_arr = as_arr(key_codebook);
         const array& value_indices_arr = as_arr(value_indices);
         const array& value_norms_arr = as_arr(value_norms);
@@ -419,6 +433,7 @@ int mlx_inline_turboquant_attention_q8_d128_packed_keys_2pass(
                 key_bytes_arr,
                 key_norms_arr,
                 key_residual_norms_arr,
+                key_slot_scale_arr,
                 key_codebook_arr,
                 value_indices_arr,
                 value_norms_arr,
@@ -467,6 +482,7 @@ int mlx_inline_turboquant_attention_q8_d128_2pass(
     const mlx_inline_array* key_qjl_signs,
     const mlx_inline_array* key_norms,
     const mlx_inline_array* key_residual_norms,
+    const mlx_inline_array* key_slot_scale,
     const mlx_inline_array* key_codebook,
     const mlx_inline_array* value_indices,
     const mlx_inline_array* value_norms,
@@ -493,6 +509,7 @@ int mlx_inline_turboquant_attention_q8_d128_2pass(
         const array& key_qjl_signs_arr = as_arr(key_qjl_signs);
         const array& key_norms_arr = as_arr(key_norms);
         const array& key_residual_norms_arr = as_arr(key_residual_norms);
+        const array& key_slot_scale_arr = as_arr(key_slot_scale);
         const array& key_codebook_arr = as_arr(key_codebook);
         const array& value_indices_arr = as_arr(value_indices);
         const array& value_norms_arr = as_arr(value_norms);
@@ -510,6 +527,7 @@ int mlx_inline_turboquant_attention_q8_d128_2pass(
                 key_qjl_signs_arr,
                 key_norms_arr,
                 key_residual_norms_arr,
+                key_slot_scale_arr,
                 key_codebook_arr,
                 value_indices_arr,
                 value_norms_arr,

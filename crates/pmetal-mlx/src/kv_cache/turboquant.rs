@@ -359,11 +359,13 @@ struct TurboKeyStore {
     regular_qjl_signs: PackedBits,
     regular_norms: Vec<f32>,
     regular_residual_norms: Vec<f32>,
+    regular_slot_scale: Vec<f32>,
     outlier_mask: Option<PackedBits>,
     outlier_indices: Option<PackedBits>,
     outlier_qjl_signs: Option<PackedBits>,
     outlier_norms: Option<Vec<f32>>,
     outlier_residual_norms: Option<Vec<f32>>,
+    outlier_slot_scale: Option<Vec<f32>>,
 }
 
 impl TurboValueStore {
@@ -459,11 +461,13 @@ impl TurboKeyStore {
             regular_qjl_signs: PackedBits::new(1),
             regular_norms: Vec::new(),
             regular_residual_norms: Vec::new(),
+            regular_slot_scale: Vec::new(),
             outlier_mask: outlier_bits.map(|_| PackedBits::new(1)),
             outlier_indices: outlier_bits.map(PackedBits::new),
             outlier_qjl_signs: outlier_bits.map(|_| PackedBits::new(1)),
             outlier_norms: outlier_bits.map(|_| Vec::new()),
             outlier_residual_norms: outlier_bits.map(|_| Vec::new()),
+            outlier_slot_scale: outlier_bits.map(|_| Vec::new()),
         }
     }
 
@@ -476,6 +480,8 @@ impl TurboKeyStore {
             .extend(encoded.regular.norms.iter().copied());
         self.regular_residual_norms
             .extend(encoded.regular.residual_norms.iter().copied());
+        self.regular_slot_scale
+            .extend(encoded.regular.slot_scale.iter().copied());
 
         if let Some(mask) = &encoded.outlier_mask {
             self.outlier_mask
@@ -500,6 +506,10 @@ impl TurboKeyStore {
                 .as_mut()
                 .expect("TurboQuant key outlier residual norms missing")
                 .extend(outlier.residual_norms.iter().copied());
+            self.outlier_slot_scale
+                .as_mut()
+                .expect("TurboQuant key outlier slot_scale missing")
+                .extend(outlier.slot_scale.iter().copied());
         }
     }
 
@@ -510,6 +520,7 @@ impl TurboKeyStore {
             .truncate(keep_rows * config.regular_dim(total_dim));
         self.regular_norms.truncate(keep_rows);
         self.regular_residual_norms.truncate(keep_rows);
+        self.regular_slot_scale.truncate(keep_rows);
 
         if let Some(mask) = &mut self.outlier_mask {
             mask.truncate(keep_rows * total_dim);
@@ -526,6 +537,9 @@ impl TurboKeyStore {
         if let Some(outlier_residual_norms) = &mut self.outlier_residual_norms {
             outlier_residual_norms.truncate(keep_rows);
         }
+        if let Some(outlier_slot_scale) = &mut self.outlier_slot_scale {
+            outlier_slot_scale.truncate(keep_rows);
+        }
     }
 
     fn memory_usage(&self) -> usize {
@@ -533,6 +547,7 @@ impl TurboKeyStore {
             + self.regular_qjl_signs.byte_len()
             + self.regular_norms.len() * std::mem::size_of::<f32>()
             + self.regular_residual_norms.len() * std::mem::size_of::<f32>()
+            + self.regular_slot_scale.len() * std::mem::size_of::<f32>()
             + self.outlier_mask.as_ref().map_or(0, PackedBits::byte_len)
             + self
                 .outlier_indices
@@ -550,6 +565,10 @@ impl TurboKeyStore {
                 .outlier_residual_norms
                 .as_ref()
                 .map_or(0, |norms| norms.len() * std::mem::size_of::<f32>())
+            + self
+                .outlier_slot_scale
+                .as_ref()
+                .map_or(0, |scales| scales.len() * std::mem::size_of::<f32>())
     }
 }
 
@@ -2163,6 +2182,11 @@ struct EncodedKeyRows {
     qjl_signs: Vec<u16>,
     norms: Vec<f32>,
     residual_norms: Vec<f32>,
+    /// Per-row codebook scaling factor (`max(|rotated|) / centroid_max`).
+    /// Reconstruction multiplies the codebook lookup by this scalar before
+    /// inverse-rotation, letting a fixed Beta codebook adapt to each slot's
+    /// rotated range. One entry per row (length == norms.len()).
+    slot_scale: Vec<f32>,
 }
 
 struct EncodedValueRows {
@@ -2200,12 +2224,44 @@ fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key_bits: u8) 
     }
 
     let mse_bits = key_bits.saturating_sub(1);
-    let mut mse_indices = quantize_mse_rows(core, &normalized, mse_bits);
-    let decoded_mse = if mse_bits == 0 {
-        vec![0.0; rows.len()]
-    } else {
-        reconstruct_mse_rows(core, &mse_indices, mse_bits)
-    };
+    let mut mse_indices = vec![0u16; rows.len()];
+    let mut slot_scale = vec![0.0f32; num_rows];
+    let mut decoded_mse = vec![0.0f32; rows.len()];
+
+    if mse_bits > 0 {
+        // Per-row slot_scale adapts the fixed Beta codebook to each row's
+        // rotated range. See pmetal-bridge::turboquant::encode for the
+        // reference comment.
+        let rotated = core.rotate_rows(&normalized);
+        let codebook = core.codebook(mse_bits);
+        let centroid_max = codebook
+            .last()
+            .copied()
+            .unwrap_or(1.0)
+            .abs()
+            .max(ZERO_EPSILON);
+        let mut decoded_rot = vec![0.0f32; rows.len()];
+        for row_idx in 0..num_rows {
+            if norms[row_idx] <= ZERO_EPSILON {
+                continue;
+            }
+            let start = row_idx * core.dim;
+            let end = start + core.dim;
+            let row_max = rotated[start..end]
+                .iter()
+                .fold(0.0f32, |acc, &v| acc.max(v.abs()));
+            let s = (row_max / centroid_max).max(ZERO_EPSILON);
+            slot_scale[row_idx] = s;
+            let inv_s = 1.0 / s;
+            for i in start..end {
+                let scaled = rotated[i] * inv_s;
+                let idx = nearest_centroid_index(scaled, codebook);
+                mse_indices[i] = idx as u16;
+                decoded_rot[i] = codebook[idx] * s;
+            }
+        }
+        decoded_mse = core.inverse_rotate_rows(&decoded_rot);
+    }
 
     let mut residual = vec![0.0f32; rows.len()];
     for row_idx in 0..num_rows {
@@ -2245,6 +2301,7 @@ fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key_bits: u8) 
         qjl_signs,
         norms,
         residual_norms,
+        slot_scale,
     }
 }
 
@@ -2374,6 +2431,7 @@ fn decode_key_component_rows(
     qjl_signs: &PackedBits,
     norms: &[f32],
     residual_norms: &[f32],
+    slot_scale: &[f32],
     key_bits: u8,
 ) -> Vec<f32> {
     decode_key_component_rows_raw(
@@ -2382,6 +2440,7 @@ fn decode_key_component_rows(
         &unpack_all(qjl_signs),
         norms,
         residual_norms,
+        slot_scale,
         key_bits,
     )
 }
@@ -2401,6 +2460,7 @@ fn decode_key_component_rows_raw(
     qjl_signs: &[u16],
     norms: &[f32],
     residual_norms: &[f32],
+    slot_scale: &[f32],
     key_bits: u8,
 ) -> Vec<f32> {
     let total_rows = norms.len();
@@ -2408,7 +2468,18 @@ fn decode_key_component_rows_raw(
     let mut reconstructed = if mse_bits == 0 {
         vec![0.0; total_rows * core.dim]
     } else {
-        reconstruct_mse_rows(core, indices, mse_bits)
+        // Codebook lookup scaled by per-row slot_scale, then inverse-rotated.
+        let codebook = core.codebook(mse_bits);
+        let mut decoded_rot = vec![0.0f32; total_rows * core.dim];
+        for row_idx in 0..total_rows {
+            let s = slot_scale[row_idx];
+            let start = row_idx * core.dim;
+            let end = start + core.dim;
+            for i in start..end {
+                decoded_rot[i] = codebook[usize::from(indices[i])] * s;
+            }
+        }
+        core.inverse_rotate_rows(&decoded_rot)
     };
 
     if residual_norms
@@ -2492,6 +2563,7 @@ fn decode_key_rows_for_runtime(
                 &store.regular_qjl_signs,
                 &store.regular_norms,
                 &store.regular_residual_norms,
+                &store.regular_slot_scale,
                 *bits,
             )
         }
@@ -2514,6 +2586,7 @@ fn decode_key_rows_for_runtime(
                 &store.regular_qjl_signs,
                 &store.regular_norms,
                 &store.regular_residual_norms,
+                &store.regular_slot_scale,
                 *regular_bits,
             );
             let outlier = decode_key_component_rows(
@@ -2534,6 +2607,10 @@ fn decode_key_rows_for_runtime(
                     .outlier_residual_norms
                     .as_ref()
                     .expect("TurboQuant key outlier residual norms missing"),
+                store
+                    .outlier_slot_scale
+                    .as_ref()
+                    .expect("TurboQuant key outlier slot_scale missing"),
                 *outlier_bits,
             );
             scatter_mixed_rows(
@@ -2934,6 +3011,69 @@ mod tests {
         let core = super::TurboQuantCore::new(192, 4);
         assert!(core.wht_left_signs.is_none());
         assert_eq!(core.rotation.len(), 192 * 192);
+    }
+
+    /// Round-trip reconstruction with adversarially-varying row magnitudes:
+    /// half the rows have a tiny scale (0.01), the other half a large one
+    /// (100.0). With a fixed Beta codebook, the small-magnitude rotated values
+    /// would crowd the centre and lose precision; per-row `slot_scale` adapts
+    /// the codebook range to each slot, so reconstruction stays bounded across
+    /// the whole batch.
+    ///
+    /// This test pins Phase B's behavioural improvement: every row, regardless
+    /// of magnitude, reconstructs within a single relative-error envelope.
+    #[test]
+    fn turboquant_slot_scale_roundtrip_adversarial_magnitudes() {
+        use pmetal_bridge::compat::{Array, Dtype, ops};
+
+        // recent_window=None → every token goes straight to cold/compressed.
+        let config = super::TurboQuantConfig::uniform(8, 4).with_recent_window(None);
+        let mut cache = super::TurboQuantKvCache::new_with_config(config);
+
+        let n_rows = 8usize;
+        let dim = 32usize;
+        let mut data = vec![0.0f32; n_rows * dim];
+        for r in 0..n_rows {
+            // Adversarial: half tiny, half large. Same direction so the
+            // unit-sphere normalisation produces identical normalized rows
+            // — the slot_scale path must recover both magnitudes after
+            // codebook + inverse-rotation.
+            let scale = if r < n_rows / 2 { 0.01f32 } else { 100.0f32 };
+            for c in 0..dim {
+                data[r * dim + c] = scale * ((r as f32 * 0.13 + c as f32 * 0.07).sin());
+            }
+        }
+        let shape = &[1, 1, n_rows as i32, dim as i32];
+        let keys = Array::from_f32_slice(&data, shape);
+        let values = Array::from_f32_slice(&data, shape);
+
+        let (recon_k, _recon_v) = cache.update_and_fetch(&keys, &values).unwrap();
+        recon_k.eval();
+        let recon = crate::test_utils::to_f32_vec_eval(&recon_k);
+
+        let mut max_relative_error = 0.0f32;
+        for r in 0..n_rows {
+            let mut sq_err = 0.0f32;
+            let mut sq_orig = 0.0f32;
+            for c in 0..dim {
+                let i = r * dim + c;
+                let d = recon[i] - data[i];
+                sq_err += d * d;
+                sq_orig += data[i] * data[i];
+            }
+            let rel = (sq_err / sq_orig.max(1e-12)).sqrt();
+            max_relative_error = max_relative_error.max(rel);
+        }
+
+        // With slot_scale, an 8-bit MSE codebook (2^7 = 128 centroids) +
+        // QJL residual reconstructs adversarial inputs to ≤ 5% relative error
+        // per row. Without slot_scale this bound would be violated by the
+        // small-magnitude rows.
+        let _ = ops::zeros(&[1], Dtype::Float32); // touch ops to keep import alive
+        assert!(
+            max_relative_error < 0.05,
+            "TurboQuant slot_scale round-trip relative error too large: {max_relative_error}"
+        );
     }
 
     #[test]

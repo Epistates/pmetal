@@ -819,10 +819,15 @@ mod kvcache {
         let key_indices_vec: Vec<u8> = (0..(kv_rows * seq * dim) as usize)
             .map(|i| (((i * 17) + 23) & 0xff) as u8)
             .collect();
-        let slot_scales_vec: Vec<f32> = (0..(kv_rows * seq * 3) as usize)
-            .map(|i| match i % 3 {
-                0 => 0.5 + (((i / 3) % 11) as f32) * 0.03125,
+        // slot_scales pack is [N, S_cap, 4]: [key_norm, residual_norm, value_norm, key_slot_scale].
+        // Component 3 is set to 1.0 here so kernel reconstruction
+        //   keys[d] = codebook[idx] * key_slot_scale * key_norm
+        // matches the reference computed below with key_slot_scale folded out.
+        let slot_scales_vec: Vec<f32> = (0..(kv_rows * seq * 4) as usize)
+            .map(|i| match i % 4 {
+                0 => 0.5 + (((i / 4) % 11) as f32) * 0.03125,
                 1 => 0.0,
+                2 => 1.0,
                 _ => 1.0,
             })
             .collect();
@@ -833,7 +838,7 @@ mod kvcache {
 
         let query_rot = InlineArray::from_f32_slice(&query_rot_vec, &[q_rows, dim]);
         let key_indices = InlineArray::from_u8_slice(&key_indices_vec, &[kv_rows, seq, dim]);
-        let slot_scales = InlineArray::from_f32_slice(&slot_scales_vec, &[kv_rows, seq, 3]);
+        let slot_scales = InlineArray::from_f32_slice(&slot_scales_vec, &[kv_rows, seq, 4]);
         let key_codebook = InlineArray::from_f32_slice(&key_codebook_vec, &[256]);
         let value_dense = InlineArray::from_f32_slice(&value_dense_vec, &[kv_rows, seq, dim]);
 
@@ -857,7 +862,7 @@ mod kvcache {
         for qh in 0..q_heads as usize {
             let kvh = qh / groups as usize;
             for t in 0..seq as usize {
-                let scale_base = (kvh * seq as usize + t) * 3;
+                let scale_base = (kvh * seq as usize + t) * 4;
                 let key_norm = slot_scales_vec[scale_base];
                 let key_base = (kvh * seq as usize + t) * dim as usize;
                 let out_base = (qh * seq as usize + t) * dim as usize;
@@ -1383,6 +1388,7 @@ mod kvcache {
             &encoded.qjl_signs,
             &encoded.norms,
             &encoded.residual_norms,
+            &encoded.slot_scale,
             bits,
         )
     }
@@ -1627,6 +1633,7 @@ mod kvcache {
             &enc_mix.qjl_signs,
             &enc_mix.norms,
             &enc_mix.residual_norms,
+            &enc_mix.slot_scale,
             core,
             3,
         )

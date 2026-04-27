@@ -44,7 +44,9 @@ static const char* TURBOQUANT_SCORE_SOURCE = R"(
         qjl += q_proj_val * q_sign;
     }
     float residual = residual_norms[kv_scalar_idx];
-    float score = mse;
+    // Codebook indices were quantised against rotated values divided by
+    // key_slot_scale; recover the original-magnitude codebook contribution.
+    float score = mse * key_slot_scale[kv_scalar_idx];
     if (residual > 0.0f) {
         score += qjl * residual * (1.2533141373155003f / float(dim));
     }
@@ -89,8 +91,10 @@ static const char* TURBOQUANT_SCORE_Q8_D256_SOURCE = R"(
     uint scalar_idx = kv_row * cache_seq_capacity + seq;
     float key_norm = norms[scalar_idx];
     float residual_scale = residual_norms[scalar_idx] * kQjlConst;
+    float key_slot_scale_val = key_slot_scale[scalar_idx];
 
-    float score_part = 0.0f;
+    float score_part_codebook = 0.0f;
+    float score_part_qjl = 0.0f;
     for (uint d0 = 0u; d0 < kDim; d0 += 8u) {
         uint key_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
         uint sign_word = qjl_signs[(kv_row * 8u + (d0 >> 5u)) * cache_seq_capacity + seq];
@@ -111,25 +115,27 @@ static const char* TURBOQUANT_SCORE_Q8_D256_SOURCE = R"(
         float qproj5 = attn_scale * shared_query_proj[d0 + 5u];
         float qproj6 = attn_scale * shared_query_proj[d0 + 6u];
         float qproj7 = attn_scale * shared_query_proj[d0 + 7u];
-        score_part += qrot0 * shared_k_codebook[(uint)indices[key_base + 0u * cache_seq_capacity]];
-        score_part += qrot1 * shared_k_codebook[(uint)indices[key_base + 1u * cache_seq_capacity]];
-        score_part += qrot2 * shared_k_codebook[(uint)indices[key_base + 2u * cache_seq_capacity]];
-        score_part += qrot3 * shared_k_codebook[(uint)indices[key_base + 3u * cache_seq_capacity]];
-        score_part += qrot4 * shared_k_codebook[(uint)indices[key_base + 4u * cache_seq_capacity]];
-        score_part += qrot5 * shared_k_codebook[(uint)indices[key_base + 5u * cache_seq_capacity]];
-        score_part += qrot6 * shared_k_codebook[(uint)indices[key_base + 6u * cache_seq_capacity]];
-        score_part += qrot7 * shared_k_codebook[(uint)indices[key_base + 7u * cache_seq_capacity]];
-        score_part += residual_scale * qproj0 * ((((sign_word >> (bit_base + 0u)) & 1u) == 0u) ? -1.0f : 1.0f);
-        score_part += residual_scale * qproj1 * ((((sign_word >> (bit_base + 1u)) & 1u) == 0u) ? -1.0f : 1.0f);
-        score_part += residual_scale * qproj2 * ((((sign_word >> (bit_base + 2u)) & 1u) == 0u) ? -1.0f : 1.0f);
-        score_part += residual_scale * qproj3 * ((((sign_word >> (bit_base + 3u)) & 1u) == 0u) ? -1.0f : 1.0f);
-        score_part += residual_scale * qproj4 * ((((sign_word >> (bit_base + 4u)) & 1u) == 0u) ? -1.0f : 1.0f);
-        score_part += residual_scale * qproj5 * ((((sign_word >> (bit_base + 5u)) & 1u) == 0u) ? -1.0f : 1.0f);
-        score_part += residual_scale * qproj6 * ((((sign_word >> (bit_base + 6u)) & 1u) == 0u) ? -1.0f : 1.0f);
-        score_part += residual_scale * qproj7 * ((((sign_word >> (bit_base + 7u)) & 1u) == 0u) ? -1.0f : 1.0f);
+        score_part_codebook += qrot0 * shared_k_codebook[(uint)indices[key_base + 0u * cache_seq_capacity]];
+        score_part_codebook += qrot1 * shared_k_codebook[(uint)indices[key_base + 1u * cache_seq_capacity]];
+        score_part_codebook += qrot2 * shared_k_codebook[(uint)indices[key_base + 2u * cache_seq_capacity]];
+        score_part_codebook += qrot3 * shared_k_codebook[(uint)indices[key_base + 3u * cache_seq_capacity]];
+        score_part_codebook += qrot4 * shared_k_codebook[(uint)indices[key_base + 4u * cache_seq_capacity]];
+        score_part_codebook += qrot5 * shared_k_codebook[(uint)indices[key_base + 5u * cache_seq_capacity]];
+        score_part_codebook += qrot6 * shared_k_codebook[(uint)indices[key_base + 6u * cache_seq_capacity]];
+        score_part_codebook += qrot7 * shared_k_codebook[(uint)indices[key_base + 7u * cache_seq_capacity]];
+        score_part_qjl += residual_scale * qproj0 * ((((sign_word >> (bit_base + 0u)) & 1u) == 0u) ? -1.0f : 1.0f);
+        score_part_qjl += residual_scale * qproj1 * ((((sign_word >> (bit_base + 1u)) & 1u) == 0u) ? -1.0f : 1.0f);
+        score_part_qjl += residual_scale * qproj2 * ((((sign_word >> (bit_base + 2u)) & 1u) == 0u) ? -1.0f : 1.0f);
+        score_part_qjl += residual_scale * qproj3 * ((((sign_word >> (bit_base + 3u)) & 1u) == 0u) ? -1.0f : 1.0f);
+        score_part_qjl += residual_scale * qproj4 * ((((sign_word >> (bit_base + 4u)) & 1u) == 0u) ? -1.0f : 1.0f);
+        score_part_qjl += residual_scale * qproj5 * ((((sign_word >> (bit_base + 5u)) & 1u) == 0u) ? -1.0f : 1.0f);
+        score_part_qjl += residual_scale * qproj6 * ((((sign_word >> (bit_base + 6u)) & 1u) == 0u) ? -1.0f : 1.0f);
+        score_part_qjl += residual_scale * qproj7 * ((((sign_word >> (bit_base + 7u)) & 1u) == 0u) ? -1.0f : 1.0f);
     }
 
-    output[row * n_seq + seq] = key_norm * score_part;
+    // Codebook indices were quantised against rotated values divided by
+    // key_slot_scale; recover the original-magnitude codebook contribution.
+    output[row * n_seq + seq] = key_norm * (key_slot_scale_val * score_part_codebook + score_part_qjl);
 )";
 
 // MIXED_SCORE: combine regular and outlier TurboQuant key contributions in one
@@ -176,14 +182,16 @@ static const char* TURBOQUANT_MIXED_SCORE_SOURCE = R"(
         outlier_qjl += q_proj_val * q_sign;
     }
 
-    float regular_score = regular_mse;
+    // Codebook indices were quantised against rotated values divided by
+    // *_slot_scale; recover the original-magnitude codebook contribution.
+    float regular_score = regular_mse * regular_slot_scale[kv_scalar_idx];
     float regular_residual = regular_residual_norms[kv_scalar_idx];
     if (regular_residual > 0.0f) {
         regular_score += regular_qjl * regular_residual * (1.2533141373155003f / float(regular_dim));
     }
     regular_score *= regular_norms[kv_scalar_idx];
 
-    float outlier_score = outlier_mse;
+    float outlier_score = outlier_mse * outlier_slot_scale[kv_scalar_idx];
     float outlier_residual = outlier_residual_norms[kv_scalar_idx];
     if (outlier_residual > 0.0f) {
         outlier_score += outlier_qjl * outlier_residual * (1.2533141373155003f / float(outlier_dim));
@@ -223,7 +231,8 @@ static const char* TURBOQUANT_SCORE_Q8_D256_FULLBYTE_SOURCE = R"(
 
     float attn_scale = as_type<float>((uint)attn_scale_bits);
     uint scalar_idx = kv_row * cache_seq_capacity + seq;
-    float key_norm = slot_scales[scalar_idx * 3u + 0u];
+    float key_norm = slot_scales[scalar_idx * 4u + 0u];
+    float key_slot_scale = slot_scales[scalar_idx * 4u + 3u];
     float score_part = 0.0f;
     uint key_base = (kv_row * cache_seq_capacity + seq) * kDim;
     for (uint d0 = 0u; d0 < kDim; d0 += 8u) {
@@ -244,13 +253,15 @@ static const char* TURBOQUANT_SCORE_Q8_D256_FULLBYTE_SOURCE = R"(
         score_part += qrot6 * shared_k_codebook[(uint)key_indices[key_base + d0 + 6u]];
         score_part += qrot7 * shared_k_codebook[(uint)key_indices[key_base + d0 + 7u]];
     }
-    output[row * n_seq + seq] = key_norm * score_part;
+    // Codebook indices were quantised against rotated values divided by
+    // key_slot_scale; recover the original-magnitude codebook contribution.
+    output[row * n_seq + seq] = key_norm * key_slot_scale * score_part;
 )";
 
 static mlx::core::fast::CustomKernelFunction& get_turboquant_score_kernel() {
     static auto kernel = mlx::core::fast::metal_kernel(
         "turboquant_score",
-        {"query_rot", "query_proj", "indices", "qjl_signs", "norms", "residual_norms", "codebook"},
+        {"query_rot", "query_proj", "indices", "qjl_signs", "norms", "residual_norms", "key_slot_scale", "codebook"},
         {"output"},
         TURBOQUANT_SCORE_SOURCE,
         "",
@@ -263,7 +274,7 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_score_kernel() {
 static mlx::core::fast::CustomKernelFunction& get_turboquant_score_q8_d256_kernel() {
     static auto kernel = mlx::core::fast::metal_kernel(
         "turboquant_score_q8_d256",
-        {"query_rot", "query_proj", "indices", "qjl_signs", "norms", "residual_norms", "codebook"},
+        {"query_rot", "query_proj", "indices", "qjl_signs", "norms", "residual_norms", "key_slot_scale", "codebook"},
         {"output"},
         TURBOQUANT_SCORE_Q8_D256_SOURCE,
         "",
@@ -283,6 +294,7 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_mixed_score_kernel(
             "regular_qjl_signs",
             "regular_norms",
             "regular_residual_norms",
+            "regular_slot_scale",
             "regular_codebook",
             "outlier_query_rot",
             "outlier_query_proj",
@@ -290,6 +302,7 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_mixed_score_kernel(
             "outlier_qjl_signs",
             "outlier_norms",
             "outlier_residual_norms",
+            "outlier_slot_scale",
             "outlier_codebook",
         },
         {"output"},
@@ -329,6 +342,7 @@ int mlx_inline_turboquant_score(
     const mlx_inline_array* qjl_signs,
     const mlx_inline_array* norms,
     const mlx_inline_array* residual_norms,
+    const mlx_inline_array* key_slot_scale,
     const mlx_inline_array* codebook,
     uint32_t                dim,
     uint32_t                qjl_words,
@@ -350,7 +364,7 @@ int mlx_inline_turboquant_score(
         auto& kernel = get_turboquant_score_kernel();
         constexpr uint32_t tg_threads = 64u;
         auto outputs = kernel(
-            {as_arr(query_rot), as_arr(query_proj), as_arr(indices), as_arr(qjl_signs), as_arr(norms), as_arr(residual_norms), as_arr(codebook)},
+            {as_arr(query_rot), as_arr(query_proj), as_arr(indices), as_arr(qjl_signs), as_arr(norms), as_arr(residual_norms), as_arr(key_slot_scale), as_arr(codebook)},
             {{(int)n_rows, (int)n_seq}},
             {float32},
             {(int)(((n_seq + tg_threads - 1) / tg_threads) * tg_threads), (int)n_rows, 1},
@@ -379,6 +393,7 @@ int mlx_inline_turboquant_score_q8_d256(
     const mlx_inline_array* qjl_signs,
     const mlx_inline_array* norms,
     const mlx_inline_array* residual_norms,
+    const mlx_inline_array* key_slot_scale,
     const mlx_inline_array* codebook,
     uint32_t                n_rows,
     uint32_t                n_seq,
@@ -404,6 +419,7 @@ int mlx_inline_turboquant_score_q8_d256(
         const array& qjl_signs_arr = as_arr(qjl_signs);
         const array& norms_arr = as_arr(norms);
         const array& residual_norms_arr = as_arr(residual_norms);
+        const array& key_slot_scale_arr = as_arr(key_slot_scale);
         const array& codebook_arr = as_arr(codebook);
 
         if (query_rot_arr.shape(-1) != dim || query_proj_arr.shape(-1) != dim) return 1;
@@ -411,7 +427,7 @@ int mlx_inline_turboquant_score_q8_d256(
 
         auto& kernel = get_turboquant_score_q8_d256_kernel();
         auto outputs = kernel(
-            {query_rot_arr, query_proj_arr, indices_arr, qjl_signs_arr, norms_arr, residual_norms_arr, codebook_arr},
+            {query_rot_arr, query_proj_arr, indices_arr, qjl_signs_arr, norms_arr, residual_norms_arr, key_slot_scale_arr, codebook_arr},
             {{(int)n_rows, (int)n_seq}},
             {float32},
             {((int)n_seq + 63) & ~63, (int)n_rows, 1},
@@ -439,6 +455,7 @@ int mlx_inline_turboquant_mixed_score(
     const mlx_inline_array* regular_qjl_signs,
     const mlx_inline_array* regular_norms,
     const mlx_inline_array* regular_residual_norms,
+    const mlx_inline_array* regular_slot_scale,
     const mlx_inline_array* regular_codebook,
     const mlx_inline_array* outlier_query_rot,
     const mlx_inline_array* outlier_query_proj,
@@ -446,6 +463,7 @@ int mlx_inline_turboquant_mixed_score(
     const mlx_inline_array* outlier_qjl_signs,
     const mlx_inline_array* outlier_norms,
     const mlx_inline_array* outlier_residual_norms,
+    const mlx_inline_array* outlier_slot_scale,
     const mlx_inline_array* outlier_codebook,
     uint32_t                regular_dim,
     uint32_t                regular_qjl_words,
@@ -477,6 +495,7 @@ int mlx_inline_turboquant_mixed_score(
                 as_arr(regular_qjl_signs),
                 as_arr(regular_norms),
                 as_arr(regular_residual_norms),
+                as_arr(regular_slot_scale),
                 as_arr(regular_codebook),
                 as_arr(outlier_query_rot),
                 as_arr(outlier_query_proj),
@@ -484,6 +503,7 @@ int mlx_inline_turboquant_mixed_score(
                 as_arr(outlier_qjl_signs),
                 as_arr(outlier_norms),
                 as_arr(outlier_residual_norms),
+                as_arr(outlier_slot_scale),
                 as_arr(outlier_codebook),
             },
             {{(int)n_rows, (int)n_seq}},

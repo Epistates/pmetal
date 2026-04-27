@@ -148,6 +148,10 @@ fn main() {
         &build_f32(kv_rows * seq_cap, 0.05),
         &[kv_rows as i32, seq_cap as i32],
     );
+    let key_slot_scale = InlineArray::from_f32_slice(
+        &vec![1.0f32; kv_rows * seq_cap],
+        &[kv_rows as i32, seq_cap as i32],
+    );
     let key_codebook = InlineArray::from_f32_slice(&build_f32(128, 1.0), &[128]);
     let value_indices = InlineArray::from_u8_slice(
         &build_u8(kv_rows * DIM * seq_cap, 256),
@@ -166,6 +170,7 @@ fn main() {
         &key_qjl_signs,
         &key_norms,
         &key_residual_norms,
+        &key_slot_scale,
         &key_codebook,
         &value_indices,
         &value_norms,
@@ -184,6 +189,7 @@ fn main() {
         &key_bytes,
         &key_norms,
         &key_residual_norms,
+        &key_slot_scale,
         &key_codebook,
         &value_indices,
         &value_norms,
@@ -216,6 +222,7 @@ fn main() {
                     &key_qjl_signs,
                     &key_norms,
                     &key_residual_norms,
+                    &key_slot_scale,
                     &key_codebook,
                     &value_indices,
                     &value_norms,
@@ -246,6 +253,7 @@ fn main() {
                 &key_bytes,
                 &key_norms,
                 &key_residual_norms,
+                &key_slot_scale,
                 &key_codebook,
                 &value_indices,
                 &value_norms,

@@ -71,11 +71,34 @@ pub(super) fn gpu_quantize_kv(
     //    rotation.T == inverse_rotation, so we matmul with inverse_rotation_arr.
     let k_rot = k_core.rotate_array(&k_norm)?;
 
-    // 4. GPU nearest-centroid → [B, H, S, D] uint32
-    let k_indices = k_core.gpu_quantize_mse(&k_rot, key_mse_bits)?;
+    // 4. Per-row slot_scale: max(|rotated|) / centroid_max. Dividing the
+    //    rotated values by slot_scale before quantize makes a fixed Beta
+    //    codebook adapt to each slot's actual range; reconstruction
+    //    multiplies the codebook lookup back by slot_scale. Decode and the
+    //    score kernels read it as the 4th component of slot_scales (or the
+    //    standalone key_slot_scale field on non-q8-shadow paths).
+    let k_centroid_max = k_core
+        .codebook(key_mse_bits)
+        .last()
+        .copied()
+        .unwrap_or(1.0)
+        .abs()
+        .max(ZERO_EPSILON);
+    let k_slot_scale_raw = k_rot
+        .abs()
+        .max_axis(-1, true)
+        .divide(&InlineArray::from_f32(k_centroid_max));
+    let k_slot_scale = k_slot_scale_raw.maximum(&eps);
+    let k_rot_scaled = k_rot.divide(&k_slot_scale);
 
-    // 5. Reconstruct MSE approximation in the rotated space.
-    let k_mse_recon_rot = k_core.gpu_reconstruct_mse(&k_indices, key_mse_bits)?;
+    // 5. GPU nearest-centroid → [B, H, S, D] uint32. Quantises the scaled
+    //    rotated values so codebook hits land in [-1, 1].
+    let k_indices = k_core.gpu_quantize_mse(&k_rot_scaled, key_mse_bits)?;
+
+    // 6. Reconstruct MSE approximation in the rotated space, then re-scale
+    //    by slot_scale to recover the original-magnitude rotated values.
+    let k_mse_recon_rot_unit = k_core.gpu_reconstruct_mse(&k_indices, key_mse_bits)?;
+    let k_mse_recon_rot = k_mse_recon_rot_unit.multiply(&k_slot_scale);
 
     // 6. Residual norms: rotation-invariant, so compute directly in rotated space.
     //    residual_rot = k_rot - k_mse_recon_rot  →  norm_l2  [B, H, S, 1]
@@ -222,12 +245,15 @@ pub(super) fn gpu_quantize_kv(
     };
     let q8_kvbytes_seq = None;
     let q8_slot_scales_seq = if use_q8_seq_shadow {
+        // Pack layout: [key_norm, residual_norm, value_norm, key_slot_scale]
+        // along the trailing axis. Score kernels offset into this with stride 4.
         let key_scales = key_norms.concatenate_2(&k_residual_norms, 3);
         let value_scales = InlineArray::ones(
             &[values.dim(0), values.dim(1), values.dim(2), 1],
             Dtype::Float32.as_i32(),
         );
-        Some(key_scales.concatenate_2(&value_scales, 3))
+        let with_value = key_scales.concatenate_2(&value_scales, 3);
+        Some(with_value.concatenate_2(&k_slot_scale, 3))
     } else {
         None
     };
@@ -245,6 +271,7 @@ pub(super) fn gpu_quantize_kv(
             qjl_signs: k_qjl_signs,
             qjl_signs_t: k_qjl_signs_t,
             residual_norms: (!use_q8_seq_shadow).then_some(k_residual_norms),
+            key_slot_scale: (!use_q8_seq_shadow).then_some(k_slot_scale),
         },
         GpuValueStore {
             indices: v_indices,
@@ -274,13 +301,30 @@ pub(super) fn gpu_encode_key_subvector(
     let normalized = rows.divide(&safe_norms);
 
     let rotated = core.rotate_array(&normalized)?;
-    let indices_u32 = core.gpu_quantize_mse(&rotated, mse_bits)?;
+
+    // Per-row slot_scale: see gpu_quantize_kv for rationale.
+    let centroid_max = core
+        .codebook(mse_bits)
+        .last()
+        .copied()
+        .unwrap_or(1.0)
+        .abs()
+        .max(ZERO_EPSILON);
+    let slot_scale_raw = rotated
+        .abs()
+        .max_axis(-1, true)
+        .divide(&InlineArray::from_f32(centroid_max));
+    let slot_scale = slot_scale_raw.maximum(&eps);
+    let rotated_scaled = rotated.divide(&slot_scale);
+
+    let indices_u32 = core.gpu_quantize_mse(&rotated_scaled, mse_bits)?;
     // Indices kept as u32 for round-trip clarity. A u8 packed shadow (matching
     // Uniform's q8_keybytes) would let a fused Mixed score kernel skip the
     // u32→u8 cast each step; deferred until the fused path lands.
     let indices = indices_u32.clone();
 
-    let recon_rot = core.gpu_reconstruct_mse(&indices_u32, mse_bits)?;
+    let recon_rot_unit = core.gpu_reconstruct_mse(&indices_u32, mse_bits)?;
+    let recon_rot = recon_rot_unit.multiply(&slot_scale);
     let residual_rot = rotated.subtract(&recon_rot);
     let residual_norms_raw = residual_rot.norm_l2(-1, true);
     let zero_bound = InlineArray::from_f32(0.0f32);
@@ -331,6 +375,7 @@ pub(super) fn gpu_encode_key_subvector(
         qjl_signs_t: Some(qjl_signs_t),
         norms,
         residual_norms,
+        slot_scale,
     })
 }
 
@@ -341,6 +386,7 @@ pub(super) struct MixedKeySubvectorEncoding {
     pub(super) qjl_signs_t: Option<InlineArray>,
     pub(super) norms: InlineArray,
     pub(super) residual_norms: InlineArray,
+    pub(super) slot_scale: InlineArray,
 }
 
 /// Encode a single-tensor sub-vector for the *value* path (norm + rotated
@@ -494,6 +540,7 @@ pub(super) fn gpu_quantize_kv_mixed(
         regular_qjl_signs_t: k_reg_enc.qjl_signs_t,
         regular_norms: k_reg_enc.norms,
         regular_residual_norms: k_reg_enc.residual_norms,
+        regular_slot_scale: k_reg_enc.slot_scale,
         regular_src_dim: k_reg_src_u8,
         outlier_indices: k_out_enc.indices,
         outlier_indices_t: k_out_enc.indices_t,
@@ -501,6 +548,7 @@ pub(super) fn gpu_quantize_kv_mixed(
         outlier_qjl_signs_t: k_out_enc.qjl_signs_t,
         outlier_norms: k_out_enc.norms,
         outlier_residual_norms: k_out_enc.residual_norms,
+        outlier_slot_scale: k_out_enc.slot_scale,
         outlier_src_dim: k_out_src_u8,
     };
     let mut vstore = GpuMixedValueStore {
@@ -627,8 +675,10 @@ pub(super) fn try_gpu_mixed_score(
 
     let reg_norms_flat = kstore.regular_norms.reshape(&[kv_rows, t]);
     let reg_residual_flat = kstore.regular_residual_norms.reshape(&[kv_rows, t]);
+    let reg_slot_scale_flat = kstore.regular_slot_scale.reshape(&[kv_rows, t]);
     let out_norms_flat = kstore.outlier_norms.reshape(&[kv_rows, t]);
     let out_residual_flat = kstore.outlier_residual_norms.reshape(&[kv_rows, t]);
+    let out_slot_scale_flat = kstore.outlier_slot_scale.reshape(&[kv_rows, t]);
 
     let reg_qjl_words = kstore.regular_qjl_signs.dim(3);
     let out_qjl_words = kstore.outlier_qjl_signs.dim(3);
@@ -640,6 +690,7 @@ pub(super) fn try_gpu_mixed_score(
         &kstore.regular_qjl_signs,
         &reg_norms_flat,
         &reg_residual_flat,
+        &reg_slot_scale_flat,
         reg_codebook,
         &q_out_rot,
         &q_out_proj,
@@ -647,6 +698,7 @@ pub(super) fn try_gpu_mixed_score(
         &kstore.outlier_qjl_signs,
         &out_norms_flat,
         &out_residual_flat,
+        &out_slot_scale_flat,
         out_codebook,
         d_reg as u32,
         reg_qjl_words as u32,
@@ -666,7 +718,8 @@ pub(super) fn try_gpu_mixed_score(
 /// Dequantise GPU-stored keys back to `[B, H, T, Dk]` f32.
 ///
 /// Formula (per coordinate):
-///   k̃ = (codebook[idx] + (√(π/2)/D) · (J^T · sign) · residual_norm) · norm  [inv-rotated]
+///   k̃ = (codebook[idx] · slot_scale + (√(π/2)/D) · (J^T · sign) · residual_norm) · norm
+///        [inv-rotated]
 pub(super) fn gpu_dequantize_keys(
     store: &GpuKeyStore,
     runtime: &TensorRuntime,
@@ -679,7 +732,15 @@ pub(super) fn gpu_dequantize_keys(
     };
 
     // 1. Reconstruct MSE centroids in the rotated domain: take(codebook, indices) → [B,H,T,D].
-    let mse_recon_rot = core.gpu_reconstruct_mse(&store.indices, key_mse_bits)?;
+    let mse_recon_rot_unit = core.gpu_reconstruct_mse(&store.indices, key_mse_bits)?;
+
+    // 1b. Re-scale the codebook lookup by the per-row slot_scale to recover
+    //     the original-magnitude rotated values.
+    let mse_recon_rot = if let Some(slot_scale) = store.key_slot_scale_array() {
+        mse_recon_rot_unit.multiply(&slot_scale)
+    } else {
+        mse_recon_rot_unit
+    };
 
     // 2. Inverse-rotate back to input space.
     //    CPU: inverse_rotate_rows = matmul_rows(inverse_rotation, dim, input) = input @ inverse_rotation.T = input @ rotation.
@@ -774,11 +835,13 @@ pub(super) fn gpu_dequantize_values(
 /// Dequantise a single key sub-vector (regular *or* outlier) for the
 /// Mixed-precision path. Mirrors `gpu_dequantize_keys` body but
 /// parameterised by an arbitrary `TurboQuantCore` and stored arrays.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn gpu_dequantize_key_subvector(
     indices_u8: &InlineArray,        // [B, H, T, D_sub] u8
     qjl_signs: &InlineArray,         // [B, H, T, ceil(D_sub/32)] u32
     norms: &InlineArray,             // [B, H, T, 1] f32
     residual_norms: &InlineArray,    // [B, H, T, 1] f32
+    slot_scale: &InlineArray,        // [B, H, T, 1] f32
     core: &TurboQuantCore,
     key_bits: u8,
 ) -> Option<InlineArray> {
@@ -786,7 +849,9 @@ pub(super) fn gpu_dequantize_key_subvector(
 
     // Phase 3a: indices stored as u32; cast no-op when already u32.
     let indices_u32 = indices_u8.as_dtype(Dtype::Uint32.as_i32());
-    let mse_recon_rot = core.gpu_reconstruct_mse(&indices_u32, mse_bits)?;
+    let mse_recon_rot_unit = core.gpu_reconstruct_mse(&indices_u32, mse_bits)?;
+    // Re-scale codebook lookup by slot_scale to recover original-magnitude rotated values.
+    let mse_recon_rot = mse_recon_rot_unit.multiply(slot_scale);
     let mse_base = core.inverse_rotate_array(&mse_recon_rot)?;
 
     let packed_shape = qjl_signs.shape();
@@ -863,6 +928,7 @@ pub(super) fn gpu_dequantize_keys_mixed(
         &store.regular_qjl_signs,
         &store.regular_norms,
         &store.regular_residual_norms,
+        &store.regular_slot_scale,
         reg_core,
         regular_bits,
     )?;
@@ -871,6 +937,7 @@ pub(super) fn gpu_dequantize_keys_mixed(
         &store.outlier_qjl_signs,
         &store.outlier_norms,
         &store.outlier_residual_norms,
+        &store.outlier_slot_scale,
         out_core,
         outlier_bits,
     )?;

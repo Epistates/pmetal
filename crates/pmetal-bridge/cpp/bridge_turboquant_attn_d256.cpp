@@ -70,6 +70,7 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_2PASS_1_SOURCE = R"(
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
         float key_norm = key_norms[scalar_idx];
         float residual_scale = key_residual_norms[scalar_idx] * kQjlConst;
+        float slot_scale = key_slot_scale[scalar_idx];
         uint key_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
         uint value_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
         uint sign_word = key_qjl_signs[(kv_row * kQjlWords + (lane >> 2u)) * cache_seq_capacity + seq];
@@ -84,6 +85,10 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_2PASS_1_SOURCE = R"(
         score_part += qrot5 * shared_k_codebook[(uint)key_indices[key_base + 5u * cache_seq_capacity]];
         score_part += qrot6 * shared_k_codebook[(uint)key_indices[key_base + 6u * cache_seq_capacity]];
         score_part += qrot7 * shared_k_codebook[(uint)key_indices[key_base + 7u * cache_seq_capacity]];
+        // Recover original-magnitude codebook contribution; QJL term added
+        // below stays in correct units (residual_norms captures the rescaled
+        // codebook residual).
+        score_part *= slot_scale;
         score_part += residual_scale * qproj0 * ((((sign_word >> (bit_base + 0u)) & 1u) == 0u) ? -1.0f : 1.0f);
         score_part += residual_scale * qproj1 * ((((sign_word >> (bit_base + 1u)) & 1u) == 0u) ? -1.0f : 1.0f);
         score_part += residual_scale * qproj2 * ((((sign_word >> (bit_base + 2u)) & 1u) == 0u) ? -1.0f : 1.0f);
@@ -188,9 +193,10 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KEYS_2PASS_1_SOURCE = R"(
 
     for (uint seq = block; seq < n_seq; seq += blocks) {
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
-        uint scale_base = scalar_idx * 3u;
+        uint scale_base = scalar_idx * 4u;
         float key_norm = slot_scales[scale_base + 0u];
         float residual_scale = slot_scales[scale_base + 1u] * kQjlConst;
+        float key_slot_scale = slot_scales[scale_base + 3u];
         float value_norm = slot_scales[scale_base + 2u];
         uint key_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
         uint value_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
@@ -222,6 +228,11 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KEYS_2PASS_1_SOURCE = R"(
         score_part += qrot5 * shared_k_codebook[(uint)(key_byte5 & 0x7fu)];
         score_part += qrot6 * shared_k_codebook[(uint)(key_byte6 & 0x7fu)];
         score_part += qrot7 * shared_k_codebook[(uint)(key_byte7 & 0x7fu)];
+        // Codebook indices were quantised against rotated values divided by
+        // key_slot_scale; recover the original-magnitude codebook contribution.
+        // QJL term below is in correct units already (residual_norm captures
+        // the rescaled-codebook residual), so it's added AFTER this multiply.
+        score_part *= key_slot_scale;
         score_part += residual_scale * qproj0 * sign0;
         score_part += residual_scale * qproj1 * sign1;
         score_part += residual_scale * qproj2 * sign2;
@@ -322,9 +333,10 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KEYS_DENSE_VALUES_2PASS_1
 
     for (uint seq = block; seq < n_seq; seq += blocks) {
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
-        uint scale_base = scalar_idx * 3u;
+        uint scale_base = scalar_idx * 4u;
         float key_norm = slot_scales[scale_base + 0u];
         float residual_scale = slot_scales[scale_base + 1u] * kQjlConst;
+        float key_slot_scale = slot_scales[scale_base + 3u];
         uint key_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
         uint value_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
 
@@ -355,6 +367,11 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KEYS_DENSE_VALUES_2PASS_1
         score_part += qrot5 * shared_k_codebook[(uint)(key_byte5 & 0x7fu)];
         score_part += qrot6 * shared_k_codebook[(uint)(key_byte6 & 0x7fu)];
         score_part += qrot7 * shared_k_codebook[(uint)(key_byte7 & 0x7fu)];
+        // Codebook indices were quantised against rotated values divided by
+        // key_slot_scale; recover the original-magnitude codebook contribution.
+        // QJL term below is in correct units already (residual_norm captures
+        // the rescaled-codebook residual), so it's added AFTER this multiply.
+        score_part *= key_slot_scale;
         score_part += residual_scale * qproj0 * sign0;
         score_part += residual_scale * qproj1 * sign1;
         score_part += residual_scale * qproj2 * sign2;
@@ -445,7 +462,8 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_FULLBYTE_DENSE_VALUES_2PASS_1_SO
 
     for (uint seq = block; seq < n_seq; seq += blocks) {
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
-        float key_norm = slot_scales[scalar_idx * 3u + 0u];
+        float key_norm = slot_scales[scalar_idx * 4u + 0u];
+        float key_slot_scale = slot_scales[scalar_idx * 4u + 3u];
         uint key_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
         uint value_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
 
@@ -467,6 +485,10 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_FULLBYTE_DENSE_VALUES_2PASS_1_SO
         score_part += qrot5 * shared_k_codebook[(uint)key_idx5];
         score_part += qrot6 * shared_k_codebook[(uint)key_idx6];
         score_part += qrot7 * shared_k_codebook[(uint)key_idx7];
+        // Recover original-magnitude codebook contribution; see PACKED_KEYS
+        // kernel commentary above. Fullbyte kernels have no QJL residual term,
+        // so slot_scale folds cleanly into the codebook accumulator.
+        score_part *= key_slot_scale;
         float score = key_norm * simd_sum(score_part);
 
         float new_max = max(max_score, score);
@@ -539,7 +561,8 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_FULLBYTE_DENSE_VALUES_2PASS_1_LO
     float local_max = -INFINITY;
     for (uint seq = block; seq < n_seq; seq += blocks) {
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
-        float key_norm = slot_scales[scalar_idx * 3u + 0u];
+        float key_norm = slot_scales[scalar_idx * 4u + 0u];
+        float key_slot_scale = slot_scales[scalar_idx * 4u + 3u];
         uint key_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
 
         uchar key_idx0 = key_indices[key_base + 0u];
@@ -560,6 +583,10 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_FULLBYTE_DENSE_VALUES_2PASS_1_LO
         score_part += qrot5 * shared_k_codebook[(uint)key_idx5];
         score_part += qrot6 * shared_k_codebook[(uint)key_idx6];
         score_part += qrot7 * shared_k_codebook[(uint)key_idx7];
+        // Recover original-magnitude codebook contribution; see PACKED_KEYS
+        // kernel commentary above. Fullbyte kernels have no QJL residual term,
+        // so slot_scale folds cleanly into the codebook accumulator.
+        score_part *= key_slot_scale;
         float score = key_norm * simd_sum(score_part);
         local_max = max(local_max, score);
     }
@@ -576,7 +603,8 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_FULLBYTE_DENSE_VALUES_2PASS_1_LO
 
     for (uint seq = block; seq < n_seq; seq += blocks) {
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
-        float key_norm = slot_scales[scalar_idx * 3u + 0u];
+        float key_norm = slot_scales[scalar_idx * 4u + 0u];
+        float key_slot_scale = slot_scales[scalar_idx * 4u + 3u];
         uint key_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
         uint value_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
 
@@ -598,6 +626,10 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_FULLBYTE_DENSE_VALUES_2PASS_1_LO
         score_part += qrot5 * shared_k_codebook[(uint)key_idx5];
         score_part += qrot6 * shared_k_codebook[(uint)key_idx6];
         score_part += qrot7 * shared_k_codebook[(uint)key_idx7];
+        // Recover original-magnitude codebook contribution; see PACKED_KEYS
+        // kernel commentary above. Fullbyte kernels have no QJL residual term,
+        // so slot_scale folds cleanly into the codebook accumulator.
+        score_part *= key_slot_scale;
         float score = key_norm * simd_sum(score_part);
         float exp_score = fast::exp(score - local_max);
         sum_exp_score += exp_score;
@@ -690,9 +722,10 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KV_2PASS_1_SOURCE = R"(
 
     for (uint seq = block; seq < n_seq; seq += blocks) {
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
-        uint scale_base = scalar_idx * 3u;
+        uint scale_base = scalar_idx * 4u;
         float key_norm = slot_scales[scale_base + 0u];
         float residual_scale = slot_scales[scale_base + 1u] * kQjlConst;
+        float key_slot_scale = slot_scales[scale_base + 3u];
         float value_norm = slot_scales[scale_base + 2u];
         uint kv_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
 
@@ -732,6 +765,11 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KV_2PASS_1_SOURCE = R"(
         score_part += qrot5 * shared_k_codebook[(uint)(key_byte5 & 0x7fu)];
         score_part += qrot6 * shared_k_codebook[(uint)(key_byte6 & 0x7fu)];
         score_part += qrot7 * shared_k_codebook[(uint)(key_byte7 & 0x7fu)];
+        // Codebook indices were quantised against rotated values divided by
+        // key_slot_scale; recover the original-magnitude codebook contribution.
+        // QJL term below is in correct units already (residual_norm captures
+        // the rescaled-codebook residual), so it's added AFTER this multiply.
+        score_part *= key_slot_scale;
         score_part += residual_scale * qproj0 * sign0;
         score_part += residual_scale * qproj1 * sign1;
         score_part += residual_scale * qproj2 * sign2;
@@ -832,9 +870,10 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KV_DENSE_VALUES_2PASS_1_S
 
     for (uint seq = block; seq < n_seq; seq += blocks) {
         uint scalar_idx = kv_row * cache_seq_capacity + seq;
-        uint scale_base = scalar_idx * 3u;
+        uint scale_base = scalar_idx * 4u;
         float key_norm = slot_scales[scale_base + 0u];
         float residual_scale = slot_scales[scale_base + 1u] * kQjlConst;
+        float key_slot_scale = slot_scales[scale_base + 3u];
         uint kv_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
         uint value_base = (kv_row * cache_seq_capacity + seq) * kDim + d0;
 
@@ -874,6 +913,11 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_PACKED_KV_DENSE_VALUES_2PASS_1_S
         score_part += qrot5 * shared_k_codebook[(uint)(key_byte5 & 0x7fu)];
         score_part += qrot6 * shared_k_codebook[(uint)(key_byte6 & 0x7fu)];
         score_part += qrot7 * shared_k_codebook[(uint)(key_byte7 & 0x7fu)];
+        // Codebook indices were quantised against rotated values divided by
+        // key_slot_scale; recover the original-magnitude codebook contribution.
+        // QJL term below is in correct units already (residual_norm captures
+        // the rescaled-codebook residual), so it's added AFTER this multiply.
+        score_part *= key_slot_scale;
         score_part += residual_scale * qproj0 * sign0;
         score_part += residual_scale * qproj1 * sign1;
         score_part += residual_scale * qproj2 * sign2;
@@ -1063,6 +1107,7 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_attention_q8_d256_2
             "key_qjl_signs",
             "key_norms",
             "key_residual_norms",
+            "key_slot_scale",
             "key_codebook",
             "value_indices",
             "value_norms",
@@ -1220,6 +1265,7 @@ int mlx_inline_turboquant_attention_q8_d256_2pass(
     const mlx_inline_array* key_qjl_signs,
     const mlx_inline_array* key_norms,
     const mlx_inline_array* key_residual_norms,
+    const mlx_inline_array* key_slot_scale,
     const mlx_inline_array* key_codebook,
     const mlx_inline_array* value_indices,
     const mlx_inline_array* value_norms,
@@ -1246,6 +1292,7 @@ int mlx_inline_turboquant_attention_q8_d256_2pass(
         const array& key_qjl_signs_arr = as_arr(key_qjl_signs);
         const array& key_norms_arr = as_arr(key_norms);
         const array& key_residual_norms_arr = as_arr(key_residual_norms);
+        const array& key_slot_scale_arr = as_arr(key_slot_scale);
         const array& key_codebook_arr = as_arr(key_codebook);
         const array& value_indices_arr = as_arr(value_indices);
         const array& value_norms_arr = as_arr(value_norms);
@@ -1263,6 +1310,7 @@ int mlx_inline_turboquant_attention_q8_d256_2pass(
                 key_qjl_signs_arr,
                 key_norms_arr,
                 key_residual_norms_arr,
+                key_slot_scale_arr,
                 key_codebook_arr,
                 value_indices_arr,
                 value_norms_arr,

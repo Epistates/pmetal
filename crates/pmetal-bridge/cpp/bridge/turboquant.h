@@ -46,6 +46,9 @@
 //   qjl_signs     — [N, ceil(D/32), S_cap]      uint32 (packed sign bits)
 //   norms         — [N, S_cap]                  f32    (slot l2 norm)
 //   residual_norms — [N, S_cap]                 f32    (residual l2 norm)
+//   key_slot_scale — [N, S_cap]                 f32    (per-row codebook
+//                                                       scaling factor:
+//                                                       max(|rotated|)/centroid_max)
 //   codebook      — [C]                         f32    (sorted centroids)
 //
 // Scratch / one-shot encode-decode buffers:
@@ -53,9 +56,12 @@
 //   sign_bits     — [N, ceil(D/32)]             uint32
 //   keys_packed_2d — [N, D]                     uint32
 //
-// q8 fullbyte (D=256, n_seq>=1024) uses a seq-major transposition:
+// q8 fullbyte (D=256, n_seq>=1024) uses a seq-major transposition + a packed
+// per-slot scalar buffer that the long-context score kernels offset into:
 //   q8_fullbyte_seq    — [N, S_cap, D]          uint8
-//   q8_slot_scales_seq — [N, S_cap]             f16
+//   q8_slot_scales_seq — [N, S_cap, 4]          f32  packed scalars
+//                          [0]=key_norm, [1]=residual_norm,
+//                          [2]=value_norm, [3]=key_slot_scale
 //   d256_rot_values_seq — [N, S_cap, D]         bf16
 //
 // Mixed-precision split layouts (regular + outlier sub-vectors):
@@ -111,7 +117,7 @@ int mlx_inline_turboquant_decode(
 // query_rot/query_proj: [N, D] f32
 // indices:              [N, D, S_cap] uint8 transposed for score-friendly seq access
 // qjl_signs:            [N, ceil(D/32), S_cap] packed uint32 sign words
-// norms/residual_norms: [N, S_cap] f32
+// norms/residual_norms/key_slot_scale: [N, S_cap] f32
 // codebook:             [C] f32
 // out_scores:           [N, S] f32
 int mlx_inline_turboquant_score(
@@ -122,6 +128,7 @@ int mlx_inline_turboquant_score(
     const mlx_inline_array* qjl_signs,
     const mlx_inline_array* norms,
     const mlx_inline_array* residual_norms,
+    const mlx_inline_array* key_slot_scale,
     const mlx_inline_array* codebook,
     uint32_t                dim,
     uint32_t                qjl_words,
@@ -142,6 +149,7 @@ int mlx_inline_turboquant_score_q8_d256(
     const mlx_inline_array* qjl_signs,
     const mlx_inline_array* norms,
     const mlx_inline_array* residual_norms,
+    const mlx_inline_array* key_slot_scale,
     const mlx_inline_array* codebook,
     uint32_t                n_rows,
     uint32_t                n_seq,
@@ -154,7 +162,7 @@ int mlx_inline_turboquant_score_q8_d256(
 // regular/outlier query tensors: [N, D_reg]/[N, D_out] f32
 // regular/outlier indices: [KvRows, S_cap, D_*]
 // regular/outlier qjl_signs: [KvRows, S_cap, ceil(D_*/32)] packed uint32 words
-// regular/outlier norms/residual_norms: [KvRows, S_cap] f32
+// regular/outlier norms/residual_norms/slot_scale: [KvRows, S_cap] f32
 // out_scores: [N, S] f32
 int mlx_inline_turboquant_mixed_score(
     mlx_inline_array*       out_scores,
@@ -164,6 +172,7 @@ int mlx_inline_turboquant_mixed_score(
     const mlx_inline_array* regular_qjl_signs,
     const mlx_inline_array* regular_norms,
     const mlx_inline_array* regular_residual_norms,
+    const mlx_inline_array* regular_slot_scale,
     const mlx_inline_array* regular_codebook,
     const mlx_inline_array* outlier_query_rot,
     const mlx_inline_array* outlier_query_proj,
@@ -171,6 +180,7 @@ int mlx_inline_turboquant_mixed_score(
     const mlx_inline_array* outlier_qjl_signs,
     const mlx_inline_array* outlier_norms,
     const mlx_inline_array* outlier_residual_norms,
+    const mlx_inline_array* outlier_slot_scale,
     const mlx_inline_array* outlier_codebook,
     uint32_t                regular_dim,
     uint32_t                regular_qjl_words,
@@ -293,6 +303,7 @@ int mlx_inline_turboquant_attention_q8_d256_2pass(
     const mlx_inline_array* key_qjl_signs,
     const mlx_inline_array* key_norms,
     const mlx_inline_array* key_residual_norms,
+    const mlx_inline_array* key_slot_scale,
     const mlx_inline_array* key_codebook,
     const mlx_inline_array* value_indices,
     const mlx_inline_array* value_norms,
@@ -498,6 +509,7 @@ int mlx_inline_turboquant_attention_q8_d128_2pass(
     const mlx_inline_array* key_qjl_signs,
     const mlx_inline_array* key_norms,
     const mlx_inline_array* key_residual_norms,
+    const mlx_inline_array* key_slot_scale,
     const mlx_inline_array* key_codebook,
     const mlx_inline_array* value_indices,
     const mlx_inline_array* value_norms,
@@ -518,6 +530,7 @@ int mlx_inline_turboquant_attention_q8_d128_packed_keys_2pass(
     const mlx_inline_array* key_bytes,
     const mlx_inline_array* key_norms,
     const mlx_inline_array* key_residual_norms,
+    const mlx_inline_array* key_slot_scale,
     const mlx_inline_array* key_codebook,
     const mlx_inline_array* value_indices,
     const mlx_inline_array* value_norms,

@@ -28,6 +28,11 @@ pub(super) struct EncodedKeyRows {
     pub(super) qjl_signs: Vec<u16>,
     pub(super) norms: Vec<f32>,
     pub(super) residual_norms: Vec<f32>,
+    /// Per-row codebook scaling factor: `max(|rotated_row|) / centroid_max`.
+    /// At decode time the codebook lookup is multiplied by this scalar before
+    /// inverse-rotation, so a fixed Beta codebook adapts to each slot's
+    /// rotated range. Length == norms.len() (one entry per row).
+    pub(super) slot_scale: Vec<f32>,
 }
 
 pub(super) struct EncodedValueRows {
@@ -127,7 +132,13 @@ pub(super) fn encode_value_rows(runtime: &TensorRuntime, total_dim: usize, rows:
     }
 }
 
-/// Two-stage key encoder: MSE at (bits-1) + QJL on residual.
+/// Two-stage key encoder: MSE at (bits-1) with per-row slot_scale + QJL on residual.
+///
+/// `slot_scale` adapts the fixed Beta codebook to each row's rotated range so
+/// values closer to ±1 are quantized at full codebook resolution rather than
+/// crowding the centre. Reconstruction multiplies the codebook lookup by
+/// `slot_scale` before inverse-rotation; the score kernel multiplies by it
+/// once per slot in the inner loop.
 #[allow(clippy::needless_range_loop)]
 pub(super) fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key_bits: u8) -> EncodedKeyRows {
     let num_rows = rows.len() / core.dim;
@@ -141,7 +152,6 @@ pub(super) fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key
         let norm = l2_norm(row);
         if !norm.is_finite() || norm <= ZERO_EPSILON {
             norms[row_idx] = 0.0;
-            // `normalized` already initialised to zero.
             continue;
         }
         norms[row_idx] = norm;
@@ -152,18 +162,53 @@ pub(super) fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key
         }
     }
 
-    // Step 2: MSE quantise at (bits-1).
     let mse_bits = key_bits.saturating_sub(1);
-    let mut mse_indices = quantize_mse_rows(core, &normalized, mse_bits);
+    let mut mse_indices = vec![0u16; rows.len()];
+    let mut slot_scale = vec![0.0f32; num_rows];
+    let mut decoded_mse = vec![0.0f32; rows.len()];
 
-    // Step 3: Reconstruct MSE approximation.
-    let decoded_mse = if mse_bits == 0 {
-        vec![0.0; rows.len()]
-    } else {
-        reconstruct_mse_rows(core, &mse_indices, mse_bits)
-    };
+    if mse_bits > 0 {
+        // Step 2: Rotate once; per-row max gives the codebook adaptation factor.
+        let rotated = core.rotate_rows(&normalized);
+        let codebook = core.codebook(mse_bits);
+        // Beta codebook is symmetric around 0; centroid_max is the rightmost
+        // (positive) value. Floor at ZERO_EPSILON so degenerate rows don't
+        // produce inf when we divide.
+        let centroid_max = codebook
+            .last()
+            .copied()
+            .unwrap_or(1.0)
+            .abs()
+            .max(ZERO_EPSILON);
 
-    // Step 4: Compute residual = normalized - decoded_mse.
+        let mut decoded_rot = vec![0.0f32; rows.len()];
+        for row_idx in 0..num_rows {
+            let start = row_idx * core.dim;
+            let end = start + core.dim;
+            if norms[row_idx] <= ZERO_EPSILON {
+                continue;
+            }
+            // Step 3: per-row max defines slot_scale. We divide rotated by
+            // slot_scale before quantize so values use the full codebook range.
+            let row_max = rotated[start..end]
+                .iter()
+                .fold(0.0f32, |acc, &v| acc.max(v.abs()));
+            let s = (row_max / centroid_max).max(ZERO_EPSILON);
+            slot_scale[row_idx] = s;
+            let inv_s = 1.0 / s;
+            for i in start..end {
+                let scaled = rotated[i] * inv_s;
+                let idx = nearest_centroid_index(scaled, codebook);
+                mse_indices[i] = idx as u16;
+                // Decoded value in rotated domain: codebook[idx] * slot_scale.
+                decoded_rot[i] = codebook[idx] * s;
+            }
+        }
+        // Step 4: inverse-rotate the rescaled codebook recon to get decoded_mse.
+        decoded_mse = core.inverse_rotate_rows(&decoded_rot);
+    }
+
+    // Step 5: residual = normalized - decoded_mse.
     let mut residual = vec![0.0f32; rows.len()];
     let mut residual_norms = vec![0.0f32; num_rows];
     for row_idx in 0..num_rows {
@@ -189,7 +234,7 @@ pub(super) fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key
         };
     }
 
-    // Step 5: QJL — project residual and take signs.
+    // Step 6: QJL — project residual and take signs.
     let projected = core.project_rows(&residual);
     let mut qjl_signs: Vec<u16> = projected
         .iter()
@@ -219,6 +264,7 @@ pub(super) fn encode_key_component_rows(core: &TurboQuantCore, rows: &[f32], key
         qjl_signs,
         norms,
         residual_norms,
+        slot_scale,
     }
 }
 
@@ -276,6 +322,7 @@ pub(super) fn decode_key_rows(
                 &unpack_all(&store.regular_qjl_signs),
                 &store.regular_norms,
                 &store.regular_residual_norms,
+                &store.regular_slot_scale,
                 *bits,
             )
         }
@@ -298,6 +345,7 @@ pub(super) fn decode_key_rows(
                 &unpack_all(&store.regular_qjl_signs),
                 &store.regular_norms,
                 &store.regular_residual_norms,
+                &store.regular_slot_scale,
                 *regular_bits,
             );
             let outlier = decode_key_component_rows_raw(
@@ -322,6 +370,10 @@ pub(super) fn decode_key_rows(
                     .outlier_residual_norms
                     .as_ref()
                     .expect("TurboQuant key outlier residual_norms missing"),
+                store
+                    .outlier_slot_scale
+                    .as_ref()
+                    .expect("TurboQuant key outlier slot_scale missing"),
                 *outlier_bits,
             );
             let mask = unpack_all(
@@ -396,10 +448,11 @@ pub(super) fn decode_value_rows(
     }
 }
 
-/// Reconstruct key rows from MSE indices + QJL signs + norms.
+/// Reconstruct key rows from MSE indices + QJL signs + norms + slot_scale.
 ///
 /// Formula (per row):
-///   k̃ = Π^T · codebook[idx] · norm + (√(π/2)/D) · Π^T · J^T · sign · residual_norm · norm
+///   k̃ = Π^T · (codebook[idx] · slot_scale) · norm
+///       + (√(π/2)/D) · Π^T · J^T · sign · residual_norm · norm
 #[allow(clippy::needless_range_loop)]
 pub(super) fn decode_key_component_rows_raw(
     core: &TurboQuantCore,
@@ -407,16 +460,27 @@ pub(super) fn decode_key_component_rows_raw(
     qjl_signs: &[u16],
     norms: &[f32],
     residual_norms: &[f32],
+    slot_scale: &[f32],
     key_bits: u8,
 ) -> Vec<f32> {
     let total_rows = norms.len();
     let mse_bits = key_bits.saturating_sub(1);
 
-    // MSE base reconstruction (rotate back from codebook centroids).
+    // MSE base reconstruction: codebook[idx] * slot_scale, then inverse-rotate.
     let mut reconstructed = if mse_bits == 0 {
         vec![0.0; total_rows * core.dim]
     } else {
-        reconstruct_mse_rows(core, indices, mse_bits)
+        let codebook = core.codebook(mse_bits);
+        let mut decoded_rot = vec![0.0f32; total_rows * core.dim];
+        for row_idx in 0..total_rows {
+            let s = slot_scale[row_idx];
+            let start = row_idx * core.dim;
+            let end = start + core.dim;
+            for i in start..end {
+                decoded_rot[i] = codebook[usize::from(indices[i])] * s;
+            }
+        }
+        core.inverse_rotate_rows(&decoded_rot)
     };
 
     // QJL correction term — only if any residual is non-trivial.
