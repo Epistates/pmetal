@@ -997,6 +997,96 @@ mod kvcache {
         );
     }
 
+    // 5-bit Lloyd-Max codebooks are structurally supported (PackedBits +
+    // beta_codebook are bit-width-generic) but were never pinned end-to-end.
+    // These tests validate the cache append → direct attention → dequantize
+    // path produces self-consistent output at 5b for both QJL modes. Phase D
+    // depends on this being a tested first-class config; the fast-path
+    // kernels (4b/5b/6b siblings of the existing q8 fullbyte family) come
+    // later.
+    fn run_uniform_5b_round_trip_at(qjl_mode: super::config::TurboQuantQjlMode, tolerance: f32) {
+        let dim = 16usize;
+        let heads = 2i32;
+        let prefill = 3i32;
+        let config = TurboQuantConfig::uniform(5, 5)
+            .with_recent_window(None)
+            .with_qjl_mode(qjl_mode);
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let step_keys = InlineArray::from_f32_slice(&make_data(step_len, 1.9), &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            4,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < tolerance,
+            "5b ({:?}) direct attention diverged from dequantized sdpa: max_abs_diff={max_abs_diff}",
+            qjl_mode
+        );
+    }
+
+    #[test]
+    fn turboquant_uniform_5b_standard_round_trip_matches_dequantized_sdpa() {
+        // 5b Standard: 4-bit codebook (16 centroids) + 1-bit QJL sign.
+        run_uniform_5b_round_trip_at(super::config::TurboQuantQjlMode::Standard, 1e-4);
+    }
+
+    #[test]
+    fn turboquant_uniform_5b_no_qjl_round_trip_matches_dequantized_sdpa() {
+        // 5b NoQjl (Variant F): full 5-bit codebook (32 centroids), no QJL.
+        run_uniform_5b_round_trip_at(super::config::TurboQuantQjlMode::NoQjl, 1e-4);
+    }
+
     #[test]
     fn turboquant_direct_attention_matches_dequantized_sdpa_uniform() {
         let (seed_cache, queries, step_keys, step_values, scale, b, h, d) =
