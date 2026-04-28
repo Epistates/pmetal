@@ -1074,6 +1074,74 @@ mod kvcache {
         assert!(off_vals.iter().all(|v| v.is_finite()));
     }
 
+    // Phase E.3 NoQjl variant: production targets typically run Variant F
+    // (NoQjl) with outliers, so cover that mode too. Variant F gives the
+    // codebook the full bit-budget (no QJL residual sign), which makes the
+    // body tighter — the override should still cleanly improve the
+    // heavy-tail reconstruction at the same bit-width.
+    #[test]
+    fn turboquant_outliers_per_block_decode_override_no_qjl() {
+        let dim = 16usize;
+        let heads = 1i32;
+        let prefill = 4i32;
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let k_outliers: u8 = 2;
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let mut data = vec![0f32; prefill_len];
+        for slot in 0..(prefill as usize) {
+            for c in 0..dim {
+                let i = slot * dim + c;
+                data[i] = (((i as f32) * 0.07).sin() * 0.3) + (((i as f32) * 0.13).cos() * 0.2);
+            }
+            let s = slot * dim;
+            data[s + slot] += 6.0;
+            data[s + ((slot + 5) % dim)] -= 5.5;
+        }
+        let keys = InlineArray::from_f32_slice(&data, &[b, h, prefill, d]);
+        let values = InlineArray::from_f32_slice(&data, &[b, h, prefill, d]);
+
+        let off_config = TurboQuantConfig::uniform(4, 4)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl);
+        let mut off_cache = QuantizedKvCache::new(off_config);
+        off_cache.append(&keys, &values).expect("off append");
+        let off_dk = off_cache.dequantize_keys().expect("off dequantize_keys");
+        let total = prefill_len;
+        let off_vals: Vec<f32> = off_dk.reshape(&[total as i32]).to_f32_vec(total).unwrap();
+
+        let on_config = TurboQuantConfig::uniform(4, 4)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl)
+            .with_outliers(super::config::TurboQuantOutlierMode::PerBlock { k: k_outliers });
+        let mut on_cache = QuantizedKvCache::new(on_config);
+        on_cache.append(&keys, &values).expect("on append");
+        let on_dk = on_cache.dequantize_keys().expect("on dequantize_keys");
+        let on_vals: Vec<f32> = on_dk.reshape(&[total as i32]).to_f32_vec(total).unwrap();
+
+        let off_mse: f32 = off_vals
+            .iter()
+            .zip(data.iter())
+            .map(|(r, o)| (r - o) * (r - o))
+            .sum::<f32>()
+            / (total as f32);
+        let on_mse: f32 = on_vals
+            .iter()
+            .zip(data.iter())
+            .map(|(r, o)| (r - o) * (r - o))
+            .sum::<f32>()
+            / (total as f32);
+        assert!(
+            on_mse < off_mse * 0.7,
+            "NoQjl + outlier override expected to cut MSE by ≥30%: \
+             off={off_mse} on={on_mse} ratio={}",
+            on_mse / off_mse
+        );
+        assert!(on_vals.iter().all(|v| v.is_finite()));
+    }
+
     // Phase D.2: setting pack_mode = Fullbyte must build the q8_fullbyte_seq
     // shadow buffer at encode time, even when the legacy env-var override
     // (PMETAL_TQ_Q8_FULLBYTE) is unset. Default Bitstream leaves the buffer
