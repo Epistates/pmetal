@@ -1666,6 +1666,50 @@ impl QuantizedKvCache {
         let query_rot = key_core.rotate_array(&query_rows)?;
 
         let kv_rows = (layout.batch * layout.heads) as i32;
+
+        // Variant F uses the full key_bits codebook for keys; values use
+        // their own codebook at value_bits resolution.
+        let key_codebook = key_core.codebook_arr(key_bits)?;
+        let value_codebook = value_core.codebook_arr(value_bits)?;
+
+        // d256 fast path: when the cache populated the seq-major shadows
+        // (`q8_slot_scales_seq` + `d256_rot_values_seq`), reuse the existing
+        // `fullbyte_dense_values_2pass` kernel. It's structurally NoQjl-shaped
+        // already (full 8-bit centroid index, no `query_proj`, no QJL term),
+        // and NoQjl's `k_indices` were quantised from `k_rot / slot_scale` so
+        // the kernel's `score_part *= key_slot_scale` recovers the original
+        // magnitude exactly. Limited to `groups <= 8` (kernel's threadgroup
+        // limit). Falls through to the base `no_qjl_2pass` kernel otherwise.
+        if key_dim == 256 && (q_heads / layout.heads as i32) <= 8 {
+            if let (Some(slot_scales), Some(value_rot_dense)) = (
+                ks.q8_slot_scales_seq.as_ref(),
+                vs.d256_rot_values_seq.as_ref(),
+            ) {
+                let key_indices_seq = ks
+                    .indices
+                    .reshape(&[kv_rows, cache_seq_capacity, key_dim]);
+                if let Some(aggregated_rot) =
+                    InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass(
+                        &query_rot,
+                        &key_indices_seq,
+                        &slot_scales.reshape(&[kv_rows, cache_seq_capacity, 4]),
+                        key_codebook,
+                        &value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]),
+                        q_rows as u32,
+                        n_seq as u32,
+                        cache_seq_capacity as u32,
+                        q_heads as u32,
+                        layout.heads as u32,
+                        scale,
+                    )
+                {
+                    let output_rows =
+                        value_core.inverse_rotate_output_array(&aggregated_rot, output_dtype)?;
+                    return Some(output_rows.reshape(&[batch, q_heads, 1, value_dim]));
+                }
+            }
+        }
+
         let key_norms = ks
             .key_norms_array()?
             .reshape(&[kv_rows, cache_seq_capacity]);
@@ -1683,11 +1727,6 @@ impl QuantizedKvCache {
         let value_norms = vs
             .norms_array()?
             .reshape(&[kv_rows, cache_seq_capacity]);
-
-        // Variant F uses the full key_bits codebook for keys; values use
-        // their own codebook at value_bits resolution.
-        let key_codebook = key_core.codebook_arr(key_bits)?;
-        let value_codebook = value_core.codebook_arr(value_bits)?;
 
         let aggregated_rot = if key_dim == 128 {
             InlineArray::turboquant_attention_q8_d128_no_qjl_2pass(
