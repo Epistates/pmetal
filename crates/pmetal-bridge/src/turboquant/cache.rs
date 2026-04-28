@@ -1870,28 +1870,30 @@ impl QuantizedKvCache {
         let kv_heads = layout.heads as i32;
         let key_dim = queries_f32.dim(3);
         let value_dim = layout.value_dim as i32;
-        // V1 restriction: per-q-row gather requires q_heads == kv_heads so the
-        // stored buffers index 1:1 with the query rows. GQA support is V2.
-        if q_heads != kv_heads {
+        // GQA: q_heads must be a positive multiple of kv_heads. Hamming
+        // pre-filter runs per-q-row via row → kv_row = row / groups inside
+        // the kernel; gather uses flat-index take_axis to pick per-q-row
+        // slot subsets from kv-row-indexed cache buffers without expanding.
+        if kv_heads <= 0 || q_heads <= 0 || (q_heads % kv_heads) != 0 {
             return None;
         }
+        let groups = q_heads / kv_heads;
         if !((key_dim == 128 && value_dim == 128) || (key_dim == 256 && value_dim == 256)) {
             return None;
         }
 
         let q_rows = batch * q_heads;
+        let kv_rows = (layout.batch * layout.heads) as i32;
         let n_seq = self.cold_offset as i32;
         let cache_seq_capacity = ks.cache_seq_capacity();
         if cache_seq_capacity < n_seq {
             return None;
         }
         let packed_dim = (key_dim + 31) / 32;
-        // Top-M defaults to min(cold_offset, 2048). Once threshold-gating
-        // ships, an explicit knob can override this.
-        // top_m = min(cold_offset, 2048) ⇒ top_m ≤ n_seq by construction; the
-        // equal case still exercises the gather path (no-op selection) and is
-        // allowed so smaller-than-2048 caches near the threshold still go
-        // through the dispatch.
+        // Top-M defaults to min(cold_offset, 2048). top_m ≤ n_seq by
+        // construction; the equal case still exercises the gather path
+        // (no-op selection) and is allowed so smaller-than-2048 caches
+        // near the threshold still go through the dispatch.
         let top_m = (self.cold_offset.min(2048)) as i32;
         if top_m <= 0 {
             return None;
@@ -1909,14 +1911,15 @@ impl QuantizedKvCache {
             q_rows as u32,
         )?;
 
-        // 3. Slice cold sign-hash and reshape to [q_rows, n_seq, packed_dim].
-        // Storage shape is [B, H, S_cap, packed_dim].
+        // 3. Slice cold sign-hash. Storage is [B, kv_heads, S_cap, packed_dim].
+        // Reshape to [kv_rows, n_seq, packed_dim] — kernel maps q_row →
+        // kv_row = q_row / groups internally.
         let sign_hash_active = sign_hash
             .slice(
                 &[0, 0, 0, 0],
                 &[layout.batch as i32, kv_heads, n_seq, packed_dim],
             )
-            .reshape(&[q_rows, n_seq, packed_dim]);
+            .reshape(&[kv_rows, n_seq, packed_dim]);
 
         // 4. Hamming distances [q_rows, n_seq] u32.
         let distances = InlineArray::turboquant_hamming_distances(
@@ -1925,6 +1928,7 @@ impl QuantizedKvCache {
             packed_dim as u32,
             q_rows as u32,
             n_seq as u32,
+            groups as u32,
         )?;
 
         // 5. argpartition for the M smallest distances. argpartition pivots
@@ -1933,44 +1937,64 @@ impl QuantizedKvCache {
         let part = distances.argpartition(top_m - 1, -1);
         let top_indices = part.slice(&[0, 0], &[q_rows, top_m]);
 
-        // 6. Gather the packed cache buffers at the selected M slot indices.
-        // Each gather builds a [N, ..., M] tightly-packed scratch buffer; the
-        // kernel then reads it with cache_seq_capacity = M.
-        let kv_rows = (layout.batch * layout.heads) as i32;
-        let key_indices_t = ks
-            .indices_t_array()
-            .reshape(&[kv_rows, key_dim, cache_seq_capacity]);
-        let key_norms = ks
-            .key_norms_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let key_slot_scale = ks
-            .key_slot_scale_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let value_indices_t = vs
+        // 6. Per-q-row gather from kv-row-indexed cache buffers using flat
+        // take_axis: flat_idx[q, m] = (q_row / groups) * S_cap + top[q, m].
+        // For non-GQA (groups=1, q_rows=kv_rows) this is equivalent to the
+        // V1 broadcast take_along_axis. For GQA (groups>1), it correctly
+        // routes each q_row to its kv_row's cache without expanding the
+        // source (which would be O(groups · kv_rows · S_cap · D)).
+        let kv_row_for_q: Vec<i32> = (0..q_rows)
+            .map(|q| (q / groups) * cache_seq_capacity)
+            .collect();
+        let kv_offset = InlineArray::from_i32_slice_shaped(&kv_row_for_q, &[q_rows, 1]);
+        let top_indices_i32 = top_indices.as_dtype(crate::compat::Dtype::Int32.as_i32());
+        let flat_idx_2d = top_indices_i32.add(&kv_offset); // [q_rows, top_m] i32
+
+        // For [kv_rows, key_dim, S_cap]: transpose to [kv_rows, S_cap, key_dim],
+        // flatten to [kv_rows*S_cap, key_dim], take_axis with flat_idx, then
+        // transpose to [q_rows, key_dim, top_m].
+        let key_indices_t = ks.indices_t_array();
+        let key_indices_kvs_d = key_indices_t
+            .reshape(&[kv_rows, key_dim, cache_seq_capacity])
+            .transpose_axes(&[0, 2, 1])
+            .reshape(&[kv_rows * cache_seq_capacity, key_dim]);
+        let gathered_key_indices_t = key_indices_kvs_d
+            .take_axis(&flat_idx_2d, 0) // [q_rows, top_m, key_dim]
+            .transpose_axes(&[0, 2, 1]); // [q_rows, key_dim, top_m]
+
+        let value_indices_kvs_d = vs
             .indices_t_array()?
-            .reshape(&[kv_rows, value_dim, cache_seq_capacity]);
-        let value_norms = vs
+            .reshape(&[kv_rows, value_dim, cache_seq_capacity])
+            .transpose_axes(&[0, 2, 1])
+            .reshape(&[kv_rows * cache_seq_capacity, value_dim]);
+        let gathered_value_indices_t = value_indices_kvs_d
+            .take_axis(&flat_idx_2d, 0)
+            .transpose_axes(&[0, 2, 1]);
+
+        // For [kv_rows, S_cap]: flatten to [kv_rows*S_cap], take_axis with
+        // flat_idx → [q_rows, top_m].
+        let key_norms_flat = ks
+            .key_norms_array()?
+            .reshape(&[kv_rows * cache_seq_capacity]);
+        let gathered_key_norms = key_norms_flat.take_axis(&flat_idx_2d, 0);
+
+        let key_slot_scale_flat = ks
+            .key_slot_scale_array()?
+            .reshape(&[kv_rows * cache_seq_capacity]);
+        let gathered_key_slot_scale = key_slot_scale_flat.take_axis(&flat_idx_2d, 0);
+
+        let value_norms_flat = vs
             .norms_array()?
-            .reshape(&[kv_rows, cache_seq_capacity]);
-
-        let key_idx_2d = top_indices.reshape(&[q_rows, top_m]);
-        let key_idx_for_dim = key_idx_2d
-            .reshape(&[q_rows, 1, top_m])
-            .broadcast_to(&[q_rows, key_dim, top_m]);
-        let value_idx_for_dim = key_idx_2d
-            .reshape(&[q_rows, 1, top_m])
-            .broadcast_to(&[q_rows, value_dim, top_m]);
-
-        let gathered_key_indices_t = key_indices_t.take_along_axis(&key_idx_for_dim, 2);
-        let gathered_key_norms = key_norms.take_along_axis(&key_idx_2d, 1);
-        let gathered_key_slot_scale = key_slot_scale.take_along_axis(&key_idx_2d, 1);
-        let gathered_value_indices_t = value_indices_t.take_along_axis(&value_idx_for_dim, 2);
-        let gathered_value_norms = value_norms.take_along_axis(&key_idx_2d, 1);
+            .reshape(&[kv_rows * cache_seq_capacity]);
+        let gathered_value_norms = value_norms_flat.take_axis(&flat_idx_2d, 0);
 
         let key_codebook = key_core.codebook_arr(key_bits)?;
         let value_codebook = value_core.codebook_arr(value_bits)?;
 
         // 7. Run the existing Variant F kernel on the gathered subset.
+        // Each q_row now has its own slice; pass q_heads = kv_heads = q_heads
+        // so the kernel treats the gathered cache as 1:1 (groups=1 inside
+        // the score kernel — GQA was already resolved during gather).
         let aggregated_rot = if key_dim == 128 {
             InlineArray::turboquant_attention_q8_d128_no_qjl_2pass(
                 &query_rot,
@@ -1985,7 +2009,7 @@ impl QuantizedKvCache {
                 top_m as u32,
                 top_m as u32,
                 q_heads as u32,
-                layout.heads as u32,
+                q_heads as u32,
                 scale,
             )?
         } else {
@@ -2002,7 +2026,7 @@ impl QuantizedKvCache {
                 top_m as u32,
                 top_m as u32,
                 q_heads as u32,
-                layout.heads as u32,
+                q_heads as u32,
                 scale,
             )?
         };

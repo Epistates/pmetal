@@ -283,20 +283,22 @@ impl InlineArray {
         }
     }
 
-    /// Phase F: XOR + popcount Hamming distance from a per-row query sign
-    /// hash to a `[N, S, packed_dim]` cache of key sign hashes. Output:
-    /// `[N, S]` u32 — Hamming distance per (row, slot), in range `[0, D]`.
+    /// Phase F: XOR + popcount Hamming distance from a per-q-row query sign
+    /// hash to a `[kv_rows, S, packed_dim]` cache of key sign hashes. Output:
+    /// `[N, S]` u32 — Hamming distance per (q_row, slot), in range `[0, D]`.
     /// Pre-filter caller picks the M slots with the smallest distances and
     /// runs exact attention on those M only (sparse score path).
     ///
-    /// - `query_signs`: `[N, packed_dim]` uint32
-    /// - `key_signs`:   `[N, S, packed_dim]` uint32
+    /// - `query_signs`: `[N, packed_dim]` uint32                    (N = q_rows)
+    /// - `key_signs`:   `[kv_rows, S, packed_dim]` uint32           (kv_rows = N / groups)
+    /// - `groups`: `q_heads / kv_heads`. Pass `1` for non-GQA models.
     pub fn turboquant_hamming_distances(
         query_signs: &Self,
         key_signs: &Self,
         packed_dim: u32,
         n_rows: u32,
         n_seq: u32,
+        groups: u32,
     ) -> Option<Self> {
         let mut out = MaybeUninit::<RawBuf>::uninit();
         let rc = unsafe {
@@ -307,6 +309,7 @@ impl InlineArray {
                 packed_dim,
                 n_rows,
                 n_seq,
+                groups,
             )
         };
         if rc == 0 {

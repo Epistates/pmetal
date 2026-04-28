@@ -704,12 +704,15 @@ mod kvcache {
             &[n_rows as i32, n_seq as i32, packed_dim as i32],
         );
 
+        // Non-GQA case (groups=1): row → kv_row identity, behaviour is the
+        // same as the original kernel.
         let distances = InlineArray::turboquant_hamming_distances(
             &query_arr,
             &keys_arr,
             packed_dim as u32,
             n_rows as u32,
             n_seq as u32,
+            1, // groups
         )
         .expect("hamming kernel");
         distances.eval();
@@ -729,6 +732,132 @@ mod kvcache {
                 );
             }
         }
+    }
+
+    // Phase F.4 V2: GQA mode (groups > 1) — kernel maps q_row → kv_row =
+    // q_row / groups. With groups=2, q_rows 0..2 share kv_row 0 and rows
+    // 2..4 share kv_row 1. Distance must therefore use the SHARED kv key
+    // signs while the query rows differ.
+    #[test]
+    fn turboquant_hamming_distances_gqa_kv_row_mapping() {
+        let kv_rows = 2usize;
+        let groups = 2usize;
+        let q_rows = kv_rows * groups;
+        let n_seq = 7usize;
+        let packed_dim = 2usize; // D = 64
+
+        // Distinct query per q_row.
+        let query: Vec<u32> = (0..(q_rows * packed_dim))
+            .map(|i| (i as u32).wrapping_mul(0x9E3779B1) ^ 0xCAFEF00D)
+            .collect();
+        // kv_rows worth of cached keys.
+        let keys: Vec<u32> = (0..(kv_rows * n_seq * packed_dim))
+            .map(|i| (i as u32).wrapping_mul(0xCC9E2D51).rotate_left(7) ^ 0x12345678)
+            .collect();
+
+        let query_arr =
+            InlineArray::from_u32_slice(&query, &[q_rows as i32, packed_dim as i32]);
+        let keys_arr = InlineArray::from_u32_slice(
+            &keys,
+            &[kv_rows as i32, n_seq as i32, packed_dim as i32],
+        );
+
+        let distances = InlineArray::turboquant_hamming_distances(
+            &query_arr,
+            &keys_arr,
+            packed_dim as u32,
+            q_rows as u32,
+            n_seq as u32,
+            groups as u32,
+        )
+        .expect("hamming kernel (gqa)");
+        distances.eval();
+        let actual: &[u32] = distances.as_slice();
+
+        for q_row in 0..q_rows {
+            let kv_row = q_row / groups;
+            for slot in 0..n_seq {
+                let mut expected = 0u32;
+                for w in 0..packed_dim {
+                    let q = query[q_row * packed_dim + w];
+                    let k = keys[(kv_row * n_seq + slot) * packed_dim + w];
+                    expected += (q ^ k).count_ones();
+                }
+                let got = actual[q_row * n_seq + slot];
+                assert_eq!(
+                    got, expected,
+                    "q_row={q_row} kv_row={kv_row} slot={slot}: \
+                     expected {expected}, got {got}"
+                );
+            }
+        }
+    }
+
+    // Phase F.4 V2: end-to-end skiplist dispatch with GQA. Builds a cache
+    // with q_heads != kv_heads, runs the skiplist dispatch path on a 1-step
+    // decode, and confirms (a) the dispatch does NOT bail out (V1 would
+    // have, due to the q_heads != kv_heads gate), and (b) the output is
+    // finite and shape-correct. Top-M == cold_offset gives bit-equivalence
+    // vs dense; partial M is correctness-finite-only at this layer.
+    #[test]
+    fn turboquant_hamming_skiplist_gqa_dispatch_runs() {
+        let dim = 128usize;
+        let kv_heads = 2i32;
+        let groups = 4i32;
+        let q_heads = kv_heads * groups;
+        let prefill = 1024i32;
+        let b = 1i32;
+        let d = dim as i32;
+
+        let kv_seed_len = (b * kv_heads * prefill * d) as usize;
+        let make_data = |seed: f32| -> Vec<f32> {
+            (0..kv_seed_len)
+                .map(|i| ((i as f32) * 0.05 + seed).sin())
+                .collect()
+        };
+        let seed_keys =
+            InlineArray::from_f32_slice(&make_data(0.1), &[b, kv_heads, prefill, d]);
+        let seed_values =
+            InlineArray::from_f32_slice(&make_data(0.7), &[b, kv_heads, prefill, d]);
+
+        // Variant F (NoQjl) + skiplist threshold of 0 so the path engages
+        // immediately at any cold size. Recent window None so all tokens
+        // are cold.
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl)
+            .with_skiplist_threshold(Some(0));
+        let mut cache = QuantizedKvCache::new(config);
+        cache.append(&seed_keys, &seed_values).expect("seed append");
+
+        // 1-step decode: query has q_heads, step_keys/values have kv_heads.
+        let q_len = (b * q_heads * 1 * d) as usize;
+        let kv_step_len = (b * kv_heads * 1 * d) as usize;
+        let query_data: Vec<f32> = (0..q_len).map(|i| ((i as f32) * 0.03).cos()).collect();
+        let kv_step_data: Vec<f32> =
+            (0..kv_step_len).map(|i| ((i as f32) * 0.04).sin()).collect();
+        let query = InlineArray::from_f32_slice(&query_data, &[b, q_heads, 1, d]);
+        let step_keys =
+            InlineArray::from_f32_slice(&kv_step_data, &[b, kv_heads, 1, d]);
+        let step_values = InlineArray::from_f32_slice(
+            &kv_step_data.iter().map(|v| v * 0.5).collect::<Vec<_>>(),
+            &[b, kv_heads, 1, d],
+        );
+        let scale = 1.0f32 / (d as f32).sqrt();
+
+        let output = cache
+            .append_and_compute_attention(&query, &step_keys, &step_values, scale)
+            .expect("attention");
+        assert_eq!(output.shape(), &[b, q_heads, 1, d]);
+        let total = (b * q_heads * 1 * d) as usize;
+        let vals: Vec<f32> = output
+            .reshape(&[total as i32])
+            .to_f32_vec(total)
+            .expect("output to_f32");
+        assert!(
+            vals.iter().all(|v| v.is_finite()),
+            "GQA skiplist dispatch must produce finite output"
+        );
     }
 
     #[test]

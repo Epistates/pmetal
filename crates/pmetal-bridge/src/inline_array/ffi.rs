@@ -639,6 +639,7 @@ unsafe extern "C" {
         packed_dim: u32,
         n_rows: u32,
         n_seq: u32,
+        groups: u32,
     ) -> i32;
 
     pub(super) fn mlx_inline_turboquant_pack_q8_keybytes(
