@@ -2038,7 +2038,12 @@ impl QuantizedKvCache {
             0
         };
         let query_rows = queries_f32.reshape(&[q_rows, key_dim]);
-        let can_try_q8_fullbyte = turboquant_q8_fullbyte_enabled()
+        // Phase D.2: pack_mode = Fullbyte enables the long-context fullbyte
+        // path the same way the env-var debug override does — both are valid
+        // ways to opt in.
+        let pack_mode_fullbyte =
+            matches!(self.config.pack_mode, super::TurboQuantPackMode::Fullbyte);
+        let can_try_q8_fullbyte = (turboquant_q8_fullbyte_enabled() || pack_mode_fullbyte)
             && key_bits == 8
             && value_bits == 8
             && key_dim == 256

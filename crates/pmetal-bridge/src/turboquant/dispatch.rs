@@ -259,7 +259,17 @@ pub(super) fn gpu_quantize_kv(
         };
         (Some(k_qjl_signs), k_qjl_signs_t, q8_keybytes_t, q8_keybytes_seq)
     };
-    let q8_fullbyte_seq = if use_q8_seq_shadow && turboquant_q8_fullbyte_enabled() {
+    // Phase D.2: build the q8 fullbyte shadow when EITHER (a) the
+    // PMETAL_TQ_Q8_FULLBYTE env-var is set (debug override), or (b) the
+    // active config asks for it via `pack_mode = Fullbyte`. The fullbyte
+    // path is currently only realised for q8/d256 (see use_q8_seq_shadow);
+    // non-8b widths request fullbyte but stay on the bitstream path until a
+    // follow-up phase widens the score kernel for variable codebook sizes.
+    let pack_mode_fullbyte =
+        matches!(config.pack_mode, super::TurboQuantPackMode::Fullbyte);
+    let q8_fullbyte_seq = if use_q8_seq_shadow
+        && (turboquant_q8_fullbyte_enabled() || pack_mode_fullbyte)
+    {
         k_core
             .gpu_quantize_mse(&k_rot, 8)
             .map(|indices| indices.as_dtype(Dtype::Uint8.as_i32()))

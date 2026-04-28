@@ -883,6 +883,74 @@ mod kvcache {
         );
     }
 
+    // Phase D.2: setting pack_mode = Fullbyte must build the q8_fullbyte_seq
+    // shadow buffer at encode time, even when the legacy env-var override
+    // (PMETAL_TQ_Q8_FULLBYTE) is unset. Default Bitstream leaves the buffer
+    // None so existing call sites pay no extra allocation.
+    #[test]
+    fn turboquant_pack_mode_fullbyte_populates_q8_fullbyte_seq() {
+        // q8 / d256 uniform is the only currently-realised fullbyte path
+        // (use_q8_seq_shadow gate). Other configs accept pack_mode = Fullbyte
+        // but stay on the bitstream path until the kernel is widened.
+        let dim = 256usize;
+        let heads = 1i32;
+        let prefill = 4i32;
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let make_data = |seed: f32| -> Vec<f32> {
+            (0..prefill_len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin())
+                .collect()
+        };
+        let keys = InlineArray::from_f32_slice(&make_data(0.2), &[b, h, prefill, d]);
+        let values = InlineArray::from_f32_slice(&make_data(0.7), &[b, h, prefill, d]);
+
+        // Default (Bitstream): no fullbyte shadow.
+        let bitstream_config = TurboQuantConfig::uniform(8, 8).with_recent_window(None);
+        let mut bitstream_cache = QuantizedKvCache::new(bitstream_config);
+        bitstream_cache
+            .append(&keys, &values)
+            .expect("bitstream append");
+        let bitstream_gpu = bitstream_cache
+            .keys
+            .as_ref()
+            .and_then(|k| k.gpu.as_ref())
+            .expect("uniform should produce a GpuKeyStore");
+        // Note: env-var is not set in cargo test by default, so q8_fullbyte_seq
+        // must be None for the bitstream config.
+        if std::env::var_os("PMETAL_TQ_Q8_FULLBYTE").is_none() {
+            assert!(
+                bitstream_gpu.q8_fullbyte_seq.is_none(),
+                "pack_mode = Bitstream + env-var unset must NOT allocate q8_fullbyte_seq"
+            );
+        }
+
+        // Fullbyte: shadow present regardless of env-var.
+        let fullbyte_config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_pack_mode(super::config::TurboQuantPackMode::Fullbyte);
+        let mut fullbyte_cache = QuantizedKvCache::new(fullbyte_config);
+        fullbyte_cache
+            .append(&keys, &values)
+            .expect("fullbyte append");
+        let fullbyte_gpu = fullbyte_cache
+            .keys
+            .as_ref()
+            .and_then(|k| k.gpu.as_ref())
+            .expect("uniform should produce a GpuKeyStore");
+        let fullbyte_seq = fullbyte_gpu
+            .q8_fullbyte_seq
+            .as_ref()
+            .expect("pack_mode = Fullbyte must allocate q8_fullbyte_seq");
+        assert_eq!(fullbyte_seq.dim(0), b);
+        assert_eq!(fullbyte_seq.dim(1), h);
+        assert_eq!(fullbyte_seq.dim(2), prefill);
+        assert_eq!(fullbyte_seq.dim(3), d);
+    }
+
     // Phase F.4 partial-selection smoke: cold_offset > 2048 forces top_m < n_seq
     // (real Hamming pre-filter selection, not a no-op). Asserts the dispatch
     // returns a finite output of the correct shape — exact agreement vs dense
