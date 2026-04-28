@@ -1033,6 +1033,7 @@ fn turboquant_config_from_mode(
             values: bridge_turboquant_tensor_config(config.values),
             recent_window: config.recent_window,
             qjl: bridge_turboquant_qjl_mode(config.qjl),
+            skiplist_threshold: config.skiplist_threshold,
         }),
         _ => None,
     }
@@ -1278,6 +1279,7 @@ impl TurboQuantPreset {
             values: value_config,
             recent_window: Some(pmetal_mlx::kv_cache::DEFAULT_RECENT_WINDOW),
             qjl: Default::default(),
+            skiplist_threshold: None,
         }
     }
 }
@@ -1833,6 +1835,7 @@ mod tests {
             values: TurboQuantConfig::preset_q2_5(128).values,
             recent_window: Some(pmetal_mlx::kv_cache::DEFAULT_RECENT_WINDOW),
             qjl: Default::default(),
+            skiplist_threshold: None,
         };
         assert_eq!(mode, CacheMode::TurboQuant { config: expected });
     }

@@ -497,6 +497,7 @@ mod kvcache {
                 outlier_count: 4,
             },
             recent_window: None,
+            skiplist_threshold: None,
         };
         let mut cpu_cache = QuantizedKvCache::new(cpu_config);
         cpu_cache.append(&keys_arr, &vals_arr).expect("CPU append");

@@ -178,6 +178,12 @@ pub struct TurboQuantConfig {
     pub recent_window: Option<usize>,
     /// QJL residual mode. See [`TurboQuantQjlMode`].
     pub qjl: TurboQuantQjlMode,
+    /// Cold-store length above which the 1-bit Hamming skip-list pre-filter
+    /// engages on the bridge side. `None` (default) keeps the full-cold
+    /// score path. This crate doesn't itself implement the pre-filter — it
+    /// just propagates the threshold to `pmetal-bridge` via the FFI mirror
+    /// so a single config object covers both backends.
+    pub skiplist_threshold: Option<usize>,
 }
 
 impl TurboQuantConfig {
@@ -188,6 +194,7 @@ impl TurboQuantConfig {
             values: TurboQuantTensorConfig::uniform(value_bits),
             recent_window: Some(DEFAULT_RECENT_WINDOW),
             qjl: TurboQuantQjlMode::Standard,
+            skiplist_threshold: None,
         }
     }
 
@@ -213,6 +220,7 @@ impl TurboQuantConfig {
             ),
             recent_window: Some(DEFAULT_RECENT_WINDOW),
             qjl: TurboQuantQjlMode::Standard,
+            skiplist_threshold: None,
         }
     }
 
@@ -226,6 +234,13 @@ impl TurboQuantConfig {
     /// Override the QJL residual mode.
     pub const fn with_qjl_mode(mut self, qjl: TurboQuantQjlMode) -> Self {
         self.qjl = qjl;
+        self
+    }
+
+    /// Enable or disable the 1-bit Hamming skip-list pre-filter (delegated
+    /// to pmetal-bridge). `None` keeps the full-cold score path.
+    pub const fn with_skiplist_threshold(mut self, threshold: Option<usize>) -> Self {
+        self.skiplist_threshold = threshold;
         self
     }
 

@@ -161,6 +161,14 @@ pub struct TurboQuantConfig {
     /// `NoQjl` (Variant F) drops the QJL term and reclaims its bit for the
     /// codebook. See [`TurboQuantQjlMode`] for the trade-offs.
     pub qjl: TurboQuantQjlMode,
+    /// Cold-store length above which the 1-bit Hamming skip-list pre-filter
+    /// kicks in. `None` (default) keeps the full-cold-store score path. When
+    /// set, encode also packs `sign(rotated)` into a per-slot hash buffer
+    /// and `append_and_compute_attention` uses XOR + popcount to pick the
+    /// top-M candidate slots before running exact attention on those M only.
+    /// Suggested value: ~32_768; anything below `recent_window + threshold`
+    /// stays on the existing fast path.
+    pub skiplist_threshold: Option<usize>,
 }
 
 impl TurboQuantConfig {
@@ -171,6 +179,7 @@ impl TurboQuantConfig {
             values: TurboQuantTensorConfig::uniform(value_bits),
             recent_window: Some(DEFAULT_RECENT_WINDOW),
             qjl: TurboQuantQjlMode::Standard,
+            skiplist_threshold: None,
         }
     }
 
@@ -196,6 +205,7 @@ impl TurboQuantConfig {
             ),
             recent_window: Some(DEFAULT_RECENT_WINDOW),
             qjl: TurboQuantQjlMode::Standard,
+            skiplist_threshold: None,
         }
     }
 
@@ -210,6 +220,14 @@ impl TurboQuantConfig {
     /// quality / memory trade-off.
     pub const fn with_qjl_mode(mut self, qjl: TurboQuantQjlMode) -> Self {
         self.qjl = qjl;
+        self
+    }
+
+    /// Enable or disable the 1-bit Hamming skip-list pre-filter. Pass
+    /// `Some(threshold)` to engage at cold-store lengths >= threshold;
+    /// `None` (default) keeps the full-cold-store score path.
+    pub const fn with_skiplist_threshold(mut self, threshold: Option<usize>) -> Self {
+        self.skiplist_threshold = threshold;
         self
     }
 

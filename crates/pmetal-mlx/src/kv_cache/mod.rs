@@ -242,6 +242,7 @@ pub fn sanitize_turboquant_config(
         values: sanitize_turboquant_tensor_config(value_head_dim, config.values),
         recent_window: config.recent_window,
         qjl: config.qjl,
+        skiplist_threshold: config.skiplist_threshold,
     }
 }
 
