@@ -202,19 +202,24 @@ pub(super) fn gpu_quantize_kv(
     // path for NoQjl goes through dequantize+SDPA (which is qjl-aware via
     // residual_norms) so the GPU score kernels never read them.
     let packed_dim = packed_qjl_words(k_core.dim) as i32;
-    // Phase D.3.1: at d256 NoQjl, the existing q8 fullbyte_dense_values_2pass
-    // score kernel is structurally bit-width-agnostic — it indexes a
-    // 256-entry codebook by u8. Widen the seq-shadow gate to cover
-    // `key_bits in 4..=8` for NoQjl so encode produces the same
+    // Phase D.3.1 / Phase G: at d256 NoQjl, the existing q8
+    // fullbyte_dense_values_2pass score kernel is structurally bit-width-
+    // agnostic — it indexes a 256-entry codebook by u8. Widen the seq-shadow
+    // gate to cover `key_bits in 2..=8` for NoQjl so encode produces the same
     // {ks.indices, q8_slot_scales_seq, vs.d256_rot_values_seq} surface the
-    // 8-bit fast path already consumes. Standard QJL stays 8-bit-only on
-    // this path because `q8_keybytes_seq` packs the QJL sign bit into the
-    // top bit of each byte and depends on a 7-bit codebook. Values stay at
-    // 8-bit (bf16 dense storage) regardless of key_bits.
+    // 8-bit fast path already consumes. Phase G extends from 4..=8 to 2..=8
+    // since the codebook math (Lloyd-Max on Beta) and 256-padded view both
+    // work at any 1..=8 bits, and the 2..=3-bit body paired with Variant G
+    // top-K outliers (Phase E.3) catches the heavy tail the codebook can't
+    // represent — beats quant.cpp's 1+1 sign-hash 2-bit at similar bit
+    // budget. Standard QJL stays 8-bit-only because `q8_keybytes_seq` packs
+    // the QJL sign bit into the top bit of each byte and depends on a 7-bit
+    // codebook. Values stay at 8-bit (bf16 dense storage) regardless of
+    // key_bits.
     let no_qjl_d256_widened = no_qjl
         && k_core.dim == 256
         && v_core.dim == 256
-        && (4..=8).contains(&key_bits)
+        && (2..=8).contains(&key_bits)
         && val_bits == 8;
     let use_q8_seq_shadow = (key_bits == 8 && k_core.dim == 256 && v_core.dim == 256)
         || no_qjl_d256_widened;
@@ -355,13 +360,28 @@ pub(super) fn gpu_quantize_kv(
     // path is currently only realised for q8/d256 (see use_q8_seq_shadow);
     // non-8b widths request fullbyte but stay on the bitstream path until a
     // follow-up phase widens the score kernel for variable codebook sizes.
+    //
+    // Phase D.3+ correctness: quantise from `k_rot_scaled` (= k_rot_body /
+    // slot_scale) so the score kernel's `score_part *= key_slot_scale` step
+    // recovers the original-magnitude rotated value. Quantising un-scaled
+    // `k_rot` here would produce indices that fold a per-row magnitude into
+    // the codebook hit, then double-multiply at score time — silent quality
+    // regression at non-trivial slot_scale.
+    //
+    // NoQjl skips this allocation entirely: `try_gpu_uniform_attention_no_qjl`
+    // reads `ks.indices` directly (which already hold k_rot_scaled at
+    // key_mse_bits = key_bits), so q8_fullbyte_seq would be dead storage —
+    // identical to ks.indices at 8b, and a separate 8b view at 4..=7b widths
+    // (still unconsumed). Dropping the allocation saves D bytes per slot
+    // for the NoQjl + d256 + 4..=8b configs that would otherwise pay it.
     let pack_mode_fullbyte =
         matches!(config.pack_mode, super::TurboQuantPackMode::Fullbyte);
     let q8_fullbyte_seq = if use_q8_seq_shadow
+        && !no_qjl
         && (turboquant_q8_fullbyte_enabled() || pack_mode_fullbyte)
     {
         k_core
-            .gpu_quantize_mse(&k_rot, 8)
+            .gpu_quantize_mse(&k_rot_scaled, 8)
             .map(|indices| indices.as_dtype(Dtype::Uint8.as_i32()))
     } else {
         None

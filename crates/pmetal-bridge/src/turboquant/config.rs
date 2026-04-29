@@ -223,6 +223,49 @@ pub const DEFAULT_RECENT_WINDOW: usize = 8192;
 /// so behavior between the two paths stays uniform.
 pub(super) const HOT_EVICTION_CHUNK: usize = 1024;
 
+/// Phase H — progressive 3-tier cache configuration.
+///
+/// Layered on top of the existing 2-tier (hot fp16 ring + cold compressed
+/// store), the warm tier sits between them: hot-evicted tokens flow into a
+/// warm cold-store at higher quality (e.g. 4-bit + outliers) while older
+/// slots migrate down to the lower-quality cold store (e.g. 2-bit +
+/// outliers). The result is a quality-adaptive cache: recent context stays
+/// fp16, mid-recency context retains high reconstruction fidelity, deep
+/// history pays maximum compression for memory savings.
+///
+/// `window` is the warm-tier capacity; once the warm store holds more than
+/// this many slots the oldest `WARM_EVICTION_CHUNK` are dequantised and
+/// re-quantised into cold at `cold_keys`/`cold_values` precision (the
+/// outer `TurboQuantConfig.keys`/`.values`).
+///
+/// `None` keeps the legacy 2-tier behavior (everything compresses straight
+/// into the existing cold store).
+///
+/// Distinct from quant.cpp's `tq_progressive` which uses fixed Q4/Q3
+/// uniform: the TurboQuant slot_scale + Variant G outliers + RHT compose at
+/// every tier, so the per-age precision steps remain quality-superior to
+/// the reference's 3-tier scheme at matched bits-per-element.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TurboQuantWarmTier {
+    /// Warm-tier slot capacity. Older slots migrate to cold beyond this.
+    pub window: usize,
+    /// Warm-tier key precision (typically higher quality than cold keys).
+    pub keys: TurboQuantTensorConfig,
+    /// Warm-tier value precision.
+    pub values: TurboQuantTensorConfig,
+}
+
+impl TurboQuantWarmTier {
+    /// Symmetric warm preset: same bit-width for keys and values.
+    pub const fn uniform(window: usize, key_bits: u8, value_bits: u8) -> Self {
+        Self {
+            window,
+            keys: TurboQuantTensorConfig::uniform(key_bits),
+            values: TurboQuantTensorConfig::uniform(value_bits),
+        }
+    }
+}
+
 /// Full K/V TurboQuant configuration — one config per tensor type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TurboQuantConfig {
@@ -255,6 +298,12 @@ pub struct TurboQuantConfig {
     /// indices for minimum memory; `Fullbyte` uses one byte per index
     /// for SIMD-friendly score-kernel reads at non-8-bit widths.
     pub pack_mode: TurboQuantPackMode,
+    /// Phase H — warm tier between hot fp16 and cold compressed. `None`
+    /// (default) keeps the 2-tier behaviour. When `Some`, hot evictions go
+    /// to a warm store at the warm-tier precision, and warm slots migrate
+    /// to the cold store (sized at `keys`/`values` precision) once the
+    /// warm window overflows. See [`TurboQuantWarmTier`].
+    pub warm_tier: Option<TurboQuantWarmTier>,
 }
 
 impl TurboQuantConfig {
@@ -268,6 +317,7 @@ impl TurboQuantConfig {
             skiplist_threshold: None,
             outliers: TurboQuantOutlierMode::None,
             pack_mode: TurboQuantPackMode::Bitstream,
+            warm_tier: None,
         }
     }
 
@@ -296,6 +346,7 @@ impl TurboQuantConfig {
             skiplist_threshold: None,
             outliers: TurboQuantOutlierMode::None,
             pack_mode: TurboQuantPackMode::Bitstream,
+            warm_tier: None,
         }
     }
 
@@ -331,6 +382,13 @@ impl TurboQuantConfig {
     /// Override centroid-index storage layout. See [`TurboQuantPackMode`].
     pub const fn with_pack_mode(mut self, mode: TurboQuantPackMode) -> Self {
         self.pack_mode = mode;
+        self
+    }
+
+    /// Phase H: enable the warm tier between hot fp16 and cold compressed.
+    /// See [`TurboQuantWarmTier`] for the eviction semantics.
+    pub const fn with_warm_tier(mut self, warm: Option<TurboQuantWarmTier>) -> Self {
+        self.warm_tier = warm;
         self
     }
 

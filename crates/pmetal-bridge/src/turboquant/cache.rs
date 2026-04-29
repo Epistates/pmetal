@@ -36,9 +36,11 @@ pub struct QuantizedKvCache {
     pub values: Option<QuantizedValueStore>,
     /// Layout from the first append (batch, heads, key_dim, value_dim).
     layout: Option<CacheLayout>,
-    /// Total cached positions (cold + hot). Public for compatibility with
-    /// callers that still read it directly. Maintained as the invariant
-    /// `offset == cold_offset + hot_offset` after every append/rollback.
+    /// Total cached positions (cold + warm + hot). Public for compatibility
+    /// with callers that still read it directly. Maintained as the invariant
+    /// `offset == cold_offset + warm_offset + hot_offset` after every
+    /// append/rollback. `warm_offset` is the warm sub-cache's `offset` (or 0
+    /// when the warm tier is disabled).
     pub offset: usize,
     /// Tokens currently sitting compressed in the cold stores. The GPU
     /// uniform attention kernels score against `cold_offset` slots.
@@ -59,6 +61,13 @@ pub struct QuantizedKvCache {
     pub config: TurboQuantConfig,
     /// Shared pre-computed matrices and codebooks.
     pub state: Option<Arc<TurboQuantState>>,
+    /// Phase H — warm tier between hot fp16 and cold compressed. When
+    /// `config.warm_tier.is_some()`, hot evictions feed this nested cache
+    /// (no hot ring of its own — `recent_window: None`). Once `warm.offset`
+    /// exceeds `config.warm_tier.window`, the entire warm contents are
+    /// dequantised and re-quantised into the outer cold store, and the
+    /// warm sub-cache is reset. Boxed to break the recursive type cycle.
+    pub(super) warm: Option<Box<QuantizedKvCache>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -84,6 +93,23 @@ impl QuantizedKvCache {
     /// Create an empty cache.  `state` should be `None` on first use; call
     /// `append` to populate.
     pub fn new(config: TurboQuantConfig) -> Self {
+        // Phase H: when a warm tier is configured, allocate a nested cache
+        // with the warm precision and the hot ring disabled. Hot evictions
+        // feed this sub-cache; warm migrations dequantise+re-encode out of
+        // it into the outer cold store.
+        let warm = config.warm_tier.map(|warm_cfg| {
+            let warm_inner_config = TurboQuantConfig {
+                keys: warm_cfg.keys,
+                values: warm_cfg.values,
+                recent_window: None, // warm has no hot ring
+                qjl: config.qjl,
+                skiplist_threshold: None, // skiplist sits at the outer (cold) tier
+                outliers: config.outliers,
+                pack_mode: config.pack_mode,
+                warm_tier: None, // no nested-nested warming
+            };
+            Box::new(QuantizedKvCache::new(warm_inner_config))
+        });
         Self {
             keys: None,
             values: None,
@@ -96,6 +122,7 @@ impl QuantizedKvCache {
             hot_dtype: None,
             config,
             state: None,
+            warm,
         }
     }
 
@@ -127,6 +154,9 @@ impl QuantizedKvCache {
         self.offset = 0;
         self.cold_offset = 0;
         self.hot_offset = 0;
+        if let Some(warm) = self.warm.as_mut() {
+            warm.reset();
+        }
     }
 
     /// Number of tokens currently held uncompressed in the hot ring.
@@ -137,6 +167,40 @@ impl QuantizedKvCache {
     /// Number of tokens that have been compressed into the cold stores.
     pub fn cold_len(&self) -> usize {
         self.cold_offset
+    }
+
+    /// Phase H: number of tokens currently in the warm sub-cache (0 when
+    /// warm tier is disabled).
+    pub fn warm_len(&self) -> usize {
+        self.warm.as_ref().map(|w| w.offset).unwrap_or(0)
+    }
+
+    /// Phase I — COW fork of the cache. Returns an independent
+    /// `QuantizedKvCache` that shares the underlying MLX storage with
+    /// `self` until either side mutates (i.e. appends).
+    ///
+    /// `kv_cache_append` always returns a *new* `InlineArray` rather than
+    /// mutating in place, and MLX arrays are reference-counted under the
+    /// hood, so the clone is O(layers) ref-count bumps — orders of
+    /// magnitude cheaper than dequantising and re-encoding the prefix.
+    ///
+    /// This is the pmetal equivalent of vLLM's PagedAttention prefix
+    /// sharing for the *single-sequence* case: any number of forks can
+    /// hold the same cached prefix, and only the appended suffix per
+    /// fork costs new memory. It does NOT yet integrate with
+    /// `ServePrefixCache` — that work belongs in pmetal-serve and is the
+    /// follow-up to wire this primitive into the cross-request prefix
+    /// share path.
+    ///
+    /// Mutating semantics: after `fork()`, `self` and the returned
+    /// cache are fully independent. Appends to one do not appear in
+    /// the other. Reading either side is identical until divergence.
+    pub fn fork(&self) -> Self {
+        // Clone is already O(layers) MLX-arc bumps (see InlineArray::Clone
+        // → mlx_inline_init_copy, which is a ref-count increment) — no
+        // deep-copy on either side. The recursive `warm` field clones
+        // its own state via the same mechanism.
+        self.clone()
     }
 
     /// Hot-ring capacity = `recent_window + HOT_EVICTION_CHUNK` when the
@@ -178,7 +242,7 @@ impl QuantizedKvCache {
         match self.config.recent_window {
             None => {
                 self.compress_into_cold(keys, values, layout, seq_len)?;
-                self.offset = self.cold_offset + self.hot_offset;
+                self.offset = self.cold_offset + self.warm_len() + self.hot_offset;
                 Ok(())
             }
             Some(window) => self.append_with_recent_window(keys, values, layout, seq_len, window),
@@ -458,7 +522,7 @@ impl QuantizedKvCache {
             );
         }
         self.hot_offset += seq_len;
-        self.offset = self.cold_offset + self.hot_offset;
+        self.offset = self.cold_offset + self.warm_len() + self.hot_offset;
 
         // Drain the oldest tokens once the ring fills past `window + chunk`.
         // Eviction is amortized: each call moves `min(overflow, chunk)` tokens
@@ -545,7 +609,61 @@ impl QuantizedKvCache {
         };
 
         // Phase 2: mutate. The borrows above are dropped.
-        self.compress_into_cold(&evict_keys, &evict_values, layout, evict_seq)?;
+        // Phase H: when a warm tier is configured, hot evictions feed the
+        // warm sub-cache instead of going straight to cold. The warm
+        // sub-cache itself has `recent_window: None`, so its `append` runs
+        // straight through `compress_into_cold` at warm precision. Once the
+        // warm sub-cache holds more than `warm_window` slots, dequantise
+        // its full contents and re-quantise into the outer cold store at
+        // cold precision (`config.keys`/`config.values`), then reset warm.
+        // Result: oldest=cold, mid=warm, newest=hot — true 3-tier ordering.
+        if self.warm.is_some() {
+            // Tier-1 ingest: warm sub-cache (no nested hot ring).
+            self.warm
+                .as_mut()
+                .expect("warm checked Some")
+                .append(&evict_keys, &evict_values)?;
+
+            // Tier-2 migration on overflow.
+            let warm_window = self
+                .config
+                .warm_tier
+                .expect("warm_tier mirrors warm.is_some")
+                .window;
+            let warm_offset = self.warm.as_ref().expect("warm Some").offset;
+            if warm_offset > warm_window {
+                let warm_keys_full = self
+                    .warm
+                    .as_ref()
+                    .expect("warm Some")
+                    .dequantize_keys()
+                    .ok_or_else(|| {
+                        "TurboQuant warm tier: dequantize_keys returned None during \
+                         migration to cold"
+                            .to_string()
+                    })?;
+                let warm_values_full = self
+                    .warm
+                    .as_ref()
+                    .expect("warm Some")
+                    .dequantize_values()
+                    .ok_or_else(|| {
+                        "TurboQuant warm tier: dequantize_values returned None during \
+                         migration to cold"
+                            .to_string()
+                    })?;
+                let warm_count = warm_offset;
+                self.warm.as_mut().expect("warm Some").reset();
+                self.compress_into_cold(
+                    &warm_keys_full,
+                    &warm_values_full,
+                    layout,
+                    warm_count,
+                )?;
+            }
+        } else {
+            self.compress_into_cold(&evict_keys, &evict_values, layout, evict_seq)?;
+        }
         if let Some((kept_keys, kept_values)) = kept {
             let capacity = self.hot_capacity().max(remain);
             let mut new_keys = InlineArray::zeros(
@@ -594,7 +712,7 @@ impl QuantizedKvCache {
             self.hot_values = None;
         }
         self.hot_offset = remain;
-        self.offset = self.cold_offset + self.hot_offset;
+        self.offset = self.cold_offset + self.warm_len() + self.hot_offset;
         Ok(())
     }
 
@@ -636,6 +754,13 @@ impl QuantizedKvCache {
             None
         };
 
+        // Phase H: warm sub-cache between cold and hot. Cast to f32 so the
+        // dtype matches the cold path. The warm tier's own dequantize runs
+        // its (cold + hot) merge — but because we configure warm with
+        // `recent_window: None`, its hot is always empty, so the result is
+        // just the warm-encoded slots.
+        let warm = self.warm.as_ref().and_then(|w| w.dequantize_keys());
+
         let hot = if self.hot_offset > 0 {
             let hot_keys = self.hot_keys.as_ref()?;
             let active = hot_keys.slice(
@@ -653,11 +778,16 @@ impl QuantizedKvCache {
             None
         };
 
-        let mut combined = match (cold, hot) {
-            (Some(c), Some(h)) => c.concatenate_2(&h, 2),
-            (Some(c), None) => c,
-            (None, Some(h)) => h,
-            (None, None) => return None,
+        // Temporal order: cold (oldest) → warm (mid) → hot (newest).
+        let mut combined = match (cold, warm, hot) {
+            (Some(c), Some(w), Some(h)) => c.concatenate_2(&w, 2).concatenate_2(&h, 2),
+            (Some(c), Some(w), None) => c.concatenate_2(&w, 2),
+            (Some(c), None, Some(h)) => c.concatenate_2(&h, 2),
+            (None, Some(w), Some(h)) => w.concatenate_2(&h, 2),
+            (Some(c), None, None) => c,
+            (None, Some(w), None) => w,
+            (None, None, Some(h)) => h,
+            (None, None, None) => return None,
         };
         let mut to_eval = vec![&mut combined];
         crate::inline_array::eval_and_detach_many(&mut to_eval);
@@ -695,6 +825,9 @@ impl QuantizedKvCache {
             None
         };
 
+        // Phase H: warm sub-cache between cold and hot.
+        let warm = self.warm.as_ref().and_then(|w| w.dequantize_values());
+
         let hot = if self.hot_offset > 0 {
             let hot_values = self.hot_values.as_ref()?;
             let active = hot_values.slice(
@@ -711,11 +844,15 @@ impl QuantizedKvCache {
             None
         };
 
-        let mut combined = match (cold, hot) {
-            (Some(c), Some(h)) => c.concatenate_2(&h, 2),
-            (Some(c), None) => c,
-            (None, Some(h)) => h,
-            (None, None) => return None,
+        let mut combined = match (cold, warm, hot) {
+            (Some(c), Some(w), Some(h)) => c.concatenate_2(&w, 2).concatenate_2(&h, 2),
+            (Some(c), Some(w), None) => c.concatenate_2(&w, 2),
+            (Some(c), None, Some(h)) => c.concatenate_2(&h, 2),
+            (None, Some(w), Some(h)) => w.concatenate_2(&h, 2),
+            (Some(c), None, None) => c,
+            (None, Some(w), None) => w,
+            (None, None, Some(h)) => h,
+            (None, None, None) => return None,
         };
         let mut to_eval = vec![&mut combined];
         crate::inline_array::eval_and_detach_many(&mut to_eval);
@@ -1682,6 +1819,11 @@ impl QuantizedKvCache {
         // GPU when outliers are enabled. The d128 + d256 base no_qjl_2pass
         // paths do NOT have outlier-bias variants yet — `outliers_active`
         // gates them off so attention falls through to dequantize+SDPA.
+        // Phase H: warm-tier presence forces dequant+SDPA fallback so the
+        // fused score kernels don't miss the warm history.
+        if self.warm.as_ref().is_some_and(|w| w.offset > 0) {
+            return None;
+        }
         let outliers_active = self.config.outliers.is_enabled();
         let ks = self.keys.as_ref()?.gpu.as_ref()?;
         let vs = self.values.as_ref()?.gpu.as_ref()?;
@@ -1713,13 +1855,19 @@ impl QuantizedKvCache {
         // falls back to dequantize+SDPA which is fine — the kernel is the
         // long-context win.
         let dim_supported = (key_dim == 128 && value_dim == 128) || (key_dim == 256 && value_dim == 256);
-        // Phase D.3.1: NoQjl widens to `key_bits in 4..=8` at d128/d256.
-        // The score kernels load 256 codebook entries unconditionally, so we
-        // pass a 256-padded view (entries past `2^bits` zeroed and never
-        // indexed because all stored indices fit in `[0, 2^bits)`). Values
-        // stay 8-bit — the dense-values fast path stores bf16 directly,
-        // and the `no_qjl_2pass` paths still use a 256-entry value codebook.
-        if !(4..=8).contains(&key_bits)
+        // Phase D.3.1 / Phase G: NoQjl supports `key_bits in 2..=8` at
+        // d128/d256. The score kernels load 256 codebook entries
+        // unconditionally, so we pass a 256-padded view (entries past
+        // `2^bits` zeroed and never indexed because all stored indices fit
+        // in `[0, 2^bits)`). Phase G extends from 4..=8 to 2..=8 — the
+        // codebook math is identical and the encoder's argmin uses the real
+        // `2^bits`-entry codebook. Practical use of 2..=3 bits requires
+        // pairing with Variant G outliers (config.outliers = PerBlock { k })
+        // to capture the heavy tail; without outliers the codebook gap on
+        // raw 2-bit/3-bit dominates attention quality. Values stay 8-bit —
+        // the dense-values fast path stores bf16 directly, and the
+        // `no_qjl_2pass` paths still use a 256-entry value codebook.
+        if !(2..=8).contains(&key_bits)
             || value_bits != 8
             || !dim_supported
             || n_seq < 1024
@@ -2009,6 +2157,11 @@ impl QuantizedKvCache {
         if self.cold_offset <= threshold {
             return None;
         }
+        // Phase H: warm-tier presence forces dequant+SDPA fallback. The
+        // skiplist sign_hash buffer lives on the cold store only.
+        if self.warm.as_ref().is_some_and(|w| w.offset > 0) {
+            return None;
+        }
         // Phase E.3: see try_gpu_uniform_attention_no_qjl — score kernels
         // would miss the outlier override. Fall through to dequantize+SDPA.
         if self.config.outliers.is_enabled() {
@@ -2220,6 +2373,13 @@ impl QuantizedKvCache {
         // score kernels read codebook + slot_scale only and would miss it.
         // Force dequantize+SDPA so attention sees the full reconstruction.
         if self.config.outliers.is_enabled() {
+            return None;
+        }
+        // Phase H: when the warm tier has data, the fast-path GPU score
+        // kernels see only the cold store and would miss the warm history.
+        // Fall through to the dequant+SDPA mixed path which interleaves
+        // [cold, warm, hot] in temporal order.
+        if self.warm.as_ref().is_some_and(|w| w.offset > 0) {
             return None;
         }
         let ks = self.keys.as_ref()?.gpu.as_ref()?;

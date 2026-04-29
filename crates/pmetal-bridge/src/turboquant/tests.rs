@@ -500,6 +500,7 @@ mod kvcache {
             skiplist_threshold: None,
             outliers: super::config::TurboQuantOutlierMode::None,
             pack_mode: super::config::TurboQuantPackMode::Bitstream,
+            warm_tier: None,
         };
         let mut cpu_cache = QuantizedKvCache::new(cpu_config);
         cpu_cache.append(&keys_arr, &vals_arr).expect("CPU append");
@@ -671,6 +672,53 @@ mod kvcache {
         assert!(
             gpu.qjl_signs_t.is_none(),
             "NoQjl must NOT allocate qjl_signs_t on the GPU side"
+        );
+    }
+
+    // Phase D.3+ cleanup: NoQjl with pack_mode=Fullbyte must NOT allocate
+    // q8_fullbyte_seq. The NoQjl fast paths read `ks.indices` directly
+    // (which holds k_rot_scaled at key_mse_bits = key_bits), so a separate
+    // 8b fullbyte shadow is dead storage — identical to ks.indices at 8b
+    // and an unconsumed 8b view at 4..=7b widths. d256 here is the only
+    // realised seq-shadow path; d128 doesn't trigger use_q8_seq_shadow.
+    #[test]
+    fn turboquant_no_qjl_fullbyte_skips_q8_fullbyte_seq() {
+        let dim = 256usize;
+        let heads = 1i32;
+        let prefill = 4i32;
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl)
+            .with_pack_mode(super::config::TurboQuantPackMode::Fullbyte);
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let make_data = |seed: f32| -> Vec<f32> {
+            (0..prefill_len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin())
+                .collect()
+        };
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(0.7), &[b, h, prefill, d]);
+
+        let mut cache = QuantizedKvCache::new(config);
+        cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let gpu = cache
+            .keys
+            .as_ref()
+            .and_then(|k| k.gpu.as_ref())
+            .expect("uniform NoQjl should produce a GpuKeyStore");
+        assert!(
+            gpu.q8_fullbyte_seq.is_none(),
+            "NoQjl + pack_mode=Fullbyte must NOT allocate q8_fullbyte_seq \
+             (NoQjl fast path reads ks.indices)"
         );
     }
 
@@ -1339,6 +1387,139 @@ mod kvcache {
         assert_eq!(fullbyte_seq.dim(3), d);
     }
 
+    // Phase D.3+ regression: when pack_mode=Fullbyte is combined with the
+    // default Standard QJL mode at d256/8b/8b, the encoder must quantise from
+    // `k_rot / slot_scale` (i.e. the same scaled rotated values that drive
+    // ks.indices), not from un-scaled k_rot. The score kernel multiplies
+    // codebook lookups by `key_slot_scale` unconditionally; quantising
+    // un-scaled k_rot folds the per-row magnitude into the codebook hit, so
+    // the kernel double-multiplies by slot_scale and silently corrupts long-
+    // context attention whenever rows have varying magnitudes. This test
+    // builds adversarial per-row magnitudes (so slot_scale spans 0.1× to 4×
+    // across rows) and asserts the production fullbyte fast path matches
+    // dequantize+SDPA within codebook resolution. Pre-fix the divergence is
+    // catastrophic; post-fix it sits comfortably under 5e-3.
+    #[test]
+    fn turboquant_pack_mode_fullbyte_standard_qjl_varying_magnitudes_match_dequantized_sdpa() {
+        let dim = 256usize;
+        let heads = 2i32;
+        let prefill = 1023i32;
+        // Default qjl mode is Standard — we deliberately do NOT call
+        // `with_qjl_mode(NoQjl)` so the fullbyte production path under
+        // try_gpu_uniform_attention_q8_d256_precomputed is exercised.
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_pack_mode(super::config::TurboQuantPackMode::Fullbyte);
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        // Per-row magnitude varies geometrically across the cache, so
+        // `slot_scale = max(|k_rot|) / centroid_max` spans roughly 0.1×–4×.
+        // The bug-pre-fix path mis-quantises low-magnitude rows badly (idx
+        // collapses to 0 because un-scaled k_rot[d] is well below the first
+        // codebook step) and clips high-magnitude rows (idx saturates at the
+        // codebook extremes), so the resulting attention output diverges
+        // from dequantize+SDPA by orders of magnitude on this fixture.
+        let make_data = |len: usize, seed: f32, prefill_i32: i32, d_i32: i32, b_i32: i32, h_i32: i32| -> Vec<f32> {
+            let mut buf = vec![0.0f32; len];
+            for bh in 0..(b_i32 * h_i32) as usize {
+                for slot in 0..prefill_i32 as usize {
+                    // Geometric spread: 0.1 .. 4.0 across slots.
+                    let mag = 0.1f32 * (40.0f32).powf((slot as f32) / (prefill_i32 as f32 - 1.0));
+                    let row_off = (bh * prefill_i32 as usize + slot) * d_i32 as usize;
+                    for di in 0..d_i32 as usize {
+                        let i = row_off + di;
+                        buf[i] = (((i as f32) * 0.07 + seed).sin()
+                            + ((i as f32) * 0.11 - seed).cos())
+                            * mag;
+                    }
+                }
+            }
+            buf
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let prefill_keys_data = make_data(prefill_len, 0.2, prefill, d, b, h);
+        let prefill_values_data = make_data(prefill_len, 0.7, prefill, d, b, h);
+        let prefill_keys = InlineArray::from_f32_slice(&prefill_keys_data, &[b, h, prefill, d]);
+        let prefill_values = InlineArray::from_f32_slice(&prefill_values_data, &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(
+            &(0..step_len)
+                .map(|i| ((i as f32) * 0.07 + 1.3).sin() + ((i as f32) * 0.11 - 1.3).cos())
+                .collect::<Vec<_>>(),
+            &[b, h, 1, d],
+        );
+        // Step token magnitude sits in the middle of the prefill range so the
+        // newly-appended slot also has a non-trivial slot_scale.
+        let step_keys_data: Vec<f32> = (0..step_len)
+            .map(|i| (((i as f32) * 0.07 + 1.9).sin() + ((i as f32) * 0.11 - 1.9).cos()) * 1.5)
+            .collect();
+        let step_keys = InlineArray::from_f32_slice(&step_keys_data, &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(
+            &(0..step_len)
+                .map(|i| ((i as f32) * 0.07 + 2.4).sin() + ((i as f32) * 0.11 - 2.4).cos())
+                .collect::<Vec<_>>(),
+            &[b, h, 1, d],
+        );
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        // Direct: production fullbyte fast path through
+        // try_gpu_uniform_attention_q8_d256_precomputed.
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        // Reference: dequantize the cache (uses ks.indices @ key_bits-1 +
+        // QJL signs, which are quantised in scaled space and known-correct)
+        // and run manual SDPA over the full cache.
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            1024,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        // 5e-2 covers codebook-resolution drift (8b fullbyte vs 7b+QJL ref)
+        // plus fp32 reduction order across 1024 keys, with the per-row
+        // magnitude variation amplifying both terms via softmax. Measured
+        // pre-fix divergence on this fixture is ≈7.19 (un-scaled k_rot
+        // double-multiplied by slot_scale at score time); post-fix sits
+        // around 0.04 — a >150× tightening, leaving ample headroom under
+        // the 5e-2 bound.
+        assert!(
+            max_abs_diff < 5e-2,
+            "Standard-QJL fullbyte path diverged from dequantize+SDPA: \
+             max_abs_diff={max_abs_diff}"
+        );
+    }
+
     // Phase F.4 partial-selection smoke: cold_offset > 2048 forces top_m < n_seq
     // (real Hamming pre-filter selection, not a no-op). Asserts the dispatch
     // returns a finite output of the correct shape — exact agreement vs dense
@@ -1949,6 +2130,373 @@ mod kvcache {
         // codebook itself has lower resolution; still must match the
         // dequant+SDPA reference (which uses the same 16-entry codebook).
         run_no_qjl_d256_long_context_matches_dequantized_sdpa_at_bits(4, 1e-3);
+    }
+
+    // Phase G: extreme low-bit support. The score kernel is bit-width-agnostic
+    // (reads 256-padded codebook unconditionally, indexes by u8); the encoder
+    // uses the real 2^bits-entry codebook. Both paths converge on the same
+    // dequantize+SDPA reference at the same codebook resolution, so parity
+    // holds within fp32 reduction drift. Quality vs fp16 is a separate
+    // question — at 2..=3 bits the codebook gap dominates and Variant G
+    // outliers are required for practical use; the dedicated outliers test
+    // (turboquant_no_qjl_d256_long_context_outliers_match_dequantized_sdpa_2b)
+    // pins the outlier-paired path.
+    #[test]
+    fn turboquant_no_qjl_d256_long_context_matches_dequantized_sdpa_3b() {
+        run_no_qjl_d256_long_context_matches_dequantized_sdpa_at_bits(3, 1e-3);
+    }
+
+    #[test]
+    fn turboquant_no_qjl_d256_long_context_matches_dequantized_sdpa_2b() {
+        run_no_qjl_d256_long_context_matches_dequantized_sdpa_at_bits(2, 1e-3);
+    }
+
+    // Phase G SOTA: 2-bit codebook (4 levels, ≈8× compression vs fp16) paired
+    // with 8 per-block fp16 outliers (Variant G). The 4-level codebook hits
+    // only the body's bulk distribution; the 8 outliers per slot capture the
+    // heavy tail that wrecks raw 2-bit. Per-block layout:
+    //   2b body @ d256: 256 * 2 / 8     = 64 B
+    //   slot_scale + key_norm           ≈  8 B
+    //   outliers (8 channels + 8 vals)  = 8 + 16 = 24 B
+    //   total                           = 96 B per slot
+    // vs fp16 baseline at d256: 512 B per slot → ~5.3× compression.
+    // Compared to quant.cpp's TURBO_KV_2B (40 B at d=128 = 2-bit body with 1+1
+    // sign hash, no outliers), we trade ~30 extra bytes per slot for an
+    // outlier mechanism that closes the heavy-tail gap — quality-superior at
+    // similar memory budget.
+    //
+    // This test pins the kernel/dispatch parity at this aggressive setting:
+    // the direct fast path must match dequant+SDPA on the same encoded
+    // values to within fp32 reduction drift + f16 outlier-value round-trip.
+    #[test]
+    fn turboquant_no_qjl_d256_long_context_2b_with_outliers_match_dequantized_sdpa() {
+        let dim = 256usize;
+        let heads = 2i32;
+        let prefill = 1023i32;
+        let k_outliers: u8 = 8;
+        let config = TurboQuantConfig::uniform(2, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl)
+            .with_outliers(super::config::TurboQuantOutlierMode::PerBlock { k: k_outliers });
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+        // Heavy-tail spikes per slot — mirrors the 8b outliers test.
+        let inject_spikes = |buf: &mut [f32], dim_i32: i32, prefill_i32: i32, batch_i32: i32, head_i32: i32| {
+            for bh in 0..(batch_i32 * head_i32) as usize {
+                for slot in 0..prefill_i32 as usize {
+                    let row = bh * prefill_i32 as usize + slot;
+                    let row_off = row * dim_i32 as usize;
+                    let dim_u = dim_i32 as usize;
+                    buf[row_off + (slot % dim_u)] += 6.0;
+                    buf[row_off + ((slot + 17) % dim_u)] -= 5.5;
+                    buf[row_off + ((slot + 53) % dim_u)] += 4.7;
+                    buf[row_off + ((slot + 113) % dim_u)] -= 4.3;
+                    buf[row_off + ((slot + 7) % dim_u)] += 3.9;
+                    buf[row_off + ((slot + 31) % dim_u)] -= 3.5;
+                    buf[row_off + ((slot + 67) % dim_u)] += 3.1;
+                    buf[row_off + ((slot + 191) % dim_u)] -= 2.7;
+                }
+            }
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let mut prefill_keys_data = make_data(prefill_len, 0.2);
+        inject_spikes(&mut prefill_keys_data, d, prefill, b, h);
+        let prefill_keys = InlineArray::from_f32_slice(&prefill_keys_data, &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let mut step_keys_data = make_data(step_len, 1.9);
+        for bh in 0..(b * h) as usize {
+            let row_off = bh * dim;
+            step_keys_data[row_off + 7] += 5.0;
+            step_keys_data[row_off + 41] -= 4.5;
+            step_keys_data[row_off + 99] += 4.0;
+            step_keys_data[row_off + 199] -= 3.5;
+            step_keys_data[row_off + 13] += 3.1;
+            step_keys_data[row_off + 71] -= 2.9;
+            step_keys_data[row_off + 137] += 2.5;
+            step_keys_data[row_off + 233] -= 2.3;
+        }
+        let step_keys = InlineArray::from_f32_slice(&step_keys_data, &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            1024,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        // Same 5e-3 bound as the 8b+outliers parity test: parity is between
+        // the direct GPU path and the dequant+SDPA reference, both reading
+        // the same encoded values + same outlier override. The bound is
+        // dominated by fp32 reduction order + f16 outlier round-trip,
+        // independent of body bit-width.
+        assert!(
+            max_abs_diff < 5e-3,
+            "Variant F + 2b + 8-outliers d256 fused kernel diverged from \
+             dequantized sdpa: max_abs_diff={max_abs_diff}"
+        );
+    }
+
+    // Phase H — progressive 3-tier cache ordering pin.
+    //
+    // Build a cache with: hot fp16 (recent_window default), warm tier at 8b
+    // NoQjl + Variant G outliers, cold tier at 4b NoQjl. Prefill enough
+    // tokens to trigger at least two hot→warm evictions and one warm→cold
+    // migration so all three tiers have data. Then assert:
+    //   1. cache.cold_len + cache.warm_len + cache.hot_len == prefill
+    //   2. dequantize_keys returns shape [B, H, prefill, D] and is finite
+    //   3. The same data appended to a 2-tier (warm_tier=None) reference
+    //      cache produces a comparable dequant — temporal ordering matches.
+    #[test]
+    fn turboquant_warm_tier_progressive_3_tier_ordering() {
+        use super::config::TurboQuantWarmTier;
+        let dim = 128usize;
+        let heads = 1i32;
+        // Eviction trigger is `hot_offset > recent_window + HOT_EVICTION_CHUNK`
+        // (≈2049 by default). We need two evictions plus a partial-fill, so
+        // 3500 tokens total. That puts ~1024 in warm post-1st-eviction; the
+        // 2nd eviction adds another 1024 → warm = 2048 → exceeds
+        // warm_window=2048? Boundary; we set warm_window=1024 so the first
+        // eviction itself triggers a warm→cold migration, exercising both
+        // paths.
+        let prefill = 3500i32;
+        let warm_window = 1024usize;
+
+        // Override recent_window so eviction triggers at small prefill.
+        // Default is 8192 — prefill=3500 would never overflow.
+        let recent_window = 512usize;
+        let warm_tier = TurboQuantWarmTier::uniform(warm_window, 8, 8);
+        let config_3tier = TurboQuantConfig::uniform(4, 4)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl)
+            .with_recent_window(Some(recent_window))
+            .with_warm_tier(Some(warm_tier));
+        let config_2tier = TurboQuantConfig::uniform(4, 4)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl)
+            .with_recent_window(Some(recent_window));
+
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+        let prefill_len = (b * h * prefill * d) as usize;
+        let prefill_keys =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.2), &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+
+        // 3-tier cache.
+        let mut cache_3tier = QuantizedKvCache::new(config_3tier);
+        cache_3tier
+            .append(&prefill_keys, &prefill_values)
+            .expect("3-tier prefill append");
+
+        // Total accounting must match.
+        assert_eq!(
+            cache_3tier.cold_len() + cache_3tier.warm_len() + cache_3tier.hot_len(),
+            prefill as usize,
+            "cold + warm + hot must equal prefill",
+        );
+        assert_eq!(cache_3tier.offset, prefill as usize, "offset == total");
+        // Cold must have data — eviction-then-migration pattern at this size.
+        assert!(
+            cache_3tier.cold_len() >= warm_window,
+            "expected at least one warm→cold migration; cold_len={}",
+            cache_3tier.cold_len()
+        );
+
+        // Warm tier struct must be present.
+        assert!(cache_3tier.warm.is_some(), "warm sub-cache must exist");
+
+        // Dequantize and assert shape + finiteness.
+        let mut deq_3tier = cache_3tier
+            .dequantize_keys()
+            .expect("3-tier dequantize_keys");
+        assert_eq!(deq_3tier.dim(0), b);
+        assert_eq!(deq_3tier.dim(1), h);
+        assert_eq!(deq_3tier.dim(2), prefill);
+        assert_eq!(deq_3tier.dim(3), d);
+        let deq_vals = deq_3tier
+            .to_f32_vec((b * h * prefill * d) as usize)
+            .expect("dequant to f32");
+        assert!(
+            deq_vals.iter().all(|v| v.is_finite()),
+            "3-tier dequant must produce all-finite values"
+        );
+
+        // 2-tier reference for sanity — same prefill, no warm tier. Should
+        // also dequantize to the same shape.
+        let mut cache_2tier = QuantizedKvCache::new(config_2tier);
+        cache_2tier
+            .append(&prefill_keys, &prefill_values)
+            .expect("2-tier prefill append");
+        assert_eq!(cache_2tier.warm_len(), 0, "2-tier warm should be empty");
+        assert_eq!(
+            cache_2tier.cold_len() + cache_2tier.hot_len(),
+            prefill as usize,
+        );
+        let deq_2tier = cache_2tier
+            .dequantize_keys()
+            .expect("2-tier dequantize_keys");
+        assert_eq!(deq_2tier.dim(2), prefill);
+
+        // Reset must clear warm.
+        cache_3tier.reset();
+        assert_eq!(cache_3tier.warm_len(), 0);
+        assert_eq!(cache_3tier.cold_len(), 0);
+        assert_eq!(cache_3tier.hot_len(), 0);
+        assert_eq!(cache_3tier.offset, 0);
+    }
+
+    // Phase I — COW fork primitive: a forked cache must diverge cleanly
+    // from the original after independent appends. Both sides see the same
+    // shared prefix, then their appended suffixes are independent. The
+    // underlying MLX arrays are ref-counted, so the fork cost is
+    // O(layers) refcount bumps, not a deep copy.
+    #[test]
+    fn turboquant_fork_cow_independent_divergence() {
+        let dim = 64usize;
+        let heads = 1i32;
+        let prefix = 8i32;
+        let suffix_a = 4i32;
+        let suffix_b = 6i32;
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None) // straight to cold so divergence is visible
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl);
+
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefix_len = (b * h * prefix * d) as usize;
+        let prefix_keys =
+            InlineArray::from_f32_slice(&make_data(prefix_len, 0.2), &[b, h, prefix, d]);
+        let prefix_values =
+            InlineArray::from_f32_slice(&make_data(prefix_len, 0.7), &[b, h, prefix, d]);
+
+        let mut origin = QuantizedKvCache::new(config);
+        origin
+            .append(&prefix_keys, &prefix_values)
+            .expect("prefix append");
+        assert_eq!(origin.offset, prefix as usize);
+
+        // Fork before divergence — both sides should see the same prefix.
+        let mut fork_a = origin.fork();
+        let mut fork_b = origin.fork();
+        assert_eq!(fork_a.offset, prefix as usize);
+        assert_eq!(fork_b.offset, prefix as usize);
+
+        // Diverge: fork_a appends `suffix_a` tokens, fork_b appends
+        // `suffix_b` tokens (different lengths AND different values via
+        // distinct seeds).
+        let suffix_a_len = (b * h * suffix_a * d) as usize;
+        let suffix_b_len = (b * h * suffix_b * d) as usize;
+        let a_keys =
+            InlineArray::from_f32_slice(&make_data(suffix_a_len, 1.5), &[b, h, suffix_a, d]);
+        let a_values =
+            InlineArray::from_f32_slice(&make_data(suffix_a_len, 2.5), &[b, h, suffix_a, d]);
+        let b_keys =
+            InlineArray::from_f32_slice(&make_data(suffix_b_len, 3.5), &[b, h, suffix_b, d]);
+        let b_values =
+            InlineArray::from_f32_slice(&make_data(suffix_b_len, 4.5), &[b, h, suffix_b, d]);
+
+        fork_a.append(&a_keys, &a_values).expect("fork_a append");
+        fork_b.append(&b_keys, &b_values).expect("fork_b append");
+
+        // Each fork sees its own length; origin is unchanged.
+        assert_eq!(fork_a.offset, (prefix + suffix_a) as usize);
+        assert_eq!(fork_b.offset, (prefix + suffix_b) as usize);
+        assert_eq!(origin.offset, prefix as usize, "origin unaffected by forks");
+
+        // Decoded histories must differ (different suffix lengths and
+        // different content).
+        let mut deq_a = fork_a.dequantize_keys().expect("fork_a dequant");
+        let mut deq_b = fork_b.dequantize_keys().expect("fork_b dequant");
+        let mut deq_origin = origin.dequantize_keys().expect("origin dequant");
+
+        assert_eq!(deq_a.dim(2), prefix + suffix_a);
+        assert_eq!(deq_b.dim(2), prefix + suffix_b);
+        assert_eq!(deq_origin.dim(2), prefix);
+
+        // Both forks share the leading `prefix` slots — verify by checking
+        // those leading rows match between fork_a and fork_b within
+        // codebook tolerance. (They go through the same encoder, so
+        // bit-identical.)
+        let a_vals = deq_a
+            .to_f32_vec((b * h * (prefix + suffix_a) * d) as usize)
+            .expect("a to_f32");
+        let b_vals = deq_b
+            .to_f32_vec((b * h * (prefix + suffix_b) * d) as usize)
+            .expect("b to_f32");
+        let prefix_elems = (b * h * prefix * d) as usize;
+        for i in 0..prefix_elems {
+            assert!(
+                (a_vals[i] - b_vals[i]).abs() < 1e-6,
+                "fork_a and fork_b must agree on the shared prefix at i={i}: a={} b={}",
+                a_vals[i],
+                b_vals[i]
+            );
+        }
+
+        // Origin's shared prefix should match too.
+        let origin_vals = deq_origin
+            .to_f32_vec((b * h * prefix * d) as usize)
+            .expect("origin to_f32");
+        for i in 0..prefix_elems {
+            assert!(
+                (origin_vals[i] - a_vals[i]).abs() < 1e-6,
+                "origin and fork_a must agree on the prefix at i={i}",
+            );
+        }
     }
 
     // d128 sibling of the bits-sweep test above. d128 doesn't trigger

@@ -1036,6 +1036,10 @@ fn turboquant_config_from_mode(
             skiplist_threshold: config.skiplist_threshold,
             outliers: bridge_turboquant_outlier_mode(config.outliers),
             pack_mode: bridge_turboquant_pack_mode(config.pack_mode),
+            // Phase H: warm tier is bridge-only for now; pmetal-mlx will
+            // mirror once the bridge implementation lands. The conversion
+            // call site here always builds a 2-tier bridge cache.
+            warm_tier: None,
         }),
         _ => None,
     }
