@@ -1312,6 +1312,108 @@ impl InlineArray {
         }
     }
 
+    /// Phase E.4 V2: outlier-bias variant of
+    /// `turboquant_attention_q8_d128_no_qjl_2pass`. Adds the precomputed
+    /// `outlier_bias` (`[q_rows, cache_seq_capacity]` f32) to the score
+    /// before exp; same semantics as the d256 fullbyte sibling.
+    #[allow(clippy::too_many_arguments)]
+    pub fn turboquant_attention_q8_d128_no_qjl_2pass_with_outlier_bias(
+        query_rot: &Self,
+        key_indices: &Self,
+        key_norms: &Self,
+        key_slot_scale: &Self,
+        key_codebook: &Self,
+        value_indices: &Self,
+        value_norms: &Self,
+        value_codebook: &Self,
+        outlier_bias: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d128_no_qjl_2pass_with_outlier_bias(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &key_indices.raw,
+                &key_norms.raw,
+                &key_slot_scale.raw,
+                &key_codebook.raw,
+                &value_indices.raw,
+                &value_norms.raw,
+                &value_codebook.raw,
+                &outlier_bias.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Phase E.4 V2: outlier-bias variant of the d256 base
+    /// `turboquant_attention_q8_d256_no_qjl_2pass`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn turboquant_attention_q8_d256_no_qjl_2pass_with_outlier_bias(
+        query_rot: &Self,
+        key_indices: &Self,
+        key_norms: &Self,
+        key_slot_scale: &Self,
+        key_codebook: &Self,
+        value_indices: &Self,
+        value_norms: &Self,
+        value_codebook: &Self,
+        outlier_bias: &Self,
+        n_rows: u32,
+        n_seq: u32,
+        cache_seq_capacity: u32,
+        q_heads: u32,
+        kv_heads: u32,
+        attn_scale: f32,
+    ) -> Option<Self> {
+        let mut out = MaybeUninit::<RawBuf>::uninit();
+        let rc = unsafe {
+            mlx_inline_turboquant_attention_q8_d256_no_qjl_2pass_with_outlier_bias(
+                out.as_mut_ptr(),
+                &query_rot.raw,
+                &key_indices.raw,
+                &key_norms.raw,
+                &key_slot_scale.raw,
+                &key_codebook.raw,
+                &value_indices.raw,
+                &value_norms.raw,
+                &value_codebook.raw,
+                &outlier_bias.raw,
+                n_rows,
+                n_seq,
+                cache_seq_capacity,
+                q_heads,
+                kv_heads,
+                attn_scale.to_bits(),
+            )
+        };
+        if rc == 0 {
+            Some(Self {
+                raw: unsafe { out.assume_init() },
+            })
+        } else {
+            None
+        }
+    }
+
     /// Specialized long-context q8 TurboQuant decode for D=128/V=128 over
     /// packed key bytes stored as `[N, D, S_cap]`.
     ///

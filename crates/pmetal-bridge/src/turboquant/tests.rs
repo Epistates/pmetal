@@ -1755,6 +1755,104 @@ mod kvcache {
         );
     }
 
+    // Phase E.4 V2: outlier-bias path on d128 base no_qjl_2pass. d128
+    // doesn't trigger `use_q8_seq_shadow` in encode (no q8_slot_scales_seq /
+    // d256_rot_values_seq shadows), so the dispatch goes through the
+    // standalone key_norms / key_slot_scale / value_indices_t / value_norms
+    // paths — different from the d256 fullbyte test which uses the seq
+    // shadow. Same parity bound (5e-3) since the bias compute is identical.
+    #[test]
+    fn turboquant_no_qjl_d128_long_context_outliers_match_dequantized_sdpa() {
+        let dim = 128usize;
+        let heads = 2i32;
+        let prefill = 1023i32;
+        let k_outliers: u8 = 4;
+        let config = TurboQuantConfig::uniform(8, 8)
+            .with_recent_window(None)
+            .with_qjl_mode(super::config::TurboQuantQjlMode::NoQjl)
+            .with_outliers(super::config::TurboQuantOutlierMode::PerBlock { k: k_outliers });
+        let b = 1i32;
+        let h = heads;
+        let d = dim as i32;
+        let scale = 1.0f32 / (dim as f32).sqrt();
+
+        let make_data = |len: usize, seed: f32| -> Vec<f32> {
+            (0..len)
+                .map(|i| ((i as f32) * 0.07 + seed).sin() + ((i as f32) * 0.11 - seed).cos())
+                .collect()
+        };
+
+        let prefill_len = (b * h * prefill * d) as usize;
+        let step_len = (b * h * d) as usize;
+        let mut prefill_keys_data = make_data(prefill_len, 0.2);
+        // Inject heavy spikes per slot at varying channels.
+        for bh in 0..(b * h) as usize {
+            for slot in 0..prefill as usize {
+                let row_off = (bh * prefill as usize + slot) * dim;
+                prefill_keys_data[row_off + (slot % dim)] += 6.0;
+                prefill_keys_data[row_off + ((slot + 17) % dim)] -= 5.5;
+                prefill_keys_data[row_off + ((slot + 53) % dim)] += 4.7;
+                prefill_keys_data[row_off + ((slot + 79) % dim)] -= 4.3;
+            }
+        }
+        let prefill_keys = InlineArray::from_f32_slice(&prefill_keys_data, &[b, h, prefill, d]);
+        let prefill_values =
+            InlineArray::from_f32_slice(&make_data(prefill_len, 0.7), &[b, h, prefill, d]);
+        let queries = InlineArray::from_f32_slice(&make_data(step_len, 1.3), &[b, h, 1, d]);
+        let mut step_keys_data = make_data(step_len, 1.9);
+        for bh in 0..(b * h) as usize {
+            let row_off = bh * dim;
+            step_keys_data[row_off + 7] += 5.0;
+            step_keys_data[row_off + 41] -= 4.5;
+            step_keys_data[row_off + 99] += 4.0;
+            step_keys_data[row_off + 113] -= 3.5;
+        }
+        let step_keys = InlineArray::from_f32_slice(&step_keys_data, &[b, h, 1, d]);
+        let step_values = InlineArray::from_f32_slice(&make_data(step_len, 2.4), &[b, h, 1, d]);
+
+        let mut seed_cache = QuantizedKvCache::new(config);
+        seed_cache
+            .append(&prefill_keys, &prefill_values)
+            .expect("prefill append");
+
+        let mut direct_cache = seed_cache.clone();
+        let mut ref_cache = seed_cache;
+
+        let mut direct = direct_cache
+            .append_and_compute_attention(&queries, &step_keys, &step_values, scale)
+            .expect("direct attention");
+
+        ref_cache
+            .append(&step_keys, &step_values)
+            .expect("reference append");
+        let mut full_keys = ref_cache.dequantize_keys().expect("dequantize keys");
+        let mut full_values = ref_cache.dequantize_values().expect("dequantize values");
+        let reference_vals = manual_single_token_attention(
+            &mut queries.clone(),
+            &mut full_keys,
+            &mut full_values,
+            b,
+            h,
+            1024,
+            d,
+            scale,
+        );
+
+        let direct_vals = direct
+            .to_f32_vec((b * h * d) as usize)
+            .expect("direct to_f32");
+        let max_abs_diff = direct_vals
+            .iter()
+            .zip(reference_vals.iter())
+            .map(|(lhs, rhs)| (lhs - rhs).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs_diff < 5e-3,
+            "Variant F d128 fused kernel with outlier-bias diverged from \
+             dequantized sdpa: max_abs_diff={max_abs_diff}"
+        );
+    }
+
     // Phase D.3.1: NoQjl + d256 fast path widened to key_bits in 4..=8.
     // Score kernel loads 256 codebook entries unconditionally, so encode +
     // dispatch must hand it a zero-padded 256-entry codebook. Indices are

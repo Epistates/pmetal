@@ -1324,6 +1324,113 @@ static const char* TURBOQUANT_ATTENTION_Q8_D256_NO_QJL_2PASS_1_SOURCE = R"(
     partials[out_base + 7u] = acc7;
 )";
 
+// Phase E.4 V2: outlier-bias variant of d256 base no_qjl_2pass.
+// Same structure as the d128 + d256-fullbyte siblings — adds one global
+// memory load + add per (row, slot). The bias is `[q_rows,
+// cache_seq_capacity]` f32 indexed by the q-row, indexed alongside the
+// kernel's existing slot loop.
+static const char* TURBOQUANT_ATTENTION_Q8_D256_NO_QJL_2PASS_1_WITH_OUTLIER_BIAS_SOURCE = R"(
+    constexpr uint kDim = 256u;
+    constexpr uint kVec = 8u;
+    constexpr uint kKeyCentroids = 256u;
+    constexpr uint kValueCentroids = 256u;
+    threadgroup float shared_k_codebook[kKeyCentroids];
+    threadgroup float shared_v_codebook[kValueCentroids];
+
+    uint kv_head = threadgroup_position_in_grid.x;
+    uint batch = threadgroup_position_in_grid.y;
+    uint block = threadgroup_position_in_grid.z;
+    uint simd_gid = simdgroup_index_in_threadgroup;
+    uint lane = thread_index_in_simdgroup;
+    uint groups = q_heads / kv_heads;
+    uint row = batch * q_heads + kv_head * groups + simd_gid;
+    if (row >= n_rows || block >= blocks) return;
+
+    if (simd_gid == 0u) {
+        for (uint c = lane; c < kKeyCentroids; c += 32u) {
+            shared_k_codebook[c] = key_codebook[c];
+        }
+        for (uint c = lane; c < kValueCentroids; c += 32u) {
+            shared_v_codebook[c] = value_codebook[c];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint kv_row = batch * kv_heads + kv_head;
+    uint d0 = lane * kVec;
+    uint query_base = row * kDim + d0;
+
+    float qrot0 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 0u];
+    float qrot1 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 1u];
+    float qrot2 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 2u];
+    float qrot3 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 3u];
+    float qrot4 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 4u];
+    float qrot5 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 5u];
+    float qrot6 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 6u];
+    float qrot7 = as_type<float>((uint)attn_scale_bits) * query_rot[query_base + 7u];
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    float acc2 = 0.0f;
+    float acc3 = 0.0f;
+    float acc4 = 0.0f;
+    float acc5 = 0.0f;
+    float acc6 = 0.0f;
+    float acc7 = 0.0f;
+    float max_score = -INFINITY;
+    float sum_exp_score = 0.0f;
+
+    for (uint seq = block; seq < n_seq; seq += blocks) {
+        uint scalar_idx = kv_row * cache_seq_capacity + seq;
+        float key_norm = key_norms[scalar_idx];
+        float slot_scale = key_slot_scale[scalar_idx];
+        uint key_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
+        uint value_base = (kv_row * kDim + d0) * cache_seq_capacity + seq;
+
+        float score_part = 0.0f;
+        score_part += qrot0 * shared_k_codebook[(uint)key_indices[key_base + 0u * cache_seq_capacity]];
+        score_part += qrot1 * shared_k_codebook[(uint)key_indices[key_base + 1u * cache_seq_capacity]];
+        score_part += qrot2 * shared_k_codebook[(uint)key_indices[key_base + 2u * cache_seq_capacity]];
+        score_part += qrot3 * shared_k_codebook[(uint)key_indices[key_base + 3u * cache_seq_capacity]];
+        score_part += qrot4 * shared_k_codebook[(uint)key_indices[key_base + 4u * cache_seq_capacity]];
+        score_part += qrot5 * shared_k_codebook[(uint)key_indices[key_base + 5u * cache_seq_capacity]];
+        score_part += qrot6 * shared_k_codebook[(uint)key_indices[key_base + 6u * cache_seq_capacity]];
+        score_part += qrot7 * shared_k_codebook[(uint)key_indices[key_base + 7u * cache_seq_capacity]];
+        float outlier_corr = outlier_bias[row * cache_seq_capacity + seq];
+        float score = key_norm * slot_scale * simd_sum(score_part) + outlier_corr;
+
+        float new_max = max(max_score, score);
+        float factor = fast::exp(max_score - new_max);
+        float exp_score = fast::exp(score - new_max);
+        max_score = new_max;
+        sum_exp_score = sum_exp_score * factor + exp_score;
+
+        float value_scale = exp_score * value_norms[scalar_idx];
+        acc0 = acc0 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 0u * cache_seq_capacity]];
+        acc1 = acc1 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 1u * cache_seq_capacity]];
+        acc2 = acc2 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 2u * cache_seq_capacity]];
+        acc3 = acc3 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 3u * cache_seq_capacity]];
+        acc4 = acc4 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 4u * cache_seq_capacity]];
+        acc5 = acc5 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 5u * cache_seq_capacity]];
+        acc6 = acc6 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 6u * cache_seq_capacity]];
+        acc7 = acc7 * factor + value_scale * shared_v_codebook[(uint)value_indices[value_base + 7u * cache_seq_capacity]];
+    }
+
+    if (lane == 0u) {
+        sums[row * blocks + block] = sum_exp_score;
+        maxs[row * blocks + block] = max_score;
+    }
+    uint out_base = (row * blocks + block) * kDim + d0;
+    partials[out_base + 0u] = acc0;
+    partials[out_base + 1u] = acc1;
+    partials[out_base + 2u] = acc2;
+    partials[out_base + 3u] = acc3;
+    partials[out_base + 4u] = acc4;
+    partials[out_base + 5u] = acc5;
+    partials[out_base + 6u] = acc6;
+    partials[out_base + 7u] = acc7;
+)";
+
 // Specialized q8 long-context decode primitive for D=128/V=128.
 // Pass 1 performs block-strided online softmax and accumulates unnormalized
 // partial value outputs directly from compressed K/V. Pass 2 merges the block
@@ -1369,6 +1476,30 @@ static mlx::core::fast::CustomKernelFunction& get_turboquant_attention_q8_d256_n
         },
         {"partials", "sums", "maxs"},
         TURBOQUANT_ATTENTION_Q8_D256_NO_QJL_2PASS_1_SOURCE,
+        "",
+        true,
+        false
+    );
+    return kernel;
+}
+
+static mlx::core::fast::CustomKernelFunction&
+get_turboquant_attention_q8_d256_no_qjl_2pass_1_with_outlier_bias_kernel() {
+    static auto kernel = mlx::core::fast::metal_kernel(
+        "turboquant_attention_q8_d256_no_qjl_2pass_1_with_outlier_bias",
+        {
+            "query_rot",
+            "key_indices",
+            "key_norms",
+            "key_slot_scale",
+            "key_codebook",
+            "value_indices",
+            "value_norms",
+            "value_codebook",
+            "outlier_bias",
+        },
+        {"partials", "sums", "maxs"},
+        TURBOQUANT_ATTENTION_Q8_D256_NO_QJL_2PASS_1_WITH_OUTLIER_BIAS_SOURCE,
         "",
         true,
         false
@@ -1711,6 +1842,94 @@ int mlx_inline_turboquant_attention_q8_d256_no_qjl_2pass(
         new (out->buf) array(pass2_outputs[0]);
         return 0;
     } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_no_qjl_2pass", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_no_qjl_2pass", "unknown C++ exception"); return 1; }
+}
+
+int mlx_inline_turboquant_attention_q8_d256_no_qjl_2pass_with_outlier_bias(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* key_indices,
+    const mlx_inline_array* key_norms,
+    const mlx_inline_array* key_slot_scale,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_indices,
+    const mlx_inline_array* value_norms,
+    const mlx_inline_array* value_codebook,
+    const mlx_inline_array* outlier_bias,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits)
+{
+    using namespace mlx::core;
+
+    constexpr uint32_t dim = 256u;
+    const uint32_t blocks = turboquant_q8_2pass_blocks_override_or(32u);
+
+    if (n_rows == 0 || n_seq < 1024 || cache_seq_capacity < n_seq) return 1;
+    if (q_heads == 0 || kv_heads == 0 || (q_heads % kv_heads) != 0) return 1;
+
+    try {
+        const array& query_rot_arr = as_arr(query_rot);
+        const array& key_indices_arr = as_arr(key_indices);
+        const array& key_norms_arr = as_arr(key_norms);
+        const array& key_slot_scale_arr = as_arr(key_slot_scale);
+        const array& key_codebook_arr = as_arr(key_codebook);
+        const array& value_indices_arr = as_arr(value_indices);
+        const array& value_norms_arr = as_arr(value_norms);
+        const array& value_codebook_arr = as_arr(value_codebook);
+        const array& outlier_bias_arr = as_arr(outlier_bias);
+
+        if (query_rot_arr.shape(-1) != dim) return 1;
+        if (key_codebook_arr.shape(0) != 256 || value_codebook_arr.shape(0) != 256) return 1;
+
+        auto& pass1 = get_turboquant_attention_q8_d256_no_qjl_2pass_1_with_outlier_bias_kernel();
+        auto pass1_outputs = pass1(
+            {
+                query_rot_arr,
+                key_indices_arr,
+                key_norms_arr,
+                key_slot_scale_arr,
+                key_codebook_arr,
+                value_indices_arr,
+                value_norms_arr,
+                value_codebook_arr,
+                outlier_bias_arr,
+            },
+            {{(int)n_rows, (int)blocks, (int)dim}, {(int)n_rows, (int)blocks}, {(int)n_rows, (int)blocks}},
+            {float32, float32, float32},
+            {32 * (int)kv_heads, (int)((q_heads / kv_heads) * (n_rows / q_heads)), (int)blocks},
+            {32, (int)(q_heads / kv_heads), 1},
+            {
+                {"n_rows", (int)n_rows},
+                {"n_seq", (int)n_seq},
+                {"blocks", (int)blocks},
+                {"cache_seq_capacity", (int)cache_seq_capacity},
+                {"q_heads", (int)q_heads},
+                {"kv_heads", (int)kv_heads},
+                {"attn_scale_bits", (int)attn_scale_bits},
+            },
+            std::nullopt, false, {}
+        );
+
+        auto& pass2 = get_turboquant_attention_q8_d256_2pass_2_kernel();
+        auto pass2_outputs = pass2(
+            {pass1_outputs[0], pass1_outputs[1], pass1_outputs[2]},
+            {{(int)n_rows, (int)dim}},
+            {float32},
+            {1024, (int)n_rows, 1},
+            {1024, 1, 1},
+            {
+                {"n_rows", (int)n_rows},
+                {"blocks", (int)blocks},
+            },
+            std::nullopt, false, {}
+        );
+
+        new (out->buf) array(pass2_outputs[0]);
+        return 0;
+    } catch (const std::exception& e) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_no_qjl_2pass_with_outlier_bias", e.what()); return 1; } catch (...) { pmetal_bridge_set_last_error("turboquant_attention_q8_d256_no_qjl_2pass_with_outlier_bias", "unknown C++ exception"); return 1; }
 }
 
 int mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(

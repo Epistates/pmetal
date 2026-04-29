@@ -353,6 +353,27 @@ int mlx_inline_turboquant_attention_q8_d256_no_qjl_2pass(
     uint32_t                kv_heads,
     uint32_t                attn_scale_bits);
 
+// Phase E.4 V2: outlier-bias variant of the d256 base no_qjl_2pass.
+// Adds `outlier_bias` ([q_rows, cache_seq_capacity] f32) to the score
+// before exp; same semantics as the d256 fullbyte sibling.
+int mlx_inline_turboquant_attention_q8_d256_no_qjl_2pass_with_outlier_bias(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* key_indices,
+    const mlx_inline_array* key_norms,
+    const mlx_inline_array* key_slot_scale,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_indices,
+    const mlx_inline_array* value_norms,
+    const mlx_inline_array* value_codebook,
+    const mlx_inline_array* outlier_bias,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
 // Specialized long-context q8 decode primitive for D=256/V=256 over packed
 // key bytes stored as [N, S_cap, D] (low 7 bits centroid index, high bit QJL sign).
 int mlx_inline_turboquant_attention_q8_d256_packed_keys_2pass(
@@ -597,6 +618,25 @@ int mlx_inline_turboquant_attention_q8_d128_no_qjl_2pass(
     const mlx_inline_array* value_indices,
     const mlx_inline_array* value_norms,
     const mlx_inline_array* value_codebook,
+    uint32_t                n_rows,
+    uint32_t                n_seq,
+    uint32_t                cache_seq_capacity,
+    uint32_t                q_heads,
+    uint32_t                kv_heads,
+    uint32_t                attn_scale_bits);
+
+// Phase E.4 V2: outlier-bias variant of the d128 no_qjl_2pass.
+int mlx_inline_turboquant_attention_q8_d128_no_qjl_2pass_with_outlier_bias(
+    mlx_inline_array*       out,
+    const mlx_inline_array* query_rot,
+    const mlx_inline_array* key_indices,
+    const mlx_inline_array* key_norms,
+    const mlx_inline_array* key_slot_scale,
+    const mlx_inline_array* key_codebook,
+    const mlx_inline_array* value_indices,
+    const mlx_inline_array* value_norms,
+    const mlx_inline_array* value_codebook,
+    const mlx_inline_array* outlier_bias,
     uint32_t                n_rows,
     uint32_t                n_seq,
     uint32_t                cache_seq_capacity,

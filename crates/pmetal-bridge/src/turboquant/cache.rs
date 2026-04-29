@@ -1763,13 +1763,18 @@ impl QuantizedKvCache {
                 let value_rot_dense_3d =
                     value_rot_dense.reshape(&[kv_rows, cache_seq_capacity, value_dim]);
                 let aggregated_rot = if outliers_active {
-                    let outlier_bias = self.compute_d256_outlier_bias(
+                    // Slot scales pack key_norm at component 0; slice it for
+                    // the bias compute. Other components (residual_norm,
+                    // value_norm, key_slot_scale) aren't used by the bias.
+                    let key_norms_kv = slot_scales_3d
+                        .slice(&[0, 0, 0], &[kv_rows, cache_seq_capacity, 1])
+                        .reshape(&[kv_rows, cache_seq_capacity]);
+                    let outlier_bias = self.compute_no_qjl_outlier_bias(
                         ks,
-                        &slot_scales_3d,
+                        &key_norms_kv,
                         &query_rot,
                         kv_rows,
                         q_rows,
-                        layout.heads as i32,
                         cache_seq_capacity,
                     )?;
                     InlineArray::turboquant_attention_q8_d256_fullbyte_dense_values_2pass_with_outlier_bias(
@@ -1809,13 +1814,6 @@ impl QuantizedKvCache {
             }
         }
 
-        // d128 + d256 base no_qjl_2pass paths don't have outlier-bias
-        // variants yet — fall through to dequantize+SDPA when outliers are
-        // active. Phase E.4 V2 will add the bias path to those kernels.
-        if outliers_active {
-            return None;
-        }
-
         let key_norms = ks
             .key_norms_array()?
             .reshape(&[kv_rows, cache_seq_capacity]);
@@ -1834,7 +1832,57 @@ impl QuantizedKvCache {
             .norms_array()?
             .reshape(&[kv_rows, cache_seq_capacity]);
 
-        let aggregated_rot = if key_dim == 128 {
+        // Phase E.4 V2: outlier-bias siblings of the d128/d256 base
+        // no_qjl_2pass kernels. The bias compute is shared with the d256
+        // fullbyte path — the only difference is the key_norms source
+        // (standalone here vs sliced from slot_scales there).
+        let aggregated_rot = if outliers_active {
+            let outlier_bias = self.compute_no_qjl_outlier_bias(
+                ks,
+                &key_norms,
+                &query_rot,
+                kv_rows,
+                q_rows,
+                cache_seq_capacity,
+            )?;
+            if key_dim == 128 {
+                InlineArray::turboquant_attention_q8_d128_no_qjl_2pass_with_outlier_bias(
+                    &query_rot,
+                    &key_indices_t,
+                    &key_norms,
+                    &key_slot_scale,
+                    key_codebook,
+                    &value_indices_t,
+                    &value_norms,
+                    value_codebook,
+                    &outlier_bias,
+                    q_rows as u32,
+                    n_seq as u32,
+                    cache_seq_capacity as u32,
+                    q_heads as u32,
+                    layout.heads as u32,
+                    scale,
+                )?
+            } else {
+                InlineArray::turboquant_attention_q8_d256_no_qjl_2pass_with_outlier_bias(
+                    &query_rot,
+                    &key_indices_t,
+                    &key_norms,
+                    &key_slot_scale,
+                    key_codebook,
+                    &value_indices_t,
+                    &value_norms,
+                    value_codebook,
+                    &outlier_bias,
+                    q_rows as u32,
+                    n_seq as u32,
+                    cache_seq_capacity as u32,
+                    q_heads as u32,
+                    layout.heads as u32,
+                    scale,
+                )?
+            }
+        } else if key_dim == 128 {
             InlineArray::turboquant_attention_q8_d128_no_qjl_2pass(
                 &query_rot,
                 &key_indices_t,
@@ -1883,10 +1931,10 @@ impl QuantizedKvCache {
     /// rows into a contiguous M-length scratch view, and runs the existing
     /// Variant F (NoQjl) score kernel over that subset. The kernel's
     /// Phase E.4: precompute the per-(q-row, slot) outlier bias term that
-    /// the d256 fullbyte score kernel adds to its dense score before
-    /// softmax. The kernel zeros outlier coords during encode (so the
-    /// dense path contributes 0 there), and this bias adds them back at
-    /// their original-magnitude rotated values:
+    /// the no_qjl score kernels add to their dense score before softmax.
+    /// The encoder zeros outlier coords during encode (so the dense path
+    /// contributes 0 there), and this bias adds them back at their
+    /// original-magnitude rotated values:
     ///
     ///   bias[q_row, slot] = key_norm[kv_row(q_row), slot]
     ///                     · Σ_k q_rot[q_row, channels[kv_row, slot, k]]
@@ -1896,22 +1944,22 @@ impl QuantizedKvCache {
     /// resolves via `q_row / groups → kv_row` indexing. Returns None
     /// when the GpuKeyStore lacks outlier buffers (caller should not
     /// have entered this path; defensive guard only).
-    #[allow(clippy::too_many_arguments)]
-    fn compute_d256_outlier_bias(
+    ///
+    /// `key_norms_kv` is `[kv_rows, cache_seq_capacity]` f32. d256 fullbyte
+    /// callers slice it from `slot_scales[..., 0]` (component 0 of the
+    /// packed slot_scales seq shadow); d128 + d256-base callers pass the
+    /// standalone `key_norms_array()` view directly.
+    fn compute_no_qjl_outlier_bias(
         &self,
         ks: &super::gpu_keystore::GpuKeyStore,
-        slot_scales_3d: &InlineArray,
+        key_norms_kv: &InlineArray,
         query_rot: &InlineArray,
         kv_rows: i32,
         q_rows: i32,
-        kv_heads: i32,
         cache_seq_capacity: i32,
     ) -> Option<InlineArray> {
         let outlier_channels = ks.outlier_channels.as_ref()?;
         let outlier_values = ks.outlier_values.as_ref()?;
-        // outlier_channels stored as [B, H, T, k] u8; reshape to
-        // [kv_rows, cache_seq_capacity, k]. kv_rows = B*H. The cache
-        // capacity along axis 2 equals `cache_seq_capacity` after append.
         let outlier_k = outlier_channels.dim(3);
         if outlier_k <= 0 {
             return None;
@@ -1922,38 +1970,23 @@ impl QuantizedKvCache {
             .as_dtype(crate::compat::Dtype::Float32.as_i32())
             .reshape(&[kv_rows, cache_seq_capacity, outlier_k]);
 
-        // q_row → kv_row mapping: kv_row = q_row / groups. Build a
-        // [q_rows] i32 index buffer and use `take_axis(_, 0)` to expand
-        // outlier buffers from [kv_rows, ...] to [q_rows, ...]. Same
-        // pattern the Hamming skiplist GQA path (V2) uses.
-        let _ = kv_heads; // kv_heads validates groups upstream; expand uses kv_rows
         let groups = q_rows / kv_rows;
         let kv_idx_for_q: Vec<i32> = (0..q_rows).map(|q| q / groups).collect();
         let kv_idx = InlineArray::from_i32_slice(&kv_idx_for_q);
 
-        let oc_q = oc_3d.take_axis(&kv_idx, 0); // [q_rows, S_cap, k]
-        let ov_q = ov_3d.take_axis(&kv_idx, 0); // [q_rows, S_cap, k]
+        let oc_q = oc_3d.take_axis(&kv_idx, 0);
+        let ov_q = ov_3d.take_axis(&kv_idx, 0);
 
-        // Gather q_rot at the outlier channels. q_rot is [q_rows, key_dim];
-        // flatten (S_cap, k) so take_along_axis aligns to last axis:
-        //   index shape [q_rows, S_cap*k] → output [q_rows, S_cap*k].
         let oc_q_i32 = oc_q.as_dtype(crate::compat::Dtype::Int32.as_i32());
         let oc_flat = oc_q_i32.reshape(&[q_rows, cache_seq_capacity * outlier_k]);
         let q_at_chans_flat = query_rot.take_along_axis(&oc_flat, -1);
         let q_at_chans =
             q_at_chans_flat.reshape(&[q_rows, cache_seq_capacity, outlier_k]);
 
-        // Σ_k q_rot[chan] · value
-        let products = q_at_chans.multiply(&ov_q); // [q_rows, S_cap, k]
-        let correction = products.sum_axis(-1, false); // [q_rows, S_cap]
+        let products = q_at_chans.multiply(&ov_q);
+        let correction = products.sum_axis(-1, false);
 
-        // Multiply by per-(kv_row, slot) key_norm. slot_scales is packed as
-        // [kv_rows, S_cap, 4] with key_norm at component 0; slice and
-        // expand to per-q-row.
-        let key_norms_kv = slot_scales_3d
-            .slice(&[0, 0, 0], &[kv_rows, cache_seq_capacity, 1])
-            .reshape(&[kv_rows, cache_seq_capacity]);
-        let key_norms_q = key_norms_kv.take_axis(&kv_idx, 0); // [q_rows, S_cap]
+        let key_norms_q = key_norms_kv.take_axis(&kv_idx, 0);
 
         Some(correction.multiply(&key_norms_q))
     }
