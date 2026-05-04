@@ -77,6 +77,13 @@ pub fn config_from_gguf(content: &GgufContent) -> Option<serde_json::Value> {
         config.insert("rope_theta".to_string(), serde_json::json!(v));
     }
 
+    if let Some(v) = get_u64(content, &format!("{arch}.attention.key_length"))
+        .or_else(|| get_u64(content, &format!("{arch}.attention.head_dim")))
+        .or_else(|| get_u64(content, &format!("{arch}.rope.dimension_count")))
+    {
+        config.insert("head_dim".to_string(), serde_json::json!(v));
+    }
+
     // RMS norm epsilon
     if let Some(v) = get_f64(content, &format!("{arch}.attention.layer_norm_rms_epsilon")) {
         config.insert("rms_norm_eps".to_string(), serde_json::json!(v));

@@ -586,8 +586,17 @@ impl TryFrom<u32> for GgmlType {
             28 => Ok(Self::F64),
             29 => Ok(Self::Iq1M),
             30 => Ok(Self::Bf16),
+            31 => Ok(Self::Q4_0_4_4),
+            32 => Ok(Self::Q4_0_4_8),
+            33 => Ok(Self::Q4_0_8_8),
             34 => Ok(Self::Tq1_0),
             35 => Ok(Self::Tq2_0),
+            36 => Ok(Self::Iq4Nl_4_4),
+            37 => Ok(Self::Iq4Nl_4_8),
+            38 => Ok(Self::Iq4Nl_8_8),
+            39 => Ok(Self::Mxfp4),
+            40 => Ok(Self::Nvfp4),
+            41 => Ok(Self::Q1_0),
             _ => Err(()),
         }
     }
@@ -611,6 +620,9 @@ mod tests {
         assert_eq!(GgmlType::try_from(2), Ok(GgmlType::Q4_0));
         assert_eq!(GgmlType::try_from(8), Ok(GgmlType::Q8_0));
         assert_eq!(GgmlType::try_from(30), Ok(GgmlType::Bf16));
+        assert_eq!(GgmlType::try_from(39), Ok(GgmlType::Mxfp4));
+        assert_eq!(GgmlType::try_from(40), Ok(GgmlType::Nvfp4));
+        assert_eq!(GgmlType::try_from(41), Ok(GgmlType::Q1_0));
         assert!(GgmlType::try_from(255).is_err());
     }
 

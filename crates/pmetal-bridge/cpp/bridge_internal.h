@@ -8,6 +8,7 @@
 #include <cstring>
 #include <cstdlib>
 #include <exception>
+#include <string>
 
 using mlx::core::array;
 
@@ -98,4 +99,19 @@ static inline mlx::core::Dtype dtype_from_int(int dtype) {
         mlx::core::complex64 // 12
     };
     return (dtype >= 0 && dtype <= 12) ? dtypes[dtype] : mlx::core::float32;
+}
+
+// Map Rust-side quantization mode discriminants to MLX quantized-matmul modes.
+static inline std::string quant_mode_from_int(int mode) {
+    switch (mode) {
+        case 1:
+            return "mxfp8";
+        case 2:
+            return "mxfp4";
+        case 3:
+            return "nvfp4";
+        case 0:
+        default:
+            return "affine";
+    }
 }

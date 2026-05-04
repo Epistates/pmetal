@@ -11,6 +11,22 @@ use super::InlineArray;
 use super::RawBuf;
 use super::ffi::*;
 
+/// Quantized matmul/quantize mode understood by MLX.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QuantizedMode {
+    Affine = 0,
+    Mxfp8 = 1,
+    Mxfp4 = 2,
+    Nvfp4 = 3,
+}
+
+impl QuantizedMode {
+    #[inline]
+    pub(crate) fn as_i32(self) -> i32 {
+        self as i32
+    }
+}
+
 impl InlineArray {
     // ── Dequantize ──────────────────────────────────────────────────────
 
@@ -45,6 +61,29 @@ impl InlineArray {
         group_size: i32,
         bits: i32,
     ) -> Self {
+        self.quantized_matmul_mode(
+            w,
+            scales,
+            biases,
+            transpose,
+            group_size,
+            bits,
+            QuantizedMode::Affine,
+        )
+    }
+
+    /// Quantized matmul in a specific MLX quantization mode.
+    #[inline]
+    pub fn quantized_matmul_mode(
+        &self,
+        w: &Self,
+        scales: &Self,
+        biases: Option<&Self>,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: QuantizedMode,
+    ) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         let b_ptr = biases
             .map(|b| &b.raw as *const RawBuf)
@@ -59,6 +98,7 @@ impl InlineArray {
                 transpose,
                 group_size,
                 bits,
+                mode.as_i32(),
             );
             Self {
                 raw: dst.assume_init(),
@@ -80,6 +120,36 @@ impl InlineArray {
         group_size: i32,
         bits: i32,
         sorted: bool,
+    ) -> Self {
+        self.gather_qmm_mode(
+            w,
+            scales,
+            biases,
+            lhs_indices,
+            rhs_indices,
+            transpose,
+            group_size,
+            bits,
+            sorted,
+            QuantizedMode::Affine,
+        )
+    }
+
+    /// Gather quantized matmul in a specific MLX quantization mode.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gather_qmm_mode(
+        &self,
+        w: &Self,
+        scales: &Self,
+        biases: Option<&Self>,
+        lhs_indices: Option<&Self>,
+        rhs_indices: Option<&Self>,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        sorted: bool,
+        mode: QuantizedMode,
     ) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
         let b_ptr = biases
@@ -104,6 +174,7 @@ impl InlineArray {
                 group_size,
                 bits,
                 sorted,
+                mode.as_i32(),
             );
             Self {
                 raw: dst.assume_init(),
@@ -136,6 +207,38 @@ impl InlineArray {
                 },
                 Self {
                     raw: b.assume_init(),
+                },
+            )
+        }
+    }
+
+    /// Quantize in an MLX floating-point quantization mode such as mxfp8.
+    ///
+    /// These modes do not have affine biases, so the return value is only
+    /// `(packed_weights, scales)`.
+    pub fn quantize_weights_mode(
+        &self,
+        group_size: i32,
+        bits: i32,
+        mode: QuantizedMode,
+    ) -> (Self, Self) {
+        let mut w = MaybeUninit::<RawBuf>::uninit();
+        let mut s = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_quantize_mode(
+                w.as_mut_ptr(),
+                s.as_mut_ptr(),
+                &self.raw,
+                group_size,
+                bits,
+                mode.as_i32(),
+            );
+            (
+                Self {
+                    raw: w.assume_init(),
+                },
+                Self {
+                    raw: s.assume_init(),
                 },
             )
         }

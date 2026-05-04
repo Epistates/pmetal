@@ -4,6 +4,30 @@ use super::{
 use std::collections::HashMap;
 use std::rc::Rc;
 
+fn fp8_weight_for_compute(weight: &Array) -> Array {
+    if weight.dtype() == super::Dtype::Uint8 {
+        ops::from_fp8(weight, super::Dtype::Bfloat16).expect("failed to dequantize FP8 weight")
+    } else {
+        weight.clone()
+    }
+}
+
+fn linear_forward_array(x: &Array, weight: &Array, bias: Option<&Array>) -> Array {
+    let weight = fp8_weight_for_compute(weight);
+    let x = if weight.dtype() == super::Dtype::Bfloat16 && x.dtype() != super::Dtype::Bfloat16 {
+        x.as_dtype(super::Dtype::Bfloat16.as_i32())
+    } else {
+        x.clone()
+    };
+
+    let output = x.matmul(&weight.t());
+    if let Some(bias) = bias {
+        output.add(bias)
+    } else {
+        output
+    }
+}
+
 // ── Linear ────────────────────────────────────────────────────────────────
 
 /// Affine linear layer: `y = x @ W^T + b`.
@@ -42,14 +66,7 @@ impl Linear {
     }
 
     pub fn forward(&self, x: &Array) -> Array {
-        match &self.bias.value {
-            Some(b) => {
-                // addmm: b + x @ W^T
-                let mm = x.matmul(&self.weight.value.t());
-                mm.add(b)
-            }
-            None => x.matmul(&self.weight.value.t()),
-        }
+        linear_forward_array(x, &self.weight.value, self.bias.value.as_ref())
     }
 
     pub fn shape(&self) -> (i32, i32) {
@@ -119,7 +136,8 @@ impl RmsNorm {
     }
 
     pub fn forward(&self, x: &Array) -> Array {
-        x.rms_norm(Some(&self.weight.value), self.eps)
+        let weight = fp8_weight_for_compute(&self.weight.value);
+        x.rms_norm(Some(&weight), self.eps)
     }
 }
 
@@ -180,9 +198,9 @@ impl LayerNorm {
     }
 
     pub fn forward(&self, x: &Array) -> Array {
-        let w: Option<&Array> = self.weight.value.as_ref();
-        let b: Option<&Array> = self.bias.value.as_ref();
-        x.layer_norm(w, b, self.eps)
+        let w = self.weight.value.as_ref().map(fp8_weight_for_compute);
+        let b = self.bias.value.as_ref().map(fp8_weight_for_compute);
+        x.layer_norm(w.as_ref(), b.as_ref(), self.eps)
     }
 }
 
@@ -299,9 +317,19 @@ impl GroupNorm {
 
     fn apply_affine(&self, x: Array) -> Array {
         match (&self.weight.value, &self.bias.value) {
-            (Some(w), Some(b)) => x.multiply(w).add(b),
-            (Some(w), None) => x.multiply(w),
-            (None, Some(b)) => x.add(b),
+            (Some(w), Some(b)) => {
+                let w = fp8_weight_for_compute(w);
+                let b = fp8_weight_for_compute(b);
+                x.multiply(&w).add(&b)
+            }
+            (Some(w), None) => {
+                let w = fp8_weight_for_compute(w);
+                x.multiply(&w)
+            }
+            (None, Some(b)) => {
+                let b = fp8_weight_for_compute(b);
+                x.add(&b)
+            }
             (None, None) => x,
         }
     }
@@ -374,11 +402,12 @@ impl Embedding {
     }
 
     pub fn forward(&self, x: &Array) -> Array {
-        self.weight.value.take_axis(x, 0)
+        let weight = fp8_weight_for_compute(&self.weight.value);
+        weight.take_axis(x, 0)
     }
 
     pub fn as_linear(&self, x: &Array) -> Array {
-        x.matmul(&self.weight.value.t())
+        linear_forward_array(x, &self.weight.value, None)
     }
 }
 

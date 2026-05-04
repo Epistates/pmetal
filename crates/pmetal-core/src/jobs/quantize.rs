@@ -33,7 +33,32 @@ pub struct QuantizeSpec {
     pub imatrix: Option<String>,
 
     #[job(label = "Method", group = "Method", argv = "--method", kind = "enum",
-          enum_options = ["dynamic", "q2_k", "q3_k", "q4_0", "q4_k_m", "q5_0", "q5_k_m", "q6_k", "q8_0", "f16", "f32"],
+          enum_options = [
+              "dynamic",
+              "q1_0",
+              "q2_k",
+              "q3_k_s",
+              "q3_k_m",
+              "q3_k_l",
+              "q4_0",
+              "q4_1",
+              "q4_k_s",
+              "q4_k_m",
+              "q5_0",
+              "q5_1",
+              "q5_k_s",
+              "q5_k_m",
+              "q6_k",
+              "q8_0",
+              "q8_1",
+              "tq1_0",
+              "tq2_0",
+              "mxfp4",
+              "nvfp4",
+              "bf16",
+              "f16",
+              "f32"
+          ],
           default = "dynamic")]
     #[serde(default = "default_method")]
     pub method: String,

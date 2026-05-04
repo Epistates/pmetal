@@ -26,6 +26,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::expert_io::ExpertOffloadContext;
 use crate::expert_prefetch::{ExpertPrefetcher, PrefetchedExpert};
+use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use crate::traits::ModelConfig;
 use pmetal_metal::expert_buffer::{ExpertBufferPool, ExpertBufferPoolConfig};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
@@ -1026,19 +1027,27 @@ impl Qwen3NextGatedDeltaNet {
             return;
         }
         use pmetal_bridge::inline_array::InlineArray;
+        fn inline_weight(arr: &Array) -> InlineArray {
+            let ia = InlineArray::from_array(arr);
+            if arr.dtype() == Dtype::Uint8 {
+                ia.from_fp8(Dtype::Bfloat16.as_i32())
+            } else {
+                ia
+            }
+        }
         // Pre-transpose weights via InlineArray.t() (no Result overhead)
         let iw = GdnInlineWeights {
-            qkv_wt: InlineArray::from_array(self.in_proj_qkv.weight.as_ref()).t(),
-            z_wt: InlineArray::from_array(self.in_proj_z.weight.as_ref()).t(),
-            b_wt: InlineArray::from_array(self.in_proj_b.weight.as_ref()).t(),
-            a_wt: InlineArray::from_array(self.in_proj_a.weight.as_ref()).t(),
-            conv_w: InlineArray::from_array(self.conv1d.weight.as_ref()),
-            out_wt: InlineArray::from_array(self.out_proj.weight.as_ref()).t(),
-            q_norm_w: InlineArray::from_array(&self.q_norm_weight),
-            k_norm_w: InlineArray::from_array(&self.k_norm_weight),
-            a_log: InlineArray::from_array(self.a_log.as_ref()),
-            dt_bias: InlineArray::from_array(self.dt_bias.as_ref()),
-            norm_w: InlineArray::from_array(self.norm.weight.as_ref()),
+            qkv_wt: inline_weight(self.in_proj_qkv.weight.as_ref()).t(),
+            z_wt: inline_weight(self.in_proj_z.weight.as_ref()).t(),
+            b_wt: inline_weight(self.in_proj_b.weight.as_ref()).t(),
+            a_wt: inline_weight(self.in_proj_a.weight.as_ref()).t(),
+            conv_w: inline_weight(self.conv1d.weight.as_ref()),
+            out_wt: inline_weight(self.out_proj.weight.as_ref()).t(),
+            q_norm_w: inline_weight(&self.q_norm_weight),
+            k_norm_w: inline_weight(&self.k_norm_weight),
+            a_log: inline_weight(self.a_log.as_ref()),
+            dt_bias: inline_weight(self.dt_bias.as_ref()),
+            norm_w: inline_weight(self.norm.weight.as_ref()),
         };
         self.inline_weights = Some(iw);
     }
@@ -1062,10 +1071,10 @@ impl Qwen3NextGatedDeltaNet {
 
         if needs_refresh {
             let weights = [
-                self.in_proj_qkv.weight.as_ref().clone(),
-                self.in_proj_z.weight.as_ref().clone(),
-                self.in_proj_b.weight.as_ref().clone(),
-                self.in_proj_a.weight.as_ref().clone(),
+                dequantize_fp8_weight_for_compute(self.in_proj_qkv.weight.as_ref())?,
+                dequantize_fp8_weight_for_compute(self.in_proj_z.weight.as_ref())?,
+                dequantize_fp8_weight_for_compute(self.in_proj_b.weight.as_ref())?,
+                dequantize_fp8_weight_for_compute(self.in_proj_a.weight.as_ref())?,
             ];
             let weight_refs: Vec<&Array> = weights.iter().collect();
             let combined = ops::concatenate_axis(&weight_refs, 0);
@@ -1081,13 +1090,9 @@ impl Qwen3NextGatedDeltaNet {
     /// Matches Python's `in_proj_qkvz` (key_dim*2 + value_dim*2 output dim).
     pub fn ensure_combined_qkvz_weight(&mut self) -> Result<Array, Exception> {
         if self.combined_qkvz_weight.is_none() {
-            let w = ops::concatenate_axis(
-                &[
-                    self.in_proj_qkv.weight.as_ref(),
-                    self.in_proj_z.weight.as_ref(),
-                ],
-                0,
-            );
+            let qkv = dequantize_fp8_weight_for_compute(self.in_proj_qkv.weight.as_ref())?;
+            let z = dequantize_fp8_weight_for_compute(self.in_proj_z.weight.as_ref())?;
+            let w = ops::concatenate_axis(&[&qkv, &z], 0);
             w.eval();
             self.combined_qkvz_weight = Some(w);
         }
@@ -1098,13 +1103,9 @@ impl Qwen3NextGatedDeltaNet {
     /// Matches Python's `in_proj_ba` (num_v_heads*2 output dim).
     pub fn ensure_combined_ba_weight(&mut self) -> Result<Array, Exception> {
         if self.combined_ba_weight.is_none() {
-            let w = ops::concatenate_axis(
-                &[
-                    self.in_proj_b.weight.as_ref(),
-                    self.in_proj_a.weight.as_ref(),
-                ],
-                0,
-            );
+            let b = dequantize_fp8_weight_for_compute(self.in_proj_b.weight.as_ref())?;
+            let a = dequantize_fp8_weight_for_compute(self.in_proj_a.weight.as_ref())?;
+            let w = ops::concatenate_axis(&[&b, &a], 0);
             w.eval();
             self.combined_ba_weight = Some(w);
         }
@@ -1162,13 +1163,15 @@ impl Qwen3NextGatedDeltaNet {
         let batch = inputs.dim(0);
         let hidden = inputs.dim(2);
         let flat = inputs.reshape(&[batch, hidden]);
+        let weight = dequantize_fp8_weight_for_compute(weight)?;
         let projected = ops::matmul(&flat, &weight.t());
         Ok(projected.reshape(&[batch, 1, output_dim]))
     }
 
     fn decode_out_projection(&self, out: &Array, batch: i32) -> Result<Array, Exception> {
         let flat = out.reshape(&[batch, self.value_dim]);
-        let projected = ops::matmul(&flat, &self.out_proj.weight.as_ref().t());
+        let weight = dequantize_fp8_weight_for_compute(self.out_proj.weight.as_ref())?;
+        let projected = ops::matmul(&flat, &weight.t());
         Ok(projected.reshape(&[batch, 1, self.hidden_size]))
     }
 
@@ -2135,9 +2138,9 @@ impl Qwen3NextSparseMoeBlock {
 
         if needs_refresh {
             let weights = [
-                self.shared_expert.gate_proj.weight.as_ref().clone(),
-                self.shared_expert.up_proj.weight.as_ref().clone(),
-                self.shared_expert_gate.weight.as_ref().clone(),
+                dequantize_fp8_weight_for_compute(self.shared_expert.gate_proj.weight.as_ref())?,
+                dequantize_fp8_weight_for_compute(self.shared_expert.up_proj.weight.as_ref())?,
+                dequantize_fp8_weight_for_compute(self.shared_expert_gate.weight.as_ref())?,
             ];
             let weight_refs: Vec<&Array> = weights.iter().collect();
             let combined = ops::concatenate_axis(&weight_refs, 0);
@@ -2172,7 +2175,9 @@ impl Qwen3NextSparseMoeBlock {
         let shared_gate_logit =
             slice_last_from(&projected, intermediate * 2).reshape(&[batch_seq, 1]);
         let hidden = nn::silu(&gate).multiply(&up);
-        let shared_y = ops::matmul(&hidden, &self.shared_expert.down_proj.weight.as_ref().t());
+        let down_weight =
+            dequantize_fp8_weight_for_compute(self.shared_expert.down_proj.weight.as_ref())?;
+        let shared_y = ops::matmul(&hidden, &down_weight.t());
 
         Ok((shared_y, shared_gate_logit))
     }
@@ -2256,15 +2261,18 @@ impl Qwen3NextSparseMoeBlock {
         // Weights are stored as [E, out, in] from checkpoint; gather_mm expects
         // A[..., M, K] @ B[E, K, N], so we transpose the last two dims (like mlx-lm's
         // SwitchLinear which calls weight.swapaxes(-1, -2) at forward time).
-        let gate_w = self.switch_mlp_gate_proj.as_ref().swap_axes(-1, -2);
-        let up_w = self.switch_mlp_up_proj.as_ref().swap_axes(-1, -2);
+        let gate_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_gate_proj.as_ref())?;
+        let up_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_up_proj.as_ref())?;
+        let gate_w = gate_weight.swap_axes(-1, -2);
+        let up_w = up_weight.swap_axes(-1, -2);
         let gate_out = gather_mm(&x_expanded, &gate_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, intermediate]
         let up_out = gather_mm(&x_expanded, &up_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, intermediate]
 
         let activated = nn::silu(&gate_out).multiply(&up_out);
 
         // Down projection
-        let down_w = self.switch_mlp_down_proj.as_ref().swap_axes(-1, -2);
+        let down_weight = dequantize_fp8_weight_for_compute(self.switch_mlp_down_proj.as_ref())?;
+        let down_w = down_weight.swap_axes(-1, -2);
         let down_out = gather_mm(&activated, &down_w, None, Some(&top_indices_i32), false)?; // [N, k, 1, D]
 
         // squeeze(-2) removes the size-1 dim: [N, k, 1, D] → [N, k, D]
@@ -3706,7 +3714,11 @@ impl Qwen3NextForCausalLM {
         let final_norm_weight = self.model.norm.weight.as_ref().clone();
         let final_norm_eps = self.model.norm.eps;
         let tie_word_embeddings = self.config.tie_word_embeddings;
-        let lm_head_weight = self.lm_head.as_ref().map(|l| l.weight.as_ref().clone());
+        let lm_head_weight = self
+            .lm_head
+            .as_ref()
+            .map(|l| dequantize_fp8_weight_for_compute(l.weight.as_ref()))
+            .transpose()?;
 
         // Capture per-layer weights
         struct LayerWeights {
@@ -3812,7 +3824,9 @@ impl Qwen3NextForCausalLM {
                 lw.gdn_dt_bias = Some(gdn.dt_bias.as_ref().clone());
                 lw.gdn_norm_w = Some(gdn.norm.weight.as_ref().clone());
                 lw.gdn_norm_eps = Some(gdn.norm.eps);
-                lw.gdn_out_w = Some(gdn.out_proj.weight.as_ref().clone());
+                lw.gdn_out_w = Some(dequantize_fp8_weight_for_compute(
+                    gdn.out_proj.weight.as_ref(),
+                )?);
                 lw.gdn_num_v_heads = gdn.num_v_heads;
                 lw.gdn_num_k_heads = gdn.num_k_heads;
                 lw.gdn_head_k_dim = gdn.head_k_dim;
@@ -3822,10 +3836,18 @@ impl Qwen3NextForCausalLM {
                 lw.gdn_conv_kernel_size = gdn.conv_kernel_size;
             } else {
                 let attn = layer.self_attn.as_ref().unwrap();
-                lw.q_proj_w = Some(attn.q_proj.weight.as_ref().clone());
-                lw.k_proj_w = Some(attn.k_proj.weight.as_ref().clone());
-                lw.v_proj_w = Some(attn.v_proj.weight.as_ref().clone());
-                lw.o_proj_w = Some(attn.o_proj.weight.as_ref().clone());
+                lw.q_proj_w = Some(dequantize_fp8_weight_for_compute(
+                    attn.q_proj.weight.as_ref(),
+                )?);
+                lw.k_proj_w = Some(dequantize_fp8_weight_for_compute(
+                    attn.k_proj.weight.as_ref(),
+                )?);
+                lw.v_proj_w = Some(dequantize_fp8_weight_for_compute(
+                    attn.v_proj.weight.as_ref(),
+                )?);
+                lw.o_proj_w = Some(dequantize_fp8_weight_for_compute(
+                    attn.o_proj.weight.as_ref(),
+                )?);
                 lw.q_norm_w = Some(attn.q_norm.weight.as_ref().clone());
                 lw.q_norm_eps = Some(attn.q_norm.eps);
                 lw.k_norm_w = Some(attn.k_norm.weight.as_ref().clone());
@@ -3842,9 +3864,11 @@ impl Qwen3NextForCausalLM {
             // MLP weights (dense path only for now)
             match &layer.mlp {
                 Qwen3NextFeedForward::Dense(mlp) => {
-                    lw.mlp_gate_w = mlp.gate_proj.weight.as_ref().clone();
-                    lw.mlp_up_w = mlp.up_proj.weight.as_ref().clone();
-                    lw.mlp_down_w = mlp.down_proj.weight.as_ref().clone();
+                    lw.mlp_gate_w =
+                        dequantize_fp8_weight_for_compute(mlp.gate_proj.weight.as_ref())?;
+                    lw.mlp_up_w = dequantize_fp8_weight_for_compute(mlp.up_proj.weight.as_ref())?;
+                    lw.mlp_down_w =
+                        dequantize_fp8_weight_for_compute(mlp.down_proj.weight.as_ref())?;
                 }
                 Qwen3NextFeedForward::MoE(_) => {
                     // MoE layers fall back to uncompiled path

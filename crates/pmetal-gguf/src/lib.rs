@@ -35,6 +35,7 @@
 pub mod config;
 pub mod dequant;
 pub mod dynamic;
+mod fp4;
 pub mod imatrix;
 pub mod iq_quants;
 pub mod k_quants;

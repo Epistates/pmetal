@@ -118,6 +118,31 @@ impl InlineArray {
         }
     }
 
+    /// Convert a floating-point matrix to MLX's native E4M3 FP8 representation.
+    ///
+    /// MLX stores FP8 payloads in `uint8` arrays and expects callers to use
+    /// `from_fp8` before arithmetic that does not consume FP8 directly.
+    pub fn to_fp8(&self) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_to_fp8(dst.as_mut_ptr(), &self.raw);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
+    /// Dequantize an MLX E4M3 FP8 payload into a floating-point dtype.
+    pub fn from_fp8(&self, dtype: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_from_fp8(dst.as_mut_ptr(), &self.raw, dtype);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
     /// Cast to a Rust primitive type `T` — compatible with mlx-rs `as_type::<T>()`.
     ///
     /// Uses the [`AsDtype`] sealed trait to map Rust types to MLX dtypes.

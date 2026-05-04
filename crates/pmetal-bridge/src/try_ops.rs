@@ -26,8 +26,8 @@
 //! the checked surface focused; other ops can adopt a `try_*` sibling
 //! later as their callers need them.
 
-use crate::InlineArray;
 use crate::error::{BridgeResult, check_last_error};
+use crate::{InlineArray, QuantizedMode};
 
 impl InlineArray {
     // ── Binary / reduction math ──────────────────────────────────────────
@@ -60,6 +60,20 @@ impl InlineArray {
     /// sampling + MoE test-abort findings.
     pub fn try_reshape(&self, shape: &[i32]) -> BridgeResult<Self> {
         let out = self.reshape(shape);
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked native E4M3 FP8 quantization. MLX stores the result as `uint8`.
+    pub fn try_to_fp8(&self) -> BridgeResult<Self> {
+        let out = self.to_fp8();
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked native E4M3 FP8 dequantization to the requested floating dtype.
+    pub fn try_from_fp8(&self, dtype: i32) -> BridgeResult<Self> {
+        let out = self.from_fp8(dtype);
         check_last_error()?;
         Ok(out)
     }
@@ -138,6 +152,23 @@ impl InlineArray {
         Ok(out)
     }
 
+    /// Checked quantized matmul in a specific MLX quantization mode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_quantized_matmul_mode(
+        &self,
+        w: &Self,
+        scales: &Self,
+        biases: Option<&Self>,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        mode: QuantizedMode,
+    ) -> BridgeResult<Self> {
+        let out = self.quantized_matmul_mode(w, scales, biases, transpose, group_size, bits, mode);
+        check_last_error()?;
+        Ok(out)
+    }
+
     /// Checked gather-quantized-matmul. The argument count mirrors the
     /// underlying FFI; the `too_many_arguments` lint is suppressed because
     /// splitting into a builder would just relocate the noise.
@@ -165,6 +196,49 @@ impl InlineArray {
             bits,
             sorted,
         );
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked gather-quantized-matmul in a specific MLX quantization mode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_gather_qmm_mode(
+        &self,
+        w: &Self,
+        scales: &Self,
+        biases: Option<&Self>,
+        lhs_indices: Option<&Self>,
+        rhs_indices: Option<&Self>,
+        transpose: bool,
+        group_size: i32,
+        bits: i32,
+        sorted: bool,
+        mode: QuantizedMode,
+    ) -> BridgeResult<Self> {
+        let out = self.gather_qmm_mode(
+            w,
+            scales,
+            biases,
+            lhs_indices,
+            rhs_indices,
+            transpose,
+            group_size,
+            bits,
+            sorted,
+            mode,
+        );
+        check_last_error()?;
+        Ok(out)
+    }
+
+    /// Checked quantize in a non-affine MLX quantization mode.
+    pub fn try_quantize_weights_mode(
+        &self,
+        group_size: i32,
+        bits: i32,
+        mode: QuantizedMode,
+    ) -> BridgeResult<(Self, Self)> {
+        let out = self.quantize_weights_mode(group_size, bits, mode);
         check_last_error()?;
         Ok(out)
     }

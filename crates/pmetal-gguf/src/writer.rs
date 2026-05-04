@@ -6,7 +6,7 @@ use crate::{
 };
 use byteorder::{LittleEndian, WriteBytesExt};
 use pmetal_core::{PMetalError, Result};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::{Seek, Write};
 
 use crate::reader::{MAX_ARRAY_LENGTH, MAX_STRING_LENGTH};
@@ -241,7 +241,14 @@ impl GgufBuilder {
             validate_metadata_value(value)?;
         }
 
+        let mut tensor_names = HashSet::with_capacity(self.tensors.len());
         for (info, data) in &self.tensors {
+            if !tensor_names.insert(info.name.as_str()) {
+                return Err(PMetalError::InvalidArgument(format!(
+                    "Duplicate GGUF tensor name: {}",
+                    info.name
+                )));
+            }
             if info.name.len() > MAX_STRING_LENGTH {
                 return Err(PMetalError::InvalidArgument(format!(
                     "GGUF tensor name {} exceeds {} bytes",
@@ -254,6 +261,14 @@ impl GgufBuilder {
                     info.name,
                     info.n_dimensions,
                     info.dimensions.len()
+                )));
+            }
+            if info.n_dimensions > crate::reader::MAX_TENSOR_DIMS {
+                return Err(PMetalError::InvalidArgument(format!(
+                    "GGUF tensor {} has {} dimensions, exceeding maximum of {}",
+                    info.name,
+                    info.n_dimensions,
+                    crate::reader::MAX_TENSOR_DIMS
                 )));
             }
             let expected = info.byte_size_checked().map_err(|e| {
@@ -474,8 +489,10 @@ impl GgufBuilder {
             .map_err(|e| {
                 pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
             })?;
-        // Dimensions
-        for dim in &info.dimensions {
+        // GGUF stores dimensions with the fastest-changing axis first. The
+        // public builder accepts conventional row-major shapes, matching the
+        // reader's reversed `TensorInfo::dimensions`.
+        for dim in info.dimensions.iter().rev() {
             writer.write_u64::<LittleEndian>(*dim).map_err(|e| {
                 pmetal_core::PMetalError::Io(std::io::Error::new(e.kind(), e.to_string()))
             })?;
@@ -636,6 +653,22 @@ mod tests {
     }
 
     #[test]
+    fn tensor_dimensions_round_trip_in_row_major_order() {
+        let mut builder = GgufBuilder::with_model("llama", "test-model");
+        builder.add_f32_tensor(
+            "test.weight",
+            vec![2, 3],
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+        );
+
+        let bytes = builder.build_to_bytes().unwrap();
+        let mut cursor = std::io::Cursor::new(bytes);
+        let content = crate::GgufContent::read(&mut cursor).unwrap();
+        let info = content.get_tensor_info("test.weight").unwrap();
+        assert_eq!(info.dimensions, vec![2, 3]);
+    }
+
+    #[test]
     fn test_alignment() {
         assert_eq!(align_offset(0, 32), 0);
         assert_eq!(align_offset(1, 32), 32);
@@ -678,6 +711,14 @@ mod tests {
     fn tensor_byte_size_mismatch_is_rejected() {
         let mut builder = GgufBuilder::with_model("llama", "test-model");
         builder.add_raw_tensor("bad.weight", vec![2], GgmlType::F32, vec![0; 4]);
+        assert!(builder.build_to_bytes().is_err());
+    }
+
+    #[test]
+    fn duplicate_tensor_names_are_rejected() {
+        let mut builder = GgufBuilder::with_model("llama", "test-model");
+        builder.add_f32_tensor("dup.weight", vec![1], vec![1.0]);
+        builder.add_f32_tensor("dup.weight", vec![1], vec![2.0]);
         assert!(builder.build_to_bytes().is_err());
     }
 }

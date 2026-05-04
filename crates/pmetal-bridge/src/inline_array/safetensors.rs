@@ -140,12 +140,16 @@ fn inline_array_from_tensor_view(
         SafeDtype::F16 => Some(InlineArray::from_u16_bits_slice(
             as_typed_slice::<u16>(tensor.data())?,
             &shape,
-            1,
+            9,
         )),
         SafeDtype::BF16 => Some(InlineArray::from_u16_bits_slice(
             as_typed_slice::<u16>(tensor.data())?,
             &shape,
             11,
+        )),
+        SafeDtype::F8_E4M3 => Some(InlineArray::from_u8_slice(
+            as_typed_slice::<u8>(tensor.data())?,
+            &shape,
         )),
         SafeDtype::I64 => {
             let values = as_typed_slice::<i64>(tensor.data())?;

@@ -271,6 +271,25 @@ void mlx_inline_quantize(mlx_inline_array* dst_w, mlx_inline_array* dst_scales,
     }
 }
 
+void mlx_inline_quantize_mode(mlx_inline_array* dst_w, mlx_inline_array* dst_scales,
+                               const mlx_inline_array* a, int group_size, int bits, int mode) {
+    // Multi-output op for MLX floating-point quantization modes such as mxfp8.
+    try {
+        auto result = mlx::core::quantize(as_arr(a), group_size, bits, quant_mode_from_int(mode));
+        new (dst_w->buf)      array(std::move(result[0]));
+        new (dst_scales->buf) array(std::move(result[1]));
+        pmetal_bridge_clear_error_internal();
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("quantize_mode", e.what());
+        new (dst_w->buf)      array(0.0f);
+        new (dst_scales->buf) array(0.0f);
+    } catch (...) {
+        pmetal_bridge_set_last_error("quantize_mode", "unknown C++ exception");
+        new (dst_w->buf)      array(0.0f);
+        new (dst_scales->buf) array(0.0f);
+    }
+}
+
 // ── Training ops: multi-axis sum/mean ────────────────────────────────────────
 
 void mlx_inline_sum_axes(mlx_inline_array* dst, const mlx_inline_array* a,

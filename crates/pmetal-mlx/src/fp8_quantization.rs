@@ -22,29 +22,23 @@
 //! let output = fp8_linear.forward(&input)?;
 //! ```
 //!
-//! # Status: Not yet integrated
+//! # Status
 //!
-//! FP8 formats (E4M3/E5M2) are fully implemented with dynamic scaling and tests pass,
-//! but `Fp8Linear` is not yet wired into the model quantization pipelines or training
-//! loops. Next step: hook into the weight-loading path and expose an `--fp8` flag in
-//! the training/inference CLI.
+//! Runtime inference quantization is wired through the shared model loader and
+//! uses MLX native E4M3 FP8 encode/decode through `pmetal-bridge`.
 
 use crate::ArrayDtypeExt;
 use pmetal_bridge::compat::{Array, Dtype, Exception, random};
 use serde::{Deserialize, Serialize};
 
-// FP8 bridge stubs — MLX native to_fp8/from_fp8 are not yet exposed in pmetal-bridge.
-// These cast-based stubs preserve compilability and API shape;
-// actual FP8 E4M3 quantization requires upstream bridge support.
 #[inline]
 fn to_fp8(x: &Array) -> Result<Array, Exception> {
-    // Approximate: cast to uint8 (not true E4M3, but preserves type contract)
-    Ok(x.as_dtype(Dtype::Uint8.as_i32()))
+    pmetal_bridge::compat::ops::to_fp8(x)
 }
 
 #[inline]
 fn from_fp8(x: &Array, dtype: Dtype) -> Result<Array, Exception> {
-    Ok(x.as_dtype(dtype.as_i32()))
+    pmetal_bridge::compat::ops::from_fp8(x, dtype)
 }
 
 /// FP8 format type.

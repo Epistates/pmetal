@@ -2,17 +2,19 @@
 //! absorbs a random rotation into Q/K/V/O so cached K/V coordinates quantize
 //! more uniformly (TurboQuant / PolarQuant / QuIP# insight).
 
-use crate::InlineArray;
+use crate::{InlineArray, QuantizedMode};
 
 use super::QuantizationConfig;
 
-/// A projection weight that is either a dense bf16 tensor or a 4-bit
-/// quantized triple (`weight`, `scales`, `biases`).
+/// A projection weight that is either dense or stored in an MLX quantized
+/// matmul format.
 ///
 /// - **Dense**: single `InlineArray`, used with `x.matmul(w)`.
 /// - **Quantized**: three `InlineArray`s loaded from `{key}.weight`,
 ///   `{key}.scales`, `{key}.biases`; used with
 ///   `x.quantized_matmul(w, scales, biases, transpose=true, group_size, bits)`.
+/// - **FpQuantized**: floating-point MLX quantization modes such as mxfp8;
+///   used with `biases=None` and the mode-aware quantized matmul entry point.
 ///
 /// The `transpose=true` flag is standard: MLX stores quantized weights in
 /// row-major `[out, in/group_size]` layout and expects the caller to signal
@@ -33,6 +35,13 @@ pub enum LayerWeight {
         group_size: i32,
         bits: i32,
     },
+    FpQuantized {
+        weight: InlineArray,
+        scales: InlineArray,
+        group_size: i32,
+        bits: i32,
+        mode: QuantizedMode,
+    },
 }
 
 impl LayerWeight {
@@ -41,7 +50,12 @@ impl LayerWeight {
         match self {
             LayerWeight::Dense(w) => w,
             LayerWeight::Quantized { weight, .. } => weight,
+            LayerWeight::FpQuantized { weight, .. } => weight,
         }
+    }
+
+    pub(crate) fn is_dense(&self) -> bool {
+        matches!(self, LayerWeight::Dense(_))
     }
 
     /// `x @ self` — dispatches to `quantized_matmul` or `matmul` as appropriate.
@@ -59,6 +73,13 @@ impl LayerWeight {
                 group_size,
                 bits,
             } => x.quantized_matmul(weight, scales, Some(biases), true, *group_size, *bits),
+            LayerWeight::FpQuantized {
+                weight,
+                scales,
+                group_size,
+                bits,
+                mode,
+            } => x.quantized_matmul_mode(weight, scales, None, true, *group_size, *bits, *mode),
         }
     }
 
@@ -93,6 +114,24 @@ impl LayerWeight {
                 *bits,
                 sorted,
             ),
+            LayerWeight::FpQuantized {
+                weight,
+                scales,
+                group_size,
+                bits,
+                mode,
+            } => x.gather_qmm_mode(
+                weight,
+                scales,
+                None,
+                lhs_indices,
+                rhs_indices,
+                true,
+                *group_size,
+                *bits,
+                sorted,
+                *mode,
+            ),
         }
     }
 
@@ -119,6 +158,23 @@ impl LayerWeight {
                     biases: b2,
                     group_size: *group_size,
                     bits: *bits,
+                }
+            }
+            LayerWeight::FpQuantized {
+                weight,
+                scales,
+                group_size,
+                bits,
+                mode,
+            } => {
+                let w2 = copy_fresh_arr(weight, zero);
+                let s2 = copy_fresh_arr(scales, zero);
+                LayerWeight::FpQuantized {
+                    weight: w2,
+                    scales: s2,
+                    group_size: *group_size,
+                    bits: *bits,
+                    mode: *mode,
                 }
             }
         }
@@ -257,6 +313,43 @@ impl std::fmt::Debug for NativeWeights {
             .field("tie_word_embeddings", &self.tie_word_embeddings)
             .field("model_dtype", &self.model_dtype)
             .finish()
+    }
+}
+
+impl NativeWeights {
+    pub(crate) fn projection_weights_are_dense(&self) -> bool {
+        self.embed_scales.is_none()
+            && self.embed_biases.is_none()
+            && self.lm_head_w.as_ref().map_or(true, LayerWeight::is_dense)
+            && self
+                .layers
+                .iter()
+                .all(LayerWeights::projection_weights_are_dense)
+    }
+}
+
+impl LayerWeights {
+    fn projection_weights_are_dense(&self) -> bool {
+        let is_dense = |w: &Option<LayerWeight>| w.as_ref().map_or(true, LayerWeight::is_dense);
+
+        is_dense(&self.mlp_gate_w)
+            && is_dense(&self.mlp_up_w)
+            && is_dense(&self.mlp_down_w)
+            && is_dense(&self.moe_gate_w)
+            && is_dense(&self.moe_up_w)
+            && is_dense(&self.moe_down_w)
+            && is_dense(&self.shared_gate_w)
+            && is_dense(&self.shared_up_w)
+            && is_dense(&self.shared_down_w)
+            && is_dense(&self.attn_q_w)
+            && is_dense(&self.attn_k_w)
+            && is_dense(&self.attn_v_w)
+            && is_dense(&self.attn_o_w)
+            && is_dense(&self.gdn_qkv_w)
+            && is_dense(&self.gdn_z_w)
+            && is_dense(&self.gdn_b_w)
+            && is_dense(&self.gdn_a_w)
+            && is_dense(&self.gdn_out_w)
     }
 }
 

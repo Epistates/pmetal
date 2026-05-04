@@ -473,21 +473,16 @@ pub fn rsqrt(a: &Array) -> Array {
     a.rsqrt()
 }
 
-/// Quantize to FP8 (E4M3 format, stored as uint8).
-///
-/// Stub implementation — returns the input cast to Float16 then reinterpreted
-/// as uint8.  Replace with proper FP8 when available.
+/// Quantize to MLX native FP8 (E4M3 format, stored as uint8).
 pub fn to_fp8(x: &Array) -> Result<Array, super::Exception> {
-    // FP8 is not yet in the inline bridge; fall back to float16 as uint8.
-    let fp16 = x.as_dtype(super::Dtype::Float16.as_i32());
-    Ok(fp16.as_dtype(super::Dtype::Uint8.as_i32()))
+    x.try_to_fp8()
+        .map_err(|err| super::Exception::custom(err.to_string()))
 }
 
-/// Dequantize from FP8 to the target dtype.
-///
-/// Stub implementation — casts uint8 input to the requested dtype.
+/// Dequantize from MLX native FP8 (E4M3 uint8 payload) to the target dtype.
 pub fn from_fp8(x: &Array, dtype: super::Dtype) -> Result<Array, super::Exception> {
-    Ok(x.as_dtype(dtype.as_i32()))
+    x.try_from_fp8(dtype.as_i32())
+        .map_err(|err| super::Exception::custom(err.to_string()))
 }
 
 /// Evenly-spaced values from `start` to `stop` (inclusive).
@@ -655,4 +650,32 @@ pub fn slice_axis_from(a: &Array, axis: i32, start: i32) -> Array {
     let e: Vec<i32> = shape.to_vec();
     s[ax] = start;
     a.slice(&s, &e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fp8_roundtrip_preserves_signed_float_values() {
+        let x = Array::from_f32_slice(&[-1.0, -0.5, 0.0, 0.5, 1.0, 2.0], &[2, 3]);
+        let q = to_fp8(&x).expect("to_fp8");
+
+        assert_eq!(q.dtype(), Dtype::Uint8);
+
+        let mut y = from_fp8(&q, Dtype::Float32).expect("from_fp8");
+        y.eval();
+        let got = y.to_f32_vec(6).expect("to_f32_vec");
+
+        assert!(got[0] < -0.75, "expected negative value, got {}", got[0]);
+        assert!(got[1] < -0.25, "expected negative value, got {}", got[1]);
+        assert!(
+            got[2].abs() < 0.05,
+            "expected near-zero value, got {}",
+            got[2]
+        );
+        assert!(got[3] > 0.25, "expected positive value, got {}", got[3]);
+        assert!(got[4] > 0.75, "expected positive value, got {}", got[4]);
+        assert!(got[5] > 1.5, "expected positive value, got {}", got[5]);
+    }
 }

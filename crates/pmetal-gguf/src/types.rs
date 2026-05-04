@@ -3,13 +3,14 @@
 /// GGUF magic number: "GGUF" in bytes.
 pub const GGUF_MAGIC: u32 = 0x46554747; // "GGUF" little-endian
 
-/// Current GGUF version (v3 with big-endian support).
+/// Current GGUF version.
 pub const GGUF_VERSION: u32 = 3;
 
 /// Default alignment for tensor data.
 pub const GGUF_DEFAULT_ALIGNMENT: u32 = 32;
 
 /// GGML tensor data types.
+#[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
 pub enum GgmlType {
@@ -71,10 +72,28 @@ pub enum GgmlType {
     Iq1M = 29,
     /// BFloat16
     Bf16 = 30,
+    /// Q4_0 packed for 4x4 tiles
+    Q4_0_4_4 = 31,
+    /// Q4_0 packed for 4x8 tiles
+    Q4_0_4_8 = 32,
+    /// Q4_0 packed for 8x8 tiles
+    Q4_0_8_8 = 33,
     /// TQ1 type 0
     Tq1_0 = 34,
     /// TQ2 type 0
     Tq2_0 = 35,
+    /// IQ4_NL packed for 4x4 tiles
+    Iq4Nl_4_4 = 36,
+    /// IQ4_NL packed for 4x8 tiles
+    Iq4Nl_4_8 = 37,
+    /// IQ4_NL packed for 8x8 tiles
+    Iq4Nl_8_8 = 38,
+    /// MXFP4 block-floating format
+    Mxfp4 = 39,
+    /// NVFP4 block-floating format
+    Nvfp4 = 40,
+    /// 1-bit quantization (type 0)
+    Q1_0 = 41,
 }
 
 impl GgmlType {
@@ -110,7 +129,16 @@ impl GgmlType {
             Self::I16 => 2,
             Self::I32 => 4,
             Self::I64 | Self::F64 => 8,
-            _ => 2, // Default for other quantized types
+            // Architecture-specific repacked variants. They store the same
+            // 32-value Q4_0/IQ4_NL payloads, only laid out for tile kernels.
+            Self::Q4_0_4_4 | Self::Q4_0_4_8 | Self::Q4_0_8_8 => 18,
+            Self::Iq4Nl_4_4 | Self::Iq4Nl_4_8 | Self::Iq4Nl_8_8 => 18,
+            // Ternary and MXFP4 formats from current ggml.
+            Self::Tq1_0 => 54, // 256 values: 48 qs + 4 qh + 2-byte scale
+            Self::Tq2_0 => 66, // 256 values: 64 qs + 2-byte scale
+            Self::Mxfp4 => 17, // 32 values: 1 E8M0 scale + 16 packed FP4 bytes
+            Self::Nvfp4 => 36, // 64 values: 4-byte scales + 32 packed FP4 bytes
+            Self::Q1_0 => 18,  // 128 values: f16 scale + 16 packed 1-bit bytes
         }
     }
 
@@ -120,8 +148,14 @@ impl GgmlType {
             Self::F32 | Self::F16 | Self::Bf16 | Self::F64 => 1,
             Self::I8 | Self::I16 | Self::I32 | Self::I64 => 1,
             Self::Q4_0 | Self::Q4_1 | Self::Q5_0 | Self::Q5_1 | Self::Q8_0 | Self::Q8_1 => 32,
+            Self::Q4_0_4_4 | Self::Q4_0_4_8 | Self::Q4_0_8_8 => 32,
+            Self::Iq4Nl_4_4 | Self::Iq4Nl_4_8 | Self::Iq4Nl_8_8 => 32,
+            Self::Mxfp4 => 32,
+            Self::Nvfp4 => 64,
+            Self::Q1_0 => 128,
             Self::Q2K | Self::Q3K | Self::Q8K => 256,
             Self::Q4K | Self::Q5K | Self::Q6K => 256,
+            Self::Tq1_0 | Self::Tq2_0 => 256,
             // IQ types: IQ4_NL uses 32, all others use 256
             Self::Iq4Nl => 32,
             Self::Iq1S
@@ -132,7 +166,6 @@ impl GgmlType {
             | Self::Iq3Xxs
             | Self::Iq3S
             | Self::Iq4Xs => 256,
-            _ => 32,
         }
     }
 
@@ -404,6 +437,34 @@ pub mod keys {
     pub const TOKENIZER_PAD_TOKEN_ID: &str = "tokenizer.ggml.padding_token_id";
     /// Chat template
     pub const TOKENIZER_CHAT_TEMPLATE: &str = "tokenizer.chat_template";
+    /// Named chat template list
+    pub const TOKENIZER_CHAT_TEMPLATES: &str = "tokenizer.chat_templates";
+    /// Named chat template key prefix; append the sanitized template name.
+    pub const TOKENIZER_CHAT_TEMPLATE_N_PREFIX: &str = "tokenizer.chat_template.";
+    /// Pre-tokenizer type
+    pub const TOKENIZER_PRE: &str = "tokenizer.ggml.pre";
+    /// Token type count for BERT-style tokenizers
+    pub const TOKENIZER_TOKEN_TYPE_COUNT: &str = "tokenizer.ggml.token_type_count";
+    /// EOT token ID
+    pub const TOKENIZER_EOT_TOKEN_ID: &str = "tokenizer.ggml.eot_token_id";
+    /// EOM token ID
+    pub const TOKENIZER_EOM_TOKEN_ID: &str = "tokenizer.ggml.eom_token_id";
+    /// Separator token ID
+    pub const TOKENIZER_SEP_TOKEN_ID: &str = "tokenizer.ggml.seperator_token_id";
+    /// Mask token ID
+    pub const TOKENIZER_MASK_TOKEN_ID: &str = "tokenizer.ggml.mask_token_id";
+    /// Whether to add BOS during tokenization
+    pub const TOKENIZER_ADD_BOS: &str = "tokenizer.ggml.add_bos_token";
+    /// Whether to add EOS during tokenization
+    pub const TOKENIZER_ADD_EOS: &str = "tokenizer.ggml.add_eos_token";
+    /// Whether to add SEP during tokenization
+    pub const TOKENIZER_ADD_SEP: &str = "tokenizer.ggml.add_sep_token";
+    /// Whether to add a space prefix during tokenization
+    pub const TOKENIZER_ADD_SPACE_PREFIX: &str = "tokenizer.ggml.add_space_prefix";
+    /// Whether to remove extra whitespace during tokenization
+    pub const TOKENIZER_REMOVE_EXTRA_WHITESPACES: &str = "tokenizer.ggml.remove_extra_whitespaces";
+    /// Full HuggingFace tokenizer JSON for provenance/debugging
+    pub const TOKENIZER_HF_JSON: &str = "tokenizer.huggingface.json";
 }
 
 /// Standard tensor names for transformer models.
@@ -479,4 +540,61 @@ pub enum FileType {
     MostlyQ5KM = 17,
     /// Mostly Q6_K
     MostlyQ6K = 18,
+    /// Mostly IQ2_XXS
+    MostlyIq2Xxs = 19,
+    /// Mostly IQ2_XS
+    MostlyIq2Xs = 20,
+    /// Mostly Q2_K_S
+    MostlyQ2KS = 21,
+    /// Mostly IQ3_XS
+    MostlyIq3Xs = 22,
+    /// Mostly IQ3_XXS
+    MostlyIq3Xxs = 23,
+    /// Mostly IQ1_S
+    MostlyIq1S = 24,
+    /// Mostly IQ4_NL
+    MostlyIq4Nl = 25,
+    /// Mostly IQ3_S
+    MostlyIq3S = 26,
+    /// Mostly IQ3_M
+    MostlyIq3M = 27,
+    /// Mostly IQ2_S
+    MostlyIq2S = 28,
+    /// Mostly IQ2_M
+    MostlyIq2M = 29,
+    /// Mostly IQ4_XS
+    MostlyIq4Xs = 30,
+    /// Mostly IQ1_M
+    MostlyIq1M = 31,
+    /// Mostly BF16
+    MostlyBf16 = 32,
+    /// Mostly TQ1_0
+    MostlyTq1_0 = 36,
+    /// Mostly TQ2_0
+    MostlyTq2_0 = 37,
+    /// Mostly MXFP4 MoE
+    MostlyMxfp4Moe = 38,
+    /// Mostly NVFP4
+    MostlyNvfp4 = 39,
+    /// Mostly Q1_0
+    MostlyQ1_0 = 40,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::GgmlType;
+
+    #[test]
+    fn current_ggml_block_sizes_are_accounted_for() {
+        assert_eq!(GgmlType::Tq1_0.block_size(), 256);
+        assert_eq!(GgmlType::Tq1_0.type_size(), 54);
+        assert_eq!(GgmlType::Tq2_0.block_size(), 256);
+        assert_eq!(GgmlType::Tq2_0.type_size(), 66);
+        assert_eq!(GgmlType::Mxfp4.block_size(), 32);
+        assert_eq!(GgmlType::Mxfp4.type_size(), 17);
+        assert_eq!(GgmlType::Nvfp4.block_size(), 64);
+        assert_eq!(GgmlType::Nvfp4.type_size(), 36);
+        assert_eq!(GgmlType::Q1_0.block_size(), 128);
+        assert_eq!(GgmlType::Q1_0.type_size(), 18);
+    }
 }

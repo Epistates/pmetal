@@ -9,6 +9,7 @@
 
 // ModuleParameters derive via impl_module_params!
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
+use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use pmetal_bridge::compat::indexing::IndexOp;
 use pmetal_bridge::compat::{
     Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
@@ -771,20 +772,26 @@ impl DeepSeekMoE {
             .moe
             .experts
             .iter()
-            .map(|expert| expert.w1.weight.as_ref().t())
-            .collect();
+            .map(|expert| {
+                dequantize_fp8_weight_for_compute(expert.w1.weight.as_ref()).map(|w| w.t())
+            })
+            .collect::<Result<Vec<_>>>()?;
         let up_weights: Vec<Array> = self
             .moe
             .experts
             .iter()
-            .map(|expert| expert.w3.weight.as_ref().t())
-            .collect();
+            .map(|expert| {
+                dequantize_fp8_weight_for_compute(expert.w3.weight.as_ref()).map(|w| w.t())
+            })
+            .collect::<Result<Vec<_>>>()?;
         let down_weights: Vec<Array> = self
             .moe
             .experts
             .iter()
-            .map(|expert| expert.w2.weight.as_ref().t())
-            .collect();
+            .map(|expert| {
+                dequantize_fp8_weight_for_compute(expert.w2.weight.as_ref()).map(|w| w.t())
+            })
+            .collect::<Result<Vec<_>>>()?;
         Ok((
             pmetal_bridge::compat::ops::stack_axis(&gate_weights, 0),
             pmetal_bridge::compat::ops::stack_axis(&up_weights, 0),

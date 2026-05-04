@@ -436,7 +436,7 @@ fn generate_cpp(
     temperature: f32,
     on_token: impl FnMut(u32) -> bool,
 ) -> Vec<u32> {
-    if !supports_cpp_decode(config) {
+    if !supports_cpp_decode(weights, config) {
         return generate(
             weights,
             cache,
@@ -460,6 +460,10 @@ fn benchmark_mlx_lm_trial_cpp(
     prompt_ids: &[u32],
     generation_tokens: usize,
 ) -> crate::decode::BenchmarkTrial {
+    if !supports_cpp_decode(weights, config) {
+        return benchmark_mlx_lm_trial(weights, prompt_ids, generation_tokens, None);
+    }
+
     crate::inline_array::reset_peak_memory();
     let mut cache = NativeCache::new_empty(weights);
 
@@ -498,9 +502,9 @@ fn benchmark_mlx_lm_trial_cpp(
 }
 
 #[allow(dead_code)]
-fn supports_cpp_decode(config: &Qwen3Config) -> bool {
+fn supports_cpp_decode(weights: &NativeWeights, config: &Qwen3Config) -> bool {
     let is_quantized = config.quantization_config.is_some();
-    !config.is_qwen3_dense() && !is_quantized
+    !config.is_qwen3_dense() && !is_quantized && weights.projection_weights_are_dense()
 }
 
 fn sync_cpp_state_back(cache: &mut NativeCache, state: &CppForwardState) {

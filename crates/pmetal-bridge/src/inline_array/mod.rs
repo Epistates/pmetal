@@ -33,6 +33,7 @@ mod gdn_methods;
 mod interop;
 mod ops;
 mod quantized;
+pub use quantized::QuantizedMode;
 mod reductions;
 mod shape_ops;
 mod turboquant_methods;

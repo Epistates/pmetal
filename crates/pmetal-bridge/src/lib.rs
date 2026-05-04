@@ -9,7 +9,7 @@
 //! so that model code can use a familiar API backed by the zero-allocation bridge.
 
 pub mod inline_array;
-pub use inline_array::InlineArray;
+pub use inline_array::{InlineArray, QuantizedMode};
 
 pub mod error;
 pub use error::{

@@ -20,6 +20,7 @@ use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
+use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 
 /// Qwen3-MoE model configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -456,18 +457,24 @@ impl Qwen3MoEBlock {
         let gate_weights: Vec<Array> = self
             .experts
             .iter()
-            .map(|expert| expert.w1.weight.as_ref().t())
-            .collect();
+            .map(|expert| {
+                dequantize_fp8_weight_for_compute(expert.w1.weight.as_ref()).map(|w| w.t())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let up_weights: Vec<Array> = self
             .experts
             .iter()
-            .map(|expert| expert.w3.weight.as_ref().t())
-            .collect();
+            .map(|expert| {
+                dequantize_fp8_weight_for_compute(expert.w3.weight.as_ref()).map(|w| w.t())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let down_weights: Vec<Array> = self
             .experts
             .iter()
-            .map(|expert| expert.w2.weight.as_ref().t())
-            .collect();
+            .map(|expert| {
+                dequantize_fp8_weight_for_compute(expert.w2.weight.as_ref()).map(|w| w.t())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         Ok((
             pmetal_bridge::compat::ops::stack_axis(&gate_weights, 0),
             pmetal_bridge::compat::ops::stack_axis(&up_weights, 0),

@@ -591,6 +591,12 @@ impl DynamicLoraModel {
         }
     }
 
+    /// Quantize merged base linear weights to FP8 E4M3 for inference.
+    pub fn quantize_fp8(&mut self) -> Result<(), LoraError> {
+        pmetal_models::fp8_utils::quantize_model_linears(self)?;
+        Ok(())
+    }
+
     /// Unmerge is not supported.
     pub fn unmerge_lora(&mut self) -> Result<(), LoraError> {
         match self {

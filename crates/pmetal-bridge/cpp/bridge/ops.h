@@ -56,6 +56,8 @@ void mlx_inline_softmax_precise(mlx_inline_array* dst, const mlx_inline_array* a
 void mlx_inline_reshape(mlx_inline_array* dst, const mlx_inline_array* a, const int* shape, int ndim);
 void mlx_inline_sum_axis(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims);
 void mlx_inline_astype(mlx_inline_array* dst, const mlx_inline_array* a, int dtype);
+void mlx_inline_to_fp8(mlx_inline_array* dst, const mlx_inline_array* a);
+void mlx_inline_from_fp8(mlx_inline_array* dst, const mlx_inline_array* a, int dtype);
 void mlx_inline_norm_l2(mlx_inline_array* dst, const mlx_inline_array* a, int axis, bool keepdims);
 
 // ── FFT ──────────────────────────────────────────────────────────────────

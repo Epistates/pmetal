@@ -1156,6 +1156,12 @@ fn load_model_with_lora(
     model
         .merge_lora()
         .map_err(|e| Exception::custom(format!("LoRA merge: {e}")))?;
+    if config.fp8 {
+        tracing::info!("Quantizing merged LoRA model weights to FP8 E4M3");
+        model
+            .quantize_fp8()
+            .map_err(|e| Exception::custom(format!("LoRA FP8 quantization: {e}")))?;
+    }
     model
         .eval_all()
         .map_err(|e| Exception::custom(format!("LoRA eval: {e}")))?;
@@ -1399,8 +1405,10 @@ fn select_cache_mode_with_working_set(
 }
 
 fn estimate_weight_bytes(model_path: &Path, param_count: usize, fp8: bool) -> u64 {
-    let param_estimate = estimate_weight_bytes_from_param_count(param_count, fp8);
-    estimate_local_model_weight_bytes(model_path, fp8)
+    let static_fp8_checkpoint = model_uses_weight_scale_inv_fp8(model_path);
+    let param_estimate =
+        estimate_weight_bytes_from_param_count(param_count, fp8 || static_fp8_checkpoint);
+    estimate_local_model_weight_bytes(model_path, fp8, static_fp8_checkpoint)
         .map(|bytes| bytes.max(param_estimate))
         .unwrap_or(param_estimate)
 }
@@ -1413,13 +1421,59 @@ fn estimate_weight_bytes_from_param_count(param_count: usize, fp8: bool) -> u64 
     (param_count as f64 * bpp) as u64
 }
 
-fn estimate_local_model_weight_bytes(model_path: &Path, fp8: bool) -> Option<u64> {
+fn estimate_local_model_weight_bytes(
+    model_path: &Path,
+    fp8: bool,
+    static_fp8_checkpoint: bool,
+) -> Option<u64> {
     let on_disk_bytes = sum_model_weight_file_bytes(model_path)?;
-    Some(if fp8 {
+    Some(if static_fp8_checkpoint {
+        ((on_disk_bytes as f64) * 1.05).ceil() as u64
+    } else if fp8 {
         ((on_disk_bytes as f64) * (1.05 / 2.0)).ceil() as u64
     } else {
         on_disk_bytes
     })
+}
+
+fn model_uses_weight_scale_inv_fp8(model_path: &Path) -> bool {
+    let config_path = model_path.join("config.json");
+    if let Ok(content) = std::fs::read_to_string(config_path) {
+        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&content) {
+            if json_quantization_config_is_fp8(config.get("quantization_config"))
+                || json_quantization_config_is_fp8(config.get("quantization"))
+                || config.get("text_config").is_some_and(|text_config| {
+                    json_quantization_config_is_fp8(text_config.get("quantization_config"))
+                        || json_quantization_config_is_fp8(text_config.get("quantization"))
+                })
+            {
+                return true;
+            }
+        }
+    }
+
+    let index_path = model_path.join("model.safetensors.index.json");
+    let Ok(content) = std::fs::read_to_string(index_path) else {
+        return false;
+    };
+    let Ok(index) = serde_json::from_str::<serde_json::Value>(&content) else {
+        return false;
+    };
+    index
+        .get("weight_map")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|weight_map| {
+            weight_map
+                .keys()
+                .any(|key| key.ends_with("weight_scale_inv"))
+        })
+}
+
+fn json_quantization_config_is_fp8(value: Option<&serde_json::Value>) -> bool {
+    value
+        .and_then(|value| value.get("quant_method"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|method| method.eq_ignore_ascii_case("fp8"))
 }
 
 fn sum_model_weight_file_bytes(model_path: &Path) -> Option<u64> {
@@ -1909,6 +1963,36 @@ mod tests {
         std::fs::write(dir.path().join("model.safetensors"), vec![0u8; 4000]).unwrap();
 
         assert_eq!(estimate_weight_bytes(dir.path(), 0, true), 2100);
+    }
+
+    #[test]
+    fn estimate_weight_bytes_accounts_for_static_fp8_mxfp8_runtime_weights() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join("model.safetensors"), vec![0u8; 4000]).unwrap();
+        std::fs::write(
+            dir.path().join("config.json"),
+            r#"{"quantization_config":{"quant_method":"fp8","fmt":"e4m3"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(estimate_weight_bytes(dir.path(), 0, false), 4200);
+    }
+
+    #[test]
+    fn estimate_weight_bytes_detects_weight_scale_inv_index_sidecars() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("model-00001-of-00001.safetensors"),
+            vec![0u8; 4096],
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("model.safetensors.index.json"),
+            r#"{"weight_map":{"model.layers.0.mlp.gate_proj.weight_scale_inv":"model-00001-of-00001.safetensors"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(estimate_weight_bytes(dir.path(), 0, false), 4301);
     }
 
     #[test]

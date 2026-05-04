@@ -18,7 +18,7 @@
 
 use pmetal_bridge::compat::{Array, Dtype, Exception};
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Error type for weight loading.
 #[derive(Debug, thiserror::Error)]
@@ -82,27 +82,74 @@ impl WeightFormat {
 
         // Check if path is a directory
         if path.is_dir() {
-            // Look for GGUF files
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    if let Some(ext) = entry.path().extension() {
-                        if ext.to_string_lossy().to_lowercase() == "gguf" {
-                            return Some(Self::Gguf);
-                        }
-                    }
-                }
-            }
-
-            // Check for safetensors
-            if path.join("model.safetensors").exists()
-                || path.join("model.safetensors.index.json").exists()
-            {
+            // Prefer canonical HuggingFace safetensors directories when both
+            // formats are present; auxiliary GGUF exports are common in model
+            // workspaces and should not shadow the primary checkpoint.
+            if has_safetensors_weights(path) {
                 return Some(Self::Safetensors);
+            }
+            if find_gguf_file_in_dir(path).is_ok() {
+                return Some(Self::Gguf);
             }
         }
 
         None
     }
+}
+
+fn has_safetensors_weights(path: &Path) -> bool {
+    path.join("model.safetensors").exists() || path.join("model.safetensors.index.json").exists()
+}
+
+fn find_gguf_file_in_dir(path: &Path) -> Result<PathBuf, WeightFormatError> {
+    let mut matches: Vec<PathBuf> = std::fs::read_dir(path)?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+        })
+        .collect();
+    matches.sort();
+
+    if let Some(model_gguf) = matches
+        .iter()
+        .find(|path| path.file_name().and_then(|n| n.to_str()) == Some("model.gguf"))
+    {
+        return Ok(model_gguf.clone());
+    }
+
+    match matches.len() {
+        0 => Err(WeightFormatError::UnsupportedFormat(format!(
+            "No .gguf file found in: {}",
+            path.display()
+        ))),
+        1 => Ok(matches.remove(0)),
+        _ => Err(WeightFormatError::UnsupportedFormat(format!(
+            "Multiple .gguf files found in {}; pass the file path explicitly",
+            path.display()
+        ))),
+    }
+}
+
+fn resolve_gguf_path(path: &Path) -> Result<PathBuf, WeightFormatError> {
+    if path.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    find_gguf_file_in_dir(path)
+}
+
+fn gguf_shape_to_i32(dimensions: &[u64], tensor_name: &str) -> Result<Vec<i32>, WeightFormatError> {
+    dimensions
+        .iter()
+        .map(|&dim| {
+            i32::try_from(dim).map_err(|_| {
+                WeightFormatError::Gguf(format!(
+                    "Tensor {tensor_name} dimension {dim} exceeds MLX i32 shape limits"
+                ))
+            })
+        })
+        .collect()
 }
 
 /// Unified weight loader supporting multiple formats.
@@ -211,29 +258,7 @@ impl WeightLoader {
     pub fn load_gguf(path: impl AsRef<Path>) -> Result<HashMap<String, Array>, WeightFormatError> {
         let path = path.as_ref();
 
-        // Find GGUF file
-        let gguf_path = if path.is_file() {
-            path.to_path_buf()
-        } else {
-            // Look for .gguf file in directory
-            let mut found = None;
-            if let Ok(entries) = std::fs::read_dir(path) {
-                for entry in entries.flatten() {
-                    if let Some(ext) = entry.path().extension() {
-                        if ext.to_string_lossy().to_lowercase() == "gguf" {
-                            found = Some(entry.path());
-                            break;
-                        }
-                    }
-                }
-            }
-            found.ok_or_else(|| {
-                WeightFormatError::UnsupportedFormat(format!(
-                    "No .gguf file found in: {}",
-                    path.display()
-                ))
-            })?
-        };
+        let gguf_path = resolve_gguf_path(path)?;
 
         // Read GGUF content
         let content = pmetal_gguf::GgufContent::from_file(&gguf_path)
@@ -252,14 +277,6 @@ impl WeightLoader {
                 WeightFormatError::Gguf(format!("Tensor not found: {}", tensor_name))
             })?;
 
-            // Read tensor data
-            let data = content
-                .read_tensor_data(&mut file, &tensor_name)
-                .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;
-
-            // Get shape for dequantization
-            let shape: Vec<i32> = tensor_info.dimensions.iter().map(|&d| d as i32).collect();
-
             // Check if dequantization is supported
             if !pmetal_gguf::dequant::is_supported(tensor_info.dtype) {
                 tracing::warn!(
@@ -269,6 +286,14 @@ impl WeightLoader {
                 );
                 continue;
             }
+
+            // Get shape for dequantization
+            let shape = gguf_shape_to_i32(&tensor_info.dimensions, &tensor_name)?;
+
+            // Read tensor data
+            let data = content
+                .read_tensor_data(&mut file, &tensor_name)
+                .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;
 
             // Dequantize to f32
             let floats = pmetal_gguf::dequant::dequantize(&data, tensor_info.dtype, &shape)
@@ -304,7 +329,7 @@ impl WeightLoader {
     ///
     /// GGUF uses names like `blk.0.attn_q.weight`
     /// HuggingFace uses names like `model.layers.0.self_attn.q_proj.weight`
-    fn gguf_to_hf_name(gguf_name: &str) -> String {
+    pub fn gguf_to_hf_name(gguf_name: &str) -> String {
         // Handle special cases first
         match gguf_name {
             "token_embd.weight" => return "model.embed_tokens.weight".to_string(),
@@ -334,6 +359,14 @@ impl WeightLoader {
                     "ffn_gate.weight" => "mlp.gate_proj.weight".to_string(),
                     "ffn_up.weight" => "mlp.up_proj.weight".to_string(),
                     "ffn_down.weight" => "mlp.down_proj.weight".to_string(),
+                    "ffn_gate_inp.weight" => "mlp.gate.weight".to_string(),
+                    "ffn_gate_exps.weight" => "mlp.experts.gate_proj.weight".to_string(),
+                    "ffn_up_exps.weight" => "mlp.experts.up_proj.weight".to_string(),
+                    "ffn_down_exps.weight" => "mlp.experts.down_proj.weight".to_string(),
+                    "ffn_gate_shexp.weight" => "mlp.shared_expert.gate_proj.weight".to_string(),
+                    "ffn_up_shexp.weight" => "mlp.shared_expert.up_proj.weight".to_string(),
+                    "ffn_down_shexp.weight" => "mlp.shared_expert.down_proj.weight".to_string(),
+                    "ffn_gate_inp_shexp.weight" => "mlp.shared_expert_gate.weight".to_string(),
                     // Qwen3-specific (Q/K norm)
                     "attn_q_norm.weight" => "self_attn.q_norm.weight".to_string(),
                     "attn_k_norm.weight" => "self_attn.k_norm.weight".to_string(),
@@ -347,6 +380,58 @@ impl WeightLoader {
 
         // Pass through unknown names
         gguf_name.to_string()
+    }
+
+    /// Map HuggingFace tensor names to GGUF naming.
+    ///
+    /// HuggingFace uses names like `model.layers.0.self_attn.q_proj.weight`;
+    /// GGUF uses names like `blk.0.attn_q.weight`.
+    pub fn hf_to_gguf_name(hf_name: &str) -> String {
+        match hf_name {
+            "model.embed_tokens.weight" => return "token_embd.weight".to_string(),
+            "model.norm.weight" => return "output_norm.weight".to_string(),
+            "lm_head.weight" => return "output.weight".to_string(),
+            _ => {}
+        }
+
+        let Some(rest) = hf_name.strip_prefix("model.layers.") else {
+            return hf_name.to_string();
+        };
+        let Some((layer_idx, suffix)) = rest.split_once('.') else {
+            return hf_name.to_string();
+        };
+        if layer_idx.parse::<usize>().is_err() {
+            return hf_name.to_string();
+        }
+
+        let gguf_suffix = match suffix {
+            "input_layernorm.weight" => "attn_norm.weight",
+            "self_attn.q_proj.weight" => "attn_q.weight",
+            "self_attn.k_proj.weight" => "attn_k.weight",
+            "self_attn.v_proj.weight" => "attn_v.weight",
+            "self_attn.o_proj.weight" => "attn_output.weight",
+            "post_attention_layernorm.weight" => "ffn_norm.weight",
+            "mlp.gate.weight" => "ffn_gate_inp.weight",
+            "mlp.router.weight" => "ffn_gate_inp.weight",
+            "mlp.gate_proj.weight" => "ffn_gate.weight",
+            "mlp.up_proj.weight" => "ffn_up.weight",
+            "mlp.down_proj.weight" => "ffn_down.weight",
+            "mlp.experts.gate_proj.weight" => "ffn_gate_exps.weight",
+            "mlp.experts.up_proj.weight" => "ffn_up_exps.weight",
+            "mlp.experts.down_proj.weight" => "ffn_down_exps.weight",
+            "mlp.shared_expert.gate_proj.weight" => "ffn_gate_shexp.weight",
+            "mlp.shared_expert.up_proj.weight" => "ffn_up_shexp.weight",
+            "mlp.shared_expert.down_proj.weight" => "ffn_down_shexp.weight",
+            "mlp.shared_experts.gate_proj.weight" => "ffn_gate_shexp.weight",
+            "mlp.shared_experts.up_proj.weight" => "ffn_up_shexp.weight",
+            "mlp.shared_experts.down_proj.weight" => "ffn_down_shexp.weight",
+            "mlp.shared_expert_gate.weight" => "ffn_gate_inp_shexp.weight",
+            "self_attn.q_norm.weight" => "attn_q_norm.weight",
+            "self_attn.k_norm.weight" => "attn_k_norm.weight",
+            _ => suffix,
+        };
+
+        format!("blk.{layer_idx}.{gguf_suffix}")
     }
 }
 
@@ -446,7 +531,10 @@ impl GgufModelConfig {
         let rms_norm_eps = get_f32("attention.layer_norm_rms_epsilon").unwrap_or(1e-5);
         let rope_theta = get_f32("rope.freq_base").unwrap_or(10000.0);
         let max_position_embeddings = get_u32("context_length").unwrap_or(4096) as i32;
-        let head_dim = get_u32("attention.head_dim").map(|v| v as i32);
+        let head_dim = get_u32("attention.head_dim")
+            .or_else(|| get_u32("attention.key_length"))
+            .or_else(|| get_u32("rope.dimension_count"))
+            .map(|v| v as i32);
 
         Ok(Self {
             architecture: arch,
@@ -566,28 +654,7 @@ impl GgufModelConfig {
 pub fn get_gguf_architecture(path: impl AsRef<Path>) -> Result<Option<String>, WeightFormatError> {
     let path = path.as_ref();
 
-    let gguf_path = if path.is_file() {
-        path.to_path_buf()
-    } else {
-        // Look for .gguf file in directory
-        let mut found = None;
-        if let Ok(entries) = std::fs::read_dir(path) {
-            for entry in entries.flatten() {
-                if let Some(ext) = entry.path().extension() {
-                    if ext.to_string_lossy().to_lowercase() == "gguf" {
-                        found = Some(entry.path());
-                        break;
-                    }
-                }
-            }
-        }
-        found.ok_or_else(|| {
-            WeightFormatError::UnsupportedFormat(format!(
-                "No .gguf file found in: {}",
-                path.display()
-            ))
-        })?
-    };
+    let gguf_path = resolve_gguf_path(path)?;
 
     let content = pmetal_gguf::GgufContent::from_file(&gguf_path)
         .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;
@@ -677,9 +744,83 @@ mod tests {
     }
 
     #[test]
+    fn test_hf_to_gguf_name_round_trip_core_tensors() {
+        let names = [
+            "model.embed_tokens.weight",
+            "model.norm.weight",
+            "lm_head.weight",
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.1.self_attn.k_proj.weight",
+            "model.layers.2.self_attn.v_proj.weight",
+            "model.layers.3.self_attn.o_proj.weight",
+            "model.layers.4.input_layernorm.weight",
+            "model.layers.5.post_attention_layernorm.weight",
+            "model.layers.6.mlp.gate_proj.weight",
+            "model.layers.7.mlp.up_proj.weight",
+            "model.layers.8.mlp.down_proj.weight",
+            "model.layers.9.self_attn.q_norm.weight",
+            "model.layers.10.self_attn.k_norm.weight",
+        ];
+
+        for name in names {
+            let gguf = WeightLoader::hf_to_gguf_name(name);
+            assert_eq!(WeightLoader::gguf_to_hf_name(&gguf), name);
+        }
+    }
+
+    #[test]
+    fn test_hf_to_gguf_name_moe_tensors() {
+        assert_eq!(
+            WeightLoader::hf_to_gguf_name("model.layers.0.mlp.gate.weight"),
+            "blk.0.ffn_gate_inp.weight"
+        );
+        assert_eq!(
+            WeightLoader::hf_to_gguf_name("model.layers.0.mlp.experts.gate_proj.weight"),
+            "blk.0.ffn_gate_exps.weight"
+        );
+        assert_eq!(
+            WeightLoader::hf_to_gguf_name("model.layers.0.mlp.shared_expert.up_proj.weight"),
+            "blk.0.ffn_up_shexp.weight"
+        );
+    }
+
+    #[test]
     fn test_format_detection_safetensors() {
         // Test with existing test paths (non-existent paths return None)
         assert_eq!(WeightFormat::detect("model.gguf"), None); // File doesn't exist
         assert_eq!(WeightFormat::detect("model.safetensors"), None); // File doesn't exist
+    }
+
+    #[test]
+    fn test_format_detection_prefers_safetensors_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(dir.path().join("model.safetensors")).unwrap();
+        std::fs::File::create(dir.path().join("extra.gguf")).unwrap();
+
+        assert_eq!(
+            WeightFormat::detect(dir.path()),
+            Some(WeightFormat::Safetensors)
+        );
+    }
+
+    #[test]
+    fn test_find_gguf_file_requires_explicit_path_for_ambiguous_dirs() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(dir.path().join("a.gguf")).unwrap();
+        std::fs::File::create(dir.path().join("b.gguf")).unwrap();
+
+        assert!(find_gguf_file_in_dir(dir.path()).is_err());
+    }
+
+    #[test]
+    fn test_find_gguf_file_prefers_model_gguf() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::File::create(dir.path().join("z.gguf")).unwrap();
+        std::fs::File::create(dir.path().join("model.gguf")).unwrap();
+
+        assert_eq!(
+            find_gguf_file_in_dir(dir.path()).unwrap(),
+            dir.path().join("model.gguf")
+        );
     }
 }

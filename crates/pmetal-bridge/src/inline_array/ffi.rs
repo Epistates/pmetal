@@ -37,6 +37,8 @@ unsafe extern "C" {
         keepdims: bool,
     );
     pub(super) fn mlx_inline_astype(dst: *mut RawBuf, a: *const RawBuf, dtype: i32);
+    pub(super) fn mlx_inline_to_fp8(dst: *mut RawBuf, a: *const RawBuf);
+    pub(super) fn mlx_inline_from_fp8(dst: *mut RawBuf, a: *const RawBuf, dtype: i32);
 
     pub(super) fn mlx_inline_gather_mm(
         dst: *mut RawBuf,
@@ -506,6 +508,7 @@ unsafe extern "C" {
         transpose: bool,
         group_size: i32,
         bits: i32,
+        mode: i32,
     );
     pub(super) fn mlx_inline_gather_qmm(
         dst: *mut RawBuf,
@@ -519,6 +522,7 @@ unsafe extern "C" {
         group_size: i32,
         bits: i32,
         sorted: bool,
+        mode: i32,
     );
 
     // ── Sampling ──
@@ -1226,6 +1230,14 @@ unsafe extern "C" {
         a: *const RawBuf,
         group_size: i32,
         bits: i32,
+    );
+    pub(super) fn mlx_inline_quantize_mode(
+        dst_w: *mut RawBuf,
+        dst_scales: *mut RawBuf,
+        a: *const RawBuf,
+        group_size: i32,
+        bits: i32,
+        mode: i32,
     );
 
     // ── Training ops: multi-axis ──

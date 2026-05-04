@@ -116,6 +116,13 @@ pub fn is_critical_tensor(name: &str) -> bool {
         return true;
     }
 
+    // Per-expert tensors are stacked for native MoE inference. Keeping all
+    // experts at the same high bit-width avoids mixed packed shapes within one
+    // stacked projection while preserving affine-quantized execution.
+    if lower.contains(".experts.") {
+        return true;
+    }
+
     // GDN / Mamba-family parameters — quantization degrades recurrent stability.
     if lower.contains("a_log") || lower.contains("dt_bias") || lower.contains("conv1d") {
         return true;
@@ -404,7 +411,7 @@ pub fn quantize_and_save_mlx(
     weights: &HashMap<String, InlineArray>,
     assignments: &[TensorQuant],
     output_dir: &Path,
-    group_size: i32,
+    _group_size: i32,
 ) -> Result<(), String> {
     std::fs::create_dir_all(output_dir)
         .map_err(|e| format!("failed to create output dir '{}: {e}", output_dir.display()))?;
@@ -425,7 +432,7 @@ pub fn quantize_and_save_mlx(
         } else {
             let n = array.size() as u64;
             let packed_bytes = (n * assignment.bits as u64).div_ceil(8);
-            let n_groups = n.div_ceil(group_size as u64);
+            let n_groups = n.div_ceil(assignment.group_size as u64);
             // scales + biases: f16 each, one per group.
             let sb_bytes = n_groups * 2 * 2;
             packed_bytes + sb_bytes
@@ -469,8 +476,9 @@ pub fn quantize_and_save_mlx(
                 shard_key_indices.push((assignment.name.clone(), own_idx));
                 weight_map.insert(assignment.name.clone(), shard_filename.clone());
             } else {
-                let (packed, scales, biases) =
-                    rec.array.quantize_weights(group_size, assignment.bits);
+                let (packed, scales, biases) = rec
+                    .array
+                    .quantize_weights(assignment.group_size, assignment.bits);
                 // Force evaluation before passing to save.
                 packed.eval();
                 scales.eval();
@@ -684,7 +692,7 @@ pub fn quantize_model(
 
         let scores: Vec<(i32, f64)> = if !quantizable {
             // Non-matrix or incompatible shape: passthrough.
-            vec![(BITS_PASSTHROUGH, 0.0)]
+            Vec::new()
         } else if is_critical_tensor(name) || extra_critical.iter().any(|p| name.contains(p)) {
             // Critical: fixed to highest candidate, skip slow evaluation.
             let high_bits = bits_candidates.iter().max().copied().unwrap_or(8);
@@ -697,7 +705,10 @@ pub fn quantize_model(
     }
 
     // Phase 2: allocate bits.
-    let assignments = allocate_bits_for_bpw(&tensor_scores, target_bpw, extra_critical);
+    let mut assignments = allocate_bits_for_bpw(&tensor_scores, target_bpw, extra_critical);
+    for assignment in &mut assignments {
+        assignment.group_size = group_size;
+    }
 
     // Phase 3: quantize and save.
     quantize_and_save_mlx(weights, &assignments, output_dir, group_size)?;
@@ -766,6 +777,9 @@ mod tests {
     #[test]
     fn critical_tensor_gate_and_gdn() {
         assert!(is_critical_tensor("model.layers.0.mlp.gate.weight"));
+        assert!(is_critical_tensor(
+            "model.layers.0.mlp.experts.12.gate_proj.weight"
+        ));
         assert!(is_critical_tensor("model.layers.0.linear_attn.a_log"));
         assert!(is_critical_tensor("model.layers.0.linear_attn.A_log"));
         assert!(is_critical_tensor("model.layers.0.linear_attn.dt_bias"));
@@ -807,6 +821,17 @@ mod tests {
         let steps = vec![0, 1]; // a at step 0 (4-bit), b at step 1 (8-bit)
         let bpw = effective_bpw(&scores, &steps);
         assert!((bpw - 6.0).abs() < 1e-9, "expected 6.0, got {bpw}");
+    }
+
+    #[test]
+    fn effective_bpw_counts_passthrough_as_bf16() {
+        let scores: TensorScores = vec![
+            ("a".into(), 100, vec![]),
+            ("b".into(), 100, vec![(4, 0.02)]),
+        ];
+        let steps = vec![0, 0];
+        let bpw = effective_bpw(&scores, &steps);
+        assert!((bpw - 10.0).abs() < 1e-9, "expected 10.0, got {bpw}");
     }
 
     // ── allocate_bits_for_bpw ─────────────────────────────────────────────────

@@ -225,6 +225,16 @@ void mlx_inline_astype(mlx_inline_array* dst, const mlx_inline_array* a, int dty
         new (dst->buf) array(mlx::core::astype(as_arr(a), dtype_from_int(dtype))));
 }
 
+void mlx_inline_to_fp8(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("to_fp8", dst,
+        new (dst->buf) array(mlx::core::to_fp8(as_arr(a))));
+}
+
+void mlx_inline_from_fp8(mlx_inline_array* dst, const mlx_inline_array* a, int dtype) {
+    BRIDGE_TRY_DST("from_fp8", dst,
+        new (dst->buf) array(mlx::core::from_fp8(as_arr(a), dtype_from_int(dtype))));
+}
+
 // Gather MM
 void mlx_inline_gather_mm(
     mlx_inline_array* dst,

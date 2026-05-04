@@ -198,13 +198,27 @@ pub struct Qwen3Config {
 /// Weight quantization parameters (from `quantization_config` in config.json).
 ///
 /// Present in models quantized with `mlx_lm.convert --q-bits 4` or similar.
-/// The `mode` field is informational only — we always use affine dequant.
+/// FP8 checkpoint metadata uses the same JSON key in HF configs; those entries
+/// are filtered out during parsing because FP8 is normalized from
+/// `weight_scale_inv` sidecars instead of MLX affine `.scales/.biases`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct QuantizationConfig {
+    #[serde(default)]
+    pub quant_method: Option<String>,
     #[serde(default = "default_quantization_bits")]
     pub bits: i32,
     #[serde(default = "default_quantization_group_size")]
     pub group_size: i32,
+    #[serde(default)]
+    pub per_tensor_overrides: std::collections::HashMap<String, i32>,
+}
+
+impl QuantizationConfig {
+    fn is_fp8_metadata(&self) -> bool {
+        self.quant_method
+            .as_deref()
+            .is_some_and(|method| method.eq_ignore_ascii_case("fp8"))
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -347,7 +361,9 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
                 .get("quantization_config")
                 .or_else(|| json.get("quantization"))
             {
-                tc["quantization_config"] = qc.clone();
+                if !json_quantization_is_fp8(qc) {
+                    tc["quantization_config"] = qc.clone();
+                }
             }
         }
         serde_json::to_string(&tc).map_err(|e| e.to_string())?
@@ -357,8 +373,22 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
 
     let mut cfg: Qwen3Config =
         serde_json::from_str(&config_str).map_err(|e| format!("failed to parse config: {e}"))?;
+    if cfg
+        .quantization_config
+        .as_ref()
+        .is_some_and(QuantizationConfig::is_fp8_metadata)
+    {
+        cfg.quantization_config = None;
+    }
     cfg.finalize();
     Ok(cfg)
+}
+
+fn json_quantization_is_fp8(value: &serde_json::Value) -> bool {
+    value
+        .get("quant_method")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|method| method.eq_ignore_ascii_case("fp8"))
 }
 
 #[cfg(test)]
@@ -443,7 +473,10 @@ mod tests {
                 "head_dim": 128,
                 "quantization": {
                     "group_size": 128,
-                    "bits": 1
+                    "bits": 1,
+                    "per_tensor_overrides": {
+                        "model.layers.0.self_attn.q_proj.weight": 8
+                    }
                 }
             }"#,
         )
@@ -455,6 +488,11 @@ mod tests {
             .expect("quantization config present");
         assert_eq!(qc.group_size, 128);
         assert_eq!(qc.bits, 1);
+        assert_eq!(
+            qc.per_tensor_overrides
+                .get("model.layers.0.self_attn.q_proj.weight"),
+            Some(&8)
+        );
     }
 
     #[test]
@@ -484,6 +522,33 @@ mod tests {
             .expect("quantization config promoted");
         assert_eq!(qc.group_size, 64);
         assert_eq!(qc.bits, 4);
+    }
+
+    #[test]
+    fn parse_nested_qwen35_ignores_outer_fp8_quantization_metadata() {
+        let config = parse_config_text(
+            r#"{
+                "model_type": "qwen3_5",
+                "quantization_config": {
+                    "activation_scheme": "dynamic",
+                    "fmt": "e4m3",
+                    "quant_method": "fp8"
+                },
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "hidden_size": 5120,
+                    "num_hidden_layers": 64,
+                    "num_attention_heads": 20,
+                    "num_key_value_heads": 2,
+                    "head_dim": 256,
+                    "layer_types": ["linear_attention", "full_attention"]
+                }
+            }"#,
+        )
+        .expect("nested fp8 qwen3.5 config parses");
+
+        assert!(config.quantization_config.is_none());
+        assert!(!config.is_qwen3_dense());
     }
 
     #[test]

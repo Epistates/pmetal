@@ -1,6 +1,8 @@
 //! Safetensors loading + shape sanitization + quantized expert stacking.
 
-use crate::InlineArray;
+use std::collections::HashMap;
+
+use crate::{InlineArray, QuantizedMode};
 
 use super::weights::{LayerWeight, LayerWeights, NativeWeights, copy_fresh_arr};
 use super::{Qwen3Config, validate_quantization_runtime_support};
@@ -17,18 +19,42 @@ use super::{Qwen3Config, validate_quantization_runtime_support};
 /// Used to confirm at load time that quantized models were loaded correctly.
 fn weights_are_quantized(layers: &[LayerWeights]) -> bool {
     for lw in layers {
-        if let Some(LayerWeight::Quantized { .. }) = lw.mlp_gate_w {
+        if matches!(
+            lw.mlp_gate_w.as_ref(),
+            Some(LayerWeight::Quantized { .. } | LayerWeight::FpQuantized { .. })
+        ) {
             return true;
         }
-        if let Some(LayerWeight::Quantized { .. }) = lw.attn_q_w {
+        if matches!(
+            lw.attn_q_w.as_ref(),
+            Some(LayerWeight::Quantized { .. } | LayerWeight::FpQuantized { .. })
+        ) {
             return true;
         }
-        if let Some(LayerWeight::Quantized { .. }) = lw.gdn_qkv_w {
+        if matches!(
+            lw.gdn_qkv_w.as_ref(),
+            Some(LayerWeight::Quantized { .. } | LayerWeight::FpQuantized { .. })
+        ) {
             return true;
         }
     }
     false
 }
+
+fn quant_bits_for_weight_key(config: &Qwen3Config, weight_key: &str, default_bits: i32) -> i32 {
+    config
+        .quantization_config
+        .as_ref()
+        .and_then(|qc| qc.per_tensor_overrides.get(weight_key).copied())
+        .unwrap_or(default_bits)
+}
+
+fn quant_bits_for_base_key(config: &Qwen3Config, base_key: &str, default_bits: i32) -> i32 {
+    quant_bits_for_weight_key(config, &format!("{base_key}.weight"), default_bits)
+}
+
+const MXFP8_GROUP_SIZE: i32 = 32;
+const MXFP8_BITS: i32 = 8;
 
 // ============================================================================
 // MoE quantized expert stacking helper
@@ -45,7 +71,7 @@ fn weights_are_quantized(layers: &[LayerWeights]) -> bool {
 /// Otherwise → `LayerWeight::Dense` (the weight is already in [E, in, out] form
 /// from the stacking step, so no additional transpose is needed).
 fn get_stacked_expert_weight(
-    raw: &std::collections::HashMap<String, InlineArray>,
+    raw: &HashMap<String, InlineArray>,
     base_key: &str,
     group_size: i32,
     bits: i32,
@@ -53,11 +79,23 @@ fn get_stacked_expert_weight(
     let w_key = format!("{base_key}.weight");
     let s_key = format!("{base_key}.scales");
     let b_key = format!("{base_key}.biases");
+    let mxfp8_s_key = format!("{base_key}.mxfp8_scales");
 
     let w = raw
         .get(&w_key)
         .cloned()
         .ok_or_else(|| format!("missing stacked expert weight: {w_key}"))?;
+    validate_quantization_runtime_support(bits)?;
+
+    if let Some(scales) = raw.get(&mxfp8_s_key) {
+        return Ok(LayerWeight::FpQuantized {
+            weight: w,
+            scales: scales.clone(),
+            group_size: MXFP8_GROUP_SIZE,
+            bits: MXFP8_BITS,
+            mode: QuantizedMode::Mxfp8,
+        });
+    }
 
     match (raw.get(&s_key), raw.get(&b_key)) {
         (Some(scales), Some(biases)) => Ok(LayerWeight::Quantized {
@@ -103,6 +141,15 @@ pub fn load_model(
     // ── Step 1+2: Shard discovery and bulk-load ─────────────────────────────
     let shard_paths = crate::native_loader::discover_safetensors_shards(model_dir)?;
     let mut raw = crate::native_loader::load_shards_into_map(&shard_paths, model_dir)?;
+
+    // Quantization params are present only in quantized checkpoints.
+    let (q_bits, q_group_size) = config
+        .quantization_config
+        .as_ref()
+        .map(|qc| (qc.bits, qc.group_size))
+        .unwrap_or((4, 64));
+    validate_quantization_runtime_support(q_bits)?;
+    let mut stacked_quant_bits: HashMap<String, i32> = HashMap::new();
 
     // ── Step 3: Sanitization ────────────────────────────────────────────────
 
@@ -162,6 +209,15 @@ pub fn load_model(
         .get("model.embed_tokens.weight")
         .map(|w| w.dtype_raw())
         .unwrap_or(11); // 11 = bfloat16 fallback
+
+    // 3d. FP8 normalization.
+    //
+    // HF Qwen FP8 checkpoints store projection weights as E4M3 with sibling
+    // `.weight_scale_inv` tensors. Repack them into MLX's mxfp8 quantized
+    // matmul format so decode keeps the bandwidth advantage instead of
+    // expanding the checkpoint to bf16 runtime weights.
+    normalize_fp8_weight_scale_inv_sidecars(&mut raw, detected_model_dtype)?;
+
     let one = InlineArray::scalar_with_dtype(1.0, detected_model_dtype);
 
     // GDN-specific f32 weights that must be cast to model dtype to prevent f32
@@ -270,9 +326,38 @@ pub fn load_model(
 
             for proj in &["gate_proj", "up_proj", "down_proj"] {
                 // Detect whether first expert is quantized.
+                let is_mxfp8 = raw.contains_key(&format!("{prefix}.experts.0.{proj}.mxfp8_scales"));
                 let is_quantized = raw.contains_key(&format!("{prefix}.experts.0.{proj}.scales"));
 
-                if is_quantized {
+                if is_mxfp8 {
+                    // MLX mxfp8: stack weight and mxfp8 scales separately.
+                    let mut w_shards: Vec<InlineArray> =
+                        Vec::with_capacity(config.num_experts as usize);
+                    let mut s_shards: Vec<InlineArray> =
+                        Vec::with_capacity(config.num_experts as usize);
+
+                    for e in 0..config.num_experts as usize {
+                        let wk = format!("{prefix}.experts.{e}.{proj}.weight");
+                        let sk = format!("{prefix}.experts.{e}.{proj}.mxfp8_scales");
+                        w_shards.push(
+                            raw.remove(&wk)
+                                .ok_or_else(|| format!("MoE mxfp8: missing {wk}"))?,
+                        );
+                        s_shards.push(
+                            raw.remove(&sk)
+                                .ok_or_else(|| format!("MoE mxfp8: missing {sk}"))?,
+                        );
+                    }
+
+                    let w_stacked = stack_arrays(w_shards, 0)?;
+                    let s_stacked = stack_arrays(s_shards, 0)?;
+
+                    raw.insert(format!("{prefix}.switch_mlp.{proj}.weight"), w_stacked);
+                    raw.insert(
+                        format!("{prefix}.switch_mlp.{proj}.mxfp8_scales"),
+                        s_stacked,
+                    );
+                } else if is_quantized {
                     // Quantized: stack weight, scales, biases separately.
                     let mut w_shards: Vec<InlineArray> =
                         Vec::with_capacity(config.num_experts as usize);
@@ -280,11 +365,23 @@ pub fn load_model(
                         Vec::with_capacity(config.num_experts as usize);
                     let mut b_shards: Vec<InlineArray> =
                         Vec::with_capacity(config.num_experts as usize);
+                    let mut expected_bits: Option<i32> = None;
 
                     for e in 0..config.num_experts as usize {
                         let wk = format!("{prefix}.experts.{e}.{proj}.weight");
                         let sk = format!("{prefix}.experts.{e}.{proj}.scales");
                         let bk = format!("{prefix}.experts.{e}.{proj}.biases");
+                        let bits = quant_bits_for_weight_key(config, &wk, q_bits);
+                        validate_quantization_runtime_support(bits)?;
+                        if let Some(expected) = expected_bits {
+                            if expected != bits {
+                                return Err(format!(
+                                    "MoE quant: mixed bit widths for {prefix}.experts.*.{proj}.weight are not stackable ({expected} vs {bits})"
+                                ));
+                            }
+                        } else {
+                            expected_bits = Some(bits);
+                        }
                         w_shards.push(
                             raw.remove(&wk)
                                 .ok_or_else(|| format!("MoE quant: missing {wk}"))?,
@@ -310,6 +407,10 @@ pub fn load_model(
                     raw.insert(format!("{prefix}.switch_mlp.{proj}.weight"), w_stacked);
                     raw.insert(format!("{prefix}.switch_mlp.{proj}.scales"), s_stacked);
                     raw.insert(format!("{prefix}.switch_mlp.{proj}.biases"), b_stacked);
+                    stacked_quant_bits.insert(
+                        format!("{prefix}.switch_mlp.{proj}.weight"),
+                        expected_bits.unwrap_or(q_bits),
+                    );
                 } else {
                     // Dense: collect and pre-transpose to [E, in, out] for gather_mm.
                     let mut shards: Vec<InlineArray> =
@@ -331,14 +432,6 @@ pub fn load_model(
     }
 
     // ── Step 4: Build per-layer weight structs ──────────────────────────────
-    // Quantization params — present only in quantized checkpoints.
-    let (q_bits, q_group_size) = config
-        .quantization_config
-        .as_ref()
-        .map(|qc| (qc.bits, qc.group_size))
-        .unwrap_or((4, 64));
-    validate_quantization_runtime_support(q_bits)?;
-
     let get = |key: &str| -> Result<InlineArray, String> {
         raw.get(key).cloned().ok_or_else(|| {
             let parts: Vec<&str> = key.rsplitn(2, '.').collect();
@@ -361,14 +454,30 @@ pub fn load_model(
         let w_key = format!("{base_key}.weight");
         let s_key = format!("{base_key}.scales");
         let b_key = format!("{base_key}.biases");
-        match (raw.get(&w_key), raw.get(&s_key), raw.get(&b_key)) {
-            (Some(w), Some(s), Some(b)) => Ok(LayerWeight::Quantized {
+        let mxfp8_s_key = format!("{base_key}.mxfp8_scales");
+
+        if let (Some(w), Some(scales)) = (raw.get(&w_key), raw.get(&mxfp8_s_key)) {
+            return Ok(LayerWeight::FpQuantized {
                 weight: w.clone(),
-                scales: s.clone(),
-                biases: b.clone(),
-                group_size: q_group_size,
-                bits: q_bits,
-            }),
+                scales: scales.clone(),
+                group_size: MXFP8_GROUP_SIZE,
+                bits: MXFP8_BITS,
+                mode: QuantizedMode::Mxfp8,
+            });
+        }
+
+        match (raw.get(&w_key), raw.get(&s_key), raw.get(&b_key)) {
+            (Some(w), Some(s), Some(b)) => {
+                let bits = quant_bits_for_weight_key(config, &w_key, q_bits);
+                validate_quantization_runtime_support(bits)?;
+                Ok(LayerWeight::Quantized {
+                    weight: w.clone(),
+                    scales: s.clone(),
+                    biases: b.clone(),
+                    group_size: q_group_size,
+                    bits,
+                })
+            }
             _ => {
                 // Dense path: load `.weight` and pre-transpose for matmul.
                 let w = get(&w_key)?;
@@ -445,19 +554,46 @@ pub fn load_model(
                 &raw,
                 &format!("{p}.mlp.switch_mlp.gate_proj"),
                 q_group_size,
-                q_bits,
+                stacked_quant_bits
+                    .get(&format!("{p}.mlp.switch_mlp.gate_proj.weight"))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        quant_bits_for_base_key(
+                            config,
+                            &format!("{p}.mlp.switch_mlp.gate_proj"),
+                            q_bits,
+                        )
+                    }),
             )?;
             let moe_up = get_stacked_expert_weight(
                 &raw,
                 &format!("{p}.mlp.switch_mlp.up_proj"),
                 q_group_size,
-                q_bits,
+                stacked_quant_bits
+                    .get(&format!("{p}.mlp.switch_mlp.up_proj.weight"))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        quant_bits_for_base_key(
+                            config,
+                            &format!("{p}.mlp.switch_mlp.up_proj"),
+                            q_bits,
+                        )
+                    }),
             )?;
             let moe_down = get_stacked_expert_weight(
                 &raw,
                 &format!("{p}.mlp.switch_mlp.down_proj"),
                 q_group_size,
-                q_bits,
+                stacked_quant_bits
+                    .get(&format!("{p}.mlp.switch_mlp.down_proj.weight"))
+                    .copied()
+                    .unwrap_or_else(|| {
+                        quant_bits_for_base_key(
+                            config,
+                            &format!("{p}.mlp.switch_mlp.down_proj"),
+                            q_bits,
+                        )
+                    }),
             )?;
 
             // Shared expert weights — may be quantized.
@@ -800,4 +936,177 @@ fn stack_arrays(arrays: Vec<InlineArray>, axis: i32) -> Result<InlineArray, Stri
         acc = acc.concatenate_2(&e, axis);
     }
     Ok(acc)
+}
+
+#[derive(Default, Debug, Clone, Copy, Eq, PartialEq)]
+struct Fp8SidecarLoadStats {
+    repacked_mxfp8: usize,
+    dequantized_dense: usize,
+}
+
+fn normalize_fp8_weight_scale_inv_sidecars(
+    raw: &mut HashMap<String, InlineArray>,
+    target_dtype: i32,
+) -> Result<Fp8SidecarLoadStats, String> {
+    let scale_inv_keys: Vec<String> = raw
+        .keys()
+        .filter(|k| {
+            k.ends_with(".weight_scale_inv")
+                && (k.starts_with("model.layers.") || k.as_str() == "lm_head.weight_scale_inv")
+        })
+        .cloned()
+        .collect();
+
+    let mut stats = Fp8SidecarLoadStats::default();
+    for scale_inv_key in scale_inv_keys {
+        let Some(weight_key) = scale_inv_key
+            .strip_suffix("_scale_inv")
+            .map(ToOwned::to_owned)
+        else {
+            continue;
+        };
+
+        let scale_inv = raw
+            .remove(&scale_inv_key)
+            .ok_or_else(|| format!("FP8 sidecar disappeared during load: {scale_inv_key}"))?;
+        let Some(weight) = raw.remove(&weight_key) else {
+            raw.insert(scale_inv_key.clone(), scale_inv);
+            return Err(format!(
+                "FP8 scale sidecar {scale_inv_key} has no matching weight {weight_key}"
+            ));
+        };
+
+        let dequant = crate::native_loader::dequantize_fp8_e4m3_scaled_weight(
+            &weight,
+            &scale_inv,
+            target_dtype,
+        )
+        .map_err(|e| format!("{weight_key}: {e}"))?;
+
+        if can_repack_as_mxfp8(&dequant) {
+            let Some(base_key) = weight_key.strip_suffix(".weight") else {
+                raw.insert(weight_key, dequant);
+                stats.dequantized_dense += 1;
+                continue;
+            };
+            let mxfp8_scale_key = format!("{base_key}.mxfp8_scales");
+            let (packed, scales) = dequant
+                .try_quantize_weights_mode(MXFP8_GROUP_SIZE, MXFP8_BITS, QuantizedMode::Mxfp8)
+                .map_err(|e| format!("{weight_key}: failed to repack FP8 as mxfp8: {e}"))?;
+            raw.insert(weight_key, packed);
+            raw.insert(mxfp8_scale_key, scales);
+            stats.repacked_mxfp8 += 1;
+        } else {
+            raw.insert(weight_key, dequant);
+            stats.dequantized_dense += 1;
+        }
+    }
+
+    Ok(stats)
+}
+
+fn can_repack_as_mxfp8(weight: &InlineArray) -> bool {
+    weight.ndim() >= 2
+        && weight
+            .shape()
+            .last()
+            .is_some_and(|last_dim| *last_dim > 0 && *last_dim % MXFP8_GROUP_SIZE == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::compat::Dtype;
+
+    #[test]
+    fn dequantizes_qwen_fp8_weight_scale_inv_sidecars_when_mxfp8_is_not_shape_legal() {
+        let dense = InlineArray::from_f32_slice(&[1.0, -2.0, 0.5, 4.0], &[2, 2]);
+        let fp8 = dense.to_fp8();
+        let scale_inv =
+            InlineArray::from_f32_slice(&[2.0], &[1, 1]).as_dtype(Dtype::Bfloat16.as_i32());
+
+        let weight_key = "model.layers.0.mlp.gate_proj.weight".to_string();
+        let scale_key = "model.layers.0.mlp.gate_proj.weight_scale_inv".to_string();
+        let mut raw = HashMap::new();
+        raw.insert(weight_key.clone(), fp8);
+        raw.insert(scale_key.clone(), scale_inv);
+
+        let stats = normalize_fp8_weight_scale_inv_sidecars(&mut raw, Dtype::Bfloat16.as_i32())
+            .expect("normalize sidecars");
+
+        assert_eq!(
+            stats,
+            Fp8SidecarLoadStats {
+                repacked_mxfp8: 0,
+                dequantized_dense: 1
+            }
+        );
+        assert!(!raw.contains_key(&scale_key));
+        assert_eq!(raw[&weight_key].dtype_raw(), Dtype::Bfloat16.as_i32());
+
+        let mut got = raw.get(&weight_key).expect("dequantized weight").clone();
+        got.eval();
+        let values = got.to_f32_vec(4).expect("weight values");
+        let expected = [2.0, -4.0, 1.0, 8.0];
+        for (got, expected) in values.iter().zip(expected) {
+            assert!(
+                (got - expected).abs() <= 0.05,
+                "got {got}, expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn repacks_qwen_fp8_weight_scale_inv_sidecars_as_mxfp8() {
+        let values: Vec<f32> = (0..64).map(|i| ((i as f32 % 17.0) - 8.0) / 4.0).collect();
+        let dense = InlineArray::from_f32_slice(&values, &[2, 32]);
+        let fp8 = dense.to_fp8();
+        let scale_inv =
+            InlineArray::from_f32_slice(&[1.0], &[1, 1]).as_dtype(Dtype::Bfloat16.as_i32());
+
+        let weight_key = "model.layers.0.mlp.gate_proj.weight".to_string();
+        let scale_key = "model.layers.0.mlp.gate_proj.weight_scale_inv".to_string();
+        let mxfp8_scale_key = "model.layers.0.mlp.gate_proj.mxfp8_scales".to_string();
+        let mut raw = HashMap::new();
+        raw.insert(weight_key.clone(), fp8);
+        raw.insert(scale_key.clone(), scale_inv);
+
+        let stats = normalize_fp8_weight_scale_inv_sidecars(&mut raw, Dtype::Bfloat16.as_i32())
+            .expect("normalize sidecars");
+
+        assert_eq!(
+            stats,
+            Fp8SidecarLoadStats {
+                repacked_mxfp8: 1,
+                dequantized_dense: 0
+            }
+        );
+        assert!(!raw.contains_key(&scale_key));
+        assert_eq!(raw[&weight_key].dtype_raw(), 3);
+        assert_eq!(raw[&mxfp8_scale_key].dtype_raw(), 1);
+
+        let x_values: Vec<f32> = (0..32).map(|i| (i as f32 - 16.0) / 16.0).collect();
+        let x = InlineArray::from_f32_slice(&x_values, &[1, 32]).as_dtype(Dtype::Bfloat16.as_i32());
+        let got = x.quantized_matmul_mode(
+            raw.get(&weight_key).expect("packed weight"),
+            raw.get(&mxfp8_scale_key).expect("mxfp8 scales"),
+            None,
+            true,
+            MXFP8_GROUP_SIZE,
+            MXFP8_BITS,
+            QuantizedMode::Mxfp8,
+        );
+        let expected = x.matmul(&dense.as_dtype(Dtype::Bfloat16.as_i32()).t());
+
+        let mut got = got;
+        let mut expected = expected;
+        let got = got.to_f32_vec(2).expect("got qmm");
+        let expected = expected.to_f32_vec(2).expect("expected dense");
+        for (got, expected) in got.iter().zip(expected) {
+            assert!(
+                (got - expected).abs() <= 0.75,
+                "got {got}, expected {expected}"
+            );
+        }
+    }
 }

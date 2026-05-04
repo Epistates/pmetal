@@ -178,7 +178,12 @@ pub fn load_model(
                 //   2. reshape to [M/128, 128, N/128, 128]
                 //   3. multiply by scale_inv[:, None, :, None]
                 //   4. reshape back
-                let dequant = dequantize_fp8_block(&weight, &scale_inv, detected_model_dtype);
+                let dequant = crate::native_loader::dequantize_fp8_e4m3_scaled_weight(
+                    &weight,
+                    &scale_inv,
+                    detected_model_dtype,
+                )
+                .map_err(|e| format!("{weight_key}: {e}"))?;
                 raw.insert(weight_key, dequant);
                 raw.remove(&scale_inv_key);
             }
@@ -500,65 +505,6 @@ pub fn load_model(
         layers,
         model_dtype,
     })
-}
-
-// ============================================================================
-// FP8 dequantization helper
-// ============================================================================
-
-/// Dequantize an FP8 (E4M3) weight tensor using block-wise scale_inv.
-///
-/// weight:    [M, N] dtype=fp8_e4m3
-/// scale_inv: [ceil(M/128), ceil(N/128)] dtype=float32
-///
-/// dequantized[i,j] = fp8_to_float(weight[i,j]) * scale_inv[i//128, j//128]
-///
-/// This matches the Python `dequant()` function in Model.sanitize().
-fn dequantize_fp8_block(
-    weight: &InlineArray,
-    scale_inv: &InlineArray,
-    target_dtype: i32,
-) -> InlineArray {
-    // Cast fp8 → bf16 (MLX astype handles fp8 e4m3 → bf16).
-    let w_f = weight.as_dtype(target_dtype);
-
-    let m = w_f.dim(0);
-    let n = w_f.dim(1);
-    let bs = 128i32;
-
-    let pad_bottom = (-m).rem_euclid(bs);
-    let pad_side = (-n).rem_euclid(bs);
-
-    let m_pad = m + pad_bottom;
-    let n_pad = n + pad_side;
-
-    // Pad weight if needed.
-    let w_padded = if pad_bottom > 0 || pad_side > 0 {
-        // Build padded tensor via slice_set into zeros.
-        let padded = InlineArray::zeros(&[m_pad, n_pad], target_dtype);
-        padded.slice_set(&w_f, &[0, 0], &[m, n])
-    } else {
-        w_f.clone()
-    };
-
-    // Reshape to [M_pad/128, 128, N_pad/128, 128].
-    let bm = m_pad / bs;
-    let bn = n_pad / bs;
-    let reshaped = w_padded.reshape(&[bm, bs, bn, bs]);
-
-    // Scale_inv: [bm, bn] → expand to [bm, 1, bn, 1] for broadcasting.
-    let si = scale_inv.reshape(&[bm, 1, bn, 1]).as_dtype(target_dtype);
-
-    // Multiply: [bm, 128, bn, 128] * [bm, 1, bn, 1] → [bm, 128, bn, 128]
-    let scaled = reshaped.multiply(&si);
-
-    // Reshape back to [m_pad, n_pad] then slice to [m, n].
-    let back = scaled.reshape(&[m_pad, n_pad]);
-    if pad_bottom > 0 || pad_side > 0 {
-        back.slice(&[0, 0], &[m, n])
-    } else {
-        back
-    }
 }
 
 // ============================================================================

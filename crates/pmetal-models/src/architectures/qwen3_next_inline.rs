@@ -22,6 +22,14 @@ pub fn ia_from_array(arr: &Array) -> InlineArray {
     arr.clone()
 }
 
+fn ia_from_weight(arr: &Array) -> InlineArray {
+    if arr.dtype() == Dtype::Uint8 {
+        arr.from_fp8(Dtype::Bfloat16.as_i32())
+    } else {
+        arr.clone()
+    }
+}
+
 /// Convert an InlineArray to a bridge Array — identity since they're the same type.
 pub fn ia_to_array(ia: &InlineArray) -> Array {
     ia.clone()
@@ -253,21 +261,21 @@ impl InlineModelWeights {
     /// Convert all model weights from Array to InlineArray. Called once.
     pub fn from_model(model: &mut Qwen3NextForCausalLM) -> Result<Self, Exception> {
         let config = &model.config;
-        let mut embed_w = ia_from_array(model.model.embed_tokens.weight.as_ref());
-        let mut final_norm_w = ia_from_array(model.model.norm.weight.as_ref());
+        let mut embed_w = ia_from_weight(model.model.embed_tokens.weight.as_ref());
+        let mut final_norm_w = ia_from_weight(model.model.norm.weight.as_ref());
         let final_norm_eps = model.model.norm.eps;
         let mut lm_head_w = model
             .lm_head
             .as_ref()
-            .map(|l| ia_from_array(l.weight.as_ref()));
+            .map(|l| ia_from_weight(l.weight.as_ref()));
 
         let mut layers = Vec::with_capacity(model.model.layers.len());
         for (li, layer) in model.model.layers.iter_mut().enumerate() {
             let mut lw = InlineLayerWeights {
                 is_linear: layer.is_linear,
-                input_ln_w: ia_from_array(layer.input_layernorm.weight.as_ref()),
+                input_ln_w: ia_from_weight(layer.input_layernorm.weight.as_ref()),
                 input_ln_eps: layer.input_layernorm.eps,
-                post_ln_w: ia_from_array(layer.post_attention_layernorm.weight.as_ref()),
+                post_ln_w: ia_from_weight(layer.post_attention_layernorm.weight.as_ref()),
                 post_ln_eps: layer.post_attention_layernorm.eps,
                 // MLP weights (pre-transposed for matmul)
                 mlp_gate_w: InlineArray::from_f32(0.0),
@@ -314,9 +322,9 @@ impl InlineModelWeights {
             // MLP
             match &layer.mlp {
                 super::qwen3_next::Qwen3NextFeedForward::Dense(mlp) => {
-                    lw.mlp_gate_w = ia_from_array(mlp.gate_proj.weight.as_ref()).t();
-                    lw.mlp_up_w = ia_from_array(mlp.up_proj.weight.as_ref()).t();
-                    lw.mlp_down_w = ia_from_array(mlp.down_proj.weight.as_ref()).t();
+                    lw.mlp_gate_w = ia_from_weight(mlp.gate_proj.weight.as_ref()).t();
+                    lw.mlp_up_w = ia_from_weight(mlp.up_proj.weight.as_ref()).t();
+                    lw.mlp_down_w = ia_from_weight(mlp.down_proj.weight.as_ref()).t();
                 }
                 super::qwen3_next::Qwen3NextFeedForward::MoE(_) => {
                     // MoE models use the standard Array path for now
@@ -329,18 +337,18 @@ impl InlineModelWeights {
             if layer.is_linear {
                 let gdn = layer.linear_attn.as_mut().unwrap();
                 // Separate projection weights (pre-transposed), matching Python's 4 Linear layers
-                lw.gdn_qkv_w = Some(ia_from_array(gdn.in_proj_qkv.weight.as_ref()).t());
-                lw.gdn_z_w = Some(ia_from_array(gdn.in_proj_z.weight.as_ref()).t());
-                lw.gdn_b_w = Some(ia_from_array(gdn.in_proj_b.weight.as_ref()).t());
-                lw.gdn_a_w = Some(ia_from_array(gdn.in_proj_a.weight.as_ref()).t());
-                lw.gdn_conv_w = Some(ia_from_array(gdn.conv1d.weight.as_ref()));
-                lw.gdn_q_nw = Some(ia_from_array(&gdn.q_norm_weight));
-                lw.gdn_k_nw = Some(ia_from_array(&gdn.k_norm_weight));
-                lw.gdn_a_log = Some(ia_from_array(gdn.a_log.as_ref()));
-                lw.gdn_dt_bias = Some(ia_from_array(gdn.dt_bias.as_ref()));
-                lw.gdn_norm_w = Some(ia_from_array(gdn.norm.weight.as_ref()));
+                lw.gdn_qkv_w = Some(ia_from_weight(gdn.in_proj_qkv.weight.as_ref()).t());
+                lw.gdn_z_w = Some(ia_from_weight(gdn.in_proj_z.weight.as_ref()).t());
+                lw.gdn_b_w = Some(ia_from_weight(gdn.in_proj_b.weight.as_ref()).t());
+                lw.gdn_a_w = Some(ia_from_weight(gdn.in_proj_a.weight.as_ref()).t());
+                lw.gdn_conv_w = Some(ia_from_weight(gdn.conv1d.weight.as_ref()));
+                lw.gdn_q_nw = Some(ia_from_weight(&gdn.q_norm_weight));
+                lw.gdn_k_nw = Some(ia_from_weight(&gdn.k_norm_weight));
+                lw.gdn_a_log = Some(ia_from_weight(gdn.a_log.as_ref()));
+                lw.gdn_dt_bias = Some(ia_from_weight(gdn.dt_bias.as_ref()));
+                lw.gdn_norm_w = Some(ia_from_weight(gdn.norm.weight.as_ref()));
                 lw.gdn_norm_eps = gdn.norm.eps;
-                lw.gdn_out_w = Some(ia_from_array(gdn.out_proj.weight.as_ref()).t());
+                lw.gdn_out_w = Some(ia_from_weight(gdn.out_proj.weight.as_ref()).t());
                 lw.gdn_nv = gdn.num_v_heads;
                 lw.gdn_nk = gdn.num_k_heads;
                 lw.gdn_dk = gdn.head_k_dim;
@@ -362,13 +370,13 @@ impl InlineModelWeights {
                 }
             } else {
                 let attn = layer.self_attn.as_ref().unwrap();
-                lw.attn_q_w = Some(ia_from_array(attn.q_proj.weight.as_ref()).t());
-                lw.attn_k_w = Some(ia_from_array(attn.k_proj.weight.as_ref()).t());
-                lw.attn_v_w = Some(ia_from_array(attn.v_proj.weight.as_ref()).t());
-                lw.attn_o_w = Some(ia_from_array(attn.o_proj.weight.as_ref()).t());
-                lw.attn_q_norm_w = Some(ia_from_array(attn.q_norm.weight.as_ref()));
+                lw.attn_q_w = Some(ia_from_weight(attn.q_proj.weight.as_ref()).t());
+                lw.attn_k_w = Some(ia_from_weight(attn.k_proj.weight.as_ref()).t());
+                lw.attn_v_w = Some(ia_from_weight(attn.v_proj.weight.as_ref()).t());
+                lw.attn_o_w = Some(ia_from_weight(attn.o_proj.weight.as_ref()).t());
+                lw.attn_q_norm_w = Some(ia_from_weight(attn.q_norm.weight.as_ref()));
                 lw.attn_q_norm_eps = attn.q_norm.eps;
-                lw.attn_k_norm_w = Some(ia_from_array(attn.k_norm.weight.as_ref()));
+                lw.attn_k_norm_w = Some(ia_from_weight(attn.k_norm.weight.as_ref()));
                 lw.attn_k_norm_eps = attn.k_norm.eps;
                 lw.attn_n_heads = attn.n_heads;
                 lw.attn_n_kv_heads = attn.n_kv_heads;

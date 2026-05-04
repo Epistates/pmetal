@@ -158,14 +158,14 @@ void mlx_inline_async_eval_many(mlx_inline_array** arrays, int count) {
 void mlx_inline_quantized_matmul(mlx_inline_array* dst,
                                    const mlx_inline_array* x, const mlx_inline_array* w,
                                    const mlx_inline_array* scales, const mlx_inline_array* biases,
-                                   bool transpose, int group_size, int bits) {
+                                   bool transpose, int group_size, int bits, int mode) {
     BRIDGE_TRY_DST("quantized_matmul", dst, {
         auto biases_opt = biases
             ? std::optional<array>(as_arr(biases))
             : std::optional<array>(std::nullopt);
         new (dst->buf) array(mlx::core::quantized_matmul(
             as_arr(x), as_arr(w), as_arr(scales), biases_opt,
-            transpose, group_size, bits));
+            transpose, group_size, bits, quant_mode_from_int(mode)));
     });
 }
 
@@ -173,7 +173,7 @@ void mlx_inline_gather_qmm(mlx_inline_array* dst,
                               const mlx_inline_array* x, const mlx_inline_array* w,
                               const mlx_inline_array* scales, const mlx_inline_array* biases,
                               const mlx_inline_array* lhs_indices, const mlx_inline_array* rhs_indices,
-                              bool transpose, int group_size, int bits, bool sorted) {
+                              bool transpose, int group_size, int bits, bool sorted, int mode) {
     BRIDGE_TRY_DST("gather_qmm", dst, {
         auto biases_opt = biases
             ? std::optional<array>(as_arr(biases))
@@ -188,7 +188,7 @@ void mlx_inline_gather_qmm(mlx_inline_array* dst,
             as_arr(x), as_arr(w), as_arr(scales), biases_opt,
             lhs_opt, rhs_opt,
             transpose, group_size, bits,
-            /*mode=*/"affine", sorted));
+            quant_mode_from_int(mode), sorted));
     });
 }
 

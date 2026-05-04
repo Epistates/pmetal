@@ -24,6 +24,7 @@
 use pmetal_bridge::compat::{Array, Exception, ModuleParameters, Param, indexing, nn, ops, random};
 use pmetal_bridge::impl_module_params;
 
+use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
@@ -681,18 +682,24 @@ impl GptOssMoE {
         let gate_weights: Vec<Array> = self
             .experts
             .iter()
-            .map(|expert| expert.gate_proj.weight.as_ref().t())
-            .collect();
+            .map(|expert| {
+                dequantize_fp8_weight_for_compute(expert.gate_proj.weight.as_ref()).map(|w| w.t())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let up_weights: Vec<Array> = self
             .experts
             .iter()
-            .map(|expert| expert.up_proj.weight.as_ref().t())
-            .collect();
+            .map(|expert| {
+                dequantize_fp8_weight_for_compute(expert.up_proj.weight.as_ref()).map(|w| w.t())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let down_weights: Vec<Array> = self
             .experts
             .iter()
-            .map(|expert| expert.down_proj.weight.as_ref().t())
-            .collect();
+            .map(|expert| {
+                dequantize_fp8_weight_for_compute(expert.down_proj.weight.as_ref()).map(|w| w.t())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let gate_biases: Vec<Array> = self
             .experts
             .iter()
@@ -1298,15 +1305,16 @@ impl LoraLinear {
 
     /// Forward pass with or without LoRA.
     pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
+        let weight = dequantize_fp8_weight_for_compute(&self.weight)?;
         if self.lora_active {
-            let out = fused_lora_forward(x, &self.weight, &self.lora_a, &self.lora_b, self.scale)?;
+            let out = fused_lora_forward(x, &weight, &self.lora_a, &self.lora_b, self.scale)?;
             if let Some(ref bias) = self.bias {
                 Ok(out.add(bias))
             } else {
                 Ok(out)
             }
         } else {
-            let out = x.matmul(&self.weight.t());
+            let out = x.matmul(&weight.t());
             if let Some(ref bias) = self.bias {
                 Ok(out.add(bias))
             } else {

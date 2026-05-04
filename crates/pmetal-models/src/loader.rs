@@ -80,6 +80,13 @@ pub struct Qwen3NextLoadOptions {
     pub skip_routed_experts: bool,
 }
 
+#[derive(Debug, Clone)]
+struct MlxQuantizationConfig {
+    bits: i32,
+    group_size: i32,
+    per_tensor_overrides: HashMap<String, i32>,
+}
+
 fn assign_loaded_weights<M: ModuleParameters + ModuleParametersExt>(
     model: &mut M,
     loaded: HashMap<String, Array>,
@@ -102,6 +109,111 @@ fn eval_loaded_parameters<M: ModuleParameters + ModuleParametersExt>(
             .map_err(|e| LoadError::Mlx(e.to_string()))?;
     }
     Ok(())
+}
+
+fn load_mlx_quantization_config(
+    model_dir: &Path,
+) -> Result<Option<MlxQuantizationConfig>, LoadError> {
+    let config_path = model_dir.join("config.json");
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = std::fs::read_to_string(&config_path)?;
+    let json: serde_json::Value = serde_json::from_str(&raw)?;
+    let Some(quant) = json
+        .get("quantization")
+        .or_else(|| json.get("quantization_config"))
+        .or_else(|| {
+            json.get("text_config").and_then(|text| {
+                text.get("quantization")
+                    .or_else(|| text.get("quantization_config"))
+            })
+        })
+    else {
+        return Ok(None);
+    };
+
+    let bits = quant
+        .get("bits")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(4) as i32;
+    let group_size = quant
+        .get("group_size")
+        .and_then(|value| value.as_i64())
+        .unwrap_or(64) as i32;
+    if bits <= 0 {
+        return Err(LoadError::SafeTensors(format!(
+            "Invalid MLX quantization bits in config.json: {bits}"
+        )));
+    }
+    if group_size <= 0 {
+        return Err(LoadError::SafeTensors(format!(
+            "Invalid MLX quantization group_size in config.json: {group_size}"
+        )));
+    }
+
+    let per_tensor_overrides = quant
+        .get("per_tensor_overrides")
+        .and_then(|value| value.as_object())
+        .map(|object| {
+            object
+                .iter()
+                .filter_map(|(key, value)| value.as_i64().map(|bits| (key.clone(), bits as i32)))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Some(MlxQuantizationConfig {
+        bits,
+        group_size,
+        per_tensor_overrides,
+    }))
+}
+
+fn quant_aux_base_key(key: &str) -> Option<&str> {
+    key.strip_suffix(".scales")
+        .or_else(|| key.strip_suffix(".biases"))
+}
+
+fn is_quant_aux_key(key: &str) -> bool {
+    quant_aux_base_key(key).is_some()
+}
+
+fn dequantize_mlx_quantized_weights(
+    weights: &mut HashMap<String, Array>,
+    config: &MlxQuantizationConfig,
+) {
+    let base_keys: Vec<String> = weights
+        .keys()
+        .filter(|key| !is_quant_aux_key(key))
+        .filter(|key| {
+            weights.contains_key(&format!("{key}.scales"))
+                && weights.contains_key(&format!("{key}.biases"))
+        })
+        .cloned()
+        .collect();
+
+    for key in base_keys {
+        let Some(weight) = weights.get(&key).cloned() else {
+            continue;
+        };
+        let Some(scales) = weights.get(&format!("{key}.scales")).cloned() else {
+            continue;
+        };
+        let Some(biases) = weights.get(&format!("{key}.biases")).cloned() else {
+            continue;
+        };
+        let bits = config
+            .per_tensor_overrides
+            .get(&key)
+            .copied()
+            .unwrap_or(config.bits);
+        let dequantized = weight.dequantize(&scales, &biases, config.group_size, bits);
+        weights.insert(key, dequantized);
+    }
+
+    weights.retain(|key, _| !is_quant_aux_key(key));
 }
 
 pub fn load_clip_weights(
@@ -933,13 +1045,17 @@ where
     F: FnMut(&str) -> bool,
 {
     let model_dir = model_dir.as_ref();
+    let quant_config = load_mlx_quantization_config(model_dir)?;
     let mut all_weights = HashMap::new();
     let single_file = model_dir.join("model.safetensors");
     if single_file.exists() {
-        let weights = load_shard(&single_file)?;
+        let mut weights = load_shard(&single_file)?;
+        if let Some(config) = &quant_config {
+            dequantize_mlx_quantized_weights(&mut weights, config);
+        }
         return Ok(weights
             .into_iter()
-            .filter(|(key, _)| keep_key(key))
+            .filter(|(key, _)| keep_key(key) && !is_quant_aux_key(key))
             .collect());
     }
 
@@ -953,20 +1069,41 @@ where
 
     let index_content = std::fs::read_to_string(&index_path).map_err(LoadError::Io)?;
     let index: WeightIndex = serde_json::from_str(&index_content)?;
+    let wanted_keys: HashSet<String> = index
+        .weight_map
+        .keys()
+        .filter(|key| {
+            keep_key(key)
+                || quant_config.is_some()
+                    && quant_aux_base_key(key).is_some_and(|base_key| keep_key(base_key))
+        })
+        .cloned()
+        .collect();
     let shard_files: HashSet<&String> = index
         .weight_map
         .iter()
-        .filter(|(key, _)| keep_key(key))
+        .filter(|(key, _)| wanted_keys.contains(*key))
         .map(|(_, shard_file)| shard_file)
         .collect();
 
     for shard_file in shard_files {
         let shard_path = validate_shard_path(model_dir, shard_file)?;
         let shard_weights = load_shard(&shard_path)?;
-        all_weights.extend(shard_weights.into_iter().filter(|(key, _)| keep_key(key)));
+        all_weights.extend(
+            shard_weights
+                .into_iter()
+                .filter(|(key, _)| wanted_keys.contains(key)),
+        );
     }
 
-    Ok(all_weights)
+    if let Some(config) = &quant_config {
+        dequantize_mlx_quantized_weights(&mut all_weights, config);
+    }
+
+    Ok(all_weights
+        .into_iter()
+        .filter(|(key, _)| keep_key(key) && !is_quant_aux_key(key))
+        .collect())
 }
 
 pub fn load_nemotron_weights(
@@ -1672,5 +1809,61 @@ mod tests {
 
         assert_eq!(loaded.len(), 1);
         assert!(loaded.contains_key("model.embed_tokens.weight"));
+    }
+
+    #[test]
+    fn load_mlx_quantization_config_accepts_alias_and_overrides() {
+        let temp = tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.json"),
+            r#"{
+                "quantization": {
+                    "bits": 4,
+                    "group_size": 64,
+                    "per_tensor_overrides": {
+                        "model.layers.0.self_attn.q_proj.weight": 8
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_mlx_quantization_config(temp.path())
+            .unwrap()
+            .expect("quantization config");
+        assert_eq!(config.bits, 4);
+        assert_eq!(config.group_size, 64);
+        assert_eq!(
+            config
+                .per_tensor_overrides
+                .get("model.layers.0.self_attn.q_proj.weight"),
+            Some(&8)
+        );
+    }
+
+    #[test]
+    fn load_weights_dequantizes_mlx_affine_quantized_tensors() {
+        let temp = tempdir().unwrap();
+        let model_dir = temp.path();
+        let weight = Array::from_slice(&[1.0f32; 128], &[2, 64]);
+        let (packed, scales, biases) = weight.quantize_weights(64, 4);
+
+        let mut weights = HashMap::new();
+        weights.insert("linear.weight".to_string(), packed);
+        weights.insert("linear.weight.scales".to_string(), scales);
+        weights.insert("linear.weight.biases".to_string(), biases);
+        write_safetensors(&model_dir.join("model.safetensors"), &weights).unwrap();
+        std::fs::write(
+            model_dir.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+
+        let loaded = load_weights(model_dir).unwrap();
+        assert_eq!(loaded.len(), 1);
+        let restored = loaded.get("linear.weight").unwrap();
+        assert_eq!(restored.shape(), &[2, 64]);
+        assert!(!loaded.contains_key("linear.weight.scales"));
+        assert!(!loaded.contains_key("linear.weight.biases"));
     }
 }
