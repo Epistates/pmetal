@@ -8,7 +8,7 @@
   let { children } = $props();
 
   let initialized = $state(false);
-  let appVersion = $state('0.3.6');
+  let appVersion = $state('0.5.0');
 
   // Navigation items
   const navItems = [

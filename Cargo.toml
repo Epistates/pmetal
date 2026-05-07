@@ -55,7 +55,7 @@ pmetal-serve = { path = "crates/pmetal-serve", version = "0.5.0" }
 pmetal-mcp = { path = "crates/pmetal-mcp", version = "0.5.0" }
 
 # Async runtime
-tokio = { version = "1.50", features = ["full"] }
+tokio = { version = "1.52", features = ["full"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -82,9 +82,9 @@ arrow-json = "58"
 
 # HuggingFace integration
 hf-hub = "0.5"
-tokenizers = "0.22"
+tokenizers = "0.23"
 reqwest = { version = "0.13", features = ["json", "multipart", "stream", "rustls"] }
-sha2 = "0.10"
+sha2 = "0.11"
 base64 = "0.22"
 
 # Jinja template engine for executing upstream chat_template strings from
@@ -130,7 +130,7 @@ pyo3-build-config = "0.28"
 # Testing
 criterion = "0.8"
 tempfile = "3"
-proptest = "1.5"
+proptest = "1.11"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

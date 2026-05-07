@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::f32::consts::PI;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use rand::{Rng, rngs::StdRng};
+use rand::{RngExt, rngs::StdRng};
 
 use crate::InlineArray;
 

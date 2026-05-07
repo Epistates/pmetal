@@ -54,7 +54,7 @@ check:
 
 # Build CLI binary (mirrors release CI)
 build-cli:
-    cargo build --release -p pmetal-cli
+    cargo build --release -p pmetal
 
 # Check GUI compiles (mirrors release CI -- catches cfg mismatches)
 check-gui:
@@ -95,16 +95,30 @@ check-version:
     WS_VER="{{ version }}"
     echo "Workspace version: $WS_VER"
     ERRORS=0
-    # Check pmetal-py pinned dep
-    PY_VER=$(grep 'pmetal = { path' crates/pmetal-py/Cargo.toml | sed 's/.*version = "//;s/".*//')
-    if [[ "$PY_VER" != "$WS_VER" ]]; then
-        echo "FAIL: pmetal-py pins pmetal = \"$PY_VER\" (expected \"$WS_VER\")"
+    # Check pmetal-py uses the workspace version
+    if ! grep -q '^version.workspace = true$' crates/pmetal-py/Cargo.toml; then
+        echo "FAIL: pmetal-py does not use version.workspace = true"
         ERRORS=$((ERRORS + 1))
     fi
-    # Check GUI version
+    # Check GUI versions
     GUI_VER=$(grep '^version = ' crates/pmetal-gui/src-tauri/Cargo.toml | sed 's/version = "//;s/"//')
     if [[ "$GUI_VER" != "$WS_VER" ]]; then
-        echo "FAIL: pmetal-gui version = \"$GUI_VER\" (expected \"$WS_VER\")"
+        echo "FAIL: pmetal-gui Cargo.toml version = \"$GUI_VER\" (expected \"$WS_VER\")"
+        ERRORS=$((ERRORS + 1))
+    fi
+    GUI_PACKAGE_VER=$(grep '"version":' crates/pmetal-gui/package.json | sed 's/.*"version": "//;s/".*//')
+    if [[ "$GUI_PACKAGE_VER" != "$WS_VER" ]]; then
+        echo "FAIL: pmetal-gui package.json version = \"$GUI_PACKAGE_VER\" (expected \"$WS_VER\")"
+        ERRORS=$((ERRORS + 1))
+    fi
+    GUI_TAURI_CONF_VER=$(grep '"version":' crates/pmetal-gui/src-tauri/tauri.conf.json | sed 's/.*"version": "//;s/".*//')
+    if [[ "$GUI_TAURI_CONF_VER" != "$WS_VER" ]]; then
+        echo "FAIL: pmetal-gui tauri.conf.json version = \"$GUI_TAURI_CONF_VER\" (expected \"$WS_VER\")"
+        ERRORS=$((ERRORS + 1))
+    fi
+    GUI_LAYOUT_VER=$(grep 'let appVersion' crates/pmetal-gui/src/routes/+layout.svelte | sed "s/.*'\([^']*\)'.*/\1/")
+    if [[ "$GUI_LAYOUT_VER" != "$WS_VER" ]]; then
+        echo "FAIL: pmetal-gui layout appVersion = \"$GUI_LAYOUT_VER\" (expected \"$WS_VER\")"
         ERRORS=$((ERRORS + 1))
     fi
     # Check CHANGELOG has entry
@@ -123,7 +137,7 @@ check-lockfile:
     cargo update --locked 2>&1 || (echo "FAIL: Cargo.lock is out of date -- run cargo update" && exit 1)
     @echo "Cargo.lock is current, no yanked crates"
 
-# Bump version across all crates (updates workspace, py, gui, changelog stub)
+# Bump version across all crates (updates workspace, gui, changelog stub)
 bump new_version:
     #!/usr/bin/env zsh
     set -euo pipefail
@@ -132,10 +146,11 @@ bump new_version:
     echo "Bumping $OLD -> $NEW"
     # Workspace Cargo.toml
     sed -i '' "s/version = \"$OLD\"/version = \"$NEW\"/g" Cargo.toml
-    # pmetal-py pinned dep
-    sed -i '' "s/version = \"$OLD\"/version = \"$NEW\"/" crates/pmetal-py/Cargo.toml
     # GUI
     sed -i '' "s/version = \"$OLD\"/version = \"$NEW\"/" crates/pmetal-gui/src-tauri/Cargo.toml
+    sed -i '' "s/\"version\": \"$OLD\"/\"version\": \"$NEW\"/" crates/pmetal-gui/package.json
+    sed -i '' "s/\"version\": \"$OLD\"/\"version\": \"$NEW\"/" crates/pmetal-gui/src-tauri/tauri.conf.json
+    sed -i '' "s/appVersion = \$state('$OLD')/appVersion = \$state('$NEW')/" crates/pmetal-gui/src/routes/+layout.svelte
     # Update lockfile
     cargo update --workspace
     echo "Bumped to $NEW -- update CHANGELOG.md before publishing"

@@ -11,6 +11,16 @@ const TOKEN_TYPE_UNUSED: i32 = 5;
 
 const LLAMA_PRETOKENIZER_CHECK: &str = "\n \n\n \n\n\n \t \t\t \t\n  \n   \n    \n     \n🚀 (normal) 😶‍🌫️ (multiple emojis concatenated) ✅ 🦙🦙 3 33 333 3333 33333 333333 3333333 33333333 3.3 3..3 3...3 កាន់តែពិសេសអាច😁 ?我想在apple工作1314151天～ ------======= нещо на Български ''''''```````\"\"\"\"......!!!!!!?????? I've been 'told he's there, 'RE you sure? 'M not sure I'll make it, 'D you like some tea? We'Ve a'lL";
 
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 fn quantize_method_file_type(method: crate::QuantizeMethod) -> pmetal_gguf::FileType {
     use pmetal_gguf::FileType;
     match method {
@@ -427,7 +437,8 @@ fn infer_pre_tokenizer(
 
     let ids = tokenizer.encode(LLAMA_PRETOKENIZER_CHECK, false).ok()?;
     let token_ids = ids.get_ids();
-    let hash = format!("{:x}", Sha256::digest(format!("{token_ids:?}").as_bytes()));
+    let digest = Sha256::digest(format!("{token_ids:?}").as_bytes());
+    let hash = lower_hex(digest.as_ref());
     if let Some(pre) = known_pre_tokenizer(&hash) {
         return Some(pre.to_string());
     }

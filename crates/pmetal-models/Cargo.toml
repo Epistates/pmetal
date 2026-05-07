@@ -20,7 +20,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
 safetensors = { workspace = true }
-json5 = "1.3.0"
+json5 = "1.3.1"
 
 # Metal dependencies (macOS only)
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -28,7 +28,7 @@ objc2 = { workspace = true }
 objc2-metal = { workspace = true }
 
 [dev-dependencies]
-serial_test = "3.2"
+serial_test = "3.4"
 tempfile = { workspace = true }
 # Pull in pmetal-mlx's `test-utils` feature so integration tests can reach
 # the shared parity helpers (`test_utils::*`). The feature is empty in

@@ -47,7 +47,7 @@ image = "0.25"
 tensorboard-rs = { version = "0.5", optional = true }
 
 [dev-dependencies]
-serial_test = "3.2.0"
+serial_test = "3.4.0"
 tempfile = { workspace = true }
 
 [lints]

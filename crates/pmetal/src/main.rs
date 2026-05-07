@@ -1186,6 +1186,16 @@ const METALLIB_SHA256: &str = match option_env!("PMETAL_METALLIB_SHA256") {
     None => "",
 };
 
+fn lower_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        output.push(HEX[(byte >> 4) as usize] as char);
+        output.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    output
+}
+
 /// Download `mlx.metallib` from the matching GitHub release.
 ///
 /// Uses `reqwest` (no subprocess) and verifies the SHA-256 of the downloaded
@@ -1251,7 +1261,7 @@ fn download_metallib(dest: &std::path::Path) -> bool {
     if !METALLIB_SHA256.is_empty() {
         use sha2::Digest as _;
         let digest = sha2::Sha256::digest(&bytes);
-        let hex = format!("{digest:x}");
+        let hex = lower_hex(digest.as_ref());
         if hex != METALLIB_SHA256 {
             eprintln!(
                 "\x1b[1;31merror:\x1b[0m SHA-256 mismatch for mlx.metallib\n\
