@@ -27,6 +27,7 @@ __all__ = [
     "download_file",
     # Model
     "Model",
+    "DFlashGenerator",
     # Tokenizer
     "Tokenizer",
     # Trainer
@@ -38,4 +39,7 @@ __all__ = [
     # Easy API
     "finetune",
     "infer",
+    "infer_with_metrics",
+    "train_mtp",
+    "train_draft",
 ]

@@ -5235,6 +5235,8 @@ dependencies = [
 name = "pmetal-py"
 version = "0.5.0"
 dependencies = [
+ "pmetal",
+ "pmetal-bridge",
  "pmetal-core",
  "pmetal-data",
  "pmetal-hub",

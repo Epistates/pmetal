@@ -12,6 +12,13 @@ SKIP_EASY = os.environ.get("PMETAL_TEST_EASY", "0") != "1"
 TEST_MODEL = os.environ.get("PMETAL_MODEL_PATH", "Qwen/Qwen3-0.6B")
 
 
+def test_easy_api_exports_extended_functions():
+    """Top-level package exports should include the full easy/speculative API."""
+    for name in ("infer_with_metrics", "train_mtp", "train_draft", "DFlashGenerator"):
+        assert hasattr(pmetal, name), f"pmetal.{name} missing"
+        assert name in pmetal.__all__
+
+
 def create_sample_dataset(path: str, n_samples: int = 10):
     """Create a minimal JSONL dataset for testing."""
     samples = [

@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 import pmetal
 
 
@@ -32,7 +34,7 @@ def test_lora_config_custom():
     config = pmetal.LoraConfig(r=32, alpha=64.0, dropout=0.1, use_rslora=True)
     assert config.r == 32
     assert config.alpha == 64.0
-    assert config.dropout == 0.1
+    assert config.dropout == pytest.approx(0.1)
     assert config.use_rslora is True
     assert config.use_dora is False
 
@@ -55,7 +57,7 @@ def test_lora_config_json_roundtrip():
     restored = pmetal.LoraConfig.from_json(json_str)
     assert restored.r == 8
     assert restored.alpha == 16.0
-    assert restored.dropout == 0.05
+    assert restored.dropout == pytest.approx(0.05)
     assert restored.use_rslora is True
     assert restored.use_dora is True
 
@@ -121,19 +123,19 @@ def test_training_config_json_roundtrip():
 def test_generation_config_defaults():
     config = pmetal.GenerationConfig()
     assert config.max_tokens == 256
-    assert config.temperature == 0.7
+    assert config.temperature == pytest.approx(0.7)
     assert config.top_k == 50
-    assert config.top_p == 0.9
-    assert config.min_p == 0.05
+    assert config.top_p == pytest.approx(0.9)
+    assert config.min_p == pytest.approx(0.05)
 
 
 def test_generation_config_custom():
     config = pmetal.GenerationConfig(max_tokens=100, temperature=0.5, seed=42)
     assert config.max_tokens == 100
-    assert config.temperature == 0.5
+    assert config.temperature == pytest.approx(0.5)
     assert config.seed == 42
     assert config.top_k == 50
-    assert config.top_p == 0.9
+    assert config.top_p == pytest.approx(0.9)
 
 
 def test_generation_config_greedy():
@@ -144,7 +146,7 @@ def test_generation_config_greedy():
 
 def test_generation_config_sampling():
     config = pmetal.GenerationConfig.sampling(256, 0.8)
-    assert config.temperature == 0.8
+    assert config.temperature == pytest.approx(0.8)
     assert config.max_tokens == 256
 
 
@@ -229,7 +231,7 @@ def test_dataset_format_enum():
 def test_model_architecture_enum():
     for name in ("Llama", "Llama4", "Qwen2", "Qwen3", "Qwen3MoE", "Gemma",
                  "Mistral", "Phi", "Phi4", "DeepSeek", "Cohere", "Granite",
-                 "NemotronH", "StarCoder2", "RecurrentGemma", "Jamba", "Flux"):
+                 "NemotronH", "Qwen3Next", "GptOss", "Gemma4", "Bert", "Flux"):
         assert hasattr(pmetal.ModelArchitecture, name), f"ModelArchitecture.{name} missing"
 
 

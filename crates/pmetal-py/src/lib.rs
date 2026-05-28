@@ -62,6 +62,9 @@ fn pmetal(_py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Easy API
     m.add_function(wrap_pyfunction!(easy::finetune, m)?)?;
     m.add_function(wrap_pyfunction!(easy::infer, m)?)?;
+    m.add_function(wrap_pyfunction!(easy::infer_with_metrics, m)?)?;
+    m.add_function(wrap_pyfunction!(easy::train_mtp, m)?)?;
+    m.add_function(wrap_pyfunction!(easy::train_draft, m)?)?;
 
     // Tracing subscriber submodule (enabled via --features tracing)
     // Uncomment when pyo3-tracing-subscriber is added to Cargo.toml:

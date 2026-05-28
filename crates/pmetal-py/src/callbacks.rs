@@ -1,7 +1,53 @@
 //! Python callback bridge for training events.
 
 use pmetal_core::TrainingCallback;
+use pyo3::call::PyCallArgs;
 use pyo3::prelude::*;
+
+fn call_optional_method0(py: Python<'_>, cb: &Py<PyAny>, name: &str) {
+    let bound = cb.bind(py);
+    let method = match bound.getattr(name) {
+        Ok(method) => method,
+        Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => return,
+        Err(err) => {
+            eprintln!("pmetal callback {name} failed:");
+            err.print(py);
+            return;
+        }
+    };
+
+    match method.call0() {
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("pmetal callback {name} failed:");
+            err.print(py);
+        }
+    }
+}
+
+fn call_optional_method1<'py, A>(py: Python<'py>, cb: &Py<PyAny>, name: &str, args: A)
+where
+    A: PyCallArgs<'py>,
+{
+    let bound = cb.bind(py);
+    let method = match bound.getattr(name) {
+        Ok(method) => method,
+        Err(err) if err.is_instance_of::<pyo3::exceptions::PyAttributeError>(py) => return,
+        Err(err) => {
+            eprintln!("pmetal callback {name} failed:");
+            err.print(py);
+            return;
+        }
+    };
+
+    match method.call1(args) {
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("pmetal callback {name} failed:");
+            err.print(py);
+        }
+    }
+}
 
 /// Bridge that dispatches Rust training callbacks to Python objects.
 ///
@@ -22,7 +68,7 @@ impl TrainingCallback for PythonCallbackBridge {
     fn on_train_start(&mut self) {
         Python::attach(|py| {
             for cb in &self.py_callbacks {
-                let _ = cb.call_method0(py, "on_train_start");
+                call_optional_method0(py, cb, "on_train_start");
             }
         });
     }
@@ -30,7 +76,7 @@ impl TrainingCallback for PythonCallbackBridge {
     fn on_train_end(&mut self) {
         Python::attach(|py| {
             for cb in &self.py_callbacks {
-                let _ = cb.call_method0(py, "on_train_end");
+                call_optional_method0(py, cb, "on_train_end");
             }
         });
     }
@@ -38,7 +84,7 @@ impl TrainingCallback for PythonCallbackBridge {
     fn on_epoch_start(&mut self, epoch: usize) {
         Python::attach(|py| {
             for cb in &self.py_callbacks {
-                let _ = cb.call_method1(py, "on_epoch_start", (epoch,));
+                call_optional_method1(py, cb, "on_epoch_start", (epoch,));
             }
         });
     }
@@ -46,8 +92,9 @@ impl TrainingCallback for PythonCallbackBridge {
     fn on_epoch_end(&mut self, epoch: usize, metrics: &pmetal_core::EvalMetrics) {
         Python::attach(|py| {
             for cb in &self.py_callbacks {
-                let _ = cb.call_method1(
+                call_optional_method1(
                     py,
+                    cb,
                     "on_epoch_end",
                     (epoch, metrics.loss, metrics.perplexity),
                 );
@@ -58,7 +105,7 @@ impl TrainingCallback for PythonCallbackBridge {
     fn on_step_start(&mut self, step: usize) {
         Python::attach(|py| {
             for cb in &self.py_callbacks {
-                let _ = cb.call_method1(py, "on_step_start", (step,));
+                call_optional_method1(py, cb, "on_step_start", (step,));
             }
         });
     }
@@ -66,7 +113,7 @@ impl TrainingCallback for PythonCallbackBridge {
     fn on_step_end(&mut self, step: usize, loss: f64) {
         Python::attach(|py| {
             for cb in &self.py_callbacks {
-                let _ = cb.call_method1(py, "on_step_end", (step, loss));
+                call_optional_method1(py, cb, "on_step_end", (step, loss));
             }
         });
     }
@@ -74,7 +121,7 @@ impl TrainingCallback for PythonCallbackBridge {
     fn on_save(&mut self, path: &std::path::Path) {
         Python::attach(|py| {
             for cb in &self.py_callbacks {
-                let _ = cb.call_method1(py, "on_save", (path.to_string_lossy().to_string(),));
+                call_optional_method1(py, cb, "on_save", (path.to_string_lossy().to_string(),));
             }
         });
     }

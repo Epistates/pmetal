@@ -121,11 +121,12 @@ impl PyModel {
 
         let max_seq_len = input_ids.len() + max_tokens + 64;
         let mut cache = self.inner.create_cache(max_seq_len);
+        let mut mamba_cache = self.inner.create_mamba_cache();
 
         let output = pmetal_models::generate_cached_async(
             |input, cache| {
                 self.inner
-                    .forward_with_hybrid_cache(input, None, Some(cache), None)
+                    .forward_with_hybrid_cache(input, None, Some(cache), mamba_cache.as_mut())
             },
             &input_ids,
             gen_config,
