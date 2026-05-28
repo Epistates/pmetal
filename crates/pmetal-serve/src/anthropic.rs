@@ -312,7 +312,11 @@ pub async fn messages(
     let (tokens, _logprobs, finish_reason, metrics) =
         state.engine.generate(&input_ids, params).await?;
     state.metrics.record(&metrics);
-    let text = state.engine.decode(&tokens)?;
+    let text = if tools_requested {
+        state.engine.decode_with_special_tokens(&tokens)?
+    } else {
+        state.engine.decode(&tokens)?
+    };
     let output_tokens = tokens.len();
 
     let (content, stop_reason) = if tools_requested {
@@ -481,7 +485,7 @@ fn anthropic_sse_stream(
 
                 let output_tokens = decoder.token_count();
                 let stop_reason = if tools_requested {
-                    if try_parse_tool_calls(&decoder.decoded_text()).is_some() {
+                    if try_parse_tool_calls(&decoder.decoded_text_with_special_tokens()).is_some() {
                         "tool_use".to_string()
                     } else {
                         to_stop_reason(&finish_reason)

@@ -30,7 +30,7 @@ use std::sync::Arc;
 /// let tail = dec.flush();
 /// if !tail.is_empty() { emit_content_delta(tail); }
 /// // For tool-call detection post-Done:
-/// let full = dec.decoded_text();
+/// let full = dec.decoded_text_with_special_tokens();
 /// ```
 ///
 /// Streaming logprobs use `push_with_aux` / `flush_aux` to keep an arbitrary
@@ -97,11 +97,14 @@ impl<Aux> IncrementalDecoder<Aux> {
         (text, aux)
     }
 
-    /// The full decoded text accumulated so far. Used by the chat /
-    /// Anthropic streams to run best-effort tool-call detection after
-    /// the terminal `Done` event.
-    pub fn decoded_text(&self) -> String {
-        self.tokenizer.decode(&self.buffer).unwrap_or_default()
+    /// The full decoded text with special tokens preserved. Tool-call
+    /// protocols such as Gemma 4 use special-token delimiters, so final
+    /// tool-call parsing needs this form even when user-visible deltas use
+    /// normal decoding.
+    pub fn decoded_text_with_special_tokens(&self) -> String {
+        self.tokenizer
+            .decode_with_special_tokens(&self.buffer)
+            .unwrap_or_default()
     }
 
     /// Number of tokens seen so far. Used by the Anthropic stream to

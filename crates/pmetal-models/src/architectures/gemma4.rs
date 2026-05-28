@@ -1172,11 +1172,28 @@ impl Gemma4ForCausalLM {
         cache: Option<&mut KVCache>,
         capture: &mut pmetal_mlx::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
+        let (_hidden, logits) =
+            self.forward_hidden_with_capture(input_ids, mask, cache, capture)?;
+        Ok(logits)
+    }
+
+    /// Forward pass that returns both final normalized hidden states and logits.
+    ///
+    /// Gemma 4 MTP assistants consume the target model's final hidden state for
+    /// the last accepted token, while the verifier still needs logits. Keeping
+    /// this as a single trunk pass avoids recomputing the target block stack.
+    pub fn forward_hidden_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<(Array, Array), Exception> {
         let hidden = self
             .model
             .forward_with_capture(input_ids, mask, cache, Some(capture))?;
         let logits = self.model.embed_tokens.as_linear(&hidden);
-        Ok(self.logit_softcap(&logits))
+        Ok((hidden, self.logit_softcap(&logits)))
     }
 }
 

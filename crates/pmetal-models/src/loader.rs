@@ -1037,7 +1037,7 @@ pub fn load_generic_weights<M: ModuleParameters + ModuleParametersExt>(
     Ok(())
 }
 
-fn load_weights_filtered<F>(
+pub(crate) fn load_weights_filtered<F>(
     model_dir: impl AsRef<Path>,
     mut keep_key: F,
 ) -> Result<HashMap<String, Array>, LoadError>

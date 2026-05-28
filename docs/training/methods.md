@@ -73,6 +73,12 @@ Sentence-transformer fine-tuning for BERT/encoder models with contrastive learni
 pmetal embed-train --model BAAI/bge-small-en-v1.5 --dataset pairs.jsonl --loss infonce
 ```
 
+## MTP And Draft Training
+
+`pmetal train-mtp` trains Gemma 4 assistant checkpoints and Qwen3Next/Qwen3.6 MTP predictor checkpoints for exact speculative decoding. Qwen checkpoints exported by this command can be loaded with `pmetal infer --mtp --mtp-model <dir>`.
+
+`pmetal train-draft` trains DFlash block-diffusion draft checkpoints from tokenized shards and a frozen Qwen3 target for use with `pmetal dflash`.
+
 ## ANE Training
 Automatic Apple Neural Engine training when available. Uses the ANE for forward passes with CPU-based gradient computation. Activated automatically on supported models.
 

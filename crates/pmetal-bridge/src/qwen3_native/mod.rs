@@ -34,8 +34,8 @@ pub use cache::{
     GdnCache, KvLayerCache, MixedBitConfig, NativeCache, QuantCacheConfig, QuantizedTuple,
 };
 pub use forward::{
-    compact_tree_cache, forward_step, forward_step_tree_verify, forward_step_with_capture,
-    rollback_cache,
+    compact_tree_cache, forward_step, forward_step_hidden, forward_step_tree_verify,
+    forward_step_with_capture, rollback_cache,
 };
 pub use generate::{
     CppDecodeSession, CppForwardState, QwenDecodeBackend, benchmark_mlx_lm_trial,

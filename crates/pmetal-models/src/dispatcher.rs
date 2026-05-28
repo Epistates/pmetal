@@ -77,7 +77,7 @@ impl std::fmt::Display for ModelArchitecture {
             Self::Cohere => write!(f, "Cohere"),
             Self::Granite => write!(f, "Granite"),
             Self::NemotronH => write!(f, "NemotronH"),
-            Self::Qwen3Next => write!(f, "Qwen 3.5"),
+            Self::Qwen3Next => write!(f, "Qwen 3.5 / 3.6"),
             Self::GptOss => write!(f, "GPT-OSS"),
             Self::Gemma4 => write!(f, "Gemma 4"),
             Self::Flux => write!(f, "Flux"),
@@ -95,7 +95,8 @@ impl ModelArchitecture {
             "qwen3_moe" => Some(Self::Qwen3MoE),
             "gpt_oss" | "gptoss" | "gpt-oss" => Some(Self::GptOss),
             "qwen3_next" | "qwen3_5" | "qwen3.5" | "qwen3_5_text" | "qwen3_5_moe"
-            | "qwen3_5_moe_text" => Some(Self::Qwen3Next),
+            | "qwen3_5_moe_text" | "qwen3_6" | "qwen3.6" | "qwen3_6_text" | "qwen3_6_moe"
+            | "qwen3_6_moe_text" => Some(Self::Qwen3Next),
             "qwen3" => Some(Self::Qwen3),
             "qwen2" | "qwen2_5" => Some(Self::Qwen2),
             "gemma" | "gemma2" | "gemma3" => Some(Self::Gemma),
@@ -136,6 +137,11 @@ impl ModelArchitecture {
                 || lower.contains("qwen3.5")
                 || lower.contains("qwen35moe")
                 || lower.contains("qwen3_5_moe")
+                || lower.contains("qwen36")
+                || lower.contains("qwen3_6")
+                || lower.contains("qwen3.6")
+                || lower.contains("qwen36moe")
+                || lower.contains("qwen3_6_moe")
             {
                 return Some(Self::Qwen3Next);
             }
@@ -144,6 +150,9 @@ impl ModelArchitecture {
             }
             if lower.contains("qwen2") || lower.contains("qwen") {
                 return Some(Self::Qwen2);
+            }
+            if lower.contains("gemma4assistant") || lower.contains("gemma4_assistant") {
+                return None;
             }
             if lower.contains("gemma4") {
                 return Some(Self::Gemma4);
@@ -1331,6 +1340,8 @@ mod tests {
                 "linear_attention".to_string(),
                 "linear_attention".to_string(),
             ]),
+            mtp_num_hidden_layers: None,
+            num_nextn_predict_layers: None,
         }
     }
 
@@ -1347,6 +1358,18 @@ mod tests {
     }
 
     #[test]
+    fn qwen36_moe_model_type_detects_as_qwen3_next() {
+        assert_eq!(
+            ModelArchitecture::from_model_type("qwen3_6_moe"),
+            Some(ModelArchitecture::Qwen3Next)
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("qwen3_6_moe_text"),
+            Some(ModelArchitecture::Qwen3Next)
+        );
+    }
+
+    #[test]
     fn llama4_text_model_type_detects_as_llama4() {
         assert_eq!(
             ModelArchitecture::from_model_type("llama4_text"),
@@ -1357,6 +1380,15 @@ mod tests {
     #[test]
     fn qwen35_moe_architecture_string_detects_as_qwen3_next() {
         let architectures = vec!["Qwen3_5_MoeForConditionalGeneration".to_string()];
+        assert_eq!(
+            ModelArchitecture::from_architectures(&architectures),
+            Some(ModelArchitecture::Qwen3Next)
+        );
+    }
+
+    #[test]
+    fn qwen36_moe_architecture_string_detects_as_qwen3_next() {
+        let architectures = vec!["Qwen3_6_MoeForConditionalGeneration".to_string()];
         assert_eq!(
             ModelArchitecture::from_architectures(&architectures),
             Some(ModelArchitecture::Qwen3Next)

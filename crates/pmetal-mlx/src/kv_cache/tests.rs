@@ -245,6 +245,34 @@ fn test_kv_cache_speculative_rollback_preserves_accepted_prefix() {
 }
 
 #[test]
+fn test_kv_cache_rollback_uses_populated_later_layer() {
+    // Hybrid models such as Qwen3Next can have GDN layers before the first
+    // full-attention layer. Layer 0 may therefore be empty while later KV
+    // layers hold speculative tokens. Rollback must trim those populated layers.
+    let config = KVCacheConfig::new(4, 64, 1, 1);
+    let mut cache = KVCache::new(config);
+
+    let prefill = seq_tensor(0.0, 4);
+    let draft = seq_tensor(10.0, 5);
+    let correction = seq_tensor(100.0, 1);
+
+    cache.update_and_fetch(3, &prefill, &prefill).unwrap();
+    cache.update_and_fetch(3, &draft, &draft).unwrap();
+    assert_eq!(cache.seq_len(), 9);
+
+    let trimmed = cache.rollback(3);
+    assert_eq!(trimmed, 3);
+    assert_eq!(cache.seq_len(), 6);
+
+    cache.update_and_fetch(3, &correction, &correction).unwrap();
+    assert_eq!(cache.seq_len(), 7);
+
+    let (cached_k, _) = cache.get(3).unwrap();
+    let flat = to_f32_vec_eval(&cached_k);
+    assert_eq!(flat, vec![0.0, 1.0, 2.0, 3.0, 10.0, 11.0, 100.0]);
+}
+
+#[test]
 fn test_kv_cache_rollback_clamps_to_seq_len() {
     let config = KVCacheConfig::new(1, 100, 1, 1);
     let mut cache = KVCache::new(config);

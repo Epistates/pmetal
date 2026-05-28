@@ -147,6 +147,13 @@ pub struct Qwen3NextConfig {
     /// When present, overrides full_attention_interval-based layer type detection.
     #[serde(default)]
     pub layer_types: Option<Vec<String>>,
+
+    /// Number of bundled MTP predictor layers, when present in the checkpoint.
+    #[serde(default)]
+    pub mtp_num_hidden_layers: Option<i32>,
+    /// Alternate HF/vLLM field name for bundled next-N predictors.
+    #[serde(default)]
+    pub num_nextn_predict_layers: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +287,14 @@ impl Qwen3NextConfig {
     pub fn rope_dims(&self) -> i32 {
         (self.get_head_dim() as f32 * self.partial_rotary_factor) as i32
     }
+
+    /// Number of bundled MTP predictor layers advertised by the config.
+    pub fn mtp_num_hidden_layers(&self) -> usize {
+        self.mtp_num_hidden_layers
+            .or(self.num_nextn_predict_layers)
+            .unwrap_or(0)
+            .max(0) as usize
+    }
 }
 
 impl ModelConfig for Qwen3NextConfig {
@@ -354,6 +369,8 @@ impl Default for Qwen3NextConfig {
             rope_scaling: None,
             rope_parameters: None,
             layer_types: None,
+            mtp_num_hidden_layers: None,
+            num_nextn_predict_layers: None,
         }
     }
 }
@@ -3130,6 +3147,40 @@ impl Qwen3NextDecoderLayer {
         })
     }
 
+    pub fn new_mtp(
+        config: &Qwen3NextConfig,
+        layer_idx: usize,
+        routed_expert_mode: Qwen3NextRoutedExpertMode,
+    ) -> Result<Self, Exception> {
+        let input_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
+            .eps(config.rms_norm_eps)
+            .build()?;
+        let post_attention_layernorm = nn::RmsNormBuilder::new(config.hidden_size)
+            .eps(config.rms_norm_eps)
+            .build()?;
+
+        let mlp = if config.use_moe_at(layer_idx) {
+            Qwen3NextFeedForward::MoE(Qwen3NextSparseMoeBlock::new_with_routed_expert_mode(
+                config,
+                routed_expert_mode,
+            )?)
+        } else {
+            Qwen3NextFeedForward::Dense(Qwen3NextMLP::new(
+                config.hidden_size,
+                config.intermediate_size,
+            )?)
+        };
+
+        Ok(Self {
+            is_linear: false,
+            linear_attn: None,
+            self_attn: Some(Qwen3NextAttention::new(config)?),
+            input_layernorm,
+            post_attention_layernorm,
+            mlp,
+        })
+    }
+
     pub fn forward(
         &mut self,
         x: &Array,
@@ -3633,6 +3684,30 @@ impl Qwen3NextForCausalLM {
             Some(capture),
         )?;
         self.lm_head_forward(&h)
+    }
+
+    /// Forward pass that returns both final normalized hidden states and logits.
+    ///
+    /// Qwen MTP consumes the target hidden state for committed tokens while the
+    /// verifier still needs logits. Returning both from one trunk pass avoids
+    /// rerunning the hybrid attention/GDN stack.
+    pub fn forward_hidden_with_capture(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+        capture: &mut pmetal_mlx::speculative::SpecCapture,
+    ) -> Result<(Array, Array), Exception> {
+        let h = self.model.forward_with_cache_and_capture(
+            input_ids,
+            mask,
+            kv_cache,
+            mamba_cache,
+            Some(capture),
+        )?;
+        let logits = self.lm_head_forward(&h)?;
+        Ok((h, logits))
     }
 
     /// Compiled whole-model decode: wraps the ENTIRE model forward in one

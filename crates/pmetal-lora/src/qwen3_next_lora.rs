@@ -1219,6 +1219,26 @@ impl Qwen3NextLoraForCausalLM {
         self.lm_head_forward(&h)
     }
 
+    /// Cache-aware forward that returns both final hidden states and logits.
+    ///
+    /// Qwen bundled MTP needs the target hidden state for committed tokens and
+    /// target logits for verification. The LoRA path uses full cache rebuilds
+    /// between verify rounds, so it does not need the base model's optimized
+    /// GDN capture/partial-rewind hook.
+    pub fn forward_hidden_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<(Array, Array), LoraError> {
+        let h = self
+            .model
+            .forward_with_cache(input_ids, mask, kv_cache, mamba_cache)?;
+        let logits = self.lm_head_forward(&h)?;
+        Ok((h, logits))
+    }
+
     /// Create a KV cache sized for the attention layers.
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
         let config = &self.model.config;
@@ -1844,6 +1864,23 @@ impl Qwen3NextLoraForCausalLM {
         Err(LoraError::InvalidState(
             "unmerge_lora is not supported: reload base model weights to undo a merge".to_string(),
         ))
+    }
+}
+
+impl pmetal_models::qwen3_next_mtp::Qwen3NextMtpTarget for Qwen3NextLoraForCausalLM {
+    fn qwen3_next_config(&self) -> &Qwen3NextConfig {
+        &self.model.config
+    }
+
+    fn forward_hidden_for_mtp(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<(Array, Array), Exception> {
+        self.forward_hidden_with_cache(input_ids, mask, kv_cache, mamba_cache)
+            .map_err(|e| Exception::custom(e.to_string()))
     }
 }
 

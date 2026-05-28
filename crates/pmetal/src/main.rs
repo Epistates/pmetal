@@ -272,6 +272,16 @@ enum Commands {
     #[cfg(feature = "trainer")]
     Train(crate::cli::train::TrainArgs),
 
+    /// Train a Gemma 4 assistant or Qwen3Next/Qwen3.6 MTP predictor
+    #[command(name = "train-mtp")]
+    #[cfg(feature = "trainer")]
+    TrainMtp(crate::cli::train_mtp::TrainMtpArgs),
+
+    /// Train a DFlash block-diffusion draft checkpoint
+    #[command(name = "train-draft")]
+    #[cfg(feature = "trainer")]
+    TrainDraft(crate::cli::train_draft::TrainDraftArgs),
+
     /// Pretrain a model from scratch (full-parameter, no LoRA)
     #[cfg(feature = "trainer")]
     Pretrain(crate::cli::pretrain::PretrainArgs),
@@ -1622,6 +1632,16 @@ async fn tokio_main() -> anyhow::Result<()> {
             orchestrator::run_training(job_config, None, extra_callbacks).await?;
         }
 
+        #[cfg(feature = "trainer")]
+        Commands::TrainMtp(args) => {
+            commands::train_mtp::run_train_mtp(args).await?;
+        }
+
+        #[cfg(feature = "trainer")]
+        Commands::TrainDraft(args) => {
+            commands::train_draft::run_train_draft(args).await?;
+        }
+
         #[cfg(feature = "mcp")]
         Commands::Mcp => {
             pmetal_mcp::run_stdio()
@@ -1713,6 +1733,9 @@ async fn tokio_main() -> anyhow::Result<()> {
                 mode,
                 backend,
                 draft_model,
+                mtp,
+                mtp_model,
+                mtp_draft_tokens,
                 metal_sampler,
                 compiled,
                 stream,
@@ -1781,6 +1804,9 @@ async fn tokio_main() -> anyhow::Result<()> {
                 mode,
                 backend,
                 draft_model.as_deref(),
+                mtp,
+                mtp_model.as_deref(),
+                mtp_draft_tokens,
                 metal_sampler,
                 compiled,
                 stream,

@@ -21,9 +21,18 @@ use pmetal_mlx::kv_cache::{
     sanitize_cache_mode_for_config,
 };
 use pmetal_mlx::{Array, Dtype, Exception, ModuleParameters as _};
+use pmetal_models::architectures::{
+    Gemma4AssistantForCausalLM, Qwen3NextConfig, Qwen3NextMtpForCausalLM,
+    load_gemma4_assistant_from_dir, load_qwen3_next_mtp_from_dir,
+};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::GenerationConfig;
-use pmetal_models::{GenerationOutput, generate_cached_async_streaming};
+use pmetal_models::{
+    Gemma4MtpConfig, GenerationOutput, Qwen3NextMtpConfig, generate_cached_async_streaming,
+    generate_gemma4_mtp_streaming, generate_qwen3_next_mtp_streaming,
+    generate_qwen3_next_mtp_streaming_rebuild, validate_gemma4_mtp_pair,
+    validate_qwen3_next_mtp_pair,
+};
 
 #[cfg(feature = "lora")]
 use pmetal_lora::{DynamicLoraModel, TrainableModel as _};
@@ -39,6 +48,14 @@ pub struct InferenceRunnerConfig {
     pub model_path: PathBuf,
     /// Optional LoRA adapter path (file or directory).
     pub lora_path: Option<String>,
+    /// Optional Gemma 4 MTP assistant checkpoint path.
+    pub mtp_assistant_path: Option<PathBuf>,
+    /// Optional Qwen MTP checkpoint path; defaults to bundled mtp.* weights in `model_path`.
+    pub qwen_mtp_path: Option<PathBuf>,
+    /// Enable bundled Qwen3Next/Qwen3.6 MTP weights from the target checkpoint.
+    pub qwen_mtp: bool,
+    /// Number of Qwen MTP draft tokens to verify per speculative step.
+    pub qwen_mtp_draft_tokens: usize,
     /// Optional packed expert weights directory for SSD-offloaded MoE.
     pub experts_dir: Option<String>,
     /// Quantize weights to FP8 E4M3 (~2x memory savings).
@@ -116,6 +133,10 @@ impl Default for InferenceRunnerConfig {
         Self {
             model_path: PathBuf::new(),
             lora_path: None,
+            mtp_assistant_path: None,
+            qwen_mtp_path: None,
+            qwen_mtp: false,
+            qwen_mtp_draft_tokens: Qwen3NextMtpConfig::default().num_draft_tokens,
             experts_dir: None,
             fp8: false,
             prompt: String::new(),
@@ -188,6 +209,11 @@ pub struct InferenceGenState {
     input_ids: Vec<u32>,
     cache: KVCache,
     mamba_cache: Option<MambaCache>,
+    mtp_assistant: Option<Gemma4AssistantForCausalLM>,
+    mtp_config: Option<Gemma4MtpConfig>,
+    qwen_mtp: Option<Qwen3NextMtpForCausalLM>,
+    qwen_mtp_cache: Option<KVCache>,
+    qwen_mtp_config: Option<Qwen3NextMtpConfig>,
     native_turboquant: Option<BridgeTurboQuantConfig>,
     /// Zero-overhead affine KV cache quantization config for native path
     native_quant_config: Option<pmetal_bridge::qwen3_native::QuantCacheConfig>,
@@ -225,6 +251,25 @@ impl InferenceRunner {
     /// 11. Create Mamba cache (for hybrid models)
     pub fn prepare(config: InferenceRunnerConfig) -> Result<Self, Exception> {
         let model_path = &config.model_path;
+        if config.qwen_mtp && config.mtp_assistant_path.is_some() {
+            return Err(Exception::custom(
+                "Use either Gemma 4 --draft-model MTP or Qwen --mtp, not both",
+            ));
+        }
+        if config.qwen_mtp_path.is_some() && !config.qwen_mtp {
+            return Err(Exception::custom("--mtp-model requires Qwen --mtp"));
+        }
+        let mtp_requested = config.mtp_assistant_path.is_some() || config.qwen_mtp;
+        if config.mtp_assistant_path.is_some() && config.lora_path.is_some() {
+            return Err(Exception::custom(
+                "Gemma 4 MTP is only supported for standard target-model inference, not LoRA-merged inference",
+            ));
+        }
+        if config.lora_path.is_some() && config.experts_dir.is_some() {
+            return Err(Exception::custom(
+                "LoRA-merged inference does not support --experts-dir; fuse the adapter first or run without expert offload",
+            ));
+        }
 
         // 1. Load tokenizer
         let tokenizer = Tokenizer::from_model_dir(model_path)
@@ -241,13 +286,16 @@ impl InferenceRunner {
 
         // 3. Sampling defaults are loaded after template detection (step 6b)
         //    because mode presets depend on the detected model family.
-        let native_bridge_info =
-            if config.lora_path.is_none() && !config.fp8 && config.experts_dir.is_none() {
-                crate::native_inference::load_native_bridge_info(model_path)
-                    .map_err(Exception::custom)?
-            } else {
-                None
-            };
+        let native_bridge_info = if config.lora_path.is_none()
+            && !config.fp8
+            && config.experts_dir.is_none()
+            && (!mtp_requested || config.qwen_mtp)
+        {
+            crate::native_inference::load_native_bridge_info(model_path)
+                .map_err(Exception::custom)?
+        } else {
+            None
+        };
         let native_bridge_candidate = native_bridge_info.is_some();
 
         // 4. Prime the Metal runtime before MLX model construction. The stable
@@ -368,7 +416,10 @@ impl InferenceRunner {
         // 9. Load model (standard or LoRA-merged)
         let max_seq_len = input_ids.len() + config.max_tokens + 64;
 
-        let cache_request = cache_mode_request_from_config(&config);
+        let mut cache_request = cache_mode_request_from_config(&config);
+        if mtp_requested {
+            cache_request.no_kv_quant = true;
+        }
         let (model, cache, mamba_cache, native_turboquant, native_quant_config) = if let Some(
             native_info,
         ) =
@@ -501,6 +552,126 @@ impl InferenceRunner {
             (LoadedModel::Standard(m), cache, mamba_cache, None, None)
         };
 
+        let (mtp_assistant, mtp_config) =
+            if let Some(ref assistant_path) = config.mtp_assistant_path {
+                match &model {
+                    LoadedModel::Standard(DynamicModel::Gemma4(target)) => {
+                        let (assistant, assistant_gen_config) =
+                            load_gemma4_assistant_from_dir(assistant_path)?;
+                        validate_gemma4_mtp_pair(target, &assistant)?;
+                        tracing::info!(
+                            assistant = %assistant_path.display(),
+                            num_assistant_tokens = assistant_gen_config.num_assistant_tokens,
+                            "Gemma 4 MTP assistant loaded"
+                        );
+                        (
+                            Some(assistant),
+                            Some(Gemma4MtpConfig {
+                                num_assistant_tokens: assistant_gen_config.num_assistant_tokens,
+                            }),
+                        )
+                    }
+                    LoadedModel::Standard(other) => {
+                        return Err(Exception::custom(format!(
+                            "Gemma 4 MTP requires a Gemma 4 target model; got {:?}",
+                            other.architecture()
+                        )));
+                    }
+                    #[cfg(feature = "lora")]
+                    LoadedModel::Lora(_) => {
+                        return Err(Exception::custom(
+                            "Gemma 4 MTP is not supported with LoRA-merged inference",
+                        ));
+                    }
+                    LoadedModel::NativeOnly => {
+                        return Err(Exception::custom(
+                            "Gemma 4 MTP requires the standard shared model path",
+                        ));
+                    }
+                }
+            } else {
+                (None, None)
+            };
+
+        let (qwen_mtp, qwen_mtp_cache, qwen_mtp_config) = if config.qwen_mtp {
+            let qwen_mtp_path = config.qwen_mtp_path.as_deref().unwrap_or(model_path);
+            match &model {
+                LoadedModel::Standard(DynamicModel::Qwen3Next(target)) => {
+                    let mut mtp = load_qwen3_next_mtp_from_dir(qwen_mtp_path, &target.config)?;
+                    validate_qwen3_next_mtp_pair(target, &mtp)?;
+                    if config.fp8 {
+                        tracing::info!("Quantizing Qwen MTP weights to FP8 E4M3");
+                        mtp.quantize_fp8_weights()?;
+                    }
+                    let mtp_cache = mtp.create_cache(max_seq_len);
+                    let mtp_config = Qwen3NextMtpConfig {
+                        num_draft_tokens: config.qwen_mtp_draft_tokens.max(1),
+                    };
+                    tracing::info!(
+                        checkpoint = %qwen_mtp_path.display(),
+                        draft_tokens = mtp_config.num_draft_tokens,
+                        predictor_layers = mtp.config.mtp_num_hidden_layers(),
+                        "Qwen MTP loaded"
+                    );
+                    (Some(mtp), Some(mtp_cache), Some(mtp_config))
+                }
+                LoadedModel::Standard(other) => {
+                    return Err(Exception::custom(format!(
+                        "Qwen MTP requires a Qwen3Next/Qwen3.6 target model; got {:?}",
+                        other.architecture()
+                    )));
+                }
+                #[cfg(feature = "lora")]
+                LoadedModel::Lora(pmetal_lora::DynamicLoraModel::Qwen3Next(target)) => {
+                    let mut mtp = load_qwen3_next_mtp_from_dir(qwen_mtp_path, target.config())?;
+                    validate_qwen3_next_mtp_pair(target, &mtp)?;
+                    if config.fp8 {
+                        tracing::info!("Quantizing Qwen MTP weights to FP8 E4M3");
+                        mtp.quantize_fp8_weights()?;
+                    }
+                    let mtp_cache = mtp.create_cache(max_seq_len);
+                    let mtp_config = Qwen3NextMtpConfig {
+                        num_draft_tokens: config.qwen_mtp_draft_tokens.max(1),
+                    };
+                    tracing::info!(
+                        checkpoint = %qwen_mtp_path.display(),
+                        draft_tokens = mtp_config.num_draft_tokens,
+                        predictor_layers = mtp.config.mtp_num_hidden_layers(),
+                        "Qwen MTP loaded for LoRA-merged target"
+                    );
+                    (Some(mtp), Some(mtp_cache), Some(mtp_config))
+                }
+                #[cfg(feature = "lora")]
+                LoadedModel::Lora(other) => {
+                    return Err(Exception::custom(format!(
+                        "Qwen MTP requires a Qwen3Next/Qwen3.6 target model; got {:?}",
+                        other.architecture()
+                    )));
+                }
+                LoadedModel::NativeOnly => {
+                    let target_config = load_qwen3_next_config_for_mtp(model_path)?;
+                    let mut mtp = load_qwen3_next_mtp_from_dir(qwen_mtp_path, &target_config)?;
+                    if config.fp8 {
+                        tracing::info!("Quantizing Qwen MTP weights to FP8 E4M3");
+                        mtp.quantize_fp8_weights()?;
+                    }
+                    let mtp_cache = mtp.create_cache(max_seq_len);
+                    let mtp_config = Qwen3NextMtpConfig {
+                        num_draft_tokens: config.qwen_mtp_draft_tokens.max(1),
+                    };
+                    tracing::info!(
+                        checkpoint = %qwen_mtp_path.display(),
+                        draft_tokens = mtp_config.num_draft_tokens,
+                        predictor_layers = mtp.config.mtp_num_hidden_layers(),
+                        "Qwen MTP loaded for native verifier"
+                    );
+                    (Some(mtp), Some(mtp_cache), Some(mtp_config))
+                }
+            }
+        } else {
+            (None, None, None)
+        };
+
         Ok(Self {
             tokenizer,
             state: InferenceGenState {
@@ -509,6 +680,11 @@ impl InferenceRunner {
                 input_ids,
                 cache,
                 mamba_cache,
+                mtp_assistant,
+                mtp_config,
+                qwen_mtp,
+                qwen_mtp_cache,
+                qwen_mtp_config,
                 native_turboquant,
                 native_quant_config,
                 model_path: config.model_path.clone(),
@@ -598,6 +774,99 @@ impl InferenceGenState {
             on_token(token)
         };
 
+        if let Some(ref mut assistant) = self.mtp_assistant {
+            let mtp_config = self.mtp_config.clone().unwrap_or_default();
+            let output = match self.model {
+                LoadedModel::Standard(DynamicModel::Gemma4(ref mut target)) => {
+                    generate_gemma4_mtp_streaming(
+                        target,
+                        assistant,
+                        &self.input_ids,
+                        self.gen_config.clone(),
+                        &mut self.cache,
+                        mtp_config,
+                        on_token_guarded,
+                    )
+                }
+                LoadedModel::Standard(ref model) => Err(Exception::custom(format!(
+                    "Gemma 4 MTP requires a Gemma 4 target model; got {:?}",
+                    model.architecture()
+                ))),
+                #[cfg(feature = "lora")]
+                LoadedModel::Lora(_) => Err(Exception::custom(
+                    "Gemma 4 MTP is not supported with LoRA-merged inference",
+                )),
+                LoadedModel::NativeOnly => Err(Exception::custom(
+                    "Gemma 4 MTP requires the standard shared model path",
+                )),
+            }?;
+            self.last_decode_metrics = output.decode_metrics;
+            return Ok(output);
+        }
+
+        if let Some(ref mut mtp) = self.qwen_mtp {
+            let qwen_mtp_config = self.qwen_mtp_config.clone().unwrap_or_default();
+            let mtp_cache = self.qwen_mtp_cache.as_mut().ok_or_else(|| {
+                Exception::custom("Qwen MTP internal error: missing MTP KV cache")
+            })?;
+            let target_mamba_cache = self
+                .mamba_cache
+                .as_mut()
+                .ok_or_else(|| Exception::custom("Qwen MTP requires a target Mamba/GDN cache"))?;
+            let output = match self.model {
+                LoadedModel::Standard(DynamicModel::Qwen3Next(ref mut target)) => {
+                    generate_qwen3_next_mtp_streaming(
+                        target,
+                        mtp,
+                        &self.input_ids,
+                        self.gen_config.clone(),
+                        &mut self.cache,
+                        target_mamba_cache,
+                        mtp_cache,
+                        qwen_mtp_config,
+                        on_token_guarded,
+                    )
+                }
+                LoadedModel::Standard(ref model) => Err(Exception::custom(format!(
+                    "Qwen MTP requires a Qwen3Next/Qwen3.6 target model; got {:?}",
+                    model.architecture()
+                ))),
+                #[cfg(feature = "lora")]
+                LoadedModel::Lora(pmetal_lora::DynamicLoraModel::Qwen3Next(ref mut target)) => {
+                    generate_qwen3_next_mtp_streaming_rebuild(
+                        target,
+                        mtp,
+                        &self.input_ids,
+                        self.gen_config.clone(),
+                        &mut self.cache,
+                        target_mamba_cache,
+                        mtp_cache,
+                        qwen_mtp_config,
+                        on_token_guarded,
+                    )
+                }
+                #[cfg(feature = "lora")]
+                LoadedModel::Lora(ref model) => Err(Exception::custom(format!(
+                    "Qwen MTP requires a Qwen3Next/Qwen3.6 target model; got {:?}",
+                    model.architecture()
+                ))),
+                LoadedModel::NativeOnly => {
+                    crate::native_inference::run_qwen3_native_mtp_inference_ext(
+                        &self.model_path,
+                        mtp,
+                        mtp_cache,
+                        &self.input_ids,
+                        self.gen_config.clone(),
+                        qwen_mtp_config,
+                        on_token_guarded,
+                    )
+                    .map_err(Exception::custom)
+                }
+            }?;
+            self.last_decode_metrics = output.decode_metrics;
+            return Ok(output);
+        }
+
         if matches!(self.model, LoadedModel::NativeOnly) {
             let stop_tokens = self.gen_config.stop_tokens.clone();
             // Wire the full filter pipeline through to the bridge.
@@ -633,6 +902,7 @@ impl InferenceGenState {
                 stopped_by_token: output.stopped_by_token,
                 stopped_by_length: output.stopped_by_length,
                 decode_metrics: output.decode_metrics,
+                speculative_metrics: None,
             });
         }
 
@@ -865,7 +1135,7 @@ fn cache_mode_request_from_config(config: &InferenceRunnerConfig) -> CacheModeRe
         kv_group_size: config.kv_group_size,
         kv_turboquant: config.kv_turboquant,
         kv_turboquant_preset: config.kv_turboquant_preset,
-        no_kv_quant: config.no_kv_quant,
+        no_kv_quant: config.no_kv_quant || config.mtp_assistant_path.is_some() || config.qwen_mtp,
         fp8: config.fp8,
     }
 }
@@ -1585,6 +1855,30 @@ fn build_native_placeholder_cache(base_cache_config: &KVCacheConfig) -> KVCache 
     // path does not instantiate the shared pmetal-mlx TurboQuant stack.
     KVCache::new(base_cache_config.clone().with_mode(CacheMode::Standard))
 }
+
+fn load_qwen3_next_config_for_mtp(model_path: &Path) -> Result<Qwen3NextConfig, Exception> {
+    let config_path = model_path.join("config.json");
+    let text = std::fs::read_to_string(&config_path).map_err(|e| {
+        Exception::custom(format!(
+            "read Qwen target config for native MTP {}: {e}",
+            config_path.display()
+        ))
+    })?;
+    let value: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
+        Exception::custom(format!(
+            "parse Qwen target config for native MTP {}: {e}",
+            config_path.display()
+        ))
+    })?;
+    let config_value = value.get("text_config").cloned().unwrap_or(value);
+    serde_json::from_value(config_value).map_err(|e| {
+        Exception::custom(format!(
+            "decode Qwen3Next config for native MTP {}: {e}",
+            config_path.display()
+        ))
+    })
+}
+
 /// Check if a model directory looks instruction-tuned and should default to chat.
 ///
 /// Primary signal is `tokenizer_config.json` containing a `chat_template`,

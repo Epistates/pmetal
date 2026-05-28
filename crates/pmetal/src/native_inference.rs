@@ -5,9 +5,19 @@
 //! intentionally self-contained; the only external dependencies are
 //! `pmetal_bridge` and `serde_json`.
 
-use std::path::Path;
+use std::{collections::HashMap, path::Path};
 
+use pmetal_bridge::compat::{Array, ops::select_axis};
 use pmetal_bridge::turboquant::TurboQuantConfig;
+use pmetal_mlx::kv_cache::KVCache;
+use pmetal_models::{
+    Qwen3NextMtpConfig,
+    architectures::Qwen3NextMtpForCausalLM,
+    generation::{
+        GenerationConfig, GenerationOutput, SpeculativeDecodeMetrics, sample_from_log_probs,
+        sampling_log_probs_with_counts, token_probability_from_log_probs,
+    },
+};
 
 fn ensure_native_bridge_metal_available() -> Result<(), String> {
     if pmetal_metal::context::MetalContext::device_available() {
@@ -94,9 +104,8 @@ pub fn detect_arch(model_path: &Path) -> Option<NativeArch> {
 
     match mt {
         "qwen3" | "qwen3dense" => Some(NativeArch::Qwen3),
-        "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" => {
-            Some(NativeArch::Qwen3_5)
-        }
+        "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6"
+        | "qwen3_6_text" | "qwen3_6_moe" | "qwen3_6_moe_text" => Some(NativeArch::Qwen3_5),
         "llama4" | "llama4_text" => Some(NativeArch::Llama4),
         "deepseek_v3" => Some(NativeArch::DeepSeek),
         "gpt_oss" => Some(NativeArch::GptOss),
@@ -207,6 +216,15 @@ mod tests {
     fn detects_qwen35_moe_from_nested_text_model_type() {
         let dir = write_temp_config(
             r#"{"model_type":"qwen3_5_moe","text_config":{"model_type":"qwen3_5_moe_text"}}"#,
+        );
+        assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3_5));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn detects_qwen36_moe_from_nested_text_model_type() {
+        let dir = write_temp_config(
+            r#"{"model_type":"qwen3_6_moe","text_config":{"model_type":"qwen3_6_moe_text"}}"#,
         );
         assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3_5));
         let _ = fs::remove_dir_all(dir);
@@ -456,6 +474,502 @@ pub fn run_native_inference_ext(
         ),
         NativeArch::Gemma4 => run_gemma4(model_path, input_ids, max_tokens, params, &mut on_token),
     }
+}
+
+/// Run Qwen3Next/Qwen3.6 MTP with the bridge-native Qwen target as verifier.
+///
+/// This is the native/compiled architecture proof: the large target/verifier
+/// uses `pmetal_bridge::qwen3_native` and its compiled decode kernels, while
+/// the small trained MTP predictor remains the existing Rust/MLX module. For
+/// correctness with Qwen's GDN recurrent state, each verify round snapshots the
+/// native cache and replays only committed tokens after partial acceptance.
+#[allow(clippy::too_many_arguments)]
+pub fn run_qwen3_native_mtp_inference_ext(
+    model_path: &Path,
+    mtp: &mut Qwen3NextMtpForCausalLM,
+    mtp_cache: &mut KVCache,
+    input_ids: &[u32],
+    gen_config: GenerationConfig,
+    mtp_config: Qwen3NextMtpConfig,
+    mut on_token: impl FnMut(u32) -> bool,
+) -> Result<GenerationOutput, String> {
+    use pmetal_bridge::qwen3_native;
+
+    if input_ids.is_empty() {
+        return Err("Qwen native MTP requires a non-empty prompt".to_string());
+    }
+    if gen_config.max_new_tokens == 0 {
+        return Ok(GenerationOutput {
+            token_ids: input_ids.to_vec(),
+            num_generated: 0,
+            stopped_by_token: false,
+            stopped_by_length: true,
+            decode_metrics: None,
+            speculative_metrics: None,
+        });
+    }
+
+    ensure_native_bridge_metal_available()?;
+
+    if let Some(seed) = gen_config.seed {
+        pmetal_bridge::inline_array::random_seed(seed);
+        seed_acceptance_rng(seed);
+    }
+
+    let config = qwen3_native::load_config(model_path)?;
+    tracing::debug!(
+        "Qwen native MTP verifier: {} layers, hidden={}",
+        config.num_hidden_layers,
+        config.hidden_size
+    );
+
+    let t0 = std::time::Instant::now();
+    let weights = qwen3_native::load_model(model_path, &config)?;
+    tracing::info!(
+        elapsed_s = format!("{:.1}", t0.elapsed().as_secs_f64()),
+        active_mb = format!(
+            "{:.0}",
+            pmetal_bridge::inline_array::get_active_memory() as f64 / 1e6
+        ),
+        "Native Qwen verifier loaded for MTP",
+    );
+
+    let mut target_cache = qwen3_native::NativeCache::new_empty(&weights);
+    mtp_cache.reset();
+
+    let prompt = token_array(input_ids);
+    let (target_hidden, target_logits) =
+        qwen3_native::forward_step_hidden(&weights, &prompt, &mut target_cache);
+    let mut prev_target_logits = select_last_logits(&target_logits);
+
+    let (mtp_hidden, mtp_logits) = mtp
+        .forward_logits(&prompt, &target_hidden, None, Some(mtp_cache), 0)
+        .map_err(|e| format!("native Qwen MTP prompt forward: {e}"))?;
+    let mut last_mtp_hidden = select_last_sequence(&mtp_hidden);
+    let mut prev_mtp_logits = select_last_logits(&mtp_logits);
+
+    let mut token_ids = input_ids.to_vec();
+    let mut generated_counts = HashMap::new();
+    let mut num_generated = 0usize;
+    let mut stopped_by_token = false;
+    let draft_budget = mtp_config.num_draft_tokens.max(1);
+    let mut speculative_metrics = SpeculativeDecodeMetrics::default();
+
+    while num_generated < gen_config.max_new_tokens {
+        let remaining = gen_config.max_new_tokens - num_generated;
+        let max_draft = draft_budget.min(remaining);
+        let base_mtp_hidden = last_mtp_hidden.clone();
+        let base_mtp_logits = prev_mtp_logits.clone();
+
+        let mut draft_tokens = Vec::with_capacity(max_draft);
+        let mut draft_log_probs = Vec::with_capacity(max_draft);
+        let mut draft_history = token_ids.clone();
+        let mut draft_counts = generated_counts.clone();
+        let mut draft_hidden = last_mtp_hidden.clone();
+        let mut draft_logits = prev_mtp_logits.clone();
+
+        for draft_idx in 0..max_draft {
+            let draft_token = if gen_config.do_sample {
+                let log_probs = sampling_log_probs_with_counts(
+                    &draft_logits,
+                    &draft_history,
+                    &draft_counts,
+                    &gen_config,
+                )
+                .map_err(|e| format!("native Qwen MTP draft sampling: {e}"))?;
+                let token = sample_from_log_probs(&log_probs)
+                    .map_err(|e| format!("native Qwen MTP draft sample: {e}"))?;
+                draft_log_probs.push(log_probs);
+                token
+            } else {
+                greedy_token(&draft_logits)
+            };
+            draft_tokens.push(draft_token);
+            draft_history.push(draft_token);
+            increment_count(&mut draft_counts, draft_token);
+
+            let (next_hidden, next_logits) =
+                mtp_step(mtp, draft_token, &draft_hidden, mtp_cache, draft_idx + 1)?;
+            draft_hidden = next_hidden;
+            draft_logits = next_logits;
+            if gen_config.stop_tokens.contains(&draft_token) || draft_idx + 1 >= max_draft {
+                break;
+            }
+        }
+
+        let target_snapshot = target_cache.fork();
+        let verify_input = token_array(&draft_tokens);
+        let (verify_hidden, verify_logits) =
+            qwen3_native::forward_step_hidden(&weights, &verify_input, &mut target_cache);
+
+        let (accepted, correction) = if gen_config.do_sample {
+            accept_sampled_draft(
+                &draft_tokens,
+                &draft_log_probs,
+                &prev_target_logits,
+                &verify_logits,
+                &token_ids,
+                &generated_counts,
+                &gen_config,
+            )?
+        } else {
+            accept_greedy_draft(&draft_tokens, &prev_target_logits, &verify_logits)
+        };
+        speculative_metrics.record_verify_step(draft_tokens.len(), accepted);
+
+        let all_accepted = accepted == draft_tokens.len();
+        let mut planned = Vec::with_capacity(draft_tokens.len() + 1);
+        planned.extend_from_slice(&draft_tokens[..accepted]);
+        let append_after_emit = if all_accepted {
+            if num_generated + planned.len() < gen_config.max_new_tokens {
+                let row = select_axis(&verify_logits, (draft_tokens.len() - 1) as i32, 1);
+                let bonus = if gen_config.do_sample {
+                    let mut verify_history = token_ids.clone();
+                    let mut verify_counts = generated_counts.clone();
+                    for &token in &draft_tokens {
+                        verify_history.push(token);
+                        increment_count(&mut verify_counts, token);
+                    }
+                    let log_probs = sampling_log_probs_with_counts(
+                        &row,
+                        &verify_history,
+                        &verify_counts,
+                        &gen_config,
+                    )
+                    .map_err(|e| format!("native Qwen MTP bonus sampling: {e}"))?;
+                    sample_from_log_probs(&log_probs)
+                        .map_err(|e| format!("native Qwen MTP bonus sample: {e}"))?
+                } else {
+                    greedy_token(&row)
+                };
+                planned.push(bonus);
+                Some(bonus)
+            } else {
+                None
+            }
+        } else {
+            let correction = correction.ok_or_else(|| {
+                "native Qwen MTP rejected a draft without correction token".to_string()
+            })?;
+            planned.push(correction);
+            Some(correction)
+        };
+
+        let stop_pos = planned
+            .iter()
+            .position(|token| gen_config.stop_tokens.contains(token));
+        let planned_len = stop_pos.map(|idx| idx + 1).unwrap_or(planned.len());
+
+        let mut continue_stream = true;
+        let mut emitted_planned_count = 0usize;
+        for &token in &planned[..planned_len] {
+            continue_stream = emit_token(
+                token,
+                &mut token_ids,
+                &mut num_generated,
+                &mut stopped_by_token,
+                &gen_config,
+                &mut on_token,
+            );
+            emitted_planned_count += 1;
+            increment_count(&mut generated_counts, token);
+            if !continue_stream || stopped_by_token || num_generated >= gen_config.max_new_tokens {
+                break;
+            }
+        }
+
+        let emitted_draft_count = emitted_planned_count.min(accepted);
+        speculative_metrics.emitted_draft_tokens += emitted_draft_count;
+        if emitted_planned_count > emitted_draft_count {
+            if all_accepted {
+                speculative_metrics.bonus_tokens += 1;
+            } else {
+                speculative_metrics.correction_tokens += 1;
+            }
+        }
+
+        if emitted_draft_count < draft_tokens.len() {
+            target_cache = target_snapshot;
+            for &token in &draft_tokens[..emitted_draft_count] {
+                let input = token_array(&[token]);
+                let _ = qwen3_native::forward_step_hidden(&weights, &input, &mut target_cache);
+            }
+        }
+
+        mtp_cache.rollback(draft_tokens.len());
+        let (mut next_mtp_hidden, mut next_mtp_logits) =
+            (base_mtp_hidden.clone(), base_mtp_logits.clone());
+        if emitted_draft_count > 0 {
+            (next_mtp_hidden, next_mtp_logits) = replay_mtp_with_target_hidden(
+                mtp,
+                mtp_cache,
+                &draft_tokens[..emitted_draft_count],
+                &verify_hidden,
+            )?;
+        }
+        last_mtp_hidden = next_mtp_hidden;
+        prev_mtp_logits = next_mtp_logits;
+
+        if !continue_stream
+            || stopped_by_token
+            || num_generated >= gen_config.max_new_tokens
+            || stop_pos.is_some()
+        {
+            break;
+        }
+
+        if let Some(token) = append_after_emit
+            && emitted_draft_count < planned_len
+        {
+            let (target_hidden, target_logits) =
+                target_step_native(&weights, &mut target_cache, token);
+            prev_target_logits = target_logits;
+            let (mtp_hidden, mtp_logits) = mtp_step(
+                mtp,
+                token,
+                &target_hidden,
+                mtp_cache,
+                emitted_draft_count + 1,
+            )?;
+            last_mtp_hidden = mtp_hidden;
+            prev_mtp_logits = mtp_logits;
+        } else if emitted_draft_count > 0 {
+            let last_idx = emitted_draft_count - 1;
+            prev_target_logits = select_axis(&verify_logits, last_idx as i32, 1);
+        }
+    }
+
+    Ok(GenerationOutput {
+        token_ids,
+        num_generated,
+        stopped_by_token,
+        stopped_by_length: num_generated >= gen_config.max_new_tokens && !stopped_by_token,
+        decode_metrics: None,
+        speculative_metrics: Some(speculative_metrics),
+    })
+}
+
+fn target_step_native(
+    weights: &pmetal_bridge::qwen3_native::NativeWeights,
+    cache: &mut pmetal_bridge::qwen3_native::NativeCache,
+    token: u32,
+) -> (Array, Array) {
+    let input = token_array(&[token]);
+    let (hidden, logits) = pmetal_bridge::qwen3_native::forward_step_hidden(weights, &input, cache);
+    (select_last_sequence(&hidden), select_last_logits(&logits))
+}
+
+fn mtp_step(
+    mtp: &mut Qwen3NextMtpForCausalLM,
+    token: u32,
+    hidden: &Array,
+    mtp_cache: &mut KVCache,
+    step_idx: usize,
+) -> Result<(Array, Array), String> {
+    let input = token_array(&[token]);
+    let (hidden, logits) = mtp
+        .forward_logits(&input, hidden, None, Some(mtp_cache), step_idx)
+        .map_err(|e| format!("native Qwen MTP step: {e}"))?;
+    Ok((select_last_sequence(&hidden), select_last_logits(&logits)))
+}
+
+fn replay_mtp_with_target_hidden(
+    mtp: &mut Qwen3NextMtpForCausalLM,
+    mtp_cache: &mut KVCache,
+    tokens: &[u32],
+    target_hidden: &Array,
+) -> Result<(Array, Array), String> {
+    let mut last_hidden = None;
+    let mut last_logits = None;
+    for (idx, &token) in tokens.iter().enumerate() {
+        let hidden = select_axis(target_hidden, idx as i32, 1).reshape(&[1, 1, -1]);
+        let (h, logits) = mtp_step(mtp, token, &hidden, mtp_cache, idx)?;
+        last_hidden = Some(h);
+        last_logits = Some(logits);
+    }
+    Ok((
+        last_hidden.ok_or_else(|| "native Qwen MTP replay received no tokens".to_string())?,
+        last_logits.ok_or_else(|| "native Qwen MTP replay received no tokens".to_string())?,
+    ))
+}
+
+fn accept_greedy_draft(
+    draft_tokens: &[u32],
+    prev_target_logits: &Array,
+    verify_logits: &Array,
+) -> (usize, Option<u32>) {
+    let mut matched = 0usize;
+    while matched < draft_tokens.len() {
+        let row = if matched == 0 {
+            prev_target_logits.clone()
+        } else {
+            select_axis(verify_logits, (matched - 1) as i32, 1)
+        };
+        if greedy_token(&row) != draft_tokens[matched] {
+            break;
+        }
+        matched += 1;
+    }
+    if matched == draft_tokens.len() {
+        (matched, None)
+    } else {
+        let row = if matched == 0 {
+            prev_target_logits.clone()
+        } else {
+            select_axis(verify_logits, (matched - 1) as i32, 1)
+        };
+        (matched, Some(greedy_token(&row)))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn accept_sampled_draft(
+    draft_tokens: &[u32],
+    draft_log_probs: &[Array],
+    prev_target_logits: &Array,
+    verify_logits: &Array,
+    token_ids: &[u32],
+    generated_counts: &HashMap<u32, usize>,
+    gen_config: &GenerationConfig,
+) -> Result<(usize, Option<u32>), String> {
+    let mut accepted = 0usize;
+    let mut verify_history = token_ids.to_vec();
+    let mut verify_counts = generated_counts.clone();
+
+    while accepted < draft_tokens.len() {
+        let row = if accepted == 0 {
+            prev_target_logits.clone()
+        } else {
+            select_axis(verify_logits, (accepted - 1) as i32, 1)
+        };
+        let target_log_probs =
+            sampling_log_probs_with_counts(&row, &verify_history, &verify_counts, gen_config)
+                .map_err(|e| format!("native Qwen MTP target sampling log-probs: {e}"))?;
+        let draft_log_probs_row = &draft_log_probs[accepted];
+        let token = draft_tokens[accepted];
+        let p_target = token_probability_from_log_probs(&target_log_probs, token)
+            .map_err(|e| format!("native Qwen MTP target probability: {e}"))?;
+        let p_draft = token_probability_from_log_probs(draft_log_probs_row, token)
+            .map_err(|e| format!("native Qwen MTP draft probability: {e}"))?;
+        let accept_prob = if p_draft > 0.0 {
+            (p_target / p_draft).min(1.0)
+        } else {
+            0.0
+        };
+
+        if rand_uniform() < accept_prob {
+            accepted += 1;
+            verify_history.push(token);
+            increment_count(&mut verify_counts, token);
+        } else {
+            let correction_log_probs =
+                correction_log_probs(&target_log_probs, draft_log_probs_row)?;
+            return Ok((
+                accepted,
+                Some(
+                    sample_from_log_probs(&correction_log_probs)
+                        .map_err(|e| format!("native Qwen MTP correction sample: {e}"))?,
+                ),
+            ));
+        }
+    }
+
+    Ok((accepted, None))
+}
+
+fn correction_log_probs(
+    target_log_probs: &Array,
+    draft_log_probs: &Array,
+) -> Result<Array, String> {
+    let target_probs = target_log_probs.exp();
+    let draft_probs = draft_log_probs.exp();
+    let diff = target_probs.subtract(&draft_probs);
+    let clipped = diff.maximum(&Array::from_f32(0.0));
+    let total = clipped.sum_axis(-1, true);
+    let total_value = total.item::<f32>();
+    if !total_value.is_finite() || total_value <= 1e-20 {
+        return Ok(target_log_probs.clone());
+    }
+    Ok(clipped.divide(&total).log())
+}
+
+fn emit_token<F>(
+    token: u32,
+    token_ids: &mut Vec<u32>,
+    num_generated: &mut usize,
+    stopped_by_token: &mut bool,
+    gen_config: &GenerationConfig,
+    on_token: &mut F,
+) -> bool
+where
+    F: FnMut(u32) -> bool,
+{
+    token_ids.push(token);
+    *num_generated += 1;
+    if gen_config.stop_tokens.contains(&token) {
+        *stopped_by_token = true;
+    }
+    on_token(token)
+}
+
+fn token_array(tokens: &[u32]) -> Array {
+    let data: Vec<i32> = tokens.iter().map(|token| *token as i32).collect();
+    Array::from_i32_slice(&data).reshape(&[1, data.len() as i32])
+}
+
+fn select_last_sequence(values: &Array) -> Array {
+    let seq_len = values.dim(1);
+    select_axis(values, seq_len - 1, 1).reshape(&[1, 1, -1])
+}
+
+fn select_last_logits(logits: &Array) -> Array {
+    let seq_len = logits.dim(1);
+    select_axis(logits, seq_len - 1, 1)
+}
+
+fn greedy_token(logits: &Array) -> u32 {
+    logits.argmax(-1).item::<u32>()
+}
+
+fn increment_count(token_counts: &mut HashMap<u32, usize>, token: u32) {
+    *token_counts.entry(token).or_insert(0) += 1;
+}
+
+thread_local! {
+    static ACCEPTANCE_RNG_STATE: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+fn seed_acceptance_rng(seed: u64) {
+    ACCEPTANCE_RNG_STATE.with(|state| {
+        state.set(if seed == 0 {
+            0xdead_beef_cafe_1234
+        } else {
+            seed
+        });
+    });
+}
+
+fn rand_uniform() -> f32 {
+    ACCEPTANCE_RNG_STATE.with(|state| {
+        let mut x = state.get();
+        if x == 0 {
+            x = seed_from_time();
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        state.set(x);
+        (x >> 40) as f32 / (1u64 << 24) as f32
+    })
+}
+
+fn seed_from_time() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos() as u64)
+        .unwrap_or(0x1234_5678_9abc_def0);
+    nanos ^ 0xa5a5_5a5a_dead_beef
 }
 
 // ============================================================================

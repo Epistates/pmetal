@@ -1023,6 +1023,13 @@ impl InferenceEngine {
             .map_err(|e| ServeError::Tokenizer(e.to_string()))
     }
 
+    /// Decode token IDs back to text while preserving special tokens.
+    pub fn decode_with_special_tokens(&self, tokens: &[u32]) -> ServeResult<String> {
+        self.tokenizer
+            .decode_with_special_tokens(tokens)
+            .map_err(|e| ServeError::Tokenizer(e.to_string()))
+    }
+
     /// Validate sampling parameters, returning an error for any out-of-range value.
     ///
     /// Deliberately does not error on `max_tokens > max_seq_len` — the engine

@@ -57,6 +57,7 @@ pub mod expert_io;
 pub mod expert_layout;
 pub mod expert_prefetch;
 pub mod fp8_utils;
+pub mod gemma4_mtp;
 pub mod generation;
 pub mod loader;
 pub mod moe;
@@ -64,6 +65,7 @@ pub mod moe_routing;
 pub mod ollama;
 pub mod pipelines;
 pub mod pooling;
+pub mod qwen3_next_mtp;
 pub mod registry;
 pub mod rl_generation;
 pub mod sampling;
@@ -75,8 +77,10 @@ pub mod weight_format;
 
 // Re-exports for convenience
 pub use dispatcher::{DynamicModel, ModelArchitecture};
+pub use gemma4_mtp::*;
 pub use generation::*;
 pub use loader::*;
+pub use qwen3_next_mtp::*;
 pub use registry::*;
 pub use rl_generation::{
     BatchedGenerationOutput, BatchedRlConfig, BatchedRlGenerator, generate_rl_completions,

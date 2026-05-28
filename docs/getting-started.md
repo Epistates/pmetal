@@ -85,7 +85,7 @@ result = pmetal.finetune(
 
 ## Explore Further
 
-- **[CLI Reference](/cli/train/)** — All 21 commands
+- **[CLI Reference](/cli/train/)** — Command reference
 - **[Rust SDK](/sdk/easy-api/)** — Builder API reference
 - **[Python SDK](/python/quick-start/)** — PyO3 bindings
 - **[Training Methods](/training/overview/)** — SFT, DPO, GRPO, distillation, and more

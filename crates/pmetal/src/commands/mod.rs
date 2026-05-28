@@ -26,6 +26,10 @@ pub(crate) mod search;
 #[cfg(feature = "serve")]
 pub(crate) mod serve;
 pub(crate) mod tokenize;
+#[cfg(feature = "trainer")]
+pub(crate) mod train_draft;
+#[cfg(feature = "trainer")]
+pub(crate) mod train_mtp;
 
 use pmetal_data::DatasetColumnConfig;
 

@@ -15,7 +15,7 @@ All causal language models below work with the CLI (`pmetal infer`), TUI, GUI, a
 | Qwen 2 | `Qwen2` | 2, 2.5 | `qwen2`, `qwen2_5` |
 | Qwen 3 | `Qwen3` | 3 | `qwen3` |
 | Qwen 3 MoE | `Qwen3MoE` | 3-MoE | `qwen3_moe` |
-| Qwen 3.5 | `Qwen3Next` | 3.5 (Next) | `qwen3_next`, `qwen3_5` |
+| Qwen 3.5 / 3.6 | `Qwen3Next` | 3.5 (Next), 3.6 | `qwen3_next`, `qwen3_5`, `qwen3_6` |
 | DeepSeek | `DeepSeek` | V3, V3.2, V3.2-Speciale | `deepseek`, `deepseek_v3` |
 | Mistral | `Mistral` | 7B, Mixtral 8×7B | `mistral`, `mixtral` |
 | Gemma | `Gemma` | 2, 3 | `gemma`, `gemma2`, `gemma3` |
@@ -26,6 +26,22 @@ All causal language models below work with the CLI (`pmetal infer`), TUI, GUI, a
 | NemotronH | `NemotronH` | Hybrid (Mamba+Attention) | `nemotron_h` |
 | GPT-OSS | `GptOss` | 20B, 120B | `gpt_oss`, `gpt-oss` |
 | Gemma 4 | `Gemma4` | 4 | `gemma4`, `gemma4_text` |
+
+Gemma 4 MTP assistant checkpoints (`model_type = "gemma4_assistant"`) are supported as
+draft assistants via `pmetal infer --draft-model <assistant>`. Greedy and sampling
+generation both use exact speculative verification.
+
+Qwen3Next/Qwen3.6 checkpoints with bundled `mtp.*` weights can enable exact
+speculative decoding with `pmetal infer --mtp --mtp-draft-tokens 3`. Bundled MTP
+supports multiple predictor layers, FP8 target/MTP weights, packed expert offload, and
+LoRA-merged Qwen3Next targets. LoRA and packed expert offload are separate modes; fuse the
+adapter first if you need both. MTP inference reports draft acceptance, average accepted
+draft tokens per verify step, and target bonus/correction token counts.
+
+Custom MTP and draft checkpoint creation is available from the CLI. Use `pmetal train-mtp`
+to export Gemma 4 assistant checkpoints or Qwen `mtp.*` predictor checkpoints, then load
+Qwen predictors with `pmetal infer --mtp --mtp-model ./qwen-mtp`. Use `pmetal train-draft`
+to export DFlash draft checkpoints for the dedicated `pmetal dflash` runtime.
 
 ## Embedding / Encoder Models
 
@@ -42,9 +58,9 @@ All causal language models below work with the CLI (`pmetal infer`), TUI, GUI, a
 | Qwen 2 | Yes | Yes | Uses Qwen3 LoRA implementation internally. |
 | Qwen 3 | Yes | Yes | Gradient checkpointing supported. |
 | Qwen 3 MoE | Yes | Yes | Sparse MoE support. |
-| Qwen 3.5 (Next) | Yes | Yes | Hybrid architecture with nested `text_config`. |
+| Qwen 3.5 / 3.6 (Next) | Yes | Yes | Hybrid architecture with nested `text_config` and bundled MTP inference. |
 | Gemma | Yes | Yes | GeGLU activation, special RMSNorm. |
-| Gemma 4 | Yes | Yes | Multimodal-era Gemma text path. |
+| Gemma 4 | Yes | Yes | Multimodal-era Gemma text path with MTP assistant inference support. |
 | Mistral | Yes | Yes | Sliding window attention support. |
 | Phi 3/4 | Yes | Yes | Partial RoPE, fused gate_up projection. |
 | DeepSeek | Yes | Yes | V3-family support. |

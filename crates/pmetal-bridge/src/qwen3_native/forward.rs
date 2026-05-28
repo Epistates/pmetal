@@ -29,6 +29,20 @@ pub fn forward_step(
     token_ids: &InlineArray, // [B, T]
     cache: &mut NativeCache,
 ) -> InlineArray {
+    let (_, logits) = forward_step_hidden(weights, token_ids, cache);
+    logits
+}
+
+/// Forward pass returning both the final normalized hidden states and logits.
+///
+/// Qwen MTP predictors consume the verifier's final hidden states while the
+/// verifier still needs logits for acceptance. Returning both avoids rerunning
+/// the native Qwen trunk.
+pub fn forward_step_hidden(
+    weights: &NativeWeights,
+    token_ids: &InlineArray, // [B, T]
+    cache: &mut NativeCache,
+) -> (InlineArray, InlineArray) {
     let b = token_ids.dim(0);
     let s = token_ids.dim(1);
     let dtype = weights.model_dtype;
@@ -109,7 +123,7 @@ pub fn forward_step(
 
     // Final norm + LM head
     let hidden = hidden.rms_norm(Some(&weights.final_norm_w), weights.final_norm_eps);
-    if weights.tie_word_embeddings {
+    let logits = if weights.tie_word_embeddings {
         // For quantized models: use quantized_matmul with the packed embedding weight
         if let (Some(scales), Some(biases)) = (&weights.embed_scales, &weights.embed_biases) {
             let qcfg = weights.quantization_config.as_ref();
@@ -121,7 +135,8 @@ pub fn forward_step(
         }
     } else {
         weights.lm_head_w.as_ref().unwrap().matmul_from(&hidden)
-    }
+    };
+    (hidden, logits)
 }
 
 /// Variant of [`forward_step`] that tees post-layer hidden states at the

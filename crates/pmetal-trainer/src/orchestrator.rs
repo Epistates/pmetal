@@ -29,7 +29,7 @@ use crate::{
 #[cfg(feature = "distributed")]
 type DistributedSyncOption = Option<crate::distributed_bridge::DistributedGradientSync>;
 #[cfg(not(feature = "distributed"))]
-type DistributedSyncOption = ();
+type DistributedSyncOption = Option<()>;
 
 #[cfg(feature = "distributed")]
 fn take_distributed_sync(sync: &mut DistributedSyncOption) -> DistributedSyncOption {
@@ -37,7 +37,9 @@ fn take_distributed_sync(sync: &mut DistributedSyncOption) -> DistributedSyncOpt
 }
 
 #[cfg(not(feature = "distributed"))]
-fn take_distributed_sync(_: &mut DistributedSyncOption) -> DistributedSyncOption {}
+fn take_distributed_sync(_: &mut DistributedSyncOption) -> DistributedSyncOption {
+    None
+}
 
 // ---------------------------------------------------------------------------
 // Configuration types
@@ -791,7 +793,7 @@ pub async fn run_training(
     };
 
     #[cfg(not(feature = "distributed"))]
-    let mut distributed_sync: DistributedSyncOption = ();
+    let mut distributed_sync: DistributedSyncOption = None;
 
     // -----------------------------------------------------------------------
     // Phase 9: Load model + run training

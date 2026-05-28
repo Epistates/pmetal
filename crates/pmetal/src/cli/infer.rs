@@ -73,9 +73,21 @@ pub struct InferArgs {
     #[arg(long = "backend", default_value = "auto")]
     pub backend: pmetal_data::inference_config::InferenceBackend,
 
-    /// Draft model for speculative decoding (HF id or local path).
+    /// Gemma 4 MTP assistant model for exact speculative decoding (HF id or local path).
     #[arg(long = "draft-model")]
     pub draft_model: Option<String>,
+
+    /// Enable bundled Qwen3Next/Qwen3.6 MTP speculative decoding.
+    #[arg(long = "mtp")]
+    pub mtp: bool,
+
+    /// Optional Qwen MTP checkpoint directory; defaults to bundled mtp.* weights in --model.
+    #[arg(long = "mtp-model")]
+    pub mtp_model: Option<String>,
+
+    /// Number of Qwen MTP draft tokens to verify per speculative step.
+    #[arg(long = "mtp-draft-tokens", default_value = "3")]
+    pub mtp_draft_tokens: usize,
 
     /// Use fused Metal sampling kernel for better battery performance.
     /// Legacy alias — prefer `--backend metal-sampler`.

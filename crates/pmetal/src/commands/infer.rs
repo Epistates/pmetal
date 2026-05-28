@@ -285,6 +285,9 @@ pub(crate) async fn run_inference(
     mode: pmetal_data::inference_config::SamplingMode,
     backend: pmetal_data::inference_config::InferenceBackend,
     draft_model: Option<&str>,
+    mtp: bool,
+    mtp_model: Option<&str>,
+    mtp_draft_tokens: usize,
     metal_sampler: bool,
     compiled: bool,
     _stream: bool,
@@ -366,10 +369,43 @@ pub(crate) async fn run_inference(
     };
 
     tracing::info!(model = %model_id, "Loading model for inference");
+    if mtp && draft_model.is_some() {
+        anyhow::bail!(
+            "Use either --mtp for bundled Qwen MTP or --draft-model for Gemma 4 MTP, not both"
+        );
+    }
+    if mtp_model.is_some() && !mtp {
+        anyhow::bail!("--mtp-model requires --mtp");
+    }
+    let mtp_owns_generation = mtp || draft_model.is_some();
+    let (metal_sampler, compiled, minimal, ane) = if mtp_owns_generation {
+        if metal_sampler || compiled || minimal || ane {
+            tracing::info!(
+                "MTP uses its own verifier/drafter generation backend; ignoring the requested non-MTP backend selector"
+            );
+        }
+        (false, false, false, false)
+    } else {
+        (metal_sampler, compiled, minimal, ane)
+    };
 
     // Download model if needed (HuggingFace repo ID contains '/')
     let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
     tracing::info!("Model ready at {:?}", model_path);
+    let mtp_assistant_path = if let Some(draft) = draft_model {
+        let path = pmetal_hub::resolve_model_path(draft, None, None).await?;
+        tracing::info!("Gemma 4 MTP assistant ready at {:?}", path);
+        Some(path)
+    } else {
+        None
+    };
+    let qwen_mtp_path = if let Some(mtp_model) = mtp_model {
+        let path = pmetal_hub::resolve_model_path(mtp_model, None, None).await?;
+        tracing::info!("Qwen MTP checkpoint ready at {:?}", path);
+        Some(path)
+    } else {
+        None
+    };
 
     // ── Prepare inference via shared runner ──────────────────────────────
     use pmetal::inference_runner::{InferenceRunner, InferenceRunnerConfig};
@@ -377,6 +413,10 @@ pub(crate) async fn run_inference(
     let runner_config = InferenceRunnerConfig {
         model_path: model_path.clone(),
         lora_path: lora_path.map(|s| s.to_string()),
+        mtp_assistant_path: mtp_assistant_path.clone(),
+        qwen_mtp_path: qwen_mtp_path.clone(),
+        qwen_mtp: mtp,
+        qwen_mtp_draft_tokens: mtp_draft_tokens.max(1),
         experts_dir: experts_dir.map(|s| s.to_string()),
         fp8,
         prompt: prompt.to_string(),
@@ -469,6 +509,20 @@ pub(crate) async fn run_inference(
     println!("Model:       {}", model_id);
     if lora_path.is_some() {
         println!("LoRA:        {}", lora_path.unwrap());
+    }
+    if let Some(path) = mtp_assistant_path.as_ref() {
+        println!("MTP:         {}", path.display());
+    }
+    if mtp {
+        if let Some(path) = qwen_mtp_path.as_ref() {
+            println!(
+                "MTP:         {} ({})",
+                path.display(),
+                mtp_draft_tokens.max(1)
+            );
+        } else {
+            println!("MTP:         bundled Qwen ({})", mtp_draft_tokens.max(1));
+        }
     }
     println!("Temperature: {}", gen_config.temperature);
     println!("Top-k:       {}", gen_config.top_k);
@@ -709,6 +763,17 @@ pub(crate) async fn run_inference(
                 m.tok_per_sec, m.avg_step_ms, m.p50_step_ms, m.measured_steps, chip,
             );
         }
+    }
+    if let Some(m) = output.speculative_metrics.as_ref() {
+        println!(
+            "Speculative: {:.1}% accepted ({} / {} draft tokens, avg {:.2}/verify, {} bonus, {} correction)",
+            m.acceptance_rate() * 100.0,
+            m.accepted_draft_tokens,
+            m.drafted_tokens,
+            m.avg_accepted_per_verify(),
+            m.bonus_tokens,
+            m.correction_tokens,
+        );
     }
 
     // Print expert prefetch stats if offloading was active

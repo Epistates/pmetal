@@ -2342,6 +2342,10 @@ async fn run_inference_streaming(
     let runner_config = InferenceRunnerConfig {
         model_path,
         lora_path: spec.lora.clone(),
+        mtp_assistant_path: None,
+        qwen_mtp_path: None,
+        qwen_mtp: false,
+        qwen_mtp_draft_tokens: 3,
         experts_dir: spec.experts_dir.clone(),
         fp8: spec.fp8,
         prompt: spec.prompt.clone(),

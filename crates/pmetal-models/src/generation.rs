@@ -714,6 +714,69 @@ pub struct GenerationOutput {
     /// summary print ingests — keeping the shape identical keeps the stats
     /// display DRY across both paths.
     pub decode_metrics: Option<pmetal_bridge::decode::DecodeMetrics>,
+    /// Speculative decoding acceptance/accounting metrics.
+    pub speculative_metrics: Option<SpeculativeDecodeMetrics>,
+}
+
+/// Acceptance and accounting counters for speculative decoding.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SpeculativeDecodeMetrics {
+    /// Number of draft/assistant tokens proposed to the target verifier.
+    pub drafted_tokens: usize,
+    /// Number of drafted tokens accepted by the target verifier.
+    pub accepted_draft_tokens: usize,
+    /// Number of accepted draft tokens actually emitted to the caller.
+    pub emitted_draft_tokens: usize,
+    /// Target bonus tokens emitted after fully accepted draft blocks.
+    pub bonus_tokens: usize,
+    /// Target correction tokens emitted after partial or zero-token accept.
+    pub correction_tokens: usize,
+    /// Number of target verification passes.
+    pub verify_steps: usize,
+    /// Verification passes where every drafted token was accepted.
+    pub full_accept_steps: usize,
+    /// Verification passes where some but not all drafted tokens were accepted.
+    pub partial_accept_steps: usize,
+    /// Verification passes where no drafted token was accepted.
+    pub zero_accept_steps: usize,
+    /// Largest draft block attempted in one speculative step.
+    pub max_draft_tokens: usize,
+}
+
+impl SpeculativeDecodeMetrics {
+    pub fn acceptance_rate(&self) -> f32 {
+        if self.drafted_tokens == 0 {
+            0.0
+        } else {
+            self.accepted_draft_tokens as f32 / self.drafted_tokens as f32
+        }
+    }
+
+    pub fn avg_accepted_per_verify(&self) -> f32 {
+        if self.verify_steps == 0 {
+            0.0
+        } else {
+            self.accepted_draft_tokens as f32 / self.verify_steps as f32
+        }
+    }
+
+    pub fn record_verify_step(&mut self, drafted: usize, accepted: usize) {
+        if drafted == 0 {
+            return;
+        }
+        let accepted = accepted.min(drafted);
+        self.drafted_tokens += drafted;
+        self.accepted_draft_tokens += accepted;
+        self.verify_steps += 1;
+        self.max_draft_tokens = self.max_draft_tokens.max(drafted);
+        if accepted == drafted {
+            self.full_accept_steps += 1;
+        } else if accepted == 0 {
+            self.zero_accept_steps += 1;
+        } else {
+            self.partial_accept_steps += 1;
+        }
+    }
 }
 
 /// Sampler for token generation.
@@ -1221,6 +1284,82 @@ pub fn token_logprobs(
     Ok((chosen, top))
 }
 
+/// Build the exact sampling distribution used by [`Sampler`] for a given
+/// history/count state.
+///
+/// The returned array is normalized log-probabilities after repetition,
+/// frequency/presence penalties, top-k/top-p/min-p filtering, and temperature.
+/// This is useful for speculative sampling verification, where the verifier
+/// needs probabilities for both target and draft distributions rather than only
+/// the sampled token.
+pub fn sampling_log_probs_with_counts(
+    logits: &Array,
+    generated_tokens: &[u32],
+    token_counts: &HashMap<u32, usize>,
+    config: &GenerationConfig,
+) -> Result<Array, Exception> {
+    let mut logits = ensure_f32(logits)?;
+
+    if config.repetition_penalty != 1.0 && !generated_tokens.is_empty() {
+        logits = apply_repetition_penalty(&logits, generated_tokens, config.repetition_penalty)?;
+    }
+    if (config.frequency_penalty != 0.0 || config.presence_penalty != 0.0)
+        && !token_counts.is_empty()
+    {
+        logits = apply_frequency_presence_penalty(
+            &logits,
+            token_counts,
+            config.frequency_penalty,
+            config.presence_penalty,
+        )?;
+    }
+
+    let mut log_probs = logits_to_log_probs(&logits)?;
+    if config.top_k > 0 {
+        log_probs = top_k_filter(&log_probs, config.top_k)?;
+    }
+    if config.top_p > 0.0 && config.top_p < 1.0 {
+        log_probs = top_p_filter(&log_probs, config.top_p)?;
+    }
+    if config.min_p > 0.0 && config.min_p < 1.0 {
+        log_probs = min_p_filter(&log_probs, config.min_p)?;
+    }
+    if config.do_sample && config.temperature > 0.0 && config.temperature != 1.0 {
+        log_probs = log_probs.multiply(&Array::from_f32(1.0 / config.temperature));
+    }
+
+    logits_to_log_probs(&log_probs)
+}
+
+/// Sample from a normalized log-probability distribution.
+pub fn sample_from_log_probs(log_probs: &Array) -> Result<u32, Exception> {
+    Ok(categorical(log_probs, -1).item::<u32>())
+}
+
+/// Return `exp(log_probs[token])`, validating the token against the vocabulary.
+pub fn token_probability_from_log_probs(log_probs: &Array, token: u32) -> Result<f32, Exception> {
+    let vocab_size = log_probs.dim(-1);
+    if token as i32 >= vocab_size {
+        return Err(Exception::custom(format!(
+            "token_probability_from_log_probs: token {token} out of range for vocab {vocab_size}"
+        )));
+    }
+    let row = if log_probs.ndim() == 1 {
+        log_probs.reshape(&[1, vocab_size])
+    } else {
+        log_probs.reshape(&[-1, vocab_size])
+    };
+    if row.dim(0) != 1 {
+        return Err(Exception::custom(format!(
+            "token_probability_from_log_probs expects one distribution row, got {}",
+            row.dim(0)
+        )));
+    }
+    let token_index = Array::from_slice(&[token as i32], &[1, 1]);
+    let log_prob = take_along_axis(&row, &token_index, -1);
+    Ok(log_prob.item::<f32>().exp())
+}
+
 /// GPU-native repetition penalty matching mlx_lm.
 ///
 /// For positive logits: divide by penalty (reduces probability)
@@ -1590,6 +1729,7 @@ where
                 stopped_by_token: true,
                 stopped_by_length: false,
                 decode_metrics: None,
+                speculative_metrics: None,
             });
         }
 
@@ -1603,6 +1743,7 @@ where
         stopped_by_token: false,
         stopped_by_length: true,
         decode_metrics: None,
+        speculative_metrics: None,
     })
 }
 
@@ -1662,6 +1803,7 @@ where
             stopped_by_token: true,
             stopped_by_length: false,
             decode_metrics: None,
+            speculative_metrics: None,
         });
     }
 
@@ -1692,6 +1834,7 @@ where
                 stopped_by_token: true,
                 stopped_by_length: false,
                 decode_metrics: None,
+                speculative_metrics: None,
             });
         }
 
@@ -1705,6 +1848,7 @@ where
         stopped_by_token: false,
         stopped_by_length: true,
         decode_metrics: None,
+        speculative_metrics: None,
     })
 }
 
@@ -1844,6 +1988,7 @@ where
                 stopped_by_token: true,
                 stopped_by_length: false,
                 decode_metrics: None,
+                speculative_metrics: None,
             });
         }
 
@@ -1873,6 +2018,7 @@ where
         stopped_by_token: false,
         stopped_by_length: true,
         decode_metrics: None,
+        speculative_metrics: None,
     })
 }
 
@@ -1961,6 +2107,7 @@ where
                 stopped_by_token: true,
                 stopped_by_length: false,
                 decode_metrics: build_decode_metrics(&step_ns),
+                speculative_metrics: None,
             });
         }
 
@@ -1975,6 +2122,7 @@ where
                 stopped_by_token: false,
                 stopped_by_length: false,
                 decode_metrics: build_decode_metrics(&step_ns),
+                speculative_metrics: None,
             });
         }
 
@@ -1999,6 +2147,7 @@ where
         stopped_by_token: false,
         stopped_by_length: true,
         decode_metrics: build_decode_metrics(&step_ns),
+        speculative_metrics: None,
     })
 }
 
@@ -2182,6 +2331,7 @@ where
                 stopped_by_token: true,
                 stopped_by_length: false,
                 decode_metrics: None,
+                speculative_metrics: None,
             });
         }
 
@@ -2238,6 +2388,7 @@ where
         stopped_by_token: false,
         stopped_by_length: true,
         decode_metrics: None,
+        speculative_metrics: None,
     })
 }
 
@@ -2322,6 +2473,7 @@ where
                 stopped_by_token: true,
                 stopped_by_length: false,
                 decode_metrics: None,
+                speculative_metrics: None,
             });
         }
 
@@ -2346,6 +2498,7 @@ where
         stopped_by_token: false,
         stopped_by_length: true,
         decode_metrics: None,
+        speculative_metrics: None,
     })
 }
 
@@ -2455,6 +2608,7 @@ where
                 stopped_by_token: true,
                 stopped_by_length: false,
                 decode_metrics: None,
+                speculative_metrics: None,
             });
         }
 
@@ -2480,6 +2634,7 @@ where
         stopped_by_token: false,
         stopped_by_length: true,
         decode_metrics: None,
+        speculative_metrics: None,
     })
 }
 
@@ -2525,6 +2680,7 @@ fn build_cached_generation_output(
             && !stopped_by_token
             && num_generated >= gen_config.max_new_tokens,
         decode_metrics: None,
+        speculative_metrics: None,
     }
 }
 
@@ -3012,6 +3168,49 @@ mod tests {
         for val in filtered_vec.iter().skip(3).take(7) {
             assert!(val.is_infinite());
         }
+    }
+
+    #[test]
+    fn test_sampling_log_probs_with_counts_applies_filters() {
+        let config = GenerationConfig::sampling(1, 1.0)
+            .with_top_k(1)
+            .with_top_p(1.0)
+            .with_min_p(0.0)
+            .with_repetition_penalty(1.0);
+        let logits = Array::from_slice(&[0.0f32, 1.0, 3.0], &[3]);
+        let log_probs = sampling_log_probs_with_counts(
+            &logits,
+            &[],
+            &std::collections::HashMap::new(),
+            &config,
+        )
+        .unwrap();
+
+        let top_prob = token_probability_from_log_probs(&log_probs, 2).unwrap();
+        let masked_prob = token_probability_from_log_probs(&log_probs, 1).unwrap();
+        assert!((top_prob - 1.0).abs() < 1e-6);
+        assert_eq!(masked_prob, 0.0);
+    }
+
+    #[test]
+    fn test_speculative_decode_metrics_accumulate_verify_steps() {
+        let mut metrics = SpeculativeDecodeMetrics::default();
+
+        metrics.record_verify_step(3, 3);
+        metrics.record_verify_step(3, 1);
+        metrics.record_verify_step(2, 0);
+        metrics.record_verify_step(0, 0);
+        metrics.record_verify_step(2, 5);
+
+        assert_eq!(metrics.drafted_tokens, 10);
+        assert_eq!(metrics.accepted_draft_tokens, 6);
+        assert_eq!(metrics.verify_steps, 4);
+        assert_eq!(metrics.full_accept_steps, 2);
+        assert_eq!(metrics.partial_accept_steps, 1);
+        assert_eq!(metrics.zero_accept_steps, 1);
+        assert_eq!(metrics.max_draft_tokens, 3);
+        assert!((metrics.acceptance_rate() - 0.6).abs() < f32::EPSILON);
+        assert!((metrics.avg_accepted_per_verify() - 1.5).abs() < f32::EPSILON);
     }
 
     #[test]

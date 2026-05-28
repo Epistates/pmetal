@@ -91,6 +91,7 @@ pub mod logprob_utils;
 pub mod lora_trainer;
 pub mod metal_fused;
 pub mod mlx_metal_optimizer;
+pub mod mtp_training;
 #[cfg(feature = "experimental-trainers")]
 pub mod online_dpo;
 #[cfg(feature = "experimental-trainers")]
@@ -149,6 +150,7 @@ pub use mlx_metal_optimizer::{
     MlxMetalOptimizer, MlxMetalOptimizerBuilder, MlxMetalOptimizerConfig, MlxMetalOptimizerError,
     MlxMetalOptimizerResult, is_mlx_metal_optimizer_available,
 };
+pub use mtp_training::*;
 // Re-export online_dpo selectively to avoid ambiguous RewardFunction with grpo
 pub use embedding_trainer::{
     EmbeddingLossType, EmbeddingResult, EmbeddingTrainer, EmbeddingTrainerConfig,

@@ -312,7 +312,11 @@ impl KVCache {
         } else if let Some(ref tq_layers) = self.turboquant_layers {
             tq_layers.first().map(|c| c.len()).unwrap_or(0)
         } else {
-            self.layer_caches.first().map(|c| c.offset).unwrap_or(0)
+            self.layer_caches
+                .iter()
+                .map(|cache| cache.offset)
+                .max()
+                .unwrap_or(0)
         }
     }
 

@@ -297,7 +297,11 @@ pub async fn chat_completions(
     state.metrics.record(&metrics);
 
     let completion_tokens = tokens.len();
-    let text = state.engine.decode(&tokens)?;
+    let text = if tools_requested {
+        state.engine.decode_with_special_tokens(&tokens)?
+    } else {
+        state.engine.decode(&tokens)?
+    };
 
     // Best-effort tool-call detection: only attempted when the caller declared
     // `tools` in the request. Falls back to plain content otherwise.
@@ -700,7 +704,8 @@ fn chat_sse_stream(
 
                 // Best-effort tool-call detection on the accumulated response.
                 let (tool_calls, reason) = if tools_requested {
-                    match try_parse_tool_calls(&decoder.decoded_text()) {
+                    let decoded = decoder.decoded_text_with_special_tokens();
+                    match try_parse_tool_calls(&decoded) {
                         Some(calls) => (Some(calls), "tool_calls".to_string()),
                         None => (None, finish_reason),
                     }

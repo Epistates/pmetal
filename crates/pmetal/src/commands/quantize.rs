@@ -455,7 +455,11 @@ fn infer_pre_tokenizer(
         .unwrap_or_default()
         .to_ascii_lowercase();
 
-    if model_type.contains("qwen3_5") || architecture.contains("qwen3_5") {
+    if model_type.contains("qwen3_5")
+        || architecture.contains("qwen3_5")
+        || model_type.contains("qwen3_6")
+        || architecture.contains("qwen3_6")
+    {
         return Some("qwen35".to_string());
     }
     if model_type.contains("qwen") || architecture.contains("qwen") {

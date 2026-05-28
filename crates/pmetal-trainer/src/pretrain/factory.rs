@@ -190,7 +190,8 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
                 config,
             )?))
         }
-        "qwen3.5" | "qwen3_5" | "qwen3_next" | "qwen3-next" | "qwen35" => {
+        "qwen3.5" | "qwen3_5" | "qwen3_next" | "qwen3-next" | "qwen35" | "qwen3.6" | "qwen3_6"
+        | "qwen36" => {
             let mut config: architectures::Qwen3NextConfig = match &json {
                 Some(v) => {
                     let effective =
@@ -200,7 +201,7 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
                             v.clone()
                         };
                     serde_json::from_value(effective)
-                        .map_err(|e| Exception::custom(format!("qwen3.5 config: {e}")))?
+                        .map_err(|e| Exception::custom(format!("qwen3.5/3.6 config: {e}")))?
                 }
                 None => architectures::Qwen3NextConfig::default(),
             };
@@ -221,7 +222,7 @@ pub fn create_model(arch: &str, config_path: Option<&Path>) -> Result<PretrainMo
         }
         other => Err(Exception::custom(format!(
             "unsupported pretrain architecture: {other}\n\
-             supported: llama, qwen2, qwen3, qwen3.5, qwen3_moe, gemma, gemma4, mistral, phi, gpt-oss"
+             supported: llama, qwen2, qwen3, qwen3.5/qwen3.6, qwen3_moe, gemma, gemma4, mistral, phi, gpt-oss"
         ))),
     }
 }

@@ -1148,6 +1148,18 @@ pub(crate) async fn run_dataset_command(action: DatasetAction) -> anyhow::Result
                                 Some((from.to_string(), value.to_string()))
                             })
                             .collect::<Vec<_>>()
+                    } else if let Some(messages) = json.get("messages").and_then(|v| v.as_array()) {
+                        messages
+                            .iter()
+                            .filter_map(|m| {
+                                let role = m.get("role")?.as_str()?;
+                                let content = m.get("content")?.as_str()?;
+                                if content.trim().is_empty() {
+                                    return None;
+                                }
+                                Some((role.to_string(), content.to_string()))
+                            })
+                            .collect::<Vec<_>>()
                     } else if let Some(inst) = json.get("instruction").and_then(|v| v.as_str()) {
                         // Convert Alpaca to conversations
                         let input_text = json.get("input").and_then(|v| v.as_str()).unwrap_or("");
@@ -1876,7 +1888,7 @@ pub(crate) fn format_conversations(
     // Raw template (pre-formatted text may already contain EOS).
     if !add_generation_prompt && !matches!(template, ChatTemplate::Raw) {
         if let Some(eos) = eos_token {
-            if !output.ends_with(eos) {
+            if !output.trim_end().ends_with(eos) {
                 output.push_str(eos);
             }
         }

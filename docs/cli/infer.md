@@ -39,6 +39,33 @@ pmetal infer --model Qwen/Qwen3-0.6B --ane-max-seq-len 2048
 # JIT-compiled sampling
 pmetal infer --model Qwen/Qwen3-0.6B --compiled --chat
 
+# Gemma 4 MTP assistant (exact speculative decode)
+pmetal infer \
+  --model google/gemma-4-31B-it \
+  --draft-model google/gemma-4-31B-it-assistant \
+  --prompt "Summarize monotonic queues." \
+  --temperature 1.0 --top-k 64 --top-p 0.95
+
+# Qwen3Next / Qwen3.6 bundled MTP (exact speculative decode)
+pmetal infer \
+  --model /path/to/qwen3next-with-mtp \
+  --mtp --mtp-draft-tokens 3 \
+  --prompt "Summarize monotonic queues." \
+  --temperature 0.7 --top-k 20 --top-p 0.8
+
+# Qwen MTP checkpoint trained with `pmetal train-mtp`
+pmetal infer \
+  --model /path/to/qwen3next-target \
+  --mtp --mtp-model ./qwen-mtp \
+  --prompt "Summarize monotonic queues." \
+  --temperature 0.7
+
+# Qwen bundled MTP with FP8 target/MTP weights and packed expert offload
+pmetal infer \
+  --model /path/to/qwen3next-with-mtp \
+  --mtp --fp8 --experts-dir /path/to/packed_experts \
+  --prompt "Summarize monotonic queues."
+
 # Profile Qwen 3.5 hybrid prefill + cached decode layers and write JSON
 pmetal infer \
   --model unsloth/Qwen3.5-0.8B \
@@ -55,6 +82,10 @@ pmetal infer \
 | `--model` | *required* | HuggingFace model ID or local path |
 | `--prompt` | — | Input prompt (omit for stdin) |
 | `--lora` | — | Path to LoRA adapter weights |
+| `--draft-model` | — | Gemma 4 MTP assistant model for exact speculative decoding |
+| `--mtp` | off | Enable bundled Qwen3Next/Qwen3.6 MTP exact speculative decoding |
+| `--mtp-model` | bundled `mtp.*` in `--model` | Optional external Qwen MTP checkpoint directory |
+| `--mtp-draft-tokens` | `3` | Number of Qwen MTP draft tokens per verify step |
 | `--temperature` | model default | Sampling temperature |
 | `--top-k` | model default | Top-k sampling |
 | `--top-p` | model default | Nucleus sampling |
@@ -77,6 +108,12 @@ pmetal infer \
 ## Layer Profiling
 
 `--profile-layers` is currently implemented for standard `Qwen 3.5 / qwen3_next` inference. It runs one real prefill pass and one real cached decode pass using the shared inference runner, forcing MLX evaluation at each measured section so the report reflects actual wall time instead of only op scheduling overhead.
+
+`--mtp` is its own verifier/drafter generation backend. It supports bundled Qwen `mtp.*` weights or an external `--mtp-model` checkpoint, FP8 target/MTP weights, packed expert offload, LoRA-merged Qwen3Next targets, and checkpoints with more than one MTP predictor layer. Backend selectors such as ANE, compiled, minimal, and metal-sampler are ignored while MTP is active because exact speculative verification owns the decode loop. LoRA and `--experts-dir` are not combined; fuse the adapter first if you need packed expert offload.
+
+When Gemma 4 or Qwen MTP is active, the CLI prints a `Speculative:` summary with draft
+acceptance rate, accepted/attempted draft tokens, average accepted draft tokens per verify
+step, and the number of target bonus/correction tokens.
 
 Use `--profile-output <PATH>` to capture the full JSON report. The CLI summary now prints:
 - total layer time vs non-layer overhead

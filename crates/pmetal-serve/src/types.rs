@@ -227,6 +227,43 @@ mod tests {
     }
 
     #[test]
+    fn tool_parse_qwen_xml_call() {
+        let text = r#"<tool_call>
+{"name": "web_search", "arguments": {"query": "qwen mtp", "limit": 5}}
+</tool_call>"#;
+        let calls = try_parse_tool_calls(text).expect("should parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "web_search");
+        assert_eq!(calls[0].function.arguments["query"], "qwen mtp");
+        assert_eq!(calls[0].function.arguments["limit"], 5);
+    }
+
+    #[test]
+    fn tool_parse_gemma4_custom_call() {
+        let text = r#"<|tool_call>call:web_search{query:<|"|>latest Gemma 4 MTP<|"|>,limit:5}<tool_call|>"#;
+        let calls = try_parse_tool_calls(text).expect("should parse");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].function.name, "web_search");
+        assert_eq!(calls[0].function.arguments["query"], "latest Gemma 4 MTP");
+        assert_eq!(calls[0].function.arguments["limit"], 5);
+    }
+
+    #[test]
+    fn tool_parse_gemma4_multiple_calls_and_nested_args() {
+        let text = concat!(
+            r#"<|tool_call>call:web.search{query:<|"|>qwen mtp<|"|>}<tool_call|>"#,
+            r#"<|tool_call>call:store_result{meta:{source:<|"|>web<|"|>,ok:true},scores:[1,2.5]}<turn|>"#
+        );
+        let calls = try_parse_tool_calls(text).expect("should parse");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].function.name, "web.search");
+        assert_eq!(calls[1].function.name, "store_result");
+        assert_eq!(calls[1].function.arguments["meta"]["source"], "web");
+        assert_eq!(calls[1].function.arguments["meta"]["ok"], true);
+        assert_eq!(calls[1].function.arguments["scores"][1], 2.5);
+    }
+
+    #[test]
     fn tool_parse_rejects_plain_text() {
         assert!(try_parse_tool_calls("Hello, world!").is_none());
         assert!(try_parse_tool_calls("{invalid json").is_none());
@@ -468,11 +505,19 @@ pub struct ChatDelta {
 /// Accepted shapes:
 /// 1. Bare object: `{"name": "...", "arguments": {...}}`
 /// 2. Wrapped object: `{"tool_calls": [{"function": {"name": ..., "arguments": ...}}, ...]}`
+/// 3. Qwen XML envelope: `<tool_call>{"name": "...", "arguments": {...}}</tool_call>`
+/// 4. Gemma 4 native envelope: `<|tool_call>call:name{arg:<|"|>value<|"|>}<tool_call|>`
 ///
 /// Returns `None` when the text does not cleanly parse as a tool call. Callers
 /// fall back to returning the raw text as `content`.
 pub fn try_parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
     let trimmed = text.trim();
+    if let Some(calls) = try_parse_gemma4_tool_calls(trimmed) {
+        return Some(calls);
+    }
+    if let Some(calls) = try_parse_qwen_xml_tool_calls(trimmed) {
+        return Some(calls);
+    }
     if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
         return None;
     }
@@ -516,6 +561,225 @@ pub fn try_parse_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
             arguments,
         },
     }])
+}
+
+fn try_parse_qwen_xml_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    const START: &str = "<tool_call>";
+    const END: &str = "</tool_call>";
+
+    let mut calls = Vec::new();
+    let mut offset = 0usize;
+    while let Some(start_rel) = text[offset..].find(START) {
+        let body_start = offset + start_rel + START.len();
+        let rest = &text[body_start..];
+        let end_rel = rest.find(END)?;
+        let body = rest[..end_rel].trim();
+        let value: serde_json::Value = serde_json::from_str(body).ok()?;
+        let name = value.get("name").and_then(|v| v.as_str())?;
+        let arguments = value
+            .get("arguments")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        calls.push(ToolCall {
+            id: None,
+            tool_type: "function".to_owned(),
+            function: FunctionCall {
+                name: name.to_owned(),
+                arguments,
+            },
+        });
+        offset = body_start + end_rel + END.len();
+    }
+
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn try_parse_gemma4_tool_calls(text: &str) -> Option<Vec<ToolCall>> {
+    const START: &str = "<|tool_call>call:";
+    const END: &str = "<tool_call|>";
+    const TURN_END: &str = "<turn|>";
+
+    let mut calls = Vec::new();
+    let mut offset = 0usize;
+    while let Some(start_rel) = text[offset..].find(START) {
+        let start = offset + start_rel + START.len();
+        let after_start = &text[start..];
+        let name_end_rel = after_start.find('{')?;
+        let name = after_start[..name_end_rel].trim();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        {
+            offset = start + name_end_rel + 1;
+            continue;
+        }
+
+        let args_start = start + name_end_rel + 1;
+        let args_end_rel = find_gemma4_matching_brace(&text[args_start..])?;
+        let args_end = args_start + args_end_rel;
+        let after_args = &text[args_end + 1..];
+        let consumed_end = if after_args.starts_with(END) {
+            args_end + 1 + END.len()
+        } else if after_args.starts_with(TURN_END) {
+            args_end + 1 + TURN_END.len()
+        } else {
+            args_end + 1
+        };
+
+        calls.push(ToolCall {
+            id: None,
+            tool_type: "function".to_owned(),
+            function: FunctionCall {
+                name: name.to_owned(),
+                arguments: parse_gemma4_arguments(&text[args_start..args_end]),
+            },
+        });
+        offset = consumed_end;
+    }
+
+    (!calls.is_empty()).then_some(calls)
+}
+
+fn find_gemma4_matching_brace(input: &str) -> Option<usize> {
+    const STRING_DELIM: &str = r#"<|"|>"#;
+    let mut idx = 0usize;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    while idx < input.len() {
+        let rest = &input[idx..];
+        if rest.starts_with(STRING_DELIM) {
+            in_string = !in_string;
+            idx += STRING_DELIM.len();
+            continue;
+        }
+        let byte = input.as_bytes()[idx];
+        if !in_string {
+            match byte {
+                b'{' => depth += 1,
+                b'}' if depth == 0 => return Some(idx),
+                b'}' => depth -= 1,
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    None
+}
+
+fn parse_gemma4_arguments(input: &str) -> serde_json::Value {
+    let mut object = serde_json::Map::new();
+    for part in split_gemma4_top_level(input, b',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some(colon) = find_gemma4_top_level(trimmed, b':') {
+            let key = trimmed[..colon].trim();
+            if key.is_empty() {
+                continue;
+            }
+            object.insert(
+                key.to_owned(),
+                parse_gemma4_value(trimmed[colon + 1..].trim()),
+            );
+        }
+    }
+    serde_json::Value::Object(object)
+}
+
+fn parse_gemma4_value(input: &str) -> serde_json::Value {
+    const STRING_DELIM: &str = r#"<|"|>"#;
+    let trimmed = input.trim();
+    if let Some(inner) = trimmed
+        .strip_prefix(STRING_DELIM)
+        .and_then(|s| s.strip_suffix(STRING_DELIM))
+    {
+        return serde_json::Value::String(inner.to_owned());
+    }
+    if let Some(inner) = trimmed.strip_prefix('{').and_then(|s| s.strip_suffix('}')) {
+        return parse_gemma4_arguments(inner);
+    }
+    if let Some(inner) = trimmed.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        let values = split_gemma4_top_level(inner, b',')
+            .into_iter()
+            .filter(|part| !part.trim().is_empty())
+            .map(parse_gemma4_value)
+            .collect();
+        return serde_json::Value::Array(values);
+    }
+    match trimmed {
+        "true" => serde_json::Value::Bool(true),
+        "false" => serde_json::Value::Bool(false),
+        "null" => serde_json::Value::Null,
+        _ => {
+            if let Ok(value) = trimmed.parse::<i64>() {
+                serde_json::Value::Number(value.into())
+            } else if let Ok(value) = trimmed.parse::<f64>() {
+                serde_json::Number::from_f64(value)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or_else(|| serde_json::Value::String(trimmed.to_owned()))
+            } else {
+                serde_json::Value::String(trimmed.to_owned())
+            }
+        }
+    }
+}
+
+fn split_gemma4_top_level(input: &str, delimiter: u8) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut idx = 0usize;
+    while idx < input.len() {
+        let rest = &input[idx..];
+        if rest.starts_with(r#"<|"|>"#) {
+            in_string = !in_string;
+            idx += r#"<|"|>"#.len();
+            continue;
+        }
+        let byte = input.as_bytes()[idx];
+        if !in_string {
+            match byte {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth -= 1,
+                b if b == delimiter && depth == 0 => {
+                    parts.push(&input[start..idx]);
+                    start = idx + 1;
+                }
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    parts.push(&input[start..]);
+    parts
+}
+
+fn find_gemma4_top_level(input: &str, needle: u8) -> Option<usize> {
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut idx = 0usize;
+    while idx < input.len() {
+        let rest = &input[idx..];
+        if rest.starts_with(r#"<|"|>"#) {
+            in_string = !in_string;
+            idx += r#"<|"|>"#.len();
+            continue;
+        }
+        let byte = input.as_bytes()[idx];
+        if !in_string {
+            match byte {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => depth -= 1,
+                b if b == needle && depth == 0 => return Some(idx),
+                _ => {}
+            }
+        }
+        idx += 1;
+    }
+    None
 }
 
 // ────────────────────────────────────────────────────────────────────────────

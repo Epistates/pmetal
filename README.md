@@ -65,6 +65,18 @@ pmetal infer \
   --prompt "Explain quantum entanglement" \
   --chat --show-thinking
 
+# Train and use a Qwen3Next/Qwen3.6 MTP predictor
+pmetal tokenize --input train.jsonl --output ./tok --tokenizer Qwen/Qwen3.6-30B-A3B-Instruct
+pmetal train-mtp \
+  --model Qwen/Qwen3.6-30B-A3B-Instruct \
+  --family qwen3-next \
+  --shards ./tok/shard_00000.bin \
+  --output ./qwen-mtp
+pmetal infer \
+  --model Qwen/Qwen3.6-30B-A3B-Instruct \
+  --mtp --mtp-model ./qwen-mtp \
+  --prompt "Explain monotonic queues."
+
 # Knowledge distillation
 pmetal distill \
   --teacher Qwen/Qwen3-4B \
@@ -109,6 +121,8 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | Command | Description |
 |---------|-------------|
 | `train` | Fine-tune with LoRA/QLoRA/DoRA (SFT) |
+| `train-mtp` | Train Gemma 4 assistant or Qwen3Next/Qwen3.6 MTP predictor checkpoints |
+| `train-draft` | Train DFlash block-diffusion draft checkpoints |
 | `infer` | Interactive inference with chat, tool use, and thinking mode |
 | `distill` | Knowledge distillation (online, offline, progressive) |
 | `grpo` | GRPO/DAPO reasoning training (VLM, speculative, async rewards) |
@@ -351,7 +365,7 @@ All causal language models below can be loaded from HuggingFace Hub or local saf
 | Qwen 2 | `Qwen2` | 2, 2.5 | `qwen2`, `qwen2_5` |
 | Qwen 3 | `Qwen3` | 3 | `qwen3` |
 | Qwen 3 MoE | `Qwen3MoE` | 3-MoE | `qwen3_moe` |
-| Qwen 3.5 | `Qwen3Next` | 3.5 (Next) | `qwen3_next`, `qwen3_5` |
+| Qwen 3.5 / 3.6 | `Qwen3Next` | 3.5 (Next), 3.6 | `qwen3_next`, `qwen3_5`, `qwen3_6` |
 | DeepSeek | `DeepSeek` | V3, V3.2, V3.2-Speciale | `deepseek`, `deepseek_v3` |
 | Mistral | `Mistral` | 7B, Mixtral 8x7B | `mistral`, `mixtral` |
 | Gemma | `Gemma` | 2, 3 | `gemma`, `gemma2`, `gemma3` |
@@ -362,6 +376,25 @@ All causal language models below can be loaded from HuggingFace Hub or local saf
 | NemotronH | `NemotronH` | Hybrid (Mamba+Attention) | `nemotron_h` |
 | GPT-OSS | `GptOss` | 20B, 120B | `gpt_oss`, `gpt-oss` |
 | Gemma 4 | `Gemma4` | 4 | `gemma4`, `gemma4_text` |
+
+Gemma 4 MTP assistant checkpoints (`model_type = "gemma4_assistant"`) are supported as
+draft assistants via `pmetal infer --draft-model <assistant>`. The standard sampling
+controls (`--temperature`, `--top-k`, `--top-p`, `--min-p`, and penalties) are preserved
+through speculative verification, so MTP does not change generation quality.
+
+Qwen3Next/Qwen3.6 checkpoints with bundled `mtp.*` weights can use exact speculative
+decoding via `pmetal infer --mtp --mtp-draft-tokens 3`. This path preserves the same
+sampling controls, supports bundled multi-predictor MTP heads, works with FP8 target/MTP
+weights, packed expert offload, and LoRA-merged targets, and verifies every drafted token
+against the target model. LoRA and packed expert offload are separate modes; fuse the adapter
+first if you need both together. MTP inference prints draft acceptance metrics, including
+accepted/attempted draft tokens, accepted tokens per verify step, and target bonus/correction
+tokens.
+
+Custom draft checkpoint creation is wired through `pmetal train-mtp` and `pmetal train-draft`.
+`train-mtp` exports HF-compatible Gemma 4 assistant checkpoints and Qwen `mtp.*` predictor
+checkpoints; load the latter with `pmetal infer --mtp --mtp-model ./qwen-mtp`. `train-draft`
+exports DFlash draft checkpoints for the dedicated `pmetal dflash` runtime.
 
 ### Embedding / Encoder Models
 
@@ -380,9 +413,9 @@ LoRA training is supported for models that have implementations in `DynamicLoraM
 | Qwen 2 | Yes | Yes | Uses Qwen3 LoRA implementation internally. |
 | Qwen 3 | Yes | Yes | Gradient checkpointing supported. |
 | Qwen 3 MoE | Yes | Yes | Sparse MoE support. |
-| Qwen 3.5 (Next) | Yes | Yes | Hybrid architecture with nested `text_config` handling. |
+| Qwen 3.5 / 3.6 (Next) | Yes | Yes | Hybrid architecture with nested `text_config` handling and bundled MTP inference. |
 | Gemma | Yes | Yes | GeGLU activation, special RMSNorm. |
-| Gemma 4 | Yes | Yes | Multimodal-era Gemma text path. |
+| Gemma 4 | Yes | Yes | Multimodal-era Gemma text path with MTP assistant inference support. |
 | Mistral | Yes | Yes | Sliding window attention support. |
 | Phi 3/4 | Yes | Yes | Partial RoPE, fused gate_up projection. |
 | DeepSeek | Yes | Yes | V3-family support. |
@@ -431,9 +464,10 @@ All training methods support callback-based cancellation (`should_stop()`), metr
 | Knowledge Distillation | `distill` | Yes | Yes | `Distiller` |
 | TAID (Temporally Adaptive) | — | — | — | `TaidDistiller` |
 | ANE Training | `train` (auto) | — | Yes | `AneTrainingLoop` |
-
 | RLKD (RL + Distillation) | `rlkd` | — | — | `RlkdTrainer` |
 | Embedding Training | `embed-train` | — | — | `EmbeddingTrainer` |
+| Gemma/Qwen MTP Predictor Training | `train-mtp` | — | — | `pmetal_trainer::mtp_training` |
+| DFlash Draft Training | `train-draft` | — | — | `pmetal_trainer::mtp_training` |
 
 Additional methods available via the library only: GSPO (`GspoTrainer`), PPO (`PpoTrainer`), Online DPO (`OnlineDpoTrainer`), Diffusion Training (`DiffusionTrainer`).
 
@@ -482,7 +516,7 @@ Near-optimal KV cache compression for long-context inference:
 - **Adaptive LR**: EMA-based anomaly detection with spike recovery, plateau reduction, and divergence detection
 - **Callback System**: `TrainingCallback` trait with lifecycle hooks (`on_step_start`, `on_step_end`, `should_stop`) for metrics logging, progress reporting, and clean cancellation
 - **Checkpoint Management**: Save and resume training from checkpoints with best-loss rollback
-- **Tool/Function Calling**: Chat templates with native tool definitions for Qwen, Llama 3.1+, Mistral v3+, and DeepSeek
+- **Tool/Function Calling**: Chat templates with native tool definitions for Qwen, Gemma 4, Llama 3.1+, Mistral v3+, and DeepSeek
 - **Schedule-Free Optimizer**: Memory-efficient optimizer without learning rate schedules
 - **Metal Fused Optimizer**: GPU-accelerated AdamW parameter updates
 - **8-bit Adam**: Memory-efficient optimizer for large models
@@ -612,6 +646,10 @@ Multiple distillation methods and loss functions:
 | `--presence-penalty` | 0.0 | Presence penalty |
 | `--chat` | false | Apply chat template |
 | `--show-thinking` | false | Show reasoning content |
+| `--draft-model` | — | Gemma 4 MTP assistant checkpoint |
+| `--mtp` | false | Enable Qwen3Next/Qwen3.6 exact speculative MTP |
+| `--mtp-model` | bundled `mtp.*` | Optional external Qwen MTP checkpoint from `train-mtp` |
+| `--mtp-draft-tokens` | 3 | Qwen MTP draft tokens per verification step |
 | `--fp8` | false | Use FP8 weights (~2x mem reduction) |
 | `--compiled` | false | Use JIT-compiled sampling |
 | `--no-ane` | false | Disable ANE inference |
