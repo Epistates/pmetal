@@ -520,12 +520,46 @@ impl GptOssMLP {
     }
 }
 
+/// GPT-OSS clamped SwiGLU — matches HF `modeling_gpt_oss` and mlx-lm `swiglu`.
+///
+/// ```text
+///   x_glu    = clip(gate, max=limit)              // gate: upper clamp only
+///   x_linear = clip(up,  -limit, limit)           // up:   symmetric clamp
+///   out      = (x_glu * sigmoid(alpha * x_glu)) * (x_linear + 1)
+/// ```
+///
+/// where `alpha = 1.702` makes `x*sigmoid(1.702*x)` a QuickGELU approximation,
+/// and the `+1` on the up branch is the identity-shift the model trains
+/// deviations against. The clamps bound the two *inputs* (asymmetrically), not
+/// the product — this keeps activations in range for MXFP4 inference.
 fn clamp_swiglu_hidden(gate: &Array, up: &Array, limit: f32) -> Result<Array, Exception> {
-    let activated = nn::silu(gate).multiply(up);
-    let limit = Array::from_f32(limit);
-    let neg_limit = Array::from_f32(-limit.item::<f32>());
-    let clamped = pmetal_bridge::compat::ops::minimum(&activated, &limit);
-    Ok(pmetal_bridge::compat::ops::maximum(&clamped, &neg_limit))
+    const ALPHA: f32 = 1.702;
+    let lim = Array::from_f32(limit);
+    let neg_lim = Array::from_f32(-limit);
+    // gate: clamp the upper bound only (min stays unbounded).
+    let x_glu = ops::minimum(gate, &lim);
+    // up: symmetric clamp to [-limit, limit].
+    let x_linear = ops::maximum(&ops::minimum(up, &lim), &neg_lim);
+    // QuickGELU gate: x_glu * sigmoid(alpha * x_glu).
+    let glu = x_glu.multiply(&ops::sigmoid(&x_glu.multiply(&Array::from_f32(ALPHA))));
+    // up branch carries a +1 identity shift.
+    Ok(glu.multiply(&x_linear.add(&Array::from_f32(1.0))))
+}
+
+/// GPT-OSS router selection — spec of record: HF `modeling_gpt_oss`
+/// (`GptOssTopKRouter`) and mlx-lm `MLPBlock`, which agree: select the top-k
+/// experts from the RAW router logits, then take `softmax` over the selected
+/// logits. NOT sigmoid, and NOT renormalized — the softmax over the chosen
+/// logits already sums to 1.
+///
+/// Returns `(top_indices [.., k] i32, weights [.., k])`.
+fn router_topk_softmax(gate_logits: &Array, top_k: i32) -> (Array, Array) {
+    // O(E) top-k: argpartition places the k largest at the tail, then slice.
+    let part = ops::argpartition_axis(gate_logits, -top_k, -1);
+    let top_indices = ops::slice_last_from(&part, -top_k).as_type::<i32>();
+    let top_logits = gate_logits.take_along_axis(&top_indices, -1);
+    let weights = ops::softmax_axis(&top_logits, -1);
+    (top_indices, weights)
 }
 
 /// GPT-OSS expert MLP with bias and SwiGLU clamping.
@@ -803,18 +837,10 @@ impl GptOssMoE {
         let batch_seq = hidden_flat.dim(0);
         let hidden_size = hidden_flat.dim(1);
 
-        // GPT-OSS uses sigmoid (not softmax) on router logits; weights are
-        // always renormalised to sum to 1.
         let gate_logits = self.gate.forward(hidden_flat);
-        let scores = pmetal_bridge::compat::ops::sigmoid(&gate_logits);
+        let (top_indices, weights) = router_topk_softmax(&gate_logits, self.top_k as i32);
 
-        let (top_indices, normalized_weights) = crate::moe_routing::topk_normalize(
-            &scores,
-            self.top_k as i32,
-            /* norm_topk_prob */ true,
-        )?;
-
-        Ok((batch_seq, hidden_size, top_indices, normalized_weights))
+        Ok((batch_seq, hidden_size, top_indices, weights))
     }
 
     fn batched_matmul(&self, x: &Array, w: &Array) -> Result<Array, Exception> {
@@ -1760,6 +1786,75 @@ mod tests {
         assert_eq!(config.experts_per_token, 4);
         assert_eq!(config.sliding_window, 128);
         assert_eq!(config.swiglu_limit, 7.0);
+    }
+
+    #[test]
+    fn clamp_swiglu_matches_gpt_oss_reference_formula() {
+        // GPT-OSS clamped SwiGLU — spec of record: HF `modeling_gpt_oss`
+        // (`gate.clamp(max=limit)`, `up.clamp(-limit,limit)`,
+        //  `glu = gate*sigmoid(1.702*gate)`, `out = (up+1)*glu`) and mlx-lm
+        // `swiglu()`, which agree exactly. Values chosen so the previous buggy
+        // `clip(silu(gate)*up, ±limit)` form gives a very different answer:
+        // gate>limit exercises the one-sided clamp; up<0 the +1 shift.
+        let limit = 7.0_f32;
+        let gate = Array::from_slice(&[8.0_f32, -3.0, 1.0], &[3]);
+        let up = Array::from_slice(&[-9.0_f32, 2.0, 0.5], &[3]);
+
+        let mut out = clamp_swiglu_hidden(&gate, &up, limit).expect("swiglu");
+        let got = out.to_f32_vec(3).expect("vec");
+
+        let alpha = 1.702_f64;
+        let g = [8.0_f64, -3.0, 1.0];
+        let u = [-9.0_f64, 2.0, 0.5];
+        let lim = 7.0_f64;
+        for i in 0..3 {
+            let x_glu = g[i].min(lim); // upper clamp only
+            let x_lin = u[i].clamp(-lim, lim); // symmetric clamp
+            let sig = 1.0 / (1.0 + (-(alpha * x_glu)).exp());
+            let expected = (x_glu * sig) * (x_lin + 1.0);
+            assert!(
+                (got[i] as f64 - expected).abs() < 1e-4,
+                "swiglu[{i}] = {} expected {expected} (gpt-oss clamped QuickGELU)",
+                got[i]
+            );
+        }
+    }
+
+    #[test]
+    fn router_topk_uses_softmax_over_raw_logits() {
+        // Spec of record: HF `GptOssTopKRouter` / mlx-lm `MLPBlock` — top-k over
+        // RAW router logits, then softmax over the selected logits. The previous
+        // pmetal path used sigmoid + L1-normalization, which gives different
+        // weights. One token, 4 experts; top-2 selects experts 3 (4.0) & 1 (2.0).
+        let logits = Array::from_slice(&[1.0_f32, 2.0, 0.5, 4.0], &[1, 4]);
+        let (indices, mut weights) = router_topk_softmax(&logits, 2);
+        let mut idx = indices.as_type::<f32>();
+        let inds: Vec<i32> = idx
+            .to_f32_vec(2)
+            .expect("idx vec")
+            .into_iter()
+            .map(|v| v as i32)
+            .collect();
+        let w = weights.to_f32_vec(2).expect("w vec");
+
+        // softmax over selected logits {4.0, 2.0}: order-independent, sums to 1.
+        let sum: f32 = w.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-5, "weights must sum to 1, got {sum}");
+        let denom = (4.0_f64).exp() + (2.0_f64).exp();
+        for (slot, &expert) in inds.iter().enumerate() {
+            let want = if expert == 3 {
+                ((4.0_f64).exp() / denom) as f32
+            } else if expert == 1 {
+                ((2.0_f64).exp() / denom) as f32
+            } else {
+                panic!("unexpected top-2 expert {expert} (want 1 and 3)");
+            };
+            assert!(
+                (w[slot] - want).abs() < 1e-4,
+                "expert {expert} weight {} != softmax {want}",
+                w[slot]
+            );
+        }
     }
 
     #[test]

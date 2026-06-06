@@ -16,11 +16,13 @@
 //! scores so each architecture keeps its activation choice local while
 //! sharing the selection + normalisation path.
 //!
-//! Note: Qwen3-Next uses an equivalent-but-sign-flipped variant
-//! (`argpartition(-scores, -k)`) that's not covered by this helper — left
-//! for a follow-up once its semantics are audited. DeepSeek uses the
-//! `noaux_tc` topk method which is structurally different and out of
-//! scope here.
+//! Note: Qwen3-Next, Qwen3-MoE, GptOss, and Llama4 all route through this
+//! helper (or the equivalent positive-scores/negative-pivot/tail-slice form
+//! inline). The earlier sign-flipped `argpartition(-scores, -k)[..., -k:]`
+//! variant was anti-top-k (selects the k *smallest*) and has been removed —
+//! see the `sign_flipped_argpartition_is_anti_topk` test below. DeepSeek uses
+//! [`noaux_tc_topk`] (bias-corrected selection) which is structurally
+//! different.
 //!
 //! ## LOC accounting
 //!
