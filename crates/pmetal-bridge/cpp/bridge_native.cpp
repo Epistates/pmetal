@@ -735,6 +735,7 @@ void mlx_inline_gdn_metal_state_update(
                  {"Dk", Dk}, {"Dv", Dv}, {"Hk", Hk}, {"Hv", Hv}},
                 std::nullopt, false, {});
             new (dst_state->buf) array(outputs[0]);
+            pmetal_bridge_clear_error_internal();
             return;
         }
 
@@ -810,6 +811,7 @@ void mlx_inline_gdn_metal_step(
                 std::nullopt, false, {});
             new (dst_y->buf) array(outputs[0]);
             new (dst_state->buf) array(outputs[1]);
+            pmetal_bridge_clear_error_internal();
             return;
         }
 
