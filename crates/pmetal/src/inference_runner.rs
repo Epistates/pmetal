@@ -1438,8 +1438,9 @@ fn load_model_with_lora(
 
     tracing::info!("LoRA merged into base model");
 
+    let mamba_cache = model.create_mamba_cache();
     let base_cache = model
-        .create_cache(max_seq_len)
+        .create_inference_kv_cache(max_seq_len)
         .ok_or_else(|| Exception::custom("model does not support KV cache"))?;
     let cache_selection = select_cache_mode_for_model(
         base_cache.config(),
@@ -1448,7 +1449,6 @@ fn load_model_with_lora(
         cache_mode_request_from_config(config),
     );
     let cache = build_cache_from_base_config(base_cache.config(), cache_selection.mode);
-    let mamba_cache = model.create_mamba_cache();
 
     Ok((model, cache, mamba_cache, cache_selection))
 }

@@ -853,6 +853,18 @@ impl DynamicLoraModel {
         }
     }
 
+    /// Create the attention KV cache for inference, including hybrid models
+    /// (e.g. Qwen3Next) whose `TrainableModel::create_cache` returns `None`
+    /// because the GDN layers use a separate Mamba cache. The attention layers
+    /// still require a KV cache, so the trait method's `None` must not be
+    /// treated as "no KV cache at all" on the inference path.
+    pub fn create_inference_kv_cache(&self, max_seq_len: usize) -> Option<KVCache> {
+        match self {
+            Self::Qwen3Next(m) => Some(m.create_cache(max_seq_len)),
+            other => TrainableModel::create_cache(other, max_seq_len),
+        }
+    }
+
     /// Evaluate all model parameters (force GPU computation).
     ///
     /// Call this after loading LoRA weights to ensure the adapter parameters
