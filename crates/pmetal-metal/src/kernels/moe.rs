@@ -50,6 +50,15 @@ use crate::{
     error::{MetalError, Result},
 };
 
+/// Maximum experts the `moe_topk_selection` kernel can route in one pass.
+///
+/// The kernel holds each thread's per-expert scores in a thread-private
+/// `float scores[1024]` array. Routing more than this many experts would
+/// write past the end of that array — silent GPU memory corruption — so the
+/// dispatch path rejects it instead. Keep in sync with the literal in
+/// `kernels/metal/moe_routing.metal`.
+pub const MOE_TOPK_MAX_EXPERTS: usize = 1024;
+
 /// Configuration for MoE kernel.
 #[derive(Debug, Clone)]
 pub struct MoeConfig {
@@ -169,6 +178,16 @@ impl MoeKernel {
     ///
     /// Routing information for subsequent GEMM operations.
     pub fn route(&self, router_logits: &MetalBuffer<f32>) -> Result<MoeRouting> {
+        // The topk kernel keeps per-expert scores in a fixed `float[1024]`
+        // thread-private buffer; routing more experts would corrupt GPU
+        // memory. Reject up front with a clear error.
+        if self.config.num_experts > MOE_TOPK_MAX_EXPERTS {
+            return Err(MetalError::InvalidConfig(format!(
+                "moe_topk_selection supports at most {MOE_TOPK_MAX_EXPERTS} experts, got {}",
+                self.config.num_experts
+            )));
+        }
+
         // Validate input
         let expected_size = self.config.num_tokens * self.config.num_experts;
         if router_logits.len() != expected_size {
