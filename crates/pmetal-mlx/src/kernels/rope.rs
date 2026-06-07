@@ -289,8 +289,6 @@ pub fn apply_rope_with_positions(
     scale: f32,
 ) -> Result<Array, Exception> {
     // x shape: [batch, heads, seq_len, head_dim]
-    let shape = x.shape();
-    let head_dim = shape[3];
     let half_dims = dims / 2;
 
     // Compute inverse frequencies: inv_freq[i] = 1.0 / (base^(2i/dims))
@@ -319,78 +317,122 @@ pub fn apply_rope_with_positions(
     let cos_theta = cos_theta.reshape(&[1, 1, -1, half_dims]);
     let sin_theta = sin_theta.reshape(&[1, 1, -1, half_dims]);
 
+    Ok(rope_rotate_with_cos_sin(x, &cos_theta, &sin_theta, dims, traditional))
+}
+
+/// Core RoPE rotation given precomputed `cos`/`sin` tables (broadcastable to
+/// `[batch, heads, seq_len, half_dims]`). Shared by the position-ID and
+/// custom-frequency entry points so the interleaved/split-half rotation lives
+/// in exactly one place.
+fn rope_rotate_with_cos_sin(
+    x: &Array,
+    cos_theta: &Array,
+    sin_theta: &Array,
+    dims: i32,
+    traditional: bool,
+) -> Array {
+    let head_dim = x.shape()[3];
+    let half_dims = dims / 2;
+
     if traditional {
         // Traditional (interleaved) RoPE: pairs are (x[0], x[1]), (x[2], x[3]), ...
-        // x shape: [batch, heads, seq_len, head_dim]
-
         let x_rope = if dims < head_dim {
-            // Split off only the RoPE portion
             let parts = x.split(&[dims], -1);
             parts[0].clone()
         } else {
             x.clone()
         };
 
-        // Reshape to [..., half_dims, 2] for interleaved pairs
         let rope_shape = x_rope.shape();
         let batch = rope_shape[0];
         let heads = rope_shape[1];
         let seq_len = rope_shape[2];
         let x_pairs = x_rope.reshape(&[batch, heads, seq_len, half_dims, 2]);
 
-        // Extract even (index 0) and odd (index 1) elements along last dim
-        // Use slice: [batch, heads, seq_len, half_dims, 0..1] then squeeze(-1)
         let x_even = x_pairs
             .slice(&[0, 0, 0, 0, 0], &[batch, heads, seq_len, half_dims, 1])
-            .squeeze(-1); // [batch, heads, seq_len, half_dims]
+            .squeeze(-1);
         let x_odd = x_pairs
             .slice(&[0, 0, 0, 0, 1], &[batch, heads, seq_len, half_dims, 2])
-            .squeeze(-1); // [batch, heads, seq_len, half_dims]
+            .squeeze(-1);
 
-        // Apply rotation
         let r_even = x_even
-            .multiply(&cos_theta)
-            .subtract(&x_odd.multiply(&sin_theta));
-        let r_odd = x_even.multiply(&sin_theta).add(&x_odd.multiply(&cos_theta));
+            .multiply(cos_theta)
+            .subtract(&x_odd.multiply(sin_theta));
+        let r_odd = x_even.multiply(sin_theta).add(&x_odd.multiply(cos_theta));
 
-        // Interleave back: stack along last dim then reshape
-        let stacked = ops::stack_axis(vec![r_even, r_odd].as_slice(), -1); // [..., half_dims, 2]
+        let stacked = ops::stack_axis(vec![r_even, r_odd].as_slice(), -1);
         let x_rotated = stacked.reshape(&[batch, heads, seq_len, dims]);
 
         if dims < head_dim {
             let parts = x.split(&[dims], -1);
-            Ok(ops::concatenate_axis(&[&x_rotated, &parts[1]], -1))
+            ops::concatenate_axis(&[&x_rotated, &parts[1]], -1)
         } else {
-            Ok(x_rotated)
+            x_rotated
         }
     } else {
         // Non-traditional (split-half) RoPE: first half and second half
         let parts = if dims == head_dim {
-            // Split into 2 equal halves: split at [half_dims]
             x.split(&[half_dims], -1)
         } else {
-            // Split at [half_dims, dims]: produces 3 parts
             x.split(&[half_dims, dims], -1)
         };
 
-        let x1 = &parts[0]; // [batch, heads, seq_len, half_dims]
+        let x1 = &parts[0];
         let x2 = &parts[1];
 
-        // Apply rotation:
-        // rx1 = x1 * cos - x2 * sin
-        // rx2 = x1 * sin + x2 * cos
-        let rx1 = x1.multiply(&cos_theta).subtract(&x2.multiply(&sin_theta));
-        let rx2 = x1.multiply(&sin_theta).add(&x2.multiply(&cos_theta));
+        let rx1 = x1.multiply(cos_theta).subtract(&x2.multiply(sin_theta));
+        let rx2 = x1.multiply(sin_theta).add(&x2.multiply(cos_theta));
 
         let x_rotated = ops::concatenate_axis(&[&rx1, &rx2], -1);
 
         if dims < head_dim && parts.len() > 2 {
             let x_pass = &parts[2];
-            Ok(ops::concatenate_axis(&[&x_rotated, x_pass], -1))
+            ops::concatenate_axis(&[&x_rotated, x_pass], -1)
         } else {
-            Ok(x_rotated)
+            x_rotated
         }
     }
+}
+
+/// Apply RoPE using explicit per-dimension inverse frequencies.
+///
+/// Unlike [`apply_rope`] (which derives `inv_freq[i] = base^(-2i/dims)` from a
+/// single scalar `base`), this takes a precomputed `inv_freq` table of length
+/// `dims/2`. This is required for Phi-3 LongRoPE / SuRoPE, where each
+/// frequency is independently scaled by a per-dimension `long_factor`:
+/// `inv_freq[i] = 1 / (long_factor[i] * base^(2i/dims))`.
+///
+/// Positions are the contiguous range `[offset, offset + seq_len)`. Any
+/// magnitude (mscale) rescaling of the activations must be applied by the
+/// caller *before* this call — this function only rotates.
+///
+/// # Arguments
+/// * `x` - `[batch, heads, seq_len, head_dim]`
+/// * `inv_freq` - `[dims/2]` angular frequencies
+/// * `dims` - rotary dimension (may be < head_dim for partial RoPE)
+/// * `traditional` - interleaved (true) vs split-half (false)
+/// * `offset` - absolute position of the first token (KV-cache aware)
+pub fn apply_rope_with_freqs(
+    x: &Array,
+    inv_freq: &Array,
+    dims: i32,
+    traditional: bool,
+    offset: i32,
+) -> Result<Array, Exception> {
+    let seq_len = x.shape()[2];
+    let half_dims = dims / 2;
+
+    // positions: [offset, offset+1, ..., offset+seq_len-1] as float32
+    let positions = ops::arange_range(offset, offset + seq_len);
+    let angles = positions
+        .expand_dims(-1) // [seq_len, 1]
+        .multiply(&inv_freq.expand_dims(0)); // [1, half_dims] → [seq_len, half_dims]
+
+    let cos_theta = angles.cos().reshape(&[1, 1, -1, half_dims]);
+    let sin_theta = angles.sin().reshape(&[1, 1, -1, half_dims]);
+
+    Ok(rope_rotate_with_cos_sin(x, &cos_theta, &sin_theta, dims, traditional))
 }
 
 /// Apply RoPE with per-batch-row position IDs.

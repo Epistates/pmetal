@@ -24,7 +24,10 @@ use pmetal_bridge::compat::{
 };
 use pmetal_bridge::impl_module_params;
 
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{apply_rope, apply_rope_with_freqs},
+};
 use pmetal_mlx::kv_cache::KVCache;
 
 use crate::traits::{CausalLMModel, ModelConfig};
@@ -149,7 +152,8 @@ pub enum LayerNormType {
 /// RoPE scaling configuration for Phi.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PhiRopeScaling {
-    /// Scaling type.
+    /// Scaling type. HF stores this under the JSON key `"type"`.
+    #[serde(rename = "type")]
     pub scaling_type: String,
     /// Short factor.
     pub short_factor: Vec<f32>,
@@ -474,27 +478,22 @@ impl PhiAttention {
         };
 
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let rope_scale = if self.su_freqs.is_some() {
-            self.su_mscale
+        // SuRoPE/LongRoPE: rotate with the per-dimension `long_factor`-scaled
+        // inverse frequencies. The mscale above is the *value* scale; it must
+        // NOT also be passed as a position `scale` to the rotation (that was a
+        // double-application bug — and plain `apply_rope` ignored `su_freqs`
+        // entirely, falling back to un-scaled base frequencies).
+        let (q_rope, k_rope) = if let Some(ref freqs) = self.su_freqs {
+            (
+                apply_rope_with_freqs(&q_rope_raw, freqs, self.rope_dim, false, offset)?,
+                apply_rope_with_freqs(&k_rope_raw, freqs, self.rope_dim, false, offset)?,
+            )
         } else {
-            1.0
+            (
+                apply_rope(&q_rope_raw, self.rope_dim, false, self.rope_theta, 1.0, offset)?,
+                apply_rope(&k_rope_raw, self.rope_dim, false, self.rope_theta, 1.0, offset)?,
+            )
         };
-        let q_rope = apply_rope(
-            &q_rope_raw,
-            self.rope_dim,
-            false,
-            self.rope_theta,
-            rope_scale,
-            offset,
-        )?;
-        let k_rope = apply_rope(
-            &k_rope_raw,
-            self.rope_dim,
-            false,
-            self.rope_theta,
-            rope_scale,
-            offset,
-        )?;
 
         // Concatenate RoPE and pass-through parts back into the head_dim axis.
         let q = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
@@ -962,6 +961,71 @@ use super::utils::create_causal_mask;
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// Phi-3 LongRoPE (SuScaledRoPE) parity against the mlx-lm oracle.
+    ///
+    /// Guards three fixes: (1) the per-dimension `long_factor`-scaled inverse
+    /// frequencies are actually applied (plain base RoPE used to be used,
+    /// ignoring `su_freqs`); (2) the mscale is applied once, as a *value*
+    /// scale, not also as a position scale; (3) `compute_su_rope_freqs`
+    /// produces `inv_freq = 1/(long_factor · base^(2i/d))`.
+    ///
+    /// Fixture: `.strategy/parity/dump_phi_surope_reference.py`.
+    #[test]
+    #[serial]
+    fn phi_surope_matches_mlx_oracle() {
+        use pmetal_mlx::kernels::rope::apply_rope_with_freqs;
+
+        let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        path.push("tests/fixtures/phi_surope_reference.safetensors");
+        let shard: std::collections::HashMap<String, Array> =
+            pmetal_bridge::inline_array::load_safetensors_shard(path.to_str().unwrap())
+                .expect("load surope fixture")
+                .into_iter()
+                .collect();
+        let x = shard.get("x").expect("x").clone();
+        let y_ref = shard.get("y").expect("y").clone();
+        let mut long_factor_arr = shard.get("long_factor").expect("long_factor").clone();
+        let long_factor = long_factor_arr.to_f32_vec(16).expect("long_factor vec");
+
+        // Match the dumper's SuScaledRoPE params.
+        let dims = 32;
+        let base = 10000.0_f32;
+        let max_pos = 512;
+        let orig_max = 128;
+        let scaling = PhiRopeScaling {
+            scaling_type: "longrope".to_string(),
+            short_factor: vec![1.0; 16],
+            long_factor,
+        };
+        let (su_freqs, mscale) =
+            compute_su_rope_freqs(&scaling, dims, base, max_pos, orig_max).expect("su freqs");
+        assert!(
+            (mscale - 1.133_893).abs() < 1e-4,
+            "mscale {mscale} != mlx 1.133893"
+        );
+
+        // SuScaledRoPE value-scales x[..., :dims] (here dims == head_dim) then
+        // rotates with the long-factor freqs at offset 0.
+        let x_scaled = x.multiply(&Array::from_f32(mscale));
+        let mut y_rust =
+            apply_rope_with_freqs(&x_scaled, &su_freqs, dims, false, 0).expect("rope with freqs");
+        y_rust.eval().unwrap();
+
+        let got = y_rust.to_f32_vec(384).expect("rust vec");
+        let mut y_ref_eval = y_ref;
+        y_ref_eval.eval().unwrap();
+        let want = y_ref_eval.to_f32_vec(384).expect("ref vec");
+        let max_abs = got
+            .iter()
+            .zip(want.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(
+            max_abs < 1e-4,
+            "SuRoPE output diverges from mlx oracle by {max_abs}"
+        );
+    }
 
     #[test]
     fn test_phi_config_presets() {
