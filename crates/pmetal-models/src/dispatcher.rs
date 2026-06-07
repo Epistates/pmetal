@@ -504,6 +504,11 @@ impl DynamicModel {
                     || config.model_type == "gemma3_text"
                 {
                     config.is_gemma3 = true;
+                } else if config.model_type == "gemma2" {
+                    // Without this, Gemma-2 checkpoints silently run the Gemma-v1
+                    // path: no 4-norm block, no sliding window, no attention
+                    // softcap, no final-logit softcap.
+                    config.is_gemma2 = true;
                 }
                 let mut model = GemmaForCausalLM::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)

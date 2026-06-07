@@ -62,6 +62,11 @@ pub struct GemmaConfig {
     /// Attention logit softcapping (Gemma2 only).
     #[serde(default)]
     pub attn_logit_softcapping: Option<f32>,
+    /// Final logit softcapping applied to LM-head output (Gemma2 only):
+    /// `tanh(logits / cap) * cap`. HF Gemma-2 ships `30.0`; absent on
+    /// Gemma v1 / v3 / v4.
+    #[serde(default)]
+    pub final_logit_softcapping: Option<f32>,
     /// Query pre-attention scalar (Gemma2 only).
     #[serde(default)]
     pub query_pre_attn_scalar: Option<i32>,
@@ -147,6 +152,7 @@ impl Default for GemmaConfig {
             rope_theta: 10000.0,
             hidden_act: "gelu".to_string(),
             attn_logit_softcapping: None,
+            final_logit_softcapping: None,
             query_pre_attn_scalar: None,
             sliding_window: None,
             is_gemma2: false,
@@ -186,6 +192,7 @@ impl GemmaConfig {
             num_key_value_heads: Some(4),
             head_dim: Some(256),
             attn_logit_softcapping: Some(50.0),
+            final_logit_softcapping: Some(30.0),
             query_pre_attn_scalar: Some(256),
             sliding_window: Some(4096),
             is_gemma2: true,
@@ -204,6 +211,7 @@ impl GemmaConfig {
             num_key_value_heads: Some(8),
             head_dim: Some(256),
             attn_logit_softcapping: Some(50.0),
+            final_logit_softcapping: Some(30.0),
             query_pre_attn_scalar: Some(256),
             sliding_window: Some(4096),
             is_gemma2: true,
@@ -221,8 +229,9 @@ impl GemmaConfig {
             num_attention_heads: 32,
             num_key_value_heads: Some(16),
             head_dim: Some(128),
-            attn_logit_softcapping: Some(30.0),
-            query_pre_attn_scalar: Some(256),
+            attn_logit_softcapping: Some(50.0),
+            final_logit_softcapping: Some(30.0),
+            query_pre_attn_scalar: Some(144),
             sliding_window: Some(4096),
             is_gemma2: true,
             ..Default::default()
@@ -909,6 +918,20 @@ impl GemmaForCausalLM {
         self.forward_with_cache(input_ids, mask, None)
     }
 
+    /// Apply the tied LM head, then Gemma2's final logit softcapping
+    /// (`tanh(logits / cap) * cap`) when configured. No-op for Gemma v1/v3/v4.
+    fn lm_head(&self, hidden_states: &Array) -> Array {
+        // Gemma always ties embeddings.
+        let logits = self.model.embed_tokens.as_linear(hidden_states);
+        match self.model.config.final_logit_softcapping {
+            Some(cap) if cap != 0.0 => {
+                let cap_arr = Array::from_f32(cap);
+                pmetal_bridge::compat::ops::tanh(&logits.divide(&cap_arr)).multiply(&cap_arr)
+            }
+            _ => logits,
+        }
+    }
+
     /// Forward pass with optional KV cache.
     pub fn forward_with_cache(
         &mut self,
@@ -917,8 +940,7 @@ impl GemmaForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
-        // Gemma always ties embeddings
-        Ok(self.model.embed_tokens.as_linear(&hidden_states))
+        Ok(self.lm_head(&hidden_states))
     }
 
     /// Forward pass that records hidden states into a DFlash capture
@@ -933,7 +955,7 @@ impl GemmaForCausalLM {
         let hidden_states =
             self.model
                 .forward_with_capture(input_ids, mask, cache, Some(capture))?;
-        Ok(self.model.embed_tokens.as_linear(&hidden_states))
+        Ok(self.lm_head(&hidden_states))
     }
 
     /// Create a KV cache for this model.
@@ -1071,7 +1093,7 @@ impl GemmaForCausalLM {
             ));
         }
         let hidden = self.model.norm.forward(&hidden)?;
-        Ok(self.model.embed_tokens.as_linear(&hidden))
+        Ok(self.lm_head(&hidden))
     }
 }
 
