@@ -329,22 +329,20 @@ impl Llama4Router {
         // x: [total_tokens, hidden]
         let router_logits = Module::forward(&mut self.gate, x)?;
 
-        // Softmax over experts
-        let router_probs = ops::softmax_axis(&router_logits, -1);
-
-        // Top-k selection via argpartition — O(n) vs O(n log n) for argsort.
-        // argpartition places the k largest elements at the last k positions.
+        // Llama4 routing (HF Llama4TextMoe / mlx-lm `MoE`): pick the top-k
+        // experts by RAW logit, then gate with `sigmoid(logit)` — NOT a
+        // softmax. The previous softmax-then-renormalize collapsed the top-1
+        // weight to exactly 1.0 (softmax over a single selected logit is 1),
+        // throwing away the router signal entirely.
         let neg_k = -(self.top_k as i32);
-        let part_indices = ops::argpartition_axis(&router_probs, neg_k, -1);
+        let part_indices = ops::argpartition_axis(&router_logits, neg_k, -1);
         // Slice the last top_k entries: [total_tokens, top_k]
         let expert_indices = ops::slice_axis_from(&part_indices, -1, neg_k);
 
-        // Gather the corresponding probabilities for the selected experts.
-        let expert_weights = router_probs.take_along_axis(&expert_indices, -1);
-
-        // Normalize weights so they sum to 1 across the top_k dimension.
-        let weight_sum = expert_weights.sum_axis(-1, true);
-        let expert_weights = expert_weights.divide(&weight_sum);
+        // Gate weight = sigmoid of the selected RAW logits (per expert,
+        // independent — no cross-expert normalisation).
+        let selected_logits = router_logits.take_along_axis(&expert_indices, -1);
+        let expert_weights = ops::sigmoid(&selected_logits);
 
         Ok((expert_indices, expert_weights, router_logits))
     }
@@ -508,11 +506,14 @@ impl Llama4MoE {
             let idx_array = Array::from_slice(&token_indices, &[token_indices.len() as i32]);
             let weight_array = Array::from_slice(&weights, &[weights.len() as i32, 1]);
 
-            let expert_input = flat_x.take_axis(&idx_array, 0);
+            // Llama4 scales the expert *input* by the sigmoid gate
+            // (`experts(x * scores)`), not the output. The expert MLP is
+            // SwiGLU (nonlinear), so input- and output-scaling are NOT
+            // equivalent — the input must be scaled to match HF/mlx-lm.
+            let expert_input = flat_x.take_axis(&idx_array, 0).multiply(&weight_array);
             let expert_out = self.experts[expert_idx].forward(&expert_input)?;
-            let weighted_out = expert_out.multiply(&weight_array);
 
-            let updates = weighted_out.reshape(&[token_indices.len() as i32, 1, hidden_size]);
+            let updates = expert_out.reshape(&[token_indices.len() as i32, 1, hidden_size]);
             combined_out = pmetal_bridge::compat::indexing::scatter_add_single(
                 &combined_out,
                 &idx_array,
@@ -1187,8 +1188,22 @@ mod tests {
         let total_tokens = shape.iter().take(shape.len() - 1).product::<i32>();
         let flat_x = x.reshape(&[total_tokens, hidden_size]).unwrap();
 
-        let (expert_indices, expert_weights, _router_logits) = moe.router.forward(&flat_x).unwrap();
+        let (expert_indices, expert_weights, router_logits) = moe.router.forward(&flat_x).unwrap();
         let shared_out = moe.shared_expert.forward(&flat_x).unwrap();
+
+        // Router weights must be sigmoid(selected raw logits) — independent
+        // per expert, NOT softmax-normalized. Verify against a direct sigmoid
+        // of the gathered logits, and confirm the per-token weights do NOT sum
+        // to 1 (which the old softmax-renormalize path would have forced).
+        let mut sig_ref = ops::sigmoid(&router_logits.take_along_axis(&expert_indices, -1)).unwrap();
+        let mut weights_eval = expert_weights.clone();
+        sig_ref.eval().unwrap();
+        weights_eval.eval().unwrap();
+        let n = (total_tokens * config.num_experts_per_tok) as usize;
+        let w = weights_eval.to_f32_vec(n).unwrap();
+        let s = sig_ref.to_f32_vec(n).unwrap();
+        let max_w_diff = w.iter().zip(&s).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+        assert!(max_w_diff < 1e-5, "router weights must equal sigmoid(logits): {max_w_diff}");
 
         let mut reference = ops::zeros_dtype(&[total_tokens, hidden_size], flat_x.dtype()).unwrap();
         let top_k = config.num_experts_per_tok;
@@ -1199,6 +1214,9 @@ mod tests {
                 .unwrap();
             let slot_weights = expert_weights.index((.., slot..slot + 1));
 
+            // Naive path scales the expert INPUT by the gate (matches
+            // `experts(x * scores)`); unmasked tokens get a zero input and a
+            // zero output (the bias-free SwiGLU expert maps 0 → 0).
             let mut slot_out =
                 ops::zeros_dtype(&[total_tokens, hidden_size], flat_x.dtype()).unwrap();
             for (expert_idx, expert) in moe.experts.iter_mut().enumerate() {
@@ -1207,15 +1225,17 @@ mod tests {
                 let mask_f32 = mask
                     .as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32())
                     .unwrap();
-                let exp_output = expert.forward(&flat_x).unwrap();
-                let masked = exp_output
-                    .multiply(&mask_f32.reshape(&[total_tokens, 1]).unwrap())
+                let gate = mask_f32
+                    .reshape(&[total_tokens, 1])
+                    .unwrap()
+                    .multiply(&slot_weights)
                     .unwrap();
-                slot_out = slot_out.add(&masked).unwrap();
+                let scaled_input = flat_x.multiply(&gate).unwrap();
+                let exp_output = expert.forward(&scaled_input).unwrap();
+                slot_out = slot_out.add(&exp_output).unwrap();
             }
 
-            let weighted = slot_out.multiply(&slot_weights).unwrap();
-            reference = reference.add(&weighted).unwrap();
+            reference = reference.add(&slot_out).unwrap();
         }
 
         let reference = shared_out.add(&reference).unwrap().reshape(&shape).unwrap();
