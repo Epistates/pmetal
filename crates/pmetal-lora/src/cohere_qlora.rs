@@ -171,10 +171,11 @@ impl CohereQloraAttention {
         let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Apply RoPE BEFORE transpose — [B, S, H, D] matches apply_rope convention
+        // Cohere uses traditional (interleaved) RoPE — see CohereAttention.
         let q = pmetal_mlx::kernels::rope::apply_rope(
             &q,
             self.head_dim,
-            false,
+            true,
             self.rope_theta,
             1.0,
             0,
@@ -183,7 +184,7 @@ impl CohereQloraAttention {
         let k = pmetal_mlx::kernels::rope::apply_rope(
             &k,
             self.head_dim,
-            false,
+            true,
             self.rope_theta,
             1.0,
             0,
@@ -545,12 +546,14 @@ impl CohereQloraForCausalLM {
     /// Forward pass producing logits `[B, S, vocab_size]`.
     pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         let hidden = self.model.forward(input_ids, mask)?;
-        if let Some(ref mut head) = self.lm_head {
-            Ok(Module::forward(head, &hidden).map_err(LoraError::Mlx)?)
+        let logits = if let Some(ref mut head) = self.lm_head {
+            Module::forward(head, &hidden).map_err(LoraError::Mlx)?
         } else {
             // Tied embeddings: embed_tokens.weight is the LM head transposed
-            Ok(self.model.embed_tokens.as_linear(&hidden))
-        }
+            self.model.embed_tokens.as_linear(&hidden)
+        };
+        // Cohere scales LM-head logits by `logit_scale` (0.0625 for Command-R).
+        Ok(logits.multiply(&Array::from_f32(self.model.config.logit_scale)))
     }
 
     // -------------------------------------------------------------------------
@@ -1054,6 +1057,7 @@ mod tests {
             max_position_embeddings: 128,
             rope_theta: 10000.0,
             layer_norm_eps: 1e-5,
+            logit_scale: 0.0625,
             tie_word_embeddings: false,
             use_sliding_window: true,
             sliding_window: 64,

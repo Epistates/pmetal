@@ -978,6 +978,7 @@ fn tiny_cohere_config() -> CohereConfig {
         max_position_embeddings: 64,
         rope_theta: 10000.0,
         layer_norm_eps: 1e-5,
+        logit_scale: 0.0625,
         tie_word_embeddings: false,
         use_sliding_window: false,
         sliding_window: 4096,

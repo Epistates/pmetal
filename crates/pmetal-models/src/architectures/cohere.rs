@@ -35,6 +35,11 @@ pub struct CohereConfig {
     pub max_position_embeddings: i32,
     pub rope_theta: f32,
     pub layer_norm_eps: f32,
+    /// Output logit scaling factor. Cohere multiplies the LM-head logits by
+    /// this (HF `CohereForCausalLM` / mlx-lm `Model.__call__`:
+    /// `out = out * logit_scale`). Command-R family ships `0.0625`.
+    #[serde(default = "default_logit_scale")]
+    pub logit_scale: f32,
     #[serde(default)]
     pub tie_word_embeddings: bool,
     /// Use sliding window attention for certain layers.
@@ -53,6 +58,10 @@ fn default_sliding_window() -> i32 {
     4096
 }
 
+fn default_logit_scale() -> f32 {
+    0.0625
+}
+
 impl Default for CohereConfig {
     fn default() -> Self {
         // Default for Command R 35B
@@ -67,7 +76,8 @@ impl Default for CohereConfig {
             max_position_embeddings: 131072,
             rope_theta: 10000.0,
             layer_norm_eps: 1e-5,
-            tie_word_embeddings: false,
+            logit_scale: 0.0625,
+            tie_word_embeddings: true,
             use_sliding_window: true,
             sliding_window: 4096,
             global_attention_layers: None,
@@ -299,9 +309,13 @@ impl CohereAttention {
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
 
+        // Cohere uses *traditional* (interleaved) RoPE — HF `CohereRotaryEmbedding`
+        // rotates adjacent pairs, and mlx-lm builds `nn.RoPE(..., traditional=True)`.
+        // The split-half (`traditional=false`) form rotates the wrong element
+        // pairs and silently corrupts every attention score.
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-        let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, offset)?;
+        let q = apply_rope(&q, self.head_dim, true, self.rope_theta, 1.0, offset)?;
+        let k = apply_rope(&k, self.head_dim, true, self.rope_theta, 1.0, offset)?;
 
         let (k, v) = if let Some((cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &k, &v)?
@@ -462,15 +476,25 @@ pub struct CohereForCausalLM {
     pub config: CohereConfig,
 
     pub model: CohereModel,
-    pub lm_head: nn::Linear,
+    /// None when `tie_word_embeddings` is true — Cohere ships tied weights,
+    /// so the LM head reuses `embed_tokens` transposed. A separate `lm_head`
+    /// would never load (no `lm_head.weight` in the checkpoint) and emit
+    /// random logits.
+    pub lm_head: Option<nn::Linear>,
 }
 impl_module_params!(CohereForCausalLM; model, lm_head);
 
 impl CohereForCausalLM {
     pub fn new(config: CohereConfig) -> Result<Self, Exception> {
-        let lm_head = nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
-            .bias(false)
-            .build()?;
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
+                    .bias(false)
+                    .build()?,
+            )
+        };
 
         let model = CohereModel::new(config.clone())?;
 
@@ -481,6 +505,16 @@ impl CohereForCausalLM {
         })
     }
 
+    /// Apply the LM head (tied or untied) and Cohere's output `logit_scale`.
+    fn lm_head_forward(&mut self, h: &Array) -> Result<Array, Exception> {
+        let logits = if let Some(ref mut lm_head) = self.lm_head {
+            Module::forward(lm_head, h)?
+        } else {
+            self.model.embed_tokens.as_linear(h)
+        };
+        Ok(logits.multiply(&Array::from_f32(self.config.logit_scale)))
+    }
+
     pub fn forward(
         &mut self,
         input_ids: &Array,
@@ -488,7 +522,7 @@ impl CohereForCausalLM {
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward(input_ids, mask, position_ids)?;
-        Module::forward(&mut self.lm_head, &hidden_states)
+        self.lm_head_forward(&hidden_states)
     }
 
     /// Forward pass with optional KV cache for incremental decoding.
@@ -499,7 +533,7 @@ impl CohereForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
-        Module::forward(&mut self.lm_head, &hidden_states)
+        self.lm_head_forward(&hidden_states)
     }
 
     /// Create a fresh KV cache sized for this model.
@@ -538,7 +572,8 @@ impl CohereForCausalLM {
             cfg.head_dim,
             cfg.rope_theta,
             1.0,
-        );
+        )
+        .with_rope_traditional(true);
 
         let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?;
         for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
@@ -559,7 +594,7 @@ impl CohereForCausalLM {
             )?;
         }
         let hidden = Module::forward(&mut self.model.norm, &hidden)?;
-        Module::forward(&mut self.lm_head, &hidden)
+        self.lm_head_forward(&hidden)
     }
 }
 

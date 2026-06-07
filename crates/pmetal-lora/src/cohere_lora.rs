@@ -145,8 +145,8 @@ impl CohereLoraAttention {
         let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
         // Apply RoPE BEFORE transpose — Cohere applies rope in [B, S, H, D] layout
-        let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, 0)?;
-        let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, 0)?;
+        let q = apply_rope(&q, self.head_dim, true, self.rope_theta, 1.0, 0)?;
+        let k = apply_rope(&k, self.head_dim, true, self.rope_theta, 1.0, 0)?;
 
         // Transpose to [B, H, S, D]
         let q = q.transpose_axes(&[0, 2, 1, 3]);
@@ -203,12 +203,12 @@ impl CohereLoraAttention {
         // Apply RoPE BEFORE transpose (with cache offset)
         let (q, k) = if let Some((ref cache_ref, _)) = cache {
             let offset = cache_ref.rope_offset();
-            let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-            let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, offset)?;
+            let q = apply_rope(&q, self.head_dim, true, self.rope_theta, 1.0, offset)?;
+            let k = apply_rope(&k, self.head_dim, true, self.rope_theta, 1.0, offset)?;
             (q, k)
         } else {
-            let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, 0)?;
-            let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, 0)?;
+            let q = apply_rope(&q, self.head_dim, true, self.rope_theta, 1.0, 0)?;
+            let k = apply_rope(&k, self.head_dim, true, self.rope_theta, 1.0, 0)?;
             (q, k)
         };
 
@@ -697,11 +697,14 @@ impl CohereLoraForCausalLM {
     }
 
     fn compute_logits(&mut self, hidden: &Array) -> Result<Array, LoraError> {
-        if let Some(ref mut head) = self.lm_head {
-            Ok(Module::forward(head, hidden)?)
+        let logits = if let Some(ref mut head) = self.lm_head {
+            Module::forward(head, hidden)?
         } else {
-            Ok(self.model.embed_tokens.as_linear(hidden))
-        }
+            self.model.embed_tokens.as_linear(hidden)
+        };
+        // Cohere scales the LM-head logits by `logit_scale` (0.0625 for the
+        // Command-R family). Applies to both training and inference.
+        Ok(logits.multiply(&Array::from_f32(self.model.config.logit_scale)))
     }
 
     pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
@@ -1236,6 +1239,7 @@ mod tests {
             max_position_embeddings: 256,
             rope_theta: 10000.0,
             layer_norm_eps: 1e-5,
+            logit_scale: 0.0625,
             tie_word_embeddings: false,
             use_sliding_window: false,
             sliding_window: 4096,
