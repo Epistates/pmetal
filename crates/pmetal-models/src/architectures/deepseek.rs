@@ -300,7 +300,7 @@ impl DeepSeekAttention {
         let q_pe = apply_rope(
             q_pe,
             self.config.qk_rope_head_dim,
-            false,
+            true, // DeepSeek MLA uses traditional (interleaved) RoPE
             self.config.rope_theta,
             1.0,
             offset,
@@ -308,7 +308,7 @@ impl DeepSeekAttention {
         let k_pe = apply_rope(
             k_pe,
             self.config.qk_rope_head_dim,
-            false,
+            true, // DeepSeek MLA uses traditional (interleaved) RoPE
             self.config.rope_theta,
             1.0,
             offset,

@@ -1,0 +1,12 @@
+{
+  "hidden_size": 128,
+  "kv_lora_rank": 32,
+  "num_attention_heads": 4,
+  "q_lora_rank": 48,
+  "qk_nope_head_dim": 16,
+  "qk_rope_head_dim": 16,
+  "rope_theta": 10000.0,
+  "scale": 0.1767766952966369,
+  "seq": 6,
+  "v_head_dim": 24
+}
