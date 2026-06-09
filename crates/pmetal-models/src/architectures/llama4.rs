@@ -187,9 +187,10 @@ impl Llama4TextConfig {
         if let Some(ref moe_layers) = self.moe_layers {
             moe_layers.contains(&layer_idx)
         } else {
-            // All layers are MoE when interleave_moe_layer_step == 1
-            // Otherwise, MoE layers are those where layer_idx % step == 0
-            layer_idx % self.interleave_moe_layer_step == 0
+            // The LAST layer in each interleave group is MoE (HF default
+            // `moe_layers = range(step-1, n, step)`, mlx-lm `idx % step == step-1`).
+            // For step == 1 every layer is MoE; for step == 2 the odd layers are.
+            layer_idx % self.interleave_moe_layer_step == self.interleave_moe_layer_step - 1
         }
     }
 
@@ -214,8 +215,10 @@ impl Llama4TextConfig {
                 return no_rope_layers[layer_idx as usize] == 1;
             }
         }
-        // NoPE every no_rope_layer_interval layers
-        layer_idx % self.no_rope_layer_interval != 0
+        // NoPE every no_rope_layer_interval layers. mlx-lm / HF use the 1-based
+        // index `(layer_idx + 1) % interval != 0`, so NoPE lands on layers
+        // 3, 7, 11, ... (not 0, 4, 8, ...).
+        (layer_idx + 1) % self.no_rope_layer_interval != 0
     }
 }
 
@@ -578,25 +581,20 @@ impl Llama4Attention {
             .bias(false)
             .build()?;
 
-        // QK norm (if enabled)
-        let (q_norm, k_norm) = if config.use_qk_norm {
+        let uses_rope = config.uses_rope(layer_idx as i32);
+
+        // QK norm: weightless RMS norm (eps 1e-6) applied AFTER RoPE, and only on
+        // RoPE layers (mlx-lm: `use_qk_norm = args.use_qk_norm and self.use_rope`).
+        // The RmsNorm weight stays at its default ones, so it is numerically
+        // identical to `mx.fast.rms_norm(x, weight=None, eps=1e-6)`.
+        let (q_norm, k_norm) = if config.use_qk_norm && uses_rope {
             (
-                Some(
-                    nn::RmsNormBuilder::new(head_dim)
-                        .eps(config.rms_norm_eps)
-                        .build()?,
-                ),
-                Some(
-                    nn::RmsNormBuilder::new(head_dim)
-                        .eps(config.rms_norm_eps)
-                        .build()?,
-                ),
+                Some(nn::RmsNormBuilder::new(head_dim).eps(1e-6).build()?),
+                Some(nn::RmsNormBuilder::new(head_dim).eps(1e-6).build()?),
             )
         } else {
             (None, None)
         };
-
-        let uses_rope = config.uses_rope(layer_idx as i32);
 
         Ok(Self {
             layer_idx,
@@ -637,12 +635,6 @@ impl Llama4Attention {
         k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
-        // QK normalization (applied before RoPE)
-        if let (Some(qn), Some(kn)) = (&mut self.q_norm, &mut self.k_norm) {
-            q = Module::forward(qn, &q)?;
-            k = Module::forward(kn, &k)?;
-        }
-
         // Apply RoPE if this is a RoPE layer (not NoPE)
         if self.uses_rope {
             if let Some(pos_ids) = position_ids {
@@ -657,6 +649,13 @@ impl Llama4Attention {
             }
         }
         // NoPE layers: no positional encoding applied
+
+        // QK normalization: weightless RMS norm applied AFTER RoPE, only on RoPE
+        // layers (q_norm/k_norm are None on NoPE layers per construction).
+        if let (Some(qn), Some(kn)) = (&mut self.q_norm, &mut self.k_norm) {
+            q = Module::forward(qn, &q)?;
+            k = Module::forward(kn, &k)?;
+        }
 
         // Transpose for attention: [B, n_heads, seq, head_dim]
         let q = q.transpose_axes(&[0, 2, 1, 3]);
@@ -743,7 +742,7 @@ impl Llama4Attention {
         let result = rope_apply(
             &x_t,
             self.head_dim,
-            false,
+            true, // Llama 4 uses traditional (interleaved) RoPE
             self.rope_theta,
             self.rope_scale,
             0,
@@ -1133,22 +1132,24 @@ mod tests {
 
         let maverick = Llama4TextConfig::maverick();
 
-        // Maverick: even layers are MoE
-        assert!(maverick.is_moe_layer(0));
-        assert!(!maverick.is_moe_layer(1));
-        assert!(maverick.is_moe_layer(2));
+        // Maverick (step=2): the LAST layer of each pair is MoE -> odd layers.
+        assert!(!maverick.is_moe_layer(0));
+        assert!(maverick.is_moe_layer(1));
+        assert!(!maverick.is_moe_layer(2));
+        assert!(maverick.is_moe_layer(3));
     }
 
     #[test]
     fn test_llama4_config_irope() {
         let config = Llama4TextConfig::default();
 
-        // NoPE every 4th layer (layers 0, 4, 8, ...)
-        assert!(!config.uses_rope(0)); // NoPE
+        // NoPE on layers where (idx + 1) % 4 == 0, i.e. layers 3, 7, 11, ...
+        assert!(config.uses_rope(0)); // RoPE
         assert!(config.uses_rope(1)); // RoPE
         assert!(config.uses_rope(2)); // RoPE
-        assert!(config.uses_rope(3)); // RoPE
-        assert!(!config.uses_rope(4)); // NoPE
+        assert!(!config.uses_rope(3)); // NoPE
+        assert!(config.uses_rope(4)); // RoPE
+        assert!(!config.uses_rope(7)); // NoPE
     }
 
     #[test]

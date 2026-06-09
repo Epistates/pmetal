@@ -1,0 +1,21 @@
+{
+  "head_dim": 32,
+  "hidden": 128,
+  "layers": {
+    "0": {
+      "attn_temperature_tuning": true,
+      "use_qk_norm": true,
+      "use_rope": true
+    },
+    "3": {
+      "attn_temperature_tuning": true,
+      "use_qk_norm": false,
+      "use_rope": false
+    }
+  },
+  "n_heads": 4,
+  "n_kv_heads": 2,
+  "rms_norm_eps": 1e-05,
+  "rope_theta": 10000.0,
+  "seq": 6
+}

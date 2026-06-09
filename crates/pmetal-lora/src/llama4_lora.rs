@@ -147,27 +147,19 @@ impl Llama4LoraAttention {
             use_dora,
         )?;
 
-        // QK norms — frozen, sizes are [head_dim].
-        let (q_norm, k_norm) = if config.use_qk_norm {
+        let uses_rope = config.uses_rope(layer_idx as i32);
+
+        // QK norms — weightless RMS norm (eps 1e-6), applied AFTER RoPE and only
+        // on RoPE layers (mlx-lm: `use_qk_norm = args.use_qk_norm and use_rope`).
+        // Weight stays at default ones == `mx.fast.rms_norm(x, None, eps=1e-6)`.
+        let (q_norm, k_norm) = if config.use_qk_norm && uses_rope {
             (
-                Some(
-                    nn::RmsNormBuilder::new(head_dim)
-                        .eps(config.rms_norm_eps)
-                        .build()
-                        .unwrap(),
-                ),
-                Some(
-                    nn::RmsNormBuilder::new(head_dim)
-                        .eps(config.rms_norm_eps)
-                        .build()
-                        .unwrap(),
-                ),
+                Some(nn::RmsNormBuilder::new(head_dim).eps(1e-6).build().unwrap()),
+                Some(nn::RmsNormBuilder::new(head_dim).eps(1e-6).build().unwrap()),
             )
         } else {
             (None, None)
         };
-
-        let uses_rope = config.uses_rope(layer_idx as i32);
 
         Ok(Self {
             layer_idx,
@@ -200,7 +192,7 @@ impl Llama4LoraAttention {
         let result = apply_rope(
             &x_t,
             self.head_dim,
-            false,
+            true, // Llama 4 uses traditional (interleaved) RoPE
             self.rope_theta,
             self.rope_scale,
             offset,
@@ -224,16 +216,16 @@ impl Llama4LoraAttention {
         k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
-        // QK normalisation (applied before RoPE, matching base model order).
-        if let (Some(qn), Some(kn)) = (&mut self.q_norm, &mut self.k_norm) {
-            q = pmetal_bridge::compat::Module::forward(qn, &q)?;
-            k = pmetal_bridge::compat::Module::forward(kn, &k)?;
-        }
-
         // Apply RoPE only for RoPE layers; NoPE layers skip positional encoding.
         if self.uses_rope {
             q = self.apply_rope_bhd(&q, 0)?;
             k = self.apply_rope_bhd(&k, 0)?;
+        }
+
+        // QK normalisation (weightless, applied AFTER RoPE on RoPE layers only).
+        if let (Some(qn), Some(kn)) = (&mut self.q_norm, &mut self.k_norm) {
+            q = pmetal_bridge::compat::Module::forward(qn, &q)?;
+            k = pmetal_bridge::compat::Module::forward(kn, &k)?;
         }
 
         // [B, T, H, D] -> [B, H, T, D]
@@ -292,11 +284,6 @@ impl Llama4LoraAttention {
         k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
-        if let (Some(qn), Some(kn)) = (&mut self.q_norm, &mut self.k_norm) {
-            q = pmetal_bridge::compat::Module::forward(qn, &q)?;
-            k = pmetal_bridge::compat::Module::forward(kn, &k)?;
-        }
-
         // Determine RoPE offset from cache and apply positional encoding.
         if self.uses_rope {
             let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
@@ -306,7 +293,7 @@ impl Llama4LoraAttention {
             let q_r = apply_rope(
                 &q_t,
                 self.head_dim,
-                false,
+                true, // Llama 4 uses traditional (interleaved) RoPE
                 self.rope_theta,
                 self.rope_scale,
                 offset,
@@ -315,7 +302,7 @@ impl Llama4LoraAttention {
             let k_r = apply_rope(
                 &k_t,
                 self.head_dim,
-                false,
+                true, // Llama 4 uses traditional (interleaved) RoPE
                 self.rope_theta,
                 self.rope_scale,
                 offset,
@@ -323,6 +310,12 @@ impl Llama4LoraAttention {
             .map_err(LoraError::Mlx)?;
             q = q_r.transpose_axes(&[0, 2, 1, 3]);
             k = k_r.transpose_axes(&[0, 2, 1, 3]);
+        }
+
+        // QK normalisation (weightless, applied AFTER RoPE on RoPE layers only).
+        if let (Some(qn), Some(kn)) = (&mut self.q_norm, &mut self.k_norm) {
+            q = pmetal_bridge::compat::Module::forward(qn, &q)?;
+            k = pmetal_bridge::compat::Module::forward(kn, &k)?;
         }
 
         // Transpose to [B, H, T, D] before cache update (cache expects this layout).

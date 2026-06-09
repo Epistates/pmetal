@@ -143,12 +143,6 @@ impl Llama4QloraAttention {
         k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
         let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
 
-        // QK normalisation (before RoPE).
-        if let (Some(qn), Some(kn)) = (&mut self.q_norm, &mut self.k_norm) {
-            q = Module::forward(qn, &q)?;
-            k = Module::forward(kn, &k)?;
-        }
-
         // RoPE: need [B, H, T, D] layout.
         if self.uses_rope {
             let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
@@ -157,7 +151,7 @@ impl Llama4QloraAttention {
             let q_r = apply_rope(
                 &q_t,
                 self.head_dim,
-                false,
+                true, // Llama 4 uses traditional (interleaved) RoPE
                 self.rope_theta,
                 self.rope_scale,
                 offset,
@@ -166,7 +160,7 @@ impl Llama4QloraAttention {
             let k_r = apply_rope(
                 &k_t,
                 self.head_dim,
-                false,
+                true, // Llama 4 uses traditional (interleaved) RoPE
                 self.rope_theta,
                 self.rope_scale,
                 offset,
@@ -174,6 +168,12 @@ impl Llama4QloraAttention {
             .map_err(LoraError::Mlx)?;
             q = q_r.transpose_axes(&[0, 2, 1, 3]);
             k = k_r.transpose_axes(&[0, 2, 1, 3]);
+        }
+
+        // QK normalisation (weightless, applied AFTER RoPE on RoPE layers only).
+        if let (Some(qn), Some(kn)) = (&mut self.q_norm, &mut self.k_norm) {
+            q = Module::forward(qn, &q)?;
+            k = Module::forward(kn, &k)?;
         }
 
         // [B, T, H, D] -> [B, H, T, D]
