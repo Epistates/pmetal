@@ -603,6 +603,8 @@ pub struct DeepSeekMoEGate {
     pub num_experts: i32,
     pub routed_scaling_factor: f32,
     pub norm_topk_prob: bool,
+    pub n_group: i32,
+    pub topk_group: i32,
 }
 impl_module_params!(DeepSeekMoEGate; weight);
 
@@ -618,6 +620,8 @@ impl DeepSeekMoEGate {
             num_experts,
             routed_scaling_factor: config.routed_scaling_factor,
             norm_topk_prob: config.norm_topk_prob,
+            n_group: config.n_group,
+            topk_group: config.topk_group,
         })
     }
     pub fn forward(&mut self, x: &Array) -> Result<(Array, Array)> {
@@ -641,6 +645,8 @@ impl DeepSeekMoEGate {
             self.top_k,
             self.norm_topk_prob,
             self.routed_scaling_factor,
+            self.n_group,
+            self.topk_group,
         )
     }
 }

@@ -113,6 +113,8 @@ pub fn noaux_tc_topk(
     top_k: i32,
     norm_topk_prob: bool,
     routed_scaling_factor: f32,
+    n_group: i32,
+    topk_group: i32,
 ) -> Result<(Array, Array), Exception> {
     if top_k <= 0 {
         return Err(Exception::custom(format!(
@@ -121,8 +123,40 @@ pub fn noaux_tc_topk(
     }
     let neg_k = -top_k;
 
-    // Select top-k from bias-corrected scores …
-    let scores_with_bias = scores.add(e_score_correction_bias);
+    // Bias-corrected scores drive expert *selection* (weights are gathered from
+    // the raw scores below).
+    let mut scores_with_bias = scores.add(e_score_correction_bias);
+
+    // Group-limited expert selection (DeepSeek-V3, arxiv:2412.19437 §2.1.2):
+    // restrict candidates to the `topk_group` highest-scoring of `n_group`
+    // expert groups before the global top-k. A group's score is the sum of its
+    // top-2 expert scores; the bottom `n_group - topk_group` groups are zeroed
+    // out so their experts can never win the top-k. Mirrors mlx-lm
+    // `group_expert_select`.
+    if n_group > 1 {
+        let dims = scores_with_bias.shape().to_vec();
+        let n = dims[0];
+        let num_experts = *dims.last().unwrap();
+        let per_group = num_experts / n_group;
+        let grouped = scores_with_bias.reshape(&[n, n_group, per_group]);
+
+        // group_scores = sum of the top-2 experts per group -> [N, n_group, 1].
+        let part = ops::argpartition_axis(&grouped, -2, -1);
+        let top2_idx = ops::slice_last_from(&part, -2);
+        let top2_vals = grouped.take_along_axis(&top2_idx, -1);
+        let group_scores = ops::sum_axis(&top2_vals, -1, true);
+
+        // Indices of the `n_group - topk_group` LOWEST groups, masked to 0.
+        let drop = n_group - topk_group;
+        let g_part = ops::argpartition_axis(&group_scores, drop - 1, -2);
+        let group_idx = ops::slice_axis(&g_part, -2, 0, drop);
+        let group_idx = ops::broadcast_to(&group_idx, &[n, drop, per_group]);
+        let zeros = ops::zeros_dtype(&[n, drop, per_group], grouped.dtype());
+        let masked = ops::put_along_axis(&grouped, &group_idx, &zeros, -2);
+        scores_with_bias = ops::flatten(&masked, -2, -1);
+    }
+
+    // Select top-k from the (group-masked) bias-corrected scores …
     let part_indices = ops::argpartition_axis(&scores_with_bias, neg_k, -1);
     let top_indices = ops::slice_last_from(&part_indices, neg_k).as_type::<i32>();
 
@@ -260,7 +294,7 @@ mod tests {
         let scores = Array::from_slice(&[0.2, 0.3, 0.1, 0.4], &[1, 4]);
         let bias = Array::from_slice(&[10.0, 0.0, 0.0, 0.0], &[4]);
 
-        let (_, weights) = noaux_tc_topk(&scores, &bias, 2, false, 1.0).unwrap();
+        let (_, weights) = noaux_tc_topk(&scores, &bias, 2, false, 1.0, 1, 1).unwrap();
         let mut w = weights.clone();
         let sel = w.to_f32_vec(2).unwrap();
         let sum: f32 = sel.iter().sum();
@@ -275,7 +309,7 @@ mod tests {
         let scores = Array::from_slice(&[0.2, 0.3, 0.1, 0.4], &[1, 4]);
         let bias = Array::from_slice(&[0.0, 0.0, 0.0, 0.0], &[4]);
 
-        let (_, weights) = noaux_tc_topk(&scores, &bias, 2, false, 2.5).unwrap();
+        let (_, weights) = noaux_tc_topk(&scores, &bias, 2, false, 2.5, 1, 1).unwrap();
         let mut w = weights.clone();
         let sel = w.to_f32_vec(2).unwrap();
         let sum: f32 = sel.iter().sum();
@@ -292,7 +326,7 @@ mod tests {
         let bias = Array::from_slice(&[0.0, 0.0, 0.0, 0.0], &[4]);
 
         // norm_topk_prob=true but top_k=1 → no normalisation per DeepSeek.
-        let (_, weights) = noaux_tc_topk(&scores, &bias, 1, true, 1.0).unwrap();
+        let (_, weights) = noaux_tc_topk(&scores, &bias, 1, true, 1.0, 1, 1).unwrap();
         let mut w = weights.clone();
         let sel = w.to_f32_vec(1).unwrap();
         // Single weight should be the raw 0.4 (top), not 1.0.
@@ -307,7 +341,7 @@ mod tests {
     fn noaux_tc_rejects_nonpositive_top_k() {
         let scores = Array::from_slice(&[0.1, 0.2], &[1, 2]);
         let bias = Array::from_slice(&[0.0, 0.0], &[2]);
-        assert!(noaux_tc_topk(&scores, &bias, 0, false, 1.0).is_err());
-        assert!(noaux_tc_topk(&scores, &bias, -1, true, 1.0).is_err());
+        assert!(noaux_tc_topk(&scores, &bias, 0, false, 1.0, 1, 1).is_err());
+        assert!(noaux_tc_topk(&scores, &bias, -1, true, 1.0, 1, 1).is_err());
     }
 }

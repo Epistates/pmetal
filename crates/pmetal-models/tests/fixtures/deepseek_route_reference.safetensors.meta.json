@@ -1,0 +1,9 @@
+{
+  "n_group": 4,
+  "n_tokens": 5,
+  "norm_topk_prob": true,
+  "num_experts": 16,
+  "routed_scaling_factor": 1.5,
+  "top_k": 4,
+  "topk_group": 2
+}
