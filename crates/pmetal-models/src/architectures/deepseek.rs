@@ -17,7 +17,10 @@ use pmetal_bridge::compat::{
 };
 use pmetal_bridge::impl_module_params;
 use pmetal_mlx::Builder;
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig,
+    rope::{apply_rope, apply_rope_with_freqs},
+};
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
 use serde::{Deserialize, Serialize};
@@ -194,6 +197,110 @@ fn default_true() -> bool {
     true
 }
 
+// ── DeepSeek YARN RoPE helpers (mirror mlx-lm DeepseekV2YarnRotaryEmbedding) ──
+
+/// YARN attention/length scale: `0.1 * mscale * ln(scale) + 1` (1.0 for scale ≤ 1).
+fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
+    if scale <= 1.0 {
+        1.0
+    } else {
+        0.1 * mscale * scale.ln() + 1.0
+    }
+}
+
+fn yarn_find_correction_dim(num_rotations: f32, dim: i32, base: f32, max_pos: i32) -> f32 {
+    (dim as f32 * (max_pos as f32 / (num_rotations * 2.0 * std::f32::consts::PI)).ln())
+        / (2.0 * base.ln())
+}
+
+fn yarn_find_correction_range(
+    low_rot: f32,
+    high_rot: f32,
+    dim: i32,
+    base: f32,
+    max_pos: i32,
+) -> (f32, f32) {
+    let low = yarn_find_correction_dim(low_rot, dim, base, max_pos).floor();
+    let high = yarn_find_correction_dim(high_rot, dim, base, max_pos).ceil();
+    (low.max(0.0), high.min((dim - 1) as f32))
+}
+
+/// Precomputed YARN rotary state: per-dimension inverse frequencies (consumed by
+/// `apply_rope_with_freqs`) plus the embedding mscale applied to q/k before
+/// rotation.
+#[derive(Debug, Clone)]
+struct YarnRope {
+    inv_freq: Array,
+    mscale: f32,
+}
+
+/// Build the YARN per-dimension inverse frequencies and embedding mscale.
+/// `scaling_factor == 1` collapses to standard RoPE (freq_inter == freq_extra).
+#[allow(clippy::too_many_arguments)]
+fn build_yarn_rope(
+    dim: i32,
+    base: f32,
+    scaling_factor: f32,
+    original_max_pos: i32,
+    beta_fast: f32,
+    beta_slow: f32,
+    mscale: f32,
+    mscale_all_dim: f32,
+) -> YarnRope {
+    let half = (dim / 2) as usize;
+    let (low, high) = yarn_find_correction_range(beta_fast, beta_slow, dim, base, original_max_pos);
+    let denom = if (high - low).abs() < f32::EPSILON {
+        0.001 // prevent singularity (mlx yarn_linear_ramp_mask)
+    } else {
+        high - low
+    };
+    let mut inv_freq = Vec::with_capacity(half);
+    for i in 0..half {
+        let exponent = (2 * i) as f32 / dim as f32;
+        let freq_extra = base.powf(exponent);
+        let freq_inter = scaling_factor * freq_extra;
+        let ramp = (((i as f32) - low) / denom).clamp(0.0, 1.0);
+        let freq_mask = 1.0 - ramp;
+        let freqs =
+            (freq_inter * freq_extra) / (freq_inter * freq_mask + freq_extra * (1.0 - freq_mask));
+        inv_freq.push(1.0 / freqs);
+    }
+    let emb_mscale =
+        yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(scaling_factor, mscale_all_dim);
+    YarnRope {
+        inv_freq: Array::from_slice(&inv_freq, &[half as i32]),
+        mscale: emb_mscale,
+    }
+}
+
+/// Parse a DeepSeek `rope_scaling` JSON block into YARN params, with mlx-lm
+/// defaults. Returns `None` if no block is configured.
+fn parse_yarn_scaling(rope_scaling: &Option<serde_json::Value>) -> Option<YarnScaling> {
+    let rs = rope_scaling.as_ref()?;
+    let get = |k: &str, default: f32| rs.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(default);
+    Some(YarnScaling {
+        factor: get("factor", 1.0),
+        original_max_pos: rs
+            .get("original_max_position_embeddings")
+            .and_then(|v| v.as_i64())
+            .map(|v| v as i32)
+            .unwrap_or(4096),
+        beta_fast: get("beta_fast", 32.0),
+        beta_slow: get("beta_slow", 1.0),
+        mscale: get("mscale", 1.0),
+        mscale_all_dim: get("mscale_all_dim", 0.0),
+    })
+}
+
+struct YarnScaling {
+    factor: f32,
+    original_max_pos: i32,
+    beta_fast: f32,
+    beta_slow: f32,
+    mscale: f32,
+    mscale_all_dim: f32,
+}
+
 #[derive(Debug)]
 pub struct DeepSeekAttention {
     pub config: DeepSeekConfig,
@@ -208,6 +315,9 @@ pub struct DeepSeekAttention {
     pub kv_a_layernorm: nn::RmsNorm,
     pub kv_b_proj: nn::Linear,
     pub o_proj: nn::Linear,
+    /// Precomputed YARN rotary state; `None` when no `rope_scaling` is configured
+    /// (plain traditional RoPE).
+    yarn_rope: Option<YarnRope>,
 }
 impl_module_params!(DeepSeekAttention; q_a_proj, q_a_layernorm, q_b_proj, q_proj, kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj, o_proj);
 
@@ -216,7 +326,27 @@ impl DeepSeekAttention {
         let hidden_size = config.hidden_size;
         let n_heads = config.num_attention_heads;
         let q_head_dim = config.q_head_dim();
-        let scale = (q_head_dim as f32).powf(-0.5);
+        let mut scale = (q_head_dim as f32).powf(-0.5);
+
+        // YARN: when rope_scaling is present, precompute per-dim inverse
+        // frequencies + embedding mscale, and fold mscale² into the softmax
+        // scale (mlx-lm DeepseekV2Attention).
+        let yarn_rope = parse_yarn_scaling(&config.rope_scaling).map(|y| {
+            if y.mscale_all_dim != 0.0 {
+                let s = yarn_get_mscale(y.factor, y.mscale_all_dim);
+                scale *= s * s;
+            }
+            build_yarn_rope(
+                config.qk_rope_head_dim,
+                config.rope_theta,
+                y.factor,
+                y.original_max_pos,
+                y.beta_fast,
+                y.beta_slow,
+                y.mscale,
+                y.mscale_all_dim,
+            )
+        });
         let (q_a_proj, q_a_layernorm, q_b_proj, q_proj) =
             if let Some(q_lora_rank) = config.q_lora_rank {
                 let q_a = nn::LinearBuilder::new(hidden_size, q_lora_rank)
@@ -262,6 +392,7 @@ impl DeepSeekAttention {
             kv_a_layernorm,
             kv_b_proj,
             o_proj,
+            yarn_rope,
         })
     }
     fn project_qkv_uncached(&mut self, x: &Array, offset: i32) -> Result<(Array, Array, Array)> {
@@ -297,22 +428,27 @@ impl DeepSeekAttention {
         let kv_split = ops::split_sections(&kv, &[self.config.qk_nope_head_dim as i32], -1);
         let k_nope = &kv_split[0];
         let values = &kv_split[1];
-        let q_pe = apply_rope(
-            q_pe,
-            self.config.qk_rope_head_dim,
-            true, // DeepSeek MLA uses traditional (interleaved) RoPE
-            self.config.rope_theta,
-            1.0,
-            offset,
-        )?;
-        let k_pe = apply_rope(
-            k_pe,
-            self.config.qk_rope_head_dim,
-            true, // DeepSeek MLA uses traditional (interleaved) RoPE
-            self.config.rope_theta,
-            1.0,
-            offset,
-        )?;
+        // DeepSeek MLA uses traditional (interleaved) RoPE. With rope_scaling
+        // configured, apply YARN per-dim frequencies + embedding mscale; without
+        // it, plain RoPE at rope_theta.
+        let rope_dim = self.config.qk_rope_head_dim;
+        let (q_pe, k_pe) = if let Some(yarn) = &self.yarn_rope {
+            let (q_in, k_in) = if yarn.mscale != 1.0 {
+                let m = Array::from_f32(yarn.mscale);
+                (q_pe.multiply(&m), k_pe.multiply(&m))
+            } else {
+                (q_pe.clone(), k_pe.clone())
+            };
+            (
+                apply_rope_with_freqs(&q_in, &yarn.inv_freq, rope_dim, true, offset)?,
+                apply_rope_with_freqs(&k_in, &yarn.inv_freq, rope_dim, true, offset)?,
+            )
+        } else {
+            (
+                apply_rope(q_pe, rope_dim, true, self.config.rope_theta, 1.0, offset)?,
+                apply_rope(k_pe, rope_dim, true, self.config.rope_theta, 1.0, offset)?,
+            )
+        };
         let k_pe_repeated = pmetal_bridge::compat::ops::broadcast_to(
             &k_pe,
             &[batch, self.n_heads, seq_len, self.config.qk_rope_head_dim],

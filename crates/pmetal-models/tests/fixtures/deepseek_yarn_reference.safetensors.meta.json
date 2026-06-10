@@ -1,0 +1,29 @@
+{
+  "cases": {
+    "emb": {
+      "emb_mscale": 1.2772588722239782,
+      "rope_scaling": {
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "factor": 4.0,
+        "mscale": 2.0,
+        "mscale_all_dim": 0.0,
+        "original_max_position_embeddings": 32
+      },
+      "scale": 0.1767766952966369
+    },
+    "scale": {
+      "emb_mscale": 1.0,
+      "rope_scaling": {
+        "beta_fast": 32,
+        "beta_slow": 1,
+        "factor": 4.0,
+        "mscale": 1.0,
+        "mscale_all_dim": 1.0,
+        "original_max_position_embeddings": 32
+      },
+      "scale": 0.22918691831189503
+    }
+  },
+  "seq": 6
+}
