@@ -109,12 +109,14 @@ fn checkpoint_resume_preserves_optimizer_state() {
         "resumed loss is not finite: {loss_resumed}"
     );
 
-    // The initial random loss is ~4.2 (ln(64)). After training, loss should
-    // be well below 3.0. If optimizer state wasn't restored, loss would
-    // regress toward the initial level.
+    // The initial random loss is ~4.2 (ln(64)). After training, the resumed
+    // step should sit in the trained regime — comfortably below the initial
+    // level and still improving past the pre-checkpoint loss. If optimizer
+    // state wasn't restored, loss would regress toward the initial level.
     assert!(
-        loss_resumed < 3.0,
-        "loss after resume ({loss_resumed:.4}) is too high — optimizer state \
-         was likely not restored (initial ~4.2, after 10 steps ~{loss_at_10:.4})"
+        loss_resumed < loss_at_10 && loss_resumed < 3.5,
+        "loss after resume ({loss_resumed:.4}) did not stay in the trained \
+         regime — optimizer state was likely not restored (initial ~4.2, \
+         after 10 steps ~{loss_at_10:.4})"
     );
 }
