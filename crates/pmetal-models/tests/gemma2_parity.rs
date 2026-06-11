@@ -136,10 +136,21 @@ fn gemma2_synthetic_parity() {
         .zip(argmax_ref.iter())
         .filter(|(a, b)| a == b)
         .count();
-    println!("argmax exact matches: {} / {}", argmax_matches, argmax_rust.len());
+    println!(
+        "argmax exact matches: {} / {}",
+        argmax_matches,
+        argmax_rust.len()
+    );
 
-    let failures: Vec<_> = reports.iter().filter(|r| !r.passed()).map(|r| r.name.clone()).collect();
-    assert!(failures.is_empty(), "Gemma 2 parity failed at: {failures:?}");
+    let failures: Vec<_> = reports
+        .iter()
+        .filter(|r| !r.passed())
+        .map(|r| r.name.clone())
+        .collect();
+    assert!(
+        failures.is_empty(),
+        "Gemma 2 parity failed at: {failures:?}"
+    );
     assert_eq!(
         argmax_matches,
         argmax_rust.len(),

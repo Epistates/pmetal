@@ -490,8 +490,22 @@ impl PhiAttention {
             )
         } else {
             (
-                apply_rope(&q_rope_raw, self.rope_dim, false, self.rope_theta, 1.0, offset)?,
-                apply_rope(&k_rope_raw, self.rope_dim, false, self.rope_theta, 1.0, offset)?,
+                apply_rope(
+                    &q_rope_raw,
+                    self.rope_dim,
+                    false,
+                    self.rope_theta,
+                    1.0,
+                    offset,
+                )?,
+                apply_rope(
+                    &k_rope_raw,
+                    self.rope_dim,
+                    false,
+                    self.rope_theta,
+                    1.0,
+                    offset,
+                )?,
             )
         };
 

@@ -277,7 +277,12 @@ fn build_yarn_rope(
 /// defaults. Returns `None` if no block is configured.
 fn parse_yarn_scaling(rope_scaling: &Option<serde_json::Value>) -> Option<YarnScaling> {
     let rs = rope_scaling.as_ref()?;
-    let get = |k: &str, default: f32| rs.get(k).and_then(|v| v.as_f64()).map(|v| v as f32).unwrap_or(default);
+    let get = |k: &str, default: f32| {
+        rs.get(k)
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(default)
+    };
     Some(YarnScaling {
         factor: get("factor", 1.0),
         original_max_pos: rs

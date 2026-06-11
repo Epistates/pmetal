@@ -317,7 +317,13 @@ pub fn apply_rope_with_positions(
     let cos_theta = cos_theta.reshape(&[1, 1, -1, half_dims]);
     let sin_theta = sin_theta.reshape(&[1, 1, -1, half_dims]);
 
-    Ok(rope_rotate_with_cos_sin(x, &cos_theta, &sin_theta, dims, traditional))
+    Ok(rope_rotate_with_cos_sin(
+        x,
+        &cos_theta,
+        &sin_theta,
+        dims,
+        traditional,
+    ))
 }
 
 /// Core RoPE rotation given precomputed `cos`/`sin` tables (broadcastable to
@@ -432,7 +438,13 @@ pub fn apply_rope_with_freqs(
     let cos_theta = angles.cos().reshape(&[1, 1, -1, half_dims]);
     let sin_theta = angles.sin().reshape(&[1, 1, -1, half_dims]);
 
-    Ok(rope_rotate_with_cos_sin(x, &cos_theta, &sin_theta, dims, traditional))
+    Ok(rope_rotate_with_cos_sin(
+        x,
+        &cos_theta,
+        &sin_theta,
+        dims,
+        traditional,
+    ))
 }
 
 /// Apply RoPE with per-batch-row position IDs.

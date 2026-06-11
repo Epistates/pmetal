@@ -111,5 +111,8 @@ fn llama4_attention_synthetic_parity() {
         .filter(|r| !r.passed())
         .map(|r| r.name.clone())
         .collect();
-    assert!(failures.is_empty(), "Llama 4 attention parity failed at: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "Llama 4 attention parity failed at: {failures:?}"
+    );
 }

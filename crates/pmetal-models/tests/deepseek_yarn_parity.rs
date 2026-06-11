@@ -103,7 +103,9 @@ fn deepseek_yarn_synthetic_parity() {
         attn.o_proj.weight = Param::new(ref_tensor(&shard, &format!("{tag}.o_proj")).clone());
 
         let x = ref_tensor(&shard, &format!("{tag}.x")).clone();
-        let y = attn.forward(&x, Some(&mask), None).expect("attention forward");
+        let y = attn
+            .forward(&x, Some(&mask), None)
+            .expect("attention forward");
 
         reports.push(ParityReport::compute_with_per_position(
             &format!("yarn_{tag}_output"),
@@ -121,5 +123,8 @@ fn deepseek_yarn_synthetic_parity() {
         .filter(|r| !r.passed())
         .map(|r| r.name.clone())
         .collect();
-    assert!(failures.is_empty(), "DeepSeek YARN parity failed at: {failures:?}");
+    assert!(
+        failures.is_empty(),
+        "DeepSeek YARN parity failed at: {failures:?}"
+    );
 }

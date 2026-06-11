@@ -1196,15 +1196,23 @@ mod tests {
         // per expert, NOT softmax-normalized. Verify against a direct sigmoid
         // of the gathered logits, and confirm the per-token weights do NOT sum
         // to 1 (which the old softmax-renormalize path would have forced).
-        let mut sig_ref = ops::sigmoid(&router_logits.take_along_axis(&expert_indices, -1)).unwrap();
+        let mut sig_ref =
+            ops::sigmoid(&router_logits.take_along_axis(&expert_indices, -1)).unwrap();
         let mut weights_eval = expert_weights.clone();
         sig_ref.eval().unwrap();
         weights_eval.eval().unwrap();
         let n = (total_tokens * config.num_experts_per_tok) as usize;
         let w = weights_eval.to_f32_vec(n).unwrap();
         let s = sig_ref.to_f32_vec(n).unwrap();
-        let max_w_diff = w.iter().zip(&s).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
-        assert!(max_w_diff < 1e-5, "router weights must equal sigmoid(logits): {max_w_diff}");
+        let max_w_diff = w
+            .iter()
+            .zip(&s)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(
+            max_w_diff < 1e-5,
+            "router weights must equal sigmoid(logits): {max_w_diff}"
+        );
 
         let mut reference = ops::zeros_dtype(&[total_tokens, hidden_size], flat_x.dtype()).unwrap();
         let top_k = config.num_experts_per_tok;

@@ -76,10 +76,7 @@ fn build_model_via_production_loader() -> CohereForCausalLM {
         json5::from_str(synthetic_config_json()).expect("synthetic config parses");
     let mut model = CohereForCausalLM::new(config).expect("cohere model builds");
 
-    let tmp = std::env::temp_dir().join(format!(
-        "pmetal_cohere_parity_{}",
-        std::process::id()
-    ));
+    let tmp = std::env::temp_dir().join(format!("pmetal_cohere_parity_{}", std::process::id()));
     std::fs::create_dir_all(&tmp).expect("temp dir");
     let dst = tmp.join("model.safetensors");
     std::fs::copy(fixture_path("cohere_synth_weights.safetensors"), &dst).expect("copy weights");
@@ -102,7 +99,9 @@ fn cohere_synthetic_parity() {
     let mut h = post_embed.clone();
     let mut layer_taps: Vec<Array> = Vec::new();
     for layer in model.model.layers.iter_mut() {
-        h = layer.forward_with_cache(&h, None, None).expect("layer forward");
+        h = layer
+            .forward_with_cache(&h, None, None)
+            .expect("layer forward");
         layer_taps.push(h.clone());
     }
     let final_hidden = Module::forward(&mut model.model.norm, &h).expect("final norm");
@@ -179,7 +178,11 @@ fn cohere_synthetic_parity() {
         argmax_rust.len()
     );
 
-    let failures: Vec<_> = reports.iter().filter(|r| !r.passed()).map(|r| r.name.clone()).collect();
+    let failures: Vec<_> = reports
+        .iter()
+        .filter(|r| !r.passed())
+        .map(|r| r.name.clone())
+        .collect();
     assert!(failures.is_empty(), "Cohere parity failed at: {failures:?}");
     assert_eq!(
         argmax_matches,

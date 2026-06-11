@@ -172,24 +172,12 @@ impl CohereQloraAttention {
 
         // Apply RoPE BEFORE transpose — [B, S, H, D] matches apply_rope convention
         // Cohere uses traditional (interleaved) RoPE — see CohereAttention.
-        let q = pmetal_mlx::kernels::rope::apply_rope(
-            &q,
-            self.head_dim,
-            true,
-            self.rope_theta,
-            1.0,
-            0,
-        )
-        .map_err(LoraError::Mlx)?;
-        let k = pmetal_mlx::kernels::rope::apply_rope(
-            &k,
-            self.head_dim,
-            true,
-            self.rope_theta,
-            1.0,
-            0,
-        )
-        .map_err(LoraError::Mlx)?;
+        let q =
+            pmetal_mlx::kernels::rope::apply_rope(&q, self.head_dim, true, self.rope_theta, 1.0, 0)
+                .map_err(LoraError::Mlx)?;
+        let k =
+            pmetal_mlx::kernels::rope::apply_rope(&k, self.head_dim, true, self.rope_theta, 1.0, 0)
+                .map_err(LoraError::Mlx)?;
 
         // Transpose to [B, H, S, D]
         let q = q.transpose_axes(&[0, 2, 1, 3]);
