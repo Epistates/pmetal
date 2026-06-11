@@ -1767,7 +1767,7 @@ mod tests {
         let lc = small_lora_config();
         // Layer 0 uses RoPE (0 % 4 != 0 is false → layer 0 is NoPE, layer 1 is RoPE).
         // Actually: uses_rope = layer_idx % no_rope_layer_interval != 0
-        // layer 0: 0 % 4 == 0 → NoPE; layer 1: 1 % 4 != 0 → RoPE.
+        // RoPE on layers where (idx + 1) % 4 != 0; layer 1 -> (2) % 4 != 0 -> RoPE.
         let mut attn = Llama4LoraAttention::new(&config, 1, &lc).unwrap();
         assert!(attn.uses_rope);
 
@@ -1783,8 +1783,8 @@ mod tests {
     fn test_llama4_lora_attention_nope() {
         let config = small_config();
         let lc = small_lora_config();
-        // Layer 0 is NoPE (0 % 4 == 0).
-        let mut attn = Llama4LoraAttention::new(&config, 0, &lc).unwrap();
+        // NoPE on layers where (idx + 1) % 4 == 0; layer 3 -> (4) % 4 == 0 -> NoPE.
+        let mut attn = Llama4LoraAttention::new(&config, 3, &lc).unwrap();
         assert!(!attn.uses_rope);
 
         let x = pmetal_bridge::compat::random::normal(
@@ -1816,9 +1816,10 @@ mod tests {
         let lc = small_lora_config();
         let mut model = Llama4LoraForCausalLM::new(config, lc).unwrap();
 
-        // With interleave_moe_layer_step=2: layer 0 is MoE (0 % 2 == 0), layer 1 is dense.
-        assert!(model.model.layers[0].is_moe);
-        assert!(!model.model.layers[1].is_moe);
+        // interleave_moe_layer_step=2: the LAST layer of each pair is MoE
+        // (idx % 2 == 1), so layer 0 is dense and layer 1 is MoE.
+        assert!(!model.model.layers[0].is_moe);
+        assert!(model.model.layers[1].is_moe);
 
         let input_ids = Array::from_i32_slice(&[1_i32, 2, 3]).reshape(&[1, 3]);
         let logits = model.forward(&input_ids, None).unwrap();

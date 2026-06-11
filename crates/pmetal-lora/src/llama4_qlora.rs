@@ -1545,9 +1545,10 @@ mod tests {
         let mut model =
             Llama4QloraForCausalLM::with_qlora_config(mixed_config(), small_qlora_config())
                 .unwrap();
-        // interleave_moe_layer_step=2: layer 0 MoE, layer 1 dense.
-        assert!(model.model.layers[0].is_moe);
-        assert!(!model.model.layers[1].is_moe);
+        // interleave_moe_layer_step=2: the LAST layer of each pair is MoE
+        // (idx % 2 == 1), so layer 0 is dense and layer 1 is MoE.
+        assert!(!model.model.layers[0].is_moe);
+        assert!(model.model.layers[1].is_moe);
 
         let input_ids = Array::from_i32_slice(&[1_i32, 2, 3]).reshape(&[1, 3]);
         let logits = model.forward(&input_ids, None).unwrap();
