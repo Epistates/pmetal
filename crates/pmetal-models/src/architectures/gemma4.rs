@@ -83,7 +83,7 @@ use pmetal_mlx::kv_cache::KVCache;
 /// subset by gathering the first `rotated_dims/2` entries of each half,
 /// rotate that contiguous tensor, then scatter the result back into the
 /// originally-untouched positions.
-fn apply_gemma4_partial_rope(
+pub(crate) fn apply_gemma4_partial_rope(
     x: &Array,
     head_dim: i32,
     rotated_dims: i32,
@@ -186,7 +186,11 @@ fn apply_gemma4_partial_rope(
 /// frequency means `angle = pos * inf = inf`, which mlx's kernel special-
 /// cases to the identity rotation (cos=1, sin=0) — leaving those
 /// dimensions untouched.
-fn build_gemma4_partial_rope_freqs(head_dim: i32, rotated_dims: i32, base: f32) -> Option<Array> {
+pub(crate) fn build_gemma4_partial_rope_freqs(
+    head_dim: i32,
+    rotated_dims: i32,
+    base: f32,
+) -> Option<Array> {
     if rotated_dims == 0 || rotated_dims == head_dim {
         return None;
     }
@@ -466,7 +470,7 @@ impl Gemma4RmsNorm {
 /// passing `None` lets MLX take the weight-less kernel path instead of
 /// materialising an all-ones tensor and doing an identity multiply, which
 /// avoids the tiny rounding drift that the ones path introduces.
-fn rms_norm_noscale(x: &Array, eps: f32) -> Array {
+pub(crate) fn rms_norm_noscale(x: &Array, eps: f32) -> Array {
     pmetal_bridge::compat::fast::rms_norm_opt(x, None, eps)
 }
 
@@ -862,6 +866,29 @@ impl Gemma4Attention {
     ) -> Result<Array, Exception> {
         let q = self.project_queries(x, offset)?;
         self.attend(&q, source_keys, source_values, mask)
+    }
+
+    /// Cross/self attention that prepends a read-only set of encoder keys and
+    /// values to this layer's freshly-projected K/V and attends with an
+    /// explicit (bidirectional) mask. Used by the DiffusionGemma decoder,
+    /// where each layer reads the encoder KV cache (never writing to it) and
+    /// the canvas attends bidirectionally over `[encoder_kv | canvas]`.
+    ///
+    /// `encoder_keys` / `encoder_values` are `[B, n_kv_heads, enc_len,
+    /// head_dim]` (post-norm, post-rope), matching this layer's geometry.
+    /// `offset` positions the canvas RoPE after the encoder sequence.
+    pub fn forward_with_encoder_kv(
+        &mut self,
+        x: &Array,
+        encoder_keys: &Array,
+        encoder_values: &Array,
+        mask: Option<&Array>,
+        offset: i32,
+    ) -> Result<Array, Exception> {
+        let (q, k, v) = self.project_qkv(x, offset)?;
+        let k = ops::concatenate_axis(&[encoder_keys, &k], 2);
+        let v = ops::concatenate_axis(&[encoder_values, &v], 2);
+        self.attend(&q, &k, &v, mask)
     }
 }
 
