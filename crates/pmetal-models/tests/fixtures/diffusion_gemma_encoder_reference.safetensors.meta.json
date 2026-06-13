@@ -1,0 +1,21 @@
+{
+  "captured_keys": [
+    "final_hidden",
+    "input_ids",
+    "layer_0_hidden",
+    "layer_1_hidden",
+    "post_embed"
+  ],
+  "hidden_size": 128,
+  "layer_types": [
+    "sliding_attention",
+    "full_attention"
+  ],
+  "model_id": "synthetic",
+  "num_hidden_layers": 2,
+  "oracle": "transformers",
+  "seed": 42,
+  "seq_len": 12,
+  "transformers_version": "5.10.0.dev0",
+  "vocab_size": 512
+}

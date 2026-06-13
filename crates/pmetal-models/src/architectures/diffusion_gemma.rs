@@ -42,9 +42,11 @@ use pmetal_bridge::compat::{Array, Exception, Module, Param, nn, ops};
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
+use std::collections::HashMap;
+
 use super::gemma4::{
     Gemma4Attention, Gemma4Config, Gemma4Mlp, Gemma4RmsNorm, Gemma4RopeConfig,
-    Gemma4RopeLayerConfig, rms_norm_noscale,
+    Gemma4RopeLayerConfig, LoadReport, rms_norm_noscale,
 };
 
 // ----------------------------------------------------------------------------
@@ -692,6 +694,220 @@ impl DiffusionGemmaEncoderModel {
         }
         Ok((self.norm.forward(&h), kvs))
     }
+}
+
+// ----------------------------------------------------------------------------
+// Weight loading (encoder subset)
+// ----------------------------------------------------------------------------
+
+fn dg_load_linear(
+    linear: &mut nn::Linear,
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    report: &mut LoadReport,
+) {
+    if let Some(w) = weights.get(&format!("{prefix}.weight")) {
+        linear.weight = Param::new(w.clone());
+        report.loaded += 1;
+    } else {
+        report.skipped.push(format!("{prefix}.weight"));
+    }
+}
+
+fn dg_load_norm(
+    slot: &mut Param<Array>,
+    weights: &HashMap<String, Array>,
+    key: &str,
+    report: &mut LoadReport,
+) {
+    if let Some(w) = weights.get(key) {
+        *slot = Param::new(w.clone());
+        report.loaded += 1;
+    } else {
+        report.skipped.push(key.to_string());
+    }
+}
+
+fn dg_load_param(
+    slot: &mut Param<Array>,
+    weights: &HashMap<String, Array>,
+    key: &str,
+    report: &mut LoadReport,
+) {
+    if let Some(w) = weights.get(key) {
+        *slot = Param::new(w.clone());
+        report.loaded += 1;
+    } else {
+        report.skipped.push(key.to_string());
+    }
+}
+
+/// Load HF `DiffusionGemmaEncoderTextModel` weights into a
+/// [`DiffusionGemmaEncoderModel`]. Keys are the raw transformers state-dict
+/// names (`embed_tokens.weight`, `layers.{i}.…`, `norm.weight`) — i.e. the
+/// encoder text tower as its own root, with no `model.` prefix. Both the
+/// fused expert tensors and `nn.Linear` weights are stored in the same layout
+/// the Python checkpoint uses, so no transpose happens at load time.
+pub fn load_diffusion_gemma_encoder_weights(
+    model: &mut DiffusionGemmaEncoderModel,
+    weights: &HashMap<String, Array>,
+) -> Result<LoadReport, Exception> {
+    let mut report = LoadReport::default();
+
+    dg_load_norm(
+        &mut model.embed_tokens.weight,
+        weights,
+        "embed_tokens.weight",
+        &mut report,
+    );
+    dg_load_norm(&mut model.norm.weight, weights, "norm.weight", &mut report);
+
+    for (i, layer) in model.layers.iter_mut().enumerate() {
+        let p = format!("layers.{i}");
+
+        // The seven RMSNorms.
+        dg_load_norm(
+            &mut layer.input_layernorm.weight,
+            weights,
+            &format!("{p}.input_layernorm.weight"),
+            &mut report,
+        );
+        dg_load_norm(
+            &mut layer.post_attention_layernorm.weight,
+            weights,
+            &format!("{p}.post_attention_layernorm.weight"),
+            &mut report,
+        );
+        dg_load_norm(
+            &mut layer.pre_feedforward_layernorm.weight,
+            weights,
+            &format!("{p}.pre_feedforward_layernorm.weight"),
+            &mut report,
+        );
+        dg_load_norm(
+            &mut layer.post_feedforward_layernorm.weight,
+            weights,
+            &format!("{p}.post_feedforward_layernorm.weight"),
+            &mut report,
+        );
+        dg_load_norm(
+            &mut layer.post_feedforward_layernorm_1.weight,
+            weights,
+            &format!("{p}.post_feedforward_layernorm_1.weight"),
+            &mut report,
+        );
+        dg_load_norm(
+            &mut layer.pre_feedforward_layernorm_2.weight,
+            weights,
+            &format!("{p}.pre_feedforward_layernorm_2.weight"),
+            &mut report,
+        );
+        dg_load_norm(
+            &mut layer.post_feedforward_layernorm_2.weight,
+            weights,
+            &format!("{p}.post_feedforward_layernorm_2.weight"),
+            &mut report,
+        );
+
+        // Attention projections + QK norms. Full layers have no `v_proj`.
+        dg_load_linear(
+            &mut layer.self_attn.q_proj,
+            weights,
+            &format!("{p}.self_attn.q_proj"),
+            &mut report,
+        );
+        dg_load_linear(
+            &mut layer.self_attn.k_proj,
+            weights,
+            &format!("{p}.self_attn.k_proj"),
+            &mut report,
+        );
+        if let Some(ref mut v) = layer.self_attn.v_proj {
+            dg_load_linear(v, weights, &format!("{p}.self_attn.v_proj"), &mut report);
+        }
+        dg_load_linear(
+            &mut layer.self_attn.o_proj,
+            weights,
+            &format!("{p}.self_attn.o_proj"),
+            &mut report,
+        );
+        dg_load_norm(
+            &mut layer.self_attn.q_norm.weight,
+            weights,
+            &format!("{p}.self_attn.q_norm.weight"),
+            &mut report,
+        );
+        dg_load_norm(
+            &mut layer.self_attn.k_norm.weight,
+            weights,
+            &format!("{p}.self_attn.k_norm.weight"),
+            &mut report,
+        );
+
+        // Dense MLP.
+        dg_load_linear(
+            &mut layer.mlp.gate_proj,
+            weights,
+            &format!("{p}.mlp.gate_proj"),
+            &mut report,
+        );
+        dg_load_linear(
+            &mut layer.mlp.up_proj,
+            weights,
+            &format!("{p}.mlp.up_proj"),
+            &mut report,
+        );
+        dg_load_linear(
+            &mut layer.mlp.down_proj,
+            weights,
+            &format!("{p}.mlp.down_proj"),
+            &mut report,
+        );
+
+        // Router.
+        dg_load_linear(
+            &mut layer.router.proj,
+            weights,
+            &format!("{p}.router.proj"),
+            &mut report,
+        );
+        dg_load_param(
+            &mut layer.router.scale,
+            weights,
+            &format!("{p}.router.scale"),
+            &mut report,
+        );
+        dg_load_param(
+            &mut layer.router.per_expert_scale,
+            weights,
+            &format!("{p}.router.per_expert_scale"),
+            &mut report,
+        );
+
+        // Experts (fused 3-D tensors, stored in HF layout).
+        dg_load_param(
+            &mut layer.experts.gate_up_proj,
+            weights,
+            &format!("{p}.experts.gate_up_proj"),
+            &mut report,
+        );
+        dg_load_param(
+            &mut layer.experts.down_proj,
+            weights,
+            &format!("{p}.experts.down_proj"),
+            &mut report,
+        );
+
+        // Per-layer scalar (persistent buffer in HF).
+        dg_load_param(
+            &mut layer.layer_scalar,
+            weights,
+            &format!("{p}.layer_scalar"),
+            &mut report,
+        );
+    }
+
+    Ok(report)
 }
 
 #[cfg(test)]
