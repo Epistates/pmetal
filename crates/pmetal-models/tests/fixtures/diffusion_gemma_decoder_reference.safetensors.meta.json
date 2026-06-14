@@ -10,6 +10,7 @@
     "final_hidden",
     "layer_0_hidden",
     "layer_1_hidden",
+    "logits",
     "post_self_cond",
     "post_self_cond_zeros",
     "self_conditioning_logits"

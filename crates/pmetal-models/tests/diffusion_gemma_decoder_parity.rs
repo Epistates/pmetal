@@ -78,6 +78,7 @@ fn tolerances() -> Vec<(&'static str, Tolerance)> {
         // Full bidirectional attention over [enc|canvas] + MoE: most drift.
         ("layer_1_hidden", Tolerance::new(6e-3, 3e-3)),
         ("final_hidden", Tolerance::new(5e-3, 3e-3)),
+        ("logits", Tolerance::new(6e-3, 3e-3)),
     ]
 }
 
@@ -175,6 +176,20 @@ fn diffusion_gemma_decoder_synthetic_parity() {
         "final_hidden",
         &final_hidden_rust,
         ref_tensor(&ref_shard, "final_hidden"),
+        &tol,
+    ));
+
+    // LM head: tied to the decoder embedding, then fp32 final-logit softcap.
+    let raw_logits = model
+        .embed_tokens
+        .as_linear(&final_hidden_rust)
+        .as_type::<f32>();
+    let cap = Array::from_f32(config.final_logit_softcapping.unwrap());
+    let logits_rust = ops::tanh(&raw_logits.divide(&cap)).multiply(&cap);
+    reports.push(compare(
+        "logits",
+        &logits_rust,
+        ref_tensor(&ref_shard, "logits"),
         &tol,
     ));
 

@@ -811,6 +811,319 @@ impl DiffusionGemmaDecoderModel {
 }
 
 // ----------------------------------------------------------------------------
+// Discrete-diffusion generation
+// ----------------------------------------------------------------------------
+
+/// Generation / sampler configuration (`DiffusionGemmaGenerationConfig` +
+/// `EntropyBoundSamplerConfig`). Defaults match the released checkpoint's
+/// `generation_config.json`.
+#[derive(Debug, Clone)]
+pub struct DiffusionGemmaGenerationConfig {
+    pub max_denoising_steps: i32,
+    pub t_min: f32,
+    pub t_max: f32,
+    pub entropy_bound: f32,
+    pub confidence_threshold: f32,
+    pub stability_threshold: i32,
+    pub max_new_tokens: i32,
+    pub eos_token_ids: Vec<i32>,
+    pub pad_token_id: i32,
+}
+
+impl Default for DiffusionGemmaGenerationConfig {
+    fn default() -> Self {
+        Self {
+            max_denoising_steps: 48,
+            t_min: 0.4,
+            t_max: 0.8,
+            entropy_bound: 0.1,
+            confidence_threshold: 0.005,
+            stability_threshold: 1,
+            max_new_tokens: 256,
+            eos_token_ids: vec![1, 106, 50],
+            pad_token_id: 0,
+        }
+    }
+}
+
+/// Linear temperature schedule (`LinearTemperatureScheduleLogitsProcessor`):
+/// `scores / (t_min + (t_max - t_min) * cur_step / max_steps)`. Applied
+/// *after* the LM-head softcap. As a positive monotone scaling it leaves the
+/// argmax unchanged.
+pub fn linear_temperature(
+    logits: &Array,
+    cur_step: i32,
+    t_min: f32,
+    t_max: f32,
+    max_steps: i32,
+) -> Array {
+    let temperature = t_min + (t_max - t_min) * (cur_step as f32 / max_steps as f32);
+    logits.divide(&Array::from_f32(temperature))
+}
+
+/// Categorical token entropy over the last (vocab) axis: `-Σ p·log p` where
+/// `p = softmax(logits)`. Returns the input with its last axis reduced.
+pub fn categorical_entropy(logits: &Array) -> Array {
+    let logp = nn::log_softmax(logits, -1);
+    let p = ops::exp(&logp);
+    p.multiply(&logp)
+        .sum_axis(-1, false)
+        .multiply(&Array::from_f32(-1.0))
+}
+
+/// Entropy-bound acceptance (`EntropyBoundSampler.accept_canvas`). Accepts the
+/// lowest-entropy canvas positions while the cumulative entropy *excluding the
+/// current position* stays within `entropy_bound`, then takes the denoiser's
+/// token there (and keeps the current token elsewhere).
+///
+/// Returns `(accepted_canvas, accepted_mask)` — `accepted_mask` is a boolean
+/// `[B, canvas]` array (true where the denoiser token was taken).
+pub fn entropy_bound_accept(
+    processed_logits: &Array,
+    current_canvas: &Array,
+    denoiser_canvas: &Array,
+    entropy_bound: f32,
+) -> (Array, Array) {
+    let ent = categorical_entropy(processed_logits); // [B, canvas]
+    let sorted_idx = ops::argsort_axis(&ent, -1); // ascending
+    let sorted_ent = ops::take_along_axis(&ent, &sorted_idx, -1);
+    let cum = ops::cumsum(&sorted_ent, -1);
+    // cumulative entropy excluding the current (max) position.
+    let excl = ops::subtract(&cum, &sorted_ent);
+    let sel = ops::less_equal(&excl, &Array::from_f32(entropy_bound)).as_type::<f32>();
+    // Scatter the sorted-order selection back to original positions
+    // (`torch.scatter(zeros, -1, sorted_idx, sel)`): place `sel[j]` at
+    // `sorted_idx[j]`.
+    let zeros = ops::zeros_like(&sel);
+    let mask_f = zeros.put_along_axis_op(&sorted_idx, &sel, -1);
+    let mask = ops::greater(&mask_f, &Array::from_f32(0.5));
+    let accepted = ops::where_fn(&mask, denoiser_canvas, current_canvas);
+    (accepted, mask)
+}
+
+/// Stable-and-confident adaptive stopping (`StableAndConfidentStoppingCriteria`),
+/// specialised to a single sequence. Stops once the argmax canvas has been
+/// identical for `stability_threshold` consecutive steps *and* the mean token
+/// entropy of the processed logits is below `confidence_threshold`.
+#[derive(Debug)]
+struct StableConfidentStopper {
+    stability_threshold: i32,
+    confidence_threshold: f32,
+    history: Vec<Vec<u32>>,
+}
+
+impl StableConfidentStopper {
+    fn new(stability_threshold: i32, confidence_threshold: f32) -> Self {
+        Self {
+            stability_threshold,
+            confidence_threshold,
+            history: Vec::new(),
+        }
+    }
+
+    /// `argmax_canvas` is `[1, canvas]`, `processed_logits` is `[1, canvas, vocab]`.
+    fn should_stop(&mut self, argmax_canvas: &Array, processed_logits: &Array) -> bool {
+        let argmax = {
+            let a = argmax_canvas.as_type::<u32>();
+            a.eval();
+            a.as_slice::<u32>().to_vec()
+        };
+        let stable = if self.stability_threshold <= 0 {
+            true
+        } else {
+            let full = self.history.len() >= self.stability_threshold as usize;
+            full && self.history.iter().all(|h| *h == argmax)
+        };
+        self.history.push(argmax);
+        while self.history.len() > self.stability_threshold.max(0) as usize {
+            self.history.remove(0);
+        }
+
+        let mean_entropy = categorical_entropy(processed_logits).mean_all().item_f32();
+        let confident = mean_entropy < self.confidence_threshold;
+        stable && confident
+    }
+}
+
+/// Top-level block-diffusion model (`DiffusionGemmaForBlockDiffusion`): the
+/// encoder + decoder trunk plus the (tied) LM head and discrete-diffusion
+/// generation loop.
+#[derive(Debug)]
+pub struct DiffusionGemmaForBlockDiffusion {
+    pub encoder: DiffusionGemmaEncoderModel,
+    pub decoder: DiffusionGemmaDecoderModel,
+    pub final_logit_softcapping: Option<f32>,
+    pub canvas_length: i32,
+    pub sliding_window: i32,
+    pub layer_types: Vec<String>,
+    pub vocab_size: i32,
+}
+impl_module_params!(DiffusionGemmaForBlockDiffusion; encoder, decoder);
+
+impl DiffusionGemmaForBlockDiffusion {
+    pub fn new(config: DiffusionGemmaTextConfig) -> Result<Self, Exception> {
+        let layer_types = config.resolved_layer_types();
+        let canvas_length = config.canvas_length;
+        let sliding_window = config.sliding_window;
+        let vocab_size = config.vocab_size;
+        let final_logit_softcapping = config.final_logit_softcapping;
+        let encoder = DiffusionGemmaEncoderModel::new(config.clone())?;
+        let decoder = DiffusionGemmaDecoderModel::new(config)?;
+        Ok(Self {
+            encoder,
+            decoder,
+            final_logit_softcapping,
+            canvas_length,
+            sliding_window,
+            layer_types,
+            vocab_size,
+        })
+    }
+
+    /// LM head: tied to the decoder's input embedding, followed by the fp32
+    /// final-logit softcap.
+    pub fn lm_logits(&self, hidden: &Array) -> Array {
+        let raw = self.decoder.embed_tokens.as_linear(hidden).as_type::<f32>();
+        match self.final_logit_softcapping {
+            Some(cap) => {
+                let c = Array::from_f32(cap);
+                ops::tanh(&raw.divide(&c)).multiply(&c)
+            }
+            None => raw,
+        }
+    }
+
+    /// Truncate sliding-attention layers' encoder K/V to the last
+    /// `sliding_window - 1` positions, matching transformers'
+    /// `DynamicSlidingWindowLayer` (non-compiled path). Full-attention layers
+    /// keep the whole sequence. The decoder's per-layer masking already copes
+    /// with the resulting ragged KV lengths.
+    fn truncate_sliding_kvs(&self, kvs: Vec<(Array, Array)>) -> Vec<(Array, Array)> {
+        let keep = (self.sliding_window - 1).max(0);
+        kvs.into_iter()
+            .enumerate()
+            .map(|(i, (k, v))| {
+                let is_sliding = self
+                    .layer_types
+                    .get(i)
+                    .map(|t| t == "sliding_attention")
+                    .unwrap_or(false);
+                let enc_len = k.dim(2);
+                if is_sliding && enc_len > keep {
+                    let start = enc_len - keep;
+                    (
+                        ops::slice_axis(&k, 2, start, enc_len),
+                        ops::slice_axis(&v, 2, start, enc_len),
+                    )
+                } else {
+                    (k, v)
+                }
+            })
+            .collect()
+    }
+
+    /// Generate by block-autoregressive discrete diffusion (batch size 1).
+    ///
+    /// For each canvas block: encode the running sequence into a read-only KV
+    /// cache, denoise a fresh uniform-random canvas over `max_denoising_steps`
+    /// (decoder → softcapped logits → linear-temperature → multinomial proposal
+    /// → entropy-bound accept → renoise rejected; processed logits feed the
+    /// next step's self-conditioning), stopping early once stable & confident,
+    /// then append the argmax canvas. Stops at `max_new_tokens` or when the
+    /// canvas contains an EOS token.
+    ///
+    /// The trajectory is stochastic (multinomial + uniform renoise), seeded via
+    /// `seed`; the per-step *transforms* are the parity-verified deterministic
+    /// functions above.
+    pub fn generate(
+        &mut self,
+        input_ids: &Array,
+        config: &DiffusionGemmaGenerationConfig,
+        seed: u64,
+    ) -> Result<Array, Exception> {
+        pmetal_bridge::compat::random::seed(seed);
+        let canvas = self.canvas_length;
+        let vocab = self.vocab_size;
+        let max_new_canvases = (config.max_new_tokens + canvas - 1) / canvas;
+
+        let mut sequence = input_ids.clone();
+        for _block in 0..max_new_canvases {
+            let (_enc_hidden, kvs_full) = self.encoder.forward(&sequence)?;
+            let kvs = self.truncate_sliding_kvs(kvs_full);
+
+            let mut current = pmetal_bridge::compat::random::randint(
+                0,
+                vocab,
+                &[1, canvas],
+                pmetal_bridge::compat::Dtype::Int32,
+            );
+            let mut argmax_canvas = current.clone();
+            let mut sc_logits: Option<Array> = None;
+            let mut stopper = StableConfidentStopper::new(
+                config.stability_threshold,
+                config.confidence_threshold,
+            );
+
+            for cur_step in (1..=config.max_denoising_steps).rev() {
+                let hidden = self.decoder.forward(&current, &kvs, sc_logits.as_ref())?;
+                let raw = self.lm_logits(&hidden);
+                let processed = linear_temperature(
+                    &raw,
+                    cur_step,
+                    config.t_min,
+                    config.t_max,
+                    config.max_denoising_steps,
+                );
+                argmax_canvas = ops::argmax(&processed, -1)
+                    .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32());
+
+                // Multinomial proposal: categorical over processed logits is
+                // equivalent to multinomial over softmax(processed).
+                let denoiser = pmetal_bridge::compat::random::categorical(&processed, -1)
+                    .as_dtype(pmetal_bridge::compat::Dtype::Int32.as_i32());
+
+                let (accepted, mask) =
+                    entropy_bound_accept(&processed, &current, &denoiser, config.entropy_bound);
+                // Renoise: rejected positions get fresh uniform tokens.
+                let renoise_mask = ops::logical_not(&mask);
+                let random_canvas = pmetal_bridge::compat::random::randint(
+                    0,
+                    vocab,
+                    &[1, canvas],
+                    pmetal_bridge::compat::Dtype::Int32,
+                );
+                current = ops::where_fn(&renoise_mask, &random_canvas, &accepted);
+
+                let stop = stopper.should_stop(&argmax_canvas, &processed);
+                sc_logits = Some(processed);
+                if stop {
+                    break;
+                }
+            }
+
+            sequence = ops::concatenate_axis(&[&sequence, &argmax_canvas], -1);
+            if canvas_contains_eos(&argmax_canvas, &config.eos_token_ids) {
+                break;
+            }
+        }
+        Ok(sequence)
+    }
+}
+
+/// True if any token in the `[1, canvas]` argmax canvas is an EOS id.
+fn canvas_contains_eos(argmax_canvas: &Array, eos_token_ids: &[i32]) -> bool {
+    if eos_token_ids.is_empty() {
+        return false;
+    }
+    let ids = {
+        let a = argmax_canvas.as_type::<i32>();
+        a.eval();
+        a.as_slice::<i32>().to_vec()
+    };
+    ids.iter().any(|t| eos_token_ids.contains(t))
+}
+
+// ----------------------------------------------------------------------------
 // Weight loading
 // ----------------------------------------------------------------------------
 
@@ -1215,5 +1528,73 @@ mod tests {
             .forward(&canvas_ids, &kvs, Some(&sc_logits))
             .unwrap();
         assert_eq!(out2.shape(), &[1, 4, cfg.hidden_size]);
+    }
+
+    #[test]
+    #[serial]
+    fn entropy_bound_accept_basic() {
+        // One near-deterministic position (entropy ≈ 0) and two uniform
+        // (entropy ≈ log 8). Sorted ascending the entropies are ≈ [0, 2.08,
+        // 2.08]; the acceptance test `cum_entropy_excluding_self <= 0.1` gives
+        // excl ≈ [0, 0, 2.08], so the lowest slot and the next (preceded only
+        // by the ≈0 slot) accept, and the last (preceded by 2.08) rejects.
+        let vocab = 8;
+        let mut rows: Vec<f32> = vec![10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0, -10.0];
+        rows.extend_from_slice(&[0.0; 8]); // uniform (entropy ≈ log 8)
+        rows.extend_from_slice(&[0.0; 8]); // uniform (entropy ≈ log 8)
+        let logits = Array::from_slice(&rows, &[1, 3, vocab]);
+        let current = Array::from_slice(&[100i32, 101, 102], &[1, 3]);
+        let denoiser = Array::from_slice(&[200i32, 201, 202], &[1, 3]);
+        let (accepted, mask) = entropy_bound_accept(&logits, &current, &denoiser, 0.1);
+
+        let mask_v: Vec<f32> = {
+            let m = mask.as_type::<f32>();
+            m.eval();
+            m.as_slice::<f32>().to_vec()
+        };
+        assert_eq!(mask_v, vec![1.0, 1.0, 0.0]);
+        let acc_v: Vec<i32> = {
+            let a = accepted.as_type::<i32>();
+            a.eval();
+            a.as_slice::<i32>().to_vec()
+        };
+        // Accepted slots take the denoiser token; rejected keeps current.
+        assert_eq!(acc_v, vec![200, 201, 102]);
+    }
+
+    #[test]
+    #[serial]
+    fn generate_structural_and_deterministic() {
+        let cfg = tiny_config();
+        let mut model = DiffusionGemmaForBlockDiffusion::new(cfg.clone()).unwrap();
+        let prompt = Array::from_slice(&[1i32, 2, 3, 4, 5], &[1, 5]);
+        let gen_cfg = DiffusionGemmaGenerationConfig {
+            max_new_tokens: cfg.canvas_length,
+            max_denoising_steps: 3,
+            eos_token_ids: vec![], // no early EOS stop
+            ..Default::default()
+        };
+
+        let out = model.generate(&prompt, &gen_cfg, 7).unwrap();
+        // One canvas block appended (max_new_tokens == canvas_length).
+        assert_eq!(out.shape(), &[1, 5 + cfg.canvas_length]);
+
+        // Same seed → identical trajectory.
+        let out_a = model.generate(&prompt, &gen_cfg, 42).unwrap();
+        let out_b = model.generate(&prompt, &gen_cfg, 42).unwrap();
+        let va: Vec<f32> = {
+            let a = out_a.as_type::<f32>();
+            a.eval();
+            a.as_slice::<f32>().to_vec()
+        };
+        let vb: Vec<f32> = {
+            let b = out_b.as_type::<f32>();
+            b.eval();
+            b.as_slice::<f32>().to_vec()
+        };
+        assert_eq!(
+            va, vb,
+            "generation must be deterministic under a fixed seed"
+        );
     }
 }
