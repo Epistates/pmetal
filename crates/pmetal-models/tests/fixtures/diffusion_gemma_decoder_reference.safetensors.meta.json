@@ -1,0 +1,30 @@
+{
+  "canvas_length": 8,
+  "captured_keys": [
+    "cache_layer0_keys",
+    "cache_layer0_values",
+    "cache_layer1_keys",
+    "cache_layer1_values",
+    "decoder_input_ids",
+    "decoder_position_ids",
+    "final_hidden",
+    "layer_0_hidden",
+    "layer_1_hidden",
+    "post_self_cond",
+    "post_self_cond_zeros",
+    "self_conditioning_logits"
+  ],
+  "enc_len": 12,
+  "hidden_size": 128,
+  "layer_types": [
+    "sliding_attention",
+    "full_attention"
+  ],
+  "mode": "decoder",
+  "model_id": "synthetic",
+  "num_hidden_layers": 2,
+  "oracle": "transformers",
+  "seed": 42,
+  "transformers_version": "5.10.0.dev0",
+  "vocab_size": 512
+}

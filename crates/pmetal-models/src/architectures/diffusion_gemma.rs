@@ -31,12 +31,13 @@
 //!
 //! # Scope
 //!
-//! Landed: config, the leaf MoE blocks, the 7-norm layer, and the **encoder**
-//! model (causal, auto-masked, KV-collecting). The **decoder** model
-//! (bidirectional canvas, read-only encoder-KV concat via
-//! [`Gemma4Attention::forward_with_encoder_kv`], self-conditioning) and the
-//! discrete-diffusion generation engine are built in later phases against the
-//! transformers parity oracle.
+//! Landed: config, the leaf MoE blocks, the 7-norm layer, the **encoder**
+//! model (causal, auto-masked, KV-collecting), and the **decoder** model
+//! (fully-bidirectional canvas over `[encoder_kv | canvas]`, read-only
+//! encoder-KV concat via [`Gemma4Attention::forward_with_encoder_kv`],
+//! self-conditioning). Both are numerically parity-verified against the
+//! transformers oracle. The discrete-diffusion generation engine (block loop,
+//! entropy-bound sampler, stopping) is built in a later phase.
 
 use pmetal_bridge::compat::{Array, Exception, Module, Param, nn, ops};
 use pmetal_bridge::impl_module_params;
@@ -697,7 +698,120 @@ impl DiffusionGemmaEncoderModel {
 }
 
 // ----------------------------------------------------------------------------
-// Weight loading (encoder subset)
+// Decoder model
+// ----------------------------------------------------------------------------
+
+/// DiffusionGemma decoder text tower (`DiffusionGemmaDecoderModel`).
+///
+/// Refines a fixed `canvas_length` block of tokens with **bidirectional**
+/// self-attention while reading — but never writing — the encoder's per-layer
+/// K/V cache. The canvas attends over the whole `[encoder_kv | canvas]`
+/// sequence with no causal or sliding-window restriction (the no-padding
+/// generation path: see `sdpa`/`eager` with `is_causal=False`, `mask=None`).
+///
+/// Each step folds the previous denoising step's soft embeddings into the
+/// input via [`DiffusionGemmaSelfConditioning`]; on the first step
+/// (`self_conditioning_logits = None`) the signal is zero and the block just
+/// re-normalises the input embeddings.
+///
+/// The trunk (`layers`, `embed_tokens`, `norm`) is weight-identical to — and
+/// in the full checkpoint tied to — the encoder; only `self_conditioning` is
+/// decoder-only.
+#[derive(Debug)]
+pub struct DiffusionGemmaDecoderModel {
+    pub embed_tokens: nn::Embedding,
+    pub self_conditioning: DiffusionGemmaSelfConditioning,
+    pub layers: Vec<DiffusionGemmaTextLayer>,
+    pub norm: Gemma4RmsNorm,
+    pub config: DiffusionGemmaTextConfig,
+    pub embed_scale: f32,
+}
+impl_module_params!(
+    DiffusionGemmaDecoderModel;
+    embed_tokens,
+    self_conditioning,
+    layers,
+    norm
+);
+
+impl DiffusionGemmaDecoderModel {
+    pub fn new(config: DiffusionGemmaTextConfig) -> Result<Self, Exception> {
+        let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
+        let self_conditioning = DiffusionGemmaSelfConditioning::new(&config)?;
+        let layers = (0..config.num_hidden_layers as usize)
+            .map(|i| DiffusionGemmaTextLayer::new(&config, i))
+            .collect::<Result<Vec<_>, _>>()?;
+        let norm = Gemma4RmsNorm::new(config.hidden_size, config.rms_norm_eps);
+        let embed_scale = (config.hidden_size as f32).sqrt();
+        Ok(Self {
+            embed_tokens,
+            self_conditioning,
+            layers,
+            norm,
+            config,
+            embed_scale,
+        })
+    }
+
+    /// Run the decoder over one canvas block.
+    ///
+    /// * `decoder_input_ids` — `[B, canvas_length]` canvas token ids.
+    /// * `encoder_kvs` — per-layer `(keys, values)` from the encoder, each
+    ///   `[B, n_kv_heads, enc_len, head_dim]` (post-norm, post-rope). Length
+    ///   must equal `num_hidden_layers`.
+    /// * `self_conditioning_logits` — `[B, canvas_length, vocab]` logits from
+    ///   the previous denoising step, or `None` on the first step (zeroed
+    ///   signal).
+    pub fn forward(
+        &mut self,
+        decoder_input_ids: &Array,
+        encoder_kvs: &[(Array, Array)],
+        self_conditioning_logits: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let inputs_embeds = self
+            .embed_tokens
+            .forward(decoder_input_ids)
+            .multiply(&Array::from_f32(self.embed_scale));
+
+        // Soft embeddings from the previous step's logits (zeros on step 0):
+        // `softmax(logits, fp32) @ embed_weight * embed_scale`.
+        let soft = match self_conditioning_logits {
+            Some(logits) => {
+                let probs = ops::softmax_axis(&logits.as_type::<f32>(), -1);
+                let weight = self.embed_tokens.weight.as_ref();
+                let probs = probs.as_dtype(weight.dtype().as_i32());
+                ops::matmul(&probs, weight).multiply(&Array::from_f32(self.embed_scale))
+            }
+            None => ops::zeros_like(&inputs_embeds),
+        };
+        let mut h = self.self_conditioning.forward(&inputs_embeds, &soft)?;
+
+        // Canvas RoPE offset = the cumulative encoder length. Sliding-attention
+        // layers keep only the last `sliding_window - 1` encoder keys in their
+        // cache, so their KV length is shorter; full-attention layers always
+        // retain the whole sequence. The true sequence length (and hence the
+        // canvas position offset) is therefore the longest per-layer cache —
+        // the last layer is always full, so this equals the prompt length.
+        let canvas = decoder_input_ids.dim(1);
+        let canvas_offset = encoder_kvs.iter().map(|(k, _)| k.dim(2)).max().unwrap_or(0);
+
+        for (layer, (enc_k, enc_v)) in self.layers.iter_mut().zip(encoder_kvs.iter()) {
+            // Fully-bidirectional mask over this layer's `[encoder_kv | canvas]`:
+            // an all-zeros additive mask sized to this layer's (possibly
+            // truncated) cache. Passing an explicit mask stops `Gemma4Attention`
+            // from synthesising a causal / sliding-window mask, so every canvas
+            // query attends to every key — matching the oracle's
+            // `is_causal=False`, `mask=None` SDPA path.
+            let enc_len = enc_k.dim(2);
+            let mask = ops::zeros_dtype(&[1, 1, canvas, enc_len + canvas], h.dtype());
+            h = layer.forward_decoder(&h, enc_k, enc_v, Some(&mask), canvas_offset)?;
+        }
+        Ok(self.norm.forward(&h))
+    }
+}
+
+// ----------------------------------------------------------------------------
+// Weight loading
 // ----------------------------------------------------------------------------
 
 fn dg_load_linear(
@@ -763,148 +877,213 @@ pub fn load_diffusion_gemma_encoder_weights(
     dg_load_norm(&mut model.norm.weight, weights, "norm.weight", &mut report);
 
     for (i, layer) in model.layers.iter_mut().enumerate() {
-        let p = format!("layers.{i}");
+        dg_load_text_layer(layer, weights, &format!("layers.{i}"), &mut report);
+    }
 
-        // The seven RMSNorms.
-        dg_load_norm(
-            &mut layer.input_layernorm.weight,
-            weights,
-            &format!("{p}.input_layernorm.weight"),
-            &mut report,
-        );
-        dg_load_norm(
-            &mut layer.post_attention_layernorm.weight,
-            weights,
-            &format!("{p}.post_attention_layernorm.weight"),
-            &mut report,
-        );
-        dg_load_norm(
-            &mut layer.pre_feedforward_layernorm.weight,
-            weights,
-            &format!("{p}.pre_feedforward_layernorm.weight"),
-            &mut report,
-        );
-        dg_load_norm(
-            &mut layer.post_feedforward_layernorm.weight,
-            weights,
-            &format!("{p}.post_feedforward_layernorm.weight"),
-            &mut report,
-        );
-        dg_load_norm(
-            &mut layer.post_feedforward_layernorm_1.weight,
-            weights,
-            &format!("{p}.post_feedforward_layernorm_1.weight"),
-            &mut report,
-        );
-        dg_load_norm(
-            &mut layer.pre_feedforward_layernorm_2.weight,
-            weights,
-            &format!("{p}.pre_feedforward_layernorm_2.weight"),
-            &mut report,
-        );
-        dg_load_norm(
-            &mut layer.post_feedforward_layernorm_2.weight,
-            weights,
-            &format!("{p}.post_feedforward_layernorm_2.weight"),
-            &mut report,
-        );
+    Ok(report)
+}
 
-        // Attention projections + QK norms. Full layers have no `v_proj`.
-        dg_load_linear(
-            &mut layer.self_attn.q_proj,
-            weights,
-            &format!("{p}.self_attn.q_proj"),
-            &mut report,
-        );
-        dg_load_linear(
-            &mut layer.self_attn.k_proj,
-            weights,
-            &format!("{p}.self_attn.k_proj"),
-            &mut report,
-        );
-        if let Some(ref mut v) = layer.self_attn.v_proj {
-            dg_load_linear(v, weights, &format!("{p}.self_attn.v_proj"), &mut report);
-        }
-        dg_load_linear(
-            &mut layer.self_attn.o_proj,
-            weights,
-            &format!("{p}.self_attn.o_proj"),
-            &mut report,
-        );
-        dg_load_norm(
-            &mut layer.self_attn.q_norm.weight,
-            weights,
-            &format!("{p}.self_attn.q_norm.weight"),
-            &mut report,
-        );
-        dg_load_norm(
-            &mut layer.self_attn.k_norm.weight,
-            weights,
-            &format!("{p}.self_attn.k_norm.weight"),
-            &mut report,
-        );
+/// Load a single [`DiffusionGemmaTextLayer`] (the 7 RMSNorms, attention
+/// projections + QK norms, dense MLP, router, fused experts, and the
+/// `layer_scalar`). Shared by the encoder and decoder loaders — encoder and
+/// decoder layers are weight-identical (tied in the full model), differing
+/// only in how attention reads the KV cache.
+fn dg_load_text_layer(
+    layer: &mut DiffusionGemmaTextLayer,
+    weights: &HashMap<String, Array>,
+    prefix: &str,
+    report: &mut LoadReport,
+) {
+    let p = prefix;
 
-        // Dense MLP.
-        dg_load_linear(
-            &mut layer.mlp.gate_proj,
-            weights,
-            &format!("{p}.mlp.gate_proj"),
-            &mut report,
-        );
-        dg_load_linear(
-            &mut layer.mlp.up_proj,
-            weights,
-            &format!("{p}.mlp.up_proj"),
-            &mut report,
-        );
-        dg_load_linear(
-            &mut layer.mlp.down_proj,
-            weights,
-            &format!("{p}.mlp.down_proj"),
-            &mut report,
-        );
+    // The seven RMSNorms.
+    dg_load_norm(
+        &mut layer.input_layernorm.weight,
+        weights,
+        &format!("{p}.input_layernorm.weight"),
+        report,
+    );
+    dg_load_norm(
+        &mut layer.post_attention_layernorm.weight,
+        weights,
+        &format!("{p}.post_attention_layernorm.weight"),
+        report,
+    );
+    dg_load_norm(
+        &mut layer.pre_feedforward_layernorm.weight,
+        weights,
+        &format!("{p}.pre_feedforward_layernorm.weight"),
+        report,
+    );
+    dg_load_norm(
+        &mut layer.post_feedforward_layernorm.weight,
+        weights,
+        &format!("{p}.post_feedforward_layernorm.weight"),
+        report,
+    );
+    dg_load_norm(
+        &mut layer.post_feedforward_layernorm_1.weight,
+        weights,
+        &format!("{p}.post_feedforward_layernorm_1.weight"),
+        report,
+    );
+    dg_load_norm(
+        &mut layer.pre_feedforward_layernorm_2.weight,
+        weights,
+        &format!("{p}.pre_feedforward_layernorm_2.weight"),
+        report,
+    );
+    dg_load_norm(
+        &mut layer.post_feedforward_layernorm_2.weight,
+        weights,
+        &format!("{p}.post_feedforward_layernorm_2.weight"),
+        report,
+    );
 
-        // Router.
-        dg_load_linear(
-            &mut layer.router.proj,
-            weights,
-            &format!("{p}.router.proj"),
-            &mut report,
-        );
-        dg_load_param(
-            &mut layer.router.scale,
-            weights,
-            &format!("{p}.router.scale"),
-            &mut report,
-        );
-        dg_load_param(
-            &mut layer.router.per_expert_scale,
-            weights,
-            &format!("{p}.router.per_expert_scale"),
-            &mut report,
-        );
+    // Attention projections + QK norms. Full layers have no `v_proj`.
+    dg_load_linear(
+        &mut layer.self_attn.q_proj,
+        weights,
+        &format!("{p}.self_attn.q_proj"),
+        report,
+    );
+    dg_load_linear(
+        &mut layer.self_attn.k_proj,
+        weights,
+        &format!("{p}.self_attn.k_proj"),
+        report,
+    );
+    if let Some(ref mut v) = layer.self_attn.v_proj {
+        dg_load_linear(v, weights, &format!("{p}.self_attn.v_proj"), report);
+    }
+    dg_load_linear(
+        &mut layer.self_attn.o_proj,
+        weights,
+        &format!("{p}.self_attn.o_proj"),
+        report,
+    );
+    dg_load_norm(
+        &mut layer.self_attn.q_norm.weight,
+        weights,
+        &format!("{p}.self_attn.q_norm.weight"),
+        report,
+    );
+    dg_load_norm(
+        &mut layer.self_attn.k_norm.weight,
+        weights,
+        &format!("{p}.self_attn.k_norm.weight"),
+        report,
+    );
 
-        // Experts (fused 3-D tensors, stored in HF layout).
-        dg_load_param(
-            &mut layer.experts.gate_up_proj,
-            weights,
-            &format!("{p}.experts.gate_up_proj"),
-            &mut report,
-        );
-        dg_load_param(
-            &mut layer.experts.down_proj,
-            weights,
-            &format!("{p}.experts.down_proj"),
-            &mut report,
-        );
+    // Dense MLP.
+    dg_load_linear(
+        &mut layer.mlp.gate_proj,
+        weights,
+        &format!("{p}.mlp.gate_proj"),
+        report,
+    );
+    dg_load_linear(
+        &mut layer.mlp.up_proj,
+        weights,
+        &format!("{p}.mlp.up_proj"),
+        report,
+    );
+    dg_load_linear(
+        &mut layer.mlp.down_proj,
+        weights,
+        &format!("{p}.mlp.down_proj"),
+        report,
+    );
 
-        // Per-layer scalar (persistent buffer in HF).
-        dg_load_param(
-            &mut layer.layer_scalar,
-            weights,
-            &format!("{p}.layer_scalar"),
-            &mut report,
-        );
+    // Router.
+    dg_load_linear(
+        &mut layer.router.proj,
+        weights,
+        &format!("{p}.router.proj"),
+        report,
+    );
+    dg_load_param(
+        &mut layer.router.scale,
+        weights,
+        &format!("{p}.router.scale"),
+        report,
+    );
+    dg_load_param(
+        &mut layer.router.per_expert_scale,
+        weights,
+        &format!("{p}.router.per_expert_scale"),
+        report,
+    );
+
+    // Experts (fused 3-D tensors, stored in HF layout).
+    dg_load_param(
+        &mut layer.experts.gate_up_proj,
+        weights,
+        &format!("{p}.experts.gate_up_proj"),
+        report,
+    );
+    dg_load_param(
+        &mut layer.experts.down_proj,
+        weights,
+        &format!("{p}.experts.down_proj"),
+        report,
+    );
+
+    // Per-layer scalar (persistent buffer in HF).
+    dg_load_param(
+        &mut layer.layer_scalar,
+        weights,
+        &format!("{p}.layer_scalar"),
+        report,
+    );
+}
+
+/// Load HF `DiffusionGemmaDecoderModel` weights into a
+/// [`DiffusionGemmaDecoderModel`]. The decoder shares its trunk (`layers.*`,
+/// `embed_tokens`, `norm`) with the encoder (tied in the full model) and adds
+/// the decoder-only `self_conditioning` block (`post_norm` is weight-less, so
+/// it is absent from the checkpoint).
+pub fn load_diffusion_gemma_decoder_weights(
+    model: &mut DiffusionGemmaDecoderModel,
+    weights: &HashMap<String, Array>,
+) -> Result<LoadReport, Exception> {
+    let mut report = LoadReport::default();
+
+    dg_load_norm(
+        &mut model.embed_tokens.weight,
+        weights,
+        "embed_tokens.weight",
+        &mut report,
+    );
+    dg_load_norm(&mut model.norm.weight, weights, "norm.weight", &mut report);
+
+    dg_load_norm(
+        &mut model.self_conditioning.pre_norm.weight,
+        weights,
+        "self_conditioning.pre_norm.weight",
+        &mut report,
+    );
+    dg_load_linear(
+        &mut model.self_conditioning.gate_proj,
+        weights,
+        "self_conditioning.gate_proj",
+        &mut report,
+    );
+    dg_load_linear(
+        &mut model.self_conditioning.up_proj,
+        weights,
+        "self_conditioning.up_proj",
+        &mut report,
+    );
+    dg_load_linear(
+        &mut model.self_conditioning.down_proj,
+        weights,
+        "self_conditioning.down_proj",
+        &mut report,
+    );
+
+    for (i, layer) in model.layers.iter_mut().enumerate() {
+        dg_load_text_layer(layer, weights, &format!("layers.{i}"), &mut report);
     }
 
     Ok(report)
@@ -1008,5 +1187,33 @@ mod tests {
         assert_eq!(kvs.len(), cfg.num_hidden_layers as usize);
         // Layer 0 is sliding: [B, n_kv_heads, seq, head_dim].
         assert_eq!(kvs[0].0.shape(), &[1, kv_layer_0, 5, cfg.head_dim]);
+    }
+
+    #[test]
+    #[serial]
+    fn decoder_forward_shape() {
+        let cfg = tiny_config();
+        // Encoder produces the read-only KV the decoder reads.
+        let mut encoder = DiffusionGemmaEncoderModel::new(cfg.clone()).unwrap();
+        let prompt = Array::from_slice(&[1i32, 2, 3, 4, 5, 6], &[1, 6]);
+        let (_enc_hidden, kvs) = encoder.forward(&prompt).unwrap();
+
+        let mut decoder = DiffusionGemmaDecoderModel::new(cfg.clone()).unwrap();
+        let canvas_ids = Array::from_slice(&[7i32, 8, 9, 10], &[1, 4]);
+        // Step 0: no self-conditioning signal.
+        let out = decoder.forward(&canvas_ids, &kvs, None).unwrap();
+        assert_eq!(out.shape(), &[1, 4, cfg.hidden_size]);
+
+        // Step >0: with self-conditioning logits over the vocab.
+        let sc_logits = pmetal_bridge::compat::random::uniform_range(
+            -1.0,
+            1.0,
+            &[1, 4, cfg.vocab_size],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        let out2 = decoder
+            .forward(&canvas_ids, &kvs, Some(&sc_logits))
+            .unwrap();
+        assert_eq!(out2.shape(), &[1, 4, cfg.hidden_size]);
     }
 }
