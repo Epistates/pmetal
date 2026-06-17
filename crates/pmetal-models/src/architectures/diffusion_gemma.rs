@@ -993,6 +993,16 @@ impl DiffusionGemmaForBlockDiffusion {
         }
     }
 
+    /// Encoder trunk hidden states `[B, seq, hidden]` — the natural
+    /// pre-LM-head representation for sentence-embedding / pooling endpoints
+    /// (`/v1/embeddings`). Runs the causal encoder and discards the per-layer
+    /// KV cache. (DiffusionGemma has no single causal next-token forward, so
+    /// the encoder output is the meaningful "hidden states" to pool over.)
+    pub fn encode_hidden(&mut self, input_ids: &Array) -> Result<Array, Exception> {
+        let (hidden, _kvs) = self.encoder.forward(input_ids)?;
+        Ok(hidden)
+    }
+
     /// Truncate sliding-attention layers' encoder K/V to the last
     /// `sliding_window - 1` positions, matching transformers'
     /// `DynamicSlidingWindowLayer` (non-compiled path). Full-attention layers
@@ -1399,6 +1409,99 @@ pub fn load_diffusion_gemma_decoder_weights(
         dg_load_text_layer(layer, weights, &format!("layers.{i}"), &mut report);
     }
 
+    Ok(report)
+}
+
+/// Parse a released `DiffusionGemmaConfig` (`model_type: diffusion_gemma`) JSON
+/// string into the text-tower [`DiffusionGemmaTextConfig`].
+///
+/// The checkpoint nests the text-tower fields under `text_config` and carries
+/// `canvas_length` (the block-diffusion canvas size) at the top level. This
+/// unwraps the former and folds the latter in. A bare `DiffusionGemmaTextConfig`
+/// (no `text_config` key — used by the synthetic parity fixtures) is also
+/// accepted. Vision / audio sub-configs are ignored (text path only).
+pub fn parse_diffusion_gemma_config(
+    config_content: &str,
+) -> Result<DiffusionGemmaTextConfig, Exception> {
+    let root: serde_json::Value =
+        serde_json::from_str(config_content).map_err(|e| Exception::custom(e.to_string()))?;
+    let text_json = root.get("text_config").unwrap_or(&root);
+    let mut config: DiffusionGemmaTextConfig =
+        serde_json::from_value(text_json.clone()).map_err(|e| Exception::custom(e.to_string()))?;
+    // `canvas_length` lives on the outer config; mirror it into the text config
+    // (which owns the decoder's canvas geometry).
+    if let Some(canvas) = root.get("canvas_length").and_then(|v| v.as_i64()) {
+        config.canvas_length = canvas as i32;
+    }
+    Ok(config)
+}
+
+/// Load a full `DiffusionGemmaForBlockDiffusion` checkpoint into the model.
+///
+/// The HF checkpoint stores the trunk once and ties three ways:
+/// `lm_head.weight` ⇄ `model.decoder.embed_tokens.weight`, and the whole
+/// encoder text tower (`model.encoder.language_model.{embed_tokens,layers,norm}`)
+/// ⇄ the decoder trunk (`model.decoder.{embed_tokens,layers,norm}`). Only the
+/// decoder carries the extra `self_conditioning.*` block.
+///
+/// Because tying lets `save_pretrained` keep a single physical copy of each
+/// shared tensor, this remapper resolves every trunk slot from whichever copy
+/// is present — decoder first, then the encoder copy, then (for the embedding
+/// only) the tied `lm_head.weight` — and feeds the reconstructed per-tower
+/// state dicts to [`load_diffusion_gemma_encoder_weights`] /
+/// [`load_diffusion_gemma_decoder_weights`]. The two towers share the same
+/// (reference-counted) tensors, matching the model's weight tying.
+pub fn load_diffusion_gemma_weights(
+    model: &mut DiffusionGemmaForBlockDiffusion,
+    weights: &HashMap<String, Array>,
+) -> Result<LoadReport, Exception> {
+    // Trunk slots keyed relative to a tower root (e.g.
+    // `layers.3.self_attn.q_proj.weight`, `embed_tokens.weight`, `norm.weight`).
+    let mut trunk: HashMap<String, Array> = HashMap::new(); // decoder copies (authoritative)
+    let mut trunk_enc: HashMap<String, Array> = HashMap::new(); // encoder copies (fallback)
+    let mut self_cond: HashMap<String, Array> = HashMap::new(); // decoder-only
+    let mut lm_head: Option<Array> = None;
+
+    for (key, value) in weights {
+        let k = key.strip_prefix("model.").unwrap_or(key.as_str());
+        if let Some(rest) = k.strip_prefix("encoder.language_model.") {
+            trunk_enc.insert(rest.to_string(), value.clone());
+        } else if let Some(rest) = k.strip_prefix("decoder.") {
+            if rest.starts_with("self_conditioning.") {
+                self_cond.insert(rest.to_string(), value.clone());
+            } else {
+                trunk.insert(rest.to_string(), value.clone());
+            }
+        } else if k == "lm_head.weight" {
+            lm_head = Some(value.clone());
+        }
+        // Other keys (vision / audio towers) are intentionally dropped.
+    }
+
+    // Fill any trunk gaps from the encoder copy (tied ⇒ identical tensors).
+    for (slot, value) in trunk_enc {
+        trunk.entry(slot).or_insert(value);
+    }
+    // The embedding may only survive physically as the tied `lm_head.weight`.
+    if !trunk.contains_key("embed_tokens.weight") {
+        if let Some(w) = lm_head {
+            trunk.insert("embed_tokens.weight".to_string(), w);
+        }
+    }
+
+    // Encoder state dict = the resolved trunk; decoder = trunk + self-conditioning.
+    let encoder_weights = trunk.clone();
+    let mut decoder_weights = trunk;
+    decoder_weights.extend(self_cond);
+
+    let enc_report = load_diffusion_gemma_encoder_weights(&mut model.encoder, &encoder_weights)?;
+    let dec_report = load_diffusion_gemma_decoder_weights(&mut model.decoder, &decoder_weights)?;
+
+    let mut report = LoadReport {
+        loaded: enc_report.loaded + dec_report.loaded,
+        skipped: enc_report.skipped,
+    };
+    report.skipped.extend(dec_report.skipped);
     Ok(report)
 }
 

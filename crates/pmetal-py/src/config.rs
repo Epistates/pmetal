@@ -478,6 +478,7 @@ pub enum PyModelArchitecture {
     Gemma4,
     Bert,
     Flux,
+    DiffusionGemma,
 }
 
 impl From<pmetal_models::ModelArchitecture> for PyModelArchitecture {
@@ -501,6 +502,7 @@ impl From<pmetal_models::ModelArchitecture> for PyModelArchitecture {
             pmetal_models::ModelArchitecture::Gemma4 => Self::Gemma4,
             pmetal_models::ModelArchitecture::Bert => Self::Bert,
             pmetal_models::ModelArchitecture::Flux => Self::Flux,
+            pmetal_models::ModelArchitecture::DiffusionGemma => Self::DiffusionGemma,
         }
     }
 }

@@ -59,6 +59,8 @@ pub enum ModelArchitecture {
     Flux,
     /// BERT / RoBERTa / DistilBERT encoder-only model.
     Bert,
+    /// DiffusionGemma block-autoregressive discrete-diffusion encoder–decoder LM.
+    DiffusionGemma,
 }
 
 impl std::fmt::Display for ModelArchitecture {
@@ -82,6 +84,7 @@ impl std::fmt::Display for ModelArchitecture {
             Self::Gemma4 => write!(f, "Gemma 4"),
             Self::Flux => write!(f, "Flux"),
             Self::Bert => write!(f, "BERT"),
+            Self::DiffusionGemma => write!(f, "DiffusionGemma"),
         }
     }
 }
@@ -105,6 +108,9 @@ impl ModelArchitecture {
             // scalar, final logit softcapping). Multimodal wrappers nest
             // the text backbone under `text_config`; the loader unwraps.
             "gemma4" | "gemma4_text" => Some(Self::Gemma4),
+            // DiffusionGemma must be matched before the generic gemma fallbacks
+            // (its model_type is distinct, but keep it explicit).
+            "diffusion_gemma" | "diffusion_gemma_text" => Some(Self::DiffusionGemma),
             "mistral" | "mixtral" => Some(Self::Mistral),
             "phi4" => Some(Self::Phi4),
             "phi" | "phi3" => Some(Self::Phi),
@@ -150,6 +156,11 @@ impl ModelArchitecture {
             }
             if lower.contains("qwen2") || lower.contains("qwen") {
                 return Some(Self::Qwen2);
+            }
+            // DiffusionGemma before the generic gemma checks: its arch string
+            // (`DiffusionGemmaForBlockDiffusion`) contains "gemma".
+            if lower.contains("diffusiongemma") || lower.contains("diffusion_gemma") {
+                return Some(Self::DiffusionGemma);
             }
             if lower.contains("gemma4assistant") || lower.contains("gemma4_assistant") {
                 return None;
@@ -251,6 +262,7 @@ macro_rules! dispatch_uniform {
             Self::Gemma4(m) => m.$method($($arg),*),
             Self::Flux(m) => m.$method($($arg),*),
             Self::Bert(m) => m.$method($($arg),*),
+            Self::DiffusionGemma(m) => m.$method($($arg),*),
         }
     };
 }
@@ -277,6 +289,7 @@ macro_rules! dispatch_architecture {
             Self::Gemma4(_) => ModelArchitecture::Gemma4,
             Self::Flux(_) => ModelArchitecture::Flux,
             Self::Bert(_) => ModelArchitecture::Bert,
+            Self::DiffusionGemma(_) => ModelArchitecture::DiffusionGemma,
         }
     };
 }
@@ -345,6 +358,7 @@ pub enum DynamicModel {
     Gemma4(Gemma4ForCausalLM),
     Flux(FluxDiT),
     Bert(BertForEmbedding),
+    DiffusionGemma(DiffusionGemmaForBlockDiffusion),
 }
 
 impl std::fmt::Debug for DynamicModel {
@@ -368,6 +382,7 @@ impl std::fmt::Debug for DynamicModel {
             Self::Gemma4(_) => write!(f, "DynamicModel::Gemma4"),
             Self::Flux(_) => write!(f, "DynamicModel::Flux"),
             Self::Bert(_) => write!(f, "DynamicModel::Bert"),
+            Self::DiffusionGemma(_) => write!(f, "DynamicModel::DiffusionGemma"),
         }
     }
 }
@@ -702,6 +717,33 @@ impl DynamicModel {
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Bert(model))
             }
+            ModelArchitecture::DiffusionGemma => {
+                // DiffusionGemma nests the text tower under `text_config` and
+                // carries `canvas_length` at the top level; the parser folds
+                // both into the text config. The checkpoint ties the encoder
+                // trunk, decoder trunk, and `lm_head` to a single physical
+                // copy of each tensor, so a bespoke remapper resolves every
+                // trunk slot before the per-tower loaders run.
+                let config = crate::architectures::diffusion_gemma::parse_diffusion_gemma_config(
+                    &config_content,
+                )?;
+                let mut model = DiffusionGemmaForBlockDiffusion::new(config)?;
+                let weights = crate::loader::load_weights(model_dir)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                let report = crate::architectures::diffusion_gemma::load_diffusion_gemma_weights(
+                    &mut model, &weights,
+                )?;
+                if !report.skipped.is_empty() {
+                    tracing::info!(
+                        "DiffusionGemma weight load: {} loaded, {} skipped (first: {:?})",
+                        report.loaded,
+                        report.skipped.len(),
+                        report.skipped.first()
+                    );
+                }
+                eval_module_parameters_batched(&model)?;
+                Ok(Self::DiffusionGemma(model))
+            }
         }
     }
 
@@ -729,6 +771,15 @@ impl DynamicModel {
             // BERT encoder: forward returns hidden states [batch, seq, hidden], not logits.
             // Use EmbeddingTrainer::encode() / pmetal_models::pooling::pool() for embeddings.
             Self::Bert(m) => BertForEmbedding::forward(m, input_ids, mask),
+            // DiffusionGemma is a block-autoregressive discrete-diffusion model:
+            // it has no single causal next-token forward. Use
+            // `as_diffusion_gemma_mut().generate(...)` for sampling, or
+            // `forward_hidden` for the encoder trunk representation.
+            Self::DiffusionGemma(_) => Err(Exception::custom(
+                "DiffusionGemma has no causal forward(input_ids, mask). Use \
+                 DynamicModel::as_diffusion_gemma_mut().generate(...) for block-diffusion \
+                 sampling, or forward_hidden() for the encoder trunk.",
+            )),
         }
     }
 
@@ -778,11 +829,15 @@ impl DynamicModel {
             Self::Phi(m) => m.model.forward_with_cache(input_ids, mask, None),
             Self::Phi4(m) => m.model.forward_with_cache(input_ids, mask, None),
             Self::Bert(m) => BertForEmbedding::forward(m, input_ids, mask),
+            // DiffusionGemma: the causal encoder trunk is the natural
+            // pre-LM-head representation to pool over (the decoder denoises a
+            // canvas and has no single hidden-state-per-input-token output).
+            Self::DiffusionGemma(m) => m.encode_hidden(input_ids),
             other => Err(Exception::custom(format!(
                 "forward_hidden not implemented for {:?} — supported archs: \
                  Llama, Llama4, Qwen2, Qwen3, Qwen3MoE, Mistral, Gemma, \
                  Gemma4, Phi, Phi4, DeepSeek, Cohere, Granite, GptOss, \
-                 NemotronH, Qwen3Next, BERT",
+                 NemotronH, Qwen3Next, BERT, DiffusionGemma",
                 other
             ))),
         }
@@ -821,6 +876,12 @@ impl DynamicModel {
             )),
             // BERT is encoder-only (no autoregressive cache) — delegate to standard forward.
             Self::Bert(m) => BertForEmbedding::forward(m, input_ids, mask),
+            // DiffusionGemma's KV cache is internal to its encoder–decoder
+            // generate loop and is not a standard causal KV cache.
+            Self::DiffusionGemma(_) => Err(Exception::custom(
+                "DiffusionGemma does not support forward_with_cache. Use \
+                 DynamicModel::as_diffusion_gemma_mut().generate(...).",
+            )),
         }
     }
 
@@ -858,6 +919,9 @@ impl DynamicModel {
             Self::GptOss(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Gemma4(m) => crate::fp8_utils::quantize_model_linears(m),
             Self::Bert(m) => crate::fp8_utils::quantize_model_linears(m),
+            // Generic linear-weight quantization; the fused 3-D expert tensors
+            // (not `.weight`) stay in their loaded dtype, same as other MoE archs.
+            Self::DiffusionGemma(m) => crate::fp8_utils::quantize_model_linears(m),
         }
     }
 
@@ -927,6 +991,9 @@ impl DynamicModel {
             Self::Flux(_) => KVCache::new(KVCacheConfig::new(0, 0, 0, 0)),
             // BERT is encoder-only with no autoregressive KV cache.
             Self::Bert(_) => KVCache::new(KVCacheConfig::new(0, 0, 0, 0)),
+            // DiffusionGemma manages its encoder KV internally inside generate();
+            // there is no external standard causal cache.
+            Self::DiffusionGemma(_) => KVCache::new(KVCacheConfig::new(0, 0, 0, 0)),
         }
     }
 
@@ -1077,6 +1144,16 @@ impl DynamicModel {
         }
     }
 
+    /// Access the underlying [`DiffusionGemmaForBlockDiffusion`] for
+    /// block-autoregressive discrete-diffusion generation (`generate(...)`),
+    /// which is not expressible through the standard causal `forward` path.
+    pub fn as_diffusion_gemma_mut(&mut self) -> Option<&mut DiffusionGemmaForBlockDiffusion> {
+        match self {
+            Self::DiffusionGemma(m) => Some(m),
+            _ => None,
+        }
+    }
+
     pub fn vocab_size(&self) -> i32 {
         match self {
             Self::Llama(m) => m.model.config.vocab_size,
@@ -1097,6 +1174,7 @@ impl DynamicModel {
             Self::Gemma4(m) => m.config.vocab_size,
             Self::Flux(_) => 0,
             Self::Bert(m) => m.config().vocab_size as i32,
+            Self::DiffusionGemma(m) => m.vocab_size,
         }
     }
 
@@ -1120,6 +1198,7 @@ impl DynamicModel {
             Self::Gemma4(m) => m.config.hidden_size,
             Self::Flux(m) => m.pos_embedder.dim as i32,
             Self::Bert(m) => m.config().hidden_size as i32,
+            Self::DiffusionGemma(m) => m.encoder.config.hidden_size,
         }
     }
 
@@ -1143,6 +1222,7 @@ impl DynamicModel {
             Self::Gemma4(m) => eval_module_parameters_batched(m),
             Self::Flux(m) => eval_module_parameters_batched(m),
             Self::Bert(m) => eval_module_parameters_batched(m),
+            Self::DiffusionGemma(m) => eval_module_parameters_batched(m),
         }
     }
 
@@ -1406,6 +1486,29 @@ mod tests {
         assert_eq!(
             ModelArchitecture::from_architectures(&architectures),
             Some(ModelArchitecture::Gemma4)
+        );
+    }
+
+    #[test]
+    fn diffusion_gemma_model_type_detects() {
+        assert_eq!(
+            ModelArchitecture::from_model_type("diffusion_gemma"),
+            Some(ModelArchitecture::DiffusionGemma)
+        );
+        assert_eq!(
+            ModelArchitecture::from_model_type("diffusion_gemma_text"),
+            Some(ModelArchitecture::DiffusionGemma)
+        );
+    }
+
+    #[test]
+    fn diffusion_gemma_architecture_string_does_not_fall_through_to_gemma() {
+        // `DiffusionGemmaForBlockDiffusion` contains "gemma"; the dedicated
+        // check must win over the generic Gemma fallback.
+        let architectures = vec!["DiffusionGemmaForBlockDiffusion".to_string()];
+        assert_eq!(
+            ModelArchitecture::from_architectures(&architectures),
+            Some(ModelArchitecture::DiffusionGemma)
         );
     }
 

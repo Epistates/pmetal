@@ -1087,8 +1087,8 @@ impl DFlashTarget for DynamicModel {
             Self::Cohere(_) => Err(dflash_architecture_unsupported("Cohere")),
             Self::Granite(_) => Err(dflash_architecture_unsupported("Granite")),
             Self::NemotronH(_) => Err(dflash_architecture_unsupported("NemotronH")),
-            Self::Flux(_) | Self::Bert(_) => Err(Exception::custom(
-                "DFlashTarget: Flux / BERT are not causal LMs and cannot serve as DFlash targets",
+            Self::Flux(_) | Self::Bert(_) | Self::DiffusionGemma(_) => Err(Exception::custom(
+                "DFlashTarget: Flux / BERT / DiffusionGemma are not causal LMs and cannot serve as DFlash targets",
             )),
         }
     }
@@ -1163,8 +1163,8 @@ impl DFlashTarget for DynamicModel {
             Self::Cohere(_) => Err(dflash_architecture_unsupported("Cohere")),
             Self::Granite(_) => Err(dflash_architecture_unsupported("Granite")),
             Self::NemotronH(_) => Err(dflash_architecture_unsupported("NemotronH")),
-            Self::Flux(_) | Self::Bert(_) => Err(Exception::custom(
-                "DFlashTarget: Flux / BERT are not causal LMs",
+            Self::Flux(_) | Self::Bert(_) | Self::DiffusionGemma(_) => Err(Exception::custom(
+                "DFlashTarget: Flux / BERT / DiffusionGemma are not causal LMs",
             )),
         }
     }
