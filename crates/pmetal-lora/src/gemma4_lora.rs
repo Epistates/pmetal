@@ -1447,6 +1447,9 @@ mod tests {
             num_kv_shared_layers: Some(0),
             use_double_wide_mlp: Some(false),
             enable_moe_block: Some(false),
+            num_experts: None,
+            top_k_experts: None,
+            moe_intermediate_size: None,
         }
     }
 

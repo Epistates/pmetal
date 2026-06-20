@@ -332,6 +332,15 @@ pub struct Gemma4Config {
     pub use_double_wide_mlp: Option<bool>,
     #[serde(default)]
     pub enable_moe_block: Option<bool>,
+    /// MoE expert count (`enable_moe_block` layers only). `None` for dense.
+    #[serde(default)]
+    pub num_experts: Option<i32>,
+    /// Experts activated per token (top-k routing).
+    #[serde(default)]
+    pub top_k_experts: Option<i32>,
+    /// Per-expert FFN intermediate size.
+    #[serde(default)]
+    pub moe_intermediate_size: Option<i32>,
 }
 
 fn default_model_type() -> String {
@@ -428,8 +437,15 @@ impl Gemma4Config {
                 "Gemma 4 unsupported per-layer-input activation {act:?}"
             )));
         }
-        if self.enable_moe_block.unwrap_or(false) {
-            return Err(Exception::custom("Gemma 4 MoE block is not ported yet."));
+        if self.enable_moe_block.unwrap_or(false)
+            && (self.num_experts.is_none()
+                || self.top_k_experts.is_none()
+                || self.moe_intermediate_size.is_none())
+        {
+            return Err(Exception::custom(
+                "Gemma 4 MoE block enabled but num_experts / top_k_experts / \
+                 moe_intermediate_size are missing from the config.",
+            ));
         }
         if self.use_double_wide_mlp.unwrap_or(false) {
             return Err(Exception::custom(
@@ -627,6 +643,228 @@ impl Gemma4Mlp {
         // `nn::gelu_tanh_approximate` in the bridge compat layer.
         let gelu_gate = nn::gelu_tanh_approximate(&gate);
         Ok(self.down_proj.forward(&gelu_gate.multiply(&up)))
+    }
+}
+
+// ----------------------------------------------------------------------------
+// MoE block (parallel dense + routed experts)
+// ----------------------------------------------------------------------------
+
+/// Gemma 4 MoE router (`Gemma4TextRouter`).
+///
+/// `softmax(proj(norm(x) · scale · hidden^-0.5))` over experts, then top-k,
+/// renormalise to sum 1, and multiply by the learned `per_expert_scale`. The
+/// softmax runs in fp32; `norm` is weight-less RMSNorm. Also reused by
+/// DiffusionGemma (its `DiffusionGemmaRouter` is an alias).
+#[derive(Debug)]
+pub struct Gemma4Router {
+    pub proj: nn::Linear,
+    /// Per-channel pre-projection scale `[hidden_size]`.
+    pub scale: Param<Array>,
+    /// Per-expert output scale `[num_experts]`.
+    pub per_expert_scale: Param<Array>,
+    pub top_k: i32,
+    pub scalar_root_size: f32,
+    pub eps: f32,
+}
+impl_module_params!(Gemma4Router; proj, scale, per_expert_scale);
+
+impl Gemma4Router {
+    pub fn new(
+        hidden_size: i32,
+        num_experts: i32,
+        top_k: i32,
+        eps: f32,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            proj: nn::LinearBuilder::new(hidden_size, num_experts)
+                .bias(false)
+                .build()?,
+            scale: Param::new(Array::ones_f32(&[hidden_size])),
+            per_expert_scale: Param::new(Array::ones_f32(&[num_experts])),
+            top_k,
+            scalar_root_size: (hidden_size as f32).powf(-0.5),
+            eps,
+        })
+    }
+
+    /// Route a `[N, hidden]` tensor of (flattened) tokens. Returns
+    /// `(top_indices, top_weights)`, both `[N, top_k]` — indices `i32`,
+    /// weights already renormalised and per-expert-scaled.
+    pub fn route(&mut self, hidden_flat: &Array) -> Result<(Array, Array), Exception> {
+        let normed = rms_norm_noscale(hidden_flat, self.eps);
+        let scaled = normed
+            .multiply(self.scale.as_ref())
+            .multiply(&Array::from_f32(self.scalar_root_size));
+        let scores = self.proj.forward(&scaled);
+        let scores_f32 = scores.as_type::<f32>();
+        let probs = ops::softmax_axis(&scores_f32, -1);
+
+        let (top_indices, top_weights) =
+            crate::moe_routing::topk_normalize(&probs, self.top_k, true)?;
+
+        let n = top_indices.dim(0);
+        let k = top_indices.dim(1);
+        let idx_flat = top_indices.reshape(&[n * k]);
+        let gathered = self
+            .per_expert_scale
+            .as_ref()
+            .take_axis(&idx_flat, 0)
+            .reshape(&[n, k]);
+        let top_weights = top_weights.multiply(&gathered);
+        Ok((top_indices, top_weights))
+    }
+}
+
+/// Gemma 4 grouped expert FFNs (`Gemma4TextExperts`).
+///
+/// Fused 3-D parameters `gate_up_proj [E, 2·I, H]` (gate and up concatenated
+/// along the output axis) and `down_proj [E, H, I]`, matching `nn.Linear`
+/// weight layout (`out_features` first). Activation is gelu-tanh. Reused by
+/// DiffusionGemma (alias `DiffusionGemmaExperts`).
+#[derive(Debug)]
+pub struct Gemma4Experts {
+    pub gate_up_proj: Param<Array>,
+    pub down_proj: Param<Array>,
+    pub num_experts: i32,
+    pub moe_intermediate_size: i32,
+    pub hidden_size: i32,
+}
+impl_module_params!(Gemma4Experts; gate_up_proj, down_proj);
+
+impl Gemma4Experts {
+    pub fn new(
+        num_experts: i32,
+        moe_intermediate_size: i32,
+        hidden_size: i32,
+    ) -> Result<Self, Exception> {
+        Ok(Self {
+            gate_up_proj: Param::new(Array::zeros_f32(&[
+                num_experts,
+                2 * moe_intermediate_size,
+                hidden_size,
+            ])),
+            down_proj: Param::new(Array::zeros_f32(&[
+                num_experts,
+                hidden_size,
+                moe_intermediate_size,
+            ])),
+            num_experts,
+            moe_intermediate_size,
+            hidden_size,
+        })
+    }
+
+    /// Apply the experts to a `[N, hidden]` tensor, dispatching each token to
+    /// its `top_indices` experts and weighting by `top_weights`
+    /// (both `[N, top_k]`). Returns `[N, hidden]`.
+    pub fn forward(
+        &self,
+        hidden_flat: &Array,
+        top_indices: &Array,
+        top_weights: &Array,
+    ) -> Result<Array, Exception> {
+        let n = hidden_flat.dim(0);
+        let h = self.hidden_size;
+        let i = self.moe_intermediate_size;
+        let k = top_indices.dim(1);
+
+        let mut out = ops::zeros_dtype(&[n, h], hidden_flat.dtype());
+        for slot in 0..k {
+            let slot_experts = ops::slice_axis(top_indices, -1, slot, slot + 1).reshape(&[n]);
+            let slot_weights = ops::slice_axis(top_weights, -1, slot, slot + 1); // [N, 1]
+
+            let gate_up_w = self
+                .gate_up_proj
+                .as_ref()
+                .take_axis(&slot_experts, 0)
+                .transpose_axes(&[0, 2, 1]);
+            let x_b = hidden_flat.reshape(&[n, 1, h]);
+            let gate_up = ops::matmul(&x_b, &gate_up_w).squeeze_axes(&[1]); // [N, 2I]
+            let gate = ops::slice_axis(&gate_up, -1, 0, i);
+            let up = ops::slice_axis(&gate_up, -1, i, 2 * i);
+            let activated = nn::gelu_tanh_approximate(&gate).multiply(&up); // [N, I]
+
+            let down_w = self
+                .down_proj
+                .as_ref()
+                .take_axis(&slot_experts, 0)
+                .transpose_axes(&[0, 2, 1]);
+            let act_b = activated.reshape(&[n, 1, i]);
+            let down = ops::matmul(&act_b, &down_w).squeeze_axes(&[1]); // [N, H]
+
+            out = out.add(&down.multiply(&slot_weights));
+        }
+        Ok(out)
+    }
+}
+
+/// Gemma 4 per-layer MoE block: the routed-experts branch that runs in
+/// *parallel* with the dense MLP and is summed into the same residual. Present
+/// only on `enable_moe_block` layers. Holds the router, the grouped experts,
+/// and the three MoE-only RMSNorms (the dense branch's post-norm `_1`, and the
+/// expert branch's pre/post norms `_2`).
+#[derive(Debug)]
+pub struct Gemma4MoeBlock {
+    pub router: Gemma4Router,
+    pub experts: Gemma4Experts,
+    pub post_feedforward_layernorm_1: Gemma4RmsNorm,
+    pub pre_feedforward_layernorm_2: Gemma4RmsNorm,
+    pub post_feedforward_layernorm_2: Gemma4RmsNorm,
+}
+impl_module_params!(
+    Gemma4MoeBlock;
+    router,
+    experts,
+    post_feedforward_layernorm_1,
+    pre_feedforward_layernorm_2,
+    post_feedforward_layernorm_2
+);
+
+impl Gemma4MoeBlock {
+    pub fn new(config: &Gemma4Config) -> Result<Self, Exception> {
+        let num_experts = config
+            .num_experts
+            .ok_or_else(|| Exception::custom("Gemma4MoeBlock: num_experts missing from config"))?;
+        let top_k = config.top_k_experts.ok_or_else(|| {
+            Exception::custom("Gemma4MoeBlock: top_k_experts missing from config")
+        })?;
+        let moe_intermediate = config.moe_intermediate_size.ok_or_else(|| {
+            Exception::custom("Gemma4MoeBlock: moe_intermediate_size missing from config")
+        })?;
+        let h = config.hidden_size;
+        let eps = config.rms_norm_eps;
+        Ok(Self {
+            router: Gemma4Router::new(h, num_experts, top_k, eps)?,
+            experts: Gemma4Experts::new(num_experts, moe_intermediate, h)?,
+            post_feedforward_layernorm_1: Gemma4RmsNorm::new(h, eps),
+            pre_feedforward_layernorm_2: Gemma4RmsNorm::new(h, eps),
+            post_feedforward_layernorm_2: Gemma4RmsNorm::new(h, eps),
+        })
+    }
+
+    /// Combine the dense-MLP output with the routed-experts output.
+    ///
+    /// `dense` is the dense branch's output (`mlp(pre_feedforward_layernorm(h))`,
+    /// before any post-norm); `residual` is the raw post-attention residual
+    /// `[B, S, H]` that the router reads. Returns `dense_1 + moe_2` (each
+    /// post-normed), still pre the shared `post_feedforward_layernorm`.
+    pub fn forward(&mut self, dense: &Array, residual: &Array) -> Result<Array, Exception> {
+        let dense = self.post_feedforward_layernorm_1.forward(dense);
+
+        let b = residual.dim(0);
+        let s = residual.dim(1);
+        let hidden = residual.dim(2);
+        let flat = residual.reshape(&[b * s, hidden]);
+        let (top_indices, top_weights) = self.router.route(&flat)?;
+        let experts_in = self.pre_feedforward_layernorm_2.forward(&flat);
+        let moe = self
+            .experts
+            .forward(&experts_in, &top_indices, &top_weights)?
+            .reshape(&[b, s, hidden]);
+        let moe = self.post_feedforward_layernorm_2.forward(&moe);
+
+        Ok(dense.add(&moe))
     }
 }
 
@@ -905,6 +1143,10 @@ pub struct Gemma4DecoderLayer {
     pub mlp: Gemma4Mlp,
     pub post_feedforward_layernorm: Gemma4RmsNorm,
     pub per_layer_input_block: Option<Gemma4PerLayerInputBlock>,
+    /// Parallel routed-experts branch, present only on `enable_moe_block`
+    /// layers. When `Some`, the dense MLP and the MoE block both feed the
+    /// same residual and are summed before `post_feedforward_layernorm`.
+    pub moe: Option<Gemma4MoeBlock>,
     /// Per-layer scalar multiplier. The reference stores it as a 1-element
     /// tensor initialised to 1.0; applied as `h = h * layer_scalar` at the
     /// end of the layer forward.
@@ -920,6 +1162,7 @@ impl_module_params!(
     mlp,
     post_feedforward_layernorm,
     per_layer_input_block,
+    moe,
     layer_scalar
 );
 
@@ -934,6 +1177,11 @@ impl Gemma4DecoderLayer {
             post_feedforward_layernorm: Gemma4RmsNorm::new(config.hidden_size, config.rms_norm_eps),
             per_layer_input_block: if config.uses_per_layer_inputs() {
                 Some(Gemma4PerLayerInputBlock::new(config)?)
+            } else {
+                None
+            },
+            moe: if config.enable_moe_block.unwrap_or(false) {
+                Some(Gemma4MoeBlock::new(config)?)
             } else {
                 None
             },
@@ -952,9 +1200,18 @@ impl Gemma4DecoderLayer {
         let h = residual_in.add(&h);
 
         let residual = h.clone();
-        let h = self.pre_feedforward_layernorm.forward(&h);
-        let h = self.mlp.forward(&h)?;
-        let h = self.post_feedforward_layernorm.forward(&h);
+        let dense = self
+            .mlp
+            .forward(&self.pre_feedforward_layernorm.forward(&h))?;
+        // MoE layers add a routed-experts branch (reading the RAW residual)
+        // in parallel with the dense MLP; both are summed before the shared
+        // post-feedforward norm. Dense-only layers pass `dense` through.
+        let ffn = if let Some(ref mut moe) = self.moe {
+            moe.forward(&dense, &residual)?
+        } else {
+            dense
+        };
+        let h = self.post_feedforward_layernorm.forward(&ffn);
         let mut h = residual.add(&h);
 
         if let Some(layer_input) = layer_input
@@ -1403,6 +1660,57 @@ pub fn load_gemma4_weights(
             &mut report,
         );
 
+        if let Some(ref mut moe) = layer.moe {
+            load_linear(
+                &mut moe.router.proj,
+                &weights,
+                &format!("{prefix}.router.proj"),
+                &mut report,
+            );
+            load_norm(
+                &mut moe.router.scale,
+                &weights,
+                &format!("{prefix}.router.scale"),
+                &mut report,
+            );
+            load_norm(
+                &mut moe.router.per_expert_scale,
+                &weights,
+                &format!("{prefix}.router.per_expert_scale"),
+                &mut report,
+            );
+            load_norm(
+                &mut moe.experts.gate_up_proj,
+                &weights,
+                &format!("{prefix}.experts.gate_up_proj"),
+                &mut report,
+            );
+            load_norm(
+                &mut moe.experts.down_proj,
+                &weights,
+                &format!("{prefix}.experts.down_proj"),
+                &mut report,
+            );
+            load_norm(
+                &mut moe.post_feedforward_layernorm_1.weight,
+                &weights,
+                &format!("{prefix}.post_feedforward_layernorm_1.weight"),
+                &mut report,
+            );
+            load_norm(
+                &mut moe.pre_feedforward_layernorm_2.weight,
+                &weights,
+                &format!("{prefix}.pre_feedforward_layernorm_2.weight"),
+                &mut report,
+            );
+            load_norm(
+                &mut moe.post_feedforward_layernorm_2.weight,
+                &weights,
+                &format!("{prefix}.post_feedforward_layernorm_2.weight"),
+                &mut report,
+            );
+        }
+
         if let Some(w) = weights.get(&format!("{prefix}.layer_scalar")) {
             layer.layer_scalar = Param::new(w.clone());
             report.loaded += 1;
@@ -1446,4 +1754,163 @@ fn load_norm(
 pub struct LoadReport {
     pub loaded: usize,
     pub skipped: Vec<String>,
+}
+
+#[cfg(test)]
+mod moe_tests {
+    use super::*;
+    use serial_test::serial;
+
+    const VOCAB: i32 = 64;
+    const HIDDEN: i32 = 32;
+    const NUM_EXPERTS: i32 = 4;
+    const TOP_K: i32 = 2;
+    const MOE_INTER: i32 = 16;
+
+    /// Tiny 2-layer (1 sliding, 1 full) Gemma 4 text config. `moe` toggles the
+    /// always-on MoE block.
+    fn tiny_config(moe: bool) -> Gemma4Config {
+        Gemma4Config {
+            model_type: "gemma4_text".to_string(),
+            vocab_size: VOCAB,
+            hidden_size: HIDDEN,
+            intermediate_size: 48,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            global_head_dim: Some(16),
+            num_global_key_value_heads: Some(1),
+            max_position_embeddings: 256,
+            rms_norm_eps: 1e-6,
+            attention_k_eq_v: true,
+            tie_word_embeddings: true,
+            sliding_window: 8,
+            final_logit_softcapping: Some(30.0),
+            layer_types: vec![
+                "sliding_attention".to_string(),
+                "full_attention".to_string(),
+            ],
+            rope_parameters: None,
+            _raw_rope_parameters: None,
+            hidden_size_per_layer_input: None,
+            vocab_size_per_layer_input: None,
+            hidden_activation: Some("gelu_pytorch_tanh".to_string()),
+            num_kv_shared_layers: None,
+            use_double_wide_mlp: Some(false),
+            enable_moe_block: Some(moe),
+            num_experts: moe.then_some(NUM_EXPERTS),
+            top_k_experts: moe.then_some(TOP_K),
+            moe_intermediate_size: moe.then_some(MOE_INTER),
+        }
+    }
+
+    /// The MoE block is built only when `enable_moe_block` is set, and is
+    /// wired into the module-parameter tree (so load / train / eval traverse
+    /// it). A dense config leaves every layer's `moe` as `None`.
+    #[test]
+    #[serial]
+    fn moe_block_present_only_when_enabled_and_wired() {
+        let dense = Gemma4ForCausalLM::new(tiny_config(false)).unwrap();
+        assert!(dense.model.layers.iter().all(|l| l.moe.is_none()));
+
+        let moe = Gemma4ForCausalLM::new(tiny_config(true)).unwrap();
+        assert!(moe.model.layers.iter().all(|l| l.moe.is_some()));
+
+        // The MoE tensors must appear in the flattened parameter map.
+        let params = moe.flatten_params();
+        assert!(
+            params.keys().any(|k| k.ends_with("experts.gate_up_proj")),
+            "expected fused expert weights in the param tree"
+        );
+        assert!(
+            params
+                .keys()
+                .any(|k| k.ends_with("router.per_expert_scale")),
+            "expected router per-expert scale in the param tree"
+        );
+    }
+
+    /// An MoE model runs end-to-end through the parallel dense+MoE layer and
+    /// produces finite, correctly-shaped logits.
+    #[test]
+    #[serial]
+    fn moe_forward_runs_and_is_finite() {
+        let mut model = Gemma4ForCausalLM::new(tiny_config(true)).unwrap();
+        let input_ids = Array::from_slice(&[1i32, 2, 3, 4], &[1, 4]);
+        let logits = model.forward(&input_ids, None).unwrap();
+        assert_eq!(logits.shape(), &[1, 4, VOCAB]);
+
+        let host = {
+            let l = logits.as_type::<f32>();
+            l.eval();
+            l.as_slice::<f32>().to_vec()
+        };
+        assert!(
+            host.iter().all(|v| v.is_finite()),
+            "MoE forward produced non-finite logits"
+        );
+    }
+
+    /// The weight loader resolves the MoE tensor keys (router + fused experts +
+    /// the three MoE-only norms) for every MoE layer.
+    #[test]
+    #[serial]
+    fn load_gemma4_moe_weights_resolves_expert_keys() {
+        let mut model = Gemma4ForCausalLM::new(tiny_config(true)).unwrap();
+
+        // Minimal weight set: the required embedding + every layer's MoE keys,
+        // each shaped as the loader expects. Non-MoE tensors are intentionally
+        // omitted (they land in `skipped`); we only assert the MoE keys load.
+        let mut weights: HashMap<String, Array> = HashMap::new();
+        weights.insert(
+            "model.embed_tokens.weight".to_string(),
+            Array::zeros_f32(&[VOCAB, HIDDEN]),
+        );
+        let mut moe_keys: Vec<String> = Vec::new();
+        for i in 0..2 {
+            let p = format!("model.layers.{i}");
+            let entries: Vec<(String, Vec<i32>)> = vec![
+                (format!("{p}.router.proj.weight"), vec![NUM_EXPERTS, HIDDEN]),
+                (format!("{p}.router.scale"), vec![HIDDEN]),
+                (format!("{p}.router.per_expert_scale"), vec![NUM_EXPERTS]),
+                (
+                    format!("{p}.experts.gate_up_proj"),
+                    vec![NUM_EXPERTS, 2 * MOE_INTER, HIDDEN],
+                ),
+                (
+                    format!("{p}.experts.down_proj"),
+                    vec![NUM_EXPERTS, HIDDEN, MOE_INTER],
+                ),
+                (
+                    format!("{p}.post_feedforward_layernorm_1.weight"),
+                    vec![HIDDEN],
+                ),
+                (
+                    format!("{p}.pre_feedforward_layernorm_2.weight"),
+                    vec![HIDDEN],
+                ),
+                (
+                    format!("{p}.post_feedforward_layernorm_2.weight"),
+                    vec![HIDDEN],
+                ),
+            ];
+            for (key, shape) in entries {
+                weights.insert(key.clone(), Array::zeros_f32(&shape));
+                // The loader strips `.weight` off linear keys before lookup, so
+                // track the key form it reports skipped (the full tensor name).
+                moe_keys.push(key);
+            }
+        }
+
+        let report = load_gemma4_weights(&mut model, &weights).unwrap();
+        for key in &moe_keys {
+            assert!(
+                !report.skipped.contains(key),
+                "MoE weight {key} was not resolved by the loader"
+            );
+        }
+        // 8 MoE tensors per layer × 2 layers + embedding.
+        assert!(report.loaded >= 17, "loaded only {}", report.loaded);
+    }
 }

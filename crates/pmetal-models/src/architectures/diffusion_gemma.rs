@@ -287,7 +287,10 @@ impl DiffusionGemmaTextConfig {
             hidden_activation: Some(self.hidden_activation.clone()),
             num_kv_shared_layers: None,
             use_double_wide_mlp: None,
-            enable_moe_block: None,
+            enable_moe_block: Some(true),
+            num_experts: Some(self.num_experts),
+            top_k_experts: Some(self.top_k_experts),
+            moe_intermediate_size: Some(self.moe_intermediate_size),
         }
     }
 
@@ -300,149 +303,18 @@ impl DiffusionGemmaTextConfig {
 }
 
 // ----------------------------------------------------------------------------
-// Router
+// Router + Experts (canonical Gemma 4 MoE blocks)
 // ----------------------------------------------------------------------------
 
-/// MoE router (`DiffusionGemmaTextRouter`).
-///
-/// `softmax(proj(norm(x) · scale · hidden^-0.5))` over experts, then top-k,
-/// renormalise to sum 1, and multiply by the learned `per_expert_scale`.
-/// The softmax runs in fp32. `norm` is weight-less RMSNorm.
-#[derive(Debug)]
-pub struct DiffusionGemmaRouter {
-    pub proj: nn::Linear,
-    /// Per-channel pre-projection scale `[hidden_size]`.
-    pub scale: Param<Array>,
-    /// Per-expert output scale `[num_experts]`.
-    pub per_expert_scale: Param<Array>,
-    pub top_k: i32,
-    pub scalar_root_size: f32,
-    pub eps: f32,
-}
-impl_module_params!(DiffusionGemmaRouter; proj, scale, per_expert_scale);
-
-impl DiffusionGemmaRouter {
-    pub fn new(config: &DiffusionGemmaTextConfig) -> Result<Self, Exception> {
-        Ok(Self {
-            proj: nn::LinearBuilder::new(config.hidden_size, config.num_experts)
-                .bias(false)
-                .build()?,
-            scale: Param::new(Array::ones_f32(&[config.hidden_size])),
-            per_expert_scale: Param::new(Array::ones_f32(&[config.num_experts])),
-            top_k: config.top_k_experts,
-            scalar_root_size: (config.hidden_size as f32).powf(-0.5),
-            eps: config.rms_norm_eps,
-        })
-    }
-
-    /// Route a `[N, hidden]` tensor of (flattened) tokens. Returns
-    /// `(top_indices, top_weights)`, both `[N, top_k]` — indices `i32`,
-    /// weights already renormalised and per-expert-scaled.
-    pub fn route(&mut self, hidden_flat: &Array) -> Result<(Array, Array), Exception> {
-        let normed = rms_norm_noscale(hidden_flat, self.eps);
-        let scaled = normed
-            .multiply(self.scale.as_ref())
-            .multiply(&Array::from_f32(self.scalar_root_size));
-        let scores = self.proj.forward(&scaled);
-        let scores_f32 = scores.as_type::<f32>();
-        let probs = ops::softmax_axis(&scores_f32, -1);
-
-        let (top_indices, top_weights) =
-            crate::moe_routing::topk_normalize(&probs, self.top_k, true)?;
-
-        // Gather the per-expert scale for each selected expert and apply it.
-        let n = top_indices.dim(0);
-        let k = top_indices.dim(1);
-        let idx_flat = top_indices.reshape(&[n * k]);
-        let gathered = self
-            .per_expert_scale
-            .as_ref()
-            .take_axis(&idx_flat, 0)
-            .reshape(&[n, k]);
-        let top_weights = top_weights.multiply(&gathered);
-        Ok((top_indices, top_weights))
-    }
-}
-
-// ----------------------------------------------------------------------------
-// Experts
-// ----------------------------------------------------------------------------
-
-/// Grouped expert FFNs (`DiffusionGemmaTextExperts` / `Gemma4TextExperts`).
-///
-/// Weights are stored as fused 3-D parameters: `gate_up_proj [E, 2·I, H]`
-/// (gate and up concatenated along the output axis) and `down_proj [E, H, I]`,
-/// matching `nn.Linear` weight layout (`out_features` first). The activation
-/// is gelu-tanh.
-#[derive(Debug)]
-pub struct DiffusionGemmaExperts {
-    pub gate_up_proj: Param<Array>,
-    pub down_proj: Param<Array>,
-    pub num_experts: i32,
-    pub moe_intermediate_size: i32,
-    pub hidden_size: i32,
-}
-impl_module_params!(DiffusionGemmaExperts; gate_up_proj, down_proj);
-
-impl DiffusionGemmaExperts {
-    pub fn new(config: &DiffusionGemmaTextConfig) -> Result<Self, Exception> {
-        let e = config.num_experts;
-        let i = config.moe_intermediate_size;
-        let h = config.hidden_size;
-        Ok(Self {
-            gate_up_proj: Param::new(Array::zeros_f32(&[e, 2 * i, h])),
-            down_proj: Param::new(Array::zeros_f32(&[e, h, i])),
-            num_experts: e,
-            moe_intermediate_size: i,
-            hidden_size: h,
-        })
-    }
-
-    /// Apply the experts to a `[N, hidden]` tensor, dispatching each token to
-    /// its `top_indices` experts and weighting by `top_weights`
-    /// (both `[N, top_k]`). Returns `[N, hidden]`.
-    pub fn forward(
-        &self,
-        hidden_flat: &Array,
-        top_indices: &Array,
-        top_weights: &Array,
-    ) -> Result<Array, Exception> {
-        let n = hidden_flat.dim(0);
-        let h = self.hidden_size;
-        let i = self.moe_intermediate_size;
-        let k = top_indices.dim(1);
-
-        let mut out = ops::zeros_dtype(&[n, h], hidden_flat.dtype());
-        for slot in 0..k {
-            let slot_experts = ops::slice_axis(top_indices, -1, slot, slot + 1).reshape(&[n]);
-            let slot_weights = ops::slice_axis(top_weights, -1, slot, slot + 1); // [N, 1]
-
-            // gate_up_proj[e]: [2I, H] -> need [H, 2I] for x[N,1,H] @ w[N,H,2I].
-            let gate_up_w = self
-                .gate_up_proj
-                .as_ref()
-                .take_axis(&slot_experts, 0)
-                .transpose_axes(&[0, 2, 1]);
-            let x_b = hidden_flat.reshape(&[n, 1, h]);
-            let gate_up = ops::matmul(&x_b, &gate_up_w).squeeze_axes(&[1]); // [N, 2I]
-            let gate = ops::slice_axis(&gate_up, -1, 0, i);
-            let up = ops::slice_axis(&gate_up, -1, i, 2 * i);
-            let activated = nn::gelu_tanh_approximate(&gate).multiply(&up); // [N, I]
-
-            // down_proj[e]: [H, I] -> need [I, H] for h[N,1,I] @ w[N,I,H].
-            let down_w = self
-                .down_proj
-                .as_ref()
-                .take_axis(&slot_experts, 0)
-                .transpose_axes(&[0, 2, 1]);
-            let act_b = activated.reshape(&[n, 1, i]);
-            let down = ops::matmul(&act_b, &down_w).squeeze_axes(&[1]); // [N, H]
-
-            out = out.add(&down.multiply(&slot_weights));
-        }
-        Ok(out)
-    }
-}
+// DiffusionGemma's MoE router and grouped experts ARE the Gemma 4 MoE blocks
+// (`Gemma4TextRouter` / `Gemma4TextExperts`) — same fp32-softmax top-k router
+// with per-channel `scale` + per-expert scale, and the same fused
+// `gate_up_proj [E, 2I, H]` / `down_proj [E, H, I]` gelu-tanh SwiGLU experts.
+// They live canonically in [`super::gemma4`]; we re-export them here under the
+// DiffusionGemma names so call sites and weight-loader keys read naturally.
+pub use super::gemma4::{
+    Gemma4Experts as DiffusionGemmaExperts, Gemma4Router as DiffusionGemmaRouter,
+};
 
 // ----------------------------------------------------------------------------
 // Self-conditioning
@@ -558,8 +430,17 @@ impl DiffusionGemmaTextLayer {
             post_feedforward_layernorm_1: Gemma4RmsNorm::new(h, eps),
             pre_feedforward_layernorm_2: Gemma4RmsNorm::new(h, eps),
             post_feedforward_layernorm_2: Gemma4RmsNorm::new(h, eps),
-            router: DiffusionGemmaRouter::new(config)?,
-            experts: DiffusionGemmaExperts::new(config)?,
+            router: DiffusionGemmaRouter::new(
+                config.hidden_size,
+                config.num_experts,
+                config.top_k_experts,
+                config.rms_norm_eps,
+            )?,
+            experts: DiffusionGemmaExperts::new(
+                config.num_experts,
+                config.moe_intermediate_size,
+                config.hidden_size,
+            )?,
             layer_scalar: Param::new(Array::ones_f32(&[1])),
         })
     }
@@ -1562,7 +1443,13 @@ mod tests {
     #[serial]
     fn router_shapes() {
         let cfg = tiny_config();
-        let mut router = DiffusionGemmaRouter::new(&cfg).unwrap();
+        let mut router = DiffusionGemmaRouter::new(
+            cfg.hidden_size,
+            cfg.num_experts,
+            cfg.top_k_experts,
+            cfg.rms_norm_eps,
+        )
+        .unwrap();
         let x = pmetal_bridge::compat::random::uniform_range(
             -1.0,
             1.0,
@@ -1578,8 +1465,16 @@ mod tests {
     #[serial]
     fn experts_shapes() {
         let cfg = tiny_config();
-        let mut router = DiffusionGemmaRouter::new(&cfg).unwrap();
-        let experts = DiffusionGemmaExperts::new(&cfg).unwrap();
+        let mut router = DiffusionGemmaRouter::new(
+            cfg.hidden_size,
+            cfg.num_experts,
+            cfg.top_k_experts,
+            cfg.rms_norm_eps,
+        )
+        .unwrap();
+        let experts =
+            DiffusionGemmaExperts::new(cfg.num_experts, cfg.moe_intermediate_size, cfg.hidden_size)
+                .unwrap();
         let x = pmetal_bridge::compat::random::uniform_range(
             -1.0,
             1.0,
