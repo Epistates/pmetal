@@ -466,6 +466,16 @@ pub struct GgufModelConfig {
 }
 
 impl GgufModelConfig {
+    /// Resolve a GGUF path (file or directory) and extract its model config
+    /// from metadata. Keeps GGUF path resolution encapsulated in this module
+    /// so callers (e.g. the inference dispatcher) need only a path.
+    pub fn from_path(path: impl AsRef<Path>) -> Result<Self, WeightFormatError> {
+        let gguf_path = resolve_gguf_path(path.as_ref())?;
+        let content = pmetal_gguf::GgufContent::from_file(&gguf_path)
+            .map_err(|e| WeightFormatError::Gguf(e.to_string()))?;
+        Self::from_gguf(&content)
+    }
+
     /// Extract config from GGUF metadata.
     pub fn from_gguf(content: &pmetal_gguf::GgufContent) -> Result<Self, WeightFormatError> {
         let arch = content
@@ -575,6 +585,26 @@ impl GgufModelConfig {
             .head_dim
             .unwrap_or_else(|| self.hidden_size / self.num_attention_heads);
         crate::architectures::qwen3::Qwen3Config {
+            vocab_size: self.vocab_size,
+            hidden_size: self.hidden_size,
+            intermediate_size: self.intermediate_size,
+            num_hidden_layers: self.num_hidden_layers,
+            num_attention_heads: self.num_attention_heads,
+            num_key_value_heads: self.num_kv_heads,
+            head_dim,
+            max_position_embeddings: self.max_position_embeddings,
+            rms_norm_eps: self.rms_norm_eps,
+            rope_theta: self.rope_theta,
+            ..Default::default()
+        }
+    }
+
+    /// Convert to Qwen2 config.
+    pub fn to_qwen2_config(&self) -> crate::architectures::qwen2::Qwen2Config {
+        let head_dim = self
+            .head_dim
+            .unwrap_or_else(|| self.hidden_size / self.num_attention_heads);
+        crate::architectures::qwen2::Qwen2Config {
             vocab_size: self.vocab_size,
             hidden_size: self.hidden_size,
             intermediate_size: self.intermediate_size,

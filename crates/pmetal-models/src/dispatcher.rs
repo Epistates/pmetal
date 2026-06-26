@@ -5,10 +5,11 @@
 
 use crate::architectures::*;
 use crate::loader::{
-    Qwen3NextLoadOptions, load_bert_weights, load_generic_weights, load_nemotron_weights,
-    load_qwen3_next_weights_with_options, load_weights,
+    Qwen3NextLoadOptions, assign_weights, load_bert_weights, load_generic_weights,
+    load_nemotron_weights, load_qwen3_next_weights_with_options, load_weights,
 };
 use crate::traits::{CausalLMModel, ModelConfig};
+use crate::weight_format::{GgufModelConfig, WeightFormat, WeightLoader};
 use pmetal_bridge::compat::{
     Array, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters,
     ModuleParametersExt, nn, transforms,
@@ -409,6 +410,15 @@ impl DynamicModel {
         options: DynamicModelLoadOptions,
     ) -> Result<Self, Exception> {
         let model_dir = model_dir.as_ref();
+
+        // GGUF checkpoints carry their config in metadata, not a config.json.
+        // A `.gguf` file path, or a directory whose only weights are GGUF,
+        // routes to the GGUF loader. `WeightFormat::detect` prefers safetensors
+        // when both are present, so canonical HF dirs fall through unchanged.
+        if matches!(WeightFormat::detect(model_dir), Some(WeightFormat::Gguf)) {
+            return Self::load_gguf(model_dir, options);
+        }
+
         let config_path = model_dir.join("config.json");
         if !config_path.exists() {
             return Err(Exception::custom(format!(
@@ -744,6 +754,74 @@ impl DynamicModel {
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::DiffusionGemma(model))
             }
+        }
+    }
+
+    /// Load a model from a GGUF checkpoint (file path or directory).
+    ///
+    /// Reads the model config from GGUF metadata, constructs the matching
+    /// architecture, then assigns the dequantized (F32), HuggingFace-named
+    /// weights produced by [`WeightLoader::load_gguf`].
+    ///
+    /// Phase B coverage is the dense Llama-family decoders (Llama, Qwen2,
+    /// Qwen3, Mistral, Phi) — the architectures whose HF parameter trees map
+    /// 1:1 onto GGUF tensor names and that already have metadata→config
+    /// converters. Gemma / Gemma 4 (extra norm blocks, embedding scaling,
+    /// softcapping, MoE) are handled in later phases and return a typed error
+    /// here rather than loading incorrectly.
+    pub fn load_gguf(
+        path: impl AsRef<Path>,
+        _options: DynamicModelLoadOptions,
+    ) -> Result<Self, Exception> {
+        let path = path.as_ref();
+        let gguf_config = GgufModelConfig::from_path(path)
+            .map_err(|e| Exception::custom(format!("GGUF config: {e}")))?;
+        let arch =
+            ModelArchitecture::from_model_type(&gguf_config.architecture).ok_or_else(|| {
+                Exception::custom(format!(
+                    "GGUF architecture '{}' is not supported for inference loading",
+                    gguf_config.architecture
+                ))
+            })?;
+
+        let weights =
+            WeightLoader::load_gguf(path).map_err(|e| Exception::custom(format!("GGUF: {e}")))?;
+
+        match arch {
+            ModelArchitecture::Llama => {
+                let mut model = LlamaForCausalLM::new(gguf_config.to_llama_config())?;
+                assign_weights(&mut model, weights)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                Ok(Self::Llama(model))
+            }
+            ModelArchitecture::Qwen2 => {
+                let mut model = Qwen2ForCausalLM::new(gguf_config.to_qwen2_config())?;
+                assign_weights(&mut model, weights)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                Ok(Self::Qwen2(model))
+            }
+            ModelArchitecture::Qwen3 => {
+                let mut model = Qwen3ForCausalLM::new_for_loading(gguf_config.to_qwen3_config())?;
+                assign_weights(&mut model, weights)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                Ok(Self::Qwen3(model))
+            }
+            ModelArchitecture::Mistral => {
+                let mut model = MistralForCausalLM::new(gguf_config.to_mistral_config())?;
+                assign_weights(&mut model, weights)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                Ok(Self::Mistral(model))
+            }
+            ModelArchitecture::Phi => {
+                let mut model = PhiForCausalLM::new(gguf_config.to_phi_config())?;
+                assign_weights(&mut model, weights)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                Ok(Self::Phi(model))
+            }
+            other => Err(Exception::custom(format!(
+                "GGUF inference loading is not yet implemented for {other} \
+                 (Phase B supports dense Llama, Qwen2, Qwen3, Mistral, Phi)"
+            ))),
         }
     }
 

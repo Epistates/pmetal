@@ -1037,6 +1037,23 @@ pub fn load_generic_weights<M: ModuleParameters + ModuleParametersExt>(
     Ok(())
 }
 
+/// Assign in-memory, HuggingFace-named weights to a model's parameters and
+/// eval them onto the GPU.
+///
+/// This is the in-memory dual of [`load_generic_weights`]: the safetensors path
+/// memory-maps shards from disk, whereas the GGUF inference path dequantizes
+/// tensors into a `HashMap` and assigns them here. Behaviour matches the
+/// safetensors generic loader exactly — params whose names match are replaced,
+/// unmatched map entries are ignored (e.g. `lm_head.weight` for tied models).
+pub fn assign_weights<M: ModuleParameters + ModuleParametersExt>(
+    model: &mut M,
+    weights: HashMap<String, Array>,
+) -> Result<(), LoadError> {
+    assign_loaded_weights(model, weights);
+    eval_loaded_parameters(model)?;
+    Ok(())
+}
+
 pub(crate) fn load_weights_filtered<F>(
     model_dir: impl AsRef<Path>,
     mut keep_key: F,
