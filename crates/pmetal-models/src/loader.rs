@@ -9,6 +9,7 @@ use pmetal_bridge::compat::{
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+use crate::architectures::LoadReport;
 use crate::architectures::bert::BertForEmbedding;
 use crate::architectures::clip::CLIPTextModel;
 use crate::architectures::flux::FluxDiT;
@@ -90,13 +91,22 @@ struct MlxQuantizationConfig {
 fn assign_loaded_weights<M: ModuleParameters + ModuleParametersExt>(
     model: &mut M,
     loaded: HashMap<String, Array>,
-) {
+) -> LoadReport {
     let mut params = model.flatten_params_mut();
+    let mut report = LoadReport::default();
     for (key, value) in loaded {
         if let Some(param) = params.get_mut(&key) {
             **param = value;
+            report.loaded += 1;
+        } else if let Some(param) = params.get_mut(&format!("model.{key}")) {
+            // Qwen3-Embedding: `layers.…` ↔ `model.layers.…`
+            **param = value;
+            report.loaded += 1;
+        } else {
+            report.skipped.push(key);
         }
     }
+    report
 }
 
 fn eval_loaded_parameters<M: ModuleParameters + ModuleParametersExt>(
@@ -1009,14 +1019,15 @@ fn find_hf_repo_root(path: &Path) -> Option<std::path::PathBuf> {
 pub fn load_generic_weights<M: ModuleParameters + ModuleParametersExt>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
-) -> Result<(), LoadError> {
+) -> Result<LoadReport, LoadError> {
     let model_dir = model_dir.as_ref();
     let single_file = model_dir.join("model.safetensors");
+    let mut report = LoadReport::default();
     if single_file.exists() {
         let loaded = load_shard(&single_file)?;
-        assign_loaded_weights(model, loaded);
+        report += assign_loaded_weights(model, loaded);
         eval_loaded_parameters(model)?;
-        return Ok(());
+        return Ok(report);
     }
     let index_path = model_dir.join("model.safetensors.index.json");
     if !index_path.exists() {
@@ -1031,10 +1042,10 @@ pub fn load_generic_weights<M: ModuleParameters + ModuleParametersExt>(
     for shard_file in shard_files {
         let shard_path = validate_shard_path(model_dir, shard_file)?;
         let loaded = load_shard(&shard_path)?;
-        assign_loaded_weights(model, loaded);
+        report += assign_loaded_weights(model, loaded);
     }
     eval_loaded_parameters(model)?;
-    Ok(())
+    Ok(report)
 }
 
 fn load_weights_filtered<F>(
@@ -1864,5 +1875,61 @@ mod tests {
         assert_eq!(restored.shape(), &[2, 64]);
         assert!(!loaded.contains_key("linear.weight.scales"));
         assert!(!loaded.contains_key("linear.weight.biases"));
+    }
+
+    #[test]
+    fn handle_unexpected_shard_keys() {
+        let temp = tempdir().unwrap();
+        let model_dir = temp.path();
+        let text_shard = model_dir.join("text.safetensors");
+
+        let mut text_weights = HashMap::new();
+        text_weights.insert(
+            "model.embed_tokens.weight".to_string(),
+            Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]),
+        );
+        text_weights.insert(
+            "model.fqn_unexpected_key.weights".to_string(),
+            Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]),
+        );
+        text_weights.insert(
+            "unexpected_key.weights".to_string(),
+            Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]),
+        );
+        write_safetensors(&text_shard, &text_weights).unwrap();
+
+        let index = serde_json::json!({
+            "metadata": {},
+            "weight_map": {
+                "model.embed_tokens.weight": "text.safetensors",
+                "model.fqn_unexpected_key.weights": "text.safetensors",
+                "unexpected_key.weights": "text.safetensors"
+            }
+        });
+        std::fs::write(
+            model_dir.join("model.safetensors.index.json"),
+            serde_json::to_string_pretty(&index).unwrap(),
+        )
+        .unwrap();
+
+        let mut model =
+            Qwen3ForCausalLM::new(crate::architectures::Qwen3Config::default()).unwrap();
+        let report = load_generic_weights(&mut model, model_dir).expect("LoadReport");
+
+        assert_eq!(
+            report.loaded, 1,
+            "Expected 1 ID to be loaded, got {:?}",
+            report.loaded
+        );
+        let factual_unexpected_ids = HashSet::from_iter(report.skipped.iter().cloned());
+        let unexpected = HashSet::from([
+            String::from("model.fqn_unexpected_key.weights"),
+            String::from("model.unexpected_key.weights"),
+        ]);
+        assert_eq!(
+            factual_unexpected_ids, unexpected,
+            "Expected following IDs to be skipped {:?}, got {:?}",
+            unexpected, factual_unexpected_ids
+        );
     }
 }
