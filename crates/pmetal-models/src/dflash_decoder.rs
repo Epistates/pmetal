@@ -34,6 +34,7 @@ use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ops};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig, MambaCache};
 use pmetal_mlx::speculative::SpecCapture;
 
+use crate::architectures::LoadReport;
 use crate::architectures::dflash_draft::{DFlashDraftConfig, DFlashDraftModel};
 use crate::traits::ModelConfig;
 
@@ -913,13 +914,7 @@ pub enum DFlashDraftQuant {
 /// [`load_dflash_draft_from_dir_quantized`]`(dir, DFlashDraftQuant::None)`.
 pub fn load_dflash_draft_from_dir(
     model_dir: impl AsRef<Path>,
-) -> Result<
-    (
-        DFlashDraftModel,
-        crate::architectures::dflash_draft::LoadReport,
-    ),
-    Exception,
-> {
+) -> Result<(DFlashDraftModel, LoadReport), Exception> {
     load_dflash_draft_from_dir_quantized(model_dir, DFlashDraftQuant::None)
 }
 
@@ -937,13 +932,7 @@ pub fn load_dflash_draft_from_dir(
 pub fn load_dflash_draft_from_dir_quantized(
     model_dir: impl AsRef<Path>,
     quant: DFlashDraftQuant,
-) -> Result<
-    (
-        DFlashDraftModel,
-        crate::architectures::dflash_draft::LoadReport,
-    ),
-    Exception,
-> {
+) -> Result<(DFlashDraftModel, LoadReport), Exception> {
     let dir = model_dir.as_ref();
 
     // Parse config.json.

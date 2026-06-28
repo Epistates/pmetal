@@ -53,6 +53,7 @@ use pmetal_bridge::compat::{
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
+use super::LoadReport;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
 
@@ -1396,10 +1397,4 @@ fn load_norm(
     } else {
         report.skipped.push(key.to_string());
     }
-}
-
-#[derive(Debug, Default, Clone)]
-pub struct LoadReport {
-    pub loaded: usize,
-    pub skipped: Vec<String>,
 }
