@@ -133,6 +133,7 @@ fn map_architecture_class(arch: &str) -> String {
         "llama" => "LlamaForCausalLM".to_string(),
         "mistral" => "MistralForCausalLM".to_string(),
         "gemma" | "gemma2" | "gemma3" => "GemmaForCausalLM".to_string(),
+        "gemma4" => "Gemma4ForCausalLM".to_string(),
         "qwen" | "qwen2" | "qwen3" => "Qwen2ForCausalLM".to_string(),
         "phi" | "phi2" | "phi3" => "PhiForCausalLM".to_string(),
         "gpt2" => "GPT2LMHeadModel".to_string(),

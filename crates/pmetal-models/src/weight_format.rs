@@ -382,6 +382,61 @@ impl WeightLoader {
         gguf_name.to_string()
     }
 
+    /// Map a Gemma 3 / Gemma 4 GGUF tensor name to HuggingFace format.
+    ///
+    /// Gemma's per-layer norm layout differs from the Llama family, so the
+    /// generic [`Self::gguf_to_hf_name`] mis-maps it: in Gemma the GGUF
+    /// `ffn_norm` is the *pre*-feedforward norm (Llama's `ffn_norm` is the
+    /// post-attention norm), and Gemma carries a separate `post_attention_norm`
+    /// and `post_ffw_norm`. Names are taken verbatim from llama.cpp
+    /// `gguf-py/gguf/constants.py` `TENSOR_NAMES` for the Gemma architectures:
+    ///
+    /// | GGUF                        | HuggingFace                       |
+    /// |-----------------------------|-----------------------------------|
+    /// | `attn_norm`                 | `input_layernorm`                 |
+    /// | `post_attention_norm`       | `post_attention_layernorm`        |
+    /// | `attn_q/k/v/output`         | `self_attn.{q,k,v,o}_proj`        |
+    /// | `attn_q_norm`/`attn_k_norm` | `self_attn.{q,k}_norm`            |
+    /// | `ffn_norm`                  | `pre_feedforward_layernorm`       |
+    /// | `post_ffw_norm`             | `post_feedforward_layernorm`      |
+    /// | `ffn_gate/up/down`          | `mlp.{gate,up,down}_proj`         |
+    pub fn gguf_to_hf_name_gemma4(gguf_name: &str) -> String {
+        match gguf_name {
+            "token_embd.weight" => return "model.embed_tokens.weight".to_string(),
+            "output_norm.weight" => return "model.norm.weight".to_string(),
+            "output.weight" => return "lm_head.weight".to_string(),
+            _ => {}
+        }
+
+        if gguf_name.starts_with("blk.") {
+            let parts: Vec<&str> = gguf_name.splitn(3, '.').collect();
+            if parts.len() >= 3 {
+                let block_num = parts[1];
+                let hf_rest = match parts[2] {
+                    "attn_norm.weight" => "input_layernorm.weight",
+                    "post_attention_norm.weight" => "post_attention_layernorm.weight",
+                    "attn_q.weight" => "self_attn.q_proj.weight",
+                    "attn_k.weight" => "self_attn.k_proj.weight",
+                    "attn_v.weight" => "self_attn.v_proj.weight",
+                    "attn_output.weight" => "self_attn.o_proj.weight",
+                    "attn_q_norm.weight" => "self_attn.q_norm.weight",
+                    "attn_k_norm.weight" => "self_attn.k_norm.weight",
+                    // Gemma: ffn_norm is the PRE-feedforward norm (not
+                    // post-attention as in Llama).
+                    "ffn_norm.weight" => "pre_feedforward_layernorm.weight",
+                    "post_ffw_norm.weight" => "post_feedforward_layernorm.weight",
+                    "ffn_gate.weight" => "mlp.gate_proj.weight",
+                    "ffn_up.weight" => "mlp.up_proj.weight",
+                    "ffn_down.weight" => "mlp.down_proj.weight",
+                    other => other,
+                };
+                return format!("model.layers.{block_num}.{hf_rest}");
+            }
+        }
+
+        gguf_name.to_string()
+    }
+
     /// Map HuggingFace tensor names to GGUF naming.
     ///
     /// HuggingFace uses names like `model.layers.0.self_attn.q_proj.weight`;
@@ -811,6 +866,69 @@ mod tests {
         assert_eq!(
             WeightLoader::hf_to_gguf_name("model.layers.0.mlp.shared_expert.up_proj.weight"),
             "blk.0.ffn_up_shexp.weight"
+        );
+    }
+
+    #[test]
+    fn test_gguf_to_hf_name_gemma4_norm_layout() {
+        // The Gemma-specific norm layout is the whole reason this map exists:
+        // ffn_norm is the PRE-feedforward norm, post_attention_norm and
+        // post_ffw_norm are separate.
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("blk.0.attn_norm.weight"),
+            "model.layers.0.input_layernorm.weight"
+        );
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("blk.3.post_attention_norm.weight"),
+            "model.layers.3.post_attention_layernorm.weight"
+        );
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("blk.3.ffn_norm.weight"),
+            "model.layers.3.pre_feedforward_layernorm.weight"
+        );
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("blk.3.post_ffw_norm.weight"),
+            "model.layers.3.post_feedforward_layernorm.weight"
+        );
+    }
+
+    #[test]
+    fn test_gguf_to_hf_name_gemma4_attention_and_qk_norm() {
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("blk.1.attn_q.weight"),
+            "model.layers.1.self_attn.q_proj.weight"
+        );
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("blk.1.attn_output.weight"),
+            "model.layers.1.self_attn.o_proj.weight"
+        );
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("blk.2.attn_q_norm.weight"),
+            "model.layers.2.self_attn.q_norm.weight"
+        );
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("blk.2.attn_k_norm.weight"),
+            "model.layers.2.self_attn.k_norm.weight"
+        );
+    }
+
+    #[test]
+    fn test_gguf_to_hf_name_gemma4_embeddings_and_ffn() {
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("token_embd.weight"),
+            "model.embed_tokens.weight"
+        );
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("output_norm.weight"),
+            "model.norm.weight"
+        );
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("blk.0.ffn_gate.weight"),
+            "model.layers.0.mlp.gate_proj.weight"
+        );
+        assert_eq!(
+            WeightLoader::gguf_to_hf_name_gemma4("blk.0.ffn_down.weight"),
+            "model.layers.0.mlp.down_proj.weight"
         );
     }
 
