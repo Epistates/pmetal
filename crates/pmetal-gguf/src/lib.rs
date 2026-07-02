@@ -41,6 +41,7 @@ pub mod iq_quants;
 pub mod k_quants;
 pub mod quantize;
 pub mod reader;
+pub mod tokenizer;
 mod types;
 pub mod vec_dot;
 mod writer;

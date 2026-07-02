@@ -4,8 +4,9 @@
 //! `tokenizer.json` to resolve special token IDs authoritatively, falling
 //! back to heuristic name-based lookup when config files are absent.
 
-use pmetal_core::Result;
-use std::path::Path;
+use pmetal_core::{PMetalError, Result};
+use pmetal_gguf::GgufContent;
+use std::path::{Path, PathBuf};
 
 /// Resolved special token IDs from model config files.
 #[derive(Debug, Default)]
@@ -22,6 +23,45 @@ fn extract_token_string(value: &serde_json::Value) -> Option<&str> {
     value
         .as_str()
         .or_else(|| value.get("content").and_then(|v| v.as_str()))
+}
+
+/// Resolve a `.gguf` weight file from a model path.
+///
+/// Accepts a direct `.gguf` file, or a directory containing `model.gguf` or a
+/// single `.gguf`. Returns `None` when no unambiguous GGUF is present (callers
+/// then fall back to the HuggingFace directory loader).
+fn resolve_gguf_path(path: &Path) -> Option<PathBuf> {
+    if path.is_file() {
+        return path
+            .extension()
+            .and_then(|e| e.to_str())
+            .filter(|e| e.eq_ignore_ascii_case("gguf"))
+            .map(|_| path.to_path_buf());
+    }
+    if !path.is_dir() {
+        return None;
+    }
+    let mut gguf_files: Vec<PathBuf> = std::fs::read_dir(path)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("gguf"))
+        })
+        .collect();
+    gguf_files.sort();
+
+    if let Some(model_gguf) = gguf_files
+        .iter()
+        .find(|p| p.file_name().and_then(|n| n.to_str()) == Some("model.gguf"))
+    {
+        return Some(model_gguf.clone());
+    }
+    match gguf_files.len() {
+        1 => Some(gguf_files.remove(0)),
+        _ => None,
+    }
 }
 
 /// Wrapper around the tokenizers library.
@@ -44,6 +84,46 @@ impl Tokenizer {
             .map_err(|e| pmetal_core::PMetalError::Tokenizer(e.to_string()))?;
 
         let special = Self::load_special_tokens(&inner, dir);
+        Ok(Self { inner, special })
+    }
+
+    /// Load a tokenizer from a model path (file or directory), resolving GGUF
+    /// metadata when no `tokenizer.json` is available.
+    ///
+    /// Resolution order:
+    /// 1. Directory with `tokenizer.json` → canonical HuggingFace loader.
+    /// 2. A `.gguf` file, or a directory whose weights are a single `.gguf` →
+    ///    reconstruct the tokenizer from `tokenizer.ggml.*` metadata.
+    /// 3. Otherwise fall back to the directory loader (clear error if nothing).
+    pub fn from_model_path<P: AsRef<Path>>(path: P) -> Result<Self> {
+        let path = path.as_ref();
+
+        if path.is_dir() && path.join("tokenizer.json").exists() {
+            return Self::from_model_dir(path);
+        }
+        if let Some(gguf_path) = resolve_gguf_path(path) {
+            let content = GgufContent::from_file(&gguf_path)
+                .map_err(|e| PMetalError::Tokenizer(format!("GGUF read: {e}")))?;
+            return Self::from_gguf(&content);
+        }
+        Self::from_model_dir(path)
+    }
+
+    /// Reconstruct a tokenizer from already-parsed GGUF content.
+    ///
+    /// Special-token ids (bos/eos/pad/unk) come straight from
+    /// `tokenizer.ggml.*_token_id` metadata rather than name heuristics.
+    pub fn from_gguf(content: &GgufContent) -> Result<Self> {
+        let data = content
+            .tokenizer_data()
+            .ok_or_else(|| PMetalError::Tokenizer("GGUF file has no tokenizer metadata".into()))?;
+        let inner = crate::gguf_tokenizer::build_tokenizer(&data)?;
+        let special = SpecialTokenIds {
+            bos: data.bos_id,
+            eos: data.eos_id,
+            pad: data.pad_id,
+            unk: data.unk_id,
+        };
         Ok(Self { inner, special })
     }
 

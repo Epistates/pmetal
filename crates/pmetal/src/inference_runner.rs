@@ -271,8 +271,9 @@ impl InferenceRunner {
             ));
         }
 
-        // 1. Load tokenizer
-        let tokenizer = Tokenizer::from_model_dir(model_path)
+        // 1. Load tokenizer (resolves GGUF tokenizer.ggml.* metadata when the
+        //    model is a .gguf without a sibling tokenizer.json)
+        let tokenizer = Tokenizer::from_model_path(model_path)
             .map_err(|e| Exception::custom(format!("tokenizer: {e}")))?;
 
         // 2. Determine chat mode (auto-detect instruction-tuned models)

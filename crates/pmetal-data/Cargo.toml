@@ -12,6 +12,7 @@ categories.workspace = true
 [dependencies]
 pmetal-core = { workspace = true }
 pmetal-bridge = { workspace = true }
+pmetal-gguf = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
@@ -19,6 +20,7 @@ tracing = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
 tokenizers = { workspace = true }
+ahash = "0.8"
 minijinja = { workspace = true }
 minijinja-contrib = { workspace = true }
 # `time` is already pulled in transitively by minijinja-contrib; depending

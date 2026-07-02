@@ -4970,6 +4970,7 @@ dependencies = [
 name = "pmetal-data"
 version = "0.5.0"
 dependencies = [
+ "ahash",
  "arrow",
  "image 0.25.10",
  "memmap2",
@@ -4978,6 +4979,7 @@ dependencies = [
  "parquet",
  "pmetal-bridge",
  "pmetal-core",
+ "pmetal-gguf",
  "rand 0.10.1",
  "rayon",
  "serde",

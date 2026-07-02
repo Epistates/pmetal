@@ -14,6 +14,7 @@ pub mod chat_templates;
 pub mod collator;
 pub mod dataloader;
 pub mod dataset;
+pub mod gguf_tokenizer;
 pub mod image_processing;
 pub mod inference_config;
 pub mod jinja_chat;
