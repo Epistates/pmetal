@@ -125,17 +125,59 @@ fn fixture_path(name: &str) -> PathBuf {
     p
 }
 
-/// Build the Rust Gemma4 model from the synthetic config + synthetic weight
-/// fixture and return it ready for forward passes.
-fn build_synthetic_model() -> Gemma4ForCausalLM {
-    let config: Gemma4Config =
-        json5::from_str(synthetic_config_json()).expect("synthetic config parses");
-    let mut model = Gemma4ForCausalLM::new(config).expect("synthetic model builds");
-    let weights = load_shard(&fixture_path("gemma4_synth_weights.safetensors"));
-    let report = load_gemma4_weights(&mut model, &weights).expect("synthetic weight loader runs");
+/// MoE synthetic config — mirrors MOE_SYNTHETIC_ARGS in the Python dumper
+/// (same geometry as the dense fixture with the routed-experts branch enabled).
+fn moe_synthetic_config_json() -> &'static str {
+    r#"{
+        "model_type": "gemma4_text",
+        "vocab_size": 512,
+        "hidden_size": 128,
+        "intermediate_size": 256,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 32,
+        "global_head_dim": 64,
+        "num_global_key_value_heads": 1,
+        "max_position_embeddings": 131072,
+        "rms_norm_eps": 1e-6,
+        "attention_k_eq_v": true,
+        "tie_word_embeddings": true,
+        "sliding_window": 8,
+        "final_logit_softcapping": 30.0,
+        "layer_types": ["sliding_attention", "full_attention"],
+        "rope_parameters": {
+            "full_attention": {
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 1000000.0,
+                "rope_type": "proportional"
+            },
+            "sliding_attention": {
+                "partial_rotary_factor": 1.0,
+                "rope_theta": 10000.0,
+                "rope_type": "default"
+            }
+        },
+        "hidden_size_per_layer_input": 0,
+        "num_kv_shared_layers": 0,
+        "use_double_wide_mlp": false,
+        "enable_moe_block": true,
+        "num_experts": 4,
+        "top_k_experts": 2,
+        "moe_intermediate_size": 64
+    }"#
+}
+
+/// Build the Rust Gemma4 model from a config JSON + weight fixture and return
+/// it ready for forward passes.
+fn build_model(config_json: &str, weights_fixture: &str) -> Gemma4ForCausalLM {
+    let config: Gemma4Config = json5::from_str(config_json).expect("config parses");
+    let mut model = Gemma4ForCausalLM::new(config).expect("model builds");
+    let weights = load_shard(&fixture_path(weights_fixture));
+    let report = load_gemma4_weights(&mut model, &weights).expect("weight loader runs");
     assert!(
         report.loaded > 0,
-        "synthetic weight loader loaded 0 tensors (skipped={:?})",
+        "weight loader loaded 0 tensors (skipped={:?})",
         report.skipped
     );
     model
@@ -199,10 +241,37 @@ fn compare_checkpoint_owned(
 
 #[test]
 fn gemma4_synthetic_parity() {
-    let ref_shard = load_shard(&fixture_path("gemma4_synth_reference.safetensors"));
+    run_synthetic_parity(
+        "dense",
+        synthetic_config_json(),
+        "gemma4_synth_weights.safetensors",
+        "gemma4_synth_reference.safetensors",
+    );
+}
+
+/// MoE-block parity: exercises the Phase A routed-experts port (parallel dense
+/// MLP + top-k experts) against the mlx-lm `gemma4_text` oracle. Same tight
+/// tolerances as the dense fixture — the 2-layer config has minimal drift.
+#[test]
+fn gemma4_moe_synthetic_parity() {
+    run_synthetic_parity(
+        "MoE",
+        moe_synthetic_config_json(),
+        "gemma4_moe_synth_weights.safetensors",
+        "gemma4_moe_synth_reference.safetensors",
+    );
+}
+
+fn run_synthetic_parity(
+    label: &str,
+    config_json: &str,
+    weights_fixture: &str,
+    reference_fixture: &str,
+) {
+    let ref_shard = load_shard(&fixture_path(reference_fixture));
     let input_ids = input_ids_from_shard(&ref_shard);
 
-    let mut model = build_synthetic_model();
+    let mut model = build_model(config_json, weights_fixture);
 
     // Use the production `forward_with_capture` path. That goes through
     // `Gemma4Attention::forward` with the internal mask-building logic and
@@ -274,7 +343,7 @@ fn gemma4_synthetic_parity() {
         ),
     ];
 
-    println!("\n== Gemma 4 synthetic parity report ==");
+    println!("\n== Gemma 4 {label} synthetic parity report ==");
     print_report_table(&reports);
 
     // Argmax-exact check (separate from the tolerance table — the argmax
@@ -310,12 +379,12 @@ fn gemma4_synthetic_parity() {
     }
     assert!(
         failures.is_empty(),
-        "Gemma 4 synthetic parity failed at checkpoints: {failures:?}"
+        "Gemma 4 {label} synthetic parity failed at checkpoints: {failures:?}"
     );
     assert_eq!(
         argmax_matches,
         argmax_rust.len(),
-        "Gemma 4 synthetic parity: argmax mismatch at some positions"
+        "Gemma 4 {label} synthetic parity: argmax mismatch at some positions"
     );
 }
 
