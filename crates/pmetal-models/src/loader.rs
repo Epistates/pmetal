@@ -1922,9 +1922,12 @@ mod tests {
             report.loaded
         );
         let factual_unexpected_ids = HashSet::from_iter(report.skipped.iter().cloned());
+        // The loader attempts a direct match followed by a "model."-prefixed lookup.
+        // We verify that keys not found in either resolution path are correctly
+        // identified and reported as skipped.
         let unexpected = HashSet::from([
             String::from("model.fqn_unexpected_key.weights"),
-            String::from("model.unexpected_key.weights"),
+            String::from("unexpected_key.weights"),
         ]);
         assert_eq!(
             factual_unexpected_ids, unexpected,
