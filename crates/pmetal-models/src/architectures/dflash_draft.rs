@@ -36,6 +36,7 @@ use pmetal_bridge::compat::{
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
+use super::LoadReport;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{RopeScaling, apply_rope},
@@ -540,15 +541,6 @@ fn assign_layer_weight(layer: &mut DFlashDecoderLayer, suffix: &str, weight: Arr
         _ => return false,
     }
     true
-}
-
-/// Summary of a [`DFlashDraftModel::load_weights`] call.
-#[derive(Debug, Default, Clone)]
-pub struct LoadReport {
-    /// Number of weights successfully assigned.
-    pub loaded: usize,
-    /// Names of weights that did not match a known parameter.
-    pub skipped: Vec<String>,
 }
 
 // ----------------------------------------------------------------------------

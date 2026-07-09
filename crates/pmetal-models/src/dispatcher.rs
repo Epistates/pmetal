@@ -291,8 +291,9 @@ macro_rules! simple_load {
         let config: $config_ty =
             json5::from_str($content).map_err(|e| Exception::custom(e.to_string()))?;
         let mut model = ($new)(config)?;
-        load_generic_weights(&mut model, $model_dir)
+        let report = load_generic_weights(&mut model, $model_dir)
             .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+        DynamicModel::report_load_summary(stringify!($variant), &report);
         eval_module_parameters_batched(&model)?;
         Ok(Self::$variant(model))
     }};
@@ -307,8 +308,9 @@ macro_rules! simple_load_moe {
         let config: $config_ty =
             json5::from_str($content).map_err(|e| Exception::custom(e.to_string()))?;
         let mut model = ($new)(config)?;
-        load_generic_weights(&mut model, $model_dir)
+        let report = load_generic_weights(&mut model, $model_dir)
             .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+        DynamicModel::report_load_summary(stringify!($variant), &report);
         eval_module_parameters_batched(&model)?;
         let mut model = Self::$variant(model);
         model.init_post_load_fast_paths()?;
@@ -663,14 +665,7 @@ impl DynamicModel {
                 let report =
                     crate::architectures::gemma4::load_gemma4_weights(&mut model, &weights)
                         .map_err(|e| Exception::custom(format!("{:?}", e)))?;
-                if !report.skipped.is_empty() {
-                    tracing::info!(
-                        "Gemma 4 weight load: {} loaded, {} skipped (first: {:?})",
-                        report.loaded,
-                        report.skipped.len(),
-                        report.skipped.first()
-                    );
-                }
+                DynamicModel::report_load_summary("Gemma4", &report);
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::Gemma4(model))
             }
@@ -1164,6 +1159,18 @@ impl DynamicModel {
     pub fn reset_prefetch_stats(&self) {
         if let Self::Qwen3Next(m) = self {
             m.reset_prefetch_stats();
+        }
+    }
+
+    fn report_load_summary(model_name: &str, report: &LoadReport) {
+        if !report.skipped.is_empty() {
+            tracing::info!(
+                "{} weight load: {} loaded, {} skipped (first: {:?})",
+                model_name,
+                report.loaded,
+                report.skipped.len(),
+                report.skipped.first()
+            );
         }
     }
 }

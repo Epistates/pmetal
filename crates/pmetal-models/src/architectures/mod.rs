@@ -55,3 +55,20 @@ pub use qwen3_next::*;
 pub use t5::*;
 pub use vae::*;
 pub use whisper::*;
+
+/// Summary of a [`<model>::load_weights`] call.
+#[derive(Debug, Default, Clone)]
+pub struct LoadReport {
+    /// Number of weights successfully assigned.
+    pub loaded: usize,
+    /// Names of weights that did not match a known parameter.
+    pub skipped: Vec<String>,
+}
+
+/// Allow combining multiple [`LoadReport`]s into one, e.g. when loading multiple shards using `+=`.
+impl std::ops::AddAssign for LoadReport {
+    fn add_assign(&mut self, rhs: Self) {
+        self.loaded += rhs.loaded;
+        self.skipped.extend(rhs.skipped);
+    }
+}
