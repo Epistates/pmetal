@@ -230,6 +230,40 @@ jobs:
           projectPath: crates/pmetal-gui
           args: --target aarch64-apple-darwin
 
+      # Bundle libmlx.dylib into the app's Frameworks directory.
+      # The build.rs sets the dylib's install name to @rpath/libmlx.dylib
+      # and emits an rpath of @executable_path/../Frameworks, so dyld can
+      # resolve it at runtime only if the dylib lives inside Frameworks/.
+      - name: Bundle libmlx.dylib into app
+        run: |
+          APP_PATH=$(find crates/pmetal-gui/src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name "*.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "No .app bundle found, skipping dylib bundling"
+            exit 0
+          fi
+          FRAMEWORKS_DIR="$APP_PATH/Contents/Frameworks"
+          mkdir -p "$FRAMEWORKS_DIR"
+
+          # Find libmlx.dylib from the Cargo build output
+          MLX_DYLIB=$(find crates/pmetal-gui/src-tauri/target/aarch64-apple-darwin/release/build/ -name "libmlx.dylib" -path "*/out/*" | head -1)
+          if [ -z "$MLX_DYLIB" ]; then
+            MLX_DYLIB="$HOME/.cache/pmetal/lib/libmlx.dylib"
+          fi
+          if [ ! -f "$MLX_DYLIB" ]; then
+            echo "ERROR: libmlx.dylib not found in build output or cache"
+            exit 1
+          fi
+          cp "$MLX_DYLIB" "$FRAMEWORKS_DIR/libmlx.dylib"
+          echo "Bundled libmlx.dylib into $FRAMEWORKS_DIR"
+
+          # Verify the install name is @rpath-relative (not an absolute path)
+          DYLIB_ID=$(otool -D "$FRAMEWORKS_DIR/libmlx.dylib" | tail -1)
+          echo "libmlx.dylib install name: $DYLIB_ID"
+          if [[ "$DYLIB_ID" == /Users/* ]]; then
+            echo "WARNING: install name is an absolute path, fixing..."
+            install_name_tool -id "@rpath/libmlx.dylib" "$FRAMEWORKS_DIR/libmlx.dylib"
+          fi
+
       # Post-build notarization
       - name: Notarize macOS app
         if: env.APPLE_CERT_IMPORTED == 'true'

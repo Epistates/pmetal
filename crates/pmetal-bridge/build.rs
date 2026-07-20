@@ -47,37 +47,46 @@ fn find_clang_rt_path() -> Option<String> {
 #[cfg(target_os = "macos")]
 fn emit_mlx_rpath(path: &str) {
     println!("cargo:rustc-link-arg=-Wl,-rpath,{path}");
+    // Also emit the standard app-bundle rpath so that distributed .app
+    // bundles can find libmlx.dylib inside Frameworks without any extra
+    // post-build fixup.  The build-time rpath above takes precedence for
+    // local dev/test runs; dyld tries each rpath entry in order.
+    println!(
+        "cargo:rustc-link-arg=-Wl,-rpath,@executable_path/../Frameworks"
+    );
 }
 
-/// Rewrite the `LC_ID_DYLIB` install name of a Mach-O dylib to an absolute
-/// path so downstream binaries record that absolute path in their
-/// `LC_LOAD_DYLIB` and dyld resolves without any `@rpath` / `DYLD_*` help.
+/// Rewrite the `LC_ID_DYLIB` install name of a Mach-O dylib to
+/// `@rpath/<filename>` so downstream binaries record a portable
+/// `@rpath`-relative reference in their `LC_LOAD_DYLIB`.
 ///
-/// Cargo's `cargo:rustc-link-arg=-Wl,-rpath,…` applies only to this crate's
-/// own artifacts — it does not propagate to downstream bins. Rewriting the
-/// dylib's own install name is the one setting that every dependent binary
-/// inherits.
+/// At runtime, dyld prepends each `LC_RPATH` entry to `@rpath` and checks
+/// whether the file exists there. For bundled macOS apps the relevant rpath
+/// is `@executable_path/../Frameworks`, which is added separately in the
+/// Tauri post-build step.
+///
+/// Using an absolute build-time path (the previous approach) breaks
+/// distribution because the path only exists on the build machine.
 #[cfg(target_os = "macos")]
 fn set_dylib_install_name(dylib: &std::path::Path) {
     if !dylib.exists() {
         return;
     }
+    let filename = match dylib.file_name() {
+        Some(f) => f.to_string_lossy().to_string(),
+        None => return,
+    };
+    let rpath_name = format!("@rpath/{filename}");
     let status = Command::new("install_name_tool")
-        .args([
-            "-id",
-            &dylib.display().to_string(),
-            &dylib.display().to_string(),
-        ])
+        .args(["-id", &rpath_name, &dylib.display().to_string()])
         .status();
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => println!(
-            "cargo:warning=install_name_tool -id {} failed: {s}",
-            dylib.display()
+            "cargo:warning=install_name_tool -id {rpath_name} failed: {s}"
         ),
         Err(e) => println!(
-            "cargo:warning=install_name_tool -id {} errored: {e}",
-            dylib.display()
+            "cargo:warning=install_name_tool -id {rpath_name} errored: {e}"
         ),
     }
 }
