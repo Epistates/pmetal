@@ -77,6 +77,7 @@ pub mod dapo;
 pub mod dflash_training;
 #[cfg(feature = "experimental-trainers")]
 pub mod diffusion;
+pub mod diffusion_gemma_train;
 pub mod distillation;
 pub mod dpo;
 pub mod embedding_trainer;

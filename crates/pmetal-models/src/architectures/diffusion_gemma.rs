@@ -913,6 +913,35 @@ impl DiffusionGemmaForBlockDiffusion {
             .collect()
     }
 
+    /// Differentiable **training** forward: encode `context_ids` into a
+    /// read-only KV cache, then denoise the (already-noised) `canvas_ids` in one
+    /// decoder pass and return softcapped canvas logits `[B, canvas, vocab]`.
+    ///
+    /// This is the gradient-carrying counterpart of a single `generate`
+    /// denoising step and is numerically identical to the oracle
+    /// `DiffusionGemmaForBlockDiffusion.forward(input_ids=context,
+    /// decoder_input_ids=canvas, self_conditioning_logits=...)`: it composes the
+    /// P4-verified encoder forward, the P5-verified sliding-KV truncation +
+    /// decoder forward, and the tied-head fp32 softcap — without the sampling
+    /// loop. The block-diffusion training objective (noise the canvas, run this,
+    /// cross-entropy against the clean targets) lives in `pmetal-trainer`.
+    ///
+    /// `self_conditioning_logits` carries the previous step's `[B, canvas,
+    /// vocab]` logits (detached during training) or `None` (step 0 / dropped).
+    pub fn forward_train(
+        &mut self,
+        context_ids: &Array,
+        canvas_ids: &Array,
+        self_conditioning_logits: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let (_enc_hidden, kvs_full) = self.encoder.forward(context_ids)?;
+        let kvs = self.truncate_sliding_kvs(kvs_full);
+        let hidden = self
+            .decoder
+            .forward(canvas_ids, &kvs, self_conditioning_logits)?;
+        Ok(self.lm_logits(&hidden))
+    }
+
     /// Generate by block-autoregressive discrete diffusion (batch size 1).
     ///
     /// For each canvas block: encode the running sequence into a read-only KV
@@ -1437,6 +1466,29 @@ mod tests {
         assert_eq!(geometry.layer_head_dim(0), 8);
         assert_eq!(geometry.layer_num_kv_heads(0), 2);
         assert!(!geometry.layer_uses_k_eq_v(0));
+    }
+
+    #[test]
+    #[serial]
+    fn forward_train_shape_and_finite() {
+        let cfg = tiny_config();
+        let vocab = cfg.vocab_size;
+        let canvas = cfg.canvas_length;
+        let mut model = DiffusionGemmaForBlockDiffusion::new(cfg).unwrap();
+
+        // Deterministic context [1, 5] and canvas [1, canvas], all ids < vocab.
+        let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
+        let context = Array::from_slice(&ctx_ids, &[1, 5]);
+        let canvas_ids: Vec<i32> = (0..canvas).map(|i| (i * 7 + 2) % vocab).collect();
+        let canvas_arr = Array::from_slice(&canvas_ids, &[1, canvas]);
+
+        let mut logits = model.forward_train(&context, &canvas_arr, None).unwrap();
+        assert_eq!(logits.shape(), &[1, canvas, vocab]);
+        let v = logits.to_f32_vec((canvas * vocab) as usize).unwrap();
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "forward_train produced non-finite logits"
+        );
     }
 
     #[test]
