@@ -1472,7 +1472,7 @@ mod tests {
             cfg.rms_norm_eps,
         )
         .unwrap();
-        let experts =
+        let mut experts =
             DiffusionGemmaExperts::new(cfg.num_experts, cfg.moe_intermediate_size, cfg.hidden_size)
                 .unwrap();
         let x = pmetal_bridge::compat::random::uniform_range(

@@ -729,6 +729,15 @@ pub struct Gemma4Experts {
     pub num_experts: i32,
     pub moe_intermediate_size: i32,
     pub hidden_size: i32,
+    /// Cached pre-transposed, materialised-contiguous expert weights:
+    /// `gate_up_t [E, H, 2·I]` and `down_t [E, I, H]`. The per-token dispatch
+    /// matmul then reads a contiguous gathered operand instead of transposing
+    /// the fused `[E, 2·I, H]` / `[E, H, I]` params on every forward. Refreshed
+    /// when the `Param` handles change (weight load / merge), keyed by
+    /// `Array::id()` — the same change-detection gpt_oss's stacked cache uses.
+    gate_up_t: Option<Array>,
+    down_t: Option<Array>,
+    transposed_sig: Option<Vec<usize>>,
 }
 impl_module_params!(Gemma4Experts; gate_up_proj, down_proj);
 
@@ -752,13 +761,96 @@ impl Gemma4Experts {
             num_experts,
             moe_intermediate_size,
             hidden_size,
+            gate_up_t: None,
+            down_t: None,
+            transposed_sig: None,
         })
+    }
+
+    /// Signature of the current fused-weight handles, used to invalidate the
+    /// transposed cache when the weights are replaced (load / merge).
+    fn current_signature(&self) -> Vec<usize> {
+        vec![
+            self.gate_up_proj.as_ref().id(),
+            self.down_proj.as_ref().id(),
+        ]
+    }
+
+    /// Build or refresh the pre-transposed, materialised expert weights.
+    fn ensure_transposed(&mut self) -> Result<(), Exception> {
+        let sig = self.current_signature();
+        if self.gate_up_t.is_some()
+            && self.down_t.is_some()
+            && self.transposed_sig.as_ref() == Some(&sig)
+        {
+            return Ok(());
+        }
+        // [E, 2I, H] -> [E, H, 2I] and [E, H, I] -> [E, I, H]; eval to force a
+        // contiguous materialisation so the per-forward gathered matmul reads a
+        // contiguous operand.
+        let gate_up_t = self.gate_up_proj.as_ref().transpose_axes(&[0, 2, 1]);
+        let down_t = self.down_proj.as_ref().transpose_axes(&[0, 2, 1]);
+        gate_up_t.eval();
+        down_t.eval();
+        self.gate_up_t = Some(gate_up_t);
+        self.down_t = Some(down_t);
+        self.transposed_sig = Some(sig);
+        Ok(())
+    }
+
+    /// Eagerly build the transposed-weight cache (optional warm-up; the forward
+    /// path builds it lazily on first use anyway).
+    pub fn init_expert_cache(&mut self) -> Result<(), Exception> {
+        self.ensure_transposed()
     }
 
     /// Apply the experts to a `[N, hidden]` tensor, dispatching each token to
     /// its `top_indices` experts and weighting by `top_weights`
     /// (both `[N, top_k]`). Returns `[N, hidden]`.
+    ///
+    /// Uses the pre-transposed weight cache (built lazily on first call and
+    /// refreshed when the params change) so the per-slot gathered matmul reads a
+    /// contiguous operand instead of transposing the fused params every forward.
     pub fn forward(
+        &mut self,
+        hidden_flat: &Array,
+        top_indices: &Array,
+        top_weights: &Array,
+    ) -> Result<Array, Exception> {
+        self.ensure_transposed()?;
+        let gate_up_t = self.gate_up_t.as_ref().expect("transposed cache built");
+        let down_t = self.down_t.as_ref().expect("transposed cache built");
+
+        let n = hidden_flat.dim(0);
+        let h = self.hidden_size;
+        let i = self.moe_intermediate_size;
+        let k = top_indices.dim(1);
+
+        let mut out = ops::zeros_dtype(&[n, h], hidden_flat.dtype());
+        for slot in 0..k {
+            let slot_experts = ops::slice_axis(top_indices, -1, slot, slot + 1).reshape(&[n]);
+            let slot_weights = ops::slice_axis(top_weights, -1, slot, slot + 1); // [N, 1]
+
+            let gate_up_w = gate_up_t.take_axis(&slot_experts, 0); // [N, H, 2I]
+            let x_b = hidden_flat.reshape(&[n, 1, h]);
+            let gate_up = ops::matmul(&x_b, &gate_up_w).squeeze_axes(&[1]); // [N, 2I]
+            let gate = ops::slice_axis(&gate_up, -1, 0, i);
+            let up = ops::slice_axis(&gate_up, -1, i, 2 * i);
+            let activated = nn::gelu_tanh_approximate(&gate).multiply(&up); // [N, I]
+
+            let down_w = down_t.take_axis(&slot_experts, 0); // [N, I, H]
+            let act_b = activated.reshape(&[n, 1, i]);
+            let down = ops::matmul(&act_b, &down_w).squeeze_axes(&[1]); // [N, H]
+
+            out = out.add(&down.multiply(&slot_weights));
+        }
+        Ok(out)
+    }
+
+    /// Reference forward that transposes the fused params inline every call (no
+    /// cache). Kept for the parity guard test that pins the cached path to this.
+    #[cfg(test)]
+    pub fn forward_reference(
         &self,
         hidden_flat: &Array,
         top_indices: &Array,
@@ -772,7 +864,7 @@ impl Gemma4Experts {
         let mut out = ops::zeros_dtype(&[n, h], hidden_flat.dtype());
         for slot in 0..k {
             let slot_experts = ops::slice_axis(top_indices, -1, slot, slot + 1).reshape(&[n]);
-            let slot_weights = ops::slice_axis(top_weights, -1, slot, slot + 1); // [N, 1]
+            let slot_weights = ops::slice_axis(top_weights, -1, slot, slot + 1);
 
             let gate_up_w = self
                 .gate_up_proj
@@ -780,10 +872,10 @@ impl Gemma4Experts {
                 .take_axis(&slot_experts, 0)
                 .transpose_axes(&[0, 2, 1]);
             let x_b = hidden_flat.reshape(&[n, 1, h]);
-            let gate_up = ops::matmul(&x_b, &gate_up_w).squeeze_axes(&[1]); // [N, 2I]
+            let gate_up = ops::matmul(&x_b, &gate_up_w).squeeze_axes(&[1]);
             let gate = ops::slice_axis(&gate_up, -1, 0, i);
             let up = ops::slice_axis(&gate_up, -1, i, 2 * i);
-            let activated = nn::gelu_tanh_approximate(&gate).multiply(&up); // [N, I]
+            let activated = nn::gelu_tanh_approximate(&gate).multiply(&up);
 
             let down_w = self
                 .down_proj
@@ -791,7 +883,7 @@ impl Gemma4Experts {
                 .take_axis(&slot_experts, 0)
                 .transpose_axes(&[0, 2, 1]);
             let act_b = activated.reshape(&[n, 1, i]);
-            let down = ops::matmul(&act_b, &down_w).squeeze_axes(&[1]); // [N, H]
+            let down = ops::matmul(&act_b, &down_w).squeeze_axes(&[1]);
 
             out = out.add(&down.multiply(&slot_weights));
         }
@@ -1803,6 +1895,54 @@ mod moe_tests {
             top_k_experts: moe.then_some(TOP_K),
             moe_intermediate_size: moe.then_some(MOE_INTER),
         }
+    }
+
+    fn max_abs_diff(a: &Array, b: &Array, len: usize) -> f32 {
+        let mut a = a.clone();
+        let mut b = b.clone();
+        let av = a.to_f32_vec(len).expect("a vec");
+        let bv = b.to_f32_vec(len).expect("b vec");
+        av.iter()
+            .zip(&bv)
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// The pre-transposed expert cache must produce output identical to the
+    /// inline-transpose reference path, and must refresh when the underlying
+    /// weights are replaced (load / merge).
+    #[test]
+    #[serial]
+    fn expert_cache_matches_reference_and_refreshes() {
+        use pmetal_bridge::compat::{Dtype, random};
+        let n = 6;
+        let len = (n * HIDDEN) as usize;
+        let rand = |shape: &[i32]| random::uniform_range(-0.5, 0.5, shape, Dtype::Float32);
+
+        let mut experts = Gemma4Experts::new(NUM_EXPERTS, MOE_INTER, HIDDEN).unwrap();
+        experts.gate_up_proj = Param::new(rand(&[NUM_EXPERTS, 2 * MOE_INTER, HIDDEN]));
+        experts.down_proj = Param::new(rand(&[NUM_EXPERTS, HIDDEN, MOE_INTER]));
+
+        let mut router = Gemma4Router::new(HIDDEN, NUM_EXPERTS, TOP_K, 1e-6).unwrap();
+        let x = random::uniform_range(-1.0, 1.0, &[n, HIDDEN], Dtype::Float32);
+        let (idx, w) = router.route(&x).unwrap();
+
+        let reference = experts.forward_reference(&x, &idx, &w).unwrap();
+        let cached = experts.forward(&x, &idx, &w).unwrap();
+        assert!(
+            max_abs_diff(&cached, &reference, len) < 1e-6,
+            "cached expert forward drifted from reference"
+        );
+
+        // Replace the weights: the Array::id() signature changes, so the cache
+        // must rebuild rather than serve stale transposed tensors.
+        experts.gate_up_proj = Param::new(rand(&[NUM_EXPERTS, 2 * MOE_INTER, HIDDEN]));
+        let reference2 = experts.forward_reference(&x, &idx, &w).unwrap();
+        let cached2 = experts.forward(&x, &idx, &w).unwrap();
+        assert!(
+            max_abs_diff(&cached2, &reference2, len) < 1e-6,
+            "expert cache failed to refresh after weight change"
+        );
     }
 
     /// The MoE block is built only when `enable_moe_block` is set, and is
