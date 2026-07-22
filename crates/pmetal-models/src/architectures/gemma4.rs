@@ -854,6 +854,21 @@ impl Gemma4Router {
     }
 }
 
+/// Quantized (QLoRA) base for [`Gemma4Experts`]: the fused expert weights in
+/// 4-/8-bit affine form. `gate_up`/`down` are each `(packed_weights, scales,
+/// biases)` from `quantize_weights`, quantized along the `in` axis (`H` for
+/// `gate_up_proj [E, 2I, H]`, `I` for `down_proj [E, H, I]`). The forward routes
+/// them through the fused `gather_qmm` (SwitchGLU rank), never materialising the
+/// experts at full precision — this is the parameter-mass win for the 26B-A4B
+/// model.
+#[derive(Debug, Clone)]
+pub struct Gemma4ExpertsQuant {
+    pub gate_up: (Array, Array, Array),
+    pub down: (Array, Array, Array),
+    pub group_size: i32,
+    pub bits: i32,
+}
+
 /// Gemma 4 grouped expert FFNs (`Gemma4TextExperts`).
 ///
 /// Fused 3-D parameters `gate_up_proj [E, 2·I, H]` (gate and up concatenated
@@ -867,6 +882,10 @@ pub struct Gemma4Experts {
     pub num_experts: i32,
     pub moe_intermediate_size: i32,
     pub hidden_size: i32,
+    /// Optional quantized base (QLoRA). `None` = dense path (the pre-transposed
+    /// cache below). Populated by [`Gemma4Experts::quantize`]; kept outside the
+    /// module-parameter tree.
+    quant: Option<Gemma4ExpertsQuant>,
     /// Cached pre-transposed, materialised-contiguous expert weights:
     /// `gate_up_t [E, H, 2·I]` and `down_t [E, I, H]`. The per-token dispatch
     /// matmul then reads a contiguous gathered operand instead of transposing
@@ -899,10 +918,109 @@ impl Gemma4Experts {
             num_experts,
             moe_intermediate_size,
             hidden_size,
+            quant: None,
             gate_up_t: None,
             down_t: None,
             transposed_sig: None,
         })
+    }
+
+    /// Quantize the fused expert weights to `bits`-bit affine (group size
+    /// `group_size`) for the QLoRA base. After this, `forward` routes through the
+    /// fused `gather_qmm` instead of the dense pre-transposed cache. Both
+    /// `hidden_size` and `moe_intermediate_size` must be a multiple of
+    /// `group_size ∈ {32, 64, 128}`. Validated up front — MLX's `quantize`
+    /// throws a foreign C++ exception Rust cannot catch.
+    pub fn quantize(&mut self, group_size: i32, bits: i32) -> Result<(), Exception> {
+        if !matches!(group_size, 32 | 64 | 128) {
+            return Err(Exception::custom(format!(
+                "Gemma4Experts::quantize: unsupported group_size {group_size} (expected 32, 64, or 128)"
+            )));
+        }
+        if !matches!(bits, 2 | 3 | 4 | 5 | 6 | 8) {
+            return Err(Exception::custom(format!(
+                "Gemma4Experts::quantize: unsupported bits {bits} (expected one of 2,3,4,5,6,8)"
+            )));
+        }
+        if self.hidden_size % group_size != 0 {
+            return Err(Exception::custom(format!(
+                "Gemma4Experts::quantize: hidden_size {} not a multiple of group_size {group_size}",
+                self.hidden_size
+            )));
+        }
+        if self.moe_intermediate_size % group_size != 0 {
+            return Err(Exception::custom(format!(
+                "Gemma4Experts::quantize: moe_intermediate_size {} not a multiple of group_size {group_size}",
+                self.moe_intermediate_size
+            )));
+        }
+        let gate_up = self
+            .gate_up_proj
+            .as_ref()
+            .quantize_weights(group_size, bits);
+        let down = self.down_proj.as_ref().quantize_weights(group_size, bits);
+        self.quant = Some(Gemma4ExpertsQuant {
+            gate_up,
+            down,
+            group_size,
+            bits,
+        });
+        Ok(())
+    }
+
+    /// Quantized expert dispatch via the fused `gather_qmm` (SwitchGLU rank),
+    /// numerically equivalent to the dense [`Self::forward`] within quantization
+    /// tolerance. `x [N, H] -> [N, 1, 1, H]`, gathered per `top_indices
+    /// [N, top_k]` to `[N, top_k, 1, ·]`, then weighted-summed over `top_k`.
+    fn forward_quantized(
+        &self,
+        hidden_flat: &Array,
+        top_indices: &Array,
+        top_weights: &Array,
+    ) -> Result<Array, Exception> {
+        let q = self
+            .quant
+            .as_ref()
+            .expect("forward_quantized: quant present");
+        let n = hidden_flat.dim(0);
+        let i = self.moe_intermediate_size;
+        let top_k = top_indices.dim(1);
+
+        // x: [N, H] -> [N, 1, 1, H] (SwitchGLU rank).
+        let switch_in = hidden_flat.expand_dims(1).expand_dims(2);
+        // gate_up: [N, top_k, 1, 2I]
+        let gate_up = switch_in.gather_qmm(
+            &q.gate_up.0,
+            &q.gate_up.1,
+            Some(&q.gate_up.2),
+            None,
+            Some(top_indices),
+            true,
+            q.group_size,
+            q.bits,
+            false,
+        );
+        let gate = ops::slice_axis(&gate_up, -1, 0, i);
+        let up = ops::slice_axis(&gate_up, -1, i, 2 * i);
+        let activated = nn::gelu_tanh_approximate(&gate).multiply(&up); // [N, top_k, 1, I]
+
+        // down: [N, top_k, 1, H] -> squeeze the singleton -> [N, top_k, H]
+        let down = activated
+            .gather_qmm(
+                &q.down.0,
+                &q.down.1,
+                Some(&q.down.2),
+                None,
+                Some(top_indices),
+                true,
+                q.group_size,
+                q.bits,
+                false,
+            )
+            .squeeze_axes(&[2]);
+
+        let weighted = down.multiply(&top_weights.reshape(&[n, top_k, 1]));
+        Ok(weighted.sum_axis(1, false)) // [N, H]
     }
 
     /// Signature of the current fused-weight handles, used to invalidate the
@@ -955,6 +1073,9 @@ impl Gemma4Experts {
         top_indices: &Array,
         top_weights: &Array,
     ) -> Result<Array, Exception> {
+        if self.quant.is_some() {
+            return self.forward_quantized(hidden_flat, top_indices, top_weights);
+        }
         self.ensure_transposed()?;
         let gate_up_t = self.gate_up_t.as_ref().expect("transposed cache built");
         let down_t = self.down_t.as_ref().expect("transposed cache built");
@@ -2277,6 +2398,50 @@ mod moe_tests {
         assert!(
             max_abs_diff(&cached2, &reference2, len) < 1e-6,
             "expert cache failed to refresh after weight change"
+        );
+    }
+
+    /// Quantized (QLoRA) experts via `gather_qmm` must track the dense expert
+    /// forward within 8-bit quantization tolerance, and `quantize` must reject an
+    /// unsupported group size instead of aborting. Uses `H`/`I` divisible by the
+    /// minimum group size (32).
+    #[test]
+    #[serial]
+    fn quantized_experts_match_dense_within_tolerance() {
+        use pmetal_bridge::compat::{Dtype, random};
+        let (h, i, e, k, n) = (64, 32, NUM_EXPERTS, TOP_K, 6);
+        let rand = |shape: &[i32]| random::uniform_range(-0.3, 0.3, shape, Dtype::Float32);
+
+        let mut experts = Gemma4Experts::new(e, i, h).unwrap();
+        experts.gate_up_proj = Param::new(rand(&[e, 2 * i, h]));
+        experts.down_proj = Param::new(rand(&[e, h, i]));
+
+        let mut router = Gemma4Router::new(h, e, k, 1e-6).unwrap();
+        let x = random::uniform_range(-1.0, 1.0, &[n, h], Dtype::Float32);
+        let (idx, w) = router.route(&x).unwrap();
+
+        // A bad group size must error cleanly (not abort the process).
+        assert!(
+            experts.quantize(48, 8).is_err(),
+            "48 is not a valid group size"
+        );
+
+        let dense = experts.forward(&x, &idx, &w).unwrap();
+        experts.quantize(32, 8).unwrap();
+        let quant = experts.forward(&x, &idx, &w).unwrap();
+
+        let len = (n * h) as usize;
+        let mut dense_c = dense.clone();
+        let scale = dense_c
+            .to_f32_vec(len)
+            .unwrap()
+            .iter()
+            .fold(0.0f32, |m, v| m.max(v.abs()))
+            .max(1e-3);
+        let d = max_abs_diff(&dense, &quant, len);
+        assert!(
+            d < 0.2 * scale,
+            "8-bit quantized experts diverged: diff={d}, scale={scale}"
         );
     }
 
