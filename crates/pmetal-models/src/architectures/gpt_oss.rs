@@ -24,8 +24,13 @@
 use pmetal_bridge::compat::{Array, Exception, ModuleParameters, Param, indexing, nn, ops, random};
 use pmetal_bridge::impl_module_params;
 
+use crate::common::yarn::{YarnRope, build_yarn_rope};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig,
+    rope::{apply_rope, apply_rope_with_freqs},
+    sink_sdpa,
+};
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
@@ -250,6 +255,28 @@ impl GptOssConfig {
         self.rope_scaling.as_ref().map(|s| s.factor).unwrap_or(1.0)
     }
 
+    /// Build the YARN rotary state (per-dim inverse frequencies + embedding
+    /// mscale) when `rope_scaling.rope_type == "yarn"`, mirroring mlx-lm's
+    /// `initialize_rope` → `YarnRoPE`. GPT-OSS's config omits `mscale`/
+    /// `mscale_all_dim`, so the mlx-lm defaults (1.0 / 0.0) apply — which still
+    /// yields a non-trivial `mscale` for factor > 1.
+    fn yarn_rope(&self) -> Option<YarnRope> {
+        let rs = self.rope_scaling.as_ref()?;
+        if rs.rope_type != "yarn" {
+            return None;
+        }
+        Some(build_yarn_rope(
+            self.head_dim,
+            self.rope_theta,
+            rs.factor,
+            rs.original_max_position_embeddings,
+            rs.beta_fast,
+            rs.beta_slow,
+            1.0,
+            0.0,
+        ))
+    }
+
     /// Get the effective max position embeddings considering RoPE scaling.
     pub fn effective_max_position(&self) -> i32 {
         let base = self
@@ -344,8 +371,15 @@ pub struct GptOssAttention {
     pub v_proj: nn::Linear,
     /// Output projection.
     pub o_proj: nn::Linear,
+    /// Per-head attention sink logits `[n_heads]`. Each joins its head's softmax
+    /// denominator as a valueless virtual key (GPT-OSS); loaded from the
+    /// checkpoint's `self_attn.sinks`, zero-initialised otherwise.
+    pub sinks: Param<Array>,
+    /// Precomputed YARN rotary state (per-dim inverse frequencies + embedding
+    /// mscale); `None` when `rope_scaling` is absent or not `"yarn"`.
+    yarn_rope: Option<YarnRope>,
 }
-impl_module_params!(GptOssAttention; q_proj, k_proj, v_proj, o_proj);
+impl_module_params!(GptOssAttention; q_proj, k_proj, v_proj, o_proj, sinks);
 
 impl GptOssAttention {
     /// Create a new attention layer.
@@ -356,6 +390,7 @@ impl GptOssAttention {
         let hidden_size = config.hidden_size;
         let scale = (head_dim as f32).powf(-0.5);
         let attention_type = config.attention_type_at(layer_idx);
+        let yarn_rope = config.yarn_rope();
 
         // GPT-OSS uses attention bias
         let use_bias = config.attention_bias;
@@ -387,6 +422,8 @@ impl GptOssAttention {
             k_proj,
             v_proj,
             o_proj,
+            sinks: Param::new(Array::zeros_f32(&[n_heads])),
+            yarn_rope,
         })
     }
 
@@ -400,7 +437,6 @@ impl GptOssAttention {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
-        let mut cache = cache;
 
         // Project Q, K, V
         let q = self.q_proj.forward(x);
@@ -417,10 +453,17 @@ impl GptOssAttention {
         let k = k.transpose_axes(&[0, 2, 1, 3]);
         let v = v.transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply RoPE
+        // Apply RoPE — YARN per-dim frequencies + embedding mscale when
+        // configured (real GPT-OSS uses yarn factor=32), else plain base RoPE.
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-        let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, offset)?;
+        let (q, k) = apply_gpt_oss_rope(
+            &q,
+            &k,
+            self.head_dim,
+            self.rope_theta,
+            &self.yarn_rope,
+            offset,
+        )?;
 
         // Configure attention based on layer type
         let mask_type = match self.attention_type {
@@ -440,26 +483,17 @@ impl GptOssAttention {
             .with_scale(self.scale)
             .with_mask_type(mask_type);
 
-        if mask.is_none() {
-            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
-                if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
-                {
-                    let output = output.transpose_axes(&[0, 2, 1, 3]);
-                    let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
-                    return Ok(self.o_proj.forward(&output));
-                }
-            }
-        }
-
-        // Update cache if provided
+        // Update cache if provided.
         let (k, v) = if let Some((cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &k, &v)?
         } else {
             (k, v)
         };
 
-        let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
+        // GPT-OSS attention has learned per-head sinks, which the fused/
+        // TurboQuant SDPA kernels can't express — always take the sink-aware
+        // eager path so the softmax denominator stays correct.
+        let output = sink_sdpa(&q, &k, &v, &attn_config, mask, self.sinks.as_ref())?;
 
         // Transpose back and project
         let output = output.transpose_axes(&[0, 2, 1, 3]);
@@ -562,6 +596,37 @@ fn router_topk_softmax(gate_logits: &Array, top_k: i32) -> (Array, Array) {
     (top_indices, weights)
 }
 
+/// Apply GPT-OSS RoPE to q/k. When `yarn` is `Some`, uses YARN per-dimension
+/// inverse frequencies and scales q/k by the embedding `mscale` first (mlx-lm
+/// `YarnRoPE`); otherwise plain base RoPE. Split-half (`traditional=false`) in
+/// both cases. Shared by the base and LoRA attention paths.
+fn apply_gpt_oss_rope(
+    q: &Array,
+    k: &Array,
+    head_dim: i32,
+    rope_theta: f32,
+    yarn: &Option<YarnRope>,
+    offset: i32,
+) -> Result<(Array, Array), Exception> {
+    if let Some(yarn) = yarn {
+        let (qi, ki) = if yarn.mscale != 1.0 {
+            let m = Array::from_f32(yarn.mscale);
+            (q.multiply(&m), k.multiply(&m))
+        } else {
+            (q.clone(), k.clone())
+        };
+        Ok((
+            apply_rope_with_freqs(&qi, &yarn.inv_freq, head_dim, false, offset)?,
+            apply_rope_with_freqs(&ki, &yarn.inv_freq, head_dim, false, offset)?,
+        ))
+    } else {
+        Ok((
+            apply_rope(q, head_dim, false, rope_theta, 1.0, offset)?,
+            apply_rope(k, head_dim, false, rope_theta, 1.0, offset)?,
+        ))
+    }
+}
+
 /// GPT-OSS expert MLP with bias and SwiGLU clamping.
 #[derive(Debug)]
 pub struct GptOssMoEExpert {
@@ -646,8 +711,10 @@ impl GptOssMoE {
         swiglu_limit: f32,
         router_aux_loss_coef: f32,
     ) -> Result<Self, Exception> {
+        // GPT-OSS router carries a bias (mlx-lm `MLPBlock.router` /
+        // HF `GptOssTopKRouter`): top-k is taken over `logits + bias`.
         let gate = nn::LinearBuilder::new(hidden_size, num_experts)
-            .bias(false)
+            .bias(true)
             .build()?;
         let experts = (0..num_experts as usize)
             .map(|_| GptOssMoEExpert::new(hidden_size, intermediate_size, swiglu_limit))
@@ -1215,63 +1282,12 @@ impl GptOssForCausalLM {
         self.model.config.vocab_size
     }
 
-    /// Fused batched decode forward for continuous-batching.
-    ///
-    /// GPT-OSS interleaves sliding-window and full-attention layers
-    /// (default: even layers slide with `config.sliding_window`, odd
-    /// layers full-attend). Attention bias is carried by the Q/K/V/O
-    /// projections themselves, so no helper changes are needed beyond
-    /// the per-layer sliding-window overlay. The stacked MoE block
-    /// handles `[N_active, 1, H]` natively via its 2-D flatten path.
-    pub fn forward_batched_impl(
-        &mut self,
-        input_ids: &Array,
-        active_indices: &[usize],
-        cache: &mut pmetal_mlx::kv_cache::FusedBatchKVCache,
-    ) -> Result<Array, Exception> {
-        use crate::common::{BatchedGqaAttnCfg, batched_prenorm_layer};
-
-        let cfg = &self.model.config;
-        let base_cfg = BatchedGqaAttnCfg::new(
-            cfg.num_attention_heads,
-            cfg.num_key_value_heads,
-            cfg.head_dim,
-            cfg.rope_theta,
-            1.0,
-        );
-        let window = cfg.sliding_window;
-        // Snapshot per-layer attention types so we don't borrow `self` twice
-        // during the mutable iteration over `self.model.layers`.
-        let attn_types: Vec<AttentionType> = (0..self.model.layers.len())
-            .map(|i| cfg.attention_type_at(i))
-            .collect();
-        let mut hidden =
-            pmetal_bridge::compat::Module::forward(&mut self.model.embed_tokens, input_ids)?;
-        for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
-            let attn_cfg = match attn_types[layer_idx] {
-                AttentionType::SlidingAttention => base_cfg.with_sliding_window(window),
-                AttentionType::FullAttention => base_cfg,
-            };
-            hidden = batched_prenorm_layer(
-                &hidden,
-                &mut layer.input_layernorm,
-                &mut layer.self_attn.q_proj,
-                &mut layer.self_attn.k_proj,
-                &mut layer.self_attn.v_proj,
-                &mut layer.self_attn.o_proj,
-                None,
-                None,
-                &mut layer.post_attention_layernorm,
-                &mut layer.mlp,
-                &attn_cfg,
-                cache,
-                active_indices,
-                layer_idx,
-            )?;
-        }
-        let hidden = pmetal_bridge::compat::Module::forward(&mut self.model.norm, &hidden)?;
-        pmetal_bridge::compat::Module::forward(&mut self.lm_head, &hidden)
-    }
+    // NOTE: GPT-OSS deliberately has no `forward_batched_impl`. Its attention
+    // uses learned per-head sinks + YARN per-dim RoPE frequencies, neither of
+    // which the shared scalar `BatchedGqaAttnCfg` / `fused_sdpa` block can
+    // express. `dispatcher::supports_fused_batched` returns `false`, so
+    // continuous-batching decode takes the correct serial path
+    // (`GptOssAttention::forward`). A future fused sink kernel can restore this.
 }
 
 // =============================================================================
@@ -1397,6 +1413,10 @@ pub struct GptOssLoraAttention {
     pub sliding_window: i32,
     /// Attention type.
     pub attention_type: AttentionType,
+    /// Frozen per-head attention sinks `[n_heads]` (LoRA does not train these).
+    pub sinks: Array,
+    /// Precomputed YARN rotary state carried over from the base attention.
+    yarn_rope: Option<YarnRope>,
     /// Query projection with LoRA.
     pub q_proj: LoraLinear,
     /// Key projection with LoRA.
@@ -1453,6 +1473,8 @@ impl GptOssLoraAttention {
             rope_theta: attn.rope_theta,
             sliding_window: attn.sliding_window,
             attention_type: attn.attention_type,
+            sinks: attn.sinks.as_ref().clone(),
+            yarn_rope: attn.yarn_rope,
             q_proj,
             k_proj,
             v_proj,
@@ -1471,7 +1493,6 @@ impl GptOssLoraAttention {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
-        let mut cache = cache;
 
         // Project Q, K, V using LoRA layers
         let q = self.q_proj.forward(x)?;
@@ -1488,10 +1509,16 @@ impl GptOssLoraAttention {
         let k = k.transpose_axes(&[0, 2, 1, 3]);
         let v = v.transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply RoPE
+        // Apply RoPE — YARN when configured, else plain base RoPE (same as base attn).
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-        let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, offset)?;
+        let (q, k) = apply_gpt_oss_rope(
+            &q,
+            &k,
+            self.head_dim,
+            self.rope_theta,
+            &self.yarn_rope,
+            offset,
+        )?;
 
         // Configure attention based on layer type
         let mask_type = match self.attention_type {
@@ -1511,18 +1538,6 @@ impl GptOssLoraAttention {
             .with_scale(self.scale)
             .with_mask_type(mask_type);
 
-        if mask.is_none() {
-            if let Some((cache_ref, layer_idx)) = cache.as_mut() {
-                if let Some(output) =
-                    (*cache_ref).try_turboquant_attention(*layer_idx, &q, &k, &v, &attn_config)?
-                {
-                    let output = output.transpose_axes(&[0, 2, 1, 3]);
-                    let output = output.reshape(&[batch, seq_len, self.n_heads * self.head_dim]);
-                    return self.o_proj.forward(&output);
-                }
-            }
-        }
-
         // Update cache if provided
         let (k, v) = if let Some((cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &k, &v)?
@@ -1530,7 +1545,8 @@ impl GptOssLoraAttention {
             (k, v)
         };
 
-        let output = fused_sdpa(&q, &k, &v, &attn_config, mask)?;
+        // Sink-aware eager attention (matches the base attention path).
+        let output = sink_sdpa(&q, &k, &v, &attn_config, mask, &self.sinks)?;
 
         // Transpose back and project
         let output = output.transpose_axes(&[0, 2, 1, 3]);

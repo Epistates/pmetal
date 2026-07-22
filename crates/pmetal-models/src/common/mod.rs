@@ -6,8 +6,10 @@
 //! sdpa sequence and lets future kernel upgrades land once.
 
 pub mod batched_attention;
+pub mod yarn;
 
 pub use batched_attention::{
     BatchedGqaAttnCfg, batched_gqa_attn, batched_parallel_block, batched_perinorm_layer,
     batched_prenorm_layer,
 };
+pub use yarn::{YarnRope, build_yarn_rope, yarn_get_mscale};

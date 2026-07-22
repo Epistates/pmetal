@@ -8,6 +8,7 @@
 //! - Multi-token prediction lookahead modules
 
 // ModuleParameters derive via impl_module_params!
+use crate::common::yarn::{YarnRope, build_yarn_rope, yarn_get_mscale};
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use pmetal_bridge::compat::indexing::IndexOp;
@@ -197,81 +198,10 @@ fn default_true() -> bool {
     true
 }
 
-// ── DeepSeek YARN RoPE helpers (mirror mlx-lm DeepseekV2YarnRotaryEmbedding) ──
-
-/// YARN attention/length scale: `0.1 * mscale * ln(scale) + 1` (1.0 for scale ≤ 1).
-fn yarn_get_mscale(scale: f32, mscale: f32) -> f32 {
-    if scale <= 1.0 {
-        1.0
-    } else {
-        0.1 * mscale * scale.ln() + 1.0
-    }
-}
-
-fn yarn_find_correction_dim(num_rotations: f32, dim: i32, base: f32, max_pos: i32) -> f32 {
-    (dim as f32 * (max_pos as f32 / (num_rotations * 2.0 * std::f32::consts::PI)).ln())
-        / (2.0 * base.ln())
-}
-
-fn yarn_find_correction_range(
-    low_rot: f32,
-    high_rot: f32,
-    dim: i32,
-    base: f32,
-    max_pos: i32,
-) -> (f32, f32) {
-    let low = yarn_find_correction_dim(low_rot, dim, base, max_pos).floor();
-    let high = yarn_find_correction_dim(high_rot, dim, base, max_pos).ceil();
-    (low.max(0.0), high.min((dim - 1) as f32))
-}
-
-/// Precomputed YARN rotary state: per-dimension inverse frequencies (consumed by
-/// `apply_rope_with_freqs`) plus the embedding mscale applied to q/k before
-/// rotation.
-#[derive(Debug, Clone)]
-struct YarnRope {
-    inv_freq: Array,
-    mscale: f32,
-}
-
-/// Build the YARN per-dimension inverse frequencies and embedding mscale.
-/// `scaling_factor == 1` collapses to standard RoPE (freq_inter == freq_extra).
-#[allow(clippy::too_many_arguments)]
-fn build_yarn_rope(
-    dim: i32,
-    base: f32,
-    scaling_factor: f32,
-    original_max_pos: i32,
-    beta_fast: f32,
-    beta_slow: f32,
-    mscale: f32,
-    mscale_all_dim: f32,
-) -> YarnRope {
-    let half = (dim / 2) as usize;
-    let (low, high) = yarn_find_correction_range(beta_fast, beta_slow, dim, base, original_max_pos);
-    let denom = if (high - low).abs() < f32::EPSILON {
-        0.001 // prevent singularity (mlx yarn_linear_ramp_mask)
-    } else {
-        high - low
-    };
-    let mut inv_freq = Vec::with_capacity(half);
-    for i in 0..half {
-        let exponent = (2 * i) as f32 / dim as f32;
-        let freq_extra = base.powf(exponent);
-        let freq_inter = scaling_factor * freq_extra;
-        let ramp = (((i as f32) - low) / denom).clamp(0.0, 1.0);
-        let freq_mask = 1.0 - ramp;
-        let freqs =
-            (freq_inter * freq_extra) / (freq_inter * freq_mask + freq_extra * (1.0 - freq_mask));
-        inv_freq.push(1.0 / freqs);
-    }
-    let emb_mscale =
-        yarn_get_mscale(scaling_factor, mscale) / yarn_get_mscale(scaling_factor, mscale_all_dim);
-    YarnRope {
-        inv_freq: Array::from_slice(&inv_freq, &[half as i32]),
-        mscale: emb_mscale,
-    }
-}
+// DeepSeek YARN RoPE: the per-dim frequency + embedding-mscale math is the
+// shared mlx-lm `YarnRoPE` formula, extracted to `common::yarn` and reused by
+// GPT-OSS. DeepSeek applies it with interleaved RoPE and folds `mscale²` into
+// the softmax scale (see `DeepSeekAttention::new`).
 
 /// Parse a DeepSeek `rope_scaling` JSON block into YARN params, with mlx-lm
 /// defaults. Returns `None` if no block is configured.

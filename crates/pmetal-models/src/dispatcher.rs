@@ -1140,11 +1140,14 @@ impl DynamicModel {
             // token-level MoE router already flattens `[N, 1, H]` cleanly
             // via `forward_stacked`.
             Self::Qwen3MoE(_) => true,
-            // GPT-OSS: per-layer sliding-window attention is handled by the
-            // `BatchedGqaAttnCfg::with_sliding_window` overlay inside the
-            // arch's `forward_batched_impl`; attention biases ride on the
-            // standard `nn::Linear` projections.
-            Self::GptOss(_) => true,
+            // GPT-OSS: takes the serial decode path. Its attention has learned
+            // per-head *sinks* (an extra softmax-denominator term) and YARN
+            // per-dim RoPE frequencies, neither of which the shared scalar
+            // `BatchedGqaAttnCfg` + `fused_sdpa` block can express. The serial
+            // `GptOssAttention::forward` applies both correctly; enabling the
+            // fused path would silently drop the sink term. Re-enable only
+            // after threading sinks through `batched_gqa_attn`.
+            Self::GptOss(_) => false,
             // Gemma1 uses `batched_prenorm_layer`. Gemma2/3 use the
             // 4-norm peri-norm helper plus optional per-layer sliding
             // window and attention logit softcap.
@@ -1197,7 +1200,10 @@ impl DynamicModel {
             Self::Qwen2(m) => m.forward_batched_impl(input_ids, active_indices, cache),
             Self::Qwen3(m) => m.forward_batched_impl(input_ids, active_indices, cache),
             Self::Qwen3MoE(m) => m.forward_batched_impl(input_ids, active_indices, cache),
-            Self::GptOss(m) => m.forward_batched_impl(input_ids, active_indices, cache),
+            // GPT-OSS intentionally omitted — `supports_fused_batched` returns
+            // false (sinks/YARN can't ride the shared fused block), so this
+            // falls through to the typed error below rather than silently
+            // dropping the sink term on a mis-gated call.
             Self::Gemma(m) => m.forward_batched_impl(input_ids, active_indices, cache),
             Self::Phi(m) => m.forward_batched_impl(input_ids, active_indices, cache),
             Self::Phi4(m) => m.forward_batched_impl(input_ids, active_indices, cache),

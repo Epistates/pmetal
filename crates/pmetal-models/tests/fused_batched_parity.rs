@@ -18,7 +18,6 @@ use pmetal_mlx::kv_cache::{FusedBatchKVCache, KVCache, KVCacheConfig};
 
 use pmetal_models::architectures::cohere::{CohereConfig, CohereForCausalLM};
 use pmetal_models::architectures::gemma::{GemmaConfig, GemmaForCausalLM};
-use pmetal_models::architectures::gpt_oss::{AttentionType, GptOssConfig, GptOssForCausalLM};
 use pmetal_models::architectures::granite::{GraniteConfig, GraniteForCausalLM};
 use pmetal_models::architectures::llama::{LlamaConfig, LlamaForCausalLM};
 use pmetal_models::architectures::mistral::{MistralConfig, MistralForCausalLM};
@@ -603,91 +602,11 @@ fn fused_vs_serial_qwen3_moe_multi_step() {
     }
 }
 
-fn tiny_gpt_oss_config() -> GptOssConfig {
-    GptOssConfig {
-        vocab_size: 64,
-        hidden_size: 32,
-        intermediate_size: 32,
-        num_hidden_layers: 4,
-        num_attention_heads: 4,
-        num_key_value_heads: 2,
-        head_dim: 8,
-        max_position_embeddings: 64,
-        initial_context_length: 64,
-        rms_norm_eps: 1e-5,
-        rope_theta: 10000.0,
-        rope_scaling: None,
-        attention_bias: true,
-        attention_dropout: 0.0,
-        tie_word_embeddings: false,
-        num_local_experts: 4,
-        experts_per_token: 2,
-        num_experts_per_tok: None,
-        router_aux_loss_coef: 0.9,
-        output_router_logits: false,
-        sliding_window: 2,
-        layer_types: vec![
-            AttentionType::SlidingAttention,
-            AttentionType::FullAttention,
-            AttentionType::SlidingAttention,
-            AttentionType::FullAttention,
-        ],
-        swiglu_limit: 7.0,
-        hidden_act: "silu".to_string(),
-        eos_token_id: 0,
-        pad_token_id: 0,
-        model_type: "gpt_oss".to_string(),
-    }
-}
-
-/// Replay tokens through the serial and fused decode paths side by side,
-/// confirming parity after `sliding_window`+1 steps — the regime where
-/// the sliding lower-bound mask becomes load-bearing.
-#[test]
-fn fused_vs_serial_gpt_oss_respects_sliding_window() {
-    let config = tiny_gpt_oss_config();
-    assert!(config.sliding_window >= 1);
-    let window = config.sliding_window as usize;
-
-    let mut model = GptOssForCausalLM::new(config.clone()).unwrap();
-    model.init_stacked_moe().unwrap();
-
-    let max_seq = config.max_position_embeddings as usize;
-    let hkv = config.num_key_value_heads as usize;
-    let hd = config.head_dim as usize;
-    let nl = config.num_hidden_layers as usize;
-
-    // Drive enough steps (window + 2) that the sliding mask has to drop at
-    // least one historical K position — otherwise sliding_window is a no-op
-    // and the test wouldn't exercise the new mask overlay.
-    let steps = window + 2;
-    let token_stream: Vec<i32> = (0..steps as i32).map(|i| (i * 3 + 5) % 37).collect();
-
-    let mut cache_serial = KVCache::new(kv_cfg(nl, max_seq, hkv, hd));
-    let mut cache_fused = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
-    cache_fused.admit(0).unwrap();
-
-    for (step, &tok) in token_stream.iter().enumerate() {
-        let serial_input = Array::from_i32_slice(&[tok]).reshape(&[1, 1]);
-        let fused_input = Array::from_i32_slice(&[tok]).reshape(&[1, 1]);
-
-        let s = model
-            .forward(&serial_input, None, Some(&mut cache_serial))
-            .unwrap();
-        let sv = last_logits(&s);
-
-        let f = model
-            .forward_batched_impl(&fused_input, &[0], &mut cache_fused)
-            .unwrap();
-        let fv = last_logits(&f);
-
-        let diff = max_abs_diff(&sv, &fv);
-        assert!(
-            diff < 5e-4,
-            "GPT-OSS step {step} (token {tok}) divergence: {diff}"
-        );
-    }
-}
+// NOTE: GPT-OSS has no fused-batched parity test here — its attention uses
+// learned per-head sinks + YARN RoPE that the shared `fused_sdpa` batched block
+// can't express, so `dispatcher::supports_fused_batched` returns false and
+// GPT-OSS decodes serially. Its correctness is covered by the mlx-lm oracle
+// parity fixture (`gpt_oss_parity.rs`).
 
 fn tiny_gemma_config() -> GemmaConfig {
     GemmaConfig {

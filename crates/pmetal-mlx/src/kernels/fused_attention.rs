@@ -831,6 +831,85 @@ fn manual_sdpa_with_softcapping(
     Ok(output)
 }
 
+/// Scaled dot-product attention with **attention sinks** (GPT-OSS).
+///
+/// MLX's fused kernel (and this crate's bridge SDPA) have no `sinks` parameter,
+/// so this mirrors `mx.fast.scaled_dot_product_attention(..., sinks=sinks)`
+/// eagerly: one learned per-head logit joins the softmax denominator as a
+/// virtual key that contributes nothing to the output. Concretely, for each
+/// (batch, head, query) row the softmax is taken over `[scores, sink_h]` and
+/// the sink column is then dropped from the weighted sum:
+///
+/// ```text
+///   scores  = scale · (Q · Kᵀ) + mask          # [B, H, L, S]
+///   p       = softmax([scores, sink_h], -1)     # [B, H, L, S+1]
+///   out     = p[..., :S] @ V
+/// ```
+///
+/// `sinks` is a 1-D `[n_heads]` array. GQA K/V are expanded internally, exactly
+/// like [`manual_sdpa_with_softcapping`]. Logit softcapping is intentionally
+/// unsupported here — GPT-OSS uses sinks, not softcap.
+pub fn sink_sdpa(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    config: &FusedAttentionConfig,
+    custom_mask: Option<&Array>,
+    sinks: &Array,
+) -> Result<Array, Exception> {
+    let shape = queries.shape();
+    let batch = shape[0];
+    let n_heads = shape[1];
+    let q_seq_len = shape[2];
+
+    let k_shape = keys.shape();
+    let n_kv_heads = k_shape[1];
+    let kv_seq_len = k_shape[2];
+
+    // Expand K/V for GQA if needed (sink softmax is per-expanded-head).
+    let (keys, values) = if n_kv_heads < n_heads {
+        let repeats = n_heads / n_kv_heads;
+        (
+            expand_kv_heads(keys, repeats)?,
+            expand_kv_heads(values, repeats)?,
+        )
+    } else {
+        (keys.clone(), values.clone())
+    };
+
+    // scale · (Q · Kᵀ)
+    let keys_t = keys.transpose_axes(&[0, 1, 3, 2]);
+    let scale_arr = Array::from_f32(config.scale);
+    let scores = queries.matmul(&keys_t).multiply(&scale_arr);
+
+    // Additive mask (matches the fused-kernel mask semantics).
+    let scores = match (&config.mask_type, custom_mask) {
+        (_, Some(mask)) => scores.add(mask),
+        (AttentionMaskType::Causal, None) => {
+            scores.add(&create_causal_mask(q_seq_len, kv_seq_len)?)
+        }
+        (AttentionMaskType::SlidingWindow(window_size), None) => scores.add(
+            &create_sliding_window_mask(q_seq_len, kv_seq_len, *window_size)?,
+        ),
+        (AttentionMaskType::None, None) => scores,
+    };
+
+    // Sink column: per-head logit broadcast to [B, H, L, 1], concatenated as the
+    // (S+1)-th key, softmaxed over the full row, then dropped from the sum.
+    let sink_col = sinks
+        .reshape(&[1, n_heads, 1, 1])
+        .broadcast_to(&[batch, n_heads, q_seq_len, 1]);
+    let combined = ops::concatenate_axis(&[&scores, &sink_col], -1);
+    let weights = combined.softmax(-1);
+    let weights = ops::slice_axis(&weights, -1, 0, kv_seq_len);
+
+    let output = weights.matmul(&values);
+
+    let v_head_dim = values.dim(3);
+    debug_assert_eq!(output.shape(), &[batch, n_heads, q_seq_len, v_head_dim]);
+    Ok(output)
+}
+
 /// Expand K/V heads for grouped query attention.
 ///
 /// [batch, n_kv_heads, seq_len, head_dim] -> [batch, n_heads, seq_len, head_dim]
@@ -1033,6 +1112,63 @@ mod tests {
             is_ultra_fusion: false,
             die_count: 1,
         }
+    }
+
+    #[test]
+    fn sink_sdpa_matches_hand_computed_softmax() {
+        // 1 batch, 1 head, 1 query, 2 keys, head_dim 1, scale 1.0, no mask.
+        // scores = q·kᵀ = [2, 3]; sink logit c = 0.5. The sink joins the
+        // softmax denominator as a valueless key, so:
+        //   Z   = e² + e³ + e^0.5
+        //   w   = [e²/Z, e³/Z]              (sink weight dropped)
+        //   out = 10·w0 + 20·w1
+        let q = Array::from_slice(&[1.0_f32], &[1, 1, 1, 1]);
+        let k = Array::from_slice(&[2.0_f32, 3.0], &[1, 1, 2, 1]);
+        let v = Array::from_slice(&[10.0_f32, 20.0], &[1, 1, 2, 1]);
+        let sinks = Array::from_slice(&[0.5_f32], &[1]);
+
+        let cfg = FusedAttentionConfig::new(1, 1, 1)
+            .with_scale(1.0)
+            .with_mask_type(AttentionMaskType::None);
+        let mut out = sink_sdpa(&q, &k, &v, &cfg, None, &sinks).expect("sink_sdpa");
+        let got = out.to_f32_vec(1).expect("vec")[0];
+
+        let (e2, e3, ec) = (2.0_f64.exp(), 3.0_f64.exp(), 0.5_f64.exp());
+        let z = e2 + e3 + ec;
+        let expected = (10.0 * e2 / z + 20.0 * e3 / z) as f32;
+        assert!(
+            (got - expected).abs() < 1e-4,
+            "sink_sdpa out {got} != hand-computed {expected}"
+        );
+    }
+
+    #[test]
+    fn sink_sdpa_zero_sink_still_shifts_denominator() {
+        // A zero sink is NOT a no-op: it adds e^0 = 1 to the denominator, so
+        // the output must differ from plain (sink-free) attention.
+        let q = Array::from_slice(&[1.0_f32], &[1, 1, 1, 1]);
+        let k = Array::from_slice(&[2.0_f32, 3.0], &[1, 1, 2, 1]);
+        let v = Array::from_slice(&[10.0_f32, 20.0], &[1, 1, 2, 1]);
+        let cfg = FusedAttentionConfig::new(1, 1, 1)
+            .with_scale(1.0)
+            .with_mask_type(AttentionMaskType::None);
+
+        let zeros = Array::from_slice(&[0.0_f32], &[1]);
+        let mut with_sink = sink_sdpa(&q, &k, &v, &cfg, None, &zeros).expect("sink");
+        let s = with_sink.to_f32_vec(1).expect("vec")[0];
+
+        // Plain softmax over [2,3]: out = (10·e² + 20·e³)/(e²+e³).
+        let (e2, e3) = (2.0_f64.exp(), 3.0_f64.exp());
+        let plain = ((10.0 * e2 + 20.0 * e3) / (e2 + e3)) as f32;
+        let with_one = ((10.0 * e2 + 20.0 * e3) / (e2 + e3 + 1.0)) as f32;
+        assert!(
+            (s - with_one).abs() < 1e-4,
+            "zero-sink out {s} != {with_one}"
+        );
+        assert!(
+            (s - plain).abs() > 1e-3,
+            "zero sink should differ from plain softmax"
+        );
     }
 
     #[test]
