@@ -140,6 +140,11 @@ pub use checkpointing::*;
 pub use dapo::*;
 #[cfg(feature = "experimental-trainers")]
 pub use diffusion::*;
+pub use diffusion_gemma_train::{
+    DiffusionGemmaStepStats, DiffusionGemmaTrainConfig, DiffusionGemmaTrainer,
+    diffusion_denoising_loss, encoder_ar_loss, load_lora_adapters, save_lora_adapters,
+    uniform_categorical_noise,
+};
 pub use distillation::*;
 pub use dpo::*;
 pub use explicit_state_compile::*;

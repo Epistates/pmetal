@@ -27,6 +27,8 @@ pub(crate) mod search;
 pub(crate) mod serve;
 pub(crate) mod tokenize;
 #[cfg(feature = "trainer")]
+pub(crate) mod train_diffusion;
+#[cfg(feature = "trainer")]
 pub(crate) mod train_draft;
 #[cfg(feature = "trainer")]
 pub(crate) mod train_mtp;

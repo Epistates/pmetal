@@ -282,6 +282,11 @@ enum Commands {
     #[cfg(feature = "trainer")]
     TrainDraft(crate::cli::train_draft::TrainDraftArgs),
 
+    /// LoRA fine-tune a DiffusionGemma block-diffusion model
+    #[command(name = "train-diffusion")]
+    #[cfg(feature = "trainer")]
+    TrainDiffusion(crate::cli::train_diffusion::TrainDiffusionArgs),
+
     /// Pretrain a model from scratch (full-parameter, no LoRA)
     #[cfg(feature = "trainer")]
     Pretrain(crate::cli::pretrain::PretrainArgs),
@@ -1640,6 +1645,11 @@ async fn tokio_main() -> anyhow::Result<()> {
         #[cfg(feature = "trainer")]
         Commands::TrainDraft(args) => {
             commands::train_draft::run_train_draft(args).await?;
+        }
+
+        #[cfg(feature = "trainer")]
+        Commands::TrainDiffusion(args) => {
+            commands::train_diffusion::run_train_diffusion(args).await?;
         }
 
         #[cfg(feature = "mcp")]

@@ -22,6 +22,8 @@ pub mod serve;
 pub mod tokenize;
 pub mod train;
 #[cfg(feature = "trainer")]
+pub mod train_diffusion;
+#[cfg(feature = "trainer")]
 pub mod train_draft;
 #[cfg(feature = "trainer")]
 pub mod train_mtp;
