@@ -53,8 +53,63 @@ use pmetal_bridge::compat::{
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
+use pmetal_core::LoraConfig;
+use pmetal_mlx::kernels::fast_lora::create_lora_params;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
 use pmetal_mlx::kv_cache::KVCache;
+
+/// A single low-rank adapter `ΔW = scale · Bᵀ · Aᵀ` applied additively to a
+/// base `nn::Linear` output (PEFT-style, baked into the module rather than a
+/// parallel model). `a` is `[rank, in]`, `b` is `[out, rank]`; `create_lora_params`
+/// zero-initialises `b`, so a freshly-attached adapter is a numerical no-op until
+/// trained — attaching LoRA never perturbs inference parity.
+#[derive(Debug, Clone)]
+pub struct LoraDelta {
+    pub a: Array,
+    pub b: Array,
+    pub scale: f32,
+}
+
+impl LoraDelta {
+    fn new(in_features: i32, out_features: i32, rank: i32, alpha: f32) -> Result<Self, Exception> {
+        let (a, b) = create_lora_params(in_features, out_features, rank)?;
+        Ok(Self {
+            a,
+            b,
+            scale: alpha / rank as f32,
+        })
+    }
+
+    /// `scale · (x · Aᵀ) · Bᵀ` — the additive delta for input `x [.., in]`.
+    fn delta(&self, x: &Array) -> Array {
+        x.matmul(&self.a.t())
+            .matmul(&self.b.t())
+            .multiply(&Array::from_f32(self.scale))
+    }
+}
+
+/// Optional per-projection LoRA adapters for [`Gemma4Attention`]. Populated by
+/// `attach_lora`; `None` slots (and the whole `Option` on the attention) mean
+/// the base projection is used unchanged. Trainable state is collected via
+/// `lora_parameters` / `lora_parameters_mut`, deliberately *outside* the
+/// `impl_module_params!` tree so base-weight loading never touches it.
+#[derive(Debug, Default, Clone)]
+pub struct Gemma4AttnLora {
+    pub q: Option<LoraDelta>,
+    pub k: Option<LoraDelta>,
+    pub v: Option<LoraDelta>,
+    pub o: Option<LoraDelta>,
+}
+
+/// Base projection + optional LoRA delta. Byte-identical to `proj.forward(x)`
+/// when `lora` is `None`, preserving inference parity.
+fn linear_lora(proj: &nn::Linear, x: &Array, lora: Option<&LoraDelta>) -> Array {
+    let base = proj.forward(x);
+    match lora {
+        Some(l) => base.add(&l.delta(x)),
+        None => base,
+    }
+}
 
 /// Apply Gemma 4 partial rotary embedding to a `[B, H, L, head_dim]` tensor.
 ///
@@ -986,6 +1041,10 @@ pub struct Gemma4Attention {
     /// per layer at construction time — `None` for full-rotation layers
     /// that already use the fused-kernel direct path.
     pub rope_partial_freqs: Option<Array>,
+    /// Optional LoRA adapters for the q/k/v/o projections (PEFT bake-in).
+    /// `None` = plain attention. Attached via [`Gemma4Attention::attach_lora`];
+    /// managed outside the module-parameter tree.
+    pub lora: Option<Gemma4AttnLora>,
 }
 impl_module_params!(Gemma4Attention; q_proj, k_proj, v_proj, o_proj, q_norm, k_norm);
 
@@ -1047,7 +1106,82 @@ impl Gemma4Attention {
             use_k_eq_v,
             sliding_window,
             rope_partial_freqs,
+            lora: None,
         })
+    }
+
+    /// Attach LoRA adapters to the projections named in `config.target_modules`
+    /// (`q_proj` / `k_proj` / `v_proj` / `o_proj`). `v_proj` is skipped on
+    /// `k_eq_v` (full-attention) layers that have no value projection. Adapters
+    /// initialise to a no-op (`B = 0`), so inference is unchanged until trained.
+    pub fn attach_lora(&mut self, config: &LoraConfig) -> Result<(), Exception> {
+        let rank = config.r as i32;
+        let alpha = config.alpha;
+        let has = |m: &str| config.target_modules.iter().any(|t| t == m);
+        let shape = |proj: &nn::Linear| {
+            let w = proj.weight.as_ref();
+            (w.dim(1), w.dim(0)) // (in, out) from [out, in]
+        };
+        let mk = |proj: &nn::Linear| -> Result<LoraDelta, Exception> {
+            let (i, o) = shape(proj);
+            LoraDelta::new(i, o, rank, alpha)
+        };
+        self.lora = Some(Gemma4AttnLora {
+            q: if has("q_proj") {
+                Some(mk(&self.q_proj)?)
+            } else {
+                None
+            },
+            k: if has("k_proj") {
+                Some(mk(&self.k_proj)?)
+            } else {
+                None
+            },
+            v: match (self.v_proj.as_ref(), has("v_proj")) {
+                (Some(vp), true) => Some(mk(vp)?),
+                _ => None,
+            },
+            o: if has("o_proj") {
+                Some(mk(&self.o_proj)?)
+            } else {
+                None
+            },
+        });
+        Ok(())
+    }
+
+    /// Named LoRA parameters (`{proj}.lora_{a,b}`) for inventory / counting.
+    pub fn lora_parameters(&self) -> Vec<(String, &Array)> {
+        let mut out = Vec::new();
+        if let Some(l) = &self.lora {
+            for (name, slot) in [
+                ("q_proj", &l.q),
+                ("k_proj", &l.k),
+                ("v_proj", &l.v),
+                ("o_proj", &l.o),
+            ] {
+                if let Some(d) = slot {
+                    out.push((format!("{name}.lora_a"), &d.a));
+                    out.push((format!("{name}.lora_b"), &d.b));
+                }
+            }
+        }
+        out
+    }
+
+    /// Mutable LoRA parameters for the optimiser (`{proj}.lora_{a,b}`).
+    pub fn lora_parameters_mut(&mut self) -> Vec<(String, &mut Array)> {
+        let mut out = Vec::new();
+        if let Some(lora) = self.lora.as_mut() {
+            let Gemma4AttnLora { q, k, v, o } = lora;
+            for (name, slot) in [("q_proj", q), ("k_proj", k), ("v_proj", v), ("o_proj", o)] {
+                if let Some(d) = slot.as_mut() {
+                    out.push((format!("{name}.lora_a"), &mut d.a));
+                    out.push((format!("{name}.lora_b"), &mut d.b));
+                }
+            }
+        }
+        out
     }
 
     fn attention_mask_type(
@@ -1090,17 +1224,23 @@ impl Gemma4Attention {
             query_len,
             self.n_heads * self.head_dim,
         ]);
-        Ok(self.o_proj.forward(&output))
+        Ok(linear_lora(
+            &self.o_proj,
+            &output,
+            self.lora.as_ref().and_then(|l| l.o.as_ref()),
+        ))
     }
 
     fn project_queries(&mut self, x: &Array, offset: i32) -> Result<Array, Exception> {
         let shape = x.shape();
         let b = shape[0];
         let l = shape[1];
-        let q = self
-            .q_proj
-            .forward(x)
-            .reshape(&[b, l, self.n_heads, self.head_dim]);
+        let q = linear_lora(
+            &self.q_proj,
+            x,
+            self.lora.as_ref().and_then(|l| l.q.as_ref()),
+        )
+        .reshape(&[b, l, self.n_heads, self.head_dim]);
         let q = self.q_norm.forward(&q).transpose_axes(&[0, 2, 1, 3]);
         apply_gemma4_partial_rope(
             &q,
@@ -1117,18 +1257,26 @@ impl Gemma4Attention {
         let b = shape[0];
         let l = shape[1];
 
-        let q = self
-            .q_proj
-            .forward(x)
-            .reshape(&[b, l, self.n_heads, self.head_dim]);
-        let k = self
-            .k_proj
-            .forward(x)
-            .reshape(&[b, l, self.n_kv_heads, self.head_dim]);
+        let lora = self.lora.as_ref();
+        let q = linear_lora(&self.q_proj, x, lora.and_then(|l| l.q.as_ref())).reshape(&[
+            b,
+            l,
+            self.n_heads,
+            self.head_dim,
+        ]);
+        let k = linear_lora(&self.k_proj, x, lora.and_then(|l| l.k.as_ref())).reshape(&[
+            b,
+            l,
+            self.n_kv_heads,
+            self.head_dim,
+        ]);
         let v_raw = match self.v_proj.as_ref() {
-            Some(v_proj) => v_proj
-                .forward(x)
-                .reshape(&[b, l, self.n_kv_heads, self.head_dim]),
+            Some(v_proj) => linear_lora(v_proj, x, lora.and_then(|l| l.v.as_ref())).reshape(&[
+                b,
+                l,
+                self.n_kv_heads,
+                self.head_dim,
+            ]),
             None => k.clone(),
         };
 

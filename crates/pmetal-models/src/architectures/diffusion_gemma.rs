@@ -942,6 +942,59 @@ impl DiffusionGemmaForBlockDiffusion {
         Ok(self.lm_logits(&hidden))
     }
 
+    /// Attach LoRA adapters to every encoder and decoder attention layer, for
+    /// the projections named in `config.target_modules`. Adapters initialise to
+    /// a no-op (`B = 0`), so `forward_train` / `generate` are numerically
+    /// unchanged until the adapters are trained.
+    ///
+    /// The encoder and decoder trunks carry *independent* adapters — they are
+    /// separate module instances in pmetal even though their base weights are
+    /// tied — so a fine-tune adapts both the causal context encoder and the
+    /// bidirectional denoising decoder.
+    pub fn attach_lora(&mut self, config: &pmetal_core::LoraConfig) -> Result<(), Exception> {
+        for layer in &mut self.encoder.layers {
+            layer.self_attn.attach_lora(config)?;
+        }
+        for layer in &mut self.decoder.layers {
+            layer.self_attn.attach_lora(config)?;
+        }
+        Ok(())
+    }
+
+    /// All LoRA parameters, namespaced
+    /// `{encoder|decoder}.layers.{i}.self_attn.{proj}.lora_{a,b}`.
+    pub fn lora_parameters(&self) -> Vec<(String, &Array)> {
+        let mut out = Vec::new();
+        for (tower, layers) in [
+            ("encoder", &self.encoder.layers),
+            ("decoder", &self.decoder.layers),
+        ] {
+            for (i, layer) in layers.iter().enumerate() {
+                for (name, arr) in layer.self_attn.lora_parameters() {
+                    out.push((format!("{tower}.layers.{i}.self_attn.{name}"), arr));
+                }
+            }
+        }
+        out
+    }
+
+    /// Mutable LoRA parameters for the optimiser (same namespacing). Two
+    /// sequential loops keep the encoder/decoder mutable borrows disjoint.
+    pub fn lora_parameters_mut(&mut self) -> Vec<(String, &mut Array)> {
+        let mut out = Vec::new();
+        for (i, layer) in self.encoder.layers.iter_mut().enumerate() {
+            for (name, arr) in layer.self_attn.lora_parameters_mut() {
+                out.push((format!("encoder.layers.{i}.self_attn.{name}"), arr));
+            }
+        }
+        for (i, layer) in self.decoder.layers.iter_mut().enumerate() {
+            for (name, arr) in layer.self_attn.lora_parameters_mut() {
+                out.push((format!("decoder.layers.{i}.self_attn.{name}"), arr));
+            }
+        }
+        out
+    }
+
     /// Generate by block-autoregressive discrete diffusion (batch size 1).
     ///
     /// For each canvas block: encode the running sequence into a read-only KV
@@ -1488,6 +1541,54 @@ mod tests {
         assert!(
             v.iter().all(|x| x.is_finite()),
             "forward_train produced non-finite logits"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lora_attach_is_noop_until_trained() {
+        use pmetal_core::LoraConfig;
+        let cfg = tiny_config();
+        let vocab = cfg.vocab_size;
+        let canvas = cfg.canvas_length;
+        let mut model = DiffusionGemmaForBlockDiffusion::new(cfg).unwrap();
+
+        let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
+        let context = Array::from_slice(&ctx_ids, &[1, 5]);
+        let canvas_ids: Vec<i32> = (0..canvas).map(|i| (i * 7 + 2) % vocab).collect();
+        let canvas_arr = Array::from_slice(&canvas_ids, &[1, canvas]);
+
+        let mut before = model.forward_train(&context, &canvas_arr, None).unwrap();
+        let before_v = before.to_f32_vec((canvas * vocab) as usize).unwrap();
+        assert!(
+            model.lora_parameters().is_empty(),
+            "no adapters before attach"
+        );
+
+        let mut lora_cfg = LoraConfig::default();
+        lora_cfg.r = 4;
+        lora_cfg.alpha = 8.0;
+        lora_cfg.target_modules = ["q_proj", "k_proj", "v_proj", "o_proj"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        model.attach_lora(&lora_cfg).unwrap();
+
+        let n = model.lora_parameters().len();
+        assert!(n > 0, "expected LoRA params after attach");
+        assert_eq!(model.lora_parameters_mut().len(), n, "mut count matches");
+
+        // B is zero-initialised, so the adapters must not change the output yet.
+        let mut after = model.forward_train(&context, &canvas_arr, None).unwrap();
+        let after_v = after.to_f32_vec((canvas * vocab) as usize).unwrap();
+        let max_diff = before_v
+            .iter()
+            .zip(&after_v)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-6,
+            "attaching zero-init LoRA changed the output by {max_diff}"
         );
     }
 
