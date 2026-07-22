@@ -961,6 +961,40 @@ impl DiffusionGemmaForBlockDiffusion {
         Ok(())
     }
 
+    /// Quantize the base weights of every encoder + decoder attention projection
+    /// and MoE expert block to `bits`-bit affine (group size `group_size`) for
+    /// QLoRA. The frozen base then runs through MLX's fused quantized matmuls
+    /// (`quantized_matmul` / `gather_qmm`) while the LoRA adapters stay in f32 —
+    /// so `attach_lora` composes with this in either order, and the block-
+    /// diffusion trainer's gradients still flow only to the f32 adapters.
+    ///
+    /// `hidden_size`, `moe_intermediate_size`, and each attention projection's
+    /// input dimension must be multiples of `group_size ∈ {32, 64, 128}`; a
+    /// violation returns a clean error rather than aborting.
+    ///
+    /// `for_training` selects the quantized experts' backward path: `true` uses
+    /// the exact dequantize-to-dense forward (required for QLoRA training, since
+    /// the fused `gather_qmm` has no input-activation vjp); `false` uses the
+    /// fast fused `gather_qmm` inference path.
+    pub fn quantize_base(
+        &mut self,
+        group_size: i32,
+        bits: i32,
+        for_training: bool,
+    ) -> Result<(), Exception> {
+        for layer in &mut self.encoder.layers {
+            layer.self_attn.quantize_projections(group_size, bits)?;
+            layer.experts.quantize(group_size, bits)?;
+            layer.experts.set_dequant_backward(for_training);
+        }
+        for layer in &mut self.decoder.layers {
+            layer.self_attn.quantize_projections(group_size, bits)?;
+            layer.experts.quantize(group_size, bits)?;
+            layer.experts.set_dequant_backward(for_training);
+        }
+        Ok(())
+    }
+
     /// All LoRA parameters, namespaced
     /// `{encoder|decoder}.layers.{i}.self_attn.{proj}.lora_{a,b}`.
     pub fn lora_parameters(&self) -> Vec<(String, &Array)> {
@@ -1541,6 +1575,49 @@ mod tests {
         assert!(
             v.iter().all(|x| x.is_finite()),
             "forward_train produced non-finite logits"
+        );
+    }
+
+    /// A QLoRA-quantized DiffusionGemma (4-bit base + f32 LoRA) must run
+    /// `forward_train` end-to-end and produce finite, correctly-shaped logits.
+    /// Uses a config whose `hidden`/`moe_intermediate` are multiples of the
+    /// minimum group size (32).
+    #[test]
+    #[serial]
+    fn quantize_base_forward_train_finite() {
+        use pmetal_core::LoraConfig;
+        let cfg = DiffusionGemmaTextConfig {
+            moe_intermediate_size: 32,
+            ..tiny_config()
+        };
+        let vocab = cfg.vocab_size;
+        let canvas = cfg.canvas_length;
+        let mut model = DiffusionGemmaForBlockDiffusion::new(cfg).unwrap();
+
+        let lora_cfg = LoraConfig {
+            r: 4,
+            alpha: 8.0,
+            target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        model.attach_lora(&lora_cfg).unwrap();
+        // for_training = false exercises the fused gather_qmm inference path.
+        model.quantize_base(32, 4, false).unwrap();
+
+        let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
+        let context = Array::from_slice(&ctx_ids, &[1, 5]);
+        let canvas_ids: Vec<i32> = (0..canvas).map(|i| (i * 7 + 2) % vocab).collect();
+        let canvas_arr = Array::from_slice(&canvas_ids, &[1, canvas]);
+
+        let mut logits = model.forward_train(&context, &canvas_arr, None).unwrap();
+        assert_eq!(logits.shape(), &[1, canvas, vocab]);
+        let v = logits.to_f32_vec((canvas * vocab) as usize).unwrap();
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "quantized forward_train produced non-finite logits"
         );
     }
 

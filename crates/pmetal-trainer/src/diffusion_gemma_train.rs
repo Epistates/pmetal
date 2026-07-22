@@ -504,7 +504,7 @@ mod tests {
 
     /// Tiny DiffusionGemma with q/k/v/o LoRA attached — mirrors the model-crate
     /// `tiny_config` so the trainer exercises the real architecture.
-    fn tiny_model_with_lora() -> (DiffusionGemmaForBlockDiffusion, i32, i32) {
+    fn tiny_model_with_lora(moe_intermediate: i32) -> (DiffusionGemmaForBlockDiffusion, i32, i32) {
         let cfg = DiffusionGemmaTextConfig {
             vocab_size: 64,
             hidden_size: 32,
@@ -519,7 +519,7 @@ mod tests {
             sliding_window_pattern: 3,
             num_experts: 4,
             top_k_experts: 2,
-            moe_intermediate_size: 16,
+            moe_intermediate_size: moe_intermediate,
             canvas_length: 8,
             ..Default::default()
         };
@@ -552,7 +552,7 @@ mod tests {
     #[test]
     #[serial]
     fn train_on_batch_reduces_overfit_loss() {
-        let (mut model, vocab, canvas) = tiny_model_with_lora();
+        let (mut model, vocab, canvas) = tiny_model_with_lora(16);
 
         let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
         let context = Array::from_slice(&ctx_ids, &[1, 5]);
@@ -597,8 +597,53 @@ mod tests {
 
     #[test]
     #[serial]
+    fn trains_lora_on_quantized_base() {
+        // QLoRA: 4-bit frozen base (attention + MoE experts) + f32 LoRA. The
+        // trainer's gradients flow only to the adapters, so the loss must still
+        // decrease even though the base is quantized. moe_intermediate = 32 to
+        // satisfy the minimum quantization group size.
+        let (mut model, vocab, canvas) = tiny_model_with_lora(32);
+        model.quantize_base(32, 4, true).unwrap();
+
+        let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
+        let context = Array::from_slice(&ctx_ids, &[1, 5]);
+        let clean: Vec<i32> = (0..canvas).map(|i| (i * 7 + 2) % vocab).collect();
+        let targets = Array::from_slice(&clean, &[1, canvas]);
+        let mut noised = clean.clone();
+        for &p in &[1usize, 3, 6] {
+            noised[p] = (noised[p] + 17) % vocab;
+        }
+        let x_t = Array::from_slice(&noised, &[1, canvas]);
+
+        let config = DiffusionGemmaTrainConfig {
+            learning_rate: 3e-3,
+            corrupted_only: false,
+            ..Default::default()
+        };
+        let mut trainer = DiffusionGemmaTrainer::new(config, vocab);
+
+        let mut first = f32::NAN;
+        let mut last = f32::NAN;
+        for i in 0..60 {
+            let stats = trainer
+                .train_on_batch(&mut model, &context, &x_t, &targets, None)
+                .unwrap();
+            assert!(stats.loss.is_finite(), "step {i} produced non-finite loss");
+            if i == 0 {
+                first = stats.loss;
+            }
+            last = stats.loss;
+        }
+        assert!(
+            last < first && first - last > 0.02,
+            "LoRA-on-quantized-base did not train: first={first}, last={last}"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn lora_checkpoint_save_load_roundtrip() {
-        let (mut model, vocab, canvas) = tiny_model_with_lora();
+        let (mut model, vocab, canvas) = tiny_model_with_lora(16);
 
         let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
         let context = Array::from_slice(&ctx_ids, &[1, 5]);

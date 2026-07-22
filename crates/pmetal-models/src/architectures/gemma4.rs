@@ -886,6 +886,11 @@ pub struct Gemma4Experts {
     /// cache below). Populated by [`Gemma4Experts::quantize`]; kept outside the
     /// module-parameter tree.
     quant: Option<Gemma4ExpertsQuant>,
+    /// When `quant` is set, selects the backward-compatible dequantize-to-dense
+    /// forward (exact gradients for QLoRA training) instead of the fused
+    /// `gather_qmm` (fast, memory-efficient, but no input-activation vjp).
+    /// Enable via [`Gemma4Experts::set_dequant_backward`] for training.
+    dequant_backward: bool,
     /// Cached pre-transposed, materialised-contiguous expert weights:
     /// `gate_up_t [E, H, 2·I]` and `down_t [E, I, H]`. The per-token dispatch
     /// matmul then reads a contiguous gathered operand instead of transposing
@@ -919,10 +924,19 @@ impl Gemma4Experts {
             moe_intermediate_size,
             hidden_size,
             quant: None,
+            dequant_backward: false,
             gate_up_t: None,
             down_t: None,
             transposed_sig: None,
         })
+    }
+
+    /// Select the exact (dequantize-to-dense) QLoRA backward path for the
+    /// quantized experts instead of the fused `gather_qmm` inference path. Set
+    /// this before training a quantized model — `gather_qmm` has no
+    /// input-activation vjp, so backprop through it NaNs.
+    pub fn set_dequant_backward(&mut self, enabled: bool) {
+        self.dequant_backward = enabled;
     }
 
     /// Quantize the fused expert weights to `bits`-bit affine (group size
@@ -1023,6 +1037,67 @@ impl Gemma4Experts {
         Ok(weighted.sum_axis(1, false)) // [N, H]
     }
 
+    /// Exact QLoRA-training expert dispatch: dequantize the frozen experts to
+    /// f32 (stop-gradient — the base is not trained) and run the differentiable
+    /// dense per-slot gather + matmul. Numerically equivalent to
+    /// [`Self::forward_quantized`], but backprops correctly to the input
+    /// activation (and thence to lower-layer LoRA), which `gather_qmm` cannot.
+    /// The persistent 4-bit storage is retained; only a transient f32 copy of
+    /// the layer's experts is materialised per forward.
+    fn forward_quantized_dequant(
+        &self,
+        hidden_flat: &Array,
+        top_indices: &Array,
+        top_weights: &Array,
+    ) -> Result<Array, Exception> {
+        let q = self
+            .quant
+            .as_ref()
+            .expect("forward_quantized_dequant: quant present");
+        // Dequantize to the fused dense layout, frozen (base is not trained).
+        let gate_up_w = ops::stop_gradient(&q.gate_up.0.dequantize(
+            &q.gate_up.1,
+            &q.gate_up.2,
+            q.group_size,
+            q.bits,
+        )); // [E, 2I, H]
+        let down_w = ops::stop_gradient(&q.down.0.dequantize(
+            &q.down.1,
+            &q.down.2,
+            q.group_size,
+            q.bits,
+        )); // [E, H, I]
+
+        let n = hidden_flat.dim(0);
+        let h = self.hidden_size;
+        let i = self.moe_intermediate_size;
+        let k = top_indices.dim(1);
+
+        let mut out = ops::zeros_dtype(&[n, h], hidden_flat.dtype());
+        for slot in 0..k {
+            let slot_experts = ops::slice_axis(top_indices, -1, slot, slot + 1).reshape(&[n]);
+            let slot_weights = ops::slice_axis(top_weights, -1, slot, slot + 1); // [N, 1]
+
+            let gate_up_e = gate_up_w
+                .take_axis(&slot_experts, 0)
+                .transpose_axes(&[0, 2, 1]); // [N, H, 2I]
+            let x_b = hidden_flat.reshape(&[n, 1, h]);
+            let gate_up = ops::matmul(&x_b, &gate_up_e).squeeze_axes(&[1]); // [N, 2I]
+            let gate = ops::slice_axis(&gate_up, -1, 0, i);
+            let up = ops::slice_axis(&gate_up, -1, i, 2 * i);
+            let activated = nn::gelu_tanh_approximate(&gate).multiply(&up); // [N, I]
+
+            let down_e = down_w
+                .take_axis(&slot_experts, 0)
+                .transpose_axes(&[0, 2, 1]); // [N, I, H]
+            let act_b = activated.reshape(&[n, 1, i]);
+            let down = ops::matmul(&act_b, &down_e).squeeze_axes(&[1]); // [N, H]
+
+            out = out.add(&down.multiply(&slot_weights));
+        }
+        Ok(out)
+    }
+
     /// Signature of the current fused-weight handles, used to invalidate the
     /// transposed cache when the weights are replaced (load / merge).
     fn current_signature(&self) -> Vec<usize> {
@@ -1074,7 +1149,11 @@ impl Gemma4Experts {
         top_weights: &Array,
     ) -> Result<Array, Exception> {
         if self.quant.is_some() {
-            return self.forward_quantized(hidden_flat, top_indices, top_weights);
+            return if self.dequant_backward {
+                self.forward_quantized_dequant(hidden_flat, top_indices, top_weights)
+            } else {
+                self.forward_quantized(hidden_flat, top_indices, top_weights)
+            };
         }
         self.ensure_transposed()?;
         let gate_up_t = self.gate_up_t.as_ref().expect("transposed cache built");

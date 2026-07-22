@@ -59,6 +59,19 @@ pub(crate) async fn run_train_diffusion(args: TrainDiffusionArgs) -> Result<()> 
         args.lora_targets
     );
 
+    // Optionally quantize the frozen base (QLoRA). Adapters stay f32, so the
+    // trainer's gradients still flow only to them.
+    if args.qlora {
+        model
+            .quantize_base(args.qlora_group_size, args.qlora_bits, true)
+            .map_err(|e| anyhow::anyhow!("QLoRA base quantization: {e}"))?;
+        tracing::info!(
+            "QLoRA: base quantized to {}-bit (group_size {})",
+            args.qlora_bits,
+            args.qlora_group_size
+        );
+    }
+
     // 4. Load the (prompt, response) dataset.
     let examples = load_prompt_response_jsonl(&args.dataset)
         .with_context(|| format!("load dataset {}", args.dataset))?;

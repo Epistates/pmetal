@@ -61,6 +61,20 @@ pub struct TrainDiffusionArgs {
     #[arg(long = "corrupted-only", default_value = "true")]
     pub corrupted_only: bool,
 
+    /// QLoRA: quantize the frozen base weights (attention + MoE experts) so only
+    /// the f32 LoRA adapters are trained. Large memory reduction for big MoE
+    /// models.
+    #[arg(long = "qlora", default_value = "false")]
+    pub qlora: bool,
+
+    /// QLoRA quantization group size (32, 64, or 128).
+    #[arg(long = "qlora-group-size", default_value = "64")]
+    pub qlora_group_size: i32,
+
+    /// QLoRA quantization bits (one of 2, 3, 4, 5, 6, 8).
+    #[arg(long = "qlora-bits", default_value = "4")]
+    pub qlora_bits: i32,
+
     /// Truncate each tokenized prompt to at most this many context tokens.
     #[arg(long = "max-context-len", default_value = "512")]
     pub max_context_len: usize,
