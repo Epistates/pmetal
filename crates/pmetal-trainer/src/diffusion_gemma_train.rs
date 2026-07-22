@@ -25,8 +25,13 @@
 //! (t-schedule sampling, self-conditioning dropout, optimiser) lives in the
 //! training loop that consumes these primitives.
 
-use pmetal_bridge::compat::{Array, Dtype, ops, random};
+use std::collections::HashMap;
+
+use pmetal_bridge::compat::nn::value_and_grad_explicit;
+use pmetal_bridge::compat::{Array, Dtype, Exception, eval, ops, random};
 use pmetal_bridge::training::per_token_cross_entropy_loss;
+use pmetal_models::architectures::diffusion_gemma::DiffusionGemmaForBlockDiffusion;
+use rand::{RngExt as _, SeedableRng, rngs::StdRng};
 
 /// Corrupt a clean canvas with the uniform-categorical forward kernel.
 ///
@@ -111,6 +116,317 @@ pub fn encoder_ar_loss(encoder_logits: &Array, input_ids: &Array, ignore_index: 
     .mean(None)
 }
 
+/// Hyperparameters for the DiffusionGemma LoRA training loop.
+///
+/// The optimiser is decoupled-weight-decay AdamW applied *only* to the bake-in
+/// LoRA adapters (`Gemma4Attention::lora`), which live outside the model's
+/// `ModuleParameters` tree by design. Gradients are obtained with
+/// [`value_and_grad_explicit`] over the explicit adapter array list rather than
+/// the module tree, so the frozen base weights never receive gradients.
+#[derive(Debug, Clone)]
+pub struct DiffusionGemmaTrainConfig {
+    /// AdamW learning rate.
+    pub learning_rate: f32,
+    /// AdamW β₁ (first-moment decay).
+    pub beta1: f32,
+    /// AdamW β₂ (second-moment decay).
+    pub beta2: f32,
+    /// AdamW ε (denominator floor).
+    pub eps: f32,
+    /// Decoupled weight decay (0.0 = none; LoRA is typically trained without it).
+    pub weight_decay: f32,
+    /// Lowest noise level sampled per step; `t ~ U(min_noise_level, 1]`.
+    pub min_noise_level: f32,
+    /// Label id excluded from the denoising cross-entropy.
+    pub ignore_index: i32,
+    /// Restrict the denoising loss to corrupted canvas positions (standard ELBO
+    /// reconstruction term). When `false`, average over the whole canvas.
+    pub corrupted_only: bool,
+    /// Global gradient-norm clip threshold (0.0 disables clipping).
+    pub max_grad_norm: f32,
+    /// Seed for the per-step noise-level sampler.
+    pub seed: u64,
+}
+
+impl Default for DiffusionGemmaTrainConfig {
+    fn default() -> Self {
+        Self {
+            learning_rate: 2e-4,
+            beta1: 0.9,
+            beta2: 0.999,
+            eps: 1e-8,
+            weight_decay: 0.0,
+            min_noise_level: 1e-3,
+            ignore_index: -100,
+            corrupted_only: true,
+            max_grad_norm: 1.0,
+            seed: 42,
+        }
+    }
+}
+
+/// Statistics for a single DiffusionGemma LoRA training step.
+#[derive(Debug, Clone)]
+pub struct DiffusionGemmaStepStats {
+    /// 1-based optimiser step counter.
+    pub step: u64,
+    /// Denoising loss at the parameters used to compute the gradient.
+    pub loss: f32,
+    /// Pre-clip global gradient norm (`None` when clipping is disabled).
+    pub grad_norm: Option<f32>,
+}
+
+/// DiffusionGemma block-diffusion LoRA trainer.
+///
+/// Owns the AdamW moment buffers (keyed by adapter parameter name) and the
+/// noise-level RNG. Call [`Self::train_step`] with a clean canvas to run the
+/// full stochastic objective (sample `t`, corrupt, denoise, update), or
+/// [`Self::train_on_batch`] with a caller-supplied corruption for a
+/// deterministic step (reproducible runs, curriculum, overfit checks).
+///
+/// The model must have adapters attached (`model.attach_lora(..)`) before the
+/// first step; otherwise there are no trainable parameters and the step errors.
+pub struct DiffusionGemmaTrainer {
+    config: DiffusionGemmaTrainConfig,
+    vocab: i32,
+    /// AdamW first moments, keyed by adapter parameter name.
+    m: HashMap<String, Array>,
+    /// AdamW second moments, keyed by adapter parameter name.
+    v: HashMap<String, Array>,
+    /// Completed optimiser steps (drives bias correction).
+    step: u64,
+    /// Noise-level sampler.
+    rng: StdRng,
+}
+
+impl DiffusionGemmaTrainer {
+    /// Create a trainer for a model whose vocabulary size is `vocab`.
+    pub fn new(config: DiffusionGemmaTrainConfig, vocab: i32) -> Self {
+        let rng = StdRng::seed_from_u64(config.seed);
+        Self {
+            config,
+            vocab,
+            m: HashMap::new(),
+            v: HashMap::new(),
+            step: 0,
+            rng,
+        }
+    }
+
+    /// Completed optimiser steps.
+    pub fn step(&self) -> u64 {
+        self.step
+    }
+
+    /// Full stochastic training step: sample a noise level `t ~ U(min, 1]`,
+    /// corrupt `canvas_x0` with the uniform-categorical kernel, denoise it
+    /// conditioned on `context_ids`, and take one AdamW step on the adapters.
+    pub fn train_step(
+        &mut self,
+        model: &mut DiffusionGemmaForBlockDiffusion,
+        context_ids: &Array,
+        canvas_x0: &Array,
+    ) -> Result<DiffusionGemmaStepStats, Exception> {
+        let t: f32 = self.rng.random_range(self.config.min_noise_level..=1.0);
+        let keep_prob = 1.0 - t;
+        let (mut x_t, mut mask) = uniform_categorical_noise(canvas_x0, keep_prob, self.vocab, None);
+        // Realise the corruption before it feeds the differentiable forward.
+        x_t.eval();
+        mask.eval();
+        let corrupted_mask = if self.config.corrupted_only {
+            Some(&mask)
+        } else {
+            None
+        };
+        self.train_on_batch(model, context_ids, &x_t, canvas_x0, corrupted_mask)
+    }
+
+    /// Deterministic training step over a caller-supplied corruption.
+    ///
+    /// Computes the denoising loss of `noised_canvas` against the clean
+    /// `targets` (both `[B, canvas]` int ids), differentiates it w.r.t. the
+    /// attached LoRA adapters, clips the global gradient norm, and applies one
+    /// decoupled-AdamW update. `corrupted_mask` (`Some` = ELBO reconstruction
+    /// over corrupted positions only) mirrors [`diffusion_denoising_loss`].
+    pub fn train_on_batch(
+        &mut self,
+        model: &mut DiffusionGemmaForBlockDiffusion,
+        context_ids: &Array,
+        noised_canvas: &Array,
+        targets: &Array,
+        corrupted_mask: Option<&Array>,
+    ) -> Result<DiffusionGemmaStepStats, Exception> {
+        // Snapshot adapter parameters in a stable order. Cloning detaches the
+        // owned array *handles* (same underlying nodes) so the model borrow ends
+        // before the differentiable closure re-borrows it mutably.
+        let (keys, param_arrays): (Vec<String>, Vec<Array>) = model
+            .lora_parameters()
+            .into_iter()
+            .map(|(k, a)| (k, a.clone()))
+            .unzip();
+        if keys.is_empty() {
+            return Err(Exception::custom(
+                "DiffusionGemmaTrainer: no LoRA adapters attached (call model.attach_lora first)",
+            ));
+        }
+        let n_params = keys.len();
+        let ignore_index = self.config.ignore_index;
+
+        // Loss closure: `all[..n_params]` are the traced adapter leaves. Inject
+        // them into the model's adapter slots so `forward_train`'s LoRA deltas
+        // are computed from the differentiated arrays, then denoise + CE.
+        let loss_fn = |all: &[Array]| -> Array {
+            for (i, (_, slot)) in model.lora_parameters_mut().into_iter().enumerate() {
+                *slot = all[i].clone();
+            }
+            match model.forward_train(context_ids, noised_canvas, None) {
+                Ok(logits) => {
+                    diffusion_denoising_loss(&logits, targets, corrupted_mask, ignore_index)
+                }
+                Err(_) => Array::from_f32(f32::NAN),
+            }
+        };
+        let (mut loss, grads) = value_and_grad_explicit(loss_fn, &param_arrays, &[])?;
+        // Model borrow released here; loss/grads reference the traced leaves.
+        loss.eval();
+        let loss_val = loss.item_f32();
+
+        // Global-norm gradient clipping.
+        let (grads, grad_norm) = if self.config.max_grad_norm > 0.0 {
+            let mut norm_sq = Array::from_f32(0.0);
+            for g in &grads {
+                norm_sq = norm_sq.add(&g.multiply(g).sum(None));
+            }
+            let mut norm = ops::sqrt(&norm_sq);
+            norm.eval();
+            let total = norm.item_f32();
+            let max_norm = self.config.max_grad_norm;
+            if total > max_norm {
+                let scale = Array::from_f32(max_norm / (total + 1e-6));
+                let clipped = grads.iter().map(|g| g.multiply(&scale)).collect();
+                (clipped, Some(total))
+            } else {
+                (grads, Some(total))
+            }
+        } else {
+            (grads, None)
+        };
+
+        // AdamW update on the adapter arrays, then write the new values back.
+        self.step += 1;
+        let new_params = self.adamw_step(&keys, &param_arrays, &grads)?;
+        for ((_, slot), np) in model.lora_parameters_mut().into_iter().zip(&new_params) {
+            *slot = np.clone();
+        }
+        eval(model.lora_parameters().into_iter().map(|(_, a)| a))?;
+
+        Ok(DiffusionGemmaStepStats {
+            step: self.step,
+            loss: loss_val,
+            grad_norm,
+        })
+    }
+
+    /// One decoupled-weight-decay AdamW update. Reads/writes the per-key moment
+    /// buffers and returns the new parameter values (already evaluated).
+    fn adamw_step(
+        &mut self,
+        keys: &[String],
+        params: &[Array],
+        grads: &[Array],
+    ) -> Result<Vec<Array>, Exception> {
+        let (lr, b1, b2, eps, wd) = (
+            self.config.learning_rate,
+            self.config.beta1,
+            self.config.beta2,
+            self.config.eps,
+            self.config.weight_decay,
+        );
+        let t = self.step as f32;
+        let bc1 = 1.0 - b1.powf(t);
+        let bc2 = 1.0 - b2.powf(t);
+        let sc = |x: f32| Array::from_f32(x);
+        let zeros_like = |a: &Array| a.multiply(&sc(0.0));
+
+        let mut new_params = Vec::with_capacity(keys.len());
+        let mut new_m = Vec::with_capacity(keys.len());
+        let mut new_v = Vec::with_capacity(keys.len());
+        for i in 0..keys.len() {
+            let g = &grads[i];
+            let m_prev = self
+                .m
+                .get(&keys[i])
+                .cloned()
+                .unwrap_or_else(|| zeros_like(g));
+            let v_prev = self
+                .v
+                .get(&keys[i])
+                .cloned()
+                .unwrap_or_else(|| zeros_like(g));
+
+            let m_new = m_prev.multiply(&sc(b1)).add(&g.multiply(&sc(1.0 - b1)));
+            let v_new = v_prev
+                .multiply(&sc(b2))
+                .add(&g.multiply(g).multiply(&sc(1.0 - b2)));
+
+            let m_hat = m_new.divide(&sc(bc1));
+            let v_hat = v_new.divide(&sc(bc2));
+            let denom = ops::sqrt(&v_hat).add(&sc(eps));
+            let update = m_hat.divide(&denom);
+
+            // Decoupled weight decay: p ← p·(1 − lr·wd) − lr·update.
+            let new_p = params[i]
+                .multiply(&sc(1.0 - lr * wd))
+                .subtract(&update.multiply(&sc(lr)));
+
+            new_params.push(new_p);
+            new_m.push(m_new);
+            new_v.push(v_new);
+        }
+
+        // Evaluate the whole update in one pass so the graph does not grow
+        // across steps, then persist the moments.
+        eval(new_params.iter().chain(new_m.iter()).chain(new_v.iter()))?;
+        for (k, (m, v)) in keys.iter().zip(new_m.into_iter().zip(new_v)) {
+            self.m.insert(k.clone(), m);
+            self.v.insert(k.clone(), v);
+        }
+        Ok(new_params)
+    }
+}
+
+/// Save the model's attached LoRA adapters to a safetensors file, keyed by the
+/// `{encoder|decoder}.layers.{i}.self_attn.{proj}.lora_{a,b}` namespace.
+pub fn save_lora_adapters(
+    model: &DiffusionGemmaForBlockDiffusion,
+    path: impl AsRef<std::path::Path>,
+) -> Result<(), Exception> {
+    let map: HashMap<String, Array> = model
+        .lora_parameters()
+        .into_iter()
+        .map(|(k, a)| (k, a.clone()))
+        .collect();
+    pmetal_lora::save_safetensors_map(path, &map).map_err(|e| Exception::custom(e.to_string()))
+}
+
+/// Load LoRA adapter weights from a safetensors file into the model's attached
+/// adapters (matching by name). Adapters must already be attached; missing keys
+/// are left at their current value.
+pub fn load_lora_adapters(
+    model: &mut DiffusionGemmaForBlockDiffusion,
+    path: impl AsRef<std::path::Path>,
+) -> Result<(), Exception> {
+    let loaded =
+        pmetal_lora::load_safetensors_map(path).map_err(|e| Exception::custom(e.to_string()))?;
+    for (name, slot) in model.lora_parameters_mut() {
+        if let Some(a) = loaded.get(&name) {
+            *slot = a.clone();
+        }
+    }
+    eval(model.lora_parameters().into_iter().map(|(_, a)| a))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +496,166 @@ mod tests {
             (item(&loss) - expected).abs() < 1e-3,
             "uniform logits loss {} != ln(4) {expected}",
             item(&loss)
+        );
+    }
+
+    use pmetal_core::LoraConfig;
+    use pmetal_models::architectures::diffusion_gemma::DiffusionGemmaTextConfig;
+
+    /// Tiny DiffusionGemma with q/k/v/o LoRA attached — mirrors the model-crate
+    /// `tiny_config` so the trainer exercises the real architecture.
+    fn tiny_model_with_lora() -> (DiffusionGemmaForBlockDiffusion, i32, i32) {
+        let cfg = DiffusionGemmaTextConfig {
+            vocab_size: 64,
+            hidden_size: 32,
+            intermediate_size: 48,
+            num_hidden_layers: 3,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            global_head_dim: 16,
+            num_global_key_value_heads: Some(1),
+            sliding_window: 8,
+            sliding_window_pattern: 3,
+            num_experts: 4,
+            top_k_experts: 2,
+            moe_intermediate_size: 16,
+            canvas_length: 8,
+            ..Default::default()
+        };
+        let vocab = cfg.vocab_size;
+        let canvas = cfg.canvas_length;
+        let mut model = DiffusionGemmaForBlockDiffusion::new(cfg).unwrap();
+        let lora_cfg = LoraConfig {
+            r: 4,
+            alpha: 8.0,
+            target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            ..Default::default()
+        };
+        model.attach_lora(&lora_cfg).unwrap();
+        (model, vocab, canvas)
+    }
+
+    fn logits_vec(
+        model: &mut DiffusionGemmaForBlockDiffusion,
+        ctx: &Array,
+        canvas: &Array,
+    ) -> Vec<f32> {
+        let mut l = model.forward_train(ctx, canvas, None).unwrap();
+        let n = (l.dim(1) * l.dim(2)) as usize;
+        l.to_f32_vec(n).unwrap()
+    }
+
+    #[test]
+    #[serial]
+    fn train_on_batch_reduces_overfit_loss() {
+        let (mut model, vocab, canvas) = tiny_model_with_lora();
+
+        let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
+        let context = Array::from_slice(&ctx_ids, &[1, 5]);
+        // Clean targets and a fixed corruption of a few canvas positions.
+        let clean: Vec<i32> = (0..canvas).map(|i| (i * 7 + 2) % vocab).collect();
+        let targets = Array::from_slice(&clean, &[1, canvas]);
+        let mut noised = clean.clone();
+        for &p in &[1usize, 3, 6] {
+            noised[p] = (noised[p] + 17) % vocab;
+        }
+        let x_t = Array::from_slice(&noised, &[1, canvas]);
+
+        let config = DiffusionGemmaTrainConfig {
+            learning_rate: 3e-3,
+            corrupted_only: false, // full-canvas loss ⇒ deterministic, monotone signal
+            ..Default::default()
+        };
+        let mut trainer = DiffusionGemmaTrainer::new(config, vocab);
+
+        let mut first = f32::NAN;
+        let mut last = f32::NAN;
+        for i in 0..60 {
+            let stats = trainer
+                .train_on_batch(&mut model, &context, &x_t, &targets, None)
+                .unwrap();
+            assert!(stats.loss.is_finite(), "step {i} produced non-finite loss");
+            if i == 0 {
+                first = stats.loss;
+            }
+            last = stats.loss;
+        }
+        assert!(
+            last < first,
+            "overfit loss did not decrease: first={first}, last={last}"
+        );
+        // Expect a clear reduction, not just numerical drift.
+        assert!(
+            first - last > 0.05,
+            "overfit loss barely moved: first={first}, last={last}"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn lora_checkpoint_save_load_roundtrip() {
+        let (mut model, vocab, canvas) = tiny_model_with_lora();
+
+        let ctx_ids: Vec<i32> = (0..5).map(|i| (i * 3 + 1) % vocab).collect();
+        let context = Array::from_slice(&ctx_ids, &[1, 5]);
+        let clean: Vec<i32> = (0..canvas).map(|i| (i * 7 + 2) % vocab).collect();
+        let targets = Array::from_slice(&clean, &[1, canvas]);
+        let mut noised = clean.clone();
+        noised[2] = (noised[2] + 9) % vocab;
+        let x_t = Array::from_slice(&noised, &[1, canvas]);
+
+        // Train a few steps so the adapters are meaningfully non-zero.
+        let mut trainer = DiffusionGemmaTrainer::new(
+            DiffusionGemmaTrainConfig {
+                learning_rate: 5e-3,
+                corrupted_only: false,
+                ..Default::default()
+            },
+            vocab,
+        );
+        for _ in 0..8 {
+            trainer
+                .train_on_batch(&mut model, &context, &x_t, &targets, None)
+                .unwrap();
+        }
+        let trained = logits_vec(&mut model, &context, &x_t);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dg_lora.safetensors");
+        save_lora_adapters(&model, &path).unwrap();
+
+        // Zero the live adapters so their effect is removed, then confirm the
+        // forward actually changed (the mutation took hold).
+        for (_, slot) in model.lora_parameters_mut() {
+            *slot = slot.multiply(&Array::from_f32(0.0));
+        }
+        eval(model.lora_parameters().into_iter().map(|(_, a)| a)).unwrap();
+        let zeroed = logits_vec(&mut model, &context, &x_t);
+        let mutated_diff = trained
+            .iter()
+            .zip(&zeroed)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            mutated_diff > 1e-5,
+            "zeroing adapters should change the forward (diff={mutated_diff})"
+        );
+
+        // Restore from the checkpoint and confirm the trained forward returns.
+        load_lora_adapters(&mut model, &path).unwrap();
+        let restored = logits_vec(&mut model, &context, &x_t);
+        let restore_diff = trained
+            .iter()
+            .zip(&restored)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            restore_diff < 1e-6,
+            "checkpoint did not restore adapters exactly (diff={restore_diff})"
         );
     }
 
