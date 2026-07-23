@@ -738,6 +738,17 @@ impl DynamicModel {
                     &config_content,
                 )?;
                 let mut model = DiffusionGemmaForBlockDiffusion::new(config)?;
+                // Multimodal checkpoints carry a `vision_config`; attach the
+                // vision tower + projector so `load_diffusion_gemma_weights`
+                // populates `vision_tower.*` / `embed_vision.*`. Text-only
+                // checkpoints leave the encoder byte-identical.
+                if let Some((vision_config, image_token_id)) =
+                    crate::architectures::diffusion_gemma::parse_diffusion_gemma_vision_config(
+                        &config_content,
+                    )?
+                {
+                    model.attach_vision(&vision_config, image_token_id)?;
+                }
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
                 let report = crate::architectures::diffusion_gemma::load_diffusion_gemma_weights(

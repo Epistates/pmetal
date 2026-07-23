@@ -39,7 +39,7 @@
 //! transformers oracle. The discrete-diffusion generation engine (block loop,
 //! entropy-bound sampler, stopping) is built in a later phase.
 
-use pmetal_bridge::compat::{Array, Exception, Module, Param, nn, ops};
+use pmetal_bridge::compat::{Array, Dtype, Exception, Module, Param, nn, ops};
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +49,13 @@ use super::gemma4::{
     Gemma4Attention, Gemma4Config, Gemma4Mlp, Gemma4RmsNorm, Gemma4RopeConfig,
     Gemma4RopeLayerConfig, LoadReport, rms_norm_noscale,
 };
+use super::gemma4_vision::{
+    Gemma4MultimodalEmbedder, Gemma4VisionConfig, Gemma4VisionModel, load_gemma4_vision_weights,
+};
+
+/// Default `image_token_id` for `google/diffusiongemma-26B-A4B-it` — the token
+/// whose embedding slots are replaced by projected vision soft tokens.
+pub const DIFFUSION_GEMMA_IMAGE_TOKEN_ID: i32 = 258_880;
 
 // ----------------------------------------------------------------------------
 // Config
@@ -535,7 +542,19 @@ pub struct DiffusionGemmaEncoderModel {
     pub norm: Gemma4RmsNorm,
     pub config: DiffusionGemmaTextConfig,
     pub embed_scale: f32,
+    /// Optional image backbone (`None` for the text-only path, which is then
+    /// byte-identical to the pre-vision encoder — preserving text parity by
+    /// construction). Attached via [`DiffusionGemmaEncoderModel::attach_vision`].
+    pub vision_tower: Option<Gemma4VisionModel>,
+    /// Optional vision→text projector, paired with `vision_tower`.
+    pub embed_vision: Option<Gemma4MultimodalEmbedder>,
+    /// Token id whose embedding slots are replaced by projected vision soft
+    /// tokens (default [`DIFFUSION_GEMMA_IMAGE_TOKEN_ID`]).
+    pub image_token_id: i32,
 }
+// `vision_tower` / `embed_vision` are intentionally outside the parameter tree
+// (like the QLoRA `qbase` fields): they are loaded by a bespoke path and their
+// absence keeps the text-tower parameter set byte-identical.
 impl_module_params!(DiffusionGemmaEncoderModel; embed_tokens, layers, norm);
 
 impl DiffusionGemmaEncoderModel {
@@ -552,7 +571,30 @@ impl DiffusionGemmaEncoderModel {
             norm,
             config,
             embed_scale,
+            vision_tower: None,
+            embed_vision: None,
+            image_token_id: DIFFUSION_GEMMA_IMAGE_TOKEN_ID,
         })
+    }
+
+    /// Attach the image backbone: a [`Gemma4VisionModel`] tower and the
+    /// vision→text [`Gemma4MultimodalEmbedder`]. Enables
+    /// [`DiffusionGemmaEncoderModel::forward_multimodal`]; the text-only
+    /// [`forward`](Self::forward) path is unaffected.
+    pub fn attach_vision(
+        &mut self,
+        vision_config: &Gemma4VisionConfig,
+        image_token_id: i32,
+    ) -> Result<(), Exception> {
+        let embedder = Gemma4MultimodalEmbedder::new(
+            vision_config.hidden_size,
+            self.config.hidden_size,
+            vision_config.rms_norm_eps,
+        )?;
+        self.vision_tower = Some(Gemma4VisionModel::new(vision_config)?);
+        self.embed_vision = Some(embedder);
+        self.image_token_id = image_token_id;
+        Ok(())
     }
 
     /// Run the encoder. Returns `(hidden_states, per_layer_kv)` where
@@ -562,20 +604,207 @@ impl DiffusionGemmaEncoderModel {
         &mut self,
         input_ids: &Array,
     ) -> Result<(Array, Vec<(Array, Array)>), Exception> {
-        let mut h = self
+        let embeds = self
             .embed_tokens
             .forward(input_ids)
             .multiply(&Array::from_f32(self.embed_scale));
+        self.forward_from_embeds(&embeds, None)
+    }
+
+    /// Run the encoder layer stack from precomputed input embeddings (the shared
+    /// tail of [`forward`](Self::forward) and
+    /// [`forward_multimodal`](Self::forward_multimodal)). Returns the
+    /// final-normed hidden states and each layer's K/V.
+    ///
+    /// `masks` supplies explicit per-layer-type additive masks
+    /// `(full_layer_mask, sliding_layer_mask)` — used for the bidirectional-image
+    /// band. `None` lets Gemma 4's attention apply its automatic per-layer
+    /// causal / sliding-window masking.
+    fn forward_from_embeds(
+        &mut self,
+        inputs_embeds: &Array,
+        masks: Option<(&Array, &Array)>,
+    ) -> Result<(Array, Vec<(Array, Array)>), Exception> {
+        // Precompute layer-type flags to avoid borrowing `self.config` inside the
+        // `self.layers` mutable loop.
+        let fulls: Vec<bool> = (0..self.layers.len())
+            .map(|i| self.config.is_full_attention(i))
+            .collect();
+        let mut h = inputs_embeds.clone();
         let mut kvs = Vec::with_capacity(self.layers.len());
-        for layer in self.layers.iter_mut() {
-            // mask=None lets Gemma 4's attention apply per-layer causal /
-            // sliding-window masking automatically.
-            let (next, keys, values) = layer.forward_encoder(&h, None, 0)?;
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let mask = masks.map(|(full, sliding)| if fulls[i] { full } else { sliding });
+            let (next, keys, values) = layer.forward_encoder(&h, mask, 0)?;
             kvs.push((keys, values));
             h = next;
         }
         Ok((self.norm.forward(&h), kvs))
     }
+
+    /// Multimodal encoder forward: embed `input_ids` (with `image_token_id`
+    /// slots temporarily zeroed to stay in-vocab, then `√hidden`-scaled),
+    /// encode `pixel_values` into projected soft tokens, scatter those into the
+    /// image slots, and run the causal stack. Requires
+    /// [`attach_vision`](Self::attach_vision). `image_position_ids` are the
+    /// `[B, num_patches, 2]` patch coordinates from the image processor.
+    ///
+    /// Numerically mirrors the oracle `DiffusionGemmaEncoderModel.forward(
+    /// input_ids, pixel_values, image_position_ids)`: the projected vision
+    /// features carry their own `√vision_hidden` pooling scale + projection and
+    /// are *not* re-scaled by the text embed scale (they replace the scaled
+    /// placeholder embeddings after the fact).
+    ///
+    /// `bidirectional_images` selects the attention mask over the merged
+    /// sequence:
+    ///
+    /// * `true` (production / design-correct): tokens within the same image
+    ///   span attend **bidirectionally** while text stays causal — the
+    ///   architecture's `use_bidirectional_attention="vision"` intent.
+    /// * `false`: the whole sequence is causal.
+    ///
+    /// **pmetal deliberately diverges from `transformers` here.** In
+    /// `transformers` (≤ 5.10.0.dev0) `DiffusionGemmaEncoderModel.forward`
+    /// builds the bidirectional-vision mask via `create_masks_for_generate(...)`
+    /// but **discards the result**, so `mm_token_type_ids` has no effect and the
+    /// encoder is silently causal (`pooled_bidir == pooled_causal`). We
+    /// implement the intended bidirectional behaviour; the `false` path exists
+    /// to reproduce the transformers oracle for the vision-tower / projector /
+    /// merge parity test.
+    pub fn forward_multimodal(
+        &mut self,
+        input_ids: &Array,
+        pixel_values: &Array,
+        image_position_ids: &Array,
+        bidirectional_images: bool,
+    ) -> Result<(Array, Vec<(Array, Array)>), Exception> {
+        let image_token = Array::from_f32(self.image_token_id as f32).as_type::<i32>();
+        let image_mask = ops::equal(input_ids, &image_token); // [B, seq] bool
+
+        // Zero image-token ids before the embedding lookup (they may be OOV),
+        // then apply the √hidden scale.
+        let safe_ids = ops::where_fn(&image_mask, &ops::zeros_like(input_ids), input_ids);
+        let text_embeds = self
+            .embed_tokens
+            .forward(&safe_ids)
+            .multiply(&Array::from_f32(self.embed_scale));
+
+        // Pooled vision soft tokens → projected into text space.
+        let feats = {
+            let vision = self.vision_tower.as_mut().ok_or_else(|| {
+                Exception::custom("forward_multimodal: vision_tower not attached")
+            })?;
+            vision.forward(pixel_values, image_position_ids)?
+        };
+        let vhidden = feats.dim(feats.shape().len() as i32 - 1);
+        let feats_flat = feats.reshape(&[-1, vhidden]); // [B·out_len, vision_hidden]
+        let image_features = {
+            let embedder = self.embed_vision.as_mut().ok_or_else(|| {
+                Exception::custom("forward_multimodal: embed_vision not attached")
+            })?;
+            embedder.forward(&feats_flat) // [B·out_len, text_hidden]
+        };
+
+        let merged = merge_image_features(&text_embeds, &image_mask, &image_features);
+
+        if bidirectional_images {
+            let block_ids = derive_image_block_ids(&image_mask);
+            let (full_mask, sliding_mask) =
+                build_multimodal_masks(&block_ids, self.config.sliding_window, merged.dtype());
+            self.forward_from_embeds(&merged, Some((&full_mask, &sliding_mask)))
+        } else {
+            self.forward_from_embeds(&merged, None)
+        }
+    }
+}
+
+/// Per-token image block ids (`get_block_sequence_ids_for_mask`): each
+/// contiguous run of image tokens gets an increasing id (0, 1, …); text tokens
+/// get −1. Two tokens attend bidirectionally iff they share a non-negative id.
+fn derive_image_block_ids(image_mask: &Array) -> Array {
+    let seq = image_mask.dim(1);
+    let is_vision = image_mask.as_type::<f32>(); // [B, seq], 0/1
+    // prev = is_vision shifted right by one (first column zeroed).
+    let zeros_col = ops::slice_axis(&is_vision, 1, 0, 1).multiply(&Array::from_f32(0.0));
+    let head = ops::slice_axis(&is_vision, 1, 0, seq - 1);
+    let prev = ops::concatenate_axis(&[&zeros_col, &head], 1); // [B, seq]
+    // new run start = is_vision AND NOT prev.
+    let new_start = is_vision.multiply(&Array::from_f32(1.0).subtract(&prev));
+    let group = ops::cumsum(&new_start, 1).subtract(&Array::from_f32(1.0)); // [B, seq]
+    ops::where_fn(image_mask, &group, &Array::from_f32(-1.0))
+}
+
+/// Additive attention masks for a merged multimodal sequence: causal
+/// (respecting the sliding window on sliding layers) OR bidirectional within an
+/// image block. Returns `(full_layer_mask, sliding_layer_mask)`, each
+/// `[B, 1, seq, seq]` in `dtype`. The sliding-window term is a no-op when
+/// `seq <= sliding_window` (as in the parity fixture); it mirrors Gemma 4's
+/// `q − k < sliding_window` convention for longer sequences.
+fn build_multimodal_masks(block_ids: &Array, sliding_window: i32, dtype: Dtype) -> (Array, Array) {
+    let b = block_ids.dim(0);
+    let seq = block_ids.dim(1);
+
+    // Bidirectional band: same block id and not text (−1).
+    let bi = block_ids.reshape(&[b, seq, 1]);
+    let bj = block_ids.reshape(&[b, 1, seq]);
+    let same = ops::equal(&bi, &bj)
+        .as_type::<f32>()
+        .multiply(&ops::greater(&bi, &Array::from_f32(-0.5)).as_type::<f32>()); // [B, seq, seq]
+
+    // Causal + window terms (in {0, 1}).
+    let idx = ops::arange(seq, Dtype::Float32);
+    let qi = idx.reshape(&[seq, 1]);
+    let kj = idx.reshape(&[1, seq]);
+    let causal = ops::less_equal(&kj, &qi).as_type::<f32>(); // [seq, seq]
+    let within =
+        ops::greater(&Array::from_f32(sliding_window as f32), &qi.subtract(&kj)).as_type::<f32>();
+
+    let full_ok = ops::maximum(&causal, &same); // OR
+    let sliding_ok = ops::maximum(&causal.multiply(&within), &same);
+
+    // Additive mask: 0 where allowed, −inf where blocked (matching MLX's own
+    // `create_sliding_window_mask`; a finite fill can leak through the masked
+    // softmax fast path for non-triangular masks).
+    let zero = Array::from_f32(0.0);
+    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
+    let to_additive = |ok: &Array| {
+        ops::where_fn(&ops::greater(ok, &Array::from_f32(0.5)), &zero, &neg_inf)
+            .reshape(&[b, 1, seq, seq])
+            .as_dtype(dtype.as_i32())
+    };
+    (to_additive(&full_ok), to_additive(&sliding_ok))
+}
+
+/// Scatter `image_features` `[n_img, hidden]` into the `image_mask`-true slots
+/// of `inputs_embeds` `[B, seq, hidden]`, in row-major order (the MLX analogue
+/// of `torch.Tensor.masked_scatter`). Non-image positions keep their text
+/// embedding.
+fn merge_image_features(
+    inputs_embeds: &Array,
+    image_mask: &Array,
+    image_features: &Array,
+) -> Array {
+    let b = inputs_embeds.dim(0);
+    let seq = inputs_embeds.dim(1);
+    let h = inputs_embeds.dim(2);
+    let n_img = image_features.dim(0).max(1);
+
+    let text_flat = inputs_embeds.reshape(&[b * seq, h]);
+    let mask_flat = image_mask.reshape(&[b * seq]).as_type::<f32>();
+
+    // slot[i] = (#image tokens up to and including i) − 1: the row of
+    // `image_features` destined for position i (garbage where non-image, but
+    // masked out below). Clamp into range so the gather is always valid.
+    let slot = ops::cumsum(&mask_flat, 0).subtract(&Array::from_f32(1.0));
+    let slot = ops::clip(
+        &slot,
+        Some(&Array::from_f32(0.0)),
+        Some(&Array::from_f32((n_img - 1) as f32)),
+    )
+    .as_type::<i32>();
+    let gathered = ops::take_axis(image_features, &slot, 0); // [B·seq, hidden]
+
+    let is_image = ops::greater(&mask_flat.expand_dims(-1), &Array::from_f32(0.5));
+    ops::where_fn(&is_image, &gathered, &text_flat).reshape(&[b, seq, h])
 }
 
 // ----------------------------------------------------------------------------
@@ -881,6 +1110,35 @@ impl DiffusionGemmaForBlockDiffusion {
     /// the encoder output is the meaningful "hidden states" to pool over.)
     pub fn encode_hidden(&mut self, input_ids: &Array) -> Result<Array, Exception> {
         let (hidden, _kvs) = self.encoder.forward(input_ids)?;
+        Ok(hidden)
+    }
+
+    /// Attach the image backbone (delegates to
+    /// [`DiffusionGemmaEncoderModel::attach_vision`]). Enables
+    /// [`encode_hidden_multimodal`](Self::encode_hidden_multimodal); the base
+    /// weights load through [`load_diffusion_gemma_weights`] afterwards.
+    pub fn attach_vision(
+        &mut self,
+        vision_config: &Gemma4VisionConfig,
+        image_token_id: i32,
+    ) -> Result<(), Exception> {
+        self.encoder.attach_vision(vision_config, image_token_id)
+    }
+
+    /// Multimodal encoder hidden states `[B, seq, hidden]`: embed `input_ids`,
+    /// merge projected vision soft tokens into the `image_token_id` slots, and
+    /// run the encoder with image spans attending bidirectionally (the
+    /// design-correct default — see
+    /// [`DiffusionGemmaEncoderModel::forward_multimodal`]).
+    pub fn encode_hidden_multimodal(
+        &mut self,
+        input_ids: &Array,
+        pixel_values: &Array,
+        image_position_ids: &Array,
+    ) -> Result<Array, Exception> {
+        let (hidden, _kvs) =
+            self.encoder
+                .forward_multimodal(input_ids, pixel_values, image_position_ids, true)?;
         Ok(hidden)
     }
 
@@ -1433,6 +1691,98 @@ pub fn parse_diffusion_gemma_config(
     Ok(config)
 }
 
+/// Extract the vision sub-config + `image_token_id` from a full DiffusionGemma
+/// config, or `None` for a text-only checkpoint (absent / null `vision_config`).
+/// The checkpoint expresses the vision RoPE base as a `rope_parameters:
+/// {rope_theta}` dict, which is folded into the flat `rope_theta` field.
+pub fn parse_diffusion_gemma_vision_config(
+    config_content: &str,
+) -> Result<Option<(Gemma4VisionConfig, i32)>, Exception> {
+    let root: serde_json::Value =
+        serde_json::from_str(config_content).map_err(|e| Exception::custom(e.to_string()))?;
+    let vision_json = match root.get("vision_config") {
+        Some(v) if !v.is_null() => v,
+        _ => return Ok(None),
+    };
+    let mut vision: Gemma4VisionConfig = serde_json::from_value(vision_json.clone())
+        .map_err(|e| Exception::custom(e.to_string()))?;
+    if let Some(theta) = vision_json
+        .get("rope_parameters")
+        .and_then(|r| r.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+    {
+        vision.rope_theta = theta as f32;
+    }
+    let image_token_id = root
+        .get("image_token_id")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(DIFFUSION_GEMMA_IMAGE_TOKEN_ID as i64) as i32;
+    Ok(Some((vision, image_token_id)))
+}
+
+/// Load the encoder's vision backbone (`vision_tower.*` + `embed_vision.*`) from
+/// checkpoint `weights`, accepting either bare (`vision_tower.…`) or
+/// full-checkpoint (`model.encoder.vision_tower.…`) key roots. A no-op unless
+/// the encoder has a tower attached ([`DiffusionGemmaEncoderModel::attach_vision`]).
+fn load_encoder_vision(
+    encoder: &mut DiffusionGemmaEncoderModel,
+    weights: &HashMap<String, Array>,
+    report: &mut LoadReport,
+) -> Result<(), Exception> {
+    if encoder.vision_tower.is_none() {
+        return Ok(());
+    }
+    let mut vision: HashMap<String, Array> = HashMap::new();
+    let mut embed_vision: HashMap<String, Array> = HashMap::new();
+    for (key, value) in weights {
+        let k = key.strip_prefix("model.").unwrap_or(key.as_str());
+        if let Some(rest) = k
+            .strip_prefix("encoder.vision_tower.")
+            .or_else(|| k.strip_prefix("vision_tower."))
+        {
+            vision.insert(rest.to_string(), value.clone());
+        } else if let Some(rest) = k
+            .strip_prefix("encoder.embed_vision.")
+            .or_else(|| k.strip_prefix("embed_vision."))
+        {
+            embed_vision.insert(rest.to_string(), value.clone());
+        }
+    }
+    if let Some(vt) = encoder.vision_tower.as_mut() {
+        let r = load_gemma4_vision_weights(vt, &vision)?;
+        report.loaded += r.loaded;
+        report.skipped.extend(r.skipped);
+    }
+    if let Some(ev) = encoder.embed_vision.as_mut() {
+        ev.load_weights(&embed_vision, report);
+    }
+    Ok(())
+}
+
+/// Load a DiffusionGemma **multimodal** encoder (text tower + optional vision
+/// tower + projector). Accepts keys rooted at the encoder — either bare
+/// (`language_model.*`, `vision_tower.*`, `embed_vision.*`) or full-checkpoint
+/// (`model.encoder.*`). Text loads via [`load_diffusion_gemma_encoder_weights`];
+/// vision loads only when a tower is attached.
+pub fn load_diffusion_gemma_encoder_multimodal_weights(
+    encoder: &mut DiffusionGemmaEncoderModel,
+    weights: &HashMap<String, Array>,
+) -> Result<LoadReport, Exception> {
+    let mut text: HashMap<String, Array> = HashMap::new();
+    for (key, value) in weights {
+        let k = key.strip_prefix("model.").unwrap_or(key.as_str());
+        if let Some(rest) = k
+            .strip_prefix("encoder.language_model.")
+            .or_else(|| k.strip_prefix("language_model."))
+        {
+            text.insert(rest.to_string(), value.clone());
+        }
+    }
+    let mut report = load_diffusion_gemma_encoder_weights(encoder, &text)?;
+    load_encoder_vision(encoder, weights, &mut report)?;
+    Ok(report)
+}
+
 /// Load a full `DiffusionGemmaForBlockDiffusion` checkpoint into the model.
 ///
 /// The HF checkpoint stores the trunk once and ties three ways:
@@ -1499,6 +1849,9 @@ pub fn load_diffusion_gemma_weights(
         skipped: enc_report.skipped,
     };
     report.skipped.extend(dec_report.skipped);
+
+    // Vision backbone (encoder-only; no-op unless a tower was attached).
+    load_encoder_vision(&mut model.encoder, weights, &mut report)?;
     Ok(report)
 }
 
@@ -1526,6 +1879,108 @@ mod tests {
             canvas_length: 8,
             ..Default::default()
         }
+    }
+
+    fn tiny_vision_config() -> Gemma4VisionConfig {
+        Gemma4VisionConfig {
+            hidden_size: 16,
+            intermediate_size: 32,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            num_key_value_heads: 2,
+            head_dim: 8,
+            pooling_kernel_size: 2,
+            patch_size: 2,
+            position_embedding_size: 32,
+            rope_theta: 100.0,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn multimodal_mask_is_causal_or_image_block() {
+        // Image tokens at positions 2..=5 (block 0); text elsewhere (−1).
+        let block_ids =
+            Array::from_slice(&[-1.0f32, -1.0, 0.0, 0.0, 0.0, 0.0, -1.0, -1.0], &[1, 8]);
+        let (full, _sliding) = build_multimodal_masks(&block_ids, 8, Dtype::Float32);
+        let mut full = full.reshape(&[8, 8]);
+        full.eval();
+        let v = full.to_f32_vec(64).unwrap();
+        let allowed: Vec<Vec<i32>> = (0..8)
+            .map(|i| {
+                (0..8)
+                    .map(|j| if v[i * 8 + j] > -1.0 { 1 } else { 0 })
+                    .collect()
+            })
+            .collect();
+        // Causal OR same-image-block (rows 2..=5 additionally see the whole
+        // 2..=5 span, including "future" image tokens).
+        let expected = vec![
+            vec![1, 0, 0, 0, 0, 0, 0, 0],
+            vec![1, 1, 0, 0, 0, 0, 0, 0],
+            vec![1, 1, 1, 1, 1, 1, 0, 0],
+            vec![1, 1, 1, 1, 1, 1, 0, 0],
+            vec![1, 1, 1, 1, 1, 1, 0, 0],
+            vec![1, 1, 1, 1, 1, 1, 0, 0],
+            vec![1, 1, 1, 1, 1, 1, 1, 0],
+            vec![1, 1, 1, 1, 1, 1, 1, 1],
+        ];
+        assert_eq!(allowed, expected);
+    }
+
+    #[test]
+    fn merge_image_features_scatters_in_order() {
+        // text embeds [1,4,2]; image mask marks positions 1 and 2.
+        let text = Array::from_slice(&[1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0], &[1, 4, 2]);
+        let mask = ops::greater(
+            &Array::from_slice(&[0.0f32, 1.0, 1.0, 0.0], &[1, 4]),
+            &Array::from_f32(0.5),
+        );
+        let feats = Array::from_slice(&[10.0, 10.0, 20.0, 20.0], &[2, 2]);
+
+        let mut merged = merge_image_features(&text, &mask, &feats);
+        assert_eq!(merged.shape(), &[1, 4, 2]);
+        merged.eval();
+        assert_eq!(
+            merged.to_f32_vec(8).unwrap(),
+            vec![1.0, 1.0, 10.0, 10.0, 20.0, 20.0, 4.0, 4.0]
+        );
+    }
+
+    #[test]
+    fn forward_multimodal_runs_and_shapes() {
+        let cfg = tiny_config();
+        let n_layers = cfg.num_hidden_layers as usize;
+        let hidden = cfg.hidden_size;
+        let mut enc = DiffusionGemmaEncoderModel::new(cfg).unwrap();
+        enc.attach_vision(&tiny_vision_config(), 5).unwrap();
+
+        // 4x4 patch grid → pool k=2 → 4 soft tokens → 4 image tokens (id 5).
+        let grid = 4;
+        let n = grid * grid;
+        let patch_dim = 3 * 2 * 2;
+        let pixel_values = pmetal_bridge::compat::random::uniform_f32(&[1, n, patch_dim]);
+        let mut coords = Vec::with_capacity((n * 2) as usize);
+        for y in 0..grid {
+            for x in 0..grid {
+                coords.push(x);
+                coords.push(y);
+            }
+        }
+        let position_ids = Array::from_slice(&coords, &[1, n, 2]);
+        let input_ids = Array::from_slice(&[1, 2, 5, 5, 5, 5, 3], &[1, 7]);
+
+        let (mut out, kvs) = enc
+            .forward_multimodal(&input_ids, &pixel_values, &position_ids, true)
+            .unwrap();
+        assert_eq!(out.shape(), &[1, 7, hidden]);
+        assert_eq!(kvs.len(), n_layers);
+        out.eval();
+        let v = out.to_f32_vec((7 * hidden) as usize).unwrap();
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "multimodal output non-finite"
+        );
     }
 
     #[test]
