@@ -1,15 +1,17 @@
 //! Numerical-parity test for the Rust Cohere (Command-R) port.
 //!
-//! Loads a tiny 2-layer seeded fixture dumped from `mlx_lm.models.cohere`
-//! (`.strategy/parity/dump_cohere_reference.py`) through the *production*
-//! weight loader and compares every tapped checkpoint against the reference
-//! tensors, plus an argmax-exact check on the final logits.
+//! The oracle is the authoritative HuggingFace `transformers`
+//! `CohereForCausalLM` — the implementation released Command-R weights are
+//! defined against. `.strategy/parity/dump_cohere_reference.py` builds a tiny
+//! 2-layer seeded model and commits its activations + weights; this test loads
+//! them through the *production* weight loader and diffs every tapped
+//! checkpoint, plus an argmax-exact check on the final logits.
 //!
 //! This is the regression guard for three forward-pass fixes:
 //!   1. output `logit_scale` (0.0625) — applied via the LM head path,
 //!   2. tied LM head — Cohere ships no `lm_head.weight`, so a separate head
 //!      would emit random logits,
-//!   3. traditional (interleaved) RoPE.
+//!   3. traditional (interleaved) RoPE — Cohere's `rotate_half` interleaves.
 //!
 //! Any of these regressing flips the argmax and blows the logits tolerance.
 
@@ -27,7 +29,7 @@ use pmetal_models::loader::load_generic_weights;
 
 /// Synthetic config — must mirror SYNTHETIC_ARGS in the Python dumper.
 /// `use_sliding_window` is omitted (defaults false) so the synthetic run is a
-/// plain global-causal forward, matching mlx-lm's `create_attention_mask`.
+/// plain global-causal forward.
 fn synthetic_config_json() -> &'static str {
     r#"{
         "vocab_size": 512,
@@ -91,18 +93,23 @@ fn cohere_synthetic_parity() {
         .forward_with_cache(&input_ids, None, None)
         .expect("model forward");
 
+    // Against the definition oracle every checkpoint lands on the fp32 noise
+    // floor (observed max_abs ≤ 1.4e-6, embeddings bit-exact), so the
+    // tolerances are ~70× the observed diff rather than the 1000× slack a
+    // third-party port needed. Note `passed()` is `abs || rel`, so the rtol
+    // has to be tightened alongside the atol to actually bite.
     let tol = [
-        ("post_embed", Tolerance::new(1e-4, 1e-4)),
-        ("layer_0_hidden", Tolerance::new(5e-4, 1e-3)),
-        ("layer_1_hidden", Tolerance::new(1e-3, 2e-3)),
-        ("final_hidden", Tolerance::new(1.5e-3, 2e-3)),
-        ("logits", Tolerance::new(5e-3, 5e-3)),
+        ("post_embed", Tolerance::new(1e-6, 1e-6)),
+        ("layer_0_hidden", Tolerance::new(1e-4, 1e-5)),
+        ("layer_1_hidden", Tolerance::new(1e-4, 1e-5)),
+        ("final_hidden", Tolerance::new(1e-4, 1e-5)),
+        ("logits", Tolerance::new(1e-5, 1e-5)),
     ];
     let lookup = |name: &str| {
         tol.iter()
             .find(|(n, _)| *n == name)
             .map(|(_, t)| *t)
-            .unwrap_or(Tolerance::new(1e-3, 1e-3))
+            .unwrap_or(Tolerance::new(1e-4, 1e-5))
     };
 
     let reports = vec![

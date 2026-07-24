@@ -21,5 +21,10 @@
   ],
   "max_position_embeddings": 512,
   "mscale": 1.1338934190276817,
-  "original_max_position_embeddings": 128
+  "note": "Phi-3 LongRoPE long-branch fixture; mscale folded into cos/sin.",
+  "oracle": "transformers",
+  "original_max_position_embeddings": 128,
+  "seq_len": 6,
+  "torch_version": "2.12.0",
+  "transformers_version": "5.10.0.dev0"
 }

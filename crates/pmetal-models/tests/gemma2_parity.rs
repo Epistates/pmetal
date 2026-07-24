@@ -1,6 +1,7 @@
 //! Numerical-parity test for the Rust Gemma 2 port.
 //!
-//! Loads a tiny 2-layer seeded fixture dumped from `mlx_lm.models.gemma2`
+//! Loads a tiny 2-layer seeded fixture dumped from the authoritative
+//! HuggingFace `transformers` `Gemma2ForCausalLM`
 //! (`.strategy/parity/dump_gemma2_reference.py`) through the full
 //! `DynamicModel::load` dispatcher path — with a `config.json` whose
 //! `model_type` is `"gemma2"` but with NO `is_gemma2` flag — so the test
@@ -8,8 +9,10 @@
 //! checkpoint would run the Gemma-v1 path (no 4-norm block, no attention
 //! softcap, no final-logit softcap) and the argmax would diverge.
 //!
-//! mlx-lm's gemma2 uses a single global causal mask, so the short synthetic
-//! sequence (sliding window is a no-op) is where mlx-lm and pmetal agree.
+//! The synthetic sequence is 12 tokens against a 4096 sliding window, so the
+//! alternating local/global layer types are a no-op here and the run is a
+//! plain global-causal forward; window geometry is covered by the Gemma 4
+//! fixture.
 
 mod common;
 
@@ -85,19 +88,19 @@ fn gemma2_synthetic_parity() {
             "layer_0_hidden",
             &layer0,
             ref_tensor(&ref_shard, "layer_0_hidden"),
-            Tolerance::new(5e-4, 1e-3),
+            Tolerance::new(1e-4, 1e-5),
         ),
         ParityReport::compute_with_per_position(
             "layer_1_hidden",
             &layer1,
             ref_tensor(&ref_shard, "layer_1_hidden"),
-            Tolerance::new(1e-3, 2e-3),
+            Tolerance::new(1e-4, 1e-5),
         ),
         ParityReport::compute_with_per_position(
             "logits",
             &logits,
             ref_tensor(&ref_shard, "logits"),
-            Tolerance::new(5e-3, 5e-3),
+            Tolerance::new(1e-4, 1e-5),
         ),
     ];
 

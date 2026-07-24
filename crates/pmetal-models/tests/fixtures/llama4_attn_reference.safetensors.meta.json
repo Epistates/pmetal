@@ -3,7 +3,7 @@
   "hidden": 128,
   "layers": {
     "0": {
-      "attn_temperature_tuning": true,
+      "attn_temperature_tuning": false,
       "use_qk_norm": true,
       "use_rope": true
     },
@@ -15,7 +15,21 @@
   },
   "n_heads": 4,
   "n_kv_heads": 2,
+  "no_rope_layers": [
+    1,
+    1,
+    1,
+    0,
+    1,
+    1,
+    1,
+    0
+  ],
+  "oracle": "transformers",
   "rms_norm_eps": 1e-05,
+  "rng_seed": 11,
   "rope_theta": 10000.0,
-  "seq": 6
+  "seq": 6,
+  "torch_version": "2.12.0",
+  "transformers_version": "5.10.0.dev0"
 }

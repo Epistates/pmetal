@@ -976,7 +976,9 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
-    /// Phi-3 LongRoPE (SuScaledRoPE) parity against the mlx-lm oracle.
+    /// Phi-3 LongRoPE parity against the authoritative HuggingFace
+    /// `transformers` oracle (`ROPE_INIT_FUNCTIONS["longrope"]` +
+    /// `models.phi3.apply_rotary_pos_emb`).
     ///
     /// Guards three fixes: (1) the per-dimension `long_factor`-scaled inverse
     /// frequencies are actually applied (plain base RoPE used to be used,
@@ -984,10 +986,14 @@ mod tests {
     /// scale, not also as a position scale; (3) `compute_su_rope_freqs`
     /// produces `inv_freq = 1/(long_factor · base^(2i/d))`.
     ///
+    /// transformers folds the mscale into `cos`/`sin` where pmetal value-scales
+    /// the input; rotation is linear, so the two are algebraically identical
+    /// and this fixture is what proves it stays that way.
+    ///
     /// Fixture: `.strategy/parity/dump_phi_surope_reference.py`.
     #[test]
     #[serial]
-    fn phi_surope_matches_mlx_oracle() {
+    fn phi_longrope_matches_transformers_oracle() {
         use pmetal_mlx::kernels::rope::apply_rope_with_freqs;
 
         let mut path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));

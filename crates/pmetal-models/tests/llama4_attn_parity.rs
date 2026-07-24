@@ -1,16 +1,19 @@
 //! Numerical-parity test for the Rust Llama 4 attention block.
 //!
-//! Isolates `Llama4Attention` (no MoE, so no SwitchGLU expert-splitting needed)
-//! and replays a reference dumped from `mlx_lm.models.llama4.Attention`
+//! Isolates `Llama4Attention` (no MoE, so no expert-splitting needed) and
+//! replays a reference dumped from the authoritative HuggingFace
+//! `transformers` `Llama4TextAttention`
 //! (`.strategy/parity/dump_llama4_attn_reference.py`). It pins the interacting
 //! iRoPE fixes:
 //!
-//!   * traditional (interleaved) RoPE,
+//!   * traditional (interleaved) RoPE — transformers rotates via
+//!     `view_as_complex`, which is the interleaved pairing,
 //!   * weightless QK-norm applied AFTER RoPE on RoPE layers only (eps 1e-6),
 //!   * the NoPE temperature-tuning path on a no-rope layer.
 //!
-//! Layer 0 exercises RoPE + QK-norm; layer 3 (where `(3 + 1) % 4 == 0`)
-//! exercises NoPE + temperature tuning. Each replays the SAME input and additive
+//! Layer 0 exercises RoPE + QK-norm; layer 3 — where the config's
+//! `no_rope_layers` is 0, since `(3 + 1) % 4 == 0` — exercises NoPE +
+//! temperature tuning. Each replays the SAME input and additive
 //! causal mask the oracle saw. Before the fixes the layer-0 output diverges
 //! (split-half RoPE, pre-RoPE/weighted/eps-1e-5 QK-norm) and the layer mapping
 //! flips which layers are NoPE.
@@ -56,7 +59,7 @@ fn llama4_attention_synthetic_parity() {
         let mut attn = Llama4Attention::new(&config, layer_idx).expect("build attention");
 
         // Load the four projection weights; q_norm/k_norm stay at their default
-        // ones (== mlx weightless `rms_norm(x, None, eps)`).
+        // ones (== the oracle's weightless `Llama4TextL2Norm`).
         attn.q_proj.weight = Param::new(ref_tensor(&shard, &format!("{tag}.q_proj")).clone());
         attn.k_proj.weight = Param::new(ref_tensor(&shard, &format!("{tag}.k_proj")).clone());
         attn.v_proj.weight = Param::new(ref_tensor(&shard, &format!("{tag}.v_proj")).clone());
@@ -78,7 +81,7 @@ fn llama4_attention_synthetic_parity() {
             &format!("{tag}_output"),
             &y,
             ref_tensor(&shard, &format!("{tag}.y")),
-            Tolerance::new(2e-4, 1e-3),
+            Tolerance::new(1e-4, 1e-5),
         ));
     }
 
