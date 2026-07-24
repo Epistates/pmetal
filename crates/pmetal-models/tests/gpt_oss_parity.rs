@@ -11,8 +11,9 @@
 //! and seeded non-zero per-head sinks so a missing sink term or a wrong RoPE
 //! rotation shifts the argmax.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+mod common;
+
+use common::{fixture_path, load_shard, ref_tensor};
 
 use pmetal_bridge::compat::Array;
 use pmetal_mlx::speculative::SpecCapture;
@@ -23,27 +24,6 @@ use serial_test::serial;
 
 use pmetal_models::architectures::gpt_oss::{GptOssConfig, GptOssForCausalLM};
 use pmetal_models::loader::load_generic_weights;
-
-fn load_shard(path: &Path) -> HashMap<String, Array> {
-    let path_str = path.to_str().expect("utf8 path");
-    let pairs = pmetal_bridge::inline_array::load_safetensors_shard(path_str)
-        .unwrap_or_else(|| panic!("failed to load safetensors shard at {path_str:?}"));
-    pairs.into_iter().collect()
-}
-
-fn ref_tensor<'a>(shard: &'a HashMap<String, Array>, key: &str) -> &'a Array {
-    shard
-        .get(key)
-        .unwrap_or_else(|| panic!("reference shard missing key {key:?}"))
-}
-
-fn fixture_path(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests");
-    p.push("fixtures");
-    p.push(name);
-    p
-}
 
 /// Mirrors `SYNTHETIC_ARGS` in the Python dumper. Fields must stay in sync.
 fn synthetic_config_json() -> &'static str {

@@ -15,36 +15,15 @@
 //! (split-half RoPE, pre-RoPE/weighted/eps-1e-5 QK-norm) and the layer mapping
 //! flips which layers are NoPE.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+mod common;
 
-use pmetal_bridge::compat::{Array, Param};
+use common::{fixture_path, load_shard, ref_tensor};
+
+use pmetal_bridge::compat::Param;
 
 use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table};
 
 use pmetal_models::architectures::llama4::{Llama4Attention, Llama4TextConfig};
-
-fn fixture_path(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests");
-    p.push("fixtures");
-    p.push(name);
-    p
-}
-
-fn load_shard(path: &Path) -> HashMap<String, Array> {
-    let path_str = path.to_str().expect("utf8 path");
-    pmetal_bridge::inline_array::load_safetensors_shard(path_str)
-        .unwrap_or_else(|| panic!("failed to load safetensors shard at {path_str:?}"))
-        .into_iter()
-        .collect()
-}
-
-fn ref_tensor<'a>(shard: &'a HashMap<String, Array>, key: &str) -> &'a Array {
-    shard
-        .get(key)
-        .unwrap_or_else(|| panic!("reference shard missing key {key:?}"))
-}
 
 fn synthetic_config() -> Llama4TextConfig {
     Llama4TextConfig {

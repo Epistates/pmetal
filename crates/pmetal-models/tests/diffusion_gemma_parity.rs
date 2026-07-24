@@ -15,8 +15,9 @@
 //! and the sliding/full dual attention geometry (reused from the
 //! parity-verified Gemma 4 blocks).
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+mod common;
+
+use common::{fixture_path, load_shard, ref_tensor};
 
 use pmetal_bridge::compat::Array;
 use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table};
@@ -24,27 +25,6 @@ use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table};
 use pmetal_models::architectures::diffusion_gemma::{
     DiffusionGemmaEncoderModel, DiffusionGemmaTextConfig, load_diffusion_gemma_encoder_weights,
 };
-
-fn load_shard(path: &Path) -> HashMap<String, Array> {
-    let path_str = path.to_str().expect("utf8 path");
-    let pairs = pmetal_bridge::inline_array::load_safetensors_shard(path_str)
-        .unwrap_or_else(|| panic!("failed to load safetensors shard at {path_str:?}"));
-    pairs.into_iter().collect()
-}
-
-fn ref_tensor<'a>(shard: &'a HashMap<String, Array>, key: &str) -> &'a Array {
-    shard
-        .get(key)
-        .unwrap_or_else(|| panic!("reference shard missing key {key:?}"))
-}
-
-fn fixture_path(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests");
-    p.push("fixtures");
-    p.push(name);
-    p
-}
 
 /// Synthetic config — mirrors `SYNTHETIC_ARGS` in the Python dumper. The RoPE
 /// parameters are left `None` so [`DiffusionGemmaTextConfig::resolved_rope_parameters`]

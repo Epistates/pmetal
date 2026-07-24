@@ -14,8 +14,12 @@
 //!
 //! Both profiles use the same helper functions from `pmetal_mlx::test_utils`.
 
+mod common;
+
+use common::{fixture_path, load_shard, ref_tensor};
+
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use pmetal_bridge::compat::{Array, ops};
 use pmetal_mlx::speculative::SpecCapture;
@@ -24,23 +28,6 @@ use pmetal_mlx::test_utils::{
 };
 
 use pmetal_models::architectures::gemma4::{Gemma4Config, Gemma4ForCausalLM, load_gemma4_weights};
-
-/// Load a safetensors file into a `HashMap<String, Array>` using the same
-/// bridge loader the production weight-loading path uses.
-fn load_shard(path: &Path) -> HashMap<String, Array> {
-    let path_str = path.to_str().expect("utf8 path");
-    let pairs = pmetal_bridge::inline_array::load_safetensors_shard(path_str)
-        .unwrap_or_else(|| panic!("failed to load safetensors shard at {path_str:?}"));
-    pairs.into_iter().collect()
-}
-
-/// Fetch a single tensor from the reference shard, panicking with a helpful
-/// message if it's missing.
-fn ref_tensor<'a>(shard: &'a HashMap<String, Array>, key: &str) -> &'a Array {
-    shard
-        .get(key)
-        .unwrap_or_else(|| panic!("reference shard missing key {key:?}"))
-}
 
 /// Synthetic config that mirrors SYNTHETIC_ARGS in the Python dumper.
 /// Fields must stay in sync with `.strategy/parity/dump_gemma4_reference.py`.
@@ -115,14 +102,6 @@ fn gemma4_31b_tolerances(tap_layers: &[i32]) -> Vec<(String, Tolerance)> {
         t.push((format!("layer_{idx}_hidden"), Tolerance::new(atol, rtol)));
     }
     t
-}
-
-fn fixture_path(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests");
-    p.push("fixtures");
-    p.push(name);
-    p
 }
 
 /// MoE synthetic config — mirrors MOE_SYNTHETIC_ARGS in the Python dumper

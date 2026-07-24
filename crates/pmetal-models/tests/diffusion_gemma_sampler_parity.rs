@@ -9,8 +9,9 @@
 //! each on fixed seeded inputs from the transformers oracle; this test diffs
 //! the Rust implementations against those references.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+mod common;
+
+use common::{fixture_path, load_shard, ref_tensor};
 
 use pmetal_bridge::compat::Array;
 use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table, to_f32_vec_eval};
@@ -25,27 +26,6 @@ const T_MAX: f32 = 0.8;
 const MAX_STEPS: i32 = 48;
 const CUR_STEP: i32 = 24;
 const ENTROPY_BOUND: f32 = 0.1;
-
-fn load_shard(path: &Path) -> HashMap<String, Array> {
-    let path_str = path.to_str().expect("utf8 path");
-    let pairs = pmetal_bridge::inline_array::load_safetensors_shard(path_str)
-        .unwrap_or_else(|| panic!("failed to load safetensors shard at {path_str:?}"));
-    pairs.into_iter().collect()
-}
-
-fn ref_tensor<'a>(shard: &'a HashMap<String, Array>, key: &str) -> &'a Array {
-    shard
-        .get(key)
-        .unwrap_or_else(|| panic!("reference shard missing key {key:?}"))
-}
-
-fn fixture_path(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests");
-    p.push("fixtures");
-    p.push(name);
-    p
-}
 
 fn i32_vec(a: &Array) -> Vec<i32> {
     to_f32_vec_eval(a).into_iter().map(|v| v as i32).collect()

@@ -11,10 +11,10 @@
 //! mlx-lm's gemma2 uses a single global causal mask, so the short synthetic
 //! sequence (sliding window is a no-op) is where mlx-lm and pmetal agree.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+mod common;
 
-use pmetal_bridge::compat::Array;
+use common::{fixture_path, load_shard, ref_tensor};
+
 use pmetal_mlx::speculative::SpecCapture;
 use pmetal_mlx::test_utils::{
     ParityReport, Tolerance, argmax_last_axis, print_report_table, to_f32_vec_eval,
@@ -39,28 +39,6 @@ fn synthetic_config_json() -> &'static str {
         "final_logit_softcapping": 30.0,
         "query_pre_attn_scalar": 256
     }"#
-}
-
-fn fixture_path(name: &str) -> PathBuf {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("tests");
-    p.push("fixtures");
-    p.push(name);
-    p
-}
-
-fn load_shard(path: &Path) -> HashMap<String, Array> {
-    let path_str = path.to_str().expect("utf8 path");
-    pmetal_bridge::inline_array::load_safetensors_shard(path_str)
-        .unwrap_or_else(|| panic!("failed to load safetensors shard at {path_str:?}"))
-        .into_iter()
-        .collect()
-}
-
-fn ref_tensor<'a>(shard: &'a HashMap<String, Array>, key: &str) -> &'a Array {
-    shard
-        .get(key)
-        .unwrap_or_else(|| panic!("reference shard missing key {key:?}"))
 }
 
 #[test]
