@@ -1,17 +1,47 @@
 {
-  "captured_keys": [
-    "argmax_tokens",
-    "final_hidden",
-    "input_ids",
-    "layer_0_hidden",
-    "layer_1_hidden",
-    "logits",
-    "post_embed"
-  ],
-  "hidden_size": 128,
-  "manual_walk_vs_canonical_max_abs_diff": 0.0,
+  "config": {
+    "attention_k_eq_v": true,
+    "enable_moe_block": false,
+    "final_logit_softcapping": 30.0,
+    "global_head_dim": 64,
+    "head_dim": 32,
+    "hidden_size": 128,
+    "hidden_size_per_layer_input": 0,
+    "intermediate_size": 256,
+    "layer_types": [
+      "sliding_attention",
+      "full_attention"
+    ],
+    "max_position_embeddings": 131072,
+    "num_attention_heads": 4,
+    "num_global_key_value_heads": 1,
+    "num_hidden_layers": 2,
+    "num_key_value_heads": 2,
+    "num_kv_shared_layers": 0,
+    "pad_token_id": 0,
+    "rms_norm_eps": 1e-06,
+    "rope_parameters": {
+      "full_attention": {
+        "partial_rotary_factor": 0.25,
+        "rope_theta": 1000000.0,
+        "rope_type": "proportional"
+      },
+      "sliding_attention": {
+        "partial_rotary_factor": 1.0,
+        "rope_theta": 10000.0,
+        "rope_type": "default"
+      }
+    },
+    "sliding_window": 8,
+    "tie_word_embeddings": true,
+    "use_double_wide_mlp": false,
+    "vocab_size": 512,
+    "vocab_size_per_layer_input": 512
+  },
+  "fp32_noise": 1.9489512663450892e-08,
+  "min_argmax_margin": 0.00011450797319412231,
   "model_id": "synthetic",
-  "num_hidden_layers": 2,
+  "oracle": "transformers",
   "rng_seed": 42,
   "seq_len": 12,
   "synthetic": true,
@@ -19,5 +49,37 @@
     0,
     1
   ],
-  "vocab_size": 512
+  "torch_version": "2.12.0",
+  "transformers_version": "5.10.0.dev0",
+  "weight_keys": [
+    "model.embed_tokens.weight",
+    "model.layers.0.input_layernorm.weight",
+    "model.layers.0.layer_scalar",
+    "model.layers.0.mlp.down_proj.weight",
+    "model.layers.0.mlp.gate_proj.weight",
+    "model.layers.0.mlp.up_proj.weight",
+    "model.layers.0.post_attention_layernorm.weight",
+    "model.layers.0.post_feedforward_layernorm.weight",
+    "model.layers.0.pre_feedforward_layernorm.weight",
+    "model.layers.0.self_attn.k_norm.weight",
+    "model.layers.0.self_attn.k_proj.weight",
+    "model.layers.0.self_attn.o_proj.weight",
+    "model.layers.0.self_attn.q_norm.weight",
+    "model.layers.0.self_attn.q_proj.weight",
+    "model.layers.0.self_attn.v_proj.weight",
+    "model.layers.1.input_layernorm.weight",
+    "model.layers.1.layer_scalar",
+    "model.layers.1.mlp.down_proj.weight",
+    "model.layers.1.mlp.gate_proj.weight",
+    "model.layers.1.mlp.up_proj.weight",
+    "model.layers.1.post_attention_layernorm.weight",
+    "model.layers.1.post_feedforward_layernorm.weight",
+    "model.layers.1.pre_feedforward_layernorm.weight",
+    "model.layers.1.self_attn.k_norm.weight",
+    "model.layers.1.self_attn.k_proj.weight",
+    "model.layers.1.self_attn.o_proj.weight",
+    "model.layers.1.self_attn.q_norm.weight",
+    "model.layers.1.self_attn.q_proj.weight",
+    "model.norm.weight"
+  ]
 }

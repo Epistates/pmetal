@@ -1,11 +1,18 @@
-//! Numerical-parity test for the Rust GPT-OSS port against the mlx-lm oracle.
+//! Numerical-parity test for the Rust GPT-OSS port against the authoritative
+//! HuggingFace `transformers` `GptOssForCausalLM` oracle.
 //!
 //! Exercises the three forward-pass fixes together — attention **sinks**,
 //! **YARN** per-dim RoPE frequencies + embedding mscale, and the **biased
-//! router** — end to end. The tiny 2-layer fixture is dumped by
-//! `.strategy/parity/dump_gpt_oss_reference.py` (which fuses/re-splits
-//! mlx-lm's SwitchGLU experts + router into pmetal's naming) and loaded here
-//! through the production `load_generic_weights` path.
+//! router** (plus the clamped `(up + 1)·gate·σ(1.702·gate)` GLU) — end to end.
+//! The tiny 2-layer fixture is dumped by
+//! `.strategy/parity/dump_gpt_oss_reference.py` and loaded here through the
+//! production `load_generic_weights` path.
+//!
+//! GPT-OSS is the one architecture whose `transformers` weight layout is not
+//! pmetal's: experts ship fused, transposed, and with gate/up **interleaved**
+//! on the last axis, so the dumper de-interleaves and transposes them into
+//! per-expert `nn.Linear` tensors. Getting that wrong is not subtle — it moves
+//! the logits by O(1).
 //!
 //! The synthetic config enables sliding+full attention layers, YARN factor=4,
 //! and seeded non-zero per-head sinks so a missing sink term or a wrong RoPE
@@ -54,12 +61,16 @@ fn synthetic_config_json() -> &'static str {
     }"#
 }
 
+/// Against the definition oracle every checkpoint lands at 1e-7 — within 2x of
+/// the oracle's own fp32-vs-fp64 error — so these are ~20x the observed diff
+/// rather than the 1000x slack a third-party port needed. `passed()` is
+/// `abs || rel`, so the rtols move with the atols.
 fn synthetic_tolerances() -> Vec<(&'static str, Tolerance)> {
     vec![
-        ("layer_0_hidden", Tolerance::new(5e-4, 1e-3)),
-        ("layer_1_hidden", Tolerance::new(1e-3, 2e-3)),
-        ("final_hidden", Tolerance::new(1.5e-3, 2e-3)),
-        ("logits", Tolerance::new(5e-3, 5e-3)),
+        ("layer_0_hidden", Tolerance::new(1e-5, 1e-5)),
+        ("layer_1_hidden", Tolerance::new(1e-5, 1e-5)),
+        ("final_hidden", Tolerance::new(1e-5, 1e-5)),
+        ("logits", Tolerance::new(1e-5, 1e-5)),
     ]
 }
 
@@ -73,7 +84,7 @@ fn compare(
         .iter()
         .find(|(n, _)| *n == name)
         .map(|(_, t)| *t)
-        .unwrap_or(Tolerance::new(1e-3, 1e-3));
+        .unwrap_or(Tolerance::new(1e-5, 1e-5));
     if name == "logits" || name == "final_hidden" || name.ends_with("_hidden") {
         ParityReport::compute_with_per_position(name, rust, reference, tol)
     } else {

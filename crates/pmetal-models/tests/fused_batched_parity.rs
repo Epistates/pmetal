@@ -605,7 +605,7 @@ fn fused_vs_serial_qwen3_moe_multi_step() {
 // NOTE: GPT-OSS has no fused-batched parity test here — its attention uses
 // learned per-head sinks + YARN RoPE that the shared `fused_sdpa` batched block
 // can't express, so `dispatcher::supports_fused_batched` returns false and
-// GPT-OSS decodes serially. Its correctness is covered by the mlx-lm oracle
+// GPT-OSS decodes serially. Its correctness is covered by the transformers oracle
 // parity fixture (`gpt_oss_parity.rs`).
 
 fn tiny_gemma_config() -> GemmaConfig {

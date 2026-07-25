@@ -40,7 +40,7 @@ use std::collections::HashMap;
 ///   `freqs[i] = factor[i] * base^(2i / rope_dim)`
 /// where `factor` is either `short_factor` or `long_factor`.
 ///
-/// In practice mlx-lm always uses `long_factor` and applies a single mscale
+/// In practice the reference always uses `long_factor` and applies a single mscale
 /// attention scalar at the Q/K level. The `mscale` is:
 ///   `sqrt(1 + ln(max_pos / orig_max_pos) / ln(orig_max_pos))`
 ///

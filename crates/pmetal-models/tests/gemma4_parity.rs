@@ -4,9 +4,16 @@
 //!
 //! 1. **Synthetic** (always) — loads a tiny 2-layer seeded fixture checked
 //!    into `tests/fixtures/` and compares every tapped checkpoint against
-//!    the reference tensors dumped by
+//!    the reference tensors dumped from the authoritative HuggingFace
+//!    `transformers` `Gemma4ForCausalLM` by
 //!    `.strategy/parity/dump_gemma4_reference.py`. Catches architectural
 //!    bugs and weight-loader bugs under tight tolerances.
+//!
+//! The 2-layer geometry makes every Gemma-4 asymmetry visible: layer 0 is
+//! `sliding_attention` (head_dim 32, full rotary, θ1e4, its own `v_proj`) and
+//! layer 1 is `full_attention` (global_head_dim 64, 0.25 partial rotary, θ1e6,
+//! `attention_k_eq_v` so there is no `v_proj`). Collapsing the two geometries
+//! cannot pass both layers.
 //! 2. **Real 31B** (only when `PMETAL_GEMMA4_REFERENCE` is set) — loads a
 //!    reference safetensors file dumped from a `gemma-4-31B` checkpoint and
 //!    compares it against the Rust forward of the same model. Tolerances
@@ -70,16 +77,22 @@ fn synthetic_config_json() -> &'static str {
 }
 
 /// Tolerance table used by the synthetic test.
-/// Values are tightened ~10x vs the 31B profile because the 2-layer config
-/// has minimal cumulative bf16 drift. The `OR` in `ParityReport::passed()`
-/// means small-magnitude tensors don't also have to satisfy `rtol`.
+///
+/// Against the definition oracle the fp32 fixture lands near the noise floor:
+/// embeddings are bit-exact, the sliding layer is 1.2e-7, and logits are 6e-6.
+/// `layer_1_hidden` is the outlier at 4e-5 — it is the `full_attention` layer,
+/// where the 0.25 partial-rotary split and `attention_k_eq_v` reuse give the
+/// two implementations more room to reassociate — so it keeps a looser atol
+/// with ~12x headroom while everything else tightens by 100x. The `OR` in
+/// `ParityReport::passed()` means the rtols have to move with the atols or
+/// they silently keep the old slack.
 fn synthetic_tolerances() -> Vec<(&'static str, Tolerance)> {
     vec![
-        ("post_embed", Tolerance::new(1e-4, 1e-4)),
-        ("layer_0_hidden", Tolerance::new(5e-4, 1e-3)),
-        ("layer_1_hidden", Tolerance::new(1e-3, 2e-3)),
-        ("final_hidden", Tolerance::new(1.5e-3, 2e-3)),
-        ("logits", Tolerance::new(5e-3, 5e-3)),
+        ("post_embed", Tolerance::new(1e-6, 1e-6)),
+        ("layer_0_hidden", Tolerance::new(1e-5, 1e-5)),
+        ("layer_1_hidden", Tolerance::new(5e-4, 5e-5)),
+        ("final_hidden", Tolerance::new(1e-4, 1e-5)),
+        ("logits", Tolerance::new(1e-4, 1e-5)),
     ]
 }
 
@@ -229,8 +242,11 @@ fn gemma4_synthetic_parity() {
 }
 
 /// MoE-block parity: exercises the Phase A routed-experts port (parallel dense
-/// MLP + top-k experts) against the mlx-lm `gemma4_text` oracle. Same tight
-/// tolerances as the dense fixture — the 2-layer config has minimal drift.
+/// MLP + top-k experts) against the `transformers` `Gemma4TextExperts` oracle.
+/// Same tight tolerances as the dense fixture — the 2-layer config has minimal
+/// drift, and transformers' expert layout (`gate_up_proj [E, 2·I, H]` +
+/// `down_proj [E, H, I]`) is already pmetal's fused layout, so the fixture
+/// needs no weight remapping.
 #[test]
 fn gemma4_moe_synthetic_parity() {
     run_synthetic_parity(

@@ -1,8 +1,7 @@
 //! Numerical-parity test for the Rust DiffusionGemma **encoder** port.
 //!
-//! Unlike the Gemma 4 parity test (which uses mlx-lm as the oracle),
-//! DiffusionGemma has no mlx-lm implementation, so the reference tensors are
-//! dumped from **transformers nightly** (`transformers >= 5.8.0.dev0`) by
+//! The oracle is the authoritative HuggingFace `transformers`
+//! `DiffusionGemmaEncoderTextModel` (`transformers >= 5.8.0.dev0`), dumped by
 //! `.strategy/parity/dump_diffusion_gemma_reference.py`. That script builds a
 //! tiny seeded `DiffusionGemmaEncoderTextModel`, captures the scaled
 //! embeddings, every encoder-layer output, and the final-normed hidden state,
