@@ -1,15 +1,21 @@
 //! Numerical-parity test for DeepSeek MLA attention WITH YARN rope_scaling.
 //!
-//! Replays references dumped from `mlx_lm.models.deepseek_v2.DeepseekV2Attention`
-//! (`.strategy/parity/dump_deepseek_yarn_reference.py`) for two cases:
+//! Replays references dumped from the authoritative HuggingFace `transformers`
+//! `DeepseekV3Attention` (`.strategy/parity/dump_deepseek_yarn_reference.py`)
+//! for two cases:
 //!
-//!   * "scale" — mscale_all_dim=1.0 (V3-realistic): mscale² folded into the
-//!     softmax scale + YARN frequency blending; embedding mscale == 1.0.
-//!   * "emb"   — mscale=2.0, mscale_all_dim=0.0: q/k pre-scaled by the embedding
-//!     mscale before rotation; softmax scale unchanged.
+//!   * "scale" — `mscale = mscale_all_dim = 1.0`: the embedding mscale ratio
+//!     collapses to 1.0, leaving the YARN frequency blend and the
+//!     `mscale²`-adjusted softmax scale (0.2292 vs the plain 0.1768).
+//!   * "emb"   — `mscale = 2.0`, `mscale_all_dim = 1.0`: same softmax scale (it
+//!     depends only on `mscale_all_dim`), but q/k are now pre-scaled by an
+//!     embedding mscale of 1.1218 before rotation.
 //!
-//! Together they pin the YARN inverse-frequency computation, the embedding
-//! mscale, and the mscale² scale adjustment.
+//! Both cases share the same weights and input, so the 1.7e-2 gap between their
+//! outputs is entirely the embedding mscale — five orders of magnitude above the
+//! parity error, which is what makes the term genuinely pinned rather than
+//! incidentally satisfied. Together they cover the YARN inverse-frequency
+//! computation, the embedding mscale, and the `mscale²` scale adjustment.
 
 mod common;
 
@@ -57,7 +63,7 @@ fn deepseek_yarn_synthetic_parity() {
             "emb",
             serde_json::json!({
                 "type": "yarn", "factor": 4.0, "beta_fast": 32, "beta_slow": 1,
-                "mscale": 2.0, "mscale_all_dim": 0.0,
+                "mscale": 2.0, "mscale_all_dim": 1.0,
                 "original_max_position_embeddings": 32
             }),
         ),
@@ -90,7 +96,7 @@ fn deepseek_yarn_synthetic_parity() {
             &format!("yarn_{tag}_output"),
             &y,
             ref_tensor(&shard, &format!("{tag}.y")),
-            Tolerance::new(2e-4, 1e-3),
+            Tolerance::new(1e-5, 1e-5),
         ));
     }
 

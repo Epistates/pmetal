@@ -1,10 +1,12 @@
 //! Numerical-parity test for DeepSeek-V3 group-limited expert routing.
 //!
-//! Replays a reference dumped from `mlx_lm.models.deepseek_v3.group_expert_select`
+//! Replays a reference dumped from the authoritative HuggingFace `transformers`
+//! `DeepseekV3MoE::route_tokens_to_experts`
 //! (`.strategy/parity/dump_deepseek_route_reference.py`) with `n_group=4`,
 //! `topk_group=2`, so the group-masking branch is exercised. The reference is a
 //! DENSE `[N, num_experts]` weight vector (top-k weights scattered to their
-//! expert columns), which is invariant to top-k ordering.
+//! expert columns), which is invariant to top-k ordering — the two
+//! implementations need not agree on tie-break order to agree on routing.
 //!
 //! The Rust side runs `noaux_tc_topk` on `sigmoid(gates)` and scatters its
 //! output into the same dense form. Before the fix `noaux_tc_topk` ignored

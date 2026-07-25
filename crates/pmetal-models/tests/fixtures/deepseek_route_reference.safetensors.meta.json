@@ -1,9 +1,45 @@
 {
+  "experts_selected_per_token": [
+    [
+      4,
+      3,
+      0,
+      6
+    ],
+    [
+      4,
+      5,
+      2,
+      0
+    ],
+    [
+      3,
+      10,
+      9,
+      11
+    ],
+    [
+      7,
+      10,
+      4,
+      11
+    ],
+    [
+      9,
+      10,
+      5,
+      7
+    ]
+  ],
   "n_group": 4,
   "n_tokens": 5,
   "norm_topk_prob": true,
   "num_experts": 16,
+  "oracle": "transformers",
+  "rng_seed": 33,
   "routed_scaling_factor": 1.5,
   "top_k": 4,
-  "topk_group": 2
+  "topk_group": 2,
+  "torch_version": "2.12.0",
+  "transformers_version": "5.10.0.dev0"
 }

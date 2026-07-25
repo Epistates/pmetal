@@ -1,14 +1,15 @@
 //! Numerical-parity test for the Rust DeepSeek MLA attention block.
 //!
-//! Replays a reference dumped from `mlx_lm.models.deepseek_v2.DeepseekV2Attention`
-//! (`.strategy/parity/dump_deepseek_attn_reference.py`), whose explicit
-//! `kv_b_proj` formulation matches pmetal's `DeepSeekAttention`. The reference
-//! uses `rope_scaling={"factor": 1.0}`, which makes YARN degenerate to standard
-//! RoPE and mscale -> 1.0, so this isolates the one always-wrong bug: DeepSeek
-//! MLA uses traditional (interleaved) RoPE, not the split-half variant.
+//! Replays a reference dumped from the authoritative HuggingFace `transformers`
+//! `DeepseekV3Attention` (`.strategy/parity/dump_deepseek_attn_reference.py`),
+//! whose explicit `kv_b_proj` formulation matches pmetal's `DeepSeekAttention`.
+//! The v3 module is the oracle rather than v2 because v2 drops YARN's `mscale²`
+//! softmax term entirely — see the dumper for the full reasoning.
 //!
-//! YARN frequency correction + mscale (only active when a real `rope_scaling`
-//! block is present) are a separate follow-up and not exercised here.
+//! With `rope_type: "default"` there is no YARN frequency correction and no
+//! mscale, so this fixture isolates the one thing that is wrong regardless of
+//! config: DeepSeek rotates the RoPE head-dims *interleaved*, not split-half.
+//! YARN is covered by `deepseek_yarn_parity.rs`.
 
 mod common;
 
@@ -65,7 +66,7 @@ fn deepseek_attention_synthetic_parity() {
         "deepseek_attn_output",
         &y,
         ref_tensor(&shard, "y"),
-        Tolerance::new(2e-4, 1e-3),
+        Tolerance::new(1e-5, 1e-5),
     );
 
     println!("\n== DeepSeek MLA attention synthetic parity report ==");
