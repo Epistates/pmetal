@@ -33,6 +33,10 @@ image = "0.25"
 
 [dev-dependencies]
 tempfile = { workspace = true }
+# Pull in pmetal-mlx's `test-utils` feature so the parity integration tests can
+# reach the shared helpers (`test_utils::*`). The feature is empty in production
+# builds, so there's no runtime impact.
+pmetal-mlx = { workspace = true, features = ["test-utils"] }
 
 [lints]
 workspace = true

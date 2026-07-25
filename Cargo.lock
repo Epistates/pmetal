@@ -4980,6 +4980,7 @@ dependencies = [
  "pmetal-bridge",
  "pmetal-core",
  "pmetal-gguf",
+ "pmetal-mlx",
  "rand 0.10.1",
  "rayon",
  "serde",

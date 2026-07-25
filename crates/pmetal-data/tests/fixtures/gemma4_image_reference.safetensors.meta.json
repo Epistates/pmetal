@@ -1,0 +1,81 @@
+{
+  "cases": [
+    {
+      "index": 0,
+      "input_size": [
+        72,
+        120
+      ],
+      "num_patches": 540,
+      "num_soft_tokens": [
+        60
+      ],
+      "resize_is_noop": true,
+      "target_size": [
+        72,
+        120
+      ]
+    },
+    {
+      "index": 1,
+      "input_size": [
+        100,
+        150
+      ],
+      "num_patches": 540,
+      "num_soft_tokens": [
+        60
+      ],
+      "resize_is_noop": false,
+      "target_size": [
+        72,
+        120
+      ]
+    },
+    {
+      "index": 2,
+      "input_size": [
+        20,
+        30
+      ],
+      "num_patches": 540,
+      "num_soft_tokens": [
+        60
+      ],
+      "resize_is_noop": false,
+      "target_size": [
+        72,
+        120
+      ]
+    },
+    {
+      "index": 3,
+      "input_size": [
+        8,
+        1200
+      ],
+      "num_patches": 630,
+      "num_soft_tokens": [
+        70
+      ],
+      "resize_is_noop": false,
+      "target_size": [
+        12,
+        840
+      ]
+    }
+  ],
+  "config": {
+    "max_soft_tokens": 70,
+    "patch_size": 4,
+    "pooling_kernel_size": 3
+  },
+  "max_patches": 630,
+  "model_id": "synthetic",
+  "oracle": "transformers",
+  "patch_dim": 48,
+  "pil_vs_torchvision_max_abs": 0.003921627998352051,
+  "processor": "Gemma4ImageProcessorPil",
+  "torch_version": "2.13.0",
+  "transformers_version": "5.10.0.dev0"
+}
