@@ -11,7 +11,30 @@
 //! yourself reaching for a bigger primitive, prefer adding it here over
 //! duplicating it in a per-test module.
 
+use std::collections::HashMap;
+use std::path::Path;
+
 use pmetal_bridge::compat::{Array, ops};
+
+/// Load a safetensors shard into a name→tensor map.
+///
+/// The counterpart to the parity dumpers' `save_fixture`: every `*_parity`
+/// integration test loads a committed fixture this way. Panics rather than
+/// returning a `Result` — a missing or malformed fixture is a broken checkout,
+/// not a condition a test can meaningfully handle.
+pub fn load_shard(path: &Path) -> HashMap<String, Array> {
+    let path_str = path.to_str().expect("utf8 path");
+    let pairs = pmetal_bridge::inline_array::load_safetensors_shard(path_str)
+        .unwrap_or_else(|| panic!("failed to load safetensors shard at {path_str:?}"));
+    pairs.into_iter().collect()
+}
+
+/// Fetch a reference tensor by key, panicking with the missing key on absence.
+pub fn ref_tensor<'a>(shard: &'a HashMap<String, Array>, key: &str) -> &'a Array {
+    shard
+        .get(key)
+        .unwrap_or_else(|| panic!("reference shard missing key {key:?}"))
+}
 
 /// Materialise an `Array` to a flat `Vec<f32>` regardless of its dtype.
 ///
