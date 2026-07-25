@@ -808,7 +808,7 @@ mod tests {
         let decompressed = compressor.decompress(&compressed, 4).unwrap();
 
         let data: Vec<f32> = decompressed.clone().to_f32_vec(8).unwrap();
-        println!("decompressed: {:?}", &data);
+        println!("decompressed: {data:?}");
         if let CompressedLogits::TopK {
             ref values,
             ref indices,

@@ -845,7 +845,7 @@ impl TrainingLoop {
 
         // Build lazy computation graph: sum of all squared norms
         let mut norm_sq_sum = Array::from_f32(0.0);
-        for (_, grad) in grads.iter() {
+        for grad in grads.values() {
             let norm_sq = grad.multiply(grad).sum(None);
             norm_sq_sum = norm_sq_sum.add(&norm_sq);
         }
@@ -858,7 +858,7 @@ impl TrainingLoop {
         if total_norm > max_norm && total_norm.is_finite() {
             let scale = max_norm / (total_norm + 1e-6);
             let scale_arr = Array::from_f32(scale);
-            for (_, grad) in grads.iter_mut() {
+            for grad in grads.values_mut() {
                 *grad = grad.multiply(&scale_arr);
             }
         }
