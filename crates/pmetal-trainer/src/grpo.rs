@@ -316,20 +316,20 @@ impl CompletionGroup {
 /// Load and preprocess images from file paths into MLX arrays.
 ///
 /// Each returned array has shape `[1, C, H, W]` (NCHW float32) with CLIP-style
-/// normalization (mean/std from `MllamaImageProcessorConfig::default()`).
+/// normalization (mean/std from `FixedSizeImageProcessorConfig::default()`).
 /// The image is resized to fit within `max_size × max_size` preserving aspect ratio.
 ///
 /// The `image` crate is already a transitive dependency via `pmetal-data`, so this
 /// function uses the same processor that is available there to avoid duplication.
 fn load_images(image_paths: &[std::path::PathBuf], max_size: usize) -> GrpoResult<Vec<Array>> {
-    use pmetal_data::image_processing::{MllamaImageProcessor, MllamaImageProcessorConfig};
+    use pmetal_data::image_processing::{FixedSizeImageProcessor, FixedSizeImageProcessorConfig};
 
     // Use CLIP-canonical normalization; the size will be overridden below.
-    let config = MllamaImageProcessorConfig {
+    let config = FixedSizeImageProcessorConfig {
         size: (max_size as u32, max_size as u32),
         ..Default::default()
     };
-    let processor = MllamaImageProcessor::new(config);
+    let processor = FixedSizeImageProcessor::new(config);
 
     let mut images = Vec::with_capacity(image_paths.len());
     for path in image_paths {

@@ -6,7 +6,7 @@ use rand::seq::SliceRandom;
 use std::sync::Arc;
 
 use super::{Sample, TrainingDataset};
-use crate::image_processing::MllamaImageProcessor;
+use crate::image_processing::FixedSizeImageProcessor;
 
 /// Errors produced while constructing a training batch.
 #[derive(Debug, thiserror::Error)]
@@ -100,7 +100,7 @@ pub struct DataLoader {
     /// Current position in the dataset.
     position: usize,
     /// Optional image processor for multimodal data.
-    image_processor: Option<Arc<MllamaImageProcessor>>,
+    image_processor: Option<Arc<FixedSizeImageProcessor>>,
 }
 
 #[derive(Debug)]
@@ -118,7 +118,7 @@ impl DataLoader {
     pub fn new(
         dataset: TrainingDataset,
         config: DataLoaderConfig,
-        image_processor: Option<Arc<MllamaImageProcessor>>,
+        image_processor: Option<Arc<FixedSizeImageProcessor>>,
     ) -> Self {
         let n = dataset.len();
         let mut indices: Vec<usize> = (0..n).collect();

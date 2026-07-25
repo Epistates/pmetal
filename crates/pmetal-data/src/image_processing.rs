@@ -2,9 +2,9 @@
 //!
 //! Two families live here:
 //!
-//! * [`MllamaImageProcessor`] / [`SiglipImageProcessor`] — fixed-size,
-//!   CLIP-style `[N, 3, H, W]` preprocessing for Llama 3.2 Vision and SigLIP
-//!   towers.
+//! * [`FixedSizeImageProcessor`] / [`SiglipImageProcessor`] — plain
+//!   resize-to-a-fixed-square `[N, 3, H, W]` preprocessing, used for generic
+//!   image training data.
 //! * [`Gemma4ImageProcessor`] — Gemma 4's patch-budget preprocessing, which
 //!   resizes to preserve aspect ratio, patchifies to
 //!   `[B, max_patches, 3·patch²]`, and emits the `(x, y)` patch coordinates the
@@ -17,9 +17,9 @@ use std::path::Path;
 
 use crate::pillow_resample::{self, ResampleFilter};
 
-/// Configuration for Mllama image processing.
+/// Configuration for [`FixedSizeImageProcessor`].
 #[derive(Debug, Clone)]
-pub struct MllamaImageProcessorConfig {
+pub struct FixedSizeImageProcessorConfig {
     /// Target image size (width, height).
     pub size: (u32, u32),
     /// Normalization mean (RGB).
@@ -33,10 +33,14 @@ pub struct MllamaImageProcessorConfig {
     pub resample: ResampleFilter,
 }
 
-impl Default for MllamaImageProcessorConfig {
+impl Default for FixedSizeImageProcessorConfig {
     fn default() -> Self {
         Self {
-            size: (560, 560), // Default for Llama 3.2 11B Vision
+            // Llama 3.2 11B Vision's tile size and stats. NOTE: the released
+            // checkpoint does *not* simply resize to this — it fits the image
+            // into a tiled canvas of up to `max_image_tiles` 560x560 tiles.
+            // These defaults reproduce its colour handling, not its geometry.
+            size: (560, 560),
             // CLIP stats (canonical values from OpenAI CLIP)
             #[allow(clippy::excessive_precision)]
             mean: [0.48145466, 0.4578275, 0.40821073],
@@ -48,23 +52,28 @@ impl Default for MllamaImageProcessorConfig {
     }
 }
 
-/// Image processor for Mllama.
+/// Fixed-size CLIP-style image processor: stretch to a fixed square, rescale,
+/// normalise.
+///
+/// This is the generic training-data path — it is *not* any released VLM's
+/// preprocessing, because every one of them preserves aspect ratio somehow.
+/// Llama 3.2 Vision in particular tiles (see the caveat on the defaults below).
 ///
 /// Supports:
 /// - Single image preprocessing
 /// - Batch preprocessing
 /// - GPU-accelerated normalization via MLX
 #[derive(Debug, Clone)]
-pub struct MllamaImageProcessor {
-    config: MllamaImageProcessorConfig,
+pub struct FixedSizeImageProcessor {
+    config: FixedSizeImageProcessorConfig,
     /// Pre-computed normalization arrays for GPU processing.
     mean_array: Option<Array>,
     std_array: Option<Array>,
 }
 
-impl MllamaImageProcessor {
+impl FixedSizeImageProcessor {
     /// Create a new processor.
-    pub fn new(config: MllamaImageProcessorConfig) -> Self {
+    pub fn new(config: FixedSizeImageProcessorConfig) -> Self {
         Self {
             config,
             mean_array: None,
@@ -220,7 +229,7 @@ impl MllamaImageProcessor {
     }
 
     /// Get the config.
-    pub fn config(&self) -> &MllamaImageProcessorConfig {
+    pub fn config(&self) -> &FixedSizeImageProcessorConfig {
         &self.config
     }
 }
@@ -228,14 +237,14 @@ impl MllamaImageProcessor {
 /// SigLIP-style image processor with different normalization.
 #[derive(Debug, Clone)]
 pub struct SiglipImageProcessor {
-    config: MllamaImageProcessorConfig,
+    config: FixedSizeImageProcessorConfig,
 }
 
 impl SiglipImageProcessor {
     /// Create a new SigLIP processor.
     pub fn new(size: (u32, u32)) -> Self {
         Self {
-            config: MllamaImageProcessorConfig {
+            config: FixedSizeImageProcessorConfig {
                 size,
                 // SigLIP normalises with `IMAGENET_STANDARD_MEAN/STD`, not
                 // CLIP's stats, and resamples bicubic (`"resample": 3`) where
@@ -250,7 +259,7 @@ impl SiglipImageProcessor {
 
     /// Process an image.
     pub fn process_image(&self, img: DynamicImage) -> Result<Array, Exception> {
-        let processor = MllamaImageProcessor::new(self.config.clone());
+        let processor = FixedSizeImageProcessor::new(self.config.clone());
         processor.process_image(img)
     }
 }
@@ -583,15 +592,15 @@ mod tests {
 
     #[test]
     fn test_processor_creation() {
-        let config = MllamaImageProcessorConfig::default();
-        let processor = MllamaImageProcessor::new(config);
+        let config = FixedSizeImageProcessorConfig::default();
+        let processor = FixedSizeImageProcessor::new(config);
 
         assert_eq!(processor.config().size, (560, 560));
     }
 
     #[test]
     fn test_normalization_values() {
-        let config = MllamaImageProcessorConfig::default();
+        let config = FixedSizeImageProcessorConfig::default();
 
         // CLIP stats should be correct
         assert!((config.mean[0] - 0.48145466).abs() < 1e-6);
@@ -608,18 +617,18 @@ mod tests {
         // ...and bicubic resampling, where Llama 3.2 Vision ships bilinear.
         assert_eq!(processor.config.resample, ResampleFilter::Bicubic);
         assert_eq!(
-            MllamaImageProcessorConfig::default().resample,
+            FixedSizeImageProcessorConfig::default().resample,
             ResampleFilter::Bilinear
         );
     }
 
     #[test]
     fn test_synthetic_image_processing() {
-        let config = MllamaImageProcessorConfig {
+        let config = FixedSizeImageProcessorConfig {
             size: (4, 4), // Small for testing
             ..Default::default()
         };
-        let processor = MllamaImageProcessor::new(config);
+        let processor = FixedSizeImageProcessor::new(config);
 
         // Create a simple synthetic image
         let img_buf = image::RgbImage::from_fn(4, 4, |_x, _y| image::Rgb([128u8, 64, 192]));
