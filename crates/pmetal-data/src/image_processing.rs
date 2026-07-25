@@ -264,6 +264,402 @@ impl SiglipImageProcessor {
     }
 }
 
+/// The reference's rescale-then-normalise chain, reproduced step for step.
+///
+/// Both halves have a precision quirk that matters if you want to assert
+/// bit-exactness rather than a tolerance:
+///
+/// * the rescale is `image.astype(np.float64) * scale` — done in **f64** and
+///   only then narrowed, so an f32 `rescale_factor` lands 1 ULP off;
+/// * the normalisation is `(image - mean) / std` in **f32**, a real divide.
+///   Folding it into `x · (1/std) + shift` costs another ULP.
+///
+/// Folding both into a single affine pass is tempting and measurably wrong, so
+/// this keeps the reference's staging. Shared by every processor here, because
+/// the arithmetic is the same wherever `do_rescale` / `do_normalize` appear.
+#[derive(Debug, Clone, Copy)]
+struct PixelNormalizer {
+    /// `Some(factor)` when `do_rescale`.
+    rescale: Option<f64>,
+    /// `Some((mean, std))` when `do_normalize`.
+    normalize: Option<([f32; 3], [f32; 3])>,
+}
+
+impl PixelNormalizer {
+    fn new(
+        do_rescale: bool,
+        rescale_factor: f64,
+        do_normalize: bool,
+        mean: [f32; 3],
+        std: [f32; 3],
+    ) -> Self {
+        Self {
+            rescale: do_rescale.then_some(rescale_factor),
+            normalize: do_normalize.then_some((mean, std)),
+        }
+    }
+
+    /// Map one raw sample in `channel` to its model-ready value.
+    #[inline]
+    fn apply(&self, raw: u8, channel: usize) -> f32 {
+        let value = match self.rescale {
+            Some(factor) => (raw as f64 * factor) as f32,
+            None => raw as f32,
+        };
+        match self.normalize {
+            Some((mean, std)) => (value - mean[channel]) / std[channel],
+            None => value,
+        }
+    }
+
+    /// The value a zero-valued (padding) pixel takes after the chain — the
+    /// reference pads *before* normalising, so padded regions are not zero.
+    #[inline]
+    fn padding_value(&self, channel: usize) -> f32 {
+        self.apply(0, channel)
+    }
+}
+
+/// Every `(tiles_high, tiles_wide)` arrangement that fits inside `max_tiles`.
+///
+/// The order is load-bearing: an image's `aspect_ratio_id` is its index in this
+/// list **plus one** (0 is reserved for batch padding), and the model looks that
+/// id up in a precomputed embedding table. Generated exactly as the reference
+/// does — height-major within a width loop — so the ids agree.
+///
+/// For `max_tiles = 4`:
+/// `[(1,1), (1,2), (1,3), (1,4), (2,1), (2,2), (3,1), (4,1)]`.
+pub fn supported_aspect_ratios(max_tiles: usize) -> Vec<(usize, usize)> {
+    let mut ratios = Vec::new();
+    for width in 1..=max_tiles {
+        for height in 1..=max_tiles {
+            if width * height <= max_tiles {
+                ratios.push((width, height));
+            }
+        }
+    }
+    ratios
+}
+
+/// Configuration for [`MllamaImageProcessor`].
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MllamaImageProcessorConfig {
+    /// Tile side length in pixels. Must be square — the reference validates it.
+    pub tile_size: u32,
+    /// Most tiles one image may be split into.
+    pub max_image_tiles: usize,
+    /// Whether to scale raw `[0, 255]` samples by [`Self::rescale_factor`].
+    pub do_rescale: bool,
+    /// Pixel scale, `1/255`. `f64` for the reason spelled out on
+    /// [`PixelNormalizer`]: the reference rescales in f64, so an f32 factor is
+    /// already rounded before the multiply and lands a ULP off.
+    pub rescale_factor: f64,
+    /// Whether to apply mean/std normalisation after rescaling.
+    pub do_normalize: bool,
+    /// Per-channel mean.
+    pub image_mean: [f32; 3],
+    /// Per-channel standard deviation.
+    pub image_std: [f32; 3],
+    /// Resampling filter; Llama 3.2 Vision ships `2` = bilinear.
+    pub resample: ResampleFilter,
+}
+
+impl Default for MllamaImageProcessorConfig {
+    fn default() -> Self {
+        Self {
+            tile_size: 560,
+            max_image_tiles: 4,
+            do_rescale: true,
+            rescale_factor: 1.0 / 255.0,
+            do_normalize: true,
+            // CLIP stats, as the released Llama 3.2 Vision checkpoint ships.
+            #[allow(clippy::excessive_precision)]
+            image_mean: [0.48145466, 0.4578275, 0.40821073],
+            #[allow(clippy::excessive_precision)]
+            image_std: [0.26862954, 0.26130258, 0.27577711],
+            resample: ResampleFilter::Bilinear,
+        }
+    }
+}
+
+/// Preprocessed images in the layout `MllamaVisionModel::forward` consumes.
+#[derive(Debug, Clone)]
+pub struct MllamaImageBatch {
+    /// `[B, max_num_images, max_image_tiles, 3, tile, tile]`. Unused image and
+    /// tile slots are zero.
+    pub pixel_values: Array,
+    /// `[B, max_num_images]` — index into [`supported_aspect_ratios`] plus one,
+    /// `0` where a batch row has fewer images than the widest one. The vision
+    /// tower indexes its tile-embedding tables by this.
+    pub aspect_ratio_ids: Array,
+    /// `[B, max_num_images, max_image_tiles]` — `1` for real tiles, `0` for
+    /// padding, so attention can ignore the padded tiles.
+    pub aspect_ratio_mask: Array,
+    /// Real tile count per image, per batch row.
+    pub num_tiles: Vec<Vec<usize>>,
+}
+
+/// Llama 3.2 Vision (Mllama) image processor: fit into a tiled canvas, pad,
+/// split into tiles.
+///
+/// Mllama does not resize to a fixed square. It picks the arrangement of up to
+/// `max_image_tiles` `tile_size²` tiles whose canvas best matches the image's
+/// aspect ratio, scales the image to fit inside that canvas *without* distorting
+/// it, pads the remainder, and splits the result into tiles the vision tower
+/// encodes independently before a global transformer attends across them. The
+/// chosen arrangement is reported back as `aspect_ratio_ids`, which the tower
+/// uses to look up per-tile position embeddings — so the geometry is not merely
+/// a preprocessing detail, it is an input the model reads.
+///
+/// One ordering detail worth knowing: the reference **pads before it
+/// normalises**, so padded pixels leave the processor at `-mean/std`, not at
+/// zero. `aspect_ratio_mask` is what marks them, not their value.
+#[derive(Debug, Clone)]
+pub struct MllamaImageProcessor {
+    config: MllamaImageProcessorConfig,
+    /// `supported_aspect_ratios(max_image_tiles)`, cached for id lookup.
+    ratios: Vec<(usize, usize)>,
+}
+
+impl MllamaImageProcessor {
+    /// Create a processor, validating the tiling geometry.
+    pub fn new(config: MllamaImageProcessorConfig) -> Result<Self, Exception> {
+        if config.tile_size == 0 || config.max_image_tiles == 0 {
+            return Err(Exception::custom(
+                "tile_size and max_image_tiles must be non-zero",
+            ));
+        }
+        let ratios = supported_aspect_ratios(config.max_image_tiles);
+        Ok(Self { config, ratios })
+    }
+
+    /// Get the config.
+    pub fn config(&self) -> &MllamaImageProcessorConfig {
+        &self.config
+    }
+
+    /// The tile arrangements this processor can emit, in `aspect_ratio_id`
+    /// order (id = index + 1).
+    pub fn aspect_ratios(&self) -> &[(usize, usize)] {
+        &self.ratios
+    }
+
+    fn normalizer(&self) -> PixelNormalizer {
+        PixelNormalizer::new(
+            self.config.do_rescale,
+            self.config.rescale_factor,
+            self.config.do_normalize,
+            self.config.image_mean,
+            self.config.image_std,
+        )
+    }
+
+    /// The value padded pixels carry once the batch is built. Exposed because
+    /// it is not zero and callers reasonably expect it to be.
+    pub fn padding_value(&self, channel: usize) -> f32 {
+        self.normalizer().padding_value(channel)
+    }
+
+    /// Best `(tiles_high, tiles_wide)` arrangement for an image.
+    ///
+    /// Mirrors the reference `get_optimal_tiled_canvas`: score every arrangement
+    /// by `min(canvas_h / h, canvas_w / w)` — the factor that makes the image
+    /// fit — then prefer the *smallest* upscale if any arrangement can hold the
+    /// image at full size, else the *largest* downscale. Ties break toward the
+    /// smallest canvas area, so a square image gets 1x1 rather than a padded
+    /// 2x2.
+    pub fn optimal_tiling(&self, height: u32, width: u32) -> Result<(usize, usize), Exception> {
+        if height == 0 || width == 0 {
+            return Err(Exception::custom("cannot preprocess a zero-sized image"));
+        }
+        let tile = self.config.tile_size as f64;
+        // The reference compares scales with `==` against the selected value, so
+        // these must be computed exactly as it computes them.
+        let scale_of = |&(tiles_h, tiles_w): &(usize, usize)| {
+            let scale_h = (tiles_h as f64 * tile) / height as f64;
+            let scale_w = (tiles_w as f64 * tile) / width as f64;
+            if scale_w > scale_h { scale_h } else { scale_w }
+        };
+
+        let scales: Vec<f64> = self.ratios.iter().map(scale_of).collect();
+        let upscales: Vec<f64> = scales.iter().copied().filter(|&s| s >= 1.0).collect();
+        let selected = if !upscales.is_empty() {
+            upscales.iter().copied().fold(f64::INFINITY, f64::min)
+        } else {
+            scales
+                .iter()
+                .copied()
+                .filter(|&s| s < 1.0)
+                .fold(f64::NEG_INFINITY, f64::max)
+        };
+
+        // `argmin` over ties keeps the first, as numpy does.
+        self.ratios
+            .iter()
+            .zip(&scales)
+            .filter(|&(_, &s)| s == selected)
+            .map(|(&ratio, _)| ratio)
+            .min_by_key(|&(tiles_h, tiles_w)| tiles_h * tiles_w)
+            .ok_or_else(|| Exception::custom("no tile arrangement matched"))
+    }
+
+    /// Size the image should be scaled to inside `canvas`, preserving aspect
+    /// ratio. Mirrors the reference `get_image_size_fit_to_canvas`.
+    fn fit_to_canvas(&self, height: u32, width: u32, canvas: (u32, u32)) -> (u32, u32) {
+        let tile = self.config.tile_size;
+        let target_h = height.clamp(tile, canvas.0) as f64;
+        let target_w = width.clamp(tile, canvas.1) as f64;
+        let scale_h = target_h / height as f64;
+        let scale_w = target_w / width as f64;
+
+        if scale_w < scale_h {
+            // Width is the binding axis; derive the height and never exceed the
+            // canvas. The `.max(1)` mirrors the reference's `or 1` guard against
+            // an extreme aspect ratio flooring a side to zero.
+            let new_h = ((height as f64 * scale_w).floor() as u32).max(1);
+            (new_h.min(target_h as u32), target_w as u32)
+        } else {
+            let new_w = ((width as f64 * scale_h).floor() as u32).max(1);
+            (target_h as u32, new_w.min(target_w as u32))
+        }
+    }
+
+    /// Resize, pad, normalise and split one image into `[num_tiles, 3, t, t]`
+    /// worth of f32, appended to `out` in tile-row-major order.
+    fn append_tiles(
+        &self,
+        img: &DynamicImage,
+        out: &mut Vec<f32>,
+    ) -> Result<(usize, usize), Exception> {
+        let rgb = img.to_rgb8();
+        let (height, width) = (rgb.height(), rgb.width());
+        let (tiles_h, tiles_w) = self.optimal_tiling(height, width)?;
+        let tile = self.config.tile_size;
+        let canvas = (tiles_h as u32 * tile, tiles_w as u32 * tile);
+        let (fit_h, fit_w) = self.fit_to_canvas(height, width, canvas);
+
+        let resized = pillow_resample::resize_rgb8(&rgb, fit_w, fit_h, self.config.resample);
+        let raw = resized.as_raw();
+
+        let normalizer = self.normalizer();
+
+        // Tiles are emitted row-major, each as a contiguous `[3, t, t]` block.
+        // The image occupies the top-left `fit_h x fit_w` of the canvas and the
+        // rest is padding — zero *before* the normalisation, so it comes out at
+        // `padding_value`, not at zero.
+        let tile = tile as usize;
+        for tile_row in 0..tiles_h {
+            for tile_col in 0..tiles_w {
+                for ch in 0..3 {
+                    let pad = normalizer.padding_value(ch);
+                    for r in 0..tile {
+                        let y = tile_row * tile + r;
+                        for c in 0..tile {
+                            let x = tile_col * tile + c;
+                            out.push(if y < fit_h as usize && x < fit_w as usize {
+                                normalizer.apply(raw[(y * fit_w as usize + x) * 3 + ch], ch)
+                            } else {
+                                pad
+                            });
+                        }
+                    }
+                }
+            }
+        }
+        Ok((tiles_h, tiles_w))
+    }
+
+    /// Preprocess a batch of samples, each carrying one or more images.
+    ///
+    /// Samples may hold different numbers of images and images may tile
+    /// differently; everything is padded up to the widest sample and to
+    /// `max_image_tiles`.
+    pub fn preprocess(&self, samples: &[Vec<DynamicImage>]) -> Result<MllamaImageBatch, Exception> {
+        if samples.is_empty() || samples.iter().all(|s| s.is_empty()) {
+            return Err(Exception::custom("Empty image batch"));
+        }
+        let batch = samples.len();
+        let max_images = samples.iter().map(|s| s.len()).max().unwrap_or(0);
+        let max_tiles = self.config.max_image_tiles;
+        let tile = self.config.tile_size as usize;
+        let tile_len = 3 * tile * tile;
+
+        let mut pixels = vec![0f32; batch * max_images * max_tiles * tile_len];
+        let mut ids = vec![0i32; batch * max_images];
+        let mut mask = vec![0i32; batch * max_images * max_tiles];
+        let mut num_tiles = Vec::with_capacity(batch);
+
+        // Scratch reused per image so a 4-tile 560px image doesn't reallocate.
+        let mut scratch = Vec::with_capacity(max_tiles * tile_len);
+
+        for (sample_idx, sample) in samples.iter().enumerate() {
+            let mut sample_tiles = Vec::with_capacity(sample.len());
+            for (image_idx, img) in sample.iter().enumerate() {
+                scratch.clear();
+                let (tiles_h, tiles_w) = self.append_tiles(img, &mut scratch)?;
+                let count = tiles_h * tiles_w;
+
+                let base = ((sample_idx * max_images) + image_idx) * max_tiles * tile_len;
+                pixels[base..base + scratch.len()].copy_from_slice(&scratch);
+
+                let ratio_index = self
+                    .ratios
+                    .iter()
+                    .position(|&r| r == (tiles_h, tiles_w))
+                    .ok_or_else(|| {
+                        Exception::custom(format!(
+                            "tiling {tiles_h}x{tiles_w} is not a supported arrangement for \
+                             max_image_tiles {max_tiles}"
+                        ))
+                    })?;
+                ids[sample_idx * max_images + image_idx] = ratio_index as i32 + 1;
+
+                // The reference marks tile 0 valid for *every* slot, including
+                // padded ones, then fills in each image's real tiles.
+                let mask_base = ((sample_idx * max_images) + image_idx) * max_tiles;
+                for slot in 0..count {
+                    mask[mask_base + slot] = 1;
+                }
+                sample_tiles.push(count);
+            }
+            for image_idx in 0..max_images {
+                mask[((sample_idx * max_images) + image_idx) * max_tiles] = 1;
+            }
+            num_tiles.push(sample_tiles);
+        }
+
+        let tile_i32 = tile as i32;
+        Ok(MllamaImageBatch {
+            pixel_values: Array::from_f32_slice(
+                &pixels,
+                &[
+                    batch as i32,
+                    max_images as i32,
+                    max_tiles as i32,
+                    3,
+                    tile_i32,
+                    tile_i32,
+                ],
+            ),
+            aspect_ratio_ids: Array::from_i32_slice_shaped(
+                &ids,
+                &[batch as i32, max_images as i32],
+            ),
+            aspect_ratio_mask: Array::from_i32_slice_shaped(
+                &mask,
+                &[batch as i32, max_images as i32, max_tiles as i32],
+            ),
+            num_tiles,
+        })
+    }
+
+    /// Preprocess a single image as a one-sample, one-image batch.
+    pub fn preprocess_one(&self, img: &DynamicImage) -> Result<MllamaImageBatch, Exception> {
+        self.preprocess(std::slice::from_ref(&vec![img.clone()]))
+    }
+}
+
 /// Soft-token budgets Gemma 4 was trained with. Anything else is rejected, as
 /// in the reference `Gemma4ImageProcessor`.
 pub const GEMMA4_SOFT_TOKEN_BUDGETS: [usize; 5] = [70, 140, 280, 560, 1120];
@@ -439,32 +835,20 @@ impl Gemma4ImageProcessor {
         Ok((target_h as u32, target_w as u32))
     }
 
-    /// Per-channel `(scale, shift)` folding rescale and normalise into one
-    /// affine pass, evaluated in f64: `out = raw · scale + shift`.
+    /// The reference's rescale/normalise chain for this config.
     ///
-    /// Mirrors the reference `rescale_and_normalize`, which folds
-    /// `rescale_factor` into mean/std when both steps are on and otherwise
-    /// applies whichever single step is enabled. For Gemma 4's shipped config
-    /// (rescale only, identity mean/std) the f64 evaluation reproduces the
-    /// reference's `astype(float64) · scale → float32` bit-for-bit. With
-    /// `do_normalize` on the fold skips an intermediate f32 rounding the
-    /// reference performs between the two steps — sub-ULP, and no released
-    /// Gemma 4 checkpoint enables it.
-    fn channel_affine(&self) -> [(f64, f64); 3] {
-        let scale = if self.config.do_rescale {
-            self.config.rescale_factor
-        } else {
-            1.0
-        };
-        if !self.config.do_normalize {
-            return [(scale, 0.0); 3];
-        }
-        let mut affine = [(scale, 0.0); 3];
-        for (ch, slot) in affine.iter_mut().enumerate() {
-            let std = self.config.image_std[ch] as f64;
-            *slot = (scale / std, -(self.config.image_mean[ch] as f64) / std);
-        }
-        affine
+    /// Gemma 4 ships `do_normalize = false` with `rescale_factor = 1/255`, so in
+    /// practice this is a plain `[0, 255] -> [0, 1]` — but it goes through the
+    /// shared [`PixelNormalizer`] so the f64 rescale and f32 divide match the
+    /// reference exactly either way.
+    fn normalizer(&self) -> PixelNormalizer {
+        PixelNormalizer::new(
+            self.config.do_rescale,
+            self.config.rescale_factor,
+            self.config.do_normalize,
+            self.config.image_mean,
+            self.config.image_std,
+        )
     }
 
     /// Resize, rescale, patchify and pad one image, appending to the batch
@@ -514,7 +898,7 @@ impl Gemma4ImageProcessor {
             )));
         }
 
-        let affine = self.channel_affine();
+        let normalizer = self.normalizer();
         let raw = resized.as_raw();
         let stride = target_w as usize * 3;
         for patch_row in 0..rows {
@@ -525,8 +909,8 @@ impl Gemma4ImageProcessor {
                     let row_base = (patch_row * patch + r) * stride + patch_col * patch * 3;
                     for c in 0..patch {
                         let px = row_base + c * 3;
-                        for (ch, &(scale, shift)) in affine.iter().enumerate() {
-                            pixels.push((raw[px + ch] as f64 * scale + shift) as f32);
+                        for ch in 0..3 {
+                            pixels.push(normalizer.apply(raw[px + ch], ch));
                         }
                     }
                 }
@@ -794,27 +1178,33 @@ mod tests {
         assert!(processor.preprocess(&[unpooled]).is_err());
     }
 
+    /// The rescale/normalise chain must be staged exactly as the reference
+    /// stages it: f64 rescale, narrow to f32, *then* `(x - mean) / std` in f32.
+    /// Folding it into one affine is a ULP off, which is the whole distance
+    /// between an atol-0 parity assertion and one carrying slack.
     #[test]
-    fn gemma4_channel_affine_folds_rescale_and_normalize() {
-        let config = Gemma4ImageProcessorConfig {
-            do_normalize: true,
-            image_mean: [0.1, 0.2, 0.3],
-            image_std: [0.5, 0.25, 0.125],
-            ..Default::default()
-        };
-        let processor = gemma4_processor(config);
-        let affine = processor.channel_affine();
-        for (ch, &(scale, shift)) in affine.iter().enumerate() {
-            let (mean, std) = (
-                processor.config.image_mean[ch] as f64,
-                processor.config.image_std[ch] as f64,
-            );
-            // The reference applies `(raw / 255 − mean) / std`.
-            let expected = (200.0 / 255.0 - mean) / std;
-            assert!((200.0 * scale + shift - expected).abs() < 1e-9);
+    fn pixel_normalizer_matches_reference_staging() {
+        let mean = [0.1f32, 0.2, 0.3];
+        let std = [0.5f32, 0.25, 0.125];
+        let normalizer = PixelNormalizer::new(true, 1.0 / 255.0, true, mean, std);
+        for raw in [0u8, 1, 37, 128, 200, 254, 255] {
+            for ch in 0..3 {
+                let staged = ((raw as f64 * (1.0 / 255.0)) as f32 - mean[ch]) / std[ch];
+                assert_eq!(normalizer.apply(raw, ch), staged, "raw {raw} ch {ch}");
+            }
         }
+        // Padding enters as a zero *pixel*, so it inherits the normalisation.
+        for ch in 0..3 {
+            assert_eq!(normalizer.padding_value(ch), -mean[ch] / std[ch]);
+        }
+
         // Gemma 4's shipped config: rescale only, identity mean/std.
-        let plain = gemma4_processor(Gemma4ImageProcessorConfig::default());
-        assert_eq!(plain.channel_affine(), [(1.0f64 / 255.0, 0.0); 3]);
+        let plain = PixelNormalizer::new(true, 1.0 / 255.0, false, [0.0; 3], [1.0; 3]);
+        assert_eq!(plain.apply(200, 0), (200.0f64 / 255.0) as f32);
+        assert_eq!(plain.padding_value(2), 0.0);
+
+        // Neither step: a straight widening.
+        let raw_only = PixelNormalizer::new(false, 1.0 / 255.0, false, [0.0; 3], [1.0; 3]);
+        assert_eq!(raw_only.apply(200, 1), 200.0);
     }
 }

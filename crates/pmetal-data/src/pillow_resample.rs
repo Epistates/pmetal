@@ -41,13 +41,54 @@ const PRECISION_BITS: u32 = 32 - 8 - 2;
 const ROUND_BIAS: i64 = 1 << (PRECISION_BITS - 1);
 
 /// Resampling filters, defined exactly as Pillow defines them.
+///
+/// Deserializes from the *integer* `PIL.Image.Resampling` code, because that is
+/// what a checkpoint's `preprocessor_config.json` stores in its `resample`
+/// field — `2` for bilinear, `3` for bicubic.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ResampleFilter {
-    /// Triangle / linear interpolation. `PIL.Image.BILINEAR`.
+    /// Triangle / linear interpolation. `PIL.Image.BILINEAR`, code `2`.
     Bilinear,
     /// Cubic convolution with `a = -0.5` — the Catmull-Rom spline.
-    /// `PIL.Image.BICUBIC`, and what every Gemma / SigLIP / CLIP processor uses.
+    /// `PIL.Image.BICUBIC`, code `3`, and what every Gemma / SigLIP / CLIP
+    /// processor uses.
     Bicubic,
+}
+
+impl ResampleFilter {
+    /// Map a `PIL.Image.Resampling` code to a filter.
+    ///
+    /// Only the two filters real VLM processors use are accepted; `0` (nearest),
+    /// `1` (lanczos), `4` (box) and `5` (hamming) are rejected rather than
+    /// silently approximated, since substituting a filter would shift every
+    /// pixel the model sees.
+    pub fn from_pil_code(code: u64) -> Option<Self> {
+        match code {
+            2 => Some(Self::Bilinear),
+            3 => Some(Self::Bicubic),
+            _ => None,
+        }
+    }
+
+    /// The `PIL.Image.Resampling` code for this filter.
+    pub fn pil_code(self) -> u64 {
+        match self {
+            Self::Bilinear => 2,
+            Self::Bicubic => 3,
+        }
+    }
+}
+
+impl<'de> serde::Deserialize<'de> for ResampleFilter {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let code = u64::deserialize(deserializer)?;
+        Self::from_pil_code(code).ok_or_else(|| {
+            serde::de::Error::custom(format!(
+                "unsupported PIL resample code {code}; pmetal implements 2 (bilinear) and \
+                 3 (bicubic)"
+            ))
+        })
+    }
 }
 
 impl ResampleFilter {
