@@ -9,19 +9,19 @@
 //! pixels and the processor's output, so no image codec sits between the two
 //! implementations.
 //!
-//! **The split matters.** Only the resize is inexact, and it is inexact for a
-//! reason no tolerance tweak will fix: Pillow clips bicubic overshoot between
-//! its two resampling passes, the `image` crate does not, so the two part
-//! company at hard edges. Everything downstream — rescale, the
-//! `(row, col, channel)` patch flattening, the `(x, y)` position ids, and the
-//! zero/`-1` padding to the patch budget — is exact integer bookkeeping, and a
-//! bug there would silently feed the tower transposed or misaligned patches
-//! without ever tripping a loose pixel tolerance.
+//! **Everything is compared at atol 0**, resized cases included. That is
+//! possible because `pmetal_data::pillow_resample` reproduces Pillow's
+//! fixed-point resampling exactly rather than approximating it (see
+//! `pillow_resample_parity.rs`, which pins the resampler itself over a much
+//! wider grid of scale ratios). So there is no tolerance here to loosen: a
+//! single differing value is a real divergence, not float drift.
 //!
-//! Case 0 is therefore sized so the aspect-ratio-preserving resize is a no-op,
-//! pinning that bookkeeping at **atol 0**. Cases 1-3 add downscale, upscale, and
-//! the degenerate-axis fallback under the resampler tolerance. Position ids are
-//! compared exactly in every case.
+//! Case 0 is still sized so the aspect-ratio-preserving resize is a no-op. It
+//! is no longer load-bearing for exactness, but it keeps the two halves
+//! separable — a regression in the patch bookkeeping (the
+//! `(row, col, channel)` flattening, the `(x, y)` position ids, the zero/`-1`
+//! padding) shows up there with the resampler provably out of the picture.
+//! Cases 1-3 add downscale, upscale, and the degenerate-axis fallback.
 
 mod common;
 
@@ -35,17 +35,9 @@ use pmetal_mlx::test_utils::{ParityReport, Tolerance, print_report_table, to_f32
 
 const FIXTURE: &str = "gemma4_image_reference.safetensors";
 
-/// Exact match — for the checkpoints that are integer bookkeeping, not
-/// arithmetic.
+/// Exact match. The whole pipeline is integer bookkeeping over a bit-exact
+/// resampler, so nothing here is entitled to a tolerance.
 const EXACT: Tolerance = Tolerance::new(0.0, 0.0);
-
-/// Resized-pixel tolerance. Observed max is `5.49e-2` = 14/255, all of it in
-/// the resize: Pillow clips bicubic overshoot between its two passes and the
-/// `image` crate does not, so the gap lives at hard edges (mean diff is
-/// `0.17/255`). `fast_image_resize` measured no closer, so this is not slack
-/// waiting to be tightened by a better library — closing it would take a
-/// Pillow-exact resampler. Set from the observed diff with ~1.5× headroom.
-const RESAMPLED: Tolerance = Tolerance::new(8e-2, 8e-2);
 
 /// Mirrors `PROC_ARGS` in `.strategy/parity/dump_gemma4_image_reference.py`.
 /// The tiny patch size keeps the fixture at ~600 KB while leaving every branch
@@ -69,7 +61,8 @@ struct Case {
     target: (u32, u32),
     /// Expected unpadded soft-token count.
     soft_tokens: usize,
-    /// Tolerance for `pixel_values` — [`EXACT`] when the resize is a no-op.
+    /// Tolerance for `pixel_values`. [`EXACT`] throughout — kept as a field so a
+    /// case that genuinely needs slack has somewhere to declare it.
     pixel_tol: Tolerance,
     /// What this case covers, for the report table.
     covers: &'static str,
@@ -82,14 +75,14 @@ const CASES: [Case; 4] = [
         target: (72, 120),
         soft_tokens: 60,
         pixel_tol: EXACT,
-        covers: "resize no-op (exact) + padding",
+        covers: "resize no-op + padding",
     },
     Case {
         index: 1,
         input: (100, 150),
         target: (72, 120),
         soft_tokens: 60,
-        pixel_tol: RESAMPLED,
+        pixel_tol: EXACT,
         covers: "downscale",
     },
     Case {
@@ -97,7 +90,7 @@ const CASES: [Case; 4] = [
         input: (20, 30),
         target: (72, 120),
         soft_tokens: 60,
-        pixel_tol: RESAMPLED,
+        pixel_tol: EXACT,
         covers: "upscale",
     },
     Case {
@@ -105,7 +98,7 @@ const CASES: [Case; 4] = [
         input: (8, 1200),
         target: (12, 840),
         soft_tokens: 70,
-        pixel_tol: RESAMPLED,
+        pixel_tol: EXACT,
         covers: "degenerate axis + max-side clamp, full budget",
     },
 ];

@@ -10,10 +10,12 @@
 //!   `[B, max_patches, 3·patch²]`, and emits the `(x, y)` patch coordinates the
 //!   vision tower's 2-D position table and pooler are indexed by.
 
-use image::{DynamicImage, RgbImage, imageops::FilterType};
+use image::{DynamicImage, RgbImage};
 use pmetal_bridge::compat::{Array, Exception};
 use serde::Deserialize;
 use std::path::Path;
+
+use crate::pillow_resample::{self, ResampleFilter};
 
 /// Configuration for Mllama image processing.
 #[derive(Debug, Clone)]
@@ -26,6 +28,9 @@ pub struct MllamaImageProcessorConfig {
     pub std: [f32; 3],
     /// Rescaling factor (e.g., 1/255.0).
     pub rescale_factor: f32,
+    /// Resampling filter, corresponding to `preprocessor_config.json`'s
+    /// `resample`. Llama 3.2 Vision ships `2` = bilinear.
+    pub resample: ResampleFilter,
 }
 
 impl Default for MllamaImageProcessorConfig {
@@ -38,6 +43,7 @@ impl Default for MllamaImageProcessorConfig {
             #[allow(clippy::excessive_precision)]
             std: [0.26862954, 0.26130258, 0.27577711],
             rescale_factor: 1.0 / 255.0,
+            resample: ResampleFilter::Bilinear,
         }
     }
 }
@@ -95,10 +101,14 @@ impl MllamaImageProcessor {
     ///
     /// Returns: Array of shape [1, 3, H, W]
     pub fn process_image(&self, img: DynamicImage) -> Result<Array, Exception> {
-        // 1. Resize with bilinear interpolation
-        let resized =
-            img.resize_exact(self.config.size.0, self.config.size.1, FilterType::Triangle);
-        let rgb = resized.to_rgb8();
+        // 1. Convert to RGB, then resize — the reference order (`do_convert_rgb`
+        // runs before the resize), and the resampler is Pillow-exact.
+        let rgb = pillow_resample::resize_rgb8(
+            &img.to_rgb8(),
+            self.config.size.0,
+            self.config.size.1,
+            self.config.resample,
+        );
 
         let width = rgb.width() as usize;
         let height = rgb.height() as usize;
@@ -144,10 +154,13 @@ impl MllamaImageProcessor {
             Exception::custom("GPU arrays not initialized. Call init_gpu_arrays() first.")
         })?;
 
-        // 1. Resize
-        let resized =
-            img.resize_exact(self.config.size.0, self.config.size.1, FilterType::Triangle);
-        let rgb = resized.to_rgb8();
+        // 1. Convert to RGB, then resize (see `process_image`).
+        let rgb = pillow_resample::resize_rgb8(
+            &img.to_rgb8(),
+            self.config.size.0,
+            self.config.size.1,
+            self.config.resample,
+        );
 
         let width = rgb.width() as usize;
         let height = rgb.height() as usize;
@@ -224,10 +237,13 @@ impl SiglipImageProcessor {
         Self {
             config: MllamaImageProcessorConfig {
                 size,
-                // SigLIP uses different normalization
+                // SigLIP normalises with `IMAGENET_STANDARD_MEAN/STD`, not
+                // CLIP's stats, and resamples bicubic (`"resample": 3`) where
+                // Llama 3.2 Vision uses bilinear.
                 mean: [0.5, 0.5, 0.5],
                 std: [0.5, 0.5, 0.5],
                 rescale_factor: 1.0 / 255.0,
+                resample: ResampleFilter::Bicubic,
             },
         }
     }
@@ -320,24 +336,16 @@ pub struct Gemma4ImageBatch {
 /// which is why the tower needs explicit `(x, y)` coordinates instead of
 /// inferring them from a known grid shape.
 ///
-/// **Resampler caveat — the one inexact step.** The reference resamples through
-/// Pillow (transformers' torchvision backend tracks it to within `1/255`,
-/// because PyTorch's antialiased path reimplements Pillow's filters). We use
-/// `image`'s `CatmullRom`, which is the same cubic kernel (`a = -0.5`, the
-/// `B = 0, C = 0.5` spline), the same half-pixel alignment, and the same
-/// downscale support scaling — but it samples vertical-before-horizontal
-/// through an *unclamped* f32 intermediate where Pillow goes horizontal-first
-/// and clips to `[0, 255]` between passes. Bicubic overshoot at a hard edge
-/// therefore survives pmetal's first pass and is clipped in Pillow's, which is
-/// where the two diverge: **up to 14/255 on a synthetic hard-edge pattern,
-/// mean 0.17/255**. `fast_image_resize` was measured against the same fixture
-/// and is no closer (15/255, mean 0.28), so this is the state of the art for an
-/// off-the-shelf Rust resampler rather than a poor choice of one.
+/// **Bit-exact against the reference, resize included.** The resize goes through
+/// [`crate::pillow_resample`], which reproduces Pillow's fixed-point resampling
+/// rather than approximating it — off-the-shelf Rust resamplers (`image`'s
+/// `CatmullRom`, `fast_image_resize`) get the kernel right but clamp bicubic
+/// overshoot in the wrong place and land 14-15/255 off at hard edges. Rescale is
+/// evaluated in f64 for the same reason the reference does. Patchify, position
+/// ids and padding are integer bookkeeping.
 ///
-/// Everything downstream of the resize — rescale, patchify, position ids,
-/// padding — is exact. `crates/pmetal-data/tests/gemma4_image_parity.rs` pins
-/// the two halves separately: **atol 0** on an image the resize passes through
-/// untouched, measured tolerance on the resampled ones.
+/// So `crates/pmetal-data/tests/gemma4_image_parity.rs` asserts **atol 0** on
+/// every checkpoint of every case, and there is no tolerance in it to loosen.
 #[derive(Debug, Clone)]
 pub struct Gemma4ImageProcessor {
     config: Gemma4ImageProcessorConfig,
@@ -470,7 +478,7 @@ impl Gemma4ImageProcessor {
         let resized: RgbImage = if (target_h, target_w) == (height, width) {
             rgb
         } else {
-            image::imageops::resize(&rgb, target_w, target_h, FilterType::CatmullRom)
+            pillow_resample::resize_rgb8(&rgb, target_w, target_h, ResampleFilter::Bicubic)
         };
 
         let patch = self.config.patch_size;
@@ -597,10 +605,15 @@ mod tests {
         // SigLIP uses 0.5 mean/std
         assert_eq!(processor.config.mean, [0.5, 0.5, 0.5]);
         assert_eq!(processor.config.std, [0.5, 0.5, 0.5]);
+        // ...and bicubic resampling, where Llama 3.2 Vision ships bilinear.
+        assert_eq!(processor.config.resample, ResampleFilter::Bicubic);
+        assert_eq!(
+            MllamaImageProcessorConfig::default().resample,
+            ResampleFilter::Bilinear
+        );
     }
 
     #[test]
-    #[ignore = "requires a functional MLX array backend"]
     fn test_synthetic_image_processing() {
         let config = MllamaImageProcessorConfig {
             size: (4, 4), // Small for testing

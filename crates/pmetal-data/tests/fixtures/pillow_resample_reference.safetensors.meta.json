@@ -1,0 +1,294 @@
+{
+  "cases": [
+    {
+      "filter": "bilinear",
+      "key": "out_0_bilinear_24x32",
+      "src": 0,
+      "src_size": [
+        48,
+        64
+      ],
+      "target_size": [
+        24,
+        32
+      ]
+    },
+    {
+      "filter": "bicubic",
+      "key": "out_0_bicubic_24x32",
+      "src": 0,
+      "src_size": [
+        48,
+        64
+      ],
+      "target_size": [
+        24,
+        32
+      ]
+    },
+    {
+      "filter": "bilinear",
+      "key": "out_0_bilinear_96x128",
+      "src": 0,
+      "src_size": [
+        48,
+        64
+      ],
+      "target_size": [
+        96,
+        128
+      ]
+    },
+    {
+      "filter": "bicubic",
+      "key": "out_0_bicubic_96x128",
+      "src": 0,
+      "src_size": [
+        48,
+        64
+      ],
+      "target_size": [
+        96,
+        128
+      ]
+    },
+    {
+      "filter": "bilinear",
+      "key": "out_0_bilinear_17x53",
+      "src": 0,
+      "src_size": [
+        48,
+        64
+      ],
+      "target_size": [
+        17,
+        53
+      ]
+    },
+    {
+      "filter": "bicubic",
+      "key": "out_0_bicubic_17x53",
+      "src": 0,
+      "src_size": [
+        48,
+        64
+      ],
+      "target_size": [
+        17,
+        53
+      ]
+    },
+    {
+      "filter": "bilinear",
+      "key": "out_0_bilinear_48x21",
+      "src": 0,
+      "src_size": [
+        48,
+        64
+      ],
+      "target_size": [
+        48,
+        21
+      ]
+    },
+    {
+      "filter": "bicubic",
+      "key": "out_0_bicubic_48x21",
+      "src": 0,
+      "src_size": [
+        48,
+        64
+      ],
+      "target_size": [
+        48,
+        21
+      ]
+    },
+    {
+      "filter": "bilinear",
+      "key": "out_0_bilinear_9x64",
+      "src": 0,
+      "src_size": [
+        48,
+        64
+      ],
+      "target_size": [
+        9,
+        64
+      ]
+    },
+    {
+      "filter": "bicubic",
+      "key": "out_0_bicubic_9x64",
+      "src": 0,
+      "src_size": [
+        48,
+        64
+      ],
+      "target_size": [
+        9,
+        64
+      ]
+    },
+    {
+      "filter": "bilinear",
+      "key": "out_1_bilinear_13x5",
+      "src": 1,
+      "src_size": [
+        91,
+        37
+      ],
+      "target_size": [
+        13,
+        5
+      ]
+    },
+    {
+      "filter": "bicubic",
+      "key": "out_1_bicubic_13x5",
+      "src": 1,
+      "src_size": [
+        91,
+        37
+      ],
+      "target_size": [
+        13,
+        5
+      ]
+    },
+    {
+      "filter": "bilinear",
+      "key": "out_1_bilinear_128x51",
+      "src": 1,
+      "src_size": [
+        91,
+        37
+      ],
+      "target_size": [
+        128,
+        51
+      ]
+    },
+    {
+      "filter": "bicubic",
+      "key": "out_1_bicubic_128x51",
+      "src": 1,
+      "src_size": [
+        91,
+        37
+      ],
+      "target_size": [
+        128,
+        51
+      ]
+    },
+    {
+      "filter": "bilinear",
+      "key": "out_1_bilinear_91x200",
+      "src": 1,
+      "src_size": [
+        91,
+        37
+      ],
+      "target_size": [
+        91,
+        200
+      ]
+    },
+    {
+      "filter": "bicubic",
+      "key": "out_1_bicubic_91x200",
+      "src": 1,
+      "src_size": [
+        91,
+        37
+      ],
+      "target_size": [
+        91,
+        200
+      ]
+    },
+    {
+      "filter": "bilinear",
+      "key": "out_1_bilinear_7x111",
+      "src": 1,
+      "src_size": [
+        91,
+        37
+      ],
+      "target_size": [
+        7,
+        111
+      ]
+    },
+    {
+      "filter": "bicubic",
+      "key": "out_1_bicubic_7x111",
+      "src": 1,
+      "src_size": [
+        91,
+        37
+      ],
+      "target_size": [
+        7,
+        111
+      ]
+    },
+    {
+      "filter": "bilinear",
+      "key": "out_2_bilinear_12x840",
+      "src": 2,
+      "src_size": [
+        8,
+        200
+      ],
+      "target_size": [
+        12,
+        840
+      ]
+    },
+    {
+      "filter": "bicubic",
+      "key": "out_2_bicubic_12x840",
+      "src": 2,
+      "src_size": [
+        8,
+        200
+      ],
+      "target_size": [
+        12,
+        840
+      ]
+    },
+    {
+      "filter": "bilinear",
+      "key": "out_2_bilinear_4x9",
+      "src": 2,
+      "src_size": [
+        8,
+        200
+      ],
+      "target_size": [
+        4,
+        9
+      ]
+    },
+    {
+      "filter": "bicubic",
+      "key": "out_2_bicubic_4x9",
+      "src": 2,
+      "src_size": [
+        8,
+        200
+      ],
+      "target_size": [
+        4,
+        9
+      ]
+    }
+  ],
+  "oracle": "pillow",
+  "pillow_version": "12.3.0",
+  "torch_version": "2.13.0",
+  "transformers_version": "5.10.0.dev0"
+}
