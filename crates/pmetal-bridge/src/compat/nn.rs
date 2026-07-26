@@ -53,6 +53,25 @@ pub fn gelu_tanh_approximate(a: &Array) -> Array {
     let t = ops::tanh(&scaled);
     half.multiply(a).multiply(&one.add(&t))
 }
+/// **Exact** GELU — the erf definition, and the one HuggingFace's
+/// `ACT2FN["gelu"]` (`GELUActivation`) computes:
+///
+/// ```text
+///     0.5 * x * (1 + erf(x / √2))
+/// ```
+///
+/// Use this whenever a reference config says `hidden_act: "gelu"`. Neither
+/// [`gelu`] (sigmoid fast-approx, ~1e-2 off) nor [`gelu_tanh_approximate`]
+/// (~1e-3 off) is a parity-grade substitute; those correspond to
+/// `"gelu_pytorch_tanh"` / `"quick_gelu"`-style activations, which real configs
+/// name explicitly.
+pub fn gelu_erf(a: &Array) -> Array {
+    let half = Array::from_f32(0.5);
+    let one = Array::from_f32(1.0);
+    let inv_sqrt2 = Array::from_f32(std::f32::consts::FRAC_1_SQRT_2);
+    half.multiply(a)
+        .multiply(&one.add(&a.multiply(&inv_sqrt2).erf()))
+}
 pub fn silu(a: &Array) -> Array {
     a.silu()
 }
@@ -243,5 +262,74 @@ where
         let grads: FlattenedModuleParam = keys.into_iter().zip(grad_arrays).collect();
 
         Ok((vec![loss_val], grads))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `0.5·x·(1 + erf(x/√2))` at f64 precision, from
+    /// `0.5*x*(1+math.erf(x/math.sqrt(2)))`.
+    const GELU_ERF_TABLE: [(f32, f32); 10] = [
+        (-4.0, -0.000_126_685),
+        (-2.0, -0.045_500_264),
+        (-1.0, -0.158_655_254),
+        (-0.5, -0.154_268_769),
+        (0.0, 0.0),
+        (0.5, 0.345_731_231),
+        (1.0, 0.841_344_746),
+        (2.0, 1.954_499_736),
+        (4.0, 3.999_873_315),
+        (7.0, 7.0),
+    ];
+
+    #[test]
+    fn gelu_erf_matches_the_exact_definition() {
+        let xs: Vec<f32> = GELU_ERF_TABLE.iter().map(|&(x, _)| x).collect();
+        let n = xs.len();
+        let mut got = gelu_erf(&Array::from_f32_slice(&xs, &[n as i32]));
+        got.eval();
+        let got = got.to_f32_vec(n).expect("to_f32_vec");
+
+        for (i, &(x, want)) in GELU_ERF_TABLE.iter().enumerate() {
+            assert!(
+                (got[i] - want).abs() < 1e-6,
+                "gelu_erf({x}) = {}, want {want}",
+                got[i]
+            );
+        }
+    }
+
+    /// The reason [`gelu_erf`] exists: the two approximations are *not*
+    /// interchangeable with it at parity tolerances. `gelu` (sigmoid) is ~1.9e-2
+    /// off at x = -2 and `gelu_tanh_approximate` ~1.5e-4 off at x = -1 — both
+    /// orders of magnitude above the 1e-5 band a forward-pass parity test runs
+    /// at. If this ever starts failing, the bridge's `gelu` changed meaning and
+    /// every `hidden_act` mapping needs re-checking.
+    #[test]
+    fn the_gelu_approximations_are_not_parity_substitutes() {
+        let xs: Vec<f32> = GELU_ERF_TABLE.iter().map(|&(x, _)| x).collect();
+        let n = xs.len();
+        let x = Array::from_f32_slice(&xs, &[n as i32]);
+
+        for (name, mut approx, min_gap) in [
+            ("gelu (sigmoid)", gelu(&x), 1e-2_f32),
+            ("gelu_tanh_approximate", gelu_tanh_approximate(&x), 1e-4),
+        ] {
+            approx.eval();
+            let approx = approx.to_f32_vec(n).expect("to_f32_vec");
+            let worst = GELU_ERF_TABLE
+                .iter()
+                .zip(&approx)
+                .map(|(&(_, want), &got)| (got - want).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                worst > min_gap,
+                "{name} is within {worst:.3e} of exact gelu — closer than the \
+                 documented {min_gap:.0e}; the doc comments on these functions \
+                 are now misleading"
+            );
+        }
     }
 }

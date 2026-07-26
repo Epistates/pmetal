@@ -49,6 +49,7 @@ impl InlineArray {
     unop!(square, mlx_inline_square);
     unop!(relu, mlx_inline_relu);
     unop!(gelu, mlx_inline_gelu);
+    unop!(erf, mlx_inline_erf);
     unop!(stop_gradient, mlx_inline_stop_gradient);
 
     // ── Softmax / norm / reshape / sum_axis ──────────────────────────────

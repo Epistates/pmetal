@@ -198,6 +198,14 @@ void mlx_inline_gelu(mlx_inline_array* dst, const mlx_inline_array* a) {
     });
 }
 
+// Gauss error function. The primitive behind *exact* GELU
+// (`0.5·x·(1 + erf(x/√2))`), which is what HuggingFace's `ACT2FN["gelu"]`
+// computes — see `compat::nn::gelu_erf`.
+void mlx_inline_erf(mlx_inline_array* dst, const mlx_inline_array* a) {
+    BRIDGE_TRY_DST("erf", dst,
+        new (dst->buf) array(mlx::core::erf(as_arr(a))));
+}
+
 // ── Training ops: comparison ─────────────────────────────────────────────────
 
 void mlx_inline_equal(mlx_inline_array* dst, const mlx_inline_array* a, const mlx_inline_array* b) {

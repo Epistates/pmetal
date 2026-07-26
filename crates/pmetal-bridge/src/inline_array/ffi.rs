@@ -1205,6 +1205,7 @@ unsafe extern "C" {
     // ── Training ops: activation ──
     pub(super) fn mlx_inline_relu(dst: *mut RawBuf, a: *const RawBuf);
     pub(super) fn mlx_inline_gelu(dst: *mut RawBuf, a: *const RawBuf);
+    pub(super) fn mlx_inline_erf(dst: *mut RawBuf, a: *const RawBuf);
 
     // ── Training ops: comparison ──
     pub(super) fn mlx_inline_equal(dst: *mut RawBuf, a: *const RawBuf, b: *const RawBuf);
