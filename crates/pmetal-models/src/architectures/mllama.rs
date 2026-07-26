@@ -1773,6 +1773,42 @@ mod tests {
         assert!(v.iter().all(|x| x.is_finite()), "vision output has NaN/inf");
     }
 
+    /// A ragged batch leaves whole image slots empty — the processor pads up to
+    /// the widest row — and such a slot's tile mask is *all* padding, so every
+    /// position in its attention mask is masked. That must not produce NaN.
+    ///
+    /// The reference survives it for the same reason we do: softmax subtracts
+    /// the row max first, so a uniformly-`-inf` row comes out uniform rather
+    /// than 0/0. Verified against `MllamaVisionModel` (the empty slot's features
+    /// are finite, just meaningless — the cross-attention mask discards them).
+    #[test]
+    #[serial]
+    fn an_empty_image_slot_does_not_poison_the_batch() {
+        let config = tiny_config();
+        let vc = &config.vision_config;
+        let mut tower = MllamaVisionModel::new(vc.clone()).unwrap();
+
+        // One batch row with two image slots; slot 1 has no image at all.
+        let pixels = random::normal(
+            &[1, 2, vc.max_num_tiles, 3, vc.image_size, vc.image_size],
+            Dtype::Float32,
+        );
+        let ids = Array::from_slice(&[2_i32, 0], &[1, 2]);
+        let mut mask_values = vec![0_i32; (2 * vc.max_num_tiles) as usize];
+        mask_values[0] = 1;
+        mask_values[1] = 1;
+        let mask = Array::from_slice(&mask_values, &[1, 2, vc.max_num_tiles]);
+
+        let mut out = tower.forward(&pixels, &ids, &mask).unwrap();
+        out.eval();
+        let n = out.size();
+        let v = out.to_f32_vec(n).unwrap();
+        assert!(
+            v.iter().all(|x| x.is_finite()),
+            "an all-padding image slot produced non-finite features"
+        );
+    }
+
     /// The tile-alignment padding is what makes the attention mask non-trivial;
     /// a `num_patches` that is already a multiple of 8 must not mask everything
     /// (the reference's `[-0:]` slice does exactly that).

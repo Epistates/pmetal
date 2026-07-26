@@ -1,0 +1,47 @@
+{
+  "aspect_ratio_id": 2,
+  "images": 1,
+  "note": "MllamaForConditionalGeneration synthetic parity fixture. All scalar gates set to 0.7 so the gated global transformer and cross-attention actually contribute. Tiles 2-3 are padding; the last text row sees no tile.",
+  "num_patches": 5,
+  "real_tiles": 2,
+  "seq": 4,
+  "text_config": {
+    "bos_token_id": 1,
+    "cross_attention_layers": [
+      1
+    ],
+    "eos_token_id": 2,
+    "hidden_size": 64,
+    "intermediate_size": 128,
+    "max_position_embeddings": 128,
+    "num_attention_heads": 4,
+    "num_hidden_layers": 3,
+    "num_key_value_heads": 2,
+    "pad_token_id": 0,
+    "rms_norm_eps": 1e-05,
+    "rope_parameters": {
+      "rope_theta": 10000.0,
+      "rope_type": "default"
+    },
+    "tie_word_embeddings": false,
+    "vocab_size": 64
+  },
+  "tiles": 4,
+  "vision_config": {
+    "attention_heads": 4,
+    "hidden_act": "gelu",
+    "hidden_size": 32,
+    "image_size": 28,
+    "intermediate_layers_indices": [
+      1
+    ],
+    "intermediate_size": 64,
+    "max_num_tiles": 4,
+    "norm_eps": 1e-05,
+    "num_channels": 3,
+    "num_global_layers": 1,
+    "num_hidden_layers": 2,
+    "patch_size": 14,
+    "vision_output_dim": 64
+  }
+}
