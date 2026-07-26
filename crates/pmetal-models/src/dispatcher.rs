@@ -62,6 +62,8 @@ pub enum ModelArchitecture {
     Bert,
     /// DiffusionGemma block-autoregressive discrete-diffusion encoder–decoder LM.
     DiffusionGemma,
+    /// Mllama (Llama 3.2 Vision) — tiled vision tower + cross-attending text decoder.
+    Mllama,
 }
 
 impl std::fmt::Display for ModelArchitecture {
@@ -86,6 +88,7 @@ impl std::fmt::Display for ModelArchitecture {
             Self::Flux => write!(f, "Flux"),
             Self::Bert => write!(f, "BERT"),
             Self::DiffusionGemma => write!(f, "DiffusionGemma"),
+            Self::Mllama => write!(f, "Llama 3.2 Vision (Mllama)"),
         }
     }
 }
@@ -95,6 +98,10 @@ impl ModelArchitecture {
         let lower = model_type.to_lowercase();
         match lower.as_str() {
             "llama4" | "llama4_text" => Some(Self::Llama4),
+            // Before the generic llama arms: Mllama's text sub-config is
+            // `mllama_text_model`, which must not fall through to plain Llama
+            // (it would drop every cross-attention layer).
+            "mllama" | "mllama_text_model" => Some(Self::Mllama),
             "llama" | "llama3" => Some(Self::Llama),
             "qwen3_moe" => Some(Self::Qwen3MoE),
             "gpt_oss" | "gptoss" | "gpt-oss" => Some(Self::GptOss),
@@ -128,6 +135,11 @@ impl ModelArchitecture {
     pub fn from_architectures(archs: &[String]) -> Option<Self> {
         for arch in archs {
             let lower = arch.to_lowercase();
+            // Before the llama checks: `MllamaForConditionalGeneration`
+            // contains "llama".
+            if lower.contains("mllama") {
+                return Some(Self::Mllama);
+            }
             if lower.contains("llama4") {
                 return Some(Self::Llama4);
             }
@@ -264,6 +276,7 @@ macro_rules! dispatch_uniform {
             Self::Flux(m) => m.$method($($arg),*),
             Self::Bert(m) => m.$method($($arg),*),
             Self::DiffusionGemma(m) => m.$method($($arg),*),
+            Self::Mllama(m) => m.$method($($arg),*),
         }
     };
 }
@@ -291,6 +304,7 @@ macro_rules! dispatch_architecture {
             Self::Flux(_) => ModelArchitecture::Flux,
             Self::Bert(_) => ModelArchitecture::Bert,
             Self::DiffusionGemma(_) => ModelArchitecture::DiffusionGemma,
+            Self::Mllama(_) => ModelArchitecture::Mllama,
         }
     };
 }
@@ -360,6 +374,7 @@ pub enum DynamicModel {
     Flux(FluxDiT),
     Bert(BertForEmbedding),
     DiffusionGemma(DiffusionGemmaForBlockDiffusion),
+    Mllama(MllamaForConditionalGeneration),
 }
 
 impl std::fmt::Debug for DynamicModel {
@@ -384,6 +399,7 @@ impl std::fmt::Debug for DynamicModel {
             Self::Flux(_) => write!(f, "DynamicModel::Flux"),
             Self::Bert(_) => write!(f, "DynamicModel::Bert"),
             Self::DiffusionGemma(_) => write!(f, "DynamicModel::DiffusionGemma"),
+            Self::Mllama(_) => write!(f, "DynamicModel::Mllama"),
         }
     }
 }
@@ -765,6 +781,31 @@ impl DynamicModel {
                 eval_module_parameters_batched(&model)?;
                 Ok(Self::DiffusionGemma(model))
             }
+            ModelArchitecture::Mllama => {
+                // Mllama's checkpoint layout needs a hand-written loader: the
+                // patch-embedding convolution has to be transposed to MLX's
+                // NHWC weight order, and the text decoder lives under a
+                // `language_model.model.` prefix that the generic loader can't
+                // express. `load_mllama_weights` also accepts the newer
+                // `model.{vision,language}_model.` layout.
+                let config: MllamaConfig = json5::from_str(&config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model = MllamaForConditionalGeneration::new(config)?;
+                let weights = crate::loader::load_weights(model_dir)
+                    .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                let report =
+                    crate::architectures::mllama::load_mllama_weights(&mut model, &weights)?;
+                if !report.skipped.is_empty() {
+                    tracing::info!(
+                        "Mllama weight load: {} loaded, {} skipped (first: {:?})",
+                        report.loaded,
+                        report.skipped.len(),
+                        report.skipped.first()
+                    );
+                }
+                eval_module_parameters_batched(&model)?;
+                Ok(Self::Mllama(model))
+            }
         }
     }
 
@@ -854,6 +895,11 @@ impl DynamicModel {
             Self::Qwen3Next(m) => m.forward(input_ids, mask),
             Self::GptOss(m) => m.forward(input_ids, mask, None),
             Self::Gemma4(m) => m.forward(input_ids, mask),
+            // Text-only: this signature carries no images, so the
+            // cross-attention layers are skipped exactly as the reference does
+            // for text-only inputs. Image conditioning goes through
+            // `as_mllama_mut()`.
+            Self::Mllama(m) => m.forward_with_cache(input_ids, mask, None),
             Self::Flux(_) => Err(Exception::custom(
                 "Flux is not a CausalLM and does not support standard forward(input_ids, mask)",
             )),
@@ -922,11 +968,13 @@ impl DynamicModel {
             // pre-LM-head representation to pool over (the decoder denoises a
             // canvas and has no single hidden-state-per-input-token output).
             Self::DiffusionGemma(m) => m.encode_hidden(input_ids),
+            // Text-only trunk, as for `forward`.
+            Self::Mllama(m) => m.forward_hidden(input_ids, mask),
             other => Err(Exception::custom(format!(
                 "forward_hidden not implemented for {:?} — supported archs: \
                  Llama, Llama4, Qwen2, Qwen3, Qwen3MoE, Mistral, Gemma, \
                  Gemma4, Phi, Phi4, DeepSeek, Cohere, Granite, GptOss, \
-                 NemotronH, Qwen3Next, BERT, DiffusionGemma",
+                 NemotronH, Qwen3Next, BERT, DiffusionGemma, Mllama",
                 other
             ))),
         }
@@ -953,6 +1001,11 @@ impl DynamicModel {
             Self::Phi4(m) => m.forward_with_cache(input_ids, mask, cache),
             Self::GptOss(m) => m.forward(input_ids, mask, cache),
             Self::Gemma4(m) => m.forward_with_cache(input_ids, mask, cache),
+            // Text-only cached decode. Image-conditioned decoding needs the
+            // vision features re-supplied every step, which this signature
+            // cannot express — use
+            // `as_mllama_mut().prepare_cross_attention(..)` + `forward_full`.
+            Self::Mllama(m) => m.forward_with_cache(input_ids, mask, cache),
             // Hybrid recurrent+attention models require both a KV cache and a
             // Mamba/GDN state cache. Use `forward_with_hybrid_cache` instead.
             Self::NemotronH(_) | Self::Qwen3Next(_) => Err(Exception::custom(
@@ -1011,6 +1064,7 @@ impl DynamicModel {
             // Generic linear-weight quantization; the fused 3-D expert tensors
             // (not `.weight`) stay in their loaded dtype, same as other MoE archs.
             Self::DiffusionGemma(m) => crate::fp8_utils::quantize_model_linears(m),
+            Self::Mllama(m) => crate::fp8_utils::quantize_model_linears(m),
         }
     }
 
@@ -1083,6 +1137,18 @@ impl DynamicModel {
             // DiffusionGemma manages its encoder KV internally inside generate();
             // there is no external standard causal cache.
             Self::DiffusionGemma(_) => KVCache::new(KVCacheConfig::new(0, 0, 0, 0)),
+            // Sized for the text decoder. Cross-attention layers hold no
+            // self-attention KV, so their slots are allocated and left unused —
+            // that keeps slot indices equal to layer indices.
+            Self::Mllama(m) => {
+                let tc = &m.config.text_config.llama;
+                KVCache::new(KVCacheConfig::new(
+                    tc.num_hidden_layers as usize,
+                    max_seq_len,
+                    tc.num_kv_heads() as usize,
+                    tc.get_head_dim() as usize,
+                ))
+            }
         }
     }
 
@@ -1249,6 +1315,17 @@ impl DynamicModel {
         }
     }
 
+    /// Access the underlying [`MllamaForConditionalGeneration`] for
+    /// image-conditioned decoding, which needs `pixel_values` /
+    /// `aspect_ratio_ids` / `aspect_ratio_mask` that the uniform `forward`
+    /// signature cannot carry.
+    pub fn as_mllama_mut(&mut self) -> Option<&mut MllamaForConditionalGeneration> {
+        match self {
+            Self::Mllama(m) => Some(m),
+            _ => None,
+        }
+    }
+
     pub fn vocab_size(&self) -> i32 {
         match self {
             Self::Llama(m) => m.model.config.vocab_size,
@@ -1270,6 +1347,7 @@ impl DynamicModel {
             Self::Flux(_) => 0,
             Self::Bert(m) => m.config().vocab_size as i32,
             Self::DiffusionGemma(m) => m.vocab_size,
+            Self::Mllama(m) => m.config.text_config.llama.vocab_size,
         }
     }
 
@@ -1294,6 +1372,7 @@ impl DynamicModel {
             Self::Flux(m) => m.pos_embedder.dim as i32,
             Self::Bert(m) => m.config().hidden_size as i32,
             Self::DiffusionGemma(m) => m.encoder.config.hidden_size,
+            Self::Mllama(m) => m.config.text_config.llama.hidden_size,
         }
     }
 
@@ -1318,6 +1397,7 @@ impl DynamicModel {
             Self::Flux(m) => eval_module_parameters_batched(m),
             Self::Bert(m) => eval_module_parameters_batched(m),
             Self::DiffusionGemma(m) => eval_module_parameters_batched(m),
+            Self::Mllama(m) => eval_module_parameters_batched(m),
         }
     }
 

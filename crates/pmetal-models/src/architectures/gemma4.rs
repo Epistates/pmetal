@@ -2304,11 +2304,10 @@ fn load_norm(
     }
 }
 
-#[derive(Debug, Default, Clone)]
-pub struct LoadReport {
-    pub loaded: usize,
-    pub skipped: Vec<String>,
-}
+/// Re-exported so the long-standing `use super::gemma4::LoadReport` in
+/// `gemma4_vision` / `diffusion_gemma` keeps working; the type is shared with
+/// every other hand-written loader.
+pub use crate::architectures::utils::LoadReport;
 
 #[cfg(test)]
 mod moe_tests {

@@ -45,6 +45,9 @@ use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
 use crate::architectures::llama::{LlamaAttention, LlamaConfig, LlamaMLP, RopeScalingValue};
+use crate::architectures::utils::{
+    LoadReport, load_layer_norm, load_linear, load_optional_param, load_param,
+};
 use crate::traits::ModelConfig;
 
 /// Mllama vision-tower configuration (`MllamaVisionConfig`).
@@ -1170,22 +1173,40 @@ impl MllamaTextModel {
         &mut self,
         input_ids: &Array,
         cross: Option<&CrossAttentionInputs>,
+        mask: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_cache(input_ids, cross, mask, None)
+    }
+
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        cross: Option<&CrossAttentionInputs>,
+        mask: Option<&Array>,
+        mut cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let mut hidden_states = self.embed_tokens.forward(input_ids);
 
-        let seq_len = input_ids.dim(1);
-        let mask = if seq_len > 1 {
-            Some(crate::architectures::utils::create_causal_mask(seq_len)?)
+        // Same convention as the other decoders here: build a causal mask only
+        // when the caller supplied neither a mask nor a cache.
+        let mask_owned;
+        let mask = if mask.is_none() && cache.is_none() {
+            mask_owned = crate::architectures::utils::create_causal_mask(input_ids.dim(1))?;
+            Some(&mask_owned)
         } else {
-            None
+            mask
         };
 
-        for layer in &mut self.layers {
+        for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
             // Text-only inputs skip the cross-attention layers outright.
             if layer.is_cross_attention() && cross.is_none() {
                 continue;
             }
-            hidden_states = layer.forward(&hidden_states, mask.as_ref(), cross, None)?;
+            // Cross-attention layers hold no self-attention KV, so they leave
+            // their cache slot untouched; indexing by the true layer id keeps
+            // the remaining slots aligned with the reference's.
+            let slot = cache.as_deref_mut().map(|c| (c, layer_idx));
+            hidden_states = layer.forward(&hidden_states, mask, cross, slot)?;
         }
 
         Ok(self.norm.forward(&hidden_states))
@@ -1257,11 +1278,53 @@ impl MllamaForConditionalGeneration {
         Ok(projected.reshape(&[-1, patches, self.config.text_config.llama.hidden_size]))
     }
 
-    /// * `vision` — image inputs; `None` runs text-only and skips every
-    ///   cross-attention layer.
+    /// Run the vision tower once and package everything the cross-attention
+    /// layers need.
+    ///
+    /// A generation loop should call this once and hand the result to every
+    /// [`Self::forward_full`] step: the vision features are fixed, so there is
+    /// nothing to cache across steps except the key/value projections of them
+    /// (which the reference does cache, and we currently recompute).
+    ///
     /// * `cross_attention_mask` — the processor's `[batch, seq, images, tiles]`
     ///   0/1 mask saying which text tokens may look at which tile. `None` lets
     ///   every token see every tile.
+    pub fn prepare_cross_attention(
+        &mut self,
+        vision: MllamaVisionInputs<'_>,
+        cross_attention_mask: Option<&Array>,
+    ) -> Result<CrossAttentionInputs, Exception> {
+        let states = self.encode_images(vision)?;
+        let (mask, full_text_row_mask) = match cross_attention_mask {
+            Some(m) => {
+                let (mask, rows) = prepare_cross_attention_mask(m, self.vision_model.num_patches());
+                (Some(mask), Some(rows))
+            }
+            None => (None, None),
+        };
+        Ok(CrossAttentionInputs {
+            states,
+            mask,
+            full_text_row_mask,
+        })
+    }
+
+    /// The full entry point. `cross` of `None` runs text-only and skips every
+    /// cross-attention layer, exactly as the reference does.
+    pub fn forward_full(
+        &mut self,
+        input_ids: &Array,
+        cross: Option<&CrossAttentionInputs>,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self
+            .language_model
+            .forward_with_cache(input_ids, cross, mask, cache)?;
+        Ok(self.lm_head.forward(&hidden_states))
+    }
+
+    /// Single-shot multimodal forward: encode the images, then run the decoder.
     pub fn forward(
         &mut self,
         input_ids: &Array,
@@ -1269,27 +1332,335 @@ impl MllamaForConditionalGeneration {
         cross_attention_mask: Option<&Array>,
     ) -> Result<Array, Exception> {
         let cross = match vision {
-            Some(vision) => {
-                let states = self.encode_images(vision)?;
-                let (mask, full_text_row_mask) = match cross_attention_mask {
-                    Some(m) => {
-                        let (mask, rows) =
-                            prepare_cross_attention_mask(m, self.vision_model.num_patches());
-                        (Some(mask), Some(rows))
-                    }
-                    None => (None, None),
-                };
-                Some(CrossAttentionInputs {
-                    states,
-                    mask,
-                    full_text_row_mask,
-                })
-            }
+            Some(vision) => Some(self.prepare_cross_attention(vision, cross_attention_mask)?),
             None => None,
         };
+        self.forward_full(input_ids, cross.as_ref(), None, None)
+    }
 
-        let hidden_states = self.language_model.forward(input_ids, cross.as_ref())?;
-        Ok(self.lm_head.forward(&hidden_states))
+    /// Text-only cached decode, for the uniform `DynamicModel` path.
+    ///
+    /// Image-conditioned decoding cannot come through here — there is no vision
+    /// channel in this signature — so use [`Self::prepare_cross_attention`] plus
+    /// [`Self::forward_full`] for that.
+    pub fn forward_with_cache(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_full(input_ids, None, mask, cache)
+    }
+
+    /// Final hidden state (pre-`lm_head`), for embedding / distillation callers.
+    pub fn forward_hidden(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.language_model.forward(input_ids, None, mask)
+    }
+}
+
+// =============================================================================
+// Weight loading
+// =============================================================================
+
+/// Pick whichever of `candidates` a checkpoint actually uses, by probing for
+/// `{prefix}{probe}`.
+///
+/// Mllama's released weights were saved when `MllamaForConditionalGeneration`
+/// held `vision_model` / `language_model` directly; current `transformers`
+/// nests both under a `MllamaModel` called `model`. Both layouts are in the
+/// wild, and probing beats guessing.
+fn resolve_prefix<'a>(
+    weights: &HashMap<String, Array>,
+    candidates: &[&'a str],
+    probe: &str,
+) -> &'a str {
+    candidates
+        .iter()
+        .copied()
+        .find(|prefix| weights.contains_key(&format!("{prefix}{probe}")))
+        .unwrap_or(candidates[0])
+}
+
+/// Load HuggingFace `MllamaForConditionalGeneration` weights.
+///
+/// The one layout conversion is the patch-embedding convolution: PyTorch stores
+/// `[out, in, kh, kw]` and MLX wants `[out, kh, kw, in]`.
+pub fn load_mllama_weights(
+    model: &mut MllamaForConditionalGeneration,
+    weights: &HashMap<String, Array>,
+) -> Result<LoadReport, Exception> {
+    let mut report = LoadReport::default();
+
+    let vision_root = resolve_prefix(
+        weights,
+        &["vision_model.", "model.vision_model."],
+        "patch_embedding.weight",
+    );
+    let text_root = resolve_prefix(
+        weights,
+        &["language_model.model.", "model.language_model."],
+        "embed_tokens.weight",
+    );
+    let projector_root = resolve_prefix(
+        weights,
+        &["multi_modal_projector.", "model.multi_modal_projector."],
+        "weight",
+    );
+
+    load_vision_weights(&mut model.vision_model, weights, vision_root, &mut report);
+    load_linear(
+        &mut model.multi_modal_projector,
+        weights,
+        projector_root.trim_end_matches('.'),
+        &mut report,
+    );
+    load_text_weights(&mut model.language_model, weights, text_root, &mut report);
+
+    // `lm_head` is outside the text model in both layouts, but at different
+    // depths.
+    let lm_head_key = ["language_model.lm_head.weight", "lm_head.weight"]
+        .into_iter()
+        .find(|k| weights.contains_key(*k))
+        .unwrap_or("lm_head.weight");
+    load_param(&mut model.lm_head.weight, weights, lm_head_key, &mut report);
+
+    Ok(report)
+}
+
+fn load_vision_encoder(
+    encoder: &mut MllamaVisionEncoder,
+    weights: &HashMap<String, Array>,
+    root: &str,
+    report: &mut LoadReport,
+) {
+    for (i, layer) in encoder.layers.iter_mut().enumerate() {
+        let p = format!("{root}layers.{i}");
+        for (proj, name) in [
+            (&mut layer.self_attn.q_proj, "q_proj"),
+            (&mut layer.self_attn.k_proj, "k_proj"),
+            (&mut layer.self_attn.v_proj, "v_proj"),
+            (&mut layer.self_attn.o_proj, "o_proj"),
+        ] {
+            load_linear(proj, weights, &format!("{p}.self_attn.{name}"), report);
+        }
+        load_linear(&mut layer.mlp.fc1, weights, &format!("{p}.mlp.fc1"), report);
+        load_linear(&mut layer.mlp.fc2, weights, &format!("{p}.mlp.fc2"), report);
+        load_layer_norm(
+            &mut layer.input_layernorm,
+            weights,
+            &format!("{p}.input_layernorm"),
+            report,
+        );
+        load_layer_norm(
+            &mut layer.post_attention_layernorm,
+            weights,
+            &format!("{p}.post_attention_layernorm"),
+            report,
+        );
+        // Only the global stack is gated; an un-gated layer must not report the
+        // absent gates as skipped.
+        if layer.gate_attn.value.is_some() {
+            load_optional_param(
+                &mut layer.gate_attn,
+                weights,
+                &format!("{p}.gate_attn"),
+                report,
+            );
+            load_optional_param(
+                &mut layer.gate_ffn,
+                weights,
+                &format!("{p}.gate_ffn"),
+                report,
+            );
+        }
+    }
+}
+
+fn load_vision_weights(
+    vision: &mut MllamaVisionModel,
+    weights: &HashMap<String, Array>,
+    root: &str,
+    report: &mut LoadReport,
+) {
+    let conv_key = format!("{root}patch_embedding.weight");
+    match weights.get(&conv_key) {
+        Some(w) => {
+            // PyTorch [O, I, kh, kw] -> MLX [O, kh, kw, I].
+            vision.patch_embedding.weight = Param::new(w.transpose_axes(&[0, 2, 3, 1]));
+            report.loaded += 1;
+        }
+        None => report.skipped.push(conv_key),
+    }
+
+    load_param(
+        &mut vision.class_embedding,
+        weights,
+        &format!("{root}class_embedding"),
+        report,
+    );
+
+    let gpe = format!("{root}gated_positional_embedding");
+    load_param(
+        &mut vision.gated_positional_embedding.embedding,
+        weights,
+        &format!("{gpe}.embedding"),
+        report,
+    );
+    load_optional_param(
+        &mut vision.gated_positional_embedding.gate,
+        weights,
+        &format!("{gpe}.gate"),
+        report,
+    );
+    load_param(
+        &mut vision.gated_positional_embedding.tile_embedding.weight,
+        weights,
+        &format!("{gpe}.tile_embedding.weight"),
+        report,
+    );
+
+    for (tile, name) in [
+        (
+            &mut vision.pre_tile_positional_embedding,
+            "pre_tile_positional_embedding",
+        ),
+        (
+            &mut vision.post_tile_positional_embedding,
+            "post_tile_positional_embedding",
+        ),
+    ] {
+        load_param(
+            &mut tile.embedding.weight,
+            weights,
+            &format!("{root}{name}.embedding.weight"),
+            report,
+        );
+        load_optional_param(
+            &mut tile.gate,
+            weights,
+            &format!("{root}{name}.gate"),
+            report,
+        );
+    }
+
+    load_layer_norm(
+        &mut vision.layernorm_pre,
+        weights,
+        &format!("{root}layernorm_pre"),
+        report,
+    );
+    load_layer_norm(
+        &mut vision.layernorm_post,
+        weights,
+        &format!("{root}layernorm_post"),
+        report,
+    );
+
+    load_vision_encoder(
+        &mut vision.transformer,
+        weights,
+        &format!("{root}transformer."),
+        report,
+    );
+    load_vision_encoder(
+        &mut vision.global_transformer,
+        weights,
+        &format!("{root}global_transformer."),
+        report,
+    );
+}
+
+fn load_text_weights(
+    text: &mut MllamaTextModel,
+    weights: &HashMap<String, Array>,
+    root: &str,
+    report: &mut LoadReport,
+) {
+    load_param(
+        &mut text.embed_tokens.weight,
+        weights,
+        &format!("{root}embed_tokens.weight"),
+        report,
+    );
+    load_param(
+        &mut text.norm.weight,
+        weights,
+        &format!("{root}norm.weight"),
+        report,
+    );
+
+    for (i, layer) in text.layers.iter_mut().enumerate() {
+        let p = format!("{root}layers.{i}");
+
+        if let Some(self_attn) = layer.self_attn.as_mut() {
+            for (proj, name) in [
+                (&mut self_attn.q_proj, "q_proj"),
+                (&mut self_attn.k_proj, "k_proj"),
+                (&mut self_attn.v_proj, "v_proj"),
+                (&mut self_attn.o_proj, "o_proj"),
+            ] {
+                load_linear(proj, weights, &format!("{p}.self_attn.{name}"), report);
+            }
+        }
+
+        if let Some(cross_attn) = layer.cross_attn.as_mut() {
+            for (proj, name) in [
+                (&mut cross_attn.q_proj, "q_proj"),
+                (&mut cross_attn.k_proj, "k_proj"),
+                (&mut cross_attn.v_proj, "v_proj"),
+                (&mut cross_attn.o_proj, "o_proj"),
+            ] {
+                load_linear(proj, weights, &format!("{p}.cross_attn.{name}"), report);
+            }
+            load_param(
+                &mut cross_attn.q_norm.weight,
+                weights,
+                &format!("{p}.cross_attn.q_norm.weight"),
+                report,
+            );
+            load_param(
+                &mut cross_attn.k_norm.weight,
+                weights,
+                &format!("{p}.cross_attn.k_norm.weight"),
+                report,
+            );
+            load_optional_param(
+                &mut layer.cross_attn_attn_gate,
+                weights,
+                &format!("{p}.cross_attn_attn_gate"),
+                report,
+            );
+            load_optional_param(
+                &mut layer.cross_attn_mlp_gate,
+                weights,
+                &format!("{p}.cross_attn_mlp_gate"),
+                report,
+            );
+        }
+
+        for (proj, name) in [
+            (&mut layer.mlp.gate_proj, "gate_proj"),
+            (&mut layer.mlp.up_proj, "up_proj"),
+            (&mut layer.mlp.down_proj, "down_proj"),
+        ] {
+            load_linear(proj, weights, &format!("{p}.mlp.{name}"), report);
+        }
+        load_param(
+            &mut layer.input_layernorm.weight,
+            weights,
+            &format!("{p}.input_layernorm.weight"),
+            report,
+        );
+        load_param(
+            &mut layer.post_attention_layernorm.weight,
+            weights,
+            &format!("{p}.post_attention_layernorm.weight"),
+            report,
+        );
     }
 }
 

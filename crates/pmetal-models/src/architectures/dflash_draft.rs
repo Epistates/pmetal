@@ -542,14 +542,9 @@ fn assign_layer_weight(layer: &mut DFlashDecoderLayer, suffix: &str, weight: Arr
     true
 }
 
-/// Summary of a [`DFlashDraftModel::load_weights`] call.
-#[derive(Debug, Default, Clone)]
-pub struct LoadReport {
-    /// Number of weights successfully assigned.
-    pub loaded: usize,
-    /// Names of weights that did not match a known parameter.
-    pub skipped: Vec<String>,
-}
+/// Summary of a [`DFlashDraftModel::load_weights`] call — shared with every
+/// other hand-written loader.
+pub use crate::architectures::utils::LoadReport;
 
 // ----------------------------------------------------------------------------
 // Tests

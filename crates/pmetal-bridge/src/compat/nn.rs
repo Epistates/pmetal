@@ -271,7 +271,7 @@ mod tests {
 
     /// `0.5·x·(1 + erf(x/√2))` at f64 precision, from
     /// `0.5*x*(1+math.erf(x/math.sqrt(2)))`.
-    const GELU_ERF_TABLE: [(f32, f32); 10] = [
+    const GELU_ERF_TABLE: [(f32, f64); 10] = [
         (-4.0, -0.000_126_685),
         (-2.0, -0.045_500_264),
         (-1.0, -0.158_655_254),
@@ -294,7 +294,7 @@ mod tests {
 
         for (i, &(x, want)) in GELU_ERF_TABLE.iter().enumerate() {
             assert!(
-                (got[i] - want).abs() < 1e-6,
+                (got[i] as f64 - want).abs() < 1e-6,
                 "gelu_erf({x}) = {}, want {want}",
                 got[i]
             );
@@ -314,7 +314,7 @@ mod tests {
         let x = Array::from_f32_slice(&xs, &[n as i32]);
 
         for (name, mut approx, min_gap) in [
-            ("gelu (sigmoid)", gelu(&x), 1e-2_f32),
+            ("gelu (sigmoid)", gelu(&x), 1e-2_f64),
             ("gelu_tanh_approximate", gelu_tanh_approximate(&x), 1e-4),
         ] {
             approx.eval();
@@ -322,8 +322,8 @@ mod tests {
             let worst = GELU_ERF_TABLE
                 .iter()
                 .zip(&approx)
-                .map(|(&(_, want), &got)| (got - want).abs())
-                .fold(0.0_f32, f32::max);
+                .map(|(&(_, want), &got)| (got as f64 - want).abs())
+                .fold(0.0_f64, f64::max);
             assert!(
                 worst > min_gap,
                 "{name} is within {worst:.3e} of exact gelu — closer than the \
