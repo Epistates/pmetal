@@ -57,7 +57,7 @@ pub struct MllamaLoraSelfAttention {
 
 impl MllamaLoraSelfAttention {
     pub fn new(config: &MllamaConfig, lora_config: &LoraConfig) -> Result<Self, LoraError> {
-        let tc = &config.text_config;
+        let tc = &config.text_config.llama;
         let n_heads = tc.num_attention_heads;
         let n_kv_heads = tc.num_kv_heads();
         let head_dim = tc.get_head_dim();
@@ -329,7 +329,7 @@ pub struct MllamaLoraCrossAttention {
 
 impl MllamaLoraCrossAttention {
     pub fn new(config: &MllamaConfig, lora_config: &LoraConfig) -> Result<Self, LoraError> {
-        let tc = &config.text_config;
+        let tc = &config.text_config.llama;
         let n_heads = tc.num_attention_heads;
         let n_kv_heads = tc.num_kv_heads();
         let head_dim = tc.get_head_dim();
@@ -454,7 +454,7 @@ pub struct MllamaLoraMLP {
 
 impl MllamaLoraMLP {
     pub fn new(config: &MllamaConfig, lora_config: &LoraConfig) -> Result<Self, LoraError> {
-        let tc = &config.text_config;
+        let tc = &config.text_config.llama;
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
 
@@ -514,7 +514,7 @@ impl MllamaLoraMLP {
 /// LoRA-enabled MLlama text decoder layer.
 ///
 /// Optionally contains a cross-attention sublayer (only on layers listed in
-/// `config.cross_attention_layers`).
+/// `config.text_config.cross_attention_layers`).
 #[derive(Debug)]
 pub struct MllamaLoraDecoderLayer {
     pub self_attn: MllamaLoraSelfAttention,
@@ -533,7 +533,7 @@ impl MllamaLoraDecoderLayer {
         lora_config: &LoraConfig,
         layer_id: usize,
     ) -> Result<Self, LoraError> {
-        let tc = &config.text_config;
+        let tc = &config.text_config.llama;
 
         let self_attn = MllamaLoraSelfAttention::new(config, lora_config)?;
         let mlp = MllamaLoraMLP::new(config, lora_config)?;
@@ -547,7 +547,10 @@ impl MllamaLoraDecoderLayer {
             .build()
             .unwrap();
 
-        let has_cross = config.cross_attention_layers.contains(&(layer_id as i32));
+        let has_cross = config
+            .text_config
+            .cross_attention_layers
+            .contains(&(layer_id as i32));
 
         let (cross_attn, cross_attention_layernorm) = if has_cross {
             let ca = MllamaLoraCrossAttention::new(config, lora_config)?;
@@ -687,7 +690,7 @@ pub struct MllamaLoraModel {
 
 impl MllamaLoraModel {
     pub fn new(config: MllamaConfig, lora_config: LoraConfig) -> Result<Self, LoraError> {
-        let tc = &config.text_config;
+        let tc = &config.text_config.llama;
         let embed_tokens = nn::Embedding::new(tc.vocab_size, tc.hidden_size)?;
 
         let layers = (0..tc.num_hidden_layers as usize)
@@ -873,7 +876,7 @@ pub struct MllamaLoraForCausalLM {
 
 impl MllamaLoraForCausalLM {
     pub fn new(config: MllamaConfig, lora_config: LoraConfig) -> Result<Self, LoraError> {
-        let tc = config.text_config.clone();
+        let tc = config.text_config.llama.clone();
         let tie_weights = tc.tie_word_embeddings;
         let model = MllamaLoraModel::new(config, lora_config)?;
 
@@ -979,7 +982,7 @@ impl MllamaLoraForCausalLM {
     // ------------------------------------------------------------------
 
     pub fn create_cache(&self, max_seq_len: usize) -> KVCache {
-        let tc = &self.model.config.text_config;
+        let tc = &self.model.config.text_config.llama;
         let config = KVCacheConfig::new(
             tc.num_hidden_layers as usize,
             max_seq_len,
@@ -1507,7 +1510,7 @@ impl crate::TrainableModel for MllamaLoraForCausalLM {
         // text-only forward to avoid a shape crash.
         let cross_states = pixel_values.and_then(|pv| {
             let last_dim = pv.shape().last().copied().unwrap_or(0);
-            if last_dim == self.model.config.text_config.hidden_size {
+            if last_dim == self.model.config.text_config.llama.hidden_size {
                 Some(pv)
             } else {
                 None
@@ -1638,11 +1641,11 @@ fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pmetal_models::architectures::mllama::MllamaVisionConfig;
+    use pmetal_models::architectures::mllama::{MllamaTextConfig, MllamaVisionConfig};
 
     fn small_config() -> MllamaConfig {
         use pmetal_models::architectures::llama::LlamaConfig;
-        let text_config = LlamaConfig {
+        let llama = LlamaConfig {
             vocab_size: 512,
             hidden_size: 64,
             intermediate_size: 128,
@@ -1657,17 +1660,24 @@ mod tests {
         };
         let vision_config = MllamaVisionConfig {
             hidden_size: 32,
+            intermediate_size: 64,
             num_hidden_layers: 2,
-            num_attention_heads: 4,
+            num_global_layers: 1,
+            attention_heads: 4,
             image_size: 28,
             patch_size: 14,
+            intermediate_layers_indices: vec![1],
+            vision_output_dim: 64,
             ..Default::default()
         };
         MllamaConfig {
-            text_config,
+            text_config: MllamaTextConfig {
+                llama,
+                // Layers 1 and 3 have cross-attention.
+                cross_attention_layers: vec![1, 3],
+            },
             vision_config,
-            // Layers 1 and 3 have cross-attention.
-            cross_attention_layers: vec![1, 3],
+            ..Default::default()
         }
     }
 
