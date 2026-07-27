@@ -268,6 +268,16 @@ pub fn fused_sdpa(
     config: &FusedAttentionConfig,
     custom_mask: Option<&Array>,
 ) -> Result<Array, Exception> {
+    // MLX requires the additive mask to promote to the attention output dtype,
+    // so an f32 mask against a bf16 model is a hard error — not a silent
+    // upcast. Mask builders (`create_causal_mask` and friends) all produce f32
+    // regardless of the model, so coerce here, at the one point every
+    // architecture funnels through, rather than in each of them.
+    let coerced_mask = custom_mask.and_then(|mask| {
+        (mask.dtype() != queries.dtype()).then(|| mask.as_dtype(queries.dtype().as_i32()))
+    });
+    let custom_mask = coerced_mask.as_ref().or(custom_mask);
+
     if let Some(output) =
         try_selected_attention_backend(queries, keys, values, config, custom_mask)?
     {
@@ -1112,6 +1122,52 @@ mod tests {
             is_ultra_fusion: false,
             die_count: 1,
         }
+    }
+
+    /// An f32 additive mask against a bf16 model must work.
+    ///
+    /// MLX's SDPA refuses a mask that doesn't promote to the output dtype — it
+    /// errors rather than upcasting — and every mask builder in `pmetal-models`
+    /// emits f32 regardless of the checkpoint's dtype. Before `fused_sdpa`
+    /// coerced the mask, this combination threw on *every* bf16 checkpoint
+    /// taking the uncached prefill path (the one `DynamicModel::forward` uses),
+    /// and the thrown op returned a placeholder that then broadcast harmlessly
+    /// through the residual stream — so the output kept its shape and stayed
+    /// finite while attention had contributed nothing.
+    #[test]
+    fn an_f32_mask_works_against_a_bf16_model() {
+        let (heads, seq, head_dim) = (2, 4, 8);
+        let shape = [1, heads, seq, head_dim];
+        let bf16 = |s: &[i32]| random::normal(s, Dtype::Float32).as_dtype(Dtype::Bfloat16.as_i32());
+        let (q, k, v) = (bf16(&shape), bf16(&shape), bf16(&shape));
+
+        // Additive causal mask in f32, exactly as `create_causal_mask` builds it.
+        let mask = {
+            let lower = ops::tri(seq, seq, 0, Dtype::Float32);
+            ops::where_fn(
+                &lower.equal(&Array::from_f32(0.0)),
+                &Array::from_f32(f32::NEG_INFINITY),
+                &Array::from_f32(0.0),
+            )
+        };
+        assert_eq!(mask.dtype(), Dtype::Float32);
+
+        let config = FusedAttentionConfig::new(heads, heads, head_dim)
+            .with_mask_type(AttentionMaskType::None);
+        let mut out = fused_sdpa(&q, &k, &v, &config, Some(&mask)).expect("fused_sdpa runs");
+        out.eval();
+
+        pmetal_bridge::check_last_error().expect("no bridge exception with an f32 mask on bf16");
+        assert_eq!(out.shape(), &shape);
+        let values = out.to_f32_vec(out.size()).expect("output readable");
+        assert!(
+            values.iter().all(|x| x.is_finite()),
+            "attention output is not finite"
+        );
+        assert!(
+            values.iter().any(|&x| x != 0.0),
+            "attention output is all zeros — the masked path produced nothing"
+        );
     }
 
     #[test]

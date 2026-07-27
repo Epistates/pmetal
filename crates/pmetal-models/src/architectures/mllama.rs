@@ -46,7 +46,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::architectures::llama::{LlamaAttention, LlamaConfig, LlamaMLP, RopeScalingValue};
 use crate::architectures::utils::{
-    LoadReport, load_layer_norm, load_linear, load_optional_param, load_param,
+    LoadReport, coerce_mask_dtype, load_layer_norm, load_linear, load_optional_param, load_param,
 };
 use crate::traits::ModelConfig;
 
@@ -505,11 +505,13 @@ impl MllamaVisionAttention {
                 .reshape(&[rows, seq, self.num_heads, self.head_dim])
                 .transpose_axes(&[0, 2, 1, 3])
         };
-        let out = to_heads(&self.q_proj).sdpa_with_mask(
+        let q = to_heads(&self.q_proj);
+        let mask = coerce_mask_dtype(&q, mask);
+        let out = q.sdpa_with_mask(
             &to_heads(&self.k_proj),
             &to_heads(&self.v_proj),
             self.scaling,
-            mask,
+            mask.as_ref(),
         );
         self.o_proj
             .forward(&out.transpose_axes(&[0, 2, 1, 3]).reshape(&[
@@ -965,7 +967,8 @@ impl MllamaTextCrossAttention {
         let k = self.k_norm.forward(&kv(&self.k_proj));
         let v = kv(&self.v_proj);
 
-        let out = q.sdpa_with_mask(&k, &v, self.scaling, mask);
+        let mask = coerce_mask_dtype(&q, mask);
+        let out = q.sdpa_with_mask(&k, &v, self.scaling, mask.as_ref());
         self.o_proj
             .forward(&out.transpose_axes(&[0, 2, 1, 3]).reshape(&[
                 batch,
@@ -1372,7 +1375,10 @@ impl MllamaForConditionalGeneration {
 /// Mllama's released weights were saved when `MllamaForConditionalGeneration`
 /// held `vision_model` / `language_model` directly; current `transformers`
 /// nests both under a `MllamaModel` called `model`. Both layouts are in the
-/// wild, and probing beats guessing.
+/// wild — the released Llama 3.2 11B Vision Instruct checkpoint uses the first
+/// (verified against its 906-key `model.safetensors.index.json`, which this
+/// loader's key set matches exactly, in both directions), and a `state_dict()`
+/// from current `transformers` uses the second. Probing beats guessing.
 fn resolve_prefix<'a>(
     weights: &HashMap<String, Array>,
     candidates: &[&'a str],

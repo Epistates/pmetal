@@ -86,6 +86,26 @@ pub fn load_layer_norm(
     load_optional_param(&mut norm.bias, weights, &format!("{prefix}.bias"), report);
 }
 
+/// Cast an additive attention mask to the query dtype, if it isn't already.
+///
+/// MLX's scaled-dot-product attention requires the mask to promote to the
+/// output dtype and errors out rather than upcasting, so an f32 mask against a
+/// bf16 checkpoint is a hard failure. Every mask builder here produces f32
+/// regardless of the model's dtype, so any code path that hands a mask straight
+/// to `Array::sdpa_with_mask` has to coerce it first.
+///
+/// `pmetal_mlx::kernels::fused_sdpa` does this internally; this is for the
+/// callers that go to the bridge directly.
+pub fn coerce_mask_dtype(query: &Array, mask: Option<&Array>) -> Option<Array> {
+    mask.map(|mask| {
+        if mask.dtype() == query.dtype() {
+            mask.clone()
+        } else {
+            mask.as_dtype(query.dtype().as_i32())
+        }
+    })
+}
+
 /// Create a causal attention mask of shape [seq_len, seq_len].
 ///
 /// Returns an additive mask where masked (future) positions hold `-inf`
