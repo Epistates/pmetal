@@ -291,27 +291,17 @@ impl NormModule for GemmaRmsNorm {
 }
 
 /// GELU activation with tanh approximation.
+///
+/// Gemma's `hidden_act` is `gelu_pytorch_tanh`, and transformers overrides even
+/// a plain `"gelu"` to the tanh variant for this family, so every spelling
+/// lands here.
+///
+/// This used to expand `tanh` by hand as `(exp(2x) - 1) / (exp(2x) + 1)`, which
+/// overflows to `inf/inf = NaN` for gate pre-activations above ~10.5 — well
+/// inside the range a real MLP produces. [`nn::gelu_tanh_approximate`] uses the
+/// `tanh` primitive, which saturates instead.
 fn gelu_tanh(x: &Array) -> Array {
-    // GELU(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    // Use tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
-    let sqrt_2_over_pi = (2.0_f32 / std::f32::consts::PI).sqrt();
-    let coef = Array::from_f32(0.044715);
-    let half = Array::from_f32(0.5);
-    let one = Array::from_f32(1.0);
-    let two = Array::from_f32(2.0);
-    let sqrt_2_pi = Array::from_f32(sqrt_2_over_pi);
-
-    let x_cubed = x.multiply(x).multiply(x);
-    let inner = x.add(&x_cubed.multiply(&coef));
-    let inner = inner.multiply(&sqrt_2_pi);
-
-    // tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
-    let exp_2x = inner.multiply(&two).exp();
-    let tanh_val = exp_2x.subtract(&one).divide(&exp_2x.add(&one));
-
-    let gate = one.add(&tanh_val).multiply(&half);
-
-    x.multiply(&gate)
+    nn::gelu_tanh_approximate(x)
 }
 
 /// Gemma attention layer.
@@ -1220,12 +1210,24 @@ mod tests {
     #[test]
     #[serial]
     fn test_gelu_tanh() {
-        let x = pmetal_bridge::compat::Array::from_slice(&[-1.0f32, 0.0, 1.0, 2.0], &[4]);
-        let output = gelu_tanh(&x);
+        // Includes inputs past the point where the old hand-expanded
+        // `(exp(2x) - 1) / (exp(2x) + 1)` overflowed to NaN (~10.5). GELU
+        // saturates to the identity there, so these must come back finite and
+        // equal to x.
+        let xs = [-1.0f32, 0.0, 1.0, 2.0, 10.5, 20.0, 50.0];
+        let x = pmetal_bridge::compat::Array::from_slice(&xs, &[xs.len() as i32]);
+        let mut output = gelu_tanh(&x);
         output.eval().unwrap();
-        // GELU(0) should be 0
-        // GELU(-x) ≈ 0 for large negative x
-        assert_eq!(output.shape(), &[4]);
+        let got = output.to_f32_vec(xs.len()).expect("to_f32_vec");
+
+        assert!(
+            got.iter().all(|v| v.is_finite()),
+            "gelu_tanh produced non-finite values: {got:?}"
+        );
+        for (i, x) in xs.iter().enumerate().filter(|(_, x)| **x >= 10.0) {
+            assert_eq!(got[i], *x, "gelu_tanh({x}) should saturate to the identity");
+        }
+        assert_eq!(got[1], 0.0, "gelu_tanh(0) should be 0");
     }
 
     #[test]

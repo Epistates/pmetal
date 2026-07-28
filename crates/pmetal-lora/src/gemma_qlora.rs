@@ -25,24 +25,15 @@ use pmetal_models::architectures::gemma::GemmaConfig;
 
 use crate::{LoraError, QLoraConfig, QLoraLinear};
 
-/// GELU activation with tanh approximation.
+/// GELU activation with tanh approximation, matching Gemma's
+/// `gelu_pytorch_tanh`.
+///
+/// This used to expand `tanh` by hand as `(exp(2x) - 1) / (exp(2x) + 1)`, which
+/// overflows to `inf/inf = NaN` for gate pre-activations above ~10.5 — well
+/// inside the range a real MLP produces, so QLoRA training could silently
+/// poison the forward pass and every gradient downstream of it.
 fn gelu_tanh(x: &Array) -> Result<Array, Exception> {
-    let sqrt_2_over_pi = (2.0_f32 / std::f32::consts::PI).sqrt();
-    let coef = Array::from_f32(0.044715);
-    let half = Array::from_f32(0.5);
-    let one = Array::from_f32(1.0);
-    let two = Array::from_f32(2.0);
-    let sqrt_2_pi = Array::from_f32(sqrt_2_over_pi);
-
-    let x_cubed = x.multiply(x).multiply(x);
-    let inner = x.add(&x_cubed.multiply(&coef));
-    let inner = inner.multiply(&sqrt_2_pi);
-
-    let exp_2x = inner.multiply(&two).exp();
-    let tanh_val = exp_2x.subtract(&one).divide(&exp_2x.add(&one));
-
-    let gate = one.add(&tanh_val).multiply(&half);
-    Ok(x.multiply(&gate))
+    Ok(nn::gelu_tanh_approximate(x))
 }
 
 /// Gemma-style RMSNorm with +1 offset.

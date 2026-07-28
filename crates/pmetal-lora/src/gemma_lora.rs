@@ -9,7 +9,8 @@
 //! # Performance Optimizations (SOTA)
 //!
 //! This implementation uses several state-of-the-art optimizations:
-//! - **Compiled GELU**: Uses `pmetal_bridge::compat::nn::gelu()` with kernel fusion
+//! - **Tanh GELU**: Uses `pmetal_bridge::compat::nn::gelu_tanh_approximate()`,
+//!   matching Gemma's `gelu_pytorch_tanh`
 //! - **Fast RMS Norm**: Uses `pmetal_bridge::compat::fast::rms_norm()` for optimized normalization
 //! - **Gemma norm**: Efficient +1 weight offset handling
 
@@ -421,12 +422,13 @@ impl GemmaLoraMLP {
 
     /// Forward pass (GeGLU activation).
     ///
-    /// Uses `nn::gelu_approximate()` which is a compiled/fused kernel for
-    /// better performance than the manual tanh approximation.
+    /// Gemma's activation is `gelu_pytorch_tanh` — the tanh approximation. This
+    /// used to call `nn::gelu_approximate()`, which is the *sigmoid* fast
+    /// approximation despite its name, so adapters trained here saw a different
+    /// activation than the base model runs at inference.
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         let gate = self.gate_proj.forward(x)?;
-        // Use the optimized compiled GELU approximation (equivalent to tanh approximation)
-        let gate = nn::gelu_approximate(&gate);
+        let gate = nn::gelu_tanh_approximate(&gate);
         let up = self.up_proj.forward(x)?;
         let hidden = gate.multiply(&up);
         self.down_proj.forward(&hidden)
@@ -1684,5 +1686,45 @@ mod tests {
         // Test ModuleParameters implementation
         let params = model.parameters();
         assert!(!params.is_empty());
+    }
+
+    /// Gemma's activation is `gelu_pytorch_tanh`. This used to call
+    /// `nn::gelu_approximate()`, which is the *sigmoid* fast-approx despite the
+    /// name, so adapters trained here optimized against a different activation
+    /// than the base model runs at inference.
+    #[test]
+    fn gemma_lora_mlp_uses_the_tanh_gelu() {
+        let mut mlp = GemmaLoraMLP::new(&small_config(), &small_lora_config()).unwrap();
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 64],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+
+        let got = to_vec(mlp.forward(&x).unwrap());
+
+        // Rebuild the block around each candidate activation using the very
+        // same projections, so the activation is the only thing that varies.
+        let gate = mlp.gate_proj.forward(&x).unwrap();
+        let up = mlp.up_proj.forward(&x).unwrap();
+        let mut through = |act: fn(&Array) -> Array| {
+            to_vec(mlp.down_proj.forward(&act(&gate).multiply(&up)).unwrap())
+        };
+
+        assert_eq!(
+            got,
+            through(nn::gelu_tanh_approximate),
+            "expected tanh gelu"
+        );
+        assert_ne!(
+            got,
+            through(nn::gelu),
+            "output matches the sigmoid fast-approx — the wrong GELU is back"
+        );
+    }
+
+    fn to_vec(mut a: Array) -> Vec<f32> {
+        a.eval().unwrap();
+        let n: usize = a.shape().iter().map(|d| *d as usize).product();
+        a.to_f32_vec(n).expect("to_f32_vec")
     }
 }

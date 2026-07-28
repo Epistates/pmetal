@@ -804,15 +804,16 @@ fn manual_sdpa_with_softcapping(
     let scale_arr = Array::from_f32(config.scale);
     let scores = scores.multiply(&scale_arr);
 
-    // Apply softcapping: cap * tanh(scores / cap)
-    // tanh(x) = (exp(2x) - 1) / (exp(2x) + 1)
+    // Apply softcapping: cap * tanh(scores / cap).
+    //
+    // Uses the `tanh` primitive rather than expanding it as
+    // `(exp(2x) - 1) / (exp(2x) + 1)`, which overflows to `inf/inf = NaN` once
+    // `scores / cap` exceeds ~44 — the same defect that made the Gemma GELU
+    // produce NaN. Softcapping exists precisely to tame outlier logits, so it
+    // must not itself blow up on them.
     let cap_arr = Array::from_f32(cap);
-    let scores = scores.divide(&cap_arr);
-    let two = Array::from_f32(2.0);
-    let one = Array::from_f32(1.0);
-    let exp_2x = scores.multiply(&two).exp();
-    let tanh_scores = exp_2x.subtract(&one).divide(&exp_2x.add(&one));
-    let scores = tanh_scores.multiply(&cap_arr);
+    let scores = pmetal_bridge::compat::ops::tanh(&scores.divide(&cap_arr));
+    let scores = scores.multiply(&cap_arr);
 
     // Apply mask
     let scores = match (&config.mask_type, custom_mask) {
