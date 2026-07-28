@@ -30,7 +30,7 @@
 //! This maximizes GPU utilization by processing all experts in parallel.
 
 use crate::ArrayDtypeExt;
-use pmetal_bridge::compat::{Array, Dtype, Exception, ops, random};
+use pmetal_bridge::compat::{Array, Dtype, Exception, nn, ops, random};
 
 /// Configuration for Grouped GEMM MoE.
 #[derive(Debug, Clone)]
@@ -230,7 +230,12 @@ impl SharedExpert {
             gate_activated.multiply(&up)
         } else {
             // GELU
-            gate.gelu()
+            // Non-gated expert FFN. Uses the tanh approximation, the variant
+            // every GELU-activated MoE names (`gelu_new`); `Array::gelu()` is
+            // the sigmoid fast-approx, which no reference config asks for. If a
+            // checkpoint ever needs the exact erf definition this has to become
+            // config-driven, as it is for the dense architectures.
+            nn::gelu_tanh_approximate(&gate)
         };
 
         // Down: hidden @ w2 -> [batch, hidden]
@@ -440,7 +445,12 @@ impl GroupedGemmMoE {
             gate_activated.multiply(&up)
         } else {
             // GELU path
-            gate.gelu()
+            // Non-gated expert FFN. Uses the tanh approximation, the variant
+            // every GELU-activated MoE names (`gelu_new`); `Array::gelu()` is
+            // the sigmoid fast-approx, which no reference config asks for. If a
+            // checkpoint ever needs the exact erf definition this has to become
+            // config-driven, as it is for the dense architectures.
+            nn::gelu_tanh_approximate(&gate)
         };
 
         // Gather w2 for each token's expert: [n_tokens, intermediate, hidden]

@@ -4,7 +4,7 @@
 //! - SwiGLU: swish(gate) * up = gate * sigmoid(gate) * up
 //! - GEGLU: gelu(gate) * up
 
-use pmetal_bridge::compat::{Array, Exception};
+use pmetal_bridge::compat::{Array, Exception, nn};
 
 type Result<T> = std::result::Result<T, Exception>;
 
@@ -30,8 +30,14 @@ pub fn swiglu(gate: &Array, up: &Array) -> Result<Array> {
 }
 
 /// Apply GEGLU activation: gelu(gate) * up.
+///
+/// Uses the **tanh** GELU approximation, which is what every GEGLU
+/// architecture names (`gelu_pytorch_tanh` for Gemma, `gelu_new` for T5).
+/// `Array::gelu()` is the sigmoid fast-approx and is ~1.9e-2 off — far outside
+/// parity tolerance. An architecture whose config says plain `"gelu"` wants the
+/// exact erf definition and should not route through here.
 pub fn geglu(gate: &Array, up: &Array) -> Result<Array> {
-    Ok(gate.gelu().multiply(up))
+    Ok(nn::gelu_tanh_approximate(gate).multiply(up))
 }
 
 /// Apply ReGLU activation: relu(gate) * up.

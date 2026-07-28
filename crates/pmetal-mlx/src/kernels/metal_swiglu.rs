@@ -295,7 +295,10 @@ fn apply_activation(x: &Array, activation: GatedActivationType) -> Array {
             // silu(x) = x * sigmoid(x)
             x.silu()
         }
-        GatedActivationType::GEGLU => x.gelu(),
+        // Tanh approximation: what `gelu_pytorch_tanh` / `gelu_new` name, and
+        // what every GEGLU architecture actually uses. `Array::gelu()` is the
+        // sigmoid fast-approx, which no real config asks for.
+        GatedActivationType::GEGLU => pmetal_bridge::compat::nn::gelu_tanh_approximate(x),
         GatedActivationType::ReGLU => x.relu(),
     }
 }
@@ -336,7 +339,7 @@ pub fn fused_geglu_forward(
     let gate = x.matmul(&gate_weight.t());
     let up = x.matmul(&up_weight.t());
 
-    let gelu_gate = gate.gelu();
+    let gelu_gate = pmetal_bridge::compat::nn::gelu_tanh_approximate(&gate);
     let hidden = gelu_gate.multiply(&up);
 
     Ok(hidden.matmul(&down_weight.t()))
