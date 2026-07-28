@@ -532,7 +532,7 @@ impl FluxJointTransformerBlock {
             .add(&shift_mlp_a);
 
         let ff_a_0_out = self.ff_a[0].forward(&norm_hidden_a);
-        let ff_a_out = self.ff_a[1].forward(&nn::gelu_approximate(&ff_a_0_out));
+        let ff_a_out = self.ff_a[1].forward(&nn::gelu_tanh_approximate(&ff_a_0_out));
         let hidden_states_a = hidden_states_a.add(&ff_a_out.multiply(&gate_mlp_a));
 
         let hidden_states_b = hidden_states_b.add(&attn_b.multiply(&gate_msa_b));
@@ -542,7 +542,7 @@ impl FluxJointTransformerBlock {
             .add(&shift_mlp_b);
 
         let ff_b_0_out = self.ff_b[0].forward(&norm_hidden_b);
-        let ff_b_out = self.ff_b[1].forward(&nn::gelu_approximate(&ff_b_0_out));
+        let ff_b_out = self.ff_b[1].forward(&nn::gelu_tanh_approximate(&ff_b_0_out));
         let hidden_states_b = hidden_states_b.add(&ff_b_out.multiply(&gate_mlp_b));
 
         Ok((hidden_states_a, hidden_states_b))
@@ -655,7 +655,7 @@ impl FluxSingleTransformerBlock {
             -1,
             (self.num_heads * self.head_dim) as i32,
         ]);
-        let mlp_hidden = nn::gelu_approximate(&mlp_hidden);
+        let mlp_hidden = nn::gelu_tanh_approximate(&mlp_hidden);
 
         let combined = ops::concatenate_axis(&[&attn_out, &mlp_hidden], -1);
         let out = self.proj_out.forward(&combined);

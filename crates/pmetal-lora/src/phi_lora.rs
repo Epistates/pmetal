@@ -403,9 +403,10 @@ impl PhiLoraMLP {
 
     /// Forward pass through MLP.
     ///
-    /// Uses optimized compiled activations for better performance:
-    /// - SwiGLU: Uses `nn::silu()` (compiled kernel)
-    /// - GELU: Uses `nn::gelu()` (compiled kernel)
+    /// SwiGLU uses the compiled `nn::silu()` kernel; the GELU variants resolve
+    /// through [`PhiActivation::act_fn`] so this matches the base model's
+    /// activation exactly. An adapter trained against a different GELU than the
+    /// one inference runs would silently learn to correct for the mismatch.
     pub fn forward(&mut self, x: &Array) -> Result<Array, LoraError> {
         let hidden = self.gate_up_proj.forward(x)?;
 
@@ -420,7 +421,9 @@ impl PhiLoraMLP {
                 let gate_activated = nn::silu(&gate);
                 gate_activated.multiply(&up)
             }
-            PhiActivation::GeluApprox | PhiActivation::GeluExact => nn::gelu(&hidden),
+            PhiActivation::GeluApprox | PhiActivation::GeluExact => {
+                (self.activation.act_fn())(&hidden)
+            }
         };
 
         self.down_proj.forward(&activated)

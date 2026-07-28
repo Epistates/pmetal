@@ -7,6 +7,8 @@ use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParameters, Param, fa
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
+use crate::architectures::utils::{Activation, resolve_activation};
+
 /// T5 encoder configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct T5Config {
@@ -22,6 +24,26 @@ pub struct T5Config {
     pub layer_norm_epsilon: f32,
     pub feed_forward_proj: String,
     pub is_gated_act: bool,
+}
+
+impl T5Config {
+    /// The activation name the reference derives from `feed_forward_proj`.
+    ///
+    /// `T5Config.__init__` splits on `-` and takes the last segment, with one
+    /// special case: `"gated-gelu"` resolves to `"gelu_new"` — the **tanh**
+    /// approximation, not the exact erf GELU that a bare `"gelu"` would mean.
+    /// T5-XXL (FLUX's text encoder) is `gated-gelu`, so that special case is
+    /// the one that actually runs.
+    pub fn dense_act_fn(&self) -> &str {
+        if self.feed_forward_proj == "gated-gelu" {
+            "gelu_new"
+        } else {
+            self.feed_forward_proj
+                .rsplit('-')
+                .next()
+                .unwrap_or(&self.feed_forward_proj)
+        }
+    }
 }
 
 impl Default for T5Config {
@@ -172,6 +194,9 @@ pub struct T5DenseGatedActDense {
     pub wi_0: nn::Linear,
     pub wi_1: nn::Linear,
     pub wo: nn::Linear,
+    /// `ACT2FN[config.dense_act_fn]`, resolved once — see
+    /// [`T5Config::dense_act_fn`].
+    pub act: Activation,
 }
 impl_module_params!(T5DenseGatedActDense; wi_0, wi_1, wo);
 
@@ -189,13 +214,24 @@ impl T5DenseGatedActDense {
             .bias(false)
             .build()
             .unwrap();
-        Self { wi_0, wi_1, wo }
+        let act = resolve_activation(config.dense_act_fn()).unwrap_or_else(|| {
+            panic!(
+                "t5: unsupported feed_forward_proj {:?}",
+                config.feed_forward_proj
+            )
+        });
+        Self {
+            wi_0,
+            wi_1,
+            wo,
+            act,
+        }
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        let hidden_gelu = nn::gelu_approximate(&self.wi_0.forward(x));
+        let hidden_act = (self.act)(&self.wi_0.forward(x));
         let hidden_linear = self.wi_1.forward(x);
-        let x = hidden_gelu.multiply(&hidden_linear);
+        let x = hidden_act.multiply(&hidden_linear);
         Ok(self.wo.forward(&x))
     }
 }

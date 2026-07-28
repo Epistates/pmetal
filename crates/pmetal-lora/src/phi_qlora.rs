@@ -364,7 +364,9 @@ impl PhiQloraMLP {
                 let gate_activated = nn::silu(&gate);
                 gate_activated.multiply(&up)
             }
-            PhiActivation::GeluApprox | PhiActivation::GeluExact => nn::gelu(&hidden),
+            PhiActivation::GeluApprox | PhiActivation::GeluExact => {
+                (self.activation.act_fn())(&hidden)
+            }
         };
 
         self.down_proj.forward(&activated)

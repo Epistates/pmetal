@@ -16,6 +16,8 @@ use pmetal_bridge::compat::{Array, Exception, Module, ModuleParameters, nn, ops}
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
+use crate::architectures::utils::{Activation, resolve_activation};
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -293,9 +295,10 @@ impl BertSelfOutput {
 #[derive(Debug)]
 pub struct BertIntermediate {
     pub dense: nn::Linear,
-    /// Activation function name. Dispatched in `forward`: relu, silu/swish, tanh,
-    /// gelu (default for any unrecognized value).
-    pub act: String,
+    /// `config.hidden_act`, resolved once at construction. BERT's default is
+    /// `"gelu"` — the *exact* erf definition, per `ACT2FN` — so this must not
+    /// fall back to either fast approximation.
+    pub act: Activation,
 }
 impl_module_params!(BertIntermediate; dense);
 
@@ -304,20 +307,18 @@ impl BertIntermediate {
         let dense =
             nn::LinearBuilder::new(config.hidden_size as i32, config.intermediate_size as i32)
                 .build()?;
-        Ok(Self {
-            dense,
-            act: config.hidden_act.clone(),
-        })
+        let act = resolve_activation(&config.hidden_act).ok_or_else(|| {
+            Exception::custom(format!(
+                "bert: unsupported hidden_act {:?}",
+                config.hidden_act
+            ))
+        })?;
+        Ok(Self { dense, act })
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let h = Module::forward(&mut self.dense, x)?;
-        Ok(match self.act.as_str() {
-            "relu" => nn::relu(&h),
-            "silu" | "swish" => nn::silu(&h),
-            "tanh" => pmetal_bridge::compat::ops::tanh(&h),
-            _ => nn::gelu(&h), // "gelu" and any unrecognized value default to GELU
-        })
+        Ok((self.act)(&h))
     }
 }
 

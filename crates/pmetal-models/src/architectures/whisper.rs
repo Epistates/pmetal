@@ -376,7 +376,9 @@ impl WhisperEncoderBlock {
         // MLP with residual
         let x_norm = Module::forward(&mut self.final_layer_norm, &x)?;
         let mlp_out = Module::forward(&mut self.fc1, &x_norm)?;
-        let mlp_out = pmetal_bridge::compat::nn::gelu(&mlp_out);
+        // `ACT2FN[config.activation_function]`, and every released Whisper says
+        // `"gelu"` — the exact erf definition, not a fast approximation.
+        let mlp_out = pmetal_bridge::compat::nn::gelu_erf(&mlp_out);
         let mlp_out = Module::forward(&mut self.fc2, &mlp_out)?;
 
         Ok(pmetal_bridge::compat::ops::add(&x, &mlp_out))
@@ -459,7 +461,9 @@ impl WhisperDecoderBlock {
         // MLP with residual
         let x_norm = Module::forward(&mut self.final_layer_norm, &x)?;
         let mlp_out = Module::forward(&mut self.fc1, &x_norm)?;
-        let mlp_out = pmetal_bridge::compat::nn::gelu(&mlp_out);
+        // `ACT2FN[config.activation_function]`, and every released Whisper says
+        // `"gelu"` — the exact erf definition, not a fast approximation.
+        let mlp_out = pmetal_bridge::compat::nn::gelu_erf(&mlp_out);
         let mlp_out = Module::forward(&mut self.fc2, &mlp_out)?;
 
         Ok(pmetal_bridge::compat::ops::add(&x, &mlp_out))
@@ -525,11 +529,13 @@ impl WhisperEncoder {
     /// # Returns
     /// Encoder output [batch, time/2, d_model]
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
-        // Conv layers with GELU
+        // Conv layers with GELU. The reference calls `nn.functional.gelu`
+        // directly here (not `ACT2FN`), which defaults to `approximate="none"`
+        // — again the exact erf definition.
         let x = Module::forward(&mut self.conv1, x)?;
-        let x = pmetal_bridge::compat::nn::gelu(&x);
+        let x = pmetal_bridge::compat::nn::gelu_erf(&x);
         let x = Module::forward(&mut self.conv2, &x)?;
-        let x = pmetal_bridge::compat::nn::gelu(&x);
+        let x = pmetal_bridge::compat::nn::gelu_erf(&x);
 
         // Transpose: [B, C, T] -> [B, T, C]
         let x = x.transpose_axes(&[0, 2, 1]);

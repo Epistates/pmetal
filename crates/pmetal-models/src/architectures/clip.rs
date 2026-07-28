@@ -8,6 +8,8 @@ use pmetal_bridge::compat::{Array, Dtype, Exception, ModuleParameters, Param, fa
 use pmetal_bridge::impl_module_params;
 use serde::{Deserialize, Serialize};
 
+use crate::architectures::utils::{Activation, resolve_activation};
+
 /// CLIP text encoder configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CLIPConfig {
@@ -18,7 +20,14 @@ pub struct CLIPConfig {
     pub intermediate_size: usize,
     pub max_position_embeddings: usize,
     pub layer_norm_eps: f32,
-    pub use_quick_gelu: bool,
+    /// `hidden_act`, verbatim from the reference config.
+    ///
+    /// This was a `use_quick_gelu: bool`, which cannot distinguish the three
+    /// GELUs a CLIP checkpoint can name: OpenAI's CLIP is `"quick_gelu"`, but
+    /// LAION re-trains ship `"gelu"` (exact erf) and some variants
+    /// `"gelu_new"` (tanh). Both non-quick spellings collapsed to the same
+    /// wrong function under the boolean.
+    pub hidden_act: String,
 }
 
 impl Default for CLIPConfig {
@@ -32,7 +41,7 @@ impl Default for CLIPConfig {
             intermediate_size: 3072,
             max_position_embeddings: 77,
             layer_norm_eps: 1e-5,
-            use_quick_gelu: true,
+            hidden_act: "quick_gelu".to_string(),
         }
     }
 }
@@ -104,7 +113,8 @@ impl CLIPAttention {
 pub struct CLIPMLP {
     pub fc1: nn::Linear,
     pub fc2: nn::Linear,
-    pub use_quick_gelu: bool,
+    /// `ACT2FN[config.hidden_act]`, resolved once at construction.
+    pub act: Activation,
 }
 impl_module_params!(CLIPMLP; fc1, fc2);
 
@@ -116,26 +126,14 @@ impl CLIPMLP {
         let fc2 = nn::LinearBuilder::new(config.intermediate_size as i32, config.embed_dim as i32)
             .build()
             .unwrap();
-        Self {
-            fc1,
-            fc2,
-            use_quick_gelu: config.use_quick_gelu,
-        }
-    }
-
-    fn quick_gelu(x: &Array) -> Result<Array, Exception> {
-        Ok(x.multiply(&pmetal_bridge::compat::ops::sigmoid(
-            &x.multiply(&Array::from_f32(1.702)),
-        )))
+        let act = resolve_activation(&config.hidden_act)
+            .unwrap_or_else(|| panic!("clip: unsupported hidden_act {:?}", config.hidden_act));
+        Self { fc1, fc2, act }
     }
 
     pub fn forward(&mut self, x: &Array) -> Result<Array, Exception> {
         let x = self.fc1.forward(x);
-        let x = if self.use_quick_gelu {
-            Self::quick_gelu(&x)?
-        } else {
-            nn::gelu(&x)
-        };
+        let x = (self.act)(&x);
         Ok(self.fc2.forward(&x))
     }
 }

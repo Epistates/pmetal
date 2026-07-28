@@ -295,11 +295,11 @@ fn load_clip_config(component_dir: &Path) -> Result<CLIPConfig> {
     config.max_position_embeddings =
         value_usize(&raw, &["max_position_embeddings"]).unwrap_or(config.max_position_embeddings);
     config.layer_norm_eps = value_f32(&raw, &["layer_norm_eps"]).unwrap_or(config.layer_norm_eps);
-    config.use_quick_gelu = match value_str(&raw, &["hidden_act", "activation_function"]) {
-        Some("quick_gelu") => true,
-        Some("gelu") | Some("gelu_new") => false,
-        _ => config.use_quick_gelu,
-    };
+    // Taken verbatim — `CLIPMLP` resolves it through `ACT2FN`, so `"gelu"`
+    // (exact erf) and `"gelu_new"` (tanh) stay distinct.
+    if let Some(hidden_act) = value_str(&raw, &["hidden_act", "activation_function"]) {
+        config.hidden_act = hidden_act.to_string();
+    }
 
     Ok(config)
 }

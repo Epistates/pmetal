@@ -30,6 +30,7 @@ use pmetal_mlx::kernels::{
 };
 use pmetal_mlx::kv_cache::KVCache;
 
+use crate::architectures::utils::{Activation, resolve_activation};
 use crate::traits::{CausalLMModel, ModelConfig};
 use std::collections::HashMap;
 
@@ -123,18 +124,50 @@ pub struct PhiConfig {
 }
 
 /// Activation function type for Phi models.
+///
+/// The GELU spellings map to HuggingFace's `ACT2FN` entries, which are three
+/// distinct functions — see [`resolve_activation`]. Phi-2's released config
+/// says `"gelu_new"` (the tanh approximation), so that spelling has to
+/// deserialize; before this was aliased, loading a stock Phi-2 `config.json`
+/// failed outright on an unknown variant.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum PhiActivation {
     /// SwiGLU activation (Phi-3).
     #[default]
     #[serde(rename = "silu", alias = "swiglu")]
     SwiGLU,
-    /// GELU approximation (Phi-2).
-    #[serde(rename = "gelu_approx")]
+    /// Tanh-approximated GELU (Phi-2's `"gelu_new"`).
+    #[serde(
+        rename = "gelu_new",
+        alias = "gelu_approx",
+        alias = "gelu_pytorch_tanh",
+        alias = "gelu_fast"
+    )]
     GeluApprox,
-    /// GELU exact.
+    /// Exact (erf) GELU.
     #[serde(rename = "gelu")]
     GeluExact,
+}
+
+impl PhiActivation {
+    /// The `ACT2FN` name this variant corresponds to.
+    pub fn act_name(self) -> &'static str {
+        match self {
+            Self::SwiGLU => "silu",
+            Self::GeluApprox => "gelu_new",
+            Self::GeluExact => "gelu",
+        }
+    }
+
+    /// The pointwise function this variant applies.
+    ///
+    /// For [`PhiActivation::SwiGLU`] this is the gate activation, which the
+    /// gated MLP applies to half the projection rather than all of it. Shared
+    /// with the LoRA and QLoRA MLPs so all three agree on what a config's
+    /// activation string means.
+    pub fn act_fn(self) -> Activation {
+        resolve_activation(self.act_name()).expect("act_name is always supported")
+    }
 }
 
 /// Layer normalization type.
@@ -618,8 +651,11 @@ impl PhiMLP {
                 let gate_activated = pmetal_bridge::compat::ops::sigmoid(&gate).multiply(&gate);
                 gate_activated.multiply(&up)
             }
-            PhiActivation::GeluApprox => pmetal_bridge::compat::nn::gelu(&hidden), // gelu_approx not in mlx-rs
-            PhiActivation::GeluExact => pmetal_bridge::compat::nn::gelu(&hidden),
+            // `ACT2FN[hidden_act]` — `"gelu_new"` is the tanh approximation and
+            // `"gelu"` the exact erf definition. They are not interchangeable.
+            PhiActivation::GeluApprox | PhiActivation::GeluExact => {
+                (self.activation.act_fn())(&hidden)
+            }
         };
 
         Ok(self.down_proj.forward(&activated))
