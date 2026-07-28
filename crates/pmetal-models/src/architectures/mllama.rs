@@ -46,7 +46,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::architectures::llama::{LlamaAttention, LlamaConfig, LlamaMLP, RopeScalingValue};
 use crate::architectures::utils::{
-    LoadReport, coerce_mask_dtype, load_layer_norm, load_linear, load_optional_param, load_param,
+    Activation, LoadReport, coerce_mask_dtype, load_layer_norm, load_linear, load_optional_param,
+    load_param, resolve_activation,
 };
 use crate::traits::ModelConfig;
 
@@ -176,17 +177,13 @@ impl MllamaVisionConfig {
     /// Resolve `hidden_act`. Mllama's vision MLP is CLIP's, so the reference
     /// runs `ACT2FN[hidden_act]`; released checkpoints say `"gelu"`, which is
     /// the **exact** erf definition, not either fast approximation.
-    fn activation(&self) -> Result<fn(&Array) -> Array, Exception> {
-        match self.hidden_act.as_str() {
-            "gelu" => Ok(nn::gelu_erf),
-            "gelu_pytorch_tanh" | "gelu_new" => Ok(nn::gelu_tanh_approximate),
-            "quick_gelu" => Ok(nn::gelu),
-            "relu" => Ok(nn::relu),
-            "silu" => Ok(nn::silu),
-            other => Err(Exception::custom(format!(
-                "mllama vision: unsupported hidden_act {other:?}"
-            ))),
-        }
+    fn activation(&self) -> Result<Activation, Exception> {
+        resolve_activation(&self.hidden_act).ok_or_else(|| {
+            Exception::custom(format!(
+                "mllama vision: unsupported hidden_act {:?}",
+                self.hidden_act
+            ))
+        })
     }
 }
 
