@@ -103,7 +103,7 @@ impl ModelArchitecture {
             // variants per layer type, k_eq_v for full-attention, layer
             // scalar, final logit softcapping). Multimodal wrappers nest
             // the text backbone under `text_config`; the loader unwraps.
-            "gemma4" | "gemma4_text" => Some(Self::Gemma4),
+            "gemma4" | "gemma4_text" | "gemma4_unified" => Some(Self::Gemma4),
             "mistral" | "mixtral" => Some(Self::Mistral),
             "phi4" => Some(Self::Phi4),
             "phi" | "phi3" => Some(Self::Phi),
