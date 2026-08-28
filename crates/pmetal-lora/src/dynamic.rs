@@ -972,6 +972,10 @@ mod tests {
             Some(ModelArchitecture::Gemma4)
         );
         assert_eq!(
+            ModelArchitecture::from_model_type("gemma4_unified"),
+            Some(ModelArchitecture::Gemma4)
+        );
+        assert_eq!(
             ModelArchitecture::from_model_type("gpt_oss"),
             Some(ModelArchitecture::GptOss)
         );

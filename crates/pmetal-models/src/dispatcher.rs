@@ -204,7 +204,7 @@ impl ModelArchitecture {
             // variants per layer type, k_eq_v for full-attention, layer
             // scalar, final logit softcapping). Multimodal wrappers nest
             // the text backbone under `text_config`; the loader unwraps.
-            "gemma4" | "gemma4_text" => Some(Self::Gemma4),
+            "gemma4" | "gemma4_text" | "gemma4_unified" => Some(Self::Gemma4),
             // DiffusionGemma must be matched before the generic gemma fallbacks
             // (its model_type is distinct, but keep it explicit).
             "diffusion_gemma" | "diffusion_gemma_text" => Some(Self::DiffusionGemma),
