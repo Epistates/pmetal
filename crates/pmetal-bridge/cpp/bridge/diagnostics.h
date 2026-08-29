@@ -26,6 +26,13 @@ void mlx_inline_synchronize(void);
 // Matches Python's mx.metal.clear_cache(), mx.metal.set_cache_limit().
 void mlx_inline_clear_cache(void);
 
+// ── Metallib path override ───────────────────────────────────────────────
+// Forward to mlx::core::metal::set_metallib_path (upstream API since MLX
+// v0.32): the given .metallib is loaded in preference to the automatic
+// search when the Metal device initializes. Lazy — safe to call any time
+// before the first GPU operation. No-op check is the caller's job.
+void mlx_inline_set_metallib_path(const char* path);
+
 // ── Metal capture for profiling ──────────────────────────────────────────
 int mlx_inline_metal_start_capture(const char* path);
 void mlx_inline_metal_stop_capture(void);

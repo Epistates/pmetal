@@ -38,6 +38,15 @@ pub fn metal_start_capture(path: &str) -> bool {
     unsafe { mlx_inline_metal_start_capture(c_path.as_ptr()) == 0 }
 }
 
+/// Point MLX at a specific `mlx.metallib` (upstream `set_metallib_path`,
+/// MLX >= 0.32). Lazy: MLX consults the stored path when the Metal device
+/// first loads its kernel library, so call this before the first GPU op.
+/// Replaces the pre-0.32 source patch that read PMETAL_METALLIB_PATH.
+pub fn set_metallib_path(path: &str) {
+    let c_path = std::ffi::CString::new(path).unwrap();
+    unsafe { mlx_inline_set_metallib_path(c_path.as_ptr()) }
+}
+
 /// Stop the Metal GPU capture.
 ///
 /// Diagnostic entry point — retained for ad-hoc profiling.

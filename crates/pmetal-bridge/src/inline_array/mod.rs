@@ -14,7 +14,8 @@ pub use diagnostics::{
     clear_cache, disable_compile, enable_compile, eval_and_detach_many, get_active_memory,
     get_cache_memory, get_max_recommended_size, get_peak_memory, graph_desc_count, graph_dump,
     graph_node_count, metal_start_capture, metal_stop_capture, new_generation_stream,
-    reset_default_stream, reset_peak_memory, set_generation_stream, set_wired_limit,
+    reset_default_stream, reset_peak_memory, set_generation_stream, set_metallib_path,
+    set_wired_limit,
     set_wired_limit_max, synchronize, verify_buffer_layout,
 };
 
