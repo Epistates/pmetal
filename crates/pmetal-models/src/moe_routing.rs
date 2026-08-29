@@ -67,7 +67,11 @@ pub fn topk_normalize(
     // tail of the axis. We then slice them and cast to the i32 index
     // dtype expected by `take_along_axis`.
     let part_indices = ops::argpartition_axis(scores, neg_k, -1);
-    let top_indices = ops::slice_last_from(&part_indices, neg_k).as_type::<i32>();
+    // MLX >= 0.32 raises "[gather] Cannot calculate VJP with respect to
+    // indices" when routing indices sit downstream of differentiable scores
+    // inside a grad trace — cut it here so gradients flow only through the
+    // gathered weights, never the index path.
+    let top_indices = ops::stop_gradient(&ops::slice_last_from(&part_indices, neg_k).as_type::<i32>());
     let top_weights = scores.take_along_axis(&top_indices, -1);
 
     let normalized_weights = if norm_topk_prob {
