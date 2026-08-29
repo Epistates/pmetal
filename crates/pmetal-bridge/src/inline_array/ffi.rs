@@ -202,6 +202,7 @@ unsafe extern "C" {
     pub(super) fn mlx_inline_graph_dump(a: *const RawBuf);
     pub(super) fn mlx_inline_metal_start_capture(path: *const std::ffi::c_char) -> i32;
     pub(super) fn mlx_inline_metal_stop_capture();
+    pub(super) fn mlx_inline_set_metallib_path(path: *const std::ffi::c_char);
 
     // Fixed-shape compiled GDN layer (shapeless=false, works with ALL primitives)
     pub(super) fn mlx_inline_compiled_gdn_layer_fixed(

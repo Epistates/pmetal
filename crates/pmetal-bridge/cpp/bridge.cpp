@@ -602,6 +602,10 @@ void mlx_inline_synchronize(void) {
     }
 }
 
+void mlx_inline_set_metallib_path(const char* path) {
+    mlx::core::metal::set_metallib_path(path);
+}
+
 int mlx_inline_metal_start_capture(const char* path) {
     mlx::core::metal::start_capture(path);
     return 0;

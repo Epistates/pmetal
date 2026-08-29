@@ -1,7 +1,7 @@
 use cmake::Config;
 use std::{env, path::PathBuf, process::Command};
 
-const BUNDLED_MLX_GIT_TAG: &str = "v0.31.1";
+const BUNDLED_MLX_GIT_TAG: &str = "v0.32.2";
 
 // ── Deployment target ──────────────────────────────────────────────────────
 
@@ -86,21 +86,18 @@ fn emit_bridge_metadata(key: &str, value: impl AsRef<str>) {
     println!("cargo:metadata={key}={}", value.as_ref());
 }
 
-// ── Patches (embedded as string constants) ────────────────────────────────
-
-/// The metallib search-path patch: adds PMETAL_METALLIB_PATH env-var override
-/// and ~/.cache/pmetal/lib/ user-cache lookups to MLX's Metal device loader.
-const METALLIB_SEARCH_PATH_PATCH: &str = include_str!("patches/metallib-search-path.patch");
-
 // ── Staging + CMake build ─────────────────────────────────────────────────
+//
+// Since MLX v0.32 the metallib override is upstream API
+// (mlx::core::metal::set_metallib_path), called from the bridge at startup —
+// the vendored MLX checkout is built exactly as shipped, no patches.
 
-/// Stage the minimal CMakeLists.txt into OUT_DIR, inject the patch commands,
-/// and write the patch files. Returns the staged directory path.
+/// Stage the minimal CMakeLists.txt into OUT_DIR. Returns the staged directory path.
 fn prepare_cmake_source() -> PathBuf {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let staged = out_dir.join("bridge-cmake-staged");
 
-    // Always re-stage so patch edits are picked up on rebuild
+    // Always re-stage so edits are picked up on rebuild
     if staged.exists() {
         std::fs::remove_dir_all(&staged).expect("Failed to clean staged cmake dir");
     }
@@ -112,29 +109,15 @@ fn prepare_cmake_source() -> PathBuf {
     let cmake_content =
         std::fs::read_to_string(&cmake_src).expect("Failed to read cmake/CMakeLists.txt");
 
-    // Inject PATCH_COMMAND into the FetchContent_Declare for MLX (same pattern as mlx-sys).
-    // Keep the tag here tied to BUNDLED_MLX_GIT_TAG so version bumps cannot
-    // accidentally build an unpatched MLX checkout.
-    let search = format!("GIT_TAG {BUNDLED_MLX_GIT_TAG})");
-    let replacement = format!(
-        "GIT_TAG {BUNDLED_MLX_GIT_TAG}\n  PATCH_COMMAND /bin/sh -c \"git apply --check ${{CMAKE_CURRENT_SOURCE_DIR}}/patches/metallib-search-path.patch && git apply ${{CMAKE_CURRENT_SOURCE_DIR}}/patches/metallib-search-path.patch || git apply --reverse --check ${{CMAKE_CURRENT_SOURCE_DIR}}/patches/metallib-search-path.patch\")"
+    // Guard: the cmake tag must match BUNDLED_MLX_GIT_TAG so version bumps
+    // cannot silently build a different MLX than the one this crate targets.
+    let expected = format!("GIT_TAG {BUNDLED_MLX_GIT_TAG})");
+    assert!(
+        cmake_content.contains(&expected),
+        "cmake/CMakeLists.txt GIT_TAG does not match BUNDLED_MLX_GIT_TAG {BUNDLED_MLX_GIT_TAG}"
     );
-    let patched = cmake_content.replace(&search, &replacement);
-    assert_ne!(
-        patched, cmake_content,
-        "failed to inject MLX patch command for {BUNDLED_MLX_GIT_TAG}"
-    );
-    std::fs::write(staged.join("CMakeLists.txt"), patched)
-        .expect("Failed to write patched CMakeLists.txt");
-
-    // Write patch files into staged/patches/
-    let patches_dir = staged.join("patches");
-    std::fs::create_dir_all(&patches_dir).expect("Failed to create patches dir");
-    std::fs::write(
-        patches_dir.join("metallib-search-path.patch"),
-        METALLIB_SEARCH_PATH_PATCH,
-    )
-    .expect("Failed to write metallib patch");
+    std::fs::write(staged.join("CMakeLists.txt"), cmake_content)
+        .expect("Failed to write staged CMakeLists.txt");
 
     staged
 }
@@ -553,7 +536,6 @@ fn build_and_link() {
     println!("cargo:rerun-if-changed=cpp/bridge.h");
     println!("cargo:rerun-if-changed=cpp/bridge_internal.h");
     println!("cargo:rerun-if-changed=cmake/CMakeLists.txt");
-    println!("cargo:rerun-if-changed=patches/metallib-search-path.patch");
     println!("cargo:rerun-if-env-changed=PMETAL_MLX_PREFIX");
     println!("cargo:rerun-if-env-changed=PMETAL_MLX_LIB_DIR");
 }

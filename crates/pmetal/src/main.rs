@@ -1046,8 +1046,9 @@ fn extract_embedded_metallib() -> Option<PathBuf> {
     Some(dest)
 }
 
-/// Discover `mlx.metallib` and set `PMETAL_METALLIB_PATH` so the patched MLX
-/// C++ backend can find it regardless of where the binary is installed.
+/// Discover `mlx.metallib` and hand it to MLX via the upstream
+/// `set_metallib_path` API (MLX >= 0.32) so the backend can find it
+/// regardless of where the binary is installed.
 ///
 /// Search order: colocated → build dir → cache → Homebrew → embedded → download → error.
 #[allow(unsafe_code)]
@@ -1111,10 +1112,16 @@ fn ensure_metallib() {
     if let Some(path) = search_paths.iter().find(|p| p.is_file()) {
         // SAFETY: called before any other threads; env var is process-internal
         unsafe {
+            // Kept for external tooling/back-compat; MLX itself no longer
+            // reads this — the bridge call below is what MLX honours.
             std::env::set_var("PMETAL_METALLIB_PATH", path);
             // Q1 2026 Best Practice: Enable JIT for architecture-specific optimizations (M4+)
             std::env::set_var("MLX_METAL_JIT", "1");
         };
+        // Since MLX v0.32 the override is upstream API (set_metallib_path),
+        // replacing the pre-0.32 source patch that read the env var.
+        #[cfg(any(feature = "models", feature = "native-only"))]
+        pmetal_bridge::inline_array::set_metallib_path(&path.to_string_lossy());
         tracing::debug!(path = %path.display(), "Found mlx.metallib");
 
         // Auto-cache: if found colocated with binary, copy to cache dir for resilience
@@ -1142,6 +1149,8 @@ fn ensure_metallib() {
             std::env::set_var("PMETAL_METALLIB_PATH", &path);
             std::env::set_var("MLX_METAL_JIT", "1");
         };
+        #[cfg(any(feature = "models", feature = "native-only"))]
+        pmetal_bridge::inline_array::set_metallib_path(&path.to_string_lossy());
         tracing::debug!(path = %path.display(), "Using embedded mlx.metallib");
         return;
     }
@@ -1151,6 +1160,8 @@ fn ensure_metallib() {
         let dest = cache.join(metallib_name);
         if download_metallib(&dest) {
             unsafe { std::env::set_var("PMETAL_METALLIB_PATH", &dest) };
+            #[cfg(any(feature = "models", feature = "native-only"))]
+            pmetal_bridge::inline_array::set_metallib_path(&dest.to_string_lossy());
             return;
         }
     }
