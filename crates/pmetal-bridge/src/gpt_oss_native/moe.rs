@@ -34,10 +34,15 @@ pub(super) fn moe_forward(lw: &LayerWeights, normed: &InlineArray, b: i32, s: i3
     // Top-k: argpartition at kth = -top_k gives top-k indices in the last k slots
     let neg_k = -lw.moe_top_k;
     let partitioned = scores.argpartition(neg_k, -1); // [B*T, num_experts]
-    let top_k_indices = partitioned.slice(
-        &[0, lw.moe_num_experts - lw.moe_top_k],
-        &[bt, lw.moe_num_experts],
-    );
+    let top_k_indices = partitioned
+        .slice(
+            &[0, lw.moe_num_experts - lw.moe_top_k],
+            &[bt, lw.moe_num_experts],
+        )
+        // MLX >= 0.32: routing indices sit downstream of differentiable
+        // scores, and gather VJP w.r.t. indices now raises — cut the trace
+        // here (gradients flow through expert_weights, never the indices).
+        .stop_gradient();
     // Re-cast to int32 for gather ops (argpartition returns int32 already, but ensure)
     let top_k_scores = scores.take_along_axis(&top_k_indices, -1); // [B*T, top_k]
 

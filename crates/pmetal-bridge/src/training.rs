@@ -100,7 +100,8 @@ fn per_token_cross_entropy_impl(
         )
     };
 
-    let gather_indices = gather_labels.expand_dims(-1);
+    // MLX >= 0.32: label indices must never enter the grad trace
+    let gather_indices = gather_labels.expand_dims(-1).stop_gradient();
     let selected_logits = flat_logits.take_along_axis(&gather_indices, -1).squeeze(-1);
     let logsumexp = flat_logits.logsumexp(-1, false);
     let per_token_loss = logsumexp

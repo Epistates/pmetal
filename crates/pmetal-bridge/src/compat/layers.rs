@@ -403,7 +403,10 @@ impl Embedding {
 
     pub fn forward(&self, x: &Array) -> Array {
         let weight = fp8_weight_for_compute(&self.weight.value);
-        weight.take_axis(x, 0)
+        // MLX >= 0.32 raises "[gather] Cannot calculate VJP with respect to
+        // indices" when token indices sit inside the grad trace; the lookup
+        // must never be differentiated w.r.t. its indices.
+        weight.take_axis(&x.stop_gradient(), 0)
     }
 
     pub fn as_linear(&self, x: &Array) -> Array {

@@ -66,6 +66,8 @@ pub fn selective_log_softmax_with_temperature(
     let gather_indices = gather_labels.expand_dims(-1i32);
 
     // Gather the single logit at each target position: [B, S, 1]
+    // MLX >= 0.32: label indices must not enter the grad trace
+    let gather_indices = gather_indices.stop_gradient();
     let selected_logits = logits.take_along_axis(&gather_indices, -1);
 
     // logsumexp over vocab dim, keepdims for broadcast: [B, S, 1]

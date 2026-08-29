@@ -29,7 +29,8 @@ pub fn forward_step(
     let dtype = weights.model_dtype;
 
     // Embedding lookup: [B, T, hidden]
-    let mut hidden = weights.embed_w.take_axis(token_ids, 0);
+    // MLX >= 0.32: indices must be stop_gradient'd inside a grad trace
+    let mut hidden = weights.embed_w.take_axis(&token_ids.stop_gradient(), 0);
 
     for (li, lw) in weights.layers.iter().enumerate() {
         // Input LayerNorm
