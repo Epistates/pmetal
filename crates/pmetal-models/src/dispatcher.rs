@@ -38,6 +38,95 @@ fn eval_module_parameters_batched(module: &impl ModuleParametersExt) -> Result<(
     Ok(())
 }
 
+/// Rewrite the bare `Infinity` / `NaN` literals some released configs contain
+/// into `null`.
+///
+/// Python's `json.dump` emits `Infinity` and `NaN` unquoted, which round-trips
+/// through Python but is not valid JSON — `serde_json` rejects it, and
+/// `serde_json::Value` could not hold the value anyway (`Number::from_f64`
+/// refuses non-finite floats). `nvidia/Nemotron-H-8B-Base-8K` ships
+/// `"time_step_limit": [0.0, Infinity]`, which was enough to make every
+/// Nemotron-H checkpoint undetectable: `detect` failed on the JSON parse before
+/// it ever reached the architecture's own `json5` deserialization, which
+/// accepts the literal and keeps the real value.
+///
+/// Only the `serde_json::Value` view is affected, and that view is read for
+/// `model_type`, `architectures`, and `text_config` — never for a numeric
+/// field — so flattening these to `null` loses nothing.
+fn sanitize_non_finite(src: &str) -> String {
+    const TOKENS: [&str; 4] = ["-Infinity", "Infinity", "-NaN", "NaN"];
+    let mut out = String::with_capacity(src.len());
+    let mut chars = src.char_indices();
+    let mut in_string = false;
+    let mut escaped = false;
+    while let Some((idx, ch)) = chars.next() {
+        if in_string {
+            out.push(ch);
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+        if ch == '"' {
+            in_string = true;
+            out.push(ch);
+            continue;
+        }
+        if let Some(token) = TOKENS.into_iter().find(|t| src[idx..].starts_with(t)) {
+            out.push_str("null");
+            for _ in 1..token.len() {
+                chars.next();
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Parse a `config.json` into a `serde_json::Value`, tolerating the non-finite
+/// literals described on [`sanitize_non_finite`].
+///
+/// Strict parsing is tried first so a well-formed config never pays for the
+/// rewrite, and so a genuinely malformed one still reports its original error.
+///
+/// Public because anything reading a released config needs this tolerance, not
+/// just the loader — `serde_json::from_str` on a Nemotron-H config fails, and
+/// failing that way looks like a corrupt file rather than a dialect mismatch.
+pub fn config_value(config_content: &str) -> Result<serde_json::Value, Exception> {
+    match serde_json::from_str(config_content) {
+        Ok(value) => Ok(value),
+        Err(strict_err) => serde_json::from_str(&sanitize_non_finite(config_content))
+            .map_err(|_| Exception::custom(strict_err.to_string())),
+    }
+}
+
+/// Unwrap a multimodal wrapper config down to its text tower.
+///
+/// Llama 4, Gemma 3/4, Qwen 3.5 and Gemma 4 all ship released configs where the
+/// language-model fields live under `text_config` and the top level carries
+/// only the wrapper (vision config, projector, token ids). The guard is
+/// `text_config` present *and* no top-level `hidden_size`, so a text-only
+/// checkpoint of the same family passes through byte-identical.
+///
+/// This was copy-pasted into four `load_with_options` arms; it is shared so
+/// [`ModelArchitecture::parse_config_json`] cannot disagree with the loader
+/// about what a wrapper config means.
+fn unwrap_text_config(config_content: &str) -> Result<std::borrow::Cow<'_, str>, Exception> {
+    let config_json = config_value(config_content)?;
+    if config_json.get("text_config").is_some() && config_json.get("hidden_size").is_none() {
+        let inner = serde_json::to_string(&config_json["text_config"])
+            .map_err(|e| Exception::custom(e.to_string()))?;
+        Ok(std::borrow::Cow::Owned(inner))
+    } else {
+        Ok(std::borrow::Cow::Borrowed(config_content))
+    }
+}
+
 /// Model architecture types supported by PMetal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ModelArchitecture {
@@ -127,7 +216,16 @@ impl ModelArchitecture {
             "granite" | "granitehybrid" | "granite_moe" => Some(Self::Granite),
             "nemotron_h" | "nemotronh" | "nemotron-h" => Some(Self::NemotronH),
             "flux" | "flux-1" | "flux.1" => Some(Self::Flux),
-            "bert" | "roberta" | "distilbert" | "xlm-roberta" | "xlm_roberta" => Some(Self::Bert),
+            // Only real BERT. `roberta`, `xlm-roberta` and `distilbert` used to
+            // map here, and none of the three can actually load:
+            // `BertConfig` has no spelling for DistilBERT's `dim` / `n_layers`
+            // / `hidden_dim`, and `remap_bert_weight_name` strips a `bert.`
+            // prefix, not `roberta.` — so a RoBERTa checkpoint matched zero
+            // parameters. RoBERTa additionally offsets its position ids past
+            // the padding index, which a prefix fix alone would get silently
+            // wrong. Claiming these here only bought a later, more confusing
+            // failure.
+            "bert" => Some(Self::Bert),
             _ => None,
         }
     }
@@ -212,12 +310,75 @@ impl ModelArchitecture {
             if lower.contains("flux") {
                 return Some(Self::Flux);
             }
-            // Check BERT family after other checks to avoid false positives
-            if lower.contains("bert") {
+            // Check BERT after other checks to avoid false positives. The
+            // RoBERTa / DistilBERT exclusion mirrors `from_model_type`: their
+            // class names contain "bert" but neither is loadable here.
+            if lower.contains("bert") && !lower.contains("distilbert") && !lower.contains("roberta")
+            {
                 return Some(Self::Bert);
             }
         }
         None
+    }
+
+    /// Deserialize a `config.json` into this architecture's config struct and
+    /// hand back the round-tripped JSON, without reading a single weight.
+    ///
+    /// [`DynamicModel::load_with_options`] fuses config deserialization into
+    /// the weight load, so the only way to discover whether pmetal can parse a
+    /// released `config.json` used to be to download the whole checkpoint.
+    /// That is how a stock Phi-2 config sat unparseable: nothing cheap ever
+    /// tried it. This runs the same deserialization on the config alone, which
+    /// lets a caller reject an unsupported checkpoint before paying for it —
+    /// and lets `real_config_parity` hold every architecture against its real
+    /// released config for the price of a few kilobytes.
+    ///
+    /// The returned value is `serde_json::to_value` of the parsed struct, so a
+    /// caller can compare it field-by-field against the raw config. That
+    /// comparison is the point: most of these structs are `#[serde(default)]`,
+    /// so a field pmetal spells differently than the checkpoint does not fail
+    /// to parse — it silently takes pmetal's default.
+    pub fn parse_config_json(self, config_content: &str) -> Result<serde_json::Value, Exception> {
+        /// Deserialize into `$ty` exactly as the matching `load` arm does, then
+        /// re-serialize. `$content` is the (possibly text-config-unwrapped)
+        /// source.
+        macro_rules! round_trip {
+            ($ty:ty, $content:expr) => {{
+                let parsed: $ty =
+                    json5::from_str($content).map_err(|e| Exception::custom(e.to_string()))?;
+                serde_json::to_value(&parsed).map_err(|e| Exception::custom(e.to_string()))
+            }};
+        }
+
+        let nested = unwrap_text_config(config_content)?;
+        match self {
+            Self::Llama => round_trip!(LlamaConfig, config_content),
+            Self::Llama4 => round_trip!(Llama4TextConfig, &nested),
+            Self::Qwen2 => round_trip!(Qwen2Config, config_content),
+            Self::Qwen3 => round_trip!(Qwen3Config, config_content),
+            Self::Qwen3MoE => round_trip!(Qwen3MoEConfig, config_content),
+            Self::Gemma => round_trip!(GemmaConfig, &nested),
+            Self::Mistral => round_trip!(MistralConfig, config_content),
+            Self::Phi | Self::Phi4 => round_trip!(PhiConfig, config_content),
+            Self::DeepSeek => round_trip!(DeepSeekConfig, config_content),
+            Self::Cohere => round_trip!(CohereConfig, config_content),
+            Self::Granite => round_trip!(GraniteConfig, config_content),
+            Self::NemotronH => round_trip!(NemotronHConfig, config_content),
+            Self::Qwen3Next => round_trip!(Qwen3NextConfig, &nested),
+            Self::GptOss => round_trip!(GptOssConfig, config_content),
+            Self::Gemma4 => round_trip!(crate::architectures::gemma4::Gemma4Config, &nested),
+            Self::Bert => round_trip!(BertConfig, config_content),
+            Self::DiffusionGemma => {
+                let parsed = crate::architectures::diffusion_gemma::parse_diffusion_gemma_config(
+                    config_content,
+                )?;
+                serde_json::to_value(&parsed).map_err(|e| Exception::custom(e.to_string()))
+            }
+            Self::Mllama => round_trip!(MllamaConfig, config_content),
+            Self::Flux => Err(Exception::custom(
+                "Flux is a diffusion pipeline, not a causal LM; its config is parsed by FluxPipeline.",
+            )),
+        }
     }
 
     pub fn detect<P: AsRef<Path>>(model_dir: P) -> Result<Self, Exception> {
@@ -230,8 +391,7 @@ impl ModelArchitecture {
         }
         let config_content = std::fs::read_to_string(config_path)
             .map_err(|e| Exception::custom(format!("{}", e)))?;
-        let config: serde_json::Value = serde_json::from_str(&config_content)
-            .map_err(|e| Exception::custom(format!("{}", e)))?;
+        let config = config_value(&config_content)?;
 
         let architectures = config["architectures"].as_array().map(|a| {
             a.iter()
@@ -444,8 +604,7 @@ impl DynamicModel {
         }
         let config_content = std::fs::read_to_string(&config_path)
             .map_err(|e| Exception::custom(format!("{}", e)))?;
-        let base_config: serde_json::Value = serde_json::from_str(&config_content)
-            .map_err(|e| Exception::custom(format!("{}", e)))?;
+        let base_config = config_value(&config_content)?;
         let architectures = base_config["architectures"].as_array().map(|a| {
             a.iter()
                 .map(|v| v.as_str().unwrap_or("").to_string())
@@ -471,16 +630,7 @@ impl DynamicModel {
                 Llama
             ),
             ModelArchitecture::Llama4 => {
-                let config_json: serde_json::Value = serde_json::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let effective = if config_json.get("text_config").is_some()
-                    && config_json.get("hidden_size").is_none()
-                {
-                    serde_json::to_string(&config_json["text_config"])
-                        .map_err(|e| Exception::custom(e.to_string()))?
-                } else {
-                    config_content.clone()
-                };
+                let effective = unwrap_text_config(&config_content)?;
                 let config: Llama4TextConfig =
                     json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = Llama4ForCausalLM::new(config)?;
@@ -521,19 +671,7 @@ impl DynamicModel {
                 Qwen3MoE
             ),
             ModelArchitecture::Gemma => {
-                // Gemma 4 multimodal configs nest the text-tower fields
-                // under `text_config` (same pattern as Qwen 3.5 VLM). Unwrap
-                // if present and the top-level has no `hidden_size`.
-                let config_json: serde_json::Value = serde_json::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let effective = if config_json.get("text_config").is_some()
-                    && config_json.get("hidden_size").is_none()
-                {
-                    serde_json::to_string(&config_json["text_config"])
-                        .map_err(|e| Exception::custom(e.to_string()))?
-                } else {
-                    config_content.clone()
-                };
+                let effective = unwrap_text_config(&config_content)?;
                 let mut config: GemmaConfig =
                     json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
                 // Set the Gemma3 flag based on model_type to enable the
@@ -650,17 +788,7 @@ impl DynamicModel {
                 Ok(model)
             }
             ModelArchitecture::Qwen3Next => {
-                // Qwen 3.5 configs may have text_config nesting (VLM wrapper format)
-                let config_json: serde_json::Value = serde_json::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let text_config_str = if config_json.get("text_config").is_some()
-                    && config_json.get("hidden_size").is_none()
-                {
-                    serde_json::to_string(&config_json["text_config"])
-                        .map_err(|e| Exception::custom(e.to_string()))?
-                } else {
-                    config_content.clone()
-                };
+                let text_config_str = unwrap_text_config(&config_content)?;
                 let mut config: Qwen3NextConfig = serde_json::from_str(&text_config_str)
                     .map_err(|e| Exception::custom(e.to_string()))?;
                 config.apply_rope_parameters();
@@ -697,19 +825,7 @@ impl DynamicModel {
                 GptOss
             ),
             ModelArchitecture::Gemma4 => {
-                // Gemma 4 configs nest the text tower under `text_config`
-                // (multimodal wrapper). Unwrap if the top level has no
-                // `hidden_size`.
-                let config_json: serde_json::Value = serde_json::from_str(&config_content)
-                    .map_err(|e| Exception::custom(e.to_string()))?;
-                let effective = if config_json.get("text_config").is_some()
-                    && config_json.get("hidden_size").is_none()
-                {
-                    serde_json::to_string(&config_json["text_config"])
-                        .map_err(|e| Exception::custom(e.to_string()))?
-                } else {
-                    config_content.clone()
-                };
+                let effective = unwrap_text_config(&config_content)?;
                 let config: crate::architectures::gemma4::Gemma4Config =
                     json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
                 let mut model = crate::architectures::gemma4::Gemma4ForCausalLM::new(config)?;
@@ -1246,7 +1362,13 @@ impl DynamicModel {
             // `batched_prenorm_layer`. Hybrid (Mamba2 + Attention) configs
             // stay on serial until the simplified Mamba2 stub is replaced
             // with a real stateful implementation.
-            Self::Granite(m) => !m.config.is_hybrid,
+            //
+            // So do configs with a non-unit `residual_multiplier` — which is
+            // every released Granite. `batched_prenorm_layer` adds both
+            // residual branches unscaled and has no channel for the scale, so
+            // taking the fused path would silently drop it. Lifting this means
+            // threading the multiplier into that helper.
+            Self::Granite(m) => !m.config.is_hybrid && m.config.residual_multiplier == 1.0,
             _ => false,
         }
     }
@@ -1488,6 +1610,77 @@ impl Module<Array> for DynamicModel {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// The literal `nvidia/Nemotron-H-8B-Base-8K` ships, reduced.
+    ///
+    /// `serde_json` rejects the bare `Infinity`, which made every Nemotron-H
+    /// checkpoint undetectable — `detect` failed on the JSON parse long before
+    /// the architecture's own `json5` deserialization, which accepts it.
+    const NEMOTRON_STYLE_CONFIG: &str = r#"{
+        "model_type": "nemotron_h",
+        "time_step_limit": [0.0, Infinity],
+        "hidden_size": 4096
+    }"#;
+
+    #[test]
+    fn non_finite_literals_do_not_defeat_config_parsing() {
+        assert!(
+            serde_json::from_str::<serde_json::Value>(NEMOTRON_STYLE_CONFIG).is_err(),
+            "premise: strict JSON must reject this, or the fix is testing nothing"
+        );
+
+        let value = config_value(NEMOTRON_STYLE_CONFIG).expect("tolerant parse");
+        assert_eq!(value["model_type"], "nemotron_h");
+        assert_eq!(value["hidden_size"], 4096);
+        // `serde_json::Number` cannot hold a non-finite float at all, so the
+        // element is flattened rather than preserved. Nothing reads it from
+        // this view — the config struct is deserialized from the original text.
+        assert_eq!(value["time_step_limit"][1], serde_json::Value::Null);
+    }
+
+    #[test]
+    fn sanitizing_leaves_strings_and_well_formed_configs_alone() {
+        // `Infinity` inside a string value is data, not a literal.
+        let quoted = r#"{"model_type": "llama", "note": "Infinity and NaN"}"#;
+        assert_eq!(sanitize_non_finite(quoted), quoted);
+
+        // Non-ASCII must survive the byte-level scan intact.
+        let unicode = r#"{"eos_token": "<|end▁of▁sentence|>", "x": NaN}"#;
+        let cleaned = sanitize_non_finite(unicode);
+        assert!(cleaned.contains("<|end▁of▁sentence|>"));
+        assert!(cleaned.contains("\"x\": null"));
+
+        // Negation is consumed with the literal, not left dangling as `-null`.
+        let negative = r#"{"lo": -Infinity}"#;
+        assert_eq!(sanitize_non_finite(negative), r#"{"lo": null}"#);
+    }
+
+    #[test]
+    fn unsupported_encoder_families_are_rejected_rather_than_routed_to_bert() {
+        assert_eq!(
+            ModelArchitecture::from_model_type("bert"),
+            Some(ModelArchitecture::Bert)
+        );
+        // Neither can load: DistilBERT's config names `dim` / `n_layers`, and
+        // RoBERTa's weights are prefixed `roberta.`, which nothing strips.
+        // Rejecting here beats matching zero parameters later.
+        assert_eq!(ModelArchitecture::from_model_type("distilbert"), None);
+        assert_eq!(ModelArchitecture::from_model_type("roberta"), None);
+        assert_eq!(ModelArchitecture::from_model_type("xlm-roberta"), None);
+        assert_eq!(
+            ModelArchitecture::from_architectures(&["DistilBertForMaskedLM".to_string()]),
+            None,
+            "the class name contains \"bert\" — the substring check must not claim it"
+        );
+        assert_eq!(
+            ModelArchitecture::from_architectures(&["RobertaForMaskedLM".to_string()]),
+            None
+        );
+        assert_eq!(
+            ModelArchitecture::from_architectures(&["BertModel".to_string()]),
+            Some(ModelArchitecture::Bert)
+        );
+    }
 
     fn tiny_qwen3_moe_config() -> Qwen3MoEConfig {
         Qwen3MoEConfig {

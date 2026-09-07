@@ -1,7 +1,14 @@
 //! BERT encoder architecture for embedding / sentence-transformer training.
 //!
-//! Supports BERT, RoBERTa, DistilBERT, and similar encoder-only models
-//! (`model_type`: `"bert"`, `"roberta"`, `"distilbert"`).
+//! Supports BERT (`model_type: "bert"`) and checkpoints that share its config
+//! and key layout.
+//!
+//! It does **not** support RoBERTa or DistilBERT, which this header used to
+//! claim. DistilBERT's released config names none of the fields below — it
+//! spells them `dim`, `hidden_dim`, `n_layers`, `n_heads` — and RoBERTa
+//! prefixes its weights `roberta.` and offsets its position ids past the
+//! padding index. Both were routed here and both failed; the dispatcher now
+//! rejects them up front.
 //!
 //! Unlike causal LM architectures this model:
 //! - Uses **bidirectional** self-attention (no causal mask).

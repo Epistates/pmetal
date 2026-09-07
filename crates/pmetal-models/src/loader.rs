@@ -1655,8 +1655,14 @@ fn load_group_norm_weight(
 /// | `embeddings.position_ids`             | skipped (buffer, not a parameter)    |
 /// | `pooler.*`                            | skipped (not part of BertForEmbedding)|
 ///
-/// Both `bert.` prefixed keys (standard BERT / RoBERTa) and bare keys (some
-/// fine-tuned checkpoints that strip the top-level prefix) are handled.
+/// Both `bert.` prefixed keys and bare keys (some fine-tuned checkpoints strip
+/// the top-level prefix) are handled.
+///
+/// This is BERT only, despite what this comment used to claim. A RoBERTa
+/// checkpoint prefixes every key with `roberta.`, which nothing here strips, so
+/// it matched zero parameters and failed with a message about the checkpoint
+/// rather than about the gap. `ModelArchitecture::from_model_type` no longer
+/// routes RoBERTa or DistilBERT here.
 pub fn load_bert_weights(
     model: &mut BertForEmbedding,
     weights: &HashMap<String, Array>,
