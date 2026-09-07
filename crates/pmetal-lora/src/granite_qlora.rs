@@ -59,9 +59,9 @@ impl GraniteQLoraAttention {
     pub fn new(config: &GraniteConfig, qlora_config: &QLoraConfig) -> Result<Self, LoraError> {
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
-        let head_dim = config.head_dim;
+        let head_dim = config.resolved_head_dim();
         let hidden_size = config.hidden_size;
-        let scale = (head_dim as f32).sqrt().recip();
+        let scale = config.attention_scale();
 
         let mut q_config = qlora_config.clone();
         q_config.lora.r = crate::effective_rank(&qlora_config.lora, "q_proj");
@@ -251,6 +251,9 @@ impl GraniteQloraMLP {
 pub struct GraniteQloraDecoderLayer {
     /// Layer type tag (Attention or Mamba2).
     pub layer_type: GraniteLayerType,
+    /// `config.residual_multiplier`, applied to both residual branches, so a
+    /// QLoRA adapter is fit against the same math inference runs.
+    pub residual_multiplier: f32,
 
     /// QLoRA attention (present for Attention layers, None for Mamba2).
     pub attention: Option<GraniteQLoraAttention>,
@@ -297,6 +300,7 @@ impl GraniteQloraDecoderLayer {
 
         Ok(Self {
             layer_type,
+            residual_multiplier: config.residual_multiplier,
             attention,
             mamba,
             mlp,
@@ -326,13 +330,14 @@ impl GraniteQloraDecoderLayer {
             }
         };
 
-        let h = x.add(&mixer_out);
+        let m = self.residual_multiplier;
+        let h = x.add(&mixer_out.mul_scalar(m));
 
         // FFN pre-norm + QLoRA MLP + residual
         let normed = pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)
             .map_err(LoraError::Mlx)?;
         let ffn_out = self.mlp.forward(&normed)?;
-        Ok(h.add(&ffn_out))
+        Ok(h.add(&ffn_out.mul_scalar(m)))
     }
 
     /// Number of trainable LoRA parameters for this layer.
@@ -418,7 +423,8 @@ impl GraniteQloraModel {
     ) -> Result<Array, LoraError> {
         let mut hidden_states =
             pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)
-                .map_err(LoraError::Mlx)?;
+                .map_err(LoraError::Mlx)?
+                .mul_scalar(self.config.embedding_multiplier);
 
         // Auto-create causal mask for full-sequence forward passes
         let mask = if mask.is_none() {
@@ -548,11 +554,13 @@ impl GraniteQloraForCausalLM {
             self.model
                 .forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
 
-        if let Some(ref mut lm_head) = self.lm_head {
-            pmetal_bridge::compat::Module::forward(lm_head, &hidden_states).map_err(LoraError::Mlx)
+        let logits = if let Some(ref mut lm_head) = self.lm_head {
+            pmetal_bridge::compat::Module::forward(lm_head, &hidden_states)
+                .map_err(LoraError::Mlx)?
         } else {
-            Ok(self.model.embed_tokens.as_linear(&hidden_states))
-        }
+            self.model.embed_tokens.as_linear(&hidden_states)
+        };
+        Ok(logits.div_scalar(self.model.config.logits_scaling))
     }
 
     /// Get all trainable LoRA parameters as a flat HashMap.
@@ -1280,7 +1288,7 @@ mod tests {
             num_hidden_layers: 2,
             num_attention_heads: 4,
             num_key_value_heads: 2,
-            head_dim: 16,
+            head_dim: Some(16),
             max_position_embeddings: 128,
             rms_norm_eps: 1e-5,
             rope_theta: 10000.0,
@@ -1293,6 +1301,7 @@ mod tests {
             num_experts: 8,
             num_experts_per_tok: 2,
             use_shared_expert: true,
+            ..Default::default()
         }
     }
 

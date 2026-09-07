@@ -987,7 +987,7 @@ fn tiny_granite_config() -> GraniteConfig {
         num_hidden_layers: 2,
         num_attention_heads: 4,
         num_key_value_heads: 2,
-        head_dim: 8,
+        head_dim: Some(8),
         max_position_embeddings: 64,
         rope_theta: 10000.0,
         rms_norm_eps: 1e-5,
@@ -1000,6 +1000,11 @@ fn tiny_granite_config() -> GraniteConfig {
         num_experts: 8,
         num_experts_per_tok: 2,
         use_shared_expert: true,
+        // Neutral multipliers: this fixture compares the fused and serial
+        // paths against each other, and `forward_batched_impl` cannot express
+        // a scaled residual. A real Granite config sets `residual_multiplier`,
+        // which is why `supports_fused_batched` rejects one.
+        ..Default::default()
     }
 }
 
@@ -1010,7 +1015,7 @@ fn fused_vs_serial_granite_single_token() {
     let input = Array::from_i32_slice(&[9_i32]).reshape(&[1, 1]);
     let max_seq = config.max_position_embeddings as usize;
     let hkv = config.num_key_value_heads as usize;
-    let hd = config.head_dim as usize;
+    let hd = config.resolved_head_dim() as usize;
     let nl = config.num_hidden_layers as usize;
 
     let mut cache = KVCache::new(kv_cfg(nl, max_seq, hkv, hd));
@@ -1040,7 +1045,7 @@ fn fused_vs_serial_granite_multi_step() {
     let mut model = GraniteForCausalLM::new(config.clone()).unwrap();
     let max_seq = config.max_position_embeddings as usize;
     let hkv = config.num_key_value_heads as usize;
-    let hd = config.head_dim as usize;
+    let hd = config.resolved_head_dim() as usize;
     let nl = config.num_hidden_layers as usize;
 
     let mut cs = KVCache::new(kv_cfg(nl, max_seq, hkv, hd));

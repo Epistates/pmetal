@@ -159,13 +159,65 @@ where
     M: MlpModule,
     N: NormModule,
 {
+    scaled_pre_norm_forward(
+        input_layernorm,
+        self_attn,
+        post_attention_layernorm,
+        mlp,
+        x,
+        mask,
+        cache,
+        1.0,
+    )
+}
+
+/// [`std_pre_norm_forward`] with a scalar applied to each residual branch.
+///
+/// ```text
+/// let h = x + residual_multiplier * self_attn(input_norm(x));
+/// let y = h + residual_multiplier * mlp(post_norm(h));
+/// ```
+///
+/// Granite is the one architecture here that needs it: its configs set
+/// `residual_multiplier` (0.22 for `granite-3.1-2b`), and `modeling_granite.py`
+/// scales *only* the branch, never the carried residual. A multiplier of 1.0
+/// reduces to the standard skeleton exactly, which is why
+/// [`std_pre_norm_forward`] is a call into this rather than a second copy of
+/// the body.
+#[allow(clippy::too_many_arguments)]
+pub fn scaled_pre_norm_forward<A, M, N>(
+    input_layernorm: &mut N,
+    self_attn: &mut A,
+    post_attention_layernorm: &mut N,
+    mlp: &mut M,
+    x: &Array,
+    mask: Option<&Array>,
+    cache: Option<(&mut KVCache, usize)>,
+    residual_multiplier: f32,
+) -> Result<Array, Exception>
+where
+    A: AttentionModule,
+    M: MlpModule,
+    N: NormModule,
+{
+    // `mul_scalar` casts the scalar to the branch's dtype; a bare f32 scalar
+    // against a bf16 residual is the promotion footgun `scalar.rs` exists to
+    // close.
+    let scale = |branch: &Array| -> Array {
+        if residual_multiplier == 1.0 {
+            branch.clone()
+        } else {
+            branch.mul_scalar(residual_multiplier)
+        }
+    };
+
     // Pre-norm + attention + residual
     let normed = input_layernorm.forward(x)?;
     let attn_out = self_attn.forward_with_cache(&normed, mask, cache)?;
-    let h = x.add(&attn_out);
+    let h = x.add(&scale(&attn_out));
 
     // Pre-norm + MLP + residual
     let normed = post_attention_layernorm.forward(&h)?;
     let mlp_out = mlp.forward(&normed)?;
-    Ok(h.add(&mlp_out))
+    Ok(h.add(&scale(&mlp_out)))
 }

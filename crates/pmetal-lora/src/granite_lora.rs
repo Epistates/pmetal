@@ -61,9 +61,9 @@ impl GraniteLoraAttention {
     pub fn new(config: &GraniteConfig, lora_config: &LoraConfig) -> Result<Self, LoraError> {
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
-        let head_dim = config.head_dim;
+        let head_dim = config.resolved_head_dim();
         let hidden_size = config.hidden_size;
-        let scale = (head_dim as f32).sqrt().recip();
+        let scale = config.attention_scale();
 
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
@@ -426,6 +426,11 @@ impl GraniteLoraMLP {
 pub struct GraniteLoraDecoderLayer {
     /// Whether this layer is an attention layer (vs Mamba2 for hybrid models).
     pub is_attention: bool,
+    /// `config.residual_multiplier`, applied to both residual branches.
+    ///
+    /// Must match the base model's: an adapter trained against unscaled
+    /// residuals is being fit to different math than inference will run.
+    pub residual_multiplier: f32,
     /// Self-attention with LoRA — `Some` for attention layers, `None` for Mamba2.
     pub self_attn: Option<GraniteLoraAttention>,
     /// Frozen Mamba2 passthrough — present only for hybrid Mamba2 layers.
@@ -475,6 +480,7 @@ impl GraniteLoraDecoderLayer {
 
         Ok(Self {
             is_attention,
+            residual_multiplier: config.residual_multiplier,
             self_attn,
             mamba,
             mlp,
@@ -497,13 +503,14 @@ impl GraniteLoraDecoderLayer {
                 .map_err(LoraError::Mlx)?
         };
 
-        let h = x.add(&mixer_out);
+        let m = self.residual_multiplier;
+        let h = x.add(&mixer_out.mul_scalar(m));
 
         let normed =
             pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
 
-        Ok(h.add(&mlp_out))
+        Ok(h.add(&mlp_out.mul_scalar(m)))
     }
 
     /// Forward pass with KV cache (attention layers use cache; Mamba2 layers ignore it).
@@ -528,13 +535,14 @@ impl GraniteLoraDecoderLayer {
                 .map_err(LoraError::Mlx)?
         };
 
-        let h = x.add(&mixer_out);
+        let m = self.residual_multiplier;
+        let h = x.add(&mixer_out.mul_scalar(m));
 
         let normed =
             pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
 
-        Ok(h.add(&mlp_out))
+        Ok(h.add(&mlp_out.mul_scalar(m)))
     }
 
     /// Forward pass with explicit position IDs for packed sequence training.
@@ -559,13 +567,14 @@ impl GraniteLoraDecoderLayer {
                 .map_err(LoraError::Mlx)?
         };
 
-        let h = x.add(&mixer_out);
+        let m = self.residual_multiplier;
+        let h = x.add(&mixer_out.mul_scalar(m));
 
         let normed =
             pmetal_bridge::compat::Module::forward(&mut self.post_attention_layernorm, &h)?;
         let mlp_out = self.mlp.forward(&normed)?;
 
-        Ok(h.add(&mlp_out))
+        Ok(h.add(&mlp_out.mul_scalar(m)))
     }
 
     /// Number of trainable parameters in this layer (LoRA params only).
@@ -634,7 +643,8 @@ impl GraniteLoraModel {
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
         let mut hidden_states =
-            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
+            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?
+                .mul_scalar(self.config.embedding_multiplier);
 
         let seq_len = input_ids.dim(1) as f32;
         let embed_dim = hidden_states.dim(2) as f32;
@@ -681,7 +691,8 @@ impl GraniteLoraModel {
         checkpoint_config: Option<&CheckpointConfig>,
     ) -> Result<Array, LoraError> {
         let mut hidden_states =
-            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
+            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?
+                .mul_scalar(self.config.embedding_multiplier);
 
         let mask = if mask.is_none() {
             let seq_len = input_ids.dim(1);
@@ -716,7 +727,8 @@ impl GraniteLoraModel {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, LoraError> {
         let mut hidden_states =
-            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
+            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?
+                .mul_scalar(self.config.embedding_multiplier);
 
         match cache {
             Some(cache) => {
@@ -746,7 +758,8 @@ impl GraniteLoraModel {
         position_ids: &Array,
     ) -> Result<Array, LoraError> {
         let mut hidden_states =
-            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
+            pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?
+                .mul_scalar(self.config.embedding_multiplier);
 
         for layer in &mut self.layers {
             hidden_states = layer.forward_with_positions(&hidden_states, mask, position_ids)?;
@@ -823,6 +836,20 @@ pub struct GraniteLoraForCausalLM {
 }
 
 impl GraniteLoraForCausalLM {
+    /// Project hidden states to logits, applying `logits_scaling`.
+    ///
+    /// Three forward variants (plain, checkpointed, cached) shared a copy of
+    /// this block; they now share the divide too, so a Granite adapter is
+    /// trained against the same logit scale inference produces.
+    fn project_logits(&mut self, hidden_states: &Array) -> Result<Array, LoraError> {
+        let logits = if let Some(ref mut lm_head) = self.lm_head {
+            pmetal_bridge::compat::Module::forward(lm_head, hidden_states)?
+        } else {
+            self.model.embed_tokens.as_linear(hidden_states)
+        };
+        Ok(logits.div_scalar(self.model.config.logits_scaling))
+    }
+
     /// Create a new LoRA Granite model with LM head.
     pub fn new(config: GraniteConfig, lora_config: LoraConfig) -> Result<Self, LoraError> {
         let tie_weights = config.tie_word_embeddings;
@@ -876,14 +903,7 @@ impl GraniteLoraForCausalLM {
             self.model
                 .forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
 
-        if let Some(ref mut lm_head) = self.lm_head {
-            Ok(pmetal_bridge::compat::Module::forward(
-                lm_head,
-                &hidden_states,
-            )?)
-        } else {
-            Ok(self.model.embed_tokens.as_linear(&hidden_states))
-        }
+        self.project_logits(&hidden_states)
     }
 
     /// Forward pass returning hidden states before lm_head, for Cut Cross-Entropy.
@@ -929,14 +949,7 @@ impl GraniteLoraForCausalLM {
             self.model
                 .forward_noised(input_ids, mask, noise_alpha, checkpoint_config.as_ref())?;
 
-        if let Some(ref mut lm_head) = self.lm_head {
-            Ok(pmetal_bridge::compat::Module::forward(
-                lm_head,
-                &hidden_states,
-            )?)
-        } else {
-            Ok(self.model.embed_tokens.as_linear(&hidden_states))
-        }
+        self.project_logits(&hidden_states)
     }
 
     /// Forward pass with KV cache for efficient inference.
@@ -948,14 +961,7 @@ impl GraniteLoraForCausalLM {
     ) -> Result<Array, LoraError> {
         let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
 
-        if let Some(ref mut lm_head) = self.lm_head {
-            Ok(pmetal_bridge::compat::Module::forward(
-                lm_head,
-                &hidden_states,
-            )?)
-        } else {
-            Ok(self.model.embed_tokens.as_linear(&hidden_states))
-        }
+        self.project_logits(&hidden_states)
     }
 
     /// Create a KV cache for this model.
@@ -964,7 +970,7 @@ impl GraniteLoraForCausalLM {
             self.model.config.num_hidden_layers as usize,
             max_seq_len,
             self.model.config.num_key_value_heads as usize,
-            self.model.config.head_dim as usize,
+            self.model.config.resolved_head_dim() as usize,
         );
         KVCache::new(config)
     }
@@ -1447,7 +1453,7 @@ mod tests {
             num_hidden_layers: 2,
             num_attention_heads: 4,
             num_key_value_heads: 2,
-            head_dim: 16,
+            head_dim: Some(16),
             max_position_embeddings: 512,
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,

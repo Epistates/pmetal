@@ -21,7 +21,7 @@ use pmetal_mlx::kv_cache::KVCache;
 
 use serde::{Deserialize, Serialize};
 
-use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
+use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, scaled_pre_norm_forward};
 use crate::traits::ModelConfig;
 
 /// Layer type for Granite Hybrid models.
@@ -43,13 +43,48 @@ pub struct GraniteConfig {
     pub num_hidden_layers: i32,
     pub num_attention_heads: i32,
     pub num_key_value_heads: i32,
-    pub head_dim: i32,
+    /// Head dimension, or `None` to derive it.
+    ///
+    /// Released Granite configs write `"head_dim": null` and expect
+    /// `hidden_size / num_attention_heads`, exactly as `GraniteConfig` in
+    /// `transformers` does. This used to be a required `i32`, so every real
+    /// Granite checkpoint failed to deserialize on the `null`. Read it through
+    /// [`GraniteConfig::resolved_head_dim`].
+    #[serde(default)]
+    pub head_dim: Option<i32>,
     pub max_position_embeddings: i32,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
     /// Whether to tie input/output embeddings.
     #[serde(default = "default_true")]
     pub tie_word_embeddings: bool,
+
+    // ---- Granite's four scalar multipliers ----
+    //
+    // These are what distinguish Granite from Llama; `modeling_granite.py`
+    // marks the logits one "main diff with Llama". All four were missing, so
+    // pmetal ran Granite as plain Llama. The attention one is not a rounding
+    // error: `granite-3.1-2b` sets `attention_multiplier` to 0.015625 against a
+    // head_dim of 64, whose standard `1/sqrt(64)` scale is 0.125 — attention
+    // logits eight times too large, before softmax.
+    /// Attention logit scale, replacing `1/sqrt(head_dim)` outright.
+    ///
+    /// `None` falls back to the standard scale. The reference defaults this to
+    /// `1.0`, which is right for a config that omits it *by construction* but
+    /// catastrophic for a hand-built one; every released Granite config states
+    /// it, so the fallback only ever applies to synthetic configs, where the
+    /// standard scale is what a caller means.
+    #[serde(default)]
+    pub attention_multiplier: Option<f32>,
+    /// Token embeddings are multiplied by this immediately after lookup.
+    #[serde(default = "default_one")]
+    pub embedding_multiplier: f32,
+    /// Every residual branch is scaled by this before it is added back.
+    #[serde(default = "default_one")]
+    pub residual_multiplier: f32,
+    /// Final logits are **divided** by this.
+    #[serde(default = "default_one")]
+    pub logits_scaling: f32,
 
     // Hybrid model options
     /// Whether this is a hybrid (Mamba2 + Attention) model.
@@ -83,6 +118,9 @@ pub struct GraniteConfig {
 fn default_true() -> bool {
     true
 }
+fn default_one() -> f32 {
+    1.0
+}
 fn default_mamba_state_dim() -> i32 {
     128
 }
@@ -106,11 +144,15 @@ impl Default for GraniteConfig {
             num_hidden_layers: 24,
             num_attention_heads: 16,
             num_key_value_heads: 4,
-            head_dim: 128,
+            head_dim: Some(128),
             max_position_embeddings: 8192,
             rope_theta: 10000.0,
             rms_norm_eps: 1e-5,
             tie_word_embeddings: true,
+            attention_multiplier: None,
+            embedding_multiplier: 1.0,
+            residual_multiplier: 1.0,
+            logits_scaling: 1.0,
             is_hybrid: false,
             layer_types: None,
             mamba_state_dim: 128,
@@ -168,6 +210,26 @@ impl GraniteConfig {
         }
     }
 
+    /// Head dimension, derived when the config leaves it `null`.
+    ///
+    /// Matches `GraniteConfig.head_dim = head_dim or hidden_size //
+    /// num_attention_heads` in the reference.
+    pub fn resolved_head_dim(&self) -> i32 {
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
+    }
+
+    /// The attention logit scale this config asks for.
+    ///
+    /// Granite states `attention_multiplier` and the reference uses it *as*
+    /// the scale — it does not combine with `1/sqrt(head_dim)`, it replaces it.
+    /// See the field docs for why the fallback is the standard scale rather
+    /// than the reference's `1.0`.
+    pub fn attention_scale(&self) -> f32 {
+        self.attention_multiplier
+            .unwrap_or_else(|| (self.resolved_head_dim() as f32).sqrt().recip())
+    }
+
     /// Get the layer type for a given layer index.
     pub fn layer_type(&self, layer_idx: usize) -> GraniteLayerType {
         if !self.is_hybrid {
@@ -206,7 +268,7 @@ impl ModelConfig for GraniteConfig {
         self.num_key_value_heads
     }
     fn head_dim(&self) -> i32 {
-        self.head_dim
+        self.resolved_head_dim()
     }
     fn intermediate_size(&self) -> i32 {
         self.intermediate_size
@@ -286,7 +348,7 @@ impl GraniteAttention {
     pub fn new(config: &GraniteConfig) -> Result<Self, Exception> {
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_key_value_heads;
-        let head_dim = config.head_dim;
+        let head_dim = config.resolved_head_dim();
         let hidden_size = config.hidden_size;
 
         let q_proj = nn::LinearBuilder::new(hidden_size, n_heads * head_dim)
@@ -306,7 +368,7 @@ impl GraniteAttention {
             n_heads,
             n_kv_heads,
             head_dim,
-            scale: (head_dim as f32).sqrt().recip(),
+            scale: config.attention_scale(),
             rope_theta: config.rope_theta,
             q_proj,
             k_proj,
@@ -469,6 +531,8 @@ impl GraniteMamba2 {
 #[derive(Debug)]
 pub struct GraniteDecoderLayer {
     pub layer_type: GraniteLayerType,
+    /// `config.residual_multiplier`, applied to both residual branches.
+    pub residual_multiplier: f32,
 
     pub attention: Option<GraniteAttention>,
     pub mamba: Option<GraniteMamba2>,
@@ -498,6 +562,7 @@ impl GraniteDecoderLayer {
 
         Ok(Self {
             layer_type,
+            residual_multiplier: config.residual_multiplier,
             attention,
             mamba,
             mlp,
@@ -529,7 +594,7 @@ impl GraniteDecoderLayer {
         cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, Exception> {
         match self.layer_type {
-            GraniteLayerType::Attention => std_pre_norm_forward(
+            GraniteLayerType::Attention => scaled_pre_norm_forward(
                 &mut self.input_layernorm,
                 self.attention.as_mut().unwrap(),
                 &mut self.post_attention_layernorm,
@@ -537,14 +602,16 @@ impl GraniteDecoderLayer {
                 x,
                 mask,
                 cache,
+                self.residual_multiplier,
             ),
             GraniteLayerType::Mamba2 => {
+                let m = self.residual_multiplier;
                 let normed = Module::forward(&mut self.input_layernorm, x)?;
                 let mixer_out = self.mamba.as_mut().unwrap().forward(&normed)?;
-                let h = x.add(&mixer_out);
+                let h = x.add(&mixer_out.mul_scalar(m));
                 let normed = Module::forward(&mut self.post_attention_layernorm, &h)?;
                 let ffn_out = self.mlp.forward(&normed)?;
-                Ok(h.add(&ffn_out))
+                Ok(h.add(&ffn_out.mul_scalar(m)))
             }
         }
     }
@@ -608,7 +675,8 @@ impl GraniteModel {
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
+        let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?
+            .mul_scalar(self.config.embedding_multiplier);
 
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             let c = cache.as_deref_mut().map(|c| (c, idx));
@@ -673,14 +741,17 @@ impl GraniteForCausalLM {
     }
 
     fn project_logits(&mut self, hidden_states: &Array) -> Result<Array, Exception> {
-        if let Some(ref mut lm_head) = self.lm_head {
-            Module::forward(lm_head, hidden_states)
+        let logits = if let Some(ref mut lm_head) = self.lm_head {
+            Module::forward(lm_head, hidden_states)?
         } else {
             // Tied embeddings: logits = hidden @ embed.weight.T
             let embed_weight = self.model.embed_tokens.weight.as_ref();
             let embed_t = embed_weight.t();
-            Ok(hidden_states.matmul(&embed_t))
-        }
+            hidden_states.matmul(&embed_t)
+        };
+        // `logits = logits / self.config.logits_scaling` — the line
+        // `modeling_granite.py` annotates "main diff with Llama".
+        Ok(logits.div_scalar(self.config.logits_scaling))
     }
 
     /// Create a fresh KV cache sized for this model.
@@ -690,7 +761,7 @@ impl GraniteForCausalLM {
             self.config.num_hidden_layers as usize,
             max_seq_len,
             self.config.num_key_value_heads as usize,
-            self.config.head_dim as usize,
+            self.config.resolved_head_dim() as usize,
         ))
     }
 
@@ -702,6 +773,13 @@ impl GraniteForCausalLM {
     /// [`crate::dispatcher::DynamicModel::supports_fused_batched`] until
     /// the simplified Mamba2 stub is replaced with a real stateful
     /// implementation.
+    ///
+    /// So is any config with a non-unit `residual_multiplier`, which every
+    /// released Granite has: `batched_prenorm_layer` adds its residuals
+    /// unscaled, and there is no way to express the scale through
+    /// `BatchedGqaAttnCfg`. Real Granite therefore takes the serial path until
+    /// the scale is threaded through the batched skeleton. The attention scale,
+    /// embedding multiplier and logits scaling are all honoured here.
     pub fn forward_batched_impl(
         &mut self,
         input_ids: &Array,
@@ -714,12 +792,15 @@ impl GraniteForCausalLM {
         let attn_cfg = BatchedGqaAttnCfg::new(
             cfg.num_attention_heads,
             cfg.num_key_value_heads,
-            cfg.head_dim,
+            cfg.resolved_head_dim(),
             cfg.rope_theta,
             1.0,
-        );
+        )
+        .with_scale(cfg.attention_scale());
+        let embedding_multiplier = cfg.embedding_multiplier;
 
-        let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?;
+        let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?
+            .mul_scalar(embedding_multiplier);
         for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
             let attn = layer.attention.as_mut().ok_or_else(|| {
                 Exception::custom(
@@ -782,6 +863,121 @@ mod tests {
         assert_eq!(out.shape(), &[1, 10, 64]);
     }
 
+    /// A config shaped like `ibm-granite/granite-3.1-2b-instruct` — same
+    /// derived head_dim and the same four multipliers, at toy width.
+    fn multiplier_config() -> GraniteConfig {
+        GraniteConfig {
+            vocab_size: 128,
+            hidden_size: 64,
+            intermediate_size: 128,
+            num_hidden_layers: 2,
+            num_attention_heads: 4,
+            num_key_value_heads: 2,
+            // `null` in the released config; derived as 64/4 = 16.
+            head_dim: None,
+            attention_multiplier: Some(0.015625),
+            embedding_multiplier: 12.0,
+            residual_multiplier: 0.22,
+            logits_scaling: 8.0,
+            tie_word_embeddings: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn granite_derives_head_dim_when_the_config_says_null() {
+        let config = multiplier_config();
+        assert_eq!(config.resolved_head_dim(), 16);
+        // A stated value still wins.
+        let stated = GraniteConfig {
+            head_dim: Some(48),
+            ..multiplier_config()
+        };
+        assert_eq!(stated.resolved_head_dim(), 48);
+    }
+
+    #[test]
+    fn granite_attention_scale_is_the_multiplier_not_one_over_sqrt_head_dim() {
+        let config = multiplier_config();
+        // The distinction is not academic: these differ by 8x, and the scale
+        // lands on attention logits before the softmax.
+        let standard = (config.resolved_head_dim() as f32).sqrt().recip();
+        assert_eq!(standard, 0.25);
+        assert_eq!(config.attention_scale(), 0.015625);
+
+        let attn = GraniteAttention::new(&config).unwrap();
+        assert_eq!(attn.scale, 0.015625);
+
+        // Omitted, as in a hand-built config: fall back to the standard scale.
+        let bare = GraniteConfig {
+            attention_multiplier: None,
+            ..multiplier_config()
+        };
+        assert_eq!(bare.attention_scale(), standard);
+    }
+
+    #[test]
+    #[serial]
+    fn granite_applies_embedding_residual_and_logits_scalars() {
+        use pmetal_bridge::compat::transforms;
+
+        let scaled = multiplier_config();
+        let neutral = GraniteConfig {
+            attention_multiplier: Some(0.015625),
+            embedding_multiplier: 1.0,
+            residual_multiplier: 1.0,
+            logits_scaling: 1.0,
+            ..multiplier_config()
+        };
+
+        let input = Array::from_i32_slice(&[3_i32, 9, 14]).reshape(&[1, 3]);
+
+        // Same weights in both models: seed the RNG identically.
+        let logits_for = |config: GraniteConfig| {
+            random::seed(1234);
+            let mut model = GraniteForCausalLM::new(config).unwrap();
+            let out = model.forward(&input, None, None).unwrap();
+            transforms::eval([&out]).unwrap();
+            out.as_slice::<f32>().to_vec()
+        };
+
+        let with_scalars = logits_for(scaled);
+        let without = logits_for(neutral);
+
+        assert_eq!(with_scalars.len(), without.len());
+        assert!(
+            with_scalars.iter().all(|v| v.is_finite()),
+            "scaled forward produced non-finite logits"
+        );
+        // Three multipliers of 12.0, 0.22 and 8.0 cannot compose to the
+        // identity, so the two forwards must differ. Before this fix they were
+        // the same computation: pmetal ran Granite as plain Llama.
+        let max_diff = with_scalars
+            .iter()
+            .zip(&without)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-4,
+            "multipliers had no effect on the forward (max diff {max_diff})"
+        );
+    }
+
+    #[test]
+    fn granite_lora_and_base_agree_on_the_scalars() {
+        // The GELU audit's lesson: an adapter trained against different math
+        // than inference runs is worse than one that fails to build. These are
+        // read from one place so the three Granite implementations cannot
+        // drift.
+        let config = multiplier_config();
+        let layer = GraniteDecoderLayer::new(&config, 0).unwrap();
+        assert_eq!(layer.residual_multiplier, config.residual_multiplier);
+        assert_eq!(
+            GraniteAttention::new(&config).unwrap().scale,
+            config.attention_scale()
+        );
+    }
+
     #[test]
     #[serial]
     fn test_granite_model_instantiation() {
@@ -791,7 +987,7 @@ mod tests {
         config.num_hidden_layers = 2;
         config.num_attention_heads = 4;
         config.num_key_value_heads = 2;
-        config.head_dim = 16;
+        config.head_dim = Some(16);
         config.vocab_size = 1000;
         config.tie_word_embeddings = true;
 
