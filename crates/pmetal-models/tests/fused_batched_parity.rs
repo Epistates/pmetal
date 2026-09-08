@@ -328,7 +328,7 @@ fn tiny_qwen2_config() -> Qwen2Config {
         num_hidden_layers: 2,
         num_attention_heads: 4,
         num_key_value_heads: Some(2),
-        head_dim: 8,
+        head_dim: Some(8),
         max_position_embeddings: 64,
         rms_norm_eps: 1e-5,
         rope_theta: 10000.0,

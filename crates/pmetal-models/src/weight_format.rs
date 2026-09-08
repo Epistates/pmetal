@@ -656,9 +656,6 @@ impl GgufModelConfig {
 
     /// Convert to Qwen2 config.
     pub fn to_qwen2_config(&self) -> crate::architectures::qwen2::Qwen2Config {
-        let head_dim = self
-            .head_dim
-            .unwrap_or_else(|| self.hidden_size / self.num_attention_heads);
         crate::architectures::qwen2::Qwen2Config {
             vocab_size: self.vocab_size,
             hidden_size: self.hidden_size,
@@ -666,7 +663,10 @@ impl GgufModelConfig {
             num_hidden_layers: self.num_hidden_layers,
             num_attention_heads: self.num_attention_heads,
             num_key_value_heads: self.num_kv_heads,
-            head_dim,
+            // Passed through rather than derived here: `Qwen2Config` resolves
+            // an absent `head_dim` the same way, and one owner of that rule is
+            // enough.
+            head_dim: self.head_dim,
             max_position_embeddings: self.max_position_embeddings,
             rms_norm_eps: self.rms_norm_eps,
             rope_theta: self.rope_theta,

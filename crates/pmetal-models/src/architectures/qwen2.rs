@@ -2,7 +2,7 @@
 //!
 //! Supports Qwen2 0.5B, 1.5B, 7B, 14B, 32B, and 72B variants.
 //! Qwen2 is architecturally similar to Llama but with key differences:
-//! - Fixed head_dim = 128 (always)
+//! - `head_dim` is derived, not fixed (see [`Qwen2Config::get_head_dim`])
 //! - Higher RoPE theta (1,000,000)
 //! - No RoPE scaling support
 //! - Optional sliding window attention (usually disabled)
@@ -38,9 +38,16 @@ pub struct Qwen2Config {
     /// Number of key-value heads (for GQA).
     #[serde(default)]
     pub num_key_value_heads: Option<i32>,
-    /// Head dimension (fixed at 128 for Qwen2).
-    #[serde(default = "default_head_dim")]
-    pub head_dim: i32,
+    /// Head dimension, when the checkpoint states one.
+    ///
+    /// Most Qwen2 checkpoints omit it (or ship an explicit `null`) and mean
+    /// `hidden_size / num_attention_heads`, which is what `transformers` reads.
+    /// It is *not* always 128: Qwen2.5-0.5B is 896/14 = 64, and defaulting to
+    /// 128 there builds q/k/v projections of the wrong width, so every
+    /// attention op throws and the residual stream carries a broadcast
+    /// placeholder instead. Read it through [`Qwen2Config::get_head_dim`].
+    #[serde(default)]
+    pub head_dim: Option<i32>,
     /// Maximum sequence length.
     #[serde(default = "default_max_position_embeddings")]
     pub max_position_embeddings: i32,
@@ -76,9 +83,6 @@ fn default_model_type() -> String {
 fn default_vocab_size() -> i32 {
     152064
 }
-fn default_head_dim() -> i32 {
-    128 // Always 128 for Qwen2
-}
 fn default_max_position_embeddings() -> i32 {
     131072 // 128K context
 }
@@ -112,7 +116,7 @@ impl crate::traits::ModelConfig for Qwen2Config {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
     }
     fn head_dim(&self) -> i32 {
-        self.head_dim
+        self.get_head_dim()
     }
     fn intermediate_size(&self) -> i32 {
         self.intermediate_size
@@ -132,9 +136,13 @@ impl crate::traits::ModelConfig for Qwen2Config {
 }
 
 impl Qwen2Config {
-    /// Get the head dimension (always 128 for Qwen2).
+    /// The head dimension the checkpoint states, else the derived one.
+    ///
+    /// Mirrors `transformers`' `getattr(config, "head_dim", hidden_size //
+    /// num_attention_heads)`.
     pub fn get_head_dim(&self) -> i32 {
         self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     /// Get GQA group count.
@@ -154,7 +162,7 @@ impl Default for Qwen2Config {
             num_hidden_layers: 28,
             num_attention_heads: 12,
             num_key_value_heads: Some(2),
-            head_dim: 128,
+            head_dim: Some(128),
             max_position_embeddings: 131072,
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
@@ -873,7 +881,7 @@ mod tests {
             num_hidden_layers: 2,
             num_attention_heads: 2, // 2 heads * 64 head_dim = 128
             num_key_value_heads: Some(1),
-            head_dim: 64, // Smaller for testing
+            head_dim: Some(64), // Smaller for testing
             max_position_embeddings: 512,
             rms_norm_eps: 1e-6,
             rope_theta: 1_000_000.0,
@@ -885,9 +893,31 @@ mod tests {
     fn test_qwen2_config_defaults() {
         let config = Qwen2Config::default();
         assert_eq!(config.model_type, "qwen2");
-        assert_eq!(config.head_dim, 128);
+        assert_eq!(config.head_dim, Some(128));
         assert_eq!(config.rope_theta, 1_000_000.0);
         assert_eq!(config.vocab_size, 152064);
+    }
+
+    /// A checkpoint that states no `head_dim` derives it, and one that states
+    /// `null` is the same case — `unsloth/Qwen2.5-0.5B-Instruct` ships
+    /// `"head_dim": null` and means 896/14 = 64, not the 128 this config used
+    /// to assume for every Qwen2.
+    #[test]
+    fn head_dim_is_derived_when_the_config_does_not_state_one() {
+        for spelling in [
+            r#"{"hidden_size":896,"intermediate_size":4864,"num_hidden_layers":24,"num_attention_heads":14}"#,
+            r#"{"hidden_size":896,"intermediate_size":4864,"num_hidden_layers":24,"num_attention_heads":14,"head_dim":null}"#,
+        ] {
+            let config: Qwen2Config = serde_json::from_str(spelling).expect("parses");
+            assert_eq!(config.head_dim, None);
+            assert_eq!(config.get_head_dim(), 64, "for {spelling}");
+        }
+
+        let stated: Qwen2Config = serde_json::from_str(
+            r#"{"hidden_size":896,"intermediate_size":4864,"num_hidden_layers":24,"num_attention_heads":14,"head_dim":128}"#,
+        )
+        .expect("parses");
+        assert_eq!(stated.get_head_dim(), 128, "a stated head_dim still wins");
     }
 
     #[test]
