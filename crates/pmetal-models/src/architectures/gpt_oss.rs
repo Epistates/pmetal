@@ -590,7 +590,12 @@ fn clamp_swiglu_hidden(gate: &Array, up: &Array, limit: f32) -> Result<Array, Ex
 fn router_topk_softmax(gate_logits: &Array, top_k: i32) -> (Array, Array) {
     // O(E) top-k: argpartition places the k largest at the tail, then slice.
     let part = ops::argpartition_axis(gate_logits, -top_k, -1);
-    let top_indices = ops::slice_last_from(&part, -top_k).as_type::<i32>();
+    // Routing indices are a discrete selection — no gradient should ever flow
+    // through them, only through the gathered logits. MLX >= 0.32 enforces
+    // this, raising "[gather] Cannot calculate VJP with respect to indices"
+    // when they sit downstream of differentiable logits inside a grad trace;
+    // v0.31 tolerated it and could silently produce NaN instead.
+    let top_indices = ops::stop_gradient(&ops::slice_last_from(&part, -top_k).as_type::<i32>());
     let top_logits = gate_logits.take_along_axis(&top_indices, -1);
     let weights = ops::softmax_axis(&top_logits, -1);
     (top_indices, weights)
