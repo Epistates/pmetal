@@ -210,7 +210,22 @@ impl ModelArchitecture {
             "diffusion_gemma" | "diffusion_gemma_text" => Some(Self::DiffusionGemma),
             "mistral" | "mixtral" => Some(Self::Mistral),
             "phi4" => Some(Self::Phi4),
-            "phi" | "phi3" => Some(Self::Phi),
+            // `Self::Phi` is a Phi-3 implementation: `self_attn.o_proj`, a
+            // fused `mlp.gate_up_proj` SwiGLU, RMSNorm, no biases, and a
+            // sequential attention-then-MLP residual.
+            //
+            // `model_type: "phi"` is Phi-1 / Phi-1.5 / Phi-2, which share none
+            // of that. They ship `self_attn.dense`, `mlp.fc1` + `mlp.fc2` with
+            // a single GELU, LayerNorm *with bias*, a bias on every projection
+            // and on `lm_head`, `model.final_layernorm` rather than
+            // `model.norm`, no `post_attention_layernorm` at all, and a
+            // parallel block: `x + attn(ln(x)) + mlp(ln(x))`.
+            //
+            // Routing them here matched almost no weights and returned noise
+            // that was finite and correctly shaped. Declining is the honest
+            // answer until the architecture exists; map this back the day it
+            // does.
+            "phi3" => Some(Self::Phi),
             "deepseek" | "deepseek2" | "deepseek_v2" | "deepseek_v3" => Some(Self::DeepSeek),
             "cohere" | "cohere2" | "command_r" | "command-r" => Some(Self::Cohere),
             "granite" | "granitehybrid" | "granite_moe" => Some(Self::Granite),
@@ -288,7 +303,9 @@ impl ModelArchitecture {
             if lower.contains("phi4") {
                 return Some(Self::Phi4);
             }
-            if lower.contains("phi") {
+            // Only Phi-3. A bare `PhiForCausalLM` is Phi-1 / Phi-1.5 / Phi-2,
+            // a different architecture — see the `from_model_type` note.
+            if lower.contains("phi3") {
                 return Some(Self::Phi);
             }
             if lower.contains("deepseek") {
@@ -738,20 +755,11 @@ impl DynamicModel {
                 model_dir,
                 Mistral
             ),
-            ModelArchitecture::Phi => simple_load!(
-                PhiConfig,
-                PhiForCausalLM::new,
-                &config_content,
-                model_dir,
-                Phi
-            ),
-            ModelArchitecture::Phi4 => simple_load!(
-                PhiConfig,
-                PhiForCausalLM::new,
-                &config_content,
-                model_dir,
-                Phi4
-            ),
+            // Phi cannot use `simple_load!`: Phi-3 fuses q/k/v into a single
+            // `self_attn.qkv_proj`, which the generic name-matching loader has
+            // no parameter for and therefore discards without a word.
+            ModelArchitecture::Phi => Self::load_phi_variant(&config_content, model_dir, false),
+            ModelArchitecture::Phi4 => Self::load_phi_variant(&config_content, model_dir, true),
             ModelArchitecture::DeepSeek => simple_load_moe!(
                 DeepSeekConfig,
                 DeepSeek::new,
@@ -923,6 +931,33 @@ impl DynamicModel {
                 Ok(Self::Mllama(model))
             }
         }
+    }
+
+    /// Load Phi-3 (`is_phi4 = false`) or Phi-4 (`true`), splitting a fused
+    /// `self_attn.qkv_proj` first if the checkpoint ships one.
+    ///
+    /// Both variants are the same `PhiForCausalLM`; they differ only in which
+    /// `DynamicModel` arm they land in. Phi-3-mini fuses q/k/v and Phi-4-mini
+    /// does not, so the split runs unconditionally and no-ops on the latter.
+    fn load_phi_variant(
+        config_content: &str,
+        model_dir: &Path,
+        is_phi4: bool,
+    ) -> Result<Self, Exception> {
+        let config: PhiConfig =
+            json5::from_str(config_content).map_err(|e| Exception::custom(e.to_string()))?;
+        let mut model = PhiForCausalLM::new(config.clone())?;
+        let mut weights = crate::loader::load_weights(model_dir)
+            .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+        crate::loader::split_phi_fused_qkv(&mut weights, &config);
+        crate::loader::assign_weights(&mut model, weights)
+            .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+        eval_module_parameters_batched(&model)?;
+        Ok(if is_phi4 {
+            Self::Phi4(model)
+        } else {
+            Self::Phi(model)
+        })
     }
 
     /// Load a model from a GGUF checkpoint (file path or directory).
@@ -1341,10 +1376,18 @@ impl DynamicModel {
             // fused path would silently drop the sink term. Re-enable only
             // after threading sinks through `batched_gqa_attn`.
             Self::GptOss(_) => false,
-            // Gemma1 uses `batched_prenorm_layer`. Gemma2/3 use the
-            // 4-norm peri-norm helper plus optional per-layer sliding
-            // window and attention logit softcap.
-            Self::Gemma(_) => true,
+            // Gemma1 uses `batched_prenorm_layer`. Gemma2 uses the 4-norm
+            // peri-norm helper plus optional per-layer sliding window and
+            // attention logit softcap.
+            //
+            // Gemma 3 takes the serial fallback. Two things the fused skeleton
+            // cannot express: its QK-norm, which the `BatchedGqaAttnCfg` path
+            // has no slot for between projection and RoPE, and its two RoPE
+            // bases — the cfg carries one scalar `rope_base`, read from
+            // `layers[0]`, which for Gemma 3 is a *sliding* layer, so every
+            // global layer would get the local base. Correct and serial beats
+            // fast and wrong.
+            Self::Gemma(m) => !m.config().is_gemma3,
             // Phi/Phi4: partial RoPE handled by `BatchedGqaAttnCfg::with_rope_dims`.
             // SuRoPE configs (`rope_scaling = Some(...)`) take the serial fallback
             // because the fused cfg carries a single scalar `rope_base`, not a

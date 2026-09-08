@@ -73,6 +73,21 @@ pub struct GemmaConfig {
     /// Sliding window size for local attention (Gemma2 only).
     #[serde(default)]
     pub sliding_window: Option<i32>,
+    /// RoPE base for the *local* (sliding-window) layers, Gemma 3 onward.
+    ///
+    /// Gemma 3 runs two RoPE bases: `rope_theta` (1e6 on the released
+    /// checkpoints) on the full-attention layers and this one (1e4) on the
+    /// sliding ones. Applying the global base everywhere gets 5 layers in 6
+    /// wrong. Absent on Gemma 1 and 2, which have a single base.
+    #[serde(default)]
+    pub rope_local_base_freq: Option<f32>,
+    /// Period of the local/global attention alternation, Gemma 3 onward.
+    ///
+    /// `transformers` derives `layer_types[i] = "sliding_attention" if
+    /// (i + 1) % sliding_window_pattern else "full_attention"`, so with the
+    /// released value of 6 every sixth layer (index 5, 11, …) is global.
+    #[serde(default = "default_sliding_window_pattern")]
+    pub sliding_window_pattern: i32,
     /// Whether this is a Gemma2 model.
     #[serde(default)]
     pub is_gemma2: bool,
@@ -103,6 +118,9 @@ fn default_rms_norm_eps() -> f32 {
 }
 fn default_rope_theta() -> f32 {
     10000.0
+}
+fn default_sliding_window_pattern() -> i32 {
+    6
 }
 fn default_hidden_act() -> String {
     "gelu".to_string()
@@ -155,6 +173,8 @@ impl Default for GemmaConfig {
             final_logit_softcapping: None,
             query_pre_attn_scalar: None,
             sliding_window: None,
+            rope_local_base_freq: None,
+            sliding_window_pattern: default_sliding_window_pattern(),
             is_gemma2: false,
             is_gemma3: false,
             rope_scaling: None,
@@ -265,20 +285,25 @@ impl GemmaRmsNorm {
     }
 
     /// Forward pass.
+    ///
+    /// The whole norm runs in fp32 and only the result is cast back, which is
+    /// what `Gemma3RMSNorm.forward` does (`self._norm(x.float())`, then
+    /// `* (1.0 + self.weight.float())`, then `.type_as(x)`). It is not
+    /// incidental: `(1 + w)` with `w` near zero loses most of its significance
+    /// in bf16, and a Gemma block runs four of these plus QK-norm, so computing
+    /// in the input dtype drifts measurably over a deep stack.
     pub fn forward(&self, x: &Array) -> Result<Array, Exception> {
-        // Compute RMS
-        let x_sq = x.multiply(x);
-        let mean_sq = x_sq.mean_axis(-1, true);
-        let eps_arr = Array::from_f32(self.eps);
-        let rms = mean_sq.add(&eps_arr).sqrt();
+        let in_dtype = x.dtype_raw();
+        let f32_dtype = Dtype::Float32.as_i32();
+        let x32 = x.as_dtype(f32_dtype);
 
-        // Normalize
-        let normed = x.divide(&rms);
+        let mean_sq = x32.multiply(&x32).mean_axis(-1, true);
+        let rms = mean_sq.add_scalar(self.eps).sqrt();
+        let normed = x32.divide(&rms);
 
-        // Apply weight with +1 offset: output = normed * (1 + weight)
-        let one = Array::from_f32(1.0);
-        let scale = self.weight.as_ref().add(&one);
-        Ok(normed.multiply(&scale))
+        // output = normed * (1 + weight)
+        let scale = self.weight.as_ref().as_dtype(f32_dtype).add_scalar(1.0);
+        Ok(normed.multiply(&scale).as_dtype(in_dtype))
     }
 }
 
@@ -340,8 +365,16 @@ pub struct GemmaAttention {
     pub o_proj: nn::Linear,
     /// RoPE layer.
     pub rope: nn::Rope,
+    /// Per-head query norm, Gemma 3 onward (`self_attn.q_norm.weight`).
+    ///
+    /// Gemma 3 normalizes queries and keys over the head dimension between the
+    /// head reshape and RoPE. Gemma 1 and 2 ship no such tensor, so these stay
+    /// `None` there and the checkpoint has nothing to leave unclaimed.
+    pub q_norm: Option<GemmaRmsNorm>,
+    /// Per-head key norm, Gemma 3 onward (`self_attn.k_norm.weight`).
+    pub k_norm: Option<GemmaRmsNorm>,
 }
-impl_module_params!(GemmaAttention; q_proj, k_proj, v_proj, o_proj, rope);
+impl_module_params!(GemmaAttention; q_proj, k_proj, v_proj, o_proj, rope, q_norm, k_norm);
 
 impl GemmaAttention {
     /// Create a new attention layer.
@@ -350,7 +383,21 @@ impl GemmaAttention {
         let n_kv_heads = config.num_kv_heads();
         let head_dim = config.get_head_dim();
         let scale = config.attention_scale();
-        let rope_theta = config.rope_theta;
+
+        // Gemma2: even layers use sliding window, odd layers use full causal.
+        // Gemma3: every `sliding_window_pattern`-th layer (5, 11, 17, …) uses
+        //         global causal attention, all others local sliding-window.
+        let is_local_attention = if config.is_gemma3 {
+            (layer_idx as i32 + 1) % config.sliding_window_pattern != 0
+        } else {
+            config.is_gemma2 && (layer_idx % 2 == 0)
+        };
+
+        // Gemma 3 runs a second, much smaller RoPE base on its local layers.
+        let rope_theta = match config.rope_local_base_freq {
+            Some(local) if is_local_attention => local,
+            _ => config.rope_theta,
+        };
 
         // Parse rope_scaling from config
         let rope_scaling_cfg = config
@@ -380,14 +427,15 @@ impl GemmaAttention {
             .traditional(false)
             .build()?;
 
-        // Gemma2: even layers use sliding window, odd layers use full causal.
-        // Gemma3: every 6th layer (5, 11, 17, ...) uses global causal attention;
-        //         all other layers use local sliding-window attention.
-        let is_local_attention = if config.is_gemma3 {
-            // Global when (layer_idx + 1) % 6 == 0, i.e. 5, 11, 17, ...
-            (layer_idx + 1) % 6 != 0
+        // Gemma 3's QK-norm normalizes over the head dimension, so these are
+        // sized `head_dim`, not `hidden_size`.
+        let (q_norm, k_norm) = if config.is_gemma3 {
+            (
+                Some(GemmaRmsNorm::new(head_dim, config.rms_norm_eps)?),
+                Some(GemmaRmsNorm::new(head_dim, config.rms_norm_eps)?),
+            )
         } else {
-            config.is_gemma2 && (layer_idx % 2 == 0)
+            (None, None)
         };
 
         Ok(Self {
@@ -407,6 +455,8 @@ impl GemmaAttention {
             v_proj,
             o_proj,
             rope,
+            q_norm,
+            k_norm,
         })
     }
 
@@ -442,6 +492,18 @@ impl GemmaAttention {
         let values = values
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
+
+        // Gemma 3 QK-norm, after the head reshape and before RoPE — the order
+        // `modeling_gemma3.py` uses. Normalizing after RoPE would rescale the
+        // rotated pairs and lose the angle.
+        let queries = match &self.q_norm {
+            Some(norm) => norm.forward(&queries)?,
+            None => queries,
+        };
+        let keys = match &self.k_norm {
+            Some(norm) => norm.forward(&keys)?,
+            None => keys,
+        };
 
         // Apply RoPE
         let (queries, keys, values) = if let Some((cache_ref, _)) = cache.as_ref() {
@@ -842,10 +904,15 @@ impl GemmaModel {
         mut cache: Option<&mut KVCache>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
-        // Get embeddings and scale
+        // Get embeddings and scale. `mul_scalar` casts the scalar to the
+        // embedding dtype first, which is load-bearing rather than tidy:
+        // `transformers` writes `embed_scale.to(self.weight.dtype)`, so on a
+        // bf16 checkpoint √1152 = 33.941 is rounded to 34.0 before it ever
+        // multiplies. Keeping f32 precision here is a 0.17% scale error that
+        // RMSNorm cannot absorb, because the residual then adds an unscaled
+        // branch to a differently-scaled one.
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
-        let scale = Array::from_f32(self.config.embedding_scale());
-        hidden_states = hidden_states.multiply(&scale);
+        hidden_states = hidden_states.mul_scalar(self.config.embedding_scale());
 
         // Create causal mask if not provided and not using cache
         let mask_owned;
@@ -988,9 +1055,9 @@ impl GemmaForCausalLM {
         let cfg = &self.model.config;
         let head_dim = cfg.get_head_dim();
 
+        // Cast-then-multiply, as in `GemmaModel::forward_with_cache` above.
         let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?;
-        let scale = Array::from_f32(cfg.embedding_scale());
-        hidden = hidden.multiply(&scale);
+        hidden = hidden.mul_scalar(cfg.embedding_scale());
 
         if let Some(layers) = self.model.layers.gemma1.as_mut() {
             // Gemma1: standard pre-norm, no softcap, no per-layer sliding.

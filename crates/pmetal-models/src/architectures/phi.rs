@@ -202,6 +202,15 @@ impl Default for PhiConfig {
 
 impl PhiConfig {
     /// Phi-3-mini configuration (3.8B, 4K context).
+    ///
+    /// Also the `Default`, and therefore the value every field a Phi config
+    /// omits falls back to — `PhiConfig` is `#[serde(default)]`.
+    /// `partial_rotary_factor` is the one that matters: Phi-3 is *full* rotary
+    /// and `microsoft/Phi-3-mini-4k-instruct` ships `"partial_rotary_factor":
+    /// null`, so this default is what gets used. `transformers` reads the same
+    /// absent field as `1.0` (`configuration_phi3.py` setdefault), and 0.5 here
+    /// rotated half of every 96-wide head. Configs that state a value still
+    /// win: Phi-4-mini says 0.75, Phi-2 says 0.4.
     pub fn phi3_mini() -> Self {
         Self {
             model_type: "phi3".to_string(),
@@ -213,7 +222,7 @@ impl PhiConfig {
             num_key_value_heads: 32,
             max_position_embeddings: 4096,
             rope_theta: 10000.0,
-            partial_rotary_factor: 0.5,
+            partial_rotary_factor: 1.0,
             rms_norm_eps: 1e-5,
             qkv_bias: false,
             hidden_act: PhiActivation::SwiGLU,
@@ -1089,7 +1098,12 @@ mod tests {
         assert_eq!(mini.hidden_size, 3072);
         assert_eq!(mini.num_hidden_layers, 32);
         assert_eq!(mini.head_dim(), 96);
-        assert_eq!(mini.rope_dim(), 48); // 0.5 * 96
+        // Full rotary. `microsoft/Phi-3-mini-4k-instruct` ships
+        // `"partial_rotary_factor": null` and `transformers` reads that as
+        // 1.0, so the whole 96-wide head rotates. This asserted 48 while the
+        // preset claimed 0.5, which is what halved RoPE on every real Phi-3
+        // checkpoint pmetal loaded.
+        assert_eq!(mini.rope_dim(), 96);
 
         let medium = PhiConfig::phi3_medium();
         assert_eq!(medium.hidden_size, 5120);

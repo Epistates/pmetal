@@ -859,30 +859,35 @@ fn fused_vs_serial_gemma2_multi_step() {
     }
 }
 
+/// Gemma 3 is *excluded* from the fused path, and this pins that.
+///
+/// The fused skeleton has no slot for Gemma 3's QK-norm between projection and
+/// RoPE, and `BatchedGqaAttnCfg` carries a single scalar `rope_base` taken from
+/// `layers[0]` — a sliding layer, so every global layer would get the local
+/// base. Both are silent divergences rather than errors, so the guarantee has
+/// to be asserted rather than assumed: `supports_fused_batched` must keep
+/// returning false, and continuous batching keeps decoding Gemma 3 serially.
+///
+/// Numerical correctness of that serial path is covered against a real
+/// checkpoint by `real_weight_parity`.
 #[test]
-fn fused_vs_serial_gemma3_multi_step() {
-    let config = tiny_gemma3_config();
-    let window = config.sliding_window.unwrap() as usize;
-    let mut model = GemmaForCausalLM::new(config.clone()).unwrap();
-    let max_seq = config.max_position_embeddings as usize;
-    let hkv = config.num_kv_heads() as usize;
-    let hd = config.get_head_dim() as usize;
-    let nl = config.num_hidden_layers as usize;
+fn gemma3_declines_the_fused_batched_path() {
+    use pmetal_models::dispatcher::DynamicModel;
 
-    let mut cs = KVCache::new(kv_cfg(nl, max_seq, hkv, hd));
-    let mut cf = FusedBatchKVCache::new(kv_cfg(nl, max_seq, hkv, hd), 1).unwrap();
-    cf.admit(0).unwrap();
+    let gemma3 = GemmaForCausalLM::new(tiny_gemma3_config()).unwrap();
+    assert!(
+        !DynamicModel::Gemma(gemma3).supports_fused_batched(),
+        "Gemma 3 must decline the fused batched path — it cannot express \
+         QK-norm or the local/global RoPE split"
+    );
 
-    let steps = window + 2;
-    let token_stream: Vec<i32> = (0..steps as i32).map(|i| (i * 7 + 2) % 47).collect();
-
-    for (step, &tok) in token_stream.iter().enumerate() {
-        let inp = Array::from_i32_slice(&[tok]).reshape(&[1, 1]);
-        let s = model.forward_with_cache(&inp, None, Some(&mut cs)).unwrap();
-        let f = model.forward_batched_impl(&inp, &[0], &mut cf).unwrap();
-        let d = max_abs_diff(&last_logits(&s), &last_logits(&f));
-        assert!(d < 5e-4, "Gemma3 step {step} (token {tok}) divergence: {d}");
-    }
+    // The Gemma 2 config next to it must still be accepted, or the gate has
+    // been widened into a blanket refusal.
+    let gemma2 = GemmaForCausalLM::new(tiny_gemma2_config()).unwrap();
+    assert!(
+        DynamicModel::Gemma(gemma2).supports_fused_batched(),
+        "Gemma 2 still has a fused batched implementation"
+    );
 }
 
 fn tiny_cohere_config() -> CohereConfig {

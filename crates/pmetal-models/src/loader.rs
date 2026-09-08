@@ -19,7 +19,7 @@ use crate::architectures::mllama::MllamaForConditionalGeneration;
 use crate::architectures::nemotron_h::{
     NemotronHForCausalLM, load_nemotron_weights as load_nemotron,
 };
-use crate::architectures::phi::PhiForCausalLM;
+use crate::architectures::phi::{PhiConfig, PhiForCausalLM};
 use crate::architectures::qwen2::Qwen2ForCausalLM;
 use crate::architectures::qwen3::Qwen3ForCausalLM;
 use crate::architectures::qwen3_next::{
@@ -1452,10 +1452,71 @@ pub fn load_gemma_weights(
                 weights,
                 &format!("{prefix}.post_feedforward_layernorm"),
             )?;
+            // Gemma 3's QK-norm. Present only when the config asked for it, so
+            // a Gemma 2 checkpoint (which ships no such tensor) is not a
+            // missing weight. `GemmaRmsNorm` inits to zeros and computes
+            // `(1 + w)`, so an unloaded one is a silent identity scale rather
+            // than a visible failure — hence loading it here rather than
+            // trusting the generic path, which this loader does not use.
+            if let Some(ref mut q_norm) = layer.self_attn.q_norm {
+                load_gemma_rms_norm_weight(q_norm, weights, &format!("{prefix}.self_attn.q_norm"))?;
+            }
+            if let Some(ref mut k_norm) = layer.self_attn.k_norm {
+                load_gemma_rms_norm_weight(k_norm, weights, &format!("{prefix}.self_attn.k_norm"))?;
+            }
         }
     }
     load_gemma_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
     Ok(())
+}
+
+/// Split Phi-3's fused `self_attn.qkv_proj` into `q_proj` / `k_proj` /
+/// `v_proj`, in place.
+///
+/// Phi-3 ships one `[n_heads·head_dim + 2·n_kv_heads·head_dim, hidden]` tensor
+/// where pmetal holds three projections. `Phi3Attention.forward` slices it as
+/// `[:query_pos]`, `[query_pos : query_pos + kv]`, `[query_pos + kv :]`, so the
+/// row order is q, k, v. Without this the fused key matches no parameter, the
+/// generic loader drops it silently, and all three projections run on random
+/// init — a whole model's attention, gone, behind finite plausible logits.
+///
+/// A no-op on checkpoints that already ship the three tensors (Phi-4-mini),
+/// which is why it can run unconditionally on the Phi path.
+pub fn split_phi_fused_qkv(weights: &mut HashMap<String, Array>, config: &PhiConfig) {
+    let head_dim = config.head_dim();
+    let q_rows = config.num_attention_heads * head_dim;
+    let kv_rows = config.num_key_value_heads * head_dim;
+
+    let fused: Vec<String> = weights
+        .keys()
+        .filter(|k| k.ends_with(".self_attn.qkv_proj.weight"))
+        .cloned()
+        .collect();
+
+    for key in fused {
+        let Some(w) = weights.remove(&key) else {
+            continue;
+        };
+        let shape = w.shape().to_vec();
+        if shape.len() != 2 || shape[0] != q_rows + 2 * kv_rows {
+            // Not the geometry this config describes. Put it back rather than
+            // silently dropping a tensor we failed to understand.
+            weights.insert(key, w);
+            continue;
+        }
+        let cols = shape[1];
+        let prefix = key.trim_end_matches("qkv_proj.weight");
+        for (name, start, stop) in [
+            ("q_proj", 0, q_rows),
+            ("k_proj", q_rows, q_rows + kv_rows),
+            ("v_proj", q_rows + kv_rows, q_rows + 2 * kv_rows),
+        ] {
+            weights.insert(
+                format!("{prefix}{name}.weight"),
+                w.slice(&[start, 0], &[stop, cols]),
+            );
+        }
+    }
 }
 
 pub fn load_phi_weights(
