@@ -534,19 +534,25 @@ pub struct GraniteDecoderLayer {
     /// `config.residual_multiplier`, applied to both residual branches.
     pub residual_multiplier: f32,
 
-    pub attention: Option<GraniteAttention>,
+    /// Named `self_attn`, not `attention`, because the generic loader assigns
+    /// weights by exact parameter path: released Granite checkpoints ship
+    /// `model.layers.N.self_attn.q_proj.weight`, and a field called `attention`
+    /// makes every one of those keys unmatched. `assign_loaded_weights` drops
+    /// an unmatched key silently, so the whole attention stack stayed at random
+    /// init and Granite inference returned noise while parsing perfectly.
+    pub self_attn: Option<GraniteAttention>,
     pub mamba: Option<GraniteMamba2>,
     pub mlp: GraniteMLP,
     pub input_layernorm: nn::RmsNorm,
     pub post_attention_layernorm: nn::RmsNorm,
 }
-impl_module_params!(GraniteDecoderLayer; attention, mamba, mlp, input_layernorm, post_attention_layernorm);
+impl_module_params!(GraniteDecoderLayer; self_attn, mamba, mlp, input_layernorm, post_attention_layernorm);
 
 impl GraniteDecoderLayer {
     pub fn new(config: &GraniteConfig, layer_idx: usize) -> Result<Self, Exception> {
         let layer_type = config.layer_type(layer_idx);
 
-        let (attention, mamba) = match layer_type {
+        let (self_attn, mamba) = match layer_type {
             GraniteLayerType::Attention => (Some(GraniteAttention::new(config)?), None),
             GraniteLayerType::Mamba2 => (None, Some(GraniteMamba2::new(config)?)),
         };
@@ -563,7 +569,7 @@ impl GraniteDecoderLayer {
         Ok(Self {
             layer_type,
             residual_multiplier: config.residual_multiplier,
-            attention,
+            self_attn,
             mamba,
             mlp,
             input_layernorm,
@@ -596,7 +602,7 @@ impl GraniteDecoderLayer {
         match self.layer_type {
             GraniteLayerType::Attention => scaled_pre_norm_forward(
                 &mut self.input_layernorm,
-                self.attention.as_mut().unwrap(),
+                self.self_attn.as_mut().unwrap(),
                 &mut self.post_attention_layernorm,
                 &mut self.mlp,
                 x,
@@ -802,7 +808,7 @@ impl GraniteForCausalLM {
         let mut hidden = Module::forward(&mut self.model.embed_tokens, input_ids)?
             .mul_scalar(embedding_multiplier);
         for (layer_idx, layer) in self.model.layers.iter_mut().enumerate() {
-            let attn = layer.attention.as_mut().ok_or_else(|| {
+            let attn = layer.self_attn.as_mut().ok_or_else(|| {
                 Exception::custom(
                     "forward_batched_impl invoked on hybrid Granite — \
                      supports_fused_batched should have gated this off",
