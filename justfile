@@ -20,13 +20,18 @@ preflight: fmt-check lint lint-all-features test test-release check-gui check-ve
 
 # ─── Formatting ─────────────────────────────────────────────────────
 
-# Format code
+# Format code.
+#
+# pmetal-gui/src-tauri is `exclude`d from the workspace, so `--all` does not
+# reach it. It needs its own invocation or it drifts unformatted.
 fmt:
     cargo fmt --all
+    cargo fmt --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml
 
 # Check formatting without changing files (CI: check job)
 fmt-check:
     cargo fmt --all -- --check
+    cargo fmt --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml -- --check
 
 # ─── Linting ────────────────────────────────────────────────────────
 

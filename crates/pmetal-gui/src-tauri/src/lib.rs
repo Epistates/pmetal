@@ -148,11 +148,9 @@ pub fn run() {
                     // Note: We cannot join the forwarder task here because Tauri's
                     // `on_window_event` handler is synchronous and the task handle
                     // is not exposed. The sleep gives async tasks one tick to flush.
-                    let _ = state
-                        .event_tx
-                        .send(crate::state::AppEvent::ModelRemoved {
-                            model_id: String::new(),
-                        });
+                    let _ = state.event_tx.send(crate::state::AppEvent::ModelRemoved {
+                        model_id: String::new(),
+                    });
                 }
 
                 // Give in-flight GPU work and the event forwarder up to 1 s to

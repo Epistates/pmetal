@@ -582,8 +582,7 @@ pub async fn delete_model(state: State<'_, AppState>, model_id: String) -> Resul
     {
         let grpo = state.grpo_runs.read().await;
         if grpo.iter().any(|r| {
-            r.model == model_id
-                && matches!(r.status, GrpoStatus::Pending | GrpoStatus::Running)
+            r.model == model_id && matches!(r.status, GrpoStatus::Pending | GrpoStatus::Running)
         }) {
             return Err(AppError(format!(
                 "Cannot delete '{model_id}': a GRPO run is currently using it."
@@ -1160,9 +1159,10 @@ pub async fn start_training(
 
         let columns = {
             let text_column = spec.text_column.clone();
-            let text_columns = spec.text_columns.as_ref().map(|s| {
-                s.split(',').map(str::to_string).collect::<Vec<_>>()
-            });
+            let text_columns = spec
+                .text_columns
+                .as_ref()
+                .map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>());
             let prompt_column = spec.prompt_column.clone();
             let response_column = spec.response_column.clone();
             let column_separator = spec.column_separator.clone();
@@ -1381,19 +1381,14 @@ pub async fn start_distillation(
         let watcher_event_tx = event_tx.clone();
         let watcher_run_id = run_id_task.clone();
         tokio::spawn(async move {
-            tail_jsonl_to_channel(
-                watcher_metrics,
-                watcher_cancel,
-                on_event,
-                move |row| {
-                    let mut runs = watcher_state.try_write().ok()?;
-                    let run = runs.iter_mut().find(|r| r.id == watcher_run_id)?;
-                    let started_at = Utc::now(); // approximate; ETA is best-effort
-                    apply_metrics_to_distillation(run, row, started_at);
-                    let _ = watcher_event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
-                    Some(())
-                },
-            )
+            tail_jsonl_to_channel(watcher_metrics, watcher_cancel, on_event, move |row| {
+                let mut runs = watcher_state.try_write().ok()?;
+                let run = runs.iter_mut().find(|r| r.id == watcher_run_id)?;
+                let started_at = Utc::now(); // approximate; ETA is best-effort
+                apply_metrics_to_distillation(run, row, started_at);
+                let _ = watcher_event_tx.send(AppEvent::DistillationUpdate { run: run.clone() });
+                Some(())
+            })
             .await;
         });
 
@@ -1507,19 +1502,14 @@ pub async fn start_grpo(
         let watcher_event_tx = event_tx.clone();
         let watcher_run_id = run_id_task.clone();
         tokio::spawn(async move {
-            tail_jsonl_to_channel(
-                watcher_metrics,
-                watcher_cancel,
-                on_event,
-                move |row| {
-                    let mut runs = watcher_state.try_write().ok()?;
-                    let run = runs.iter_mut().find(|r| r.id == watcher_run_id)?;
-                    let started_at = Utc::now();
-                    apply_metrics_to_grpo(run, row, started_at);
-                    let _ = watcher_event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
-                    Some(())
-                },
-            )
+            tail_jsonl_to_channel(watcher_metrics, watcher_cancel, on_event, move |row| {
+                let mut runs = watcher_state.try_write().ok()?;
+                let run = runs.iter_mut().find(|r| r.id == watcher_run_id)?;
+                let started_at = Utc::now();
+                apply_metrics_to_grpo(run, row, started_at);
+                let _ = watcher_event_tx.send(AppEvent::GrpoUpdate { run: run.clone() });
+                Some(())
+            })
             .await;
         });
 
@@ -1644,7 +1634,14 @@ pub async fn start_serve(
         }
     }
 
-    let instance = ServeInstance::new(&spec.model, &host, port, max_seq_len, fp8, &kv_cache_display);
+    let instance = ServeInstance::new(
+        &spec.model,
+        &host,
+        port,
+        max_seq_len,
+        fp8,
+        &kv_cache_display,
+    );
     let instance_id = instance.id.clone();
     state.create_serve_instance(instance).await;
 
@@ -1841,7 +1838,10 @@ pub async fn start_bench(
     if !matches!(mode, "basic" | "workload") {
         return Err(AppError(format!("unknown benchmark mode: {mode}")));
     }
-    let preset = spec.preset.as_deref().filter(|p| !p.is_empty() && *p != "custom");
+    let preset = spec
+        .preset
+        .as_deref()
+        .filter(|p| !p.is_empty() && *p != "custom");
     if (mode == "basic" || preset.is_none()) && spec.model.trim().is_empty() {
         return Err(AppError("model is required".into()));
     }
@@ -2512,13 +2512,8 @@ pub async fn start_inference(
         .insert(session_id.clone(), cancel_flag.clone());
 
     tokio::spawn(async move {
-        let result = run_inference_streaming(
-            &spec,
-            messages.as_deref(),
-            &cancel_flag,
-            &app_handle,
-        )
-        .await;
+        let result =
+            run_inference_streaming(&spec, messages.as_deref(), &cancel_flag, &app_handle).await;
 
         match result {
             Ok(metrics) => {
@@ -3202,9 +3197,10 @@ async fn run_distillation_in_process(
     // Build column config from the spec fields.
     let col_cfg = {
         let text_column = spec.text_column.clone();
-        let text_columns = spec.text_columns.as_ref().map(|s| {
-            s.split(',').map(str::to_string).collect::<Vec<_>>()
-        });
+        let text_columns = spec
+            .text_columns
+            .as_ref()
+            .map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>());
         let prompt_column = spec.prompt_column.clone();
         let response_column = spec.response_column.clone();
         let column_separator = spec.column_separator.clone();
@@ -3349,10 +3345,7 @@ async fn run_distillation_in_process(
 
     let callback = pmetal::trainer::MetricsJsonCallback::new(metrics_path)
         .map_err(|e| AppError(e.to_string()))?
-        .with_run_name(format!(
-            "distill-{}",
-            spec.student.replace('/', "-")
-        ));
+        .with_run_name(format!("distill-{}", spec.student.replace('/', "-")));
     trainer.add_callback(Box::new(callback));
     trainer.add_callback(Box::new(CancelOnFlag {
         cancelled: cancel_flag,
@@ -3409,9 +3402,10 @@ async fn run_grpo_in_process(
     // Build column config from spec fields.
     let col_cfg = {
         let text_column = spec.text_column.clone();
-        let text_columns = spec.text_columns.as_ref().map(|s| {
-            s.split(',').map(str::to_string).collect::<Vec<_>>()
-        });
+        let text_columns = spec
+            .text_columns
+            .as_ref()
+            .map(|s| s.split(',').map(str::to_string).collect::<Vec<_>>());
         let prompt_column = spec.prompt_column.clone();
         let response_column = spec.response_column.clone();
         let column_separator = spec.column_separator.clone();
@@ -3471,8 +3465,8 @@ async fn run_grpo_in_process(
         pmetal::lora::DynamicLoraModel::from_pretrained(&model_path, lora_config.clone())
             .map_err(|e| AppError(e.to_string()))?;
 
-    let mut grpo_config = pmetal::trainer::GrpoConfig::new(spec.num_generations)
-        .with_beta(spec.beta);
+    let mut grpo_config =
+        pmetal::trainer::GrpoConfig::new(spec.num_generations).with_beta(spec.beta);
     grpo_config.max_prompt_length = max_seq_len;
     grpo_config.max_completion_length = spec.max_completion_length;
     grpo_config.kv_cache_bits = spec.grpo_kv_bits;
@@ -3515,11 +3509,10 @@ async fn run_grpo_in_process(
     let control_file = PathBuf::from(&output_dir).join(".lr_control.json");
     trainer.enable_adaptive_lr_with_control(adaptive_config, control_file);
 
-    let mut optimizer = pmetal_bridge::compat::optimizers::AdamWBuilder::new(
-        spec.learning_rate as f32,
-    )
-    .build()
-    .map_err(|e| AppError(e.to_string()))?;
+    let mut optimizer =
+        pmetal_bridge::compat::optimizers::AdamWBuilder::new(spec.learning_rate as f32)
+            .build()
+            .map_err(|e| AppError(e.to_string()))?;
     let mut ref_model =
         pmetal::models::DynamicModel::load(&model_path).map_err(|e| AppError(e.to_string()))?;
 
@@ -4225,10 +4218,7 @@ pub async fn start_embed_train(
         "--temperature".into(),
         config.temperature.unwrap_or(0.05).to_string(),
     ]);
-    args.extend([
-        "--margin".into(),
-        config.margin.unwrap_or(0.3).to_string(),
-    ]);
+    args.extend(["--margin".into(), config.margin.unwrap_or(0.3).to_string()]);
     args.extend([
         "--learning-rate".into(),
         config.learning_rate.unwrap_or(2e-5).to_string(),
@@ -4237,10 +4227,7 @@ pub async fn start_embed_train(
         "--batch-size".into(),
         config.batch_size.unwrap_or(32).to_string(),
     ]);
-    args.extend([
-        "--epochs".into(),
-        config.epochs.unwrap_or(3).to_string(),
-    ]);
+    args.extend(["--epochs".into(), config.epochs.unwrap_or(3).to_string()]);
     args.extend([
         "--max-seq-len".into(),
         config.max_seq_len.unwrap_or(512).to_string(),
@@ -4256,10 +4243,7 @@ pub async fn start_embed_train(
         "--log-every".into(),
         config.log_every.unwrap_or(10).to_string(),
     ]);
-    args.extend([
-        "--seed".into(),
-        config.seed.unwrap_or(42).to_string(),
-    ]);
+    args.extend(["--seed".into(), config.seed.unwrap_or(42).to_string()]);
 
     spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
     Ok(run_id)
@@ -4342,22 +4326,13 @@ pub async fn start_rlkd(
         "--num-generations".into(),
         config.num_generations.unwrap_or(8).to_string(),
     ]);
-    args.extend([
-        "--beta".into(),
-        config.beta.unwrap_or(0.001).to_string(),
-    ]);
+    args.extend(["--beta".into(), config.beta.unwrap_or(0.001).to_string()]);
     args.extend([
         "--learning-rate".into(),
         config.learning_rate.unwrap_or(5e-6).to_string(),
     ]);
-    args.extend([
-        "--epochs".into(),
-        config.epochs.unwrap_or(1).to_string(),
-    ]);
-    args.extend([
-        "--lora-r".into(),
-        config.lora_r.unwrap_or(16).to_string(),
-    ]);
+    args.extend(["--epochs".into(), config.epochs.unwrap_or(1).to_string()]);
+    args.extend(["--lora-r".into(), config.lora_r.unwrap_or(16).to_string()]);
     args.extend([
         "--lora-alpha".into(),
         config.lora_alpha.unwrap_or(32.0).to_string(),
@@ -4370,10 +4345,7 @@ pub async fn start_rlkd(
         "--max-completion-length".into(),
         config.max_completion_length.unwrap_or(512).to_string(),
     ]);
-    args.extend([
-        "--seed".into(),
-        config.seed.unwrap_or(42).to_string(),
-    ]);
+    args.extend(["--seed".into(), config.seed.unwrap_or(42).to_string()]);
     if config.reasoning_rewards.unwrap_or(false) {
         args.push("--reasoning-rewards".into());
     }
@@ -4510,8 +4482,9 @@ async fn spawn_oneshot_subprocess(
         tokio::spawn(async move {
             let mut reader = BufReader::new(s).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let _ = on_event_stdout
-                    .send(serde_json::json!({ "event": "log", "line": &line, "run_id": &run_id_stdout }));
+                let _ = on_event_stdout.send(
+                    serde_json::json!({ "event": "log", "line": &line, "run_id": &run_id_stdout }),
+                );
             }
         });
     }
@@ -4521,8 +4494,9 @@ async fn spawn_oneshot_subprocess(
         tokio::spawn(async move {
             let mut reader = BufReader::new(s).lines();
             while let Ok(Some(line)) = reader.next_line().await {
-                let _ = on_event_stderr
-                    .send(serde_json::json!({ "event": "log", "line": &line, "run_id": &run_id_stderr }));
+                let _ = on_event_stderr.send(
+                    serde_json::json!({ "event": "log", "line": &line, "run_id": &run_id_stderr }),
+                );
             }
         });
     }
