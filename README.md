@@ -367,7 +367,7 @@ pmetal/
 ├── pmetal-mhc          # Manifold-Constrained Hyper-Connections
 ├── pmetal-distributed  # Distributed training (mDNS, Ring All-Reduce)
 ├── pmetal-vocoder      # BigVGAN neural vocoder
-├── pmetal-serve        # OpenAI-compatible inference server
+├── pmetal-serve        # OpenAI- and Anthropic-compatible inference server
 ├── pmetal-mcp          # MCP server (51 tools for Claude Desktop)
 ├── pmetal-py           # Python bindings (maturin/PyO3)
 ├── pmetal              # Umbrella crate: CLI binary + TUI control center
@@ -704,7 +704,7 @@ Defaults are `cli`, `dashboard`, `trainer`, `lora`, `merge`, `ane` and `distribu
 | `lora-metal-fused` | No | — | ~2x LoRA training speedup via fused Metal kernels |
 | `vocoder` | No | `pmetal-vocoder` | BigVGAN neural vocoder |
 | `mhc` | No | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
-| `serve` | No | `pmetal-serve` | OpenAI-compatible inference server |
+| `serve` | No | `pmetal-serve` | OpenAI- and Anthropic-compatible inference server |
 | `mcp` | No | `pmetal-mcp` | MCP server (51 tools for Claude Desktop) |
 | `full` | No | — | All sub-crate features (not `cli`, `serve` or `mcp`) |
 

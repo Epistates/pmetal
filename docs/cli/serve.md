@@ -26,11 +26,17 @@ pmetal serve --model ./output/fused --port 8080
 
 ## API Compatibility
 
-The server exposes OpenAI-compatible endpoints:
+The server speaks both the OpenAI and the Anthropic wire formats:
 
-- `POST /v1/chat/completions` — Chat completions
-- `POST /v1/completions` — Text completions
-- `GET /v1/models` — List loaded models
+- `POST /v1/chat/completions` — chat completions (streaming and non-streaming, tool calling, token logprobs)
+- `POST /v1/completions` — text completions
+- `POST /v1/embeddings` — embeddings, 17 architectures via `forward_hidden`
+- `POST /v1/messages` — Anthropic-compatible messages, with SSE streaming
+- `GET /v1/models` — list loaded models
+- `GET /v1/metrics` — serving metrics
+- `GET /health` — liveness check
+
+Request bodies are capped at 2 MiB.
 
 ```bash
 curl http://localhost:8080/v1/chat/completions \
