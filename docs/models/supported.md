@@ -26,6 +26,8 @@ All causal language models below work with the CLI (`pmetal infer`), TUI, GUI, a
 | NemotronH | `NemotronH` | Hybrid (Mamba+Attention) | `nemotron_h` |
 | GPT-OSS | `GptOss` | 20B, 120B | `gpt_oss`, `gpt-oss` |
 | Gemma 4 | `Gemma4` | 4 | `gemma4`, `gemma4_text` |
+| Llama 3.2 Vision | `Mllama` | 11B, 90B | `mllama`, `mllama_text_model` |
+| DiffusionGemma | `DiffusionGemma` | dense, MoE | `diffusion_gemma`, `diffusion_gemma_text` |
 
 Gemma 4 MTP assistant checkpoints (`model_type = "gemma4_assistant"`) are supported as
 draft assistants via `pmetal infer --draft-model <assistant>`. Greedy and sampling
@@ -68,6 +70,7 @@ to export DFlash draft checkpoints for the dedicated `pmetal dflash` runtime.
 | Granite | Yes | Yes | Dense and hybrid variants. |
 | NemotronH | Yes | Yes | Hybrid architecture support. |
 | GPT-OSS | Yes | Yes | MoE variants. |
+| DiffusionGemma | Yes | Yes | Block-diffusion; trained via `pmetal train-diffusion` (add `--qlora`). |
 
 ## Architecture Modules (Not Yet in Dispatcher)
 
@@ -77,7 +80,6 @@ These have implementations in `pmetal-models` but are not in the `DynamicModel` 
 |--------|--------|-------|
 | Pixtral | `pixtral` | 12B vision-language |
 | Qwen2-VL | `qwen2_vl` | 2B, 7B vision-language |
-| MLlama | `mllama` | Llama 3.2-Vision |
 | CLIP | `clip` | ViT-L/14 vision encoder |
 | Whisper | `whisper` | Base–Large speech models |
 | T5 | `t5` | Encoder-decoder architecture |
