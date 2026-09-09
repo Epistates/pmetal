@@ -760,13 +760,25 @@ impl DynamicModel {
             // no parameter for and therefore discards without a word.
             ModelArchitecture::Phi => Self::load_phi_variant(&config_content, model_dir, false),
             ModelArchitecture::Phi4 => Self::load_phi_variant(&config_content, model_dir, true),
-            ModelArchitecture::DeepSeek => simple_load_moe!(
-                DeepSeekConfig,
-                DeepSeek::new,
-                &config_content,
-                model_dir,
-                DeepSeek
-            ),
+            // DeepSeek cannot use `simple_load_moe!`: its MoE layers name the
+            // router, the shared expert and every routed expert differently
+            // from the checkpoint, and the generic loader drops what it cannot
+            // match by exact name. See `deepseek_param_name`.
+            ModelArchitecture::DeepSeek => {
+                let config: DeepSeekConfig = json5::from_str(&config_content)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                let mut model = DeepSeek::new(config)?;
+                crate::loader::load_generic_weights_renamed(
+                    &mut model,
+                    model_dir,
+                    crate::loader::deepseek_param_name,
+                )
+                .map_err(|e| Exception::custom(format!("{:?}", e)))?;
+                eval_module_parameters_batched(&model)?;
+                let mut model = Self::DeepSeek(model);
+                model.init_post_load_fast_paths()?;
+                Ok(model)
+            }
             ModelArchitecture::Cohere => simple_load!(
                 CohereConfig,
                 CohereForCausalLM::new,

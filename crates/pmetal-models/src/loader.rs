@@ -1018,10 +1018,36 @@ pub fn load_generic_weights<M: ModuleParameters + ModuleParametersExt>(
     model: &mut M,
     model_dir: impl AsRef<Path>,
 ) -> Result<(), LoadError> {
+    load_generic_weights_renamed(model, model_dir, |_| None)
+}
+
+/// [`load_generic_weights`] with a hook that rewrites checkpoint keys into
+/// pmetal parameter paths.
+///
+/// `rename` returns `Some(path)` for a key that needs rewriting and `None` to
+/// pass it through. This exists for architectures whose parameter tree is
+/// shaped differently from the checkpoint but not differently enough to justify
+/// a bespoke loader — the alternative is `assign_loaded_weights` silently
+/// dropping every renamed tensor, since it matches by exact name.
+pub fn load_generic_weights_renamed<M: ModuleParameters + ModuleParametersExt>(
+    model: &mut M,
+    model_dir: impl AsRef<Path>,
+    rename: impl Fn(&str) -> Option<String>,
+) -> Result<(), LoadError> {
+    let apply = |loaded: HashMap<String, Array>| -> HashMap<String, Array> {
+        loaded
+            .into_iter()
+            .map(|(key, value)| match rename(&key) {
+                Some(renamed) => (renamed, value),
+                None => (key, value),
+            })
+            .collect()
+    };
+
     let model_dir = model_dir.as_ref();
     let single_file = model_dir.join("model.safetensors");
     if single_file.exists() {
-        let loaded = load_shard(&single_file)?;
+        let loaded = apply(load_shard(&single_file)?);
         assign_loaded_weights(model, loaded);
         eval_loaded_parameters(model)?;
         return Ok(());
@@ -1038,11 +1064,50 @@ pub fn load_generic_weights<M: ModuleParameters + ModuleParametersExt>(
     let shard_files: HashSet<&String> = index.weight_map.values().collect();
     for shard_file in shard_files {
         let shard_path = validate_shard_path(model_dir, shard_file)?;
-        let loaded = load_shard(&shard_path)?;
+        let loaded = apply(load_shard(&shard_path)?);
         assign_loaded_weights(model, loaded);
     }
     eval_loaded_parameters(model)?;
     Ok(())
+}
+
+/// Rewrite a DeepSeek checkpoint key into pmetal's parameter path.
+///
+/// Three renames, all inside a MoE layer's `mlp`:
+///
+/// * `mlp.gate.weight` — the router matrix. pmetal reaches it through
+///   `DeepSeekMoEGate`, whose own `Linear` field is called `weight`, so the
+///   flattened path double-nests to `mlp.weight.weight`.
+/// * `mlp.shared_experts.*` — `DeepSeekMoE` merges the shared expert's
+///   parameters into its own map with no prefix, so they sit directly at
+///   `mlp.*`.
+/// * `mlp.experts.N.{gate,up,down}_proj` — the shared `Expert` type spells a
+///   SwiGLU expert `w1`/`w3`/`w2`.
+///
+/// Scoped to the `.mlp.` segment so a dense layer's own `mlp.gate_proj.weight`,
+/// which already matches, is left alone. Every one of these was silently
+/// dropped before, taking the entire mixture with it.
+pub fn deepseek_param_name(key: &str) -> Option<String> {
+    let idx = key.find(".mlp.")?;
+    let (prefix, tail) = key.split_at(idx + ".mlp.".len());
+
+    if tail == "gate.weight" {
+        return Some(format!("{prefix}weight.weight"));
+    }
+    if let Some(rest) = tail.strip_prefix("shared_experts.") {
+        return Some(format!("{prefix}{rest}"));
+    }
+    if let Some(rest) = tail.strip_prefix("experts.") {
+        let (index, member) = rest.split_once('.')?;
+        let renamed = match member {
+            "gate_proj.weight" => "w1.weight",
+            "up_proj.weight" => "w3.weight",
+            "down_proj.weight" => "w2.weight",
+            _ => return None,
+        };
+        return Some(format!("{prefix}experts.{index}.{renamed}"));
+    }
+    None
 }
 
 /// Assign in-memory, HuggingFace-named weights to a model's parameters and

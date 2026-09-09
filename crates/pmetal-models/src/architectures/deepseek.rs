@@ -676,6 +676,8 @@ pub struct DeepSeekMoEGate {
     pub norm_topk_prob: bool,
     pub n_group: i32,
     pub topk_group: i32,
+    /// `"sigmoid"` (V3) or `"softmax"` (V2), straight from the config.
+    pub scoring_func: String,
 }
 impl_module_params!(DeepSeekMoEGate; weight);
 
@@ -693,6 +695,7 @@ impl DeepSeekMoEGate {
             norm_topk_prob: config.norm_topk_prob,
             n_group: config.n_group,
             topk_group: config.topk_group,
+            scoring_func: config.scoring_func.clone(),
         })
     }
     pub fn forward(&mut self, x: &Array) -> Result<(Array, Array)> {
@@ -702,11 +705,17 @@ impl DeepSeekMoEGate {
         let hidden_flat = x.reshape(&[token_count, hidden_size]);
         let gates = self.weight.forward(&hidden_flat);
 
-        // DeepSeek routes on sigmoid scores (not softmax). The cast keeps
-        // the reduction in f32 for numerical stability on bf16 models.
-        let scores = pmetal_bridge::compat::ops::sigmoid(
-            &gates.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32()),
-        );
+        // The scoring function is per-checkpoint, not per-family: V3 routes on
+        // sigmoid, V2 on softmax. Hardcoding sigmoid put every V2 token through
+        // an unnormalised score, which changes both which experts win and how
+        // much weight each carries. The cast keeps the reduction in f32 for
+        // numerical stability on bf16 models.
+        let logits = gates.as_dtype(pmetal_bridge::compat::Dtype::Float32.as_i32());
+        let scores = if self.scoring_func == "softmax" {
+            pmetal_bridge::compat::ops::softmax_axis(&logits, -1)
+        } else {
+            pmetal_bridge::compat::ops::sigmoid(&logits)
+        };
 
         // Shared top-k + noaux_tc bias-corrected selection —
         // see `crate::moe_routing::noaux_tc_topk`.
@@ -733,10 +742,19 @@ pub struct DeepSeekMoE {
     pub stacked_down_proj: Option<Array>,
     pub stacked_weight_signature: Option<Vec<usize>>,
 }
+/// `MoELayer` carries its own `router`, but `DeepSeekMoE` never asks it to
+/// route — every path goes through `self.gate`, which implements DeepSeek's
+/// sigmoid/softmax scoring and group-limited selection. Publishing that unused
+/// router as a parameter leaves a tensor no checkpoint can fill, sitting at
+/// random init inside an otherwise fully-loaded model.
+const UNUSED_MOE_ROUTER: &str = "router";
+
 impl ModuleParameters for DeepSeekMoE {
     fn parameters(&self) -> ModuleParamRef<'_> {
         let mut map = self.gate.parameters();
-        map.extend(self.moe.parameters());
+        let mut moe = self.moe.parameters();
+        moe.remove(UNUSED_MOE_ROUTER);
+        map.extend(moe);
         if let Some(ref s) = self.shared_experts {
             map.extend(s.parameters());
         }
@@ -744,7 +762,9 @@ impl ModuleParameters for DeepSeekMoE {
     }
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let mut map = self.gate.trainable_parameters();
-        map.extend(self.moe.trainable_parameters());
+        let mut moe = self.moe.trainable_parameters();
+        moe.remove(UNUSED_MOE_ROUTER);
+        map.extend(moe);
         if let Some(ref s) = self.shared_experts {
             map.extend(s.trainable_parameters());
         }
@@ -760,7 +780,9 @@ impl ModuleParameters for DeepSeekMoE {
     }
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut map = self.gate.parameters_mut();
-        map.extend(self.moe.parameters_mut());
+        let mut moe = self.moe.parameters_mut();
+        moe.remove(UNUSED_MOE_ROUTER);
+        map.extend(moe);
         if let Some(ref mut s) = self.shared_experts {
             map.extend(s.parameters_mut());
         }
