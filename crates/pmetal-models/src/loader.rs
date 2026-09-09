@@ -120,7 +120,15 @@ fn load_mlx_quantization_config(
     }
 
     let raw = std::fs::read_to_string(&config_path)?;
-    let json: serde_json::Value = serde_json::from_str(&raw)?;
+    // Through `config_value`, not `serde_json::from_str`: Python's `json.dump`
+    // emits bare `Infinity`, which is not JSON. `nvidia/Nemotron-H-8B-Base-8K`
+    // ships `"time_step_limit": [0.0, Infinity]`, and reading it strictly here
+    // failed the *whole load* with a parse error 46 lines from anything this
+    // function cares about. Architecture detection already routed around it;
+    // this was the other half, and no config-only sweep could see it because
+    // no config-only sweep loads weights.
+    let json =
+        crate::dispatcher::config_value(&raw).map_err(|e| LoadError::SafeTensors(e.to_string()))?;
     let Some(quant) = json
         .get("quantization")
         .or_else(|| json.get("quantization_config"))
@@ -1572,7 +1580,11 @@ pub fn load_phi_weights(
         )?;
     }
     load_phi_rms_norm_weight(&mut model.model.norm, weights, "model.norm")?;
-    load_linear_weight(&mut model.lm_head, weights, "lm_head")?;
+    // Absent on a tied checkpoint, where `lm_head` is `None` and the embedding
+    // is reused instead.
+    if let Some(lm_head) = model.lm_head.as_mut() {
+        load_linear_weight(lm_head, weights, "lm_head")?;
+    }
     Ok(())
 }
 
