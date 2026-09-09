@@ -17,7 +17,7 @@ pub struct MergeArgs {
     #[arg(short, long = "output")]
     pub output: String,
 
-    /// Merge method (linear, slerp, ties, dare_ties, dare_linear, task_arithmetic, della, breadcrumbs, model_stock, nearswap, passthrough)
+    /// Merge method (linear, slerp, ties, dare_ties, dare_linear, task_arithmetic, della, della_linear, breadcrumbs, model_stock, nearswap, passthrough)
     #[arg(long = "method", default_value = "slerp")]
     pub method: String,
 

@@ -1,8 +1,8 @@
 # Model Merging
 
-Merge models with 16 strategies — SLERP, TIES, DARE, Task Arithmetic, and more.
+Merge models with 15 strategies — SLERP, TIES, DARE, Task Arithmetic, and more.
 
-PMetal supports 16 model merging strategies (12 via CLI, 4 library-only). Features GPU-accelerated merging, FP8-aware operations, and async double-buffered streaming for large models.
+PMetal supports 15 model merging strategies (12 via CLI, 3 more via `MergeConfig`). Features GPU-accelerated merging, FP8-aware operations, and async double-buffered streaming for large models.
 
 ## CLI Strategies
 
@@ -23,11 +23,17 @@ PMetal supports 16 model merging strategies (12 via CLI, 4 library-only). Featur
 
 ## Library-Only Strategies
 
-| Strategy | Description |
-|----------|-------------|
-| `RamMerge` | RAM merge strategy |
-| `SouperMerge` | Souper merge strategy |
-| `MultiSlerpMerge` | Multi-model SLERP |
+Reachable by setting `MergeConfig.merge_method` directly; `pmetal merge --method` does not accept them.
+
+| `merge_method` | Description |
+|----------------|-------------|
+| `ram` | RAM (Rescaled Activation Merging) |
+| `ram_plus` | RAM+ variant |
+| `multi_slerp` | Multi-model SLERP |
+
+`FisherMerge`, `RegMeanMerge` and `SouperMerge` are implemented in
+`pmetal_merge::methods` but have no `MergeMethodConfig` variant, so they are only usable by
+constructing the `MergeMethod` trait object yourself.
 
 ## Examples
 

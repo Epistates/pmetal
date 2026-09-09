@@ -362,7 +362,7 @@ pmetal/
 ├── pmetal-data         # Dataset loading, chat templates, tokenization
 ├── pmetal-hub          # HuggingFace Hub integration + model fit estimation
 ├── pmetal-distill      # Knowledge distillation losses, offline caches, and TAID
-├── pmetal-merge        # Model merging (14 strategies)
+├── pmetal-merge        # Model merging (15 strategies)
 ├── pmetal-gguf         # GGUF format with imatrix quantization
 ├── pmetal-mhc          # Manifold-Constrained Hyper-Connections
 ├── pmetal-distributed  # Distributed training (mDNS, Ring All-Reduce)
@@ -569,7 +569,7 @@ The `pmetal dataset` subcommand provides utilities for analysis, download from H
 ### Model Operations
 
 - **HuggingFace Hub Search**: `pmetal search` with memory fit estimation and download
-- **Model Merging** (16 strategies via library, 12 via CLI):
+- **Model Merging** (15 strategies via `MergeConfig`, 12 via CLI):
 
   | CLI | Library | Description |
   |-----|---------|-------------|

@@ -55,7 +55,7 @@ pmetal merge \
 | `nearswap` | Near-swap merge strategy |
 | `passthrough` | Layer passthrough composition |
 
-Additional library-only strategies: `RamMerge`, `SouperMerge`, `MultiSlerpMerge`.
+Three more (`ram`, `ram_plus`, `multi_slerp`) are reachable by setting `MergeConfig.merge_method` directly.
 
 ## See Also
 
