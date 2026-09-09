@@ -1360,7 +1360,13 @@ impl DynamicModel {
     /// default to `false` and expose `true` only after a parity test.
     pub fn supports_fused_batched(&self) -> bool {
         match self {
-            Self::Llama(_) => true,
+            // Llama: standard GQA rides the shared fused block. Llama 3
+            // (`"rope_type": "llama3"`) takes the serial fallback — it rescales
+            // three RoPE frequency bands separately, and `BatchedGqaAttnCfg`
+            // is scalar-only by design, carrying a single `rope_base`. Taking
+            // the fused path would silently rotate with unscaled RoPE and
+            // disagree with this model's own serial decode.
+            Self::Llama(m) => !m.has_banded_rope(),
             Self::Mistral(m) => m.config().sliding_window.is_none(),
             Self::Qwen2(m) => !m.config().use_sliding_window,
             Self::Qwen3(m) => !m.config.use_sliding_window,

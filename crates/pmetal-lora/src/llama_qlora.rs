@@ -40,6 +40,12 @@ pub struct LlamaQLoraAttention {
     pub o_proj: QLoraLinear,
     /// RoPE layer.
     pub rope: nn::Rope,
+    /// Per-dimension RoPE period table for Llama 3 frequency-band scaling.
+    ///
+    /// Must track [`pmetal_models::architectures::llama::LlamaAttention`]: an
+    /// adapter trained under a different positional geometry than the one it
+    /// infers with learns to correct a rotation that will not be there.
+    pub rope_periods: Option<Array>,
 }
 
 impl LlamaQLoraAttention {
@@ -84,6 +90,7 @@ impl LlamaQLoraAttention {
             v_proj,
             o_proj,
             rope,
+            rope_periods: config.rope_period_table(),
         })
     }
 
@@ -125,6 +132,7 @@ impl LlamaQLoraAttention {
             v_proj,
             o_proj,
             rope,
+            rope_periods: config.rope_period_table(),
         })
     }
 
@@ -150,9 +158,27 @@ impl LlamaQLoraAttention {
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply RoPE
-        let queries = pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?;
-        let keys = pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?;
+        // Apply RoPE. `self.rope` carries a single scalar base, so a Llama 3
+        // banded config takes the explicit period table instead.
+        let (queries, keys) = match self.rope_periods.as_ref() {
+            Some(periods) => {
+                let rotate = |x: &Array| {
+                    pmetal_bridge::compat::fast::rope_with_freqs(
+                        x,
+                        self.head_dim,
+                        false,
+                        self.rope.scale,
+                        0,
+                        periods,
+                    )
+                };
+                (rotate(&queries), rotate(&keys))
+            }
+            None => (
+                pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?,
+                pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?,
+            ),
+        };
 
         // Expand KV heads for GQA if needed
         let keys = if self.n_kv_heads < self.n_heads {

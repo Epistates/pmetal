@@ -13,7 +13,7 @@ use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{apply_rope, apply_rope_with_positions},
+    rope::{apply_rope, apply_rope_with_positions, apply_rope_with_positions_and_periods},
 };
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::llama::LlamaConfig;
@@ -51,6 +51,12 @@ pub struct LlamaLoraAttention {
     pub o_proj: LinearAdapter,
     /// RoPE layer.
     pub rope: nn::Rope,
+    /// Per-dimension RoPE period table for Llama 3 frequency-band scaling.
+    ///
+    /// Must track [`pmetal_models::architectures::llama::LlamaAttention`]: an
+    /// adapter trained under a different positional geometry than the one it
+    /// infers with learns to correct a rotation that will not be there.
+    pub rope_periods: Option<Array>,
 }
 
 impl LlamaLoraAttention {
@@ -128,7 +134,32 @@ impl LlamaLoraAttention {
             v_proj,
             o_proj,
             rope,
+            rope_periods: config.rope_period_table(),
         })
+    }
+
+    /// Rotate `x` by RoPE at absolute position `offset`, honouring a Llama 3
+    /// period table when the base model ships one.
+    fn apply_rotary(&self, x: &Array, offset: i32) -> Result<Array, LoraError> {
+        match self.rope_periods.as_ref() {
+            Some(periods) => Ok(pmetal_bridge::compat::fast::rope_with_freqs(
+                x,
+                self.head_dim,
+                false,
+                self.rope.scale,
+                offset,
+                periods,
+            )),
+            None => apply_rope(
+                x,
+                self.head_dim,
+                false,
+                self.rope.base,
+                self.rope.scale,
+                offset,
+            )
+            .map_err(LoraError::from),
+        }
     }
 
     /// Forward pass through attention.
@@ -153,9 +184,19 @@ impl LlamaLoraAttention {
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply RoPE
-        let queries = pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?;
-        let keys = pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?;
+        // Apply RoPE. `self.rope` carries a single scalar base, so a Llama 3
+        // banded config takes the explicit path even at offset 0.
+        let (queries, keys) = if self.rope_periods.is_some() {
+            (
+                self.apply_rotary(&queries, 0)?,
+                self.apply_rotary(&keys, 0)?,
+            )
+        } else {
+            (
+                pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?,
+                pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?,
+            )
+        };
 
         // Expand KV heads for GQA if needed
         let keys = if self.n_kv_heads < self.n_heads {
@@ -231,22 +272,28 @@ impl LlamaLoraAttention {
         let rope_base = self.rope.base;
         let rope_scale = self.rope.scale;
         let rope_traditional = self.rope.traditional;
-        let queries = apply_rope_with_positions(
-            &queries,
-            position_ids,
-            rope_dims,
-            rope_traditional,
-            rope_base,
-            rope_scale,
-        )?;
-        let keys = apply_rope_with_positions(
-            &keys,
-            position_ids,
-            rope_dims,
-            rope_traditional,
-            rope_base,
-            rope_scale,
-        )?;
+        let rotate = |x: &Array| -> Result<Array, Exception> {
+            match self.rope_periods.as_ref() {
+                Some(periods) => apply_rope_with_positions_and_periods(
+                    x,
+                    position_ids,
+                    periods,
+                    rope_dims,
+                    rope_traditional,
+                    rope_scale,
+                ),
+                None => apply_rope_with_positions(
+                    x,
+                    position_ids,
+                    rope_dims,
+                    rope_traditional,
+                    rope_base,
+                    rope_scale,
+                ),
+            }
+        };
+        let queries = rotate(&queries)?;
+        let keys = rotate(&keys)?;
 
         let keys = if self.n_kv_heads < self.n_heads {
             let repeats = self.n_heads / self.n_kv_heads;
@@ -316,15 +363,22 @@ impl LlamaLoraAttention {
             .transpose_axes(&[0, 2, 1, 3]);
 
         // Get RoPE offset and apply RoPE
-        let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
-            let offset = cache_ref.rope_offset();
-            let queries = apply_rope(&queries, self.head_dim, false, self.rope.base, 1.0, offset)?;
-            let keys = apply_rope(&keys, self.head_dim, false, self.rope.base, 1.0, offset)?;
-            (queries, keys, values)
-        } else {
-            let queries = pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?;
-            let keys = pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?;
-            (queries, keys, values)
+        let (queries, keys) = match (&cache, self.rope_periods.is_some()) {
+            (Some((cache_ref, _layer_idx)), _) => {
+                let offset = cache_ref.rope_offset();
+                (
+                    self.apply_rotary(&queries, offset)?,
+                    self.apply_rotary(&keys, offset)?,
+                )
+            }
+            (None, true) => (
+                self.apply_rotary(&queries, 0)?,
+                self.apply_rotary(&keys, 0)?,
+            ),
+            (None, false) => (
+                pmetal_bridge::compat::Module::forward(&mut self.rope, &queries)?,
+                pmetal_bridge::compat::Module::forward(&mut self.rope, &keys)?,
+            ),
         };
 
         // Handle KV cache update - keys/values are already in [B, heads, seq, head_dim] format

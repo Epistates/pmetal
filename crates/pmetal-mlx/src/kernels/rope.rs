@@ -54,6 +54,12 @@ pub enum RopeScaling {
     /// YaRN (Yet another RoPE extensioN).
     /// Advanced scaling with attention factor and dimension-aware interpolation.
     Yarn(YarnConfig),
+    /// Llama 3 frequency-band scaling (`"rope_type": "llama3"`).
+    ///
+    /// Unlike every variant above, this has no scalar `(base, scale)`
+    /// equivalent — see [`Llama3Config`]. Callers must read
+    /// [`RopeScaling::rope_periods`].
+    Llama3(Llama3Config),
 }
 
 impl Default for RopeScaling {
@@ -64,6 +70,9 @@ impl Default for RopeScaling {
 
 impl RopeScaling {
     /// Get the position scale factor for RoPE.
+    ///
+    /// Identity for [`RopeScaling::Llama3`], which rescales frequencies
+    /// rather than positions — see [`Self::rope_periods`].
     pub fn scale(&self) -> f32 {
         match self {
             RopeScaling::None => 1.0,
@@ -71,10 +80,13 @@ impl RopeScaling {
             RopeScaling::DynamicNtk { .. } => 1.0, // NTK modifies base, not scale
             RopeScaling::NtkAware { factor, .. } => 1.0 / factor.sqrt(),
             RopeScaling::Yarn(config) => 1.0 / config.factor,
+            RopeScaling::Llama3(_) => 1.0,
         }
     }
 
     /// Get the modified base frequency.
+    ///
+    /// Identity for [`RopeScaling::Llama3`] — see [`Self::rope_periods`].
     pub fn effective_base(&self, base: f32, dims: i32) -> f32 {
         match self {
             RopeScaling::None | RopeScaling::Linear { .. } => base,
@@ -85,6 +97,27 @@ impl RopeScaling {
                 base * (alpha * factor - alpha + 1.0).powf(dims as f32 / (dims - 2) as f32)
             }
             RopeScaling::Yarn(config) => config.compute_base(base, dims),
+            RopeScaling::Llama3(_) => base,
+        }
+    }
+
+    /// Per-dimension RoPE periods for schemes no `(base, scale)` pair can express.
+    ///
+    /// Returns `None` for the scalar schemes, whose behaviour
+    /// [`Self::effective_base`] and [`Self::scale`] fully describe.
+    ///
+    /// **A caller that ignores a `Some` runs the model unscaled.** Llama 3
+    /// rescales each frequency band independently, so there is no single base
+    /// or position scale that reproduces it; reading only `effective_base` and
+    /// `scale` silently yields plain RoPE.
+    ///
+    /// The returned layout is what `mx.fast.rope`'s `freqs` argument wants:
+    /// *periods* (`base^(2i/dims)`, the reciprocal of an inverse frequency),
+    /// length `dims / 2`.
+    pub fn rope_periods(&self, dims: i32, base: f32) -> Option<Vec<f32>> {
+        match self {
+            RopeScaling::Llama3(config) => Some(config.rope_periods(dims, base)),
+            _ => None,
         }
     }
 }
@@ -93,40 +126,116 @@ impl RopeScaling {
     /// Parse rope_scaling from a HuggingFace config HashMap.
     ///
     /// Expected keys:
-    /// - "type": "linear", "dynamic", "yarn" (String)
+    /// - "type": "linear", "dynamic", "yarn", "llama3" (String)
     /// - "factor": scaling factor (Float)
-    /// - "original_max_position_embeddings": for YaRN (Float)
+    /// - "original_max_position_embeddings": for YaRN and Llama 3 (Float)
     /// - "attention_factor": optional YaRN attention factor (Float)
+    /// - "low_freq_factor" / "high_freq_factor": Llama 3 band boundaries (Float)
     pub fn from_config_map(map: &std::collections::HashMap<String, serde_json::Value>) -> Self {
+        // `as_f64` rather than `as_i64` even for the integer-valued keys: some
+        // callers round-trip the map through an f32 before handing it over, so
+        // `original_max_position_embeddings` arrives as `8192.0`, and `as_i64`
+        // returns `None` for a JSON float.
+        let number = |key: &str| map.get(key).and_then(|v| v.as_f64()).map(|v| v as f32);
+
         let rope_type = map
             .get("type")
             .or_else(|| map.get("rope_type"))
             .and_then(|v| v.as_str())
             .unwrap_or("default");
 
-        let factor = map.get("factor").and_then(|v| v.as_f64()).unwrap_or(1.0) as f32;
+        let factor = number("factor").unwrap_or(1.0);
 
         match rope_type {
             "linear" => RopeScaling::Linear { factor },
             "dynamic" => RopeScaling::DynamicNtk { factor },
             "yarn" => {
-                let original_max_pos = map
-                    .get("original_max_position_embeddings")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(4096) as i32;
+                let original_max_pos =
+                    number("original_max_position_embeddings").unwrap_or(4096.0) as i32;
                 let mut config = YarnConfig::new(factor, original_max_pos);
-                if let Some(attn) = map.get("attention_factor").and_then(|v| v.as_f64()) {
-                    config = config.with_attention_factor(attn as f32);
+                if let Some(attn) = number("attention_factor") {
+                    config = config.with_attention_factor(attn);
                 }
-                if let Some(beta_fast) = map.get("beta_fast").and_then(|v| v.as_f64()) {
-                    if let Some(beta_slow) = map.get("beta_slow").and_then(|v| v.as_f64()) {
-                        config = config.with_betas(beta_fast as f32, beta_slow as f32);
+                if let Some(beta_fast) = number("beta_fast") {
+                    if let Some(beta_slow) = number("beta_slow") {
+                        config = config.with_betas(beta_fast, beta_slow);
                     }
                 }
                 RopeScaling::Yarn(config)
             }
+            "llama3" => RopeScaling::Llama3(Llama3Config {
+                factor,
+                low_freq_factor: number("low_freq_factor").unwrap_or(1.0),
+                high_freq_factor: number("high_freq_factor").unwrap_or(4.0),
+                original_max_position: number("original_max_position_embeddings").unwrap_or(8192.0)
+                    as i32,
+            }),
             _ => RopeScaling::None,
         }
+    }
+}
+
+/// Configuration for Llama 3 frequency-band RoPE scaling.
+///
+/// Llama 3.1 onwards extends context by rescaling RoPE frequencies according
+/// to each dimension's wavelength, rather than by scaling positions or the
+/// base. Three bands, split at `original_max_position / {low,high}_freq_factor`:
+///
+/// - **High frequency** (short wavelength): untouched, so local ordering is
+///   preserved exactly as trained.
+/// - **Low frequency** (long wavelength): divided by `factor`, the plain
+///   linear interpolation that buys the extra context.
+/// - **Medium**: a linear ramp between the two, which is what stops the seam
+///   between the bands from showing up as a discontinuity.
+///
+/// This is why the scheme cannot ride the scalar `(base, scale)` path: the
+/// three bands need three different treatments of the same base.
+///
+/// Mirrors `transformers`' `_compute_llama3_parameters`.
+#[derive(Debug, Clone)]
+pub struct Llama3Config {
+    /// Context extension factor (32 for Llama 3.2, 8 for Llama 3.1).
+    pub factor: f32,
+    /// Divides `original_max_position` to give the low-frequency boundary.
+    pub low_freq_factor: f32,
+    /// Divides `original_max_position` to give the high-frequency boundary.
+    pub high_freq_factor: f32,
+    /// Context length the model was originally trained on.
+    pub original_max_position: i32,
+}
+
+impl Llama3Config {
+    /// Compute the `[dims / 2]` period table for this configuration.
+    ///
+    /// Periods, not inverse frequencies: that is the layout `mx.fast.rope`
+    /// takes via its `freqs` argument, so the result feeds the fused kernel
+    /// directly.
+    pub fn rope_periods(&self, dims: i32, base: f32) -> Vec<f32> {
+        let half = (dims / 2).max(0) as usize;
+        let original = self.original_max_position as f32;
+        let low_wavelen = original / self.low_freq_factor;
+        let high_wavelen = original / self.high_freq_factor;
+        // Degenerate config: no medium band to ramp across, and the ramp's
+        // denominator would be zero. Fall back to the two-band split.
+        let band_width = self.high_freq_factor - self.low_freq_factor;
+
+        (0..half)
+            .map(|i| {
+                let period = base.powf((2 * i) as f32 / dims as f32);
+                let inv_freq = 1.0 / period;
+                let wavelen = 2.0 * std::f32::consts::PI * period;
+
+                let scaled = if wavelen > low_wavelen {
+                    inv_freq / self.factor
+                } else if wavelen < high_wavelen || band_width == 0.0 {
+                    inv_freq
+                } else {
+                    let smooth = (original / wavelen - self.low_freq_factor) / band_width;
+                    (1.0 - smooth) * inv_freq / self.factor + smooth * inv_freq
+                };
+                1.0 / scaled
+            })
+            .collect()
     }
 }
 
@@ -288,16 +397,48 @@ pub fn apply_rope_with_positions(
     base: f32,
     scale: f32,
 ) -> Result<Array, Exception> {
-    // x shape: [batch, heads, seq_len, head_dim]
-    let half_dims = dims / 2;
-
     // Compute inverse frequencies: inv_freq[i] = 1.0 / (base^(2i/dims))
     // indices: [0, 1, ..., half_dims-1] as float
-    let indices = ops::arange_range(0, half_dims); // [half_dims] float32
+    let indices = ops::arange_range(0, dims / 2); // [half_dims] float32
     let neg_two_over_dims = Array::from_f32(-2.0 / dims as f32);
     let exponents = indices.multiply(&neg_two_over_dims);
     let base_arr = Array::from_f32(base);
     let inv_freq = base_arr.pow(&exponents); // [half_dims]
+
+    rope_with_positions_and_inv_freq(x, position_ids, &inv_freq, dims, traditional, scale)
+}
+
+/// Apply RoPE with explicit position IDs and an explicit period table.
+///
+/// Sibling of [`apply_rope_with_positions`] for scalings that rescale each
+/// frequency band separately, where no single `base` describes the rotation
+/// (Llama 3). `periods` is the same `[dims / 2]` table `mx.fast.rope` takes —
+/// periods, not inverse frequencies — so one table serves both the fused
+/// contiguous-offset path and this packed-sequence one.
+pub fn apply_rope_with_positions_and_periods(
+    x: &Array,
+    position_ids: &Array,
+    periods: &Array,
+    dims: i32,
+    traditional: bool,
+    scale: f32,
+) -> Result<Array, Exception> {
+    let inv_freq = Array::from_f32(1.0).divide(periods);
+    rope_with_positions_and_inv_freq(x, position_ids, &inv_freq, dims, traditional, scale)
+}
+
+/// Shared body: rotate `x` at the given per-token positions using a
+/// precomputed `[dims / 2]` inverse-frequency table.
+fn rope_with_positions_and_inv_freq(
+    x: &Array,
+    position_ids: &Array,
+    inv_freq: &Array,
+    dims: i32,
+    traditional: bool,
+    scale: f32,
+) -> Result<Array, Exception> {
+    // x shape: [batch, heads, seq_len, head_dim]
+    let half_dims = dims / 2;
 
     // position_ids: [seq_len] as i32 → float and scale
     let pos_float = position_ids.as_dtype(Dtype::Float32.as_i32());
@@ -604,6 +745,7 @@ pub fn effective_context_length(original: i32, scaling: &RopeScaling) -> i32 {
         RopeScaling::DynamicNtk { factor } => (original as f32 * factor) as i32,
         RopeScaling::NtkAware { factor, .. } => (original as f32 * factor) as i32,
         RopeScaling::Yarn(config) => (original as f32 * config.factor) as i32,
+        RopeScaling::Llama3(config) => (original as f32 * config.factor) as i32,
     }
 }
 
@@ -727,5 +869,116 @@ mod tests {
     fn test_rope_default() {
         let scaling = RopeScaling::default();
         assert!(matches!(scaling, RopeScaling::None));
+    }
+
+    /// Llama-3.2-1B's shipped `rope_scaling` block.
+    fn llama3_2_config_map() -> std::collections::HashMap<String, serde_json::Value> {
+        [
+            ("rope_type", serde_json::Value::from("llama3")),
+            ("factor", serde_json::Value::from(32.0)),
+            ("low_freq_factor", serde_json::Value::from(1.0)),
+            ("high_freq_factor", serde_json::Value::from(4.0)),
+            // Deliberately a float: `LlamaConfig` round-trips rope_scaling
+            // values through f32, so this is the shape the parser really sees.
+            (
+                "original_max_position_embeddings",
+                serde_json::Value::from(8192.0),
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v))
+        .collect()
+    }
+
+    #[test]
+    fn llama3_rope_type_parses_instead_of_falling_through_to_none() {
+        let scaling = RopeScaling::from_config_map(&llama3_2_config_map());
+        let RopeScaling::Llama3(config) = &scaling else {
+            panic!("expected Llama3, got {scaling:?}");
+        };
+        assert_eq!(config.factor, 32.0);
+        assert_eq!(config.low_freq_factor, 1.0);
+        assert_eq!(config.high_freq_factor, 4.0);
+        // The float spelling has to survive; `as_i64` would drop it to the
+        // 8192 default by luck here and to the wrong value elsewhere.
+        assert_eq!(config.original_max_position, 8192);
+
+        // Neither scalar knob carries the scaling, so an unaware caller gets
+        // plain RoPE. That is the failure this variant exists to make visible.
+        assert_eq!(scaling.scale(), 1.0);
+        assert_eq!(scaling.effective_base(500000.0, 64), 500000.0);
+    }
+
+    #[test]
+    fn llama3_periods_match_transformers_compute_llama3_parameters() {
+        let scaling = RopeScaling::from_config_map(&llama3_2_config_map());
+        let periods = scaling
+            .rope_periods(64, 500000.0)
+            .expect("llama3 must publish per-dimension periods");
+        assert_eq!(periods.len(), 32);
+
+        // Reference: `1 / _compute_llama3_parameters(...)[0]` from
+        // transformers, for Llama-3.2-1B (head_dim 64, rope_theta 5e5).
+        // The three sampled bands are, in order: untouched high frequency,
+        // ramped medium, and low frequency divided by `factor`.
+        for (index, expected) in [
+            (0_usize, 1.0_f32),
+            (1, 1.506929),
+            (10, 60.384865),
+            (15, 774.864624),
+            (20, 116682.632812),
+            (24, 601696.5),
+            (28, 3102764.0),
+            (31, 10617620.0),
+        ] {
+            let got = periods[index];
+            let rel = (got - expected).abs() / expected;
+            assert!(
+                rel < 1e-5,
+                "period[{index}]: got {got}, transformers says {expected} (rel {rel:e})"
+            );
+        }
+
+        // The high band is left alone, which is the whole point of banding
+        // rather than scaling everything. (Not bit-exact: the untouched branch
+        // still round-trips through `1 / (1 / period)`.)
+        let untouched_high = 500000.0_f32.powf(20.0 / 64.0);
+        assert!((periods[10] / untouched_high - 1.0).abs() < 1e-6);
+        // ...and the low band is a clean factor-32 stretch.
+        let unscaled_low = 500000.0_f32.powf(48.0 / 64.0);
+        assert!((periods[24] / unscaled_low - 32.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn llama3_degenerate_band_split_does_not_produce_nan() {
+        // low == high leaves no medium band to ramp across; the ramp's
+        // denominator is zero, so guard rather than emit NaN frequencies.
+        let config = Llama3Config {
+            factor: 8.0,
+            low_freq_factor: 4.0,
+            high_freq_factor: 4.0,
+            original_max_position: 8192,
+        };
+        assert!(
+            config
+                .rope_periods(64, 500000.0)
+                .iter()
+                .all(|p| p.is_finite())
+        );
+    }
+
+    #[test]
+    fn scalar_scalings_publish_no_period_table() {
+        assert!(RopeScaling::None.rope_periods(64, 10000.0).is_none());
+        assert!(
+            RopeScaling::Linear { factor: 2.0 }
+                .rope_periods(64, 10000.0)
+                .is_none()
+        );
+        assert!(
+            RopeScaling::Yarn(YarnConfig::new(8.0, 4096))
+                .rope_periods(64, 10000.0)
+                .is_none()
+        );
     }
 }

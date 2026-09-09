@@ -95,6 +95,36 @@ impl LlamaConfig {
         self.head_dim
             .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
+
+    /// Parse `rope_scaling` into the shared [`RopeScaling`] spec.
+    pub fn rope_scaling_spec(&self) -> RopeScaling {
+        let Some(map) = self.rope_scaling.as_ref() else {
+            return RopeScaling::None;
+        };
+        let json_map: HashMap<String, serde_json::Value> = map
+            .iter()
+            .map(|(k, v)| {
+                let json_v = match v {
+                    RopeScalingValue::Float(f) => serde_json::Value::from(*f as f64),
+                    RopeScalingValue::String(s) => serde_json::Value::from(s.clone()),
+                };
+                (k.clone(), json_v)
+            })
+            .collect();
+        RopeScaling::from_config_map(&json_map)
+    }
+
+    /// Build the per-dimension RoPE period table, if this config needs one.
+    ///
+    /// `Some` for Llama 3 (`"rope_type": "llama3"`), whose three frequency
+    /// bands no scalar `(base, scale)` pair can express. Every path that
+    /// rotates Q/K — inference, LoRA, QLoRA — has to honour it or the model
+    /// silently runs on unscaled RoPE.
+    pub fn rope_period_table(&self) -> Option<Array> {
+        self.rope_scaling_spec()
+            .rope_periods(self.get_head_dim(), self.rope_theta)
+            .map(|periods| Array::from_f32_slice(&periods, &[periods.len() as i32]))
+    }
 }
 
 impl Default for LlamaConfig {
@@ -136,6 +166,10 @@ pub struct LlamaAttention {
     pub rope_scale: f32,
     /// Effective RoPE base after scaling.
     pub effective_base: f32,
+    /// Per-dimension RoPE period table, present only for Llama 3 frequency-band
+    /// scaling. When set it supersedes `effective_base`/`rope_scale`, neither of
+    /// which can express the three-band rescale.
+    pub rope_periods: Option<Array>,
     /// Layer ID for training cache (set during model construction).
     pub layer_id: usize,
 
@@ -165,28 +199,10 @@ impl LlamaAttention {
         let scale = (head_dim as f32).sqrt().recip();
         let rope_theta = config.rope_theta;
 
-        // Parse rope_scaling from config
-        let rope_scaling = config
-            .rope_scaling
-            .as_ref()
-            .map(|map| {
-                // Convert HashMap<String, RopeScalingValue> to HashMap<String, serde_json::Value>
-                let json_map: std::collections::HashMap<String, serde_json::Value> = map
-                    .iter()
-                    .map(|(k, v)| {
-                        let json_v = match v {
-                            RopeScalingValue::Float(f) => serde_json::Value::from(*f as f64),
-                            RopeScalingValue::String(s) => serde_json::Value::from(s.clone()),
-                        };
-                        (k.clone(), json_v)
-                    })
-                    .collect();
-                RopeScaling::from_config_map(&json_map)
-            })
-            .unwrap_or(RopeScaling::None);
-
+        let rope_scaling = config.rope_scaling_spec();
         let rope_scale = rope_scaling.scale();
         let effective_base = rope_scaling.effective_base(rope_theta, head_dim);
+        let rope_periods = config.rope_period_table();
 
         let q_proj = nn::LinearBuilder::new(config.hidden_size, n_heads * head_dim)
             .bias(false)
@@ -216,6 +232,7 @@ impl LlamaAttention {
             rope_theta,
             rope_scale,
             effective_base,
+            rope_periods,
             layer_id,
             q_proj,
             k_proj,
@@ -223,6 +240,33 @@ impl LlamaAttention {
             o_proj,
             rope,
         })
+    }
+
+    /// Rotate `x` by RoPE at absolute position `offset`.
+    ///
+    /// Routes through the per-dimension period table when the checkpoint ships
+    /// Llama 3 frequency-band scaling, and through the scalar base otherwise.
+    /// Both are the fused `mx.fast.rope` kernel, so the banded path costs no
+    /// more than the plain one.
+    fn apply_rotary(&self, x: &Array, offset: i32) -> Result<Array, Exception> {
+        match self.rope_periods.as_ref() {
+            Some(periods) => Ok(pmetal_bridge::compat::fast::rope_with_freqs(
+                x,
+                self.head_dim,
+                false,
+                self.rope_scale,
+                offset,
+                periods,
+            )),
+            None => apply_rope(
+                x,
+                self.head_dim,
+                false,
+                self.effective_base,
+                self.rope_scale,
+                offset,
+            ),
+        }
     }
 
     /// Forward pass through attention using fused Metal kernels.
@@ -284,32 +328,25 @@ impl LlamaAttention {
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
 
-        // Get RoPE offset and apply RoPE
-        let (queries, keys, values) = if let Some((cache_ref, _layer_idx)) = cache.as_ref() {
-            // Cached path: use apply_rope with offset and scaling
-            let offset = cache_ref.rope_offset();
-            let queries = apply_rope(
-                &queries,
-                self.head_dim,
-                false,
-                self.effective_base,
-                self.rope_scale,
-                offset,
-            )?;
-            let keys = apply_rope(
-                &keys,
-                self.head_dim,
-                false,
-                self.effective_base,
-                self.rope_scale,
-                offset,
-            )?;
-            (queries, keys, values)
-        } else {
-            // Non-cached path: use RoPE module (offset=0)
-            let queries = Module::forward(&mut self.rope, &queries)?;
-            let keys = Module::forward(&mut self.rope, &keys)?;
-            (queries, keys, values)
+        // Get RoPE offset and apply RoPE. The prebuilt `self.rope` module
+        // carries a scalar base, so a Llama 3 banded config has to take the
+        // explicit path even at offset 0.
+        let (queries, keys) = match (cache.as_ref(), self.rope_periods.is_some()) {
+            (Some((cache_ref, _layer_idx)), _) => {
+                let offset = cache_ref.rope_offset();
+                (
+                    self.apply_rotary(&queries, offset)?,
+                    self.apply_rotary(&keys, offset)?,
+                )
+            }
+            (None, true) => (
+                self.apply_rotary(&queries, 0)?,
+                self.apply_rotary(&keys, 0)?,
+            ),
+            (None, false) => (
+                Module::forward(&mut self.rope, &queries)?,
+                Module::forward(&mut self.rope, &keys)?,
+            ),
         };
 
         // Use fused attention kernel - handles GQA natively (no KV head expansion needed)
@@ -788,6 +825,16 @@ impl LlamaForCausalLM {
     /// Get configuration.
     pub fn config(&self) -> &LlamaConfig {
         &self.model.config
+    }
+
+    /// Whether RoPE needs a per-dimension period table (Llama 3 banded scaling).
+    ///
+    /// Gates the fused batched decode path, which carries one scalar base.
+    pub fn has_banded_rope(&self) -> bool {
+        self.model
+            .layers
+            .first()
+            .is_some_and(|layer| layer.self_attn.rope_periods.is_some())
     }
 }
 
