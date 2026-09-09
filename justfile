@@ -132,10 +132,17 @@ check-version:
     fi
     echo "All versions consistent"
 
-# Verify Cargo.lock is up-to-date and no yanked crates
+# Verify Cargo.lock satisfies the manifests without needing changes.
+#
+# `cargo update --locked` is NOT this check: `--locked` forbids writing the
+# lockfile and `cargo update` exists to write it, so that command fails the
+# moment any dependency anywhere publishes a new version. It never passes for
+# long, which is how a red `preflight` went unnoticed. `cargo metadata --locked`
+# resolves the graph and fails only if Cargo.lock would have to change.
+# Yanked crates are `just audit`'s job, not this one.
 check-lockfile:
-    cargo update --locked 2>&1 || (echo "FAIL: Cargo.lock is out of date -- run cargo update" && exit 1)
-    @echo "Cargo.lock is current, no yanked crates"
+    cargo metadata --locked --format-version 1 > /dev/null || (echo "FAIL: Cargo.lock is out of date -- run cargo update --workspace" && exit 1)
+    @echo "Cargo.lock satisfies the manifests"
 
 # Bump version across all crates (updates workspace, gui, changelog stub)
 bump new_version:
