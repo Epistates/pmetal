@@ -564,13 +564,22 @@ fn unclaimed_is_expected(key: &str) -> bool {
             .any(|tower| key.contains(tower))
 }
 
-/// The loader's prefix rewrites, applied so the comparison sees the names the
+/// The loader's key rewrites, applied so the comparison sees the names the
 /// loader actually assigns.
 ///
 /// Multimodal wrappers nest the text stack under `model.language_model.` and
-/// the dispatcher strips the infix back to `model.` before assignment.
-fn loader_normalized(key: &str) -> String {
-    collapse_indices(&key.replace("model.language_model.", "model."))
+/// the dispatcher strips the infix back to `model.` before assignment. DeepSeek
+/// goes further and renames its whole mixture; that rewrite is the loader's own
+/// `deepseek_param_name`, called here rather than restated, so the check cannot
+/// drift from what actually runs.
+fn loader_normalized(arch: ModelArchitecture, key: &str) -> String {
+    let stripped = key.replace("model.language_model.", "model.");
+    let renamed = if arch == ModelArchitecture::DeepSeek {
+        pmetal_models::loader::deepseek_param_name(&stripped).unwrap_or(stripped)
+    } else {
+        stripped
+    };
+    collapse_indices(&renamed)
 }
 
 /// Whether this architecture assigns weights by matching parameter names
@@ -759,7 +768,7 @@ fn released_checkpoints_claim_every_tensor() {
         let unclaimed: BTreeSet<String> = names
             .iter()
             .filter(|k| !unclaimed_is_expected(k))
-            .map(|k| loader_normalized(k))
+            .map(|k| loader_normalized(arch, k))
             .filter(|k| !params.contains(k))
             .collect();
 
