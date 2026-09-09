@@ -9,7 +9,7 @@ Combines GRPO policy gradient optimization with knowledge distillation from a fr
 ```bash
 pmetal rlkd \
   --model <STUDENT_MODEL> \
-  --teacher <TEACHER_MODEL> \
+  --teacher-model <TEACHER_MODEL> \
   --dataset <DATASET> \
   --output <OUTPUT_DIR> \
   [OPTIONS]
@@ -21,16 +21,16 @@ pmetal rlkd \
 # Basic RLKD with teacher distillation
 pmetal rlkd \
   --model Qwen/Qwen3-0.6B \
-  --teacher Qwen/Qwen3-4B \
+  --teacher-model Qwen/Qwen3-4B \
   --dataset reasoning.jsonl \
   --output ./output/rlkd
 
 # With annealing alpha (reduce distillation over time)
 pmetal rlkd \
   --model Qwen/Qwen3-0.6B \
-  --teacher Qwen/Qwen3-4B \
+  --teacher-model Qwen/Qwen3-4B \
   --dataset reasoning.jsonl \
-  --alpha 0.5 --final-alpha 0.1 --anneal-alpha
+  --distill-alpha 0.5 --final-alpha 0.1 --anneal-alpha
 ```
 
 ## Parameters
@@ -38,13 +38,12 @@ pmetal rlkd \
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `--model` | *required* | Student/policy model ID or local path |
-| `--teacher` | *required* | Teacher model ID or local path |
+| `--teacher-model` | *required* | Teacher model ID or local path |
 | `--dataset` | *required* | Training dataset (JSONL) |
 | `--output` | `./output/rlkd` | Output directory |
-| `--alpha` | `0.5` | Distillation weight (0 = pure GRPO, 1 = pure distillation) |
+| `--distill-alpha` | `0.5` | Distillation weight (0 = pure GRPO, 1 = pure distillation) |
 | `--final-alpha` | — | Final alpha for annealing schedule |
 | `--anneal-alpha` | `false` | Enable alpha annealing over training |
-| `--top-k-distill` | — | Top-k logit distillation (sparse alignment) |
 | `--lora-r` | `16` | LoRA rank |
 | `--learning-rate` | `2e-4` | Learning rate |
 | `--reasoning-rewards` | `false` | Enable reasoning-aware reward functions |

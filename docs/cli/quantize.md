@@ -1,6 +1,6 @@
 # pmetal quantize
 
-Quantize models to GGUF format with 13 quantization options.
+Quantize models to GGUF format with 24 quantization methods.
 
 Quantize a model to GGUF format for efficient inference. Supports importance matrix for quality-preserving quantization.
 
@@ -10,7 +10,7 @@ Quantize a model to GGUF format for efficient inference. Supports importance mat
 pmetal quantize \
   --model <MODEL> \
   --output <OUTPUT_FILE> \
-  --type <QUANT_TYPE> \
+  --method <METHOD> \
   [OPTIONS]
 ```
 
@@ -20,18 +20,18 @@ pmetal quantize \
 # 4-bit quantization
 pmetal quantize \
   --model ./output \
-  --output model.gguf --type q4km
+  --output model.gguf --method q4_k_m
 
 # With importance matrix
 pmetal quantize \
   --model ./output \
-  --output model.gguf --type q4km \
+  --output model.gguf --method q4_k_m \
   --imatrix calibration.jsonl
 
 # Dynamic per-layer quantization
 pmetal quantize \
   --model ./output \
-  --output model.gguf --type dynamic
+  --output model.gguf --method dynamic
 
 # KL-calibrated quantization (per-tensor type selection)
 pmetal quantize \
@@ -42,21 +42,26 @@ pmetal quantize \
 
 ## Quantization Types
 
-| Format | Description |
+These are the values `--method` accepts.
+
+| Method | Description |
 |--------|-------------|
-| `dynamic` | Auto-select per layer |
-| `q8_0` | 8-bit quantization |
-| `q6k` | 6-bit k-quant |
-| `q5km` | 5-bit k-quant (medium) |
-| `q5ks` | 5-bit k-quant (small) |
-| `q4km` | 4-bit k-quant (medium) |
-| `q4ks` | 4-bit k-quant (small) |
-| `q3km` | 3-bit k-quant (medium) |
-| `q3ks` | 3-bit k-quant (small) |
-| `q3kl` | 3-bit k-quant (large) |
-| `q2k` | 2-bit k-quant |
-| `f16` | Float16 |
-| `f32` | Float32 |
+| `dynamic` | Importance-matrix-guided mixed precision (default; pair with `--imatrix`) |
+| `q8_0` | 8-bit integer, near-lossless |
+| `q8_1` | 8-bit integer with dot-product sum helper |
+| `q6_k` | 6-bit K-quant, high quality |
+| `q5_k_m` | 5-bit K-quant medium |
+| `q5_k_s` | 5-bit K-quant small |
+| `q5_0` / `q5_1` | Legacy 5-bit symmetric / affine |
+| `q4_k_m` | 4-bit K-quant medium (recommended 4-bit) |
+| `q4_k_s` | 4-bit K-quant small |
+| `q4_0` / `q4_1` | Legacy 4-bit symmetric / affine |
+| `q3_k_l` / `q3_k_m` / `q3_k_s` | 3-bit K-quant large / medium / small |
+| `q2_k` | 2-bit K-quant, lowest quality |
+| `q1_0` | 1-bit sign |
+| `tq1_0` / `tq2_0` | Ternary 1.69-bit / 2.06-bit |
+| `mxfp4` / `nvfp4` | Block-floating 4-bit |
+| `bf16` / `f16` / `f32` | Dense export |
 
 ## See Also
 

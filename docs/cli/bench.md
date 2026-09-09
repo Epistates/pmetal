@@ -19,7 +19,7 @@ pmetal bench --model Qwen/Qwen3-0.6B --batch-size 4
 Benchmark the generation loop — tokens per second, time to first token, and decode latency.
 
 ```bash
-pmetal bench-gen --model Qwen/Qwen3-0.6B --prompt "Hello" --max-tokens 100
+pmetal bench-gen --model Qwen/Qwen3-0.6B
 ```
 
 ### bench-ffi

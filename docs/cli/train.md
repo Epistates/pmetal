@@ -35,7 +35,7 @@ pmetal train \
 pmetal train \
   --model Qwen/Qwen3-0.6B \
   --dataset train.jsonl \
-  --dora --lr-schedule cosine_with_restarts
+  --lr-schedule cosine_with_restarts
 
 # From a config file
 pmetal train --config training.yaml
@@ -57,7 +57,6 @@ pmetal train --config training.yaml
 | `--max-grad-norm` | `1.0` | Gradient clipping |
 | `--quantization` | none | QLoRA method: `nf4`, `fp4`, `int8` |
 | `--gradient-accumulation-steps` | `4` | Gradient accumulation steps |
-| `--no-ane` | `false` | Disable ANE training |
 | `--embedding-lr` | None | Separate LR for embeddings |
 | `--no-metal-fused-optimizer` | `false` | Disable Metal fused optimizer |
 | `--lr-schedule` | `cosine` | `constant`, `linear`, `cosine`, `cosine_with_restarts`, `polynomial`, `wsd` |
@@ -66,7 +65,6 @@ pmetal train --config training.yaml
 | `--warmup-steps` | `100` | Learning rate warmup steps |
 | `--weight-decay` | `0.01` | AdamW weight decay |
 | `--no-sequence-packing` | `false` | Disable sequence packing |
-| `--dora` | `false` | Enable DoRA (Weight-Decomposed LoRA) |
 | `--cut-cross-entropy` | `false` | Memory-efficient loss (avoids full logit materialization) |
 | `--text-column` | — | Custom JSONL column name for training text |
 | `--text-columns` | — | Multi-column concat (comma-separated, e.g. `thinking,solution`) |

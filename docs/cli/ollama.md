@@ -11,7 +11,7 @@ Integration with [Ollama](https://ollama.ai) for model deployment.
 Generate an Ollama Modelfile from a PMetal model.
 
 ```bash
-pmetal ollama modelfile --model ./output --output Modelfile
+pmetal ollama modelfile --base ./output --output Modelfile
 ```
 
 ### create
@@ -19,7 +19,7 @@ pmetal ollama modelfile --model ./output --output Modelfile
 Create an Ollama model directly.
 
 ```bash
-pmetal ollama create my-model --model ./output
+pmetal ollama create --name my-model --base ./output
 ```
 
 ### templates

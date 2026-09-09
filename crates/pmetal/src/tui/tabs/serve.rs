@@ -315,6 +315,8 @@ mod tests {
     }
 
     #[test]
+    /// `pmetal serve` has no `--lora`; the documented workflow is to `pmetal fuse`
+    /// the adapter first. Guards against the spec field coming back.
     fn serve_tab_does_not_emit_removed_lora_flag() {
         let mut tab = ServeTab::new();
         tab.form.set_value("Model", "/tmp/model");

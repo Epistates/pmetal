@@ -74,7 +74,7 @@ pmetal infer \
   --model Qwen/Qwen3-0.6B \
   --lora ./output/lora_weights.safetensors \
   --prompt "Explain quantum entanglement" \
-  --chat --show-thinking
+  --chat
 
 # Train and use a Qwen3Next/Qwen3.6 MTP predictor
 pmetal tokenize --input train.jsonl --output ./tok --tokenizer Qwen/Qwen3.6-30B-A3B-Instruct
@@ -105,13 +105,13 @@ pmetal search "qwen 0.6b" --detailed
 
 # Merge models with SLERP
 pmetal merge \
-  --models model-a model-b \
+  --model-a model-a --model-b model-b \
   --method slerp --t 0.5
 
 # Quantize to GGUF
 pmetal quantize \
   --model ./output \
-  --output model.gguf --type q4km
+  --output model.gguf --method q4_k_m
 
 # Fuse LoRA into base model
 pmetal fuse \
@@ -132,9 +132,11 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 
 | Command | Description |
 |---------|-------------|
-| `train` | Fine-tune with LoRA/QLoRA/DoRA (SFT) |
+| `train` | Fine-tune with LoRA/QLoRA (SFT) |
 | `train-mtp` | Train Gemma 4 assistant or Qwen3Next/Qwen3.6 MTP predictor checkpoints |
 | `train-draft` | Train DFlash block-diffusion draft checkpoints |
+| `train-diffusion` | LoRA/QLoRA fine-tune a DiffusionGemma block-diffusion model |
+| `pretrain` | Pretrain a model from scratch (full-parameter, no LoRA) |
 | `infer` | Interactive inference with chat, tool use, and thinking mode |
 | `distill` | Knowledge distillation (online, offline, progressive) |
 | `grpo` | GRPO/DAPO reasoning training (VLM, speculative, async rewards) |
@@ -142,12 +144,12 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `embed-train` | Sentence-transformer fine-tuning (InfoNCE, Triplet, CoSENT) |
 | `search` | Search HuggingFace Hub with memory fit estimation |
 | `download` | Download a model from HuggingFace Hub |
-| `merge` | Merge two or more models (12 strategies) |
-| `quantize` | GGUF quantization (13 format options) |
+| `merge` | Merge two models (12 strategies; use a YAML config for more) |
+| `quantize` | GGUF quantization (24 methods) |
 | `fuse` | Fuse LoRA adapter weights into base model |
 | `eval` | Evaluate model perplexity on a dataset |
-| `serve` | OpenAI-compatible inference server (feature-gated) |
-| `tui` | Full TUI control center (9 tabs) |
+| `serve` | OpenAI- and Anthropic-compatible inference server |
+| `tui` | Full TUI control center (20 tabs) |
 | `dashboard` | Real-time training metrics visualization |
 | `dataset` | Dataset utilities: `analyze`, `download`, `convert` |
 | `ollama` | Ollama integration: `modelfile`, `create`, `templates` |
@@ -159,6 +161,10 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `bench-ffi` | Benchmark FFI overhead |
 | `bench-workload` | Benchmark real cached inference/training workloads |
 | `bench-corpus` | Structured kernel benchmarking with JSON reporting |
+| `bench-gdn` | Benchmark Qwen3.5 GDN backends on real layer shapes |
+| `tokenize` | Tokenize a text corpus into binary shards for pretraining |
+| `pack-experts` | Pack expert weights for SSD-offloaded MoE inference |
+| `dflash` | Block-diffusion speculative decoding |
 | `mcp` | Start MCP server (51 tools for Claude Desktop / MCP clients) |
 | `cluster` | Multi-Mac cluster: discover peers, train across machines, run all-reduce / pipeline benchmarks |
 
@@ -472,7 +478,7 @@ All training methods support callback-based cancellation (`should_stop()`), metr
 | SFT (Supervised Fine-Tuning) | `train` | Yes | Yes | `orchestrator::run_training()` |
 | LoRA | `train` | Yes | Yes | `orchestrator::run_training()` |
 | QLoRA (4-bit) | `train --quantization nf4` | Yes | Yes | `orchestrator::run_training()` |
-| DoRA | `train --dora` | Yes | Yes | `orchestrator::run_training()` |
+| DoRA | — | — | — | `LoraConfig { use_dora: true }` |
 | DPO (Direct Preference) | — | — | — | `DpoTrainer` |
 | SimPO (Simple Preference) | — | — | — | `SimpoTrainer` |
 | ORPO (Odds-Ratio Preference) | — | — | — | `OrpoTrainer` |
@@ -634,7 +640,6 @@ Multiple distillation methods and loss functions:
 | `--max-grad-norm` | 1.0 | Gradient clipping |
 | `--quantization` | none | QLoRA method (nf4, fp4, int8) |
 | `--gradient-accumulation-steps` | 4 | Gradient accumulation steps |
-| `--no-ane` | false | Disable ANE training |
 | `--embedding-lr` | None | Separate LR for embeddings |
 | `--no-metal-fused-optimizer` | false | Disable Metal fused optimizer |
 | `--lr-schedule` | cosine | Schedule type (constant, linear, cosine, cosine_with_restarts, polynomial, wsd) |
@@ -664,14 +669,12 @@ Multiple distillation methods and loss functions:
 | `--frequency-penalty` | 0.0 | Frequency penalty |
 | `--presence-penalty` | 0.0 | Presence penalty |
 | `--chat` | false | Apply chat template |
-| `--show-thinking` | false | Show reasoning content |
 | `--draft-model` | — | Gemma 4 MTP assistant checkpoint |
 | `--mtp` | false | Enable Qwen3Next/Qwen3.6 exact speculative MTP |
 | `--mtp-model` | bundled `mtp.*` | Optional external Qwen MTP checkpoint from `train-mtp` |
 | `--mtp-draft-tokens` | 3 | Qwen MTP draft tokens per verification step |
 | `--fp8` | false | Use FP8 weights (~2x mem reduction) |
 | `--compiled` | false | Use JIT-compiled sampling |
-| `--no-ane` | false | Disable ANE inference |
 | `--ane-max-seq-len` | 1024 | Max ANE kernel sequence length |
 | `--tools` | — | Tool/function definitions file (OpenAI format) |
 | `--system` | — | System message |

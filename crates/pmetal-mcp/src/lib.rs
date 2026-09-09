@@ -1666,7 +1666,6 @@ impl PmetalMcpServer {
         &self,
         #[description("Model ID or local path")] model: String,
         #[description("Port to listen on (default: 8080)")] port: Option<u64>,
-        #[description("LoRA adapter path")] lora: Option<String>,
         #[description("Host to bind to (default: 0.0.0.0)")] host: Option<String>,
         #[description("Max sequence length for KV cache (default: 4096)")] max_seq_len: Option<u64>,
         #[description("Packed expert weights dir for SSD-offloaded MoE")] experts_dir: Option<
@@ -1682,7 +1681,6 @@ impl PmetalMcpServer {
             host: host.unwrap_or_else(|| "0.0.0.0".to_string()),
             max_seq_len: max_seq_len.unwrap_or(4096) as usize,
             experts_dir,
-            lora,
             ane: ane.unwrap_or(false),
             ane_max_seq_len: ane_max_seq_len.unwrap_or(1024) as usize,
             ane_real_time: ane_real_time.unwrap_or(false),

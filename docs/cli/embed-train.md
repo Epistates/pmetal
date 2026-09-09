@@ -58,7 +58,7 @@ pmetal embed-train \
 | `--output` | `./output` | Output directory |
 | `--loss` | `infonce` | Loss function: `infonce`, `triplet`, `cosent` |
 | `--pooling` | `cls` | Pooling strategy: `cls`, `mean`, `last_token` |
-| `--normalize` | `true` | L2 normalize embeddings |
+| `--no-normalize` | `false` | Skip L2 normalization of embeddings |
 | `--learning-rate` | `2e-5` | Learning rate |
 | `--batch-size` | `32` | Batch size |
 | `--epochs` | `3` | Training epochs |

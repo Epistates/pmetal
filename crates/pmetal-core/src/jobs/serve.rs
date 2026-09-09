@@ -58,15 +58,6 @@ pub struct ServeSpec {
     pub experts_dir: Option<String>,
 
     #[job(
-        label = "LoRA Adapter",
-        group = "Model",
-        argv = "--lora",
-        kind = "path"
-    )]
-    #[serde(default)]
-    pub lora: Option<String>,
-
-    #[job(
         label = "FP8 Weights",
         group = "Quantization",
         argv = "--fp8",
@@ -216,7 +207,6 @@ impl Default for ServeSpec {
             port: default_port(),
             max_seq_len: default_max_seq_len(),
             experts_dir: None,
-            lora: None,
             fp8: false,
             kv_quant: None,
             no_kv_quant: false,

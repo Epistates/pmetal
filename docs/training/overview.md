@@ -11,7 +11,7 @@ PMetal supports 12+ training methods across CLI, GUI, TUI, and the Rust/Python S
 | SFT (Supervised Fine-Tuning) | `train` | Yes | Yes | `orchestrator::run_training()` |
 | LoRA | `train` | Yes | Yes | `orchestrator::run_training()` |
 | QLoRA (4-bit) | `train --quantization nf4` | Yes | Yes | `orchestrator::run_training()` |
-| DoRA | `train --dora` | Yes | Yes | `orchestrator::run_training()` |
+| DoRA | — | — | — | `LoraConfig { use_dora: true }` |
 | DPO (Direct Preference) | — | — | — | `DpoTrainer` |
 | SimPO | — | — | — | `SimpoTrainer` |
 | ORPO | — | — | — | `OrpoTrainer` |

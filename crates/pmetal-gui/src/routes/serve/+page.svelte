@@ -20,7 +20,6 @@
   let fp8 = $state(false);
   let kvCache = $state('auto');
   let kvGroupSize = $state(64);
-  let loraAdapter = $state('');
   let expertsDir = $state('');
 
   // UI state
@@ -83,7 +82,6 @@
           kvCache === 'tq3_5' ? 'q3_5' :
           undefined,
         kv_group_size: kvGroupSize,
-        lora: loraAdapter.trim() || undefined,
         experts_dir: expertsDir.trim() || undefined,
       };
       await serveStore.start(spec);
@@ -226,10 +224,6 @@
           </div>
 
           <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-            <div>
-              <label class="label" for="serve-lora">LoRA Adapter (optional)</label>
-              <input id="serve-lora" type="text" class="input" placeholder="/path/to/lora/adapter" bind:value={loraAdapter} />
-            </div>
             <div>
               <label class="label" for="serve-experts">Experts Dir (optional)</label>
               <input id="serve-experts" type="text" class="input" placeholder="/path/to/packed-experts" bind:value={expertsDir} />

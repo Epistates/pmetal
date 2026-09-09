@@ -1,15 +1,16 @@
 # pmetal merge
 
-Merge two or more models using 12 merge strategies.
+Merge two models using 12 merge strategies.
 
-Merge multiple models into one using various merge strategies. Supports GPU-accelerated merging, FP8-aware merging, and async double-buffered streaming for large models.
+The CLI merges exactly two models at a time; task-vector methods take a third via `--base`. Supports GPU-accelerated merging, FP8-aware merging, and async double-buffered streaming for large models.
 
 ## Usage
 
 ```bash
 pmetal merge \
-  --models <MODEL_A> <MODEL_B> [<MODEL_C>...] \
-  --method <METHOD> \
+  --model-a <MODEL_A> \
+  --model-b <MODEL_B> \
+  --output <OUTPUT> \
   [OPTIONS]
 ```
 
@@ -18,17 +19,20 @@ pmetal merge \
 ```bash
 # SLERP merge
 pmetal merge \
-  --models model-a model-b \
+  --model-a model-a --model-b model-b \
+  --output ./merged \
   --method slerp --t 0.5
 
 # TIES merge with sparsification
 pmetal merge \
-  --models base-model ft-model-1 ft-model-2 \
+  --model-a ft-model-1 --model-b ft-model-2 \
+  --base base-model --output ./merged \
   --method ties --density 0.5
 
 # DARE-TIES with random pruning
 pmetal merge \
-  --models model-a model-b \
+  --model-a model-a --model-b model-b \
+  --base base-model --output ./merged \
   --method dare_ties --density 0.7
 ```
 

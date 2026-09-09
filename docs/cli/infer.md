@@ -23,7 +23,7 @@ pmetal infer --model Qwen/Qwen3-0.6B --prompt "What is 2+2?"
 pmetal infer \
   --model Qwen/Qwen3-0.6B \
   --lora ./output/lora_weights.safetensors \
-  --chat --show-thinking
+  --chat
 
 # FP8 quantized inference (2× memory reduction)
 pmetal infer --model Qwen/Qwen3-4B --fp8 --chat
@@ -95,12 +95,10 @@ pmetal infer \
 | `--frequency-penalty` | `0.0` | Frequency penalty |
 | `--presence-penalty` | `0.0` | Presence penalty |
 | `--chat` | `false` | Apply chat template |
-| `--show-thinking` | `false` | Show reasoning content |
 | `--fp8` | `false` | FP8 weights (~2× mem reduction) |
 | `--compiled` | `false` | JIT-compiled sampling |
 | `--profile-layers` | `false` | Run an opt-in per-layer forward profile for supported hybrid models |
 | `--profile-output` | — | Write the layer profile report as pretty JSON |
-| `--no-ane` | `false` | Disable ANE inference |
 | `--ane-max-seq-len` | `1024` | Max ANE kernel sequence length |
 | `--tools` | — | Tool definitions file (OpenAI format) |
 | `--system` | — | System message |

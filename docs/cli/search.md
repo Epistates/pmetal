@@ -20,7 +20,7 @@ pmetal search "qwen 0.6b"
 pmetal search "qwen 0.6b" --detailed
 
 # Filter by model type
-pmetal search "llama 3" --type text-generation
+pmetal search "llama 3" --limit 20
 ```
 
 ## Output
