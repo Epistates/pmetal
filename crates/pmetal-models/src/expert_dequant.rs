@@ -117,7 +117,7 @@ fn extract_u32(
 
     // Convert LE bytes → u32 elements.
     //
-    // Using chunks_exact rather than a transmute cast because:
+    // Using as_chunks rather than a transmute cast because:
     // 1. No additional `unsafe` block needed here (we already have the
     //    `#![allow(unsafe_code)]` gate in fused_moe.rs but this file
     //    should stay safe).
@@ -128,8 +128,10 @@ fn extract_u32(
     // 3. Correctness is guaranteed regardless of host endianness (though
     //    pmetal only targets macOS/ARM, being explicit is free).
     let elements: Vec<u32> = bytes
-        .chunks_exact(mem::size_of::<u32>())
-        .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<{ mem::size_of::<u32>() }>()
+        .0
+        .iter()
+        .map(|chunk| u32::from_le_bytes(*chunk))
         .collect();
 
     MetalBuffer::from_slice(ctx, &elements, BufferUsage::Shared)
@@ -149,8 +151,10 @@ fn extract_u16(
     validate_alignment(bytes.len(), mem::size_of::<u16>(), name)?;
 
     let elements: Vec<u16> = bytes
-        .chunks_exact(mem::size_of::<u16>())
-        .map(|chunk| u16::from_le_bytes(chunk.try_into().unwrap()))
+        .as_chunks::<{ mem::size_of::<u16>() }>()
+        .0
+        .iter()
+        .map(|chunk| u16::from_le_bytes(*chunk))
         .collect();
 
     MetalBuffer::from_slice(ctx, &elements, BufferUsage::Shared)
@@ -222,7 +226,9 @@ mod tests {
         // Fill weight components with a counting pattern (LE u32 = 0, 1, 2, …)
         for comp in [&record.gate_weight, &record.up_weight, &record.down_weight] {
             for (i, chunk) in raw[comp.offset..comp.offset + comp.size]
-                .chunks_exact_mut(4)
+                .as_chunks_mut::<4>()
+                .0
+                .iter_mut()
                 .enumerate()
             {
                 chunk.copy_from_slice(&(i as u32).to_le_bytes());
@@ -238,7 +244,11 @@ mod tests {
             &record.down_scales,
             &record.down_biases,
         ] {
-            for chunk in raw[comp.offset..comp.offset + comp.size].chunks_exact_mut(2) {
+            for chunk in raw[comp.offset..comp.offset + comp.size]
+                .as_chunks_mut::<2>()
+                .0
+                .iter_mut()
+            {
                 chunk.copy_from_slice(&0x3F80u16.to_le_bytes());
             }
         }

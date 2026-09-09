@@ -3111,8 +3111,6 @@ impl App {
 
         // Clone dashboard data for split-borrow access in training/distill/grpo tabs.
         // This is cheap: max ~10K samples at 5fps render rate.
-        let dash_samples;
-        let dash_throughput;
         let needs_metrics = matches!(
             self.active_tab,
             Tab::Training
@@ -3122,13 +3120,14 @@ impl App {
                 | Tab::EmbedTrain
                 | Tab::Rlkd
         );
-        if needs_metrics {
-            dash_samples = self.dashboard.samples.clone();
-            dash_throughput = self.dashboard.throughput_data.clone();
+        let (dash_samples, dash_throughput) = if needs_metrics {
+            (
+                self.dashboard.samples.clone(),
+                self.dashboard.throughput_data.clone(),
+            )
         } else {
-            dash_samples = Vec::new();
-            dash_throughput = Vec::new();
-        }
+            (Vec::new(), Vec::new())
+        };
 
         // Active tab content
         match self.active_tab {

@@ -394,8 +394,10 @@ pub fn deserialize_compressed(bytes: &[u8]) -> Option<CompressedGradient> {
                 return None;
             }
             let floats: Vec<f32> = bytes[5..]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             CompressedData::Full(floats)
         }
@@ -412,15 +414,19 @@ pub fn deserialize_compressed(bytes: &[u8]) -> Option<CompressedGradient> {
                 return None;
             }
             let indices: Vec<u32> = bytes[9..indices_end]
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c))
                 .collect();
             if indices.iter().any(|&idx| idx as usize >= original_size) {
                 return None;
             }
             let values: Vec<f32> = bytes[indices_end..]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
                 .collect();
             CompressedData::Sparse { indices, values }
         }
@@ -431,8 +437,10 @@ pub fn deserialize_compressed(bytes: &[u8]) -> Option<CompressedGradient> {
                 return None;
             }
             let data: Vec<u16> = bytes[5..]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             CompressedData::FP16(data)
         }
@@ -443,8 +451,10 @@ pub fn deserialize_compressed(bytes: &[u8]) -> Option<CompressedGradient> {
                 return None;
             }
             let data: Vec<u16> = bytes[5..]
-                .chunks_exact(2)
-                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| u16::from_le_bytes(*c))
                 .collect();
             CompressedData::BF16(data)
         }

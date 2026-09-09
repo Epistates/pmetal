@@ -263,9 +263,8 @@ pub mod ring {
             tokio::try_join!(send(&send_bytes), recv(&mut recv_bytes))?;
 
             // Reduce received data
-            for (i, chunk) in recv_bytes.chunks_exact(4).enumerate() {
-                let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                buffer[recv_start + i] += val;
+            for (i, chunk) in recv_bytes.as_chunks::<4>().0.iter().enumerate() {
+                buffer[recv_start + i] += f32::from_le_bytes(*chunk);
             }
         }
 
@@ -292,9 +291,8 @@ pub mod ring {
             tokio::try_join!(send(&send_bytes), recv(&mut recv_bytes))?;
 
             // Copy received data
-            for (i, chunk) in recv_bytes.chunks_exact(4).enumerate() {
-                let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                buffer[recv_start + i] = val;
+            for (i, chunk) in recv_bytes.as_chunks::<4>().0.iter().enumerate() {
+                buffer[recv_start + i] = f32::from_le_bytes(*chunk);
             }
 
             send_idx = recv_idx;
@@ -406,9 +404,8 @@ pub mod centralized {
                 recv_from_peer(&mut recv_buf).await?;
 
                 // Accumulate
-                for (i, chunk) in recv_buf.chunks_exact(4).enumerate() {
-                    let val = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                    buffer[i] += val;
+                for (i, chunk) in recv_buf.as_chunks::<4>().0.iter().enumerate() {
+                    buffer[i] += f32::from_le_bytes(*chunk);
                 }
             }
 
@@ -431,8 +428,8 @@ pub mod centralized {
             recv_from_root(&mut recv_buf).await?;
 
             // Copy result
-            for (i, chunk) in recv_buf.chunks_exact(4).enumerate() {
-                buffer[i] = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            for (i, chunk) in recv_buf.as_chunks::<4>().0.iter().enumerate() {
+                buffer[i] = f32::from_le_bytes(*chunk);
             }
         }
 

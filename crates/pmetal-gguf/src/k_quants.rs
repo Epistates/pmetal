@@ -235,7 +235,7 @@ pub fn dequantize_q2k(block: &BlockQ2K, output: &mut [f32; QK_K]) {
     let mut is = 0usize; // index into block.scales
 
     // Two 128-element halves; each half uses 32 qs bytes and 8 scale bytes.
-    for qs in block.qs.chunks_exact(32) {
+    for qs in block.qs.as_chunks::<32>().0 {
         // 4 shift passes of 64 output elements each (2 sub-blocks of 16 per pass).
         let mut shift = 0u32;
         for _j in 0..4 {
@@ -330,10 +330,17 @@ pub fn dequantize_q3k(block: &BlockQ3K, output: &mut [f32; QK_K]) {
     let mut is = 0usize;
     let mut m = 1u8; // bitmask into hmask bytes: cycles 1,2,4,8,16,32,64,128
 
-    for (out_128, qs) in output.chunks_exact_mut(128).zip(block.qs.chunks_exact(32)) {
+    for (out_128, qs) in output
+        .as_chunks_mut::<128>()
+        .0
+        .iter_mut()
+        .zip(block.qs.as_chunks::<32>().0)
+    {
         let mut shift = 0u32;
-        for shift_chunk in out_128.chunks_exact_mut(32) {
-            for (scale_index, scale_chunk) in shift_chunk.chunks_exact_mut(16).enumerate() {
+        for shift_chunk in out_128.as_chunks_mut::<32>().0.iter_mut() {
+            for (scale_index, scale_chunk) in
+                shift_chunk.as_chunks_mut::<16>().0.iter_mut().enumerate()
+            {
                 let dl = d * scales[is] as f32;
                 is += 1;
                 for (i, out_val) in scale_chunk.iter_mut().enumerate() {
@@ -896,7 +903,7 @@ pub fn quantize_q4k(xs: &[f32]) -> Vec<BlockQ4K> {
         let mut scales = [0.0f32; QK_K / 32];
 
         // Compute per-subblock scales and mins
-        for (j, chunk) in x.chunks_exact(32).enumerate() {
+        for (j, chunk) in x.as_chunks::<32>().0.iter().enumerate() {
             (scales[j], mins[j]) = make_qkx1_quants(15, 5, chunk);
         }
 
@@ -980,7 +987,7 @@ pub fn quantize_q5k(xs: &[f32]) -> Vec<BlockQ5K> {
         let mut mins = [0.0f32; QK_K / 32];
         let mut scales = [0.0f32; QK_K / 32];
 
-        for (j, chunk) in x.chunks_exact(32).enumerate() {
+        for (j, chunk) in x.as_chunks::<32>().0.iter().enumerate() {
             (scales[j], mins[j]) = make_qkx1_quants(31, 5, chunk);
         }
 
@@ -1156,7 +1163,7 @@ pub fn quantize_q3k(xs: &[f32]) -> Vec<BlockQ3K> {
         let x = &xs[start..start + QK_K];
 
         let mut scales_f = [0.0f32; QK_K / 16];
-        for (j, chunk) in x.chunks_exact(16).enumerate() {
+        for (j, chunk) in x.as_chunks::<16>().0.iter().enumerate() {
             scales_f[j] = make_q3_quants(chunk, 4, true);
         }
 

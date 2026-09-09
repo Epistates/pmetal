@@ -222,8 +222,10 @@ fn dequantize_f32(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> 
     validate_data_size(data, expected_size)?;
 
     let floats: Vec<f32> = data
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| f32::from_le_bytes(*b))
         .collect();
 
     Ok(floats)
@@ -236,8 +238,10 @@ fn dequantize_f16(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> 
     validate_data_size(data, expected_size)?;
 
     let floats: Vec<f32> = data
-        .chunks_exact(2)
-        .map(|b| half::f16::from_le_bytes([b[0], b[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| half::f16::from_le_bytes(*b).to_f32())
         .collect();
 
     Ok(floats)
@@ -250,8 +254,10 @@ fn dequantize_bf16(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError>
     validate_data_size(data, expected_size)?;
 
     let floats: Vec<f32> = data
-        .chunks_exact(2)
-        .map(|b| half::bf16::from_le_bytes([b[0], b[1]]).to_f32())
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| half::bf16::from_le_bytes(*b).to_f32())
         .collect();
 
     Ok(floats)
@@ -706,8 +712,10 @@ fn dequantize_i16(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> 
     let n_elements = shape_n_elements(shape)?;
     validate_data_size(data, n_elements * 2)?;
     Ok(data
-        .chunks_exact(2)
-        .map(|b| i16::from_le_bytes([b[0], b[1]]) as f32)
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b) as f32)
         .collect())
 }
 
@@ -715,8 +723,10 @@ fn dequantize_i32(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> 
     let n_elements = shape_n_elements(shape)?;
     validate_data_size(data, n_elements * 4)?;
     Ok(data
-        .chunks_exact(4)
-        .map(|b| i32::from_le_bytes([b[0], b[1], b[2], b[3]]) as f32)
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b) as f32)
         .collect())
 }
 
@@ -724,8 +734,10 @@ fn dequantize_i64(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> 
     let n_elements = shape_n_elements(shape)?;
     validate_data_size(data, n_elements * 8)?;
     Ok(data
-        .chunks_exact(8)
-        .map(|b| i64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| i64::from_le_bytes(*b) as f32)
         .collect())
 }
 
@@ -733,8 +745,10 @@ fn dequantize_f64(data: &[u8], shape: &[i32]) -> Result<Vec<f32>, DequantError> 
     let n_elements = shape_n_elements(shape)?;
     validate_data_size(data, n_elements * 8)?;
     Ok(data
-        .chunks_exact(8)
-        .map(|b| f64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) as f32)
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| f64::from_le_bytes(*b) as f32)
         .collect())
 }
 

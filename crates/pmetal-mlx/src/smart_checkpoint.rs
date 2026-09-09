@@ -956,8 +956,10 @@ fn load_array_from_disk(path: &Path) -> Result<Array, Exception> {
     file.read_to_end(&mut bytes)
         .map_err(|e| Exception::custom(e.to_string()))?;
     let data: Vec<f32> = bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect();
     Ok(Array::from_f32_slice(&data, &[data.len() as i32]))
 }
@@ -997,8 +999,10 @@ fn load_segment_from_disk(path: &Path) -> Result<HashMap<String, Array>, Excepti
             break;
         }
         let data: Vec<f32> = bytes[pos..pos + data_len * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         pos += data_len * 4;
 

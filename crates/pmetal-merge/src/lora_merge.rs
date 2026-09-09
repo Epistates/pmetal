@@ -210,8 +210,10 @@ fn bytes_to_f64_2d(bytes: &[u8], dtype: Dtype, shape: &[usize], name: &str) -> R
                 return Err(byte_len_mismatch(name, n * 2, bytes.len()));
             }
             bytes
-                .chunks_exact(2)
-                .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f64())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f16::from_le_bytes(*c).to_f64())
                 .collect()
         }
         Dtype::BF16 => {
@@ -219,8 +221,10 @@ fn bytes_to_f64_2d(bytes: &[u8], dtype: Dtype, shape: &[usize], name: &str) -> R
                 return Err(byte_len_mismatch(name, n * 2, bytes.len()));
             }
             bytes
-                .chunks_exact(2)
-                .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f64())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| bf16::from_le_bytes(*c).to_f64())
                 .collect()
         }
         Dtype::F32 => {
@@ -228,8 +232,10 @@ fn bytes_to_f64_2d(bytes: &[u8], dtype: Dtype, shape: &[usize], name: &str) -> R
                 return Err(byte_len_mismatch(name, n * 4, bytes.len()));
             }
             bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c) as f64)
                 .collect()
         }
         Dtype::F64 => {
@@ -237,8 +243,10 @@ fn bytes_to_f64_2d(bytes: &[u8], dtype: Dtype, shape: &[usize], name: &str) -> R
                 return Err(byte_len_mismatch(name, n * 8, bytes.len()));
             }
             bytes
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect()
         }
         other => {
@@ -280,8 +288,10 @@ fn bytes_to_f64_1d(bytes: &[u8], dtype: Dtype, shape: &[usize], name: &str) -> R
                 return Err(byte_len_mismatch(name, n * 2, bytes.len()));
             }
             bytes
-                .chunks_exact(2)
-                .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f64())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| f16::from_le_bytes(*c).to_f64())
                 .collect()
         }
         Dtype::BF16 => {
@@ -289,8 +299,10 @@ fn bytes_to_f64_1d(bytes: &[u8], dtype: Dtype, shape: &[usize], name: &str) -> R
                 return Err(byte_len_mismatch(name, n * 2, bytes.len()));
             }
             bytes
-                .chunks_exact(2)
-                .map(|c| bf16::from_le_bytes([c[0], c[1]]).to_f64())
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| bf16::from_le_bytes(*c).to_f64())
                 .collect()
         }
         Dtype::F32 => {
@@ -298,8 +310,10 @@ fn bytes_to_f64_1d(bytes: &[u8], dtype: Dtype, shape: &[usize], name: &str) -> R
                 return Err(byte_len_mismatch(name, n * 4, bytes.len()));
             }
             bytes
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64)
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c) as f64)
                 .collect()
         }
         Dtype::F64 => {
@@ -307,8 +321,10 @@ fn bytes_to_f64_1d(bytes: &[u8], dtype: Dtype, shape: &[usize], name: &str) -> R
                 return Err(byte_len_mismatch(name, n * 8, bytes.len()));
             }
             bytes
-                .chunks_exact(8)
-                .map(|c| f64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                .as_chunks::<8>()
+                .0
+                .iter()
+                .map(|c| f64::from_le_bytes(*c))
                 .collect()
         }
         other => {
@@ -840,11 +856,13 @@ fn write_merged_rows(
         match dtype {
             Dtype::F16 => {
                 for ((base_chunk, &d), out_chunk) in base_row
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .zip(delta_row)
-                    .zip(out_row.chunks_exact_mut(2))
+                    .zip(out_row.as_chunks_mut::<2>().0.iter_mut())
                 {
-                    let base_val = f16::from_le_bytes([base_chunk[0], base_chunk[1]]).to_f64();
+                    let base_val = f16::from_le_bytes(*base_chunk).to_f64();
                     let merged =
                         ((base_val + d) as f32).clamp(f16::MIN.to_f32(), f16::MAX.to_f32());
                     out_chunk.copy_from_slice(&f16::from_f32(merged).to_le_bytes());
@@ -852,11 +870,13 @@ fn write_merged_rows(
             }
             Dtype::BF16 => {
                 for ((base_chunk, &d), out_chunk) in base_row
-                    .chunks_exact(2)
+                    .as_chunks::<2>()
+                    .0
+                    .iter()
                     .zip(delta_row)
-                    .zip(out_row.chunks_exact_mut(2))
+                    .zip(out_row.as_chunks_mut::<2>().0.iter_mut())
                 {
-                    let base_val = bf16::from_le_bytes([base_chunk[0], base_chunk[1]]).to_f64();
+                    let base_val = bf16::from_le_bytes(*base_chunk).to_f64();
                     let merged =
                         ((base_val + d) as f32).clamp(bf16::MIN.to_f32(), bf16::MAX.to_f32());
                     out_chunk.copy_from_slice(&bf16::from_f32(merged).to_le_bytes());
@@ -864,16 +884,13 @@ fn write_merged_rows(
             }
             Dtype::F32 => {
                 for ((base_chunk, &d), out_chunk) in base_row
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .zip(delta_row)
-                    .zip(out_row.chunks_exact_mut(4))
+                    .zip(out_row.as_chunks_mut::<4>().0.iter_mut())
                 {
-                    let base_val = f32::from_le_bytes([
-                        base_chunk[0],
-                        base_chunk[1],
-                        base_chunk[2],
-                        base_chunk[3],
-                    ]) as f64;
+                    let base_val = f32::from_le_bytes(*base_chunk) as f64;
                     let merged = (base_val + d) as f32;
                     out_chunk.copy_from_slice(&merged.to_le_bytes());
                 }
@@ -1430,8 +1447,10 @@ mod tests {
         let meta = file.tensor_meta(tensor_name).unwrap();
         let bytes = file.tensor_bytes(tensor_name).unwrap();
         bytes
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| f16::from_le_bytes(*c).to_f32())
             .collect::<Vec<_>>()[..(meta.shape.iter().product::<usize>())]
             .to_vec()
     }
@@ -1496,8 +1515,10 @@ mod tests {
         .unwrap();
 
         let result: Vec<f32> = out
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert_eq!(result, base_vals);
     }
@@ -1532,8 +1553,10 @@ mod tests {
         .unwrap();
 
         let result: Vec<f32> = out
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert!((result[0] - 3.0).abs() < 1e-6);
         assert!((result[1] - 2.0).abs() < 1e-6);
@@ -1583,12 +1606,16 @@ mod tests {
         .unwrap();
 
         let full: Vec<f32> = out_full
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         let tiled: Vec<f32> = out_tiled
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
 
         for (a, b) in full.iter().zip(tiled.iter()) {
@@ -1627,8 +1654,10 @@ mod tests {
         .unwrap();
 
         let result: Vec<f32> = out
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert!((result[0] - 4.0).abs() < 1e-6, "result[0]={}", result[0]);
         assert!((result[1] - 4.0).abs() < 1e-6, "result[1]={}", result[1]);
@@ -1861,8 +1890,10 @@ mod tests {
         .unwrap();
 
         let result: Vec<f32> = out
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect();
         assert!((result[0] - 1.1).abs() < 1e-5, "got {}", result[0]);
         assert!((result[1] - 2.2).abs() < 1e-5, "got {}", result[1]);

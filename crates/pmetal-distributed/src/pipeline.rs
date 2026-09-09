@@ -447,12 +447,8 @@ fn greedy_argmax_last_position(data: &[u8], shape: &[u32]) -> DistributedResult<
     let mut best_idx: u32 = 0;
     let mut best_val: f32 = f32::NEG_INFINITY;
 
-    for (i, chunk) in last_pos_bytes.chunks_exact(4).enumerate() {
-        let val = f32::from_le_bytes(
-            chunk
-                .try_into()
-                .expect("chunks_exact(4) guarantees 4 bytes"),
-        );
+    for (i, chunk) in last_pos_bytes.as_chunks::<4>().0.iter().enumerate() {
+        let val = f32::from_le_bytes(*chunk);
         if val > best_val {
             best_val = val;
             best_idx = i as u32;

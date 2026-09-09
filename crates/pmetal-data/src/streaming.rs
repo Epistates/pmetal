@@ -222,8 +222,10 @@ impl ShardCursor {
         let end = self.byte_offset + take * 4;
         out.extend(
             data[self.byte_offset..end]
-                .chunks_exact(4)
-                .map(|c| u32::from_le_bytes(c.try_into().unwrap())),
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| u32::from_le_bytes(*c)),
         );
         self.byte_offset += take * 4;
         self.tokens_in_current_doc -= take;

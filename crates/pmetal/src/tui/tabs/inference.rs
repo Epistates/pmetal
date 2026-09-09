@@ -187,7 +187,7 @@ impl InferenceTab {
 
     /// Take the current input buffer contents and clear it.
     pub fn take_input(&mut self) -> String {
-        let s = self.input_buffer.drain(..).collect();
+        let s = std::mem::take(&mut self.input_buffer);
         self.cursor_position = 0;
         s
     }

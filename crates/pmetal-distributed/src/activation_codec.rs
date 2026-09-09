@@ -43,9 +43,8 @@ pub fn decompress_f16_to_f32(data: &[u8]) -> Vec<f32> {
         "fp16 data must be even length"
     );
     let mut out = Vec::with_capacity(data.len() / 2);
-    for chunk in data.chunks_exact(2) {
-        let h = f16::from_le_bytes([chunk[0], chunk[1]]);
-        out.push(h.to_f32());
+    for chunk in data.as_chunks::<2>().0 {
+        out.push(f16::from_le_bytes(*chunk).to_f32());
     }
     out
 }
@@ -60,8 +59,10 @@ pub fn compress_activation(data: &[u8], src_is_f32: bool, codec: ActivationCodec
             if src_is_f32 {
                 // Reinterpret bytes as f32 via zerocopy-safe conversion
                 let f32_data: Vec<f32> = data
-                    .chunks_exact(4)
-                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|c| f32::from_le_bytes(*c))
                     .collect();
                 compress_f32_to_f16(&f32_data)
             } else {

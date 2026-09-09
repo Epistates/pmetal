@@ -344,8 +344,10 @@ impl QuantizerOps for GroupQuantizer {
         // Reconstruct GroupQuantizedTensor
         let qweight: Vec<u32> = quantized
             .data
-            .chunks_exact(4)
-            .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|chunk| u32::from_le_bytes(*chunk))
             .collect();
 
         let group_quantized = GroupQuantizedTensor {

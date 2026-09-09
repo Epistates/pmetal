@@ -149,8 +149,8 @@ fn greedy_argmax_last_position(data: &[u8], vocab: usize) -> u32 {
     let last_pos_start = (total - vocab) * 4;
     let mut best_idx: u32 = 0;
     let mut best_val: f32 = f32::NEG_INFINITY;
-    for (i, c) in data[last_pos_start..].chunks_exact(4).enumerate() {
-        let v = f32::from_le_bytes(c.try_into().expect("4 bytes"));
+    for (i, c) in data[last_pos_start..].as_chunks::<4>().0.iter().enumerate() {
+        let v = f32::from_le_bytes(*c);
         if v > best_val {
             best_val = v;
             best_idx = i as u32;

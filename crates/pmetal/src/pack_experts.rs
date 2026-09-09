@@ -771,20 +771,26 @@ fn quantize_and_write_matrix(
     // Decode the raw bytes to f32.
     let weights_f32: Vec<f32> = match view.dtype {
         Dtype::F32 => raw
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect(),
         Dtype::BF16 => raw
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|b| {
-                let bits = u16::from_le_bytes([b[0], b[1]]);
+                let bits = u16::from_le_bytes(*b);
                 // bf16 → f32: shift the 16-bit pattern to the top of a f32.
                 f32::from_bits((bits as u32) << 16)
             })
             .collect(),
         Dtype::F16 => raw
-            .chunks_exact(2)
-            .map(|b| f16_to_f32(u16::from_le_bytes([b[0], b[1]])))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| f16_to_f32(u16::from_le_bytes(*b)))
             .collect(),
         dt => bail!("Unsupported dtype {dt:?} for weight tensor `{weight_key}`"),
     };

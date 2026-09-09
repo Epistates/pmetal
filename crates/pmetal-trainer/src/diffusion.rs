@@ -427,7 +427,7 @@ impl DiffusionTrainingLoop {
         }
 
         let mut total_norm_sq = 0.0_f32;
-        for (_, grad) in grads.iter() {
+        for grad in grads.values() {
             let mut norm_sq = grad.multiply(grad).sum(None);
             norm_sq.eval();
             total_norm_sq += norm_sq.item_f32();
@@ -436,7 +436,7 @@ impl DiffusionTrainingLoop {
 
         if total_norm > max_norm {
             let scale = max_norm / (total_norm + 1e-6);
-            for (_, grad) in grads.iter_mut() {
+            for grad in grads.values_mut() {
                 *grad = grad.multiply(&Array::from_f32(scale));
             }
         }
