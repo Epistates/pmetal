@@ -1192,8 +1192,10 @@ impl DFlashTarget for DynamicModel {
                 Some(lm) => Ok(Module::forward(lm, hidden)?),
                 None => Ok(m.model.embed_tokens.as_linear(hidden)),
             },
-            Self::Phi(m) => Ok(Module::forward(&mut m.lm_head, hidden)?),
-            Self::Phi4(m) => Ok(Module::forward(&mut m.lm_head, hidden)?),
+            // Through `project_logits`, which handles the tied-head case.
+            // Phi-4-mini ties, so a direct `lm_head` projection here draws on
+            // a head the checkpoint never filled.
+            Self::Phi(m) | Self::Phi4(m) => m.project_logits(hidden),
             Self::DeepSeek(m) => Ok(Module::forward(&mut m.lm_head, hidden)?),
             Self::Qwen3MoE(m) => match &mut m.lm_head {
                 Some(lm) => Ok(Module::forward(lm, hidden)?),

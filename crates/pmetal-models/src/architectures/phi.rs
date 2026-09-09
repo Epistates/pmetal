@@ -20,7 +20,7 @@ use crate::decoder_layer::{
 };
 use pmetal_bridge::compat::nn::{Embedding, Linear, RmsNorm, RopeBuilder};
 use pmetal_bridge::compat::{
-    Array, Exception, ModuleParameters, ModuleParametersExt, Param, fast, nn, ops, random,
+    Array, Exception, Module, ModuleParameters, ModuleParametersExt, Param, fast, nn, ops, random,
 };
 use pmetal_bridge::impl_module_params;
 
@@ -829,18 +829,41 @@ impl PhiModel {
 #[derive(Debug)]
 pub struct PhiForCausalLM {
     pub model: PhiModel,
-    pub lm_head: Linear,
+    /// `None` when the config ties word embeddings, because a tied checkpoint
+    /// ships no `lm_head.weight` at all. Holding an unconditional `Linear` here
+    /// left Phi-4-mini's head at its random init — the trunk was bit-identical
+    /// across seeds while every one of its 3.2M logits moved.
+    pub lm_head: Option<Linear>,
 }
 impl_module_params!(PhiForCausalLM; model, lm_head);
 
 impl PhiForCausalLM {
     /// Create a new Phi causal LM.
     pub fn new(config: PhiConfig) -> Result<Self, Exception> {
-        let lm_head = nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
-            .bias(false)
-            .build()?;
+        let lm_head = if config.tie_word_embeddings {
+            None
+        } else {
+            Some(
+                nn::LinearBuilder::new(config.hidden_size, config.vocab_size)
+                    .bias(false)
+                    .build()?,
+            )
+        };
         let model = PhiModel::new(config)?;
         Ok(Self { model, lm_head })
+    }
+
+    /// Project trunk hidden states to logits, through the tied embedding when
+    /// the checkpoint carries no separate head.
+    ///
+    /// Public because the DFlash decoder projects its own draft hidden states
+    /// and would otherwise repeat the tied-head branch — the omission this
+    /// method exists to prevent.
+    pub fn project_logits(&mut self, hidden: &Array) -> Result<Array, Exception> {
+        match self.lm_head.as_mut() {
+            Some(head) => Ok(Module::forward(head, hidden)?),
+            None => Ok(self.model.embed_tokens.as_linear(hidden)),
+        }
     }
 
     /// Forward pass producing logits.
@@ -856,7 +879,7 @@ impl PhiForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward_with_cache(input_ids, mask, cache)?;
-        Ok(self.lm_head.forward(&hidden))
+        self.project_logits(&hidden)
     }
 
     /// Forward pass that records hidden states into a DFlash capture
@@ -871,7 +894,7 @@ impl PhiForCausalLM {
         let hidden = self
             .model
             .forward_with_capture(input_ids, mask, cache, Some(capture))?;
-        Ok(self.lm_head.forward(&hidden))
+        self.project_logits(&hidden)
     }
 
     /// Create a KV cache for this model.
@@ -940,11 +963,7 @@ impl PhiForCausalLM {
             )?;
         }
         let hidden = self.model.norm.forward(&hidden)?;
-        if cfg.tie_word_embeddings {
-            Ok(self.model.embed_tokens.as_linear(&hidden))
-        } else {
-            Ok(Module::forward(&mut self.lm_head, &hidden)?)
-        }
+        self.project_logits(&hidden)
     }
 }
 
