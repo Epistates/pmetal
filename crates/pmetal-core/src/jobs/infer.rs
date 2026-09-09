@@ -191,16 +191,6 @@ pub struct InferSpec {
     pub metal_sampler: bool,
 
     #[job(
-        label = "Stream",
-        group = "Compute",
-        argv = "--stream",
-        flag,
-        default_bool = false
-    )]
-    #[serde(default)]
-    pub stream: bool,
-
-    #[job(
         label = "Minimal Path",
         group = "Compute",
         argv = "--minimal",
@@ -404,7 +394,6 @@ impl Default for InferSpec {
             draft_model: None,
             compiled: false,
             metal_sampler: false,
-            stream: false,
             minimal: false,
             tools: None,
             fp8: false,

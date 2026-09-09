@@ -99,11 +99,6 @@ pub struct InferArgs {
     #[arg(long = "compiled")]
     pub compiled: bool,
 
-    /// Use dedicated GPU stream for generation.
-    /// NOTE: Currently a no-op placeholder.
-    #[arg(long = "stream", hide = true)]
-    pub stream: bool,
-
     /// Use minimal async generation (for performance debugging)
     #[arg(long = "minimal")]
     pub minimal: bool,

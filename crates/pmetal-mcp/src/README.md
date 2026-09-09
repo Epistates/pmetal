@@ -55,7 +55,6 @@ The `InferSpec` in `pmetal_core::jobs::infer` models **32** fields. The followin
 | Backend selector | `backend: String` | `--backend auto\|standard\|compiled\|metal-sampler\|ane\|minimal\|dflash` |
 | Draft model | `draft_model: Option<String>` | `--draft-model <path>` |
 | Compiled sampling | `compiled: bool` | `--compiled` |
-| Stream mode | `stream: bool` | `--stream` |
 | Benchmark mode | `benchmark: bool` | `--benchmark` |
 | Profile layers | `profile_layers: bool` | `--profile-layers` |
 | KV K-bits (per-key quant) | `kv_k_bits: Option<u8>` | `--kv-k-bits <bits>` |
@@ -76,7 +75,6 @@ async fn generate(&self, model: String, prompt: String,
     backend: Option<String>,
     draft_model: Option<String>,
     compiled: Option<bool>,
-    stream: Option<bool>,
     benchmark: Option<bool>,
     profile_layers: Option<bool>,
     kv_k_bits: Option<u64>,
@@ -92,7 +90,6 @@ async fn generate(&self, model: String, prompt: String,
         backend: backend.unwrap_or_else(|| "auto".to_string()),
         draft_model,
         compiled: compiled.unwrap_or(false),
-        stream: stream.unwrap_or(false),
         benchmark: benchmark.unwrap_or(false),
         profile_layers: profile_layers.unwrap_or(false),
         kv_k_bits: kv_k_bits.map(|b| b as u8),

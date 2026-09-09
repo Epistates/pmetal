@@ -290,7 +290,6 @@ pub(crate) async fn run_inference(
     mtp_draft_tokens: usize,
     metal_sampler: bool,
     compiled: bool,
-    _stream: bool,
     minimal: bool,
     hide_thinking: bool,
     fp8: bool,
