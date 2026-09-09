@@ -52,13 +52,40 @@ build-debug:
 check:
     cargo check --workspace --exclude pmetal-py
 
-# Build CLI binary (mirrors release CI)
+# Build CLI binary (mirrors release CI, including its feature set)
 build-cli:
-    cargo build --release -p pmetal
+    cargo build --release -p pmetal --features serve,mcp
 
 # Check GUI compiles (mirrors release CI -- catches cfg mismatches)
 check-gui:
     cargo check --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml
+
+# Stage the CLI sidecar + metallib the release bundle expects.
+#
+# `bun tauri dev` and a plain `bun tauri build` do NOT need this: externalBin
+# lives in tauri.bundle.conf.json, which is only merged for release bundles.
+# Run this before `just build-gui-bundle`.
+stage-gui-sidecar: build-cli
+    #!/usr/bin/env zsh
+    set -euo pipefail
+    SIDECAR_DIR=crates/pmetal-gui/src-tauri/binaries
+    TRIPLE=$(rustc -vV | sed -n 's/^host: //p')
+    mkdir -p "$SIDECAR_DIR"
+    cp target/release/pmetal "$SIDECAR_DIR/pmetal-$TRIPLE"
+    METALLIB=$(find target/release/build -name mlx.metallib -path '*/out/build/lib/*' | head -1)
+    if [[ -z "$METALLIB" ]]; then
+        METALLIB="$HOME/.cache/pmetal/lib/mlx.metallib"
+    fi
+    if [[ ! -f "$METALLIB" ]]; then
+        echo "FAIL: mlx.metallib not found in the build output or the cache"
+        exit 1
+    fi
+    cp "$METALLIB" "$SIDECAR_DIR/mlx.metallib"
+    echo "Staged sidecar for $TRIPLE"
+
+# Build the release GUI bundle the way release CI does (sidecar included)
+build-gui-bundle: stage-gui-sidecar
+    cd crates/pmetal-gui && bun run tauri build -c src-tauri/tauri.bundle.conf.json
 
 # ─── Testing ────────────────────────────────────────────────────────
 

@@ -39,7 +39,8 @@ curl http://localhost:8080/v1/chat/completions \
 ```
 
 :::note
-Requires building with `--features serve`: `cargo install pmetal --features serve`
+The prebuilt release binary and the Homebrew formula both ship this command. If you build PMetal
+yourself, `serve` is opt-in: `cargo install pmetal --features serve`.
 :::
 
 ## See Also

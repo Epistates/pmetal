@@ -97,6 +97,23 @@ bun install
 bun tauri dev
 ```
 
+### GUI and the CLI
+
+Most GUI pages run in-process, but bench, eval, pretrain, merge, quantize, DFlash, embed-train,
+RLKD, Ollama and Serve drive the `pmetal` CLI as a subprocess. The release bundle carries the CLI
+as a sidecar, so a downloaded `.app` is self-contained.
+
+A GUI you built yourself has no sidecar, and an app launched from Finder inherits launchd's PATH
+(`/usr/bin:/bin:/usr/sbin:/sbin`), which does not include Homebrew or cargo. The GUI therefore also
+looks for `pmetal` in `~/.cargo/bin`, `/opt/homebrew/bin` and `/usr/local/bin` by absolute path, so
+a `cargo install pmetal` or `brew install pmetal` is found. Set `PMETAL_CLI` to override.
+
+To reproduce the release bundle locally, including the sidecar:
+
+```bash
+just build-gui-bundle
+```
+
 ## Python SDK
 
 The Python SDK is built with maturin and PyO3:

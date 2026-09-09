@@ -25,6 +25,10 @@ pub fn run() {
                 app.handle().plugin(tauri_plugin_process::init())?;
             }
 
+            // Must run before anything touches MLX, which loads its metallib
+            // lazily on the first array operation.
+            ensure_metallib(app.handle());
+
             let state = app.state::<AppState>();
 
             // Log startup diagnostics for troubleshooting
@@ -170,6 +174,55 @@ pub fn run() {
 // everywhere and complicate kill()), we pass just the Arcs we need for
 // startup init tasks.
 // ---------------------------------------------------------------------------
+
+/// Point the patched MLX backend at an `mlx.metallib`.
+///
+/// MLX cannot load a single Metal kernel without it. The bundled app carries one
+/// as a Tauri resource; a source checkout has one next to the built executable or
+/// in the shared cache that `pmetal-bridge`'s build script writes. Without this,
+/// the only thing that ever populated that cache was building PMetal from source
+/// on the same machine, so a GUI installed from the .dmg alone had no metallib
+/// at all.
+///
+/// The `PMETAL_METALLIB_PATH` override is the first entry in the C++ search order
+/// (see `crates/pmetal-bridge/patches/metallib-search-path.patch`), so an
+/// operator who sets it wins and we leave it alone.
+fn ensure_metallib(app: &tauri::AppHandle) {
+    use tauri::path::BaseDirectory;
+
+    if std::env::var_os("PMETAL_METALLIB_PATH").is_some_and(|v| !v.is_empty()) {
+        return;
+    }
+
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+
+    if let Ok(path) = app.path().resolve("mlx.metallib", BaseDirectory::Resource) {
+        candidates.push(path);
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            candidates.push(dir.join("mlx.metallib"));
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates.push(std::path::PathBuf::from(home).join(".cache/pmetal/lib/mlx.metallib"));
+    }
+
+    match candidates.into_iter().find(|p| p.is_file()) {
+        Some(path) => {
+            tracing::info!(path = %path.display(), "Found mlx.metallib");
+            std::env::set_var("PMETAL_METALLIB_PATH", &path);
+            std::env::set_var("MLX_METAL_JIT", "1");
+        }
+        None => {
+            tracing::error!(
+                "mlx.metallib not found — MLX kernels will fail to load. \
+                 Install the pmetal CLI (it carries an embedded copy and extracts \
+                 it to ~/.cache/pmetal/lib/) or set PMETAL_METALLIB_PATH."
+            );
+        }
+    }
+}
 
 /// Log startup diagnostics so crash reports have context.
 fn log_startup_diagnostics() {

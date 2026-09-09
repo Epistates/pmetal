@@ -86,6 +86,8 @@ test-training-output/
 **/node_modules
 **/.svelte-kit
 crates/pmetal-gui/build/
+# CLI sidecar + metallib staged into the Tauri bundle at release time
+crates/pmetal-gui/src-tauri/binaries/
 .mcp.json
 
 *.gputrace

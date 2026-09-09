@@ -2277,27 +2277,56 @@ pub async fn stop_pretrain(state: State<'_, AppState>, run_id: String) -> Result
 }
 
 /// Resolve the `pmetal` CLI binary used to spawn long-running subprocesses
-/// (serve / bench / eval). In dev mode the sibling `target/{debug,release}`
-/// is checked; in a packaged GUI the binary should sit next to the app
-/// executable. Falls back to PATH lookup.
+/// (serve / bench / eval / quantize / merge / ollama / ...).
+///
+/// A release bundle carries the CLI as a Tauri sidecar, which lands next to the
+/// app executable in `Contents/MacOS/`, so that is checked first. Failing that
+/// we look in the usual install locations *by absolute path*.
+///
+/// Relying on a bare `pmetal` PATH lookup is not enough: an app launched from
+/// Finder inherits launchd's PATH (`/usr/bin:/bin:/usr/sbin:/sbin`), which
+/// contains neither Homebrew's `/opt/homebrew/bin` nor cargo's `~/.cargo/bin`.
+/// A `cargo install pmetal` or `brew install pmetal` would otherwise be
+/// invisible to the packaged GUI even though it works fine in a terminal.
 fn pmetal_binary() -> PathBuf {
-    // Try sibling paths relative to the GUI executable first (works for
-    // both dev builds and bundled apps).
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            for candidate in [
-                parent.join("pmetal"),
-                parent.join("../pmetal/pmetal"),
-                parent.join("../../debug/pmetal"),
-                parent.join("../../release/pmetal"),
-            ] {
-                if candidate.exists() {
-                    return candidate;
-                }
-            }
+    // Explicit override wins, for unusual installs and for testing.
+    if let Some(path) = std::env::var_os("PMETAL_CLI") {
+        let path = PathBuf::from(path);
+        if path.is_file() {
+            return path;
         }
     }
-    PathBuf::from("pmetal")
+
+    let mut candidates: Vec<PathBuf> = Vec::new();
+
+    // Bundled sidecar, then the dev-build siblings.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(parent) = exe.parent() {
+            candidates.push(parent.join("pmetal"));
+            candidates.push(parent.join("../pmetal/pmetal"));
+            candidates.push(parent.join("../../debug/pmetal"));
+            candidates.push(parent.join("../../release/pmetal"));
+        }
+    }
+
+    // `cargo install pmetal` — respects CARGO_HOME when it is set.
+    let cargo_bin = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cargo")))
+        .map(|c| c.join("bin/pmetal"));
+    candidates.extend(cargo_bin);
+
+    // Homebrew (Apple Silicon, then Intel), and the location the install docs
+    // tell people to drop the prebuilt binary in.
+    candidates.push("/opt/homebrew/bin/pmetal".into());
+    candidates.push("/usr/local/bin/pmetal".into());
+
+    candidates
+        .into_iter()
+        .find(|c| c.is_file())
+        // Last resort: let the OS resolve it, which works when the GUI was
+        // started from a shell that already has the right PATH.
+        .unwrap_or_else(|| PathBuf::from("pmetal"))
 }
 
 // ---------------------------------------------------------------------------

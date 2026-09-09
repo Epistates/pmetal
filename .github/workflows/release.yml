@@ -44,8 +44,12 @@ jobs:
           key: cli-aarch64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
           shared-key: cli-aarch64-apple-darwin
 
+      # `serve` and `mcp` are not in the default feature set so that library
+      # consumers don't inherit axum/rmcp, but a shipped binary is expected to
+      # have `pmetal serve` and `pmetal mcp` — the TUI's Serve tab and the GUI's
+      # Serve page both spawn `pmetal serve`.
       - name: Build CLI
-        run: cargo build --release --target aarch64-apple-darwin -p pmetal
+        run: cargo build --release --target aarch64-apple-darwin -p pmetal --features serve,mcp
 
       - name: Stage metallib
         run: |
@@ -163,6 +167,12 @@ jobs:
   build-gui:
     name: Build GUI (macOS aarch64)
     runs-on: macos-latest
+    # The GUI bundles the CLI as a sidecar rather than rebuilding it: most of the
+    # GUI's pages drive `pmetal` as a subprocess, and an app launched from Finder
+    # inherits launchd's PATH, which contains neither /opt/homebrew/bin nor
+    # ~/.cargo/bin. Reusing build-cli's artifact also guarantees the two halves of
+    # a release are the same binary.
+    needs: build-cli
     permissions:
       contents: read
 
@@ -192,6 +202,36 @@ jobs:
           key: gui-aarch64-apple-darwin-${{ hashFiles('**/Cargo.lock') }}
           shared-key: gui-aarch64-apple-darwin
           cache-on-failure: true
+
+      - name: Download CLI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: cli-aarch64-apple-darwin
+          path: cli-artifact
+
+      - name: Stage CLI sidecar and metallib
+        run: |
+          set -euo pipefail
+          SIDECAR_DIR=crates/pmetal-gui/src-tauri/binaries
+          mkdir -p "$SIDECAR_DIR"
+          tar -xzf cli-artifact/*.tar.gz -C cli-artifact
+
+          # Tauri resolves externalBin "binaries/pmetal" to a file suffixed with
+          # the target triple, and strips the suffix when bundling.
+          CLI=$(find cli-artifact -maxdepth 1 -name 'pmetal-*-aarch64-apple-darwin' -type f | head -1)
+          if [ -z "$CLI" ]; then
+            echo "ERROR: CLI binary not found in the build-cli artifact"
+            ls -R cli-artifact
+            exit 1
+          fi
+          cp "$CLI" "$SIDECAR_DIR/pmetal-aarch64-apple-darwin"
+          chmod +x "$SIDECAR_DIR/pmetal-aarch64-apple-darwin"
+
+          # MLX loads no kernels without this. It ships as a Tauri resource and
+          # the GUI points PMETAL_METALLIB_PATH at it on startup.
+          cp cli-artifact/mlx.metallib "$SIDECAR_DIR/mlx.metallib"
+
+          ls -lh "$SIDECAR_DIR"
 
       - name: Install frontend dependencies
         working-directory: crates/pmetal-gui
@@ -228,7 +268,9 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: crates/pmetal-gui
-          args: --target aarch64-apple-darwin
+          # tauri.bundle.conf.json carries externalBin/resources and is merged
+          # only here, so `bun tauri dev` still works without a staged sidecar.
+          args: --target aarch64-apple-darwin -c src-tauri/tauri.bundle.conf.json
 
       # Post-build notarization
       - name: Notarize macOS app
