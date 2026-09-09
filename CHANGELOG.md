@@ -89,6 +89,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Gemma 4 caches pre-transposed expert weights
 - Clean under Rust 1.98 clippy (`chunks_exact` → `as_chunks`, `for_kv_map`, `drain_collect`, `needless_late_init`)
 
+### Removed
+
+- **`pmetal infer --stream`.** It was accepted, threaded through `main.rs`, and landed in a parameter nothing read. It was hidden on the CLI but not elsewhere: `InferSpec` carried it as a "Stream" toggle, so the TUI's inference form rendered a switch for it, and the MCP `infer` tool advertised it as "Stream tokens to stdout as they are generated"
+- **`ServeSpec.lora`.** `pmetal serve` has no `--lora` — the documented workflow is to `pmetal fuse` the adapter first — but the spec still carried a "LoRA Adapter" field, so the TUI's Serve form and the GUI's Serve page both rendered an input that would have produced an unrecognized flag. Also removed from the MCP `start_serve` tool
+- Sixteen CLI flags that appeared in the README and `docs/cli/*.md` but were never defined, including `infer --show-thinking`, `merge --models`, `quantize --type`, `train --dora`, `rlkd --teacher`, `ollama modelfile --model` and `search --type`. DoRA is real but library-only (`LoraConfig.use_dora`); the docs no longer claim a CLI flag, GUI control or TUI control for it
+
 ## [0.5.0] - 2026-05-07
 
 ### Added
