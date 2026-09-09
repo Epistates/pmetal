@@ -2,7 +2,9 @@
 
 Merge two models using 12 merge strategies.
 
-The CLI merges exactly two models at a time; task-vector methods take a third via `--base`. Supports GPU-accelerated merging, FP8-aware merging, and async double-buffered streaming for large models.
+The CLI merges exactly two models at a time; task-vector methods take a third via `--base`.
+For N-way merges and slice-based frankenmerging, build a `pmetal_merge::MergeConfig` and call
+`run_merge` directly — the CLI does not accept a merge config file. Supports GPU-accelerated merging, FP8-aware merging, and async double-buffered streaming for large models.
 
 ## Usage
 
