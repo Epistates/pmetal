@@ -506,9 +506,13 @@ impl MistralModel {
         // Get embeddings
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
 
-        // Create causal mask if not provided and not using cache
+        // Create causal mask if not provided and not using cache — but only
+        // when every layer wants the same one. A sliding-window config makes
+        // `MistralAttention` pick `AttentionMaskType::SlidingWindow`, and
+        // handing it a mask instead drops that to `None`, silently widening
+        // every layer to full causal. See the same note in `gemma.rs`.
         let mask_owned;
-        let mask = if mask.is_none() && cache.is_none() {
+        let mask = if mask.is_none() && cache.is_none() && self.config.sliding_window.is_none() {
             let seq_len = input_ids.dim(1);
             mask_owned = create_causal_mask(seq_len)?;
             Some(&mask_owned)

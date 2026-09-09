@@ -467,16 +467,35 @@ fn benchmark_attention_candidate(
     };
     let elapsed = start.elapsed();
     let max_diff = max_abs_diff(reference, &output)?;
-    if max_diff > 0.1 {
+    let reference_scale = max_abs(reference)?;
+    if !candidate_matches_reference(max_diff, reference_scale) {
         tracing::debug!(
-            "Rejecting {:?} attention backend due to max_diff={:.5}",
+            "Rejecting {:?} attention backend: max_diff={:.5e} against a reference scale of {:.5e}",
             backend,
-            max_diff
+            max_diff,
+            reference_scale
         );
         return Ok(None);
     }
 
     Ok(Some((elapsed, output)))
+}
+
+/// Whether a candidate backend's output is close enough to the reference's to
+/// be worth timing.
+///
+/// Judged against the reference's own scale, not an absolute constant. The
+/// Metal backends stage Q/K/V through f16, whose smallest normal is ~6e-5, and
+/// not every model keeps its activations near 1: Nemotron-H's residual stream
+/// sits around 1e-17, where the f16 path returns all zeros. Against a fixed
+/// 0.1 that scored as a perfect match, so the zero-returning backend won on
+/// speed and was cached, and every attention layer in the architecture
+/// contributed nothing.
+///
+/// The ratio is the same 0.1 the absolute rule used, so a unit-scale tensor
+/// accepts and rejects exactly as it did before.
+fn candidate_matches_reference(max_diff: f32, reference_scale: f32) -> bool {
+    max_diff <= 0.1 * reference_scale
 }
 
 fn reference_attention_output(
@@ -514,7 +533,14 @@ fn fast_fused_sdpa(
         (AttentionMaskType::SlidingWindow(window_size), None) => {
             let query_len = queries.dim(2);
             let key_len = keys.dim(2);
-            let mask = create_sliding_window_mask(query_len, key_len, *window_size)?;
+            // Build it in the query's dtype. MLX rejects a mask that does not
+            // promote to the output type rather than upcasting, so the f32
+            // builder threw on every bf16 model — and a thrown bridge op
+            // returns a 0-dim array that broadcasts on through the layer
+            // instead of failing. `fused_sdpa` coerces the *caller's* mask for
+            // exactly this reason; a mask built in here needs the same care.
+            let mask = create_sliding_window_mask(query_len, key_len, *window_size)?
+                .as_dtype(queries.dtype().as_i32());
             Ok(queries.sdpa_with_mask(keys, values, config.scale, Some(&mask)))
         }
     }
@@ -614,6 +640,18 @@ fn mpp_flash_attention_supported(
 ) -> bool {
     dispatch.preferred_backend().caps().has_mpp_flash_attention
         && mpp_flash_attention_shape_ok(queries, keys, values, custom_mask)
+}
+
+/// Largest magnitude in `array`, as f32.
+fn max_abs(array: &Array) -> Result<f32, Exception> {
+    let array = if array.dtype() == Dtype::Float32 {
+        array.clone()
+    } else {
+        array.as_dtype(Dtype::Float32.as_i32())
+    };
+    let max = array.abs_val().max(None);
+    max.eval();
+    Ok(max.item_f32())
 }
 
 fn max_abs_diff(lhs: &Array, rhs: &Array) -> Result<f32, Exception> {
@@ -1169,6 +1207,108 @@ mod tests {
             values.iter().any(|&x| x != 0.0),
             "attention output is all zeros — the masked path produced nothing"
         );
+    }
+
+    /// `AttentionMaskType::SlidingWindow` must work against a bf16 model too.
+    ///
+    /// The sibling test above covers the mask a *caller* supplies, which
+    /// `fused_sdpa` coerces. This covers the one the kernel builds for itself,
+    /// which it did not: an f32 mask reached `sdpa_with_mask` and threw on every
+    /// bf16 checkpoint, so no windowed layer of any Gemma / Phi / Qwen / Mistral
+    /// model ever ran its window. Nothing caught it because the throw returns a
+    /// placeholder that broadcasts — and because architectures papered over the
+    /// window by handing the whole stack one causal mask instead.
+    #[test]
+    fn a_sliding_window_runs_against_a_bf16_model() {
+        let (heads, seq, head_dim) = (2, 8, 8);
+        let window = 3;
+        let shape = [1, heads, seq, head_dim];
+        let f32_qkv: Vec<Array> = (0..3).map(|_| random_tensor(&shape)).collect();
+        let to_bf16 = |a: &Array| a.as_dtype(Dtype::Bfloat16.as_i32());
+
+        let config = FusedAttentionConfig::new(heads, heads, head_dim)
+            .with_mask_type(AttentionMaskType::SlidingWindow(window));
+
+        let bf16_out = fused_sdpa(
+            &to_bf16(&f32_qkv[0]),
+            &to_bf16(&f32_qkv[1]),
+            &to_bf16(&f32_qkv[2]),
+            &config,
+            None,
+        )
+        .expect("fused_sdpa runs");
+        bf16_out.eval();
+        pmetal_bridge::check_last_error()
+            .expect("no bridge exception from a self-built sliding-window mask on bf16");
+        assert_eq!(bf16_out.shape(), &shape);
+
+        // The window has to actually be honoured, not just not-throw: compare
+        // against the same attention in f32, where the mask dtype already
+        // matched and the path was known good.
+        let mut f32_out = fused_sdpa(&f32_qkv[0], &f32_qkv[1], &f32_qkv[2], &config, None)
+            .expect("f32 reference");
+        f32_out.eval();
+        let got = bf16_out
+            .as_dtype(Dtype::Float32.as_i32())
+            .to_f32_vec(bf16_out.size())
+            .expect("bf16 output readable");
+        let want = f32_out
+            .to_f32_vec(f32_out.size())
+            .expect("f32 output readable");
+        let worst = got
+            .iter()
+            .zip(&want)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        assert!(worst < 0.05, "bf16 windowed attention diverges by {worst}");
+
+        // ...and the window must differ from plain causal, or the comparison
+        // above would pass on an implementation that silently dropped it.
+        let causal = config.with_mask_type(AttentionMaskType::Causal);
+        let mut causal_out =
+            fused_sdpa(&f32_qkv[0], &f32_qkv[1], &f32_qkv[2], &causal, None).expect("causal");
+        causal_out.eval();
+        let causal_values = causal_out
+            .to_f32_vec(causal_out.size())
+            .expect("causal output readable");
+        assert!(
+            want.iter()
+                .zip(&causal_values)
+                .any(|(a, b)| (a - b).abs() > 1e-3),
+            "a {window}-token window over {seq} tokens produced plain causal attention"
+        );
+    }
+
+    /// Backend selection must judge accuracy against the tensor's own scale.
+    ///
+    /// The Metal backends stage Q/K/V through f16, whose smallest normal is
+    /// ~6e-5. A model whose activations sit far below that gets all zeros back,
+    /// and the old absolute `max_diff > 0.1` rule scored those zeros as a
+    /// perfect match — so the zero-returning backend won on speed and was
+    /// cached. Nemotron-H runs at ~1e-17 and lost every attention layer to it,
+    /// which showed up only as a real-weight forward divergence.
+    #[test]
+    fn a_candidate_is_judged_against_the_reference_scale() {
+        // The case that broke: candidate returned all zeros, reference is
+        // ~1e-17. `max_diff` is 1e-17, which clears any absolute 0.1.
+        assert!(
+            !candidate_matches_reference(1e-17, 1e-17),
+            "a candidate that zeroed the whole tensor was accepted"
+        );
+
+        // Unit-scale behaviour is unchanged: the ratio is the same 0.1 the
+        // absolute rule used when the reference happened to be near 1.
+        assert!(candidate_matches_reference(0.05, 1.0));
+        assert!(!candidate_matches_reference(0.15, 1.0));
+
+        // f16 staging costs ~1e-3 relative; that has to keep passing at any
+        // scale, or every model below unit scale loses its fast backends.
+        assert!(candidate_matches_reference(1e-20, 1e-17));
+        assert!(candidate_matches_reference(1e3, 1e6));
+
+        // A genuinely all-zero reference admits only an all-zero candidate.
+        assert!(candidate_matches_reference(0.0, 0.0));
+        assert!(!candidate_matches_reference(1e-30, 0.0));
     }
 
     #[test]

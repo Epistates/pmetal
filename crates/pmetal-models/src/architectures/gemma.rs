@@ -151,6 +151,16 @@ impl GemmaConfig {
             (self.get_head_dim() as f32).sqrt().recip()
         }
     }
+
+    /// Whether any decoder layer uses sliding-window rather than full attention.
+    ///
+    /// Gemma 1 is uniformly causal; Gemma 2 alternates and Gemma 3 makes every
+    /// layer local except one in `sliding_window_pattern`. When layers disagree
+    /// the trunk cannot hand them a single shared mask — see
+    /// [`GemmaModel::forward_with_capture`].
+    pub fn has_local_layers(&self) -> bool {
+        self.sliding_window.is_some() && (self.is_gemma2 || self.is_gemma3)
+    }
 }
 
 impl Default for GemmaConfig {
@@ -914,9 +924,18 @@ impl GemmaModel {
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
         hidden_states = hidden_states.mul_scalar(self.config.embedding_scale());
 
-        // Create causal mask if not provided and not using cache
+        // Create causal mask if not provided and not using cache — but only
+        // when every layer wants the same one.
+        //
+        // Gemma 2 and Gemma 3 interleave sliding-window layers with global
+        // ones, and `GemmaAttention` falls back to `AttentionMaskType::None`
+        // whenever a mask is handed down. So a blanket causal mask silently
+        // un-windows every local layer. That is invisible until the sequence
+        // passes the window, because below it causal and sliding are the same
+        // mask: it cost Gemma 3 nothing up to token 511 and grew to a 731x
+        // divergence by token 637.
         let mask_owned;
-        let mask = if mask.is_none() && cache.is_none() {
+        let mask = if mask.is_none() && cache.is_none() && !self.config.has_local_layers() {
             let seq_len = input_ids.dim(1);
             mask_owned = create_causal_mask(seq_len)?;
             Some(&mask_owned)

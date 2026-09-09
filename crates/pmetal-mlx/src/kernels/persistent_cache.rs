@@ -75,6 +75,23 @@ where
     }
 }
 
+/// Bump whenever the *meaning* of a cached choice changes: a new selection
+/// criterion, a fixed backend, an added or removed candidate.
+///
+/// A cached entry records a conclusion, not the reasoning that produced it, so
+/// entries written by older logic are not merely stale — they are wrong, and
+/// they are sticky: the cache short-circuits benchmarking entirely, so a fix to
+/// the selection rule has no effect on any machine that already ran the old
+/// one. Epoch 2 is the first release whose attention-backend selection judges a
+/// candidate against the reference's own scale instead of an absolute 0.1;
+/// epoch-1 files accepted backends that returned all zeros for models whose
+/// activations sit far below unit scale.
+#[cfg_attr(
+    test,
+    expect(dead_code, reason = "tests never touch the on-disk cache")
+)]
+const CACHE_EPOCH: u32 = 2;
+
 fn default_cache_path(filename: &str) -> Option<PathBuf> {
     #[cfg(test)]
     {
@@ -84,7 +101,11 @@ fn default_cache_path(filename: &str) -> Option<PathBuf> {
 
     #[cfg(not(test))]
     {
-        dirs::cache_dir().map(|dir| dir.join("pmetal").join("mlx-kernels").join(filename))
+        dirs::cache_dir().map(|dir| {
+            dir.join("pmetal")
+                .join(format!("mlx-kernels-v{CACHE_EPOCH}"))
+                .join(filename)
+        })
     }
 }
 
