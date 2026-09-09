@@ -207,19 +207,20 @@ impl MambaRMSNormGated {
 // SSM Computation Functions
 // ============================================================================
 
-/// Compute dt = softplus(dt + dt_bias) clipped to limits.
-fn compute_dt(
-    dt: &Array,
-    dt_bias: &Array,
-    time_step_min: f32,
-    time_step_max: f32,
-) -> Result<Array, Exception> {
+/// Compute `dt = softplus(dt + dt_bias)`, floored at `time_step_min`.
+///
+/// Lower bound only. `config.time_step_max` (0.1 on every released
+/// Nemotron-H) names a *training* initialisation range, not an inference
+/// clamp — `transformers` passes only the floor to `torch.clamp` and has the
+/// ceiling commented out. Applying it here truncated most of the timestep
+/// distribution, which softplus puts well above 0.1.
+fn compute_dt(dt: &Array, dt_bias: &Array, time_step_min: f32) -> Result<Array, Exception> {
     let dt_biased = dt.add(dt_bias);
     let dt_soft = nn::softplus(&dt_biased);
     Ok(pmetal_bridge::compat::ops::clip(
         &dt_soft,
         Some(&Array::from_f32(time_step_min)),
-        Some(&Array::from_f32(time_step_max)),
+        None,
     ))
 }
 
@@ -256,7 +257,7 @@ fn segsum(x: &Array) -> Result<Array, Exception> {
 /// * `dt` - Time deltas [B, 1, H]
 /// * `dt_bias` - Time delta bias [H]
 /// * `state` - Previous SSM state [B, H, D, N]
-/// * `time_step_limit` - (min, max) for dt clipping
+/// * `time_step_min` - lower bound for dt (no upper bound; see `compute_dt`)
 ///
 /// # Returns
 /// (output [B, 1, H, D], new_state [B, H, D, N])
@@ -269,7 +270,7 @@ pub fn ssm_update_single(
     dt: &Array,      // [B, 1, H]
     dt_bias: &Array, // [H]
     state: &Array,   // [B, H, D, N]
-    time_step_limit: (f32, f32),
+    time_step_min: f32,
 ) -> Result<(Array, Array), Exception> {
     let shape = x.shape();
     let batch = shape[0];
@@ -285,7 +286,7 @@ pub fn ssm_update_single(
     // Compute dt with bias and clipping: dt = clip(softplus(dt + dt_bias), min, max)
     // dt: [B, 1, H] -> squeeze to [B, H]
     let dt_squeezed = dt.squeeze_axes(&[1]);
-    let dt_full = compute_dt(&dt_squeezed, dt_bias, time_step_limit.0, time_step_limit.1)?;
+    let dt_full = compute_dt(&dt_squeezed, dt_bias, time_step_min)?;
 
     // Compute A = -exp(A_log): [H]
     let a = pmetal_bridge::compat::ops::negative(&pmetal_bridge::compat::ops::exp(a_log));
@@ -364,7 +365,7 @@ pub fn ssm_update_single(
 /// * `dt` - Time deltas [B, L, H]
 /// * `dt_bias` - Time delta bias [H]
 /// * `state` - Optional previous SSM state [B, H, D, N]
-/// * `time_step_limit` - (min, max) for dt clipping
+/// * `time_step_min` - lower bound for dt (no upper bound; see `compute_dt`)
 ///
 /// # Returns
 /// (output [B, L, H, D], new_state [B, H, D, N])
@@ -377,7 +378,7 @@ pub fn ssm_attention(
     dt: &Array,            // [B, L, H] - time deltas
     dt_bias: &Array,       // [H] - time delta bias
     state: Option<&Array>, // Optional previous state [B, H, D, N]
-    time_step_limit: (f32, f32),
+    time_step_min: f32,
 ) -> Result<(Array, Array), Exception> {
     let shape = x.shape();
     let batch = shape[0];
@@ -392,7 +393,7 @@ pub fn ssm_attention(
     let repeats = num_heads / n_groups;
 
     // Compute dt with bias and clipping: dt = clip(softplus(dt + dt_bias), min, max)
-    let dt_full = compute_dt(dt, dt_bias, time_step_limit.0, time_step_limit.1)?;
+    let dt_full = compute_dt(dt, dt_bias, time_step_min)?;
 
     // Compute A = -exp(A_log) and cast to dt dtype
     let a = pmetal_bridge::compat::ops::negative(&pmetal_bridge::compat::ops::exp(a_log));
@@ -1665,7 +1666,7 @@ impl NemotronHMixer {
                 dt,
                 dt_bias,
                 prev,
-                (self.time_step_min, self.time_step_max),
+                self.time_step_min,
             )?
         } else {
             // Full SSM attention computation
@@ -1678,7 +1679,7 @@ impl NemotronHMixer {
                 dt,
                 dt_bias,
                 prev_state,
-                (self.time_step_min, self.time_step_max),
+                self.time_step_min,
             )?
         };
 
@@ -1735,17 +1736,12 @@ impl NemotronHMixer {
         let k = k.transpose_axes(&[0, 2, 1, 3]);
         let v = v.transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply RoPE
-        let (q, k, v) = if let Some((cache_ref, _)) = cache.as_ref() {
-            let offset = cache_ref.rope_offset();
-            let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-            let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-            (q, k, v)
-        } else {
-            let q = apply_rope(&q, self.head_dim, false, self.rope_theta, 1.0, 0)?;
-            let k = apply_rope(&k, self.head_dim, false, self.rope_theta, 1.0, 0)?;
-            (q, k, v)
-        };
+        // No RoPE. Nemotron-H's attention blocks carry no positional encoding
+        // at all — `NemotronHAttention.forward` projects Q/K/V and goes
+        // straight to the attention interface, because the interleaved Mamba
+        // blocks are what supply position. pmetal used to rotate by
+        // `rope_theta` here, which cost the block most of its agreement with
+        // the reference (cosine 0.56 at the first attention layer).
 
         // Use fused attention kernel
         let attn_config =
