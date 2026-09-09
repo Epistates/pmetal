@@ -22,13 +22,13 @@ cd crates/pmetal-gui
 bun install && bun tauri dev
 ```
 
-10 pages: Dashboard, Models, Datasets, Training, Distillation, GRPO, Inference, Merging, Quantize, and Settings. Download models from HuggingFace, configure LoRA training with live loss metrics, chat with models, merge weights, and quantize — all from the GUI. Training runs in-process with real-time progress updates.
+19 pages: Dashboard, Training, GRPO, Distillation, Pretrain, Inference, DFlash, Models, Datasets, Merging, Quantize, Embed Train, RLKD, Ollama, Serve, Bench, Eval, Jobs, and Settings. Download models from HuggingFace, configure LoRA training with live loss metrics, chat with models, merge weights, and quantize — all from the GUI. Training, inference, distillation and GRPO run in-process with real-time progress updates; the remaining pages drive the `pmetal` CLI as a subprocess, which the app bundles.
 
 ### Terminal TUI
 
 <img src="public/pmetal_tui.png" alt="pmetal screenshot showing TUI" style="width: 100%; max-width: 100%; margin: 20px 0;"/>
 
-A full-featured terminal control center with 9 tabs.
+A full-featured terminal control center with 20 tabs.
 
 ```bash
 pmetal tui
@@ -36,17 +36,28 @@ pmetal tui
 
 | Tab | Description |
 |-----|-------------|
-| **Dashboard** | Live loss curves (braille), LR schedule, throughput sparklines, timing breakdown gauges |
 | **Device** | GPU/ANE info, Metal feature detection, memory gauge, kernel tuning, UltraFusion topology |
 | **Models** | Browse cached models, HuggingFace Hub search (`S`), memory fit estimation, download |
 | **Datasets** | Scan and preview local datasets (JSONL, Parquet, CSV) with line counts |
+| **Tokenize** | Tokenize a text corpus into binary shards for pretraining |
 | **Training** | Configure and launch SFT/LoRA/QLoRA training runs with sectioned parameter forms |
+| **Embed Train** | Train a sentence-embedding (encoder-only) model with contrastive losses |
+| **Pretrain** | Full-parameter pretraining from scratch |
 | **Distillation** | Configure knowledge distillation (online, offline, progressive) |
+| **RLKD** | Reinforcement learning with knowledge distillation |
 | **GRPO** | Configure GRPO/DAPO reasoning training with reward functions and sampling params |
+| **Dashboard** | Live loss curves (braille), LR schedule, throughput sparklines, timing breakdown gauges |
 | **Inference** | Interactive chat interface with markdown rendering and generation settings sidebar |
+| **DFlash** | Block-diffusion speculative decoding |
+| **Serve** | OpenAI-compatible server control |
+| **Quantize** | GGUF and MLX quantization with bit/method selection |
+| **Merge** | SLERP, TIES, DARE and linear model merging |
+| **Bench** | Training and inference benchmarking |
+| **Eval** | Perplexity evaluation against a dataset |
+| **Ollama** | Modelfile generation and Ollama export |
 | **Jobs** | Training run history with log viewer, status tracking, and metadata |
 
-Keybindings: `Tab`/`Shift+Tab` to switch tabs, `Alt+1-9` for direct access, `L` to adjust learning rate mid-run, `q` to quit.
+Keybindings: `Tab`/`Shift+Tab` to cycle tabs, `Alt+1-9` (or `Ctrl+1-9`) to jump to the first nine, `L` to adjust learning rate mid-run, `q` to quit.
 
 ### CLI
 
@@ -112,7 +123,8 @@ pmetal eval \
   --model Qwen/Qwen3-0.6B \
   --dataset eval.jsonl
 
-# Start OpenAI-compatible server (requires --features serve)
+# Start OpenAI-compatible server
+# (in the prebuilt binary and the brew formula; add --features serve if you build it yourself)
 pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 ```
 
@@ -147,7 +159,7 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `bench-ffi` | Benchmark FFI overhead |
 | `bench-workload` | Benchmark real cached inference/training workloads |
 | `bench-corpus` | Structured kernel benchmarking with JSON reporting |
-| `mcp` | Start MCP server (45 tools for Claude Desktop / MCP clients) |
+| `mcp` | Start MCP server (51 tools for Claude Desktop / MCP clients) |
 | `cluster` | Multi-Mac cluster: discover peers, train across machines, run all-reduce / pipeline benchmarks |
 
 ### Multi-Mac Cluster (Thunderbolt-aware)
@@ -191,46 +203,51 @@ What's wired today: gradient all-reduce (multi-machine training, real), fabric-a
 
 ## SDK
 
-PMetal is an embeddable SDK — integrate training, inference, and model operations into your own Rust applications. The `easy` module provides high-level builders, while the underlying crates (`pmetal-trainer`, `pmetal-models`, `pmetal-lora`, etc.) offer full control over every pipeline stage.
+PMetal is an embeddable SDK — integrate training, inference, and model operations into your own Rust applications. `pmetal` re-exports every sub-crate, so one dependency gets you the whole framework.
+
+`orchestrator::run_training` is the one-call training entry point the CLI itself uses:
 
 ```rust
-use pmetal::easy;
+use pmetal::trainer::orchestrator::{TrainingJobConfig, run_training};
 
-// Fine-tune with LoRA
-let result = easy::finetune("Qwen/Qwen3-0.6B", "train.jsonl")
-    .lora(16, 32.0)
-    .learning_rate(2e-4)
-    .epochs(3)
-    .output("./output")
-    .run()
-    .await?;
+let config = TrainingJobConfig {
+    model_id: "Qwen/Qwen3-0.6B".to_string(),
+    dataset: "train.jsonl".to_string(),
+    output_dir: "./output".to_string(),
+    ..Default::default()
+};
 
-// DPO preference optimization
-let result = easy::dpo("Qwen/Qwen3-0.6B", "preferences.jsonl")
-    .dpo_beta(0.1)
-    .reference_model("Qwen/Qwen3-0.6B")
-    .run()
-    .await?;
-
-// Inference
-let output = easy::infer("Qwen/Qwen3-0.6B")
-    .temperature(0.7)
-    .lora("./output/lora_weights.safetensors")
-    .generate("What is 2+2?")
-    .await?;
-
-// Streaming inference
-easy::infer("Qwen/Qwen3-0.6B")
-    .generate_streaming("Tell me a story", |delta| {
-        print!("{delta}");
-        true // return false to stop early
-    })
-    .await?;
+let result = run_training(config, None, Vec::new()).await?;
+println!("final loss {:.4} over {} steps", result.final_loss, result.total_steps);
 ```
 
-Available builders: `easy::finetune()`, `easy::dpo()`, `easy::simpo()`, `easy::orpo()`, `easy::kto()`, `easy::infer()`.
+Inference goes through the model dispatcher:
 
-For lower-level control, use the crates directly — `pmetal-trainer::TrainingLoop`, `pmetal-models::DynamicModel`, `pmetal-lora::DynamicLoraModel`, `pmetal-distill::Distiller`, etc. See the [`examples/`](crates/pmetal/examples/) directory for complete working examples including manual training loop orchestration and ANE-specific workflows.
+```rust
+use pmetal::models::generate;
+use pmetal::prelude::*;
+
+let model_dir = pmetal::hub::resolve_model_path("Qwen/Qwen3-0.6B", None, None).await?;
+let mut model = DynamicModel::load(&model_dir)?;
+let tokenizer = Tokenizer::from_model_dir(&model_dir)?;
+
+let input_ids = tokenizer.encode_with_special_tokens("What is 2+2?")?;
+let output = generate(
+    |input| model.forward(input, None),
+    &input_ids,
+    GenerationConfig::sampling(256, 0.7),
+)?;
+println!("{}", tokenizer.decode(&output.token_ids[input_ids.len()..])?);
+```
+
+Preference optimization (`DpoTrainer`, `SimpoTrainer`, `OrpoTrainer`, `KtoTrainer`) and TAID
+distillation are library-only for now — there is no CLI subcommand for them yet.
+
+For step-by-step control, use the crates directly: `pmetal_trainer::TrainingLoop`,
+`pmetal_models::DynamicModel`, `pmetal_lora::DynamicLoraModel`, `pmetal_distill::Distiller`. Every
+code block in each crate's README is compiled as a doctest, so they stay honest. See
+[`examples/`](crates/pmetal/examples/) for complete working programs, including manual training-loop
+orchestration and ANE-specific workflows.
 
 ## Python SDK
 
@@ -326,10 +343,11 @@ PMetal automatically detects Apple Silicon capabilities at startup and tunes ker
 
 PMetal is organized as a Rust workspace with 20 specialized crates:
 
-```
+```text
 pmetal/
 ├── pmetal-bridge       # Zero-allocation MLX C++ bridge (inline array FFI)
 ├── pmetal-core         # Foundation: configs, traits, types, error handling
+├── pmetal-core-derive  # Derive macros for the core traits
 ├── pmetal-metal        # Custom Metal GPU kernels + ANE runtime
 ├── pmetal-mlx          # MLX backend integration (KV cache, RoPE, etc.)
 ├── pmetal-models       # LLM architectures (Llama, Qwen, DeepSeek, etc.)
@@ -346,11 +364,11 @@ pmetal/
 ├── pmetal-serve        # OpenAI-compatible inference server
 ├── pmetal-mcp          # MCP server (51 tools for Claude Desktop)
 ├── pmetal-py           # Python bindings (maturin/PyO3)
-├── pmetal-cli          # Command-line interface + TUI control center
+├── pmetal              # Umbrella crate: CLI binary + TUI control center
 └── pmetal-gui          # Desktop GUI (Tauri + Svelte + TailwindCSS)
 ```
 
-The `pmetal` facade crate re-exports all modules with feature flags and provides the `easy` API for quick-start usage.
+The `pmetal` crate is both the umbrella library — it re-exports every sub-crate behind a feature flag — and the binary that ships the CLI and TUI.
 
 ## Supported Models
 
@@ -451,25 +469,26 @@ All training methods support callback-based cancellation (`should_stop()`), metr
 
 | Method | CLI | GUI | TUI | Library |
 |--------|-----|-----|-----|---------|
-| SFT (Supervised Fine-Tuning) | `train` | Yes | Yes | `easy::finetune()` |
-| LoRA | `train` | Yes | Yes | `easy::finetune()` |
-| QLoRA (4-bit) | `train --quantization nf4` | Yes | Yes | `easy::finetune()` |
-| DoRA | `train --dora` | Yes | Yes | `easy::finetune()` |
-| DPO (Direct Preference) | — | — | — | `easy::dpo()` |
-| SimPO (Simple Preference) | — | — | — | `easy::simpo()` |
-| ORPO (Odds-Ratio Preference) | — | — | — | `easy::orpo()` |
-| KTO (Kahneman-Tversky) | — | — | — | `easy::kto()` |
+| SFT (Supervised Fine-Tuning) | `train` | Yes | Yes | `orchestrator::run_training()` |
+| LoRA | `train` | Yes | Yes | `orchestrator::run_training()` |
+| QLoRA (4-bit) | `train --quantization nf4` | Yes | Yes | `orchestrator::run_training()` |
+| DoRA | `train --dora` | Yes | Yes | `orchestrator::run_training()` |
+| DPO (Direct Preference) | — | — | — | `DpoTrainer` |
+| SimPO (Simple Preference) | — | — | — | `SimpoTrainer` |
+| ORPO (Odds-Ratio Preference) | — | — | — | `OrpoTrainer` |
+| KTO (Kahneman-Tversky) | — | — | — | `KtoTrainer` |
 | GRPO (Reasoning) | `grpo` | Yes | Yes | `GrpoTrainer` |
 | DAPO (Decoupled GRPO) | `grpo --dapo` | Yes | Yes | `GrpoTrainer` DAPO mode |
 | Knowledge Distillation | `distill` | Yes | Yes | `Distiller` |
 | TAID (Temporally Adaptive) | — | — | — | `TaidDistiller` |
 | ANE Training | `train` (auto) | — | Yes | `AneTrainingLoop` |
-| RLKD (RL + Distillation) | `rlkd` | — | — | `RlkdTrainer` |
-| Embedding Training | `embed-train` | — | — | `EmbeddingTrainer` |
+| RLKD (RL + Distillation) | `rlkd` | Yes | Yes | `RlkdTrainer` |
+| Embedding Training | `embed-train` | Yes | Yes | `EmbeddingTrainer` |
+| Block-Diffusion (DiffusionGemma) | `train-diffusion` | — | — | `DiffusionTrainingLoop` |
 | Gemma/Qwen MTP Predictor Training | `train-mtp` | — | — | `pmetal_trainer::mtp_training` |
 | DFlash Draft Training | `train-draft` | — | — | `pmetal_trainer::mtp_training` |
 
-Additional methods available via the library only: GSPO (`GspoTrainer`), PPO (`PpoTrainer`), Online DPO (`OnlineDpoTrainer`), Diffusion Training (`DiffusionTrainer`).
+Additional methods available via the library only: GSPO (`GspoTrainer`), PPO (`PpoTrainer`), Online DPO (`OnlineDpoTrainer`).
 
 ## Key Features
 
@@ -659,29 +678,34 @@ Multiple distillation methods and loss functions:
 
 ### Feature Flags
 
+Defaults are `cli`, `dashboard`, `trainer`, `lora`, `merge`, `ane` and `distributed`; the rest are pulled in transitively.
+
 | Feature | Default | Crate | Description |
 |---------|---------|-------|-------------|
-| `core` | Yes | `pmetal-core` | Foundation types, configs, traits |
-| `gguf` | Yes | `pmetal-gguf` | GGUF format support |
-| `metal` | Yes | `pmetal-metal` | Metal GPU kernels |
-| `hub` | Yes | `pmetal-hub` | HuggingFace Hub integration |
-| `mlx` | Yes | `pmetal-mlx` | MLX backend |
-| `models` | Yes | `pmetal-models` | LLM architectures |
+| `cli` | Yes | — | The `pmetal` binary and its CLI-only dependencies |
+| `core` | Yes* | `pmetal-core` | Foundation types, configs, traits |
+| `gguf` | Yes* | `pmetal-gguf` | GGUF format support |
+| `metal` | Yes* | `pmetal-metal` | Metal GPU kernels |
+| `hub` | Yes* | `pmetal-hub` | HuggingFace Hub integration |
+| `mlx` | Yes* | `pmetal-mlx` | MLX backend |
+| `models` | Yes* | `pmetal-models` | LLM architectures |
 | `lora` | Yes | `pmetal-lora` | LoRA/QLoRA |
 | `trainer` | Yes | `pmetal-trainer` | Training loops (pulls in `data`, `distill`) |
-| `easy` | Yes | — | High-level builders (pulls in `trainer`, `hub`, `data`) |
+| `data` | Yes* | `pmetal-data` | Dataset loading (*via `cli` and `trainer`) |
+| `distill` | Yes* | `pmetal-distill` | Knowledge distillation (*via `trainer`) |
+| `merge` | Yes | `pmetal-merge` | Model merging strategies |
+| `distributed` | Yes | `pmetal-distributed` | Distributed training and the `cluster` subcommand |
 | `ane` | Yes | — | Apple Neural Engine |
-| `data` | Yes* | `pmetal-data` | Dataset loading (*default via `easy`) |
-| `distill` | Yes* | `pmetal-distill` | Knowledge distillation (*default via `trainer`) |
+| `dashboard` | Yes | — | TUI control center |
+| `native-only` | No | `pmetal-bridge` | Bridge-only build with no mlx-rs/mlx-sys |
 | `lora-metal-fused` | No | — | ~2x LoRA training speedup via fused Metal kernels |
-| `merge` | No | `pmetal-merge` | Model merging strategies |
 | `vocoder` | No | `pmetal-vocoder` | BigVGAN neural vocoder |
-| `distributed` | No | `pmetal-distributed` | Distributed training |
 | `mhc` | No | `pmetal-mhc` | Manifold-Constrained Hyper-Connections |
 | `serve` | No | `pmetal-serve` | OpenAI-compatible inference server |
 | `mcp` | No | `pmetal-mcp` | MCP server (51 tools for Claude Desktop) |
-| `dashboard` | Yes | — | TUI control center |
-| `full` | No | — | All features |
+| `full` | No | — | All sub-crate features (not `cli`, `serve` or `mcp`) |
+
+`serve` and `mcp` stay out of the default set so library consumers don't inherit axum and rmcp. The **prebuilt binary and the Homebrew formula both build with `--features serve,mcp`**, so `pmetal serve` and `pmetal mcp` are there if you installed either way. Building yourself, add the flag: `cargo install pmetal --features serve,mcp`.
 
 ## Development
 

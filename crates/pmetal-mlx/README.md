@@ -18,14 +18,18 @@ This crate provides the bridge between PMetal and Apple's MLX framework, along w
 
 ## Usage
 
-```rust
+```rust,no_run
 use pmetal_mlx::prelude::*;
 
-// Create a KV cache for inference
-let cache = KVCache::new(num_layers, batch_size, max_seq_len, head_dim);
+fn setup(sequences: &[(&Array, &Array)]) -> std::result::Result<(), Exception> {
+    // KV cache for inference: (layers, max_seq_len, kv_heads, head_dim)
+    let _cache = KVCache::new(KVCacheConfig::new(28, 4096, 8, 128));
 
-// Use sequence packing for training
-let packed = SequencePacker::pack(&sequences, max_length)?;
+    // Sequence packing for training
+    let packer = SequencePacker::new(PackingConfig::new(2048));
+    let _packed = packer.pack_sequences(sequences)?;
+    Ok(())
+}
 ```
 
 ## Modules

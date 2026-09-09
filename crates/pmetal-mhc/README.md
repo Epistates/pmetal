@@ -8,7 +8,7 @@ This crate implements Manifold-Constrained Hyper-Connections from [DeepSeek-AI](
 
 ## Architecture
 
-```
+```text
 Input [batch, n, C]
     │
     ▼
@@ -49,38 +49,45 @@ Output [batch, n, C]
 
 ## Usage
 
-```rust
-use pmetal_mhc::{MhcConfig, MhcPreset, MhcLayer};
-use ndarray::Array3;
+```rust,no_run
+use ndarray::{Array2, Array3};
+use pmetal_mhc::{MhcConfig, MhcLayer, MhcPreset};
 
-// Create configuration from preset
-let config = MhcConfig::from_preset(MhcPreset::Medium);
+fn step(
+    attention_fn: impl Fn(&Array2<f32>) -> Array2<f32>,
+    grad_output: &Array3<f32>,
+) {
+    let config = MhcConfig::from_preset(MhcPreset::Medium);
+    let layer = MhcLayer::new(config);
 
-// Initialize layer
-let layer = MhcLayer::new(config);
+    // Forward
+    let x: Array3<f32> = Array3::zeros((2, 4, 512));
+    let (h_in, mappings) = layer.pre_layer(&x);
+    let h_out = attention_fn(&h_in);
+    let _output = layer.post_res_layer(&x, &h_out, &mappings);
 
-// Forward pass
-let x = Array3::zeros((batch, n, hidden_dim));
-let (h_in, mappings) = layer.pre_layer(&x);
-let h_out = attention_fn(&h_in);
-let output = layer.post_res_layer(&x, &h_out, &mappings);
+    // Backward
+    let (_grad_x, _grad_h_in) = layer.backward(&x, &h_out, &mappings, grad_output, None);
 
-// Backward pass
-let (grad_x, grad_h_in) = layer.backward(
-    &x, &h_out, &mappings, &grad_output, None
-);
-
-// Update parameters
-layer.apply_gradients_sgd(learning_rate);
+    layer.apply_gradients_sgd(1e-3);
+}
 ```
 
 ### Transformer Block
 
-```rust
-use pmetal_mhc::MhcTransformerBlock;
+```rust,no_run
+use ndarray::{Array2, Array3};
+use pmetal_mhc::{MhcConfig, MhcPreset, MhcTransformerBlock};
 
-let block = MhcTransformerBlock::new(config, attn_fn, ffn_fn, layer_idx);
-let output = block.forward(&x);
+fn block(
+    attn_fn: impl Fn(&Array2<f32>) -> Array2<f32>,
+    ffn_fn: impl Fn(&Array2<f32>) -> Array2<f32>,
+    x: &Array3<f32>,
+) -> Array3<f32> {
+    let config = MhcConfig::from_preset(MhcPreset::Medium);
+    let block = MhcTransformerBlock::new(config, attn_fn, ffn_fn, 0);
+    block.forward(x)
+}
 ```
 
 ## Presets

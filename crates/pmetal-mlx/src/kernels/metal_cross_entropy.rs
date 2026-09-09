@@ -57,8 +57,7 @@ use super::cut_cross_entropy::{CutCrossEntropy, CutCrossEntropyConfig};
 use super::persistent_cache::PersistentChoiceCache;
 use crate::error::MlxError;
 
-/// Result type for metal cross-entropy operations.
-pub type Result<T> = std::result::Result<T, MlxError>;
+use super::utils::Result;
 
 const DEFAULT_METAL_CROSS_ENTROPY_CHUNK_SIZE: usize = 4096;
 

@@ -58,15 +58,17 @@ pmetal infer \
 Integrate PMetal into your own Rust applications:
 
 ```rust
-use pmetal::easy;
+use pmetal::trainer::orchestrator::{TrainingJobConfig, run_training};
 
-let result = easy::finetune("Qwen/Qwen3-0.6B", "train.jsonl")
-    .lora(16, 32.0)
-    .learning_rate(2e-4)
-    .epochs(3)
-    .output("./output")
-    .run()
-    .await?;
+let config = TrainingJobConfig {
+    model_id: "Qwen/Qwen3-0.6B".to_string(),
+    dataset: "train.jsonl".to_string(),
+    output_dir: "./output".to_string(),
+    ..Default::default()
+};
+
+let result = run_training(config, None, Vec::new()).await?;
+println!("final loss {:.4}", result.final_loss);
 ```
 
 Or from Python:
@@ -86,7 +88,7 @@ result = pmetal.finetune(
 ## Explore Further
 
 - **[CLI Reference](/cli/train/)** — Command reference
-- **[Rust SDK](/sdk/easy-api/)** — Builder API reference
+- **[Rust SDK](/sdk/advanced/)** — Crate-level API reference
 - **[Python SDK](/python/quick-start/)** — PyO3 bindings
 - **[Training Methods](/training/overview/)** — SFT, DPO, GRPO, distillation, and more
 - **[Supported Models](/models/supported/)** — All supported architectures

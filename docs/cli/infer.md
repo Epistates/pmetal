@@ -162,5 +162,5 @@ Supported for Qwen, Llama 3.1+, Mistral v3+, and DeepSeek models.
 ## See Also
 
 - [pmetal serve](/cli/serve/) — OpenAI-compatible inference server
-- [Rust SDK](/sdk/easy-api/) — Programmatic inference
+- [Rust SDK](/sdk/advanced/) — Programmatic inference
 - [Python SDK](/python/quick-start/) — Python inference

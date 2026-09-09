@@ -37,13 +37,14 @@ This crate provides knowledge distillation utilities for training smaller studen
 `TaidDistiller`, `LogitCache`, and `LogitCompressor` for use inside a higher-level
 training loop.
 
-```rust
-use pmetal_distill::{DistillConfig, Distiller};
+```rust,no_run
+use pmetal_distill::{DistillConfig, Distiller, Result};
 
-let config = DistillConfig::from_yaml_file("distill_config.yaml")?;
-let distiller = Distiller::new(config)?;
-
-// Call `distiller.compute_loss(...)` inside your training loop.
+fn build() -> Result<Distiller> {
+    let config = DistillConfig::from_yaml_file("distill_config.yaml")?;
+    // Call `distiller.compute_loss(..)` inside your training loop.
+    Distiller::new(config)
+}
 ```
 
 For end-to-end model training, use the `pmetal distill` CLI or

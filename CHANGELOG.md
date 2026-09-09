@@ -7,6 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+#### New architectures
+
+- **DiffusionGemma (block-diffusion) port**: text trunk config, MoE blocks, 7-norm layer and encoder; decoder with bidirectional canvas and self-conditioning; discrete-diffusion generation engine and sampler; dispatcher plus full tied-weight loader
+  - Vision tower and multimodal encoder, with a bit-exact image processor
+  - LoRA and QLoRA training: trainable forward, block-diffusion loss, bake-in LoRA on the attention trunk, autograd/AdamW/checkpoint loop
+  - **`pmetal train-diffusion`** CLI subcommand, with `--qlora` for quantized attention projections and MoE experts
+- **Mllama (Llama 3.2 Vision)**: real port replacing the previous skeleton, tiled image processor, weight loader and dispatcher wiring
+- **Gemma 4 MoE**: parallel dense-plus-experts block in `Gemma4ForCausalLM`, vision tower, image processor, encoder-KV attention path
+- **MTP speculative decoding workflows** for Qwen3Next/Qwen3.6 assistants
+
+#### GGUF
+
+- Generic **GGUF → `DynamicModel` inference loader** for the dense Llama family
+- **Tokenizer reconstruction from GGUF metadata**, so a GGUF file alone is enough for CLI inference
+- Authoritative **Gemma 4 GGUF tensor-name map** and architecture detection
+
+#### Parity infrastructure
+
+- **Real-released-config sweep** (`real_config_parity`): every architecture is constructed from its shipped `config.json`
+- **Real-weight sweep** (`real_weight_parity`): 12 architectures run against real released checkpoints and are held to a *measured* bf16 noise floor, with a per-position profile alongside the aggregate. Also checks that no parameter is left at random init and that no checkpoint tensor goes unclaimed
+- **Pillow-exact image resampler**: preprocessing now matches PIL bit-for-bit
+- Shared `ACT2FN` activation resolver and an exact (erf) GELU in the bridge
+
+### Fixed
+
+#### Attention (cross-cutting)
+
+- **Sliding-window masks were built in f32**, which MLX rejects against a bf16 output dtype. The op threw and returned a 0-dim array that broadcast silently, so **no windowed layer of any architecture ever ran its window**
+- **Trunk-level blanket causal masks** in Gemma and Mistral dropped every layer to an unwindowed mask. The trunk now builds one only when every layer wants the same mask
+- **Attention backend selection compared candidates on an absolute difference.** Metal backends stage through f16, so on a model running at ~1e-17 the f16 path returned all zeros, scored as a perfect match and won on speed. Selection is now relative to the reference magnitude, and the persistent kernel cache carries an epoch so a stale recorded choice cannot short-circuit the fix
+- Attention masks are coerced to the query dtype
+
+#### Per-architecture correctness
+
+- **Llama 3.x**: `rope_scaling` had no `"llama3"` arm, so the whole family ran unscaled. Banded scaling now applies in inference, LoRA and QLoRA alike
+- **Phi**: LongRoPE picks the short or long factor table by sequence length instead of always using `long_factor`; Phi-3 SuRoPE applies per-dimension frequencies and no longer double-scales `mscale`; the fused `qkv_proj` is mapped; `partial_rotary_factor` defaults to 1.0 as transformers reads it; Phi-4-mini reuses the embedding for its tied head
+- **Gemma**: Gemma 3 loads `q_norm`/`k_norm`, honors `rope_local_base_freq`, rounds the embedding scale in bf16 and upcasts RMSNorm; Gemma 2 dispatch and final-logit softcapping; correct GELU variant in the LoRA path
+- **DeepSeek**: the entire MoE was unmapped (three name mismatches, 5291 tensors silently dropped and every expert left at random init); the router follows the `scoring_func` the config names; MLA uses traditional interleaved RoPE with YARN per-dimension frequencies and embedding mscale; V3 group-limited expert routing
+- **GPT-OSS**: clamped SwiGLU, router top-k softmax, attention sinks, YARN RoPE, biased router, and a gradient trace cut at the router's top-k indices
+- **Granite**: the attention field was named so the checkpoint's 160 tensors never loaded (it trained fine and inferred noise); the four scalar multipliers Granite is defined by now apply
+- **Llama 4**: iRoPE parity (traditional RoPE, post-RoPE QK-norm, NoPE map) and a sigmoid MoE gate on expert input
+- **Cohere**: `logit_scale`, tied head, traditional RoPE
+- **Qwen2**: `head_dim` is derived rather than assumed to be 128 (Qwen2.5-0.5B ships `"head_dim": null`)
+- **Nemotron-H**: `dt` is no longer clamped to `time_step_max` (a training-init range, not an inference clamp) and attention no longer applies RoPE, which Nemotron-H does not use; the loader tolerates the bare `Infinity` its `config.json` contains
+- **GELU variants** across BERT, Whisper, Phi, T5, CLIP, Flux and Gemma now follow the variant each reference config names
+
+#### Other
+
+- Bridge error-slot invariant preserved in the GDN Metal fast paths
+- Metal MoE routing guarded against expert-count overflow
+- Attention KV cache is built for hybrid LoRA inference
+- Python bindings hardened
+- Offline and sandboxed builds honor `FETCHCONTENT` environment overrides (#17)
+
+### Changed
+
+#### Shipped artifacts and the desktop app
+
+- **The release binary and the Homebrew formula now build with `--features serve,mcp`.** The default feature set stays lean so library consumers don't inherit axum and rmcp, but no distributed binary previously had `pmetal serve` or `pmetal mcp` — while the TUI ships a Serve tab and the GUI a Serve page that both spawn `pmetal serve`
+- **The GUI bundle now carries the `pmetal` CLI as a Tauri sidecar.** Eleven GUI pages drive the CLI as a subprocess, and an app launched from Finder inherits launchd's `PATH`, which contains neither `/opt/homebrew/bin` nor `~/.cargo/bin`. The GUI additionally probes those directories by absolute path, with a `PMETAL_CLI` override
+- **The GUI bundle now ships an `mlx.metallib` and points `PMETAL_METALLIB_PATH` at it during startup.** MLX loads no kernels without one, and the only thing that had ever populated `~/.cache/pmetal/lib` was building PMetal from source on the same machine
+
+#### Documentation
+
+- **Every code block in every crate README is compiled as a doctest** (`#[cfg(doctest)] #[doc = include_str!("../README.md")]`), so the crates.io front pages cannot drift from the API again. All 33 blocks were corrected in the process: wrong constructor arity, methods that never existed, and one block that was not valid Rust
+- **Removed the `easy` API documentation.** `pmetal::easy` was deleted in 2026-03 (`789d1aa`) but remained the entire Quick Start on crates.io and docs.rs, all of `docs/sdk/easy-api.md`, and the "Rust SDK" link from three other pages. Replaced with `orchestrator::run_training`, which is what the removal commit pointed at and what the CLI itself uses
+- Corrected the feature-flag tables in the README, the crate README and `docs/configuration/feature-flags.md`: they listed a non-existent `easy` feature and marked `merge` and `distributed` as non-default when both are in `default`
+- Corrected the TUI tab table (9 listed, 20 real) and the GUI page list (10 listed, 19 real)
+- The training-method matrix no longer claims `easy::dpo()` and friends; DPO, SimPO, ORPO and KTO are named for what they are, library-only
+
+#### Library
+
+- **`pmetal_mlx::prelude::*` no longer makes the name `Result` unusable.** Six `Result` aliases in `kernels/` were glob-exported into the prelude; four were byte-identical duplicates of `kernels::utils::Result` and now reference it, and the two `Exception`-based ones no longer leak into the glob. `pmetal_mlx::kernels::{metal_cross_entropy,metal_swiglu,training_attention,rms_norm,metal_norm_lora}::Result` are no longer nameable
+- **`just preflight`'s lockfile gate could never pass.** It ran `cargo update --locked`, which fails as soon as any transitive dependency publishes a new version; it now runs `cargo metadata --locked`, which fails only when `Cargo.lock` would actually have to change
+- `just fmt` and `just fmt-check` now cover `pmetal-gui/src-tauri`, which is excluded from the workspace and had therefore never been formatted
+- **Parity oracles migrated from mlx-lm to transformers** across every architecture, with shared fixture helpers and `pmetal_mlx::test_utils`
+- `MllamaImageProcessor` renamed to `FixedSizeImageProcessor`, reflecting what it actually does
+- Gemma 4 caches pre-transposed expert weights
+- Clean under Rust 1.98 clippy (`chunks_exact` → `as_chunks`, `for_kv_map`, `drain_collect`, `needless_late_init`)
+
 ## [0.5.0] - 2026-05-07
 
 ### Added

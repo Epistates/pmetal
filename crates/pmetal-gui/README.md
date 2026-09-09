@@ -46,7 +46,7 @@ bun tauri build
 
 ## Architecture
 
-```
+```text
 pmetal-gui/
 ├── src/                    # Svelte frontend
 │   ├── routes/             # SvelteKit pages (10 pages)

@@ -4,7 +4,8 @@ Detailed guide to each training method — SFT, LoRA, DPO, SimPO, ORPO, KTO, GRP
 
 ## Supervised Fine-Tuning (SFT)
 
-Standard fine-tuning on instruction/response pairs. Used via `pmetal train` or `easy::finetune()`.
+Standard fine-tuning on instruction/response pairs. Used via `pmetal train`, or from Rust via
+`pmetal_trainer::orchestrator::run_training()`.
 
 ### LoRA
 Low-Rank Adaptation — trains small adapter matrices instead of full weights. Parameters:
@@ -26,12 +27,17 @@ pmetal train --model Qwen/Qwen3-0.6B --dataset train.jsonl --dora
 ## Preference Optimization
 
 ### DPO (Direct Preference Optimization)
-Trains on preference pairs (chosen/rejected) without a reward model.
+Trains on preference pairs (chosen/rejected) without a reward model. Library-only for now: there is
+no `pmetal` subcommand for it.
+
 ```rust
-easy::dpo("model", "preferences.jsonl")
-    .dpo_beta(0.1)
-    .reference_model("model")
-    .run().await?;
+use pmetal_core::TrainingConfig;
+use pmetal_trainer::{DpoConfig, DpoTrainer};
+
+let trainer = DpoTrainer::new(
+    DpoConfig { beta: 0.1, ..Default::default() },
+    TrainingConfig::default(),
+)?;
 ```
 
 ### SimPO (Simple Preference Optimization)

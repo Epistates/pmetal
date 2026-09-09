@@ -20,3 +20,10 @@ pub use fit::*;
 pub use resolve::*;
 pub use search::*;
 pub use upload::*;
+
+/// Compiles the code blocks in `README.md` as doctests, so the crate's front
+/// page cannot drift away from its API. `cfg(doctest)` keeps the item out of
+/// the rendered docs and out of every normal build.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

@@ -54,4 +54,4 @@ text = pmetal.infer(
 ## See Also
 
 - [Full Control](/python/full-control/) — Custom training loops and model loading
-- [Rust SDK](/sdk/easy-api/) — Rust equivalent API
+- [Rust SDK](/sdk/advanced/) — Rust equivalent API

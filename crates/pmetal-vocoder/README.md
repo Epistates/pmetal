@@ -10,7 +10,7 @@ This crate provides a Rust implementation of BigVGAN, a high-fidelity neural voc
 
 BigVGAN uses an anti-aliased multi-periodicity architecture:
 
-```
+```text
 Mel Spectrogram → Conv1d → [AMP Blocks × N] → Conv1d → Audio Waveform
                               ↓
                      Snake Activations
@@ -45,17 +45,16 @@ Mel Spectrogram → Conv1d → [AMP Blocks × N] → Conv1d → Audio Waveform
 
 ## Usage
 
-```rust
-use pmetal_vocoder::{BigVGAN, BigVGANConfig};
+```rust,no_run
+use pmetal_bridge::compat::Array;
+use pmetal_vocoder::{BigVGAN, BigVGANConfig, Result};
 
-// Load vocoder
-let config = BigVGANConfig::default();
-let vocoder = BigVGAN::new(config)?;
-
-// Convert mel spectrogram to audio
-let mel = /* mel spectrogram [batch, mel_bins, frames] */;
-let audio = vocoder.forward(&mel)?;
-// audio: [batch, 1, samples]
+/// `mel` is `[batch, mel_bins, frames]`; the result is `[batch, 1, samples]`.
+fn vocode(mel: &Array) -> Result<Array> {
+    let config = BigVGANConfig::v2_24khz_100band();
+    let vocoder = BigVGAN::new(config)?;
+    vocoder.forward(mel)
+}
 ```
 
 ## Configuration

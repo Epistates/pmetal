@@ -17,44 +17,52 @@ This crate provides seamless integration with the HuggingFace Hub, enabling mode
 
 ### Download a Model
 
-```rust
-use pmetal_hub::Hub;
+The API is free functions, not a client object. `download_model` checks the cache first, so calling
+it again on a downloaded model does no network I/O.
 
-let hub = Hub::new()?;
+```rust,no_run
+use pmetal_hub::download_model;
 
-// Download model to cache
-let model_path = hub.download("meta-llama/Llama-3.2-1B")?;
-
-// Use cached path
-println!("Model at: {}", model_path.display());
+async fn fetch() -> Result<(), Box<dyn std::error::Error>> {
+    let model_path = download_model("meta-llama/Llama-3.2-1B", None, None).await?;
+    println!("Model at: {}", model_path.display());
+    Ok(())
+}
 ```
 
 ### With Authentication
 
-```rust
-use pmetal_hub::Hub;
+Pass a token to reach private or gated repos. `SecretString` keeps it out of `Debug` output.
 
-// Use HF_TOKEN environment variable or provide explicitly
-let hub = Hub::with_token(std::env::var("HF_TOKEN")?)?;
+```rust,no_run
+use pmetal_core::SecretString;
+use pmetal_hub::download_model;
 
-// Access private/gated models
-let model_path = hub.download("meta-llama/Llama-3.2-1B")?;
+async fn fetch_gated() -> Result<(), Box<dyn std::error::Error>> {
+    let token = SecretString::new(std::env::var("HF_TOKEN")?);
+    let model_path = download_model("meta-llama/Llama-3.2-1B", None, Some(&token)).await?;
+    println!("Model at: {}", model_path.display());
+    Ok(())
+}
 ```
 
 ### Cache Management
 
-```rust
-use pmetal_hub::Cache;
+```rust,no_run
+use pmetal_hub::{cache_dir, cache_size, clear_cache, evict_model, find_cached_model};
 
-let cache = Cache::default();
+fn manage() -> Result<(), Box<dyn std::error::Error>> {
+    println!("cache at {}", cache_dir().display());
+    println!("{} bytes on disk", cache_size()?);
 
-// Check if model is cached
-if cache.contains("meta-llama/Llama-3.2-1B")? {
-    let path = cache.get("meta-llama/Llama-3.2-1B")?;
+    if let Some(path) = find_cached_model("meta-llama/Llama-3.2-1B") {
+        println!("already downloaded to {}", path.display());
+    }
+
+    evict_model("meta-llama/Llama-3.2-1B")?; // one model
+    clear_cache()?; // everything
+    Ok(())
 }
-
-// Clear cache
-cache.clear()?;
 ```
 
 ## Environment Variables

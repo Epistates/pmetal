@@ -18,20 +18,18 @@ This crate provides the foundational types, traits, and configurations used thro
 ```rust
 use pmetal_core::prelude::*;
 
-// Configure LoRA training
 let lora_config = LoraConfig {
     r: 16,
     alpha: 16.0,
     dropout: 0.0,
-    target_modules: vec!["q_proj", "v_proj"],
+    target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
     ..Default::default()
 };
 
-// Configure training
 let training_config = TrainingConfig {
     batch_size: 4,
     learning_rate: 2e-4,
-    epochs: 1,
+    num_epochs: 1,
     ..Default::default()
 };
 ```

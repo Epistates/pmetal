@@ -8,14 +8,14 @@ PMetal supports 12+ training methods across CLI, GUI, TUI, and the Rust/Python S
 
 | Method | CLI | GUI | TUI | Library |
 |--------|-----|-----|-----|---------|
-| SFT (Supervised Fine-Tuning) | `train` | Yes | Yes | `easy::finetune()` |
-| LoRA | `train` | Yes | Yes | `easy::finetune()` |
-| QLoRA (4-bit) | `train --quantization nf4` | Yes | Yes | `easy::finetune()` |
-| DoRA | `train --dora` | Yes | Yes | `easy::finetune()` |
-| DPO (Direct Preference) | — | — | — | `easy::dpo()` |
-| SimPO | — | — | — | `easy::simpo()` |
-| ORPO | — | — | — | `easy::orpo()` |
-| KTO | — | — | — | `easy::kto()` |
+| SFT (Supervised Fine-Tuning) | `train` | Yes | Yes | `orchestrator::run_training()` |
+| LoRA | `train` | Yes | Yes | `orchestrator::run_training()` |
+| QLoRA (4-bit) | `train --quantization nf4` | Yes | Yes | `orchestrator::run_training()` |
+| DoRA | `train --dora` | Yes | Yes | `orchestrator::run_training()` |
+| DPO (Direct Preference) | — | — | — | `DpoTrainer` |
+| SimPO | — | — | — | `SimpoTrainer` |
+| ORPO | — | — | — | `OrpoTrainer` |
+| KTO | — | — | — | `KtoTrainer` |
 | GRPO (Reasoning) | `grpo` | Yes | Yes | `GrpoTrainer` |
 | DAPO (Decoupled GRPO) | `grpo --dapo` | Yes | Yes | `GrpoTrainer` DAPO mode |
 | Knowledge Distillation | `distill` | Yes | Yes | `Distiller` |

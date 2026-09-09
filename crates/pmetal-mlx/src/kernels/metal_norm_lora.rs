@@ -39,7 +39,7 @@ use pmetal_bridge::compat::{Array, Dtype, ops, random};
 
 use pmetal_bridge::compat::Exception;
 /// Result type for fused norm+LoRA operations.
-pub type Result<T> = std::result::Result<T, Exception>;
+type Result<T> = std::result::Result<T, Exception>;
 
 /// Configuration for fused RMSNorm + LoRA.
 #[derive(Debug, Clone)]

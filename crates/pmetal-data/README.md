@@ -27,43 +27,78 @@ This crate provides data loading, preprocessing, and batching utilities optimize
 
 ### Basic Dataset Loading
 
-```rust
-use pmetal_data::{Dataset, DataLoader};
+```rust,no_run
+use pmetal_data::{DataLoader, DataLoaderConfig, DatasetFormat, Tokenizer, TrainingDataset};
 
-// Load dataset
-let dataset = Dataset::from_jsonl("train.jsonl")?;
+fn load(model_dir: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let tokenizer = Tokenizer::from_model_dir(model_dir)?;
 
-// Create dataloader
-let loader = DataLoader::new(dataset, batch_size: 4, shuffle: true);
+    let dataset = TrainingDataset::from_jsonl_tokenized(
+        "train.jsonl",
+        &tokenizer,
+        DatasetFormat::Auto,
+        2048,
+        None, // chat template
+        None, // custom column config
+    )?;
 
-for batch in loader {
-    // batch.input_ids, batch.attention_mask, batch.labels
+    let config = DataLoaderConfig {
+        batch_size: 4,
+        max_seq_len: 2048,
+        shuffle: true,
+        pad_token_id: tokenizer.pad_token_id().unwrap_or(0),
+        ..Default::default()
+    };
+
+    let mut loader = DataLoader::new(dataset, config, None);
+    while let Some(batch) = loader.next_batch() {
+        // batch.input_ids, batch.attention_mask, batch.labels
+        let _ = batch.seq_len;
+    }
+    Ok(())
 }
 ```
 
 ### With Sequence Packing
 
-```rust
-use pmetal_data::{Dataset, SequencePacker};
+```rust,no_run
+use pmetal_data::{PackerConfig, SequencePacker, TrainingDataset};
 
-let dataset = Dataset::from_jsonl("train.jsonl")?;
-
-// Pack sequences for efficient training
-let packed = SequencePacker::pack(&dataset, max_length: 2048)?;
-// Reports: "Packing: 1000 sequences → 850 batches, 99.5% efficiency"
+fn pack(dataset: &TrainingDataset) -> Result<(), Box<dyn std::error::Error>> {
+    let packer = SequencePacker::new(PackerConfig::with_max_length(2048));
+    let (batches, stats) = packer.pack_with_stats(dataset.samples())?;
+    println!(
+        "{} sequences -> {} batches, {:.1}% efficiency",
+        stats.num_sequences,
+        batches.len(),
+        stats.efficiency * 100.0
+    );
+    Ok(())
+}
 ```
 
 ### Chat Template Application
 
-```rust
-use pmetal_data::ChatTemplate;
+`detect_chat_template` reads the model's real Jinja template from `tokenizer_config.json` and falls
+back to a family default when there isn't one.
 
-let template = ChatTemplate::from_tokenizer(&tokenizer)?;
+```rust,no_run
+use std::path::Path;
 
-let formatted = template.apply(&[
-    Message::user("Hello!"),
-    Message::assistant("Hi there!"),
-])?;
+use pmetal_data::chat_templates::{Message, detect_chat_template};
+
+fn format(model_dir: &Path) -> String {
+    let template = detect_chat_template(model_dir, "Qwen/Qwen3-0.6B");
+
+    let formatted = template.apply(&[
+        Message::user("Hello!"),
+        Message::assistant("Hi there!"),
+    ]);
+
+    // `response_start` is the byte offset to mask the prompt up to.
+    let _prompt_len = formatted.response_start;
+    formatted.text
+}
 ```
 
 ## Dataset Format Examples

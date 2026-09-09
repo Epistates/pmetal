@@ -31,38 +31,70 @@ This crate provides the training infrastructure for PMetal, including various tr
 
 ### Basic Training Loop
 
-```rust
-use pmetal_trainer::{TrainingLoop, TrainingConfig};
+`TrainingLoop::new` takes a single `TrainingLoopConfig`. The model and dataset go to `run_packed`,
+which returns the trained model.
 
-let config = TrainingConfig {
-    batch_size: 4,
-    gradient_accumulation_steps: 4,
-    learning_rate: 2e-4,
-    epochs: 1,
-    max_grad_norm: 1.0,
-    ..Default::default()
-};
+```rust,no_run
+use pmetal_core::TrainingConfig;
+use pmetal_data::{DataLoaderConfig, TrainingDataset};
+use pmetal_lora::DynamicLoraModel;
+use pmetal_trainer::{ProgressCallback, TrainingLoop, TrainingLoopConfig};
 
-let mut trainer = TrainingLoop::new(model, optimizer, config)?;
+fn train(
+    model: DynamicLoraModel,
+    train_dataset: TrainingDataset,
+) -> anyhow::Result<DynamicLoraModel> {
+    let loop_config = TrainingLoopConfig {
+        training: TrainingConfig {
+            batch_size: 4,
+            gradient_accumulation_steps: 4,
+            learning_rate: 2e-4,
+            num_epochs: 1,
+            max_grad_norm: 1.0,
+            ..Default::default()
+        },
+        dataloader: DataLoaderConfig { batch_size: 4, ..Default::default() },
+        use_sequence_packing: true,
+        ..Default::default()
+    };
 
-// Train with optional callbacks
-trainer.train(&dataloader, callbacks)?;
+    let mut training_loop = TrainingLoop::new(loop_config);
+    training_loop.add_callback(Box::new(ProgressCallback::new(1_000)));
+
+    Ok(training_loop.run_packed(model, train_dataset, None, None)?)
+}
 ```
+
+Drive the iteration yourself with `train_step(&mut model, &batch, &mut optimizer)` if you need
+control over batching.
 
 ### With Checkpointing
 
-```rust
-use pmetal_trainer::CheckpointManager;
+```rust,no_run
+use pmetal_data::TrainingDataset;
+use pmetal_lora::{DynamicLoraModel, TrainableModel};
+use pmetal_trainer::{CheckpointManager, TrainingLoop};
 
-let checkpoint_mgr = CheckpointManager::new("output/checkpoints");
+fn train_with_checkpoints(
+    mut model: DynamicLoraModel,
+    train_dataset: TrainingDataset,
+    training_loop: &mut TrainingLoop,
+) -> anyhow::Result<DynamicLoraModel> {
+    let checkpoints = CheckpointManager::new("output/checkpoints")?
+        .with_max_checkpoints(3)
+        .with_save_best(true);
 
-// Resume from checkpoint if available
-if let Some(ckpt) = checkpoint_mgr.latest()? {
-    trainer.load_checkpoint(&ckpt)?;
+    // Resume from the newest checkpoint if there is one.
+    if let Some((lora_params, metadata)) = checkpoints.load_latest()? {
+        model.set_lora_parameters(&lora_params);
+        training_loop.set_step(metadata.step);
+        training_loop.set_epoch(metadata.epoch);
+        println!("resumed at step {}", metadata.step);
+    }
+
+    // Hand the manager to run_packed and it saves on the configured cadence.
+    Ok(training_loop.run_packed(model, train_dataset, None, Some(&checkpoints))?)
 }
-
-// Save checkpoints during training
-trainer.train_with_checkpoints(&dataloader, &checkpoint_mgr, save_every: 500)?;
 ```
 
 ## Optimizers

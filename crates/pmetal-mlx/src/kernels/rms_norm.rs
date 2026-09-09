@@ -4,9 +4,6 @@
 
 use pmetal_bridge::compat::{Array, Exception};
 
-/// Result type for RMS normalization.
-pub type Result<T> = std::result::Result<T, Exception>;
-
 /// Apply RMS normalization to a tensor (functional version).
 ///
 /// # Arguments

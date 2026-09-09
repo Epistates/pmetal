@@ -41,8 +41,7 @@ use pmetal_bridge::compat::{Array, Dtype, random};
 
 use crate::error::MlxError;
 
-/// Result type for metal SwiGLU operations.
-pub type Result<T> = std::result::Result<T, MlxError>;
+use super::utils::Result;
 
 /// Configuration for fused SwiGLU MLP.
 #[derive(Debug, Clone)]

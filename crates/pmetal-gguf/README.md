@@ -17,50 +17,64 @@ This crate provides reading and writing support for the GGUF (GPT-Generated Unif
 
 ### Reading GGUF Files
 
-```rust
+```rust,no_run
 use pmetal_gguf::GgufContent;
 
-// Load GGUF file
-let gguf = GgufContent::from_file("model.gguf")?;
+fn inspect(path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let gguf = GgufContent::from_file(path)?;
 
-// Access metadata
-println!("Architecture: {}", gguf.metadata.get("general.architecture")?);
-println!("Context length: {}", gguf.metadata.get("llama.context_length")?);
+    println!("Architecture: {:?}", gguf.architecture());
+    println!("Context length: {:?}", gguf.get_metadata("llama.context_length"));
 
-// Iterate tensors
-for (name, tensor) in gguf.tensors() {
-    println!("{}: {:?}", name, tensor.shape());
+    for name in gguf.tensor_names() {
+        if let Some(info) = gguf.get_tensor_info(name) {
+            println!("{name}: {:?}", info.dimensions);
+        }
+    }
+    Ok(())
 }
 ```
 
 ### Dequantizing Tensors
 
-```rust
+`dequantize` takes the raw tensor bytes plus the type and shape the header recorded.
+
+```rust,no_run
+use std::fs::File;
+
 use pmetal_gguf::{GgufContent, dequant};
 
-let gguf = GgufContent::from_file("model-q4.gguf")?;
+fn dequantize_one(path: &str, name: &str) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
+    let mut file = File::open(path)?;
+    let gguf = GgufContent::from_file(path)?;
 
-// Dequantize a specific tensor
-let weights = gguf.get_tensor("model.layers.0.self_attn.q_proj.weight")?;
-let fp32_weights = dequant::dequantize(&weights)?;
+    let info = gguf
+        .get_tensor_info(name)
+        .ok_or("tensor not present in this file")?;
+    let shape: Vec<i32> = info.dimensions.iter().map(|&d| d as i32).collect();
+    let dtype = info.dtype;
+
+    let bytes = gguf.read_tensor_data(&mut file, name)?;
+    Ok(dequant::dequantize(&bytes, dtype, &shape)?)
+}
 ```
 
 ### Converting to GGUF
 
-```rust
-use pmetal_gguf::{GgufWriter, Quantization};
+```rust,no_run
+use std::fs::File;
 
-let mut writer = GgufWriter::new("output.gguf")?;
+use pmetal_gguf::GgufBuilder;
 
-// Set metadata
-writer.set_metadata("general.architecture", "llama")?;
-writer.set_metadata("general.name", "My Model")?;
+fn write(path: &str, embeddings: Vec<f32>) -> Result<(), Box<dyn std::error::Error>> {
+    let mut builder = GgufBuilder::with_model("llama", "My Model");
+    builder.add_u32("llama.context_length", 4096);
+    builder.add_f32_tensor("token_embd.weight", vec![4096, 32000], embeddings);
 
-// Add tensors with optional quantization
-writer.add_tensor("model.embed_tokens.weight", &embeddings, Quantization::None)?;
-writer.add_tensor("model.layers.0.self_attn.q_proj.weight", &weights, Quantization::Q4_K)?;
-
-writer.finish()?;
+    let mut file = File::create(path)?;
+    builder.write(&mut file)?;
+    Ok(())
+}
 ```
 
 ## Supported Quantization Types

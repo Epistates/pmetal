@@ -19,42 +19,50 @@ This crate provides efficient Low-Rank Adaptation (LoRA) and Quantized LoRA (QLo
 
 ### Basic LoRA Training
 
-```rust
-use pmetal_lora::{DynamicLoraModel, TrainableModel};
+`from_pretrained` takes a **local directory**; resolve HuggingFace ids with
+`pmetal_hub::download_model` first.
+
+```rust,no_run
+use pmetal_bridge::compat::Array;
 use pmetal_core::LoraConfig;
+use pmetal_lora::{DynamicLoraModel, TrainableModel};
 
-// Configure LoRA
-let config = LoraConfig {
-    r: 16,
-    alpha: 16.0,
-    dropout: 0.0,
-    ..Default::default()
-};
+fn train(model_dir: &str, batches: &[Array]) -> Result<(), Box<dyn std::error::Error>> {
+    let config = LoraConfig {
+        r: 16,
+        alpha: 16.0,
+        dropout: 0.0,
+        ..Default::default()
+    };
 
-// Load model with LoRA adapters
-let mut model = DynamicLoraModel::from_pretrained("path/to/model", config)?;
+    let mut model = DynamicLoraModel::from_pretrained(model_dir, config)?;
 
-// Training loop
-for batch in dataloader {
-    let logits = model.forward(&batch.input_ids, None)?;
-    // Compute loss and backprop...
+    for input_ids in batches {
+        let _logits = model.forward(input_ids, None)?;
+        // Compute loss and backprop...
+    }
+
+    model.save_lora_weights("output/lora_weights.safetensors")?;
+    Ok(())
 }
-
-// Save adapters
-model.save_lora_weights("output/lora_weights.safetensors")?;
 ```
 
 ### Loading Trained Adapters
 
-```rust
-// Load base model with LoRA structure
-let mut model = DynamicLoraModel::from_pretrained("path/to/model", config)?;
+```rust,no_run
+use pmetal_bridge::compat::Array;
+use pmetal_core::LoraConfig;
+use pmetal_lora::{DynamicLoraModel, TrainableModel};
 
-// Load trained adapter weights
-model.load_lora_weights("output/lora_weights.safetensors")?;
+fn infer(model_dir: &str, input_ids: &Array) -> Result<Array, Box<dyn std::error::Error>> {
+    let config = LoraConfig::default();
 
-// Run inference
-let logits = model.forward(&input_ids, None)?;
+    // Build the base model with LoRA structure, then fill the adapters.
+    let mut model = DynamicLoraModel::from_pretrained(model_dir, config)?;
+    model.load_lora_weights("output/lora_weights.safetensors")?;
+
+    Ok(model.forward(input_ids, None)?)
+}
 ```
 
 ## Architecture Support

@@ -20,7 +20,7 @@ This crate provides custom Metal shaders that accelerate LLM training and infere
 
 ## Architecture
 
-```
+```text
 pmetal-metal/
 ├── src/
 │   ├── context.rs        # Thread-safe Metal device management
@@ -64,15 +64,37 @@ The ANE module provides a complete training and inference pipeline using Apple's
 
 ## Usage
 
-```rust
-use pmetal_metal::{MetalContext, FlashAttention};
+`MetalContext::global()` returns the process-wide shared context; prefer it over `new()` so device,
+queue and pipeline cache are shared.
 
-// Initialize Metal context
-let ctx = MetalContext::new()?;
+```rust,no_run
+use half::f16;
+use pmetal_metal::{
+    FlashAttention, FlashAttentionConfig, MetalBuffer, MetalContext, Result,
+};
 
-// Use FlashAttention for memory-efficient attention
-let attention = FlashAttention::new(&ctx, head_dim, num_heads)?;
-let output = attention.forward(&query, &key, &value, mask)?;
+fn attend(
+    queries: &MetalBuffer<f16>,
+    keys: &MetalBuffer<f16>,
+    values: &MetalBuffer<f16>,
+) -> Result<()> {
+    let ctx = MetalContext::global()?;
+
+    let config = FlashAttentionConfig {
+        batch_size: 1,
+        num_heads: 32,
+        num_kv_heads: 8, // GQA; set equal to num_heads for standard MHA
+        query_seq_len: 512,
+        kv_seq_len: 512,
+        head_dim: 128,
+        is_causal: true,
+        ..Default::default()
+    };
+
+    let attention = FlashAttention::new(ctx, config)?;
+    let _output = attention.forward(queries, keys, values)?;
+    Ok(())
+}
 ```
 
 ## Kernels

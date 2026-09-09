@@ -57,34 +57,37 @@ These have implementations but are not wired into `DynamicModel` — use their t
 
 ## Usage
 
-```rust
+`DynamicModel::load` detects the architecture from `config.json`. It takes a **local directory**;
+resolve HuggingFace ids with `pmetal_hub::download_model` first.
+
+```rust,no_run
+use pmetal_bridge::compat::Exception;
 use pmetal_models::{DynamicModel, GenerationConfig, generate};
 
-// Load model with auto-detection
-let model = DynamicModel::from_pretrained("meta-llama/Llama-3.2-1B")?;
+fn run(model_dir: &str, input_tokens: &[u32]) -> Result<Vec<u32>, Exception> {
+    let mut model = DynamicModel::load(model_dir)?;
 
-// Configure generation
-let config = GenerationConfig::sampling(256, 0.7)
-    .with_top_k(40)
-    .with_top_p(0.95);
+    let config = GenerationConfig::sampling(256, 0.7)
+        .with_top_k(40)
+        .with_top_p(0.95);
 
-// Generate tokens
-let output = generate(
-    |input| model.forward(input, None),
-    &input_tokens,
-    config,
-)?;
+    let output = generate(|input| model.forward(input, None), input_tokens, config)?;
+    Ok(output.token_ids)
+}
 ```
 
 ## Architecture Detection
 
 The `DynamicModel` automatically detects model architecture:
 
-```rust
+```rust,no_run
+use pmetal_bridge::compat::Exception;
 use pmetal_models::ModelArchitecture;
 
-let arch = ModelArchitecture::detect("path/to/model")?;
-// Returns: Llama, Qwen3, Mistral, Gemma, Phi, etc.
+fn detect(model_dir: &str) -> Result<ModelArchitecture, Exception> {
+    // Reads config.json: Llama, Qwen3, Mistral, Gemma, Phi, and so on.
+    ModelArchitecture::detect(model_dir)
+}
 ```
 
 ## Generation Configuration

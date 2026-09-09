@@ -22,8 +22,7 @@ use super::fused_attention::FusedAttentionConfig;
 use super::utils::{array_to_metal_buffer_f16, metal_buffer_into_array_f16};
 use crate::error::MlxError;
 
-/// Result type for training attention.
-pub type Result<T> = std::result::Result<T, MlxError>;
+use super::utils::Result;
 
 /// Context for training attention operations.
 ///

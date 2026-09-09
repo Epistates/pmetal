@@ -32,3 +32,10 @@ pub use image_processing::*;
 pub use packing::*;
 pub use tokenizer::*;
 pub use vocab_compact::VocabCompactor;
+
+/// Compiles the code blocks in `README.md` as doctests, so the crate's front
+/// page cannot drift away from its API. `cfg(doctest)` keeps the item out of
+/// the rendered docs and out of every normal build.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+pub struct ReadmeDoctests;

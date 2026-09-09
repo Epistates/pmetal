@@ -8,7 +8,7 @@ This crate provides peer-to-peer distributed training infrastructure designed fo
 
 ## Architecture
 
-```
+```text
                     ┌──────────────────────────┐
                     │  DistributedContext       │
                     │  (Backend-agnostic API)   │
@@ -52,43 +52,61 @@ This crate provides peer-to-peer distributed training infrastructure designed fo
 
 ### Auto-Discovery (Zero-Config)
 
-```rust
-use pmetal_distributed::{AutoDiscoveryBackend, DistributedContext};
+`all_reduce` operates on gradients encoded as little-endian `f32` bytes, and takes the reduction op.
+
+```rust,no_run
 use std::time::Duration;
 
-let backend = AutoDiscoveryBackend::new().await?;
-backend.wait_for_peers(1, Duration::from_secs(30)).await?;
-backend.establish_ring().await?;
+use pmetal_distributed::{AutoDiscoveryBackend, DistributedContext, ReduceOp};
 
-let ctx = DistributedContext::new(Box::new(backend));
-ctx.all_reduce(&mut gradient_buffer).await?;
+async fn sync(gradients: &[f32]) -> anyhow::Result<Vec<f32>> {
+    let backend = AutoDiscoveryBackend::new().await?;
+    backend.wait_for_peers(1, Duration::from_secs(30)).await?;
+    backend.establish_ring().await?;
+
+    let ctx = DistributedContext::new(Box::new(backend));
+
+    let mut buffer: Vec<u8> = gradients.iter().flat_map(|g| g.to_le_bytes()).collect();
+    ctx.all_reduce(&mut buffer, ReduceOp::Mean).await?;
+
+    Ok(buffer
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
+        .collect())
+}
 ```
 
 ### Manual Configuration
 
-```rust
-use pmetal_distributed::{DistributedConfig, RingBackend, DistributedContext};
+```rust,no_run
+use pmetal_distributed::{DistributedConfig, DistributedContext, RingBackend};
 
-let config = DistributedConfig::new(
-    vec!["192.168.1.10:52416".parse()?, "192.168.1.11:52416".parse()?],
-    0, // This node's rank
-);
+async fn manual() -> Result<DistributedContext, Box<dyn std::error::Error>> {
+    let config = DistributedConfig::new(
+        vec!["192.168.1.10:52416".parse()?, "192.168.1.11:52416".parse()?],
+        0, // This node's rank
+    );
 
-let backend = RingBackend::new(config).await?;
-let ctx = DistributedContext::new(Box::new(backend));
+    let backend = RingBackend::new(config).await?;
+    Ok(DistributedContext::new(Box::new(backend)))
+}
 ```
 
 ### Gradient Compression
 
-```rust
-use pmetal_distributed::{GradientCompressor, CompressionStrategy};
+```rust,no_run
+use pmetal_distributed::compression::CompressedGradient;
+use pmetal_distributed::{CompressionStrategy, GradientCompressor};
 
-let mut compressor = GradientCompressor::new(
-    CompressionStrategy::TopK { ratio: 0.1 },
-    true, // enable error feedback
-);
-
-let compressed = compressor.compress(&gradients);
+fn compress(gradients: &[f32]) -> CompressedGradient {
+    let mut compressor = GradientCompressor::new(
+        CompressionStrategy::TopK { ratio: 0.1 },
+        true, // error feedback: carry the residual into the next step
+    );
+    compressor.compress(gradients)
+}
 ```
 
 ## Compression Strategies

@@ -29,11 +29,8 @@ use pmetal_metal::{
 };
 
 use super::fused_attention::{AttentionMaskType, FusedAttentionConfig};
-use super::utils::{array_to_metal_buffer_f16, metal_buffer_into_array_f16};
+use super::utils::{Result, array_to_metal_buffer_f16, metal_buffer_into_array_f16};
 use crate::error::MlxError;
-
-/// Result type for differentiable attention operations.
-pub type Result<T> = std::result::Result<T, MlxError>;
 
 /// Activation cache for a single attention layer.
 #[derive(Debug)]

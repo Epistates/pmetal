@@ -32,27 +32,36 @@ curl http://localhost:8080/v1/chat/completions \
 
 ### As a Library
 
-```rust
+```rust,no_run
 use std::path::Path;
 
+use pmetal_data::Tokenizer;
+use pmetal_models::DynamicModel;
 use pmetal_serve::{InferenceEngine, ServeConfig, server::run_server};
 
-let engine = InferenceEngine::new(
-    model,
-    tokenizer,
-    "my-model".to_string(),
-    Path::new("/path/to/model"),
-    4096,
-    true,
-    1024,
-)?;
-let config = ServeConfig {
-    port: 8080,
-    host: "127.0.0.1".to_string(),
-    max_concurrent: 16,
-};
+async fn serve(model_dir: &str) -> anyhow::Result<()> {
+    let model = DynamicModel::load(model_dir)?;
+    let tokenizer = Tokenizer::from_model_dir(model_dir)?;
 
-run_server(engine, config).await?;
+    let engine = InferenceEngine::new(
+        model,
+        tokenizer,
+        "my-model".to_string(),
+        Path::new(model_dir),
+        4096, // max_seq_len
+    )?;
+
+    // `continuous_batching: Some(BatcherConfig { .. })` opts into the
+    // continuous-batching engine instead of one-request-at-a-time decode.
+    let config = ServeConfig {
+        port: 8080,
+        host: "127.0.0.1".to_string(),
+        max_concurrent: 16,
+        continuous_batching: None,
+    };
+
+    run_server(engine, config).await
+}
 ```
 
 ## Configuration

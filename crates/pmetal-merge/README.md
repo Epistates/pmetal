@@ -41,54 +41,95 @@ This crate provides utilities for merging multiple fine-tuned models into a sing
 
 ### Linear Merge
 
-```rust
-use pmetal_merge::{MergeConfig, LinearMerge, run_merge};
+```rust,no_run
+use std::path::PathBuf;
 
-let config = MergeConfig {
-    method: MergeMethod::Linear,
-    models: vec![
-        ModelWeight { path: "model_a", weight: 0.7 },
-        ModelWeight { path: "model_b", weight: 0.3 },
-    ],
-    output: "merged_model",
+use pmetal_merge::{
+    MergeConfig, MergeMethodConfig, MergeParameters, ModelConfig, ParameterSetting, run_merge,
 };
 
-run_merge(&config)?;
+fn weighted(path: &str, weight: f32) -> ModelConfig {
+    ModelConfig {
+        model: path.to_string(),
+        parameters: MergeParameters {
+            weight: Some(ParameterSetting::Scalar(weight)),
+            ..Default::default()
+        },
+    }
+}
+
+fn linear() -> Result<(), Box<dyn std::error::Error>> {
+    let config = MergeConfig {
+        merge_method: MergeMethodConfig::Linear,
+        models: vec![weighted("model_a", 0.7), weighted("model_b", 0.3)],
+        output_path: Some(PathBuf::from("merged_model")),
+        ..Default::default()
+    };
+
+    run_merge(&config)?;
+    Ok(())
+}
 ```
 
 ### SLERP Merge
 
-```rust
-use pmetal_merge::{MergeConfig, MergeMethod};
+Method-specific knobs like SLERP's `t` and TIES's `density` live in `MergeParameters`, either
+globally or per model.
 
-let config = MergeConfig {
-    method: MergeMethod::Slerp { t: 0.5 },
-    models: vec![
-        ModelWeight { path: "model_a", weight: 1.0 },
-        ModelWeight { path: "model_b", weight: 1.0 },
-    ],
-    output: "merged_model",
+```rust,no_run
+use std::path::PathBuf;
+
+use pmetal_merge::{
+    MergeConfig, MergeMethodConfig, MergeParameters, ModelConfig, ParameterSetting,
 };
+
+fn model(path: &str) -> ModelConfig {
+    ModelConfig { model: path.to_string(), parameters: MergeParameters::default() }
+}
+
+fn slerp() -> MergeConfig {
+    MergeConfig {
+        merge_method: MergeMethodConfig::Slerp,
+        models: vec![model("model_a"), model("model_b")],
+        parameters: MergeParameters {
+            t: Some(ParameterSetting::Scalar(0.5)),
+            ..Default::default()
+        },
+        output_path: Some(PathBuf::from("merged_model")),
+        ..Default::default()
+    }
+}
 ```
 
 ### TIES Merge
 
-```rust
-use pmetal_merge::{MergeConfig, MergeMethod};
+TIES and the other task-vector methods need a `base_model` to subtract.
 
-let config = MergeConfig {
-    method: MergeMethod::Ties {
-        density: 0.5,      // Keep top 50% of weights
-        majority_sign: true,
-    },
-    models: vec![
-        ModelWeight { path: "task_a", weight: 1.0 },
-        ModelWeight { path: "task_b", weight: 1.0 },
-        ModelWeight { path: "task_c", weight: 1.0 },
-    ],
-    base_model: Some("base_model"),
-    output: "merged_model",
+```rust,no_run
+use std::path::PathBuf;
+
+use pmetal_merge::{
+    MergeConfig, MergeMethodConfig, MergeParameters, ModelConfig, ParameterSetting,
 };
+
+fn model(path: &str) -> ModelConfig {
+    ModelConfig { model: path.to_string(), parameters: MergeParameters::default() }
+}
+
+fn ties() -> MergeConfig {
+    MergeConfig {
+        merge_method: MergeMethodConfig::Ties,
+        models: vec![model("task_a"), model("task_b"), model("task_c")],
+        base_model: Some("base_model".to_string()),
+        parameters: MergeParameters {
+            // Keep the top 50% of each task vector by magnitude.
+            density: Some(ParameterSetting::Scalar(0.5)),
+            ..Default::default()
+        },
+        output_path: Some(PathBuf::from("merged_model")),
+        ..Default::default()
+    }
+}
 ```
 
 ## Merge Methods Explained
