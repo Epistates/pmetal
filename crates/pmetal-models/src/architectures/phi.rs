@@ -34,43 +34,74 @@ use crate::architectures::utils::{Activation, resolve_activation};
 use crate::traits::{CausalLMModel, ModelConfig};
 use std::collections::HashMap;
 
-/// Compute SuRoPE precomputed frequencies for Phi-3 128K / Phi-3.5 models.
+/// LongRoPE / SuRoPE state for Phi-3 128K, Phi-3.5 and Phi-4 models.
 ///
-/// SuRoPE (Scaled Uniform RoPE) from the Phi-3 128K paper uses per-dimension
-/// scaling factors. The frequencies passed to `pmetal_bridge::compat::fast::rope` are:
-///   `freqs[i] = factor[i] * base^(2i / rope_dim)`
-/// where `factor` is either `short_factor` or `long_factor`.
+/// LongRoPE ships **two** per-dimension scaling vectors and picks between them
+/// by sequence length, so one precomputed table is not enough. Holding both and
+/// choosing per forward is what makes short-context runs match the reference.
+#[derive(Debug)]
+pub struct LongRopeFreqs {
+    /// Inverse frequencies from `short_factor`, for sequences that stay within
+    /// the pretraining length.
+    pub short: Array,
+    /// Inverse frequencies from `long_factor`, for sequences that pass it.
+    pub long: Array,
+    /// The pretraining length the two tables switch at.
+    pub original_max_position: i32,
+    /// Attention mscale applied to Q and K. Independent of which table is in
+    /// use — `transformers` computes it once at construction and never revises
+    /// it when the branch flips.
+    pub mscale: f32,
+}
+
+impl LongRopeFreqs {
+    /// Pick the table for a forward whose highest absolute position is
+    /// `max_position` (0-based), i.e. an effective length of `max_position + 1`.
+    ///
+    /// Mirrors `transformers`' `longrope_frequency_update`, which re-decides on
+    /// **every** forward from `max(position_ids) + 1`. A decode that crosses the
+    /// boundary therefore rotates later tokens with `long` while the cache still
+    /// holds `short`-rotated keys; that is the reference's behaviour, quirk and
+    /// all, and diverging from it is what this reproduces.
+    pub fn table_for(&self, max_position: i32) -> &Array {
+        if max_position + 1 > self.original_max_position {
+            &self.long
+        } else {
+            &self.short
+        }
+    }
+}
+
+/// Compute both LongRoPE frequency tables and the attention mscale.
 ///
-/// In practice the reference always uses `long_factor` and applies a single mscale
-/// attention scalar at the Q/K level. The `mscale` is:
-///   `sqrt(1 + ln(max_pos / orig_max_pos) / ln(orig_max_pos))`
+/// Each table holds INVERSE frequencies — LongRoPE scales those, not the
+/// periods:
+///   `inv_freq[i] = 1 / (factor[i] * theta^(2i / rope_dim))`
 ///
-/// Returns `(freqs, mscale)`.
-fn compute_su_rope_freqs(
+/// The mscale is `sqrt(1 + ln(factor) / ln(orig_max_pos))` for
+/// `factor = max_pos / orig_max_pos`, matching `transformers`'
+/// `_compute_longrope_parameters` when the config states no explicit
+/// `attention_factor`.
+fn compute_longrope_freqs(
     scaling: &PhiRopeScaling,
     rope_dim: i32,
     rope_theta: f32,
     max_position_embeddings: i32,
     original_max_position_embeddings: i32,
-) -> Result<(Array, f32), Exception> {
+) -> Result<LongRopeFreqs, Exception> {
     let half = (rope_dim / 2) as usize;
-    let long_factor = &scaling.long_factor;
+    let table = |factors: &[f32]| {
+        let freqs: Vec<f32> = (0..half)
+            .map(|i| {
+                let exponent = (2 * i) as f32 / rope_dim as f32;
+                let base_period = rope_theta.powf(exponent); // theta^(2i/D) = period
+                let factor = factors.get(i).copied().unwrap_or(1.0);
+                1.0 / (factor * base_period)
+            })
+            .collect();
+        Array::from_slice(&freqs, &[half as i32])
+    };
 
-    // Compute INVERSE frequencies: 1 / (factor * base^(2i/rope_dim))
-    // SuRoPE scales the inverse frequencies, NOT the periods.
-    // inv_freq[i] = 1 / (long_factor[i] * theta^(2i/D))
-    let mut freqs = Vec::with_capacity(half);
-    for i in 0..half {
-        let exponent = (2 * i) as f32 / rope_dim as f32;
-        let base_period = rope_theta.powf(exponent); // theta^(2i/D) = period
-        let factor = long_factor.get(i).copied().unwrap_or(1.0);
-        // Inverse frequency scaled by factor
-        freqs.push(1.0 / (factor * base_period));
-    }
-    let freqs_arr = Array::from_slice(&freqs, &[half as i32]);
-
-    // mscale = sqrt(1 + ln(factor) / ln(original_max_pos))
-    // where factor = max_pos / original_max_pos
     let factor = max_position_embeddings as f32 / original_max_position_embeddings as f32;
     let mscale = if factor <= 1.0 {
         1.0_f32
@@ -78,7 +109,12 @@ fn compute_su_rope_freqs(
         (1.0 + factor.ln() / (original_max_position_embeddings as f32).ln()).sqrt()
     };
 
-    Ok((freqs_arr, mscale))
+    Ok(LongRopeFreqs {
+        short: table(&scaling.short_factor),
+        long: table(&scaling.long_factor),
+        original_max_position: original_max_position_embeddings,
+        mscale,
+    })
 }
 
 /// Phi model configuration.
@@ -380,7 +416,7 @@ pub struct PhiAttention {
     pub k_proj: Linear,
     pub v_proj: Linear,
     pub o_proj: Linear,
-    /// Standard RoPE module (used when `su_freqs` is None).
+    /// Standard RoPE module (used when `long_rope` is None).
     pub rope: pmetal_bridge::compat::nn::Rope,
     pub n_heads: i32,
     pub n_kv_heads: i32,
@@ -388,11 +424,9 @@ pub struct PhiAttention {
     pub rope_dim: i32,
     pub scale: f32,
     pub rope_theta: f32,
-    /// SuRoPE precomputed per-dimension frequencies (shape [rope_dim/2]).
-    /// Present only for Phi-3 128K / Phi-3.5 models with `rope_scaling` set.
-    pub su_freqs: Option<Array>,
-    /// Attention mscale applied to Q and K when using SuRoPE.
-    pub su_mscale: f32,
+    /// LongRoPE / SuRoPE tables, present only for models with `rope_scaling`
+    /// set (Phi-3 128K, Phi-3.5, Phi-4).
+    pub long_rope: Option<LongRopeFreqs>,
 }
 impl_module_params!(PhiAttention; q_proj, k_proj, v_proj, o_proj);
 
@@ -428,31 +462,24 @@ impl PhiAttention {
 
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        // Compute SuRoPE frequencies if rope_scaling is provided (Phi-3 128K / Phi-3.5)
-        let (su_freqs, su_mscale) = if let Some(ref rope_scaling) = config.rope_scaling {
-            if rope_scaling.scaling_type == "su"
-                || rope_scaling.scaling_type == "longrope"
-                || rope_scaling.scaling_type == "linear"
-            {
+        // Compute LongRoPE tables if rope_scaling is provided (Phi-3 128K / Phi-3.5 / Phi-4)
+        let long_rope = config
+            .rope_scaling
+            .as_ref()
+            .filter(|scaling| matches!(scaling.scaling_type.as_str(), "su" | "longrope" | "linear"))
+            .and_then(|scaling| {
                 let orig_max = config
                     .original_max_position_embeddings
                     .unwrap_or(config.max_position_embeddings);
-                match compute_su_rope_freqs(
-                    rope_scaling,
+                compute_longrope_freqs(
+                    scaling,
                     rope_dim,
                     rope_theta,
                     config.max_position_embeddings,
                     orig_max,
-                ) {
-                    Ok((freqs, mscale)) => (Some(freqs), mscale),
-                    Err(_) => (None, 1.0),
-                }
-            } else {
-                (None, 1.0)
-            }
-        } else {
-            (None, 1.0)
-        };
+                )
+                .ok()
+            });
 
         Ok(Self {
             q_proj,
@@ -466,8 +493,7 @@ impl PhiAttention {
             rope_dim,
             scale,
             rope_theta,
-            su_freqs,
-            su_mscale,
+            long_rope,
         })
     }
 
@@ -512,20 +538,23 @@ impl PhiAttention {
 
         // Apply SuRoPE mscale to the rotary portion only (matches the Python
         // reference: `x[..., :self.dim] = self._scale * x[..., :self.dim]`).
-        let (q_rope_raw, k_rope_raw) = if self.su_freqs.is_some() && self.su_mscale != 1.0 {
-            let mscale = Array::from_f32(self.su_mscale);
+        let mscale = self.long_rope.as_ref().map_or(1.0, |lr| lr.mscale);
+        let (q_rope_raw, k_rope_raw) = if mscale != 1.0 {
+            let mscale = Array::from_f32(mscale);
             (q_rope_raw.multiply(&mscale), k_rope_raw.multiply(&mscale))
         } else {
             (q_rope_raw, k_rope_raw)
         };
 
         let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        // SuRoPE/LongRoPE: rotate with the per-dimension `long_factor`-scaled
-        // inverse frequencies. The mscale above is the *value* scale; it must
-        // NOT also be passed as a position `scale` to the rotation (that was a
-        // double-application bug — and plain `apply_rope` ignored `su_freqs`
+        // SuRoPE/LongRoPE: rotate with the per-dimension factor-scaled inverse
+        // frequencies, choosing the short or long table by how far this forward
+        // actually reaches. The mscale above is the *value* scale; it must NOT
+        // also be passed as a position `scale` to the rotation (that was a
+        // double-application bug — and plain `apply_rope` ignored the tables
         // entirely, falling back to un-scaled base frequencies).
-        let (q_rope, k_rope) = if let Some(ref freqs) = self.su_freqs {
+        let (q_rope, k_rope) = if let Some(ref long_rope) = self.long_rope {
+            let freqs = long_rope.table_for(offset + seq_len - 1);
             (
                 apply_rope_with_freqs(&q_rope_raw, freqs, self.rope_dim, false, offset)?,
                 apply_rope_with_freqs(&k_rope_raw, freqs, self.rope_dim, false, offset)?,
@@ -1046,9 +1075,12 @@ mod tests {
     ///
     /// Guards three fixes: (1) the per-dimension `long_factor`-scaled inverse
     /// frequencies are actually applied (plain base RoPE used to be used,
-    /// ignoring `su_freqs`); (2) the mscale is applied once, as a *value*
-    /// scale, not also as a position scale; (3) `compute_su_rope_freqs`
+    /// ignoring the tables); (2) the mscale is applied once, as a *value*
+    /// scale, not also as a position scale; (3) `compute_longrope_freqs`
     /// produces `inv_freq = 1/(long_factor · base^(2i/d))`.
+    ///
+    /// The fixture forces the long branch (`seq_len = orig_max + 1`), so this
+    /// reads the long table explicitly rather than through `table_for`.
     ///
     /// transformers folds the mscale into `cos`/`sin` where pmetal value-scales
     /// the input; rotation is linear, so the two are algebraically identical
@@ -1082,18 +1114,19 @@ mod tests {
             short_factor: vec![1.0; 16],
             long_factor,
         };
-        let (su_freqs, mscale) =
-            compute_su_rope_freqs(&scaling, dims, base, max_pos, orig_max).expect("su freqs");
+        let long_rope =
+            compute_longrope_freqs(&scaling, dims, base, max_pos, orig_max).expect("su freqs");
         assert!(
-            (mscale - 1.133_893).abs() < 1e-4,
-            "mscale {mscale} != mlx 1.133893"
+            (long_rope.mscale - 1.133_893).abs() < 1e-4,
+            "mscale {} != mlx 1.133893",
+            long_rope.mscale
         );
 
         // SuScaledRoPE value-scales x[..., :dims] (here dims == head_dim) then
         // rotates with the long-factor freqs at offset 0.
-        let x_scaled = x.multiply(&Array::from_f32(mscale));
-        let mut y_rust =
-            apply_rope_with_freqs(&x_scaled, &su_freqs, dims, false, 0).expect("rope with freqs");
+        let x_scaled = x.multiply(&Array::from_f32(long_rope.mscale));
+        let mut y_rust = apply_rope_with_freqs(&x_scaled, &long_rope.long, dims, false, 0)
+            .expect("rope with freqs");
         y_rust.eval().unwrap();
 
         let got = y_rust.to_f32_vec(384).expect("rust vec");
@@ -1109,6 +1142,39 @@ mod tests {
             max_abs < 1e-4,
             "SuRoPE output diverges from mlx oracle by {max_abs}"
         );
+    }
+
+    /// LongRoPE picks its table by sequence length, not unconditionally.
+    ///
+    /// pmetal used to precompute only `long_factor` and use it for everything.
+    /// That is wrong for every sequence shorter than the pretraining length,
+    /// which is most of them: Phi-4-mini's `original_max_position_embeddings`
+    /// is 4096, so an ordinary prompt should rotate with `short_factor`. It
+    /// showed up as a real-weight divergence at position 22 of a 640-token run.
+    #[test]
+    fn longrope_switches_tables_at_the_pretraining_length() {
+        let scaling = PhiRopeScaling {
+            scaling_type: "longrope".to_string(),
+            short_factor: vec![1.0; 8],
+            long_factor: (0..8).map(|i| 1.0 + 0.5 * i as f32).collect(),
+        };
+        let long_rope = compute_longrope_freqs(&scaling, 16, 10000.0, 512, 128).unwrap();
+
+        // A `short_factor` of all ones leaves the base frequencies alone, so
+        // the two tables really are different and the choice is observable.
+        let short = long_rope.short.clone().to_f32_vec(8).unwrap();
+        let long = long_rope.long.clone().to_f32_vec(8).unwrap();
+        assert!((short[4] - 10000.0_f32.powf(-8.0 / 16.0)).abs() < 1e-6);
+        assert!((long[4] / short[4] - 1.0 / 3.0).abs() < 1e-5);
+
+        // The boundary is on the effective length (`max_position + 1`), the
+        // same quantity transformers derives as `max(position_ids) + 1`.
+        let id_of = |arr: &Array| arr.clone().to_f32_vec(8).unwrap();
+        assert_eq!(id_of(long_rope.table_for(0)), short, "single token");
+        assert_eq!(id_of(long_rope.table_for(126)), short, "127 tokens");
+        assert_eq!(id_of(long_rope.table_for(127)), short, "exactly 128 tokens");
+        assert_eq!(id_of(long_rope.table_for(128)), long, "129 tokens");
+        assert_eq!(id_of(long_rope.table_for(639)), long, "a long run");
     }
 
     #[test]
