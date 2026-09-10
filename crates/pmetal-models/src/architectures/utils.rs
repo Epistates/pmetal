@@ -18,6 +18,44 @@ pub struct LoadReport {
     pub skipped: Vec<String>,
 }
 
+/// Combine per-shard reports, so a sharded load reads as one result.
+impl std::ops::AddAssign for LoadReport {
+    fn add_assign(&mut self, rhs: Self) {
+        self.loaded += rhs.loaded;
+        self.skipped.extend(rhs.skipped);
+    }
+}
+
+impl LoadReport {
+    /// Log what a load actually matched.
+    ///
+    /// A checkpoint whose layout the loader does not recognise assigns nothing
+    /// and leaves the model on its random init, which downstream looks like a
+    /// model that loads fine and emits noise. This is the line that tells you
+    /// otherwise, so it is a warning when *nothing* matched.
+    pub fn log_summary(&self, model_dir: &std::path::Path) {
+        if self.loaded == 0 {
+            tracing::warn!(
+                dir = %model_dir.display(),
+                skipped = self.skipped.len(),
+                first_skipped = ?self.skipped.first(),
+                "weight load matched no parameters — the model is running on random init; \
+                 the checkpoint's key layout is probably not one this architecture expects"
+            );
+        } else if !self.skipped.is_empty() {
+            tracing::info!(
+                dir = %model_dir.display(),
+                loaded = self.loaded,
+                skipped = self.skipped.len(),
+                first_skipped = ?self.skipped.first(),
+                "weight load complete with unmatched checkpoint keys"
+            );
+        } else {
+            tracing::debug!(loaded = self.loaded, "weight load complete");
+        }
+    }
+}
+
 /// Assign `weights[key]` to a raw parameter slot, recording the outcome.
 pub fn load_param(
     slot: &mut Param<Array>,

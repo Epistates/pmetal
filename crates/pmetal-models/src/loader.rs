@@ -26,6 +26,7 @@ use crate::architectures::qwen3_next::{
     Qwen3NextConfig, Qwen3NextForCausalLM, Qwen3NextSanitizeOptions, sanitize_weights,
 };
 use crate::architectures::t5::T5EncoderModel;
+use crate::architectures::utils::LoadReport;
 use crate::architectures::vae::FluxVAE;
 
 #[derive(Debug, thiserror::Error)]
@@ -87,16 +88,30 @@ struct MlxQuantizationConfig {
     per_tensor_overrides: HashMap<String, i32>,
 }
 
+/// Assign every checkpoint tensor whose name matches a parameter path,
+/// reporting the ones that matched nothing.
+///
+/// Matching is by exact name, so a checkpoint laid out differently from the
+/// parameter tree silently contributes nothing and the model runs on its
+/// random init. Returning the unmatched keys is what makes that visible —
+/// `load_generic_weights_renamed` logs a summary, and a caller that knows the
+/// checkpoint should map completely can assert on it.
 fn assign_loaded_weights<M: ModuleParameters + ModuleParametersExt>(
     model: &mut M,
     loaded: HashMap<String, Array>,
-) {
+) -> LoadReport {
     let mut params = model.flatten_params_mut();
+    let mut report = LoadReport::default();
     for (key, value) in loaded {
-        if let Some(param) = params.get_mut(&key) {
-            **param = value;
+        match params.get_mut(&key) {
+            Some(param) => {
+                **param = value;
+                report.loaded += 1;
+            }
+            None => report.skipped.push(key),
         }
     }
+    report
 }
 
 fn eval_loaded_parameters<M: ModuleParameters + ModuleParametersExt>(
@@ -1045,11 +1060,13 @@ pub fn load_generic_weights_renamed<M: ModuleParameters + ModuleParametersExt>(
     };
 
     let model_dir = model_dir.as_ref();
+    let mut report = LoadReport::default();
     let single_file = model_dir.join("model.safetensors");
     if single_file.exists() {
         let loaded = apply(load_shard(&single_file)?);
-        assign_loaded_weights(model, loaded);
+        report += assign_loaded_weights(model, loaded);
         eval_loaded_parameters(model)?;
+        report.log_summary(model_dir);
         return Ok(());
     }
     let index_path = model_dir.join("model.safetensors.index.json");
@@ -1065,9 +1082,10 @@ pub fn load_generic_weights_renamed<M: ModuleParameters + ModuleParametersExt>(
     for shard_file in shard_files {
         let shard_path = validate_shard_path(model_dir, shard_file)?;
         let loaded = apply(load_shard(&shard_path)?);
-        assign_loaded_weights(model, loaded);
+        report += assign_loaded_weights(model, loaded);
     }
     eval_loaded_parameters(model)?;
+    report.log_summary(model_dir);
     Ok(())
 }
 
@@ -2025,5 +2043,50 @@ mod tests {
         assert_eq!(restored.shape(), &[2, 64]);
         assert!(!loaded.contains_key("linear.weight.scales"));
         assert!(!loaded.contains_key("linear.weight.biases"));
+    }
+
+    /// A checkpoint key that matches no parameter has to come back in the
+    /// report. Silently dropping it is how a model ends up running on random
+    /// init while looking like it loaded fine.
+    #[test]
+    fn unmatched_checkpoint_keys_are_reported() {
+        let temp = tempdir().unwrap();
+        let model_dir = temp.path();
+
+        let mut weights = HashMap::new();
+        weights.insert(
+            "model.embed_tokens.weight".to_string(),
+            Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]),
+        );
+        weights.insert(
+            "model.not_a_parameter.weight".to_string(),
+            Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]),
+        );
+        weights.insert(
+            "layers.0.self_attn.q_proj.weight".to_string(),
+            Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]),
+        );
+        write_safetensors(&model_dir.join("model.safetensors"), &weights).unwrap();
+
+        let mut model = crate::architectures::Qwen3ForCausalLM::new(Default::default()).unwrap();
+        let mut report = LoadReport::default();
+        report += assign_loaded_weights(
+            &mut model,
+            load_shard(&model_dir.join("model.safetensors")).unwrap(),
+        );
+
+        assert_eq!(
+            report.loaded, 1,
+            "only embed_tokens matches a real parameter"
+        );
+        let skipped: HashSet<&str> = report.skipped.iter().map(String::as_str).collect();
+        assert_eq!(
+            skipped,
+            HashSet::from([
+                "model.not_a_parameter.weight",
+                "layers.0.self_attn.q_proj.weight"
+            ]),
+            "both unmatched keys must be reported, including the un-prefixed layout"
+        );
     }
 }
