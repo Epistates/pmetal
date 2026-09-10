@@ -173,7 +173,7 @@ pub fn run() {
 // startup init tasks.
 // ---------------------------------------------------------------------------
 
-/// Point the patched MLX backend at an `mlx.metallib`.
+/// Point the MLX backend at an `mlx.metallib`.
 ///
 /// MLX cannot load a single Metal kernel without it. The bundled app carries one
 /// as a Tauri resource; a source checkout has one next to the built executable or
@@ -182,14 +182,19 @@ pub fn run() {
 /// on the same machine, so a GUI installed from the .dmg alone had no metallib
 /// at all.
 ///
-/// The `PMETAL_METALLIB_PATH` override is the first entry in the C++ search order
-/// (see `crates/pmetal-bridge/patches/metallib-search-path.patch`), so an
-/// operator who sets it wins and we leave it alone.
+/// Handing the path to `set_metallib_path` is what MLX honours (upstream API
+/// since MLX v0.32). `PMETAL_METALLIB_PATH` is still read here as an operator
+/// override and re-exported for child processes, but MLX itself no longer looks
+/// at it — before v0.32 that env var was serviced by a patch to MLX's own
+/// `load_default_library`, which this crate no longer carries.
 fn ensure_metallib(app: &tauri::AppHandle) {
     use tauri::path::BaseDirectory;
 
-    if std::env::var_os("PMETAL_METALLIB_PATH").is_some_and(|v| !v.is_empty()) {
-        return;
+    if let Some(explicit) = std::env::var_os("PMETAL_METALLIB_PATH") {
+        if !explicit.is_empty() {
+            pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
+            return;
+        }
     }
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -209,6 +214,9 @@ fn ensure_metallib(app: &tauri::AppHandle) {
     match candidates.into_iter().find(|p| p.is_file()) {
         Some(path) => {
             tracing::info!(path = %path.display(), "Found mlx.metallib");
+            pmetal_bridge::inline_array::set_metallib_path(&path.to_string_lossy());
+            // Re-exported so the `pmetal` CLI subprocesses this app spawns
+            // resolve the same file without repeating the search.
             std::env::set_var("PMETAL_METALLIB_PATH", &path);
             std::env::set_var("MLX_METAL_JIT", "1");
         }
