@@ -365,9 +365,14 @@ impl GroupedGemmMoE {
         let n_rows = partitioned_indices.dim(0);
         let n_cols = partitioned_indices.dim(1);
         let col_start = n_cols + neg_k; // n_cols - k
-        let indices = partitioned_indices
-            .slice(&[0, col_start], &[n_rows, n_cols])
-            .as_dtype(Dtype::Int32.as_i32());
+        // MLX >= 0.32 raises "[gather] Cannot calculate VJP with respect to
+        // indices"; routing indices descend from differentiable probs, so cut
+        // the trace here. Gradients flow through `values`, never the indices.
+        let indices = ops::stop_gradient(
+            &partitioned_indices
+                .slice(&[0, col_start], &[n_rows, n_cols])
+                .as_dtype(Dtype::Int32.as_i32()),
+        );
         let values = probs.take_along_axis(&indices, -1);
         (values, indices)
     }

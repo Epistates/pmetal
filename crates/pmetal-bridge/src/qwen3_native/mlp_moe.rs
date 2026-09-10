@@ -61,7 +61,12 @@ fn moe_routed_forward(lw: &LayerWeights, x_flat: &InlineArray) -> InlineArray {
     // inds: [S, num_experts] → slice to [S, top_k]
     let all_inds = gates.argpartition(-top_k, -1);
     let num_experts_dim = gates.dim(1);
-    let inds = all_inds.slice(&[0, num_experts_dim - top_k], &[s, num_experts_dim]);
+    // MLX >= 0.32 raises "[gather] Cannot calculate VJP with respect to indices"
+    // when routing indices sit downstream of differentiable gates inside a grad
+    // trace. Gradients flow through the gathered scores, never the index path.
+    let inds = all_inds
+        .slice(&[0, num_experts_dim - top_k], &[s, num_experts_dim])
+        .stop_gradient();
 
     // Gather expert scores: [S, top_k]
     let mut scores = gates.take_along_axis(&inds, -1);

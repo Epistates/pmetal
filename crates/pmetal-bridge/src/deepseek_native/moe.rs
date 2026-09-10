@@ -159,8 +159,10 @@ fn group_topk(
     // argpartition(-scores, kth=top_k-1) gives indices of top-k (unsorted).
     let neg_scores = scores.negative();
     let part_inds = neg_scores.argpartition(top_k - 1, -1); // [T, n_experts]
-    // Take first top_k indices: [T, top_k]
-    let inds = part_inds.slice(&[0, 0], &[t, top_k]); // [T, top_k]
+    // Take first top_k indices: [T, top_k]. MLX >= 0.32 rejects a gather VJP
+    // taken with respect to indices, and these descend from differentiable
+    // scores — cut the trace here; gradients flow through `sel_scores`.
+    let inds = part_inds.slice(&[0, 0], &[t, top_k]).stop_gradient(); // [T, top_k]
 
     // Gather orig_scores at selected indices: [T, top_k]
     let sel_scores = orig_scores.take_along_axis(&inds, -1); // [T, top_k]
@@ -197,7 +199,9 @@ fn top2_sum_per_group(s_grouped: &InlineArray, _n_group: i32, _epg: i32) -> Inli
     // argpartition(-s, kth=1, axis=-1): first 2 elements have the top-2.
     let neg = s_grouped.negative();
     let part = neg.argpartition(1, -1); // [T, n_group, epg]
-    let top2_inds = part.slice(&[0, 0, 0], &[s_grouped.dim(0), s_grouped.dim(1), 2]); // [T, n_group, 2]
+    let top2_inds = part
+        .slice(&[0, 0, 0], &[s_grouped.dim(0), s_grouped.dim(1), 2])
+        .stop_gradient(); // [T, n_group, 2]
     let top2_vals = s_grouped.take_along_axis(&top2_inds, -1); // [T, n_group, 2]
     top2_vals.sum_axis(-1, true) // [T, n_group, 1]
 }
