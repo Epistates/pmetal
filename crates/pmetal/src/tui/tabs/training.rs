@@ -477,6 +477,13 @@ impl TrainingTab {
                 };
                 v.parse().unwrap_or(TrainSpec::default().lora_alpha)
             },
+            dora: self.form.value("DoRA") == "Enabled",
+            rslora: self.form.value("RSLoRA") == "Enabled",
+            lora_dropout: self
+                .form
+                .value("LoRA Dropout")
+                .parse()
+                .unwrap_or(TrainSpec::default().lora_dropout),
             quantization,
             quant_block_size: self
                 .form

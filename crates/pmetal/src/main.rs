@@ -1449,6 +1449,9 @@ async fn tokio_main() -> anyhow::Result<()> {
                 output,
                 lora_r,
                 lora_alpha,
+                dora,
+                rslora,
+                lora_dropout,
                 learning_rate,
                 batch_size,
                 epochs,
@@ -1563,6 +1566,9 @@ async fn tokio_main() -> anyhow::Result<()> {
                 lora: LoraConfig {
                     r: lora_r,
                     alpha: lora_alpha,
+                    dropout: lora_dropout,
+                    use_rslora: rslora,
+                    use_dora: dora,
                     ..Default::default()
                 },
                 qlora,

@@ -36,6 +36,21 @@ pub struct TrainArgs {
     #[arg(long = "lora-alpha", default_value = "32")]
     pub lora_alpha: f32,
 
+    /// Train DoRA (Weight-Decomposed LoRA) adapters instead of plain LoRA.
+    /// Decomposes each update into magnitude and direction; slower per step,
+    /// usually better at low rank.
+    #[arg(long = "dora")]
+    pub dora: bool,
+
+    /// Use rank-stabilized LoRA scaling (alpha/sqrt(r) instead of alpha/r),
+    /// which keeps the update magnitude steady as rank grows.
+    #[arg(long = "rslora")]
+    pub rslora: bool,
+
+    /// Dropout applied to the LoRA branch during training.
+    #[arg(long = "lora-dropout", default_value = "0.0")]
+    pub lora_dropout: f32,
+
     /// Learning rate. Recommended: 2e-4 for most tasks.
     #[arg(long = "learning-rate", default_value = "2e-4")]
     pub learning_rate: f64,

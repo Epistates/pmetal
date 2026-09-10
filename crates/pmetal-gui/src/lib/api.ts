@@ -128,6 +128,9 @@ export interface TrainSpec {
   loss_scale?: number;
   lora_r?: number;
   lora_alpha?: number;
+  lora_dropout?: number;
+  rslora?: boolean;
+  dora?: boolean;
   quantization?: string | null;
   quant_block_size?: number;
   double_quant?: boolean;

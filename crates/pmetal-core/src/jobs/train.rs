@@ -220,6 +220,37 @@ pub struct TrainSpec {
     pub lora_alpha: f32,
 
     #[job(
+        label = "DoRA",
+        group = "LoRA",
+        argv = "--dora",
+        flag,
+        default_bool = false
+    )]
+    #[serde(default)]
+    pub dora: bool,
+
+    #[job(
+        label = "RSLoRA",
+        group = "LoRA",
+        argv = "--rslora",
+        flag,
+        default_bool = false
+    )]
+    #[serde(default)]
+    pub rslora: bool,
+
+    #[job(
+        label = "LoRA Dropout",
+        group = "LoRA",
+        argv = "--lora-dropout",
+        min = 0.0,
+        max = 1.0,
+        default_float = 0.0
+    )]
+    #[serde(default)]
+    pub lora_dropout: f32,
+
+    #[job(
         label = "Quantization",
         group = "LoRA",
         argv = "--quantization",
@@ -423,6 +454,9 @@ impl Default for TrainSpec {
             loss_scale: default_loss_scale(),
             lora_r: default_lora_r(),
             lora_alpha: default_lora_alpha(),
+            dora: false,
+            rslora: false,
+            lora_dropout: 0.0,
             quantization: None,
             quant_block_size: default_quant_block_size(),
             double_quant: false,

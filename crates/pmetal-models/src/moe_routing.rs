@@ -71,7 +71,8 @@ pub fn topk_normalize(
     // indices" when routing indices sit downstream of differentiable scores
     // inside a grad trace — cut it here so gradients flow only through the
     // gathered weights, never the index path.
-    let top_indices = ops::stop_gradient(&ops::slice_last_from(&part_indices, neg_k).as_type::<i32>());
+    let top_indices =
+        ops::stop_gradient(&ops::slice_last_from(&part_indices, neg_k).as_type::<i32>());
     let top_weights = scores.take_along_axis(&top_indices, -1);
 
     let normalized_weights = if norm_topk_prob {
