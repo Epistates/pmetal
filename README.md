@@ -57,7 +57,7 @@ pmetal tui
 | **Ollama** | Modelfile generation and Ollama export |
 | **Jobs** | Training run history with log viewer, status tracking, and metadata |
 
-Keybindings: `Tab`/`Shift+Tab` to cycle tabs, `Alt+1-9` (or `Ctrl+1-9`) to jump to the first nine, `L` to adjust learning rate mid-run, `q` to quit.
+Keybindings: `Ctrl+P` to jump to any tab (type to filter), `Tab`/`Shift+Tab` to cycle, `Alt+1-9` (or `Ctrl+1-9`) for the first nine, `L` to adjust learning rate mid-run, `?` for contextual help, `q` to quit.
 
 ### CLI
 

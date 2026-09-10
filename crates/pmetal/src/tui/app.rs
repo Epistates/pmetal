@@ -376,6 +376,12 @@ impl App {
                 self.modal_stack.push(Modal::help(self.active_tab));
                 return;
             }
+            // Jump-to-tab palette. Alt+1-9 only reaches the first nine of
+            // twenty tabs; this reaches all of them, filtering as you type.
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                self.modal_stack.push(Modal::tab_picker(self.active_tab));
+                return;
+            }
             _ => {}
         }
 
@@ -2192,6 +2198,9 @@ impl App {
                 }
                 _ => {}
             },
+            ModalAction::SelectTab(tab) => {
+                self.active_tab = tab;
+            }
             ModalAction::HfDownload(model_id) => {
                 self.download_model(&model_id);
             }

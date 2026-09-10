@@ -31,6 +31,8 @@ pub enum ModalAction {
     TextSubmitted(String),
     /// User wants to download a model from HF search results.
     HfDownload(String),
+    /// User picked a tab to jump to.
+    SelectTab(Tab),
 }
 
 /// A modal dialog.
@@ -79,6 +81,14 @@ pub enum Modal {
     },
     /// Contextual help overlay showing global + per-tab keybindings.
     Help { tab: Tab },
+    /// Jump-to-tab palette.
+    ///
+    /// `Alt+1-9` only reaches the first nine of twenty tabs, and cycling with
+    /// Tab is up to ten presses. This lists every tab and filters as you type.
+    TabPicker {
+        list_state: ListState,
+        search: String,
+    },
 }
 
 /// An entry in the HF search results modal.
@@ -154,6 +164,17 @@ impl Modal {
 
     pub fn help(tab: Tab) -> Self {
         Modal::Help { tab }
+    }
+
+    pub fn tab_picker(current: Tab) -> Self {
+        let mut state = ListState::default();
+        state.select(Some(
+            Tab::ALL.iter().position(|t| *t == current).unwrap_or(0),
+        ));
+        Modal::TabPicker {
+            list_state: state,
+            search: String::new(),
+        }
     }
 
     pub fn error(title: impl Into<String>, message: impl Into<String>) -> Self {
@@ -331,6 +352,51 @@ impl Modal {
                 _ => None,
             },
 
+            Modal::TabPicker { list_state, search } => match key.code {
+                KeyCode::Esc => Some(ModalAction::None),
+                KeyCode::Backspace => {
+                    search.pop();
+                    let max_idx = filtered_tabs(search).len().saturating_sub(1);
+                    if let Some(i) = list_state.selected() {
+                        if i > max_idx {
+                            list_state.select(Some(max_idx));
+                        }
+                    }
+                    None
+                }
+                KeyCode::Down => {
+                    let count = filtered_tabs(search).len();
+                    if count > 0 {
+                        let i = list_state.selected().map_or(0, |i| (i + 1) % count);
+                        list_state.select(Some(i));
+                    }
+                    None
+                }
+                KeyCode::Up => {
+                    let count = filtered_tabs(search).len();
+                    if count > 0 {
+                        let i = list_state.selected().map_or(0, |i| (i + count - 1) % count);
+                        list_state.select(Some(i));
+                    }
+                    None
+                }
+                KeyCode::Enter => {
+                    let filtered = filtered_tabs(search);
+                    list_state
+                        .selected()
+                        .and_then(|i| filtered.get(i).copied())
+                        .map(ModalAction::SelectTab)
+                }
+                // Every printable key filters; j/k would otherwise shadow the
+                // letters in tab names.
+                KeyCode::Char(c) => {
+                    search.push(c);
+                    list_state.select(Some(0));
+                    None
+                }
+                _ => None,
+            },
+
             Modal::DatasetPicker {
                 datasets,
                 list_state,
@@ -497,6 +563,9 @@ impl Modal {
                 table_state,
             } => render_hf_search(popup_area, buf, entries, table_state),
             Modal::Help { tab } => render_help(popup_area, buf, *tab),
+            Modal::TabPicker { list_state, search } => {
+                render_tab_picker(popup_area, buf, list_state, search)
+            }
         }
     }
 
@@ -507,6 +576,7 @@ impl Modal {
             Modal::ModelPicker { .. } | Modal::DatasetPicker { .. } => 70,
             Modal::HfSearch { .. } => 85,
             Modal::Help { .. } => 65,
+            Modal::TabPicker { .. } => 45,
         }
     }
 
@@ -518,6 +588,7 @@ impl Modal {
             Modal::ModelPicker { .. } | Modal::DatasetPicker { .. } => 60,
             Modal::HfSearch { .. } => 70,
             Modal::Help { .. } => 75,
+            Modal::TabPicker { .. } => 70,
         }
     }
 }
@@ -681,6 +752,57 @@ fn render_model_picker(
 
 /// Return the subset of `datasets` whose `id` or `path` contains `search`
 /// (case-insensitive).  Returns the full slice when `search` is empty.
+/// Tabs whose name contains `search`, case-insensitively.
+fn filtered_tabs(search: &str) -> Vec<Tab> {
+    if search.is_empty() {
+        return Tab::ALL.to_vec();
+    }
+    let lower = search.to_lowercase();
+    Tab::ALL
+        .iter()
+        .copied()
+        .filter(|t| t.to_string().to_lowercase().contains(&lower))
+        .collect()
+}
+
+fn render_tab_picker(area: Rect, buf: &mut Buffer, list_state: &mut ListState, search: &str) {
+    let title = if search.is_empty() {
+        " Go to Tab ".to_string()
+    } else {
+        format!(" Go to Tab [{search}] ")
+    };
+    let block = Block::default()
+        .title(title)
+        .title_style(THEME.block_title_focused)
+        .borders(Borders::ALL)
+        .border_style(THEME.block_focused);
+
+    let filtered = filtered_tabs(search);
+    if filtered.is_empty() {
+        Paragraph::new("\n  No tab matches.")
+            .style(THEME.text_muted)
+            .block(block)
+            .render(area, buf);
+        return;
+    }
+
+    let items: Vec<ListItem> = filtered
+        .iter()
+        .map(|tab| {
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {} ", tab.icon()), THEME.text_dim),
+                Span::styled(tab.to_string(), THEME.kv_value),
+            ]))
+        })
+        .collect();
+
+    let list = List::new(items)
+        .block(block)
+        .highlight_style(THEME.table_selected)
+        .highlight_symbol("> ");
+    StatefulWidget::render(list, area, buf, list_state);
+}
+
 fn filtered_datasets<'a>(datasets: &'a [PickerEntry], search: &str) -> Vec<&'a PickerEntry> {
     if search.is_empty() {
         datasets.iter().collect()
@@ -929,6 +1051,7 @@ fn render_help(area: Rect, buf: &mut Buffer, tab: Tab) {
         ("?", "Toggle this help overlay"),
         ("Tab / Shift+Tab", "Switch tabs forward / backward"),
         ("Alt+1..9", "Jump directly to tab 1..9"),
+        ("Ctrl+P", "Go to any tab (type to filter)"),
         ("Ctrl+1..9", "Jump directly to tab 1..9 (alternative)"),
         ("q / Ctrl+C", "Quit the TUI"),
         ("F2", "Toggle mouse capture (text select/copy)"),

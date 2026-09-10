@@ -42,6 +42,7 @@ Listed in tab order, which is also the `Alt+N` order.
 | Key | Action |
 |-----|--------|
 | `Tab` / `Shift+Tab` | Switch tabs |
+| `Ctrl+P` | Go to any tab — type to filter |
 | `Alt+1-9` / `Ctrl+1-9` | Jump straight to one of the first nine tabs |
 | `L` | Adjust learning rate mid-run |
 | `S` | Search HuggingFace Hub (Models tab) |
