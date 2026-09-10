@@ -57,9 +57,9 @@ build-debug:
 check:
     cargo check --workspace --exclude pmetal-py
 
-# Build CLI binary (mirrors release CI, including its feature set)
+# Build CLI binary (mirrors release CI: feature set + self-contained MLX)
 build-cli:
-    cargo build --release -p pmetal --features serve,mcp
+    PMETAL_MLX_STATIC=1 cargo build --release -p pmetal --features serve,mcp
 
 # Check GUI compiles (mirrors release CI -- catches cfg mismatches)
 check-gui:

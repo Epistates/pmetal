@@ -154,8 +154,12 @@ fn mlx_fingerprint() -> String {
     } else {
         "other"
     };
+    // Static vs shared changes which artifact lands in the prefix (libmlx.a vs
+    // libmlx.dylib), so it has to be part of the key or a cached prefix from
+    // the other mode gets reused.
+    let static_mlx = mlx_static_requested() as u8;
     format!(
-        "{tag};target={target};macos_deployment={deployment};metal={metal};accelerate={accelerate};debug={debug};os={os}",
+        "{tag};target={target};macos_deployment={deployment};metal={metal};accelerate={accelerate};debug={debug};static={static_mlx};os={os}",
         tag = BUNDLED_MLX_GIT_TAG
     )
 }
@@ -300,11 +304,30 @@ fn run_cmake_build() -> PathBuf {
     #[cfg(not(debug_assertions))]
     {
         config.define("CMAKE_BUILD_TYPE", "Release");
-        config.define("BUILD_SHARED_LIBS", "ON");
         config.define("CMAKE_INTERPROCEDURAL_OPTIMIZATION", "ON");
+        // Release normally builds MLX as a dylib: `libmlx.a` is ~200 MB, and a
+        // release `cargo test` links ~96 test binaries, so a static MLX there
+        // is not viable.
+        //
+        // A *distributed* binary is the opposite case — one binary, and it has
+        // to run on a machine that has never seen this build tree. Set
+        // PMETAL_MLX_STATIC=1 for those (see .github/workflows/release.yml) and
+        // the artifact carries MLX inside it: no dylib to locate, no install
+        // name, no rpath, nothing to bundle. Dead-stripping at link time keeps
+        // the result near the size of the dynamic build.
+        if !mlx_static_requested() {
+            config.define("BUILD_SHARED_LIBS", "ON");
+        }
     }
 
     config.build()
+}
+
+/// Whether to link MLX statically even in release. See the call site.
+///
+/// Debug already builds static unconditionally, so this only steers release.
+fn mlx_static_requested() -> bool {
+    env::var("PMETAL_MLX_STATIC").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
 }
 
 // ── Main build ────────────────────────────────────────────────────────────
@@ -538,6 +561,7 @@ fn build_and_link() {
     println!("cargo:rerun-if-changed=cmake/CMakeLists.txt");
     println!("cargo:rerun-if-env-changed=PMETAL_MLX_PREFIX");
     println!("cargo:rerun-if-env-changed=PMETAL_MLX_LIB_DIR");
+    println!("cargo:rerun-if-env-changed=PMETAL_MLX_STATIC");
 }
 
 fn main() {

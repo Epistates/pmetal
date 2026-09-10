@@ -48,8 +48,27 @@ jobs:
       # consumers don't inherit axum/rmcp, but a shipped binary is expected to
       # have `pmetal serve` and `pmetal mcp` — the TUI's Serve tab and the GUI's
       # Serve page both spawn `pmetal serve`.
+      #
+      # PMETAL_MLX_STATIC links MLX into the binary. Release otherwise builds
+      # libmlx.dylib and stamps its own absolute build-machine path as the
+      # install name, which is why the v0.5.0 artifacts died on launch with
+      # "Library not loaded: /Users/…/libmlx.dylib" (#21). A shipped artifact
+      # has to be self-contained.
       - name: Build CLI
+        env:
+          PMETAL_MLX_STATIC: '1'
         run: cargo build --release --target aarch64-apple-darwin -p pmetal --features serve,mcp
+
+      - name: Verify CLI is self-contained
+        run: |
+          BIN=target/aarch64-apple-darwin/release/pmetal
+          echo "Linked dylibs:"
+          otool -L "$BIN"
+          if otool -L "$BIN" | grep -q 'libmlx'; then
+            echo "ERROR: $BIN still links libmlx dynamically — it will not run off this machine."
+            exit 1
+          fi
+          echo "OK: no libmlx dependency."
 
       - name: Stage metallib
         run: |
@@ -260,6 +279,13 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CARGO_NET_GIT_FETCH_WITH_CLI: 'true'
+          # Link MLX into the app binary. Without this the release build
+          # produces libmlx.dylib whose install name is an absolute path on the
+          # runner, and the shipped .app dies at launch with
+          # "Library not loaded: /Users/…/libmlx.dylib" (#21). Also has to
+          # happen before signing — install_name_tool fixups afterwards would
+          # invalidate the signature that tauri-action applies here.
+          PMETAL_MLX_STATIC: '1'
           APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_DEVELOPER_ID }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
@@ -271,6 +297,25 @@ jobs:
           # tauri.bundle.conf.json carries externalBin/resources and is merged
           # only here, so `bun tauri dev` still works without a staged sidecar.
           args: --target aarch64-apple-darwin -c src-tauri/tauri.bundle.conf.json
+
+      - name: Verify app is self-contained
+        run: |
+          APP_PATH=$(find crates/pmetal-gui/src-tauri/target/aarch64-apple-darwin/release/bundle/macos -name "*.app" -type d | head -n 1)
+          if [ -z "$APP_PATH" ]; then
+            echo "ERROR: no .app bundle found"
+            exit 1
+          fi
+          BIN="$APP_PATH/Contents/MacOS/pmetal-gui"
+          [ -f "$BIN" ] || BIN=$(find "$APP_PATH/Contents/MacOS" -type f -perm +111 ! -name pmetal | head -n 1)
+          echo "Linked dylibs for $BIN:"
+          otool -L "$BIN"
+          if otool -L "$BIN" | grep -q 'libmlx'; then
+            echo "ERROR: the app still links libmlx dynamically — it will not launch off this machine (#21)."
+            exit 1
+          fi
+          echo "Bundled sidecar + resources:"
+          ls -lh "$APP_PATH/Contents/MacOS" "$APP_PATH/Contents/Resources/mlx.metallib"
+          echo "OK: no libmlx dependency."
 
       # Post-build notarization
       - name: Notarize macOS app
