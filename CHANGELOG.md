@@ -7,7 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-09-10
+
+### Fixed
+
+#### Shipped artifacts
+
+- **The v0.5.0 release artifacts could not run off the build machine** ([#21](https://github.com/Epistates/pmetal/issues/21)). The release profile builds MLX as a dylib and stamps its own absolute build path as the install name, so `PMetal.app` died at launch with `Library not loaded: /Users/…/libmlx.dylib`, and `cargo install` left a binary pointing at a build directory it had already deleted. Both release jobs and the Homebrew formula now set `PMETAL_MLX_STATIC=1`, which links MLX into the artifact — no dylib to locate, no install name, no rpath. Each job asserts with `otool` that no `libmlx` dependency survives. Reported and diagnosed by [@imleooooo](https://github.com/imleooooo)
+- **Bundled MLX moved to v0.32.2** ([#24](https://github.com/Epistates/pmetal/issues/24)), which fixes the kernel-JIT failure that made every training run panic against the Metal toolchain in Xcode 26.6. Contributed by [@texchi2](https://github.com/texchi2)
+  - MLX ≥ 0.32 raises `[gather] Cannot calculate VJP with respect to indices`, so every gather whose indices descend from a differentiable tensor now cuts the trace: embedding lookups, cross-entropy label gathers, and MoE routing in `moe_routing`, `gpt_oss_native`, `qwen3_native`, `deepseek_native` and `grouped_gemm_moe`
+  - The metallib override is upstream API now (`mlx::core::metal::set_metallib_path`), so the vendored MLX checkout builds unpatched. The CLI and the GUI both call it; `PMETAL_METALLIB_PATH` is still honoured as an operator override
+
+#### Models
+
+- **Gemma 4 unified multimodal checkpoints** (`model_type: gemma4_unified`, e.g. `mlx-community/gemma-4-12B-it-bf16`) now load: the `language_model.*` prefix is stripped alongside the existing `model.language_model.*`, and `vision_embedder` / `embed_audio` entries are skipped. Contributed by [@texchi2](https://github.com/texchi2)
+
 ### Added
+
+- **DoRA, RSLoRA and LoRA dropout are reachable.** All three are `LoraConfig` fields that `pmetal-lora` honours, and none had a way in: no CLI flag, no `TrainSpec` field, no MCP parameter, while the GUI rendered a DoRA checkbox, an RSLoRA checkbox and a dropout input that were never sent. Adds `--dora`, `--rslora` and `--lora-dropout`, which the TUI form and the MCP `train` tool pick up from the spec
+- **`pmetal tui` gains a jump-to-tab palette (`Ctrl+P`).** `Alt+1-9` reaches nine of twenty tabs; everything past GRPO was only reachable by cycling
+- **The generic weight loader reports checkpoint keys that matched no parameter** ([#19](https://github.com/Epistates/pmetal/issues/19)). `assign_loaded_weights` matched by exact name and dropped the rest in silence, so a checkpoint laid out differently from the parameter tree loads nothing and the model runs on random init while looking healthy. It now logs a warning when nothing matched and an info line when some keys were left over. Reporting approach from [@iilyak](https://github.com/iilyak)
 
 #### New architectures
 
@@ -84,6 +103,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **`pmetal_mlx::prelude::*` no longer makes the name `Result` unusable.** Six `Result` aliases in `kernels/` were glob-exported into the prelude; four were byte-identical duplicates of `kernels::utils::Result` and now reference it, and the two `Exception`-based ones no longer leak into the glob. `pmetal_mlx::kernels::{metal_cross_entropy,metal_swiglu,training_attention,rms_norm,metal_norm_lora}::Result` are no longer nameable
 - **`just preflight`'s lockfile gate could never pass.** It ran `cargo update --locked`, which fails as soon as any transitive dependency publishes a new version; it now runs `cargo metadata --locked`, which fails only when `Cargo.lock` would actually have to change
 - `just fmt` and `just fmt-check` now cover `pmetal-gui/src-tauri`, which is excluded from the workspace and had therefore never been formatted
+- **The toolchain is pinned** (`rust-toolchain.toml`). CI lints with `-D warnings` against unpinned stable, so any stable that adds a lint turns the build red with no change on our side — 1.98 did exactly that. Bumping is now a reviewable commit
 - **Parity oracles migrated from mlx-lm to transformers** across every architecture, with shared fixture helpers and `pmetal_mlx::test_utils`
 - `MllamaImageProcessor` renamed to `FixedSizeImageProcessor`, reflecting what it actually does
 - Gemma 4 caches pre-transposed expert weights

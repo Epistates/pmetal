@@ -58,13 +58,13 @@ cargo build --release --no-default-features --features dashboard
 
 ```toml
 [dependencies]
-pmetal = "0.5"                                    # default features
-pmetal = { version = "0.5", features = ["full"] } # every sub-crate
+pmetal = "0.6"                                    # default features
+pmetal = { version = "0.6", features = ["full"] } # every sub-crate
 
 # Or depend on the crates you need directly
-pmetal-models = "0.5"
-pmetal-trainer = "0.5"
-pmetal-lora = "0.5"
+pmetal-models = "0.6"
+pmetal-trainer = "0.6"
+pmetal-lora = "0.6"
 ```
 
 ## See Also

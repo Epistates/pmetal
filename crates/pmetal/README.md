@@ -10,8 +10,8 @@ This is the umbrella crate that re-exports all PMetal sub-crates behind feature 
 
 ```toml
 [dependencies]
-pmetal = "0.5"                                      # default features
-pmetal = { version = "0.5", features = ["full"] }   # every sub-crate
+pmetal = "0.6"                                      # default features
+pmetal = { version = "0.6", features = ["full"] }   # every sub-crate
 ```
 
 ## Quick Start
