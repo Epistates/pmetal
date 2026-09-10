@@ -95,7 +95,7 @@ rest come in transitively.
 | `trainer` | `pmetal-trainer` | yes | Training loops (SFT, DPO, SimPO, ORPO, KTO, GRPO, DAPO, RLKD, Embedding, PPO, GSPO, Online DPO, Diffusion) — enables `data` + `distill` |
 | `data` | `pmetal-data` | yes* | Dataset loading and preprocessing (*via `cli` and `trainer`) |
 | `distill` | `pmetal-distill` | yes* | Knowledge distillation incl. TAID (*via `trainer`) |
-| `merge` | `pmetal-merge` | yes | Model merging (14 strategies: Linear, SLERP, TIES, DARE, DELLA, ModelStock, etc.) |
+| `merge` | `pmetal-merge` | yes | Model merging (15 strategies: Linear, SLERP, TIES, DARE, DELLA, ModelStock, etc.) |
 | `distributed` | `pmetal-distributed` | yes | Distributed training (mDNS, Ring All-Reduce) and the `cluster` subcommand |
 | `ane` | `pmetal-metal` | yes | Apple Neural Engine direct programming |
 | `dashboard` | — | yes | TUI control center |
