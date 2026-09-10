@@ -1,0 +1,18 @@
+# Pin the toolchain so a new stable release cannot turn CI red on its own.
+#
+# CI lints with `-D warnings`, so every stable that adds a lint breaks the build
+# for everyone at once, with no change on our side. Rust 1.98 did exactly that
+# (`chunks_exact_to_as_chunks` alone fired at 50 sites). Pinning makes the
+# toolchain bump a deliberate, reviewable commit instead of a surprise.
+#
+# To bump: raise `channel`, run `just preflight`, fix what the new lints find,
+# and land it as its own commit. Keep it close to current stable — the point is
+# to control *when* we take the change, not to avoid taking it.
+#
+# `rust-version` in Cargo.toml (the MSRV we promise to library consumers) is a
+# separate, lower number and is not what this file pins.
+[toolchain]
+channel = "1.98.0"
+components = ["rustfmt", "clippy"]
+targets = ["aarch64-apple-darwin"]
+profile = "minimal"
