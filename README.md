@@ -165,7 +165,7 @@ pmetal serve --model Qwen/Qwen3-0.6B --port 8080
 | `tokenize` | Tokenize a text corpus into binary shards for pretraining |
 | `pack-experts` | Pack expert weights for SSD-offloaded MoE inference |
 | `dflash` | Block-diffusion speculative decoding |
-| `mcp` | Start MCP server (51 tools for Claude Desktop / MCP clients) |
+| `mcp` | Start MCP server over stdio (51 tools for Claude Desktop / Claude Code) |
 | `cluster` | Multi-Mac cluster: discover peers, train across machines, run all-reduce / pipeline benchmarks |
 
 ### Multi-Mac Cluster (Thunderbolt-aware)

@@ -52,4 +52,5 @@ yourself, `serve` is opt-in: `cargo install pmetal --features serve`.
 ## See Also
 
 - [pmetal infer](/cli/infer/) — Interactive inference
+- [pmetal mcp](/cli/mcp/) — MCP server for Claude Desktop and Claude Code
 - [Feature Flags](/configuration/feature-flags/) — Enable the serve feature
