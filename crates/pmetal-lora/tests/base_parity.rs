@@ -1056,3 +1056,38 @@ fn only_adapters_are_trainable() {
         );
     }
 }
+
+/// The adapted model answers for the architecture it wraps.
+///
+/// The trainer asks these of whatever it is fine-tuning; delegating rather than
+/// re-deriving is the point.
+#[test]
+fn the_adapted_model_reports_its_architecture() {
+    for case in cases() {
+        let Ok(base) = DynamicModel::from_config(case.config_json) else {
+            continue;
+        };
+        let expected = base.architecture();
+        let mut adapted = AdaptedModel::attach(base, lora_config()).expect("attach");
+
+        assert_eq!(adapted.architecture(), expected, "{}", case.name);
+        assert!(
+            TrainableModel::supports_kv_cache(&adapted),
+            "{}: an adapted model should still support KV caching",
+            case.name
+        );
+        assert!(
+            TrainableModel::create_cache(&adapted, 64).is_some(),
+            "{}: could not build a cache",
+            case.name
+        );
+
+        // Hidden states must still be reachable, for cut cross-entropy.
+        let ids = input_ids(config_int(&case, "vocab_size").expect("vocab"));
+        assert!(
+            adapted.forward_hidden(&ids, None).is_ok(),
+            "{}: forward_hidden failed",
+            case.name
+        );
+    }
+}

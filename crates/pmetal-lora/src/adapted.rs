@@ -217,6 +217,27 @@ impl AdaptedModel {
     pub fn eval_all(&self) -> Result<(), LoraError> {
         self.model.eval().map_err(LoraError::Mlx)
     }
+
+    /// Which architecture is loaded.
+    pub fn architecture(&self) -> pmetal_models::ModelArchitecture {
+        self.model.architecture()
+    }
+
+    /// Hidden states before the LM head, for cut cross-entropy.
+    pub fn forward_hidden(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array, LoraError> {
+        self.model
+            .forward_hidden(input_ids, mask)
+            .map_err(LoraError::Mlx)
+    }
+
+    /// A KV cache sized for this architecture.
+    pub fn create_cache(&self, max_seq_len: usize) -> pmetal_mlx::kv_cache::KVCache {
+        self.model.create_cache(max_seq_len)
+    }
 }
 
 /// Whether a projection at `path` should carry an adapter.
@@ -281,6 +302,14 @@ impl crate::TrainableModel for AdaptedModel {
         self.model
             .forward_with_cache(input_ids, mask, cache)
             .map_err(LoraError::Mlx)
+    }
+
+    fn supports_kv_cache(&self) -> bool {
+        true
+    }
+
+    fn create_cache(&self, max_seq_len: usize) -> Option<pmetal_mlx::kv_cache::KVCache> {
+        Some(AdaptedModel::create_cache(self, max_seq_len))
     }
 }
 
