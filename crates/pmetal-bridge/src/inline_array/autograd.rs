@@ -84,6 +84,13 @@ where
 
 // ── Gradient checkpointing ───────────────────────────────────────────────
 
+/// Capacity of the output buffer handed to the checkpointed callback.
+///
+/// The callback reports how many outputs it actually produced, so this only has
+/// to be an upper bound: a decoder layer running one at a time produces at most
+/// a handful (hidden, kv_k, kv_v, state).  Both sides clamp to it.
+const MAX_OUTPUTS: usize = 64;
+
 /// Apply gradient checkpointing to a forward function.
 ///
 /// `inner_fn` receives the input arrays and must return a `Vec<InlineArray>`.
@@ -93,24 +100,53 @@ where
 /// O(layers × batch × seq × hidden) to O(1 layer) at the cost of one extra
 /// forward pass per gradient step.
 ///
+/// # Gradients only reach `inputs`
+///
+/// `checkpoint` installs a `custom_vjp`, and a `custom_vjp` differentiates with
+/// respect to its explicit primals.  Anything `inner_fn` captures is a constant
+/// to the tape and comes back with a **zero** gradient, silently.  Every tensor
+/// that needs to be trained has to arrive through `inputs` and be read out of
+/// the slice, which is why the module-level wrapper threads a layer's trainable
+/// parameters in and writes them back before running the layer.
+///
 /// # Usage
 ///
 /// ```ignore
 /// let outputs = checkpoint_apply(&inputs, |arrays| {
 ///     // normal forward computation using InlineArray ops
-///     let h = arrays[0].matmul(&weight);
+///     let h = arrays[0].matmul(&arrays[1]);
 ///     vec![h.relu()]
 /// });
 /// ```
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if the C++ checkpoint call throws (logged to stderr before panicking).
-// TODO(gradient-checkpointing): wire into training loops (v0.4.0 roadmap).
-// Memory win: O(layers) → O(1) activation memory at the cost of one recompute
-// pass. Kept available for when the training loop opts in.
-#[allow(dead_code)]
-pub fn checkpoint_apply<F>(inputs: &[InlineArray], mut inner_fn: F) -> Vec<InlineArray>
+/// Returns an empty `Vec` if the C++ side threw; the reason is available from
+/// [`crate::check_last_error`].
+pub fn checkpoint_apply<F>(inputs: &[InlineArray], inner_fn: F) -> Vec<InlineArray>
+where
+    F: FnMut(&[InlineArray]) -> Vec<InlineArray> + 'static,
+{
+    // Safety: `F: 'static`, so the closure cannot dangle no matter how long MLX
+    // holds on to the graph.
+    unsafe { checkpoint_apply_unchecked(inputs, inner_fn) }
+}
+
+/// [`checkpoint_apply`] without the `'static` bound on the closure.
+///
+/// # Safety
+///
+/// `inner_fn` is invoked again during the backward pass, which happens after
+/// this function returns, and MLX keeps the closure alive for as long as any
+/// array still references the resulting graph.  The caller must guarantee that
+/// everything `inner_fn` borrows outlives every differentiation of that graph.
+///
+/// The intended use is a decoder layer borrowed from a model that the training
+/// loop owns: the model outlives the step, and each step's graph is
+/// differentiated once.  Retaining an output array past the model's lifetime,
+/// or differentiating the same graph a second time after the borrow has ended,
+/// is undefined behaviour.
+pub unsafe fn checkpoint_apply_unchecked<F>(inputs: &[InlineArray], inner_fn: F) -> Vec<InlineArray>
 where
     F: FnMut(&[InlineArray]) -> Vec<InlineArray>,
 {
@@ -138,64 +174,56 @@ where
             .collect();
 
         let results = f(&arrays);
-        let n = results.len();
+        // `outputs_out` holds MAX_OUTPUTS slots; writing past them would run off
+        // the end of the caller's buffer.
+        let n = results.len().min(MAX_OUTPUTS);
 
         // Write each output via placement-copy into the caller's flat buffer.
-        for (i, r) in results.iter().enumerate() {
+        for (i, r) in results.iter().take(n).enumerate() {
             unsafe { mlx_inline_init_copy(outputs_out.add(i), &r.raw) };
         }
         unsafe { *n_outputs_out = n as i32 };
         // `arrays` and `results` drop here, calling mlx_inline_destroy for each.
     }
 
+    // Frees the boxed closure once C++ drops the last copy of the checkpointed
+    // function.  Paired with the `Box::into_raw` below.
+    unsafe extern "C" fn drop_ctx<F>(ctx: *mut std::ffi::c_void) {
+        drop(unsafe { Box::from_raw(ctx as *mut F) });
+    }
+
     let n_total = inputs.len();
     // Build flat pointer array for the C++ side.
     let all_ptrs: Vec<*const RawBuf> = inputs.iter().map(|a| &a.raw as *const RawBuf).collect();
 
-    // Pre-allocate output buffer.  We don't know n_outputs ahead of time so
-    // we ask inner_fn once with a dry run — but that would break the graph.
-    // Instead, we use a convention: inner_fn is called exactly once inside
-    // checkpoint(); its return Vec length sets n_outputs_max.  We must know
-    // this capacity before the C++ call.  The caller communicates this via a
-    // sentinel: we call inner_fn on *copies* to count outputs, then replay
-    // via the checkpointed path.
-    //
-    // In practice, callers always know how many tensors their forward pass
-    // returns (it's statically determined).  The trampoline writes into
-    // outputs_out using the count returned by the callback itself, so we
-    // only need to allocate a buffer large enough.  We use a fixed max of
-    // 64 outputs — sufficient for any realistic use (a 28-layer model running
-    // one layer at a time produces at most ~4 outputs: hidden, kv_k, kv_v, state).
-    //
-    // The C++ side also guards against overflow via `i < n_outputs_max`.
-    // Pre-initialize each slot with a valid scalar so the C++ side can safely
-    // call placement-new over them (matching the established bridge convention
-    // used in value_and_grad's grads_out pre-initialization).
-    const MAX_OUTPUTS: usize = 64;
-    let mut output_storage: Vec<InlineArray> = (0..MAX_OUTPUTS)
-        .map(|_| InlineArray::from_f32(0.0))
-        .collect();
+    // The slots are left uninitialised for C++ to placement-new into, and
+    // `set_len` afterwards claims exactly the ones it wrote.  Pre-filling them
+    // with real arrays instead would leak one per slot per call, since
+    // placement-new does not run the destructor of what it overwrites.
+    let mut output_storage: Vec<InlineArray> = Vec::with_capacity(MAX_OUTPUTS);
+
+    // Hand the closure to C++, which keeps it alive until the graph is gone.
+    let ctx = Box::into_raw(Box::new(inner_fn)) as *mut std::ffi::c_void;
 
     let mut n_written: i32 = 0;
     unsafe {
         mlx_inline_checkpoint(
             trampoline::<F>,
-            &mut inner_fn as *mut F as *mut std::ffi::c_void,
+            ctx,
+            drop_ctx::<F>,
             all_ptrs.as_ptr(),
             n_total as i32,
             MAX_OUTPUTS as i32,
-            // Safety: InlineArray is a single-field struct whose only field is
-            // RawBuf, so &mut output_storage[0].raw is the first byte of the
-            // first element of a contiguous Vec<InlineArray> — valid for
-            // pointer arithmetic up to MAX_OUTPUTS elements.
-            &mut output_storage[0].raw,
+            // Safety: InlineArray is a single-field struct wrapping RawBuf, so
+            // the Vec's buffer is MAX_OUTPUTS contiguous RawBuf-sized slots.
+            output_storage.as_mut_ptr() as *mut RawBuf,
             &mut n_written,
         );
     }
 
-    // Truncate to the actual count written by the callback.  The remaining
-    // slots (still holding their from_f32(0.0) arrays) are dropped by Vec.
-    let n = n_written as usize;
-    output_storage.truncate(n);
+    // Safety: C++ placement-new'd exactly `n_written` slots (clamped to
+    // MAX_OUTPUTS on its side), and wrote 0 if it threw.
+    let n = (n_written as usize).min(MAX_OUTPUTS);
+    unsafe { output_storage.set_len(n) };
     output_storage
 }

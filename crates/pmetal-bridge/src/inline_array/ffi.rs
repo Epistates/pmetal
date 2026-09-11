@@ -1303,7 +1303,9 @@ unsafe extern "C" {
             *mut i32,             // n_outputs_out (written by callback)
             *mut std::ffi::c_void,
         ),
+        // Takes ownership of `ctx`; `drop_fn` is called when C++ releases it.
         ctx: *mut std::ffi::c_void,
+        drop_fn: unsafe extern "C" fn(*mut std::ffi::c_void),
         all_arrays: *const *const RawBuf,
         n_total: i32,
         n_outputs_max: i32,

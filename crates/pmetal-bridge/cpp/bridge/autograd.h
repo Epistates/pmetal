@@ -42,12 +42,21 @@ typedef void (*mlx_rust_checkpoint_fn)(
     void* ctx
 );
 
+// Called once, when C++ releases `ctx`. Frees the boxed Rust closure.
+typedef void (*mlx_rust_drop_fn)(void* ctx);
+
 // Apply gradient checkpointing to a forward function over the given inputs.
 // The inner function may produce multiple output arrays (n_outputs_max capacity).
 // On return, dst_outputs[0..*n_outputs_written-1] hold the output arrays.
+//
+// Takes ownership of `ctx`: checkpoint() re-invokes `forward_fn` during the
+// backward pass, long after this call returns, so `ctx` must outlive the graph
+// rather than the call. `drop_fn` is invoked when the last copy of the internal
+// closure is destroyed.
 void mlx_inline_checkpoint(
     mlx_rust_checkpoint_fn forward_fn,
     void* ctx,
+    mlx_rust_drop_fn drop_fn,
     const mlx_inline_array* const* all_arrays,
     int n_total,
     int n_outputs_max,

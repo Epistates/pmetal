@@ -2,6 +2,7 @@
 // Extracted from bridge.cpp for maintainability.
 
 #include "bridge_internal.h"
+#include <memory>
 #include <numeric>
 
 extern "C" {
@@ -659,6 +660,14 @@ void mlx_inline_conv2d(mlx_inline_array* dst, const mlx_inline_array* input,
 //   5. Writes outputs via placement-new into dst_outputs[0..n_outputs-1].
 //
 // n_outputs_max must equal the number of outputs the forward_fn will produce.
+//
+// LIFETIME.  checkpoint() does not run the forward function once and forget it.
+// It installs a custom_vjp whose backward *re-invokes* the same function, and
+// that happens whenever the surrounding graph is differentiated, which is after
+// this call has returned.  So neither the lambda nor `ctx` may point at anything
+// owned by this stack frame: capture is by value, and `ctx` is adopted into a
+// shared_ptr whose deleter hands it back to Rust once MLX drops the last copy
+// of the closure.  Capturing by reference here reliably faults during backward.
 
 typedef void (*mlx_rust_checkpoint_fn)(
     const mlx_inline_array* const* all_arrays,
@@ -668,9 +677,12 @@ typedef void (*mlx_rust_checkpoint_fn)(
     void* ctx
 );
 
+typedef void (*mlx_rust_drop_fn)(void* ctx);
+
 void mlx_inline_checkpoint(
     mlx_rust_checkpoint_fn forward_fn,
     void* ctx,
+    mlx_rust_drop_fn drop_fn,
     const mlx_inline_array* const* all_arrays,
     int n_total,
     int n_outputs_max,
@@ -684,9 +696,18 @@ void mlx_inline_checkpoint(
         inputs.push_back(as_arr(all_arrays[i]));
     }
 
+    // Adopt `ctx`. Every copy of the closure below shares this guard, so the
+    // Rust box stays alive exactly as long as MLX can still call back into it.
+    std::shared_ptr<void> ctx_guard(ctx, [drop_fn](void* p) {
+        if (drop_fn != nullptr && p != nullptr) {
+            drop_fn(p);
+        }
+    });
+
     // Lambda that calls back into Rust to build the forward graph.
     // Returns a std::vector<array> matching the outputs the callback emits.
-    auto cpp_forward = [&](const std::vector<array>& args) -> std::vector<array> {
+    auto cpp_forward = [forward_fn, ctx_guard, n_outputs_max](
+                           const std::vector<array>& args) -> std::vector<array> {
         // Wrap each array as a temporary InlineArray for the Rust callback.
         std::vector<mlx_inline_array> bufs(args.size());
         std::vector<const mlx_inline_array*> ptrs(args.size());
@@ -695,24 +716,23 @@ void mlx_inline_checkpoint(
             ptrs[i] = &bufs[i];
         }
 
-        // Allocate output buffer for the Rust callback.
+        // Raw storage for the callback to placement-new its outputs into.
+        // Deliberately left uninitialised: the callback placement-news each
+        // slot it uses, and placement-new does not destroy what it overwrites,
+        // so pre-filling these would leak one array per slot per call.  Only
+        // the slots the callback reports are read back and destroyed.
         std::vector<mlx_inline_array> out_bufs(n_outputs_max);
-        for (int i = 0; i < n_outputs_max; i++) {
-            mlx_inline_init_empty(&out_bufs[i]);
-        }
         int n_out = 0;
-        forward_fn(ptrs.data(), (int)ptrs.size(), out_bufs.data(), &n_out, ctx);
+        forward_fn(ptrs.data(), (int)ptrs.size(), out_bufs.data(), &n_out, ctx_guard.get());
+        if (n_out > n_outputs_max) {
+            n_out = n_outputs_max;
+        }
 
         // Collect outputs before destroying the bufs.
         std::vector<array> results;
         results.reserve(n_out);
         for (int i = 0; i < n_out; i++) {
             results.push_back(as_arr(&out_bufs[i]));
-            as_arr(&out_bufs[i]).~array();
-        }
-        // Remaining output slots that were never initialised are still
-        // default-initialised (mlx_inline_init_empty) — destroy them too.
-        for (int i = n_out; i < n_outputs_max; i++) {
             as_arr(&out_bufs[i]).~array();
         }
 

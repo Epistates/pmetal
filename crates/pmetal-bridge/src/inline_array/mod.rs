@@ -22,7 +22,7 @@ mod safetensors;
 pub use safetensors::{load_safetensors_shard, random_seed};
 
 mod autograd;
-pub use autograd::{checkpoint_apply, value_and_grad};
+pub use autograd::{checkpoint_apply, checkpoint_apply_unchecked, value_and_grad};
 
 mod compiled;
 mod eval;
