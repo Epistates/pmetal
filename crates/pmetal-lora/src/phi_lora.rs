@@ -23,9 +23,14 @@ use pmetal_bridge::compat::{
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{apply_rope, apply_rope_with_freqs},
+};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
-use pmetal_models::architectures::phi::{PhiActivation, PhiConfig};
+use pmetal_models::architectures::phi::{
+    LongRopeFreqs, PhiActivation, PhiConfig, compute_longrope_freqs,
+};
 
 use crate::lora::LoraProjection;
 use crate::lora_helpers::{
@@ -85,6 +90,12 @@ pub struct PhiLoraAttention {
     pub rope_dim: i32,
     /// Attention scale.
     pub scale: f32,
+    /// LongRoPE / SuRoPE tables, when the config asks for them.
+    ///
+    /// Phi-3-128k and Phi-3.5 ship two per-dimension scaling vectors and choose
+    /// between them by sequence length. Without this the rotation falls back to
+    /// un-scaled base frequencies, which is a different model.
+    pub long_rope: Option<LongRopeFreqs>,
 }
 
 impl PhiLoraAttention {
@@ -143,6 +154,26 @@ impl PhiLoraAttention {
 
         let scale = 1.0 / (head_dim as f32).sqrt();
 
+        // LongRoPE tables (Phi-3 128K / Phi-3.5 / Phi-4), built by the same
+        // function `PhiAttention` uses.
+        let long_rope = config
+            .rope_scaling
+            .as_ref()
+            .filter(|scaling| matches!(scaling.scaling_type.as_str(), "su" | "longrope" | "linear"))
+            .and_then(|scaling| {
+                let orig_max = config
+                    .original_max_position_embeddings
+                    .unwrap_or(config.max_position_embeddings);
+                compute_longrope_freqs(
+                    scaling,
+                    rope_dim,
+                    config.rope_theta,
+                    config.max_position_embeddings,
+                    orig_max,
+                )
+                .ok()
+            });
+
         Ok(Self {
             q_proj,
             k_proj,
@@ -154,7 +185,30 @@ impl PhiLoraAttention {
             head_dim,
             rope_dim,
             scale,
+            long_rope,
         })
+    }
+
+    /// Rotate the rotary slice, choosing the LongRoPE table by how far this
+    /// forward reaches.
+    ///
+    /// `mscale` is the *value* scale and is applied to the slice before
+    /// rotation; it must not also be passed as a position scale, which would
+    /// double-apply it. Mirrors `PhiAttention::forward_with_cache`.
+    fn rotate(&self, rope_slice: &Array, offset: i32, seq_len: i32) -> Result<Array, Exception> {
+        let mscale = self.long_rope.as_ref().map_or(1.0, |lr| lr.mscale);
+        let scaled = if mscale != 1.0 {
+            rope_slice.multiply(&Array::from_f32(mscale))
+        } else {
+            rope_slice.clone()
+        };
+        match self.long_rope.as_ref() {
+            Some(long_rope) => {
+                let freqs = long_rope.table_for(offset + seq_len - 1);
+                apply_rope_with_freqs(&scaled, freqs, self.rope_dim, false, offset)
+            }
+            None => apply_rope(&scaled, self.rope_dim, false, self.rope.base, 1.0, offset),
+        }
     }
 
     /// Forward pass through attention.
@@ -165,26 +219,29 @@ impl PhiLoraAttention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        // Reshape to [batch, seq, n_heads, head_dim]
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        // Reshape and transpose to [batch, n_heads, seq, head_dim] BEFORE RoPE,
+        // so axis -2 is the sequence axis. Rotating in [B, S, H, D] makes the
+        // head axis the position axis, the bug `PhiAttention` documents fixing.
+        let q = q
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let k = k
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let v = v
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply partial RoPE
-        let (q_rope, q_pass) = self.split_rotary(&q)?;
-        let (k_rope, k_pass) = self.split_rotary(&k)?;
+        // Partial RoPE split on the last axis (head_dim -> rope_dim + pass).
+        let (q_rope, q_pass) = self.split_rotary_transposed(&q)?;
+        let (k_rope, k_pass) = self.split_rotary_transposed(&k)?;
 
-        let q_rope = Module::forward(&mut self.rope, &q_rope)?;
-        let k_rope = Module::forward(&mut self.rope, &k_rope)?;
+        let q_rope = self.rotate(&q_rope, 0, seq_len)?;
+        let k_rope = self.rotate(&k_rope, 0, seq_len)?;
 
         // Concatenate RoPE and pass-through parts
         let q = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
         let k = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1);
-
-        // Transpose for attention: [batch, n_heads, seq, head_dim]
-        let q = q.transpose_axes(&[0, 2, 1, 3]);
-        let k = k.transpose_axes(&[0, 2, 1, 3]);
-        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Expand KV heads for GQA
         let k = if self.n_kv_heads < self.n_heads {
@@ -254,30 +311,17 @@ impl PhiLoraAttention {
         let keys = keys.transpose_axes(&[0, 2, 1, 3]);
         let values = values.transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply partial RoPE with cache offset
-        let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
-            let offset = cache_ref.rope_offset();
-
-            // Apply partial RoPE to query
+        // Apply partial RoPE with the cache offset. Both branches go through
+        // `rotate`, so a cached decode uses the same LongRoPE table the prefill
+        // that seeded it did.
+        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let (queries, keys, values) = {
             let (q_rope, q_pass) = self.split_rotary_transposed(&queries)?;
-            let q_rope = apply_rope(&q_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
+            let q_rope = self.rotate(&q_rope, offset, seq_len)?;
             let queries = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
 
-            // Apply partial RoPE to key
             let (k_rope, k_pass) = self.split_rotary_transposed(&keys)?;
-            let k_rope = apply_rope(&k_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
-            let keys = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1);
-
-            (queries, keys, values)
-        } else {
-            // No cache - use standard RoPE
-            let (q_rope, q_pass) = self.split_rotary_transposed(&queries)?;
-            let (k_rope, k_pass) = self.split_rotary_transposed(&keys)?;
-
-            let q_rope = Module::forward(&mut self.rope, &q_rope)?;
-            let k_rope = Module::forward(&mut self.rope, &k_rope)?;
-
-            let queries = pmetal_bridge::compat::ops::concatenate_axis(&[&q_rope, &q_pass], -1);
+            let k_rope = self.rotate(&k_rope, offset, seq_len)?;
             let keys = pmetal_bridge::compat::ops::concatenate_axis(&[&k_rope, &k_pass], -1);
 
             (queries, keys, values)
@@ -309,15 +353,9 @@ impl PhiLoraAttention {
         self.o_proj.forward(&output).map_err(LoraError::from)
     }
 
-    /// Split tensor into RoPE and pass-through parts.
-    fn split_rotary(&self, x: &Array) -> Result<(Array, Array), Exception> {
-        let rope_part = pmetal_bridge::compat::ops::slice_last_to(x, self.rope_dim);
-        let pass_part = pmetal_bridge::compat::ops::slice_last_from(x, self.rope_dim);
-        Ok((rope_part, pass_part))
-    }
-
-    /// Split tensor into RoPE and pass-through parts (for transposed layout).
-    /// Input: [B, heads, seq, head_dim]
+    /// Split a tensor into its RoPE and pass-through parts.
+    ///
+    /// Slices the last axis, so the leading layout does not matter.
     fn split_rotary_transposed(&self, x: &Array) -> Result<(Array, Array), Exception> {
         let rope_part = pmetal_bridge::compat::ops::slice_last_to(x, self.rope_dim);
         let pass_part = pmetal_bridge::compat::ops::slice_last_from(x, self.rope_dim);

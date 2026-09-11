@@ -184,10 +184,7 @@ fn cases() -> Vec<ArchCase> {
                     "long_factor": [1.0, 1.4, 1.8, 2.2, 2.6, 3.0, 3.4, 3.8]
                 }
             }"#,
-            known_divergence: Some(
-                "PhiLoraAttention has no LongRoPE: it applies plain RoPE whatever \
-                 rope_scaling says, so a 128k Phi-3 trains against the wrong positions.",
-            ),
+            known_divergence: None,
         },
         ArchCase {
             name: "cohere",

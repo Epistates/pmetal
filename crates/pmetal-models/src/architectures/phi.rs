@@ -82,7 +82,11 @@ impl LongRopeFreqs {
 /// `factor = max_pos / orig_max_pos`, matching `transformers`'
 /// `_compute_longrope_parameters` when the config states no explicit
 /// `attention_factor`.
-fn compute_longrope_freqs(
+///
+/// Public so `pmetal-lora`'s Phi can build the same tables. A second
+/// implementation of this is how a 128k Phi comes to be fine-tuned against
+/// positions it will never be served with.
+pub fn compute_longrope_freqs(
     scaling: &PhiRopeScaling,
     rope_dim: i32,
     rope_theta: f32,
