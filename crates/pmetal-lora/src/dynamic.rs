@@ -257,8 +257,13 @@ impl DynamicLoraModel {
                 Ok(DynamicLoraModel::Qwen3(model))
             }
             ModelArchitecture::Gemma => {
-                let gemma_config: pmetal_models::architectures::gemma::GemmaConfig =
-                    serde_json::from_str(&config_content)?;
+                // `is_gemma2` / `is_gemma3` are pmetal's own flags, derived from
+                // `model_type` rather than read from the checkpoint. Plain
+                // deserialization leaves both false, which runs the Gemma-v1
+                // architecture against a Gemma 2 or 3 checkpoint: no
+                // pre/post-feedforward norms, no softcaps, no window interleave.
+                let gemma_config = pmetal_models::dispatcher::parse_gemma_config(&config_content)
+                    .map_err(|e| DynamicLoraError::Lora(LoraError::Mlx(e)))?;
 
                 let mut model = GemmaLoraForCausalLM::new(gemma_config, lora_config)?;
                 model.load_base_weights_from_dir(model_dir)?;

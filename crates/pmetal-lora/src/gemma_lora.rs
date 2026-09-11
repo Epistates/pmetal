@@ -33,6 +33,7 @@ use crate::lora::LoraProjection;
 use crate::lora_helpers::{
     LoraDecoderStack, collect_lora_parameters, count_trainable_params, load_lora_weights_impl,
     save_lora_weights_impl, set_lora_parameters as helpers_set_lora_parameters,
+    training_attention_mask,
 };
 use crate::{LoraError, LoraLinear};
 
@@ -118,6 +119,13 @@ pub struct GemmaLoraAttention {
     pub scale: f32,
     /// Attention logit softcapping (Gemma2).
     pub logit_softcapping: Option<f32>,
+    /// Whether this layer attends locally (sliding window) rather than globally.
+    ///
+    /// Gemma 2 alternates; Gemma 3 makes every layer local except one in
+    /// `sliding_window_pattern`. Gemma 1 is uniformly causal.
+    pub is_local_attention: bool,
+    /// Window width for a local layer.
+    pub sliding_window: Option<i32>,
 
     /// Query projection with LoRA.
     pub q_proj: LoraLinear,
@@ -129,15 +137,37 @@ pub struct GemmaLoraAttention {
     pub o_proj: LoraLinear,
     /// RoPE layer.
     pub rope: nn::Rope,
+    /// Gemma 3 QK-norm over the head dimension, applied before RoPE.
+    pub q_norm: Option<GemmaRmsNorm>,
+    /// Gemma 3 QK-norm over the head dimension, applied before RoPE.
+    pub k_norm: Option<GemmaRmsNorm>,
 }
 
 impl GemmaLoraAttention {
     /// Create a new LoRA attention layer.
-    pub fn new(config: &GemmaConfig, lora_config: &LoraConfig) -> Result<Self, LoraError> {
+    ///
+    /// `layer_idx` decides whether this layer attends locally, which in turn
+    /// decides its RoPE base: Gemma 3 runs a second, much smaller base on its
+    /// local layers. Mirrors `GemmaAttention::new` in pmetal-models.
+    pub fn new(
+        config: &GemmaConfig,
+        lora_config: &LoraConfig,
+        layer_idx: usize,
+    ) -> Result<Self, LoraError> {
         let n_heads = config.num_attention_heads;
         let n_kv_heads = config.num_kv_heads();
         let head_dim = config.get_head_dim();
         let scale = config.attention_scale();
+
+        let is_local_attention = if config.is_gemma3 {
+            (layer_idx as i32 + 1) % config.sliding_window_pattern != 0
+        } else {
+            config.is_gemma2 && (layer_idx % 2 == 0)
+        };
+        let rope_theta = match config.rope_local_base_freq {
+            Some(local) if is_local_attention => local,
+            _ => config.rope_theta,
+        };
 
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
@@ -181,10 +211,21 @@ impl GemmaLoraAttention {
         )?;
 
         let rope = nn::RopeBuilder::new(head_dim)
-            .base(config.rope_theta)
+            .base(rope_theta)
             .traditional(false)
             .build()
             .unwrap();
+
+        // Gemma 3's QK-norm normalizes over the head dimension, so these are
+        // sized `head_dim`, not `hidden_size`.
+        let (q_norm, k_norm) = if config.is_gemma3 {
+            (
+                Some(GemmaRmsNorm::new(head_dim, config.rms_norm_eps)?),
+                Some(GemmaRmsNorm::new(head_dim, config.rms_norm_eps)?),
+            )
+        } else {
+            (None, None)
+        };
 
         Ok(Self {
             n_heads,
@@ -192,11 +233,15 @@ impl GemmaLoraAttention {
             head_dim,
             scale,
             logit_softcapping: config.attn_logit_softcapping,
+            is_local_attention,
+            sliding_window: config.sliding_window,
             q_proj,
             k_proj,
             v_proj,
             o_proj,
             rope,
+            q_norm,
+            k_norm,
         })
     }
 
@@ -219,6 +264,16 @@ impl GemmaLoraAttention {
         let values = values
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
+
+        // Gemma 3 normalizes q/k over the head dimension before RoPE.
+        let queries = match self.q_norm.as_ref() {
+            Some(norm) => norm.forward(&queries)?,
+            None => queries,
+        };
+        let keys = match self.k_norm.as_ref() {
+            Some(norm) => norm.forward(&keys)?,
+            None => keys,
+        };
 
         // Apply RoPE
         let queries = Module::forward(&mut self.rope, &queries)?;
@@ -300,6 +355,16 @@ impl GemmaLoraAttention {
         let keys = keys.transpose_axes(&[0, 2, 1, 3]);
         let values = values.transpose_axes(&[0, 2, 1, 3]);
 
+        // Gemma 3 normalizes q/k over the head dimension before RoPE.
+        let queries = match self.q_norm.as_ref() {
+            Some(norm) => norm.forward(&queries)?,
+            None => queries,
+        };
+        let keys = match self.k_norm.as_ref() {
+            Some(norm) => norm.forward(&keys)?,
+            None => keys,
+        };
+
         // Get RoPE offset and apply RoPE
         let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
             let offset = cache_ref.rope_offset();
@@ -321,11 +386,22 @@ impl GemmaLoraAttention {
             (keys, values)
         };
 
-        // Use fused attention kernel for inference
+        // A caller-supplied mask is already complete; a local layer without one
+        // needs its window, not a blanket causal mask.
+        let mask_type = if mask.is_some() {
+            AttentionMaskType::None
+        } else if self.is_local_attention {
+            match self.sliding_window {
+                Some(window) => AttentionMaskType::SlidingWindow(window),
+                None => AttentionMaskType::Causal,
+            }
+        } else {
+            AttentionMaskType::Causal
+        };
         let mut attn_config =
             FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
                 .with_scale(self.scale)
-                .with_mask_type(AttentionMaskType::Causal);
+                .with_mask_type(mask_type);
 
         // Apply logit softcapping if configured (Gemma2)
         if let Some(cap) = self.logit_softcapping {
@@ -457,8 +533,12 @@ pub struct GemmaLoraDecoderLayer {
 
 impl GemmaLoraDecoderLayer {
     /// Create a new decoder layer with LoRA.
-    pub fn new(config: &GemmaConfig, lora_config: &LoraConfig) -> Result<Self, LoraError> {
-        let self_attn = GemmaLoraAttention::new(config, lora_config)?;
+    pub fn new(
+        config: &GemmaConfig,
+        lora_config: &LoraConfig,
+        layer_idx: usize,
+    ) -> Result<Self, LoraError> {
+        let self_attn = GemmaLoraAttention::new(config, lora_config, layer_idx)?;
         let mlp = GemmaLoraMLP::new(config, lora_config)?;
 
         let input_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
@@ -531,8 +611,12 @@ pub struct Gemma2LoraDecoderLayer {
 
 impl Gemma2LoraDecoderLayer {
     /// Create a new Gemma2 decoder layer with LoRA.
-    pub fn new(config: &GemmaConfig, lora_config: &LoraConfig) -> Result<Self, LoraError> {
-        let self_attn = GemmaLoraAttention::new(config, lora_config)?;
+    pub fn new(
+        config: &GemmaConfig,
+        lora_config: &LoraConfig,
+        layer_idx: usize,
+    ) -> Result<Self, LoraError> {
+        let self_attn = GemmaLoraAttention::new(config, lora_config, layer_idx)?;
         let mlp = GemmaLoraMLP::new(config, lora_config)?;
 
         let input_layernorm = GemmaRmsNorm::new(config.hidden_size, config.rms_norm_eps)?;
@@ -633,6 +717,46 @@ impl GemmaLoraLayers {
     }
 }
 
+/// The masks a Gemma trunk owes its layers when the caller supplies none.
+///
+/// Gemma 1 is uniformly causal and needs one mask. Gemma 2 alternates local and
+/// global layers, and Gemma 3 makes every layer local but one, so a single
+/// shared mask is wrong for whichever group it does not describe. Handing a
+/// blanket causal mask to a local layer silently un-windows it, and that stays
+/// invisible below the window, where causal and sliding are the same mask.
+///
+/// Inference sidesteps this by passing `None` down and letting each layer's
+/// `AttentionMaskType` decide. The training path hand-rolls its softmax and can
+/// only add the mask it is given, so the trunk has to decide instead.
+struct GemmaTrunkMasks {
+    global: Array,
+    local: Option<Array>,
+}
+
+impl GemmaTrunkMasks {
+    fn build(seq_len: i32, config: &GemmaConfig) -> Result<Self, LoraError> {
+        let local = match config.sliding_window {
+            Some(window) if config.has_local_layers() => {
+                Some(training_attention_mask(seq_len, Some(window))?)
+            }
+            _ => None,
+        };
+        Ok(Self {
+            global: training_attention_mask(seq_len, None)?,
+            local,
+        })
+    }
+
+    /// The mask for one layer. A local layer falls back to the global mask when
+    /// the config states no window, matching `GemmaAttention`'s own fallback.
+    fn for_layer(&self, is_local: bool) -> &Array {
+        match (is_local, self.local.as_ref()) {
+            (true, Some(local)) => local,
+            _ => &self.global,
+        }
+    }
+}
+
 /// LoRA-enabled Gemma model (without LM head).
 #[derive(Debug)]
 pub struct GemmaLoraModel {
@@ -656,17 +780,18 @@ impl GemmaLoraModel {
         let embed_tokens = nn::Embedding::new(config.vocab_size, config.hidden_size)?;
         let embedding_scale = config.embedding_scale();
 
-        // Create appropriate layer type based on config
-        let layers = if config.is_gemma2 {
+        // Gemma 3 uses Gemma 2-style layers (pre/post feedforward norms), the
+        // same selection `GemmaModel::new` makes in pmetal-models.
+        let layers = if config.is_gemma2 || config.is_gemma3 {
             GemmaLoraLayers::Gemma2(
                 (0..config.num_hidden_layers)
-                    .map(|_| Gemma2LoraDecoderLayer::new(&config, &lora_config))
+                    .map(|i| Gemma2LoraDecoderLayer::new(&config, &lora_config, i as usize))
                     .collect::<Result<Vec<_>, _>>()?,
             )
         } else {
             GemmaLoraLayers::Gemma1(
                 (0..config.num_hidden_layers)
-                    .map(|_| GemmaLoraDecoderLayer::new(&config, &lora_config))
+                    .map(|i| GemmaLoraDecoderLayer::new(&config, &lora_config, i as usize))
                     .collect::<Result<Vec<_>, _>>()?,
             )
         };
@@ -700,11 +825,9 @@ impl GemmaLoraModel {
         let scale = Array::from_f32(self.embedding_scale);
         hidden_states = hidden_states.multiply(&scale);
 
-        let mask = if mask.is_none() {
-            let seq_len = input_ids.dim(1);
-            Some(create_causal_mask(seq_len)?)
-        } else {
-            mask.cloned()
+        let owned_masks = match mask {
+            Some(_) => None,
+            None => Some(GemmaTrunkMasks::build(input_ids.dim(1), &self.config)?),
         };
 
         let layers_per_block = checkpoint_config
@@ -715,7 +838,12 @@ impl GemmaLoraModel {
         match &mut self.layers {
             GemmaLoraLayers::Gemma1(layers) => {
                 for (idx, layer) in layers.iter_mut().enumerate() {
-                    hidden_states = layer.forward(&hidden_states, mask.as_ref())?;
+                    let layer_mask = mask.or_else(|| {
+                        owned_masks
+                            .as_ref()
+                            .map(|m| m.for_layer(layer.self_attn.is_local_attention))
+                    });
+                    hidden_states = layer.forward(&hidden_states, layer_mask)?;
 
                     // Checkpoint boundary marker
                     // NOTE: We do NOT call eval() here - that breaks the gradient computation graph.
@@ -726,7 +854,12 @@ impl GemmaLoraModel {
             }
             GemmaLoraLayers::Gemma2(layers) => {
                 for (idx, layer) in layers.iter_mut().enumerate() {
-                    hidden_states = layer.forward(&hidden_states, mask.as_ref())?;
+                    let layer_mask = mask.or_else(|| {
+                        owned_masks
+                            .as_ref()
+                            .map(|m| m.for_layer(layer.self_attn.is_local_attention))
+                    });
+                    hidden_states = layer.forward(&hidden_states, layer_mask)?;
 
                     // Checkpoint boundary marker
                     // NOTE: We do NOT call eval() here - that breaks the gradient computation graph.
@@ -775,17 +908,17 @@ impl GemmaLoraModel {
                 }
             }
             (GemmaLoraLayers::Gemma1(layers), None) => {
-                let seq_len = input_ids.dim(1);
-                let mask = Some(create_causal_mask(seq_len)?);
+                let masks = GemmaTrunkMasks::build(input_ids.dim(1), &self.config)?;
                 for layer in layers {
-                    hidden_states = layer.forward(&hidden_states, mask.as_ref())?;
+                    let layer_mask = masks.for_layer(layer.self_attn.is_local_attention);
+                    hidden_states = layer.forward(&hidden_states, Some(layer_mask))?;
                 }
             }
             (GemmaLoraLayers::Gemma2(layers), None) => {
-                let seq_len = input_ids.dim(1);
-                let mask = Some(create_causal_mask(seq_len)?);
+                let masks = GemmaTrunkMasks::build(input_ids.dim(1), &self.config)?;
                 for layer in layers {
-                    hidden_states = layer.forward(&hidden_states, mask.as_ref())?;
+                    let layer_mask = masks.for_layer(layer.self_attn.is_local_attention);
+                    hidden_states = layer.forward(&hidden_states, Some(layer_mask))?;
                 }
             }
         }
@@ -909,6 +1042,23 @@ impl GemmaLoraForCausalLM {
         })
     }
 
+    /// Apply the tied LM head, then Gemma 2's final logit softcapping
+    /// (`tanh(logits / cap) * cap`) when configured.
+    ///
+    /// Mirrors `GemmaForCausalLM::lm_head`. Without the softcap the training
+    /// logits run past the range the served model can produce, which shows up
+    /// as a loss computed against a distribution inference never emits.
+    fn lm_head(&self, hidden_states: &Array) -> Array {
+        let logits = self.model.embed_tokens.as_linear(hidden_states);
+        match self.model.config.final_logit_softcapping {
+            Some(cap) if cap != 0.0 => {
+                let cap_arr = Array::from_f32(cap);
+                pmetal_bridge::compat::ops::tanh(&logits.divide(&cap_arr)).multiply(&cap_arr)
+            }
+            _ => logits,
+        }
+    }
+
     /// Enable gradient checkpointing.
     pub fn enable_gradient_checkpointing(&mut self, layers_per_block: usize) {
         self.checkpoint_config = Some(CheckpointConfig {
@@ -940,7 +1090,7 @@ impl GemmaLoraForCausalLM {
             self.model
                 .forward_with_checkpoint(input_ids, mask, checkpoint_config)?;
         // Gemma always ties embeddings
-        Ok(self.model.embed_tokens.as_linear(&hidden_states))
+        Ok(self.lm_head(&hidden_states))
     }
 
     /// Forward pass returning hidden states before lm_head, for Cut Cross-Entropy.
@@ -1002,7 +1152,7 @@ impl GemmaLoraForCausalLM {
     ) -> Result<Array, LoraError> {
         let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
         // Gemma always ties embeddings
-        Ok(self.model.embed_tokens.as_linear(&hidden_states))
+        Ok(self.lm_head(&hidden_states))
     }
 
     /// Create a KV cache for this model.
@@ -1514,18 +1664,6 @@ impl ModuleParameters for GemmaLoraForCausalLM {
 // Implement TrainableModel for GemmaLoraForCausalLM via shared macro.
 crate::impl_trainable_model!(GemmaLoraForCausalLM);
 
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask =
-        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-    Ok(pmetal_bridge::compat::ops::where_fn(
-        &mask.equal(&zero),
-        &neg_inf,
-        &zero,
-    ))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1569,7 +1707,7 @@ mod tests {
     fn test_gemma_lora_attention() {
         let config = small_config();
         let lora_config = small_lora_config();
-        let mut attn = GemmaLoraAttention::new(&config, &lora_config).unwrap();
+        let mut attn = GemmaLoraAttention::new(&config, &lora_config, 0).unwrap();
 
         let x = pmetal_bridge::compat::random::normal(
             &[1, 4, 64],
@@ -1646,7 +1784,7 @@ mod tests {
     fn test_gemma2_lora_extra_norms() {
         let config = small_gemma2_config();
         let lora_config = small_lora_config();
-        let layer = Gemma2LoraDecoderLayer::new(&config, &lora_config).unwrap();
+        let layer = Gemma2LoraDecoderLayer::new(&config, &lora_config, 0).unwrap();
 
         // Verify Gemma2 has extra normalization layers
         let x = pmetal_bridge::compat::random::normal(

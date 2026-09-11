@@ -157,11 +157,7 @@ fn cases() -> Vec<ArchCase> {
                 "final_logit_softcapping": 30.0,
                 "query_pre_attn_scalar": 16
             }"#,
-            known_divergence: Some(
-                "GemmaLoraModel::forward builds one causal mask for the whole trunk, so \
-                 the Gemma 2 local/global interleave never runs and every layer sees \
-                 the full prefix.",
-            ),
+            known_divergence: None,
         },
         // Phi-3 with LongRoPE. `max_position_embeddings` exceeds
         // `original_max_position_embeddings`, which is what selects the long
@@ -295,10 +291,7 @@ fn cases() -> Vec<ArchCase> {
                 "sliding_window": 8,
                 "sliding_window_pattern": 2
             }"#,
-            known_divergence: Some(
-                "Same single-mask trunk as gemma2, against Gemma 3's every-layer-local \
-                 interleave.",
-            ),
+            known_divergence: None,
         },
         ArchCase {
             name: "gemma4",

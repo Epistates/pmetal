@@ -529,7 +529,11 @@ fn resolve_architecture(config_content: &str) -> Result<ModelArchitecture, Excep
 /// pmetal's own switches for the 4-norm block, the attention and final-logit
 /// softcaps, and the local/global window interleave. Deriving them in one place
 /// keeps a construction path from silently running the Gemma-v1 math.
-fn parse_gemma_config(config_content: &str) -> Result<GemmaConfig, Exception> {
+///
+/// Public because `pmetal-lora`'s dispatcher builds the same config and needs
+/// the same flags. Deserializing `GemmaConfig` straight from the checkpoint
+/// leaves both `false`, which is a Gemma 1 model wearing a Gemma 3 checkpoint.
+pub fn parse_gemma_config(config_content: &str) -> Result<GemmaConfig, Exception> {
     let effective = unwrap_text_config(config_content)?;
     let mut config: GemmaConfig =
         json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
