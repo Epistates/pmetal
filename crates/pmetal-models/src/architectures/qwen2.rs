@@ -7,6 +7,7 @@
 //! - No RoPE scaling support
 //! - Optional sliding window attention (usually disabled)
 
+use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::traits::ModelConfig;
 use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, nn, ops, random};
@@ -599,6 +600,9 @@ pub struct Qwen2Model {
     pub layers: Vec<Qwen2DecoderLayer>,
     /// Final layer norm.
     pub norm: nn::RmsNorm,
+    /// Recompute each layer's activations during the backward pass instead of
+    /// holding them. Training only; see [`crate::checkpointing`].
+    pub grad_checkpoint: bool,
 }
 impl_module_params!(Qwen2Model; embed_tokens, layers, norm);
 
@@ -620,6 +624,7 @@ impl Qwen2Model {
             embed_tokens,
             layers,
             norm,
+            grad_checkpoint: false,
         })
     }
 
@@ -688,8 +693,16 @@ impl Qwen2Model {
                 }
             }
             None => {
+                // Hoisted: the loop below borrows `self.layers` mutably.
+                let grad_checkpoint = self.grad_checkpoint;
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                    hidden_states = layer.forward(&hidden_states, mask)?;
+                    hidden_states = if grad_checkpoint {
+                        checkpointed_layer(layer, &hidden_states, mask, |layer, h, mask| {
+                            layer.forward(h, mask)
+                        })?
+                    } else {
+                        layer.forward(&hidden_states, mask)?
+                    };
                     if let Some(buf) = capture.as_deref_mut()
                         && buf.wants_hidden_for(layer_idx)
                     {

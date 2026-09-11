@@ -31,6 +31,7 @@ use pmetal_mlx::kernels::{
 use pmetal_mlx::kv_cache::KVCache;
 
 use crate::architectures::utils::{Activation, resolve_activation};
+use crate::checkpointing::checkpointed_layer;
 use crate::traits::{CausalLMModel, ModelConfig};
 use std::collections::HashMap;
 
@@ -787,6 +788,9 @@ pub struct PhiModel {
     pub layers: Vec<PhiDecoderLayer>,
     pub norm: PhiRMSNorm,
     pub config: PhiConfig,
+    /// Recompute each layer's activations during the backward pass instead of
+    /// holding them. Training only; see [`crate::checkpointing`].
+    pub grad_checkpoint: bool,
 }
 impl_module_params!(PhiModel; embed_tokens, layers, norm);
 
@@ -804,6 +808,7 @@ impl PhiModel {
             layers,
             norm,
             config,
+            grad_checkpoint: false,
         })
     }
 
@@ -844,9 +849,19 @@ impl PhiModel {
             mask
         };
 
+        // Hoisted: the loop below borrows `self.layers` mutably.
+        let grad_checkpoint = self.grad_checkpoint;
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             let c = cache.as_deref_mut().map(|c| (c, idx));
-            hidden = layer.forward_with_cache(&hidden, mask, c)?;
+            // A cache means generation, which has no backward pass for the
+            // recompute to pay for.
+            hidden = if grad_checkpoint && c.is_none() {
+                checkpointed_layer(layer, &hidden, mask, |layer, h, mask| {
+                    layer.forward_with_cache(h, mask, None)
+                })?
+            } else {
+                layer.forward_with_cache(&hidden, mask, c)?
+            };
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(idx)
             {

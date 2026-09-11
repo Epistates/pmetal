@@ -24,6 +24,7 @@
 use pmetal_bridge::compat::{Array, Exception, ModuleParameters, Param, indexing, nn, ops, random};
 use pmetal_bridge::impl_module_params;
 
+use crate::checkpointing::checkpointed_layer;
 use crate::common::yarn::{YarnRope, build_yarn_rope};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use pmetal_mlx::kernels::{
@@ -1139,6 +1140,9 @@ pub struct GptOssModel {
     pub layers: Vec<GptOssDecoderLayer>,
     /// Final layer norm.
     pub norm: nn::RmsNorm,
+    /// Recompute each layer's activations during the backward pass instead of
+    /// holding them. Training only; see [`crate::checkpointing`].
+    pub grad_checkpoint: bool,
 }
 impl_module_params!(GptOssModel; embed_tokens, layers, norm);
 
@@ -1160,6 +1164,7 @@ impl GptOssModel {
             embed_tokens,
             layers,
             norm,
+            grad_checkpoint: false,
         })
     }
 
@@ -1196,8 +1201,16 @@ impl GptOssModel {
                 }
             }
             None => {
+                // Hoisted: the loop below borrows `self.layers` mutably.
+                let grad_checkpoint = self.grad_checkpoint;
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                    hidden = layer.forward(&hidden, mask, None)?;
+                    hidden = if grad_checkpoint {
+                        checkpointed_layer(layer, &hidden, mask, |layer, h, mask| {
+                            layer.forward(h, mask, None)
+                        })?
+                    } else {
+                        layer.forward(&hidden, mask, None)?
+                    };
                     if let Some(buf) = capture.as_deref_mut()
                         && buf.wants_hidden_for(layer_idx)
                     {

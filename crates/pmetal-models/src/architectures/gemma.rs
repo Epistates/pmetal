@@ -18,6 +18,7 @@ use pmetal_mlx::kernels::{
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
+use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{
     AttentionModule, DecoderLayer, MlpModule, NormModule, std_pre_norm_forward,
 };
@@ -847,6 +848,9 @@ pub struct GemmaModel {
     pub layers: GemmaLayers,
     /// Final layer norm.
     pub norm: GemmaRmsNorm,
+    /// Recompute each layer's activations during the backward pass instead of
+    /// holding them. Training only; see [`crate::checkpointing`].
+    pub grad_checkpoint: bool,
 }
 impl_module_params!(GemmaModel; embed_tokens, layers, norm);
 
@@ -885,6 +889,7 @@ impl GemmaModel {
             embed_tokens,
             layers,
             norm,
+            grad_checkpoint: false,
         })
     }
 
@@ -946,10 +951,20 @@ impl GemmaModel {
         // Pass through transformer layers — gemma1 and gemma2 keep their
         // layer vecs in separate Option slots, so we mirror the branching
         // here.
+        // Hoisted: the branches below borrow `self.layers` mutably.
+        let grad_checkpoint = self.grad_checkpoint;
         if let Some(ref mut layers) = self.layers.gemma1 {
             for (idx, layer) in layers.iter_mut().enumerate() {
                 let c = cache.as_deref_mut().map(|c| (c, idx));
-                hidden_states = layer.forward_with_cache(&hidden_states, mask, c)?;
+                // A cache means generation, which has no backward pass for the
+                // recompute to pay for.
+                hidden_states = if grad_checkpoint && c.is_none() {
+                    checkpointed_layer(layer, &hidden_states, mask, |layer, h, mask| {
+                        layer.forward_with_cache(h, mask, None)
+                    })?
+                } else {
+                    layer.forward_with_cache(&hidden_states, mask, c)?
+                };
                 if let Some(buf) = capture.as_deref_mut()
                     && buf.wants_hidden_for(idx)
                 {
@@ -959,7 +974,13 @@ impl GemmaModel {
         } else if let Some(ref mut layers) = self.layers.gemma2 {
             for (idx, layer) in layers.iter_mut().enumerate() {
                 let c = cache.as_deref_mut().map(|c| (c, idx));
-                hidden_states = layer.forward_with_cache(&hidden_states, mask, c)?;
+                hidden_states = if grad_checkpoint && c.is_none() {
+                    checkpointed_layer(layer, &hidden_states, mask, |layer, h, mask| {
+                        layer.forward_with_cache(h, mask, None)
+                    })?
+                } else {
+                    layer.forward_with_cache(&hidden_states, mask, c)?
+                };
                 if let Some(buf) = capture.as_deref_mut()
                     && buf.wants_hidden_for(idx)
                 {

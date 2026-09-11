@@ -19,6 +19,7 @@ use pmetal_mlx::kv_cache::KVCache;
 
 use serde::{Deserialize, Serialize};
 
+use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, MlpModule, NormModule};
 use crate::traits::ModelConfig;
 
@@ -420,6 +421,9 @@ pub struct CohereModel {
     pub embed_tokens: nn::Embedding,
     pub layers: Vec<CohereDecoderLayer>,
     pub norm: nn::LayerNorm,
+    /// Recompute each layer's activations during the backward pass instead of
+    /// holding them. Training only; see [`crate::checkpointing`].
+    pub grad_checkpoint: bool,
 }
 impl_module_params!(CohereModel; embed_tokens, layers, norm);
 
@@ -440,6 +444,7 @@ impl CohereModel {
             embed_tokens,
             layers,
             norm,
+            grad_checkpoint: false,
         })
     }
 
@@ -461,9 +466,19 @@ impl CohereModel {
     ) -> Result<Array, Exception> {
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
 
+        // Hoisted: the loop below borrows `self.layers` mutably.
+        let grad_checkpoint = self.grad_checkpoint;
         for (idx, layer) in self.layers.iter_mut().enumerate() {
             let c = cache.as_deref_mut().map(|c| (c, idx));
-            hidden_states = layer.forward_with_cache(&hidden_states, mask, c)?;
+            // A cache means generation, which has no backward pass for the
+            // recompute to pay for.
+            hidden_states = if grad_checkpoint && c.is_none() {
+                checkpointed_layer(layer, &hidden_states, mask, |layer, h, mask| {
+                    layer.forward_with_cache(h, mask, None)
+                })?
+            } else {
+                layer.forward_with_cache(&hidden_states, mask, c)?
+            };
         }
 
         Module::forward(&mut self.norm, &hidden_states)

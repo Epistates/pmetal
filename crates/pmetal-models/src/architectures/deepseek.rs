@@ -8,6 +8,7 @@
 //! - Multi-token prediction lookahead modules
 
 // ModuleParameters derive via impl_module_params!
+use crate::checkpointing::checkpointed_layer;
 use crate::common::yarn::{YarnRope, build_yarn_rope, yarn_get_mscale};
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
@@ -1206,6 +1207,9 @@ pub struct DeepSeekModel {
     pub embed_tokens: nn::Embedding,
     pub layers: Vec<DeepSeekDecoderLayer>,
     pub norm: nn::RmsNorm,
+    /// Recompute each layer's activations during the backward pass instead of
+    /// holding them. Training only; see [`crate::checkpointing`].
+    pub grad_checkpoint: bool,
 }
 impl_module_params!(DeepSeekModel; embed_tokens, layers, norm);
 
@@ -1223,6 +1227,7 @@ impl DeepSeekModel {
             embed_tokens,
             layers,
             norm,
+            grad_checkpoint: false,
         })
     }
     pub fn forward(
@@ -1244,8 +1249,19 @@ impl DeepSeekModel {
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array> {
         let mut h = self.embed_tokens.forward(input_ids);
+        // Hoisted: the loop below borrows `self.layers` mutably.
+        let grad_checkpoint = self.grad_checkpoint;
         for (i, layer) in self.layers.iter_mut().enumerate() {
-            h = layer.forward(&h, mask, cache.as_mut().map(|c| (&mut **c, i)))?;
+            let layer_cache = cache.as_mut().map(|c| (&mut **c, i));
+            // A cache means generation, which has no backward pass for the
+            // recompute to pay for.
+            h = if grad_checkpoint && layer_cache.is_none() {
+                checkpointed_layer(layer, &h, mask, |layer, h, mask| {
+                    layer.forward(h, mask, None)
+                })?
+            } else {
+                layer.forward(&h, mask, layer_cache)?
+            };
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(i)
             {

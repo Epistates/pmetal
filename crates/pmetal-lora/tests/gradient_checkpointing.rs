@@ -20,22 +20,32 @@ use pmetal_core::LoraConfig;
 use pmetal_lora::{AdaptedModel, TrainableModel};
 use pmetal_models::dispatcher::DynamicModel;
 
-/// Two architectures whose trunks implement checkpointing, one per shape of
-/// layer loop: llama branches on the cache, qwen3 threads it through the index.
+/// Every architecture whose trunk implements checkpointing.
+///
+/// The layer loops are not all the same shape: some branch on the cache, some
+/// thread it through the index, gemma runs two parallel layer vectors, and
+/// llama4 carries position IDs the closure has to own rather than borrow. Each
+/// of those is a way to get the wiring subtly wrong, so each is covered.
 const CASES: &[(&str, &str)] = &[
     (
         "llama",
         r#"{
             "model_type": "llama",
-            "vocab_size": 128,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_hidden_layers": 4,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "max_position_embeddings": 256,
-            "rms_norm_eps": 1e-6,
-            "rope_theta": 10000.0,
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+            "tie_word_embeddings": false
+        }"#,
+    ),
+    (
+        "qwen2",
+        r#"{
+            "model_type": "qwen2",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
             "tie_word_embeddings": false
         }"#,
     ),
@@ -43,16 +53,130 @@ const CASES: &[(&str, &str)] = &[
         "qwen3",
         r#"{
             "model_type": "qwen3",
-            "vocab_size": 128,
-            "hidden_size": 64,
-            "intermediate_size": 128,
-            "num_hidden_layers": 4,
-            "num_attention_heads": 4,
-            "num_key_value_heads": 2,
-            "head_dim": 16,
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 16,
             "max_position_embeddings": 256,
-            "rms_norm_eps": 1e-6,
-            "rope_theta": 10000.0,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+            "tie_word_embeddings": false
+        }"#,
+    ),
+    (
+        "mistral",
+        r#"{
+            "model_type": "mistral",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+            "tie_word_embeddings": false
+        }"#,
+    ),
+    (
+        "cohere",
+        r#"{
+            "model_type": "cohere",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 16,
+            "max_position_embeddings": 256,
+            "layer_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "logit_scale": 0.0625
+        }"#,
+    ),
+    (
+        "granite",
+        r#"{
+            "model_type": "granite",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+            "attention_multiplier": 0.125, "embedding_multiplier": 12.0,
+            "residual_multiplier": 0.22, "logits_scaling": 8.0,
+            "tie_word_embeddings": false
+        }"#,
+    ),
+    (
+        "gemma",
+        r#"{
+            "model_type": "gemma",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 16,
+            "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0
+        }"#,
+    ),
+    (
+        "phi3",
+        r#"{
+            "model_type": "phi3",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 4, "max_position_embeddings": 256,
+            "original_max_position_embeddings": 128,
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "hidden_act": "silu", "tie_word_embeddings": false
+        }"#,
+    ),
+    (
+        "qwen3_moe",
+        r#"{
+            "model_type": "qwen3_moe",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128,
+            "moe_intermediate_size": 32,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 16,
+            "num_experts": 4, "num_experts_per_tok": 2,
+            "decoder_sparse_step": 1, "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
+            "tie_word_embeddings": false
+        }"#,
+    ),
+    (
+        "gpt_oss",
+        r#"{
+            "model_type": "gpt_oss",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 32,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 16,
+            "num_local_experts": 4, "num_experts_per_tok": 2,
+            "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "sliding_window": 8, "tie_word_embeddings": false
+        }"#,
+    ),
+    (
+        "llama4",
+        r#"{
+            "model_type": "llama4_text",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 32,
+            "intermediate_size_mlp": 128,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 2, "head_dim": 16,
+            "num_local_experts": 4, "num_experts_per_tok": 2,
+            "interleave_moe_layer_step": 1, "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-5, "rope_theta": 10000.0,
+            "attention_chunk_size": 8192, "tie_word_embeddings": false
+        }"#,
+    ),
+    (
+        "deepseek",
+        r#"{
+            "model_type": "deepseek_v3",
+            "vocab_size": 128, "hidden_size": 64, "intermediate_size": 128,
+            "moe_intermediate_size": 32,
+            "num_hidden_layers": 4, "num_attention_heads": 4,
+            "num_key_value_heads": 4, "num_experts_per_tok": 1,
+            "n_group": 1, "topk_group": 1, "first_k_dense_replace": 8,
+            "routed_scaling_factor": 1.0, "topk_method": "greedy",
+            "scoring_func": "softmax", "norm_topk_prob": true,
+            "attention_bias": false, "moe_layer_freq": 1,
+            "kv_lora_rank": 16, "q_lora_rank": null,
+            "qk_rope_head_dim": 8, "qk_nope_head_dim": 8, "v_head_dim": 16,
+            "max_position_embeddings": 256,
+            "rms_norm_eps": 1e-6, "rope_theta": 10000.0,
             "tie_word_embeddings": false
         }"#,
     ),

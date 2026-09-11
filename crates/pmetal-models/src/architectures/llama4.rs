@@ -20,6 +20,7 @@ use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::rope::apply_rope as rope_apply;
 use serde::{Deserialize, Serialize};
 
+use crate::checkpointing::checkpointed_layer;
 use crate::traits::ModelConfig;
 
 /// Llama 4 text configuration.
@@ -966,6 +967,9 @@ pub struct Llama4TextModel {
     pub embed_tokens: nn::Embedding,
     pub layers: Vec<Llama4DecoderLayer>,
     pub norm: nn::RmsNorm,
+    /// Recompute each layer's activations during the backward pass instead of
+    /// holding them. Training only; see [`crate::checkpointing`].
+    pub grad_checkpoint: bool,
 }
 impl_module_params!(Llama4TextModel; embed_tokens, layers, norm);
 
@@ -986,6 +990,7 @@ impl Llama4TextModel {
             embed_tokens,
             layers,
             norm,
+            grad_checkpoint: false,
         })
     }
 
@@ -997,8 +1002,19 @@ impl Llama4TextModel {
     ) -> Result<Array, Exception> {
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
 
+        // Hoisted: the loop below borrows `self.layers` mutably.
+        let grad_checkpoint = self.grad_checkpoint;
         for layer in &mut self.layers {
-            hidden_states = layer.forward(&hidden_states, mask, position_ids)?;
+            hidden_states = if grad_checkpoint {
+                // Owned per iteration, then moved in: a captured `&Array` would
+                // dangle when the backward pass re-runs this closure.
+                let positions = position_ids.cloned();
+                checkpointed_layer(layer, &hidden_states, mask, move |layer, h, mask| {
+                    layer.forward(h, mask, positions.as_ref())
+                })?
+            } else {
+                layer.forward(&hidden_states, mask, position_ids)?
+            };
         }
 
         Module::forward(&mut self.norm, &hidden_states)

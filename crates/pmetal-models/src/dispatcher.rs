@@ -1384,7 +1384,24 @@ impl DynamicModel {
     fn grad_checkpoint_flag_mut(&mut self) -> Option<&mut bool> {
         match self {
             Self::Llama(m) => Some(&mut m.model.grad_checkpoint),
+            Self::Llama4(m) => Some(&mut m.model.grad_checkpoint),
+            Self::Qwen2(m) => Some(&mut m.model.grad_checkpoint),
             Self::Qwen3(m) => Some(&mut m.model.grad_checkpoint),
+            Self::Qwen3MoE(m) => Some(&mut m.model.grad_checkpoint),
+            Self::Gemma(m) => Some(&mut m.model.grad_checkpoint),
+            Self::Mistral(m) => Some(&mut m.model.grad_checkpoint),
+            Self::Phi(m) | Self::Phi4(m) => Some(&mut m.model.grad_checkpoint),
+            Self::DeepSeek(m) => Some(&mut m.model.grad_checkpoint),
+            Self::Cohere(m) => Some(&mut m.model.grad_checkpoint),
+            Self::Granite(m) => Some(&mut m.model.grad_checkpoint),
+            Self::GptOss(m) => Some(&mut m.model.grad_checkpoint),
+            // Gemma 4, Qwen3-Next, Nemotron-H and Mllama are left out on
+            // purpose. Each has a trunk whose layers read or write state
+            // belonging to another layer (Gemma 4's shared KV, the hybrid
+            // models' recurrent caches, Mllama's cross-attention), and a
+            // recompute would replay those side effects a second time. They
+            // need the state threading through `checkpoint` as an input, not
+            // just an extra call site.
             _ => None,
         }
     }
@@ -1392,7 +1409,17 @@ impl DynamicModel {
     fn grad_checkpoint_flag(&self) -> Option<bool> {
         match self {
             Self::Llama(m) => Some(m.model.grad_checkpoint),
+            Self::Llama4(m) => Some(m.model.grad_checkpoint),
+            Self::Qwen2(m) => Some(m.model.grad_checkpoint),
             Self::Qwen3(m) => Some(m.model.grad_checkpoint),
+            Self::Qwen3MoE(m) => Some(m.model.grad_checkpoint),
+            Self::Gemma(m) => Some(m.model.grad_checkpoint),
+            Self::Mistral(m) => Some(m.model.grad_checkpoint),
+            Self::Phi(m) | Self::Phi4(m) => Some(m.model.grad_checkpoint),
+            Self::DeepSeek(m) => Some(m.model.grad_checkpoint),
+            Self::Cohere(m) => Some(m.model.grad_checkpoint),
+            Self::Granite(m) => Some(m.model.grad_checkpoint),
+            Self::GptOss(m) => Some(m.model.grad_checkpoint),
             _ => None,
         }
     }
