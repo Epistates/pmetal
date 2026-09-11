@@ -41,7 +41,7 @@ fn checkpointing_does_not_change_the_gradients() {
     let (plain_loss, plain_grads) = value_and_grad(
         |a| mlp(&a[2], &a[0], &a[1]).sum_all(),
         &[w1.clone(), w2.clone()],
-        &[x.clone()],
+        std::slice::from_ref(&x),
     );
 
     // Same forward, run under checkpoint().  The weights have to be handed in
@@ -55,7 +55,7 @@ fn checkpointing_does_not_change_the_gradients() {
             out[0].sum_all()
         },
         &[w1.clone(), w2.clone()],
-        &[x.clone()],
+        std::slice::from_ref(&x),
     );
 
     assert!(
@@ -97,7 +97,7 @@ fn a_captured_array_receives_no_gradient() {
             out[0].sum_all()
         },
         &[w1.clone(), w2.clone()],
-        &[x.clone()],
+        std::slice::from_ref(&x),
     );
 
     let w1_grad_magnitude = grads[0].abs().max(None).item_f32();
@@ -127,7 +127,7 @@ fn checkpointing_survives_nesting() {
             h.matmul(&a[1]).sum_all()
         },
         &[w1.clone(), w2.clone()],
-        &[x.clone()],
+        std::slice::from_ref(&x),
     );
 
     let (ckpt_loss, ckpt_grads) = value_and_grad(
@@ -141,7 +141,7 @@ fn checkpointing_survives_nesting() {
             second[0].sum_all()
         },
         &[w1.clone(), w2.clone()],
-        &[x.clone()],
+        std::slice::from_ref(&x),
     );
 
     assert!(

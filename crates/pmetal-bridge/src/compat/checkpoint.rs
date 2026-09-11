@@ -182,7 +182,7 @@ mod tests {
                     .sum_all()
             },
             &[plain_a, plain_b],
-            &[x.clone()],
+            std::slice::from_ref(&x),
         );
 
         let mut checkpointed_module = adapted_linear();
