@@ -25,9 +25,10 @@ use pmetal_bridge::compat::{
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
-use pmetal_mlx::kernels::rope::apply_rope;
+use pmetal_mlx::kernels::rope::{apply_rope, apply_rope_with_freqs};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
-use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE};
+use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE, mla_scale_and_yarn};
+use pmetal_models::common::yarn::YarnRope;
 
 use crate::lora::LoraProjection;
 use crate::lora_helpers::{
@@ -72,6 +73,9 @@ pub struct DeepSeekLoraAttention {
     pub n_heads: i32,
     pub scale: f32,
     pub layer_id: usize,
+    /// YARN tables, when `rope_scaling` asks for them. `None` means plain
+    /// traditional RoPE at `rope_theta`.
+    pub yarn_rope: Option<YarnRope>,
 
     /// Q projection (either two-stage LoRa or direct).
     pub q: DeepSeekLoraQProj,
@@ -94,7 +98,9 @@ impl DeepSeekLoraAttention {
         let hidden = config.hidden_size;
         let n_heads = config.num_attention_heads;
         let q_head_dim = config.q_head_dim();
-        let scale = (q_head_dim as f32).powf(-0.5);
+        // YARN folds mscale^2 into the softmax scale at the same moment it
+        // builds the frequency tables, so both come from one call.
+        let (scale, yarn_rope) = mla_scale_and_yarn(config);
 
         let alpha = lora_config.alpha;
         let use_rslora = lora_config.use_rslora;
@@ -175,6 +181,7 @@ impl DeepSeekLoraAttention {
             config: config.clone(),
             n_heads,
             scale,
+            yarn_rope,
             layer_id,
             q,
             kv_a_proj_with_mqa,
@@ -249,25 +256,32 @@ impl DeepSeekLoraAttention {
         let k_nope = &kv_split[0];
         let values = &kv_split[1];
 
-        // RoPE
-        let q_pe = apply_rope(
-            q_pe,
-            self.config.qk_rope_head_dim,
-            false,
-            self.config.rope_theta,
-            1.0,
-            offset,
-        )
-        .map_err(LoraError::Mlx)?;
-        let k_pe = apply_rope(
-            &k_pe,
-            self.config.qk_rope_head_dim,
-            false,
-            self.config.rope_theta,
-            1.0,
-            offset,
-        )
-        .map_err(LoraError::Mlx)?;
+        // DeepSeek MLA uses traditional (interleaved) RoPE. The split-half
+        // form rotates the wrong element pairs and silently corrupts every
+        // attention score. With rope_scaling configured, apply YARN per-dim
+        // frequencies + embedding mscale; without it, plain RoPE at rope_theta.
+        let rope_dim = self.config.qk_rope_head_dim;
+        let (q_pe, k_pe) = if let Some(yarn) = &self.yarn_rope {
+            let (q_in, k_in) = if yarn.mscale != 1.0 {
+                let m = Array::from_f32(yarn.mscale);
+                (q_pe.multiply(&m), k_pe.multiply(&m))
+            } else {
+                (q_pe.clone(), k_pe.clone())
+            };
+            (
+                apply_rope_with_freqs(&q_in, &yarn.inv_freq, rope_dim, true, offset)
+                    .map_err(LoraError::Mlx)?,
+                apply_rope_with_freqs(&k_in, &yarn.inv_freq, rope_dim, true, offset)
+                    .map_err(LoraError::Mlx)?,
+            )
+        } else {
+            (
+                apply_rope(q_pe, rope_dim, true, self.config.rope_theta, 1.0, offset)
+                    .map_err(LoraError::Mlx)?,
+                apply_rope(&k_pe, rope_dim, true, self.config.rope_theta, 1.0, offset)
+                    .map_err(LoraError::Mlx)?,
+            )
+        };
 
         let k_pe_broad = pmetal_bridge::compat::ops::broadcast_to(
             &k_pe,

@@ -19,7 +19,7 @@ use pmetal_bridge::compat::{
 use pmetal_bridge::impl_module_params;
 use pmetal_mlx::Builder;
 use pmetal_mlx::kernels::{
-    AttentionMaskType, FusedAttentionConfig,
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
     rope::{apply_rope, apply_rope_with_freqs},
 };
 use pmetal_mlx::kv_cache::KVCache;
@@ -256,32 +256,42 @@ pub struct DeepSeekAttention {
 }
 impl_module_params!(DeepSeekAttention; q_a_proj, q_a_layernorm, q_b_proj, q_proj, kv_a_proj_with_mqa, kv_a_layernorm, kv_b_proj, o_proj);
 
+/// The softmax scale and YARN tables an MLA layer runs with.
+///
+/// These are one decision, not two: YARN folds `mscale²` into the softmax scale
+/// (mlx-lm `DeepseekV2Attention`) at the same moment it builds the per-dimension
+/// inverse frequencies. Returning them together is what stops a caller taking
+/// the tables and forgetting the scale, or taking neither.
+///
+/// Public because `pmetal-lora` builds the same attention and needs the same
+/// answer.
+pub fn mla_scale_and_yarn(config: &DeepSeekConfig) -> (f32, Option<YarnRope>) {
+    let mut scale = (config.q_head_dim() as f32).powf(-0.5);
+    let yarn_rope = parse_yarn_scaling(&config.rope_scaling).map(|y| {
+        if y.mscale_all_dim != 0.0 {
+            let s = yarn_get_mscale(y.factor, y.mscale_all_dim);
+            scale *= s * s;
+        }
+        build_yarn_rope(
+            config.qk_rope_head_dim,
+            config.rope_theta,
+            y.factor,
+            y.original_max_pos,
+            y.beta_fast,
+            y.beta_slow,
+            y.mscale,
+            y.mscale_all_dim,
+        )
+    });
+    (scale, yarn_rope)
+}
+
 impl DeepSeekAttention {
     pub fn new(config: &DeepSeekConfig, layer_id: usize) -> Result<Self> {
         let hidden_size = config.hidden_size;
         let n_heads = config.num_attention_heads;
         let q_head_dim = config.q_head_dim();
-        let mut scale = (q_head_dim as f32).powf(-0.5);
-
-        // YARN: when rope_scaling is present, precompute per-dim inverse
-        // frequencies + embedding mscale, and fold mscale² into the softmax
-        // scale (mlx-lm DeepseekV2Attention).
-        let yarn_rope = parse_yarn_scaling(&config.rope_scaling).map(|y| {
-            if y.mscale_all_dim != 0.0 {
-                let s = yarn_get_mscale(y.factor, y.mscale_all_dim);
-                scale *= s * s;
-            }
-            build_yarn_rope(
-                config.qk_rope_head_dim,
-                config.rope_theta,
-                y.factor,
-                y.original_max_pos,
-                y.beta_fast,
-                y.beta_slow,
-                y.mscale,
-                y.mscale_all_dim,
-            )
-        });
+        let (scale, yarn_rope) = mla_scale_and_yarn(config);
         let (q_a_proj, q_a_layernorm, q_b_proj, q_proj) =
             if let Some(q_lora_rank) = config.q_lora_rank {
                 let q_a = nn::LinearBuilder::new(hidden_size, q_lora_rank)
@@ -450,15 +460,17 @@ impl DeepSeekAttention {
             (keys, values)
         };
 
-        let mut attn_weights = queries
-            .matmul(&keys.transpose_axes(&[0, 1, 3, 2]))
-            .multiply(&Array::from_f32(self.scale));
-        if let Some(mask) = mask {
-            attn_weights = attn_weights.add(mask);
-        }
-        let attn_weights = pmetal_bridge::compat::ops::softmax_axis(&attn_weights, -1);
-        let output = attn_weights
-            .matmul(&values)
+        // `attn_config` carries the causal mask type, so hand it to the kernel
+        // rather than recomputing attention here. The previous hand-rolled
+        // `matmul -> scale -> add(mask) -> softmax` added only the *caller's*
+        // mask; with `mask = None`, which is how generation calls this, no mask
+        // was applied at all and every token attended to its own future.
+        //
+        // `fused_sdpa` reaches MLX's SDPA for MLA: `flash_attention_supported`
+        // declines when the value head dim differs from the key head dim, which
+        // is exactly the DeepSeek case, and MLX sizes its output from
+        // `v.shape(-1)`.
+        let output = fused_sdpa(&queries, &keys, &values, &attn_config, mask)?
             .transpose_axes(&[0, 2, 1, 3])
             .reshape(&[batch, seq_len, -1]);
         Ok(self.o_proj.forward(&output))

@@ -335,6 +335,40 @@ fn cases() -> Vec<ArchCase> {
                  llama4_lora.rs only inside a test fixture.",
             ),
         },
+        // Dense DeepSeek (no routed experts) isolates MLA from the MoE.
+        ArchCase {
+            name: "deepseek_dense",
+            config_json: r#"{
+                "model_type": "deepseek_v3",
+                "vocab_size": 256,
+                "hidden_size": 64,
+                "intermediate_size": 128,
+                "moe_intermediate_size": 32,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "num_experts_per_tok": 1,
+                "n_group": 1,
+                "topk_group": 1,
+                "first_k_dense_replace": 8,
+                "routed_scaling_factor": 1.0,
+                "topk_method": "greedy",
+                "scoring_func": "softmax",
+                "norm_topk_prob": true,
+                "attention_bias": false,
+                "moe_layer_freq": 1,
+                "kv_lora_rank": 16,
+                "q_lora_rank": null,
+                "qk_rope_head_dim": 8,
+                "qk_nope_head_dim": 8,
+                "v_head_dim": 16,
+                "max_position_embeddings": 512,
+                "rms_norm_eps": 1e-6,
+                "rope_theta": 10000.0,
+                "tie_word_embeddings": false
+            }"#,
+            known_divergence: None,
+        },
         ArchCase {
             name: "deepseek",
             config_json: r#"{
@@ -369,9 +403,9 @@ fn cases() -> Vec<ArchCase> {
                 "tie_word_embeddings": false
             }"#,
             known_divergence: Some(
-                "DeepSeekLoraAttention re-derives MLA with a hand-rolled softmax and has \
-                 no YARN scaling at all (`build_yarn_rope` / `mscale` are absent from \
-                 deepseek_lora.rs).",
+                "MoE only: the dense MLA path agrees exactly (see deepseek_dense). \
+                 DeepSeekLoraMoE routes through a frozen DeepSeekMoE whose stacked \
+                 expert weights the LoRA loader never materialises",
             ),
         },
         ArchCase {
