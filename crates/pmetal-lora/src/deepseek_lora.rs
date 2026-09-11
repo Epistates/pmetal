@@ -1032,15 +1032,23 @@ impl ModuleParameters for DeepSeekLoraModel {
     }
 
     fn parameters(&self) -> ModuleParamRef<'_> {
+        // `extend` merges a child's map at the top level, so extending with two
+        // children that both expose `weight` collides: the second silently
+        // replaces the first, and the flattened tree loses `embed_tokens.weight`
+        // entirely. Nest them under their field names, as every other
+        // architecture does.
         let mut m = ModuleParamRef::new();
-        m.extend(self.embed_tokens.parameters());
+        m.insert(
+            Rc::from("embed_tokens"),
+            NestedValue::Map(self.embed_tokens.parameters()),
+        );
         for (i, layer) in self.layers.iter().enumerate() {
             m.insert(
-                Rc::from(format!("{}", i)),
+                Rc::from(format!("layers.{i}")),
                 NestedValue::Map(layer.parameters()),
             );
         }
-        m.extend(self.norm.parameters());
+        m.insert(Rc::from("norm"), NestedValue::Map(self.norm.parameters()));
         m
     }
 
@@ -1048,7 +1056,7 @@ impl ModuleParameters for DeepSeekLoraModel {
         let mut m = ModuleParamRef::new();
         for (i, layer) in self.layers.iter().enumerate() {
             m.insert(
-                Rc::from(format!("{}", i)),
+                Rc::from(format!("layers.{i}")),
                 NestedValue::Map(layer.trainable_parameters()),
             );
         }
@@ -1057,14 +1065,20 @@ impl ModuleParameters for DeepSeekLoraModel {
 
     fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
         let mut m = ModuleParamMut::new();
-        m.extend(self.embed_tokens.parameters_mut());
+        m.insert(
+            Rc::from("embed_tokens"),
+            NestedValue::Map(self.embed_tokens.parameters_mut()),
+        );
         for (i, layer) in self.layers.iter_mut().enumerate() {
             m.insert(
-                Rc::from(format!("{}", i)),
+                Rc::from(format!("layers.{i}")),
                 NestedValue::Map(layer.parameters_mut()),
             );
         }
-        m.extend(self.norm.parameters_mut());
+        m.insert(
+            Rc::from("norm"),
+            NestedValue::Map(self.norm.parameters_mut()),
+        );
         m
     }
 }
@@ -1720,7 +1734,9 @@ impl ModuleParameters for DeepSeekLoraForCausalLM {
         let mut m = ModuleParamRef::new();
         m.insert(Rc::from("model"), NestedValue::Map(self.model.parameters()));
         if let Some(ref head) = self.lm_head {
-            m.extend(head.parameters());
+            // Nested, not extended: `extend` would put the head's own `weight`
+            // at the top level as a bare `weight` rather than `lm_head.weight`.
+            m.insert(Rc::from("lm_head"), NestedValue::Map(head.parameters()));
         }
         m
     }
@@ -1741,7 +1757,7 @@ impl ModuleParameters for DeepSeekLoraForCausalLM {
             NestedValue::Map(self.model.parameters_mut()),
         );
         if let Some(ref mut head) = self.lm_head {
-            m.extend(head.parameters_mut());
+            m.insert(Rc::from("lm_head"), NestedValue::Map(head.parameters_mut()));
         }
         m
     }

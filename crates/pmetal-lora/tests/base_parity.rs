@@ -745,3 +745,48 @@ fn reference_forward_is_non_degenerate() {
         "reference argmax is constant across every position"
     );
 }
+
+/// Distinct modules must occupy distinct parameter paths.
+///
+/// `ModuleParamRef::extend` merges a child's map at the top level rather than
+/// nesting it, so extending with two children that both expose `weight` makes
+/// the second silently replace the first. `DeepSeekLoraModel` did that with
+/// `embed_tokens` and `norm`, and the flattened tree lost the embedding
+/// entirely -- invisible to training, which reaches adapters through
+/// `lora_parameters`, but wrong for anything keyed on parameter paths.
+#[test]
+fn parameter_paths_do_not_collide() {
+    for case in cases() {
+        let Ok(dir) = stage(&case) else { continue };
+        let lora_config = LoraConfig {
+            r: 8,
+            alpha: 16.0,
+            dropout: 0.0,
+            ..Default::default()
+        };
+        let model = DynamicLoraModel::from_pretrained(&dir, lora_config);
+        let _ = std::fs::remove_dir_all(&dir);
+        let Ok(model) = model else { continue };
+
+        let params = model.flatten_params();
+        // A path that is a strict prefix of another means one module was merged
+        // into a parent's map instead of nested under its own name, which is the
+        // shape that produces a collision.
+        for name in params.keys() {
+            assert!(
+                !name.is_empty(),
+                "{}: a parameter flattened to an empty path",
+                case.name
+            );
+            assert!(
+                !params
+                    .keys()
+                    .any(|other| other.as_ref() != name.as_ref()
+                        && other.ends_with(&format!(".{name}"))),
+                "{}: `{name}` is also the tail of another path, so two modules \
+                 share a name at different depths",
+                case.name
+            );
+        }
+    }
+}
