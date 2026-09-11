@@ -921,13 +921,41 @@ fn merging_preserves_the_adapted_output() {
 
     let ids = input_ids(config_int(case, "vocab_size").expect("vocab"));
     let before = adapted.forward(&ids, None).expect("adapted forward");
-    adapted.merge();
-    let after = adapted.forward(&ids, None).expect("merged forward");
 
-    let report = ParityReport::compute("merge", &after, &before, TOLERANCE);
+    adapted.merge();
+    let merged = adapted.forward(&ids, None).expect("merged forward");
+    let report = ParityReport::compute("merge", &merged, &before, TOLERANCE);
     assert!(
         report.passed(),
         "merging changed the output: max_abs={:.3e} cos={:.6}",
+        report.max_abs_diff,
+        report.cosine_similarity
+    );
+
+    // Merging is reversible, so a run can merge for an evaluation pass and then
+    // carry on training.
+    adapted.unmerge();
+    let unmerged = adapted.forward(&ids, None).expect("unmerged forward");
+    let report = ParityReport::compute("unmerge", &unmerged, &before, TOLERANCE);
+    assert!(
+        report.passed(),
+        "unmerging did not restore the model: max_abs={:.3e} cos={:.6}",
+        report.max_abs_diff,
+        report.cosine_similarity
+    );
+
+    // Fusing is the one-way form `pmetal fuse` produces.
+    adapted.fuse();
+    assert!(adapted.adapted_projections().is_empty());
+    assert!(
+        adapted.lora_parameters().is_empty(),
+        "fuse left adapter tensors in the parameter tree"
+    );
+    let fused = adapted.forward(&ids, None).expect("fused forward");
+    let report = ParityReport::compute("fuse", &fused, &before, TOLERANCE);
+    assert!(
+        report.passed(),
+        "fusing changed the output: max_abs={:.3e} cos={:.6}",
         report.max_abs_diff,
         report.cosine_similarity
     );

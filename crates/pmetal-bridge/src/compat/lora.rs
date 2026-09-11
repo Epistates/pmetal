@@ -50,6 +50,12 @@ pub struct LoraAdapter {
     /// Set once the adapter has been folded into the base weight, after which
     /// it contributes nothing further.
     pub merged: bool,
+    /// The base weight as it stood before a merge.
+    ///
+    /// Only populated for DoRA, whose merge is
+    /// `m·(W + s·B·A) / ‖W + s·B·A‖` — not an addition, so subtracting the
+    /// delta would not put `W` back.
+    unmerged_weight: Option<Array>,
 }
 
 impl LoraAdapter {
@@ -90,6 +96,7 @@ impl LoraAdapter {
             training: false,
             magnitude: None,
             merged: false,
+            unmerged_weight: None,
         })
     }
 
@@ -115,6 +122,45 @@ impl LoraAdapter {
     /// `scale · B·A`, the dense update this adapter represents.
     pub fn delta(&self) -> Array {
         self.b.matmul(&self.a).multiply(&self.scale_arr)
+    }
+
+    /// The weight this adapter is equivalent to, folded.
+    ///
+    /// For LoRA that is `W + s·B·A`. For DoRA the update is renormalised:
+    /// `m·(W + s·B·A) / ‖W + s·B·A‖_col`.
+    pub fn merged_weight(&self, weight: &Array) -> Array {
+        let combined = weight.add(&self.delta());
+        match &self.magnitude {
+            Some(magnitude) => {
+                let norm = column_norms(&combined).add(&Array::from_f32(1e-6));
+                combined.multiply(&magnitude.divide(&norm))
+            }
+            None => combined,
+        }
+    }
+
+    /// Fold this adapter into `weight`, remembering how to undo it.
+    pub(crate) fn merge_into(&mut self, weight: &mut Array) {
+        if self.merged {
+            return;
+        }
+        if self.magnitude.is_some() {
+            self.unmerged_weight = Some(weight.clone());
+        }
+        *weight = self.merged_weight(weight);
+        self.merged = true;
+    }
+
+    /// Undo [`merge_into`](Self::merge_into).
+    pub(crate) fn unmerge_from(&mut self, weight: &mut Array) {
+        if !self.merged {
+            return;
+        }
+        *weight = match self.unmerged_weight.take() {
+            Some(original) => original,
+            None => weight.subtract(&self.delta()),
+        };
+        self.merged = false;
     }
 
     /// Recompute the cached scale array after `scale` is assigned directly.
@@ -150,13 +196,19 @@ impl LoraAdapter {
             .multiply(&self.scale_arr);
         let y = y.add(&delta);
 
-        // DoRA rescales the combined output by `m / ‖W‖_col`. The norm is taken
-        // over the frozen weight rather than over `W + s·B·A`: exact at
-        // initialisation, where B is zero, and close while the update stays
-        // small relative to the base.
+        // DoRA rescales by `m / ‖W + s·B·A‖_col` — the norm of the *combined*
+        // weight, as Liu et al. define it and as PEFT computes it. Scaling the
+        // output per row is the same thing as scaling the weight's rows, which
+        // is what makes `merged_weight` agree with this exactly.
+        //
+        // It does mean materialising `B·A` on the forward, which is the cost
+        // DoRA carries over LoRA. Normalising by `‖W‖` instead would avoid that
+        // and is a good approximation near initialisation, but it would make a
+        // merged model compute something a live one does not.
         let y = match &self.magnitude {
             Some(magnitude) => {
-                let norm = column_norms(weight).add(&Array::from_f32(1e-6));
+                let combined = weight.add(&self.delta());
+                let norm = column_norms(&combined).add(&Array::from_f32(1e-6));
                 y.multiply(&magnitude.divide(&norm).squeeze_axes(&[-1]))
             }
             None => y,
@@ -217,27 +269,83 @@ mod tests {
         );
     }
 
-    /// Merging folds the update into the weight, so the layer keeps computing
-    /// what it did while adapted. This is what `pmetal fuse` relies on.
-    #[test]
-    fn merging_preserves_the_adapted_output() {
+    fn trained_layer(dora: bool) -> Linear {
         let mut layer = Linear::new(3, 4, false).expect("layer");
+        let weight = layer.weight.value.clone();
         {
             let adapter = layer.attach_lora(2, 4.0, false).expect("attach");
             // Give B a non-zero value so the adapter actually contributes.
             adapter.b = random::uniform_range(-0.5, 0.5, &[4, 2], Dtype::Float32);
+            if dora {
+                adapter.set_dora(&weight);
+            }
         }
+        layer
+    }
+
+    /// Folding the update into the weight keeps the layer computing what it did
+    /// while adapted. That holds for DoRA too, whose merge renormalises rather
+    /// than adds.
+    #[test]
+    fn merging_preserves_the_adapted_output() {
+        for dora in [false, true] {
+            let mut layer = trained_layer(dora);
+            let adapted = values(layer.forward(&probe()));
+
+            layer.merge_lora();
+            let merged = values(layer.forward(&probe()));
+
+            for (a, m) in adapted.iter().zip(&merged) {
+                assert!(
+                    (a - m).abs() < 1e-4,
+                    "dora={dora}: merged output {m} differs from adapted {a}"
+                );
+            }
+        }
+    }
+
+    /// Merging is reversible, so a run can merge for an evaluation pass and then
+    /// carry on training.
+    #[test]
+    fn unmerging_restores_the_base_weight() {
+        for dora in [false, true] {
+            let mut layer = trained_layer(dora);
+            let before = values(layer.weight.value.clone());
+
+            layer.merge_lora();
+            layer.unmerge_lora();
+            let after = values(layer.weight.value.clone());
+
+            for (b, a) in before.iter().zip(&after) {
+                assert!(
+                    (b - a).abs() < 1e-5,
+                    "dora={dora}: unmerge left the weight at {a}, not {b}"
+                );
+            }
+            assert!(layer.is_adapted(), "unmerge dropped the adapter");
+        }
+    }
+
+    /// Fusing folds the update in and drops the adapter, which is what
+    /// `pmetal fuse` produces.
+    #[test]
+    fn fusing_leaves_an_ordinary_dense_layer() {
+        let mut layer = trained_layer(false);
         let adapted = values(layer.forward(&probe()));
 
-        layer.merge_lora();
-        assert!(!layer.is_adapted(), "merge left the adapter attached");
-        let merged = values(layer.forward(&probe()));
+        layer.fuse_lora();
+        assert!(!layer.is_adapted(), "fuse left the adapter attached");
+        assert!(
+            layer
+                .flatten_params()
+                .keys()
+                .all(|k| !k.starts_with("lora_")),
+            "fuse left adapter tensors in the parameter tree"
+        );
 
-        for (a, m) in adapted.iter().zip(&merged) {
-            assert!(
-                (a - m).abs() < 1e-5,
-                "merged output {m} differs from adapted {a}"
-            );
+        let fused = values(layer.forward(&probe()));
+        for (a, m) in adapted.iter().zip(&fused) {
+            assert!((a - m).abs() < 1e-5, "fused output {m} differs from {a}");
         }
     }
 

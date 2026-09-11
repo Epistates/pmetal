@@ -140,13 +140,29 @@ impl AdaptedModel {
             .visit_linears_mut("", &mut |_, linear| linear.set_adapter_training(training));
     }
 
-    /// Fold every adapter into its base weight, leaving a plain dense model.
+    /// Fold every adapter into its base weight, keeping them attached.
     ///
-    /// This is what `pmetal fuse` wants: afterwards the model is byte-for-byte
-    /// servable without pmetal-lora in the picture.
+    /// Reversible with [`unmerge`](Self::unmerge). A merged model runs one
+    /// matmul per projection instead of three, which is worth it for an
+    /// evaluation pass mid-run.
     pub fn merge(&mut self) {
         self.model
             .visit_linears_mut("", &mut |_, linear| linear.merge_lora());
+    }
+
+    /// Undo [`merge`](Self::merge) and resume training.
+    pub fn unmerge(&mut self) {
+        self.model
+            .visit_linears_mut("", &mut |_, linear| linear.unmerge_lora());
+    }
+
+    /// Fold every adapter in and drop it, leaving a plain dense model.
+    ///
+    /// This is what `pmetal fuse` produces: servable without pmetal-lora in the
+    /// picture, and not reversible.
+    pub fn fuse(&mut self) {
+        self.model
+            .visit_linears_mut("", &mut |_, linear| linear.fuse_lora());
         self.adapted.clear();
     }
 

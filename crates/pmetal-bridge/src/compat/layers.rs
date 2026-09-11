@@ -71,18 +71,32 @@ impl Linear {
         self.adapter.take()
     }
 
-    /// Fold the adapter into the base weight and drop it.
+    /// Fold the adapter into the base weight, keeping it attached.
     ///
-    /// After this the layer is dense again and numerically equivalent, which is
-    /// what `pmetal fuse` wants before serving.
+    /// Reversible with [`unmerge_lora`](Self::unmerge_lora): a merged layer runs
+    /// one matmul instead of three, which is worth it for evaluation mid-run,
+    /// and training can resume afterwards. Use [`fuse_lora`](Self::fuse_lora)
+    /// when the fold should be permanent.
     pub fn merge_lora(&mut self) {
-        let Some(adapter) = self.adapter.take() else {
-            return;
-        };
-        if adapter.merged {
-            return;
+        if let Some(adapter) = self.adapter.as_mut() {
+            adapter.merge_into(&mut self.weight.value);
         }
-        self.weight.value = self.weight.value.add(&adapter.delta());
+    }
+
+    /// Undo [`merge_lora`](Self::merge_lora).
+    pub fn unmerge_lora(&mut self) {
+        if let Some(adapter) = self.adapter.as_mut() {
+            adapter.unmerge_from(&mut self.weight.value);
+        }
+    }
+
+    /// Fold the adapter in and drop it, leaving an ordinary dense layer.
+    ///
+    /// This is what `pmetal fuse` produces: a model that serves without
+    /// pmetal-lora in the picture, and cannot be un-fused.
+    pub fn fuse_lora(&mut self) {
+        self.merge_lora();
+        self.adapter = None;
     }
 
     /// Whether a low-rank adapter is attached.
