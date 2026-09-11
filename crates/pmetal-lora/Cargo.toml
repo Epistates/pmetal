@@ -30,6 +30,10 @@ tracing = { workspace = true }
 [dev-dependencies]
 criterion = { workspace = true, features = ["html_reports"] }
 tempfile = { workspace = true }
+# Pull in pmetal-mlx's `test-utils` feature so `base_parity` can reach the
+# shared comparison helpers (`ParityReport`, `Tolerance`, …). The feature is
+# empty in production builds, so there's no runtime impact.
+pmetal-mlx = { workspace = true, features = ["test-utils"] }
 
 
 [lints]

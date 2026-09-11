@@ -500,6 +500,64 @@ macro_rules! dispatch_architecture {
 ///
 /// `$new` accepts any callable returning `Result<Model, Exception>` — most
 /// architectures pass `TypeName::new`; Qwen3 passes `Qwen3ForCausalLM::new_for_loading`.
+/// Resolve a `config.json` body to the architecture that should run it.
+///
+/// `model_type` decides; the `architectures` array is the fallback for
+/// checkpoints that omit it. Shared by [`DynamicModel::load_with_options`] and
+/// [`DynamicModel::from_config`] so the two cannot disagree about what a
+/// checkpoint is.
+fn resolve_architecture(config_content: &str) -> Result<ModelArchitecture, Exception> {
+    let base_config = config_value(config_content)?;
+    let architectures = base_config["architectures"].as_array().map(|a| {
+        a.iter()
+            .map(|v| v.as_str().unwrap_or("").to_string())
+            .collect::<Vec<_>>()
+    });
+    let model_type = base_config["model_type"].as_str().unwrap_or("");
+    ModelArchitecture::from_model_type(model_type)
+        .or_else(|| {
+            architectures
+                .as_ref()
+                .and_then(|a| ModelArchitecture::from_architectures(a))
+        })
+        .ok_or_else(|| Exception::custom(format!("Unsupported architecture: {}", model_type)))
+}
+
+/// Parse a Gemma config, deriving the generation flags from `model_type`.
+///
+/// `is_gemma2` / `is_gemma3` are not fields any checkpoint sets; they are
+/// pmetal's own switches for the 4-norm block, the attention and final-logit
+/// softcaps, and the local/global window interleave. Deriving them in one place
+/// keeps a construction path from silently running the Gemma-v1 math.
+fn parse_gemma_config(config_content: &str) -> Result<GemmaConfig, Exception> {
+    let effective = unwrap_text_config(config_content)?;
+    let mut config: GemmaConfig =
+        json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
+    if config.model_type == "gemma3"
+        || config.model_type == "gemma4"
+        || config.model_type == "gemma4_text"
+        || config.model_type == "gemma3_text"
+    {
+        config.is_gemma3 = true;
+    } else if config.model_type == "gemma2" {
+        config.is_gemma2 = true;
+    }
+    Ok(config)
+}
+
+/// Construct a model from a parsed config, with no weights to load.
+///
+/// The counterpart to [`simple_load!`]: same config deserialization, but the
+/// architecture's *sized* constructor rather than the placeholder one, because
+/// nothing is coming along afterwards to give the parameters their shapes.
+macro_rules! simple_new {
+    ($config_ty:ty, $new:expr, $content:expr, $variant:ident) => {{
+        let config: $config_ty =
+            json5::from_str($content).map_err(|e| Exception::custom(e.to_string()))?;
+        Ok(Self::$variant(($new)(config)?))
+    }};
+}
+
 macro_rules! simple_load {
     ($config_ty:ty, $new:expr, $content:expr, $model_dir:expr, $variant:ident) => {{
         let config: $config_ty =
@@ -597,6 +655,127 @@ impl DynamicModel {
         Self::load_with_options(model_dir, DynamicModelLoadOptions::default())
     }
 
+    /// Build a randomly initialised model from a `config.json` body, with no
+    /// checkpoint.
+    ///
+    /// [`load`](Self::load) exists to put a checkpoint into a model, and several
+    /// architectures exploit that by constructing one-element placeholder
+    /// parameters and letting the loader size them (`Qwen3ForCausalLM::new_for_loading`
+    /// is the clearest case). That is the right trade when weights are coming,
+    /// and useless when they are not: the parameters never acquire a shape and
+    /// the first forward pass indexes into an empty dimension.
+    ///
+    /// This is the other half — every architecture's *sized* constructor, behind
+    /// the same `model_type` resolution `load` uses — for pretraining from
+    /// scratch and for tests that need a model without a checkpoint.
+    ///
+    /// Architectures that are not causal language models, or whose construction
+    /// is inseparable from their checkpoint layout, return an error naming the
+    /// reason rather than a half-built model.
+    pub fn from_config(config_content: &str) -> Result<Self, Exception> {
+        let arch = resolve_architecture(config_content)?;
+        match arch {
+            ModelArchitecture::Llama => {
+                simple_new!(LlamaConfig, LlamaForCausalLM::new, config_content, Llama)
+            }
+            ModelArchitecture::Llama4 => {
+                let effective = unwrap_text_config(config_content)?;
+                simple_new!(Llama4TextConfig, Llama4ForCausalLM::new, &effective, Llama4)
+            }
+            ModelArchitecture::Qwen2 => {
+                simple_new!(Qwen2Config, Qwen2ForCausalLM::new, config_content, Qwen2)
+            }
+            // `Qwen3ForCausalLM::new`, deliberately, where `load` takes
+            // `new_for_loading`.
+            ModelArchitecture::Qwen3 => {
+                simple_new!(Qwen3Config, Qwen3ForCausalLM::new, config_content, Qwen3)
+            }
+            ModelArchitecture::Qwen3MoE => {
+                simple_new!(Qwen3MoEConfig, Qwen3MoE::new, config_content, Qwen3MoE)
+            }
+            ModelArchitecture::Gemma => Ok(Self::Gemma(GemmaForCausalLM::new(
+                parse_gemma_config(config_content)?,
+            )?)),
+            ModelArchitecture::Mistral => {
+                simple_new!(
+                    MistralConfig,
+                    MistralForCausalLM::new,
+                    config_content,
+                    Mistral
+                )
+            }
+            ModelArchitecture::Phi => {
+                simple_new!(PhiConfig, PhiForCausalLM::new, config_content, Phi)
+            }
+            ModelArchitecture::Phi4 => {
+                simple_new!(PhiConfig, PhiForCausalLM::new, config_content, Phi4)
+            }
+            ModelArchitecture::DeepSeek => {
+                simple_new!(DeepSeekConfig, DeepSeek::new, config_content, DeepSeek)
+            }
+            ModelArchitecture::Cohere => {
+                simple_new!(CohereConfig, CohereForCausalLM::new, config_content, Cohere)
+            }
+            ModelArchitecture::Granite => {
+                simple_new!(
+                    GraniteConfig,
+                    GraniteForCausalLM::new,
+                    config_content,
+                    Granite
+                )
+            }
+            ModelArchitecture::NemotronH => {
+                simple_new!(
+                    NemotronHConfig,
+                    NemotronHForCausalLM::new,
+                    config_content,
+                    NemotronH
+                )
+            }
+            ModelArchitecture::Qwen3Next => {
+                let text_config_str = unwrap_text_config(config_content)?;
+                let mut config: Qwen3NextConfig = serde_json::from_str(&text_config_str)
+                    .map_err(|e| Exception::custom(e.to_string()))?;
+                config.apply_rope_parameters();
+                Ok(Self::Qwen3Next(Qwen3NextForCausalLM::new(config)?))
+            }
+            ModelArchitecture::GptOss => {
+                simple_new!(GptOssConfig, GptOssForCausalLM::new, config_content, GptOss)
+            }
+            ModelArchitecture::Gemma4 => {
+                let effective = unwrap_text_config(config_content)?;
+                simple_new!(
+                    crate::architectures::gemma4::Gemma4Config,
+                    crate::architectures::gemma4::Gemma4ForCausalLM::new,
+                    &effective,
+                    Gemma4
+                )
+            }
+            ModelArchitecture::Bert => {
+                simple_new!(BertConfig, BertForEmbedding::new, config_content, Bert)
+            }
+            ModelArchitecture::DiffusionGemma => {
+                let config = crate::architectures::diffusion_gemma::parse_diffusion_gemma_config(
+                    config_content,
+                )?;
+                Ok(Self::DiffusionGemma(DiffusionGemmaForBlockDiffusion::new(
+                    config,
+                )?))
+            }
+            ModelArchitecture::Mllama => {
+                simple_new!(
+                    MllamaConfig,
+                    MllamaForConditionalGeneration::new,
+                    config_content,
+                    Mllama
+                )
+            }
+            ModelArchitecture::Flux => Err(Exception::custom(
+                "Flux models are diffusion pipelines, not causal language models. Build them via pmetal_models::pipelines::FluxPipeline instead of DynamicModel::from_config.",
+            )),
+        }
+    }
+
     /// Load a model from a directory with caller-controlled load behavior.
     pub fn load_with_options(
         model_dir: impl AsRef<Path>,
@@ -621,22 +800,7 @@ impl DynamicModel {
         }
         let config_content = std::fs::read_to_string(&config_path)
             .map_err(|e| Exception::custom(format!("{}", e)))?;
-        let base_config = config_value(&config_content)?;
-        let architectures = base_config["architectures"].as_array().map(|a| {
-            a.iter()
-                .map(|v| v.as_str().unwrap_or("").to_string())
-                .collect::<Vec<_>>()
-        });
-        let model_type = base_config["model_type"].as_str().unwrap_or("");
-        let arch = ModelArchitecture::from_model_type(model_type)
-            .or_else(|| {
-                architectures
-                    .as_ref()
-                    .and_then(|a| ModelArchitecture::from_architectures(a))
-            })
-            .ok_or_else(|| {
-                Exception::custom(format!("Unsupported architecture: {}", model_type))
-            })?;
+        let arch = resolve_architecture(&config_content)?;
 
         match arch {
             ModelArchitecture::Llama => simple_load!(
@@ -688,24 +852,7 @@ impl DynamicModel {
                 Qwen3MoE
             ),
             ModelArchitecture::Gemma => {
-                let effective = unwrap_text_config(&config_content)?;
-                let mut config: GemmaConfig =
-                    json5::from_str(&effective).map_err(|e| Exception::custom(e.to_string()))?;
-                // Set the Gemma3 flag based on model_type to enable the
-                // correct sliding window pattern (every 6th layer global,
-                // rest local). Gemma 4 inherits the same interleave.
-                if config.model_type == "gemma3"
-                    || config.model_type == "gemma4"
-                    || config.model_type == "gemma4_text"
-                    || config.model_type == "gemma3_text"
-                {
-                    config.is_gemma3 = true;
-                } else if config.model_type == "gemma2" {
-                    // Without this, Gemma-2 checkpoints silently run the Gemma-v1
-                    // path: no 4-norm block, no sliding window, no attention
-                    // softcap, no final-logit softcap.
-                    config.is_gemma2 = true;
-                }
+                let config = parse_gemma_config(&config_content)?;
                 let mut model = GemmaForCausalLM::new(config)?;
                 let weights = crate::loader::load_weights(model_dir)
                     .map_err(|e| Exception::custom(format!("{:?}", e)))?;
