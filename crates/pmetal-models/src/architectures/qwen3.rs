@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
 
+use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 use crate::traits::ModelConfig;
 use pmetal_mlx::kernels::{
@@ -674,6 +675,9 @@ pub struct Qwen3Model {
     pub embed_tokens: nn::Embedding,
     pub layers: Vec<Qwen3Layer>,
     pub norm: nn::RmsNorm,
+    /// Recompute each layer's activations during the backward pass instead of
+    /// holding them. Training only; see [`crate::checkpointing`].
+    pub grad_checkpoint: bool,
 }
 impl_module_params!(Qwen3Model; embed_tokens, layers, norm);
 
@@ -694,6 +698,7 @@ impl Qwen3Model {
             embed_tokens,
             layers,
             norm,
+            grad_checkpoint: false,
         })
     }
 
@@ -714,6 +719,7 @@ impl Qwen3Model {
             embed_tokens,
             layers,
             norm,
+            grad_checkpoint: false,
         })
     }
 
@@ -732,6 +738,7 @@ impl Qwen3Model {
             embed_tokens,
             layers,
             norm,
+            grad_checkpoint: false,
         })
     }
 
@@ -742,9 +749,19 @@ impl Qwen3Model {
         mut cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(input_ids);
+        // Hoisted: the loop below borrows `self.layers` mutably.
+        let grad_checkpoint = self.grad_checkpoint;
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let layer_cache = cache.as_mut().map(|c| (&mut **c, i));
-            h = layer.forward(&h, mask, layer_cache)?;
+            // A cache means generation, which has no backward pass for the
+            // recompute to pay for.
+            h = if grad_checkpoint && layer_cache.is_none() {
+                checkpointed_layer(layer, &h, mask, |layer, h, mask| {
+                    layer.forward(h, mask, None)
+                })?
+            } else {
+                layer.forward(&h, mask, layer_cache)?
+            };
         }
         Ok(self.norm.forward(&h))
     }

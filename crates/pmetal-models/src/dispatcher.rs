@@ -1341,6 +1341,62 @@ impl DynamicModel {
         }
     }
 
+    /// Recompute each decoder layer's activations during the backward pass
+    /// instead of holding them for it.
+    ///
+    /// Peak activation memory stops scaling with depth, at the cost of one
+    /// extra forward per step. Training only: the flag is ignored on any
+    /// forward that carries a KV cache, since generation has no backward pass
+    /// for the recompute to pay for.
+    ///
+    /// Returns `false` when this architecture's trunk does not implement it, so
+    /// a caller can report that honestly rather than assume it took effect.
+    pub fn set_gradient_checkpointing(&mut self, enabled: bool) -> bool {
+        match self.grad_checkpoint_flag_mut() {
+            Some(flag) => {
+                *flag = enabled;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether this architecture's trunk can checkpoint its layers.
+    ///
+    /// Callers have to ask before enabling, and enabling needs `&mut self`,
+    /// which is why this is separate from [`set_gradient_checkpointing`].
+    ///
+    /// [`set_gradient_checkpointing`]: Self::set_gradient_checkpointing
+    pub fn supports_gradient_checkpointing(&self) -> bool {
+        self.grad_checkpoint_flag().is_some()
+    }
+
+    /// Whether checkpointing is currently on.
+    pub fn is_gradient_checkpointing(&self) -> bool {
+        self.grad_checkpoint_flag() == Some(true)
+    }
+
+    /// The trunk's checkpointing flag, for architectures that have one.
+    ///
+    /// This and its shared-reference twin are the only places that name the
+    /// supported architectures. Adding one means adding an arm to both, which
+    /// `the_support_check_and_the_setter_agree` in `pmetal-lora` holds together.
+    fn grad_checkpoint_flag_mut(&mut self) -> Option<&mut bool> {
+        match self {
+            Self::Llama(m) => Some(&mut m.model.grad_checkpoint),
+            Self::Qwen3(m) => Some(&mut m.model.grad_checkpoint),
+            _ => None,
+        }
+    }
+
+    fn grad_checkpoint_flag(&self) -> Option<bool> {
+        match self {
+            Self::Llama(m) => Some(m.model.grad_checkpoint),
+            Self::Qwen3(m) => Some(m.model.grad_checkpoint),
+            _ => None,
+        }
+    }
+
     pub fn quantize_fp8(&mut self) -> Result<(), Exception> {
         match self {
             // NemotronH has a bespoke implementation that operates on concrete

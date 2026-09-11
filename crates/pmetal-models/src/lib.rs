@@ -46,6 +46,7 @@
 #![allow(ambiguous_glob_reexports)]
 
 pub mod architectures;
+pub(crate) mod checkpointing;
 pub mod common;
 pub mod ddtree;
 pub mod decoder_layer;

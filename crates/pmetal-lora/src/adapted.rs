@@ -327,6 +327,23 @@ impl crate::TrainableModel for AdaptedModel {
     fn create_cache(&self, max_seq_len: usize) -> Option<pmetal_mlx::kv_cache::KVCache> {
         Some(AdaptedModel::create_cache(self, max_seq_len))
     }
+
+    /// `layers_per_block` is accepted and ignored.
+    ///
+    /// One decoder layer is the checkpoint unit, which is what PyTorch and
+    /// mlx-lm both use. The parameter stays on the trait because the CLI still
+    /// carries the flag; it never selected anything.
+    fn enable_gradient_checkpointing(&mut self, _layers_per_block: usize) {
+        self.model.set_gradient_checkpointing(true);
+    }
+
+    fn disable_gradient_checkpointing(&mut self) {
+        self.model.set_gradient_checkpointing(false);
+    }
+
+    fn supports_gradient_checkpointing(&self) -> bool {
+        self.model.supports_gradient_checkpointing()
+    }
 }
 
 /// Delegates straight through to the wrapped model, so the optimizer and the

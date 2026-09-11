@@ -14,6 +14,7 @@ use pmetal_mlx::kernels::{
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
+use crate::checkpointing::checkpointed_layer;
 use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_norm_forward};
 
 /// Llama model configuration.
@@ -561,6 +562,9 @@ pub struct LlamaModel {
     pub layers: Vec<LlamaDecoderLayer>,
     /// Final layer norm.
     pub norm: nn::RmsNorm,
+    /// Recompute each layer's activations during the backward pass instead of
+    /// holding them. Training only; see [`crate::checkpointing`].
+    pub grad_checkpoint: bool,
 }
 impl_module_params!(LlamaModel; embed_tokens, layers, norm);
 
@@ -582,6 +586,7 @@ impl LlamaModel {
             embed_tokens,
             layers,
             norm,
+            grad_checkpoint: false,
         })
     }
 
@@ -653,8 +658,16 @@ impl LlamaModel {
                 }
             }
             None => {
+                // Hoisted: the loop below borrows `self.layers` mutably.
+                let grad_checkpoint = self.grad_checkpoint;
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                    hidden_states = layer.forward(&hidden_states, mask)?;
+                    hidden_states = if grad_checkpoint {
+                        checkpointed_layer(layer, &hidden_states, mask, |layer, h, mask| {
+                            layer.forward(h, mask)
+                        })?
+                    } else {
+                        layer.forward(&hidden_states, mask)?
+                    };
                     if let Some(buf) = capture.as_deref_mut()
                         && buf.wants_hidden_for(layer_idx)
                     {
