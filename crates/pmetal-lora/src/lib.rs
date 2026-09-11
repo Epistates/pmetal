@@ -38,6 +38,7 @@
 #![allow(clippy::unnecessary_cast)]
 #![allow(clippy::type_complexity)]
 
+pub mod adapted;
 mod adapter;
 pub mod arch_config;
 pub mod autograd;
@@ -81,6 +82,7 @@ pub mod qwen3_next_qlora;
 pub mod qwen3_qlora;
 mod trainable;
 
+pub use adapted::AdaptedModel;
 pub use adapter::*;
 pub use arch_config::LoraArchitectureConfig;
 pub use autograd::{

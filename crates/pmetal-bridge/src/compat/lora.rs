@@ -96,8 +96,14 @@ impl LoraAdapter {
     /// Turn this into a DoRA adapter, seeding the magnitude from the base
     /// weight's column norms so the layer starts out unchanged.
     pub fn with_dora(mut self, base_weight: &Array) -> Self {
-        self.magnitude = Some(column_norms(base_weight));
+        self.set_dora(base_weight);
         self
+    }
+
+    /// In-place form of [`with_dora`](Self::with_dora), for callers holding a
+    /// `&mut` to an already-attached adapter.
+    pub fn set_dora(&mut self, base_weight: &Array) {
+        self.magnitude = Some(column_norms(base_weight));
     }
 
     /// Set the adapter's input dropout.

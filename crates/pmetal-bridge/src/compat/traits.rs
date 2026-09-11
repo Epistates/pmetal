@@ -20,6 +20,17 @@ pub trait ModuleParametersExt: ModuleParameters {
         out
     }
 
+    /// Flatten only the trainable parameters.
+    ///
+    /// For an adapted model this is the adapter set and nothing else, which is
+    /// exactly what an optimizer should be handed.
+    fn flatten_trainable_params(&self) -> FlattenedModuleParam {
+        let tree = self.trainable_parameters();
+        let mut out = FlattenedModuleParam::new();
+        super::flatten_nested_ref_owned(&tree, "", &mut out);
+        out
+    }
+
     /// Flatten all mutable parameters into a `HashMap<String, &mut Array>`.
     ///
     /// Used by weight loaders that need to assign tensors by name.
@@ -50,6 +61,16 @@ impl<T: ModuleParameters> ModuleParametersExt for T {}
 pub trait Parameter {
     /// Insert borrowed array references into the `ModuleParamRef` map.
     fn collect_params<'a>(&'a self, key: &str, out: &mut ModuleParamRef<'a>);
+
+    /// Insert only the *trainable* leaves.
+    ///
+    /// A leaf is always trainable; a nested module decides for itself, which is
+    /// how an adapted `Linear` reports its adapter and withholds its frozen
+    /// weight. Without this the recursion would collect everything and a LoRA
+    /// run would hand the whole model to the optimizer.
+    fn collect_trainable_params<'a>(&'a self, key: &str, out: &mut ModuleParamRef<'a>) {
+        self.collect_params(key, out);
+    }
     /// Insert mutable array references into the `ModuleParamMut` map.
     fn collect_params_mut<'a>(&'a mut self, key: &str, out: &mut ModuleParamMut<'a>);
     /// Count leaf arrays.
@@ -161,6 +182,19 @@ where
             // Re-borrow with 'a lifetime: copy value references into sub_map
             // Safety: sub-struct lifetime >= 'a because self: 'a
             // We clone the NestedValue which just copies the &Array pointer.
+            sub_map.insert(k, unsafe { super::clone_nested_ref_lifetime(v) });
+        }
+        out.insert(std::rc::Rc::from(key), NestedValue::Map(sub_map));
+    }
+
+    fn collect_trainable_params<'a>(&'a self, key: &str, out: &mut ModuleParamRef<'a>) {
+        let sub = self.trainable_parameters();
+        if sub.is_empty() {
+            return;
+        }
+        let mut sub_map: std::collections::HashMap<std::rc::Rc<str>, NestedValue<&'a Array>> =
+            std::collections::HashMap::new();
+        for (k, v) in sub {
             sub_map.insert(k, unsafe { super::clone_nested_ref_lifetime(v) });
         }
         out.insert(std::rc::Rc::from(key), NestedValue::Map(sub_map));
@@ -306,6 +340,12 @@ macro_rules! impl_module_params {
                 out
             }
 
+            fn trainable_parameters(&self) -> $crate::compat::ModuleParamRef<'_> {
+                let mut out = ::std::collections::HashMap::new();
+                $( $crate::compat::Parameter::collect_trainable_params(&self.$field, stringify!($field), &mut out); )*
+                out
+            }
+
             fn parameters_mut(&mut self) -> $crate::compat::ModuleParamMut<'_> {
                 let mut out = ::std::collections::HashMap::new();
                 $( $crate::compat::Parameter::collect_params_mut(&mut self.$field, stringify!($field), &mut out); )*
@@ -340,6 +380,12 @@ macro_rules! impl_module_params {
             fn parameters(&self) -> $crate::compat::ModuleParamRef<'_> {
                 let mut out = ::std::collections::HashMap::new();
                 $( $crate::compat::Parameter::collect_params(&self.$field, stringify!($field), &mut out); )*
+                out
+            }
+
+            fn trainable_parameters(&self) -> $crate::compat::ModuleParamRef<'_> {
+                let mut out = ::std::collections::HashMap::new();
+                $( $crate::compat::Parameter::collect_trainable_params(&self.$field, stringify!($field), &mut out); )*
                 out
             }
 

@@ -33,9 +33,9 @@ use std::rc::Rc;
 
 use pmetal_bridge::compat::{Array, ModuleParametersExt, eval};
 use pmetal_core::LoraConfig;
-use pmetal_lora::{DynamicLoraModel, TrainableModel, save_safetensors_map};
+use pmetal_lora::{AdaptedModel, DynamicLoraModel, TrainableModel, save_safetensors_map};
 use pmetal_mlx::test_utils::{
-    ParityReport, Tolerance, argmax_last_axis, max_abs_value, print_report_table,
+    ParityReport, Tolerance, argmax_last_axis, max_abs_diff, max_abs_value, print_report_table,
 };
 use pmetal_models::dispatcher::DynamicModel;
 
@@ -836,5 +836,223 @@ fn the_linear_walker_agrees_with_the_parameter_tree() {
                 case.name
             );
         }
+    }
+}
+
+// ─── The generic path ────────────────────────────────────────────────────────
+//
+// `AdaptedModel` attaches adapters to the model the inference path builds,
+// rather than re-deriving the architecture. The tests below are the ones the
+// per-architecture path could never pass by construction: there is one forward
+// pass, so agreement is structural rather than something each architecture has
+// to be talked into.
+
+fn lora_config() -> LoraConfig {
+    LoraConfig {
+        r: 8,
+        alpha: 16.0,
+        dropout: 0.0,
+        ..Default::default()
+    }
+}
+
+/// Attaching adapters must not change what the model computes.
+///
+/// Note what is *not* needed here: a staged checkpoint, or a second model to
+/// compare against. The adapted model is the base model, so this compares it to
+/// itself before and after.
+#[test]
+fn attaching_adapters_changes_nothing() {
+    let mut checked = 0;
+    for case in cases() {
+        let Ok(mut base) = DynamicModel::from_config(case.config_json) else {
+            continue;
+        };
+        let vocab = config_int(&case, "vocab_size").expect("vocab_size");
+        let ids = input_ids(vocab);
+
+        let before = base.forward(&ids, None).expect("base forward");
+        let mut adapted = AdaptedModel::attach(base, lora_config()).expect("attach");
+        let after = adapted.forward(&ids, None).expect("adapted forward");
+
+        assert_eq!(
+            max_abs_diff(&before, &after),
+            0.0,
+            "{}: attaching adapters perturbed the model",
+            case.name
+        );
+        assert!(
+            !adapted.adapted_projections().is_empty(),
+            "{}: no projection was adapted",
+            case.name
+        );
+        checked += 1;
+    }
+    assert!(checked >= 15, "only {checked} architectures were exercised");
+}
+
+/// Merging folds the adapters in and leaves a model that computes the same
+/// thing, which is what `pmetal fuse` produces.
+#[test]
+fn merging_preserves_the_adapted_output() {
+    let case = &cases()[0];
+    let base = DynamicModel::from_config(case.config_json).expect("build");
+    let mut adapted = AdaptedModel::attach(base, lora_config()).expect("attach");
+
+    // Give the adapters something to contribute, as a training step would.
+    let trained: HashMap<Rc<str>, Array> = adapted
+        .lora_parameters()
+        .into_iter()
+        .map(|(k, v)| {
+            let value = if k.ends_with("lora_b") {
+                pmetal_bridge::compat::random::uniform_range(
+                    -0.02,
+                    0.02,
+                    v.shape(),
+                    pmetal_bridge::compat::Dtype::Float32,
+                )
+            } else {
+                v
+            };
+            (k, value)
+        })
+        .collect();
+    adapted.set_lora_parameters(&trained);
+
+    let ids = input_ids(config_int(case, "vocab_size").expect("vocab"));
+    let before = adapted.forward(&ids, None).expect("adapted forward");
+    adapted.merge();
+    let after = adapted.forward(&ids, None).expect("merged forward");
+
+    let report = ParityReport::compute("merge", &after, &before, TOLERANCE);
+    assert!(
+        report.passed(),
+        "merging changed the output: max_abs={:.3e} cos={:.6}",
+        report.max_abs_diff,
+        report.cosine_similarity
+    );
+}
+
+/// Adapters survive a trip through a safetensors file.
+#[test]
+fn adapters_round_trip_through_a_file() {
+    let case = &cases()[0];
+    let base = DynamicModel::from_config(case.config_json).expect("build");
+    let mut adapted = AdaptedModel::attach(base, lora_config()).expect("attach");
+
+    let seeded: HashMap<Rc<str>, Array> = adapted
+        .lora_parameters()
+        .into_iter()
+        .map(|(k, v)| {
+            let value = pmetal_bridge::compat::random::uniform_range(
+                -0.1,
+                0.1,
+                v.shape(),
+                pmetal_bridge::compat::Dtype::Float32,
+            );
+            (k, value)
+        })
+        .collect();
+    adapted.set_lora_parameters(&seeded);
+    let written = adapted.lora_parameters();
+
+    let dir = std::env::temp_dir().join(format!("pmetal_adapter_rt_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let path = dir.join("adapters.safetensors");
+    adapted.save_lora_weights(&path).expect("save");
+
+    // Re-attach from scratch, then load: the adapters must come back identical.
+    let fresh = DynamicModel::from_config(case.config_json).expect("build");
+    let mut reloaded = AdaptedModel::attach(fresh, lora_config()).expect("attach");
+    reloaded.load_lora_weights(&path).expect("load");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let recovered = reloaded.lora_parameters();
+    assert_eq!(recovered.len(), written.len(), "adapter count changed");
+    for (key, value) in &written {
+        let got = recovered
+            .get(key)
+            .unwrap_or_else(|| panic!("`{key}` missing after reload"));
+        assert_eq!(max_abs_diff(got, value), 0.0, "`{key}` came back different");
+    }
+}
+
+/// `target_modules` selects which projections are adapted, by the name a
+/// checkpoint uses.
+#[test]
+fn targeting_selects_projections_by_name() {
+    let case = &cases()[0];
+    let base = DynamicModel::from_config(case.config_json).expect("build");
+    let config = LoraConfig {
+        target_modules: vec!["q_proj".to_string(), "v_proj".to_string()],
+        ..lora_config()
+    };
+    let adapted = AdaptedModel::attach(base, config).expect("attach");
+
+    let names: Vec<&str> = adapted
+        .adapted_projections()
+        .iter()
+        .map(|p| p.rsplit('.').next().unwrap_or(p))
+        .collect();
+    assert!(!names.is_empty(), "nothing was adapted");
+    assert!(
+        names.iter().all(|n| *n == "q_proj" || *n == "v_proj"),
+        "adapted something outside target_modules: {names:?}"
+    );
+    assert!(names.contains(&"q_proj") && names.contains(&"v_proj"));
+}
+
+/// A target that matches nothing is a mistake worth reporting, not a model that
+/// silently trains zero parameters.
+#[test]
+fn an_unmatched_target_is_an_error() {
+    let case = &cases()[0];
+    let base = DynamicModel::from_config(case.config_json).expect("build");
+    let config = LoraConfig {
+        target_modules: vec!["not_a_projection".to_string()],
+        ..lora_config()
+    };
+    assert!(AdaptedModel::attach(base, config).is_err());
+}
+
+/// Only the adapters are trainable, across the whole model.
+///
+/// `Linear` reports this per layer and the recursion carries it up, so nothing
+/// in between has to know which projections were targeted. If this regressed, a
+/// LoRA run would quietly hand every base weight to the optimizer -- a full
+/// fine-tune wearing a LoRA config.
+#[test]
+fn only_adapters_are_trainable() {
+    for case in cases() {
+        let Ok(base) = DynamicModel::from_config(case.config_json) else {
+            continue;
+        };
+        let adapted = AdaptedModel::attach(base, lora_config()).expect("attach");
+
+        let trainable = adapted.flatten_trainable_params();
+
+        assert!(
+            !trainable.is_empty(),
+            "{}: nothing is trainable at all",
+            case.name
+        );
+        let offenders: Vec<&str> = trainable
+            .keys()
+            .map(|k| k.as_ref())
+            .filter(|k| !k.contains("lora_"))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "{}: {} non-adapter tensors are trainable, e.g. {:?}",
+            case.name,
+            offenders.len(),
+            &offenders[..offenders.len().min(4)]
+        );
+        assert_eq!(
+            trainable.len(),
+            adapted.lora_parameters().len(),
+            "{}: trainable set and adapter set disagree",
+            case.name
+        );
     }
 }
