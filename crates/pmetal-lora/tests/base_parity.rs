@@ -330,14 +330,18 @@ fn cases() -> Vec<ArchCase> {
                 "tie_word_embeddings": false
             }"#,
             known_divergence: Some(
-                "The two paths disagree about where Llama 4's MoE block lives in a \
-                 checkpoint. pmetal-models names the field `moe`, so its parameter \
-                 path is `model.layers.N.moe.experts.J.…`; llama4_lora.rs reads \
-                 `…feed_forward.experts.J.…`, which is what transformers' \
-                 Llama4TextDecoderLayer calls it. The string `feed_forward` appears \
-                 nowhere in pmetal-models, and the Llama 4 load arm remaps only the \
-                 `model.language_model.` prefix, so at most one of the two can match \
-                 a released checkpoint. Needs a real Llama 4 checkpoint to settle",
+                "Neither path can load a real Llama 4 checkpoint, so they cannot \
+                 agree. transformers' Llama4TextDecoderLayer calls the block \
+                 `feed_forward`, and Llama4TextExperts holds FUSED 3-D parameters: \
+                 `feed_forward.experts.gate_up_proj` [E, hidden, 2*expert_dim] and \
+                 `feed_forward.experts.down_proj` [E, expert_dim, hidden], with \
+                 `feed_forward.router.weight` (Llama4Router extends nn.Linear). \
+                 pmetal-models names the field `moe` and expects per-expert 2-D \
+                 Linears; llama4_lora.rs uses `feed_forward` but also per-expert \
+                 2-D Linears and `router.gate.weight`. No test has ever loaded real \
+                 Llama 4 weights -- real_weight_parity covers twelve checkpoints and \
+                 Llama 4 is not one of them. Needs a checkpoint loader that splits \
+                 the fused tensors, not a rename",
             ),
         },
         // Dense DeepSeek (no routed experts) isolates MLA from the MoE.
