@@ -14,7 +14,7 @@ use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use pmetal_bridge::compat::indexing::IndexOp;
 use pmetal_bridge::compat::{
     Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
-    Param, indexing, nn, ops, random,
+    Param, VisitLinears, indexing, nn, ops, random,
 };
 use pmetal_bridge::impl_module_params;
 use pmetal_mlx::Builder;
@@ -761,6 +761,19 @@ pub struct DeepSeekMoE {
 /// random init inside an otherwise fully-loaded model.
 const UNUSED_MOE_ROUTER: &str = "router";
 
+// Mirrors `parameters()`: the gate and the shared expert merge into the parent
+// path rather than nesting, which is the layout `deepseek_param_name` maps a
+// checkpoint onto.
+impl VisitLinears for DeepSeekMoE {
+    fn visit_linears_mut(&mut self, prefix: &str, f: &mut dyn FnMut(&str, &mut nn::Linear)) {
+        self.gate.visit_linears_mut(prefix, f);
+        self.moe.visit_linears_mut(prefix, f);
+        if let Some(shared) = self.shared_experts.as_mut() {
+            shared.visit_linears_mut(prefix, f);
+        }
+    }
+}
+
 impl ModuleParameters for DeepSeekMoE {
     fn parameters(&self) -> ModuleParamRef<'_> {
         let mut map = self.gate.parameters();
@@ -1027,6 +1040,15 @@ pub enum DeepSeekMLPType {
     Dense(DeepSeekMLP),
     MoE(DeepSeekMoE),
 }
+impl VisitLinears for DeepSeekMLPType {
+    fn visit_linears_mut(&mut self, prefix: &str, f: &mut dyn FnMut(&str, &mut nn::Linear)) {
+        match self {
+            Self::Dense(mlp) => mlp.visit_linears_mut(prefix, f),
+            Self::MoE(moe) => moe.visit_linears_mut(prefix, f),
+        }
+    }
+}
+
 impl ModuleParameters for DeepSeekMLPType {
     fn parameters(&self) -> ModuleParamRef<'_> {
         match self {

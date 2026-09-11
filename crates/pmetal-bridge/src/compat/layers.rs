@@ -1,5 +1,6 @@
 use super::{
-    Array, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, Param, ops, random,
+    Array, Exception, LoraAdapter, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
+    Param, Parameter, ops, random,
 };
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -30,15 +31,71 @@ fn linear_forward_array(x: &Array, weight: &Array, bias: Option<&Array>) -> Arra
 
 // ── Linear ────────────────────────────────────────────────────────────────
 
-/// Affine linear layer: `y = x @ W^T + b`.
+/// Affine linear layer: `y = x @ W^T + b`, optionally low-rank adapted.
+///
+/// `adapter` is the seam that makes every architecture in the workspace
+/// fine-tunable without knowing it. See [`LoraAdapter`] for why it lives here
+/// rather than in a parallel `LoraLinear` type.
 #[derive(Debug, Clone)]
 pub struct Linear {
     pub weight: Param<Array>,
     pub bias: Param<Option<Array>>,
+    /// Low-rank adapter, when one has been attached. `None` is a plain dense
+    /// layer and costs one predictable branch per forward.
+    pub adapter: Option<Box<LoraAdapter>>,
 }
 
 impl Linear {
     pub const DEFAULT_BIAS: bool = true;
+
+    /// Attach a low-rank adapter, replacing any existing one.
+    ///
+    /// The layer's output is unchanged until the adapter is trained: `B` is
+    /// zero-initialised.
+    pub fn attach_lora(
+        &mut self,
+        rank: i32,
+        alpha: f32,
+        use_rslora: bool,
+    ) -> Result<&mut LoraAdapter, super::Exception> {
+        let (out_features, in_features) = self.shape();
+        let adapter = LoraAdapter::new(in_features, out_features, rank, alpha, use_rslora)?;
+        Ok(self.adapter.insert(Box::new(adapter)))
+    }
+
+    /// Drop the adapter, leaving the frozen base weight as it stands.
+    ///
+    /// Returns the adapter so a caller can keep it. This does *not* fold it in;
+    /// use [`merge_lora`](Self::merge_lora) for that.
+    pub fn detach_lora(&mut self) -> Option<Box<LoraAdapter>> {
+        self.adapter.take()
+    }
+
+    /// Fold the adapter into the base weight and drop it.
+    ///
+    /// After this the layer is dense again and numerically equivalent, which is
+    /// what `pmetal fuse` wants before serving.
+    pub fn merge_lora(&mut self) {
+        let Some(adapter) = self.adapter.take() else {
+            return;
+        };
+        if adapter.merged {
+            return;
+        }
+        self.weight.value = self.weight.value.add(&adapter.delta());
+    }
+
+    /// Whether a low-rank adapter is attached.
+    pub fn is_adapted(&self) -> bool {
+        self.adapter.is_some()
+    }
+
+    /// Put any attached adapter into training mode, enabling its dropout.
+    pub fn set_adapter_training(&mut self, training: bool) {
+        if let Some(adapter) = self.adapter.as_mut() {
+            adapter.training = training;
+        }
+    }
 
     pub fn new(in_dims: i32, out_dims: i32, with_bias: bool) -> Result<Self, super::Exception> {
         let scale = f32::sqrt(1.0 / in_dims as f32);
@@ -57,6 +114,7 @@ impl Linear {
         Ok(Self {
             weight: Param::new(weight),
             bias: Param::new(bias),
+            adapter: None,
         })
     }
 
@@ -66,7 +124,10 @@ impl Linear {
     }
 
     pub fn forward(&self, x: &Array) -> Array {
-        linear_forward_array(x, &self.weight.value, self.bias.value.as_ref())
+        match self.adapter.as_deref() {
+            None => linear_forward_array(x, &self.weight.value, self.bias.value.as_ref()),
+            Some(adapter) => adapter.apply(x, &self.weight.value, self.bias.value.as_ref()),
+        }
     }
 
     pub fn shape(&self) -> (i32, i32) {
@@ -85,7 +146,64 @@ impl Linear {
     }
 }
 
-crate::impl_module_params!(Linear; weight, bias);
+// Hand-written rather than `impl_module_params!` because the adapter must
+// flatten *beside* the weight, not under it. The generated impl would nest the
+// adapter's own map and produce `q_proj.adapter.lora_a`; every adapter file ever
+// written by pmetal says `q_proj.lora_a`.
+impl ModuleParameters for Linear {
+    fn num_parameters(&self) -> usize {
+        Parameter::count_params(&self.weight)
+            + Parameter::count_params(&self.bias)
+            + self
+                .adapter
+                .as_ref()
+                .map_or(0, |a| 2 + usize::from(a.magnitude.is_some()))
+    }
+
+    fn parameters(&self) -> ModuleParamRef<'_> {
+        let mut out = HashMap::new();
+        Parameter::collect_params(&self.weight, "weight", &mut out);
+        Parameter::collect_params(&self.bias, "bias", &mut out);
+        if let Some(adapter) = self.adapter.as_deref() {
+            out.insert(Rc::from("lora_a"), NestedValue::Value(&adapter.a));
+            out.insert(Rc::from("lora_b"), NestedValue::Value(&adapter.b));
+            if let Some(magnitude) = adapter.magnitude.as_ref() {
+                out.insert(Rc::from("lora_magnitude"), NestedValue::Value(magnitude));
+            }
+        }
+        out
+    }
+
+    fn parameters_mut(&mut self) -> ModuleParamMut<'_> {
+        let mut out = HashMap::new();
+        Parameter::collect_params_mut(&mut self.weight, "weight", &mut out);
+        Parameter::collect_params_mut(&mut self.bias, "bias", &mut out);
+        if let Some(adapter) = self.adapter.as_deref_mut() {
+            out.insert(Rc::from("lora_a"), NestedValue::Value(&mut adapter.a));
+            out.insert(Rc::from("lora_b"), NestedValue::Value(&mut adapter.b));
+            if let Some(magnitude) = adapter.magnitude.as_mut() {
+                out.insert(Rc::from("lora_magnitude"), NestedValue::Value(magnitude));
+            }
+        }
+        out
+    }
+
+    /// An adapted layer trains its adapter and nothing else: that is what makes
+    /// it LoRA rather than a full fine-tune. An unadapted one is ordinary and
+    /// trains everything.
+    fn trainable_parameters(&self) -> ModuleParamRef<'_> {
+        let Some(adapter) = self.adapter.as_deref() else {
+            return self.parameters();
+        };
+        let mut out = HashMap::new();
+        out.insert(Rc::from("lora_a"), NestedValue::Value(&adapter.a));
+        out.insert(Rc::from("lora_b"), NestedValue::Value(&adapter.b));
+        if let Some(magnitude) = adapter.magnitude.as_ref() {
+            out.insert(Rc::from("lora_magnitude"), NestedValue::Value(magnitude));
+        }
+        out
+    }
+}
 
 /// Builder for [`Linear`].
 pub struct LinearBuilder {
@@ -586,6 +704,11 @@ impl Rope {
     }
 }
 
+// RoPE holds frequency tables, never a projection.
+impl super::VisitLinears for Rope {
+    fn visit_linears_mut(&mut self, _prefix: &str, _f: &mut dyn FnMut(&str, &mut Linear)) {}
+}
+
 impl ModuleParameters for Rope {
     fn num_parameters(&self) -> usize {
         0
@@ -913,6 +1036,12 @@ impl Sequential {
     pub fn new() -> Self {
         Self { layers: Vec::new() }
     }
+}
+
+// `Sequential` stores `dyn Module` trait objects, which cannot be downcast back
+// to `Linear`. Nothing in the workspace builds a model out of it.
+impl super::VisitLinears for Sequential {
+    fn visit_linears_mut(&mut self, _prefix: &str, _f: &mut dyn FnMut(&str, &mut Linear)) {}
 }
 
 impl ModuleParameters for Sequential {

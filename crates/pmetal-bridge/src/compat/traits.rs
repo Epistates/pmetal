@@ -184,6 +184,101 @@ where
     }
 }
 
+// ── VisitLinears trait ────────────────────────────────────────────────────────
+
+/// Walk every [`Linear`](super::layers::Linear) in a module tree, handing each one its
+/// dotted path.
+///
+/// This is the Rust stand-in for PyTorch's `named_modules()`, and it exists for
+/// the same reason PEFT and mlx-lm need it: attaching adapters is a pass over a
+/// *built* model, not a decision the architecture makes when it is constructed.
+/// `ModuleParameters` cannot serve — it flattens to `Array` leaves, and by the
+/// time you have the arrays you have lost the layer they belong to.
+///
+/// `impl_module_params!` generates this alongside `ModuleParameters`, so every
+/// architecture in the workspace is walkable without touching its source.
+pub trait VisitLinears {
+    /// Call `f` for each `Linear` reachable from here, deepest path last.
+    fn visit_linears_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut super::layers::Linear),
+    );
+}
+
+/// Join a parent path and a field name, skipping the separator at the root.
+pub fn child_path(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_string()
+    } else {
+        format!("{prefix}.{name}")
+    }
+}
+
+impl VisitLinears for super::layers::Linear {
+    fn visit_linears_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut super::layers::Linear),
+    ) {
+        f(prefix, self);
+    }
+}
+
+// Parameter leaves hold arrays, never layers, so the walk stops here.
+impl VisitLinears for Array {
+    fn visit_linears_mut(
+        &mut self,
+        _prefix: &str,
+        _f: &mut dyn FnMut(&str, &mut super::layers::Linear),
+    ) {
+    }
+}
+
+impl<T> VisitLinears for Param<T> {
+    fn visit_linears_mut(
+        &mut self,
+        _prefix: &str,
+        _f: &mut dyn FnMut(&str, &mut super::layers::Linear),
+    ) {
+    }
+}
+
+impl<T: VisitLinears> VisitLinears for Option<T> {
+    fn visit_linears_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut super::layers::Linear),
+    ) {
+        if let Some(inner) = self {
+            inner.visit_linears_mut(prefix, f);
+        }
+    }
+}
+
+impl<T: VisitLinears> VisitLinears for Box<T> {
+    fn visit_linears_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut super::layers::Linear),
+    ) {
+        (**self).visit_linears_mut(prefix, f);
+    }
+}
+
+/// Indexed like a checkpoint key: `layers.0.self_attn.q_proj`.
+impl<T: VisitLinears> VisitLinears for Vec<T> {
+    fn visit_linears_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut super::layers::Linear),
+    ) {
+        for (i, item) in self.iter_mut().enumerate() {
+            item.visit_linears_mut(&child_path(prefix, &i.to_string()), f);
+        }
+    }
+}
+
 // ── impl_module_params! macro ────────────────────────────────────────────────
 
 /// Implement `ModuleParameters` for a struct.
@@ -217,6 +312,22 @@ macro_rules! impl_module_params {
                 out
             }
         }
+
+        impl $crate::compat::VisitLinears for $ty {
+            fn visit_linears_mut(
+                &mut self,
+                prefix: &str,
+                f: &mut dyn ::std::ops::FnMut(&str, &mut $crate::compat::Linear),
+            ) {
+                $(
+                    $crate::compat::VisitLinears::visit_linears_mut(
+                        &mut self.$field,
+                        &$crate::compat::child_path(prefix, stringify!($field)),
+                        f,
+                    );
+                )*
+            }
+        }
     };
 
     // Variant with generics: impl_module_params!(MyStruct<T> where T: Foo; field1, field2)
@@ -236,6 +347,22 @@ macro_rules! impl_module_params {
                 let mut out = ::std::collections::HashMap::new();
                 $( $crate::compat::Parameter::collect_params_mut(&mut self.$field, stringify!($field), &mut out); )*
                 out
+            }
+        }
+
+        impl $crate::compat::VisitLinears for $ty where $($bound)* {
+            fn visit_linears_mut(
+                &mut self,
+                prefix: &str,
+                f: &mut dyn ::std::ops::FnMut(&str, &mut $crate::compat::Linear),
+            ) {
+                $(
+                    $crate::compat::VisitLinears::visit_linears_mut(
+                        &mut self.$field,
+                        &$crate::compat::child_path(prefix, stringify!($field)),
+                        f,
+                    );
+                )*
             }
         }
     };

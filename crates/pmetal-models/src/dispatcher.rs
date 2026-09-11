@@ -1771,6 +1771,20 @@ impl DynamicModel {
     }
 }
 
+/// Walk every projection in whichever architecture is loaded.
+///
+/// This is what lets `pmetal-lora` attach adapters to a model it did not build
+/// and does not have the concrete type of.
+impl pmetal_bridge::compat::VisitLinears for DynamicModel {
+    fn visit_linears_mut(
+        &mut self,
+        prefix: &str,
+        f: &mut dyn FnMut(&str, &mut pmetal_bridge::compat::Linear),
+    ) {
+        dispatch_uniform!(self, visit_linears_mut, prefix, f)
+    }
+}
+
 impl ModuleParameters for DynamicModel {
     fn parameters(&self) -> pmetal_bridge::compat::module::ModuleParamRef<'_> {
         dispatch_uniform!(self, parameters)

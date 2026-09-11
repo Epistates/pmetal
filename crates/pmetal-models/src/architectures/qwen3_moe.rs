@@ -7,8 +7,8 @@
 //! - SwitchGLU-style expert MLP with gather_mm
 
 use pmetal_bridge::compat::{
-    Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, Param, indexing, nn,
-    ops, random,
+    Array, Dtype, Exception, ModuleParamMut, ModuleParamRef, ModuleParameters, Param, VisitLinears,
+    indexing, nn, ops, random,
 };
 use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::{
@@ -668,6 +668,15 @@ pub enum Qwen3MoEFeedForward {
     Dense(Qwen3MoEDenseMLP),
     /// Mixture of Experts.
     MoE(Qwen3MoEBlock),
+}
+
+impl VisitLinears for Qwen3MoEFeedForward {
+    fn visit_linears_mut(&mut self, prefix: &str, f: &mut dyn FnMut(&str, &mut nn::Linear)) {
+        match self {
+            Self::Dense(mlp) => mlp.visit_linears_mut(prefix, f),
+            Self::MoE(moe) => moe.visit_linears_mut(prefix, f),
+        }
+    }
 }
 
 impl ModuleParameters for Qwen3MoEFeedForward {

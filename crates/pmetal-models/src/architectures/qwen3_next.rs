@@ -13,8 +13,8 @@ use pmetal_bridge::compat::ops::{
     select_axis, slice_axis, slice_axis_from, slice_last_from, slice_last_to,
 };
 use pmetal_bridge::compat::{
-    Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param, fast,
-    nn, ops, random,
+    Array, Dtype, Exception, Module, ModuleParamMut, ModuleParamRef, ModuleParameters, Param,
+    VisitLinears, fast, nn, ops, random,
 };
 use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
@@ -2998,6 +2998,15 @@ fn load_missing_experts_into_aligned_buffers(
 pub enum Qwen3NextFeedForward {
     Dense(Qwen3NextMLP),
     MoE(Qwen3NextSparseMoeBlock),
+}
+
+impl VisitLinears for Qwen3NextFeedForward {
+    fn visit_linears_mut(&mut self, prefix: &str, f: &mut dyn FnMut(&str, &mut nn::Linear)) {
+        match self {
+            Self::Dense(mlp) => mlp.visit_linears_mut(prefix, f),
+            Self::MoE(moe) => moe.visit_linears_mut(prefix, f),
+        }
+    }
 }
 
 impl ModuleParameters for Qwen3NextFeedForward {

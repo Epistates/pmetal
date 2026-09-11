@@ -32,6 +32,7 @@ fn zero_linear(out_dims: i32, in_dims: i32, bias: bool) -> nn::Linear {
         } else {
             None
         }),
+        adapter: None,
     }
 }
 

@@ -19,6 +19,7 @@ pub use traits::*;
 
 pub mod indexing;
 pub mod layers;
+pub mod lora;
 pub mod nn;
 pub mod ops;
 pub mod optimizers;
@@ -27,6 +28,9 @@ pub mod optimizers;
 
 /// Re-export InlineArray as Array for source compatibility.
 pub use crate::InlineArray as Array;
+
+pub use layers::Linear;
+pub use lora::LoraAdapter;
 
 // ── Dtype ────────────────────────────────────────────────────────────────────
 

@@ -790,3 +790,51 @@ fn parameter_paths_do_not_collide() {
         }
     }
 }
+
+/// Every projection the walker reaches must sit at the same path its weight
+/// occupies in the parameter tree.
+///
+/// This is the invariant adapter targeting depends on. `target_modules` names
+/// projections the way a checkpoint does (`q_proj`, `gate_proj`), so a walker
+/// that agreed with the struct layout but not with the parameter tree would
+/// attach adapters to the wrong layers, or to none.
+#[test]
+fn the_linear_walker_agrees_with_the_parameter_tree() {
+    use pmetal_bridge::compat::VisitLinears;
+
+    for case in cases() {
+        let Ok(mut model) = DynamicModel::from_config(case.config_json) else {
+            continue;
+        };
+
+        let weight_paths: std::collections::HashSet<String> = model
+            .flatten_params()
+            .keys()
+            .filter_map(|k| k.strip_suffix(".weight").map(str::to_string))
+            .collect();
+
+        let mut visited: Vec<String> = Vec::new();
+        model.visit_linears_mut("", &mut |path, _| visited.push(path.to_string()));
+
+        assert!(
+            !visited.is_empty(),
+            "{}: the walker reached no projections at all",
+            case.name
+        );
+
+        let mut seen = std::collections::HashSet::new();
+        for path in &visited {
+            assert!(
+                seen.insert(path.clone()),
+                "{}: two projections share the path `{path}`",
+                case.name
+            );
+            assert!(
+                weight_paths.contains(path),
+                "{}: walker reached `{path}`, which has no `{path}.weight` in the \
+                 parameter tree",
+                case.name
+            );
+        }
+    }
+}
