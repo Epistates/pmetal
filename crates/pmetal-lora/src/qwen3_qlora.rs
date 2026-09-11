@@ -21,6 +21,7 @@ use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa};
 use pmetal_models::ModelConfig;
 use pmetal_models::architectures::qwen3::Qwen3Config;
+use pmetal_models::architectures::utils::create_causal_mask;
 
 use crate::{LoraError, QLoraConfig, QLoraLinear};
 
@@ -1256,20 +1257,6 @@ impl crate::TrainableModel for Qwen3QloraForCausalLM {
     fn supports_gradient_checkpointing(&self) -> bool {
         false
     }
-}
-
-/// Create a causal attention mask.
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask =
-        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-    let equal_zero = mask.equal(&zero);
-    Ok(pmetal_bridge::compat::ops::where_fn(
-        &equal_zero,
-        &neg_inf,
-        &zero,
-    ))
 }
 
 #[cfg(test)]

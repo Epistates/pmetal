@@ -19,6 +19,7 @@ use pmetal_mlx::kernels::{
 };
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::granite::{GraniteConfig, GraniteLayerType};
+use pmetal_models::architectures::utils::create_causal_mask;
 
 use crate::lora::LoraProjection;
 use crate::lora_helpers::{
@@ -1424,18 +1425,6 @@ crate::impl_trainable_model!(GraniteLoraForCausalLM);
 // =============================================================================
 // Helpers
 // =============================================================================
-
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask =
-        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-    Ok(pmetal_bridge::compat::ops::where_fn(
-        &mask.equal(&zero),
-        &neg_inf,
-        &zero,
-    ))
-}
 
 // =============================================================================
 // Tests

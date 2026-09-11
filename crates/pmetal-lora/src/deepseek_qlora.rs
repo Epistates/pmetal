@@ -27,6 +27,7 @@ use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kernels::rope::apply_rope;
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE};
+use pmetal_models::architectures::utils::create_causal_mask;
 
 use crate::{LoraError, QLoraConfig, QLoraLinear};
 
@@ -1217,19 +1218,6 @@ fn load_qlora_lora_weights(
         .collect();
     set_qlora_lora_params(model, &params);
     Ok(())
-}
-
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let indices: Vec<i32> = (0..seq_len).collect();
-    let row = Array::from_slice(&indices, &[1, seq_len]);
-    let col = Array::from_slice(&indices, &[seq_len, 1]);
-    let mask_bool = row.less_equal(&col);
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0f32);
-    Ok(
-        pmetal_bridge::compat::ops::r#where(&mask_bool, &zero, &neg_inf)
-            .reshape(&[1, 1, seq_len, seq_len]),
-    )
 }
 
 // ─── ForCausalLM ─────────────────────────────────────────────────────────────

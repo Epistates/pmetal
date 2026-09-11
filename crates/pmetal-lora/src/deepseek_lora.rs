@@ -28,6 +28,7 @@ use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kernels::rope::{apply_rope, apply_rope_with_freqs};
 use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::deepseek::{DeepSeekConfig, DeepSeekMoE, mla_scale_and_yarn};
+use pmetal_models::architectures::utils::create_causal_mask;
 use pmetal_models::common::yarn::YarnRope;
 
 use crate::lora::LoraProjection;
@@ -1066,20 +1067,6 @@ impl ModuleParameters for DeepSeekLoraModel {
         m.extend(self.norm.parameters_mut());
         m
     }
-}
-
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let indices: Vec<i32> = (0..seq_len).collect();
-    let row = Array::from_slice(&indices, &[1, seq_len]);
-    let col = Array::from_slice(&indices, &[seq_len, 1]);
-    let mask_bool = row.less_equal(&col);
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0f32);
-    // where mask_bool: 0, else -inf  →  upper-triangular entries are -inf
-    Ok(
-        pmetal_bridge::compat::ops::r#where(&mask_bool, &zero, &neg_inf)
-            .reshape(&[1, 1, seq_len, seq_len]),
-    )
 }
 
 // ─── LoRA parameter management helpers ───────────────────────────────────────

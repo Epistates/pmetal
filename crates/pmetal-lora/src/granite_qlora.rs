@@ -22,6 +22,7 @@ use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_models::architectures::granite::{GraniteConfig, GraniteLayerType, GraniteMamba2};
+use pmetal_models::architectures::utils::create_causal_mask;
 
 use crate::{LoraError, QLoraConfig, QLoraLinear};
 
@@ -1261,15 +1262,6 @@ fn expand_kv_heads(x: &Array, repeats: i32) -> Result<Array, LoraError> {
         &[batch, n_kv_heads, repeats, seq_len, head_dim],
     );
     Ok(x.reshape(&[batch, n_kv_heads * repeats, seq_len, head_dim]))
-}
-
-/// Build a causal attention mask of shape [seq_len, seq_len].
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-    let equal_zero = mask.equal(&zero);
-    Ok(ops::where_fn(&equal_zero, &neg_inf, &zero))
 }
 
 // =============================================================================

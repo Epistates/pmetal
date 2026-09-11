@@ -25,6 +25,7 @@ use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_models::architectures::cohere::CohereConfig;
+use pmetal_models::architectures::utils::create_causal_mask;
 
 use crate::{LoraError, QLoraConfig, QLoraLinear, TrainableModel};
 
@@ -1017,13 +1018,6 @@ impl TrainableModel for CohereQloraForCausalLM {
 // =============================================================================
 // Helpers
 // =============================================================================
-
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask = ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-    Ok(ops::where_fn(&mask.equal(&zero), &neg_inf, &zero))
-}
 
 // =============================================================================
 // Tests

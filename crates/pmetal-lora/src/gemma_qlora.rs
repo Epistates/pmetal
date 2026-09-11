@@ -22,6 +22,7 @@ use pmetal_bridge::compat::{
 use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_models::architectures::gemma::GemmaConfig;
+use pmetal_models::architectures::utils::create_causal_mask;
 
 use crate::{LoraError, QLoraConfig, QLoraLinear};
 
@@ -1037,18 +1038,6 @@ impl GemmaQloraForCausalLM {
 
         self.load_and_quantize_weights(&all_weights)
     }
-}
-
-fn create_causal_mask(seq_len: i32) -> Result<Array, Exception> {
-    let mask =
-        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-    Ok(pmetal_bridge::compat::ops::where_fn(
-        &mask.equal(&zero),
-        &neg_inf,
-        &zero,
-    ))
 }
 
 /// Implement ModuleParameters for GemmaQloraForCausalLM.

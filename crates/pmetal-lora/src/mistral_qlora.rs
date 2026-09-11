@@ -17,6 +17,7 @@ use pmetal_core::LoraConfig;
 use pmetal_mlx::gradient_checkpoint::CheckpointConfig;
 use pmetal_models::architectures::mistral::MistralConfig;
 
+use crate::lora_helpers::training_attention_mask;
 use crate::{LoraError, QLoraConfig, QLoraLinear, TrainableModel};
 
 /// QLoRA-enabled attention layer for Mistral.
@@ -451,7 +452,10 @@ impl MistralQloraModel {
         // Create causal mask if not provided
         let mask = if mask.is_none() {
             let seq_len = input_ids.dim(1);
-            Some(create_causal_mask(seq_len, self.config.sliding_window)?)
+            Some(training_attention_mask(
+                seq_len,
+                self.config.sliding_window,
+            )?)
         } else {
             mask.cloned()
         };
@@ -1005,31 +1009,6 @@ impl MistralQloraForCausalLM {
 
         self.load_and_quantize_weights(&all_weights)
     }
-}
-
-/// Create a causal attention mask with optional sliding window.
-fn create_causal_mask(seq_len: i32, sliding_window: Option<i32>) -> Result<Array, Exception> {
-    let mask =
-        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-    let mut causal_mask = pmetal_bridge::compat::ops::where_fn(&mask.equal(&zero), &neg_inf, &zero);
-
-    // Apply sliding window if specified
-    if let Some(window) = sliding_window {
-        // Create lower triangular mask with window offset
-        let window_mask = pmetal_bridge::compat::ops::tri(
-            seq_len,
-            seq_len,
-            -window,
-            pmetal_bridge::compat::Dtype::Float32,
-        );
-        let one = Array::from_f32(1.0);
-        causal_mask =
-            pmetal_bridge::compat::ops::where_fn(&window_mask.equal(&one), &neg_inf, &causal_mask);
-    }
-
-    Ok(causal_mask)
 }
 
 /// Implement ModuleParameters for MistralQloraForCausalLM.

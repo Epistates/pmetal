@@ -31,6 +31,7 @@ use pmetal_models::architectures::llama4::{
 };
 
 use crate::lora::LoraProjection;
+use crate::lora_helpers::training_attention_mask;
 use crate::lora_helpers::{
     LoraDecoderStack, collect_lora_parameters, count_trainable_params, load_lora_weights_impl,
     save_lora_weights_impl, set_lora_parameters as helpers_set_lora_parameters,
@@ -780,7 +781,7 @@ impl Llama4LoraModel {
 
         let mask = if mask.is_none() {
             let seq_len = input_ids.dim(1);
-            Some(create_causal_mask(seq_len)?)
+            Some(training_attention_mask(seq_len, None)?)
         } else {
             mask.cloned()
         };
@@ -858,7 +859,7 @@ impl Llama4LoraModel {
 
         let mask = if mask.is_none() {
             let seq_len_i = input_ids.dim(1);
-            Some(create_causal_mask(seq_len_i)?)
+            Some(training_attention_mask(seq_len_i, None)?)
         } else {
             mask.cloned()
         };
@@ -1672,19 +1673,6 @@ fn apply_temperature_scaling(q: Array, seq_len: i32, floor_scale: f32, attn_scal
     let scales = log_vals.multiply(&Array::from_f32(attn_scale)).add(&ones);
     let scales = scales.reshape(&[1, 1, seq_len, 1]);
     q.multiply(&scales)
-}
-
-/// Build a standard causal attention mask of shape `[seq_len, seq_len]`.
-fn create_causal_mask(seq_len: i32) -> Result<Array, LoraError> {
-    let mask =
-        pmetal_bridge::compat::ops::tri(seq_len, seq_len, 0, pmetal_bridge::compat::Dtype::Float32);
-    let neg_inf = Array::from_f32(f32::NEG_INFINITY);
-    let zero = Array::from_f32(0.0);
-    Ok(pmetal_bridge::compat::ops::where_fn(
-        &mask.equal(&zero),
-        &neg_inf,
-        &zero,
-    ))
 }
 
 // =============================================================================
