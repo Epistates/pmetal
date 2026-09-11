@@ -355,7 +355,13 @@ macro_rules! impl_trainable_model {
             }
 
             fn supports_gradient_checkpointing(&self) -> bool {
-                true
+                // These models accept `enable_gradient_checkpointing` and store
+                // the flag, but their forward passes only log at the boundaries
+                // they were told to checkpoint at. Claiming support made the
+                // trainer report the feature as on for every architecture that
+                // uses this macro. Real checkpointing lives on `AdaptedModel`,
+                // which is replacing these.
+                false
             }
 
             fn supports_kv_cache(&self) -> bool {

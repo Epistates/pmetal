@@ -71,7 +71,6 @@ pub mod adaptive_lr;
 pub mod ane_reward;
 pub mod callbacks;
 pub mod checkpoint;
-pub mod checkpointing;
 pub mod contrastive_loss;
 pub mod dapo;
 pub mod dflash_training;
@@ -136,7 +135,6 @@ pub use adaptive_lr::{AdaptiveLrConfig, AdaptiveLrController, LrControlCommand, 
 pub use ane_reward::{AsyncRewardModel, PendingRewards, PipelinedGrpoSession};
 pub use callbacks::*;
 pub use checkpoint::*;
-pub use checkpointing::*;
 pub use dapo::*;
 #[cfg(feature = "experimental-trainers")]
 pub use diffusion::*;

@@ -43,7 +43,6 @@ pub mod offloading;
 pub mod prefix_cache;
 pub mod quantization;
 pub mod sequence_packing;
-pub mod smart_checkpoint;
 pub mod speculative;
 
 #[cfg(any(test, feature = "test-utils"))]
@@ -62,7 +61,6 @@ pub use neftune::*;
 pub use offloading::*;
 pub use prefix_cache::*;
 pub use sequence_packing::*;
-pub use smart_checkpoint::*;
 pub use speculative::*;
 
 // Re-export bridge types for convenience
@@ -87,7 +85,6 @@ pub mod prelude {
     pub use crate::prefix_cache::*;
     pub use crate::quantization::*;
     pub use crate::sequence_packing::*;
-    pub use crate::smart_checkpoint::*;
     pub use crate::speculative::*;
     pub use pmetal_bridge::compat::{Array, Dtype, Exception, Module, ModuleParameters, Param};
 }

@@ -1586,7 +1586,9 @@ mod tests {
                 .unwrap();
 
         assert!(model.supports_kv_cache());
-        assert!(model.supports_gradient_checkpointing());
+        // The per-architecture LoRA models accept the setting and log at the
+        // boundaries, but never checkpoint. Real support lives on `AdaptedModel`.
+        assert!(!model.supports_gradient_checkpointing());
 
         let input_ids = Array::from_i32_slice(&[10_i32, 20]).reshape(&[1, 2]);
         let logits = model.forward(&input_ids, None).unwrap();

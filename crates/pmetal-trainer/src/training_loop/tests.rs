@@ -315,7 +315,7 @@ fn test_jit_training_step_multiple_steps() {
 }
 
 #[test]
-fn test_run_packed_direct_api_applies_gradient_checkpointing() {
+fn test_run_packed_declines_gradient_checkpointing_the_model_cannot_do() {
     let config = TrainingLoopConfig {
         training: TrainingConfig {
             learning_rate: 1e-4,
@@ -352,15 +352,18 @@ fn test_run_packed_direct_api_applies_gradient_checkpointing() {
         .run_packed(model, dataset, None, None)
         .unwrap();
 
-    let checkpoint_config = model
-        .checkpoint_config
-        .expect("packed direct API should enable gradient checkpointing");
-    assert!(checkpoint_config.enabled);
-    assert_eq!(checkpoint_config.layers_per_block, 3);
+    // `LlamaLoraForCausalLM` reports no gradient-checkpointing support, so the
+    // request is declined and the run proceeds without it. This used to assert
+    // the opposite, which only ever confirmed that a flag had been stored in a
+    // field the forward pass ignores.
+    assert!(
+        model.checkpoint_config.is_none(),
+        "packed run enabled checkpointing on a model that does not implement it"
+    );
 }
 
 #[test]
-fn test_run_compiled_direct_api_applies_gradient_checkpointing() {
+fn test_run_compiled_declines_gradient_checkpointing_the_model_cannot_do() {
     let config = TrainingLoopConfig {
         training: TrainingConfig {
             learning_rate: 1e-4,
@@ -397,11 +400,11 @@ fn test_run_compiled_direct_api_applies_gradient_checkpointing() {
         .run_compiled(model, dataset, None, None)
         .unwrap();
 
-    let checkpoint_config = model
-        .checkpoint_config
-        .expect("compiled direct API should enable gradient checkpointing");
-    assert!(checkpoint_config.enabled);
-    assert_eq!(checkpoint_config.layers_per_block, 3);
+    // See the packed variant above: the model declines, and the run continues.
+    assert!(
+        model.checkpoint_config.is_none(),
+        "compiled run enabled checkpointing on a model that does not implement it"
+    );
 }
 
 #[test]

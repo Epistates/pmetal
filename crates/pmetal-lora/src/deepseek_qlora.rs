@@ -1876,7 +1876,9 @@ mod tests {
         let mut model =
             DeepSeekQloraForCausalLM::new(tiny_moe_config(), default_lora_config()).unwrap();
         assert!(model.supports_kv_cache());
-        assert!(model.supports_gradient_checkpointing());
+        // The per-architecture LoRA models accept the setting and log at the
+        // boundaries, but never checkpoint. Real support lives on `AdaptedModel`.
+        assert!(!model.supports_gradient_checkpointing());
         assert!(model.num_trainable_params() > 0);
 
         let input_ids = Array::from_slice(&[1i32, 2], &[1, 2]);
