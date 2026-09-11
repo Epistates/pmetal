@@ -40,6 +40,7 @@ use pmetal_models::architectures::qwen3_next::{
     sanitize_weights,
 };
 
+use crate::lora_helpers::training_attention_mask;
 use crate::{LoraError, LoraLinear};
 
 // ============================================================================
@@ -1078,7 +1079,16 @@ impl Qwen3NextLoraModel {
         // - Full attention: uses the causal mask from the caller (4D [1,1,T,T])
         // - GDN (linear attention): uses None — GDN expects 2D [B,T] token-validity,
         //   not a 4D attention mask. Passing 4D causes reshape errors.
-        let fa_mask = mask;
+        //
+        // Training calls this with no mask, and `Qwen3NextLoraAttention::forward`
+        // only reaches a causal kernel at seq >= 2048; below that it hand-rolls
+        // a softmax over whatever mask it was handed. So the trunk owes its
+        // attention layers one, or ordinary fine-tuning attends bidirectionally.
+        let owned_mask = match mask {
+            Some(_) => None,
+            None => Some(training_attention_mask(input_ids.dim(1), None)?),
+        };
+        let fa_mask = mask.or(owned_mask.as_ref());
         let ssm_mask: Option<&Array> = None;
 
         let layers_per_block = checkpoint_config

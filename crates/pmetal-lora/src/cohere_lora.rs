@@ -27,6 +27,7 @@ use crate::lora::LoraProjection;
 use crate::lora_helpers::{
     LoraDecoderStack, collect_lora_parameters, count_trainable_params, load_lora_weights_impl,
     save_lora_weights_impl, set_lora_parameters as helpers_set_lora_parameters,
+    training_attention_mask,
 };
 use crate::{LoraError, LoraLinear};
 
@@ -139,19 +140,23 @@ impl CohereLoraAttention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        // Reshape: [B, S, H*D] -> [B, S, H, D]
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        // Reshape and transpose to [B, H, S, D] BEFORE RoPE so that axis -2 is
+        // the sequence axis. Rotating in [B, S, H, D] makes `apply_rope` treat
+        // the head axis as positions — the axis bug `CohereAttention` in
+        // pmetal-models documents having fixed, and the same one fixed in Phi.
+        let q = q
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let k = k
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let v = v
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply RoPE BEFORE transpose — Cohere applies rope in [B, S, H, D] layout
+        // Cohere uses *traditional* (interleaved) RoPE.
         let q = apply_rope(&q, self.head_dim, true, self.rope_theta, 1.0, 0)?;
         let k = apply_rope(&k, self.head_dim, true, self.rope_theta, 1.0, 0)?;
-
-        // Transpose to [B, H, S, D]
-        let q = q.transpose_axes(&[0, 2, 1, 3]);
-        let k = k.transpose_axes(&[0, 2, 1, 3]);
-        let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // GQA: expand KV heads if needed
         let k = if self.n_kv_heads < self.n_heads {
@@ -196,26 +201,23 @@ impl CohereLoraAttention {
         let k = self.k_proj.forward(x)?;
         let v = self.v_proj.forward(x)?;
 
-        let q = q.reshape(&[batch, seq_len, self.n_heads, self.head_dim]);
-        let k = k.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
-        let v = v.reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim]);
+        // Transpose to [B, H, S, D] BEFORE RoPE so axis -2 is the sequence
+        // axis. With a cache offset the old ordering misrotated heads as
+        // positions, which is what makes a cached decode disagree with the
+        // prefill that seeded it.
+        let q = q
+            .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let k = k
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
+        let v = v
+            .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
+            .transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply RoPE BEFORE transpose (with cache offset)
-        let (q, k) = if let Some((ref cache_ref, _)) = cache {
-            let offset = cache_ref.rope_offset();
-            let q = apply_rope(&q, self.head_dim, true, self.rope_theta, 1.0, offset)?;
-            let k = apply_rope(&k, self.head_dim, true, self.rope_theta, 1.0, offset)?;
-            (q, k)
-        } else {
-            let q = apply_rope(&q, self.head_dim, true, self.rope_theta, 1.0, 0)?;
-            let k = apply_rope(&k, self.head_dim, true, self.rope_theta, 1.0, 0)?;
-            (q, k)
-        };
-
-        // Transpose to [B, H, S, D]
-        let q = q.transpose_axes(&[0, 2, 1, 3]);
-        let k = k.transpose_axes(&[0, 2, 1, 3]);
-        let v = v.transpose_axes(&[0, 2, 1, 3]);
+        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let q = apply_rope(&q, self.head_dim, true, self.rope_theta, 1.0, offset)?;
+        let k = apply_rope(&k, self.head_dim, true, self.rope_theta, 1.0, offset)?;
 
         let (k, v) = if let Some((cache, layer_idx)) = cache {
             cache
@@ -585,8 +587,22 @@ impl CohereLoraModel {
         })
     }
 
+    /// Forward pass.
+    ///
+    /// Builds the causal mask when the caller supplies none.
+    /// `CohereLoraAttention::forward` adds whatever mask it is handed and
+    /// nothing more, so without this the training pass attends bidirectionally
+    /// while inference does not. Cohere is uniformly causal, with no sliding
+    /// window to carry.
     pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         let mut h = Module::forward(&mut self.embed_tokens, input_ids)?;
+
+        let owned_mask = match mask {
+            Some(_) => None,
+            None => Some(training_attention_mask(input_ids.dim(1), None)?),
+        };
+        let mask = mask.or(owned_mask.as_ref());
+
         for layer in &mut self.layers {
             h = layer.forward(&h, mask)?;
         }

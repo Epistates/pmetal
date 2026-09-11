@@ -17,7 +17,7 @@ use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
 use pmetal_models::architectures::mistral::MistralConfig;
 
 use crate::lora::LoraProjection;
-use crate::lora_helpers::{LoraDecoderStack, count_trainable_params};
+use crate::lora_helpers::{LoraDecoderStack, count_trainable_params, training_attention_mask};
 use crate::{LoraError, LoraLinear, TrainableModel};
 
 /// LoRA-enabled attention layer for Mistral.
@@ -244,7 +244,12 @@ impl MistralLoraAttention {
 
         // Use fused attention kernel for inference (more efficient than standard attention)
         // Mistral supports sliding window attention if configured
-        let mask_type = if let Some(window_size) = self.sliding_window {
+        // A caller-supplied mask is already complete. Asking the fused kernel
+        // for a causal or windowed mask on top of it applies the geometry
+        // twice.
+        let mask_type = if mask.is_some() {
+            AttentionMaskType::None
+        } else if let Some(window_size) = self.sliding_window {
             AttentionMaskType::SlidingWindow(window_size)
         } else {
             AttentionMaskType::Causal
@@ -476,9 +481,24 @@ impl MistralLoraModel {
     }
 
     /// Forward pass.
+    ///
+    /// Builds the causal (or sliding-window) mask when the caller supplies
+    /// none. `MistralLoraAttention::forward` adds whatever mask it is handed
+    /// and nothing more, so without this the training pass attends
+    /// bidirectionally while inference, which reaches a masked `fused_sdpa`
+    /// through `forward_with_cache`, does not.
     pub fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         let mut hidden_states =
             pmetal_bridge::compat::Module::forward(&mut self.embed_tokens, input_ids)?;
+
+        let owned_mask = match mask {
+            Some(_) => None,
+            None => Some(training_attention_mask(
+                input_ids.dim(1),
+                self.config.sliding_window,
+            )?),
+        };
+        let mask = mask.or(owned_mask.as_ref());
 
         for layer in &mut self.layers {
             hidden_states = layer.forward(&hidden_states, mask)?;

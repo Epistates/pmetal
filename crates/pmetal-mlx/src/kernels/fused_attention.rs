@@ -1004,7 +1004,12 @@ fn create_causal_mask(query_len: i32, key_len: i32) -> Result<Array, Exception> 
 ///
 /// Positions can only attend to positions within `window_size` distance.
 /// Shape: [1, 1, query_len, key_len] with -inf for masked positions.
-fn create_sliding_window_mask(
+///
+/// Public because a training forward pass, which cannot always route through
+/// [`fused_sdpa`], still has to see the same geometry the inference path does.
+/// Two builders for one window is how a model comes to be fine-tuned under a
+/// mask it will never be served under.
+pub fn create_sliding_window_mask(
     query_len: i32,
     key_len: i32,
     window_size: i32,

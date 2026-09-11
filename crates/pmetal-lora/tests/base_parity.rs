@@ -95,11 +95,7 @@ fn cases() -> Vec<ArchCase> {
                 "rope_theta": 10000.0,
                 "tie_word_embeddings": false
             }"#,
-            known_divergence: Some(
-                "MistralLoraAttention::forward adds a mask only when one is passed, and \
-                 MistralLoraModel::forward never builds one, so training attends \
-                 bidirectionally.",
-            ),
+            known_divergence: None,
         },
         ArchCase {
             name: "qwen3",
@@ -213,11 +209,7 @@ fn cases() -> Vec<ArchCase> {
                 "rope_theta": 10000.0,
                 "logit_scale": 0.0625
             }"#,
-            known_divergence: Some(
-                "CohereLoraAttention::forward adds a mask only when one is passed, and \
-                 CohereLoraModel::forward never builds one, so training attends \
-                 bidirectionally.",
-            ),
+            known_divergence: None,
         },
         ArchCase {
             name: "granite",
@@ -419,11 +411,7 @@ fn cases() -> Vec<ArchCase> {
                 "partial_rotary_factor": 0.25,
                 "tie_word_embeddings": false
             }"#,
-            known_divergence: Some(
-                "Qwen3NextLoraAttention only takes the causal `differentiable_attention` \
-                 path at seq >= 2048; below that it hand-rolls a softmax with no mask, \
-                 so ordinary fine-tuning attends bidirectionally.",
-            ),
+            known_divergence: None,
         },
     ]
 }

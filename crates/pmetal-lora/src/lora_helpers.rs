@@ -9,6 +9,8 @@
 //! - `impl_trainable_model!` macro that generates the boilerplate `TrainableModel`
 //!   impl for architectures whose `ForCausalLM` type exposes all required methods
 //!   as inherent methods.
+//! - `training_attention_mask`: the mask a trunk must build when its caller
+//!   supplies none.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -17,6 +19,40 @@ use pmetal_bridge::compat::Array;
 
 use crate::LoraError;
 use crate::lora::LoraProjection;
+
+// ─── Attention masking ───────────────────────────────────────────────────────
+
+/// The additive attention mask a training forward pass must apply when the
+/// caller passes none.
+///
+/// Inference reaches [`pmetal_mlx::kernels::fused_sdpa`], which derives the mask
+/// from an [`AttentionMaskType`](pmetal_mlx::kernels::AttentionMaskType) when
+/// none is supplied. Training mostly cannot: the fused path is not always
+/// differentiable, so the LoRA architectures hand-roll
+/// `softmax(QK^T * scale + mask)` and simply add whatever mask they were given.
+/// Given `None`, that is no mask at all, and the model trains bidirectionally
+/// while it will be served causally.
+///
+/// So the trunk owes its layers a mask. This builds it from the same primitives
+/// `fused_sdpa` uses, rather than a second implementation that can drift:
+/// `create_sliding_window_mask` is literally the function the fused path calls.
+///
+/// `sliding_window` wider than the sequence is the same mask as plain causal,
+/// so it takes the cheaper path.
+pub fn training_attention_mask(
+    seq_len: i32,
+    sliding_window: Option<i32>,
+) -> Result<Array, LoraError> {
+    match sliding_window {
+        Some(window) if window > 0 && window < seq_len => {
+            pmetal_mlx::kernels::create_sliding_window_mask(seq_len, seq_len, window)
+                .map_err(LoraError::Mlx)
+        }
+        _ => {
+            pmetal_models::architectures::utils::create_causal_mask(seq_len).map_err(LoraError::Mlx)
+        }
+    }
+}
 
 // ─── LoraDecoderStack ────────────────────────────────────────────────────────
 
