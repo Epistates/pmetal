@@ -146,6 +146,13 @@ where
 /// differentiated once.  Retaining an output array past the model's lifetime,
 /// or differentiating the same graph a second time after the borrow has ended,
 /// is undefined behaviour.
+///
+/// The trap is quieter than it looks.  A closure written without `move`
+/// captures even plain `Copy` locals by reference, so an index or a length
+/// belonging to the calling frame becomes a dangling read on the recompute and
+/// comes back as whatever is on the stack by then.  Write the closure as
+/// `move` and let it own everything except the long-lived borrows this contract
+/// is actually about.
 pub unsafe fn checkpoint_apply_unchecked<F>(inputs: &[InlineArray], inner_fn: F) -> Vec<InlineArray>
 where
     F: FnMut(&[InlineArray]) -> Vec<InlineArray>,

@@ -17,6 +17,7 @@
 mod traits;
 pub use traits::*;
 
+pub mod checkpoint;
 pub mod indexing;
 pub mod layers;
 pub mod lora;
@@ -29,6 +30,7 @@ pub mod optimizers;
 /// Re-export InlineArray as Array for source compatibility.
 pub use crate::InlineArray as Array;
 
+pub use checkpoint::checkpointed;
 pub use layers::Linear;
 pub use lora::LoraAdapter;
 
