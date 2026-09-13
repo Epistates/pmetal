@@ -81,11 +81,30 @@ pub struct Qwen3NextLoadOptions {
     pub skip_routed_experts: bool,
 }
 
+/// Width of one quantized tensor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TensorQuant {
+    bits: i32,
+    group_size: i32,
+}
+
 #[derive(Debug, Clone)]
 struct MlxQuantizationConfig {
     bits: i32,
     group_size: i32,
-    per_tensor_overrides: HashMap<String, i32>,
+    /// Per-tensor widths, keyed by the tensor's own checkpoint key.
+    overrides: HashMap<String, TensorQuant>,
+}
+
+impl MlxQuantizationConfig {
+    /// The width to unpack `key` at, which is the model-wide one unless the
+    /// checkpoint said otherwise for this tensor.
+    fn for_tensor(&self, key: &str) -> TensorQuant {
+        self.overrides.get(key).copied().unwrap_or(TensorQuant {
+            bits: self.bits,
+            group_size: self.group_size,
+        })
+    }
 }
 
 /// Assign every checkpoint tensor whose name matches a parameter path,
@@ -176,21 +195,69 @@ fn load_mlx_quantization_config(
         )));
     }
 
-    let per_tensor_overrides = quant
+    let mut overrides: HashMap<String, TensorQuant> = HashMap::new();
+
+    // MLX's own layout, and the one mlx-community QAT releases ship: each
+    // module that differs from the model-wide setting gets its own entry
+    // *beside* `bits` and `group_size`, keyed by module path, e.g.
+    //
+    //   "language_model.model.layers.0.mlp.gate_proj": {"bits": 8, "group_size": 64}
+    //
+    // mlx-lm reads these in `class_predicate` when rebuilding the model. Not
+    // reading them unpacks those tensors at the model-wide width, which yields
+    // the right byte count and the wrong shape, so the failure surfaces several
+    // ops later as a norm complaining about its input.
+    //
+    // A module may also map to `false`, meaning it was left unquantized; those
+    // carry no `.scales`/`.biases` and are skipped on that basis below.
+    if let Some(object) = quant.as_object() {
+        for (module_path, value) in object {
+            let Some(entry) = value.as_object() else {
+                continue;
+            };
+            let read = |field: &str, fallback: i32| {
+                entry
+                    .get(field)
+                    .and_then(|v| v.as_i64())
+                    .map(|v| v as i32)
+                    .unwrap_or(fallback)
+            };
+            let quant = TensorQuant {
+                bits: read("bits", bits),
+                group_size: read("group_size", group_size),
+            };
+            if quant.bits <= 0 || quant.group_size <= 0 {
+                return Err(LoadError::SafeTensors(format!(
+                    "Invalid MLX quantization for {module_path}: {quant:?}"
+                )));
+            }
+            // Keyed by module; the packed tensor is that module's `weight`.
+            overrides.insert(format!("{module_path}.weight"), quant);
+        }
+    }
+
+    // pmetal's own mixed-precision output, which records bits per *tensor* key.
+    if let Some(object) = quant
         .get("per_tensor_overrides")
         .and_then(|value| value.as_object())
-        .map(|object| {
-            object
-                .iter()
-                .filter_map(|(key, value)| value.as_i64().map(|bits| (key.clone(), bits as i32)))
-                .collect()
-        })
-        .unwrap_or_default();
+    {
+        for (tensor_key, value) in object {
+            if let Some(per_tensor_bits) = value.as_i64() {
+                overrides.insert(
+                    tensor_key.clone(),
+                    TensorQuant {
+                        bits: per_tensor_bits as i32,
+                        group_size,
+                    },
+                );
+            }
+        }
+    }
 
     Ok(Some(MlxQuantizationConfig {
         bits,
         group_size,
-        per_tensor_overrides,
+        overrides,
     }))
 }
 
@@ -227,12 +294,11 @@ fn dequantize_mlx_quantized_weights(
         let Some(biases) = weights.get(&format!("{key}.biases")).cloned() else {
             continue;
         };
-        let bits = config
-            .per_tensor_overrides
-            .get(&key)
-            .copied()
-            .unwrap_or(config.bits);
-        let dequantized = weight.dequantize(&scales, &biases, config.group_size, bits);
+        // Both the width *and* the group size can vary per tensor. Unpacking a
+        // mixed-precision checkpoint at one model-wide setting silently
+        // produces wrongly-shaped weights.
+        let quant = config.for_tensor(&key);
+        let dequantized = weight.dequantize(&scales, &biases, quant.group_size, quant.bits);
         weights.insert(key, dequantized);
     }
 
@@ -2012,10 +2078,94 @@ mod tests {
         assert_eq!(config.bits, 4);
         assert_eq!(config.group_size, 64);
         assert_eq!(
-            config
-                .per_tensor_overrides
-                .get("model.layers.0.self_attn.q_proj.weight"),
-            Some(&8)
+            config.for_tensor("model.layers.0.self_attn.q_proj.weight"),
+            TensorQuant {
+                bits: 8,
+                group_size: 64
+            }
+        );
+    }
+
+    /// The layout MLX itself writes, and the one mlx-community QAT releases
+    /// ship: per-module entries sitting beside `bits` and `group_size`, keyed
+    /// by module path rather than tensor key.
+    #[test]
+    fn load_mlx_quantization_config_reads_mlx_per_module_overrides() {
+        let temp = tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.json"),
+            r#"{
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4,
+                    "mode": "affine",
+                    "language_model.model.layers.0.mlp.gate_proj": {
+                        "bits": 8,
+                        "group_size": 32
+                    },
+                    "language_model.model.layers.0.self_attn.q_proj": false
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_mlx_quantization_config(temp.path())
+            .unwrap()
+            .expect("quantization config");
+
+        assert_eq!(
+            config.for_tensor("language_model.model.layers.0.mlp.gate_proj.weight"),
+            TensorQuant {
+                bits: 8,
+                group_size: 32
+            },
+            "per-module override was not applied, so this tensor unpacks at the \
+             model-wide width"
+        );
+        assert_eq!(
+            config.for_tensor("language_model.model.layers.0.mlp.down_proj.weight"),
+            TensorQuant {
+                bits: 4,
+                group_size: 64
+            },
+            "a module with no override should take the model-wide setting"
+        );
+        // `false` means the module was left unquantized. It carries no
+        // scales/biases, so it never reaches dequantization.
+        assert!(
+            !config
+                .overrides
+                .contains_key("language_model.model.layers.0.self_attn.q_proj.weight"),
+            "an unquantized module was recorded as an override"
+        );
+    }
+
+    /// A per-module entry that omits `group_size` inherits the model-wide one,
+    /// which is how MLX's `to_quantized(**params)` fills its defaults.
+    #[test]
+    fn a_partial_per_module_override_inherits_the_model_wide_group_size() {
+        let temp = tempdir().unwrap();
+        std::fs::write(
+            temp.path().join("config.json"),
+            r#"{
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4,
+                    "model.layers.3.mlp.up_proj": {"bits": 8}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = load_mlx_quantization_config(temp.path())
+            .unwrap()
+            .expect("quantization config");
+        assert_eq!(
+            config.for_tensor("model.layers.3.mlp.up_proj.weight"),
+            TensorQuant {
+                bits: 8,
+                group_size: 64
+            }
         );
     }
 
@@ -2043,6 +2193,81 @@ mod tests {
         assert_eq!(restored.shape(), &[2, 64]);
         assert!(!loaded.contains_key("linear.weight.scales"));
         assert!(!loaded.contains_key("linear.weight.biases"));
+    }
+
+    /// A mixed-precision checkpoint, which is what mlx-community QAT releases
+    /// ship: most tensors at the model-wide width, some at another.
+    ///
+    /// Unpacking the 8-bit tensor at the model-wide 4 bits reads the right
+    /// number of bytes and produces the wrong shape, so the load "succeeds" and
+    /// the failure surfaces later as a norm complaining about its input size.
+    #[test]
+    fn load_weights_honours_per_module_quantization_widths() {
+        let temp = tempdir().unwrap();
+        let model_dir = temp.path();
+
+        let wide = Array::from_slice(&[1.0f32; 128], &[2, 64]);
+        let (wide_packed, wide_scales, wide_biases) = wide.quantize_weights(64, 8);
+        let narrow = Array::from_slice(&[1.0f32; 128], &[2, 64]);
+        let (narrow_packed, narrow_scales, narrow_biases) = narrow.quantize_weights(64, 4);
+
+        let mut weights = HashMap::new();
+        weights.insert(
+            "model.layers.0.mlp.gate_proj.weight".to_string(),
+            wide_packed,
+        );
+        weights.insert(
+            "model.layers.0.mlp.gate_proj.weight.scales".to_string(),
+            wide_scales,
+        );
+        weights.insert(
+            "model.layers.0.mlp.gate_proj.weight.biases".to_string(),
+            wide_biases,
+        );
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.weight".to_string(),
+            narrow_packed,
+        );
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.weight.scales".to_string(),
+            narrow_scales,
+        );
+        weights.insert(
+            "model.layers.0.self_attn.q_proj.weight.biases".to_string(),
+            narrow_biases,
+        );
+        write_safetensors(&model_dir.join("model.safetensors"), &weights).unwrap();
+
+        std::fs::write(
+            model_dir.join("config.json"),
+            r#"{
+                "quantization": {
+                    "group_size": 64,
+                    "bits": 4,
+                    "mode": "affine",
+                    "model.layers.0.mlp.gate_proj": {"bits": 8, "group_size": 64}
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let loaded = load_weights(model_dir).unwrap();
+        assert_eq!(
+            loaded
+                .get("model.layers.0.mlp.gate_proj.weight")
+                .unwrap()
+                .shape(),
+            &[2, 64],
+            "the 8-bit tensor unpacked at the model-wide 4 bits"
+        );
+        assert_eq!(
+            loaded
+                .get("model.layers.0.self_attn.q_proj.weight")
+                .unwrap()
+                .shape(),
+            &[2, 64],
+            "the tensor with no override should still take the model-wide width"
+        );
     }
 
     /// A checkpoint key that matches no parameter has to come back in the
