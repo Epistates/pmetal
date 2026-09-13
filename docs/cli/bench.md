@@ -118,26 +118,26 @@ This is the right tool when you want to evaluate flash-moe-style BLAS ideas on t
 
 ```bash
 pmetal bench-gdn \
-  --model /Users/nickpaterno/.cache/huggingface/hub/models--unsloth--Qwen3.5-0.8B/snapshots/<rev> \
+  --model ~/.cache/huggingface/hub/models--unsloth--Qwen3.5-0.8B/snapshots/<rev> \
   --json \
-  --output .strategy/bench_gdn_qwen35_0_8b.json
+  --output bench_gdn_qwen35_0_8b.json
 ```
 
 ```bash
 pmetal bench-gdn \
   --stage out-proj \
-  --model /Users/nickpaterno/.cache/huggingface/hub/models--unsloth--Qwen3.5-0.8B/snapshots/<rev> \
+  --model ~/.cache/huggingface/hub/models--unsloth--Qwen3.5-0.8B/snapshots/<rev> \
   --json \
-  --output .strategy/bench_gdn_qwen35_0_8b_out_proj.json
+  --output bench_gdn_qwen35_0_8b_out_proj.json
 ```
 
 ```bash
 pmetal bench-gdn \
   --stage prefill \
   --seq-len 1024 \
-  --model /Users/nickpaterno/.cache/huggingface/hub/models--unsloth--Qwen3.5-0.8B/snapshots/<rev> \
+  --model ~/.cache/huggingface/hub/models--unsloth--Qwen3.5-0.8B/snapshots/<rev> \
   --json \
-  --output .strategy/bench_gdn_qwen35_0_8b_prefill.json
+  --output bench_gdn_qwen35_0_8b_prefill.json
 ```
 
 For large sparse Qwen3.5 checkpoints, the command still works without `--experts-dir` because it only loads the hybrid trunk and benchmarks a GDN layer; it does not execute routed experts.
