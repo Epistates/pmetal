@@ -39,10 +39,9 @@ fn setup(sequences: &[(&Array, &Array)]) -> std::result::Result<(), Exception> {
 | `kernels` | Custom MLX kernels (cross entropy, RMS norm, GDN, etc.) |
 | `kernels/gated_delta` | Gated Delta Network (GDN) recurrence with fused Metal shader |
 | `quantization` | Weight quantization implementations |
-| `gradient_checkpoint` | Memory-efficient gradient computation |
+| `gradient_checkpoint` | Gradient-checkpointing config (the mechanism lives in `pmetal-bridge`) |
 | `kv_cache` | Key-value cache for efficient inference |
 | `moe` | Mixture of Experts support |
-| `neftune` | NEFTune noise injection |
 | `sequence_packing` | Efficient sequence batching |
 | `speculative` | Speculative decoding utilities |
 

@@ -344,6 +344,25 @@ impl crate::TrainableModel for AdaptedModel {
     fn supports_gradient_checkpointing(&self) -> bool {
         self.model.supports_gradient_checkpointing()
     }
+
+    /// Forward with NEFTune noise on the embedding output.
+    ///
+    /// The alpha is set on the embedding for the duration of the call and
+    /// cleared afterwards, so nothing else that shares this model (an eval
+    /// pass, a generation) inherits it.
+    fn forward_noised(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        noise_alpha: f32,
+    ) -> Result<Array, LoraError> {
+        if !self.model.set_neftune_alpha(Some(noise_alpha)) {
+            return AdaptedModel::forward(self, input_ids, mask);
+        }
+        let out = AdaptedModel::forward(self, input_ids, mask);
+        self.model.set_neftune_alpha(None);
+        out
+    }
 }
 
 /// Delegates straight through to the wrapped model, so the optimizer and the

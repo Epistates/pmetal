@@ -514,9 +514,15 @@ impl GroupNormBuilder {
 // ── Embedding ─────────────────────────────────────────────────────────────
 
 /// Simple embedding lookup table.
+///
+/// Carries the NEFTune noise scale as a property, the same way [`Linear`]
+/// carries its adapter: it is a thing that happens to this layer's output, and
+/// putting it here keeps every architecture from having to know about it.
 #[derive(Debug, Clone)]
 pub struct Embedding {
     pub weight: Param<Array>,
+    /// NEFTune noise scale, when training with it. See [`Embedding::forward`].
+    pub neftune_alpha: Option<f32>,
 }
 
 impl Embedding {
@@ -530,20 +536,50 @@ impl Embedding {
         );
         Ok(Self {
             weight: Param::new(weight),
+            neftune_alpha: None,
         })
     }
 
+    /// Look up `x`, adding NEFTune noise when [`Embedding::neftune_alpha`] is set.
+    ///
+    /// NEFTune (Jain et al., 2023) adds `U(-mag, mag)` to the embedding output
+    /// during training, with `mag = alpha / sqrt(seq_len * dims)`. This is the
+    /// same point TRL injects at, since its hook fires on the embedding
+    /// module's output: for Gemma that means the noise goes in *before* the
+    /// `sqrt(hidden_size)` scale and gets multiplied up with everything else.
+    ///
+    /// Only the token-embedding layer should carry an alpha. A tied LM head
+    /// goes through [`Embedding::as_linear`], which never adds noise.
     pub fn forward(&self, x: &Array) -> Array {
         let weight = fp8_weight_for_compute(&self.weight.value);
         // MLX >= 0.32 raises "[gather] Cannot calculate VJP with respect to
         // indices" when token indices sit inside the grad trace; the lookup
         // must never be differentiated w.r.t. its indices.
-        weight.take_axis(&x.stop_gradient(), 0)
+        let embedded = weight.take_axis(&x.stop_gradient(), 0);
+        match self.neftune_alpha {
+            Some(alpha) if alpha > 0.0 => add_neftune_noise(&embedded, alpha),
+            _ => embedded,
+        }
     }
 
     pub fn as_linear(&self, x: &Array) -> Array {
         linear_forward_array(x, &self.weight.value, None)
     }
+}
+
+/// Add NEFTune uniform noise to an embedding output.
+///
+/// The noise is drawn in `embedded`'s own dtype. Drawing it in f32 against a
+/// bf16 checkpoint promotes the sum, and MLX carries that promotion through
+/// every op downstream, so the whole forward silently runs in f32 for the rest
+/// of the model.
+fn add_neftune_noise(embedded: &Array, alpha: f32) -> Array {
+    let shape = embedded.shape();
+    let dims = shape[shape.len() - 1] as f32;
+    let seq_len = shape[shape.len() - 2] as f32;
+    let magnitude = alpha / (seq_len * dims).sqrt();
+    let noise = random::uniform_range(-magnitude, magnitude, shape, embedded.dtype());
+    embedded.add(&noise)
 }
 
 crate::impl_module_params!(Embedding; weight);

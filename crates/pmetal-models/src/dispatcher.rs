@@ -1424,6 +1424,50 @@ impl DynamicModel {
         }
     }
 
+    /// The token-embedding layer, for architectures that have a single one.
+    ///
+    /// The input embedding is where NEFTune noise goes, and where a caller that
+    /// wants to run the trunk on embeddings it built itself (multimodal, soft
+    /// prompts) has to reach. Excludes Flux, which has no token embedding.
+    pub fn token_embedding_mut(&mut self) -> Option<&mut nn::Embedding> {
+        match self {
+            Self::Llama(m) => Some(&mut m.model.embed_tokens),
+            Self::Llama4(m) => Some(&mut m.model.embed_tokens),
+            Self::Qwen2(m) => Some(&mut m.model.embed_tokens),
+            Self::Qwen3(m) => Some(&mut m.model.embed_tokens),
+            Self::Qwen3MoE(m) => Some(&mut m.model.embed_tokens),
+            Self::Qwen3Next(m) => Some(&mut m.model.embed_tokens),
+            Self::Gemma(m) => Some(&mut m.model.embed_tokens),
+            Self::Gemma4(m) => Some(&mut m.model.embed_tokens),
+            Self::Mistral(m) => Some(&mut m.model.embed_tokens),
+            Self::Phi(m) | Self::Phi4(m) => Some(&mut m.model.embed_tokens),
+            Self::DeepSeek(m) => Some(&mut m.model.embed_tokens),
+            Self::Cohere(m) => Some(&mut m.model.embed_tokens),
+            Self::Granite(m) => Some(&mut m.model.embed_tokens),
+            Self::GptOss(m) => Some(&mut m.model.embed_tokens),
+            Self::NemotronH(m) => Some(&mut m.backbone.embeddings),
+            Self::Mllama(m) => Some(&mut m.language_model.embed_tokens),
+            Self::Bert(_) | Self::DiffusionGemma(_) | Self::Flux(_) => None,
+        }
+    }
+
+    /// Set the NEFTune noise scale on the token embedding, or clear it.
+    ///
+    /// NEFTune (Jain et al., 2023) perturbs the embedding output during
+    /// training. `alpha` is typically 5 to 15; `None` turns it off.
+    ///
+    /// Returns `false` when this architecture has no single token embedding to
+    /// put it on, so a caller can say so rather than assume it took.
+    pub fn set_neftune_alpha(&mut self, alpha: Option<f32>) -> bool {
+        match self.token_embedding_mut() {
+            Some(embedding) => {
+                embedding.neftune_alpha = alpha;
+                true
+            }
+            None => false,
+        }
+    }
+
     pub fn quantize_fp8(&mut self) -> Result<(), Exception> {
         match self {
             // NemotronH has a bespoke implementation that operates on concrete
