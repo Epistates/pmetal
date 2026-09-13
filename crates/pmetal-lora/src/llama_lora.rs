@@ -1627,7 +1627,7 @@ impl ModuleParameters for LlamaLoraForCausalLM {
 }
 
 // Implement TrainableModel for LlamaLoraForCausalLM via shared macro.
-crate::impl_trainable_model!(LlamaLoraForCausalLM);
+crate::impl_trainable_model!(LlamaLoraForCausalLM, packed_positions);
 
 #[cfg(test)]
 mod tests {

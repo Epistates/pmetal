@@ -1213,6 +1213,11 @@ impl ModuleParameters for Qwen3QloraForCausalLM {
 
 /// Implement TrainableModel for Qwen3QloraForCausalLM.
 impl crate::TrainableModel for Qwen3QloraForCausalLM {
+    /// This architecture's `forward_with_positions` applies the positions.
+    fn supports_packed_positions(&self) -> bool {
+        true
+    }
+
     fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         Qwen3QloraForCausalLM::forward(self, input_ids, mask, None)
     }

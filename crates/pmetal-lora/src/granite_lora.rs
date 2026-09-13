@@ -1420,7 +1420,7 @@ impl ModuleParameters for GraniteLoraForCausalLM {
 }
 
 // Wire TrainableModel via shared macro.
-crate::impl_trainable_model!(GraniteLoraForCausalLM);
+crate::impl_trainable_model!(GraniteLoraForCausalLM, packed_positions);
 
 // =============================================================================
 // Helpers

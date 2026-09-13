@@ -759,6 +759,10 @@ impl TrainableModel for DynamicLoraModel {
         dispatch_lora_uniform!(self, supports_gradient_checkpointing)
     }
 
+    fn supports_packed_positions(&self) -> bool {
+        dispatch_lora_uniform!(self, supports_packed_positions)
+    }
+
     fn forward_with_cache(
         &mut self,
         input_ids: &Array,
@@ -1046,6 +1050,65 @@ mod tests {
             .unwrap(),
         );
         assert!(!qwen3_next.supports_gradient_checkpointing());
+    }
+
+    /// Packing is on by default, so which architectures really restart their
+    /// RoPE positions at a packed boundary is worth stating outright.
+    ///
+    /// `forward_with_positions` has a default that takes the position IDs and
+    /// drops them, and several architectures override it with one that does
+    /// the same. Both look like support from the call site, which is how a
+    /// packed run ends up feeding the second sequence in a row positions that
+    /// continue from the first.
+    #[test]
+    fn only_the_architectures_that_apply_positions_claim_to() {
+        let lora_config = LoraConfig {
+            r: 4,
+            alpha: 8.0,
+            target_modules: vec!["q_proj".into()],
+            ..Default::default()
+        };
+
+        let llama = DynamicLoraModel::Llama(
+            LlamaLoraForCausalLM::new(
+                LlamaConfig {
+                    vocab_size: 100,
+                    hidden_size: 32,
+                    intermediate_size: 64,
+                    num_hidden_layers: 2,
+                    num_attention_heads: 4,
+                    num_key_value_heads: Some(2),
+                    ..Default::default()
+                },
+                lora_config.clone(),
+            )
+            .unwrap(),
+        );
+        assert!(
+            llama.supports_packed_positions(),
+            "llama applies position IDs through apply_rope_with_positions"
+        );
+
+        let mistral = DynamicLoraModel::Mistral(
+            MistralLoraForCausalLM::new(
+                pmetal_models::architectures::mistral::MistralConfig {
+                    vocab_size: 100,
+                    hidden_size: 32,
+                    intermediate_size: 64,
+                    num_hidden_layers: 2,
+                    num_attention_heads: 4,
+                    num_key_value_heads: Some(2),
+                    ..Default::default()
+                },
+                lora_config,
+            )
+            .unwrap(),
+        );
+        assert!(
+            !mistral.supports_packed_positions(),
+            "mistral's forward_with_positions takes the IDs and ignores them; claiming \
+             support here would hide that from the packed trainer"
+        );
     }
 
     #[test]

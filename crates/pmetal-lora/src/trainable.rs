@@ -55,6 +55,23 @@ pub trait TrainableModel: ModuleParameters {
         self.forward(input_ids, mask)
     }
 
+    /// Whether [`forward_with_positions`] actually applies the positions.
+    ///
+    /// The default above accepts `position_ids` and ignores them, and several
+    /// architectures override it with a version that does the same. That is
+    /// indistinguishable from real support at the call site, which matters
+    /// because sequence packing is on by default: a model answering `false`
+    /// here is one whose RoPE positions run straight through the boundary
+    /// between two packed sequences instead of restarting.
+    ///
+    /// The block-diagonal mask still stops one sequence attending to another,
+    /// so this degrades the positions rather than mixing the content.
+    ///
+    /// [`forward_with_positions`]: Self::forward_with_positions
+    fn supports_packed_positions(&self) -> bool {
+        false
+    }
+
     /// Perform forward pass for Vision-Language Models with image inputs.
     ///
     /// This is used for VLM training (e.g., Llama 3.2 Vision) where the model

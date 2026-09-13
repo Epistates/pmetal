@@ -105,6 +105,21 @@ impl TrainingLoop {
         }
 
         let mut model = model;
+
+        // Packing is on by default, so this is the common path. The
+        // block-diagonal mask keeps one packed sequence from attending to
+        // another, but a model that does not apply the position IDs still
+        // gives the second sequence in a row RoPE positions continuing from
+        // wherever the first one ended, rather than restarting at zero.
+        if !model.supports_packed_positions() {
+            tracing::warn!(
+                "Sequence packing is on, but this model ignores the position IDs, so RoPE \
+                 positions will not restart at packed-sequence boundaries. Attention is \
+                 still blocked across sequences by the mask. Pass --no-sequence-packing \
+                 to train on unpacked batches instead."
+            );
+        }
+
         self.apply_gradient_checkpointing(&mut model, "Packed");
 
         // Compute actual total steps: max_steps takes priority, otherwise epochs * batches_per_epoch

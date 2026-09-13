@@ -1478,6 +1478,11 @@ impl ModuleParameters for MllamaLoraForCausalLM {
 // ---------------------------------------------------------------------------
 
 impl crate::TrainableModel for MllamaLoraForCausalLM {
+    /// This architecture's `forward_with_positions` applies the positions.
+    fn supports_packed_positions(&self) -> bool {
+        true
+    }
+
     fn forward(&mut self, input_ids: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         MllamaLoraForCausalLM::forward(self, input_ids, mask)
     }

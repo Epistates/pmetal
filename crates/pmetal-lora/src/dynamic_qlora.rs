@@ -616,6 +616,10 @@ impl TrainableModel for DynamicQloraModel {
     fn supports_gradient_checkpointing(&self) -> bool {
         dispatch_qlora!(self, supports_gradient_checkpointing)
     }
+
+    fn supports_packed_positions(&self) -> bool {
+        dispatch_qlora!(self, supports_packed_positions)
+    }
 }
 
 // ---------------------------------------------------------------------------

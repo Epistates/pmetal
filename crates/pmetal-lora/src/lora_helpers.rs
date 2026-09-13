@@ -307,8 +307,20 @@ pub fn count_trainable_params(stack: &dyn LoraDecoderStack) -> usize {
 /// - `get_lm_head_weight(&self) -> Option<Array>`
 #[macro_export]
 macro_rules! impl_trainable_model {
+    // Opt-in form for architectures whose `forward_with_positions` genuinely
+    // applies the positions rather than accepting and dropping them.
+    ($type:ty, packed_positions) => {
+        $crate::impl_trainable_model!(@inner $type, true);
+    };
     ($type:ty) => {
+        $crate::impl_trainable_model!(@inner $type, false);
+    };
+    (@inner $type:ty, $packed_positions:expr) => {
         impl $crate::TrainableModel for $type {
+            fn supports_packed_positions(&self) -> bool {
+                $packed_positions
+            }
+
             fn forward(
                 &mut self,
                 input_ids: &Array,
