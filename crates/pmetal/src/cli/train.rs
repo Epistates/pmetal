@@ -119,8 +119,9 @@ pub struct TrainArgs {
     #[arg(long = "no-gradient-checkpointing")]
     pub no_gradient_checkpointing: bool,
 
-    /// Number of layers per checkpoint block (default: 4).
-    #[arg(long = "gradient-checkpointing-layers", default_value = "4")]
+    /// Deprecated, has no effect. One decoder layer is the checkpoint unit,
+    /// as in PyTorch and mlx-lm, so there is no block size to pick.
+    #[arg(long = "gradient-checkpointing-layers", default_value = "1")]
     pub gradient_checkpointing_layers: usize,
 
     /// Path to log training metrics as JSONL.

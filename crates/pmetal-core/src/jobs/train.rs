@@ -128,13 +128,19 @@ pub struct TrainSpec {
     #[serde(default)]
     pub no_gradient_checkpointing: bool,
 
+    /// Deprecated, has no effect.
+    ///
+    /// One decoder layer is the checkpoint unit, as in PyTorch and mlx-lm, so
+    /// there is no block size to pick. Kept on the spec so existing job files
+    /// and `--gradient-checkpointing-layers` still parse; `min = max = 1` stops
+    /// the generated UI offering a control that does nothing.
     #[job(
-        label = "Gradient Checkpointing Layers",
+        label = "Gradient Checkpointing Layers (deprecated, no effect)",
         group = "Optimization",
         argv = "--gradient-checkpointing-layers",
         min = 1,
-        max = 1024,
-        default_int = 4
+        max = 1,
+        default_int = 1
     )]
     #[serde(default = "default_grad_ckpt_layers")]
     pub gradient_checkpointing_layers: usize,
@@ -509,7 +515,7 @@ fn default_grad_accum() -> usize {
     defaults::GRADIENT_ACCUMULATION_STEPS
 }
 fn default_grad_ckpt_layers() -> usize {
-    4
+    1
 }
 fn default_max_grad_norm() -> f64 {
     defaults::MAX_GRAD_NORM

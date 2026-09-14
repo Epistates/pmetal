@@ -217,10 +217,6 @@ pub struct TrainingConfig {
     #[serde(default)]
     pub polynomial_power: Option<f64>,
 
-    /// Gradient checkpointing strategy.
-    #[serde(default)]
-    pub gradient_checkpointing: CheckpointStrategy,
-
     /// Optimizer type.
     #[serde(default)]
     pub optimizer: OptimizerType,
@@ -272,7 +268,6 @@ impl Default for TrainingConfig {
             wsd_stable_ratio: None,
             cosine_num_restarts: None,
             polynomial_power: None,
-            gradient_checkpointing: CheckpointStrategy::default(),
             optimizer: OptimizerType::default(),
             seed: default_seed(),
             logging_steps: default_logging_steps(),
@@ -303,25 +298,6 @@ pub enum LrSchedulerType {
     /// Warmup-Stable-Decay: linear warmup → constant plateau → linear decay.
     /// Modern default for LLM training. Stable phase ratio defaults to 0.7.
     Wsd,
-}
-
-/// Gradient checkpointing strategy.
-///
-/// **Not yet implemented for the MLX backend** — selecting a strategy other than
-/// `None` has no effect on peak memory usage. The option is retained so configs
-/// remain forward-compatible once backend support lands.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum CheckpointStrategy {
-    /// No checkpointing (default — gradient checkpointing is not yet implemented).
-    #[default]
-    None,
-    /// Checkpoint every N layers.
-    EveryN(usize),
-    /// Smart checkpointing based on memory budget.
-    Smart,
-    /// Selective attention-only checkpointing.
-    SelectiveAttention,
 }
 
 /// Optimizer type.

@@ -393,20 +393,25 @@ impl TrainingLoop {
             return;
         }
 
+        // One decoder layer is the checkpoint unit, matching what PyTorch and
+        // mlx-lm both do. `--gradient-checkpointing-layers` predates that and
+        // has never selected anything; say so rather than echo it back as if
+        // it had.
         let layers = self.config.gradient_checkpointing_layers.max(1);
+        if layers != 1 {
+            tracing::warn!(
+                layers_per_block = layers,
+                "--gradient-checkpointing-layers has no effect: one decoder layer is the \
+                 checkpoint unit, as in PyTorch and mlx-lm. The flag is accepted for \
+                 compatibility and will be removed."
+            );
+        }
         model.enable_gradient_checkpointing(layers);
 
         if mode.is_empty() {
-            tracing::info!(
-                "Gradient checkpointing enabled: {} layers per checkpoint block",
-                layers
-            );
+            tracing::info!("Gradient checkpointing enabled, one decoder layer per block");
         } else {
-            tracing::info!(
-                "{}: gradient checkpointing enabled (every {} layers)",
-                mode,
-                layers
-            );
+            tracing::info!("{mode}: gradient checkpointing enabled, one decoder layer per block");
         }
     }
 
