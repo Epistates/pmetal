@@ -2041,46 +2041,24 @@ impl Gemma4ForCausalLM {
 
 /// Load Gemma 4 weights into an existing [`Gemma4ForCausalLM`] instance.
 ///
-/// The loader tolerates the Gemma 4 multimodal wrapper by first stripping
-/// the `model.language_model.` prefix when present — multimodal checkpoints
-/// also carry vision / audio weights which are simply skipped.
+/// Keys arrive in any of the three released layouts and are normalised onto
+/// the bare `model.*` text tower by
+/// [`pmetal_bridge::gemma4_native::normalize_checkpoint_key`]; vision and
+/// audio weights are skipped.
 pub fn load_gemma4_weights(
     model: &mut Gemma4ForCausalLM,
     raw_weights: &HashMap<String, Array>,
 ) -> Result<LoadReport, Exception> {
     let mut report = LoadReport::default();
 
-    // Strip multimodal prefix + skip vision / audio tower entries.
-    //
-    // Two multimodal layouts exist in the wild:
-    //   - `model.language_model.*` (google/ transformers export)
-    //   - `language_model.model.*` (unified `gemma4_unified` export, e.g.
-    //     mlx-community/gemma-4-12B-it-bf16, where the vision / audio towers
-    //     sit beside the text backbone as `vision_embedder.*`,
-    //     `embed_vision.*`, `embed_audio.*`)
-    // Both normalise to the bare `model.*` keys this loader expects.
+    // Strip the multimodal prefix + skip vision / audio tower entries. The
+    // rule lives in `pmetal_bridge::gemma4_native` so the native engine and
+    // this loader accept exactly the same set of checkpoints.
     let weights: HashMap<String, Array> = raw_weights
         .iter()
         .filter_map(|(key, value)| {
-            let stripped = key
-                .strip_prefix("model.language_model.")
-                .map(|rest| format!("model.{rest}"))
-                .or_else(|| {
-                    key.strip_prefix("language_model.")
-                        .map(|rest| rest.to_string())
-                })
-                .unwrap_or_else(|| key.clone());
-            if stripped.contains("embed_vision")
-                || stripped.contains("embed_audio")
-                || stripped.contains("vision_tower")
-                || stripped.contains("vision_embedder")
-                || stripped.contains("audio_tower")
-                || stripped.contains("multi_modal_projector")
-            {
-                None
-            } else {
-                Some((stripped, value.clone()))
-            }
+            pmetal_bridge::gemma4_native::normalize_checkpoint_key(key)
+                .map(|stripped| (stripped, value.clone()))
         })
         .collect();
 

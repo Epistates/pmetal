@@ -718,6 +718,44 @@ fn shared_kv_attention_forward(
         .rms_norm(Some(&layer.post_attn_norm_w), eps)
 }
 
+/// Normalise a Gemma 4 checkpoint key onto the bare `model.*` text-tower
+/// layout, returning `None` for vision / audio entries the text tower never
+/// reads.
+///
+/// Three layouts ship in the wild:
+///
+/// * `model.*` — text-only export (`gemma4_text`).
+/// * `model.language_model.*` — transformers multimodal export, e.g.
+///   `unsloth/gemma-4-31B-it`, with the towers under `model.vision_tower.*`.
+/// * `language_model.model.*` — unified export (`gemma4_unified`), e.g.
+///   `mlx-community/gemma-4-12B-it-bf16`, where the towers sit *beside* the
+///   text backbone as `vision_embedder.*`, `embed_vision.*`, `embed_audio.*`
+///   rather than under a shared `model.` root.
+///
+/// Shared with `pmetal_models::architectures::gemma4::load_gemma4_weights` so
+/// the two loaders cannot drift on which checkpoints they accept.
+pub fn normalize_checkpoint_key(key: &str) -> Option<String> {
+    const NON_TEXT_TOWER: [&str; 6] = [
+        "embed_vision",
+        "embed_audio",
+        "vision_tower",
+        "vision_embedder",
+        "audio_tower",
+        "multi_modal_projector",
+    ];
+
+    let stripped = key
+        .strip_prefix("model.language_model.")
+        .map(|rest| format!("model.{rest}"))
+        .or_else(|| key.strip_prefix("language_model.").map(str::to_string))
+        .unwrap_or_else(|| key.to_string());
+
+    if NON_TEXT_TOWER.iter().any(|tower| stripped.contains(tower)) {
+        return None;
+    }
+    Some(stripped)
+}
+
 /// Load a Gemma 4 checkpoint into [`NativeWeights`]. Dense linears are
 /// pre-transposed at load time so the per-step matmuls are contiguous.
 pub fn load_model(
@@ -740,9 +778,9 @@ pub fn load_model(
         return Err(format!("no .safetensors shards found in {model_path_str}"));
     }
 
-    // Collect every `(key, array)` pair across shards. Stripping the
-    // `model.language_model.` prefix lets us consume both text-only and
-    // multimodal checkpoints transparently.
+    // Collect every `(key, array)` pair across shards, normalised onto the
+    // bare `model.*` text-tower layout so text-only, multimodal and unified
+    // checkpoints all load through the same key set.
     let mut raw: std::collections::HashMap<String, InlineArray> = std::collections::HashMap::new();
     for shard in &shard_files {
         let shard_str = shard
@@ -752,18 +790,16 @@ pub fn load_model(
             return Err(format!("failed to load safetensors shard {shard_str}"));
         };
         for (key, arr) in pairs {
-            let stripped = key
-                .strip_prefix("model.language_model.")
-                .map(|rest| format!("model.{rest}"))
-                .unwrap_or(key.clone());
-            if stripped.contains("embed_vision")
-                || stripped.contains("vision_tower")
-                || stripped.contains("audio_tower")
-                || stripped.contains("multi_modal_projector")
-            {
+            let Some(stripped) = normalize_checkpoint_key(&key) else {
                 continue;
+            };
+            // Two layouts normalising onto one key would resolve silently in
+            // whatever order the shards happened to be read.
+            if raw.insert(stripped.clone(), arr).is_some() {
+                return Err(format!(
+                    "Gemma 4 native: two checkpoint keys both normalise to {stripped}"
+                ));
             }
-            raw.insert(stripped, arr);
         }
     }
 
@@ -1413,5 +1449,60 @@ mod tests {
                 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0,
             ]
         );
+    }
+
+    /// `mlx-community/gemma-4-12B-it-bf16` and `-31b-it-bf16` publish the text
+    /// tower under `language_model.model.*`, which the loader used to leave
+    /// untouched and then reject with `missing weight model.embed_tokens.weight`
+    /// (issue #26).
+    #[test]
+    fn unified_layout_normalises_onto_the_text_tower() {
+        assert_eq!(
+            normalize_checkpoint_key("language_model.model.embed_tokens.weight").as_deref(),
+            Some("model.embed_tokens.weight")
+        );
+        assert_eq!(
+            normalize_checkpoint_key("language_model.model.layers.7.self_attn.q_proj.weight")
+                .as_deref(),
+            Some("model.layers.7.self_attn.q_proj.weight")
+        );
+        assert_eq!(
+            normalize_checkpoint_key("language_model.lm_head.weight").as_deref(),
+            Some("lm_head.weight")
+        );
+    }
+
+    #[test]
+    fn transformers_and_text_only_layouts_normalise_onto_the_text_tower() {
+        assert_eq!(
+            normalize_checkpoint_key("model.language_model.embed_tokens.weight").as_deref(),
+            Some("model.embed_tokens.weight")
+        );
+        assert_eq!(
+            normalize_checkpoint_key("model.layers.0.layer_scalar").as_deref(),
+            Some("model.layers.0.layer_scalar")
+        );
+        assert_eq!(
+            normalize_checkpoint_key("lm_head.weight").as_deref(),
+            Some("lm_head.weight")
+        );
+    }
+
+    /// The unified export parks its towers *beside* the text backbone rather
+    /// than under a shared `model.` root, so the skip list has to name those
+    /// spellings too.
+    #[test]
+    fn tower_weights_are_skipped_in_every_layout() {
+        for key in [
+            "model.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight",
+            "model.embed_vision.embedding_projection.weight",
+            "vision_embedder.patch_dense.weight",
+            "embed_vision.embedding_projection.weight",
+            "embed_audio.embedding_projection.weight",
+            "language_model.model.audio_tower.something.weight",
+            "multi_modal_projector.weight",
+        ] {
+            assert_eq!(normalize_checkpoint_key(key), None, "should skip {key}");
+        }
     }
 }
