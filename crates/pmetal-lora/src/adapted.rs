@@ -320,6 +320,21 @@ impl crate::TrainableModel for AdaptedModel {
             .map_err(LoraError::Mlx)
     }
 
+    fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        position_ids: &Array,
+    ) -> Result<Array, LoraError> {
+        self.model
+            .forward_with_positions(input_ids, mask, Some(position_ids))
+            .map_err(LoraError::Mlx)
+    }
+
+    fn supports_packed_positions(&self) -> bool {
+        self.model.supports_packed_positions()
+    }
+
     fn supports_kv_cache(&self) -> bool {
         true
     }
