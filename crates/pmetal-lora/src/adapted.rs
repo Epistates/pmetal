@@ -335,6 +335,34 @@ impl crate::TrainableModel for AdaptedModel {
         self.model.supports_packed_positions()
     }
 
+    /// `pixel_values` here means vision features already projected to the text
+    /// hidden size, which is what the VLM adapter path computes once and
+    /// reuses. Running the tower from raw pixels needs the processor's tile
+    /// geometry, which no uniform batch carries; see
+    /// [`DynamicModel::forward_with_cross_states`].
+    ///
+    /// A model with no cross-attention errors rather than quietly running
+    /// text-only, so a VLM run that was handed images and could not use them
+    /// stops instead of reporting a loss that ignored them.
+    fn forward_with_images(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        pixel_values: Option<&Array>,
+    ) -> Result<Array, LoraError> {
+        match pixel_values {
+            Some(cross_states) => self
+                .model
+                .forward_with_cross_states(input_ids, mask, cross_states)
+                .map_err(LoraError::Mlx),
+            None => AdaptedModel::forward(self, input_ids, mask),
+        }
+    }
+
+    fn is_multimodal(&self) -> bool {
+        self.model.supports_cross_attention()
+    }
+
     fn supports_kv_cache(&self) -> bool {
         true
     }

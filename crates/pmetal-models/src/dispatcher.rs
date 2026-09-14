@@ -1282,6 +1282,59 @@ impl DynamicModel {
         }
     }
 
+    /// Forward conditioned on **already projected** vision features,
+    /// `[batch · images · tiles, patches, hidden]`.
+    ///
+    /// Raw pixels do not come through here. Mllama's tower needs its
+    /// processor's tile geometry — `aspect_ratio_ids` and `aspect_ratio_mask`
+    /// — which no uniform batch shape carries;
+    /// [`as_mllama_mut`](Self::as_mllama_mut) plus
+    /// `prepare_cross_attention` is the path that runs the tower from pixels.
+    /// This is the adapter-training shape, where the features are computed
+    /// once and reused.
+    ///
+    /// Errors for an architecture with no cross-attention rather than
+    /// quietly running text-only, which is the difference between a VLM run
+    /// that failed and one that trained on nothing it was given.
+    pub fn forward_with_cross_states(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cross_states: &Array,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Mllama(m) => {
+                let hidden = m.config.text_config.llama.hidden_size;
+                let last = cross_states.shape().last().copied().unwrap_or(0);
+                if last != hidden {
+                    return Err(Exception::custom(format!(
+                        "cross states must already be projected to the text hidden size \
+                         ({hidden}), got a last dimension of {last}. Run the vision tower \
+                         through as_mllama_mut().prepare_cross_attention(..) first."
+                    )));
+                }
+                let cross = crate::architectures::mllama::CrossAttentionInputs {
+                    states: cross_states.clone(),
+                    mask: None,
+                    full_text_row_mask: None,
+                };
+                m.forward_full(input_ids, Some(&cross), mask, None)
+            }
+            other => Err(Exception::custom(format!(
+                "{other:?} has no cross-attention layers, so there is nothing for vision \
+                 features to condition; check supports_cross_attention() before calling"
+            ))),
+        }
+    }
+
+    /// Whether [`forward_with_cross_states`] conditions on vision features for
+    /// this architecture.
+    ///
+    /// [`forward_with_cross_states`]: Self::forward_with_cross_states
+    pub fn supports_cross_attention(&self) -> bool {
+        matches!(self, Self::Mllama(_))
+    }
+
     /// Whether [`forward_with_positions`] actually applies the positions for
     /// this architecture, rather than accepting and dropping them.
     ///
