@@ -242,3 +242,61 @@ fn div_ceil_i32(value: i32, divisor: i32) -> i32 {
 fn broadcasts_to_2d(scale_m: i32, scale_n: i32, weight_m: i32, weight_n: i32) -> bool {
     (scale_m == 1 || scale_m == weight_m) && (scale_n == 1 || scale_n == weight_n)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::discover_safetensors_shards;
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn temp_dir() -> std::path::PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("pmetal-native-loader-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// macOS writes an AppleDouble sidecar named `._<file>` beside every file
+    /// on a volume without native extended attributes, which is every external
+    /// or network drive people keep checkpoints on. A directory glob picks
+    /// those up and the loader dies on "Invalid json header length"; the index
+    /// names only the real shards.
+    #[test]
+    fn apple_double_sidecars_are_not_mistaken_for_shards() {
+        let dir = temp_dir();
+        for name in [
+            "model-00001-of-00002.safetensors",
+            "model-00002-of-00002.safetensors",
+            "._model-00001-of-00002.safetensors",
+            "._model-00002-of-00002.safetensors",
+        ] {
+            fs::write(dir.join(name), b"not really a shard").unwrap();
+        }
+        fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map":{
+                "a": "model-00001-of-00002.safetensors",
+                "b": "model-00002-of-00002.safetensors"
+            }}"#,
+        )
+        .unwrap();
+
+        let mut shards = discover_safetensors_shards(&dir).unwrap();
+        shards.sort();
+        let names: Vec<String> = shards
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "model-00001-of-00002.safetensors".to_string(),
+                "model-00002-of-00002.safetensors".to_string(),
+            ]
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+}

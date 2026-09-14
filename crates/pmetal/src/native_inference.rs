@@ -109,7 +109,9 @@ pub fn detect_arch(model_path: &Path) -> Option<NativeArch> {
         "llama4" | "llama4_text" => Some(NativeArch::Llama4),
         "deepseek_v3" => Some(NativeArch::DeepSeek),
         "gpt_oss" => Some(NativeArch::GptOss),
-        "gemma4" | "gemma4_text" => Some(NativeArch::Gemma4),
+        "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
+            Some(NativeArch::Gemma4)
+        }
         _ => None,
     }
 }
@@ -227,6 +229,18 @@ mod tests {
             r#"{"model_type":"qwen3_6_moe","text_config":{"model_type":"qwen3_6_moe_text"}}"#,
         );
         assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3_5));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `mlx-community/gemma-4-12B-it-bf16` states `gemma4_unified_text`, which
+    /// used to match nothing here, so it fell through to the generic path and
+    /// decoded garbage while the 31B (`gemma4_text`) took the native engine.
+    #[test]
+    fn detects_gemma4_unified_from_nested_text_model_type() {
+        let dir = write_temp_config(
+            r#"{"model_type":"gemma4_unified","text_config":{"model_type":"gemma4_unified_text"}}"#,
+        );
+        assert_eq!(detect_arch(&dir), Some(NativeArch::Gemma4));
         let _ = fs::remove_dir_all(dir);
     }
 

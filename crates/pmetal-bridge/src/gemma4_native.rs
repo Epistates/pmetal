@@ -762,21 +762,12 @@ pub fn load_model(
     model_dir: &std::path::Path,
     config: &Gemma4Config,
 ) -> Result<NativeWeights, String> {
-    let model_path_str = model_dir
-        .to_str()
-        .ok_or_else(|| "model path is not valid UTF-8".to_string())?;
-
-    // Gather all safetensors shards in the directory.
-    let mut shard_files: Vec<std::path::PathBuf> = std::fs::read_dir(model_dir)
-        .map_err(|e| format!("read_dir({model_path_str}): {e}"))?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|p| p.extension().is_some_and(|e| e == "safetensors"))
-        .collect();
+    // Shards come from the index rather than a directory glob. A glob picks up
+    // whatever else ends in `.safetensors`, and on a non-APFS volume that
+    // includes the `._model-0000N-of-…` AppleDouble sidecars macOS writes
+    // beside every file, which fail with "Invalid json header length".
+    let mut shard_files = crate::native_loader::discover_safetensors_shards(model_dir)?;
     shard_files.sort();
-    if shard_files.is_empty() {
-        return Err(format!("no .safetensors shards found in {model_path_str}"));
-    }
 
     // Collect every `(key, array)` pair across shards, normalised onto the
     // bare `model.*` text-tower layout so text-only, multimodal and unified
