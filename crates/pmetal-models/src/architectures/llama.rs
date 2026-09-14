@@ -331,7 +331,7 @@ impl LlamaAttention {
             positions,
             cache
                 .as_ref()
-                .map_or(0, |(cache_ref, _layer_idx)| cache_ref.rope_offset()),
+                .map_or(0, |(cache_ref, layer)| cache_ref.rope_offset_for(*layer)),
         );
         let queries = self.apply_rotary(&queries, rope_positions)?;
         let keys = self.apply_rotary(&keys, rope_positions)?;

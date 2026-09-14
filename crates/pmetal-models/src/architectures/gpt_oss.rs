@@ -459,7 +459,9 @@ impl GptOssAttention {
         // configured (real GPT-OSS uses yarn factor=32), else plain base RoPE.
         let rope_positions = RopePositions::resolve(
             positions,
-            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+            cache
+                .as_ref()
+                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
         let (q, k) = apply_gpt_oss_rope(
             &q,
@@ -1570,7 +1572,9 @@ impl GptOssLoraAttention {
         // Apply RoPE — YARN when configured, else plain base RoPE (same as base attn).
         let rope_positions = RopePositions::resolve(
             positions,
-            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+            cache
+                .as_ref()
+                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
         let (q, k) = apply_gpt_oss_rope(
             &q,

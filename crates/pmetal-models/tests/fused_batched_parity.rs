@@ -90,7 +90,7 @@ fn serial_cache_per_layer_offsets_after_forward() {
     ));
     // Fresh cache: layer 0 offset should be 0, rope_offset() should be 0.
     assert_eq!(cache.seq_len(), 0);
-    assert_eq!(cache.rope_offset(), 0);
+    assert_eq!(cache.rope_offset_for(0), 0);
     // Simulate layer 0 writing one token.
     let h = config.num_kv_heads();
     let d = config.get_head_dim();
@@ -99,7 +99,7 @@ fn serial_cache_per_layer_offsets_after_forward() {
     cache.update_and_fetch(0, &new_k, &new_v).unwrap();
     // Now layer 0's offset is 1, so rope_offset returns 1.
     assert_eq!(cache.seq_len(), 1);
-    assert_eq!(cache.rope_offset(), 1);
+    assert_eq!(cache.rope_offset_for(0), 1);
 }
 
 #[test]

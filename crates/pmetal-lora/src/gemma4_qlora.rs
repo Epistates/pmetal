@@ -392,7 +392,9 @@ impl Gemma4QLoraAttention {
         mask: Option<&Array>,
         mut cache: Option<(&mut KVCache, usize)>,
     ) -> Result<Array, LoraError> {
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let offset = cache
+            .as_ref()
+            .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
         let (q, k, v) = self.project_qkv(x, offset)?;
         let (k, v) = if let Some((cache_ref, layer_idx)) = cache.as_mut() {
             (*cache_ref)
@@ -625,7 +627,7 @@ impl Gemma4QLoraModel {
             let layer_input_ref = layer_input.as_ref();
 
             if let Some(shared_source) = layer.kv_shared_source_layer {
-                let rope_offset = cache.as_ref().map(|c| c.rope_offset()).unwrap_or(0);
+                let rope_offset = cache.as_ref().map_or(0, |c| c.rope_offset_for(i));
                 if let Some(cache_ref) = cache.as_ref() {
                     let (source_keys, source_values) =
                         cache_ref.get(shared_source).ok_or_else(|| {
@@ -1317,7 +1319,7 @@ mod tests {
             .unwrap();
         assert_eq!(no_cache.shape(), with_cache.shape());
         // rope_offset advances by prompt length after the call
-        assert_eq!(cache.rope_offset(), 4);
+        assert_eq!(cache.rope_offset_for(0), 4);
     }
 
     #[test]

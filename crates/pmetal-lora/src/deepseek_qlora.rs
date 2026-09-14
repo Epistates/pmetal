@@ -199,7 +199,9 @@ impl DeepSeekQloraAttention {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let offset = cache
+            .as_ref()
+            .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
 
         // Q path
         let q = self.q.project(x)?;

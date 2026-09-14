@@ -314,7 +314,9 @@ impl Qwen3NextLoraAttention {
         let keys = keys_normed.transpose_axes(&[0, 2, 1, 3]);
         let values = values.transpose_axes(&[0, 2, 1, 3]);
 
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let offset = cache
+            .as_ref()
+            .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
         let queries = apply_rope(
             &queries,
             self.rope_dims,

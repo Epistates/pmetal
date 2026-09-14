@@ -430,7 +430,9 @@ impl DeepSeekAttention {
     ) -> Result<(Array, Array, Array)> {
         let rope_positions = RopePositions::resolve(
             positions,
-            cache.as_ref().map_or(0, |(c, _)| c.rope_offset()),
+            cache
+                .as_ref()
+                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
         let (queries, keys, values) = self.project_qkv_uncached(x, rope_positions)?;
         let (keys, values) = if let Some((ref mut cache, layer_idx)) = cache {
@@ -451,7 +453,9 @@ impl DeepSeekAttention {
         let mut cache = cache;
         let rope_positions = RopePositions::resolve(
             positions,
-            cache.as_ref().map_or(0, |(c, _)| c.rope_offset()),
+            cache
+                .as_ref()
+                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
         let (queries, keys, values) = self.project_qkv_uncached(x, rope_positions)?;
         let batch = queries.shape()[0];
@@ -637,7 +641,9 @@ impl DeepSeekSparseAttention {
         }
         let rope_positions = RopePositions::resolve(
             positions,
-            cache.as_ref().map_or(0, |(c, _)| c.rope_offset()),
+            cache
+                .as_ref()
+                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
         let scores = self.indexer.compute_scores(x, rope_positions)?;
         let selected_indices = self.selector.select_tokens(&scores, mask)?;

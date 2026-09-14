@@ -1636,7 +1636,9 @@ impl Gemma4Attention {
     ) -> Result<Array, Exception> {
         let rope_positions = RopePositions::resolve(
             positions,
-            cache.as_ref().map_or(0, |(c, _)| c.rope_offset()),
+            cache
+                .as_ref()
+                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
         let (q, k, v) = self.project_qkv(x, rope_positions)?;
 
@@ -1944,7 +1946,7 @@ impl Gemma4Model {
             if let Some(shared_source) = layer.kv_shared_source_layer {
                 let rope_positions = RopePositions::resolve(
                     positions,
-                    cache.as_ref().map_or(0, |c| c.rope_offset()),
+                    cache.as_ref().map_or(0, |c| c.rope_offset_for(i)),
                 );
                 if let Some(cache_ref) = cache.as_ref() {
                     let (source_keys, source_values) = cache_ref.get(shared_source).ok_or_else(|| {

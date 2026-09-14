@@ -265,7 +265,9 @@ impl DFlashAttention {
         // RoPE: queries start at offset `cache.offset + context_len`, keys
         // start at offset `cache.offset` (the context rows sit at the front
         // of the KV sequence). This matches dflash_mlx/draft.py:141-148.
-        let cache_offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let cache_offset = cache
+            .as_ref()
+            .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
         let queries = rope(
             &queries,
             RopePositions::Offset(cache_offset + context_len),

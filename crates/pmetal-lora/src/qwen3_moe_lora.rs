@@ -126,7 +126,9 @@ impl Qwen3MoELoraAttention {
         k = k.transpose_axes(&[0, 2, 1, 3]);
         let v = v.transpose_axes(&[0, 2, 1, 3]);
 
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let offset = cache
+            .as_ref()
+            .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
         let q = apply_rope(
             &q,
             self.head_dim,

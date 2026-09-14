@@ -178,12 +178,18 @@ impl InlineCache {
             }
         }
 
+        // Snapshotted before any layer runs, so every attention layer is at
+        // the same offset and the first one answers for all of them.
+        let rope_offset = attn_layer_indices
+            .first()
+            .map_or(0, |&layer| kv_cache.rope_offset_for(layer));
+
         InlineCache {
             gdn_caches,
             kv_caches,
             gdn_layer_indices,
             attn_layer_indices,
-            rope_offset: kv_cache.rope_offset(),
+            rope_offset,
         }
     }
 
@@ -1646,7 +1652,7 @@ fn inline_attn_forward(
     let values = values.transpose_axes(&[0, 2, 1, 3]);
 
     // RoPE — pure InlineArray, no Array conversion
-    let offset = kv_cache.rope_offset();
+    let offset = kv_cache.rope_offset_for(layer_idx);
     let queries = queries.rope(
         lw.attn_rope_dims,
         false,

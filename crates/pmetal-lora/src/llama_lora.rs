@@ -365,8 +365,8 @@ impl LlamaLoraAttention {
 
         // Get RoPE offset and apply RoPE
         let (queries, keys) = match (&cache, self.rope_periods.is_some()) {
-            (Some((cache_ref, _layer_idx)), _) => {
-                let offset = cache_ref.rope_offset();
+            (Some((cache_ref, layer_idx)), _) => {
+                let offset = cache_ref.rope_offset_for(*layer_idx);
                 (
                     self.apply_rotary(&queries, offset)?,
                     self.apply_rotary(&keys, offset)?,

@@ -224,8 +224,8 @@ impl PhiQLoraAttention {
         let keys = keys.transpose_axes(&[0, 2, 1, 3]);
         let values = values.transpose_axes(&[0, 2, 1, 3]);
 
-        let (queries, keys, values) = if let Some((ref cache_ref, _)) = cache {
-            let offset = cache_ref.rope_offset();
+        let (queries, keys, values) = if let Some((ref cache_ref, layer_idx)) = cache {
+            let offset = cache_ref.rope_offset_for(layer_idx);
 
             let (q_rope, q_pass) = split_rotary_last(&queries, self.rope_dim);
             let q_rope = apply_rope(&q_rope, self.rope_dim, false, self.rope.base, 1.0, offset)?;
@@ -1254,14 +1254,14 @@ mod tests {
         assert!(model.supports_kv_cache());
 
         let mut cache = PhiQloraForCausalLM::create_cache(&model, 128);
-        assert_eq!(cache.rope_offset(), 0);
+        assert_eq!(cache.rope_offset_for(0), 0);
 
         let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
         let logits = model
             .forward_with_cache(&input_ids, None, Some(&mut cache))
             .unwrap();
         assert_eq!(logits.shape(), &[1, 4, config.vocab_size]);
-        assert_eq!(cache.rope_offset(), 4);
+        assert_eq!(cache.rope_offset_for(0), 4);
     }
 
     #[test]

@@ -484,7 +484,9 @@ impl Qwen3Attention {
         // Apply RoPE with cache offset
         let rope_positions = RopePositions::resolve(
             positions,
-            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+            cache
+                .as_ref()
+                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
         let q = rope(
             &q,

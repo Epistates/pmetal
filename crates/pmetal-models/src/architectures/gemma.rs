@@ -522,7 +522,9 @@ impl GemmaAttention {
         // cache, and a cached decode has no explicit positions.
         let rope_positions = RopePositions::resolve(
             positions,
-            cache.as_ref().map_or(0, |(c, _)| c.rope_offset()),
+            cache
+                .as_ref()
+                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
         let queries = rope(
             &queries,

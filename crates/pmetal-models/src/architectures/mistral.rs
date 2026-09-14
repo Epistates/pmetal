@@ -257,7 +257,7 @@ impl MistralAttention {
             positions,
             cache
                 .as_ref()
-                .map_or(0, |(cache_ref, _)| cache_ref.rope_offset()),
+                .map_or(0, |(cache_ref, layer)| cache_ref.rope_offset_for(*layer)),
         );
         let queries = rope(
             &queries,

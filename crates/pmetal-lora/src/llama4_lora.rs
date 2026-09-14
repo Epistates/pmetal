@@ -287,7 +287,9 @@ impl Llama4LoraAttention {
 
         // Determine RoPE offset from cache and apply positional encoding.
         if self.uses_rope {
-            let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+            let offset = cache
+                .as_ref()
+                .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
             // Transpose to [B, H, T, D] for rope_apply, then back.
             let q_t = q.transpose_axes(&[0, 2, 1, 3]);
             let k_t = k.transpose_axes(&[0, 2, 1, 3]);

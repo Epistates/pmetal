@@ -698,7 +698,9 @@ impl Qwen3NextAttention {
         // Apply partial RoPE
         let rope_positions = RopePositions::resolve(
             positions,
-            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+            cache
+                .as_ref()
+                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
         let queries = rope(
             &queries,
@@ -798,7 +800,9 @@ impl Qwen3NextAttention {
         let rope_cache_start = Instant::now();
         let rope_positions = RopePositions::resolve(
             positions,
-            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+            cache
+                .as_ref()
+                .map_or(0, |(c, layer)| c.rope_offset_for(*layer)),
         );
         let queries = rope(
             &queries,

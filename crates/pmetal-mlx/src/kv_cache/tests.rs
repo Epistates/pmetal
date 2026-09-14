@@ -290,14 +290,65 @@ fn test_kv_cache_rope_offset() {
     let config = KVCacheConfig::new(1, 100, 4, 64);
     let mut cache = KVCache::new(config);
 
-    assert_eq!(cache.rope_offset(), 0);
+    assert_eq!(cache.rope_offset_for(0), 0);
 
     // [B, heads, seq, head_dim] format
     let keys = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
     let values = ops::zeros(&[1, 4, 10, 64], Dtype::Float32);
     cache.update_and_fetch(0, &keys, &values).unwrap();
 
-    assert_eq!(cache.rope_offset(), 10);
+    assert_eq!(cache.rope_offset_for(0), 10);
+}
+
+/// Every layer advances its own offset during one forward, so the offset has
+/// to be read per layer. A whole-cache reading is already a chunk ahead by the
+/// time layer 1 asks, which puts every layer but the first one step past where
+/// its own cached keys sit.
+#[test]
+fn rope_offset_is_per_layer_not_whichever_layer_ran_last() {
+    let mut cache = KVCache::new(KVCacheConfig::new(3, 100, 1, 1));
+    let prompt = seq_tensor(0.0, 5);
+
+    for layer in 0..3 {
+        assert_eq!(
+            cache.rope_offset_for(layer),
+            0,
+            "layer {layer} starts the prefill at position 0, whatever the layers \
+             before it have already cached"
+        );
+        cache.update_and_fetch(layer, &prompt, &prompt).unwrap();
+    }
+
+    let next = seq_tensor(5.0, 1);
+    for layer in 0..3 {
+        assert_eq!(
+            cache.rope_offset_for(layer),
+            5,
+            "layer {layer} continues from the five tokens it cached itself"
+        );
+        cache.update_and_fetch(layer, &next, &next).unwrap();
+    }
+}
+
+/// Same, for the sliding window, where `offset` stops being the absolute
+/// position once the oldest entries start falling off the front.
+#[test]
+fn sliding_window_rope_offset_is_per_layer_and_absolute() {
+    let mut cache = KVCache::new(KVCacheConfig::new(2, 100, 1, 1).with_sliding_window(4));
+    let first = seq_tensor(0.0, 3);
+    let second = seq_tensor(3.0, 3);
+
+    for layer in 0..2 {
+        cache.update_and_fetch(layer, &first, &first).unwrap();
+    }
+    for layer in 0..2 {
+        assert_eq!(cache.rope_offset_for(layer), 3);
+        cache.update_and_fetch(layer, &second, &second).unwrap();
+    }
+    for layer in 0..2 {
+        // Six tokens in, four retained: the position is six, not four.
+        assert_eq!(cache.rope_offset_for(layer), 6);
+    }
 }
 
 #[test]
@@ -312,7 +363,7 @@ fn test_kv_cache_sliding_window_rope_offset_tracks_total_tokens() {
 
     assert_eq!(cache.seq_len(), 4);
     assert_eq!(cache.total_tokens(), 6);
-    assert_eq!(cache.rope_offset(), 6);
+    assert_eq!(cache.rope_offset_for(0), 6);
 }
 
 #[test]
@@ -327,7 +378,7 @@ fn test_kv_cache_rotating_window_preserves_keep_tokens() {
 
     assert_eq!(cache.seq_len(), 6);
     assert_eq!(cache.total_tokens(), 8);
-    assert_eq!(cache.rope_offset(), 8);
+    assert_eq!(cache.rope_offset_for(0), 8);
 
     let k_vec = to_f32_vec_eval(&cached_k);
     let v_vec = to_f32_vec_eval(&cached_v);

@@ -25,6 +25,10 @@ struct LayerCache {
     /// Current offset (actual data length) within the pre-allocated buffer.
     /// This is the number of tokens actually stored, not the buffer size.
     offset: usize,
+    /// Tokens this layer has ever been given, which `offset` stops tracking
+    /// once a sliding or rotating mode starts dropping the oldest ones. RoPE
+    /// needs the absolute position, so it reads this rather than `offset`.
+    tokens_seen: usize,
 }
 
 impl LayerCache {
@@ -33,6 +37,7 @@ impl LayerCache {
             keys: None,
             values: None,
             offset: 0,
+            tokens_seen: 0,
         }
     }
 
@@ -64,12 +69,14 @@ impl LayerCache {
             keys,
             values,
             offset: 0,
+            tokens_seen: 0,
         }
     }
 
     fn reset(&mut self) {
         // For eager allocation, just reset offset but keep buffers
         self.offset = 0;
+        self.tokens_seen = 0;
         // Note: We don't set keys/values to None to preserve the pre-allocated buffers
     }
 
@@ -77,6 +84,7 @@ impl LayerCache {
         self.keys = None;
         self.values = None;
         self.offset = 0;
+        self.tokens_seen = 0;
     }
 }
 
@@ -300,6 +308,7 @@ impl KVCache {
         cache.keys = Some(new_keys);
         cache.values = Some(new_values);
         cache.offset = new_offset;
+        cache.tokens_seen = cache.tokens_seen.max(new_offset);
         if layer_idx == 0 {
             self.total_tokens = new_offset;
         }
@@ -473,6 +482,7 @@ impl KVCache {
         // Sequence dimension is axis 2 in [B, heads, seq, head_dim] format
         let new_seq_len = new_keys.dim(2) as usize;
         let prev_offset = cache.offset;
+        cache.tokens_seen += new_seq_len;
 
         // Update total tokens count (only count for first layer to avoid double counting)
         if layer_idx == 0 {
@@ -741,16 +751,35 @@ impl KVCache {
         }
     }
 
-    /// Get the offset for RoPE when using cache.
+    /// The absolute position of this layer's next token, for RoPE.
     ///
-    /// This is the starting position for new tokens when computing
-    /// rotary embeddings during cached generation.
-    pub fn rope_offset(&self) -> i32 {
+    /// **Per layer, and read before that layer's own
+    /// [`update_and_fetch`](Self::update_and_fetch).** Every layer advances its
+    /// own offset during the same forward pass, so a whole-cache reading is
+    /// already one chunk ahead by the time layer 1 asks: layer 0 would rotate
+    /// its new token at the right position and every layer after it one step
+    /// too far. Prefill hides that — shifting a whole layer uniformly is
+    /// invisible to relative RoPE — but the first decode step lands the new
+    /// token inside the range its own cached keys already occupy, and the error
+    /// compounds with depth.
+    ///
+    /// Sliding and rotating modes drop the oldest entries, so `offset` stops
+    /// being the absolute position and `tokens_seen` is what RoPE wants.
+    pub fn rope_offset_for(&self, layer_idx: usize) -> i32 {
+        if let Some(ref q_layers) = self.quantized_layers {
+            return q_layers.get(layer_idx).map_or(0, |c| c.len()) as i32;
+        }
+        if let Some(ref tq_layers) = self.turboquant_layers {
+            return tq_layers.get(layer_idx).map_or(0, |c| c.len()) as i32;
+        }
+        let Some(cache) = self.layer_caches.get(layer_idx) else {
+            return 0;
+        };
         match self.config.mode {
             CacheMode::SlidingWindow { .. } | CacheMode::Rotating { .. } => {
-                self.total_tokens as i32
+                cache.tokens_seen as i32
             }
-            _ => self.seq_len() as i32,
+            _ => cache.offset as i32,
         }
     }
 

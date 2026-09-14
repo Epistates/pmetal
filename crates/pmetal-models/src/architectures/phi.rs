@@ -552,7 +552,9 @@ impl PhiAttention {
             (q_rope_raw, k_rope_raw)
         };
 
-        let offset = cache.as_ref().map_or(0, |(c, _)| c.rope_offset());
+        let offset = cache
+            .as_ref()
+            .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
         let rope_positions = RopePositions::resolve(positions, offset);
         // SuRoPE/LongRoPE: rotate with the per-dimension factor-scaled inverse
         // frequencies, choosing the short or long table by how far this forward

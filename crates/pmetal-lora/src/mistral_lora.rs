@@ -222,8 +222,8 @@ impl MistralLoraAttention {
             .transpose_axes(&[0, 2, 1, 3]);
 
         // Get RoPE offset and apply RoPE
-        let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
-            let offset = cache_ref.rope_offset();
+        let (queries, keys, values) = if let Some((ref cache_ref, layer_idx)) = cache {
+            let offset = cache_ref.rope_offset_for(layer_idx);
             let queries = apply_rope(&queries, self.head_dim, false, self.rope.base, 1.0, offset)?;
             let keys = apply_rope(&keys, self.head_dim, false, self.rope.base, 1.0, offset)?;
             (queries, keys, values)
@@ -1420,7 +1420,7 @@ mod tests {
 
         // Create a cache (via trait method which returns Option<KVCache>)
         let mut cache = model.create_cache(128);
-        assert_eq!(cache.rope_offset(), 0);
+        assert_eq!(cache.rope_offset_for(0), 0);
 
         // Test forward pass with cache
         let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
@@ -1429,7 +1429,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]);
-        assert_eq!(cache.rope_offset(), 4);
+        assert_eq!(cache.rope_offset_for(0), 4);
 
         // Test incremental generation
         let next_token = Array::from_i32_slice(&[5_i32]).reshape(&[1, 1]);
@@ -1438,6 +1438,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(next_logits.shape(), &[1, 1, 1000]);
-        assert_eq!(cache.rope_offset(), 5);
+        assert_eq!(cache.rope_offset_for(0), 5);
     }
 }

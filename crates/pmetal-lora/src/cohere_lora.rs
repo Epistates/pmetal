@@ -215,7 +215,9 @@ impl CohereLoraAttention {
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
 
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let offset = cache
+            .as_ref()
+            .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
         let q = apply_rope(&q, self.head_dim, true, self.rope_theta, 1.0, offset)?;
         let k = apply_rope(&k, self.head_dim, true, self.rope_theta, 1.0, offset)?;
 

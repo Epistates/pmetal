@@ -315,7 +315,9 @@ impl PhiLoraAttention {
         // Apply partial RoPE with the cache offset. Both branches go through
         // `rotate`, so a cached decode uses the same LongRoPE table the prefill
         // that seeded it did.
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let offset = cache
+            .as_ref()
+            .map_or(0, |(c, layer)| c.rope_offset_for(*layer));
         let (queries, keys, values) = {
             let (q_rope, q_pass) = self.split_rotary_transposed(&queries)?;
             let q_rope = self.rotate(&q_rope, offset, seq_len)?;
@@ -1335,7 +1337,7 @@ mod tests {
 
         // Create a cache
         let mut cache = model.create_cache(128);
-        assert_eq!(cache.rope_offset(), 0);
+        assert_eq!(cache.rope_offset_for(0), 0);
 
         // Test forward pass with cache
         let input_ids = Array::from_i32_slice(&[1_i32, 2, 3, 4]).reshape(&[1, 4]);
@@ -1344,7 +1346,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(logits.shape(), &[1, 4, 1000]);
-        assert_eq!(cache.rope_offset(), 4);
+        assert_eq!(cache.rope_offset_for(0), 4);
 
         // Test incremental generation
         let next_token = Array::from_i32_slice(&[5_i32]).reshape(&[1, 1]);
@@ -1353,6 +1355,6 @@ mod tests {
             .unwrap();
 
         assert_eq!(next_logits.shape(), &[1, 1, 1000]);
-        assert_eq!(cache.rope_offset(), 5);
+        assert_eq!(cache.rope_offset_for(0), 5);
     }
 }

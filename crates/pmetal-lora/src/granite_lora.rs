@@ -281,8 +281,8 @@ impl GraniteLoraAttention {
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
 
-        let (queries, keys, values) = if let Some((ref cache_ref, _layer_idx)) = cache {
-            let offset = cache_ref.rope_offset();
+        let (queries, keys, values) = if let Some((ref cache_ref, layer_idx)) = cache {
+            let offset = cache_ref.rope_offset_for(layer_idx);
             let queries = apply_rope(&queries, self.head_dim, false, self.rope.base, 1.0, offset)?;
             let keys = apply_rope(&keys, self.head_dim, false, self.rope.base, 1.0, offset)?;
             (queries, keys, values)
