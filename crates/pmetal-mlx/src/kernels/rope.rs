@@ -339,6 +339,109 @@ impl YarnConfig {
     }
 }
 
+/// Where a rotary embedding takes its positions from.
+///
+/// [`Offset`] is the contiguous run `offset, offset + 1, …`: every cached
+/// decode, and every forward over one unbroken sequence. [`Explicit`] is one
+/// position per token, which is what a packed batch needs so the second
+/// sequence in a row restarts at 0 instead of continuing the first.
+///
+/// Architectures thread `Option<&Array>` down from their own forward and call
+/// [`RopePositions::resolve`] once against the cache offset, rather than
+/// branching separately at each `q` and `k` rotation.
+///
+/// [`Offset`]: RopePositions::Offset
+/// [`Explicit`]: RopePositions::Explicit
+#[derive(Debug, Clone, Copy)]
+pub enum RopePositions<'a> {
+    /// Positions `offset, offset + 1, …, offset + seq_len - 1`.
+    Offset(i32),
+    /// One position per token, shape `[seq_len]`.
+    Explicit(&'a Array),
+}
+
+impl<'a> RopePositions<'a> {
+    /// The caller's explicit positions when it has them, the contiguous run
+    /// from `offset` otherwise.
+    pub fn resolve(positions: Option<&'a Array>, offset: i32) -> Self {
+        match positions {
+            Some(ids) => Self::Explicit(ids),
+            None => Self::Offset(offset),
+        }
+    }
+}
+
+/// Apply RoPE at `positions` using a scalar base frequency.
+///
+/// The contiguous arm is the fused `mx.fast.rope` kernel; the explicit arm
+/// builds the cos/sin tables from the position vector. They compute the same
+/// rotation, which this module's tests pin down for both `traditional`
+/// settings, at a non-zero offset, and for partial RoPE.
+pub fn rope(
+    x: &Array,
+    positions: RopePositions<'_>,
+    dims: i32,
+    traditional: bool,
+    base: f32,
+    scale: f32,
+) -> Result<Array, Exception> {
+    match positions {
+        RopePositions::Offset(offset) => apply_rope(x, dims, traditional, base, scale, offset),
+        RopePositions::Explicit(ids) => {
+            apply_rope_with_positions(x, ids, dims, traditional, base, scale)
+        }
+    }
+}
+
+/// [`rope`] with an explicit `[dims / 2]` inverse-frequency table.
+///
+/// Needed wherever no single `base` describes the rotation: Phi-3 LongRoPE
+/// scales each band by its own `long_factor`, and YaRN blends per-band ramps.
+pub fn rope_with_inv_freq(
+    x: &Array,
+    positions: RopePositions<'_>,
+    inv_freq: &Array,
+    dims: i32,
+    traditional: bool,
+) -> Result<Array, Exception> {
+    match positions {
+        RopePositions::Offset(offset) => {
+            apply_rope_with_freqs(x, inv_freq, dims, traditional, offset)
+        }
+        RopePositions::Explicit(ids) => {
+            rope_with_positions_and_inv_freq(x, ids, inv_freq, dims, traditional, 1.0)
+        }
+    }
+}
+
+/// [`rope`] with an explicit `[dims / 2]` *period* table, the form
+/// `mx.fast.rope` takes through its `freqs=` argument.
+///
+/// Llama 3's frequency-band scaling is published this way, so the contiguous
+/// arm stays on the fused kernel instead of rebuilding the tables per call.
+pub fn rope_with_periods(
+    x: &Array,
+    positions: RopePositions<'_>,
+    periods: &Array,
+    dims: i32,
+    traditional: bool,
+    scale: f32,
+) -> Result<Array, Exception> {
+    match positions {
+        RopePositions::Offset(offset) => Ok(fast::rope_with_freqs(
+            x,
+            dims,
+            traditional,
+            scale,
+            offset,
+            periods,
+        )),
+        RopePositions::Explicit(ids) => {
+            apply_rope_with_positions_and_periods(x, ids, periods, dims, traditional, scale)
+        }
+    }
+}
+
 /// Apply RoPE to a tensor (functional version).
 ///
 /// # Arguments
@@ -980,5 +1083,201 @@ mod tests {
                 .rope_periods(64, 10000.0)
                 .is_none()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // RopePositions
+    //
+    // The two arms take different code paths — a fused Metal kernel versus
+    // cos/sin tables built here — so "same rotation" is an assertion, not a
+    // definition. Everything downstream of `RopePositions` assumes it.
+    // ------------------------------------------------------------------
+
+    fn ramp(shape: &[i32]) -> Array {
+        let n: i32 = shape.iter().product();
+        let values: Vec<f32> = (0..n).map(|i| (i as f32 * 0.017).sin()).collect();
+        Array::from_slice(&values, shape)
+    }
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        let n = a.shape().iter().product::<i32>() as usize;
+        let a = a.subtract(b).abs();
+        a.try_eval().expect("eval");
+        a.as_slice::<f32>()[..n]
+            .iter()
+            .fold(0.0f32, |worst, v| worst.max(v.abs()))
+    }
+
+    fn contiguous_positions(offset: i32, seq_len: i32) -> Array {
+        let values: Vec<i32> = (offset..offset + seq_len).collect();
+        Array::from_i32_slice_shaped(&values, &[seq_len])
+    }
+
+    #[test]
+    fn contiguous_and_explicit_positions_agree() {
+        let (seq_len, dims) = (6, 16);
+        let x = ramp(&[1, 2, seq_len, dims]);
+
+        for traditional in [false, true] {
+            for offset in [0, 5] {
+                let contiguous = rope(
+                    &x,
+                    RopePositions::Offset(offset),
+                    dims,
+                    traditional,
+                    10000.0,
+                    1.0,
+                )
+                .unwrap();
+                let ids = contiguous_positions(offset, seq_len);
+                let explicit = rope(
+                    &x,
+                    RopePositions::Explicit(&ids),
+                    dims,
+                    traditional,
+                    10000.0,
+                    1.0,
+                )
+                .unwrap();
+
+                let diff = max_abs_diff(&contiguous, &explicit);
+                assert!(
+                    diff < 1e-4,
+                    "traditional={traditional} offset={offset}: max |Δ| = {diff:e}"
+                );
+            }
+        }
+    }
+
+    /// Partial RoPE (`dims < head_dim`) has to leave the tail untouched on
+    /// both arms, not just the fused one.
+    #[test]
+    fn contiguous_and_explicit_positions_agree_on_partial_rope() {
+        let (seq_len, head_dim, dims) = (4, 16, 8);
+        let x = ramp(&[1, 2, seq_len, head_dim]);
+        let ids = contiguous_positions(3, seq_len);
+
+        for traditional in [false, true] {
+            let contiguous = rope(
+                &x,
+                RopePositions::Offset(3),
+                dims,
+                traditional,
+                10000.0,
+                1.0,
+            )
+            .unwrap();
+            let explicit = rope(
+                &x,
+                RopePositions::Explicit(&ids),
+                dims,
+                traditional,
+                10000.0,
+                1.0,
+            )
+            .unwrap();
+
+            let diff = max_abs_diff(&contiguous, &explicit);
+            assert!(diff < 1e-4, "traditional={traditional}: max |Δ| = {diff:e}");
+        }
+    }
+
+    #[test]
+    fn contiguous_and_explicit_positions_agree_with_an_inv_freq_table() {
+        let (seq_len, dims) = (5, 16);
+        let x = ramp(&[1, 2, seq_len, dims]);
+        // A table no scalar base produces: every other band stretched.
+        let table: Vec<f32> = (0..dims / 2)
+            .map(|i| 1.0 / (10000.0f32.powf(2.0 * i as f32 / dims as f32) * (1.0 + i as f32)))
+            .collect();
+        let inv_freq = Array::from_slice(&table, &[dims / 2]);
+        let ids = contiguous_positions(2, seq_len);
+
+        let contiguous =
+            rope_with_inv_freq(&x, RopePositions::Offset(2), &inv_freq, dims, false).unwrap();
+        let explicit =
+            rope_with_inv_freq(&x, RopePositions::Explicit(&ids), &inv_freq, dims, false).unwrap();
+
+        let diff = max_abs_diff(&contiguous, &explicit);
+        assert!(diff < 1e-4, "max |Δ| = {diff:e}");
+    }
+
+    #[test]
+    fn contiguous_and_explicit_positions_agree_with_a_period_table() {
+        let (seq_len, dims) = (5, 64);
+        let x = ramp(&[1, 2, seq_len, dims]);
+        let periods = Llama3Config {
+            factor: 32.0,
+            low_freq_factor: 1.0,
+            high_freq_factor: 4.0,
+            original_max_position: 8192,
+        }
+        .rope_periods(dims, 500000.0);
+        let periods = Array::from_slice(&periods, &[dims / 2]);
+        let ids = contiguous_positions(7, seq_len);
+
+        let contiguous =
+            rope_with_periods(&x, RopePositions::Offset(7), &periods, dims, false, 1.0).unwrap();
+        let explicit = rope_with_periods(
+            &x,
+            RopePositions::Explicit(&ids),
+            &periods,
+            dims,
+            false,
+            1.0,
+        )
+        .unwrap();
+
+        let diff = max_abs_diff(&contiguous, &explicit);
+        assert!(diff < 1e-4, "max |Δ| = {diff:e}");
+    }
+
+    /// The reason the type exists: two sequences packed into one row must
+    /// rotate as if each had been run on its own.
+    #[test]
+    fn packed_positions_restart_the_rotation_at_a_sequence_boundary() {
+        let dims = 16;
+        let first = ramp(&[1, 1, 2, dims]);
+        let second = ramp(&[1, 1, 3, dims]);
+        let packed = ops::concatenate_axis(&[&first, &second], 2);
+
+        let separate = ops::concatenate_axis(
+            &[
+                &rope(&first, RopePositions::Offset(0), dims, false, 10000.0, 1.0).unwrap(),
+                &rope(&second, RopePositions::Offset(0), dims, false, 10000.0, 1.0).unwrap(),
+            ],
+            2,
+        );
+
+        let ids = Array::from_i32_slice_shaped(&[0, 1, 0, 1, 2], &[5]);
+        let together = rope(
+            &packed,
+            RopePositions::Explicit(&ids),
+            dims,
+            false,
+            10000.0,
+            1.0,
+        )
+        .unwrap();
+        assert!(max_abs_diff(&separate, &together) < 1e-4);
+
+        // And that the run-through positions a packed forward gets today are
+        // genuinely different, so the test above is not vacuous.
+        let run_through =
+            rope(&packed, RopePositions::Offset(0), dims, false, 10000.0, 1.0).unwrap();
+        assert!(max_abs_diff(&separate, &run_through) > 1e-2);
+    }
+
+    #[test]
+    fn resolve_prefers_explicit_positions_over_the_cache_offset() {
+        let ids = Array::from_i32_slice_shaped(&[0, 1, 0], &[3]);
+        assert!(matches!(
+            RopePositions::resolve(Some(&ids), 17),
+            RopePositions::Explicit(_)
+        ));
+        assert!(matches!(
+            RopePositions::resolve(None, 17),
+            RopePositions::Offset(17)
+        ));
     }
 }
