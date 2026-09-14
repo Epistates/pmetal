@@ -93,6 +93,12 @@ pub struct NativeBridgeInfo {
 /// Checks `text_config.model_type` first (multi-modal configs), then falls
 /// back to the top-level `model_type` field.
 pub fn detect_arch(model_path: &Path) -> Option<NativeArch> {
+    // Escape hatch for comparing the native engine against the generic
+    // `pmetal-models` path on the same checkpoint, which is the only way to
+    // tell which of the two is wrong when they disagree.
+    if std::env::var_os("PMETAL_DISABLE_NATIVE_BRIDGE").is_some() {
+        return None;
+    }
     let data = std::fs::read_to_string(model_path.join("config.json")).ok()?;
     let v: serde_json::Value = serde_json::from_str(&data).ok()?;
 

@@ -310,6 +310,13 @@ impl ChatTemplateType {
     }
 
     /// Get the BOS token for this template type (if any).
+    ///
+    /// `None` here does not mean the model has no BOS, it means the
+    /// tokenizer's own post-processor prepends it. Gemma 2 and 3 do exactly
+    /// that; Gemma 4 ships a pass-through post-processor and emits
+    /// `{{ bos_token }}` from its chat template instead, so it has to come
+    /// from here or the model receives a conversation with no beginning and
+    /// answers as though the prompt were empty.
     pub fn bos_token(&self) -> Option<&'static str> {
         match self {
             Self::Llama2 => Some("<s>"),
@@ -317,6 +324,7 @@ impl ChatTemplateType {
             Self::Llama4 => Some("<|begin_of_text|>"),
             Self::DeepSeek => Some("<｜begin▁of▁sentence｜>"),
             Self::Cohere => Some("<BOS_TOKEN>"),
+            Self::Gemma4 => Some("<bos>"),
             _ => None,
         }
     }
@@ -385,6 +393,7 @@ impl ChatTemplate {
                     | ChatTemplateType::Llama4
                     | ChatTemplateType::DeepSeek
                     | ChatTemplateType::Cohere
+                    | ChatTemplateType::Gemma4
             ),
             add_eos: true,
             jinja_source: None,
@@ -1113,6 +1122,14 @@ impl ChatTemplate {
     fn format_gemma4(&self, messages: &[Message]) -> FormattedChat {
         let mut text = String::new();
         let mut response_start = 0;
+
+        // Gemma 4's tokenizer post-processor adds nothing; its chat template
+        // opens with `{{ bos_token }}`. Gemma 2 and 3 are the other way round.
+        if self.add_bos {
+            if let Some(ref bos) = self.bos_token {
+                text.push_str(bos);
+            }
+        }
 
         for (i, msg) in messages.iter().enumerate() {
             let role = match msg.role.as_str() {
@@ -2095,6 +2112,30 @@ mod tests {
         assert!(formatted.text.contains("<start_of_turn>user"));
         assert!(formatted.text.contains("<start_of_turn>model"));
         assert!(formatted.text.contains("<end_of_turn>"));
+    }
+
+    /// Gemma 4's tokenizer post-processor is a pass-through: unlike Gemma 2
+    /// and 3 it prepends nothing, and the released chat template opens with
+    /// `{{ bos_token }}`. Without it the model receives a conversation with no
+    /// beginning and answers as though the prompt were empty, which reads like
+    /// a broken forward pass rather than a missing token.
+    #[test]
+    fn gemma4_opens_with_bos_and_gemma_does_not() {
+        let messages = vec![Message::user("What is 2 + 2?")];
+
+        let gemma4 = ChatTemplate::gemma4().apply(&messages).text;
+        assert!(
+            gemma4.starts_with("<bos><|turn>user\n"),
+            "gemma4 prompt must open with the BOS its template emits, got {gemma4:?}"
+        );
+
+        // Gemma 2 / 3 get theirs from the tokenizer, so emitting one here
+        // would double it.
+        let gemma = ChatTemplate::gemma().apply(&messages).text;
+        assert!(
+            gemma.starts_with("<start_of_turn>user\n"),
+            "gemma prompt must not carry a BOS of its own, got {gemma:?}"
+        );
     }
 
     #[test]

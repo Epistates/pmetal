@@ -1145,19 +1145,22 @@ void mlx_inline_compiled_gemma4_attn_block(
                         auto updated_keys = put_along_axis(cache_keys, kv_indices, k, 2);
                         auto updated_vals = put_along_axis(cache_vals, kv_indices, v, 2);
 
-                        // 6. Build the attention validity mask. For Gemma 4
-                        //    we only need to mask out trailing junk in the
-                        //    pre-allocated cache (positions >= next_offset)
-                        //    AND, for sliding layers, keys outside the window
-                        //    behind the current decode position.
-                        auto next_offset = add(kv_offset_arr, array(S));
+                        // 6. Build the attention mask, per query row. A
+                        //    key-only `[1,1,1,L]` mask is right for decode
+                        //    (`S == 1`) and wrong for prefill: with no query
+                        //    axis every prompt token sees every other one,
+                        //    including the ones after it, and the layer runs
+                        //    bidirectionally. Keying it off each query's own
+                        //    absolute position covers both, and collapses to
+                        //    exactly the old mask when `S == 1`.
+                        auto query_pos = add(
+                            reshape(arange(S, int32), {1, 1, S, 1}),
+                            reshape(kv_offset_arr, {1, 1, 1, 1}));
                         auto positions = reshape(arange(L, int32), {1, 1, 1, L});
-                        auto valid_mask = less(positions, reshape(next_offset, {1, 1, 1, 1}));
+                        auto valid_mask = less_equal(positions, query_pos);
                         if (SW > 0) {
-                            auto window_start = subtract(next_offset, array(SW));
-                            auto in_window = greater_equal(
-                                positions,
-                                reshape(window_start, {1, 1, 1, 1}));
+                            auto in_window = greater(
+                                positions, subtract(query_pos, array(SW)));
                             valid_mask = logical_and(valid_mask, in_window);
                         }
 

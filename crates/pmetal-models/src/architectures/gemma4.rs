@@ -1921,9 +1921,13 @@ impl Gemma4Model {
         positions: Option<&Array>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
-        let mut h = self.embed_tokens.forward(input_ids);
-        let scale = Array::from_f32(self.embed_scale);
-        h = h.multiply(&scale);
+        // `mul_scalar` casts the scalar to the embedding's dtype first. A bare
+        // f32 here promotes a bf16 checkpoint's residual stream to f32 and
+        // carries it through all forty-eight layers.
+        let mut h = self
+            .embed_tokens
+            .forward(input_ids)
+            .mul_scalar(self.embed_scale);
         let per_layer_inputs = self
             .per_layer_inputs
             .as_ref()
@@ -2023,10 +2027,8 @@ impl Gemma4ForCausalLM {
 
     fn logit_softcap(&self, logits: &Array) -> Array {
         if let Some(cap) = self.config.final_logit_softcapping {
-            let cap_arr = Array::from_f32(cap);
-            let scaled = logits.divide(&cap_arr);
-            let tanh = ops::tanh(&scaled);
-            tanh.multiply(&cap_arr)
+            // Scalar cast to the logits' dtype, so a bf16 model stays bf16.
+            ops::tanh(&logits.div_scalar(cap)).mul_scalar(cap)
         } else {
             logits.clone()
         }
