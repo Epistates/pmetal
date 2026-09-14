@@ -107,12 +107,87 @@ impl MlxQuantizationConfig {
     }
 }
 
+/// How many checkpoint keys [`detect_namespace_prefix`] probes before deciding.
+/// Each probe narrows the candidate set, and one alone is enough whenever the
+/// parameter tree has no repeated tails.
+const NAMESPACE_PROBE_KEYS: usize = 8;
+
+/// The namespace shift, if any, that reconciles a checkpoint's keys with a
+/// model's parameter names.
+///
+/// Publishers disagree on whether the text tower carries its wrapper's
+/// namespace. `Qwen/Qwen3-Embedding-8B` ships `embed_tokens.weight`,
+/// `layers.0.…` and `norm.weight` where `Qwen3ForCausalLM` holds all three
+/// under `model.`, so an exact-name load matches nothing and the model answers
+/// from its random init.
+///
+/// The shift is detected once for the whole checkpoint rather than per key. A
+/// per-key fallback would let a checkpoint carrying both `layers.0.x` and
+/// `model.layers.0.x` resolve both onto the same parameter, in whatever order
+/// the `HashMap` happened to yield them.
+///
+/// Returns `None` when the names already line up, when nothing explains them,
+/// or when two prefixes explain them equally well — which leaves the mismatch
+/// for [`LoadReport`] to report rather than papering over it with a guess.
+fn detect_namespace_prefix(
+    params: &HashMap<String, &mut Array>,
+    loaded: &HashMap<String, Array>,
+) -> Option<String> {
+    let explains = |prefix: &str| -> usize {
+        loaded
+            .keys()
+            .filter(|key| params.contains_key(&format!("{prefix}{key}")))
+            .count()
+    };
+
+    let already = explains("");
+    if already == loaded.len() {
+        return None;
+    }
+
+    // A candidate is whatever the parameter tree puts in front of a checkpoint
+    // key. A handful of probes surfaces every prefix in play; scoring then runs
+    // each candidate against the whole checkpoint, so one stray key among the
+    // probes cannot veto a prefix that explains all the rest.
+    let mut probes: Vec<&String> = loaded.keys().collect();
+    probes.sort_unstable();
+    probes.truncate(NAMESPACE_PROBE_KEYS);
+
+    let mut candidates: HashSet<String> = HashSet::new();
+    for probe in probes {
+        let tail = format!(".{probe}");
+        candidates.extend(
+            params
+                .keys()
+                .filter_map(|name| name.strip_suffix(tail.as_str()))
+                .map(|prefix| format!("{prefix}.")),
+        );
+    }
+
+    let mut ranked: Vec<(usize, String)> = candidates
+        .into_iter()
+        .map(|prefix| (explains(&prefix), prefix))
+        .collect();
+    ranked.sort_unstable();
+
+    match ranked.pop() {
+        // A prefix that explains no more than the bare names is not a shift,
+        // and two prefixes explaining equally much is a coin flip that would
+        // silently half-load the model.
+        Some((best, prefix)) if best > already && !ranked.iter().any(|(n, _)| *n == best) => {
+            Some(prefix)
+        }
+        _ => None,
+    }
+}
+
 /// Assign every checkpoint tensor whose name matches a parameter path,
 /// reporting the ones that matched nothing.
 ///
-/// Matching is by exact name, so a checkpoint laid out differently from the
-/// parameter tree silently contributes nothing and the model runs on its
-/// random init. Returning the unmatched keys is what makes that visible —
+/// Matching is by exact name, after [`detect_namespace_prefix`] reconciles a
+/// checkpoint that omits the model's namespace. A checkpoint laid out
+/// differently in some other way still contributes nothing and leaves the model
+/// on its random init, so the unmatched keys come back in the report —
 /// `load_generic_weights_renamed` logs a summary, and a caller that knows the
 /// checkpoint should map completely can assert on it.
 fn assign_loaded_weights<M: ModuleParameters + ModuleParametersExt>(
@@ -120,13 +195,20 @@ fn assign_loaded_weights<M: ModuleParameters + ModuleParametersExt>(
     loaded: HashMap<String, Array>,
 ) -> LoadReport {
     let mut params = model.flatten_params_mut();
+    let prefix = detect_namespace_prefix(&params, &loaded);
     let mut report = LoadReport::default();
     for (key, value) in loaded {
-        match params.get_mut(&key) {
+        let name = match &prefix {
+            Some(prefix) => format!("{prefix}{key}"),
+            None => key.clone(),
+        };
+        match params.get_mut(&name) {
             Some(param) => {
                 **param = value;
                 report.loaded += 1;
             }
+            // The checkpoint's own spelling, not the probed one, since that is
+            // what the reader has in front of them.
             None => report.skipped.push(key),
         }
     }
@@ -2313,5 +2395,164 @@ mod tests {
             ]),
             "both unmatched keys must be reported, including the un-prefixed layout"
         );
+    }
+
+    /// Build a `flatten_params_mut`-shaped map without a real module, so the
+    /// namespace probe can be exercised on layouts no architecture ships.
+    fn param_map<'a>(names: &[&str], slots: &'a mut [Array]) -> HashMap<String, &'a mut Array> {
+        assert_eq!(names.len(), slots.len());
+        names
+            .iter()
+            .map(|name| (*name).to_string())
+            .zip(slots.iter_mut())
+            .collect()
+    }
+
+    fn checkpoint(keys: &[&str]) -> HashMap<String, Array> {
+        keys.iter()
+            .map(|key| ((*key).to_string(), Array::from_slice(&[0.0f32], &[1])))
+            .collect()
+    }
+
+    /// `Qwen/Qwen3-Embedding-8B` publishes the text tower with no namespace at
+    /// all, so every key missed and the model answered from random init
+    /// (issue #19).
+    #[test]
+    fn unprefixed_checkpoint_resolves_against_the_model_namespace() {
+        let mut slots = [
+            Array::from_slice(&[0.0f32], &[1]),
+            Array::from_slice(&[0.0f32], &[1]),
+            Array::from_slice(&[0.0f32], &[1]),
+            Array::from_slice(&[0.0f32], &[1]),
+        ];
+        let params = param_map(
+            &[
+                "model.embed_tokens.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.norm.weight",
+                "lm_head.weight",
+            ],
+            &mut slots,
+        );
+        let loaded = checkpoint(&[
+            "embed_tokens.weight",
+            "layers.0.self_attn.q_proj.weight",
+            "norm.weight",
+        ]);
+
+        assert_eq!(
+            detect_namespace_prefix(&params, &loaded).as_deref(),
+            Some("model.")
+        );
+    }
+
+    /// The checkpoint above plus an `lm_head.weight` that *does* line up. An
+    /// early-out on "some key matched" would take the identity mapping here and
+    /// drop every layer.
+    #[test]
+    fn one_already_matching_key_does_not_veto_the_shift() {
+        let mut slots = [
+            Array::from_slice(&[0.0f32], &[1]),
+            Array::from_slice(&[0.0f32], &[1]),
+            Array::from_slice(&[0.0f32], &[1]),
+            Array::from_slice(&[0.0f32], &[1]),
+        ];
+        let params = param_map(
+            &[
+                "model.embed_tokens.weight",
+                "model.layers.0.self_attn.q_proj.weight",
+                "model.norm.weight",
+                "lm_head.weight",
+            ],
+            &mut slots,
+        );
+        let loaded = checkpoint(&[
+            "embed_tokens.weight",
+            "layers.0.self_attn.q_proj.weight",
+            "norm.weight",
+            "lm_head.weight",
+        ]);
+
+        assert_eq!(
+            detect_namespace_prefix(&params, &loaded).as_deref(),
+            Some("model."),
+            "three keys under `model.` outweigh the one that already matched"
+        );
+    }
+
+    #[test]
+    fn a_checkpoint_that_already_lines_up_is_left_alone() {
+        let mut slots = [
+            Array::from_slice(&[0.0f32], &[1]),
+            Array::from_slice(&[0.0f32], &[1]),
+        ];
+        let params = param_map(
+            &["model.embed_tokens.weight", "model.norm.weight"],
+            &mut slots,
+        );
+        let loaded = checkpoint(&["model.embed_tokens.weight", "model.norm.weight"]);
+
+        assert_eq!(detect_namespace_prefix(&params, &loaded), None);
+    }
+
+    /// Two towers with identically-named sublayers: prefixing onto either is a
+    /// coin flip, so the load has to stay put and report the misses.
+    #[test]
+    fn an_ambiguous_shift_is_refused() {
+        let mut slots = [
+            Array::from_slice(&[0.0f32], &[1]),
+            Array::from_slice(&[0.0f32], &[1]),
+        ];
+        let params = param_map(
+            &[
+                "text_model.layers.0.self_attn.q_proj.weight",
+                "vision_model.layers.0.self_attn.q_proj.weight",
+            ],
+            &mut slots,
+        );
+        let loaded = checkpoint(&["layers.0.self_attn.q_proj.weight"]);
+
+        assert_eq!(detect_namespace_prefix(&params, &loaded), None);
+    }
+
+    #[test]
+    fn a_layout_no_prefix_explains_is_left_to_the_report() {
+        let mut slots = [Array::from_slice(&[0.0f32], &[1])];
+        let params = param_map(&["model.embed_tokens.weight"], &mut slots);
+        let loaded = checkpoint(&["bert.encoder.layer.0.attention.self.query.weight"]);
+
+        assert_eq!(detect_namespace_prefix(&params, &loaded), None);
+    }
+
+    /// End to end on the real `Qwen3ForCausalLM` parameter tree: before the
+    /// shift was detected this loaded nothing at all.
+    #[test]
+    fn unprefixed_qwen3_checkpoint_loads_into_the_model() {
+        let temp = tempdir().unwrap();
+        let model_dir = temp.path();
+
+        let mut weights = HashMap::new();
+        for key in [
+            "embed_tokens.weight",
+            "norm.weight",
+            "layers.0.self_attn.q_proj.weight",
+            "layers.0.self_attn.k_proj.weight",
+            "layers.0.mlp.gate_proj.weight",
+        ] {
+            weights.insert(
+                key.to_string(),
+                Array::from_slice(&[1.0f32, 2.0, 3.0, 4.0], &[2, 2]),
+            );
+        }
+        write_safetensors(&model_dir.join("model.safetensors"), &weights).unwrap();
+
+        let mut model = crate::architectures::Qwen3ForCausalLM::new(Default::default()).unwrap();
+        let report = assign_loaded_weights(
+            &mut model,
+            load_shard(&model_dir.join("model.safetensors")).unwrap(),
+        );
+
+        assert_eq!(report.loaded, weights.len());
+        assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
     }
 }
