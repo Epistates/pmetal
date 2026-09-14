@@ -118,7 +118,7 @@ fn gpt_oss_synthetic_parity() {
     let mut capture = SpecCapture::with_layers_and_embedding(vec![0, 1], false);
     let final_hidden = model
         .model
-        .forward_with_capture(&input_ids, None, None, Some(&mut capture))
+        .forward_with_capture(&input_ids, None, None, None, Some(&mut capture))
         .expect("forward_with_capture runs");
     let logits = model.lm_head.forward(&final_hidden);
 

@@ -96,7 +96,7 @@ impl Qwen3NextMtpModel {
         let layer_idx = step_idx % self.layers.len();
         let layer = &mut self.layers[layer_idx];
         let kv = cache.map(|cache| (cache, layer_idx));
-        h = layer.forward(&h, mask, kv, None)?;
+        h = layer.forward(&h, mask, kv, None, None)?;
         Ok(self.norm.forward(&h))
     }
 }

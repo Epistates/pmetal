@@ -276,7 +276,7 @@ fn run_synthetic_parity(
     let mut capture = SpecCapture::with_layers_and_embedding(vec![0, 1], true);
     let final_hidden_rust = model
         .model
-        .forward_with_capture(&input_ids, None, None, Some(&mut capture))
+        .forward_with_capture(&input_ids, None, None, None, Some(&mut capture))
         .expect("forward_with_capture runs");
 
     // Gemma4Model::forward_with_capture returns the post-norm hidden state.
@@ -460,7 +460,7 @@ fn gemma4_31b_parity() {
 
     let hidden_rust = gemma4
         .model
-        .forward_with_capture(&input_ids, None, None, Some(&mut capture))
+        .forward_with_capture(&input_ids, None, None, None, Some(&mut capture))
         .expect("real forward_with_capture runs");
     let final_hidden_rust = hidden_rust.clone();
     let raw_logits = gemma4.model.embed_tokens.as_linear(&final_hidden_rust);

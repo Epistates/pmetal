@@ -41,6 +41,7 @@
 
 use pmetal_bridge::compat::{Array, Dtype, Exception, Module, Param, nn, ops};
 use pmetal_bridge::impl_module_params;
+use pmetal_mlx::kernels::rope::RopePositions;
 use serde::{Deserialize, Serialize};
 
 use std::collections::HashMap;
@@ -493,7 +494,9 @@ impl DiffusionGemmaTextLayer {
     ) -> Result<(Array, Array, Array), Exception> {
         let residual = x.clone();
         let h = self.input_layernorm.forward(x);
-        let (attn_out, keys, values) = self.self_attn.forward_collect_kv(&h, mask, offset)?;
+        let (attn_out, keys, values) =
+            self.self_attn
+                .forward_collect_kv(&h, mask, RopePositions::Offset(offset))?;
         let h = self.post_attention_layernorm.forward(&attn_out);
         let h = residual.add(&h);
         let out = self.feed_forward(&h)?;
@@ -518,7 +521,7 @@ impl DiffusionGemmaTextLayer {
             encoder_keys,
             encoder_values,
             mask,
-            offset,
+            RopePositions::Offset(offset),
         )?;
         let h = self.post_attention_layernorm.forward(&attn_out);
         let h = residual.add(&h);

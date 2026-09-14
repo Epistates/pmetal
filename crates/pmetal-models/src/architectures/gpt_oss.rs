@@ -29,7 +29,7 @@ use crate::common::yarn::{YarnRope, build_yarn_rope};
 use crate::fp8_utils::dequantize_fp8_weight_for_compute;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig,
-    rope::{apply_rope, apply_rope_with_freqs},
+    rope::{RopePositions, rope, rope_with_inv_freq},
     sink_sdpa,
 };
 use pmetal_mlx::kv_cache::KVCache;
@@ -434,6 +434,7 @@ impl GptOssAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let batch = shape[0];
@@ -456,14 +457,17 @@ impl GptOssAttention {
 
         // Apply RoPE — YARN per-dim frequencies + embedding mscale when
         // configured (real GPT-OSS uses yarn factor=32), else plain base RoPE.
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+        );
         let (q, k) = apply_gpt_oss_rope(
             &q,
             &k,
             self.head_dim,
             self.rope_theta,
             &self.yarn_rope,
-            offset,
+            rope_positions,
         )?;
 
         // Configure attention based on layer type
@@ -612,7 +616,7 @@ fn apply_gpt_oss_rope(
     head_dim: i32,
     rope_theta: f32,
     yarn: &Option<YarnRope>,
-    offset: i32,
+    rope_positions: RopePositions<'_>,
 ) -> Result<(Array, Array), Exception> {
     if let Some(yarn) = yarn {
         let (qi, ki) = if yarn.mscale != 1.0 {
@@ -622,13 +626,13 @@ fn apply_gpt_oss_rope(
             (q.clone(), k.clone())
         };
         Ok((
-            apply_rope_with_freqs(&qi, &yarn.inv_freq, head_dim, false, offset)?,
-            apply_rope_with_freqs(&ki, &yarn.inv_freq, head_dim, false, offset)?,
+            rope_with_inv_freq(&qi, rope_positions, &yarn.inv_freq, head_dim, false)?,
+            rope_with_inv_freq(&ki, rope_positions, &yarn.inv_freq, head_dim, false)?,
         ))
     } else {
         Ok((
-            apply_rope(q, head_dim, false, rope_theta, 1.0, offset)?,
-            apply_rope(k, head_dim, false, rope_theta, 1.0, offset)?,
+            rope(q, rope_positions, head_dim, false, rope_theta, 1.0)?,
+            rope(k, rope_positions, head_dim, false, rope_theta, 1.0)?,
         ))
     }
 }
@@ -1109,11 +1113,12 @@ impl GptOssDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         // Pre-norm attention
         let residual = x;
         let hidden = self.input_layernorm.forward(x);
-        let hidden = self.self_attn.forward(&hidden, mask, cache)?;
+        let hidden = self.self_attn.forward(&hidden, mask, cache, positions)?;
         let hidden = residual.add(&hidden);
 
         // Pre-norm MLP
@@ -1175,7 +1180,22 @@ impl GptOssModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        self.forward_with_capture(input_ids, mask, cache, None)
+        self.forward_with_capture(input_ids, mask, cache, None, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. The block-diagonal mask keeps the content apart; this keeps the
+    /// positions apart.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, None, positions, None)
     }
 
     /// Forward pass with optional hidden-state capture for DFlash
@@ -1185,6 +1205,7 @@ impl GptOssModel {
         input_ids: &Array,
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         let mut hidden = self.embed_tokens.forward(input_ids);
@@ -1192,7 +1213,7 @@ impl GptOssModel {
         match cache {
             Some(cache) => {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                    hidden = layer.forward(&hidden, mask, Some((cache, layer_idx)))?;
+                    hidden = layer.forward(&hidden, mask, Some((cache, layer_idx)), positions)?;
                     if let Some(buf) = capture.as_deref_mut()
                         && buf.wants_hidden_for(layer_idx)
                     {
@@ -1205,11 +1226,15 @@ impl GptOssModel {
                 let grad_checkpoint = self.grad_checkpoint;
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                     hidden = if grad_checkpoint {
-                        checkpointed_layer(layer, &hidden, mask, |layer, h, mask| {
-                            layer.forward(h, mask, None)
-                        })?
+                        checkpointed_layer(
+                            layer,
+                            &hidden,
+                            mask,
+                            positions,
+                            |layer, h, mask, positions| layer.forward(h, mask, None, positions),
+                        )?
                     } else {
-                        layer.forward(&hidden, mask, None)?
+                        layer.forward(&hidden, mask, None, positions)?
                     };
                     if let Some(buf) = capture.as_deref_mut()
                         && buf.wants_hidden_for(layer_idx)
@@ -1270,6 +1295,20 @@ impl GptOssForCausalLM {
         Ok(self.lm_head.forward(&hidden))
     }
 
+    /// Forward pass with one rotary position per token; see
+    /// [`GptOssModel::forward_with_positions`].
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let hidden = self
+            .model
+            .forward_with_positions(input_ids, mask, positions)?;
+        Ok(self.lm_head.forward(&hidden))
+    }
+
     /// Forward pass that records hidden states into a DFlash capture
     /// buffer at every tapped layer index.
     pub fn forward_with_capture(
@@ -1279,9 +1318,9 @@ impl GptOssForCausalLM {
         cache: Option<&mut KVCache>,
         capture: &mut pmetal_mlx::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
-        let hidden = self
-            .model
-            .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+        let hidden =
+            self.model
+                .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
         Ok(self.lm_head.forward(&hidden))
     }
 
@@ -1507,6 +1546,7 @@ impl GptOssLoraAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let batch = shape[0];
@@ -1528,14 +1568,17 @@ impl GptOssLoraAttention {
         let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE — YARN when configured, else plain base RoPE (same as base attn).
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+        );
         let (q, k) = apply_gpt_oss_rope(
             &q,
             &k,
             self.head_dim,
             self.rope_theta,
             &self.yarn_rope,
-            offset,
+            rope_positions,
         )?;
 
         // Configure attention based on layer type
@@ -1636,11 +1679,12 @@ impl GptOssLoraDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         // Pre-norm attention
         let residual = x;
         let hidden = self.input_layernorm.forward(x);
-        let hidden = self.self_attn.forward(&hidden, mask, cache)?;
+        let hidden = self.self_attn.forward(&hidden, mask, cache, positions)?;
         let hidden = residual.add(&hidden);
 
         // Pre-norm MLP
@@ -1698,17 +1742,32 @@ impl GptOssLoraModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
+        self.forward_inner(input_ids, mask, cache, None)
+    }
+
+    /// The layer loop, with every per-call input the layers can take.
+    ///
+    /// `positions` carries one rotary position per token, `[seq_len]`, which
+    /// is what a packed batch needs so the second sequence in a row restarts
+    /// at 0 rather than continuing the first.
+    fn forward_inner(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
         let mut hidden = self.embed_tokens.forward(input_ids);
 
         match cache {
             Some(cache) => {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                    hidden = layer.forward(&hidden, mask, Some((cache, layer_idx)))?;
+                    hidden = layer.forward(&hidden, mask, Some((cache, layer_idx)), positions)?;
                 }
             }
             None => {
                 for layer in self.layers.iter_mut() {
-                    hidden = layer.forward(&hidden, mask, None)?;
+                    hidden = layer.forward(&hidden, mask, None, positions)?;
                 }
             }
         }

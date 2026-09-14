@@ -21,7 +21,7 @@ use pmetal_bridge::impl_module_params;
 use pmetal_mlx::Builder;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{apply_rope, apply_rope_with_freqs},
+    rope::{RopePositions, rope, rope_with_inv_freq},
 };
 use pmetal_mlx::kv_cache::KVCache;
 use pmetal_mlx::moe::{MoEConfig, MoELayer};
@@ -341,7 +341,11 @@ impl DeepSeekAttention {
             yarn_rope,
         })
     }
-    fn project_qkv_uncached(&mut self, x: &Array, offset: i32) -> Result<(Array, Array, Array)> {
+    fn project_qkv_uncached(
+        &mut self,
+        x: &Array,
+        rope_positions: RopePositions<'_>,
+    ) -> Result<(Array, Array, Array)> {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
@@ -386,13 +390,27 @@ impl DeepSeekAttention {
                 (q_pe.clone(), k_pe.clone())
             };
             (
-                apply_rope_with_freqs(&q_in, &yarn.inv_freq, rope_dim, true, offset)?,
-                apply_rope_with_freqs(&k_in, &yarn.inv_freq, rope_dim, true, offset)?,
+                rope_with_inv_freq(&q_in, rope_positions, &yarn.inv_freq, rope_dim, true)?,
+                rope_with_inv_freq(&k_in, rope_positions, &yarn.inv_freq, rope_dim, true)?,
             )
         } else {
             (
-                apply_rope(q_pe, rope_dim, true, self.config.rope_theta, 1.0, offset)?,
-                apply_rope(k_pe, rope_dim, true, self.config.rope_theta, 1.0, offset)?,
+                rope(
+                    q_pe,
+                    rope_positions,
+                    rope_dim,
+                    true,
+                    self.config.rope_theta,
+                    1.0,
+                )?,
+                rope(
+                    k_pe,
+                    rope_positions,
+                    rope_dim,
+                    true,
+                    self.config.rope_theta,
+                    1.0,
+                )?,
             )
         };
         let k_pe_repeated = pmetal_bridge::compat::ops::broadcast_to(
@@ -408,9 +426,13 @@ impl DeepSeekAttention {
         &mut self,
         x: &Array,
         mut cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<(Array, Array, Array)> {
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let (queries, keys, values) = self.project_qkv_uncached(x, offset)?;
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map_or(0, |(c, _)| c.rope_offset()),
+        );
+        let (queries, keys, values) = self.project_qkv_uncached(x, rope_positions)?;
         let (keys, values) = if let Some((ref mut cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &keys, &values)?
         } else {
@@ -418,15 +440,20 @@ impl DeepSeekAttention {
         };
         Ok((queries, keys, values))
     }
+
     pub fn forward(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array> {
         let mut cache = cache;
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let (queries, keys, values) = self.project_qkv_uncached(x, offset)?;
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map_or(0, |(c, _)| c.rope_offset()),
+        );
+        let (queries, keys, values) = self.project_qkv_uncached(x, rope_positions)?;
         let batch = queries.shape()[0];
         let seq_len = queries.shape()[2];
         let attn_config =
@@ -512,7 +539,11 @@ impl LightningIndexer {
             non_interleaved: config.indexer_non_interleaved_rope,
         })
     }
-    pub fn compute_scores(&mut self, x: &Array, offset: i32) -> Result<Array> {
+    pub fn compute_scores(
+        &mut self,
+        x: &Array,
+        rope_positions: RopePositions<'_>,
+    ) -> Result<Array> {
         let shape = x.shape();
         let batch = shape[0];
         let seq_len = shape[1];
@@ -526,21 +557,21 @@ impl LightningIndexer {
             .forward(x)
             .reshape(&[batch, seq_len, self.n_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
-        let q = apply_rope(
+        let q = rope(
             &q,
+            rope_positions,
             self.rope_dim,
             !self.non_interleaved,
             self.rope_theta,
             1.0,
-            offset,
         )?;
-        let k = apply_rope(
+        let k = rope(
             &k,
+            rope_positions,
             self.rope_dim,
             !self.non_interleaved,
             self.rope_theta,
             1.0,
-            offset,
         )?;
         let scores = q
             .matmul(&k.transpose_axes(&[0, 1, 3, 2]))
@@ -598,15 +629,19 @@ impl DeepSeekSparseAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array> {
         let seq_len = x.shape()[1];
         if seq_len < 2 * self.selector.top_k {
-            return self.base_attention.forward(x, mask, cache);
+            return self.base_attention.forward(x, mask, cache, positions);
         }
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0) as i32;
-        let scores = self.indexer.compute_scores(x, offset)?;
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map_or(0, |(c, _)| c.rope_offset()),
+        );
+        let scores = self.indexer.compute_scores(x, rope_positions)?;
         let selected_indices = self.selector.select_tokens(&scores, mask)?;
-        let (queries, keys, values) = self.base_attention.project_qkv(x, cache)?;
+        let (queries, keys, values) = self.base_attention.project_qkv(x, cache, positions)?;
         let (batch, n_heads, query_len, key_dim) = (
             queries.shape()[0],
             queries.shape()[1],
@@ -1156,6 +1191,7 @@ impl DeepSeekDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array> {
         std_pre_norm_forward(
             &mut self.input_layernorm,
@@ -1165,6 +1201,7 @@ impl DeepSeekDecoderLayer {
             x,
             mask,
             cache,
+            positions,
         )
     }
 
@@ -1179,8 +1216,9 @@ impl AttentionModule for DeepSeekAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        DeepSeekAttention::forward(self, x, mask, cache)
+        DeepSeekAttention::forward(self, x, mask, cache, positions)
     }
 }
 
@@ -1196,8 +1234,9 @@ impl DecoderLayer for DeepSeekDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        DeepSeekDecoderLayer::forward(self, x, mask, cache)
+        DeepSeekDecoderLayer::forward(self, x, mask, cache, positions)
     }
 }
 
@@ -1236,7 +1275,22 @@ impl DeepSeekModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array> {
-        self.forward_with_capture(input_ids, mask, cache, None)
+        self.forward_with_capture(input_ids, mask, cache, None, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. The block-diagonal mask keeps the content apart; this keeps the
+    /// positions apart.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array> {
+        self.forward_with_capture(input_ids, mask, None, positions, None)
     }
 
     /// Forward pass with optional hidden-state capture for DFlash
@@ -1246,6 +1300,7 @@ impl DeepSeekModel {
         input_ids: &Array,
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array> {
         let mut h = self.embed_tokens.forward(input_ids);
@@ -1256,11 +1311,11 @@ impl DeepSeekModel {
             // A cache means generation, which has no backward pass for the
             // recompute to pay for.
             h = if grad_checkpoint && layer_cache.is_none() {
-                checkpointed_layer(layer, &h, mask, |layer, h, mask| {
-                    layer.forward(h, mask, None)
+                checkpointed_layer(layer, &h, mask, positions, |layer, h, mask, positions| {
+                    layer.forward(h, mask, None, positions)
                 })?
             } else {
-                layer.forward(&h, mask, layer_cache)?
+                layer.forward(&h, mask, layer_cache, positions)?
             };
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(i)
@@ -1279,7 +1334,7 @@ impl DeepSeekModel {
         let mut h = self.embed_tokens.forward(input_ids);
         let mut all_hidden = Vec::with_capacity(self.layers.len());
         for layer in self.layers.iter_mut() {
-            h = layer.forward(&h, mask, None)?;
+            h = layer.forward(&h, mask, None, None)?;
             all_hidden.push(h.clone());
         }
         let out = self.norm.forward(&h);
@@ -1327,7 +1382,8 @@ impl DeepSeekMTPModule {
         let hn = self.hnorm.forward(h_prev);
         let en = self.enorm.forward(e_curr);
         let cat = pmetal_bridge::compat::ops::concatenate_axis(&[&hn, &en], -1);
-        self.layer.forward(&self.eh_proj.forward(&cat), mask, None)
+        self.layer
+            .forward(&self.eh_proj.forward(&cat), mask, None, None)
     }
 }
 
@@ -1395,6 +1451,20 @@ impl DeepSeek {
             .forward(&self.model.forward(input_ids, mask, cache)?))
     }
 
+    /// Forward pass with one rotary position per token; see
+    /// [`DeepSeekModel::forward_with_positions`].
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array> {
+        let hidden = self
+            .model
+            .forward_with_positions(input_ids, mask, positions)?;
+        Ok(self.lm_head.forward(&hidden))
+    }
+
     /// Forward pass that records hidden states into a DFlash capture
     /// buffer for every requested layer index.
     pub fn forward_with_capture(
@@ -1404,9 +1474,9 @@ impl DeepSeek {
         cache: Option<&mut KVCache>,
         capture: &mut pmetal_mlx::speculative::SpecCapture,
     ) -> Result<Array> {
-        let hidden = self
-            .model
-            .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+        let hidden =
+            self.model
+                .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
         Ok(self.lm_head.forward(&hidden))
     }
 

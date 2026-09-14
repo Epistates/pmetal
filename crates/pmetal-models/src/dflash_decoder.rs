@@ -1264,6 +1264,7 @@ impl DFlashTarget for Qwen3NextForCausalLM {
             input_ids,
             mask,
             kv_cache,
+            None,
             mamba_cache,
             Some(capture),
         )?;

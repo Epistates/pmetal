@@ -1232,6 +1232,82 @@ impl DynamicModel {
         }
     }
 
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Sequence packing concatenates several training records into one row.
+    /// The block-diagonal mask stops one record attending to another, but
+    /// nothing stops the positions running straight through the boundary
+    /// unless they are given explicitly, which is what this takes.
+    /// [`supports_packed_positions`] answers for the architecture *before* a
+    /// caller relies on it.
+    ///
+    /// Plain RoPE rotates by the difference between positions, so the shift a
+    /// packed row introduces cancels inside a sealed-off block. What it does
+    /// reach is everything reading the absolute position — Llama 4's attention
+    /// temperature tuning, Phi-3's LongRoPE table selection — and positions
+    /// running past the trained window. `tests/packed_positions.rs` holds
+    /// every architecture to the equivalence this is for.
+    ///
+    /// [`supports_packed_positions`]: Self::supports_packed_positions
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        match self {
+            Self::Llama(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::Llama4(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::Qwen2(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::Qwen3(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::Qwen3MoE(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::Qwen3Next(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::Gemma(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::Gemma4(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::Mistral(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::Phi(m) | Self::Phi4(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::DeepSeek(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::Cohere(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::Granite(m) => m.forward_with_positions(input_ids, mask, positions),
+            Self::GptOss(m) => m.forward_with_positions(input_ids, mask, positions),
+            // Text-only, as for `forward`.
+            Self::Mllama(m) => m.forward_with_positions(input_ids, mask, positions),
+            // NemotronH's attention blocks carry no positional encoding, and a
+            // packed row breaks the Mamba recurrence in a way positions cannot
+            // repair. Flux / BERT / DiffusionGemma are not causal LMs.
+            other => Err(Exception::custom(format!(
+                "forward_with_positions is not implemented for {other:?}; \
+                 check supports_packed_positions() before calling"
+            ))),
+        }
+    }
+
+    /// Whether [`forward_with_positions`] actually applies the positions for
+    /// this architecture, rather than accepting and dropping them.
+    ///
+    /// [`forward_with_positions`]: Self::forward_with_positions
+    pub fn supports_packed_positions(&self) -> bool {
+        matches!(
+            self,
+            Self::Llama(_)
+                | Self::Llama4(_)
+                | Self::Qwen2(_)
+                | Self::Qwen3(_)
+                | Self::Qwen3MoE(_)
+                | Self::Qwen3Next(_)
+                | Self::Gemma(_)
+                | Self::Gemma4(_)
+                | Self::Mistral(_)
+                | Self::Phi(_)
+                | Self::Phi4(_)
+                | Self::DeepSeek(_)
+                | Self::Cohere(_)
+                | Self::Granite(_)
+                | Self::GptOss(_)
+                | Self::Mllama(_)
+        )
+    }
+
     /// Forward pass returning last-layer hidden states `[batch, seq, hidden]`
     /// — the pre-lm-head representation used for sentence embeddings and
     /// `/v1/embeddings`-style pooling endpoints.

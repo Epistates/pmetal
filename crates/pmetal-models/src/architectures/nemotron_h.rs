@@ -20,7 +20,10 @@ use pmetal_bridge::compat::{
 use pmetal_bridge::impl_module_params;
 use std::collections::HashMap;
 
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{RopePositions, rope},
+};
 use pmetal_mlx::kv_cache::{KVCache, MambaCache, MambaCacheEntry};
 use serde::{Deserialize, Serialize};
 
@@ -1548,8 +1551,14 @@ impl NemotronHMixer {
         x: &Array,
         mask: Option<&Array>,
         kv_cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
         mamba_cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
+        // Accepted for a uniform layer signature and then dropped: no block
+        // here is rotary, so there is no rotation for explicit positions to
+        // change. The Mamba blocks take their order from the recurrence,
+        // which a packed row breaks in a way positions cannot repair.
+        let _ = positions;
         match self.block_type {
             'M' => self.forward_mamba(x, mamba_cache),
             '*' => self.forward_attention(x, mask, kv_cache),
@@ -1705,6 +1714,9 @@ impl NemotronHMixer {
         )
     }
 
+    /// Takes no positions: Nemotron-H's attention blocks carry no positional
+    /// encoding, so there is nothing for a packed batch to reset. See the
+    /// note where RoPE would otherwise go.
     fn forward_attention(
         &mut self,
         x: &Array,
@@ -1889,12 +1901,13 @@ impl NemotronHBlock {
         x: &Array,
         mask: Option<&Array>,
         kv_cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
         mamba_cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
         let hidden = Module::forward(&mut self.norm, x)?;
-        let output = self
-            .mixer
-            .forward_with_cache(&hidden, mask, kv_cache, mamba_cache)?;
+        let output =
+            self.mixer
+                .forward_with_cache(&hidden, mask, kv_cache, positions, mamba_cache)?;
         // Residual connection
         Ok(x.add(&output))
     }
@@ -1964,7 +1977,33 @@ impl NemotronHModel {
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
+        kv_cache: Option<&mut KVCache>,
+        mamba_cache: Option<&mut MambaCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_inner(input_ids, mask, kv_cache, None, mamba_cache)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. Only the attention blocks rotate; the Mamba blocks carry their
+    /// order in the recurrence and take no positions.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_inner(input_ids, mask, None, positions, None)
+    }
+
+    fn forward_inner(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
         mut kv_cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
         mut mamba_cache: Option<&mut MambaCache>,
     ) -> Result<Array, Exception> {
         let mut hidden = Module::forward(&mut self.embeddings, input_ids)?;
@@ -1991,7 +2030,7 @@ impl NemotronHModel {
                 None
             };
 
-            hidden = layer.forward_with_cache(&hidden, layer_mask, kv, mamba)?;
+            hidden = layer.forward_with_cache(&hidden, layer_mask, kv, positions, mamba)?;
         }
 
         Module::forward(&mut self.norm_f, &hidden)

@@ -55,7 +55,10 @@ use serde::{Deserialize, Serialize};
 
 use pmetal_core::LoraConfig;
 use pmetal_mlx::kernels::fast_lora::create_lora_params;
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{RopePositions, rope, rope_with_periods},
+};
 use pmetal_mlx::kv_cache::KVCache;
 
 /// A single low-rank adapter `ΔW = scale · Bᵀ · Aᵀ` applied additively to a
@@ -226,7 +229,7 @@ pub(crate) fn apply_gemma4_partial_rope(
     head_dim: i32,
     rotated_dims: i32,
     base: f32,
-    offset: i32,
+    rope_positions: RopePositions<'_>,
     partial_freqs: Option<&Array>,
 ) -> Result<Array, Exception> {
     if rotated_dims == 0 {
@@ -234,7 +237,7 @@ pub(crate) fn apply_gemma4_partial_rope(
     }
     if rotated_dims == head_dim {
         // Full rotation — standard rope works directly.
-        return apply_rope(x, head_dim, false, base, 1.0, offset);
+        return rope(x, rope_positions, head_dim, false, base, 1.0);
     }
     // Fast path: a precomputed `[head_dim / 2]` inverse-frequency array
     // with `inf` in the non-rotated slots lets us call `fast::rope` once
@@ -242,9 +245,7 @@ pub(crate) fn apply_gemma4_partial_rope(
     // mlx-lm's `ProportionalRoPE` and is ~5-7x faster than the manual
     // slice/concat dance (the old fallback path) during decode.
     if let Some(freqs) = partial_freqs {
-        return Ok(pmetal_bridge::compat::fast::rope_with_freqs(
-            x, head_dim, false, 1.0, offset, freqs,
-        ));
+        return rope_with_periods(x, rope_positions, freqs, head_dim, false, 1.0);
     }
     if rotated_dims % 2 != 0 || head_dim % 2 != 0 {
         return Err(Exception::custom(format!(
@@ -288,13 +289,13 @@ pub(crate) fn apply_gemma4_partial_rope(
     //   (left_rot[i], right_rot[i]) = (x[i], x[half + i]).
     let rotated_input = ops::concatenate_axis(&[&left_rot, &right_rot], -1);
     let effective_base = base.powf(rotated_dims as f32 / head_dim as f32);
-    let rotated = apply_rope(
+    let rotated = rope(
         &rotated_input,
+        rope_positions,
         rotated_dims,
         false,
         effective_base,
         1.0,
-        offset,
     )?;
 
     // Split rotated back into its two halves.
@@ -1540,7 +1541,11 @@ impl Gemma4Attention {
         ))
     }
 
-    fn project_queries(&mut self, x: &Array, offset: i32) -> Result<Array, Exception> {
+    fn project_queries(
+        &mut self,
+        x: &Array,
+        rope_positions: RopePositions<'_>,
+    ) -> Result<Array, Exception> {
         let shape = x.shape();
         let b = shape[0];
         let l = shape[1];
@@ -1557,12 +1562,16 @@ impl Gemma4Attention {
             self.head_dim,
             self.rope_partial_dims,
             self.rope_base,
-            offset,
+            rope_positions,
             self.rope_partial_freqs.as_ref(),
         )
     }
 
-    fn project_qkv(&mut self, x: &Array, offset: i32) -> Result<(Array, Array, Array), Exception> {
+    fn project_qkv(
+        &mut self,
+        x: &Array,
+        rope_positions: RopePositions<'_>,
+    ) -> Result<(Array, Array, Array), Exception> {
         let shape = x.shape();
         let b = shape[0];
         let l = shape[1];
@@ -1604,7 +1613,7 @@ impl Gemma4Attention {
             self.head_dim,
             self.rope_partial_dims,
             self.rope_base,
-            offset,
+            rope_positions,
             partial_freqs,
         )?;
         let k = apply_gemma4_partial_rope(
@@ -1612,7 +1621,7 @@ impl Gemma4Attention {
             self.head_dim,
             self.rope_partial_dims,
             self.rope_base,
-            offset,
+            rope_positions,
             partial_freqs,
         )?;
         Ok((q, k, v))
@@ -1623,9 +1632,13 @@ impl Gemma4Attention {
         x: &Array,
         mask: Option<&Array>,
         mut cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let (q, k, v) = self.project_qkv(x, offset)?;
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map_or(0, |(c, _)| c.rope_offset()),
+        );
+        let (q, k, v) = self.project_qkv(x, rope_positions)?;
 
         // Update KV cache.
         let (k, v) = if let Some((cache_ref, layer_idx)) = cache.as_mut() {
@@ -1641,9 +1654,9 @@ impl Gemma4Attention {
         &mut self,
         x: &Array,
         mask: Option<&Array>,
-        offset: i32,
+        rope_positions: RopePositions<'_>,
     ) -> Result<(Array, Array, Array), Exception> {
-        let (q, k, v) = self.project_qkv(x, offset)?;
+        let (q, k, v) = self.project_qkv(x, rope_positions)?;
         let output = self.attend(&q, &k, &v, mask)?;
         Ok((output, k, v))
     }
@@ -1654,9 +1667,9 @@ impl Gemma4Attention {
         mask: Option<&Array>,
         source_keys: &Array,
         source_values: &Array,
-        offset: i32,
+        rope_positions: RopePositions<'_>,
     ) -> Result<Array, Exception> {
-        let q = self.project_queries(x, offset)?;
+        let q = self.project_queries(x, rope_positions)?;
         self.attend(&q, source_keys, source_values, mask)
     }
 
@@ -1675,9 +1688,9 @@ impl Gemma4Attention {
         encoder_keys: &Array,
         encoder_values: &Array,
         mask: Option<&Array>,
-        offset: i32,
+        rope_positions: RopePositions<'_>,
     ) -> Result<Array, Exception> {
-        let (q, k, v) = self.project_qkv(x, offset)?;
+        let (q, k, v) = self.project_qkv(x, rope_positions)?;
         let k = ops::concatenate_axis(&[encoder_keys, &k], 2);
         let v = ops::concatenate_axis(&[encoder_values, &v], 2);
         self.attend(&q, &k, &v, mask)
@@ -1782,6 +1795,7 @@ impl Gemma4DecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
         layer_input: Option<&Array>,
     ) -> Result<Array, Exception> {
         // Dynamic-path decoder (used by training, parity tests, and
@@ -1792,7 +1806,7 @@ impl Gemma4DecoderLayer {
         // exercises exactly what's below.
         let residual = x.clone();
         let h = self.input_layernorm.forward(x);
-        let h = self.self_attn.forward(&h, mask, cache)?;
+        let h = self.self_attn.forward(&h, mask, cache, positions)?;
         self.finish_forward(&residual, &h, layer_input)
     }
 
@@ -1800,12 +1814,14 @@ impl Gemma4DecoderLayer {
         &mut self,
         x: &Array,
         mask: Option<&Array>,
-        offset: i32,
+        rope_positions: RopePositions<'_>,
         layer_input: Option<&Array>,
     ) -> Result<(Array, Array, Array), Exception> {
         let residual = x.clone();
         let h = self.input_layernorm.forward(x);
-        let (attn_out, keys, values) = self.self_attn.forward_collect_kv(&h, mask, offset)?;
+        let (attn_out, keys, values) =
+            self.self_attn
+                .forward_collect_kv(&h, mask, rope_positions)?;
         let hidden = self.finish_forward(&residual, &attn_out, layer_input)?;
         Ok((hidden, keys, values))
     }
@@ -1816,14 +1832,18 @@ impl Gemma4DecoderLayer {
         mask: Option<&Array>,
         source_keys: &Array,
         source_values: &Array,
-        offset: i32,
+        rope_positions: RopePositions<'_>,
         layer_input: Option<&Array>,
     ) -> Result<Array, Exception> {
         let residual = x.clone();
         let h = self.input_layernorm.forward(x);
-        let attn_out =
-            self.self_attn
-                .forward_with_shared_kv(&h, mask, source_keys, source_values, offset)?;
+        let attn_out = self.self_attn.forward_with_shared_kv(
+            &h,
+            mask,
+            source_keys,
+            source_values,
+            rope_positions,
+        )?;
         self.finish_forward(&residual, &attn_out, layer_input)
     }
 }
@@ -1873,7 +1893,22 @@ impl Gemma4Model {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        self.forward_with_capture(input_ids, mask, cache, None)
+        self.forward_with_capture(input_ids, mask, cache, None, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. The block-diagonal mask keeps the content apart; this keeps the
+    /// positions apart.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, None, positions, None)
     }
 
     pub fn forward_with_capture(
@@ -1881,6 +1916,7 @@ impl Gemma4Model {
         input_ids: &Array,
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(input_ids);
@@ -1906,7 +1942,10 @@ impl Gemma4Model {
                 .map(|inputs| layer_per_input(inputs, i));
             let layer_input_ref = layer_input.as_ref();
             if let Some(shared_source) = layer.kv_shared_source_layer {
-                let rope_offset = cache.as_ref().map(|c| c.rope_offset()).unwrap_or(0);
+                let rope_positions = RopePositions::resolve(
+                    positions,
+                    cache.as_ref().map_or(0, |c| c.rope_offset()),
+                );
                 if let Some(cache_ref) = cache.as_ref() {
                     let (source_keys, source_values) = cache_ref.get(shared_source).ok_or_else(|| {
                         Exception::custom(format!(
@@ -1918,7 +1957,7 @@ impl Gemma4Model {
                         mask,
                         &source_keys,
                         &source_values,
-                        rope_offset,
+                        rope_positions,
                         layer_input_ref,
                     )?;
                 } else {
@@ -1936,18 +1975,22 @@ impl Gemma4Model {
                         mask,
                         source_keys,
                         source_values,
-                        rope_offset,
+                        rope_positions,
                         layer_input_ref,
                     )?;
                 }
             } else if let Some(ref mut shared_kv) = local_shared_kv {
-                let (next_h, keys, values) =
-                    layer.forward_collect_kv(&h, mask, 0, layer_input_ref)?;
+                let (next_h, keys, values) = layer.forward_collect_kv(
+                    &h,
+                    mask,
+                    RopePositions::resolve(positions, 0),
+                    layer_input_ref,
+                )?;
                 shared_kv[i] = Some((keys, values));
                 h = next_h;
             } else {
                 let c = cache.as_deref_mut().map(|c| (c, i));
-                h = layer.forward(&h, mask, c, layer_input_ref)?;
+                h = layer.forward(&h, mask, c, positions, layer_input_ref)?;
             }
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(i)
@@ -1998,9 +2041,28 @@ impl Gemma4ForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden = self.model.forward_with_cache(input_ids, mask, cache)?;
-        // Gemma 4 ties embeddings; project via transposed embed table.
-        let logits = self.model.embed_tokens.as_linear(&hidden);
-        Ok(self.logit_softcap(&logits))
+        Ok(self.project_logits(&hidden))
+    }
+
+    /// Forward pass with one rotary position per token; see
+    /// [`Gemma4Model::forward_with_positions`].
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let hidden = self
+            .model
+            .forward_with_positions(input_ids, mask, positions)?;
+        Ok(self.project_logits(&hidden))
+    }
+
+    /// Gemma 4 ties embeddings, so logits come off the transposed embed table
+    /// and then through the softcap.
+    fn project_logits(&mut self, hidden: &Array) -> Array {
+        let logits = self.model.embed_tokens.as_linear(hidden);
+        self.logit_softcap(&logits)
     }
 
     pub fn forward_with_capture(
@@ -2027,9 +2089,9 @@ impl Gemma4ForCausalLM {
         cache: Option<&mut KVCache>,
         capture: &mut pmetal_mlx::speculative::SpecCapture,
     ) -> Result<(Array, Array), Exception> {
-        let hidden = self
-            .model
-            .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+        let hidden =
+            self.model
+                .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
         let logits = self.model.embed_tokens.as_linear(&hidden);
         Ok((hidden, self.logit_softcap(&logits)))
     }
@@ -2412,12 +2474,12 @@ mod moe_tests {
         attn.o_proj.weight = Param::new(rand(&[HIDDEN, out_q]));
 
         let x = rand(&[1, 5, HIDDEN]);
-        let dense = attn.forward(&x, None, None).unwrap();
+        let dense = attn.forward(&x, None, None, None).unwrap();
         assert!(attn.qbase.is_none(), "no quant base before quantize");
 
         attn.quantize_projections(32, 8).unwrap();
         assert!(attn.qbase.is_some(), "quant base present after quantize");
-        let quant = attn.forward(&x, None, None).unwrap();
+        let quant = attn.forward(&x, None, None, None).unwrap();
 
         let len = (5 * HIDDEN) as usize;
         let mut dense_c = dense.clone();

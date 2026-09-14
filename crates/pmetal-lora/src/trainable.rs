@@ -61,11 +61,15 @@ pub trait TrainableModel: ModuleParameters {
     /// architectures override it with a version that does the same. That is
     /// indistinguishable from real support at the call site, which matters
     /// because sequence packing is on by default: a model answering `false`
-    /// here is one whose RoPE positions run straight through the boundary
-    /// between two packed sequences instead of restarting.
+    /// here is one whose positions run straight through the boundary between
+    /// two packed sequences instead of restarting.
     ///
     /// The block-diagonal mask still stops one sequence attending to another,
-    /// so this degrades the positions rather than mixing the content.
+    /// and plain RoPE rotates by the *difference* between positions, so a
+    /// uniform shift cancels inside a sealed-off block. What the shift does
+    /// reach is everything reading the absolute position — Llama 4's attention
+    /// temperature tuning, Phi-3's LongRoPE table selection — and any position
+    /// running past the trained window.
     ///
     /// [`forward_with_positions`]: Self::forward_with_positions
     fn supports_packed_positions(&self) -> bool {

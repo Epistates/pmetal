@@ -38,7 +38,7 @@ use pmetal_mlx::{
         fused_sdpa,
         gated_delta::{self, gated_delta_update},
         metal_swiglu::fused_swiglu_forward,
-        rope::{RopeScaling, apply_rope},
+        rope::{RopePositions, RopeScaling, rope},
     },
 };
 
@@ -664,6 +664,7 @@ impl Qwen3NextAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let b = shape[0];
@@ -695,22 +696,25 @@ impl Qwen3NextAttention {
         let values = values.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply partial RoPE
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let queries = apply_rope(
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+        );
+        let queries = rope(
             &queries,
+            rope_positions,
             self.rope_dims,
             false,
             self.effective_base,
             self.rope_scale,
-            offset,
         )?;
-        let keys = apply_rope(
+        let keys = rope(
             &keys,
+            rope_positions,
             self.rope_dims,
             false,
             self.effective_base,
             self.rope_scale,
-            offset,
         )?;
 
         // Fused SDPA with GQA
@@ -761,6 +765,7 @@ impl Qwen3NextAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
         layer_profile: &mut Qwen3NextLayerProfile,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
@@ -791,22 +796,25 @@ impl Qwen3NextAttention {
         layer_profile.push_section("attn_prepare_qkv", prep_start);
 
         let rope_cache_start = Instant::now();
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let queries = apply_rope(
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+        );
+        let queries = rope(
             &queries,
+            rope_positions,
             self.rope_dims,
             false,
             self.effective_base,
             self.rope_scale,
-            offset,
         )?;
-        let keys = apply_rope(
+        let keys = rope(
             &keys,
+            rope_positions,
             self.rope_dims,
             false,
             self.effective_base,
             self.rope_scale,
-            offset,
         )?;
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
             .with_scale(self.scale)
@@ -3195,6 +3203,7 @@ impl Qwen3NextDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         kv_cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
         mamba_cache: Option<&mut MambaCacheEntry>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x);
@@ -3207,7 +3216,7 @@ impl Qwen3NextDecoderLayer {
             self.self_attn
                 .as_mut()
                 .expect("self_attn must be Some for attention layers")
-                .forward(&normed, mask, kv_cache)?
+                .forward(&normed, mask, kv_cache, positions)?
         };
         let h = x.add(&r);
         let mlp_in = self.post_attention_layernorm.forward(&h);
@@ -3225,6 +3234,7 @@ impl Qwen3NextDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         kv_cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
         mamba_cache: Option<&mut MambaCacheEntry>,
         layer_idx: usize,
         capture: &mut pmetal_mlx::speculative::SpecCapture,
@@ -3239,7 +3249,7 @@ impl Qwen3NextDecoderLayer {
             self.self_attn
                 .as_mut()
                 .expect("self_attn must be Some for attention layers")
-                .forward(&normed, mask, kv_cache)?
+                .forward(&normed, mask, kv_cache, positions)?
         };
         let h = x.add(&r);
         let mlp_in = self.post_attention_layernorm.forward(&h);
@@ -3252,6 +3262,7 @@ impl Qwen3NextDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         kv_cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
         mamba_cache: Option<&mut MambaCacheEntry>,
         layer_idx: usize,
     ) -> Result<(Array, Qwen3NextLayerProfile), Exception> {
@@ -3270,7 +3281,7 @@ impl Qwen3NextDecoderLayer {
             self.self_attn
                 .as_mut()
                 .expect("self_attn must be Some for attention layers")
-                .forward_profiled(&normed, mask, kv_cache, &mut profile)?
+                .forward_profiled(&normed, mask, kv_cache, positions, &mut profile)?
         };
         let h = profile_array_section(&mut profile, "attn_residual", || x.add(&r));
         let mlp_in = profile_array_section(&mut profile, "post_attention_layernorm", || {
@@ -3357,7 +3368,22 @@ impl Qwen3NextModel {
         kv_cache: Option<&mut KVCache>,
         mamba_cache: Option<&mut MambaCache>,
     ) -> Result<Array, Exception> {
-        self.forward_with_cache_and_capture(input_ids, mask, kv_cache, mamba_cache, None)
+        self.forward_with_cache_and_capture(input_ids, mask, kv_cache, None, mamba_cache, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. Only the full-attention layers rotate; the GDN layers carry their
+    /// order in the recurrence and take no positions.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_cache_and_capture(input_ids, mask, None, positions, None, None)
     }
 
     /// Forward pass with optional hidden-state capture for speculative
@@ -3380,6 +3406,7 @@ impl Qwen3NextModel {
         input_ids: &Array,
         mask: Option<&Array>,
         mut kv_cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
         mut mamba_cache: Option<&mut MambaCache>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
@@ -3430,12 +3457,14 @@ impl Qwen3NextModel {
             // layers do not need the capture and just reuse `forward`.
             hidden = if let Some(buf) = capture.as_deref_mut() {
                 if layer.is_linear {
-                    layer.forward_with_capture(&hidden, layer_mask, kv, mamba, layer_idx, buf)?
+                    layer.forward_with_capture(
+                        &hidden, layer_mask, kv, positions, mamba, layer_idx, buf,
+                    )?
                 } else {
-                    layer.forward(&hidden, layer_mask, kv, mamba)?
+                    layer.forward(&hidden, layer_mask, kv, positions, mamba)?
                 }
             } else {
-                layer.forward(&hidden, layer_mask, kv, mamba)?
+                layer.forward(&hidden, layer_mask, kv, positions, mamba)?
             };
 
             if let Some(buf) = capture.as_deref_mut()
@@ -3505,7 +3534,7 @@ impl Qwen3NextModel {
             };
             let layer_mask = if layer.is_linear { ssm_mask } else { fa_mask };
             let (next_hidden, layer_profile) =
-                layer.forward_profiled(&hidden, layer_mask, kv, mamba, layer_idx)?;
+                layer.forward_profiled(&hidden, layer_mask, kv, None, mamba, layer_idx)?;
             hidden = next_hidden;
             profile.layers.push(layer_profile);
 
@@ -3669,6 +3698,20 @@ impl Qwen3NextForCausalLM {
         self.lm_head_forward(&h)
     }
 
+    /// Forward pass with one rotary position per token; see
+    /// [`Qwen3NextModel::forward_with_positions`].
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let h = self
+            .model
+            .forward_with_positions(input_ids, mask, positions)?;
+        self.lm_head_forward(&h)
+    }
+
     /// Forward pass that returns logits AND pre-lm-head hidden states for
     /// the tapped layers — the target side of a DFlash speculative verify
     /// step for the hybrid-attention Qwen3.5 stack.
@@ -3689,6 +3732,7 @@ impl Qwen3NextForCausalLM {
             input_ids,
             mask,
             kv_cache,
+            None,
             mamba_cache,
             Some(capture),
         )?;
@@ -3712,6 +3756,7 @@ impl Qwen3NextForCausalLM {
             input_ids,
             mask,
             kv_cache,
+            None,
             mamba_cache,
             Some(capture),
         )?;
@@ -4107,22 +4152,22 @@ impl Qwen3NextForCausalLM {
 
                         // RoPE offset = number of cached tokens (the position of the new token)
                         let rope_off = cached_keys.dim(2);
-                        queries = apply_rope(
+                        queries = rope(
                             &queries,
+                            RopePositions::Offset(rope_off),
                             lw.rope_dims,
                             false,
                             lw.effective_base,
                             lw.rope_scale,
-                            rope_off,
                         )
                         .expect("rope failed");
-                        keys = apply_rope(
+                        keys = rope(
                             &keys,
+                            RopePositions::Offset(rope_off),
                             lw.rope_dims,
                             false,
                             lw.effective_base,
                             lw.rope_scale,
-                            rope_off,
                         )
                         .expect("rope failed");
 
@@ -4646,7 +4691,7 @@ mod tests {
             &[1, 4, 32],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let output = attn.forward(&x, None, None).unwrap();
+        let output = attn.forward(&x, None, None, None).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
     }
 
@@ -5210,13 +5255,13 @@ mod tests {
             &[1, 4, 32],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let out0 = layer0.forward(&x, None, None, None).unwrap();
+        let out0 = layer0.forward(&x, None, None, None, None).unwrap();
         assert_eq!(out0.shape(), &[1, 4, 32]);
 
         // Full attention layer
         let mut layer3 = Qwen3NextDecoderLayer::new(&config, 3).unwrap();
         assert!(!layer3.is_linear);
-        let out3 = layer3.forward(&x, None, None, None).unwrap();
+        let out3 = layer3.forward(&x, None, None, None, None).unwrap();
         assert_eq!(out3.shape(), &[1, 4, 32]);
     }
 

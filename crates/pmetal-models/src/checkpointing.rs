@@ -34,31 +34,42 @@ use pmetal_bridge::compat::{Array, Exception, ModuleParametersExt};
 /// backward pass to save anything for, so the recompute would be pure cost and
 /// callers gate this on there being no KV cache.
 ///
-/// `mask` is threaded through as an input rather than captured. The closure
-/// outlives this call, so a captured reference to the caller's mask would be a
+/// `mask` and `positions` are threaded through as inputs rather than captured.
+/// The closure outlives this call, so a captured reference to either would be a
 /// dangling read on the recompute.
 pub(crate) fn checkpointed_layer<L, F>(
     layer: &mut L,
     h: &Array,
     mask: Option<&Array>,
+    positions: Option<&Array>,
     mut forward: F,
 ) -> Result<Array, Exception>
 where
     L: ModuleParametersExt,
-    F: FnMut(&mut L, &Array, Option<&Array>) -> Result<Array, Exception>,
+    F: FnMut(&mut L, &Array, Option<&Array>, Option<&Array>) -> Result<Array, Exception>,
 {
-    let inputs: Vec<Array> = match mask {
-        Some(mask) => vec![h.clone(), mask.clone()],
-        None => vec![h.clone()],
-    };
-    let has_mask = mask.is_some();
+    // Slot order is fixed rather than positional-by-presence, so the closure
+    // indexes the same way whatever the caller passed.
+    let mut inputs = vec![h.clone()];
+    let mask_slot = mask.map(|mask| {
+        inputs.push(mask.clone());
+        inputs.len() - 1
+    });
+    let positions_slot = positions.map(|positions| {
+        inputs.push(positions.clone());
+        inputs.len() - 1
+    });
 
     // SAFETY: `layer` is borrowed from the model running this forward pass, so
     // it outlives the graph being built. See the module docs.
     unsafe {
         pmetal_bridge::compat::checkpointed(layer, &inputs, move |layer, inputs| {
-            let mask = has_mask.then(|| &inputs[1]);
-            forward(layer, &inputs[0], mask)
+            forward(
+                layer,
+                &inputs[0],
+                mask_slot.map(|slot| &inputs[slot]),
+                positions_slot.map(|slot| &inputs[slot]),
+            )
         })
     }
 }

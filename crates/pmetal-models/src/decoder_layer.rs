@@ -61,11 +61,22 @@ pub trait AttentionModule: std::fmt::Debug {
     /// Signature mirrors the concrete per-arch `forward_with_cache` that
     /// every dense transformer already exposes, so the trait is a
     /// one-line adapter for each arch.
+    ///
+    /// `positions` carries one rotary position per token, `[seq_len]`, and is
+    /// `None` for the contiguous run that every unpacked forward and every
+    /// cached decode wants. Packed training is what needs it: several records
+    /// share one row, and their positions have to restart at each boundary.
+    ///
+    /// It is a parameter rather than a defaulted extra method on purpose. A
+    /// default that accepts the positions and drops them is indistinguishable
+    /// from real support at the call site, which is how the trainer came to
+    /// report packing as position-aware on architectures that were not.
     fn forward_with_cache(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception>;
 }
 
@@ -106,11 +117,15 @@ impl NormModule for nn::LayerNorm {
 /// can run every arch through one call without match-on-variant.
 pub trait DecoderLayer: std::fmt::Debug {
     /// Forward pass with optional KV cache. This is the main entry.
+    ///
+    /// `positions` is passed straight through to the attention module; see
+    /// [`AttentionModule::forward_with_cache`].
     fn forward_with_cache(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception>;
 
     /// Forward pass without cache (inference-only convenience wrapper).
@@ -118,7 +133,7 @@ pub trait DecoderLayer: std::fmt::Debug {
     /// Provided as a default so each arch only overrides
     /// `forward_with_cache`.
     fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 }
 
@@ -143,8 +158,9 @@ pub trait DecoderLayer: std::fmt::Debug {
 /// * `self_attn` — the attention module.
 /// * `post_attention_layernorm` — the pre-MLP norm.
 /// * `mlp` — the feed-forward module.
-/// * `x` / `mask` / `cache` — forward-pass inputs, threaded through
-///   unchanged from the decoder layer's own forward signature.
+/// * `x` / `mask` / `cache` / `positions` — forward-pass inputs, threaded
+///   through unchanged from the decoder layer's own forward signature.
+#[allow(clippy::too_many_arguments)]
 pub fn std_pre_norm_forward<A, M, N>(
     input_layernorm: &mut N,
     self_attn: &mut A,
@@ -153,6 +169,7 @@ pub fn std_pre_norm_forward<A, M, N>(
     x: &Array,
     mask: Option<&Array>,
     cache: Option<(&mut KVCache, usize)>,
+    positions: Option<&Array>,
 ) -> Result<Array, Exception>
 where
     A: AttentionModule,
@@ -167,6 +184,7 @@ where
         x,
         mask,
         cache,
+        positions,
         1.0,
     )
 }
@@ -193,6 +211,7 @@ pub fn scaled_pre_norm_forward<A, M, N>(
     x: &Array,
     mask: Option<&Array>,
     cache: Option<(&mut KVCache, usize)>,
+    positions: Option<&Array>,
     residual_multiplier: f32,
 ) -> Result<Array, Exception>
 where
@@ -213,7 +232,7 @@ where
 
     // Pre-norm + attention + residual
     let normed = input_layernorm.forward(x)?;
-    let attn_out = self_attn.forward_with_cache(&normed, mask, cache)?;
+    let attn_out = self_attn.forward_with_cache(&normed, mask, cache, positions)?;
     let h = x.add(&scale(&attn_out));
 
     // Pre-norm + MLP + residual

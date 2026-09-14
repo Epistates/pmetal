@@ -13,7 +13,7 @@ use pmetal_bridge::impl_module_params;
 
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopeScaling, apply_rope},
+    rope::{RopePositions, RopeScaling, rope},
 };
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
@@ -473,7 +473,7 @@ impl GemmaAttention {
 
     /// Forward pass through attention using fused kernels.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 
     /// Forward pass with optional KV cache.
@@ -482,6 +482,7 @@ impl GemmaAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let batch = shape[0];
@@ -517,30 +518,28 @@ impl GemmaAttention {
         };
 
         // Apply RoPE
-        let (queries, keys, values) = if let Some((cache_ref, _)) = cache.as_ref() {
-            let offset = cache_ref.rope_offset();
-            let queries = apply_rope(
-                &queries,
-                self.head_dim,
-                false,
-                self.effective_base,
-                self.rope_scale,
-                offset,
-            )?;
-            let keys = apply_rope(
-                &keys,
-                self.head_dim,
-                false,
-                self.effective_base,
-                self.rope_scale,
-                offset,
-            )?;
-            (queries, keys, values)
-        } else {
-            let queries = Module::forward(&mut self.rope, &queries)?;
-            let keys = Module::forward(&mut self.rope, &keys)?;
-            (queries, keys, values)
-        };
+        // Explicit positions win over the cache offset: a packed batch has no
+        // cache, and a cached decode has no explicit positions.
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map_or(0, |(c, _)| c.rope_offset()),
+        );
+        let queries = rope(
+            &queries,
+            rope_positions,
+            self.head_dim,
+            false,
+            self.effective_base,
+            self.rope_scale,
+        )?;
+        let keys = rope(
+            &keys,
+            rope_positions,
+            self.head_dim,
+            false,
+            self.effective_base,
+            self.rope_scale,
+        )?;
 
         // Build fused attention config with optional softcapping
         // Gemma2: even layers use sliding window, odd layers use full causal
@@ -696,7 +695,7 @@ impl GemmaDecoderLayer {
 
     /// Forward pass.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 
     /// Forward pass with optional KV cache.
@@ -709,6 +708,7 @@ impl GemmaDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         std_pre_norm_forward(
             &mut self.input_layernorm,
@@ -718,6 +718,7 @@ impl GemmaDecoderLayer {
             x,
             mask,
             cache,
+            positions,
         )
     }
 }
@@ -728,8 +729,9 @@ impl AttentionModule for GemmaAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        GemmaAttention::forward_with_cache(self, x, mask, cache)
+        GemmaAttention::forward_with_cache(self, x, mask, cache, positions)
     }
 }
 
@@ -739,8 +741,9 @@ impl DecoderLayer for GemmaDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        GemmaDecoderLayer::forward_with_cache(self, x, mask, cache)
+        GemmaDecoderLayer::forward_with_cache(self, x, mask, cache, positions)
     }
 }
 
@@ -787,7 +790,7 @@ impl Gemma2DecoderLayer {
 
     /// Forward pass with extra normalization.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 
     /// Forward pass with optional KV cache.
@@ -803,10 +806,13 @@ impl Gemma2DecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         // Pre-norm + attention
         let normed = self.input_layernorm.forward(x)?;
-        let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
+        let attn_out = self
+            .self_attn
+            .forward_with_cache(&normed, mask, cache, positions)?;
         let attn_out = self.post_attention_layernorm.forward(&attn_out)?;
         let h = x.add(&attn_out);
 
@@ -824,8 +830,9 @@ impl DecoderLayer for Gemma2DecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        Gemma2DecoderLayer::forward_with_cache(self, x, mask, cache)
+        Gemma2DecoderLayer::forward_with_cache(self, x, mask, cache, positions)
     }
 }
 
@@ -905,7 +912,22 @@ impl GemmaModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        self.forward_with_capture(input_ids, mask, cache, None)
+        self.forward_with_capture(input_ids, mask, cache, None, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. The block-diagonal mask keeps the content apart; this keeps the
+    /// positions apart.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, None, positions, None)
     }
 
     /// Forward pass with optional hidden-state capture for DFlash
@@ -917,6 +939,7 @@ impl GemmaModel {
         input_ids: &Array,
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         // Get embeddings and scale. `mul_scalar` casts the scalar to the
@@ -959,11 +982,17 @@ impl GemmaModel {
                 // A cache means generation, which has no backward pass for the
                 // recompute to pay for.
                 hidden_states = if grad_checkpoint && c.is_none() {
-                    checkpointed_layer(layer, &hidden_states, mask, |layer, h, mask| {
-                        layer.forward_with_cache(h, mask, None)
-                    })?
+                    checkpointed_layer(
+                        layer,
+                        &hidden_states,
+                        mask,
+                        positions,
+                        |layer, h, mask, positions| {
+                            layer.forward_with_cache(h, mask, None, positions)
+                        },
+                    )?
                 } else {
-                    layer.forward_with_cache(&hidden_states, mask, c)?
+                    layer.forward_with_cache(&hidden_states, mask, c, positions)?
                 };
                 if let Some(buf) = capture.as_deref_mut()
                     && buf.wants_hidden_for(idx)
@@ -975,11 +1004,17 @@ impl GemmaModel {
             for (idx, layer) in layers.iter_mut().enumerate() {
                 let c = cache.as_deref_mut().map(|c| (c, idx));
                 hidden_states = if grad_checkpoint && c.is_none() {
-                    checkpointed_layer(layer, &hidden_states, mask, |layer, h, mask| {
-                        layer.forward_with_cache(h, mask, None)
-                    })?
+                    checkpointed_layer(
+                        layer,
+                        &hidden_states,
+                        mask,
+                        positions,
+                        |layer, h, mask, positions| {
+                            layer.forward_with_cache(h, mask, None, positions)
+                        },
+                    )?
                 } else {
-                    layer.forward_with_cache(&hidden_states, mask, c)?
+                    layer.forward_with_cache(&hidden_states, mask, c, positions)?
                 };
                 if let Some(buf) = capture.as_deref_mut()
                     && buf.wants_hidden_for(idx)
@@ -1040,6 +1075,20 @@ impl GemmaForCausalLM {
         Ok(self.lm_head(&hidden_states))
     }
 
+    /// Forward pass with one rotary position per token; see
+    /// `forward_with_positions` on the inner model.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self
+            .model
+            .forward_with_positions(input_ids, mask, positions)?;
+        Ok(self.lm_head(&hidden_states))
+    }
+
     /// Forward pass that records hidden states into a DFlash capture
     /// buffer at every tapped layer index.
     pub fn forward_with_capture(
@@ -1051,7 +1100,7 @@ impl GemmaForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden_states =
             self.model
-                .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+                .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
         Ok(self.lm_head(&hidden_states))
     }
 

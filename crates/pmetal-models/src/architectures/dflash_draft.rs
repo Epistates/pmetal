@@ -38,7 +38,7 @@ use serde::{Deserialize, Serialize};
 
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopeScaling, apply_rope},
+    rope::{RopePositions, RopeScaling, rope},
 };
 use pmetal_mlx::kv_cache::KVCache;
 
@@ -266,21 +266,21 @@ impl DFlashAttention {
         // start at offset `cache.offset` (the context rows sit at the front
         // of the KV sequence). This matches dflash_mlx/draft.py:141-148.
         let cache_offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let queries = apply_rope(
+        let queries = rope(
             &queries,
+            RopePositions::Offset(cache_offset + context_len),
             self.head_dim,
             false,
             self.effective_base,
             self.rope_scale,
-            cache_offset + context_len,
         )?;
-        let keys = apply_rope(
+        let keys = rope(
             &keys,
+            RopePositions::Offset(cache_offset),
             self.head_dim,
             false,
             self.effective_base,
             self.rope_scale,
-            cache_offset,
         )?;
 
         let (keys, values) = if let Some((cache_ref, layer_idx)) = cache.as_mut() {

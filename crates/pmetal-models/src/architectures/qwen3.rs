@@ -21,7 +21,7 @@ use crate::decoder_layer::{AttentionModule, DecoderLayer, MlpModule, std_pre_nor
 use crate::traits::ModelConfig;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopeScaling, apply_rope},
+    rope::{RopePositions, RopeScaling, rope},
 };
 use pmetal_mlx::kv_cache::KVCache;
 
@@ -456,6 +456,7 @@ impl Qwen3Attention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let b = shape[0];
@@ -481,22 +482,25 @@ impl Qwen3Attention {
         let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE with cache offset
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let q = apply_rope(
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+        );
+        let q = rope(
             &q,
+            rope_positions,
             self.head_dim,
             false,
             self.effective_base,
             self.rope_scale,
-            offset,
         )?;
-        let k = apply_rope(
+        let k = rope(
             &k,
+            rope_positions,
             self.head_dim,
             false,
             self.effective_base,
             self.rope_scale,
-            offset,
         )?;
 
         // Fused SDPA with GQA-native path
@@ -623,7 +627,7 @@ impl Qwen3Layer {
         x: &Array,
         mask: Option<&Array>,
     ) -> Result<Array, Exception> {
-        self.forward(x, mask, None)
+        self.forward(x, mask, None, None)
     }
 
     /// Forward pass with optional KV cache.
@@ -635,6 +639,7 @@ impl Qwen3Layer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         std_pre_norm_forward(
             &mut self.input_layernorm,
@@ -644,6 +649,7 @@ impl Qwen3Layer {
             x,
             mask,
             cache,
+            positions,
         )
     }
 }
@@ -654,8 +660,9 @@ impl AttentionModule for Qwen3Attention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        Qwen3Attention::forward(self, x, mask, cache)
+        Qwen3Attention::forward(self, x, mask, cache, positions)
     }
 }
 
@@ -665,8 +672,9 @@ impl DecoderLayer for Qwen3Layer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        Qwen3Layer::forward(self, x, mask, cache)
+        Qwen3Layer::forward(self, x, mask, cache, positions)
     }
 }
 
@@ -747,7 +755,37 @@ impl Qwen3Model {
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_inner(input_ids, mask, cache, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. The block-diagonal mask keeps the content apart; this keeps the
+    /// positions apart.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_inner(input_ids, mask, None, positions)
+    }
+
+    /// The layer loop, with every per-call input the layers can take.
+    ///
+    /// `positions` carries one rotary position per token, `[seq_len]`, which
+    /// is what a packed batch needs so the second sequence in a row restarts
+    /// at 0 rather than continuing the first.
+    fn forward_inner(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(input_ids);
         // Hoisted: the loop below borrows `self.layers` mutably.
@@ -757,11 +795,11 @@ impl Qwen3Model {
             // A cache means generation, which has no backward pass for the
             // recompute to pay for.
             h = if grad_checkpoint && layer_cache.is_none() {
-                checkpointed_layer(layer, &h, mask, |layer, h, mask| {
-                    layer.forward(h, mask, None)
+                checkpointed_layer(layer, &h, mask, positions, |layer, h, mask, positions| {
+                    layer.forward(h, mask, None, positions)
                 })?
             } else {
-                layer.forward(&h, mask, layer_cache)?
+                layer.forward(&h, mask, layer_cache, positions)?
             };
         }
         Ok(self.norm.forward(&h))
@@ -782,15 +820,16 @@ impl Qwen3Model {
         input_ids: &Array,
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         if capture.is_none() {
-            return self.forward(input_ids, mask, cache);
+            return self.forward_inner(input_ids, mask, cache, positions);
         }
         let mut h = self.embed_tokens.forward(input_ids);
         for (i, layer) in self.layers.iter_mut().enumerate() {
             let layer_cache = cache.as_mut().map(|c| (&mut **c, i));
-            h = layer.forward(&h, mask, layer_cache)?;
+            h = layer.forward(&h, mask, layer_cache, positions)?;
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(i)
             {
@@ -874,6 +913,20 @@ impl Qwen3ForCausalLM {
         self.lm_head_forward(&h)
     }
 
+    /// Forward pass with one rotary position per token; see
+    /// [`Qwen3Model::forward_with_positions`].
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let h = self
+            .model
+            .forward_with_positions(input_ids, mask, positions)?;
+        self.lm_head_forward(&h)
+    }
+
     pub fn forward_with_cache(
         &mut self,
         input_ids: &Array,
@@ -943,7 +996,7 @@ impl Qwen3ForCausalLM {
     ) -> Result<Array, Exception> {
         let h = self
             .model
-            .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+            .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
         self.lm_head_forward(&h)
     }
 }
@@ -1145,7 +1198,7 @@ mod tests {
             &[1, 4, 32],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let output = attn.forward(&x, None, None).unwrap();
+        let output = attn.forward(&x, None, None, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 32]);
     }
@@ -1160,7 +1213,7 @@ mod tests {
             &[1, 4, 32],
             pmetal_bridge::compat::Dtype::Float32,
         );
-        let output = layer.forward(&x, None, None).unwrap();
+        let output = layer.forward(&x, None, None, None).unwrap();
 
         assert_eq!(output.shape(), &[1, 4, 32]);
     }

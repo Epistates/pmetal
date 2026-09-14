@@ -339,7 +339,7 @@ impl NemotronHQloraMixer {
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, LoraError> {
         match self {
             Self::Mamba(m) => m
-                .forward_with_cache(x, mask, None, None)
+                .forward_with_cache(x, mask, None, None, None)
                 .map_err(LoraError::Mlx),
             Self::Attention(a) => a.forward(x, mask),
             Self::Mlp(m) => m.forward(x),
@@ -357,7 +357,7 @@ impl NemotronHQloraMixer {
     ) -> Result<Array, LoraError> {
         match self {
             Self::Mamba(m) => m
-                .forward_with_cache(x, mask, None, mamba_cache)
+                .forward_with_cache(x, mask, None, None, mamba_cache)
                 .map_err(LoraError::Mlx),
             Self::Attention(a) => a.forward_with_cache(x, mask, kv_cache),
             Self::Mlp(m) => m.forward(x),

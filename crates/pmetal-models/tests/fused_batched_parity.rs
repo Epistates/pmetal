@@ -149,7 +149,7 @@ fn attn_layer0_matches_at_position_zero() {
     ));
     let out_s = model.model.layers[0]
         .self_attn
-        .forward_with_cache(&normed, None, Some((&mut cache_s, 0)))
+        .forward_with_cache(&normed, None, Some((&mut cache_s, 0)), None)
         .unwrap();
     out_s.eval();
     let sv = out_s.as_slice::<f32>().to_vec();

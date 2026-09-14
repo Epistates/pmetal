@@ -81,7 +81,7 @@ fn cohere_synthetic_parity() {
     let mut layer_taps: Vec<Array> = Vec::new();
     for layer in model.model.layers.iter_mut() {
         h = layer
-            .forward_with_cache(&h, None, None)
+            .forward_with_cache(&h, None, None, None)
             .expect("layer forward");
         layer_taps.push(h.clone());
     }

@@ -26,7 +26,7 @@ use pmetal_bridge::impl_module_params;
 
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{apply_rope, apply_rope_with_freqs},
+    rope::{RopePositions, rope, rope_with_inv_freq},
 };
 use pmetal_mlx::kv_cache::KVCache;
 
@@ -504,7 +504,7 @@ impl PhiAttention {
 
     /// Forward pass.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 
     /// Forward pass with optional KV cache.
@@ -513,6 +513,7 @@ impl PhiAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let mut cache = cache;
         let (batch, seq_len, _) = (x.dim(0), x.dim(1), x.dim(2));
@@ -551,7 +552,8 @@ impl PhiAttention {
             (q_rope_raw, k_rope_raw)
         };
 
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
+        let offset = cache.as_ref().map_or(0, |(c, _)| c.rope_offset());
+        let rope_positions = RopePositions::resolve(positions, offset);
         // SuRoPE/LongRoPE: rotate with the per-dimension factor-scaled inverse
         // frequencies, choosing the short or long table by how far this forward
         // actually reaches. The mscale above is the *value* scale; it must NOT
@@ -559,28 +561,31 @@ impl PhiAttention {
         // double-application bug — and plain `apply_rope` ignored the tables
         // entirely, falling back to un-scaled base frequencies).
         let (q_rope, k_rope) = if let Some(ref long_rope) = self.long_rope {
+            // Explicit positions only ever restart *within* the row, so the
+            // reach is still bounded by `seq_len` and the table choice holds
+            // without reading the position values back off the device.
             let freqs = long_rope.table_for(offset + seq_len - 1);
             (
-                apply_rope_with_freqs(&q_rope_raw, freqs, self.rope_dim, false, offset)?,
-                apply_rope_with_freqs(&k_rope_raw, freqs, self.rope_dim, false, offset)?,
+                rope_with_inv_freq(&q_rope_raw, rope_positions, freqs, self.rope_dim, false)?,
+                rope_with_inv_freq(&k_rope_raw, rope_positions, freqs, self.rope_dim, false)?,
             )
         } else {
             (
-                apply_rope(
+                rope(
                     &q_rope_raw,
+                    rope_positions,
                     self.rope_dim,
                     false,
                     self.rope_theta,
                     1.0,
-                    offset,
                 )?,
-                apply_rope(
+                rope(
                     &k_rope_raw,
+                    rope_positions,
                     self.rope_dim,
                     false,
                     self.rope_theta,
                     1.0,
-                    offset,
                 )?,
             )
         };
@@ -734,7 +739,7 @@ impl PhiDecoderLayer {
 
     /// Forward pass.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 
     /// Forward pass with optional KV cache.
@@ -746,6 +751,7 @@ impl PhiDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         std_pre_norm_forward(
             &mut self.input_layernorm,
@@ -755,6 +761,7 @@ impl PhiDecoderLayer {
             x,
             mask,
             cache,
+            positions,
         )
     }
 }
@@ -765,8 +772,9 @@ impl AttentionModule for PhiAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        PhiAttention::forward_with_cache(self, x, mask, cache)
+        PhiAttention::forward_with_cache(self, x, mask, cache, positions)
     }
 }
 
@@ -776,8 +784,9 @@ impl DecoderLayer for PhiDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        PhiDecoderLayer::forward_with_cache(self, x, mask, cache)
+        PhiDecoderLayer::forward_with_cache(self, x, mask, cache, positions)
     }
 }
 
@@ -824,7 +833,22 @@ impl PhiModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        self.forward_with_capture(input_ids, mask, cache, None)
+        self.forward_with_capture(input_ids, mask, cache, None, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. The block-diagonal mask keeps the content apart; this keeps the
+    /// positions apart.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, None, positions, None)
     }
 
     /// Forward pass with optional hidden-state capture for DFlash
@@ -835,6 +859,7 @@ impl PhiModel {
         input_ids: &Array,
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         let mut hidden = self.embed_tokens.forward(input_ids);
@@ -856,11 +881,15 @@ impl PhiModel {
             // A cache means generation, which has no backward pass for the
             // recompute to pay for.
             hidden = if grad_checkpoint && c.is_none() {
-                checkpointed_layer(layer, &hidden, mask, |layer, h, mask| {
-                    layer.forward_with_cache(h, mask, None)
-                })?
+                checkpointed_layer(
+                    layer,
+                    &hidden,
+                    mask,
+                    positions,
+                    |layer, h, mask, positions| layer.forward_with_cache(h, mask, None, positions),
+                )?
             } else {
-                layer.forward_with_cache(&hidden, mask, c)?
+                layer.forward_with_cache(&hidden, mask, c, positions)?
             };
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(idx)
@@ -930,6 +959,20 @@ impl PhiForCausalLM {
         self.project_logits(&hidden)
     }
 
+    /// Forward pass with one rotary position per token; see
+    /// `forward_with_positions` on the inner model.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let hidden = self
+            .model
+            .forward_with_positions(input_ids, mask, positions)?;
+        self.project_logits(&hidden)
+    }
+
     /// Forward pass that records hidden states into a DFlash capture
     /// buffer at every requested layer index.
     pub fn forward_with_capture(
@@ -939,9 +982,9 @@ impl PhiForCausalLM {
         cache: Option<&mut KVCache>,
         capture: &mut pmetal_mlx::speculative::SpecCapture,
     ) -> Result<Array, Exception> {
-        let hidden = self
-            .model
-            .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+        let hidden =
+            self.model
+                .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
         self.project_logits(&hidden)
     }
 

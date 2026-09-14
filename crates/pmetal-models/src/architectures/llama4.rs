@@ -1006,12 +1006,13 @@ impl Llama4TextModel {
         let grad_checkpoint = self.grad_checkpoint;
         for layer in &mut self.layers {
             hidden_states = if grad_checkpoint {
-                // Owned per iteration, then moved in: a captured `&Array` would
-                // dangle when the backward pass re-runs this closure.
-                let positions = position_ids.cloned();
-                checkpointed_layer(layer, &hidden_states, mask, move |layer, h, mask| {
-                    layer.forward(h, mask, positions.as_ref())
-                })?
+                checkpointed_layer(
+                    layer,
+                    &hidden_states,
+                    mask,
+                    position_ids,
+                    |layer, h, mask, positions| layer.forward(h, mask, positions),
+                )?
             } else {
                 layer.forward(&hidden_states, mask, position_ids)?
             };
@@ -1081,6 +1082,19 @@ impl Llama4ForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward(input_ids, mask, position_ids)?;
         Module::forward(&mut self.lm_head, &hidden_states)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Llama 4 already carries positions through its forward, so this is the
+    /// same call under the name every architecture answers to.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward(input_ids, mask, positions)
     }
 
     /// Forward pass accepting a KV cache parameter for API compatibility.

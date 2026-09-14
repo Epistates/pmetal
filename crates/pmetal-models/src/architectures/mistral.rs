@@ -10,7 +10,10 @@ use pmetal_bridge::impl_module_params;
 
 use std::collections::HashMap;
 
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{RopePositions, rope},
+};
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
 
@@ -216,7 +219,7 @@ impl MistralAttention {
 
     /// Forward pass through attention with optional sliding window using fused kernels.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 
     /// Forward pass with optional KV cache.
@@ -225,6 +228,7 @@ impl MistralAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let batch = shape[0];
@@ -247,17 +251,30 @@ impl MistralAttention {
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
 
-        // Apply RoPE
-        let (queries, keys, values) = if let Some((cache_ref, _)) = cache.as_ref() {
-            let offset = cache_ref.rope_offset();
-            let queries = apply_rope(&queries, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-            let keys = apply_rope(&keys, self.head_dim, false, self.rope_theta, 1.0, offset)?;
-            (queries, keys, values)
-        } else {
-            let queries = Module::forward(&mut self.rope, &queries)?;
-            let keys = Module::forward(&mut self.rope, &keys)?;
-            (queries, keys, values)
-        };
+        // Apply RoPE. Explicit positions win over the cache offset: a packed
+        // batch has no cache, and a cached decode has no explicit positions.
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache
+                .as_ref()
+                .map_or(0, |(cache_ref, _)| cache_ref.rope_offset()),
+        );
+        let queries = rope(
+            &queries,
+            rope_positions,
+            self.head_dim,
+            false,
+            self.rope_theta,
+            1.0,
+        )?;
+        let keys = rope(
+            &keys,
+            rope_positions,
+            self.head_dim,
+            false,
+            self.rope_theta,
+            1.0,
+        )?;
 
         // Determine mask type for fused attention
         let mask_type = if mask.is_some() {
@@ -397,7 +414,7 @@ impl MistralDecoderLayer {
 
     /// Forward pass.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 
     /// Forward pass with optional KV cache.
@@ -409,6 +426,7 @@ impl MistralDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         std_pre_norm_forward(
             &mut self.input_layernorm,
@@ -418,6 +436,7 @@ impl MistralDecoderLayer {
             x,
             mask,
             cache,
+            positions,
         )
     }
 }
@@ -428,8 +447,9 @@ impl AttentionModule for MistralAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        MistralAttention::forward_with_cache(self, x, mask, cache)
+        MistralAttention::forward_with_cache(self, x, mask, cache, positions)
     }
 }
 
@@ -439,8 +459,9 @@ impl DecoderLayer for MistralDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        MistralDecoderLayer::forward_with_cache(self, x, mask, cache)
+        MistralDecoderLayer::forward_with_cache(self, x, mask, cache, positions)
     }
 }
 
@@ -495,7 +516,22 @@ impl MistralModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        self.forward_with_capture(input_ids, mask, cache, None)
+        self.forward_with_capture(input_ids, mask, cache, None, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. The block-diagonal mask keeps the content apart; this keeps the
+    /// positions apart.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, None, positions, None)
     }
 
     /// Forward pass with optional hidden-state capture for DFlash
@@ -506,6 +542,7 @@ impl MistralModel {
         input_ids: &Array,
         mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         // Get embeddings
@@ -533,11 +570,15 @@ impl MistralModel {
             // A cache means generation, which has no backward pass for the
             // recompute to pay for.
             hidden_states = if grad_checkpoint && c.is_none() {
-                checkpointed_layer(layer, &hidden_states, mask, |layer, h, mask| {
-                    layer.forward_with_cache(h, mask, None)
-                })?
+                checkpointed_layer(
+                    layer,
+                    &hidden_states,
+                    mask,
+                    positions,
+                    |layer, h, mask, positions| layer.forward_with_cache(h, mask, None, positions),
+                )?
             } else {
-                layer.forward_with_cache(&hidden_states, mask, c)?
+                layer.forward_with_cache(&hidden_states, mask, c, positions)?
             };
             if let Some(buf) = capture.as_deref_mut()
                 && buf.wants_hidden_for(idx)
@@ -592,13 +633,30 @@ impl MistralForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
+        self.lm_head_forward(&hidden_states)
+    }
 
-        // Get logits from LM head or shared embeddings
+    /// Forward pass with one rotary position per token; see
+    /// [`MistralModel::forward_with_positions`].
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self
+            .model
+            .forward_with_positions(input_ids, mask, positions)?;
+        self.lm_head_forward(&hidden_states)
+    }
+
+    /// Project hidden states to vocabulary logits, through the LM head when
+    /// the checkpoint has one and the tied embedding otherwise.
+    fn lm_head_forward(&mut self, hidden_states: &Array) -> Result<Array, Exception> {
         if let Some(ref mut lm_head) = self.lm_head {
-            Module::forward(lm_head, &hidden_states)
+            Module::forward(lm_head, hidden_states)
         } else {
-            // Tie weights: use embedding weight transposed
-            Ok(self.model.embed_tokens.as_linear(&hidden_states))
+            Ok(self.model.embed_tokens.as_linear(hidden_states))
         }
     }
 
@@ -613,7 +671,7 @@ impl MistralForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden_states =
             self.model
-                .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+                .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
         if let Some(ref mut lm_head) = self.lm_head {
             Module::forward(lm_head, &hidden_states)
         } else {

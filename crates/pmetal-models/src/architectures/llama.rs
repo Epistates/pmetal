@@ -9,7 +9,7 @@ use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, differentiable_attention, fused_sdpa,
     get_training_context,
-    rope::{RopeScaling, apply_rope, apply_rope_scaled},
+    rope::{RopePositions, RopeScaling, apply_rope, apply_rope_scaled, rope, rope_with_periods},
 };
 use pmetal_mlx::kv_cache::KVCache;
 use serde::{Deserialize, Serialize};
@@ -243,29 +243,24 @@ impl LlamaAttention {
         })
     }
 
-    /// Rotate `x` by RoPE at absolute position `offset`.
+    /// Rotate `x` by RoPE at `positions`.
     ///
     /// Routes through the per-dimension period table when the checkpoint ships
     /// Llama 3 frequency-band scaling, and through the scalar base otherwise.
-    /// Both are the fused `mx.fast.rope` kernel, so the banded path costs no
-    /// more than the plain one.
-    fn apply_rotary(&self, x: &Array, offset: i32) -> Result<Array, Exception> {
+    /// A contiguous run stays on the fused `mx.fast.rope` kernel either way, so
+    /// the banded path costs no more than the plain one.
+    fn apply_rotary(&self, x: &Array, positions: RopePositions<'_>) -> Result<Array, Exception> {
         match self.rope_periods.as_ref() {
-            Some(periods) => Ok(pmetal_bridge::compat::fast::rope_with_freqs(
+            Some(periods) => {
+                rope_with_periods(x, positions, periods, self.head_dim, false, self.rope_scale)
+            }
+            None => rope(
                 x,
-                self.head_dim,
-                false,
-                self.rope_scale,
-                offset,
-                periods,
-            )),
-            None => apply_rope(
-                x,
+                positions,
                 self.head_dim,
                 false,
                 self.effective_base,
                 self.rope_scale,
-                offset,
             ),
         }
     }
@@ -285,7 +280,7 @@ impl LlamaAttention {
     /// Output tensor of shape [batch, seq_len, hidden_size]
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
         // Non-cached forward - delegate to cached version with None
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 
     /// Forward pass with optional KV cache for efficient generation.
@@ -307,6 +302,7 @@ impl LlamaAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let batch = shape[0];
@@ -329,26 +325,16 @@ impl LlamaAttention {
             .reshape(&[batch, seq_len, self.n_kv_heads, self.head_dim])
             .transpose_axes(&[0, 2, 1, 3]);
 
-        // Get RoPE offset and apply RoPE. The prebuilt `self.rope` module
-        // carries a scalar base, so a Llama 3 banded config has to take the
-        // explicit path even at offset 0.
-        let (queries, keys) = match (cache.as_ref(), self.rope_periods.is_some()) {
-            (Some((cache_ref, _layer_idx)), _) => {
-                let offset = cache_ref.rope_offset();
-                (
-                    self.apply_rotary(&queries, offset)?,
-                    self.apply_rotary(&keys, offset)?,
-                )
-            }
-            (None, true) => (
-                self.apply_rotary(&queries, 0)?,
-                self.apply_rotary(&keys, 0)?,
-            ),
-            (None, false) => (
-                Module::forward(&mut self.rope, &queries)?,
-                Module::forward(&mut self.rope, &keys)?,
-            ),
-        };
+        // Explicit positions win over the cache offset: a packed batch has no
+        // cache, and a cached decode never has explicit positions.
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache
+                .as_ref()
+                .map_or(0, |(cache_ref, _layer_idx)| cache_ref.rope_offset()),
+        );
+        let queries = self.apply_rotary(&queries, rope_positions)?;
+        let keys = self.apply_rotary(&keys, rope_positions)?;
 
         // Use fused attention kernel - handles GQA natively (no KV head expansion needed)
         let attn_config = FusedAttentionConfig::new(self.n_heads, self.n_kv_heads, self.head_dim)
@@ -501,7 +487,7 @@ impl LlamaDecoderLayer {
 
     /// Forward pass.
     pub fn forward(&mut self, x: &Array, mask: Option<&Array>) -> Result<Array, Exception> {
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 
     /// Forward pass with optional KV cache.
@@ -516,6 +502,7 @@ impl LlamaDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         std_pre_norm_forward(
             &mut self.input_layernorm,
@@ -525,6 +512,7 @@ impl LlamaDecoderLayer {
             x,
             mask,
             cache,
+            positions,
         )
     }
 }
@@ -535,8 +523,9 @@ impl AttentionModule for LlamaAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        LlamaAttention::forward_with_cache(self, x, mask, cache)
+        LlamaAttention::forward_with_cache(self, x, mask, cache, positions)
     }
 }
 
@@ -546,8 +535,9 @@ impl DecoderLayer for LlamaDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        LlamaDecoderLayer::forward_with_cache(self, x, mask, cache)
+        LlamaDecoderLayer::forward_with_cache(self, x, mask, cache, positions)
     }
 }
 
@@ -617,7 +607,22 @@ impl LlamaModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        self.forward_with_capture(input_ids, mask, cache, None)
+        self.forward_with_capture(input_ids, mask, cache, None, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. The block-diagonal mask keeps the content apart; this keeps the
+    /// positions apart.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, None, positions, None)
     }
 
     /// Forward pass with optional hidden-state capture for DFlash
@@ -629,6 +634,7 @@ impl LlamaModel {
         input_ids: &Array,
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         // Get embeddings
@@ -648,8 +654,12 @@ impl LlamaModel {
         match cache {
             Some(cache) => {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                    hidden_states =
-                        layer.forward_with_cache(&hidden_states, mask, Some((cache, layer_idx)))?;
+                    hidden_states = layer.forward_with_cache(
+                        &hidden_states,
+                        mask,
+                        Some((cache, layer_idx)),
+                        positions,
+                    )?;
                     if let Some(buf) = capture.as_deref_mut()
                         && buf.wants_hidden_for(layer_idx)
                     {
@@ -662,11 +672,17 @@ impl LlamaModel {
                 let grad_checkpoint = self.grad_checkpoint;
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                     hidden_states = if grad_checkpoint {
-                        checkpointed_layer(layer, &hidden_states, mask, |layer, h, mask| {
-                            layer.forward(h, mask)
-                        })?
+                        checkpointed_layer(
+                            layer,
+                            &hidden_states,
+                            mask,
+                            positions,
+                            |layer, h, mask, positions| {
+                                layer.forward_with_cache(h, mask, None, positions)
+                            },
+                        )?
                     } else {
-                        layer.forward(&hidden_states, mask)?
+                        layer.forward_with_cache(&hidden_states, mask, None, positions)?
                     };
                     if let Some(buf) = capture.as_deref_mut()
                         && buf.wants_hidden_for(layer_idx)
@@ -738,13 +754,30 @@ impl LlamaForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
+        self.lm_head_forward(&hidden_states)
+    }
 
-        // Get logits from LM head or shared embeddings
+    /// Forward pass with one rotary position per token; see
+    /// [`LlamaModel::forward_with_positions`].
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self
+            .model
+            .forward_with_positions(input_ids, mask, positions)?;
+        self.lm_head_forward(&hidden_states)
+    }
+
+    /// Project hidden states to vocabulary logits, through the LM head when
+    /// the checkpoint has one and the tied embedding otherwise.
+    fn lm_head_forward(&mut self, hidden_states: &Array) -> Result<Array, Exception> {
         if let Some(ref mut lm_head) = self.lm_head {
-            Module::forward(lm_head, &hidden_states)
+            Module::forward(lm_head, hidden_states)
         } else {
-            // Tie weights: use embedding weight transposed
-            Ok(self.model.embed_tokens.as_linear(&hidden_states))
+            Ok(self.model.embed_tokens.as_linear(hidden_states))
         }
     }
 
@@ -759,12 +792,8 @@ impl LlamaForCausalLM {
     ) -> Result<Array, Exception> {
         let hidden_states =
             self.model
-                .forward_with_capture(input_ids, mask, cache, Some(capture))?;
-        if let Some(ref mut lm_head) = self.lm_head {
-            Module::forward(lm_head, &hidden_states)
-        } else {
-            Ok(self.model.embed_tokens.as_linear(&hidden_states))
-        }
+                .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
+        self.lm_head_forward(&hidden_states)
     }
 
     /// Fused batched decode forward.

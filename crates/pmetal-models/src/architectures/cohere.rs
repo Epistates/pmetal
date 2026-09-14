@@ -14,7 +14,10 @@ use pmetal_bridge::compat::{
 };
 use pmetal_bridge::impl_module_params;
 
-use pmetal_mlx::kernels::{AttentionMaskType, FusedAttentionConfig, fused_sdpa, rope::apply_rope};
+use pmetal_mlx::kernels::{
+    AttentionMaskType, FusedAttentionConfig, fused_sdpa,
+    rope::{RopePositions, rope},
+};
 use pmetal_mlx::kv_cache::KVCache;
 
 use serde::{Deserialize, Serialize};
@@ -272,7 +275,7 @@ impl CohereAttention {
         mask: Option<&Array>,
         _position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 
     /// Forward pass with optional KV cache.
@@ -290,6 +293,7 @@ impl CohereAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let batch = x.shape()[0];
         let seq_len = x.shape()[1];
@@ -314,9 +318,26 @@ impl CohereAttention {
         // rotates adjacent pairs, and mlx-lm builds `nn.RoPE(..., traditional=True)`.
         // The split-half (`traditional=false`) form rotates the wrong element
         // pairs and silently corrupts every attention score.
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let q = apply_rope(&q, self.head_dim, true, self.rope_theta, 1.0, offset)?;
-        let k = apply_rope(&k, self.head_dim, true, self.rope_theta, 1.0, offset)?;
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+        );
+        let q = rope(
+            &q,
+            rope_positions,
+            self.head_dim,
+            true,
+            self.rope_theta,
+            1.0,
+        )?;
+        let k = rope(
+            &k,
+            rope_positions,
+            self.head_dim,
+            true,
+            self.rope_theta,
+            1.0,
+        )?;
 
         let (k, v) = if let Some((cache, layer_idx)) = cache {
             cache.update_and_fetch(layer_idx, &k, &v)?
@@ -346,8 +367,9 @@ impl AttentionModule for CohereAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        CohereAttention::forward_with_cache(self, x, mask, cache)
+        CohereAttention::forward_with_cache(self, x, mask, cache, positions)
     }
 }
 
@@ -393,7 +415,7 @@ impl CohereDecoderLayer {
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
         let _ = position_ids;
-        self.forward_with_cache(x, mask, None)
+        self.forward_with_cache(x, mask, None, None)
     }
 
     /// Cohere parallel decoder block with optional KV cache.
@@ -405,9 +427,12 @@ impl CohereDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let normed = Module::forward(&mut self.input_layernorm, x)?;
-        let attn_out = self.self_attn.forward_with_cache(&normed, mask, cache)?;
+        let attn_out = self
+            .self_attn
+            .forward_with_cache(&normed, mask, cache, positions)?;
         let ffn_out = self.mlp.forward(&normed)?;
         Ok(x.add(&attn_out).add(&ffn_out))
     }
@@ -454,15 +479,44 @@ impl CohereModel {
         mask: Option<&Array>,
         position_ids: Option<&Array>,
     ) -> Result<Array, Exception> {
-        let _ = position_ids;
-        self.forward_with_cache(input_ids, mask, None)
+        self.forward_inner(input_ids, mask, None, position_ids)
     }
 
     pub fn forward_with_cache(
         &mut self,
         input_ids: &Array,
         mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_inner(input_ids, mask, cache, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. The block-diagonal mask keeps the content apart; this keeps the
+    /// positions apart.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_inner(input_ids, mask, None, positions)
+    }
+
+    /// The layer loop, with every per-call input the layers can take.
+    ///
+    /// `positions` carries one rotary position per token, `[seq_len]`, which
+    /// is what a packed batch needs so the second sequence in a row restarts
+    /// at 0 rather than continuing the first.
+    fn forward_inner(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let mut hidden_states = Module::forward(&mut self.embed_tokens, input_ids)?;
 
@@ -473,11 +527,15 @@ impl CohereModel {
             // A cache means generation, which has no backward pass for the
             // recompute to pay for.
             hidden_states = if grad_checkpoint && c.is_none() {
-                checkpointed_layer(layer, &hidden_states, mask, |layer, h, mask| {
-                    layer.forward_with_cache(h, mask, None)
-                })?
+                checkpointed_layer(
+                    layer,
+                    &hidden_states,
+                    mask,
+                    positions,
+                    |layer, h, mask, positions| layer.forward_with_cache(h, mask, None, positions),
+                )?
             } else {
-                layer.forward_with_cache(&hidden_states, mask, c)?
+                layer.forward_with_cache(&hidden_states, mask, c, positions)?
             };
         }
 
@@ -548,6 +606,20 @@ impl CohereForCausalLM {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward_with_cache(input_ids, mask, cache)?;
+        self.lm_head_forward(&hidden_states)
+    }
+
+    /// Forward pass with one rotary position per token; see
+    /// `forward_with_positions` on the inner model.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self
+            .model
+            .forward_with_positions(input_ids, mask, positions)?;
         self.lm_head_forward(&hidden_states)
     }
 

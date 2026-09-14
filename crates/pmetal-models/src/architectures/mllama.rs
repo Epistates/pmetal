@@ -1053,11 +1053,14 @@ impl MllamaTextDecoderLayer {
         mask: Option<&Array>,
         cross: Option<&CrossAttentionInputs>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let normed = self.input_layernorm.forward(x);
 
         let attn = match (self.self_attn.as_mut(), self.cross_attn.as_ref()) {
-            (Some(self_attn), _) => self_attn.forward_with_cache(&normed, mask, cache)?,
+            (Some(self_attn), _) => {
+                self_attn.forward_with_cache(&normed, mask, cache, positions)?
+            }
             (None, Some(cross_attn)) => {
                 let cross = cross.ok_or_else(|| {
                     Exception::custom(
@@ -1183,7 +1186,33 @@ impl MllamaTextModel {
         input_ids: &Array,
         cross: Option<&CrossAttentionInputs>,
         mask: Option<&Array>,
+        cache: Option<&mut KVCache>,
+    ) -> Result<Array, Exception> {
+        self.forward_inner(input_ids, cross, mask, cache, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. Cross-attention layers read the vision features and never rotate.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        cross: Option<&CrossAttentionInputs>,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_inner(input_ids, cross, mask, None, positions)
+    }
+
+    fn forward_inner(
+        &mut self,
+        input_ids: &Array,
+        cross: Option<&CrossAttentionInputs>,
+        mask: Option<&Array>,
         mut cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let mut hidden_states = self.embed_tokens.forward(input_ids);
 
@@ -1206,7 +1235,7 @@ impl MllamaTextModel {
             // their cache slot untouched; indexing by the true layer id keeps
             // the remaining slots aligned with the reference's.
             let slot = cache.as_deref_mut().map(|c| (c, layer_idx));
-            hidden_states = layer.forward(&hidden_states, mask, cross, slot)?;
+            hidden_states = layer.forward(&hidden_states, mask, cross, slot, positions)?;
         }
 
         Ok(self.norm.forward(&hidden_states))
@@ -1321,6 +1350,20 @@ impl MllamaForConditionalGeneration {
         let hidden_states = self
             .language_model
             .forward_with_cache(input_ids, cross, mask, cache)?;
+        Ok(self.lm_head.forward(&hidden_states))
+    }
+
+    /// Forward pass with one rotary position per token; see
+    /// [`MllamaTextModel::forward_with_positions`].
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self
+            .language_model
+            .forward_with_positions(input_ids, None, mask, positions)?;
         Ok(self.lm_head.forward(&hidden_states))
     }
 

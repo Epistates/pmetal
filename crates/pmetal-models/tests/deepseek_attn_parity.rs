@@ -59,7 +59,7 @@ fn deepseek_attention_synthetic_parity() {
     let x = ref_tensor(&shard, "x").clone();
     let mask = ref_tensor(&shard, "mask").clone();
     let y = attn
-        .forward(&x, Some(&mask), None)
+        .forward(&x, Some(&mask), None, None)
         .expect("attention forward");
 
     let report = ParityReport::compute_with_per_position(

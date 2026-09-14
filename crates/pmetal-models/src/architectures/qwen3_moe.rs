@@ -13,7 +13,7 @@ use pmetal_bridge::compat::{
 use pmetal_bridge::impl_module_params;
 use pmetal_mlx::kernels::{
     AttentionMaskType, FusedAttentionConfig, fused_sdpa,
-    rope::{RopeScaling, apply_rope},
+    rope::{RopePositions, RopeScaling, rope},
 };
 use pmetal_mlx::kv_cache::KVCache;
 // MoE block uses pmetal_mlx::moe::Expert directly for individual expert MLPs
@@ -264,6 +264,7 @@ impl Qwen3MoEAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         let shape = x.shape();
         let batch = shape[0];
@@ -290,22 +291,25 @@ impl Qwen3MoEAttention {
         let v = v.transpose_axes(&[0, 2, 1, 3]);
 
         // Apply RoPE
-        let offset = cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0);
-        let q = apply_rope(
+        let rope_positions = RopePositions::resolve(
+            positions,
+            cache.as_ref().map(|(c, _)| c.rope_offset()).unwrap_or(0),
+        );
+        let q = rope(
             &q,
+            rope_positions,
             self.head_dim,
             false,
             self.effective_base,
             self.rope_scale,
-            offset,
         )?;
-        let k = apply_rope(
+        let k = rope(
             &k,
+            rope_positions,
             self.head_dim,
             false,
             self.effective_base,
             self.rope_scale,
-            offset,
         )?;
 
         // Use fused SDPA
@@ -814,6 +818,7 @@ impl Qwen3MoEDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
         std_pre_norm_forward(
             &mut self.input_layernorm,
@@ -823,6 +828,7 @@ impl Qwen3MoEDecoderLayer {
             x,
             mask,
             cache,
+            positions,
         )
     }
 
@@ -838,8 +844,9 @@ impl AttentionModule for Qwen3MoEAttention {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        Qwen3MoEAttention::forward(self, x, mask, cache)
+        Qwen3MoEAttention::forward(self, x, mask, cache, positions)
     }
 }
 
@@ -855,8 +862,9 @@ impl DecoderLayer for Qwen3MoEDecoderLayer {
         x: &Array,
         mask: Option<&Array>,
         cache: Option<(&mut KVCache, usize)>,
+        positions: Option<&Array>,
     ) -> Result<Array, Exception> {
-        Qwen3MoEDecoderLayer::forward(self, x, mask, cache)
+        Qwen3MoEDecoderLayer::forward(self, x, mask, cache, positions)
     }
 }
 
@@ -907,7 +915,22 @@ impl Qwen3MoEModel {
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
-        self.forward_with_capture(input_ids, mask, cache, None)
+        self.forward_with_capture(input_ids, mask, cache, None, None)
+    }
+
+    /// Forward pass with one rotary position per token, `[seq_len]`.
+    ///
+    /// Packed training concatenates several sequences into one row, so the
+    /// positions have to restart at each boundary instead of running through
+    /// it. The block-diagonal mask keeps the content apart; this keeps the
+    /// positions apart.
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        self.forward_with_capture(input_ids, mask, None, positions, None)
     }
 
     /// Forward pass with optional hidden-state capture for DFlash
@@ -917,6 +940,7 @@ impl Qwen3MoEModel {
         input_ids: &Array,
         mask: Option<&Array>,
         cache: Option<&mut KVCache>,
+        positions: Option<&Array>,
         mut capture: Option<&mut pmetal_mlx::speculative::SpecCapture>,
     ) -> Result<Array, Exception> {
         let mut h = self.embed_tokens.forward(input_ids);
@@ -924,7 +948,7 @@ impl Qwen3MoEModel {
         match cache {
             Some(cache) => {
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
-                    h = layer.forward(&h, mask, Some((cache, layer_idx)))?;
+                    h = layer.forward(&h, mask, Some((cache, layer_idx)), positions)?;
                     if let Some(buf) = capture.as_deref_mut()
                         && buf.wants_hidden_for(layer_idx)
                     {
@@ -937,11 +961,15 @@ impl Qwen3MoEModel {
                 let grad_checkpoint = self.grad_checkpoint;
                 for (layer_idx, layer) in self.layers.iter_mut().enumerate() {
                     h = if grad_checkpoint {
-                        checkpointed_layer(layer, &h, mask, |layer, h, mask| {
-                            layer.forward(h, mask, None)
-                        })?
+                        checkpointed_layer(
+                            layer,
+                            &h,
+                            mask,
+                            positions,
+                            |layer, h, mask, positions| layer.forward(h, mask, None, positions),
+                        )?
                     } else {
-                        layer.forward(&h, mask, None)?
+                        layer.forward(&h, mask, None, positions)?
                     };
                     if let Some(buf) = capture.as_deref_mut()
                         && buf.wants_hidden_for(layer_idx)
@@ -1010,9 +1038,26 @@ impl Qwen3MoE {
         cache: Option<&mut KVCache>,
     ) -> Result<Array, Exception> {
         let hidden_states = self.model.forward(input_ids, mask, cache)?;
+        self.project_logits(&hidden_states)
+    }
 
+    /// Forward pass with one rotary position per token; see
+    /// [`Qwen3MoEModel::forward_with_positions`].
+    pub fn forward_with_positions(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+        positions: Option<&Array>,
+    ) -> Result<Array, Exception> {
+        let hidden_states = self
+            .model
+            .forward_with_positions(input_ids, mask, positions)?;
+        self.project_logits(&hidden_states)
+    }
+
+    fn project_logits(&mut self, hidden_states: &Array) -> Result<Array, Exception> {
         if let Some(ref mut head) = self.lm_head {
-            Ok(head.forward(&hidden_states))
+            Ok(head.forward(hidden_states))
         } else {
             // Tied embeddings: use embed_tokens weight as linear projection
             // embed_tokens.weight is [vocab, hidden], so logits = hidden @ weight.T
@@ -1032,7 +1077,7 @@ impl Qwen3MoE {
     ) -> Result<Array, Exception> {
         let hidden_states =
             self.model
-                .forward_with_capture(input_ids, mask, cache, Some(capture))?;
+                .forward_with_capture(input_ids, mask, cache, None, Some(capture))?;
         if let Some(ref mut head) = self.lm_head {
             Ok(head.forward(&hidden_states))
         } else {

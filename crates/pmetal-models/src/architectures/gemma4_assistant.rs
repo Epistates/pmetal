@@ -15,6 +15,7 @@ use pmetal_bridge::compat::{
     transforms,
 };
 use pmetal_bridge::impl_module_params;
+use pmetal_mlx::kernels::rope::RopePositions;
 use serde::{Deserialize, Serialize};
 
 use super::gemma4::{Gemma4Config, Gemma4Model, LoadReport};
@@ -319,7 +320,14 @@ impl Gemma4AssistantForCausalLM {
                 ))
             })?;
 
-            h = layer.forward_with_shared_kv(&h, None, &source.0, &source.1, position_id, None)?;
+            h = layer.forward_with_shared_kv(
+                &h,
+                None,
+                &source.0,
+                &source.1,
+                RopePositions::Offset(position_id),
+                None,
+            )?;
         }
         let hidden_state = self.model.norm.forward(&h);
         let backbone_hidden_state = self.post_projection.forward(&hidden_state);
