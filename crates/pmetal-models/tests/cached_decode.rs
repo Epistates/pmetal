@@ -156,6 +156,14 @@ fn ids(tokens: &[i32]) -> Array {
 /// geometry the tiny ones do not, and a cache error that a two-layer toy
 /// carries as a rounding difference compounds through forty-eight.
 ///
+/// It asserts on the **token**, not the logit magnitudes. A released bf16
+/// checkpoint is not held to the 1e-3 the f32 synthetic cases meet: Gemma 4's
+/// logits reach the ±30 softcap and its residual stream runs into the
+/// thousands, where one bf16 step is large enough that the two paths' accumulation
+/// orders part by a few percent on their own. A fixed epsilon there would
+/// measure the format. Picking a different token is the thing that ruins a
+/// generation, and it is format-independent.
+///
 /// Checkpoints are not committed, so this is `#[ignore]`d and gated:
 ///
 /// ```bash
@@ -192,10 +200,18 @@ fn a_real_checkpoint_decodes_what_it_recomputes() {
             argmax(&cached_row),
             argmax(&fresh_row)
         );
+        assert_eq!(
+            argmax(&cached_row),
+            argmax(&fresh_row),
+            "step {step}: cached decode and uncached recompute of the same {} tokens pick \
+             different tokens (logits differ by {diff:e}, relative {:e})",
+            prefix.len(),
+            diff / scale
+        );
         assert!(
-            diff / scale < 1e-2,
-            "step {step}: cached decode and uncached recompute disagree by {diff:e} \
-             (relative {:e})",
+            diff / scale < 0.5,
+            "step {step}: the two paths are {:e} apart relative, far past anything bf16 \
+             accumulation explains",
             diff / scale
         );
 
