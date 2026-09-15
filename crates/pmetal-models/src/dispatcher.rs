@@ -183,6 +183,36 @@ impl std::fmt::Display for ModelArchitecture {
 }
 
 impl ModelArchitecture {
+    /// The variant's name as a bare identifier, with no spacing or branding.
+    ///
+    /// Distinct from `Display`, which is prose for a human ("Qwen 3.5 / 3.6").
+    /// Callers compare this against a literal, so a spelling here is part of
+    /// the contract rather than a label.
+    pub fn identifier(self) -> &'static str {
+        match self {
+            Self::Llama => "Llama",
+            Self::Llama4 => "Llama4",
+            Self::Qwen2 => "Qwen2",
+            Self::Qwen3 => "Qwen3",
+            Self::Qwen3MoE => "Qwen3MoE",
+            Self::Gemma => "Gemma",
+            Self::Mistral => "Mistral",
+            Self::Phi => "Phi",
+            Self::Phi4 => "Phi4",
+            Self::DeepSeek => "DeepSeek",
+            Self::Cohere => "Cohere",
+            Self::Granite => "Granite",
+            Self::NemotronH => "NemotronH",
+            Self::Qwen3Next => "Qwen3Next",
+            Self::GptOss => "GptOss",
+            Self::Gemma4 => "Gemma4",
+            Self::Flux => "Flux",
+            Self::Bert => "Bert",
+            Self::DiffusionGemma => "DiffusionGemma",
+            Self::Mllama => "Mllama",
+        }
+    }
+
     pub fn from_model_type(model_type: &str) -> Option<Self> {
         let lower = model_type.to_lowercase();
         match lower.as_str() {

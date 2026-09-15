@@ -622,33 +622,37 @@ impl InferenceRunner {
                         other.architecture()
                     )));
                 }
+                // An adapted model wraps the same `DynamicModel` the standard
+                // arm above matches on, so the target is reached through it
+                // rather than through a LoRA-specific variant.
                 #[cfg(feature = "lora")]
-                LoadedModel::Lora(pmetal_lora::DynamicLoraModel::Qwen3Next(target)) => {
-                    let mut mtp = load_qwen3_next_mtp_from_dir(qwen_mtp_path, target.config())?;
-                    validate_qwen3_next_mtp_pair(target, &mtp)?;
-                    if config.fp8 {
-                        tracing::info!("Quantizing Qwen MTP weights to FP8 E4M3");
-                        mtp.quantize_fp8_weights()?;
+                LoadedModel::Lora(lora) => match lora.model() {
+                    DynamicModel::Qwen3Next(target) => {
+                        let mut mtp = load_qwen3_next_mtp_from_dir(qwen_mtp_path, &target.config)?;
+                        validate_qwen3_next_mtp_pair(target, &mtp)?;
+                        if config.fp8 {
+                            tracing::info!("Quantizing Qwen MTP weights to FP8 E4M3");
+                            mtp.quantize_fp8_weights()?;
+                        }
+                        let mtp_cache = mtp.create_cache(max_seq_len);
+                        let mtp_config = Qwen3NextMtpConfig {
+                            num_draft_tokens: config.qwen_mtp_draft_tokens.max(1),
+                        };
+                        tracing::info!(
+                            checkpoint = %qwen_mtp_path.display(),
+                            draft_tokens = mtp_config.num_draft_tokens,
+                            predictor_layers = mtp.config.mtp_num_hidden_layers(),
+                            "Qwen MTP loaded for LoRA-merged target"
+                        );
+                        (Some(mtp), Some(mtp_cache), Some(mtp_config))
                     }
-                    let mtp_cache = mtp.create_cache(max_seq_len);
-                    let mtp_config = Qwen3NextMtpConfig {
-                        num_draft_tokens: config.qwen_mtp_draft_tokens.max(1),
-                    };
-                    tracing::info!(
-                        checkpoint = %qwen_mtp_path.display(),
-                        draft_tokens = mtp_config.num_draft_tokens,
-                        predictor_layers = mtp.config.mtp_num_hidden_layers(),
-                        "Qwen MTP loaded for LoRA-merged target"
-                    );
-                    (Some(mtp), Some(mtp_cache), Some(mtp_config))
-                }
-                #[cfg(feature = "lora")]
-                LoadedModel::Lora(other) => {
-                    return Err(Exception::custom(format!(
-                        "Qwen MTP requires a Qwen3Next/Qwen3.6 target model; got {:?}",
-                        other.architecture()
-                    )));
-                }
+                    other => {
+                        return Err(Exception::custom(format!(
+                            "Qwen MTP requires a Qwen3Next/Qwen3.6 target model; got {:?}",
+                            other.architecture()
+                        )));
+                    }
+                },
                 LoadedModel::NativeOnly => {
                     let target_config = load_qwen3_next_config_for_mtp(model_path)?;
                     let mut mtp = load_qwen3_next_mtp_from_dir(qwen_mtp_path, &target_config)?;
@@ -833,8 +837,8 @@ impl InferenceGenState {
                     model.architecture()
                 ))),
                 #[cfg(feature = "lora")]
-                LoadedModel::Lora(pmetal_lora::DynamicLoraModel::Qwen3Next(ref mut target)) => {
-                    generate_qwen3_next_mtp_streaming_rebuild(
+                LoadedModel::Lora(ref mut lora) => match lora.model_mut() {
+                    DynamicModel::Qwen3Next(target) => generate_qwen3_next_mtp_streaming_rebuild(
                         target,
                         mtp,
                         &self.input_ids,
@@ -844,13 +848,12 @@ impl InferenceGenState {
                         mtp_cache,
                         qwen_mtp_config,
                         on_token_guarded,
-                    )
-                }
-                #[cfg(feature = "lora")]
-                LoadedModel::Lora(ref model) => Err(Exception::custom(format!(
-                    "Qwen MTP requires a Qwen3Next/Qwen3.6 target model; got {:?}",
-                    model.architecture()
-                ))),
+                    ),
+                    other => Err(Exception::custom(format!(
+                        "Qwen MTP requires a Qwen3Next/Qwen3.6 target model; got {:?}",
+                        other.architecture()
+                    ))),
+                },
                 LoadedModel::NativeOnly => {
                     crate::native_inference::run_qwen3_native_mtp_inference_ext(
                         &self.model_path,

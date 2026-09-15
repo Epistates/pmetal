@@ -134,7 +134,20 @@ pub(crate) async fn run_grpo_cli(
         }
     }
 
-    // 4. Load Model (Trainable LoRA)
+    // 4. Resolve the reward model's path before loading anything, so a bad ID
+    // fails now rather than after minutes of weight loading. It also has to
+    // happen here: a loaded model is not `Send`, and holding one across this
+    // `await` would make the whole command's future unspawnable.
+    let resolved_reward_model_path = match reward_model_path {
+        Some(ref rm_path_str) => Some(
+            pmetal_hub::resolve_model_path(rm_path_str, None, None)
+                .await
+                .map(|path| (rm_path_str.clone(), path))?,
+        ),
+        None => None,
+    };
+
+    // 5. Load Model (Trainable LoRA)
     tracing::info!("Loading model with LoRA...");
     let lora_config = LoraConfig {
         r: lora_r,
@@ -251,18 +264,14 @@ pub(crate) async fn run_grpo_cli(
         rewards = rewards.add(Box::new(DummyReward), 1.0);
     }
 
-    // 6b. Load ML reward model if configured.
-    if let Some(ref rm_path_str) = reward_model_path {
+    // 6b. Load ML reward model if configured. Its path was resolved in step 4.
+    if let Some((ref rm_path_str, ref rm_path)) = resolved_reward_model_path {
         if emit_console_output {
             println!("Loading ML reward model: {}", rm_path_str);
         }
         tracing::info!("Loading ML reward model from: {}", rm_path_str);
 
-        // Resolve the reward model path — download from HF if it looks like a
-        // model ID and doesn't exist locally.
-        let rm_path = pmetal_hub::resolve_model_path(rm_path_str, None, None).await?;
-
-        let rm_tokenizer = pmetal_data::Tokenizer::from_model_dir(&rm_path)
+        let rm_tokenizer = pmetal_data::Tokenizer::from_model_dir(rm_path)
             .map_err(|e| anyhow::anyhow!("Failed to load reward model tokenizer: {}", e))?;
 
         let rm_config = pmetal_trainer::reward_model::RewardModelConfig {
