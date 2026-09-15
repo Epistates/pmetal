@@ -42,9 +42,7 @@ pub mod adapted;
 mod adapter;
 pub mod arch_config;
 pub mod autograd;
-pub mod cohere_lora;
 pub mod cohere_qlora;
-pub mod deepseek_lora;
 pub mod deepseek_qlora;
 mod dora;
 mod dynamic;
@@ -52,29 +50,22 @@ mod dynamic_qlora;
 pub mod galore;
 pub mod gemma4_lora;
 pub mod gemma4_qlora;
-pub mod gemma_lora;
 pub mod gemma_qlora;
 pub mod gpt_oss_lora;
 pub mod gpt_oss_qlora;
-pub mod granite_lora;
 pub mod granite_qlora;
 pub mod llama4_lora;
 pub mod llama4_qlora;
-pub mod llama_lora;
 pub mod llama_qlora;
 mod lora;
 pub mod lora_helpers;
-pub mod mistral_lora;
 pub mod mistral_qlora;
-pub mod mllama_lora;
 pub mod nemotron_h_lora;
 pub mod nemotron_h_qlora;
 mod patcher;
-pub mod phi_lora;
 pub mod phi_qlora;
 mod qblora;
 mod qlora;
-pub mod qwen3_lora;
 pub mod qwen3_moe_lora;
 pub mod qwen3_moe_qlora;
 pub mod qwen3_next_lora;
@@ -89,9 +80,7 @@ pub use autograd::{
     AccumulatedLoraGrads, LoraForwardSaved, LoraGradContext, LoraGrads, MlpForwardSaved,
     MlpLoraGrads, fused_mlp_backward, fused_mlp_forward, lora_backward, lora_forward_with_grad,
 };
-pub use cohere_lora::*;
 pub use cohere_qlora::*;
-pub use deepseek_lora::*;
 pub use deepseek_qlora::*;
 pub use dora::*;
 pub use dynamic::*;
@@ -99,15 +88,12 @@ pub use dynamic_qlora::DynamicQloraModel;
 pub use galore::{
     GaloreConfig, GaloreParamState, GaloreProjectionState, GaloreProjectionType, GaloreProjector,
 };
-pub use gemma_lora::*;
 pub use gemma_qlora::*;
 pub use gemma4_lora::*;
 pub use gemma4_qlora::*;
 pub use gpt_oss_lora::*;
 pub use gpt_oss_qlora::*;
-pub use granite_lora::*;
 pub use granite_qlora::*;
-pub use llama_lora::*;
 pub use llama_qlora::*;
 pub use llama4_lora::*;
 pub use llama4_qlora::*;
@@ -116,17 +102,13 @@ pub use lora_helpers::{
     LoraDecoderStack, collect_lora_parameters, count_trainable_params, load_lora_weights_impl,
     save_lora_weights_impl, set_lora_parameters,
 };
-pub use mistral_lora::*;
 pub use mistral_qlora::*;
-pub use mllama_lora::*;
 pub use nemotron_h_lora::*;
 pub use nemotron_h_qlora::*;
 pub use patcher::*;
-pub use phi_lora::*;
 pub use phi_qlora::*;
 pub use qblora::*;
 pub use qlora::*;
-pub use qwen3_lora::*;
 pub use qwen3_moe_lora::*;
 pub use qwen3_moe_qlora::*;
 pub use qwen3_next_lora::*;

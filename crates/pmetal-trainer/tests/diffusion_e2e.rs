@@ -16,8 +16,9 @@ use pmetal_bridge::compat::Array;
 use pmetal_bridge::compat::optimizers::Sgd;
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
-use pmetal_lora::Qwen3LoraForCausalLM;
+use pmetal_lora::AdaptedModel;
 use pmetal_models::architectures::qwen3::Qwen3Config;
+use pmetal_models::dispatcher::DynamicModel;
 use pmetal_trainer::{
     DiffusionConfig, DiffusionTrainingLoop, diffusion_loss_gpu, forward_process_gpu,
 };
@@ -57,6 +58,14 @@ fn small_lora_config() -> LoraConfig {
         loraplus_lr_ratio: None,
         use_dora: false,
     }
+}
+
+/// The trainable model these tests run against: the dispatcher's own Qwen3
+/// with adapters attached, which is what `pmetal train` builds.
+fn small_model() -> AdaptedModel {
+    let base = DynamicModel::from_config(&serde_json::to_string(&small_qwen3_config()).unwrap())
+        .expect("qwen3 builds");
+    AdaptedModel::attach(base, small_lora_config()).expect("attach adapters")
 }
 
 fn create_dummy_dataset(num_samples: usize, seq_len: usize) -> TrainingDataset {
@@ -155,8 +164,7 @@ fn test_diffusion_training_loop_creation() {
 #[serial]
 fn test_diffusion_training_step() {
     // Create Qwen3 LoRA model
-    let mut model = Qwen3LoraForCausalLM::new(small_qwen3_config(), small_lora_config())
-        .expect("Failed to create Qwen3 LoRA model");
+    let mut model = small_model();
 
     // Create diffusion config
     let config = DiffusionConfig {
@@ -223,8 +231,7 @@ fn test_diffusion_training_step() {
 #[test]
 #[serial]
 fn test_diffusion_training_multiple_steps() {
-    let mut model = Qwen3LoraForCausalLM::new(small_qwen3_config(), small_lora_config())
-        .expect("Failed to create model");
+    let mut model = small_model();
 
     let config = DiffusionConfig {
         mask_token_id: 255,
@@ -277,8 +284,7 @@ fn test_diffusion_training_multiple_steps() {
 #[test]
 #[serial]
 fn test_diffusion_gradient_accumulation() {
-    let mut model = Qwen3LoraForCausalLM::new(small_qwen3_config(), small_lora_config())
-        .expect("Failed to create model");
+    let mut model = small_model();
 
     let config = DiffusionConfig {
         mask_token_id: 255,

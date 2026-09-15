@@ -9,8 +9,8 @@ use pmetal_bridge::compat::{
     Array, Exception, eval_params, module::ModuleParameters, nn, optimizers::Optimizer,
 };
 use pmetal_core::{LoraConfig, TrainingConfig};
-use pmetal_lora::LlamaLoraForCausalLM;
-use pmetal_models::architectures::llama::LlamaConfig;
+use pmetal_lora::AdaptedModel;
+use pmetal_models::dispatcher::DynamicModel;
 
 use crate::{CheckpointManager, CheckpointMetadata, Result, SftError};
 
@@ -27,10 +27,10 @@ pub struct TrainStepStats {
     pub grad_norm: Option<f32>,
 }
 
-/// LoRA trainer for fine-tuning Llama models.
+/// LoRA trainer for fine-tuning any architecture the dispatcher can build.
 pub struct LoraTrainer {
     /// Model being trained.
-    pub model: LlamaLoraForCausalLM,
+    pub model: AdaptedModel,
     /// Training configuration.
     pub config: TrainingConfig,
     /// Current training step.
@@ -42,13 +42,19 @@ pub struct LoraTrainer {
 }
 
 impl LoraTrainer {
-    /// Create a new LoRA trainer.
+    /// Create a new LoRA trainer over a model built from `config_json`.
+    ///
+    /// Takes the raw config rather than a typed one, because which type it
+    /// deserializes into is the dispatcher's decision, not the caller's. This
+    /// used to be `LlamaConfig`, and so the trainer was Llama-only.
     pub fn new(
-        model_config: LlamaConfig,
+        config_json: &str,
         lora_config: LoraConfig,
         training_config: TrainingConfig,
     ) -> Result<Self> {
-        let model = LlamaLoraForCausalLM::new(model_config, lora_config)
+        let base = DynamicModel::from_config(config_json)
+            .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
+        let model = AdaptedModel::attach(base, lora_config)
             .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
         Ok(Self {
@@ -61,7 +67,7 @@ impl LoraTrainer {
     }
 
     /// Create from an existing model.
-    pub fn from_model(model: LlamaLoraForCausalLM, training_config: TrainingConfig) -> Self {
+    pub fn from_model(model: AdaptedModel, training_config: TrainingConfig) -> Self {
         Self {
             model,
             config: training_config,
@@ -129,14 +135,18 @@ impl LoraTrainer {
         // Get learning rate
         let lr = self.get_learning_rate();
 
-        // Apply gradients
+        // Plain SGD on the adapters: `p -= lr * g`. The per-architecture model
+        // carried its own `apply_gradients`; an adapted model updates the same
+        // tensors `lora_parameters` reports.
+        let mut updated = self.model.lora_parameters();
+        for (name, value) in updated.iter_mut() {
+            if let Some(grad) = gradients.get(name) {
+                *value = value.subtract(&grad.mul_scalar(lr));
+            }
+        }
+        self.model.set_lora_parameters(&updated);
         self.model
-            .apply_gradients(gradients, lr)
-            .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
-
-        // Evaluate updated params
-        self.model
-            .eval_lora_params()
+            .eval_all()
             .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
 
         self.step += 1;
@@ -169,7 +179,7 @@ impl LoraTrainer {
         optimizer: &mut O,
     ) -> Result<TrainStepStats> {
         // Define loss function for value_and_grad
-        let loss_fn = |model: &mut LlamaLoraForCausalLM,
+        let loss_fn = |model: &mut AdaptedModel,
                        (ids, lbls): (&Array, &Array)|
          -> std::result::Result<Array, Exception> {
             let logits = model
@@ -260,9 +270,7 @@ impl LoraTrainer {
 
     /// Merge LoRA weights into base model.
     pub fn merge_lora(&mut self) -> Result<()> {
-        self.model
-            .merge_lora()
-            .map_err(|e| SftError::Mlx(Exception::custom(e.to_string())))?;
+        self.model.merge();
         Ok(())
     }
 
@@ -368,7 +376,7 @@ pub fn compute_lm_loss(logits: &Array, labels: &Array) -> Result<Array> {
 /// # Returns
 /// Final loss value
 pub fn simple_training_loop<I>(
-    model_config: LlamaConfig,
+    config_json: &str,
     lora_config: LoraConfig,
     training_config: TrainingConfig,
     data: I,
@@ -376,7 +384,7 @@ pub fn simple_training_loop<I>(
 where
     I: Iterator<Item = (Array, Array)>,
 {
-    let mut trainer = LoraTrainer::new(model_config, lora_config, training_config)?;
+    let mut trainer = LoraTrainer::new(config_json, lora_config, training_config)?;
 
     tracing::info!(
         "Starting LoRA training with {} trainable parameters",
@@ -413,6 +421,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pmetal_models::architectures::llama::LlamaConfig;
 
     fn small_config() -> LlamaConfig {
         LlamaConfig {
@@ -428,6 +437,10 @@ mod tests {
             rope_theta: 10000.0,
             ..Default::default()
         }
+    }
+
+    fn small_config_json() -> String {
+        serde_json::to_string(&small_config()).expect("serialize config")
     }
 
     fn small_lora_config() -> LoraConfig {
@@ -461,8 +474,12 @@ mod tests {
 
     #[test]
     fn test_lora_trainer_creation() {
-        let trainer =
-            LoraTrainer::new(small_config(), small_lora_config(), small_training_config()).unwrap();
+        let trainer = LoraTrainer::new(
+            &small_config_json(),
+            small_lora_config(),
+            small_training_config(),
+        )
+        .unwrap();
 
         assert!(trainer.num_trainable_params() > 0);
         assert_eq!(trainer.current_step(), 0);
@@ -470,8 +487,12 @@ mod tests {
 
     #[test]
     fn test_lora_trainer_loss_computation() {
-        let mut trainer =
-            LoraTrainer::new(small_config(), small_lora_config(), small_training_config()).unwrap();
+        let mut trainer = LoraTrainer::new(
+            &small_config_json(),
+            small_lora_config(),
+            small_training_config(),
+        )
+        .unwrap();
 
         // Create dummy data
         let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
@@ -486,8 +507,12 @@ mod tests {
 
     #[test]
     fn test_learning_rate_schedule() {
-        let mut trainer =
-            LoraTrainer::new(small_config(), small_lora_config(), small_training_config()).unwrap();
+        let mut trainer = LoraTrainer::new(
+            &small_config_json(),
+            small_lora_config(),
+            small_training_config(),
+        )
+        .unwrap();
 
         // At step 0, should be in warmup
         trainer.step = 0;
@@ -504,8 +529,12 @@ mod tests {
     fn test_train_step_autodiff() {
         use pmetal_bridge::compat::optimizers::Sgd;
 
-        let mut trainer =
-            LoraTrainer::new(small_config(), small_lora_config(), small_training_config()).unwrap();
+        let mut trainer = LoraTrainer::new(
+            &small_config_json(),
+            small_lora_config(),
+            small_training_config(),
+        )
+        .unwrap();
 
         // Create dummy data
         let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
@@ -534,8 +563,12 @@ mod tests {
 
     #[test]
     fn test_train_step_finite_diff_fails_explicitly() {
-        let mut trainer =
-            LoraTrainer::new(small_config(), small_lora_config(), small_training_config()).unwrap();
+        let mut trainer = LoraTrainer::new(
+            &small_config_json(),
+            small_lora_config(),
+            small_training_config(),
+        )
+        .unwrap();
 
         let input_ids = Array::from_slice(&[1_i32, 2, 3, 4], &[1, 4]);
         let labels = Array::from_slice(&[2_i32, 3, 4, 5], &[1, 4]);

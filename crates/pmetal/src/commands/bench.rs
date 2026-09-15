@@ -8,7 +8,7 @@ use pmetal_core::{
     DatasetConfig, LoraConfig, ModelConfig, StepMetrics, TrainingCallback, TrainingConfig,
 };
 use pmetal_data::{DatasetColumnConfig, DatasetFormat, TextSample, Tokenizer, TrainingDataset};
-use pmetal_lora::LlamaLoraForCausalLM;
+use pmetal_lora::AdaptedModel;
 use pmetal_metal::context::{DeviceTier, MemoryBandwidthSource};
 use pmetal_metal::kernels::BatchedCommandBuffer;
 use pmetal_metal::kernels::mpp_gemm::{MppGemm, MppGemmConfig};
@@ -55,25 +55,30 @@ pub(crate) async fn run_benchmark(
     println!("  Seq Length: {}", seq_len);
     println!("\nBenchmarking in progress...");
 
-    // Create dummy config
-    let llama_config = LlamaConfig {
-        vocab_size: 32000,
-        hidden_size: 2048,
-        intermediate_size: 5632,
-        num_hidden_layers: 22,
-        num_attention_heads: 32,
-        num_key_value_heads: Some(4),
-        max_position_embeddings: 2048,
-        ..Default::default()
-    };
-
+    // A TinyLlama-shaped model with random weights. The point is the shape of
+    // the forward pass, not the weights, so it is built from a config rather
+    // than loaded.
     let lora_config = LoraConfig {
         r: 16,
         alpha: 32.0,
         ..Default::default()
     };
 
-    let mut model_inst = LlamaLoraForCausalLM::new(llama_config, lora_config)?;
+    let base = DynamicModel::from_config(
+        &serde_json::to_string(&LlamaConfig {
+            vocab_size: 32000,
+            hidden_size: 2048,
+            intermediate_size: 5632,
+            num_hidden_layers: 22,
+            num_attention_heads: 32,
+            num_key_value_heads: Some(4),
+            max_position_embeddings: 2048,
+            ..Default::default()
+        })
+        .context("serialize benchmark config")?,
+    )
+    .map_err(|e| anyhow::anyhow!("build benchmark model: {e}"))?;
+    let mut model_inst = AdaptedModel::attach(base, lora_config)?;
 
     // Create dummy data
     let input_ids = pmetal_bridge::compat::ops::zeros(

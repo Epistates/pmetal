@@ -13,8 +13,9 @@
 use pmetal_bridge::compat::optimizers::Sgd;
 use pmetal_core::{LoraConfig, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
-use pmetal_lora::LlamaLoraForCausalLM;
+use pmetal_lora::AdaptedModel;
 use pmetal_models::architectures::llama::LlamaConfig;
+use pmetal_models::dispatcher::DynamicModel;
 use pmetal_trainer::{TrainingLoop, TrainingLoopConfig};
 
 fn small_llama_config() -> LlamaConfig {
@@ -52,6 +53,14 @@ fn small_lora_config() -> LoraConfig {
     }
 }
 
+/// The trainable model these tests run against: the dispatcher's own Llama
+/// with adapters attached, which is what `pmetal train` builds.
+fn small_model() -> AdaptedModel {
+    let base = DynamicModel::from_config(&serde_json::to_string(&small_llama_config()).unwrap())
+        .expect("llama builds");
+    AdaptedModel::attach(base, small_lora_config()).expect("attach adapters")
+}
+
 fn create_dummy_dataset(num_samples: usize, seq_len: usize) -> TrainingDataset {
     let samples: Vec<Sample> = (0..num_samples)
         .map(|i| {
@@ -65,8 +74,7 @@ fn create_dummy_dataset(num_samples: usize, seq_len: usize) -> TrainingDataset {
 #[test]
 fn test_training_loop_single_step() {
     // Create model
-    let mut model = LlamaLoraForCausalLM::new(small_llama_config(), small_lora_config())
-        .expect("Failed to create model");
+    let mut model = small_model();
 
     // Create training loop config
     let config = TrainingLoopConfig {
@@ -127,8 +135,7 @@ fn test_training_loop_single_step() {
 
 #[test]
 fn test_training_loop_gradient_accumulation() {
-    let mut model = LlamaLoraForCausalLM::new(small_llama_config(), small_lora_config())
-        .expect("Failed to create model");
+    let mut model = small_model();
 
     let config = TrainingLoopConfig {
         training: TrainingConfig {
@@ -191,8 +198,7 @@ fn test_training_loop_gradient_accumulation() {
 
 #[test]
 fn test_training_loop_multiple_steps() {
-    let mut model = LlamaLoraForCausalLM::new(small_llama_config(), small_lora_config())
-        .expect("Failed to create model");
+    let mut model = small_model();
 
     let config = TrainingLoopConfig {
         training: TrainingConfig {
@@ -263,8 +269,7 @@ fn test_training_loop_multiple_steps() {
 #[test]
 fn test_training_with_metal_flash_attention() {
     // This test verifies that Metal FlashAttention integration doesn't break training
-    let mut model = LlamaLoraForCausalLM::new(small_llama_config(), small_lora_config())
-        .expect("Failed to create model");
+    let mut model = small_model();
 
     let config = TrainingLoopConfig {
         training: TrainingConfig {
@@ -550,8 +555,7 @@ fn test_qlora_multiple_steps() {
 #[test]
 fn test_evaluation_metrics() {
     // Test that evaluation returns comprehensive metrics (loss, perplexity, accuracy)
-    let mut model = LlamaLoraForCausalLM::new(small_llama_config(), small_lora_config())
-        .expect("Failed to create model");
+    let mut model = small_model();
 
     let config = TrainingLoopConfig {
         training: TrainingConfig {

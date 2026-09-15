@@ -1,10 +1,19 @@
 use super::*;
 use pmetal_core::{LoraConfig, StepMetrics, TrainingCallback, TrainingConfig};
 use pmetal_data::{DataLoaderConfig, Sample, TrainingDataset};
-use pmetal_lora::LlamaLoraForCausalLM;
+use pmetal_lora::AdaptedModel;
 use pmetal_models::architectures::llama::LlamaConfig;
+use pmetal_models::dispatcher::DynamicModel;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// The trainable model these tests run against: the dispatcher's own Llama,
+/// with adapters attached, which is what `pmetal train` builds.
+fn small_model() -> AdaptedModel {
+    let base = DynamicModel::from_config(&serde_json::to_string(&small_config()).unwrap())
+        .expect("llama builds");
+    AdaptedModel::attach(base, small_lora_config()).expect("attach adapters")
+}
 
 fn small_config() -> LlamaConfig {
     LlamaConfig {
@@ -176,7 +185,7 @@ fn test_run_packed_falls_back_to_standard_when_no_sequences_are_combined() {
     };
 
     let mut training_loop = TrainingLoop::new(config);
-    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let model = small_model();
     let dataset = create_dummy_dataset(3, 8);
 
     let _model = training_loop
@@ -218,7 +227,7 @@ fn test_single_train_step() {
     };
     let mut training_loop = TrainingLoop::new(config);
 
-    let mut model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let mut model = small_model();
     let mut optimizer = Sgd::new(1e-4);
 
     // Create a minimal batch
@@ -246,7 +255,7 @@ fn test_jit_training_step() {
     // Test the JIT-compiled training step function directly
     use pmetal_bridge::compat::optimizers::AdamW;
 
-    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let model = small_model();
     let optimizer = AdamW::new(1e-4, 0.0);
 
     let mut state = (model, optimizer);
@@ -274,7 +283,7 @@ fn test_jit_training_step_multiple_steps() {
     // This verifies the training step function itself works, independent of compile_with_state
     use pmetal_bridge::compat::optimizers::AdamW;
 
-    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let model = small_model();
     let optimizer = AdamW::new(1e-4, 0.0);
 
     let mut state = (model, optimizer);
@@ -315,7 +324,7 @@ fn test_jit_training_step_multiple_steps() {
 }
 
 #[test]
-fn test_run_packed_declines_gradient_checkpointing_the_model_cannot_do() {
+fn test_run_packed_enables_gradient_checkpointing_the_model_supports() {
     let config = TrainingLoopConfig {
         training: TrainingConfig {
             learning_rate: 1e-4,
@@ -345,25 +354,26 @@ fn test_run_packed_declines_gradient_checkpointing_the_model_cannot_do() {
     };
 
     let mut training_loop = TrainingLoop::new(config);
-    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let model = small_model();
     let dataset = create_dummy_dataset(4, 2);
 
     let model = training_loop
         .run_packed(model, dataset, None, None)
         .unwrap();
 
-    // `LlamaLoraForCausalLM` reports no gradient-checkpointing support, so the
-    // request is declined and the run proceeds without it. This used to assert
-    // the opposite, which only ever confirmed that a flag had been stored in a
-    // field the forward pass ignores.
+    // Llama reaches a real `mlx::core::checkpoint` through the dispatcher, so
+    // the request is honoured. It used to be declined: the per-architecture
+    // LoRA types had no route to the feature, and an earlier version of this
+    // test asserted the flag had been stored in a field the forward pass
+    // ignored.
     assert!(
-        model.checkpoint_config.is_none(),
-        "packed run enabled checkpointing on a model that does not implement it"
+        model.model().is_gradient_checkpointing(),
+        "packed run declined checkpointing on a model that implements it"
     );
 }
 
 #[test]
-fn test_run_compiled_declines_gradient_checkpointing_the_model_cannot_do() {
+fn test_run_compiled_enables_gradient_checkpointing_the_model_supports() {
     let config = TrainingLoopConfig {
         training: TrainingConfig {
             learning_rate: 1e-4,
@@ -393,17 +403,17 @@ fn test_run_compiled_declines_gradient_checkpointing_the_model_cannot_do() {
     };
 
     let mut training_loop = TrainingLoop::new(config);
-    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let model = small_model();
     let dataset = create_dummy_dataset(2, 8);
 
     let model = training_loop
         .run_compiled(model, dataset, None, None)
         .unwrap();
 
-    // See the packed variant above: the model declines, and the run continues.
+    // See the packed variant above.
     assert!(
-        model.checkpoint_config.is_none(),
-        "compiled run enabled checkpointing on a model that does not implement it"
+        model.model().is_gradient_checkpointing(),
+        "compiled run declined checkpointing on a model that implements it"
     );
 }
 
@@ -415,9 +425,9 @@ fn test_single_sequence_packed_step_matches_standard_step() {
     let labels = [2_i64, 3, 4, 5, 6, 7];
 
     random::seed(1337);
-    let model_standard = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let model_standard = small_model();
     random::seed(1337);
-    let model_packed = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let model_packed = small_model();
 
     let optimizer_standard = AdamW::new(0.0, 0.0);
     let optimizer_packed = AdamW::new(0.0, 0.0);
@@ -453,7 +463,7 @@ fn test_single_sequence_packed_cce_step_is_finite() {
     let labels = [2_i64, 3, 4, 5, 6, 7];
 
     random::seed(7331);
-    let model_packed = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let model_packed = small_model();
 
     let optimizer_packed = AdamW::new(0.0, 0.0);
 
@@ -478,7 +488,7 @@ fn test_jit_training_step_with_warmup() {
     use pmetal_bridge::compat::optimizers::AdamW;
     use pmetal_bridge::compat::optimizers::Updatable;
 
-    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let model = small_model();
     let optimizer = AdamW::new(1e-4, 0.0);
 
     let mut state = (model, optimizer);
@@ -691,7 +701,7 @@ fn test_run_packed_callbacks_report_non_zero_interval_metrics() {
     let snapshot = capture.clone();
     training_loop.add_callback(Box::new(capture));
 
-    let model = LlamaLoraForCausalLM::new(small_config(), small_lora_config()).unwrap();
+    let model = small_model();
     let dataset = create_dummy_dataset(6, 24);
 
     let _model = training_loop
