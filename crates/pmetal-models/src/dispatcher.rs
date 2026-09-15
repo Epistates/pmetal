@@ -1580,6 +1580,25 @@ impl DynamicModel {
         }
     }
 
+    /// The matrix that projects hidden states onto the vocabulary.
+    ///
+    /// Cut cross-entropy needs it so the loss can be computed without ever
+    /// materialising `[batch, seq, vocab]` logits, which for a 150k-token
+    /// vocabulary is most of the step's peak memory.
+    ///
+    /// Read out of the flattened parameter tree rather than matched per
+    /// architecture: every one of them spells the field `lm_head`, and a model
+    /// that ties its embeddings has no separate head at all, so the embedding
+    /// *is* the matrix, read the other way round. Matching would add an arm per
+    /// architecture to restate that.
+    pub fn lm_head_weight(&self) -> Option<Array> {
+        let params = self.flatten_params();
+        ["lm_head.weight", "model.embed_tokens.weight"]
+            .iter()
+            .find_map(|key| params.get(*key))
+            .cloned()
+    }
+
     /// Set the NEFTune noise scale on the token embedding, or clear it.
     ///
     /// NEFTune (Jain et al., 2023) perturbs the embedding output during

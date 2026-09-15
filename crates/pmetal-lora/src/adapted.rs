@@ -388,6 +388,27 @@ impl crate::TrainableModel for AdaptedModel {
         self.model.supports_gradient_checkpointing()
     }
 
+    /// Hidden states before the LM head, so cut cross-entropy never has to
+    /// materialise `[batch, seq, vocab]` logits.
+    ///
+    /// `None` only when this architecture has no trunk forward to call, which
+    /// is what the dispatcher reports by erroring.
+    fn forward_hidden(
+        &mut self,
+        input_ids: &Array,
+        mask: Option<&Array>,
+    ) -> Option<Result<Array, LoraError>> {
+        Some(
+            self.model
+                .forward_hidden(input_ids, mask)
+                .map_err(LoraError::Mlx),
+        )
+    }
+
+    fn lm_head_weight(&self) -> Option<Array> {
+        self.model.lm_head_weight()
+    }
+
     /// Forward with NEFTune noise on the embedding output.
     ///
     /// The alpha is set on the embedding for the duration of the call and

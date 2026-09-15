@@ -891,6 +891,38 @@ fn attaching_adapters_changes_nothing() {
     assert!(checked >= 15, "only {checked} architectures were exercised");
 }
 
+/// Cut cross-entropy needs the LM head matrix, and falls back to standard CE
+/// when it cannot get one. The fallback is silent and costs the whole
+/// `[batch, seq, vocab]` logits tensor, so a naming drift in one architecture
+/// would show up as a memory regression rather than a failure.
+///
+/// Its shape has to be `[vocab, hidden]`, tied or not, because that is the
+/// orientation the loss multiplies against.
+#[test]
+fn every_architecture_hands_over_its_lm_head() {
+    let mut checked = 0;
+    for case in cases() {
+        let Ok(base) = DynamicModel::from_config(case.config_json) else {
+            continue;
+        };
+        let vocab = config_int(&case, "vocab_size").expect("vocab_size");
+        let hidden = config_int(&case, "hidden_size").expect("hidden_size");
+
+        let adapted = AdaptedModel::attach(base, lora_config()).expect("attach");
+        let head = TrainableModel::lm_head_weight(&adapted)
+            .unwrap_or_else(|| panic!("{}: no LM head, so CCE falls back", case.name));
+
+        assert_eq!(
+            head.shape(),
+            &[vocab, hidden],
+            "{}: LM head is not [vocab, hidden]",
+            case.name
+        );
+        checked += 1;
+    }
+    assert!(checked >= 15, "only {checked} architectures were exercised");
+}
+
 /// Merging folds the adapters in and leaves a model that computes the same
 /// thing, which is what `pmetal fuse` produces.
 #[test]
