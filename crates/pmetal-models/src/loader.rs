@@ -352,36 +352,65 @@ fn is_quant_aux_key(key: &str) -> bool {
     quant_aux_base_key(key).is_some()
 }
 
+/// The packed tensor a `.scales` / `.biases` entry belongs to, if it is present.
+///
+/// ⚠️ Two layouts ship, and they differ by one path segment.
+///
+/// **MLX**, and so every `mlx-community` release, stores a quantized module's
+/// three parameters as *siblings*: `mlp.up_proj.weight` holds the packed
+/// payload next to `mlp.up_proj.scales` and `mlp.up_proj.biases`.
+///
+/// **pmetal's own quantizer** suffixes the full tensor name instead, so the
+/// same module comes out as `mlp.up_proj.weight` with
+/// `mlp.up_proj.weight.scales` and `mlp.up_proj.weight.biases`.
+///
+/// Preferring the `.weight` child and falling back to the base name lands on
+/// the right tensor either way. A module path is never itself a tensor, so the
+/// two cases cannot both apply to one entry.
+fn packed_weight_key_for(aux_key: &str, weights: &HashMap<String, Array>) -> Option<String> {
+    let base = quant_aux_base_key(aux_key)?;
+    let child = format!("{base}.weight");
+    if weights.contains_key(&child) {
+        Some(child)
+    } else if weights.contains_key(base) {
+        Some(base.to_string())
+    } else {
+        None
+    }
+}
+
 fn dequantize_mlx_quantized_weights(
     weights: &mut HashMap<String, Array>,
     config: &MlxQuantizationConfig,
 ) {
-    let base_keys: Vec<String> = weights
+    // `(packed, scales, biases)` triples, resolved before anything is replaced
+    // so the lookups above see the checkpoint as it was read.
+    let triples: Vec<(String, String, String)> = weights
         .keys()
-        .filter(|key| !is_quant_aux_key(key))
-        .filter(|key| {
-            weights.contains_key(&format!("{key}.scales"))
-                && weights.contains_key(&format!("{key}.biases"))
+        .filter(|key| key.ends_with(".scales"))
+        .filter_map(|scales_key| {
+            let weight_key = packed_weight_key_for(scales_key, weights)?;
+            let biases_key = format!("{}.biases", quant_aux_base_key(scales_key)?);
+            weights
+                .contains_key(&biases_key)
+                .then(|| (weight_key, scales_key.clone(), biases_key))
         })
-        .cloned()
         .collect();
 
-    for key in base_keys {
-        let Some(weight) = weights.get(&key).cloned() else {
-            continue;
-        };
-        let Some(scales) = weights.get(&format!("{key}.scales")).cloned() else {
-            continue;
-        };
-        let Some(biases) = weights.get(&format!("{key}.biases")).cloned() else {
+    for (weight_key, scales_key, biases_key) in triples {
+        let (Some(weight), Some(scales), Some(biases)) = (
+            weights.get(&weight_key).cloned(),
+            weights.get(&scales_key).cloned(),
+            weights.get(&biases_key).cloned(),
+        ) else {
             continue;
         };
         // Both the width *and* the group size can vary per tensor. Unpacking a
         // mixed-precision checkpoint at one model-wide setting silently
         // produces wrongly-shaped weights.
-        let quant = config.for_tensor(&key);
+        let quant = config.for_tensor(&weight_key);
         let dequantized = weight.dequantize(&scales, &biases, quant.group_size, quant.bits);
-        weights.insert(key, dequantized);
+        weights.insert(weight_key, dequantized);
     }
 
     weights.retain(|key, _| !is_quant_aux_key(key));
@@ -1209,6 +1238,25 @@ pub fn load_generic_weights_renamed<M: ModuleParameters + ModuleParametersExt>(
 
     let model_dir = model_dir.as_ref();
     let mut report = LoadReport::default();
+
+    // ⚠️ A quantized checkpoint cannot be streamed a shard at a time. Unpacking
+    // needs `{module}.weight` together with its `.scales` and `.biases`, which
+    // are three separate tensors, and nothing in the format promises a shard
+    // boundary won't fall between them. Assemble it whole, unpack, then assign.
+    //
+    // Without this every architecture reaching the model through
+    // `load_generic_weights` — llama, qwen2, mistral, gemma, phi, cohere and
+    // the rest of the `simple_load!` arms — handed the packed `uint32` payload
+    // straight to the model. The first norm then reported a weight that did not
+    // match the width of its input, several ops downstream of the real problem.
+    if load_mlx_quantization_config(model_dir)?.is_some() {
+        let loaded = apply(load_weights(model_dir)?);
+        report += assign_loaded_weights(model, loaded);
+        eval_loaded_parameters(model)?;
+        report.log_summary(model_dir);
+        return Ok(());
+    }
+
     let single_file = model_dir.join("model.safetensors");
     if single_file.exists() {
         let loaded = apply(load_shard(&single_file)?);
@@ -1329,8 +1377,13 @@ where
         .weight_map
         .keys()
         .filter(|key| {
+            // An aux entry has to come along whenever its packed tensor does,
+            // or the tensor arrives still packed. Which name that is depends on
+            // the layout, so ask about both (see `packed_weight_key_for`).
             keep_key(key)
-                || quant_config.is_some() && quant_aux_base_key(key).is_some_and(&mut keep_key)
+                || quant_config.is_some()
+                    && quant_aux_base_key(key)
+                        .is_some_and(|base| keep_key(base) || keep_key(&format!("{base}.weight")))
         })
         .cloned()
         .collect();
@@ -2260,8 +2313,8 @@ mod tests {
 
         let mut weights = HashMap::new();
         weights.insert("linear.weight".to_string(), packed);
-        weights.insert("linear.weight.scales".to_string(), scales);
-        weights.insert("linear.weight.biases".to_string(), biases);
+        weights.insert("linear.scales".to_string(), scales);
+        weights.insert("linear.biases".to_string(), biases);
         write_safetensors(&model_dir.join("model.safetensors"), &weights).unwrap();
         std::fs::write(
             model_dir.join("config.json"),
@@ -2273,8 +2326,34 @@ mod tests {
         assert_eq!(loaded.len(), 1);
         let restored = loaded.get("linear.weight").unwrap();
         assert_eq!(restored.shape(), &[2, 64]);
-        assert!(!loaded.contains_key("linear.weight.scales"));
-        assert!(!loaded.contains_key("linear.weight.biases"));
+        assert!(!loaded.contains_key("linear.scales"));
+        assert!(!loaded.contains_key("linear.biases"));
+    }
+
+    /// pmetal's own quantizer writes the aux tensors under the full weight name
+    /// rather than beside it, so `quantize_and_save_mlx` output has to keep
+    /// loading too.
+    #[test]
+    fn load_weights_dequantizes_pmetals_own_aux_key_layout() {
+        let temp = tempdir().unwrap();
+        let model_dir = temp.path();
+        let weight = Array::from_slice(&[1.0f32; 128], &[2, 64]);
+        let (packed, scales, biases) = weight.quantize_weights(64, 4);
+
+        let mut weights = HashMap::new();
+        weights.insert("linear.weight".to_string(), packed);
+        weights.insert("linear.weight.scales".to_string(), scales);
+        weights.insert("linear.weight.biases".to_string(), biases);
+        write_safetensors(&model_dir.join("model.safetensors"), &weights).unwrap();
+        std::fs::write(
+            model_dir.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+
+        let loaded = load_weights(model_dir).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded.get("linear.weight").unwrap().shape(), &[2, 64]);
     }
 
     /// A mixed-precision checkpoint, which is what mlx-community QAT releases
@@ -2299,11 +2378,11 @@ mod tests {
             wide_packed,
         );
         weights.insert(
-            "model.layers.0.mlp.gate_proj.weight.scales".to_string(),
+            "model.layers.0.mlp.gate_proj.scales".to_string(),
             wide_scales,
         );
         weights.insert(
-            "model.layers.0.mlp.gate_proj.weight.biases".to_string(),
+            "model.layers.0.mlp.gate_proj.biases".to_string(),
             wide_biases,
         );
         weights.insert(
@@ -2311,11 +2390,11 @@ mod tests {
             narrow_packed,
         );
         weights.insert(
-            "model.layers.0.self_attn.q_proj.weight.scales".to_string(),
+            "model.layers.0.self_attn.q_proj.scales".to_string(),
             narrow_scales,
         );
         weights.insert(
-            "model.layers.0.self_attn.q_proj.weight.biases".to_string(),
+            "model.layers.0.self_attn.q_proj.biases".to_string(),
             narrow_biases,
         );
         write_safetensors(&model_dir.join("model.safetensors"), &weights).unwrap();
@@ -2554,5 +2633,43 @@ mod tests {
 
         assert_eq!(report.loaded, weights.len());
         assert!(report.skipped.is_empty(), "skipped: {:?}", report.skipped);
+    }
+
+    /// ⚠️ The `simple_load!` arms — llama, qwen2, mistral, gemma, phi, cohere
+    /// and most of the rest — reach the model through `load_generic_weights`,
+    /// which read shards straight off disk and never consulted the
+    /// quantization config. Every `mlx-community` 4-bit checkpoint therefore
+    /// arrived still packed, and the model built on `uint32` payloads.
+    ///
+    /// Asserted on the *parameter*, not on a returned map, because the gap was
+    /// between reading the shard and assigning it.
+    #[test]
+    fn load_generic_weights_unpacks_a_quantized_checkpoint() {
+        let temp = tempdir().unwrap();
+        let model_dir = temp.path();
+
+        let mut model = crate::architectures::Qwen3ForCausalLM::new(Default::default()).unwrap();
+        let hidden = model.model.embed_tokens.weight.shape()[1];
+        let dense = Array::from_slice(&vec![0.5f32; (hidden * 2) as usize], &[2, hidden]);
+        let (packed, scales, biases) = dense.quantize_weights(64, 4);
+
+        let mut weights = HashMap::new();
+        weights.insert("model.layers.0.self_attn.q_proj.weight".to_string(), packed);
+        weights.insert("model.layers.0.self_attn.q_proj.scales".to_string(), scales);
+        weights.insert("model.layers.0.self_attn.q_proj.biases".to_string(), biases);
+        write_safetensors(&model_dir.join("model.safetensors"), &weights).unwrap();
+        std::fs::write(
+            model_dir.join("config.json"),
+            r#"{"quantization": {"bits": 4, "group_size": 64}}"#,
+        )
+        .unwrap();
+
+        load_generic_weights(&mut model, model_dir).unwrap();
+
+        assert_eq!(
+            model.model.layers[0].self_attn.q_proj.weight.shape(),
+            &[2, hidden],
+            "q_proj kept the packed uint32 width instead of being dequantized"
+        );
     }
 }
