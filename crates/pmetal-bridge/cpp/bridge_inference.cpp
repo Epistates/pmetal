@@ -184,11 +184,17 @@ void mlx_inline_gather_qmm(mlx_inline_array* dst,
         auto rhs_opt = rhs_indices
             ? std::optional<array>(as_arr(rhs_indices))
             : std::optional<array>(std::nullopt);
+        // `global_scale` sits between the mode and `sorted_indices`. It is for
+        // two-level quantization, which no checkpoint we read uses, so it stays
+        // nullopt. Named rather than positional because a bool binds silently
+        // to the wrong slot if the signature shifts again.
         new (dst->buf) array(mlx::core::gather_qmm(
             as_arr(x), as_arr(w), as_arr(scales), biases_opt,
             lhs_opt, rhs_opt,
             transpose, group_size, bits,
-            quant_mode_from_int(mode), sorted));
+            quant_mode_from_int(mode),
+            /* global_scale */ std::nullopt,
+            /* sorted_indices */ sorted));
     });
 }
 

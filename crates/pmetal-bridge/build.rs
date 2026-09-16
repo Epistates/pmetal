@@ -1,7 +1,11 @@
 use cmake::Config;
 use std::{env, path::PathBuf, process::Command};
 
-const BUNDLED_MLX_GIT_TAG: &str = "v0.32.2";
+/// The MLX revision this crate builds against, tag or commit.
+///
+/// Currently a commit: see `cmake/CMakeLists.txt` for which kernels and
+/// quantized-matmul fixes v0.32.2 is missing.
+const BUNDLED_MLX_GIT_TAG: &str = "7241f12e631440387a2156ec1018d1c9fe8e56b9";
 
 // ── Deployment target ──────────────────────────────────────────────────────
 

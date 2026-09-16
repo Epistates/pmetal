@@ -15,10 +15,17 @@ set(MLX_BUILD_EXAMPLES OFF)
 set(MLX_BUILD_BENCHMARKS OFF)
 set(MLX_BUILD_PYTHON_BINDINGS OFF)
 
+# Pinned to a commit rather than a tag. v0.32.2 (2026-08-25) predates the
+# Metal kernels Gemma 4 decodes through: D512 vector attention (#4459) covers
+# its full-attention layers, and the fused NAX head-dim-256 prefill path
+# (#4416) covers its sliding ones. It also predates several quantized-matmul
+# correctness fixes, including the non-transposed affine qmm dispatch (#4392)
+# that the packed-weight path depends on. Move this back to a tag at the next
+# release that contains them.
 FetchContent_Declare(
   mlx
   GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-  GIT_TAG v0.32.2)
+  GIT_TAG 7241f12e631440387a2156ec1018d1c9fe8e56b9)
 FetchContent_MakeAvailable(mlx)
 
 # ── Expose include dir and libmlx.a for the cc::Build step ──
