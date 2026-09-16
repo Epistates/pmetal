@@ -187,11 +187,20 @@ pub struct Qwen3Config {
     #[serde(default)]
     pub mlp_only_layers: Vec<usize>,
 
-    /// Optional quantization config.
+    /// Quantization parameters under MLX's own key.
     ///
-    /// MLX checkpoints commonly use `quantization_config`, but newer Bonsai /
-    /// MLX-LM exports may spell the same object as `quantization`.
-    #[serde(default, alias = "quantization")]
+    /// ⚠️ `mlx_lm.convert` writes **both** `quantization` and
+    /// `quantization_config`, with the same contents, so HF tooling that only
+    /// knows the latter still sees them. A serde `alias` maps both spellings
+    /// onto one field and then rejects the checkpoint for a duplicate, which
+    /// is why every `mlx-community` 4-bit Qwen3 failed to load with
+    /// "duplicate field `quantization_config`". They are two fields here, and
+    /// [`quantization`](Self::quantization) picks.
+    #[serde(default, rename = "quantization")]
+    pub quantization_mlx: Option<QuantizationConfig>,
+
+    /// The same object under the Hugging Face key.
+    #[serde(default)]
     pub quantization_config: Option<QuantizationConfig>,
 }
 
@@ -230,6 +239,17 @@ struct RopeParameters {
 }
 
 impl Qwen3Config {
+    /// The checkpoint's quantization parameters, under whichever key it used.
+    ///
+    /// MLX's own `quantization` wins when a checkpoint carries both, since it
+    /// is the one `mlx_lm.convert` writes first and the one the per-module
+    /// overrides live under.
+    pub fn quantization(&self) -> Option<&QuantizationConfig> {
+        self.quantization_mlx
+            .as_ref()
+            .or(self.quantization_config.as_ref())
+    }
+
     /// Promote nested `rope_parameters.partial_rotary_factor` when the
     /// top-level field is absent. Call once after deserializing.
     pub fn finalize(&mut self) {
@@ -352,17 +372,18 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
                 tc["model_type"] = mt.clone();
             }
         }
-        // Promote quantization metadata from the outer JSON into text_config when
-        // present at the top level but absent from the nested config. MLX-LM
-        // uses `quantization_config`, while newer Bonsai exports may use
-        // `quantization` for the same object.
+        // Promote quantization metadata from the outer JSON into text_config
+        // when present at the top level but absent from the nested config.
+        // `quantization` is preferred over `quantization_config` here for the
+        // same reason `Qwen3Config::quantization` prefers it: a checkpoint
+        // carrying both puts the per-module overrides under MLX's own key.
         if tc.get("quantization_config").is_none() && tc.get("quantization").is_none() {
             if let Some(qc) = json
-                .get("quantization_config")
-                .or_else(|| json.get("quantization"))
+                .get("quantization")
+                .or_else(|| json.get("quantization_config"))
             {
                 if !json_quantization_is_fp8(qc) {
-                    tc["quantization_config"] = qc.clone();
+                    tc["quantization"] = qc.clone();
                 }
             }
         }
@@ -373,11 +394,15 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
 
     let mut cfg: Qwen3Config =
         serde_json::from_str(&config_str).map_err(|e| format!("failed to parse config: {e}"))?;
+    // FP8 is normalised from `weight_scale_inv` sidecars rather than MLX
+    // `.scales`/`.biases`, so its metadata must not be mistaken for an affine
+    // quantization. Both spellings get cleared, or whichever survives would
+    // put the loader back on the quantized path.
     if cfg
-        .quantization_config
-        .as_ref()
+        .quantization()
         .is_some_and(QuantizationConfig::is_fp8_metadata)
     {
+        cfg.quantization_mlx = None;
         cfg.quantization_config = None;
     }
     cfg.finalize();
@@ -482,10 +507,7 @@ mod tests {
         )
         .expect("quantized qwen3 config parses");
 
-        let qc = config
-            .quantization_config
-            .as_ref()
-            .expect("quantization config present");
+        let qc = config.quantization().expect("quantization config present");
         assert_eq!(qc.group_size, 128);
         assert_eq!(qc.bits, 1);
         assert_eq!(
@@ -516,10 +538,7 @@ mod tests {
         )
         .expect("nested quantized qwen3.5 config parses");
 
-        let qc = config
-            .quantization_config
-            .as_ref()
-            .expect("quantization config promoted");
+        let qc = config.quantization().expect("quantization config promoted");
         assert_eq!(qc.group_size, 64);
         assert_eq!(qc.bits, 4);
     }
@@ -547,8 +566,56 @@ mod tests {
         )
         .expect("nested fp8 qwen3.5 config parses");
 
-        assert!(config.quantization_config.is_none());
+        assert!(config.quantization().is_none());
         assert!(!config.is_qwen3_dense());
+    }
+
+    /// ⚠️ `mlx_lm.convert` writes the quantization block twice, once under its
+    /// own key and once under the Hugging Face one, so tooling that knows only
+    /// `quantization_config` still finds it. A serde `alias` folded both onto
+    /// one field and then rejected the file for a duplicate, which meant no
+    /// stock `mlx-community` 4-bit Qwen3 ever reached the native engine.
+    ///
+    /// The literal below is the head of
+    /// `mlx-community/Qwen3-1.7B-4bit`'s `config.json`.
+    #[test]
+    fn a_checkpoint_carrying_both_quantization_keys_parses() {
+        let config = parse_config_text(
+            r#"{
+                "model_type": "qwen3",
+                "hidden_size": 2048,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8,
+                "head_dim": 128,
+                "quantization": {"group_size": 64, "bits": 4},
+                "quantization_config": {"group_size": 64, "bits": 4}
+            }"#,
+        )
+        .expect("a checkpoint with both spellings parses");
+
+        let qc = config.quantization().expect("quantization is found");
+        assert_eq!((qc.group_size, qc.bits), (64, 4));
+    }
+
+    /// When the two disagree, MLX's own key is the one carrying per-module
+    /// overrides, so it wins.
+    #[test]
+    fn mlx_own_quantization_key_wins_over_the_hugging_face_one() {
+        let config = parse_config_text(
+            r#"{
+                "model_type": "qwen3",
+                "hidden_size": 2048,
+                "num_hidden_layers": 28,
+                "num_attention_heads": 16,
+                "quantization": {"group_size": 32, "bits": 8},
+                "quantization_config": {"group_size": 64, "bits": 4}
+            }"#,
+        )
+        .expect("config parses");
+
+        let qc = config.quantization().expect("quantization is found");
+        assert_eq!((qc.group_size, qc.bits), (32, 8));
     }
 
     #[test]

@@ -503,7 +503,7 @@ fn benchmark_mlx_lm_trial_cpp(
 
 #[allow(dead_code)]
 fn supports_cpp_decode(weights: &NativeWeights, config: &Qwen3Config) -> bool {
-    let is_quantized = config.quantization_config.is_some();
+    let is_quantized = config.quantization().is_some();
     !config.is_qwen3_dense() && !is_quantized && weights.projection_weights_are_dense()
 }
 
