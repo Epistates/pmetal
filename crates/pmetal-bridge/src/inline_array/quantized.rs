@@ -32,15 +32,43 @@ impl InlineArray {
 
     /// Dequantize packed integer weights using per-group scales and biases.
     pub fn dequantize(&self, scales: &Self, biases: &Self, group_size: i32, bits: i32) -> Self {
+        self.dequantize_mode(
+            scales,
+            Some(biases),
+            group_size,
+            bits,
+            QuantizedMode::Affine,
+        )
+    }
+
+    /// Dequantize in a specific MLX quantization mode.
+    ///
+    /// `biases` is optional because only affine mode has them: mxfp4, nvfp4
+    /// and mxfp8 store a scale per group and nothing else. Passing a bias array
+    /// for one of those is an error rather than a no-op, so the `Option` is
+    /// load-bearing.
+    #[inline]
+    pub fn dequantize_mode(
+        &self,
+        scales: &Self,
+        biases: Option<&Self>,
+        group_size: i32,
+        bits: i32,
+        mode: QuantizedMode,
+    ) -> Self {
         let mut dst = MaybeUninit::<RawBuf>::uninit();
+        let b_ptr = biases
+            .map(|b| &b.raw as *const RawBuf)
+            .unwrap_or(std::ptr::null());
         unsafe {
             mlx_inline_dequantize(
                 dst.as_mut_ptr(),
                 &self.raw,
                 &scales.raw,
-                &biases.raw,
+                b_ptr,
                 group_size,
                 bits,
+                mode.as_i32(),
             );
             Self {
                 raw: dst.assume_init(),

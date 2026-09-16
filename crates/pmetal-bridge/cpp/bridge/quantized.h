@@ -11,9 +11,10 @@ extern "C" {
 #endif
 
 // Dequantize: reconstruct float from packed int + scales + biases
+// Dequantize packed weights. `biases` may be null: only affine mode has them.
 void mlx_inline_dequantize(mlx_inline_array* dst, const mlx_inline_array* w,
     const mlx_inline_array* scales, const mlx_inline_array* biases,
-    int group_size, int bits);
+    int group_size, int bits, int mode);
 
 // Quantized matmul: x @ dequantize(w, scales, biases)
 void mlx_inline_quantized_matmul(mlx_inline_array* dst,

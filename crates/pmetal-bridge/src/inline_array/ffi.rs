@@ -128,9 +128,11 @@ unsafe extern "C" {
         dst: *mut RawBuf,
         w: *const RawBuf,
         scales: *const RawBuf,
+        // Null for the floating-point modes, which carry scales only.
         biases: *const RawBuf,
         group_size: i32,
         bits: i32,
+        mode: i32,
     );
     pub(super) fn mlx_inline_from_f32_slice(
         dst: *mut RawBuf,

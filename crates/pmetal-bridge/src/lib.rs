@@ -38,6 +38,8 @@ pub mod turboquant_dispatch;
 
 pub mod native_common;
 pub mod native_loader;
+pub mod native_weight;
+pub use native_weight::{EmbeddingWeight, LayerWeight, QuantParams};
 
 pub mod deepseek_native;
 pub mod gemma4_native;

@@ -427,10 +427,17 @@ void mlx_inline_sign(mlx_inline_array* dst, const mlx_inline_array* a) {
 
 void mlx_inline_dequantize(mlx_inline_array* dst, const mlx_inline_array* w,
     const mlx_inline_array* scales, const mlx_inline_array* biases,
-    int group_size, int bits) {
-    BRIDGE_TRY_DST("dequantize", dst,
+    int group_size, int bits, int mode) {
+    BRIDGE_TRY_DST("dequantize", dst, {
+        // Only affine mode carries biases; mxfp4, nvfp4 and mxfp8 store a
+        // scale per group and nothing else.
+        auto biases_opt = biases
+            ? std::optional<array>(as_arr(biases))
+            : std::optional<array>(std::nullopt);
         new (dst->buf) array(mlx::core::dequantize(
-            as_arr(w), as_arr(scales), as_arr(biases), group_size, bits)));
+            as_arr(w), as_arr(scales), biases_opt, group_size, bits,
+            quant_mode_from_int(mode)));
+    });
 }
 
 void mlx_inline_from_f32_slice(mlx_inline_array* dst, const float* data, const int* shape, int ndim) {

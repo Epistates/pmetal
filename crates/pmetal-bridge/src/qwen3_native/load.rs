@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::{InlineArray, QuantizedMode};
+use crate::{InlineArray, QuantParams, QuantizedMode};
 
 use super::weights::{LayerWeight, LayerWeights, NativeWeights, copy_fresh_arr};
 use super::{Qwen3Config, validate_quantization_runtime_support};
@@ -19,22 +19,13 @@ use super::{Qwen3Config, validate_quantization_runtime_support};
 /// Used to confirm at load time that quantized models were loaded correctly.
 fn weights_are_quantized(layers: &[LayerWeights]) -> bool {
     for lw in layers {
-        if matches!(
-            lw.mlp_gate_w.as_ref(),
-            Some(LayerWeight::Quantized { .. } | LayerWeight::FpQuantized { .. })
-        ) {
+        if matches!(lw.mlp_gate_w.as_ref(), Some(LayerWeight::Quantized { .. })) {
             return true;
         }
-        if matches!(
-            lw.attn_q_w.as_ref(),
-            Some(LayerWeight::Quantized { .. } | LayerWeight::FpQuantized { .. })
-        ) {
+        if matches!(lw.attn_q_w.as_ref(), Some(LayerWeight::Quantized { .. })) {
             return true;
         }
-        if matches!(
-            lw.gdn_qkv_w.as_ref(),
-            Some(LayerWeight::Quantized { .. } | LayerWeight::FpQuantized { .. })
-        ) {
+        if matches!(lw.gdn_qkv_w.as_ref(), Some(LayerWeight::Quantized { .. })) {
             return true;
         }
     }
@@ -43,8 +34,7 @@ fn weights_are_quantized(layers: &[LayerWeights]) -> bool {
 
 fn quant_bits_for_weight_key(config: &Qwen3Config, weight_key: &str, default_bits: i32) -> i32 {
     config
-        .quantization_config
-        .as_ref()
+        .quantization()
         .and_then(|qc| qc.per_tensor_overrides.get(weight_key).copied())
         .unwrap_or(default_bits)
 }
@@ -88,12 +78,15 @@ fn get_stacked_expert_weight(
     validate_quantization_runtime_support(bits)?;
 
     if let Some(scales) = raw.get(&mxfp8_s_key) {
-        return Ok(LayerWeight::FpQuantized {
+        return Ok(LayerWeight::Quantized {
             weight: w,
             scales: scales.clone(),
-            group_size: MXFP8_GROUP_SIZE,
-            bits: MXFP8_BITS,
-            mode: QuantizedMode::Mxfp8,
+            biases: None,
+            params: QuantParams {
+                group_size: MXFP8_GROUP_SIZE,
+                bits: MXFP8_BITS,
+                mode: QuantizedMode::Mxfp8,
+            },
         });
     }
 
@@ -101,9 +94,12 @@ fn get_stacked_expert_weight(
         (Some(scales), Some(biases)) => Ok(LayerWeight::Quantized {
             weight: w,
             scales: scales.clone(),
-            biases: biases.clone(),
-            group_size,
-            bits,
+            biases: Some(biases.clone()),
+            params: QuantParams {
+                group_size,
+                bits,
+                mode: QuantizedMode::Affine,
+            },
         }),
         _ => {
             // Dense — already [E, in, out]; no transpose needed.
@@ -144,8 +140,7 @@ pub fn load_model(
 
     // Quantization params are present only in quantized checkpoints.
     let (q_bits, q_group_size) = config
-        .quantization_config
-        .as_ref()
+        .quantization()
         .map(|qc| (qc.bits, qc.group_size))
         .unwrap_or((4, 64));
     validate_quantization_runtime_support(q_bits)?;
@@ -205,10 +200,8 @@ pub fn load_model(
     ];
 
     // 3d. Conv1d transpose + norm shift + f32→model_dtype casts.
-    let detected_model_dtype = raw
-        .get("model.embed_tokens.weight")
-        .map(|w| w.dtype_raw())
-        .unwrap_or(11); // 11 = bfloat16 fallback
+    let detected_model_dtype =
+        crate::native_weight::detect_model_dtype(|k| raw.get(k).map(|w| w.dtype_raw()));
 
     // 3d. FP8 normalization.
     //
@@ -457,12 +450,15 @@ pub fn load_model(
         let mxfp8_s_key = format!("{base_key}.mxfp8_scales");
 
         if let (Some(w), Some(scales)) = (raw.get(&w_key), raw.get(&mxfp8_s_key)) {
-            return Ok(LayerWeight::FpQuantized {
+            return Ok(LayerWeight::Quantized {
                 weight: w.clone(),
                 scales: scales.clone(),
-                group_size: MXFP8_GROUP_SIZE,
-                bits: MXFP8_BITS,
-                mode: QuantizedMode::Mxfp8,
+                biases: None,
+                params: QuantParams {
+                    group_size: MXFP8_GROUP_SIZE,
+                    bits: MXFP8_BITS,
+                    mode: QuantizedMode::Mxfp8,
+                },
             });
         }
 
@@ -473,9 +469,12 @@ pub fn load_model(
                 Ok(LayerWeight::Quantized {
                     weight: w.clone(),
                     scales: s.clone(),
-                    biases: b.clone(),
-                    group_size: q_group_size,
-                    bits,
+                    biases: Some(b.clone()),
+                    params: QuantParams {
+                        group_size: q_group_size,
+                        bits,
+                        mode: QuantizedMode::Affine,
+                    },
                 })
             }
             _ => {
@@ -497,7 +496,10 @@ pub fn load_model(
         Some(get_layer_weight("lm_head")?)
     };
 
-    let model_dtype = embed_w.dtype_raw();
+    // Deliberately not `embed_w.dtype_raw()`: see `detect_model_dtype`. On a
+    // quantized checkpoint that tensor is packed `uint32`.
+    let model_dtype =
+        crate::native_weight::detect_model_dtype(|k| raw.get(k).map(|w| w.dtype_raw()));
 
     // GDN dimensions (identical across all GDN layers; only meaningful for Qwen3.5).
     let nv = config.gdn_nv();
@@ -888,7 +890,7 @@ pub fn load_model(
     }
 
     // Determine quantization mode for diagnostic output.
-    let _quant_mode = if let Some(ref qc) = config.quantization_config {
+    let _quant_mode = if let Some(qc) = config.quantization() {
         // Inspect the first projection weight to confirm quantized loading succeeded.
         let confirmed = weights_are_quantized(&layers);
         format!(
@@ -907,7 +909,7 @@ pub fn load_model(
         final_norm_eps,
         lm_head_w,
         tie_word_embeddings: config.tie_word_embeddings,
-        quantization_config: config.quantization_config.clone(),
+        quantization_config: config.quantization().cloned(),
         layers,
         model_dtype,
         qjl_matrix: None, // populated by apply_qjl_matrix() when --kv-qjl is set
