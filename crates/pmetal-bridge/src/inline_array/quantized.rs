@@ -25,6 +25,19 @@ impl QuantizedMode {
     pub(crate) fn as_i32(self) -> i32 {
         self as i32
     }
+
+    /// The spelling a checkpoint's `quantization` block uses, as accepted by
+    /// `mx.quantize(..., mode=)`. Unknown names return `None` so a caller can
+    /// reject the file rather than silently decode it as affine.
+    pub fn from_config_name(name: &str) -> Option<Self> {
+        match name {
+            "affine" => Some(Self::Affine),
+            "mxfp8" => Some(Self::Mxfp8),
+            "mxfp4" => Some(Self::Mxfp4),
+            "nvfp4" => Some(Self::Nvfp4),
+            _ => None,
+        }
+    }
 }
 
 impl InlineArray {

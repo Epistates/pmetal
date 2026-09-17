@@ -18,6 +18,7 @@ use crate::InlineArray;
 use crate::compat::Dtype;
 use crate::error::check_last_error;
 use crate::inline_array as bridge;
+use crate::native_weight::MlxQuantization;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -28,6 +29,43 @@ use std::path::{Path, PathBuf};
 pub fn read_config_json(model_dir: &Path) -> Result<String, String> {
     let path = model_dir.join("config.json");
     std::fs::read_to_string(&path).map_err(|e| format!("failed to read {}: {e}", path.display()))
+}
+
+/// The `quantization` block from a checkpoint's `config.json`, or `None` when
+/// the weights are dense.
+///
+/// ⚠️ `mlx_lm.convert` writes the block **twice**, under `quantization` (MLX's
+/// own key, which is where per-module overrides live) and `quantization_config`
+/// (the HF key), with identical contents. MLX's key wins. HF's multimodal
+/// exports also park it inside `text_config`, which is checked last.
+///
+/// `normalize` maps the checkpoint's module paths onto the caller's key
+/// namespace; see [`MlxQuantization::from_json`].
+pub fn load_mlx_quantization(
+    model_dir: &Path,
+    normalize: impl Fn(&str) -> Option<String>,
+) -> Result<Option<MlxQuantization>, String> {
+    let text = read_config_json(model_dir)?;
+    let json: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("failed to parse config.json: {e}"))?;
+
+    let block = ["quantization", "quantization_config"]
+        .iter()
+        .find_map(|key| {
+            json.get(key)
+                .or_else(|| json.get("text_config").and_then(|tc| tc.get(key)))
+        });
+    let Some(block) = block else {
+        return Ok(None);
+    };
+    MlxQuantization::from_json(block, normalize)
+        .map(Some)
+        .ok_or_else(|| {
+            format!(
+                "unsupported quantization block in {}: {block}",
+                model_dir.join("config.json").display()
+            )
+        })
 }
 
 /// Resolve the set of `.safetensors` shard paths under `model_dir`,
