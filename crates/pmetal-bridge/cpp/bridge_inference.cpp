@@ -284,9 +284,16 @@ int mlx_inline_load_safetensors_all(
         int max_entries) {
     try {
         auto [arrays, metadata] = mlx::core::load_safetensors(std::string(path));
+        // Truncating would be indistinguishable from a complete load, since the
+        // caller only sees a count. Fail instead and let it fall back.
+        if (arrays.size() > static_cast<std::size_t>(max_entries)) {
+            pmetal_bridge_set_last_error(
+                "load_safetensors_all",
+                "buffer smaller than the number of tensors in the shard");
+            return -1;
+        }
         int count = 0;
         for (auto& [key, arr] : arrays) {
-            if (count >= max_entries) break;
             key_buf[count] = strdup(key.c_str());
             new (arr_buf[count].buf) array(arr);
             count++;

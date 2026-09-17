@@ -18,23 +18,35 @@ use super::ffi::*;
 /// Load all arrays from a safetensors shard in a single parse.
 ///
 /// This is substantially faster than calling `InlineArray::load_safetensors`
-/// per key because the file is parsed exactly once.  A typical model shard
-/// has ~300 tensors; `MAX_ENTRIES` (2048) comfortably covers any realistic
-/// shard.
+/// per key because the file is parsed exactly once.
+///
+/// The buffers are sized from the shard's own header rather than a fixed cap.
+/// ⚠️ A cap that is too small used to drop tensors **silently**: the C++ loader
+/// stopped at `max_entries` and returned that count, which looks exactly like a
+/// complete load. `mlx-community/gemma-4-e4b-it-4bit` ships 2770 tensors in one
+/// file (text tower plus the audio and vision towers), so the old cap of 2048
+/// lost 722 of them, `model.norm.weight` among them, and the loader reported a
+/// missing weight for a key that was sitting in the file.
 ///
 /// Returns `None` on I/O or parse error.  Individual key allocation failures
 /// (malformed UTF-8 key) are silently skipped.
 pub fn load_safetensors_shard(path: &str) -> Option<Vec<(String, InlineArray)>> {
-    const MAX_ENTRIES: usize = 2048;
+    let Some(entries) = safetensors_entry_count(path) else {
+        // Header unreadable by the Rust parser: let the per-tensor path try.
+        return load_safetensors_shard_fallback(path);
+    };
+    if entries == 0 {
+        return Some(Vec::new());
+    }
 
     let c_path = std::ffi::CString::new(path).ok()?;
 
     // Allocate key-pointer buffer.  C++ will strdup into each slot.
-    let mut key_ptrs: Vec<*mut std::ffi::c_char> = vec![std::ptr::null_mut(); MAX_ENTRIES];
+    let mut key_ptrs: Vec<*mut std::ffi::c_char> = vec![std::ptr::null_mut(); entries];
 
     // Allocate uninitialised array slots.  C++ does placement new into each
     // occupied slot; only the first `count` slots are initialised.
-    let mut arr_slots: Vec<MaybeUninit<RawBuf>> = (0..MAX_ENTRIES)
+    let mut arr_slots: Vec<MaybeUninit<RawBuf>> = (0..entries)
         .map(|_| MaybeUninit::<RawBuf>::uninit())
         .collect();
 
@@ -45,7 +57,7 @@ pub fn load_safetensors_shard(path: &str) -> Option<Vec<(String, InlineArray)>> 
             // Cast *mut MaybeUninit<RawBuf> → *mut RawBuf.  This is safe
             // because MaybeUninit<T> has the same layout as T.
             arr_slots.as_mut_ptr() as *mut RawBuf,
-            MAX_ENTRIES as i32,
+            entries as i32,
         )
     };
 
@@ -82,6 +94,15 @@ pub fn load_safetensors_shard(path: &str) -> Option<Vec<(String, InlineArray)>> 
     }
 
     Some(result)
+}
+
+/// How many tensors a shard holds, from its header alone.
+///
+/// `SafeTensors::deserialize` parses the JSON header and borrows the rest, so
+/// this does not read any tensor data.
+fn safetensors_entry_count(path: &str) -> Option<usize> {
+    let mapped = map_safetensors_file(path)?;
+    Some(SafeTensors::deserialize(&mapped).ok()?.names().len())
 }
 
 fn load_safetensors_shard_fallback(path: &str) -> Option<Vec<(String, InlineArray)>> {
@@ -201,4 +222,45 @@ impl InlineArray {
 /// Set the global MLX random seed for reproducibility.
 pub fn random_seed(seed: u64) {
     unsafe { mlx_inline_random_seed(seed) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⚠️ The regression this exists for: the loader used to size its buffers
+    /// to a fixed 2048 and the C++ side stopped there, returning a count that
+    /// looked like a complete load. `mlx-community/gemma-4-e4b-it-4bit` holds
+    /// 2770 tensors in one file, so 722 went missing and the Gemma 4 loader
+    /// reported `missing weight model.norm.weight` for a key that was in the
+    /// file all along.
+    #[test]
+    fn a_shard_with_more_tensors_than_the_old_cap_loads_every_one() {
+        const ENTRIES: usize = 2770;
+
+        let dir = std::env::temp_dir().join("pmetal-safetensors-cap-test");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("many.safetensors");
+        let path_str = path.to_str().expect("utf-8 path");
+
+        let arrays: Vec<InlineArray> = (0..ENTRIES)
+            .map(|i| InlineArray::from_f32_slice(&[i as f32], &[1]))
+            .collect();
+        let names: Vec<String> = (0..ENTRIES).map(|i| format!("tensor.{i}.weight")).collect();
+        let entries: Vec<(&str, &InlineArray)> = names
+            .iter()
+            .map(String::as_str)
+            .zip(arrays.iter())
+            .collect();
+        InlineArray::save_safetensors(path_str, &entries);
+
+        let loaded = load_safetensors_shard(path_str).expect("shard loads");
+        assert_eq!(loaded.len(), ENTRIES, "every tensor comes back");
+        assert!(
+            loaded.iter().any(|(k, _)| k == "tensor.2769.weight"),
+            "the last tensor is present, not truncated away"
+        );
+
+        let _ = std::fs::remove_file(&path);
+    }
 }
