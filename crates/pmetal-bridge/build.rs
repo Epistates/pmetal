@@ -9,6 +9,12 @@ const BUNDLED_MLX_GIT_TAG: &str = "7241f12e631440387a2156ec1018d1c9fe8e56b9";
 
 // ── Deployment target ──────────────────────────────────────────────────────
 
+/// The macOS floor for everything this crate produces.
+///
+/// This is the only place it is set. It deliberately does *not* live in
+/// `.cargo/config.toml` under `[env]`, which would also stamp host proc-macro
+/// dylibs and make them unloadable under Xcode 27 (#29). An ambient
+/// `MACOSX_DEPLOYMENT_TARGET` may still raise it, never lower it.
 #[cfg(target_os = "macos")]
 fn resolve_deployment_target() -> String {
     const MLX_MIN_MACOS: (u32, u32) = (14, 0);
@@ -86,8 +92,15 @@ fn set_dylib_install_name(dylib: &std::path::Path) {
     }
 }
 
+/// Publish a key dependents read as `DEP_PMETAL_BRIDGE_<KEY>`.
+///
+/// The separator has to be `::`. `cargo:metadata=k=v` is the *old* one-key
+/// form, so cargo reads the key as `metadata` and the value as the whole
+/// `k=v` string: every call lands on `DEP_PMETAL_BRIDGE_METADATA` and the last
+/// one wins. That is why `pmetal/build.rs` never found `DEP_PMETAL_BRIDGE_*`
+/// and always fell through to scanning sibling build directories.
 fn emit_bridge_metadata(key: &str, value: impl AsRef<str>) {
-    println!("cargo:metadata={key}={}", value.as_ref());
+    println!("cargo::metadata={key}={}", value.as_ref());
 }
 
 // ── Staging + CMake build ─────────────────────────────────────────────────
@@ -337,12 +350,16 @@ fn mlx_static_requested() -> bool {
 // ── Main build ────────────────────────────────────────────────────────────
 
 fn build_and_link() {
-    // Enforce macOS deployment target >= 14.0 before cmake or cc see CFLAGS
+    // Enforce macOS deployment target >= 14.0 before cmake or cc see CFLAGS.
+    // Setting it here keeps it inside this build script's own process, so no
+    // host proc macro is ever linked with it.
     #[cfg(target_os = "macos")]
     {
         let target = resolve_deployment_target();
         // SAFETY: build scripts are single-threaded; no other threads exist yet.
         unsafe { env::set_var("MACOSX_DEPLOYMENT_TARGET", &target) };
+        // Dependents link against objects built for this floor, so publish it.
+        emit_bridge_metadata("min_macos", &target);
     }
 
     let mlx_prefix = env::var("PMETAL_MLX_PREFIX").ok().map(PathBuf::from);

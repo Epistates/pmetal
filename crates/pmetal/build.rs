@@ -13,12 +13,14 @@ use std::path::PathBuf;
 fn main() {
     println!("cargo:rerun-if-env-changed=DEP_PMETAL_BRIDGE_MLX_LIB_DIR");
     println!("cargo:rerun-if-env-changed=DEP_PMETAL_BRIDGE_MLX_METALLIB");
+    println!("cargo:rerun-if-env-changed=DEP_PMETAL_BRIDGE_MIN_MACOS");
     println!("cargo:rerun-if-env-changed=HOME");
 
     if env::var("CARGO_CFG_TARGET_OS").unwrap() != "macos" {
         return;
     }
 
+    emit_deployment_target();
     emit_runtime_rpath();
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -48,6 +50,20 @@ fn main() {
 
 fn emit(path: &std::path::Path) {
     println!("cargo:rustc-env=MLX_METALLIB_EMBED_PATH={}", path.display());
+}
+
+/// Stamp the binary with the macOS floor the bridge was built against, so it
+/// advertises what it actually needs instead of rustc's default of 11.0.
+///
+/// This has to be a link arg rather than `MACOSX_DEPLOYMENT_TARGET` in
+/// `.cargo/config.toml`: `[env]` reaches host proc macros too, and stamping
+/// those breaks the build outright under Xcode 27 (#29). A link arg from here
+/// applies to this package's artifacts and nothing else.
+fn emit_deployment_target() {
+    let Ok(min_macos) = env::var("DEP_PMETAL_BRIDGE_MIN_MACOS") else {
+        return;
+    };
+    println!("cargo:rustc-link-arg=-mmacosx-version-min={min_macos}");
 }
 
 fn emit_runtime_rpath() {
