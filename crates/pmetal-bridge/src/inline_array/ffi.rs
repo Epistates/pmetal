@@ -3,7 +3,7 @@
 //! All `mlx_inline_*` extern declarations live here with `pub(super)` visibility
 //! so each submodule can `use super::ffi::*;` to pick up exactly what it needs.
 
-use super::RawBuf;
+use super::{QWeightRaw, RawBuf};
 
 #[allow(dead_code)]
 unsafe extern "C" {
@@ -338,10 +338,10 @@ unsafe extern "C" {
         dst_cache_vals: *mut RawBuf,
         x: *const RawBuf,
         in_norm_w: *const RawBuf,
-        q_w: *const RawBuf,
-        k_w: *const RawBuf,
-        v_w: *const RawBuf,
-        o_w: *const RawBuf,
+        q_w: *const QWeightRaw,
+        k_w: *const QWeightRaw,
+        v_w: *const QWeightRaw,
+        o_w: *const QWeightRaw,
         q_norm_w: *const RawBuf,
         k_norm_w: *const RawBuf,
         post_norm_w: *const RawBuf,
@@ -365,8 +365,8 @@ unsafe extern "C" {
         dst_out: *mut RawBuf,
         x: *const RawBuf,
         in_norm_w: *const RawBuf,
-        q_w: *const RawBuf,
-        o_w: *const RawBuf,
+        q_w: *const QWeightRaw,
+        o_w: *const QWeightRaw,
         q_norm_w: *const RawBuf,
         post_norm_w: *const RawBuf,
         rope_freqs: *const RawBuf,
@@ -389,9 +389,9 @@ unsafe extern "C" {
         dst_out: *mut RawBuf,
         x: *const RawBuf,
         pre_norm_w: *const RawBuf,
-        gate_w: *const RawBuf,
-        up_w: *const RawBuf,
-        down_w: *const RawBuf,
+        gate_w: *const QWeightRaw,
+        up_w: *const QWeightRaw,
+        down_w: *const QWeightRaw,
         post_norm_w: *const RawBuf,
         pre_norm_eps: f32,
         post_norm_eps: f32,
@@ -401,8 +401,8 @@ unsafe extern "C" {
         dst_out: *mut RawBuf,
         x: *const RawBuf,
         layer_input: *const RawBuf,
-        gate_w: *const RawBuf,
-        projection_w: *const RawBuf,
+        gate_w: *const QWeightRaw,
+        projection_w: *const QWeightRaw,
         post_norm_w: *const RawBuf,
         post_norm_eps: f32,
     );

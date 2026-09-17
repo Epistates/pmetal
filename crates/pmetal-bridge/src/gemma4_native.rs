@@ -33,6 +33,7 @@ use serde::Deserialize;
 use crate::InlineArray;
 use crate::compat::{Dtype, nn};
 use crate::inline_array as bridge;
+use crate::native_weight::{EmbeddingWeight, LayerWeight, QuantParams, detect_model_dtype};
 
 // ----------------------------------------------------------------------------
 // Config
@@ -263,11 +264,13 @@ fn parse_config_text(text: &str) -> Result<Gemma4Config, String> {
 // Per-layer weights + cache
 // ----------------------------------------------------------------------------
 
-/// Per-layer weight bundle. All dense linears are pre-transposed to
-/// `[in, out]` form so the matmul hot path is contiguous.
+/// Per-layer weight bundle. A dense linear is pre-transposed to `[in, out]`
+/// form so the matmul hot path is contiguous; a packed one keeps the
+/// checkpoint's `[out, in]` and transposes in-kernel. [`LayerWeight`] hides
+/// the difference from every call site.
 pub struct PerLayerInputWeights {
-    pub embed_w: InlineArray,
-    pub projection_w: InlineArray,
+    pub embed_w: EmbeddingWeight,
+    pub projection_w: LayerWeight,
     pub projection_norm_w: InlineArray,
     pub embed_scale_scalar: InlineArray,
     pub projection_scale_scalar: InlineArray,
@@ -277,26 +280,26 @@ pub struct PerLayerInputWeights {
 }
 
 pub struct PerLayerGateWeights {
-    pub gate_w: InlineArray,
-    pub projection_w: InlineArray,
+    pub gate_w: LayerWeight,
+    pub projection_w: LayerWeight,
     pub post_norm_w: InlineArray,
 }
 
 pub struct LayerWeights {
     pub input_norm_w: InlineArray,
-    pub q_w: InlineArray,
-    pub k_w: InlineArray,
+    pub q_w: LayerWeight,
+    pub k_w: LayerWeight,
     /// `None` for full-attention layers under `attention_k_eq_v` (values
     /// come from the raw k_proj output).
-    pub v_w: Option<InlineArray>,
-    pub o_w: InlineArray,
+    pub v_w: Option<LayerWeight>,
+    pub o_w: LayerWeight,
     pub q_norm_w: InlineArray,
     pub k_norm_w: InlineArray,
     pub post_attn_norm_w: InlineArray,
     pub pre_ffn_norm_w: InlineArray,
-    pub gate_w: InlineArray,
-    pub up_w: InlineArray,
-    pub down_w: InlineArray,
+    pub gate_w: LayerWeight,
+    pub up_w: LayerWeight,
+    pub down_w: LayerWeight,
     pub post_ffn_norm_w: InlineArray,
     pub layer_scalar: InlineArray,
     pub per_layer_gate: Option<PerLayerGateWeights>,
@@ -320,10 +323,10 @@ pub struct LayerWeights {
 /// Full model weight bundle. `lm_head_w` is `None` when the model ties
 /// embeddings (the norm step uses `embed_w` directly).
 pub struct NativeWeights {
-    pub embed_w: InlineArray,
+    pub embed_w: EmbeddingWeight,
     pub per_layer_inputs: Option<PerLayerInputWeights>,
     pub final_norm_w: InlineArray,
-    pub lm_head_w: Option<InlineArray>,
+    pub lm_head_w: Option<LayerWeight>,
     pub layers: Vec<LayerWeights>,
     pub model_dtype: i32,
     pub config: Gemma4Config,
@@ -552,7 +555,7 @@ fn compute_per_layer_inputs(
     };
     let per_layer_embeds = ple
         .embed_w
-        .take_axis(&safe_token_ids, 0)
+        .lookup(&safe_token_ids)
         .multiply(&ple.embed_scale_scalar)
         .reshape(&[
             input_ids.dim(0),
@@ -560,8 +563,9 @@ fn compute_per_layer_inputs(
             weights.config.num_hidden_layers,
             per_layer_dim,
         ]);
-    let projection = inputs_embeds
-        .matmul(&ple.projection_w)
+    let projection = ple
+        .projection_w
+        .matmul_from(inputs_embeds)
         .multiply(&ple.projection_scale_scalar)
         .reshape(&[
             input_ids.dim(0),
@@ -609,11 +613,11 @@ fn apply_per_layer_input_block(
         );
     }
     let residual = hidden.clone();
-    let gate = hidden.matmul(&ple.gate_w);
+    let gate = ple.gate_w.matmul_from(hidden);
     let activated = nn::gelu_tanh_approximate(&gate);
-    let projected = activated
-        .multiply(layer_per_input)
-        .matmul(&ple.projection_w)
+    let projected = ple
+        .projection_w
+        .matmul_from(&activated.multiply(layer_per_input))
         .rms_norm(Some(&ple.post_norm_w), eps);
     residual.add(&projected)
 }
@@ -676,8 +680,9 @@ fn shared_kv_attention_forward(
         );
 
     let normed = hidden.rms_norm(Some(&layer.input_norm_w), eps);
-    let queries = normed
-        .matmul(&layer.q_w)
+    let queries = layer
+        .q_w
+        .matmul_from(&normed)
         .reshape(&[b, s, layer.n_heads, layer.head_dim])
         .rms_norm(Some(&layer.q_norm_w), eps)
         .transpose_axes(&[0, 2, 1, 3]);
@@ -711,10 +716,13 @@ fn shared_kv_attention_forward(
         crate::decode::sdpa_causal_like_mlx(&queries, &source_keys, &source_values, 1.0, s)
     };
 
-    attn_out
-        .transpose_axes(&[0, 2, 1, 3])
-        .reshape(&[b, s, layer.n_heads * layer.head_dim])
-        .matmul(&layer.o_w)
+    layer
+        .o_w
+        .matmul_from(&attn_out.transpose_axes(&[0, 2, 1, 3]).reshape(&[
+            b,
+            s,
+            layer.n_heads * layer.head_dim,
+        ]))
         .rms_norm(Some(&layer.post_attn_norm_w), eps)
 }
 
@@ -794,6 +802,23 @@ pub fn load_model(
         }
     }
 
+    // The `quantization` block, if any, read the way mlx-lm reads it. Its
+    // module paths get the same normalisation as the weight keys, or every
+    // per-module override would miss and the 8-bit tensors in a QAT
+    // checkpoint would be decoded as 4-bit.
+    let quantization = crate::native_loader::load_mlx_quantization(model_dir, |path| {
+        normalize_checkpoint_key(path)
+    })?;
+    // How to read one module's packed tensors: its own override, else the
+    // file-level block, else MLX's affine defaults. Only ever consulted for a
+    // module that has scales, so the last case decodes nothing.
+    let params_for = |module: &str| -> QuantParams {
+        quantization
+            .as_ref()
+            .map(|q| q.params_for(module).unwrap_or_else(|| q.default_params()))
+            .unwrap_or_else(|| QuantParams::defaults_for(crate::QuantizedMode::Affine))
+    };
+
     let take = |map: &mut std::collections::HashMap<String, InlineArray>,
                 key: &str|
      -> Result<InlineArray, String> {
@@ -801,19 +826,48 @@ pub fn load_model(
             .ok_or_else(|| format!("Gemma 4 native: missing weight {key}"))
     };
 
-    let embed_w = take(&mut raw, "model.embed_tokens.weight")?;
+    // ⚠️ Not from `embed_tokens.weight`: on a quantized checkpoint that is the
+    // packed `uint32` payload, and deriving the trunk dtype from it makes
+    // every scalar and the whole KV cache integer. The model then loads, runs
+    // at the right speed, and decodes noise.
+    let model_dtype = detect_model_dtype(|key| raw.get(key).map(|arr| arr.dtype_raw()));
+
+    // One module's three tensors. `scales` decides the variant, which is
+    // upstream's rule too: mlx-lm quantizes a module exactly when
+    // `{path}.scales` is in the weights.
+    let take_proj = |map: &mut std::collections::HashMap<String, InlineArray>,
+                     module: &str|
+     -> Result<LayerWeight, String> {
+        let weight = map
+            .remove(&format!("{module}.weight"))
+            .ok_or_else(|| format!("Gemma 4 native: missing weight {module}.weight"))?;
+        let scales = map.remove(&format!("{module}.scales"));
+        let biases = map.remove(&format!("{module}.biases"));
+        Ok(LayerWeight::new(weight, scales, biases, params_for(module)))
+    };
+
+    let embed_w = EmbeddingWeight::new(
+        take(&mut raw, "model.embed_tokens.weight")?,
+        raw.remove("model.embed_tokens.scales"),
+        raw.remove("model.embed_tokens.biases"),
+        params_for("model.embed_tokens"),
+    );
     let final_norm_w = take(&mut raw, "model.norm.weight")?;
     let lm_head_w = if config.tie_word_embeddings {
         None
     } else {
-        Some(take(&mut raw, "lm_head.weight")?.t())
+        Some(take_proj(&mut raw, "lm_head")?)
     };
-    let model_dtype = embed_w.dtype().as_i32();
     let per_layer_inputs = if config.uses_per_layer_inputs() {
         let total_ple_dim = config.num_hidden_layers * config.per_layer_input_dim();
         Some(PerLayerInputWeights {
-            embed_w: take(&mut raw, "model.embed_tokens_per_layer.weight")?,
-            projection_w: take(&mut raw, "model.per_layer_model_projection.weight")?.t(),
+            embed_w: EmbeddingWeight::new(
+                take(&mut raw, "model.embed_tokens_per_layer.weight")?,
+                raw.remove("model.embed_tokens_per_layer.scales"),
+                raw.remove("model.embed_tokens_per_layer.biases"),
+                params_for("model.embed_tokens_per_layer"),
+            ),
+            projection_w: take_proj(&mut raw, "model.per_layer_model_projection")?,
             projection_norm_w: take(&mut raw, "model.per_layer_projection_norm.weight")?,
             embed_scale_scalar: InlineArray::scalar_with_dtype(
                 (config.per_layer_input_dim() as f32).sqrt(),
@@ -873,22 +927,22 @@ pub fn load_model(
         let q_norm_w = take(&mut raw, &format!("{p}.self_attn.q_norm.weight"))?;
         let k_norm_w = take(&mut raw, &format!("{p}.self_attn.k_norm.weight"))?;
 
-        let q_w = take(&mut raw, &format!("{p}.self_attn.q_proj.weight"))?.t();
-        let k_w = take(&mut raw, &format!("{p}.self_attn.k_proj.weight"))?.t();
+        let q_w = take_proj(&mut raw, &format!("{p}.self_attn.q_proj"))?;
+        let k_w = take_proj(&mut raw, &format!("{p}.self_attn.k_proj"))?;
         let v_w = if use_k_eq_v {
             None
         } else {
-            Some(take(&mut raw, &format!("{p}.self_attn.v_proj.weight"))?.t())
+            Some(take_proj(&mut raw, &format!("{p}.self_attn.v_proj"))?)
         };
-        let o_w = take(&mut raw, &format!("{p}.self_attn.o_proj.weight"))?.t();
+        let o_w = take_proj(&mut raw, &format!("{p}.self_attn.o_proj"))?;
 
-        let gate_w = take(&mut raw, &format!("{p}.mlp.gate_proj.weight"))?.t();
-        let up_w = take(&mut raw, &format!("{p}.mlp.up_proj.weight"))?.t();
-        let down_w = take(&mut raw, &format!("{p}.mlp.down_proj.weight"))?.t();
+        let gate_w = take_proj(&mut raw, &format!("{p}.mlp.gate_proj"))?;
+        let up_w = take_proj(&mut raw, &format!("{p}.mlp.up_proj"))?;
+        let down_w = take_proj(&mut raw, &format!("{p}.mlp.down_proj"))?;
         let per_layer_gate = if config.uses_per_layer_inputs() {
             Some(PerLayerGateWeights {
-                gate_w: take(&mut raw, &format!("{p}.per_layer_input_gate.weight"))?.t(),
-                projection_w: take(&mut raw, &format!("{p}.per_layer_projection.weight"))?.t(),
+                gate_w: take_proj(&mut raw, &format!("{p}.per_layer_input_gate"))?,
+                projection_w: take_proj(&mut raw, &format!("{p}.per_layer_projection"))?,
                 post_norm_w: take(&mut raw, &format!("{p}.post_per_layer_input_norm.weight"))?,
             })
         } else {
@@ -957,6 +1011,9 @@ pub fn load_model(
     for l in weights.layers.iter() {
         l.q_w.async_eval_ref();
         l.k_w.async_eval_ref();
+        if let Some(ref v) = l.v_w {
+            v.async_eval_ref();
+        }
         l.o_w.async_eval_ref();
         l.gate_w.async_eval_ref();
         l.up_w.async_eval_ref();
@@ -1033,7 +1090,7 @@ pub fn forward_step(
     input_ids: &InlineArray,
     cache: &mut NativeCache,
 ) -> InlineArray {
-    let dtype = weights.embed_w.dtype();
+    let dtype = Dtype::from_raw(weights.model_dtype);
     let seq_len = input_ids.dim(1);
     let profile = std::env::var_os("PMETAL_GEMMA4_TIMING").is_some();
     let t_start = if profile {
@@ -1046,7 +1103,7 @@ pub fn forward_step(
     // time so broadcasting doesn't promote the bf16 residual stream.
     let mut hidden = weights
         .embed_w
-        .take_axis(input_ids, 0)
+        .lookup(input_ids)
         .multiply(&weights.embed_scale_scalar);
     let per_layer_inputs = compute_per_layer_inputs(weights, input_ids, &hidden);
 
@@ -1157,10 +1214,10 @@ pub fn forward_step(
             )
         } else {
             let mlp_in = h.rms_norm(Some(&layer.pre_ffn_norm_w), eps);
-            let gate = mlp_in.matmul(&layer.gate_w);
-            let up = mlp_in.matmul(&layer.up_w);
+            let gate = layer.gate_w.matmul_from(&mlp_in);
+            let up = layer.up_w.matmul_from(&mlp_in);
             let activated = InlineArray::fused_geglu_tanh(&gate, &up);
-            let down = activated.matmul(&layer.down_w);
+            let down = layer.down_w.matmul_from(&activated);
             down.rms_norm(Some(&layer.post_ffn_norm_w), eps)
         };
 
@@ -1201,11 +1258,11 @@ pub fn forward_step(
     // 3. Final norm + tied LM head + logit softcap.
     let normed = hidden.rms_norm(Some(&weights.final_norm_w), eps);
     let raw_logits = match weights.lm_head_w.as_ref() {
-        Some(w) => normed.matmul(w),
-        // Tied embedding: `embed_w` is stored as `[vocab, hidden]`. Use
-        // its `.t()` view so the matmul shape `[B, T, hidden] @
-        // [hidden, vocab]` lines up. `.t()` is metadata-only in mlx.
-        None => normed.matmul(&weights.embed_w.t()),
+        Some(w) => w.matmul_from(&normed),
+        // Tied embedding: `as_linear` is `mlx.nn.Embedding.as_linear`, which
+        // takes the `[vocab, hidden]` table's transpose for a dense model and
+        // runs a quantized matmul against the packed rows otherwise.
+        None => weights.embed_w.as_linear(&normed),
     };
     match weights.softcap_scalar.as_ref() {
         Some(cap_arr) => {
@@ -1374,9 +1431,9 @@ mod tests {
     fn compute_per_layer_inputs_matches_scaled_embedding_path() {
         let config = toy_config();
         let weights = NativeWeights {
-            embed_w: InlineArray::zeros(&[8, 4], Dtype::Float32.as_i32()),
+            embed_w: EmbeddingWeight::Dense(InlineArray::zeros(&[8, 4], Dtype::Float32.as_i32())),
             per_layer_inputs: Some(PerLayerInputWeights {
-                embed_w: InlineArray::from_f32_slice(
+                embed_w: EmbeddingWeight::Dense(InlineArray::from_f32_slice(
                     &[
                         0.0, 0.0, 0.0, 0.0, //
                         1.0, 2.0, 3.0, 4.0, //
@@ -1388,8 +1445,11 @@ mod tests {
                         0.0, 0.0, 0.0, 0.0,
                     ],
                     &[8, 4],
-                ),
-                projection_w: InlineArray::zeros(&[4, 4], Dtype::Float32.as_i32()),
+                )),
+                projection_w: LayerWeight::Dense(InlineArray::zeros(
+                    &[4, 4],
+                    Dtype::Float32.as_i32(),
+                )),
                 projection_norm_w: InlineArray::ones(&[2], Dtype::Float32.as_i32()),
                 embed_scale_scalar: InlineArray::scalar_with_dtype(
                     2.0f32.sqrt(),

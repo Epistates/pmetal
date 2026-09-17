@@ -116,42 +116,10 @@ pub fn detect_arch(model_path: &Path) -> Option<NativeArch> {
         "deepseek_v3" => Some(NativeArch::DeepSeek),
         "gpt_oss" => Some(NativeArch::GptOss),
         "gemma4" | "gemma4_text" | "gemma4_unified" | "gemma4_unified_text" => {
-            if declares_quantized_weights(&v) {
-                tracing::info!(
-                    "Gemma 4 checkpoint is quantized; using the generic engine, which \
-                     dequantizes to the model dtype. Expect the memory of an unquantized \
-                     model until the native engine reads packed weights."
-                );
-                return None;
-            }
             Some(NativeArch::Gemma4)
         }
         _ => None,
     }
-}
-
-/// `true` when `config.json` says the weights are stored quantized.
-///
-/// Every native architecture except Gemma 4 reads the `.scales`/`.biases`
-/// siblings and runs MLX's quantized matmul kernels. Gemma 4's loader takes
-/// each `{key}.weight` straight out of the checkpoint, so on a quantized one it
-/// hands the packed `uint32` payload to a dense matmul. The shapes stay
-/// self-consistent for a while, and the failure surfaces several ops later as a
-/// norm complaining that its weight does not match the width of its input.
-///
-/// Declining here routes those checkpoints to the generic `pmetal-models`
-/// loader, which dequantizes them properly, per-module bit-width overrides
-/// included. That costs the memory the quantization was bought for, so it is a
-/// stopgap for correctness rather than the end state.
-fn declares_quantized_weights(config: &serde_json::Value) -> bool {
-    let quantized = |scope: Option<&serde_json::Value>| {
-        scope.is_some_and(|scope| {
-            ["quantization", "quantization_config"]
-                .iter()
-                .any(|key| scope.get(key).is_some_and(|q| q.get("bits").is_some()))
-        })
-    };
-    quantized(Some(config)) || quantized(config.get("text_config"))
 }
 
 pub fn load_native_bridge_info(model_path: &Path) -> Result<Option<NativeBridgeInfo>, String> {
@@ -283,11 +251,12 @@ mod tests {
     }
 
     /// `mlx-community/gemma-4-12B-it-qat-4bit` stores every projection and the
-    /// embedding as packed `uint32` beside `.scales`/`.biases`. The Gemma 4
-    /// native loader has no notion of either, so claiming the checkpoint means
-    /// multiplying by the packed payload.
+    /// embedding as packed `uint32` beside `.scales`/`.biases`, and puts the
+    /// MLP at 8 bits through per-module overrides. The native engine reads all
+    /// of that now, so handing it to the generic loader would dequantize a
+    /// 10 GB checkpoint back up to ~27 GB for nothing.
     #[test]
-    fn declines_a_quantized_gemma4_checkpoint() {
+    fn claims_a_quantized_gemma4_checkpoint() {
         let dir = write_temp_config(
             r#"{
                 "model_type":"gemma4_unified",
@@ -299,12 +268,12 @@ mod tests {
                 }
             }"#,
         );
-        assert_eq!(detect_arch(&dir), None);
+        assert_eq!(detect_arch(&dir), Some(NativeArch::Gemma4));
         let _ = fs::remove_dir_all(dir);
     }
 
-    /// The other native architectures read `.scales`/`.biases` themselves, so
-    /// quantization is not a reason to hand them to the generic loader.
+    /// Every native architecture reads `.scales`/`.biases` itself, so
+    /// quantization is not a reason to hand one to the generic loader.
     #[test]
     fn a_quantized_checkpoint_still_reaches_the_other_native_engines() {
         let dir = write_temp_config(

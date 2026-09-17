@@ -50,6 +50,23 @@ pub(crate) struct RawBuf {
     pub(crate) buf: [u8; ARRAY_BUF_SIZE],
 }
 
+/// One projection weight as the compiled blocks take it — matches
+/// `mlx_inline_qweight` in C.
+///
+/// A null `scales` means dense, and a null `biases` means a mode with no bias
+/// term. Build one with [`crate::native_weight::LayerWeight::as_raw`]; the
+/// borrow keeps the arrays it points at alive for the call.
+#[repr(C)]
+pub(crate) struct QWeightRaw<'a> {
+    pub(crate) weight: *const RawBuf,
+    pub(crate) scales: *const RawBuf,
+    pub(crate) biases: *const RawBuf,
+    pub(crate) group_size: i32,
+    pub(crate) bits: i32,
+    pub(crate) mode: i32,
+    pub(crate) _owner: std::marker::PhantomData<&'a InlineArray>,
+}
+
 mod ffi;
 use ffi::*;
 

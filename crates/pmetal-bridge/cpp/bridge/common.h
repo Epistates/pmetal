@@ -23,6 +23,27 @@ typedef struct {
     _Alignas(MLX_ARRAY_ALIGN) unsigned char buf[MLX_ARRAY_SIZE];
 } mlx_inline_array;
 
+// One projection weight, dense or packed. Mirrors `native_weight::LayerWeight`.
+//
+// `scales == NULL` means dense: `weight` is already pre-transposed to
+// `[in, out]` and the op is a plain matmul. Otherwise `weight` is packed as
+// the checkpoint stores it, `[out, in / (32 / bits)]`, and the op is a
+// quantized_matmul with transpose = true. `biases` is NULL for the
+// floating-point modes (mxfp4, nvfp4, mxfp8), which carry scales only.
+//
+// Passing this rather than a bare array is what lets one compiled Gemma 4
+// graph serve both a bf16 and a 4-bit checkpoint. `group_size` / `bits` /
+// `mode` are part of every compiled block's cache key, so a mixed-precision
+// checkpoint gets one trace per distinct combination.
+typedef struct {
+    const mlx_inline_array* weight;
+    const mlx_inline_array* scales;
+    const mlx_inline_array* biases;
+    int group_size;
+    int bits;
+    int mode;
+} mlx_inline_qweight;
+
 // ── Lifecycle ─────────────────────────────────────────────────────────────
 void mlx_inline_init_empty(mlx_inline_array* dst);
 void mlx_inline_init_copy(mlx_inline_array* dst, const mlx_inline_array* src);

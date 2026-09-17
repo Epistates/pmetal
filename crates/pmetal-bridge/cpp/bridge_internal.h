@@ -8,7 +8,9 @@
 #include <cstring>
 #include <cstdlib>
 #include <exception>
+#include <optional>
 #include <string>
+#include <vector>
 
 using mlx::core::array;
 
@@ -114,4 +116,80 @@ static inline std::string quant_mode_from_int(int mode) {
         default:
             return "affine";
     }
+}
+
+// ---------------------------------------------------------------------------
+// Polymorphic projections inside a compiled block
+// ---------------------------------------------------------------------------
+//
+// A compiled trace bakes in which kernel each projection uses, so a block that
+// serves both dense and packed weights needs two things: the quantization
+// signature in its cache key, and a fixed input arity so the traced lambda can
+// index its inputs by position. Every projection therefore contributes exactly
+// three slots, with dummies standing in for the tensors a dense weight does
+// not have.
+
+// The part of a projection that selects a kernel. The arrays themselves arrive
+// through the compiled function's input vector; this is what gets captured.
+struct QProjSig {
+    int quantized = 0;
+    int has_biases = 0;
+    int group_size = 0;
+    int bits = 0;
+    int mode = 0;
+
+    bool operator==(const QProjSig& other) const {
+        return quantized == other.quantized && has_biases == other.has_biases
+            && group_size == other.group_size && bits == other.bits
+            && mode == other.mode;
+    }
+};
+
+static inline QProjSig qproj_sig(const mlx_inline_qweight* w) {
+    if (w == nullptr || w->scales == nullptr) {
+        return QProjSig{};
+    }
+    return QProjSig{1, w->biases != nullptr ? 1 : 0, w->group_size, w->bits, w->mode};
+}
+
+// A stand-in for a slot the projection does not use. Shared across every
+// block: a compiled trace keys on shape and dtype, so one scalar serves all.
+static inline const array& qproj_dummy() {
+    static array dummy(0.0f);
+    return dummy;
+}
+
+// Append one projection's three slots: weight, scales, biases.
+static inline void push_qproj(std::vector<array>& ins, const mlx_inline_qweight* w) {
+    ins.push_back(as_arr(w->weight));
+    ins.push_back(w->scales != nullptr ? as_arr(w->scales) : qproj_dummy());
+    ins.push_back(w->biases != nullptr ? as_arr(w->biases) : qproj_dummy());
+}
+
+// `x @ w`, dense or packed. The dense arm relies on the caller having
+// pre-transposed to `[in, out]`; the packed arm asks MLX to transpose, since a
+// packed tensor cannot be transposed without unpacking it first. Mirrors
+// `native_weight::LayerWeight::matmul_from`.
+static inline array qproj_matmul(
+    const array& x,
+    const array& weight,
+    const array& scales,
+    const array& biases,
+    const QProjSig& sig
+) {
+    if (sig.quantized == 0) {
+        return mlx::core::matmul(x, weight);
+    }
+    return mlx::core::quantized_matmul(
+        x, weight, scales,
+        sig.has_biases ? std::optional<array>(biases) : std::nullopt,
+        /* transpose */ true, sig.group_size, sig.bits,
+        quant_mode_from_int(sig.mode));
+}
+
+// The output width of a projection. A packed weight keeps its `[out, in]`
+// orientation, so the axis to read depends on the variant.
+static inline int qproj_out_dim(const mlx_inline_qweight* w) {
+    const array& weight = as_arr(w->weight);
+    return w->scales != nullptr ? weight.shape(0) : weight.shape(1);
 }

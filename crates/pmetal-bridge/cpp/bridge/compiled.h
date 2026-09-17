@@ -104,16 +104,21 @@ void mlx_inline_compiled_attn_layer_fixed(
 //       Decode-only q-only attention for KV-shared layers.
 //   * `mlx_inline_compiled_gemma4_per_layer_input_block`
 //       Decode-time per-layer-input gating/projection block.
+//
+// Projections are `mlx_inline_qweight` so one block serves a bf16 and a
+// packed checkpoint alike; the quantization signature is part of each
+// block's cache key, so a mixed-precision checkpoint traces once per
+// distinct combination rather than once overall.
 void mlx_inline_compiled_gemma4_attn_block(
     mlx_inline_array* dst_out,
     mlx_inline_array* dst_cache_keys,
     mlx_inline_array* dst_cache_vals,
     const mlx_inline_array* x,
     const mlx_inline_array* in_norm_w,
-    const mlx_inline_array* q_w,
-    const mlx_inline_array* k_w,
-    const mlx_inline_array* v_w,
-    const mlx_inline_array* o_w,
+    const mlx_inline_qweight* q_w,
+    const mlx_inline_qweight* k_w,
+    const mlx_inline_qweight* v_w,
+    const mlx_inline_qweight* o_w,
     const mlx_inline_array* q_norm_w,
     const mlx_inline_array* k_norm_w,
     const mlx_inline_array* post_norm_w,
@@ -136,8 +141,8 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
     mlx_inline_array* dst_out,
     const mlx_inline_array* x,
     const mlx_inline_array* in_norm_w,
-    const mlx_inline_array* q_w,
-    const mlx_inline_array* o_w,
+    const mlx_inline_qweight* q_w,
+    const mlx_inline_qweight* o_w,
     const mlx_inline_array* q_norm_w,
     const mlx_inline_array* post_norm_w,
     const mlx_inline_array* rope_freqs,
@@ -159,9 +164,9 @@ void mlx_inline_compiled_gemma4_mlp_block(
     mlx_inline_array* dst_out,
     const mlx_inline_array* x,
     const mlx_inline_array* pre_norm_w,
-    const mlx_inline_array* gate_w,
-    const mlx_inline_array* up_w,
-    const mlx_inline_array* down_w,
+    const mlx_inline_qweight* gate_w,
+    const mlx_inline_qweight* up_w,
+    const mlx_inline_qweight* down_w,
     const mlx_inline_array* post_norm_w,
     float pre_norm_eps,
     float post_norm_eps);
@@ -170,8 +175,8 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
     mlx_inline_array* dst_out,
     const mlx_inline_array* x,
     const mlx_inline_array* layer_input,
-    const mlx_inline_array* gate_w,
-    const mlx_inline_array* projection_w,
+    const mlx_inline_qweight* gate_w,
+    const mlx_inline_qweight* projection_w,
     const mlx_inline_array* post_norm_w,
     float post_norm_eps);
 

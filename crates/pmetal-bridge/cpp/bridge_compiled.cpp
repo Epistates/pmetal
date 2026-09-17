@@ -957,8 +957,14 @@ void mlx_inline_compiled_moe_layer_fixed(
 //
 // Each call site keeps a list of `Entry` records keyed by shape signature
 // (batch, seq_len, cache_len, n_heads, n_kv, head_dim, k_eq_v, has_freqs)
-// so prefill-vs-decode and sliding-vs-full layers each get their own
+// plus the quantization signature of every projection, so prefill-vs-decode,
+// sliding-vs-full and 4-bit-vs-8-bit layers each get their own
 // shapeless=false compiled trace.
+//
+// Projections arrive as `mlx_inline_qweight` rather than bare arrays. Each one
+// occupies three input slots (weight, scales, biases) whether or not it is
+// packed, so the traced lambda can index by position while the kernel choice
+// rides in the captured signature. See `qproj_matmul` in bridge_internal.h.
 
 void mlx_inline_compiled_gemma4_attn_block(
     mlx_inline_array* dst_out,
@@ -972,10 +978,10 @@ void mlx_inline_compiled_gemma4_attn_block(
     // savings from a smaller compile trace.
     const mlx_inline_array* x,
     const mlx_inline_array* in_norm_w,
-    const mlx_inline_array* q_w,
-    const mlx_inline_array* k_w,
-    const mlx_inline_array* v_w,           // may be null when use_k_eq_v
-    const mlx_inline_array* o_w,
+    const mlx_inline_qweight* q_w,
+    const mlx_inline_qweight* k_w,
+    const mlx_inline_qweight* v_w,         // may be null when use_k_eq_v
+    const mlx_inline_qweight* o_w,
     const mlx_inline_array* q_norm_w,
     const mlx_inline_array* k_norm_w,
     const mlx_inline_array* post_norm_w,
@@ -1005,6 +1011,10 @@ void mlx_inline_compiled_gemma4_attn_block(
         int has_freqs;
         int sliding_window;
         int dtype;
+        QProjSig q_sig;
+        QProjSig k_sig;
+        QProjSig v_sig;
+        QProjSig o_sig;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
@@ -1015,6 +1025,13 @@ void mlx_inline_compiled_gemma4_attn_block(
         int cache_len = as_arr(cache_keys_in).shape(2);
         int dtype = static_cast<int>(as_arr(x).dtype().val());
         int has_freqs = (rope_freqs != nullptr) ? 1 : 0;
+
+        // Under k_eq_v there is no v_proj at all, and the caller passes q_w in
+        // its slot as a placeholder. Signing it as dense keeps the key stable.
+        QProjSig q_sig = qproj_sig(q_w);
+        QProjSig k_sig = qproj_sig(k_w);
+        QProjSig v_sig = use_k_eq_v ? QProjSig{} : qproj_sig(v_w);
+        QProjSig o_sig = qproj_sig(o_w);
 
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
@@ -1027,7 +1044,11 @@ void mlx_inline_compiled_gemma4_attn_block(
                 && entry.k_eq_v == static_cast<int>(use_k_eq_v)
                 && entry.has_freqs == has_freqs
                 && entry.sliding_window == sliding_window
-                && entry.dtype == dtype) {
+                && entry.dtype == dtype
+                && entry.q_sig == q_sig
+                && entry.k_sig == k_sig
+                && entry.v_sig == v_sig
+                && entry.o_sig == o_sig) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1046,6 +1067,10 @@ void mlx_inline_compiled_gemma4_attn_block(
             float QKE = qk_norm_eps;
             float PNE = post_norm_eps;
             float RBASE = rope_base;
+            QProjSig QS = q_sig;
+            QProjSig KS = k_sig;
+            QProjSig VS = v_sig;
+            QProjSig OS = o_sig;
 
             entries->push_back(Entry{
                 batch,
@@ -1058,8 +1083,13 @@ void mlx_inline_compiled_gemma4_attn_block(
                 has_freqs,
                 sliding_window,
                 dtype,
+                q_sig,
+                k_sig,
+                v_sig,
+                o_sig,
                 *make_compiled_fixed(
-                    [NH, NKV, HD, RD, L, SW, KEV, HAS_FREQS, INE, QKE, PNE, RBASE]
+                    [NH, NKV, HD, RD, L, SW, KEV, HAS_FREQS, INE, QKE, PNE, RBASE,
+                     QS, KS, VS, OS]
                     (const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
 
@@ -1067,11 +1097,19 @@ void mlx_inline_compiled_gemma4_attn_block(
                         const array& x = ins[idx++];
                         const array& in_norm_w = ins[idx++];
                         const array& q_w = ins[idx++];
+                        const array& q_scales = ins[idx++];
+                        const array& q_biases = ins[idx++];
                         const array& k_w = ins[idx++];
+                        const array& k_scales = ins[idx++];
+                        const array& k_biases = ins[idx++];
                         // v_w is only present when !KEV, but we always pass
                         // a placeholder to keep the input vector shape stable.
                         const array& v_w = ins[idx++];
+                        const array& v_scales = ins[idx++];
+                        const array& v_biases = ins[idx++];
                         const array& o_w = ins[idx++];
+                        const array& o_scales = ins[idx++];
+                        const array& o_biases = ins[idx++];
                         const array& q_norm_w = ins[idx++];
                         const array& k_norm_w = ins[idx++];
                         const array& post_norm_w = ins[idx++];
@@ -1086,18 +1124,19 @@ void mlx_inline_compiled_gemma4_attn_block(
                         // 1. Input layernorm.
                         auto normed = fast::rms_norm(x, in_norm_w, INE);
 
-                        // 2. Q/K/V projections. Weights are expected in
-                        // `[in, out]` form (pre-transposed by the caller
-                        // at load time — matches the qwen3_native
-                        // pattern, avoids per-step strided matmul).
-                        auto q_proj = matmul(normed, q_w);
-                        auto k_proj = matmul(normed, k_w);
+                        // 2. Q/K/V projections. A dense weight is expected in
+                        // `[in, out]` form (pre-transposed by the caller at
+                        // load time — matches the qwen3_native pattern, avoids
+                        // per-step strided matmul); a packed one keeps the
+                        // checkpoint's `[out, in]` and transposes in-kernel.
+                        auto q_proj = qproj_matmul(normed, q_w, q_scales, q_biases, QS);
+                        auto k_proj = qproj_matmul(normed, k_w, k_scales, k_biases, KS);
                         // For attention_k_eq_v full layers, values are taken
                         // from the *raw* k_proj output BEFORE k_norm — we keep
                         // a copy here and skip the v_proj matmul.
                         array v_pre = k_proj;
                         if (!KEV) {
-                            v_pre = matmul(normed, v_w);
+                            v_pre = qproj_matmul(normed, v_w, v_scales, v_biases, VS);
                         }
 
                         auto q4 = reshape(q_proj, {B, S, NH, HD});
@@ -1171,7 +1210,7 @@ void mlx_inline_compiled_gemma4_attn_block(
                         output = reshape(output, {B, S, NH * HD});
 
                         // 8. Output projection + post_attention_layernorm.
-                        auto attn_out = matmul(output, o_w);
+                        auto attn_out = qproj_matmul(output, o_w, o_scales, o_biases, OS);
                         auto post = fast::rms_norm(attn_out, post_norm_w, PNE);
                         return {post, updated_keys, updated_vals};
                     })
@@ -1179,32 +1218,33 @@ void mlx_inline_compiled_gemma4_attn_block(
             compiled = &entries->back().compiled;
         }
 
-        // Build the input vector. We always emit a v_w slot — when
+        // Build the input vector. We always emit v_w's three slots — when
         // use_k_eq_v=true the caller passes q_w as a placeholder (the
-        // compiled lambda branches on KEV and ignores that slot). Same
-        // for rope_freqs: when null the caller passes a 1-element scalar
-        // dummy. This keeps the input vector shape stable across calls.
-        const mlx_inline_array* v_input = use_k_eq_v ? q_w : v_w;
-        static array dummy_freqs(0.0f);
+        // compiled lambda branches on KEV and ignores them). Same for
+        // rope_freqs: when null the caller passes a 1-element scalar dummy.
+        // This keeps the input vector shape stable across calls.
+        const mlx_inline_qweight* v_input = use_k_eq_v ? q_w : v_w;
         const array& freqs_input = (rope_freqs != nullptr)
             ? as_arr(rope_freqs)
-            : dummy_freqs;
+            : qproj_dummy();
 
-        auto result = (*compiled)({
-            as_arr(x),
-            as_arr(in_norm_w),
-            as_arr(q_w),
-            as_arr(k_w),
-            as_arr(v_input),
-            as_arr(o_w),
-            as_arr(q_norm_w),
-            as_arr(k_norm_w),
-            as_arr(post_norm_w),
-            freqs_input,
-            as_arr(cache_keys_in),
-            as_arr(cache_vals_in),
-            array(kv_offset),
-        });
+        std::vector<array> ins;
+        ins.reserve(21);
+        ins.push_back(as_arr(x));
+        ins.push_back(as_arr(in_norm_w));
+        push_qproj(ins, q_w);
+        push_qproj(ins, k_w);
+        push_qproj(ins, v_input);
+        push_qproj(ins, o_w);
+        ins.push_back(as_arr(q_norm_w));
+        ins.push_back(as_arr(k_norm_w));
+        ins.push_back(as_arr(post_norm_w));
+        ins.push_back(freqs_input);
+        ins.push_back(as_arr(cache_keys_in));
+        ins.push_back(as_arr(cache_vals_in));
+        ins.push_back(array(kv_offset));
+
+        auto result = (*compiled)(ins);
         new (dst_out->buf) array(result[0]);
         new (dst_cache_keys->buf) array(result[1]);
         new (dst_cache_vals->buf) array(result[2]);
@@ -1226,8 +1266,8 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
     mlx_inline_array* dst_out,
     const mlx_inline_array* x,
     const mlx_inline_array* in_norm_w,
-    const mlx_inline_array* q_w,
-    const mlx_inline_array* o_w,
+    const mlx_inline_qweight* q_w,
+    const mlx_inline_qweight* o_w,
     const mlx_inline_array* q_norm_w,
     const mlx_inline_array* post_norm_w,
     const mlx_inline_array* rope_freqs,
@@ -1255,6 +1295,8 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
         int has_freqs;
         int sliding_window;
         int dtype;
+        QProjSig q_sig;
+        QProjSig o_sig;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
@@ -1265,6 +1307,8 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
         int cache_len = as_arr(cache_keys_in).shape(2);
         int dtype = static_cast<int>(as_arr(x).dtype().val());
         int has_freqs = (rope_freqs != nullptr) ? 1 : 0;
+        QProjSig q_sig = qproj_sig(q_w);
+        QProjSig o_sig = qproj_sig(o_w);
 
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
@@ -1276,7 +1320,9 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
                 && entry.head_dim == head_dim
                 && entry.has_freqs == has_freqs
                 && entry.sliding_window == sliding_window
-                && entry.dtype == dtype) {
+                && entry.dtype == dtype
+                && entry.q_sig == q_sig
+                && entry.o_sig == o_sig) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1294,6 +1340,8 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
             float QNE = q_norm_eps;
             float PNE = post_norm_eps;
             float RBASE = rope_base;
+            QProjSig QS = q_sig;
+            QProjSig OS = o_sig;
 
             entries->push_back(Entry{
                 batch,
@@ -1305,8 +1353,10 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
                 has_freqs,
                 sliding_window,
                 dtype,
+                q_sig,
+                o_sig,
                 *make_compiled_fixed(
-                    [NH, NKV, HD, RD, L, SW, HAS_FREQS, INE, QNE, PNE, RBASE]
+                    [NH, NKV, HD, RD, L, SW, HAS_FREQS, INE, QNE, PNE, RBASE, QS, OS]
                     (const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
 
@@ -1314,7 +1364,11 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
                         const array& x = ins[idx++];
                         const array& in_norm_w = ins[idx++];
                         const array& q_w = ins[idx++];
+                        const array& q_scales = ins[idx++];
+                        const array& q_biases = ins[idx++];
                         const array& o_w = ins[idx++];
+                        const array& o_scales = ins[idx++];
+                        const array& o_biases = ins[idx++];
                         const array& q_norm_w = ins[idx++];
                         const array& post_norm_w = ins[idx++];
                         const array& rope_freqs_arr = ins[idx++];
@@ -1327,7 +1381,7 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
                         int S = x.shape(1);
 
                         auto normed = fast::rms_norm(x, in_norm_w, INE);
-                        auto q_proj = matmul(normed, q_w);
+                        auto q_proj = qproj_matmul(normed, q_w, q_scales, q_biases, QS);
                         auto q = reshape(q_proj, {B, S, NH, HD});
                         q = fast::rms_norm(q, q_norm_w, QNE);
                         q = transpose(q, {0, 2, 1, 3});
@@ -1358,7 +1412,7 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
                         output = transpose(output, {0, 2, 1, 3});
                         output = reshape(output, {B, S, NH * HD});
 
-                        auto attn_out = matmul(output, o_w);
+                        auto attn_out = qproj_matmul(output, o_w, o_scales, o_biases, OS);
                         auto post = fast::rms_norm(attn_out, post_norm_w, PNE);
                         return {post};
                     })
@@ -1366,24 +1420,25 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
             compiled = &entries->back().compiled;
         }
 
-        static array dummy_freqs(0.0f);
         const array& freqs_input = (rope_freqs != nullptr)
             ? as_arr(rope_freqs)
-            : dummy_freqs;
+            : qproj_dummy();
 
-        auto result = (*compiled)({
-            as_arr(x),
-            as_arr(in_norm_w),
-            as_arr(q_w),
-            as_arr(o_w),
-            as_arr(q_norm_w),
-            as_arr(post_norm_w),
-            freqs_input,
-            as_arr(cache_keys_in),
-            as_arr(cache_vals_in),
-            array(valid_kv_len),
-            array(rope_offset),
-        });
+        std::vector<array> ins;
+        ins.reserve(15);
+        ins.push_back(as_arr(x));
+        ins.push_back(as_arr(in_norm_w));
+        push_qproj(ins, q_w);
+        push_qproj(ins, o_w);
+        ins.push_back(as_arr(q_norm_w));
+        ins.push_back(as_arr(post_norm_w));
+        ins.push_back(freqs_input);
+        ins.push_back(as_arr(cache_keys_in));
+        ins.push_back(as_arr(cache_vals_in));
+        ins.push_back(array(valid_kv_len));
+        ins.push_back(array(rope_offset));
+
+        auto result = (*compiled)(ins);
         new (dst_out->buf) array(result[0]);
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
@@ -1399,9 +1454,9 @@ void mlx_inline_compiled_gemma4_mlp_block(
     mlx_inline_array* dst_out,
     const mlx_inline_array* x,
     const mlx_inline_array* pre_norm_w,
-    const mlx_inline_array* gate_w,
-    const mlx_inline_array* up_w,
-    const mlx_inline_array* down_w,
+    const mlx_inline_qweight* gate_w,
+    const mlx_inline_qweight* up_w,
+    const mlx_inline_qweight* down_w,
     const mlx_inline_array* post_norm_w,
     float pre_norm_eps,
     float post_norm_eps
@@ -1412,6 +1467,9 @@ void mlx_inline_compiled_gemma4_mlp_block(
         int hidden;
         int intermediate;
         int dtype;
+        QProjSig gate_sig;
+        QProjSig up_sig;
+        QProjSig down_sig;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
@@ -1420,8 +1478,11 @@ void mlx_inline_compiled_gemma4_mlp_block(
         int batch = as_arr(x).shape(0);
         int seq_len = as_arr(x).shape(1);
         int hidden = as_arr(x).shape(2);
-        int intermediate = as_arr(gate_w).shape(1);
+        int intermediate = qproj_out_dim(gate_w);
         int dtype = static_cast<int>(as_arr(x).dtype().val());
+        QProjSig gate_sig = qproj_sig(gate_w);
+        QProjSig up_sig = qproj_sig(up_w);
+        QProjSig down_sig = qproj_sig(down_w);
 
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
@@ -1429,7 +1490,10 @@ void mlx_inline_compiled_gemma4_mlp_block(
                 && entry.seq_len == seq_len
                 && entry.hidden == hidden
                 && entry.intermediate == intermediate
-                && entry.dtype == dtype) {
+                && entry.dtype == dtype
+                && entry.gate_sig == gate_sig
+                && entry.up_sig == up_sig
+                && entry.down_sig == down_sig) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1438,21 +1502,34 @@ void mlx_inline_compiled_gemma4_mlp_block(
         if (compiled == nullptr) {
             float PRE = pre_norm_eps;
             float POST = post_norm_eps;
+            QProjSig GS = gate_sig;
+            QProjSig US = up_sig;
+            QProjSig DS = down_sig;
             entries->push_back(Entry{
                 batch,
                 seq_len,
                 hidden,
                 intermediate,
                 dtype,
+                gate_sig,
+                up_sig,
+                down_sig,
                 *make_compiled_fixed(
-                    [PRE, POST](const std::vector<array>& ins) -> std::vector<array> {
+                    [PRE, POST, GS, US, DS](const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
-                        const array& x = ins[0];
-                        const array& pre_w = ins[1];
-                        const array& gate_w = ins[2];
-                        const array& up_w = ins[3];
-                        const array& down_w = ins[4];
-                        const array& post_w = ins[5];
+                        std::size_t idx = 0;
+                        const array& x = ins[idx++];
+                        const array& pre_w = ins[idx++];
+                        const array& gate_w = ins[idx++];
+                        const array& gate_scales = ins[idx++];
+                        const array& gate_biases = ins[idx++];
+                        const array& up_w = ins[idx++];
+                        const array& up_scales = ins[idx++];
+                        const array& up_biases = ins[idx++];
+                        const array& down_w = ins[idx++];
+                        const array& down_scales = ins[idx++];
+                        const array& down_biases = ins[idx++];
+                        const array& post_w = ins[idx++];
 
                         // pre_feedforward_layernorm.
                         auto h = fast::rms_norm(x, pre_w, PRE);
@@ -1460,10 +1537,8 @@ void mlx_inline_compiled_gemma4_mlp_block(
                         // Tanh-approx GELU on gate_proj output, multiply by
                         // up_proj output. Matches mlx-lm's `geglu(gate, x) =
                         // nn.gelu_approx(gate) * x` (sqrt(2/pi)·(g + 0.044715·g^3)).
-                        // Weights are expected in `[in, out]` form (caller
-                        // pre-transposed at load time).
-                        auto gate = matmul(h, gate_w);
-                        auto up = matmul(h, up_w);
+                        auto gate = qproj_matmul(h, gate_w, gate_scales, gate_biases, GS);
+                        auto up = qproj_matmul(h, up_w, up_scales, up_biases, US);
 
                         // Scalars MUST be cast to gate.dtype() or bf16
                         // inputs silently promote to f32, forcing every
@@ -1480,7 +1555,7 @@ void mlx_inline_compiled_gemma4_mlp_block(
                         auto gelu_g = multiply(half, multiply(gate, add(one, t)));
 
                         auto activated = multiply(gelu_g, up);
-                        auto down = matmul(activated, down_w);
+                        auto down = qproj_matmul(activated, down_w, down_scales, down_biases, DS);
                         // post_feedforward_layernorm.
                         auto post = fast::rms_norm(down, post_w, POST);
                         return {post};
@@ -1489,14 +1564,16 @@ void mlx_inline_compiled_gemma4_mlp_block(
             compiled = &entries->back().compiled;
         }
 
-        auto result = (*compiled)({
-            as_arr(x),
-            as_arr(pre_norm_w),
-            as_arr(gate_w),
-            as_arr(up_w),
-            as_arr(down_w),
-            as_arr(post_norm_w),
-        });
+        std::vector<array> ins;
+        ins.reserve(12);
+        ins.push_back(as_arr(x));
+        ins.push_back(as_arr(pre_norm_w));
+        push_qproj(ins, gate_w);
+        push_qproj(ins, up_w);
+        push_qproj(ins, down_w);
+        ins.push_back(as_arr(post_norm_w));
+
+        auto result = (*compiled)(ins);
         new (dst_out->buf) array(result[0]);
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
@@ -1512,8 +1589,8 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
     mlx_inline_array* dst_out,
     const mlx_inline_array* x,
     const mlx_inline_array* layer_input,
-    const mlx_inline_array* gate_w,
-    const mlx_inline_array* projection_w,
+    const mlx_inline_qweight* gate_w,
+    const mlx_inline_qweight* projection_w,
     const mlx_inline_array* post_norm_w,
     float post_norm_eps
 ) {
@@ -1523,6 +1600,8 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
         int hidden;
         int per_layer_hidden;
         int dtype;
+        QProjSig gate_sig;
+        QProjSig projection_sig;
         CompiledFn compiled;
     };
     static auto* entries = new std::vector<Entry>();
@@ -1533,6 +1612,8 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
         int hidden = as_arr(x).shape(2);
         int per_layer_hidden = as_arr(layer_input).shape(2);
         int dtype = static_cast<int>(as_arr(x).dtype().val());
+        QProjSig gate_sig = qproj_sig(gate_w);
+        QProjSig projection_sig = qproj_sig(projection_w);
 
         CompiledFn* compiled = nullptr;
         for (auto& entry : *entries) {
@@ -1540,7 +1621,9 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
                 && entry.seq_len == seq_len
                 && entry.hidden == hidden
                 && entry.per_layer_hidden == per_layer_hidden
-                && entry.dtype == dtype) {
+                && entry.dtype == dtype
+                && entry.gate_sig == gate_sig
+                && entry.projection_sig == projection_sig) {
                 compiled = &entry.compiled;
                 break;
             }
@@ -1548,22 +1631,31 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
 
         if (compiled == nullptr) {
             float POST = post_norm_eps;
+            QProjSig GS = gate_sig;
+            QProjSig PS = projection_sig;
             entries->push_back(Entry{
                 batch,
                 seq_len,
                 hidden,
                 per_layer_hidden,
                 dtype,
+                gate_sig,
+                projection_sig,
                 *make_compiled_fixed(
-                    [POST](const std::vector<array>& ins) -> std::vector<array> {
+                    [POST, GS, PS](const std::vector<array>& ins) -> std::vector<array> {
                         using namespace mlx::core;
-                        const array& x = ins[0];
-                        const array& layer_input = ins[1];
-                        const array& gate_w = ins[2];
-                        const array& projection_w = ins[3];
-                        const array& post_norm_w = ins[4];
+                        std::size_t idx = 0;
+                        const array& x = ins[idx++];
+                        const array& layer_input = ins[idx++];
+                        const array& gate_w = ins[idx++];
+                        const array& gate_scales = ins[idx++];
+                        const array& gate_biases = ins[idx++];
+                        const array& projection_w = ins[idx++];
+                        const array& projection_scales = ins[idx++];
+                        const array& projection_biases = ins[idx++];
+                        const array& post_norm_w = ins[idx++];
 
-                        auto gate = matmul(x, gate_w);
+                        auto gate = qproj_matmul(x, gate_w, gate_scales, gate_biases, GS);
 
                         auto dt = gate.dtype();
                         auto half = astype(array(0.5f), dt);
@@ -1576,7 +1668,8 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
                         auto gelu_g = multiply(half, multiply(gate, add(one, t)));
 
                         auto mixed = multiply(gelu_g, layer_input);
-                        auto projected = matmul(mixed, projection_w);
+                        auto projected = qproj_matmul(
+                            mixed, projection_w, projection_scales, projection_biases, PS);
                         auto post = fast::rms_norm(projected, post_norm_w, POST);
                         return {add(x, post)};
                     })
@@ -1584,13 +1677,15 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
             compiled = &entries->back().compiled;
         }
 
-        auto result = (*compiled)({
-            as_arr(x),
-            as_arr(layer_input),
-            as_arr(gate_w),
-            as_arr(projection_w),
-            as_arr(post_norm_w),
-        });
+        std::vector<array> ins;
+        ins.reserve(9);
+        ins.push_back(as_arr(x));
+        ins.push_back(as_arr(layer_input));
+        push_qproj(ins, gate_w);
+        push_qproj(ins, projection_w);
+        ins.push_back(as_arr(post_norm_w));
+
+        auto result = (*compiled)(ins);
         new (dst_out->buf) array(result[0]);
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {

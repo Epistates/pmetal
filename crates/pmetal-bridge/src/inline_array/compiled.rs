@@ -10,6 +10,7 @@ use std::mem::MaybeUninit;
 use super::InlineArray;
 use super::RawBuf;
 use super::ffi::*;
+use crate::native_weight::LayerWeight;
 
 impl InlineArray {
     // ── Compiled fixed-shape sub-layers ─────────────────────────────────────
@@ -354,16 +355,19 @@ impl InlineArray {
     /// `attention_k_eq_v` collapse) → q_norm / k_norm / v_norm-no-scale
     /// → transpose → RoPE (custom freqs OR full base) → KV cache write
     /// → SDPA → o_proj → post_attention_layernorm into a single
-    /// mlx::compile graph. Weights are expected in `[in, out]` form
-    /// (pre-transposed by the caller at load time).
+    /// mlx::compile graph.
+    ///
+    /// Projections may be dense or packed. A dense one is expected in
+    /// `[in, out]` form (pre-transposed by the caller at load time); a packed
+    /// one keeps the checkpoint's `[out, in]` and transposes in-kernel.
     #[allow(clippy::too_many_arguments)]
     pub fn compiled_gemma4_attn_block(
         x: &Self,
         in_norm_w: &Self,
-        q_w: &Self,
-        k_w: &Self,
-        v_w: Option<&Self>,
-        o_w: &Self,
+        q_w: &LayerWeight,
+        k_w: &LayerWeight,
+        v_w: Option<&LayerWeight>,
+        o_w: &LayerWeight,
         q_norm_w: &Self,
         k_norm_w: &Self,
         post_norm_w: &Self,
@@ -385,10 +389,12 @@ impl InlineArray {
         let mut ck_out = std::mem::MaybeUninit::<RawBuf>::uninit();
         let mut cv_out = std::mem::MaybeUninit::<RawBuf>::uninit();
         let use_k_eq_v = v_w.is_none();
-        let v_ptr: *const RawBuf = match v_w {
-            Some(v) => &v.raw,
-            None => &q_w.raw,
-        };
+        // Under k_eq_v there is no v_proj, so q_w stands in its slot and the
+        // compiled block ignores it.
+        let q_raw = q_w.as_raw();
+        let k_raw = k_w.as_raw();
+        let v_raw = v_w.unwrap_or(q_w).as_raw();
+        let o_raw = o_w.as_raw();
         let freqs_ptr: *const RawBuf = match rope_freqs {
             Some(f) => &f.raw,
             None => std::ptr::null(),
@@ -400,10 +406,10 @@ impl InlineArray {
                 cv_out.as_mut_ptr(),
                 &x.raw,
                 &in_norm_w.raw,
-                &q_w.raw,
-                &k_w.raw,
-                v_ptr,
-                &o_w.raw,
+                &q_raw,
+                &k_raw,
+                &v_raw,
+                &o_raw,
                 &q_norm_w.raw,
                 &k_norm_w.raw,
                 &post_norm_w.raw,
@@ -446,8 +452,8 @@ impl InlineArray {
     pub fn compiled_gemma4_shared_attn_decode(
         x: &Self,
         in_norm_w: &Self,
-        q_w: &Self,
-        o_w: &Self,
+        q_w: &LayerWeight,
+        o_w: &LayerWeight,
         q_norm_w: &Self,
         post_norm_w: &Self,
         rope_freqs: Option<&Self>,
@@ -466,6 +472,8 @@ impl InlineArray {
         rope_dims: i32,
     ) -> Self {
         let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
+        let q_raw = q_w.as_raw();
+        let o_raw = o_w.as_raw();
         let freqs_ptr: *const RawBuf = match rope_freqs {
             Some(f) => &f.raw,
             None => std::ptr::null(),
@@ -475,8 +483,8 @@ impl InlineArray {
                 out.as_mut_ptr(),
                 &x.raw,
                 &in_norm_w.raw,
-                &q_w.raw,
-                &o_w.raw,
+                &q_raw,
+                &o_raw,
                 &q_norm_w.raw,
                 &post_norm_w.raw,
                 freqs_ptr,
@@ -506,28 +514,28 @@ impl InlineArray {
     /// GELU + element-wise multiply + down_proj + `post_feedforward_layernorm`
     /// into a single mlx::compile graph.
     #[allow(clippy::too_many_arguments)]
-    // TODO(gemma4): wire into Gemma4 forward path — staged alongside the
-    // Gemma4 compiled-layer roadmap; currently superseded by the per-op path.
-    #[allow(dead_code)]
     pub fn compiled_gemma4_mlp_block(
         x: &Self,
         pre_norm_w: &Self,
-        gate_w: &Self,
-        up_w: &Self,
-        down_w: &Self,
+        gate_w: &LayerWeight,
+        up_w: &LayerWeight,
+        down_w: &LayerWeight,
         post_norm_w: &Self,
         pre_norm_eps: f32,
         post_norm_eps: f32,
     ) -> Self {
         let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
+        let gate_raw = gate_w.as_raw();
+        let up_raw = up_w.as_raw();
+        let down_raw = down_w.as_raw();
         unsafe {
             mlx_inline_compiled_gemma4_mlp_block(
                 out.as_mut_ptr(),
                 &x.raw,
                 &pre_norm_w.raw,
-                &gate_w.raw,
-                &up_w.raw,
-                &down_w.raw,
+                &gate_raw,
+                &up_raw,
+                &down_raw,
                 &post_norm_w.raw,
                 pre_norm_eps,
                 post_norm_eps,
@@ -543,19 +551,21 @@ impl InlineArray {
     pub fn compiled_gemma4_per_layer_input_block(
         x: &Self,
         layer_input: &Self,
-        gate_w: &Self,
-        projection_w: &Self,
+        gate_w: &LayerWeight,
+        projection_w: &LayerWeight,
         post_norm_w: &Self,
         post_norm_eps: f32,
     ) -> Self {
         let mut out = std::mem::MaybeUninit::<RawBuf>::uninit();
+        let gate_raw = gate_w.as_raw();
+        let projection_raw = projection_w.as_raw();
         unsafe {
             mlx_inline_compiled_gemma4_per_layer_input_block(
                 out.as_mut_ptr(),
                 &x.raw,
                 &layer_input.raw,
-                &gate_w.raw,
-                &projection_w.raw,
+                &gate_raw,
+                &projection_raw,
                 &post_norm_w.raw,
                 post_norm_eps,
             );
