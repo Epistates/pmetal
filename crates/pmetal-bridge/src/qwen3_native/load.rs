@@ -79,6 +79,7 @@ fn get_stacked_expert_weight(
 
     if let Some(scales) = raw.get(&mxfp8_s_key) {
         return Ok(LayerWeight::Quantized {
+            global_scale: None,
             weight: w,
             scales: scales.clone(),
             biases: None,
@@ -92,6 +93,7 @@ fn get_stacked_expert_weight(
 
     match (raw.get(&s_key), raw.get(&b_key)) {
         (Some(scales), Some(biases)) => Ok(LayerWeight::Quantized {
+            global_scale: None,
             weight: w,
             scales: scales.clone(),
             biases: Some(biases.clone()),
@@ -451,6 +453,7 @@ pub fn load_model(
 
         if let (Some(w), Some(scales)) = (raw.get(&w_key), raw.get(&mxfp8_s_key)) {
             return Ok(LayerWeight::Quantized {
+                global_scale: None,
                 weight: w.clone(),
                 scales: scales.clone(),
                 biases: None,
@@ -467,6 +470,7 @@ pub fn load_model(
                 let bits = quant_bits_for_weight_key(config, &w_key, q_bits);
                 validate_quantization_runtime_support(bits)?;
                 Ok(LayerWeight::Quantized {
+                    global_scale: None,
                     weight: w.clone(),
                     scales: s.clone(),
                     biases: Some(b.clone()),

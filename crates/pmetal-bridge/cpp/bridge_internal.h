@@ -134,12 +134,14 @@ static inline std::string quant_mode_from_int(int mode) {
 struct QProjSig {
     int quantized = 0;
     int has_biases = 0;
+    int has_global = 0;
     int group_size = 0;
     int bits = 0;
     int mode = 0;
 
     bool operator==(const QProjSig& other) const {
         return quantized == other.quantized && has_biases == other.has_biases
+            && has_global == other.has_global
             && group_size == other.group_size && bits == other.bits
             && mode == other.mode;
     }
@@ -149,7 +151,11 @@ static inline QProjSig qproj_sig(const mlx_inline_qweight* w) {
     if (w == nullptr || w->scales == nullptr) {
         return QProjSig{};
     }
-    return QProjSig{1, w->biases != nullptr ? 1 : 0, w->group_size, w->bits, w->mode};
+    return QProjSig{
+        1,
+        w->biases != nullptr ? 1 : 0,
+        w->global_scale != nullptr ? 1 : 0,
+        w->group_size, w->bits, w->mode};
 }
 
 // A stand-in for a slot the projection does not use. Shared across every
@@ -159,12 +165,16 @@ static inline const array& qproj_dummy() {
     return dummy;
 }
 
-// Append one projection's three slots: weight, scales, biases.
+// Append one projection's four slots: weight, scales, biases, global scale.
 static inline void push_qproj(std::vector<array>& ins, const mlx_inline_qweight* w) {
     ins.push_back(as_arr(w->weight));
     ins.push_back(w->scales != nullptr ? as_arr(w->scales) : qproj_dummy());
     ins.push_back(w->biases != nullptr ? as_arr(w->biases) : qproj_dummy());
+    ins.push_back(w->global_scale != nullptr ? as_arr(w->global_scale) : qproj_dummy());
 }
+
+// How many input slots one projection occupies.
+static constexpr std::size_t QPROJ_SLOTS = 4;
 
 // `x @ w`, dense or packed. The dense arm relies on the caller having
 // pre-transposed to `[in, out]`; the packed arm asks MLX to transpose, since a
@@ -175,10 +185,24 @@ static inline array qproj_matmul(
     const array& weight,
     const array& scales,
     const array& biases,
+    const array& global_scale,
     const QProjSig& sig
 ) {
     if (sig.quantized == 0) {
         return mlx::core::matmul(x, weight);
+    }
+    // ⚠️ A two-level weight can use neither kernel here. `quantized_matmul`
+    // has no global-scale argument and would drop the per-tensor factor in
+    // silence; `qqmm` requires both global scales for nvfp4 or neither, since
+    // it is written for a quantized activation and this one is bf16. Unpack
+    // and multiply densely: correct, at the cost of a materialisation.
+    if (sig.has_global) {
+        auto dense = mlx::core::dequantize(
+            weight, scales,
+            sig.has_biases ? std::optional<array>(biases) : std::nullopt,
+            sig.group_size, sig.bits, quant_mode_from_int(sig.mode),
+            /* global_scale */ std::optional<array>(global_scale));
+        return mlx::core::matmul(x, mlx::core::transpose(dense));
     }
     return mlx::core::quantized_matmul(
         x, weight, scales,

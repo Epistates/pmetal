@@ -302,6 +302,11 @@ pub enum LayerWeight {
         weight: InlineArray,
         scales: InlineArray,
         biases: Option<InlineArray>,
+        /// nvfp4's second level: one scale for the whole tensor, beside the
+        /// per-group ones. NVIDIA ModelOpt ships it as `weight_scale_2`.
+        /// `Some` switches every op here onto `qqmm`, because MLX's plain
+        /// `quantized_matmul` has no slot to pass it through.
+        global_scale: Option<InlineArray>,
         params: QuantParams,
     },
 }
@@ -317,11 +322,29 @@ impl LayerWeight {
         biases: Option<InlineArray>,
         params: QuantParams,
     ) -> Self {
+        Self::new_two_level(weight, scales, biases, None, params)
+    }
+
+    /// Build a weight that may carry a per-tensor scale beside its per-group
+    /// ones.
+    ///
+    /// Only a two-level scheme has one, nvfp4 being the one that ships. Use
+    /// this wherever a checkpoint might store `weight_scale_2`: dropping it
+    /// does not fail and does not change a shape, it scales every weight by a
+    /// constant.
+    pub fn new_two_level(
+        weight: InlineArray,
+        scales: Option<InlineArray>,
+        biases: Option<InlineArray>,
+        global_scale: Option<InlineArray>,
+        params: QuantParams,
+    ) -> Self {
         match scales {
             Some(scales) => Self::Quantized {
                 weight,
                 scales,
                 biases,
+                global_scale,
                 params,
             },
             // Only the dense arm transposes: see the layout note above.
@@ -354,11 +377,41 @@ impl LayerWeight {
     pub fn matmul_from(&self, x: &InlineArray) -> InlineArray {
         match self {
             Self::Dense(w) => x.matmul(w),
+            // ⚠️ A two-level weight cannot use `quantized_matmul`, which has no
+            // global-scale argument and would drop the per-tensor factor in
+            // silence. It cannot use `qqmm` either on this path: for nvfp4 MLX
+            // requires *both* `global_scale_x` and `global_scale_w` or
+            // neither, because that kernel is for a quantized activation, and
+            // ours is bf16. So the weight is unpacked here and multiplied
+            // densely, which is correct and costs a materialisation per call.
+            //
+            // Keeping it packed through the matmul needs either activation
+            // quantization or an MLX kernel that takes a weight-side global
+            // scale alone.
+            Self::Quantized {
+                weight,
+                scales,
+                biases,
+                global_scale: Some(global_scale),
+                params,
+            } => x.matmul(
+                &weight
+                    .dequantize_two_level(
+                        scales,
+                        biases.as_ref(),
+                        Some(global_scale),
+                        params.group_size,
+                        params.bits,
+                        params.mode,
+                    )
+                    .t(),
+            ),
             Self::Quantized {
                 weight,
                 scales,
                 biases,
                 params,
+                ..
             } => x.quantized_matmul_mode(
                 weight,
                 scales,
@@ -386,11 +439,34 @@ impl LayerWeight {
     ) -> InlineArray {
         match self {
             Self::Dense(w) => x.gather_mm(w, lhs_indices, rhs_indices, sorted),
+            // Same constraint as `matmul_from`: `gather_qqmm` wants both global
+            // scales for nvfp4, so a bf16 activation has to meet a dense
+            // weight.
+            Self::Quantized {
+                weight,
+                scales,
+                biases,
+                global_scale: Some(global_scale),
+                params,
+            } => x.gather_mm(
+                &weight.dequantize_two_level(
+                    scales,
+                    biases.as_ref(),
+                    Some(global_scale),
+                    params.group_size,
+                    params.bits,
+                    params.mode,
+                ),
+                lhs_indices,
+                rhs_indices,
+                sorted,
+            ),
             Self::Quantized {
                 weight,
                 scales,
                 biases,
                 params,
+                ..
             } => x.gather_qmm_mode(
                 weight,
                 scales,
@@ -417,6 +493,7 @@ impl LayerWeight {
                 weight: &w.raw,
                 scales: std::ptr::null(),
                 biases: std::ptr::null(),
+                global_scale: std::ptr::null(),
                 group_size: 0,
                 bits: 0,
                 mode: 0,
@@ -426,11 +503,13 @@ impl LayerWeight {
                 weight,
                 scales,
                 biases,
+                global_scale,
                 params,
             } => QWeightRaw {
                 weight: &weight.raw,
                 scales: &scales.raw,
                 biases: biases.as_ref().map_or(std::ptr::null(), |b| &b.raw),
+                global_scale: global_scale.as_ref().map_or(std::ptr::null(), |g| &g.raw),
                 group_size: params.group_size,
                 bits: params.bits,
                 mode: params.mode.as_i32(),
@@ -447,11 +526,13 @@ impl LayerWeight {
                 weight,
                 scales,
                 biases,
+                global_scale,
                 params,
             } => Self::Quantized {
                 weight: copy_fresh_arr(weight, zero),
                 scales: copy_fresh_arr(scales, zero),
                 biases: biases.as_ref().map(|b| copy_fresh_arr(b, zero)),
+                global_scale: global_scale.as_ref().map(|g| copy_fresh_arr(g, zero)),
                 params: *params,
             },
         }
@@ -790,6 +871,50 @@ mod tests {
         assert_eq!(
             overridden.group_size, 64,
             "affine's default, not the file's 32"
+        );
+    }
+
+    /// A two-level weight must not reach `quantized_matmul`, which has no
+    /// global-scale argument and would drop the per-tensor factor in silence.
+    ///
+    /// ⚠️ It cannot reach `qqmm` either: for nvfp4 MLX wants both
+    /// `global_scale_x` and `global_scale_w` or neither, because that kernel
+    /// is for a quantized activation. So `matmul_from` unpacks instead, and
+    /// this asserts the global scale still changes the answer.
+    #[test]
+    fn a_two_level_weight_applies_its_global_scale() {
+        let (out, in_dim) = (8i32, 64i32);
+        let values: Vec<f32> = (0..out * in_dim)
+            .map(|i| ((i % 13) as f32 - 6.0) / 6.0)
+            .collect();
+        let w = InlineArray::from_f32_slice(&values, &[out, in_dim]);
+        let (packed, scales) = w.quantize_weights_mode(16, 4, QuantizedMode::Nvfp4);
+        crate::check_last_error().expect("nvfp4 quantize");
+
+        let params = QuantParams::defaults_for(QuantizedMode::Nvfp4);
+        let x = InlineArray::from_f32_slice(&vec![0.25f32; in_dim as usize], &[1, in_dim]);
+
+        let plain =
+            LayerWeight::new_two_level(packed.clone(), Some(scales.clone()), None, None, params);
+        let mut a = plain.matmul_from(&x);
+        crate::check_last_error().expect("single-level matmul");
+
+        let half = InlineArray::from_f32_slice(&[0.5], &[1]);
+        let two_level = LayerWeight::new_two_level(packed, Some(scales), None, Some(half), params);
+        let mut b = two_level.matmul_from(&x);
+        crate::check_last_error().expect("two-level matmul");
+
+        let n = out as usize;
+        let va = a.to_f32_vec(n).expect("read single-level");
+        let vb = b.to_f32_vec(n).expect("read two-level");
+        let max_diff = va
+            .iter()
+            .zip(vb.iter())
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff > 1e-6,
+            "global scale never reached the kernel: max|diff| = {max_diff}"
         );
     }
 

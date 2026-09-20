@@ -1099,17 +1099,21 @@ void mlx_inline_compiled_gemma4_attn_block(
                         const array& q_w = ins[idx++];
                         const array& q_scales = ins[idx++];
                         const array& q_biases = ins[idx++];
+                        const array& q_global = ins[idx++];
                         const array& k_w = ins[idx++];
                         const array& k_scales = ins[idx++];
                         const array& k_biases = ins[idx++];
+                        const array& k_global = ins[idx++];
                         // v_w is only present when !KEV, but we always pass
                         // a placeholder to keep the input vector shape stable.
                         const array& v_w = ins[idx++];
                         const array& v_scales = ins[idx++];
                         const array& v_biases = ins[idx++];
+                        const array& v_global = ins[idx++];
                         const array& o_w = ins[idx++];
                         const array& o_scales = ins[idx++];
                         const array& o_biases = ins[idx++];
+                        const array& o_global = ins[idx++];
                         const array& q_norm_w = ins[idx++];
                         const array& k_norm_w = ins[idx++];
                         const array& post_norm_w = ins[idx++];
@@ -1129,14 +1133,14 @@ void mlx_inline_compiled_gemma4_attn_block(
                         // load time — matches the qwen3_native pattern, avoids
                         // per-step strided matmul); a packed one keeps the
                         // checkpoint's `[out, in]` and transposes in-kernel.
-                        auto q_proj = qproj_matmul(normed, q_w, q_scales, q_biases, QS);
-                        auto k_proj = qproj_matmul(normed, k_w, k_scales, k_biases, KS);
+                        auto q_proj = qproj_matmul(normed, q_w, q_scales, q_biases, q_global, QS);
+                        auto k_proj = qproj_matmul(normed, k_w, k_scales, k_biases, k_global, KS);
                         // For attention_k_eq_v full layers, values are taken
                         // from the *raw* k_proj output BEFORE k_norm — we keep
                         // a copy here and skip the v_proj matmul.
                         array v_pre = k_proj;
                         if (!KEV) {
-                            v_pre = qproj_matmul(normed, v_w, v_scales, v_biases, VS);
+                            v_pre = qproj_matmul(normed, v_w, v_scales, v_biases, v_global, VS);
                         }
 
                         auto q4 = reshape(q_proj, {B, S, NH, HD});
@@ -1210,7 +1214,7 @@ void mlx_inline_compiled_gemma4_attn_block(
                         output = reshape(output, {B, S, NH * HD});
 
                         // 8. Output projection + post_attention_layernorm.
-                        auto attn_out = qproj_matmul(output, o_w, o_scales, o_biases, OS);
+                        auto attn_out = qproj_matmul(output, o_w, o_scales, o_biases, o_global, OS);
                         auto post = fast::rms_norm(attn_out, post_norm_w, PNE);
                         return {post, updated_keys, updated_vals};
                     })
@@ -1229,7 +1233,7 @@ void mlx_inline_compiled_gemma4_attn_block(
             : qproj_dummy();
 
         std::vector<array> ins;
-        ins.reserve(21);
+        ins.reserve(25);
         ins.push_back(as_arr(x));
         ins.push_back(as_arr(in_norm_w));
         push_qproj(ins, q_w);
@@ -1366,9 +1370,11 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
                         const array& q_w = ins[idx++];
                         const array& q_scales = ins[idx++];
                         const array& q_biases = ins[idx++];
+                        const array& q_global = ins[idx++];
                         const array& o_w = ins[idx++];
                         const array& o_scales = ins[idx++];
                         const array& o_biases = ins[idx++];
+                        const array& o_global = ins[idx++];
                         const array& q_norm_w = ins[idx++];
                         const array& post_norm_w = ins[idx++];
                         const array& rope_freqs_arr = ins[idx++];
@@ -1381,7 +1387,7 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
                         int S = x.shape(1);
 
                         auto normed = fast::rms_norm(x, in_norm_w, INE);
-                        auto q_proj = qproj_matmul(normed, q_w, q_scales, q_biases, QS);
+                        auto q_proj = qproj_matmul(normed, q_w, q_scales, q_biases, q_global, QS);
                         auto q = reshape(q_proj, {B, S, NH, HD});
                         q = fast::rms_norm(q, q_norm_w, QNE);
                         q = transpose(q, {0, 2, 1, 3});
@@ -1412,7 +1418,7 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
                         output = transpose(output, {0, 2, 1, 3});
                         output = reshape(output, {B, S, NH * HD});
 
-                        auto attn_out = qproj_matmul(output, o_w, o_scales, o_biases, OS);
+                        auto attn_out = qproj_matmul(output, o_w, o_scales, o_biases, o_global, OS);
                         auto post = fast::rms_norm(attn_out, post_norm_w, PNE);
                         return {post};
                     })
@@ -1425,7 +1431,7 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
             : qproj_dummy();
 
         std::vector<array> ins;
-        ins.reserve(15);
+        ins.reserve(17);
         ins.push_back(as_arr(x));
         ins.push_back(as_arr(in_norm_w));
         push_qproj(ins, q_w);
@@ -1523,12 +1529,15 @@ void mlx_inline_compiled_gemma4_mlp_block(
                         const array& gate_w = ins[idx++];
                         const array& gate_scales = ins[idx++];
                         const array& gate_biases = ins[idx++];
+                        const array& gate_global = ins[idx++];
                         const array& up_w = ins[idx++];
                         const array& up_scales = ins[idx++];
                         const array& up_biases = ins[idx++];
+                        const array& up_global = ins[idx++];
                         const array& down_w = ins[idx++];
                         const array& down_scales = ins[idx++];
                         const array& down_biases = ins[idx++];
+                        const array& down_global = ins[idx++];
                         const array& post_w = ins[idx++];
 
                         // pre_feedforward_layernorm.
@@ -1537,8 +1546,8 @@ void mlx_inline_compiled_gemma4_mlp_block(
                         // Tanh-approx GELU on gate_proj output, multiply by
                         // up_proj output. Matches mlx-lm's `geglu(gate, x) =
                         // nn.gelu_approx(gate) * x` (sqrt(2/pi)·(g + 0.044715·g^3)).
-                        auto gate = qproj_matmul(h, gate_w, gate_scales, gate_biases, GS);
-                        auto up = qproj_matmul(h, up_w, up_scales, up_biases, US);
+                        auto gate = qproj_matmul(h, gate_w, gate_scales, gate_biases, gate_global, GS);
+                        auto up = qproj_matmul(h, up_w, up_scales, up_biases, up_global, US);
 
                         // Scalars MUST be cast to gate.dtype() or bf16
                         // inputs silently promote to f32, forcing every
@@ -1555,7 +1564,7 @@ void mlx_inline_compiled_gemma4_mlp_block(
                         auto gelu_g = multiply(half, multiply(gate, add(one, t)));
 
                         auto activated = multiply(gelu_g, up);
-                        auto down = qproj_matmul(activated, down_w, down_scales, down_biases, DS);
+                        auto down = qproj_matmul(activated, down_w, down_scales, down_biases, down_global, DS);
                         // post_feedforward_layernorm.
                         auto post = fast::rms_norm(down, post_w, POST);
                         return {post};
@@ -1565,7 +1574,7 @@ void mlx_inline_compiled_gemma4_mlp_block(
         }
 
         std::vector<array> ins;
-        ins.reserve(12);
+        ins.reserve(15);
         ins.push_back(as_arr(x));
         ins.push_back(as_arr(pre_norm_w));
         push_qproj(ins, gate_w);
@@ -1650,12 +1659,14 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
                         const array& gate_w = ins[idx++];
                         const array& gate_scales = ins[idx++];
                         const array& gate_biases = ins[idx++];
+                        const array& gate_global = ins[idx++];
                         const array& projection_w = ins[idx++];
                         const array& projection_scales = ins[idx++];
                         const array& projection_biases = ins[idx++];
+                        const array& projection_global = ins[idx++];
                         const array& post_norm_w = ins[idx++];
 
-                        auto gate = qproj_matmul(x, gate_w, gate_scales, gate_biases, GS);
+                        auto gate = qproj_matmul(x, gate_w, gate_scales, gate_biases, gate_global, GS);
 
                         auto dt = gate.dtype();
                         auto half = astype(array(0.5f), dt);
@@ -1668,8 +1679,7 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
                         auto gelu_g = multiply(half, multiply(gate, add(one, t)));
 
                         auto mixed = multiply(gelu_g, layer_input);
-                        auto projected = qproj_matmul(
-                            mixed, projection_w, projection_scales, projection_biases, PS);
+                        auto projected = qproj_matmul(mixed, projection_w, projection_scales, projection_biases, projection_global, PS);
                         auto post = fast::rms_norm(projected, post_norm_w, POST);
                         return {add(x, post)};
                     })
@@ -1678,7 +1688,7 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
         }
 
         std::vector<array> ins;
-        ins.reserve(9);
+        ins.reserve(11);
         ins.push_back(as_arr(x));
         ins.push_back(as_arr(layer_input));
         push_qproj(ins, gate_w);

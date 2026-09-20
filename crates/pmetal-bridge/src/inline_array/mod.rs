@@ -61,6 +61,9 @@ pub(crate) struct QWeightRaw<'a> {
     pub(crate) weight: *const RawBuf,
     pub(crate) scales: *const RawBuf,
     pub(crate) biases: *const RawBuf,
+    /// nvfp4's per-tensor second level. Non-null switches the projection onto
+    /// `qqmm` inside the compiled block.
+    pub(crate) global_scale: *const RawBuf,
     pub(crate) group_size: i32,
     pub(crate) bits: i32,
     pub(crate) mode: i32,

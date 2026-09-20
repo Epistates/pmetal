@@ -35,10 +35,15 @@ typedef struct {
 // graph serve both a bf16 and a 4-bit checkpoint. `group_size` / `bits` /
 // `mode` are part of every compiled block's cache key, so a mixed-precision
 // checkpoint gets one trace per distinct combination.
+// `global_scale` is nvfp4's second level, one scale for the whole tensor
+// beside the per-group ones. Non-NULL routes the projection through
+// `mlx::core::qqmm`, because `quantized_matmul` has no slot to pass it and
+// would drop it silently.
 typedef struct {
     const mlx_inline_array* weight;
     const mlx_inline_array* scales;
     const mlx_inline_array* biases;
+    const mlx_inline_array* global_scale;
     int group_size;
     int bits;
     int mode;
