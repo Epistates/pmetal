@@ -291,6 +291,10 @@ pub struct PerLayerGateWeights {
 /// cache. The E2B/E4B checkpoints ship *no* `k_proj`, `v_proj` or `k_norm` for
 /// a shared layer, so the two cases carry different tensors and this keeps the
 /// combination that cannot exist out of the type.
+// One per layer and never moved after load, so the size difference between the
+// variants costs nothing worth a `Box` indirection on the decode path. Same
+// reasoning as `LayerWeight` and `EmbeddingWeight` in `native_weight`.
+#[allow(clippy::large_enum_variant)]
 pub enum AttentionKv {
     /// The layer projects its own keys and values.
     Projected {
