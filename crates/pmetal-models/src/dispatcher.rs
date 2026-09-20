@@ -215,7 +215,14 @@ impl ModelArchitecture {
 
     pub fn from_model_type(model_type: &str) -> Option<Self> {
         let lower = model_type.to_lowercase();
-        match lower.as_str() {
+        // A `*_mtp` checkpoint is the base architecture plus bundled
+        // multi-token-prediction layers, which `--mtp` loads separately as a
+        // speculative draft. `mlx-community/Qwen3.8-27B-MTP-4bit` states
+        // `qwen3_5_mtp` and carries no `architectures` array, so without this
+        // the whole checkpoint failed detection rather than running as its
+        // own target model.
+        let lower = lower.strip_suffix("_mtp").unwrap_or(&lower);
+        match lower {
             "llama4" | "llama4_text" => Some(Self::Llama4),
             // Before the generic llama arms: Mllama's text sub-config is
             // `mllama_text_model`, which must not fall through to plain Llama
@@ -2141,6 +2148,29 @@ impl Module<Array> for DynamicModel {
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    /// A bundled-MTP checkpoint is its base architecture plus draft layers.
+    /// `mlx-community/Qwen3.8-27B-MTP-4bit` states `qwen3_5_mtp` with no
+    /// `architectures` array to fall back on, so before the suffix was
+    /// stripped the whole family resolved to `None` and never loaded.
+    #[test]
+    fn bundled_mtp_checkpoints_resolve_to_their_target_architecture() {
+        for mt in ["qwen3_5_mtp", "qwen3_6_mtp", "qwen3_5_moe_mtp"] {
+            assert_eq!(
+                ModelArchitecture::from_model_type(mt),
+                Some(ModelArchitecture::Qwen3Next),
+                "{mt} should run as its target architecture"
+            );
+        }
+        // The plain names keep resolving the same way.
+        assert_eq!(
+            ModelArchitecture::from_model_type("qwen3_5"),
+            Some(ModelArchitecture::Qwen3Next)
+        );
+        // A suffix on something we do not implement still resolves to nothing,
+        // rather than to a neighbouring architecture.
+        assert_eq!(ModelArchitecture::from_model_type("mamba_mtp"), None);
+    }
 
     /// The literal `nvidia/Nemotron-H-8B-Base-8K` ships, reduced.
     ///

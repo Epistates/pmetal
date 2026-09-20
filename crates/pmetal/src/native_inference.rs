@@ -108,6 +108,11 @@ pub fn detect_arch(model_path: &Path) -> Option<NativeArch> {
         .or_else(|| v.get("model_type"))
         .and_then(|mv| mv.as_str())?;
 
+    // A `*_mtp` checkpoint is the base architecture plus bundled
+    // multi-token-prediction layers; `--mtp` loads those separately as a
+    // speculative draft, and the target runs as its own architecture.
+    let mt = mt.strip_suffix("_mtp").unwrap_or(mt);
+
     match mt {
         "qwen3" | "qwen3dense" => Some(NativeArch::Qwen3),
         "qwen3_5" | "qwen3_5_text" | "qwen3_5_moe" | "qwen3_5_moe_text" | "qwen3_6"
@@ -281,6 +286,21 @@ mod tests {
         );
         assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3));
         let _ = fs::remove_dir_all(dir);
+    }
+
+    /// `mlx-community/Qwen3.8-27B-MTP-4bit` states `qwen3_5_mtp` and carries no
+    /// `architectures` array, so the bundled-MTP checkpoints matched nothing
+    /// and fell off the native engine entirely. The MTP layers are a draft that
+    /// `--mtp` loads separately; the target is still a Qwen3.5.
+    #[test]
+    fn a_bundled_mtp_checkpoint_runs_as_its_target_architecture() {
+        let dir = write_temp_config(r#"{"model_type":"qwen3_5_mtp"}"#);
+        assert_eq!(detect_arch(&dir), Some(NativeArch::Qwen3_5));
+        let _ = fs::remove_dir_all(dir);
+
+        let moe = write_temp_config(r#"{"model_type":"qwen3_6_moe_mtp"}"#);
+        assert_eq!(detect_arch(&moe), Some(NativeArch::Qwen3_5));
+        let _ = fs::remove_dir_all(moe);
     }
 
     #[test]
