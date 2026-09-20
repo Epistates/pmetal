@@ -843,7 +843,7 @@ pub fn load_model(
     let params_for = |module: &str| -> QuantParams {
         quantization
             .as_ref()
-            .map(|q| q.params_for(module).unwrap_or_else(|| q.default_params()))
+            .and_then(|q| q.params_for(module).or_else(|| q.default_params()))
             .unwrap_or_else(|| QuantParams::defaults_for(crate::QuantizedMode::Affine))
     };
 

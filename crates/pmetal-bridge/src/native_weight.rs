@@ -66,7 +66,12 @@ impl QuantParams {
 /// projection at 8 bits and leaving attention at 4.
 #[derive(Clone, Debug)]
 pub struct MlxQuantization {
-    default: QuantParams,
+    /// How to read a module the block never names.
+    ///
+    /// `Some` for MLX's own format, where the file-level `bits`/`group_size`
+    /// apply to everything not overridden. `None` for NVIDIA ModelOpt, which
+    /// names every quantized module explicitly and leaves the rest dense.
+    default: Option<QuantParams>,
     overrides: std::collections::HashMap<String, Option<QuantParams>>,
 }
 
@@ -86,7 +91,11 @@ impl MlxQuantization {
         normalize: impl Fn(&str) -> Option<String>,
     ) -> Option<Self> {
         let map = block.as_object()?;
-        let default = Self::params_from(map)?;
+        // NVIDIA ModelOpt / compressed-tensors states its own schema.
+        if map.contains_key("config_groups") {
+            return Self::from_modelopt(map, normalize);
+        }
+        let default = Some(Self::params_from(map)?);
 
         let mut overrides = std::collections::HashMap::new();
         for (key, value) in map {
@@ -105,7 +114,7 @@ impl MlxQuantization {
                 // The predicate returned a bare bool, so mlx passes the
                 // file-level arguments through unchanged.
                 serde_json::Value::Bool(true) => {
-                    overrides.insert(path, Some(default));
+                    overrides.insert(path, default);
                 }
                 serde_json::Value::Bool(false) => {
                     overrides.insert(path, None);
@@ -116,6 +125,112 @@ impl MlxQuantization {
             }
         }
         Some(Self { default, overrides })
+    }
+
+    /// Parse NVIDIA ModelOpt's `config_groups` schema.
+    ///
+    /// Unlike MLX's block, this names every quantized module explicitly in a
+    /// group's `targets` list and leaves everything else dense, so there is no
+    /// file-level default to fall back on:
+    ///
+    /// ```json
+    /// "quantization_config": {
+    ///   "quant_method": "modelopt",
+    ///   "config_groups": {
+    ///     "group_0": {"weights": {"num_bits": 8, "type": "float"},
+    ///                 "targets": ["model.layers.0.self_attn.q_proj", ...]},
+    ///     "group_1": {"weights": {"num_bits": 4, "type": "float", "group_size": 16},
+    ///                 "targets": ["model.layers.0.mlp.down_proj", ...]}
+    ///   },
+    ///   "ignore": ["mtp*"]
+    /// }
+    /// ```
+    ///
+    /// `input_activations` is ignored: those describe a quantized activation,
+    /// and reading the weights alone is valid, just not the whole speedup.
+    fn from_modelopt(
+        map: &serde_json::Map<String, serde_json::Value>,
+        normalize: impl Fn(&str) -> Option<String>,
+    ) -> Option<Self> {
+        let groups = map.get("config_groups")?.as_object()?;
+        let mut overrides = std::collections::HashMap::new();
+
+        for group in groups.values() {
+            let group = group.as_object()?;
+            // `None` here is a scheme with no MLX mode, per-tensor fp8 being
+            // the one that ships. Its targets are recorded as dense so they
+            // take the fp8 path rather than failing the whole checkpoint.
+            let params = Self::params_from_modelopt(group.get("weights")?.as_object()?);
+            let targets = group.get("targets").and_then(|t| t.as_array());
+            for target in targets.into_iter().flatten() {
+                let Some(name) = target.as_str() else {
+                    continue;
+                };
+                if let Some(path) = normalize(name) {
+                    overrides.insert(path, params);
+                }
+            }
+        }
+
+        // `ignore` wins over any group that also named the module.
+        for pattern in map
+            .get("ignore")
+            .and_then(|i| i.as_array())
+            .into_iter()
+            .flatten()
+        {
+            let Some(pattern) = pattern.as_str() else {
+                continue;
+            };
+            let prefix = pattern.trim_end_matches('*');
+            let matched: Vec<String> = overrides
+                .keys()
+                .filter(|path| path.starts_with(prefix))
+                .cloned()
+                .collect();
+            for path in matched {
+                overrides.insert(path, None);
+            }
+        }
+
+        Some(Self {
+            default: None,
+            overrides,
+        })
+    }
+
+    /// One group's weight spec, in ModelOpt's vocabulary.
+    ///
+    /// ⚠️ A `num_bits: 8, type: float` group with no `group_size` is
+    /// per-tensor fp8, which is not one of MLX's block-scaled modes. It has no
+    /// `QuantParams` spelling, so it returns `None` here and the loader keeps
+    /// those tensors on the dense fp8 path.
+    fn params_from_modelopt(
+        weights: &serde_json::Map<String, serde_json::Value>,
+    ) -> Option<QuantParams> {
+        let bits = weights.get("num_bits")?.as_i64()? as i32;
+        let kind = weights
+            .get("type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("int");
+        let group_size = weights
+            .get("group_size")
+            .and_then(|g| g.as_i64())
+            .map(|g| g as i32);
+
+        let mode = match (kind, bits, group_size) {
+            ("float", 4, Some(16)) => QuantizedMode::Nvfp4,
+            ("float", 4, Some(32)) => QuantizedMode::Mxfp4,
+            ("float", 8, Some(32)) => QuantizedMode::Mxfp8,
+            // Per-tensor fp8, or an integer scheme this build cannot express.
+            ("float", _, _) => return None,
+            _ => QuantizedMode::Affine,
+        };
+        Some(QuantParams {
+            group_size: group_size.unwrap_or(QuantParams::defaults_for(mode).group_size),
+            bits,
+            mode,
+        })
     }
 
     /// One `{group_size, bits, mode}` triple, defaulting the way
@@ -157,13 +272,16 @@ impl MlxQuantization {
     pub fn params_for(&self, module_path: &str) -> Option<QuantParams> {
         match self.overrides.get(module_path) {
             Some(entry) => *entry,
-            None => Some(self.default),
+            None => self.default,
         }
     }
 
     /// The file-level parameters, for tensors that are not per-module, such as
     /// pre-stacked MoE expert weights.
-    pub fn default_params(&self) -> QuantParams {
+    ///
+    /// `None` for a block that names every quantized module rather than
+    /// declaring a default, which is how NVIDIA ModelOpt writes it.
+    pub fn default_params(&self) -> Option<QuantParams> {
         self.default
     }
 }
@@ -665,7 +783,7 @@ mod tests {
         });
         let q = MlxQuantization::from_json(&block, identity).expect("block parses");
 
-        assert_eq!(q.default_params().mode, QuantizedMode::Mxfp4);
+        assert_eq!(q.default_params().unwrap().mode, QuantizedMode::Mxfp4);
         let overridden = q.params_for("model.layers.0.mlp.down_proj").unwrap();
         assert_eq!(overridden.mode, QuantizedMode::Affine);
         assert_eq!(overridden.bits, 8);
@@ -673,6 +791,46 @@ mod tests {
             overridden.group_size, 64,
             "affine's default, not the file's 32"
         );
+    }
+
+    /// The shape `nvidia/Qwen3.8-27B-NVFP4` ships: two groups, one per-tensor
+    /// fp8 and one nvfp4 at group size 16, every quantized module named
+    /// explicitly, and the MTP draft layers left out via `ignore`.
+    #[test]
+    fn modelopt_groups_name_every_quantized_module() {
+        let block = serde_json::json!({
+            "quant_method": "modelopt",
+            "config_groups": {
+                "group_0": {
+                    "weights": {"dynamic": false, "num_bits": 8, "type": "float"},
+                    "input_activations": {"dynamic": false, "num_bits": 8, "type": "float"},
+                    "targets": ["model.layers.0.self_attn.q_proj"]
+                },
+                "group_1": {
+                    "weights": {"dynamic": false, "num_bits": 4, "type": "float", "group_size": 16},
+                    "input_activations": {"dynamic": false, "num_bits": 4, "type": "float", "group_size": 16},
+                    "targets": ["model.layers.0.mlp.down_proj", "mtp.layers.0.mlp.down_proj"]
+                }
+            },
+            "ignore": ["mtp*"]
+        });
+        let q = MlxQuantization::from_json(&block, identity).expect("modelopt block parses");
+
+        // group_1 is nvfp4: 4-bit float at group size 16.
+        let down = q.params_for("model.layers.0.mlp.down_proj").unwrap();
+        assert_eq!(down.mode, QuantizedMode::Nvfp4);
+        assert_eq!((down.group_size, down.bits), (16, 4));
+
+        // Per-tensor fp8 has no MLX mode, so it stays off the packed path.
+        assert_eq!(q.params_for("model.layers.0.self_attn.q_proj"), None);
+
+        // `ignore` wins over the group that also named the module.
+        assert_eq!(q.params_for("mtp.layers.0.mlp.down_proj"), None);
+
+        // Nothing is quantized by default: a module the block never names is
+        // dense, unlike MLX's format where the file-level params apply.
+        assert_eq!(q.default_params(), None);
+        assert_eq!(q.params_for("model.layers.7.self_attn.k_proj"), None);
     }
 
     /// Decoding mxfp4 as affine yields a model that loads and emits noise, so

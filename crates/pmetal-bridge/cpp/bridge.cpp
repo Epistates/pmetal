@@ -428,16 +428,23 @@ void mlx_inline_sign(mlx_inline_array* dst, const mlx_inline_array* a) {
 
 void mlx_inline_dequantize(mlx_inline_array* dst, const mlx_inline_array* w,
     const mlx_inline_array* scales, const mlx_inline_array* biases,
-    int group_size, int bits, int mode) {
+    int group_size, int bits, int mode,
+    const mlx_inline_array* global_scale) {
     BRIDGE_TRY_DST("dequantize", dst, {
         // Only affine mode carries biases; mxfp4, nvfp4 and mxfp8 store a
         // scale per group and nothing else.
         auto biases_opt = biases
             ? std::optional<array>(as_arr(biases))
             : std::optional<array>(std::nullopt);
+        // nvfp4's second level. Named rather than positional: `dtype` sits
+        // right after it, and both are optional.
+        auto global_opt = global_scale
+            ? std::optional<array>(as_arr(global_scale))
+            : std::optional<array>(std::nullopt);
         new (dst->buf) array(mlx::core::dequantize(
             as_arr(w), as_arr(scales), biases_opt, group_size, bits,
-            quant_mode_from_int(mode)));
+            quant_mode_from_int(mode),
+            /* global_scale */ global_opt));
     });
 }
 

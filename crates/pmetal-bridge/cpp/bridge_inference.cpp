@@ -169,6 +169,49 @@ void mlx_inline_quantized_matmul(mlx_inline_array* dst,
     });
 }
 
+void mlx_inline_qqmm(mlx_inline_array* dst,
+                       const mlx_inline_array* x, const mlx_inline_array* w,
+                       const mlx_inline_array* w_scales,
+                       int group_size, int bits, int mode,
+                       const mlx_inline_array* global_scale_x,
+                       const mlx_inline_array* global_scale_w) {
+    BRIDGE_TRY_DST("qqmm", dst, {
+        auto opt = [](const mlx_inline_array* a) {
+            return a ? std::optional<array>(as_arr(a))
+                     : std::optional<array>(std::nullopt);
+        };
+        new (dst->buf) array(mlx::core::qqmm(
+            as_arr(x), as_arr(w), opt(w_scales),
+            group_size, bits, quant_mode_from_int(mode),
+            /* global_scale_x */ opt(global_scale_x),
+            /* global_scale_w */ opt(global_scale_w)));
+    });
+}
+
+void mlx_inline_gather_qqmm(mlx_inline_array* dst,
+                              const mlx_inline_array* x, const mlx_inline_array* w,
+                              const mlx_inline_array* w_scales,
+                              const mlx_inline_array* lhs_indices,
+                              const mlx_inline_array* rhs_indices,
+                              int group_size, int bits, int mode,
+                              const mlx_inline_array* global_scale_x,
+                              const mlx_inline_array* global_scale_w,
+                              bool sorted_indices) {
+    BRIDGE_TRY_DST("gather_qqmm", dst, {
+        auto opt = [](const mlx_inline_array* a) {
+            return a ? std::optional<array>(as_arr(a))
+                     : std::optional<array>(std::nullopt);
+        };
+        new (dst->buf) array(mlx::core::gather_qqmm(
+            as_arr(x), as_arr(w), opt(w_scales),
+            opt(lhs_indices), opt(rhs_indices),
+            group_size, bits, quant_mode_from_int(mode),
+            /* global_scale_x */ opt(global_scale_x),
+            /* global_scale_w */ opt(global_scale_w),
+            /* sorted_indices */ sorted_indices));
+    });
+}
+
 void mlx_inline_gather_qmm(mlx_inline_array* dst,
                               const mlx_inline_array* x, const mlx_inline_array* w,
                               const mlx_inline_array* scales, const mlx_inline_array* biases,
