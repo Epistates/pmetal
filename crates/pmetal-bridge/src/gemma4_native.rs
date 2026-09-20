@@ -285,16 +285,43 @@ pub struct PerLayerGateWeights {
     pub post_norm_w: InlineArray,
 }
 
+/// Where a layer's keys and values come from.
+///
+/// A Gemma 4 layer either projects its own K/V or reuses an earlier layer's
+/// cache. The E2B/E4B checkpoints ship *no* `k_proj`, `v_proj` or `k_norm` for
+/// a shared layer, so the two cases carry different tensors and this keeps the
+/// combination that cannot exist out of the type.
+pub enum AttentionKv {
+    /// The layer projects its own keys and values.
+    Projected {
+        k_w: LayerWeight,
+        k_norm_w: InlineArray,
+        /// `None` for full-attention layers under `attention_k_eq_v`, where
+        /// values are the raw k_proj output taken *before* `k_norm`, so there
+        /// is no `v_proj` to load.
+        v_w: Option<LayerWeight>,
+    },
+    /// The layer reuses the cache of the last non-shared layer with the same
+    /// attention type, and projects queries only.
+    Shared { source_layer: usize },
+}
+
+impl AttentionKv {
+    /// The layer whose cache this one reads, when it does not fill its own.
+    pub fn source_layer(&self) -> Option<usize> {
+        match self {
+            Self::Projected { .. } => None,
+            Self::Shared { source_layer } => Some(*source_layer),
+        }
+    }
+}
+
 pub struct LayerWeights {
     pub input_norm_w: InlineArray,
     pub q_w: LayerWeight,
-    pub k_w: LayerWeight,
-    /// `None` for full-attention layers under `attention_k_eq_v` (values
-    /// come from the raw k_proj output).
-    pub v_w: Option<LayerWeight>,
+    pub kv: AttentionKv,
     pub o_w: LayerWeight,
     pub q_norm_w: InlineArray,
-    pub k_norm_w: InlineArray,
     pub post_attn_norm_w: InlineArray,
     pub pre_ffn_norm_w: InlineArray,
     pub gate_w: LayerWeight,
@@ -315,9 +342,6 @@ pub struct LayerWeights {
     pub rope_base: f32,
     pub rope_dims: i32,
     pub sliding_window: Option<i32>,
-    /// For Gemma 4 KV sharing, later layers reuse the K/V cache of the
-    /// last non-shared layer with the same attention type.
-    pub kv_shared_source_layer: Option<usize>,
 }
 
 /// Full model weight bundle. `lm_head_w` is `None` when the model ties
@@ -904,35 +928,42 @@ pub fn load_model(
             Some(config.sliding_window)
         };
         let rope_freqs = build_partial_rope_freqs(head_dim, rope_dims, rope_base);
-        let kv_shared_source_layer =
-            if idx >= first_kv_shared_layer_idx && first_kv_shared_layer_idx > 0 {
-                Some(config.kv_shared_source_layer(idx).ok_or_else(|| {
-                    format!(
-                        "Gemma 4 native: no KV-sharing source layer found for layer {idx} ({})",
-                        if is_full {
-                            "full_attention"
-                        } else {
-                            "sliding_attention"
-                        }
-                    )
-                })?)
-            } else {
-                None
-            };
+        let shared_source = if idx >= first_kv_shared_layer_idx && first_kv_shared_layer_idx > 0 {
+            Some(config.kv_shared_source_layer(idx).ok_or_else(|| {
+                format!(
+                    "Gemma 4 native: no KV-sharing source layer found for layer {idx} ({})",
+                    if is_full {
+                        "full_attention"
+                    } else {
+                        "sliding_attention"
+                    }
+                )
+            })?)
+        } else {
+            None
+        };
 
         let input_norm_w = take(&mut raw, &format!("{p}.input_layernorm.weight"))?;
         let post_attn_norm_w = take(&mut raw, &format!("{p}.post_attention_layernorm.weight"))?;
         let pre_ffn_norm_w = take(&mut raw, &format!("{p}.pre_feedforward_layernorm.weight"))?;
         let post_ffn_norm_w = take(&mut raw, &format!("{p}.post_feedforward_layernorm.weight"))?;
         let q_norm_w = take(&mut raw, &format!("{p}.self_attn.q_norm.weight"))?;
-        let k_norm_w = take(&mut raw, &format!("{p}.self_attn.k_norm.weight"))?;
 
         let q_w = take_proj(&mut raw, &format!("{p}.self_attn.q_proj"))?;
-        let k_w = take_proj(&mut raw, &format!("{p}.self_attn.k_proj"))?;
-        let v_w = if use_k_eq_v {
-            None
-        } else {
-            Some(take_proj(&mut raw, &format!("{p}.self_attn.v_proj"))?)
+        // A KV-shared layer reads an earlier layer's cache, so the checkpoint
+        // ships no k_proj, v_proj or k_norm for it at all. Asking for them is
+        // what kept every E2B/E4B checkpoint from loading (#31).
+        let kv = match shared_source {
+            Some(source_layer) => AttentionKv::Shared { source_layer },
+            None => AttentionKv::Projected {
+                k_w: take_proj(&mut raw, &format!("{p}.self_attn.k_proj"))?,
+                k_norm_w: take(&mut raw, &format!("{p}.self_attn.k_norm.weight"))?,
+                v_w: if use_k_eq_v {
+                    None
+                } else {
+                    Some(take_proj(&mut raw, &format!("{p}.self_attn.v_proj"))?)
+                },
+            },
         };
         let o_w = take_proj(&mut raw, &format!("{p}.self_attn.o_proj"))?;
 
@@ -962,11 +993,9 @@ pub fn load_model(
         layers.push(LayerWeights {
             input_norm_w,
             q_w,
-            k_w,
-            v_w,
+            kv,
             o_w,
             q_norm_w,
-            k_norm_w,
             post_attn_norm_w,
             pre_ffn_norm_w,
             gate_w,
@@ -983,7 +1012,6 @@ pub fn load_model(
             rope_base,
             rope_dims,
             sliding_window,
-            kv_shared_source_layer,
         });
     }
 
@@ -1010,9 +1038,11 @@ pub fn load_model(
     // decode step. Matches qwen3_native's pattern.
     for l in weights.layers.iter() {
         l.q_w.async_eval_ref();
-        l.k_w.async_eval_ref();
-        if let Some(ref v) = l.v_w {
-            v.async_eval_ref();
+        if let AttentionKv::Projected { k_w, v_w, .. } = &l.kv {
+            k_w.async_eval_ref();
+            if let Some(v) = v_w {
+                v.async_eval_ref();
+            }
         }
         l.o_w.async_eval_ref();
         l.gate_w.async_eval_ref();
@@ -1131,55 +1161,59 @@ pub fn forward_step(
         } else {
             None
         };
-        let attn_out = if let Some(shared_source) = layer.kv_shared_source_layer {
-            let attn = {
-                let source_cache = &cache.layers[shared_source];
-                shared_kv_attention_forward(&hidden, layer, source_cache, rope_offset, eps)
-            };
-            let source_offset = cache.layers[shared_source].offset;
-            cache.layers[i].offset = source_offset;
-            attn
-        } else {
-            let layer_cache = &mut cache.layers[i];
-            let needed = rope_offset + seq_len;
-            ensure_cache_capacity(layer_cache, needed, layer.n_kv_heads, layer.head_dim, dtype);
+        let attn_out = match &layer.kv {
+            AttentionKv::Shared { source_layer } => {
+                let source_layer = *source_layer;
+                let attn = {
+                    let source_cache = &cache.layers[source_layer];
+                    shared_kv_attention_forward(&hidden, layer, source_cache, rope_offset, eps)
+                };
+                let source_offset = cache.layers[source_layer].offset;
+                cache.layers[i].offset = source_offset;
+                attn
+            }
+            AttentionKv::Projected { k_w, k_norm_w, v_w } => {
+                let layer_cache = &mut cache.layers[i];
+                let needed = rope_offset + seq_len;
+                ensure_cache_capacity(layer_cache, needed, layer.n_kv_heads, layer.head_dim, dtype);
 
-            let cache_k = layer_cache.keys.take().unwrap();
-            let cache_v = layer_cache.values.take().unwrap();
+                let cache_k = layer_cache.keys.take().unwrap();
+                let cache_v = layer_cache.values.take().unwrap();
 
-            // Wide compiled attention block: includes input_layernorm at
-            // the top and post_attention_layernorm at the bottom. Measured
-            // to be ~15-20% faster on 31B than the narrower "norms-outside"
-            // variant — probably because the extra per-op RMS-norm kernels
-            // become their own dispatch-cost floor for large hidden sizes.
-            let (attn_out, new_k, new_v) = InlineArray::compiled_gemma4_attn_block(
-                &hidden,
-                &layer.input_norm_w,
-                &layer.q_w,
-                &layer.k_w,
-                layer.v_w.as_ref(),
-                &layer.o_w,
-                &layer.q_norm_w,
-                &layer.k_norm_w,
-                &layer.post_attn_norm_w,
-                layer.rope_freqs.as_ref(),
-                &cache_k,
-                &cache_v,
-                rope_offset,
-                layer.n_heads,
-                layer.n_kv_heads,
-                layer.head_dim,
-                eps,
-                eps,
-                eps,
-                layer.sliding_window.unwrap_or(0),
-                layer.rope_base,
-                layer.rope_dims,
-            );
-            layer_cache.keys = Some(new_k);
-            layer_cache.values = Some(new_v);
-            layer_cache.offset = (rope_offset + seq_len) as usize;
-            attn_out
+                // Wide compiled attention block: includes input_layernorm at
+                // the top and post_attention_layernorm at the bottom. Measured
+                // to be ~15-20% faster on 31B than the narrower "norms-outside"
+                // variant — probably because the extra per-op RMS-norm kernels
+                // become their own dispatch-cost floor for large hidden sizes.
+                let (attn_out, new_k, new_v) = InlineArray::compiled_gemma4_attn_block(
+                    &hidden,
+                    &layer.input_norm_w,
+                    &layer.q_w,
+                    k_w,
+                    v_w.as_ref(),
+                    &layer.o_w,
+                    &layer.q_norm_w,
+                    k_norm_w,
+                    &layer.post_attn_norm_w,
+                    layer.rope_freqs.as_ref(),
+                    &cache_k,
+                    &cache_v,
+                    rope_offset,
+                    layer.n_heads,
+                    layer.n_kv_heads,
+                    layer.head_dim,
+                    eps,
+                    eps,
+                    eps,
+                    layer.sliding_window.unwrap_or(0),
+                    layer.rope_base,
+                    layer.rope_dims,
+                );
+                layer_cache.keys = Some(new_k);
+                layer_cache.values = Some(new_v);
+                layer_cache.offset = (rope_offset + seq_len) as usize;
+                attn_out
+            }
         };
 
         if profile {
@@ -1425,6 +1459,56 @@ mod tests {
         assert_eq!(cfg.kv_shared_source_layer(3), None);
         assert_eq!(cfg.kv_shared_source_layer(4), Some(2));
         assert_eq!(cfg.kv_shared_source_layer(5), Some(3));
+    }
+
+    /// `mlx-community/gemma-4-e4b-it-4bit`: 42 layers, the last 18 shared, so
+    /// every shared layer reads the last concrete layer of its own attention
+    /// type (22 sliding, 23 full). This is `layer_idx_to_cache_idx` in
+    /// mlx-lm's `gemma3n.py`, which E4B inherits from.
+    ///
+    /// ⚠️ Those 18 layers ship no `k_proj`, `v_proj` or `k_norm` at all, which
+    /// is why demanding them kept the whole E2B/E4B family from loading (#31).
+    #[test]
+    fn e4b_shared_layers_read_the_last_concrete_layer_of_their_type() {
+        let mut cfg = toy_config();
+        cfg.num_hidden_layers = 42;
+        cfg.layer_types = (0..42)
+            .map(|i| {
+                if i % 2 == 0 {
+                    "sliding_attention".to_string()
+                } else {
+                    "full_attention".to_string()
+                }
+            })
+            .collect();
+        cfg.num_kv_shared_layers = Some(18);
+
+        assert_eq!(cfg.first_kv_shared_layer_idx(), 24);
+        // The last concrete layer of each type, layers 0..24.
+        assert_eq!(cfg.kv_shared_source_layer(24), Some(22), "sliding");
+        assert_eq!(cfg.kv_shared_source_layer(25), Some(23), "full");
+        assert_eq!(cfg.kv_shared_source_layer(41), Some(23), "last layer, full");
+        // Everything below the boundary fills its own cache.
+        assert_eq!(cfg.kv_shared_source_layer(23), None);
+    }
+
+    /// A layer either projects its own K/V or reuses a cache, and the type
+    /// keeps the third combination from existing.
+    #[test]
+    fn attention_kv_reports_its_source_layer_only_when_shared() {
+        assert_eq!(
+            AttentionKv::Shared { source_layer: 22 }.source_layer(),
+            Some(22)
+        );
+        assert_eq!(
+            AttentionKv::Projected {
+                k_w: LayerWeight::Dense(InlineArray::zeros(&[2, 2], Dtype::Float32.as_i32())),
+                k_norm_w: InlineArray::ones(&[2], Dtype::Float32.as_i32()),
+                v_w: None,
+            }
+            .source_layer(),
+            None
+        );
     }
 
     #[test]
