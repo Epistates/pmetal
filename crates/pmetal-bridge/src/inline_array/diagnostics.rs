@@ -69,12 +69,21 @@ pub fn set_wired_limit_max() -> usize {
     }
 }
 
-/// Set the wired memory limit explicitly. Returns the previous limit.
+/// Set the wired memory limit, clamped to what the device allows.
+///
+/// Returns the previous limit. Asking for more than
+/// [`get_max_recommended_size`] is not an error: the bridge clamps, because
+/// MLX's own `set_wired_limit` throws on an over-large request and this runs
+/// on the decode path where that would terminate the process.
 pub fn set_wired_limit(limit: usize) -> usize {
     unsafe { mlx_inline_set_wired_limit(limit) }
 }
 
-/// Get the device's maximum recommended working set size (GPU memory limit).
+/// The device's maximum recommended working set size.
+///
+/// This is the number MLX validates `set_wired_limit` against, read from the
+/// device rather than estimated from installed RAM. The ratio to `hw.memsize`
+/// is not a constant: 84% on a 128 GB M4 Max, 74% on a 16 GB M4 mini.
 pub fn get_max_recommended_size() -> usize {
     unsafe { mlx_inline_get_max_recommended_size() }
 }
@@ -202,4 +211,36 @@ pub fn verify_buffer_layout() {
         al <= ARRAY_BUF_ALIGN,
         "mlx::core::array alignment is {al} but ARRAY_BUF_ALIGN={ARRAY_BUF_ALIGN}"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ⚠️ The regression this exists for: `get_max_recommended_size` returned
+    /// `hw.memsize * 3 / 4` on the theory that Metal recommends 75% of RAM.
+    /// The real ratio is not a constant (84% on a 128 GB M4 Max, 74% on a
+    /// 16 GB M4 mini), so on the mini the estimate came out 160 MB *above* the
+    /// device maximum, `mlx::core::set_wired_limit` threw, and the uncaught
+    /// exception terminated the process before a single token was decoded.
+    /// Both engines call this on every generate.
+    #[test]
+    fn the_recommended_size_is_always_a_legal_wired_limit() {
+        let max = get_max_recommended_size();
+        assert!(max > 0, "device reported no working set size");
+
+        // Would have aborted the test binary, not failed the assertion.
+        let previous = set_wired_limit(max);
+        crate::check_last_error().expect("setting the reported maximum is legal");
+        set_wired_limit(previous);
+    }
+
+    /// Over-asking is clamped rather than thrown, so a caller that does its own
+    /// sizing arithmetic cannot take the process down.
+    #[test]
+    fn an_oversized_request_is_clamped_not_fatal() {
+        let previous = set_wired_limit(usize::MAX);
+        crate::check_last_error().expect("an oversized request is clamped");
+        set_wired_limit(previous);
+    }
 }

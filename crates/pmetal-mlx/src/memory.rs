@@ -160,12 +160,18 @@ fn query_system_memory() -> Option<u64> {
 }
 
 /// Get GPU memory limit (recommended working set size).
+///
+/// Falls back to the device's own recommendation rather than a fraction of
+/// installed RAM: that ratio is not a constant, and guessing it is what made
+/// `set_wired_limit` abort on a 16 GB Mac mini.
 pub fn get_gpu_memory_limit() -> Option<u64> {
     let limit = get_memory_limit();
     if limit > 0 {
-        Some(limit as u64)
-    } else {
-        get_system_memory().map(|total| total * 3 / 4)
+        return Some(limit as u64);
+    }
+    match pmetal_bridge::inline_array::get_max_recommended_size() {
+        0 => None,
+        recommended => Some(recommended as u64),
     }
 }
 

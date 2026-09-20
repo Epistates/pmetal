@@ -19,6 +19,7 @@
 #include <numeric>
 #include <unordered_set>
 #include <string>
+#include <variant>
 #include <sys/sysctl.h>
 
 static_assert(sizeof(array) <= MLX_ARRAY_SIZE, "MLX_ARRAY_SIZE too small");
@@ -558,20 +559,54 @@ void mlx_inline_clear_cache(void) { mlx::core::clear_cache(); }
 
 static mlx::core::Stream* generation_stream_ = nullptr;
 
+// Raise the wired limit, clamped to what the device actually allows.
+//
+// `mlx::core::set_wired_limit` throws when asked for more than the device's
+// max_recommended_working_set_size, and this is called from a decode path, so
+// an escaping exception terminates the process rather than failing a call.
+// Clamping first means the only way to get an error here is for MLX to reject
+// a value it just told us was legal.
 size_t mlx_inline_set_wired_limit(size_t limit) {
-    return mlx::core::set_wired_limit(limit);
+    try {
+        size_t allowed = mlx_inline_get_max_recommended_size();
+        return mlx::core::set_wired_limit(allowed > 0 && limit > allowed ? allowed : limit);
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error("set_wired_limit", e.what());
+        return 0;
+    } catch (...) {
+        pmetal_bridge_set_last_error("set_wired_limit", "unknown C++ exception");
+        return 0;
+    }
 }
 
+// The device's own max_recommended_working_set_size.
+//
+// ⚠️ This used to return `hw.memsize * 3 / 4` on the theory that Metal's
+// recommendation is "typically 75% of RAM". It is not exact, and on a 16 GB
+// Mac mini the real value is 11.84 GB against a 12.0 GB guess, so every
+// `set_wired_limit` call threw and aborted the process before a single token
+// came out. Ask the device, since this is the same number MLX validates
+// against in `metal::set_wired_limit`.
 size_t mlx_inline_get_max_recommended_size(void) {
-    // Use system memory as a proxy — Metal's recommendedMaxWorkingSetSize
-    // is typically 75% of total RAM on Apple Silicon.
-    // For M4 Max with 128GB: 96GB. For M3 with 36GB: 27GB.
+    try {
+        const auto& info = mlx::core::gpu::device_info();
+        auto entry = info.find("max_recommended_working_set_size");
+        if (entry != info.end()) {
+            if (const size_t* value = std::get_if<size_t>(&entry->second)) {
+                return *value;
+            }
+        }
+    } catch (...) {
+        // Fall through to the conservative estimate below.
+    }
+    // No Metal device to ask (CPU-only build or a failed query). Stay under
+    // any plausible recommendation rather than over it.
     size_t total_ram = 0;
     size_t len = sizeof(total_ram);
     if (sysctlbyname("hw.memsize", &total_ram, &len, nullptr, 0) == 0) {
-        return (total_ram * 3) / 4; // 75% of total RAM
+        return total_ram / 2;
     }
-    return (size_t)8 * 1024 * 1024 * 1024ULL; // 8 GiB fallback
+    return (size_t)2 * 1024 * 1024 * 1024ULL;
 }
 
 int mlx_inline_new_stream(void) {
