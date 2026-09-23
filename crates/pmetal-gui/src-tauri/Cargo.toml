@@ -39,7 +39,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Utilities
-dirs = "6"
+dirs = "7"
 reqwest = { version = "0.13", features = ["json", "rustls"], default-features = false }
 pmetal = { path = "../../pmetal", features = ["full"] }
 pmetal-bridge = { path = "../../pmetal-bridge" }
