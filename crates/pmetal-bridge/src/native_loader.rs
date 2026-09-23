@@ -249,6 +249,83 @@ impl ModelOptWeight {
     }
 }
 
+/// How a native engine holds one ModelOpt tensor. See
+/// [`ModelOptWeight::into_native`].
+#[allow(clippy::large_enum_variant)]
+pub enum NativeModelOpt {
+    /// On a packed MLX kernel, with the per-tensor factor applied to the
+    /// product.
+    Packed {
+        weight: InlineArray,
+        scales: InlineArray,
+        tensor_scale: InlineArray,
+        params: crate::QuantParams,
+    },
+    /// Unpacked to `[out, in]`, for a shape no packed kernel can tile.
+    Dense(InlineArray),
+}
+
+impl NativeModelOpt {
+    pub fn into_layer_weight(self) -> crate::native_weight::LayerWeight {
+        match self {
+            Self::Packed {
+                weight,
+                scales,
+                tensor_scale,
+                params,
+            } => crate::native_weight::LayerWeight::new_scaled(
+                weight,
+                Some(scales),
+                None,
+                Some(tensor_scale),
+                params,
+            ),
+            // Pre-transposed to `[in, out]`, like every dense projection.
+            Self::Dense(weight) => crate::native_weight::LayerWeight::Dense(weight.t()),
+        }
+    }
+}
+
+impl ModelOptWeight {
+    /// Put this tensor on a packed kernel where one can take it.
+    ///
+    /// nvfp4 is a bitcast: ModelOpt's bytes are MLX's layout. Per-tensor fp8
+    /// keeps its e4m3 bytes unchanged on MLX's mxfp8 kernel with every block
+    /// scale at 2^0, so the product is exact where re-quantizing to mxfp8
+    /// would round each element a second time. A width the mxfp8 kernel cannot
+    /// tile goes dense.
+    pub fn into_native(self, dtype: i32) -> Result<NativeModelOpt, String> {
+        const MXFP8_GROUP: i32 = 32;
+        /// The e8m0 byte for 2^0: an mxfp8 block scale that leaves a value alone.
+        const E8M0_ONE: f32 = 127.0;
+        match self {
+            Self::Nvfp4 {
+                packed,
+                scales,
+                tensor_scale,
+            } => Ok(NativeModelOpt::Packed {
+                weight: packed,
+                scales,
+                tensor_scale,
+                params: crate::QuantParams::defaults_for(crate::QuantizedMode::Nvfp4),
+            }),
+            Self::Fp8 {
+                weight,
+                tensor_scale,
+            } if weight.dim(1) % MXFP8_GROUP == 0 => {
+                let blocks = [weight.dim(0), weight.dim(1) / MXFP8_GROUP];
+                Ok(NativeModelOpt::Packed {
+                    scales: InlineArray::full(&blocks, E8M0_ONE, crate::dtype::U8),
+                    weight: weight.view(crate::dtype::U32),
+                    tensor_scale,
+                    params: crate::QuantParams::defaults_for(crate::QuantizedMode::Mxfp8),
+                })
+            }
+            fp8 => fp8.to_dense(dtype).map(NativeModelOpt::Dense),
+        }
+    }
+}
+
 /// Lift every ModelOpt quantized tensor out of `raw`, keyed by module path.
 ///
 /// Removes each one's `weight`, `weight_scale`, `weight_scale_2` and

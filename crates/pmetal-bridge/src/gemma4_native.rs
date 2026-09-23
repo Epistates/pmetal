@@ -860,12 +860,27 @@ pub fn load_model(
     // at the right speed, and decodes noise.
     let model_dtype = detect_model_dtype(|key| raw.get(key).map(|arr| arr.dtype_raw()));
 
+    // NVIDIA ModelOpt projections, built up front from their own sidecars.
+    // Their mode comes from the tensors: the config's `targets` names layer
+    // classes rather than module paths, so `params_for` cannot say.
+    let mut modelopt: std::collections::HashMap<String, LayerWeight> =
+        std::collections::HashMap::new();
+    for (module, weight) in crate::native_loader::take_modelopt_weights(&mut raw)? {
+        let native = weight
+            .into_native(model_dtype)
+            .map_err(|e| format!("Gemma 4 native: {module}.weight: {e}"))?;
+        modelopt.insert(module, native.into_layer_weight());
+    }
+
     // One module's three tensors. `scales` decides the variant, which is
     // upstream's rule too: mlx-lm quantizes a module exactly when
     // `{path}.scales` is in the weights.
-    let take_proj = |map: &mut std::collections::HashMap<String, InlineArray>,
-                     module: &str|
+    let mut take_proj = |map: &mut std::collections::HashMap<String, InlineArray>,
+                         module: &str|
      -> Result<LayerWeight, String> {
+        if let Some(weight) = modelopt.remove(module) {
+            return Ok(weight);
+        }
         let weight = map
             .remove(&format!("{module}.weight"))
             .ok_or_else(|| format!("Gemma 4 native: missing weight {module}.weight"))?;
@@ -1017,6 +1032,16 @@ pub fn load_model(
             rope_dims,
             sliding_window,
         });
+    }
+
+    // A quantized module nothing asked for is a key this loader maps wrongly,
+    // and its layer would otherwise have loaded without it.
+    if !modelopt.is_empty() {
+        let mut unused: Vec<&String> = modelopt.keys().collect();
+        unused.sort();
+        return Err(format!(
+            "Gemma 4 native: quantized modules with no place in the model: {unused:?}"
+        ));
     }
 
     // Pre-cast scalars once so the forward step never constructs an

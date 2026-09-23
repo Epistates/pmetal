@@ -1044,53 +1044,44 @@ struct ModelOptLoadStats {
     fp8_dense: usize,
 }
 
-/// The e8m0 byte for 2^0, MLX's mxfp8 block scale that leaves a value alone.
-const E8M0_ONE: f32 = 127.0;
-
 /// Put NVIDIA ModelOpt's quantized tensors on the packed kernels, keeping each
-/// one's per-tensor factor as `{base}.tensor_scale`.
-///
-/// nvfp4 is a bitcast: ModelOpt's bytes are MLX's layout. Per-tensor fp8 keeps
-/// its e4m3 bytes unchanged on MLX's mxfp8 kernel with every block scale at
-/// 2^0, so the product is exact where re-quantizing to mxfp8 would round each
-/// element a second time. A width the mxfp8 kernel cannot tile goes dense.
-/// See [`crate::native_loader::ModelOptWeight`] for the formats.
+/// one's per-tensor factor as `{base}.tensor_scale`. Staged as keys rather than
+/// built straight into `LayerWeight`s because MoE experts are stacked from
+/// these keys afterwards. See [`crate::native_loader::ModelOptWeight::into_native`]
+/// for which kernel each tensor gets.
 fn normalize_modelopt_sidecars(
     raw: &mut HashMap<String, InlineArray>,
     target_dtype: i32,
 ) -> Result<ModelOptLoadStats, String> {
-    use crate::native_loader::ModelOptWeight;
+    use crate::native_loader::NativeModelOpt;
 
     let mut stats = ModelOptLoadStats::default();
     for (base, weight) in crate::native_loader::take_modelopt_weights(raw)? {
-        match weight {
-            ModelOptWeight::Nvfp4 {
-                packed,
+        let native = weight
+            .into_native(target_dtype)
+            .map_err(|e| format!("{base}.weight: {e}"))?;
+        match native {
+            NativeModelOpt::Packed {
+                weight,
                 scales,
                 tensor_scale,
+                params,
             } => {
-                raw.insert(format!("{base}.weight"), packed);
-                raw.insert(format!("{base}.nvfp4_scales"), scales);
+                let scales_name = match params.mode {
+                    QuantizedMode::Nvfp4 => {
+                        stats.nvfp4 += 1;
+                        "nvfp4_scales"
+                    }
+                    _ => {
+                        stats.fp8_packed += 1;
+                        "mxfp8_scales"
+                    }
+                };
+                raw.insert(format!("{base}.weight"), weight);
+                raw.insert(format!("{base}.{scales_name}"), scales);
                 raw.insert(format!("{base}.tensor_scale"), tensor_scale);
-                stats.nvfp4 += 1;
             }
-            ModelOptWeight::Fp8 {
-                weight,
-                tensor_scale,
-            } if weight.dim(1) % MXFP8_GROUP_SIZE == 0 => {
-                let blocks = [weight.dim(0), weight.dim(1) / MXFP8_GROUP_SIZE];
-                raw.insert(
-                    format!("{base}.mxfp8_scales"),
-                    InlineArray::full(&blocks, E8M0_ONE, crate::dtype::U8),
-                );
-                raw.insert(format!("{base}.weight"), weight.view(crate::dtype::U32));
-                raw.insert(format!("{base}.tensor_scale"), tensor_scale);
-                stats.fp8_packed += 1;
-            }
-            fp8 => {
-                let dense = fp8
-                    .to_dense(target_dtype)
-                    .map_err(|e| format!("{base}.weight: {e}"))?;
+            NativeModelOpt::Dense(dense) => {
                 raw.insert(format!("{base}.weight"), dense);
                 stats.fp8_dense += 1;
             }
