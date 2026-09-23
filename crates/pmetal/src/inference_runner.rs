@@ -1361,6 +1361,41 @@ fn bridge_turboquant_tensor_config(config: TurboQuantTensorConfig) -> BridgeTurb
     }
 }
 
+/// The LoRA hyperparameters an adapter was trained with, from the
+/// `adapter_config.json` beside it. `lora_path` may be the adapter directory or
+/// its weights file. Falls back to the defaults when the config is missing.
+#[cfg(feature = "lora")]
+pub fn lora_config_for_adapter(lora_path: &Path) -> pmetal_core::LoraConfig {
+    let adapter_dir = if lora_path.is_dir() {
+        lora_path
+    } else {
+        lora_path.parent().unwrap_or(Path::new("."))
+    };
+    let Some(cfg) = std::fs::read_to_string(adapter_dir.join("adapter_config.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+    else {
+        return pmetal_core::LoraConfig::default();
+    };
+    pmetal_core::LoraConfig {
+        r: cfg["r"].as_u64().unwrap_or(16) as usize,
+        alpha: cfg["alpha"]
+            .as_f64()
+            .or_else(|| cfg["lora_alpha"].as_f64())
+            .unwrap_or(32.0) as f32,
+        target_modules: cfg["target_modules"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        use_rslora: cfg["use_rslora"].as_bool().unwrap_or(false),
+        ..pmetal_core::LoraConfig::default()
+    }
+}
+
 /// Load a model with LoRA weights merged in.
 #[cfg(feature = "lora")]
 fn load_model_with_lora(
@@ -1377,44 +1412,7 @@ fn load_model_with_lora(
     ),
     Exception,
 > {
-    let lora_path_buf = Path::new(lora_path);
-    let adapter_dir = if lora_path_buf.is_dir() {
-        lora_path_buf
-    } else {
-        lora_path_buf.parent().unwrap_or(Path::new("."))
-    };
-
-    // Parse adapter_config.json for LoRA hyperparameters
-    let lora_config =
-        if let Ok(cfg_str) = std::fs::read_to_string(adapter_dir.join("adapter_config.json")) {
-            if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&cfg_str) {
-                let r = cfg["r"].as_u64().unwrap_or(16) as usize;
-                let alpha = cfg["alpha"]
-                    .as_f64()
-                    .or_else(|| cfg["lora_alpha"].as_f64())
-                    .unwrap_or(32.0) as f32;
-                let target_modules: Vec<String> = cfg["target_modules"]
-                    .as_array()
-                    .map(|arr| {
-                        arr.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let use_rslora = cfg["use_rslora"].as_bool().unwrap_or(false);
-                pmetal_core::LoraConfig {
-                    r,
-                    alpha,
-                    target_modules,
-                    use_rslora,
-                    ..pmetal_core::LoraConfig::default()
-                }
-            } else {
-                pmetal_core::LoraConfig::default()
-            }
-        } else {
-            pmetal_core::LoraConfig::default()
-        };
+    let lora_config = lora_config_for_adapter(Path::new(lora_path));
 
     tracing::info!(
         r = lora_config.r,

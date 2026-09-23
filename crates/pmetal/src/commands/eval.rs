@@ -1,7 +1,24 @@
 use indicatif::{ProgressBar, ProgressStyle};
-use pmetal_core::LoraConfig;
+use pmetal_bridge::compat::Array;
 use pmetal_data::{DatasetFormat, Tokenizer, TrainingDataset};
-use pmetal_lora::DynamicLoraModel;
+use pmetal_lora::{DynamicLoraModel, TrainableModel};
+use pmetal_models::DynamicModel;
+
+/// The model being scored: the checkpoint alone, or with an adapter attached.
+enum EvalModel {
+    Base(DynamicModel),
+    Adapted(DynamicLoraModel),
+}
+
+impl EvalModel {
+    fn forward(&mut self, input_ids: &Array) -> anyhow::Result<Array> {
+        let logits = match self {
+            Self::Base(model) => model.forward(input_ids, None).map_err(|e| e.to_string()),
+            Self::Adapted(model) => model.forward(input_ids, None).map_err(|e| e.to_string()),
+        };
+        logits.map_err(|e| anyhow::anyhow!("Forward pass failed: {e}"))
+    }
+}
 
 /// Evaluate model perplexity on a dataset.
 pub(crate) async fn run_eval(
@@ -43,22 +60,28 @@ pub(crate) async fn run_eval(
         None,
     )?;
 
-    // Load model with optional LoRA
-    let lora_config = LoraConfig {
-        r: 0,
-        ..Default::default()
+    // ⚠️ A base model is not a rank-0 adapter: `AdaptedModel::attach` rejects
+    // rank 0, which left eval unable to score any model without `--lora`.
+    let mut model = match lora_path {
+        None => EvalModel::Base(
+            DynamicModel::load(&model_path)
+                .map_err(|e| anyhow::anyhow!("Failed to load model: {}", e))?,
+        ),
+        Some(lp) => {
+            let lp = std::path::Path::new(lp);
+            let lora_config = pmetal::inference_runner::lora_config_for_adapter(lp);
+            let lora_file = if lp.is_dir() {
+                lp.join("lora_weights.safetensors")
+            } else {
+                lp.to_path_buf()
+            };
+            let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config)?;
+            model
+                .load_lora_weights(&lora_file)
+                .map_err(|e| anyhow::anyhow!("Failed to load LoRA weights: {}", e))?;
+            EvalModel::Adapted(model)
+        }
     };
-    let mut model = DynamicLoraModel::from_pretrained(&model_path, lora_config)?;
-    if let Some(lp) = lora_path {
-        let lora_file = if std::path::Path::new(lp).is_dir() {
-            std::path::PathBuf::from(lp).join("lora_weights.safetensors")
-        } else {
-            std::path::PathBuf::from(lp)
-        };
-        model
-            .load_lora_weights(&lora_file)
-            .map_err(|e| anyhow::anyhow!("Failed to load LoRA weights: {}", e))?;
-    }
 
     // Evaluate perplexity
     let samples = dataset.samples();
@@ -86,7 +109,6 @@ pub(crate) async fn run_eval(
         None
     };
 
-    use pmetal_lora::TrainableModel;
     for sample in samples.iter().take(eval_samples) {
         let tokens: Vec<i32> = sample.input_ids.iter().map(|&t| t as i32).collect();
         if tokens.len() < 2 {
@@ -96,9 +118,7 @@ pub(crate) async fn run_eval(
         let input_array =
             pmetal_bridge::compat::Array::from_slice(&tokens[..n - 1], &[1, (n - 1) as i32]);
 
-        let logits = model
-            .forward(&input_array, None)
-            .map_err(|e| anyhow::anyhow!("Forward pass failed: {}", e))?;
+        let logits = model.forward(&input_array)?;
 
         // logits: [1, seq-1, vocab]  → [seq-1, vocab]
         let logits = logits.squeeze_axes(&[0i32]);
