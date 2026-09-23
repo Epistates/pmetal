@@ -136,31 +136,6 @@ unsafe extern "C" {
         // Null unless the tensor is two-level (nvfp4's `weight_scale_2`).
         global_scale: *const RawBuf,
     );
-    pub(super) fn mlx_inline_qqmm(
-        dst: *mut RawBuf,
-        x: *const RawBuf,
-        w: *const RawBuf,
-        w_scales: *const RawBuf,
-        group_size: i32,
-        bits: i32,
-        mode: i32,
-        global_scale_x: *const RawBuf,
-        global_scale_w: *const RawBuf,
-    );
-    pub(super) fn mlx_inline_gather_qqmm(
-        dst: *mut RawBuf,
-        x: *const RawBuf,
-        w: *const RawBuf,
-        w_scales: *const RawBuf,
-        lhs_indices: *const RawBuf,
-        rhs_indices: *const RawBuf,
-        group_size: i32,
-        bits: i32,
-        mode: i32,
-        global_scale_x: *const RawBuf,
-        global_scale_w: *const RawBuf,
-        sorted_indices: bool,
-    );
     pub(super) fn mlx_inline_from_f32_slice(
         dst: *mut RawBuf,
         data: *const f32,

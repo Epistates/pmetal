@@ -29,30 +29,6 @@ void mlx_inline_quantized_matmul(mlx_inline_array* dst,
     const mlx_inline_array* scales, const mlx_inline_array* biases,
     bool transpose, int group_size, int bits, int mode);
 
-// Two-level quantized matmul (`mlx::core::qqmm`), for nvfp4 and mxfp4.
-//
-// Separate from `mlx_inline_quantized_matmul` because MLX's own
-// `quantized_matmul` takes no global scale: a two-level weight has to go
-// through this entry point or its per-tensor scale is silently dropped.
-// `global_scale_x` is for a quantized *activation* and stays null on the
-// weight-only path; `global_scale_w` is the weight's `weight_scale_2`.
-void mlx_inline_qqmm(mlx_inline_array* dst,
-    const mlx_inline_array* x, const mlx_inline_array* w,
-    const mlx_inline_array* w_scales,
-    int group_size, int bits, int mode,
-    const mlx_inline_array* global_scale_x,
-    const mlx_inline_array* global_scale_w);
-
-// Two-level gather matmul (`mlx::core::gather_qqmm`) for MoE expert dispatch.
-void mlx_inline_gather_qqmm(mlx_inline_array* dst,
-    const mlx_inline_array* x, const mlx_inline_array* w,
-    const mlx_inline_array* w_scales,
-    const mlx_inline_array* lhs_indices, const mlx_inline_array* rhs_indices,
-    int group_size, int bits, int mode,
-    const mlx_inline_array* global_scale_x,
-    const mlx_inline_array* global_scale_w,
-    bool sorted_indices);
-
 // Gather quantized matmul (gathers rows of w before dequantize + matmul)
 void mlx_inline_gather_qmm(mlx_inline_array* dst,
     const mlx_inline_array* x, const mlx_inline_array* w,
