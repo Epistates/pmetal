@@ -40,7 +40,7 @@ async-trait = "0.1"
 zerocopy = { workspace = true }
 
 # Peer discovery and networking (libp2p stack)
-libp2p = { version = "0.56", features = [
+libp2p = { version = "0.57", features = [
     "tokio",
     "tcp",
     "noise",
@@ -59,7 +59,7 @@ petgraph = "0.8"
 
 # Utilities
 dirs = { workspace = true }
-sha3 = "0.11"
+sha3 = "0.12"
 bs58 = "0.5"
 rand = { workspace = true }
 parking_lot = "0.12"

@@ -75,10 +75,10 @@ clap = { version = "4", features = ["derive"] }
 
 # Data formats
 safetensors = "0.7"
-arrow = "58"
-parquet = "58"
-arrow-array = "58"
-arrow-json = "58"
+arrow = "60"
+parquet = "60"
+arrow-array = "60"
+arrow-json = "60"
 
 # HuggingFace integration
 hf-hub = "0.5"
