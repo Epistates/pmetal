@@ -69,26 +69,39 @@ fn get_stacked_expert_weight(
     let w_key = format!("{base_key}.weight");
     let s_key = format!("{base_key}.scales");
     let b_key = format!("{base_key}.biases");
-    let mxfp8_s_key = format!("{base_key}.mxfp8_scales");
-
     let w = raw
         .get(&w_key)
         .cloned()
         .ok_or_else(|| format!("missing stacked expert weight: {w_key}"))?;
     validate_quantization_runtime_support(bits)?;
 
-    if let Some(scales) = raw.get(&mxfp8_s_key) {
-        return Ok(LayerWeight::Quantized {
-            tensor_scale: None,
-            weight: w,
-            scales: scales.clone(),
-            biases: None,
-            params: QuantParams {
+    // Float modes carry scales only, plus a per-expert `[E]` tensor scale when
+    // the checkpoint came from NVIDIA ModelOpt.
+    let tensor_scale = raw.get(&format!("{base_key}.tensor_scale")).cloned();
+    let float_modes = [
+        (
+            "mxfp8_scales",
+            QuantParams {
                 group_size: MXFP8_GROUP_SIZE,
                 bits: MXFP8_BITS,
                 mode: QuantizedMode::Mxfp8,
             },
-        });
+        ),
+        (
+            "nvfp4_scales",
+            QuantParams::defaults_for(QuantizedMode::Nvfp4),
+        ),
+    ];
+    for (scales_name, params) in float_modes {
+        if let Some(scales) = raw.get(&format!("{base_key}.{scales_name}")) {
+            return Ok(LayerWeight::Quantized {
+                tensor_scale,
+                weight: w,
+                scales: scales.clone(),
+                biases: None,
+                params,
+            });
+        }
     }
 
     match (raw.get(&s_key), raw.get(&b_key)) {
@@ -323,45 +336,44 @@ pub fn load_model(
             }
 
             for proj in &["gate_proj", "up_proj", "down_proj"] {
-                // ⚠️ Neither branch below stacks a per-tensor scale, so a
-                // ModelOpt expert would load with it dropped and decode noise.
-                if raw.contains_key(&format!("{prefix}.experts.0.{proj}.tensor_scale")) {
-                    return Err(format!(
-                        "{prefix}.experts.*.{proj}: NVIDIA ModelOpt quantized MoE experts are not supported yet"
-                    ));
-                }
-                // Detect whether first expert is quantized.
-                let is_mxfp8 = raw.contains_key(&format!("{prefix}.experts.0.{proj}.mxfp8_scales"));
+                // Detect whether first expert is quantized. The float modes
+                // (mxfp8, and nvfp4 from a ModelOpt checkpoint) carry scales
+                // only, keyed by mode.
+                let fp_scales_key = ["mxfp8_scales", "nvfp4_scales"]
+                    .into_iter()
+                    .find(|k| raw.contains_key(&format!("{prefix}.experts.0.{proj}.{k}")));
                 let is_quantized = raw.contains_key(&format!("{prefix}.experts.0.{proj}.scales"));
 
-                if is_mxfp8 {
-                    // MLX mxfp8: stack weight and mxfp8 scales separately.
-                    let mut w_shards: Vec<InlineArray> =
-                        Vec::with_capacity(config.num_experts as usize);
-                    let mut s_shards: Vec<InlineArray> =
-                        Vec::with_capacity(config.num_experts as usize);
+                if let Some(scales_name) = fp_scales_key {
+                    let expert_key =
+                        |e: usize, name: &str| format!("{prefix}.experts.{e}.{proj}.{name}");
+                    // ⚠️ Each ModelOpt expert has its own per-tensor scale.
+                    // Stacking the weights without them decodes noise.
+                    let scaled = raw.contains_key(&expert_key(0, "tensor_scale"));
+                    let mut w_shards = Vec::with_capacity(config.num_experts as usize);
+                    let mut s_shards = Vec::with_capacity(config.num_experts as usize);
+                    let mut t_shards = Vec::with_capacity(config.num_experts as usize);
 
                     for e in 0..config.num_experts as usize {
-                        let wk = format!("{prefix}.experts.{e}.{proj}.weight");
-                        let sk = format!("{prefix}.experts.{e}.{proj}.mxfp8_scales");
-                        w_shards.push(
-                            raw.remove(&wk)
-                                .ok_or_else(|| format!("MoE mxfp8: missing {wk}"))?,
-                        );
-                        s_shards.push(
-                            raw.remove(&sk)
-                                .ok_or_else(|| format!("MoE mxfp8: missing {sk}"))?,
-                        );
+                        let mut take = |name: &str| {
+                            let key = expert_key(e, name);
+                            raw.remove(&key)
+                                .ok_or_else(|| format!("MoE {scales_name}: missing {key}"))
+                        };
+                        w_shards.push(take("weight")?);
+                        s_shards.push(take(scales_name)?);
+                        if scaled {
+                            t_shards.push(take("tensor_scale")?);
+                        }
                     }
 
-                    let w_stacked = stack_arrays(w_shards, 0)?;
-                    let s_stacked = stack_arrays(s_shards, 0)?;
-
-                    raw.insert(format!("{prefix}.switch_mlp.{proj}.weight"), w_stacked);
-                    raw.insert(
-                        format!("{prefix}.switch_mlp.{proj}.mxfp8_scales"),
-                        s_stacked,
-                    );
+                    let switch_key = |name: &str| format!("{prefix}.switch_mlp.{proj}.{name}");
+                    raw.insert(switch_key("weight"), stack_arrays(w_shards, 0)?);
+                    raw.insert(switch_key(scales_name), stack_arrays(s_shards, 0)?);
+                    if scaled {
+                        // Scalars stack to `[E]`, one per expert.
+                        raw.insert(switch_key("tensor_scale"), stack_arrays(t_shards, 0)?);
+                    }
                 } else if is_quantized {
                     // Quantized: stack weight, scales, biases separately.
                     let mut w_shards: Vec<InlineArray> =
@@ -942,27 +954,20 @@ pub fn load_model(
 }
 
 // ============================================================================
-// Stack helper — concatenates arrays along a new axis
+// Stack helper — joins per-expert arrays along a new axis
 // ============================================================================
 //
-// MLX does not expose a standalone `stack` in the bridge; we implement it as
-// expand_dims(axis=0) on each shard + successive concatenate_2 calls.
-// For small E (e.g. 512 experts) this is done ONCE at load time and is not
-// on the hot path.
+// ⚠️ One `mlx::core::stack`, not a chain of pairwise concatenates. The chain
+// copied the growing accumulator at every step, O(E²) in bytes, which for a
+// 256-expert layer is gigabytes of copying per projection.
 
 fn stack_arrays(arrays: Vec<InlineArray>, axis: i32) -> Result<InlineArray, String> {
     if arrays.is_empty() {
         return Err("stack_arrays: empty input".to_string());
     }
-    // Expand each shard: [out, in] → [1, out, in]
-    let mut expanded: Vec<InlineArray> = arrays.into_iter().map(|a| a.expand_dims(axis)).collect();
-
-    // Concatenate along the new axis: [1, out, in] × E → [E, out, in]
-    let mut acc = expanded.remove(0);
-    for e in expanded {
-        acc = acc.concatenate_2(&e, axis);
-    }
-    Ok(acc)
+    let stacked = crate::compat::ops::stack_axis(&arrays, axis);
+    crate::check_last_error().map_err(|e| format!("stack_arrays: {e}"))?;
+    Ok(stacked)
 }
 
 #[derive(Default, Debug, Clone, Copy, Eq, PartialEq)]
