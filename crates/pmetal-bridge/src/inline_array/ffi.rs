@@ -133,7 +133,8 @@ unsafe extern "C" {
         group_size: i32,
         bits: i32,
         mode: i32,
-        // Null unless the tensor is two-level (nvfp4's `weight_scale_2`).
+        // MLX's nvfp4 `global_scale`: the tensor's amax, which MLX divides
+        // by 448 * 6. ModelOpt's `weight_scale_2` is that already divided.
         global_scale: *const RawBuf,
     );
     pub(super) fn mlx_inline_from_f32_slice(

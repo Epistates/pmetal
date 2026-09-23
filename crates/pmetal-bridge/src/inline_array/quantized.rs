@@ -72,13 +72,14 @@ impl InlineArray {
         self.dequantize_two_level(scales, biases, None, group_size, bits, mode)
     }
 
-    /// Dequantize a tensor that may carry a per-tensor scale beside its
-    /// per-group ones.
+    /// Dequantize with MLX's nvfp4 `global_scale`.
     ///
-    /// nvfp4 is two-level: an fp8 scale per group of 16, and one fp32 scale for
-    /// the whole tensor. NVIDIA ModelOpt checkpoints ship the second as
-    /// `weight_scale_2`. Dropping it does not fail or change a shape, it
-    /// returns every weight off by a constant factor.
+    /// ⚠️ MLX's convention: `global_scale` is the tensor's amax, and the kernel
+    /// multiplies by `global_scale / (448 × 6)`. NVIDIA ModelOpt's
+    /// `weight_scale_2` is that quotient already, so it goes in multiplied by
+    /// 2688 or every weight comes out 2688 times too small. The native engines
+    /// avoid the question by scaling the product instead: see `tensor_scale`
+    /// on `LayerWeight::Quantized`.
     #[inline]
     pub fn dequantize_two_level(
         &self,
@@ -338,16 +339,16 @@ mod tests {
     use super::*;
     use crate::dtype;
 
-    /// nvfp4 is two-level: an fp8 scale per group of 16 and one scale for the
-    /// whole tensor. NVIDIA ModelOpt checkpoints ship the second as
-    /// `weight_scale_2`, and the bridge had no way to pass it, so it went to
-    /// MLX's `std::nullopt` default.
+    /// Pins MLX's convention for the nvfp4 global scale: the kernel multiplies
+    /// by `global_scale / (448 × 6)`, so it is the tensor's amax and NVIDIA's
+    /// `weight_scale_2` is that divided by 2688.
     ///
-    /// ⚠️ Dropping it does not fail and does not change a shape. It returns
-    /// every weight off by a constant factor, which is exactly the class of
-    /// bug that loads, runs at the right speed, and decodes noise.
+    /// ⚠️ An earlier version of this test only checked that the scale changed
+    /// the answer. Treating `weight_scale_2` as MLX's global scale passes that
+    /// check and leaves every weight 2688 times too small, which is the bug
+    /// this exists to catch.
     #[test]
-    fn the_nvfp4_global_scale_reaches_the_kernel() {
+    fn the_nvfp4_global_scale_is_divided_by_2688() {
         let rows = 4;
         let cols = 64;
         let values: Vec<f32> = (0..rows * cols)
@@ -361,9 +362,12 @@ mod tests {
         let plain = packed.dequantize_two_level(&scales, None, None, 16, 4, QuantizedMode::Nvfp4);
         crate::check_last_error().expect("dequantize without a global scale");
 
-        let half = InlineArray::from_f32_slice(&[0.5], &[1]).as_dtype(dtype::F32);
+        // What ModelOpt would store as `weight_scale_2`.
+        let weight_scale_2 = 0.37f32;
+        let global =
+            InlineArray::from_f32_slice(&[weight_scale_2 * 448.0 * 6.0], &[1]).as_dtype(dtype::F32);
         let scaled =
-            packed.dequantize_two_level(&scales, None, Some(&half), 16, 4, QuantizedMode::Nvfp4);
+            packed.dequantize_two_level(&scales, None, Some(&global), 16, 4, QuantizedMode::Nvfp4);
         crate::check_last_error().expect("dequantize with a global scale");
 
         let n = (rows * cols) as usize;
@@ -372,16 +376,16 @@ mod tests {
         let a = plain.to_f32_vec(n).expect("read plain");
         let b = scaled.to_f32_vec(n).expect("read scaled");
 
-        // A global scale that is not 1.0 has to change the result. If the
-        // argument were dropped on the floor these would be identical.
-        let max_diff = a
+        // Relative to one bfloat16 ulp, the dtype fp-mode `dequantize` returns.
+        // A wrong convention is off by 2688x, not by a rounding step.
+        let worst = a
             .iter()
             .zip(b.iter())
-            .map(|(x, y)| (x - y).abs())
+            .map(|(p, q)| (p * weight_scale_2 - q).abs() / (q.abs() + f32::EPSILON))
             .fold(0.0f32, f32::max);
         assert!(
-            max_diff > 1e-6,
-            "global scale had no effect: max|diff| = {max_diff}, so it never reached the kernel"
+            worst <= 2f32.powi(-8),
+            "dequantize(global = s × 2688) should equal dequantize() × s: worst relative error {worst}"
         );
     }
 }

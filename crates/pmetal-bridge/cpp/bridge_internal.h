@@ -126,22 +126,22 @@ static inline std::string quant_mode_from_int(int mode) {
 // serves both dense and packed weights needs two things: the quantization
 // signature in its cache key, and a fixed input arity so the traced lambda can
 // index its inputs by position. Every projection therefore contributes exactly
-// three slots, with dummies standing in for the tensors a dense weight does
-// not have.
+// `QPROJ_SLOTS` slots, with dummies standing in for the tensors a dense weight
+// does not have.
 
 // The part of a projection that selects a kernel. The arrays themselves arrive
 // through the compiled function's input vector; this is what gets captured.
 struct QProjSig {
     int quantized = 0;
     int has_biases = 0;
-    int has_global = 0;
+    int has_tensor_scale = 0;
     int group_size = 0;
     int bits = 0;
     int mode = 0;
 
     bool operator==(const QProjSig& other) const {
         return quantized == other.quantized && has_biases == other.has_biases
-            && has_global == other.has_global
+            && has_tensor_scale == other.has_tensor_scale
             && group_size == other.group_size && bits == other.bits
             && mode == other.mode;
     }
@@ -154,7 +154,7 @@ static inline QProjSig qproj_sig(const mlx_inline_qweight* w) {
     return QProjSig{
         1,
         w->biases != nullptr ? 1 : 0,
-        w->global_scale != nullptr ? 1 : 0,
+        w->tensor_scale != nullptr ? 1 : 0,
         w->group_size, w->bits, w->mode};
 }
 
@@ -165,12 +165,12 @@ static inline const array& qproj_dummy() {
     return dummy;
 }
 
-// Append one projection's four slots: weight, scales, biases, global scale.
+// Append one projection's four slots: weight, scales, biases, tensor scale.
 static inline void push_qproj(std::vector<array>& ins, const mlx_inline_qweight* w) {
     ins.push_back(as_arr(w->weight));
     ins.push_back(w->scales != nullptr ? as_arr(w->scales) : qproj_dummy());
     ins.push_back(w->biases != nullptr ? as_arr(w->biases) : qproj_dummy());
-    ins.push_back(w->global_scale != nullptr ? as_arr(w->global_scale) : qproj_dummy());
+    ins.push_back(w->tensor_scale != nullptr ? as_arr(w->tensor_scale) : qproj_dummy());
 }
 
 // How many input slots one projection occupies.
@@ -185,30 +185,27 @@ static inline array qproj_matmul(
     const array& weight,
     const array& scales,
     const array& biases,
-    const array& global_scale,
+    const array& tensor_scale,
     const QProjSig& sig
 ) {
     if (sig.quantized == 0) {
         return mlx::core::matmul(x, weight);
     }
-    // ⚠️ A two-level weight can use neither kernel here. `quantized_matmul`
-    // has no global-scale argument and would drop the per-tensor factor in
-    // silence; `qqmm` requires both global scales for nvfp4 or neither, since
-    // it is written for a quantized activation and this one is bf16. Unpack
-    // and multiply densely: correct, at the cost of a materialisation.
-    if (sig.has_global) {
-        auto dense = mlx::core::dequantize(
-            weight, scales,
-            sig.has_biases ? std::optional<array>(biases) : std::nullopt,
-            sig.group_size, sig.bits, quant_mode_from_int(sig.mode),
-            /* global_scale */ std::optional<array>(global_scale));
-        return mlx::core::matmul(x, mlx::core::transpose(dense));
-    }
-    return mlx::core::quantized_matmul(
+    auto y = mlx::core::quantized_matmul(
         x, weight, scales,
         sig.has_biases ? std::optional<array>(biases) : std::nullopt,
         /* transpose */ true, sig.group_size, sig.bits,
         quant_mode_from_int(sig.mode));
+    if (!sig.has_tensor_scale) {
+        return y;
+    }
+    // Constant across the tensor, so it commutes with the matmul and the
+    // weight stays packed. Applied in fp32 like MLX's own kernels, then cast
+    // back. Mirrors `scale_product` in native_weight.rs.
+    auto dtype = y.dtype();
+    return mlx::core::astype(
+        mlx::core::multiply(mlx::core::astype(y, mlx::core::float32), tensor_scale),
+        dtype);
 }
 
 // The output width of a projection. A packed weight keeps its `[out, in]`

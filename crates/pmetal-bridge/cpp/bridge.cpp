@@ -436,8 +436,8 @@ void mlx_inline_dequantize(mlx_inline_array* dst, const mlx_inline_array* w,
         auto biases_opt = biases
             ? std::optional<array>(as_arr(biases))
             : std::optional<array>(std::nullopt);
-        // nvfp4's second level. Named rather than positional: `dtype` sits
-        // right after it, and both are optional.
+        // nvfp4's second level, in MLX's amax convention. Named rather than
+        // positional: `dtype` sits right after it, and both are optional.
         auto global_opt = global_scale
             ? std::optional<array>(as_arr(global_scale))
             : std::optional<array>(std::nullopt);

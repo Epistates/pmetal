@@ -14,10 +14,10 @@ extern "C" {
 //
 // `biases` may be null: only affine mode has them.
 //
-// `global_scale` may be null. nvfp4 is two-level: an fp8 scale per group *and*
-// one fp32 scale for the whole tensor. NVIDIA ModelOpt checkpoints ship that
-// second scale as `weight_scale_2`, and dropping it does not fail, it returns
-// every weight off by a constant factor.
+// `global_scale` may be null. It is MLX's nvfp4 second level in MLX's own
+// convention: the tensor's amax, which the kernel divides by 448 * 6. NVIDIA
+// ModelOpt's `weight_scale_2` is the same quantity already divided, so passing
+// it here unconverted returns every weight 2688 times too small.
 void mlx_inline_dequantize(mlx_inline_array* dst, const mlx_inline_array* w,
     const mlx_inline_array* scales, const mlx_inline_array* biases,
     int group_size, int bits, int mode,

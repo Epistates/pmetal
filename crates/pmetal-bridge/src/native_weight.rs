@@ -302,13 +302,35 @@ pub enum LayerWeight {
         weight: InlineArray,
         scales: InlineArray,
         biases: Option<InlineArray>,
-        /// nvfp4's second level: one scale for the whole tensor, beside the
-        /// per-group ones. NVIDIA ModelOpt ships it as `weight_scale_2`.
-        /// `Some` switches every op here onto `qqmm`, because MLX's plain
-        /// `quantized_matmul` has no slot to pass it through.
-        global_scale: Option<InlineArray>,
+        /// One `f32` factor for the whole tensor, so the weight is
+        /// `dequantize(weight, scales) × tensor_scale`. A stacked expert
+        /// tensor carries one per expert, shaped `[E]`.
+        ///
+        /// NVIDIA ModelOpt ships it as `weight_scale_2` beside nvfp4 weights
+        /// and as `weight_scale` beside per-tensor fp8 ones. Being constant
+        /// across the tensor, it commutes with the matmul, which is what
+        /// keeps both on packed kernels: the product is scaled, never the
+        /// weight.
+        ///
+        /// ⚠️ Not MLX's `global_scale` argument. That one is the tensor's
+        /// amax, and MLX divides it by `448 × 6` inside the kernel, so
+        /// ModelOpt's value is MLX's divided by 2688. Passing one where the
+        /// other belongs scales every weight by that factor and decodes noise.
+        tensor_scale: Option<InlineArray>,
         params: QuantParams,
     },
+}
+
+/// `y × scale` in `f32`, returned in `y`'s dtype.
+///
+/// Matches MLX's own kernels, which apply a per-tensor scale to the `f32`
+/// accumulator before the cast. Rounding the scale to `bfloat16` instead would
+/// bias the whole projection by up to 0.4% in one direction.
+fn scale_product(y: InlineArray, scale: &InlineArray) -> InlineArray {
+    let dtype = y.dtype_raw();
+    y.as_dtype(crate::dtype::F32)
+        .multiply(scale)
+        .as_dtype(dtype)
 }
 
 impl LayerWeight {
@@ -322,21 +344,19 @@ impl LayerWeight {
         biases: Option<InlineArray>,
         params: QuantParams,
     ) -> Self {
-        Self::new_two_level(weight, scales, biases, None, params)
+        Self::new_scaled(weight, scales, biases, None, params)
     }
 
     /// Build a weight that may carry a per-tensor scale beside its per-group
-    /// ones.
+    /// ones. See `tensor_scale` on [`Self::Quantized`] for what it means.
     ///
-    /// Only a two-level scheme has one, nvfp4 being the one that ships. Use
-    /// this wherever a checkpoint might store `weight_scale_2`: dropping it
-    /// does not fail and does not change a shape, it scales every weight by a
-    /// constant.
-    pub fn new_two_level(
+    /// Use this wherever a checkpoint might store one: dropping it does not
+    /// fail and does not change a shape, it scales every weight by a constant.
+    pub fn new_scaled(
         weight: InlineArray,
         scales: Option<InlineArray>,
         biases: Option<InlineArray>,
-        global_scale: Option<InlineArray>,
+        tensor_scale: Option<InlineArray>,
         params: QuantParams,
     ) -> Self {
         match scales {
@@ -344,7 +364,7 @@ impl LayerWeight {
                 weight,
                 scales,
                 biases,
-                global_scale,
+                tensor_scale,
                 params,
             },
             // Only the dense arm transposes: see the layout note above.
@@ -377,50 +397,27 @@ impl LayerWeight {
     pub fn matmul_from(&self, x: &InlineArray) -> InlineArray {
         match self {
             Self::Dense(w) => x.matmul(w),
-            // ⚠️ A two-level weight cannot use `quantized_matmul`, which has no
-            // global-scale argument and would drop the per-tensor factor in
-            // silence. It cannot use `qqmm` either on this path: for nvfp4 MLX
-            // requires *both* `global_scale_x` and `global_scale_w` or
-            // neither, because that kernel is for a quantized activation, and
-            // ours is bf16. So the weight is unpacked here and multiplied
-            // densely, which is correct and costs a materialisation per call.
-            //
-            // Keeping it packed through the matmul needs either activation
-            // quantization or an MLX kernel that takes a weight-side global
-            // scale alone.
             Self::Quantized {
                 weight,
                 scales,
                 biases,
-                global_scale: Some(global_scale),
+                tensor_scale,
                 params,
-            } => x.matmul(
-                &weight
-                    .dequantize_two_level(
-                        scales,
-                        biases.as_ref(),
-                        Some(global_scale),
-                        params.group_size,
-                        params.bits,
-                        params.mode,
-                    )
-                    .t(),
-            ),
-            Self::Quantized {
-                weight,
-                scales,
-                biases,
-                params,
-                ..
-            } => x.quantized_matmul_mode(
-                weight,
-                scales,
-                biases.as_ref(),
-                true,
-                params.group_size,
-                params.bits,
-                params.mode,
-            ),
+            } => {
+                let y = x.quantized_matmul_mode(
+                    weight,
+                    scales,
+                    biases.as_ref(),
+                    true,
+                    params.group_size,
+                    params.bits,
+                    params.mode,
+                );
+                match tensor_scale {
+                    Some(scale) => scale_product(y, scale),
+                    None => y,
+                }
+            }
         }
     }
 
@@ -439,46 +436,38 @@ impl LayerWeight {
     ) -> InlineArray {
         match self {
             Self::Dense(w) => x.gather_mm(w, lhs_indices, rhs_indices, sorted),
-            // Same constraint as `matmul_from`: `gather_qqmm` wants both global
-            // scales for nvfp4, so a bf16 activation has to meet a dense
-            // weight.
             Self::Quantized {
                 weight,
                 scales,
                 biases,
-                global_scale: Some(global_scale),
+                tensor_scale,
                 params,
-            } => x.gather_mm(
-                &weight.dequantize_two_level(
+            } => {
+                let y = x.gather_qmm_mode(
+                    weight,
                     scales,
                     biases.as_ref(),
-                    Some(global_scale),
+                    lhs_indices,
+                    rhs_indices,
+                    true,
                     params.group_size,
                     params.bits,
+                    sorted,
                     params.mode,
-                ),
-                lhs_indices,
-                rhs_indices,
-                sorted,
-            ),
-            Self::Quantized {
-                weight,
-                scales,
-                biases,
-                params,
-                ..
-            } => x.gather_qmm_mode(
-                weight,
-                scales,
-                biases.as_ref(),
-                lhs_indices,
-                rhs_indices,
-                true,
-                params.group_size,
-                params.bits,
-                sorted,
-                params.mode,
-            ),
+                );
+                let Some(scale) = tensor_scale else {
+                    return y;
+                };
+                // Stacked experts each carry their own scale. The output is
+                // `indices.shape + [M, N]`, so pick each row's expert and
+                // broadcast over the last two axes.
+                match rhs_indices {
+                    Some(idx) if scale.ndim() > 0 => {
+                        scale_product(y, &scale.take_axis(idx, 0).expand_dims(-1).expand_dims(-1))
+                    }
+                    _ => scale_product(y, scale),
+                }
+            }
         }
     }
 
@@ -493,7 +482,7 @@ impl LayerWeight {
                 weight: &w.raw,
                 scales: std::ptr::null(),
                 biases: std::ptr::null(),
-                global_scale: std::ptr::null(),
+                tensor_scale: std::ptr::null(),
                 group_size: 0,
                 bits: 0,
                 mode: 0,
@@ -503,13 +492,13 @@ impl LayerWeight {
                 weight,
                 scales,
                 biases,
-                global_scale,
+                tensor_scale,
                 params,
             } => QWeightRaw {
                 weight: &weight.raw,
                 scales: &scales.raw,
                 biases: biases.as_ref().map_or(std::ptr::null(), |b| &b.raw),
-                global_scale: global_scale.as_ref().map_or(std::ptr::null(), |g| &g.raw),
+                tensor_scale: tensor_scale.as_ref().map_or(std::ptr::null(), |s| &s.raw),
                 group_size: params.group_size,
                 bits: params.bits,
                 mode: params.mode.as_i32(),
@@ -526,13 +515,13 @@ impl LayerWeight {
                 weight,
                 scales,
                 biases,
-                global_scale,
+                tensor_scale,
                 params,
             } => Self::Quantized {
                 weight: copy_fresh_arr(weight, zero),
                 scales: copy_fresh_arr(scales, zero),
                 biases: biases.as_ref().map(|b| copy_fresh_arr(b, zero)),
-                global_scale: global_scale.as_ref().map(|g| copy_fresh_arr(g, zero)),
+                tensor_scale: tensor_scale.as_ref().map(|s| copy_fresh_arr(s, zero)),
                 params: *params,
             },
         }
@@ -546,12 +535,16 @@ impl LayerWeight {
                 weight,
                 scales,
                 biases,
+                tensor_scale,
                 ..
             } => {
                 weight.async_eval_ref();
                 scales.async_eval_ref();
                 if let Some(b) = biases {
                     b.async_eval_ref();
+                }
+                if let Some(s) = tensor_scale {
+                    s.async_eval_ref();
                 }
             }
         }
@@ -874,15 +867,20 @@ mod tests {
         );
     }
 
-    /// A two-level weight must not reach `quantized_matmul`, which has no
-    /// global-scale argument and would drop the per-tensor factor in silence.
-    ///
-    /// ⚠️ It cannot reach `qqmm` either: for nvfp4 MLX wants both
-    /// `global_scale_x` and `global_scale_w` or neither, because that kernel
-    /// is for a quantized activation. So `matmul_from` unpacks instead, and
-    /// this asserts the global scale still changes the answer.
+    fn max_abs_diff(a: &mut InlineArray, b: &mut InlineArray, n: usize) -> f32 {
+        let va = a.to_f32_vec(n).expect("read lhs");
+        let vb = b.to_f32_vec(n).expect("read rhs");
+        va.iter()
+            .zip(vb.iter())
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// A per-tensor scale stays on the packed kernel: `quantized_matmul`
+    /// runs on the packed weight and the product is scaled afterwards. This
+    /// is the path every NVIDIA ModelOpt nvfp4 projection takes.
     #[test]
-    fn a_two_level_weight_applies_its_global_scale() {
+    fn a_tensor_scale_applies_to_the_packed_product() {
         let (out, in_dim) = (8i32, 64i32);
         let values: Vec<f32> = (0..out * in_dim)
             .map(|i| ((i % 13) as f32 - 6.0) / 6.0)
@@ -892,29 +890,83 @@ mod tests {
         crate::check_last_error().expect("nvfp4 quantize");
 
         let params = QuantParams::defaults_for(QuantizedMode::Nvfp4);
-        let x = InlineArray::from_f32_slice(&vec![0.25f32; in_dim as usize], &[1, in_dim]);
+        let x_values: Vec<f32> = (0..in_dim).map(|i| (i as f32 - 32.0) / 32.0).collect();
+        let x = InlineArray::from_f32_slice(&x_values, &[1, in_dim]);
+        // Deliberately not a power of two, so a dropped or doubled scale shows.
+        let scale = InlineArray::from_f32_slice(&[0.37], &[]);
 
-        let plain =
-            LayerWeight::new_two_level(packed.clone(), Some(scales.clone()), None, None, params);
-        let mut a = plain.matmul_from(&x);
-        crate::check_last_error().expect("single-level matmul");
+        let scaled = LayerWeight::new_scaled(
+            packed.clone(),
+            Some(scales.clone()),
+            None,
+            Some(scale.clone()),
+            params,
+        );
+        let mut got = scaled.matmul_from(&x);
+        crate::check_last_error().expect("scaled matmul");
 
-        let half = InlineArray::from_f32_slice(&[0.5], &[1]);
-        let two_level = LayerWeight::new_two_level(packed, Some(scales), None, Some(half), params);
-        let mut b = two_level.matmul_from(&x);
-        crate::check_last_error().expect("two-level matmul");
+        let dense = packed
+            .dequantize_mode(&scales, None, 16, 4, QuantizedMode::Nvfp4)
+            .multiply(&scale);
+        let mut want = x.matmul(&dense.t());
+        crate::check_last_error().expect("reference matmul");
 
-        let n = out as usize;
-        let va = a.to_f32_vec(n).expect("read single-level");
-        let vb = b.to_f32_vec(n).expect("read two-level");
-        let max_diff = va
-            .iter()
-            .zip(vb.iter())
-            .map(|(p, q)| (p - q).abs())
-            .fold(0.0f32, f32::max);
+        let diff = max_abs_diff(&mut got, &mut want, out as usize);
         assert!(
-            max_diff > 1e-6,
-            "global scale never reached the kernel: max|diff| = {max_diff}"
+            diff < 1e-4,
+            "packed product scaled wrongly: max|diff| = {diff}"
+        );
+    }
+
+    /// Stacked experts each carry their own scale, so the gather path has to
+    /// pick the scale of the expert each row was routed to.
+    #[test]
+    fn stacked_experts_each_apply_their_own_scale() {
+        let (experts, out, in_dim) = (2i32, 8i32, 64i32);
+        let values: Vec<f32> = (0..experts * out * in_dim)
+            .map(|i| ((i % 11) as f32 - 5.0) / 5.0)
+            .collect();
+        let w = InlineArray::from_f32_slice(&values, &[experts, out, in_dim]);
+        let (packed, scales) = w.quantize_weights_mode(16, 4, QuantizedMode::Nvfp4);
+        crate::check_last_error().expect("nvfp4 quantize");
+
+        let params = QuantParams::defaults_for(QuantizedMode::Nvfp4);
+        let per_expert = InlineArray::from_f32_slice(&[0.5, 3.0], &[experts]);
+        let stacked = LayerWeight::new_scaled(
+            packed.clone(),
+            Some(scales.clone()),
+            None,
+            Some(per_expert),
+            params,
+        );
+
+        let x_values: Vec<f32> = (0..2 * in_dim)
+            .map(|i| ((i % 7) as f32 - 3.0) / 3.0)
+            .collect();
+        let x = InlineArray::from_f32_slice(&x_values, &[2, 1, in_dim]);
+        // Row 0 goes to expert 1 and row 1 to expert 0, so a scale taken in
+        // the wrong order is caught as well as a missing one.
+        let routes = InlineArray::from_u32_slice(&[1, 0], &[2]);
+        let mut got = stacked.gather_mm_from(&x, None, Some(&routes), false);
+        crate::check_last_error().expect("scaled gather matmul");
+
+        let dense = packed.dequantize_mode(&scales, None, 16, 4, QuantizedMode::Nvfp4);
+        // `[1, in, out]` and `[1, 1, in]`, so each product is `[1, 1, out]`.
+        let expert = |e: i32| dense.index((e..e + 1, ..)).transpose_axes(&[0, 2, 1]);
+        let row = |r: i32| x.index((r..r + 1, ..));
+        let want_0 = row(0)
+            .matmul(&expert(1))
+            .multiply(&InlineArray::from_f32_slice(&[3.0], &[]));
+        let want_1 = row(1)
+            .matmul(&expert(0))
+            .multiply(&InlineArray::from_f32_slice(&[0.5], &[]));
+        let mut want = want_0.concatenate_2(&want_1, 0);
+        crate::check_last_error().expect("reference gather");
+
+        let diff = max_abs_diff(&mut got, &mut want, (2 * out) as usize);
+        assert!(
+            diff < 1e-4,
+            "per-expert scales misapplied: max|diff| = {diff}"
         );
     }
 
