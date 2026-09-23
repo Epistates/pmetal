@@ -119,6 +119,21 @@ impl InlineArray {
         }
     }
 
+    /// Reinterpret the same bytes as another dtype, like `numpy.ndarray.view`.
+    ///
+    /// No values are converted. The last axis rescales by the ratio of the
+    /// two element sizes, so `[out, n]` `uint8` viewed as `uint32` is
+    /// `[out, n / 4]`.
+    pub fn view(&self, dtype: i32) -> Self {
+        let mut dst = MaybeUninit::<RawBuf>::uninit();
+        unsafe {
+            mlx_inline_view(dst.as_mut_ptr(), &self.raw, dtype);
+            Self {
+                raw: dst.assume_init(),
+            }
+        }
+    }
+
     /// Convert a floating-point matrix to MLX's native E4M3 FP8 representation.
     ///
     /// MLX stores FP8 payloads in `uint8` arrays and expects callers to use

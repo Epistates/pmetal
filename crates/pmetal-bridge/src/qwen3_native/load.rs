@@ -213,6 +213,9 @@ pub fn load_model(
     // expanding the checkpoint to bf16 runtime weights.
     normalize_fp8_weight_scale_inv_sidecars(&mut raw, detected_model_dtype)?;
 
+    // 3d. NVIDIA ModelOpt normalization (nvfp4 and per-tensor fp8).
+    normalize_modelopt_sidecars(&mut raw, detected_model_dtype)?;
+
     let one = InlineArray::scalar_with_dtype(1.0, detected_model_dtype);
 
     // GDN-specific f32 weights that must be cast to model dtype to prevent f32
@@ -320,6 +323,13 @@ pub fn load_model(
             }
 
             for proj in &["gate_proj", "up_proj", "down_proj"] {
+                // ⚠️ Neither branch below stacks a per-tensor scale, so a
+                // ModelOpt expert would load with it dropped and decode noise.
+                if raw.contains_key(&format!("{prefix}.experts.0.{proj}.tensor_scale")) {
+                    return Err(format!(
+                        "{prefix}.experts.*.{proj}: NVIDIA ModelOpt quantized MoE experts are not supported yet"
+                    ));
+                }
                 // Detect whether first expert is quantized.
                 let is_mxfp8 = raw.contains_key(&format!("{prefix}.experts.0.{proj}.mxfp8_scales"));
                 let is_quantized = raw.contains_key(&format!("{prefix}.experts.0.{proj}.scales"));
@@ -450,10 +460,12 @@ pub fn load_model(
         let s_key = format!("{base_key}.scales");
         let b_key = format!("{base_key}.biases");
         let mxfp8_s_key = format!("{base_key}.mxfp8_scales");
+        let nvfp4_s_key = format!("{base_key}.nvfp4_scales");
+        let tensor_scale = raw.get(&format!("{base_key}.tensor_scale")).cloned();
 
         if let (Some(w), Some(scales)) = (raw.get(&w_key), raw.get(&mxfp8_s_key)) {
             return Ok(LayerWeight::Quantized {
-                tensor_scale: None,
+                tensor_scale,
                 weight: w.clone(),
                 scales: scales.clone(),
                 biases: None,
@@ -462,6 +474,15 @@ pub fn load_model(
                     bits: MXFP8_BITS,
                     mode: QuantizedMode::Mxfp8,
                 },
+            });
+        }
+        if let (Some(w), Some(scales)) = (raw.get(&w_key), raw.get(&nvfp4_s_key)) {
+            return Ok(LayerWeight::Quantized {
+                tensor_scale,
+                weight: w.clone(),
+                scales: scales.clone(),
+                biases: None,
+                params: QuantParams::defaults_for(QuantizedMode::Nvfp4),
             });
         }
 
@@ -1011,6 +1032,68 @@ fn normalize_fp8_weight_scale_inv_sidecars(
     Ok(stats)
 }
 
+#[derive(Default, Debug, Clone, Copy, Eq, PartialEq)]
+struct ModelOptLoadStats {
+    nvfp4: usize,
+    fp8_packed: usize,
+    fp8_dense: usize,
+}
+
+/// The e8m0 byte for 2^0, MLX's mxfp8 block scale that leaves a value alone.
+const E8M0_ONE: f32 = 127.0;
+
+/// Put NVIDIA ModelOpt's quantized tensors on the packed kernels, keeping each
+/// one's per-tensor factor as `{base}.tensor_scale`.
+///
+/// nvfp4 is a bitcast: ModelOpt's bytes are MLX's layout. Per-tensor fp8 keeps
+/// its e4m3 bytes unchanged on MLX's mxfp8 kernel with every block scale at
+/// 2^0, so the product is exact where re-quantizing to mxfp8 would round each
+/// element a second time. A width the mxfp8 kernel cannot tile goes dense.
+/// See [`crate::native_loader::ModelOptWeight`] for the formats.
+fn normalize_modelopt_sidecars(
+    raw: &mut HashMap<String, InlineArray>,
+    target_dtype: i32,
+) -> Result<ModelOptLoadStats, String> {
+    use crate::native_loader::ModelOptWeight;
+
+    let mut stats = ModelOptLoadStats::default();
+    for (base, weight) in crate::native_loader::take_modelopt_weights(raw)? {
+        match weight {
+            ModelOptWeight::Nvfp4 {
+                packed,
+                scales,
+                tensor_scale,
+            } => {
+                raw.insert(format!("{base}.weight"), packed);
+                raw.insert(format!("{base}.nvfp4_scales"), scales);
+                raw.insert(format!("{base}.tensor_scale"), tensor_scale);
+                stats.nvfp4 += 1;
+            }
+            ModelOptWeight::Fp8 {
+                weight,
+                tensor_scale,
+            } if weight.dim(1) % MXFP8_GROUP_SIZE == 0 => {
+                let blocks = [weight.dim(0), weight.dim(1) / MXFP8_GROUP_SIZE];
+                raw.insert(
+                    format!("{base}.mxfp8_scales"),
+                    InlineArray::full(&blocks, E8M0_ONE, crate::dtype::U8),
+                );
+                raw.insert(format!("{base}.weight"), weight.view(crate::dtype::U32));
+                raw.insert(format!("{base}.tensor_scale"), tensor_scale);
+                stats.fp8_packed += 1;
+            }
+            fp8 => {
+                let dense = fp8
+                    .to_dense(target_dtype)
+                    .map_err(|e| format!("{base}.weight: {e}"))?;
+                raw.insert(format!("{base}.weight"), dense);
+                stats.fp8_dense += 1;
+            }
+        }
+    }
+    Ok(stats)
+}
+
 fn can_repack_as_mxfp8(weight: &InlineArray) -> bool {
     weight.ndim() >= 2
         && weight
@@ -1023,6 +1106,150 @@ fn can_repack_as_mxfp8(weight: &InlineArray) -> bool {
 mod tests {
     use super::*;
     use crate::compat::Dtype;
+    use crate::native_weight::LayerWeight as Lw;
+
+    fn max_abs_diff(mut a: InlineArray, mut b: InlineArray, n: usize) -> f32 {
+        let va = a.to_f32_vec(n).expect("read lhs");
+        let vb = b.to_f32_vec(n).expect("read rhs");
+        va.iter()
+            .zip(vb.iter())
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    fn modelopt_weight(raw: &HashMap<String, InlineArray>, base: &str, mode: QuantizedMode) -> Lw {
+        let scales_key = match mode {
+            QuantizedMode::Nvfp4 => "nvfp4_scales",
+            _ => "mxfp8_scales",
+        };
+        Lw::new_scaled(
+            raw[&format!("{base}.weight")].clone(),
+            Some(raw[&format!("{base}.{scales_key}")].clone()),
+            None,
+            Some(raw[&format!("{base}.tensor_scale")].clone()),
+            QuantParams::defaults_for(mode),
+        )
+    }
+
+    /// NVIDIA's per-tensor fp8 bytes run on MLX's mxfp8 kernel with every
+    /// block scale at 2^0. If the unit byte or the element format disagreed,
+    /// every attention projection of a ModelOpt checkpoint would be off.
+    #[test]
+    fn modelopt_fp8_runs_exactly_on_the_mxfp8_kernel() {
+        let (out, in_dim) = (4i32, 64i32);
+        let values: Vec<f32> = (0..out * in_dim)
+            .map(|i| ((i % 19) as f32 - 9.0) / 3.0)
+            .collect();
+        let fp8 = InlineArray::from_f32_slice(&values, &[out, in_dim]).to_fp8();
+        let base = "model.layers.0.self_attn.q_proj";
+        let mut raw = HashMap::from([
+            (format!("{base}.weight"), fp8.clone()),
+            (
+                format!("{base}.weight_scale"),
+                InlineArray::from_f32_slice(&[0.37], &[]),
+            ),
+            (
+                format!("{base}.input_scale"),
+                InlineArray::from_f32_slice(&[0.2], &[]),
+            ),
+        ]);
+
+        let stats = normalize_modelopt_sidecars(&mut raw, Dtype::Bfloat16.as_i32())
+            .expect("normalize ModelOpt fp8");
+        assert_eq!(stats.fp8_packed, 1);
+        assert!(!raw.contains_key(&format!("{base}.input_scale")));
+
+        let x_values: Vec<f32> = (0..in_dim).map(|i| (i as f32 - 32.0) / 32.0).collect();
+        let x = InlineArray::from_f32_slice(&x_values, &[1, in_dim]);
+        let got = modelopt_weight(&raw, base, QuantizedMode::Mxfp8).matmul_from(&x);
+        crate::check_last_error().expect("mxfp8 matmul");
+
+        let dense = fp8
+            .from_fp8(Dtype::Float32.as_i32())
+            .multiply(&InlineArray::from_f32_slice(&[0.37], &[]));
+        let want = x.matmul(&dense.t());
+        let diff = max_abs_diff(got, want, out as usize);
+        assert!(
+            diff < 1e-4,
+            "fp8 on the mxfp8 kernel drifted: max|diff| = {diff}"
+        );
+    }
+
+    /// ModelOpt's nvfp4 bytes are MLX's layout read as `uint8`, so the loader
+    /// only bitcasts them, and the per-tensor scale lands on the product.
+    #[test]
+    fn modelopt_nvfp4_is_a_bitcast_plus_a_tensor_scale() {
+        let (out, in_dim) = (4i32, 64i32);
+        let values: Vec<f32> = (0..out * in_dim)
+            .map(|i| ((i % 13) as f32 - 6.0) / 6.0)
+            .collect();
+        let w = InlineArray::from_f32_slice(&values, &[out, in_dim]);
+        let (packed, scales) = w.quantize_weights_mode(16, 4, QuantizedMode::Nvfp4);
+        crate::check_last_error().expect("nvfp4 quantize");
+
+        let base = "model.layers.0.mlp.down_proj";
+        let mut raw = HashMap::from([
+            // What ModelOpt stores: the same bytes, typed as uint8.
+            (format!("{base}.weight"), packed.view(crate::dtype::U8)),
+            (format!("{base}.weight_scale"), scales.clone()),
+            (
+                format!("{base}.weight_scale_2"),
+                InlineArray::from_f32_slice(&[0.37], &[]),
+            ),
+            (
+                format!("{base}.input_scale"),
+                InlineArray::from_f32_slice(&[0.2], &[]),
+            ),
+        ]);
+
+        let stats = normalize_modelopt_sidecars(&mut raw, Dtype::Bfloat16.as_i32())
+            .expect("normalize ModelOpt nvfp4");
+        assert_eq!(stats.nvfp4, 1);
+        assert_eq!(
+            raw[&format!("{base}.weight")].dtype_raw(),
+            crate::dtype::U32
+        );
+
+        let x_values: Vec<f32> = (0..in_dim).map(|i| (i as f32 - 32.0) / 32.0).collect();
+        let x = InlineArray::from_f32_slice(&x_values, &[1, in_dim]);
+        let got = modelopt_weight(&raw, base, QuantizedMode::Nvfp4).matmul_from(&x);
+        crate::check_last_error().expect("nvfp4 matmul");
+
+        let dense = packed
+            .dequantize_mode(&scales, None, 16, 4, QuantizedMode::Nvfp4)
+            .as_dtype(Dtype::Float32.as_i32())
+            .multiply(&InlineArray::from_f32_slice(&[0.37], &[]));
+        let want = x.matmul(&dense.t());
+        let diff = max_abs_diff(got, want, out as usize);
+        assert!(diff < 1e-3, "nvfp4 product misscaled: max|diff| = {diff}");
+    }
+
+    /// A width the mxfp8 kernel cannot tile still loads, as a dense weight.
+    #[test]
+    fn modelopt_fp8_falls_back_to_dense_off_the_block_size() {
+        let (out, in_dim) = (2i32, 48i32);
+        let values: Vec<f32> = (0..out * in_dim).map(|i| (i % 5) as f32 - 2.0).collect();
+        let base = "model.layers.0.linear_attn.in_proj_qkv";
+        let mut raw = HashMap::from([
+            (
+                format!("{base}.weight"),
+                InlineArray::from_f32_slice(&values, &[out, in_dim]).to_fp8(),
+            ),
+            (
+                format!("{base}.weight_scale"),
+                InlineArray::from_f32_slice(&[0.5], &[]),
+            ),
+        ]);
+
+        let stats = normalize_modelopt_sidecars(&mut raw, Dtype::Bfloat16.as_i32())
+            .expect("normalize ModelOpt fp8");
+        assert_eq!(stats.fp8_dense, 1);
+        assert!(!raw.contains_key(&format!("{base}.tensor_scale")));
+        assert_eq!(
+            raw[&format!("{base}.weight")].dtype_raw(),
+            Dtype::Bfloat16.as_i32()
+        );
+    }
 
     #[test]
     fn dequantizes_qwen_fp8_weight_scale_inv_sidecars_when_mxfp8_is_not_shape_legal() {

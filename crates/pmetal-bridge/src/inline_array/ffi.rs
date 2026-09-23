@@ -37,6 +37,7 @@ unsafe extern "C" {
         keepdims: bool,
     );
     pub(super) fn mlx_inline_astype(dst: *mut RawBuf, a: *const RawBuf, dtype: i32);
+    pub(super) fn mlx_inline_view(dst: *mut RawBuf, a: *const RawBuf, dtype: i32);
     pub(super) fn mlx_inline_to_fp8(dst: *mut RawBuf, a: *const RawBuf);
     pub(super) fn mlx_inline_from_fp8(dst: *mut RawBuf, a: *const RawBuf, dtype: i32);
 

@@ -223,11 +223,22 @@ pub struct QuantizationConfig {
 }
 
 impl QuantizationConfig {
-    fn is_fp8_metadata(&self) -> bool {
-        self.quant_method
-            .as_deref()
-            .is_some_and(|method| method.eq_ignore_ascii_case("fp8"))
+    fn is_sidecar_metadata(&self) -> bool {
+        self.quant_method.as_deref().is_some_and(is_sidecar_method)
     }
+}
+
+/// Schemes the loader reads from per-tensor sidecars rather than MLX's
+/// `.scales`/`.biases`.
+///
+/// ⚠️ Letting one through reads its block as MLX affine (`bits` and
+/// `group_size` default to 4 and 64), finds no `.scales`, and loads every
+/// packed tensor as a dense weight: the model runs and decodes noise.
+/// - `fp8`: Qwen's block-scaled FP8, from `weight_scale_inv`.
+/// - `modelopt`: NVIDIA's nvfp4 and per-tensor fp8, from `weight_scale`,
+///   `weight_scale_2` and `input_scale`.
+fn is_sidecar_method(method: &str) -> bool {
+    method.eq_ignore_ascii_case("fp8") || method.eq_ignore_ascii_case("modelopt")
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -382,7 +393,7 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
                 .get("quantization")
                 .or_else(|| json.get("quantization_config"))
             {
-                if !json_quantization_is_fp8(qc) {
+                if !json_quantization_is_sidecar(qc) {
                     tc["quantization"] = qc.clone();
                 }
             }
@@ -394,13 +405,12 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
 
     let mut cfg: Qwen3Config =
         serde_json::from_str(&config_str).map_err(|e| format!("failed to parse config: {e}"))?;
-    // FP8 is normalised from `weight_scale_inv` sidecars rather than MLX
-    // `.scales`/`.biases`, so its metadata must not be mistaken for an affine
-    // quantization. Both spellings get cleared, or whichever survives would
-    // put the loader back on the quantized path.
+    // Sidecar schemes are normalised from their own tensors, so their metadata
+    // must not be mistaken for an affine quantization. Both spellings get
+    // cleared, or whichever survives would put the loader back on that path.
     if cfg
         .quantization()
-        .is_some_and(QuantizationConfig::is_fp8_metadata)
+        .is_some_and(QuantizationConfig::is_sidecar_metadata)
     {
         cfg.quantization_mlx = None;
         cfg.quantization_config = None;
@@ -409,11 +419,11 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
     Ok(cfg)
 }
 
-fn json_quantization_is_fp8(value: &serde_json::Value) -> bool {
+fn json_quantization_is_sidecar(value: &serde_json::Value) -> bool {
     value
         .get("quant_method")
         .and_then(serde_json::Value::as_str)
-        .is_some_and(|method| method.eq_ignore_ascii_case("fp8"))
+        .is_some_and(is_sidecar_method)
 }
 
 #[cfg(test)]
@@ -568,6 +578,40 @@ mod tests {
 
         assert!(config.quantization().is_none());
         assert!(!config.is_qwen3_dense());
+    }
+
+    /// ⚠️ `nvidia/Qwen3.8-27B-NVFP4` ships a ModelOpt block with no `bits` or
+    /// `group_size`. Read as MLX's, it became "4-bit affine, group 64", found
+    /// no `.scales`, and loaded all 401 packed tensors as dense weights.
+    #[test]
+    fn parse_nested_qwen35_ignores_outer_modelopt_quantization_metadata() {
+        let config = parse_config_text(
+            r#"{
+                "model_type": "qwen3_5",
+                "quantization_config": {
+                    "quant_method": "modelopt",
+                    "config_groups": {
+                        "group_1": {
+                            "weights": {"num_bits": 4, "type": "float", "group_size": 16},
+                            "targets": ["model.language_model.layers.0.mlp.down_proj"]
+                        }
+                    },
+                    "ignore": ["mtp*"]
+                },
+                "text_config": {
+                    "model_type": "qwen3_5_text",
+                    "hidden_size": 5120,
+                    "num_hidden_layers": 64,
+                    "num_attention_heads": 20,
+                    "num_key_value_heads": 2,
+                    "head_dim": 256,
+                    "layer_types": ["linear_attention", "full_attention"]
+                }
+            }"#,
+        )
+        .expect("nested modelopt qwen3.5 config parses");
+
+        assert!(config.quantization().is_none());
     }
 
     /// ⚠️ `mlx_lm.convert` writes the quantization block twice, once under its

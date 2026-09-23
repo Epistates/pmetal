@@ -192,6 +192,150 @@ pub fn dequantize_fp8_e4m3_scaled_weight(
     }
 }
 
+/// One NVIDIA ModelOpt quantized tensor, lifted out of a checkpoint.
+///
+/// ModelOpt writes two schemes, told apart by their sidecars:
+///
+/// - nvfp4: `weight` is `uint8` holding two e2m1 values per byte, low nibble
+///   first, with an e4m3 `weight_scale` per 16 and an fp32 `weight_scale_2`.
+///   Those bytes read as `uint32` are MLX's own nvfp4 layout.
+/// - per-tensor fp8: `weight` is e4m3 with an fp32 `weight_scale`.
+///
+/// In both, the fp32 factor multiplies the whole dequantized tensor. `input_scale`
+/// calibrates quantized activations, which pmetal does not do, and is dropped.
+/// A checkpoint with `kv_cache_scheme` also ships `k_proj.k_scale` and
+/// `v_proj.v_scale`, which calibrate an fp8 KV cache and touch no weight;
+/// pmetal quantizes its cache itself, so loaders leave them unmatched.
+pub enum ModelOptWeight {
+    /// Packed in MLX's nvfp4 layout (`uint32`), its e4m3 scale per 16 values,
+    /// and the per-tensor factor as an fp32 scalar.
+    Nvfp4 {
+        packed: InlineArray,
+        scales: InlineArray,
+        tensor_scale: InlineArray,
+    },
+    /// The e4m3 bytes as `uint8`, and the per-tensor factor as an fp32 scalar.
+    Fp8 {
+        weight: InlineArray,
+        tensor_scale: InlineArray,
+    },
+}
+
+impl ModelOptWeight {
+    /// Unpack to a dense `[out, in]` weight in `dtype`.
+    ///
+    /// Rounds once. An fp4 value carries at most two significant bits and an
+    /// e4m3 scale four, so their product is exact in bfloat16, and the only
+    /// rounding is the fp32 multiply by the tensor scale.
+    pub fn to_dense(&self, dtype: i32) -> Result<InlineArray, String> {
+        let f32_dtype = Dtype::Float32.as_i32();
+        let dense = match self {
+            Self::Nvfp4 {
+                packed,
+                scales,
+                tensor_scale,
+            } => packed
+                .dequantize_mode(scales, None, 16, 4, crate::QuantizedMode::Nvfp4)
+                .as_dtype(f32_dtype)
+                .multiply(tensor_scale),
+            Self::Fp8 {
+                weight,
+                tensor_scale,
+            } => fp8_e4m3_to_dtype(weight, f32_dtype)?.multiply(tensor_scale),
+        };
+        let dense = dense.as_dtype(dtype);
+        check_last_error().map_err(|e| format!("ModelOpt dequantize: {e}"))?;
+        Ok(dense)
+    }
+}
+
+/// Lift every ModelOpt quantized tensor out of `raw`, keyed by module path.
+///
+/// Removes each one's `weight`, `weight_scale`, `weight_scale_2` and
+/// `input_scale`, so what is left in `raw` is the checkpoint's dense tensors.
+/// Shapes are checked here, once, for every loader.
+pub fn take_modelopt_weights(
+    raw: &mut HashMap<String, InlineArray>,
+) -> Result<Vec<(String, ModelOptWeight)>, String> {
+    const U8: i32 = 1;
+    const U32: i32 = 3;
+    let f32_dtype = Dtype::Float32.as_i32();
+
+    let bases: Vec<String> = raw
+        .keys()
+        .filter_map(|k| k.strip_suffix(".weight_scale"))
+        .map(ToOwned::to_owned)
+        .collect();
+
+    let mut taken = Vec::with_capacity(bases.len());
+    for base in bases {
+        let weight_key = format!("{base}.weight");
+        let scale = raw
+            .remove(&format!("{base}.weight_scale"))
+            .ok_or_else(|| format!("ModelOpt sidecar disappeared during load: {base}"))?;
+        let weight = raw
+            .remove(&weight_key)
+            .ok_or_else(|| format!("ModelOpt scale {base}.weight_scale has no weight"))?;
+        raw.remove(&format!("{base}.input_scale"));
+
+        if weight.dtype_raw() != U8 || weight.ndim() != 2 {
+            return Err(format!(
+                "{weight_key}: expected a 2D uint8 ModelOpt weight, got dtype {} shape {:?}",
+                weight.dtype_raw(),
+                weight.shape()
+            ));
+        }
+
+        let entry = if let Some(scale_2) = raw.remove(&format!("{base}.weight_scale_2")) {
+            // Two fp4 values per byte, one e4m3 scale per 16 values.
+            let in_dim = weight.dim(1) * 2;
+            if scale.dtype_raw() != U8 || scale.dim(1) * 16 != in_dim || in_dim % 8 != 0 {
+                return Err(format!(
+                    "{weight_key}: nvfp4 scales {:?} do not match weight {:?}",
+                    scale.shape(),
+                    weight.shape()
+                ));
+            }
+            ModelOptWeight::Nvfp4 {
+                packed: weight.view(U32),
+                scales: scale,
+                tensor_scale: scale_2.as_dtype(f32_dtype).reshape(&[]),
+            }
+        } else {
+            if scale.size() != 1 {
+                return Err(format!(
+                    "{weight_key}: only per-tensor ModelOpt fp8 is supported, got weight_scale {:?}",
+                    scale.shape()
+                ));
+            }
+            ModelOptWeight::Fp8 {
+                weight,
+                tensor_scale: scale.as_dtype(f32_dtype).reshape(&[]),
+            }
+        };
+        taken.push((base, entry));
+    }
+    Ok(taken)
+}
+
+/// The module a per-tensor quantization sidecar belongs to, or `None` when the
+/// key is not one. `"model.layers.0.mlp.down_proj.weight_scale_2"` gives
+/// `"model.layers.0.mlp.down_proj"`.
+///
+/// ⚠️ A loader that finishes with one of these still in hand has read its
+/// weight as dense bytes. The model loads, runs, and decodes noise, so a
+/// leftover has to be an error rather than an "unmatched key" warning.
+pub fn quant_sidecar_base(key: &str) -> Option<&str> {
+    [
+        ".weight_scale",
+        ".weight_scale_2",
+        ".weight_scale_inv",
+        ".input_scale",
+    ]
+    .iter()
+    .find_map(|suffix| key.strip_suffix(suffix))
+}
+
 fn fp8_e4m3_to_dtype(weight: &InlineArray, target_dtype: i32) -> Result<InlineArray, String> {
     if weight.dtype_raw() == Dtype::Uint8.as_i32() {
         return weight
