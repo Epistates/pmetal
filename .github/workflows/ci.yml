@@ -28,7 +28,7 @@ jobs:
     runs-on: macos-latest
 
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -46,7 +46,7 @@ jobs:
       # Per-tag MLX cache, shared across all runners on the repo. The key is
       # keyed on the tag plus the files that drive MLX's cmake configure so
       # any edit to them triggers a rebuild, but Cargo.lock churn does not.
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: ${{ env.PMETAL_MLX_PREFIX }}
           key: mlx-${{ runner.os }}-${{ runner.arch }}-${{ steps.mlx.outputs.tag }}-${{ hashFiles('crates/pmetal-bridge/build.rs', 'crates/pmetal-bridge/cmake/**', 'crates/pmetal-bridge/patches/**') }}
