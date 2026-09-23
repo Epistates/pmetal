@@ -416,6 +416,78 @@ fn dequantize_mlx_quantized_weights(
     weights.retain(|key, _| !is_quant_aux_key(key));
 }
 
+/// Unpack every per-tensor-sidecar scheme to dense, as MLX's own format is
+/// unpacked above: NVIDIA ModelOpt nvfp4 and fp8, and Qwen's block-scaled FP8.
+///
+/// ⚠️ Before this, their sidecars fell through as unmatched keys with a
+/// warning, and the packed bytes were assigned to dense `Linear` weights. The
+/// load reported every weight matched, and anything trained on it trained on
+/// noise.
+fn dequantize_sidecar_weights(weights: &mut HashMap<String, Array>) -> Result<(), LoadError> {
+    use pmetal_bridge::native_loader as nl;
+
+    if !weights
+        .keys()
+        .any(|key| nl::quant_sidecar_base(key).is_some())
+    {
+        return Ok(());
+    }
+    let dtype = pmetal_bridge::native_weight::detect_model_dtype(|key| {
+        weights.get(key).map(|w| w.dtype_raw())
+    });
+
+    for (base, weight) in nl::take_modelopt_weights(weights).map_err(LoadError::SafeTensors)? {
+        let dense = weight
+            .to_dense(dtype)
+            .map_err(|e| LoadError::SafeTensors(format!("{base}.weight: {e}")))?;
+        weights.insert(format!("{base}.weight"), dense);
+    }
+
+    let block_fp8: Vec<String> = weights
+        .keys()
+        .filter_map(|key| key.strip_suffix(".weight_scale_inv"))
+        .map(ToOwned::to_owned)
+        .collect();
+    for base in block_fp8 {
+        let weight_key = format!("{base}.weight");
+        let (Some(scale_inv), Some(weight)) = (
+            weights.remove(&format!("{base}.weight_scale_inv")),
+            weights.remove(&weight_key),
+        ) else {
+            return Err(LoadError::SafeTensors(format!(
+                "FP8 scale {base}.weight_scale_inv has no weight"
+            )));
+        };
+        let dense = nl::dequantize_fp8_e4m3_scaled_weight(&weight, &scale_inv, dtype)
+            .map_err(|e| LoadError::SafeTensors(format!("{weight_key}: {e}")))?;
+        weights.insert(weight_key, dense);
+    }
+
+    // An activation calibration with no weight scale beside it changes no
+    // weight, so it is safe to drop. A weight scale is not.
+    weights.retain(|key, _| !key.ends_with(".input_scale"));
+    let leftover: Vec<&String> = weights
+        .keys()
+        .filter(|key| nl::quant_sidecar_base(key).is_some())
+        .take(10)
+        .collect();
+    if !leftover.is_empty() {
+        return Err(LoadError::SafeTensors(format!(
+            "quantization scales this loader cannot apply, so their weights would load as raw bytes: {leftover:?}"
+        )));
+    }
+    Ok(())
+}
+
+/// Whether a sharded checkpoint carries per-tensor quantization sidecars, which
+/// cannot be applied a shard at a time.
+fn index_has_quant_sidecars(index: &WeightIndex) -> bool {
+    index
+        .weight_map
+        .keys()
+        .any(|key| pmetal_bridge::native_loader::quant_sidecar_base(key).is_some())
+}
+
 pub fn load_clip_weights(
     model: &mut CLIPTextModel,
     weights: &HashMap<String, Array>,
@@ -1257,9 +1329,11 @@ pub fn load_generic_weights_renamed<M: ModuleParameters + ModuleParametersExt>(
         return Ok(());
     }
 
+    // One file is read whole either way; `load_weights` also unpacks any
+    // per-tensor quantization it carries.
     let single_file = model_dir.join("model.safetensors");
     if single_file.exists() {
-        let loaded = apply(load_shard(&single_file)?);
+        let loaded = apply(load_weights(model_dir)?);
         report += assign_loaded_weights(model, loaded);
         eval_loaded_parameters(model)?;
         report.log_summary(model_dir);
@@ -1274,6 +1348,15 @@ pub fn load_generic_weights_renamed<M: ModuleParameters + ModuleParametersExt>(
     }
     let index_content = std::fs::read_to_string(&index_path).map_err(LoadError::Io)?;
     let index: WeightIndex = serde_json::from_str(&index_content)?;
+    // Same reason as the MLX case above: a scale and its weight can sit in
+    // different shards.
+    if index_has_quant_sidecars(&index) {
+        let loaded = apply(load_weights(model_dir)?);
+        report += assign_loaded_weights(model, loaded);
+        eval_loaded_parameters(model)?;
+        report.log_summary(model_dir);
+        return Ok(());
+    }
     let shard_files: HashSet<&String> = index.weight_map.values().collect();
     for shard_file in shard_files {
         let shard_path = validate_shard_path(model_dir, shard_file)?;
@@ -1357,6 +1440,7 @@ where
         if let Some(config) = &quant_config {
             dequantize_mlx_quantized_weights(&mut weights, config);
         }
+        dequantize_sidecar_weights(&mut weights)?;
         return Ok(weights
             .into_iter()
             .filter(|(key, _)| keep_key(key) && !is_quant_aux_key(key))
@@ -1384,6 +1468,8 @@ where
                 || quant_config.is_some()
                     && quant_aux_base_key(key)
                         .is_some_and(|base| keep_key(base) || keep_key(&format!("{base}.weight")))
+                || pmetal_bridge::native_loader::quant_sidecar_base(key)
+                    .is_some_and(|base| keep_key(&format!("{base}.weight")))
         })
         .cloned()
         .collect();
@@ -1407,6 +1493,7 @@ where
     if let Some(config) = &quant_config {
         dequantize_mlx_quantized_weights(&mut all_weights, config);
     }
+    dequantize_sidecar_weights(&mut all_weights)?;
 
     Ok(all_weights
         .into_iter()
@@ -2101,6 +2188,95 @@ fn remap_bert_weight_name(hf_name: &str) -> String {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    fn max_abs_diff(a: &Array, b: &Array) -> f32 {
+        let n = a.size();
+        let f32_dtype = pmetal_bridge::dtype::F32;
+        let mut a = a.as_dtype(f32_dtype);
+        let mut b = b.as_dtype(f32_dtype);
+        let va = a.to_f32_vec(n).expect("read lhs");
+        let vb = b.to_f32_vec(n).expect("read rhs");
+        va.iter()
+            .zip(vb.iter())
+            .map(|(p, q)| (p - q).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// ⚠️ A ModelOpt checkpoint used to load with its sidecars skipped as
+    /// "unmatched" and its packed bytes assigned as dense weights, while
+    /// reporting every weight matched. Training and eval both read this path.
+    #[test]
+    fn modelopt_checkpoints_unpack_to_dense() {
+        use pmetal_bridge::QuantizedMode;
+        let dir = tempdir().unwrap();
+        let (out, in_dim) = (4i32, 64i32);
+        let values: Vec<f32> = (0..out * in_dim)
+            .map(|i| ((i % 13) as f32 - 6.0) / 6.0)
+            .collect();
+        let w = Array::from_f32_slice(&values, &[out, in_dim]);
+        let (packed, scales) = w.quantize_weights_mode(16, 4, QuantizedMode::Nvfp4);
+        let fp8 = w.to_fp8();
+        let scalar = |v: f32| Array::from_f32_slice(&[v], &[]);
+
+        let down = "model.layers.0.mlp.down_proj";
+        let q = "model.layers.0.self_attn.q_proj";
+        let mut weights = HashMap::new();
+        weights.insert(
+            format!("{down}.weight"),
+            packed.view(pmetal_bridge::dtype::U8),
+        );
+        weights.insert(format!("{down}.weight_scale"), scales.clone());
+        weights.insert(format!("{down}.weight_scale_2"), scalar(0.37));
+        weights.insert(format!("{down}.input_scale"), scalar(0.2));
+        weights.insert(format!("{q}.weight"), fp8.clone());
+        weights.insert(format!("{q}.weight_scale"), scalar(0.5));
+        weights.insert(format!("{q}.input_scale"), scalar(0.2));
+        weights.insert(
+            "model.norm.weight".to_string(),
+            Array::ones(&[in_dim], pmetal_bridge::dtype::F32),
+        );
+        write_safetensors(&dir.path().join("model.safetensors"), &weights).unwrap();
+
+        let loaded = load_weights(dir.path()).unwrap();
+
+        let sidecars: Vec<&String> = loaded
+            .keys()
+            .filter(|k| pmetal_bridge::native_loader::quant_sidecar_base(k).is_some())
+            .collect();
+        assert!(sidecars.is_empty(), "sidecars survived: {sidecars:?}");
+
+        let want_down = packed
+            .dequantize_mode(&scales, None, 16, 4, QuantizedMode::Nvfp4)
+            .as_dtype(pmetal_bridge::dtype::F32)
+            .multiply(&scalar(0.37));
+        let diff = max_abs_diff(&loaded[&format!("{down}.weight")], &want_down);
+        assert!(diff < 1e-6, "nvfp4 unpacked wrongly: max|diff| = {diff}");
+
+        let want_q = fp8
+            .from_fp8(pmetal_bridge::dtype::F32)
+            .multiply(&scalar(0.5));
+        let diff = max_abs_diff(&loaded[&format!("{q}.weight")], &want_q);
+        assert!(diff < 1e-6, "fp8 unpacked wrongly: max|diff| = {diff}");
+    }
+
+    /// A weight scale with nothing to apply it to has to stop the load.
+    #[test]
+    fn an_orphaned_weight_scale_is_an_error() {
+        let dir = tempdir().unwrap();
+        let mut weights = HashMap::new();
+        weights.insert(
+            "model.layers.0.mlp.down_proj.weight_scale_inv".to_string(),
+            Array::from_f32_slice(&[1.0], &[1, 1]),
+        );
+        weights.insert(
+            "model.norm.weight".to_string(),
+            Array::ones(&[4], pmetal_bridge::dtype::F32),
+        );
+        write_safetensors(&dir.path().join("model.safetensors"), &weights).unwrap();
+
+        let err = load_weights(dir.path()).unwrap_err().to_string();
+        assert!(err.contains("weight_scale_inv"), "unexpected error: {err}");
+    }
 
     fn write_safetensors(
         path: &Path,
