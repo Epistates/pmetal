@@ -372,6 +372,80 @@ impl LayerWeight {
         }
     }
 
+    /// Stack per-expert projections along a new leading expert axis, the
+    /// layout [`Self::gather_mm_from`] takes.
+    ///
+    /// Every part has to be the same variant with the same parameters, since
+    /// MLX's gather kernels read one layout for the whole stack. Per-tensor
+    /// scales stack to `[E]`, one per expert.
+    pub fn stack(parts: Vec<Self>) -> Result<Self, String> {
+        let stack = |arrays: Vec<InlineArray>| {
+            let stacked = crate::compat::ops::stack_axis(&arrays, 0);
+            crate::check_last_error()
+                .map(|()| stacked)
+                .map_err(|e| format!("LayerWeight::stack: {e}"))
+        };
+        let Some(first) = parts.first() else {
+            return Err("LayerWeight::stack: no experts".to_string());
+        };
+        match first {
+            // Each part is already `[in, out]`, so the stack is `[E, in, out]`.
+            Self::Dense(_) => {
+                let mut weights = Vec::with_capacity(parts.len());
+                for part in parts {
+                    let Self::Dense(w) = part else {
+                        return Err("LayerWeight::stack: dense and packed experts mixed".into());
+                    };
+                    weights.push(w);
+                }
+                Ok(Self::Dense(stack(weights)?))
+            }
+            Self::Quantized {
+                biases,
+                tensor_scale,
+                params,
+                ..
+            } => {
+                let (params, has_biases, has_scale) =
+                    (*params, biases.is_some(), tensor_scale.is_some());
+                let n = parts.len();
+                let (mut weights, mut scales) = (Vec::with_capacity(n), Vec::with_capacity(n));
+                let (mut all_biases, mut all_scales) = (Vec::new(), Vec::new());
+                for part in parts {
+                    match part {
+                        Self::Quantized {
+                            weight,
+                            scales: s,
+                            biases: b,
+                            tensor_scale: t,
+                            params: p,
+                        } if p == params
+                            && b.is_some() == has_biases
+                            && t.is_some() == has_scale =>
+                        {
+                            weights.push(weight);
+                            scales.push(s);
+                            all_biases.extend(b);
+                            all_scales.extend(t);
+                        }
+                        _ => {
+                            return Err(
+                                "LayerWeight::stack: experts quantized differently".to_string()
+                            );
+                        }
+                    }
+                }
+                Ok(Self::Quantized {
+                    weight: stack(weights)?,
+                    scales: stack(scales)?,
+                    biases: has_biases.then(|| stack(all_biases)).transpose()?,
+                    tensor_scale: has_scale.then(|| stack(all_scales)).transpose()?,
+                    params,
+                })
+            }
+        }
+    }
+
     /// The packed or dense payload, for pointer export and buffer refresh.
     pub fn weight_arr(&self) -> &InlineArray {
         match self {

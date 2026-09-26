@@ -257,6 +257,89 @@ fn gemma4_moe_synthetic_parity() {
     );
 }
 
+/// The native Gemma 4 engine against the same `transformers` oracle, on the
+/// dense fixture. The native engine is a separate implementation from the
+/// module-based port above, so it needs its own check.
+#[test]
+fn gemma4_native_synthetic_parity() {
+    run_native_synthetic_parity(
+        "dense",
+        synthetic_config_json(),
+        "gemma4_synth_weights.safetensors",
+        "gemma4_synth_reference.safetensors",
+    );
+}
+
+/// The native engine's routed-experts branch against `transformers`
+/// `Gemma4TextRouter` and `Gemma4TextExperts`, through the fused
+/// `gate_up_proj` layout Hugging Face checkpoints ship.
+#[test]
+fn gemma4_native_moe_synthetic_parity() {
+    run_native_synthetic_parity(
+        "MoE",
+        moe_synthetic_config_json(),
+        "gemma4_moe_synth_weights.safetensors",
+        "gemma4_moe_synth_reference.safetensors",
+    );
+}
+
+fn run_native_synthetic_parity(
+    label: &str,
+    config_json: &str,
+    weights_fixture: &str,
+    reference_fixture: &str,
+) {
+    use pmetal_bridge::gemma4_native;
+
+    // The native loader reads a checkpoint directory, not a tensor map.
+    let dir = tempfile::tempdir().expect("temp dir");
+    std::fs::write(dir.path().join("config.json"), config_json).expect("write config");
+    std::fs::copy(
+        fixture_path(weights_fixture),
+        dir.path().join("model.safetensors"),
+    )
+    .expect("stage weights");
+
+    let config = gemma4_native::load_config(dir.path()).expect("native config parses");
+    let weights = gemma4_native::load_model(dir.path(), &config).expect("native load");
+    let mut cache = gemma4_native::build_cache(&weights, &config);
+
+    let ref_shard = load_shard(&fixture_path(reference_fixture));
+    let logits =
+        gemma4_native::forward_step(&weights, &input_ids_from_shard(&ref_shard), &mut cache);
+    pmetal_bridge::check_last_error().expect("native forward");
+
+    // ⚠️ Tighter than `synthetic_tolerances`, which the module port can
+    // afford because it also checks every layer's hidden state. With only the
+    // logits to go on, 1e-4 let routing to the *least* likely experts through
+    // (3.3e-5). Measured: 5.4e-6 correct on both fixtures, 3.3e-5 with the
+    // top-k inverted, 5.5e-4 without `per_expert_scale`, 1.5e-3 without the
+    // dense branch's post-norm. A gate/up swap is invisible here, since the
+    // fixture keeps GELU linear; `fused_experts_split_gate_first` pins it.
+    let report = compare_checkpoint(
+        "logits",
+        &logits,
+        ref_tensor(&ref_shard, "logits"),
+        &[("logits", Tolerance::new(1.5e-5, 0.0))],
+    );
+    println!("\n== Gemma 4 native {label} synthetic parity report ==");
+    print_report_table(std::slice::from_ref(&report));
+
+    let argmax = argmax_last_axis(&logits);
+    let argmax_ref: Vec<i32> = to_f32_vec_eval(ref_tensor(&ref_shard, "argmax_tokens"))
+        .into_iter()
+        .map(|v| v as i32)
+        .collect();
+    assert!(
+        report.passed(),
+        "Gemma 4 native {label}: logits outside tolerance"
+    );
+    assert_eq!(
+        argmax, argmax_ref,
+        "Gemma 4 native {label}: argmax mismatch"
+    );
+}
+
 fn run_synthetic_parity(
     label: &str,
     config_json: &str,

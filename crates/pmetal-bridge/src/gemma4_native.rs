@@ -128,6 +128,16 @@ pub struct Gemma4Config {
     pub use_double_wide_mlp: Option<bool>,
     #[serde(default)]
     pub enable_moe_block: Option<bool>,
+    /// Routed experts per layer, when `enable_moe_block` is set.
+    #[serde(default)]
+    pub num_experts: Option<i32>,
+    /// Experts each token is routed to.
+    #[serde(default)]
+    pub top_k_experts: Option<i32>,
+    /// Each expert's hidden width. Only the fused `gate_up_proj` layout needs
+    /// it, to find where gate ends and up begins.
+    #[serde(default)]
+    pub moe_intermediate_size: Option<i32>,
 }
 
 fn default_true() -> bool {
@@ -199,6 +209,11 @@ impl Gemma4Config {
         self.vocab_size_per_layer_input.unwrap_or(self.vocab_size)
     }
 
+    /// Whether every layer runs a routed-experts branch beside its dense MLP.
+    pub fn uses_moe(&self) -> bool {
+        self.enable_moe_block.unwrap_or(false)
+    }
+
     pub fn num_kv_shared_layers(&self) -> usize {
         self.num_kv_shared_layers.unwrap_or(0).max(0) as usize
     }
@@ -228,8 +243,15 @@ impl Gemma4Config {
                 "Gemma 4 native: unsupported per-layer-input activation {act:?}"
             ));
         }
-        if self.enable_moe_block.unwrap_or(false) {
-            return Err("Gemma 4 native: MoE block is not ported yet".to_string());
+        if self.uses_moe()
+            && (self.num_experts.is_none()
+                || self.top_k_experts.is_none()
+                || self.moe_intermediate_size.is_none())
+        {
+            return Err(
+                "Gemma 4 native: MoE block needs num_experts, top_k_experts and moe_intermediate_size"
+                    .to_string(),
+            );
         }
         if self.use_double_wide_mlp.unwrap_or(false) {
             return Err("Gemma 4 native: double-wide MLP is not ported yet".to_string());
@@ -320,6 +342,29 @@ impl AttentionKv {
     }
 }
 
+/// One layer's routed-experts branch (`Gemma4TextRouter` + `Gemma4TextExperts`).
+///
+/// It runs beside the dense MLP rather than in place of it. Each branch is
+/// post-normed on its own, the two are summed, and the layer's shared
+/// `post_feedforward_layernorm` applies to the sum.
+pub struct MoeWeights {
+    pub router_proj_w: LayerWeight,
+    /// The router's per-channel `scale` times `hidden_size^-0.5`, folded once.
+    pub router_scale: InlineArray,
+    /// `[num_experts]`, multiplied into each routed weight after renormalising.
+    pub per_expert_scale: InlineArray,
+    /// Stacked over experts, `[E, ...]`, dense or packed.
+    pub gate_w: LayerWeight,
+    pub up_w: LayerWeight,
+    pub down_w: LayerWeight,
+    /// Applied to the expert branch's input, which is the raw residual.
+    pub pre_ffn_norm_2_w: InlineArray,
+    /// Post-norms for the dense branch (`_1`) and the expert branch (`_2`).
+    pub post_ffn_norm_1_w: InlineArray,
+    pub post_ffn_norm_2_w: InlineArray,
+    pub top_k: i32,
+}
+
 pub struct LayerWeights {
     pub input_norm_w: InlineArray,
     pub q_w: LayerWeight,
@@ -334,6 +379,8 @@ pub struct LayerWeights {
     pub post_ffn_norm_w: InlineArray,
     pub layer_scalar: InlineArray,
     pub per_layer_gate: Option<PerLayerGateWeights>,
+    /// The routed-experts branch, on `enable_moe_block` checkpoints.
+    pub moe: Option<MoeWeights>,
     /// Precomputed inverse-frequency array for partial RoPE (full layers).
     /// `None` for full-rotation sliding layers.
     pub rope_freqs: Option<InlineArray>,
@@ -989,6 +1036,87 @@ pub fn load_model(
         let gate_w = take_proj(&mut raw, &format!("{p}.mlp.gate_proj"))?;
         let up_w = take_proj(&mut raw, &format!("{p}.mlp.up_proj"))?;
         let down_w = take_proj(&mut raw, &format!("{p}.mlp.down_proj"))?;
+
+        let moe = if config.uses_moe() {
+            let experts = format!("{p}.experts");
+            let (gate, up, down) =
+                if let Some(gate_up) = raw.remove(&format!("{experts}.gate_up_proj")) {
+                    let down = take(&mut raw, &format!("{experts}.down_proj"))?;
+                    experts_from_fused(
+                        &gate_up,
+                        down,
+                        config.moe_intermediate_size.unwrap_or_default(),
+                    )
+                } else if raw.contains_key(&format!("{experts}.switch_glu.gate_proj.weight")) {
+                    // mlx-lm stacks experts as `switch_glu.*`, `[E, out, in]`.
+                    let mut stacked = |name: &str| -> Result<LayerWeight, String> {
+                        let module = format!("{experts}.switch_glu.{name}");
+                        if raw.contains_key(&format!("{module}.scales")) {
+                            return take_proj(&mut raw, &module);
+                        }
+                        // ⚠️ Not `take_proj`: its dense arm is `.t()`, which
+                        // reverses every axis and would make this `[in, out, E]`.
+                        let w = take(&mut raw, &format!("{module}.weight"))?;
+                        Ok(LayerWeight::Dense(w.transpose_axes(&[0, 2, 1])))
+                    };
+                    (
+                        stacked("gate_proj")?,
+                        stacked("up_proj")?,
+                        stacked("down_proj")?,
+                    )
+                } else {
+                    // One module per expert, as NVIDIA ModelOpt ships them.
+                    let num_experts = config.num_experts.unwrap_or_default();
+                    let mut per_expert = |name: &str| -> Result<LayerWeight, String> {
+                        let mut parts = Vec::with_capacity(num_experts as usize);
+                        for e in 0..num_experts {
+                            parts.push(take_proj(&mut raw, &format!("{experts}.{e}.{name}"))?);
+                        }
+                        LayerWeight::stack(parts).map_err(|e| format!("{experts}.*.{name}: {e}"))
+                    };
+                    (
+                        per_expert("gate_proj")?,
+                        per_expert("up_proj")?,
+                        per_expert("down_proj")?,
+                    )
+                };
+
+            // `norm(x) * scale * hidden^-0.5`: the two constants fold into one.
+            let root = (config.hidden_size as f32).powf(-0.5);
+            let router_scale = take(&mut raw, &format!("{p}.router.scale"))?
+                .as_dtype(Dtype::Float32.as_i32())
+                .multiply(&InlineArray::scalar_with_dtype(
+                    root,
+                    Dtype::Float32.as_i32(),
+                ))
+                .as_dtype(model_dtype);
+            Some(MoeWeights {
+                router_proj_w: take_proj(&mut raw, &format!("{p}.router.proj"))?,
+                router_scale,
+                // Routing weights are fp32 until the experts use them.
+                per_expert_scale: take(&mut raw, &format!("{p}.router.per_expert_scale"))?
+                    .as_dtype(Dtype::Float32.as_i32()),
+                gate_w: gate,
+                up_w: up,
+                down_w: down,
+                pre_ffn_norm_2_w: take(
+                    &mut raw,
+                    &format!("{p}.pre_feedforward_layernorm_2.weight"),
+                )?,
+                post_ffn_norm_1_w: take(
+                    &mut raw,
+                    &format!("{p}.post_feedforward_layernorm_1.weight"),
+                )?,
+                post_ffn_norm_2_w: take(
+                    &mut raw,
+                    &format!("{p}.post_feedforward_layernorm_2.weight"),
+                )?,
+                top_k: config.top_k_experts.unwrap_or_default(),
+            })
+        } else {
+            None
+        };
+
         let per_layer_gate = if config.uses_per_layer_inputs() {
             Some(PerLayerGateWeights {
                 gate_w: take_proj(&mut raw, &format!("{p}.per_layer_input_gate"))?,
@@ -1023,6 +1151,7 @@ pub fn load_model(
             post_ffn_norm_w,
             layer_scalar,
             per_layer_gate,
+            moe,
             rope_freqs,
             is_full_attention: is_full,
             n_heads: config.num_attention_heads,
@@ -1081,6 +1210,15 @@ pub fn load_model(
             ple.gate_w.async_eval_ref();
             ple.projection_w.async_eval_ref();
         }
+        // The stacked experts are still lazy `stack` graphs until evaluated.
+        if let Some(ref moe) = l.moe {
+            moe.router_proj_w.async_eval_ref();
+            moe.router_scale.async_eval_ref();
+            moe.per_expert_scale.async_eval_ref();
+            moe.gate_w.async_eval_ref();
+            moe.up_w.async_eval_ref();
+            moe.down_w.async_eval_ref();
+        }
     }
     if let Some(ref ple) = weights.per_layer_inputs {
         ple.embed_w.async_eval_ref();
@@ -1090,6 +1228,93 @@ pub fn load_model(
     weights.final_norm_w.async_eval_ref();
 
     Ok(weights)
+}
+
+// ----------------------------------------------------------------------------
+// MoE branch
+// ----------------------------------------------------------------------------
+
+/// Hugging Face's fused expert layout as `(gate, up, down)`, each `[E, in, out]`.
+///
+/// `gate_up` is `[E, 2I, H]` with gate first (`Gemma4TextExperts` chunks it in
+/// that order) and `down` is `[E, H, I]`.
+///
+/// ⚠️ Swapping gate and up passes the synthetic oracle: its weights are small
+/// enough that GELU is linear there and `gelu(g)·u ≈ gelu(u)·g`. The order is
+/// pinned by its own test instead.
+fn experts_from_fused(
+    gate_up: &InlineArray,
+    down: InlineArray,
+    intermediate: i32,
+) -> (LayerWeight, LayerWeight, LayerWeight) {
+    let dense = |w: InlineArray| LayerWeight::Dense(w.transpose_axes(&[0, 2, 1]));
+    (
+        dense(gate_up.index((.., 0..intermediate, ..))),
+        dense(gate_up.index((.., intermediate..2 * intermediate, ..))),
+        dense(down),
+    )
+}
+
+/// `Gemma4TextRouter`: each row's `top_k` experts and their weights, both
+/// `[S, top_k]`, weights in fp32.
+///
+/// A weight-less RMSNorm, the folded `scale · hidden^-0.5`, the projection,
+/// then a softmax in fp32. The top-k probabilities are renormalised to sum to
+/// one and multiplied by each chosen expert's `per_expert_scale`.
+fn route_experts(moe: &MoeWeights, h_flat: &InlineArray, eps: f32) -> (InlineArray, InlineArray) {
+    let scaled = h_flat.rms_norm(None, eps).multiply(&moe.router_scale);
+    let probs = moe
+        .router_proj_w
+        .matmul_from(&scaled)
+        .as_dtype(Dtype::Float32.as_i32())
+        .softmax(-1);
+    let (s, num_experts, k) = (probs.dim(0), probs.dim(1), moe.top_k);
+
+    // ⚠️ `argpartition(-k)` puts the k largest in the last k slots. Taking the
+    // first k instead routes every token to its least likely experts.
+    let inds = probs
+        .argpartition(-k, -1)
+        .slice(&[0, num_experts - k], &[s, num_experts]);
+    let top = probs.take_along_axis(&inds, -1);
+    let top = top.divide(&top.sum_axis(-1, true));
+    let per_expert = moe
+        .per_expert_scale
+        .take_axis(&inds.reshape(&[s * k]), 0)
+        .reshape(&[s, k]);
+    (inds, top.multiply(&per_expert))
+}
+
+/// A MoE layer's feed-forward output: the dense branch and the routed experts,
+/// each post-normed, summed, then through the shared post-norm.
+///
+/// `h` is the post-attention residual, which the router and the experts read
+/// directly. `dense` is the dense MLP's output before any post-norm.
+fn moe_feed_forward(
+    moe: &MoeWeights,
+    h: &InlineArray,
+    dense: &InlineArray,
+    post_ffn_norm_w: &InlineArray,
+    eps: f32,
+) -> InlineArray {
+    let shape = h.shape();
+    let hidden = shape[shape.len() - 1];
+    let h_flat = h.reshape(&[-1, hidden]);
+
+    let (inds, weights) = route_experts(moe, &h_flat, eps);
+    let experts = crate::native_moe::switch_glu(
+        &h_flat.rms_norm(Some(&moe.pre_ffn_norm_2_w), eps),
+        &moe.gate_w,
+        &moe.up_w,
+        &moe.down_w,
+        &inds,
+        &weights.as_dtype(h.dtype_raw()),
+        InlineArray::fused_geglu_tanh,
+    )
+    .reshape(shape);
+
+    let dense = dense.rms_norm(Some(&moe.post_ffn_norm_1_w), eps);
+    let experts = experts.rms_norm(Some(&moe.post_ffn_norm_2_w), eps);
+    dense.add(&experts).rms_norm(Some(post_ffn_norm_w), eps)
 }
 
 // ----------------------------------------------------------------------------
@@ -1264,7 +1489,17 @@ pub fn forward_step(
         // pre_ffn_norm → gate / up matmuls → GELU·multiply → down
         // matmul → post_ffn_norm. mlx's per-op matmul is already highly
         // tuned for `[in, out]` pre-transposed weights.
-        let mlp_out = if seq_len == 1 {
+        let mlp_out = if let Some(moe) = &layer.moe {
+            // The compiled block ends in the post-FFN norm, and a MoE layer
+            // needs the dense output before it.
+            let mlp_in = h.rms_norm(Some(&layer.pre_ffn_norm_w), eps);
+            let gate = layer.gate_w.matmul_from(&mlp_in);
+            let up = layer.up_w.matmul_from(&mlp_in);
+            let dense = layer
+                .down_w
+                .matmul_from(&InlineArray::fused_geglu_tanh(&gate, &up));
+            moe_feed_forward(moe, &h, &dense, &layer.post_ffn_norm_w, eps)
+        } else if seq_len == 1 {
             InlineArray::compiled_gemma4_mlp_block(
                 &h,
                 &layer.pre_ffn_norm_w,
@@ -1398,6 +1633,76 @@ pub fn generate(
 mod tests {
     use super::*;
 
+    /// Gate is the first half of `gate_up_proj`, checked where GELU is far
+    /// from linear so that swapping the halves changes the answer. The
+    /// synthetic oracle cannot see this: its weights keep GELU linear.
+    #[test]
+    fn fused_experts_split_gate_first() {
+        let (experts, hidden, inter) = (2usize, 4usize, 3usize);
+        let gate_up: Vec<f32> = (0..experts * 2 * inter * hidden)
+            .map(|i| ((i * 7 % 11) as f32 - 5.0) / 2.5)
+            .collect();
+        let down: Vec<f32> = (0..experts * hidden * inter)
+            .map(|i| ((i * 5 % 9) as f32 - 4.0) / 3.0)
+            .collect();
+        let x: Vec<f32> = vec![0.9, -1.3, 1.7, 0.4];
+
+        let (gate, up, down_w) = experts_from_fused(
+            &InlineArray::from_f32_slice(
+                &gate_up,
+                &[experts as i32, 2 * inter as i32, hidden as i32],
+            ),
+            InlineArray::from_f32_slice(&down, &[experts as i32, hidden as i32, inter as i32]),
+            inter as i32,
+        );
+        // Route the one token to expert 1 alone, at weight 1.
+        let inds = InlineArray::from_u32_slice(&[1], &[1, 1]);
+        let scores = InlineArray::from_f32_slice(&[1.0], &[1, 1]);
+        let mut got = crate::native_moe::switch_glu(
+            &InlineArray::from_f32_slice(&x, &[1, hidden as i32]),
+            &gate,
+            &up,
+            &down_w,
+            &inds,
+            &scores,
+            InlineArray::fused_geglu_tanh,
+        );
+        crate::check_last_error().expect("switch_glu");
+        let got = got.to_f32_vec(hidden).expect("read output");
+
+        let gelu = |v: f64| {
+            0.5 * v
+                * (1.0 + ((2.0 / std::f64::consts::PI).sqrt() * (v + 0.044715 * v.powi(3))).tanh())
+        };
+        let row = |m: &[f32], r: usize, cols: usize| -> Vec<f64> {
+            m[r * cols..(r + 1) * cols]
+                .iter()
+                .map(|&v| f64::from(v))
+                .collect()
+        };
+        let dot =
+            |a: &[f64], b: &[f32]| a.iter().zip(b).map(|(p, &q)| p * f64::from(q)).sum::<f64>();
+        let e = 1usize;
+        let activated: Vec<f64> = (0..inter)
+            .map(|j| {
+                let g = dot(&row(&gate_up, e * 2 * inter + j, hidden), &x);
+                let u = dot(&row(&gate_up, e * 2 * inter + inter + j, hidden), &x);
+                gelu(g) * u
+            })
+            .collect();
+        for (h, got) in got.iter().enumerate() {
+            let want: f64 = row(&down, e * hidden + h, inter)
+                .iter()
+                .zip(&activated)
+                .map(|(d, a)| d * a)
+                .sum();
+            assert!(
+                (f64::from(*got) - want).abs() < 1e-3,
+                "output {h}: {got} against {want}; gate and up split the wrong way?"
+            );
+        }
+    }
+
     fn toy_config() -> Gemma4Config {
         Gemma4Config {
             vocab_size: 8,
@@ -1425,6 +1730,9 @@ mod tests {
             num_kv_shared_layers: Some(0),
             use_double_wide_mlp: Some(false),
             enable_moe_block: Some(false),
+            num_experts: None,
+            top_k_experts: None,
+            moe_intermediate_size: None,
         }
     }
 
