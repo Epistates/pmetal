@@ -428,11 +428,11 @@ fn json_quantization_is_sidecar(value: &serde_json::Value) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::mlp_moe::moe_switch_glu_input;
     use super::{
         QwenDecodeBackend, canonical_decode_backend, parse_config_text,
         validate_quantization_runtime_support_for,
     };
+    use crate::native_moe::switch_glu_input as moe_switch_glu_input;
     use crate::{compat::Dtype, inline_array::InlineArray};
 
     #[test]

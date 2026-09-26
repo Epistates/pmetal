@@ -38,6 +38,7 @@ pub mod turboquant_dispatch;
 
 pub mod native_common;
 pub mod native_loader;
+pub mod native_moe;
 pub mod native_weight;
 pub use native_weight::{EmbeddingWeight, LayerWeight, QuantParams};
 

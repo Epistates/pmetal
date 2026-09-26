@@ -38,15 +38,6 @@ pub(super) fn dense_mlp_forward(lw: &LayerWeights, mlp_in: &InlineArray) -> Inli
 // We work in [B*T, hidden] = [S, hidden] throughout, then reshape back.
 
 #[inline]
-pub(super) fn moe_switch_glu_input(x_flat: &InlineArray) -> InlineArray {
-    debug_assert_eq!(x_flat.ndim(), 2);
-    // MLX SwitchGLU does `mx.expand_dims(x, (-2, -3))` before gather_mm. Use
-    // positive axes here so insertion order is unambiguous and yields the same
-    // `[S, 1, 1, hidden]` layout for flattened `[S, hidden]` inputs.
-    x_flat.expand_dims(1).expand_dims(2)
-}
-
-#[inline]
 fn moe_routed_forward(lw: &LayerWeights, x_flat: &InlineArray) -> InlineArray {
     let s = x_flat.dim(0);
     let top_k = lw.moe_top_k;
@@ -75,45 +66,16 @@ fn moe_routed_forward(lw: &LayerWeights, x_flat: &InlineArray) -> InlineArray {
         scores = scores.divide(&score_sum);
     }
 
-    // ── Expert dispatch via gather_mm / gather_qmm ─────────────────────────
-    //
-    // Mirror MLX SwitchGLU rank semantics exactly:
-    //   x: [S, hidden] -> [S, 1, 1, hidden]
-    //   up/gate gather_mm -> [S, top_k, 1, moe_intermediate]
-    //   down gather_mm -> [S, top_k, 1, hidden]
-    //   squeeze(-2) -> [S, top_k, hidden]
-    //
-    // Without these singleton axes, the down projection can reinterpret the
-    // sequence axis as an additional batch dimension and produce
-    // `[S, top_k, S, hidden]`, which then breaks score broadcasting.
-    let switch_in = moe_switch_glu_input(x_flat);
-    let x_gate_exp =
-        lw.moe_gate_w
-            .as_ref()
-            .unwrap()
-            .gather_mm_from(&switch_in, None, Some(&inds), false);
-    let x_up_exp =
-        lw.moe_up_w
-            .as_ref()
-            .unwrap()
-            .gather_mm_from(&switch_in, None, Some(&inds), false);
-
-    // Fused swiglu: silu(gate) * up
-    let x_act = InlineArray::fused_swiglu(&x_gate_exp, &x_up_exp);
-
-    // gather_mm for down projection: [S, top_k, 1, moe_intermediate] ×
-    // [E, moe_intermediate, hidden] → [S, top_k, 1, hidden]
-    let y_exp = lw
-        .moe_down_w
-        .as_ref()
-        .unwrap()
-        .gather_mm_from(&x_act, None, Some(&inds), false)
-        .squeeze(-2);
-
-    // Weighted sum over top_k: [S, top_k, hidden] * [S, top_k, 1] →
-    // sum(-2) → [S, hidden]
-    let scores_exp = scores.reshape(&[s, top_k, 1]);
-    y_exp.multiply(&scores_exp).sum_axis(-2, false)
+    // ── Expert dispatch: silu(gate) * up ───────────────────────────────────
+    crate::native_moe::switch_glu(
+        x_flat,
+        lw.moe_gate_w.as_ref().unwrap(),
+        lw.moe_up_w.as_ref().unwrap(),
+        lw.moe_down_w.as_ref().unwrap(),
+        &inds,
+        &scores,
+        InlineArray::fused_swiglu,
+    )
 }
 
 pub(super) fn moe_forward(lw: &LayerWeights, x: &InlineArray) -> InlineArray {
