@@ -508,6 +508,108 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    /// e2m1 by code: sign bit high, then two exponent bits and one mantissa.
+    const E2M1: [f64; 16] = [
+        0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+    ];
+
+    /// e4m3fn: bias 7, subnormal when the exponent field is zero.
+    fn e4m3(byte: u8) -> f64 {
+        let sign = if byte & 0x80 != 0 { -1.0 } else { 1.0 };
+        let exp = i32::from((byte >> 3) & 0x0f);
+        let man = f64::from(byte & 0x07);
+        if exp == 0 {
+            sign * (man / 8.0) * 2f64.powi(-6)
+        } else {
+            sign * (1.0 + man / 8.0) * 2f64.powi(exp - 7)
+        }
+    }
+
+    /// Bytes laid out the way NVIDIA ModelOpt writes nvfp4, packed by hand from
+    /// the format rather than by MLX's quantizer, so a nibble-order or scale
+    /// disagreement with the loader cannot cancel out. Adjacent codes always
+    /// differ, which makes a swapped nibble change the answer.
+    ///
+    /// The layout was first confirmed against nvidia/Qwen3.8-27B-NVFP4 itself;
+    /// checkpoint slices can't live in the repo, so this pins the same format.
+    #[test]
+    fn modelopt_nvfp4_matches_a_decode_from_the_format() {
+        use crate::InlineArray;
+        use std::collections::HashMap;
+
+        let (out, in_dim) = (2usize, 32usize);
+        // Pseudo-random codes and inputs. ⚠️ An arithmetic sequence of codes
+        // meets every value beside its negation (code + 8) and, against a
+        // linear `x`, a swapped nibble order cancels to exactly the right sum.
+        let mut state = 0x2545_f491u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            state >> 16
+        };
+        let mut codes = vec![0u8; out * in_dim];
+        for i in 0..codes.len() {
+            let mut c = (next() & 0x0f) as u8;
+            if i % 2 == 1 && c == codes[i - 1] {
+                c = (c + 5) & 0x0f;
+            }
+            codes[i] = c;
+        }
+        let x: Vec<f32> = (0..in_dim)
+            .map(|_| (next() % 2001) as f32 / 1000.0 - 1.0)
+            .collect();
+        let code = |r: usize, c: usize| codes[r * in_dim + c];
+        let packed: Vec<u8> = (0..out)
+            .flat_map(|r| (0..in_dim / 2).map(move |j| code(r, 2 * j) | (code(r, 2 * j + 1) << 4)))
+            .collect();
+        // 1.0, 2.0 / 0.5, 1.5: one e4m3 scale per 16 values.
+        let scale_bytes = [0x38u8, 0x40, 0x30, 0x3c];
+        let tensor_scale = 0.37f64;
+
+        let base = "model.layers.0.mlp.down_proj";
+        let mut raw = HashMap::from([
+            (
+                format!("{base}.weight"),
+                InlineArray::from_u8_slice(&packed, &[out as i32, (in_dim / 2) as i32]),
+            ),
+            (
+                format!("{base}.weight_scale"),
+                InlineArray::from_u8_slice(&scale_bytes, &[out as i32, (in_dim / 16) as i32]),
+            ),
+            (
+                format!("{base}.weight_scale_2"),
+                InlineArray::from_f32_slice(&[tensor_scale as f32], &[]),
+            ),
+        ]);
+
+        let (_, weight) = super::take_modelopt_weights(&mut raw)
+            .expect("classify")
+            .pop()
+            .expect("one ModelOpt tensor");
+        let projection = weight
+            .into_native(crate::dtype::F32)
+            .expect("pack")
+            .into_layer_weight();
+
+        let mut got = projection.matmul_from(&InlineArray::from_f32_slice(&x, &[1, in_dim as i32]));
+        crate::check_last_error().expect("nvfp4 matmul");
+        let got = got.to_f32_vec(out).expect("read product");
+
+        for (r, got) in got.iter().enumerate() {
+            let want: f64 = (0..in_dim)
+                .map(|c| {
+                    let w = E2M1[code(r, c) as usize]
+                        * e4m3(scale_bytes[r * (in_dim / 16) + c / 16])
+                        * tensor_scale;
+                    w * f64::from(x[c])
+                })
+                .sum();
+            assert!(
+                (f64::from(*got) - want).abs() < 1e-4,
+                "row {r}: loader gives {got}, the format gives {want}"
+            );
+        }
+    }
+
     fn temp_dir() -> std::path::PathBuf {
         let unique = SystemTime::now()
             .duration_since(UNIX_EPOCH)
