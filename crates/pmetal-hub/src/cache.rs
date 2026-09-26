@@ -99,12 +99,36 @@ pub fn find_cached_model(repo_id: &str) -> Option<PathBuf> {
     for snap in snapshots {
         let snap_path = snap.path();
         // A valid model snapshot must have config.json
-        if snap_path.join("config.json").exists() {
+        if snap_path.join("config.json").exists() && shards_complete(&snap_path) {
             return Some(snap_path);
         }
     }
 
     None
+}
+
+/// Whether every shard a snapshot's `model.safetensors.index.json` names is
+/// present. A snapshot without an index has nothing to check.
+///
+/// ⚠️ A download interrupted after the index but before the last shard (a
+/// 429 from the Hub does it) leaves a snapshot with `config.json` that is
+/// missing weights. Treating that as cached made every retry return early, so
+/// the gap could never be filled, and the load then failed on the missing
+/// shard. A missing blob behind a snapshot symlink reads as absent here.
+fn shards_complete(snapshot: &std::path::Path) -> bool {
+    let Ok(index) = std::fs::read_to_string(snapshot.join("model.safetensors.index.json")) else {
+        return true;
+    };
+    let Ok(index) = serde_json::from_str::<serde_json::Value>(&index) else {
+        return false;
+    };
+    let Some(weight_map) = index.get("weight_map").and_then(|m| m.as_object()) else {
+        return false;
+    };
+    weight_map
+        .values()
+        .filter_map(|shard| shard.as_str())
+        .all(|shard| snapshot.join(shard).exists())
 }
 
 /// Check if a dataset is already cached locally and return its path.
@@ -181,3 +205,54 @@ pub fn cache_size() -> Result<u64> {
 }
 
 // Note: walkdir dependency would need to be added to Cargo.toml
+
+#[cfg(test)]
+mod tests {
+    use super::shards_complete;
+
+    fn snapshot(name: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("pmetal-hub-cache-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("model.safetensors.index.json"),
+            r#"{"weight_map": {"a.w": "model-00001-of-00002.safetensors",
+                               "b.w": "model-00002-of-00002.safetensors"}}"#,
+        )
+        .unwrap();
+        dir
+    }
+
+    /// The shape a 429 left behind: the index and the first shard, with the
+    /// second shard's snapshot symlink pointing at a blob that never arrived.
+    #[test]
+    fn a_snapshot_missing_a_shard_is_not_cached() {
+        let dir = snapshot("partial");
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), b"x").unwrap();
+        std::os::unix::fs::symlink(
+            dir.join("never-downloaded-blob"),
+            dir.join("model-00002-of-00002.safetensors"),
+        )
+        .unwrap();
+        assert!(!shards_complete(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_snapshot_with_every_shard_is_cached() {
+        let dir = snapshot("complete");
+        std::fs::write(dir.join("model-00001-of-00002.safetensors"), b"x").unwrap();
+        std::fs::write(dir.join("model-00002-of-00002.safetensors"), b"x").unwrap();
+        assert!(shards_complete(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_single_file_snapshot_has_nothing_to_check() {
+        let dir = snapshot("single");
+        std::fs::remove_file(dir.join("model.safetensors.index.json")).unwrap();
+        assert!(shards_complete(&dir));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
