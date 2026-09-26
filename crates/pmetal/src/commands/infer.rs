@@ -553,6 +553,10 @@ pub(crate) async fn run_inference(
     // ── Generation dispatch ────────────────────────────────────────────────
     let start = std::time::Instant::now();
     let mut already_streamed = false;
+    // ⚠️ The native engines load their weights inside the dispatch below, so
+    // `start` measures load + prefill + decode. Reporting that as generation
+    // time made a 1 s generation read as 30 s.
+    let mut first_token_at: Option<std::time::Instant> = None;
 
     let output = {
         // ANE branch: separate engine with its own weight loading and KV cache
@@ -695,6 +699,7 @@ pub(crate) async fn run_inference(
                 pmetal_data::stream_format::StreamFormatter::new(tokenizer, show_thinking);
             runner.state.generate_streaming(|token_id| {
                 use std::io::Write;
+                first_token_at.get_or_insert_with(std::time::Instant::now);
                 let delta = formatter.push_token(tokenizer, token_id);
                 if !delta.is_empty() {
                     let _ = std::io::stdout().write_all(delta.as_bytes());
@@ -734,11 +739,19 @@ pub(crate) async fn run_inference(
     // Ensure a clean newline between streamed output and stats
     println!();
     println!("---");
-    println!(
-        "Generated {} tokens in {:.2}s",
-        output.num_generated,
-        elapsed.as_secs_f64(),
-    );
+    match first_token_at {
+        Some(first) => println!(
+            "Generated {} tokens in {:.2}s ({:.2}s to the first token, model load included)",
+            output.num_generated,
+            (elapsed - (first - start)).as_secs_f64(),
+            (first - start).as_secs_f64(),
+        ),
+        None => println!(
+            "Generated {} tokens in {:.2}s",
+            output.num_generated,
+            elapsed.as_secs_f64(),
+        ),
+    }
     if output.stopped_by_token {
         println!("Stopped by: EOS token");
     } else {
