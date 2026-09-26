@@ -14,7 +14,7 @@ default:
 # Runs every check that CI performs. If this passes, publish is safe.
 
 # Full pre-publish validation (mirrors CI + release pipelines)
-preflight: fmt-check lint lint-all-features test test-release check-gui check-version check-lockfile
+preflight: fmt-check lint lint-all-features test test-release check-gui lint-gui check-version check-lockfile
     @echo ""
     @echo "All preflight checks passed -- safe to publish {{ version }}"
 
@@ -61,9 +61,22 @@ check:
 build-cli:
     PMETAL_MLX_STATIC=1 cargo build --release -p pmetal --features serve,mcp
 
+# Typecheck and build the GUI frontend.
+#
+# The Rust side needs this first: `tauri::generate_context!` embeds
+# `frontendDist` at compile time and panics when the directory is missing, so
+# `check-gui` used to pass only on a checkout where someone had already built
+# the frontend.
+gui-frontend:
+    cd crates/pmetal-gui && bun install --frozen-lockfile && bun run check && bun run build
+
 # Check GUI compiles (mirrors release CI -- catches cfg mismatches)
-check-gui:
+check-gui: gui-frontend
     cargo check --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml
+
+# Clippy for the GUI crate, which `--workspace` does not reach (see `fmt`).
+lint-gui: gui-frontend
+    cargo clippy --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml --all-targets -- -D warnings
 
 # Stage the CLI sidecar + metallib the release bundle expects.
 #

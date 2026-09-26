@@ -2800,6 +2800,9 @@ fn try_add_adapter(
     });
 }
 
+// Each argument is a named field of the frontend's `invoke` payload, so
+// bundling them into a struct would change the call the Svelte side makes.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub async fn quantize_model(
     _app_handle: AppHandle,
