@@ -6,7 +6,7 @@
 //! - [`LoggingCallback`] - Basic logging with tracing
 //! - [`CheckpointCallback`] - Checkpoint event logging
 //! - [`MetricsJsonCallback`] - JSONL metrics file (Wandb-compatible import)
-//! - [`TensorBoardCallback`] - TensorBoard logging (requires `tensorboard` feature)
+//! - [`TensorBoardCallback`] - TensorBoard event files
 //!
 //! # Wandb Integration
 //!
@@ -15,14 +15,6 @@
 //!
 //! ```bash
 //! wandb sync --include-offline --include-synced path/to/metrics.jsonl
-//! ```
-//!
-//! # TensorBoard Integration
-//!
-//! Enable the `tensorboard` feature to use [`TensorBoardCallback`]:
-//!
-//! ```toml
-//! pmetal-trainer = { version = "0.1", features = ["tensorboard"] }
 //! ```
 
 use pmetal_core::{EvalMetrics, StepMetrics, TrainingCallback};
@@ -318,14 +310,6 @@ impl TrainingCallback for MetricsJsonCallback {
 /// Writes training metrics to TensorBoard event files that can be viewed
 /// using `tensorboard --logdir <path>`.
 ///
-/// # Feature Flag
-///
-/// Requires the `tensorboard` feature:
-///
-/// ```toml
-/// pmetal-trainer = { version = "0.1", features = ["tensorboard"] }
-/// ```
-///
 /// # Example
 ///
 /// ```ignore
@@ -334,14 +318,12 @@ impl TrainingCallback for MetricsJsonCallback {
 /// let callback = TensorBoardCallback::new("./output/tensorboard")?;
 /// trainer.add_callback(Box::new(callback));
 /// ```
-#[cfg(feature = "tensorboard")]
 pub struct TensorBoardCallback {
-    writer: tensorboard_rs::summary_writer::SummaryWriter,
+    writer: crate::tensorboard::EventWriter,
     log_dir: PathBuf,
     current_epoch: usize,
 }
 
-#[cfg(feature = "tensorboard")]
 impl TensorBoardCallback {
     /// Create a new TensorBoard callback.
     ///
@@ -351,13 +333,10 @@ impl TensorBoardCallback {
     ///
     /// # Errors
     ///
-    /// Returns an error if the directory cannot be created.
+    /// Returns an error if the directory or event file cannot be created.
     pub fn new(log_dir: impl AsRef<Path>) -> std::io::Result<Self> {
         let log_dir = log_dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&log_dir)?;
-
-        let writer =
-            tensorboard_rs::summary_writer::SummaryWriter::new(&log_dir.display().to_string());
+        let writer = crate::tensorboard::EventWriter::new(&log_dir)?;
 
         Ok(Self {
             writer,
@@ -372,7 +351,6 @@ impl TensorBoardCallback {
     }
 }
 
-#[cfg(feature = "tensorboard")]
 impl TrainingCallback for TensorBoardCallback {
     fn on_train_start(&mut self) {
         tracing::info!(
@@ -382,7 +360,7 @@ impl TrainingCallback for TensorBoardCallback {
     }
 
     fn on_train_end(&mut self) {
-        self.writer.flush();
+        let _ = self.writer.flush();
         tracing::info!("TensorBoard logging complete");
     }
 
@@ -391,28 +369,28 @@ impl TrainingCallback for TensorBoardCallback {
     }
 
     fn on_epoch_end(&mut self, epoch: usize, metrics: &EvalMetrics) {
-        use std::collections::HashMap;
-
-        let mut scalars = HashMap::new();
-        scalars.insert("epoch_loss".to_string(), metrics.loss as f32);
-        scalars.insert("epoch_perplexity".to_string(), metrics.perplexity as f32);
-
-        self.writer.add_scalars("epoch", &scalars, epoch);
-        self.writer.flush();
+        let _ = self.writer.add_scalars(
+            &[
+                ("epoch/loss", metrics.loss as f32),
+                ("epoch/perplexity", metrics.perplexity as f32),
+            ],
+            epoch as i64,
+        );
+        let _ = self.writer.flush();
     }
 
     fn on_step_end(&mut self, step: usize, loss: f64) {
-        use std::collections::HashMap;
-
-        let mut scalars = HashMap::new();
-        scalars.insert("loss".to_string(), loss as f32);
-        scalars.insert("epoch".to_string(), self.current_epoch as f32);
-
-        self.writer.add_scalars("train", &scalars, step);
+        let _ = self.writer.add_scalars(
+            &[
+                ("train/loss", loss as f32),
+                ("train/epoch", self.current_epoch as f32),
+            ],
+            step as i64,
+        );
 
         // Flush every 50 steps to reduce I/O overhead
         if step % 50 == 0 {
-            self.writer.flush();
+            let _ = self.writer.flush();
         }
     }
 }

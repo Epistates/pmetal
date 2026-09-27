@@ -11,7 +11,8 @@ categories.workspace = true
 
 [features]
 default = ["ane", "hub"]
-tensorboard = ["dep:tensorboard-rs"]
+# No-op: TensorBoard logging is always built. Kept so manifests naming it still resolve.
+tensorboard = []
 ane = ["pmetal-metal/ane", "pmetal-core/ane"]
 hub = ["dep:pmetal-hub"]
 distributed = ["dep:pmetal-distributed"]
@@ -43,8 +44,9 @@ arrow = { workspace = true }
 parquet = { workspace = true }
 image = "0.25"
 
-# Optional: TensorBoard logging
-tensorboard-rs = { version = "0.5", optional = true }
+# TensorBoard event files
+prost = "0.14"
+crc = "3.4"
 
 [dev-dependencies]
 serial_test = "4"

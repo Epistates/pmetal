@@ -111,6 +111,7 @@ pub mod scheduler;
 pub mod sft;
 #[cfg(feature = "experimental-trainers")]
 pub mod simpo;
+pub mod tensorboard;
 pub mod training_loop;
 
 #[cfg(feature = "distributed")]
