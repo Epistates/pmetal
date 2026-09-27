@@ -12,7 +12,7 @@
 # `rust-version` in Cargo.toml (the MSRV we promise to library consumers) is a
 # separate, lower number and is not what this file pins.
 [toolchain]
-channel = "1.98.0"
+channel = "1.98.1"
 components = ["rustfmt", "clippy"]
 targets = ["aarch64-apple-darwin"]
 profile = "minimal"

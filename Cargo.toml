@@ -27,7 +27,7 @@ members = [
 [workspace.package]
 version = "0.6.0"
 edition = "2024"
-rust-version = "1.89"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/epistates/pmetal"
 keywords = ["machine-learning", "llm", "fine-tuning", "apple-silicon", "mlx"]
@@ -55,7 +55,7 @@ pmetal-serve = { path = "crates/pmetal-serve", version = "0.6.0" }
 pmetal-mcp = { path = "crates/pmetal-mcp", version = "0.6.0" }
 
 # Async runtime
-tokio = { version = "1.52", features = ["full"] }
+tokio = { version = "1.53", features = ["full"] }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
@@ -74,18 +74,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 
 # Data formats
-safetensors = "0.7"
+safetensors = "0.8"
 arrow = "60"
 parquet = "60"
 arrow-array = "60"
 arrow-json = "60"
 
 # HuggingFace integration
-hf-hub = "0.5"
+hf-hub = "1.0"
 tokenizers = "0.23"
 reqwest = { version = "0.13", features = ["json", "multipart", "stream", "rustls"] }
 sha2 = "0.11"
-base64 = "0.22"
+base64 = "0.23"
 
 # Jinja template engine for executing upstream chat_template strings from
 # tokenizer_config.json. `minijinja-contrib` adds the `now`/`strftime_now`
@@ -119,13 +119,13 @@ ndarray = { version = "0.17", features = ["rayon"] }
 rand = "0.10"
 indicatif = "0.18"
 humansize = "2"
-dirs = "6"
+dirs = "7"
 walkdir = "2"
 memmap2 = "0.9"
 
 # Python bindings
-pyo3 = "0.28"
-pyo3-build-config = "0.28"
+pyo3 = "0.29"
+pyo3-build-config = "0.29"
 
 # Testing
 criterion = "0.8"

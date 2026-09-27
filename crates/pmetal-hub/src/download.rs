@@ -1,21 +1,71 @@
 //! Model and dataset downloading from HuggingFace Hub.
 
-use hf_hub::api::tokio::{Api, ApiBuilder};
-use hf_hub::{Repo, RepoType};
+use hf_hub::{
+    HFClient, HFError, HFRepository, HFResult, RepoType, RepoTypeDataset, RepoTypeModel, split_id,
+};
 use pmetal_core::{Result, SecretString};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-/// Build API with optional token authentication.
-fn build_api(token: Option<&SecretString>) -> Result<Api> {
-    let mut builder = ApiBuilder::from_env();
+/// Build a client with optional token authentication.
+///
+/// The cache directory is pmetal's own resolution, so a download lands where
+/// [`crate::cache::find_cached_model`] looks for it.
+fn build_client(token: Option<&SecretString>) -> Result<HFClient> {
+    let mut builder = HFClient::builder().cache_dir(crate::cache::cache_dir());
 
     if let Some(secret) = token {
-        builder = builder.with_token(Some(secret.expose_secret().to_string()));
+        builder = builder.token(secret.expose_secret());
     }
 
-    builder
-        .build()
-        .map_err(|e| pmetal_core::PMetalError::Hub(e.to_string()))
+    builder.build().map_err(hub_error)
+}
+
+fn hub_error(e: HFError) -> pmetal_core::PMetalError {
+    pmetal_core::PMetalError::Hub(e.to_string())
+}
+
+/// A repository handle pinned to one revision (`None` is the default branch).
+struct Repo<T: RepoType> {
+    handle: HFRepository<T>,
+    revision: Option<String>,
+}
+
+impl<T: RepoType> Repo<T> {
+    /// Download `filename` into the cache and return its snapshot path.
+    async fn get(&self, filename: &str) -> HFResult<PathBuf> {
+        self.handle
+            .download_file()
+            .filename(filename)
+            .maybe_revision(self.revision.clone())
+            .send()
+            .await
+    }
+}
+
+fn model_repo(client: &HFClient, id: &str, revision: Option<&str>) -> Repo<RepoTypeModel> {
+    let (owner, name) = split_id(id);
+    Repo {
+        handle: client.model(owner, name),
+        revision: revision.map(str::to_owned),
+    }
+}
+
+fn dataset_repo(client: &HFClient, id: &str, revision: Option<&str>) -> Repo<RepoTypeDataset> {
+    let (owner, name) = split_id(id);
+    Repo {
+        handle: client.dataset(owner, name),
+        revision: revision.map(str::to_owned),
+    }
+}
+
+/// The snapshot directory a downloaded repo file lives under.
+///
+/// `path` ends in the repo-relative `filename`, which can be nested
+/// (`data/train-00000.parquet`), so its parent is not always the snapshot root.
+fn snapshot_root(path: &Path, filename: &str) -> Option<PathBuf> {
+    path.ancestors()
+        .nth(Path::new(filename).components().count())
+        .map(PathBuf::from)
 }
 
 /// Files to skip during full-repo download (large binaries, metadata, etc.).
@@ -76,26 +126,22 @@ pub async fn download_model(
         }
     }
 
-    let api = build_api(token)?;
-
-    let repo = match revision {
-        Some(rev) => api.repo(Repo::with_revision(
-            model_id.to_string(),
-            RepoType::Model,
-            rev.to_string(),
-        )),
-        None => api.model(model_id.to_string()),
-    };
+    let client = build_client(token)?;
+    let repo = model_repo(&client, model_id, revision);
 
     // List all files in the repository
     let repo_info = repo
+        .handle
         .info()
+        .maybe_revision(repo.revision.clone())
+        .send()
         .await
         .map_err(|e| pmetal_core::PMetalError::Hub(format!("Failed to list repo files: {e}")))?;
 
     let all_files: Vec<&str> = repo_info
         .siblings
         .iter()
+        .flatten()
         .map(|s| s.rfilename.as_str())
         .collect();
 
@@ -184,7 +230,7 @@ pub async fn download_model(
                 downloaded += 1;
                 // Capture model directory from the first downloaded file
                 if model_dir.is_none() {
-                    model_dir = path.parent().map(PathBuf::from);
+                    model_dir = snapshot_root(&path, filename);
                 }
             }
             Err(e) => {
@@ -281,20 +327,11 @@ pub async fn download_file(
     revision: Option<&str>,
     token: Option<&SecretString>,
 ) -> Result<PathBuf> {
-    let api = build_api(token)?;
-
-    let repo = match revision {
-        Some(rev) => api.repo(Repo::with_revision(
-            model_id.to_string(),
-            RepoType::Model,
-            rev.to_string(),
-        )),
-        None => api.model(model_id.to_string()),
-    };
-
-    repo.get(filename)
+    let client = build_client(token)?;
+    model_repo(&client, model_id, revision)
+        .get(filename)
         .await
-        .map_err(|e| pmetal_core::PMetalError::Hub(e.to_string()))
+        .map_err(hub_error)
 }
 
 /// Download all safetensors files for a model.
@@ -308,16 +345,8 @@ pub async fn download_safetensors(
     revision: Option<&str>,
     token: Option<&SecretString>,
 ) -> Result<Vec<PathBuf>> {
-    let api = build_api(token)?;
-
-    let repo = match revision {
-        Some(rev) => api.repo(Repo::with_revision(
-            model_id.to_string(),
-            RepoType::Model,
-            rev.to_string(),
-        )),
-        None => api.model(model_id.to_string()),
-    };
+    let client = build_client(token)?;
+    let repo = model_repo(&client, model_id, revision);
 
     // Try to get model.safetensors first (single file models)
     if let Ok(path) = repo.get("model.safetensors").await {
@@ -391,26 +420,22 @@ pub async fn download_dataset(
         }
     }
 
-    let api = build_api(token)?;
-
-    let repo = match revision {
-        Some(rev) => api.repo(Repo::with_revision(
-            dataset_id.to_string(),
-            RepoType::Dataset,
-            rev.to_string(),
-        )),
-        None => api.repo(Repo::new(dataset_id.to_string(), RepoType::Dataset)),
-    };
+    let client = build_client(token)?;
+    let repo = dataset_repo(&client, dataset_id, revision);
 
     let repo_info = repo
+        .handle
         .info()
+        .maybe_revision(repo.revision.clone())
+        .send()
         .await
         .map_err(|e| pmetal_core::PMetalError::Hub(format!("Failed to list repo files: {e}")))?;
 
-    let mut downloaded_paths = Vec::new();
+    let mut dataset_dir: Option<PathBuf> = None;
+    let mut data_files_downloaded = 0usize;
     let mut data_failures = Vec::new();
 
-    for sibling in &repo_info.siblings {
+    for sibling in repo_info.siblings.iter().flatten() {
         let filename = sibling.rfilename.as_str();
         if filename.starts_with('.') {
             continue;
@@ -425,7 +450,14 @@ pub async fn download_dataset(
         }
 
         match repo.get(filename).await {
-            Ok(path) => downloaded_paths.push(path),
+            Ok(path) => {
+                if is_data_file {
+                    data_files_downloaded += 1;
+                }
+                if dataset_dir.is_none() {
+                    dataset_dir = snapshot_root(&path, filename);
+                }
+            }
             Err(err) => {
                 if is_data_file {
                     data_failures.push(format!("{filename}: {err}"));
@@ -436,16 +468,6 @@ pub async fn download_dataset(
             }
         }
     }
-
-    // Count only successfully-downloaded data files (not README.md).
-    let data_files_downloaded = downloaded_paths
-        .iter()
-        .filter(|p| {
-            p.file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n != "README.md")
-        })
-        .count();
 
     if data_files_downloaded == 0 {
         if !data_failures.is_empty() {
@@ -477,10 +499,9 @@ pub async fn download_dataset(
         )));
     }
 
-    Ok(downloaded_paths[0]
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(".")))
+    dataset_dir.ok_or_else(|| {
+        pmetal_core::PMetalError::Hub(format!("No dataset files downloaded for {dataset_id}"))
+    })
 }
 
 /// Download dataset Parquet files from HuggingFace Hub.
@@ -502,16 +523,8 @@ pub async fn download_dataset_parquet(
     revision: Option<&str>,
     token: Option<&SecretString>,
 ) -> Result<Vec<PathBuf>> {
-    let api = build_api(token)?;
-
-    let repo = match revision {
-        Some(rev) => api.repo(Repo::with_revision(
-            dataset_id.to_string(),
-            RepoType::Dataset,
-            rev.to_string(),
-        )),
-        None => api.repo(Repo::new(dataset_id.to_string(), RepoType::Dataset)),
-    };
+    let client = build_client(token)?;
+    let repo = dataset_repo(&client, dataset_id, revision);
 
     let mut paths = Vec::new();
 
@@ -573,11 +586,7 @@ pub async fn download_dataset_parquet(
     }
 
     // Try using the parquet conversion branch which HuggingFace provides
-    let parquet_repo = api.repo(Repo::with_revision(
-        dataset_id.to_string(),
-        RepoType::Dataset,
-        "refs/convert/parquet".to_string(),
-    ));
+    let parquet_repo = dataset_repo(&client, dataset_id, Some("refs/convert/parquet"));
 
     // Try common paths in the parquet branch
     let parquet_patterns = [
@@ -617,18 +626,39 @@ pub async fn download_dataset_file(
     revision: Option<&str>,
     token: Option<&SecretString>,
 ) -> Result<PathBuf> {
-    let api = build_api(token)?;
-
-    let repo = match revision {
-        Some(rev) => api.repo(Repo::with_revision(
-            dataset_id.to_string(),
-            RepoType::Dataset,
-            rev.to_string(),
-        )),
-        None => api.repo(Repo::new(dataset_id.to_string(), RepoType::Dataset)),
-    };
-
-    repo.get(filename)
+    let client = build_client(token)?;
+    dataset_repo(&client, dataset_id, revision)
+        .get(filename)
         .await
-        .map_err(|e| pmetal_core::PMetalError::Hub(e.to_string()))
+        .map_err(hub_error)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::snapshot_root;
+    use std::path::Path;
+
+    #[test]
+    fn a_nested_file_resolves_to_its_snapshot_root() {
+        let snapshot = Path::new("/hub/datasets--o--n/snapshots/abc");
+        let file = snapshot.join("data/train-00000-of-00001.parquet");
+        assert_eq!(
+            snapshot_root(&file, "data/train-00000-of-00001.parquet").as_deref(),
+            Some(snapshot)
+        );
+        assert_eq!(
+            snapshot_root(&snapshot.join("config.json"), "config.json").as_deref(),
+            Some(snapshot)
+        );
+    }
+
+    /// Hits the Hub. `tatsu-lab/alpaca` keeps its data under `data/`.
+    #[tokio::test]
+    #[ignore = "network"]
+    async fn a_dataset_with_nested_files_downloads_to_its_snapshot_root() {
+        let dir = super::download_dataset("tatsu-lab/alpaca", None, Some("main"), None)
+            .await
+            .unwrap();
+        assert!(dir.join("data").is_dir(), "{}", dir.display());
+    }
 }

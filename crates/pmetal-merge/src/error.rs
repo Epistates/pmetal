@@ -54,7 +54,7 @@ pub enum MergeError {
 
     /// HuggingFace Hub error.
     #[error("Hub error: {0}")]
-    Hub(#[from] hf_hub::api::sync::ApiError),
+    Hub(#[from] hf_hub::HFError),
 
     /// Method requires base model but none provided.
     #[error("Base model required for {method} merge but not provided")]

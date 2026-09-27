@@ -3,39 +3,51 @@
 use pmetal_core::Result;
 use std::path::PathBuf;
 
+/// Get the HuggingFace home directory, resolved the way the Python
+/// `huggingface_hub` library does it.
+///
+/// Resolution order:
+/// 1. `HF_HOME`
+/// 2. `$XDG_CACHE_HOME/huggingface`
+/// 3. `~/.cache/huggingface` — default on all platforms
+fn hf_home() -> PathBuf {
+    if let Some(home) = std::env::var_os("HF_HOME") {
+        return PathBuf::from(home);
+    }
+    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+        return PathBuf::from(xdg).join("huggingface");
+    }
+    dirs::home_dir()
+        .unwrap_or_default()
+        .join(".cache")
+        .join("huggingface")
+}
+
 /// Get the HuggingFace hub cache directory.
 ///
-/// Respects `HF_HOME` and `HF_HUB_CACHE` environment variables, matching
-/// the behavior of the `hf-hub` crate and the Python `huggingface_hub` library.
+/// Every download goes through a client pointed at this directory, so the
+/// cache lookups here and the downloads agree by construction.
 ///
 /// Resolution order:
 /// 1. `HF_HUB_CACHE` — direct override for the hub cache directory
-/// 2. `HF_HOME/hub` — if `HF_HOME` is set
-/// 3. `~/.cache/huggingface/hub` — default on all platforms
+/// 2. `HUGGINGFACE_HUB_CACHE` — its legacy name
+/// 3. `<HF home>/hub`
 pub fn cache_dir() -> PathBuf {
-    // HF_HUB_CACHE takes highest priority (direct path to hub cache)
-    if let Ok(hub_cache) = std::env::var("HF_HUB_CACHE") {
-        return PathBuf::from(hub_cache);
-    }
-    // Use hf-hub crate's Cache::from_env() which handles HF_HOME
-    hf_hub::Cache::from_env().path().clone()
+    std::env::var_os("HF_HUB_CACHE")
+        .or_else(|| std::env::var_os("HUGGINGFACE_HUB_CACHE"))
+        .map(PathBuf::from)
+        .unwrap_or_else(|| hf_home().join("hub"))
 }
 
 /// Get the HuggingFace datasets cache directory.
 ///
 /// Resolution order:
 /// 1. `HF_DATASETS_CACHE` — direct override
-/// 2. `HF_HOME/datasets` — if `HF_HOME` is set
-/// 3. `~/.cache/huggingface/datasets` — default on all platforms
+/// 2. `<HF home>/datasets`
 pub fn datasets_cache_dir() -> PathBuf {
-    if let Ok(ds_cache) = std::env::var("HF_DATASETS_CACHE") {
-        return PathBuf::from(ds_cache);
-    }
-    // hf_hub::Cache path points to <root>/hub, go up one level and add datasets
-    let mut path = hf_hub::Cache::from_env().path().clone();
-    path.pop(); // remove "hub"
-    path.push("datasets");
-    path
+    std::env::var_os("HF_DATASETS_CACHE")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| hf_home().join("datasets"))
 }
 
 /// Get the pmetal-specific cache directory (for non-HF local state).

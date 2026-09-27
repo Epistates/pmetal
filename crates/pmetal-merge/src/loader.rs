@@ -594,18 +594,23 @@ impl ModelSource {
             Self::Hub { repo_id, revision } => {
                 info!("Downloading model from Hub: {}", repo_id);
 
-                let api = hf_hub::api::sync::ApiBuilder::from_env().build()?;
-                let repo = match revision {
-                    Some(rev) => api.repo(hf_hub::Repo::with_revision(
-                        repo_id.clone(),
-                        hf_hub::RepoType::Model,
-                        rev.clone(),
-                    )),
-                    None => api.model(repo_id.clone()),
+                let client = hf_hub::HFClientSync::new()?;
+                let (owner, name) = hf_hub::split_id(repo_id);
+                let repo = client.model(owner, name);
+                let get = |filename: &str| {
+                    repo.download_file()
+                        .filename(filename)
+                        .maybe_revision(revision.clone())
+                        .send()
                 };
 
                 // Download all safetensors files
-                let files = repo.info()?.siblings;
+                let files = repo
+                    .info()
+                    .maybe_revision(revision.clone())
+                    .send()?
+                    .siblings
+                    .unwrap_or_default();
                 let safetensor_files: Vec<_> = files
                     .iter()
                     .filter(|f| f.rfilename.ends_with(".safetensors"))
@@ -619,7 +624,7 @@ impl ModelSource {
                 }
 
                 // Download first file to get the directory
-                let first = repo.get(&safetensor_files[0].rfilename)?;
+                let first = get(&safetensor_files[0].rfilename)?;
                 let model_dir = first
                     .parent()
                     .ok_or_else(|| {
@@ -632,7 +637,7 @@ impl ModelSource {
 
                 // Download remaining files
                 for file in &safetensor_files[1..] {
-                    let _ = repo.get(&file.rfilename)?;
+                    let _ = get(&file.rfilename)?;
                 }
 
                 Ok(Box::new(SafetensorsLoader::new(model_dir)?))

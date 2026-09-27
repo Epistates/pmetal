@@ -20,7 +20,7 @@ pmetal-metal = { workspace = true }
 pmetal-hub = { workspace = true }
 
 # MCP server framework
-turbomcp = { version = "3.1.3", features = ["stdio"] }
+turbomcp = { version = "3.5.0", features = ["stdio"] }
 
 # Async runtime
 tokio = { workspace = true }

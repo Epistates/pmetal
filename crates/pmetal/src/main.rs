@@ -1357,8 +1357,13 @@ fn init_logging(component: &str, suppress_stderr: bool) {
         path
     };
 
+    // hf-hub's Xet transfer client logs every request at INFO, several lines
+    // per downloaded file. Hold it (`xet_*` and `hf_xet`) to warnings; a
+    // more specific `RUST_LOG=xet_client=info` still wins.
     let filter = tracing_subscriber::EnvFilter::from_default_env()
-        .add_directive(tracing::Level::INFO.into());
+        .add_directive(tracing::Level::INFO.into())
+        .add_directive("xet=warn".parse().expect("static directive"))
+        .add_directive("hf_xet=warn".parse().expect("static directive"));
 
     if suppress_stderr {
         // TUI: file only (no stderr to avoid corrupting terminal)

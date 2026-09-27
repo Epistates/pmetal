@@ -179,17 +179,18 @@ impl BigVGAN {
 
     /// Load pretrained model from HuggingFace Hub.
     pub fn from_pretrained(model_id: &str) -> Result<Self> {
-        use hf_hub::api::sync::ApiBuilder;
-
-        let api = ApiBuilder::from_env()
-            .build()
-            .map_err(|e| VocoderError::Hub(e.to_string()))?;
-        let repo = api.model(model_id.to_string());
+        let client = hf_hub::HFClientSync::new().map_err(|e| VocoderError::Hub(e.to_string()))?;
+        let (owner, name) = hf_hub::split_id(model_id);
+        let repo = client.model(owner, name);
+        let get = |filename: &str| {
+            repo.download_file()
+                .filename(filename)
+                .send()
+                .map_err(|e| VocoderError::Hub(e.to_string()))
+        };
 
         // Download config
-        let config_path = repo
-            .get("config.json")
-            .map_err(|e| VocoderError::Hub(e.to_string()))?;
+        let config_path = get("config.json")?;
         let config_str = std::fs::read_to_string(&config_path).map_err(VocoderError::from)?;
         let config: BigVGANConfig =
             serde_json::from_str(&config_str).map_err(|e| VocoderError::Config(e.to_string()))?;
@@ -198,9 +199,7 @@ impl BigVGAN {
         let mut model = Self::new(config)?;
 
         // Download and load weights
-        let weights_path = repo
-            .get("model.safetensors")
-            .map_err(|e| VocoderError::Hub(e.to_string()))?;
+        let weights_path = get("model.safetensors")?;
         model.load_weights(&weights_path)?;
 
         Ok(model)

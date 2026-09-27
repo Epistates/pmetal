@@ -26,7 +26,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install maturin
-        run: pip install "maturin>=1.8"
+        run: pip install "maturin>=1.15,<2.0"
 
       - name: Build wheel
         working-directory: crates/pmetal-py
