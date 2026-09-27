@@ -5,7 +5,7 @@ use std::{env, path::PathBuf, process::Command};
 ///
 /// Currently a commit: see `cmake/CMakeLists.txt` for which kernels and
 /// quantized-matmul fixes v0.32.2 is missing.
-const BUNDLED_MLX_GIT_TAG: &str = "7241f12e631440387a2156ec1018d1c9fe8e56b9";
+const BUNDLED_MLX_GIT_TAG: &str = "09e67c686f627ca371ebcce82f8f79110d8e186e";
 
 // ── Deployment target ──────────────────────────────────────────────────────
 

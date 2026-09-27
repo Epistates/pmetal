@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **Every dependency is at its latest release**, with all lockfiles regenerated from scratch. Majors: `hf-hub` 1.0, `safetensors` 0.8, `base64` 0.23, `pyo3` 0.29, `dirs` 7
   - `hf-hub` 1.0 is a rewrite. Downloads now use Hugging Face's Xet transfer protocol and retry 429 and 5xx responses on their own. The Xet client's per-request INFO logging is held to warnings in the CLI
+  - Bundled MLX moved to upstream `main` (`09e67c6`), which adds a Metal fence deadlock fix, lower SDPA memory use at head dims 256 and 512, and a faster gather matmul
 - **MSRV**: Raised workspace `rust-version` to 1.91. The 1.89 it declared no longer built: `ordered-float` needs 1.90 and `hf-hub`'s Xet client needs 1.91, verified with `cargo +1.91 check`
 
 ### Fixed

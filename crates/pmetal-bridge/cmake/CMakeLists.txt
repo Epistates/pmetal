@@ -25,7 +25,7 @@ set(MLX_BUILD_PYTHON_BINDINGS OFF)
 FetchContent_Declare(
   mlx
   GIT_REPOSITORY "https://github.com/ml-explore/mlx.git"
-  GIT_TAG 7241f12e631440387a2156ec1018d1c9fe8e56b9)
+  GIT_TAG 09e67c686f627ca371ebcce82f8f79110d8e186e)
 FetchContent_MakeAvailable(mlx)
 
 # ── Expose include dir and libmlx.a for the cc::Build step ──
