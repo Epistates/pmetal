@@ -202,14 +202,11 @@ jobs:
         with:
           node-version: '24'
 
-      - uses: pnpm/action-setup@v6
-        with:
-          version: 10.32.1
-          run_install: false
-
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # `packageManager` in package.json pins it, so CI installs with the
+          # bun that wrote bun.lock and --frozen-lockfile can't disagree.
+          bun-version-file: crates/pmetal-gui/package.json
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -254,7 +251,7 @@ jobs:
 
       - name: Install frontend dependencies
         working-directory: crates/pmetal-gui
-        run: pnpm install --frozen-lockfile
+        run: bun install --frozen-lockfile
 
       # macOS Code Signing
       - name: Import Apple Code Signing Certificate
@@ -294,6 +291,7 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: crates/pmetal-gui
+          tauriScript: bun tauri
           # tauri.bundle.conf.json carries externalBin/resources and is merged
           # only here, so `bun tauri dev` still works without a staged sidecar.
           args: --target aarch64-apple-darwin -c src-tauri/tauri.bundle.conf.json

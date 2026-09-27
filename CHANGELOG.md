@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Bundled MLX moved to upstream `main` (`09e67c6`), which adds a Metal fence deadlock fix, lower SDPA memory use at head dims 256 and 512, and a faster gather matmul
 - **MSRV**: Raised workspace `rust-version` to 1.91. The 1.89 it declared no longer built: `ordered-float` needs 1.90 and `hf-hub`'s Xet client needs 1.91, verified with `cargo +1.91 check`
 - **TensorBoard logging is always built** and writes its event files with pmetal's own writer (`pmetal_trainer::tensorboard::EventWriter`, on `prost` and `crc`). The `tensorboard-rs` crate it replaces had been unmaintained since 2022 and pulled in `protobuf` 2.28 (RUSTSEC-2024-0437) and 15 other crates. The `tensorboard` feature is now a no-op, kept so manifests that name it still resolve. Each metric is now its own tag in one event file (`train/loss`, `train/epoch`, `epoch/loss`, `epoch/perplexity`). `tensorboard-rs` wrote each metric to its own run subdirectory (`log_dir/train/loss/`) under the shared tag `train`, which drew loss and epoch number on one chart
+- **The GUI uses bun alone.** The release build installed from `pnpm-lock.yaml` while local builds and preflight used `bun.lock`, so a release could ship frontend dependencies nobody had built locally. `pnpm-lock.yaml` is gone, and `packageManager` in `package.json` pins the bun version CI installs
 
 ### Fixed
 
