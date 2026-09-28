@@ -53,6 +53,8 @@ pmetal-mhc = { path = "crates/pmetal-mhc", version = "0.6.0" }
 pmetal-distributed = { path = "crates/pmetal-distributed", version = "0.6.0" }
 pmetal-serve = { path = "crates/pmetal-serve", version = "0.6.0" }
 pmetal-mcp = { path = "crates/pmetal-mcp", version = "0.6.0" }
+# The CLI crate, as a library. Renamed because pmetal-py's own lib is `pmetal`.
+pmetal-lib = { package = "pmetal", path = "crates/pmetal", version = "0.6.0", default-features = false }
 
 # Async runtime
 tokio = { version = "1.53", features = ["full"] }

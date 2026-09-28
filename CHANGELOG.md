@@ -19,6 +19,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Dataset downloads returned the wrong directory when the first file was nested** (`data/train-….parquet`), because the snapshot root was taken as the parent of that file
+- **`pmetal-py` could not be published to crates.io**: its dependency on the `pmetal` crate was a bare path with no version, which `cargo publish` rejects. It now inherits `pmetal-lib` from the workspace table, so `just bump` keeps the version current
 
 ## [0.6.0] - 2026-09-10
 
