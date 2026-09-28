@@ -1,0 +1,66 @@
+# cargo-deny policy: `just deny`, run by `just preflight`.
+#
+# Licenses are permissive-only. Anything else needs a named exception below,
+# with the reason it's acceptable, so a new copyleft crate fails the check
+# instead of arriving unnoticed with a lockfile update.
+#
+# The same file covers the Tauri GUI (`crates/pmetal-gui/src-tauri`), which
+# is a separate workspace; cargo-deny finds this file by walking up from its
+# manifest.
+
+[graph]
+# The only target pmetal builds or ships. Other targets' dependencies
+# (windows-*, wasm-bindgen, r-efi) never compile, so they aren't checked.
+targets = ["aarch64-apple-darwin"]
+# Optional features are shipped too: check every dependency any of them adds.
+all-features = true
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0436", reason = "paste is unmaintained, not vulnerable. It is a build-time proc macro reached only through libp2p (netlink) and image (exr/pulp); the fix has to come from those crates." },
+]
+
+[licenses]
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]
+confidence-threshold = 0.8
+exceptions = [
+    # MPL-2.0 is file-level copyleft: it binds changes to the MPL files
+    # themselves, not the program that links them. Each of these is used
+    # unmodified from crates.io, which publishes its source.
+    { allow = ["MPL-2.0"], crate = "option-ext" },        # via dirs-sys (dirs, hf-hub)
+    { allow = ["MPL-2.0"], crate = "colored" },           # via xet-runtime, non-optional in hf-hub 1.0
+    { allow = ["MPL-2.0"], crate = "cssparser" },         # GUI only, via tauri-utils (kuchikiki)
+    { allow = ["MPL-2.0"], crate = "cssparser-macros" },  # GUI only, via cssparser
+    { allow = ["MPL-2.0"], crate = "dtoa-short" },        # GUI only, via cssparser
+    { allow = ["MPL-2.0"], crate = "selectors" },         # GUI only, via tauri-utils (kuchikiki)
+]
+# Both workspaces share this file, so an entry only one of them needs is
+# expected to go unused in the other.
+unused-allowed-license = "allow"
+unused-license-exception = "allow"
+
+[bans]
+# Duplicate versions come from upstream crates on different majors; they
+# cost build time, not correctness.
+multiple-versions = "allow"
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

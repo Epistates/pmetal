@@ -14,7 +14,7 @@ default:
 # Runs every check that CI performs. If this passes, publish is safe.
 
 # Full pre-publish validation (mirrors CI + release pipelines)
-preflight: fmt-check lint lint-all-features test test-release check-gui lint-gui check-version check-lockfile
+preflight: fmt-check lint lint-all-features test test-release check-gui lint-gui check-version check-lockfile deny
     @echo ""
     @echo "All preflight checks passed -- safe to publish {{ version }}"
 
@@ -231,9 +231,16 @@ doc:
 deps:
     cargo tree --workspace-only
 
-# Run security audit
+# License, advisory, ban and source policy from deny.toml (CI: deny job).
+# The GUI is a separate workspace, so it gets its own run against the same file.
+deny:
+    cargo deny check
+    cargo deny --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml check
+
+# Security advisories only, with deny.toml's reviewed ignores applied
 audit:
-    cargo audit
+    cargo deny check advisories
+    cargo deny --manifest-path crates/pmetal-gui/src-tauri/Cargo.toml check advisories
 
 # ─── Benchmarks ─────────────────────────────────────────────────────
 

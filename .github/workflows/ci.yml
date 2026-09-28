@@ -70,3 +70,19 @@ jobs:
       # Single-threaded to avoid Metal/GPU conflicts.
       - name: Run tests
         run: cargo test --workspace --exclude pmetal-py --profile ci -- --test-threads=1
+
+  # License, advisory, ban and source policy from deny.toml (`just deny`).
+  # It reads manifests and lockfiles, never builds, so it runs on Linux.
+  deny:
+    name: Deny
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
+      # The GUI is a separate workspace; same deny.toml, found by walking up.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          manifest-path: crates/pmetal-gui/src-tauri/Cargo.toml
