@@ -927,37 +927,27 @@ impl AppState {
     }
 
     pub async fn cancel_training_run(&self, id: &str) -> bool {
-        // Set cancellation flag first (avoids race with monitor task)
-        {
-            let flags = self.cancel_flags.read().await;
-            if let Some(flag) = flags.get(id) {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        // Kill the process if still running
-        {
-            let mut procs = self.active_processes.write().await;
-            if let Some(mut child) = procs.remove(id) {
-                let _ = child.kill().await;
-            }
-        }
-        // Mark as cancelled
-        let mut found = false;
-        let mut runs = self.training_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
-            if run.status == TrainingStatus::Running || run.status == TrainingStatus::Pending {
-                run.status = TrainingStatus::Cancelled;
-                run.ended_at = Some(Utc::now());
-                let _ = self
-                    .event_tx
-                    .send(AppEvent::TrainingUpdate { run: run.clone() });
-                let _ = self.event_tx.send(AppEvent::TrainingStopped {
-                    run_id: id.to_string(),
-                });
-            }
-            found = true;
-        }
-        found
+        self.cancel_job(
+            id,
+            &self.training_runs,
+            |run| run.id == id,
+            |run| {
+                let live = matches!(
+                    run.status,
+                    TrainingStatus::Running | TrainingStatus::Pending
+                );
+                if live {
+                    run.status = TrainingStatus::Cancelled;
+                    run.ended_at = Some(Utc::now());
+                }
+                live
+            },
+            |run| AppEvent::TrainingUpdate { run },
+            AppEvent::TrainingStopped {
+                run_id: id.to_string(),
+            },
+        )
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -998,36 +988,27 @@ impl AppState {
     }
 
     pub async fn cancel_distillation_run(&self, id: &str) -> bool {
-        {
-            let flags = self.cancel_flags.read().await;
-            if let Some(flag) = flags.get(id) {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        {
-            let mut procs = self.active_processes.write().await;
-            if let Some(mut child) = procs.remove(id) {
-                let _ = child.kill().await;
-            }
-        }
-        let mut found = false;
-        let mut runs = self.distillation_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
-            if run.status != DistillationStatus::Completed
-                && run.status != DistillationStatus::Failed
-            {
-                run.status = DistillationStatus::Cancelled;
-                run.ended_at = Some(Utc::now());
-                let _ = self
-                    .event_tx
-                    .send(AppEvent::DistillationUpdate { run: run.clone() });
-                let _ = self.event_tx.send(AppEvent::DistillationStopped {
-                    run_id: id.to_string(),
-                });
-            }
-            found = true;
-        }
-        found
+        self.cancel_job(
+            id,
+            &self.distillation_runs,
+            |run| run.id == id,
+            |run| {
+                let live = !matches!(
+                    run.status,
+                    DistillationStatus::Completed | DistillationStatus::Failed
+                );
+                if live {
+                    run.status = DistillationStatus::Cancelled;
+                    run.ended_at = Some(Utc::now());
+                }
+                live
+            },
+            |run| AppEvent::DistillationUpdate { run },
+            AppEvent::DistillationStopped {
+                run_id: id.to_string(),
+            },
+        )
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -1068,34 +1049,24 @@ impl AppState {
     }
 
     pub async fn cancel_grpo_run(&self, id: &str) -> bool {
-        {
-            let flags = self.cancel_flags.read().await;
-            if let Some(flag) = flags.get(id) {
-                flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        {
-            let mut procs = self.active_processes.write().await;
-            if let Some(mut child) = procs.remove(id) {
-                let _ = child.kill().await;
-            }
-        }
-        let mut found = false;
-        let mut runs = self.grpo_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
-            if run.status == GrpoStatus::Running || run.status == GrpoStatus::Pending {
-                run.status = GrpoStatus::Cancelled;
-                run.ended_at = Some(Utc::now());
-                let _ = self
-                    .event_tx
-                    .send(AppEvent::GrpoUpdate { run: run.clone() });
-                let _ = self.event_tx.send(AppEvent::GrpoStopped {
-                    run_id: id.to_string(),
-                });
-            }
-            found = true;
-        }
-        found
+        self.cancel_job(
+            id,
+            &self.grpo_runs,
+            |run| run.id == id,
+            |run| {
+                let live = matches!(run.status, GrpoStatus::Running | GrpoStatus::Pending);
+                if live {
+                    run.status = GrpoStatus::Cancelled;
+                    run.ended_at = Some(Utc::now());
+                }
+                live
+            },
+            |run| AppEvent::GrpoUpdate { run },
+            AppEvent::GrpoStopped {
+                run_id: id.to_string(),
+            },
+        )
+        .await
     }
 
     // -----------------------------------------------------------------------
@@ -1155,28 +1126,17 @@ impl AppState {
     }
 
     pub async fn cancel_bench_run(&self, id: &str) -> bool {
-        {
-            let mut procs = self.active_processes.write().await;
-            if let Some(mut child) = procs.remove(id) {
-                let _ = child.kill().await;
-            }
-        }
-        let mut found = false;
-        let mut runs = self.bench_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
-            if run.status == JobStatus::Running || run.status == JobStatus::Pending {
-                run.status = JobStatus::Cancelled;
-                run.ended_at = Some(Utc::now());
-                let _ = self
-                    .event_tx
-                    .send(AppEvent::BenchUpdate { run: run.clone() });
-                let _ = self.event_tx.send(AppEvent::BenchStopped {
-                    run_id: id.to_string(),
-                });
-            }
-            found = true;
-        }
-        found
+        self.cancel_job(
+            id,
+            &self.bench_runs,
+            |run| run.id == id,
+            |run| cancel_live_job(&mut run.status, &mut run.ended_at),
+            |run| AppEvent::BenchUpdate { run },
+            AppEvent::BenchStopped {
+                run_id: id.to_string(),
+            },
+        )
+        .await
     }
 
     pub async fn create_eval_run(&self, run: EvalRun) {
@@ -1204,28 +1164,17 @@ impl AppState {
     }
 
     pub async fn cancel_eval_run(&self, id: &str) -> bool {
-        {
-            let mut procs = self.active_processes.write().await;
-            if let Some(mut child) = procs.remove(id) {
-                let _ = child.kill().await;
-            }
-        }
-        let mut found = false;
-        let mut runs = self.eval_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
-            if run.status == JobStatus::Running || run.status == JobStatus::Pending {
-                run.status = JobStatus::Cancelled;
-                run.ended_at = Some(Utc::now());
-                let _ = self
-                    .event_tx
-                    .send(AppEvent::EvalUpdate { run: run.clone() });
-                let _ = self.event_tx.send(AppEvent::EvalStopped {
-                    run_id: id.to_string(),
-                });
-            }
-            found = true;
-        }
-        found
+        self.cancel_job(
+            id,
+            &self.eval_runs,
+            |run| run.id == id,
+            |run| cancel_live_job(&mut run.status, &mut run.ended_at),
+            |run| AppEvent::EvalUpdate { run },
+            AppEvent::EvalStopped {
+                run_id: id.to_string(),
+            },
+        )
+        .await
     }
 
     pub async fn create_pretrain_run(&self, run: PretrainRun) {
@@ -1240,62 +1189,99 @@ impl AppState {
     }
 
     pub async fn cancel_pretrain_run(&self, id: &str) -> bool {
-        {
-            let mut procs = self.active_processes.write().await;
-            if let Some(mut child) = procs.remove(id) {
-                let _ = child.kill().await;
-            }
-        }
-        let mut found = false;
-        let mut runs = self.pretrain_runs.write().await;
-        if let Some(run) = runs.iter_mut().find(|r| r.id == id) {
-            if run.status == JobStatus::Running || run.status == JobStatus::Pending {
-                run.status = JobStatus::Cancelled;
-                run.ended_at = Some(Utc::now());
-                let _ = self
-                    .event_tx
-                    .send(AppEvent::PretrainUpdate { run: run.clone() });
-                let _ = self.event_tx.send(AppEvent::PretrainStopped {
-                    run_id: id.to_string(),
-                });
-            }
-            found = true;
-        }
-        found
+        self.cancel_job(
+            id,
+            &self.pretrain_runs,
+            |run| run.id == id,
+            |run| cancel_live_job(&mut run.status, &mut run.ended_at),
+            |run| AppEvent::PretrainUpdate { run },
+            AppEvent::PretrainStopped {
+                run_id: id.to_string(),
+            },
+        )
+        .await
     }
 
     /// Stop a running serve instance: kill the child process, mark the
     /// instance `Stopped`, and broadcast the transition.
     pub async fn stop_serve_instance(&self, id: &str) -> bool {
+        self.cancel_job(
+            id,
+            &self.serve_instances,
+            |inst| inst.id == id,
+            |inst| {
+                let live = matches!(inst.status, ServeStatus::Starting | ServeStatus::Running);
+                if live {
+                    inst.status = ServeStatus::Stopped;
+                    inst.stopped_at = Some(Utc::now());
+                    inst.status_message = Some("Stopped by user".to_string());
+                }
+                live
+            },
+            |instance| AppEvent::ServeUpdate { instance },
+            AppEvent::ServeStopped {
+                instance_id: id.to_string(),
+            },
+        )
+        .await
+    }
+
+    // -----------------------------------------------------------------------
+    // Cancellation
+    // -----------------------------------------------------------------------
+
+    /// Stop job `id`: set its cancel flag, kill its process, then let
+    /// `cancel` move the record to its cancelled state. If `cancel` reports
+    /// the job was still live, broadcast `update` of the record followed by
+    /// `stopped`. Returns whether the job exists.
+    ///
+    /// The flag is set before the kill so the monitor task watching it
+    /// doesn't race the process exit. Only training, distillation and GRPO
+    /// register a flag; for the rest the lookup finds nothing.
+    async fn cancel_job<T: Clone>(
+        &self,
+        id: &str,
+        jobs: &RwLock<Vec<T>>,
+        is_job: impl Fn(&T) -> bool,
+        cancel: impl FnOnce(&mut T) -> bool,
+        update: impl FnOnce(T) -> AppEvent,
+        stopped: AppEvent,
+    ) -> bool {
+        if let Some(flag) = self.cancel_flags.read().await.get(id) {
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
         {
             let mut procs = self.active_processes.write().await;
             if let Some(mut child) = procs.remove(id) {
                 let _ = child.kill().await;
             }
         }
-        let mut found = false;
-        let mut instances = self.serve_instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            if matches!(inst.status, ServeStatus::Starting | ServeStatus::Running) {
-                inst.status = ServeStatus::Stopped;
-                inst.stopped_at = Some(Utc::now());
-                inst.status_message = Some("Stopped by user".to_string());
-                let _ = self.event_tx.send(AppEvent::ServeUpdate {
-                    instance: inst.clone(),
-                });
-                let _ = self.event_tx.send(AppEvent::ServeStopped {
-                    instance_id: id.to_string(),
-                });
-            }
-            found = true;
+        let mut jobs = jobs.write().await;
+        let Some(job) = jobs.iter_mut().find(|j| is_job(j)) else {
+            return false;
+        };
+        if cancel(job) {
+            let _ = self.event_tx.send(update(job.clone()));
+            let _ = self.event_tx.send(stopped);
         }
-        found
+        true
     }
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Cancel a `JobStatus` job that is still pending or running, stamping its
+/// end time. Returns whether it changed.
+fn cancel_live_job(status: &mut JobStatus, ended_at: &mut Option<DateTime<Utc>>) -> bool {
+    let live = matches!(status, JobStatus::Running | JobStatus::Pending);
+    if live {
+        *status = JobStatus::Cancelled;
+        *ended_at = Some(Utc::now());
+    }
+    live
+}
 
 /// Returns the HuggingFace hub cache root, honouring the standard env vars in
 /// priority order: HF_HOME > HUGGINGFACE_HUB_CACHE > HF_HUB_CACHE > ~/.cache/huggingface
@@ -1653,5 +1639,91 @@ pub fn format_downloads(n: u64) -> String {
         format!("{:.1}K", n as f64 / 1_000.0)
     } else {
         n.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Whether a process with this pid still exists.
+    fn pid_exists(pid: u32) -> bool {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_live_run_flags_kills_marks_and_broadcasts_in_order() {
+        let state = AppState::new();
+        let run = TrainingRun::new("m", "lora", None, None, 1);
+        let id = run.id.clone();
+        state.create_training_run(run).await;
+
+        let flag = Arc::new(AtomicBool::new(false));
+        state
+            .cancel_flags
+            .write()
+            .await
+            .insert(id.clone(), flag.clone());
+        let child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap();
+        state
+            .active_processes
+            .write()
+            .await
+            .insert(id.clone(), child);
+
+        let mut events = state.subscribe();
+        assert!(state.cancel_training_run(&id).await);
+
+        assert!(flag.load(Ordering::SeqCst));
+        assert!(state.active_processes.read().await.is_empty());
+        assert!(!pid_exists(pid), "the child should be killed and reaped");
+
+        let run = state.get_training_run(&id).await.unwrap();
+        assert_eq!(run.status, TrainingStatus::Cancelled);
+        assert!(run.ended_at.is_some());
+
+        match events.try_recv().unwrap() {
+            AppEvent::TrainingUpdate { run } => assert_eq!(run.status, TrainingStatus::Cancelled),
+            other => panic!("expected TrainingUpdate first, got {other:?}"),
+        }
+        assert!(matches!(
+            events.try_recv().unwrap(),
+            AppEvent::TrainingStopped { run_id } if run_id == id
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_unknown_run_reports_not_found() {
+        let state = AppState::new();
+        let mut events = state.subscribe();
+        assert!(!state.cancel_bench_run("nope").await);
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_finished_run_is_found_but_left_alone() {
+        let state = AppState::new();
+        let mut run = BenchRun::new("throughput", "m", None);
+        run.status = JobStatus::Completed;
+        let id = run.id.clone();
+        state.create_bench_run(run).await;
+
+        let mut events = state.subscribe();
+        assert!(state.cancel_bench_run(&id).await);
+
+        let runs = state.list_bench_runs().await;
+        assert_eq!(runs[0].status, JobStatus::Completed);
+        assert!(runs[0].ended_at.is_none());
+        assert!(events.try_recv().is_err());
     }
 }
