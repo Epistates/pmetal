@@ -244,7 +244,7 @@ jobs:
           chmod +x "$SIDECAR_DIR/pmetal-aarch64-apple-darwin"
 
           # MLX loads no kernels without this. It ships as a Tauri resource and
-          # the GUI points PMETAL_METALLIB_PATH at it on startup.
+          # the GUI hands its path to MLX (set_metallib_path) on startup.
           cp cli-artifact/mlx.metallib "$SIDECAR_DIR/mlx.metallib"
 
           ls -lh "$SIDECAR_DIR"
