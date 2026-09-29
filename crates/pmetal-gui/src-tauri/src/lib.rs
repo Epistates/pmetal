@@ -184,17 +184,18 @@ pub fn run() {
 ///
 /// Handing the path to `set_metallib_path` is what MLX honours (upstream API
 /// since MLX v0.32). `PMETAL_METALLIB_PATH` is still read here as an operator
-/// override and re-exported for child processes, but MLX itself no longer looks
-/// at it — before v0.32 that env var was serviced by a patch to MLX's own
-/// `load_default_library`, which this crate no longer carries.
+/// override, but MLX itself no longer looks at it — before v0.32 that env var
+/// was serviced by a patch to MLX's own `load_default_library`, which this crate
+/// no longer carries. The `pmetal` CLI processes this app spawns run their own
+/// search, so the path isn't exported to them.
 fn ensure_metallib(app: &tauri::AppHandle) {
     use tauri::path::BaseDirectory;
 
-    if let Some(explicit) = std::env::var_os("PMETAL_METALLIB_PATH") {
-        if !explicit.is_empty() {
-            pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
-            return;
-        }
+    if let Some(explicit) = std::env::var_os("PMETAL_METALLIB_PATH")
+        && !explicit.is_empty()
+    {
+        pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
+        return;
     }
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -202,10 +203,10 @@ fn ensure_metallib(app: &tauri::AppHandle) {
     if let Ok(path) = app.path().resolve("mlx.metallib", BaseDirectory::Resource) {
         candidates.push(path);
     }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("mlx.metallib"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        candidates.push(dir.join("mlx.metallib"));
     }
     if let Some(home) = std::env::var_os("HOME") {
         candidates.push(std::path::PathBuf::from(home).join(".cache/pmetal/lib/mlx.metallib"));
@@ -215,10 +216,6 @@ fn ensure_metallib(app: &tauri::AppHandle) {
         Some(path) => {
             tracing::info!(path = %path.display(), "Found mlx.metallib");
             pmetal_bridge::inline_array::set_metallib_path(&path.to_string_lossy());
-            // Re-exported so the `pmetal` CLI subprocesses this app spawns
-            // resolve the same file without repeating the search.
-            std::env::set_var("PMETAL_METALLIB_PATH", &path);
-            std::env::set_var("MLX_METAL_JIT", "1");
         }
         None => {
             tracing::error!(
@@ -274,11 +271,11 @@ struct AppStateInit {
 impl AppStateInit {
     async fn load_config(&self) {
         let path = AppState::config_path_pub();
-        if let Ok(data) = tokio::fs::read_to_string(&path).await {
-            if let Ok(cfg) = serde_json::from_str::<state::AppConfig>(&data) {
-                *self.config.write().await = cfg;
-                tracing::info!("Loaded config from {}", path.display());
-            }
+        if let Ok(data) = tokio::fs::read_to_string(&path).await
+            && let Ok(cfg) = serde_json::from_str::<state::AppConfig>(&data)
+        {
+            *self.config.write().await = cfg;
+            tracing::info!("Loaded config from {}", path.display());
         }
     }
 
@@ -363,21 +360,21 @@ struct TeeWriter {
 impl std::io::Write for TeeWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let n = self.stderr.write(buf)?;
-        if let Some(ref file) = self.file {
-            if let Ok(mut f) = file.lock() {
-                // Strip ANSI escape codes for the file
-                let _ = f.write_all(&buf[..n]);
-            }
+        if let Some(ref file) = self.file
+            && let Ok(mut f) = file.lock()
+        {
+            // Strip ANSI escape codes for the file
+            let _ = f.write_all(&buf[..n]);
         }
         Ok(n)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         self.stderr.flush()?;
-        if let Some(ref file) = self.file {
-            if let Ok(mut f) = file.lock() {
-                let _ = f.flush();
-            }
+        if let Some(ref file) = self.file
+            && let Ok(mut f) = file.lock()
+        {
+            let _ = f.flush();
         }
         Ok(())
     }

@@ -9,9 +9,9 @@ use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Emitter, State};
 
 use crate::state::{
-    format_downloads, format_size, AppConfig, AppEvent, AppState, BenchRun, CachedModel,
-    DistillationRun, DistillationStatus, EvalRun, GrpoRun, GrpoStatus, JobStatus, PretrainRun,
-    ServeInstance, ServeStatus, TrainingConfigSummary, TrainingRun, TrainingStatus,
+    AppConfig, AppEvent, AppState, BenchRun, CachedModel, DistillationRun, DistillationStatus,
+    EvalRun, GrpoRun, GrpoStatus, JobStatus, PretrainRun, ServeInstance, ServeStatus,
+    TrainingConfigSummary, TrainingRun, TrainingStatus, format_downloads, format_size,
 };
 
 // ---------------------------------------------------------------------------
@@ -523,14 +523,14 @@ pub async fn get_model_defaults(
 
     // Read generation_config.json for sampling params
     let gen_config_path = model_path.join("generation_config.json");
-    if let Ok(content) = tokio::fs::read_to_string(&gen_config_path).await {
-        if let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content) {
-            defaults.temperature = cfg["temperature"].as_f64().map(|v| v as f32);
-            defaults.top_k = cfg["top_k"].as_u64().map(|v| v as u32);
-            defaults.top_p = cfg["top_p"].as_f64().map(|v| v as f32);
-            defaults.repetition_penalty = cfg["repetition_penalty"].as_f64().map(|v| v as f32);
-            defaults.max_new_tokens = cfg["max_new_tokens"].as_u64().map(|v| v as u32);
-        }
+    if let Ok(content) = tokio::fs::read_to_string(&gen_config_path).await
+        && let Ok(cfg) = serde_json::from_str::<serde_json::Value>(&content)
+    {
+        defaults.temperature = cfg["temperature"].as_f64().map(|v| v as f32);
+        defaults.top_k = cfg["top_k"].as_u64().map(|v| v as u32);
+        defaults.top_p = cfg["top_p"].as_f64().map(|v| v as f32);
+        defaults.repetition_penalty = cfg["repetition_penalty"].as_f64().map(|v| v as f32);
+        defaults.max_new_tokens = cfg["max_new_tokens"].as_u64().map(|v| v as u32);
     }
 
     // Read config.json for model arch info
@@ -1247,11 +1247,11 @@ pub async fn start_training(
         let status_tx = event_tx.clone();
         let status_run_id = run_id_task.clone();
         let phase_cb = move |phase: &pmetal::trainer::TrainingPhase| {
-            if let Ok(mut runs) = status_state.try_write() {
-                if let Some(run) = runs.iter_mut().find(|r| r.id == status_run_id) {
-                    run.status_message = Some(phase.message().to_string());
-                    let _ = status_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
-                }
+            if let Ok(mut runs) = status_state.try_write()
+                && let Some(run) = runs.iter_mut().find(|r| r.id == status_run_id)
+            {
+                run.status_message = Some(phase.message().to_string());
+                let _ = status_tx.send(AppEvent::TrainingUpdate { run: run.clone() });
             }
         };
 
@@ -1760,25 +1760,25 @@ fn spawn_serve_exit_watcher(
                     procs.remove(&instance_id);
                     drop(procs);
                     let mut instances_w = instances.write().await;
-                    if let Some(inst) = instances_w.iter_mut().find(|i| i.id == instance_id) {
-                        if matches!(inst.status, ServeStatus::Starting | ServeStatus::Running) {
-                            if status.success() {
-                                inst.status = ServeStatus::Stopped;
-                                inst.status_message = Some("Exited cleanly".to_string());
-                            } else {
-                                inst.status = ServeStatus::Failed;
-                                let msg = format!("Process exited with status {status}");
-                                inst.error_message = Some(msg.clone());
-                                inst.status_message = Some(msg);
-                            }
-                            inst.stopped_at = Some(Utc::now());
-                            let _ = event_tx.send(AppEvent::ServeUpdate {
-                                instance: inst.clone(),
-                            });
-                            let _ = event_tx.send(AppEvent::ServeStopped {
-                                instance_id: instance_id.clone(),
-                            });
+                    if let Some(inst) = instances_w.iter_mut().find(|i| i.id == instance_id)
+                        && matches!(inst.status, ServeStatus::Starting | ServeStatus::Running)
+                    {
+                        if status.success() {
+                            inst.status = ServeStatus::Stopped;
+                            inst.status_message = Some("Exited cleanly".to_string());
+                        } else {
+                            inst.status = ServeStatus::Failed;
+                            let msg = format!("Process exited with status {status}");
+                            inst.error_message = Some(msg.clone());
+                            inst.status_message = Some(msg);
                         }
+                        inst.stopped_at = Some(Utc::now());
+                        let _ = event_tx.send(AppEvent::ServeUpdate {
+                            instance: inst.clone(),
+                        });
+                        let _ = event_tx.send(AppEvent::ServeStopped {
+                            instance_id: instance_id.clone(),
+                        });
                     }
                     return;
                 }
@@ -2175,59 +2175,57 @@ fn spawn_job_exit_watcher(
                     match kind {
                         JobKind::Bench => {
                             let mut runs = bench_runs.write().await;
-                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                                if matches!(run.status, JobStatus::Running | JobStatus::Pending) {
-                                    run.status = if success {
-                                        JobStatus::Completed
-                                    } else {
-                                        JobStatus::Failed
-                                    };
-                                    run.ended_at = Some(Utc::now());
-                                    run.error_message = msg.clone();
-                                    let _ =
-                                        event_tx.send(AppEvent::BenchUpdate { run: run.clone() });
-                                    let _ = event_tx.send(AppEvent::BenchStopped {
-                                        run_id: run_id.clone(),
-                                    });
-                                }
+                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id)
+                                && matches!(run.status, JobStatus::Running | JobStatus::Pending)
+                            {
+                                run.status = if success {
+                                    JobStatus::Completed
+                                } else {
+                                    JobStatus::Failed
+                                };
+                                run.ended_at = Some(Utc::now());
+                                run.error_message = msg.clone();
+                                let _ = event_tx.send(AppEvent::BenchUpdate { run: run.clone() });
+                                let _ = event_tx.send(AppEvent::BenchStopped {
+                                    run_id: run_id.clone(),
+                                });
                             }
                         }
                         JobKind::Eval => {
                             let mut runs = eval_runs.write().await;
-                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                                if matches!(run.status, JobStatus::Running | JobStatus::Pending) {
-                                    run.status = if success {
-                                        JobStatus::Completed
-                                    } else {
-                                        JobStatus::Failed
-                                    };
-                                    run.ended_at = Some(Utc::now());
-                                    run.error_message = msg.clone();
-                                    let _ =
-                                        event_tx.send(AppEvent::EvalUpdate { run: run.clone() });
-                                    let _ = event_tx.send(AppEvent::EvalStopped {
-                                        run_id: run_id.clone(),
-                                    });
-                                }
+                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id)
+                                && matches!(run.status, JobStatus::Running | JobStatus::Pending)
+                            {
+                                run.status = if success {
+                                    JobStatus::Completed
+                                } else {
+                                    JobStatus::Failed
+                                };
+                                run.ended_at = Some(Utc::now());
+                                run.error_message = msg.clone();
+                                let _ = event_tx.send(AppEvent::EvalUpdate { run: run.clone() });
+                                let _ = event_tx.send(AppEvent::EvalStopped {
+                                    run_id: run_id.clone(),
+                                });
                             }
                         }
                         JobKind::Pretrain => {
                             let mut runs = pretrain_runs.write().await;
-                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id) {
-                                if matches!(run.status, JobStatus::Running | JobStatus::Pending) {
-                                    run.status = if success {
-                                        JobStatus::Completed
-                                    } else {
-                                        JobStatus::Failed
-                                    };
-                                    run.ended_at = Some(Utc::now());
-                                    run.error_message = msg.clone();
-                                    let _ = event_tx
-                                        .send(AppEvent::PretrainUpdate { run: run.clone() });
-                                    let _ = event_tx.send(AppEvent::PretrainStopped {
-                                        run_id: run_id.clone(),
-                                    });
-                                }
+                            if let Some(run) = runs.iter_mut().find(|r| r.id == run_id)
+                                && matches!(run.status, JobStatus::Running | JobStatus::Pending)
+                            {
+                                run.status = if success {
+                                    JobStatus::Completed
+                                } else {
+                                    JobStatus::Failed
+                                };
+                                run.ended_at = Some(Utc::now());
+                                run.error_message = msg.clone();
+                                let _ =
+                                    event_tx.send(AppEvent::PretrainUpdate { run: run.clone() });
+                                let _ = event_tx.send(AppEvent::PretrainStopped {
+                                    run_id: run_id.clone(),
+                                });
                             }
                         }
                     }
@@ -2300,13 +2298,13 @@ fn pmetal_binary() -> PathBuf {
     let mut candidates: Vec<PathBuf> = Vec::new();
 
     // Bundled sidecar, then the dev-build siblings.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(parent) = exe.parent() {
-            candidates.push(parent.join("pmetal"));
-            candidates.push(parent.join("../pmetal/pmetal"));
-            candidates.push(parent.join("../../debug/pmetal"));
-            candidates.push(parent.join("../../release/pmetal"));
-        }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(parent) = exe.parent()
+    {
+        candidates.push(parent.join("pmetal"));
+        candidates.push(parent.join("../pmetal/pmetal"));
+        candidates.push(parent.join("../../debug/pmetal"));
+        candidates.push(parent.join("../../release/pmetal"));
     }
 
     // `cargo install pmetal` — respects CARGO_HOME when it is set.
@@ -3002,12 +3000,12 @@ fn apply_metrics_to_distillation(
     {
         run.tokens_per_second = Some(v);
     }
-    if let (Some(total_steps), step) = (run.total_steps, run.step) {
-        if step > 0 {
-            let elapsed = (Utc::now() - started_at).num_seconds().max(1) as f64;
-            let remaining = total_steps.saturating_sub(step) as f64;
-            run.eta_seconds = Some(((elapsed / step as f64) * remaining) as u64);
-        }
+    if let (Some(total_steps), step) = (run.total_steps, run.step)
+        && step > 0
+    {
+        let elapsed = (Utc::now() - started_at).num_seconds().max(1) as f64;
+        let remaining = total_steps.saturating_sub(step) as f64;
+        run.eta_seconds = Some(((elapsed / step as f64) * remaining) as u64);
     }
 }
 
@@ -3078,12 +3076,12 @@ fn apply_metrics_to_grpo(
     {
         run.tokens_per_second = Some(v);
     }
-    if let (Some(total_steps), step) = (run.total_steps, run.step) {
-        if step > 0 {
-            let elapsed = (Utc::now() - started_at).num_seconds().max(1) as f64;
-            let remaining = total_steps.saturating_sub(step) as f64;
-            run.eta_seconds = Some(((elapsed / step as f64) * remaining) as u64);
-        }
+    if let (Some(total_steps), step) = (run.total_steps, run.step)
+        && step > 0
+    {
+        let elapsed = (Utc::now() - started_at).num_seconds().max(1) as f64;
+        let remaining = total_steps.saturating_sub(step) as f64;
+        run.eta_seconds = Some(((elapsed / step as f64) * remaining) as u64);
     }
 }
 
@@ -4068,10 +4066,10 @@ async fn read_model_config_json(repo_path: &str) -> Option<serde_json::Value> {
 
     // 1. Check root config.json (custom dirs, non-HF layouts)
     let root_config = base.join("config.json");
-    if let Ok(data) = tokio::fs::read_to_string(&root_config).await {
-        if let Ok(cfg) = serde_json::from_str(&data) {
-            return Some(cfg);
-        }
+    if let Ok(data) = tokio::fs::read_to_string(&root_config).await
+        && let Ok(cfg) = serde_json::from_str(&data)
+    {
+        return Some(cfg);
     }
 
     // 2. Check HF hub cache layout: snapshots/{hash}/config.json
@@ -4080,10 +4078,10 @@ async fn read_model_config_json(repo_path: &str) -> Option<serde_json::Value> {
         while let Ok(Some(entry)) = rd.next_entry().await {
             if entry.file_type().await.ok().is_some_and(|ft| ft.is_dir()) {
                 let config_path = entry.path().join("config.json");
-                if let Ok(data) = tokio::fs::read_to_string(&config_path).await {
-                    if let Ok(cfg) = serde_json::from_str(&data) {
-                        return Some(cfg);
-                    }
+                if let Ok(data) = tokio::fs::read_to_string(&config_path).await
+                    && let Ok(cfg) = serde_json::from_str(&data)
+                {
+                    return Some(cfg);
                 }
             }
         }
@@ -4355,20 +4353,20 @@ pub async fn start_rlkd(
     if config.no_flash_attention.unwrap_or(false) {
         args.push("--no-flash-attention".into());
     }
-    if let Some(ref tc) = config.text_column {
-        if !tc.is_empty() {
-            args.extend(["--text-column".into(), tc.clone()]);
-        }
+    if let Some(ref tc) = config.text_column
+        && !tc.is_empty()
+    {
+        args.extend(["--text-column".into(), tc.clone()]);
     }
-    if let Some(ref pc) = config.prompt_column {
-        if !pc.is_empty() {
-            args.extend(["--prompt-column".into(), pc.clone()]);
-        }
+    if let Some(ref pc) = config.prompt_column
+        && !pc.is_empty()
+    {
+        args.extend(["--prompt-column".into(), pc.clone()]);
     }
-    if let Some(ref rc) = config.response_column {
-        if !rc.is_empty() {
-            args.extend(["--response-column".into(), rc.clone()]);
-        }
+    if let Some(ref rc) = config.response_column
+        && !rc.is_empty()
+    {
+        args.extend(["--response-column".into(), rc.clone()]);
     }
 
     spawn_oneshot_subprocess(run_id.clone(), args, on_event).await?;
@@ -4562,7 +4560,7 @@ async fn run_pmetal_subprocess_to_completion(args: Vec<String>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{chat_message_from_inference_message, InferenceMessage};
+    use super::{InferenceMessage, chat_message_from_inference_message};
 
     #[test]
     fn inference_message_mapping_preserves_supported_roles() {

@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::{broadcast, RwLock};
+use tokio::sync::{RwLock, broadcast};
 use uuid::Uuid;
 
 // ---------------------------------------------------------------------------
@@ -509,12 +509,12 @@ fn parse_eval_sample_progress(line: &str) -> Option<(usize, usize)> {
             let tail = &line[i..];
             let end = tail.find([' ', ',']).unwrap_or(tail.len());
             let slice = &tail[..end];
-            if let Some((a, b)) = slice.split_once('/') {
-                if let (Ok(done), Ok(total)) = (a.parse::<usize>(), b.parse::<usize>()) {
-                    if total > 0 && done <= total {
-                        return Some((done, total));
-                    }
-                }
+            if let Some((a, b)) = slice.split_once('/')
+                && let (Ok(done), Ok(total)) = (a.parse::<usize>(), b.parse::<usize>())
+                && total > 0
+                && done <= total
+            {
+                return Some((done, total));
             }
             break;
         }
@@ -828,11 +828,11 @@ impl AppState {
 
     pub async fn load_config(&self) {
         let path = Self::config_path();
-        if let Ok(data) = tokio::fs::read_to_string(&path).await {
-            if let Ok(cfg) = serde_json::from_str::<AppConfig>(&data) {
-                *self.config.write().await = cfg;
-                tracing::info!("Loaded config from {}", path.display());
-            }
+        if let Ok(data) = tokio::fs::read_to_string(&path).await
+            && let Ok(cfg) = serde_json::from_str::<AppConfig>(&data)
+        {
+            *self.config.write().await = cfg;
+            tracing::info!("Loaded config from {}", path.display());
         }
     }
 
@@ -1528,21 +1528,19 @@ async fn build_model_from_dir(dir: &PathBuf, source: ModelSource) -> Option<Cach
 
     // For GGUF-only directories without config.json: try extracting model name
     // from GGUF metadata and generate config.json for downstream consumers.
-    if !dir.join("config.json").exists() {
-        if let Some(gguf_path) = find_first_gguf(dir).await {
-            if let Ok(content) = pmetal::gguf::GgufContent::from_file(&gguf_path) {
-                // Use general.name as model ID if available
-                if let Some(pmetal::gguf::MetadataValue::String(name)) =
-                    content.get_metadata("general.name")
-                {
-                    if !name.is_empty() {
-                        model_id = name.clone();
-                    }
-                }
-                // Generate config.json from GGUF metadata
-                pmetal::gguf::config::write_config_from_gguf(&content, dir);
-            }
+    if !dir.join("config.json").exists()
+        && let Some(gguf_path) = find_first_gguf(dir).await
+        && let Ok(content) = pmetal::gguf::GgufContent::from_file(&gguf_path)
+    {
+        // Use general.name as model ID if available
+        if let Some(pmetal::gguf::MetadataValue::String(name)) =
+            content.get_metadata("general.name")
+            && !name.is_empty()
+        {
+            model_id = name.clone();
         }
+        // Generate config.json from GGUF metadata
+        pmetal::gguf::config::write_config_from_gguf(&content, dir);
     }
 
     let size = dir_size_follow_symlinks(dir).await;
