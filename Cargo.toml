@@ -100,7 +100,7 @@ bitcode = { version = "0.6", features = ["serde"] }
 
 # Metal bindings (modern objc2 ecosystem)
 objc2 = "0.6"
-objc2-foundation = { version = "0.3", features = ["NSData", "NSError", "NSString"] }
+objc2-foundation = { version = "0.3", features = ["NSData", "NSError", "NSProcessInfo", "NSString"] }
 objc2-metal = { version = "0.3", features = [
     "MTLDevice", "MTLCommandQueue", "MTLCommandBuffer", "MTLCommandEncoder",
     "MTLComputeCommandEncoder", "MTLComputePipeline", "MTLLibrary",

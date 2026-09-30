@@ -32,6 +32,35 @@ use crate::ane::kernel::{self, TransformerKernelConfig};
 use crate::ane::runtime::{AneModel, AneRuntime};
 use crate::error::{MetalError, Result};
 
+/// Per-layer tensors the inference engine reads; a checkpoint must supply all.
+const INFERENCE_LAYER_TENSORS: [&str; 11] = [
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "self_attn.q_norm.weight",
+    "self_attn.k_norm.weight",
+    "mlp.gate_proj.weight",
+    "mlp.down_proj.weight",
+    "mlp.up_proj.weight",
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+];
+
+/// Whether the ANE inference engine implements this model.
+///
+/// The engine is Qwen3-shaped: per-head q/k RMSNorm, SiLU-gated FFN, plain
+/// RoPE, logits from the embedding matrix. It used to share the training
+/// check, which admitted Llama and Gemma: those have no q/k norm (the engine
+/// substituted 1.0) and, for Gemma, a different FFN. See
+/// [`super::checkpoint`] for the limits both engines share.
+pub fn is_ane_inference_compatible(
+    config_json: &serde_json::Value,
+) -> std::result::Result<(), String> {
+    super::checkpoint::check_model_type(config_json, &["qwen3"], "inference")?;
+    super::checkpoint::check_shared_limits(config_json, "inference")
+}
+
 /// Configuration for ANE inference.
 #[derive(Debug, Clone)]
 pub struct AneInferenceConfig {
@@ -1264,6 +1293,7 @@ impl AneInferenceEngine {
             }
         };
 
+        let mut loader = super::checkpoint::StrictLoader::default();
         for file_path in &files {
             let file = std::fs::File::open(file_path).map_err(|e| {
                 MetalError::InvalidConfig(format!("Failed to open {:?}: {e}", file_path))
@@ -1276,25 +1306,23 @@ impl AneInferenceEngine {
             })?;
 
             for (name, tensor) in tensors.tensors() {
-                let data_f32 = match safetensors_to_f32(&tensor) {
-                    Ok(data) => data,
-                    Err(_) => continue, // skip unsupported dtypes
-                };
+                // An unsupported dtype (a packed quantized weight, say) is an
+                // error only for a tensor we use.
+                let data_f32 = safetensors_to_f32(&tensor);
 
-                if name == "model.embed_tokens.weight" || name == "lm_head.weight" {
-                    if name == "model.embed_tokens.weight" {
-                        let expected = self.config.vocab_size * d;
-                        if data_f32.len() >= expected {
-                            self.embed_weights[..expected].copy_from_slice(&data_f32[..expected]);
-                        }
-                    }
+                if name == "model.embed_tokens.weight" {
+                    let expected = self.config.vocab_size * d;
+                    loader.copy(&name, &data_f32, &mut self.embed_weights, expected)?;
+                    continue;
+                }
+                // Logits come from the embedding matrix; `is_ane_inference_compatible`
+                // refuses a model whose lm_head is separate, so this one is a copy.
+                if name == "lm_head.weight" {
                     continue;
                 }
 
                 if name == "model.norm.weight" {
-                    if data_f32.len() == d {
-                        self.rms_final.copy_from_slice(&data_f32);
-                    }
+                    loader.copy(&name, &data_f32, &mut self.rms_final, d)?;
                     continue;
                 }
 
@@ -1315,39 +1343,37 @@ impl AneInferenceEngine {
                     let lw = &mut self.layer_weights[layer_idx];
                     let suffix = parts[1];
 
-                    match suffix {
-                        "self_attn.q_proj.weight" => {
-                            copy_weight(&data_f32, &mut lw.wq, q_dim * d);
-                        }
-                        "self_attn.k_proj.weight" => {
-                            copy_weight(&data_f32, &mut lw.wk, kv_dim * d);
-                        }
-                        "self_attn.v_proj.weight" => {
-                            copy_weight(&data_f32, &mut lw.wv, kv_dim * d);
-                        }
-                        "self_attn.o_proj.weight" => {
-                            copy_weight(&data_f32, &mut lw.wo, d * q_dim);
-                        }
-                        "self_attn.q_norm.weight" => copy_weight(&data_f32, &mut lw.q_norm, hd),
-                        "self_attn.k_norm.weight" => copy_weight(&data_f32, &mut lw.k_norm, hd),
-                        "mlp.gate_proj.weight" => {
-                            copy_weight(&data_f32, &mut lw.w1, self.config.hidden_dim * d);
-                        }
-                        "mlp.down_proj.weight" => {
-                            copy_weight(&data_f32, &mut lw.w2, d * self.config.hidden_dim);
-                        }
-                        "mlp.up_proj.weight" => {
-                            copy_weight(&data_f32, &mut lw.w3, self.config.hidden_dim * d);
-                        }
-                        "input_layernorm.weight" => copy_weight(&data_f32, &mut lw.rms_att, d),
-                        "post_attention_layernorm.weight" => {
-                            copy_weight(&data_f32, &mut lw.rms_ffn, d);
-                        }
-                        _ => {}
-                    }
+                    let hidden = self.config.hidden_dim;
+                    let (dst, expected): (&mut [f32], usize) = match suffix {
+                        "self_attn.q_proj.weight" => (&mut lw.wq, q_dim * d),
+                        "self_attn.k_proj.weight" => (&mut lw.wk, kv_dim * d),
+                        "self_attn.v_proj.weight" => (&mut lw.wv, kv_dim * d),
+                        "self_attn.o_proj.weight" => (&mut lw.wo, d * q_dim),
+                        "self_attn.q_norm.weight" => (&mut lw.q_norm, hd),
+                        "self_attn.k_norm.weight" => (&mut lw.k_norm, hd),
+                        "mlp.gate_proj.weight" => (&mut lw.w1, hidden * d),
+                        "mlp.down_proj.weight" => (&mut lw.w2, d * hidden),
+                        "mlp.up_proj.weight" => (&mut lw.w3, hidden * d),
+                        "input_layernorm.weight" => (&mut lw.rms_att, d),
+                        "post_attention_layernorm.weight" => (&mut lw.rms_ffn, d),
+                        _ => continue,
+                    };
+                    loader.copy(&name, &data_f32, dst, expected)?;
                 }
             }
         }
+
+        // The q/k norms used to default to 1.0 when absent, so a checkpoint
+        // without them (any non-Qwen3 model) ran with no error and wrong output.
+        loader.require(
+            ["model.embed_tokens.weight", "model.norm.weight"]
+                .map(String::from)
+                .into_iter()
+                .chain(super::checkpoint::layer_tensors(
+                    self.config.n_layers,
+                    &INFERENCE_LAYER_TENSORS,
+                )),
+        )?;
 
         Ok(())
     }
@@ -1548,12 +1574,6 @@ fn apply_rope_vec(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, ro
 /// Matrix-vector multiply: out = W @ x, where W is [rows, cols] row-major.
 fn gemv(w: &[f32], x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
     accelerate::gemm(w, x, out, rows, 1, cols, 1.0, 0.0, false, false);
-}
-
-/// Copy weight data, clamping to target size.
-fn copy_weight(src: &[f32], dst: &mut [f32], expected: usize) {
-    let len = src.len().min(dst.len()).min(expected);
-    dst[..len].copy_from_slice(&src[..len]);
 }
 
 /// Convert safetensors tensor data to f32.

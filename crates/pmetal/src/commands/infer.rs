@@ -591,26 +591,32 @@ pub(crate) async fn run_inference(
                 };
 
             if param_count_too_small {
-                tracing::info!("Small model (<2B) — using GPU path for faster decode");
+                tracing::warn!(
+                    "--ane ignored: models under ~2B parameters decode faster on the GPU, so they \
+                     always use it"
+                );
                 None
             } else {
-                let ane_compatible = match std::fs::read_to_string(model_path.join("config.json")) {
-                    Ok(config_text) => {
-                        match serde_json::from_str::<serde_json::Value>(&config_text) {
-                            Ok(config_json) => {
-                                use pmetal_metal::ane::dynamic_trainer::DynamicAneTrainerConfig;
-                                match DynamicAneTrainerConfig::is_ane_compatible(&config_json) {
-                                    Ok(()) => true,
-                                    Err(reason) => {
-                                        tracing::info!("Skipping ANE inference: {}", reason);
-                                        false
-                                    }
-                                }
+                // --ane was asked for, so every reason not to use it is a warning.
+                // An unreadable config used to count as compatible.
+                let ane_compatible = match std::fs::read_to_string(model_path.join("config.json"))
+                    .map_err(|e| e.to_string())
+                    .and_then(|text| {
+                        serde_json::from_str::<serde_json::Value>(&text).map_err(|e| e.to_string())
+                    }) {
+                    Ok(config_json) => {
+                        match pmetal_models::is_ane_inference_compatible(&config_json) {
+                            Ok(()) => true,
+                            Err(reason) => {
+                                tracing::warn!("--ane ignored: {reason}");
+                                false
                             }
-                            Err(_) => true,
                         }
                     }
-                    Err(_) => true,
+                    Err(e) => {
+                        tracing::warn!("--ane ignored: can't read config.json: {e}");
+                        false
+                    }
                 };
 
                 if ane_compatible {

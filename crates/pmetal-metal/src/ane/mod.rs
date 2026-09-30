@@ -39,6 +39,7 @@
 //! - [`dynamic_trainer`]: Compile-once training loop (replaces static trainer)
 //! - [`inference`]: Forward-only ANE inference engine with autoregressive generation
 
+pub(crate) mod checkpoint;
 pub mod dynamic_kernel;
 pub mod dynamic_trainer;
 pub mod inference;

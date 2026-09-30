@@ -79,8 +79,12 @@ pub struct DynamicAneTrainerConfig {
     pub warmup_steps: usize,
     /// Minimum LR ratio for cosine decay.
     pub min_lr_ratio: f32,
-    /// RMSNorm epsilon (must match ANE kernel eps). Default: 1e-6.
+    /// RMSNorm epsilon, used by both the CPU paths and the ANE kernels.
+    /// Default: 1e-6.
     pub rms_norm_eps: f32,
+    /// RoPE base frequency, from the checkpoint's `rope_theta`. Default: 1e6
+    /// (Qwen's); Llama 2 uses 1e4 and Llama 3 5e5.
+    pub rope_theta: f32,
     /// Loss scaling factor. Multiplies dlogits before backward and divides
     /// gradients after accumulation, preventing fp32 underflow for small
     /// gradient magnitudes at >350M params. Default: 1.0 (disabled).
@@ -111,6 +115,7 @@ impl Default for DynamicAneTrainerConfig {
             warmup_steps: 100,
             min_lr_ratio: 0.1,
             rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
             loss_scale: 1.0,
             embedding_lr: None,
         }
@@ -217,52 +222,29 @@ impl VocabMap {
     }
 }
 
+/// Per-layer tensors the training engine reads; a checkpoint must supply all.
+const TRAINER_LAYER_TENSORS: [&str; 9] = [
+    "self_attn.q_proj.weight",
+    "self_attn.k_proj.weight",
+    "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight",
+    "mlp.gate_proj.weight",
+    "mlp.down_proj.weight",
+    "mlp.up_proj.weight",
+    "input_layernorm.weight",
+    "post_attention_layernorm.weight",
+];
+
 impl DynamicAneTrainerConfig {
-    /// Check if a model architecture is compatible with ANE training/inference.
+    /// Whether the ANE training engine implements this model.
     ///
-    /// Rejects hybrid/recurrent architectures (GDN, Mamba, RG-LRU) and MoE models
-    /// that cannot be mapped to ANE's transformer-only kernel set.
-    pub fn is_ane_compatible(config_json: &serde_json::Value) -> std::result::Result<(), String> {
-        let model_type = config_json
-            .get("model_type")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-
-        // Reject known incompatible architectures
-        const INCOMPATIBLE: &[&str] = &[
-            "qwen3_5",
-            "qwen3_5_text",
-            "qwen3_next", // GDN hybrid
-            "nemotron_h", // Mamba hybrid
-            "gemma4",     // extra per-layer norms / KV-sharing / PLI blocks
-            "gemma4_text",
-        ];
-        if INCOMPATIBLE.contains(&model_type) {
-            return Err(format!(
-                "Model type '{}' uses hybrid/recurrent layers not supported by ANE. Use GPU training.",
-                model_type
-            ));
-        }
-
-        // Reject MoE (no expert routing on ANE)
-        if config_json
-            .get("num_experts")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            > 0
-        {
-            return Err("MoE models with routed experts are not supported by ANE training.".into());
-        }
-        if config_json
-            .get("num_local_experts")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)
-            > 0
-        {
-            return Err("MoE models with routed experts are not supported by ANE training.".into());
-        }
-
-        Ok(())
+    /// The training kernels are Llama-shaped: SiLU-gated FFN, no per-head q/k
+    /// norm, plain RoPE, logits from the embedding matrix. That rules out
+    /// Qwen3 (per-head q/k norm, which the loader never reads) as well as the
+    /// hybrid, MoE and scaled-RoPE models; see [`super::checkpoint`].
+    pub fn is_ane_trainable(config_json: &serde_json::Value) -> std::result::Result<(), String> {
+        super::checkpoint::check_model_type(config_json, &["llama", "mistral"], "training")?;
+        super::checkpoint::check_shared_limits(config_json, "training")
     }
 }
 
@@ -580,8 +562,9 @@ impl DynamicAneTrainer {
             n_kv_heads: nkv,
             head_dim: hd,
             seq_len: s,
-            rope_theta: 1_000_000.0,
-            rms_norm_eps: 1e-6,
+            // Both used to be constants here, whatever the checkpoint said (#34).
+            rope_theta: config.rope_theta,
+            rms_norm_eps: config.rms_norm_eps,
         };
 
         // Try to initialize Metal GPU dW path
@@ -2767,11 +2750,6 @@ impl DynamicAneTrainer {
             }
         }
 
-        fn copy_w(src: &[f32], dst: &mut [f32], expected: usize) {
-            let n = src.len().min(expected).min(dst.len());
-            dst[..n].copy_from_slice(&src[..n]);
-        }
-
         let files = if path.is_file() {
             vec![path.to_path_buf()]
         } else {
@@ -2805,6 +2783,7 @@ impl DynamicAneTrainer {
             }
         };
 
+        let mut loader = super::checkpoint::StrictLoader::default();
         for file_path in &files {
             let file = std::fs::File::open(file_path).map_err(|e| {
                 MetalError::InvalidConfig(format!("Failed to open {:?}: {e}", file_path))
@@ -2818,18 +2797,17 @@ impl DynamicAneTrainer {
             })?;
 
             for (name, tensor) in tensors.tensors() {
-                let data = match st_to_f32(&tensor) {
-                    Some(d) => d,
-                    None => continue,
-                };
+                // An unsupported dtype is an error only for a tensor we use.
+                let data = st_to_f32(&tensor)
+                    .ok_or_else(|| format!("unsupported dtype {:?}", tensor.dtype()));
 
                 if name == "model.embed_tokens.weight" {
                     let expected = self.config.vocab_size * d;
-                    copy_w(&data, &mut self.embed_weights, expected);
+                    loader.copy(&name, &data, &mut self.embed_weights, expected)?;
                     continue;
                 }
                 if name == "model.norm.weight" {
-                    copy_w(&data, &mut self.rms_final, d);
+                    loader.copy(&name, &data, &mut self.rms_final, d)?;
                     continue;
                 }
 
@@ -2849,21 +2827,32 @@ impl DynamicAneTrainer {
                     let qd = self.kernel_config.q_dim();
                     let kvd = self.kernel_config.kv_dim();
                     let lw = &mut self.layer_weights[layer_idx];
-                    match parts[1] {
-                        "self_attn.q_proj.weight" => copy_w(&data, &mut lw.wq, qd * d),
-                        "self_attn.k_proj.weight" => copy_w(&data, &mut lw.wk, kvd * d),
-                        "self_attn.v_proj.weight" => copy_w(&data, &mut lw.wv, kvd * d),
-                        "self_attn.o_proj.weight" => copy_w(&data, &mut lw.wo, d * qd),
-                        "mlp.gate_proj.weight" => copy_w(&data, &mut lw.w1, h * d),
-                        "mlp.down_proj.weight" => copy_w(&data, &mut lw.w2, d * h),
-                        "mlp.up_proj.weight" => copy_w(&data, &mut lw.w3, h * d),
-                        "input_layernorm.weight" => copy_w(&data, &mut lw.rms_att, d),
-                        "post_attention_layernorm.weight" => copy_w(&data, &mut lw.rms_ffn, d),
-                        _ => {}
-                    }
+                    let (dst, expected): (&mut [f32], usize) = match parts[1] {
+                        "self_attn.q_proj.weight" => (&mut lw.wq, qd * d),
+                        "self_attn.k_proj.weight" => (&mut lw.wk, kvd * d),
+                        "self_attn.v_proj.weight" => (&mut lw.wv, kvd * d),
+                        "self_attn.o_proj.weight" => (&mut lw.wo, d * qd),
+                        "mlp.gate_proj.weight" => (&mut lw.w1, h * d),
+                        "mlp.down_proj.weight" => (&mut lw.w2, d * h),
+                        "mlp.up_proj.weight" => (&mut lw.w3, h * d),
+                        "input_layernorm.weight" => (&mut lw.rms_att, d),
+                        "post_attention_layernorm.weight" => (&mut lw.rms_ffn, d),
+                        _ => continue,
+                    };
+                    loader.copy(&name, &data, dst, expected)?;
                 }
             }
         }
+
+        loader.require(
+            ["model.embed_tokens.weight", "model.norm.weight"]
+                .map(String::from)
+                .into_iter()
+                .chain(super::checkpoint::layer_tensors(
+                    self.config.n_layers,
+                    &TRAINER_LAYER_TENSORS,
+                )),
+        )?;
 
         // Initialize transposed weights
         self.refresh_transposed_weights();
@@ -3021,79 +3010,54 @@ mod tests {
     // ======== Architecture Validation Tests ========
 
     #[test]
-    fn test_ane_compatible_llama() {
+    fn a_plain_llama_is_trainable() {
         let config = serde_json::json!({
             "model_type": "llama",
             "hidden_size": 768,
             "num_attention_heads": 12,
-            "num_hidden_layers": 12,
+            "rope_scaling": null,
+            "tie_word_embeddings": true,
         });
-        assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_ok());
+        assert!(DynamicAneTrainerConfig::is_ane_trainable(&config).is_ok());
+    }
+
+    /// ⚠️ Qwen3 was admitted before (#34). Its per-head q/k norm is not in the
+    /// training kernels, and the loader never read q_norm/k_norm.
+    #[test]
+    fn qwen3_is_not_trainable() {
+        let config = serde_json::json!({"model_type": "qwen3", "hidden_size": 768});
+        let err = DynamicAneTrainerConfig::is_ane_trainable(&config).unwrap_err();
+        assert!(err.contains("qwen3"), "{err}");
     }
 
     #[test]
-    fn test_ane_compatible_qwen3() {
-        let config = serde_json::json!({
-            "model_type": "qwen3",
-            "hidden_size": 768,
-            "num_attention_heads": 12,
-            "num_key_value_heads": 4,
-        });
-        assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_ok());
+    fn hybrid_and_other_architectures_are_not_trainable() {
+        for model_type in ["qwen3_next", "nemotron_h", "gemma4_text", "gemma3", ""] {
+            let config = serde_json::json!({"model_type": model_type});
+            assert!(
+                DynamicAneTrainerConfig::is_ane_trainable(&config).is_err(),
+                "{model_type:?} should be rejected"
+            );
+        }
     }
 
     #[test]
-    fn test_ane_incompatible_qwen3_5() {
-        let config = serde_json::json!({
-            "model_type": "qwen3_next",
-            "hidden_size": 768,
-            "num_attention_heads": 12,
-        });
-        let result = DynamicAneTrainerConfig::is_ane_compatible(&config);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("hybrid/recurrent"));
-    }
-
-    #[test]
-    fn test_ane_incompatible_nemotron_h() {
-        let config = serde_json::json!({
-            "model_type": "nemotron_h",
-            "hidden_size": 768,
-        });
-        assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_err());
-    }
-
-    #[test]
-    fn test_ane_incompatible_gemma4() {
-        let config = serde_json::json!({
-            "model_type": "gemma4_text",
-            "hidden_size": 768,
-            "num_attention_heads": 12,
-        });
-        let result = DynamicAneTrainerConfig::is_ane_compatible(&config);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("hybrid/recurrent"));
-    }
-
-    #[test]
-    fn test_ane_incompatible_moe() {
-        let config = serde_json::json!({
-            "model_type": "llama",
-            "hidden_size": 768,
-            "num_experts": 8,
-        });
-        let result = DynamicAneTrainerConfig::is_ane_compatible(&config);
-        assert!(result.is_err());
-        assert!(result.unwrap_err().contains("MoE"));
-    }
-
-    #[test]
-    fn test_ane_incompatible_moe_local_experts() {
-        let config = serde_json::json!({
-            "model_type": "llama",
-            "hidden_size": 768,
-            "num_local_experts": 8,
-        });
-        assert!(DynamicAneTrainerConfig::is_ane_compatible(&config).is_err());
+    fn llama_variants_the_kernels_dont_implement_are_not_trainable() {
+        for (key, value) in [
+            ("num_experts", serde_json::json!(8)),
+            ("num_local_experts", serde_json::json!(8)),
+            (
+                "rope_scaling",
+                serde_json::json!({"rope_type": "llama3", "factor": 32.0}),
+            ),
+            ("tie_word_embeddings", serde_json::json!(false)),
+        ] {
+            let mut config = serde_json::json!({"model_type": "llama"});
+            config[key] = value;
+            assert!(
+                DynamicAneTrainerConfig::is_ane_trainable(&config).is_err(),
+                "{key} should be rejected"
+            );
+        }
     }
 }

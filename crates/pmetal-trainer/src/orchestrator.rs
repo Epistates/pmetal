@@ -627,7 +627,7 @@ pub async fn run_training(
         let config_text = std::fs::read_to_string(model_path.join("config.json"))?;
         let config_json: serde_json::Value = serde_json::from_str(&config_text)?;
 
-        match DynamicAneTrainerConfig::is_ane_compatible(&config_json) {
+        match DynamicAneTrainerConfig::is_ane_trainable(&config_json) {
             Ok(()) => {
                 tracing::info!("Model is ANE-compatible — attempting ANE full-parameter training");
                 emit_phase(phase_cb, TrainingPhase::CompilingAneKernels);
@@ -1362,7 +1362,7 @@ async fn attempt_ane_training(
     let config_text = std::fs::read_to_string(model_path.join("config.json"))?;
     let config_json: serde_json::Value = serde_json::from_str(&config_text)?;
 
-    if let Err(reason) = DynamicAneTrainerConfig::is_ane_compatible(&config_json) {
+    if let Err(reason) = DynamicAneTrainerConfig::is_ane_trainable(&config_json) {
         anyhow::bail!("{}", reason);
     }
 
@@ -1520,6 +1520,14 @@ async fn attempt_ane_training(
         .and_then(|v| v.as_f64())
         .map(|v| v as f32)
         .unwrap_or(1e-6);
+    // The config default is 1e6 (Qwen's). Llama 2 uses 1e4 and Llama 3 5e5, so
+    // leaving it at the default rotated every Llama's positions wrongly (#34).
+    // 1e4 is the Hugging Face default when the key is absent.
+    let rope_theta = config_json
+        .get("rope_theta")
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(10_000.0);
 
     let trainer_config = DynamicAneTrainerConfig {
         dim,
@@ -1551,6 +1559,7 @@ async fn attempt_ane_training(
         warmup_steps: full_config.training.warmup_steps.max(50),
         gradient_clip_norm: full_config.training.max_grad_norm as f32,
         rms_norm_eps,
+        rope_theta,
         loss_scale: config.dispatch.loss_scale,
         embedding_lr: full_config
             .training

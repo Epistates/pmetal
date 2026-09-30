@@ -335,9 +335,9 @@ impl AneRuntime {
         self.chaining_class.is_some()
     }
 
-    /// Check if ANE performance stats API is available.
+    /// Check if ANE performance stats can be requested on this system.
     pub fn perf_stats_available(&self) -> bool {
-        self.perf_stats_class.is_some()
+        self.perf_stats_class.is_some() && perf_stats_request_supported()
     }
 
     /// Check if the ANE real-time evaluation API is available.
@@ -879,7 +879,10 @@ impl AneModel {
         unsafe {
             let rt = AneRuntime::global()?;
             let perf_stats = if collect_stats {
-                let Some(perf_class) = rt.perf_stats_class else {
+                let Some(perf_class) = rt
+                    .perf_stats_class
+                    .filter(|_| perf_stats_request_supported())
+                else {
                     self.evaluate_inner(inputs, outputs, mode, false)?;
                     return Ok(AnePerformanceStats::default());
                 };
@@ -1147,6 +1150,22 @@ unsafe fn client_can_load(model: *mut AnyObject) -> bool {
     responds.as_bool()
 }
 
+/// Whether a request may carry an `_ANEPerformanceStats`. On macOS 27,
+/// `-[_ANERequest validate]` sends `-count` to the `perfStats` argument, so the
+/// single stats object earlier releases take raises an Objective-C exception
+/// Rust can't catch, and ANE training aborted on its first step (#34). The
+/// shape it now expects isn't known, so stats aren't requested there;
+/// evaluation works without them and hardware time reads as 0.
+fn perf_stats_request_supported() -> bool {
+    static SUPPORTED: OnceLock<bool> = OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        objc2_foundation::NSProcessInfo::processInfo()
+            .operatingSystemVersion()
+            .majorVersion
+            < 27
+    })
+}
+
 fn empty_options_dict() -> objc2::rc::Retained<NSDictionary<NSString, AnyObject>> {
     NSDictionary::<NSString, AnyObject>::new()
 }
@@ -1287,7 +1306,10 @@ mod tests {
             Ok(rt) => {
                 assert_eq!(rt.real_time_available(), rt.client_class.is_some());
                 assert_eq!(rt.chaining_available(), rt.chaining_class.is_some());
-                assert_eq!(rt.perf_stats_available(), rt.perf_stats_class.is_some());
+                assert_eq!(
+                    rt.perf_stats_available(),
+                    rt.perf_stats_class.is_some() && perf_stats_request_supported()
+                );
             }
             Err(MetalError::AneNotAvailable) => {}
             Err(e) => panic!("Unexpected error: {e}"),

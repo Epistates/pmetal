@@ -149,6 +149,7 @@ fn ane_training_reduces_loss() {
         warmup_steps: 0,
         min_lr_ratio: 0.1,
         rms_norm_eps: 1e-6,
+        rope_theta: 1_000_000.0,
         loss_scale: 1.0,
         embedding_lr: None,
     };
@@ -264,6 +265,7 @@ fn ane_kernels_compile_all_configs() {
             warmup_steps: 0,
             min_lr_ratio: 0.1,
             rms_norm_eps: 1e-6,
+            rope_theta: 1_000_000.0,
             loss_scale: 1.0,
             embedding_lr: None,
         };

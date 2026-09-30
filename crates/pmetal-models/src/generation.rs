@@ -2825,7 +2825,7 @@ where
 pub fn is_ane_inference_compatible(
     config_json: &serde_json::Value,
 ) -> std::result::Result<(), String> {
-    pmetal_metal::ane::dynamic_trainer::DynamicAneTrainerConfig::is_ane_compatible(config_json)
+    pmetal_metal::ane::inference::is_ane_inference_compatible(config_json)
 }
 
 /// Check if a model config is compatible with the CPU hybrid engine.
@@ -3367,11 +3367,15 @@ mod tests {
     #[test]
     fn test_is_ane_inference_compatible_rejects_hybrid_architectures() {
         let dense: serde_json::Value = serde_json::json!({
-            "model_type": "llama",
+            "model_type": "qwen3",
             "num_experts": 0,
             "num_local_experts": 0
         });
         assert!(is_ane_inference_compatible(&dense).is_ok());
+
+        // The engine applies per-head q/k norm, which Llama doesn't have (#34).
+        let llama: serde_json::Value = serde_json::json!({"model_type": "llama"});
+        assert!(is_ane_inference_compatible(&llama).is_err());
 
         let hybrid: serde_json::Value = serde_json::json!({
             "model_type": "qwen3_next",
