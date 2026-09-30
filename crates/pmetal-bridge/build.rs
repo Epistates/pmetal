@@ -209,11 +209,11 @@ fn try_reuse_cached_mlx(prefix: &std::path::Path) -> Option<(PathBuf, PathBuf)> 
     }
     let lib_dir = prefix.join("lib");
     let include_dir = prefix.join("include");
-    // Accept either the shared build (libmlx.dylib, release) or the static
-    // build (libmlx.a, debug). Profile is baked into the fingerprint above,
-    // so whichever shows up here matches what this build expects.
-    let has_lib = lib_dir.join(mlx_dylib_name()).exists() || lib_dir.join("libmlx.a").exists();
-    if !has_lib {
+    // The slot must hold the kind this build links and not the other: a
+    // static slot that also held a dylib (populated from a stale tree) linked
+    // dynamically, so it's rebuilt instead of reused.
+    let (wanted, other) = mlx_lib_names();
+    if !lib_dir.join(wanted).exists() || lib_dir.join(other).exists() {
         return None;
     }
     #[cfg(feature = "metal")]
@@ -248,13 +248,12 @@ fn populate_mlx_prefix(dst: &std::path::Path, prefix: &std::path::Path) -> std::
     std::fs::create_dir_all(&lib_dir)?;
     std::fs::create_dir_all(&include_dir)?;
 
-    // Copy whichever MLX library artifact exists for this profile.
-    for name in [mlx_dylib_name(), "libmlx.a"] {
-        let src = dst.join("build/lib").join(name);
-        if src.exists() {
-            std::fs::copy(&src, lib_dir.join(name))?;
-        }
-    }
+    // Only the kind this fingerprint promises. The build tree can hold a
+    // stale one of the other kind, and copying it made a static slot link
+    // dynamically.
+    let (wanted, other) = mlx_lib_names();
+    let _ = std::fs::remove_file(lib_dir.join(other));
+    std::fs::copy(dst.join("build/lib").join(wanted), lib_dir.join(wanted))?;
 
     #[cfg(feature = "metal")]
     {
@@ -345,10 +344,15 @@ fn run_cmake_build() -> PathBuf {
         // the artifact carries MLX inside it: no dylib to locate, no install
         // name, no rpath, nothing to bundle. Dead-stripping at link time keeps
         // the result near the size of the dynamic build.
-        if !mlx_static_requested() {
-            config.define("BUILD_SHARED_LIBS", "ON");
-        }
     }
+    // Always explicit, both ways: CMake caches it in the build tree, so
+    // leaving it unset for a static build meant a directory that last built
+    // shared (a release `cargo test`, then PMETAL_MLX_STATIC=1) built shared
+    // again, and the "static" binary linked this tree's libmlx.dylib.
+    config.define(
+        "BUILD_SHARED_LIBS",
+        if mlx_builds_shared() { "ON" } else { "OFF" },
+    );
 
     config.build()
 }
@@ -358,6 +362,25 @@ fn run_cmake_build() -> PathBuf {
 /// Debug already builds static unconditionally, so this only steers release.
 fn mlx_static_requested() -> bool {
     env::var("PMETAL_MLX_STATIC").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+/// Whether this build produces `libmlx.dylib` (else `libmlx.a`): release,
+/// unless PMETAL_MLX_STATIC asks for static.
+fn mlx_builds_shared() -> bool {
+    !cfg!(debug_assertions) && !mlx_static_requested()
+}
+
+/// The MLX library file this build links, and the one it must not find.
+///
+/// The link is `dylib=mlx`, which resolves to whichever of the two the linker
+/// meets first on the search path, so a leftover of the other kind decides
+/// the linkage. Static linking relies on no `libmlx.dylib` being visible.
+fn mlx_lib_names() -> (&'static str, &'static str) {
+    if mlx_builds_shared() {
+        (mlx_dylib_name(), "libmlx.a")
+    } else {
+        ("libmlx.a", mlx_dylib_name())
+    }
 }
 
 // ── Main build ────────────────────────────────────────────────────────────
@@ -400,6 +423,13 @@ fn build_and_link() {
             }
             None => {
                 let dst = run_cmake_build();
+                // This tree may have built the other kind before (the env var
+                // changed, not the OUT_DIR). Both paths below go on the link
+                // search path, so drop the leftover or it decides the linkage.
+                let (_, other) = mlx_lib_names();
+                for dir in ["build/lib", "build/_deps/mlx-build"] {
+                    let _ = std::fs::remove_file(dst.join(dir).join(other));
+                }
                 // Legacy search path — cmake puts the fetched target's libs in _deps too.
                 println!(
                     "cargo:rustc-link-search=native={}/build/_deps/mlx-build",
