@@ -124,6 +124,16 @@ humansize = "2"
 dirs = "7"
 walkdir = "2"
 memmap2 = "0.9"
+chrono = "0.4.45"
+futures = "0.3.34"
+image = "0.25.10"
+libc = "0.2.189"
+parking_lot = "0.12.5"
+regex = "1.13"
+uuid = "1.26"
+
+# Native build helpers
+cc = "1.5"
 
 # Python bindings
 pyo3 = "0.29"
@@ -133,6 +143,7 @@ pyo3-build-config = "0.29"
 criterion = "0.8"
 tempfile = "3"
 proptest = "1.11"
+serial_test = "4.0"
 
 [workspace.lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

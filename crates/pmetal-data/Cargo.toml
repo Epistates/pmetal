@@ -29,7 +29,7 @@ time = { version = "0.3", features = ["formatting", "macros"] }
 memmap2 = { workspace = true }
 rand = { workspace = true }
 rayon = "1"
-image = "0.25"
+image = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

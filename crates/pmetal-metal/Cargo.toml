@@ -51,10 +51,10 @@ safetensors = { workspace = true, optional = true }
 memmap2 = { workspace = true, optional = true }
 
 # Synchronization
-parking_lot = "0.12"
+parking_lot = { workspace = true }
 
 [build-dependencies]
-cc = "1"
+cc = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

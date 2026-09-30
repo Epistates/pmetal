@@ -36,20 +36,20 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 indicatif = { workspace = true }
 tokio = { workspace = true }
-chrono = "0.4"
+chrono = { workspace = true }
 dirs = { workspace = true }
 serde_yaml = { workspace = true }
 anyhow = { workspace = true }
 arrow = { workspace = true }
 parquet = { workspace = true }
-image = "0.25"
+image = { workspace = true }
 
 # TensorBoard event files
 prost = "0.14"
 crc = "3.4"
 
 [dev-dependencies]
-serial_test = "4"
+serial_test = { workspace = true }
 tempfile = { workspace = true }
 
 [lints]

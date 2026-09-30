@@ -32,7 +32,7 @@ bitcode = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 criterion = { workspace = true }
-serial_test = "4"
+serial_test = { workspace = true }
 
 [[bench]]
 name = "gpu_losses"

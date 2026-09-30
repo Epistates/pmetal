@@ -108,24 +108,24 @@ indicatif = { workspace = true, optional = true }
 anyhow = { workspace = true, optional = true }
 safetensors = { workspace = true, optional = true }
 dirs = { workspace = true, optional = true }
-chrono = { version = "0.4", optional = true }
+chrono = { workspace = true, optional = true }
 parquet = { workspace = true, features = ["arrow"], optional = true }
 arrow-array = { workspace = true, optional = true }
 arrow-json = { workspace = true, optional = true }
 rand = { workspace = true, optional = true }
-regex = { version = "1", optional = true }
+regex = { workspace = true, optional = true }
 tempfile = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 walkdir = { workspace = true, optional = true }
 flate2 = { version = "1", optional = true }
-libc = { version = "0.2", optional = true }
+libc = { workspace = true, optional = true }
 reqwest = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 
 # Dashboard dependencies (optional, behind "dashboard" feature)
 ratatui = { version = "0.30", optional = true }
 crossterm = { version = "0.29", features = ["event-stream"], optional = true }
-futures = { version = "0.3", optional = true }
+futures = { workspace = true, optional = true }
 tokio-util = { version = "0.7", features = ["rt"], optional = true }
 
 [build-dependencies]

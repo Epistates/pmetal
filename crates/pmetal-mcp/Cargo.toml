@@ -37,8 +37,8 @@ tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 
 # Job management
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1", features = ["v4"] }
+chrono = { workspace = true, features = ["serde"] }
+uuid = { workspace = true, features = ["v4"] }
 
 [lints]
 workspace = true

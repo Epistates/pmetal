@@ -21,7 +21,7 @@ num-traits = { workspace = true }
 tokio = { workspace = true }
 
 # Concurrency
-parking_lot = "0.12"
+parking_lot = { workspace = true }
 
 # Serialization - use workspace
 serde = { workspace = true }

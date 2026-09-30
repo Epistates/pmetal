@@ -34,7 +34,7 @@ thiserror = { workspace = true }
 anyhow = { workspace = true }
 
 # Async utilities
-futures = "0.3"
+futures = { workspace = true }
 bytes = "1.12"
 async-trait = "0.1"
 zerocopy = { workspace = true }
@@ -62,7 +62,7 @@ dirs = { workspace = true }
 sha3 = "0.12"
 bs58 = "0.5"
 rand = { workspace = true }
-parking_lot = "0.12"
+parking_lot = { workspace = true }
 half = { workspace = true }
 ordered-float = "5"
 

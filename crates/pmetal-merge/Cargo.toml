@@ -29,7 +29,7 @@ half = { workspace = true }
 zerocopy = { workspace = true }
 memmap2 = { workspace = true }
 ndarray = { workspace = true }
-regex = "1"
+regex = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
