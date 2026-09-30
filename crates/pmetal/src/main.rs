@@ -596,6 +596,24 @@ enum Commands {
     Cluster(crate::cli::cluster::ClusterArgs),
 }
 
+impl Commands {
+    /// Whether this command runs anything on MLX. The ones that don't skip the
+    /// metallib search and the device check in `main`, so a missing or broken
+    /// Metal library (or no network for the download fallback) can't stop
+    /// them. A new command counts as using MLX until it is listed here.
+    fn uses_mlx(&self) -> bool {
+        match self {
+            #[cfg(feature = "trainer")]
+            Commands::Init { .. } => false,
+            Commands::Download { .. }
+            | Commands::Search { .. }
+            | Commands::Dataset { .. }
+            | Commands::Tokenize(_) => false,
+            _ => true,
+        }
+    }
+}
+
 /// Dataset subcommands for data preparation.
 #[derive(Subcommand, Debug)]
 enum DatasetAction {
@@ -1343,7 +1361,8 @@ fn download_metallib(dest: &std::path::Path) -> bool {
 /// `#[tokio::main]`. Logging is set up first so its messages are recorded, and
 /// argument parsing before that, so `--help` and usage errors exit without
 /// searching for (or downloading) a metallib. MLX's Metal device is then built
-/// before any command, which measured no slower than not doing it.
+/// before any command that uses MLX, which measured no slower than not doing
+/// it; the others (`Commands::uses_mlx`) skip both steps.
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -1354,17 +1373,19 @@ fn main() -> anyhow::Result<()> {
     let is_tui = false;
     init_logging(if is_tui { "tui" } else { "cli" }, is_tui);
 
-    ensure_metallib();
-    // Load the library now: if MLX can't, every command would otherwise fail
-    // later, some by aborting from a bridge call with no error guard.
-    pmetal_bridge::inline_array::init_device().map_err(|e| {
-        anyhow::anyhow!(
-            "MLX could not load its Metal library: {e}\n\
-             Remove that file, or set PMETAL_METALLIB_PATH to a working mlx.metallib."
-        )
-    })?;
-    #[cfg(feature = "metal")]
-    let _ = pmetal_metal::context::MetalContext::device_available();
+    if cli.command.uses_mlx() {
+        ensure_metallib();
+        // Load the library now: if MLX can't, the command would otherwise fail
+        // later, possibly by aborting from a bridge call with no error guard.
+        pmetal_bridge::inline_array::init_device().map_err(|e| {
+            anyhow::anyhow!(
+                "MLX could not load its Metal library: {e}\n\
+                 Remove that file, or set PMETAL_METALLIB_PATH to a working mlx.metallib."
+            )
+        })?;
+        #[cfg(feature = "metal")]
+        let _ = pmetal_metal::context::MetalContext::device_available();
+    }
     tokio_main(cli)
 }
 
