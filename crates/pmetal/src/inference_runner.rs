@@ -29,13 +29,14 @@ use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::GenerationConfig;
 use pmetal_models::{
     Gemma4MtpConfig, GenerationOutput, Qwen3NextMtpConfig, generate_cached_async_streaming,
-    generate_gemma4_mtp_streaming, generate_qwen3_next_mtp_streaming,
-    generate_qwen3_next_mtp_streaming_rebuild, validate_gemma4_mtp_pair,
+    generate_gemma4_mtp_streaming, generate_qwen3_next_mtp_streaming, validate_gemma4_mtp_pair,
     validate_qwen3_next_mtp_pair,
 };
 
 #[cfg(feature = "lora")]
 use pmetal_lora::{DynamicLoraModel, TrainableModel as _};
+#[cfg(feature = "lora")]
+use pmetal_models::generate_qwen3_next_mtp_streaming_rebuild;
 
 /// Configuration for preparing an inference run.
 ///

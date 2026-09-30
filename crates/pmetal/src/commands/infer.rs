@@ -295,7 +295,7 @@ pub(crate) async fn run_inference(
     fp8: bool,
     tools: Option<&[pmetal_data::chat_templates::ToolDefinition]>,
     ane: bool,
-    ane_max_seq_len: usize,
+    #[cfg_attr(not(feature = "ane"), allow(unused_variables))] ane_max_seq_len: usize,
     ane_real_time: bool,
     benchmark: bool,
     benchmark_iters: usize,
@@ -377,6 +377,8 @@ pub(crate) async fn run_inference(
         anyhow::bail!("--mtp-model requires --mtp");
     }
     let mtp_owns_generation = mtp || draft_model.is_some();
+    // Only the ANE path reads `ane` from here on.
+    #[cfg_attr(not(feature = "ane"), allow(unused_variables))]
     let (metal_sampler, compiled, minimal, ane) = if mtp_owns_generation {
         if metal_sampler || compiled || minimal || ane {
             tracing::info!(

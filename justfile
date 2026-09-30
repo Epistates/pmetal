@@ -14,7 +14,7 @@ default:
 # Runs every check that CI performs. If this passes, publish is safe.
 
 # Full pre-publish validation (mirrors CI + release pipelines)
-preflight: fmt-check lint lint-all-features test test-release check-gui lint-gui check-version check-lockfile deny
+preflight: fmt-check lint lint-all-features lint-min-features test test-release check-gui lint-gui check-version check-lockfile deny
     @echo ""
     @echo "All preflight checks passed -- safe to publish {{ version }}"
 
@@ -42,6 +42,12 @@ lint:
 # Clippy with ALL features enabled (catches cfg-gated field mismatches)
 lint-all-features:
     cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+# Clippy on the smallest CLI build (`cli` alone: no trainer, LoRA or ANE).
+# Nothing else compiles the paths those features gate off, so unused-code
+# warnings there went unseen.
+lint-min-features:
+    cargo clippy -p pmetal --all-targets --no-default-features --features cli -- -D warnings
 
 # ─── Building ───────────────────────────────────────────────────────
 
