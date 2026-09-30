@@ -191,11 +191,19 @@ pub fn run() {
 fn ensure_metallib(app: &tauri::AppHandle) {
     use tauri::path::BaseDirectory;
 
+    // Operator override. The CLI honours the same variable the same way.
     if let Some(explicit) = std::env::var_os("PMETAL_METALLIB_PATH")
         && !explicit.is_empty()
     {
-        pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
-        return;
+        let explicit = std::path::PathBuf::from(explicit);
+        if explicit.is_file() {
+            pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
+            return;
+        }
+        tracing::warn!(
+            path = %explicit.display(),
+            "PMETAL_METALLIB_PATH is not a file; searching the default locations"
+        );
     }
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();

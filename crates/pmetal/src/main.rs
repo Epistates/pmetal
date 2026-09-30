@@ -1065,8 +1065,25 @@ fn extract_embedded_metallib() -> Option<PathBuf> {
 /// `set_metallib_path` API (MLX >= 0.32) so the backend can find it
 /// regardless of where the binary is installed.
 ///
-/// Search order: colocated → build dir → cache → Homebrew → embedded → download → error.
+/// Search order: `PMETAL_METALLIB_PATH` → colocated → build dir → cache →
+/// Homebrew → embedded → download → error.
 fn ensure_metallib() {
+    // 0. Operator override. The GUI honours the same variable.
+    if let Some(explicit) = std::env::var_os("PMETAL_METALLIB_PATH").filter(|p| !p.is_empty()) {
+        let explicit = PathBuf::from(explicit);
+        if explicit.is_file() {
+            #[cfg(any(feature = "models", feature = "native-only"))]
+            pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
+            return;
+        }
+        // Runs before logging is initialised, hence eprintln.
+        eprintln!(
+            "\x1b[1;33mwarning:\x1b[0m PMETAL_METALLIB_PATH={} is not a file; \
+             searching the default locations",
+            explicit.display()
+        );
+    }
+
     let metallib_name = "mlx.metallib";
     let cache_dir = std::env::var("HOME")
         .ok()
