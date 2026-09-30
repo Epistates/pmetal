@@ -199,14 +199,14 @@ void mlx_inline_compiled_gdn_layer_fixed(
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("compiled_gdn_layer_fixed", e.what());
-        new (dst_out->buf) array(0.0f);
-        new (dst_conv_state->buf) array(0.0f);
-        new (dst_ssm_state->buf) array(0.0f);
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_conv_state);
+        bridge_placeholder(dst_ssm_state);
     } catch (...) {
         pmetal_bridge_set_last_error("compiled_gdn_layer_fixed", "unknown C++ exception");
-        new (dst_out->buf) array(0.0f);
-        new (dst_conv_state->buf) array(0.0f);
-        new (dst_ssm_state->buf) array(0.0f);
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_conv_state);
+        bridge_placeholder(dst_ssm_state);
     }
 }
 
@@ -376,14 +376,14 @@ void mlx_inline_compiled_attn_layer_fixed(
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("compiled_attn_layer_fixed", e.what());
-        new (dst_out->buf) array(0.0f);
-        new (dst_cache_keys->buf) array(0.0f);
-        new (dst_cache_vals->buf) array(0.0f);
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
     } catch (...) {
         pmetal_bridge_set_last_error("compiled_attn_layer_fixed", "unknown C++ exception");
-        new (dst_out->buf) array(0.0f);
-        new (dst_cache_keys->buf) array(0.0f);
-        new (dst_cache_vals->buf) array(0.0f);
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
     }
 }
 
@@ -550,14 +550,14 @@ void mlx_inline_compiled_gptoss_attn_layer_fixed(
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("compiled_gptoss_attn_layer_fixed", e.what());
-        new (dst_out->buf) array(0.0f);
-        new (dst_cache_keys->buf) array(0.0f);
-        new (dst_cache_vals->buf) array(0.0f);
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
     } catch (...) {
         pmetal_bridge_set_last_error("compiled_gptoss_attn_layer_fixed", "unknown C++ exception");
-        new (dst_out->buf) array(0.0f);
-        new (dst_cache_keys->buf) array(0.0f);
-        new (dst_cache_vals->buf) array(0.0f);
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
     }
 }
 
@@ -786,14 +786,14 @@ void mlx_inline_compiled_llama4_attn_layer_fixed(
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("compiled_llama4_attn_layer_fixed", e.what());
-        new (dst_out->buf) array(0.0f);
-        new (dst_cache_keys->buf) array(0.0f);
-        new (dst_cache_vals->buf) array(0.0f);
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
     } catch (...) {
         pmetal_bridge_set_last_error("compiled_llama4_attn_layer_fixed", "unknown C++ exception");
-        new (dst_out->buf) array(0.0f);
-        new (dst_cache_keys->buf) array(0.0f);
-        new (dst_cache_vals->buf) array(0.0f);
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
     }
 }
 
@@ -927,10 +927,10 @@ void mlx_inline_compiled_moe_layer_fixed(
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("compiled_moe_layer_fixed", e.what());
-        new (dst_out->buf) array(0.0f);
+        bridge_placeholder(dst_out);
     } catch (...) {
         pmetal_bridge_set_last_error("compiled_moe_layer_fixed", "unknown C++ exception");
-        new (dst_out->buf) array(0.0f);
+        bridge_placeholder(dst_out);
     }
 }
 
@@ -1255,14 +1255,14 @@ void mlx_inline_compiled_gemma4_attn_block(
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("compiled_gemma4_attn_block", e.what());
-        new (dst_out->buf) array(0.0f);
-        new (dst_cache_keys->buf) array(0.0f);
-        new (dst_cache_vals->buf) array(0.0f);
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
     } catch (...) {
         pmetal_bridge_set_last_error("compiled_gemma4_attn_block", "unknown C++ exception");
-        new (dst_out->buf) array(0.0f);
-        new (dst_cache_keys->buf) array(0.0f);
-        new (dst_cache_vals->buf) array(0.0f);
+        bridge_placeholder(dst_out);
+        bridge_placeholder(dst_cache_keys);
+        bridge_placeholder(dst_cache_vals);
     }
 }
 
@@ -1449,10 +1449,10 @@ void mlx_inline_compiled_gemma4_shared_attn_decode(
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("compiled_gemma4_shared_attn_decode", e.what());
-        new (dst_out->buf) array(0.0f);
+        bridge_placeholder(dst_out);
     } catch (...) {
         pmetal_bridge_set_last_error("compiled_gemma4_shared_attn_decode", "unknown C++ exception");
-        new (dst_out->buf) array(0.0f);
+        bridge_placeholder(dst_out);
     }
 }
 
@@ -1587,10 +1587,10 @@ void mlx_inline_compiled_gemma4_mlp_block(
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("compiled_gemma4_mlp_block", e.what());
-        new (dst_out->buf) array(0.0f);
+        bridge_placeholder(dst_out);
     } catch (...) {
         pmetal_bridge_set_last_error("compiled_gemma4_mlp_block", "unknown C++ exception");
-        new (dst_out->buf) array(0.0f);
+        bridge_placeholder(dst_out);
     }
 }
 
@@ -1700,10 +1700,10 @@ void mlx_inline_compiled_gemma4_per_layer_input_block(
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("compiled_gemma4_per_layer_input_block", e.what());
-        new (dst_out->buf) array(0.0f);
+        bridge_placeholder(dst_out);
     } catch (...) {
         pmetal_bridge_set_last_error("compiled_gemma4_per_layer_input_block", "unknown C++ exception");
-        new (dst_out->buf) array(0.0f);
+        bridge_placeholder(dst_out);
     }
 }
 

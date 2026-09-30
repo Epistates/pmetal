@@ -41,11 +41,34 @@ static inline const array& as_arr(const mlx_inline_array* a) {
 void pmetal_bridge_set_last_error(const char* op, const char* what) noexcept;
 void pmetal_bridge_clear_error_internal() noexcept;
 
+// Construct a placeholder array into `dst` without letting an exception
+// escape. Every path that must leave `dst` holding a valid array uses this:
+// error paths (so Rust's drop never runs ~array() on uninit memory) and
+// empty initialisation.
+//
+// The placeholder is normally a scalar zero, which allocates through MLX's
+// Metal allocator. When the failure being reported is the Metal device itself
+// (an unloadable metallib, say), that allocation throws the same error again,
+// and a C++ exception unwinding into Rust aborts the process. The fallback is
+// an empty array over a null buffer with a no-op deleter: it touches no GPU
+// state, and with zero elements nothing can read through the null pointer.
+static inline void bridge_placeholder(mlx_inline_array* dst) noexcept {
+    try {
+        new (dst->buf) array(0.0f);
+    } catch (...) {
+        new (dst->buf) array(
+            mlx::core::allocator::Buffer(nullptr),
+            mlx::core::Shape{0},
+            mlx::core::float32,
+            [](mlx::core::allocator::Buffer) {});
+    }
+}
+
 // Standard try/catch wrapper for ops that construct a single output via
 // placement-new into `dst->buf`. On success, clears any prior error and
 // runs `body` (which is expected to placement-new into dst->buf). On
-// failure, sets the thread-local error state AND placement-news a scalar
-// zero into dst->buf so Rust's drop never calls `~array()` on uninit memory.
+// failure, sets the thread-local error state AND fills dst with
+// `bridge_placeholder` so Rust's drop never calls `~array()` on uninit memory.
 //
 // `body` is variadic so call sites can pass expressions containing
 // unparenthesised commas (e.g. templates like `std::pair<int,int>`) — a
@@ -57,10 +80,10 @@ void pmetal_bridge_clear_error_internal() noexcept;
             pmetal_bridge_clear_error_internal(); \
         } catch (const std::exception& e) { \
             pmetal_bridge_set_last_error((op_name), e.what()); \
-            new ((dst)->buf) array(0.0f); \
+            bridge_placeholder(dst); \
         } catch (...) { \
             pmetal_bridge_set_last_error((op_name), "unknown C++ exception"); \
-            new ((dst)->buf) array(0.0f); \
+            bridge_placeholder(dst); \
         } \
     } while (0)
 

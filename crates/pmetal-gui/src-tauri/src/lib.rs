@@ -196,14 +196,16 @@ fn ensure_metallib(app: &tauri::AppHandle) {
         && !explicit.is_empty()
     {
         let explicit = std::path::PathBuf::from(explicit);
-        if explicit.is_file() {
-            pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
-            return;
+        match pmetal_bridge::inline_array::validate_metallib(&explicit) {
+            Ok(()) => {
+                pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
+                return;
+            }
+            Err(e) => tracing::warn!(
+                path = %explicit.display(),
+                "PMETAL_METALLIB_PATH is unusable ({e}); searching the default locations"
+            ),
         }
-        tracing::warn!(
-            path = %explicit.display(),
-            "PMETAL_METALLIB_PATH is not a file; searching the default locations"
-        );
     }
 
     let mut candidates: Vec<std::path::PathBuf> = Vec::new();
@@ -220,7 +222,17 @@ fn ensure_metallib(app: &tauri::AppHandle) {
         candidates.push(std::path::PathBuf::from(home).join(".cache/pmetal/lib/mlx.metallib"));
     }
 
-    match candidates.into_iter().find(|p| p.is_file()) {
+    // A candidate that is there but fails the header check would make MLX
+    // abort on its first allocation, so it is skipped with a warning.
+    let usable = |p: &std::path::PathBuf| match pmetal_bridge::inline_array::validate_metallib(p) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!(path = %p.display(), "skipping unusable mlx.metallib: {e}");
+            false
+        }
+    };
+    match candidates.into_iter().find(|p| usable(p)) {
         Some(path) => {
             tracing::info!(path = %path.display(), "Found mlx.metallib");
             pmetal_bridge::inline_array::set_metallib_path(&path.to_string_lossy());

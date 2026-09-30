@@ -110,13 +110,13 @@ int mlx_inline_gdn_update(
         return 0;
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("gdn_update", e.what());
-        new (dst_y->buf) array(0.0f);
-        new (dst_state->buf) array(0.0f);
+        bridge_placeholder(dst_y);
+        bridge_placeholder(dst_state);
         return -1;
     } catch (...) {
         pmetal_bridge_set_last_error("gdn_update", "unknown C++ exception");
-        new (dst_y->buf) array(0.0f);
-        new (dst_state->buf) array(0.0f);
+        bridge_placeholder(dst_y);
+        bridge_placeholder(dst_state);
         return -1;
     }
 }

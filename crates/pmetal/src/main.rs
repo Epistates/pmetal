@@ -1022,8 +1022,8 @@ pub enum OllamaTemplate {
 static MLX_METALLIB_GZ: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/mlx.metallib.gz"));
 
 /// Extract the embedded `mlx.metallib` to `~/.cache/pmetal/lib/mlx.metallib`,
-/// decompressing the gzip'd blob on first run. Skips if a file of non-zero
-/// size already exists at the destination.
+/// decompressing the gzip'd blob on first run. Skips if a valid metallib is
+/// already there; a wrong, empty or truncated one is replaced.
 /// Returns the path if extraction succeeded.
 #[cfg(target_os = "macos")]
 fn extract_embedded_metallib() -> Option<PathBuf> {
@@ -1037,13 +1037,10 @@ fn extract_embedded_metallib() -> Option<PathBuf> {
     let cache_dir = PathBuf::from(home).join(".cache/pmetal/lib");
     let dest = cache_dir.join("mlx.metallib");
 
-    // Skip if already present with non-zero size
-    if dest.is_file() {
-        if let Ok(meta) = dest.metadata() {
-            if meta.len() > 0 {
-                return Some(dest);
-            }
-        }
+    // Skip if already present and whole. A corrupt copy is overwritten below
+    // rather than returned, or it would reach MLX and abort the process.
+    if pmetal_bridge::inline_array::validate_metallib(&dest).is_ok() {
+        return Some(dest);
     }
 
     std::fs::create_dir_all(&cache_dir).ok()?;
@@ -1065,21 +1062,36 @@ fn extract_embedded_metallib() -> Option<PathBuf> {
 /// `set_metallib_path` API (MLX >= 0.32) so the backend can find it
 /// regardless of where the binary is installed.
 ///
+/// Whether `path` holds a whole Metal library. A file that is there but fails
+/// the check (wrong, empty or truncated) is reported, so the search moves past
+/// it rather than handing MLX a library it can't load.
+fn usable_metallib(path: &Path) -> bool {
+    match pmetal_bridge::inline_array::validate_metallib(path) {
+        Ok(()) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => {
+            tracing::warn!(path = %path.display(), "skipping unusable mlx.metallib: {e}");
+            false
+        }
+    }
+}
+
 /// Search order: `PMETAL_METALLIB_PATH` → colocated → build dir → cache →
 /// Homebrew → embedded → download → error.
 fn ensure_metallib() {
     // 0. Operator override. The GUI honours the same variable.
     if let Some(explicit) = std::env::var_os("PMETAL_METALLIB_PATH").filter(|p| !p.is_empty()) {
         let explicit = PathBuf::from(explicit);
-        if explicit.is_file() {
-            #[cfg(any(feature = "models", feature = "native-only"))]
-            pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
-            return;
+        match pmetal_bridge::inline_array::validate_metallib(&explicit) {
+            Ok(()) => {
+                pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
+                return;
+            }
+            Err(e) => tracing::warn!(
+                path = %explicit.display(),
+                "PMETAL_METALLIB_PATH is unusable ({e}); searching the default locations"
+            ),
         }
-        tracing::warn!(
-            path = %explicit.display(),
-            "PMETAL_METALLIB_PATH is not a file; searching the default locations"
-        );
     }
 
     let metallib_name = "mlx.metallib";
@@ -1138,7 +1150,7 @@ fn ensure_metallib() {
     // 4. Homebrew Intel / standard
     search_paths.push("/usr/local/lib/mlx.metallib".into());
 
-    if let Some(path) = search_paths.iter().find(|p| p.is_file()) {
+    if let Some(path) = search_paths.iter().find(|p| usable_metallib(p)) {
         // Since MLX v0.32 the override is upstream API (set_metallib_path),
         // replacing the pre-0.32 source patch that read an env var.
         #[cfg(any(feature = "models", feature = "native-only"))]
@@ -1305,6 +1317,12 @@ fn download_metallib(dest: &std::path::Path) -> bool {
         eprintln!("\x1b[1;33mwarning:\x1b[0m Failed to write temp metallib: {e}");
         return false;
     }
+    // Catches a bad file even when no SHA-256 was compiled in.
+    if let Err(e) = pmetal_bridge::inline_array::validate_metallib(&tmp) {
+        eprintln!("\x1b[1;33mwarning:\x1b[0m Downloaded mlx.metallib is unusable: {e}");
+        let _ = std::fs::remove_file(&tmp);
+        return false;
+    }
 
     if std::fs::rename(&tmp, dest).is_ok() {
         eprintln!(
@@ -1324,7 +1342,8 @@ fn download_metallib(dest: &std::path::Path) -> bool {
 /// download fallback blocks on a runtime of its own, which can't start inside
 /// `#[tokio::main]`. Logging is set up first so its messages are recorded, and
 /// argument parsing before that, so `--help` and usage errors exit without
-/// searching for (or downloading) a metallib.
+/// searching for (or downloading) a metallib. MLX's Metal device is then built
+/// before any command, which measured no slower than not doing it.
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
@@ -1336,6 +1355,14 @@ fn main() -> anyhow::Result<()> {
     init_logging(if is_tui { "tui" } else { "cli" }, is_tui);
 
     ensure_metallib();
+    // Load the library now: if MLX can't, every command would otherwise fail
+    // later, some by aborting from a bridge call with no error guard.
+    pmetal_bridge::inline_array::init_device().map_err(|e| {
+        anyhow::anyhow!(
+            "MLX could not load its Metal library: {e}\n\
+             Remove that file, or set PMETAL_METALLIB_PATH to a working mlx.metallib."
+        )
+    })?;
     #[cfg(feature = "metal")]
     let _ = pmetal_metal::context::MetalContext::device_available();
     tokio_main(cli)

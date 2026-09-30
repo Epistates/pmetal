@@ -20,7 +20,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - **Dataset downloads returned the wrong directory when the first file was nested** (`data/train-….parquet`), because the snapshot root was taken as the parent of that file
-- **The CLI ignored `PMETAL_METALLIB_PATH`**, though 0.6.0's notes say it is honoured as an operator override. Only the GUI read it. The CLI now checks it before every other location. Both warn and fall back to the normal search when it names something that isn't a file, where the GUI used to hand a mistyped path to MLX and fail on the first kernel
+- **The CLI ignored `PMETAL_METALLIB_PATH`**, though 0.6.0's notes say it is honoured as an operator override. Only the GUI read it. The CLI now checks it before every other location. Both warn and fall back to the normal search when it doesn't name a usable Metal library, where the GUI used to hand a mistyped path to MLX and fail on the first kernel
+- **A bad `mlx.metallib` aborted the process** (`libc++abi: terminating due to uncaught exception`) instead of reporting an error. MLX builds its Metal device on the first allocation, and when the library wouldn't load, the throw escaped into Rust, including from the bridge's own error handlers, whose fallback array allocated through the same failing device. Now a wrong, empty or truncated file is rejected by its header before MLX sees it (a corrupt cached copy is skipped and re-extracted), the CLI loads the library before any command and exits with a clear error if MLX still refuses it, and the bridge's error paths no longer allocate on the GPU
 - **`pmetal-py` could not be published to crates.io**: its dependency on the `pmetal` crate was a bare path with no version, which `cargo publish` rejects. It now inherits `pmetal-lib` from the workspace table, so `just bump` keeps the version current
 
 ## [0.6.0] - 2026-09-10

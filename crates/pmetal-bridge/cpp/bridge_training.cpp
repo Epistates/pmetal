@@ -270,13 +270,13 @@ void mlx_inline_quantize(mlx_inline_array* dst_w, mlx_inline_array* dst_scales,
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("quantize", e.what());
         new (dst_w->buf)      array(0.0f);
-        new (dst_scales->buf) array(0.0f);
-        new (dst_biases->buf) array(0.0f);
+        bridge_placeholder(dst_scales);
+        bridge_placeholder(dst_biases);
     } catch (...) {
         pmetal_bridge_set_last_error("quantize", "unknown C++ exception");
         new (dst_w->buf)      array(0.0f);
-        new (dst_scales->buf) array(0.0f);
-        new (dst_biases->buf) array(0.0f);
+        bridge_placeholder(dst_scales);
+        bridge_placeholder(dst_biases);
     }
 }
 
@@ -291,11 +291,11 @@ void mlx_inline_quantize_mode(mlx_inline_array* dst_w, mlx_inline_array* dst_sca
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("quantize_mode", e.what());
         new (dst_w->buf)      array(0.0f);
-        new (dst_scales->buf) array(0.0f);
+        bridge_placeholder(dst_scales);
     } catch (...) {
         pmetal_bridge_set_last_error("quantize_mode", "unknown C++ exception");
         new (dst_w->buf)      array(0.0f);
-        new (dst_scales->buf) array(0.0f);
+        bridge_placeholder(dst_scales);
     }
 }
 
@@ -373,12 +373,12 @@ void mlx_inline_svd(
         pmetal_bridge_set_last_error("svd", e.what());
         new (dst_u->buf)  array(0.0f);
         new (dst_s->buf)  array(0.0f);
-        new (dst_vt->buf) array(0.0f);
+        bridge_placeholder(dst_vt);
     } catch (...) {
         pmetal_bridge_set_last_error("svd", "unknown C++ exception");
         new (dst_u->buf)  array(0.0f);
         new (dst_s->buf)  array(0.0f);
-        new (dst_vt->buf) array(0.0f);
+        bridge_placeholder(dst_vt);
     }
 }
 
@@ -463,13 +463,13 @@ void mlx_inline_value_and_grad(
         // Return scalar NaN loss and zero gradients so the training loop can detect failure.
         new (loss_out->buf) array(std::numeric_limits<float>::quiet_NaN());
         for (int i = 0; i < n_params; i++) {
-            new (grads_out[i]->buf) array(0.0f);
+            bridge_placeholder(grads_out[i]);
         }
     } catch (...) {
         pmetal_bridge_set_last_error("value_and_grad", "unknown C++ exception");
         new (loss_out->buf) array(std::numeric_limits<float>::quiet_NaN());
         for (int i = 0; i < n_params; i++) {
-            new (grads_out[i]->buf) array(0.0f);
+            bridge_placeholder(grads_out[i]);
         }
     }
 }

@@ -47,6 +47,55 @@ pub fn set_metallib_path(path: &str) {
     unsafe { mlx_inline_set_metallib_path(c_path.as_ptr()) }
 }
 
+/// Build MLX's Metal device now, loading the metallib given to
+/// [`set_metallib_path`].
+///
+/// MLX otherwise builds it on the first allocation. If the library can't be
+/// loaded, that throws from whichever bridge call allocates first, and several
+/// (memory queries, `synchronize`, stream setup) have no error guard, so the
+/// process aborts; the guarded ones leave placeholder arrays that a caller
+/// that doesn't check each op keeps computing on. Calling this first turns
+/// that into one error, reported before any work starts.
+///
+/// [`validate_metallib`] catches a wrong or truncated file without the GPU;
+/// this also catches one whose header is intact but whose contents MLX
+/// rejects, such as a metallib format it no longer supports.
+pub fn init_device() -> crate::BridgeResult<()> {
+    unsafe { mlx_inline_init_device() };
+    crate::check_last_error()
+}
+
+/// Check that `path` looks like a whole Metal library before handing it to
+/// [`set_metallib_path`], without touching the GPU.
+///
+/// MLX builds its Metal device on the first allocation, and a library it
+/// can't load makes that throw from whichever bridge call allocates first,
+/// often outside any error guard, which aborts the process. Rejecting a bad
+/// file here lets the caller fall back or report it instead. The header starts
+/// with the magic `MTLB` and records the file's total size as a little-endian
+/// u64 at offset 16 (true of MLX's metallib and of Apple's own), so this
+/// catches a wrong file, an empty one, and a truncated copy.
+pub fn validate_metallib(path: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind, Read};
+
+    let invalid = |why: String| Error::new(ErrorKind::InvalidData, why);
+    let mut file = std::fs::File::open(path)?;
+    let actual = file.metadata()?.len();
+    let mut header = [0u8; 24];
+    file.read_exact(&mut header)
+        .map_err(|_| invalid(format!("{actual} bytes is too short for a Metal library")))?;
+    if &header[..4] != b"MTLB" {
+        return Err(invalid("not a Metal library (no MTLB header)".into()));
+    }
+    let declared = u64::from_le_bytes(header[16..24].try_into().unwrap());
+    if declared != actual {
+        return Err(invalid(format!(
+            "header declares {declared} bytes but the file has {actual}; it is truncated or corrupt"
+        )));
+    }
+    Ok(())
+}
+
 /// Stop the Metal GPU capture.
 ///
 /// Diagnostic entry point — retained for ad-hoc profiling.
@@ -216,6 +265,44 @@ pub fn verify_buffer_layout() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The metallib this build compiled and hands out, which the header check
+    /// must accept.
+    #[test]
+    fn the_built_metallib_validates() {
+        let built = concat!(env!("OUT_DIR"), "/build/lib/mlx.metallib");
+        validate_metallib(std::path::Path::new(built)).expect("MLX's own metallib is valid");
+    }
+
+    #[test]
+    fn a_wrong_empty_or_truncated_file_is_rejected() {
+        let dir = std::env::temp_dir().join(format!("pmetal-metallib-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let p = dir.join(name);
+            std::fs::write(&p, bytes).unwrap();
+            p
+        };
+        let header = |size: u64| {
+            let mut h = b"MTLB".to_vec();
+            h.resize(16, 0);
+            h.extend_from_slice(&size.to_le_bytes());
+            h
+        };
+
+        let mut whole = header(64);
+        whole.resize(64, 0);
+        assert!(validate_metallib(&write("whole", &whole)).is_ok());
+
+        let mut truncated = header(64);
+        truncated.resize(40, 0);
+        assert!(validate_metallib(&write("truncated", &truncated)).is_err());
+        assert!(validate_metallib(&write("empty", b"")).is_err());
+        assert!(validate_metallib(&write("text", b"not a metallib, just some text")).is_err());
+        assert!(validate_metallib(&dir.join("missing")).is_err());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// ⚠️ The regression this exists for: `get_max_recommended_size` returned
     /// `hw.memsize * 3 / 4` on the theory that Metal recommends 75% of RAM.

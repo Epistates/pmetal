@@ -684,10 +684,10 @@ void mlx_inline_qwen35_decode_step(
     pmetal_bridge_clear_error_internal();
   } catch (const std::exception& e) {
     pmetal_bridge_set_last_error("qwen35_decode_step", e.what());
-    new (dst_logits->buf) array(0.0f);
+    bridge_placeholder(dst_logits);
   } catch (...) {
     pmetal_bridge_set_last_error("qwen35_decode_step", "unknown C++ exception");
-    new (dst_logits->buf) array(0.0f);
+    bridge_placeholder(dst_logits);
   }
 }
 
@@ -761,10 +761,10 @@ void mlx_inline_gdn_metal_state_update(
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("gdn_metal_state_update", e.what());
-        new (dst_state->buf) array(0.0f);
+        bridge_placeholder(dst_state);
     } catch (...) {
         pmetal_bridge_set_last_error("gdn_metal_state_update", "unknown C++ exception");
-        new (dst_state->buf) array(0.0f);
+        bridge_placeholder(dst_state);
     }
 }
 
@@ -845,12 +845,12 @@ void mlx_inline_gdn_metal_step(
         pmetal_bridge_clear_error_internal();
     } catch (const std::exception& e) {
         pmetal_bridge_set_last_error("gdn_metal_step", e.what());
-        new (dst_y->buf) array(0.0f);
-        new (dst_state->buf) array(0.0f);
+        bridge_placeholder(dst_y);
+        bridge_placeholder(dst_state);
     } catch (...) {
         pmetal_bridge_set_last_error("gdn_metal_step", "unknown C++ exception");
-        new (dst_y->buf) array(0.0f);
-        new (dst_state->buf) array(0.0f);
+        bridge_placeholder(dst_y);
+        bridge_placeholder(dst_state);
     }
 }
 

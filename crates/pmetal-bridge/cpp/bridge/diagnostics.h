@@ -33,6 +33,11 @@ void mlx_inline_clear_cache(void);
 // before the first GPU operation. No-op check is the caller's job.
 void mlx_inline_set_metallib_path(const char* path);
 
+// Build MLX's Metal device now, loading the metallib. A library it can't load
+// is reported through the error channel here, instead of throwing from
+// whichever later call allocates first (often an unguarded one, which aborts).
+void mlx_inline_init_device(void);
+
 // ── Metal capture for profiling ──────────────────────────────────────────
 int mlx_inline_metal_start_capture(const char* path);
 void mlx_inline_metal_stop_capture(void);

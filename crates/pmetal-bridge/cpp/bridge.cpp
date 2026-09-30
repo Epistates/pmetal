@@ -118,7 +118,7 @@ int32_t pmetal_bridge_get_error_log_mode(void) {
 }
 
 void mlx_inline_init_empty(mlx_inline_array* dst) {
-    new (dst->buf) array(0.0f);  // MLX array default = scalar 0
+    bridge_placeholder(dst);  // MLX array default = scalar 0
 }
 
 void mlx_inline_init_copy(mlx_inline_array* dst, const mlx_inline_array* src) {
@@ -138,7 +138,7 @@ void mlx_inline_from_handle(mlx_inline_array* dst, void* handle_ctx) {
     if (handle_ctx) {
         new (dst->buf) array(*static_cast<array*>(handle_ctx));
     } else {
-        new (dst->buf) array(0.0f);
+        bridge_placeholder(dst);
     }
 }
 
@@ -324,11 +324,11 @@ void mlx_inline_split(const mlx_inline_array* input, const int* indices, int num
         pmetal_bridge_set_last_error("split", e.what());
         // Caller's `outputs` slice length is num_indices + 1.
         int expected = num_indices + 1;
-        for (int i = 0; i < expected; i++) new (outputs[i].buf) array(0.0f);
+        for (int i = 0; i < expected; i++) bridge_placeholder(&outputs[i]);
     } catch (...) {
         pmetal_bridge_set_last_error("split", "unknown C++ exception");
         int expected = num_indices + 1;
-        for (int i = 0; i < expected; i++) new (outputs[i].buf) array(0.0f);
+        for (int i = 0; i < expected; i++) bridge_placeholder(&outputs[i]);
     }
 }
 
@@ -363,8 +363,26 @@ void mlx_inline_async_eval(mlx_inline_array* a) {
 }
 
 // Factory
-void mlx_inline_from_f32(mlx_inline_array* dst, float val) { new (dst->buf) array(val); }
-void mlx_inline_from_i32(mlx_inline_array* dst, int val) { new (dst->buf) array(val); }
+// A scalar is often the first allocation in a run, which is where MLX builds
+// its Metal device, so a failure here must not escape into Rust. Unlike
+// BRIDGE_TRY_DST these do not clear the error state on success: they never
+// did, and callers build scalars between an op and its error check.
+extern "C++" {
+template <typename T>
+static void from_scalar(mlx_inline_array* dst, T val, const char* op) {
+    try {
+        new (dst->buf) array(val);
+    } catch (const std::exception& e) {
+        pmetal_bridge_set_last_error(op, e.what());
+        bridge_placeholder(dst);
+    } catch (...) {
+        pmetal_bridge_set_last_error(op, "unknown C++ exception");
+        bridge_placeholder(dst);
+    }
+}
+}
+void mlx_inline_from_f32(mlx_inline_array* dst, float val) { from_scalar(dst, val, "from_f32"); }
+void mlx_inline_from_i32(mlx_inline_array* dst, int val) { from_scalar(dst, val, "from_i32"); }
 
 // Query — operate directly on the inline buffer
 int mlx_inline_ndim(const mlx_inline_array* a) { return as_arr(a).ndim(); }
@@ -658,6 +676,11 @@ void mlx_inline_synchronize(void) {
 
 void mlx_inline_set_metallib_path(const char* path) {
     mlx::core::metal::set_metallib_path(path);
+}
+
+void mlx_inline_init_device(void) {
+    // The first allocation constructs the Metal device, which loads the library.
+    BRIDGE_TRY_VOID("init_device", array probe(0.0f));
 }
 
 int mlx_inline_metal_start_capture(const char* path) {
