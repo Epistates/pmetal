@@ -543,6 +543,12 @@ fn build_and_link() {
         let metallib = mlx_lib_dir_built.join("mlx.metallib");
         if metallib.exists() {
             emit_bridge_metadata("mlx_metallib", metallib.display().to_string());
+            // For this crate's own tests: with PMETAL_MLX_PREFIX (CI) the file
+            // lives in the prefix, not under OUT_DIR.
+            println!(
+                "cargo:rustc-env=PMETAL_BRIDGE_MLX_METALLIB={}",
+                metallib.display()
+            );
             if let Ok(home) = env::var("HOME") {
                 let cache_dir = PathBuf::from(home).join(".cache/pmetal/lib");
                 let dest = cache_dir.join("mlx.metallib");

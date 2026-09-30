@@ -266,11 +266,15 @@ pub fn verify_buffer_layout() {
 mod tests {
     use super::*;
 
-    /// The metallib this build compiled and hands out, which the header check
-    /// must accept.
+    /// The metallib this build uses and hands out, which the header check must
+    /// accept. build.rs exports its path, since with a reused MLX prefix it is
+    /// not under OUT_DIR; it exports none when there is no metallib (no
+    /// `metal` feature), and then there is nothing to check.
     #[test]
     fn the_built_metallib_validates() {
-        let built = concat!(env!("OUT_DIR"), "/build/lib/mlx.metallib");
+        let Some(built) = option_env!("PMETAL_BRIDGE_MLX_METALLIB") else {
+            return;
+        };
         validate_metallib(std::path::Path::new(built)).expect("MLX's own metallib is valid");
     }
 
