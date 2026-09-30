@@ -18,6 +18,7 @@ tauri-build = { version = "2.7", features = [] }
 # Tauri
 tauri = { version = "2.12", features = [] }
 tauri-plugin-opener = "2.6"
+tauri-plugin-dialog = "2.8"
 
 [target.'cfg(any(target_os = "macos", windows, target_os = "linux"))'.dependencies]
 # tauri-plugin-updater = "2"  # TODO: re-enable once signing key is configured in CI

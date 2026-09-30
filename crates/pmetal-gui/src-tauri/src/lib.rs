@@ -15,6 +15,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .manage(app_state)
         .setup(|app| {
             #[cfg(desktop)]
@@ -28,6 +29,21 @@ pub fn run() {
             // Must run before anything touches MLX, which loads its metallib
             // lazily on the first array operation.
             ensure_metallib(app.handle());
+            // Load it now, so a library MLX can't load is reported once, here,
+            // rather than failing (or aborting) the first GPU job.
+            if let Err(e) = pmetal_bridge::inline_array::init_device() {
+                use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+                tracing::error!("MLX could not load its Metal library: {e}");
+                app.dialog()
+                    .message(format!(
+                        "PMetal could not load its Metal library, so training and \
+                         inference won't run.\n\n{e}\n\nReinstall PMetal, or set \
+                         PMETAL_METALLIB_PATH to a working mlx.metallib."
+                    ))
+                    .title("GPU unavailable")
+                    .kind(MessageDialogKind::Error)
+                    .show(|_| {});
+            }
 
             let state = app.state::<AppState>();
 
