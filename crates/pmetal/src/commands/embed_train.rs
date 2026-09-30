@@ -25,6 +25,9 @@ pub(crate) async fn run_embed_train(
         EmbeddingLossType, EmbeddingTrainer, EmbeddingTrainerConfig,
     };
 
+    // `seed` also orders the batches below; this covers MLX's own key.
+    pmetal_bridge::compat::random::seed(seed);
+
     // Parse loss type
     let loss_type = match loss_str {
         "info_nce" | "infonce" => EmbeddingLossType::InfoNce,

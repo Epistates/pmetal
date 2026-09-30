@@ -40,6 +40,8 @@ pub(crate) async fn run_rlkd_cli(
     use pmetal_lora::{DynamicLoraModel, TrainableModel};
     use pmetal_models::DynamicModel;
 
+    pmetal_bridge::compat::random::seed(seed);
+
     let column_cfg = crate::commands::build_column_config(
         text_column,
         text_columns,
@@ -147,6 +149,7 @@ pub(crate) async fn run_rlkd_cli(
     let mut grpo_config = GrpoConfig::new(num_generations).with_beta(beta);
     grpo_config.max_completion_length = max_completion_length;
     grpo_config.max_prompt_length = max_seq_len;
+    grpo_config.seed = Some(seed);
 
     // 8. Setup RLKD config
     let training_config = TrainingConfig {
@@ -283,7 +286,6 @@ pub(crate) async fn run_rlkd_cli(
     }
 
     let _ = use_metal_flash_attention; // passed through GRPO config; honored by model load
-    let _ = seed; // used for dataset shuffling; plumbed via DataLoaderConfig in full impl
 
     trainer
         .run(

@@ -213,6 +213,10 @@ pub(crate) async fn run_distillation_cli(
     use pmetal_trainer::{DistillationTrainer, TrainingLoopConfig, generate_teacher_logit_cache};
     use std::path::{Path, PathBuf};
 
+    // The data loader takes `seed` too; this one covers MLX's own key, which
+    // initialises the student's LoRA weights.
+    pmetal_bridge::compat::random::seed(seed);
+
     let column_cfg = crate::commands::build_column_config(
         text_column,
         text_columns,
