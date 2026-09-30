@@ -2041,8 +2041,20 @@ mod tests {
 
     #[test]
     fn test_select_accelerated_backend_prefers_ane_for_large_dense_model() {
-        let config = dense_config(8192, 80, 128_256);
+        let mut config = dense_config(8192, 80, 128_256);
+        config["model_type"] = serde_json::json!("qwen3");
         assert_eq!(
+            select_accelerated_backend(&config, true),
+            PreferredGenerationBackend::Ane
+        );
+    }
+
+    /// The ANE inference engine is Qwen3-shaped: a Llama served there ran with
+    /// q/k norms it doesn't have (#34).
+    #[test]
+    fn test_select_accelerated_backend_keeps_large_llama_off_the_ane() {
+        let config = dense_config(8192, 80, 128_256);
+        assert_ne!(
             select_accelerated_backend(&config, true),
             PreferredGenerationBackend::Ane
         );
