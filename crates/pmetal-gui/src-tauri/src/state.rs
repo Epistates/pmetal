@@ -995,7 +995,9 @@ impl AppState {
             |run| {
                 let live = !matches!(
                     run.status,
-                    DistillationStatus::Completed | DistillationStatus::Failed
+                    DistillationStatus::Completed
+                        | DistillationStatus::Failed
+                        | DistillationStatus::Cancelled
                 );
                 if live {
                     run.status = DistillationStatus::Cancelled;
@@ -1724,6 +1726,24 @@ mod tests {
         let runs = state.list_bench_runs().await;
         assert_eq!(runs[0].status, JobStatus::Completed);
         assert!(runs[0].ended_at.is_none());
+        assert!(events.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_distillation_twice_keeps_the_first_cancellation() {
+        let state = AppState::new();
+        let run = DistillationRun::new("s", "t", None, "kl", 2.0, 1, None);
+        let id = run.id.clone();
+        state.create_distillation_run(run).await;
+
+        assert!(state.cancel_distillation_run(&id).await);
+        let first = state.get_distillation_run(&id).await.unwrap().ended_at;
+
+        let mut events = state.subscribe();
+        assert!(state.cancel_distillation_run(&id).await);
+        let run = state.get_distillation_run(&id).await.unwrap();
+        assert_eq!(run.status, DistillationStatus::Cancelled);
+        assert_eq!(run.ended_at, first);
         assert!(events.try_recv().is_err());
     }
 }
