@@ -1076,11 +1076,9 @@ fn ensure_metallib() {
             pmetal_bridge::inline_array::set_metallib_path(&explicit.to_string_lossy());
             return;
         }
-        // Runs before logging is initialised, hence eprintln.
-        eprintln!(
-            "\x1b[1;33mwarning:\x1b[0m PMETAL_METALLIB_PATH={} is not a file; \
-             searching the default locations",
-            explicit.display()
+        tracing::warn!(
+            path = %explicit.display(),
+            "PMETAL_METALLIB_PATH is not a file; searching the default locations"
         );
     }
 
@@ -1322,15 +1320,25 @@ fn download_metallib(dest: &std::path::Path) -> bool {
 
 /// Synchronous entry point.
 ///
-/// `ensure_metallib` calls `std::env::set_var` which is unsound when other
-/// threads are running.  By invoking it here — before the `#[tokio::main]`
-/// macro starts the async runtime and its thread pool — we guarantee that
-/// the environment mutation happens in a single-threaded context.
+/// `ensure_metallib` runs here rather than in `tokio_main` because its
+/// download fallback blocks on a runtime of its own, which can't start inside
+/// `#[tokio::main]`. Logging is set up first so its messages are recorded, and
+/// argument parsing before that, so `--help` and usage errors exit without
+/// searching for (or downloading) a metallib.
 fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+
+    // The TUI owns the terminal, so it logs to the file only.
+    #[cfg(feature = "dashboard")]
+    let is_tui = matches!(cli.command, Commands::Tui { .. });
+    #[cfg(not(feature = "dashboard"))]
+    let is_tui = false;
+    init_logging(if is_tui { "tui" } else { "cli" }, is_tui);
+
     ensure_metallib();
     #[cfg(feature = "metal")]
     let _ = pmetal_metal::context::MetalContext::device_available();
-    tokio_main()
+    tokio_main(cli)
 }
 
 // ---------------------------------------------------------------------------
@@ -1431,20 +1439,10 @@ impl std::io::Write for TeeWriter {
 }
 
 #[tokio::main]
-async fn tokio_main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
-
+async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
     // Capture global flags before `cli` is moved into the `match` below.
     #[cfg(feature = "trainer")]
     let log_events_path = cli.log_events.clone();
-
-    // Initialize logging — suppress stderr output when running the TUI
-    // to avoid corrupting the raw terminal display.
-    #[cfg(feature = "dashboard")]
-    let is_tui = matches!(cli.command, Commands::Tui { .. });
-    #[cfg(not(feature = "dashboard"))]
-    let is_tui = false;
-    init_logging(if is_tui { "tui" } else { "cli" }, is_tui);
 
     match cli.command {
         #[cfg(feature = "trainer")]
