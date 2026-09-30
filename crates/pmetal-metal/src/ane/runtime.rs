@@ -710,7 +710,9 @@ impl AneModel {
                 chain_request,
             ) {
                 Ok(()) => (self.real_time_model, self.real_time_model != self.model),
-                Err(primary_err) if self.real_time_model != self.model => {
+                Err(primary_err)
+                    if self.real_time_model != self.model && client_can_load(self.model) =>
+                {
                     tracing::debug!(
                         error = %primary_err,
                         "ANE chaining preparation failed with the inner model; retrying with the in-memory wrapper"
@@ -990,7 +992,9 @@ impl AneModel {
         self.unload_standard_if_loaded();
         match real_time.evaluate(self.real_time_model, request) {
             Ok(()) => Ok(()),
-            Err(primary_err) if self.real_time_model != self.model => {
+            Err(primary_err)
+                if self.real_time_model != self.model && unsafe { client_can_load(self.model) } =>
+            {
                 real_time.unload_if_loaded();
                 tracing::debug!(
                     error = %primary_err,
@@ -1128,6 +1132,19 @@ unsafe fn ns_error_description(error: *mut NSError) -> String {
 /// Clean up a temp directory.
 fn cleanup_tmp(path: &str) {
     let _ = std::fs::remove_dir_all(path);
+}
+
+/// Whether `model` can be handed to `_ANEClient`'s load path. On macOS 27 that
+/// path calls `externConstants` on it, which `_ANEInMemoryModel` doesn't
+/// implement: passing one raises an Objective-C exception that Rust can't
+/// catch, and the process aborts. The inner `_ANEModel` does implement it.
+///
+/// # Safety
+/// `model` must be a valid Objective-C object pointer.
+unsafe fn client_can_load(model: *mut AnyObject) -> bool {
+    let sel = objc2::sel!(externConstants);
+    let responds: Bool = msg_send![model, respondsToSelector: sel];
+    responds.as_bool()
 }
 
 fn empty_options_dict() -> objc2::rc::Retained<NSDictionary<NSString, AnyObject>> {
@@ -1328,24 +1345,26 @@ mod tests {
 
         let model = match rt.compile(mil_text.as_bytes(), None) {
             Ok(model) => model,
-            Err(MetalError::AneCompileFailed(_)) | Err(MetalError::AneLoadFailed(_)) => return,
-            Err(e) => panic!("Unexpected error: {e}"),
+            Err(e) => panic!("ANE is present but the test program failed to compile or load: {e}"),
         };
 
-        let input = IoSurface::for_tensor_f32(1, 4).unwrap();
-        let output_std = IoSurface::for_tensor_f32(1, 4).unwrap();
-        let output_rt = IoSurface::for_tensor_f32(1, 4).unwrap();
+        // The loaded model reports RowStride = 64 bytes for this 16-byte row
+        // (macOS 27), and a surface sized to the bare tensor fails with
+        // Code=42 "IOSurface smaller than the model expects". 16 fp32 = 64 B.
+        let input = IoSurface::for_tensor_f32(1, 16).unwrap();
+        let output_std = IoSurface::for_tensor_f32(1, 16).unwrap();
+        let output_rt = IoSurface::for_tensor_f32(1, 16).unwrap();
         let input_values = [1.5f32, -2.0, 0.25, 7.0];
         input.write_f32_at(0, &input_values, 1, 4);
 
-        if let Err(err) = model.evaluate(&[input.as_ptr()], &[output_std.as_ptr()]) {
-            eprintln!("Skipping standard-vs-real-time comparison: {err}");
-            return;
-        }
-        if let Err(err) = model.evaluate_real_time(&[input.as_ptr()], &[output_rt.as_ptr()]) {
-            eprintln!("Skipping real-time output comparison: {err}");
-            return;
-        }
+        // An ANE is present, so a failed evaluation is a failure, not a skip:
+        // skipping here is how Code=42 on macOS 27 passed unnoticed (#34).
+        model
+            .evaluate(&[input.as_ptr()], &[output_std.as_ptr()])
+            .expect("standard ANE evaluation");
+        model
+            .evaluate_real_time(&[input.as_ptr()], &[output_rt.as_ptr()])
+            .expect("real-time ANE evaluation");
 
         let mut std_values = [0.0f32; 4];
         let mut rt_values = [0.0f32; 4];
@@ -1399,8 +1418,7 @@ mod tests {
 
         let model = match rt.compile(sdpa.mil_text.as_bytes(), Some(&sdpa.weights)) {
             Ok(model) => model,
-            Err(MetalError::AneCompileFailed(_)) | Err(MetalError::AneLoadFailed(_)) => return,
-            Err(e) => panic!("Unexpected error: {e}"),
+            Err(e) => panic!("ANE is present but the test program failed to compile or load: {e}"),
         };
         if !model.real_time_available() {
             return;
@@ -1415,14 +1433,12 @@ mod tests {
             .collect::<Vec<_>>();
         input.write_f32_as_fp16(&input_values, cfg.dim, cfg.seq_len);
 
-        if let Err(err) = model.evaluate(&[input.as_ptr()], &[output_std.as_ptr()]) {
-            eprintln!("Skipping SDPA standard-vs-real-time probe: {err}");
-            return;
-        }
-        if let Err(err) = model.evaluate_real_time(&[input.as_ptr()], &[output_rt.as_ptr()]) {
-            eprintln!("Skipping SDPA real-time probe: {err}");
-            return;
-        }
+        model
+            .evaluate(&[input.as_ptr()], &[output_std.as_ptr()])
+            .expect("standard ANE evaluation of the SDPA kernel");
+        model
+            .evaluate_real_time(&[input.as_ptr()], &[output_rt.as_ptr()])
+            .expect("real-time ANE evaluation of the SDPA kernel");
 
         let mut std_values = vec![0.0f32; output_channels * cfg.seq_len];
         let mut rt_values = vec![0.0f32; output_channels * cfg.seq_len];
@@ -1443,28 +1459,18 @@ mod tests {
 
         for _ in 0..iterations {
             let start = Instant::now();
-            let stats = match model.evaluate_with_stats(&[input.as_ptr()], &[output_std.as_ptr()]) {
-                Ok(stats) => stats,
-                Err(err) => {
-                    eprintln!("Skipping SDPA latency probe during standard eval: {err}");
-                    return;
-                }
-            };
+            let stats = model
+                .evaluate_with_stats(&[input.as_ptr()], &[output_std.as_ptr()])
+                .expect("standard ANE evaluation during the latency probe");
             standard_wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);
             standard_hw_ms.push(stats.hw_execution_time_ns as f64 / 1_000_000.0);
         }
 
         for _ in 0..iterations {
             let start = Instant::now();
-            let stats = match model
+            let stats = model
                 .evaluate_real_time_with_stats(&[input.as_ptr()], &[output_rt.as_ptr()])
-            {
-                Ok(stats) => stats,
-                Err(err) => {
-                    eprintln!("Skipping SDPA latency probe during real-time eval: {err}");
-                    return;
-                }
-            };
+                .expect("real-time ANE evaluation during the latency probe");
             realtime_wall_ms.push(start.elapsed().as_secs_f64() * 1000.0);
             realtime_hw_ms.push(stats.hw_execution_time_ns as f64 / 1_000_000.0);
         }
@@ -1533,8 +1539,7 @@ mod tests {
         let mil_text = program.finalize("x");
         let model = match rt.compile(mil_text.as_bytes(), None) {
             Ok(model) => model,
-            Err(MetalError::AneCompileFailed(_)) | Err(MetalError::AneLoadFailed(_)) => return,
-            Err(e) => panic!("Unexpected error: {e}"),
+            Err(e) => panic!("ANE is present but the test program failed to compile or load: {e}"),
         };
 
         if !model.chaining_available() {
@@ -1551,10 +1556,9 @@ mod tests {
             &AneLoopbackChainConfig::default(),
         ) {
             Ok(prepared) => prepared,
-            Err(MetalError::AneChainingFailed(err))
-            | Err(MetalError::AneCompileFailed(err))
-            | Err(MetalError::AneLoadFailed(err))
-            | Err(MetalError::AneEvalFailed(err)) => {
+            // Chaining is a private API this probes for; its own refusal is a
+            // skip. A compile, load or eval failure on present hardware is not.
+            Err(MetalError::AneChainingFailed(err)) => {
                 eprintln!("Skipping loopback chain smoke test: {err}");
                 return;
             }
