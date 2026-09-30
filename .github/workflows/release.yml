@@ -194,6 +194,11 @@ jobs:
     needs: build-cli
     permissions:
       contents: read
+    env:
+      # .cargo/config.toml shares one target dir across the repo's workspaces,
+      # which only saves anything locally. This job builds the GUI alone, and
+      # the cache mapping and bundle paths below expect src-tauri/target.
+      CARGO_TARGET_DIR: ${{ github.workspace }}/crates/pmetal-gui/src-tauri/target
 
     steps:
       - uses: actions/checkout@v7

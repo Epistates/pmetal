@@ -178,6 +178,12 @@ strip = false
 
 [profile.dev]
 opt-level = 1
+# File and line in backtraces and profiler stacks, without full DWARF for every
+# crate: with the default, debug info (and the per-codegen-unit .o files macOS
+# keeps for it) was a large share of target/. For variables in lldb, build with
+# CARGO_PROFILE_DEV_DEBUG=true. crates/pmetal-gui/src-tauri mirrors this
+# profile so the two workspaces share builds in target/.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3

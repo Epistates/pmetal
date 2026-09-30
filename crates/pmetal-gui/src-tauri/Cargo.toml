@@ -57,6 +57,10 @@ tauri-plugin-process = "2.4"
 # for fast recompilation.
 [profile.dev]
 opt-level = 1
+# Same as the root workspace's dev profile: profile settings are part of a
+# crate's build hash, so any difference here rebuilds every shared dependency
+# in target/ instead of reusing the root's.
+debug = "line-tables-only"
 
 [profile.dev.package."*"]
 opt-level = 3

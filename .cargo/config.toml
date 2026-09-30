@@ -1,4 +1,20 @@
+[build]
+# One target dir for all three workspaces in this repo (root, the GUI's
+# src-tauri, fuzz). They resolve the same dependency versions, so a crate
+# built for one is reused by the others instead of compiled again in a
+# second or third tree. The release workflow pins the GUI job's own dir with
+# CARGO_TARGET_DIR, which overrides this.
+target-dir = "target"
+
 [env]
+# Every pmetal-bridge variant (each feature set, `-p` run and profile) runs
+# the build script, and without a prefix each compiled its own MLX (~800 MB
+# and several minutes apiece; 7 of them were found side by side). With one,
+# build.rs reuses a build whose fingerprint (MLX tag, features, profile,
+# static/shared) matches. It lives in target/, so `cargo clean` clears it.
+# An explicit PMETAL_MLX_PREFIX in the environment (CI sets one) wins.
+PMETAL_MLX_PREFIX = { value = "target/mlx-prefix", relative = true }
+
 # Serialize test execution to prevent SIGSEGV from concurrent MLX GPU access.
 # MLX's internal device/memory state is not thread-safe for parallel test execution.
 # Full suite (650+ tests) runs in ~1s serial, so no performance impact.

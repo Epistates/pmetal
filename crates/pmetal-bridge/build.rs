@@ -144,10 +144,11 @@ fn prepare_cmake_source() -> PathBuf {
 // When PMETAL_MLX_PREFIX is set to a directory, a fingerprint-matched
 // pre-built MLX in that directory is reused and cmake is skipped entirely.
 // Otherwise MLX is built as usual, and the result is copied into the
-// prefix for reuse on the next invocation (intended for CI where the
-// prefix is mounted via actions/cache keyed on BUNDLED_MLX_GIT_TAG).
+// prefix for reuse on the next invocation. CI mounts it via actions/cache
+// keyed on BUNDLED_MLX_GIT_TAG; locally .cargo/config.toml points it at
+// target/mlx-prefix, so every pmetal-bridge variant shares one build.
 //
-// Layout inside the prefix:
+// Each fingerprint gets its own slot, `<prefix>/<mlx_prefix_slot()>/`:
 //   .mlx-version         — fingerprint string (tag + feature flags)
 //   lib/libmlx.dylib     — MLX dynamic library (or libmlx.so elsewhere)
 //   lib/mlx.metallib     — compiled Metal kernels (when metal feature on)
@@ -179,6 +180,18 @@ fn mlx_fingerprint() -> String {
         "{tag};target={target};macos_deployment={deployment};metal={metal};accelerate={accelerate};debug={debug};static={static_mlx};os={os}",
         tag = BUNDLED_MLX_GIT_TAG
     )
+}
+
+/// The prefix subdirectory for this build's fingerprint: its 64-bit FNV-1a
+/// hash in hex. Stable across runs and Rust versions, which `DefaultHasher`
+/// doesn't promise.
+fn mlx_prefix_slot() -> String {
+    let hash = mlx_fingerprint()
+        .bytes()
+        .fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3)
+        });
+    format!("{hash:016x}")
 }
 
 fn mlx_dylib_name() -> &'static str {
@@ -362,7 +375,13 @@ fn build_and_link() {
         emit_bridge_metadata("min_macos", &target);
     }
 
-    let mlx_prefix = env::var("PMETAL_MLX_PREFIX").ok().map(PathBuf::from);
+    // One subdirectory per fingerprint. With a single slot, a debug and a
+    // release build overwrote each other's MLX, so switching profile rebuilt
+    // it, and binaries whose libmlx.dylib install name points into the prefix
+    // started loading the other profile's library.
+    let mlx_prefix = env::var("PMETAL_MLX_PREFIX")
+        .ok()
+        .map(|root| PathBuf::from(root).join(mlx_prefix_slot()));
 
     // Resolve MLX artifacts: prefer a matching cache, otherwise build and
     // (if a prefix is configured) populate the cache for next time.
