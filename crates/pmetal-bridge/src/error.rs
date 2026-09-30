@@ -182,4 +182,28 @@ mod tests {
         // Slot must have been cleared by check_last_error.
         assert_eq!(check_last_error(), Ok(()));
     }
+
+    /// Calls that are not ops (memory queries, syncs, scalar constructors) run
+    /// between an op and its error check, so a success there must not erase
+    /// the op's error.
+    #[test]
+    fn non_op_calls_leave_a_pending_error_in_place() {
+        use crate::InlineArray;
+        use crate::inline_array::{clear_cache, get_active_memory, synchronize};
+
+        clear_last_error();
+        let two_elem = InlineArray::from_f32_slice(&[1.0, 2.0], &[2]);
+        let _ = two_elem.item_f32();
+
+        let _ = get_active_memory();
+        synchronize();
+        clear_cache();
+        let _ = InlineArray::from_f32(1.0);
+
+        let err = check_last_error().expect_err("the item_f32 error is still pending");
+        assert!(
+            format!("{err:?}").contains("item_f32"),
+            "wrong error: {err:?}"
+        );
+    }
 }

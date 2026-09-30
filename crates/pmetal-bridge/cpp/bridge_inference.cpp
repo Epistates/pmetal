@@ -327,19 +327,25 @@ void mlx_inline_detach(mlx_inline_array* a) {
 // ── Metal memory instrumentation ──
 
 size_t mlx_inline_get_active_memory(void) {
-    return mlx::core::get_active_memory();
+    size_t bytes = 0;
+    BRIDGE_GUARD("get_active_memory", bytes = mlx::core::get_active_memory());
+    return bytes;
 }
 
 size_t mlx_inline_get_cache_memory(void) {
-    return mlx::core::get_cache_memory();
+    size_t bytes = 0;
+    BRIDGE_GUARD("get_cache_memory", bytes = mlx::core::get_cache_memory());
+    return bytes;
 }
 
 size_t mlx_inline_get_peak_memory(void) {
-    return mlx::core::get_peak_memory();
+    size_t bytes = 0;
+    BRIDGE_GUARD("get_peak_memory", bytes = mlx::core::get_peak_memory());
+    return bytes;
 }
 
 void mlx_inline_reset_peak_memory(void) {
-    mlx::core::reset_peak_memory();
+    BRIDGE_GUARD("reset_peak_memory", mlx::core::reset_peak_memory());
 }
 
 

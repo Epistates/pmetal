@@ -585,7 +585,7 @@ size_t mlx_inline_array_align(void) { return alignof(array); }
 
 void mlx_inline_enable_compile(void) { mlx::core::enable_compile(); }
 void mlx_inline_disable_compile(void) { mlx::core::disable_compile(); }
-void mlx_inline_clear_cache(void) { mlx::core::clear_cache(); }
+void mlx_inline_clear_cache(void) { BRIDGE_GUARD("clear_cache", mlx::core::clear_cache()); }
 
 static mlx::core::Stream* generation_stream_ = nullptr;
 
@@ -644,16 +644,20 @@ int mlx_inline_new_stream(void) {
     // A static local Stream destructs at program exit in unpredictable order
     // relative to Metal device teardown, causing a SIGSEGV. A leaked heap
     // object outlives all destructors, letting the OS reclaim it cleanly.
-    if (!generation_stream_) {
-        generation_stream_ = new mlx::core::Stream(
-            mlx::core::new_stream(mlx::core::default_device()));
-    }
-    return 0;
+    int status = 0;
+    BRIDGE_GUARD("new_stream", {
+        if (!generation_stream_) {
+            generation_stream_ = new mlx::core::Stream(
+                mlx::core::new_stream(mlx::core::default_device()));
+        }
+    });
+    if (!generation_stream_) status = -1;
+    return status;
 }
 
 void mlx_inline_set_default_stream(int /*index*/) {
     if (generation_stream_) {
-        mlx::core::set_default_stream(*generation_stream_);
+        BRIDGE_GUARD("set_default_stream", mlx::core::set_default_stream(*generation_stream_));
     }
 }
 
@@ -662,16 +666,19 @@ void mlx_inline_reset_default_stream(void) {
     // Must be called after generation completes and before InlineArray drops,
     // otherwise array destructors execute on the generation stream which can
     // race with Metal teardown and cause SIGSEGV.
-    mlx::core::set_default_stream(
-        mlx::core::default_stream(mlx::core::default_device()));
+    BRIDGE_GUARD("reset_default_stream",
+                 mlx::core::set_default_stream(
+                     mlx::core::default_stream(mlx::core::default_device())));
 }
 
 void mlx_inline_synchronize(void) {
-    if (generation_stream_) {
-        mlx::core::synchronize(*generation_stream_);
-    } else {
-        mlx::core::synchronize();
-    }
+    BRIDGE_GUARD("synchronize", {
+        if (generation_stream_) {
+            mlx::core::synchronize(*generation_stream_);
+        } else {
+            mlx::core::synchronize();
+        }
+    });
 }
 
 void mlx_inline_set_metallib_path(const char* path) {
@@ -684,11 +691,15 @@ void mlx_inline_init_device(void) {
 }
 
 int mlx_inline_metal_start_capture(const char* path) {
-    mlx::core::metal::start_capture(path);
-    return 0;
+    int status = -1;
+    BRIDGE_GUARD("metal_start_capture", {
+        mlx::core::metal::start_capture(path);
+        status = 0;
+    });
+    return status;
 }
 void mlx_inline_metal_stop_capture(void) {
-    mlx::core::metal::stop_capture();
+    BRIDGE_GUARD("metal_stop_capture", mlx::core::metal::stop_capture());
 }
 
 // Traverse computation graph and count unique nodes

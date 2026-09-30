@@ -103,6 +103,23 @@ static inline void bridge_placeholder(mlx_inline_array* dst) noexcept {
         } \
     } while (0)
 
+// Guard for calls that are not ops: memory queries, cache and stream
+// management, synchronize. These reach the Metal device (and synchronize
+// rethrows a failed command buffer), so an exception must not escape into
+// Rust. A failure is reported through the error channel, but unlike the
+// BRIDGE_TRY_* macros a success leaves the channel alone: these run between
+// an op and its error check (memory logging, syncs) and must not erase it.
+#define BRIDGE_GUARD(op_name, ...) \
+    do { \
+        try { \
+            __VA_ARGS__; \
+        } catch (const std::exception& e) { \
+            pmetal_bridge_set_last_error((op_name), e.what()); \
+        } catch (...) { \
+            pmetal_bridge_set_last_error((op_name), "unknown C++ exception"); \
+        } \
+    } while (0)
+
 // GDN Metal kernel getter — defined in bridge_native.cpp, used across files.
 mlx::core::fast::CustomKernelFunction& get_gdn_kernel();
 
