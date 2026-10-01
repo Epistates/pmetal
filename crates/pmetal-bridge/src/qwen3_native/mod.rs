@@ -202,6 +202,12 @@ pub struct Qwen3Config {
     /// The same object under the Hugging Face key.
     #[serde(default)]
     pub quantization_config: Option<QuantizationConfig>,
+
+    /// The quantization block read MLX's way, per-module overrides included
+    /// (sibling keys under `quantization`, keyed by module path). Set by
+    /// `parse_config_text`; `None` when unquantized or a sidecar scheme.
+    #[serde(skip)]
+    pub mlx_quantization: Option<crate::native_weight::MlxQuantization>,
 }
 
 /// Weight quantization parameters (from `quantization_config` in config.json).
@@ -405,6 +411,20 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
 
     let mut cfg: Qwen3Config =
         serde_json::from_str(&config_str).map_err(|e| format!("failed to parse config: {e}"))?;
+    // MLX's per-module overrides, with their paths canonicalized the way the
+    // loader canonicalizes tensor keys so the two match (#30).
+    cfg.mlx_quantization = serde_json::from_str::<serde_json::Value>(&config_str)
+        .ok()
+        .and_then(|v| {
+            v.get("quantization")
+                .or_else(|| v.get("quantization_config"))
+                .cloned()
+        })
+        .and_then(|block| {
+            crate::native_weight::MlxQuantization::from_json(&block, |path| {
+                Some(load::canonical_key(path))
+            })
+        });
     // Sidecar schemes are normalised from their own tensors, so their metadata
     // must not be mistaken for an affine quantization. Both spellings get
     // cleared, or whichever survives would put the loader back on that path.
@@ -414,6 +434,7 @@ pub(super) fn parse_config_text(text: &str) -> Result<Qwen3Config, String> {
     {
         cfg.quantization_mlx = None;
         cfg.quantization_config = None;
+        cfg.mlx_quantization = None;
     }
     cfg.finalize();
     Ok(cfg)

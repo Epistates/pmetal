@@ -32,15 +32,49 @@ fn weights_are_quantized(layers: &[LayerWeights]) -> bool {
     false
 }
 
-fn quant_bits_for_weight_key(config: &Qwen3Config, weight_key: &str, default_bits: i32) -> i32 {
+/// Quantization for the module at `base_key` (the tensor key without
+/// `.weight`), bits and group size both.
+///
+/// Checked in order: pmetal's legacy `per_tensor_overrides` (bits only,
+/// keyed `{module}.weight`; what `mlx_quant` wrote before #30, and nothing
+/// else writes it), then MLX's own per-module override or file default, then
+/// `default`. The legacy map goes first because MLX's parser always answers,
+/// with the file default when a module isn't named.
+fn quant_params_for(config: &Qwen3Config, base_key: &str, default: QuantParams) -> QuantParams {
+    let legacy = config.quantization().and_then(|qc| {
+        qc.per_tensor_overrides
+            .get(&format!("{base_key}.weight"))
+            .copied()
+    });
+    if let Some(bits) = legacy {
+        return QuantParams { bits, ..default };
+    }
     config
-        .quantization()
-        .and_then(|qc| qc.per_tensor_overrides.get(weight_key).copied())
-        .unwrap_or(default_bits)
+        .mlx_quantization
+        .as_ref()
+        .and_then(|q| q.params_for(base_key))
+        .unwrap_or(default)
 }
 
-fn quant_bits_for_base_key(config: &Qwen3Config, base_key: &str, default_bits: i32) -> i32 {
-    quant_bits_for_weight_key(config, &format!("{base_key}.weight"), default_bits)
+/// The key a checkpoint tensor or module path has once sanitized: VLM
+/// prefixes reduced to `model.`, `A_log` renamed `a_log`. Also applied to the
+/// module paths in the quantization block, so its overrides match.
+pub(super) fn canonical_key(key: &str) -> String {
+    let mut key = if key.starts_with("language_model.model.") {
+        // "language_model.model.X" → "model.X"
+        key.replacen("language_model.", "", 1)
+    } else if key.starts_with("language_model.") {
+        // "language_model.lm_head.weight" → "lm_head.weight"
+        key.replacen("language_model.", "", 1)
+    } else if key.starts_with("model.language_model.") {
+        key.replacen("model.language_model.", "model.", 1)
+    } else {
+        key.to_string()
+    };
+    if key.contains(".A_log") {
+        key = key.replace(".A_log", ".a_log");
+    }
+    key
 }
 
 const MXFP8_GROUP_SIZE: i32 = 32;
@@ -159,7 +193,12 @@ pub fn load_model(
         .map(|qc| (qc.bits, qc.group_size))
         .unwrap_or((4, 64));
     validate_quantization_runtime_support(q_bits)?;
-    let mut stacked_quant_bits: HashMap<String, i32> = HashMap::new();
+    let default_params = QuantParams {
+        group_size: q_group_size,
+        bits: q_bits,
+        mode: QuantizedMode::Affine,
+    };
+    let mut stacked_quant_params: HashMap<String, QuantParams> = HashMap::new();
 
     // ── Step 3: Sanitization ────────────────────────────────────────────────
 
@@ -176,19 +215,7 @@ pub fn load_model(
     // Qwen3 uses plain "model.layers.N..." with no prefix.
     let original_keys: Vec<String> = raw.keys().cloned().collect();
     for old_key in original_keys {
-        let mut new_key = old_key.clone();
-        if new_key.starts_with("language_model.model.") {
-            // "language_model.model.X" → "model.X"
-            new_key = new_key.replacen("language_model.", "", 1);
-        } else if new_key.starts_with("language_model.") {
-            // "language_model.lm_head.weight" → "lm_head.weight"
-            new_key = new_key.replacen("language_model.", "", 1);
-        } else if new_key.starts_with("model.language_model.") {
-            new_key = new_key.replacen("model.language_model.", "model.", 1);
-        }
-        if new_key.contains(".A_log") {
-            new_key = new_key.replace(".A_log", ".a_log");
-        }
+        let new_key = canonical_key(&old_key);
         if new_key != old_key {
             if let Some(v) = raw.remove(&old_key) {
                 raw.insert(new_key, v);
@@ -382,22 +409,26 @@ pub fn load_model(
                         Vec::with_capacity(config.num_experts as usize);
                     let mut b_shards: Vec<InlineArray> =
                         Vec::with_capacity(config.num_experts as usize);
-                    let mut expected_bits: Option<i32> = None;
+                    let mut expected: Option<QuantParams> = None;
 
                     for e in 0..config.num_experts as usize {
                         let wk = format!("{prefix}.experts.{e}.{proj}.weight");
                         let sk = format!("{prefix}.experts.{e}.{proj}.scales");
                         let bk = format!("{prefix}.experts.{e}.{proj}.biases");
-                        let bits = quant_bits_for_weight_key(config, &wk, q_bits);
-                        validate_quantization_runtime_support(bits)?;
-                        if let Some(expected) = expected_bits {
-                            if expected != bits {
+                        let params = quant_params_for(
+                            config,
+                            &format!("{prefix}.experts.{e}.{proj}"),
+                            default_params,
+                        );
+                        validate_quantization_runtime_support(params.bits)?;
+                        match expected {
+                            Some(first) if first != params => {
                                 return Err(format!(
-                                    "MoE quant: mixed bit widths for {prefix}.experts.*.{proj}.weight are not stackable ({expected} vs {bits})"
+                                    "MoE quant: experts of {prefix}.experts.*.{proj} are quantized differently ({first:?} vs {params:?}) and can't be stacked"
                                 ));
                             }
-                        } else {
-                            expected_bits = Some(bits);
+                            Some(_) => {}
+                            None => expected = Some(params),
                         }
                         w_shards.push(
                             raw.remove(&wk)
@@ -424,9 +455,9 @@ pub fn load_model(
                     raw.insert(format!("{prefix}.switch_mlp.{proj}.weight"), w_stacked);
                     raw.insert(format!("{prefix}.switch_mlp.{proj}.scales"), s_stacked);
                     raw.insert(format!("{prefix}.switch_mlp.{proj}.biases"), b_stacked);
-                    stacked_quant_bits.insert(
+                    stacked_quant_params.insert(
                         format!("{prefix}.switch_mlp.{proj}.weight"),
-                        expected_bits.unwrap_or(q_bits),
+                        expected.unwrap_or(default_params),
                     );
                 } else {
                     // Dense: collect and pre-transpose to [E, in, out] for gather_mm.
@@ -500,17 +531,17 @@ pub fn load_model(
 
         match (raw.get(&w_key), raw.get(&s_key), raw.get(&b_key)) {
             (Some(w), Some(s), Some(b)) => {
-                let bits = quant_bits_for_weight_key(config, &w_key, q_bits);
-                validate_quantization_runtime_support(bits)?;
+                let params = quant_params_for(config, base_key, default_params);
+                validate_quantization_runtime_support(params.bits)?;
                 Ok(LayerWeight::Quantized {
                     tensor_scale: None,
                     weight: w.clone(),
                     scales: s.clone(),
                     biases: Some(b.clone()),
+                    // Scales plus biases is affine, whatever the block says.
                     params: QuantParams {
-                        group_size: q_group_size,
-                        bits,
                         mode: QuantizedMode::Affine,
+                        ..params
                     },
                 })
             }
@@ -589,51 +620,30 @@ pub fn load_model(
             // Stacked expert weights were placed under "switch_mlp.{proj}.weight" during
             // Step 3e above.  For quantized models the stacking loop also placed
             // "switch_mlp.{proj}.scales" and ".biases" — check for those here.
-            let moe_gate = get_stacked_expert_weight(
-                &raw,
-                &format!("{p}.mlp.switch_mlp.gate_proj"),
-                q_group_size,
-                stacked_quant_bits
-                    .get(&format!("{p}.mlp.switch_mlp.gate_proj.weight"))
+            let moe_gate = {
+                let base = format!("{p}.mlp.switch_mlp.gate_proj");
+                let params = stacked_quant_params
+                    .get(&format!("{base}.weight"))
                     .copied()
-                    .unwrap_or_else(|| {
-                        quant_bits_for_base_key(
-                            config,
-                            &format!("{p}.mlp.switch_mlp.gate_proj"),
-                            q_bits,
-                        )
-                    }),
-            )?;
-            let moe_up = get_stacked_expert_weight(
-                &raw,
-                &format!("{p}.mlp.switch_mlp.up_proj"),
-                q_group_size,
-                stacked_quant_bits
-                    .get(&format!("{p}.mlp.switch_mlp.up_proj.weight"))
+                    .unwrap_or_else(|| quant_params_for(config, &base, default_params));
+                get_stacked_expert_weight(&raw, &base, params.group_size, params.bits)?
+            };
+            let moe_up = {
+                let base = format!("{p}.mlp.switch_mlp.up_proj");
+                let params = stacked_quant_params
+                    .get(&format!("{base}.weight"))
                     .copied()
-                    .unwrap_or_else(|| {
-                        quant_bits_for_base_key(
-                            config,
-                            &format!("{p}.mlp.switch_mlp.up_proj"),
-                            q_bits,
-                        )
-                    }),
-            )?;
-            let moe_down = get_stacked_expert_weight(
-                &raw,
-                &format!("{p}.mlp.switch_mlp.down_proj"),
-                q_group_size,
-                stacked_quant_bits
-                    .get(&format!("{p}.mlp.switch_mlp.down_proj.weight"))
+                    .unwrap_or_else(|| quant_params_for(config, &base, default_params));
+                get_stacked_expert_weight(&raw, &base, params.group_size, params.bits)?
+            };
+            let moe_down = {
+                let base = format!("{p}.mlp.switch_mlp.down_proj");
+                let params = stacked_quant_params
+                    .get(&format!("{base}.weight"))
                     .copied()
-                    .unwrap_or_else(|| {
-                        quant_bits_for_base_key(
-                            config,
-                            &format!("{p}.mlp.switch_mlp.down_proj"),
-                            q_bits,
-                        )
-                    }),
-            )?;
+                    .unwrap_or_else(|| quant_params_for(config, &base, default_params));
+                get_stacked_expert_weight(&raw, &base, params.group_size, params.bits)?
+            };
 
             // Shared expert weights — may be quantized.
             let sh_gate = get_layer_weight(&format!("{p}.mlp.shared_expert.gate_proj"))?;
@@ -1096,6 +1106,63 @@ fn can_repack_as_mxfp8(weight: &InlineArray) -> bool {
             .shape()
             .last()
             .is_some_and(|last_dim| *last_dim > 0 && *last_dim % MXFP8_GROUP_SIZE == 0)
+}
+
+#[cfg(test)]
+mod quant_params_tests {
+    use super::*;
+
+    fn config_with(quantization: &str) -> Qwen3Config {
+        super::super::parse_config_text(&format!(
+            r#"{{"model_type": "qwen3", "hidden_size": 64, "num_hidden_layers": 2,
+                "num_attention_heads": 4, "quantization": {quantization}}}"#
+        ))
+        .expect("config parses")
+    }
+
+    const DEFAULT: QuantParams = QuantParams {
+        group_size: 64,
+        bits: 4,
+        mode: QuantizedMode::Affine,
+    };
+
+    /// #30: MLX writes per-module overrides as sibling keys of the
+    /// `quantization` object, and both bits and group size can change.
+    #[test]
+    fn mlx_per_module_overrides_set_bits_and_group_size() {
+        let config = config_with(
+            r#"{"group_size": 64, "bits": 4, "mode": "affine",
+                "model.layers.0.self_attn.q_proj": {"group_size": 32, "bits": 8}}"#,
+        );
+        let q = quant_params_for(&config, "model.layers.0.self_attn.q_proj", DEFAULT);
+        assert_eq!((q.group_size, q.bits), (32, 8));
+        let other = quant_params_for(&config, "model.layers.1.self_attn.q_proj", DEFAULT);
+        assert_eq!((other.group_size, other.bits), (64, 4));
+    }
+
+    /// Override paths go through the same prefix stripping as tensor keys.
+    #[test]
+    fn vlm_prefixed_override_paths_match_canonical_keys() {
+        let config = config_with(
+            r#"{"group_size": 64, "bits": 4,
+                "language_model.model.layers.0.mlp.gate_proj": {"group_size": 64, "bits": 8}}"#,
+        );
+        assert_eq!(
+            quant_params_for(&config, "model.layers.0.mlp.gate_proj", DEFAULT).bits,
+            8
+        );
+    }
+
+    /// Checkpoints quantized by pmetal before #30 keep loading.
+    #[test]
+    fn legacy_per_tensor_overrides_still_apply() {
+        let config = config_with(
+            r#"{"group_size": 64, "bits": 4,
+                "per_tensor_overrides": {"model.layers.0.mlp.down_proj.weight": 8}}"#,
+        );
+        let q = quant_params_for(&config, "model.layers.0.mlp.down_proj", DEFAULT);
+        assert_eq!((q.group_size, q.bits), (64, 8));
+    }
 }
 
 #[cfg(test)]
