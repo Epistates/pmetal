@@ -148,6 +148,16 @@ impl AneRuntime {
     /// This performs the full pipeline: descriptor → model → compile → load.
     /// The returned `AneModel` implements `Drop` for RAII cleanup.
     pub fn compile(&self, mil_text: &[u8], weight_dict: Option<&WeightDict>) -> Result<AneModel> {
+        // Several weight files fail macOS 27's bundle hash check; see pack_weights.
+        let packed = weight_dict.filter(|_| macos_27_or_later()).and_then(|wd| {
+            let mil = std::str::from_utf8(mil_text).ok()?;
+            pack_weights(mil, wd)
+        });
+        let (mil_text, weight_dict) = match &packed {
+            Some((mil, wd)) => (mil.as_bytes(), Some(wd)),
+            None => (mil_text, weight_dict),
+        };
+
         // SAFETY: All ObjC message sends use valid class/object pointers obtained
         // from the framework. Memory management follows ObjC retain/release rules.
         unsafe {
@@ -1097,6 +1107,80 @@ impl Default for WeightDict {
     }
 }
 
+/// Path of the single weight file [`pack_weights`] produces.
+const PACKED_WEIGHTS_PATH: &str = "@model_path/weights/weight.bin";
+
+/// Merge a kernel's one-blob-per-file weights into one file and point the
+/// MIL's `BLOBFILE` references at each blob's offset in it.
+///
+/// On macOS 27 the descriptor hashes the weight entries in one order and
+/// `ANECompilerService` rehashes the files in the bundle in another, so a
+/// kernel with several distinct weight files fails `verifyBundleAtPath` with
+/// a hash mismatch (Code=10; #34). With one file there is no order. The
+/// layout is the one CoreML's weight.bin uses, which the blobs already follow
+/// individually: a 64-byte header (blob count, version 2), then per blob a
+/// 64-byte metadata record (0xDEADBEEF, dtype, size, data offset) and its
+/// data, each record 64-byte aligned. `BLOBFILE(offset=…)` names the record.
+///
+/// Returns `None`, leaving the inputs as they are, when there is at most one
+/// weight file or a blob or reference isn't in the expected form.
+fn pack_weights(mil_text: &str, weights: &WeightDict) -> Option<(String, WeightDict)> {
+    const HEADER: usize = 64;
+    const RECORD: usize = 64;
+    if weights.entries.len() < 2 {
+        return None;
+    }
+    let align = |n: usize| n.div_ceil(64) * 64;
+    let u32_at = |b: &[u8], at: usize| u32::from_le_bytes(b[at..at + 4].try_into().unwrap());
+
+    let mut entries: Vec<&(String, Vec<u8>)> = weights.entries.iter().collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut packed = vec![0u8; HEADER];
+    packed[0..4].copy_from_slice(&(entries.len() as u32).to_le_bytes());
+    packed[4..8].copy_from_slice(&2u32.to_le_bytes());
+    let mut mil = mil_text.to_string();
+
+    for (path, blob) in entries {
+        // One blob per file: count 1, its record at 64, data at 128.
+        if blob.len() < HEADER + RECORD
+            || u32_at(blob, 0) != 1
+            || u32_at(blob, 64) != 0xDEAD_BEEF
+            || u32_at(blob, 80) != (HEADER + RECORD) as u32
+        {
+            return None;
+        }
+        let size = u32_at(blob, 72) as usize;
+        if HEADER + RECORD + size > blob.len() {
+            return None;
+        }
+        let reference = format!("BLOBFILE(path=string(\"{path}\"), offset=uint64(64))");
+        if !mil.contains(&reference) {
+            return None;
+        }
+
+        let record_at = packed.len();
+        // Within the record: size at +8, data offset at +16 (file offsets 72, 80).
+        let mut record = blob[HEADER..HEADER + RECORD].to_vec();
+        record[8..16].copy_from_slice(&(size as u64).to_le_bytes());
+        record[16..24].copy_from_slice(&((record_at + RECORD) as u64).to_le_bytes());
+        packed.extend_from_slice(&record);
+        packed.extend_from_slice(&blob[HEADER + RECORD..HEADER + RECORD + size]);
+        packed.resize(align(packed.len()), 0);
+
+        mil = mil.replace(
+            &reference,
+            &format!(
+                "BLOBFILE(path=string(\"{PACKED_WEIGHTS_PATH}\"), offset=uint64({record_at}))"
+            ),
+        );
+    }
+
+    let mut out = WeightDict::new();
+    out.add(PACKED_WEIGHTS_PATH, packed);
+    Some((mil, out))
+}
+
 // ============================================================================
 // Helper functions
 // ============================================================================
@@ -1157,12 +1241,19 @@ unsafe fn client_can_load(model: *mut AnyObject) -> bool {
 /// shape it now expects isn't known, so stats aren't requested there;
 /// evaluation works without them and hardware time reads as 0.
 fn perf_stats_request_supported() -> bool {
-    static SUPPORTED: OnceLock<bool> = OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
+    !macos_27_or_later()
+}
+
+/// macOS 27 changed the private ANE API in several places (#34). Behavior
+/// keyed to it is limited to 27+, because earlier releases can't be tested
+/// here and their existing path is known to work.
+fn macos_27_or_later() -> bool {
+    static AT_LEAST_27: OnceLock<bool> = OnceLock::new();
+    *AT_LEAST_27.get_or_init(|| {
         objc2_foundation::NSProcessInfo::processInfo()
             .operatingSystemVersion()
             .majorVersion
-            < 27
+            >= 27
     })
 }
 
@@ -1346,6 +1437,119 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, MetalError::InvalidConfig(_)));
         assert!(err.to_string().contains("output set 0"));
+    }
+
+    fn two_conv_kernel(w1: &[f32], w2: &[f32], c: usize, sp: usize) -> (String, WeightDict) {
+        use crate::ane::kernel::WeightBlob;
+        let mut p = MilProgram::new(c, sp);
+        p.emit_conv_constants();
+        let mut wd = WeightDict::new();
+        for (name, w) in [("w1", w1), ("w2", w2)] {
+            let path = format!("@model_path/weights/{name}.bin");
+            p.emit_weight_const(name, &[c, c, 1, 1], &path);
+            wd.add(&path, WeightBlob::from_f32(w, c, c));
+        }
+        p.emit_conv("y", &[1, c, 1, sp], "w1", "x");
+        p.emit_conv("z", &[1, c, 1, sp], "w2", "y");
+        (p.finalize("z"), wd)
+    }
+
+    #[test]
+    fn pack_weights_lays_blobs_out_like_coreml_weight_bin() {
+        let (c, sp) = (8, 32);
+        let (mil, wd) = two_conv_kernel(&[0.5; 64], &[0.25; 64], c, sp);
+        let (packed_mil, packed) = pack_weights(&mil, &wd).expect("two blobs pack");
+
+        assert_eq!(packed.entries.len(), 1);
+        let (path, file) = &packed.entries[0];
+        assert_eq!(path, PACKED_WEIGHTS_PATH);
+        let u32_at = |at: usize| u32::from_le_bytes(file[at..at + 4].try_into().unwrap());
+        let u64_at = |at: usize| u64::from_le_bytes(file[at..at + 8].try_into().unwrap());
+        assert_eq!((u32_at(0), u32_at(4)), (2, 2), "count, version");
+
+        // Each record: magic, size, data offset just past the record, data
+        // copied, and the MIL pointing at it.
+        let data_bytes = c * c * 2;
+        for (record_at, name) in [(64usize, "w1"), (64 + 64 + data_bytes, "w2")] {
+            assert_eq!(record_at % 64, 0);
+            assert_eq!(u32_at(record_at), 0xDEAD_BEEF);
+            assert_eq!(u64_at(record_at + 8) as usize, data_bytes);
+            assert_eq!(u64_at(record_at + 16) as usize, record_at + 64);
+            let original = &wd.entries.iter().find(|(p, _)| p.contains(name)).unwrap().1;
+            assert_eq!(
+                &file[record_at + 64..record_at + 64 + data_bytes],
+                &original[128..]
+            );
+            assert!(packed_mil.contains(&format!(
+                "BLOBFILE(path=string(\"{PACKED_WEIGHTS_PATH}\"), offset=uint64({record_at}))"
+            )));
+        }
+        assert!(!packed_mil.contains("w1.bin") && !packed_mil.contains("w2.bin"));
+    }
+
+    #[test]
+    fn pack_weights_leaves_what_it_cant_handle() {
+        let (mil, wd) = two_conv_kernel(&[0.5; 64], &[0.25; 64], 8, 32);
+        let mut one = WeightDict::new();
+        one.add(&wd.entries[0].0, wd.entries[0].1.clone());
+        assert!(
+            pack_weights(&mil, &one).is_none(),
+            "a single file needs no packing"
+        );
+        assert!(
+            pack_weights("no references here", &wd).is_none(),
+            "a blob the MIL doesn't reference at offset 64"
+        );
+        let mut bad = WeightDict::new();
+        bad.add(&wd.entries[0].0, vec![0u8; 200]);
+        bad.add(&wd.entries[1].0, wd.entries[1].1.clone());
+        assert!(
+            pack_weights(&mil, &bad).is_none(),
+            "a blob without the header"
+        );
+    }
+
+    /// Packed weights must evaluate to the same function: two layers with
+    /// distinct weights against a CPU reference. 8x32 fp16 rows are 64 bytes,
+    /// so this avoids the separate row-stride sizing issue (Code=42).
+    #[test]
+    #[ignore = "requires ANE hardware and private AppleNeuralEngine.framework"]
+    fn test_multi_weight_kernel_evaluates_correctly() {
+        let rt = match AneRuntime::global() {
+            Ok(rt) => rt,
+            Err(MetalError::AneNotAvailable) => return,
+            Err(e) => panic!("Unexpected error: {e}"),
+        };
+        let (c, sp) = (8usize, 32usize);
+        let w1: Vec<f32> = (0..c * c).map(|k| ((k % 7) as f32 - 3.0) * 0.05).collect();
+        let w2: Vec<f32> = (0..c * c).map(|k| ((k % 5) as f32 - 2.0) * 0.07).collect();
+        let (mil, wd) = two_conv_kernel(&w1, &w2, c, sp);
+        let model = rt
+            .compile(mil.as_bytes(), Some(&wd))
+            .expect("a kernel with several weight files compiles");
+
+        let x: Vec<f32> = (0..c * sp).map(|k| ((k % 11) as f32 - 5.0) * 0.1).collect();
+        let input = IoSurface::for_tensor(c, sp).unwrap();
+        let output = IoSurface::for_tensor(c, sp).unwrap();
+        input.write_f32_as_fp16(&x, c, sp);
+        model
+            .evaluate(&[input.as_ptr()], &[output.as_ptr()])
+            .expect("ANE evaluation");
+        let mut got = vec![0.0f32; c * sp];
+        output.read_fp16_as_f32(&mut got, 0, c, sp);
+
+        let conv = |w: &[f32], x: &[f32]| {
+            let mut y = vec![0.0f32; c * sp];
+            for o in 0..c {
+                for t in 0..sp {
+                    y[o * sp + t] = (0..c).map(|i| w[o * c + i] * x[i * sp + t]).sum();
+                }
+            }
+            y
+        };
+        let expected = conv(&w2, &conv(&w1, &x));
+        let diff = max_abs_diff(&got, &expected);
+        assert!(diff < 1e-3, "max |ane - cpu| = {diff}");
     }
 
     #[test]
