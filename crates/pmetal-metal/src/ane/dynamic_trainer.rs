@@ -2502,6 +2502,55 @@ impl DynamicAneTrainer {
         self.refresh_transposed_weights();
     }
 
+    /// Write the current weights to `path` as one safetensors file, under the
+    /// names [`Self::load_weights_safetensors`] reads. f32: the updates at the
+    /// learning rates this trainer uses are below bf16's precision for
+    /// weights of typical size, so a bf16 file would round most of them away.
+    pub fn save_safetensors(&self, path: &std::path::Path) -> Result<()> {
+        use safetensors::{Dtype, tensor::TensorView};
+
+        let (d, h) = (self.config.dim, self.config.hidden_dim);
+        let (qd, kvd) = (self.kernel_config.q_dim(), self.kernel_config.kv_dim());
+        let v = self.config.vocab_size;
+        let mut tensors: Vec<(String, &[f32], Vec<usize>)> = vec![
+            (
+                "model.embed_tokens.weight".into(),
+                &self.embed_weights,
+                vec![v, d],
+            ),
+            ("model.norm.weight".into(), &self.rms_final, vec![d]),
+        ];
+        for (l, lw) in self.layer_weights.iter().enumerate() {
+            for (name, data, shape) in [
+                ("self_attn.q_proj.weight", &lw.wq, vec![qd, d]),
+                ("self_attn.k_proj.weight", &lw.wk, vec![kvd, d]),
+                ("self_attn.v_proj.weight", &lw.wv, vec![kvd, d]),
+                ("self_attn.o_proj.weight", &lw.wo, vec![d, qd]),
+                ("mlp.gate_proj.weight", &lw.w1, vec![h, d]),
+                ("mlp.down_proj.weight", &lw.w2, vec![d, h]),
+                ("mlp.up_proj.weight", &lw.w3, vec![h, d]),
+                ("input_layernorm.weight", &lw.rms_att, vec![d]),
+                ("post_attention_layernorm.weight", &lw.rms_ffn, vec![d]),
+            ] {
+                tensors.push((format!("model.layers.{l}.{name}"), data, shape));
+            }
+        }
+
+        let views = tensors
+            .iter()
+            .map(|(name, data, shape)| {
+                let bytes: &[u8] = zerocopy::IntoBytes::as_bytes(*data);
+                TensorView::new(Dtype::F32, shape.clone(), bytes)
+                    .map(|view| (name.as_str(), view))
+                    .map_err(|e| MetalError::InvalidConfig(format!("tensor {name}: {e}")))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let metadata = std::collections::HashMap::from([("format".to_string(), "pt".to_string())]);
+        safetensors::serialize_to_file(views, Some(metadata), path).map_err(|e| {
+            MetalError::InvalidConfig(format!("Failed to write {}: {e}", path.display()))
+        })
+    }
+
     /// The current weights, in [`Self::load_weights_flat`]'s layout.
     pub fn export_weights_flat(&self) -> Vec<f32> {
         let mut out = Vec::with_capacity(self.embed_weights.len() + self.rms_final.len());
@@ -2798,6 +2847,33 @@ mod tests {
         // Same full token → same compact token
         let r2 = vm.remap_tokens(&[5, 5, 0]);
         assert_eq!(r2[0], r2[1]); // both are token 5
+    }
+
+    #[test]
+    fn saved_weights_load_back_unchanged() {
+        let config = DynamicAneTrainerConfig {
+            dim: 16,
+            hidden_dim: 32,
+            n_heads: 4,
+            n_kv_heads: 2,
+            n_layers: 2,
+            vocab_size: 50,
+            seq_len: 4,
+            ..Default::default()
+        };
+        let mut trainer = DynamicAneTrainer::new(config.clone());
+        let n = trainer.export_weights_flat().len();
+        let weights: Vec<f32> = (0..n).map(|i| (i % 97) as f32 * 0.001 - 0.04).collect();
+        trainer.load_weights_flat(&weights);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        trainer.save_safetensors(&path).unwrap();
+
+        // The strict loader refuses a missing or misshapen tensor.
+        let mut reloaded = DynamicAneTrainer::new(config);
+        reloaded.load_weights_safetensors(&path).unwrap();
+        assert_eq!(reloaded.export_weights_flat(), weights);
     }
 
     #[test]

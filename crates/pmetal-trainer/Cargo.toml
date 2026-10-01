@@ -13,7 +13,7 @@ categories.workspace = true
 default = ["ane", "hub"]
 # No-op: TensorBoard logging is always built. Kept so manifests naming it still resolve.
 tensorboard = []
-ane = ["pmetal-metal/ane", "pmetal-core/ane"]
+ane = ["pmetal-metal/ane", "pmetal-core/ane", "dep:pmetal-merge", "dep:safetensors"]
 hub = ["dep:pmetal-hub"]
 distributed = ["dep:pmetal-distributed"]
 experimental-trainers = []
@@ -26,6 +26,9 @@ pmetal-data = { workspace = true }
 pmetal-models = { workspace = true }
 pmetal-distill = { workspace = true }
 pmetal-metal = { workspace = true }
+# Writes the ANE trainer's output model next to the base model's side files.
+pmetal-merge = { workspace = true, optional = true }
+safetensors = { workspace = true, optional = true }
 pmetal-distributed = { workspace = true, optional = true }
 pmetal-hub = { workspace = true, optional = true }
 pmetal-bridge = { workspace = true }

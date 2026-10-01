@@ -360,6 +360,8 @@ pub struct TrainingResult {
     pub total_steps: usize,
     pub total_tokens: usize,
     pub output_dir: PathBuf,
+    /// The trained weights: a LoRA adapter, or for full-parameter ANE
+    /// training the model's own weights (`model.safetensors`).
     pub lora_weights_path: PathBuf,
 }
 
@@ -1691,14 +1693,44 @@ async fn attempt_ane_training(
 
     tracing::info!("ANE training complete");
 
-    let lora_weights_path = PathBuf::from(output_dir).join("lora_weights.safetensors");
+    // The ANE trains every weight, so the result is a whole model: the
+    // trained weights next to the base model's config and tokenizer. It used
+    // to be thrown away.
+    emit_phase(phase_cb, TrainingPhase::SavingWeights);
+    let output = PathBuf::from(output_dir);
+    let source_dir = if model_path.is_dir() {
+        model_path
+    } else {
+        model_path.parent().unwrap_or(Path::new("."))
+    };
+    pmetal_merge::copy_side_files(source_dir, &output)?;
+    pmetal_merge::patch_config_dtype(&output, safetensors::Dtype::F32)?;
+    let weights_path = output.join("model.safetensors");
+    training_loop.save_model(&weights_path)?;
+    tracing::info!(path = %weights_path.display(), "Saved ANE-trained model");
+
+    if config.emit_console_output {
+        println!("\n========================================");
+        println!("  Training Complete!");
+        println!("========================================");
+        println!("Final Loss:   {:.4}", final_loss);
+        println!("Total Steps:  {}", total_batches);
+        println!("Total Tokens: {}", total_tokens_processed);
+        println!("Output:       {}", output_dir);
+        println!("========================================");
+        println!("\nNext steps:");
+        println!(
+            "  Inference:  pmetal infer -m {} -p \"Your prompt\"",
+            output_dir
+        );
+    }
 
     Ok(TrainingResult {
         final_loss,
         total_steps: total_batches,
         total_tokens: total_tokens_processed,
-        output_dir: PathBuf::from(output_dir),
-        lora_weights_path,
+        output_dir: output,
+        lora_weights_path: weights_path,
     })
 }
 

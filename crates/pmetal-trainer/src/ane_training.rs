@@ -88,7 +88,13 @@ impl AneTrainingLoop {
         self.trainer.load_weights_safetensors(path)
     }
 
-    /// Install vocab compaction for faster classifier operations.
+    /// Write the trained weights to `path`, an f32 safetensors file under
+    /// the checkpoint's own tensor names.
+    pub fn save_model(&self, path: &Path) -> Result<(), pmetal_metal::error::MetalError> {
+        self.trainer.save_safetensors(path)
+    }
+
+    /// Install a vocab map, so batches can carry compact u16 token ids.
     ///
     /// Must be called after `load_weights_*` and before `compile_kernels()`.
     pub fn install_vocab_map(&mut self, vocab_map: pmetal_metal::ane::dynamic_trainer::VocabMap) {
@@ -222,6 +228,12 @@ impl AneTrainingLoop {
         if let Err(e) = std::fs::create_dir_all(path) {
             tracing::error!(error = %e, "Failed to create checkpoint directory");
             return;
+        }
+
+        // The weights, which a checkpoint used to leave out.
+        let weights_path = path.join("model.safetensors");
+        if let Err(e) = self.save_model(&weights_path) {
+            tracing::error!(error = %e, "Failed to write checkpoint weights");
         }
 
         let state_path = path.join("training_state.json");
