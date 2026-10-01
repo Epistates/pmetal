@@ -14,7 +14,6 @@
 //! gracefully if the framework is missing.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::path::PathBuf;
 use std::sync::{
     OnceLock,
     atomic::{AtomicBool, AtomicPtr, Ordering},
@@ -203,6 +202,7 @@ impl AneRuntime {
             let tmp_dir: *mut AnyObject =
                 msg_send![&*tmp_base, stringByAppendingPathComponent: hex_id];
             let tmp_dir_str = ns_string_to_rust(tmp_dir as *const AnyObject);
+            let _compile_dir = CompileDir(tmp_dir_str.clone());
 
             // Pre-populate temp directory with MIL + weights
             let fm = NSFileManager::defaultManager();
@@ -258,7 +258,6 @@ impl AneRuntime {
                 } else {
                     "unknown error".to_string()
                 };
-                cleanup_tmp(&tmp_dir_str);
                 return Err(MetalError::AneCompileFailed(msg));
             }
 
@@ -276,7 +275,6 @@ impl AneRuntime {
                 } else {
                     "unknown error".to_string()
                 };
-                cleanup_tmp(&tmp_dir_str);
                 return Err(MetalError::AneLoadFailed(msg));
             }
 
@@ -337,7 +335,6 @@ impl AneRuntime {
                 real_time,
                 standard_loaded: AtomicBool::new(true),
                 standard_load_lock: Mutex::new(()),
-                tmp_dir: PathBuf::from(&tmp_dir_str),
                 input_layouts,
                 output_layouts,
                 staging: Mutex::new(Staging::default()),
@@ -636,7 +633,7 @@ impl AneRealTimeState {
 
 /// A compiled ANE model ready for evaluation.
 ///
-/// Implements `Drop` for RAII: unloads from ANE hardware and cleans up temp directory.
+/// Implements `Drop` for RAII: unloads from ANE hardware.
 pub struct AneModel {
     model: *mut AnyObject,
     real_time_model: *mut AnyObject,
@@ -645,7 +642,6 @@ pub struct AneModel {
     real_time: Option<AneRealTimeState>,
     standard_loaded: AtomicBool,
     standard_load_lock: Mutex<()>,
-    tmp_dir: PathBuf,
     input_layouts: Vec<AneTensorLayout>,
     output_layouts: Vec<AneTensorLayout>,
     /// Surfaces laid out the model's way, for callers' packed ones whose
@@ -1104,7 +1100,6 @@ impl Drop for AneModel {
             }
         }
         self.unload();
-        cleanup_tmp(&self.tmp_dir.to_string_lossy());
         unsafe {
             let _: () = msg_send![self.model, release];
             if self.real_time_model != self.model {
@@ -1522,9 +1517,19 @@ unsafe fn ns_error_description(error: *mut NSError) -> String {
     unsafe { ns_string_to_rust(desc) }
 }
 
-/// Clean up a temp directory.
-fn cleanup_tmp(path: &str) {
-    let _ = std::fs::remove_dir_all(path);
+/// The directory a kernel compiles in: its MIL, its weights, and the
+/// framework's own copy of them, so about twice the kernel's weight bytes.
+/// Removed when dropped. A loaded model no longer reads it (it evaluates,
+/// unloads and reloads without it), so it's dropped as soon as `compile`
+/// returns. Keeping it for the model's lifetime put two copies of every
+/// layer's weights on the boot volume, which filled it partway through a 4B
+/// model.
+struct CompileDir(String);
+
+impl Drop for CompileDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 /// Whether `model` can be handed to `_ANEClient`'s load path. On macOS 27 that
