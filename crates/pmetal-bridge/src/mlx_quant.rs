@@ -491,19 +491,21 @@ pub fn quantize_and_save_mlx(
                 owned_arrays.push(biases);
                 let biases_idx = owned_arrays.len() - 1;
 
+                // MLX's layout: the packed tensor keeps its `.weight` name and
+                // the scales and biases are its siblings, `{module}.scales`
+                // and `{module}.biases`. Suffixing the full tensor name
+                // (`{module}.weight.scales`) made checkpoints mlx_lm can't
+                // load (#30).
+                let module = module_path(&assignment.name);
+                let scales_key = format!("{module}.scales");
+                let biases_key = format!("{module}.biases");
                 shard_key_indices.push((assignment.name.clone(), packed_idx));
-                shard_key_indices.push((format!("{}.scales", assignment.name), scales_idx));
-                shard_key_indices.push((format!("{}.biases", assignment.name), biases_idx));
+                shard_key_indices.push((scales_key.clone(), scales_idx));
+                shard_key_indices.push((biases_key.clone(), biases_idx));
 
                 weight_map.insert(assignment.name.clone(), shard_filename.clone());
-                weight_map.insert(
-                    format!("{}.scales", assignment.name),
-                    shard_filename.clone(),
-                );
-                weight_map.insert(
-                    format!("{}.biases", assignment.name),
-                    shard_filename.clone(),
-                );
+                weight_map.insert(scales_key, shard_filename.clone());
+                weight_map.insert(biases_key, shard_filename.clone());
             }
         }
 
@@ -588,14 +590,23 @@ fn dtype_element_bytes(dtype_raw: i32) -> u64 {
     }
 }
 
+/// The module a tensor belongs to: its name without the trailing `.weight`.
+/// MLX names a quantized module's scales, biases and config override by this.
+fn module_path(tensor_name: &str) -> &str {
+    tensor_name.strip_suffix(".weight").unwrap_or(tensor_name)
+}
+
 // ── Config writing ────────────────────────────────────────────────────────────
 
 /// Copy `source_config_path` to `output_dir/config.json`, injecting a
-/// `"quantization"` block with `group_size`, `bits`, and any per-tensor
-/// overrides that differ from the default.
+/// `"quantization"` block with `group_size`, `bits`, and an override for
+/// each module whose bits differ from the default.
 ///
-/// The `"quantization"` key is written at the top level, matching MLX's
-/// convention (used by `mlx_lm` and compatible loaders).
+/// The block follows MLX's convention, which `mlx_lm` and pmetal's loaders
+/// read: it sits at the top level, and an override is a sibling key named by
+/// module path (`"model.layers.0.mlp.down_proj": {"group_size": 64,
+/// "bits": 8}`). `per_tensor_overrides` is keyed by tensor name
+/// (`….down_proj.weight`), as the quantizer assigns bits.
 ///
 /// # Errors
 ///
@@ -620,15 +631,16 @@ pub fn write_quantization_config(
         "bits": default_bits,
     });
 
-    // Only record overrides that differ from the default to keep the file tidy.
-    let non_default: serde_json::Map<String, serde_json::Value> = per_tensor_overrides
-        .iter()
-        .filter(|(_, bits)| **bits != default_bits)
-        .map(|(k, v)| (k.clone(), serde_json::Value::Number((*v).into())))
-        .collect();
-
-    if !non_default.is_empty() {
-        quant["per_tensor_overrides"] = serde_json::Value::Object(non_default);
+    // Only modules that differ from the default get an entry. pmetal used to
+    // write these as its own `per_tensor_overrides` map, which mlx_lm ignores
+    // (#30); its loaders still read that for older checkpoints.
+    for (tensor, bits) in per_tensor_overrides {
+        if *bits != default_bits {
+            quant[module_path(tensor)] = serde_json::json!({
+                "group_size": group_size,
+                "bits": bits,
+            });
+        }
     }
 
     match &mut json {
@@ -752,6 +764,69 @@ pub fn quantize_model(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── MLX checkpoint layout (#30) ───────────────────────────────────────────
+
+    #[test]
+    fn module_path_drops_the_weight_suffix_only() {
+        assert_eq!(
+            module_path("model.layers.0.mlp.down_proj.weight"),
+            "model.layers.0.mlp.down_proj"
+        );
+        assert_eq!(
+            module_path("model.layers.0.mlp.gate"),
+            "model.layers.0.mlp.gate"
+        );
+    }
+
+    /// Overrides are written MLX's way, and read back by the same parser
+    /// pmetal's own loaders use, so the two can't drift apart.
+    #[test]
+    fn config_overrides_are_mlx_module_keys() {
+        let dir = std::env::temp_dir().join(format!("pmetal-mlx-quant-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.json");
+        std::fs::write(&source, r#"{"model_type": "qwen3"}"#).unwrap();
+
+        let overrides = HashMap::from([
+            ("model.layers.0.mlp.down_proj.weight".to_string(), 8),
+            ("model.layers.1.mlp.up_proj.weight".to_string(), 4),
+        ]);
+        write_quantization_config(&source, &dir, 4, 64, &overrides).unwrap();
+
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("config.json")).unwrap())
+                .unwrap();
+        let quant = &written["quantization"];
+        assert!(quant.get("per_tensor_overrides").is_none());
+        assert_eq!(
+            quant["model.layers.0.mlp.down_proj"],
+            serde_json::json!({"group_size": 64, "bits": 8})
+        );
+        assert!(
+            quant.get("model.layers.1.mlp.up_proj").is_none(),
+            "default-width modules get no entry"
+        );
+
+        let parsed =
+            crate::native_weight::MlxQuantization::from_json(quant, |p| Some(p.to_string()))
+                .expect("MLX parser accepts the block");
+        assert_eq!(
+            parsed
+                .params_for("model.layers.0.mlp.down_proj")
+                .unwrap()
+                .bits,
+            8
+        );
+        assert_eq!(
+            parsed
+                .params_for("model.layers.1.mlp.up_proj")
+                .unwrap()
+                .bits,
+            4
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     // ── is_critical_tensor ────────────────────────────────────────────────────
 
