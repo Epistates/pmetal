@@ -147,6 +147,18 @@ impl AneRuntime {
     /// This performs the full pipeline: descriptor → model → compile → load.
     /// The returned `AneModel` implements `Drop` for RAII cleanup.
     pub fn compile(&self, mil_text: &[u8], weight_dict: Option<&WeightDict>) -> Result<AneModel> {
+        // The framework hands back autoreleased objects, the descriptor among
+        // them, and it holds a copy of every weight. A Rust thread has no
+        // pool to drain them, so without this one each kernel's weights
+        // stayed in memory for the life of the process.
+        objc2::rc::autoreleasepool(|_| self.compile_in_pool(mil_text, weight_dict))
+    }
+
+    fn compile_in_pool(
+        &self,
+        mil_text: &[u8],
+        weight_dict: Option<&WeightDict>,
+    ) -> Result<AneModel> {
         // Several weight files fail macOS 27's bundle hash check; see pack_weights.
         let packed = weight_dict.filter(|_| macos_27_or_later()).and_then(|wd| {
             let mil = std::str::from_utf8(mil_text).ok()?;
@@ -204,78 +216,24 @@ impl AneRuntime {
             let tmp_dir_str = ns_string_to_rust(tmp_dir as *const AnyObject);
             let _compile_dir = CompileDir(tmp_dir_str.clone());
 
-            // Pre-populate temp directory with MIL + weights
-            let fm = NSFileManager::defaultManager();
-            let weights_dir = format!("{}/weights", tmp_dir_str);
-            let weights_dir_ns = NSString::from_str(&weights_dir);
-            let _: Bool = msg_send![
-                &*fm,
-                createDirectoryAtPath: &*weights_dir_ns,
-                withIntermediateDirectories: Bool::YES,
-                attributes: std::ptr::null::<AnyObject>(),
-                error: std::ptr::null_mut::<*mut NSError>()
-            ];
-
-            // Write MIL text
-            let mil_path = format!("{}/model.mil", tmp_dir_str);
-            let mil_path_ns = NSString::from_str(&mil_path);
-            let _: Bool = msg_send![&*mil_data, writeToFile: &*mil_path_ns, atomically: Bool::YES];
-
-            // Write weight files
-            if let Some(wd) = weight_dict {
-                for (name, data) in &wd.entries {
-                    let rel = name.replace("@model_path/", "");
-                    // Reject path traversal attempts in weight key names.
-                    if rel.contains("..")
-                        || rel.starts_with('/')
-                        || rel.starts_with('\\')
-                        || rel.contains('\0')
-                    {
-                        return Err(MetalError::InvalidConfig(format!(
-                            "Invalid weight key (path traversal attempt): {name:?}"
-                        )));
-                    }
-                    let path = format!("{}/{}", tmp_dir_str, rel);
-                    let path_ns = NSString::from_str(&path);
-                    let ns_data = NSData::with_bytes(data);
-                    let _: Bool =
-                        msg_send![&*ns_data, writeToFile: &*path_ns, atomically: Bool::YES];
+            // aned keeps compiled programs across processes, keyed by the
+            // hash in this directory's name (MIL, weights, options), so a
+            // kernel compiled by an earlier run only needs loading.
+            // Recompiling it took ~0.3 s for each Qwen3-4B FFN kernel.
+            let cached: Bool = msg_send![model, compiledModelExists];
+            let mut from_cache = cached.as_bool();
+            if !from_cache {
+                stage_and_compile(model, &tmp_dir_str, &mil_data, weight_dict)?;
+            }
+            if let Err(err) = load_model(model) {
+                if !from_cache {
+                    return Err(err);
                 }
-            }
-
-            // Compile: compileWithQoS:options:error:
-            let mut error: *mut NSError = std::ptr::null_mut();
-            let empty_dict = NSDictionary::<NSString, AnyObject>::new();
-            let ok: Bool = msg_send![
-                model,
-                compileWithQoS: ANE_QOS,
-                options: &*empty_dict,
-                error: &mut error
-            ];
-            if !ok.as_bool() {
-                let msg = if !error.is_null() {
-                    ns_error_description(error)
-                } else {
-                    "unknown error".to_string()
-                };
-                return Err(MetalError::AneCompileFailed(msg));
-            }
-
-            // Load: loadWithQoS:options:error:
-            error = std::ptr::null_mut();
-            let ok: Bool = msg_send![
-                model,
-                loadWithQoS: ANE_QOS,
-                options: &*empty_dict,
-                error: &mut error
-            ];
-            if !ok.as_bool() {
-                let msg = if !error.is_null() {
-                    ns_error_description(error)
-                } else {
-                    "unknown error".to_string()
-                };
-                return Err(MetalError::AneLoadFailed(msg));
+                from_cache = false;
+                // Purged between the check and the load.
+                tracing::debug!(error = %err, "cached ANE program didn't load; recompiling");
+                stage_and_compile(model, &tmp_dir_str, &mil_data, weight_dict)?;
+                load_model(model)?;
             }
 
             // Retain the model object
@@ -327,6 +285,11 @@ impl AneRuntime {
                 None
             };
 
+            // The descriptor holds a copy of every weight, about as much
+            // memory again as the loaded program. A loaded model evaluates,
+            // unloads and reloads without it.
+            let _: () = msg_send![model, setDescriptor: std::ptr::null::<AnyObject>()];
+
             Ok(AneModel {
                 model,
                 real_time_model,
@@ -338,6 +301,7 @@ impl AneRuntime {
                 input_layouts,
                 output_layouts,
                 staging: Mutex::new(Staging::default()),
+                from_cache,
             })
         }
     }
@@ -529,12 +493,7 @@ impl AneRealTimeState {
                 error: &mut error
             ];
             if !ok.as_bool() {
-                let msg = if !error.is_null() {
-                    ns_error_description(error)
-                } else {
-                    "unknown error".to_string()
-                };
-                return Err(MetalError::AneLoadFailed(msg));
+                return Err(MetalError::AneLoadFailed(error_message(error)));
             }
         }
 
@@ -555,12 +514,7 @@ impl AneRealTimeState {
                 error: &mut error
             ];
             if !mapped.as_bool() {
-                let msg = if !error.is_null() {
-                    ns_error_description(error)
-                } else {
-                    "unknown error".to_string()
-                };
-                return Err(MetalError::AneEvalFailed(msg));
+                return Err(MetalError::AneEvalFailed(error_message(error)));
             }
 
             let began: Bool = msg_send![self.client, beginRealTimeTask];
@@ -586,12 +540,7 @@ impl AneRealTimeState {
             let _: () = msg_send![self.client, unmapIOSurfacesWithModel: model, request: request];
 
             if !ok.as_bool() {
-                let msg = if !error.is_null() {
-                    ns_error_description(error)
-                } else {
-                    "unknown error".to_string()
-                };
-                return Err(MetalError::AneEvalFailed(msg));
+                return Err(MetalError::AneEvalFailed(error_message(error)));
             }
         }
 
@@ -647,6 +596,7 @@ pub struct AneModel {
     /// Surfaces laid out the model's way, for callers' packed ones whose
     /// layout is padded. Allocated on first use; held for the evaluation.
     staging: Mutex<Staging>,
+    from_cache: bool,
 }
 
 #[derive(Default)]
@@ -669,6 +619,12 @@ impl AneModel {
     /// The layout the model produces for each output, in order.
     pub fn output_layouts(&self) -> &[AneTensorLayout] {
         &self.output_layouts
+    }
+
+    /// Whether the program came from aned's compiled-program cache, which
+    /// outlives the process, rather than being compiled for this call.
+    pub fn from_cache(&self) -> bool {
+        self.from_cache
     }
 
     /// Returns true when the real-time evaluation path is available for this model.
@@ -806,24 +762,7 @@ impl AneModel {
             return Ok(());
         }
 
-        unsafe {
-            let mut error: *mut NSError = std::ptr::null_mut();
-            let empty_dict = empty_options_dict();
-            let ok: Bool = msg_send![
-                self.model,
-                loadWithQoS: ANE_QOS,
-                options: &*empty_dict,
-                error: &mut error
-            ];
-            if !ok.as_bool() {
-                let msg = if !error.is_null() {
-                    ns_error_description(error)
-                } else {
-                    "unknown error".to_string()
-                };
-                return Err(MetalError::AneLoadFailed(msg));
-            }
-        }
+        unsafe { load_model(self.model)? };
 
         self.standard_loaded.store(true, Ordering::Release);
         Ok(())
@@ -847,12 +786,9 @@ impl AneModel {
         ];
 
         if !ok.as_bool() {
-            let msg = if !error.is_null() {
-                unsafe { ns_error_description(error) }
-            } else {
-                "unknown error".to_string()
-            };
-            return Err(MetalError::AneChainingFailed(msg));
+            return Err(MetalError::AneChainingFailed(unsafe {
+                error_message(error)
+            }));
         }
 
         Ok(())
@@ -1052,12 +988,7 @@ impl AneModel {
         ];
 
         if !ok.as_bool() {
-            let msg = if !error.is_null() {
-                unsafe { ns_error_description(error) }
-            } else {
-                "unknown error".to_string()
-            };
-            return Err(MetalError::AneEvalFailed(msg));
+            return Err(MetalError::AneEvalFailed(unsafe { error_message(error) }));
         }
 
         Ok(())
@@ -1134,31 +1065,29 @@ impl WeightDict {
     ///
     /// Format: `{ "@model_path/weights/name.bin": { "offset": 0, "data": NSData } }`
     fn to_ns_dict(&self) -> objc2::rc::Retained<NSDictionary<NSString, AnyObject>> {
+        // `new` returns an owned object, which `Retained` takes over. Retaining
+        // it again, as this used to, leaked the dictionary and with it a copy
+        // of every weight the kernel was compiled with.
+        let mutable_dict = objc2::runtime::AnyClass::get(c"NSMutableDictionary").unwrap();
         unsafe {
-            let dict: *mut AnyObject = msg_send![
-                objc2::runtime::AnyClass::get(c"NSMutableDictionary").unwrap(),
-                new
-            ];
+            let dict: objc2::rc::Retained<AnyObject> = msg_send![mutable_dict, new];
 
             for (path, data) in &self.entries {
                 let key = NSString::from_str(path);
                 let ns_data = NSData::with_bytes(data);
 
                 // Build inner dict: { "offset": @0, "data": ns_data }
-                let inner: *mut AnyObject = msg_send![
-                    objc2::runtime::AnyClass::get(c"NSMutableDictionary").unwrap(),
-                    new
-                ];
+                let inner: objc2::rc::Retained<AnyObject> = msg_send![mutable_dict, new];
                 let offset_key = NSString::from_str("offset");
                 let data_key = NSString::from_str("data");
                 let zero = NSNumber::new_i32(0);
 
-                let _: () = msg_send![inner, setObject: &*zero, forKey: &*offset_key];
-                let _: () = msg_send![inner, setObject: &*ns_data, forKey: &*data_key];
-                let _: () = msg_send![dict, setObject: inner, forKey: &*key];
+                let _: () = msg_send![&*inner, setObject: &*zero, forKey: &*offset_key];
+                let _: () = msg_send![&*inner, setObject: &*ns_data, forKey: &*data_key];
+                let _: () = msg_send![&*dict, setObject: &*inner, forKey: &*key];
             }
 
-            objc2::rc::Retained::retain(dict as *mut NSDictionary<NSString, AnyObject>).unwrap()
+            objc2::rc::Retained::cast_unchecked(dict)
         }
     }
 }
@@ -1517,6 +1446,91 @@ unsafe fn ns_error_description(error: *mut NSError) -> String {
     unsafe { ns_string_to_rust(desc) }
 }
 
+/// Write a kernel's MIL and weight files into `dir`, where the compiler reads
+/// them, and compile it.
+///
+/// # Safety
+/// `model` must be a valid `_ANEInMemoryModel` pointer.
+unsafe fn stage_and_compile(
+    model: *mut AnyObject,
+    dir: &str,
+    mil_data: &NSData,
+    weight_dict: Option<&WeightDict>,
+) -> Result<()> {
+    let fm = NSFileManager::defaultManager();
+    let weights_dir = NSString::from_str(&format!("{dir}/weights"));
+    let _: Bool = msg_send![
+        &*fm,
+        createDirectoryAtPath: &*weights_dir,
+        withIntermediateDirectories: Bool::YES,
+        attributes: std::ptr::null::<AnyObject>(),
+        error: std::ptr::null_mut::<*mut NSError>()
+    ];
+
+    let mil_path = NSString::from_str(&format!("{dir}/model.mil"));
+    let _: Bool = msg_send![mil_data, writeToFile: &*mil_path, atomically: Bool::YES];
+
+    for (name, data) in weight_dict.map_or(&[][..], |wd| &wd.entries[..]) {
+        let rel = name.replace("@model_path/", "");
+        // Reject path traversal attempts in weight key names.
+        if rel.contains("..") || rel.starts_with('/') || rel.starts_with('\\') || rel.contains('\0')
+        {
+            return Err(MetalError::InvalidConfig(format!(
+                "Invalid weight key (path traversal attempt): {name:?}"
+            )));
+        }
+        let path = NSString::from_str(&format!("{dir}/{rel}"));
+        let ns_data = NSData::with_bytes(data);
+        let _: Bool = msg_send![&*ns_data, writeToFile: &*path, atomically: Bool::YES];
+    }
+
+    let mut error: *mut NSError = std::ptr::null_mut();
+    let empty_dict = empty_options_dict();
+    let ok: Bool = msg_send![
+        model,
+        compileWithQoS: ANE_QOS,
+        options: &*empty_dict,
+        error: &mut error
+    ];
+    if !ok.as_bool() {
+        return Err(MetalError::AneCompileFailed(unsafe {
+            error_message(error)
+        }));
+    }
+    Ok(())
+}
+
+/// Load a compiled kernel onto the ANE.
+///
+/// # Safety
+/// `model` must be a valid `_ANEInMemoryModel` pointer.
+unsafe fn load_model(model: *mut AnyObject) -> Result<()> {
+    let mut error: *mut NSError = std::ptr::null_mut();
+    let empty_dict = empty_options_dict();
+    let ok: Bool = msg_send![
+        model,
+        loadWithQoS: ANE_QOS,
+        options: &*empty_dict,
+        error: &mut error
+    ];
+    if !ok.as_bool() {
+        return Err(MetalError::AneLoadFailed(unsafe { error_message(error) }));
+    }
+    Ok(())
+}
+
+/// The description of `error`, which may be null.
+///
+/// # Safety
+/// `error` must be null or a valid NSError pointer.
+unsafe fn error_message(error: *mut NSError) -> String {
+    if error.is_null() {
+        "unknown error".to_string()
+    } else {
+        unsafe { ns_error_description(error) }
+    }
+}
+
 /// The directory a kernel compiles in: its MIL, its weights, and the
 /// framework's own copy of them, so about twice the kernel's weight bytes.
 /// Removed when dropped. A loaded model no longer reads it (it evaluates,
@@ -1868,6 +1882,51 @@ mod tests {
         let expected = conv(&w2, &conv(&w1, &x));
         let diff = max_abs_diff(&got, &expected);
         assert!(diff < 1e-3, "width {sp}: max |ane - cpu| = {diff}");
+    }
+
+    #[test]
+    #[ignore = "requires ANE hardware and private AppleNeuralEngine.framework"]
+    fn test_second_compile_of_a_kernel_loads_from_cache() {
+        let rt = match AneRuntime::global() {
+            Ok(rt) => rt,
+            Err(MetalError::AneNotAvailable) => return,
+            Err(e) => panic!("Unexpected error: {e}"),
+        };
+        let (c, sp) = (8usize, 32usize);
+        // Weights no earlier run compiled, so the first compile can't hit
+        // the cache.
+        let mut stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut w1: Vec<f32> = (0..c * c).map(|k| ((k % 7) as f32 - 3.0) * 0.05).collect();
+        for w in &mut w1[..8] {
+            *w = (stamp % 100) as f32 * 0.01;
+            stamp /= 100;
+        }
+        let w2: Vec<f32> = (0..c * c).map(|k| ((k % 5) as f32 - 2.0) * 0.07).collect();
+        let (mil, wd) = two_conv_kernel(&w1, &w2, c, sp);
+
+        let first = rt.compile(mil.as_bytes(), Some(&wd)).unwrap();
+        let second = rt.compile(mil.as_bytes(), Some(&wd)).unwrap();
+        assert!(!first.from_cache(), "a new kernel was compiled");
+        assert!(second.from_cache(), "the same kernel again was loaded");
+
+        let x: Vec<f32> = (0..c * sp).map(|k| ((k % 11) as f32 - 5.0) * 0.1).collect();
+        let input = IoSurface::for_tensor(c, sp).unwrap();
+        input.write_f32_as_fp16(&x, c, sp);
+        let run = |model: &AneModel| {
+            let output = IoSurface::for_tensor(c, sp).unwrap();
+            model
+                .evaluate(&[input.as_ptr()], &[output.as_ptr()])
+                .unwrap();
+            let mut y = vec![0.0f32; c * sp];
+            output.read_fp16_as_f32(&mut y, 0, c, sp);
+            y
+        };
+        let y = run(&first);
+        assert!(y.iter().any(|v| *v != 0.0));
+        assert_eq!(y, run(&second));
     }
 
     #[test]

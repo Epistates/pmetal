@@ -571,6 +571,15 @@ impl AneInferenceEngine {
             });
         }
 
+        let kernels: Vec<&AneModel> = layer_kernels
+            .iter()
+            .flat_map(|lk| std::iter::once(&lk.fwd_attn_kv).chain(lk.fwd_ffn.as_ref()))
+            .collect();
+        tracing::info!(
+            kernels = kernels.len(),
+            cached = kernels.iter().filter(|k| k.from_cache()).count(),
+            "ANE kernels loaded"
+        );
         self.layer_kernels = Some(layer_kernels);
 
         let ane_ffn_count = self.config.n_layers - cpu_ffn_count;
