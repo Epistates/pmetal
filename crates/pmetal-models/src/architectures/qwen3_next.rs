@@ -1569,6 +1569,12 @@ impl Qwen3NextGatedDeltaNet {
 
         let ssm_state = cache.as_ref().and_then(|c| c.ssm_state.as_ref());
 
+        // An uncached forward is a training (or scoring) pass, which needs the
+        // differentiable ops path: the fused GDN Metal kernel has no VJP, so
+        // under value_and_grad it failed ("Primitive::vjp Not implemented
+        // for CustomKernel") and the loss came out NaN. Same rule as
+        // qwen3_next_qlora. Cached prefill and decode keep the kernel.
+        let training = cache.is_none();
         let (out, new_state) = gated_delta_update(
             &q_normed,
             &k_normed,
@@ -1579,7 +1585,7 @@ impl Qwen3NextGatedDeltaNet {
             self.dt_bias.as_ref(),
             ssm_state,
             mask,
-            false,
+            training,
         )?;
 
         if let Some(cache) = cache {
@@ -4733,6 +4739,44 @@ mod tests {
         );
         let output = gdn.forward(&x, None, None).unwrap();
         assert_eq!(output.shape(), &[1, 4, 32]);
+    }
+
+    /// ⚠️ An uncached forward is what training differentiates. It used the
+    /// fused GDN Metal kernel, which has no VJP, so value_and_grad threw
+    /// "[Primitive::vjp] Not implemented for CustomKernel" and LoRA training
+    /// on Qwen3.5 reported NaN loss. (The bridge turns the throw into a
+    /// placeholder array, so check its error channel, not just the shape.)
+    #[test]
+    #[serial]
+    fn test_gdn_uncached_forward_is_differentiable() {
+        // The fused kernel only takes key dims that are a multiple of 32, so
+        // tiny_config's 16 would never reach it.
+        let config = Qwen3NextConfig {
+            linear_key_head_dim: 32,
+            linear_value_head_dim: 32,
+            ..tiny_config()
+        };
+        let mut gdn = Qwen3NextGatedDeltaNet::new(&config).unwrap();
+        let x = pmetal_bridge::compat::random::normal(
+            &[1, 4, 32],
+            pmetal_bridge::compat::Dtype::Float32,
+        );
+        pmetal_bridge::clear_last_error();
+        let (loss, grads) = pmetal_bridge::compat::nn::value_and_grad_explicit(
+            |arrays: &[Array]| gdn.forward(&arrays[0], None, None).unwrap().sum(None),
+            std::slice::from_ref(&x),
+            &[],
+        )
+        .unwrap();
+        pmetal_bridge::check_last_error().expect("no bridge op failed under value_and_grad");
+
+        assert!(loss.item::<f32>().is_finite());
+        // Evaluate before reading: as_slice on a lazy array reads a null pointer.
+        grads[0].eval();
+        pmetal_bridge::check_last_error().expect("the gradient evaluates");
+        let dx = grads[0].as_slice::<f32>();
+        assert!(dx.iter().all(|g| g.is_finite()), "finite input gradient");
+        assert!(dx.iter().any(|g| *g != 0.0), "non-zero input gradient");
     }
 
     #[test]
