@@ -27,8 +27,11 @@ use tracing::{debug, info};
 use crate::accelerate;
 use crate::ane::dynamic_kernel::{self, DynamicKernelConfig, DynamicKernelOutput};
 use crate::ane::iosurface::IoSurface;
-use crate::ane::kernel::TransformerKernelConfig;
-use crate::ane::loss::{AneTrainingLoss, CrossEntropyLoss};
+use crate::ane::kernel::{self, TransformerKernelConfig};
+/// A target [`DynamicAneTrainer::train_batch`] leaves out of the loss:
+/// padding, and prompt tokens a dataset masks with `-100`.
+pub const IGNORE_TARGET: u16 = u16::MAX;
+use crate::ane::loss::{AneTrainingLoss, CrossEntropyLoss, IGNORE_INDEX};
 use crate::ane::runtime::{AneModel, AneRuntime};
 use crate::ane::scratch::{
     BackwardScratch, BackwardScratchIds, backward_scratch_entries, backward_scratch_ids,
@@ -86,8 +89,9 @@ pub struct DynamicAneTrainerConfig {
     /// (Qwen's); Llama 2 uses 1e4 and Llama 3 5e5.
     pub rope_theta: f32,
     /// Loss scaling factor. Multiplies dlogits before backward and divides
-    /// gradients after accumulation, preventing fp32 underflow for small
-    /// gradient magnitudes at >350M params. Default: 1.0 (disabled).
+    /// gradients after accumulation, against fp16 underflow in the ANE
+    /// kernels. The trainer already scales by `seq_len` (see `grad_scale`);
+    /// this applies on top. Default: 1.0.
     pub loss_scale: f32,
     /// Optional separate learning rate for embeddings. If `None`, uses base LR.
     /// Embeddings benefit from lower LR to prevent divergence from sparse
@@ -187,11 +191,15 @@ impl VocabMap {
         }
     }
 
-    /// Remap a slice of full-vocab token ids to compact ids.
+    /// Remap a slice of full-vocab token ids to compact ids. [`IGNORE_TARGET`]
+    /// passes through.
     pub fn remap_tokens(&self, tokens: &[u16]) -> Vec<u16> {
         tokens
             .iter()
             .map(|&t| {
+                if t == IGNORE_TARGET {
+                    return t;
+                }
                 let c = self.full_to_compact[t as usize];
                 debug_assert!(c >= 0, "Token {} not in VocabMap", t);
                 c as u16
@@ -249,6 +257,14 @@ impl DynamicAneTrainerConfig {
 }
 
 /// Per-layer weight storage (f32, row-major).
+/// One layer's weights. `w*` are `[out, in]`, as checkpoints store them and
+/// as the weight gradients come out; `w*_t` are `[in, out]`.
+///
+/// A packed weight is read as `[in, out]` relative to the activation it
+/// multiplies (see `IoSurface::write_packed_f32`), so a forward projection
+/// takes `w*_t` and an input gradient, which multiplies by Wᵀ, takes `w*`.
+/// The fused SDPA kernels are the exception for Wo: they transpose it
+/// themselves and take `wo`.
 struct LayerWeights {
     wq: Vec<f32>,
     wk: Vec<f32>,
@@ -259,7 +275,6 @@ struct LayerWeights {
     w3: Vec<f32>,
     rms_att: Vec<f32>,
     rms_ffn: Vec<f32>,
-    // Transposed weight buffers for backward kernels
     wq_t: Vec<f32>,
     wk_t: Vec<f32>,
     wv_t: Vec<f32>,
@@ -400,8 +415,6 @@ struct DynamicKernels {
     ffn_bwd_w2t: AneModel,
     /// FFN backward W1^T + W3^T.
     ffn_bwd_w13t: AneModel,
-    /// Softmax kernel for cross-entropy.
-    softmax: Option<AneModel>,
 }
 
 /// IOSurface pool for the decomposed dynamic pipeline.
@@ -424,9 +437,6 @@ struct DynIoPool {
     ffn_bwd_w2t_out: IoSurface,
     ffn_bwd_w13t_in: IoSurface,
     ffn_bwd_w13t_out: IoSurface,
-    /// Softmax IO surfaces (fp16, compact_vocab × seq).
-    softmax_in: Option<IoSurface>,
-    softmax_out: Option<IoSurface>,
 }
 
 /// Dynamic weight ANE trainer. Compiles 9+ kernels once, then trains forever.
@@ -470,15 +480,8 @@ pub struct DynamicAneTrainer {
     /// Use decomposed FFN (ANE projections + CPU SiLU) instead of fused FFN
     /// kernel. Enabled automatically when hidden_dim × seq exceeds ANE SRAM.
     decomposed_ffn: bool,
-    // --- Vocab compaction state ---
-    /// Optional vocab compaction map (built from training data).
+    /// Maps the compact ids `train_batch` takes back to the model's own.
     vocab_map: Option<VocabMap>,
-    /// Compact embedding matrix `[compact_vocab * dim]`.
-    compact_embed: Vec<f32>,
-    /// Compact embedding gradient accumulator.
-    compact_embed_grad: Vec<f32>,
-    /// Compact embedding Adam state.
-    compact_embed_adam: AdamParam,
     // --- ANE throughput degradation detection ---
     /// Baseline hardware execution time (ns) from first 5 calibration steps.
     /// `None` until the calibration window is filled.
@@ -732,9 +735,6 @@ impl DynamicAneTrainer {
             decomposed_attn: false,
             decomposed_ffn: false,
             vocab_map: None,
-            compact_embed: Vec::new(),
-            compact_embed_grad: Vec::new(),
-            compact_embed_adam: AdamParam::new(0),
             baseline_hw_ns: None,
             hw_ring: VecDeque::with_capacity(8),
             total_ane_evals: 0,
@@ -852,52 +852,34 @@ impl DynamicAneTrainer {
         }
     }
 
-    /// Install a VocabMap for compact classifier/embedding operations.
-    ///
-    /// Must be called after `load_weights_*` and before `compile_kernels()`.
-    /// Builds the compact embedding matrix from the full embedding table.
+    /// Install a VocabMap: `train_batch` then takes compact ids, which it maps
+    /// back to the model's own. The classifier and loss still cover the
+    /// whole vocabulary.
     pub fn install_vocab_map(&mut self, vocab_map: VocabMap) {
-        let d = self.config.dim;
-        let cv = vocab_map.compact_vocab;
-
-        // Build compact embedding from full
-        let mut compact = vec![0.0f32; cv * d];
-        for c in 0..cv {
-            let full_row = vocab_map.compact_to_full[c] * d;
-            let compact_row = c * d;
-            compact[compact_row..compact_row + d]
-                .copy_from_slice(&self.embed_weights[full_row..full_row + d]);
-        }
-
         info!(
             full_vocab = self.config.vocab_size,
-            compact_vocab = cv,
-            ratio = format!("{:.1}x", self.config.vocab_size as f64 / cv as f64),
-            "Vocab compaction installed"
+            compact_vocab = vocab_map.compact_vocab,
+            "Vocab map installed"
         );
-
-        self.compact_embed = compact;
-        self.compact_embed_grad = vec![0.0f32; cv * d];
-        self.compact_embed_adam = AdamParam::new(cv * d);
         self.vocab_map = Some(vocab_map);
     }
 
-    /// Whether vocab compaction is active.
+    /// Whether a vocab map is installed.
     pub fn has_vocab_compaction(&self) -> bool {
         self.vocab_map.is_some()
     }
 
-    /// Scatter compact embedding weights back to the full embedding table.
-    fn scatter_compact_to_full(&mut self) {
-        if let Some(ref vm) = self.vocab_map {
-            let d = self.config.dim;
-            for c in 0..vm.compact_vocab {
-                let full_row = vm.compact_to_full[c] * d;
-                let compact_row = c * d;
-                self.embed_weights[full_row..full_row + d]
-                    .copy_from_slice(&self.compact_embed[compact_row..compact_row + d]);
-            }
-        }
+    /// The model's token ids for `tokens`, which are compact when a vocab map
+    /// is installed. [`IGNORE_TARGET`] becomes the loss's [`IGNORE_INDEX`].
+    fn model_ids(&self, tokens: &[u16]) -> Vec<u32> {
+        tokens
+            .iter()
+            .map(|&t| match &self.vocab_map {
+                _ if t == IGNORE_TARGET => IGNORE_INDEX,
+                Some(vm) => vm.compact_to_full[t as usize] as u32,
+                None => t as u32,
+            })
+            .collect()
     }
 
     /// Compile all dynamic ANE kernels (called once at startup).
@@ -1058,28 +1040,9 @@ impl DynamicAneTrainer {
         let ffn_bwd_w13t = compile(&k5, rt, "ffn_bwd_w13t")?;
         self.compile_count += 1;
 
-        // 5. Softmax (optional)
-        let softmax_vocab = self
-            .vocab_map
-            .as_ref()
-            .map(|vm| vm.compact_vocab)
-            .unwrap_or(self.config.vocab_size);
-        let (softmax_kern, softmax_in, softmax_out) = {
-            let sm_out = dynamic_kernel::gen_dynamic_softmax(softmax_vocab, s, 0);
-            match compile(&sm_out, rt, "softmax") {
-                Ok(model) => {
-                    self.compile_count += 1;
-                    let sm_in = IoSurface::for_tensor(softmax_vocab, s)?;
-                    let sm_out_io = IoSurface::for_tensor(softmax_vocab, s)?;
-                    (Some(model), Some(sm_in), Some(sm_out_io))
-                }
-                Err(_) => (None, None, None),
-            }
-        };
-
         // 6. Allocate IOSurface pool for fused kernels
-        let sdpa_fwd_sp = s + 1 + 2 * qd + 2 * kvd;
-        let ffn_fwd_sp = s + 1 + 2 * h;
+        let sdpa_fwd_sp = s + 2 * qd + 2 * kvd;
+        let ffn_fwd_sp = s + 2 * h;
         let bwd1_in_ch = qd + 2 * kvd + d;
         let bwd1_out_ch = kvd + 2 * score_ch;
         let bwd2_in_ch = 2 * score_ch + qd + kvd;
@@ -1089,7 +1052,7 @@ impl DynamicAneTrainer {
             proj_inputs,
             proj_outputs,
             sdpa_fwd_in: IoSurface::for_tensor_f32(d, sdpa_fwd_sp)?,
-            sdpa_fwd_out: IoSurface::for_tensor_f32(2 * d + 2 * qd + 2 * kvd, s)?,
+            sdpa_fwd_out: IoSurface::for_tensor_f32(d + 2 * qd + 2 * kvd, s)?,
             ffn_fwd_in: IoSurface::for_tensor_f32(d, ffn_fwd_sp)?,
             ffn_fwd_out: IoSurface::for_tensor_f32(3 * h, s)?,
             sdpa_bwd1_in: IoSurface::for_tensor_f32(bwd1_in_ch, s + qd)?,
@@ -1100,8 +1063,6 @@ impl DynamicAneTrainer {
             ffn_bwd_w2t_out: IoSurface::for_tensor_f32(h, s)?,
             ffn_bwd_w13t_in: IoSurface::for_tensor_f32(h, 2 * s + 2 * d)?,
             ffn_bwd_w13t_out: IoSurface::for_tensor_f32(d, s)?,
-            softmax_in,
-            softmax_out,
         };
 
         self.kernels = Some(DynamicKernels {
@@ -1112,7 +1073,6 @@ impl DynamicAneTrainer {
             sdpa_bwd2,
             ffn_bwd_w2t,
             ffn_bwd_w13t,
-            softmax: softmax_kern,
         });
         self.io_pool = Some(io_pool);
 
@@ -1185,36 +1145,11 @@ impl DynamicAneTrainer {
                 (Some(b1), Some(b2))
             };
 
-            let sm_out_b = dynamic_kernel::gen_dynamic_softmax(softmax_vocab, s, 1);
-            let softmax_b = match compile(&sm_out_b, rt, "softmax_b") {
-                Ok(m) => {
-                    self.compile_count += 1;
-                    Some(m)
-                }
-                Err(_) => None,
-            };
-
-            // Allocate softmax IOSurfaces as a pair — both must succeed or both None.
-            let sm_io_b = if softmax_b.is_some() {
-                match (
-                    IoSurface::for_tensor(softmax_vocab, s),
-                    IoSurface::for_tensor(softmax_vocab, s),
-                ) {
-                    (Ok(sin), Ok(sout)) => (Some(sin), Some(sout)),
-                    _ => {
-                        tracing::warn!("Softmax B-set IOSurface pair allocation failed");
-                        (None, None)
-                    }
-                }
-            } else {
-                (None, None)
-            };
-
             let io_pool_b = DynIoPool {
                 proj_inputs: proj_in_b,
                 proj_outputs: proj_out_b,
                 sdpa_fwd_in: IoSurface::for_tensor_f32(d, sdpa_fwd_sp)?,
-                sdpa_fwd_out: IoSurface::for_tensor_f32(2 * d + 2 * qd + 2 * kvd, s)?,
+                sdpa_fwd_out: IoSurface::for_tensor_f32(d + 2 * qd + 2 * kvd, s)?,
                 ffn_fwd_in: IoSurface::for_tensor_f32(d, ffn_fwd_sp)?,
                 ffn_fwd_out: IoSurface::for_tensor_f32(3 * h, s)?,
                 sdpa_bwd1_in: IoSurface::for_tensor_f32(bwd1_in_ch, s + qd)?,
@@ -1225,8 +1160,6 @@ impl DynamicAneTrainer {
                 ffn_bwd_w2t_out: IoSurface::for_tensor_f32(h, s)?,
                 ffn_bwd_w13t_in: IoSurface::for_tensor_f32(h, 2 * s + 2 * d)?,
                 ffn_bwd_w13t_out: IoSurface::for_tensor_f32(d, s)?,
-                softmax_in: sm_io_b.0,
-                softmax_out: sm_io_b.1,
             };
 
             self.kernels_b = Some(DynamicKernels {
@@ -1237,7 +1170,6 @@ impl DynamicAneTrainer {
                 sdpa_bwd2: sdpa_bwd2_b,
                 ffn_bwd_w2t: ffn_bwd_w2t_b,
                 ffn_bwd_w13t: ffn_bwd_w13t_b,
-                softmax: softmax_b,
             });
             self.io_pool_b = Some(io_pool_b);
 
@@ -1269,12 +1201,8 @@ impl DynamicAneTrainer {
         self.bwd_ids = Some(ids);
 
         // Initialize default loss function if not already set
-        let vocab = self
-            .vocab_map
-            .as_ref()
-            .map_or(self.config.vocab_size, |vm| vm.compact_vocab);
         if self.loss_fn.is_none() {
-            self.loss_fn = Some(Box::new(CrossEntropyLoss::new(vocab)));
+            self.loss_fn = Some(Box::new(CrossEntropyLoss::new(self.config.vocab_size)));
         }
 
         Ok(())
@@ -1378,21 +1306,24 @@ impl DynamicAneTrainer {
             )
         };
 
+        // RMSNorm on the CPU in f32 for both paths. In fp16 on the ANE, the
+        // sum of squares overflows once the residual's RMS passes
+        // sqrt(65504 / dim), about 11 for a 576-wide model: every real
+        // checkpoint, and the loss came out NaN.
+        accelerate::rmsnorm(
+            &mut acts.xnorm,
+            x,
+            &lw.rms_att,
+            d,
+            s,
+            self.config.rms_norm_eps,
+        );
+
         if self.decomposed_attn {
             // ====== Decomposed Attention (ANE projections + CPU BLAS attention) ======
             // Used when the attention matrix [heads, seq, seq] exceeds ANE SRAM.
 
-            // 1. RMSNorm on CPU
-            accelerate::rmsnorm(
-                &mut acts.xnorm,
-                x,
-                &lw.rms_att,
-                d,
-                s,
-                self.config.rms_norm_eps,
-            );
-
-            // 2. Q, K, V projections via ANE (individual projection kernels).
+            // Q, K, V projections via ANE (individual projection kernels).
             // On layer 0, use evaluate_with_stats on the Q projection to collect
             // hw timing for degradation detection.  The result is stored in
             // `hw_sample` and forwarded to record_hw_sample() at function exit,
@@ -1404,22 +1335,26 @@ impl DynamicAneTrainer {
                 })?;
                 let io_in = io.proj_inputs.get(&q_key).unwrap();
                 let io_out = io.proj_outputs.get(&q_key).unwrap();
-                io_in.write_packed_f32(&acts.xnorm, &[(&lw.wq, qd)], d, s);
+                io_in.write_packed_f32(&acts.xnorm, &[(&lw.wq_t, qd)], d, s);
                 let stats = q_kernel.evaluate_with_stats(&[io_in.as_ptr()], &[io_out.as_ptr()])?;
                 io_out.read_f32(&mut acts.q, 0, qd, s);
                 hw_sample = Some(stats.hw_execution_time_ns);
             } else {
-                Self::run_projection(kernels, io, d, qd, s, &acts.xnorm, &lw.wq, &mut acts.q)?;
+                Self::run_projection(kernels, io, d, qd, s, &acts.xnorm, &lw.wq_t, &mut acts.q)?;
             }
-            Self::run_projection(kernels, io, d, kvd, s, &acts.xnorm, &lw.wk, &mut acts.k)?;
-            Self::run_projection(kernels, io, d, kvd, s, &acts.xnorm, &lw.wv, &mut acts.v)?;
+            Self::run_projection(kernels, io, d, kvd, s, &acts.xnorm, &lw.wk_t, &mut acts.k)?;
+            Self::run_projection(kernels, io, d, kvd, s, &acts.xnorm, &lw.wv_t, &mut acts.v)?;
+
+            let n_heads = self.kernel_config.n_heads;
+            let n_kv_heads = self.kernel_config.n_kv_heads;
+            let hd = self.kernel_config.head_dim;
+            let theta = self.kernel_config.rope_theta;
+            kernel::rope_channel_first(&mut acts.q, n_heads, hd, s, theta, false);
+            kernel::rope_channel_first(&mut acts.k, n_kv_heads, hd, s, theta, false);
 
             // 3. Attention on CPU via Accelerate BLAS
             // Layout: Q [qd, s] channel-first, K [kvd, s], V [kvd, s]
             // Reshape to [heads, hd, s] → [heads, s, hd] for BLAS matmul
-            let n_heads = self.kernel_config.n_heads;
-            let n_kv_heads = self.kernel_config.n_kv_heads;
-            let hd = self.kernel_config.head_dim;
             let scale = 1.0 / (hd as f32).sqrt();
             let gqa_ratio = n_heads / n_kv_heads;
 
@@ -1468,14 +1403,14 @@ impl DynamicAneTrainer {
                     }
                 }
 
-                // attn_out_h = scores @ V_h^T: [s, s] @ [s, hd] → [s, hd]
-                // Output in channel-first: [hd, s] at offset h_idx * hd * s
+                // attn_out_h[i, t] = sum_u V_h[i, u] * probs[t, u], channel-first
+                // [hd, s]: V_h [hd, s] @ probs^T. This was probs @ V_h^T with
+                // the operands' shapes swapped, which read past V_h (NaN at
+                // long sequences) and was wrong when it didn't.
                 let attn_off = h_idx * hd * s;
-                // V is [hd, s] channel-first; we need [s, hd] row-major for GEMM
-                // scores @ V^T where V^T is [s, hd] = transpose of [hd, s]
                 accelerate::gemm(
-                    &scores,
                     &acts.v[v_off..v_off + hd * s],
+                    &scores,
                     &mut acts.attn_out[attn_off..attn_off + hd * s],
                     hd,
                     s,
@@ -1495,7 +1430,7 @@ impl DynamicAneTrainer {
                 d,
                 s,
                 &acts.attn_out,
-                &lw.wo,
+                &lw.wo_t,
                 &mut acts.o_out,
             )?;
 
@@ -1503,14 +1438,13 @@ impl DynamicAneTrainer {
             accelerate::vadd(x, &acts.o_out, &mut acts.x2);
         } else {
             // ====== Fused Attention Block (ANE) ======
-            // Input layout: x [d, s], rms_w [d, 1], wq [d, qd], wk [d, kvd], wv [d, kvd], wo [d, qd]
+            // Input layout: xnorm [d, s], wq [d, qd], wk [d, kvd], wv [d, kvd], wo [d, qd]
             io.sdpa_fwd_in.write_packed_f32(
-                x,
+                &acts.xnorm,
                 &[
-                    (&lw.rms_att, 1),
-                    (&lw.wq, qd),
-                    (&lw.wk, kvd),
-                    (&lw.wv, kvd),
+                    (&lw.wq_t, qd),
+                    (&lw.wk_t, kvd),
+                    (&lw.wv_t, kvd),
                     (&lw.wo, qd),
                 ],
                 d,
@@ -1532,8 +1466,8 @@ impl DynamicAneTrainer {
             }
 
             // Read back all taps for backward pass
-            // Taps: [o_out, q, k, v, attn_flat, xnorm]
-            let out_ch = 2 * d + 2 * qd + 2 * kvd;
+            // Taps: [o_out, q, k, v, attn_flat], q and k after RoPE
+            let out_ch = d + 2 * qd + 2 * kvd;
             let mut taps = vec![0.0f32; out_ch * s];
             io.sdpa_fwd_out.read_f32(&mut taps, 0, out_ch, s);
 
@@ -1549,7 +1483,6 @@ impl DynamicAneTrainer {
             copy_tap(&mut acts.k, kvd);
             copy_tap(&mut acts.v, kvd);
             copy_tap(&mut acts.attn_out, qd);
-            copy_tap(&mut acts.xnorm, d);
 
             // Residual: x2 = x + o_out
             accelerate::vadd(x, &acts.o_out, &mut acts.x2);
@@ -1575,8 +1508,8 @@ impl DynamicAneTrainer {
             // Used when hidden_dim × seq exceeds ANE SRAM for the fused kernel.
 
             // W1, W3 projections via ANE: x2norm @ W1, x2norm @ W3
-            Self::run_projection(kernels, io, d, h, s, &acts.x2norm, &lw.w1, &mut acts.h1)?;
-            Self::run_projection(kernels, io, d, h, s, &acts.x2norm, &lw.w3, &mut acts.h3)?;
+            Self::run_projection(kernels, io, d, h, s, &acts.x2norm, &lw.w1_t, &mut acts.h1)?;
+            Self::run_projection(kernels, io, d, h, s, &acts.x2norm, &lw.w3_t, &mut acts.h3)?;
 
             // SiLU gate on CPU: silu_out = SiLU(h1) * h3
             for i in 0..(h * s) {
@@ -1592,7 +1525,7 @@ impl DynamicAneTrainer {
                 d,
                 s,
                 &acts.silu_out,
-                &lw.w2,
+                &lw.w2_t,
                 &mut acts.ffn_out,
             )?;
 
@@ -1600,13 +1533,9 @@ impl DynamicAneTrainer {
             accelerate::vadd(&acts.x2, &acts.ffn_out, x);
         } else {
             // ====== Fused FFN Block (ANE) ======
-            // Input layout: x2 [d, s], rms_ffn [d, 1], w1 [d, h], w3 [d, h]
-            io.ffn_fwd_in.write_packed_f32(
-                &acts.x2,
-                &[(&lw.rms_ffn, 1), (&lw.w1, h), (&lw.w3, h)],
-                d,
-                s,
-            );
+            // Input layout: x2norm [d, s], w1 [d, h], w3 [d, h]
+            io.ffn_fwd_in
+                .write_packed_f32(&acts.x2norm, &[(&lw.w1_t, h), (&lw.w3_t, h)], d, s);
 
             let ffn_model = kernels
                 .ffn_fwd
@@ -1636,7 +1565,7 @@ impl DynamicAneTrainer {
                 d,
                 s,
                 &acts.silu_out,
-                &lw.w2,
+                &lw.w2_t,
                 &mut acts.ffn_out,
             )?;
 
@@ -1698,7 +1627,7 @@ impl DynamicAneTrainer {
 
         // 1. dffn @ W2^T → dsilu_raw (fused ANE kernel)
         io.ffn_bwd_w2t_in
-            .write_packed_f32(dx, &[(&self.layer_weights[l].w2_t, h)], d, s);
+            .write_packed_f32(dx, &[(&self.layer_weights[l].w2, h)], d, s);
         kernels.ffn_bwd_w2t.evaluate(
             &[io.ffn_bwd_w2t_in.as_ptr()],
             &[io.ffn_bwd_w2t_out.as_ptr()],
@@ -1773,8 +1702,8 @@ impl DynamicAneTrainer {
             scratch.get(ids.dh1),
             &[
                 (scratch.get(ids.dh3), s),
-                (&self.layer_weights[l].w1_t, d),
-                (&self.layer_weights[l].w3_t, d),
+                (&self.layer_weights[l].w1, d),
+                (&self.layer_weights[l].w3, d),
             ],
             h,
             s,
@@ -1799,6 +1728,16 @@ impl DynamicAneTrainer {
             s,
             eps,
         );
+        // The residual around the FFN passes dx straight through, so the
+        // gradient at x2 (the attention block's output) is dx plus the FFN
+        // branch's. Without it neither the attention backward nor the layer
+        // below saw the gradient that bypasses this FFN.
+        {
+            let dx_ffn_norm = scratch.get_mut(ids.dx_ffn_norm);
+            for (g, r) in dx_ffn_norm.iter_mut().zip(dx.iter()) {
+                *g += r;
+            }
+        }
 
         // ====== Attention Backward ======
 
@@ -1820,7 +1759,7 @@ impl DynamicAneTrainer {
                 qd,
                 s,
                 &dx_ffn_norm_copy,
-                &self.layer_weights[l].wo_t,
+                &self.layer_weights[l].wo,
                 &mut da,
             )?;
 
@@ -2044,6 +1983,15 @@ impl DynamicAneTrainer {
                 .read_fp16_as_f32(scratch.get_mut(ids.dk), qd, kvd, s);
         }
 
+        // dq and dk are gradients of the rotated q and k. Rotating them back
+        // gives the gradients of the projections' outputs.
+        let hd = self.kernel_config.head_dim;
+        let theta = self.kernel_config.rope_theta;
+        let n_heads = self.kernel_config.n_heads;
+        let n_kv_heads = self.kernel_config.n_kv_heads;
+        kernel::rope_channel_first(scratch.get_mut(ids.dq), n_heads, hd, s, theta, true);
+        kernel::rope_channel_first(scratch.get_mut(ids.dk), n_kv_heads, hd, s, theta, true);
+
         // dWq, dWk, dWv
         encode_dw_gemm(
             gpu_dw,
@@ -2092,7 +2040,7 @@ impl DynamicAneTrainer {
             d,
             s,
             &dq_copy,
-            &self.layer_weights[l].wq_t,
+            &self.layer_weights[l].wq,
             scratch.get_mut(ids.dxq),
         )?;
         let dk_copy: Vec<f32> = scratch.get(ids.dk).to_vec();
@@ -2103,7 +2051,7 @@ impl DynamicAneTrainer {
             d,
             s,
             &dk_copy,
-            &self.layer_weights[l].wk_t,
+            &self.layer_weights[l].wk,
             scratch.get_mut(ids.dxk),
         )?;
         let dv_copy: Vec<f32> = scratch.get(ids.dv).to_vec();
@@ -2114,7 +2062,7 @@ impl DynamicAneTrainer {
             d,
             s,
             &dv_copy,
-            &self.layer_weights[l].wv_t,
+            &self.layer_weights[l].wv,
             scratch.get_mut(ids.dxv),
         )?;
 
@@ -2155,9 +2103,9 @@ impl DynamicAneTrainer {
 
     /// Run a single training step (forward + backward + grad accumulation).
     ///
-    /// When vocab compaction is active, the classifier operates on the compact
-    /// embedding (`compact_vocab * dim`) instead of the full one, giving ~3.5x
-    /// speedup on the classifier matmul and cross-entropy.
+    /// Tokens are compact ids when a vocab map is installed; targets may be
+    /// [`IGNORE_TARGET`]. The loss is the cross-entropy over the whole
+    /// vocabulary, in f32 on the CPU.
     ///
     /// Weight gradient GEMMs are encoded into `batch` (GPU) or run inline (CPU).
     /// The caller (`train_batch`) creates the batch and calls `execute()`.
@@ -2173,17 +2121,12 @@ impl DynamicAneTrainer {
         assert_eq!(input_tokens.len(), s);
         assert_eq!(target_tokens.len(), s);
 
+        let inputs = self.model_ids(input_tokens);
+        let targets = self.model_ids(target_tokens);
+
         // === Forward pass ===
-        // Embedding lookup: if vocab compaction is active, input tokens are compact
-        // IDs — use the compact embedding table directly. Otherwise use full table.
         let mut x = vec![0.0f32; d * s];
-        if self.vocab_map.is_some() {
-            let tokens_u32: Vec<u32> = input_tokens.iter().map(|&t| t as u32).collect();
-            accelerate::embed_lookup(&mut x, &self.compact_embed, &tokens_u32, d, s);
-        } else {
-            let tokens_u32: Vec<u32> = input_tokens.iter().map(|&t| t as u32).collect();
-            accelerate::embed_lookup(&mut x, &self.embed_weights, &tokens_u32, d, s);
-        }
+        accelerate::embed_lookup(&mut x, &self.embed_weights, &inputs, d, s);
 
         let fwd_start = std::time::Instant::now();
         for l in 0..self.config.n_layers {
@@ -2211,110 +2154,12 @@ impl DynamicAneTrainer {
         );
         self.last_timings.rmsnorm_us += rms_start.elapsed().as_micros() as u64;
 
-        // Classifier + loss + backward: compact or full path
-        let (loss, mut dx) = if let Some(ref vm) = self.vocab_map {
-            // === Compact classifier path ===
-            let cv = vm.compact_vocab;
-
-            // Tokens are ALREADY compact u16 ids (remapped by orchestrator during
-            // batch construction). No second remap needed.
-            let compact_targets = target_tokens;
-
-            // logits = compact_embed @ x_final: [cv, d] @ [d, s] → [cv, s]
-            let mut logits = vec![0.0f32; cv * s];
-            accelerate::gemm(
-                &self.compact_embed,
-                &x_final,
-                &mut logits,
-                cv,
-                s,
-                d,
-                1.0,
-                0.0,
-                false,
-                false,
-            );
-
-            // Cross-entropy loss on compact vocab
-            // Try ANE softmax first, fall back to CPU
-            let mut dlogits = vec![0.0f32; cv * s];
-            let loss_scale = self.config.loss_scale;
-            let loss = if let (Some(kernels), Some(io)) = (&self.kernels, &self.io_pool) {
-                if let (Some(sm_kern), Some(sm_in), Some(sm_out)) =
-                    (&kernels.softmax, &io.softmax_in, &io.softmax_out)
-                {
-                    // ANE softmax path: logits → ANE → probs → CPU NLL
-                    sm_in.write_f32_as_fp16(&logits, cv, s);
-                    if let Ok(()) = sm_kern.evaluate(&[sm_in.as_ptr()], &[sm_out.as_ptr()]) {
-                        let mut probs = vec![0.0f32; cv * s];
-                        sm_out.read_fp16_as_f32(&mut probs, 0, cv, s);
-                        let l = accelerate::nll_loss_from_probs(
-                            &mut dlogits,
-                            &probs,
-                            compact_targets,
-                            cv,
-                            s,
-                        );
-                        if loss_scale != 1.0 {
-                            accelerate::scale_inplace(&mut dlogits, loss_scale);
-                        }
-                        l
-                    } else {
-                        // ANE eval failed, fall back to pluggable loss
-                        self.loss_fn
-                            .as_mut()
-                            .unwrap()
-                            .compute(&logits, compact_targets, cv, s, loss_scale, &mut dlogits)
-                            .loss
-                    }
-                } else {
-                    self.loss_fn
-                        .as_mut()
-                        .unwrap()
-                        .compute(&logits, compact_targets, cv, s, loss_scale, &mut dlogits)
-                        .loss
-                }
-            } else {
-                self.loss_fn
-                    .as_mut()
-                    .unwrap()
-                    .compute(&logits, compact_targets, cv, s, loss_scale, &mut dlogits)
-                    .loss
-            };
-
-            // dx = compact_embed^T @ dlogits: [d, cv] @ [cv, s] → [d, s]
-            let mut dx = vec![0.0f32; d * s];
-            accelerate::gemm(
-                &self.compact_embed,
-                &dlogits,
-                &mut dx,
-                d,
-                s,
-                cv,
-                1.0,
-                0.0,
-                true,
-                false,
-            );
-
-            // Compact embed gradient: dE = dlogits @ x_final^T: [cv, s] @ [s, d] → [cv, d]
-            // Stays on CPU (embed grads are Vec<f32>, not MetalBuffer — sparse update)
-            accelerate::gemm(
-                &dlogits,
-                &x_final,
-                &mut self.compact_embed_grad,
-                cv,
-                d,
-                s,
-                1.0,
-                1.0,
-                false,
-                true,
-            );
-
-            (loss, dx)
-        } else {
-            // === Full vocab classifier path ===
+        // Classifier + loss + backward over the whole vocabulary. It used to
+        // run over only the tokens in the training data when a vocab map was
+        // installed (always, from the CLI), which isn't the cross-entropy the
+        // model is trained on: the loss read far too low, and the logits of
+        // every token absent from the data went unpenalized.
+        let (loss, mut dx) = {
             let v = self.config.vocab_size;
 
             let mut logits = vec![0.0f32; v * s];
@@ -2332,18 +2177,12 @@ impl DynamicAneTrainer {
             );
 
             let mut dlogits = vec![0.0f32; v * s];
+            let grad_scale = self.grad_scale();
             let loss = self
                 .loss_fn
                 .as_mut()
                 .unwrap()
-                .compute(
-                    &logits,
-                    target_tokens,
-                    v,
-                    s,
-                    self.config.loss_scale,
-                    &mut dlogits,
-                )
+                .compute(&logits, &targets, v, s, grad_scale, &mut dlogits)
                 .loss;
 
             let mut dx = vec![0.0f32; d * s];
@@ -2399,18 +2238,22 @@ impl DynamicAneTrainer {
         self.last_timings.ane_bwd_us += bwd_start.elapsed().as_micros() as u64;
 
         // Embedding backward (scatter: stays CPU, sparse op)
-        let tokens_u32: Vec<u32> = input_tokens.iter().map(|&t| t as u32).collect();
-        if self.vocab_map.is_some() {
-            // Compact tokens → scatter into compact embedding gradient
-            accelerate::embed_backward(&mut self.compact_embed_grad, &dx, &tokens_u32, d, s);
-        } else {
-            accelerate::embed_backward(&mut self.embed_grad, &dx, &tokens_u32, d, s);
-        }
+        accelerate::embed_backward(&mut self.embed_grad, &dx, &inputs, d, s);
 
         Ok(loss)
     }
 
     /// Compute learning rate with warmup + cosine decay.
+    /// The factor the gradient carries through the backward pass, undone on
+    /// the f32 weight gradients after it. The loss is a mean over the
+    /// sequence, so each position's gradient is 1/seq of a sum's; at 1024
+    /// positions that put the fp16 kernels' gradients below fp16's normal
+    /// range and flipped their signs. Scaling by `seq_len` keeps them O(1)
+    /// at any length; `loss_scale` applies on top.
+    fn grad_scale(&self) -> f32 {
+        self.config.loss_scale * self.config.seq_len as f32
+    }
+
     fn get_lr(&self, step: usize, max_steps: usize) -> f32 {
         let base_lr = self.config.learning_rate;
         let warmup = self.config.warmup_steps;
@@ -2431,8 +2274,6 @@ impl DynamicAneTrainer {
     /// No recompilation needed — weights are injected via IOSurface writes.
     /// GPU dW GEMMs are batched per train_step and executed before gradient ops.
     pub fn train_batch(&mut self, data: &[(Vec<u16>, Vec<u16>)], max_steps: usize) -> Result<f32> {
-        let use_compact = self.vocab_map.is_some();
-
         // Reset step timings
         self.last_timings = StepTimings::default();
         let step_start = std::time::Instant::now();
@@ -2441,11 +2282,7 @@ impl DynamicAneTrainer {
         for lg in &mut self.layer_grads {
             lg.zero();
         }
-        if use_compact {
-            self.compact_embed_grad.fill(0.0);
-        } else {
-            self.embed_grad.fill(0.0);
-        }
+        self.embed_grad.fill(0.0);
         self.rms_final_grad.fill(0.0);
 
         // Accumulate gradients
@@ -2476,7 +2313,7 @@ impl DynamicAneTrainer {
 
         // Scale gradients: divide by accum_steps and undo loss scaling.
         // Combined into a single scale pass for efficiency.
-        let scale = 1.0 / (steps as f32 * self.config.loss_scale);
+        let scale = 1.0 / (steps as f32 * self.grad_scale());
         for lg in &mut self.layer_grads {
             accelerate::scale_inplace(lg.wq.as_mut_slice(), scale);
             accelerate::scale_inplace(lg.wk.as_mut_slice(), scale);
@@ -2488,11 +2325,7 @@ impl DynamicAneTrainer {
             accelerate::scale_inplace(&mut lg.rms_att, scale);
             accelerate::scale_inplace(&mut lg.rms_ffn, scale);
         }
-        if use_compact {
-            accelerate::scale_inplace(&mut self.compact_embed_grad, scale);
-        } else {
-            accelerate::scale_inplace(&mut self.embed_grad, scale);
-        }
+        accelerate::scale_inplace(&mut self.embed_grad, scale);
         accelerate::scale_inplace(&mut self.rms_final_grad, scale);
 
         // Gradient clipping
@@ -2508,11 +2341,7 @@ impl DynamicAneTrainer {
             grad_norm_sq += accelerate::sum_of_squares(&lg.rms_att);
             grad_norm_sq += accelerate::sum_of_squares(&lg.rms_ffn);
         }
-        if use_compact {
-            grad_norm_sq += accelerate::sum_of_squares(&self.compact_embed_grad);
-        } else {
-            grad_norm_sq += accelerate::sum_of_squares(&self.embed_grad);
-        }
+        grad_norm_sq += accelerate::sum_of_squares(&self.embed_grad);
         grad_norm_sq += accelerate::sum_of_squares(&self.rms_final_grad);
 
         let grad_norm = grad_norm_sq.sqrt();
@@ -2529,11 +2358,7 @@ impl DynamicAneTrainer {
                 accelerate::scale_inplace(&mut lg.rms_att, clip_scale);
                 accelerate::scale_inplace(&mut lg.rms_ffn, clip_scale);
             }
-            if use_compact {
-                accelerate::scale_inplace(&mut self.compact_embed_grad, clip_scale);
-            } else {
-                accelerate::scale_inplace(&mut self.embed_grad, clip_scale);
-            }
+            accelerate::scale_inplace(&mut self.embed_grad, clip_scale);
             accelerate::scale_inplace(&mut self.rms_final_grad, clip_scale);
         }
 
@@ -2599,33 +2424,17 @@ impl DynamicAneTrainer {
         // from sparse token updates and magnitude drift through many layers)
         let embed_lr = self.config.embedding_lr.unwrap_or(lr);
 
-        if use_compact {
-            // Adam update on compact embedding, then scatter back to full
-            accelerate::adam_update(
-                &mut self.compact_embed,
-                &self.compact_embed_grad,
-                &mut self.compact_embed_adam.m,
-                &mut self.compact_embed_adam.v,
-                t,
-                embed_lr,
-                b1,
-                b2,
-                eps,
-            );
-            self.scatter_compact_to_full();
-        } else {
-            accelerate::adam_update(
-                &mut self.embed_weights,
-                &self.embed_grad,
-                &mut self.embed_adam.m,
-                &mut self.embed_adam.v,
-                t,
-                embed_lr,
-                b1,
-                b2,
-                eps,
-            );
-        }
+        accelerate::adam_update(
+            &mut self.embed_weights,
+            &self.embed_grad,
+            &mut self.embed_adam.m,
+            &mut self.embed_adam.v,
+            t,
+            embed_lr,
+            b1,
+            b2,
+            eps,
+        );
 
         accelerate::adam_update(
             &mut self.rms_final,
@@ -2691,6 +2500,29 @@ impl DynamicAneTrainer {
 
         // Initialize transposed weights
         self.refresh_transposed_weights();
+    }
+
+    /// The current weights, in [`Self::load_weights_flat`]'s layout.
+    pub fn export_weights_flat(&self) -> Vec<f32> {
+        let mut out = Vec::with_capacity(self.embed_weights.len() + self.rms_final.len());
+        out.extend_from_slice(&self.embed_weights);
+        for lw in &self.layer_weights {
+            for tensor in [
+                &lw.rms_att,
+                &lw.wq,
+                &lw.wk,
+                &lw.wv,
+                &lw.wo,
+                &lw.rms_ffn,
+                &lw.w1,
+                &lw.w2,
+                &lw.w3,
+            ] {
+                out.extend_from_slice(tensor);
+            }
+        }
+        out.extend_from_slice(&self.rms_final);
+        out
     }
 
     /// Load weights from SafeTensors files on disk.
@@ -2991,20 +2823,15 @@ mod tests {
         let vm = VocabMap::from_batches(&batches, 100);
         assert_eq!(vm.compact_vocab, 4);
 
+        let compact = vm.remap_tokens(&[50, 0, 10]);
         trainer.install_vocab_map(vm);
         assert!(trainer.has_vocab_compaction());
-        assert_eq!(trainer.compact_embed.len(), 4 * 8);
 
-        // Verify compact embed contains correct rows
-        let vm = trainer.vocab_map.as_ref().unwrap();
-        for c in 0..vm.compact_vocab {
-            let full_row = vm.compact_to_full[c] * 8;
-            let compact_row = c * 8;
-            assert_eq!(
-                &trainer.compact_embed[compact_row..compact_row + 8],
-                &trainer.embed_weights[full_row..full_row + 8]
-            );
-        }
+        // Compact ids map back to the model's, and an ignored target to the
+        // loss's ignore index.
+        let mut tokens = compact;
+        tokens.push(IGNORE_TARGET);
+        assert_eq!(trainer.model_ids(&tokens), vec![50, 0, 10, IGNORE_INDEX]);
     }
 
     // ======== Architecture Validation Tests ========

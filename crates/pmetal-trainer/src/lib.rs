@@ -126,7 +126,7 @@ pub use distributed_bridge::{DistributedGradientSync, create_distributed_context
 pub use ane_training::{AneTrainingLoop, AneTrainingLoopConfig};
 #[cfg(feature = "ane")]
 pub use pmetal_metal::ane::dynamic_trainer::{
-    DynamicAneTrainer, DynamicAneTrainerConfig, VocabMap,
+    DynamicAneTrainer, DynamicAneTrainerConfig, IGNORE_TARGET, VocabMap,
 };
 
 #[cfg(feature = "experimental-trainers")]

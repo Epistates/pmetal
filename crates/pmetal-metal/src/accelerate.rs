@@ -552,22 +552,39 @@ pub fn rmsnorm_backward(
     }
 }
 
+/// A target [`cross_entropy_loss`] skips: no loss, no gradient, and not
+/// counted in the mean. Padding and prompt tokens masked with `-100` in a
+/// dataset's labels map to it.
+pub const IGNORE_INDEX: u32 = u32::MAX;
+
+/// The number of positions in `targets` that count, and the gradient scale
+/// `1 / count` for their mean.
+fn counted_targets(targets: &[u32]) -> (usize, f32) {
+    let n = targets.iter().filter(|&&t| t != IGNORE_INDEX).count();
+    (n, if n == 0 { 0.0 } else { 1.0 / n as f32 })
+}
+
 /// Cross-entropy loss with gradient computation.
 ///
 /// Operates on channel-first `[V, S]` layout (vocab × sequence).
-/// Returns mean loss and writes `dlogits = (softmax(logits) - one_hot(targets)) / S`.
+/// Returns the mean loss over the positions whose target isn't
+/// [`IGNORE_INDEX`] and writes `dlogits = (softmax(logits) - one_hot(targets)) / n`
+/// there, zero elsewhere.
 ///
 /// Matches the ANE reference `cross_entropy_loss()` using vDSP softmax.
 pub fn cross_entropy_loss(
     dlogits: &mut [f32],
     logits: &[f32],
-    targets: &[u16],
+    targets: &[u32],
     vocab: usize,
     seq: usize,
 ) -> f32 {
     debug_assert_eq!(logits.len(), vocab * seq);
     debug_assert_eq!(dlogits.len(), vocab * seq);
     debug_assert_eq!(targets.len(), seq);
+
+    let (n, inv_n) = counted_targets(targets);
+    let mut total_loss = 0.0f32;
 
     #[cfg(target_os = "macos")]
     {
@@ -577,11 +594,12 @@ pub fn cross_entropy_loss(
             ffi::vDSP_mtrans(logits.as_ptr(), 1, buf.as_mut_ptr(), 1, seq, vocab);
         }
 
-        let mut total_loss = 0.0f32;
-        let inv_s = 1.0f32 / seq as f32;
-
         for t in 0..seq {
             let row = &mut buf[t * vocab..(t + 1) * vocab];
+            if targets[t] == IGNORE_INDEX {
+                row.fill(0.0);
+                continue;
+            }
 
             unsafe {
                 // max for numerical stability
@@ -593,8 +611,8 @@ pub fn cross_entropy_loss(
                 ffi::vDSP_vsadd(row.as_ptr(), 1, &neg_max, row.as_mut_ptr(), 1, vocab);
 
                 // exp
-                let n = vocab as i32;
-                ffi::vvexpf(row.as_mut_ptr(), row.as_ptr(), &n);
+                let len = vocab as i32;
+                ffi::vvexpf(row.as_mut_ptr(), row.as_ptr(), &len);
 
                 // sum and normalize
                 let mut sum: f32 = 0.0;
@@ -607,10 +625,10 @@ pub fn cross_entropy_loss(
             let tgt = targets[t] as usize;
             total_loss -= (row[tgt] + 1e-10).ln();
 
-            // gradient: softmax - one_hot, scaled by 1/S
+            // gradient: softmax - one_hot, over the counted positions
             row[tgt] -= 1.0;
             unsafe {
-                ffi::vDSP_vsmul(row.as_ptr(), 1, &inv_s, row.as_mut_ptr(), 1, vocab);
+                ffi::vDSP_vsmul(row.as_ptr(), 1, &inv_n, row.as_mut_ptr(), 1, vocab);
             }
         }
 
@@ -618,16 +636,18 @@ pub fn cross_entropy_loss(
         unsafe {
             ffi::vDSP_mtrans(buf.as_ptr(), 1, dlogits.as_mut_ptr(), 1, vocab, seq);
         }
-
-        total_loss / seq as f32
     }
 
     #[cfg(not(target_os = "macos"))]
     {
-        let mut total_loss = 0.0f32;
-        let inv_s = 1.0 / seq as f32;
-
         for t in 0..seq {
+            if targets[t] == IGNORE_INDEX {
+                for v in 0..vocab {
+                    dlogits[v * seq + t] = 0.0;
+                }
+                continue;
+            }
+
             // Find max for stability
             let mut maxv = f32::NEG_INFINITY;
             for v in 0..vocab {
@@ -652,68 +672,12 @@ pub fn cross_entropy_loss(
             // Gradient
             dlogits[tgt * seq + t] -= 1.0;
             for v in 0..vocab {
-                dlogits[v * seq + t] *= inv_s;
+                dlogits[v * seq + t] *= inv_n;
             }
         }
-
-        total_loss / seq as f32
-    }
-}
-
-/// NLL loss + gradient from pre-computed softmax probabilities.
-///
-/// When softmax is computed on ANE, the CPU only needs to:
-/// 1. Extract -log(probs[target]) for the loss
-/// 2. Compute gradient: dlogits[i] = probs[i] - one_hot[i], scaled by 1/seq_len
-///
-/// `probs` and `dlogits` are channel-first `[V, S]` layout.
-/// `targets` contains the target token index for each sequence position.
-pub fn nll_loss_from_probs(
-    dlogits: &mut [f32],
-    probs: &[f32],
-    targets: &[u16],
-    vocab: usize,
-    seq: usize,
-) -> f32 {
-    debug_assert_eq!(probs.len(), vocab * seq);
-    debug_assert_eq!(dlogits.len(), vocab * seq);
-    debug_assert_eq!(targets.len(), seq);
-
-    let inv_s = 1.0f32 / seq as f32;
-    let mut total_loss = 0.0f32;
-
-    // Copy probs → dlogits, then adjust for gradient
-    dlogits.copy_from_slice(probs);
-
-    for t in 0..seq {
-        let tgt = targets[t] as usize;
-        // Loss: -log(prob[target])
-        total_loss -= (probs[tgt * seq + t] + 1e-10).ln();
-        // Gradient: probs - one_hot, scaled by 1/S
-        dlogits[tgt * seq + t] -= 1.0;
     }
 
-    // Scale all gradients by 1/seq_len
-    #[cfg(target_os = "macos")]
-    unsafe {
-        ffi::vDSP_vsmul(
-            dlogits.as_ptr(),
-            1,
-            &inv_s,
-            dlogits.as_mut_ptr(),
-            1,
-            vocab * seq,
-        );
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    {
-        for val in dlogits.iter_mut() {
-            *val *= inv_s;
-        }
-    }
-
-    total_loss / seq as f32
+    if n == 0 { 0.0 } else { total_loss / n as f32 }
 }
 
 /// Softmax in-place on channel-first `[D, S]` layout.
@@ -1076,7 +1040,7 @@ mod tests {
         let seq = 1;
         // One position, 4 vocab items
         let logits = vec![1.0, 2.0, 3.0, 4.0]; // [V, S=1] channel-first
-        let targets = vec![2u16]; // target is vocab index 2
+        let targets = vec![2u32]; // target is vocab index 2
         let mut dlogits = vec![0.0f32; vocab * seq];
 
         let loss = cross_entropy_loss(&mut dlogits, &logits, &targets, vocab, seq);
@@ -1157,5 +1121,39 @@ mod tests {
         //          d_embed[1*2+1] += dx[1*2+0] + dx[1*2+1] = 3+4 = 7
         assert!((d_embed[2] - 3.0).abs() < 1e-6);
         assert!((d_embed[3] - 7.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn ignored_targets_add_no_loss_or_gradient() {
+        // [V=3, S=3] channel-first; position 1 is ignored.
+        let (vocab, seq) = (3, 3);
+        let logits = [0.2f32, 1.5, -0.3, 0.9, -1.0, 0.4, -0.5, 0.1, 2.0];
+        let targets = [2u32, IGNORE_INDEX, 0];
+
+        // The same two counted positions on their own.
+        let column = |t: usize| -> Vec<f32> { (0..vocab).map(|v| logits[v * seq + t]).collect() };
+        let kept: Vec<f32> = (0..vocab)
+            .flat_map(|v| [column(0)[v], column(2)[v]])
+            .collect();
+        let mut kept_grad = vec![0.0f32; vocab * 2];
+        let want = cross_entropy_loss(&mut kept_grad, &kept, &[2, 0], vocab, 2);
+
+        let mut grad = vec![1.0f32; vocab * seq];
+        let got = cross_entropy_loss(&mut grad, &logits, &targets, vocab, seq);
+        assert!((got - want).abs() < 1e-6, "{got} vs {want}");
+        for v in 0..vocab {
+            assert_eq!(grad[v * seq + 1], 0.0);
+            assert!((grad[v * seq] - kept_grad[v * 2]).abs() < 1e-6);
+            assert!((grad[v * seq + 2] - kept_grad[v * 2 + 1]).abs() < 1e-6);
+        }
+
+        // Nothing counted: no loss, no gradient.
+        let mut none = vec![1.0f32; vocab * seq];
+        let all_ignored = [IGNORE_INDEX; 3];
+        assert_eq!(
+            cross_entropy_loss(&mut none, &logits, &all_ignored, vocab, seq),
+            0.0
+        );
+        assert!(none.iter().all(|g| *g == 0.0));
     }
 }

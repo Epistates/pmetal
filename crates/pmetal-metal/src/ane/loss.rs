@@ -8,10 +8,13 @@
 //! the ANE trainer convention. Each channel (vocab entry) is a contiguous
 //! vector of length `seq`.
 
+pub use crate::accelerate::IGNORE_INDEX;
+
 /// Output from a loss computation.
 #[derive(Copy, Clone)]
 pub struct LossOutput {
-    /// Scalar loss value: mean NLL per token (divided by `seq`, not by `loss_scale`).
+    /// Scalar loss value: mean NLL over the counted tokens (not scaled by
+    /// `loss_scale`).
     pub loss: f32,
 }
 
@@ -23,18 +26,18 @@ pub trait AneTrainingLoss: Send {
     /// Compute loss and gradient from logits and targets.
     ///
     /// - `logits`: `[vocab, seq]` channel-first (each vocab entry is contiguous over seq).
-    /// - `targets`: `[seq]` token IDs.
+    /// - `targets`: `[seq]` token IDs; [`IGNORE_INDEX`] leaves a position out.
     /// - `vocab`: vocabulary size.
     /// - `seq`: sequence length.
     /// - `loss_scale`: multiplier on gradient for mixed-precision stability.
     /// - `dlogits`: output gradient buffer `[vocab, seq]`, same layout as logits.
     ///
-    /// Returns the mean NLL per token (total NLL divided by `seq`).
-    /// Gradient in `dlogits` is scaled by `loss_scale / seq`.
+    /// Returns the mean NLL over the counted positions, `n` of them. The
+    /// gradient in `dlogits` is scaled by `loss_scale / n`.
     fn compute(
         &mut self,
         logits: &[f32],
-        targets: &[u16],
+        targets: &[u32],
         vocab: usize,
         seq: usize,
         loss_scale: f32,
@@ -62,7 +65,7 @@ impl AneTrainingLoss for CrossEntropyLoss {
     fn compute(
         &mut self,
         logits: &[f32],
-        targets: &[u16],
+        targets: &[u32],
         vocab: usize,
         seq: usize,
         loss_scale: f32,
@@ -97,7 +100,7 @@ mod tests {
         let mut loss_fn = CrossEntropyLoss::new(vocab);
         // Channel-first: [V=8, S=2]
         let logits = vec![0.1f32; vocab * seq];
-        let targets = vec![0u16, 3];
+        let targets = vec![0u32, 3];
         let mut dlogits = vec![0.0f32; vocab * seq];
 
         let out = loss_fn.compute(&logits, &targets, vocab, seq, 1.0, &mut dlogits);
@@ -113,7 +116,7 @@ mod tests {
         let vocab = 4;
         let seq = 1;
         let mut loss_fn = CrossEntropyLoss::new(vocab);
-        let targets = vec![1u16];
+        let targets = vec![1u32];
 
         // Uniform logits [V=4, S=1] — each channel has 1 element
         let logits_uniform = vec![0.0f32; vocab];
@@ -134,7 +137,7 @@ mod tests {
         let seq = 1;
         let mut loss_fn = CrossEntropyLoss::new(vocab);
         let logits = vec![0.1f32; vocab];
-        let targets = vec![0u16];
+        let targets = vec![0u32];
 
         let mut d1 = vec![0.0f32; vocab];
         let mut d2 = vec![0.0f32; vocab];

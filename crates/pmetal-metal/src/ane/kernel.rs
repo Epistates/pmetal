@@ -276,14 +276,18 @@ fn emit_rmsnorm(p: &mut MilProgram, d: usize, s: usize, inv_d: f32, eps: f32, we
 /// Returns `(cos_blob, sin_blob)` each of shape `[1, 1, half_dim, seq_len]`.
 /// Uses non-traditional split-half RoPE frequencies:
 /// `inv_freq[d] = 1 / rope_theta^(2d / head_dim)` for `d in 0..half_dim`.
-fn build_rope_tables(head_dim: usize, seq_len: usize, rope_theta: f32) -> (Vec<u8>, Vec<u8>) {
+pub(crate) fn build_rope_tables(
+    head_dim: usize,
+    seq_len: usize,
+    rope_theta: f32,
+) -> (Vec<u8>, Vec<u8>) {
     let half_dim = head_dim / 2;
     let n = half_dim * seq_len;
     let mut cos_data = vec![0.0f32; n];
     let mut sin_data = vec![0.0f32; n];
 
     for d in 0..half_dim {
-        let inv_freq = 1.0 / rope_theta.powf(2.0 * d as f32 / head_dim as f32);
+        let inv_freq = rope_inv_freq(d, head_dim, rope_theta);
         for t in 0..seq_len {
             let angle = t as f32 * inv_freq;
             // Layout: [half_dim, seq_len] channel-first
@@ -296,6 +300,43 @@ fn build_rope_tables(head_dim: usize, seq_len: usize, rope_theta: f32) -> (Vec<u
         WeightBlob::from_f32(&cos_data, half_dim, seq_len),
         WeightBlob::from_f32(&sin_data, half_dim, seq_len),
     )
+}
+
+/// RoPE's angular frequency for rotation pair `d` (`d < head_dim / 2`).
+fn rope_inv_freq(d: usize, head_dim: usize, rope_theta: f32) -> f32 {
+    1.0 / rope_theta.powf(2.0 * d as f32 / head_dim as f32)
+}
+
+/// Apply RoPE in place on the CPU to `x`, channel-first
+/// `[n_heads * head_dim, seq]` with position `t` in column `t`: the same
+/// split-half rotation [`emit_rope`] applies on the ANE.
+///
+/// `inverse` rotates by −θ. The rotation is orthogonal, so that is also its
+/// transpose, which is how a gradient goes back through it.
+pub(crate) fn rope_channel_first(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    seq: usize,
+    rope_theta: f32,
+    inverse: bool,
+) {
+    debug_assert_eq!(x.len(), n_heads * head_dim * seq);
+    let half = head_dim / 2;
+    for d in 0..half {
+        let inv_freq = rope_inv_freq(d, head_dim, rope_theta);
+        for t in 0..seq {
+            let (sin, cos) = (t as f32 * inv_freq).sin_cos();
+            let sin = if inverse { -sin } else { sin };
+            for h in 0..n_heads {
+                let first = (h * head_dim + d) * seq + t;
+                let second = first + half * seq;
+                let (a, b) = (x[first], x[second]);
+                x[first] = a * cos - b * sin;
+                x[second] = a * sin + b * cos;
+            }
+        }
+    }
 }
 
 /// Emit MIL for per-head RMSNorm on a `[1, n_heads, head_dim, seq]` tensor.
@@ -361,7 +402,7 @@ fn emit_per_head_rmsnorm(
 /// Splits the head_dim axis into first/second halves, applies rotation using
 /// precomputed cos/sin tables of shape `[1, 1, half_dim, seq]`.
 #[allow(clippy::too_many_arguments)]
-fn emit_rope(
+pub(crate) fn emit_rope(
     p: &mut MilProgram,
     input: &str,
     output: &str,
@@ -2080,5 +2121,65 @@ mod tests {
             "gen_sdpa_fwd_taps GQA must not use tile"
         );
         assert!(out_taps.mil_text.contains("concat"));
+    }
+
+    /// `[n_heads * head_dim, seq]` with every entry distinct.
+    fn rope_input(n_heads: usize, head_dim: usize, seq: usize) -> Vec<f32> {
+        (0..n_heads * head_dim * seq)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.02)
+            .collect()
+    }
+
+    #[test]
+    fn rope_inverse_undoes_the_rotation_and_position_zero_is_untouched() {
+        let (nh, hd, s) = (3, 8, 5);
+        let x = rope_input(nh, hd, s);
+        let mut y = x.clone();
+        rope_channel_first(&mut y, nh, hd, s, 10_000.0, false);
+        assert_ne!(y, x);
+        for ch in 0..nh * hd {
+            assert_eq!(y[ch * s], x[ch * s], "position 0 rotates by 0");
+        }
+        rope_channel_first(&mut y, nh, hd, s, 10_000.0, true);
+        let diff = x
+            .iter()
+            .zip(&y)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f32::max);
+        assert!(diff < 1e-5, "{diff}");
+    }
+
+    #[test]
+    fn rope_scores_depend_only_on_relative_position() {
+        // One head, the same q and k at every position: after RoPE,
+        // q_t . k_u is a function of t - u alone.
+        let (hd, s) = (8, 6);
+        let q: Vec<f32> = (0..hd).map(|i| 0.3 + i as f32 * 0.1).collect();
+        let k: Vec<f32> = (0..hd).map(|i| 0.9 - i as f32 * 0.07).collect();
+        let spread = |v: &[f32]| -> Vec<f32> { (0..hd * s).map(|i| v[i / s]).collect() };
+        let (mut qs, mut ks) = (spread(&q), spread(&k));
+        rope_channel_first(&mut qs, 1, hd, s, 10_000.0, false);
+        rope_channel_first(&mut ks, 1, hd, s, 10_000.0, false);
+        let dot = |t: usize, u: usize| (0..hd).map(|i| qs[i * s + t] * ks[i * s + u]).sum::<f32>();
+        assert!((dot(3, 1) - dot(4, 2)).abs() < 1e-5);
+        assert!((dot(5, 5) - dot(0, 0)).abs() < 1e-5);
+        assert!(
+            (dot(3, 1) - dot(3, 2)).abs() > 1e-3,
+            "and it does depend on it"
+        );
+    }
+
+    #[test]
+    fn rope_inverse_is_the_transpose_for_gradients() {
+        // <R x, g> == <x, R^-1 g>, so R^-1 carries a gradient back through R.
+        let (nh, hd, s) = (2, 4, 7);
+        let x = rope_input(nh, hd, s);
+        let g: Vec<f32> = rope_input(nh, hd, s).iter().rev().copied().collect();
+        let (mut rx, mut rg) = (x.clone(), g.clone());
+        rope_channel_first(&mut rx, nh, hd, s, 500.0, false);
+        rope_channel_first(&mut rg, nh, hd, s, 500.0, true);
+        let lhs: f32 = rx.iter().zip(&g).map(|(a, b)| a * b).sum();
+        let rhs: f32 = x.iter().zip(&rg).map(|(a, b)| a * b).sum();
+        assert!((lhs - rhs).abs() < 1e-4, "{lhs} vs {rhs}");
     }
 }

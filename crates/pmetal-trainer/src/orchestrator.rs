@@ -1442,8 +1442,9 @@ async fn attempt_ane_training(
 
     // Collect all u32 token IDs for VocabMap
     let mut all_token_ids: Vec<u32> = Vec::new();
-    // Also collect the (input, target) pairs as u32 for later remapping
-    let mut pairs_u32: Vec<(Vec<u32>, Vec<u32>)> = Vec::new();
+    // Also collect the (input, target) pairs as u32 for later remapping, with
+    // which targets count toward the loss.
+    let mut pairs_u32: Vec<(Vec<u32>, Vec<u32>, Vec<bool>)> = Vec::new();
     // ANE kernels require all sequences to be EXACTLY max_seq_len tokens
     // (baked into IOSurface dimensions). Pad short sequences, truncate long ones.
     let pad_token = 0u32; // Pad token ID (will be compacted by VocabMap)
@@ -1458,14 +1459,30 @@ async fn attempt_ane_training(
         let usable = ids.len().min(max_seq_len + 1);
         input.extend_from_slice(&ids[..usable - 1]);
         target.extend_from_slice(&ids[1..usable]);
+        // Target t predicts ids[t + 1]. It counts unless the dataset masks
+        // that token (label -100, a prompt token) or it's padding. Padding
+        // used to count, so most of a short example's loss was predicting
+        // the pad token after the pad token.
+        let mut counted: Vec<bool> = (1..usable)
+            .map(|i| {
+                sample
+                    .labels
+                    .as_ref()
+                    .is_none_or(|labels| labels.get(i).is_none_or(|&l| l != -100))
+            })
+            .collect();
+        if !counted.contains(&true) {
+            continue;
+        }
         // Pad to exact seq_len
         while input.len() < max_seq_len {
             input.push(pad_token);
             target.push(pad_token);
+            counted.push(false);
         }
         all_token_ids.extend_from_slice(&input);
         all_token_ids.extend_from_slice(&target);
-        pairs_u32.push((input, target));
+        pairs_u32.push((input, target, counted));
     }
 
     if pairs_u32.is_empty() {
@@ -1484,9 +1501,14 @@ async fn attempt_ane_training(
     // Remap to compact u16 and build batches
     let mut batches: Vec<Vec<(Vec<u16>, Vec<u16>)>> = Vec::new();
     let mut current_batch: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
-    for (input_u32, target_u32) in &pairs_u32 {
+    for (input_u32, target_u32, counted) in &pairs_u32 {
         let input = vocab_map.remap_u32(input_u32);
-        let target = vocab_map.remap_u32(target_u32);
+        let mut target = vocab_map.remap_u32(target_u32);
+        for (t, &counts) in target.iter_mut().zip(counted) {
+            if !counts {
+                *t = crate::IGNORE_TARGET;
+            }
+        }
         current_batch.push((input, target));
 
         if current_batch.len() >= gradient_accumulation_steps.max(1) {

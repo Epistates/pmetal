@@ -17,8 +17,8 @@
 //!
 //! | # | Kernel | IC | Spatial | Weights Packed |
 //! |---|--------|---|----|---|
-//! | 1 | `sdpa_fwd` | DIM | SEQ + 1 + 2*Q_DIM + 2*KV_DIM | x, rms_w, Wq, Wk, Wv, Wo |
-//! | 2 | `ffn_w13` | DIM | SEQ + 1 + 2*HIDDEN | x, rms_w, W1, W3 (+ SiLU/gate inside) |
+//! | 1 | `sdpa_fwd` | DIM | SEQ + 2*Q_DIM + 2*KV_DIM | xnorm, Wq, Wk, Wv, Wo |
+//! | 2 | `ffn_w13` | DIM | SEQ + 2*HIDDEN | x2norm, W1, W3 (+ SiLU/gate inside) |
 //! | 3 | `ffn_w2` | HIDDEN | SEQ + DIM | gate, W2 |
 //! | 4 | `ffn_bwd_w2t` | DIM | SEQ + HIDDEN | dffn, W2^T |
 //! | 5 | `ffn_bwd_w13t` | HIDDEN | 2*SEQ + 2*DIM | dh1, dh3, W1^T, W3^T |
@@ -35,7 +35,7 @@
 //! **GQA support:** Kernels 7-8 handle GQA natively via tile+reduce_sum.
 //! Kernel 9 is split into 9a+9b for GQA (mixed IC dimensions).
 
-use crate::ane::kernel::{TransformerKernelConfig, WeightBlob};
+use crate::ane::kernel::{TransformerKernelConfig, WeightBlob, build_rope_tables, emit_rope};
 use crate::ane::mil::MilProgram;
 use crate::ane::runtime::WeightDict;
 
@@ -181,7 +181,9 @@ fn emit_dyn_matmul_with_act(
     out
 }
 
-/// Helper for matmul where input activations are at a specific channel offset.
+/// Helper for a matmul whose activations and `[ic, oc]` weights both start
+/// at channel `act_ch_off` of `input`, at spatial offsets `act_sp_off` and
+/// `w_sp_off`.
 #[allow(clippy::too_many_arguments)]
 fn emit_dyn_matmul_at_ch(
     p: &mut MilProgram,
@@ -207,9 +209,16 @@ fn emit_dyn_matmul_at_ch(
     let act = p.next_var(&format!("{prefix}_act"));
     p.emit_slice_by_size(&act, &[1, ic, 1, seq], input, &act_begin, &act_size);
 
-    // Slice weights: [1, ic, 1, oc] from spatial offset
+    // Slice weights: [1, ic, 1, oc] from the same channels, at spatial
+    // offset w_sp_off. Reading them from channel 0, which the trainer leaves
+    // zero, made sdpa_bwd1's dA zero.
     let w_begin = p.next_var(&format!("{prefix}_wb"));
-    p.emit_tensor_const(&w_begin, &[4], "int32", &format!("[0,0,0,{}]", w_sp_off));
+    p.emit_tensor_const(
+        &w_begin,
+        &[4],
+        "int32",
+        &format!("[0,{},0,{}]", act_ch_off, w_sp_off),
+    );
     let w_size = p.next_var(&format!("{prefix}_ws"));
     p.emit_tensor_const(&w_size, &[4], "int32", &format!("[1,{ic},1,{oc}]"));
     let w = p.next_var(&format!("{prefix}_w"));
@@ -657,7 +666,11 @@ fn build_causal_mask(seq_len: usize) -> Vec<u8> {
 // Kernel 1: SDPA Forward (dynamic Wq, Wk, Wv, Wo + Fused RMSNorm)
 // ============================================================================
 
-/// Generate the dynamic SDPA forward kernel with fused RMSNorm and tap outputs.
+/// Generate the dynamic SDPA forward kernel with tap outputs.
+///
+/// The input is already RMS-normalized (in f32, by the trainer: in fp16 the
+/// sum of squares overflows on real checkpoints). Q and K are rotated by RoPE (`cfg.rope_theta`) before attention, and the
+/// `q` and `k` taps are the rotated values.
 ///
 /// `variant`: pass `0` for primary, `1` for secondary (dual-die alternation).
 pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKernelOutput {
@@ -671,13 +684,13 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKe
     let qd = c.q_dim();
     let kvd = c.kv_dim();
 
-    let wq_off = s + 1;
+    let wq_off = s;
     let wk_off = wq_off + qd;
     let wv_off = wk_off + kvd;
     let wo_off = wv_off + kvd;
     let sp = wo_off + qd;
 
-    let out_ch = 2 * d + 2 * qd + 2 * kvd;
+    let out_ch = d + 2 * qd + 2 * kvd;
     let scale = 1.0 / (hd as f32).sqrt();
 
     let mut p = MilProgram::new_fp32(d, sp);
@@ -687,17 +700,8 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKe
     p.emit_tensor_const(&x_begin, &[4], "int32", "[0,0,0,0]");
     let x_size = p.next_var("xs");
     p.emit_tensor_const(&x_size, &[4], "int32", &format!("[1,{d},1,{s}]"));
-    let x_raw = p.next_var("xr");
-    p.emit_slice_by_size(&x_raw, &[1, d, 1, s], "x16", &x_begin, &x_size);
-
-    let rw_begin = p.next_var("rwb");
-    p.emit_tensor_const(&rw_begin, &[4], "int32", &format!("[0,0,0,{s}]"));
-    let rw_size = p.next_var("rws");
-    p.emit_tensor_const(&rw_size, &[4], "int32", &format!("[1,{d},1,1]"));
-    let rms_w = p.next_var("rw");
-    p.emit_slice_by_size(&rms_w, &[1, d, 1, 1], "x16", &rw_begin, &rw_size);
-
-    let xnorm = emit_rmsnorm_fuse(&mut p, "rn", &x_raw, &rms_w, d, s, c.rms_norm_eps);
+    let xnorm = p.next_var("xn");
+    p.emit_slice_by_size(&xnorm, &[1, d, 1, s], "x16", &x_begin, &x_size);
 
     let q = emit_dyn_matmul_with_act(&mut p, "q", &xnorm, "x16", d, qd, s, wq_off);
     let k = emit_dyn_matmul_with_act(&mut p, "k", &xnorm, "x16", d, kvd, s, wk_off);
@@ -708,28 +712,42 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKe
     let q_heads = p.next_var("qh");
     p.emit_reshape(&q_heads, &[1, nh, hd, s], &q_rsh, &q);
 
-    let perm23 = p.next_var("p23");
-    p.emit_tensor_const(&perm23, &[4], "int32", "[0,1,3,2]");
-    let qt = p.next_var("qt");
-    p.emit_transpose(&qt, &[1, nh, s, hd], &perm23, &q_heads);
-
     let kv_rsh = p.next_var("kvrs");
     p.emit_tensor_const(&kv_rsh, &[4], "int32", &format!("[1,{nkv},{hd},{s}]"));
     let k_kv = p.next_var("kkv");
     p.emit_reshape(&k_kv, &[1, nkv, hd, s], &kv_rsh, &k);
 
+    // RoPE on Q and K. The taps carry the rotated values, which the
+    // attention backward needs; the trainer rotates dQ and dK back.
+    let (cos_path, sin_path) = ("@model_path/weights/cos.bin", "@model_path/weights/sin.bin");
+    let q_rope = p.next_var("qrope");
+    emit_rope(&mut p, &q_heads, &q_rope, nh, hd, s, cos_path, sin_path);
+    let k_rope = p.next_var("krope");
+    emit_rope(&mut p, &k_kv, &k_rope, nkv, hd, s, cos_path, sin_path);
+    let q_flat_rsh = p.next_var("qfrs");
+    p.emit_tensor_const(&q_flat_rsh, &[4], "int32", &format!("[1,{qd},1,{s}]"));
+    let q_tap = p.next_var("qtap");
+    p.emit_reshape(&q_tap, &[1, qd, 1, s], &q_flat_rsh, &q_rope);
+    let k_flat_rsh = p.next_var("kfrs");
+    p.emit_tensor_const(&k_flat_rsh, &[4], "int32", &format!("[1,{kvd},1,{s}]"));
+    let k_tap = p.next_var("ktap");
+    p.emit_reshape(&k_tap, &[1, kvd, 1, s], &k_flat_rsh, &k_rope);
+
+    let perm23 = p.next_var("p23");
+    p.emit_tensor_const(&perm23, &[4], "int32", "[0,1,3,2]");
+    let qt = p.next_var("qt");
+    p.emit_transpose(&qt, &[1, nh, s, hd], &perm23, &q_rope);
+
     let (k_heads, v_h) = if groups > 1 {
-        let k_final = emit_gqa_expand(&mut p, "ke", &k_kv, nkv, nh, hd, s, groups);
+        let k_final = emit_gqa_expand(&mut p, "ke", &k_rope, nkv, nh, hd, s, groups);
         let v_kv = p.next_var("vkv");
         p.emit_reshape(&v_kv, &[1, nkv, hd, s], &kv_rsh, &v);
         let v_final = emit_gqa_expand(&mut p, "ve", &v_kv, nkv, nh, hd, s, groups);
         (k_final, v_final)
     } else {
-        let k_h = p.next_var("kh");
-        p.emit_reshape(&k_h, &[1, nh, hd, s], &q_rsh, &k);
         let v_h = p.next_var("vh");
         p.emit_reshape(&v_h, &[1, nh, hd, s], &q_rsh, &v);
-        (k_h, v_h)
+        (k_rope.clone(), v_h)
     };
 
     let mm_false = p.next_var("mmf");
@@ -813,7 +831,7 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKe
         &[1, out_ch, 1, s],
         &cat_ax,
         &cat_il,
-        &[&o_out, &q, &k, &v, &attn_flat, &xnorm],
+        &[&o_out, &q_tap, &k_tap, &v, &attn_flat],
     );
 
     let taps32 = p.next_var("taps32");
@@ -823,6 +841,9 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKe
     let mil_text = p.finalize(&final_out);
     let mut static_weights = WeightDict::new();
     static_weights.add(mask_path, build_causal_mask(s));
+    let (cos, sin) = build_rope_tables(hd, s, c.rope_theta);
+    static_weights.add(cos_path, cos);
+    static_weights.add(sin_path, sin);
 
     DynamicKernelOutput {
         mil_text,
@@ -848,7 +869,8 @@ pub fn gen_dynamic_sdpa_fwd(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKe
 // Kernel 2: FFN W1+W3 Forward (dynamic W1, W3 + SiLU gate + Fused RMSNorm)
 // ============================================================================
 
-/// Generate the dynamic FFN forward kernel with fused RMSNorm.
+/// Generate the dynamic FFN forward kernel. The input is already
+/// RMS-normalized, as for [`gen_dynamic_sdpa_fwd`].
 ///
 /// `variant`: pass `0` for primary, `1` for secondary (dual-die alternation).
 pub fn gen_dynamic_ffn_w13(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKernelOutput {
@@ -856,7 +878,7 @@ pub fn gen_dynamic_ffn_w13(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKer
     let d = c.dim;
     let h = c.hidden_dim;
     let s = c.seq_len;
-    let sp = s + 1 + 2 * h;
+    let sp = s + 2 * h;
     let out_ch = 3 * h;
 
     let mut p = MilProgram::new_fp32(d, sp);
@@ -866,20 +888,11 @@ pub fn gen_dynamic_ffn_w13(dkc: &DynamicKernelConfig, variant: u8) -> DynamicKer
     p.emit_tensor_const(&x_begin, &[4], "int32", "[0,0,0,0]");
     let x_size = p.next_var("xs");
     p.emit_tensor_const(&x_size, &[4], "int32", &format!("[1,{d},1,{s}]"));
-    let x_raw = p.next_var("xr");
-    p.emit_slice_by_size(&x_raw, &[1, d, 1, s], "x16", &x_begin, &x_size);
+    let xnorm = p.next_var("xn");
+    p.emit_slice_by_size(&xnorm, &[1, d, 1, s], "x16", &x_begin, &x_size);
 
-    let rw_begin = p.next_var("rwb");
-    p.emit_tensor_const(&rw_begin, &[4], "int32", &format!("[0,0,0,{s}]"));
-    let rw_size = p.next_var("rws");
-    p.emit_tensor_const(&rw_size, &[4], "int32", &format!("[1,{d},1,1]"));
-    let rms_w = p.next_var("rw");
-    p.emit_slice_by_size(&rms_w, &[1, d, 1, 1], "x16", &rw_begin, &rw_size);
-
-    let xnorm = emit_rmsnorm_fuse(&mut p, "rn", &x_raw, &rms_w, d, s, c.rms_norm_eps);
-
-    let h1 = emit_dyn_matmul_with_act(&mut p, "w1", &xnorm, "x16", d, h, s, s + 1);
-    let h3 = emit_dyn_matmul_with_act(&mut p, "w3", &xnorm, "x16", d, h, s, s + 1 + h);
+    let h1 = emit_dyn_matmul_with_act(&mut p, "w1", &xnorm, "x16", d, h, s, s);
+    let h3 = emit_dyn_matmul_with_act(&mut p, "w3", &xnorm, "x16", d, h, s, s + h);
 
     let sig = p.next_var("sig");
     p.emit_sigmoid(&sig, &[1, h, 1, s], &h1);
@@ -1689,7 +1702,8 @@ mod tests {
         assert!(out.mil_text.contains("softmax("));
         assert!(out.mil_text.contains("BLOBFILE"));
         assert_eq!(out.input_layout.ic, 64);
-        assert_eq!(out.output_layout.ic, 2 * 64 + 2 * 64 + 2 * 64);
+        // o_out, q, k, v, attn: the input arrives normalized, so no xnorm tap.
+        assert_eq!(out.output_layout.ic, 64 + 2 * 64 + 2 * 64);
     }
 
     #[test]
@@ -1837,7 +1851,7 @@ mod tests {
         let out = gen_dynamic_sdpa_fwd(&dkc, 0);
         assert!(out.mil_text.contains("concat("));
         assert_eq!(out.input_layout.ic, d);
-        assert_eq!(out.output_layout.ic, 2 * d + 2 * qd + 2 * kvd);
+        assert_eq!(out.output_layout.ic, d + 2 * qd + 2 * kvd);
     }
 
     #[test]

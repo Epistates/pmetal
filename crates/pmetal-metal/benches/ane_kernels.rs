@@ -82,7 +82,7 @@ fn bench_cross_entropy(c: &mut Criterion) {
         let logits: Vec<f32> = (0..vocab * seq)
             .map(|i| (i as f32 % 256.0 - 128.0) * 0.01)
             .collect();
-        let targets: Vec<u16> = (0..seq).map(|t| (t % vocab.min(65535)) as u16).collect();
+        let targets: Vec<u32> = (0..seq).map(|t| (t % vocab) as u32).collect();
         let mut dlogits = vec![0.0f32; vocab * seq];
 
         group.bench_with_input(BenchmarkId::new("vocab", vocab), &vocab, |b, &v| {

@@ -756,7 +756,8 @@ impl AneTrainer {
 
         // Cross-entropy loss
         let mut dlogits = vec![0.0f32; v * s];
-        let loss = accelerate::cross_entropy_loss(&mut dlogits, &logits, target_tokens, v, s);
+        let targets: Vec<u32> = target_tokens.iter().map(|&t| t as u32).collect();
+        let loss = accelerate::cross_entropy_loss(&mut dlogits, &logits, &targets, v, s);
 
         // === Backward pass ===
 
