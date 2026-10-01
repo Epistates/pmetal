@@ -29,6 +29,8 @@ mod ffi {
         pub fn IOSurfaceUnlock(surface: *mut c_void, options: u32, seed: *mut u32) -> i32;
         pub fn IOSurfaceGetBaseAddress(surface: *mut c_void) -> *mut c_void;
         pub fn IOSurfaceGetAllocSize(surface: *mut c_void) -> usize;
+        pub fn IOSurfaceGetBytesPerRow(surface: *mut c_void) -> usize;
+        pub fn IOSurfaceGetHeight(surface: *mut c_void) -> usize;
 
         // CoreFoundation
         pub fn CFRelease(cf: *const c_void);
@@ -89,6 +91,44 @@ impl IoSurface {
     /// Size of this surface in bytes.
     pub fn size_bytes(&self) -> usize {
         self.size_bytes
+    }
+
+    /// The declared size of a raw surface (bytes per row × height), which is
+    /// what the ANE compares against a model's tensor layout. The allocation
+    /// itself can be rounded up to a page and isn't a usable measure.
+    ///
+    /// # Safety
+    /// `surface` must be a valid IOSurfaceRef.
+    pub(crate) unsafe fn declared_bytes(surface: *mut c_void) -> usize {
+        unsafe { ffi::IOSurfaceGetBytesPerRow(surface) * ffi::IOSurfaceGetHeight(surface) }
+    }
+
+    /// Copy `rows` rows of `row_bytes` from `src` to `dst`, row `r` going from
+    /// byte `src_at(r)` to byte `dst_at(r)`. Restrides between the packed
+    /// layout pmetal writes and a padded one a model expects.
+    ///
+    /// # Safety
+    /// Both must be valid, distinct IOSurfaceRefs, and every row must fit
+    /// inside each surface at the offsets given.
+    pub(crate) unsafe fn copy_rows(
+        src: *mut c_void,
+        dst: *mut c_void,
+        rows: usize,
+        row_bytes: usize,
+        src_at: impl Fn(usize) -> usize,
+        dst_at: impl Fn(usize) -> usize,
+    ) {
+        unsafe {
+            ffi::IOSurfaceLock(src, ffi::K_IO_SURFACE_LOCK_READ_ONLY, std::ptr::null_mut());
+            ffi::IOSurfaceLock(dst, 0, std::ptr::null_mut());
+            let from = ffi::IOSurfaceGetBaseAddress(src) as *const u8;
+            let to = ffi::IOSurfaceGetBaseAddress(dst) as *mut u8;
+            for r in 0..rows {
+                std::ptr::copy_nonoverlapping(from.add(src_at(r)), to.add(dst_at(r)), row_bytes);
+            }
+            ffi::IOSurfaceUnlock(dst, 0, std::ptr::null_mut());
+            ffi::IOSurfaceUnlock(src, ffi::K_IO_SURFACE_LOCK_READ_ONLY, std::ptr::null_mut());
+        }
     }
 
     /// Write f32 data as fp16 to the surface.

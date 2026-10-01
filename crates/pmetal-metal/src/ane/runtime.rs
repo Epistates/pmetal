@@ -291,7 +291,22 @@ impl AneRuntime {
                 inner_model
             };
 
-            let real_time = if self.client_class.is_some() {
+            // Only the inner model: see read_io_layouts.
+            let (input_layouts, output_layouts) = if inner_model.is_null() {
+                (Vec::new(), Vec::new())
+            } else {
+                read_io_layouts(inner_model)
+            };
+            tracing::debug!(
+                inputs = ?input_layouts,
+                outputs = ?output_layouts,
+                "ANE kernel I/O layouts"
+            );
+
+            // On macOS 27, _ANEClient's load for real-time evaluation fails
+            // with no error detail, for the inner model and the wrapper alike,
+            // while standard dispatch works. Report it unavailable there.
+            let real_time = if self.client_class.is_some() && !macos_27_or_later() {
                 let client: *mut AnyObject = if let Some(client_class) = self.client_class {
                     let private_client: *mut AnyObject =
                         msg_send![client_class, sharedPrivateConnection];
@@ -323,6 +338,9 @@ impl AneRuntime {
                 standard_loaded: AtomicBool::new(true),
                 standard_load_lock: Mutex::new(()),
                 tmp_dir: PathBuf::from(&tmp_dir_str),
+                input_layouts,
+                output_layouts,
+                staging: Mutex::new(Staging::default()),
             })
         }
     }
@@ -628,6 +646,17 @@ pub struct AneModel {
     standard_loaded: AtomicBool,
     standard_load_lock: Mutex<()>,
     tmp_dir: PathBuf,
+    input_layouts: Vec<AneTensorLayout>,
+    output_layouts: Vec<AneTensorLayout>,
+    /// Surfaces laid out the model's way, for callers' packed ones whose
+    /// layout is padded. Allocated on first use; held for the evaluation.
+    staging: Mutex<Staging>,
+}
+
+#[derive(Default)]
+struct Staging {
+    inputs: Vec<Option<crate::ane::iosurface::IoSurface>>,
+    outputs: Vec<Option<crate::ane::iosurface::IoSurface>>,
 }
 
 // SAFETY: ANE model objects are thread-safe for evaluation dispatch.
@@ -635,6 +664,17 @@ unsafe impl Send for AneModel {}
 unsafe impl Sync for AneModel {}
 
 impl AneModel {
+    /// The layout the model expects for each input, in order. Empty when the
+    /// model doesn't report it.
+    pub fn input_layouts(&self) -> &[AneTensorLayout] {
+        &self.input_layouts
+    }
+
+    /// The layout the model produces for each output, in order.
+    pub fn output_layouts(&self) -> &[AneTensorLayout] {
+        &self.output_layouts
+    }
+
     /// Returns true when the real-time evaluation path is available for this model.
     pub fn real_time_available(&self) -> bool {
         self.real_time.is_some()
@@ -879,7 +919,34 @@ impl AneModel {
         self.evaluate_inner(inputs, outputs, AneEvaluationMode::RealTime, true)
     }
 
+    /// Evaluate, restriding any packed surface the model expects padded:
+    /// inputs are copied into staging surfaces laid out the model's way, and
+    /// outputs are copied back after. Surfaces that already match pass
+    /// through untouched, so on layouts without padding this costs nothing.
     fn evaluate_inner(
+        &self,
+        inputs: &[*mut c_void],
+        outputs: &[*mut c_void],
+        mode: AneEvaluationMode,
+        collect_stats: bool,
+    ) -> Result<AnePerformanceStats> {
+        let mut staging = self.staging.lock();
+        let ins = stage(inputs, &self.input_layouts, &mut staging.inputs)?;
+        let outs = stage(outputs, &self.output_layouts, &mut staging.outputs)?;
+        for (i, layout, surface) in &ins.restrided {
+            // SAFETY: both are live surfaces sized for this layout (see stage).
+            unsafe { restride(inputs[*i], *surface, layout, Direction::ToModel) };
+        }
+        check_surface_sizes("input", &ins.surfaces, &self.input_layouts)?;
+        check_surface_sizes("output", &outs.surfaces, &self.output_layouts)?;
+        let stats = self.evaluate_raw(&ins.surfaces, &outs.surfaces, mode, collect_stats)?;
+        for (i, layout, surface) in &outs.restrided {
+            unsafe { restride(*surface, outputs[*i], layout, Direction::FromModel) };
+        }
+        Ok(stats)
+    }
+
+    fn evaluate_raw(
         &self,
         inputs: &[*mut c_void],
         outputs: &[*mut c_void],
@@ -893,7 +960,7 @@ impl AneModel {
                     .perf_stats_class
                     .filter(|_| perf_stats_request_supported())
                 else {
-                    self.evaluate_inner(inputs, outputs, mode, false)?;
+                    self.evaluate_raw(inputs, outputs, mode, false)?;
                     return Ok(AnePerformanceStats::default());
                 };
 
@@ -903,7 +970,7 @@ impl AneModel {
                     statsWithHardwareExecutionNS: &*zero
                 ];
                 if perf_stats.is_null() {
-                    self.evaluate_inner(inputs, outputs, mode, false)?;
+                    self.evaluate_raw(inputs, outputs, mode, false)?;
                     return Ok(AnePerformanceStats::default());
                 }
                 perf_stats
@@ -1105,6 +1172,245 @@ impl Default for WeightDict {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// How the ANE expects one model input or output laid out in memory, as the
+/// loaded model reports it (`modelAttributes` → `NetworkStatusList`).
+///
+/// Surfaces are written channel-major with each channel's row packed, which
+/// matches this only when `row_stride` equals the row's natural width. On
+/// macOS 27 rows are padded to 64 bytes, so a short row (a 16-element fp16
+/// sequence, say) needs a bigger surface than the tensor's element count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AneTensorLayout {
+    /// Channel count (C in `[1, C, H, W]`).
+    pub channels: usize,
+    /// Rows per channel.
+    pub height: usize,
+    /// Elements per row (the sequence or spatial length).
+    pub width: usize,
+    /// Depth (1 for the 4-D tensors pmetal uses).
+    pub depth: usize,
+    /// Batch count.
+    pub batches: usize,
+    /// Bytes from one row to the next.
+    pub row_stride: usize,
+    /// Bytes from one channel's plane to the next.
+    pub plane_stride: usize,
+    /// Bytes from one batch to the next.
+    pub batch_stride: usize,
+    /// Bytes per element (2 for Float16, 4 for Float32; 0 if unreported).
+    pub element_bytes: usize,
+}
+
+impl AneTensorLayout {
+    /// The size of the same tensor with every row packed, which is how
+    /// pmetal's surfaces are written.
+    pub fn packed_size(&self) -> usize {
+        self.channels * self.height * self.width * self.depth * self.batches * self.element_bytes
+    }
+
+    /// Whether rows are padded past their natural width, so a packed surface
+    /// has to be restrided before the ANE reads it.
+    pub fn is_padded(&self) -> bool {
+        self.element_bytes > 0 && self.row_stride > self.width * self.element_bytes
+    }
+
+    /// The surface size, in bytes, this tensor needs.
+    pub fn byte_size(&self) -> usize {
+        (self.batch_stride * self.batches)
+            .max(self.plane_stride * self.channels * self.depth * self.batches)
+    }
+}
+
+/// Read a loaded model's input and output layouts. Both are empty when the
+/// model doesn't report them.
+///
+/// # Safety
+/// `model` must be the inner `_ANEModel`. On the `_ANEInMemoryModel` wrapper,
+/// `modelAttributes` can raise `-externConstants: unrecognized selector`,
+/// which aborts the process.
+unsafe fn read_io_layouts(model: *mut AnyObject) -> (Vec<AneTensorLayout>, Vec<AneTensorLayout>) {
+    unsafe {
+        let responds: Bool = msg_send![model, respondsToSelector: objc2::sel!(modelAttributes)];
+        if !responds.as_bool() {
+            return (Vec::new(), Vec::new());
+        }
+        let attrs: *mut AnyObject = msg_send![model, modelAttributes];
+        let get = |dict: *mut AnyObject, key: &str| -> *mut AnyObject {
+            if dict.is_null() {
+                return std::ptr::null_mut();
+            }
+            let key = NSString::from_str(key);
+            msg_send![dict, objectForKey: &*key]
+        };
+        let count = |array: *mut AnyObject| -> usize {
+            if array.is_null() {
+                0
+            } else {
+                msg_send![array, count]
+            }
+        };
+        let status = get(attrs, "NetworkStatusList");
+        if count(status) == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        let network: *mut AnyObject = msg_send![status, objectAtIndex: 0usize];
+        let layouts = |key: &str| -> Vec<AneTensorLayout> {
+            let list = get(network, key);
+            (0..count(list))
+                .map(|i| {
+                    let d: *mut AnyObject = msg_send![list, objectAtIndex: i];
+                    let n = |k: &str| -> usize {
+                        let v = get(d, k);
+                        if v.is_null() {
+                            0
+                        } else {
+                            let x: u64 = msg_send![v, unsignedLongLongValue];
+                            x as usize
+                        }
+                    };
+                    let element_bytes = {
+                        let t = get(d, "Type");
+                        if t.is_null() {
+                            0
+                        } else {
+                            match ns_string_to_rust(t as *const AnyObject).as_str() {
+                                "Float16" => 2,
+                                "Float32" => 4,
+                                _ => 0,
+                            }
+                        }
+                    };
+                    AneTensorLayout {
+                        element_bytes,
+                        channels: n("Channels"),
+                        height: n("Height"),
+                        width: n("Width"),
+                        depth: n("Depth").max(1),
+                        batches: n("Batches").max(1),
+                        row_stride: n("RowStride"),
+                        plane_stride: n("PlaneStride"),
+                        batch_stride: n("BatchStride"),
+                    }
+                })
+                .collect()
+        };
+        (layouts("LiveInputList"), layouts("LiveOutputList"))
+    }
+}
+
+/// The surfaces to evaluate with, and which of them stand in for a caller's.
+struct Staged {
+    surfaces: Vec<*mut c_void>,
+    /// (index, layout, staging surface) for each restrided tensor.
+    restrided: Vec<(usize, AneTensorLayout, *mut c_void)>,
+}
+
+/// Swap in a staging surface for each caller surface written packed against
+/// a layout whose rows are padded. Everything else passes through, and
+/// `check_surface_sizes` still reports a surface that's simply too small.
+fn stage(
+    surfaces: &[*mut c_void],
+    layouts: &[AneTensorLayout],
+    pool: &mut Vec<Option<crate::ane::iosurface::IoSurface>>,
+) -> Result<Staged> {
+    use crate::ane::iosurface::IoSurface;
+    let mut staged = Staged {
+        surfaces: surfaces.to_vec(),
+        restrided: Vec::new(),
+    };
+    if surfaces.len() != layouts.len() {
+        return Ok(staged);
+    }
+    pool.resize_with(surfaces.len(), || None);
+    for (i, (&surface, layout)) in surfaces.iter().zip(layouts).enumerate() {
+        let have = unsafe { IoSurface::declared_bytes(surface) };
+        let packed_input =
+            have < layout.byte_size() && have >= layout.packed_size() && layout.packed_size() > 0;
+        if !(layout.is_padded()
+            && layout.height >= 1
+            && layout.depth == 1
+            && layout.batches == 1
+            && packed_input)
+        {
+            continue;
+        }
+        if pool[i]
+            .as_ref()
+            .is_none_or(|s| s.size_bytes() < layout.byte_size())
+        {
+            pool[i] = Some(IoSurface::new(layout.byte_size())?);
+        }
+        let ptr = pool[i]
+            .as_ref()
+            .map_or(std::ptr::null_mut(), IoSurface::as_ptr);
+        staged.surfaces[i] = ptr;
+        staged.restrided.push((i, *layout, ptr));
+    }
+    Ok(staged)
+}
+
+#[derive(Clone, Copy)]
+enum Direction {
+    /// Packed caller surface → padded staging surface.
+    ToModel,
+    /// Padded staging surface → packed caller surface.
+    FromModel,
+}
+
+/// Copy a tensor between its packed form and the model's padded layout, one
+/// row at a time.
+///
+/// # Safety
+/// `src` and `dst` must be live surfaces: the packed one at least
+/// `layout.packed_size()` bytes, the padded one `layout.byte_size()`.
+unsafe fn restride(
+    src: *mut c_void,
+    dst: *mut c_void,
+    layout: &AneTensorLayout,
+    direction: Direction,
+) {
+    let row_bytes = layout.width * layout.element_bytes;
+    let rows = layout.channels * layout.height;
+    let (height, plane, row) = (layout.height, layout.plane_stride, layout.row_stride);
+    let packed = move |r: usize| r * row_bytes;
+    let padded = move |r: usize| (r / height) * plane + (r % height) * row;
+    unsafe {
+        match direction {
+            Direction::ToModel => crate::ane::iosurface::IoSurface::copy_rows(
+                src, dst, rows, row_bytes, packed, padded,
+            ),
+            Direction::FromModel => crate::ane::iosurface::IoSurface::copy_rows(
+                src, dst, rows, row_bytes, padded, packed,
+            ),
+        }
+    }
+}
+
+/// Fail before evaluation, with the sizes, when a surface is smaller than the
+/// model's layout for it. The ANE's own error for this (Code=42) names
+/// neither the tensor nor the size it wanted.
+fn check_surface_sizes(
+    kind: &str,
+    surfaces: &[*mut c_void],
+    layouts: &[AneTensorLayout],
+) -> Result<()> {
+    if surfaces.len() != layouts.len() {
+        return Ok(());
+    }
+    for (i, (&surface, layout)) in surfaces.iter().zip(layouts).enumerate() {
+        let have = unsafe { crate::ane::iosurface::IoSurface::declared_bytes(surface) };
+        let need = layout.byte_size();
+        if have < need {
+            return Err(MetalError::AneEvalFailed(format!(
+                "{kind} {i}: surface is {have} bytes but the model expects {need} \
+                 ({} channels x {} wide, row stride {} bytes)",
+                layout.channels, layout.width, layout.row_stride
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Path of the single weight file [`pack_weights`] produces.
@@ -1510,17 +1816,24 @@ mod tests {
     }
 
     /// Packed weights must evaluate to the same function: two layers with
-    /// distinct weights against a CPU reference. 8x32 fp16 rows are 64 bytes,
-    /// so this avoids the separate row-stride sizing issue (Code=42).
+    /// distinct weights against a CPU reference. At width 32 the fp16 rows
+    /// are exactly 64 bytes; at 12 they're 24, which macOS 27 pads to 64, so
+    /// the surfaces go through AneModel's restriding both ways.
     #[test]
     #[ignore = "requires ANE hardware and private AppleNeuralEngine.framework"]
     fn test_multi_weight_kernel_evaluates_correctly() {
+        for sp in [32usize, 12] {
+            multi_weight_kernel_case(sp);
+        }
+    }
+
+    fn multi_weight_kernel_case(sp: usize) {
         let rt = match AneRuntime::global() {
             Ok(rt) => rt,
             Err(MetalError::AneNotAvailable) => return,
             Err(e) => panic!("Unexpected error: {e}"),
         };
-        let (c, sp) = (8usize, 32usize);
+        let c = 8usize;
         let w1: Vec<f32> = (0..c * c).map(|k| ((k % 7) as f32 - 3.0) * 0.05).collect();
         let w2: Vec<f32> = (0..c * c).map(|k| ((k % 5) as f32 - 2.0) * 0.07).collect();
         let (mil, wd) = two_conv_kernel(&w1, &w2, c, sp);
@@ -1549,7 +1862,7 @@ mod tests {
         };
         let expected = conv(&w2, &conv(&w1, &x));
         let diff = max_abs_diff(&got, &expected);
-        assert!(diff < 1e-3, "max |ane - cpu| = {diff}");
+        assert!(diff < 1e-3, "width {sp}: max |ane - cpu| = {diff}");
     }
 
     #[test]
@@ -1560,9 +1873,6 @@ mod tests {
             Err(MetalError::AneNotAvailable) => return,
             Err(e) => panic!("Unexpected error: {e}"),
         };
-        if !rt.real_time_available() {
-            return;
-        }
 
         let mut program = MilProgram::new_fp32(1, 4);
         program.emit_cast("x16", &[1, 1, 1, 4], "x", "fp16");
@@ -1574,12 +1884,11 @@ mod tests {
             Err(e) => panic!("ANE is present but the test program failed to compile or load: {e}"),
         };
 
-        // The loaded model reports RowStride = 64 bytes for this 16-byte row
-        // (macOS 27), and a surface sized to the bare tensor fails with
-        // Code=42 "IOSurface smaller than the model expects". 16 fp32 = 64 B.
-        let input = IoSurface::for_tensor_f32(1, 16).unwrap();
-        let output_std = IoSurface::for_tensor_f32(1, 16).unwrap();
-        let output_rt = IoSurface::for_tensor_f32(1, 16).unwrap();
+        // Sized to the bare 16-byte row. On macOS 27 the model pads rows to
+        // 64 bytes, so this also exercises AneModel's restriding.
+        let input = IoSurface::for_tensor_f32(1, 4).unwrap();
+        let output_std = IoSurface::for_tensor_f32(1, 4).unwrap();
+        let output_rt = IoSurface::for_tensor_f32(1, 4).unwrap();
         let input_values = [1.5f32, -2.0, 0.25, 7.0];
         input.write_f32_at(0, &input_values, 1, 4);
 
@@ -1588,13 +1897,19 @@ mod tests {
         model
             .evaluate(&[input.as_ptr()], &[output_std.as_ptr()])
             .expect("standard ANE evaluation");
+        let mut std_values = [0.0f32; 4];
+        output_std.read_f32(&mut std_values, 0, 1, 4);
+        // The program casts through fp16, which represents these exactly.
+        assert_eq!(std_values, input_values, "standard evaluation round-trips");
+
+        // Real-time is unavailable on macOS 27; the standard path is still tested.
+        if !model.real_time_available() {
+            return;
+        }
         model
             .evaluate_real_time(&[input.as_ptr()], &[output_rt.as_ptr()])
             .expect("real-time ANE evaluation");
-
-        let mut std_values = [0.0f32; 4];
         let mut rt_values = [0.0f32; 4];
-        output_std.read_f32(&mut std_values, 0, 1, 4);
         output_rt.read_f32(&mut rt_values, 0, 1, 4);
 
         for (standard, realtime) in std_values.iter().zip(rt_values.iter()) {
@@ -1613,9 +1928,6 @@ mod tests {
             Err(MetalError::AneNotAvailable) => return,
             Err(e) => panic!("Unexpected error: {e}"),
         };
-        if !rt.real_time_available() {
-            return;
-        }
 
         let cfg = TransformerKernelConfig {
             dim: 64,
@@ -1646,10 +1958,6 @@ mod tests {
             Ok(model) => model,
             Err(e) => panic!("ANE is present but the test program failed to compile or load: {e}"),
         };
-        if !model.real_time_available() {
-            return;
-        }
-
         let input = IoSurface::for_tensor(cfg.dim, cfg.seq_len).unwrap();
         let output_channels = cfg.sdpa_fwd_output_ch();
         let output_std = IoSurface::for_tensor(output_channels, cfg.seq_len).unwrap();
@@ -1662,6 +1970,11 @@ mod tests {
         model
             .evaluate(&[input.as_ptr()], &[output_std.as_ptr()])
             .expect("standard ANE evaluation of the SDPA kernel");
+        // Real-time is unavailable on macOS 27; the kernel still compiled and
+        // ran through standard dispatch above.
+        if !model.real_time_available() {
+            return;
+        }
         model
             .evaluate_real_time(&[input.as_ptr()], &[output_rt.as_ptr()])
             .expect("real-time ANE evaluation of the SDPA kernel");
