@@ -13,7 +13,9 @@ use std::path::Path;
 use std::time::Instant;
 
 use crate::ane::checkpoint::{self, Checkpoint};
-use crate::ane::extend::{ExtendConfig, ExtendModel, LayerWeights, WeightFormat, gen_lm_head};
+use crate::ane::extend::{
+    ExtendConfig, ExtendModel, LayerWeights, WeightFormat, gen_lm_head, lm_head_pieces,
+};
 use crate::ane::iosurface::IoSurface;
 use crate::ane::runtime::{AneModel, AneRuntime};
 use crate::error::{MetalError, Result};
@@ -71,7 +73,8 @@ pub struct AneLm {
     layers: ExtendModel,
     head: AneModel,
     head_in: IoSurface,
-    head_out: IoSurface,
+    /// The logits, one surface per LM head piece, each `[rows, W]`.
+    head_out: Vec<IoSurface>,
     /// `[vocab, dim]` fp16.
     embed: Vec<half::f16>,
 }
@@ -162,7 +165,10 @@ impl AneLm {
 
         Ok(Self {
             head_in: IoSurface::for_tensor(d, opts.width)?,
-            head_out: IoSurface::for_tensor(vocab, opts.width)?,
+            head_out: lm_head_pieces(vocab, d)
+                .into_iter()
+                .map(|(_, rows)| IoSurface::for_tensor(rows, opts.width))
+                .collect::<Result<_>>()?,
             cfg,
             vocab,
             layers,
@@ -222,10 +228,11 @@ impl AneLm {
             padded[c * w..c * w + n].copy_from_slice(&hidden[c * n..(c + 1) * n]);
         }
         self.head_in.write_f32_as_fp16(&padded, d, w);
-        self.head
-            .evaluate(&[self.head_in.as_ptr()], &[self.head_out.as_ptr()])?;
+        let outputs: Vec<_> = self.head_out.iter().map(IoSurface::as_ptr).collect();
+        self.head.evaluate(&[self.head_in.as_ptr()], &outputs)?;
         Ok(Logits {
-            surface: &self.head_out,
+            pieces: &self.head_out,
+            dim: self.cfg.dim,
             vocab: self.vocab,
             width: w,
             n,
@@ -290,7 +297,8 @@ fn sample(logits: &[f32], temperature: f32, top_k: usize) -> u32 {
 
 /// The logits from one [`AneLm::step`].
 pub struct Logits<'a> {
-    surface: &'a IoSurface,
+    pieces: &'a [IoSurface],
+    dim: usize,
     vocab: usize,
     width: usize,
     n: usize,
@@ -310,12 +318,14 @@ impl Logits<'_> {
     /// Position `t`'s logits, `[vocab]`.
     pub fn row(&self, t: usize) -> Vec<f32> {
         assert!(t < self.n, "position {t} of {}", self.n);
-        let (w, vocab) = (self.width, self.vocab);
-        self.surface.with_fp16(|bits| {
-            (0..vocab)
-                .map(|v| half::f16::from_bits(bits[v * w + t]).to_f32())
-                .collect()
-        })
+        let w = self.width;
+        let mut row = Vec::with_capacity(self.vocab);
+        for (piece, (_, rows)) in self.pieces.iter().zip(lm_head_pieces(self.vocab, self.dim)) {
+            piece.with_fp16(|bits| {
+                row.extend((0..rows).map(|v| half::f16::from_bits(bits[v * w + t]).to_f32()));
+            });
+        }
+        row
     }
 
     /// Position `t`'s most likely token.

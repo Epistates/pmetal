@@ -532,13 +532,26 @@ fn emit_layer(
     (n("x3"), n("ktap"), n("v"))
 }
 
-/// The widest output a single convolution in [`gen_lm_head`] produces; the
-/// ANE rejects much wider ones.
-const HEAD_PIECE: usize = 16384;
+/// The vocabulary rows each LM head output covers, as `(start, rows)`, for
+/// a model `dim` wide.
+///
+/// The ANE reads a convolution's weights slowly once its outputs outnumber
+/// its inputs by much more than four: Qwen3-0.6B's head (1024 wide) as
+/// 16384-row pieces read 26 GB/s, as 4096-row pieces 97 GB/s. A piece is
+/// also kept to 16384 rows, the widest tensor dimension the ANE handles
+/// natively.
+pub fn lm_head_pieces(vocab: usize, dim: usize) -> Vec<(usize, usize)> {
+    let piece = (4 * dim).clamp(1024, 16384);
+    (0..vocab)
+        .step_by(piece)
+        .map(|start| (start, piece.min(vocab - start)))
+        .collect()
+}
 
 /// Generate the LM head: the final RMSNorm of `a_x` `[1, dim, 1, W]` and the
-/// logits `o_logits` `[1, vocab, 1, W]`, from `weight` `[vocab, dim]` stored
-/// as `cfg.weights` says, in pieces of at most 16384 rows.
+/// logits, one output per [`lm_head_pieces`] piece, `o_logits_NN`
+/// `[1, rows, 1, W]`, from `weight` `[vocab, dim]` stored as `cfg.weights`
+/// says.
 pub fn gen_lm_head(
     cfg: &ExtendConfig,
     final_norm: &[f32],
@@ -557,8 +570,6 @@ pub fn gen_lm_head(
     p.emit_conv_constants();
     p.emit_tensor_const("ax1", &[1], "int32", "[1]");
     p.emit_scalar_const("kd", "bool", "true");
-    p.emit_scalar_const("cat1", "int32", "1");
-    p.emit_scalar_const("tf", "bool", "false");
     let path = "@model_path/weights/final_norm.bin";
     p.emit_weight_const("final_norm", &[1, d, 1, 1], path);
     weights.add(path, WeightBlob::from_rms_weights(final_norm));
@@ -572,9 +583,8 @@ pub fn gen_lm_head(
         "final_norm",
     );
 
-    let mut pieces = Vec::new();
-    for (i, start) in (0..vocab).step_by(HEAD_PIECE).enumerate() {
-        let rows = HEAD_PIECE.min(vocab - start);
+    let mut outputs = Vec::new();
+    for (i, (start, rows)) in lm_head_pieces(vocab, d).into_iter().enumerate() {
         let name = format!("head{i}");
         emit_projection_weight(
             &mut p,
@@ -585,19 +595,14 @@ pub fn gen_lm_head(
             rows,
             d,
         );
-        let out = format!("logits{i}");
+        // Zero-padded: outputs bind in name order.
+        let out = format!("o_logits_{i:02}");
         p.emit_conv(&out, &[1, rows, 1, w], &name, "xn");
-        pieces.push(out);
+        outputs.push(out);
     }
-    let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
-    if refs.len() == 1 {
-        p.emit_scalar_const("one", "fp16", "1.0");
-        p.emit_mul("o_logits", &[1, vocab, 1, w], refs[0], "one");
-    } else {
-        p.emit_concat("o_logits", &[1, vocab, 1, w], "cat1", "tf", &refs);
-    }
+    let refs: Vec<&str> = outputs.iter().map(String::as_str).collect();
     Ok(KernelOutput {
-        mil_text: p.finalize("o_logits"),
+        mil_text: p.finalize_multi(&refs),
         weights,
         input_bytes: d * w * 2,
         output_bytes: vocab * w * 2,
