@@ -53,6 +53,74 @@ pub fn check_supported(config: &serde_json::Value) -> std::result::Result<(), St
     checkpoint::check_architecture_limits(config, "inference")
 }
 
+/// How [`AneLm::generate`] decodes.
+#[derive(Debug, Clone)]
+pub struct GenerateOptions {
+    /// Most tokens to generate.
+    pub max_new: usize,
+    /// Sampling temperature; 0 is greedy.
+    pub temperature: f32,
+    /// Sample among the `top_k` most likely tokens (0 for all).
+    pub top_k: usize,
+    /// Tokens that end generation (and are returned).
+    pub stop: Vec<u32>,
+}
+
+/// Guesses at what follows a context, for [`AneLm::generate`] to verify.
+pub trait Drafter {
+    /// Up to `max` tokens likely to follow `context`.
+    fn draft(&mut self, context: &[u32], max: usize) -> Vec<u32>;
+}
+
+/// No guesses: one token per pass.
+pub struct NoDraft;
+
+impl Drafter for NoDraft {
+    fn draft(&mut self, _: &[u32], _: usize) -> Vec<u32> {
+        Vec::new()
+    }
+}
+
+/// Prompt lookup: find the last `n` tokens earlier in the context (the
+/// longest `n` from `max_ngram` down to `min_ngram` that matches) and guess
+/// the tokens that followed them. No draft model; it pays off wherever
+/// output repeats its input, as in code edits, quoting and structured text.
+pub struct PromptLookup {
+    /// Longest n-gram to match.
+    pub max_ngram: usize,
+    /// Shortest n-gram to match.
+    pub min_ngram: usize,
+}
+
+impl Default for PromptLookup {
+    fn default() -> Self {
+        Self {
+            max_ngram: 4,
+            min_ngram: 2,
+        }
+    }
+}
+
+impl Drafter for PromptLookup {
+    fn draft(&mut self, context: &[u32], max: usize) -> Vec<u32> {
+        for n in (self.min_ngram..=self.max_ngram).rev() {
+            if max == 0 || context.len() <= n {
+                continue;
+            }
+            let tail = &context[context.len() - n..];
+            // The most recent earlier occurrence.
+            if let Some(at) = (0..context.len() - n)
+                .rev()
+                .find(|&i| &context[i..i + n] == tail)
+            {
+                let from = at + n;
+                return context[from..(from + max).min(context.len())].to_vec();
+            }
+        }
+        Vec::new()
+    }
+}
+
 /// Statistics for one [`AneLm::generate`] call.
 #[derive(Debug, Clone, Default)]
 pub struct GenerationStats {
@@ -64,6 +132,12 @@ pub struct GenerationStats {
     pub prefill_secs: f64,
     /// Seconds spent generating.
     pub decode_secs: f64,
+    /// Decode passes run.
+    pub passes: usize,
+    /// Guesses verified.
+    pub drafted_tokens: usize,
+    /// Guesses kept.
+    pub accepted_tokens: usize,
 }
 
 /// A language model compiled for the ANE.
@@ -239,24 +313,29 @@ impl AneLm {
         })
     }
 
-    /// Generate up to `max_new` tokens after `prompt`, starting from an empty
-    /// cache. Sampling is greedy at `temperature` 0, otherwise top-`top_k`
-    /// (0 for all). Stops at a token in `stop`, or when `on_token` returns
+    /// Generate after `prompt`, starting from an empty cache, until
+    /// `opts.max_new` tokens, a token in `opts.stop`, or `on_token` returning
     /// false. Returns the generated tokens.
+    ///
+    /// Each pass verifies the drafter's guesses at what follows alongside the
+    /// next token, for about the cost of the next token alone, and keeps the
+    /// guesses the model agrees with. The output is what decoding one token
+    /// at a time would produce, in distribution when sampling (a guess is
+    /// kept only when the token sampled at its position equals it).
     pub fn generate(
         &mut self,
         prompt: &[u32],
-        max_new: usize,
-        temperature: f32,
-        top_k: usize,
-        stop: &[u32],
+        opts: &GenerateOptions,
+        drafter: &mut dyn Drafter,
         mut on_token: impl FnMut(u32) -> bool,
     ) -> Result<(Vec<u32>, GenerationStats)> {
         if prompt.is_empty() {
             return Err(MetalError::InvalidConfig("empty prompt".into()));
         }
-        let budget = self.capacity().saturating_sub(prompt.len());
-        let max_new = max_new.min(budget);
+        let max_new = opts
+            .max_new
+            .min(self.capacity().saturating_sub(prompt.len()));
+        let pick = |row: Vec<f32>| sample(&row, opts.temperature, opts.top_k);
         self.truncate(0);
         let mut stats = GenerationStats {
             prompt_tokens: prompt.len(),
@@ -269,20 +348,47 @@ impl AneLm {
         for (i, chunk) in chunks.iter().enumerate() {
             let logits = self.step(chunk)?;
             if i + 1 == chunks.len() {
-                next = sample(&logits.row(chunk.len() - 1), temperature, top_k);
+                next = pick(logits.row(chunk.len() - 1));
             }
         }
         stats.prefill_secs = started.elapsed().as_secs_f64();
 
         let started = Instant::now();
+        let mut context = prompt.to_vec();
         let mut out = Vec::with_capacity(max_new);
-        while out.len() < max_new {
+        'decode: loop {
+            // `next` is decided; emit it.
             out.push(next);
-            if stop.contains(&next) || !on_token(next) || out.len() == max_new {
+            context.push(next);
+            if opts.stop.contains(&next) || !on_token(next) || out.len() >= max_new {
                 break;
             }
-            let logits = self.step(&[next])?;
-            next = sample(&logits.row(0), temperature, top_k);
+
+            // Verify `next` and up to width - 1 guesses in one pass. The
+            // cache has room for every token fed, so a guess can't push the
+            // output past max_new.
+            let room = (max_new - out.len()).min(self.capacity() - self.position() - 1);
+            let mut feed = vec![next];
+            feed.extend(drafter.draft(&context, room.min(self.width() - 1)));
+            let start = self.position();
+            let logits = self.step(&feed)?;
+            stats.passes += 1;
+            stats.drafted_tokens += feed.len() - 1;
+            let mut kept = 0;
+            next = pick(logits.row(0));
+            while kept + 1 < feed.len() && next == feed[kept + 1] {
+                kept += 1;
+                next = pick(logits.row(kept));
+            }
+            self.truncate(start + 1 + kept);
+            stats.accepted_tokens += kept;
+            for &token in &feed[1..=kept] {
+                out.push(token);
+                context.push(token);
+                if opts.stop.contains(&token) || !on_token(token) || out.len() >= max_new {
+                    break 'decode;
+                }
+            }
         }
         stats.decode_secs = started.elapsed().as_secs_f64();
         stats.generated_tokens = out.len();
