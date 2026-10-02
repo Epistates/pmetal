@@ -1750,6 +1750,8 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 ane_max_seq_len,
                 #[cfg(feature = "ane")]
                 ane_real_time,
+                #[cfg(feature = "ane")]
+                draft_model,
                 continuous_batch,
                 cb_max_slots,
                 cb_max_queue_depth,
@@ -1769,6 +1771,10 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             let serve_ane_real_time = ane_real_time;
             #[cfg(not(feature = "ane"))]
             let serve_ane_real_time = false;
+            #[cfg(feature = "ane")]
+            let serve_draft_model = draft_model;
+            #[cfg(not(feature = "ane"))]
+            let serve_draft_model = None;
 
             commands::serve::run_serve(
                 model,
@@ -1785,6 +1791,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
                 ane_enabled,
                 serve_ane_max_seq_len,
                 serve_ane_real_time,
+                serve_draft_model,
                 continuous_batch,
                 cb_max_slots,
                 cb_max_queue_depth,

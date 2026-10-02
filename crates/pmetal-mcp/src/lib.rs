@@ -1679,8 +1679,11 @@ impl PmetalMcpServer {
             String,
         >,
         #[description("Enable ANE (Apple Neural Engine) serving")] ane: Option<bool>,
-        #[description("Maximum ANE kernel sequence length")] ane_max_seq_len: Option<u64>,
+        #[description("Largest ANE context, prompt plus output (default: 4096)")]
+        ane_max_seq_len: Option<u64>,
         #[description("Use experimental ANE real-time serving path")] ane_real_time: Option<bool>,
+        #[description("DFlash draft model drafting for the model on the ANE (needs ane)")]
+        draft_model: Option<String>,
     ) -> McpResult<String> {
         let mut spec = ServeSpec {
             model,
@@ -1689,8 +1692,10 @@ impl PmetalMcpServer {
             max_seq_len: max_seq_len.unwrap_or(4096) as usize,
             experts_dir,
             ane: ane.unwrap_or(false),
-            ane_max_seq_len: ane_max_seq_len.unwrap_or(1024) as usize,
+            ane_max_seq_len: ane_max_seq_len
+                .map_or(ServeSpec::default().ane_max_seq_len, |v| v as usize),
             ane_real_time: ane_real_time.unwrap_or(false),
+            draft_model,
             ..ServeSpec::default()
         };
         spec.normalize().map_err(into_mcp_error)?;

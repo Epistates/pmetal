@@ -15,6 +15,7 @@ pub(crate) async fn run_serve(
     ane_enabled: bool,
     ane_max_seq_len: usize,
     ane_real_time: bool,
+    draft_model: Option<String>,
     continuous_batch: bool,
     cb_max_slots: usize,
     cb_max_queue_depth: usize,
@@ -30,6 +31,19 @@ pub(crate) async fn run_serve(
     // Resolve model path
     tracing::info!("Resolving model: {}", model_id);
     let model_path = pmetal_hub::resolve_model_path(&model_id, None, None).await?;
+    let draft_path = match draft_model {
+        Some(draft) => {
+            let path = pmetal_hub::resolve_model_path(&draft, None, None).await?;
+            if !ane_enabled || !pmetal_models::dflash_drafter::is_dflash_draft(&path) {
+                anyhow::bail!(
+                    "--draft-model takes a DFlash draft model, which drafts for the ANE \
+                     engine with --ane; {draft} isn't one, or --ane is off"
+                );
+            }
+            Some(path)
+        }
+        None => None,
+    };
 
     // Load tokenizer — use pmetal_data::Tokenizer for config-aware special token
     // resolution (needed by collect_all_stop_tokens inside InferenceEngine::new).
@@ -104,6 +118,10 @@ pub(crate) async fn run_serve(
         ane_real_time,
         cache_mode_override,
     )?;
+    let engine = match draft_path {
+        Some(path) => engine.with_ane_drafter(path),
+        None => engine,
+    };
 
     // Start server
     let continuous_batching = if continuous_batch {

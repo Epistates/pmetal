@@ -465,6 +465,8 @@ pub struct InferenceEngine {
     max_seq_len: usize,
     /// Fixed ANE bucket cap for accelerated backends.
     ane_max_seq_len: usize,
+    /// DFlash draft model drafting for the ANE engine, if any.
+    ane_draft_path: Option<std::path::PathBuf>,
     /// Enable the experimental ANE real-time evaluation path for ANE requests.
     ane_real_time: bool,
     /// Preferred generation backend; falls back to GPU permanently on failure.
@@ -693,6 +695,13 @@ impl InferenceEngine {
         )
     }
 
+    /// Draft with the DFlash draft model in `path` when generating on the ANE
+    /// (run on the GPU, reading the ANE model's hidden states).
+    pub fn with_ane_drafter(mut self, path: std::path::PathBuf) -> Self {
+        self.ane_draft_path = Some(path);
+        self
+    }
+
     /// Create a new inference engine with explicit backend and cache mode controls.
     pub fn new_with_options(
         model: DynamicModel,
@@ -761,6 +770,7 @@ impl InferenceEngine {
             model_path: model_path.to_path_buf(),
             max_seq_len,
             ane_max_seq_len,
+            ane_draft_path: None,
             ane_real_time,
             backend: Arc::new(Mutex::new(BackendState {
                 preferred: preferred_backend,
@@ -1147,6 +1157,7 @@ impl InferenceEngine {
     fn try_accelerated_generate_blocking(
         backend: &Arc<Mutex<BackendState>>,
         model_path: &std::path::Path,
+        draft_path: Option<&std::path::Path>,
         input_ids: &[u32],
         gen_config: &GenerationConfig,
         ane_max_seq_len: usize,
@@ -1163,7 +1174,7 @@ impl InferenceEngine {
         let output = match preferred_backend {
             PreferredGenerationBackend::Ane => generate_cached_ane_streaming(
                 model_path,
-                None,
+                draft_path,
                 input_ids,
                 gen_config,
                 ane_max_seq_len,
@@ -1208,6 +1219,7 @@ impl InferenceEngine {
     fn try_accelerated_streaming_blocking(
         backend: &Arc<Mutex<BackendState>>,
         model_path: &std::path::Path,
+        draft_path: Option<&std::path::Path>,
         input_ids: &[u32],
         gen_config: &GenerationConfig,
         ane_max_seq_len: usize,
@@ -1227,7 +1239,7 @@ impl InferenceEngine {
         let output = match preferred_backend {
             PreferredGenerationBackend::Ane => generate_cached_ane_streaming(
                 model_path,
-                None,
+                draft_path,
                 input_ids,
                 gen_config,
                 ane_max_seq_len,
@@ -1631,6 +1643,7 @@ impl InferenceEngine {
         let model_path = self.model_path.clone();
         let max_seq_len = self.max_seq_len;
         let ane_max_seq_len = self.ane_max_seq_len;
+        let ane_draft_path = self.ane_draft_path.clone();
         let backend = Arc::clone(&self.backend);
         let cache_mode_override = self.cache_mode_override;
         let tokenizer = Arc::clone(&self.tokenizer);
@@ -1652,6 +1665,7 @@ impl InferenceEngine {
                 if let Some(result) = Self::try_accelerated_generate_blocking(
                     &backend,
                     &model_path,
+                    ane_draft_path.as_deref(),
                     &input_ids,
                     &gen_config,
                     ane_max_seq_len,
@@ -1820,6 +1834,7 @@ impl InferenceEngine {
         let model_path = self.model_path.clone();
         let max_seq_len = self.max_seq_len;
         let ane_max_seq_len = self.ane_max_seq_len;
+        let ane_draft_path = self.ane_draft_path.clone();
         let backend = Arc::clone(&self.backend);
         let cache_mode_override = self.cache_mode_override;
         let tokenizer = Arc::clone(&self.tokenizer);
@@ -1846,6 +1861,7 @@ impl InferenceEngine {
                 && Self::try_accelerated_streaming_blocking(
                     &backend,
                     &model_path,
+                    ane_draft_path.as_deref(),
                     &input_ids,
                     &gen_config,
                     ane_max_seq_len,

@@ -145,6 +145,15 @@ pub struct ServeSpec {
     pub ane_real_time: bool,
 
     #[job(
+        label = "Draft Model",
+        group = "Compute",
+        argv = "--draft-model",
+        kind = "model_picker"
+    )]
+    #[serde(default)]
+    pub draft_model: Option<String>,
+
+    #[job(
         label = "Continuous Batch",
         group = "Server",
         argv = "--continuous-batch",
@@ -216,6 +225,7 @@ impl Default for ServeSpec {
             ane: false,
             ane_max_seq_len: default_ane_max_seq_len(),
             ane_real_time: false,
+            draft_model: None,
             continuous_batch: false,
             cb_max_slots: default_cb_slots(),
             cb_max_queue_depth: default_cb_queue(),
@@ -226,9 +236,15 @@ impl Default for ServeSpec {
 }
 
 impl ServeSpec {
-    /// Run descriptor validation.
+    /// Run descriptor + cross-field validation.
     pub fn normalize(&mut self) -> Result<(), Vec<FieldError>> {
-        let errs = self.validate_descriptors();
+        let mut errs = self.validate_descriptors();
+        if self.draft_model.is_some() && !self.ane {
+            errs.push(FieldError::new(
+                "draft_model",
+                "a DFlash draft model drafts for the ANE engine; enable ANE",
+            ));
+        }
         if errs.is_empty() { Ok(()) } else { Err(errs) }
     }
 }

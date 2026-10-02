@@ -605,6 +605,7 @@ export interface ServeSpec {
   ane?: boolean;
   ane_max_seq_len?: number;
   ane_real_time?: boolean;
+  draft_model?: string | null;
   continuous_batch?: boolean;
   cb_max_slots?: number;
   cb_max_queue_depth?: number;
