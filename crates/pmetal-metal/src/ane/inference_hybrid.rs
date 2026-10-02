@@ -725,7 +725,7 @@ impl Qwen3NextInferenceEngine {
                     continue;
                 }
 
-                let mut data = safetensors_to_f32(&tensor)?;
+                let mut data = super::checkpoint::tensor_to_f32(&tensor)?;
 
                 // Apply (1+w) offset where applicable
                 if should_shift_norms && norm_1pw_suffixes.iter().any(|sfx| name.ends_with(sfx)) {
@@ -1314,61 +1314,6 @@ fn softplus(x: f32) -> f32 {
 #[inline]
 fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
-}
-
-/// Convert safetensors tensor data to f32.
-fn safetensors_to_f32(tensor: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>> {
-    use safetensors::Dtype;
-    match tensor.dtype() {
-        Dtype::F32 => {
-            let bytes = tensor.data();
-            if bytes.len() % 4 != 0 {
-                return Err(MetalError::UnsupportedDtype(format!(
-                    "F32 tensor data length {} is not a multiple of 4",
-                    bytes.len()
-                )));
-            }
-            let n = bytes.len() / 4;
-            let mut out = vec![0.0f32; n];
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, n * 4);
-            }
-            Ok(out)
-        }
-        Dtype::F16 => {
-            let bytes = tensor.data();
-            if bytes.len() % 2 != 0 {
-                return Err(MetalError::UnsupportedDtype(format!(
-                    "F16 tensor data length {} is not a multiple of 2",
-                    bytes.len()
-                )));
-            }
-            let n = bytes.len() / 2;
-            let mut out = vec![0.0f32; n];
-            for i in 0..n {
-                let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
-                out[i] = half::f16::from_bits(bits).to_f32();
-            }
-            Ok(out)
-        }
-        Dtype::BF16 => {
-            let bytes = tensor.data();
-            if bytes.len() % 2 != 0 {
-                return Err(MetalError::UnsupportedDtype(format!(
-                    "BF16 tensor data length {} is not a multiple of 2",
-                    bytes.len()
-                )));
-            }
-            let n = bytes.len() / 2;
-            let mut out = vec![0.0f32; n];
-            for i in 0..n {
-                let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
-                out[i] = half::bf16::from_bits(bits).to_f32();
-            }
-            Ok(out)
-        }
-        dtype => Err(MetalError::UnsupportedDtype(format!("{dtype:?}"))),
-    }
 }
 
 /// Check if a config.json is compatible with the CPU hybrid engine.

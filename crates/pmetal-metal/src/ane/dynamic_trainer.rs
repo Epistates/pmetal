@@ -2582,55 +2582,6 @@ impl DynamicAneTrainer {
         let d = self.config.dim;
         let h = self.config.hidden_dim;
 
-        fn st_to_f32(tensor: &safetensors::tensor::TensorView<'_>) -> Option<Vec<f32>> {
-            use safetensors::Dtype;
-            match tensor.dtype() {
-                Dtype::F32 => {
-                    let bytes = tensor.data();
-                    if bytes.len() % 4 != 0 {
-                        return None;
-                    }
-                    let n = bytes.len() / 4;
-                    let mut out = vec![0.0f32; n];
-                    unsafe {
-                        std::ptr::copy_nonoverlapping(
-                            bytes.as_ptr(),
-                            out.as_mut_ptr() as *mut u8,
-                            n * 4,
-                        );
-                    }
-                    Some(out)
-                }
-                Dtype::F16 => {
-                    let bytes = tensor.data();
-                    if bytes.len() % 2 != 0 {
-                        return None;
-                    }
-                    let n = bytes.len() / 2;
-                    let mut out = vec![0.0f32; n];
-                    for i in 0..n {
-                        let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
-                        out[i] = half::f16::from_bits(bits).to_f32();
-                    }
-                    Some(out)
-                }
-                Dtype::BF16 => {
-                    let bytes = tensor.data();
-                    if bytes.len() % 2 != 0 {
-                        return None;
-                    }
-                    let n = bytes.len() / 2;
-                    let mut out = vec![0.0f32; n];
-                    for i in 0..n {
-                        let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
-                        out[i] = f32::from_bits((bits as u32) << 16);
-                    }
-                    Some(out)
-                }
-                _ => None,
-            }
-        }
-
         let files = if path.is_file() {
             vec![path.to_path_buf()]
         } else {
@@ -2679,8 +2630,7 @@ impl DynamicAneTrainer {
 
             for (name, tensor) in tensors.tensors() {
                 // An unsupported dtype is an error only for a tensor we use.
-                let data = st_to_f32(&tensor)
-                    .ok_or_else(|| format!("unsupported dtype {:?}", tensor.dtype()));
+                let data = super::checkpoint::tensor_to_f32(&tensor);
 
                 if name == "model.embed_tokens.weight" {
                     let expected = self.config.vocab_size * d;

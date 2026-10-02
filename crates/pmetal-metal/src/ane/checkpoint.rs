@@ -13,6 +13,47 @@ use std::collections::HashSet;
 
 use crate::error::{MetalError, Result};
 
+/// A checkpoint tensor's data as f32. The ANE engines read f32, f16 and bf16;
+/// anything else (a packed quantized weight, an integer tensor) is an error.
+pub(crate) fn tensor_to_f32(tensor: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>> {
+    bytes_to_f32(tensor.dtype(), tensor.data())
+}
+
+fn bytes_to_f32(dtype: safetensors::Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
+    use safetensors::Dtype;
+    let width = match dtype {
+        Dtype::F32 => 4,
+        Dtype::F16 | Dtype::BF16 => 2,
+        other => return Err(MetalError::UnsupportedDtype(format!("{other:?}"))),
+    };
+    if bytes.len() % width != 0 {
+        return Err(MetalError::UnsupportedDtype(format!(
+            "{dtype:?} data of {} bytes isn't a whole number of elements",
+            bytes.len()
+        )));
+    }
+    Ok(match dtype {
+        Dtype::F32 => bytes
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
+            .collect(),
+        Dtype::F16 => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::f16::from_bits(u16::from_le_bytes(*b)).to_f32())
+            .collect(),
+        _ => bytes
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|b| half::bf16::from_bits(u16::from_le_bytes(*b)).to_f32())
+            .collect(),
+    })
+}
+
 /// Config limits both engines share. `engine` names the caller in errors.
 pub(crate) fn check_shared_limits(
     config: &serde_json::Value,

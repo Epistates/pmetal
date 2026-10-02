@@ -1317,7 +1317,7 @@ impl AneInferenceEngine {
             for (name, tensor) in tensors.tensors() {
                 // An unsupported dtype (a packed quantized weight, say) is an
                 // error only for a tensor we use.
-                let data_f32 = safetensors_to_f32(&tensor);
+                let data_f32 = super::checkpoint::tensor_to_f32(&tensor);
 
                 if name == "model.embed_tokens.weight" {
                     let expected = self.config.vocab_size * d;
@@ -1465,7 +1465,11 @@ impl AneInferenceEngine {
         let tensor_map: std::collections::HashMap<String, Vec<f32>> = tensors
             .tensors()
             .into_iter()
-            .filter_map(|(name, view)| safetensors_to_f32(&view).ok().map(|data| (name, data)))
+            .filter_map(|(name, view)| {
+                super::checkpoint::tensor_to_f32(&view)
+                    .ok()
+                    .map(|data| (name, data))
+            })
             .collect();
 
         for layer_idx in 0..self.config.n_layers {
@@ -1583,62 +1587,6 @@ fn apply_rope_vec(x: &mut [f32], n_heads: usize, head_dim: usize, pos: usize, ro
 /// Matrix-vector multiply: out = W @ x, where W is [rows, cols] row-major.
 fn gemv(w: &[f32], x: &[f32], out: &mut [f32], rows: usize, cols: usize) {
     accelerate::gemm(w, x, out, rows, 1, cols, 1.0, 0.0, false, false);
-}
-
-/// Convert safetensors tensor data to f32.
-fn safetensors_to_f32(tensor: &safetensors::tensor::TensorView<'_>) -> Result<Vec<f32>> {
-    use safetensors::Dtype;
-    match tensor.dtype() {
-        Dtype::F32 => {
-            let bytes = tensor.data();
-            if bytes.len() % 4 != 0 {
-                return Err(MetalError::UnsupportedDtype(format!(
-                    "F32 tensor data length {} is not a multiple of 4",
-                    bytes.len()
-                )));
-            }
-            let n = bytes.len() / 4;
-            let mut out = vec![0.0f32; n];
-            // SAFETY: f32 is 4 bytes, no alignment requirement for byte copy
-            unsafe {
-                std::ptr::copy_nonoverlapping(bytes.as_ptr(), out.as_mut_ptr() as *mut u8, n * 4);
-            }
-            Ok(out)
-        }
-        Dtype::F16 => {
-            let bytes = tensor.data();
-            if bytes.len() % 2 != 0 {
-                return Err(MetalError::UnsupportedDtype(format!(
-                    "F16 tensor data length {} is not a multiple of 2",
-                    bytes.len()
-                )));
-            }
-            let n = bytes.len() / 2;
-            let mut out = vec![0.0f32; n];
-            for i in 0..n {
-                let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
-                out[i] = half::f16::from_bits(bits).to_f32();
-            }
-            Ok(out)
-        }
-        Dtype::BF16 => {
-            let bytes = tensor.data();
-            if bytes.len() % 2 != 0 {
-                return Err(MetalError::UnsupportedDtype(format!(
-                    "BF16 tensor data length {} is not a multiple of 2",
-                    bytes.len()
-                )));
-            }
-            let n = bytes.len() / 2;
-            let mut out = vec![0.0f32; n];
-            for i in 0..n {
-                let bits = u16::from_le_bytes([bytes[i * 2], bytes[i * 2 + 1]]);
-                out[i] = half::bf16::from_bits(bits).to_f32();
-            }
-            Ok(out)
-        }
-        dtype => Err(MetalError::UnsupportedDtype(format!("{dtype:?}"))),
-    }
 }
 
 /// Return the list of LoRA target modules with their weight field name and dimensions.
