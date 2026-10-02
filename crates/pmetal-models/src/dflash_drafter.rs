@@ -126,6 +126,12 @@ impl DFlashDrafter {
             pending: Vec::new(),
             slots,
         };
+        // MLX builds its kernels on first use, ~1.5 s that would otherwise
+        // land on the first request.
+        drafter.reset();
+        let row = drafter.taps.len() * dim;
+        drafter.observe(&vec![0.0; row], 1)?;
+        drafter.propose(0, drafter.max_guesses())?;
         drafter.reset();
         Ok(drafter)
     }
