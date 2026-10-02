@@ -853,14 +853,15 @@ mod tests {
     #[test]
     fn inputs_are_declared_in_binding_order() {
         let cfg = tiny();
+        // Sized for the largest projection; each takes its own [out, in].
         let w = vec![0.01f32; 128 * 64];
         let norm = vec![1.0f32; 64];
         let t = LayerTensors {
             rms_att: &norm,
-            wq: &w,
-            wk: &w,
-            wv: &w,
-            wo: &w,
+            wq: &w[..64 * 64],
+            wk: &w[..32 * 64],
+            wv: &w[..32 * 64],
+            wo: &w[..64 * 64],
             q_norm: &norm[..16],
             k_norm: &norm[..16],
             rms_ffn: &norm,
