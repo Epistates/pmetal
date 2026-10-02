@@ -33,6 +33,9 @@ pub struct AneLmOptions {
     /// Weight bytes per layer program, which decides how many layers each
     /// holds. About 1 GB, as Anemll found works.
     pub max_program_bytes: usize,
+    /// Layers whose output a [`Drafter`] reads ([`Drafter::taps`]),
+    /// ascending; empty for none.
+    pub taps: Vec<usize>,
 }
 
 impl Default for AneLmOptions {
@@ -42,6 +45,7 @@ impl Default for AneLmOptions {
             capacity: 2048,
             weights: WeightFormat::Int8,
             max_program_bytes: 1 << 30,
+            taps: Vec::new(),
         }
     }
 }
@@ -68,16 +72,35 @@ pub struct GenerateOptions {
 
 /// Guesses at what follows a context, for [`AneLm::generate`] to verify.
 pub trait Drafter {
+    /// Layers whose output (the residual stream after them) the drafter
+    /// reads, ascending. The model must be built with them in
+    /// [`AneLmOptions::taps`].
+    fn taps(&self) -> &[usize] {
+        &[]
+    }
+
+    /// Forget everything observed: a new generation starts.
+    fn reset(&mut self) {}
+
+    /// The tapped layers' output for the next `n` tokens of context, as they
+    /// are decided: `[n, taps * dim]`, token-major, the taps in order. Every
+    /// context token is observed once, in order, before a draft follows it,
+    /// except the last, which [`draft`](Self::draft) is asked to continue.
+    fn observe(&mut self, hidden: &[f32], n: usize) -> Result<()> {
+        let _ = (hidden, n);
+        Ok(())
+    }
+
     /// Up to `max` tokens likely to follow `context`.
-    fn draft(&mut self, context: &[u32], max: usize) -> Vec<u32>;
+    fn draft(&mut self, context: &[u32], max: usize) -> Result<Vec<u32>>;
 }
 
 /// No guesses: one token per pass.
 pub struct NoDraft;
 
 impl Drafter for NoDraft {
-    fn draft(&mut self, _: &[u32], _: usize) -> Vec<u32> {
-        Vec::new()
+    fn draft(&mut self, _: &[u32], _: usize) -> Result<Vec<u32>> {
+        Ok(Vec::new())
     }
 }
 
@@ -102,7 +125,7 @@ impl Default for PromptLookup {
 }
 
 impl Drafter for PromptLookup {
-    fn draft(&mut self, context: &[u32], max: usize) -> Vec<u32> {
+    fn draft(&mut self, context: &[u32], max: usize) -> Result<Vec<u32>> {
         for n in (self.min_ngram..=self.max_ngram).rev() {
             if max == 0 || context.len() <= n {
                 continue;
@@ -114,10 +137,10 @@ impl Drafter for PromptLookup {
                 .find(|&i| &context[i..i + n] == tail)
             {
                 let from = at + n;
-                return context[from..(from + max).min(context.len())].to_vec();
+                return Ok(context[from..(from + max).min(context.len())].to_vec());
             }
         }
-        Vec::new()
+        Ok(Vec::new())
     }
 }
 
@@ -132,6 +155,9 @@ pub struct GenerationStats {
     pub prefill_secs: f64,
     /// Seconds spent generating.
     pub decode_secs: f64,
+    /// Of `decode_secs`, the seconds the drafter took (drafting and
+    /// observing).
+    pub draft_secs: f64,
     /// Decode passes run.
     pub passes: usize,
     /// Guesses verified.
@@ -151,6 +177,7 @@ pub struct AneLm {
     head_out: Vec<IoSurface>,
     /// `[vocab, dim]` fp16.
     embed: Vec<half::f16>,
+    taps: Vec<usize>,
 }
 
 impl AneLm {
@@ -214,22 +241,29 @@ impl AneLm {
         let layer_bytes = (2 * qd * d + 2 * kvd * d + 3 * h * d) * per_weight;
         let per_program = (opts.max_program_bytes / layer_bytes).clamp(1, n_layers);
         let started = Instant::now();
-        let layers = ExtendModel::compile(cfg.clone(), rope_theta, n_layers, per_program, |i| {
-            let t = |name: &str, n: usize| ckpt.f32(&format!("model.layers.{i}.{name}"), n);
-            Ok(LayerWeights {
-                rms_att: t("input_layernorm.weight", d)?,
-                wq: t("self_attn.q_proj.weight", qd * d)?,
-                wk: t("self_attn.k_proj.weight", kvd * d)?,
-                wv: t("self_attn.v_proj.weight", kvd * d)?,
-                wo: t("self_attn.o_proj.weight", d * qd)?,
-                q_norm: t("self_attn.q_norm.weight", hd)?,
-                k_norm: t("self_attn.k_norm.weight", hd)?,
-                rms_ffn: t("post_attention_layernorm.weight", d)?,
-                w_gate: t("mlp.gate_proj.weight", h * d)?,
-                w_up: t("mlp.up_proj.weight", h * d)?,
-                w_down: t("mlp.down_proj.weight", d * h)?,
-            })
-        })?;
+        let layers = ExtendModel::compile(
+            cfg.clone(),
+            rope_theta,
+            n_layers,
+            per_program,
+            &opts.taps,
+            |i| {
+                let t = |name: &str, n: usize| ckpt.f32(&format!("model.layers.{i}.{name}"), n);
+                Ok(LayerWeights {
+                    rms_att: t("input_layernorm.weight", d)?,
+                    wq: t("self_attn.q_proj.weight", qd * d)?,
+                    wk: t("self_attn.k_proj.weight", kvd * d)?,
+                    wv: t("self_attn.v_proj.weight", kvd * d)?,
+                    wo: t("self_attn.o_proj.weight", d * qd)?,
+                    q_norm: t("self_attn.q_norm.weight", hd)?,
+                    k_norm: t("self_attn.k_norm.weight", hd)?,
+                    rms_ffn: t("post_attention_layernorm.weight", d)?,
+                    w_gate: t("mlp.gate_proj.weight", h * d)?,
+                    w_up: t("mlp.up_proj.weight", h * d)?,
+                    w_down: t("mlp.down_proj.weight", d * h)?,
+                })
+            },
+        )?;
         tracing::info!(
             layers = n_layers,
             per_program,
@@ -248,6 +282,7 @@ impl AneLm {
             layers,
             head,
             embed,
+            taps: opts.taps.clone(),
         })
     }
 
@@ -332,6 +367,17 @@ impl AneLm {
         if prompt.is_empty() {
             return Err(MetalError::InvalidConfig("empty prompt".into()));
         }
+        drafter.reset();
+        // The drafter reads tapped layers only if the model was built with
+        // exactly those.
+        let tapping = !drafter.taps().is_empty();
+        if tapping && drafter.taps() != self.taps.as_slice() {
+            return Err(MetalError::InvalidConfig(format!(
+                "the drafter reads layers {:?}; the model was built tapping {:?}",
+                drafter.taps(),
+                self.taps
+            )));
+        }
         let max_new = opts
             .max_new
             .min(self.capacity().saturating_sub(prompt.len()));
@@ -349,6 +395,9 @@ impl AneLm {
             let logits = self.step(chunk)?;
             if i + 1 == chunks.len() {
                 next = pick(logits.row(chunk.len() - 1));
+            }
+            if tapping {
+                drafter.observe(&self.layers.tapped(0..chunk.len()), chunk.len())?;
             }
         }
         stats.prefill_secs = started.elapsed().as_secs_f64();
@@ -369,7 +418,9 @@ impl AneLm {
             // output past max_new.
             let room = (max_new - out.len()).min(self.capacity() - self.position() - 1);
             let mut feed = vec![next];
-            feed.extend(drafter.draft(&context, room.min(self.width() - 1)));
+            let drafting = Instant::now();
+            feed.extend(drafter.draft(&context, room.min(self.width() - 1))?);
+            stats.draft_secs += drafting.elapsed().as_secs_f64();
             let start = self.position();
             let logits = self.step(&feed)?;
             stats.passes += 1;
@@ -382,6 +433,11 @@ impl AneLm {
             }
             self.truncate(start + 1 + kept);
             stats.accepted_tokens += kept;
+            if tapping {
+                let observing = Instant::now();
+                drafter.observe(&self.layers.tapped(0..kept + 1), kept + 1)?;
+                stats.draft_secs += observing.elapsed().as_secs_f64();
+            }
             for &token in &feed[1..=kept] {
                 out.push(token);
                 context.push(token);

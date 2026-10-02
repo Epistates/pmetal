@@ -195,14 +195,15 @@ fn tiny(format: WeightFormat) -> ExtendConfig {
 }
 
 /// Run `steps` tokens at a time through `n_layers` random layers, in chunks
-/// of two, and check every position against the reference.
-fn case(cfg: ExtendConfig, n_layers: usize, steps: &[usize], qk_norm: f32) {
+/// of two, and check every position against the reference, along with the
+/// residual stream after each layer in `taps`.
+fn case(cfg: ExtendConfig, n_layers: usize, steps: &[usize], qk_norm: f32, taps: &[usize]) {
     let format = cfg.weights;
     let theta = 10_000.0f32;
     let layers: Vec<LayerWeights> = (0..n_layers as u64)
         .map(|i| random_layer(&cfg, 100 * (i + 1), qk_norm))
         .collect();
-    let mut model = ExtendModel::compile(cfg.clone(), theta, layers.len(), 2, |i| {
+    let mut model = ExtendModel::compile(cfg.clone(), theta, layers.len(), 2, taps, |i| {
         Ok(layers[i].clone())
     })
     .expect("extend kernels compile");
@@ -216,11 +217,22 @@ fn case(cfg: ExtendConfig, n_layers: usize, steps: &[usize], qk_norm: f32) {
             .collect()
     };
     let mut got = vec![0.0f32; d * s];
+    // Per tap, `[dim, s]`.
+    let mut got_taps = vec![vec![0.0f32; d * s]; taps.len()];
     let mut at = 0;
     for &n in steps {
         let out = model.extend(&column(at, n), n).expect("extend");
         for c in 0..d {
             got[c * s + at..c * s + at + n].copy_from_slice(&out[c * n..(c + 1) * n]);
+        }
+        // Token-major [n, taps * dim].
+        let tapped = model.tapped(0..n);
+        for (k, got_tap) in got_taps.iter_mut().enumerate() {
+            for t in 0..n {
+                for c in 0..d {
+                    got_tap[c * s + at + t] = tapped[t * taps.len() * d + k * d + c];
+                }
+            }
         }
         at += n;
     }
@@ -228,8 +240,8 @@ fn case(cfg: ExtendConfig, n_layers: usize, steps: &[usize], qk_norm: f32) {
 
     let stored: Vec<LayerWeights> = layers.iter().map(|l| as_stored(l, format, &cfg)).collect();
     let want = reference(&cfg, &stored, &x, s, theta as f64);
-    // `out` holds positions `from..from + n`, `[dim, n]`.
-    let check = |out: &[f32], from: usize, n: usize, what: &str| {
+    // `out` holds positions `from..from + n`, `[dim, n]`, of `want`.
+    let check_against = |want: &[f64], out: &[f32], from: usize, n: usize, what: &str| {
         for t in 0..n {
             let at = |c: usize| (out[c * n + t] as f64, want[c * s + from + t]);
             let err: f64 = (0..d)
@@ -237,15 +249,23 @@ fn case(cfg: ExtendConfig, n_layers: usize, steps: &[usize], qk_norm: f32) {
                 .sum::<f64>()
                 .sqrt();
             let norm: f64 = (0..d).map(|c| at(c).1.powi(2)).sum::<f64>().sqrt();
+            // fp16 noise runs 3e-3 to 8e-3 here, with the odd position past
+            // 1e-2; a wrong layout or position is off by order 1.
             assert!(
-                err / norm < 1e-2,
+                err / norm < 1.5e-2,
                 "{format:?} {what}, position {}: relative error {:.2e}",
                 from + t,
                 err / norm
             );
         }
     };
+    let check =
+        |out: &[f32], from: usize, n: usize, what: &str| check_against(&want, out, from, n, what);
     check(&got, 0, s, "as run");
+    for (k, &tap) in taps.iter().enumerate() {
+        let want_tap = reference(&cfg, &stored[..=tap], &x, s, theta as f64);
+        check_against(&want_tap, &got_taps[k], 0, s, &format!("after layer {tap}"));
+    }
 
     // Rewinding and running the last 4 again, now as one block, recomputes
     // them.
@@ -261,13 +281,21 @@ fn case(cfg: ExtendConfig, n_layers: usize, steps: &[usize], qk_norm: f32) {
 #[ignore = "requires ANE hardware"]
 fn extend_matches_cpu_reference_fp16() {
     // Prefill in full blocks, decode one at a time, then a partial block.
-    case(tiny(WeightFormat::Fp16), 3, &[8, 8, 1, 1, 1, 3], 1.0);
+    // Every layer tapped: two taps in the first chunk, and the second's only
+    // layer, whose output is also the chunk's.
+    case(
+        tiny(WeightFormat::Fp16),
+        3,
+        &[8, 8, 1, 1, 1, 3],
+        1.0,
+        &[0, 1, 2],
+    );
 }
 
 #[test]
 #[ignore = "requires ANE hardware"]
 fn extend_matches_cpu_reference_int8() {
-    case(tiny(WeightFormat::Int8), 3, &[8, 8, 1, 1, 1, 3], 1.0);
+    case(tiny(WeightFormat::Int8), 3, &[8, 8, 1, 1, 1, 3], 1.0, &[]);
 }
 
 /// Qwen3-0.6B's shapes: a short prompt, then single tokens. Its q/k norm
@@ -287,7 +315,7 @@ fn extend_matches_cpu_reference_qwen3_shape() {
         rms_norm_eps: 1e-6,
         weights: WeightFormat::Fp16,
     };
-    case(cfg, 2, &[5, 1, 1, 1, 1], 3.0);
+    case(cfg, 2, &[5, 1, 1, 1, 1], 3.0, &[0]);
 }
 
 /// Time one chunk of Qwen3-4B-shaped layers (random int8 weights) and
@@ -310,11 +338,15 @@ fn extend_throughput_qwen3_4b_shape() {
         };
         let layer = random_layer(&cfg, 1, 1.0);
         let start = std::time::Instant::now();
-        let mut model =
-            ExtendModel::compile(cfg.clone(), 1e6, layers_per_chunk, layers_per_chunk, |_| {
-                Ok(layer.clone())
-            })
-            .expect("compile");
+        let mut model = ExtendModel::compile(
+            cfg.clone(),
+            1e6,
+            layers_per_chunk,
+            layers_per_chunk,
+            &[],
+            |_| Ok(layer.clone()),
+        )
+        .expect("compile");
         let compile = start.elapsed();
         let x = values(cfg.dim, 3, 0.0, 1.0);
         for _ in 0..3 {

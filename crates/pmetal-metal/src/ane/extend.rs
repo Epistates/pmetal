@@ -14,6 +14,7 @@
 //! inputs   a_x [1,D,1,W]  b_cos, c_sin [1,hd/2,1,W]  d_mask [1,1,1,L]
 //!          k_NN [1,n_kv,hd,L], v_NN [1,n_kv,L,hd]  (the cache, per layer)
 //! outputs  o_kv [1, layers*2*kv_dim, 1, W]  (each layer's new K, V)
+//!          o_t  [1, taps*D, 1, W]            (after tapped layers, if any)
 //!          o_x  [1,D,1,W]                    (the residual stream after)
 //! ```
 //!
@@ -183,12 +184,26 @@ fn cache_input(kind: char, i: usize) -> String {
 }
 
 /// Generate the extend kernel for `layers`, consecutive layers of the model.
-pub fn gen_extend_chunk(cfg: &ExtendConfig, layers: &[LayerTensors<'_>]) -> Result<KernelOutput> {
+///
+/// `taps` (ascending indices into `layers`) adds an output `o_t`,
+/// `[1, taps*D, 1, W]`: the residual stream after each tapped layer, for a
+/// drafter that reads the model's hidden states.
+pub fn gen_extend_chunk(
+    cfg: &ExtendConfig,
+    layers: &[LayerTensors<'_>],
+    taps: &[usize],
+) -> Result<KernelOutput> {
     cfg.validate()?;
     if layers.is_empty() || layers.len() > 100 {
         return Err(MetalError::InvalidConfig(
             "extend kernel: a chunk holds 1 to 100 layers".into(),
         ));
+    }
+    if !taps.is_sorted_by(|a, b| a < b) || taps.last().is_some_and(|&t| t >= layers.len()) {
+        return Err(MetalError::InvalidConfig(format!(
+            "extend kernel: taps {taps:?} must ascend within the chunk's {} layers",
+            layers.len()
+        )));
     }
     let (d, w, l) = (cfg.dim, cfg.width, cfg.capacity);
     let (kvd, half) = (cfg.kv_dim(), cfg.head_dim / 2);
@@ -238,25 +253,43 @@ pub fn gen_extend_chunk(cfg: &ExtendConfig, layers: &[LayerTensors<'_>]) -> Resu
 
     let mut x = "a_x".to_string();
     let mut kv_taps = Vec::with_capacity(2 * layers.len());
+    let mut hidden_taps = Vec::with_capacity(taps.len());
     for (i, layer) in layers.iter().enumerate() {
         let (x_next, k_tap, v_tap) = emit_layer(&mut p, &mut weights, cfg, i, layer, &x);
         x = x_next;
         kv_taps.push(k_tap);
         kv_taps.push(v_tap);
+        if taps.contains(&i) {
+            hidden_taps.push(x.clone());
+        }
     }
 
-    let taps: Vec<&str> = kv_taps.iter().map(String::as_str).collect();
+    let kv: Vec<&str> = kv_taps.iter().map(String::as_str).collect();
     p.emit_concat(
         "o_kv",
         &[1, 2 * kvd * layers.len(), 1, w],
         "cat1",
         "tf",
-        &taps,
+        &kv,
     );
-    // An output can't be an input, so even a no-op chunk produces a new x.
+    // An output can't be an input or another output, so a single tap and the
+    // final x are copies.
     p.emit_scalar_const("one", "fp16", "1.0");
+    let mut outputs = vec!["o_kv"];
+    match hidden_taps.as_slice() {
+        [] => {}
+        [only] => p.emit_mul("o_t", &[1, d, 1, w], only, "one"),
+        many => {
+            let many: Vec<&str> = many.iter().map(String::as_str).collect();
+            p.emit_concat("o_t", &[1, d * many.len(), 1, w], "cat1", "tf", &many);
+        }
+    }
+    if !hidden_taps.is_empty() {
+        outputs.push("o_t");
+    }
     p.emit_mul("o_x", &[1, d, 1, w], &x, "one");
-    let mil_text = p.finalize_multi(&["o_kv", "o_x"]);
+    outputs.push("o_x");
+    let mil_text = p.finalize_multi(&outputs);
 
     Ok(KernelOutput {
         mil_text,
@@ -657,6 +690,11 @@ struct Chunk {
     layers: Range<usize>,
     /// The chunk's new K/V, `[layers * 2 * kv_dim, W]`.
     kv_out: IoSurface,
+    /// The residual stream after the chunk's tapped layers, `[taps * dim,
+    /// W]`, when it has any.
+    tap_out: Option<IoSurface>,
+    /// How many of the model's taps fall in this chunk.
+    taps: usize,
 }
 
 /// A model's layers compiled into extend kernels, with its KV cache.
@@ -665,10 +703,16 @@ struct Chunk {
 /// every layer, appends their keys and values to the cache, and returns the
 /// residual stream after the last layer. Embedding, final norm and logits are
 /// the caller's.
+///
+/// Built with taps, it also keeps the residual stream after each tapped layer
+/// from the last call, for [`tapped`](Self::tapped).
 pub struct ExtendModel {
     cfg: ExtendConfig,
     rope_theta: f32,
     chunks: Vec<Chunk>,
+    n_taps: usize,
+    /// Tokens in the last call.
+    last_n: usize,
     k_cache: Vec<IoSurface>,
     v_cache: Vec<IoSurface>,
     /// The residual stream, ping-ponged between chunks.
@@ -681,15 +725,22 @@ pub struct ExtendModel {
 
 impl ExtendModel {
     /// Compile `n_layers` layers in chunks of at most `layers_per_chunk`,
-    /// getting each layer's weights from `layer`.
+    /// getting each layer's weights from `layer`, and keep the residual
+    /// stream after each layer in `taps` (ascending).
     pub fn compile(
         cfg: ExtendConfig,
         rope_theta: f32,
         n_layers: usize,
         layers_per_chunk: usize,
+        taps: &[usize],
         mut layer: impl FnMut(usize) -> Result<LayerWeights>,
     ) -> Result<Self> {
         cfg.validate()?;
+        if !taps.is_sorted_by(|a, b| a < b) || taps.last().is_some_and(|&t| t >= n_layers) {
+            return Err(MetalError::InvalidConfig(format!(
+                "taps {taps:?} must ascend within the model's {n_layers} layers"
+            )));
+        }
         let rt = AneRuntime::global()?;
         let (d, w, l, kvd) = (cfg.dim, cfg.width, cfg.capacity, cfg.kv_dim());
         let per_chunk = layers_per_chunk.max(1);
@@ -698,13 +749,24 @@ impl ExtendModel {
             let range = start..(start + per_chunk).min(n_layers);
             let owned = range.clone().map(&mut layer).collect::<Result<Vec<_>>>()?;
             let tensors: Vec<LayerTensors<'_>> = owned.iter().map(LayerWeights::tensors).collect();
-            let kernel = gen_extend_chunk(&cfg, &tensors)?;
+            let local: Vec<usize> = taps
+                .iter()
+                .filter(|t| range.contains(t))
+                .map(|t| t - range.start)
+                .collect();
+            let kernel = gen_extend_chunk(&cfg, &tensors, &local)?;
             drop(tensors);
             drop(owned);
             let model = rt.compile(kernel.mil_text.as_bytes(), Some(&kernel.weights))?;
             chunks.push(Chunk {
                 model,
                 kv_out: IoSurface::for_tensor(2 * kvd * range.len(), w)?,
+                tap_out: if local.is_empty() {
+                    None
+                } else {
+                    Some(IoSurface::for_tensor(d * local.len(), w)?)
+                },
+                taps: local.len(),
                 layers: range,
             });
         }
@@ -719,6 +781,8 @@ impl ExtendModel {
             cfg,
             rope_theta,
             chunks,
+            n_taps: taps.len(),
+            last_n: 0,
             pos: 0,
         })
     }
@@ -791,9 +855,10 @@ impl ExtendModel {
             ];
             inputs.extend(chunk.layers.clone().map(|i| self.k_cache[i].as_ptr()));
             inputs.extend(chunk.layers.clone().map(|i| self.v_cache[i].as_ptr()));
-            chunk
-                .model
-                .evaluate(&inputs, &[chunk.kv_out.as_ptr(), self.x[1 - cur].as_ptr()])?;
+            let mut outputs = vec![chunk.kv_out.as_ptr()];
+            outputs.extend(chunk.tap_out.as_ref().map(IoSurface::as_ptr));
+            outputs.push(self.x[1 - cur].as_ptr());
+            chunk.model.evaluate(&inputs, &outputs)?;
             cur = 1 - cur;
 
             // Append this chunk's new keys and values at pos..pos + n. The taps
@@ -821,6 +886,7 @@ impl ExtendModel {
             });
         }
         self.pos += n;
+        self.last_n = n;
 
         let mut out = vec![0.0f32; d * w];
         self.x[cur].read_fp16_as_f32(&mut out, 0, d, w);
@@ -829,6 +895,40 @@ impl ExtendModel {
             hidden[c * n..(c + 1) * n].copy_from_slice(&out[c * w..c * w + n]);
         }
         Ok(hidden)
+    }
+
+    /// Layers tapped.
+    pub fn n_taps(&self) -> usize {
+        self.n_taps
+    }
+
+    /// The residual stream after each tapped layer for `tokens` of the last
+    /// [`extend`](Self::extend) call, token-major: `[tokens.len(), taps * dim]`,
+    /// the taps in layer order.
+    pub fn tapped(&self, tokens: Range<usize>) -> Vec<f32> {
+        assert!(
+            tokens.end <= self.last_n,
+            "tokens {tokens:?} of the last call's {}",
+            self.last_n
+        );
+        let (d, w) = (self.cfg.dim, self.cfg.width);
+        let row = self.n_taps * d;
+        let mut out = vec![0.0f32; tokens.len() * row];
+        let mut base = 0;
+        for chunk in &self.chunks {
+            let Some(surface) = &chunk.tap_out else {
+                continue;
+            };
+            surface.with_fp16(|bits| {
+                for ch in 0..chunk.taps * d {
+                    for (r, t) in tokens.clone().enumerate() {
+                        out[r * row + base + ch] = half::f16::from_bits(bits[ch * w + t]).to_f32();
+                    }
+                }
+            });
+            base += chunk.taps * d;
+        }
+        out
     }
 }
 
@@ -869,7 +969,7 @@ mod tests {
             w_up: &w,
             w_down: &w,
         };
-        let out = gen_extend_chunk(&cfg, &[t]).unwrap();
+        let out = gen_extend_chunk(&cfg, std::slice::from_ref(&t), &[]).unwrap();
         let sig = out
             .mil_text
             .lines()
@@ -883,6 +983,11 @@ mod tests {
         assert_eq!(names, ["a_x", "b_cos", "c_sin", "d_mask", "k_00", "v_00"]);
         assert!(out.mil_text.contains("constexpr_blockwise_shift_scale"));
         assert!(out.mil_text.contains("} -> (o_kv, o_x);"));
+
+        // Taps add o_t, which binds between the two.
+        let tapped = gen_extend_chunk(&cfg, std::slice::from_ref(&t), &[0]).unwrap();
+        assert!(tapped.mil_text.contains("} -> (o_kv, o_t, o_x);"));
+        assert!(gen_extend_chunk(&cfg, std::slice::from_ref(&t), &[1]).is_err());
     }
 
     #[test]
