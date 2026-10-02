@@ -40,6 +40,8 @@
 //! - [`inference`]: Forward-only ANE inference engine with autoregressive generation
 //! - [`extend`]: Multi-layer inference kernels over an IOSurface KV cache, one
 //!   family for prefill, decode and speculative verification
+//! - [`lm`]: Text generation from a Hugging Face checkpoint on the extend
+//!   kernels
 
 pub(crate) mod checkpoint;
 pub mod dynamic_kernel;
@@ -49,6 +51,7 @@ pub mod inference;
 pub mod inference_hybrid;
 pub mod iosurface;
 pub mod kernel;
+pub mod lm;
 pub mod loss;
 pub mod mil;
 pub mod pipeline;

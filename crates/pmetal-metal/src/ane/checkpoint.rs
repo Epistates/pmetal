@@ -9,7 +9,8 @@
 //! used to load anyway and compute a different function with no error (#34),
 //! as did one whose tensors failed to convert or had the wrong size.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::error::{MetalError, Result};
 
@@ -54,8 +55,104 @@ fn bytes_to_f32(dtype: safetensors::Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
     })
 }
 
+/// A safetensors checkpoint (one file, or shards with an index), read one
+/// tensor at a time: an engine that builds a layer at a time never holds the
+/// whole model as f32.
+pub(crate) struct Checkpoint {
+    files: Vec<(PathBuf, memmap2::Mmap, usize)>,
+    /// Tensor name to (file, metadata).
+    index: HashMap<String, (usize, safetensors::tensor::TensorInfo)>,
+}
+
+impl Checkpoint {
+    /// Open the checkpoint in `dir` (or the single file `dir`).
+    pub(crate) fn open(dir: &Path) -> Result<Self> {
+        let bad = |what: String| MetalError::InvalidConfig(what);
+        let paths = if dir.is_file() {
+            vec![dir.to_path_buf()]
+        } else if dir.join("model.safetensors.index.json").exists() {
+            let text = std::fs::read_to_string(dir.join("model.safetensors.index.json"))
+                .map_err(|e| bad(format!("model.safetensors.index.json: {e}")))?;
+            let index: serde_json::Value = serde_json::from_str(&text)
+                .map_err(|e| bad(format!("model.safetensors.index.json: {e}")))?;
+            let mut shards: Vec<String> = index["weight_map"]
+                .as_object()
+                .ok_or_else(|| bad("model.safetensors.index.json has no weight_map".into()))?
+                .values()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect();
+            shards.sort();
+            shards.dedup();
+            shards.into_iter().map(|f| dir.join(f)).collect()
+        } else {
+            vec![dir.join("model.safetensors")]
+        };
+
+        let mut files = Vec::with_capacity(paths.len());
+        let mut index = HashMap::new();
+        for (i, path) in paths.into_iter().enumerate() {
+            let file =
+                std::fs::File::open(&path).map_err(|e| bad(format!("{}: {e}", path.display())))?;
+            #[allow(unsafe_code)]
+            // SAFETY: the file is opened read-only, and a checkpoint isn't
+            // rewritten while a model loads from it.
+            let mmap = unsafe { memmap2::Mmap::map(&file) }
+                .map_err(|e| bad(format!("{}: {e}", path.display())))?;
+            let (header_len, metadata) = safetensors::SafeTensors::read_metadata(&mmap)
+                .map_err(|e| bad(format!("{}: {e}", path.display())))?;
+            for (name, info) in metadata.tensors() {
+                index.insert(name, (i, info.clone()));
+            }
+            files.push((path, mmap, 8 + header_len));
+        }
+        Ok(Self { files, index })
+    }
+
+    /// Whether the checkpoint has `name`.
+    pub(crate) fn contains(&self, name: &str) -> bool {
+        self.index.contains_key(name)
+    }
+
+    /// `name` as f32, which must have `expected` elements.
+    pub(crate) fn f32(&self, name: &str, expected: usize) -> Result<Vec<f32>> {
+        let (file, info) = self
+            .index
+            .get(name)
+            .ok_or_else(|| MetalError::InvalidConfig(format!("checkpoint has no tensor {name}")))?;
+        let (path, mmap, data_start) = &self.files[*file];
+        let (start, end) = info.data_offsets;
+        let bytes = mmap
+            .get(data_start + start..data_start + end)
+            .ok_or_else(|| {
+                MetalError::InvalidConfig(format!("{name} runs past the end of {}", path.display()))
+            })?;
+        let data = bytes_to_f32(info.dtype, bytes).map_err(|e| {
+            MetalError::InvalidConfig(format!(
+                "{name}: {e} (the ANE engines read f32, f16 and bf16 weights only)"
+            ))
+        })?;
+        if data.len() != expected {
+            return Err(MetalError::InvalidConfig(format!(
+                "{name} has {} elements; the ANE engine expects {expected}",
+                data.len()
+            )));
+        }
+        Ok(data)
+    }
+}
+
 /// Config limits both engines share. `engine` names the caller in errors.
 pub(crate) fn check_shared_limits(
+    config: &serde_json::Value,
+    engine: &str,
+) -> std::result::Result<(), String> {
+    check_architecture_limits(config, engine)?;
+    check_tied_embeddings(config, engine)
+}
+
+/// What no ANE engine implements: routed experts, `rope_scaling`, sliding
+/// windows, attention or MLP biases.
+pub(crate) fn check_architecture_limits(
     config: &serde_json::Value,
     engine: &str,
 ) -> std::result::Result<(), String> {
@@ -88,8 +185,16 @@ pub(crate) fn check_shared_limits(
             ));
         }
     }
+    Ok(())
+}
+
+/// The older engines take logits from the embedding matrix.
+fn check_tied_embeddings(
+    config: &serde_json::Value,
+    engine: &str,
+) -> std::result::Result<(), String> {
     // Hugging Face defaults tie_word_embeddings to true when absent.
-    if flag("tie_word_embeddings") == Some(false) {
+    if config.get("tie_word_embeddings").and_then(|v| v.as_bool()) == Some(false) {
         return Err(format!(
             "The ANE {engine} engine takes logits from the embedding matrix, so a model \
              with a separate lm_head (tie_word_embeddings: false) is not supported."

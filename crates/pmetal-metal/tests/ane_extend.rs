@@ -4,7 +4,7 @@
 
 #![cfg(target_os = "macos")]
 
-use pmetal_metal::ane::extend::{ExtendConfig, ExtendModel, LayerTensors, WeightFormat};
+use pmetal_metal::ane::extend::{ExtendConfig, ExtendModel, LayerWeights, WeightFormat};
 use pmetal_metal::ane::kernel::quantize_int8_rows;
 
 /// `n` values in `[-spread, spread]` from a Knuth LCG.
@@ -21,95 +21,68 @@ fn values(n: usize, seed: u64, center: f32, spread: f32) -> Vec<f32> {
         .collect()
 }
 
-struct Layer {
-    rms_att: Vec<f32>,
-    wq: Vec<f32>,
-    wk: Vec<f32>,
-    wv: Vec<f32>,
-    wo: Vec<f32>,
-    q_norm: Vec<f32>,
-    k_norm: Vec<f32>,
-    rms_ffn: Vec<f32>,
-    w_gate: Vec<f32>,
-    w_up: Vec<f32>,
-    w_down: Vec<f32>,
+/// Random weights for one layer, big enough that attention depends on
+/// position. `qk_norm` centers the q/k norm weights, which set how large the
+/// attention scores get.
+fn random_layer(cfg: &ExtendConfig, seed: u64, qk_norm: f32) -> LayerWeights {
+    let (d, h, qd, kvd, hd) = (
+        cfg.dim,
+        cfg.hidden_dim,
+        cfg.q_dim(),
+        cfg.kv_dim(),
+        cfg.head_dim,
+    );
+    LayerWeights {
+        rms_att: values(d, seed, 1.0, 0.2),
+        wq: values(qd * d, seed + 1, 0.0, 0.5),
+        wk: values(kvd * d, seed + 2, 0.0, 0.5),
+        wv: values(kvd * d, seed + 3, 0.0, 0.3),
+        wo: values(d * qd, seed + 4, 0.0, 0.2),
+        q_norm: values(hd, seed + 5, qk_norm, 0.3),
+        k_norm: values(hd, seed + 6, qk_norm, 0.3),
+        rms_ffn: values(d, seed + 7, 1.0, 0.2),
+        w_gate: values(h * d, seed + 8, 0.0, 0.2),
+        w_up: values(h * d, seed + 9, 0.0, 0.2),
+        w_down: values(d * h, seed + 10, 0.0, 0.2),
+    }
 }
 
-impl Layer {
-    fn random(cfg: &ExtendConfig, seed: u64) -> Self {
-        let (d, h, qd, kvd, hd) = (
-            cfg.dim,
-            cfg.hidden_dim,
-            cfg.q_dim(),
-            cfg.kv_dim(),
-            cfg.head_dim,
-        );
-        Self {
-            rms_att: values(d, seed, 1.0, 0.2),
-            // Big enough that attention depends on position.
-            wq: values(qd * d, seed + 1, 0.0, 0.5),
-            wk: values(kvd * d, seed + 2, 0.0, 0.5),
-            wv: values(kvd * d, seed + 3, 0.0, 0.3),
-            wo: values(d * qd, seed + 4, 0.0, 0.2),
-            q_norm: values(hd, seed + 5, 1.0, 0.3),
-            k_norm: values(hd, seed + 6, 1.0, 0.3),
-            rms_ffn: values(d, seed + 7, 1.0, 0.2),
-            w_gate: values(h * d, seed + 8, 0.0, 0.2),
-            w_up: values(h * d, seed + 9, 0.0, 0.2),
-            w_down: values(d * h, seed + 10, 0.0, 0.2),
-        }
-    }
-
-    fn tensors(&self) -> LayerTensors<'_> {
-        LayerTensors {
-            rms_att: &self.rms_att,
-            wq: &self.wq,
-            wk: &self.wk,
-            wv: &self.wv,
-            wo: &self.wo,
-            q_norm: &self.q_norm,
-            k_norm: &self.k_norm,
-            rms_ffn: &self.rms_ffn,
-            w_gate: &self.w_gate,
-            w_up: &self.w_up,
-            w_down: &self.w_down,
-        }
-    }
-
-    /// The projection weights the kernel computes with.
-    fn as_stored(&self, format: WeightFormat, cfg: &ExtendConfig) -> Self {
-        let (d, h, qd, kvd) = (cfg.dim, cfg.hidden_dim, cfg.q_dim(), cfg.kv_dim());
-        let stored = |w: &[f32], rows: usize, cols: usize| -> Vec<f32> {
-            match format {
-                WeightFormat::Fp16 => w.iter().map(|&x| half::f16::from_f32(x).to_f32()).collect(),
-                WeightFormat::Int8 => {
-                    let (q, s) = quantize_int8_rows(w, rows, cols);
-                    q.iter()
-                        .enumerate()
-                        .map(|(i, &v)| v as f32 * s[i / cols].to_f32())
-                        .collect()
-                }
+/// The projection weights the kernel computes with.
+fn as_stored(layer: &LayerWeights, format: WeightFormat, cfg: &ExtendConfig) -> LayerWeights {
+    let (d, h, qd, kvd) = (cfg.dim, cfg.hidden_dim, cfg.q_dim(), cfg.kv_dim());
+    let stored = |w: &[f32], rows: usize, cols: usize| -> Vec<f32> {
+        match format {
+            WeightFormat::Fp16 => w.iter().map(|&x| half::f16::from_f32(x).to_f32()).collect(),
+            WeightFormat::Int8 => {
+                let (q, s) = quantize_int8_rows(w, rows, cols);
+                q.iter()
+                    .enumerate()
+                    .map(|(i, &v)| v as f32 * s[i / cols].to_f32())
+                    .collect()
             }
-        };
-        Self {
-            rms_att: self.rms_att.clone(),
-            wq: stored(&self.wq, qd, d),
-            wk: stored(&self.wk, kvd, d),
-            wv: stored(&self.wv, kvd, d),
-            wo: stored(&self.wo, d, qd),
-            q_norm: self.q_norm.clone(),
-            k_norm: self.k_norm.clone(),
-            rms_ffn: self.rms_ffn.clone(),
-            w_gate: stored(&self.w_gate, h, d),
-            w_up: stored(&self.w_up, h, d),
-            w_down: stored(&self.w_down, d, h),
         }
+    };
+    LayerWeights {
+        wq: stored(&layer.wq, qd, d),
+        wk: stored(&layer.wk, kvd, d),
+        wv: stored(&layer.wv, kvd, d),
+        wo: stored(&layer.wo, d, qd),
+        w_gate: stored(&layer.w_gate, h, d),
+        w_up: stored(&layer.w_up, h, d),
+        w_down: stored(&layer.w_down, d, h),
+        ..layer.clone()
     }
 }
 
 /// The residual stream after every layer for `x`, `[dim, s]` channel-first,
 /// computed causally over all `s` positions in f64.
-fn reference(cfg: &ExtendConfig, layers: &[Layer], x: &[f32], s: usize, theta: f64) -> Vec<f64> {
+fn reference(
+    cfg: &ExtendConfig,
+    layers: &[LayerWeights],
+    x: &[f32],
+    s: usize,
+    theta: f64,
+) -> Vec<f64> {
     let (d, h, nh, nkv, hd) = (
         cfg.dim,
         cfg.hidden_dim,
@@ -204,8 +177,9 @@ fn reference(cfg: &ExtendConfig, layers: &[Layer], x: &[f32], s: usize, theta: f
     x
 }
 
-fn case(format: WeightFormat) {
-    let cfg = ExtendConfig {
+/// A small model: three layers in two chunks.
+fn tiny(format: WeightFormat) -> ExtendConfig {
+    ExtendConfig {
         dim: 64,
         hidden_dim: 128,
         n_heads: 4,
@@ -217,16 +191,22 @@ fn case(format: WeightFormat) {
         capacity: 64,
         rms_norm_eps: 1e-6,
         weights: format,
-    };
+    }
+}
+
+/// Run `steps` tokens at a time through `n_layers` random layers, in chunks
+/// of two, and check every position against the reference.
+fn case(cfg: ExtendConfig, n_layers: usize, steps: &[usize], qk_norm: f32) {
+    let format = cfg.weights;
     let theta = 10_000.0f32;
-    let layers: Vec<Layer> = (0..3).map(|i| Layer::random(&cfg, 100 * (i + 1))).collect();
+    let layers: Vec<LayerWeights> = (0..n_layers as u64)
+        .map(|i| random_layer(&cfg, 100 * (i + 1), qk_norm))
+        .collect();
     let mut model = ExtendModel::compile(cfg.clone(), theta, layers.len(), 2, |i| {
-        Ok(layers[i].tensors())
+        Ok(layers[i].clone())
     })
     .expect("extend kernels compile");
 
-    // Prefill in full blocks, decode one at a time, then a partial block.
-    let steps = [8usize, 8, 1, 1, 1, 3];
     let s: usize = steps.iter().sum();
     let d = cfg.dim;
     let x = values(d * s, 7, 0.0, 1.0);
@@ -237,7 +217,7 @@ fn case(format: WeightFormat) {
     };
     let mut got = vec![0.0f32; d * s];
     let mut at = 0;
-    for &n in &steps {
+    for &n in steps {
         let out = model.extend(&column(at, n), n).expect("extend");
         for c in 0..d {
             got[c * s + at..c * s + at + n].copy_from_slice(&out[c * n..(c + 1) * n]);
@@ -246,7 +226,7 @@ fn case(format: WeightFormat) {
     }
     assert_eq!(model.position(), s);
 
-    let stored: Vec<Layer> = layers.iter().map(|l| l.as_stored(format, &cfg)).collect();
+    let stored: Vec<LayerWeights> = layers.iter().map(|l| as_stored(l, format, &cfg)).collect();
     let want = reference(&cfg, &stored, &x, s, theta as f64);
     // `out` holds positions `from..from + n`, `[dim, n]`.
     let check = |out: &[f32], from: usize, n: usize, what: &str| {
@@ -267,24 +247,47 @@ fn case(format: WeightFormat) {
     };
     check(&got, 0, s, "as run");
 
-    // Rewinding and running the tail again, now as one block, recomputes it.
-    model.truncate(17);
+    // Rewinding and running the last 4 again, now as one block, recomputes
+    // them.
+    let from = s - 4;
+    model.truncate(from);
     let again = model
-        .extend(&column(17, 4), 4)
+        .extend(&column(from, 4), 4)
         .expect("extend after truncate");
-    check(&again, 17, 4, "after truncate");
+    check(&again, from, 4, "after truncate");
 }
 
 #[test]
 #[ignore = "requires ANE hardware"]
 fn extend_matches_cpu_reference_fp16() {
-    case(WeightFormat::Fp16);
+    // Prefill in full blocks, decode one at a time, then a partial block.
+    case(tiny(WeightFormat::Fp16), 3, &[8, 8, 1, 1, 1, 3], 1.0);
 }
 
 #[test]
 #[ignore = "requires ANE hardware"]
 fn extend_matches_cpu_reference_int8() {
-    case(WeightFormat::Int8);
+    case(tiny(WeightFormat::Int8), 3, &[8, 8, 1, 1, 1, 3], 1.0);
+}
+
+/// Qwen3-0.6B's shapes: a short prompt, then single tokens. Its q/k norm
+/// weights put attention scores in the tens, as a real model's are: past
+/// ~11, where exp overflows fp16, the ANE's reduce_log_sum_exp broke decode.
+#[test]
+#[ignore = "requires ANE hardware"]
+fn extend_matches_cpu_reference_qwen3_shape() {
+    let cfg = ExtendConfig {
+        dim: 1024,
+        hidden_dim: 3072,
+        n_heads: 16,
+        n_kv_heads: 8,
+        head_dim: 128,
+        width: 32,
+        capacity: 512,
+        rms_norm_eps: 1e-6,
+        weights: WeightFormat::Fp16,
+    };
+    case(cfg, 2, &[5, 1, 1, 1, 1], 3.0);
 }
 
 /// Time one chunk of Qwen3-4B-shaped layers (random int8 weights) and
@@ -305,11 +308,11 @@ fn extend_throughput_qwen3_4b_shape() {
             rms_norm_eps: 1e-6,
             weights: WeightFormat::Int8,
         };
-        let layer = Layer::random(&cfg, 1);
+        let layer = random_layer(&cfg, 1, 1.0);
         let start = std::time::Instant::now();
         let mut model =
             ExtendModel::compile(cfg.clone(), 1e6, layers_per_chunk, layers_per_chunk, |_| {
-                Ok(layer.tensors())
+                Ok(layer.clone())
             })
             .expect("compile");
         let compile = start.elapsed();

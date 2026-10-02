@@ -125,6 +125,53 @@ pub struct LayerTensors<'a> {
     pub w_down: &'a [f32],
 }
 
+/// One layer's weights, owned: what [`ExtendModel::compile`] asks for a layer
+/// at a time, so a model is never held whole as f32.
+#[derive(Clone)]
+pub struct LayerWeights {
+    /// Attention input RMSNorm, `[dim]`.
+    pub rms_att: Vec<f32>,
+    /// Query projection, `[q_dim, dim]`.
+    pub wq: Vec<f32>,
+    /// Key projection, `[kv_dim, dim]`.
+    pub wk: Vec<f32>,
+    /// Value projection, `[kv_dim, dim]`.
+    pub wv: Vec<f32>,
+    /// Output projection, `[dim, q_dim]`.
+    pub wo: Vec<f32>,
+    /// Per-head query RMSNorm, `[head_dim]`.
+    pub q_norm: Vec<f32>,
+    /// Per-head key RMSNorm, `[head_dim]`.
+    pub k_norm: Vec<f32>,
+    /// FFN input RMSNorm, `[dim]`.
+    pub rms_ffn: Vec<f32>,
+    /// Gate projection, `[hidden, dim]`.
+    pub w_gate: Vec<f32>,
+    /// Up projection, `[hidden, dim]`.
+    pub w_up: Vec<f32>,
+    /// Down projection, `[dim, hidden]`.
+    pub w_down: Vec<f32>,
+}
+
+impl LayerWeights {
+    /// Borrow as the kernel generator's input.
+    pub fn tensors(&self) -> LayerTensors<'_> {
+        LayerTensors {
+            rms_att: &self.rms_att,
+            wq: &self.wq,
+            wk: &self.wk,
+            wv: &self.wv,
+            wo: &self.wo,
+            q_norm: &self.q_norm,
+            k_norm: &self.k_norm,
+            rms_ffn: &self.rms_ffn,
+            w_gate: &self.w_gate,
+            w_up: &self.w_up,
+            w_down: &self.w_down,
+        }
+    }
+}
+
 /// The name of layer `i`'s (within its chunk) cache input for `kind` (`k` or
 /// `v`). Zero-padded so the ANE's alphabetical binding order is layer order.
 fn cache_input(kind: char, i: usize) -> String {
@@ -421,23 +468,26 @@ fn emit_layer(
     p.emit_softmax(&n("pn"), &[1, nkv, gw, w], "ax_last", &n("snm"));
     p.emit_matmul(&n("oc"), &[1, nkv, gw, hd], "tf", "tf", &n("pc"), &vc);
     p.emit_matmul(&n("on"), &[1, nkv, gw, hd], "tf", "tt", &n("pn"), &n("v4"));
-    p.emit_reduce(
-        "reduce_log_sum_exp",
-        &n("lc"),
-        &stat,
-        &n("scm"),
-        "ax3",
-        "kd",
-    );
-    p.emit_reduce(
-        "reduce_log_sum_exp",
-        &n("ln"),
-        &stat,
-        &n("snm"),
-        "ax3",
-        "kd",
-    );
-    p.emit_sub(&n("dl"), &stat, &n("lc"), &n("ln"));
+    // Each log-sum-exp as max + log(sum(exp(s - max))). The ANE's own
+    // reduce_log_sum_exp overflows fp16 once a score passes ~11 (a real
+    // model's reach 40+), which left the cache's share NaN.
+    for (block, scores, shape) in [("c", "scm", [1, nkv, gw, l]), ("n", "snm", [1, nkv, gw, w])] {
+        let v = |s: &str| n(&format!("{s}{block}"));
+        p.emit_reduce("reduce_max", &v("mx"), &stat, &n(scores), "ax3", "kd");
+        p.emit_sub(&v("sh"), &shape, &n(scores), &v("mx"));
+        p.emit_unary("exp", &v("ex"), &shape, &v("sh"));
+        p.emit_reduce("reduce_sum", &v("z"), &stat, &v("ex"), "ax3", "kd");
+        // MIL's log needs its epsilon spelled out (z >= 1 here anyway).
+        p.emit_scalar_const(&v("leps"), "fp16", "0.0");
+        p.emit_raw(&format!(
+            "        tensor<fp16, [1, {nkv}, {gw}, 1]> {lz} = log(x={z},epsilon={eps})[name=string(\"{lz}\")];",
+            lz = v("lz"),
+            z = v("z"),
+            eps = v("leps"),
+        ));
+        p.emit_add(&v("lse"), &stat, &v("mx"), &v("lz"));
+    }
+    p.emit_sub(&n("dl"), &stat, &n("lsec"), &n("lsen"));
     p.emit_sigmoid(&n("wc"), &stat, &n("dl"));
     p.emit_scalar_const(&n("one_w"), "fp16", "1.0");
     p.emit_sub(&n("wn"), &stat, &n("one_w"), &n("wc"));
@@ -480,6 +530,78 @@ fn emit_layer(
     p.emit_tensor_const(&n("rs_kvf"), &[4], "int32", &format!("[1,{kvd},1,{w}]"));
     p.emit_reshape(&n("ktap"), &[1, kvd, 1, w], &n("rs_kvf"), &n("kr"));
     (n("x3"), n("ktap"), n("v"))
+}
+
+/// The widest output a single convolution in [`gen_lm_head`] produces; the
+/// ANE rejects much wider ones.
+const HEAD_PIECE: usize = 16384;
+
+/// Generate the LM head: the final RMSNorm of `a_x` `[1, dim, 1, W]` and the
+/// logits `o_logits` `[1, vocab, 1, W]`, from `weight` `[vocab, dim]` stored
+/// as `cfg.weights` says, in pieces of at most 16384 rows.
+pub fn gen_lm_head(
+    cfg: &ExtendConfig,
+    final_norm: &[f32],
+    weight: &[f32],
+    vocab: usize,
+) -> Result<KernelOutput> {
+    cfg.validate()?;
+    let (d, w) = (cfg.dim, cfg.width);
+    if final_norm.len() != d || weight.len() != vocab * d {
+        return Err(MetalError::InvalidConfig(format!(
+            "LM head: expected a [{d}] norm and [{vocab}, {d}] weights"
+        )));
+    }
+    let mut p = MilProgram::with_inputs(&[("a_x", &[1, d, 1, w])]);
+    let mut weights = WeightDict::new();
+    p.emit_conv_constants();
+    p.emit_tensor_const("ax1", &[1], "int32", "[1]");
+    p.emit_scalar_const("kd", "bool", "true");
+    p.emit_scalar_const("cat1", "int32", "1");
+    p.emit_scalar_const("tf", "bool", "false");
+    let path = "@model_path/weights/final_norm.bin";
+    p.emit_weight_const("final_norm", &[1, d, 1, 1], path);
+    weights.add(path, WeightBlob::from_rms_weights(final_norm));
+    emit_rmsnorm(
+        &mut p,
+        "a_x",
+        "xn",
+        &[1, d, 1, w],
+        1,
+        cfg.rms_norm_eps,
+        "final_norm",
+    );
+
+    let mut pieces = Vec::new();
+    for (i, start) in (0..vocab).step_by(HEAD_PIECE).enumerate() {
+        let rows = HEAD_PIECE.min(vocab - start);
+        let name = format!("head{i}");
+        emit_projection_weight(
+            &mut p,
+            &mut weights,
+            cfg,
+            &name,
+            &weight[start * d..(start + rows) * d],
+            rows,
+            d,
+        );
+        let out = format!("logits{i}");
+        p.emit_conv(&out, &[1, rows, 1, w], &name, "xn");
+        pieces.push(out);
+    }
+    let refs: Vec<&str> = pieces.iter().map(String::as_str).collect();
+    if refs.len() == 1 {
+        p.emit_scalar_const("one", "fp16", "1.0");
+        p.emit_mul("o_logits", &[1, vocab, 1, w], refs[0], "one");
+    } else {
+        p.emit_concat("o_logits", &[1, vocab, 1, w], "cat1", "tf", &refs);
+    }
+    Ok(KernelOutput {
+        mil_text: p.finalize("o_logits"),
+        weights,
+        input_bytes: d * w * 2,
+        output_bytes: vocab * w * 2,
+    })
 }
 
 /// cos and sin of RoPE for positions `start..start + width`, each
@@ -534,12 +656,12 @@ pub struct ExtendModel {
 impl ExtendModel {
     /// Compile `n_layers` layers in chunks of at most `layers_per_chunk`,
     /// getting each layer's weights from `layer`.
-    pub fn compile<'a>(
+    pub fn compile(
         cfg: ExtendConfig,
         rope_theta: f32,
         n_layers: usize,
         layers_per_chunk: usize,
-        mut layer: impl FnMut(usize) -> Result<LayerTensors<'a>>,
+        mut layer: impl FnMut(usize) -> Result<LayerWeights>,
     ) -> Result<Self> {
         cfg.validate()?;
         let rt = AneRuntime::global()?;
@@ -548,9 +670,11 @@ impl ExtendModel {
         let mut chunks = Vec::new();
         for start in (0..n_layers).step_by(per_chunk) {
             let range = start..(start + per_chunk).min(n_layers);
-            let tensors = range.clone().map(&mut layer).collect::<Result<Vec<_>>>()?;
+            let owned = range.clone().map(&mut layer).collect::<Result<Vec<_>>>()?;
+            let tensors: Vec<LayerTensors<'_>> = owned.iter().map(LayerWeights::tensors).collect();
             let kernel = gen_extend_chunk(&cfg, &tensors)?;
             drop(tensors);
+            drop(owned);
             let model = rt.compile(kernel.mil_text.as_bytes(), Some(&kernel.weights))?;
             chunks.push(Chunk {
                 model,
