@@ -174,3 +174,43 @@ fn qwen3_4b_throughput() {
     }
     assert_eq!(spec, plain);
 }
+
+/// Qwen3-4B (`PMETAL_TEST_QWEN3_4B`) answering a chat prompt, int8 and fp16,
+/// against mlx_lm's greedy answer (bf16). The prompt opens with the
+/// attention-sink special tokens, whose activations reach the thousands:
+/// int8 weights used to overflow the ANE's int8 convolution there and
+/// answer with end-of-text.
+#[test]
+#[ignore = "requires ANE hardware and PMETAL_TEST_QWEN3_4B"]
+fn qwen3_4b_answers_a_chat_prompt() {
+    let Some(dir) = std::env::var_os("PMETAL_TEST_QWEN3_4B") else {
+        eprintln!("PMETAL_TEST_QWEN3_4B not set; skipping");
+        return;
+    };
+    // "<|im_start|>user\nWrite a Python function that returns the nth
+    // Fibonacci number.<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    let prompt = [
+        151644, 872, 198, 7985, 264, 13027, 729, 429, 4675, 279, 55129, 79683, 1372, 13, 151645,
+        198, 151644, 77091, 198, 151667, 271, 151668, 271,
+    ];
+    // "Sure! Here's a Python function that returns the **"
+    let want = [39814, 0, 5692, 594, 264, 13027, 729, 429, 4675, 279, 3070];
+    let settings = GenerateOptions {
+        max_new: want.len(),
+        temperature: 0.0,
+        top_k: 0,
+        stop: Vec::new(),
+    };
+    for weights in [WeightFormat::Int8, WeightFormat::Fp16] {
+        let opts = AneLmOptions {
+            capacity: 512,
+            weights,
+            ..AneLmOptions::default()
+        };
+        let mut lm = AneLm::load(std::path::Path::new(&dir), &opts).expect("load");
+        let (got, _) = lm
+            .generate(&prompt, &settings, &mut NoDraft, |_| true)
+            .expect("generate");
+        assert_eq!(got, want, "{weights:?}");
+    }
+}

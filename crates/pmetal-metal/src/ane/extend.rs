@@ -35,6 +35,10 @@ use crate::error::{MetalError, Result};
 /// can't see.
 const MASKED: f32 = -65504.0;
 
+/// How much smaller the down projection's input is computed (see
+/// `emit_layer`).
+const DOWN_SCALE: f32 = 16.0;
+
 /// How a kernel's projection weights are stored.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WeightFormat {
@@ -517,14 +521,31 @@ fn emit_layer(
         &n("rms_ffn"),
     );
     emit_projection_weight(p, weights, cfg, &n("w1"), t.w_gate, h, d);
-    emit_projection_weight(p, weights, cfg, &n("w3"), t.w_up, h, d);
+    // The ANE's int8 convolution appears to sum the int8 values times the
+    // input in fp16 and apply each row's scale after, so its sum is the
+    // output over the scale: hundreds of times the output. At an attention
+    // sink token the down projection's output reaches the thousands, and the
+    // sum overflowed (Qwen3-4B's chat prompts came out as end-of-text). With
+    // int8 weights, up is scaled down by DOWN_SCALE, exactly (its rows carry
+    // their own scale), and the down projection's output back up. fp16
+    // weights don't need it, and small models' activations lose precision to
+    // it.
+    let down_scale = match cfg.weights {
+        WeightFormat::Int8 => DOWN_SCALE,
+        WeightFormat::Fp16 => 1.0,
+    };
+    let up_scaled: Vec<f32> = t.w_up.iter().map(|v| v / down_scale).collect();
+    emit_projection_weight(p, weights, cfg, &n("w3"), &up_scaled, h, d);
+    drop(up_scaled);
     emit_projection_weight(p, weights, cfg, &n("w2"), t.w_down, d, h);
     p.emit_conv(&n("h1"), &[1, h, 1, w], &n("w1"), &n("xn2"));
     p.emit_conv(&n("h3"), &[1, h, 1, w], &n("w3"), &n("xn2"));
     p.emit_sigmoid(&n("sg"), &[1, h, 1, w], &n("h1"));
     p.emit_mul(&n("silu"), &[1, h, 1, w], &n("h1"), &n("sg"));
     p.emit_mul(&n("g"), &[1, h, 1, w], &n("silu"), &n("h3"));
-    p.emit_conv(&n("y"), &[1, d, 1, w], &n("w2"), &n("g"));
+    p.emit_conv(&n("ys"), &[1, d, 1, w], &n("w2"), &n("g"));
+    p.emit_scalar_const(&n("down_scale"), "fp16", &format!("{down_scale}"));
+    p.emit_mul(&n("y"), &[1, d, 1, w], &n("ys"), &n("down_scale"));
     p.emit_add(&n("x3"), &[1, d, 1, w], &n("x2"), &n("y"));
 
     p.emit_tensor_const(&n("rs_kvf"), &[4], "int32", &format!("[1,{kvd},1,{w}]"));
