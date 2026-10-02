@@ -94,6 +94,89 @@ impl MilProgram {
         }
     }
 
+    /// Create a MIL program whose inputs are fp16 tensors with the given
+    /// names and shapes.
+    ///
+    /// The ANE binds inputs in the alphabetical order of their names, not the
+    /// order they're declared in, so callers name them to sort the way they
+    /// pass surfaces (`a_x`, `b_cos`, ...).
+    pub fn with_inputs(inputs: &[(&str, &[usize])]) -> Self {
+        debug_assert!(
+            inputs.windows(2).all(|w| w[0].0 < w[1].0),
+            "inputs must be named in alphabetical order"
+        );
+        let mut text = String::with_capacity(65536);
+        text.push_str(MIL_HEADER);
+        let params: Vec<String> = inputs
+            .iter()
+            .map(|(name, shape)| format!("tensor<fp16, {}> {}", format_shape(shape), name))
+            .collect();
+        write!(text, "    func main<ios18>({}) {{\n", params.join(", ")).unwrap();
+        Self {
+            text,
+            var_counter: 0,
+        }
+    }
+
+    /// Emit an int8 weight, quantized per output channel, as a constant the
+    /// ANE dequantizes as it reads it: `w[o, ..] = scale[o] * data[o, ..]`.
+    ///
+    /// `shape` is the weight's `[O, I, 1, 1]`; the int8 data and the fp16
+    /// `[O, 1, 1, 1]` scales are separate blobs.
+    pub fn emit_int8_weight_const(
+        &mut self,
+        name: &str,
+        shape: &[usize],
+        data_path: &str,
+        scale_path: &str,
+    ) {
+        let shape_str = format_shape(shape);
+        let scale_shape = format_shape(&[shape[0], 1, 1, 1]);
+        write!(
+            self.text,
+            "        tensor<fp16, {shape_str}> {name} = constexpr_blockwise_shift_scale(data=tensor<int8, {shape_str}>(BLOBFILE(path=string(\"{data_path}\"), offset=uint64(64))), scale=tensor<fp16, {scale_shape}>(BLOBFILE(path=string(\"{scale_path}\"), offset=uint64(64))))[name=string(\"{name}\")];\n"
+        )
+        .unwrap();
+    }
+
+    /// Emit a unary op (`exp`, `abs`, `sqrt`, `silu`, ...).
+    pub fn emit_unary(&mut self, op: &str, result_name: &str, shape: &[usize], x: &str) {
+        let shape_str = format_shape(shape);
+        write!(
+            self.text,
+            "        tensor<fp16, {shape_str}> {result_name} = {op}(x={x})[name=string(\"{result_name}\")];\n"
+        )
+        .unwrap();
+    }
+
+    /// Emit a binary elementwise op (`real_div`, `maximum`, ...).
+    pub fn emit_binary(&mut self, op: &str, result_name: &str, shape: &[usize], x: &str, y: &str) {
+        let shape_str = format_shape(shape);
+        write!(
+            self.text,
+            "        tensor<fp16, {shape_str}> {result_name} = {op}(x={x},y={y})[name=string(\"{result_name}\")];\n"
+        )
+        .unwrap();
+    }
+
+    /// Emit a reduction (`reduce_max`, `reduce_sum`, ...) over `axes_name`.
+    pub fn emit_reduce(
+        &mut self,
+        op: &str,
+        result_name: &str,
+        shape: &[usize],
+        input: &str,
+        axes_name: &str,
+        keep_dims_name: &str,
+    ) {
+        let shape_str = format_shape(shape);
+        write!(
+            self.text,
+            "        tensor<fp16, {shape_str}> {result_name} = {op}(x={input},axes={axes_name},keep_dims={keep_dims_name})[name=string(\"{result_name}\")];\n"
+        )
+        .unwrap();
+    }
+
     /// Emit shared conv constants (pad, strides, dilations, groups).
     pub fn emit_conv_constants(&mut self) {
         self.text.push_str(CONV_CONST);

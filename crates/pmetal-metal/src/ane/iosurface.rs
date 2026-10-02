@@ -131,6 +131,39 @@ impl IoSurface {
         }
     }
 
+    /// Run `f` on the surface's contents as fp16 bits, locked for writing.
+    pub fn with_fp16_mut<R>(&self, f: impl FnOnce(&mut [u16]) -> R) -> R {
+        // SAFETY: the surface is locked for the slice's lifetime, and its
+        // allocation holds at least `size_bytes`.
+        unsafe {
+            ffi::IOSurfaceLock(self.surface, 0, std::ptr::null_mut());
+            let base = ffi::IOSurfaceGetBaseAddress(self.surface) as *mut u16;
+            let out = f(std::slice::from_raw_parts_mut(base, self.size_bytes / 2));
+            ffi::IOSurfaceUnlock(self.surface, 0, std::ptr::null_mut());
+            out
+        }
+    }
+
+    /// Run `f` on the surface's contents as fp16 bits, locked for reading.
+    pub fn with_fp16<R>(&self, f: impl FnOnce(&[u16]) -> R) -> R {
+        // SAFETY: as for `with_fp16_mut`.
+        unsafe {
+            ffi::IOSurfaceLock(
+                self.surface,
+                ffi::K_IO_SURFACE_LOCK_READ_ONLY,
+                std::ptr::null_mut(),
+            );
+            let base = ffi::IOSurfaceGetBaseAddress(self.surface) as *const u16;
+            let out = f(std::slice::from_raw_parts(base, self.size_bytes / 2));
+            ffi::IOSurfaceUnlock(
+                self.surface,
+                ffi::K_IO_SURFACE_LOCK_READ_ONLY,
+                std::ptr::null_mut(),
+            );
+            out
+        }
+    }
+
     /// Write f32 data as fp16 to the surface.
     ///
     /// Converts `data` (f32, channel-first `[C, S]`) to fp16 and writes to the surface.

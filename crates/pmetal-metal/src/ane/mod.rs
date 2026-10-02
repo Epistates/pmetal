@@ -38,10 +38,13 @@
 //! - [`dynamic_kernel`]: Dynamic weight kernel generators (9 kernels, compile once)
 //! - [`dynamic_trainer`]: Compile-once training loop (replaces static trainer)
 //! - [`inference`]: Forward-only ANE inference engine with autoregressive generation
+//! - [`extend`]: Multi-layer inference kernels over an IOSurface KV cache, one
+//!   family for prefill, decode and speculative verification
 
 pub(crate) mod checkpoint;
 pub mod dynamic_kernel;
 pub mod dynamic_trainer;
+pub mod extend;
 pub mod inference;
 pub mod inference_hybrid;
 pub mod iosurface;

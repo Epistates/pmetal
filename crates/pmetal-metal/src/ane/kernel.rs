@@ -206,8 +206,52 @@ impl WeightBlob {
     }
 }
 
-/// Write the 128-byte blob header.
+/// Blob dtype codes, the byte after the magic (as CoreML's `weight.bin` uses
+/// them).
+const BLOB_FP16: u8 = 1;
+const BLOB_INT8: u8 = 4;
+
+/// Quantize `[rows, cols]` row-major weights to int8, symmetric per row (per
+/// output channel): `w[r, c] ≈ scale[r] * q[r, c]`. The scale is rounded to
+/// fp16 before quantizing, so these are exactly the weights the ANE computes
+/// with.
+pub fn quantize_int8_rows(weights: &[f32], rows: usize, cols: usize) -> (Vec<i8>, Vec<half::f16>) {
+    debug_assert_eq!(weights.len(), rows * cols);
+    let mut q = vec![0i8; rows * cols];
+    let mut scales = Vec::with_capacity(rows);
+    for r in 0..rows {
+        let row = &weights[r * cols..(r + 1) * cols];
+        let max = row.iter().fold(0f32, |m, w| m.max(w.abs()));
+        let scale = half::f16::from_f32(if max > 0.0 { max / 127.0 } else { 1.0 });
+        let inv = 1.0 / scale.to_f32();
+        for (dst, w) in q[r * cols..(r + 1) * cols].iter_mut().zip(row) {
+            *dst = (w * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+        scales.push(scale);
+    }
+    (q, scales)
+}
+
+impl WeightBlob {
+    /// int8 blobs for `[rows, cols]` weights quantized per row by
+    /// [`quantize_int8_rows`]: the data, then the `[rows]` fp16 scales.
+    pub fn int8_per_row(weights: &[f32], rows: usize, cols: usize) -> (Vec<u8>, Vec<u8>) {
+        let (q, scales) = quantize_int8_rows(weights, rows, cols);
+        let mut data = vec![0u8; 128 + q.len()];
+        write_typed_header(&mut data, q.len(), BLOB_INT8);
+        data[128..].copy_from_slice(q.as_bytes());
+        let bits: Vec<u16> = scales.iter().map(|s| s.to_bits()).collect();
+        (data, Self::from_fp16(&bits))
+    }
+}
+
+/// Write the 128-byte blob header for fp16 data.
 fn write_header(blob: &mut [u8], data_size: usize) {
+    write_typed_header(blob, data_size, BLOB_FP16);
+}
+
+/// Write the 128-byte blob header for data of the given dtype code.
+fn write_typed_header(blob: &mut [u8], data_size: usize, dtype: u8) {
     blob[0] = 0x01;
     blob[4] = 0x02;
     // Magic: 0xDEADBEEF little-endian
@@ -215,7 +259,7 @@ fn write_header(blob: &mut [u8], data_size: usize) {
     blob[65] = 0xBE;
     blob[66] = 0xAD;
     blob[67] = 0xDE;
-    blob[68] = 0x01;
+    blob[68] = dtype;
     // Data size (uint32 LE)
     let ds = data_size as u32;
     blob[72..76].copy_from_slice(&ds.to_le_bytes());
@@ -420,6 +464,25 @@ pub(crate) fn emit_rope(
     p.emit_weight_const(&cos_w, &[1, 1, half_dim, seq_len], cos_path);
     let sin_w = format!("{pfx}_sin");
     p.emit_weight_const(&sin_w, &[1, 1, half_dim, seq_len], sin_path);
+    emit_rope_with(p, input, output, n_heads, head_dim, seq_len, &cos_w, &sin_w);
+}
+
+/// [`emit_rope`] with the cos/sin tables already in the program as `cos_w`
+/// and `sin_w`, each `[1, 1, head_dim / 2, seq]`: constants, or inputs when
+/// the positions change from call to call.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn emit_rope_with(
+    p: &mut MilProgram,
+    input: &str,
+    output: &str,
+    n_heads: usize,
+    head_dim: usize,
+    seq_len: usize,
+    cos_w: &str,
+    sin_w: &str,
+) {
+    let half_dim = head_dim / 2;
+    let pfx = p.next_var("rope");
 
     // Slice first half: begin=[0,0,0,0], size=[1,n_heads,half_dim,seq]
     let b0 = format!("{pfx}_b0");
@@ -454,17 +517,17 @@ pub(crate) fn emit_rope(
 
     // rot_first = x_first * cos - x_second * sin
     let fc = format!("{pfx}_fc");
-    p.emit_mul(&fc, &[1, n_heads, half_dim, seq_len], &x_first, &cos_w);
+    p.emit_mul(&fc, &[1, n_heads, half_dim, seq_len], &x_first, cos_w);
     let ss = format!("{pfx}_ss");
-    p.emit_mul(&ss, &[1, n_heads, half_dim, seq_len], &x_second, &sin_w);
+    p.emit_mul(&ss, &[1, n_heads, half_dim, seq_len], &x_second, sin_w);
     let rot_first = format!("{pfx}_rf");
     p.emit_sub(&rot_first, &[1, n_heads, half_dim, seq_len], &fc, &ss);
 
     // rot_second = x_first * sin + x_second * cos
     let fs = format!("{pfx}_fs");
-    p.emit_mul(&fs, &[1, n_heads, half_dim, seq_len], &x_first, &sin_w);
+    p.emit_mul(&fs, &[1, n_heads, half_dim, seq_len], &x_first, sin_w);
     let sc = format!("{pfx}_sc");
-    p.emit_mul(&sc, &[1, n_heads, half_dim, seq_len], &x_second, &cos_w);
+    p.emit_mul(&sc, &[1, n_heads, half_dim, seq_len], &x_second, cos_w);
     let rot_second = format!("{pfx}_rs");
     p.emit_add(&rot_second, &[1, n_heads, half_dim, seq_len], &fs, &sc);
 
