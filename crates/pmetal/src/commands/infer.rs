@@ -376,7 +376,23 @@ pub(crate) async fn run_inference(
     if mtp_model.is_some() && !mtp {
         anyhow::bail!("--mtp-model requires --mtp");
     }
-    let mtp_owns_generation = mtp || draft_model.is_some();
+    // A draft model is a Gemma 4 MTP assistant, or a DFlash draft model for
+    // the ANE engine.
+    let draft_path = match draft_model {
+        Some(draft) => Some(pmetal_hub::resolve_model_path(draft, None, None).await?),
+        None => None,
+    };
+    let dflash_draft = draft_path
+        .as_deref()
+        .is_some_and(pmetal_models::dflash_drafter::is_dflash_draft);
+    if dflash_draft && !ane {
+        anyhow::bail!(
+            "{} is a DFlash draft model, which drafts for the ANE engine: add --ane, or run \
+             `pmetal dflash` for the GPU",
+            draft_model.unwrap_or_default()
+        );
+    }
+    let mtp_owns_generation = mtp || (draft_model.is_some() && !dflash_draft);
     // Only the ANE path reads `ane` from here on.
     #[cfg_attr(not(feature = "ane"), allow(unused_variables))]
     let (metal_sampler, compiled, minimal, ane) = if mtp_owns_generation {
@@ -393,12 +409,12 @@ pub(crate) async fn run_inference(
     // Download model if needed (HuggingFace repo ID contains '/')
     let model_path = pmetal_hub::resolve_model_path(model_id, None, None).await?;
     tracing::info!("Model ready at {:?}", model_path);
-    let mtp_assistant_path = if let Some(draft) = draft_model {
-        let path = pmetal_hub::resolve_model_path(draft, None, None).await?;
-        tracing::info!("Gemma 4 MTP assistant ready at {:?}", path);
-        Some(path)
-    } else {
-        None
+    let mtp_assistant_path = match &draft_path {
+        Some(path) if !dflash_draft => {
+            tracing::info!("Gemma 4 MTP assistant ready at {:?}", path);
+            Some(path.clone())
+        }
+        _ => None,
     };
     let qwen_mtp_path = if let Some(mtp_model) = mtp_model {
         let path = pmetal_hub::resolve_model_path(mtp_model, None, None).await?;
@@ -627,6 +643,7 @@ pub(crate) async fn run_inference(
                         pmetal_data::stream_format::StreamFormatter::new(tokenizer, show_thinking);
                     match pmetal_models::generate_cached_ane_streaming(
                         &model_path,
+                        draft_path.as_deref().filter(|_| dflash_draft),
                         &input_ids,
                         &gen_config,
                         ane_max_seq_len,

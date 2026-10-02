@@ -73,7 +73,9 @@ pub struct InferArgs {
     #[arg(long = "backend", default_value = "auto")]
     pub backend: pmetal_data::inference_config::InferenceBackend,
 
-    /// Gemma 4 MTP assistant model for exact speculative decoding (HF id or local path).
+    /// Draft model for exact speculative decoding (HF id or local path): a
+    /// Gemma 4 MTP assistant, or with --ane a DFlash draft model (run on the
+    /// GPU, for the model on the ANE).
     #[arg(long = "draft-model")]
     pub draft_model: Option<String>,
 

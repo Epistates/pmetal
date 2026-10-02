@@ -1163,6 +1163,7 @@ impl InferenceEngine {
         let output = match preferred_backend {
             PreferredGenerationBackend::Ane => generate_cached_ane_streaming(
                 model_path,
+                None,
                 input_ids,
                 gen_config,
                 ane_max_seq_len,
@@ -1226,6 +1227,7 @@ impl InferenceEngine {
         let output = match preferred_backend {
             PreferredGenerationBackend::Ane => generate_cached_ane_streaming(
                 model_path,
+                None,
                 input_ids,
                 gen_config,
                 ane_max_seq_len,

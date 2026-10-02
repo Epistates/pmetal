@@ -42,7 +42,7 @@ thread_local! {
     /// One ANE model per checkpoint, compiled for the largest context asked
     /// of it so far: a smaller request reuses it, a larger one rebuilds it.
     /// Two at once would hold the weights on the ANE twice.
-    static ANE_LM_CACHE: std::cell::RefCell<HashMap<std::path::PathBuf, pmetal_metal::ane::lm::AneLm>> =
+    static ANE_LM_CACHE: std::cell::RefCell<HashMap<std::path::PathBuf, AneEngine>> =
         std::cell::RefCell::new(HashMap::new());
     static HYBRID_CPU_ENGINE_CACHE: std::cell::RefCell<HashMap<HybridCpuEngineKey, pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine>> =
         std::cell::RefCell::new(HashMap::new());
@@ -57,23 +57,44 @@ fn ane_context(prompt_len: usize, max_new: usize, cap: usize) -> usize {
         .clamp(512, cap.max(512))
 }
 
+/// A model on the ANE, and the DFlash drafter (on the GPU) reading its
+/// hidden states, if it has one.
+#[cfg(feature = "ane")]
+struct AneEngine {
+    lm: pmetal_metal::ane::lm::AneLm,
+    drafter: Option<(std::path::PathBuf, crate::dflash_drafter::DFlashDrafter)>,
+}
+
 #[cfg(feature = "ane")]
 fn with_cached_ane_lm<R>(
     model_path: &std::path::Path,
+    draft_path: Option<&std::path::Path>,
     context: usize,
     f: impl FnOnce(
         &mut pmetal_metal::ane::lm::AneLm,
+        Option<&mut crate::dflash_drafter::DFlashDrafter>,
     ) -> std::result::Result<R, pmetal_metal::error::MetalError>,
 ) -> std::result::Result<R, pmetal_metal::error::MetalError> {
     use pmetal_metal::ane::lm::{AneLm, AneLmOptions};
+    use pmetal_metal::error::MetalError;
     ANE_LM_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        let fits = cache
-            .get(model_path)
-            .is_some_and(|lm| lm.capacity() >= context);
+        let fits = cache.get(model_path).is_some_and(|engine| {
+            engine.lm.capacity() >= context
+                && engine.drafter.as_ref().map(|(path, _)| path.as_path()) == draft_path
+        });
         if !fits {
             // Free the old model's ANE memory before compiling the new one.
             cache.remove(model_path);
+            // The drafter decides which layers the ANE programs output.
+            let drafter = draft_path
+                .map(|path| {
+                    tracing::info!(draft = %path.display(), "Loading the DFlash drafter");
+                    crate::dflash_drafter::DFlashDrafter::load(path, model_path, context)
+                        .map(|drafter| (path.to_path_buf(), drafter))
+                        .map_err(|e| MetalError::InvalidConfig(e.to_string()))
+                })
+                .transpose()?;
             tracing::info!(
                 model = %model_path.display(),
                 context,
@@ -81,11 +102,17 @@ fn with_cached_ane_lm<R>(
             );
             let opts = AneLmOptions {
                 capacity: context,
+                taps: drafter
+                    .as_ref()
+                    .map(|(_, d)| d.target_layer_ids().to_vec())
+                    .unwrap_or_default(),
                 ..AneLmOptions::default()
             };
-            cache.insert(model_path.to_path_buf(), AneLm::load(model_path, &opts)?);
+            let lm = AneLm::load(model_path, &opts)?;
+            cache.insert(model_path.to_path_buf(), AneEngine { lm, drafter });
         }
-        f(cache.get_mut(model_path).expect("inserted above"))
+        let engine = cache.get_mut(model_path).expect("inserted above");
+        f(&mut engine.lm, engine.drafter.as_mut().map(|(_, d)| d))
     })
 }
 
@@ -2658,12 +2685,15 @@ fn build_cached_generation_output(
 
 /// Generate on the ANE: the model's layers as multi-layer ANE programs over a
 /// KV cache sized to the request (at most `ane_max_context` tokens), with
-/// prompt lookup verifying guesses alongside each token, which changes the
-/// speed but not the output. Sampling is greedy or top-k at the request's
-/// temperature; top-p, min-p and the penalties aren't applied.
+/// guesses at the following tokens verified alongside each one, which changes
+/// the speed but not the output. The guesses come from the DFlash draft model
+/// in `draft_path` (run on the GPU) when there is one, and from prompt lookup
+/// otherwise. Sampling is greedy or top-k at the request's temperature;
+/// top-p, min-p and the penalties aren't applied.
 #[cfg(feature = "ane")]
 pub fn generate_cached_ane_streaming<F>(
     model_path: &std::path::Path,
+    draft_path: Option<&std::path::Path>,
     input_ids: &[u32],
     gen_config: &GenerationConfig,
     ane_max_context: usize,
@@ -2672,7 +2702,7 @@ pub fn generate_cached_ane_streaming<F>(
 where
     F: FnMut(u32) -> bool,
 {
-    use pmetal_metal::ane::lm::{GenerateOptions, PromptLookup};
+    use pmetal_metal::ane::lm::{Drafter, GenerateOptions, PromptLookup};
 
     let prompt_len = input_ids.len();
     let context = ane_context(prompt_len, gen_config.max_new_tokens, ane_max_context);
@@ -2689,16 +2719,21 @@ where
         stop: gen_config.stop_tokens.clone(),
     };
     let mut cancelled = false;
-    let (generated, stats) = with_cached_ane_lm(model_path, context, |lm| {
-        lm.generate(input_ids, &opts, &mut PromptLookup::default(), |token| {
+    let (generated, stats) = with_cached_ane_lm(model_path, draft_path, context, |lm, dflash| {
+        let mut lookup = PromptLookup::default();
+        let drafter: &mut dyn Drafter = match dflash {
+            Some(dflash) => dflash,
+            None => &mut lookup,
+        };
+        lm.generate(input_ids, &opts, drafter, |token| {
             cancelled = !on_token(token);
             !cancelled
         })
     })?;
     tracing::debug!(
-        passes = stats.passes,
-        drafted = stats.drafted_tokens,
-        accepted = stats.accepted_tokens,
+        passes = stats.passes + 1,
+        guesses_kept = format!("{}/{}", stats.accepted_tokens, stats.drafted_tokens),
+        draft_ms = format!("{:.0}", stats.draft_secs * 1e3),
         "ANE decode"
     );
 

@@ -51,6 +51,7 @@ pub mod common;
 pub mod ddtree;
 pub mod decoder_layer;
 pub mod dflash_decoder;
+pub mod dflash_drafter;
 pub mod dflash_native_target;
 pub mod dispatcher;
 pub mod expert_dequant;
