@@ -33,88 +33,60 @@ use std::collections::HashMap;
 
 #[cfg(feature = "ane")]
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct AneEngineKey {
-    model_path: std::path::PathBuf,
-    ane_seq_len: usize,
-}
-
-#[cfg(feature = "ane")]
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct HybridCpuEngineKey {
     model_path: std::path::PathBuf,
 }
 
 #[cfg(feature = "ane")]
 thread_local! {
-    static ANE_ENGINE_CACHE: std::cell::RefCell<HashMap<AneEngineKey, pmetal_metal::ane::inference::AneInferenceEngine>> =
+    /// One ANE model per checkpoint, compiled for the largest context asked
+    /// of it so far: a smaller request reuses it, a larger one rebuilds it.
+    /// Two at once would hold the weights on the ANE twice.
+    static ANE_LM_CACHE: std::cell::RefCell<HashMap<std::path::PathBuf, pmetal_metal::ane::lm::AneLm>> =
         std::cell::RefCell::new(HashMap::new());
     static HYBRID_CPU_ENGINE_CACHE: std::cell::RefCell<HashMap<HybridCpuEngineKey, pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine>> =
         std::cell::RefCell::new(HashMap::new());
 }
 
+/// The KV cache an ANE request needs: prompt and output, rounded up to a
+/// power of two (so nearby requests share a compiled model), 512 to `cap`.
 #[cfg(feature = "ane")]
-fn build_ane_engine(
-    model_path: &std::path::Path,
-    config: pmetal_metal::ane::inference::AneInferenceConfig,
-    prompt_len: usize,
-) -> std::result::Result<
-    pmetal_metal::ane::inference::AneInferenceEngine,
-    pmetal_metal::error::MetalError,
-> {
-    let mut engine = pmetal_metal::ane::inference::AneInferenceEngine::new(config, prompt_len)?;
-    engine.load_weights_safetensors(model_path)?;
-    engine.compile_kernels()?;
-    Ok(engine)
+fn ane_context(prompt_len: usize, max_new: usize, cap: usize) -> usize {
+    (prompt_len + max_new)
+        .next_power_of_two()
+        .clamp(512, cap.max(512))
 }
 
 #[cfg(feature = "ane")]
-fn with_cached_ane_engine<R>(
+fn with_cached_ane_lm<R>(
     model_path: &std::path::Path,
-    config: pmetal_metal::ane::inference::AneInferenceConfig,
-    prompt_len: usize,
+    context: usize,
     f: impl FnOnce(
-        &mut pmetal_metal::ane::inference::AneInferenceEngine,
+        &mut pmetal_metal::ane::lm::AneLm,
     ) -> std::result::Result<R, pmetal_metal::error::MetalError>,
 ) -> std::result::Result<R, pmetal_metal::error::MetalError> {
-    let key = AneEngineKey {
-        model_path: model_path.to_path_buf(),
-        ane_seq_len: config.resolve_ane_seq_len(prompt_len),
-    };
-
-    ANE_ENGINE_CACHE.with(
-        |cache| -> std::result::Result<R, pmetal_metal::error::MetalError> {
-            let mut cache = cache.borrow_mut();
-            let needs_rebuild = match cache.get(&key) {
-                Some(engine) => engine.config().max_seq_len < config.max_seq_len,
-                None => true,
-            };
-
-            if needs_rebuild {
-                tracing::info!(
-                    model = %model_path.display(),
-                    ane_seq_len = key.ane_seq_len,
-                    max_seq_len = config.max_seq_len,
-                    "Building cached ANE inference engine"
-                );
-                let engine = build_ane_engine(model_path, config.clone(), prompt_len)?;
-                cache.insert(key.clone(), engine);
-            }
-
-            let engine = cache.get_mut(&key).ok_or_else(|| {
-                pmetal_metal::error::MetalError::Internal(
-                    "ANE engine cache missing freshly-built entry".to_string(),
-                )
-            })?;
-            engine.set_generation_params(
-                config.temperature,
-                config.top_k,
-                config.max_tokens,
-                config.eos_token_id,
-                config.real_time_eval,
+    use pmetal_metal::ane::lm::{AneLm, AneLmOptions};
+    ANE_LM_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        let fits = cache
+            .get(model_path)
+            .is_some_and(|lm| lm.capacity() >= context);
+        if !fits {
+            // Free the old model's ANE memory before compiling the new one.
+            cache.remove(model_path);
+            tracing::info!(
+                model = %model_path.display(),
+                context,
+                "Compiling the model for the ANE (cached by the system after the first run)"
             );
-            f(engine)
-        },
-    )
+            let opts = AneLmOptions {
+                capacity: context,
+                ..AneLmOptions::default()
+            };
+            cache.insert(model_path.to_path_buf(), AneLm::load(model_path, &opts)?);
+        }
+        f(cache.get_mut(model_path).expect("inserted above"))
+    })
 }
 
 #[cfg(feature = "ane")]
@@ -2684,136 +2656,61 @@ fn build_cached_generation_output(
     }
 }
 
-#[cfg(feature = "ane")]
-fn build_ane_inference_config(
-    model_path: &std::path::Path,
-    input_ids: &[u32],
-    gen_config: &GenerationConfig,
-    ane_max_seq_len: usize,
-) -> std::result::Result<
-    pmetal_metal::ane::inference::AneInferenceConfig,
-    pmetal_metal::error::MetalError,
-> {
-    let config_json = load_model_config_json(model_path)?;
-    build_ane_inference_config_from_json(&config_json, input_ids, gen_config, ane_max_seq_len)
-}
-
-#[cfg(feature = "ane")]
-fn build_ane_inference_config_from_json(
-    config_json: &serde_json::Value,
-    input_ids: &[u32],
-    gen_config: &GenerationConfig,
-    ane_max_seq_len: usize,
-) -> std::result::Result<
-    pmetal_metal::ane::inference::AneInferenceConfig,
-    pmetal_metal::error::MetalError,
-> {
-    use pmetal_metal::ane::inference::AneInferenceConfig;
-
-    let get_usize = |key: &str| -> std::result::Result<usize, pmetal_metal::error::MetalError> {
-        config_json
-            .get(key)
-            .and_then(|v| v.as_u64())
-            .map(|v| v as usize)
-            .ok_or_else(|| {
-                pmetal_metal::error::MetalError::InvalidConfig(format!(
-                    "config.json missing '{key}'"
-                ))
-            })
-    };
-    let get_float_or = |key: &str, default: f64| -> f32 {
-        config_json
-            .get(key)
-            .and_then(|v| v.as_f64())
-            .unwrap_or(default) as f32
-    };
-
-    let dim = get_usize("hidden_size")?;
-    let hidden_dim = get_usize("intermediate_size")?;
-    let n_heads = get_usize("num_attention_heads")?;
-    let n_layers = get_usize("num_hidden_layers")?;
-    let vocab_size = get_usize("vocab_size")?;
-    let n_kv_heads = config_json
-        .get("num_key_value_heads")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize)
-        .unwrap_or(n_heads);
-    let rope_theta = get_float_or("rope_theta", 1_000_000.0);
-    let rms_norm_eps = get_float_or("rms_norm_eps", 1e-6);
-    let head_dim = config_json
-        .get("head_dim")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
-
-    Ok(AneInferenceConfig {
-        dim,
-        hidden_dim,
-        n_heads,
-        n_kv_heads,
-        n_layers,
-        vocab_size,
-        // KV cache sized for full generation window (prompt + output)
-        max_seq_len: input_ids.len() + gen_config.max_new_tokens + 64,
-        // ANE kernel seq_len: auto-bucketed to next power of 2, capped
-        ane_seq_len: None, // auto-compute from prompt_len
-        max_ane_seq_len: ane_max_seq_len,
-        temperature: gen_config.temperature,
-        top_k: gen_config.top_k,
-        max_tokens: gen_config.max_new_tokens,
-        real_time_eval: gen_config.ane_real_time,
-        eos_token_id: gen_config.stop_tokens.first().copied(),
-        rope_theta,
-        rms_norm_eps,
-        head_dim,
-        ..Default::default()
-    })
-}
-
-#[cfg(feature = "ane")]
-pub fn generate_cached_ane(
-    model_path: &std::path::Path,
-    input_ids: &[u32],
-    gen_config: &GenerationConfig,
-    ane_max_seq_len: usize,
-) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError> {
-    generate_cached_ane_streaming(model_path, input_ids, gen_config, ane_max_seq_len, |_| true)
-}
-
+/// Generate on the ANE: the model's layers as multi-layer ANE programs over a
+/// KV cache sized to the request (at most `ane_max_context` tokens), with
+/// prompt lookup verifying guesses alongside each token, which changes the
+/// speed but not the output. Sampling is greedy or top-k at the request's
+/// temperature; top-p, min-p and the penalties aren't applied.
 #[cfg(feature = "ane")]
 pub fn generate_cached_ane_streaming<F>(
     model_path: &std::path::Path,
     input_ids: &[u32],
     gen_config: &GenerationConfig,
-    ane_max_seq_len: usize,
+    ane_max_context: usize,
     mut on_token: F,
 ) -> std::result::Result<GenerationOutput, pmetal_metal::error::MetalError>
 where
     F: FnMut(u32) -> bool,
 {
-    let ane_config =
-        build_ane_inference_config(model_path, input_ids, gen_config, ane_max_seq_len)?;
-    let stop_tokens = gen_config.stop_tokens.clone();
+    use pmetal_metal::ane::lm::{GenerateOptions, PromptLookup};
+
     let prompt_len = input_ids.len();
+    let context = ane_context(prompt_len, gen_config.max_new_tokens, ane_max_context);
+    if prompt_len >= context {
+        return Err(pmetal_metal::error::MetalError::InvalidConfig(format!(
+            "the prompt is {prompt_len} tokens; the ANE context is {context} \
+             (raise it with --ane-max-seq-len)"
+        )));
+    }
+    let opts = GenerateOptions {
+        max_new: gen_config.max_new_tokens,
+        temperature: gen_config.temperature,
+        top_k: gen_config.top_k,
+        stop: gen_config.stop_tokens.clone(),
+    };
     let mut cancelled = false;
-    let mut saw_stop_token = false;
-
-    let token_ids = with_cached_ane_engine(model_path, ane_config, prompt_len, |engine| {
-        engine.generate_cached_streaming(input_ids, |token| {
-            if stop_tokens.contains(&token) {
-                saw_stop_token = true;
-                return false;
-            }
-            if !on_token(token) {
-                cancelled = true;
-                return false;
-            }
-            true
+    let (generated, stats) = with_cached_ane_lm(model_path, context, |lm| {
+        lm.generate(input_ids, &opts, &mut PromptLookup::default(), |token| {
+            cancelled = !on_token(token);
+            !cancelled
         })
-    });
+    })?;
+    tracing::debug!(
+        passes = stats.passes,
+        drafted = stats.drafted_tokens,
+        accepted = stats.accepted_tokens,
+        "ANE decode"
+    );
 
+    // Stop tokens end generation without being part of the output.
+    let saw_stop_token = generated
+        .last()
+        .is_some_and(|t| gen_config.stop_tokens.contains(t));
+    let mut token_ids = input_ids.to_vec();
+    token_ids.extend(&generated[..generated.len() - usize::from(saw_stop_token)]);
     Ok(build_cached_generation_output(
         prompt_len,
-        token_ids?,
+        token_ids,
         gen_config,
         cancelled,
         saw_stop_token,
@@ -2825,7 +2722,7 @@ where
 pub fn is_ane_inference_compatible(
     config_json: &serde_json::Value,
 ) -> std::result::Result<(), String> {
-    pmetal_metal::ane::inference::is_ane_inference_compatible(config_json)
+    pmetal_metal::ane::lm::check_supported(config_json)
 }
 
 /// Check if a model config is compatible with the CPU hybrid engine.
@@ -3387,21 +3284,11 @@ mod tests {
 
     #[cfg(feature = "ane")]
     #[test]
-    fn test_build_ane_inference_config_propagates_real_time_flag() {
-        let config_json = serde_json::json!({
-            "hidden_size": 1024,
-            "intermediate_size": 4096,
-            "num_attention_heads": 16,
-            "num_hidden_layers": 24,
-            "vocab_size": 32000
-        });
-        let gen_config = GenerationConfig::greedy(32).with_ane_real_time(true);
-        let ane_config =
-            build_ane_inference_config_from_json(&config_json, &[1, 2, 3], &gen_config, 512)
-                .unwrap();
-
-        assert!(ane_config.real_time_eval);
-        assert_eq!(ane_config.max_ane_seq_len, 512);
-        assert_eq!(ane_config.max_seq_len, 3 + 32 + 64);
+    fn ane_context_fits_the_request_in_a_power_of_two() {
+        assert_eq!(ane_context(10, 20, 4096), 512);
+        assert_eq!(ane_context(600, 100, 4096), 1024);
+        assert_eq!(ane_context(3000, 2000, 4096), 4096);
+        // A cap under the floor still gets the floor.
+        assert_eq!(ane_context(10, 20, 64), 512);
     }
 }

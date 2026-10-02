@@ -54,9 +54,11 @@ pub struct ServeArgs {
     #[arg(long = "ane")]
     pub ane: bool,
 
-    /// Maximum ANE kernel sequence length (power-of-2 bucket cap).
+    /// Largest context (prompt plus output, in tokens) the ANE compiles a
+    /// model for. Each request gets the smallest power of two from 512 that
+    /// fits it, up to this; a smaller context runs faster.
     #[cfg(feature = "ane")]
-    #[arg(long = "ane-max-seq-len", default_value = "1024")]
+    #[arg(long = "ane-max-seq-len", default_value = "4096")]
     pub ane_max_seq_len: usize,
 
     /// Use the experimental ANE real-time evaluation path when ANE serving is selected.

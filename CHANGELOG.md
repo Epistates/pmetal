@@ -7,7 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A new ANE inference engine behind `infer --ane` and `serve --ane`** (`pmetal_metal::ane::lm::AneLm`). The whole model runs on the ANE: several layers per ANE program, each taking a batch of new tokens at once against a KV cache that stays in IOSurfaces between calls, with int8 weights by default (fp16 optional) and the LM head split into pieces sized to the model width. The engine it replaces ran one layer per kernel and kept part of each step on the GPU
+  - Each step also checks guesses taken from the prompt (prompt lookup). Checking a few extra tokens costs about the same as computing one, so accepted guesses are free tokens, and the output is identical with or without them
+  - Qwen3-4B on an M4 Max: 19.7 tok/s plain, 30.5 tok/s with prompt lookup on a repetitive prompt, 12.6 s to load once the system has cached the compiled programs. Greedy output matches `mlx_lm` (bf16) on Qwen3-0.6B (fp16) and on a Qwen3-4B chat prompt (int8 and fp16), and int8 perplexity on Qwen3-4B matches bf16 (NLL 2.287 vs 2.294)
+  - Output streams token by token in `infer`, and the timing line separates loading from generation
+  - Qwen3 only for now; `infer --ane` says why it's using the GPU for anything else
+
 ### Changed
+
+- **`--ane-max-seq-len` is the largest context the ANE engine compiles for**, prompt plus output, and defaults to 4096 (was 1024). Each request gets the smallest power of two from 512 that fits it, so short requests stay fast; a longer one recompiles the model once at the larger size. A prompt that doesn't fit is refused with the flag named
 
 - **Every dependency is at its latest release**, with all lockfiles regenerated from scratch. Majors: `hf-hub` 1.0, `safetensors` 0.8, `base64` 0.23, `pyo3` 0.29, `dirs` 7
   - `hf-hub` 1.0 is a rewrite. Downloads now use Hugging Face's Xet transfer protocol and retry 429 and 5xx responses on their own. The Xet client's per-request INFO logging is held to warnings in the CLI

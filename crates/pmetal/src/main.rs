@@ -1764,7 +1764,7 @@ async fn tokio_main(cli: Cli) -> anyhow::Result<()> {
             #[cfg(feature = "ane")]
             let serve_ane_max_seq_len = ane_max_seq_len;
             #[cfg(not(feature = "ane"))]
-            let serve_ane_max_seq_len = 1024;
+            let serve_ane_max_seq_len = 4096;
             #[cfg(feature = "ane")]
             let serve_ane_real_time = ane_real_time;
             #[cfg(not(feature = "ane"))]

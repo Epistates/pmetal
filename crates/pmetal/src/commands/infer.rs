@@ -620,14 +620,34 @@ pub(crate) async fn run_inference(
                 };
 
                 if ane_compatible {
-                    tracing::info!("Attempting ANE-hybrid inference engine");
-                    match pmetal_models::generate_cached_ane(
+                    tracing::info!("Generating on the ANE");
+                    let tokenizer = &runner.tokenizer;
+                    let show_thinking = use_chat && !hide_thinking && !no_thinking;
+                    let mut formatter =
+                        pmetal_data::stream_format::StreamFormatter::new(tokenizer, show_thinking);
+                    match pmetal_models::generate_cached_ane_streaming(
                         &model_path,
                         &input_ids,
                         &gen_config,
                         ane_max_seq_len,
+                        |token_id| {
+                            use std::io::Write;
+                            first_token_at.get_or_insert_with(std::time::Instant::now);
+                            if gen_config.stop_tokens.contains(&token_id) {
+                                return true;
+                            }
+                            let delta = formatter.push_token(tokenizer, token_id);
+                            if !delta.is_empty() {
+                                let _ = std::io::stdout().write_all(delta.as_bytes());
+                                let _ = std::io::stdout().flush();
+                            }
+                            true
+                        },
                     ) {
-                        Ok(output) => Some(output),
+                        Ok(output) => {
+                            already_streamed = true;
+                            Some(output)
+                        }
                         Err(e) => {
                             tracing::warn!("ANE inference failed ({}), falling back to GPU", e);
                             None

@@ -126,10 +126,10 @@ pub struct ServeSpec {
     pub ane: bool,
 
     #[job(
-        label = "ANE Max Seq Len",
+        label = "ANE Max Context",
         group = "Compute",
         argv = "--ane-max-seq-len",
-        default_int = 1024
+        default_int = 4096
     )]
     #[serde(default = "default_ane_max_seq_len")]
     pub ane_max_seq_len: usize,
@@ -246,7 +246,7 @@ fn default_kv_group_size() -> usize {
     64
 }
 fn default_ane_max_seq_len() -> usize {
-    1024
+    4096
 }
 fn default_cb_slots() -> usize {
     8
