@@ -494,43 +494,28 @@ fn emit_layer(
     p.emit_matmul(&n("sn"), &[1, nkv, gw, w], "tf", "tf", &n("qg"), &n("kr"));
     p.emit_add(&n("snm"), &[1, nkv, gw, w], &n("sn"), "causal");
 
-    // One softmax over both blocks, as two: each block's own softmax times
-    // V, mixed by the block's share of the total weight, which from the two
-    // log-sum-exps is sigmoid(lse_c - lse_n). Exact, no sum can overflow, and
-    // an empty cache (every slot masked) gets a share of 0. Normalizing the
-    // exponentials by a hand-built sum instead made the compiler's graph
-    // cyclic ("Couldn't do topological sort").
-    let stat = [1, nkv, gw, 1];
-    p.emit_softmax(&n("pc"), &[1, nkv, gw, l], "ax_last", &n("scm"));
-    p.emit_softmax(&n("pn"), &[1, nkv, gw, w], "ax_last", &n("snm"));
+    // One softmax over both blocks, side by side, then each block's share
+    // times its V. The cache is never copied, only its scores. Mixing two
+    // per-block softmaxes by their log-sum-exps instead cost a second pass
+    // over the cache's scores for each sum, and attention over a 4096-slot
+    // cache was 60% of a Qwen3-4B layer.
+    p.emit_concat(
+        &n("s"),
+        &[1, nkv, gw, l + w],
+        "ax_last",
+        "tf",
+        &[&n("scm"), &n("snm")],
+    );
+    p.emit_softmax(&n("pa"), &[1, nkv, gw, l + w], "ax_last", &n("s"));
+    p.emit_tensor_const(&n("b_c"), &[4], "int32", "[0,0,0,0]");
+    p.emit_tensor_const(&n("z_c"), &[4], "int32", &format!("[1,{nkv},{gw},{l}]"));
+    p.emit_tensor_const(&n("b_n"), &[4], "int32", &format!("[0,0,0,{l}]"));
+    p.emit_tensor_const(&n("z_n"), &[4], "int32", &format!("[1,{nkv},{gw},{w}]"));
+    p.emit_slice_by_size(&n("pc"), &[1, nkv, gw, l], &n("pa"), &n("b_c"), &n("z_c"));
+    p.emit_slice_by_size(&n("pn"), &[1, nkv, gw, w], &n("pa"), &n("b_n"), &n("z_n"));
     p.emit_matmul(&n("oc"), &[1, nkv, gw, hd], "tf", "tf", &n("pc"), &vc);
     p.emit_matmul(&n("on"), &[1, nkv, gw, hd], "tf", "tt", &n("pn"), &n("v4"));
-    // Each log-sum-exp as max + log(sum(exp(s - max))). The ANE's own
-    // reduce_log_sum_exp overflows fp16 once a score passes ~11 (a real
-    // model's reach 40+), which left the cache's share NaN.
-    for (block, scores, shape) in [("c", "scm", [1, nkv, gw, l]), ("n", "snm", [1, nkv, gw, w])] {
-        let v = |s: &str| n(&format!("{s}{block}"));
-        p.emit_reduce("reduce_max", &v("mx"), &stat, &n(scores), "ax3", "kd");
-        p.emit_sub(&v("sh"), &shape, &n(scores), &v("mx"));
-        p.emit_unary("exp", &v("ex"), &shape, &v("sh"));
-        p.emit_reduce("reduce_sum", &v("z"), &stat, &v("ex"), "ax3", "kd");
-        // MIL's log needs its epsilon spelled out (z >= 1 here anyway).
-        p.emit_scalar_const(&v("leps"), "fp16", "0.0");
-        p.emit_raw(&format!(
-            "        tensor<fp16, [1, {nkv}, {gw}, 1]> {lz} = log(x={z},epsilon={eps})[name=string(\"{lz}\")];",
-            lz = v("lz"),
-            z = v("z"),
-            eps = v("leps"),
-        ));
-        p.emit_add(&v("lse"), &stat, &v("mx"), &v("lz"));
-    }
-    p.emit_sub(&n("dl"), &stat, &n("lsec"), &n("lsen"));
-    p.emit_sigmoid(&n("wc"), &stat, &n("dl"));
-    p.emit_scalar_const(&n("one_w"), "fp16", "1.0");
-    p.emit_sub(&n("wn"), &stat, &n("one_w"), &n("wc"));
-    p.emit_mul(&n("ocw"), &[1, nkv, gw, hd], &n("oc"), &n("wc"));
-    p.emit_mul(&n("onw"), &[1, nkv, gw, hd], &n("on"), &n("wn"));
-    p.emit_add(&n("o"), &[1, nkv, gw, hd], &n("ocw"), &n("onw"));
+    p.emit_add(&n("o"), &[1, nkv, gw, hd], &n("oc"), &n("on"));
 
     // Back to [1, q_dim, 1, W] and out through Wo.
     p.emit_tensor_const(&n("rs_oh"), &[4], "int32", &format!("[1,{nh},{w},{hd}]"));
