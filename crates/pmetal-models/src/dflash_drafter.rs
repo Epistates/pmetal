@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use pmetal_bridge::compat::{Array, Exception, ops};
-use pmetal_mlx::kv_cache::{KVCache, KVCacheConfig};
+use pmetal_mlx::kv_cache::KVCache;
 
 use crate::architectures::dflash_draft::DFlashDraftModel;
 use crate::dflash_decoder::load_dflash_draft_from_dir;
@@ -43,8 +43,8 @@ pub struct DFlashDrafter {
     dim: usize,
     /// Observed hidden states not yet in the cache, `[n, taps * dim]`.
     pending: Vec<f32>,
-    /// Cache slots per layer.
-    slots: usize,
+    /// Context positions the cache holds.
+    max_context: usize,
 }
 
 impl DFlashDrafter {
@@ -115,7 +115,6 @@ impl DFlashDrafter {
             Some(take("lm_head.weight")?)
         };
 
-        let slots = max_context + draft.block_size();
         let mut drafter = Self {
             cache: Vec::new(),
             draft,
@@ -124,7 +123,7 @@ impl DFlashDrafter {
             taps,
             dim,
             pending: Vec::new(),
-            slots,
+            max_context,
         };
         // MLX builds its kernels on first use, ~1.5 s that would otherwise
         // land on the first request.
@@ -148,16 +147,7 @@ impl DFlashDrafter {
 
     /// Forget the context.
     pub fn reset(&mut self) {
-        let cfg = &self.draft.config;
-        let layer = KVCacheConfig::new(
-            1,
-            self.slots,
-            cfg.num_key_value_heads as usize,
-            cfg.head_dim as usize,
-        );
-        self.cache = (0..self.draft.num_layers())
-            .map(|_| KVCache::new(layer.clone()))
-            .collect();
+        self.cache = self.draft.make_cache(self.max_context);
         self.pending.clear();
     }
 
@@ -199,13 +189,7 @@ impl DFlashDrafter {
         let noise = ops::take_axis(&self.embed, &ids, 0).reshape(&[1, bs as i32, dim as i32]);
         let context = Array::from_slice(&self.pending, &[1, n as i32, row as i32])
             .as_dtype(self.embed.dtype().as_i32());
-        let hidden = self
-            .draft
-            .forward(&noise, &context, Some(&mut self.cache))?;
-        // The block's keys and values go; the context's stay.
-        for layer in &mut self.cache {
-            layer.rollback(bs);
-        }
+        let hidden = self.draft.draft_block(&noise, &context, &mut self.cache)?;
         self.pending.clear();
 
         let guesses = hidden.slice(&[0, 1, 0], &[1, 1 + max as i32, dim as i32]);

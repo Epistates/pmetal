@@ -344,6 +344,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
         }
         let mut mamba_cache: Option<MambaCache> = self.target.make_mamba_cache();
         let mut capture = SpecCapture::with_layers(self.target_layer_ids.clone());
+        let mut draft_cache = self.draft.make_cache(total_max_tokens);
 
         // ── Prefill ───────────────────────────────────────────────────────
         // The target processes the whole prompt in one pass and records
@@ -382,10 +383,11 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             // noise_embedding is the target's token embedding of the block.
             let noise_embedding = self.target.embed_tokens(&block_input)?;
 
-            // Cacheless draft pass: simpler to get right than the cached
-            // path and plenty fast for a ~4-layer DFlash checkpoint. Cache
-            // reuse can be added later for long generations.
-            let draft_hidden = self.draft.forward(&noise_embedding, &target_hidden, None)?;
+            // `target_hidden` holds only the positions since the last draft;
+            // the draft cache holds the rest of the context.
+            let draft_hidden =
+                self.draft
+                    .draft_block(&noise_embedding, &target_hidden, &mut draft_cache)?;
             let draft_suffix = slice_axis_1(&draft_hidden, 1, block_size as i32);
             let draft_logits = self.target.lm_head_project(&draft_suffix)?;
             let drafted_tokens = argmax_last_axis(&draft_logits)?;
@@ -573,6 +575,7 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
 
         let mut mamba_cache: Option<MambaCache> = self.target.make_mamba_cache();
         let mut capture = SpecCapture::with_layers(self.target_layer_ids.clone());
+        let mut draft_cache = self.draft.make_cache(total_max_tokens);
 
         // ── Prefill ───────────────────────────────────────────────────
         let prefill_logits = self.target.forward_with_capture(
@@ -662,7 +665,9 @@ impl<T: DFlashTarget> DFlashDecoder<T> {
             }
             let block_input = array_from_i32_row(&block_tokens);
             let noise_embedding = self.target.embed_tokens(&block_input)?;
-            let draft_hidden = self.draft.forward(&noise_embedding, &target_hidden, None)?;
+            let draft_hidden =
+                self.draft
+                    .draft_block(&noise_embedding, &target_hidden, &mut draft_cache)?;
             // [1, draft_horizon, hidden] — slice away the root position.
             let draft_suffix = slice_axis_1(&draft_hidden, 1, (1 + draft_horizon) as i32);
             // [1, draft_horizon, vocab]

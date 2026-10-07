@@ -462,6 +462,39 @@ impl DFlashDraftModel {
         }
         Ok(self.norm.forward(&hidden))
     }
+
+    /// A KV cache per layer, with room for `context` positions of context
+    /// and a block, for [`draft_block`](Self::draft_block).
+    pub fn make_cache(&self, context: usize) -> Vec<KVCache> {
+        let config = pmetal_mlx::kv_cache::KVCacheConfig::new(
+            1,
+            context + self.block_size(),
+            self.config.num_key_value_heads as usize,
+            self.config.head_dim as usize,
+        );
+        (0..self.layers.len())
+            .map(|_| KVCache::new(config.clone()))
+            .collect()
+    }
+
+    /// Draft a block against everything drafted against so far, as
+    /// dflash-mlx does: `target_hidden` holds the target's tapped states for
+    /// the context positions since the last draft, which join `cache` for
+    /// good, and `noise_embedding` the block, whose keys and values are
+    /// dropped after. Every draft attends to the whole context.
+    pub fn draft_block(
+        &mut self,
+        noise_embedding: &Array,
+        target_hidden: &Array,
+        cache: &mut [KVCache],
+    ) -> Result<Array, Exception> {
+        let block = noise_embedding.dim(1) as usize;
+        let hidden = self.forward(noise_embedding, target_hidden, Some(cache))?;
+        for layer in cache.iter_mut() {
+            layer.rollback(block);
+        }
+        Ok(hidden)
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -604,6 +637,53 @@ mod tests {
 
         let out = model.forward(&noise, &target_hidden, None).unwrap();
         assert_eq!(out.shape(), &[1, block, hidden]);
+    }
+
+    /// Drafting against context A, then against B through the cache, is
+    /// drafting once against A and B together: the cache keeps the context
+    /// and only the block's own keys and values are dropped. Drafting against
+    /// B alone (what `DFlashDecoder` did, without a cache) is not.
+    #[test]
+    #[serial]
+    fn test_dflash_draft_block_attends_to_the_whole_context() {
+        use pmetal_bridge::compat::{Dtype, random::normal};
+        let config = tiny_config();
+        let (hidden, block) = (config.hidden_size, config.block_size);
+        let row = config.num_target_layers() as i32 * hidden;
+        let mut model = DFlashDraftModel::new(config).unwrap();
+        let first = normal(&[1, block, hidden], Dtype::Float32);
+        let second = normal(&[1, block, hidden], Dtype::Float32);
+        let (a, b) = (
+            normal(&[1, 3, row], Dtype::Float32),
+            normal(&[1, 2, row], Dtype::Float32),
+        );
+
+        let mut cache = model.make_cache(16);
+        model.draft_block(&first, &a, &mut cache).unwrap();
+        let cached = model.draft_block(&second, &b, &mut cache).unwrap();
+        let whole = model
+            .forward(&second, &ops::concatenate_axis(&[&a, &b], 1), None)
+            .unwrap();
+        let last_only = model.forward(&second, &b, None).unwrap();
+
+        let max_diff = |x: &Array, y: &Array| {
+            let (x, y) = (x.clone(), y.clone());
+            let _ = x.eval();
+            let _ = y.eval();
+            x.as_slice::<f32>()
+                .iter()
+                .zip(y.as_slice::<f32>())
+                .map(|(p, q)| (p - q).abs())
+                .fold(0.0f32, f32::max)
+        };
+        assert!(
+            max_diff(&cached, &whole) < 1e-4,
+            "cached draft != whole-context draft"
+        );
+        assert!(
+            max_diff(&last_only, &whole) > 1e-3,
+            "the context made no difference"
+        );
     }
 
     #[test]
