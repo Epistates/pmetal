@@ -180,7 +180,19 @@ impl LoraAdapter {
     /// matmuls against the activations, which is the whole point of the
     /// factorisation.
     pub(crate) fn apply(&self, x: &Array, weight: &Array, bias: Option<&Array>) -> Array {
-        let y = x.matmul(&weight.t());
+        self.apply_to_product(x, x.matmul(&weight.t()), &|| weight.clone(), bias)
+    }
+
+    /// [`apply`](Self::apply) given the base product `y = x·Wᵀ` already, for
+    /// a base weight stored packed. `weight` produces the dense `W`, which
+    /// only DoRA's normalisation reads.
+    pub(crate) fn apply_to_product(
+        &self,
+        x: &Array,
+        y: Array,
+        weight: &dyn Fn() -> Array,
+        bias: Option<&Array>,
+    ) -> Array {
         if self.merged {
             return add_bias(y, bias);
         }
@@ -207,7 +219,7 @@ impl LoraAdapter {
         // merged model compute something a live one does not.
         let y = match &self.magnitude {
             Some(magnitude) => {
-                let combined = weight.add(&self.delta());
+                let combined = weight().add(&self.delta());
                 let norm = column_norms(&combined).add(&Array::from_f32(1e-6));
                 y.multiply(&magnitude.divide(&norm).squeeze_axes(&[-1]))
             }
@@ -428,5 +440,70 @@ mod tests {
     fn rank_must_be_positive() {
         assert!(LoraAdapter::new(4, 4, 0, 1.0, false).is_err());
         assert!(LoraAdapter::new(4, 4, -1, 1.0, false).is_err());
+    }
+
+    /// Packing a layer's weight (8-bit affine, as `quantize` defaults to for
+    /// a drafter) keeps its shape and, to the packing's rounding, its output.
+    fn packed_pair() -> (Linear, Linear, Array) {
+        let dense = Linear::new(128, 8, true).expect("layer");
+        let mut packed = dense.clone();
+        packed
+            .quantize(crate::native_weight::QuantParams {
+                group_size: 64,
+                bits: 8,
+                mode: crate::QuantizedMode::Affine,
+            })
+            .expect("quantize");
+        let x = random::uniform_range(-1.0, 1.0, &[2, 128], Dtype::Float32);
+        (dense, packed, x)
+    }
+
+    #[test]
+    fn a_packed_weight_computes_the_dense_one() {
+        let (dense, packed, x) = packed_pair();
+        assert_eq!(packed.shape(), (8, 128));
+        let (want, got) = (values(dense.forward(&x)), values(packed.forward(&x)));
+        for (w, g) in want.iter().zip(&got) {
+            assert!((w - g).abs() < 2e-2, "packed {g} vs dense {w}");
+        }
+        // Packed, the layer saves as mlx's QuantizedLinear does, and is frozen.
+        let names: Vec<String> = packed.parameters().keys().map(|k| k.to_string()).collect();
+        for name in ["weight", "bias", "scales", "biases"] {
+            assert!(
+                names.iter().any(|n| n == name),
+                "{name} missing from {names:?}"
+            );
+        }
+        assert!(packed.trainable_parameters().is_empty());
+    }
+
+    /// QLoRA: an adapter on a packed weight computes what it does on that
+    /// weight unpacked, trains alone, and merging unpacks the layer.
+    #[test]
+    fn an_adapter_on_a_packed_weight_is_qlora() {
+        let (_, mut packed, x) = packed_pair();
+        {
+            let adapter = packed.attach_lora(4, 8.0, false).expect("attach");
+            adapter.b = random::uniform_range(-0.5, 0.5, &[8, 4], Dtype::Float32);
+        }
+        let mut unpacked = packed.clone();
+        unpacked.dequantize();
+        let (want, got) = (values(unpacked.forward(&x)), values(packed.forward(&x)));
+        for (w, g) in want.iter().zip(&got) {
+            assert!((w - g).abs() < 1e-4, "packed {g} vs unpacked {w}");
+        }
+        let trainable: Vec<String> = packed
+            .trainable_parameters()
+            .keys()
+            .map(|k| k.to_string())
+            .collect();
+        assert_eq!(trainable.len(), 2, "{trainable:?}");
+
+        packed.merge_lora();
+        assert!(packed.quant.is_none());
+        let merged = values(packed.forward(&x));
+        for (w, m) in want.iter().zip(&merged) {
+            assert!((w - m).abs() < 1e-4, "merged {m} vs adapted {w}");
+        }
     }
 }

@@ -34,6 +34,7 @@ fn zero_linear(out_dims: i32, in_dims: i32, bias: bool) -> nn::Linear {
             None
         }),
         adapter: None,
+        quant: None,
     }
 }
 

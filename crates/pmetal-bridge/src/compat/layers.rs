@@ -2,6 +2,8 @@ use super::{
     Array, Exception, LoraAdapter, ModuleParamMut, ModuleParamRef, ModuleParameters, NestedValue,
     Param, Parameter, ops, random,
 };
+use crate::QuantizedMode;
+use crate::native_weight::QuantParams;
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -31,6 +33,18 @@ fn linear_forward_array(x: &Array, weight: &Array, bias: Option<&Array>) -> Arra
 
 // ── Linear ────────────────────────────────────────────────────────────────
 
+/// How a [`Linear`]'s weight is packed for MLX's quantized matmul: the packed
+/// `uint32` weight sits in `weight` as usual, `[out, in·bits/32]`, and its
+/// scales (and, for affine quantization, biases) beside it. This is
+/// `mlx.nn.QuantizedLinear`'s layout, and the parameter tree names them the
+/// same way (`scales`, `biases`).
+#[derive(Debug, Clone)]
+pub struct LinearQuant {
+    pub scales: Array,
+    pub biases: Option<Array>,
+    pub params: QuantParams,
+}
+
 /// Affine linear layer: `y = x @ W^T + b`, optionally low-rank adapted.
 ///
 /// `adapter` is the seam that makes every architecture in the workspace
@@ -43,6 +57,11 @@ pub struct Linear {
     /// Low-rank adapter, when one has been attached. `None` is a plain dense
     /// layer and costs one predictable branch per forward.
     pub adapter: Option<Box<LoraAdapter>>,
+    /// Set when `weight` is packed for MLX's quantized matmul
+    /// ([`quantize`](Self::quantize)). An adapter works the same on a packed
+    /// weight, which is QLoRA: the base stays packed and frozen, the adapter
+    /// trains.
+    pub quant: Option<LinearQuant>,
 }
 
 impl Linear {
@@ -77,7 +96,14 @@ impl Linear {
     /// one matmul instead of three, which is worth it for evaluation mid-run,
     /// and training can resume afterwards. Use [`fuse_lora`](Self::fuse_lora)
     /// when the fold should be permanent.
+    ///
+    /// A packed weight is unpacked first: the merged weight isn't the packed
+    /// one plus a delta, so the layer is dense from then on, as mlx-lm's
+    /// `fuse --dequantize` leaves it.
     pub fn merge_lora(&mut self) {
+        if self.adapter.as_ref().is_some_and(|a| !a.merged) {
+            self.dequantize();
+        }
         if let Some(adapter) = self.adapter.as_mut() {
             adapter.merge_into(&mut self.weight.value);
         }
@@ -129,6 +155,7 @@ impl Linear {
             weight: Param::new(weight),
             bias: Param::new(bias),
             adapter: None,
+            quant: None,
         })
     }
 
@@ -138,15 +165,105 @@ impl Linear {
     }
 
     pub fn forward(&self, x: &Array) -> Array {
+        let bias = self.bias.value.as_ref();
+        let Some(quant) = &self.quant else {
+            return match self.adapter.as_deref() {
+                None => linear_forward_array(x, &self.weight.value, bias),
+                Some(adapter) => adapter.apply(x, &self.weight.value, bias),
+            };
+        };
+        // The kernel takes the activations in the scales' dtype.
+        let x = if x.dtype() == quant.scales.dtype() {
+            x.clone()
+        } else {
+            x.as_dtype(quant.scales.dtype().as_i32())
+        };
+        let y = x.quantized_matmul_mode(
+            &self.weight.value,
+            &quant.scales,
+            quant.biases.as_ref(),
+            true,
+            quant.params.group_size,
+            quant.params.bits,
+            quant.params.mode,
+        );
         match self.adapter.as_deref() {
-            None => linear_forward_array(x, &self.weight.value, self.bias.value.as_ref()),
-            Some(adapter) => adapter.apply(x, &self.weight.value, self.bias.value.as_ref()),
+            None => match bias {
+                Some(b) => y.add(b),
+                None => y,
+            },
+            Some(adapter) => adapter.apply_to_product(&x, y, &|| self.dense_weight(), bias),
         }
     }
 
+    /// `(out_features, in_features)`, whether the weight is packed or not.
     pub fn shape(&self) -> (i32, i32) {
         let s = self.weight.value.shape();
-        (s[0], s[1])
+        match &self.quant {
+            Some(quant) => (s[0], s[1] * 32 / quant.params.bits),
+            None => (s[0], s[1]),
+        }
+    }
+
+    /// Pack the weight for MLX's quantized matmul, as
+    /// `mlx.nn.QuantizedLinear.from_linear` does. Smaller and, where reading
+    /// the weight is the cost (decode), faster; the layer's parameters stop
+    /// training, though an adapter on it still does.
+    ///
+    /// Refused while an adapter is merged in, which a packed weight couldn't
+    /// unmerge.
+    pub fn quantize(&mut self, params: QuantParams) -> Result<(), Exception> {
+        if self.quant.is_some() {
+            return Ok(());
+        }
+        if self.adapter.as_ref().is_some_and(|a| a.merged) {
+            return Err(Exception::custom(
+                "Linear::quantize: unmerge the adapter before packing the weight",
+            ));
+        }
+        let dense = fp8_weight_for_compute(&self.weight.value);
+        let (weight, scales, biases) = match params.mode {
+            QuantizedMode::Affine => {
+                let (w, s, b) = dense.quantize_weights(params.group_size, params.bits);
+                (w, s, Some(b))
+            }
+            mode => {
+                let (w, s) = dense.quantize_weights_mode(params.group_size, params.bits, mode);
+                (w, s, None)
+            }
+        };
+        crate::check_last_error()
+            .map_err(|e| Exception::custom(format!("Linear::quantize: {e}")))?;
+        self.weight.value = weight;
+        self.quant = Some(LinearQuant {
+            scales,
+            biases,
+            params,
+        });
+        Ok(())
+    }
+
+    /// The weight as a dense `[out, in]` array, unpacked if it's packed.
+    pub fn dense_weight(&self) -> Array {
+        match &self.quant {
+            Some(quant) => self.weight.value.dequantize_mode(
+                &quant.scales,
+                quant.biases.as_ref(),
+                quant.params.group_size,
+                quant.params.bits,
+                quant.params.mode,
+            ),
+            None => fp8_weight_for_compute(&self.weight.value),
+        }
+    }
+
+    /// Undo [`quantize`](Self::quantize), leaving the unpacked weight (with
+    /// the rounding packing introduced).
+    pub fn dequantize(&mut self) {
+        if self.quant.is_some() {
+            self.weight.value = self.dense_weight();
+            self.quant = None;
+        }
     }
 
     #[inline]
@@ -169,6 +286,10 @@ impl ModuleParameters for Linear {
         Parameter::count_params(&self.weight)
             + Parameter::count_params(&self.bias)
             + self
+                .quant
+                .as_ref()
+                .map_or(0, |q| 1 + usize::from(q.biases.is_some()))
+            + self
                 .adapter
                 .as_ref()
                 .map_or(0, |a| 2 + usize::from(a.magnitude.is_some()))
@@ -178,6 +299,12 @@ impl ModuleParameters for Linear {
         let mut out = HashMap::new();
         Parameter::collect_params(&self.weight, "weight", &mut out);
         Parameter::collect_params(&self.bias, "bias", &mut out);
+        if let Some(quant) = &self.quant {
+            out.insert(Rc::from("scales"), NestedValue::Value(&quant.scales));
+            if let Some(biases) = &quant.biases {
+                out.insert(Rc::from("biases"), NestedValue::Value(biases));
+            }
+        }
         if let Some(adapter) = self.adapter.as_deref() {
             out.insert(Rc::from("lora_a"), NestedValue::Value(&adapter.a));
             out.insert(Rc::from("lora_b"), NestedValue::Value(&adapter.b));
@@ -192,6 +319,12 @@ impl ModuleParameters for Linear {
         let mut out = HashMap::new();
         Parameter::collect_params_mut(&mut self.weight, "weight", &mut out);
         Parameter::collect_params_mut(&mut self.bias, "bias", &mut out);
+        if let Some(quant) = &mut self.quant {
+            out.insert(Rc::from("scales"), NestedValue::Value(&mut quant.scales));
+            if let Some(biases) = &mut quant.biases {
+                out.insert(Rc::from("biases"), NestedValue::Value(biases));
+            }
+        }
         if let Some(adapter) = self.adapter.as_deref_mut() {
             out.insert(Rc::from("lora_a"), NestedValue::Value(&mut adapter.a));
             out.insert(Rc::from("lora_b"), NestedValue::Value(&mut adapter.b));
@@ -204,9 +337,13 @@ impl ModuleParameters for Linear {
 
     /// An adapted layer trains its adapter and nothing else: that is what makes
     /// it LoRA rather than a full fine-tune. An unadapted one is ordinary and
-    /// trains everything.
+    /// trains everything, unless its weight is packed, which can't train
+    /// (`mlx.nn.QuantizedLinear` freezes itself the same way).
     fn trainable_parameters(&self) -> ModuleParamRef<'_> {
         let Some(adapter) = self.adapter.as_deref() else {
+            if self.quant.is_some() {
+                return HashMap::new();
+            }
             return self.parameters();
         };
         let mut out = HashMap::new();
