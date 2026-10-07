@@ -45,6 +45,8 @@
 #![allow(clippy::len_zero)]
 #![allow(ambiguous_glob_reexports)]
 
+#[cfg(feature = "ane")]
+mod ane_worker;
 pub mod architectures;
 pub(crate) mod checkpointing;
 pub mod common;

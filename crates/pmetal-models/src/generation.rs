@@ -39,11 +39,6 @@ struct HybridCpuEngineKey {
 
 #[cfg(feature = "ane")]
 thread_local! {
-    /// One ANE model per checkpoint, compiled for the largest context asked
-    /// of it so far: a smaller request reuses it, a larger one rebuilds it.
-    /// Two at once would hold the weights on the ANE twice.
-    static ANE_LM_CACHE: std::cell::RefCell<HashMap<std::path::PathBuf, AneEngine>> =
-        std::cell::RefCell::new(HashMap::new());
     static HYBRID_CPU_ENGINE_CACHE: std::cell::RefCell<HashMap<HybridCpuEngineKey, pmetal_metal::ane::inference_hybrid::Qwen3NextInferenceEngine>> =
         std::cell::RefCell::new(HashMap::new());
 }
@@ -55,65 +50,6 @@ fn ane_context(prompt_len: usize, max_new: usize, cap: usize) -> usize {
     (prompt_len + max_new)
         .next_power_of_two()
         .clamp(512, cap.max(512))
-}
-
-/// A model on the ANE, and the DFlash drafter (on the GPU) reading its
-/// hidden states, if it has one.
-#[cfg(feature = "ane")]
-struct AneEngine {
-    lm: pmetal_metal::ane::lm::AneLm,
-    drafter: Option<(std::path::PathBuf, crate::dflash_drafter::DFlashDrafter)>,
-}
-
-#[cfg(feature = "ane")]
-fn with_cached_ane_lm<R>(
-    model_path: &std::path::Path,
-    draft_path: Option<&std::path::Path>,
-    context: usize,
-    f: impl FnOnce(
-        &mut pmetal_metal::ane::lm::AneLm,
-        Option<&mut crate::dflash_drafter::DFlashDrafter>,
-    ) -> std::result::Result<R, pmetal_metal::error::MetalError>,
-) -> std::result::Result<R, pmetal_metal::error::MetalError> {
-    use pmetal_metal::ane::lm::{AneLm, AneLmOptions};
-    use pmetal_metal::error::MetalError;
-    ANE_LM_CACHE.with(|cache| {
-        let mut cache = cache.borrow_mut();
-        let fits = cache.get(model_path).is_some_and(|engine| {
-            engine.lm.capacity() >= context
-                && engine.drafter.as_ref().map(|(path, _)| path.as_path()) == draft_path
-        });
-        if !fits {
-            // Free the old model's ANE memory before compiling the new one.
-            cache.remove(model_path);
-            // The drafter decides which layers the ANE programs output.
-            let drafter = draft_path
-                .map(|path| {
-                    tracing::info!(draft = %path.display(), "Loading the DFlash drafter");
-                    crate::dflash_drafter::DFlashDrafter::load(path, model_path, context)
-                        .map(|drafter| (path.to_path_buf(), drafter))
-                        .map_err(|e| MetalError::InvalidConfig(e.to_string()))
-                })
-                .transpose()?;
-            tracing::info!(
-                model = %model_path.display(),
-                context,
-                "Compiling the model for the ANE (cached by the system after the first run)"
-            );
-            let opts = AneLmOptions {
-                capacity: context,
-                taps: drafter
-                    .as_ref()
-                    .map(|(_, d)| d.target_layer_ids().to_vec())
-                    .unwrap_or_default(),
-                ..AneLmOptions::default()
-            };
-            let lm = AneLm::load(model_path, &opts)?;
-            cache.insert(model_path.to_path_buf(), AneEngine { lm, drafter });
-        }
-        let engine = cache.get_mut(model_path).expect("inserted above");
-        f(&mut engine.lm, engine.drafter.as_mut().map(|(_, d)| d))
-    })
 }
 
 #[cfg(feature = "ane")]
@@ -2702,7 +2638,7 @@ pub fn generate_cached_ane_streaming<F>(
 where
     F: FnMut(u32) -> bool,
 {
-    use pmetal_metal::ane::lm::{Drafter, GenerateOptions, PromptLookup};
+    use pmetal_metal::ane::lm::GenerateOptions;
 
     let prompt_len = input_ids.len();
     let context = ane_context(prompt_len, gen_config.max_new_tokens, ane_max_context);
@@ -2718,17 +2654,17 @@ where
         top_k: gen_config.top_k,
         stop: gen_config.stop_tokens.clone(),
     };
+    let request = crate::ane_worker::AneRequest {
+        model_path: model_path.to_path_buf(),
+        draft_path: draft_path.map(std::path::Path::to_path_buf),
+        context,
+        input_ids: input_ids.to_vec(),
+        opts,
+    };
     let mut cancelled = false;
-    let (generated, stats) = with_cached_ane_lm(model_path, draft_path, context, |lm, dflash| {
-        let mut lookup = PromptLookup::default();
-        let drafter: &mut dyn Drafter = match dflash {
-            Some(dflash) => dflash,
-            None => &mut lookup,
-        };
-        lm.generate(input_ids, &opts, drafter, |token| {
-            cancelled = !on_token(token);
-            !cancelled
-        })
+    let (generated, stats) = crate::ane_worker::generate(request, |token| {
+        cancelled = !on_token(token);
+        !cancelled
     })?;
     tracing::debug!(
         passes = stats.passes + 1,
