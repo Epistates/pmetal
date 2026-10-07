@@ -12,6 +12,7 @@
 use std::path::Path;
 
 use pmetal_bridge::compat::{Array, Exception, ops};
+use pmetal_bridge::native_weight::{EmbeddingWeight, LayerWeight, QuantParams};
 use pmetal_mlx::kv_cache::KVCache;
 
 use crate::architectures::dflash_draft::DFlashDraftModel;
@@ -36,9 +37,11 @@ pub struct DFlashDrafter {
     /// draft runs.
     cache: Vec<KVCache>,
     /// The target's token embedding, `[vocab, dim]`.
-    embed: Array,
-    /// The target's LM head, `[vocab, dim]`, when it isn't the embedding.
-    lm_head: Option<Array>,
+    embed: EmbeddingWeight,
+    /// The target's LM head when it isn't the embedding.
+    lm_head: Option<LayerWeight>,
+    /// The activations' dtype: the target's, as its embedding was stored.
+    dtype: i32,
     taps: Vec<usize>,
     dim: usize,
     /// Observed hidden states not yet in the cache, `[n, taps * dim]`.
@@ -49,13 +52,16 @@ pub struct DFlashDrafter {
 
 impl DFlashDrafter {
     /// Load the draft model in `draft_dir` for the target in `target_dir`,
-    /// with room for `max_context` tokens of context.
+    /// with room for `max_context` tokens of context, its weights and its
+    /// copy of the target's embedding and LM head packed as `quant` says
+    /// (dense for `None`).
     pub fn load(
         draft_dir: &Path,
         target_dir: &Path,
         max_context: usize,
+        quant: Option<QuantParams>,
     ) -> Result<Self, Exception> {
-        let (draft, report) = load_dflash_draft_from_dir(draft_dir)?;
+        let (mut draft, report) = load_dflash_draft_from_dir(draft_dir)?;
         let expected = TENSORS_PER_LAYER * draft.num_layers() + 3;
         if report.loaded != expected || !report.skipped.is_empty() {
             return Err(Exception::custom(format!(
@@ -114,23 +120,66 @@ impl DFlashDrafter {
         } else {
             Some(take("lm_head.weight")?)
         };
+        let dtype = embed.dtype().as_i32();
+        let (embed, lm_head) = match quant {
+            None => (
+                EmbeddingWeight::new(
+                    embed,
+                    None,
+                    None,
+                    QuantParams::defaults_for(pmetal_bridge::QuantizedMode::Affine),
+                ),
+                lm_head.map(|w| {
+                    LayerWeight::new(
+                        w,
+                        None,
+                        None,
+                        QuantParams::defaults_for(pmetal_bridge::QuantizedMode::Affine),
+                    )
+                }),
+            ),
+            Some(params) => {
+                draft.quantize(params)?;
+                let pack = |w: Array| {
+                    let (w, s, b) = w.quantize_weights(params.group_size, params.bits);
+                    pmetal_bridge::check_last_error()
+                        .map(|()| (w, s, b))
+                        .map_err(|e| Exception::custom(format!("DFlash target head: {e}")))
+                };
+                let (w, s, b) = pack(embed)?;
+                let embed = EmbeddingWeight::new(w, Some(s), Some(b), params);
+                let lm_head = match lm_head {
+                    Some(head) => {
+                        let (w, s, b) = pack(head)?;
+                        Some(LayerWeight::new(w, Some(s), Some(b), params))
+                    }
+                    None => None,
+                };
+                (embed, lm_head)
+            }
+        };
 
         let mut drafter = Self {
             cache: Vec::new(),
             draft,
             embed,
             lm_head,
+            dtype,
             taps,
             dim,
             pending: Vec::new(),
             max_context,
         };
         // MLX builds its kernels on first use, ~1.5 s that would otherwise
-        // land on the first request.
+        // land on the first request. A draft after a prompt reads many rows
+        // of context and one mid-generation a few, which take different
+        // kernels (packed matmuls especially), so warm both.
         drafter.reset();
         let row = drafter.taps.len() * dim;
-        drafter.observe(&vec![0.0; row], 1)?;
-        drafter.propose(0, drafter.max_guesses())?;
+        for n in [64, 1] {
+            drafter.observe(&vec![0.0; n * row], n)?;
+            drafter.propose(0, drafter.max_guesses())?;
+        }
         drafter.reset();
         Ok(drafter)
     }
@@ -186,15 +235,17 @@ impl DFlashDrafter {
         let mut block = vec![self.draft.mask_token_id(); bs];
         block[0] = last as i32;
         let ids = Array::from_slice(&block, &[bs as i32]);
-        let noise = ops::take_axis(&self.embed, &ids, 0).reshape(&[1, bs as i32, dim as i32]);
-        let context = Array::from_slice(&self.pending, &[1, n as i32, row as i32])
-            .as_dtype(self.embed.dtype().as_i32());
+        let noise = self.embed.lookup(&ids).reshape(&[1, bs as i32, dim as i32]);
+        let context =
+            Array::from_slice(&self.pending, &[1, n as i32, row as i32]).as_dtype(self.dtype);
         let hidden = self.draft.draft_block(&noise, &context, &mut self.cache)?;
         self.pending.clear();
 
         let guesses = hidden.slice(&[0, 1, 0], &[1, 1 + max as i32, dim as i32]);
-        let head = self.lm_head.as_ref().unwrap_or(&self.embed);
-        let logits = ops::matmul(&guesses, &ops::transpose(head));
+        let logits = match &self.lm_head {
+            Some(head) => head.matmul_from(&guesses),
+            None => self.embed.as_linear(&guesses),
+        };
         let tokens = ops::argmax_axis(&logits, -1);
         let _ = tokens.eval();
         pmetal_bridge::check_last_error()

@@ -9,6 +9,8 @@
 
 use std::path::PathBuf;
 
+use pmetal_bridge::QuantizedMode;
+use pmetal_bridge::native_weight::QuantParams;
 use pmetal_metal::ane::lm::{AneLm, AneLmOptions, GenerateOptions, NoDraft};
 use pmetal_models::dflash_drafter::DFlashDrafter;
 
@@ -56,10 +58,24 @@ fn dflash_keeps_greedy_output_on_the_ane() {
         return;
     };
     let capacity = 1024;
-    let mut drafter = DFlashDrafter::load(&draft, &target, capacity).expect("load draft");
+    let eight_bit = QuantParams {
+        group_size: 64,
+        bits: 8,
+        mode: QuantizedMode::Affine,
+    };
+    let mut drafters = [
+        (
+            "bf16",
+            DFlashDrafter::load(&draft, &target, capacity, None).expect("load draft"),
+        ),
+        (
+            "8-bit",
+            DFlashDrafter::load(&draft, &target, capacity, Some(eight_bit)).expect("load draft"),
+        ),
+    ];
     let opts = AneLmOptions {
         capacity,
-        taps: drafter.target_layer_ids().to_vec(),
+        taps: drafters[0].1.target_layer_ids().to_vec(),
         ..AneLmOptions::default()
     };
     let mut lm = AneLm::load(&target, &opts).expect("load target");
@@ -74,28 +90,38 @@ fn dflash_keeps_greedy_output_on_the_ane() {
         let (plain, p) = lm
             .generate(prompt, &settings, &mut NoDraft, |_| true)
             .expect("plain");
-        let (spec, s) = lm
-            .generate(prompt, &settings, &mut drafter, |_| true)
-            .expect("dflash");
-        let tokens_per_pass = s.generated_tokens as f64 / (s.passes + 1) as f64;
         eprintln!(
-            "{name}: plain {:.1} tok/s; dflash {:.1} tok/s, {tokens_per_pass:.2} tokens/pass, \
-             {:.1} ms/pass of which {:.1} drafting ({} tokens, {} passes, {}/{} guesses kept)",
-            p.generated_tokens as f64 / p.decode_secs,
-            s.generated_tokens as f64 / s.decode_secs,
-            s.decode_secs * 1e3 / (s.passes + 1) as f64,
-            s.draft_secs * 1e3 / (s.passes + 1) as f64,
-            s.generated_tokens,
-            s.passes + 1,
-            s.accepted_tokens,
-            s.drafted_tokens,
+            "{name}: plain {:.1} tok/s",
+            p.generated_tokens as f64 / p.decode_secs
         );
-        assert_eq!(spec, plain, "{name}: DFlash changed the greedy output");
-        per_pass.push(tokens_per_pass);
+        for (precision, drafter) in &mut drafters {
+            let (spec, s) = lm
+                .generate(prompt, &settings, drafter, |_| true)
+                .expect("dflash");
+            let tokens_per_pass = s.generated_tokens as f64 / (s.passes + 1) as f64;
+            eprintln!(
+                "  {precision} draft: {:.1} tok/s, {tokens_per_pass:.2} tokens/pass, {:.1} ms/pass \
+                 of which {:.1} drafting ({} tokens, {} passes, {}/{} guesses kept)",
+                s.generated_tokens as f64 / s.decode_secs,
+                s.decode_secs * 1e3 / (s.passes + 1) as f64,
+                s.draft_secs * 1e3 / (s.passes + 1) as f64,
+                s.generated_tokens,
+                s.passes + 1,
+                s.accepted_tokens,
+                s.drafted_tokens,
+            );
+            assert_eq!(
+                spec, plain,
+                "{name}: the {precision} draft changed the greedy output"
+            );
+            per_pass.push(tokens_per_pass);
+        }
     }
+    // The fibonacci prompt, either draft.
     assert!(
-        per_pass[0] > 4.0,
-        "fibonacci: {:.2} tokens per pass; upstream reaches 8.4",
-        per_pass[0]
+        per_pass[0] > 4.0 && per_pass[1] > 4.0,
+        "fibonacci: {:.2} and {:.2} tokens per pass; upstream reaches 8.4",
+        per_pass[0],
+        per_pass[1]
     );
 }

@@ -463,6 +463,22 @@ impl DFlashDraftModel {
         Ok(self.norm.forward(&hidden))
     }
 
+    /// Pack every projection for MLX's quantized matmul. At 8 bits the
+    /// drafts barely change (dflash-mlx: the same tokens per verify step on
+    /// Qwen3-4B) and a draft reads half the bytes.
+    pub fn quantize(
+        &mut self,
+        params: pmetal_bridge::native_weight::QuantParams,
+    ) -> Result<(), Exception> {
+        let mut result = Ok(());
+        pmetal_bridge::compat::VisitLinears::visit_linears_mut(self, "", &mut |_, linear| {
+            if result.is_ok() {
+                result = linear.quantize(params);
+            }
+        });
+        result
+    }
+
     /// A KV cache per layer, with room for `context` positions of context
     /// and a block, for [`draft_block`](Self::draft_block).
     pub fn make_cache(&self, context: usize) -> Vec<KVCache> {

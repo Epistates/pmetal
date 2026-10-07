@@ -20,6 +20,17 @@ use pmetal_metal::error::{MetalError, Result};
 
 use crate::dflash_drafter::DFlashDrafter;
 
+/// How the DFlash drafter's weights are packed. At 8 bits its guesses are as
+/// good as at bf16 (Qwen3-4B: 7.1, 4.7 and 3.1 tokens per pass on three chat
+/// prompts against 6.9, 4.7 and 3.0) and a draft takes ~2.5 ms less, with
+/// half the GPU memory.
+const DRAFT_QUANT: pmetal_bridge::native_weight::QuantParams =
+    pmetal_bridge::native_weight::QuantParams {
+        group_size: 64,
+        bits: 8,
+        mode: pmetal_bridge::QuantizedMode::Affine,
+    };
+
 /// A model on the ANE, and the DFlash drafter (on the GPU) reading its
 /// hidden states, if it has one.
 struct AneEngine {
@@ -147,7 +158,7 @@ fn engine_for<'a>(
         let drafter = draft_path
             .map(|path| {
                 tracing::info!(draft = %path.display(), "Loading the DFlash drafter");
-                DFlashDrafter::load(path, model_path, context)
+                DFlashDrafter::load(path, model_path, context, Some(DRAFT_QUANT))
                     .map(|drafter| (path.to_path_buf(), drafter))
                     .map_err(|e| MetalError::InvalidConfig(e.to_string()))
             })
