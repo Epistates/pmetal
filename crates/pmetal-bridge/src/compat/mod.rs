@@ -955,27 +955,39 @@ pub mod losses {
         pub fn build(self) -> BinaryCrossEntropy {
             BinaryCrossEntropy {
                 reduction: self.reduction,
-                _with_logits: self.with_logits,
+                with_logits: self.with_logits,
             }
         }
     }
 
+    /// Binary cross-entropy, MLX's `nn.losses.binary_cross_entropy`.
     pub struct BinaryCrossEntropy {
         reduction: LossReduction,
-        _with_logits: bool,
+        with_logits: bool,
     }
 
     impl BinaryCrossEntropy {
-        pub fn call(&self, logits: &Array, targets: &Array) -> Array {
-            // BCE with logits: -( targets * log_sigmoid(logits) + (1-targets) * log_sigmoid(-logits) )
-            let ones = Array::ones(logits.shape(), 10);
-            let neg_logits = logits.negative();
-            let pos = logits.log_softmax(0); // placeholder - proper impl would use log_sigmoid
-            let neg = neg_logits.log_softmax(0);
-            let loss = targets
-                .negative()
-                .multiply(&pos)
-                .subtract(&ones.subtract(targets).multiply(&neg));
+        /// Element-wise BCE of `inputs` against `targets` in `{0, 1}`, then
+        /// the reduction.
+        ///
+        /// With logits, `logaddexp(0, x) - x·t`, which is
+        /// `-(t·log σ(x) + (1 - t)·log(1 - σ(x)))` without overflow. With
+        /// probabilities, `-(t·log p + (1 - t)·log(1 - p))` with each log
+        /// clipped at -100, as MLX and PyTorch do.
+        pub fn call(&self, inputs: &Array, targets: &Array) -> Array {
+            let loss = if self.with_logits {
+                let zero = Array::scalar_like(0.0, inputs);
+                zero.logaddexp(inputs).subtract(&inputs.multiply(targets))
+            } else {
+                let floor = Array::scalar_like(-100.0, inputs);
+                let one = Array::scalar_like(1.0, inputs);
+                let log_p = inputs.log().maximum(&floor);
+                let log_not_p = one.subtract(inputs).log().maximum(&floor);
+                targets
+                    .multiply(&log_p)
+                    .add(&one.subtract(targets).multiply(&log_not_p))
+                    .negative()
+            };
             match self.reduction {
                 LossReduction::Mean => loss.mean_all(),
                 LossReduction::Sum => loss.sum_all(),
