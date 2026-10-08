@@ -180,6 +180,20 @@ impl ContinuousPump {
         gen_config: GenerationConfig,
         channel_capacity: usize,
     ) -> Result<(SlotId, mpsc::Receiver<TokenEvent>), EnqueueError> {
+        let (tx, rx) = mpsc::channel(channel_capacity);
+        let slot = self.enqueue_with_sender(prompt, params, gen_config, tx)?;
+        Ok((slot, rx))
+    }
+
+    /// [`enqueue`](Self::enqueue) into a channel the caller made. On error
+    /// nothing is sent, so the caller can still use `tx` for the request.
+    pub fn enqueue_with_sender(
+        &mut self,
+        prompt: Vec<u32>,
+        params: SlotParams,
+        gen_config: GenerationConfig,
+        tx: mpsc::Sender<TokenEvent>,
+    ) -> Result<SlotId, EnqueueError> {
         let prompt_tokens = prompt.len();
         let stop_sequences = params.stop_sequences.clone();
         let logprobs_top_n = params.logprobs_top_n;
@@ -230,7 +244,6 @@ impl ContinuousPump {
         let slot =
             self.batcher
                 .enqueue_with_reserved_tokens(scheduler_prompt, params, reserved_tokens)?;
-        let (tx, rx) = mpsc::channel(channel_capacity);
         self.records.insert(
             slot,
             SlotRecord {
@@ -250,7 +263,7 @@ impl ContinuousPump {
                 prefix_hit_len,
             },
         );
-        Ok((slot, rx))
+        Ok(slot)
     }
 
     /// Cancel an in-flight slot. Pending slots are simply dropped; a

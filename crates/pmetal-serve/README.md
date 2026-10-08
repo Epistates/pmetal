@@ -43,11 +43,13 @@ use pmetal_models::DynamicModel;
 use pmetal_serve::{InferenceEngine, ServeConfig, server::run_server};
 
 async fn serve(model_dir: &str) -> anyhow::Result<()> {
-    let model = DynamicModel::load(model_dir)?;
     let tokenizer = Tokenizer::from_model_dir(model_dir)?;
 
+    // The model loads on the engine's own thread and stays there; every
+    // request runs on it.
+    let dir = model_dir.to_string();
     let engine = InferenceEngine::new(
-        model,
+        move || Ok(DynamicModel::load(&dir)?),
         tokenizer,
         "my-model".to_string(),
         Path::new(model_dir),

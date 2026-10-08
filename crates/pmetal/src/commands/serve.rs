@@ -53,35 +53,6 @@ pub(crate) async fn run_serve(
     let tokenizer = pmetal_data::Tokenizer::from_model_dir(&model_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
 
-    // Load model
-    tracing::info!("Loading model from {:?}...", model_path);
-    let mut model = DynamicModel::load_with_options(
-        &model_path,
-        pmetal_models::dispatcher::DynamicModelLoadOptions {
-            prefer_expert_offload: experts_dir.is_some(),
-        },
-    )?;
-
-    // Quantize to FP8 if requested
-    if fp8 {
-        tracing::info!("Quantizing model weights to FP8 E4M3...");
-        model.quantize_fp8()?;
-    }
-
-    // Enable expert offloading if a packed experts directory is provided
-    if let Some(ref experts_dir) = experts_dir {
-        model.enable_expert_offloading(std::path::Path::new(experts_dir))?;
-    } else if model.requires_expert_offloading() {
-        anyhow::bail!(
-            "this model requires expert offloading; repack routed experts with `pmetal pack-experts` and pass --experts-dir <packed_dir>"
-        );
-    }
-
-    tracing::info!("Model loaded successfully");
-
-    // Resolve KV cache mode override using the same model-derived base-cache
-    // configuration path as CLI/GUI inference. This keeps dense and MoE models
-    // on one canonical TurboQuant/KV selection policy.
     let kv_turboquant_preset = match kv_turboquant_preset.as_deref() {
         Some("q2_5") => Some(TurboQuantPreset::Q2_5),
         Some("q3_5") => Some(TurboQuantPreset::Q3_5),
@@ -90,35 +61,73 @@ pub(crate) async fn run_serve(
         }
         None => None,
     };
-    let base_cache = model.create_cache(max_seq_len);
-    let cache_mode_override = explicit_cache_mode_override(
-        base_cache.config(),
-        CacheModeRequest {
-            kv_quant,
-            kv_k_bits: None,
-            kv_v_bits: None,
-            kv_group_size,
-            kv_turboquant,
-            kv_turboquant_preset,
-            no_kv_quant,
-            fp8,
-        },
-    );
-    if let Some(ref mode) = cache_mode_override {
-        tracing::info!(mode = %mode.describe(), "KV cache override");
-    }
+    let cache_mode_request = CacheModeRequest {
+        kv_quant,
+        kv_k_bits: None,
+        kv_v_bits: None,
+        kv_group_size,
+        kv_turboquant,
+        kv_turboquant_preset,
+        no_kv_quant,
+        fp8,
+    };
 
-    // Create inference engine
-    let engine = InferenceEngine::new_with_options(
-        model,
+    // The model loads on the engine's own thread, where every request will
+    // run: arrays it leaves unevaluated can't be evaluated anywhere else.
+    tracing::info!("Loading model from {:?}...", model_path);
+    let (cache_mode_tx, cache_mode_rx) = std::sync::mpsc::channel();
+    let load_path = model_path.clone();
+    let load = move || -> anyhow::Result<DynamicModel> {
+        let mut model = DynamicModel::load_with_options(
+            &load_path,
+            pmetal_models::dispatcher::DynamicModelLoadOptions {
+                prefer_expert_offload: experts_dir.is_some(),
+            },
+        )?;
+
+        // Quantize to FP8 if requested
+        if fp8 {
+            tracing::info!("Quantizing model weights to FP8 E4M3...");
+            model.quantize_fp8()?;
+        }
+
+        // Enable expert offloading if a packed experts directory is provided
+        if let Some(ref experts_dir) = experts_dir {
+            model.enable_expert_offloading(std::path::Path::new(experts_dir))?;
+        } else if model.requires_expert_offloading() {
+            anyhow::bail!(
+                "this model requires expert offloading; repack routed experts with `pmetal pack-experts` and pass --experts-dir <packed_dir>"
+            );
+        }
+
+        // Resolve the KV cache mode override from the model's own cache
+        // configuration, as CLI/GUI inference does, so dense and MoE models
+        // share one TurboQuant/KV selection policy.
+        let base_cache = model.create_cache(max_seq_len);
+        let _ = cache_mode_tx.send(explicit_cache_mode_override(
+            base_cache.config(),
+            cache_mode_request,
+        ));
+        Ok(model)
+    };
+
+    let engine = InferenceEngine::new_with_backend(
+        load,
         tokenizer,
         model_id.clone(),
         &model_path,
         max_seq_len,
         ane_enabled,
         ane_max_seq_len,
-        cache_mode_override,
     )?;
+    tracing::info!("Model loaded successfully");
+    let engine = match cache_mode_rx.recv().ok().flatten() {
+        Some(mode) => {
+            tracing::info!(mode = %mode.describe(), "KV cache override");
+            engine.with_cache_mode_override(mode)
+        }
+        None => engine,
+    };
     let engine = match draft_path {
         Some(path) => engine.with_ane_drafter(path),
         None => engine,

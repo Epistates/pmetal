@@ -42,9 +42,8 @@ criterion = { workspace = true }
 name = "continuous_batch"
 harness = false
 
-# Inherit workspace lints (including `unsafe_code = "deny"`); the single
-# `unsafe impl Send for ModelState` in engine.rs is annotated with
-# `#[allow(unsafe_code)]` + a SAFETY comment, which overrides the deny at
-# the item level.
+# Inherit workspace lints, including `unsafe_code = "deny"`. The models live
+# on their own threads (`pmetal_models::model_thread`), so nothing here has to
+# claim a `!Send` model is safe to share.
 [lints]
 workspace = true

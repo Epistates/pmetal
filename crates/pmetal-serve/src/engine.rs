@@ -1,5 +1,6 @@
 //! Core inference engine that wraps model + tokenizer + generation.
 
+use crate::continuous_pump::ContinuousPump;
 use crate::error::{ServeError, ServeResult};
 use crate::types::ChatMessage;
 use pmetal_data::chat_templates::{ChatTemplate, ChatTemplateType, detect_chat_template};
@@ -8,6 +9,7 @@ use pmetal_mlx::kv_cache::{CacheMode, KVCache, KVCacheConfig, MambaCache};
 use pmetal_mlx::{Array, Dtype, ModuleParameters as _};
 use pmetal_models::dispatcher::DynamicModel;
 use pmetal_models::generation::{GenerationConfig, Sampler};
+use pmetal_models::model_thread::{Background, ModelThread, ModelThreadStartError};
 use pmetal_models::{
     GenerationOutput, generate_cached_ane_streaming, generate_cached_hybrid_cpu_streaming,
     is_ane_inference_compatible, is_hybrid_cpu_compatible,
@@ -446,9 +448,16 @@ fn estimate_fp16_kv_cache_bytes(base_cache_config: &KVCacheConfig) -> u64 {
 // ────────────────────────────────────────────────────────────────────────────
 
 /// The inference engine encapsulates model, tokenizer, and generation parameters.
+///
+/// The model lives on its own thread (see [`ModelThread`]): it is loaded there,
+/// every request that touches it runs there, one at a time, and so does the
+/// continuous-batching scheduler when it is enabled. MLX streams belong to the
+/// thread that created them, so a model moved between tokio's blocking-pool
+/// threads failed with "There is no Stream(gpu, N) in current thread" as soon
+/// as a request landed on a thread other than the one that built its arrays.
 pub struct InferenceEngine {
-    /// The loaded model (behind a std Mutex — DynamicModel is !Send).
-    model: Arc<Mutex<ModelState>>,
+    /// The thread that owns the model.
+    model: ModelThread<EngineState>,
     /// The tokenizer.
     tokenizer: Arc<pmetal_data::Tokenizer>,
     /// Detected chat template.
@@ -476,128 +485,54 @@ pub struct InferenceEngine {
     /// processed. Empty for hybrid/recurrent models (they can't be
     /// safely snapshot-truncated) and for every request where the
     /// engine is also running an accelerated ANE/CPU-hybrid backend.
+    /// Its entries are only touched on the model thread.
     prefix_cache: Arc<Mutex<crate::prefix_cache::ServePrefixCache>>,
-    /// Optional continuous-batching runtime. `None` by default — an
-    /// opt-in alternative to the single-request `generate` /
-    /// `generate_streaming` paths. Enabled by calling
-    /// [`enable_continuous_batching`](Self::enable_continuous_batching).
-    continuous: Arc<Mutex<Option<ContinuousRuntime>>>,
+    /// The continuous-batching pump while it is enabled (`None` by
+    /// default). The model thread drives it; this handle is for
+    /// [`continuous_batching_depth`](Self::continuous_batching_depth).
+    continuous: Mutex<Option<Arc<Mutex<ContinuousPump>>>>,
 }
 
-/// Runtime state for the continuous-batching driver. Dropping the
-/// `InferenceEngine` (or explicitly calling `disable_continuous_batching`)
-/// signals `shutdown`, and the driver thread joins.
-struct ContinuousRuntime {
-    pump: Arc<Mutex<crate::continuous_pump::ContinuousPump>>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-    driver: Option<std::thread::JoinHandle<()>>,
+/// What lives on the model thread.
+struct EngineState {
+    model: DynamicModel,
+    /// The continuous-batching pump, while enabled. The thread runs one of its
+    /// steps whenever no request is queued.
+    continuous: Option<Arc<Mutex<ContinuousPump>>>,
 }
 
-impl Drop for ContinuousRuntime {
-    fn drop(&mut self) {
-        self.shutdown
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        if let Some(h) = self.driver.take() {
-            let _ = h.join();
-        }
-    }
-}
-
-/// Continuous-batching driver loop.
-///
-/// Parked in a dedicated OS thread (not a tokio task — forward passes
-/// are synchronous and hold the model lock). Each iteration:
-///
-/// 1. Checks the shutdown flag.
-/// 2. Locks the model, then the pump.
-/// 3. Hands the pump a forward closure that drives
-///    `DynamicModel::forward_with_hybrid_cache` on the current slot's
-///    KV cache.
-/// 4. Advances the slot state based on the returned `Tick`.
-/// 5. Releases both locks so single-request paths can run between
-///    ticks, and parks briefly on `Tick::Idle`.
-///
-/// The loop exits when `shutdown` flips to `true` — either because the
-/// `ContinuousRuntime` was dropped or `disable_continuous_batching()`
-/// was called.
-fn run_continuous_driver(
-    model_arc: Arc<Mutex<ModelState>>,
-    pump_arc: Arc<Mutex<crate::continuous_pump::ContinuousPump>>,
-    shutdown: Arc<std::sync::atomic::AtomicBool>,
-) {
+/// One continuous-batching step, run by the model thread between jobs: a
+/// prefill chunk for one slot or a decode step for every decoding slot.
+/// Reports idle when no request is pending or in flight; the job that
+/// enqueues the next one wakes the thread.
+fn continuous_step(state: &mut EngineState) -> Background {
     use crate::continuous_pump::Tick;
-    use pmetal_bridge::compat::{Array as _Array, Dtype as _Dtype};
-    use std::sync::atomic::Ordering;
-    use std::time::Duration;
 
-    // Park briefly on idle instead of hot-spinning. 10 ms is short
-    // enough that an incoming enqueue is picked up quickly and long
-    // enough to avoid burning a core when no requests are in flight.
-    const IDLE_SLEEP: Duration = Duration::from_millis(10);
-    // After an error, back off a bit longer before retrying so we
-    // don't drown the logs.
-    const ERROR_SLEEP: Duration = Duration::from_millis(100);
-
-    loop {
-        if shutdown.load(Ordering::SeqCst) {
-            break;
-        }
-
-        // Lock model + pump in a fixed order (model → pump) to avoid
-        // deadlocking against `generate_batched`, which only ever
-        // takes the pump lock.
-        let tick_result = {
-            let mut state = match model_arc.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    // Model mutex poisoned — the engine is in an
-                    // unrecoverable state. Exit cleanly.
-                    tracing::error!(target: "pmetal_serve::continuous_batch", "model mutex poisoned; stopping driver");
-                    return;
-                }
-            };
-            let model = &mut state.model;
-
-            let mut forward = |tokens: &[u32],
-                               cache: &mut KVCache|
-             -> Result<_Array, pmetal_bridge::compat::Exception> {
-                // Build a [1, S] Int32 input from the u32 tokens. Every
-                // architecture's `forward_with_hybrid_cache` accepts
-                // Int32 inputs in this shape.
-                let shape = [1i32, tokens.len() as i32];
-                let arr = _Array::from_u32_slice(tokens, &shape);
-                let arr = arr.as_dtype(_Dtype::Int32.as_i32());
-                model.forward_with_hybrid_cache(&arr, None, Some(cache), None)
-            };
-
-            let mut pump = match pump_arc.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    tracing::error!(target: "pmetal_serve::continuous_batch", "pump mutex poisoned; stopping driver");
-                    return;
-                }
-            };
-            pump.tick(&mut forward)
+    let Some(pump) = state.continuous.as_ref() else {
+        return Background::Idle;
+    };
+    let Ok(mut pump) = pump.lock() else {
+        tracing::error!(target: "pmetal_serve::continuous_batch", "pump mutex poisoned");
+        return Background::Idle;
+    };
+    let model = &mut state.model;
+    let mut forward =
+        |tokens: &[u32], cache: &mut KVCache| -> Result<Array, pmetal_bridge::compat::Exception> {
+            let input = Array::from_u32_slice(tokens, &[1, tokens.len() as i32])
+                .as_dtype(Dtype::Int32.as_i32());
+            model.forward_with_hybrid_cache(&input, None, Some(cache), None)
         };
-
-        match tick_result {
-            Ok(Tick::Ran) => {
-                // Yield the thread briefly so the tokio runtime gets a
-                // chance to schedule token-channel readers.
-                std::thread::yield_now();
-            }
-            Ok(Tick::Idle) => std::thread::sleep(IDLE_SLEEP),
-            Err(e) => {
-                tracing::warn!(
-                    target: "pmetal_serve::continuous_batch",
-                    "driver tick error: {e:?}; backing off"
-                );
-                std::thread::sleep(ERROR_SLEEP);
-            }
+    match pump.tick(&mut forward) {
+        Ok(Tick::Ran) => Background::Busy,
+        Ok(Tick::Idle) => Background::Idle,
+        Err(e) => {
+            tracing::warn!(
+                target: "pmetal_serve::continuous_batch",
+                "continuous-batching step failed: {e:?}"
+            );
+            Background::Idle
         }
     }
-
-    tracing::info!(target: "pmetal_serve::continuous_batch", "driver stopped");
 }
 
 // Default prefix-cache budgets. Generous on entries since each one is
@@ -605,16 +540,23 @@ fn run_continuous_driver(
 const DEFAULT_PREFIX_CACHE_ENTRIES: usize = 16;
 const DEFAULT_PREFIX_CACHE_BYTES: usize = 2 * 1024 * 1024 * 1024; // 2 GiB
 
-/// Model + cache state that must be accessed sequentially.
-struct ModelState {
-    model: DynamicModel,
+/// What a GPU request needs on the model thread, besides the model.
+#[derive(Clone)]
+struct GpuRequestContext {
+    model_path: PathBuf,
+    max_seq_len: usize,
+    cache_mode_override: Option<CacheMode>,
+    tokenizer: Arc<pmetal_data::Tokenizer>,
+    prefix_cache: Arc<Mutex<crate::prefix_cache::ServePrefixCache>>,
 }
 
-// SAFETY: DynamicModel is !Send because it contains raw pointers from MLX's C FFI.
-// We serialize all access through std::sync::Mutex, ensuring no concurrent access.
-// The Mutex guard is never held across an await point.
-#[allow(unsafe_code)]
-unsafe impl Send for ModelState {}
+/// One GPU generation request, run on the model thread.
+struct GpuRequest {
+    input_ids: Vec<u32>,
+    gen_config: GenerationConfig,
+    stop_sequences: Vec<String>,
+    logprobs_top_n: Option<usize>,
+}
 
 impl InferenceEngine {
     fn create_request_caches(
@@ -645,16 +587,21 @@ impl InferenceEngine {
         (cache, mamba_cache)
     }
 
-    /// Create a new inference engine from a loaded model and tokenizer.
+    /// Create a new inference engine, loading the model with `load`.
+    ///
+    /// `load` runs on the engine's model thread, where the model stays: it
+    /// has to be built there, since arrays it leaves unevaluated can't be
+    /// evaluated on any other thread. Returns once the model is loaded, or
+    /// with the error `load` returned.
     pub fn new(
-        model: DynamicModel,
+        load: impl FnOnce() -> anyhow::Result<DynamicModel> + Send + 'static,
         tokenizer: pmetal_data::Tokenizer,
         model_id: String,
         model_path: &std::path::Path,
         max_seq_len: usize,
-    ) -> ServeResult<Self> {
+    ) -> anyhow::Result<Self> {
         Self::new_with_backend(
-            model,
+            load,
             tokenizer,
             model_id,
             model_path,
@@ -664,46 +611,17 @@ impl InferenceEngine {
         )
     }
 
-    /// Create a new inference engine with explicit backend controls.
+    /// Create a new inference engine with explicit backend controls. See
+    /// [`new`](Self::new) for `load`.
     pub fn new_with_backend(
-        model: DynamicModel,
+        load: impl FnOnce() -> anyhow::Result<DynamicModel> + Send + 'static,
         tokenizer: pmetal_data::Tokenizer,
         model_id: String,
         model_path: &std::path::Path,
         max_seq_len: usize,
         ane_enabled: bool,
         ane_max_seq_len: usize,
-    ) -> ServeResult<Self> {
-        Self::new_with_options(
-            model,
-            tokenizer,
-            model_id,
-            model_path,
-            max_seq_len,
-            ane_enabled,
-            ane_max_seq_len,
-            None,
-        )
-    }
-
-    /// Draft with the DFlash draft model in `path` when generating on the ANE
-    /// (run on the GPU, reading the ANE model's hidden states).
-    pub fn with_ane_drafter(mut self, path: std::path::PathBuf) -> Self {
-        self.ane_draft_path = Some(path);
-        self
-    }
-
-    /// Create a new inference engine with explicit backend and cache mode controls.
-    pub fn new_with_options(
-        model: DynamicModel,
-        tokenizer: pmetal_data::Tokenizer,
-        model_id: String,
-        model_path: &std::path::Path,
-        max_seq_len: usize,
-        ane_enabled: bool,
-        ane_max_seq_len: usize,
-        cache_mode_override: Option<CacheMode>,
-    ) -> ServeResult<Self> {
+    ) -> anyhow::Result<Self> {
         let chat_template = detect_chat_template(model_path, &model_id);
 
         // Collect stop tokens from all available sources using the canonical
@@ -712,12 +630,6 @@ impl InferenceEngine {
         // EOS, and 11 well-known special token probes — deduplicated.
         let template_type: Option<ChatTemplateType> = Some(chat_template.template_type);
         let stop_token_ids = collect_all_stop_tokens(model_path, &tokenizer, template_type);
-
-        tracing::info!(
-            "Inference engine ready: model_id={}, stop_tokens={:?}",
-            model_id,
-            stop_token_ids
-        );
 
         let preferred_backend = match std::fs::read_to_string(model_path.join("config.json")) {
             Ok(config_text) => match serde_json::from_str::<serde_json::Value>(&config_text) {
@@ -741,6 +653,26 @@ impl InferenceEngine {
             }
         };
 
+        let model = ModelThread::spawn_with_background(
+            "pmetal-model",
+            move || {
+                load().map(|model| EngineState {
+                    model,
+                    continuous: None,
+                })
+            },
+            continuous_step,
+        )
+        .map_err(|e| match e {
+            ModelThreadStartError::Init(e) => e,
+            other => anyhow::anyhow!("{other}"),
+        })?;
+
+        tracing::info!(
+            "Inference engine ready: model_id={}, stop_tokens={:?}",
+            model_id,
+            stop_token_ids
+        );
         tracing::info!(
             model = %model_path.display(),
             backend = ?preferred_backend,
@@ -749,10 +681,8 @@ impl InferenceEngine {
             "Selected serving generation backend"
         );
 
-        let created_at = chrono::Utc::now().timestamp();
-
         Ok(Self {
-            model: Arc::new(Mutex::new(ModelState { model })),
+            model,
             tokenizer: Arc::new(tokenizer),
             chat_template,
             model_id,
@@ -764,14 +694,28 @@ impl InferenceEngine {
                 preferred: preferred_backend,
             })),
             stop_token_ids,
-            created_at,
-            cache_mode_override,
+            created_at: chrono::Utc::now().timestamp(),
+            cache_mode_override: None,
             prefix_cache: Arc::new(Mutex::new(crate::prefix_cache::ServePrefixCache::new(
                 DEFAULT_PREFIX_CACHE_ENTRIES,
                 DEFAULT_PREFIX_CACHE_BYTES,
             ))),
-            continuous: Arc::new(Mutex::new(None)),
+            continuous: Mutex::new(None),
         })
+    }
+
+    /// Draft with the DFlash draft model in `path` when generating on the ANE
+    /// (run on the GPU, reading the ANE model's hidden states).
+    pub fn with_ane_drafter(mut self, path: std::path::PathBuf) -> Self {
+        self.ane_draft_path = Some(path);
+        self
+    }
+
+    /// Use `mode` for every request's KV cache instead of choosing one from
+    /// the model's size and the device's memory.
+    pub fn with_cache_mode_override(mut self, mode: CacheMode) -> Self {
+        self.cache_mode_override = Some(mode);
+        self
     }
 
     /// Override the default prefix-cache budgets. `max_entries = 0`
@@ -791,14 +735,15 @@ impl InferenceEngine {
         }
     }
 
-    /// Enable continuous batching with the given capacity. Spawns a
-    /// dedicated driver thread that holds the model lock each tick,
-    /// processes one scheduler instruction, and parks briefly on idle.
+    /// Enable continuous batching with the given capacity. The model thread
+    /// then runs one scheduler step (a prefill chunk or a decode step across
+    /// the decoding slots) whenever no other request is queued, and sleeps
+    /// when nothing is in flight.
     ///
     /// While enabled, callers dispatch requests through
     /// [`generate_batched`](Self::generate_batched). The single-request
-    /// `generate` / `generate_streaming` paths continue to work but
-    /// will contend with the driver for the model lock.
+    /// `generate` / `generate_streaming` paths continue to work; each runs
+    /// to completion between two scheduler steps.
     ///
     /// Calling this twice is a no-op that returns `Ok` — the first
     /// configuration wins. Use
@@ -807,55 +752,43 @@ impl InferenceEngine {
     ///
     /// `cache_config` must match the model (num_layers, n_kv_heads,
     /// head_dim, max_seq_len). A mismatch will surface as a shape
-    /// error on the first forward pass.
+    /// error on the first forward pass. Blocks until the model thread is
+    /// free to set the pump up.
     pub fn enable_continuous_batching(
         &self,
         batcher_config: crate::continuous_batch::BatcherConfig,
         cache_config: KVCacheConfig,
     ) -> ServeResult<()> {
-        use std::sync::atomic::AtomicBool;
-
         let mut guard = self.continuous.lock().map_err(|_| ServeError::Busy)?;
         if guard.is_some() {
             return Ok(());
         }
-
-        let pump = Arc::new(Mutex::new(
-            crate::continuous_pump::ContinuousPump::new_with_prefix_cache(
-                batcher_config,
-                cache_config,
-                Some(Arc::clone(&self.tokenizer)),
-                Some(Arc::clone(&self.prefix_cache)),
-            ),
-        ));
-        let shutdown = Arc::new(AtomicBool::new(false));
-
-        let model_arc = Arc::clone(&self.model);
-        let pump_arc = Arc::clone(&pump);
-        let shutdown_arc = Arc::clone(&shutdown);
-
-        let driver = std::thread::Builder::new()
-            .name("pmetal-cb-driver".into())
-            .spawn(move || {
-                run_continuous_driver(model_arc, pump_arc, shutdown_arc);
+        let tokenizer = Arc::clone(&self.tokenizer);
+        let prefix_cache = Arc::clone(&self.prefix_cache);
+        let pump = self
+            .model
+            .call(move |state| {
+                let pump = Arc::new(Mutex::new(ContinuousPump::new_with_prefix_cache(
+                    batcher_config,
+                    cache_config,
+                    Some(tokenizer),
+                    Some(prefix_cache),
+                )));
+                state.continuous = Some(Arc::clone(&pump));
+                pump
             })
-            .map_err(|e| {
-                ServeError::Internal(format!("failed to spawn continuous-batching driver: {e}"))
-            })?;
-
-        *guard = Some(ContinuousRuntime {
-            pump,
-            shutdown,
-            driver: Some(driver),
-        });
+            .map_err(|_| ServeError::ModelNotLoaded)?;
+        *guard = Some(pump);
         Ok(())
     }
 
-    /// Stop the continuous-batching driver and drop the pump. Any
-    /// in-flight requests will see their receivers closed.
+    /// Stop continuous batching and drop the pump. Requests still in it see
+    /// their receivers close.
     pub fn disable_continuous_batching(&self) {
         if let Ok(mut guard) = self.continuous.lock() {
-            *guard = None; // Drop impl handles shutdown + join.
+            if guard.take().is_some() {
+                let _ = self.model.submit(|state| state.continuous = None);
+            }
         }
     }
 
@@ -864,17 +797,24 @@ impl InferenceEngine {
     /// Returns an mpsc receiver that emits one `TokenEvent::Token` per
     /// generated token and exactly one `TokenEvent::Done` /
     /// `TokenEvent::Error` terminator — mirroring the streaming
-    /// contract of `generate_streaming`.
+    /// contract of `generate_streaming`. A request the pump's queue has
+    /// no room for runs on the single-request path instead, into the
+    /// same receiver.
     ///
     /// Errors if continuous batching is not enabled (call
     /// [`enable_continuous_batching`](Self::enable_continuous_batching)
-    /// first) or if the pump's pending queue is saturated.
+    /// first) or the model thread has exited.
     pub fn generate_batched(
         &self,
         input_ids: &[u32],
         params: SamplingParams,
     ) -> ServeResult<tokio::sync::mpsc::Receiver<TokenEvent>> {
         Self::validate_params(&params, self.max_seq_len)?;
+        if !self.continuous_batching_enabled() {
+            return Err(ServeError::Internal(
+                "continuous batching not enabled; call enable_continuous_batching first".into(),
+            ));
+        }
 
         let gen_config = self.build_generation_config(&params);
         let slot_params = crate::continuous_batch::SlotParams {
@@ -884,18 +824,47 @@ impl InferenceEngine {
             prefill_step_size: gen_config.prefill_step_size,
             logprobs_top_n: params.logprobs_top_n,
         };
+        let request = GpuRequest {
+            input_ids: input_ids.to_vec(),
+            gen_config,
+            stop_sequences: params.stop_sequences,
+            logprobs_top_n: params.logprobs_top_n,
+        };
+        let ctx = self.gpu_request_context();
+        let (tx, rx) = tokio::sync::mpsc::channel::<TokenEvent>(64);
 
-        let runtime_guard = self.continuous.lock().map_err(|_| ServeError::Busy)?;
-        let runtime = runtime_guard.as_ref().ok_or_else(|| {
-            ServeError::Internal(
-                "continuous batching not enabled; call enable_continuous_batching first".into(),
-            )
-        })?;
-
-        let mut pump = runtime.pump.lock().map_err(|_| ServeError::Busy)?;
-        let (_slot, rx) = pump
-            .enqueue(input_ids.to_vec(), slot_params, gen_config, 64)
-            .map_err(|e| ServeError::Internal(format!("enqueue failed: {e}")))?;
+        // Enqueueing touches the prefix cache's KV snapshots, so it runs on
+        // the model thread too; queueing the job also wakes the scheduler.
+        self.model
+            .submit(move |state| {
+                let enqueued = match state.continuous.as_ref().map(|pump| pump.lock()) {
+                    Some(Ok(mut pump)) => pump.enqueue_with_sender(
+                        request.input_ids.clone(),
+                        slot_params,
+                        request.gen_config.clone(),
+                        tx.clone(),
+                    ),
+                    Some(Err(_)) => {
+                        let _ = tx.try_send(TokenEvent::Error(
+                            "continuous-batching pump poisoned".into(),
+                        ));
+                        return;
+                    }
+                    None => {
+                        let _ = tx
+                            .try_send(TokenEvent::Error("continuous batching was disabled".into()));
+                        return;
+                    }
+                };
+                if let Err(e) = enqueued {
+                    tracing::warn!(
+                        "continuous-batching enqueue failed ({e}); running the request on the \
+                         single-request path"
+                    );
+                    Self::stream_on_model(&mut state.model, &ctx, request, &tx);
+                }
+            })
+            .map_err(|_| ServeError::ModelNotLoaded)?;
         Ok(rx)
     }
 
@@ -905,16 +874,21 @@ impl InferenceEngine {
     }
 
     fn create_continuous_cache_config(&self) -> ServeResult<KVCacheConfig> {
-        let (cache_config, has_recurrent_cache) = {
-            let state = self.model.lock().map_err(|_| ServeError::Busy)?;
-            let (cache, mamba_cache) = Self::create_request_caches(
-                &state.model,
-                &self.model_path,
-                self.max_seq_len,
-                self.cache_mode_override,
-            );
-            (cache.config().clone(), mamba_cache.is_some())
-        };
+        let model_path = self.model_path.clone();
+        let max_seq_len = self.max_seq_len;
+        let cache_mode_override = self.cache_mode_override;
+        let (cache_config, has_recurrent_cache) = self
+            .model
+            .call(move |state| {
+                let (cache, mamba_cache) = Self::create_request_caches(
+                    &state.model,
+                    &model_path,
+                    max_seq_len,
+                    cache_mode_override,
+                );
+                (cache.config().clone(), mamba_cache.is_some())
+            })
+            .map_err(|_| ServeError::ModelNotLoaded)?;
         if has_recurrent_cache {
             return Err(ServeError::BadRequest(
                 "continuous batching is unsupported for hybrid/recurrent models".into(),
@@ -929,7 +903,7 @@ impl InferenceEngine {
     ///
     /// The cache config comes from `DynamicModel::create_cache(max_seq_len)`
     /// so it matches exactly what `create_request_caches` hands out for
-    /// single-request generation. Requires a short lock on the model.
+    /// single-request generation.
     pub fn enable_continuous_batching_auto(
         &self,
         mut batcher_config: crate::continuous_batch::BatcherConfig,
@@ -946,16 +920,13 @@ impl InferenceEngine {
     /// Inspect pump depth: `(active_slots, pending_depth)`. Returns
     /// `(0, 0)` when continuous batching is not enabled.
     pub fn continuous_batching_depth(&self) -> (usize, usize) {
-        let guard = match self.continuous.lock() {
-            Ok(g) => g,
+        let pump = match self.continuous.lock() {
+            Ok(guard) => guard.clone(),
             Err(_) => return (0, 0),
         };
-        let Some(runtime) = guard.as_ref() else {
-            return (0, 0);
-        };
-        match runtime.pump.lock() {
-            Ok(pump) => (pump.active_slots(), pump.pending_depth()),
-            Err(_) => (0, 0),
+        match pump.as_ref().map(|pump| pump.lock()) {
+            Some(Ok(pump)) => (pump.active_slots(), pump.pending_depth()),
+            _ => (0, 0),
         }
     }
 
@@ -1596,6 +1567,101 @@ impl InferenceEngine {
             completion_tokens: visible_len,
         })
     }
+    /// What a GPU request needs on the model thread, besides the model.
+    fn gpu_request_context(&self) -> GpuRequestContext {
+        GpuRequestContext {
+            model_path: self.model_path.clone(),
+            max_seq_len: self.max_seq_len,
+            cache_mode_override: self.cache_mode_override,
+            tokenizer: Arc::clone(&self.tokenizer),
+            prefix_cache: Arc::clone(&self.prefix_cache),
+        }
+    }
+
+    /// Run one request on the GPU, on the model thread. `on_token` sees each
+    /// token as it is generated. Returns the run and when it started.
+    fn generate_on_model<E>(
+        model: &mut DynamicModel,
+        ctx: &GpuRequestContext,
+        request: GpuRequest,
+        on_token: E,
+    ) -> ServeResult<(DecodeRun, Instant)>
+    where
+        E: FnMut(u32, Option<TokenLogprobEntry>) -> StepOutcome,
+    {
+        let (mut cache, mut mamba_cache) = Self::create_request_caches(
+            model,
+            &ctx.model_path,
+            ctx.max_seq_len,
+            ctx.cache_mode_override,
+        );
+        let max_tokens = request.gen_config.max_new_tokens;
+        let stop_tokens = request.gen_config.stop_tokens.clone();
+        let prefill_step_size = request.gen_config.prefill_step_size;
+        let mut sampler = Sampler::new(request.gen_config);
+        let start = Instant::now();
+        let run = Self::run_async_decode(
+            model,
+            &mut cache,
+            &mut mamba_cache,
+            &mut sampler,
+            ctx.tokenizer.as_ref(),
+            &request.input_ids,
+            max_tokens,
+            &stop_tokens,
+            &request.stop_sequences,
+            request.logprobs_top_n,
+            prefill_step_size,
+            Some(&ctx.prefix_cache),
+            start,
+            on_token,
+        )?;
+        Ok((run, start))
+    }
+
+    /// Run one request on the GPU, on the model thread, streaming its tokens
+    /// into `tx` and finishing with `Done` or `Error`. Stops early, without
+    /// `Done`, when the receiver has gone.
+    fn stream_on_model(
+        model: &mut DynamicModel,
+        ctx: &GpuRequestContext,
+        request: GpuRequest,
+        tx: &tokio::sync::mpsc::Sender<TokenEvent>,
+    ) {
+        let prompt_tokens = request.input_ids.len();
+        let run = Self::generate_on_model(model, ctx, request, |token, logprob| {
+            if tx
+                .blocking_send(TokenEvent::Token { id: token, logprob })
+                .is_err()
+            {
+                StepOutcome::Cancel
+            } else {
+                StepOutcome::Continue
+            }
+        });
+        let (run, start) = match run {
+            Ok(r) => r,
+            Err(e) => {
+                let _ = tx.blocking_send(TokenEvent::Error(e.to_string()));
+                return;
+            }
+        };
+        // If the client dropped mid-stream, nothing is listening for Done.
+        if run.finish_reason == "cancelled" {
+            return;
+        }
+        let metrics = Self::build_metrics(
+            start,
+            prompt_tokens,
+            run.completion_tokens,
+            run.first_token_time_ms,
+        );
+        let _ = tx.blocking_send(TokenEvent::Done {
+            finish_reason: run.finish_reason.to_string(),
+            metrics,
+            stripped_tokens: run.stripped_tokens,
+        });
+    }
 
     /// Generate tokens from input IDs (non-streaming).
     ///
@@ -1616,98 +1682,74 @@ impl InferenceEngine {
         String,
         RequestMetrics,
     )> {
-        // Validate before dispatching to the blocking thread.
         Self::validate_params(&params, self.max_seq_len)?;
 
         let prompt_tokens = input_ids.len();
-        let gen_config = self.build_generation_config(&params);
-        let input_ids = input_ids.to_vec();
-        let model_arc = Arc::clone(&self.model);
-        let model_path = self.model_path.clone();
-        let max_seq_len = self.max_seq_len;
-        let ane_max_seq_len = self.ane_max_seq_len;
-        let ane_draft_path = self.ane_draft_path.clone();
-        let backend = Arc::clone(&self.backend);
-        let cache_mode_override = self.cache_mode_override;
-        let tokenizer = Arc::clone(&self.tokenizer);
-        let prefix_cache = Arc::clone(&self.prefix_cache);
+        let request = GpuRequest {
+            input_ids: input_ids.to_vec(),
+            gen_config: self.build_generation_config(&params),
+            stop_sequences: params.stop_sequences,
+            logprobs_top_n: params.logprobs_top_n,
+        };
 
-        let logprobs_top_n = params.logprobs_top_n;
-        let stop_sequences = params.stop_sequences.clone();
-
-        // Generation is synchronous/blocking; run it on a dedicated blocking
-        // thread so we don't stall the async executor.
-        //
-        // DynamicModel is !Send — ModelState wraps it with an unsafe Send impl
-        // guarded by the Mutex. The Mutex is cloned (Arc) into the closure.
-        let result = tokio::task::spawn_blocking(move || {
-            // Accelerated ANE / CPU-hybrid paths can't collect logprobs (they
-            // run outside the MLX logits pipeline). Skip them when logprobs
-            // are requested so the standard GPU loop handles the request.
-            if logprobs_top_n.is_none() && stop_sequences.is_empty() {
-                if let Some(result) = Self::try_accelerated_generate_blocking(
+        // The accelerated ANE / CPU-hybrid engines keep their own models
+        // (the ANE ones on their own thread), so they run on the blocking
+        // pool. They can't collect logprobs or match raw-text stops, and
+        // they hand the request back to the GPU when they fail.
+        if request.logprobs_top_n.is_none()
+            && request.stop_sequences.is_empty()
+            && Self::backend_or_gpu(&self.backend) != PreferredGenerationBackend::Gpu
+        {
+            let backend = Arc::clone(&self.backend);
+            let model_path = self.model_path.clone();
+            let draft_path = self.ane_draft_path.clone();
+            let ane_max_seq_len = self.ane_max_seq_len;
+            let input_ids = request.input_ids.clone();
+            let gen_config = request.gen_config.clone();
+            let accelerated = tokio::task::spawn_blocking(move || {
+                Self::try_accelerated_generate_blocking(
                     &backend,
                     &model_path,
-                    ane_draft_path.as_deref(),
+                    draft_path.as_deref(),
                     &input_ids,
                     &gen_config,
                     ane_max_seq_len,
-                )? {
-                    let (tokens, reason, metrics) = result;
-                    return Ok((tokens, None, reason, metrics));
-                }
+                )
+            })
+            .await
+            .map_err(|e| ServeError::Internal(e.to_string()))??;
+            if let Some((tokens, reason, metrics)) = accelerated {
+                return Ok((tokens, None, reason, metrics));
             }
+        }
 
-            let max_tokens = gen_config.max_new_tokens;
-            let stop_tokens = gen_config.stop_tokens.clone();
-            let prefill_step_size = gen_config.prefill_step_size;
-            let mut state = model_arc.lock().map_err(|_| ServeError::Busy)?;
-            let model = &mut state.model;
-            let (mut cache, mut mamba_cache) =
-                Self::create_request_caches(model, &model_path, max_seq_len, cache_mode_override);
-
-            // Sampler holds MLX Arrays and is !Send — must live inside the
-            // blocking thread.
-            let mut sampler = Sampler::new(gen_config);
-            let start = Instant::now();
-
-            let run = Self::run_async_decode(
-                model,
-                &mut cache,
-                &mut mamba_cache,
-                &mut sampler,
-                tokenizer.as_ref(),
-                &input_ids,
-                max_tokens,
-                &stop_tokens,
-                &stop_sequences,
-                logprobs_top_n,
-                prefill_step_size,
-                Some(&prefix_cache),
-                start,
-                // Non-streaming: no side-effect callback; helper accumulates
-                // tokens + logprobs internally.
-                |_token, _logprob| StepOutcome::Continue,
-            )?;
-
-            let metrics = Self::build_metrics(
-                start,
-                prompt_tokens,
-                run.completion_tokens,
-                run.first_token_time_ms,
-            );
-
-            Ok::<_, ServeError>((
-                run.generated,
-                run.logprobs,
-                run.finish_reason.to_string(),
-                metrics,
-            ))
-        })
-        .await
-        .map_err(|e| ServeError::Internal(e.to_string()))??;
-
-        Ok(result)
+        let ctx = self.gpu_request_context();
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.model
+            .submit(move |state| {
+                let result = Self::generate_on_model(&mut state.model, &ctx, request, |_, _| {
+                    StepOutcome::Continue
+                })
+                .map(|(run, start)| {
+                    let metrics = Self::build_metrics(
+                        start,
+                        prompt_tokens,
+                        run.completion_tokens,
+                        run.first_token_time_ms,
+                    );
+                    (
+                        run.generated,
+                        run.logprobs,
+                        run.finish_reason.to_string(),
+                        metrics,
+                    )
+                });
+                let _ = reply.send(result);
+            })
+            .map_err(|_| ServeError::ModelNotLoaded)?;
+        answer
+            .await
+            .map_err(|_| ServeError::Internal("generation panicked".into()))?
     }
 
     /// Compute pooled sentence embeddings for a batch of texts.
@@ -1739,9 +1781,8 @@ impl InferenceEngine {
         let batch = tokenized.len();
         let seq_max = tokenized.iter().map(Vec::len).max().unwrap_or(0).max(1);
 
-        // Build padded [batch, seq_max] token + mask arrays up front — the
-        // blocking closure receives them by value so !Send DynamicModel never
-        // crosses an await point.
+        // Padded [batch, seq_max] token ids and mask, built here as plain
+        // vectors; the arrays are made on the model thread.
         let mut ids_flat: Vec<i32> = vec![0; batch * seq_max];
         let mut mask_flat: Vec<f32> = vec![0.0; batch * seq_max];
         for (b, row) in tokenized.iter().enumerate() {
@@ -1751,44 +1792,44 @@ impl InferenceEngine {
             }
         }
 
-        let model_arc = Arc::clone(&self.model);
-        tokio::task::spawn_blocking(move || -> ServeResult<Vec<Vec<f32>>> {
-            let mut state = model_arc.lock().map_err(|_| ServeError::Busy)?;
-            let model = &mut state.model;
-
-            let ids = Array::from_slice(&ids_flat, &[batch as i32, seq_max as i32]);
-            let mask = Array::from_slice(&mask_flat, &[batch as i32, seq_max as i32]);
-
-            let hidden = model
-                .forward_hidden(&ids, None)
-                .map_err(ServeError::Model)?;
-            let pooled =
-                pmetal_models::pooling::pool(&hidden, &mask, mode).map_err(ServeError::Model)?;
-            let pooled_eval = pooled;
-            pooled_eval.try_eval().map_err(|e| {
-                ServeError::Model(pmetal_bridge::compat::Exception::custom(e.to_string()))
-            })?;
-
-            let hidden_dim = pooled_eval.dim(1) as usize;
-            let flat: Vec<f32> = pooled_eval.as_slice::<f32>().to_vec();
-            let out = (0..batch)
-                .map(|b| flat[b * hidden_dim..(b + 1) * hidden_dim].to_vec())
-                .collect();
-            Ok(out)
-        })
-        .await
-        .map_err(|e| ServeError::Model(pmetal_bridge::compat::Exception::custom(e.to_string())))?
+        let (reply, answer) = tokio::sync::oneshot::channel();
+        self.model
+            .submit(move |state| {
+                let mut embed = || -> ServeResult<Vec<Vec<f32>>> {
+                    let ids = Array::from_slice(&ids_flat, &[batch as i32, seq_max as i32]);
+                    let mask = Array::from_slice(&mask_flat, &[batch as i32, seq_max as i32]);
+                    let hidden = state
+                        .model
+                        .forward_hidden(&ids, None)
+                        .map_err(ServeError::Model)?;
+                    let pooled = pmetal_models::pooling::pool(&hidden, &mask, mode)
+                        .map_err(ServeError::Model)?;
+                    pooled.try_eval().map_err(|e| {
+                        ServeError::Model(pmetal_bridge::compat::Exception::custom(e.to_string()))
+                    })?;
+                    let hidden_dim = pooled.dim(1) as usize;
+                    let flat: Vec<f32> = pooled.as_slice::<f32>().to_vec();
+                    Ok((0..batch)
+                        .map(|b| flat[b * hidden_dim..(b + 1) * hidden_dim].to_vec())
+                        .collect())
+                };
+                let _ = reply.send(embed());
+            })
+            .map_err(|_| ServeError::ModelNotLoaded)?;
+        answer
+            .await
+            .map_err(|_| ServeError::Internal("embedding panicked".into()))?
     }
 
     /// Begin token-by-token streaming generation.
     ///
-    /// Validates `params` before spawning. If validation fails, sends a single
-    /// `TokenEvent::Error` through the channel and returns immediately.
+    /// Validates `params` before dispatching. If validation fails, sends a
+    /// single `TokenEvent::Error` through the channel and returns immediately.
     ///
-    /// Spawns a blocking thread that runs the generation loop and sends
-    /// `TokenEvent` values through an `mpsc` channel. Returns the receiver
-    /// end immediately so the route handler can start consuming events while
-    /// generation proceeds in parallel.
+    /// Queues the request on the model thread (or, for an accelerated ANE /
+    /// CPU-hybrid backend, runs it on the blocking pool) and returns the
+    /// receiver end immediately so the route handler can start consuming
+    /// events while generation proceeds in parallel.
     ///
     /// The channel will receive:
     /// - Zero or more `TokenEvent::Token(id)` — one per generated token.
@@ -1804,139 +1845,58 @@ impl InferenceEngine {
         // don't allocate an unbounded queue.
         let (tx, rx) = tokio::sync::mpsc::channel::<TokenEvent>(64);
 
-        // Validate before spawning — send error through channel if invalid.
+        // Validate before dispatching — send error through channel if invalid.
         if let Err(e) = Self::validate_params(&params, self.max_seq_len) {
             let _ = tx.try_send(TokenEvent::Error(e.to_string()));
             return rx;
         }
 
-        let prompt_tokens = input_ids.len();
-        let gen_config = self.build_generation_config(&params);
-        let input_ids = input_ids.to_vec();
-        let model_arc = Arc::clone(&self.model);
-        let model_path = self.model_path.clone();
-        let max_seq_len = self.max_seq_len;
-        let ane_max_seq_len = self.ane_max_seq_len;
-        let ane_draft_path = self.ane_draft_path.clone();
-        let backend = Arc::clone(&self.backend);
-        let cache_mode_override = self.cache_mode_override;
-        let tokenizer = Arc::clone(&self.tokenizer);
-        let prefix_cache = Arc::clone(&self.prefix_cache);
-        // Captured per-token logprobs flag for the GPU streaming loop. The
-        // accelerated paths cannot collect logprobs, so they always emit
-        // TokenEvent::Token { logprob: None } regardless of this value.
-        let logprobs_top_n = params.logprobs_top_n;
-        let stop_sequences = params.stop_sequences.clone();
+        let request = GpuRequest {
+            input_ids: input_ids.to_vec(),
+            gen_config: self.build_generation_config(&params),
+            stop_sequences: params.stop_sequences,
+            logprobs_top_n: params.logprobs_top_n,
+        };
+        let accelerable = request.stop_sequences.is_empty()
+            && Self::backend_or_gpu(&self.backend) != PreferredGenerationBackend::Gpu;
+        let input_ids = request.input_ids.clone();
+        let gen_config = request.gen_config.clone();
 
-        // Spawn generation on a dedicated blocking thread.
-        tokio::task::spawn_blocking(move || {
-            // Macro-style helper: send an event or bail on channel close.
-            macro_rules! send {
-                ($event:expr) => {
-                    if tx.blocking_send($event).is_err() {
-                        // Receiver dropped (client disconnected) — stop generation.
-                        return;
-                    }
-                };
-            }
-
-            if stop_sequences.is_empty()
-                && Self::try_accelerated_streaming_blocking(
-                    &backend,
-                    &model_path,
-                    ane_draft_path.as_deref(),
-                    &input_ids,
-                    &gen_config,
-                    ane_max_seq_len,
-                    &tx,
-                )
-            {
-                return;
-            }
-
-            let max_tokens = gen_config.max_new_tokens;
-            let stop_tokens = gen_config.stop_tokens.clone();
-            let prefill_step_size = gen_config.prefill_step_size;
-
-            let state_guard = match model_arc.lock() {
-                Ok(g) => g,
-                Err(_) => {
-                    send!(TokenEvent::Error("engine busy".into()));
-                    return;
-                }
-            };
-            // Shadow to get mutable access — we need to hold the guard for
-            // the entire generation loop.
-            let mut state = state_guard;
-            let model = &mut state.model;
-            let (mut cache, mut mamba_cache) =
-                Self::create_request_caches(model, &model_path, max_seq_len, cache_mode_override);
-
-            // Sampler created inside spawn_blocking — it holds MLX Arrays.
-            let mut sampler = Sampler::new(gen_config);
-            let start = Instant::now();
-
-            // Stream each generated token through the channel. When the
-            // receiver has been dropped (client disconnected), propagate
-            // `Cancel` so the decode loop returns with `finish_reason =
-            // "cancelled"`. The closure only touches `tx`; model state is
-            // borrowed by `run_async_decode` via the other arguments.
-            let tx_inner = tx.clone();
-            let run_result = Self::run_async_decode(
-                model,
-                &mut cache,
-                &mut mamba_cache,
-                &mut sampler,
-                tokenizer.as_ref(),
-                &input_ids,
-                max_tokens,
-                &stop_tokens,
-                &stop_sequences,
-                logprobs_top_n,
-                prefill_step_size,
-                Some(&prefix_cache),
-                start,
-                |token, logprob| {
-                    if tx_inner
-                        .blocking_send(TokenEvent::Token { id: token, logprob })
-                        .is_err()
-                    {
-                        StepOutcome::Cancel
-                    } else {
-                        StepOutcome::Continue
-                    }
-                },
-            );
-
-            let run = match run_result {
-                Ok(r) => r,
-                Err(e) => {
-                    let _ = tx.blocking_send(TokenEvent::Error(e.to_string()));
-                    return;
-                }
-            };
-
-            // If the client dropped mid-stream, drop the Done event too —
-            // nothing is listening.
-            if run.finish_reason == "cancelled" {
-                return;
-            }
-
-            let metrics = Self::build_metrics(
-                start,
-                prompt_tokens,
-                run.completion_tokens,
-                run.first_token_time_ms,
-            );
-
-            // Done — send final event (ignore send error, client may be gone).
-            let _ = tx.blocking_send(TokenEvent::Done {
-                finish_reason: run.finish_reason.to_string(),
-                metrics,
-                stripped_tokens: run.stripped_tokens,
+        let ctx = self.gpu_request_context();
+        let model = self.model.clone();
+        let tx_gpu = tx.clone();
+        let on_gpu = move |tx: tokio::sync::mpsc::Sender<TokenEvent>| {
+            let queued = model.submit(move |state| {
+                Self::stream_on_model(&mut state.model, &ctx, request, &tx_gpu);
             });
-        });
+            if queued.is_err() {
+                let _ = tx.try_send(TokenEvent::Error("the model thread has exited".into()));
+            }
+        };
 
+        if !accelerable {
+            on_gpu(tx);
+            return rx;
+        }
+        // The accelerated ANE / CPU-hybrid engines keep their own models, so
+        // they run on the blocking pool; a request they fail goes to the GPU.
+        let backend = Arc::clone(&self.backend);
+        let model_path = self.model_path.clone();
+        let draft_path = self.ane_draft_path.clone();
+        let ane_max_seq_len = self.ane_max_seq_len;
+        tokio::task::spawn_blocking(move || {
+            if !Self::try_accelerated_streaming_blocking(
+                &backend,
+                &model_path,
+                draft_path.as_deref(),
+                &input_ids,
+                &gen_config,
+                ane_max_seq_len,
+                &tx,
+            ) {
+                on_gpu(tx);
+            }
+        });
         rx
     }
 }
@@ -2158,22 +2118,25 @@ mod tests {
 
     #[test]
     fn continuous_cache_config_honors_cache_mode_override() {
-        let model = DynamicModel::Llama(LlamaForCausalLM::new(tiny_llama_config()).unwrap());
         let override_mode = CacheMode::Quantized {
             bits: 4,
             group_size: 8,
         };
-        let engine = InferenceEngine::new_with_options(
-            model,
+        let engine = InferenceEngine::new_with_backend(
+            || {
+                Ok(DynamicModel::Llama(LlamaForCausalLM::new(
+                    tiny_llama_config(),
+                )?))
+            },
             test_tokenizer(),
             "tiny-llama".into(),
             std::env::temp_dir().as_path(),
             64,
             false,
             1024,
-            Some(override_mode),
         )
-        .unwrap();
+        .unwrap()
+        .with_cache_mode_override(override_mode);
 
         let cfg = engine.create_continuous_cache_config().unwrap();
         assert_eq!(cfg.mode, override_mode);
@@ -2181,17 +2144,18 @@ mod tests {
 
     #[test]
     fn continuous_cache_config_rejects_hybrid_models() {
-        let model =
-            DynamicModel::NemotronH(NemotronHForCausalLM::new(tiny_nemotron_h_config()).unwrap());
-        let engine = InferenceEngine::new_with_options(
-            model,
+        let engine = InferenceEngine::new_with_backend(
+            || {
+                Ok(DynamicModel::NemotronH(NemotronHForCausalLM::new(
+                    tiny_nemotron_h_config(),
+                )?))
+            },
             test_tokenizer(),
             "tiny-hybrid".into(),
             std::env::temp_dir().as_path(),
             64,
             false,
             1024,
-            None,
         )
         .unwrap();
 
@@ -2200,6 +2164,86 @@ mod tests {
             ServeError::BadRequest(msg) => assert!(msg.contains("hybrid/recurrent")),
             other => panic!("expected BadRequest, got {other:?}"),
         }
+    }
+
+    fn greedy(max_tokens: usize) -> SamplingParams {
+        SamplingParams {
+            max_tokens,
+            temperature: 0.0,
+            top_k: None,
+            top_p: None,
+            min_p: None,
+            repetition_penalty: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            extra_stop_token_ids: vec![],
+            stop_sequences: vec![],
+            logprobs_top_n: None,
+        }
+    }
+
+    async fn collect_stream(mut rx: tokio::sync::mpsc::Receiver<TokenEvent>) -> Vec<u32> {
+        let mut tokens = Vec::new();
+        while let Some(event) = rx.recv().await {
+            match event {
+                TokenEvent::Token { id, .. } => tokens.push(id),
+                TokenEvent::Done { .. } => return tokens,
+                TokenEvent::Error(e) => panic!("stream failed: {e}"),
+            }
+        }
+        panic!("stream closed without Done");
+    }
+
+    /// Requests arrive on whatever thread the runtime picks, many at once and
+    /// after idle gaps, and every one of them must see the same model. On
+    /// tokio's blocking pool the second concurrent request evaluated the
+    /// prefix-cache snapshot the first had made on another thread and failed
+    /// with "There is no Stream(gpu, N) in current thread".
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn requests_from_every_thread_share_one_model() {
+        let engine = Arc::new(
+            InferenceEngine::new_with_backend(
+                || {
+                    Ok(DynamicModel::Llama(LlamaForCausalLM::new(
+                        tiny_llama_config(),
+                    )?))
+                },
+                test_tokenizer(),
+                "tiny-llama".into(),
+                std::env::temp_dir().as_path(),
+                64,
+                false,
+                1024,
+            )
+            .unwrap(),
+        );
+        let prompt = [1u32, 2, 3, 1, 2];
+        let (expected, ..) = engine.generate(&prompt, greedy(6)).await.unwrap();
+        assert_eq!(expected.len(), 6);
+
+        let mut tasks = Vec::new();
+        for i in 0..8 {
+            let engine = Arc::clone(&engine);
+            tasks.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    engine.generate(&prompt, greedy(6)).await.unwrap().0
+                } else {
+                    collect_stream(engine.generate_streaming(&prompt, greedy(6))).await
+                }
+            }));
+        }
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), expected);
+        }
+        let embeddings = engine
+            .embed(
+                &["alpha beta".to_string()],
+                pmetal_models::pooling::PoolingMode::Mean,
+            )
+            .await
+            .unwrap();
+        assert_eq!(embeddings[0].len(), 32);
     }
 
     fn test_tokenizer() -> pmetal_data::Tokenizer {
